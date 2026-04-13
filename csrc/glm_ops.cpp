@@ -595,6 +595,69 @@ static Napi::Value IndexSelect(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value AllocH(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, size)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    size_t bytes = info[1].As<Napi::Number>().Int64Value();
+    int handle = glm_alloc_h(reinterpret_cast<GlmCtx*>(ctx_ptr), bytes);
+    return Napi::Number::New(env, handle);
+}
+
+static Napi::Value FreeH(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, handle)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    int handle = info[1].As<Napi::Number>().Int32Value();
+    glm_free_h(reinterpret_cast<GlmCtx*>(ctx_ptr), handle);
+    return env.Undefined();
+}
+
+static Napi::Value MmapOpen(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, path)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    std::string path = info[1].As<Napi::String>().Utf8Value();
+    int handle = glm_mmap_open(reinterpret_cast<GlmCtx*>(ctx_ptr), path.c_str());
+    return Napi::Number::New(env, handle);
+}
+
+static Napi::Value MmapLoad(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5) {
+        Napi::TypeError::New(env, "Expected (ctx, gpu_handle, mmap_handle, offset, nbytes)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    int gpu_handle = info[1].As<Napi::Number>().Int32Value();
+    int mmap_handle = info[2].As<Napi::Number>().Int32Value();
+    uint64_t offset = info[3].As<Napi::Number>().Int64Value();
+    uint64_t nbytes = info[4].As<Napi::Number>().Int64Value();
+    glm_mmap_load(reinterpret_cast<GlmCtx*>(ctx_ptr), gpu_handle, mmap_handle, offset, nbytes);
+    return env.Undefined();
+}
+
+static Napi::Value MmapClose(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, mmap_handle)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    int mmap_handle = info[1].As<Napi::Number>().Int32Value();
+    glm_mmap_close(reinterpret_cast<GlmCtx*>(ctx_ptr), mmap_handle);
+    return env.Undefined();
+}
+
 static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "init"), Napi::Function::New(env, Init));
     exports.Set(Napi::String::New(env, "free"), Napi::Function::New(env, Free));
@@ -628,6 +691,11 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "mul"), Napi::Function::New(env, Mul));
     exports.Set(Napi::String::New(env, "reduceSum"), Napi::Function::New(env, ReduceSum));
     exports.Set(Napi::String::New(env, "indexSelect"), Napi::Function::New(env, IndexSelect));
+    exports.Set(Napi::String::New(env, "allocH"), Napi::Function::New(env, AllocH));
+    exports.Set(Napi::String::New(env, "freeH"), Napi::Function::New(env, FreeH));
+    exports.Set(Napi::String::New(env, "mmapOpen"), Napi::Function::New(env, MmapOpen));
+    exports.Set(Napi::String::New(env, "mmapLoad"), Napi::Function::New(env, MmapLoad));
+    exports.Set(Napi::String::New(env, "mmapClose"), Napi::Function::New(env, MmapClose));
     return exports;
 }
 

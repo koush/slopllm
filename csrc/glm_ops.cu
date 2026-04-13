@@ -3,6 +3,11 @@
 #include <cublas_v2.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define CUBLAS(ctx) (*reinterpret_cast<cublasHandle_t*>(&(ctx)->cublas_handle))
 
@@ -21,11 +26,35 @@ GlmCtx* glm_init(int device_id) {
     cudaStreamCreate(&ctx->stream);
     cublasCreate(&CUBLAS(ctx));
     cublasSetStream(CUBLAS(ctx), ctx->stream);
+
+    ctx->gpu_allocs = nullptr;
+    ctx->gpu_alloc_count = 0;
+    ctx->gpu_alloc_capacity = 0;
+
+    ctx->mmaps = nullptr;
+    ctx->mmap_count = 0;
+    ctx->mmap_capacity = 0;
+
     return ctx;
 }
 
 void glm_free(GlmCtx* ctx) {
     if (!ctx) return;
+
+    for (int i = 0; i < ctx->gpu_alloc_count; i++) {
+        if (ctx->gpu_allocs[i]) {
+            cudaFree(ctx->gpu_allocs[i]);
+        }
+    }
+    free(ctx->gpu_allocs);
+
+    for (int i = 0; i < ctx->mmap_count; i++) {
+        if (ctx->mmaps[i].ptr) {
+            munmap(ctx->mmaps[i].ptr, ctx->mmaps[i].size);
+        }
+    }
+    free(ctx->mmaps);
+
     cublasDestroy(CUBLAS(ctx));
     cudaStreamDestroy(ctx->stream);
     delete ctx;
@@ -48,6 +77,157 @@ void* glm_alloc(GlmCtx* ctx, size_t bytes) {
 
 void glm_free_buf(GlmCtx* ctx, void* ptr) {
     if (ptr) cudaFree(ptr);
+}
+
+// ---------------------------------------------------------------------------
+// GPU allocation handles
+// ---------------------------------------------------------------------------
+
+int glm_alloc_h(GlmCtx* ctx, size_t bytes) {
+    void* ptr = nullptr;
+    cudaSetDevice(ctx->device_id);
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm_alloc_h: cudaMalloc(%zu) failed: %s\n", bytes, cudaGetErrorString(err));
+        return 0;
+    }
+
+    if (ctx->gpu_alloc_count >= ctx->gpu_alloc_capacity) {
+        int new_cap = ctx->gpu_alloc_capacity == 0 ? 64 : ctx->gpu_alloc_capacity * 2;
+        void** new_arr = (void**)realloc(ctx->gpu_allocs, new_cap * sizeof(void*));
+        if (!new_arr) {
+            cudaFree(ptr);
+            fprintf(stderr, "glm_alloc_h: realloc failed\n");
+            return 0;
+        }
+        memset(new_arr + ctx->gpu_alloc_capacity, 0,
+               (new_cap - ctx->gpu_alloc_capacity) * sizeof(void*));
+        ctx->gpu_allocs = new_arr;
+        ctx->gpu_alloc_capacity = new_cap;
+    }
+
+    // 1-indexed: handle 0 is invalid
+    int handle = ctx->gpu_alloc_count + 1;
+    ctx->gpu_allocs[ctx->gpu_alloc_count] = ptr;
+    ctx->gpu_alloc_count++;
+    return handle;
+}
+
+void glm_free_h(GlmCtx* ctx, int handle) {
+    if (handle < 1 || handle > ctx->gpu_alloc_count) {
+        fprintf(stderr, "glm_free_h: invalid handle %d\n", handle);
+        return;
+    }
+    int idx = handle - 1;
+    if (ctx->gpu_allocs[idx]) {
+        cudaFree(ctx->gpu_allocs[idx]);
+        ctx->gpu_allocs[idx] = nullptr;
+    }
+}
+
+void* glm_deref(GlmCtx* ctx, int handle) {
+    if (handle < 1 || handle > ctx->gpu_alloc_count) {
+        fprintf(stderr, "glm_deref: invalid handle %d\n", handle);
+        return nullptr;
+    }
+    void* ptr = ctx->gpu_allocs[handle - 1];
+    if (!ptr) {
+        fprintf(stderr, "glm_deref: handle %d has been freed\n", handle);
+    }
+    return ptr;
+}
+
+// ---------------------------------------------------------------------------
+// Mmap handles
+// ---------------------------------------------------------------------------
+
+int glm_mmap_open(GlmCtx* ctx, const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "glm_mmap_open: cannot open %s\n", path);
+        return 0;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        fprintf(stderr, "glm_mmap_open: fstat failed for %s\n", path);
+        close(fd);
+        return 0;
+    }
+    uint64_t size = (uint64_t)st.st_size;
+
+    void* ptr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    if (ptr == MAP_FAILED) {
+        fprintf(stderr, "glm_mmap_open: mmap failed for %s (size=%llu)\n", path, (unsigned long long)size);
+        return 0;
+    }
+
+    if (ctx->mmap_count >= ctx->mmap_capacity) {
+        int new_cap = ctx->mmap_capacity == 0 ? 16 : ctx->mmap_capacity * 2;
+        GlmMmapEntry* new_arr = (GlmMmapEntry*)realloc(ctx->mmaps, new_cap * sizeof(GlmMmapEntry));
+        if (!new_arr) {
+            munmap(ptr, size);
+            fprintf(stderr, "glm_mmap_open: realloc failed\n");
+            return 0;
+        }
+        memset(new_arr + ctx->mmap_capacity, 0,
+               (new_cap - ctx->mmap_capacity) * sizeof(GlmMmapEntry));
+        ctx->mmaps = new_arr;
+        ctx->mmap_capacity = new_cap;
+    }
+
+    int handle = ctx->mmap_count + 1;
+    ctx->mmaps[ctx->mmap_count].ptr = ptr;
+    ctx->mmaps[ctx->mmap_count].size = size;
+    ctx->mmap_count++;
+    return handle;
+}
+
+void glm_mmap_load(GlmCtx* ctx, int gpu_handle, int mmap_handle,
+                   uint64_t offset, uint64_t nbytes) {
+    if (gpu_handle < 1 || gpu_handle > ctx->gpu_alloc_count) {
+        fprintf(stderr, "glm_mmap_load: invalid gpu_handle %d\n", gpu_handle);
+        return;
+    }
+    if (mmap_handle < 1 || mmap_handle > ctx->mmap_count) {
+        fprintf(stderr, "glm_mmap_load: invalid mmap_handle %d\n", mmap_handle);
+        return;
+    }
+
+    void* gpu_dst = ctx->gpu_allocs[gpu_handle - 1];
+    GlmMmapEntry* entry = &ctx->mmaps[mmap_handle - 1];
+
+    if (!gpu_dst) {
+        fprintf(stderr, "glm_mmap_load: gpu_handle %d has been freed\n", gpu_handle);
+        return;
+    }
+    if (!entry->ptr) {
+        fprintf(stderr, "glm_mmap_load: mmap_handle %d has been closed\n", mmap_handle);
+        return;
+    }
+    if (offset + nbytes > entry->size) {
+        fprintf(stderr, "glm_mmap_load: offset+%llu > file size %llu\n",
+                (unsigned long long)(offset + nbytes), (unsigned long long)entry->size);
+        return;
+    }
+
+    const void* src = (const char*)entry->ptr + offset;
+    cudaMemcpyAsync(gpu_dst, src, nbytes, cudaMemcpyHostToDevice, ctx->stream);
+}
+
+void glm_mmap_close(GlmCtx* ctx, int mmap_handle) {
+    if (mmap_handle < 1 || mmap_handle > ctx->mmap_count) {
+        fprintf(stderr, "glm_mmap_close: invalid mmap_handle %d\n", mmap_handle);
+        return;
+    }
+    int idx = mmap_handle - 1;
+    if (ctx->mmaps[idx].ptr) {
+        munmap(ctx->mmaps[idx].ptr, ctx->mmaps[idx].size);
+        ctx->mmaps[idx].ptr = nullptr;
+        ctx->mmaps[idx].size = 0;
+    }
 }
 
 void glm_h2d(GlmCtx* ctx, void* dst, const void* src, size_t bytes) {

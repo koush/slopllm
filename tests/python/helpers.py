@@ -256,6 +256,24 @@ class GlmOps:
         self.lib.glm_synchronize.restype = None
         self.lib.glm_synchronize.argtypes = [ctypes.c_void_p]
 
+        self.lib.glm_alloc_h.restype = ctypes.c_int
+        self.lib.glm_alloc_h.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+
+        self.lib.glm_free_h.restype = None
+        self.lib.glm_free_h.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        self.lib.glm_deref.restype = ctypes.c_void_p
+        self.lib.glm_deref.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        self.lib.glm_mmap_open.restype = ctypes.c_int
+        self.lib.glm_mmap_open.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+        self.lib.glm_mmap_load.restype = None
+        self.lib.glm_mmap_load.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64]
+
+        self.lib.glm_mmap_close.restype = None
+        self.lib.glm_mmap_close.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
         self.lib.glm_flash_prefill.restype = None
         self.lib.glm_flash_prefill.argtypes = [
             ctypes.c_void_p,
@@ -309,6 +327,27 @@ class GlmOps:
 
     def synchronize(self):
         self.lib.glm_synchronize(self.ctx)
+
+    def alloc_h(self, size):
+        handle = self.lib.glm_alloc_h(self.ctx, size)
+        if handle == 0:
+            raise RuntimeError(f"glm_alloc_h failed for size {size}")
+        return handle
+
+    def free_h(self, handle):
+        self.lib.glm_free_h(self.ctx, handle)
+
+    def mmap_open(self, path):
+        handle = self.lib.glm_mmap_open(self.ctx, path.encode('utf-8') if isinstance(path, str) else path)
+        if handle == 0:
+            raise RuntimeError(f"glm_mmap_open failed for {path}")
+        return handle
+
+    def mmap_load(self, gpu_handle, mmap_handle, offset, nbytes):
+        self.lib.glm_mmap_load(self.ctx, gpu_handle, mmap_handle, offset, nbytes)
+
+    def mmap_close(self, mmap_handle):
+        self.lib.glm_mmap_close(self.ctx, mmap_handle)
 
     def upload_tensor(self, tensor):
         assert tensor.is_cuda, "Tensor must be on CUDA"
