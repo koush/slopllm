@@ -1,0 +1,3 @@
+[submodule "vendor/flashinfer"]
+	path = vendor/flashinfer
+	url = https://github.com/flashinfer-ai/flashinfer.git

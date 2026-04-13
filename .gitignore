@@ -10,7 +10,8 @@ node_modules/
 .venv/
 
 # Vendor (large third-party repos)
-vendor/
+vendor/*
+!vendor/flashinfer
 
 # Python
 __pycache__/
