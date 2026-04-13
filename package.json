@@ -9,6 +9,7 @@
     "build:all": "npm run build:addon && npm run build",
     "test:python": "cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .",
     "start": "node dist/main.js",
+    "start:qwen3": "node dist/run_qwen3.js",
     "dev": "tsc --watch",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

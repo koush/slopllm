@@ -10,51 +10,27 @@
 extern "C" {
 #endif
 
-typedef struct {
-    void* ptr;
-    uint64_t size;
-} GlmMmapEntry;
-
 struct GlmCtx {
     int device_id;
     cudaStream_t stream;
     void* cublas_handle;
-
-    void** gpu_allocs;
-    int gpu_alloc_count;
-    int gpu_alloc_capacity;
-
-    GlmMmapEntry* mmaps;
-    int mmap_count;
-    int mmap_capacity;
 };
 
 typedef struct GlmCtx GlmCtx;
-
-// ---------------------------------------------------------------------------
-// GPU allocation handles
-// ---------------------------------------------------------------------------
-
-int glm_alloc_h(GlmCtx* ctx, size_t bytes);
-void glm_free_h(GlmCtx* ctx, int handle);
-void* glm_deref(GlmCtx* ctx, int handle);
-
-// ---------------------------------------------------------------------------
-// Mmap handles
-// ---------------------------------------------------------------------------
-
-int glm_mmap_open(GlmCtx* ctx, const char* path);
-void glm_mmap_load(GlmCtx* ctx, int gpu_handle, int mmap_handle,
-                   uint64_t offset, uint64_t nbytes);
-void glm_mmap_close(GlmCtx* ctx, int mmap_handle);
 
 GlmCtx* glm_init(int device_id);
 void glm_free(GlmCtx* ctx);
 
 void* glm_alloc(GlmCtx* ctx, size_t bytes);
 void glm_free_buf(GlmCtx* ctx, void* ptr);
+
 void glm_h2d(GlmCtx* ctx, void* dst, const void* src, size_t bytes);
 void glm_d2h(GlmCtx* ctx, void* dst, const void* src, size_t bytes);
+
+void* glm_mmap_open(const char* path);
+void glm_mmap_close(void* ptr, uint64_t size);
+void glm_mmap_load(GlmCtx* ctx, void* gpu_dst, const void* mmap_ptr,
+                   uint64_t offset, uint64_t nbytes);
 
 void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
                  const void* weight, float eps, int dim, int batch);

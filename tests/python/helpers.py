@@ -1,5 +1,6 @@
 import ctypes
 import os
+import os
 import torch
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "build", "Release", "libglm_ops.so")
@@ -45,6 +46,67 @@ def has_model_cached(repo_id: str) -> bool:
         return True
     except ModelNotFoundError:
         return False
+
+class GpuBuffer:
+    def __init__(self, ops, ptr, size):
+        self._ops = ops
+        self._ptr = ptr
+        self._size = size
+        self._freed = False
+
+    @property
+    def ptr(self):
+        if self._freed:
+            raise RuntimeError("Cannot access freed GpuBuffer")
+        return self._ptr
+
+    @property
+    def size(self):
+        return self._size
+
+    def free(self):
+        if self._freed:
+            return
+        self._ops.free_buf(self._ptr)
+        self._freed = True
+
+    def __del__(self):
+        if not self._freed:
+            self.free()
+
+
+class MmapFile:
+    def __init__(self, ops, ptr, path, size):
+        self._ops = ops
+        self._ptr = ptr
+        self._path = path
+        self._size = size
+        self._closed = False
+
+    @property
+    def ptr(self):
+        if self._closed:
+            raise RuntimeError("Cannot access closed MmapFile")
+        return self._ptr
+
+    @property
+    def size(self):
+        return self._size
+
+    @property
+    def path(self):
+        return self._path
+
+    def close(self):
+        if self._closed:
+            return
+        self._ops.mmap_close(self._ptr, self._size)
+        self._closed = True
+
+    def __del__(self):
+        if not self._closed:
+            self.close()
+
 
 class GlmOps:
     def __init__(self, lib_path=None, device_id=0):
@@ -256,23 +318,14 @@ class GlmOps:
         self.lib.glm_synchronize.restype = None
         self.lib.glm_synchronize.argtypes = [ctypes.c_void_p]
 
-        self.lib.glm_alloc_h.restype = ctypes.c_int
-        self.lib.glm_alloc_h.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-
-        self.lib.glm_free_h.restype = None
-        self.lib.glm_free_h.argtypes = [ctypes.c_void_p, ctypes.c_int]
-
-        self.lib.glm_deref.restype = ctypes.c_void_p
-        self.lib.glm_deref.argtypes = [ctypes.c_void_p, ctypes.c_int]
-
-        self.lib.glm_mmap_open.restype = ctypes.c_int
-        self.lib.glm_mmap_open.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-
-        self.lib.glm_mmap_load.restype = None
-        self.lib.glm_mmap_load.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64]
+        self.lib.glm_mmap_open.restype = ctypes.c_void_p
+        self.lib.glm_mmap_open.argtypes = [ctypes.c_char_p]
 
         self.lib.glm_mmap_close.restype = None
-        self.lib.glm_mmap_close.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.glm_mmap_close.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+
+        self.lib.glm_mmap_load.restype = None
+        self.lib.glm_mmap_load.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
 
         self.lib.glm_flash_prefill.restype = None
         self.lib.glm_flash_prefill.argtypes = [
@@ -328,26 +381,22 @@ class GlmOps:
     def synchronize(self):
         self.lib.glm_synchronize(self.ctx)
 
-    def alloc_h(self, size):
-        handle = self.lib.glm_alloc_h(self.ctx, size)
-        if handle == 0:
-            raise RuntimeError(f"glm_alloc_h failed for size {size}")
-        return handle
-
-    def free_h(self, handle):
-        self.lib.glm_free_h(self.ctx, handle)
-
     def mmap_open(self, path):
-        handle = self.lib.glm_mmap_open(self.ctx, path.encode('utf-8') if isinstance(path, str) else path)
-        if handle == 0:
+        encoded = path.encode('utf-8') if isinstance(path, str) else path
+        ptr = self.lib.glm_mmap_open(encoded)
+        if ptr is None or ptr == 0:
             raise RuntimeError(f"glm_mmap_open failed for {path}")
-        return handle
+        raw_ptr = ptr.value if hasattr(ptr, 'value') else ptr
+        size = os.path.getsize(path if isinstance(path, str) else path.decode('utf-8'))
+        return MmapFile(self, raw_ptr, path, size)
 
-    def mmap_load(self, gpu_handle, mmap_handle, offset, nbytes):
-        self.lib.glm_mmap_load(self.ctx, gpu_handle, mmap_handle, offset, nbytes)
+    def mmap_close(self, ptr, size):
+        self.lib.glm_mmap_close(ctypes.c_void_p(ptr), ctypes.c_uint64(size))
 
-    def mmap_close(self, mmap_handle):
-        self.lib.glm_mmap_close(self.ctx, mmap_handle)
+    def mmap_load(self, gpu_dst, mmap_ptr, offset, nbytes):
+        self.lib.glm_mmap_load(self.ctx, ctypes.c_void_p(gpu_dst),
+                               ctypes.c_void_p(mmap_ptr),
+                               ctypes.c_uint64(offset), ctypes.c_uint64(nbytes))
 
     def upload_tensor(self, tensor):
         assert tensor.is_cuda, "Tensor must be on CUDA"
