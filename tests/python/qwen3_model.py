@@ -9,6 +9,12 @@ from helpers import GlmOps, get_model_path
 BF16 = 2  # bytes per bfloat16
 I32 = 4   # bytes per int32
 FLASH_TMP_SIZE = 32 * 1024 * 1024  # 32MB workspace for FlashInfer
+BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024  # 128MB float workspace
+BATCH_INT_WS_SIZE = 8 * 1024 * 1024  # 8MB int workspace (GPU)
+BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024  # 8MB pinned host int workspace
+PAGE_SIZE = 16
+DECODE_PLAN_INFO_SIZE = 10  # int64s
+PREFILL_PLAN_INFO_SIZE = 15  # int64s
 
 
 def _f32_to_bf16_bytes(arr):
@@ -21,6 +27,137 @@ def _bf16_bytes_to_f32(data):
     u16 = np.frombuffer(data, dtype=np.uint16)
     u32 = u16.astype(np.uint32) << 16
     return u32.view(np.float32)
+
+
+class PagedKVCache:
+    def __init__(self, glm, n_kv, hd, n_layers, max_pages, page_size=PAGE_SIZE):
+        self.glm = glm
+        self.n_kv = n_kv
+        self.hd = hd
+        self.n_layers = n_layers
+        self.max_pages = max_pages
+        self.page_size = page_size
+        self.page_stride = n_kv * page_size * hd * BF16
+        self.k_data = [glm.alloc(max_pages * n_kv * page_size * hd * BF16) for _ in range(n_layers)]
+        self.v_data = [glm.alloc(max_pages * n_kv * page_size * hd * BF16) for _ in range(n_layers)]
+        self.indices = glm.alloc(max_pages * I32)
+        self.indptr_d = None
+        self.last_page_len = None
+        self.indptr_h = None
+        self.last_page_len_h = None
+        self.num_pages_used = 0
+        self.seq_page_counts = []
+        self.seq_kv_lens = []
+
+        indptr_np = np.arange(max_pages, dtype=np.int32)
+        glm.h2d(self.indices, indptr_np.tobytes())
+
+    def free(self):
+        glm = self.glm
+        for ptr in self.k_data:
+            glm.free_buf(ptr)
+        for ptr in self.v_data:
+            glm.free_buf(ptr)
+        glm.free_buf(self.indices)
+        if self.indptr_d is not None:
+            glm.free_buf(self.indptr_d)
+        if self.last_page_len is not None:
+            glm.free_buf(self.last_page_len)
+        if self.indptr_h is not None:
+            glm.free_pinned(self.indptr_h)
+        if self.last_page_len_h is not None:
+            glm.free_pinned(self.last_page_len_h)
+        self.k_data = []
+        self.v_data = []
+
+    def reset(self, batch_size):
+        self.num_pages_used = 0
+        self.seq_page_counts = [0] * batch_size
+        self.seq_kv_lens = [0] * batch_size
+
+        if self.indptr_d is not None:
+            self.glm.free_buf(self.indptr_d)
+        if self.last_page_len is not None:
+            self.glm.free_buf(self.last_page_len)
+        if self.indptr_h is not None:
+            self.glm.free_pinned(self.indptr_h)
+        if self.last_page_len_h is not None:
+            self.glm.free_pinned(self.last_page_len_h)
+
+        self.indptr_d = self.glm.alloc((batch_size + 1) * I32)
+        self.last_page_len = self.glm.alloc(batch_size * I32)
+        self.indptr_h = self.glm.alloc_pinned((batch_size + 1) * I32)
+        self.last_page_len_h = self.glm.alloc_pinned(batch_size * I32)
+
+    def alloc_pages(self, seq_idx, num_tokens):
+        page_size = self.page_size
+        num_new_pages = (num_tokens + page_size - 1) // page_size
+        start_page = self.num_pages_used
+        self.num_pages_used += num_new_pages
+        self.seq_page_counts[seq_idx] += num_new_pages
+        self.seq_kv_lens[seq_idx] += num_tokens
+        return start_page, num_new_pages
+
+    def alloc_prefill_pages(self, seq_idx, seq_len):
+        page_size = self.page_size
+        num_pages = (seq_len + page_size - 1) // page_size
+        start_page = self.num_pages_used
+        self.num_pages_used += num_pages
+        self.seq_page_counts[seq_idx] = num_pages
+        self.seq_kv_lens[seq_idx] = seq_len
+        return start_page, num_pages
+
+    def alloc_decode_token(self, seq_idx):
+        kv_len = self.seq_kv_lens[seq_idx]
+        page_size = self.page_size
+        page_idx_in_seq = kv_len // page_size
+        if page_idx_in_seq >= self.seq_page_counts[seq_idx]:
+            start_page = self.num_pages_used
+            self.num_pages_used += 1
+            self.seq_page_counts[seq_idx] += 1
+        self.seq_kv_lens[seq_idx] = kv_len + 1
+        abs_page = sum(self.seq_page_counts[:seq_idx]) + page_idx_in_seq
+        slot_in_page = kv_len % page_size
+        return abs_page, slot_in_page
+
+    def update_indptr(self):
+        batch_size = len(self.seq_page_counts)
+        indptr = [0] * (batch_size + 1)
+        for i in range(batch_size):
+            indptr[i + 1] = indptr[i] + self.seq_page_counts[i]
+        indptr_np = np.array(indptr, dtype=np.int32)
+        last_page_len_list = []
+        for i in range(batch_size):
+            kv_len = self.seq_kv_lens[i]
+            remainder = kv_len % self.page_size
+            last_page_len_list.append(remainder if remainder != 0 else self.page_size if kv_len > 0 else 0)
+        last_page_len_np = np.array(last_page_len_list, dtype=np.int32)
+        ctypes.memset(self.indptr_h, 0, (batch_size + 1) * I32)
+        ctypes.memset(self.last_page_len_h, 0, batch_size * I32)
+        ctypes.memmove(self.indptr_h, indptr_np.tobytes(), (batch_size + 1) * I32)
+        ctypes.memmove(self.last_page_len_h, last_page_len_np.tobytes(), batch_size * I32)
+        self.glm.h2d(self.indptr_d, indptr_np.tobytes())
+        self.glm.h2d(self.last_page_len, last_page_len_np.tobytes())
+
+
+class WorkspaceBuffers:
+    def __init__(self, glm):
+        self.glm = glm
+        self.float_ws = glm.alloc(BATCH_FLOAT_WS_SIZE)
+        self.int_ws = glm.alloc(BATCH_INT_WS_SIZE)
+        self.pinned_int_ws = glm.alloc_pinned(BATCH_PINNED_INT_WS_SIZE)
+        self.decode_plan_info = glm.alloc_pinned(DECODE_PLAN_INFO_SIZE * 8)
+        self.prefill_plan_info = glm.alloc_pinned(PREFILL_PLAN_INFO_SIZE * 8)
+
+    def free(self):
+        glm = self.glm
+        glm.free_buf(self.float_ws)
+        glm.free_buf(self.int_ws)
+        glm.free_pinned(self.pinned_int_ws)
+        glm.free_pinned(self.decode_plan_info)
+        glm.free_pinned(self.prefill_plan_info)
+        self.float_ws = 0
+        self.int_ws = 0
 
 
 def _normalize_token_ids(input_ids, tokenizer):
@@ -930,3 +1067,316 @@ class Qwen3Model:
         glm.linear(self._ws["o_proj_buf"], self._ws["flash_out"],
                     self.weights[f"{pfx}.self_attn.o_proj.weight"],
                     BS, hs, n_heads * hd)
+
+    def prefill_batch(self, input_ids_list, ws, paged_kv):
+        cfg = self.cfg
+        glm = self.glm
+        hs = cfg.hidden_size
+        n_heads = cfg.num_attention_heads
+        n_kv = cfg.num_key_value_heads
+        hd = cfg.head_dim
+        vs = cfg.vocab_size
+        batch_size = len(input_ids_list)
+
+        paged_kv.reset(batch_size)
+
+        seq_lens = [len(ids) for ids in input_ids_list]
+        total_tokens = sum(seq_lens)
+
+        page_allocs = []
+        for seq_idx, s in enumerate(seq_lens):
+            start_page, num_pages = paged_kv.alloc_prefill_pages(seq_idx, s)
+            page_allocs.append((start_page, num_pages))
+
+        all_ids = []
+        for ids in input_ids_list:
+            all_ids.extend(ids)
+        ids_np = np.array(all_ids, dtype=np.int32)
+        ids_ptr = glm.alloc(ids_np.nbytes)
+        glm.h2d(ids_ptr, ids_np.tobytes())
+
+        glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
+                       ids_ptr, hs, total_tokens)
+        glm.free_buf(ids_ptr)
+
+        qo_indptr = [0]
+        kv_indptr = [0]
+        for s in seq_lens:
+            qo_indptr.append(qo_indptr[-1] + s)
+            kv_indptr.append(kv_indptr[-1] + s)
+        qo_indptr_np = np.array(qo_indptr, dtype=np.int32)
+        kv_indptr_np = np.array(kv_indptr, dtype=np.int32)
+
+        pos_ids = []
+        for s in seq_lens:
+            pos_ids.extend(range(s))
+        pos_ids_np = np.array(pos_ids, dtype=np.int32)
+        glm.h2d(self._ws["position_ids"], pos_ids_np.tobytes())
+
+        glm.rotary_embedding(self._ws["cos"], self._ws["sin"], self.inv_freq,
+                              self._ws["position_ids"],
+                              hd // 2, 1, total_tokens)
+
+        glm.batch_prefill_ragged_plan(
+            ws.float_ws, BATCH_FLOAT_WS_SIZE,
+            ws.int_ws, ws.pinned_int_ws, BATCH_INT_WS_SIZE,
+            ws.prefill_plan_info,
+            qo_indptr_np.ctypes.data, kv_indptr_np.ctypes.data,
+            total_tokens, batch_size,
+            n_heads, n_kv, hd,
+            1
+        )
+
+        for i in range(cfg.num_hidden_layers):
+            pfx = f"model.layers.{i}"
+
+            glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
+                         self.weights[f"{pfx}.input_layernorm.weight"],
+                         cfg.rms_norm_eps, hs, total_tokens)
+
+            glm.linear(self._ws["q_buf"], self._ws["normed"],
+                         self.weights[f"{pfx}.self_attn.q_proj.weight"],
+                         total_tokens, n_heads * hd, hs)
+            glm.linear(self._ws["k_buf"], self._ws["normed"],
+                         self.weights[f"{pfx}.self_attn.k_proj.weight"],
+                         total_tokens, n_kv * hd, hs)
+            glm.linear(self._ws["v_buf"], self._ws["normed"],
+                         self.weights[f"{pfx}.self_attn.v_proj.weight"],
+                         total_tokens, n_kv * hd, hs)
+
+            glm.rmsnorm(self._ws["q_normed"], self._ws["q_buf"],
+                         self.weights[f"{pfx}.self_attn.q_norm.weight"],
+                         cfg.rms_norm_eps, hd, total_tokens * n_heads)
+            glm.rmsnorm(self._ws["k_normed"], self._ws["k_buf"],
+                         self.weights[f"{pfx}.self_attn.k_norm.weight"],
+                         cfg.rms_norm_eps, hd, total_tokens * n_kv)
+
+            glm.transpose_4d(self._ws["q_t"], self._ws["q_normed"],
+                              1, total_tokens, n_heads, hd, 0, 2, 1, 3)
+            glm.transpose_4d(self._ws["k_t"], self._ws["k_normed"],
+                              1, total_tokens, n_kv, hd, 0, 2, 1, 3)
+            glm.transpose_4d(self._ws["v_t"], self._ws["v_buf"],
+                              1, total_tokens, n_kv, hd, 0, 2, 1, 3)
+
+            glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
+                                      self._ws["cos"], self._ws["sin"],
+                                      hd, n_heads, total_tokens, 1, 1)
+            glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
+                                      self._ws["cos"], self._ws["sin"],
+                                      hd, n_kv, total_tokens, 1, 1)
+
+            for seq_idx, s in enumerate(seq_lens):
+                start_page, num_pages = page_allocs[seq_idx]
+                page_size = paged_kv.page_size
+                seq_start = sum(seq_lens[:seq_idx])
+                for h in range(n_kv):
+                    for p in range(num_pages):
+                        page_offset = (start_page + p) * n_kv * page_size * hd
+                        kv_head_offset = page_offset + h * page_size * hd
+                        token_start = p * page_size
+                        token_count = min(page_size, s - p * page_size)
+                        src_off = (h * total_tokens + seq_start + token_start) * hd * BF16
+                        dst_off = kv_head_offset * BF16
+                        copy_bytes = token_count * hd * BF16
+                        glm.memcpy(paged_kv.k_data[i] + dst_off,
+                                    self._ws["k_rope"] + src_off,
+                                    copy_bytes)
+                        glm.memcpy(paged_kv.v_data[i] + dst_off,
+                                    self._ws["v_t"] + src_off,
+                                    copy_bytes)
+
+            q_stride_n = hd
+            q_stride_h = total_tokens * hd
+            kv_stride_n = hd
+            kv_stride_h = total_tokens * hd
+
+            qo_indptr_d = glm.alloc((batch_size + 1) * I32)
+            kv_indptr_d = glm.alloc((batch_size + 1) * I32)
+            glm.h2d(qo_indptr_d, qo_indptr_np.tobytes())
+            glm.h2d(kv_indptr_d, kv_indptr_np.tobytes())
+
+            glm.batch_prefill_ragged_run(
+                self._ws["q_rope"], self._ws["k_rope"], self._ws["v_t"], self._ws["flash_out"],
+                ws.float_ws, ws.int_ws,
+                qo_indptr_d, kv_indptr_d,
+                ws.prefill_plan_info,
+                total_tokens, batch_size,
+                n_heads, n_kv, hd,
+                q_stride_n, q_stride_h,
+                kv_stride_n, kv_stride_h,
+                1, cfg.scaling
+            )
+
+            glm.free_buf(qo_indptr_d)
+            glm.free_buf(kv_indptr_d)
+
+            glm.linear(self._ws["o_proj_buf"], self._ws["flash_out"],
+                         self.weights[f"{pfx}.self_attn.o_proj.weight"],
+                         total_tokens, hs, n_heads * hd)
+
+            glm.add(self._ws["hidden_b"], self._ws["hidden_a"],
+                     self._ws["o_proj_buf"], total_tokens * hs)
+
+            glm.rmsnorm(self._ws["normed"], self._ws["hidden_b"],
+                         self.weights[f"{pfx}.post_attention_layernorm.weight"],
+                         cfg.rms_norm_eps, hs, total_tokens)
+
+            self._mlp(total_tokens, 1, pfx)
+
+        glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
+                     self.weights["model.norm.weight"],
+                     cfg.rms_norm_eps, hs, total_tokens)
+
+        glm.linear(self._ws["logits_buf"], self._ws["normed"],
+                     self.weights["lm_head.weight"],
+                     total_tokens, vs, hs)
+
+        paged_kv.update_indptr()
+
+        all_logits = []
+        offset = 0
+        for s in seq_lens:
+            logits_ptr = self._ws["logits_buf"] + (offset + s - 1) * vs * BF16
+            logits_u16 = self._read_logits(logits_ptr, vs)
+            logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(vs)
+            all_logits.append(torch.from_numpy(logits_f32.copy()))
+            offset += s
+
+        return all_logits
+
+    def decode_batch(self, token_ids_list, ws, paged_kv):
+        cfg = self.cfg
+        glm = self.glm
+        hs = cfg.hidden_size
+        n_heads = cfg.num_attention_heads
+        n_kv = cfg.num_key_value_heads
+        hd = cfg.head_dim
+        vs = cfg.vocab_size
+        page_size = paged_kv.page_size
+        batch_size = len(token_ids_list)
+
+        write_locations = []
+        for seq_idx in range(batch_size):
+            abs_page, slot_in_page = paged_kv.alloc_decode_token(seq_idx)
+            write_locations.append((abs_page, slot_in_page))
+
+        paged_kv.update_indptr()
+
+        all_ids = token_ids_list
+        ids_np = np.array(all_ids, dtype=np.int32)
+        ids_ptr = glm.alloc(ids_np.nbytes)
+        glm.h2d(ids_ptr, ids_np.tobytes())
+
+        glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
+                       ids_ptr, hs, batch_size)
+        glm.free_buf(ids_ptr)
+
+        pos_ids = []
+        for seq_idx in range(batch_size):
+            pos_ids.append(paged_kv.seq_kv_lens[seq_idx] - 1)
+        pos_ids_np = np.array(pos_ids, dtype=np.int32)
+        glm.h2d(self._ws["position_ids"], pos_ids_np.tobytes())
+
+        glm.rotary_embedding(self._ws["cos"], self._ws["sin"], self.inv_freq,
+                              self._ws["position_ids"],
+                              hd // 2, batch_size, 1)
+
+        glm.batch_decode_plan(
+            ws.float_ws, BATCH_FLOAT_WS_SIZE,
+            ws.int_ws, ws.pinned_int_ws, BATCH_INT_WS_SIZE,
+            ws.decode_plan_info,
+            paged_kv.indptr_h,
+            batch_size,
+            n_heads, n_kv, page_size
+        )
+
+        for i in range(cfg.num_hidden_layers):
+            pfx = f"model.layers.{i}"
+
+            glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
+                         self.weights[f"{pfx}.input_layernorm.weight"],
+                         cfg.rms_norm_eps, hs, batch_size)
+
+            glm.linear(self._ws["q_buf"], self._ws["normed"],
+                         self.weights[f"{pfx}.self_attn.q_proj.weight"],
+                         batch_size, n_heads * hd, hs)
+            glm.linear(self._ws["k_buf"], self._ws["normed"],
+                         self.weights[f"{pfx}.self_attn.k_proj.weight"],
+                         batch_size, n_kv * hd, hs)
+            glm.linear(self._ws["v_buf"], self._ws["normed"],
+                         self.weights[f"{pfx}.self_attn.v_proj.weight"],
+                         batch_size, n_kv * hd, hs)
+
+            glm.rmsnorm(self._ws["q_normed"], self._ws["q_buf"],
+                         self.weights[f"{pfx}.self_attn.q_norm.weight"],
+                         cfg.rms_norm_eps, hd, batch_size * n_heads)
+            glm.rmsnorm(self._ws["k_normed"], self._ws["k_buf"],
+                         self.weights[f"{pfx}.self_attn.k_norm.weight"],
+                         cfg.rms_norm_eps, hd, batch_size * n_kv)
+
+            glm.transpose_4d(self._ws["q_t"], self._ws["q_normed"],
+                              batch_size, 1, n_heads, hd, 0, 2, 1, 3)
+            glm.transpose_4d(self._ws["k_t"], self._ws["k_normed"],
+                              batch_size, 1, n_kv, hd, 0, 2, 1, 3)
+            glm.transpose_4d(self._ws["v_t"], self._ws["v_buf"],
+                              batch_size, 1, n_kv, hd, 0, 2, 1, 3)
+
+            glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
+                                      self._ws["cos"], self._ws["sin"],
+                                      hd, n_heads, 1, batch_size, 1)
+            glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
+                                      self._ws["cos"], self._ws["sin"],
+                                      hd, n_kv, 1, batch_size, 1)
+
+            for seq_idx in range(batch_size):
+                abs_page, slot_in_page = write_locations[seq_idx]
+                for h in range(n_kv):
+                    page_offset = abs_page * n_kv * page_size * hd
+                    kv_head_offset = page_offset + h * page_size * hd
+                    token_offset = kv_head_offset + slot_in_page * hd
+                    src_off = (seq_idx * n_kv + h) * hd * BF16
+                    glm.memcpy(paged_kv.k_data[i] + token_offset * BF16,
+                                self._ws["k_rope"] + src_off,
+                                hd * BF16)
+                    glm.memcpy(paged_kv.v_data[i] + token_offset * BF16,
+                                self._ws["v_t"] + src_off,
+                                hd * BF16)
+
+            glm.batch_decode_run(
+                self._ws["q_rope"], self._ws["flash_out"],
+                paged_kv.k_data[i], paged_kv.v_data[i],
+                paged_kv.indices, paged_kv.indptr_d, paged_kv.last_page_len,
+                ws.float_ws, ws.int_ws,
+                ws.decode_plan_info,
+                n_heads, n_kv, hd, page_size, cfg.scaling
+            )
+
+            glm.linear(self._ws["o_proj_buf"], self._ws["flash_out"],
+                         self.weights[f"{pfx}.self_attn.o_proj.weight"],
+                         batch_size, hs, n_heads * hd)
+
+            glm.add(self._ws["hidden_b"], self._ws["hidden_a"],
+                     self._ws["o_proj_buf"], batch_size * hs)
+
+            glm.rmsnorm(self._ws["normed"], self._ws["hidden_b"],
+                         self.weights[f"{pfx}.post_attention_layernorm.weight"],
+                         cfg.rms_norm_eps, hs, batch_size)
+
+            self._mlp(batch_size, 1, pfx)
+
+        glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
+                     self.weights["model.norm.weight"],
+                     cfg.rms_norm_eps, hs, batch_size)
+
+        glm.linear(self._ws["logits_buf"], self._ws["normed"],
+                     self.weights["lm_head.weight"],
+                     batch_size, vs, hs)
+
+        all_logits = []
+        for seq_idx in range(batch_size):
+            logits_ptr = self._ws["logits_buf"] + seq_idx * vs * BF16
+            logits_u16 = self._read_logits(logits_ptr, vs)
+            logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(vs)
+            all_logits.append(torch.from_numpy(logits_f32.copy()))
+
+        return all_logits

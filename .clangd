@@ -1,0 +1,10 @@
+CompileFlags:
+  Add:
+    - "-I/mnt/storage2/glm.js/node_modules/node-addon-api"
+    - "-I/mnt/storage2/glm.js/csrc"
+    - "-I/mnt/storage2/glm.js/vendor/flashinfer/include"
+    - "-I/usr/include/node"
+    - "-I/usr/local/cuda-12.9/targets/x86_64-linux/include"
+    - "-std=c++17"
+    - "-fPIC"
+    - "--cuda-gpu-arch=sm_120"

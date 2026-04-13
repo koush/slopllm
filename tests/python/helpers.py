@@ -350,6 +350,63 @@ class GlmOps:
             ctypes.c_float,
         ]
 
+        self.lib.glm_alloc_pinned.restype = ctypes.c_void_p
+        self.lib.glm_alloc_pinned.argtypes = [ctypes.c_size_t]
+
+        self.lib.glm_free_pinned.restype = None
+        self.lib.glm_free_pinned.argtypes = [ctypes.c_void_p]
+
+        self.lib.glm_batch_decode_plan.restype = None
+        self.lib.glm_batch_decode_plan.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+
+        self.lib.glm_batch_decode_run.restype = None
+        self.lib.glm_batch_decode_run.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_float,
+        ]
+
+        self.lib.glm_batch_prefill_ragged_plan.restype = None
+        self.lib.glm_batch_prefill_ragged_plan.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_int32,
+        ]
+
+        self.lib.glm_batch_prefill_ragged_run.restype = None
+        self.lib.glm_batch_prefill_ragged_run.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_int32, ctypes.c_float,
+        ]
+
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
             self.lib.glm_free(self.ctx)
@@ -720,5 +777,89 @@ class GlmOps:
             q_stride_n, q_stride_h,
             kv_stride_n, kv_stride_h,
             ctypes.c_float(sm_scale)
+        )
+        self.synchronize()
+
+    def alloc_pinned(self, nbytes):
+        ptr = self.lib.glm_alloc_pinned(nbytes)
+        if ptr is None or ptr == 0:
+            raise RuntimeError(f"glm_alloc_pinned failed for size {nbytes}")
+        return ptr.value if hasattr(ptr, 'value') else ptr
+
+    def free_pinned(self, ptr):
+        self.lib.glm_free_pinned(ctypes.c_void_p(ptr))
+
+    def batch_decode_plan(self, float_ws, float_ws_size,
+                          int_ws, pinned_int_ws, int_ws_size,
+                          plan_info, indptr_h,
+                          batch_size, num_qo_heads, num_kv_heads, page_size):
+        self.lib.glm_batch_decode_plan(
+            self.ctx,
+            ctypes.c_void_p(float_ws), ctypes.c_size_t(float_ws_size),
+            ctypes.c_void_p(int_ws), ctypes.c_void_p(pinned_int_ws), ctypes.c_size_t(int_ws_size),
+            ctypes.c_void_p(plan_info),
+            ctypes.c_void_p(indptr_h),
+            ctypes.c_uint32(batch_size),
+            ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads),
+            ctypes.c_uint32(page_size)
+        )
+        self.synchronize()
+
+    def batch_decode_run(self, q, o, k_data, v_data,
+                         indices, indptr_d, last_page_len,
+                         float_ws, int_ws, plan_info,
+                         num_qo_heads, num_kv_heads,
+                         head_dim, page_size, sm_scale):
+        self.lib.glm_batch_decode_run(
+            self.ctx,
+            ctypes.c_void_p(q), ctypes.c_void_p(o),
+            ctypes.c_void_p(k_data), ctypes.c_void_p(v_data),
+            ctypes.c_void_p(indices), ctypes.c_void_p(indptr_d), ctypes.c_void_p(last_page_len),
+            ctypes.c_void_p(float_ws), ctypes.c_void_p(int_ws),
+            ctypes.c_void_p(plan_info),
+            ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads),
+            ctypes.c_uint32(head_dim), ctypes.c_uint32(page_size),
+            ctypes.c_float(sm_scale)
+        )
+        self.synchronize()
+
+    def batch_prefill_ragged_plan(self, float_ws, float_ws_size,
+                                   int_ws, pinned_int_ws, int_ws_size,
+                                   plan_info, qo_indptr_h, kv_indptr_h,
+                                   total_qo_rows, batch_size,
+                                   num_qo_heads, num_kv_heads,
+                                   head_dim, mask_mode):
+        self.lib.glm_batch_prefill_ragged_plan(
+            self.ctx,
+            ctypes.c_void_p(float_ws), ctypes.c_size_t(float_ws_size),
+            ctypes.c_void_p(int_ws), ctypes.c_void_p(pinned_int_ws), ctypes.c_size_t(int_ws_size),
+            ctypes.c_void_p(plan_info),
+            ctypes.c_void_p(qo_indptr_h), ctypes.c_void_p(kv_indptr_h),
+            ctypes.c_uint32(total_qo_rows), ctypes.c_uint32(batch_size),
+            ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads),
+            ctypes.c_uint32(head_dim), ctypes.c_int32(mask_mode)
+        )
+        self.synchronize()
+
+    def batch_prefill_ragged_run(self, q, k, v, o,
+                                  float_ws, int_ws,
+                                  q_indptr_d, kv_indptr_d,
+                                  plan_info,
+                                  total_qo_rows, batch_size,
+                                  num_qo_heads, num_kv_heads, head_dim,
+                                  q_stride_n, q_stride_h,
+                                  kv_stride_n, kv_stride_h,
+                                  mask_mode, sm_scale):
+        self.lib.glm_batch_prefill_ragged_run(
+            self.ctx,
+            ctypes.c_void_p(q), ctypes.c_void_p(k), ctypes.c_void_p(v), ctypes.c_void_p(o),
+            ctypes.c_void_p(float_ws), ctypes.c_void_p(int_ws),
+            ctypes.c_void_p(q_indptr_d), ctypes.c_void_p(kv_indptr_d),
+            ctypes.c_void_p(plan_info),
+            ctypes.c_uint32(total_qo_rows), ctypes.c_uint32(batch_size),
+            ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads), ctypes.c_uint32(head_dim),
+            ctypes.c_uint32(q_stride_n), ctypes.c_uint32(q_stride_h),
+            ctypes.c_uint32(kv_stride_n), ctypes.c_uint32(kv_stride_h),
+            ctypes.c_int32(mask_mode), ctypes.c_float(sm_scale)
         )
         self.synchronize()

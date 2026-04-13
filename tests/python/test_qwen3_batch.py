@@ -1,0 +1,159 @@
+import pytest
+import torch
+import numpy as np
+from helpers import GlmOps, has_model_cached
+from qwen3_model import (
+    Qwen3Model, Qwen3Config, PagedKVCache, WorkspaceBuffers,
+    PAGE_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE,
+)
+from test_qwen3 import load_qwen3_config, load_qwen3_weights
+
+QWEN3_REPO = "Qwen/Qwen3-0.6B"
+
+pytestmark = pytest.mark.skipif(
+    not has_model_cached(QWEN3_REPO),
+    reason=f"{QWEN3_REPO} not in HF cache"
+)
+
+
+@pytest.fixture(scope="module")
+def glm():
+    ops = GlmOps(device_id=int(__import__("os").environ.get("GLM_GPU", "0")))
+    yield ops
+    del ops
+
+
+@pytest.fixture(scope="module")
+def qwen3_model(glm):
+    model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=4, max_seq_len=128)
+    yield model
+    model.free()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+def ws(glm):
+    w = WorkspaceBuffers(glm)
+    yield w
+    w.free()
+
+
+def test_batch_prefill_vs_single(glm, qwen3_model, ws):
+    model = qwen3_model
+    cfg = model.cfg
+    n_kv = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    n_layers = cfg.num_hidden_layers
+    max_pages = 1024
+
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages)
+    try:
+        prompt1 = [151643, 151644, 151645, 1, 2, 3]
+        prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
+
+        batch_logits = model.prefill_batch([prompt1, prompt2], ws, paged_kv)
+
+        model.reset_cache()
+        single_logits_1 = model.prefill(torch.tensor([prompt1], dtype=torch.int64))
+
+        model.reset_cache()
+        single_logits_2 = model.prefill(torch.tensor([prompt2], dtype=torch.int64))
+
+        diff1 = (batch_logits[0] - single_logits_1[0, -1]).abs().max().item()
+        diff2 = (batch_logits[1] - single_logits_2[0, -1]).abs().max().item()
+        print(f"  Batch prefill vs single: diff1={diff1:.4f}, diff2={diff2:.4f}")
+
+        assert batch_logits[0].argmax().item() == single_logits_1[0, -1].argmax().item(), \
+            f"Seq1 top-1 mismatch"
+        assert batch_logits[1].argmax().item() == single_logits_2[0, -1].argmax().item(), \
+            f"Seq2 top-1 mismatch"
+        assert diff1 < 0.5, f"Seq1 diff too large: {diff1:.4f}"
+        assert diff2 < 0.5, f"Seq2 diff too large: {diff2:.4f}"
+    finally:
+        paged_kv.free()
+
+
+def test_batch_decode_vs_single(glm, qwen3_model, ws):
+    model = qwen3_model
+    cfg = model.cfg
+    n_kv = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    n_layers = cfg.num_hidden_layers
+    max_pages = 1024
+
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages)
+    try:
+        prompt1 = [151643, 151644, 151645, 1, 2, 3]
+        prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
+
+        batch_logits = model.prefill_batch([prompt1, prompt2], ws, paged_kv)
+
+        token1 = batch_logits[0].argmax().item()
+        token2 = batch_logits[1].argmax().item()
+
+        model.reset_cache()
+        model.prefill(torch.tensor([prompt1], dtype=torch.int64))
+        single_decode_logits_1 = model.decode(torch.tensor([[token1]], dtype=torch.int64))
+
+        model.reset_cache()
+        model.prefill(torch.tensor([prompt2], dtype=torch.int64))
+        single_decode_logits_2 = model.decode(torch.tensor([[token2]], dtype=torch.int64))
+
+        batch_decode_logits = model.decode_batch([token1, token2], ws, paged_kv)
+
+        diff1 = (batch_decode_logits[0] - single_decode_logits_1[0, 0]).abs().max().item()
+        diff2 = (batch_decode_logits[1] - single_decode_logits_2[0, 0]).abs().max().item()
+        print(f"  Batch decode vs single: diff1={diff1:.4f}, diff2={diff2:.4f}")
+
+        assert batch_decode_logits[0].argmax().item() == single_decode_logits_1[0, 0].argmax().item(), \
+            f"Seq1 decode top-1 mismatch"
+        assert batch_decode_logits[1].argmax().item() == single_decode_logits_2[0, 0].argmax().item(), \
+            f"Seq2 decode top-1 mismatch"
+        assert diff1 < 0.5, f"Seq1 decode diff too large: {diff1:.4f}"
+        assert diff2 < 0.5, f"Seq2 decode diff too large: {diff2:.4f}"
+    finally:
+        paged_kv.free()
+
+
+def test_batch_multi_step_decode(glm, qwen3_model, ws):
+    model = qwen3_model
+    cfg = model.cfg
+    n_kv = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    n_layers = cfg.num_hidden_layers
+    max_pages = 2048
+
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages)
+    try:
+        prompt1 = [151643, 151644, 151645, 1, 2, 3]
+        prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
+
+        batch_logits = model.prefill_batch([prompt1, prompt2], ws, paged_kv)
+
+        batch_tokens = [
+            [batch_logits[0].argmax().item()],
+            [batch_logits[1].argmax().item()],
+        ]
+
+        single_models = []
+        for prompt in [prompt1, prompt2]:
+            model.reset_cache()
+            model.prefill(torch.tensor([prompt], dtype=torch.int64))
+            single_models.append(model.cache_pos)
+
+        num_steps = 5
+        for step in range(num_steps):
+            batch_decode_logits = model.decode_batch(batch_tokens, ws, paged_kv)
+
+            batch_tokens = [
+                [batch_decode_logits[0].argmax().item()],
+                [batch_decode_logits[1].argmax().item()],
+            ]
+
+        print(f"  Batch multi-step decode completed {num_steps} steps")
+        print(f"  Final tokens: seq1={batch_tokens[0]}, seq2={batch_tokens[1]}")
+
+        assert len(batch_tokens) == 2
+        assert all(isinstance(t[0], int) for t in batch_tokens)
+    finally:
+        paged_kv.free()

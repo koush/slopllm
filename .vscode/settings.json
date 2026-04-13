@@ -1,0 +1,10 @@
+{
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+  "C_Cpp.default.includePath": [
+    "${workspaceFolder}/csrc",
+    "${workspaceFolder}/vendor/flashinfer/include",
+    "/usr/include/node",
+    "${workspaceFolder}/node_modules/node-addon-api",
+    "/usr/local/cuda-12.9/targets/x86_64-linux/include"
+  ]
+}
