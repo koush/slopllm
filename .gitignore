@@ -1,0 +1,31 @@
+# Build
+build/
+dist/
+*.o
+*.so
+*.node
+
+# Dependencies
+node_modules/
+.venv/
+
+# Vendor (large third-party repos)
+vendor/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.clangd
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

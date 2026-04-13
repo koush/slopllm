@@ -1,0 +1,27 @@
+{
+  "name": "glm",
+  "version": "1.0.0",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc",
+    "build:cuda": "make",
+    "build:addon": "npm run build:cuda && node-gyp rebuild",
+    "build:all": "npm run build:addon && npm run build",
+    "test:python": "cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .",
+    "start": "node dist/main.js",
+    "dev": "tsc --watch",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.2"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.0.1",
+    "node-addon-api": "^8.7.0"
+  }
+}
