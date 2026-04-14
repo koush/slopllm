@@ -44,7 +44,7 @@ def test_batch_prefill_vs_single(glm, qwen3_model, ws):
     n_layers = cfg.num_hidden_layers
     max_pages = 128
 
-    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages)
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
     try:
         prompt1 = [151643, 151644, 151645, 1, 2, 3]
         prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
@@ -79,7 +79,7 @@ def test_batch_decode_vs_single(glm, qwen3_model, ws):
     n_layers = cfg.num_hidden_layers
     max_pages = 128
 
-    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages)
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
     try:
         prompt1 = [151643, 151644, 151645, 1, 2, 3]
         prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
@@ -121,7 +121,7 @@ def test_batch_multi_step_decode(glm, qwen3_model, ws):
     n_layers = cfg.num_hidden_layers
     max_pages = 128
 
-    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages)
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
     try:
         prompt1 = [151643, 151644, 151645, 1, 2, 3]
         prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
@@ -166,7 +166,7 @@ def test_batch_generate_vs_single(glm, qwen3_model, ws):
     max_pages = 128
     max_new_tokens = 20
 
-    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages)
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
     try:
         prompt1 = [151643, 151644, 151645, 1, 2, 3, 4, 5, 6, 7]
         prompt2 = [151643, 151644, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]

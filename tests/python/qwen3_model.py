@@ -145,6 +145,7 @@ class Qwen3Model:
             "decode_id": glm.alloc(I32),
             "flash_out": glm.alloc(B * n_heads * S * hd * BF16),
             "flash_tmp": glm.alloc(FLASH_TMP_SIZE),
+            "input_ids_buf": glm.alloc(BS * I32),
         }
 
     def _alloc_cache(self, B, S):
@@ -180,14 +181,6 @@ class Qwen3Model:
 
     def reset_cache(self):
         self.cache_pos = 0
-
-    def _upload_ids(self, input_ids):
-        B, S = input_ids.shape
-        ids_np = input_ids.cpu().numpy().astype(np.int32).flatten()
-        nbytes = ids_np.nbytes
-        ptr = self.glm.alloc(nbytes)
-        self.glm.h2d(ptr, ids_np.tobytes())
-        return ptr, nbytes
 
     def _read_logits(self, ptr, count):
         nbytes = count * BF16
@@ -235,10 +228,10 @@ class Qwen3Model:
         assert B <= self.max_batch and S <= self.max_seq_len, \
             f"input (B={B}, S={S}) exceeds max (B={self.max_batch}, S={self.max_seq_len})"
 
-        ids_ptr, ids_nbytes = self._upload_ids(input_ids)
+        ids_np = input_ids.cpu().numpy().astype(np.int32).flatten()
+        glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
         glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
-                       ids_ptr, hs, BS)
-        glm.free_buf(ids_ptr)
+                       self._ws["input_ids_buf"], hs, BS)
 
         glm.arange(self._ws["position_ids"], 0, 1, S)
 
@@ -281,10 +274,10 @@ class Qwen3Model:
         assert B <= self.max_batch and S <= self.max_seq_len
         assert self.cache_pos == 0, "Cache must be reset before prefill"
 
-        ids_ptr, ids_nbytes = self._upload_ids(input_ids)
+        ids_np = input_ids.cpu().numpy().astype(np.int32).flatten()
+        glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
         glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
-                       ids_ptr, hs, BS)
-        glm.free_buf(ids_ptr)
+                       self._ws["input_ids_buf"], hs, BS)
 
         glm.arange(self._ws["position_ids"], 0, 1, S)
 
@@ -754,12 +747,10 @@ class Qwen3Model:
         for ids in input_ids_list:
             all_ids.extend(ids)
         ids_np = np.array(all_ids, dtype=np.int32)
-        ids_ptr = glm.alloc(ids_np.nbytes)
-        glm.h2d(ids_ptr, ids_np.tobytes())
+        glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
 
         glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
-                       ids_ptr, hs, total_tokens)
-        glm.free_buf(ids_ptr)
+                       self._ws["input_ids_buf"], hs, total_tokens)
 
         qo_indptr = [0]
         kv_indptr = [0]
@@ -888,12 +879,10 @@ class Qwen3Model:
 
         all_ids = token_ids_list
         ids_np = np.array(all_ids, dtype=np.int32)
-        ids_ptr = glm.alloc(ids_np.nbytes)
-        glm.h2d(ids_ptr, ids_np.tobytes())
+        glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
 
         glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
-                       ids_ptr, hs, batch_size)
-        glm.free_buf(ids_ptr)
+                       self._ws["input_ids_buf"], hs, batch_size)
 
         pos_ids = []
         for seq_idx in range(batch_size):

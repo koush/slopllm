@@ -12,21 +12,22 @@ PREFILL_PLAN_INFO_SIZE = 15  # int64s
 
 
 class PagedKVCache:
-    def __init__(self, glm, n_kv, hd, n_layers, max_pages, page_size=PAGE_SIZE):
+    def __init__(self, glm, n_kv, hd, n_layers, max_pages, max_batch, page_size=PAGE_SIZE):
         self.glm = glm
         self.n_kv = n_kv
         self.hd = hd
         self.n_layers = n_layers
         self.max_pages = max_pages
+        self.max_batch = max_batch
         self.page_size = page_size
         self.page_stride = n_kv * page_size * hd * BF16
         self.k_data = [glm.alloc(max_pages * n_kv * page_size * hd * BF16) for _ in range(n_layers)]
         self.v_data = [glm.alloc(max_pages * n_kv * page_size * hd * BF16) for _ in range(n_layers)]
         self.indices = glm.alloc(max_pages * I32)
-        self.indptr_d = None
-        self.last_page_len = None
-        self.indptr_h = None
-        self.last_page_len_h = None
+        self.indptr_d = glm.alloc((max_batch + 1) * I32)
+        self.last_page_len = glm.alloc(max_batch * I32)
+        self.indptr_h = glm.alloc_pinned((max_batch + 1) * I32)
+        self.last_page_len_h = glm.alloc_pinned(max_batch * I32)
         self.num_pages_used = 0
         self.seq_pages = []
         self.seq_kv_lens = []
@@ -38,35 +39,19 @@ class PagedKVCache:
         for ptr in self.v_data:
             glm.free_buf(ptr)
         glm.free_buf(self.indices)
-        if self.indptr_d is not None:
-            glm.free_buf(self.indptr_d)
-        if self.last_page_len is not None:
-            glm.free_buf(self.last_page_len)
-        if self.indptr_h is not None:
-            glm.free_pinned(self.indptr_h)
-        if self.last_page_len_h is not None:
-            glm.free_pinned(self.last_page_len_h)
+        glm.free_buf(self.indptr_d)
+        glm.free_buf(self.last_page_len)
+        glm.free_pinned(self.indptr_h)
+        glm.free_pinned(self.last_page_len_h)
         self.k_data = []
         self.v_data = []
 
     def reset(self, batch_size):
+        assert batch_size <= self.max_batch, \
+            f"batch_size {batch_size} exceeds max_batch {self.max_batch}"
         self.num_pages_used = 0
         self.seq_pages = [[] for _ in range(batch_size)]
         self.seq_kv_lens = [0] * batch_size
-
-        if self.indptr_d is not None:
-            self.glm.free_buf(self.indptr_d)
-        if self.last_page_len is not None:
-            self.glm.free_buf(self.last_page_len)
-        if self.indptr_h is not None:
-            self.glm.free_pinned(self.indptr_h)
-        if self.last_page_len_h is not None:
-            self.glm.free_pinned(self.last_page_len_h)
-
-        self.indptr_d = self.glm.alloc((batch_size + 1) * I32)
-        self.last_page_len = self.glm.alloc(batch_size * I32)
-        self.indptr_h = self.glm.alloc_pinned((batch_size + 1) * I32)
-        self.last_page_len_h = self.glm.alloc_pinned(batch_size * I32)
 
     def alloc_pages(self, seq_idx, num_tokens):
         page_size = self.page_size

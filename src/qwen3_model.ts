@@ -156,6 +156,7 @@ export class Qwen3Model {
       decodeId: glm.alloc(I32),
       flashOut: glm.alloc(B * nHeads * S * hd * BF16),
       flashTmp: glm.alloc(FLASH_TMP_SIZE),
+      inputIdsBuf: glm.alloc(BS * I32),
     };
   }
 
@@ -204,21 +205,6 @@ export class Qwen3Model {
     this.cachePos = 0;
   }
 
-  private uploadIds(inputIds: number[][]): number {
-    const B = inputIds.length;
-    const S = inputIds[0].length;
-    const flat = new Int32Array(B * S);
-    for (let b = 0; b < B; b++) {
-      for (let s = 0; s < S; s++) {
-        flat[b * S + s] = inputIds[b][s];
-      }
-    }
-    const nbytes = flat.byteLength;
-    const ptr = this.glm.alloc(nbytes);
-    this.glm.h2d(ptr, Buffer.from(flat.buffer));
-    return ptr;
-  }
-
   private readArgmax(ptr: number, count: number): number {
     this.glm.argmax(this.ws.argmaxIdx, ptr, count);
     const buf = Buffer.alloc(I32);
@@ -252,9 +238,14 @@ export class Qwen3Model {
       throw new Error("Cache must be reset before prefill");
     }
 
-    const idsPtr = this.uploadIds(inputIds);
-    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, idsPtr, hs, BS);
-    glm.freeBuf(idsPtr);
+    const flat = new Int32Array(B * S);
+    for (let b = 0; b < B; b++) {
+      for (let s = 0; s < S; s++) {
+        flat[b * S + s] = inputIds[b][s];
+      }
+    }
+    glm.h2d(this.ws.inputIdsBuf, Buffer.from(flat.buffer, flat.byteOffset, flat.byteLength));
+    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
 
     glm.arange(this.ws.positionIds, 0, 1, S);
     glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, B, S);
@@ -533,11 +524,9 @@ export class Qwen3Model {
     const allIds: number[] = [];
     for (const ids of inputIdsList) allIds.push(...ids);
     const idsBuf = Int32Array.from(allIds);
-    const idsPtr = glm.alloc(idsBuf.byteLength);
-    glm.h2d(idsPtr, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+    glm.h2d(this.ws.inputIdsBuf, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
 
-    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, idsPtr, hs, totalTokens);
-    glm.freeBuf(idsPtr);
+    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, totalTokens);
 
     const qoIndptr = [0];
     const kvIndptr = [0];
@@ -672,11 +661,9 @@ export class Qwen3Model {
     pagedKV.updateIndptr();
 
     const idsBuf = Int32Array.from(tokenIdsList);
-    const idsPtr = glm.alloc(idsBuf.byteLength);
-    glm.h2d(idsPtr, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+    glm.h2d(this.ws.inputIdsBuf, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
 
-    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, idsPtr, hs, batchSize);
-    glm.freeBuf(idsPtr);
+    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, batchSize);
 
     const posIds = new Array(batchSize);
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {

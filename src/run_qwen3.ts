@@ -1,13 +1,13 @@
 import { GlmOps } from "./glm_ops.js";
 import { Qwen3Model } from "./qwen3_model.js";
-import { AutoTokenizer } from "@huggingface/transformers";
+import { AutoTokenizer, PreTrainedTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path.js";
 import { createInterface } from "node:readline";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const EOS_TOKEN_IDS = new Set([151645, 151643]);
 
-async function chatLoop(model: Qwen3Model, tokenizer: any, maxNewTokens: number, noThink: boolean): Promise<void> {
+async function chatLoop(model: Qwen3Model, tokenizer: PreTrainedTokenizer, maxNewTokens: number, noThink: boolean): Promise<void> {
   const messages: Array<{ role: string; content: string }> = [];
   const enableThinking = !noThink;
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -28,26 +28,17 @@ async function chatLoop(model: Qwen3Model, tokenizer: any, maxNewTokens: number,
 
     messages.push({ role: "user", content: userInput });
 
-    let inputIds: number[];
-    try {
-      const result = tokenizer.apply_chat_template(messages, {
-        tokenize: true,
-        add_generation_prompt: true,
-        enable_thinking: enableThinking,
-        return_tensor: false,
-      });
-      inputIds = result.input_ids;
-    } catch {
-      const result = tokenizer.apply_chat_template(messages, {
-        tokenize: true,
-        add_generation_prompt: true,
-        return_tensor: false,
-      });
-      inputIds = result.input_ids;
-    }
+    const result = tokenizer.apply_chat_template(messages, {
+      tokenize: true,
+      add_generation_prompt: true,
+      return_tensor: false,
+      return_dict: true,
+      tokenizer_kwargs: { enable_thinking: enableThinking },
+    }) as { input_ids: number[] | number[][] };
+    const inputIds = (Array.isArray(result.input_ids[0]) ? result.input_ids : [result.input_ids]) as number[][];
 
-    if (inputIds.length > model.maxSeqLen) {
-      console.log(`Prompt (${inputIds.length} tokens) exceeds max_seq_len (${model.maxSeqLen}). Truncating conversation.`);
+    if (inputIds[0].length > model.maxSeqLen) {
+      console.log(`Prompt (${inputIds[0].length} tokens) exceeds max_seq_len (${model.maxSeqLen}). Truncating conversation.`);
       messages.pop();
       continue;
     }
@@ -57,7 +48,7 @@ async function chatLoop(model: Qwen3Model, tokenizer: any, maxNewTokens: number,
     const start = Date.now();
     let tokenCount = 0;
 
-    for (const tokenId of model.streamTokens([inputIds], maxNewTokens, EOS_TOKEN_IDS)) {
+    for (const tokenId of model.streamTokens(inputIds, maxNewTokens, EOS_TOKEN_IDS)) {
       generatedIds.push(tokenId);
       tokenCount++;
       const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });

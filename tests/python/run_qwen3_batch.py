@@ -38,7 +38,7 @@ def main():
     n_layers = cfg.num_hidden_layers
 
     ws = WorkspaceBuffers(glm)
-    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, args.max_pages)
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, args.max_pages, max_batch=1)
 
     enable_thinking = not args.no_think
 

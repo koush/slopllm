@@ -13,6 +13,7 @@ export class PagedKVCache {
   readonly hd: number;
   readonly nLayers: number;
   readonly maxPages: number;
+  readonly maxBatch: number;
   readonly pageSize: number;
   readonly pageStride: number;
   kData: number[];
@@ -26,12 +27,13 @@ export class PagedKVCache {
   seqPages: number[][];
   seqKvLens: number[];
 
-  constructor(glm: GlmOps, nKv: number, hd: number, nLayers: number, maxPages: number, pageSize = PAGE_SIZE) {
+  constructor(glm: GlmOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE) {
     this.glm = glm;
     this.nKv = nKv;
     this.hd = hd;
     this.nLayers = nLayers;
     this.maxPages = maxPages;
+    this.maxBatch = maxBatch;
     this.pageSize = pageSize;
     this.pageStride = nKv * pageSize * hd * BF16;
     this.kData = [];
@@ -41,10 +43,10 @@ export class PagedKVCache {
       this.vData.push(glm.alloc(maxPages * nKv * pageSize * hd * BF16));
     }
     this.indices = glm.alloc(maxPages * I32);
-    this.indptrD = 0;
-    this.lastPageLen = 0;
-    this.indptrH = 0;
-    this.lastPageLenH = 0;
+    this.indptrD = glm.alloc((maxBatch + 1) * I32);
+    this.lastPageLen = glm.alloc(maxBatch * I32);
+    this.indptrH = glm.allocPinned((maxBatch + 1) * I32);
+    this.lastPageLenH = glm.allocPinned(maxBatch * I32);
     this.numPagesUsed = 0;
     this.seqPages = [];
     this.seqKvLens = [];
@@ -55,29 +57,21 @@ export class PagedKVCache {
     for (const ptr of this.kData) glm.freeBuf(ptr);
     for (const ptr of this.vData) glm.freeBuf(ptr);
     glm.freeBuf(this.indices);
-    if (this.indptrD) glm.freeBuf(this.indptrD);
-    if (this.lastPageLen) glm.freeBuf(this.lastPageLen);
-    if (this.indptrH) glm.freePinned(this.indptrH);
-    if (this.lastPageLenH) glm.freePinned(this.lastPageLenH);
+    glm.freeBuf(this.indptrD);
+    glm.freeBuf(this.lastPageLen);
+    glm.freePinned(this.indptrH);
+    glm.freePinned(this.lastPageLenH);
     this.kData = [];
     this.vData = [];
   }
 
   reset(batchSize: number): void {
+    if (batchSize > this.maxBatch) {
+      throw new Error(`batchSize ${batchSize} exceeds maxBatch ${this.maxBatch}`);
+    }
     this.numPagesUsed = 0;
     this.seqPages = Array.from({ length: batchSize }, () => []);
     this.seqKvLens = new Array(batchSize).fill(0);
-
-    const glm = this.glm;
-    if (this.indptrD) glm.freeBuf(this.indptrD);
-    if (this.lastPageLen) glm.freeBuf(this.lastPageLen);
-    if (this.indptrH) glm.freePinned(this.indptrH);
-    if (this.lastPageLenH) glm.freePinned(this.lastPageLenH);
-
-    this.indptrD = glm.alloc((batchSize + 1) * I32);
-    this.lastPageLen = glm.alloc(batchSize * I32);
-    this.indptrH = glm.allocPinned((batchSize + 1) * I32);
-    this.lastPageLenH = glm.allocPinned(batchSize * I32);
   }
 
   allocPrefillPages(seqIdx: number, seqLen: number): [number, number] {

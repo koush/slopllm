@@ -15,6 +15,7 @@ async function main(): Promise<void> {
   let gpu: number | undefined;
   let maxSeqLen = 2048;
   let maxPages = 128;
+  let maxBatch = 4;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--max-tokens" && i + 1 < args.length) {
@@ -27,6 +28,8 @@ async function main(): Promise<void> {
       maxSeqLen = parseInt(args[++i], 10);
     } else if (args[i] === "--max-pages" && i + 1 < args.length) {
       maxPages = parseInt(args[++i], 10);
+    } else if (args[i] === "--max-batch" && i + 1 < args.length) {
+      maxBatch = parseInt(args[++i], 10);
     }
   }
 
@@ -46,7 +49,7 @@ async function main(): Promise<void> {
   const nLayers = cfg.numHiddenLayers;
 
   const ws = new WorkspaceBuffers(glm);
-  const pagedKV = new PagedKVCache(glm, nKv, hd, nLayers, maxPages);
+  const pagedKV = new PagedKVCache(glm, nKv, hd, nLayers, maxPages, maxBatch);
 
   const enableThinking = !noThink;
 
@@ -82,23 +85,14 @@ async function main(): Promise<void> {
       const inputIdsList: number[][] = [];
       for (const prompt of prompts) {
         const messages = [{ role: "user" as const, content: prompt }];
-        let ids: number[];
-        try {
-          const result: any = tokenizer.apply_chat_template(messages as any, {
-            tokenize: true,
-            add_generation_prompt: true,
-            enable_thinking: enableThinking,
-            return_tensor: false,
-          } as any);
-          ids = result.input_ids;
-        } catch {
-          const result: any = tokenizer.apply_chat_template(messages as any, {
-            tokenize: true,
-            add_generation_prompt: true,
-            return_tensor: false,
-          } as any);
-          ids = result.input_ids;
-        }
+        const result = tokenizer.apply_chat_template(messages as any, {
+          tokenize: true,
+          add_generation_prompt: true,
+          return_tensor: false,
+          return_dict: true,
+          tokenizer_kwargs: { enable_thinking: enableThinking },
+        }) as { input_ids: number[] | number[][] };
+        const ids = (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
         inputIdsList.push(ids);
       }
 
