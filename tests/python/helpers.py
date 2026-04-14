@@ -429,6 +429,16 @@ class GlmOps:
         self.lib.glm_graph_exec_destroy.restype = None
         self.lib.glm_graph_exec_destroy.argtypes = [ctypes.c_void_p]
 
+        self.lib.glm_kv_cache_write.restype = None
+        self.lib.glm_kv_cache_write.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+        ]
+
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
             self.lib.glm_free(self.ctx)
@@ -911,3 +921,15 @@ class GlmOps:
 
     def graph_exec_destroy(self, graph_exec):
         self.lib.glm_graph_exec_destroy(ctypes.c_void_p(graph_exec))
+
+    def kv_cache_write(self, src_k, src_v, dst_k, dst_v, slot_mapping,
+                        batch_size, n_kv, hd, page_size):
+        self.lib.glm_kv_cache_write(
+            self.ctx,
+            ctypes.c_void_p(src_k), ctypes.c_void_p(src_v),
+            ctypes.c_void_p(dst_k), ctypes.c_void_p(dst_v),
+            ctypes.c_void_p(slot_mapping),
+            ctypes.c_uint32(batch_size), ctypes.c_uint32(n_kv),
+            ctypes.c_uint32(hd), ctypes.c_uint32(page_size)
+        )
+        self.synchronize()

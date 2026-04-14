@@ -593,6 +593,7 @@ export class Qwen3Model {
     }
 
     pagedKV.updateIndptr();
+    pagedKV.updateSlotMapping(writeLocations, pageSize);
 
     const idsBuf = Int32Array.from(tokenIdsList);
     glm.h2d(this.ws.inputIdsBuf, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
@@ -624,18 +625,12 @@ export class Qwen3Model {
 
       this.computeQkv(pfx, batchSize, batchSize, 1);
 
-      // Write KV to paged cache
-      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-        const [absPage, slotInPage] = writeLocations[seqIdx];
-        for (let h = 0; h < nKv; h++) {
-          const pageOffset = absPage * nKv * pageSize * hd;
-          const kvHeadOffset = pageOffset + h * pageSize * hd;
-          const tokenOffset = kvHeadOffset + slotInPage * hd;
-          const srcOff = (seqIdx * nKv + h) * hd * BF16;
-          glm.memcpy(pagedKV.kData[i] + tokenOffset * BF16, this.ws.kRope + srcOff, hd * BF16);
-          glm.memcpy(pagedKV.vData[i] + tokenOffset * BF16, this.ws.vT + srcOff, hd * BF16);
-        }
-      }
+      glm.kvCacheWrite(
+        this.ws.kRope, this.ws.vT,
+        pagedKV.kData[i], pagedKV.vData[i],
+        pagedKV.slotMapping,
+        batchSize, nKv, hd, pageSize
+      );
 
       glm.batchDecodeRun(
         this.ws.qRope, this.ws.flashOut,

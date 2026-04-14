@@ -22,6 +22,8 @@ export class PagedKVCache {
   lastPageLen: number;
   indptrH: number;
   lastPageLenH: number;
+  slotMapping: number;
+  slotMappingH: number;
   numPagesUsed: number;
   seqPages: number[][];
   seqKvLens: number[];
@@ -45,6 +47,8 @@ export class PagedKVCache {
     this.lastPageLen = glm.alloc(maxBatch * I32);
     this.indptrH = glm.allocPinned((maxBatch + 1) * I32);
     this.lastPageLenH = glm.allocPinned(maxBatch * I32);
+    this.slotMapping = glm.alloc(maxBatch * I32);
+    this.slotMappingH = glm.allocPinned(maxBatch * I32);
     this.numPagesUsed = 0;
     this.seqPages = [];
     this.seqKvLens = [];
@@ -59,6 +63,8 @@ export class PagedKVCache {
     glm.freeBuf(this.lastPageLen);
     glm.freePinned(this.indptrH);
     glm.freePinned(this.lastPageLenH);
+    glm.freeBuf(this.slotMapping);
+    glm.freePinned(this.slotMappingH);
     this.kData = [];
     this.vData = [];
   }
@@ -123,6 +129,17 @@ export class PagedKVCache {
     this.glm.h2d(this.indices, Buffer.from(indicesBuf.buffer, indicesBuf.byteOffset, indicesBuf.byteLength));
     this.glm.h2d(this.indptrD, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
     this.glm.h2d(this.lastPageLen, Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
+  }
+
+  updateSlotMapping(writeLocations: [number, number][], pageSize: number): void {
+    const batchSize = writeLocations.length;
+    const slotMappingBuf = new Int32Array(batchSize);
+    for (let i = 0; i < batchSize; i++) {
+      const [absPage, slotInPage] = writeLocations[i];
+      slotMappingBuf[i] = absPage * pageSize + slotInPage;
+    }
+    this.glm.writePinned(this.slotMappingH, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+    this.glm.h2d(this.slotMapping, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
   }
 }
 

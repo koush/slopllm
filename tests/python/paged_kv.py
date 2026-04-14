@@ -28,6 +28,8 @@ class PagedKVCache:
         self.last_page_len = glm.alloc(max_batch * I32)
         self.indptr_h = glm.alloc_pinned((max_batch + 1) * I32)
         self.last_page_len_h = glm.alloc_pinned(max_batch * I32)
+        self.slot_mapping = glm.alloc(max_batch * I32)
+        self.slot_mapping_h = glm.alloc_pinned(max_batch * I32)
         self.num_pages_used = 0
         self.seq_pages = []
         self.seq_kv_lens = []
@@ -43,6 +45,8 @@ class PagedKVCache:
         glm.free_buf(self.last_page_len)
         glm.free_pinned(self.indptr_h)
         glm.free_pinned(self.last_page_len_h)
+        glm.free_buf(self.slot_mapping)
+        glm.free_pinned(self.slot_mapping_h)
         self.k_data = []
         self.v_data = []
 
@@ -107,6 +111,15 @@ class PagedKVCache:
         self.glm.h2d(self.indices, indices_np.tobytes())
         self.glm.h2d(self.indptr_d, indptr_np.tobytes())
         self.glm.h2d(self.last_page_len, last_page_len_np.tobytes())
+
+    def update_slot_mapping(self, write_locations, page_size):
+        batch_size = len(write_locations)
+        slot_mapping_np = np.array([
+            abs_page * page_size + slot_in_page
+            for abs_page, slot_in_page in write_locations
+        ], dtype=np.int32)
+        ctypes.memmove(self.slot_mapping_h, slot_mapping_np.tobytes(), batch_size * I32)
+        self.glm.h2d(self.slot_mapping, slot_mapping_np.tobytes())
 
 
 class WorkspaceBuffers:

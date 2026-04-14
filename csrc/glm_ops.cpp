@@ -628,6 +628,32 @@ static Napi::Value Argmax(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value KvCacheWrite(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 10) {
+        Napi::TypeError::New(env, "Expected (ctx, src_k, src_v, dst_k, dst_v, slot_mapping, batch_size, n_kv, hd, page_size)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t src_k_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t src_v_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t dst_k_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t dst_v_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t slot_ptr = info[5].As<Napi::Number>().Int64Value();
+    uint32_t batch_size = info[6].As<Napi::Number>().Uint32Value();
+    uint32_t n_kv = info[7].As<Napi::Number>().Uint32Value();
+    uint32_t hd = info[8].As<Napi::Number>().Uint32Value();
+    uint32_t page_size = info[9].As<Napi::Number>().Uint32Value();
+    glm_kv_cache_write(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                        reinterpret_cast<void*>(src_k_ptr),
+                        reinterpret_cast<void*>(src_v_ptr),
+                        reinterpret_cast<void*>(dst_k_ptr),
+                        reinterpret_cast<void*>(dst_v_ptr),
+                        reinterpret_cast<int32_t*>(slot_ptr),
+                        batch_size, n_kv, hd, page_size);
+    return env.Undefined();
+}
+
 static Napi::Value Memcpy(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 4) {
@@ -1089,6 +1115,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "arange"), Napi::Function::New(env, Arange));
     exports.Set(Napi::String::New(env, "argmax"), Napi::Function::New(env, Argmax));
     exports.Set(Napi::String::New(env, "memcpy"), Napi::Function::New(env, Memcpy));
+    exports.Set(Napi::String::New(env, "kvCacheWrite"), Napi::Function::New(env, KvCacheWrite));
     exports.Set(Napi::String::New(env, "synchronize"), Napi::Function::New(env, Synchronize));
     exports.Set(Napi::String::New(env, "expandDim1Strided"), Napi::Function::New(env, ExpandDim1Strided));
     exports.Set(Napi::String::New(env, "flashPrefill"), Napi::Function::New(env, FlashPrefill));

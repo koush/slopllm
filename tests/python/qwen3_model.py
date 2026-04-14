@@ -880,6 +880,7 @@ class Qwen3Model:
             write_locations.append((abs_page, slot_in_page))
 
         paged_kv.update_indptr()
+        paged_kv.update_slot_mapping(write_locations, page_size)
 
         all_ids = token_ids_list
         ids_np = np.array(all_ids, dtype=np.int32)
@@ -916,19 +917,11 @@ class Qwen3Model:
 
             self._compute_qkv(pfx, batch_size, batch_size, 1)
 
-            for seq_idx in range(batch_size):
-                abs_page, slot_in_page = write_locations[seq_idx]
-                for h in range(n_kv):
-                    page_offset = abs_page * n_kv * page_size * hd
-                    kv_head_offset = page_offset + h * page_size * hd
-                    token_offset = kv_head_offset + slot_in_page * hd
-                    src_off = (seq_idx * n_kv + h) * hd * BF16
-                    glm.memcpy(paged_kv.k_data[i] + token_offset * BF16,
-                                self._ws["k_rope"] + src_off,
-                                hd * BF16)
-                    glm.memcpy(paged_kv.v_data[i] + token_offset * BF16,
-                                self._ws["v_t"] + src_off,
-                                hd * BF16)
+            glm.kv_cache_write(
+                self._ws["k_rope"], self._ws["v_t"],
+                paged_kv.k_data[i], paged_kv.v_data[i],
+                paged_kv.slot_mapping,
+                batch_size, n_kv, hd, page_size)
 
             glm.batch_decode_run(
                 self._ws["q_rope"], self._ws["flash_out"],

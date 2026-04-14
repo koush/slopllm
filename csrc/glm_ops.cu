@@ -1236,6 +1236,59 @@ void glm_arange(GlmCtx* ctx, int* out, int start, int step, int count) {
 }
 
 // ---------------------------------------------------------------------------
+// KV cache write kernel (vLLM-style slot_mapping scatter)
+// src_k, src_v: [batch, n_kv, hd] contiguous BF16
+// dst_k, dst_v: [max_pages, n_kv, page_size, hd] BF16
+// slot_mapping: [batch] int32 — slot = page * page_size + slot_in_page, -1 = skip
+// ---------------------------------------------------------------------------
+
+__global__ void kv_cache_write_kernel(
+    __nv_bfloat16* dst_k,
+    __nv_bfloat16* dst_v,
+    const __nv_bfloat16* src_k,
+    const __nv_bfloat16* src_v,
+    const int32_t* slot_mapping,
+    uint32_t n_kv,
+    uint32_t page_size,
+    uint32_t hd
+) {
+    int token = blockIdx.x;
+    int h = blockIdx.y;
+    if (token >= gridDim.x || h >= gridDim.y) return;
+
+    int32_t slot = slot_mapping[token];
+    if (slot < 0) return;
+
+    int32_t page = slot / (int32_t)page_size;
+    int32_t slot_in_page = slot % (int32_t)page_size;
+
+    int64_t dst_off = (int64_t)page * n_kv * page_size * hd
+                     + (int64_t)h * page_size * hd
+                     + (int64_t)slot_in_page * hd;
+    int64_t src_off = ((int64_t)token * n_kv + h) * hd;
+
+    for (int d = threadIdx.x; d < (int)hd; d += blockDim.x) {
+        dst_k[dst_off + d] = src_k[src_off + d];
+        dst_v[dst_off + d] = src_v[src_off + d];
+    }
+}
+
+void glm_kv_cache_write(GlmCtx* ctx,
+                          void* src_k, void* src_v,
+                          void* dst_k, void* dst_v,
+                          int32_t* slot_mapping,
+                          uint32_t batch_size, uint32_t n_kv,
+                          uint32_t hd, uint32_t page_size) {
+    cudaSetDevice(ctx->device_id);
+    dim3 grid(batch_size, n_kv);
+    dim3 block(hd);
+    kv_cache_write_kernel<<<grid, block, 0, ctx->stream>>>(
+        (__nv_bfloat16*)dst_k, (__nv_bfloat16*)dst_v,
+        (const __nv_bfloat16*)src_k, (const __nv_bfloat16*)src_v,
+        slot_mapping, n_kv, page_size, hd);
+}
+
+// ---------------------------------------------------------------------------
 // Device-to-device memory copy
 // ---------------------------------------------------------------------------
 

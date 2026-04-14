@@ -117,6 +117,13 @@ void glm_argmax(GlmCtx* ctx, int* out_index, const void* input, int dim, int bat
 
 void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes);
 
+void glm_kv_cache_write(GlmCtx* ctx,
+                         void* src_k, void* src_v,
+                         void* dst_k, void* dst_v,
+                         int32_t* slot_mapping,
+                         uint32_t batch_size, uint32_t n_kv,
+                         uint32_t hd, uint32_t page_size);
+
 void glm_synchronize(GlmCtx* ctx);
 
 void glm_flash_prefill(
