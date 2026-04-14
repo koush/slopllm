@@ -863,8 +863,8 @@ static Napi::Value BatchDecodePlan(const Napi::CallbackInfo& info) {
 
 static Napi::Value BatchDecodeRun(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 12) {
-        Napi::TypeError::New(env, "Expected (ctx, q, o, k_data, v_data, indices, indptr_d, last_page_len, float_ws, int_ws, plan_info, num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale)").ThrowAsJavaScriptException();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, q, o, k_data, v_data, indices, indptr_d, last_page_len, float_ws, int_ws, plan_info, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -878,11 +878,12 @@ static Napi::Value BatchDecodeRun(const Napi::CallbackInfo& info) {
     uintptr_t float_ws_ptr = info[8].As<Napi::Number>().Int64Value();
     uintptr_t int_ws_ptr = info[9].As<Napi::Number>().Int64Value();
     uintptr_t plan_info_ptr = info[10].As<Napi::Number>().Int64Value();
-    uint32_t num_qo_heads = info[11].As<Napi::Number>().Uint32Value();
-    uint32_t num_kv_heads = info[12].As<Napi::Number>().Uint32Value();
-    uint32_t head_dim = info[13].As<Napi::Number>().Uint32Value();
-    uint32_t page_size = info[14].As<Napi::Number>().Uint32Value();
-    float sm_scale = info[15].As<Napi::Number>().FloatValue();
+    uint32_t batch_size = info[11].As<Napi::Number>().Uint32Value();
+    uint32_t num_qo_heads = info[12].As<Napi::Number>().Uint32Value();
+    uint32_t num_kv_heads = info[13].As<Napi::Number>().Uint32Value();
+    uint32_t head_dim = info[14].As<Napi::Number>().Uint32Value();
+    uint32_t page_size = info[15].As<Napi::Number>().Uint32Value();
+    float sm_scale = info[16].As<Napi::Number>().FloatValue();
     glm_batch_decode_run(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(q_ptr), reinterpret_cast<void*>(o_ptr),
@@ -892,7 +893,7 @@ static Napi::Value BatchDecodeRun(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(last_page_len_ptr),
         reinterpret_cast<void*>(float_ws_ptr), reinterpret_cast<void*>(int_ws_ptr),
         reinterpret_cast<int64_t*>(plan_info_ptr),
-        num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale);
+        batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale);
     return env.Undefined();
 }
 

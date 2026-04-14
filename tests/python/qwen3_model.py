@@ -932,6 +932,7 @@ class Qwen3Model:
                 paged_kv.indices, paged_kv.indptr_d, paged_kv.last_page_len,
                 ws.float_ws, ws.int_ws,
                 ws.decode_plan_info,
+                batch_size,
                 n_heads, n_kv, hd, page_size, cfg.scaling
             )
 

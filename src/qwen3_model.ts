@@ -709,6 +709,7 @@ export class Qwen3Model {
         pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
         ws.floatWs, ws.intWs,
         ws.decodePlanInfo,
+        batchSize,
         nHeads, nKv, hd, pageSize, cfg.scaling
       );
 

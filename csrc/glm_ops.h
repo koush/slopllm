@@ -159,6 +159,7 @@ void glm_batch_decode_run(
     int32_t* indices, int32_t* indptr_d, int32_t* last_page_len,
     void* float_ws, void* int_ws,
     int64_t* plan_info,
+    uint32_t batch_size,
     uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim, uint32_t page_size, float sm_scale);
 

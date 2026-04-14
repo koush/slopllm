@@ -376,6 +376,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p,
+            ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_float,
@@ -808,6 +809,7 @@ class GlmOps:
     def batch_decode_run(self, q, o, k_data, v_data,
                          indices, indptr_d, last_page_len,
                          float_ws, int_ws, plan_info,
+                         batch_size,
                          num_qo_heads, num_kv_heads,
                          head_dim, page_size, sm_scale):
         self.lib.glm_batch_decode_run(
@@ -817,6 +819,7 @@ class GlmOps:
             ctypes.c_void_p(indices), ctypes.c_void_p(indptr_d), ctypes.c_void_p(last_page_len),
             ctypes.c_void_p(float_ws), ctypes.c_void_p(int_ws),
             ctypes.c_void_p(plan_info),
+            ctypes.c_uint32(batch_size),
             ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads),
             ctypes.c_uint32(head_dim), ctypes.c_uint32(page_size),
             ctypes.c_float(sm_scale)

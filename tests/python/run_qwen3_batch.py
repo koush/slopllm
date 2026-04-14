@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=None, help="GPU device ID")
     parser.add_argument("--max-seq-len", type=int, default=2048, help="Max sequence length")
     parser.add_argument("--max-pages", type=int, default=128, help="Max pages for paged KV cache")
+    parser.add_argument("--max-batch", type=int, default=4, help="Max batch size")
     args = parser.parse_args()
 
     gpu_id = args.gpu if args.gpu is not None else int(os.environ.get("GLM_GPU", "0"))
@@ -29,7 +30,7 @@ def main():
 
     print(f"Loading model on GPU {gpu_id}...")
     glm = GlmOps(device_id=0)
-    model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=1, max_seq_len=args.max_seq_len)
+    model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=args.max_batch, max_seq_len=args.max_seq_len)
     tokenizer = AutoTokenizer.from_pretrained(QWEN3_REPO)
 
     cfg = model.cfg
@@ -38,7 +39,7 @@ def main():
     n_layers = cfg.num_hidden_layers
 
     ws = WorkspaceBuffers(glm)
-    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, args.max_pages, max_batch=1)
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, args.max_pages, max_batch=args.max_batch)
 
     enable_thinking = not args.no_think
 
