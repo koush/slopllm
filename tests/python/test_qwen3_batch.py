@@ -198,3 +198,57 @@ def test_batch_generate_vs_single(glm, qwen3_model, ws):
     finally:
         paged_kv.free()
         flat_cache.free()
+
+
+def test_cuda_graph_decode(glm, qwen3_model, ws):
+    model = qwen3_model
+    cfg = model.cfg
+    n_kv = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    n_layers = cfg.num_hidden_layers
+    max_pages = 128
+
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
+    try:
+        prompt = [151643, 151644, 151645, 1, 2988, 279, 1716, 364]
+
+        # Step 1: Normal decode to get reference tokens
+        tokens = model.prefill_batch([prompt], ws, paged_kv)
+        state_ref = model.decode_batch_plan([tokens[0]], ws, paged_kv,
+                                             enable_cuda_graph=True)
+        model.decode_batch_forward(state_ref, ws, paged_kv)
+        tokens_ref = model.decode_batch_read(state_ref)
+        print(f"  Reference tokens: {tokens_ref}")
+
+        # Step 2: Capture the decode forward pass
+        # Note: during capture, kernels are NOT executed — only recorded
+        paged_kv.reset(1)
+        tokens2 = model.prefill_batch([prompt], ws, paged_kv)
+        state = model.decode_batch_plan([tokens2[0]], ws, paged_kv,
+                                         enable_cuda_graph=True)
+        glm.graph_begin_capture()
+        model.decode_batch_forward(state, ws, paged_kv)
+        graph = glm.graph_end_capture()
+        assert graph is not None and graph != 0, "graph_end_capture returned null"
+        graph_exec = glm.graph_instantiate(graph)
+        assert graph_exec is not None and graph_exec != 0, "graph_instantiate returned null"
+
+        # Step 3: Replay the captured graph and compare against reference
+        paged_kv.reset(1)
+        tokens3 = model.prefill_batch([prompt], ws, paged_kv)
+        state2 = model.decode_batch_plan([tokens3[0]], ws, paged_kv,
+                                          enable_cuda_graph=True)
+
+        glm.graph_launch(graph_exec)
+        glm.synchronize()
+
+        tokens_replay = model.decode_batch_read(state2)
+        print(f"  Replay tokens:    {tokens_replay}")
+
+        assert tokens_replay == tokens_ref, \
+            f"Graph replay mismatch: replay={tokens_replay}, ref={tokens_ref}"
+
+        glm.graph_exec_destroy(graph_exec)
+        glm.graph_destroy(graph)
+    finally:
+        paged_kv.free()
