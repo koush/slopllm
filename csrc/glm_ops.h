@@ -185,6 +185,15 @@ void glm_batch_prefill_ragged_run(
     uint32_t kv_stride_n, uint32_t kv_stride_h,
     int mask_mode, float sm_scale);
 
+// CUDA Graph operations
+void glm_graph_begin_capture(GlmCtx* ctx);
+void* glm_graph_end_capture(GlmCtx* ctx);
+void* glm_graph_instantiate(void* graph);
+void glm_graph_launch(void* graph_exec, GlmCtx* ctx);
+int glm_graph_exec_update(void* graph_exec, void* graph);
+void glm_graph_destroy(void* graph);
+void glm_graph_exec_destroy(void* graph_exec);
+
 #ifdef __cplusplus
 }
 #endif

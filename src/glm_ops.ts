@@ -47,6 +47,13 @@ interface NativeAddon {
   batchDecodeRun(ctx: number, q: number, o: number, kData: number, vData: number, indices: number, indptrD: number, lastPageLen: number, floatWs: number, intWs: number, planInfo: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, smScale: number): void;
   batchPrefillRaggedPlan(ctx: number, floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, qoIndptrH: number, kvIndptrH: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, maskMode: number): void;
   batchPrefillRaggedRun(ctx: number, q: number, k: number, v: number, o: number, floatWs: number, intWs: number, qIndptrD: number, kvIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, maskMode: number, smScale: number): void;
+  graphBeginCapture(ctx: number): void;
+  graphEndCapture(ctx: number): number;
+  graphInstantiate(graph: number): number;
+  graphLaunch(graphExec: number, ctx: number): void;
+  graphExecUpdate(graphExec: number, graph: number): number;
+  graphDestroy(graph: number): void;
+  graphExecDestroy(graphExec: number): void;
   mmapOpen(path: string): number;
   mmapLoad(ctx: number, gpuDst: number, mmapPtr: number, offset: number, nbytes: number): void;
   mmapClose(mmapPtr: number, size: number): void;
@@ -215,6 +222,34 @@ export class GlmOps {
 
   mmapClose(mmapPtr: number, size: number): void {
     this.native.mmapClose(mmapPtr, size);
+  }
+
+  graphBeginCapture(): void {
+    this.native.graphBeginCapture(this.ctx);
+  }
+
+  graphEndCapture(): number {
+    return this.native.graphEndCapture(this.ctx);
+  }
+
+  graphInstantiate(graph: number): number {
+    return this.native.graphInstantiate(graph);
+  }
+
+  graphLaunch(graphExec: number): void {
+    this.native.graphLaunch(graphExec, this.ctx);
+  }
+
+  graphExecUpdate(graphExec: number, graph: number): number {
+    return this.native.graphExecUpdate(graphExec, graph);
+  }
+
+  graphDestroy(graph: number): void {
+    this.native.graphDestroy(graph);
+  }
+
+  graphExecDestroy(graphExec: number): void {
+    this.native.graphExecDestroy(graphExec);
   }
 }
 

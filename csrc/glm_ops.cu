@@ -1250,3 +1250,51 @@ void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes) {
 void glm_synchronize(GlmCtx* ctx) {
     cudaStreamSynchronize(ctx->stream);
 }
+
+// ---------------------------------------------------------------------------
+// CUDA Graph operations
+// ---------------------------------------------------------------------------
+
+void glm_graph_begin_capture(GlmCtx* ctx) {
+    cudaSetDevice(ctx->device_id);
+    cudaStreamBeginCapture(ctx->stream, cudaStreamCaptureModeGlobal);
+}
+
+void* glm_graph_end_capture(GlmCtx* ctx) {
+    cudaSetDevice(ctx->device_id);
+    cudaGraph_t graph = nullptr;
+    cudaStreamEndCapture(ctx->stream, &graph);
+    return reinterpret_cast<void*>(graph);
+}
+
+void* glm_graph_instantiate(void* graph) {
+    cudaGraphExec_t graph_exec = nullptr;
+    cudaGraphInstantiate(&graph_exec, reinterpret_cast<cudaGraph_t>(graph), nullptr, nullptr, 0);
+    return reinterpret_cast<void*>(graph_exec);
+}
+
+void glm_graph_launch(void* graph_exec, GlmCtx* ctx) {
+    cudaSetDevice(ctx->device_id);
+    cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(graph_exec), ctx->stream);
+}
+
+int glm_graph_exec_update(void* graph_exec, void* graph) {
+    cudaGraphNode_t error_node = nullptr;
+    cudaGraphExecUpdateResult result = cudaGraphExecUpdateSuccess;
+    cudaGraphExecUpdate(reinterpret_cast<cudaGraphExec_t>(graph_exec),
+                        reinterpret_cast<cudaGraph_t>(graph),
+                        &error_node, &result);
+    return (result == cudaGraphExecUpdateSuccess) ? 0 : 1;
+}
+
+void glm_graph_destroy(void* graph) {
+    if (graph) {
+        cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(graph));
+    }
+}
+
+void glm_graph_exec_destroy(void* graph_exec) {
+    if (graph_exec) {
+        cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(graph_exec));
+    }
+}

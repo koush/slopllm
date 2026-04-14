@@ -408,6 +408,27 @@ class GlmOps:
             ctypes.c_int32, ctypes.c_float,
         ]
 
+        self.lib.glm_graph_begin_capture.restype = None
+        self.lib.glm_graph_begin_capture.argtypes = [ctypes.c_void_p]
+
+        self.lib.glm_graph_end_capture.restype = ctypes.c_void_p
+        self.lib.glm_graph_end_capture.argtypes = [ctypes.c_void_p]
+
+        self.lib.glm_graph_instantiate.restype = ctypes.c_void_p
+        self.lib.glm_graph_instantiate.argtypes = [ctypes.c_void_p]
+
+        self.lib.glm_graph_launch.restype = None
+        self.lib.glm_graph_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        self.lib.glm_graph_exec_update.restype = ctypes.c_int
+        self.lib.glm_graph_exec_update.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        self.lib.glm_graph_destroy.restype = None
+        self.lib.glm_graph_destroy.argtypes = [ctypes.c_void_p]
+
+        self.lib.glm_graph_exec_destroy.restype = None
+        self.lib.glm_graph_exec_destroy.argtypes = [ctypes.c_void_p]
+
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
             self.lib.glm_free(self.ctx)
@@ -866,3 +887,27 @@ class GlmOps:
             ctypes.c_int32(mask_mode), ctypes.c_float(sm_scale)
         )
         self.synchronize()
+
+    def graph_begin_capture(self):
+        self.lib.glm_graph_begin_capture(self.ctx)
+
+    def graph_end_capture(self):
+        ptr = self.lib.glm_graph_end_capture(self.ctx)
+        return ptr.value if hasattr(ptr, 'value') else ptr
+
+    def graph_instantiate(self, graph):
+        ptr = self.lib.glm_graph_instantiate(ctypes.c_void_p(graph))
+        return ptr.value if hasattr(ptr, 'value') else ptr
+
+    def graph_launch(self, graph_exec):
+        self.lib.glm_graph_launch(ctypes.c_void_p(graph_exec), self.ctx)
+        self.synchronize()
+
+    def graph_exec_update(self, graph_exec, graph):
+        return self.lib.glm_graph_exec_update(ctypes.c_void_p(graph_exec), ctypes.c_void_p(graph))
+
+    def graph_destroy(self, graph):
+        self.lib.glm_graph_destroy(ctypes.c_void_p(graph))
+
+    def graph_exec_destroy(self, graph_exec):
+        self.lib.glm_graph_exec_destroy(ctypes.c_void_p(graph_exec))

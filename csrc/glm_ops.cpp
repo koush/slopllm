@@ -972,6 +972,87 @@ static Napi::Value BatchPrefillRaggedRun(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value GraphBeginCapture(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1) {
+        Napi::TypeError::New(env, "Expected (ctx)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    glm_graph_begin_capture(reinterpret_cast<GlmCtx*>(ctx_ptr));
+    return env.Undefined();
+}
+
+static Napi::Value GraphEndCapture(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1) {
+        Napi::TypeError::New(env, "Expected (ctx)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    void* graph = glm_graph_end_capture(reinterpret_cast<GlmCtx*>(ctx_ptr));
+    return Napi::Number::New(env, reinterpret_cast<uintptr_t>(graph));
+}
+
+static Napi::Value GraphInstantiate(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1) {
+        Napi::TypeError::New(env, "Expected (graph)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t graph_ptr = info[0].As<Napi::Number>().Int64Value();
+    void* graph_exec = glm_graph_instantiate(reinterpret_cast<void*>(graph_ptr));
+    return Napi::Number::New(env, reinterpret_cast<uintptr_t>(graph_exec));
+}
+
+static Napi::Value GraphLaunch(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (graph_exec, ctx)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t graph_exec_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t ctx_ptr = info[1].As<Napi::Number>().Int64Value();
+    glm_graph_launch(reinterpret_cast<void*>(graph_exec_ptr),
+                     reinterpret_cast<GlmCtx*>(ctx_ptr));
+    return env.Undefined();
+}
+
+static Napi::Value GraphExecUpdate(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (graph_exec, graph)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t graph_exec_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t graph_ptr = info[1].As<Napi::Number>().Int64Value();
+    int result = glm_graph_exec_update(reinterpret_cast<void*>(graph_exec_ptr),
+                                       reinterpret_cast<void*>(graph_ptr));
+    return Napi::Number::New(env, result);
+}
+
+static Napi::Value GraphDestroy(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1) {
+        Napi::TypeError::New(env, "Expected (graph)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t graph_ptr = info[0].As<Napi::Number>().Int64Value();
+    glm_graph_destroy(reinterpret_cast<void*>(graph_ptr));
+    return env.Undefined();
+}
+
+static Napi::Value GraphExecDestroy(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1) {
+        Napi::TypeError::New(env, "Expected (graph_exec)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t graph_exec_ptr = info[0].As<Napi::Number>().Int64Value();
+    glm_graph_exec_destroy(reinterpret_cast<void*>(graph_exec_ptr));
+    return env.Undefined();
+}
+
 static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "init"), Napi::Function::New(env, Init));
     exports.Set(Napi::String::New(env, "free"), Napi::Function::New(env, Free));
@@ -1022,6 +1103,13 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "batchDecodeRun"), Napi::Function::New(env, BatchDecodeRun));
     exports.Set(Napi::String::New(env, "batchPrefillRaggedPlan"), Napi::Function::New(env, BatchPrefillRaggedPlan));
     exports.Set(Napi::String::New(env, "batchPrefillRaggedRun"), Napi::Function::New(env, BatchPrefillRaggedRun));
+    exports.Set(Napi::String::New(env, "graphBeginCapture"), Napi::Function::New(env, GraphBeginCapture));
+    exports.Set(Napi::String::New(env, "graphEndCapture"), Napi::Function::New(env, GraphEndCapture));
+    exports.Set(Napi::String::New(env, "graphInstantiate"), Napi::Function::New(env, GraphInstantiate));
+    exports.Set(Napi::String::New(env, "graphLaunch"), Napi::Function::New(env, GraphLaunch));
+    exports.Set(Napi::String::New(env, "graphExecUpdate"), Napi::Function::New(env, GraphExecUpdate));
+    exports.Set(Napi::String::New(env, "graphDestroy"), Napi::Function::New(env, GraphDestroy));
+    exports.Set(Napi::String::New(env, "graphExecDestroy"), Napi::Function::New(env, GraphExecDestroy));
     return exports;
 }
 
