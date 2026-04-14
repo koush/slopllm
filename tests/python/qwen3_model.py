@@ -195,6 +195,32 @@ class Qwen3Model:
         self.glm.lib.glm_d2h(self.glm.ctx, buf, ctypes.c_void_p(ptr), nbytes)
         return np.frombuffer(buf.raw, dtype=np.uint16)
 
+    def _final_norm_and_logits(self, count, src=None):
+        cfg = self.cfg
+        glm = self.glm
+        hs = cfg.hidden_size
+        vs = cfg.vocab_size
+
+        if src is None:
+            src = self._ws["hidden_a"]
+
+        glm.rmsnorm(self._ws["normed"], src,
+                     self.weights["model.norm.weight"],
+                     cfg.rms_norm_eps, hs, count)
+        glm.linear(self._ws["logits_buf"], self._ws["normed"],
+                    self.weights["lm_head.weight"],
+                    count, vs, hs)
+
+    def _extract_last_logits(self, count, last_indices_np):
+        cfg = self.cfg
+        glm = self.glm
+        hs = cfg.hidden_size
+
+        glm.h2d(self._ws["last_idx"], last_indices_np.tobytes())
+        glm.index_select(self._ws["hidden_last"], self._ws["hidden_a"],
+                          self._ws["last_idx"], hs, count)
+        self._final_norm_and_logits(count, src=self._ws["hidden_last"])
+
     def forward(self, input_ids):
         B, S = input_ids.shape
         cfg = self.cfg
@@ -273,17 +299,7 @@ class Qwen3Model:
             self._decoder_layer_prefill_flash(B, S, i, pfx)
 
         last_idx_np = np.array([S - 1], dtype=np.int32)
-        glm.h2d(self._ws["last_idx"], last_idx_np.tobytes())
-        glm.index_select(self._ws["hidden_last"], self._ws["hidden_a"],
-                          self._ws["last_idx"], hs, 1)
-
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_last"],
-                     self.weights["model.norm.weight"],
-                     cfg.rms_norm_eps, hs, 1)
-
-        glm.linear(self._ws["logits_buf"], self._ws["normed"],
-                    self.weights["lm_head.weight"],
-                    1, vs, hs)
+        self._extract_last_logits(1, last_idx_np)
 
         self.cache_pos = S
 
@@ -323,13 +339,7 @@ class Qwen3Model:
             pfx = f"model.layers.{i}"
             self._decoder_layer_decode_flash(B, S, i, pfx, cached_len)
 
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
-                     self.weights["model.norm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
-
-        glm.linear(self._ws["logits_buf"], self._ws["normed"],
-                    self.weights["lm_head.weight"],
-                    BS, vs, hs)
+        self._final_norm_and_logits(BS)
 
         self.cache_pos = cached_len + S
 
@@ -482,119 +492,47 @@ class Qwen3Model:
     def _decoder_layer(self, B, S, pfx):
         cfg = self.cfg
         glm = self.glm
-        hs = cfg.hidden_size
-        inter = cfg.intermediate_size
         BS = B * S
 
         glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
                      self.weights[f"{pfx}.input_layernorm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
+                     cfg.rms_norm_eps, cfg.hidden_size, BS)
 
         self._attention(B, S, pfx)
 
-        glm.add(self._ws["hidden_b"], self._ws["hidden_a"],
-                self._ws["o_proj_buf"], BS * hs)
-
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_b"],
-                     self.weights[f"{pfx}.post_attention_layernorm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
-
-        self._mlp(B, S, pfx)
-
-    def _decoder_layer_prefill(self, B, S, layer_idx, pfx):
-        cfg = self.cfg
-        glm = self.glm
-        hs = cfg.hidden_size
-        inter = cfg.intermediate_size
-        BS = B * S
-
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
-                     self.weights[f"{pfx}.input_layernorm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
-
-        self._attention_prefill(B, S, layer_idx, pfx)
-
-        glm.add(self._ws["hidden_b"], self._ws["hidden_a"],
-                self._ws["o_proj_buf"], BS * hs)
-
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_b"],
-                     self.weights[f"{pfx}.post_attention_layernorm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
-
-        self._mlp(B, S, pfx)
+        self._residual_and_mlp(pfx, BS)
 
     def _decoder_layer_prefill_flash(self, B, S, layer_idx, pfx):
         cfg = self.cfg
         glm = self.glm
-        hs = cfg.hidden_size
-        inter = cfg.intermediate_size
         BS = B * S
 
         glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
                      self.weights[f"{pfx}.input_layernorm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
+                     cfg.rms_norm_eps, cfg.hidden_size, BS)
 
         self._attention_prefill_flash(B, S, layer_idx, pfx)
 
-        glm.add(self._ws["hidden_b"], self._ws["hidden_a"],
-                self._ws["o_proj_buf"], BS * hs)
-
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_b"],
-                     self.weights[f"{pfx}.post_attention_layernorm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
-
-        self._mlp(B, S, pfx)
-
-    def _decoder_layer_decode(self, B, S, layer_idx, pfx, cached_len):
-        cfg = self.cfg
-        glm = self.glm
-        hs = cfg.hidden_size
-        inter = cfg.intermediate_size
-        BS = B * S
-
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
-                     self.weights[f"{pfx}.input_layernorm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
-
-        self._attention_decode(B, S, layer_idx, pfx, cached_len)
-
-        glm.add(self._ws["hidden_b"], self._ws["hidden_a"],
-                self._ws["o_proj_buf"], BS * hs)
-
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_b"],
-                     self.weights[f"{pfx}.post_attention_layernorm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
-
-        self._mlp(B, S, pfx)
+        self._residual_and_mlp(pfx, BS)
 
     def _decoder_layer_decode_flash(self, B, S, layer_idx, pfx, cached_len):
         cfg = self.cfg
         glm = self.glm
-        hs = cfg.hidden_size
-        inter = cfg.intermediate_size
         BS = B * S
 
         glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
                      self.weights[f"{pfx}.input_layernorm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
+                     cfg.rms_norm_eps, cfg.hidden_size, BS)
 
         self._attention_decode_flash(B, S, layer_idx, pfx, cached_len)
 
-        glm.add(self._ws["hidden_b"], self._ws["hidden_a"],
-                self._ws["o_proj_buf"], BS * hs)
+        self._residual_and_mlp(pfx, BS)
 
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_b"],
-                     self.weights[f"{pfx}.post_attention_layernorm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
-
-        self._mlp(B, S, pfx)
-
-    def _mlp(self, B, S, pfx):
+    def _mlp(self, BS, pfx):
         cfg = self.cfg
         glm = self.glm
         hs = cfg.hidden_size
         inter = cfg.intermediate_size
-        BS = B * S
 
         glm.linear(self._ws["gate_buf"], self._ws["normed"],
                     self.weights[f"{pfx}.mlp.gate_proj.weight"],
@@ -611,6 +549,75 @@ class Qwen3Model:
         glm.add(self._ws["hidden_a"], self._ws["hidden_b"],
                 self._ws["down_buf"], BS * hs)
 
+    def _residual_and_mlp(self, pfx, BS):
+        cfg = self.cfg
+        glm = self.glm
+        hs = cfg.hidden_size
+
+        glm.add(self._ws["hidden_b"], self._ws["hidden_a"],
+                self._ws["o_proj_buf"], BS * hs)
+        glm.rmsnorm(self._ws["normed"], self._ws["hidden_b"],
+                     self.weights[f"{pfx}.post_attention_layernorm.weight"],
+                     cfg.rms_norm_eps, hs, BS)
+        self._mlp(BS, pfx)
+
+    def _compute_qkv(self, pfx, BS, B, S):
+        cfg = self.cfg
+        glm = self.glm
+        hs = cfg.hidden_size
+        n_heads = cfg.num_attention_heads
+        n_kv = cfg.num_key_value_heads
+        hd = cfg.head_dim
+
+        glm.linear(self._ws["q_buf"], self._ws["normed"],
+                    self.weights[f"{pfx}.self_attn.q_proj.weight"],
+                    BS, n_heads * hd, hs)
+        glm.linear(self._ws["k_buf"], self._ws["normed"],
+                    self.weights[f"{pfx}.self_attn.k_proj.weight"],
+                    BS, n_kv * hd, hs)
+        glm.linear(self._ws["v_buf"], self._ws["normed"],
+                    self.weights[f"{pfx}.self_attn.v_proj.weight"],
+                    BS, n_kv * hd, hs)
+
+        glm.rmsnorm(self._ws["q_normed"], self._ws["q_buf"],
+                     self.weights[f"{pfx}.self_attn.q_norm.weight"],
+                     cfg.rms_norm_eps, hd, BS * n_heads)
+
+        glm.rmsnorm(self._ws["k_normed"], self._ws["k_buf"],
+                     self.weights[f"{pfx}.self_attn.k_norm.weight"],
+                     cfg.rms_norm_eps, hd, BS * n_kv)
+
+        glm.transpose_4d(self._ws["q_t"], self._ws["q_normed"],
+                          B, S, n_heads, hd, 0, 2, 1, 3)
+        glm.transpose_4d(self._ws["k_t"], self._ws["k_normed"],
+                          B, S, n_kv, hd, 0, 2, 1, 3)
+        glm.transpose_4d(self._ws["v_t"], self._ws["v_buf"],
+                          B, S, n_kv, hd, 0, 2, 1, 3)
+
+        glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
+                                  self._ws["cos"], self._ws["sin"],
+                                  hd, n_heads, S, B, 1)
+        glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
+                                  self._ws["cos"], self._ws["sin"],
+                                  hd, n_kv, S, B, 1)
+
+    def _write_kv_flat(self, layer_idx, S, offset=0):
+        cfg = self.cfg
+        glm = self.glm
+        n_kv = cfg.num_key_value_heads
+        hd = cfg.head_dim
+        max_S = self.max_seq_len
+
+        for h in range(n_kv):
+            src_off = h * S * hd * BF16
+            dst_off = (h * max_S * hd + offset * hd) * BF16
+            glm.memcpy(self.k_cache[layer_idx] + dst_off,
+                        self._ws["k_rope"] + src_off,
+                        S * hd * BF16)
+            glm.memcpy(self.v_cache[layer_idx] + dst_off,
+                        self._ws["v_t"] + src_off,
+                        S * hd * BF16)
+
     def _attention(self, B, S, pfx):
         cfg = self.cfg
         glm = self.glm
@@ -621,37 +628,7 @@ class Qwen3Model:
         n_groups = cfg.num_key_value_groups
         BS = B * S
 
-        glm.linear(self._ws["q_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.q_proj.weight"],
-                    BS, n_heads * hd, hs)
-        glm.linear(self._ws["k_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.k_proj.weight"],
-                    BS, n_kv * hd, hs)
-        glm.linear(self._ws["v_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.v_proj.weight"],
-                    BS, n_kv * hd, hs)
-
-        glm.rmsnorm(self._ws["q_normed"], self._ws["q_buf"],
-                     self.weights[f"{pfx}.self_attn.q_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_heads)
-
-        glm.rmsnorm(self._ws["k_normed"], self._ws["k_buf"],
-                     self.weights[f"{pfx}.self_attn.k_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_kv)
-
-        glm.transpose_4d(self._ws["q_t"], self._ws["q_normed"],
-                          B, S, n_heads, hd, 0, 2, 1, 3)
-        glm.transpose_4d(self._ws["k_t"], self._ws["k_normed"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
-        glm.transpose_4d(self._ws["v_t"], self._ws["v_buf"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
-
-        glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
-                                  self._ws["cos"], self._ws["sin"],
-                                  hd, n_heads, S, B, 1)
-        glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
-                                  self._ws["cos"], self._ws["sin"],
-                                  hd, n_kv, S, B, 1)
+        self._compute_qkv(pfx, BS, B, S)
 
         if n_groups > 1:
             glm.expand_dim1(self._ws["k_expanded"], self._ws["k_rope"],
@@ -674,177 +651,6 @@ class Qwen3Model:
 
         glm.bmm(self._ws["attn_out"], self._ws["attn_scores"], self._ws["v_expanded"],
                  1.0, 0.0, B * n_heads, S, hd, S, 0)
-
-        glm.transpose_4d(self._ws["attn_out_t"], self._ws["attn_out"],
-                          B, n_heads, S, hd, 0, 2, 1, 3)
-
-        glm.linear(self._ws["o_proj_buf"], self._ws["attn_out_t"],
-                    self.weights[f"{pfx}.self_attn.o_proj.weight"],
-                    BS, hs, n_heads * hd)
-
-    def _attention_prefill(self, B, S, layer_idx, pfx):
-        cfg = self.cfg
-        glm = self.glm
-        hs = cfg.hidden_size
-        n_heads = cfg.num_attention_heads
-        n_kv = cfg.num_key_value_heads
-        hd = cfg.head_dim
-        n_groups = cfg.num_key_value_groups
-        max_S = self.max_seq_len
-        BS = B * S
-
-        glm.linear(self._ws["q_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.q_proj.weight"],
-                    BS, n_heads * hd, hs)
-        glm.linear(self._ws["k_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.k_proj.weight"],
-                    BS, n_kv * hd, hs)
-        glm.linear(self._ws["v_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.v_proj.weight"],
-                    BS, n_kv * hd, hs)
-
-        glm.rmsnorm(self._ws["q_normed"], self._ws["q_buf"],
-                     self.weights[f"{pfx}.self_attn.q_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_heads)
-
-        glm.rmsnorm(self._ws["k_normed"], self._ws["k_buf"],
-                     self.weights[f"{pfx}.self_attn.k_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_kv)
-
-        glm.transpose_4d(self._ws["q_t"], self._ws["q_normed"],
-                          B, S, n_heads, hd, 0, 2, 1, 3)
-        glm.transpose_4d(self._ws["k_t"], self._ws["k_normed"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
-        glm.transpose_4d(self._ws["v_t"], self._ws["v_buf"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
-
-        glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
-                                  self._ws["cos"], self._ws["sin"],
-                                  hd, n_heads, S, B, 1)
-        glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
-                                  self._ws["cos"], self._ws["sin"],
-                                  hd, n_kv, S, B, 1)
-
-        for h in range(n_kv):
-            src_off = h * S * hd * BF16
-            dst_off = h * max_S * hd * BF16
-            glm.memcpy(self.k_cache[layer_idx] + dst_off,
-                        self._ws["k_rope"] + src_off,
-                        S * hd * BF16)
-            glm.memcpy(self.v_cache[layer_idx] + dst_off,
-                        self._ws["v_t"] + src_off,
-                        S * hd * BF16)
-
-        if n_groups > 1:
-            glm.expand_dim1(self._ws["k_expanded"], self._ws["k_rope"],
-                            n_heads, n_kv, S, hd, B)
-            glm.expand_dim1(self._ws["v_expanded"], self._ws["v_t"],
-                            n_heads, n_kv, S, hd, B)
-        else:
-            glm.memcpy(self._ws["k_expanded"], self._ws["k_rope"], B * n_heads * S * hd * BF16)
-            glm.memcpy(self._ws["v_expanded"], self._ws["v_t"], B * n_heads * S * hd * BF16)
-
-        glm.bmm(self._ws["attn_scores"], self._ws["q_rope"], self._ws["k_expanded"],
-                 cfg.scaling, 0.0, B * n_heads, S, S, hd, 1)
-
-        glm.expand_dim1(self._ws["mask_expanded"], self._ws["causal_mask"],
-                        n_heads, 1, S, S, B)
-
-        glm.softmax(self._ws["attn_scores"], self._ws["attn_scores"],
-                     self._ws["mask_expanded"],
-                     S, B * n_heads * S)
-
-        glm.bmm(self._ws["attn_out"], self._ws["attn_scores"], self._ws["v_expanded"],
-                 1.0, 0.0, B * n_heads, S, hd, S, 0)
-
-        glm.transpose_4d(self._ws["attn_out_t"], self._ws["attn_out"],
-                          B, n_heads, S, hd, 0, 2, 1, 3)
-
-        glm.linear(self._ws["o_proj_buf"], self._ws["attn_out_t"],
-                    self.weights[f"{pfx}.self_attn.o_proj.weight"],
-                    BS, hs, n_heads * hd)
-
-    def _attention_decode(self, B, S, layer_idx, pfx, cached_len):
-        cfg = self.cfg
-        glm = self.glm
-        hs = cfg.hidden_size
-        n_heads = cfg.num_attention_heads
-        n_kv = cfg.num_key_value_heads
-        hd = cfg.head_dim
-        n_groups = cfg.num_key_value_groups
-        max_S = self.max_seq_len
-        BS = B * S
-        total_len = cached_len + S
-
-        glm.linear(self._ws["q_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.q_proj.weight"],
-                    BS, n_heads * hd, hs)
-        glm.linear(self._ws["k_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.k_proj.weight"],
-                    BS, n_kv * hd, hs)
-        glm.linear(self._ws["v_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.v_proj.weight"],
-                    BS, n_kv * hd, hs)
-
-        glm.rmsnorm(self._ws["q_normed"], self._ws["q_buf"],
-                     self.weights[f"{pfx}.self_attn.q_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_heads)
-
-        glm.rmsnorm(self._ws["k_normed"], self._ws["k_buf"],
-                     self.weights[f"{pfx}.self_attn.k_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_kv)
-
-        glm.transpose_4d(self._ws["q_t"], self._ws["q_normed"],
-                          B, S, n_heads, hd, 0, 2, 1, 3)
-        glm.transpose_4d(self._ws["k_t"], self._ws["k_normed"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
-        glm.transpose_4d(self._ws["v_t"], self._ws["v_buf"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
-
-        glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
-                                  self._ws["cos"], self._ws["sin"],
-                                  hd, n_heads, S, B, 1)
-        glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
-                                  self._ws["cos"], self._ws["sin"],
-                                  hd, n_kv, S, B, 1)
-
-        for h in range(n_kv):
-            src_off = h * S * hd * BF16
-            dst_off = (h * max_S * hd + cached_len * hd) * BF16
-            glm.memcpy(self.k_cache[layer_idx] + dst_off,
-                        self._ws["k_rope"] + src_off,
-                        S * hd * BF16)
-            glm.memcpy(self.v_cache[layer_idx] + dst_off,
-                        self._ws["v_t"] + src_off,
-                        S * hd * BF16)
-
-        head_stride = max_S * hd
-
-        if n_groups > 1:
-            glm.expand_dim1_strided(self._ws["k_expanded"], self.k_cache[layer_idx],
-                                    n_heads, n_kv, total_len, hd, B, head_stride)
-            glm.expand_dim1_strided(self._ws["v_expanded"], self.v_cache[layer_idx],
-                                    n_heads, n_kv, total_len, hd, B, head_stride)
-        else:
-            for h in range(n_kv):
-                src_off = h * max_S * hd * BF16
-                dst_off = h * total_len * hd * BF16
-                glm.memcpy(self._ws["k_expanded"] + dst_off,
-                            self.k_cache[layer_idx] + src_off,
-                            total_len * hd * BF16)
-                glm.memcpy(self._ws["v_expanded"] + dst_off,
-                            self.v_cache[layer_idx] + src_off,
-                            total_len * hd * BF16)
-
-        glm.bmm(self._ws["attn_scores"], self._ws["q_rope"], self._ws["k_expanded"],
-                 cfg.scaling, 0.0, B * n_heads, S, total_len, hd, 1)
-
-        glm.softmax(self._ws["attn_scores"], self._ws["attn_scores"],
-                     None,
-                     total_len, B * n_heads * S)
-
-        glm.bmm(self._ws["attn_out"], self._ws["attn_scores"], self._ws["v_expanded"],
-                 1.0, 0.0, B * n_heads, S, hd, total_len, 0)
 
         glm.transpose_4d(self._ws["attn_out_t"], self._ws["attn_out"],
                           B, n_heads, S, hd, 0, 2, 1, 3)
@@ -863,47 +669,9 @@ class Qwen3Model:
         max_S = self.max_seq_len
         BS = B * S
 
-        glm.linear(self._ws["q_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.q_proj.weight"],
-                    BS, n_heads * hd, hs)
-        glm.linear(self._ws["k_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.k_proj.weight"],
-                    BS, n_kv * hd, hs)
-        glm.linear(self._ws["v_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.v_proj.weight"],
-                    BS, n_kv * hd, hs)
+        self._compute_qkv(pfx, BS, B, S)
 
-        glm.rmsnorm(self._ws["q_normed"], self._ws["q_buf"],
-                     self.weights[f"{pfx}.self_attn.q_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_heads)
-
-        glm.rmsnorm(self._ws["k_normed"], self._ws["k_buf"],
-                     self.weights[f"{pfx}.self_attn.k_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_kv)
-
-        glm.transpose_4d(self._ws["q_t"], self._ws["q_normed"],
-                          B, S, n_heads, hd, 0, 2, 1, 3)
-        glm.transpose_4d(self._ws["k_t"], self._ws["k_normed"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
-        glm.transpose_4d(self._ws["v_t"], self._ws["v_buf"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
-
-        glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
-                                  self._ws["cos"], self._ws["sin"],
-                                  hd, n_heads, S, B, 1)
-        glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
-                                  self._ws["cos"], self._ws["sin"],
-                                  hd, n_kv, S, B, 1)
-
-        for h in range(n_kv):
-            src_off = h * S * hd * BF16
-            dst_off = h * max_S * hd * BF16
-            glm.memcpy(self.k_cache[layer_idx] + dst_off,
-                        self._ws["k_rope"] + src_off,
-                        S * hd * BF16)
-            glm.memcpy(self.v_cache[layer_idx] + dst_off,
-                        self._ws["v_t"] + src_off,
-                        S * hd * BF16)
+        self._write_kv_flat(layer_idx, S)
 
         kv_stride_h = max_S * hd
         kv_stride_n = hd
@@ -938,47 +706,9 @@ class Qwen3Model:
         BS = B * S
         total_len = cached_len + S
 
-        glm.linear(self._ws["q_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.q_proj.weight"],
-                    BS, n_heads * hd, hs)
-        glm.linear(self._ws["k_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.k_proj.weight"],
-                    BS, n_kv * hd, hs)
-        glm.linear(self._ws["v_buf"], self._ws["normed"],
-                    self.weights[f"{pfx}.self_attn.v_proj.weight"],
-                    BS, n_kv * hd, hs)
+        self._compute_qkv(pfx, BS, B, S)
 
-        glm.rmsnorm(self._ws["q_normed"], self._ws["q_buf"],
-                     self.weights[f"{pfx}.self_attn.q_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_heads)
-
-        glm.rmsnorm(self._ws["k_normed"], self._ws["k_buf"],
-                     self.weights[f"{pfx}.self_attn.k_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_kv)
-
-        glm.transpose_4d(self._ws["q_t"], self._ws["q_normed"],
-                          B, S, n_heads, hd, 0, 2, 1, 3)
-        glm.transpose_4d(self._ws["k_t"], self._ws["k_normed"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
-        glm.transpose_4d(self._ws["v_t"], self._ws["v_buf"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
-
-        glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
-                                  self._ws["cos"], self._ws["sin"],
-                                  hd, n_heads, S, B, 1)
-        glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
-                                  self._ws["cos"], self._ws["sin"],
-                                  hd, n_kv, S, B, 1)
-
-        for h in range(n_kv):
-            src_off = h * S * hd * BF16
-            dst_off = (h * max_S * hd + cached_len * hd) * BF16
-            glm.memcpy(self.k_cache[layer_idx] + dst_off,
-                        self._ws["k_rope"] + src_off,
-                        S * hd * BF16)
-            glm.memcpy(self.v_cache[layer_idx] + dst_off,
-                        self._ws["v_t"] + src_off,
-                        S * hd * BF16)
+        self._write_kv_flat(layer_idx, S, offset=cached_len)
 
         kv_stride_h = max_S * hd
         kv_stride_n = hd
@@ -1066,36 +796,7 @@ class Qwen3Model:
                          self.weights[f"{pfx}.input_layernorm.weight"],
                          cfg.rms_norm_eps, hs, total_tokens)
 
-            glm.linear(self._ws["q_buf"], self._ws["normed"],
-                         self.weights[f"{pfx}.self_attn.q_proj.weight"],
-                         total_tokens, n_heads * hd, hs)
-            glm.linear(self._ws["k_buf"], self._ws["normed"],
-                         self.weights[f"{pfx}.self_attn.k_proj.weight"],
-                         total_tokens, n_kv * hd, hs)
-            glm.linear(self._ws["v_buf"], self._ws["normed"],
-                         self.weights[f"{pfx}.self_attn.v_proj.weight"],
-                         total_tokens, n_kv * hd, hs)
-
-            glm.rmsnorm(self._ws["q_normed"], self._ws["q_buf"],
-                         self.weights[f"{pfx}.self_attn.q_norm.weight"],
-                         cfg.rms_norm_eps, hd, total_tokens * n_heads)
-            glm.rmsnorm(self._ws["k_normed"], self._ws["k_buf"],
-                         self.weights[f"{pfx}.self_attn.k_norm.weight"],
-                         cfg.rms_norm_eps, hd, total_tokens * n_kv)
-
-            glm.transpose_4d(self._ws["q_t"], self._ws["q_normed"],
-                              1, total_tokens, n_heads, hd, 0, 2, 1, 3)
-            glm.transpose_4d(self._ws["k_t"], self._ws["k_normed"],
-                              1, total_tokens, n_kv, hd, 0, 2, 1, 3)
-            glm.transpose_4d(self._ws["v_t"], self._ws["v_buf"],
-                              1, total_tokens, n_kv, hd, 0, 2, 1, 3)
-
-            glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
-                                      self._ws["cos"], self._ws["sin"],
-                                      hd, n_heads, total_tokens, 1, 1)
-            glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
-                                      self._ws["cos"], self._ws["sin"],
-                                      hd, n_kv, total_tokens, 1, 1)
+            self._compute_qkv(pfx, total_tokens, 1, total_tokens)
 
             for seq_idx, s in enumerate(seq_lens):
                 start_page, num_pages = page_allocs[seq_idx]
@@ -1146,14 +847,7 @@ class Qwen3Model:
                          self.weights[f"{pfx}.self_attn.o_proj.weight"],
                          total_tokens, hs, n_heads * hd)
 
-            glm.add(self._ws["hidden_b"], self._ws["hidden_a"],
-                     self._ws["o_proj_buf"], total_tokens * hs)
-
-            glm.rmsnorm(self._ws["normed"], self._ws["hidden_b"],
-                         self.weights[f"{pfx}.post_attention_layernorm.weight"],
-                         cfg.rms_norm_eps, hs, total_tokens)
-
-            self._mlp(total_tokens, 1, pfx)
+            self._residual_and_mlp(pfx, total_tokens)
 
         last_indices = []
         offset = 0
@@ -1161,17 +855,7 @@ class Qwen3Model:
             last_indices.append(offset + s - 1)
             offset += s
         last_idx_np = np.array(last_indices, dtype=np.int32)
-        glm.h2d(self._ws["last_idx"], last_idx_np.tobytes())
-        glm.index_select(self._ws["hidden_last"], self._ws["hidden_a"],
-                          self._ws["last_idx"], hs, batch_size)
-
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_last"],
-                     self.weights["model.norm.weight"],
-                     cfg.rms_norm_eps, hs, batch_size)
-
-        glm.linear(self._ws["logits_buf"], self._ws["normed"],
-                     self.weights["lm_head.weight"],
-                     batch_size, vs, hs)
+        self._extract_last_logits(batch_size, last_idx_np)
 
         paged_kv.update_indptr()
 
@@ -1237,36 +921,7 @@ class Qwen3Model:
                          self.weights[f"{pfx}.input_layernorm.weight"],
                          cfg.rms_norm_eps, hs, batch_size)
 
-            glm.linear(self._ws["q_buf"], self._ws["normed"],
-                         self.weights[f"{pfx}.self_attn.q_proj.weight"],
-                         batch_size, n_heads * hd, hs)
-            glm.linear(self._ws["k_buf"], self._ws["normed"],
-                         self.weights[f"{pfx}.self_attn.k_proj.weight"],
-                         batch_size, n_kv * hd, hs)
-            glm.linear(self._ws["v_buf"], self._ws["normed"],
-                         self.weights[f"{pfx}.self_attn.v_proj.weight"],
-                         batch_size, n_kv * hd, hs)
-
-            glm.rmsnorm(self._ws["q_normed"], self._ws["q_buf"],
-                         self.weights[f"{pfx}.self_attn.q_norm.weight"],
-                         cfg.rms_norm_eps, hd, batch_size * n_heads)
-            glm.rmsnorm(self._ws["k_normed"], self._ws["k_buf"],
-                         self.weights[f"{pfx}.self_attn.k_norm.weight"],
-                         cfg.rms_norm_eps, hd, batch_size * n_kv)
-
-            glm.transpose_4d(self._ws["q_t"], self._ws["q_normed"],
-                              batch_size, 1, n_heads, hd, 0, 2, 1, 3)
-            glm.transpose_4d(self._ws["k_t"], self._ws["k_normed"],
-                              batch_size, 1, n_kv, hd, 0, 2, 1, 3)
-            glm.transpose_4d(self._ws["v_t"], self._ws["v_buf"],
-                              batch_size, 1, n_kv, hd, 0, 2, 1, 3)
-
-            glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
-                                      self._ws["cos"], self._ws["sin"],
-                                      hd, n_heads, 1, batch_size, 1)
-            glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
-                                      self._ws["cos"], self._ws["sin"],
-                                      hd, n_kv, 1, batch_size, 1)
+            self._compute_qkv(pfx, batch_size, batch_size, 1)
 
             for seq_idx in range(batch_size):
                 abs_page, slot_in_page = write_locations[seq_idx]
@@ -1293,24 +948,11 @@ class Qwen3Model:
 
             glm.linear(self._ws["o_proj_buf"], self._ws["flash_out"],
                          self.weights[f"{pfx}.self_attn.o_proj.weight"],
-                         batch_size, hs, n_heads * hd)
+                          batch_size, hs, n_heads * hd)
 
-            glm.add(self._ws["hidden_b"], self._ws["hidden_a"],
-                     self._ws["o_proj_buf"], batch_size * hs)
+            self._residual_and_mlp(pfx, batch_size)
 
-            glm.rmsnorm(self._ws["normed"], self._ws["hidden_b"],
-                         self.weights[f"{pfx}.post_attention_layernorm.weight"],
-                         cfg.rms_norm_eps, hs, batch_size)
-
-            self._mlp(batch_size, 1, pfx)
-
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
-                     self.weights["model.norm.weight"],
-                     cfg.rms_norm_eps, hs, batch_size)
-
-        glm.linear(self._ws["logits_buf"], self._ws["normed"],
-                     self.weights["lm_head.weight"],
-                     batch_size, vs, hs)
+        self._final_norm_and_logits(batch_size)
 
         all_logits = []
         for seq_idx in range(batch_size):
