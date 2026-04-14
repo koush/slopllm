@@ -193,6 +193,30 @@ void glm_batch_prefill_ragged_run(
     uint32_t kv_stride_n, uint32_t kv_stride_h,
     int mask_mode, float sm_scale);
 
+void glm_batch_prefill_paged_plan(
+    GlmCtx* ctx,
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
+    int64_t* plan_info,
+    int32_t* qo_indptr_h, int32_t* paged_kv_indptr_h,
+    uint32_t total_qo_rows, uint32_t batch_size,
+    uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t head_dim, uint32_t page_size, int mask_mode);
+
+void glm_batch_prefill_paged_run(
+    GlmCtx* ctx,
+    void* q, void* o,
+    void* k_data, void* v_data,
+    int32_t* indices, int32_t* indptr_d, int32_t* last_page_len,
+    void* float_ws, void* int_ws,
+    int32_t* q_indptr_d,
+    int64_t* plan_info,
+    uint32_t total_qo_rows, uint32_t batch_size,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+    uint32_t page_size,
+    int32_t q_stride_n, int32_t q_stride_h,
+    int mask_mode, float sm_scale);
+
 // CUDA Graph operations
 void glm_graph_begin_capture(GlmCtx* ctx);
 void* glm_graph_end_capture(GlmCtx* ctx);

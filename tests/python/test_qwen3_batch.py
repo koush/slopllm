@@ -69,6 +69,64 @@ def test_batch_prefill_vs_single(glm, qwen3_model, ws):
         flat_cache.free()
 
 
+def test_batch_prefill_paged_vs_single(glm, qwen3_model, ws):
+    model = qwen3_model
+    cfg = model.cfg
+    n_kv = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    n_layers = cfg.num_hidden_layers
+    max_pages = 128
+
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
+    flat_cache = model.create_flat_kv_cache()
+    try:
+        prompt1 = [151643, 151644, 151645, 1, 2, 3]
+        prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
+
+        batch_tokens = model.prefill_batch_paged([prompt1, prompt2], ws, paged_kv)
+
+        flat_cache.reset()
+        single_logits_1 = model.prefill(torch.tensor([prompt1], dtype=torch.int64), flat_cache)
+        single_token_1 = single_logits_1[0].argmax().item()
+
+        flat_cache.reset()
+        single_logits_2 = model.prefill(torch.tensor([prompt2], dtype=torch.int64), flat_cache)
+        single_token_2 = single_logits_2[0].argmax().item()
+
+        assert batch_tokens[0] == single_token_1, \
+            f"Seq1 paged prefill token mismatch: paged={batch_tokens[0]}, single={single_token_1}"
+        assert batch_tokens[1] == single_token_2, \
+            f"Seq2 paged prefill token mismatch: paged={batch_tokens[1]}, single={single_token_2}"
+    finally:
+        paged_kv.free()
+        flat_cache.free()
+
+
+def test_batch_prefill_paged_then_decode(glm, qwen3_model, ws):
+    model = qwen3_model
+    cfg = model.cfg
+    n_kv = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    n_layers = cfg.num_hidden_layers
+    max_pages = 128
+
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
+    try:
+        prompt1 = [151643, 151644, 151645, 1, 2, 3]
+        prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
+
+        batch_tokens = model.prefill_batch_paged([prompt1, prompt2], ws, paged_kv)
+        paged_kv.update_indptr()
+
+        decode_tokens = model.decode_batch(batch_tokens, ws, paged_kv)
+
+        assert isinstance(decode_tokens[0], int), f"Decode token 0 not int: {decode_tokens[0]}"
+        assert isinstance(decode_tokens[1], int), f"Decode token 1 not int: {decode_tokens[1]}"
+        print(f"  Paged prefill -> decode tokens: {decode_tokens}")
+    finally:
+        paged_kv.free()
+
+
 def test_batch_decode_vs_single(glm, qwen3_model, ws):
     model = qwen3_model
     cfg = model.cfg

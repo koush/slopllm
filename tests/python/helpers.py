@@ -409,6 +409,35 @@ class GlmOps:
             ctypes.c_int32, ctypes.c_float,
         ]
 
+        self.lib.glm_batch_prefill_paged_plan.restype = None
+        self.lib.glm_batch_prefill_paged_plan.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_int32,
+        ]
+
+        self.lib.glm_batch_prefill_paged_run.restype = None
+        self.lib.glm_batch_prefill_paged_run.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_int32, ctypes.c_int32,
+            ctypes.c_int32, ctypes.c_float,
+        ]
+
         self.lib.glm_graph_begin_capture.restype = None
         self.lib.glm_graph_begin_capture.argtypes = [ctypes.c_void_p]
 
@@ -862,6 +891,49 @@ class GlmOps:
             ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads), ctypes.c_uint32(head_dim),
             ctypes.c_uint32(q_stride_n), ctypes.c_uint32(q_stride_h),
             ctypes.c_uint32(kv_stride_n), ctypes.c_uint32(kv_stride_h),
+            ctypes.c_int32(mask_mode),             ctypes.c_float(sm_scale)
+        )
+
+    def batch_prefill_paged_plan(self, float_ws, float_ws_size,
+                                  int_ws, pinned_int_ws, int_ws_size,
+                                  plan_info, qo_indptr_h, paged_kv_indptr_h,
+                                  total_qo_rows, batch_size,
+                                  num_qo_heads, num_kv_heads,
+                                  head_dim, page_size, mask_mode):
+        self.lib.glm_batch_prefill_paged_plan(
+            self.ctx,
+            ctypes.c_void_p(float_ws), ctypes.c_size_t(float_ws_size),
+            ctypes.c_void_p(int_ws), ctypes.c_void_p(pinned_int_ws), ctypes.c_size_t(int_ws_size),
+            ctypes.c_void_p(plan_info),
+            ctypes.c_void_p(qo_indptr_h), ctypes.c_void_p(paged_kv_indptr_h),
+            ctypes.c_uint32(total_qo_rows), ctypes.c_uint32(batch_size),
+            ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads),
+            ctypes.c_uint32(head_dim),             ctypes.c_uint32(page_size),
+            ctypes.c_int32(mask_mode)
+        )
+
+    def batch_prefill_paged_run(self, q, o,
+                                 k_data, v_data,
+                                 indices, indptr_d, last_page_len,
+                                 float_ws, int_ws, q_indptr_d,
+                                 plan_info,
+                                 total_qo_rows, batch_size,
+                                 num_qo_heads, num_kv_heads, head_dim,
+                                 page_size,
+                                 q_stride_n, q_stride_h,
+                                 mask_mode, sm_scale):
+        self.lib.glm_batch_prefill_paged_run(
+            self.ctx,
+            ctypes.c_void_p(q), ctypes.c_void_p(o),
+            ctypes.c_void_p(k_data), ctypes.c_void_p(v_data),
+            ctypes.c_void_p(indices), ctypes.c_void_p(indptr_d), ctypes.c_void_p(last_page_len),
+            ctypes.c_void_p(float_ws), ctypes.c_void_p(int_ws),
+            ctypes.c_void_p(q_indptr_d),
+            ctypes.c_void_p(plan_info),
+            ctypes.c_uint32(total_qo_rows), ctypes.c_uint32(batch_size),
+            ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads), ctypes.c_uint32(head_dim),
+            ctypes.c_uint32(page_size),
+            ctypes.c_int32(q_stride_n), ctypes.c_int32(q_stride_h),
             ctypes.c_int32(mask_mode),             ctypes.c_float(sm_scale)
         )
 

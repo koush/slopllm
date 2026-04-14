@@ -48,6 +48,8 @@ interface NativeAddon {
   batchDecodeRun(ctx: number, q: number, o: number, kData: number, vData: number, indices: number, indptrD: number, lastPageLen: number, floatWs: number, intWs: number, planInfo: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, smScale: number): void;
   batchPrefillRaggedPlan(ctx: number, floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, qoIndptrH: number, kvIndptrH: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, maskMode: number): void;
   batchPrefillRaggedRun(ctx: number, q: number, k: number, v: number, o: number, floatWs: number, intWs: number, qIndptrD: number, kvIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, maskMode: number, smScale: number): void;
+  batchPrefillPagedPlan(ctx: number, floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, qoIndptrH: number, pagedKvIndptrH: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, maskMode: number): void;
+  batchPrefillPagedRun(ctx: number, q: number, o: number, kData: number, vData: number, indices: number, indptrD: number, lastPageLen: number, floatWs: number, intWs: number, qIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): void;
   graphBeginCapture(ctx: number): void;
   graphEndCapture(ctx: number): number;
   graphInstantiate(graph: number): number;
@@ -213,6 +215,14 @@ export class GlmOps {
 
   batchPrefillRaggedRun(q: number, k: number, v: number, o: number, floatWs: number, intWs: number, qIndptrD: number, kvIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, maskMode: number, smScale: number): void {
     this.native.batchPrefillRaggedRun(this.ctx, q, k, v, o, floatWs, intWs, qIndptrD, kvIndptrD, planInfo, totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, maskMode, smScale);
+  }
+
+  batchPrefillPagedPlan(floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, qoIndptrH: number, pagedKvIndptrH: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, maskMode: number): void {
+    this.native.batchPrefillPagedPlan(this.ctx, floatWs, floatWsSize, intWs, pinnedIntWs, intWsSize, planInfo, qoIndptrH, pagedKvIndptrH, totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, pageSize, maskMode);
+  }
+
+  batchPrefillPagedRun(q: number, o: number, kData: number, vData: number, indices: number, indptrD: number, lastPageLen: number, floatWs: number, intWs: number, qIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): void {
+    this.native.batchPrefillPagedRun(this.ctx, q, o, kData, vData, indices, indptrD, lastPageLen, floatWs, intWs, qIndptrD, planInfo, totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, pageSize, qStrideN, qStrideH, maskMode, smScale);
   }
 
   mmapOpen(filePath: string): number {
