@@ -50,24 +50,20 @@ def test_batch_prefill_vs_single(glm, qwen3_model, ws):
         prompt1 = [151643, 151644, 151645, 1, 2, 3]
         prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
 
-        batch_logits = model.prefill_batch([prompt1, prompt2], ws, paged_kv)
+        batch_tokens = model.prefill_batch([prompt1, prompt2], ws, paged_kv)
 
         flat_cache.reset()
         single_logits_1 = model.prefill(torch.tensor([prompt1], dtype=torch.int64), flat_cache)
+        single_token_1 = single_logits_1[0].argmax().item()
 
         flat_cache.reset()
         single_logits_2 = model.prefill(torch.tensor([prompt2], dtype=torch.int64), flat_cache)
+        single_token_2 = single_logits_2[0].argmax().item()
 
-        diff1 = (batch_logits[0] - single_logits_1[0]).abs().max().item()
-        diff2 = (batch_logits[1] - single_logits_2[0]).abs().max().item()
-        print(f"  Batch prefill vs single: diff1={diff1:.4f}, diff2={diff2:.4f}")
-
-        assert batch_logits[0].argmax().item() == single_logits_1[0].argmax().item(), \
-            f"Seq1 top-1 mismatch"
-        assert batch_logits[1].argmax().item() == single_logits_2[0].argmax().item(), \
-            f"Seq2 top-1 mismatch"
-        assert diff1 < 0.5, f"Seq1 diff too large: {diff1:.4f}"
-        assert diff2 < 0.5, f"Seq2 diff too large: {diff2:.4f}"
+        assert batch_tokens[0] == single_token_1, \
+            f"Seq1 prefill token mismatch: batch={batch_tokens[0]}, single={single_token_1}"
+        assert batch_tokens[1] == single_token_2, \
+            f"Seq2 prefill token mismatch: batch={batch_tokens[1]}, single={single_token_2}"
     finally:
         paged_kv.free()
         flat_cache.free()
@@ -87,31 +83,27 @@ def test_batch_decode_vs_single(glm, qwen3_model, ws):
         prompt1 = [151643, 151644, 151645, 1, 2, 3]
         prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
 
-        batch_logits = model.prefill_batch([prompt1, prompt2], ws, paged_kv)
+        batch_tokens = model.prefill_batch([prompt1, prompt2], ws, paged_kv)
 
-        token1 = batch_logits[0].argmax().item()
-        token2 = batch_logits[1].argmax().item()
-
-        flat_cache.reset()
-        model.prefill(torch.tensor([prompt1], dtype=torch.int64), flat_cache)
-        single_decode_logits_1 = model.decode(torch.tensor([[token1]], dtype=torch.int64), flat_cache)
+        token1 = batch_tokens[0]
+        token2 = batch_tokens[1]
 
         flat_cache.reset()
-        model.prefill(torch.tensor([prompt2], dtype=torch.int64), flat_cache)
-        single_decode_logits_2 = model.decode(torch.tensor([[token2]], dtype=torch.int64), flat_cache)
+        single_logits_1 = model.prefill(torch.tensor([prompt1], dtype=torch.int64), flat_cache)
+        single_decode_logits_1 = model.decode(torch.tensor([[single_logits_1[0].argmax().item()]], dtype=torch.int64), flat_cache)
+        single_decode_token_1 = single_decode_logits_1[0, 0].argmax().item()
 
-        batch_decode_logits = model.decode_batch([token1, token2], ws, paged_kv)
+        flat_cache.reset()
+        single_logits_2 = model.prefill(torch.tensor([prompt2], dtype=torch.int64), flat_cache)
+        single_decode_logits_2 = model.decode(torch.tensor([[single_logits_2[0].argmax().item()]], dtype=torch.int64), flat_cache)
+        single_decode_token_2 = single_decode_logits_2[0, 0].argmax().item()
 
-        diff1 = (batch_decode_logits[0] - single_decode_logits_1[0, 0]).abs().max().item()
-        diff2 = (batch_decode_logits[1] - single_decode_logits_2[0, 0]).abs().max().item()
-        print(f"  Batch decode vs single: diff1={diff1:.4f}, diff2={diff2:.4f}")
+        batch_decode_tokens = model.decode_batch([token1, token2], ws, paged_kv)
 
-        assert batch_decode_logits[0].argmax().item() == single_decode_logits_1[0, 0].argmax().item(), \
-            f"Seq1 decode top-1 mismatch"
-        assert batch_decode_logits[1].argmax().item() == single_decode_logits_2[0, 0].argmax().item(), \
-            f"Seq2 decode top-1 mismatch"
-        assert diff1 < 0.5, f"Seq1 decode diff too large: {diff1:.4f}"
-        assert diff2 < 0.5, f"Seq2 decode diff too large: {diff2:.4f}"
+        assert batch_decode_tokens[0] == single_decode_token_1, \
+            f"Seq1 decode token mismatch: batch={batch_decode_tokens[0]}, single={single_decode_token_1}"
+        assert batch_decode_tokens[1] == single_decode_token_2, \
+            f"Seq2 decode token mismatch: batch={batch_decode_tokens[1]}, single={single_decode_token_2}"
     finally:
         paged_kv.free()
         flat_cache.free()
@@ -130,20 +122,21 @@ def test_batch_multi_step_decode(glm, qwen3_model, ws):
         prompt1 = [151643, 151644, 151645, 1, 2, 3]
         prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
 
-        batch_logits = model.prefill_batch([prompt1, prompt2], ws, paged_kv)
+        batch_tokens = model.prefill_batch([prompt1, prompt2], ws, paged_kv)
 
         batch_tokens = [
-            [batch_logits[0].argmax().item()],
-            [batch_logits[1].argmax().item()],
+            [batch_tokens[0]],
+            [batch_tokens[1]],
         ]
 
         num_steps = 5
         for step in range(num_steps):
-            batch_decode_logits = model.decode_batch(batch_tokens, ws, paged_kv)
+            decode_ids = [t[0] for t in batch_tokens]
+            next_tokens = model.decode_batch(decode_ids, ws, paged_kv)
 
             batch_tokens = [
-                [batch_decode_logits[0].argmax().item()],
-                [batch_decode_logits[1].argmax().item()],
+                [next_tokens[0]],
+                [next_tokens[1]],
             ]
 
         print(f"  Batch multi-step decode completed {num_steps} steps")

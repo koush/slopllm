@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
@@ -74,6 +75,19 @@ class Qwen3Config:
         self.attention_bias = d.get("attention_bias", False)
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.scaling = self.head_dim ** -0.5
+
+
+@dataclass
+class DecodeState:
+    batch_size: int
+
+
+@dataclass
+class PrefillState:
+    batch_size: int
+    total_tokens: int
+    seq_lens: list[int]
+    page_allocs: list[tuple[int, int]]
 
 
 class Qwen3Model:
@@ -171,11 +185,13 @@ class Qwen3Model:
             "logits_buf": glm.alloc(B * vs * BF16),
             "hidden_last": glm.alloc(B * hs * BF16),
             "last_idx": glm.alloc(B * I32),
-            "argmax_idx": glm.alloc(I32),
+            "argmax_idx": glm.alloc(B * I32),
             "decode_id": glm.alloc(I32),
             "flash_out": glm.alloc(B * n_heads * S * hd * BF16),
             "flash_tmp": glm.alloc(FLASH_TMP_SIZE),
             "input_ids_buf": glm.alloc(BS * I32),
+            "qo_indptr_d": glm.alloc((B + 1) * I32),
+            "kv_indptr_d": glm.alloc((B + 1) * I32),
         }
 
     def free(self) -> None:
@@ -368,6 +384,13 @@ class Qwen3Model:
         self.glm.lib.glm_d2h(self.glm.ctx, buf, ctypes.c_void_p(self._ws["argmax_idx"]), I32)
         return int(np.frombuffer(buf.raw, dtype=np.int32)[0])
 
+    def _argmax_logits_batch(self, batch_size: int) -> list[int]:
+        vs = self.cfg.vocab_size
+        self.glm.argmax(self._ws["argmax_idx"], self._ws["logits_buf"], vs, batch_size)
+        buf = ctypes.create_string_buffer(batch_size * I32)
+        self.glm.lib.glm_d2h(self.glm.ctx, buf, ctypes.c_void_p(self._ws["argmax_idx"]), batch_size * I32)
+        return [int(x) for x in np.frombuffer(buf.raw, dtype=np.int32)]
+
     def generate(self, input_ids: torch.Tensor, cache: FlatKVCache,
                  max_new_tokens: int = 100, eos_token_ids: Optional[set[int]] = None) -> list[int]:
         return list(self.generate_tokens(input_ids, cache, max_new_tokens, eos_token_ids))
@@ -428,9 +451,8 @@ class Qwen3Model:
         cfg = self.cfg
         vs = cfg.vocab_size
 
-        all_logits = self.prefill_batch(input_ids_list, ws, paged_kv)
+        next_tokens = self.prefill_batch(input_ids_list, ws, paged_kv)
 
-        next_tokens = [logits.argmax().item() for logits in all_logits]
         generated: list[list[int]] = [[t] for t in next_tokens]
         finished = [t in eos_token_ids for t in next_tokens]
 
@@ -439,12 +461,11 @@ class Qwen3Model:
                 break
 
             token_ids = [next_tokens[i] for i in range(batch_size)]
-            all_logits = self.decode_batch(token_ids, ws, paged_kv)
+            next_tokens = self.decode_batch(token_ids, ws, paged_kv)
 
             for i in range(batch_size):
                 if finished[i]:
                     continue
-                next_tokens[i] = all_logits[i].argmax().item()
                 if next_tokens[i] in eos_token_ids:
                     finished[i] = True
                 else:
@@ -725,15 +746,13 @@ class Qwen3Model:
                     self.weights[f"{pfx}.self_attn.o_proj.weight"],
                     BS, hs, n_heads * hd)
 
-    def prefill_batch(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
-                      paged_kv: PagedKVCache) -> list[torch.Tensor]:
+    def prefill_batch_plan(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
+                           paged_kv: PagedKVCache) -> PrefillState:
         cfg = self.cfg
         glm = self.glm
-        hs = cfg.hidden_size
         n_heads = cfg.num_attention_heads
         n_kv = cfg.num_key_value_heads
         hd = cfg.head_dim
-        vs = cfg.vocab_size
         batch_size = len(input_ids_list)
 
         paged_kv.reset(batch_size)
@@ -752,9 +771,6 @@ class Qwen3Model:
         ids_np = np.array(all_ids, dtype=np.int32)
         glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
 
-        glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
-                       self._ws["input_ids_buf"], hs, total_tokens)
-
         qo_indptr = [0]
         kv_indptr = [0]
         for s in seq_lens:
@@ -769,9 +785,13 @@ class Qwen3Model:
         pos_ids_np = np.array(pos_ids, dtype=np.int32)
         glm.h2d(self._ws["position_ids"], pos_ids_np.tobytes())
 
-        glm.rotary_embedding(self._ws["cos"], self._ws["sin"], self.inv_freq,
-                              self._ws["position_ids"],
-                              hd // 2, 1, total_tokens)
+        last_indices: list[int] = []
+        offset = 0
+        for s in seq_lens:
+            last_indices.append(offset + s - 1)
+            offset += s
+        last_idx_np = np.array(last_indices, dtype=np.int32)
+        glm.h2d(self._ws["last_idx"], last_idx_np.tobytes())
 
         glm.batch_prefill_ragged_plan(
             ws.float_ws, BATCH_FLOAT_WS_SIZE,
@@ -782,6 +802,32 @@ class Qwen3Model:
             n_heads, n_kv, hd,
             1
         )
+
+        glm.h2d(self._ws["qo_indptr_d"], qo_indptr_np.tobytes())
+        glm.h2d(self._ws["kv_indptr_d"], kv_indptr_np.tobytes())
+
+        return PrefillState(batch_size=batch_size, total_tokens=total_tokens,
+                            seq_lens=seq_lens, page_allocs=page_allocs)
+
+    def prefill_batch_forward(self, state: PrefillState, ws: WorkspaceBuffers,
+                               paged_kv: PagedKVCache) -> None:
+        cfg = self.cfg
+        glm = self.glm
+        hs = cfg.hidden_size
+        n_heads = cfg.num_attention_heads
+        n_kv = cfg.num_key_value_heads
+        hd = cfg.head_dim
+        batch_size = state.batch_size
+        total_tokens = state.total_tokens
+        seq_lens = state.seq_lens
+        page_allocs = state.page_allocs
+
+        glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
+                       self._ws["input_ids_buf"], hs, total_tokens)
+
+        glm.rotary_embedding(self._ws["cos"], self._ws["sin"], self.inv_freq,
+                              self._ws["position_ids"],
+                              hd // 2, 1, total_tokens)
 
         for i in range(cfg.num_hidden_layers):
             pfx = f"model.layers.{i}"
@@ -817,15 +863,10 @@ class Qwen3Model:
             kv_stride_n = hd
             kv_stride_h = total_tokens * hd
 
-            qo_indptr_d = glm.alloc((batch_size + 1) * I32)
-            kv_indptr_d = glm.alloc((batch_size + 1) * I32)
-            glm.h2d(qo_indptr_d, qo_indptr_np.tobytes())
-            glm.h2d(kv_indptr_d, kv_indptr_np.tobytes())
-
             glm.batch_prefill_ragged_run(
                 self._ws["q_rope"], self._ws["k_rope"], self._ws["v_t"], self._ws["flash_out"],
                 ws.float_ws, ws.int_ws,
-                qo_indptr_d, kv_indptr_d,
+                self._ws["qo_indptr_d"], self._ws["kv_indptr_d"],
                 ws.prefill_plan_info,
                 total_tokens, batch_size,
                 n_heads, n_kv, hd,
@@ -834,43 +875,38 @@ class Qwen3Model:
                 1, cfg.scaling
             )
 
-            glm.free_buf(qo_indptr_d)
-            glm.free_buf(kv_indptr_d)
-
             glm.linear(self._ws["o_proj_buf"], self._ws["flash_out"],
                          self.weights[f"{pfx}.self_attn.o_proj.weight"],
                          total_tokens, hs, n_heads * hd)
 
             self._residual_and_mlp(pfx, total_tokens)
 
-        last_indices: list[int] = []
-        offset = 0
-        for s in seq_lens:
-            last_indices.append(offset + s - 1)
-            offset += s
-        last_idx_np = np.array(last_indices, dtype=np.int32)
-        self._extract_last_logits(batch_size, last_idx_np)
+        glm.index_select(self._ws["hidden_last"], self._ws["hidden_a"],
+                          self._ws["last_idx"], hs, batch_size)
+        self._final_norm_and_logits(batch_size, src=self._ws["hidden_last"])
 
+        vs = cfg.vocab_size
+        self.glm.argmax(self._ws["argmax_idx"], self._ws["logits_buf"], vs, batch_size)
+
+    def prefill_batch_read(self, state: PrefillState) -> list[int]:
+        batch_size = state.batch_size
+        buf = ctypes.create_string_buffer(batch_size * I32)
+        self.glm.lib.glm_d2h(self.glm.ctx, buf, ctypes.c_void_p(self._ws["argmax_idx"]), batch_size * I32)
+        return [int(x) for x in np.frombuffer(buf.raw, dtype=np.int32)]
+
+    def prefill_batch(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
+                      paged_kv: PagedKVCache) -> list[int]:
+        state = self.prefill_batch_plan(input_ids_list, ws, paged_kv)
+        self.prefill_batch_forward(state, ws, paged_kv)
         paged_kv.update_indptr()
+        return self.prefill_batch_read(state)
 
-        all_logits: list[torch.Tensor] = []
-        for i in range(batch_size):
-            logits_ptr = self._ws["logits_buf"] + i * vs * BF16
-            logits_u16 = self._read_logits(logits_ptr, vs)
-            logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(vs)
-            all_logits.append(torch.from_numpy(logits_f32.copy()))
-
-        return all_logits
-
-    def decode_batch(self, token_ids_list: list[int], ws: WorkspaceBuffers,
-                     paged_kv: PagedKVCache) -> list[torch.Tensor]:
+    def decode_batch_plan(self, token_ids_list: list[int], ws: WorkspaceBuffers,
+                          paged_kv: PagedKVCache) -> DecodeState:
         cfg = self.cfg
         glm = self.glm
-        hs = cfg.hidden_size
         n_heads = cfg.num_attention_heads
         n_kv = cfg.num_key_value_heads
-        hd = cfg.head_dim
-        vs = cfg.vocab_size
         page_size = paged_kv.page_size
         batch_size = len(token_ids_list)
 
@@ -882,22 +918,14 @@ class Qwen3Model:
         paged_kv.update_indptr()
         paged_kv.update_slot_mapping(write_locations, page_size)
 
-        all_ids = token_ids_list
-        ids_np = np.array(all_ids, dtype=np.int32)
+        ids_np = np.array(token_ids_list, dtype=np.int32)
         glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
-
-        glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
-                       self._ws["input_ids_buf"], hs, batch_size)
 
         pos_ids: list[int] = []
         for seq_idx in range(batch_size):
             pos_ids.append(paged_kv.seq_kv_lens[seq_idx] - 1)
         pos_ids_np = np.array(pos_ids, dtype=np.int32)
         glm.h2d(self._ws["position_ids"], pos_ids_np.tobytes())
-
-        glm.rotary_embedding(self._ws["cos"], self._ws["sin"], self.inv_freq,
-                              self._ws["position_ids"],
-                              hd // 2, batch_size, 1)
 
         glm.batch_decode_plan(
             ws.float_ws, BATCH_FLOAT_WS_SIZE,
@@ -907,6 +935,26 @@ class Qwen3Model:
             batch_size,
             n_heads, n_kv, page_size
         )
+
+        return DecodeState(batch_size=batch_size)
+
+    def decode_batch_forward(self, state: DecodeState, ws: WorkspaceBuffers,
+                             paged_kv: PagedKVCache) -> None:
+        cfg = self.cfg
+        glm = self.glm
+        hs = cfg.hidden_size
+        n_heads = cfg.num_attention_heads
+        n_kv = cfg.num_key_value_heads
+        hd = cfg.head_dim
+        page_size = paged_kv.page_size
+        batch_size = state.batch_size
+
+        glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
+                       self._ws["input_ids_buf"], hs, batch_size)
+
+        glm.rotary_embedding(self._ws["cos"], self._ws["sin"], self.inv_freq,
+                              self._ws["position_ids"],
+                              hd // 2, batch_size, 1)
 
         for i in range(cfg.num_hidden_layers):
             pfx = f"model.layers.{i}"
@@ -941,11 +989,17 @@ class Qwen3Model:
 
         self._final_norm_and_logits(batch_size)
 
-        all_logits: list[torch.Tensor] = []
-        for seq_idx in range(batch_size):
-            logits_ptr = self._ws["logits_buf"] + seq_idx * vs * BF16
-            logits_u16 = self._read_logits(logits_ptr, vs)
-            logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(vs)
-            all_logits.append(torch.from_numpy(logits_f32.copy()))
+        vs = cfg.vocab_size
+        self.glm.argmax(self._ws["argmax_idx"], self._ws["logits_buf"], vs, batch_size)
 
-        return all_logits
+    def decode_batch_read(self, state: DecodeState) -> list[int]:
+        batch_size = state.batch_size
+        buf = ctypes.create_string_buffer(batch_size * I32)
+        self.glm.lib.glm_d2h(self.glm.ctx, buf, ctypes.c_void_p(self._ws["argmax_idx"]), batch_size * I32)
+        return [int(x) for x in np.frombuffer(buf.raw, dtype=np.int32)]
+
+    def decode_batch(self, token_ids_list: list[int], ws: WorkspaceBuffers,
+                     paged_kv: PagedKVCache) -> list[int]:
+        state = self.decode_batch_plan(token_ids_list, ws, paged_kv)
+        self.decode_batch_forward(state, ws, paged_kv)
+        return self.decode_batch_read(state)

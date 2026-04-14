@@ -45,6 +45,17 @@ interface Workspace {
   [key: string]: number;
 }
 
+export interface DecodeState {
+  batchSize: number;
+}
+
+export interface PrefillState {
+  batchSize: number;
+  totalTokens: number;
+  seqLens: number[];
+  pageAllocs: [number, number][];
+}
+
 export class Qwen3Model {
   glm: GlmOps;
   cfg: Qwen3Config;
@@ -139,11 +150,13 @@ export class Qwen3Model {
       logitsBuf: glm.alloc(B * vs * BF16),
       hiddenLast: glm.alloc(B * hs * BF16),
       lastIdx: glm.alloc(B * I32),
-      argmaxIdx: glm.alloc(I32),
+      argmaxIdx: glm.alloc(B * I32),
       decodeId: glm.alloc(I32),
       flashOut: glm.alloc(B * nHeads * S * hd * BF16),
       flashTmp: glm.alloc(FLASH_TMP_SIZE),
       inputIdsBuf: glm.alloc(BS * I32),
+      qoIndptrD: glm.alloc((B + 1) * I32),
+      kvIndptrD: glm.alloc((B + 1) * I32),
     };
   }
 
@@ -173,6 +186,18 @@ export class Qwen3Model {
     const buf = Buffer.alloc(I32);
     this.glm.d2h(buf, this.ws.argmaxIdx);
     return buf.readInt32LE(0);
+  }
+
+  private readArgmaxBatch(batchSize: number): number[] {
+    const vs = this.cfg.vocabSize;
+    this.glm.argmax(this.ws.argmaxIdx, this.ws.logitsBuf, vs, batchSize);
+    const buf = Buffer.alloc(batchSize * I32);
+    this.glm.d2h(buf, this.ws.argmaxIdx);
+    const result: number[] = [];
+    for (let i = 0; i < batchSize; i++) {
+      result.push(buf.readInt32LE(i * I32));
+    }
+    return result;
   }
 
   prefill(inputIds: number[][], cache: FlatKVCache): number {
@@ -438,14 +463,12 @@ export class Qwen3Model {
     glm.linear(this.ws.oProjBuf, this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd);
   }
 
-  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
+  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): PrefillState {
     const cfg = this.cfg;
     const glm = this.glm;
-    const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
-    const vs = cfg.vocabSize;
     const batchSize = inputIdsList.length;
 
     pagedKV.reset(batchSize);
@@ -463,8 +486,6 @@ export class Qwen3Model {
     const idsBuf = Int32Array.from(allIds);
     glm.h2d(this.ws.inputIdsBuf, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
 
-    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, totalTokens);
-
     const indptr = [0];
     for (const s of seqLens) {
       indptr.push(indptr[indptr.length - 1] + s);
@@ -478,9 +499,15 @@ export class Qwen3Model {
     const posIdsBuf = Int32Array.from(posIds);
     glm.h2d(this.ws.positionIds, Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
 
-    glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, 1, totalTokens);
+    const lastIndices: number[] = [];
+    let offset = 0;
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      lastIndices.push(offset + seqLens[seqIdx] - 1);
+      offset += seqLens[seqIdx];
+    }
+    const lastIdxBuf = Int32Array.from(lastIndices);
+    glm.h2d(this.ws.lastIdx, Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
 
-    // Write indptr to host memory for plan
     const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
     const kvIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
     glm.writePinned(qoIndptrHostPtr, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
@@ -499,6 +526,28 @@ export class Qwen3Model {
     glm.freePinned(qoIndptrHostPtr);
     glm.freePinned(kvIndptrHostPtr);
 
+    glm.h2d(this.ws.qoIndptrD, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
+    glm.h2d(this.ws.kvIndptrD, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
+
+    return { batchSize, totalTokens, seqLens, pageAllocs };
+  }
+
+  prefillBatchForward(state: PrefillState, ws: WorkspaceBuffers, pagedKV: PagedKVCache): void {
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const hs = cfg.hiddenSize;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const batchSize = state.batchSize;
+    const totalTokens = state.totalTokens;
+    const seqLens = state.seqLens;
+    const pageAllocs = state.pageAllocs;
+
+    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, totalTokens);
+
+    glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, 1, totalTokens);
+
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
 
@@ -506,7 +555,6 @@ export class Qwen3Model {
 
       this.computeQkv(pfx, totalTokens, 1, totalTokens);
 
-      // Copy KV to paged cache
       const pageSize = pagedKV.pageSize;
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
         const [startPage, numPages] = pageAllocs[seqIdx];
@@ -532,15 +580,10 @@ export class Qwen3Model {
       const kvStrideN = hd;
       const kvStrideH = totalTokens * hd;
 
-      const qoIndptrD = glm.alloc((batchSize + 1) * I32);
-      const kvIndptrD = glm.alloc((batchSize + 1) * I32);
-      glm.h2d(qoIndptrD, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
-      glm.h2d(kvIndptrD, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
-
       glm.batchPrefillRaggedRun(
         this.ws.qRope, this.ws.kRope, this.ws.vT, this.ws.flashOut,
         ws.floatWs, ws.intWs,
-        qoIndptrD, kvIndptrD,
+        this.ws.qoIndptrD, this.ws.kvIndptrD,
         ws.prefillPlanInfo,
         totalTokens, batchSize,
         nHeads, nKv, hd,
@@ -549,41 +592,39 @@ export class Qwen3Model {
         1, cfg.scaling
       );
 
-      glm.freeBuf(qoIndptrD);
-      glm.freeBuf(kvIndptrD);
-
       glm.linear(this.ws.oProjBuf, this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, totalTokens, hs, nHeads * hd);
       this.residualAndMlp(pfx, totalTokens);
     }
 
-    const lastIndices: number[] = [];
-    let offset = 0;
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      lastIndices.push(offset + seqLens[seqIdx] - 1);
-      offset += seqLens[seqIdx];
-    }
-    const lastIdxBuf = Int32Array.from(lastIndices);
-    this.extractLastLogits(batchSize, Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+    glm.indexSelect(this.ws.hiddenLast, this.ws.hiddenA, this.ws.lastIdx, hs, batchSize);
+    this.finalNormAndLogits(batchSize, this.ws.hiddenLast);
 
-    pagedKV.updateIndptr();
-
-    const nextTokens: number[] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      const logitsPtr = this.ws.logitsBuf + seqIdx * vs * BF16;
-      nextTokens.push(this.readArgmax(logitsPtr, vs));
-    }
-
-    return nextTokens;
+    this.glm.argmax(this.ws.argmaxIdx, this.ws.logitsBuf, cfg.vocabSize, batchSize);
   }
 
-  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
+  prefillBatchRead(state: PrefillState): number[] {
+    const batchSize = state.batchSize;
+    const buf = Buffer.alloc(batchSize * I32);
+    this.glm.d2h(buf, this.ws.argmaxIdx);
+    const result: number[] = [];
+    for (let i = 0; i < batchSize; i++) {
+      result.push(buf.readInt32LE(i * I32));
+    }
+    return result;
+  }
+
+  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
+    const state = this.prefillBatchPlan(inputIdsList, ws, pagedKV);
+    this.prefillBatchForward(state, ws, pagedKV);
+    pagedKV.updateIndptr();
+    return this.prefillBatchRead(state);
+  }
+
+  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache): DecodeState {
     const cfg = this.cfg;
     const glm = this.glm;
-    const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const vs = cfg.vocabSize;
     const pageSize = pagedKV.pageSize;
     const batchSize = tokenIdsList.length;
 
@@ -598,16 +639,12 @@ export class Qwen3Model {
     const idsBuf = Int32Array.from(tokenIdsList);
     glm.h2d(this.ws.inputIdsBuf, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
 
-    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, batchSize);
-
     const posIds = new Array(batchSize);
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       posIds[seqIdx] = pagedKV.seqKvLens[seqIdx] - 1;
     }
     const posIdsBuf = Int32Array.from(posIds);
     glm.h2d(this.ws.positionIds, Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
-
-    glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, batchSize, 1);
 
     glm.batchDecodePlan(
       ws.floatWs, BATCH_FLOAT_WS_SIZE,
@@ -617,6 +654,23 @@ export class Qwen3Model {
       batchSize,
       nHeads, nKv, pageSize
     );
+
+    return { batchSize };
+  }
+
+  decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, pagedKV: PagedKVCache): void {
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const hs = cfg.hiddenSize;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const pageSize = pagedKV.pageSize;
+    const batchSize = state.batchSize;
+
+    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, batchSize);
+
+    glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, batchSize, 1);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
@@ -648,13 +702,24 @@ export class Qwen3Model {
 
     this.finalNormAndLogits(batchSize);
 
-    const nextTokens: number[] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      const logitsPtr = this.ws.logitsBuf + seqIdx * vs * BF16;
-      nextTokens.push(this.readArgmax(logitsPtr, vs));
-    }
+    this.glm.argmax(this.ws.argmaxIdx, this.ws.logitsBuf, cfg.vocabSize, batchSize);
+  }
 
-    return nextTokens;
+  decodeBatchRead(state: DecodeState): number[] {
+    const batchSize = state.batchSize;
+    const buf = Buffer.alloc(batchSize * I32);
+    this.glm.d2h(buf, this.ws.argmaxIdx);
+    const result: number[] = [];
+    for (let i = 0; i < batchSize; i++) {
+      result.push(buf.readInt32LE(i * I32));
+    }
+    return result;
+  }
+
+  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
+    const state = this.decodeBatchPlan(tokenIdsList, ws, pagedKV);
+    this.decodeBatchForward(state, ws, pagedKV);
+    return this.decodeBatchRead(state);
   }
 
   generateBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[][] {
