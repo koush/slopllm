@@ -157,7 +157,8 @@ void glm_batch_decode_plan(
     int32_t* indptr_h,
     uint32_t batch_size,
     uint32_t num_qo_heads, uint32_t num_kv_heads,
-    uint32_t page_size);
+    uint32_t page_size,
+    bool enable_cuda_graph);
 
 void glm_batch_decode_run(
     GlmCtx* ctx,

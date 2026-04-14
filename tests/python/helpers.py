@@ -366,6 +366,7 @@ class GlmOps:
             ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32,
+            ctypes.c_bool,
         ]
 
         self.lib.glm_batch_decode_run.restype = None
@@ -493,15 +494,12 @@ class GlmOps:
 
     def arange(self, out, start, step, count):
         self.lib.glm_arange(self.ctx, self._ptr(out), start, step, count)
-        self.synchronize()
 
     def argmax(self, out_index, input, dim, batch=1):
         self.lib.glm_argmax(self.ctx, self._ptr(out_index), self._ptr(input), dim, batch)
-        self.synchronize()
 
     def memcpy(self, dst, src, bytes):
         self.lib.glm_memcpy(self.ctx, self._ptr(dst), self._ptr(src), bytes)
-        self.synchronize()
 
     def rmsnorm(self, output, input, weight, eps, dim, batch):
         self.lib.glm_rmsnorm(
@@ -511,7 +509,6 @@ class GlmOps:
             self._ptr(weight),
             ctypes.c_float(eps), dim, batch
         )
-        self.synchronize()
 
     def silu_and_mul(self, output, gate, up, intermediate, batch):
         self.lib.glm_silu_and_mul(
@@ -521,7 +518,6 @@ class GlmOps:
             self._ptr(up),
             intermediate, batch
         )
-        self.synchronize()
 
     def linear(self, output, input, weight, batch, n, k):
         self.lib.glm_linear(
@@ -531,7 +527,6 @@ class GlmOps:
             self._ptr(weight),
             batch, n, k
         )
-        self.synchronize()
 
     def embedding(self, output, table, ids, hidden, seq_len):
         self.lib.glm_embedding(
@@ -541,7 +536,6 @@ class GlmOps:
             self._ptr(ids),
             hidden, seq_len
         )
-        self.synchronize()
 
     def layernorm(self, output, input, weight, bias, eps, dim, batch):
         bias_ptr = self._ptr(bias) if bias is not None else ctypes.c_void_p(0)
@@ -553,7 +547,6 @@ class GlmOps:
             bias_ptr,
             ctypes.c_float(eps), dim, batch
         )
-        self.synchronize()
 
     def relu(self, output, input, n):
         self.lib.glm_relu(
@@ -562,7 +555,6 @@ class GlmOps:
             self._ptr(input),
             n
         )
-        self.synchronize()
 
     def sigmoid(self, output, input, n):
         self.lib.glm_sigmoid(
@@ -571,7 +563,6 @@ class GlmOps:
             self._ptr(input),
             n
         )
-        self.synchronize()
 
     def softmax(self, output, input, mask, dim, batch):
         mask_ptr = self._ptr(mask) if mask is not None else ctypes.c_void_p(0)
@@ -582,7 +573,6 @@ class GlmOps:
             mask_ptr,
             dim, batch
         )
-        self.synchronize()
 
     def causal_mask(self, output, seq_len):
         self.lib.glm_causal_mask(
@@ -590,7 +580,6 @@ class GlmOps:
             self._ptr(output),
             seq_len
         )
-        self.synchronize()
 
     def fill(self, output, value, n):
         self.lib.glm_fill(
@@ -599,7 +588,6 @@ class GlmOps:
             ctypes.c_float(value),
             n
         )
-        self.synchronize()
 
     def gather(self, output, input, indices, k, in_dim, batch):
         self.lib.glm_gather(
@@ -609,7 +597,6 @@ class GlmOps:
             self._ptr(indices),
             k, in_dim, batch
         )
-        self.synchronize()
 
     def scatter_scalar(self, output, indices, value, k, out_dim, batch):
         self.lib.glm_scatter_scalar(
@@ -619,7 +606,6 @@ class GlmOps:
             ctypes.c_float(value),
             k, out_dim, batch
         )
-        self.synchronize()
 
     def cat_last_dim(self, output, a, b, a_last_dim, b_last_dim, outer):
         self.lib.glm_cat_last_dim(
@@ -629,7 +615,6 @@ class GlmOps:
             self._ptr(b),
             a_last_dim, b_last_dim, outer
         )
-        self.synchronize()
 
     def masked_fill(self, output, input, mask, value, n):
         self.lib.glm_masked_fill(
@@ -640,7 +625,6 @@ class GlmOps:
             ctypes.c_float(value),
             n
         )
-        self.synchronize()
 
     def index_add(self, output, indices, values, n_indices, dim):
         self.lib.glm_index_add(
@@ -650,7 +634,6 @@ class GlmOps:
             self._ptr(values),
             n_indices, dim
         )
-        self.synchronize()
 
     def rotary_embedding(self, cos_out, sin_out, inv_freq, position_ids, dim_half, batch, seq_len):
         if hasattr(position_ids, 'data_ptr'):
@@ -666,7 +649,6 @@ class GlmOps:
             pos_ptr,
             dim_half, batch, seq_len
         )
-        self.synchronize()
 
     def apply_rotary_pos_emb(self, output, x, cos, sin, rope_dim, n_heads, seq_len, batch, unsqueeze_dim):
         self.lib.glm_apply_rotary_pos_emb(
@@ -677,7 +659,6 @@ class GlmOps:
             self._ptr(sin),
             rope_dim, n_heads, seq_len, batch, unsqueeze_dim
         )
-        self.synchronize()
 
     def topk(self, out_values, out_indices, input, k, dim, batch):
         self.lib.glm_topk(
@@ -687,7 +668,6 @@ class GlmOps:
             self._ptr(input),
             k, dim, batch
         )
-        self.synchronize()
 
     def bmm(self, C, A, B, alpha, beta, batch, M, N, K, transB):
         self.lib.glm_bmm(
@@ -698,7 +678,6 @@ class GlmOps:
             ctypes.c_float(alpha), ctypes.c_float(beta),
             batch, M, N, K, transB
         )
-        self.synchronize()
 
     def scale(self, output, input, scale, n):
         self.lib.glm_scale(
@@ -708,7 +687,6 @@ class GlmOps:
             ctypes.c_float(scale),
             n
         )
-        self.synchronize()
 
     def add(self, output, a, b, n):
         self.lib.glm_add(
@@ -718,7 +696,6 @@ class GlmOps:
             self._ptr(b),
             n
         )
-        self.synchronize()
 
     def expand_dim1(self, output, input, dim1_out, dim1_in, seq_len, head_dim, batch):
         self.lib.glm_expand_dim1(
@@ -727,7 +704,6 @@ class GlmOps:
             self._ptr(input),
             dim1_out, dim1_in, seq_len, head_dim, batch
         )
-        self.synchronize()
 
     def expand_dim1_strided(self, output, input, dim1_out, dim1_in, seq_len, head_dim, batch, head_stride):
         self.lib.glm_expand_dim1_strided(
@@ -736,7 +712,6 @@ class GlmOps:
             self._ptr(input),
             dim1_out, dim1_in, seq_len, head_dim, batch, head_stride
         )
-        self.synchronize()
 
     def transpose_4d(self, output, input, d0, d1, d2, d3, p0, p1, p2, p3):
         self.lib.glm_transpose_4d(
@@ -745,7 +720,6 @@ class GlmOps:
             self._ptr(input),
             d0, d1, d2, d3, p0, p1, p2, p3
         )
-        self.synchronize()
 
     def mul(self, output, a, b, n):
         self.lib.glm_mul(
@@ -755,7 +729,6 @@ class GlmOps:
             self._ptr(b),
             n
         )
-        self.synchronize()
 
     def reduce_sum(self, output, input, rows, cols):
         self.lib.glm_reduce_sum(
@@ -764,7 +737,6 @@ class GlmOps:
             self._ptr(input),
             rows, cols
         )
-        self.synchronize()
 
     def index_select(self, output, src, indices, dim, k):
         self.lib.glm_index_select(
@@ -774,7 +746,6 @@ class GlmOps:
             self._ptr(indices),
             dim, k
         )
-        self.synchronize()
 
     def flash_prefill(self, q, k, v, o, tmp,
                       qo_len, kv_len,
@@ -793,7 +764,6 @@ class GlmOps:
             v_stride_n, v_stride_h,
             mask_mode, kv_layout, ctypes.c_float(sm_scale)
         )
-        self.synchronize()
 
     def flash_decode(self, q, k, v, o, tmp,
                      kv_len,
@@ -810,7 +780,6 @@ class GlmOps:
             kv_stride_n, kv_stride_h,
             ctypes.c_float(sm_scale)
         )
-        self.synchronize()
 
     def alloc_pinned(self, nbytes):
         ptr = self.lib.glm_alloc_pinned(nbytes)
@@ -824,7 +793,8 @@ class GlmOps:
     def batch_decode_plan(self, float_ws, float_ws_size,
                           int_ws, pinned_int_ws, int_ws_size,
                           plan_info, indptr_h,
-                          batch_size, num_qo_heads, num_kv_heads, page_size):
+                          batch_size, num_qo_heads, num_kv_heads, page_size,
+                          enable_cuda_graph=False):
         self.lib.glm_batch_decode_plan(
             self.ctx,
             ctypes.c_void_p(float_ws), ctypes.c_size_t(float_ws_size),
@@ -833,9 +803,9 @@ class GlmOps:
             ctypes.c_void_p(indptr_h),
             ctypes.c_uint32(batch_size),
             ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads),
-            ctypes.c_uint32(page_size)
+            ctypes.c_uint32(page_size),
+            ctypes.c_bool(enable_cuda_graph)
         )
-        self.synchronize()
 
     def batch_decode_run(self, q, o, k_data, v_data,
                          indices, indptr_d, last_page_len,
@@ -855,7 +825,6 @@ class GlmOps:
             ctypes.c_uint32(head_dim), ctypes.c_uint32(page_size),
             ctypes.c_float(sm_scale)
         )
-        self.synchronize()
 
     def batch_prefill_ragged_plan(self, float_ws, float_ws_size,
                                    int_ws, pinned_int_ws, int_ws_size,
@@ -871,9 +840,8 @@ class GlmOps:
             ctypes.c_void_p(qo_indptr_h), ctypes.c_void_p(kv_indptr_h),
             ctypes.c_uint32(total_qo_rows), ctypes.c_uint32(batch_size),
             ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads),
-            ctypes.c_uint32(head_dim), ctypes.c_int32(mask_mode)
+            ctypes.c_uint32(head_dim),             ctypes.c_int32(mask_mode)
         )
-        self.synchronize()
 
     def batch_prefill_ragged_run(self, q, k, v, o,
                                   float_ws, int_ws,
@@ -894,9 +862,8 @@ class GlmOps:
             ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads), ctypes.c_uint32(head_dim),
             ctypes.c_uint32(q_stride_n), ctypes.c_uint32(q_stride_h),
             ctypes.c_uint32(kv_stride_n), ctypes.c_uint32(kv_stride_h),
-            ctypes.c_int32(mask_mode), ctypes.c_float(sm_scale)
+            ctypes.c_int32(mask_mode),             ctypes.c_float(sm_scale)
         )
-        self.synchronize()
 
     def graph_begin_capture(self):
         self.lib.glm_graph_begin_capture(self.ctx)
@@ -911,7 +878,6 @@ class GlmOps:
 
     def graph_launch(self, graph_exec):
         self.lib.glm_graph_launch(ctypes.c_void_p(graph_exec), self.ctx)
-        self.synchronize()
 
     def graph_exec_update(self, graph_exec, graph):
         return self.lib.glm_graph_exec_update(ctypes.c_void_p(graph_exec), ctypes.c_void_p(graph))
@@ -932,4 +898,3 @@ class GlmOps:
             ctypes.c_uint32(batch_size), ctypes.c_uint32(n_kv),
             ctypes.c_uint32(hd), ctypes.c_uint32(page_size)
         )
-        self.synchronize()

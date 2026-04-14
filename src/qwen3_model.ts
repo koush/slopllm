@@ -652,7 +652,8 @@ export class Qwen3Model {
       ws.decodePlanInfo,
       pagedKV.indptrH,
       batchSize,
-      nHeads, nKv, pageSize
+      nHeads, nKv, pageSize,
+      false
     );
 
     return { batchSize };

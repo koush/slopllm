@@ -902,7 +902,8 @@ class Qwen3Model:
         return self.prefill_batch_read(state)
 
     def decode_batch_plan(self, token_ids_list: list[int], ws: WorkspaceBuffers,
-                          paged_kv: PagedKVCache) -> DecodeState:
+                          paged_kv: PagedKVCache,
+                          enable_cuda_graph: bool = False) -> DecodeState:
         cfg = self.cfg
         glm = self.glm
         n_heads = cfg.num_attention_heads
@@ -933,7 +934,8 @@ class Qwen3Model:
             ws.decode_plan_info,
             paged_kv.indptr_h,
             batch_size,
-            n_heads, n_kv, page_size
+            n_heads, n_kv, page_size,
+            enable_cuda_graph
         )
 
         return DecodeState(batch_size=batch_size)
