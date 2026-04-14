@@ -30,20 +30,17 @@ const HEADER_SIZE = 8;
 export class SafeTensorFile {
   private fd: number;
   private header: Record<string, TensorMeta>;
-  private metadata: Record<string, string>;
   private _dataStart: number;
   private _tensorNames: string[];
 
   private constructor(
     fd: number,
     header: Record<string, TensorMeta>,
-    metadata: Record<string, string>,
     dataStart: number,
     tensorNames: string[],
   ) {
     this.fd = fd;
     this.header = header;
-    this.metadata = metadata;
     this._dataStart = dataStart;
     this._tensorNames = tensorNames;
   }
@@ -78,15 +75,11 @@ export class SafeTensorFile {
     }
 
     const header: Record<string, TensorMeta> = {};
-    const metadata: Record<string, string> = {};
     const tensorNames: string[] = [];
     let prevEnd = 0;
 
     for (const [key, value] of Object.entries(parsed)) {
       if (key === "__metadata__") {
-        if (typeof value === "object" && value !== null) {
-          Object.assign(metadata, value as Record<string, string>);
-        }
         continue;
       }
 
@@ -118,7 +111,7 @@ export class SafeTensorFile {
       tensorNames.push(key);
     }
 
-    return new SafeTensorFile(fd, header, metadata, HEADER_SIZE + Number(headerLen), tensorNames);
+    return new SafeTensorFile(fd, header, HEADER_SIZE + Number(headerLen), tensorNames);
   }
 
   get dataStart(): number {

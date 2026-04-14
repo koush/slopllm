@@ -2,8 +2,6 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -54,6 +52,7 @@ void* glm_alloc(GlmCtx* ctx, size_t bytes) {
 }
 
 void glm_free_buf(GlmCtx* ctx, void* ptr) {
+    (void)ctx;
     if (ptr) cudaFree(ptr);
 }
 

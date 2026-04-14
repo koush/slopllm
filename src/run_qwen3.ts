@@ -1,13 +1,14 @@
-import { GlmOps } from "./glm_ops.js";
-import { Qwen3Model } from "./qwen3_model.js";
+import { GlmOps } from "./glm_ops";
+import { Qwen3Model } from "./qwen3_model";
+import { FlatKVCache } from "./flat_kv";
 import { AutoTokenizer, PreTrainedTokenizer } from "@huggingface/transformers";
-import { resolveModelPath } from "./model_path.js";
+import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const EOS_TOKEN_IDS = new Set([151645, 151643]);
 
-async function chatLoop(model: Qwen3Model, tokenizer: PreTrainedTokenizer, maxNewTokens: number, noThink: boolean): Promise<void> {
+async function chatLoop(model: Qwen3Model, cache: FlatKVCache, tokenizer: PreTrainedTokenizer, maxNewTokens: number, noThink: boolean): Promise<void> {
   const messages: Array<{ role: string; content: string }> = [];
   const enableThinking = !noThink;
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -22,7 +23,7 @@ async function chatLoop(model: Qwen3Model, tokenizer: PreTrainedTokenizer, maxNe
     if (userInput.toLowerCase() === "/clear") {
       messages.length = 0;
       console.log("Conversation cleared.");
-      model.resetCache();
+      cache.reset();
       continue;
     }
 
@@ -48,7 +49,7 @@ async function chatLoop(model: Qwen3Model, tokenizer: PreTrainedTokenizer, maxNe
     const start = Date.now();
     let tokenCount = 0;
 
-    for (const tokenId of model.streamTokens(inputIds, maxNewTokens, EOS_TOKEN_IDS)) {
+    for (const tokenId of model.streamTokens(inputIds, cache, maxNewTokens, EOS_TOKEN_IDS)) {
       generatedIds.push(tokenId);
       tokenCount++;
       const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -71,7 +72,7 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   let maxTokens = 512;
   let noThink = false;
-  let gpu = undefined;
+  let gpu: number | undefined;
   let maxSeqLen = 2048;
 
   for (let i = 0; i < args.length; i++) {
@@ -92,6 +93,7 @@ async function main(): Promise<void> {
   console.log(`Loading model on GPU ${gpuId}...`);
   const glm = new GlmOps(0);
   const model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 1, maxSeqLen);
+  const cache = model.createFlatKVCache();
 
   const modelDir = resolveModelPath(QWEN3_REPO);
   const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
@@ -99,7 +101,7 @@ async function main(): Promise<void> {
   console.log(`Qwen3-0.6B ready (max_tokens=${maxTokens}, thinking=${noThink ? "off" : "on"})`);
   console.log("Type a message to chat. /clear to reset, /q to quit.");
 
-  await chatLoop(model, tokenizer, maxTokens, noThink);
+  await chatLoop(model, cache, tokenizer, maxTokens, noThink);
 }
 
 main().catch((err) => {

@@ -99,7 +99,7 @@ static Napi::Value Rmsnorm(const Napi::CallbackInfo& info) {
 
 static Napi::Value SiluAndMul(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 5) {
+    if (info.Length() < 6) {
         Napi::TypeError::New(env, "Expected (ctx, out, gate, up, intermediate, batch)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -119,7 +119,7 @@ static Napi::Value SiluAndMul(const Napi::CallbackInfo& info) {
 
 static Napi::Value Linear(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 6) {
+    if (info.Length() < 7) {
         Napi::TypeError::New(env, "Expected (ctx, out, input, weight, batch, n, k)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -140,7 +140,7 @@ static Napi::Value Linear(const Napi::CallbackInfo& info) {
 
 static Napi::Value Embedding(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 5) {
+    if (info.Length() < 6) {
         Napi::TypeError::New(env, "Expected (ctx, out, table, ids, hidden, seq_len)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -160,7 +160,7 @@ static Napi::Value Embedding(const Napi::CallbackInfo& info) {
 
 static Napi::Value Layernorm(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 7) {
+    if (info.Length() < 8) {
         Napi::TypeError::New(env, "Expected (ctx, out, input, weight, bias, eps, dim, batch)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -183,7 +183,7 @@ static Napi::Value Layernorm(const Napi::CallbackInfo& info) {
 
 static Napi::Value Relu(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 3) {
+    if (info.Length() < 4) {
         Napi::TypeError::New(env, "Expected (ctx, out, input, n)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -199,7 +199,7 @@ static Napi::Value Relu(const Napi::CallbackInfo& info) {
 
 static Napi::Value Sigmoid(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 3) {
+    if (info.Length() < 4) {
         Napi::TypeError::New(env, "Expected (ctx, out, input, n)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -215,7 +215,7 @@ static Napi::Value Sigmoid(const Napi::CallbackInfo& info) {
 
 static Napi::Value Softmax(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 5) {
+    if (info.Length() < 6) {
         Napi::TypeError::New(env, "Expected (ctx, out, input, mask, dim, batch)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -235,7 +235,7 @@ static Napi::Value Softmax(const Napi::CallbackInfo& info) {
 
 static Napi::Value CausalMask(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 2) {
+    if (info.Length() < 3) {
         Napi::TypeError::New(env, "Expected (ctx, out, seq_len)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -249,7 +249,7 @@ static Napi::Value CausalMask(const Napi::CallbackInfo& info) {
 
 static Napi::Value Fill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 3) {
+    if (info.Length() < 4) {
         Napi::TypeError::New(env, "Expected (ctx, out, value, n)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -264,7 +264,7 @@ static Napi::Value Fill(const Napi::CallbackInfo& info) {
 
 static Napi::Value Gather(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 6) {
+    if (info.Length() < 7) {
         Napi::TypeError::New(env, "Expected (ctx, out, input, indices, k, in_dim, batch)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -285,7 +285,7 @@ static Napi::Value Gather(const Napi::CallbackInfo& info) {
 
 static Napi::Value ScatterScalar(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 6) {
+    if (info.Length() < 7) {
         Napi::TypeError::New(env, "Expected (ctx, out, indices, value, k, out_dim, batch)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -305,7 +305,7 @@ static Napi::Value ScatterScalar(const Napi::CallbackInfo& info) {
 
 static Napi::Value CatLastDim(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 6) {
+    if (info.Length() < 7) {
         Napi::TypeError::New(env, "Expected (ctx, out, a, b, a_last_dim, b_last_dim, outer)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -326,7 +326,7 @@ static Napi::Value CatLastDim(const Napi::CallbackInfo& info) {
 
 static Napi::Value MaskedFill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 5) {
+    if (info.Length() < 6) {
         Napi::TypeError::New(env, "Expected (ctx, out, input, mask, value, n)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -346,7 +346,7 @@ static Napi::Value MaskedFill(const Napi::CallbackInfo& info) {
 
 static Napi::Value IndexAdd(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 5) {
+    if (info.Length() < 6) {
         Napi::TypeError::New(env, "Expected (ctx, out, indices, values, n_indices, dim)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -366,7 +366,7 @@ static Napi::Value IndexAdd(const Napi::CallbackInfo& info) {
 
 static Napi::Value RotaryEmbedding(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 7) {
+    if (info.Length() < 8) {
         Napi::TypeError::New(env, "Expected (ctx, cos_out, sin_out, inv_freq, position_ids, dim_half, batch, seq_len)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -389,7 +389,7 @@ static Napi::Value RotaryEmbedding(const Napi::CallbackInfo& info) {
 
 static Napi::Value ApplyRotaryPosEmb(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 9) {
+    if (info.Length() < 10) {
         Napi::TypeError::New(env, "Expected (ctx, out, x, cos, sin, rope_dim, n_heads, seq_len, batch, unsqueeze_dim)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -414,7 +414,7 @@ static Napi::Value ApplyRotaryPosEmb(const Napi::CallbackInfo& info) {
 
 static Napi::Value Topk(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 6) {
+    if (info.Length() < 7) {
         Napi::TypeError::New(env, "Expected (ctx, out_values, out_indices, input, k, dim, batch)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -460,7 +460,7 @@ static Napi::Value Bmm(const Napi::CallbackInfo& info) {
 
 static Napi::Value Scale(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 4) {
+    if (info.Length() < 5) {
         Napi::TypeError::New(env, "Expected (ctx, out, input, scale, n)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -477,7 +477,7 @@ static Napi::Value Scale(const Napi::CallbackInfo& info) {
 
 static Napi::Value Add(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 4) {
+    if (info.Length() < 5) {
         Napi::TypeError::New(env, "Expected (ctx, out, a, b, n)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -516,7 +516,7 @@ static Napi::Value ExpandDim1(const Napi::CallbackInfo& info) {
 
 static Napi::Value Transpose4d(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 10) {
+    if (info.Length() < 11) {
         Napi::TypeError::New(env, "Expected (ctx, out, input, d0, d1, d2, d3, p0, p1, p2, p3)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -679,7 +679,7 @@ static Napi::Value ExpandDim1Strided(const Napi::CallbackInfo& info) {
 
 static Napi::Value FlashPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 19) {
+    if (info.Length() < 20) {
         Napi::TypeError::New(env, "Expected (ctx, q, k, v, o, tmp, qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, v_stride_n, v_stride_h, mask_mode, kv_layout, sm_scale)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -720,7 +720,7 @@ static Napi::Value FlashPrefill(const Napi::CallbackInfo& info) {
 
 static Napi::Value FlashDecode(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 14) {
+    if (info.Length() < 15) {
         Napi::TypeError::New(env, "Expected (ctx, q, k, v, o, tmp, kv_len, num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, sm_scale)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -835,7 +835,7 @@ static Napi::Value WritePinned(const Napi::CallbackInfo& info) {
 
 static Napi::Value BatchDecodePlan(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 11) {
+    if (info.Length() < 12) {
         Napi::TypeError::New(env, "Expected (ctx, float_ws, float_ws_size, int_ws, pinned_int_ws, int_ws_size, plan_info, indptr_h, batch_size, num_qo_heads, num_kv_heads, page_size)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -863,7 +863,7 @@ static Napi::Value BatchDecodePlan(const Napi::CallbackInfo& info) {
 
 static Napi::Value BatchDecodeRun(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 13) {
+    if (info.Length() < 17) {
         Napi::TypeError::New(env, "Expected (ctx, q, o, k_data, v_data, indices, indptr_d, last_page_len, float_ws, int_ws, plan_info, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -899,7 +899,7 @@ static Napi::Value BatchDecodeRun(const Napi::CallbackInfo& info) {
 
 static Napi::Value BatchPrefillRaggedPlan(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 12) {
+    if (info.Length() < 15) {
         Napi::TypeError::New(env, "Expected (ctx, float_ws, float_ws_size, int_ws, pinned_int_ws, int_ws_size, plan_info, qo_indptr_h, kv_indptr_h, total_qo_rows, batch_size, num_qo_heads, num_kv_heads, head_dim, mask_mode)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -932,7 +932,7 @@ static Napi::Value BatchPrefillRaggedPlan(const Napi::CallbackInfo& info) {
 
 static Napi::Value BatchPrefillRaggedRun(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 18) {
+    if (info.Length() < 21) {
         Napi::TypeError::New(env, "Expected (ctx, q, k, v, o, float_ws, int_ws, q_indptr_d, kv_indptr_d, plan_info, total_qo_rows, batch_size, num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, mask_mode, sm_scale)").ThrowAsJavaScriptException();
         return env.Undefined();
     }

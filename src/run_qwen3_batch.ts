@@ -1,8 +1,8 @@
-import { GlmOps } from "./glm_ops.js";
-import { Qwen3Model } from "./qwen3_model.js";
-import { PagedKVCache, WorkspaceBuffers } from "./paged_kv.js";
+import { GlmOps } from "./glm_ops";
+import { Qwen3Model } from "./qwen3_model";
+import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { AutoTokenizer } from "@huggingface/transformers";
-import { resolveModelPath } from "./model_path.js";
+import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";

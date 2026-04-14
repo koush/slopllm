@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, FLASH_TMP_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, PAGE_SIZE } from "./glm_ops.js";
-import { SafeTensorFile } from "./safetensors.js";
-import { resolveModelPath } from "./model_path.js";
-import { PagedKVCache, WorkspaceBuffers } from "./paged_kv.js";
+import { GlmOps, f32ToBf16Bytes, BF16, I32, FLASH_TMP_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE } from "./glm_ops";
+import { SafeTensorFile } from "./safetensors";
+import { resolveModelPath } from "./model_path";
+import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
+import { FlatKVCache } from "./flat_kv";
 
 export interface Qwen3Config {
   hiddenSize: number;
@@ -52,9 +53,6 @@ export class Qwen3Model {
   maxSeqLen: number;
   invFreq: number;
   ws: Workspace;
-  kCache: number[];
-  vCache: number[];
-  cachePos: number;
 
   private constructor(glm: GlmOps, config: Qwen3Config, weights: Map<string, number>, maxBatch: number, maxSeqLen: number) {
     this.glm = glm;
@@ -62,7 +60,6 @@ export class Qwen3Model {
     this.weights = weights;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
-    this.cachePos = 0;
 
     const halfDim = config.headDim / 2;
     const invFreqF32 = new Float32Array(halfDim);
@@ -73,9 +70,6 @@ export class Qwen3Model {
     glm.h2d(this.invFreq, f32ToBf16Bytes(invFreqF32));
 
     this.ws = this.allocWorkspace(maxBatch, maxSeqLen);
-    const cache = this.allocCache(maxBatch, maxSeqLen);
-    this.kCache = cache.k;
-    this.vCache = cache.v;
   }
 
   static fromPretrained(glm: GlmOps, repoId: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {
@@ -134,11 +128,6 @@ export class Qwen3Model {
       vT: glm.alloc(B * nKv * S * hd * BF16),
       qRope: glm.alloc(B * nHeads * S * hd * BF16),
       kRope: glm.alloc(B * nKv * S * hd * BF16),
-      kExpanded: glm.alloc(B * nHeads * S * hd * BF16),
-      vExpanded: glm.alloc(B * nHeads * S * hd * BF16),
-      attnScores: glm.alloc(B * nHeads * S * S * BF16),
-      attnOut: glm.alloc(B * nHeads * S * hd * BF16),
-      attnOutT: glm.alloc(B * nHeads * S * hd * BF16),
       oProjBuf: glm.alloc(BS * hs * BF16),
       gateBuf: glm.alloc(BS * inter * BF16),
       upBuf: glm.alloc(BS * inter * BF16),
@@ -146,8 +135,6 @@ export class Qwen3Model {
       downBuf: glm.alloc(BS * hs * BF16),
       cos: glm.alloc(B * S * hd * BF16),
       sin: glm.alloc(B * S * hd * BF16),
-      causalMask: glm.alloc(S * S * BF16),
-      maskExpanded: glm.alloc(B * nHeads * S * S * BF16),
       positionIds: glm.alloc(B * S * I32),
       logitsBuf: glm.alloc(B * vs * BF16),
       hiddenLast: glm.alloc(B * hs * BF16),
@@ -160,31 +147,9 @@ export class Qwen3Model {
     };
   }
 
-  private allocCache(B: number, S: number): { k: number[]; v: number[] } {
-    const cfg = this.cfg;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const nLayers = cfg.numHiddenLayers;
-    const glm = this.glm;
-
-    const k: number[] = [];
-    const v: number[] = [];
-    for (let i = 0; i < nLayers; i++) {
-      k.push(glm.alloc(B * nKv * S * hd * BF16));
-      v.push(glm.alloc(B * nKv * S * hd * BF16));
-    }
-    return { k, v };
-  }
-
   free(): void {
     const glm = this.glm;
     for (const ptr of Object.values(this.ws)) {
-      glm.freeBuf(ptr);
-    }
-    for (const ptr of this.kCache) {
-      glm.freeBuf(ptr);
-    }
-    for (const ptr of this.vCache) {
       glm.freeBuf(ptr);
     }
     glm.freeBuf(this.invFreq);
@@ -196,13 +161,11 @@ export class Qwen3Model {
       }
     }
     this.ws = {};
-    this.kCache = [];
-    this.vCache = [];
     this.weights = new Map();
   }
 
-  resetCache(): void {
-    this.cachePos = 0;
+  createFlatKVCache(): FlatKVCache {
+    return new FlatKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, this.maxBatch, this.maxSeqLen);
   }
 
   private readArgmax(ptr: number, count: number): number {
@@ -212,14 +175,7 @@ export class Qwen3Model {
     return buf.readInt32LE(0);
   }
 
-  private readLogits(ptr: number, count: number): Float32Array {
-    const nbytes = count * BF16;
-    const buf = Buffer.alloc(nbytes);
-    this.glm.d2h(buf, ptr);
-    return bf16BytesToF32(buf);
-  }
-
-  prefill(inputIds: number[][]): number {
+  prefill(inputIds: number[][], cache: FlatKVCache): number {
     const B = inputIds.length;
     const S = inputIds[0].length;
     const cfg = this.cfg;
@@ -234,7 +190,7 @@ export class Qwen3Model {
     if (B > this.maxBatch || S > this.maxSeqLen) {
       throw new Error(`input (B=${B}, S=${S}) exceeds max (B=${this.maxBatch}, S=${this.maxSeqLen})`);
     }
-    if (this.cachePos !== 0) {
+    if (cache.cachePos !== 0) {
       throw new Error("Cache must be reset before prefill");
     }
 
@@ -249,21 +205,19 @@ export class Qwen3Model {
 
     glm.arange(this.ws.positionIds, 0, 1, S);
     glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, B, S);
-    glm.causalMask(this.ws.causalMask, S);
-
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      this.decoderLayerPrefillFlash(B, S, i, `model.layers.${i}`);
+      this.decoderLayerPrefillFlash(B, S, i, `model.layers.${i}`, cache);
     }
 
     const lastIdxBuf = Int32Array.from([S - 1]);
     this.extractLastLogits(1, Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
 
-    this.cachePos = S;
+    cache.cachePos = S;
 
     return this.readArgmax(this.ws.logitsBuf, vs);
   }
 
-  private decodeToken(tokenId: number): void {
+  private decodeToken(tokenId: number, cache: FlatKVCache): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -272,7 +226,7 @@ export class Qwen3Model {
     const B = 1;
     const S = 1;
     const BS = 1;
-    const cachedLen = this.cachePos;
+    const cachedLen = cache.cachePos;
 
     if (cachedLen === 0) throw new Error("Must prefill before decode");
     if (cachedLen + S > this.maxSeqLen) throw new Error("Cache overflow");
@@ -286,68 +240,51 @@ export class Qwen3Model {
     glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, B, S);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      this.decoderLayerDecodeFlash(B, S, i, `model.layers.${i}`, cachedLen);
+      this.decoderLayerDecodeFlash(B, S, i, `model.layers.${i}`, cachedLen, cache);
     }
 
     this.finalNormAndLogits(BS);
 
-    this.cachePos = cachedLen + S;
+    cache.cachePos = cachedLen + S;
   }
 
-  private get hd(): number { return this.cfg.headDim; }
-
-  generateTokens(inputIds: number[][], maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[] {
-    const vs = this.cfg.vocabSize;
-    const B = inputIds.length;
-    if (B !== 1) throw new Error("generateTokens only supports batch=1");
-
-    this.resetCache();
-    let nextToken = this.prefill(inputIds);
-    const generated = [nextToken];
-
-    for (let i = 0; i < maxNewTokens - 1; i++) {
-      if (eosTokenIds.has(nextToken)) break;
-      this.decodeToken(nextToken);
-      nextToken = this.readArgmax(this.ws.logitsBuf, vs);
-      generated.push(nextToken);
-    }
-
-    return generated;
+  generateTokens(inputIds: number[][], cache: FlatKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[] {
+    return [...this.streamTokens(inputIds, cache, maxNewTokens, eosTokenIds)];
   }
 
-  *streamTokens(inputIds: number[][], maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): Generator<number> {
+  *streamTokens(inputIds: number[][], cache: FlatKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): Generator<number> {
     const vs = this.cfg.vocabSize;
     if (inputIds.length !== 1) throw new Error("streamTokens only supports batch=1");
 
-    this.resetCache();
-    let nextToken = this.prefill(inputIds);
+    cache.reset();
+    let nextToken = this.prefill(inputIds, cache);
     yield nextToken;
 
     for (let i = 0; i < maxNewTokens - 1; i++) {
       if (eosTokenIds.has(nextToken)) break;
-      this.decodeToken(nextToken);
+      this.decodeToken(nextToken, cache);
       nextToken = this.readArgmax(this.ws.logitsBuf, vs);
       yield nextToken;
     }
   }
 
-  private decoderLayerPrefillFlash(B: number, S: number, layerIdx: number, pfx: string): void {
+  private decoderLayerPrefillFlash(B: number, S: number, layerIdx: number, pfx: string, cache: FlatKVCache): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const BS = B * S;
 
     glm.rmsnorm(this.ws.normed, this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, cfg.hiddenSize, BS);
-    this.attentionPrefillFlash(B, S, layerIdx, pfx);
+    this.attentionPrefillFlash(B, S, layerIdx, pfx, cache);
     this.residualAndMlp(pfx, BS);
   }
 
-  private decoderLayerDecodeFlash(B: number, S: number, layerIdx: number, pfx: string, cachedLen: number): void {
+  private decoderLayerDecodeFlash(B: number, S: number, layerIdx: number, pfx: string, cachedLen: number, cache: FlatKVCache): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const BS = B * S;
 
     glm.rmsnorm(this.ws.normed, this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, cfg.hiddenSize, BS);
-    this.attentionDecodeFlash(B, S, layerIdx, pfx, cachedLen);
+    this.attentionDecodeFlash(B, S, layerIdx, pfx, cachedLen, cache);
     this.residualAndMlp(pfx, BS);
   }
 
@@ -397,7 +334,7 @@ export class Qwen3Model {
     glm.applyRotaryPosEmb(this.ws.kRope, this.ws.kT, this.ws.cos, this.ws.sin, hd, nKv, S, B, 1);
   }
 
-  private writeKvFlat(layerIdx: number, S: number, offset = 0): void {
+  private writeKvFlat(layerIdx: number, S: number, cache: FlatKVCache, offset = 0): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const nKv = cfg.numKeyValueHeads;
@@ -407,8 +344,8 @@ export class Qwen3Model {
     for (let h = 0; h < nKv; h++) {
       const srcOff = h * S * hd * BF16;
       const dstOff = (h * maxS * hd + offset * hd) * BF16;
-      glm.memcpy(this.kCache[layerIdx] + dstOff, this.ws.kRope + srcOff, S * hd * BF16);
-      glm.memcpy(this.vCache[layerIdx] + dstOff, this.ws.vT + srcOff, S * hd * BF16);
+      glm.memcpy(cache.kData[layerIdx] + dstOff, this.ws.kRope + srcOff, S * hd * BF16);
+      glm.memcpy(cache.vData[layerIdx] + dstOff, this.ws.vT + srcOff, S * hd * BF16);
     }
   }
 
@@ -434,7 +371,7 @@ export class Qwen3Model {
     this.finalNormAndLogits(count, this.ws.hiddenLast);
   }
 
-  private attentionPrefillFlash(B: number, S: number, layerIdx: number, pfx: string): void {
+  private attentionPrefillFlash(B: number, S: number, layerIdx: number, pfx: string, cache: FlatKVCache): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -445,15 +382,15 @@ export class Qwen3Model {
     const BS = B * S;
 
     this.computeQkv(pfx, BS, B, S);
-    this.writeKvFlat(layerIdx, S);
+    this.writeKvFlat(layerIdx, S, cache);
 
     const kvStrideH = maxS * hd;
     const kvStrideN = hd;
 
     glm.flashPrefill(
       this.ws.qRope,
-      this.kCache[layerIdx],
-      this.vCache[layerIdx],
+      cache.kData[layerIdx],
+      cache.vData[layerIdx],
       this.ws.flashOut,
       this.ws.flashTmp,
       S, S,
@@ -468,7 +405,7 @@ export class Qwen3Model {
     glm.linear(this.ws.oProjBuf, this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd);
   }
 
-  private attentionDecodeFlash(B: number, S: number, layerIdx: number, pfx: string, cachedLen: number): void {
+  private attentionDecodeFlash(B: number, S: number, layerIdx: number, pfx: string, cachedLen: number, cache: FlatKVCache): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -480,15 +417,15 @@ export class Qwen3Model {
     const totalLen = cachedLen + S;
 
     this.computeQkv(pfx, BS, B, S);
-    this.writeKvFlat(layerIdx, S, cachedLen);
+    this.writeKvFlat(layerIdx, S, cache, cachedLen);
 
     const kvStrideH = maxS * hd;
     const kvStrideN = hd;
 
     glm.flashDecode(
       this.ws.qRope,
-      this.kCache[layerIdx],
-      this.vCache[layerIdx],
+      cache.kData[layerIdx],
+      cache.vData[layerIdx],
       this.ws.flashOut,
       this.ws.flashTmp,
       totalLen,
@@ -528,14 +465,11 @@ export class Qwen3Model {
 
     glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, totalTokens);
 
-    const qoIndptr = [0];
-    const kvIndptr = [0];
+    const indptr = [0];
     for (const s of seqLens) {
-      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
-      kvIndptr.push(kvIndptr[kvIndptr.length - 1] + s);
+      indptr.push(indptr[indptr.length - 1] + s);
     }
-    const qoIndptrBuf = Int32Array.from(qoIndptr);
-    const kvIndptrBuf = Int32Array.from(kvIndptr);
+    const indptrBuf = Int32Array.from(indptr);
 
     const posIds: number[] = [];
     for (const s of seqLens) {
@@ -549,8 +483,8 @@ export class Qwen3Model {
     // Write indptr to host memory for plan
     const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
     const kvIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
-    glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
-    glm.writePinned(kvIndptrHostPtr, Buffer.from(kvIndptrBuf.buffer, kvIndptrBuf.byteOffset, kvIndptrBuf.byteLength));
+    glm.writePinned(qoIndptrHostPtr, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
+    glm.writePinned(kvIndptrHostPtr, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
 
     glm.batchPrefillRaggedPlan(
       ws.floatWs, BATCH_FLOAT_WS_SIZE,
@@ -600,8 +534,8 @@ export class Qwen3Model {
 
       const qoIndptrD = glm.alloc((batchSize + 1) * I32);
       const kvIndptrD = glm.alloc((batchSize + 1) * I32);
-      glm.h2d(qoIndptrD, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
-      glm.h2d(kvIndptrD, Buffer.from(kvIndptrBuf.buffer, kvIndptrBuf.byteOffset, kvIndptrBuf.byteLength));
+      glm.h2d(qoIndptrD, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
+      glm.h2d(kvIndptrD, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
 
       glm.batchPrefillRaggedRun(
         this.ws.qRope, this.ws.kRope, this.ws.vT, this.ws.flashOut,

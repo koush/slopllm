@@ -9,6 +9,7 @@ from paged_kv import (
     PagedKVCache, WorkspaceBuffers,
     PAGE_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE,
 )
+from flat_kv import FlatKVCache
 
 BF16 = 2  # bytes per bfloat16
 I32 = 4   # bytes per int32
@@ -74,7 +75,6 @@ class Qwen3Model:
         glm.h2d(self.inv_freq, inv_freq_bytes)
 
         self._alloc_workspace(max_batch, max_seq_len)
-        self._alloc_cache(max_batch, max_seq_len)
 
     @classmethod
     def from_pretrained(cls, glm, repo_id, max_batch=1, max_seq_len=4096):
@@ -148,39 +148,23 @@ class Qwen3Model:
             "input_ids_buf": glm.alloc(BS * I32),
         }
 
-    def _alloc_cache(self, B, S):
-        cfg = self.cfg
-        n_kv = cfg.num_key_value_heads
-        hd = cfg.head_dim
-        n_layers = cfg.num_hidden_layers
-        glm = self.glm
-
-        self.k_cache = [glm.alloc(B * n_kv * S * hd * BF16) for _ in range(n_layers)]
-        self.v_cache = [glm.alloc(B * n_kv * S * hd * BF16) for _ in range(n_layers)]
-        self.cache_pos = 0
-
     def free(self):
         glm = self.glm
         for ptr in self._ws.values():
-            glm.free_buf(ptr)
-        for ptr in self.k_cache:
-            glm.free_buf(ptr)
-        for ptr in self.v_cache:
             glm.free_buf(ptr)
         glm.free_buf(self.inv_freq)
         for ptr in self.weights.values():
             glm.free_buf(ptr)
         self._ws = {}
-        self.k_cache = []
-        self.v_cache = []
         self.weights = {}
+
+    def create_flat_kv_cache(self):
+        return FlatKVCache(self.glm, self.cfg.num_key_value_heads, self.cfg.head_dim,
+                           self.cfg.num_hidden_layers, self.max_batch, self.max_seq_len)
 
     def __del__(self):
         if hasattr(self, '_ws') and self._ws:
             self.free()
-
-    def reset_cache(self):
-        self.cache_pos = 0
 
     def _read_logits(self, ptr, count):
         nbytes = count * BF16
@@ -260,7 +244,7 @@ class Qwen3Model:
         logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(B, S, vs)
         return torch.from_numpy(logits_f32.copy())
 
-    def prefill(self, input_ids):
+    def prefill(self, input_ids, cache):
         B, S = input_ids.shape
         cfg = self.cfg
         glm = self.glm
@@ -272,7 +256,7 @@ class Qwen3Model:
         BS = B * S
 
         assert B <= self.max_batch and S <= self.max_seq_len
-        assert self.cache_pos == 0, "Cache must be reset before prefill"
+        assert cache.cache_pos == 0, "Cache must be reset before prefill"
 
         ids_np = input_ids.cpu().numpy().astype(np.int32).flatten()
         glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
@@ -289,18 +273,18 @@ class Qwen3Model:
 
         for i in range(cfg.num_hidden_layers):
             pfx = f"model.layers.{i}"
-            self._decoder_layer_prefill_flash(B, S, i, pfx)
+            self._decoder_layer_prefill_flash(B, S, i, pfx, cache)
 
         last_idx_np = np.array([S - 1], dtype=np.int32)
         self._extract_last_logits(1, last_idx_np)
 
-        self.cache_pos = S
+        cache.cache_pos = S
 
         logits_u16 = self._read_logits(self._ws["logits_buf"], vs)
         logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(1, vs)
         return torch.from_numpy(logits_f32.copy())
 
-    def _decode_token(self, token_id):
+    def _decode_token(self, token_id, cache):
         cfg = self.cfg
         glm = self.glm
         hs = cfg.hidden_size
@@ -311,7 +295,7 @@ class Qwen3Model:
         B = 1
         S = 1
         BS = 1
-        cached_len = self.cache_pos
+        cached_len = cache.cache_pos
 
         assert cached_len > 0, "Must prefill before decode"
         assert cached_len + S <= self.max_seq_len
@@ -330,19 +314,19 @@ class Qwen3Model:
 
         for i in range(cfg.num_hidden_layers):
             pfx = f"model.layers.{i}"
-            self._decoder_layer_decode_flash(B, S, i, pfx, cached_len)
+            self._decoder_layer_decode_flash(B, S, i, pfx, cached_len, cache)
 
         self._final_norm_and_logits(BS)
 
-        self.cache_pos = cached_len + S
+        cache.cache_pos = cached_len + S
 
-    def decode(self, input_ids):
+    def decode(self, input_ids, cache):
         B, S = input_ids.shape
         assert B == 1 and S == 1, "Decode only supports B=1, S=1"
         vs = self.cfg.vocab_size
 
         token_id = input_ids[0, 0].item()
-        self._decode_token(token_id)
+        self._decode_token(token_id, cache)
 
         logits_u16 = self._read_logits(self._ws["logits_buf"], vs)
         logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(1, 1, vs)
@@ -354,32 +338,10 @@ class Qwen3Model:
         self.glm.lib.glm_d2h(self.glm.ctx, buf, ctypes.c_void_p(self._ws["argmax_idx"]), I32)
         return int(np.frombuffer(buf.raw, dtype=np.int32)[0])
 
-    def generate(self, input_ids, max_new_tokens=100, eos_token_ids=None):
-        if eos_token_ids is None:
-            eos_token_ids = {151645, 151643}
+    def generate(self, input_ids, cache, max_new_tokens=100, eos_token_ids=None):
+        return list(self.generate_tokens(input_ids, cache, max_new_tokens, eos_token_ids))
 
-        B, S = input_ids.shape
-        assert B == 1, "generate() only supports batch=1"
-
-        cfg = self.cfg
-        vs = cfg.vocab_size
-
-        self.reset_cache()
-        self.prefill(input_ids)
-
-        next_token = self._argmax_logits(self._ws["logits_buf"], vs)
-        generated = [next_token]
-
-        for _ in range(max_new_tokens - 1):
-            if next_token in eos_token_ids:
-                break
-            self._decode_token(next_token)
-            next_token = self._argmax_logits(self._ws["logits_buf"], vs)
-            generated.append(next_token)
-
-        return generated
-
-    def generate_tokens(self, input_ids, max_new_tokens=100, eos_token_ids=None):
+    def generate_tokens(self, input_ids, cache, max_new_tokens=100, eos_token_ids=None):
         if eos_token_ids is None:
             eos_token_ids = {151645, 151643}
 
@@ -389,8 +351,8 @@ class Qwen3Model:
         cfg = self.cfg
         vs = cfg.vocab_size
 
-        self.reset_cache()
-        self.prefill(input_ids)
+        cache.reset()
+        self.prefill(input_ids, cache)
 
         next_token = self._argmax_logits(self._ws["logits_buf"], vs)
         yield next_token
@@ -398,11 +360,11 @@ class Qwen3Model:
         for _ in range(max_new_tokens - 1):
             if next_token in eos_token_ids:
                 break
-            self._decode_token(next_token)
+            self._decode_token(next_token, cache)
             next_token = self._argmax_logits(self._ws["logits_buf"], vs)
             yield next_token
 
-    def generate_text(self, prompt, tokenizer, max_new_tokens=100,
+    def generate_text(self, prompt, tokenizer, cache, max_new_tokens=100,
                       eos_token_ids=None, enable_thinking=True):
         messages = [{"role": "user", "content": prompt}]
         try:
@@ -418,7 +380,7 @@ class Qwen3Model:
         input_tensor = torch.tensor([input_ids], dtype=torch.int64)
 
         generated_ids = list(self.generate_tokens(
-            input_tensor, max_new_tokens=max_new_tokens,
+            input_tensor, cache, max_new_tokens=max_new_tokens,
             eos_token_ids=eos_token_ids,
         ))
         return tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -495,7 +457,7 @@ class Qwen3Model:
 
         self._residual_and_mlp(pfx, BS)
 
-    def _decoder_layer_prefill_flash(self, B, S, layer_idx, pfx):
+    def _decoder_layer_prefill_flash(self, B, S, layer_idx, pfx, cache):
         cfg = self.cfg
         glm = self.glm
         BS = B * S
@@ -504,11 +466,11 @@ class Qwen3Model:
                      self.weights[f"{pfx}.input_layernorm.weight"],
                      cfg.rms_norm_eps, cfg.hidden_size, BS)
 
-        self._attention_prefill_flash(B, S, layer_idx, pfx)
+        self._attention_prefill_flash(B, S, layer_idx, pfx, cache)
 
         self._residual_and_mlp(pfx, BS)
 
-    def _decoder_layer_decode_flash(self, B, S, layer_idx, pfx, cached_len):
+    def _decoder_layer_decode_flash(self, B, S, layer_idx, pfx, cached_len, cache):
         cfg = self.cfg
         glm = self.glm
         BS = B * S
@@ -517,7 +479,7 @@ class Qwen3Model:
                      self.weights[f"{pfx}.input_layernorm.weight"],
                      cfg.rms_norm_eps, cfg.hidden_size, BS)
 
-        self._attention_decode_flash(B, S, layer_idx, pfx, cached_len)
+        self._attention_decode_flash(B, S, layer_idx, pfx, cached_len, cache)
 
         self._residual_and_mlp(pfx, BS)
 
@@ -594,7 +556,7 @@ class Qwen3Model:
                                   self._ws["cos"], self._ws["sin"],
                                   hd, n_kv, S, B, 1)
 
-    def _write_kv_flat(self, layer_idx, S, offset=0):
+    def _write_kv_flat(self, layer_idx, S, cache, offset=0):
         cfg = self.cfg
         glm = self.glm
         n_kv = cfg.num_key_value_heads
@@ -604,10 +566,10 @@ class Qwen3Model:
         for h in range(n_kv):
             src_off = h * S * hd * BF16
             dst_off = (h * max_S * hd + offset * hd) * BF16
-            glm.memcpy(self.k_cache[layer_idx] + dst_off,
+            glm.memcpy(cache.k_data[layer_idx] + dst_off,
                         self._ws["k_rope"] + src_off,
                         S * hd * BF16)
-            glm.memcpy(self.v_cache[layer_idx] + dst_off,
+            glm.memcpy(cache.v_data[layer_idx] + dst_off,
                         self._ws["v_t"] + src_off,
                         S * hd * BF16)
 
@@ -652,7 +614,7 @@ class Qwen3Model:
                     self.weights[f"{pfx}.self_attn.o_proj.weight"],
                     BS, hs, n_heads * hd)
 
-    def _attention_prefill_flash(self, B, S, layer_idx, pfx):
+    def _attention_prefill_flash(self, B, S, layer_idx, pfx, cache):
         cfg = self.cfg
         glm = self.glm
         hs = cfg.hidden_size
@@ -664,15 +626,15 @@ class Qwen3Model:
 
         self._compute_qkv(pfx, BS, B, S)
 
-        self._write_kv_flat(layer_idx, S)
+        self._write_kv_flat(layer_idx, S, cache)
 
         kv_stride_h = max_S * hd
         kv_stride_n = hd
 
         glm.flash_prefill(
             self._ws["q_rope"],
-            self.k_cache[layer_idx],
-            self.v_cache[layer_idx],
+            cache.k_data[layer_idx],
+            cache.v_data[layer_idx],
             self._ws["flash_out"],
             self._ws["flash_tmp"],
             S, S,
@@ -688,7 +650,7 @@ class Qwen3Model:
                     self.weights[f"{pfx}.self_attn.o_proj.weight"],
                     BS, hs, n_heads * hd)
 
-    def _attention_decode_flash(self, B, S, layer_idx, pfx, cached_len):
+    def _attention_decode_flash(self, B, S, layer_idx, pfx, cached_len, cache):
         cfg = self.cfg
         glm = self.glm
         hs = cfg.hidden_size
@@ -701,15 +663,15 @@ class Qwen3Model:
 
         self._compute_qkv(pfx, BS, B, S)
 
-        self._write_kv_flat(layer_idx, S, offset=cached_len)
+        self._write_kv_flat(layer_idx, S, cache, offset=cached_len)
 
         kv_stride_h = max_S * hd
         kv_stride_n = hd
 
         glm.flash_decode(
             self._ws["q_rope"],
-            self.k_cache[layer_idx],
-            self.v_cache[layer_idx],
+            cache.k_data[layer_idx],
+            cache.v_data[layer_idx],
             self._ws["flash_out"],
             self._ws["flash_tmp"],
             total_len,

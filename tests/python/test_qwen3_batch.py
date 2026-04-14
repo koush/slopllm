@@ -45,17 +45,18 @@ def test_batch_prefill_vs_single(glm, qwen3_model, ws):
     max_pages = 128
 
     paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
+    flat_cache = model.create_flat_kv_cache()
     try:
         prompt1 = [151643, 151644, 151645, 1, 2, 3]
         prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
 
         batch_logits = model.prefill_batch([prompt1, prompt2], ws, paged_kv)
 
-        model.reset_cache()
-        single_logits_1 = model.prefill(torch.tensor([prompt1], dtype=torch.int64))
+        flat_cache.reset()
+        single_logits_1 = model.prefill(torch.tensor([prompt1], dtype=torch.int64), flat_cache)
 
-        model.reset_cache()
-        single_logits_2 = model.prefill(torch.tensor([prompt2], dtype=torch.int64))
+        flat_cache.reset()
+        single_logits_2 = model.prefill(torch.tensor([prompt2], dtype=torch.int64), flat_cache)
 
         diff1 = (batch_logits[0] - single_logits_1[0]).abs().max().item()
         diff2 = (batch_logits[1] - single_logits_2[0]).abs().max().item()
@@ -69,6 +70,7 @@ def test_batch_prefill_vs_single(glm, qwen3_model, ws):
         assert diff2 < 0.5, f"Seq2 diff too large: {diff2:.4f}"
     finally:
         paged_kv.free()
+        flat_cache.free()
 
 
 def test_batch_decode_vs_single(glm, qwen3_model, ws):
@@ -80,6 +82,7 @@ def test_batch_decode_vs_single(glm, qwen3_model, ws):
     max_pages = 128
 
     paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
+    flat_cache = model.create_flat_kv_cache()
     try:
         prompt1 = [151643, 151644, 151645, 1, 2, 3]
         prompt2 = [151643, 151644, 1, 2, 3, 4, 5]
@@ -89,13 +92,13 @@ def test_batch_decode_vs_single(glm, qwen3_model, ws):
         token1 = batch_logits[0].argmax().item()
         token2 = batch_logits[1].argmax().item()
 
-        model.reset_cache()
-        model.prefill(torch.tensor([prompt1], dtype=torch.int64))
-        single_decode_logits_1 = model.decode(torch.tensor([[token1]], dtype=torch.int64))
+        flat_cache.reset()
+        model.prefill(torch.tensor([prompt1], dtype=torch.int64), flat_cache)
+        single_decode_logits_1 = model.decode(torch.tensor([[token1]], dtype=torch.int64), flat_cache)
 
-        model.reset_cache()
-        model.prefill(torch.tensor([prompt2], dtype=torch.int64))
-        single_decode_logits_2 = model.decode(torch.tensor([[token2]], dtype=torch.int64))
+        flat_cache.reset()
+        model.prefill(torch.tensor([prompt2], dtype=torch.int64), flat_cache)
+        single_decode_logits_2 = model.decode(torch.tensor([[token2]], dtype=torch.int64), flat_cache)
 
         batch_decode_logits = model.decode_batch([token1, token2], ws, paged_kv)
 
@@ -111,6 +114,7 @@ def test_batch_decode_vs_single(glm, qwen3_model, ws):
         assert diff2 < 0.5, f"Seq2 decode diff too large: {diff2:.4f}"
     finally:
         paged_kv.free()
+        flat_cache.free()
 
 
 def test_batch_multi_step_decode(glm, qwen3_model, ws):
@@ -132,12 +136,6 @@ def test_batch_multi_step_decode(glm, qwen3_model, ws):
             [batch_logits[0].argmax().item()],
             [batch_logits[1].argmax().item()],
         ]
-
-        single_models = []
-        for prompt in [prompt1, prompt2]:
-            model.reset_cache()
-            model.prefill(torch.tensor([prompt], dtype=torch.int64))
-            single_models.append(model.cache_pos)
 
         num_steps = 5
         for step in range(num_steps):
@@ -167,6 +165,7 @@ def test_batch_generate_vs_single(glm, qwen3_model, ws):
     max_new_tokens = 20
 
     paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
+    flat_cache = model.create_flat_kv_cache()
     try:
         prompt1 = [151643, 151644, 151645, 1, 2, 3, 4, 5, 6, 7]
         prompt2 = [151643, 151644, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -176,15 +175,15 @@ def test_batch_generate_vs_single(glm, qwen3_model, ws):
             max_new_tokens=max_new_tokens,
         )
 
-        model.reset_cache()
+        flat_cache.reset()
         single1 = model.generate(
-            torch.tensor([prompt1], dtype=torch.int64),
+            torch.tensor([prompt1], dtype=torch.int64), flat_cache,
             max_new_tokens=max_new_tokens,
         )
 
-        model.reset_cache()
+        flat_cache.reset()
         single2 = model.generate(
-            torch.tensor([prompt2], dtype=torch.int64),
+            torch.tensor([prompt2], dtype=torch.int64), flat_cache,
             max_new_tokens=max_new_tokens,
         )
 
@@ -205,3 +204,4 @@ def test_batch_generate_vs_single(glm, qwen3_model, ws):
             f"Seq2 first 3 tokens mismatch: batch={batch_generated[1][:3]}, single={single2[:3]}"
     finally:
         paged_kv.free()
+        flat_cache.free()

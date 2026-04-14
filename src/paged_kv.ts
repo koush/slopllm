@@ -1,4 +1,4 @@
-import { GlmOps, BF16, I32 } from "./glm_ops.js";
+import { GlmOps, BF16, I32 } from "./glm_ops";
 
 export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
@@ -15,7 +15,6 @@ export class PagedKVCache {
   readonly maxPages: number;
   readonly maxBatch: number;
   readonly pageSize: number;
-  readonly pageStride: number;
   kData: number[];
   vData: number[];
   indices: number;
@@ -35,7 +34,6 @@ export class PagedKVCache {
     this.maxPages = maxPages;
     this.maxBatch = maxBatch;
     this.pageSize = pageSize;
-    this.pageStride = nKv * pageSize * hd * BF16;
     this.kData = [];
     this.vData = [];
     for (let i = 0; i < nLayers; i++) {

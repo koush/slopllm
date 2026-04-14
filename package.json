@@ -12,7 +12,10 @@
     "start:qwen3": "node dist/run_qwen3.js",
     "start:qwen3-batch": "node dist/run_qwen3_batch.js",
     "dev": "tsc --watch",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "pretest": "npm run build:all",
+    "test:node": "node --test dist/test.js",
+    "test:python": "cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .",
+    "test": "npm run test:python && npm run test:node"
   },
   "keywords": [],
   "author": "",

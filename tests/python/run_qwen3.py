@@ -15,7 +15,7 @@ QWEN3_REPO = "Qwen/Qwen3-0.6B"
 EOS_TOKEN_IDS = {151645, 151643}
 
 
-def chat_loop(model, tokenizer, max_new_tokens, no_think):
+def chat_loop(model, cache, tokenizer, max_new_tokens, no_think):
     messages = []
     enable_thinking = not no_think
 
@@ -33,6 +33,7 @@ def chat_loop(model, tokenizer, max_new_tokens, no_think):
         if user_input.lower() == "/clear":
             messages = []
             print("Conversation cleared.")
+            cache.reset()
             continue
 
         messages.append({"role": "user", "content": user_input})
@@ -61,7 +62,7 @@ def chat_loop(model, tokenizer, max_new_tokens, no_think):
         token_count = 0
 
         for token_id in model.generate_tokens(
-            input_tensor, max_new_tokens=max_new_tokens,
+            input_tensor, cache, max_new_tokens=max_new_tokens,
             eos_token_ids=EOS_TOKEN_IDS,
         ):
             generated_ids.append(token_id)
@@ -95,12 +96,13 @@ def main():
     print(f"Loading model on GPU {gpu_id}...")
     glm = GlmOps(device_id=0)
     model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=1, max_seq_len=args.max_seq_len)
+    cache = model.create_flat_kv_cache()
     tokenizer = AutoTokenizer.from_pretrained(QWEN3_REPO)
 
     print(f"Qwen3-0.6B ready (max_tokens={args.max_tokens}, thinking={'off' if args.no_think else 'on'})")
     print("Type a message to chat. /clear to reset, /q to quit.")
 
-    chat_loop(model, tokenizer, args.max_tokens, args.no_think)
+    chat_loop(model, cache, tokenizer, args.max_tokens, args.no_think)
 
 
 if __name__ == "__main__":

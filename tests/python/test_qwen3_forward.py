@@ -120,17 +120,20 @@ def test_qwen3_prefill_vs_forward(qwen3_model, glm):
 
     input_ids = torch.tensor([[151643, 151644, 151645, 1, 2, 3, 4, 5]], dtype=torch.int64, device=device)
 
-    model.reset_cache()
-    prefill_logits = model.prefill(input_ids)
-    forward_logits = model.forward(input_ids)
+    cache = model.create_flat_kv_cache()
+    try:
+        prefill_logits = model.prefill(input_ids, cache)
+        forward_logits = model.forward(input_ids)
 
-    max_diff = (prefill_logits - forward_logits[0, -1:]).abs().max().item()
-    print(f"  Prefill vs forward max diff: {max_diff:.6f}")
-    assert max_diff < 0.75, f"Prefill vs forward max diff {max_diff} too large"
+        max_diff = (prefill_logits - forward_logits[0, -1:]).abs().max().item()
+        print(f"  Prefill vs forward max diff: {max_diff:.6f}")
+        assert max_diff < 0.75, f"Prefill vs forward max diff {max_diff} too large"
 
-    prefill_top5 = prefill_logits[0].topk(5).indices.tolist()
-    forward_top5 = forward_logits[0, -1].topk(5).indices.tolist()
-    assert prefill_top5 == forward_top5, f"Top-5 mismatch: prefill={prefill_top5}, forward={forward_top5}"
+        prefill_top5 = prefill_logits[0].topk(5).indices.tolist()
+        forward_top5 = forward_logits[0, -1].topk(5).indices.tolist()
+        assert prefill_top5 == forward_top5, f"Top-5 mismatch: prefill={prefill_top5}, forward={forward_top5}"
+    finally:
+        cache.free()
 
 
 def test_qwen3_prefill_decode(glm):
@@ -143,48 +146,51 @@ def test_qwen3_prefill_decode(glm):
     prompt = [151643, 151644, 151645, 1, 2, 3]
     input_ids = torch.tensor([prompt], dtype=torch.int64, device=device)
 
-    model.reset_cache()
-    prefill_logits = model.prefill(input_ids)
-    assert model.cache_pos == len(prompt)
+    cache = model.create_flat_kv_cache()
+    try:
+        prefill_logits = model.prefill(input_ids, cache)
+        assert cache.cache_pos == len(prompt)
 
-    ref_full = qwen3_model_torch(input_ids, weights, cfg)
-    max_diff = (prefill_logits - ref_full[0, -1:].cpu()).abs().max().item()
-    print(f"  Prefill vs reference max diff: {max_diff:.4f}")
-    assert max_diff < 50.0, f"Prefill max diff {max_diff} too large"
+        ref_full = qwen3_model_torch(input_ids, weights, cfg)
+        max_diff = (prefill_logits - ref_full[0, -1:].cpu()).abs().max().item()
+        print(f"  Prefill vs reference max diff: {max_diff:.4f}")
+        assert max_diff < 50.0, f"Prefill max diff {max_diff} too large"
 
-    ref_top5 = set(ref_full[0, -1].topk(5).indices.tolist())
-    prefill_top5 = set(prefill_logits[0].topk(5).indices.tolist())
-    assert len(prefill_top5 & ref_top5) >= 4, f"Top-5 overlap < 4: prefill={prefill_top5}, ref={ref_top5}"
+        ref_top5 = set(ref_full[0, -1].topk(5).indices.tolist())
+        prefill_top5 = set(prefill_logits[0].topk(5).indices.tolist())
+        assert len(prefill_top5 & ref_top5) >= 4, f"Top-5 overlap < 4: prefill={prefill_top5}, ref={ref_top5}"
 
-    num_decode_steps = 5
-    all_ids = list(prompt)
-    decode_logits = None
-    for step in range(num_decode_steps):
-        if step == 0:
-            next_id = prefill_logits[0].argmax().item()
-        else:
-            next_id = decode_logits[0, 0].argmax().item()
-        next_input = torch.tensor([[next_id]], dtype=torch.int64, device=device)
+        num_decode_steps = 5
+        all_ids = list(prompt)
+        decode_logits = None
+        for step in range(num_decode_steps):
+            if step == 0:
+                next_id = prefill_logits[0].argmax().item()
+            else:
+                next_id = decode_logits[0, 0].argmax().item()
+            next_input = torch.tensor([[next_id]], dtype=torch.int64, device=device)
 
-        decode_logits = model.decode(next_input)
-        assert model.cache_pos == len(prompt) + step + 1
+            decode_logits = model.decode(next_input, cache)
+            assert cache.cache_pos == len(prompt) + step + 1
 
-        all_ids.append(next_id)
+            all_ids.append(next_id)
 
-        extended_ids = torch.tensor([all_ids], dtype=torch.int64, device=device)
-        ref_extended = qwen3_model_torch(extended_ids, weights, cfg)
+            extended_ids = torch.tensor([all_ids], dtype=torch.int64, device=device)
+            ref_extended = qwen3_model_torch(extended_ids, weights, cfg)
 
-        diff = (decode_logits - ref_extended[0, -1:].cpu()).abs()
-        max_diff = diff.max().item()
-        mean_diff = diff.mean().item()
-        print(f"  Decode step {step}: max_diff={max_diff:.4f}, mean_diff={mean_diff:.4f}")
+            diff = (decode_logits - ref_extended[0, -1:].cpu()).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+            print(f"  Decode step {step}: max_diff={max_diff:.4f}, mean_diff={mean_diff:.4f}")
 
-        assert max_diff < 50.0, f"Decode step {step}: max_diff {max_diff} too large"
+            assert max_diff < 50.0, f"Decode step {step}: max_diff {max_diff} too large"
 
-        decode_top1 = decode_logits[0, 0].topk(1).indices.item()
-        ref_top1 = ref_extended[0, -1].topk(1).indices.item()
-        assert decode_top1 == ref_top1, \
-            f"Decode step {step}: Top-1 mismatch: decode={decode_top1}, ref={ref_top1}"
+            decode_top1 = decode_logits[0, 0].topk(1).indices.item()
+            ref_top1 = ref_extended[0, -1].topk(1).indices.item()
+            assert decode_top1 == ref_top1, \
+                f"Decode step {step}: Top-1 mismatch: decode={decode_top1}, ref={ref_top1}"
+    finally:
+        cache.free()
 
     del weights
     model.free()
@@ -201,22 +207,25 @@ def test_qwen3_prefill_decode_vs_hf(glm):
     input_ids = torch.tensor([prompt], dtype=torch.int64, device=device)
 
     model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=1, max_seq_len=32)
-    model.reset_cache()
-    prefill_logits = model.prefill(input_ids).cpu()
+    cache = model.create_flat_kv_cache()
+    try:
+        prefill_logits = model.prefill(input_ids, cache).cpu()
 
-    num_decode_steps = 5
-    all_ids = list(prompt)
-    decode_logits_list = []
-    decode_logits = None
-    for step in range(num_decode_steps):
-        if step == 0:
-            next_id = prefill_logits[0].argmax().item()
-        else:
-            next_id = decode_logits[0, 0].argmax().item()
-        next_input = torch.tensor([[next_id]], dtype=torch.int64, device=device)
-        decode_logits = model.decode(next_input).cpu()
-        decode_logits_list.append(decode_logits)
-        all_ids.append(next_id)
+        num_decode_steps = 5
+        all_ids = list(prompt)
+        decode_logits_list = []
+        decode_logits = None
+        for step in range(num_decode_steps):
+            if step == 0:
+                next_id = prefill_logits[0].argmax().item()
+            else:
+                next_id = decode_logits[0, 0].argmax().item()
+            next_input = torch.tensor([[next_id]], dtype=torch.int64, device=device)
+            decode_logits = model.decode(next_input, cache).cpu()
+            decode_logits_list.append(decode_logits)
+            all_ids.append(next_id)
+    finally:
+        cache.free()
 
     model.free()
     del model
@@ -261,15 +270,19 @@ def test_qwen3_generate(glm):
 
     tokenizer = AutoTokenizer.from_pretrained(QWEN3_REPO)
     model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=1, max_seq_len=128)
+    cache = model.create_flat_kv_cache()
 
-    prompt = "The capital of France is"
-    input_ids = tokenizer.encode(prompt, return_tensors='pt')
-    generated = model.generate(input_ids, max_new_tokens=20, eos_token_ids={151645, 151643})
+    try:
+        prompt = "The capital of France is"
+        input_ids = tokenizer.encode(prompt, return_tensors='pt')
+        generated = model.generate(input_ids, cache, max_new_tokens=20, eos_token_ids={151645, 151643})
 
-    text = tokenizer.decode(input_ids[0].tolist() + generated, skip_special_tokens=True)
-    assert len(generated) > 0, "generate() produced no tokens"
-    assert "Paris" in text, f"Expected 'Paris' in generated text, got: {repr(text)}"
-    print(f"  Generated {len(generated)} tokens: {repr(text)}")
+        text = tokenizer.decode(input_ids[0].tolist() + generated, skip_special_tokens=True)
+        assert len(generated) > 0, "generate() produced no tokens"
+        assert "Paris" in text, f"Expected 'Paris' in generated text, got: {repr(text)}"
+        print(f"  Generated {len(generated)} tokens: {repr(text)}")
+    finally:
+        cache.free()
 
     model.free()
     torch.cuda.empty_cache()
@@ -280,15 +293,19 @@ def test_qwen3_generate_tokens(glm):
 
     tokenizer = AutoTokenizer.from_pretrained(QWEN3_REPO)
     model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=1, max_seq_len=128)
+    cache = model.create_flat_kv_cache()
 
-    prompt = "The capital of France is"
-    input_ids = tokenizer.encode(prompt, return_tensors='pt')
+    try:
+        prompt = "The capital of France is"
+        input_ids = tokenizer.encode(prompt, return_tensors='pt')
 
-    list_tokens = model.generate(input_ids, max_new_tokens=20, eos_token_ids={151645, 151643})
-    gen_tokens = list(model.generate_tokens(input_ids, max_new_tokens=20, eos_token_ids={151645, 151643}))
+        list_tokens = model.generate(input_ids, cache, max_new_tokens=20, eos_token_ids={151645, 151643})
+        gen_tokens = list(model.generate_tokens(input_ids, cache, max_new_tokens=20, eos_token_ids={151645, 151643}))
 
-    assert list_tokens == gen_tokens, f"generate_tokens() mismatch: {list_tokens} vs {gen_tokens}"
-    print(f"  Both methods produced {len(gen_tokens)} tokens, identical")
+        assert list_tokens == gen_tokens, f"generate_tokens() mismatch: {list_tokens} vs {gen_tokens}"
+        print(f"  Both methods produced {len(gen_tokens)} tokens, identical")
+    finally:
+        cache.free()
 
     model.free()
     torch.cuda.empty_cache()
@@ -299,13 +316,17 @@ def test_qwen3_generate_text(glm):
 
     tokenizer = AutoTokenizer.from_pretrained(QWEN3_REPO)
     model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=1, max_seq_len=256)
+    cache = model.create_flat_kv_cache()
 
-    text = model.generate_text(
-        "The capital of France is", tokenizer,
-        max_new_tokens=30, enable_thinking=False,
-    )
-    print(f"  Generated text: {repr(text)}")
-    assert "Paris" in text, f"Expected 'Paris' in generated text, got: {repr(text)}"
+    try:
+        text = model.generate_text(
+            "The capital of France is", tokenizer, cache,
+            max_new_tokens=30, enable_thinking=False,
+        )
+        print(f"  Generated text: {repr(text)}")
+        assert "Paris" in text, f"Expected 'Paris' in generated text, got: {repr(text)}"
+    finally:
+        cache.free()
 
     model.free()
     torch.cuda.empty_cache()
@@ -316,10 +337,12 @@ def test_qwen3_flash_vs_bmm_attention(glm):
 
     input_ids = torch.tensor([[151643, 151644, 151645, 1, 2, 3, 4, 5]], dtype=torch.int64)
 
-    model.reset_cache()
-    flash_logits = model.prefill(input_ids)
+    cache = model.create_flat_kv_cache()
+    try:
+        flash_logits = model.prefill(input_ids, cache)
+    finally:
+        cache.free()
 
-    model.reset_cache()
     bmm_logits = model.forward(input_ids)
 
     bmm_last = bmm_logits[:, -1, :]
