@@ -124,13 +124,11 @@ def test_qwen3_prefill_vs_forward(qwen3_model, glm):
     prefill_logits = model.prefill(input_ids)
     forward_logits = model.forward(input_ids)
 
-    max_diff = (prefill_logits - forward_logits).abs().max().item()
+    max_diff = (prefill_logits - forward_logits[0, -1:]).abs().max().item()
     print(f"  Prefill vs forward max diff: {max_diff:.6f}")
-    # FlashInfer vs BMM attention accumulate different BF16 rounding across 28 layers;
-    # per-layer diff ~0.03-0.06 compounds to ~0.65. Top-5 token match is the real check.
     assert max_diff < 0.75, f"Prefill vs forward max diff {max_diff} too large"
 
-    prefill_top5 = prefill_logits[0, -1].topk(5).indices.tolist()
+    prefill_top5 = prefill_logits[0].topk(5).indices.tolist()
     forward_top5 = forward_logits[0, -1].topk(5).indices.tolist()
     assert prefill_top5 == forward_top5, f"Top-5 mismatch: prefill={prefill_top5}, forward={forward_top5}"
 
@@ -150,12 +148,12 @@ def test_qwen3_prefill_decode(glm):
     assert model.cache_pos == len(prompt)
 
     ref_full = qwen3_model_torch(input_ids, weights, cfg)
-    max_diff = (prefill_logits - ref_full.cpu()).abs().max().item()
+    max_diff = (prefill_logits - ref_full[0, -1:].cpu()).abs().max().item()
     print(f"  Prefill vs reference max diff: {max_diff:.4f}")
     assert max_diff < 50.0, f"Prefill max diff {max_diff} too large"
 
     ref_top5 = set(ref_full[0, -1].topk(5).indices.tolist())
-    prefill_top5 = set(prefill_logits[0, -1].topk(5).indices.tolist())
+    prefill_top5 = set(prefill_logits[0].topk(5).indices.tolist())
     assert len(prefill_top5 & ref_top5) >= 4, f"Top-5 overlap < 4: prefill={prefill_top5}, ref={ref_top5}"
 
     num_decode_steps = 5
@@ -163,7 +161,7 @@ def test_qwen3_prefill_decode(glm):
     decode_logits = None
     for step in range(num_decode_steps):
         if step == 0:
-            next_id = prefill_logits[0, -1].argmax().item()
+            next_id = prefill_logits[0].argmax().item()
         else:
             next_id = decode_logits[0, 0].argmax().item()
         next_input = torch.tensor([[next_id]], dtype=torch.int64, device=device)
@@ -212,7 +210,7 @@ def test_qwen3_prefill_decode_vs_hf(glm):
     decode_logits = None
     for step in range(num_decode_steps):
         if step == 0:
-            next_id = prefill_logits[0, -1].argmax().item()
+            next_id = prefill_logits[0].argmax().item()
         else:
             next_id = decode_logits[0, 0].argmax().item()
         next_input = torch.tensor([[next_id]], dtype=torch.int64, device=device)
@@ -233,7 +231,7 @@ def test_qwen3_prefill_decode_vs_hf(glm):
         hf_prefill_logits = hf_out.logits.cpu()
         hf_past = hf_out.past_key_values
 
-    max_diff = (prefill_logits - hf_prefill_logits).abs().max().item()
+    max_diff = (prefill_logits - hf_prefill_logits[0, -1:].cpu()).abs().max().item()
     print(f"  Prefill vs HF max diff: {max_diff:.4f}")
     assert max_diff < 100.0, f"Prefill vs HF max diff {max_diff} too large"
 
@@ -324,13 +322,14 @@ def test_qwen3_flash_vs_bmm_attention(glm):
     model.reset_cache()
     bmm_logits = model.forward(input_ids)
 
-    max_diff = (flash_logits - bmm_logits).abs().max().item()
-    mean_diff = (flash_logits - bmm_logits).abs().mean().item()
+    bmm_last = bmm_logits[:, -1, :]
+    max_diff = (flash_logits - bmm_last).abs().max().item()
+    mean_diff = (flash_logits - bmm_last).abs().mean().item()
     print(f"  Flash vs BMM max diff: {max_diff:.6f}, mean diff: {mean_diff:.6f}")
     assert max_diff < 1.0, f"Flash vs BMM max diff {max_diff} too large"
 
-    flash_top5 = flash_logits[0, -1].topk(5).indices.tolist()
-    bmm_top5 = bmm_logits[0, -1].topk(5).indices.tolist()
+    flash_top5 = flash_logits[0].topk(5).indices.tolist()
+    bmm_top5 = bmm_last[0].topk(5).indices.tolist()
     assert flash_top5 == bmm_top5, f"Top-5 mismatch: flash={flash_top5}, bmm={bmm_top5}"
 
     model.free()

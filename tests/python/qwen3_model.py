@@ -5,16 +5,14 @@ import numpy as np
 import torch
 from safetensors import safe_open
 from helpers import GlmOps, get_model_path
+from paged_kv import (
+    PagedKVCache, WorkspaceBuffers,
+    PAGE_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE,
+)
 
 BF16 = 2  # bytes per bfloat16
 I32 = 4   # bytes per int32
 FLASH_TMP_SIZE = 32 * 1024 * 1024  # 32MB workspace for FlashInfer
-BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024  # 128MB float workspace
-BATCH_INT_WS_SIZE = 8 * 1024 * 1024  # 8MB int workspace (GPU)
-BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024  # 8MB pinned host int workspace
-PAGE_SIZE = 16
-DECODE_PLAN_INFO_SIZE = 10  # int64s
-PREFILL_PLAN_INFO_SIZE = 15  # int64s
 
 
 def _f32_to_bf16_bytes(arr):
@@ -27,137 +25,6 @@ def _bf16_bytes_to_f32(data):
     u16 = np.frombuffer(data, dtype=np.uint16)
     u32 = u16.astype(np.uint32) << 16
     return u32.view(np.float32)
-
-
-class PagedKVCache:
-    def __init__(self, glm, n_kv, hd, n_layers, max_pages, page_size=PAGE_SIZE):
-        self.glm = glm
-        self.n_kv = n_kv
-        self.hd = hd
-        self.n_layers = n_layers
-        self.max_pages = max_pages
-        self.page_size = page_size
-        self.page_stride = n_kv * page_size * hd * BF16
-        self.k_data = [glm.alloc(max_pages * n_kv * page_size * hd * BF16) for _ in range(n_layers)]
-        self.v_data = [glm.alloc(max_pages * n_kv * page_size * hd * BF16) for _ in range(n_layers)]
-        self.indices = glm.alloc(max_pages * I32)
-        self.indptr_d = None
-        self.last_page_len = None
-        self.indptr_h = None
-        self.last_page_len_h = None
-        self.num_pages_used = 0
-        self.seq_page_counts = []
-        self.seq_kv_lens = []
-
-        indptr_np = np.arange(max_pages, dtype=np.int32)
-        glm.h2d(self.indices, indptr_np.tobytes())
-
-    def free(self):
-        glm = self.glm
-        for ptr in self.k_data:
-            glm.free_buf(ptr)
-        for ptr in self.v_data:
-            glm.free_buf(ptr)
-        glm.free_buf(self.indices)
-        if self.indptr_d is not None:
-            glm.free_buf(self.indptr_d)
-        if self.last_page_len is not None:
-            glm.free_buf(self.last_page_len)
-        if self.indptr_h is not None:
-            glm.free_pinned(self.indptr_h)
-        if self.last_page_len_h is not None:
-            glm.free_pinned(self.last_page_len_h)
-        self.k_data = []
-        self.v_data = []
-
-    def reset(self, batch_size):
-        self.num_pages_used = 0
-        self.seq_page_counts = [0] * batch_size
-        self.seq_kv_lens = [0] * batch_size
-
-        if self.indptr_d is not None:
-            self.glm.free_buf(self.indptr_d)
-        if self.last_page_len is not None:
-            self.glm.free_buf(self.last_page_len)
-        if self.indptr_h is not None:
-            self.glm.free_pinned(self.indptr_h)
-        if self.last_page_len_h is not None:
-            self.glm.free_pinned(self.last_page_len_h)
-
-        self.indptr_d = self.glm.alloc((batch_size + 1) * I32)
-        self.last_page_len = self.glm.alloc(batch_size * I32)
-        self.indptr_h = self.glm.alloc_pinned((batch_size + 1) * I32)
-        self.last_page_len_h = self.glm.alloc_pinned(batch_size * I32)
-
-    def alloc_pages(self, seq_idx, num_tokens):
-        page_size = self.page_size
-        num_new_pages = (num_tokens + page_size - 1) // page_size
-        start_page = self.num_pages_used
-        self.num_pages_used += num_new_pages
-        self.seq_page_counts[seq_idx] += num_new_pages
-        self.seq_kv_lens[seq_idx] += num_tokens
-        return start_page, num_new_pages
-
-    def alloc_prefill_pages(self, seq_idx, seq_len):
-        page_size = self.page_size
-        num_pages = (seq_len + page_size - 1) // page_size
-        start_page = self.num_pages_used
-        self.num_pages_used += num_pages
-        self.seq_page_counts[seq_idx] = num_pages
-        self.seq_kv_lens[seq_idx] = seq_len
-        return start_page, num_pages
-
-    def alloc_decode_token(self, seq_idx):
-        kv_len = self.seq_kv_lens[seq_idx]
-        page_size = self.page_size
-        page_idx_in_seq = kv_len // page_size
-        if page_idx_in_seq >= self.seq_page_counts[seq_idx]:
-            start_page = self.num_pages_used
-            self.num_pages_used += 1
-            self.seq_page_counts[seq_idx] += 1
-        self.seq_kv_lens[seq_idx] = kv_len + 1
-        abs_page = sum(self.seq_page_counts[:seq_idx]) + page_idx_in_seq
-        slot_in_page = kv_len % page_size
-        return abs_page, slot_in_page
-
-    def update_indptr(self):
-        batch_size = len(self.seq_page_counts)
-        indptr = [0] * (batch_size + 1)
-        for i in range(batch_size):
-            indptr[i + 1] = indptr[i] + self.seq_page_counts[i]
-        indptr_np = np.array(indptr, dtype=np.int32)
-        last_page_len_list = []
-        for i in range(batch_size):
-            kv_len = self.seq_kv_lens[i]
-            remainder = kv_len % self.page_size
-            last_page_len_list.append(remainder if remainder != 0 else self.page_size if kv_len > 0 else 0)
-        last_page_len_np = np.array(last_page_len_list, dtype=np.int32)
-        ctypes.memset(self.indptr_h, 0, (batch_size + 1) * I32)
-        ctypes.memset(self.last_page_len_h, 0, batch_size * I32)
-        ctypes.memmove(self.indptr_h, indptr_np.tobytes(), (batch_size + 1) * I32)
-        ctypes.memmove(self.last_page_len_h, last_page_len_np.tobytes(), batch_size * I32)
-        self.glm.h2d(self.indptr_d, indptr_np.tobytes())
-        self.glm.h2d(self.last_page_len, last_page_len_np.tobytes())
-
-
-class WorkspaceBuffers:
-    def __init__(self, glm):
-        self.glm = glm
-        self.float_ws = glm.alloc(BATCH_FLOAT_WS_SIZE)
-        self.int_ws = glm.alloc(BATCH_INT_WS_SIZE)
-        self.pinned_int_ws = glm.alloc_pinned(BATCH_PINNED_INT_WS_SIZE)
-        self.decode_plan_info = glm.alloc_pinned(DECODE_PLAN_INFO_SIZE * 8)
-        self.prefill_plan_info = glm.alloc_pinned(PREFILL_PLAN_INFO_SIZE * 8)
-
-    def free(self):
-        glm = self.glm
-        glm.free_buf(self.float_ws)
-        glm.free_buf(self.int_ws)
-        glm.free_pinned(self.pinned_int_ws)
-        glm.free_pinned(self.decode_plan_info)
-        glm.free_pinned(self.prefill_plan_info)
-        self.float_ws = 0
-        self.int_ws = 0
 
 
 def _normalize_token_ids(input_ids, tokenizer):
@@ -271,7 +138,9 @@ class Qwen3Model:
             "causal_mask": glm.alloc(S * S * BF16),
             "mask_expanded": glm.alloc(B * n_heads * S * S * BF16),
             "position_ids": glm.alloc(B * S * I32),
-            "logits_buf": glm.alloc(BS * vs * BF16),
+            "logits_buf": glm.alloc(B * vs * BF16),
+            "hidden_last": glm.alloc(B * hs * BF16),
+            "last_idx": glm.alloc(B * I32),
             "argmax_idx": glm.alloc(I32),
             "decode_id": glm.alloc(I32),
             "flash_out": glm.alloc(B * n_heads * S * hd * BF16),
@@ -361,12 +230,14 @@ class Qwen3Model:
                      self.weights["model.norm.weight"],
                      cfg.rms_norm_eps, hs, BS)
 
-        glm.linear(self._ws["logits_buf"], self._ws["normed"],
+        logits_full = glm.alloc(BS * vs * BF16)
+        glm.linear(logits_full, self._ws["normed"],
                     self.weights["lm_head.weight"],
                     BS, vs, hs)
 
         logits_count = BS * vs
-        logits_u16 = self._read_logits(self._ws["logits_buf"], logits_count)
+        logits_u16 = self._read_logits(logits_full, logits_count)
+        glm.free_buf(logits_full)
         logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(B, S, vs)
         return torch.from_numpy(logits_f32.copy())
 
@@ -401,19 +272,23 @@ class Qwen3Model:
             pfx = f"model.layers.{i}"
             self._decoder_layer_prefill_flash(B, S, i, pfx)
 
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
+        last_idx_np = np.array([S - 1], dtype=np.int32)
+        glm.h2d(self._ws["last_idx"], last_idx_np.tobytes())
+        glm.index_select(self._ws["hidden_last"], self._ws["hidden_a"],
+                          self._ws["last_idx"], hs, 1)
+
+        glm.rmsnorm(self._ws["normed"], self._ws["hidden_last"],
                      self.weights["model.norm.weight"],
-                     cfg.rms_norm_eps, hs, BS)
+                     cfg.rms_norm_eps, hs, 1)
 
         glm.linear(self._ws["logits_buf"], self._ws["normed"],
                     self.weights["lm_head.weight"],
-                    BS, vs, hs)
+                    1, vs, hs)
 
         self.cache_pos = S
 
-        logits_count = BS * vs
-        logits_u16 = self._read_logits(self._ws["logits_buf"], logits_count)
-        logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(B, S, vs)
+        logits_u16 = self._read_logits(self._ws["logits_buf"], vs)
+        logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(1, vs)
         return torch.from_numpy(logits_f32.copy())
 
     def _decode_token(self, token_id):
@@ -489,8 +364,7 @@ class Qwen3Model:
         self.reset_cache()
         self.prefill(input_ids)
 
-        last_logits_ptr = self._ws["logits_buf"] + (S - 1) * vs * BF16
-        next_token = self._argmax_logits(last_logits_ptr, vs)
+        next_token = self._argmax_logits(self._ws["logits_buf"], vs)
         generated = [next_token]
 
         for _ in range(max_new_tokens - 1):
@@ -515,8 +389,7 @@ class Qwen3Model:
         self.reset_cache()
         self.prefill(input_ids)
 
-        last_logits_ptr = self._ws["logits_buf"] + (S - 1) * vs * BF16
-        next_token = self._argmax_logits(last_logits_ptr, vs)
+        next_token = self._argmax_logits(self._ws["logits_buf"], vs)
         yield next_token
 
         for _ in range(max_new_tokens - 1):
@@ -546,6 +419,65 @@ class Qwen3Model:
             eos_token_ids=eos_token_ids,
         ))
         return tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    def generate_batch(self, input_ids_list, ws, paged_kv, max_new_tokens=100,
+                       eos_token_ids=None):
+        if eos_token_ids is None:
+            eos_token_ids = {151645, 151643}
+
+        batch_size = len(input_ids_list)
+        cfg = self.cfg
+        vs = cfg.vocab_size
+
+        all_logits = self.prefill_batch(input_ids_list, ws, paged_kv)
+
+        next_tokens = [logits.argmax().item() for logits in all_logits]
+        generated = [[t] for t in next_tokens]
+        finished = [t in eos_token_ids for t in next_tokens]
+
+        for _ in range(max_new_tokens - 1):
+            if all(finished):
+                break
+
+            token_ids = [next_tokens[i] for i in range(batch_size)]
+            all_logits = self.decode_batch(token_ids, ws, paged_kv)
+
+            for i in range(batch_size):
+                if finished[i]:
+                    continue
+                next_tokens[i] = all_logits[i].argmax().item()
+                if next_tokens[i] in eos_token_ids:
+                    finished[i] = True
+                else:
+                    generated[i].append(next_tokens[i])
+
+        return generated
+
+    def generate_text_batch(self, prompts, tokenizer, ws, paged_kv,
+                            max_new_tokens=100, eos_token_ids=None,
+                            enable_thinking=True):
+        input_ids_list = []
+        for prompt in prompts:
+            messages = [{"role": "user", "content": prompt}]
+            try:
+                ids = tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+            except TypeError:
+                ids = tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                )
+            ids = _normalize_token_ids(ids, tokenizer)
+            input_ids_list.append(ids)
+
+        generated_ids = self.generate_batch(
+            input_ids_list, ws, paged_kv,
+            max_new_tokens=max_new_tokens,
+            eos_token_ids=eos_token_ids,
+        )
+
+        return [tokenizer.decode(ids, skip_special_tokens=True) for ids in generated_ids]
 
     def _decoder_layer(self, B, S, pfx):
         cfg = self.cfg
@@ -1223,24 +1155,32 @@ class Qwen3Model:
 
             self._mlp(total_tokens, 1, pfx)
 
-        glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
+        last_indices = []
+        offset = 0
+        for s in seq_lens:
+            last_indices.append(offset + s - 1)
+            offset += s
+        last_idx_np = np.array(last_indices, dtype=np.int32)
+        glm.h2d(self._ws["last_idx"], last_idx_np.tobytes())
+        glm.index_select(self._ws["hidden_last"], self._ws["hidden_a"],
+                          self._ws["last_idx"], hs, batch_size)
+
+        glm.rmsnorm(self._ws["normed"], self._ws["hidden_last"],
                      self.weights["model.norm.weight"],
-                     cfg.rms_norm_eps, hs, total_tokens)
+                     cfg.rms_norm_eps, hs, batch_size)
 
         glm.linear(self._ws["logits_buf"], self._ws["normed"],
                      self.weights["lm_head.weight"],
-                     total_tokens, vs, hs)
+                     batch_size, vs, hs)
 
         paged_kv.update_indptr()
 
         all_logits = []
-        offset = 0
-        for s in seq_lens:
-            logits_ptr = self._ws["logits_buf"] + (offset + s - 1) * vs * BF16
+        for i in range(batch_size):
+            logits_ptr = self._ws["logits_buf"] + i * vs * BF16
             logits_u16 = self._read_logits(logits_ptr, vs)
             logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(vs)
             all_logits.append(torch.from_numpy(logits_f32.copy()))
-            offset += s
 
         return all_logits
 

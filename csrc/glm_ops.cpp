@@ -820,6 +820,19 @@ static Napi::Value FreePinned(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value WritePinned(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3) {
+        Napi::TypeError::New(env, "Expected (dst, src_buffer, size)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t dst = info[0].As<Napi::Number>().Int64Value();
+    auto src_buf = info[1].As<Napi::Buffer<uint8_t>>();
+    size_t size = info[2].As<Napi::Number>().Uint32Value();
+    glm_write_pinned(reinterpret_cast<void*>(dst), src_buf.Data(), size);
+    return env.Undefined();
+}
+
 static Napi::Value BatchDecodePlan(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 11) {
@@ -1003,6 +1016,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "mmapClose"), Napi::Function::New(env, MmapClose));
     exports.Set(Napi::String::New(env, "allocPinned"), Napi::Function::New(env, AllocPinned));
     exports.Set(Napi::String::New(env, "freePinned"), Napi::Function::New(env, FreePinned));
+    exports.Set(Napi::String::New(env, "writePinned"), Napi::Function::New(env, WritePinned));
     exports.Set(Napi::String::New(env, "batchDecodePlan"), Napi::Function::New(env, BatchDecodePlan));
     exports.Set(Napi::String::New(env, "batchDecodeRun"), Napi::Function::New(env, BatchDecodeRun));
     exports.Set(Napi::String::New(env, "batchPrefillRaggedPlan"), Napi::Function::New(env, BatchPrefillRaggedPlan));

@@ -140,6 +140,7 @@ void glm_flash_decode(
 
 void* glm_alloc_pinned(size_t bytes);
 void glm_free_pinned(void* ptr);
+void glm_write_pinned(void* dst, const void* src, size_t size);
 
 void glm_batch_decode_plan(
     GlmCtx* ctx,

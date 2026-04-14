@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, FLASH_TMP_SIZE } from "./glm_ops.js";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, FLASH_TMP_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, PAGE_SIZE } from "./glm_ops.js";
 import { SafeTensorFile } from "./safetensors.js";
 import { resolveModelPath } from "./model_path.js";
+import { PagedKVCache, WorkspaceBuffers } from "./paged_kv.js";
 
 export interface Qwen3Config {
   hiddenSize: number;
@@ -148,7 +149,9 @@ export class Qwen3Model {
       causalMask: glm.alloc(S * S * BF16),
       maskExpanded: glm.alloc(B * nHeads * S * S * BF16),
       positionIds: glm.alloc(B * S * I32),
-      logitsBuf: glm.alloc(BS * vs * BF16),
+      logitsBuf: glm.alloc(B * vs * BF16),
+      hiddenLast: glm.alloc(B * hs * BF16),
+      lastIdx: glm.alloc(B * I32),
       argmaxIdx: glm.alloc(I32),
       decodeId: glm.alloc(I32),
       flashOut: glm.alloc(B * nHeads * S * hd * BF16),
@@ -261,13 +264,15 @@ export class Qwen3Model {
       this.decoderLayerPrefillFlash(B, S, i, `model.layers.${i}`);
     }
 
-    glm.rmsnorm(this.ws.normed, this.ws.hiddenA, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, BS);
-    glm.linear(this.ws.logitsBuf, this.ws.normed, this.weights.get("lm_head.weight")!, BS, vs, hs);
+    const lastIdxBuf = Int32Array.from([S - 1]);
+    glm.h2d(this.ws.lastIdx, Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+    glm.indexSelect(this.ws.hiddenLast, this.ws.hiddenA, this.ws.lastIdx, hs, 1);
+    glm.rmsnorm(this.ws.normed, this.ws.hiddenLast, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, 1);
+    glm.linear(this.ws.logitsBuf, this.ws.normed, this.weights.get("lm_head.weight")!, 1, vs, hs);
 
     this.cachePos = S;
 
-    const logitsPtr = this.ws.logitsBuf + (S - 1) * vs * BF16;
-    return this.readArgmax(logitsPtr, vs);
+    return this.readArgmax(this.ws.logitsBuf, vs);
   }
 
   private decodeToken(tokenId: number): void {
@@ -482,5 +487,298 @@ export class Qwen3Model {
     );
 
     glm.linear(this.ws.oProjBuf, this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd);
+  }
+
+  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const hs = cfg.hiddenSize;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const vs = cfg.vocabSize;
+    const batchSize = inputIdsList.length;
+
+    pagedKV.reset(batchSize);
+
+    const seqLens = inputIdsList.map(ids => ids.length);
+    const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+
+    const pageAllocs: [number, number][] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      pageAllocs.push(pagedKV.allocPrefillPages(seqIdx, seqLens[seqIdx]));
+    }
+
+    const allIds: number[] = [];
+    for (const ids of inputIdsList) allIds.push(...ids);
+    const idsBuf = Int32Array.from(allIds);
+    const idsPtr = glm.alloc(idsBuf.byteLength);
+    glm.h2d(idsPtr, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+
+    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, idsPtr, hs, totalTokens);
+    glm.freeBuf(idsPtr);
+
+    const qoIndptr = [0];
+    const kvIndptr = [0];
+    for (const s of seqLens) {
+      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
+      kvIndptr.push(kvIndptr[kvIndptr.length - 1] + s);
+    }
+    const qoIndptrBuf = Int32Array.from(qoIndptr);
+    const kvIndptrBuf = Int32Array.from(kvIndptr);
+
+    const posIds: number[] = [];
+    for (const s of seqLens) {
+      for (let p = 0; p < s; p++) posIds.push(p);
+    }
+    const posIdsBuf = Int32Array.from(posIds);
+    glm.h2d(this.ws.positionIds, Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+
+    glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, 1, totalTokens);
+
+    // Write indptr to host memory for plan
+    const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
+    const kvIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
+    glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+    glm.writePinned(kvIndptrHostPtr, Buffer.from(kvIndptrBuf.buffer, kvIndptrBuf.byteOffset, kvIndptrBuf.byteLength));
+
+    glm.batchPrefillRaggedPlan(
+      ws.floatWs, BATCH_FLOAT_WS_SIZE,
+      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
+      ws.prefillPlanInfo,
+      qoIndptrHostPtr, kvIndptrHostPtr,
+      totalTokens, batchSize,
+      nHeads, nKv, hd,
+      1
+    );
+
+    glm.freePinned(qoIndptrHostPtr);
+    glm.freePinned(kvIndptrHostPtr);
+
+    for (let i = 0; i < cfg.numHiddenLayers; i++) {
+      const pfx = `model.layers.${i}`;
+
+      glm.rmsnorm(this.ws.normed, this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+
+      glm.linear(this.ws.qBuf, this.ws.normed, this.weights.get(`${pfx}.self_attn.q_proj.weight`)!, totalTokens, nHeads * hd, hs);
+      glm.linear(this.ws.kBuf, this.ws.normed, this.weights.get(`${pfx}.self_attn.k_proj.weight`)!, totalTokens, nKv * hd, hs);
+      glm.linear(this.ws.vBuf, this.ws.normed, this.weights.get(`${pfx}.self_attn.v_proj.weight`)!, totalTokens, nKv * hd, hs);
+
+      glm.rmsnorm(this.ws.qNormed, this.ws.qBuf, this.weights.get(`${pfx}.self_attn.q_norm.weight`)!, cfg.rmsNormEps, hd, totalTokens * nHeads);
+      glm.rmsnorm(this.ws.kNormed, this.ws.kBuf, this.weights.get(`${pfx}.self_attn.k_norm.weight`)!, cfg.rmsNormEps, hd, totalTokens * nKv);
+
+      glm.transpose4d(this.ws.qT, this.ws.qNormed, 1, totalTokens, nHeads, hd, 0, 2, 1, 3);
+      glm.transpose4d(this.ws.kT, this.ws.kNormed, 1, totalTokens, nKv, hd, 0, 2, 1, 3);
+      glm.transpose4d(this.ws.vT, this.ws.vBuf, 1, totalTokens, nKv, hd, 0, 2, 1, 3);
+
+      glm.applyRotaryPosEmb(this.ws.qRope, this.ws.qT, this.ws.cos, this.ws.sin, hd, nHeads, totalTokens, 1, 1);
+      glm.applyRotaryPosEmb(this.ws.kRope, this.ws.kT, this.ws.cos, this.ws.sin, hd, nKv, totalTokens, 1, 1);
+
+      // Copy KV to paged cache
+      const pageSize = pagedKV.pageSize;
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        const [startPage, numPages] = pageAllocs[seqIdx];
+        const seqStart = seqLens.slice(0, seqIdx).reduce((a, b) => a + b, 0);
+        const s = seqLens[seqIdx];
+        for (let h = 0; h < nKv; h++) {
+          for (let p = 0; p < numPages; p++) {
+            const pageOffset = (startPage + p) * nKv * pageSize * hd;
+            const kvHeadOffset = pageOffset + h * pageSize * hd;
+            const tokenStart = p * pageSize;
+            const tokenCount = Math.min(pageSize, s - p * pageSize);
+            const srcOff = (h * totalTokens + seqStart + tokenStart) * hd * BF16;
+            const dstOff = kvHeadOffset * BF16;
+            const copyBytes = tokenCount * hd * BF16;
+            glm.memcpy(pagedKV.kData[i] + dstOff, this.ws.kRope + srcOff, copyBytes);
+            glm.memcpy(pagedKV.vData[i] + dstOff, this.ws.vT + srcOff, copyBytes);
+          }
+        }
+      }
+
+      const qStrideN = hd;
+      const qStrideH = totalTokens * hd;
+      const kvStrideN = hd;
+      const kvStrideH = totalTokens * hd;
+
+      const qoIndptrD = glm.alloc((batchSize + 1) * I32);
+      const kvIndptrD = glm.alloc((batchSize + 1) * I32);
+      glm.h2d(qoIndptrD, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+      glm.h2d(kvIndptrD, Buffer.from(kvIndptrBuf.buffer, kvIndptrBuf.byteOffset, kvIndptrBuf.byteLength));
+
+      glm.batchPrefillRaggedRun(
+        this.ws.qRope, this.ws.kRope, this.ws.vT, this.ws.flashOut,
+        ws.floatWs, ws.intWs,
+        qoIndptrD, kvIndptrD,
+        ws.prefillPlanInfo,
+        totalTokens, batchSize,
+        nHeads, nKv, hd,
+        qStrideN, qStrideH,
+        kvStrideN, kvStrideH,
+        1, cfg.scaling
+      );
+
+      glm.freeBuf(qoIndptrD);
+      glm.freeBuf(kvIndptrD);
+
+      glm.linear(this.ws.oProjBuf, this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, totalTokens, hs, nHeads * hd);
+      glm.add(this.ws.hiddenB, this.ws.hiddenA, this.ws.oProjBuf, totalTokens * hs);
+      glm.rmsnorm(this.ws.normed, this.ws.hiddenB, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+      this.mlp(totalTokens, 1, pfx);
+    }
+
+    const lastIndices: number[] = [];
+    let offset = 0;
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      lastIndices.push(offset + seqLens[seqIdx] - 1);
+      offset += seqLens[seqIdx];
+    }
+    const lastIdxBuf = Int32Array.from(lastIndices);
+    glm.h2d(this.ws.lastIdx, Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+    glm.indexSelect(this.ws.hiddenLast, this.ws.hiddenA, this.ws.lastIdx, hs, batchSize);
+
+    glm.rmsnorm(this.ws.normed, this.ws.hiddenLast, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, batchSize);
+    glm.linear(this.ws.logitsBuf, this.ws.normed, this.weights.get("lm_head.weight")!, batchSize, vs, hs);
+
+    pagedKV.updateIndptr();
+
+    const nextTokens: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const logitsPtr = this.ws.logitsBuf + seqIdx * vs * BF16;
+      nextTokens.push(this.readArgmax(logitsPtr, vs));
+    }
+
+    return nextTokens;
+  }
+
+  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const hs = cfg.hiddenSize;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const vs = cfg.vocabSize;
+    const pageSize = pagedKV.pageSize;
+    const batchSize = tokenIdsList.length;
+
+    const writeLocations: [number, number][] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
+    }
+
+    pagedKV.updateIndptr();
+
+    const idsBuf = Int32Array.from(tokenIdsList);
+    const idsPtr = glm.alloc(idsBuf.byteLength);
+    glm.h2d(idsPtr, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+
+    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, idsPtr, hs, batchSize);
+    glm.freeBuf(idsPtr);
+
+    const posIds = new Array(batchSize);
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      posIds[seqIdx] = pagedKV.seqKvLens[seqIdx] - 1;
+    }
+    const posIdsBuf = Int32Array.from(posIds);
+    glm.h2d(this.ws.positionIds, Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+
+    glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, batchSize, 1);
+
+    glm.batchDecodePlan(
+      ws.floatWs, BATCH_FLOAT_WS_SIZE,
+      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
+      ws.decodePlanInfo,
+      pagedKV.indptrH,
+      batchSize,
+      nHeads, nKv, pageSize
+    );
+
+    for (let i = 0; i < cfg.numHiddenLayers; i++) {
+      const pfx = `model.layers.${i}`;
+
+      glm.rmsnorm(this.ws.normed, this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
+
+      glm.linear(this.ws.qBuf, this.ws.normed, this.weights.get(`${pfx}.self_attn.q_proj.weight`)!, batchSize, nHeads * hd, hs);
+      glm.linear(this.ws.kBuf, this.ws.normed, this.weights.get(`${pfx}.self_attn.k_proj.weight`)!, batchSize, nKv * hd, hs);
+      glm.linear(this.ws.vBuf, this.ws.normed, this.weights.get(`${pfx}.self_attn.v_proj.weight`)!, batchSize, nKv * hd, hs);
+
+      glm.rmsnorm(this.ws.qNormed, this.ws.qBuf, this.weights.get(`${pfx}.self_attn.q_norm.weight`)!, cfg.rmsNormEps, hd, batchSize * nHeads);
+      glm.rmsnorm(this.ws.kNormed, this.ws.kBuf, this.weights.get(`${pfx}.self_attn.k_norm.weight`)!, cfg.rmsNormEps, hd, batchSize * nKv);
+
+      glm.transpose4d(this.ws.qT, this.ws.qNormed, batchSize, 1, nHeads, hd, 0, 2, 1, 3);
+      glm.transpose4d(this.ws.kT, this.ws.kNormed, batchSize, 1, nKv, hd, 0, 2, 1, 3);
+      glm.transpose4d(this.ws.vT, this.ws.vBuf, batchSize, 1, nKv, hd, 0, 2, 1, 3);
+
+      glm.applyRotaryPosEmb(this.ws.qRope, this.ws.qT, this.ws.cos, this.ws.sin, hd, nHeads, 1, batchSize, 1);
+      glm.applyRotaryPosEmb(this.ws.kRope, this.ws.kT, this.ws.cos, this.ws.sin, hd, nKv, 1, batchSize, 1);
+
+      // Write KV to paged cache
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        const [absPage, slotInPage] = writeLocations[seqIdx];
+        for (let h = 0; h < nKv; h++) {
+          const pageOffset = absPage * nKv * pageSize * hd;
+          const kvHeadOffset = pageOffset + h * pageSize * hd;
+          const tokenOffset = kvHeadOffset + slotInPage * hd;
+          const srcOff = (seqIdx * nKv + h) * hd * BF16;
+          glm.memcpy(pagedKV.kData[i] + tokenOffset * BF16, this.ws.kRope + srcOff, hd * BF16);
+          glm.memcpy(pagedKV.vData[i] + tokenOffset * BF16, this.ws.vT + srcOff, hd * BF16);
+        }
+      }
+
+      glm.batchDecodeRun(
+        this.ws.qRope, this.ws.flashOut,
+        pagedKV.kData[i], pagedKV.vData[i],
+        pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
+        ws.floatWs, ws.intWs,
+        ws.decodePlanInfo,
+        nHeads, nKv, hd, pageSize, cfg.scaling
+      );
+
+      glm.linear(this.ws.oProjBuf, this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, batchSize, hs, nHeads * hd);
+      glm.add(this.ws.hiddenB, this.ws.hiddenA, this.ws.oProjBuf, batchSize * hs);
+      glm.rmsnorm(this.ws.normed, this.ws.hiddenB, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
+      this.mlp(batchSize, 1, pfx);
+    }
+
+    glm.rmsnorm(this.ws.normed, this.ws.hiddenA, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, batchSize);
+    glm.linear(this.ws.logitsBuf, this.ws.normed, this.weights.get("lm_head.weight")!, batchSize, vs, hs);
+
+    const nextTokens: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const logitsPtr = this.ws.logitsBuf + seqIdx * vs * BF16;
+      nextTokens.push(this.readArgmax(logitsPtr, vs));
+    }
+
+    return nextTokens;
+  }
+
+  generateBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[][] {
+    const batchSize = inputIdsList.length;
+    const vs = this.cfg.vocabSize;
+
+    const firstTokens = this.prefillBatch(inputIdsList, ws, pagedKV);
+
+    const nextTokens = [...firstTokens];
+    const generated: number[][] = nextTokens.map(t => [t]);
+    const finished = nextTokens.map(t => eosTokenIds.has(t));
+
+    for (let step = 0; step < maxNewTokens - 1; step++) {
+      if (finished.every(f => f)) break;
+
+      const newTokens = this.decodeBatch(nextTokens, ws, pagedKV);
+
+      for (let i = 0; i < batchSize; i++) {
+        nextTokens[i] = newTokens[i];
+        if (!finished[i]) {
+          if (eosTokenIds.has(newTokens[i])) {
+            finished[i] = true;
+          } else {
+            generated[i].push(newTokens[i]);
+          }
+        }
+      }
+    }
+
+    return generated;
   }
 }

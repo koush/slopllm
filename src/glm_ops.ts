@@ -42,6 +42,13 @@ interface NativeAddon {
   synchronize(ctx: number): void;
   flashPrefill(ctx: number, q: number, k: number, v: number, o: number, tmp: number, qoLen: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: number, kvLayout: number, smScale: number): void;
   flashDecode(ctx: number, q: number, k: number, v: number, o: number, tmp: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, smScale: number): void;
+  allocPinned(bytes: number): number;
+  freePinned(ptr: number): void;
+  writePinned(dst: number, src: Buffer, size: number): void;
+  batchDecodePlan(ctx: number, floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, indptrH: number, batchSize: number, numQoHeads: number, numKvHeads: number, pageSize: number): void;
+  batchDecodeRun(ctx: number, q: number, o: number, kData: number, vData: number, indices: number, indptrD: number, lastPageLen: number, floatWs: number, intWs: number, planInfo: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, smScale: number): void;
+  batchPrefillRaggedPlan(ctx: number, floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, qoIndptrH: number, kvIndptrH: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, maskMode: number): void;
+  batchPrefillRaggedRun(ctx: number, q: number, k: number, v: number, o: number, floatWs: number, intWs: number, qIndptrD: number, kvIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, maskMode: number, smScale: number): void;
   mmapOpen(path: string): number;
   mmapLoad(ctx: number, gpuDst: number, mmapPtr: number, offset: number, nbytes: number): void;
   mmapClose(mmapPtr: number, size: number): void;
@@ -148,6 +155,10 @@ export class GlmOps {
     this.native.expandDim1Strided(this.ctx, out, input, dim1Out, dim1In, seqLen, headDim, batch, headStride);
   }
 
+  indexSelect(out: number, src: number, indices: number, dim: number, k: number): void {
+    this.native.indexSelect(this.ctx, out, src, indices, dim, k);
+  }
+
   transpose4d(out: number, input: number, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): void {
     this.native.transpose4d(this.ctx, out, input, d0, d1, d2, d3, p0, p1, p2, p3);
   }
@@ -162,6 +173,36 @@ export class GlmOps {
 
   flashDecode(q: number, k: number, v: number, o: number, tmp: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, smScale: number): void {
     this.native.flashDecode(this.ctx, q, k, v, o, tmp, kvLen, numQoHeads, numKvHeads, headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, smScale);
+  }
+
+  allocPinned(bytes: number): number {
+    const ptr = this.native.allocPinned(bytes);
+    if (!ptr) throw new Error(`allocPinned failed for size ${bytes}`);
+    return ptr;
+  }
+
+  freePinned(ptr: number): void {
+    this.native.freePinned(ptr);
+  }
+
+  writePinned(dst: number, src: Buffer, size?: number): void {
+    this.native.writePinned(dst, src, size ?? src.length);
+  }
+
+  batchDecodePlan(floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, indptrH: number, batchSize: number, numQoHeads: number, numKvHeads: number, pageSize: number): void {
+    this.native.batchDecodePlan(this.ctx, floatWs, floatWsSize, intWs, pinnedIntWs, intWsSize, planInfo, indptrH, batchSize, numQoHeads, numKvHeads, pageSize);
+  }
+
+  batchDecodeRun(q: number, o: number, kData: number, vData: number, indices: number, indptrD: number, lastPageLen: number, floatWs: number, intWs: number, planInfo: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, smScale: number): void {
+    this.native.batchDecodeRun(this.ctx, q, o, kData, vData, indices, indptrD, lastPageLen, floatWs, intWs, planInfo, numQoHeads, numKvHeads, headDim, pageSize, smScale);
+  }
+
+  batchPrefillRaggedPlan(floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, qoIndptrH: number, kvIndptrH: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, maskMode: number): void {
+    this.native.batchPrefillRaggedPlan(this.ctx, floatWs, floatWsSize, intWs, pinnedIntWs, intWsSize, planInfo, qoIndptrH, kvIndptrH, totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, maskMode);
+  }
+
+  batchPrefillRaggedRun(q: number, k: number, v: number, o: number, floatWs: number, intWs: number, qIndptrD: number, kvIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, maskMode: number, smScale: number): void {
+    this.native.batchPrefillRaggedRun(this.ctx, q, k, v, o, floatWs, intWs, qIndptrD, kvIndptrD, planInfo, totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, maskMode, smScale);
   }
 
   mmapOpen(filePath: string): number {
@@ -200,3 +241,7 @@ export function bf16BytesToF32(buf: Buffer): Float32Array {
 export const BF16 = 2;
 export const I32 = 4;
 export const FLASH_TMP_SIZE = 32 * 1024 * 1024;
+export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
+export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
+export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
+export const PAGE_SIZE = 16;
