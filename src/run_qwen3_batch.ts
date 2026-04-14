@@ -38,7 +38,7 @@ async function main(): Promise<void> {
 
   console.log(`Loading model on GPU ${gpuId}...`);
   const glm = new GlmOps(0);
-  const model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 1, maxSeqLen);
+  const model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, maxBatch, maxSeqLen);
 
   const modelDir = resolveModelPath(QWEN3_REPO);
   const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
