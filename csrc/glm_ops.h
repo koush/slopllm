@@ -205,28 +205,6 @@ int glm_graph_exec_update(void* graph_exec, void* graph);
 void glm_graph_destroy(void* graph);
 void glm_graph_exec_destroy(void* graph_exec);
 
-// FP8 block-wise GEMM (SM120 CUTLASS)
-// Performs: output[m,n] = (act_scale * fp8_input[m,k]) @ (weight_scale * fp8_weight[n,k]).T
-// fp8_input: row-major [m, k] FP8 E4M3
-// act_scale: row-major [m, k/128] float32 (per-group-of-128 along K, ScaleGranularityM=1)
-// fp8_weight: row-major [n, k] FP8 E4M3 (= column-major [k, n] for CUTLASS)
-// weight_scale: row-major [n/128, k/128] float32 (block-wise 128x128)
-// bf16_out: row-major [m, n] BF16
-void glm_fp8_linear(GlmCtx* ctx, void* bf16_out, const void* fp8_input,
-                    const float* act_scale, const void* fp8_weight,
-                    const float* weight_scale, void* workspace,
-                    size_t workspace_size, int m, int n, int k);
-
-// Query workspace size for FP8 GEMM
-size_t glm_fp8_gemm_workspace_size(int m, int n, int k);
-
-// Quantize BF16 input to FP8 E4M3 with per-group-of-128 float32 scales
-// fp8_out: row-major [m, k] FP8 E4M3
-// scales: row-major [m, ceil(k/128)] float32
-// bf16_input: row-major [m, k] BF16
-void glm_fp8_quantize(GlmCtx* ctx, void* fp8_out, float* scales,
-                      const void* bf16_input, int m, int k);
-
 // Fused FP8 dequantize + GEMV for decode (any M)
 // Computes: output[m, j] = sum_k(bf16_input[m, k] * fp8_weight[j, k] * weight_scale[j/128, k/128])
 // No activation quantization — BF16 input used directly.

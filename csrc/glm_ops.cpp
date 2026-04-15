@@ -1088,67 +1088,6 @@ static Napi::Value GraphExecDestroy(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value Fp8Linear(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, bf16_out, fp8_input, act_scale, fp8_weight, weight_scale, workspace, workspace_size, m, n, k)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t fp8_input_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t act_scale_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t fp8_weight_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t weight_scale_ptr = info[5].As<Napi::Number>().Int64Value();
-    uintptr_t workspace_ptr = info[6].As<Napi::Number>().Int64Value();
-    size_t workspace_size = info[7].As<Napi::Number>().Int64Value();
-    int m = info[8].As<Napi::Number>().Int32Value();
-    int n = info[9].As<Napi::Number>().Int32Value();
-    int k = info[10].As<Napi::Number>().Int32Value();
-    glm_fp8_linear(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                   reinterpret_cast<void*>(out_ptr),
-                   reinterpret_cast<const void*>(fp8_input_ptr),
-                   reinterpret_cast<const float*>(act_scale_ptr),
-                   reinterpret_cast<const void*>(fp8_weight_ptr),
-                   reinterpret_cast<const float*>(weight_scale_ptr),
-                   reinterpret_cast<void*>(workspace_ptr),
-                   workspace_size, m, n, k);
-    return env.Undefined();
-}
-
-static Napi::Value Fp8Quantize(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 6) {
-        Napi::TypeError::New(env, "Expected (ctx, fp8_out, scales, bf16_input, m, k)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t fp8_out_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t scales_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t bf16_input_ptr = info[3].As<Napi::Number>().Int64Value();
-    int m = info[4].As<Napi::Number>().Int32Value();
-    int k = info[5].As<Napi::Number>().Int32Value();
-    glm_fp8_quantize(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                     reinterpret_cast<void*>(fp8_out_ptr),
-                     reinterpret_cast<float*>(scales_ptr),
-                     reinterpret_cast<const void*>(bf16_input_ptr),
-                     m, k);
-    return env.Undefined();
-}
-
-static Napi::Value Fp8GemmWorkspaceSize(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 3) {
-        Napi::TypeError::New(env, "Expected (m, n, k)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    int m = info[0].As<Napi::Number>().Int32Value();
-    int n = info[1].As<Napi::Number>().Int32Value();
-    int k = info[2].As<Napi::Number>().Int32Value();
-    size_t size = glm_fp8_gemm_workspace_size(m, n, k);
-    return Napi::Number::New(env, static_cast<double>(size));
-}
-
 static Napi::Value Fp8LinearDecode(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 7) {
@@ -1230,9 +1169,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "graphExecUpdate"), Napi::Function::New(env, GraphExecUpdate));
     exports.Set(Napi::String::New(env, "graphDestroy"), Napi::Function::New(env, GraphDestroy));
     exports.Set(Napi::String::New(env, "graphExecDestroy"), Napi::Function::New(env, GraphExecDestroy));
-    exports.Set(Napi::String::New(env, "fp8Linear"), Napi::Function::New(env, Fp8Linear));
-    exports.Set(Napi::String::New(env, "fp8Quantize"), Napi::Function::New(env, Fp8Quantize));
-    exports.Set(Napi::String::New(env, "fp8GemmWorkspaceSize"), Napi::Function::New(env, Fp8GemmWorkspaceSize));
     exports.Set(Napi::String::New(env, "fp8LinearDecode"), Napi::Function::New(env, Fp8LinearDecode));
     return exports;
 }

@@ -15,7 +15,6 @@ from flat_kv import FlatKVCache
 
 FP8 = 1  # bytes per float8
 FP8_BLOCK = 128
-FP8_WORKSPACE_SIZE = 32 * 1024 * 1024  # 32MB
 
 FP8_LINEAR_SUFFIXES = (
     ".self_attn.q_proj.weight",
@@ -103,16 +102,6 @@ class Qwen3FP8Model(Qwen3Model):
 
     def _alloc_workspace(self, B: int, S: int) -> None:
         super()._alloc_workspace(B, S)
-        glm = self.glm
-        cfg = self.cfg
-        hs = cfg.hidden_size
-        inter = cfg.intermediate_size
-        BS = B * S
-        max_k = max(hs, inter)
-
-        self._ws["fp8_input"] = glm.alloc(BS * max_k * FP8)
-        self._ws["fp8_act_scales"] = glm.alloc(BS * ((max_k + FP8_BLOCK - 1) // FP8_BLOCK) * 4)
-        self._ws["fp8_workspace"] = glm.alloc(FP8_WORKSPACE_SIZE)
 
     def free(self) -> None:
         glm = self.glm
@@ -137,15 +126,7 @@ class Qwen3FP8Model(Qwen3Model):
         scale_key = weight_key + "_scale_inv"
         ws_ptr = self.weight_scales[scale_key]
 
-        num_act_groups = (k + FP8_BLOCK - 1) // FP8_BLOCK
-
-        glm.fp8_quantize(self._ws["fp8_input"], self._ws["fp8_act_scales"],
-                          input_bf16, m, k)
-
-        glm.fp8_linear(output, self._ws["fp8_input"], self._ws["fp8_act_scales"],
-                        fp8_w_ptr, ws_ptr,
-                        self._ws["fp8_workspace"], FP8_WORKSPACE_SIZE,
-                        m, n, k)
+        glm.fp8_linear_decode(output, input_bf16, fp8_w_ptr, ws_ptr, m, n, k)
 
     def _compute_qkv(self, pfx: str, BS: int, B: int, S: int) -> None:
         cfg = self.cfg

@@ -444,29 +444,6 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
         ]
 
-        self.lib.glm_fp8_linear.restype = None
-        self.lib.glm_fp8_linear.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_size_t,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ]
-
-        self.lib.glm_fp8_gemm_workspace_size.restype = ctypes.c_size_t
-        self.lib.glm_fp8_gemm_workspace_size.argtypes = [
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ]
-
-        self.lib.glm_fp8_quantize.restype = None
-        self.lib.glm_fp8_quantize.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int,
-        ]
-
         self.lib.glm_fp8_linear_decode.restype = None
         self.lib.glm_fp8_linear_decode.argtypes = [
             ctypes.c_void_p,
@@ -938,26 +915,6 @@ class GlmOps:
             ctypes.c_uint32(batch_size), ctypes.c_uint32(n_kv),
             ctypes.c_uint32(hd), ctypes.c_uint32(page_size),
             ctypes.c_uint32(src_token_stride), ctypes.c_uint32(src_head_stride)
-        )
-
-    def fp8_linear(self, bf16_out, fp8_input, act_scale, fp8_weight, weight_scale,
-                    workspace, workspace_size, m, n, k):
-        self.lib.glm_fp8_linear(
-            self.ctx,
-            self._ptr(bf16_out), self._ptr(fp8_input),
-            self._ptr(act_scale), self._ptr(fp8_weight), self._ptr(weight_scale),
-            self._ptr(workspace), ctypes.c_size_t(workspace_size),
-            m, n, k
-        )
-
-    def fp8_gemm_workspace_size(self, m, n, k):
-        return self.lib.glm_fp8_gemm_workspace_size(m, n, k)
-
-    def fp8_quantize(self, fp8_out, scales, bf16_input, m, k):
-        self.lib.glm_fp8_quantize(
-            self.ctx,
-            self._ptr(fp8_out), self._ptr(scales), self._ptr(bf16_input),
-            m, k
         )
 
     def fp8_linear_decode(self, bf16_out, bf16_input, fp8_weight, weight_scale, m, n, k):

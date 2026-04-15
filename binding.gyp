@@ -32,8 +32,6 @@
             "--expt-relaxed-constexpr",
             "-o", "<@(_outputs)", "<@(_inputs)",
             "-Ivendor/flashinfer/include",
-            "-Ivendor/flashinfer/3rdparty/cutlass/include",
-            "-Ivendor/flashinfer/3rdparty/cutlass/tools/util/include",
             "-I/usr/local/cuda/include",
             "-L/usr/local/cuda/lib64", "-lcublas", "-lcudart",
             "-Xcompiler", "-fPIC"

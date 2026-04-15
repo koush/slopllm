@@ -58,9 +58,6 @@ interface NativeAddon {
   mmapOpen(path: string): number;
   mmapLoad(ctx: number, gpuDst: number, mmapPtr: number, offset: number, nbytes: number): void;
   mmapClose(mmapPtr: number, size: number): void;
-  fp8Linear(ctx: number, bf16Out: number, fp8Input: number, actScale: number, fp8Weight: number, weightScale: number, workspace: number, workspaceSize: number, m: number, n: number, k: number): void;
-  fp8Quantize(ctx: number, fp8Out: number, scales: number, bf16Input: number, m: number, k: number): void;
-  fp8GemmWorkspaceSize(m: number, n: number, k: number): number;
   fp8LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, m: number, n: number, k: number): void;
 }
 
@@ -261,18 +258,6 @@ export class GlmOps {
     this.native.graphExecDestroy(graphExec);
   }
 
-  fp8Linear(bf16Out: number, fp8Input: number, actScale: number, fp8Weight: number, weightScale: number, workspace: number, workspaceSize: number, m: number, n: number, k: number): void {
-    this.native.fp8Linear(this.ctx, bf16Out, fp8Input, actScale, fp8Weight, weightScale, workspace, workspaceSize, m, n, k);
-  }
-
-  fp8Quantize(fp8Out: number, scales: number, bf16Input: number, m: number, k: number): void {
-    this.native.fp8Quantize(this.ctx, fp8Out, scales, bf16Input, m, k);
-  }
-
-  fp8GemmWorkspaceSize(m: number, n: number, k: number): number {
-    return this.native.fp8GemmWorkspaceSize(m, n, k);
-  }
-
   fp8LinearDecode(bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, m: number, n: number, k: number): void {
     this.native.fp8LinearDecode(this.ctx, bf16Out, bf16Input, fp8Weight, weightScale, m, n, k);
   }
@@ -298,7 +283,6 @@ export function bf16BytesToF32(buf: Buffer): Float32Array {
 
 export const BF16 = 2;
 export const I32 = 4;
-export const FP8_GEMM_WORKSPACE_SIZE = 32 * 1024 * 1024;
 export const FLASH_TMP_SIZE = 32 * 1024 * 1024;
 export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
