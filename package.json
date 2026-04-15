@@ -16,7 +16,6 @@
     "pretest": "npm run build:all",
     "test:node": "node --test dist/test.js",
     "test:batch": "node --test dist/test_batch.js",
-    "test:python": "cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .",
     "test": "npm run test:python && npm run test:node && npm run test:batch"
   },
   "keywords": [],
@@ -25,6 +24,7 @@
   "description": "",
   "devDependencies": {
     "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
     "typescript": "^6.0.2"
   },
   "dependencies": {
