@@ -765,7 +765,87 @@ export class Qwen3Model {
     return this.prefillBatchRead(state);
   }
 
-  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache): DecodeState {
+  prefillBatchPagedAppendPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): PrefillState {
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const pageSize = pagedKV.pageSize;
+    const batchSize = inputIdsList.length;
+
+    if (pagedKV.seqPages.length !== batchSize) {
+      throw new Error(`prefillBatchPagedAppend: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+    }
+
+    const seqLens = inputIdsList.map(ids => ids.length);
+    const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+    const startPos = pagedKV.seqKvLens.slice();
+
+    const pageAllocs: [number, number][] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      pageAllocs.push(pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]));
+    }
+
+    const allIds: number[] = [];
+    for (const ids of inputIdsList) allIds.push(...ids);
+    const idsBuf = Int32Array.from(allIds);
+    glm.h2d(this.ws.inputIdsBuf, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+
+    const qoIndptr = [0];
+    for (const s of seqLens) {
+      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
+    }
+    const qoIndptrBuf = Int32Array.from(qoIndptr);
+
+    pagedKV.updateIndptr();
+
+    const posIds: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      for (let p = 0; p < seqLens[seqIdx]; p++) {
+        posIds.push(startPos[seqIdx] + p);
+      }
+    }
+    const posIdsBuf = Int32Array.from(posIds);
+    glm.h2d(this.ws.positionIds, Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+
+    const lastIndices: number[] = [];
+    let offset = 0;
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      lastIndices.push(offset + seqLens[seqIdx] - 1);
+      offset += seqLens[seqIdx];
+    }
+    const lastIdxBuf = Int32Array.from(lastIndices);
+    glm.h2d(this.ws.lastIdx, Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+
+    const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
+    glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    glm.batchPrefillPagedPlan(
+      ws.floatWs, BATCH_FLOAT_WS_SIZE,
+      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
+      ws.prefillPlanInfo,
+      qoIndptrHostPtr, pagedKV.indptrH,
+      totalTokens, batchSize,
+      nHeads, nKv, hd,
+      pageSize,
+      1
+    );
+
+    glm.freePinned(qoIndptrHostPtr);
+
+    glm.h2d(this.ws.qoIndptrD, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    return { batchSize, totalTokens, seqLens, pageAllocs };
+  }
+
+  prefillBatchPagedAppend(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
+    const state = this.prefillBatchPagedAppendPlan(inputIdsList, ws, pagedKV);
+    this.prefillBatchPagedForward(state, ws, pagedKV);
+    return this.prefillBatchRead(state);
+  }
+
+  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache, enableCudaGraph = false): DecodeState {
     const cfg = this.cfg;
     const glm = this.glm;
     const nHeads = cfg.numAttentionHeads;
@@ -798,7 +878,7 @@ export class Qwen3Model {
       pagedKV.indptrH,
       batchSize,
       nHeads, nKv, pageSize,
-      false
+      enableCudaGraph
     );
 
     return { batchSize };

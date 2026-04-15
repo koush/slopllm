@@ -1061,6 +1061,77 @@ class Qwen3Model:
         self.prefill_batch_paged_forward(state, ws, paged_kv)
         return self.prefill_batch_read(state)
 
+    def prefill_batch_paged_append_plan(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
+                                         paged_kv: PagedKVCache) -> PrefillState:
+        cfg = self.cfg
+        glm = self.glm
+        n_heads = cfg.num_attention_heads
+        n_kv = cfg.num_key_value_heads
+        hd = cfg.head_dim
+        page_size = paged_kv.page_size
+        batch_size = len(input_ids_list)
+
+        assert len(paged_kv.seq_pages) == batch_size, \
+            f"prefill_batch_paged_append: paged_kv has {len(paged_kv.seq_pages)} sequences, expected {batch_size}"
+
+        seq_lens: list[int] = [len(ids) for ids in input_ids_list]
+        total_tokens = sum(seq_lens)
+        start_pos = list(paged_kv.seq_kv_lens)
+
+        page_allocs: list[tuple[int, int]] = []
+        for seq_idx, s in enumerate(seq_lens):
+            start_page, num_pages = paged_kv.alloc_append_pages(seq_idx, s)
+            page_allocs.append((start_page, num_pages))
+
+        all_ids: list[int] = []
+        for ids in input_ids_list:
+            all_ids.extend(ids)
+        ids_np = np.array(all_ids, dtype=np.int32)
+        glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
+
+        qo_indptr = [0]
+        for s in seq_lens:
+            qo_indptr.append(qo_indptr[-1] + s)
+        qo_indptr_np = np.array(qo_indptr, dtype=np.int32)
+
+        paged_kv.update_indptr()
+
+        pos_ids: list[int] = []
+        for seq_idx, s in enumerate(seq_lens):
+            pos_ids.extend(range(start_pos[seq_idx], start_pos[seq_idx] + s))
+        pos_ids_np = np.array(pos_ids, dtype=np.int32)
+        glm.h2d(self._ws["position_ids"], pos_ids_np.tobytes())
+
+        last_indices: list[int] = []
+        offset = 0
+        for s in seq_lens:
+            last_indices.append(offset + s - 1)
+            offset += s
+        last_idx_np = np.array(last_indices, dtype=np.int32)
+        glm.h2d(self._ws["last_idx"], last_idx_np.tobytes())
+
+        glm.batch_prefill_paged_plan(
+            ws.float_ws, BATCH_FLOAT_WS_SIZE,
+            ws.int_ws, ws.pinned_int_ws, BATCH_INT_WS_SIZE,
+            ws.prefill_plan_info,
+            qo_indptr_np.ctypes.data, paged_kv.indptr_h,
+            total_tokens, batch_size,
+            n_heads, n_kv, hd,
+            page_size,
+            1
+        )
+
+        glm.h2d(self._ws["qo_indptr_d"], qo_indptr_np.tobytes())
+
+        return PrefillState(batch_size=batch_size, total_tokens=total_tokens,
+                            seq_lens=seq_lens, page_allocs=page_allocs)
+
+    def prefill_batch_paged_append(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
+                                    paged_kv: PagedKVCache) -> list[int]:
+        state = self.prefill_batch_paged_append_plan(input_ids_list, ws, paged_kv)
+        self.prefill_batch_paged_forward(state, ws, paged_kv)
+        return self.prefill_batch_read(state)
+
     def decode_batch_plan(self, token_ids_list: list[int], ws: WorkspaceBuffers,
                           paged_kv: PagedKVCache,
                           enable_cuda_graph: bool = False) -> DecodeState:

@@ -88,6 +88,22 @@ export class PagedKVCache {
     return [startPage, numPages];
   }
 
+  allocAppendPages(seqIdx: number, numNewTokens: number): [number, number] {
+    const pageSize = this.pageSize;
+    const currentLen = this.seqKvLens[seqIdx];
+    const currentPageCount = this.seqPages[seqIdx].length;
+    const newTotalLen = currentLen + numNewTokens;
+    const newPageCount = Math.ceil(newTotalLen / pageSize);
+    const numNewPages = newPageCount - currentPageCount;
+    const startPage = this.numPagesUsed;
+    for (let i = 0; i < numNewPages; i++) {
+      this.seqPages[seqIdx].push(startPage + i);
+    }
+    this.numPagesUsed += numNewPages;
+    this.seqKvLens[seqIdx] = newTotalLen;
+    return [startPage, numNewPages];
+  }
+
   allocDecodeToken(seqIdx: number): [number, number] {
     const kvLen = this.seqKvLens[seqIdx];
     const pageSize = this.pageSize;

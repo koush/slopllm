@@ -75,6 +75,20 @@ class PagedKVCache:
         self.seq_kv_lens[seq_idx] = seq_len
         return start_page, num_pages
 
+    def alloc_append_pages(self, seq_idx, num_new_tokens):
+        page_size = self.page_size
+        current_len = self.seq_kv_lens[seq_idx]
+        current_page_count = len(self.seq_pages[seq_idx])
+        new_total_len = current_len + num_new_tokens
+        new_page_count = (new_total_len + page_size - 1) // page_size
+        num_new_pages = new_page_count - current_page_count
+        start_page = self.num_pages_used
+        for i in range(num_new_pages):
+            self.seq_pages[seq_idx].append(start_page + i)
+        self.num_pages_used += num_new_pages
+        self.seq_kv_lens[seq_idx] = new_total_len
+        return start_page, num_new_pages
+
     def alloc_decode_token(self, seq_idx):
         kv_len = self.seq_kv_lens[seq_idx]
         page_size = self.page_size

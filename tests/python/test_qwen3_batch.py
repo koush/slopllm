@@ -127,6 +127,47 @@ def test_batch_prefill_paged_then_decode(glm, qwen3_model, ws):
         paged_kv.free()
 
 
+def test_batch_prefill_paged_append(glm, qwen3_model, ws):
+    model = qwen3_model
+    cfg = model.cfg
+    n_kv = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    n_layers = cfg.num_hidden_layers
+    max_pages = 256
+
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=1)
+    flat_cache = model.create_flat_kv_cache()
+    try:
+        prompt1 = [151643, 151644, 151645, 1, 2, 3]
+        prompt2_suffix = [4, 5, 6, 7]
+        full_prompt = prompt1 + prompt2_suffix
+
+        # Method 1: Full paged prefill of combined prompt
+        paged_kv.reset(1)
+        tokens_full = model.prefill_batch_paged([full_prompt], ws, paged_kv)
+        paged_kv.update_indptr()
+
+        # Method 2: Prefill first part, then append second part
+        paged_kv.reset(1)
+        tokens_first = model.prefill_batch_paged([prompt1], ws, paged_kv)
+        paged_kv.update_indptr()
+        tokens_append = model.prefill_batch_paged_append([prompt2_suffix], ws, paged_kv)
+
+        # Full prefill reference
+        flat_cache.reset()
+        single_logits = model.prefill(torch.tensor([full_prompt], dtype=torch.int64), flat_cache)
+        single_token = single_logits[0].argmax().item()
+
+        assert tokens_full[0] == single_token, \
+            f"Full paged prefill mismatch: paged={tokens_full[0]}, single={single_token}"
+        assert tokens_append[0] == tokens_full[0], \
+            f"Append prefill mismatch: append={tokens_append[0]}, full={tokens_full[0]}"
+        print(f"  Paged append: full={tokens_full[0]}, append={tokens_append[0]}, single={single_token}")
+    finally:
+        paged_kv.free()
+        flat_cache.free()
+
+
 def test_batch_decode_vs_single(glm, qwen3_model, ws):
     model = qwen3_model
     cfg = model.cfg
