@@ -157,6 +157,7 @@ export class Qwen3Model {
       inputIdsBuf: glm.alloc(BS * I32),
       qoIndptrD: glm.alloc((B + 1) * I32),
       kvIndptrD: glm.alloc((B + 1) * I32),
+      prefillSlotMapping: glm.alloc(BS * I32),
     };
   }
 
@@ -529,6 +530,19 @@ export class Qwen3Model {
     glm.h2d(this.ws.qoIndptrD, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
     glm.h2d(this.ws.kvIndptrD, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
 
+    const slotMapping: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const pages = pagedKV.seqPages[seqIdx];
+      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
+        const pageIdxInSeq = Math.floor(pos / pagedKV.pageSize);
+        const offsetInPage = pos % pagedKV.pageSize;
+        const absPage = pages[pageIdxInSeq];
+        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
+      }
+    }
+    const slotMappingBuf = Int32Array.from(slotMapping);
+    glm.h2d(this.ws.prefillSlotMapping, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+
     return { batchSize, totalTokens, seqLens, pageAllocs };
   }
 
@@ -555,25 +569,13 @@ export class Qwen3Model {
 
       this.computeQkv(pfx, totalTokens, 1, totalTokens);
 
-      const pageSize = pagedKV.pageSize;
-      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-        const [startPage, numPages] = pageAllocs[seqIdx];
-        const seqStart = seqLens.slice(0, seqIdx).reduce((a, b) => a + b, 0);
-        const s = seqLens[seqIdx];
-        for (let h = 0; h < nKv; h++) {
-          for (let p = 0; p < numPages; p++) {
-            const pageOffset = (startPage + p) * nKv * pageSize * hd;
-            const kvHeadOffset = pageOffset + h * pageSize * hd;
-            const tokenStart = p * pageSize;
-            const tokenCount = Math.min(pageSize, s - p * pageSize);
-            const srcOff = (h * totalTokens + seqStart + tokenStart) * hd * BF16;
-            const dstOff = kvHeadOffset * BF16;
-            const copyBytes = tokenCount * hd * BF16;
-            glm.memcpy(pagedKV.kData[i] + dstOff, this.ws.kRope + srcOff, copyBytes);
-            glm.memcpy(pagedKV.vData[i] + dstOff, this.ws.vT + srcOff, copyBytes);
-          }
-        }
-      }
+      glm.kvCacheWrite(
+        this.ws.kRope, this.ws.vT,
+        pagedKV.kData[i], pagedKV.vData[i],
+        this.ws.prefillSlotMapping,
+        totalTokens, nKv, hd, pagedKV.pageSize,
+        hd, totalTokens * hd
+      );
 
       const qStrideN = hd;
       const qStrideH = totalTokens * hd;
@@ -686,6 +688,19 @@ export class Qwen3Model {
 
     glm.h2d(this.ws.qoIndptrD, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
 
+    const slotMapping: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const pages = pagedKV.seqPages[seqIdx];
+      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
+        const pageIdxInSeq = Math.floor(pos / pagedKV.pageSize);
+        const offsetInPage = pos % pagedKV.pageSize;
+        const absPage = pages[pageIdxInSeq];
+        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
+      }
+    }
+    const slotMappingBuf = Int32Array.from(slotMapping);
+    glm.h2d(this.ws.prefillSlotMapping, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+
     return { batchSize, totalTokens, seqLens, pageAllocs };
   }
 
@@ -713,24 +728,13 @@ export class Qwen3Model {
 
       this.computeQkv(pfx, totalTokens, 1, totalTokens);
 
-      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-        const [startPage, numPages] = pageAllocs[seqIdx];
-        const seqStart = seqLens.slice(0, seqIdx).reduce((a, b) => a + b, 0);
-        const s = seqLens[seqIdx];
-        for (let h = 0; h < nKv; h++) {
-          for (let p = 0; p < numPages; p++) {
-            const pageOffset = (startPage + p) * nKv * pageSize * hd;
-            const kvHeadOffset = pageOffset + h * pageSize * hd;
-            const tokenStart = p * pageSize;
-            const tokenCount = Math.min(pageSize, s - p * pageSize);
-            const srcOff = (h * totalTokens + seqStart + tokenStart) * hd * BF16;
-            const dstOff = kvHeadOffset * BF16;
-            const copyBytes = tokenCount * hd * BF16;
-            glm.memcpy(pagedKV.kData[i] + dstOff, this.ws.kRope + srcOff, copyBytes);
-            glm.memcpy(pagedKV.vData[i] + dstOff, this.ws.vT + srcOff, copyBytes);
-          }
-        }
-      }
+      glm.kvCacheWrite(
+        this.ws.kRope, this.ws.vT,
+        pagedKV.kData[i], pagedKV.vData[i],
+        this.ws.prefillSlotMapping,
+        totalTokens, nKv, hd, pagedKV.pageSize,
+        hd, totalTokens * hd
+      );
 
       const qStrideN = hd;
       const qStrideH = totalTokens * hd;
@@ -835,6 +839,20 @@ export class Qwen3Model {
     glm.freePinned(qoIndptrHostPtr);
 
     glm.h2d(this.ws.qoIndptrD, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    const slotMapping: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const pages = pagedKV.seqPages[seqIdx];
+      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
+        const kvPos = startPos[seqIdx] + pos;
+        const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
+        const offsetInPage = kvPos % pagedKV.pageSize;
+        const absPage = pages[pageIdxInSeq];
+        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
+      }
+    }
+    const slotMappingBuf = Int32Array.from(slotMapping);
+    glm.h2d(this.ws.prefillSlotMapping, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
 
     return { batchSize, totalTokens, seqLens, pageAllocs };
   }
