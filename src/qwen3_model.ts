@@ -273,6 +273,11 @@ export class Qwen3Model {
     cache.cachePos = cachedLen + S;
   }
 
+  decode(tokenId: number, cache: FlatKVCache): number {
+    this.decodeToken(tokenId, cache);
+    return this.readArgmax(this.ws.logitsBuf, this.cfg.vocabSize);
+  }
+
   generateTokens(inputIds: number[][], cache: FlatKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[] {
     return [...this.streamTokens(inputIds, cache, maxNewTokens, eosTokenIds)];
   }
