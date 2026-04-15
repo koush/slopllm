@@ -370,3 +370,86 @@ def test_cuda_graph_decode(glm, qwen3_model, ws):
         glm.graph_destroy(graph)
     finally:
         paged_kv.free()
+
+
+def test_cuda_graph_multi_step_decode(glm, qwen3_model, ws):
+    """Capture a decode graph once, replay it multiple times with growing KV cache,
+    and verify each step produces the same token as normal decode."""
+    model = qwen3_model
+    cfg = model.cfg
+    n_kv = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    n_layers = cfg.num_hidden_layers
+    max_pages = 128
+    num_steps = 10
+
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=4)
+    try:
+        prompt = [151643, 151644, 151645, 1, 2988, 279, 1716, 364]
+
+        # Reference: normal decode for num_steps
+        paged_kv.reset(1)
+        tokens = model.prefill_batch([prompt], ws, paged_kv)
+        paged_kv.update_indptr()
+
+        ref_tokens = []
+        current = tokens[0]
+        for step in range(num_steps):
+            state = model.decode_batch_plan([current], ws, paged_kv,
+                                             enable_cuda_graph=True)
+            model.decode_batch_forward(state, ws, paged_kv)
+            current = model.decode_batch_read(state)[0]
+            ref_tokens.append(current)
+        print(f"  Reference tokens: {ref_tokens}")
+
+        # Graph decode: warmup + capture + multi-step replay
+        paged_kv.reset(1)
+        tokens = model.prefill_batch([prompt], ws, paged_kv)
+        paged_kv.update_indptr()
+
+        # Warmup: one decode step with enable_cuda_graph=True
+        current = tokens[0]
+        warmup_state = model.decode_batch_plan([current], ws, paged_kv,
+                                                enable_cuda_graph=True)
+        model.decode_batch_forward(warmup_state, ws, paged_kv)
+        current = model.decode_batch_read(warmup_state)[0]
+        assert current == ref_tokens[0], \
+            f"Warmup mismatch: {current} != {ref_tokens[0]}"
+
+        # Capture the decode forward pass
+        state = model.decode_batch_plan([current], ws, paged_kv,
+                                         enable_cuda_graph=True)
+        glm.graph_begin_capture()
+        model.decode_batch_forward(state, ws, paged_kv)
+        graph = glm.graph_end_capture()
+        assert graph is not None and graph != 0, "graph_end_capture returned null"
+        graph_exec = glm.graph_instantiate(graph)
+        assert graph_exec is not None and graph_exec != 0, "graph_instantiate returned null"
+        glm.graph_destroy(graph)
+
+        # First replay: graph was captured with state for token after warmup
+        glm.graph_launch(graph_exec)
+        glm.synchronize()
+        current = model.decode_batch_read(state)[0]
+        graph_tokens = [ref_tokens[0], current]
+        assert current == ref_tokens[1], \
+            f"Replay step 1 mismatch: {current} != {ref_tokens[1]}"
+
+        # Subsequent replays: plan updates inputs, then replay graph
+        for step in range(2, num_steps):
+            state = model.decode_batch_plan([current], ws, paged_kv,
+                                             enable_cuda_graph=True)
+            glm.graph_launch(graph_exec)
+            glm.synchronize()
+            current = model.decode_batch_read(state)[0]
+            graph_tokens.append(current)
+            assert current == ref_tokens[step], \
+                f"Replay step {step} mismatch: {current} != {ref_tokens[step]}"
+
+        print(f"  Graph tokens:     {graph_tokens}")
+        assert graph_tokens == ref_tokens, \
+            f"Token sequence mismatch: graph={graph_tokens}, ref={ref_tokens}"
+
+        glm.graph_exec_destroy(graph_exec)
+    finally:
+        paged_kv.free()
