@@ -24,8 +24,7 @@ function tokenizeMessages(tokenizer: any, messages: Array<{ role: string; conten
       return_dict: true,
       tokenizer_kwargs: { enable_thinking: enableThinking },
     }) as { input_ids: number[] | number[][] };
-    const ids = (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
-    return ids;
+    return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
   } catch {
     const result = tokenizer.apply_chat_template(messages, {
       tokenize: true,
@@ -33,48 +32,49 @@ function tokenizeMessages(tokenizer: any, messages: Array<{ role: string; conten
       return_tensor: false,
       return_dict: true,
     }) as { input_ids: number[] | number[][] };
-    const ids = (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
-    return ids;
+    return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
   }
 }
 
-function isPrefix(prefix: number[], full: number[]): boolean {
-  if (prefix.length > full.length) return false;
-  for (let i = 0; i < prefix.length; i++) {
-    if (prefix[i] !== full[i]) return false;
+function longestPrefix(a: number[], b: number[]): number {
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    if (a[i] !== b[i]) return i;
   }
-  return true;
+  return len;
 }
 
 function generateResponse(
   model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, pagedKV: PagedKVCache,
-  inputIds: number[], graphExec: number | null, maxNewTokens: number, warmupSteps: number,
-  useAppend: boolean, previousTokens: number[],
-): { tokens: number[]; graphExec: number | null; timing: TimingInfo; cachedTokens: number[] } {
+  inputIds: number[], cachedTokenIds: number[], graphExec: number | null, maxNewTokens: number, warmupSteps: number,
+): { tokens: number[]; graphExec: number | null; timing: TimingInfo; cachedTokenIds: number[]; matchLen: number } {
   const timing: TimingInfo = { prefillMs: 0, warmupMs: [], captureMs: 0, replayMs: [] };
   const generatedTokens: number[] = [];
 
-  // Compute suffix for append mode.
-  // previousTokens = all tokens currently in KV cache (input + previously decoded).
-  // On next turn, the tokenizer produces the full conversation including the
-  // assistant response, so we diff against the cached token IDs.
-  let suffixIds: number[];
-  if (useAppend && previousTokens.length > 0 && isPrefix(previousTokens, inputIds)) {
-    suffixIds = inputIds.slice(previousTokens.length);
+  let matchLen: number;
+  if (cachedTokenIds.length > 0) {
+    matchLen = longestPrefix(cachedTokenIds, inputIds);
   } else {
+    matchLen = 0;
+  }
+
+  let suffixIds: number[];
+  if (matchLen > 0 && matchLen < inputIds.length) {
+    if (matchLen < cachedTokenIds.length) {
+      pagedKV.truncate(0, matchLen);
+    }
+    suffixIds = inputIds.slice(matchLen);
+  } else {
+    matchLen = 0;
     suffixIds = inputIds;
     pagedKV.reset(1);
   }
 
-  // Prefill
   const t0 = performance.now();
   let tokens: number[];
-  if (useAppend && previousTokens.length > 0 && suffixIds !== inputIds) {
+  if (matchLen > 0) {
     tokens = model.prefillBatchAppend([suffixIds], ws, pagedKV);
   } else {
-    if (!useAppend || previousTokens.length === 0) {
-      pagedKV.reset(1);
-    }
     tokens = model.prefillBatch([suffixIds], ws, pagedKV);
   }
   pagedKV.updateIndptr();
@@ -84,17 +84,15 @@ function generateResponse(
   generatedTokens.push(currentToken);
 
   if (EOS_TOKEN_IDS.has(currentToken)) {
-    // cachedTokens = input (or suffix) + decoded tokens
-    const cachedTokens = suffixIds.concat(generatedTokens);
-    return { tokens: generatedTokens, graphExec, timing, cachedTokens };
+    const newCachedTokenIds = inputIds.slice(0, matchLen).concat(suffixIds).concat(generatedTokens);
+    return { tokens: generatedTokens, graphExec, timing, cachedTokenIds: newCachedTokenIds, matchLen };
   }
 
-  // Warmup + capture (first call only)
   if (graphExec === null) {
     for (let i = 0; i < warmupSteps; i++) {
       if (EOS_TOKEN_IDS.has(currentToken)) {
-        const cachedTokens = suffixIds.concat(generatedTokens);
-        return { tokens: generatedTokens, graphExec: null, timing, cachedTokens };
+        const newCachedTokenIds = inputIds.slice(0, matchLen).concat(suffixIds).concat(generatedTokens);
+        return { tokens: generatedTokens, graphExec: null, timing, cachedTokenIds: newCachedTokenIds, matchLen };
       }
       const t1 = performance.now();
       const state = model.decodeBatchPlan([currentToken], ws, pagedKV, true);
@@ -105,11 +103,10 @@ function generateResponse(
     }
 
     if (EOS_TOKEN_IDS.has(currentToken)) {
-      const cachedTokens = suffixIds.concat(generatedTokens);
-      return { tokens: generatedTokens, graphExec: null, timing, cachedTokens };
+      const newCachedTokenIds = inputIds.slice(0, matchLen).concat(suffixIds).concat(generatedTokens);
+      return { tokens: generatedTokens, graphExec: null, timing, cachedTokenIds: newCachedTokenIds, matchLen };
     }
 
-    // Capture graph
     const t2 = performance.now();
     const state = model.decodeBatchPlan([currentToken], ws, pagedKV, true);
     glm.graphBeginCapture();
@@ -121,14 +118,12 @@ function generateResponse(
     glm.graphDestroy(graph);
     timing.captureMs = performance.now() - t2;
 
-    // Replay captured step (forward wasn't executed during capture)
     glm.graphLaunch(graphExec);
     glm.synchronize();
     currentToken = model.decodeBatchRead(state)[0];
     generatedTokens.push(currentToken);
   }
 
-  // Decode loop with graph replay
   const remaining = maxNewTokens - generatedTokens.length;
   for (let i = 0; i < remaining; i++) {
     if (EOS_TOKEN_IDS.has(currentToken)) break;
@@ -141,15 +136,14 @@ function generateResponse(
     generatedTokens.push(currentToken);
   }
 
-  // cachedTokens = all tokens in KV cache after this turn (suffix + decoded)
-  const cachedTokens = suffixIds.concat(generatedTokens);
-  return { tokens: generatedTokens, graphExec, timing, cachedTokens };
+  const newCachedTokenIds = inputIds.slice(0, matchLen).concat(suffixIds).concat(generatedTokens);
+  return { tokens: generatedTokens, graphExec, timing, cachedTokenIds: newCachedTokenIds, matchLen };
 }
 
 async function interactiveChat(model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, pagedKV: PagedKVCache, tokenizer: any, args: any): Promise<void> {
   const messages: Array<{ role: string; content: string }> = [];
   let graphExec: number | null = null;
-  let previousTokens: number[] = [];
+  let cachedTokenIds: number[] = [];
 
   console.log(`Qwen3-0.6B  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  kv_persist=${args.noReset ? "on" : "off"}`);
   console.log(`Graph capture: ${args.warmupSteps} warmup steps, max ${args.maxNewTokens} tokens/turn`);
@@ -166,7 +160,7 @@ async function interactiveChat(model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuff
       if (userInput === "/quit") break;
       if (userInput === "/clear") {
         messages.length = 0;
-        previousTokens = [];
+        cachedTokenIds = [];
         graphExec = null;
         pagedKV.reset(1);
         console.log("Conversation cleared.\n");
@@ -180,7 +174,7 @@ async function interactiveChat(model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuff
       if (inputIds.length > args.maxSeqLen - args.maxNewTokens) {
         console.log(`Warning: prompt (${inputIds.length} tokens) too long, truncating conversation`);
         while (inputIds.length > args.maxSeqLen - args.maxNewTokens && messages.length > 1) {
-          messages.splice(1, 2); // remove oldest user+assistant pair
+          messages.splice(1, 2);
           const retryIds = tokenizeMessages(tokenizer, messages, args.thinking);
           if (retryIds.length <= args.maxSeqLen - args.maxNewTokens) break;
         }
@@ -191,39 +185,30 @@ async function interactiveChat(model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuff
         }
       }
 
-      // Prefix match check for KV cache persistence
-      if (args.noReset && previousTokens.length > 0) {
-        const prefixOk = isPrefix(previousTokens, inputIds);
-        if (!prefixOk) {
-          console.log("  [prefix mismatch, falling back to full prefill]");
-          previousTokens = [];
-          graphExec = null;
-          pagedKV.reset(1);
-        } else {
-          const suffixLen = inputIds.length - previousTokens.length;
-          console.log(`  [prefix match, appending ${suffixLen} tokens (${previousTokens.length} cached)]`);
-        }
-      }
-
       const result = generateResponse(
-        model, glm, ws, pagedKV, inputIds, graphExec,
+        model, glm, ws, pagedKV, inputIds, cachedTokenIds, graphExec,
         args.maxNewTokens, args.warmupSteps,
-        args.noReset, previousTokens,
       );
 
       graphExec = result.graphExec;
-      previousTokens = result.cachedTokens;
+      cachedTokenIds = result.cachedTokenIds;
 
-      // Strip EOS tokens
+      if (cachedTokenIds.length > 0) {
+        if (result.matchLen > 0) {
+          const suffixLen = inputIds.length - result.matchLen;
+          console.log(`  [cache hit ${result.matchLen}/${cachedTokenIds.length} tokens, appending ${suffixLen} new]`);
+        } else {
+          console.log("  [cache miss, full prefill]");
+        }
+      }
+
       const responseTokens = result.tokens.filter(t => !EOS_TOKEN_IDS.has(t));
       const responseText = tokenizer.decode(responseTokens, { skip_special_tokens: true });
 
       process.stdout.write(responseText + "\n\n");
 
-      // Add assistant response to history
       messages.push({ role: "assistant", content: responseText });
 
-      // Print timing on first turn
       if (result.timing.captureMs > 0) {
         const avg = result.timing.replayMs.length > 0
           ? result.timing.replayMs.reduce((a, b) => a + b, 0) / result.timing.replayMs.length
@@ -243,7 +228,7 @@ async function interactiveChat(model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuff
 }
 
 async function singlePrompt(model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, pagedKV: PagedKVCache, tokenizer: any, args: any): Promise<void> {
-  const messages = [{ role: "user" as const, content: args.prompt }];
+  const messages = [{ role: "user", content: args.prompt }];
   const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
 
   console.log(`Prompt: ${args.prompt}`);
@@ -251,9 +236,8 @@ async function singlePrompt(model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers
 
   pagedKV.reset(1);
   const result = generateResponse(
-    model, glm, ws, pagedKV, inputIds, null,
+    model, glm, ws, pagedKV, inputIds, [], null,
     args.maxNewTokens, args.warmupSteps,
-    args.noReset, [],
   );
 
   const responseTokens = result.tokens.filter(t => !EOS_TOKEN_IDS.has(t));

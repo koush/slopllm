@@ -78,6 +78,26 @@ export class PagedKVCache {
     this.seqKvLens = new Array(batchSize).fill(0);
   }
 
+  truncate(seqIdx: number, newLen: number): void {
+    if (newLen > this.seqKvLens[seqIdx]) {
+      throw new Error(`truncate: newLen ${newLen} > current seqKvLens ${this.seqKvLens[seqIdx]}`);
+    }
+    if (newLen === 0) {
+      this.seqPages[seqIdx] = [];
+      this.seqKvLens[seqIdx] = 0;
+      return;
+    }
+    const pageSize = this.pageSize;
+    const newPageCount = Math.ceil(newLen / pageSize);
+    const oldPageCount = this.seqPages[seqIdx].length;
+    const removedPages = oldPageCount - newPageCount;
+    if (removedPages > 0 && this.seqPages[seqIdx][oldPageCount - 1] === this.numPagesUsed - 1) {
+      this.numPagesUsed -= removedPages;
+    }
+    this.seqPages[seqIdx] = this.seqPages[seqIdx].slice(0, newPageCount);
+    this.seqKvLens[seqIdx] = newLen;
+  }
+
   allocPrefillPages(seqIdx: number, seqLen: number): [number, number] {
     const pageSize = this.pageSize;
     const numPages = Math.ceil(seqLen / pageSize);

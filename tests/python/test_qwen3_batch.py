@@ -135,6 +135,58 @@ def test_batch_prefill_append(glm, qwen3_model, ws):
         flat_cache.free()
 
 
+def test_batch_prefill_truncate_append(glm, qwen3_model, ws):
+    model = qwen3_model
+    cfg = model.cfg
+    n_kv = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    n_layers = cfg.num_hidden_layers
+    max_pages = 256
+
+    paged_kv = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=1)
+    flat_cache = model.create_flat_kv_cache()
+    try:
+        prompt1 = [151643, 151644, 151645, 1, 2, 3]
+        prompt2_suffix = [4, 5, 6, 7]
+        full_prompt = prompt1 + prompt2_suffix
+
+        # Prefill first part, then append, then truncate and append different suffix
+        paged_kv.reset(1)
+        model.prefill_batch([prompt1], ws, paged_kv)
+        paged_kv.update_indptr()
+        model.prefill_batch_append([prompt2_suffix], ws, paged_kv)
+        paged_kv.update_indptr()
+
+        # Now truncate back to prompt1 length and append prompt2_suffix again
+        paged_kv.truncate(0, len(prompt1))
+        paged_kv.update_indptr()
+        tokens_trunc_append = model.prefill_batch_append([prompt2_suffix], ws, paged_kv)
+        paged_kv.update_indptr()
+
+        # Reference: full prefill of combined prompt
+        paged_kv2 = PagedKVCache(glm, n_kv, hd, n_layers, max_pages, max_batch=1)
+        try:
+            paged_kv2.reset(1)
+            tokens_full = model.prefill_batch([full_prompt], ws, paged_kv2)
+            paged_kv2.update_indptr()
+
+            assert tokens_trunc_append[0] == tokens_full[0], \
+                f"Truncate+append mismatch: trunc_append={tokens_trunc_append[0]}, full={tokens_full[0]}"
+            print(f"  Truncate+append: trunc_append={tokens_trunc_append[0]}, full={tokens_full[0]}")
+        finally:
+            paged_kv2.free()
+
+        # Also verify against flat cache reference
+        flat_cache.reset()
+        single_logits = model.prefill(torch.tensor([full_prompt], dtype=torch.int64), flat_cache)
+        single_token = single_logits[0].argmax().item()
+        assert tokens_trunc_append[0] == single_token, \
+            f"Truncate+append vs single mismatch: trunc_append={tokens_trunc_append[0]}, single={single_token}"
+    finally:
+        paged_kv.free()
+        flat_cache.free()
+
+
 def test_batch_decode_vs_single(glm, qwen3_model, ws):
     model = qwen3_model
     cfg = model.cfg

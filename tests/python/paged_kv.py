@@ -57,6 +57,22 @@ class PagedKVCache:
         self.seq_pages = [[] for _ in range(batch_size)]
         self.seq_kv_lens = [0] * batch_size
 
+    def truncate(self, seq_idx, new_len):
+        assert new_len <= self.seq_kv_lens[seq_idx], \
+            f"truncate: new_len {new_len} > current seq_kv_lens {self.seq_kv_lens[seq_idx]}"
+        if new_len == 0:
+            self.seq_pages[seq_idx] = []
+            self.seq_kv_lens[seq_idx] = 0
+            return
+        page_size = self.page_size
+        new_page_count = (new_len + page_size - 1) // page_size
+        old_page_count = len(self.seq_pages[seq_idx])
+        removed_pages = old_page_count - new_page_count
+        if removed_pages > 0 and self.seq_pages[seq_idx][-1] == self.num_pages_used - 1:
+            self.num_pages_used -= removed_pages
+        self.seq_pages[seq_idx] = self.seq_pages[seq_idx][:new_page_count]
+        self.seq_kv_lens[seq_idx] = new_len
+
     def alloc_pages(self, seq_idx, num_tokens):
         page_size = self.page_size
         num_new_pages = (num_tokens + page_size - 1) // page_size
