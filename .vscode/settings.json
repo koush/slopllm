@@ -3,6 +3,8 @@
   "C_Cpp.default.includePath": [
     "${workspaceFolder}/csrc",
     "${workspaceFolder}/vendor/flashinfer/include",
+    "${workspaceFolder}/vendor/flashinfer/3rdparty/cutlass/include",
+    "${workspaceFolder}/vendor/flashinfer/3rdparty/cutlass/tools/util/include",
     "/usr/include/node",
     "${workspaceFolder}/node_modules/node-addon-api",
     "/usr/local/cuda-12.9/targets/x86_64-linux/include"

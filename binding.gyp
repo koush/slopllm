@@ -24,13 +24,16 @@
       "actions": [
         {
           "action_name": "build_libglm",
-          "inputs": [ "csrc/glm_ops.cu", "csrc/glm_flash.cu" ],
+          "inputs": [ "csrc/glm_ops.cu", "csrc/glm_flash.cu", "csrc/glm_fp8.cu" ],
           "outputs": [ "<(PRODUCT_DIR)/libglm_ops.so" ],
           "action": [
             "nvcc", "-O2", "-Xcompiler", "-fPIC", "-shared",
-            "-gencode", "arch=compute_120,code=sm_120",
+            "-gencode", "arch=compute_120a,code=sm_120a",
+            "--expt-relaxed-constexpr",
             "-o", "<@(_outputs)", "<@(_inputs)",
             "-Ivendor/flashinfer/include",
+            "-Ivendor/flashinfer/3rdparty/cutlass/include",
+            "-Ivendor/flashinfer/3rdparty/cutlass/tools/util/include",
             "-I/usr/local/cuda/include",
             "-L/usr/local/cuda/lib64", "-lcublas", "-lcudart",
             "-Xcompiler", "-fPIC"
