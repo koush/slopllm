@@ -5,6 +5,7 @@ import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { FlatKVCache } from "./flat_kv";
+import { Tensor } from "./tensor";
 
 export interface Qwen3Config {
   hiddenSize: number;
@@ -41,8 +42,89 @@ function loadConfig(modelDir: string): Qwen3Config {
   };
 }
 
-interface Workspace {
-  [key: string]: number;
+class Qwen3Workspace {
+  hiddenA: Tensor;
+  hiddenB: Tensor;
+  normed: Tensor;
+  qBuf: Tensor;
+  kBuf: Tensor;
+  vBuf: Tensor;
+  qNormed: Tensor;
+  kNormed: Tensor;
+  qT: Tensor;
+  kT: Tensor;
+  vT: Tensor;
+  qRope: Tensor;
+  kRope: Tensor;
+  oProjBuf: Tensor;
+  gateBuf: Tensor;
+  upBuf: Tensor;
+  siluBuf: Tensor;
+  downBuf: Tensor;
+  cos: Tensor;
+  sin: Tensor;
+  positionIds: Tensor;
+  logitsBuf: Tensor;
+  hiddenLast: Tensor;
+  lastIdx: Tensor;
+  argmaxIdx: Tensor;
+  decodeId: Tensor;
+  flashOut: Tensor;
+  flashTmp: Tensor;
+  inputIdsBuf: Tensor;
+  qoIndptrD: Tensor;
+  prefillSlotMapping: Tensor;
+
+  constructor(glm: GlmOps, B: number, S: number, cfg: Qwen3Config) {
+    const hs = cfg.hiddenSize;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const inter = cfg.intermediateSize;
+    const vs = cfg.vocabSize;
+    const BS = B * S;
+
+    this.hiddenA = Tensor.alloc(glm, [B, S, hs], "BF16");
+    this.hiddenB = Tensor.alloc(glm, [B, S, hs], "BF16");
+    this.normed = Tensor.alloc(glm, [B, S, hs], "BF16");
+    this.qBuf = Tensor.alloc(glm, [B, S, nHeads * hd], "BF16");
+    this.kBuf = Tensor.alloc(glm, [B, S, nKv * hd], "BF16");
+    this.vBuf = Tensor.alloc(glm, [B, S, nKv * hd], "BF16");
+    this.qNormed = Tensor.alloc(glm, [B, S, nHeads * hd], "BF16");
+    this.kNormed = Tensor.alloc(glm, [B, S, nKv * hd], "BF16");
+    this.qT = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
+    this.kT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
+    this.vT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
+    this.qRope = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
+    this.kRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
+    this.oProjBuf = Tensor.alloc(glm, [B, S, hs], "BF16");
+    this.gateBuf = Tensor.alloc(glm, [B, S, inter], "BF16");
+    this.upBuf = Tensor.alloc(glm, [B, S, inter], "BF16");
+    this.siluBuf = Tensor.alloc(glm, [B, S, inter], "BF16");
+    this.downBuf = Tensor.alloc(glm, [B, S, hs], "BF16");
+    this.cos = Tensor.alloc(glm, [B, S, hd], "BF16");
+    this.sin = Tensor.alloc(glm, [B, S, hd], "BF16");
+    this.positionIds = Tensor.alloc(glm, [B * S], "I32");
+    this.logitsBuf = Tensor.alloc(glm, [B, vs], "BF16");
+    this.hiddenLast = Tensor.alloc(glm, [B, hs], "BF16");
+    this.lastIdx = Tensor.alloc(glm, [B], "I32");
+    this.argmaxIdx = Tensor.alloc(glm, [B], "I32");
+    this.decodeId = Tensor.alloc(glm, [1], "I32");
+    this.flashOut = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
+    this.flashTmp = Tensor.alloc(glm, [FLASH_TMP_SIZE], "U8");
+    this.inputIdsBuf = Tensor.alloc(glm, [B * S], "I32");
+    this.qoIndptrD = Tensor.alloc(glm, [B + 1], "I32");
+    this.prefillSlotMapping = Tensor.alloc(glm, [B * S], "I32");
+  }
+
+  free(): void {
+    for (const key of Object.keys(this) as (keyof this)[]) {
+      const value = this[key];
+      if (value instanceof Tensor) {
+        value.free();
+      }
+    }
+  }
 }
 
 export interface DecodeState {
@@ -59,13 +141,13 @@ export interface PrefillState {
 export class Qwen3Model {
   glm: GlmOps;
   cfg: Qwen3Config;
-  weights: Map<string, number>;
+  weights: Map<string, Tensor>;
   maxBatch: number;
   maxSeqLen: number;
-  invFreq: number;
-  ws: Workspace;
+  invFreq: Tensor;
+  ws: Qwen3Workspace;
 
-  private constructor(glm: GlmOps, config: Qwen3Config, weights: Map<string, number>, maxBatch: number, maxSeqLen: number) {
+  private constructor(glm: GlmOps, config: Qwen3Config, weights: Map<string, Tensor>, maxBatch: number, maxSeqLen: number) {
     this.glm = glm;
     this.cfg = config;
     this.weights = weights;
@@ -77,10 +159,10 @@ export class Qwen3Model {
     for (let i = 0; i < halfDim; i++) {
       invFreqF32[i] = 1.0 / Math.pow(config.ropeTheta, (2 * i) / config.headDim);
     }
-    this.invFreq = glm.alloc(halfDim * BF16);
-    glm.h2d(this.invFreq, f32ToBf16Bytes(invFreqF32));
+    this.invFreq = Tensor.alloc(glm, [halfDim], "BF16");
+    this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
 
-    this.ws = this.allocWorkspace(maxBatch, maxSeqLen);
+    this.ws = new Qwen3Workspace(glm, maxBatch, maxSeqLen, config);
   }
 
   static fromPretrained(glm: GlmOps, repoId: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {
@@ -92,14 +174,13 @@ export class Qwen3Model {
     const mmapPtr = glm.mmapOpen(stPath);
     const fileSize = fs.statSync(stPath).size;
 
-    const weights = new Map<string, number>();
+    const weights = new Map<string, Tensor>();
     for (const name of st.tensorNames()) {
       const meta = st.meta(name);
-      const size = meta.dataOffsets[1] - meta.dataOffsets[0];
-      const gpuPtr = glm.alloc(size);
+      const tensor = Tensor.alloc(glm, meta.shape, meta.dtype);
       const offset = st.dataStart + meta.dataOffsets[0];
-      glm.mmapLoad(gpuPtr, mmapPtr, offset, size);
-      weights.set(name, gpuPtr);
+      glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
+      weights.set(name, tensor);
     }
 
     glm.synchronize();
@@ -107,73 +188,20 @@ export class Qwen3Model {
     glm.mmapClose(mmapPtr, fileSize);
 
     if (config.tieWordEmbeddings && !weights.has("lm_head.weight")) {
-      const embedPtr = weights.get("model.embed_tokens.weight")!;
-      weights.set("lm_head.weight", embedPtr);
+      const embedTensor = weights.get("model.embed_tokens.weight")!;
+      weights.set("lm_head.weight", embedTensor);
     }
 
     return new Qwen3Model(glm, config, weights, maxBatch, maxSeqLen);
   }
 
-  private allocWorkspace(B: number, S: number): Workspace {
-    const cfg = this.cfg;
-    const hs = cfg.hiddenSize;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const inter = cfg.intermediateSize;
-    const vs = cfg.vocabSize;
-    const BS = B * S;
-    const glm = this.glm;
-
-    return {
-      hiddenA: glm.alloc(BS * hs * BF16),
-      hiddenB: glm.alloc(BS * hs * BF16),
-      normed: glm.alloc(BS * hs * BF16),
-      qBuf: glm.alloc(BS * nHeads * hd * BF16),
-      kBuf: glm.alloc(BS * nKv * hd * BF16),
-      vBuf: glm.alloc(BS * nKv * hd * BF16),
-      qNormed: glm.alloc(BS * nHeads * hd * BF16),
-      kNormed: glm.alloc(BS * nKv * hd * BF16),
-      qT: glm.alloc(B * nHeads * S * hd * BF16),
-      kT: glm.alloc(B * nKv * S * hd * BF16),
-      vT: glm.alloc(B * nKv * S * hd * BF16),
-      qRope: glm.alloc(B * nHeads * S * hd * BF16),
-      kRope: glm.alloc(B * nKv * S * hd * BF16),
-      oProjBuf: glm.alloc(BS * hs * BF16),
-      gateBuf: glm.alloc(BS * inter * BF16),
-      upBuf: glm.alloc(BS * inter * BF16),
-      siluBuf: glm.alloc(BS * inter * BF16),
-      downBuf: glm.alloc(BS * hs * BF16),
-      cos: glm.alloc(B * S * hd * BF16),
-      sin: glm.alloc(B * S * hd * BF16),
-      positionIds: glm.alloc(B * S * I32),
-      logitsBuf: glm.alloc(B * vs * BF16),
-      hiddenLast: glm.alloc(B * hs * BF16),
-      lastIdx: glm.alloc(B * I32),
-      argmaxIdx: glm.alloc(B * I32),
-      decodeId: glm.alloc(I32),
-      flashOut: glm.alloc(B * nHeads * S * hd * BF16),
-      flashTmp: glm.alloc(FLASH_TMP_SIZE),
-      inputIdsBuf: glm.alloc(BS * I32),
-      qoIndptrD: glm.alloc((B + 1) * I32),
-      prefillSlotMapping: glm.alloc(BS * I32),
-    };
-  }
-
   free(): void {
-    const glm = this.glm;
-    for (const ptr of Object.values(this.ws)) {
-      glm.freeBuf(ptr);
+    this.ws.free();
+    this.invFreq.free();
+    for (const tensor of this.weights.values()) {
+      tensor.free();
     }
-    glm.freeBuf(this.invFreq);
-    const seen = new Set<number>();
-    for (const ptr of this.weights.values()) {
-      if (!seen.has(ptr)) {
-        seen.add(ptr);
-        glm.freeBuf(ptr);
-      }
-    }
-    this.ws = {};
+    this.ws = null!;
     this.weights = new Map();
   }
 
@@ -181,18 +209,18 @@ export class Qwen3Model {
     return new FlatKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, this.maxBatch, this.maxSeqLen);
   }
 
-  private readArgmax(ptr: number, count: number): number {
-    this.glm.argmax(this.ws.argmaxIdx, ptr, count);
+  private readArgmax(ptr: Tensor | number, count: number): number {
+    this.ws.argmaxIdx.argmax(ptr, count);
     const buf = Buffer.alloc(I32);
-    this.glm.d2h(buf, this.ws.argmaxIdx);
+    this.ws.argmaxIdx.d2h(buf);
     return buf.readInt32LE(0);
   }
 
   private readArgmaxBatch(batchSize: number): number[] {
     const vs = this.cfg.vocabSize;
-    this.glm.argmax(this.ws.argmaxIdx, this.ws.logitsBuf, vs, batchSize);
+    this.ws.argmaxIdx.argmax(this.ws.logitsBuf, vs, batchSize);
     const buf = Buffer.alloc(batchSize * I32);
-    this.glm.d2h(buf, this.ws.argmaxIdx);
+    this.ws.argmaxIdx.d2h(buf);
     const result: number[] = [];
     for (let i = 0; i < batchSize; i++) {
       result.push(buf.readInt32LE(i * I32));
@@ -225,11 +253,11 @@ export class Qwen3Model {
         flat[b * S + s] = inputIds[b][s];
       }
     }
-    glm.h2d(this.ws.inputIdsBuf, Buffer.from(flat.buffer, flat.byteOffset, flat.byteLength));
-    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
+    this.ws.inputIdsBuf.h2d(Buffer.from(flat.buffer, flat.byteOffset, flat.byteLength));
+    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
 
-    glm.arange(this.ws.positionIds, 0, 1, S);
-    glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, B, S);
+    this.ws.positionIds.arange(0, 1, S);
+    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, B, S);
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       this.decoderLayerPrefillFlash(B, S, i, `model.layers.${i}`, cache);
     }
@@ -258,11 +286,11 @@ export class Qwen3Model {
 
     const idsBuf = Buffer.alloc(I32);
     idsBuf.writeInt32LE(tokenId, 0);
-    glm.h2d(this.ws.decodeId, idsBuf);
+    this.ws.decodeId.h2d(idsBuf);
 
-    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.decodeId, hs, BS);
-    glm.arange(this.ws.positionIds, cachedLen, 0, 1);
-    glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, B, S);
+    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.decodeId, hs, BS);
+    this.ws.positionIds.arange(cachedLen, 0, 1);
+    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, B, S);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       this.decoderLayerDecodeFlash(B, S, i, `model.layers.${i}`, cachedLen, cache);
@@ -300,68 +328,63 @@ export class Qwen3Model {
 
   private decoderLayerPrefillFlash(B: number, S: number, layerIdx: number, pfx: string, cache: FlatKVCache): void {
     const cfg = this.cfg;
-    const glm = this.glm;
     const BS = B * S;
 
-    glm.rmsnorm(this.ws.normed, this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, cfg.hiddenSize, BS);
+    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, cfg.hiddenSize, BS);
     this.attentionPrefillFlash(B, S, layerIdx, pfx, cache);
     this.residualAndMlp(pfx, BS);
   }
 
   private decoderLayerDecodeFlash(B: number, S: number, layerIdx: number, pfx: string, cachedLen: number, cache: FlatKVCache): void {
     const cfg = this.cfg;
-    const glm = this.glm;
     const BS = B * S;
 
-    glm.rmsnorm(this.ws.normed, this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, cfg.hiddenSize, BS);
+    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, cfg.hiddenSize, BS);
     this.attentionDecodeFlash(B, S, layerIdx, pfx, cachedLen, cache);
     this.residualAndMlp(pfx, BS);
   }
 
   private mlp(BS: number, pfx: string): void {
     const cfg = this.cfg;
-    const glm = this.glm;
     const hs = cfg.hiddenSize;
     const inter = cfg.intermediateSize;
 
-    glm.linear(this.ws.gateBuf, this.ws.normed, this.weights.get(`${pfx}.mlp.gate_proj.weight`)!, BS, inter, hs);
-    glm.linear(this.ws.upBuf, this.ws.normed, this.weights.get(`${pfx}.mlp.up_proj.weight`)!, BS, inter, hs);
-    glm.siluAndMul(this.ws.siluBuf, this.ws.gateBuf, this.ws.upBuf, inter, BS);
-    glm.linear(this.ws.downBuf, this.ws.siluBuf, this.weights.get(`${pfx}.mlp.down_proj.weight`)!, BS, hs, inter);
-    glm.add(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, BS * hs);
+    this.ws.gateBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.gate_proj.weight`)!, BS, inter, hs);
+    this.ws.upBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.up_proj.weight`)!, BS, inter, hs);
+    this.ws.siluBuf.siluAndMul(this.ws.gateBuf, this.ws.upBuf, inter, BS);
+    this.ws.downBuf.linear(this.ws.siluBuf, this.weights.get(`${pfx}.mlp.down_proj.weight`)!, BS, hs, inter);
+    this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
   }
 
   private residualAndMlp(pfx: string, BS: number): void {
     const cfg = this.cfg;
-    const glm = this.glm;
     const hs = cfg.hiddenSize;
 
-    glm.add(this.ws.hiddenB, this.ws.hiddenA, this.ws.oProjBuf, BS * hs);
-    glm.rmsnorm(this.ws.normed, this.ws.hiddenB, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+    this.ws.hiddenB.add(this.ws.hiddenA, this.ws.oProjBuf, BS * hs);
+    this.ws.normed.rmsnorm(this.ws.hiddenB, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
     this.mlp(BS, pfx);
   }
 
   private computeQkv(pfx: string, BS: number, B: number, S: number): void {
     const cfg = this.cfg;
-    const glm = this.glm;
     const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
 
-    glm.linear(this.ws.qBuf, this.ws.normed, this.weights.get(`${pfx}.self_attn.q_proj.weight`)!, BS, nHeads * hd, hs);
-    glm.linear(this.ws.kBuf, this.ws.normed, this.weights.get(`${pfx}.self_attn.k_proj.weight`)!, BS, nKv * hd, hs);
-    glm.linear(this.ws.vBuf, this.ws.normed, this.weights.get(`${pfx}.self_attn.v_proj.weight`)!, BS, nKv * hd, hs);
+    this.ws.qBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.q_proj.weight`)!, BS, nHeads * hd, hs);
+    this.ws.kBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.k_proj.weight`)!, BS, nKv * hd, hs);
+    this.ws.vBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.v_proj.weight`)!, BS, nKv * hd, hs);
 
-    glm.rmsnorm(this.ws.qNormed, this.ws.qBuf, this.weights.get(`${pfx}.self_attn.q_norm.weight`)!, cfg.rmsNormEps, hd, BS * nHeads);
-    glm.rmsnorm(this.ws.kNormed, this.ws.kBuf, this.weights.get(`${pfx}.self_attn.k_norm.weight`)!, cfg.rmsNormEps, hd, BS * nKv);
+    this.ws.qNormed.rmsnorm(this.ws.qBuf, this.weights.get(`${pfx}.self_attn.q_norm.weight`)!, cfg.rmsNormEps, hd, BS * nHeads);
+    this.ws.kNormed.rmsnorm(this.ws.kBuf, this.weights.get(`${pfx}.self_attn.k_norm.weight`)!, cfg.rmsNormEps, hd, BS * nKv);
 
-    glm.transpose4d(this.ws.qT, this.ws.qNormed, B, S, nHeads, hd, 0, 2, 1, 3);
-    glm.transpose4d(this.ws.kT, this.ws.kNormed, B, S, nKv, hd, 0, 2, 1, 3);
-    glm.transpose4d(this.ws.vT, this.ws.vBuf, B, S, nKv, hd, 0, 2, 1, 3);
+    this.ws.qT.transpose4d(this.ws.qNormed, B, S, nHeads, hd, 0, 2, 1, 3);
+    this.ws.kT.transpose4d(this.ws.kNormed, B, S, nKv, hd, 0, 2, 1, 3);
+    this.ws.vT.transpose4d(this.ws.vBuf, B, S, nKv, hd, 0, 2, 1, 3);
 
-    glm.applyRotaryPosEmb(this.ws.qRope, this.ws.qT, this.ws.cos, this.ws.sin, hd, nHeads, S, B, 1);
-    glm.applyRotaryPosEmb(this.ws.kRope, this.ws.kT, this.ws.cos, this.ws.sin, hd, nKv, S, B, 1);
+    this.ws.qRope.applyRotaryPosEmb(this.ws.qT, this.ws.cos, this.ws.sin, hd, nHeads, S, B, 1);
+    this.ws.kRope.applyRotaryPosEmb(this.ws.kT, this.ws.cos, this.ws.sin, hd, nKv, S, B, 1);
   }
 
   private writeKvFlat(layerIdx: number, S: number, cache: FlatKVCache, offset = 0): void {
@@ -374,30 +397,23 @@ export class Qwen3Model {
     for (let h = 0; h < nKv; h++) {
       const srcOff = h * S * hd * BF16;
       const dstOff = (h * maxS * hd + offset * hd) * BF16;
-      glm.memcpy(cache.kData[layerIdx] + dstOff, this.ws.kRope + srcOff, S * hd * BF16);
-      glm.memcpy(cache.vData[layerIdx] + dstOff, this.ws.vT + srcOff, S * hd * BF16);
+      glm.memcpy(cache.kData[layerIdx] + dstOff, this.ws.kRope.data + srcOff, S * hd * BF16);
+      glm.memcpy(cache.vData[layerIdx] + dstOff, this.ws.vT.data + srcOff, S * hd * BF16);
     }
   }
 
-  private finalNormAndLogits(count: number, src?: number): void {
+  private finalNormAndLogits(count: number, src?: Tensor): void {
     const cfg = this.cfg;
-    const glm = this.glm;
     const hs = cfg.hiddenSize;
     const vs = cfg.vocabSize;
 
-    if (src === undefined) src = this.ws.hiddenA;
-
-    glm.rmsnorm(this.ws.normed, src, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, count);
-    glm.linear(this.ws.logitsBuf, this.ws.normed, this.weights.get("lm_head.weight")!, count, vs, hs);
+    this.ws.normed.rmsnorm(src ?? this.ws.hiddenA, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, count);
+    this.ws.logitsBuf.linear(this.ws.normed, this.weights.get("lm_head.weight")!, count, vs, hs);
   }
 
   private extractLastLogits(count: number, lastIndicesBuf: Buffer): void {
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const hs = cfg.hiddenSize;
-
-    glm.h2d(this.ws.lastIdx, lastIndicesBuf);
-    glm.indexSelect(this.ws.hiddenLast, this.ws.hiddenA, this.ws.lastIdx, hs, count);
+    this.ws.lastIdx.h2d(lastIndicesBuf);
+    this.ws.hiddenLast.indexSelect(this.ws.hiddenA, this.ws.lastIdx, this.cfg.hiddenSize, count);
     this.finalNormAndLogits(count, this.ws.hiddenLast);
   }
 
@@ -418,11 +434,11 @@ export class Qwen3Model {
     const kvStrideN = hd;
 
     glm.flashPrefill(
-      this.ws.qRope,
+      this.ws.qRope.data,
       cache.kData[layerIdx],
       cache.vData[layerIdx],
-      this.ws.flashOut,
-      this.ws.flashTmp,
+      this.ws.flashOut.data,
+      this.ws.flashTmp.data,
       S, S,
       nHeads, nKv, hd,
       hd, S * hd,
@@ -432,7 +448,7 @@ export class Qwen3Model {
       cfg.scaling,
     );
 
-    glm.linear(this.ws.oProjBuf, this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd);
+    this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd);
   }
 
   private attentionDecodeFlash(B: number, S: number, layerIdx: number, pfx: string, cachedLen: number, cache: FlatKVCache): void {
@@ -453,11 +469,11 @@ export class Qwen3Model {
     const kvStrideN = hd;
 
     glm.flashDecode(
-      this.ws.qRope,
+      this.ws.qRope.data,
       cache.kData[layerIdx],
       cache.vData[layerIdx],
-      this.ws.flashOut,
-      this.ws.flashTmp,
+      this.ws.flashOut.data,
+      this.ws.flashTmp.data,
       totalLen,
       nHeads, nKv, hd,
       hd, S * hd,
@@ -465,7 +481,7 @@ export class Qwen3Model {
       cfg.scaling,
     );
 
-    glm.linear(this.ws.oProjBuf, this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd);
+    this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd);
   }
 
   prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): PrefillState {
@@ -490,7 +506,7 @@ export class Qwen3Model {
     const allIds: number[] = [];
     for (const ids of inputIdsList) allIds.push(...ids);
     const idsBuf = Int32Array.from(allIds);
-    glm.h2d(this.ws.inputIdsBuf, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
 
     const qoIndptr = [0];
     for (const s of seqLens) {
@@ -505,7 +521,7 @@ export class Qwen3Model {
       for (let p = 0; p < s; p++) posIds.push(p);
     }
     const posIdsBuf = Int32Array.from(posIds);
-    glm.h2d(this.ws.positionIds, Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
 
     const lastIndices: number[] = [];
     let offset = 0;
@@ -514,7 +530,7 @@ export class Qwen3Model {
       offset += seqLens[seqIdx];
     }
     const lastIdxBuf = Int32Array.from(lastIndices);
-    glm.h2d(this.ws.lastIdx, Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+    this.ws.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
 
     const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
     glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
@@ -532,7 +548,7 @@ export class Qwen3Model {
 
     glm.freePinned(qoIndptrHostPtr);
 
-    glm.h2d(this.ws.qoIndptrD, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+    this.ws.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
 
     const slotMapping: number[] = [];
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -545,7 +561,7 @@ export class Qwen3Model {
       }
     }
     const slotMappingBuf = Int32Array.from(slotMapping);
-    glm.h2d(this.ws.prefillSlotMapping, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+    this.ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
 
     return { batchSize, totalTokens, seqLens, pageAllocs };
   }
@@ -560,24 +576,22 @@ export class Qwen3Model {
     const pageSize = pagedKV.pageSize;
     const batchSize = state.batchSize;
     const totalTokens = state.totalTokens;
-    const seqLens = state.seqLens;
-    const pageAllocs = state.pageAllocs;
 
-    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, totalTokens);
+    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, totalTokens);
 
-    glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, 1, totalTokens);
+    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, 1, totalTokens);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
 
-      glm.rmsnorm(this.ws.normed, this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+      this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
 
       this.computeQkv(pfx, totalTokens, 1, totalTokens);
 
       glm.kvCacheWrite(
-        this.ws.kRope, this.ws.vT,
+        this.ws.kRope.data, this.ws.vT.data,
         pagedKV.kData[i], pagedKV.vData[i],
-        this.ws.prefillSlotMapping,
+        this.ws.prefillSlotMapping.data,
         totalTokens, nKv, hd, pagedKV.pageSize,
         hd, totalTokens * hd
       );
@@ -586,11 +600,11 @@ export class Qwen3Model {
       const qStrideH = totalTokens * hd;
 
       glm.batchPrefillPagedRun(
-        this.ws.qRope, this.ws.flashOut,
+        this.ws.qRope.data, this.ws.flashOut.data,
         pagedKV.kData[i], pagedKV.vData[i],
         pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
         ws.floatWs, ws.intWs,
-        this.ws.qoIndptrD,
+        this.ws.qoIndptrD.data,
         ws.prefillPlanInfo,
         totalTokens, batchSize,
         nHeads, nKv, hd,
@@ -599,20 +613,20 @@ export class Qwen3Model {
         1, cfg.scaling
       );
 
-      glm.linear(this.ws.oProjBuf, this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, totalTokens, hs, nHeads * hd);
+      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, totalTokens, hs, nHeads * hd);
       this.residualAndMlp(pfx, totalTokens);
     }
 
-    glm.indexSelect(this.ws.hiddenLast, this.ws.hiddenA, this.ws.lastIdx, hs, batchSize);
+    this.ws.hiddenLast.indexSelect(this.ws.hiddenA, this.ws.lastIdx, hs, batchSize);
     this.finalNormAndLogits(batchSize, this.ws.hiddenLast);
 
-    this.glm.argmax(this.ws.argmaxIdx, this.ws.logitsBuf, cfg.vocabSize, batchSize);
+    this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
   }
 
   prefillBatchRead(state: PrefillState): number[] {
     const batchSize = state.batchSize;
     const buf = Buffer.alloc(batchSize * I32);
-    this.glm.d2h(buf, this.ws.argmaxIdx);
+    this.ws.argmaxIdx.d2h(buf);
     const result: number[] = [];
     for (let i = 0; i < batchSize; i++) {
       result.push(buf.readInt32LE(i * I32));
@@ -651,7 +665,7 @@ export class Qwen3Model {
     const allIds: number[] = [];
     for (const ids of inputIdsList) allIds.push(...ids);
     const idsBuf = Int32Array.from(allIds);
-    glm.h2d(this.ws.inputIdsBuf, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
 
     const qoIndptr = [0];
     for (const s of seqLens) {
@@ -668,7 +682,7 @@ export class Qwen3Model {
       }
     }
     const posIdsBuf = Int32Array.from(posIds);
-    glm.h2d(this.ws.positionIds, Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
 
     const lastIndices: number[] = [];
     let offset = 0;
@@ -677,7 +691,7 @@ export class Qwen3Model {
       offset += seqLens[seqIdx];
     }
     const lastIdxBuf = Int32Array.from(lastIndices);
-    glm.h2d(this.ws.lastIdx, Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+    this.ws.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
 
     const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
     glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
@@ -695,7 +709,7 @@ export class Qwen3Model {
 
     glm.freePinned(qoIndptrHostPtr);
 
-    glm.h2d(this.ws.qoIndptrD, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+    this.ws.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
 
     const slotMapping: number[] = [];
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -709,7 +723,7 @@ export class Qwen3Model {
       }
     }
     const slotMappingBuf = Int32Array.from(slotMapping);
-    glm.h2d(this.ws.prefillSlotMapping, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+    this.ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
 
     return { batchSize, totalTokens, seqLens, pageAllocs };
   }
@@ -737,14 +751,14 @@ export class Qwen3Model {
     pagedKV.updateSlotMapping(writeLocations, pageSize);
 
     const idsBuf = Int32Array.from(tokenIdsList);
-    glm.h2d(this.ws.inputIdsBuf, Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
 
     const posIds = new Array(batchSize);
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       posIds[seqIdx] = pagedKV.seqKvLens[seqIdx] - 1;
     }
     const posIdsBuf = Int32Array.from(posIds);
-    glm.h2d(this.ws.positionIds, Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
 
     glm.batchDecodePlan(
       ws.floatWs, BATCH_FLOAT_WS_SIZE,
@@ -769,19 +783,19 @@ export class Qwen3Model {
     const pageSize = pagedKV.pageSize;
     const batchSize = state.batchSize;
 
-    glm.embedding(this.ws.hiddenA, this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, batchSize);
+    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, batchSize);
 
-    glm.rotaryEmbedding(this.ws.cos, this.ws.sin, this.invFreq, this.ws.positionIds, hd / 2, batchSize, 1);
+    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, batchSize, 1);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
 
-      glm.rmsnorm(this.ws.normed, this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
+      this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
 
       this.computeQkv(pfx, batchSize, batchSize, 1);
 
       glm.kvCacheWrite(
-        this.ws.kRope, this.ws.vT,
+        this.ws.kRope.data, this.ws.vT.data,
         pagedKV.kData[i], pagedKV.vData[i],
         pagedKV.slotMapping,
         batchSize, nKv, hd, pageSize,
@@ -789,7 +803,7 @@ export class Qwen3Model {
       );
 
       glm.batchDecodeRun(
-        this.ws.qRope, this.ws.flashOut,
+        this.ws.qRope.data, this.ws.flashOut.data,
         pagedKV.kData[i], pagedKV.vData[i],
         pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
         ws.floatWs, ws.intWs,
@@ -798,19 +812,19 @@ export class Qwen3Model {
         nHeads, nKv, hd, pageSize, cfg.scaling
       );
 
-      glm.linear(this.ws.oProjBuf, this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, batchSize, hs, nHeads * hd);
+      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, batchSize, hs, nHeads * hd);
       this.residualAndMlp(pfx, batchSize);
     }
 
     this.finalNormAndLogits(batchSize);
 
-    this.glm.argmax(this.ws.argmaxIdx, this.ws.logitsBuf, cfg.vocabSize, batchSize);
+    this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
   }
 
   decodeBatchRead(state: DecodeState): number[] {
     const batchSize = state.batchSize;
     const buf = Buffer.alloc(batchSize * I32);
-    this.glm.d2h(buf, this.ws.argmaxIdx);
+    this.ws.argmaxIdx.d2h(buf);
     const result: number[] = [];
     for (let i = 0; i < batchSize; i++) {
       result.push(buf.readInt32LE(i * I32));
