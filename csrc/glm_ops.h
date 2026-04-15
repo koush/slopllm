@@ -227,16 +227,16 @@ size_t glm_fp8_gemm_workspace_size(int m, int n, int k);
 void glm_fp8_quantize(GlmCtx* ctx, void* fp8_out, float* scales,
                       const void* bf16_input, int m, int k);
 
-// Fused FP8 dequantize + GEMV for decode (M=1)
-// Computes: output[j] = sum_k(bf16_input[k] * fp8_weight[j,k] * weight_scale[j/128, k/128])
+// Fused FP8 dequantize + GEMV for decode (any M)
+// Computes: output[m, j] = sum_k(bf16_input[m, k] * fp8_weight[j, k] * weight_scale[j/128, k/128])
 // No activation quantization — BF16 input used directly.
-// bf16_out: row-major [1, n] BF16
-// bf16_input: row-major [1, k] BF16
-// fp8_weight: row-major [n, k] FP8 E4M3
-// weight_scale: row-major [n/128, k/128] float32 (block-wise scale_inv)
+// bf16_out: row-major [M, N] BF16
+// bf16_input: row-major [M, K] BF16
+// fp8_weight: row-major [N, K] FP8 E4M3
+// weight_scale: row-major [N/128, K/128] float32 (block-wise scale_inv)
 void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
                             const void* fp8_weight, const float* weight_scale,
-                            int n, int k);
+                            int m, int n, int k);
 
 #ifdef __cplusplus
 }

@@ -286,14 +286,16 @@ class TestFP8Linear:
 
 class TestFP8LinearDecode:
 
-    @pytest.mark.parametrize("n,k", [
-        (128, 128),
-        (1024, 1024),
-        (3072, 1024),
-        (1024, 3072),
+    @pytest.mark.parametrize("m,n,k", [
+        (1, 128, 128),
+        (1, 1024, 1024),
+        (1, 3072, 1024),
+        (1, 1024, 3072),
+        (4, 1024, 1024),
+        (8, 3072, 1024),
+        (4, 1024, 3072),
     ])
-    def test_fp8_decode_vs_cutlass(self, glm, device, n, k):
-        m = 1
+    def test_fp8_decode_vs_reference(self, glm, device, m, n, k):
         torch.manual_seed(42)
         x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.5
         w_bf16 = torch.randn(n, k, dtype=torch.bfloat16, device=device) * 0.5
@@ -303,48 +305,28 @@ class TestFP8LinearDecode:
         num_groups_n = n // 128
         num_groups_k = k // 128
 
-        fp8_x, act_scales = per_token_group_quant_fp8_ref(x_bf16.cpu())
         fp8_w, weight_scales = blockwise_quantize_weight(w_bf16.cpu())
+        weight_scales_f32 = weight_scales.float()
 
-        workspace_size = glm.fp8_gemm_workspace_size(m, n, k)
-        fp8_x_gpu = glm.alloc(m * k)
-        scales_x_gpu = glm.alloc(m * num_groups_k * 4)
         fp8_w_gpu = glm.alloc(n * k)
-        scales_w_gpu = glm.alloc(num_groups_n * num_groups_k * 4)
-        out_cutlass_gpu = glm.alloc(m * n * 2)
-        out_decode_gpu = glm.alloc(m * n * 2)
-        workspace = glm.alloc(workspace_size)
-
-        fp8_x_bytes = fp8_x.view(torch.uint8)
-        glm.h2d(fp8_x_gpu, fp8_x_bytes.cpu().numpy().ctypes.data_as(ctypes.c_void_p), m * k)
-        glm.h2d(scales_x_gpu, act_scales.cpu().numpy().ctypes.data_as(ctypes.c_void_p), m * num_groups_k * 4)
+        scales_w_f32_gpu = glm.alloc(num_groups_n * num_groups_k * 4)
+        out_gpu = glm.alloc(m * n * 2)
 
         fp8_w_bytes = fp8_w.view(torch.uint8)
         glm.h2d(fp8_w_gpu, fp8_w_bytes.cpu().numpy().ctypes.data_as(ctypes.c_void_p), n * k)
-        glm.h2d(scales_w_gpu, weight_scales.cpu().numpy().ctypes.data_as(ctypes.c_void_p), num_groups_n * num_groups_k * 4)
-
-        glm.fp8_linear(out_cutlass_gpu, fp8_x_gpu, scales_x_gpu, fp8_w_gpu, scales_w_gpu,
-                       workspace, workspace_size, m, n, k)
-
-        weight_scales_f32 = weight_scales.float()
-        scales_w_f32_gpu = glm.alloc(num_groups_n * num_groups_k * 4)
         glm.h2d(scales_w_f32_gpu, weight_scales_f32.cpu().numpy().ctypes.data_as(ctypes.c_void_p),
                 num_groups_n * num_groups_k * 4)
 
-        glm.fp8_linear_decode(out_decode_gpu, x_bf16.data_ptr(), fp8_w_gpu,
-                              scales_w_f32_gpu, n, k)
+        glm.fp8_linear_decode(out_gpu, x_bf16.data_ptr(), fp8_w_gpu,
+                              scales_w_f32_gpu, m, n, k)
 
         glm.synchronize()
 
-        out_cutlass_raw = torch.empty(m, n, dtype=torch.uint16, device='cpu')
-        glm.d2h(out_cutlass_raw.numpy().ctypes.data_as(ctypes.c_void_p), out_cutlass_gpu, m * n * 2)
-        out_cutlass = out_cutlass_raw.view(torch.bfloat16).float()
+        out_raw = torch.empty(m, n, dtype=torch.uint16, device='cpu')
+        glm.d2h(out_raw.numpy().ctypes.data_as(ctypes.c_void_p), out_gpu, m * n * 2)
+        out_decode = out_raw.view(torch.bfloat16).float()
 
-        out_decode_raw = torch.empty(m, n, dtype=torch.uint16, device='cpu')
-        glm.d2h(out_decode_raw.numpy().ctypes.data_as(ctypes.c_void_p), out_decode_gpu, m * n * 2)
-        out_decode = out_decode_raw.view(torch.bfloat16).float()
-
-        for ptr in [fp8_x_gpu, scales_x_gpu, fp8_w_gpu, scales_w_gpu, scales_w_f32_gpu, out_cutlass_gpu, out_decode_gpu, workspace]:
+        for ptr in [fp8_w_gpu, scales_w_f32_gpu, out_gpu]:
             glm.free_buf(ptr)
 
         mean_err = (out_decode - ref_out).abs().mean().item()
@@ -353,9 +335,6 @@ class TestFP8LinearDecode:
 
         assert mean_err < mean_abs_ref * 0.1, f"Decode mean error {mean_err:.4f} > 10% of ref {mean_abs_ref:.4f}"
         assert max_err < mean_abs_ref * 2.0, f"Decode max error {max_err:.4f} > 2x ref {mean_abs_ref:.4f}"
-
-        cutlass_mean = (out_cutlass - ref_out).abs().mean().item()
-        assert cutlass_mean < mean_abs_ref * 0.1, f"Cutlass mean error {cutlass_mean:.4f} > 10% of ref"
 
     def test_fp8_decode_identity(self, glm, device):
         n, k = 128, 128
@@ -376,7 +355,7 @@ class TestFP8LinearDecode:
         glm.h2d(scales_w_gpu, weight_scales_f32.cpu().numpy().ctypes.data_as(ctypes.c_void_p), 4)
 
         glm.fp8_linear_decode(out_gpu, x_bf16.data_ptr(), fp8_w_gpu,
-                              scales_w_gpu, n, k)
+                              scales_w_gpu, 1, n, k)
         glm.synchronize()
 
         out_raw = torch.empty(1, n, dtype=torch.uint16, device='cpu')

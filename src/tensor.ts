@@ -1,4 +1,4 @@
-import { GlmOps, FP8_GEMM_WORKSPACE_SIZE } from "./glm_ops";
+import { GlmOps } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 
 function ptr(t: Tensor | number): number {
@@ -16,16 +16,6 @@ export interface OpContext {
   ws: {
     tensors: Map<string, Tensor>;
   };
-}
-
-function ensureFp8Workspace(context: OpContext): void {
-  if (context.ws.tensors.has("fp8Input")) return;
-  const maxK = Math.max(context.cfg.hiddenSize, context.cfg.intermediateSize);
-  const hiddenA = context.ws.tensors.get("hiddenA")!;
-  const BS = hiddenA.shape[0] * hiddenA.shape[1];
-  context.ws.tensors.set("fp8Input", Tensor.alloc(context.glm, [BS, maxK], "F8_E4M3", "fp8Input"));
-  context.ws.tensors.set("fp8ActScales", Tensor.alloc(context.glm, [BS, Math.ceil(maxK / 128)], "F32", "fp8ActScales"));
-  context.ws.tensors.set("fp8Workspace", Tensor.alloc(context.glm, [FP8_GEMM_WORKSPACE_SIZE], "U8", "fp8Workspace"));
 }
 
 export class Tensor {
@@ -72,16 +62,7 @@ export class Tensor {
     const w = typeof weight === "number" ? undefined : weight;
     if (context && w && w.type === "F8_E4M3") {
       const scale = context.weights.get(w.name! + "_scale_inv")!;
-      if (batch <= 1) {
-        context.glm.fp8LinearDecode(this.data, ptr(input), w.data, scale.data, n, k);
-      } else {
-        ensureFp8Workspace(context);
-        const fp8Input = context.ws.tensors.get("fp8Input")!;
-        const fp8ActScales = context.ws.tensors.get("fp8ActScales")!;
-        const fp8Workspace = context.ws.tensors.get("fp8Workspace")!;
-        context.glm.fp8Quantize(fp8Input.data, fp8ActScales.data, ptr(input), batch, k);
-        context.glm.fp8Linear(this.data, fp8Input.data, fp8ActScales.data, w.data, scale.data, fp8Workspace.data, FP8_GEMM_WORKSPACE_SIZE, batch, n, k);
-      }
+      context.glm.fp8LinearDecode(this.data, ptr(input), w.data, scale.data, batch, n, k);
     } else {
       this.glm.linear(this.data, ptr(input), ptr(weight), batch, n, k);
     }

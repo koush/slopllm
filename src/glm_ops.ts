@@ -61,7 +61,7 @@ interface NativeAddon {
   fp8Linear(ctx: number, bf16Out: number, fp8Input: number, actScale: number, fp8Weight: number, weightScale: number, workspace: number, workspaceSize: number, m: number, n: number, k: number): void;
   fp8Quantize(ctx: number, fp8Out: number, scales: number, bf16Input: number, m: number, k: number): void;
   fp8GemmWorkspaceSize(m: number, n: number, k: number): number;
-  fp8LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, n: number, k: number): void;
+  fp8LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, m: number, n: number, k: number): void;
 }
 
 export class GlmOps {
@@ -273,8 +273,8 @@ export class GlmOps {
     return this.native.fp8GemmWorkspaceSize(m, n, k);
   }
 
-  fp8LinearDecode(bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, n: number, k: number): void {
-    this.native.fp8LinearDecode(this.ctx, bf16Out, bf16Input, fp8Weight, weightScale, n, k);
+  fp8LinearDecode(bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, m: number, n: number, k: number): void {
+    this.native.fp8LinearDecode(this.ctx, bf16Out, bf16Input, fp8Weight, weightScale, m, n, k);
   }
 }
 

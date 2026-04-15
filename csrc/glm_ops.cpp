@@ -1151,8 +1151,8 @@ static Napi::Value Fp8GemmWorkspaceSize(const Napi::CallbackInfo& info) {
 
 static Napi::Value Fp8LinearDecode(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 6) {
-        Napi::TypeError::New(env, "Expected (ctx, bf16_out, bf16_input, fp8_weight, weight_scale, n, k)").ThrowAsJavaScriptException();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (ctx, bf16_out, bf16_input, fp8_weight, weight_scale, m, n, k)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1160,14 +1160,15 @@ static Napi::Value Fp8LinearDecode(const Napi::CallbackInfo& info) {
     uintptr_t input_ptr = info[2].As<Napi::Number>().Int64Value();
     uintptr_t weight_ptr = info[3].As<Napi::Number>().Int64Value();
     uintptr_t scale_ptr = info[4].As<Napi::Number>().Int64Value();
-    int n = info[5].As<Napi::Number>().Int32Value();
-    int k = info[6].As<Napi::Number>().Int32Value();
+    int m = info[5].As<Napi::Number>().Int32Value();
+    int n = info[6].As<Napi::Number>().Int32Value();
+    int k = info[7].As<Napi::Number>().Int32Value();
     glm_fp8_linear_decode(reinterpret_cast<GlmCtx*>(ctx_ptr),
                            reinterpret_cast<void*>(out_ptr),
                            reinterpret_cast<const void*>(input_ptr),
                            reinterpret_cast<const void*>(weight_ptr),
                            reinterpret_cast<const float*>(scale_ptr),
-                           n, k);
+                           m, n, k);
     return env.Undefined();
 }
 

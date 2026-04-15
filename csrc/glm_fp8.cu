@@ -70,10 +70,11 @@ __global__ void transpose_scales_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Fused FP8 dequantize + GEMV kernel for M=1 decode
-// Computes: output[j] = sum_k(input[k] * fp8_weight[j,k] * scale_inv[j/128, k/128])
+// Fused FP8 dequantize + GEMV kernel for decode (any M)
+// Computes: output[m, j] = sum_k(input[m, k] * fp8_weight[j, k] * scale_inv[j/128, k/128])
 // No activation quantization needed — BF16 input used directly.
-// Each warp computes one output row; each block has ROWS_PER_BLOCK warps.
+// Each warp computes one (m, j) output; each block has ROWS_PER_BLOCK warps.
+// blockIdx.x encodes (m * num_row_groups + row_group).
 // ---------------------------------------------------------------------------
 
 constexpr int FP8_GEMV_WARP_SIZE = 32;
@@ -85,16 +86,20 @@ __global__ void fp8_dequantize_gemv_kernel(
     const __nv_bfloat16* __restrict__ input,
     const __nv_fp8_e4m3* __restrict__ weight,
     const float* __restrict__ scale_inv,
-    int N, int K) {
+    int M, int N, int K) {
 
-    int row = blockIdx.x * FP8_GEMV_ROWS_PER_BLOCK + threadIdx.x / FP8_GEMV_WARP_SIZE;
+    int num_row_groups = (N + FP8_GEMV_ROWS_PER_BLOCK - 1) / FP8_GEMV_ROWS_PER_BLOCK;
+    int m = blockIdx.x / num_row_groups;
+    int row_group = blockIdx.x % num_row_groups;
+    int row = row_group * FP8_GEMV_ROWS_PER_BLOCK + threadIdx.x / FP8_GEMV_WARP_SIZE;
     int lane = threadIdx.x % FP8_GEMV_WARP_SIZE;
 
-    if (row >= N) return;
+    if (m >= M || row >= N) return;
 
     int num_k_blocks = K / 128;
     int n_block = row / 128;
     const __nv_fp8_e4m3* weight_row = weight + (size_t)row * K;
+    const __nv_bfloat16* input_row = input + (size_t)m * K;
 
     float sum = 0.0f;
 
@@ -106,7 +111,7 @@ __global__ void fp8_dequantize_gemv_kernel(
         for (int ki = lane; ki < 128; ki += FP8_GEMV_WARP_SIZE) {
             int k = k_start + ki;
             float w_val = static_cast<float>(weight_row[k]) * scale;
-            float x_val = __bfloat162float(input[k]);
+            float x_val = __bfloat162float(input_row[k]);
             sum += w_val * x_val;
         }
     }
@@ -116,7 +121,7 @@ __global__ void fp8_dequantize_gemv_kernel(
         int kb = k / 128;
         float scale = scale_inv[n_block * num_k_blocks + kb];
         float w_val = static_cast<float>(weight_row[k]) * scale;
-        float x_val = __bfloat162float(input[k]);
+        float x_val = __bfloat162float(input_row[k]);
         sum += w_val * x_val;
     }
 
@@ -125,7 +130,7 @@ __global__ void fp8_dequantize_gemv_kernel(
     }
 
     if (lane == 0) {
-        output[row] = __float2bfloat16(sum);
+        output[(size_t)m * N + row] = __float2bfloat16(sum);
     }
 }
 
@@ -135,14 +140,15 @@ extern "C" {
 
 void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
                             const void* fp8_weight, const float* weight_scale,
-                            int n, int k) {
-    int grid_size = (n + FP8_GEMV_ROWS_PER_BLOCK - 1) / FP8_GEMV_ROWS_PER_BLOCK;
+                            int m, int n, int k) {
+    int num_row_groups = (n + FP8_GEMV_ROWS_PER_BLOCK - 1) / FP8_GEMV_ROWS_PER_BLOCK;
+    int grid_size = m * num_row_groups;
     fp8_dequantize_gemv_kernel<<<grid_size, FP8_GEMV_BLOCK_SIZE, 0, ctx->stream>>>(
         reinterpret_cast<__nv_bfloat16*>(bf16_out),
         reinterpret_cast<const __nv_bfloat16*>(bf16_input),
         reinterpret_cast<const __nv_fp8_e4m3*>(fp8_weight),
         weight_scale,
-        n, k);
+        m, n, k);
 }
 
 void glm_fp8_linear(GlmCtx* ctx, void* bf16_out, const void* fp8_input,
