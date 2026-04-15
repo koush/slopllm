@@ -70,12 +70,12 @@ function generateResponse(
   const t0 = performance.now();
   let tokens: number[];
   if (useAppend && previousTokens.length > 0 && suffixIds !== inputIds) {
-    tokens = model.prefillBatchPagedAppend([suffixIds], ws, pagedKV);
+    tokens = model.prefillBatchAppend([suffixIds], ws, pagedKV);
   } else {
     if (!useAppend || previousTokens.length === 0) {
       pagedKV.reset(1);
     }
-    tokens = model.prefillBatchPaged([suffixIds], ws, pagedKV);
+    tokens = model.prefillBatch([suffixIds], ws, pagedKV);
   }
   pagedKV.updateIndptr();
   timing.prefillMs = performance.now() - t0;

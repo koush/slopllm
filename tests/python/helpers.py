@@ -383,33 +383,7 @@ class GlmOps:
             ctypes.c_float,
         ]
 
-        self.lib.glm_batch_prefill_ragged_plan.restype = None
-        self.lib.glm_batch_prefill_ragged_plan.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_size_t,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
-            ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_uint32, ctypes.c_uint32,
-            ctypes.c_uint32, ctypes.c_uint32,
-            ctypes.c_uint32, ctypes.c_int32,
-        ]
-
-        self.lib.glm_batch_prefill_ragged_run.restype = None
-        self.lib.glm_batch_prefill_ragged_run.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_uint32, ctypes.c_uint32,
-            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
-            ctypes.c_uint32, ctypes.c_uint32,
-            ctypes.c_uint32, ctypes.c_uint32,
-            ctypes.c_int32, ctypes.c_float,
-        ]
-
-        self.lib.glm_batch_prefill_paged_plan.restype = None
+        self.lib.glm_batch_decode_plan.restype = None
         self.lib.glm_batch_prefill_paged_plan.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_size_t,
@@ -854,45 +828,6 @@ class GlmOps:
             ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads),
             ctypes.c_uint32(head_dim), ctypes.c_uint32(page_size),
             ctypes.c_float(sm_scale)
-        )
-
-    def batch_prefill_ragged_plan(self, float_ws, float_ws_size,
-                                   int_ws, pinned_int_ws, int_ws_size,
-                                   plan_info, qo_indptr_h, kv_indptr_h,
-                                   total_qo_rows, batch_size,
-                                   num_qo_heads, num_kv_heads,
-                                   head_dim, mask_mode):
-        self.lib.glm_batch_prefill_ragged_plan(
-            self.ctx,
-            ctypes.c_void_p(float_ws), ctypes.c_size_t(float_ws_size),
-            ctypes.c_void_p(int_ws), ctypes.c_void_p(pinned_int_ws), ctypes.c_size_t(int_ws_size),
-            ctypes.c_void_p(plan_info),
-            ctypes.c_void_p(qo_indptr_h), ctypes.c_void_p(kv_indptr_h),
-            ctypes.c_uint32(total_qo_rows), ctypes.c_uint32(batch_size),
-            ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads),
-            ctypes.c_uint32(head_dim),             ctypes.c_int32(mask_mode)
-        )
-
-    def batch_prefill_ragged_run(self, q, k, v, o,
-                                  float_ws, int_ws,
-                                  q_indptr_d, kv_indptr_d,
-                                  plan_info,
-                                  total_qo_rows, batch_size,
-                                  num_qo_heads, num_kv_heads, head_dim,
-                                  q_stride_n, q_stride_h,
-                                  kv_stride_n, kv_stride_h,
-                                  mask_mode, sm_scale):
-        self.lib.glm_batch_prefill_ragged_run(
-            self.ctx,
-            ctypes.c_void_p(q), ctypes.c_void_p(k), ctypes.c_void_p(v), ctypes.c_void_p(o),
-            ctypes.c_void_p(float_ws), ctypes.c_void_p(int_ws),
-            ctypes.c_void_p(q_indptr_d), ctypes.c_void_p(kv_indptr_d),
-            ctypes.c_void_p(plan_info),
-            ctypes.c_uint32(total_qo_rows), ctypes.c_uint32(batch_size),
-            ctypes.c_uint32(num_qo_heads), ctypes.c_uint32(num_kv_heads), ctypes.c_uint32(head_dim),
-            ctypes.c_uint32(q_stride_n), ctypes.c_uint32(q_stride_h),
-            ctypes.c_uint32(kv_stride_n), ctypes.c_uint32(kv_stride_h),
-            ctypes.c_int32(mask_mode),             ctypes.c_float(sm_scale)
         )
 
     def batch_prefill_paged_plan(self, float_ws, float_ws_size,

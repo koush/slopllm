@@ -191,7 +191,6 @@ class Qwen3Model:
             "flash_tmp": glm.alloc(FLASH_TMP_SIZE),
             "input_ids_buf": glm.alloc(BS * I32),
             "qo_indptr_d": glm.alloc((B + 1) * I32),
-            "kv_indptr_d": glm.alloc((B + 1) * I32),
             "prefill_slot_mapping": glm.alloc(BS * I32),
         }
 
@@ -748,159 +747,6 @@ class Qwen3Model:
                     BS, hs, n_heads * hd)
 
     def prefill_batch_plan(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
-                           paged_kv: PagedKVCache) -> PrefillState:
-        cfg = self.cfg
-        glm = self.glm
-        n_heads = cfg.num_attention_heads
-        n_kv = cfg.num_key_value_heads
-        hd = cfg.head_dim
-        batch_size = len(input_ids_list)
-
-        paged_kv.reset(batch_size)
-
-        seq_lens: list[int] = [len(ids) for ids in input_ids_list]
-        total_tokens = sum(seq_lens)
-
-        page_allocs: list[tuple[int, int]] = []
-        for seq_idx, s in enumerate(seq_lens):
-            start_page, num_pages = paged_kv.alloc_prefill_pages(seq_idx, s)
-            page_allocs.append((start_page, num_pages))
-
-        all_ids: list[int] = []
-        for ids in input_ids_list:
-            all_ids.extend(ids)
-        ids_np = np.array(all_ids, dtype=np.int32)
-        glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
-
-        qo_indptr = [0]
-        kv_indptr = [0]
-        for s in seq_lens:
-            qo_indptr.append(qo_indptr[-1] + s)
-            kv_indptr.append(kv_indptr[-1] + s)
-        qo_indptr_np = np.array(qo_indptr, dtype=np.int32)
-        kv_indptr_np = np.array(kv_indptr, dtype=np.int32)
-
-        pos_ids: list[int] = []
-        for s in seq_lens:
-            pos_ids.extend(range(s))
-        pos_ids_np = np.array(pos_ids, dtype=np.int32)
-        glm.h2d(self._ws["position_ids"], pos_ids_np.tobytes())
-
-        last_indices: list[int] = []
-        offset = 0
-        for s in seq_lens:
-            last_indices.append(offset + s - 1)
-            offset += s
-        last_idx_np = np.array(last_indices, dtype=np.int32)
-        glm.h2d(self._ws["last_idx"], last_idx_np.tobytes())
-
-        glm.batch_prefill_ragged_plan(
-            ws.float_ws, BATCH_FLOAT_WS_SIZE,
-            ws.int_ws, ws.pinned_int_ws, BATCH_INT_WS_SIZE,
-            ws.prefill_plan_info,
-            qo_indptr_np.ctypes.data, kv_indptr_np.ctypes.data,
-            total_tokens, batch_size,
-            n_heads, n_kv, hd,
-            1
-        )
-
-        glm.h2d(self._ws["qo_indptr_d"], qo_indptr_np.tobytes())
-        glm.h2d(self._ws["kv_indptr_d"], kv_indptr_np.tobytes())
-
-        slot_mapping: list[int] = []
-        for seq_idx, s in enumerate(seq_lens):
-            pages = paged_kv.seq_pages[seq_idx]
-            for pos in range(s):
-                page_idx_in_seq = pos // paged_kv.page_size
-                offset_in_page = pos % paged_kv.page_size
-                abs_page = pages[page_idx_in_seq]
-                slot_mapping.append(abs_page * paged_kv.page_size + offset_in_page)
-        slot_mapping_np = np.array(slot_mapping, dtype=np.int32)
-        glm.h2d(self._ws["prefill_slot_mapping"], slot_mapping_np.tobytes())
-
-        return PrefillState(batch_size=batch_size, total_tokens=total_tokens,
-                            seq_lens=seq_lens, page_allocs=page_allocs)
-
-    def prefill_batch_forward(self, state: PrefillState, ws: WorkspaceBuffers,
-                               paged_kv: PagedKVCache) -> None:
-        cfg = self.cfg
-        glm = self.glm
-        hs = cfg.hidden_size
-        n_heads = cfg.num_attention_heads
-        n_kv = cfg.num_key_value_heads
-        hd = cfg.head_dim
-        batch_size = state.batch_size
-        total_tokens = state.total_tokens
-        seq_lens = state.seq_lens
-        page_allocs = state.page_allocs
-
-        glm.embedding(self._ws["hidden_a"], self.weights["model.embed_tokens.weight"],
-                       self._ws["input_ids_buf"], hs, total_tokens)
-
-        glm.rotary_embedding(self._ws["cos"], self._ws["sin"], self.inv_freq,
-                              self._ws["position_ids"],
-                              hd // 2, 1, total_tokens)
-
-        for i in range(cfg.num_hidden_layers):
-            pfx = f"model.layers.{i}"
-
-            glm.rmsnorm(self._ws["normed"], self._ws["hidden_a"],
-                         self.weights[f"{pfx}.input_layernorm.weight"],
-                         cfg.rms_norm_eps, hs, total_tokens)
-
-            self._compute_qkv(pfx, total_tokens, 1, total_tokens)
-
-            glm.kv_cache_write(
-                self._ws["k_rope"], self._ws["v_t"],
-                paged_kv.k_data[i], paged_kv.v_data[i],
-                self._ws["prefill_slot_mapping"],
-                total_tokens, n_kv, hd, paged_kv.page_size,
-                hd, total_tokens * hd)
-
-            q_stride_n = hd
-            q_stride_h = total_tokens * hd
-            kv_stride_n = hd
-            kv_stride_h = total_tokens * hd
-
-            glm.batch_prefill_ragged_run(
-                self._ws["q_rope"], self._ws["k_rope"], self._ws["v_t"], self._ws["flash_out"],
-                ws.float_ws, ws.int_ws,
-                self._ws["qo_indptr_d"], self._ws["kv_indptr_d"],
-                ws.prefill_plan_info,
-                total_tokens, batch_size,
-                n_heads, n_kv, hd,
-                q_stride_n, q_stride_h,
-                kv_stride_n, kv_stride_h,
-                1, cfg.scaling
-            )
-
-            glm.linear(self._ws["o_proj_buf"], self._ws["flash_out"],
-                         self.weights[f"{pfx}.self_attn.o_proj.weight"],
-                         total_tokens, hs, n_heads * hd)
-
-            self._residual_and_mlp(pfx, total_tokens)
-
-        glm.index_select(self._ws["hidden_last"], self._ws["hidden_a"],
-                          self._ws["last_idx"], hs, batch_size)
-        self._final_norm_and_logits(batch_size, src=self._ws["hidden_last"])
-
-        vs = cfg.vocab_size
-        self.glm.argmax(self._ws["argmax_idx"], self._ws["logits_buf"], vs, batch_size)
-
-    def prefill_batch_read(self, state: PrefillState) -> list[int]:
-        batch_size = state.batch_size
-        buf = ctypes.create_string_buffer(batch_size * I32)
-        self.glm.lib.glm_d2h(self.glm.ctx, buf, ctypes.c_void_p(self._ws["argmax_idx"]), batch_size * I32)
-        return [int(x) for x in np.frombuffer(buf.raw, dtype=np.int32)]
-
-    def prefill_batch(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
-                      paged_kv: PagedKVCache) -> list[int]:
-        state = self.prefill_batch_plan(input_ids_list, ws, paged_kv)
-        self.prefill_batch_forward(state, ws, paged_kv)
-        paged_kv.update_indptr()
-        return self.prefill_batch_read(state)
-
-    def prefill_batch_paged_plan(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
                                   paged_kv: PagedKVCache) -> PrefillState:
         cfg = self.cfg
         glm = self.glm
@@ -974,7 +820,7 @@ class Qwen3Model:
         return PrefillState(batch_size=batch_size, total_tokens=total_tokens,
                             seq_lens=seq_lens, page_allocs=page_allocs)
 
-    def prefill_batch_paged_forward(self, state: PrefillState, ws: WorkspaceBuffers,
+    def prefill_batch_forward(self, state: PrefillState, ws: WorkspaceBuffers,
                                      paged_kv: PagedKVCache) -> None:
         cfg = self.cfg
         glm = self.glm
@@ -1041,13 +887,19 @@ class Qwen3Model:
         vs = cfg.vocab_size
         self.glm.argmax(self._ws["argmax_idx"], self._ws["logits_buf"], vs, batch_size)
 
-    def prefill_batch_paged(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
-                             paged_kv: PagedKVCache) -> list[int]:
-        state = self.prefill_batch_paged_plan(input_ids_list, ws, paged_kv)
-        self.prefill_batch_paged_forward(state, ws, paged_kv)
+    def prefill_batch_read(self, state: PrefillState) -> list[int]:
+        batch_size = state.batch_size
+        buf = ctypes.create_string_buffer(batch_size * I32)
+        self.glm.lib.glm_d2h(self.glm.ctx, buf, ctypes.c_void_p(self._ws["argmax_idx"]), batch_size * I32)
+        return [int(x) for x in np.frombuffer(buf.raw, dtype=np.int32)]
+
+    def prefill_batch(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
+                      paged_kv: PagedKVCache) -> list[int]:
+        state = self.prefill_batch_plan(input_ids_list, ws, paged_kv)
+        self.prefill_batch_forward(state, ws, paged_kv)
         return self.prefill_batch_read(state)
 
-    def prefill_batch_paged_append_plan(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
+    def prefill_batch_append_plan(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
                                          paged_kv: PagedKVCache) -> PrefillState:
         cfg = self.cfg
         glm = self.glm
@@ -1058,7 +910,7 @@ class Qwen3Model:
         batch_size = len(input_ids_list)
 
         assert len(paged_kv.seq_pages) == batch_size, \
-            f"prefill_batch_paged_append: paged_kv has {len(paged_kv.seq_pages)} sequences, expected {batch_size}"
+            f"prefill_batch_append: paged_kv has {len(paged_kv.seq_pages)} sequences, expected {batch_size}"
 
         seq_lens: list[int] = [len(ids) for ids in input_ids_list]
         total_tokens = sum(seq_lens)
@@ -1124,10 +976,10 @@ class Qwen3Model:
         return PrefillState(batch_size=batch_size, total_tokens=total_tokens,
                             seq_lens=seq_lens, page_allocs=page_allocs)
 
-    def prefill_batch_paged_append(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
-                                    paged_kv: PagedKVCache) -> list[int]:
-        state = self.prefill_batch_paged_append_plan(input_ids_list, ws, paged_kv)
-        self.prefill_batch_paged_forward(state, ws, paged_kv)
+    def prefill_batch_append(self, input_ids_list: list[list[int]], ws: WorkspaceBuffers,
+                              paged_kv: PagedKVCache) -> list[int]:
+        state = self.prefill_batch_append_plan(input_ids_list, ws, paged_kv)
+        self.prefill_batch_forward(state, ws, paged_kv)
         return self.prefill_batch_read(state)
 
     def decode_batch_plan(self, token_ids_list: list[int], ws: WorkspaceBuffers,

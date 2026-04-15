@@ -928,81 +928,6 @@ static Napi::Value BatchDecodeRun(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value BatchPrefillRaggedPlan(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 15) {
-        Napi::TypeError::New(env, "Expected (ctx, float_ws, float_ws_size, int_ws, pinned_int_ws, int_ws_size, plan_info, qo_indptr_h, kv_indptr_h, total_qo_rows, batch_size, num_qo_heads, num_kv_heads, head_dim, mask_mode)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t float_ws = info[1].As<Napi::Number>().Int64Value();
-    size_t float_ws_size = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t int_ws = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t pinned_int_ws = info[4].As<Napi::Number>().Int64Value();
-    size_t int_ws_size = info[5].As<Napi::Number>().Int64Value();
-    uintptr_t plan_info_ptr = info[6].As<Napi::Number>().Int64Value();
-    uintptr_t qo_indptr_h_ptr = info[7].As<Napi::Number>().Int64Value();
-    uintptr_t kv_indptr_h_ptr = info[8].As<Napi::Number>().Int64Value();
-    uint32_t total_qo_rows = info[9].As<Napi::Number>().Uint32Value();
-    uint32_t batch_size = info[10].As<Napi::Number>().Uint32Value();
-    uint32_t num_qo_heads = info[11].As<Napi::Number>().Uint32Value();
-    uint32_t num_kv_heads = info[12].As<Napi::Number>().Uint32Value();
-    uint32_t head_dim = info[13].As<Napi::Number>().Uint32Value();
-    int mask_mode = info[14].As<Napi::Number>().Int32Value();
-    glm_batch_prefill_ragged_plan(
-        reinterpret_cast<GlmCtx*>(ctx_ptr),
-        reinterpret_cast<void*>(float_ws), float_ws_size,
-        reinterpret_cast<void*>(int_ws), reinterpret_cast<void*>(pinned_int_ws), int_ws_size,
-        reinterpret_cast<int64_t*>(plan_info_ptr),
-        reinterpret_cast<int32_t*>(qo_indptr_h_ptr),
-        reinterpret_cast<int32_t*>(kv_indptr_h_ptr),
-        total_qo_rows, batch_size,
-        num_qo_heads, num_kv_heads, head_dim, mask_mode);
-    return env.Undefined();
-}
-
-static Napi::Value BatchPrefillRaggedRun(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 21) {
-        Napi::TypeError::New(env, "Expected (ctx, q, k, v, o, float_ws, int_ws, q_indptr_d, kv_indptr_d, plan_info, total_qo_rows, batch_size, num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, mask_mode, sm_scale)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t k_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t v_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t o_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t float_ws_ptr = info[5].As<Napi::Number>().Int64Value();
-    uintptr_t int_ws_ptr = info[6].As<Napi::Number>().Int64Value();
-    uintptr_t q_indptr_d_ptr = info[7].As<Napi::Number>().Int64Value();
-    uintptr_t kv_indptr_d_ptr = info[8].As<Napi::Number>().Int64Value();
-    uintptr_t plan_info_ptr = info[9].As<Napi::Number>().Int64Value();
-    uint32_t total_qo_rows = info[10].As<Napi::Number>().Uint32Value();
-    uint32_t batch_size = info[11].As<Napi::Number>().Uint32Value();
-    uint32_t num_qo_heads = info[12].As<Napi::Number>().Uint32Value();
-    uint32_t num_kv_heads = info[13].As<Napi::Number>().Uint32Value();
-    uint32_t head_dim = info[14].As<Napi::Number>().Uint32Value();
-    uint32_t q_stride_n = info[15].As<Napi::Number>().Uint32Value();
-    uint32_t q_stride_h = info[16].As<Napi::Number>().Uint32Value();
-    uint32_t kv_stride_n = info[17].As<Napi::Number>().Uint32Value();
-    uint32_t kv_stride_h = info[18].As<Napi::Number>().Uint32Value();
-    int mask_mode = info[19].As<Napi::Number>().Int32Value();
-    float sm_scale = info[20].As<Napi::Number>().FloatValue();
-    glm_batch_prefill_ragged_run(
-        reinterpret_cast<GlmCtx*>(ctx_ptr),
-        reinterpret_cast<void*>(q_ptr), reinterpret_cast<void*>(k_ptr),
-        reinterpret_cast<void*>(v_ptr), reinterpret_cast<void*>(o_ptr),
-        reinterpret_cast<void*>(float_ws_ptr), reinterpret_cast<void*>(int_ws_ptr),
-        reinterpret_cast<int32_t*>(q_indptr_d_ptr),
-        reinterpret_cast<int32_t*>(kv_indptr_d_ptr),
-        reinterpret_cast<int64_t*>(plan_info_ptr),
-        total_qo_rows, batch_size,
-        num_qo_heads, num_kv_heads, head_dim,
-        q_stride_n, q_stride_h, kv_stride_n, kv_stride_h,
-        mask_mode, sm_scale);
-    return env.Undefined();
-}
-
 static Napi::Value BatchPrefillPagedPlan(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 16) {
@@ -1212,8 +1137,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "writePinned"), Napi::Function::New(env, WritePinned));
     exports.Set(Napi::String::New(env, "batchDecodePlan"), Napi::Function::New(env, BatchDecodePlan));
     exports.Set(Napi::String::New(env, "batchDecodeRun"), Napi::Function::New(env, BatchDecodeRun));
-    exports.Set(Napi::String::New(env, "batchPrefillRaggedPlan"), Napi::Function::New(env, BatchPrefillRaggedPlan));
-    exports.Set(Napi::String::New(env, "batchPrefillRaggedRun"), Napi::Function::New(env, BatchPrefillRaggedRun));
     exports.Set(Napi::String::New(env, "batchPrefillPagedPlan"), Napi::Function::New(env, BatchPrefillPagedPlan));
     exports.Set(Napi::String::New(env, "batchPrefillPagedRun"), Napi::Function::New(env, BatchPrefillPagedRun));
     exports.Set(Napi::String::New(env, "graphBeginCapture"), Napi::Function::New(env, GraphBeginCapture));

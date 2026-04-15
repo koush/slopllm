@@ -172,28 +172,6 @@ void glm_batch_decode_run(
     uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim, uint32_t page_size, float sm_scale);
 
-void glm_batch_prefill_ragged_plan(
-    GlmCtx* ctx,
-    void* float_ws, size_t float_ws_size,
-    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
-    int64_t* plan_info,
-    int32_t* qo_indptr_h, int32_t* kv_indptr_h,
-    uint32_t total_qo_rows, uint32_t batch_size,
-    uint32_t num_qo_heads, uint32_t num_kv_heads,
-    uint32_t head_dim, int mask_mode);
-
-void glm_batch_prefill_ragged_run(
-    GlmCtx* ctx,
-    void* q, void* k, void* v, void* o,
-    void* float_ws, void* int_ws,
-    int32_t* q_indptr_d, int32_t* kv_indptr_d,
-    int64_t* plan_info,
-    uint32_t total_qo_rows, uint32_t batch_size,
-    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-    uint32_t q_stride_n, uint32_t q_stride_h,
-    uint32_t kv_stride_n, uint32_t kv_stride_h,
-    int mask_mode, float sm_scale);
-
 void glm_batch_prefill_paged_plan(
     GlmCtx* ctx,
     void* float_ws, size_t float_ws_size,
