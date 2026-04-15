@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, BF16, I32, FLASH_TMP_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, FLASH_TMP_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { FlatKVCache } from "./flat_kv";
-import { Tensor } from "./tensor";
+import { Tensor, OpContext } from "./tensor";
 
 export interface Qwen3Config {
   hiddenSize: number;
@@ -74,6 +74,7 @@ class Qwen3Workspace {
   inputIdsBuf: Tensor;
   qoIndptrD: Tensor;
   prefillSlotMapping: Tensor;
+  tensors = new Map<string, Tensor>();
 
   constructor(glm: GlmOps, B: number, S: number, cfg: Qwen3Config) {
     const hs = cfg.hiddenSize;
@@ -115,15 +116,20 @@ class Qwen3Workspace {
     this.inputIdsBuf = Tensor.alloc(glm, [B * S], "I32");
     this.qoIndptrD = Tensor.alloc(glm, [B + 1], "I32");
     this.prefillSlotMapping = Tensor.alloc(glm, [B * S], "I32");
+
+    for (const key of Object.keys(this) as (keyof this)[]) {
+      const value = this[key];
+      if (value instanceof Tensor && typeof key === 'string') {
+        this.tensors.set(key, value);
+      }
+    }
   }
 
   free(): void {
-    for (const key of Object.keys(this) as (keyof this)[]) {
-      const value = this[key];
-      if (value instanceof Tensor) {
-        value.free();
-      }
+    for (const tensor of this.tensors.values()) {
+      tensor.free();
     }
+    this.tensors.clear();
   }
 }
 
@@ -138,7 +144,7 @@ export interface PrefillState {
   pageAllocs: [number, number][];
 }
 
-export class Qwen3Model {
+export class Qwen3Model implements OpContext {
   glm: GlmOps;
   cfg: Qwen3Config;
   weights: Map<string, Tensor>;
@@ -177,10 +183,19 @@ export class Qwen3Model {
     const weights = new Map<string, Tensor>();
     for (const name of st.tensorNames()) {
       const meta = st.meta(name);
-      const tensor = Tensor.alloc(glm, meta.shape, meta.dtype);
-      const offset = st.dataStart + meta.dataOffsets[0];
-      glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
-      weights.set(name, tensor);
+      if (name.endsWith("_scale_inv")) {
+        const bf16Bytes = st.readTensor(name);
+        const f32Array = bf16BytesToF32(bf16Bytes);
+        const f32Buffer = Buffer.from(f32Array.buffer, f32Array.byteOffset, f32Array.byteLength);
+        const tensor = Tensor.alloc(glm, meta.shape, "F32", name);
+        tensor.h2d(f32Buffer);
+        weights.set(name, tensor);
+      } else {
+        const tensor = Tensor.alloc(glm, meta.shape, meta.dtype, name);
+        const offset = st.dataStart + meta.dataOffsets[0];
+        glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
+        weights.set(name, tensor);
+      }
     }
 
     glm.synchronize();
@@ -349,10 +364,10 @@ export class Qwen3Model {
     const hs = cfg.hiddenSize;
     const inter = cfg.intermediateSize;
 
-    this.ws.gateBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.gate_proj.weight`)!, BS, inter, hs);
-    this.ws.upBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.up_proj.weight`)!, BS, inter, hs);
+    this.ws.gateBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.gate_proj.weight`)!, BS, inter, hs, this);
+    this.ws.upBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.up_proj.weight`)!, BS, inter, hs, this);
     this.ws.siluBuf.siluAndMul(this.ws.gateBuf, this.ws.upBuf, inter, BS);
-    this.ws.downBuf.linear(this.ws.siluBuf, this.weights.get(`${pfx}.mlp.down_proj.weight`)!, BS, hs, inter);
+    this.ws.downBuf.linear(this.ws.siluBuf, this.weights.get(`${pfx}.mlp.down_proj.weight`)!, BS, hs, inter, this);
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
   }
 
@@ -372,9 +387,9 @@ export class Qwen3Model {
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
 
-    this.ws.qBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.q_proj.weight`)!, BS, nHeads * hd, hs);
-    this.ws.kBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.k_proj.weight`)!, BS, nKv * hd, hs);
-    this.ws.vBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.v_proj.weight`)!, BS, nKv * hd, hs);
+    this.ws.qBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.q_proj.weight`)!, BS, nHeads * hd, hs, this);
+    this.ws.kBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.k_proj.weight`)!, BS, nKv * hd, hs, this);
+    this.ws.vBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.v_proj.weight`)!, BS, nKv * hd, hs, this);
 
     this.ws.qNormed.rmsnorm(this.ws.qBuf, this.weights.get(`${pfx}.self_attn.q_norm.weight`)!, cfg.rmsNormEps, hd, BS * nHeads);
     this.ws.kNormed.rmsnorm(this.ws.kBuf, this.weights.get(`${pfx}.self_attn.k_norm.weight`)!, cfg.rmsNormEps, hd, BS * nKv);
@@ -408,7 +423,7 @@ export class Qwen3Model {
     const vs = cfg.vocabSize;
 
     this.ws.normed.rmsnorm(src ?? this.ws.hiddenA, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, count);
-    this.ws.logitsBuf.linear(this.ws.normed, this.weights.get("lm_head.weight")!, count, vs, hs);
+    this.ws.logitsBuf.linear(this.ws.normed, this.weights.get("lm_head.weight")!, count, vs, hs, this);
   }
 
   private extractLastLogits(count: number, lastIndicesBuf: Buffer): void {
@@ -448,7 +463,7 @@ export class Qwen3Model {
       cfg.scaling,
     );
 
-    this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd);
+    this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd, this);
   }
 
   private attentionDecodeFlash(B: number, S: number, layerIdx: number, pfx: string, cachedLen: number, cache: FlatKVCache): void {
@@ -481,7 +496,7 @@ export class Qwen3Model {
       cfg.scaling,
     );
 
-    this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd);
+    this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd, this);
   }
 
   prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): PrefillState {
@@ -613,7 +628,7 @@ export class Qwen3Model {
         1, cfg.scaling
       );
 
-      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, totalTokens, hs, nHeads * hd);
+      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, totalTokens, hs, nHeads * hd, this);
       this.residualAndMlp(pfx, totalTokens);
     }
 
@@ -812,7 +827,7 @@ export class Qwen3Model {
         nHeads, nKv, hd, pageSize, cfg.scaling
       );
 
-      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, batchSize, hs, nHeads * hd);
+      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, batchSize, hs, nHeads * hd, this);
       this.residualAndMlp(pfx, batchSize);
     }
 

@@ -467,6 +467,14 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int,
         ]
 
+        self.lib.glm_fp8_linear_decode.restype = None
+        self.lib.glm_fp8_linear_decode.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+        ]
+
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
             self.lib.glm_free(self.ctx)
@@ -950,4 +958,12 @@ class GlmOps:
             self.ctx,
             self._ptr(fp8_out), self._ptr(scales), self._ptr(bf16_input),
             m, k
+        )
+
+    def fp8_linear_decode(self, bf16_out, bf16_input, fp8_weight, weight_scale, n, k):
+        self.lib.glm_fp8_linear_decode(
+            self.ctx,
+            self._ptr(bf16_out), self._ptr(bf16_input),
+            self._ptr(fp8_weight), self._ptr(weight_scale),
+            n, k
         )

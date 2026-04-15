@@ -6,6 +6,7 @@ import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
+const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const EOS_TOKEN_IDS = new Set([151645, 151643]);
 
 async function chatLoop(model: Qwen3Model, cache: FlatKVCache, tokenizer: PreTrainedTokenizer, maxNewTokens: number, noThink: boolean): Promise<void> {
@@ -74,6 +75,7 @@ async function main(): Promise<void> {
   let noThink = false;
   let gpu: number | undefined;
   let maxSeqLen = 2048;
+  let useFp8 = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--max-tokens" && i + 1 < args.length) {
@@ -84,21 +86,25 @@ async function main(): Promise<void> {
       gpu = parseInt(args[++i], 10);
     } else if (args[i] === "--max-seq-len" && i + 1 < args.length) {
       maxSeqLen = parseInt(args[++i], 10);
+    } else if (args[i] === "--fp8") {
+      useFp8 = true;
     }
   }
 
   const gpuId = gpu ?? parseInt(process.env.GLM_GPU ?? "0", 10);
   process.env.CUDA_VISIBLE_DEVICES = String(gpuId);
 
-  console.log(`Loading model on GPU ${gpuId}...`);
+  const repoId = useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO;
+
+  console.log(`Loading model on GPU ${gpuId}${useFp8 ? " (FP8)" : ""}...`);
   const glm = new GlmOps(0);
-  const model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 1, maxSeqLen);
+  const model = Qwen3Model.fromPretrained(glm, repoId, 1, maxSeqLen);
   const cache = model.createFlatKVCache();
 
-  const modelDir = resolveModelPath(QWEN3_REPO);
+  const modelDir = resolveModelPath(repoId);
   const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
 
-  console.log(`Qwen3-0.6B ready (max_tokens=${maxTokens}, thinking=${noThink ? "off" : "on"})`);
+  console.log(`Qwen3-0.6B ready (max_tokens=${maxTokens}, thinking=${noThink ? "off" : "on"}${useFp8 ? ", fp8" : ""})`);
   console.log("Type a message to chat. /clear to reset, /q to quit.");
 
   await chatLoop(model, cache, tokenizer, maxTokens, noThink);

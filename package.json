@@ -16,6 +16,7 @@
     "pretest": "npm run build:all",
     "test:node": "node --test dist/test.js",
     "test:batch": "node --test dist/test_batch.js",
+    "test:fp8": "node --test dist/test_fp8.js",
     "test": "npm run test:python && npm run test:node && npm run test:batch"
   },
   "keywords": [],

@@ -1,4 +1,4 @@
-import { GlmOps } from "./glm_ops";
+import { GlmOps, FP8_GEMM_WORKSPACE_SIZE } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 
 function ptr(t: Tensor | number): number {
@@ -9,23 +9,44 @@ function numElements(shape: number[]): number {
   return shape.reduce((a, b) => a * b, 1);
 }
 
+export interface OpContext {
+  glm: GlmOps;
+  cfg: { hiddenSize: number; intermediateSize: number };
+  weights: Map<string, Tensor>;
+  ws: {
+    tensors: Map<string, Tensor>;
+  };
+}
+
+function ensureFp8Workspace(context: OpContext): void {
+  if (context.ws.tensors.has("fp8Input")) return;
+  const maxK = Math.max(context.cfg.hiddenSize, context.cfg.intermediateSize);
+  const hiddenA = context.ws.tensors.get("hiddenA")!;
+  const BS = hiddenA.shape[0] * hiddenA.shape[1];
+  context.ws.tensors.set("fp8Input", Tensor.alloc(context.glm, [BS, maxK], "F8_E4M3", "fp8Input"));
+  context.ws.tensors.set("fp8ActScales", Tensor.alloc(context.glm, [BS, Math.ceil(maxK / 128)], "F32", "fp8ActScales"));
+  context.ws.tensors.set("fp8Workspace", Tensor.alloc(context.glm, [FP8_GEMM_WORKSPACE_SIZE], "U8", "fp8Workspace"));
+}
+
 export class Tensor {
   data: number;
   readonly type: string;
   readonly shape: number[];
   private glm: GlmOps;
+  readonly name?: string;
 
-  private constructor(glm: GlmOps, data: number, shape: number[], type: string) {
+  private constructor(glm: GlmOps, data: number, shape: number[], type: string, name?: string) {
     this.glm = glm;
     this.data = data;
     this.shape = shape;
     this.type = type;
+    this.name = name;
   }
 
-  static alloc(glm: GlmOps, shape: number[], type: string): Tensor {
+  static alloc(glm: GlmOps, shape: number[], type: string, name?: string): Tensor {
     const bytes = Math.ceil(numElements(shape) * SafeTensorFile.dtypeBytes(type));
     const data = glm.alloc(bytes);
-    return new Tensor(glm, data, shape, type);
+    return new Tensor(glm, data, shape, type, name);
   }
 
   get bytes(): number {
@@ -47,8 +68,23 @@ export class Tensor {
     this.glm.d2h(buf, this.data, size);
   }
 
-  linear(input: Tensor | number, weight: Tensor | number, batch: number, n: number, k: number): void {
-    this.glm.linear(this.data, ptr(input), ptr(weight), batch, n, k);
+  linear(input: Tensor | number, weight: Tensor | number, batch: number, n: number, k: number, context?: OpContext): void {
+    const w = typeof weight === "number" ? undefined : weight;
+    if (context && w && w.type === "F8_E4M3") {
+      const scale = context.weights.get(w.name! + "_scale_inv")!;
+      if (batch <= 1) {
+        context.glm.fp8LinearDecode(this.data, ptr(input), w.data, scale.data, n, k);
+      } else {
+        ensureFp8Workspace(context);
+        const fp8Input = context.ws.tensors.get("fp8Input")!;
+        const fp8ActScales = context.ws.tensors.get("fp8ActScales")!;
+        const fp8Workspace = context.ws.tensors.get("fp8Workspace")!;
+        context.glm.fp8Quantize(fp8Input.data, fp8ActScales.data, ptr(input), batch, k);
+        context.glm.fp8Linear(this.data, fp8Input.data, fp8ActScales.data, w.data, scale.data, fp8Workspace.data, FP8_GEMM_WORKSPACE_SIZE, batch, n, k);
+      }
+    } else {
+      this.glm.linear(this.data, ptr(input), ptr(weight), batch, n, k);
+    }
   }
 
   rmsnorm(input: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
