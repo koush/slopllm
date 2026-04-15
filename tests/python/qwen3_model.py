@@ -807,6 +807,17 @@ class Qwen3Model:
         glm.h2d(self._ws["qo_indptr_d"], qo_indptr_np.tobytes())
         glm.h2d(self._ws["kv_indptr_d"], kv_indptr_np.tobytes())
 
+        slot_mapping: list[int] = []
+        for seq_idx, s in enumerate(seq_lens):
+            pages = paged_kv.seq_pages[seq_idx]
+            for pos in range(s):
+                page_idx_in_seq = pos // paged_kv.page_size
+                offset_in_page = pos % paged_kv.page_size
+                abs_page = pages[page_idx_in_seq]
+                slot_mapping.append(abs_page * paged_kv.page_size + offset_in_page)
+        slot_mapping_np = np.array(slot_mapping, dtype=np.int32)
+        glm.h2d(self._ws["prefill_slot_mapping"], slot_mapping_np.tobytes())
+
         return PrefillState(batch_size=batch_size, total_tokens=total_tokens,
                             seq_lens=seq_lens, page_allocs=page_allocs)
 
@@ -839,25 +850,12 @@ class Qwen3Model:
 
             self._compute_qkv(pfx, total_tokens, 1, total_tokens)
 
-            for seq_idx, s in enumerate(seq_lens):
-                start_page, num_pages = page_allocs[seq_idx]
-                page_size = paged_kv.page_size
-                seq_start = sum(seq_lens[:seq_idx])
-                for h in range(n_kv):
-                    for p in range(num_pages):
-                        page_offset = (start_page + p) * n_kv * page_size * hd
-                        kv_head_offset = page_offset + h * page_size * hd
-                        token_start = p * page_size
-                        token_count = min(page_size, s - p * page_size)
-                        src_off = (h * total_tokens + seq_start + token_start) * hd * BF16
-                        dst_off = kv_head_offset * BF16
-                        copy_bytes = token_count * hd * BF16
-                        glm.memcpy(paged_kv.k_data[i] + dst_off,
-                                    self._ws["k_rope"] + src_off,
-                                    copy_bytes)
-                        glm.memcpy(paged_kv.v_data[i] + dst_off,
-                                    self._ws["v_t"] + src_off,
-                                    copy_bytes)
+            glm.kv_cache_write(
+                self._ws["k_rope"], self._ws["v_t"],
+                paged_kv.k_data[i], paged_kv.v_data[i],
+                self._ws["prefill_slot_mapping"],
+                total_tokens, n_kv, hd, paged_kv.page_size,
+                hd, total_tokens * hd)
 
             q_stride_n = hd
             q_stride_h = total_tokens * hd
@@ -1006,24 +1004,12 @@ class Qwen3Model:
 
             self._compute_qkv(pfx, total_tokens, 1, total_tokens)
 
-            for seq_idx, s in enumerate(seq_lens):
-                start_page, num_pages = page_allocs[seq_idx]
-                seq_start = sum(seq_lens[:seq_idx])
-                for h in range(n_kv):
-                    for p in range(num_pages):
-                        page_offset = (start_page + p) * n_kv * page_size * hd
-                        kv_head_offset = page_offset + h * page_size * hd
-                        token_start = p * page_size
-                        token_count = min(page_size, s - p * page_size)
-                        src_off = (h * total_tokens + seq_start + token_start) * hd * BF16
-                        dst_off = kv_head_offset * BF16
-                        copy_bytes = token_count * hd * BF16
-                        glm.memcpy(paged_kv.k_data[i] + dst_off,
-                                    self._ws["k_rope"] + src_off,
-                                    copy_bytes)
-                        glm.memcpy(paged_kv.v_data[i] + dst_off,
-                                    self._ws["v_t"] + src_off,
-                                    copy_bytes)
+            glm.kv_cache_write(
+                self._ws["k_rope"], self._ws["v_t"],
+                paged_kv.k_data[i], paged_kv.v_data[i],
+                self._ws["prefill_slot_mapping"],
+                total_tokens, n_kv, hd, page_size,
+                hd, total_tokens * hd)
 
             q_stride_n = hd
             q_stride_h = total_tokens * hd
@@ -1123,6 +1109,18 @@ class Qwen3Model:
 
         glm.h2d(self._ws["qo_indptr_d"], qo_indptr_np.tobytes())
 
+        slot_mapping: list[int] = []
+        for seq_idx, s in enumerate(seq_lens):
+            pages = paged_kv.seq_pages[seq_idx]
+            for pos in range(s):
+                kv_pos = start_pos[seq_idx] + pos
+                page_idx_in_seq = kv_pos // paged_kv.page_size
+                offset_in_page = kv_pos % paged_kv.page_size
+                abs_page = pages[page_idx_in_seq]
+                slot_mapping.append(abs_page * paged_kv.page_size + offset_in_page)
+        slot_mapping_np = np.array(slot_mapping, dtype=np.int32)
+        glm.h2d(self._ws["prefill_slot_mapping"], slot_mapping_np.tobytes())
+
         return PrefillState(batch_size=batch_size, total_tokens=total_tokens,
                             seq_lens=seq_lens, page_allocs=page_allocs)
 
@@ -1202,7 +1200,8 @@ class Qwen3Model:
                 self._ws["k_rope"], self._ws["v_t"],
                 paged_kv.k_data[i], paged_kv.v_data[i],
                 paged_kv.slot_mapping,
-                batch_size, n_kv, hd, page_size)
+                batch_size, n_kv, hd, page_size,
+                n_kv * hd, hd)
 
             glm.batch_decode_run(
                 self._ws["q_rope"], self._ws["flash_out"],

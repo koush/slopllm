@@ -1250,7 +1250,9 @@ __global__ void kv_cache_write_kernel(
     const int32_t* slot_mapping,
     uint32_t n_kv,
     uint32_t page_size,
-    uint32_t hd
+    uint32_t hd,
+    uint32_t src_token_stride,
+    uint32_t src_head_stride
 ) {
     int token = blockIdx.x;
     int h = blockIdx.y;
@@ -1265,7 +1267,7 @@ __global__ void kv_cache_write_kernel(
     int64_t dst_off = (int64_t)page * n_kv * page_size * hd
                      + (int64_t)h * page_size * hd
                      + (int64_t)slot_in_page * hd;
-    int64_t src_off = ((int64_t)token * n_kv + h) * hd;
+    int64_t src_off = (int64_t)token * src_token_stride + (int64_t)h * src_head_stride;
 
     for (int d = threadIdx.x; d < (int)hd; d += blockDim.x) {
         dst_k[dst_off + d] = src_k[src_off + d];
@@ -1278,14 +1280,16 @@ void glm_kv_cache_write(GlmCtx* ctx,
                           void* dst_k, void* dst_v,
                           int32_t* slot_mapping,
                           uint32_t batch_size, uint32_t n_kv,
-                          uint32_t hd, uint32_t page_size) {
+                          uint32_t hd, uint32_t page_size,
+                          uint32_t src_token_stride, uint32_t src_head_stride) {
     cudaSetDevice(ctx->device_id);
     dim3 grid(batch_size, n_kv);
     dim3 block(hd);
     kv_cache_write_kernel<<<grid, block, 0, ctx->stream>>>(
         (__nv_bfloat16*)dst_k, (__nv_bfloat16*)dst_v,
         (const __nv_bfloat16*)src_k, (const __nv_bfloat16*)src_v,
-        slot_mapping, n_kv, page_size, hd);
+        slot_mapping, n_kv, page_size, hd,
+        src_token_stride, src_head_stride);
 }
 
 // ---------------------------------------------------------------------------

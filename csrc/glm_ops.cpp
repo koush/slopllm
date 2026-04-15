@@ -630,8 +630,8 @@ static Napi::Value Argmax(const Napi::CallbackInfo& info) {
 
 static Napi::Value KvCacheWrite(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 10) {
-        Napi::TypeError::New(env, "Expected (ctx, src_k, src_v, dst_k, dst_v, slot_mapping, batch_size, n_kv, hd, page_size)").ThrowAsJavaScriptException();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, src_k, src_v, dst_k, dst_v, slot_mapping, batch_size, n_kv, hd, page_size, src_token_stride, src_head_stride)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -644,13 +644,16 @@ static Napi::Value KvCacheWrite(const Napi::CallbackInfo& info) {
     uint32_t n_kv = info[7].As<Napi::Number>().Uint32Value();
     uint32_t hd = info[8].As<Napi::Number>().Uint32Value();
     uint32_t page_size = info[9].As<Napi::Number>().Uint32Value();
+    uint32_t src_token_stride = info[10].As<Napi::Number>().Uint32Value();
+    uint32_t src_head_stride = info[11].As<Napi::Number>().Uint32Value();
     glm_kv_cache_write(reinterpret_cast<GlmCtx*>(ctx_ptr),
                         reinterpret_cast<void*>(src_k_ptr),
                         reinterpret_cast<void*>(src_v_ptr),
                         reinterpret_cast<void*>(dst_k_ptr),
                         reinterpret_cast<void*>(dst_v_ptr),
                         reinterpret_cast<int32_t*>(slot_ptr),
-                        batch_size, n_kv, hd, page_size);
+                        batch_size, n_kv, hd, page_size,
+                        src_token_stride, src_head_stride);
     return env.Undefined();
 }
 

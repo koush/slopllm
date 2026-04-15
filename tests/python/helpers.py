@@ -467,6 +467,7 @@ class GlmOps:
             ctypes.c_void_p,
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
         ]
 
     def __del__(self):
@@ -961,12 +962,14 @@ class GlmOps:
         self.lib.glm_graph_exec_destroy(ctypes.c_void_p(graph_exec))
 
     def kv_cache_write(self, src_k, src_v, dst_k, dst_v, slot_mapping,
-                        batch_size, n_kv, hd, page_size):
+                        batch_size, n_kv, hd, page_size,
+                        src_token_stride, src_head_stride):
         self.lib.glm_kv_cache_write(
             self.ctx,
             ctypes.c_void_p(src_k), ctypes.c_void_p(src_v),
             ctypes.c_void_p(dst_k), ctypes.c_void_p(dst_v),
             ctypes.c_void_p(slot_mapping),
             ctypes.c_uint32(batch_size), ctypes.c_uint32(n_kv),
-            ctypes.c_uint32(hd), ctypes.c_uint32(page_size)
+            ctypes.c_uint32(hd), ctypes.c_uint32(page_size),
+            ctypes.c_uint32(src_token_stride), ctypes.c_uint32(src_head_stride)
         )

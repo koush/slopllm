@@ -122,7 +122,8 @@ void glm_kv_cache_write(GlmCtx* ctx,
                          void* dst_k, void* dst_v,
                          int32_t* slot_mapping,
                          uint32_t batch_size, uint32_t n_kv,
-                         uint32_t hd, uint32_t page_size);
+                         uint32_t hd, uint32_t page_size,
+                         uint32_t src_token_stride, uint32_t src_head_stride);
 
 void glm_synchronize(GlmCtx* ctx);
 

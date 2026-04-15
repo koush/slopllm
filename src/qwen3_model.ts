@@ -909,7 +909,8 @@ export class Qwen3Model {
         this.ws.kRope, this.ws.vT,
         pagedKV.kData[i], pagedKV.vData[i],
         pagedKV.slotMapping,
-        batchSize, nKv, hd, pageSize
+        batchSize, nKv, hd, pageSize,
+        nKv * hd, hd
       );
 
       glm.batchDecodeRun(
