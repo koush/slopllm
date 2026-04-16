@@ -210,7 +210,7 @@ class Qwen35Model:
                     if is_gemma_norm:
                         t = (1.0 + t.float()).to(torch.bfloat16).contiguous()
 
-                    if weight_name.endswith("A_log"):
+                    if weight_name.endswith("A_log") or weight_name.endswith("dt_bias"):
                         t_f32 = t.float().contiguous()
                         nbytes = t_f32.numel() * 4
                         gpu_ptr = glm.alloc(nbytes)

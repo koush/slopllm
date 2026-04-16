@@ -288,7 +288,26 @@ export class Qwen35Model implements OpContext {
         const isGemmaNorm = weightName === "norm.weight" ||
           gemmaNormSuffixes.some(s => weightName.endsWith(s));
 
-        if (meta.dtype === "F32" && !weightName.includes("A_log")) {
+        if (weightName.includes("A_log") || weightName.includes("dt_bias")) {
+          // A_log and dt_bias are used as float32 by GDN kernels
+          // A_log is stored as F32; dt_bias is stored as BF16 but must be uploaded as F32
+          const numElements = meta.shape.reduce((a, b) => a * b, 1);
+          const tensor = Tensor.alloc(glm, meta.shape, "F32", weightName);
+          if (meta.dtype === "F32") {
+            const offset = st.dataStart + meta.dataOffsets[0];
+            glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
+          } else {
+            const rawBytes = st.readTensor(name);
+            const f32Arr = new Float32Array(numElements);
+            for (let i = 0; i < numElements; i++) {
+              const u16 = rawBytes.readUInt16LE(i * 2);
+              const u32 = u16 << 16;
+              f32Arr[i] = new Float32Array(new Uint32Array([u32]).buffer)[0];
+            }
+            tensor.h2d(Buffer.from(f32Arr.buffer));
+          }
+          weights.set(weightName, tensor);
+        } else if (meta.dtype === "F32") {
           const numElements = meta.shape.reduce((a, b) => a * b, 1);
           const tensor = Tensor.alloc(glm, meta.shape, "BF16", weightName);
           const f32Bytes = st.readTensor(name);
