@@ -1,6 +1,7 @@
 import { GlmOps } from "./glm_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model, SamplingParams } from "./qwen35_model";
+import { Qwen35GdnState } from "./qwen35_gdn_state";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { FlatKVCache } from "./flat_kv";
 import { AutoTokenizer } from "@huggingface/transformers";
@@ -272,7 +273,7 @@ async function singlePromptQwen3(model: Qwen3Model, glm: GlmOps, ws: WorkspaceBu
   model.free();
 }
 
-async function interactiveChatQwen35(model: Qwen35Model, cache: FlatKVCache, tokenizer: any, args: any): Promise<void> {
+async function interactiveChatQwen35(model: Qwen35Model, cache: FlatKVCache, gdnState: Qwen35GdnState, tokenizer: any, args: any): Promise<void> {
   const messages: Array<{ role: string; content: string }> = [];
   const sampling: SamplingParams = {
     temperature: args.temperature,
@@ -299,7 +300,7 @@ async function interactiveChatQwen35(model: Qwen35Model, cache: FlatKVCache, tok
       if (userInput === "/clear") {
         messages.length = 0;
         cache.reset();
-        model.gdnState.reset();
+        gdnState.reset();
         console.log("Conversation cleared.\n");
         continue;
       }
@@ -324,7 +325,7 @@ async function interactiveChatQwen35(model: Qwen35Model, cache: FlatKVCache, tok
 
       const t0 = performance.now();
       const generatedIds: number[] = [];
-      for (const tokenId of model.streamTokens([inputIds], cache, args.maxNewTokens, QWEN35_EOS, sampling)) {
+      for (const tokenId of model.streamTokens([inputIds], cache, gdnState, args.maxNewTokens, QWEN35_EOS, sampling)) {
         generatedIds.push(tokenId);
         if (QWEN35_EOS.has(tokenId)) break;
       }
@@ -341,13 +342,14 @@ async function interactiveChatQwen35(model: Qwen35Model, cache: FlatKVCache, tok
       messages.push({ role: "assistant", content: responseText });
     }
   } finally {
+    gdnState.free();
     cache.free();
     model.free();
     rl.close();
   }
 }
 
-async function singlePromptQwen35(model: Qwen35Model, cache: FlatKVCache, tokenizer: any, args: any): Promise<void> {
+async function singlePromptQwen35(model: Qwen35Model, cache: FlatKVCache, gdnState: Qwen35GdnState, tokenizer: any, args: any): Promise<void> {
   const messages = [{ role: "user", content: args.prompt }];
   const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
   const sampling: SamplingParams = {
@@ -364,7 +366,7 @@ async function singlePromptQwen35(model: Qwen35Model, cache: FlatKVCache, tokeni
 
   const t0 = performance.now();
   const generatedIds: number[] = [];
-  for (const tokenId of model.streamTokens([inputIds], cache, args.maxNewTokens, QWEN35_EOS, sampling)) {
+  for (const tokenId of model.streamTokens([inputIds], cache, gdnState, args.maxNewTokens, QWEN35_EOS, sampling)) {
     generatedIds.push(tokenId);
     if (QWEN35_EOS.has(tokenId)) break;
   }
@@ -377,6 +379,7 @@ async function singlePromptQwen35(model: Qwen35Model, cache: FlatKVCache, tokeni
   console.log(`\n${tokCount} tokens in ${elapsed.toFixed(1)}ms (${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s)`);
   console.log(`\nResponse: ${responseText}`);
 
+  gdnState.free();
   cache.free();
   model.free();
 }
@@ -456,6 +459,7 @@ async function main(): Promise<void> {
     console.log(`Loading Qwen3.5-0.8B on GPU ${gpuId}...`);
     const model = Qwen35Model.fromPretrained(glm, QWEN35_REPO, 1, maxSeqLen);
     const cache = model.createFlatKVCache();
+    const gdnState = model.createGdnState();
 
     const modelDir = resolveModelPath(QWEN35_REPO);
     const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
@@ -463,9 +467,9 @@ async function main(): Promise<void> {
     const cliArgs = { gpu: gpuId, maxSeqLen, maxNewTokens, thinking, prompt, temperature, topP, topK, repetitionPenalty, presencePenalty, repetitionPenaltyWindow };
 
     if (prompt) {
-      await singlePromptQwen35(model, cache, tokenizer, cliArgs);
+      await singlePromptQwen35(model, cache, gdnState, tokenizer, cliArgs);
     } else {
-      await interactiveChatQwen35(model, cache, tokenizer, cliArgs);
+      await interactiveChatQwen35(model, cache, gdnState, tokenizer, cliArgs);
     }
   } else {
     const model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 1, maxSeqLen);

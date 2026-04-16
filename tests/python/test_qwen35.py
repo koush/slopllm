@@ -86,6 +86,13 @@ def qwen35_model(glm):
     torch.cuda.empty_cache()
 
 
+@pytest.fixture(scope="module")
+def gdn_state(glm, qwen35_model):
+    gs = qwen35_model.create_gdn_state()
+    yield gs
+    gs.free()
+
+
 class TestGemmaRMSNorm:
     def test_gemma_vs_standard(self):
         dim = 128
@@ -375,15 +382,15 @@ class TestQwen35ForwardVsTorch:
 
 
 class TestQwen35ModelForward:
-    def test_prefill_single_token(self, glm, qwen35_model, cfg):
+    def test_prefill_single_token(self, glm, qwen35_model, gdn_state, cfg):
         model = qwen35_model
         device = torch.device("cuda", glm.device)
         cache = model.create_flat_kv_cache()
 
         input_ids = torch.tensor([[1]], dtype=torch.int64, device=device)
-        logits = model.prefill(input_ids, cache)
+        logits = model.prefill(input_ids, cache, gdn_state)
         cache.reset()
-        model.gdn_state.reset()
+        gdn_state.reset()
 
         print(f"  Logits shape: {logits.shape}")
         print(f"  Logits stats: mean={logits.mean():.4f}, std={logits.std():.4f}")
@@ -394,27 +401,27 @@ class TestQwen35ModelForward:
         assert not torch.isnan(logits).any(), "Logits contain NaN"
         assert not torch.isinf(logits).any(), "Logits contain Inf"
 
-    def test_prefill_multi_token(self, glm, qwen35_model, cfg):
+    def test_prefill_multi_token(self, glm, qwen35_model, gdn_state, cfg):
         model = qwen35_model
         device = torch.device("cuda", glm.device)
         cache = model.create_flat_kv_cache()
 
         input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64, device=device)
-        logits = model.prefill(input_ids, cache)
+        logits = model.prefill(input_ids, cache, gdn_state)
         cache.reset()
-        model.gdn_state.reset()
+        gdn_state.reset()
 
         print(f"  Logits shape: {logits.shape}")
         assert logits.shape == (1, cfg.vocab_size)
         assert not torch.isnan(logits).any(), "Logits contain NaN"
 
-    def test_generate_tokens(self, glm, qwen35_model, cfg):
+    def test_generate_tokens(self, glm, qwen35_model, gdn_state, cfg):
         model = qwen35_model
         device = torch.device("cuda", glm.device)
         cache = model.create_flat_kv_cache()
 
         input_ids = torch.tensor([[151643, 151644, 872]], dtype=torch.int64, device=device)
-        tokens = list(model.generate_tokens(input_ids, cache, max_new_tokens=10))
+        tokens = list(model.generate_tokens(input_ids, cache, gdn_state, max_new_tokens=10))
         print(f"  Generated tokens: {tokens}")
 
         assert len(tokens) > 0, "No tokens generated"
@@ -436,7 +443,7 @@ class TestQwen35TorchReference:
         assert not torch.isnan(logits).any(), "PyTorch reference logits contain NaN"
         assert not torch.isinf(logits).any(), "PyTorch reference logits contain Inf"
 
-    def test_torch_vs_cuda_prefill(self, glm, qwen35_model, model_dir, cfg):
+    def test_torch_vs_cuda_prefill(self, glm, qwen35_model, gdn_state, model_dir, cfg):
         device = torch.device("cuda:0")
         torch_model = Qwen35TorchModel(model_dir, device)
 
@@ -446,9 +453,9 @@ class TestQwen35TorchReference:
             torch_logits = torch_model.forward(input_ids)
 
         cache = qwen35_model.create_flat_kv_cache()
-        cuda_logits = qwen35_model.prefill(input_ids, cache)
+        cuda_logits = qwen35_model.prefill(input_ids, cache, gdn_state)
         cache.reset()
-        qwen35_model.gdn_state.reset()
+        gdn_state.reset()
 
         max_diff = (cuda_logits - torch_logits.cpu()).abs().max().item()
         mean_diff = (cuda_logits - torch_logits.cpu()).abs().mean().item()

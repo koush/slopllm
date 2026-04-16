@@ -6,6 +6,7 @@ import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { FlatKVCache } from "./flat_kv";
 import { Tensor, OpContext } from "./tensor";
+import { Qwen35GdnState } from "./qwen35_gdn_state";
 
 const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
 const EOS_TOKEN_IDS = new Set([248044]);
@@ -237,59 +238,6 @@ class Qwen35Workspace {
   }
 }
 
-export class Qwen35GdnState {
-  convState: Tensor[];
-  recurrentState: Tensor[];
-  private glm: GlmOps;
-  private cfg: Qwen35Config;
-
-  constructor(glm: GlmOps, cfg: Qwen35Config) {
-    this.glm = glm;
-    this.cfg = cfg;
-    const linHeads = cfg.linearNumKeyHeads;
-    const linKDim = cfg.linearKeyHeadDim;
-    const linVDim = cfg.linearValueHeadDim;
-    const convDim = linHeads * (linKDim * 2 + linVDim);
-    const kernelSize = cfg.linearConvKernelDim;
-    this.convState = [];
-    this.recurrentState = [];
-    for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      if (cfg.layerTypes[i] === "linear_attention") {
-        this.convState.push(Tensor.alloc(glm, [convDim * (kernelSize - 1)], "BF16"));
-        this.recurrentState.push(Tensor.alloc(glm, [linHeads * linKDim * linVDim], "F32"));
-      } else {
-        this.convState.push(null!);
-        this.recurrentState.push(null!);
-      }
-    }
-    this.zeroStates();
-  }
-
-  private zeroStates(): void {
-    const linHeads = this.cfg.linearNumKeyHeads;
-    const linKDim = this.cfg.linearKeyHeadDim;
-    const linVDim = this.cfg.linearValueHeadDim;
-    const convDim = linHeads * (linKDim * 2 + linVDim);
-    const kernelSize = this.cfg.linearConvKernelDim;
-    for (let i = 0; i < this.cfg.numHiddenLayers; i++) {
-      if (this.cfg.layerTypes[i] === "linear_attention") {
-        this.glm.fill(this.recurrentState[i].data, 0, 2 * linHeads * linKDim * linVDim);
-        this.glm.fill(this.convState[i].data, 0, convDim * (kernelSize - 1));
-      }
-    }
-  }
-
-  reset(): void {
-    this.zeroStates();
-  }
-
-  free(): void {
-    for (const t of this.convState) { if (t) t.free(); }
-    for (const t of this.recurrentState) { if (t) t.free(); }
-    this.convState = [];
-    this.recurrentState = [];
-  }
-}
 
 export interface Qwen35DecodeState {
   batchSize: number;
@@ -310,7 +258,6 @@ export class Qwen35Model implements OpContext {
   maxSeqLen: number;
   invFreq: Tensor;
   ws: Qwen35Workspace;
-  gdnState: Qwen35GdnState;
 
   private constructor(glm: GlmOps, config: Qwen35Config, weights: Map<string, Tensor>, maxBatch: number, maxSeqLen: number) {
     this.glm = glm;
@@ -329,7 +276,6 @@ export class Qwen35Model implements OpContext {
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
 
     this.ws = new Qwen35Workspace(glm, maxBatch, maxSeqLen, config);
-    this.gdnState = new Qwen35GdnState(glm, config);
   }
 
   static fromPretrained(glm: GlmOps, repoId: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Qwen35Model {
@@ -439,7 +385,6 @@ export class Qwen35Model implements OpContext {
 
   free(): void {
     this.ws.free();
-    this.gdnState.free();
     this.invFreq.free();
     for (const tensor of this.weights.values()) {
       if (tensor !== this.weights.get("lm_head.weight") || !this.cfg.tieWordEmbeddings) {
@@ -447,6 +392,10 @@ export class Qwen35Model implements OpContext {
       }
     }
     this.weights = new Map();
+  }
+
+  createGdnState(): Qwen35GdnState {
+    return new Qwen35GdnState(this.glm, this.cfg);
   }
 
   createFlatKVCache(): FlatKVCache {
@@ -664,7 +613,7 @@ export class Qwen35Model implements OpContext {
     this.ws.downBuf.linear(this.ws.siluBuf, this.weights.get(`${pfx}.mlp.down_proj.weight`)!, BS, hs, inter, this);
   }
 
-  private gdnLayerPrefill(layerIdx: number, S: number): void {
+  private gdnLayerPrefill(layerIdx: number, S: number, gdnState: Qwen35GdnState): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -691,8 +640,8 @@ export class Qwen35Model implements OpContext {
 
     qkvBuf.transpose4d(qkvLinear, 1, S, convDim, 1, 0, 2, 1, 3);
 
-    const convState = this.gdnState.convState[layerIdx];
-    const recurrentState = this.gdnState.recurrentState[layerIdx];
+    const convState = gdnState.convState[layerIdx];
+    const recurrentState = gdnState.recurrentState[layerIdx];
     const kernelSize = cfg.linearConvKernelDim;
 
     const convOut = this.ws.gdnPrefillConvOut;
@@ -726,7 +675,7 @@ export class Qwen35Model implements OpContext {
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
   }
 
-  private gdnLayerDecode(layerIdx: number): void {
+  private gdnLayerDecode(layerIdx: number, gdnState: Qwen35GdnState): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -750,8 +699,8 @@ export class Qwen35Model implements OpContext {
     bBuf.linear(this.ws.normed, this.weights.get(`${pfx}.in_proj_b.weight`)!, BS, linHeads, hs, this);
     zBuf.linear(this.ws.normed, this.weights.get(`${pfx}.in_proj_z.weight`)!, BS, zDim, hs, this);
 
-    const convState = this.gdnState.convState[layerIdx];
-    const recurrentState = this.gdnState.recurrentState[layerIdx];
+    const convState = gdnState.convState[layerIdx];
+    const recurrentState = gdnState.recurrentState[layerIdx];
     const kernelSize = cfg.linearConvKernelDim;
 
     glm.causalConv1dUpdate(qkvBuf.data, convState.data, qkvBuf.data, this.weights.get(`${pfx}.conv1d.weight`)!.data, convDim, kernelSize);
@@ -947,7 +896,7 @@ export class Qwen35Model implements OpContext {
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
   }
 
-  prefill(inputIds: number[][], cache: FlatKVCache): number {
+  prefill(inputIds: number[][], cache: FlatKVCache, gdnState: Qwen35GdnState): number {
     const B = inputIds.length;
     const S = inputIds[0].length;
     const cfg = this.cfg;
@@ -964,7 +913,7 @@ export class Qwen35Model implements OpContext {
       throw new Error("Cache must be reset before prefill");
     }
 
-    this.gdnState.reset();
+    gdnState.reset();
 
     const flat = new Int32Array(B * S);
     for (let b = 0; b < B; b++) {
@@ -981,7 +930,7 @@ export class Qwen35Model implements OpContext {
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       if (cfg.layerTypes[i] === "linear_attention") {
-        this.gdnLayerPrefill(i, S);
+        this.gdnLayerPrefill(i, S, gdnState);
       } else {
         this.fullAttnLayerPrefillFlash(i, B, S, cache);
       }
@@ -995,7 +944,7 @@ export class Qwen35Model implements OpContext {
     return this.readArgmax(this.ws.logitsBuf, vs);
   }
 
-  private decodeToken(tokenId: number, cache: FlatKVCache, cachedLen: number): void {
+  private decodeToken(tokenId: number, cache: FlatKVCache, cachedLen: number, gdnState: Qwen35GdnState): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -1014,7 +963,7 @@ export class Qwen35Model implements OpContext {
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       if (cfg.layerTypes[i] === "linear_attention") {
-        this.gdnLayerDecode(i);
+        this.gdnLayerDecode(i, gdnState);
       } else {
         this.fullAttnLayerDecodeFlash(i, cachedLen, cache);
       }
@@ -1023,23 +972,23 @@ export class Qwen35Model implements OpContext {
     this.finalNormAndLogits(BS);
   }
 
-  decode(tokenId: number, cache: FlatKVCache): number {
+  decode(tokenId: number, cache: FlatKVCache, gdnState: Qwen35GdnState): number {
     const cachedLen = cache.cachePos;
-    this.decodeToken(tokenId, cache, cachedLen);
+    this.decodeToken(tokenId, cache, cachedLen, gdnState);
     cache.cachePos = cachedLen + 1;
     return this.readArgmax(this.ws.logitsBuf, this.cfg.vocabSize);
   }
 
-  generateTokens(inputIds: number[][], cache: FlatKVCache, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): number[] {
-    return [...this.streamTokens(inputIds, cache, maxNewTokens, eosTokenIds, sampling)];
+  generateTokens(inputIds: number[][], cache: FlatKVCache, gdnState: Qwen35GdnState, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): number[] {
+    return [...this.streamTokens(inputIds, cache, gdnState, maxNewTokens, eosTokenIds, sampling)];
   }
 
-  *streamTokens(inputIds: number[][], cache: FlatKVCache, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): Generator<number> {
+  *streamTokens(inputIds: number[][], cache: FlatKVCache, gdnState: Qwen35GdnState, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): Generator<number> {
     const vs = this.cfg.vocabSize;
     if (inputIds.length !== 1) throw new Error("streamTokens only supports batch=1");
 
     cache.reset();
-    let nextToken = this.prefill(inputIds, cache);
+    let nextToken = this.prefill(inputIds, cache, gdnState);
     yield nextToken;
 
     const tokenHistory = [...inputIds[0], nextToken];
@@ -1047,7 +996,7 @@ export class Qwen35Model implements OpContext {
     for (let i = 0; i < maxNewTokens - 1; i++) {
       if (eosTokenIds.has(nextToken)) break;
       const cachedLen = cache.cachePos;
-      this.decodeToken(nextToken, cache, cachedLen);
+      this.decodeToken(nextToken, cache, cachedLen, gdnState);
       cache.cachePos = cachedLen + 1;
 
       if (sampling && (sampling.temperature > 0 || sampling.repetitionPenalty !== 1.0 || sampling.presencePenalty !== 0 || sampling.topK > 0 || sampling.topP < 1.0)) {

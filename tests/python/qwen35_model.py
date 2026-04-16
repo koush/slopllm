@@ -174,7 +174,6 @@ class Qwen35Model:
         glm.h2d(self.inv_freq, inv_freq_bytes)
 
         self._alloc_workspace(max_batch, max_seq_len)
-        self.gdn_state = Qwen35GdnState(glm, config)
 
     @classmethod
     def from_pretrained(cls, glm: GlmOps, repo_id: str = "Qwen/Qwen3.5-0.8B",
@@ -296,7 +295,6 @@ class Qwen35Model:
         for ptr in self._ws.values():
             glm.free_buf(ptr)
         glm.free_buf(self.inv_freq)
-        self.gdn_state.free()
         freed_ptrs = set()
         for ptr in self.weights.values():
             if isinstance(ptr, int) and ptr not in freed_ptrs:
@@ -304,6 +302,9 @@ class Qwen35Model:
                 freed_ptrs.add(ptr)
         self._ws = {}
         self.weights = {}
+
+    def create_gdn_state(self) -> Qwen35GdnState:
+        return Qwen35GdnState(self.glm, self.cfg)
 
     def create_flat_kv_cache(self) -> FlatKVCache:
         return FlatKVCache(self.glm, self.cfg.num_key_value_heads, self.cfg.head_dim,
@@ -349,7 +350,7 @@ class Qwen35Model:
                 idx += 1
         return idx
 
-    def _gdn_layer_prefill(self, layer_idx: int, S: int) -> None:
+    def _gdn_layer_prefill(self, layer_idx: int, S: int, gdn_state: Qwen35GdnState) -> None:
         cfg = self.cfg
         glm = self.glm
         hs = cfg.hidden_size
@@ -382,8 +383,8 @@ class Qwen35Model:
         glm.transpose_4d(ws["gdn_qkv_transposed"], ws["gdn_qkv_linear"],
                           1, S, conv_dim, 1, 0, 2, 1, 3)
 
-        conv_state = self.gdn_state.conv_state_ptrs[layer_idx]
-        recurrent_state = self.gdn_state.recurrent_state_ptrs[layer_idx]
+        conv_state = gdn_state.conv_state_ptrs[layer_idx]
+        recurrent_state = gdn_state.recurrent_state_ptrs[layer_idx]
         kernel_size = cfg.linear_conv_kernel_dim
 
         glm.causal_conv1d(ws["gdn_conv_out"], conv_state,
@@ -417,7 +418,7 @@ class Qwen35Model:
         self._mlp(f"layers.{layer_idx}", BS)
         glm.add(ws["hidden_a"], ws["hidden_b"], ws["down_buf"], BS * hs)
 
-    def _gdn_layer_decode(self, layer_idx: int) -> None:
+    def _gdn_layer_decode(self, layer_idx: int, gdn_state: Qwen35GdnState) -> None:
         cfg = self.cfg
         glm = self.glm
         hs = cfg.hidden_size
@@ -447,8 +448,8 @@ class Qwen35Model:
                     self.weights[f"{pfx}.in_proj_z.weight"],
                     BS, z_dim, hs)
 
-        conv_state = self.gdn_state.conv_state_ptrs[layer_idx]
-        recurrent_state = self.gdn_state.recurrent_state_ptrs[layer_idx]
+        conv_state = gdn_state.conv_state_ptrs[layer_idx]
+        recurrent_state = gdn_state.recurrent_state_ptrs[layer_idx]
         kernel_size = cfg.linear_conv_kernel_dim
 
         glm.causal_conv1d_update(ws["gdn_qkv_linear"], conv_state,
@@ -694,7 +695,7 @@ class Qwen35Model:
                     self.weights[f"{pfx}.mlp.down_proj.weight"],
                     BS, hs, inter)
 
-    def prefill(self, input_ids: torch.Tensor, cache: FlatKVCache) -> torch.Tensor:
+    def prefill(self, input_ids: torch.Tensor, cache: FlatKVCache, gdn_state: Qwen35GdnState) -> torch.Tensor:
         B, S = input_ids.shape
         cfg = self.cfg
         glm = self.glm
@@ -708,7 +709,7 @@ class Qwen35Model:
         assert B <= self.max_batch and S <= self.max_seq_len
         assert cache.cache_pos == 0
 
-        self.gdn_state.reset()
+        gdn_state.reset()
 
         ids_np = input_ids.cpu().numpy().astype(np.int32).flatten()
         glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
@@ -723,7 +724,7 @@ class Qwen35Model:
 
         for i in range(cfg.num_hidden_layers):
             if cfg.layer_types[i] == "linear_attention":
-                self._gdn_layer_prefill(i, S)
+                self._gdn_layer_prefill(i, S, gdn_state)
             else:
                 self._full_attn_layer_prefill_flash(i, B, S, cache)
 
@@ -735,7 +736,7 @@ class Qwen35Model:
         logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(1, vs)
         return torch.from_numpy(logits_f32.copy())
 
-    def _decode_token(self, token_id: int, cache: FlatKVCache) -> None:
+    def _decode_token(self, token_id: int, cache: FlatKVCache, gdn_state: Qwen35GdnState) -> None:
         cfg = self.cfg
         glm = self.glm
         hs = cfg.hidden_size
@@ -762,19 +763,19 @@ class Qwen35Model:
 
         for i in range(cfg.num_hidden_layers):
             if cfg.layer_types[i] == "linear_attention":
-                self._gdn_layer_decode(i)
+                self._gdn_layer_decode(i, gdn_state)
             else:
                 self._full_attn_layer_decode_flash(i, cached_len, cache)
 
         self._final_norm_and_logits(BS)
         cache.cache_pos = cached_len + S
 
-    def decode(self, input_ids: torch.Tensor, cache: FlatKVCache) -> torch.Tensor:
+    def decode(self, input_ids: torch.Tensor, cache: FlatKVCache, gdn_state: Qwen35GdnState) -> torch.Tensor:
         B, S = input_ids.shape
         assert B == 1 and S == 1
         vs = self.cfg.vocab_size
         token_id = input_ids[0, 0].item()
-        self._decode_token(token_id, cache)
+        self._decode_token(token_id, cache, gdn_state)
         logits_u16 = self._read_logits(self._ws["logits_buf"], vs)
         logits_f32 = _bf16_bytes_to_f32(logits_u16.tobytes()).reshape(1, 1, vs)
         return torch.from_numpy(logits_f32.copy())
@@ -786,6 +787,7 @@ class Qwen35Model:
         return int(np.frombuffer(buf.raw, dtype=np.int32)[0])
 
     def generate_tokens(self, input_ids: torch.Tensor, cache: FlatKVCache,
+                        gdn_state: Qwen35GdnState,
                         max_new_tokens: int = 100,
                         eos_token_ids: Optional[set[int]] = None) -> Any:
         if eos_token_ids is None:
@@ -794,14 +796,14 @@ class Qwen35Model:
         assert B == 1
         vs = self.cfg.vocab_size
         cache.reset()
-        self.gdn_state.reset()
-        logits = self.prefill(input_ids, cache)
+        gdn_state.reset()
+        logits = self.prefill(input_ids, cache, gdn_state)
         next_token = self._argmax_logits(self._ws["logits_buf"], vs)
         yield next_token
         for _ in range(max_new_tokens - 1):
             if next_token in eos_token_ids:
                 break
-            self._decode_token(next_token, cache)
+            self._decode_token(next_token, cache, gdn_state)
             next_token = self._argmax_logits(self._ws["logits_buf"], vs)
             yield next_token
 
