@@ -700,9 +700,11 @@ void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
 // out = x * cos + rotate_half(x) * sin
 // rotate_half(x)[..., d] = (d < half) ? -x[..., d+half] : x[..., d-half]
 //
-// unsqueeze_dim=1: x is [batch, n_heads, seq_len, rope_dim]
-// unsqueeze_dim=2: x is [batch, seq_len, n_heads, rope_dim]
+// unsqueeze_dim=1: x is [batch, n_heads, seq_len, head_dim]
+// unsqueeze_dim=2: x is [batch, seq_len, n_heads, head_dim]
 // cos, sin are [batch, seq_len, rope_dim] (broadcast over heads)
+// rope_dim <= head_dim: only first rope_dim dims get RoPE, rest pass through
+// When head_dim == rope_dim, this reduces to the original behavior.
 // ---------------------------------------------------------------------------
 
 __global__ void apply_rotary_pos_emb_kernel(
@@ -711,6 +713,7 @@ __global__ void apply_rotary_pos_emb_kernel(
     const __nv_bfloat16* cos_emb,
     const __nv_bfloat16* sin_emb,
     int rope_dim,
+    int head_dim,
     int seq_len,
     int n_heads,
     int batch,
@@ -721,38 +724,64 @@ __global__ void apply_rotary_pos_emb_kernel(
     if (idx >= total) return;
 
     int d = idx % rope_dim;
-    int b, s;
+    int b, h, s;
     if (unsqueeze_dim == 1) {
         int rest = idx / rope_dim;
         s = rest % seq_len;
+        h = (rest / seq_len) % n_heads;
         b = rest / (n_heads * seq_len);
     } else {
         int rest = idx / rope_dim;
+        h = rest % n_heads;
         s = (rest / n_heads) % seq_len;
         b = rest / (n_heads * seq_len);
+    }
+
+    int x_idx;
+    if (unsqueeze_dim == 1) {
+        x_idx = ((b * n_heads + h) * seq_len + s) * head_dim + d;
+    } else {
+        x_idx = ((b * seq_len + s) * n_heads + h) * head_dim + d;
     }
 
     int cos_idx = (b * seq_len + s) * rope_dim + d;
     int half = rope_dim / 2;
 
-    float x_val = __bfloat162float(x[idx]);
+    float x_val = __bfloat162float(x[x_idx]);
     float cos_val = __bfloat162float(cos_emb[cos_idx]);
     float sin_val = __bfloat162float(sin_emb[cos_idx]);
 
     float x_rot;
     if (d < half) {
-        x_rot = -__bfloat162float(x[idx + half]);
+        int rot_idx = x_idx + half;
+        x_rot = -__bfloat162float(x[rot_idx]);
     } else {
-        x_rot = __bfloat162float(x[idx - half]);
+        int rot_idx = x_idx - half;
+        x_rot = __bfloat162float(x[rot_idx]);
     }
 
-    out[idx] = __float2bfloat16(x_val * cos_val + x_rot * sin_val);
+    out[x_idx] = __float2bfloat16(x_val * cos_val + x_rot * sin_val);
 }
 
 void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
-                              const void* cos, const void* sin,
-                              int rope_dim, int n_heads, int seq_len,
-                              int batch, int unsqueeze_dim) {
+                               const void* cos, const void* sin,
+                               int rope_dim, int n_heads, int seq_len,
+                               int batch, int unsqueeze_dim) {
+    cudaSetDevice(ctx->device_id);
+    int head_dim = rope_dim;
+    int total = batch * n_heads * seq_len * rope_dim;
+    int block_size = 256;
+    int grid = (total + block_size - 1) / block_size;
+    apply_rotary_pos_emb_kernel<<<grid, block_size, 0, ctx->stream>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
+        (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
+        rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim);
+}
+
+void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
+                                        const void* cos, const void* sin,
+                                        int rope_dim, int head_dim, int n_heads, int seq_len,
+                                        int batch, int unsqueeze_dim) {
     cudaSetDevice(ctx->device_id);
     int total = batch * n_heads * seq_len * rope_dim;
     int block_size = 256;
@@ -760,7 +789,7 @@ void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
     apply_rotary_pos_emb_kernel<<<grid, block_size, 0, ctx->stream>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
         (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
-        rope_dim, seq_len, n_heads, batch, unsqueeze_dim);
+        rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim);
 }
 
 // ---------------------------------------------------------------------------

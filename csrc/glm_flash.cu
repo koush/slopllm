@@ -96,22 +96,42 @@ void glm_flash_prefill(
   flashinfer::MaskMode flash_mask = static_cast<flashinfer::MaskMode>(mask_mode);
 
   cudaError_t status;
-  if (flash_mask == flashinfer::MaskMode::kCausal) {
-    status = flashinfer::SinglePrefillWithKVCacheDispatched<
-        128, 128,
-        flashinfer::PosEncodingMode::kNone,
-        false,
-        flashinfer::MaskMode::kCausal,
-        AttentionVariant, Params>(
-        params, static_cast<DTypeO*>(tmp), ctx->stream);
+  if (head_dim == 256) {
+    if (flash_mask == flashinfer::MaskMode::kCausal) {
+      status = flashinfer::SinglePrefillWithKVCacheDispatched<
+          256, 256,
+          flashinfer::PosEncodingMode::kNone,
+          false,
+          flashinfer::MaskMode::kCausal,
+          AttentionVariant, Params>(
+          params, static_cast<DTypeO*>(tmp), ctx->stream);
+    } else {
+      status = flashinfer::SinglePrefillWithKVCacheDispatched<
+          256, 256,
+          flashinfer::PosEncodingMode::kNone,
+          false,
+          flashinfer::MaskMode::kNone,
+          AttentionVariant, Params>(
+          params, static_cast<DTypeO*>(tmp), ctx->stream);
+    }
   } else {
-    status = flashinfer::SinglePrefillWithKVCacheDispatched<
-        128, 128,
-        flashinfer::PosEncodingMode::kNone,
-        false,
-        flashinfer::MaskMode::kNone,
-        AttentionVariant, Params>(
-        params, static_cast<DTypeO*>(tmp), ctx->stream);
+    if (flash_mask == flashinfer::MaskMode::kCausal) {
+      status = flashinfer::SinglePrefillWithKVCacheDispatched<
+          128, 128,
+          flashinfer::PosEncodingMode::kNone,
+          false,
+          flashinfer::MaskMode::kCausal,
+          AttentionVariant, Params>(
+          params, static_cast<DTypeO*>(tmp), ctx->stream);
+    } else {
+      status = flashinfer::SinglePrefillWithKVCacheDispatched<
+          128, 128,
+          flashinfer::PosEncodingMode::kNone,
+          false,
+          flashinfer::MaskMode::kNone,
+          AttentionVariant, Params>(
+          params, static_cast<DTypeO*>(tmp), ctx->stream);
+    }
   }
 
   if (status != cudaSuccess) {
@@ -151,12 +171,20 @@ void glm_flash_decode(
   params.rope_rcp_theta = 1.0f;
   params.kv_chunk_size = 0;
 
-  cudaError_t status =
-      flashinfer::SingleDecodeWithKVCacheDispatched<
-          128,
-          flashinfer::PosEncodingMode::kNone,
-          AttentionVariant, Params>(
-          params, static_cast<DTypeO*>(tmp), ctx->stream);
+  cudaError_t status;
+  if (head_dim == 256) {
+    status = flashinfer::SingleDecodeWithKVCacheDispatched<
+        256,
+        flashinfer::PosEncodingMode::kNone,
+        AttentionVariant, Params>(
+        params, static_cast<DTypeO*>(tmp), ctx->stream);
+  } else {
+    status = flashinfer::SingleDecodeWithKVCacheDispatched<
+        128,
+        flashinfer::PosEncodingMode::kNone,
+        AttentionVariant, Params>(
+        params, static_cast<DTypeO*>(tmp), ctx->stream);
+  }
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_flash_decode failed: %s\n", cudaGetErrorString(status));

@@ -92,6 +92,10 @@ export class Tensor {
     this.glm.applyRotaryPosEmb(this.data, ptr(x), ptr(cos), ptr(sin), ropeDim, nHeads, seqLen, batch, unsqueezeDim);
   }
 
+  applyRotaryPosEmbPartial(x: Tensor | number, cos: Tensor | number, sin: Tensor | number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
+    this.glm.applyRotaryPosEmbPartial(this.data, ptr(x), ptr(cos), ptr(sin), ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim);
+  }
+
   arange(start: number, step: number, count: number): void {
     this.glm.arange(this.data, start, step, count);
   }
@@ -102,5 +106,37 @@ export class Tensor {
 
   indexSelect(src: Tensor | number, indices: Tensor | number, dim: number, k: number): void {
     this.glm.indexSelect(this.data, ptr(src), ptr(indices), dim, k);
+  }
+
+  gdnRecurrentStep(state: Tensor | number, q: Tensor | number, k: Tensor | number, v: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, numHeads: number, dK: number, dV: number): void {
+    this.glm.gdnRecurrentStep(this.data, ptr(state), ptr(q), ptr(k), ptr(v), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), numHeads, dK, dV);
+  }
+
+  gdnPrefill(state: Tensor | number, q: Tensor | number, k: Tensor | number, v: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, seqLen: number, numHeads: number, dK: number, dV: number): void {
+    this.glm.gdnPrefill(this.data, ptr(state), ptr(q), ptr(k), ptr(v), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), seqLen, numHeads, dK, dV);
+  }
+
+  causalConv1d(convState: Tensor | number, input: Tensor | number, weight: Tensor | number, convDim: number, seqLen: number, kernelSize: number): void {
+    this.glm.causalConv1d(this.data, ptr(convState), ptr(input), ptr(weight), convDim, seqLen, kernelSize);
+  }
+
+  causalConv1dUpdate(convState: Tensor | number, input: Tensor | number, weight: Tensor | number, convDim: number, kernelSize: number): void {
+    this.glm.causalConv1dUpdate(this.data, ptr(convState), ptr(input), ptr(weight), convDim, kernelSize);
+  }
+
+  rmsnormGated(input: Tensor | number, gate: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
+    this.glm.rmsnormGated(this.data, ptr(input), ptr(gate), ptr(weight), eps, dim, batch);
+  }
+
+  sigmoid(input: Tensor | number, n: number): void {
+    this.glm.sigmoid(this.data, ptr(input), n);
+  }
+
+  mul(a: Tensor | number, b: Tensor | number, n: number): void {
+    this.glm.mul(this.data, ptr(a), ptr(b), n);
+  }
+
+  qkvSplit(kOut: Tensor | number, vOut: Tensor | number, qkvIn: Tensor | number, seqLen: number, numHeads: number, dK: number, dV: number): void {
+    this.glm.qkvSplit(this.data, ptr(kOut), ptr(vOut), ptr(qkvIn), seqLen, numHeads, dK, dV);
   }
 }

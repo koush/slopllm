@@ -12,6 +12,7 @@
     "start:qwen3": "node dist/run_qwen3.js",
     "start:qwen3-batch": "node dist/run_qwen3_batch.js",
     "start:qwen3-chat": "node dist/run_qwen3_chat.js",
+    "start:qwen35-chat": "node dist/run_qwen3_chat.js --qwen35",
     "dev": "tsc --watch",
     "pretest": "npm run build:all",
     "test:node": "node --test dist/test.js",

@@ -82,6 +82,11 @@ void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
                               int rope_dim, int n_heads, int seq_len,
                               int batch, int unsqueeze_dim);
 
+void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
+                                       const void* cos, const void* sin,
+                                       int rope_dim, int head_dim, int n_heads, int seq_len,
+                                       int batch, int unsqueeze_dim);
+
 void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
               const void* input, int k, int dim, int batch);
 
@@ -215,6 +220,82 @@ void glm_graph_exec_destroy(void* graph_exec);
 void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
                             const void* fp8_weight, const float* weight_scale,
                             int m, int n, int k);
+
+// Gated DeltaNet recurrent step (decode, T=1)
+// Fused: L2 norm q,k + gate computation + delta rule update
+// output: [num_heads, d_v] BF16
+// state: [num_heads, d_k, d_v] FP32 (updated in-place)
+// q: [num_heads, d_k] BF16
+// k: [num_heads, d_k] BF16
+// v: [num_heads, d_v] BF16
+// a_raw: [num_heads] BF16 (gate input, before softplus)
+// b_raw: [num_heads] BF16 (beta input, before sigmoid)
+// A_log: [num_heads] FP32 (learned log decay rate)
+// dt_bias: [num_heads] FP32 (gate bias)
+void glm_gdn_recurrent_step(GlmCtx* ctx, void* output, void* state,
+                             const void* q, const void* k, const void* v,
+                             const void* a_raw, const void* b_raw,
+                             const float* A_log, const float* dt_bias,
+                             int num_heads, int d_k, int d_v);
+
+// Gated DeltaNet prefill (sequential over tokens)
+// output: [seq_len, num_heads, d_v] BF16
+// state: [num_heads, d_k, d_v] FP32 (updated in-place, initial state should be zero-initialized)
+// q: [seq_len, num_heads, d_k] BF16
+// k: [seq_len, num_heads, d_k] BF16
+// v: [seq_len, num_heads, d_v] BF16
+// a_raw: [seq_len, num_heads] BF16
+// b_raw: [seq_len, num_heads] BF16
+// A_log: [num_heads] FP32
+// dt_bias: [num_heads] FP32
+void glm_gdn_prefill(GlmCtx* ctx, void* output, void* state,
+                      const void* q, const void* k, const void* v,
+                      const void* a_raw, const void* b_raw,
+                      const float* A_log, const float* dt_bias,
+                      int seq_len, int num_heads, int d_k, int d_v);
+
+// Causal conv1d with SiLU activation (prefill, full sequence)
+// input/output layout: [conv_dim, seq_len] (channel-first, BF16)
+// weight layout: [conv_dim, kernel_size] (BF16)
+// conv_state: [conv_dim, kernel_size-1] BF16 (initialized with last K-1 values after prefill, can be NULL)
+void glm_causal_conv1d(GlmCtx* ctx, void* output, void* conv_state,
+                        const void* input, const void* weight,
+                        int conv_dim, int seq_len, int kernel_size);
+
+// Causal conv1d update with SiLU activation (decode, single token)
+// input/output layout: [conv_dim] (single token, BF16)
+// conv_state: [conv_dim, kernel_size-1] BF16 (updated in-place)
+// weight layout: [conv_dim, kernel_size] (BF16)
+void glm_causal_conv1d_update(GlmCtx* ctx, void* output, void* conv_state,
+                               const void* input, const void* weight,
+                               int conv_dim, int kernel_size);
+
+// RMSNorm gated: output = RMSNorm(input) * weight * SiLU(gate)
+// output: [batch, dim] BF16
+// input: [batch, dim] BF16
+// gate: [batch, dim] BF16
+// weight: [dim] BF16
+void glm_rmsnorm_gated(GlmCtx* ctx, void* output, const void* input,
+                        const void* gate, const void* weight,
+                        float eps, int dim, int batch);
+
+// QKV split from conv1d output [convDim, S] to GDN prefill layout
+// qkv_in: [num_heads * qkv_stride, seq_len] BF16 (channel-first, output of causal_conv1d)
+// q_out: [seq_len, num_heads, d_k] BF16
+// k_out: [seq_len, num_heads, d_k] BF16
+// v_out: [seq_len, num_heads, d_v] BF16
+// qkv_stride = 2 * d_k + d_v (per-head QKV channel stride)
+void glm_qkv_split(GlmCtx* ctx, void* q_out, void* k_out, void* v_out,
+                    const void* qkv_in,
+                    int seq_len, int num_heads, int d_k, int d_v);
+
+// Split interleaved [query|gate] per head:
+// qg_in: [batch_seq, num_heads, head_dim * 2] BF16 (row-major)
+// q_out: [batch_seq, num_heads * head_dim] BF16
+// gate_out: [batch_seq, num_heads * head_dim] BF16
+void glm_interleaved_split(GlmCtx* ctx, void* q_out, void* gate_out,
+                            const void* qg_in,
+                            int batch_seq, int num_heads, int head_dim);
 
 #ifdef __cplusplus
 }

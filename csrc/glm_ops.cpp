@@ -412,6 +412,32 @@ static Napi::Value ApplyRotaryPosEmb(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value ApplyRotaryPosEmbPartial(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, out, x, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t x_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t cos_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t sin_ptr = info[4].As<Napi::Number>().Int64Value();
+    int rope_dim = info[5].As<Napi::Number>().Int32Value();
+    int head_dim = info[6].As<Napi::Number>().Int32Value();
+    int n_heads = info[7].As<Napi::Number>().Int32Value();
+    int seq_len = info[8].As<Napi::Number>().Int32Value();
+    int batch = info[9].As<Napi::Number>().Int32Value();
+    int unsqueeze_dim = info[10].As<Napi::Number>().Int32Value();
+    glm_apply_rotary_pos_emb_partial(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                      reinterpret_cast<void*>(out_ptr),
+                                      reinterpret_cast<const void*>(x_ptr),
+                                      reinterpret_cast<const void*>(cos_ptr),
+                                      reinterpret_cast<const void*>(sin_ptr),
+                                      rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim);
+    return env.Undefined();
+}
+
 static Napi::Value Topk(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 7) {
@@ -1111,6 +1137,186 @@ static Napi::Value Fp8LinearDecode(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value GdnRecurrentStep(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, output, state, q, k, v, a_raw, b_raw, A_log, dt_bias, num_heads, d_k, d_v)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t state_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t q_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t k_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t v_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t a_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t b_ptr = info[7].As<Napi::Number>().Int64Value();
+    uintptr_t alog_ptr = info[8].As<Napi::Number>().Int64Value();
+    uintptr_t dtb_ptr = info[9].As<Napi::Number>().Int64Value();
+    int num_heads = info[10].As<Napi::Number>().Int32Value();
+    int d_k = info[11].As<Napi::Number>().Int32Value();
+    int d_v = info[12].As<Napi::Number>().Int32Value();
+    glm_gdn_recurrent_step(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                            reinterpret_cast<void*>(out_ptr),
+                            reinterpret_cast<float*>(state_ptr),
+                            reinterpret_cast<const void*>(q_ptr),
+                            reinterpret_cast<const void*>(k_ptr),
+                            reinterpret_cast<const void*>(v_ptr),
+                            reinterpret_cast<const void*>(a_ptr),
+                            reinterpret_cast<const void*>(b_ptr),
+                            reinterpret_cast<const float*>(alog_ptr),
+                            reinterpret_cast<const float*>(dtb_ptr),
+                            num_heads, d_k, d_v);
+    return env.Undefined();
+}
+
+static Napi::Value GdnPrefill(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, output, state, q, k, v, a_raw, b_raw, A_log, dt_bias, seq_len, num_heads, d_k, d_v)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t state_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t q_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t k_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t v_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t a_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t b_ptr = info[7].As<Napi::Number>().Int64Value();
+    uintptr_t alog_ptr = info[8].As<Napi::Number>().Int64Value();
+    uintptr_t dtb_ptr = info[9].As<Napi::Number>().Int64Value();
+    int seq_len = info[10].As<Napi::Number>().Int32Value();
+    int num_heads = info[11].As<Napi::Number>().Int32Value();
+    int d_k = info[12].As<Napi::Number>().Int32Value();
+    int d_v = info[13].As<Napi::Number>().Int32Value();
+    glm_gdn_prefill(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                     reinterpret_cast<void*>(out_ptr),
+                     reinterpret_cast<float*>(state_ptr),
+                     reinterpret_cast<const void*>(q_ptr),
+                     reinterpret_cast<const void*>(k_ptr),
+                     reinterpret_cast<const void*>(v_ptr),
+                     reinterpret_cast<const void*>(a_ptr),
+                     reinterpret_cast<const void*>(b_ptr),
+                     reinterpret_cast<const float*>(alog_ptr),
+                     reinterpret_cast<const float*>(dtb_ptr),
+                     seq_len, num_heads, d_k, d_v);
+    return env.Undefined();
+}
+
+static Napi::Value CausalConv1d(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (ctx, output, conv_state, input, weight, conv_dim, seq_len, kernel_size)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t cs_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t w_ptr = info[4].As<Napi::Number>().Int64Value();
+    int conv_dim = info[5].As<Napi::Number>().Int32Value();
+    int seq_len = info[6].As<Napi::Number>().Int32Value();
+    int kernel_size = info[7].As<Napi::Number>().Int32Value();
+    glm_causal_conv1d(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                       reinterpret_cast<void*>(out_ptr),
+                       reinterpret_cast<void*>(cs_ptr),
+                       reinterpret_cast<const void*>(in_ptr),
+                       reinterpret_cast<const void*>(w_ptr),
+                       conv_dim, seq_len, kernel_size);
+    return env.Undefined();
+}
+
+static Napi::Value CausalConv1dUpdate(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, output, conv_state, input, weight, conv_dim, kernel_size)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t cs_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t w_ptr = info[4].As<Napi::Number>().Int64Value();
+    int conv_dim = info[5].As<Napi::Number>().Int32Value();
+    int kernel_size = info[6].As<Napi::Number>().Int32Value();
+    glm_causal_conv1d_update(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                              reinterpret_cast<void*>(out_ptr),
+                              reinterpret_cast<void*>(cs_ptr),
+                              reinterpret_cast<const void*>(in_ptr),
+                              reinterpret_cast<const void*>(w_ptr),
+                              conv_dim, kernel_size);
+    return env.Undefined();
+}
+
+static Napi::Value RmsnormGated(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 8) {
+        Napi::TypeError::New(env, "Expected (ctx, out, input, gate, weight, eps, dim, batch)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t gate_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t w_ptr = info[4].As<Napi::Number>().Int64Value();
+    float eps = info[5].As<Napi::Number>().FloatValue();
+    int dim = info[6].As<Napi::Number>().Int32Value();
+    int batch = info[7].As<Napi::Number>().Int32Value();
+    glm_rmsnorm_gated(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                       reinterpret_cast<void*>(out_ptr),
+                       reinterpret_cast<const void*>(in_ptr),
+                       reinterpret_cast<const void*>(gate_ptr),
+                       reinterpret_cast<const void*>(w_ptr),
+                       eps, dim, batch);
+    return env.Undefined();
+}
+
+static Napi::Value QkvSplit(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 9) {
+        Napi::TypeError::New(env, "Expected (ctx, q_out, k_out, v_out, qkv_in, seq_len, num_heads, d_k, d_v)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t k_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t v_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t qkv_ptr = info[4].As<Napi::Number>().Int64Value();
+    int seq_len = info[5].As<Napi::Number>().Int32Value();
+    int num_heads = info[6].As<Napi::Number>().Int32Value();
+    int d_k = info[7].As<Napi::Number>().Int32Value();
+    int d_v = info[8].As<Napi::Number>().Int32Value();
+    glm_qkv_split(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                   reinterpret_cast<void*>(q_ptr),
+                   reinterpret_cast<void*>(k_ptr),
+                   reinterpret_cast<void*>(v_ptr),
+                   reinterpret_cast<const void*>(qkv_ptr),
+                   seq_len, num_heads, d_k, d_v);
+    return env.Undefined();
+}
+
+static Napi::Value InterleavedSplit(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (ctx, q_out, gate_out, qg_in, batch_seq, num_heads, head_dim)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t gate_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t qg_ptr = info[3].As<Napi::Number>().Int64Value();
+    int batch_seq = info[4].As<Napi::Number>().Int32Value();
+    int num_heads = info[5].As<Napi::Number>().Int32Value();
+    int head_dim = info[6].As<Napi::Number>().Int32Value();
+    glm_interleaved_split(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                           reinterpret_cast<void*>(q_ptr),
+                           reinterpret_cast<void*>(gate_ptr),
+                           reinterpret_cast<const void*>(qg_ptr),
+                           batch_seq, num_heads, head_dim);
+    return env.Undefined();
+}
+
 static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "init"), Napi::Function::New(env, Init));
     exports.Set(Napi::String::New(env, "free"), Napi::Function::New(env, Free));
@@ -1135,6 +1341,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "indexAdd"), Napi::Function::New(env, IndexAdd));
     exports.Set(Napi::String::New(env, "rotaryEmbedding"), Napi::Function::New(env, RotaryEmbedding));
     exports.Set(Napi::String::New(env, "applyRotaryPosEmb"), Napi::Function::New(env, ApplyRotaryPosEmb));
+    exports.Set(Napi::String::New(env, "applyRotaryPosEmbPartial"), Napi::Function::New(env, ApplyRotaryPosEmbPartial));
     exports.Set(Napi::String::New(env, "topk"), Napi::Function::New(env, Topk));
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));
     exports.Set(Napi::String::New(env, "scale"), Napi::Function::New(env, Scale));
@@ -1170,6 +1377,13 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "graphDestroy"), Napi::Function::New(env, GraphDestroy));
     exports.Set(Napi::String::New(env, "graphExecDestroy"), Napi::Function::New(env, GraphExecDestroy));
     exports.Set(Napi::String::New(env, "fp8LinearDecode"), Napi::Function::New(env, Fp8LinearDecode));
+    exports.Set(Napi::String::New(env, "gdnRecurrentStep"), Napi::Function::New(env, GdnRecurrentStep));
+    exports.Set(Napi::String::New(env, "gdnPrefill"), Napi::Function::New(env, GdnPrefill));
+    exports.Set(Napi::String::New(env, "causalConv1d"), Napi::Function::New(env, CausalConv1d));
+    exports.Set(Napi::String::New(env, "causalConv1dUpdate"), Napi::Function::New(env, CausalConv1dUpdate));
+    exports.Set(Napi::String::New(env, "rmsnormGated"), Napi::Function::New(env, RmsnormGated));
+    exports.Set(Napi::String::New(env, "qkvSplit"), Napi::Function::New(env, QkvSplit));
+    exports.Set(Napi::String::New(env, "interleavedSplit"), Napi::Function::New(env, InterleavedSplit));
     return exports;
 }
 

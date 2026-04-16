@@ -237,6 +237,13 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int
         ]
 
+        self.lib.glm_apply_rotary_pos_emb_partial.restype = None
+        self.lib.glm_apply_rotary_pos_emb_partial.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int
+        ]
+
         self.lib.glm_topk.restype = None
         self.lib.glm_topk.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -449,6 +456,63 @@ class GlmOps:
             ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_gdn_recurrent_step.restype = None
+        self.lib.glm_gdn_recurrent_step.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_gdn_prefill.restype = None
+        self.lib.glm_gdn_prefill.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_causal_conv1d.restype = None
+        self.lib.glm_causal_conv1d.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_causal_conv1d_update.restype = None
+        self.lib.glm_causal_conv1d_update.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_rmsnorm_gated.restype = None
+        self.lib.glm_rmsnorm_gated.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_float, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_qkv_split.restype = None
+        self.lib.glm_qkv_split.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_interleaved_split.restype = None
+        self.lib.glm_interleaved_split.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
@@ -670,6 +734,16 @@ class GlmOps:
             self._ptr(cos),
             self._ptr(sin),
             rope_dim, n_heads, seq_len, batch, unsqueeze_dim
+        )
+
+    def apply_rotary_pos_emb_partial(self, output, x, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim):
+        self.lib.glm_apply_rotary_pos_emb_partial(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(x),
+            self._ptr(cos),
+            self._ptr(sin),
+            rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim
         )
 
     def topk(self, out_values, out_indices, input, k, dim, batch):
@@ -923,4 +997,69 @@ class GlmOps:
             self._ptr(bf16_out), self._ptr(bf16_input),
             self._ptr(fp8_weight), self._ptr(weight_scale),
             m, n, k
+        )
+
+    def gdn_recurrent_step(self, output, state, q, k, v, a_raw, b_raw, A_log, dt_bias,
+                            num_heads, d_k, d_v):
+        self.lib.glm_gdn_recurrent_step(
+            self.ctx,
+            self._ptr(output), self._ptr(state),
+            self._ptr(q), self._ptr(k), self._ptr(v),
+            self._ptr(a_raw), self._ptr(b_raw),
+            self._ptr(A_log), self._ptr(dt_bias),
+            num_heads, d_k, d_v
+        )
+
+    def gdn_prefill(self, output, state, q, k, v, a_raw, b_raw, A_log, dt_bias,
+                     seq_len, num_heads, d_k, d_v):
+        self.lib.glm_gdn_prefill(
+            self.ctx,
+            self._ptr(output), self._ptr(state),
+            self._ptr(q), self._ptr(k), self._ptr(v),
+            self._ptr(a_raw), self._ptr(b_raw),
+            self._ptr(A_log), self._ptr(dt_bias),
+            seq_len, num_heads, d_k, d_v
+        )
+
+    def causal_conv1d(self, output, conv_state, input, weight, conv_dim, seq_len, kernel_size):
+        cs_ptr = self._ptr(conv_state) if conv_state is not None else ctypes.c_void_p(0)
+        self.lib.glm_causal_conv1d(
+            self.ctx,
+            self._ptr(output), cs_ptr,
+            self._ptr(input), self._ptr(weight),
+            conv_dim, seq_len, kernel_size
+        )
+
+    def causal_conv1d_update(self, output, conv_state, input, weight, conv_dim, kernel_size):
+        self.lib.glm_causal_conv1d_update(
+            self.ctx,
+            self._ptr(output), self._ptr(conv_state),
+            self._ptr(input), self._ptr(weight),
+            conv_dim, kernel_size
+        )
+
+    def rmsnorm_gated(self, output, input, gate, weight, eps, dim, batch):
+        self.lib.glm_rmsnorm_gated(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input),
+            self._ptr(gate),
+            self._ptr(weight),
+            ctypes.c_float(eps), dim, batch
+        )
+
+    def qkv_split(self, q_out, k_out, v_out, qkv_in, seq_len, num_heads, d_k, d_v):
+        self.lib.glm_qkv_split(
+            self.ctx,
+            self._ptr(q_out), self._ptr(k_out), self._ptr(v_out),
+            self._ptr(qkv_in),
+            seq_len, num_heads, d_k, d_v
+        )
+
+    def interleaved_split(self, q_out, gate_out, qg_in, batch_seq, num_heads, head_dim):
+        self.lib.glm_interleaved_split(
+            self.ctx,
+            self._ptr(q_out), self._ptr(gate_out),
+            self._ptr(qg_in),
+            batch_seq, num_heads, head_dim
         )
