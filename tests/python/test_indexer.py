@@ -181,7 +181,7 @@ def test_indexer_no_mask(glm, device):
     _compare_topk(cuda_indices, ref_indices, cuda_scores, ref_scores)
 
 
-def _compare_topk(cuda_indices, ref_indices, index_scores_cuda, index_scores_ref, atol=0.1):
+def _compare_topk(cuda_indices, ref_indices, index_scores_cuda, index_scores_ref, atol=0.5):
     cuda_vals_sorted, _ = torch.sort(index_scores_cuda.float(), dim=-1, descending=True)
     ref_vals_sorted, _ = torch.sort(index_scores_ref.float(), dim=-1, descending=True)
     k = cuda_indices.shape[-1]

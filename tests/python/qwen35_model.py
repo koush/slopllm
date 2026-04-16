@@ -297,8 +297,11 @@ class Qwen35Model:
             glm.free_buf(ptr)
         glm.free_buf(self.inv_freq)
         self.gdn_state.free()
+        freed_ptrs = set()
         for ptr in self.weights.values():
-            glm.free_buf(ptr)
+            if isinstance(ptr, int) and ptr not in freed_ptrs:
+                glm.free_buf(ptr)
+                freed_ptrs.add(ptr)
         self._ws = {}
         self.weights = {}
 

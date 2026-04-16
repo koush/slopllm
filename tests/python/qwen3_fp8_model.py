@@ -108,12 +108,19 @@ class Qwen3FP8Model(Qwen3Model):
         for ptr in self._ws.values():
             glm.free_buf(ptr)
         glm.free_buf(self.inv_freq)
+        freed_ptrs = set()
         for ptr in self.weights.values():
-            glm.free_buf(ptr)
+            if isinstance(ptr, int) and ptr not in freed_ptrs:
+                glm.free_buf(ptr)
+                freed_ptrs.add(ptr)
         for ptr in self.fp8_weights.values():
-            glm.free_buf(ptr)
+            if isinstance(ptr, int) and ptr not in freed_ptrs:
+                glm.free_buf(ptr)
+                freed_ptrs.add(ptr)
         for ptr in self.weight_scales.values():
-            glm.free_buf(ptr)
+            if isinstance(ptr, int) and ptr not in freed_ptrs:
+                glm.free_buf(ptr)
+                freed_ptrs.add(ptr)
         self._ws = {}
         self.weights = {}
         self.fp8_weights = {}
