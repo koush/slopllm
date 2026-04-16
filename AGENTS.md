@@ -23,7 +23,7 @@ npm run test:python     # run all Python verification tests (158 tests)
 
 Run Python tests directly:
 ```bash
-cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .
+cd tests/python && pytest -v .
 ```
 
 ## Precision Model

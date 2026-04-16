@@ -7,7 +7,7 @@
     "build:cuda": "make",
     "build:addon": "npm run build:cuda && node-gyp rebuild",
     "build:all": "npm run build:addon && npm run build",
-    "test:python": "cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .",
+    "test:python": "cd tests/python && pytest -v .",
     "start": "node dist/main.js",
     "start:qwen3": "node dist/run_qwen3.js",
     "start:qwen3-batch": "node dist/run_qwen3_batch.js",

@@ -47,7 +47,7 @@ npm run test:python
 Or directly:
 
 ```bash
-cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .
+cd tests/python && pytest -v .
 ```
 
 Install Python dependencies:
