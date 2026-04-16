@@ -517,8 +517,7 @@ class GlmOps:
         ]
 
     def __del__(self):
-        if hasattr(self, 'ctx') and self.ctx:
-            self.lib.glm_free(self.ctx)
+        pass
 
     def _ptr(self, t):
         if isinstance(t, ctypes.c_void_p):
