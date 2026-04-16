@@ -104,6 +104,39 @@ class Qwen35Workspace {
   flashTmp: Tensor;
   oProjBuf: Tensor;
   decodeId: Tensor;
+  gdnQkvBuf: Tensor;
+  gdnABuf: Tensor;
+  gdnBBuf: Tensor;
+  gdnZBuf: Tensor;
+  gdnQBuf: Tensor;
+  gdnKBuf: Tensor;
+  gdnVBuf: Tensor;
+  gdnOut: Tensor;
+  gdnGatedOut: Tensor;
+  gdnPrefillQkvLinear: Tensor;
+  gdnPrefillQkvBuf: Tensor;
+  gdnPrefillABuf: Tensor;
+  gdnPrefillBBuf: Tensor;
+  gdnPrefillZBuf: Tensor;
+  gdnPrefillConvOut: Tensor;
+  gdnPrefillQBuf: Tensor;
+  gdnPrefillKBuf: Tensor;
+  gdnPrefillVBuf: Tensor;
+  gdnPrefillOut: Tensor;
+  gdnPrefillGatedOut: Tensor;
+  attnQBuf: Tensor;
+  attnQOnly: Tensor;
+  attnKBuf: Tensor;
+  attnVBuf: Tensor;
+  attnGateBuf: Tensor;
+  attnQNormed: Tensor;
+  attnKNormed: Tensor;
+  attnQT: Tensor;
+  attnKT: Tensor;
+  attnVT: Tensor;
+  attnQRope: Tensor;
+  attnKRope: Tensor;
+  attnSigBuf: Tensor;
   tensors = new Map<string, Tensor>();
 
   constructor(glm: GlmOps, B: number, S: number, cfg: Qwen35Config) {
@@ -113,6 +146,11 @@ class Qwen35Workspace {
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
+    const linHeads = cfg.linearNumKeyHeads;
+    const linKDim = cfg.linearKeyHeadDim;
+    const linVDim = cfg.linearValueHeadDim;
+    const convDim = linHeads * (linKDim * 2 + linVDim);
+    const zDim = linHeads * linVDim;
     const BS = B * S;
 
     this.hiddenA = Tensor.alloc(glm, [B, S, hs], "BF16");
@@ -134,6 +172,43 @@ class Qwen35Workspace {
     this.flashTmp = Tensor.alloc(glm, [32 * 1024 * 1024], "U8");
     this.oProjBuf = Tensor.alloc(glm, [B, S, hs], "BF16");
     this.decodeId = Tensor.alloc(glm, [1], "I32");
+
+    this.gdnQkvBuf = Tensor.alloc(glm, [convDim], "BF16");
+    this.gdnABuf = Tensor.alloc(glm, [linHeads], "BF16");
+    this.gdnBBuf = Tensor.alloc(glm, [linHeads], "BF16");
+    this.gdnZBuf = Tensor.alloc(glm, [1, zDim], "BF16");
+    this.gdnQBuf = Tensor.alloc(glm, [linHeads, linKDim], "BF16");
+    this.gdnKBuf = Tensor.alloc(glm, [linHeads, linKDim], "BF16");
+    this.gdnVBuf = Tensor.alloc(glm, [linHeads, linVDim], "BF16");
+    this.gdnOut = Tensor.alloc(glm, [linHeads, linVDim], "BF16");
+    this.gdnGatedOut = Tensor.alloc(glm, [linHeads, linVDim], "BF16");
+
+    this.gdnPrefillQkvLinear = Tensor.alloc(glm, [BS, convDim], "BF16");
+    this.gdnPrefillQkvBuf = Tensor.alloc(glm, [convDim, S], "BF16");
+    this.gdnPrefillABuf = Tensor.alloc(glm, [BS * linHeads], "BF16");
+    this.gdnPrefillBBuf = Tensor.alloc(glm, [BS * linHeads], "BF16");
+    this.gdnPrefillZBuf = Tensor.alloc(glm, [BS, zDim], "BF16");
+    this.gdnPrefillConvOut = Tensor.alloc(glm, [convDim, S], "BF16");
+    this.gdnPrefillQBuf = Tensor.alloc(glm, [S * linHeads * linKDim], "BF16");
+    this.gdnPrefillKBuf = Tensor.alloc(glm, [S * linHeads * linKDim], "BF16");
+    this.gdnPrefillVBuf = Tensor.alloc(glm, [S * linHeads * linVDim], "BF16");
+    this.gdnPrefillOut = Tensor.alloc(glm, [S * linHeads, linVDim], "BF16");
+    this.gdnPrefillGatedOut = Tensor.alloc(glm, [S * linHeads, linVDim], "BF16");
+
+    const qTotalDim = nHeads * hd;
+    this.attnQBuf = Tensor.alloc(glm, [BS, qTotalDim * 2], "BF16");
+    this.attnQOnly = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
+    this.attnKBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
+    this.attnVBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
+    this.attnGateBuf = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
+    this.attnQNormed = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
+    this.attnKNormed = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
+    this.attnQT = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
+    this.attnKT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
+    this.attnVT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
+    this.attnQRope = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
+    this.attnKRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
+    this.attnSigBuf = Tensor.alloc(glm, [BS * nHeads * hd], "BF16");
 
     for (const key of Object.keys(this) as (keyof this)[]) {
       const value = this[key];
@@ -540,11 +615,11 @@ export class Qwen35Model implements OpContext {
 
     this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`layers.${layerIdx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
-    const qkvLinear = Tensor.alloc(glm, [BS, convDim], "BF16");
-    const qkvBuf = Tensor.alloc(glm, [convDim, S], "BF16");
-    const aBuf = Tensor.alloc(glm, [S * linHeads], "BF16");
-    const bBuf = Tensor.alloc(glm, [S * linHeads], "BF16");
-    const zBuf = Tensor.alloc(glm, [BS, zDim], "BF16");
+    const qkvLinear = this.ws.gdnPrefillQkvLinear;
+    const qkvBuf = this.ws.gdnPrefillQkvBuf;
+    const aBuf = this.ws.gdnPrefillABuf;
+    const bBuf = this.ws.gdnPrefillBBuf;
+    const zBuf = this.ws.gdnPrefillZBuf;
 
     qkvLinear.linear(this.ws.normed, this.weights.get(`${pfx}.in_proj_qkv.weight`)!, BS, convDim, hs, this);
     aBuf.linear(this.ws.normed, this.weights.get(`${pfx}.in_proj_a.weight`)!, BS, linHeads, hs, this);
@@ -557,16 +632,16 @@ export class Qwen35Model implements OpContext {
     const recurrentState = this.gdnState.recurrentState[layerIdx];
     const kernelSize = cfg.linearConvKernelDim;
 
-    const convOut = Tensor.alloc(glm, [convDim, S], "BF16");
+    const convOut = this.ws.gdnPrefillConvOut;
     glm.causalConv1d(convOut.data, convState.data, qkvBuf.data, this.weights.get(`${pfx}.conv1d.weight`)!.data, convDim, S, kernelSize);
 
-    const qBuf = Tensor.alloc(glm, [S * linHeads * linKDim], "BF16");
-    const kBuf = Tensor.alloc(glm, [S * linHeads * linKDim], "BF16");
-    const vBuf = Tensor.alloc(glm, [S * linHeads * linVDim], "BF16");
+    const qBuf = this.ws.gdnPrefillQBuf;
+    const kBuf = this.ws.gdnPrefillKBuf;
+    const vBuf = this.ws.gdnPrefillVBuf;
 
     qBuf.qkvSplit(kBuf, vBuf, convOut, S, linHeads, linKDim, linVDim);
 
-    const gdnOut = Tensor.alloc(glm, [S * linHeads, linVDim], "BF16");
+    const gdnOut = this.ws.gdnPrefillOut;
 
     glm.gdnPrefill(
       gdnOut.data, recurrentState.data,
@@ -577,7 +652,7 @@ export class Qwen35Model implements OpContext {
       S, linHeads, linKDim, linVDim,
     );
 
-    const gatedOut = Tensor.alloc(glm, [S * linHeads, linVDim], "BF16");
+    const gatedOut = this.ws.gdnPrefillGatedOut;
     gatedOut.rmsnormGated(gdnOut, zBuf, this.weights.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, S * linHeads);
 
     this.ws.oProjBuf.linear(gatedOut, this.weights.get(`${pfx}.out_proj.weight`)!, BS, hs, zDim, this);
@@ -586,10 +661,6 @@ export class Qwen35Model implements OpContext {
     this.ws.normed.rmsnorm(this.ws.hiddenB, this.weights.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
     this.mlp(`layers.${layerIdx}`, BS);
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
-
-    qkvLinear.free(); qkvBuf.free(); aBuf.free(); bBuf.free(); zBuf.free();
-    convOut.free(); qBuf.free(); kBuf.free(); vBuf.free();
-    gdnOut.free(); gatedOut.free();
   }
 
   private gdnLayerDecode(layerIdx: number): void {
@@ -606,10 +677,10 @@ export class Qwen35Model implements OpContext {
 
     this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`layers.${layerIdx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
-    const qkvBuf = Tensor.alloc(glm, [convDim], "BF16");
-    const aBuf = Tensor.alloc(glm, [linHeads], "BF16");
-    const bBuf = Tensor.alloc(glm, [linHeads], "BF16");
-    const zBuf = Tensor.alloc(glm, [1, zDim], "BF16");
+    const qkvBuf = this.ws.gdnQkvBuf;
+    const aBuf = this.ws.gdnABuf;
+    const bBuf = this.ws.gdnBBuf;
+    const zBuf = this.ws.gdnZBuf;
 
     qkvBuf.linear(this.ws.normed, this.weights.get(`${pfx}.in_proj_qkv.weight`)!, BS, convDim, hs, this);
     aBuf.linear(this.ws.normed, this.weights.get(`${pfx}.in_proj_a.weight`)!, BS, linHeads, hs, this);
@@ -622,9 +693,9 @@ export class Qwen35Model implements OpContext {
 
     glm.causalConv1dUpdate(qkvBuf.data, convState.data, qkvBuf.data, this.weights.get(`${pfx}.conv1d.weight`)!.data, convDim, kernelSize);
 
-    const qBuf = Tensor.alloc(glm, [linHeads, linKDim], "BF16");
-    const kBuf = Tensor.alloc(glm, [linHeads, linKDim], "BF16");
-    const vBuf = Tensor.alloc(glm, [linHeads, linVDim], "BF16");
+    const qBuf = this.ws.gdnQBuf;
+    const kBuf = this.ws.gdnKBuf;
+    const vBuf = this.ws.gdnVBuf;
 
     const keyDim = linHeads * linKDim;
     const valueDim = linHeads * linVDim;
@@ -632,7 +703,7 @@ export class Qwen35Model implements OpContext {
     glm.memcpy(kBuf.data, qkvBuf.data + keyDim * BF16, keyDim * BF16);
     glm.memcpy(vBuf.data, qkvBuf.data + keyDim * 2 * BF16, valueDim * BF16);
 
-    const gdnOut = Tensor.alloc(glm, [linHeads, linVDim], "BF16");
+    const gdnOut = this.ws.gdnOut;
 
     glm.gdnRecurrentStep(
       gdnOut.data, recurrentState.data,
@@ -643,7 +714,7 @@ export class Qwen35Model implements OpContext {
       linHeads, linKDim, linVDim,
     );
 
-    const gatedOut = Tensor.alloc(glm, [linHeads, linVDim], "BF16");
+    const gatedOut = this.ws.gdnGatedOut;
     gatedOut.rmsnormGated(gdnOut, zBuf, this.weights.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, linHeads);
 
     this.ws.oProjBuf.linear(gatedOut, this.weights.get(`${pfx}.out_proj.weight`)!, BS, hs, zDim, this);
@@ -652,10 +723,6 @@ export class Qwen35Model implements OpContext {
     this.ws.normed.rmsnorm(this.ws.hiddenB, this.weights.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
     this.mlp(`layers.${layerIdx}`, BS);
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
-
-    qkvBuf.free(); aBuf.free(); bBuf.free(); zBuf.free();
-    qBuf.free(); kBuf.free(); vBuf.free();
-    gdnOut.free(); gatedOut.free();
   }
 
   private fullAttnLayerPrefillFlash(layerIdx: number, B: number, S: number, cache: FlatKVCache): void {
@@ -673,33 +740,33 @@ export class Qwen35Model implements OpContext {
 
     this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`layers.${layerIdx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
-    const qBuf = Tensor.alloc(glm, [BS, qTotalDim * 2], "BF16");
-    const qOnly = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
-    const kBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
-    const vBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
-    const gateBuf = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
+    const qBuf = this.ws.attnQBuf;
+    const qOnly = this.ws.attnQOnly;
+    const kBuf = this.ws.attnKBuf;
+    const vBuf = this.ws.attnVBuf;
+    const gateBuf = this.ws.attnGateBuf;
 
     qBuf.linear(this.ws.normed, this.weights.get(`${pfx}.q_proj.weight`)!, BS, qTotalDim * 2, hs, this);
     glm.interleavedSplit(qOnly.data, gateBuf.data, qBuf.data, BS, nHeads, hd);
     kBuf.linear(this.ws.normed, this.weights.get(`${pfx}.k_proj.weight`)!, BS, nKv * hd, hs, this);
     vBuf.linear(this.ws.normed, this.weights.get(`${pfx}.v_proj.weight`)!, BS, nKv * hd, hs, this);
 
-    const qNormed = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
-    const kNormed = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
+    const qNormed = this.ws.attnQNormed;
+    const kNormed = this.ws.attnKNormed;
     qNormed.rmsnorm(qOnly, this.weights.get(`${pfx}.q_norm.weight`)!, cfg.rmsNormEps, hd, BS * nHeads);
     kNormed.rmsnorm(kBuf, this.weights.get(`${pfx}.k_norm.weight`)!, cfg.rmsNormEps, hd, BS * nKv);
 
-    const qT = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
-    const kT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
-    const vT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
+    const qT = this.ws.attnQT;
+    const kT = this.ws.attnKT;
+    const vT = this.ws.attnVT;
 
     qT.transpose4d(qNormed, B, S, nHeads, hd, 0, 2, 1, 3);
     kT.transpose4d(kNormed, B, S, nKv, hd, 0, 2, 1, 3);
     vT.transpose4d(vBuf, B, S, nKv, hd, 0, 2, 1, 3);
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    const qRope = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
-    const kRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
+    const qRope = this.ws.attnQRope;
+    const kRope = this.ws.attnKRope;
 
     qRope.applyRotaryPosEmbPartial(qT, this.ws.cos, this.ws.sin, ropeDim, hd, nHeads, S, B, 1);
     kRope.applyRotaryPosEmbPartial(kT, this.ws.cos, this.ws.sin, ropeDim, hd, nKv, S, B, 1);
@@ -724,10 +791,9 @@ export class Qwen35Model implements OpContext {
     );
 
     if (cfg.attnOutputGate) {
-      const sigBuf = Tensor.alloc(glm, [BS * nHeads * hd], "BF16");
+      const sigBuf = this.ws.attnSigBuf;
       sigBuf.sigmoid(gateBuf, BS * nHeads * hd);
       this.ws.flashOut.mul(this.ws.flashOut, sigBuf, BS * nHeads * hd);
-      sigBuf.free();
     }
 
     this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.o_proj.weight`)!, BS, hs, nHeads * hd, this);
@@ -736,11 +802,6 @@ export class Qwen35Model implements OpContext {
     this.ws.normed.rmsnorm(this.ws.hiddenB, this.weights.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
     this.mlp(`layers.${layerIdx}`, BS);
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
-
-    qBuf.free(); qOnly.free(); kBuf.free(); vBuf.free(); gateBuf.free();
-    qNormed.free(); kNormed.free();
-    qT.free(); kT.free(); vT.free();
-    qRope.free(); kRope.free();
   }
 
   private fullAttnLayerDecodeFlash(layerIdx: number, cachedLen: number, cache: FlatKVCache): void {
@@ -760,33 +821,33 @@ export class Qwen35Model implements OpContext {
     this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`layers.${layerIdx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
     const qTotalDim = nHeads * hd;
-    const qBuf = Tensor.alloc(glm, [BS, qTotalDim * 2], "BF16");
-    const qOnly = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
-    const kBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
-    const vBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
-    const gateBuf = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
+    const qBuf = this.ws.attnQBuf;
+    const qOnly = this.ws.attnQOnly;
+    const kBuf = this.ws.attnKBuf;
+    const vBuf = this.ws.attnVBuf;
+    const gateBuf = this.ws.attnGateBuf;
 
     qBuf.linear(this.ws.normed, this.weights.get(`${pfx}.q_proj.weight`)!, BS, qTotalDim * 2, hs, this);
     glm.interleavedSplit(qOnly.data, gateBuf.data, qBuf.data, BS, nHeads, hd);
     kBuf.linear(this.ws.normed, this.weights.get(`${pfx}.k_proj.weight`)!, BS, nKv * hd, hs, this);
     vBuf.linear(this.ws.normed, this.weights.get(`${pfx}.v_proj.weight`)!, BS, nKv * hd, hs, this);
 
-    const qNormed = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
-    const kNormed = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
+    const qNormed = this.ws.attnQNormed;
+    const kNormed = this.ws.attnKNormed;
     qNormed.rmsnorm(qOnly, this.weights.get(`${pfx}.q_norm.weight`)!, cfg.rmsNormEps, hd, BS * nHeads);
     kNormed.rmsnorm(kBuf, this.weights.get(`${pfx}.k_norm.weight`)!, cfg.rmsNormEps, hd, BS * nKv);
 
-    const qT = Tensor.alloc(glm, [1, nHeads, 1, hd], "BF16");
-    const kT = Tensor.alloc(glm, [1, nKv, 1, hd], "BF16");
-    const vT = Tensor.alloc(glm, [1, nKv, 1, hd], "BF16");
+    const qT = this.ws.attnQT;
+    const kT = this.ws.attnKT;
+    const vT = this.ws.attnVT;
 
     qT.transpose4d(qNormed, BS, S, nHeads, hd, 0, 2, 1, 3);
     kT.transpose4d(kNormed, BS, S, nKv, hd, 0, 2, 1, 3);
     vT.transpose4d(vBuf, BS, S, nKv, hd, 0, 2, 1, 3);
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    const qRope = Tensor.alloc(glm, [BS, nHeads, S, hd], "BF16");
-    const kRope = Tensor.alloc(glm, [BS, nKv, S, hd], "BF16");
+    const qRope = this.ws.attnQRope;
+    const kRope = this.ws.attnKRope;
 
     qRope.applyRotaryPosEmbPartial(qT, this.ws.cos, this.ws.sin, ropeDim, hd, nHeads, S, BS, 1);
     kRope.applyRotaryPosEmbPartial(kT, this.ws.cos, this.ws.sin, ropeDim, hd, nKv, S, BS, 1);
@@ -810,10 +871,9 @@ export class Qwen35Model implements OpContext {
     );
 
     if (cfg.attnOutputGate) {
-      const sigBuf = Tensor.alloc(glm, [BS * nHeads * hd], "BF16");
+      const sigBuf = this.ws.attnSigBuf;
       sigBuf.sigmoid(gateBuf, BS * nHeads * hd);
       this.ws.flashOut.mul(this.ws.flashOut, sigBuf, BS * nHeads * hd);
-      sigBuf.free();
     }
 
     this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.o_proj.weight`)!, BS, hs, nHeads * hd, this);
@@ -822,11 +882,6 @@ export class Qwen35Model implements OpContext {
     this.ws.normed.rmsnorm(this.ws.hiddenB, this.weights.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
     this.mlp(`layers.${layerIdx}`, BS);
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
-
-    qBuf.free(); qOnly.free(); kBuf.free(); vBuf.free(); gateBuf.free();
-    qNormed.free(); kNormed.free();
-    qT.free(); kT.free(); vT.free();
-    qRope.free(); kRope.free();
   }
 
   prefill(inputIds: number[][], cache: FlatKVCache): number {
