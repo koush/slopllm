@@ -10,6 +10,41 @@
 #define CUBLAS(ctx) (*reinterpret_cast<cublasHandle_t*>(&(ctx)->cublas_handle))
 
 // ---------------------------------------------------------------------------
+// Device helpers: tree reduction
+// ---------------------------------------------------------------------------
+
+__device__ void block_reduce_sum(float* sdata, int tid) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+}
+
+__device__ void block_reduce_max_idx(float* s_vals, int* s_idxs, int tid) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_vals[tid + s] > s_vals[tid] ||
+                (s_vals[tid + s] == s_vals[tid] && s_idxs[tid + s] < s_idxs[tid])) {
+                s_vals[tid] = s_vals[tid + s];
+                s_idxs[tid] = s_idxs[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__device__ void block_reduce_max(float* sdata, int tid) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+}
+
+__device__ float sigmoid_f(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// ---------------------------------------------------------------------------
 // Context management
 // ---------------------------------------------------------------------------
 
@@ -132,11 +167,7 @@ __global__ void rmsnorm_kernel(
 
     sdata[threadIdx.x] = sum;
     __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
+    block_reduce_sum(sdata, threadIdx.x);
 
     float inv_rms = rsqrtf(sdata[0] / dim + eps);
 
@@ -172,8 +203,7 @@ __global__ void silu_and_mul_kernel(
     if (idx < total) {
         float g = __bfloat162float(gate[idx]);
         float u = __bfloat162float(up[idx]);
-        float sig = 1.0f / (1.0f + expf(-g));
-        out[idx] = __float2bfloat16(g * sig * u);
+        out[idx] = __float2bfloat16(g * sigmoid_f(g) * u);
     }
 }
 
@@ -226,30 +256,9 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
 // Embedding lookup kernel
 // ---------------------------------------------------------------------------
 
-__global__ void embedding_kernel(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* table,
-    const int* ids,
-    int hidden,
-    int seq_len
-) {
-    int token_idx = blockIdx.x;
-    if (token_idx >= seq_len) return;
-    int id = ids[token_idx];
-    const __nv_bfloat16* src = table + id * hidden;
-    __nv_bfloat16* dst = out + token_idx * hidden;
-    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-        dst[i] = src[i];
-    }
-}
-
 void glm_embedding(GlmCtx* ctx, void* out, const void* table,
                    const int* ids, int hidden, int seq_len) {
-    cudaSetDevice(ctx->device_id);
-    int block_size = 256;
-    embedding_kernel<<<seq_len, block_size, 0, ctx->stream>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)table,
-        ids, hidden, seq_len);
+    glm_index_select(ctx, out, table, ids, hidden, seq_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -276,10 +285,7 @@ __global__ void layernorm_kernel(
     }
     sdata[threadIdx.x] = mean;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
+    block_reduce_sum(sdata, threadIdx.x);
     mean = sdata[0] / dim;
 
     float var = 0.0f;
@@ -289,10 +295,7 @@ __global__ void layernorm_kernel(
     }
     sdata[threadIdx.x] = var;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
+    block_reduce_sum(sdata, threadIdx.x);
     float inv_std = rsqrtf(sdata[0] / dim + eps);
 
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
@@ -351,7 +354,7 @@ __global__ void sigmoid_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         float v = __bfloat162float(input[idx]);
-        out[idx] = __float2bfloat16(1.0f / (1.0f + expf(-v)));
+        out[idx] = __float2bfloat16(sigmoid_f(v));
     }
 }
 
@@ -390,10 +393,7 @@ __global__ void softmax_kernel(
     }
     sdata[threadIdx.x] = max_val;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
-        __syncthreads();
-    }
+    block_reduce_max(sdata, threadIdx.x);
     max_val = sdata[0];
 
     float sum = 0.0f;
@@ -404,10 +404,7 @@ __global__ void softmax_kernel(
     }
     sdata[threadIdx.x] = sum;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
+    block_reduce_sum(sdata, threadIdx.x);
     float inv_sum = 1.0f / sdata[0];
 
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
@@ -767,15 +764,9 @@ void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
                                const void* cos, const void* sin,
                                int rope_dim, int n_heads, int seq_len,
                                int batch, int unsqueeze_dim) {
-    cudaSetDevice(ctx->device_id);
-    int head_dim = rope_dim;
-    int total = batch * n_heads * seq_len * rope_dim;
-    int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
-    apply_rotary_pos_emb_kernel<<<grid, block_size, 0, ctx->stream>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
-        (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
-        rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim);
+    glm_apply_rotary_pos_emb_partial(ctx, out, x, cos, sin,
+                                      rope_dim, rope_dim, n_heads, seq_len,
+                                      batch, unsqueeze_dim);
 }
 
 void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
@@ -832,7 +823,7 @@ __global__ void topk_kernel(
         float my_max = -INFINITY;
         int my_idx = -1;
         for (int i = tid; i < dim; i += blockDim.x) {
-            if (s_vals[i] >= my_max) {
+            if (s_vals[i] > my_max || (s_vals[i] == my_max && i < my_idx)) {
                 my_max = s_vals[i];
                 my_idx = i;
             }
@@ -841,15 +832,7 @@ __global__ void topk_kernel(
         s_reduce_idx[tid] = my_idx;
         __syncthreads();
 
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (tid < s) {
-                if (s_reduce[tid + s] > s_reduce[tid]) {
-                    s_reduce[tid] = s_reduce[tid + s];
-                    s_reduce_idx[tid] = s_reduce_idx[tid + s];
-                }
-            }
-            __syncthreads();
-        }
+        block_reduce_max_idx(s_reduce, s_reduce_idx, tid);
 
         if (tid == 0) {
             int best = s_reduce_idx[0];
@@ -1139,10 +1122,7 @@ __global__ void reduce_sum_kernel(
     extern __shared__ float sdata[];
     sdata[threadIdx.x] = sum;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
+    block_reduce_sum(sdata, threadIdx.x);
     if (threadIdx.x == 0) {
         out[row] = __float2bfloat16(sdata[0]);
     }
@@ -1212,7 +1192,7 @@ __global__ void argmax_kernel(int* out_indices, const __nv_bfloat16* input,
     int my_idx = -1;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float val = __bfloat162float(row_in[i]);
-        if (val > my_max) {
+        if (val > my_max || (val == my_max && i < my_idx)) {
             my_max = val;
             my_idx = i;
         }
@@ -1221,15 +1201,7 @@ __global__ void argmax_kernel(int* out_indices, const __nv_bfloat16* input,
     s_idxs[threadIdx.x] = my_idx;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            if (s_vals[threadIdx.x + s] > s_vals[threadIdx.x]) {
-                s_vals[threadIdx.x] = s_vals[threadIdx.x + s];
-                s_idxs[threadIdx.x] = s_idxs[threadIdx.x + s];
-            }
-        }
-        __syncthreads();
-    }
+    block_reduce_max_idx(s_vals, s_idxs, threadIdx.x);
 
     if (threadIdx.x == 0) {
         out_indices[row] = s_idxs[0];

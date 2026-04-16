@@ -70,6 +70,29 @@ def test_topk_moe_routing(glm, device):
             f"Top-k indices overlap too small at batch {b}: {overlap}/{top_k} (cuda={cuda_set}, ref={ref_set})"
 
 
+def test_topk_tiebreaking(glm, device):
+    batch, dim, k = 1, 8, 4
+    x_vals = [3.0, 1.0, 3.0, 2.0, 3.0, 0.5, 2.0, 0.25]
+    x = torch.tensor([x_vals], dtype=torch.bfloat16, device=device)
+    out_vals = torch.empty(batch, k, dtype=torch.bfloat16, device=device)
+    out_idxs = torch.empty(batch, k, dtype=torch.int32, device=device)
+
+    glm.topk(out_vals, out_idxs, x, k, dim, batch)
+
+    ref_vals, ref_idxs = torch.topk(x.float(), k, dim=-1, sorted=False)
+    ref_vals = ref_vals.to(torch.bfloat16)
+
+    cuda_set = set(out_idxs[0].cpu().tolist())
+    ref_set = set(ref_idxs[0].cpu().tolist())
+    assert cuda_set == ref_set, f"Index set mismatch: cuda={cuda_set}, ref={ref_set}"
+
+    for tied_val in [3.0, 2.0]:
+        tied_cuda_idxs = [out_idxs[0, i].item() for i in range(k)
+                          if abs(out_vals[0, i].item() - tied_val) < 0.01]
+        assert tied_cuda_idxs == sorted(tied_cuda_idxs), \
+            f"Tied value {tied_val}: indices should be ascending, got {tied_cuda_idxs}"
+
+
 def test_topk_k_equals_dim(glm, device):
     batch, dim = 2, 8
     x = torch.randn(batch, dim, dtype=torch.bfloat16, device=device)
