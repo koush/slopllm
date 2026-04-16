@@ -1,11 +1,20 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, FLASH_TMP_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, F32, SAMPLING_MAX_TOPK, FLASH_TMP_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { FlatKVCache } from "./flat_kv";
 import { Tensor, OpContext } from "./tensor";
+
+export interface SamplingParams {
+  temperature: number;
+  topP: number;
+  topK: number;
+  repetitionPenalty: number;
+  presencePenalty: number;
+  repetitionPenaltyWindow: number;
+}
 
 export interface Qwen3Config {
   hiddenSize: number;
@@ -74,6 +83,11 @@ class Qwen3Workspace {
   inputIdsBuf: Tensor;
   qoIndptrD: Tensor;
   prefillSlotMapping: Tensor;
+  sampleOutToken: Tensor;
+  sampleTopkVals: Tensor;
+  sampleTopkIdxs: Tensor;
+  sampleWorkspace: Tensor;
+  samplePenaltyTokens: Tensor;
   tensors = new Map<string, Tensor>();
 
   constructor(glm: GlmOps, B: number, S: number, cfg: Qwen3Config) {
@@ -116,6 +130,12 @@ class Qwen3Workspace {
     this.inputIdsBuf = Tensor.alloc(glm, [B * S], "I32");
     this.qoIndptrD = Tensor.alloc(glm, [B + 1], "I32");
     this.prefillSlotMapping = Tensor.alloc(glm, [B * S], "I32");
+
+    this.sampleOutToken = Tensor.alloc(glm, [1], "I32");
+    this.sampleTopkVals = Tensor.alloc(glm, [SAMPLING_MAX_TOPK * 256], "F32");
+    this.sampleTopkIdxs = Tensor.alloc(glm, [SAMPLING_MAX_TOPK * 256], "I32");
+    this.sampleWorkspace = Tensor.alloc(glm, [vs], "F32");
+    this.samplePenaltyTokens = Tensor.alloc(glm, [1024], "I32");
 
     for (const key of Object.keys(this) as (keyof this)[]) {
       const value = this[key];
@@ -231,6 +251,58 @@ export class Qwen3Model implements OpContext {
     return buf.readInt32LE(0);
   }
 
+  private sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number {
+    const vs = this.cfg.vocabSize;
+    const glm = this.glm;
+
+    const hasRepPenalty = params.repetitionPenalty !== 1.0;
+    const hasPresPenalty = params.presencePenalty !== 0;
+
+    let numPenaltyTokens = 0;
+    if (hasRepPenalty || hasPresPenalty) {
+      const seen = new Set<number>();
+      const start = Math.max(0, tokenHistory.length - params.repetitionPenaltyWindow);
+      for (let i = start; i < tokenHistory.length; i++) seen.add(tokenHistory[i]);
+      const penaltyBuf = Buffer.alloc(seen.size * I32);
+      let offset = 0;
+      for (const tid of seen) {
+        if (tid < vs) {
+          penaltyBuf.writeInt32LE(tid, offset);
+          offset += I32;
+          numPenaltyTokens++;
+        }
+      }
+      if (numPenaltyTokens > 0) {
+        this.ws.samplePenaltyTokens.h2d(penaltyBuf, numPenaltyTokens * I32);
+      }
+    }
+
+    const randomVal = Math.random();
+    const topK = params.topK > 0 ? params.topK : 0;
+    const temperature = params.temperature > 0 ? params.temperature : 0;
+
+    glm.sample(
+      this.ws.sampleOutToken.data,
+      this.ws.sampleTopkVals.data,
+      this.ws.sampleTopkIdxs.data,
+      this.ws.sampleWorkspace.data,
+      this.ws.logitsBuf.data,
+      this.ws.samplePenaltyTokens.data,
+      vs,
+      numPenaltyTokens,
+      temperature,
+      params.repetitionPenalty,
+      params.presencePenalty,
+      topK,
+      params.topP,
+      randomVal,
+    );
+
+    const buf = Buffer.alloc(I32);
+    this.ws.sampleOutToken.d2h(buf);
+    return buf.readInt32LE(0);
+  }
+
   private readArgmaxBatch(batchSize: number): number[] {
     const vs = this.cfg.vocabSize;
     this.ws.argmaxIdx.argmax(this.ws.logitsBuf, vs, batchSize);
@@ -325,7 +397,7 @@ export class Qwen3Model implements OpContext {
     return [...this.streamTokens(inputIds, cache, maxNewTokens, eosTokenIds)];
   }
 
-  *streamTokens(inputIds: number[][], cache: FlatKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): Generator<number> {
+  *streamTokens(inputIds: number[][], cache: FlatKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643]), sampling?: SamplingParams): Generator<number> {
     const vs = this.cfg.vocabSize;
     if (inputIds.length !== 1) throw new Error("streamTokens only supports batch=1");
 
@@ -333,10 +405,18 @@ export class Qwen3Model implements OpContext {
     let nextToken = this.prefill(inputIds, cache);
     yield nextToken;
 
+    const tokenHistory = [...inputIds[0], nextToken];
+
     for (let i = 0; i < maxNewTokens - 1; i++) {
       if (eosTokenIds.has(nextToken)) break;
       this.decodeToken(nextToken, cache);
-      nextToken = this.readArgmax(this.ws.logitsBuf, vs);
+
+      if (sampling && (sampling.temperature > 0 || sampling.repetitionPenalty !== 1.0 || sampling.presencePenalty !== 0 || sampling.topK > 0 || sampling.topP < 1.0)) {
+        nextToken = this.sampleTokenGPU(sampling, tokenHistory);
+      } else {
+        nextToken = this.readArgmax(this.ws.logitsBuf, vs);
+      }
+      tokenHistory.push(nextToken);
       yield nextToken;
     }
   }

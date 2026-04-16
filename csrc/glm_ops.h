@@ -297,6 +297,19 @@ void glm_interleaved_split(GlmCtx* ctx, void* q_out, void* gate_out,
                             const void* qg_in,
                             int batch_seq, int num_heads, int head_dim);
 
+// GPU sampling: temperature, repetition/presence penalty, top-K, softmax, top-P, multinomial
+// out_token: [1] int32 - sampled token ID
+// topk_vals: [SAMPLING_MAX_TOPK] float32 - workspace for top-K values
+// topk_idxs: [SAMPLING_MAX_TOPK] int32 - workspace for top-K indices
+// workspace: [vocab_size] float32 - workspace for F32 logits
+// logits: [vocab_size] bfloat16 - input logits
+// penalty_tokens: [num_penalty_tokens] int32 - token IDs for penalty
+void glm_sample(GlmCtx* ctx, int* out_token, float* topk_vals, int* topk_idxs,
+                float* workspace, const void* logits, const int* penalty_tokens,
+                int vocab_size, int num_penalty_tokens,
+                float temperature, float repetition_penalty, float presence_penalty,
+                int top_k, float top_p, float random_val);
+
 #ifdef __cplusplus
 }
 #endif

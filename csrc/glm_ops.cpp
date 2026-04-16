@@ -1296,6 +1296,40 @@ static Napi::Value QkvSplit(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value Sample(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 14) {
+        Napi::TypeError::New(env, "Expected (ctx, out_token, topk_vals, topk_idxs, workspace, logits, penalty_tokens, vocab_size, num_penalty_tokens, temperature, repetition_penalty, presence_penalty, top_k, top_p, random_val)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_token_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t topk_vals_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t topk_idxs_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t workspace_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t logits_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t penalty_tokens_ptr = info[6].As<Napi::Number>().Int64Value();
+    int vocab_size = info[7].As<Napi::Number>().Int32Value();
+    int num_penalty_tokens = info[8].As<Napi::Number>().Int32Value();
+    double temperature = info[9].As<Napi::Number>().DoubleValue();
+    double repetition_penalty = info[10].As<Napi::Number>().DoubleValue();
+    double presence_penalty = info[11].As<Napi::Number>().DoubleValue();
+    int top_k = info[12].As<Napi::Number>().Int32Value();
+    double top_p = info[13].As<Napi::Number>().DoubleValue();
+    double random_val = info[14].As<Napi::Number>().DoubleValue();
+    glm_sample(reinterpret_cast<GlmCtx*>(ctx_ptr),
+               reinterpret_cast<int*>(out_token_ptr),
+               reinterpret_cast<float*>(topk_vals_ptr),
+               reinterpret_cast<int*>(topk_idxs_ptr),
+               reinterpret_cast<float*>(workspace_ptr),
+               reinterpret_cast<const void*>(logits_ptr),
+               reinterpret_cast<const int*>(penalty_tokens_ptr),
+               vocab_size, num_penalty_tokens,
+               (float)temperature, (float)repetition_penalty, (float)presence_penalty,
+               top_k, (float)top_p, (float)random_val);
+    return env.Undefined();
+}
+
 static Napi::Value InterleavedSplit(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 7) {
@@ -1384,6 +1418,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "rmsnormGated"), Napi::Function::New(env, RmsnormGated));
     exports.Set(Napi::String::New(env, "qkvSplit"), Napi::Function::New(env, QkvSplit));
     exports.Set(Napi::String::New(env, "interleavedSplit"), Napi::Function::New(env, InterleavedSplit));
+    exports.Set(Napi::String::New(env, "sample"), Napi::Function::New(env, Sample));
     return exports;
 }
 

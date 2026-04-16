@@ -24,7 +24,7 @@
       "actions": [
         {
           "action_name": "build_libglm",
-          "inputs": [ "csrc/glm_ops.cu", "csrc/glm_flash.cu", "csrc/glm_fp8.cu", "csrc/glm_gdn.cu" ],
+          "inputs": [ "csrc/glm_ops.cu", "csrc/glm_flash.cu", "csrc/glm_fp8.cu", "csrc/glm_gdn.cu", "csrc/glm_sampling.cu" ],
           "outputs": [ "<(PRODUCT_DIR)/libglm_ops.so" ],
           "action": [
             "nvcc", "-O2", "-Xcompiler", "-fPIC", "-shared",

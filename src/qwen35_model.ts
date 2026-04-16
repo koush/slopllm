@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32 } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, F32, SAMPLING_MAX_TOPK } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
@@ -137,6 +137,11 @@ class Qwen35Workspace {
   attnQRope: Tensor;
   attnKRope: Tensor;
   attnSigBuf: Tensor;
+  sampleOutToken: Tensor;
+  sampleTopkVals: Tensor;
+  sampleTopkIdxs: Tensor;
+  sampleWorkspace: Tensor;
+  samplePenaltyTokens: Tensor;
   tensors = new Map<string, Tensor>();
 
   constructor(glm: GlmOps, B: number, S: number, cfg: Qwen35Config) {
@@ -209,6 +214,12 @@ class Qwen35Workspace {
     this.attnQRope = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
     this.attnKRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
     this.attnSigBuf = Tensor.alloc(glm, [BS * nHeads * hd], "BF16");
+
+    this.sampleOutToken = Tensor.alloc(glm, [1], "I32");
+    this.sampleTopkVals = Tensor.alloc(glm, [SAMPLING_MAX_TOPK * 256], "F32");
+    this.sampleTopkIdxs = Tensor.alloc(glm, [SAMPLING_MAX_TOPK * 256], "I32");
+    this.sampleWorkspace = Tensor.alloc(glm, [vs], "F32");
+    this.samplePenaltyTokens = Tensor.alloc(glm, [1024], "I32");
 
     for (const key of Object.keys(this) as (keyof this)[]) {
       const value = this[key];
@@ -575,6 +586,58 @@ export class Qwen35Model implements OpContext {
       if (r <= cumSum) return i;
     }
     return vs - 1;
+  }
+
+  private sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number {
+    const vs = this.cfg.vocabSize;
+    const glm = this.glm;
+
+    const hasRepPenalty = params.repetitionPenalty !== 1.0;
+    const hasPresPenalty = params.presencePenalty !== 0;
+
+    let numPenaltyTokens = 0;
+    if (hasRepPenalty || hasPresPenalty) {
+      const seen = new Set<number>();
+      const start = Math.max(0, tokenHistory.length - params.repetitionPenaltyWindow);
+      for (let i = start; i < tokenHistory.length; i++) seen.add(tokenHistory[i]);
+      const penaltyBuf = Buffer.alloc(seen.size * I32);
+      let offset = 0;
+      for (const tid of seen) {
+        if (tid < vs) {
+          penaltyBuf.writeInt32LE(tid, offset);
+          offset += I32;
+          numPenaltyTokens++;
+        }
+      }
+      if (numPenaltyTokens > 0) {
+        this.ws.samplePenaltyTokens.h2d(penaltyBuf, numPenaltyTokens * I32);
+      }
+    }
+
+    const randomVal = Math.random();
+    const topK = params.topK > 0 ? params.topK : 0;
+    const temperature = params.temperature > 0 ? params.temperature : 0;
+
+    glm.sample(
+      this.ws.sampleOutToken.data,
+      this.ws.sampleTopkVals.data,
+      this.ws.sampleTopkIdxs.data,
+      this.ws.sampleWorkspace.data,
+      this.ws.logitsBuf.data,
+      this.ws.samplePenaltyTokens.data,
+      vs,
+      numPenaltyTokens,
+      temperature,
+      params.repetitionPenalty,
+      params.presencePenalty,
+      topK,
+      params.topP,
+      randomVal,
+    );
+
+    const buf = Buffer.alloc(I32);
+    this.ws.sampleOutToken.d2h(buf);
+    return buf.readInt32LE(0);
   }
 
   private finalNormAndLogits(count: number, src?: Tensor): void {
@@ -988,8 +1051,7 @@ export class Qwen35Model implements OpContext {
       cache.cachePos = cachedLen + 1;
 
       if (sampling && (sampling.temperature > 0 || sampling.repetitionPenalty !== 1.0 || sampling.presencePenalty !== 0 || sampling.topK > 0 || sampling.topP < 1.0)) {
-        const logits = this.readLogits();
-        nextToken = this.sampleToken(logits, sampling, tokenHistory);
+        nextToken = this.sampleTokenGPU(sampling, tokenHistory);
       } else {
         nextToken = this.readArgmax(this.ws.logitsBuf, vs);
       }

@@ -67,6 +67,7 @@ interface NativeAddon {
   rmsnormGated(ctx: number, output: number, input: number, gate: number, weight: number, eps: number, dim: number, batch: number): void;
   qkvSplit(ctx: number, qOut: number, kOut: number, vOut: number, qkvIn: number, seqLen: number, numHeads: number, dK: number, dV: number): void;
   interleavedSplit(ctx: number, qOut: number, gateOut: number, qgIn: number, batchSeq: number, numHeads: number, headDim: number): void;
+  sample(ctx: number, outToken: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, vocabSize: number, numPenaltyTokens: number, temperature: number, repetitionPenalty: number, presencePenalty: number, topK: number, topP: number, randomVal: number): void;
 }
 
 export class GlmOps {
@@ -313,6 +314,10 @@ export class GlmOps {
   interleavedSplit(qOut: number, gateOut: number, qgIn: number, batchSeq: number, numHeads: number, headDim: number): void {
     this.native.interleavedSplit(this.ctx, qOut, gateOut, qgIn, batchSeq, numHeads, headDim);
   }
+
+  sample(outToken: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, vocabSize: number, numPenaltyTokens: number, temperature: number, repetitionPenalty: number, presencePenalty: number, topK: number, topP: number, randomVal: number): void {
+    this.native.sample(this.ctx, outToken, topkVals, topkIdxs, workspace, logits, penaltyTokens, vocabSize, numPenaltyTokens, temperature, repetitionPenalty, presencePenalty, topK, topP, randomVal);
+  }
 }
 
 export function f32ToBf16Bytes(arr: Float32Array): Buffer {
@@ -335,6 +340,8 @@ export function bf16BytesToF32(buf: Buffer): Float32Array {
 
 export const BF16 = 2;
 export const I32 = 4;
+export const F32 = 4;
+export const SAMPLING_MAX_TOPK = 256;
 export const FLASH_TMP_SIZE = 32 * 1024 * 1024;
 export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
