@@ -701,9 +701,6 @@ export class Qwen35Model implements OpContext {
     const qRope = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
     const kRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
 
-    glm.memcpy(qRope.data, qT.data, B * nHeads * S * hd * BF16);
-    glm.memcpy(kRope.data, kT.data, B * nKv * S * hd * BF16);
-
     qRope.applyRotaryPosEmbPartial(qT, this.ws.cos, this.ws.sin, ropeDim, hd, nHeads, S, B, 1);
     kRope.applyRotaryPosEmbPartial(kT, this.ws.cos, this.ws.sin, ropeDim, hd, nKv, S, B, 1);
 
@@ -790,9 +787,6 @@ export class Qwen35Model implements OpContext {
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
     const qRope = Tensor.alloc(glm, [BS, nHeads, S, hd], "BF16");
     const kRope = Tensor.alloc(glm, [BS, nKv, S, hd], "BF16");
-
-    glm.memcpy(qRope.data, qT.data, BS * nHeads * S * hd * BF16);
-    glm.memcpy(kRope.data, kT.data, BS * nKv * S * hd * BF16);
 
     qRope.applyRotaryPosEmbPartial(qT, this.ws.cos, this.ws.sin, ropeDim, hd, nHeads, S, BS, 1);
     kRope.applyRotaryPosEmbPartial(kT, this.ws.cos, this.ws.sin, ropeDim, hd, nKv, S, BS, 1);

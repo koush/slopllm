@@ -531,8 +531,6 @@ class Qwen35Model:
                           B, S, n_kv, hd, 0, 2, 1, 3)
 
         rope_dim = int(hd * cfg.partial_rotary_factor)
-        glm.memcpy(ws["q_rope"], ws["q_t"], B * n_heads * S * hd * BF16)
-        glm.memcpy(ws["k_rope"], ws["k_t"], B * n_kv * S * hd * BF16)
         glm.apply_rotary_pos_emb_partial(ws["q_rope"], ws["q_t"],
                                   ws["cos"], ws["sin"],
                                   rope_dim, hd, n_heads, S, B, 1)
@@ -630,8 +628,6 @@ class Qwen35Model:
                           BS, S, n_kv, hd, 0, 2, 1, 3)
 
         rope_dim = int(hd * cfg.partial_rotary_factor)
-        glm.memcpy(ws["q_rope"], ws["q_t"], BS * n_heads * S * hd * BF16)
-        glm.memcpy(ws["k_rope"], ws["k_t"], BS * n_kv * S * hd * BF16)
         glm.apply_rotary_pos_emb_partial(ws["q_rope"], ws["q_t"],
                                   ws["cos"], ws["sin"],
                                   rope_dim, hd, n_heads, S, BS, 1)

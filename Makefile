@@ -1,6 +1,6 @@
 NVCC ?= nvcc
 CUDA_PATH ?= /usr/local/cuda
-NVCC_FLAGS = -O2 -Xcompiler -fPIC -Icsrc -gencode arch=compute_120a,code=sm_120a --expt-relaxed-constexpr
+NVCC_FLAGS = -O2 -std=c++20 -Xcompiler -fPIC -Icsrc -gencode arch=compute_120a,code=sm_120a --expt-relaxed-constexpr --extended-lambda
 FLASHINFER_INC = -Ivendor/flashinfer/include
 LIB_NAME = libglm_ops.so
 

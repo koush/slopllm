@@ -78,6 +78,61 @@ def test_apply_rotary_pos_emb_position_zero(glm, device):
     assert (cos_pos0 == 1.0).all(), "cos(0) should be 1.0"
 
 
+def _ref_apply_rotary_pos_emb_partial(x, cos, sin, rope_dim, unsqueeze_dim=1):
+    x_rot = x[..., :rope_dim]
+    cos_r = cos.unsqueeze(unsqueeze_dim)
+    sin_r = sin.unsqueeze(unsqueeze_dim)
+    x1 = x_rot[..., : rope_dim // 2]
+    x2 = x_rot[..., rope_dim // 2 :]
+    rotated = torch.cat((-x2, x1), dim=-1)
+    out = x.clone()
+    out[..., :rope_dim] = (x_rot.float() * cos_r.float() + rotated.float() * sin_r.float()).to(torch.bfloat16)
+    return out
+
+
+def test_apply_rotary_pos_emb_partial_passthrough(glm, device):
+    batch, n_heads, seq_len, head_dim, rope_dim = 2, 4, 8, 64, 16
+    dim_half = rope_dim // 2
+    cos_emb, sin_emb = _make_rope((batch, seq_len, rope_dim), dim_half, seq_len, batch, device)
+
+    x = torch.randn(batch, n_heads, seq_len, head_dim, dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x)
+
+    x_flat = x.reshape(batch * n_heads, seq_len, head_dim)
+    out_flat = out.reshape(batch * n_heads, seq_len, head_dim)
+
+    glm.apply_rotary_pos_emb_partial(out_flat, x_flat, cos_emb, sin_emb,
+                                       rope_dim, head_dim, n_heads, seq_len, batch, 1)
+
+    ref = _ref_apply_rotary_pos_emb_partial(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), rope_dim, unsqueeze_dim=1)
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)
+
+    nope_dims = out[..., rope_dim:].cpu()
+    ref_nope = x[..., rope_dim:].cpu()
+    assert torch.equal(nope_dims, ref_nope), "Non-RoPE dims should be unchanged"
+
+
+def test_apply_rotary_pos_emb_partial_qwen35_dims(glm, device):
+    batch, n_heads, seq_len = 1, 8, 4
+    head_dim = 256
+    rope_dim = 64
+    dim_half = rope_dim // 2
+    theta = 10_000_000.0
+    cos_emb, sin_emb = _make_rope((batch, seq_len, rope_dim), dim_half, seq_len, batch, device, theta=theta)
+
+    x = torch.randn(batch, n_heads, seq_len, head_dim, dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x)
+
+    x_flat = x.reshape(batch * n_heads, seq_len, head_dim)
+    out_flat = out.reshape(batch * n_heads, seq_len, head_dim)
+
+    glm.apply_rotary_pos_emb_partial(out_flat, x_flat, cos_emb, sin_emb,
+                                       rope_dim, head_dim, n_heads, seq_len, batch, 1)
+
+    ref = _ref_apply_rotary_pos_emb_partial(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), rope_dim, unsqueeze_dim=1)
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)
+
+
 def test_apply_rotary_pos_emb_glm51_dims(glm, device):
     batch, n_heads, seq_len, rope_dim = 1, 128, 16, 64
     dim_half = rope_dim // 2

@@ -45,6 +45,23 @@ __device__ float sigmoid_f(float x) {
 }
 
 // ---------------------------------------------------------------------------
+// BF16 vector I/O helpers
+// ---------------------------------------------------------------------------
+
+__device__ inline void load_bf16x2(const __nv_bfloat16* ptr, float& v0, float& v1) {
+    __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(ptr);
+    v0 = __bfloat162float(v.x);
+    v1 = __bfloat162float(v.y);
+}
+
+__device__ inline void store_bf16x2(__nv_bfloat16* ptr, float v0, float v1) {
+    __nv_bfloat162 v;
+    v.x = __float2bfloat16(v0);
+    v.y = __float2bfloat16(v1);
+    *reinterpret_cast<__nv_bfloat162*>(ptr) = v;
+}
+
+// ---------------------------------------------------------------------------
 // Context management
 // ---------------------------------------------------------------------------
 
@@ -160,8 +177,13 @@ __global__ void rmsnorm_kernel(
     extern __shared__ float sdata[];
 
     float sum = 0.0f;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float val = __bfloat162float(x[i]);
+    for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
+        float v0, v1;
+        load_bf16x2(x + i, v0, v1);
+        sum += v0 * v0 + v1 * v1;
+    }
+    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+        float val = __bfloat162float(x[dim - 1]);
         sum += val * val;
     }
 
@@ -171,10 +193,16 @@ __global__ void rmsnorm_kernel(
 
     float inv_rms = rsqrtf(sdata[0] / dim + eps);
 
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float xi = __bfloat162float(x[i]);
-        float wi = __bfloat162float(weight[i]);
-        o[i] = __float2bfloat16(wi * xi * inv_rms);
+    for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
+        float x0, x1, w0, w1;
+        load_bf16x2(x + i, x0, x1);
+        load_bf16x2(weight + i, w0, w1);
+        store_bf16x2(o + i, w0 * x0 * inv_rms, w1 * x1 * inv_rms);
+    }
+    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+        float xi = __bfloat162float(x[dim - 1]);
+        float wi = __bfloat162float(weight[dim - 1]);
+        o[dim - 1] = __float2bfloat16(wi * xi * inv_rms);
     }
 }
 
@@ -199,8 +227,13 @@ __global__ void silu_and_mul_kernel(
     const __nv_bfloat16* up,
     int total
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total) {
+    int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
+    if (idx + 1 < total) {
+        float g0, g1, u0, u1;
+        load_bf16x2(gate + idx, g0, g1);
+        load_bf16x2(up + idx, u0, u1);
+        store_bf16x2(out + idx, g0 * sigmoid_f(g0) * u0, g1 * sigmoid_f(g1) * u1);
+    } else if (idx < total) {
         float g = __bfloat162float(gate[idx]);
         float u = __bfloat162float(up[idx]);
         out[idx] = __float2bfloat16(g * sigmoid_f(g) * u);
@@ -280,8 +313,13 @@ __global__ void layernorm_kernel(
     extern __shared__ float sdata[];
 
     float mean = 0.0f;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        mean += __bfloat162float(x[i]);
+    for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
+        float v0, v1;
+        load_bf16x2(x + i, v0, v1);
+        mean += v0 + v1;
+    }
+    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+        mean += __bfloat162float(x[dim - 1]);
     }
     sdata[threadIdx.x] = mean;
     __syncthreads();
@@ -289,8 +327,14 @@ __global__ void layernorm_kernel(
     mean = sdata[0] / dim;
 
     float var = 0.0f;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float d = __bfloat162float(x[i]) - mean;
+    for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
+        float v0, v1;
+        load_bf16x2(x + i, v0, v1);
+        float d0 = v0 - mean, d1 = v1 - mean;
+        var += d0 * d0 + d1 * d1;
+    }
+    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+        float d = __bfloat162float(x[dim - 1]) - mean;
         var += d * d;
     }
     sdata[threadIdx.x] = var;
@@ -298,11 +342,20 @@ __global__ void layernorm_kernel(
     block_reduce_sum(sdata, threadIdx.x);
     float inv_std = rsqrtf(sdata[0] / dim + eps);
 
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float xi = __bfloat162float(x[i]);
-        float wi = __bfloat162float(weight[i]);
-        float bi = bias ? __bfloat162float(bias[i]) : 0.0f;
-        o[i] = __float2bfloat16(wi * (xi - mean) * inv_std + bi);
+    for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
+        float x0, x1, w0, w1;
+        load_bf16x2(x + i, x0, x1);
+        load_bf16x2(weight + i, w0, w1);
+        float b0 = bias ? __bfloat162float(bias[i]) : 0.0f;
+        float b1 = bias ? __bfloat162float(bias[i + 1]) : 0.0f;
+        store_bf16x2(o + i, w0 * (x0 - mean) * inv_std + b0,
+                              w1 * (x1 - mean) * inv_std + b1);
+    }
+    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+        float xi = __bfloat162float(x[dim - 1]);
+        float wi = __bfloat162float(weight[dim - 1]);
+        float bi = bias ? __bfloat162float(bias[dim - 1]) : 0.0f;
+        o[dim - 1] = __float2bfloat16(wi * (xi - mean) * inv_std + bi);
     }
 }
 
@@ -319,50 +372,63 @@ void glm_layernorm(GlmCtx* ctx, void* out, const void* input,
 }
 
 // ---------------------------------------------------------------------------
-// ReLU kernel
+// Element-wise unary kernel (templated)
+// F: float -> float
 // ---------------------------------------------------------------------------
 
-__global__ void relu_kernel(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* input,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        float v = __bfloat162float(input[idx]);
-        out[idx] = __float2bfloat16(fmaxf(v, 0.0f));
+template<auto F>
+__global__ void ew_unary_kernel(__nv_bfloat16* out, const __nv_bfloat16* input, int n) {
+    int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
+    if (idx + 1 < n) {
+        float v0, v1;
+        load_bf16x2(input + idx, v0, v1);
+        store_bf16x2(out + idx, F(v0), F(v1));
+    } else if (idx < n) {
+        out[idx] = __float2bfloat16(F(__bfloat162float(input[idx])));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Element-wise binary kernel (templated)
+// F: (float, float) -> float
+// ---------------------------------------------------------------------------
+
+template<auto F>
+__global__ void ew_binary_kernel(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b, int n) {
+    int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
+    if (idx + 1 < n) {
+        float a0, a1, b0, b1;
+        load_bf16x2(a + idx, a0, a1);
+        load_bf16x2(b + idx, b0, b1);
+        store_bf16x2(out + idx, F(a0, b0), F(a1, b1));
+    } else if (idx < n) {
+        out[idx] = __float2bfloat16(F(__bfloat162float(a[idx]), __bfloat162float(b[idx])));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReLU
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ float relu_f(float v) { return fmaxf(v, 0.0f); }
 
 void glm_relu(GlmCtx* ctx, void* out, const void* input, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    relu_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    ew_unary_kernel<relu_f><<<grid, block_size, 0, ctx->stream>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input, n);
 }
 
 // ---------------------------------------------------------------------------
-// Sigmoid kernel
+// Sigmoid
 // ---------------------------------------------------------------------------
-
-__global__ void sigmoid_kernel(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* input,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        float v = __bfloat162float(input[idx]);
-        out[idx] = __float2bfloat16(sigmoid_f(v));
-    }
-}
 
 void glm_sigmoid(GlmCtx* ctx, void* out, const void* input, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    sigmoid_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    ew_unary_kernel<sigmoid_f><<<grid, block_size, 0, ctx->stream>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input, n);
 }
 
@@ -373,6 +439,46 @@ void glm_sigmoid(GlmCtx* ctx, void* out, const void* input, int n) {
 // ---------------------------------------------------------------------------
 
 __global__ void softmax_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* mask,
+    int dim
+) {
+    int row = blockIdx.x;
+    const __nv_bfloat16* x = input + row * dim;
+    const __nv_bfloat16* m = mask ? mask + row * dim : nullptr;
+    __nv_bfloat16* o = out + row * dim;
+
+    extern __shared__ float sdata[];
+    float* s_cache = sdata + blockDim.x;
+
+    float max_val = -1e30f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float val = __bfloat162float(x[i]);
+        if (m) val += __bfloat162float(m[i]);
+        s_cache[i] = val;
+        if (val > max_val) max_val = val;
+    }
+    sdata[threadIdx.x] = max_val;
+    __syncthreads();
+    block_reduce_max(sdata, threadIdx.x);
+    max_val = sdata[0];
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        sum += expf(s_cache[i] - max_val);
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    block_reduce_sum(sdata, threadIdx.x);
+    float inv_sum = 1.0f / sdata[0];
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        o[i] = __float2bfloat16(expf(s_cache[i] - max_val) * inv_sum);
+    }
+}
+
+__global__ void softmax_kernel_uncached(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* mask,
@@ -420,10 +526,15 @@ void glm_softmax(GlmCtx* ctx, void* out, const void* input,
     int block_size = 256;
     if (block_size > dim) block_size = (dim + 31) / 32 * 32;
     size_t shared_mem = block_size * sizeof(float);
-    softmax_kernel<<<batch, block_size, shared_mem, ctx->stream>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-        mask ? (const __nv_bfloat16*)mask : nullptr,
-        dim);
+    const __nv_bfloat16* mask_ptr = mask ? (const __nv_bfloat16*)mask : nullptr;
+    if ((dim + block_size) * sizeof(float) <= 48 * 1024) {
+        shared_mem = (dim + block_size) * sizeof(float);
+        softmax_kernel<<<batch, block_size, shared_mem, ctx->stream>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input, mask_ptr, dim);
+    } else {
+        softmax_kernel_uncached<<<batch, block_size, shared_mem, ctx->stream>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input, mask_ptr, dim);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -468,10 +579,14 @@ __global__ void fill_kernel(__nv_bfloat16* out, float value, int n) {
 
 void glm_fill(GlmCtx* ctx, void* out, float value, int n) {
     cudaSetDevice(ctx->device_id);
-    int block_size = 256;
-    int grid = (n + block_size - 1) / block_size;
-    fill_kernel<<<grid, block_size, 0, ctx->stream>>>(
-        (__nv_bfloat16*)out, value, n);
+    if (value == 0.0f) {
+        cudaMemsetAsync(out, 0, n * sizeof(__nv_bfloat16), ctx->stream);
+    } else {
+        int block_size = 256;
+        int grid = (n + block_size - 1) / block_size;
+        fill_kernel<<<grid, block_size, 0, ctx->stream>>>(
+            (__nv_bfloat16*)out, value, n);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -673,8 +788,10 @@ __global__ void rotary_embedding_kernel(
         int b = idx / (seq_len * dim);
         float freq = __bfloat162float(inv_freq[d % dim_half]) *
                      (float)position_ids[b * seq_len + s];
-        cos_out[idx] = __float2bfloat16(cosf(freq));
-        sin_out[idx] = __float2bfloat16(sinf(freq));
+        float cos_val, sin_val;
+        sincosf(freq, &sin_val, &cos_val);
+        cos_out[idx] = __float2bfloat16(cos_val);
+        sin_out[idx] = __float2bfloat16(sin_val);
     }
 }
 
@@ -716,19 +833,19 @@ __global__ void apply_rotary_pos_emb_kernel(
     int batch,
     int unsqueeze_dim
 ) {
-    int total = batch * n_heads * seq_len * rope_dim;
+    int total = batch * n_heads * seq_len * head_dim;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
-    int d = idx % rope_dim;
+    int d = idx % head_dim;
     int b, h, s;
     if (unsqueeze_dim == 1) {
-        int rest = idx / rope_dim;
+        int rest = idx / head_dim;
         s = rest % seq_len;
         h = (rest / seq_len) % n_heads;
         b = rest / (n_heads * seq_len);
     } else {
-        int rest = idx / rope_dim;
+        int rest = idx / head_dim;
         h = rest % n_heads;
         s = (rest / n_heads) % seq_len;
         b = rest / (n_heads * seq_len);
@@ -741,23 +858,27 @@ __global__ void apply_rotary_pos_emb_kernel(
         x_idx = ((b * seq_len + s) * n_heads + h) * head_dim + d;
     }
 
-    int cos_idx = (b * seq_len + s) * rope_dim + d;
-    int half = rope_dim / 2;
+    if (d < rope_dim) {
+        int cos_idx = (b * seq_len + s) * rope_dim + d;
+        int half = rope_dim / 2;
 
-    float x_val = __bfloat162float(x[x_idx]);
-    float cos_val = __bfloat162float(cos_emb[cos_idx]);
-    float sin_val = __bfloat162float(sin_emb[cos_idx]);
+        float x_val = __bfloat162float(x[x_idx]);
+        float cos_val = __bfloat162float(cos_emb[cos_idx]);
+        float sin_val = __bfloat162float(sin_emb[cos_idx]);
 
-    float x_rot;
-    if (d < half) {
-        int rot_idx = x_idx + half;
-        x_rot = -__bfloat162float(x[rot_idx]);
+        float x_rot;
+        if (d < half) {
+            int rot_idx = x_idx + half;
+            x_rot = -__bfloat162float(x[rot_idx]);
+        } else {
+            int rot_idx = x_idx - half;
+            x_rot = __bfloat162float(x[rot_idx]);
+        }
+
+        out[x_idx] = __float2bfloat16(x_val * cos_val + x_rot * sin_val);
     } else {
-        int rot_idx = x_idx - half;
-        x_rot = __bfloat162float(x[rot_idx]);
+        out[x_idx] = x[x_idx];
     }
-
-    out[x_idx] = __float2bfloat16(x_val * cos_val + x_rot * sin_val);
 }
 
 void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
@@ -774,7 +895,7 @@ void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
                                         int rope_dim, int head_dim, int n_heads, int seq_len,
                                         int batch, int unsqueeze_dim) {
     cudaSetDevice(ctx->device_id);
-    int total = batch * n_heads * seq_len * rope_dim;
+    int total = batch * n_heads * seq_len * head_dim;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
     apply_rotary_pos_emb_kernel<<<grid, block_size, 0, ctx->stream>>>(
@@ -922,8 +1043,12 @@ __global__ void scale_kernel(
     float scale,
     int n
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
+    int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
+    if (idx + 1 < n) {
+        float v0, v1;
+        load_bf16x2(input + idx, v0, v1);
+        store_bf16x2(out + idx, v0 * scale, v1 * scale);
+    } else if (idx < n) {
         out[idx] = __float2bfloat16(__bfloat162float(input[idx]) * scale);
     }
 }
@@ -937,26 +1062,16 @@ void glm_scale(GlmCtx* ctx, void* out, const void* input, float scale, int n) {
 }
 
 // ---------------------------------------------------------------------------
-// Add kernel: out = a + b
+// Add: out = a + b
 // ---------------------------------------------------------------------------
 
-__global__ void add_kernel(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* a,
-    const __nv_bfloat16* b,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        out[idx] = __float2bfloat16(__bfloat162float(a[idx]) + __bfloat162float(b[idx]));
-    }
-}
+static __device__ __forceinline__ float add_f(float a, float b) { return a + b; }
 
 void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    add_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    ew_binary_kernel<add_f><<<grid, block_size, 0, ctx->stream>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b, n);
 }
 
@@ -976,7 +1091,8 @@ __global__ void expand_dim1_kernel(
     int seq_len,
     int head_dim,
     int batch,
-    int head_stride
+    int head_stride,
+    int expand_ratio
 ) {
     int total = batch * dim1_out * seq_len * head_dim;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -988,7 +1104,7 @@ __global__ void expand_dim1_kernel(
         int h_out = rest % dim1_out;
         int b = rest / dim1_out;
 
-        int h_in = h_out * dim1_in / dim1_out;
+        int h_in = h_out / expand_ratio;
         int in_idx = (b * dim1_in + h_in) * head_stride + s * head_dim + d;
         out[idx] = input[in_idx];
     }
@@ -1002,7 +1118,8 @@ void glm_expand_dim1(GlmCtx* ctx, void* out, const void* input,
     int grid = (total + block_size - 1) / block_size;
     expand_dim1_kernel<<<grid, block_size, 0, ctx->stream>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-        dim1_out, dim1_in, seq_len, head_dim, batch, seq_len * head_dim);
+        dim1_out, dim1_in, seq_len, head_dim, batch, seq_len * head_dim,
+        dim1_out / dim1_in);
 }
 
 void glm_expand_dim1_strided(GlmCtx* ctx, void* out, const void* input,
@@ -1014,7 +1131,34 @@ void glm_expand_dim1_strided(GlmCtx* ctx, void* out, const void* input,
     int grid = (total + block_size - 1) / block_size;
     expand_dim1_kernel<<<grid, block_size, 0, ctx->stream>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-        dim1_out, dim1_in, seq_len, head_dim, batch, head_stride);
+        dim1_out, dim1_in, seq_len, head_dim, batch, head_stride,
+        dim1_out / dim1_in);
+}
+
+// ---------------------------------------------------------------------------
+// Specialized transpose for {0,2,1,3}: swaps dims 1 and 2
+// input:  [dim0, dim1, dim2, dim3]  output: [dim0, dim2, dim1, dim3]
+// out[b, s, h, d] = in[b, h, s, d]
+// ---------------------------------------------------------------------------
+
+__global__ void transpose_0213_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* input,
+    int dim0, int dim1, int dim2, int dim3
+) {
+    int total = dim0 * dim1 * dim2 * dim3;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int i3 = idx % dim3;
+    int rest = idx / dim3;
+    int i2 = rest % dim2;
+    rest /= dim2;
+    int i1 = rest % dim1;
+    int i0 = rest / dim1;
+
+    int out_idx = ((i0 * dim2 + i2) * dim1 + i1) * dim3 + i3;
+    out[out_idx] = input[idx];
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,35 +1212,28 @@ void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
     int total = dim0 * dim1 * dim2 * dim3;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    transpose_4d_kernel<<<grid, block_size, 0, ctx->stream>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-        dim0, dim1, dim2, dim3, perm0, perm1, perm2, perm3);
-}
-
-// ---------------------------------------------------------------------------
-// Element-wise multiply kernel
-//   out[i] = a[i] * b[i]  (BF16, FP32 accumulation)
-// ---------------------------------------------------------------------------
-
-__global__ void mul_kernel(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* a,
-    const __nv_bfloat16* b,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        float va = __bfloat162float(a[idx]);
-        float vb = __bfloat162float(b[idx]);
-        out[idx] = __float2bfloat16(va * vb);
+    if (perm0 == 0 && perm1 == 2 && perm2 == 1 && perm3 == 3) {
+        transpose_0213_kernel<<<grid, block_size, 0, ctx->stream>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+            dim0, dim1, dim2, dim3);
+    } else {
+        transpose_4d_kernel<<<grid, block_size, 0, ctx->stream>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+            dim0, dim1, dim2, dim3, perm0, perm1, perm2, perm3);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Mul: out = a * b
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ float mul_f(float a, float b) { return a * b; }
 
 void glm_mul(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    mul_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    ew_binary_kernel<mul_f><<<grid, block_size, 0, ctx->stream>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)a,
         (const __nv_bfloat16*)b, n);
 }
@@ -1116,8 +1253,13 @@ __global__ void reduce_sum_kernel(
     int row = blockIdx.x;
     const __nv_bfloat16* row_ptr = input + row * cols;
     float sum = 0.0f;
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
-        sum += __bfloat162float(row_ptr[c]);
+    for (int i = threadIdx.x * 2; i + 1 < cols; i += blockDim.x * 2) {
+        float v0, v1;
+        load_bf16x2(row_ptr + i, v0, v1);
+        sum += v0 + v1;
+    }
+    if ((cols & 1) && threadIdx.x == (cols / 2) % blockDim.x) {
+        sum += __bfloat162float(row_ptr[cols - 1]);
     }
     extern __shared__ float sdata[];
     sdata[threadIdx.x] = sum;
