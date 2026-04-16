@@ -88,12 +88,8 @@ FlashInfer's FA2 CUDA attention kernels are compiled into `libglm_ops.so` (Path 
 - `qwen3_model.py`: `_attention_prefill_flash()` and `_attention_decode_flash()` methods
 - Hot path (`prefill()` and `_decode_token()`) uses flash attention; `forward()` retains BMM-based attention for testing
 
-### Memory savings (at S=4096)
-Flash attention eliminates: attn_scores (512MB), mask_expanded (512MB), causal_mask (32MB), k/v_expanded (32MB), attn_out + attn_out_t (32MB) = ~1.1GB
-Added: flash_out (16MB) + flash_tmp (32MB) = 48MB
-
 ## Python Code
 
-- All Python code lives in `tests/python/` — verification only, not production
+- All Python code lives in `tests/python/` — verification only against torch operations and transformers models, not production
 - Use `json.load()` for config parsing (no transformers dependency)
 - Use `safetensors.safe_open()` for weight loading
