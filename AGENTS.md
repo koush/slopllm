@@ -32,9 +32,7 @@ cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .
 - Test references should match CUDA precision model: BF16 inputs for linear ops, float32 for fused ops (e.g. silu*mul)
 - When increasing test tolerances, investigate implementation bugs first — don't mask real errors with loose tolerances
 - MoE routing weight differences (~1 BF16 ULP) cause cascading errors proportional to output magnitude — this is expected BF16 behavior
-- **Qwen3.5 BF16 vs FP32**: HuggingFace `AutoModelForCausalLM` uses FP32 computation. Our CUDA model uses BF16 throughout. Per-layer synced accuracy is ~0.02-0.28 max_diff, but errors accumulate through 24 layers to ~3.25 max_diff in hidden state and ~7 in logits. This causes greedy decoding divergence. Sampling (temperature/top-p/repetition penalty) mitigates this.
-- Per-layer accuracy (synced input, CUDA vs PyTorch ref): all 24 layers show max_diff < 0.02 for GDN layers and < 0.01 for full attention layers with 4-token input; up to 0.28 for GDN layers with 13-token input
-- Greedy decoding diverges from HF at token position 2-3 due to logit differences of ~2.25 BF16 ULP accumulation through 24 layers
+- **Qwen3.5 BF16 vs FP32**: HuggingFace `AutoModelForCausalLM` uses FP32 computation. Our CUDA model uses BF16 throughout. Greedy decoding matches HuggingFace for ~9 tokens; divergence at position 10 is a ~0.25 logit difference from BF16 accumulation through 24 layers. Per-layer synced max_diff < 0.031 (GDN) / < 0.016 (full attention) with 13-token input; accumulated max_diff through all 24 layers is ~0.094 in hidden state / ~0.29 in logits. Sampling (temperature/top-p/top-k/repetition penalty) mitigates this.
 
 ## Model Details
 
@@ -61,12 +59,14 @@ cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .
 - 24 layers: 18 GDN (linear_attention) + 6 full_attention, every 4th layer is full attention
 - hidden_size=1024, intermediate_size=3584, vocab_size=248320, rms_norm_eps=1e-6
 - Full attention: 8 heads, 2 KV heads, head_dim=256, partial_rotary_factor=0.25 (64 RoPE dims), attn_output_gate=true
-- GDN: 16 linear heads, linear_key_head_dim=128, linear_value_head_dim=128, conv_kernel_dim=4
-- GemmaRMSNorm for layer norms (input_layernorm, post_attention_layernorm, q_norm, k_norm, final norm)
-- Standard RMSNorm for GDN internal norm (linear_attn.norm.weight) — do NOT add +1
+- GDN: 16 linear_key_heads, 16 linear_value_heads, linear_key_head_dim=128, linear_value_head_dim=128, conv_kernel_dim=4
+- **Weight dtype note**: `A_log` (F32) and `dt_bias` (BF16 in safetensors, but must be uploaded as F32 — GDN kernels read both as `const float*`)
+- GemmaRMSNorm for layer norms (input_layernorm, post_attention_layernorm, q_norm, k_norm, final norm) — weight += 1 during loading
+- Standard RMSNorm for GDN internal norm (linear_attn.norm.weight) — do NOT add +1; weight is F32 in safetensors, kernel reads as BF16 (acceptable precision loss)
 - GDN recurrent state is float32 (mamba_ssm_dtype: float32)
+- rope_theta=10000000 (in rope_parameters, not top-level config)
 - Run: `npx tsx src/run_qwen3_chat.ts --qwen35`
-- Sampling: `--temperature 0.6 --top-p 0.95 --repetition-penalty 1.1` (defaults); `--greedy` for argmax
+- Sampling defaults: `--temperature 0.6 --top-p 0.95 --top-k 20 --repetition-penalty 1.1`; `--greedy` for argmax
 - HuggingFace reference: `scratchpad/hf_qwen35_gen.py`
 
 ## FlashInfer Integration
@@ -75,12 +75,13 @@ FlashInfer's FA2 CUDA attention kernels are compiled into `libglm_ops.so` (Path 
 
 ### Architecture
 - `csrc/glm_flash.cu` — C wrappers calling FlashInfer's `SinglePrefillWithKVCacheDispatched` and `SingleDecodeWithKVCacheDispatched`
-- Specialized for BF16, head_dim=128, PosEncodingMode::kNone, DefaultAttention variant (no custom mask/sliding window/logits_soft_cap/alibi)
+- Specialized for BF16, **head_dim=128 and head_dim=256** (256 added for Qwen3.5), PosEncodingMode::kNone, DefaultAttention variant
 - Prefill uses MaskMode::kCausal; Decode uses MaskMode::kNone
 - KV cache is HND layout: `[n_kv, max_S, hd]` — FlashInfer reads directly from cache via stride parameters
 - Q tensor layout after transpose is `[B, n_heads, S, hd]` (HND) — strides: q_stride_n=hd, q_stride_h=S*hd
 - Output from FlashInfer is NHD: `[S, n_heads, hd]` = `[S, hidden]` — directly compatible with o_proj
 - 32MB workspace buffer for split-KV path (rarely triggered for small sequences)
+- **Note**: Batch prefill/decode paths are hardcoded to head_dim=128; single prefill/decode support both 128 and 256
 
 ### Python bindings
 - `helpers.py`: `flash_prefill()` and `flash_decode()` methods on `GlmOps`
