@@ -432,12 +432,17 @@ async function main(): Promise<void> {
       repetitionPenaltyWindow = parseInt(args[++i], 10);
     } else if (args[i] === "--greedy") {
       temperature = 0;
+      topK = 0;
+      topP = 1.0;
+      repetitionPenalty = 1.0;
+      presencePenalty = 0;
     }
   }
 
   // Qwen3.5 model-recommended defaults (adapted for 0.8B):
   // top_k=20 from model card; other params tuned for coherent output on small model
-  if (useQwen35 && temperature === 0.6 && topP === 0.95 && topK === 0 && repetitionPenalty === 1.0 && presencePenalty === 0) {
+  // Skip if --greedy was explicitly set (temperature=0)
+  if (useQwen35 && temperature > 0 && topP === 0.95 && topK === 0 && repetitionPenalty === 1.0 && presencePenalty === 0) {
     topK = 20;
     repetitionPenalty = 1.1;
   }

@@ -987,7 +987,7 @@ export class Qwen35Model implements OpContext {
       this.decodeToken(nextToken, cache, cachedLen);
       cache.cachePos = cachedLen + 1;
 
-      if (sampling && (sampling.temperature > 0 || sampling.repetitionPenalty !== 1.0)) {
+      if (sampling && (sampling.temperature > 0 || sampling.repetitionPenalty !== 1.0 || sampling.presencePenalty !== 0 || sampling.topK > 0 || sampling.topP < 1.0)) {
         const logits = this.readLogits();
         nextToken = this.sampleToken(logits, sampling, tokenHistory);
       } else {
