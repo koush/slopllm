@@ -13,7 +13,9 @@ const EOS_TOKEN_IDS = new Set([248044]);
 export interface SamplingParams {
   temperature: number;
   topP: number;
+  topK: number;
   repetitionPenalty: number;
+  presencePenalty: number;
   repetitionPenaltyWindow: number;
 }
 
@@ -387,24 +389,7 @@ export class Qwen35Model implements OpContext {
   sampleToken(logits: Float32Array, params: SamplingParams, tokenHistory: number[]): number {
     const vs = logits.length;
 
-    if (params.temperature <= 0 || (params.repetitionPenalty === 1.0 && params.topP >= 1.0)) {
-      if (params.repetitionPenalty !== 1.0) {
-        const seen = new Set<number>();
-        const start = Math.max(0, tokenHistory.length - params.repetitionPenaltyWindow);
-        for (let i = start; i < tokenHistory.length; i++) seen.add(tokenHistory[i]);
-        for (const tid of seen) {
-          if (tid < vs) {
-            logits[tid] = logits[tid] > 0 ? logits[tid] / params.repetitionPenalty : logits[tid] * params.repetitionPenalty;
-          }
-        }
-      }
-      let best = 0;
-      for (let i = 1; i < vs; i++) {
-        if (logits[i] > logits[best]) best = i;
-      }
-      return best;
-    }
-
+    // Repetition penalty: divide positive logits, multiply negative logits
     if (params.repetitionPenalty !== 1.0) {
       const seen = new Set<number>();
       const start = Math.max(0, tokenHistory.length - params.repetitionPenaltyWindow);
@@ -416,20 +401,55 @@ export class Qwen35Model implements OpContext {
       }
     }
 
-    const invTemp = 1.0 / params.temperature;
+    // Presence penalty: flat subtraction for tokens that appeared
+    if (params.presencePenalty !== 0) {
+      const seen = new Set<number>();
+      const start = Math.max(0, tokenHistory.length - params.repetitionPenaltyWindow);
+      for (let i = start; i < tokenHistory.length; i++) seen.add(tokenHistory[i]);
+      for (const tid of seen) {
+        if (tid < vs) logits[tid] -= params.presencePenalty;
+      }
+    }
+
+    // Greedy: temperature <= 0 with no topK
+    if (params.temperature <= 0 && params.topK <= 0) {
+      let best = 0;
+      for (let i = 1; i < vs; i++) {
+        if (logits[i] > logits[best]) best = i;
+      }
+      return best;
+    }
+
+    // Temperature scaling
+    const invTemp = params.temperature > 0 ? 1.0 / params.temperature : 1.0;
     let maxLogit = -Infinity;
     for (let i = 0; i < vs; i++) {
       logits[i] *= invTemp;
       if (logits[i] > maxLogit) maxLogit = logits[i];
     }
 
+    // Top-K: zero out tokens beyond the k highest
+    if (params.topK > 0 && params.topK < vs) {
+      const indices = Array.from({ length: vs }, (_, i) => i);
+      indices.sort((a, b) => logits[b] - logits[a]);
+      const threshold = logits[indices[params.topK]];
+      for (let i = 0; i < vs; i++) {
+        if (logits[i] < threshold) logits[i] = -Infinity;
+      }
+      // Recompute maxLogit
+      maxLogit = logits[indices[0]];
+    }
+
+    // Softmax
     let sumExp = 0;
     for (let i = 0; i < vs; i++) {
-      logits[i] = Math.exp(logits[i] - maxLogit);
+      const v = logits[i] - maxLogit;
+      logits[i] = v > -30 ? Math.exp(v) : 0;
       sumExp += logits[i];
     }
 
-    if (params.topP < 1.0) {
+    // Top-P: zero out tokens beyond cumulative probability threshold
+    if (params.topP < 1.0 && params.topK <= 0) {
       const sorted = Array.from({ length: vs }, (_, i) => i).sort((a, b) => logits[b] - logits[a]);
       let cumSum = 0;
       let cutoff = vs;
@@ -453,6 +473,7 @@ export class Qwen35Model implements OpContext {
       for (let i = 0; i < vs; i++) logits[i] /= sumExp;
     }
 
+    // Sample
     let r = Math.random();
     let cumSum = 0;
     for (let i = 0; i < vs; i++) {

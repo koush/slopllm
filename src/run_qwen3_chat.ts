@@ -277,12 +277,14 @@ async function interactiveChatQwen35(model: Qwen35Model, cache: FlatKVCache, tok
   const sampling: SamplingParams = {
     temperature: args.temperature,
     topP: args.topP,
+    topK: args.topK,
     repetitionPenalty: args.repetitionPenalty,
+    presencePenalty: args.presencePenalty,
     repetitionPenaltyWindow: args.repetitionPenaltyWindow,
   };
 
   console.log(`Qwen3.5-0.8B  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}`);
-  console.log(`Max ${args.maxNewTokens} tokens/turn  |  temp=${sampling.temperature} top_p=${sampling.topP} rep_pen=${sampling.repetitionPenalty}`);
+  console.log(`Max ${args.maxNewTokens} tokens/turn  |  temp=${sampling.temperature} top_p=${sampling.topP} top_k=${sampling.topK} rep_pen=${sampling.repetitionPenalty} pres_pen=${sampling.presencePenalty}`);
   console.log("Type /quit to exit, /clear to reset conversation\n");
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -351,12 +353,14 @@ async function singlePromptQwen35(model: Qwen35Model, cache: FlatKVCache, tokeni
   const sampling: SamplingParams = {
     temperature: args.temperature,
     topP: args.topP,
+    topK: args.topK,
     repetitionPenalty: args.repetitionPenalty,
+    presencePenalty: args.presencePenalty,
     repetitionPenaltyWindow: args.repetitionPenaltyWindow,
   };
 
   console.log(`Prompt: ${args.prompt}`);
-  console.log(`Tokens: ${inputIds.length}  |  temp=${sampling.temperature} top_p=${sampling.topP} rep_pen=${sampling.repetitionPenalty}`);
+  console.log(`Tokens: ${inputIds.length}  |  temp=${sampling.temperature} top_p=${sampling.topP} top_k=${sampling.topK} rep_pen=${sampling.repetitionPenalty} pres_pen=${sampling.presencePenalty}`);
 
   const t0 = performance.now();
   const generatedIds: number[] = [];
@@ -390,7 +394,9 @@ async function main(): Promise<void> {
   let useQwen35 = false;
   let temperature = 0.6;
   let topP = 0.95;
-  let repetitionPenalty = 1.1;
+  let topK = 0;
+  let repetitionPenalty = 1.0;
+  let presencePenalty = 0;
   let repetitionPenaltyWindow = 64;
 
   for (let i = 0; i < args.length; i++) {
@@ -416,6 +422,10 @@ async function main(): Promise<void> {
       temperature = parseFloat(args[++i]);
     } else if (args[i] === "--top-p" && i + 1 < args.length) {
       topP = parseFloat(args[++i]);
+    } else if (args[i] === "--top-k" && i + 1 < args.length) {
+      topK = parseInt(args[++i], 10);
+    } else if (args[i] === "--presence-penalty" && i + 1 < args.length) {
+      presencePenalty = parseFloat(args[++i]);
     } else if (args[i] === "--repetition-penalty" && i + 1 < args.length) {
       repetitionPenalty = parseFloat(args[++i]);
     } else if (args[i] === "--repetition-penalty-window" && i + 1 < args.length) {
@@ -423,6 +433,13 @@ async function main(): Promise<void> {
     } else if (args[i] === "--greedy") {
       temperature = 0;
     }
+  }
+
+  // Qwen3.5 model-recommended defaults (adapted for 0.8B):
+  // top_k=20 from model card; other params tuned for coherent output on small model
+  if (useQwen35 && temperature === 0.6 && topP === 0.95 && topK === 0 && repetitionPenalty === 1.0 && presencePenalty === 0) {
+    topK = 20;
+    repetitionPenalty = 1.1;
   }
 
   const gpuId = gpu ?? parseInt(process.env.GLM_GPU ?? "0", 10);
@@ -438,7 +455,7 @@ async function main(): Promise<void> {
     const modelDir = resolveModelPath(QWEN35_REPO);
     const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
 
-    const cliArgs = { gpu: gpuId, maxSeqLen, maxNewTokens, thinking, prompt, temperature, topP, repetitionPenalty, repetitionPenaltyWindow };
+    const cliArgs = { gpu: gpuId, maxSeqLen, maxNewTokens, thinking, prompt, temperature, topP, topK, repetitionPenalty, presencePenalty, repetitionPenaltyWindow };
 
     if (prompt) {
       await singlePromptQwen35(model, cache, tokenizer, cliArgs);
