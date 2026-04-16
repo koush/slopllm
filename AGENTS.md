@@ -32,6 +32,9 @@ cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .
 - Test references should match CUDA precision model: BF16 inputs for linear ops, float32 for fused ops (e.g. silu*mul)
 - When increasing test tolerances, investigate implementation bugs first — don't mask real errors with loose tolerances
 - MoE routing weight differences (~1 BF16 ULP) cause cascading errors proportional to output magnitude — this is expected BF16 behavior
+- **Qwen3.5 BF16 vs FP32**: HuggingFace `AutoModelForCausalLM` uses FP32 computation. Our CUDA model uses BF16 throughout. Per-layer synced accuracy is ~0.02-0.28 max_diff, but errors accumulate through 24 layers to ~3.25 max_diff in hidden state and ~7 in logits. This causes greedy decoding divergence. Sampling (temperature/top-p/repetition penalty) mitigates this.
+- Per-layer accuracy (synced input, CUDA vs PyTorch ref): all 24 layers show max_diff < 0.02 for GDN layers and < 0.01 for full attention layers with 4-token input; up to 0.28 for GDN layers with 13-token input
+- Greedy decoding diverges from HF at token position 2-3 due to logit differences of ~2.25 BF16 ULP accumulation through 24 layers
 
 ## Model Details
 
@@ -52,6 +55,19 @@ cd tests/python && LD_LIBRARY_PATH=../../build:$LD_LIBRARY_PATH pytest -v .
 - SwiGLU MLP: `down_proj(silu(gate_proj(x)) * up_proj(x))`
 - Reference: `vendor/modeling_qwen3.py`, `vendor/configuration_qwen3.py`
 - Run Qwen3 tests with: `HF_HOME=/mnt/storage/.cache/huggingface pytest test_qwen3.py -v`
+
+### Qwen3.5-0.8B
+- Model: `Qwen/Qwen3.5-0.8B`, cached at `/mnt/storage/.cache/huggingface/`
+- 24 layers: 18 GDN (linear_attention) + 6 full_attention, every 4th layer is full attention
+- hidden_size=1024, intermediate_size=3584, vocab_size=248320, rms_norm_eps=1e-6
+- Full attention: 8 heads, 2 KV heads, head_dim=256, partial_rotary_factor=0.25 (64 RoPE dims), attn_output_gate=true
+- GDN: 16 linear heads, linear_key_head_dim=128, linear_value_head_dim=128, conv_kernel_dim=4
+- GemmaRMSNorm for layer norms (input_layernorm, post_attention_layernorm, q_norm, k_norm, final norm)
+- Standard RMSNorm for GDN internal norm (linear_attn.norm.weight) — do NOT add +1
+- GDN recurrent state is float32 (mamba_ssm_dtype: float32)
+- Run: `npx tsx src/run_qwen3_chat.ts --qwen35`
+- Sampling: `--temperature 0.6 --top-p 0.95 --repetition-penalty 1.1` (defaults); `--greedy` for argmax
+- HuggingFace reference: `scratchpad/hf_qwen35_gen.py`
 
 ## FlashInfer Integration
 
