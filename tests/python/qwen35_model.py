@@ -288,6 +288,7 @@ class Qwen35Model:
             "gdn_out": glm.alloc(S * lin_h * lin_vd * BF16),
             "gdn_gated": glm.alloc(S * lin_h * lin_vd * BF16),
             "sig_buf": glm.alloc(BS * q_total_dim * BF16),
+            "cu_seqlens": glm.alloc(2 * I32),
         }
 
     def free(self) -> None:
@@ -390,7 +391,7 @@ class Qwen35Model:
         glm.causal_conv1d(ws["gdn_conv_out"], conv_state,
                            ws["gdn_qkv_transposed"],
                            self.weights[f"{pfx}.conv1d.weight"],
-                           conv_dim, S, kernel_size)
+                           ws["cu_seqlens"], conv_dim, S, kernel_size)
 
         glm.qkv_split(ws["gdn_q"], ws["gdn_k"], ws["gdn_v"],
                        ws["gdn_conv_out"],
@@ -401,7 +402,7 @@ class Qwen35Model:
                          ws["gdn_a"], ws["gdn_b"],
                          self.weights[f"{pfx}.A_log"],
                          self.weights[f"{pfx}.dt_bias"],
-                         S, lin_h, lin_kd, lin_vd)
+                         ws["cu_seqlens"], S, lin_h, lin_kd, lin_vd)
 
         glm.rmsnorm_gated(ws["gdn_gated"], ws["gdn_out"], ws["gdn_z"],
                            self.weights[f"{pfx}.norm.weight"],
@@ -710,6 +711,9 @@ class Qwen35Model:
         assert cache.cache_pos == 0
 
         gdn_state.reset()
+
+        cu_seqlens_np = np.array([0, S], dtype=np.int32)
+        glm.h2d(self._ws["cu_seqlens"], cu_seqlens_np.tobytes())
 
         ids_np = input_ids.cpu().numpy().astype(np.int32).flatten()
         glm.h2d(self._ws["input_ids_buf"], ids_np.tobytes())
