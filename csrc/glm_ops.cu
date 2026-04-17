@@ -461,7 +461,7 @@ __global__ void ew_binary_kernel(__nv_bfloat16* out, const __nv_bfloat16* a, con
 
 // ---------------------------------------------------------------------------
 // Element-wise unary 2D kernel (templated) — pitched input
-// Reads from a 2D pitched view of input: element(r, c) = in[r * pitch + c]
+// Reads from a 2D pitched view of input: element(r, c) = in[r * pitch + col_offset + c]
 // F: (float, float) -> float, receives (out_val, in_val)
 // out: [rows * cols] contiguous
 // ---------------------------------------------------------------------------
@@ -475,7 +475,7 @@ template<auto F>
 __global__ void ew_unary_2d_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ in,
-    int rows, int cols, int pitch
+    int rows, int cols, int pitch, int col_offset
 ) {
     int total = rows * cols;
     int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
@@ -484,13 +484,13 @@ __global__ void ew_unary_2d_kernel(
         int r1 = (idx + 1) / cols, c1 = (idx + 1) % cols;
         float v0 = __bfloat162float(out[idx]);
         float v1 = __bfloat162float(out[idx + 1]);
-        float g0 = __bfloat162float(in[r0 * pitch + c0]);
-        float g1 = __bfloat162float(in[r1 * pitch + c1]);
+        float g0 = __bfloat162float(in[r0 * pitch + col_offset + c0]);
+        float g1 = __bfloat162float(in[r1 * pitch + col_offset + c1]);
         store_bf16x2(out + idx, F(v0, g0), F(v1, g1));
     } else if (idx < total) {
         int r = idx / cols, c = idx % cols;
         float v = __bfloat162float(out[idx]);
-        float g = __bfloat162float(in[r * pitch + c]);
+        float g = __bfloat162float(in[r * pitch + col_offset + c]);
         out[idx] = __float2bfloat16(F(v, g));
     }
 }
@@ -509,7 +509,7 @@ void glm_gate_sigmoid_mul(
     ew_unary_2d_kernel<sigmoid_mul_f><<<grid, block_size, 0, ctx->stream>>>(
         (__nv_bfloat16*)attn_out,
         (const __nv_bfloat16*)gate_interleaved,
-        rows, cols, pitch);
+        rows, cols, pitch, head_dim);
 }
 
 // ---------------------------------------------------------------------------

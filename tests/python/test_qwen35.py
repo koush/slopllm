@@ -467,3 +467,27 @@ class TestQwen35TorchReference:
         print(f"  PyTorch top-5: {torch_top5}")
 
         assert not torch.isnan(cuda_logits).any(), "CUDA logits contain NaN"
+
+
+def test_qwen35_generate_paris(glm):
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(QWEN35_REPO)
+    model = Qwen35Model.from_pretrained(glm, QWEN35_REPO, max_batch=1, max_seq_len=128)
+    cache = model.create_flat_kv_cache()
+    gdn_state = model.create_gdn_state()
+
+    try:
+        prompt = "The capital of France is"
+        input_ids = tokenizer.encode(prompt, return_tensors='pt')
+        tokens = list(model.generate_tokens(input_ids, cache, gdn_state, max_new_tokens=20))
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
+        assert len(tokens) > 0, "No tokens generated"
+        assert "Paris" in text, f"Expected 'Paris' in generated text, got: {repr(text)}"
+        print(f"  Generated {len(tokens)} tokens: {repr(text)}")
+    finally:
+        cache.free()
+        gdn_state.free()
+
+    model.free()
+    torch.cuda.empty_cache()
