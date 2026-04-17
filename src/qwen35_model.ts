@@ -661,7 +661,7 @@ export class Qwen35Model extends ChatModelBase {
     }
   }
 
-  batchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
+  forward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
     if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
     const { pagedKV, gdnState } = cache;
     const cfg = this.cfg;

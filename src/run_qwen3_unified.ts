@@ -141,7 +141,7 @@ export function* generateStream(
   const suffixIds = cache.prefixMatch(0, inputIds);
   cache.appendTokens(0, suffixIds);
 
-  const firstTokens = model.prefillBatch([suffixIds], ws, cache);
+  const firstTokens = model.forwardEager([suffixIds], ws, cache);
   let currentToken = firstTokens[0];
   yield currentToken;
   cache.appendTokens(0, [currentToken]);
@@ -151,7 +151,7 @@ export function* generateStream(
   let capturing = false;
 
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
-    const state = model.decodeBatchPlan([currentToken], ws, cache, useGraph);
+    const state = model.planDecode([currentToken], ws, cache, useGraph);
 
     if (useGraph && graphState!.graphExec !== null) {
       glm.graphLaunch(graphState!.graphExec);
@@ -162,7 +162,7 @@ export function* generateStream(
         glm.graphBeginCapture();
       }
 
-      model.decodeBatchForward(state, ws, cache);
+      model.decodeForward(state, ws, cache);
 
       if (capturing) {
         const graph = glm.graphEndCapture();
@@ -175,7 +175,7 @@ export function* generateStream(
       if (useGraph) graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
     }
 
-    currentToken = model.decodeBatchRead(state)[0];
+    currentToken = model.decodeRead(state)[0];
 
     if (sampling && needsSampling(sampling)) {
       currentToken = model.sampleTokenGPU(sampling, tokenHistory);
@@ -193,7 +193,7 @@ export function generateBatchTokens(
 ): number[][] {
   const batchSize = inputIdsList.length;
   cache.reset(batchSize);
-  const firstTokens = model.prefillBatch(inputIdsList, ws, cache);
+  const firstTokens = model.forwardEager(inputIdsList, ws, cache);
 
   const nextTokens = [...firstTokens];
   const generated: number[][] = nextTokens.map(t => [t]);
@@ -202,7 +202,7 @@ export function generateBatchTokens(
   for (let step = 0; step < maxNewTokens - 1; step++) {
     if (finished.every(f => f)) break;
 
-    const newTokens = model.decodeBatch(nextTokens, ws, cache);
+    const newTokens = model.decodeEager(nextTokens, ws, cache);
 
     for (let i = 0; i < batchSize; i++) {
       nextTokens[i] = newTokens[i];

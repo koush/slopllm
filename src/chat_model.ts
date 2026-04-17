@@ -29,17 +29,14 @@ export interface BatchState {
 export interface ChatModel {
   readonly eosIds: Set<number>;
   createChatCache(maxPages?: number): ChatCache;
-  batchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): BatchState;
-  batchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
-  batchRead(state: BatchState): number[];
-  batch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[];
-  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[];
-  prefill(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache): number;
-  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): BatchState;
-  decodeBatchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
-  decodeBatchRead(state: BatchState): number[];
-  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[];
-  decode(tokenId: number, ws: WorkspaceBuffers, cache: ChatCache): number;
+  plan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): BatchState;
+  forward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
+  read(state: BatchState): number[];
+  forwardEager(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[];
+  planDecode(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): BatchState;
+  decodeForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
+  decodeRead(state: BatchState): number[];
+  decodeEager(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[];
   sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number;
   free(): void;
 }
@@ -83,7 +80,7 @@ export abstract class ChatModelBase implements ChatModel {
     _startPos: number[], _cache: ChatCache,
   ): void {}
 
-  batchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): BatchState {
+  plan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): BatchState {
     const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;
@@ -101,7 +98,7 @@ export abstract class ChatModelBase implements ChatModel {
     }
 
     if (pagedKV.seqPages.length !== batchSize) {
-      throw new Error(`batchPlan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+      throw new Error(`plan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
     }
 
     const allIds: number[] = [];
@@ -208,9 +205,9 @@ export abstract class ChatModelBase implements ChatModel {
     return { batchSize, totalTokens, seqLens, pageAllocs, isDecode: false };
   }
 
-  abstract batchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
+  abstract forward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
 
-  batchRead(state: BatchState): number[] {
+  read(state: BatchState): number[] {
     const batchSize = state.batchSize;
     const buf = Buffer.alloc(batchSize * I32);
     this.ws.argmaxIdx.d2h(buf);
@@ -221,38 +218,26 @@ export abstract class ChatModelBase implements ChatModel {
     return result;
   }
 
-  batch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[] {
-    const state = this.batchPlan(inputIdsList, ws, cache);
-    this.batchForward(state, ws, cache);
-    return this.batchRead(state);
+  forwardEager(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[] {
+    const state = this.plan(inputIdsList, ws, cache);
+    this.forward(state, ws, cache);
+    return this.read(state);
   }
 
-  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[] {
-    return this.batch(inputIdsList, ws, cache);
+  planDecode(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): BatchState {
+    return this.plan(tokenIdsList.map(t => [t]), ws, cache, enableCudaGraph);
   }
 
-  prefill(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache): number {
-    return this.batch(inputIds, ws, cache)[0];
+  decodeForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
+    this.forward(state, ws, cache);
   }
 
-  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): BatchState {
-    return this.batchPlan(tokenIdsList.map(t => [t]), ws, cache, enableCudaGraph);
+  decodeRead(state: BatchState): number[] {
+    return this.read(state);
   }
 
-  decodeBatchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
-    this.batchForward(state, ws, cache);
-  }
-
-  decodeBatchRead(state: BatchState): number[] {
-    return this.batchRead(state);
-  }
-
-  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[] {
-    return this.batch(tokenIdsList.map(t => [t]), ws, cache);
-  }
-
-  decode(tokenId: number, ws: WorkspaceBuffers, cache: ChatCache): number {
-    return this.decodeBatch([tokenId], ws, cache)[0];
+  decodeEager(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[] {
+    return this.forwardEager(tokenIdsList.map(t => [t]), ws, cache);
   }
 
   protected readArgmax(ptr: Tensor | number, count: number): number {

@@ -263,7 +263,7 @@ export class Qwen3Model extends ChatModelBase {
     return S === 1 ? this.ws.vBuf.data : this.ws.vT.data;
   }
 
-  batchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
+  forward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
     const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;

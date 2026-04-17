@@ -7,7 +7,7 @@ export function generateBatchTokens(
 ): number[][] {
   const batchSize = inputIdsList.length;
   cache.reset(batchSize);
-  const firstTokens = model.prefillBatch(inputIdsList, ws, cache);
+  const firstTokens = model.forwardEager(inputIdsList, ws, cache);
 
   const nextTokens = [...firstTokens];
   const generated: number[][] = nextTokens.map(t => [t]);
@@ -16,7 +16,7 @@ export function generateBatchTokens(
   for (let step = 0; step < maxNewTokens - 1; step++) {
     if (finished.every(f => f)) break;
 
-    const newTokens = model.decodeBatch(nextTokens, ws, cache);
+    const newTokens = model.decodeEager(nextTokens, ws, cache);
 
     for (let i = 0; i < batchSize; i++) {
       nextTokens[i] = newTokens[i];
@@ -39,7 +39,7 @@ export function* generateTokens(
   sampling?: SamplingParams,
 ): Generator<number> {
   cache.reset(1);
-  const firstTokens = model.prefillBatch([inputIds], ws, cache);
+  const firstTokens = model.forwardEager([inputIds], ws, cache);
   let nextToken = firstTokens[0];
   yield nextToken;
 
@@ -48,7 +48,7 @@ export function* generateTokens(
   for (let i = 0; i < maxNewTokens - 1; i++) {
     if (eosIds.has(nextToken)) break;
 
-    const decodeTokens = model.decodeBatch([nextToken], ws, cache);
+    const decodeTokens = model.decodeEager([nextToken], ws, cache);
     nextToken = decodeTokens[0];
 
     if (sampling && needsSampling(sampling)) {
