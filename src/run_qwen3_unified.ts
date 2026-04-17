@@ -24,7 +24,6 @@ interface CliArgs {
   maxPages: number;
   maxBatch: number;
   noReset: boolean;
-  thinking: boolean;
   prompt: string | undefined;
   useQwen35: boolean;
   useFp8: boolean;
@@ -47,7 +46,6 @@ function parseArgs(argv: string[]): CliArgs {
     maxPages: 256,
     maxBatch: 4,
     noReset: true,
-    thinking: true,
     prompt: undefined,
     useQwen35: false,
     useFp8: false,
@@ -71,7 +69,6 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--max-pages" && i + 1 < argv.length) args.maxPages = parseInt(argv[++i], 10);
     else if (a === "--max-batch" && i + 1 < argv.length) args.maxBatch = parseInt(argv[++i], 10);
     else if (a === "--no-kv-persist") args.noReset = false;
-    else if (a === "--no-thinking") args.thinking = false;
     else if (a === "--qwen35") args.useQwen35 = true;
     else if (a === "--fp8") args.useFp8 = true;
     else if (a === "--batch") args.useBatch = true;
@@ -252,16 +249,16 @@ async function interactiveChat(
       }
 
       messages.push({ role: "user", content: userInput });
-      const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
+      const inputIds = tokenizeMessages(tokenizer, messages, true);
 
       if (inputIds.length > args.maxSeqLen - args.maxNewTokens) {
         console.log(`Warning: prompt (${inputIds.length} tokens) too long, truncating conversation`);
         while (inputIds.length > args.maxSeqLen - args.maxNewTokens && messages.length > 1) {
           messages.splice(1, 2);
-          const retryIds = tokenizeMessages(tokenizer, messages, args.thinking);
+          const retryIds = tokenizeMessages(tokenizer, messages, true);
           if (retryIds.length <= args.maxSeqLen - args.maxNewTokens) break;
         }
-        if (messages.length === 1 && tokenizeMessages(tokenizer, messages, args.thinking).length > args.maxSeqLen - args.maxNewTokens) {
+        if (messages.length === 1 && tokenizeMessages(tokenizer, messages, true).length > args.maxSeqLen - args.maxNewTokens) {
           console.log("Conversation too long even after truncation. Use /clear to reset.");
           messages.pop();
           continue;
@@ -303,7 +300,7 @@ async function singlePrompt(
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
   const eosIds = model.eosIds;
   const messages = [{ role: "user", content: args.prompt! }];
-  const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
+  const inputIds = tokenizeMessages(tokenizer, messages, true);
 
   console.log(`Prompt: ${args.prompt}`);
   console.log(`Tokens: ${inputIds.length}`);
@@ -369,7 +366,7 @@ async function interactiveBatch(
       const inputIdsList: number[][] = [];
       for (const prompt of prompts) {
         const messages = [{ role: "user" as const, content: prompt }];
-        const ids = tokenizeMessages(tokenizer, messages, args.thinking);
+        const ids = tokenizeMessages(tokenizer, messages, true);
         inputIdsList.push(ids);
       }
 
@@ -431,7 +428,7 @@ async function main(): Promise<void> {
   if (sp.presencePenalty !== 0) samplingParts.push(`pres_pen=${sp.presencePenalty}`);
   const samplingStr = samplingParts.length > 0 ? samplingParts.join(" ") : "greedy";
 
-  console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}${args.thinking ? "  |  thinking" : ""}`);
+  console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}`);
 
   if (args.useBatch) {
     await interactiveBatch(model, cache, ws, tokenizer, args);
