@@ -1,6 +1,6 @@
-import { GlmOps } from "./glm_ops";
+import { GlmOps, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE } from "./glm_ops";
 import { Qwen3Model } from "./qwen3_model";
-import { FlatKVCache } from "./flat_kv";
+import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { AutoTokenizer, PreTrainedTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
@@ -9,7 +9,7 @@ const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const EOS_TOKEN_IDS = new Set([151645, 151643]);
 
-async function chatLoop(model: Qwen3Model, cache: FlatKVCache, tokenizer: PreTrainedTokenizer, maxNewTokens: number, noThink: boolean): Promise<void> {
+async function chatLoop(model: Qwen3Model, pagedKV: PagedKVCache, ws: WorkspaceBuffers, tokenizer: PreTrainedTokenizer, maxNewTokens: number, noThink: boolean): Promise<void> {
   const messages: Array<{ role: string; content: string }> = [];
   const enableThinking = !noThink;
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -24,7 +24,7 @@ async function chatLoop(model: Qwen3Model, cache: FlatKVCache, tokenizer: PreTra
     if (userInput.toLowerCase() === "/clear") {
       messages.length = 0;
       console.log("Conversation cleared.");
-      cache.reset();
+      pagedKV.reset(1);
       continue;
     }
 
@@ -50,7 +50,7 @@ async function chatLoop(model: Qwen3Model, cache: FlatKVCache, tokenizer: PreTra
     const start = Date.now();
     let tokenCount = 0;
 
-    for (const tokenId of model.streamTokens(inputIds, cache, maxNewTokens, EOS_TOKEN_IDS)) {
+    for (const tokenId of model.streamTokens(inputIds, ws, pagedKV, maxNewTokens, EOS_TOKEN_IDS)) {
       generatedIds.push(tokenId);
       tokenCount++;
       const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -99,7 +99,8 @@ async function main(): Promise<void> {
   console.log(`Loading model on GPU ${gpuId}${useFp8 ? " (FP8)" : ""}...`);
   const glm = new GlmOps(0);
   const model = Qwen3Model.fromPretrained(glm, repoId, 1, maxSeqLen);
-  const cache = model.createFlatKVCache();
+  const pagedKV = new PagedKVCache(glm, model.cfg.numKeyValueHeads, model.cfg.headDim, model.cfg.numHiddenLayers, 256, 1);
+  const ws = new WorkspaceBuffers(glm);
 
   const modelDir = resolveModelPath(repoId);
   const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
@@ -107,7 +108,7 @@ async function main(): Promise<void> {
   console.log(`Qwen3-0.6B ready (max_tokens=${maxTokens}, thinking=${noThink ? "off" : "on"}${useFp8 ? ", fp8" : ""})`);
   console.log("Type a message to chat. /clear to reset, /q to quit.");
 
-  await chatLoop(model, cache, tokenizer, maxTokens, noThink);
+  await chatLoop(model, pagedKV, ws, tokenizer, maxTokens, noThink);
 }
 
 main().catch((err) => {

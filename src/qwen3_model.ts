@@ -4,17 +4,11 @@ import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, F32, SAMPLING_MAX_TO
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
-import { FlatKVCache } from "./flat_kv";
 import { Tensor, OpContext } from "./tensor";
+import type { ChatModel, ChatCache } from "./chat_model";
+import { SamplingParams } from "./chat_model";
 
-export interface SamplingParams {
-  temperature: number;
-  topP: number;
-  topK: number;
-  repetitionPenalty: number;
-  presencePenalty: number;
-  repetitionPenaltyWindow: number;
-}
+export type { SamplingParams };
 
 export interface Qwen3Config {
   hiddenSize: number;
@@ -164,7 +158,8 @@ export interface PrefillState {
   pageAllocs: [number, number][];
 }
 
-export class Qwen3Model implements OpContext {
+export class Qwen3Model implements OpContext, ChatModel {
+  readonly eosIds = new Set([151645, 151643]);
   glm: GlmOps;
   cfg: Qwen3Config;
   weights: Map<string, Tensor>;
@@ -240,8 +235,13 @@ export class Qwen3Model implements OpContext {
     this.weights = new Map();
   }
 
-  createFlatKVCache(): FlatKVCache {
-    return new FlatKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, this.maxBatch, this.maxSeqLen);
+  createChatCache(maxPages = 256): ChatCache {
+    return new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, maxPages, this.maxBatch);
+  }
+
+  *chatStream(inputIds: number[][], cache: ChatCache, ws: WorkspaceBuffers, maxNewTokens = 100, eosIds?: Set<number>, sampling?: SamplingParams): Generator<number> {
+    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
+    yield* this.streamTokens(inputIds, ws, cache, maxNewTokens, eosIds ?? this.eosIds, sampling);
   }
 
   private readArgmax(ptr: Tensor | number, count: number): number {
@@ -315,128 +315,41 @@ export class Qwen3Model implements OpContext {
     return result;
   }
 
-  prefill(inputIds: number[][], cache: FlatKVCache): number {
-    const B = inputIds.length;
-    const S = inputIds[0].length;
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const hs = cfg.hiddenSize;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const vs = cfg.vocabSize;
-    const BS = B * S;
-
-    if (B > this.maxBatch || S > this.maxSeqLen) {
-      throw new Error(`input (B=${B}, S=${S}) exceeds max (B=${this.maxBatch}, S=${this.maxSeqLen})`);
-    }
-    if (cache.cachePos !== 0) {
-      throw new Error("Cache must be reset before prefill");
-    }
-
-    const flat = new Int32Array(B * S);
-    for (let b = 0; b < B; b++) {
-      for (let s = 0; s < S; s++) {
-        flat[b * S + s] = inputIds[b][s];
-      }
-    }
-    this.ws.inputIdsBuf.h2d(Buffer.from(flat.buffer, flat.byteOffset, flat.byteLength));
-    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
-
-    this.ws.positionIds.arange(0, 1, S);
-    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, B, S);
-    for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      this.decoderLayerPrefillFlash(B, S, i, `model.layers.${i}`, cache);
-    }
-
-    const lastIdxBuf = Int32Array.from([S - 1]);
-    this.extractLastLogits(1, Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
-
-    cache.cachePos = S;
-
-    return this.readArgmax(this.ws.logitsBuf, vs);
+  prefill(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number {
+    return this.prefillBatch(inputIds, ws, pagedKV)[0];
   }
 
-  private decodeToken(tokenId: number, cache: FlatKVCache): void {
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const hs = cfg.hiddenSize;
-    const hd = cfg.headDim;
-    const vs = cfg.vocabSize;
-    const B = 1;
-    const S = 1;
-    const BS = 1;
-    const cachedLen = cache.cachePos;
-
-    if (cachedLen === 0) throw new Error("Must prefill before decode");
-    if (cachedLen + S > this.maxSeqLen) throw new Error("Cache overflow");
-
-    const idsBuf = Buffer.alloc(I32);
-    idsBuf.writeInt32LE(tokenId, 0);
-    this.ws.decodeId.h2d(idsBuf);
-
-    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.decodeId, hs, BS);
-    this.ws.positionIds.arange(cachedLen, 0, 1);
-    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, B, S);
-
-    for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      this.decoderLayerDecodeFlash(B, S, i, `model.layers.${i}`, cachedLen, cache);
-    }
-
-    this.finalNormAndLogits(BS);
-
-    cache.cachePos = cachedLen + S;
+  decode(tokenId: number, ws: WorkspaceBuffers, pagedKV: PagedKVCache): number {
+    return this.decodeBatch([tokenId], ws, pagedKV)[0];
   }
 
-  decode(tokenId: number, cache: FlatKVCache): number {
-    this.decodeToken(tokenId, cache);
-    return this.readArgmax(this.ws.logitsBuf, this.cfg.vocabSize);
+  generateTokens(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[] {
+    return [...this.streamTokens(inputIds, ws, pagedKV, maxNewTokens, eosTokenIds)];
   }
 
-  generateTokens(inputIds: number[][], cache: FlatKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[] {
-    return [...this.streamTokens(inputIds, cache, maxNewTokens, eosTokenIds)];
-  }
-
-  *streamTokens(inputIds: number[][], cache: FlatKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643]), sampling?: SamplingParams): Generator<number> {
+  *streamTokens(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643]), sampling?: SamplingParams): Generator<number> {
     const vs = this.cfg.vocabSize;
     if (inputIds.length !== 1) throw new Error("streamTokens only supports batch=1");
 
-    cache.reset();
-    let nextToken = this.prefill(inputIds, cache);
+    const firstTokens = this.prefillBatch(inputIds, ws, pagedKV);
+    let nextToken = firstTokens[0];
     yield nextToken;
 
     const tokenHistory = [...inputIds[0], nextToken];
 
     for (let i = 0; i < maxNewTokens - 1; i++) {
       if (eosTokenIds.has(nextToken)) break;
-      this.decodeToken(nextToken, cache);
+
+      const decodeTokens = this.decodeBatch([nextToken], ws, pagedKV);
+      nextToken = decodeTokens[0];
 
       if (sampling && (sampling.temperature > 0 || sampling.repetitionPenalty !== 1.0 || sampling.presencePenalty !== 0 || sampling.topK > 0 || sampling.topP < 1.0)) {
         nextToken = this.sampleTokenGPU(sampling, tokenHistory);
-      } else {
-        nextToken = this.readArgmax(this.ws.logitsBuf, vs);
       }
+
       tokenHistory.push(nextToken);
       yield nextToken;
     }
-  }
-
-  private decoderLayerPrefillFlash(B: number, S: number, layerIdx: number, pfx: string, cache: FlatKVCache): void {
-    const cfg = this.cfg;
-    const BS = B * S;
-
-    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, cfg.hiddenSize, BS);
-    this.attentionPrefillFlash(B, S, layerIdx, pfx, cache);
-    this.residualAndMlp(pfx, BS);
-  }
-
-  private decoderLayerDecodeFlash(B: number, S: number, layerIdx: number, pfx: string, cachedLen: number, cache: FlatKVCache): void {
-    const cfg = this.cfg;
-    const BS = B * S;
-
-    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, cfg.hiddenSize, BS);
-    this.attentionDecodeFlash(B, S, layerIdx, pfx, cachedLen, cache);
-    this.residualAndMlp(pfx, BS);
   }
 
   private mlp(BS: number, pfx: string): void {
@@ -482,21 +395,6 @@ export class Qwen3Model implements OpContext {
     this.ws.kRope.applyRotaryPosEmb(this.ws.kT, this.ws.cos, this.ws.sin, hd, nKv, S, B, 1);
   }
 
-  private writeKvFlat(layerIdx: number, S: number, cache: FlatKVCache, offset = 0): void {
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const maxS = this.maxSeqLen;
-
-    for (let h = 0; h < nKv; h++) {
-      const srcOff = h * S * hd * BF16;
-      const dstOff = (h * maxS * hd + offset * hd) * BF16;
-      glm.memcpy(cache.kData[layerIdx] + dstOff, this.ws.kRope.data + srcOff, S * hd * BF16);
-      glm.memcpy(cache.vData[layerIdx] + dstOff, this.ws.vT.data + srcOff, S * hd * BF16);
-    }
-  }
-
   private finalNormAndLogits(count: number, src?: Tensor): void {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
@@ -510,73 +408,6 @@ export class Qwen3Model implements OpContext {
     this.ws.lastIdx.h2d(lastIndicesBuf);
     this.ws.hiddenLast.indexSelect(this.ws.hiddenA, this.ws.lastIdx, this.cfg.hiddenSize, count);
     this.finalNormAndLogits(count, this.ws.hiddenLast);
-  }
-
-  private attentionPrefillFlash(B: number, S: number, layerIdx: number, pfx: string, cache: FlatKVCache): void {
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const hs = cfg.hiddenSize;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const maxS = this.maxSeqLen;
-    const BS = B * S;
-
-    this.computeQkv(pfx, BS, B, S);
-    this.writeKvFlat(layerIdx, S, cache);
-
-    const kvStrideH = maxS * hd;
-    const kvStrideN = hd;
-
-    glm.flashPrefill(
-      this.ws.qRope.data,
-      cache.kData[layerIdx],
-      cache.vData[layerIdx],
-      this.ws.flashOut.data,
-      this.ws.flashTmp.data,
-      S, S,
-      nHeads, nKv, hd,
-      hd, S * hd,
-      kvStrideN, kvStrideH,
-      kvStrideN, kvStrideH,
-      1, 1,
-      cfg.scaling,
-    );
-
-    this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd, this);
-  }
-
-  private attentionDecodeFlash(B: number, S: number, layerIdx: number, pfx: string, cachedLen: number, cache: FlatKVCache): void {
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const hs = cfg.hiddenSize;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const maxS = this.maxSeqLen;
-    const BS = B * S;
-    const totalLen = cachedLen + S;
-
-    this.computeQkv(pfx, BS, B, S);
-    this.writeKvFlat(layerIdx, S, cache, cachedLen);
-
-    const kvStrideH = maxS * hd;
-    const kvStrideN = hd;
-
-    glm.flashDecode(
-      this.ws.qRope.data,
-      cache.kData[layerIdx],
-      cache.vData[layerIdx],
-      this.ws.flashOut.data,
-      this.ws.flashTmp.data,
-      totalLen,
-      nHeads, nKv, hd,
-      hd, S * hd,
-      kvStrideN, kvStrideH,
-      cfg.scaling,
-    );
-
-    this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd, this);
   }
 
   prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): PrefillState {
@@ -834,6 +665,7 @@ export class Qwen3Model implements OpContext {
     const glm = this.glm;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
     const pageSize = pagedKV.pageSize;
     const batchSize = tokenIdsList.length;
 
@@ -861,7 +693,7 @@ export class Qwen3Model implements OpContext {
       ws.decodePlanInfo,
       pagedKV.indptrH,
       batchSize,
-      nHeads, nKv, pageSize,
+      nHeads, nKv, hd, pageSize,
       enableCudaGraph
     );
 
@@ -933,7 +765,9 @@ export class Qwen3Model implements OpContext {
     return this.decodeBatchRead(state);
   }
 
-  generateBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[][] {
+  generateBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[][] {
+    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
+    const pagedKV = cache;
     const batchSize = inputIdsList.length;
     const vs = this.cfg.vocabSize;
 

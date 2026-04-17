@@ -1,6 +1,6 @@
 import { GlmOps } from "./glm_ops";
 import { Qwen3Model } from "./qwen3_model";
-import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
+import { WorkspaceBuffers } from "./paged_kv";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
@@ -43,13 +43,8 @@ async function main(): Promise<void> {
   const modelDir = resolveModelPath(QWEN3_REPO);
   const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
 
-  const cfg = (model as any).cfg;
-  const nKv = cfg.numKeyValueHeads;
-  const hd = cfg.headDim;
-  const nLayers = cfg.numHiddenLayers;
-
   const ws = new WorkspaceBuffers(glm);
-  const pagedKV = new PagedKVCache(glm, nKv, hd, nLayers, maxPages, maxBatch);
+  const cache = model.createChatCache(maxPages);
 
   const enableThinking = !noThink;
 
@@ -103,7 +98,7 @@ async function main(): Promise<void> {
       }
 
       const start = Date.now();
-      const generatedIds = model.generateBatch(inputIdsList, ws, pagedKV, maxTokens, EOS_TOKEN_IDS);
+      const generatedIds = model.generateBatch(inputIdsList, ws, cache, maxTokens, EOS_TOKEN_IDS);
       const elapsed = (Date.now() - start) / 1000;
       const totalTokens = generatedIds.reduce((sum, ids) => sum + ids.length, 0);
 
@@ -116,7 +111,7 @@ async function main(): Promise<void> {
       console.log(`\n  [${prompts.length} prompts, ${totalTokens} tokens, ${elapsed.toFixed(1)}s, ${(totalTokens / elapsed).toFixed(1)} tok/s]`);
     }
   } finally {
-    pagedKV.free();
+    cache.free();
     ws.free();
     model.free();
     rl.close();

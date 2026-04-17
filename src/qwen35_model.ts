@@ -1,24 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, F32, SAMPLING_MAX_TOPK } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, F32, SAMPLING_MAX_TOPK, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, PAGE_SIZE } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
-import { FlatKVCache } from "./flat_kv";
 import { Tensor, OpContext } from "./tensor";
 import { Qwen35GdnState } from "./qwen35_gdn_state";
+import type { ChatModel, ChatCache } from "./chat_model";
+import { SamplingParams, Qwen35ChatCache } from "./chat_model";
+
+export type { SamplingParams };
 
 const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
 const EOS_TOKEN_IDS = new Set([248044]);
-
-export interface SamplingParams {
-  temperature: number;
-  topP: number;
-  topK: number;
-  repetitionPenalty: number;
-  presencePenalty: number;
-  repetitionPenaltyWindow: number;
-}
 
 export interface Qwen35Config {
   hiddenSize: number;
@@ -143,6 +137,8 @@ class Qwen35Workspace {
   sampleTopkIdxs: Tensor;
   sampleWorkspace: Tensor;
   samplePenaltyTokens: Tensor;
+  qoIndptrD: Tensor;
+  prefillSlotMapping: Tensor;
   tensors = new Map<string, Tensor>();
 
   constructor(glm: GlmOps, B: number, S: number, cfg: Qwen35Config) {
@@ -222,6 +218,9 @@ class Qwen35Workspace {
     this.sampleWorkspace = Tensor.alloc(glm, [vs], "F32");
     this.samplePenaltyTokens = Tensor.alloc(glm, [1024], "I32");
 
+    this.qoIndptrD = Tensor.alloc(glm, [B + 1], "I32");
+    this.prefillSlotMapping = Tensor.alloc(glm, [B * S], "I32");
+
     for (const key of Object.keys(this) as (keyof this)[]) {
       const value = this[key];
       if (value instanceof Tensor && typeof key === 'string') {
@@ -250,7 +249,8 @@ export interface Qwen35PrefillState {
   pageAllocs: [number, number][];
 }
 
-export class Qwen35Model implements OpContext {
+export class Qwen35Model implements OpContext, ChatModel {
+  readonly eosIds = new Set([248044]);
   glm: GlmOps;
   cfg: Qwen35Config;
   weights: Map<string, Tensor>;
@@ -321,8 +321,6 @@ export class Qwen35Model implements OpContext {
           gemmaNormSuffixes.some(s => weightName.endsWith(s));
 
         if (weightName.includes("A_log") || weightName.includes("dt_bias")) {
-          // A_log and dt_bias are used as float32 by GDN kernels
-          // A_log is stored as F32; dt_bias is stored as BF16 but must be uploaded as F32
           const numElements = meta.shape.reduce((a, b) => a * b, 1);
           const tensor = Tensor.alloc(glm, meta.shape, "F32", weightName);
           if (meta.dtype === "F32") {
@@ -398,12 +396,15 @@ export class Qwen35Model implements OpContext {
     return new Qwen35GdnState(this.glm, this.cfg);
   }
 
-  createFlatKVCache(): FlatKVCache {
-    return new FlatKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, this.maxBatch, this.maxSeqLen);
+  createChatCache(maxPages = 256): ChatCache {
+    const pagedKV = new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, this.maxBatch);
+    const gdnState = this.createGdnState();
+    return new Qwen35ChatCache(pagedKV, gdnState);
   }
 
-  createPagedKVCache(maxPages = 256): PagedKVCache {
-    return new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, this.maxBatch);
+  *chatStream(inputIds: number[][], cache: ChatCache, ws: WorkspaceBuffers, maxNewTokens = 100, eosIds?: Set<number>, sampling?: SamplingParams): Generator<number> {
+    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+    yield* this.streamTokens(inputIds, ws, cache.pagedKV, cache.gdnState, maxNewTokens, eosIds ?? this.eosIds, sampling);
   }
 
   private fullAttnCacheIdx(layerIdx: number): number {
@@ -438,103 +439,6 @@ export class Qwen35Model implements OpContext {
     const buf = Buffer.alloc(vs * BF16);
     this.glm.d2h(buf, this.ws.logitsBuf.data, vs * BF16);
     return bf16BytesToF32(buf);
-  }
-
-  sampleToken(logits: Float32Array, params: SamplingParams, tokenHistory: number[]): number {
-    const vs = logits.length;
-
-    // Repetition penalty: divide positive logits, multiply negative logits
-    if (params.repetitionPenalty !== 1.0) {
-      const seen = new Set<number>();
-      const start = Math.max(0, tokenHistory.length - params.repetitionPenaltyWindow);
-      for (let i = start; i < tokenHistory.length; i++) seen.add(tokenHistory[i]);
-      for (const tid of seen) {
-        if (tid < vs) {
-          logits[tid] = logits[tid] > 0 ? logits[tid] / params.repetitionPenalty : logits[tid] * params.repetitionPenalty;
-        }
-      }
-    }
-
-    // Presence penalty: flat subtraction for tokens that appeared
-    if (params.presencePenalty !== 0) {
-      const seen = new Set<number>();
-      const start = Math.max(0, tokenHistory.length - params.repetitionPenaltyWindow);
-      for (let i = start; i < tokenHistory.length; i++) seen.add(tokenHistory[i]);
-      for (const tid of seen) {
-        if (tid < vs) logits[tid] -= params.presencePenalty;
-      }
-    }
-
-    // Greedy: temperature <= 0 with no topK
-    if (params.temperature <= 0 && params.topK <= 0) {
-      let best = 0;
-      for (let i = 1; i < vs; i++) {
-        if (logits[i] > logits[best]) best = i;
-      }
-      return best;
-    }
-
-    // Temperature scaling
-    const invTemp = params.temperature > 0 ? 1.0 / params.temperature : 1.0;
-    let maxLogit = -Infinity;
-    for (let i = 0; i < vs; i++) {
-      logits[i] *= invTemp;
-      if (logits[i] > maxLogit) maxLogit = logits[i];
-    }
-
-    // Top-K: zero out tokens beyond the k highest
-    if (params.topK > 0 && params.topK < vs) {
-      const indices = Array.from({ length: vs }, (_, i) => i);
-      indices.sort((a, b) => logits[b] - logits[a]);
-      const threshold = logits[indices[params.topK]];
-      for (let i = 0; i < vs; i++) {
-        if (logits[i] < threshold) logits[i] = -Infinity;
-      }
-      // Recompute maxLogit
-      maxLogit = logits[indices[0]];
-    }
-
-    // Softmax
-    let sumExp = 0;
-    for (let i = 0; i < vs; i++) {
-      const v = logits[i] - maxLogit;
-      logits[i] = v > -30 ? Math.exp(v) : 0;
-      sumExp += logits[i];
-    }
-
-    // Top-P: zero out tokens beyond cumulative probability threshold
-    if (params.topP < 1.0 && params.topK <= 0) {
-      const sorted = Array.from({ length: vs }, (_, i) => i).sort((a, b) => logits[b] - logits[a]);
-      let cumSum = 0;
-      let cutoff = vs;
-      for (let i = 0; i < sorted.length; i++) {
-        cumSum += logits[sorted[i]] / sumExp;
-        if (cumSum > params.topP) {
-          cutoff = i + 1;
-          break;
-        }
-      }
-      const allowed = new Set(sorted.slice(0, cutoff));
-      let renorm = 0;
-      for (let i = 0; i < vs; i++) {
-        if (!allowed.has(i)) logits[i] = 0;
-        else renorm += logits[i];
-      }
-      if (renorm > 0) {
-        for (let i = 0; i < vs; i++) logits[i] /= renorm;
-      }
-    } else {
-      for (let i = 0; i < vs; i++) logits[i] /= sumExp;
-    }
-
-    // Sample
-    let r = Math.random();
-    let cumSum = 0;
-    for (let i = 0; i < vs; i++) {
-      cumSum += logits[i];
-      if (r <= cumSum) return i;
-    }
-    return vs - 1;
   }
 
   private sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number {
@@ -737,21 +641,105 @@ export class Qwen35Model implements OpContext {
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
   }
 
-  private fullAttnLayerPrefillFlash(layerIdx: number, B: number, S: number, cache: FlatKVCache): void {
+  private fullAttnLayerPrefillPaged(layerIdx: number, totalTokens: number, batchSize: number, pagedKV: PagedKVCache, ws: WorkspaceBuffers, gdnState: Qwen35GdnState): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
-    const maxS = this.maxSeqLen;
-    const BS = B * S;
+    const pageSize = pagedKV.pageSize;
     const cacheIdx = this.fullAttnCacheIdx(layerIdx);
     const pfx = `layers.${layerIdx}.self_attn`;
     const qTotalDim = nHeads * hd;
 
+    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`layers.${layerIdx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+
+    const qBuf = this.ws.attnQBuf;
+    const qOnly = this.ws.attnQOnly;
+    const kBuf = this.ws.attnKBuf;
+    const vBuf = this.ws.attnVBuf;
+    const gateBuf = this.ws.attnGateBuf;
+
+    qBuf.linear(this.ws.normed, this.weights.get(`${pfx}.q_proj.weight`)!, totalTokens, qTotalDim * 2, hs, this);
+    glm.interleavedSplit(qOnly.data, gateBuf.data, qBuf.data, totalTokens, nHeads, hd);
+    kBuf.linear(this.ws.normed, this.weights.get(`${pfx}.k_proj.weight`)!, totalTokens, nKv * hd, hs, this);
+    vBuf.linear(this.ws.normed, this.weights.get(`${pfx}.v_proj.weight`)!, totalTokens, nKv * hd, hs, this);
+
+    const qNormed = this.ws.attnQNormed;
+    const kNormed = this.ws.attnKNormed;
+    qNormed.rmsnorm(qOnly, this.weights.get(`${pfx}.q_norm.weight`)!, cfg.rmsNormEps, hd, totalTokens * nHeads);
+    kNormed.rmsnorm(kBuf, this.weights.get(`${pfx}.k_norm.weight`)!, cfg.rmsNormEps, hd, totalTokens * nKv);
+
+    const qT = this.ws.attnQT;
+    const kT = this.ws.attnKT;
+    const vT = this.ws.attnVT;
+
+    qT.transpose4d(qNormed, 1, totalTokens, nHeads, hd, 0, 2, 1, 3);
+    kT.transpose4d(kNormed, 1, totalTokens, nKv, hd, 0, 2, 1, 3);
+    vT.transpose4d(vBuf, 1, totalTokens, nKv, hd, 0, 2, 1, 3);
+
+    const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
+    const qRope = this.ws.attnQRope;
+    const kRope = this.ws.attnKRope;
+
+    qRope.applyRotaryPosEmbPartial(qT, this.ws.cos, this.ws.sin, ropeDim, hd, nHeads, totalTokens, 1, 1);
+    kRope.applyRotaryPosEmbPartial(kT, this.ws.cos, this.ws.sin, ropeDim, hd, nKv, totalTokens, 1, 1);
+
+    glm.kvCacheWrite(
+      kRope.data, vT.data,
+      pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
+      this.ws.prefillSlotMapping.data,
+      totalTokens, nKv, hd, pageSize,
+      hd, totalTokens * hd
+    );
+
+    const qStrideN = hd;
+    const qStrideH = totalTokens * hd;
+
+    glm.batchPrefillPagedRun(
+      qRope.data, this.ws.flashOut.data,
+      pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
+      pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
+      ws.floatWs, ws.intWs,
+      this.ws.qoIndptrD.data,
+      ws.prefillPlanInfo,
+      totalTokens, batchSize,
+      nHeads, nKv, hd,
+      pageSize,
+      qStrideN, qStrideH,
+      1, cfg.scaling
+    );
+
+    if (cfg.attnOutputGate) {
+      const sigBuf = this.ws.attnSigBuf;
+      sigBuf.sigmoid(gateBuf, totalTokens * nHeads * hd);
+      this.ws.flashOut.mul(this.ws.flashOut, sigBuf, totalTokens * nHeads * hd);
+    }
+
+    this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.o_proj.weight`)!, totalTokens, hs, nHeads * hd, this);
+
+    this.ws.hiddenB.add(this.ws.hiddenA, this.ws.oProjBuf, totalTokens * hs);
+    this.ws.normed.rmsnorm(this.ws.hiddenB, this.weights.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+    this.mlp(`layers.${layerIdx}`, totalTokens);
+    this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, totalTokens * hs);
+  }
+
+  private fullAttnLayerDecodePaged(layerIdx: number, batchSize: number, pagedKV: PagedKVCache, ws: WorkspaceBuffers, gdnState: Qwen35GdnState): void {
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const hs = cfg.hiddenSize;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const pageSize = pagedKV.pageSize;
+    const cacheIdx = this.fullAttnCacheIdx(layerIdx);
+    const pfx = `layers.${layerIdx}.self_attn`;
+    const BS = batchSize;
+
     this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`layers.${layerIdx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
+    const qTotalDim = nHeads * hd;
     const qBuf = this.ws.attnQBuf;
     const qOnly = this.ws.attnQOnly;
     const kBuf = this.ws.attnKBuf;
@@ -772,34 +760,34 @@ export class Qwen35Model implements OpContext {
     const kT = this.ws.attnKT;
     const vT = this.ws.attnVT;
 
-    qT.transpose4d(qNormed, B, S, nHeads, hd, 0, 2, 1, 3);
-    kT.transpose4d(kNormed, B, S, nKv, hd, 0, 2, 1, 3);
-    vT.transpose4d(vBuf, B, S, nKv, hd, 0, 2, 1, 3);
+    qT.transpose4d(qNormed, BS, 1, nHeads, hd, 0, 2, 1, 3);
+    kT.transpose4d(kNormed, BS, 1, nKv, hd, 0, 2, 1, 3);
+    vT.transpose4d(vBuf, BS, 1, nKv, hd, 0, 2, 1, 3);
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
     const qRope = this.ws.attnQRope;
     const kRope = this.ws.attnKRope;
 
-    qRope.applyRotaryPosEmbPartial(qT, this.ws.cos, this.ws.sin, ropeDim, hd, nHeads, S, B, 1);
-    kRope.applyRotaryPosEmbPartial(kT, this.ws.cos, this.ws.sin, ropeDim, hd, nKv, S, B, 1);
+    qRope.applyRotaryPosEmbPartial(qT, this.ws.cos, this.ws.sin, ropeDim, hd, nHeads, 1, BS, 1);
+    kRope.applyRotaryPosEmbPartial(kT, this.ws.cos, this.ws.sin, ropeDim, hd, nKv, 1, BS, 1);
 
-    const kvStrideH = maxS * hd;
-    const kvStrideN = hd;
-    for (let h = 0; h < nKv; h++) {
-      const srcOff = h * S * hd * BF16;
-      const dstOff = h * maxS * hd * BF16;
-      glm.memcpy(cache.kData[cacheIdx] + dstOff, kRope.data + srcOff, S * hd * BF16);
-      glm.memcpy(cache.vData[cacheIdx] + dstOff, vT.data + srcOff, S * hd * BF16);
-    }
+    glm.kvCacheWrite(
+      kRope.data, vT.data,
+      pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
+      pagedKV.slotMapping,
+      BS, nKv, hd, pageSize,
+      nKv * hd, hd
+    );
 
-    glm.flashPrefill(
-      qRope.data, cache.kData[cacheIdx], cache.vData[cacheIdx],
-      this.ws.flashOut.data, this.ws.flashTmp.data,
-      S, S, nHeads, nKv, hd,
-      hd, S * hd,
-      kvStrideN, kvStrideH,
-      kvStrideN, kvStrideH,
-      1, 1, cfg.scaling,
+    glm.batchDecodeRun(
+      qRope.data, this.ws.flashOut.data,
+      pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
+      pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
+      ws.floatWs, ws.intWs,
+      ws.decodePlanInfo,
+      BS,
+      nHeads, nKv, hd, pageSize,
+      cfg.scaling
     );
 
     if (cfg.attnOutputGate) {
@@ -816,232 +804,375 @@ export class Qwen35Model implements OpContext {
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
   }
 
-  private fullAttnLayerDecodeFlash(layerIdx: number, cachedLen: number, cache: FlatKVCache): void {
+  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): Qwen35PrefillState {
     const cfg = this.cfg;
     const glm = this.glm;
-    const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
-    const maxS = this.maxSeqLen;
-    const BS = 1;
-    const S = 1;
-    const totalLen = cachedLen + 1;
-    const cacheIdx = this.fullAttnCacheIdx(layerIdx);
-    const pfx = `layers.${layerIdx}.self_attn`;
+    const pageSize = pagedKV.pageSize;
+    const batchSize = inputIdsList.length;
 
-    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`layers.${layerIdx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-
-    const qTotalDim = nHeads * hd;
-    const qBuf = this.ws.attnQBuf;
-    const qOnly = this.ws.attnQOnly;
-    const kBuf = this.ws.attnKBuf;
-    const vBuf = this.ws.attnVBuf;
-    const gateBuf = this.ws.attnGateBuf;
-
-    qBuf.linear(this.ws.normed, this.weights.get(`${pfx}.q_proj.weight`)!, BS, qTotalDim * 2, hs, this);
-    glm.interleavedSplit(qOnly.data, gateBuf.data, qBuf.data, BS, nHeads, hd);
-    kBuf.linear(this.ws.normed, this.weights.get(`${pfx}.k_proj.weight`)!, BS, nKv * hd, hs, this);
-    vBuf.linear(this.ws.normed, this.weights.get(`${pfx}.v_proj.weight`)!, BS, nKv * hd, hs, this);
-
-    const qNormed = this.ws.attnQNormed;
-    const kNormed = this.ws.attnKNormed;
-    qNormed.rmsnorm(qOnly, this.weights.get(`${pfx}.q_norm.weight`)!, cfg.rmsNormEps, hd, BS * nHeads);
-    kNormed.rmsnorm(kBuf, this.weights.get(`${pfx}.k_norm.weight`)!, cfg.rmsNormEps, hd, BS * nKv);
-
-    const qT = this.ws.attnQT;
-    const kT = this.ws.attnKT;
-    const vT = this.ws.attnVT;
-
-    qT.transpose4d(qNormed, BS, S, nHeads, hd, 0, 2, 1, 3);
-    kT.transpose4d(kNormed, BS, S, nKv, hd, 0, 2, 1, 3);
-    vT.transpose4d(vBuf, BS, S, nKv, hd, 0, 2, 1, 3);
-
-    const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    const qRope = this.ws.attnQRope;
-    const kRope = this.ws.attnKRope;
-
-    qRope.applyRotaryPosEmbPartial(qT, this.ws.cos, this.ws.sin, ropeDim, hd, nHeads, S, BS, 1);
-    kRope.applyRotaryPosEmbPartial(kT, this.ws.cos, this.ws.sin, ropeDim, hd, nKv, S, BS, 1);
-
-    const kvStrideH = maxS * hd;
-    const kvStrideN = hd;
-    for (let h = 0; h < nKv; h++) {
-      const srcOff = h * hd * BF16;
-      const dstOff = (h * maxS * hd + cachedLen * hd) * BF16;
-      glm.memcpy(cache.kData[cacheIdx] + dstOff, kRope.data + srcOff, hd * BF16);
-      glm.memcpy(cache.vData[cacheIdx] + dstOff, vT.data + srcOff, hd * BF16);
-    }
-
-    glm.flashDecode(
-      qRope.data, cache.kData[cacheIdx], cache.vData[cacheIdx],
-      this.ws.flashOut.data, this.ws.flashTmp.data,
-      totalLen, nHeads, nKv, hd,
-      hd, S * hd,
-      kvStrideN, kvStrideH,
-      cfg.scaling,
-    );
-
-    if (cfg.attnOutputGate) {
-      const sigBuf = this.ws.attnSigBuf;
-      sigBuf.sigmoid(gateBuf, BS * nHeads * hd);
-      this.ws.flashOut.mul(this.ws.flashOut, sigBuf, BS * nHeads * hd);
-    }
-
-    this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.o_proj.weight`)!, BS, hs, nHeads * hd, this);
-
-    this.ws.hiddenB.add(this.ws.hiddenA, this.ws.oProjBuf, BS * hs);
-    this.ws.normed.rmsnorm(this.ws.hiddenB, this.weights.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-    this.mlp(`layers.${layerIdx}`, BS);
-    this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
-  }
-
-  prefill(inputIds: number[][], cache: FlatKVCache, gdnState: Qwen35GdnState): number {
-    const B = inputIds.length;
-    const S = inputIds[0].length;
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const hs = cfg.hiddenSize;
-    const hd = cfg.headDim;
-    const vs = cfg.vocabSize;
-    const BS = B * S;
-
-    if (B > this.maxBatch || S > this.maxSeqLen) {
-      throw new Error(`input (B=${B}, S=${S}) exceeds max (B=${this.maxBatch}, S=${this.maxSeqLen})`);
-    }
-    if (cache.cachePos !== 0) {
-      throw new Error("Cache must be reset before prefill");
-    }
-
+    pagedKV.reset(batchSize);
     gdnState.reset();
 
-    const flat = new Int32Array(B * S);
-    for (let b = 0; b < B; b++) {
-      for (let s = 0; s < S; s++) {
-        flat[b * S + s] = inputIds[b][s];
+    const seqLens = inputIdsList.map(ids => ids.length);
+    const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+
+    if (totalTokens > this.maxBatch * this.maxSeqLen) {
+      throw new Error(`Total tokens ${totalTokens} exceeds max (B=${this.maxBatch}, S=${this.maxSeqLen})`);
+    }
+
+    const pageAllocs: [number, number][] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      pageAllocs.push(pagedKV.allocPrefillPages(seqIdx, seqLens[seqIdx]));
+    }
+
+    const allIds: number[] = [];
+    for (const ids of inputIdsList) allIds.push(...ids);
+    const idsBuf = Int32Array.from(allIds);
+    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+
+    const qoIndptr = [0];
+    for (const s of seqLens) {
+      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
+    }
+    const qoIndptrBuf = Int32Array.from(qoIndptr);
+
+    pagedKV.updateIndptr();
+
+    const posIds: number[] = [];
+    for (const s of seqLens) {
+      for (let p = 0; p < s; p++) posIds.push(p);
+    }
+    const posIdsBuf = Int32Array.from(posIds);
+    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+
+    const lastIndices: number[] = [];
+    let offset = 0;
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      lastIndices.push(offset + seqLens[seqIdx] - 1);
+      offset += seqLens[seqIdx];
+    }
+    const lastIdxBuf = Int32Array.from(lastIndices);
+    this.ws.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+
+    const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
+    glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    glm.batchPrefillPagedPlan(
+      ws.floatWs, BATCH_FLOAT_WS_SIZE,
+      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
+      ws.prefillPlanInfo,
+      qoIndptrHostPtr, pagedKV.indptrH,
+      totalTokens, batchSize,
+      nHeads, nKv, hd,
+      pageSize,
+      1
+    );
+
+    glm.freePinned(qoIndptrHostPtr);
+
+    this.ws.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    const slotMapping: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const pages = pagedKV.seqPages[seqIdx];
+      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
+        const pageIdxInSeq = Math.floor(pos / pagedKV.pageSize);
+        const offsetInPage = pos % pagedKV.pageSize;
+        const absPage = pages[pageIdxInSeq];
+        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
       }
     }
-    this.ws.inputIdsBuf.h2d(Buffer.from(flat.buffer, flat.byteOffset, flat.byteLength));
-    this.ws.hiddenA.embedding(this.weights.get("embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
+    const slotMappingBuf = Int32Array.from(slotMapping);
+    this.ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+
+    return { batchSize, totalTokens, seqLens, pageAllocs };
+  }
+
+  prefillBatchForward(state: Qwen35PrefillState, ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): void {
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const hs = cfg.hiddenSize;
+    const hd = cfg.headDim;
+    const batchSize = state.batchSize;
+    const totalTokens = state.totalTokens;
+
+    this.ws.hiddenA.embedding(this.weights.get("embed_tokens.weight")!, this.ws.inputIdsBuf, hs, totalTokens);
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    this.ws.positionIds.arange(0, 1, S);
-    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, ropeDim / 2, B, S);
+    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, ropeDim / 2, 1, totalTokens);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       if (cfg.layerTypes[i] === "linear_attention") {
-        this.gdnLayerPrefill(i, S, gdnState);
+        this.gdnLayerPrefill(i, totalTokens, gdnState);
       } else {
-        this.fullAttnLayerPrefillFlash(i, B, S, cache);
+        this.fullAttnLayerPrefillPaged(i, totalTokens, batchSize, pagedKV, ws, gdnState);
       }
     }
 
-    const lastIdxBuf = Int32Array.from([S - 1]);
-    this.extractLastLogits(1, Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+    this.ws.hiddenLast.indexSelect(this.ws.hiddenA, this.ws.lastIdx, hs, batchSize);
+    this.finalNormAndLogits(batchSize, this.ws.hiddenLast);
 
-    cache.cachePos = S;
-
-    return this.readArgmax(this.ws.logitsBuf, vs);
+    this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
   }
 
-  private decodeToken(tokenId: number, cache: FlatKVCache, cachedLen: number, gdnState: Qwen35GdnState): void {
+  prefillBatchRead(state: Qwen35PrefillState): number[] {
+    const batchSize = state.batchSize;
+    const buf = Buffer.alloc(batchSize * I32);
+    this.ws.argmaxIdx.d2h(buf);
+    const result: number[] = [];
+    for (let i = 0; i < batchSize; i++) {
+      result.push(buf.readInt32LE(i * I32));
+    }
+    return result;
+  }
+
+  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): number[] {
+    const state = this.prefillBatchPlan(inputIdsList, ws, pagedKV, gdnState);
+    this.prefillBatchForward(state, ws, pagedKV, gdnState);
+    return this.prefillBatchRead(state);
+  }
+
+  prefillBatchAppendPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): Qwen35PrefillState {
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const pageSize = pagedKV.pageSize;
+    const batchSize = inputIdsList.length;
+
+    if (pagedKV.seqPages.length !== batchSize) {
+      throw new Error(`prefillBatchAppend: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+    }
+
+    const seqLens = inputIdsList.map(ids => ids.length);
+    const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);
+    }
+
+    const allIds: number[] = [];
+    for (const ids of inputIdsList) allIds.push(...ids);
+    const idsBuf = Int32Array.from(allIds);
+    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+
+    const qoIndptr = [0];
+    for (const s of seqLens) {
+      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
+    }
+    const qoIndptrBuf = Int32Array.from(qoIndptr);
+
+    pagedKV.updateIndptr();
+
+    const posIds: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const startPos = pagedKV.seqKvLens[seqIdx] - seqLens[seqIdx];
+      for (let p = 0; p < seqLens[seqIdx]; p++) {
+        posIds.push(startPos + p);
+      }
+    }
+    const posIdsBuf = Int32Array.from(posIds);
+    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+
+    const lastIndices: number[] = [];
+    let offset = 0;
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      lastIndices.push(offset + seqLens[seqIdx] - 1);
+      offset += seqLens[seqIdx];
+    }
+    const lastIdxBuf = Int32Array.from(lastIndices);
+    this.ws.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+
+    const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
+    glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    glm.batchPrefillPagedPlan(
+      ws.floatWs, BATCH_FLOAT_WS_SIZE,
+      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
+      ws.prefillPlanInfo,
+      qoIndptrHostPtr, pagedKV.indptrH,
+      totalTokens, batchSize,
+      nHeads, nKv, hd,
+      pageSize,
+      1
+    );
+
+    glm.freePinned(qoIndptrHostPtr);
+
+    this.ws.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    const slotMapping: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const pages = pagedKV.seqPages[seqIdx];
+      const startPos = pagedKV.seqKvLens[seqIdx] - seqLens[seqIdx];
+      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
+        const kvPos = startPos + pos;
+        const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
+        const offsetInPage = kvPos % pagedKV.pageSize;
+        const absPage = pages[pageIdxInSeq];
+        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
+      }
+    }
+    const slotMappingBuf = Int32Array.from(slotMapping);
+    this.ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+
+    const seqLensResult = seqLens.slice();
+    const pageAllocs: [number, number][] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const pages = pagedKV.seqPages[seqIdx];
+      pageAllocs.push([pages[0], pages.length]);
+    }
+
+    return { batchSize, totalTokens, seqLens: seqLensResult, pageAllocs };
+  }
+
+  prefillBatchAppend(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): number[] {
+    const state = this.prefillBatchAppendPlan(inputIdsList, ws, pagedKV, gdnState);
+    this.prefillBatchForward(state, ws, pagedKV, gdnState);
+    return this.prefillBatchRead(state);
+  }
+
+  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState, enableCudaGraph = false): Qwen35DecodeState {
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const pageSize = pagedKV.pageSize;
+    const batchSize = tokenIdsList.length;
+
+    const writeLocations: [number, number][] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
+    }
+
+    pagedKV.updateIndptr();
+    pagedKV.updateSlotMapping(writeLocations, pageSize);
+
+    const idsBuf = Int32Array.from(tokenIdsList);
+    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+
+    const posIds = new Array(batchSize);
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      posIds[seqIdx] = pagedKV.seqKvLens[seqIdx] - 1;
+    }
+    const posIdsBuf = Int32Array.from(posIds);
+    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+
+    glm.batchDecodePlan(
+      ws.floatWs, BATCH_FLOAT_WS_SIZE,
+      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
+      ws.decodePlanInfo,
+      pagedKV.indptrH,
+      batchSize,
+      nHeads, nKv, hd, pageSize,
+      enableCudaGraph
+    );
+
+    return { batchSize };
+  }
+
+  decodeBatchForward(state: Qwen35DecodeState, ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
     const hd = cfg.headDim;
-    const vs = cfg.vocabSize;
-    const BS = 1;
+    const batchSize = state.batchSize;
 
-    const idsBuf = Buffer.alloc(I32);
-    idsBuf.writeInt32LE(tokenId, 0);
-    this.ws.decodeId.h2d(idsBuf);
-    this.ws.hiddenA.embedding(this.weights.get("embed_tokens.weight")!, this.ws.decodeId, hs, BS);
+    this.ws.hiddenA.embedding(this.weights.get("embed_tokens.weight")!, this.ws.inputIdsBuf, hs, batchSize);
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    this.ws.positionIds.arange(cachedLen, 0, 1);
-    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, ropeDim / 2, 1, 1);
+    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, ropeDim / 2, batchSize, 1);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       if (cfg.layerTypes[i] === "linear_attention") {
         this.gdnLayerDecode(i, gdnState);
       } else {
-        this.fullAttnLayerDecodeFlash(i, cachedLen, cache);
+        this.fullAttnLayerDecodePaged(i, batchSize, pagedKV, ws, gdnState);
       }
     }
 
-    this.finalNormAndLogits(BS);
+    this.finalNormAndLogits(batchSize);
+
+    this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
   }
 
-  decode(tokenId: number, cache: FlatKVCache, gdnState: Qwen35GdnState): number {
-    const cachedLen = cache.cachePos;
-    this.decodeToken(tokenId, cache, cachedLen, gdnState);
-    cache.cachePos = cachedLen + 1;
-    return this.readArgmax(this.ws.logitsBuf, this.cfg.vocabSize);
+  decodeBatchRead(state: Qwen35DecodeState): number[] {
+    const batchSize = state.batchSize;
+    const buf = Buffer.alloc(batchSize * I32);
+    this.ws.argmaxIdx.d2h(buf);
+    const result: number[] = [];
+    for (let i = 0; i < batchSize; i++) {
+      result.push(buf.readInt32LE(i * I32));
+    }
+    return result;
   }
 
-  generateTokens(inputIds: number[][], cache: FlatKVCache, gdnState: Qwen35GdnState, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): number[] {
-    return [...this.streamTokens(inputIds, cache, gdnState, maxNewTokens, eosTokenIds, sampling)];
+  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): number[] {
+    const state = this.decodeBatchPlan(tokenIdsList, ws, pagedKV, gdnState);
+    this.decodeBatchForward(state, ws, pagedKV, gdnState);
+    return this.decodeBatchRead(state);
   }
 
-  *streamTokens(inputIds: number[][], cache: FlatKVCache, gdnState: Qwen35GdnState, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): Generator<number> {
+  prefill(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): number {
+    return this.prefillBatch(inputIds, ws, pagedKV, gdnState)[0];
+  }
+
+  decode(tokenId: number, ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): number {
+    return this.decodeBatch([tokenId], ws, pagedKV, gdnState)[0];
+  }
+
+  generateTokens(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): number[] {
+    return [...this.streamTokens(inputIds, ws, pagedKV, gdnState, maxNewTokens, eosTokenIds, sampling)];
+  }
+
+  *streamTokens(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): Generator<number> {
     const vs = this.cfg.vocabSize;
     if (inputIds.length !== 1) throw new Error("streamTokens only supports batch=1");
 
-    cache.reset();
-    let nextToken = this.prefill(inputIds, cache, gdnState);
+    const firstTokens = this.prefillBatch(inputIds, ws, pagedKV, gdnState);
+    let nextToken = firstTokens[0];
     yield nextToken;
 
     const tokenHistory = [...inputIds[0], nextToken];
 
     for (let i = 0; i < maxNewTokens - 1; i++) {
       if (eosTokenIds.has(nextToken)) break;
-      const cachedLen = cache.cachePos;
-      this.decodeToken(nextToken, cache, cachedLen, gdnState);
-      cache.cachePos = cachedLen + 1;
+
+      const decodeTokens = this.decodeBatch([nextToken], ws, pagedKV, gdnState);
+      nextToken = decodeTokens[0];
 
       if (sampling && (sampling.temperature > 0 || sampling.repetitionPenalty !== 1.0 || sampling.presencePenalty !== 0 || sampling.topK > 0 || sampling.topP < 1.0)) {
         nextToken = this.sampleTokenGPU(sampling, tokenHistory);
-      } else {
-        nextToken = this.readArgmax(this.ws.logitsBuf, vs);
       }
+
       tokenHistory.push(nextToken);
       yield nextToken;
     }
   }
 
-  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
-    throw new Error("Qwen35Model.prefillBatch not yet implemented");
-  }
+  generateBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS): number[][] {
+    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+    const { pagedKV, gdnState } = cache;
+    const batchSize = inputIdsList.length;
+    const firstTokens = this.prefillBatch(inputIdsList, ws, pagedKV, gdnState);
+    const results: number[][] = firstTokens.map(t => [t]);
 
-  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): Qwen35PrefillState {
-    throw new Error("Qwen35Model.prefillBatchPlan not yet implemented");
-  }
-
-  prefillBatchForward(state: Qwen35PrefillState, ws: WorkspaceBuffers, pagedKV: PagedKVCache): void {
-    throw new Error("Qwen35Model.prefillBatchForward not yet implemented");
-  }
-
-  prefillBatchRead(state: Qwen35PrefillState): number[] {
-    throw new Error("Qwen35Model.prefillBatchRead not yet implemented");
-  }
-
-  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache, enableCudaGraph = false): Qwen35DecodeState {
-    throw new Error("Qwen35Model.decodeBatchPlan not yet implemented");
-  }
-
-  decodeBatchForward(state: Qwen35DecodeState, ws: WorkspaceBuffers, pagedKV: PagedKVCache): void {
-    throw new Error("Qwen35Model.decodeBatchForward not yet implemented");
-  }
-
-  decodeBatchRead(state: Qwen35DecodeState): number[] {
-    throw new Error("Qwen35Model.decodeBatchRead not yet implemented");
-  }
-
-  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
-    throw new Error("Qwen35Model.decodeBatch not yet implemented");
-  }
-
-  generateBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS): number[][] {
-    throw new Error("Qwen35Model.generateBatch not yet implemented");
+    let current = firstTokens.slice();
+    for (let step = 0; step < maxNewTokens - 1; step++) {
+      const done = current.every((t, i) => eosTokenIds.has(t) && results[i].length > 1);
+      if (done) break;
+      current = this.decodeBatch(current, ws, pagedKV, gdnState);
+      for (let i = 0; i < batchSize; i++) {
+        if (!eosTokenIds.has(results[i][results[i].length - 1]) || results[i].length === 1) {
+          results[i].push(current[i]);
+        }
+      }
+    }
+    return results;
   }
 }

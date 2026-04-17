@@ -11,7 +11,7 @@
             "runtimeExecutable": "tsx",
             "console": "integratedTerminal",
             "runtimeArgs": [
-                "${workspaceFolder}/src/run_qwen3_chat.ts"
+                "${workspaceFolder}/src/run_qwen3_unified.ts"
             ],
             "skipFiles": [
                 "<node_internals>/**"

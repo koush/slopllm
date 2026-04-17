@@ -2,10 +2,14 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { GlmOps, bf16BytesToF32 } from "./glm_ops";
 import { Qwen3Model } from "./qwen3_model";
-import { FlatKVCache } from "./flat_kv";
+import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 
 const FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const BF16_REPO = "Qwen/Qwen3-0.6B";
+
+function makeKV(m: Qwen3Model, maxPages = 256): PagedKVCache {
+  return new PagedKVCache(m.glm, m.cfg.numKeyValueHeads, m.cfg.headDim, m.cfg.numHiddenLayers, maxPages, m.maxBatch);
+}
 
 function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   let dot = 0;
@@ -64,41 +68,45 @@ describe("Qwen3-0.6B-FP8 model", () => {
   });
 
   it("prefills and produces a valid token", () => {
-    const cache = model.createFlatKVCache();
+    const pagedKV = makeKV(model);
+    const ws = new WorkspaceBuffers(glm);
     try {
-      const token = model.prefill([[1, 2, 3, 4, 5]], cache);
+      const token = model.prefill([[1, 2, 3, 4, 5]], ws, pagedKV);
       assert.ok(Number.isInteger(token), "prefill should return an integer token");
       assert.ok(token >= 0 && token < model.cfg.vocabSize, `token ${token} out of vocab range [0, ${model.cfg.vocabSize})`);
     } finally {
-      cache.free();
+      pagedKV.free();
+      ws.free();
     }
   });
 
   it("decodes tokens after prefill", () => {
-    const cache = model.createFlatKVCache();
+    const pagedKV = makeKV(model);
+    const ws = new WorkspaceBuffers(glm);
     try {
-      const tokens = [...model.streamTokens([[1, 2, 3, 4, 5]], cache, 10)];
+      const tokens = [...model.streamTokens([[1, 2, 3, 4, 5]], ws, pagedKV, 10)];
       assert.ok(tokens.length > 0, "should produce at least one token");
       for (const t of tokens) {
         assert.ok(Number.isInteger(t), `token ${t} should be an integer`);
         assert.ok(t >= 0 && t < model.cfg.vocabSize, `token ${t} out of vocab range`);
       }
     } finally {
-      cache.free();
+      pagedKV.free();
+      ws.free();
     }
   });
 
   it("FP8 logits correlate with BF16 logits (cosine sim >= 0.99)", () => {
-    const fp8Cache = model.createFlatKVCache();
-    let bf16Model: Qwen3Model | null = null;
-    let bf16Cache: FlatKVCache | null = null;
+    const fp8KV = makeKV(model);
+    const ws = new WorkspaceBuffers(glm);
+    const bf16Model = Qwen3Model.fromPretrained(glm, BF16_REPO, 1, 64);
+    const bf16KV = makeKV(bf16Model);
+    const bf16Ws = new WorkspaceBuffers(glm);
     try {
-      model.prefill([[1, 2, 3, 4, 5]], fp8Cache);
+      model.prefill([[1, 2, 3, 4, 5]], ws, fp8KV);
       const fp8Logits = readLogits(model);
 
-      bf16Model = Qwen3Model.fromPretrained(glm, BF16_REPO, 1, 64);
-      bf16Cache = bf16Model.createFlatKVCache();
-      bf16Model.prefill([[1, 2, 3, 4, 5]], bf16Cache);
+      bf16Model.prefill([[1, 2, 3, 4, 5]], bf16Ws, bf16KV);
       const bf16Logits = readLogits(bf16Model);
 
       assert.equal(fp8Logits.length, bf16Logits.length, "logits length mismatch");
@@ -106,9 +114,11 @@ describe("Qwen3-0.6B-FP8 model", () => {
       const sim = cosineSimilarity(fp8Logits, bf16Logits);
       assert.ok(sim >= 0.95, `cosine similarity ${sim.toFixed(6)} < 0.95`);
     } finally {
-      fp8Cache.free();
-      if (bf16Cache) bf16Cache.free();
-      if (bf16Model) bf16Model.free();
+      fp8KV.free();
+      ws.free();
+      bf16KV.free();
+      bf16Ws.free();
+      bf16Model.free();
     }
   });
 });

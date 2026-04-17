@@ -19,12 +19,11 @@ using DType = __nv_bfloat16;
 using DTypeO = __nv_bfloat16;
 using IdType = int32_t;
 using AttentionVariant = flashinfer::DefaultAttention<false, false, false, false>;
-constexpr uint32_t HEAD_DIM = 128;
 constexpr auto POS_ENC = flashinfer::PosEncodingMode::kNone;
 
 namespace {
 
-template <uint32_t GROUP_SIZE>
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM>
 cudaError_t dispatch_decode_work_est(
     bool& split_kv, uint32_t& max_grid_size,
     uint32_t& max_num_pages_per_batch,
@@ -39,7 +38,7 @@ cudaError_t dispatch_decode_work_est(
       batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
 }
 
-template <uint32_t CTA_TILE_Q, flashinfer::MaskMode MASK_MODE>
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, flashinfer::MaskMode MASK_MODE>
 cudaError_t dispatch_batch_prefill_paged_run_inner(
     flashinfer::BatchPrefillPagedParams<DType, DType, DTypeO, IdType>& params,
     DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream) {
@@ -48,6 +47,62 @@ cudaError_t dispatch_batch_prefill_paged_run_inner(
       AttentionVariant,
       flashinfer::BatchPrefillPagedParams<DType, DType, DTypeO, IdType>>(
       params, tmp_v, tmp_s, enable_pdl, stream);
+}
+
+template <uint32_t HEAD_DIM>
+void glm_batch_decode_plan_impl(
+    GlmCtx* ctx,
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
+    int64_t* plan_info,
+    int32_t* indptr_h,
+    uint32_t batch_size,
+    uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t page_size,
+    bool enable_cuda_graph) {
+
+  using DecodeParams = flashinfer::BatchDecodeParams<DType, DType, DTypeO, IdType>;
+
+  flashinfer::DecodePlanInfo info;
+  uint32_t group_size = num_qo_heads / num_kv_heads;
+
+  auto work_est = [&](bool& split_kv, uint32_t& max_grid_size,
+                      uint32_t& max_num_pages_per_batch,
+                      uint32_t& new_batch_size, uint32_t& gdy,
+                      uint32_t bs, IdType* kv_indptr,
+                      uint32_t nqh, uint32_t ps,
+                      bool ecg, cudaStream_t s) -> cudaError_t {
+    switch (group_size) {
+      case 1: return dispatch_decode_work_est<1, HEAD_DIM>(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
+      case 2: return dispatch_decode_work_est<2, HEAD_DIM>(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
+      case 4: return dispatch_decode_work_est<4, HEAD_DIM>(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
+      case 8: return dispatch_decode_work_est<8, HEAD_DIM>(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
+      case 16: return dispatch_decode_work_est<16, HEAD_DIM>(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
+      default:
+        fprintf(stderr, "Unsupported group_size %u\n", group_size);
+        return cudaErrorInvalidValue;
+    }
+  };
+
+  cudaError_t status = flashinfer::DecodePlan<HEAD_DIM, POS_ENC, AttentionVariant, DecodeParams>(
+      float_ws, float_ws_size,
+      int_ws, pinned_int_ws, int_ws_size,
+      info,
+      indptr_h,
+      batch_size,
+      num_qo_heads,
+      page_size,
+      enable_cuda_graph,
+      ctx->stream,
+      work_est);
+
+  if (status != cudaSuccess) {
+    fprintf(stderr, "glm_batch_decode_plan failed: %s\n", cudaGetErrorString(status));
+    return;
+  }
+
+  auto vec = info.ToVector();
+  memcpy(plan_info, vec.data(), sizeof(int64_t) * vec.size());
 }
 
 } // anonymous namespace
@@ -217,51 +272,20 @@ void glm_batch_decode_plan(
     int32_t* indptr_h,
     uint32_t batch_size,
     uint32_t num_qo_heads, uint32_t num_kv_heads,
-    uint32_t page_size,
+    uint32_t head_dim, uint32_t page_size,
     bool enable_cuda_graph) {
 
-  using DecodeParams = flashinfer::BatchDecodeParams<DType, DType, DTypeO, IdType>;
-
-  flashinfer::DecodePlanInfo info;
-  uint32_t group_size = num_qo_heads / num_kv_heads;
-
-  auto work_est = [&](bool& split_kv, uint32_t& max_grid_size,
-                      uint32_t& max_num_pages_per_batch,
-                      uint32_t& new_batch_size, uint32_t& gdy,
-                      uint32_t bs, IdType* kv_indptr,
-                      uint32_t nqh, uint32_t ps,
-                      bool ecg, cudaStream_t s) -> cudaError_t {
-    switch (group_size) {
-      case 1: return dispatch_decode_work_est<1>(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
-      case 2: return dispatch_decode_work_est<2>(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
-      case 4: return dispatch_decode_work_est<4>(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
-      case 8: return dispatch_decode_work_est<8>(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
-      case 16: return dispatch_decode_work_est<16>(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
-      default:
-        fprintf(stderr, "Unsupported group_size %u\n", group_size);
-        return cudaErrorInvalidValue;
-    }
-  };
-
-  cudaError_t status = flashinfer::DecodePlan<HEAD_DIM, POS_ENC, AttentionVariant, DecodeParams>(
-      float_ws, float_ws_size,
-      int_ws, pinned_int_ws, int_ws_size,
-      info,
-      indptr_h,
-      batch_size,
-      num_qo_heads,
-      page_size,
-      enable_cuda_graph,
-      ctx->stream,
-      work_est);
-
-  if (status != cudaSuccess) {
-    fprintf(stderr, "glm_batch_decode_plan failed: %s\n", cudaGetErrorString(status));
-    return;
+  if (head_dim == 256) {
+    glm_batch_decode_plan_impl<256>(ctx, float_ws, float_ws_size,
+        int_ws, pinned_int_ws, int_ws_size,
+        plan_info, indptr_h, batch_size,
+        num_qo_heads, num_kv_heads, page_size, enable_cuda_graph);
+  } else {
+    glm_batch_decode_plan_impl<128>(ctx, float_ws, float_ws_size,
+        int_ws, pinned_int_ws, int_ws_size,
+        plan_info, indptr_h, batch_size,
+        num_qo_heads, num_kv_heads, page_size, enable_cuda_graph);
   }
-
-  auto vec = info.ToVector();
-  memcpy(plan_info, vec.data(), sizeof(int64_t) * vec.size());
 }
 
 void glm_batch_decode_run(
@@ -322,9 +346,16 @@ void glm_batch_decode_run(
       ? reinterpret_cast<float*>(static_cast<char*>(float_ws) + info.s_offset)
       : nullptr;
 
-  cudaError_t status =
-      flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENC, AttentionVariant, DecodeParams>(
+  cudaError_t status;
+  if (head_dim == 256) {
+      status =
+      flashinfer::BatchDecodeWithPagedKVCacheDispatched<256, POS_ENC, AttentionVariant, DecodeParams>(
           params, tmp_v, tmp_s, false, ctx->stream);
+  } else {
+      status =
+      flashinfer::BatchDecodeWithPagedKVCacheDispatched<128, POS_ENC, AttentionVariant, DecodeParams>(
+          params, tmp_v, tmp_s, false, ctx->stream);
+  }
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_batch_decode_run failed: %s\n", cudaGetErrorString(status));
@@ -456,21 +487,41 @@ void glm_batch_prefill_paged_run(
 
   cudaError_t status = cudaSuccess;
 
-  if (flash_mask == flashinfer::MaskMode::kCausal) {
-    switch (cta_tile_q) {
-      case 128: status = dispatch_batch_prefill_paged_run_inner<128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
-      case 64: status = dispatch_batch_prefill_paged_run_inner<64, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
-      case 16: status = dispatch_batch_prefill_paged_run_inner<16, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
-      case 1: status = dispatch_batch_prefill_paged_run_inner<1, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
-      default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
+  if (head_dim == 256) {
+    if (flash_mask == flashinfer::MaskMode::kCausal) {
+      switch (cta_tile_q) {
+        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
+      }
+    } else {
+      switch (cta_tile_q) {
+        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
+      }
     }
   } else {
-    switch (cta_tile_q) {
-      case 128: status = dispatch_batch_prefill_paged_run_inner<128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
-      case 64: status = dispatch_batch_prefill_paged_run_inner<64, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
-      case 16: status = dispatch_batch_prefill_paged_run_inner<16, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
-      case 1: status = dispatch_batch_prefill_paged_run_inner<1, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
-      default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
+    if (flash_mask == flashinfer::MaskMode::kCausal) {
+      switch (cta_tile_q) {
+        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
+      }
+    } else {
+      switch (cta_tile_q) {
+        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
+      }
     }
   }
 

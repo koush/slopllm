@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { GlmOps } from "./glm_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
-import { FlatKVCache } from "./flat_kv";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const PROMPT1 = [151643, 151644, 151645, 1, 2, 3];
@@ -37,15 +36,15 @@ describe("Qwen3-0.6B batch tests", () => {
 
   it("batch prefill vs single prefill", () => {
     const pagedKV = makePagedKV();
-    const flatCache = model.createFlatKVCache();
+    const singleKV = makePagedKV(1);
     try {
       const batchTokens = model.prefillBatch([PROMPT1, PROMPT2], ws, pagedKV);
 
-      flatCache.reset();
-      const singleToken1 = model.prefill([PROMPT1], flatCache);
+      singleKV.reset(1);
+      const singleToken1 = model.prefill([PROMPT1], ws, singleKV);
 
-      flatCache.reset();
-      const singleToken2 = model.prefill([PROMPT2], flatCache);
+      singleKV.reset(1);
+      const singleToken2 = model.prefill([PROMPT2], ws, singleKV);
 
       assert.equal(batchTokens[0], singleToken1,
         `Seq1 prefill token mismatch: batch=${batchTokens[0]}, single=${singleToken1}`);
@@ -53,7 +52,7 @@ describe("Qwen3-0.6B batch tests", () => {
         `Seq2 prefill token mismatch: batch=${batchTokens[1]}, single=${singleToken2}`);
     } finally {
       pagedKV.free();
-      flatCache.free();
+      singleKV.free();
     }
   });
 
@@ -74,7 +73,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
   it("batch prefill append", () => {
     const pagedKV = makePagedKV(1, 256);
-    const flatCache = model.createFlatKVCache();
+    const singleKV = makePagedKV(1, 256);
     try {
       const suffix = [4, 5, 6, 7];
       const fullPrompt = [...PROMPT1, ...suffix];
@@ -87,8 +86,8 @@ describe("Qwen3-0.6B batch tests", () => {
       pagedKV.updateIndptr();
       const tokensAppend = model.prefillBatchAppend([suffix], ws, pagedKV);
 
-      flatCache.reset();
-      const singleToken = model.prefill([fullPrompt], flatCache);
+      singleKV.reset(1);
+      const singleToken = model.prefill([fullPrompt], ws, singleKV);
 
       assert.equal(tokensFull[0], singleToken,
         `Full paged prefill mismatch: paged=${tokensFull[0]}, single=${singleToken}`);
@@ -96,13 +95,13 @@ describe("Qwen3-0.6B batch tests", () => {
         `Append prefill mismatch: append=${tokensAppend[0]}, full=${tokensFull[0]}`);
     } finally {
       pagedKV.free();
-      flatCache.free();
+      singleKV.free();
     }
   });
 
   it("batch prefill truncate append", () => {
     const pagedKV = makePagedKV(1, 256);
-    const flatCache = model.createFlatKVCache();
+    const singleKV = makePagedKV(1, 256);
     try {
       const suffix = [4, 5, 6, 7];
       const fullPrompt = [...PROMPT1, ...suffix];
@@ -128,31 +127,31 @@ describe("Qwen3-0.6B batch tests", () => {
         pagedKV2.free();
       }
 
-      flatCache.reset();
-      const singleToken = model.prefill([fullPrompt], flatCache);
+      singleKV.reset(1);
+      const singleToken = model.prefill([fullPrompt], ws, singleKV);
       assert.equal(tokensTruncAppend[0], singleToken,
         `Truncate+append vs single mismatch: trunc_append=${tokensTruncAppend[0]}, single=${singleToken}`);
     } finally {
       pagedKV.free();
-      flatCache.free();
+      singleKV.free();
     }
   });
 
   it("batch decode vs single decode", () => {
     const pagedKV = makePagedKV();
-    const flatCache = model.createFlatKVCache();
+    const singleKV = makePagedKV(1);
     try {
       const batchTokens = model.prefillBatch([PROMPT1, PROMPT2], ws, pagedKV);
       const token1 = batchTokens[0];
       const token2 = batchTokens[1];
 
-      flatCache.reset();
-      const singleFirst1 = model.prefill([PROMPT1], flatCache);
-      const singleDecode1 = model.decode(singleFirst1, flatCache);
+      singleKV.reset(1);
+      const singleFirst1 = model.prefill([PROMPT1], ws, singleKV);
+      const singleDecode1 = model.decode(singleFirst1, ws, singleKV);
 
-      flatCache.reset();
-      const singleFirst2 = model.prefill([PROMPT2], flatCache);
-      const singleDecode2 = model.decode(singleFirst2, flatCache);
+      singleKV.reset(1);
+      const singleFirst2 = model.prefill([PROMPT2], ws, singleKV);
+      const singleDecode2 = model.decode(singleFirst2, ws, singleKV);
 
       const batchDecodeTokens = model.decodeBatch([token1, token2], ws, pagedKV);
 
@@ -162,7 +161,7 @@ describe("Qwen3-0.6B batch tests", () => {
         `Seq2 decode token mismatch: batch=${batchDecodeTokens[1]}, single=${singleDecode2}`);
     } finally {
       pagedKV.free();
-      flatCache.free();
+      singleKV.free();
     }
   });
 
@@ -189,16 +188,16 @@ describe("Qwen3-0.6B batch tests", () => {
 
   it("batch generate vs single generate", () => {
     const pagedKV = makePagedKV();
-    const flatCache = model.createFlatKVCache();
+    const singleKV = makePagedKV(1, 256);
     const maxNewTokens = 20;
     try {
       const batchGenerated = model.generateBatch([PROMPT_LONG1, PROMPT_LONG2], ws, pagedKV, maxNewTokens);
 
-      flatCache.reset();
-      const single1 = model.generateTokens([PROMPT_LONG1], flatCache, maxNewTokens);
+      singleKV.reset(1);
+      const single1 = model.generateTokens([PROMPT_LONG1], ws, singleKV, maxNewTokens);
 
-      flatCache.reset();
-      const single2 = model.generateTokens([PROMPT_LONG2], flatCache, maxNewTokens);
+      singleKV.reset(1);
+      const single2 = model.generateTokens([PROMPT_LONG2], ws, singleKV, maxNewTokens);
 
       assert.ok(batchGenerated[0].length > 0, "Seq1 generated no tokens");
       assert.ok(batchGenerated[1].length > 0, "Seq2 generated no tokens");
@@ -212,7 +211,7 @@ describe("Qwen3-0.6B batch tests", () => {
         `Seq2 first 3 tokens mismatch: batch=${batchGenerated[1].slice(0, 3)}, single=${single2.slice(0, 3)}`);
     } finally {
       pagedKV.free();
-      flatCache.free();
+      singleKV.free();
     }
   });
 

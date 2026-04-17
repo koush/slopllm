@@ -1,9 +1,8 @@
 import { GlmOps } from "./glm_ops";
-import { Qwen3Model, SamplingParams as Qwen3SamplingParams } from "./qwen3_model";
-import { Qwen35Model, SamplingParams as Qwen35SamplingParams } from "./qwen35_model";
-import { Qwen35GdnState } from "./qwen35_gdn_state";
+import { Qwen3Model } from "./qwen3_model";
+import { Qwen35Model } from "./qwen35_model";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
-import { FlatKVCache } from "./flat_kv";
+import { ChatModel, ChatCache, Qwen35ChatCache, SamplingParams, makeSamplingParams, needsSampling, samplingLabel } from "./chat_model";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
@@ -12,9 +11,6 @@ const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
 const QWEN3_EOS = new Set([151645, 151643]);
-const QWEN35_EOS = new Set([248044]);
-
-type SamplingParams = Qwen3SamplingParams;
 
 interface TimingInfo {
   prefillMs: number;
@@ -23,48 +19,12 @@ interface TimingInfo {
   replayMs: number[];
 }
 
-function tokenizeMessages(tokenizer: any, messages: Array<{ role: string; content: string }>, enableThinking: boolean): number[] {
-  try {
-    const result = tokenizer.apply_chat_template(messages, {
-      tokenize: true,
-      add_generation_prompt: true,
-      return_tensor: false,
-      return_dict: true,
-      tokenizer_kwargs: { enable_thinking: enableThinking },
-    }) as { input_ids: number[] | number[][] };
-    return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
-  } catch {
-    const result = tokenizer.apply_chat_template(messages, {
-      tokenize: true,
-      add_generation_prompt: true,
-      return_tensor: false,
-      return_dict: true,
-    }) as { input_ids: number[] | number[][] };
-    return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
-  }
-}
-
 function longestPrefix(a: number[], b: number[]): number {
   const len = Math.min(a.length, b.length);
   for (let i = 0; i < len; i++) {
     if (a[i] !== b[i]) return i;
   }
   return len;
-}
-
-function makeSamplingParams(args: CliArgs): SamplingParams {
-  return {
-    temperature: args.temperature,
-    topP: args.topP,
-    topK: args.topK,
-    repetitionPenalty: args.repetitionPenalty,
-    presencePenalty: args.presencePenalty,
-    repetitionPenaltyWindow: args.repetitionPenaltyWindow,
-  };
-}
-
-function needsSampling(sp: SamplingParams): boolean {
-  return sp.temperature > 0 || sp.repetitionPenalty !== 1.0 || sp.presencePenalty !== 0 || sp.topK > 0 || sp.topP < 1.0;
 }
 
 interface CliArgs {
@@ -146,10 +106,6 @@ function parseArgs(argv: string[]): CliArgs {
     console.error("Error: --fp8 is not supported with --qwen35");
     process.exit(1);
   }
-  if (args.useQwen35 && args.useBatch) {
-    console.error("Error: --batch is not supported with --qwen35 (batch not yet implemented for Qwen3.5)");
-    process.exit(1);
-  }
   if (args.useQwen35 && args.useCudaGraph) {
     console.error("Error: --cuda-graph is not supported with --qwen35");
     process.exit(1);
@@ -170,16 +126,6 @@ function parseArgs(argv: string[]): CliArgs {
 function modelLabel(args: CliArgs): string {
   if (args.useQwen35) return "Qwen3.5-0.8B";
   return args.useFp8 ? "Qwen3-0.6B-FP8" : "Qwen3-0.6B";
-}
-
-function samplingLabel(sp: SamplingParams): string {
-  const parts: string[] = [];
-  parts.push(`temp=${sp.temperature}`);
-  if (sp.topP < 1.0) parts.push(`top_p=${sp.topP}`);
-  if (sp.topK > 0) parts.push(`top_k=${sp.topK}`);
-  if (sp.repetitionPenalty !== 1.0) parts.push(`rep_pen=${sp.repetitionPenalty}`);
-  if (sp.presencePenalty !== 0) parts.push(`pres_pen=${sp.presencePenalty}`);
-  return parts.join(" ");
 }
 
 function printTiming(timing: TimingInfo): void {
@@ -417,10 +363,10 @@ async function singlePromptQwen3CudaGraph(
   model.free();
 }
 
-// --- Qwen3 + Batch path (PagedKVCache, multi-batch) ---
+// --- Qwen3 + Batch path ---
 
 async function interactiveQwen3Batch(
-  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, pagedKV: PagedKVCache,
+  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
   tokenizer: any, args: CliArgs,
 ): Promise<void> {
   const enableThinking = args.thinking;
@@ -477,7 +423,7 @@ async function interactiveQwen3Batch(
       }
 
       const start = Date.now();
-      const generatedIds = model.generateBatch(inputIdsList, ws, pagedKV, args.maxNewTokens, QWEN3_EOS);
+      const generatedIds = model.generateBatch(inputIdsList, ws, cache, args.maxNewTokens, QWEN3_EOS);
       const elapsed = (Date.now() - start) / 1000;
       const totalTokens = generatedIds.reduce((sum, ids) => sum + ids.length, 0);
 
@@ -490,26 +436,132 @@ async function interactiveQwen3Batch(
       console.log(`\n  [${prompts.length} prompts, ${totalTokens} tokens, ${elapsed.toFixed(1)}s, ${(totalTokens / elapsed).toFixed(1)} tok/s]`);
     }
   } finally {
-    pagedKV.free();
+    cache.free();
     ws.free();
     model.free();
     rl.close();
   }
 }
 
-// --- Qwen3 + Streaming path (FlatKVCache, batch=1, no CUDA graph) ---
+// --- Qwen3.5 + Batch path ---
 
-async function interactiveQwen3Stream(
-  model: Qwen3Model, cache: FlatKVCache, tokenizer: any, args: CliArgs,
+async function interactiveQwen35Batch(
+  model: Qwen35Model, cache: ChatCache, ws: WorkspaceBuffers,
+  tokenizer: any, args: CliArgs,
+): Promise<void> {
+  const enableThinking = args.thinking;
+
+  console.log(`${modelLabel(args)} batch  |  GPU ${args.gpu}  |  max_batch=${args.maxBatch}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}`);
+  console.log("Enter prompts one per line. Empty line to submit batch. /clear to reset, /q to quit.");
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const askLine = (prompt: string): Promise<string> =>
+    new Promise((resolve) => rl.question(prompt, resolve));
+
+  try {
+    while (true) {
+      const prompts: string[] = [];
+      while (true) {
+        const line = (await askLine(`\nPrompt ${prompts.length + 1} (empty=done): `)).trim();
+        if (line === "") break;
+        if (line.toLowerCase() === "quit" || line.toLowerCase() === "exit" || line.toLowerCase() === "/q") {
+          rl.close();
+          return;
+        }
+        if (line.toLowerCase() === "/clear") {
+          prompts.length = 0;
+          console.log("Batch cleared.");
+          continue;
+        }
+        prompts.push(line);
+      }
+
+      if (prompts.length === 0) continue;
+      if (prompts.length > args.maxBatch) {
+        console.log(`Too many prompts (${prompts.length}), max batch is ${args.maxBatch}. Reducing to first ${args.maxBatch}.`);
+        prompts.length = args.maxBatch;
+      }
+
+      const inputIdsList: number[][] = [];
+      for (const prompt of prompts) {
+        const messages = [{ role: "user" as const, content: prompt }];
+        const ids = tokenizeMessages(tokenizer, messages, enableThinking);
+        inputIdsList.push(ids);
+      }
+
+      const maxPromptLen = Math.max(...inputIdsList.map(ids => ids.length));
+      if (maxPromptLen > args.maxSeqLen) {
+        console.log(`Longest prompt (${maxPromptLen} tokens) exceeds max_seq_len (${args.maxSeqLen}). Skipping.`);
+        continue;
+      }
+
+      cache.reset(prompts.length);
+
+      const start = Date.now();
+      const generatedIds = model.generateBatch(inputIdsList, ws, cache, args.maxNewTokens);
+      const elapsed = (Date.now() - start) / 1000;
+      const totalTokens = generatedIds.reduce((sum, ids) => sum + ids.length, 0);
+
+      for (let i = 0; i < prompts.length; i++) {
+        const text = tokenizer.decode(generatedIds[i], { skip_special_tokens: true });
+        console.log(`\n--- Response ${i + 1} ---`);
+        console.log(text);
+      }
+
+      console.log(`\n  [${prompts.length} prompts, ${totalTokens} tokens, ${elapsed.toFixed(1)}s, ${(totalTokens / elapsed).toFixed(1)} tok/s]`);
+    }
+  } finally {
+    cache.free();
+    ws.free();
+    model.free();
+    rl.close();
+  }
+}
+
+function tokenizeMessages(
+  tokenizer: any,
+  messages: Array<{ role: string; content: string }>,
+  enableThinking: boolean,
+): number[] {
+  try {
+    const result = tokenizer.apply_chat_template(messages, {
+      tokenize: true,
+      add_generation_prompt: true,
+      return_tensor: false,
+      return_dict: true,
+      tokenizer_kwargs: { enable_thinking: enableThinking },
+    }) as { input_ids: number[] | number[][] };
+    return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
+  } catch {
+    const result = tokenizer.apply_chat_template(messages, {
+      tokenize: true,
+      add_generation_prompt: true,
+      return_tensor: false,
+      return_dict: true,
+    }) as { input_ids: number[] | number[][] };
+    return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
+  }
+}
+
+interface StreamArgs {
+  maxSeqLen: number;
+  maxNewTokens: number;
+  thinking: boolean;
+  temperature: number;
+  topP: number;
+  topK: number;
+  repetitionPenalty: number;
+  presencePenalty: number;
+  repetitionPenaltyWindow: number;
+}
+
+async function interactiveStream(
+  model: ChatModel, cache: ChatCache, ws: WorkspaceBuffers,
+  tokenizer: any, args: StreamArgs,
 ): Promise<void> {
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
+  const eosIds = model.eosIds;
   const messages: Array<{ role: string; content: string }> = [];
-  const eosIds = QWEN3_EOS;
-
-  console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  streaming`);
-  if (sp) console.log(`Sampling: ${samplingLabel(sp)}`);
-  console.log(`Max ${args.maxNewTokens} tokens/turn`);
-  console.log("Type a message to chat. /clear to reset, /quit to exit.\n");
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const askLine = (prompt: string): Promise<string> =>
@@ -522,7 +574,7 @@ async function interactiveQwen3Stream(
       if (userInput.toLowerCase() === "quit" || userInput.toLowerCase() === "exit" || userInput.toLowerCase() === "/q") break;
       if (userInput.toLowerCase() === "/clear") {
         messages.length = 0;
-        cache.reset();
+        cache.reset(1);
         console.log("Conversation cleared.\n");
         continue;
       }
@@ -549,7 +601,7 @@ async function interactiveQwen3Stream(
       let tokCount = 0;
       const generatedIds: number[] = [];
 
-      for (const tokenId of model.streamTokens([inputIds], cache, args.maxNewTokens, eosIds, sp)) {
+      for (const tokenId of model.chatStream([inputIds], cache, ws, args.maxNewTokens, eosIds, sp)) {
         generatedIds.push(tokenId);
         tokCount++;
         const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -570,12 +622,13 @@ async function interactiveQwen3Stream(
   }
 }
 
-async function singlePromptQwen3Stream(
-  model: Qwen3Model, cache: FlatKVCache, tokenizer: any, args: CliArgs,
+async function singlePromptStream(
+  model: ChatModel, cache: ChatCache, ws: WorkspaceBuffers,
+  tokenizer: any, args: StreamArgs & { prompt: string },
 ): Promise<void> {
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
-  const eosIds = QWEN3_EOS;
-  const messages = [{ role: "user", content: args.prompt! }];
+  const eosIds = model.eosIds;
+  const messages = [{ role: "user", content: args.prompt }];
   const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
 
   console.log(`Prompt: ${args.prompt}`);
@@ -586,7 +639,7 @@ async function singlePromptQwen3Stream(
   let tokCount = 0;
   const generatedIds: number[] = [];
 
-  for (const tokenId of model.streamTokens([inputIds], cache, args.maxNewTokens, eosIds, sp)) {
+  for (const tokenId of model.chatStream([inputIds], cache, ws, args.maxNewTokens, eosIds, sp)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -601,110 +654,18 @@ async function singlePromptQwen3Stream(
   model.free();
 }
 
-// --- Qwen3.5 path (FlatKVCache, GPU sampling, streaming) ---
-
-async function interactiveQwen35(
-  model: Qwen35Model, cache: FlatKVCache, gdnState: Qwen35GdnState, tokenizer: any, args: CliArgs,
-): Promise<void> {
-  const sp = makeSamplingParams(args);
-  const eosIds = QWEN35_EOS;
-  const messages: Array<{ role: string; content: string }> = [];
-
-  console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  streaming`);
-  console.log(`Max ${args.maxNewTokens} tokens/turn  |  ${samplingLabel(sp)}`);
-  console.log("Type /quit to exit, /clear to reset conversation\n");
-
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const askLine = (prompt: string): Promise<string> =>
-    new Promise((resolve) => rl.question(prompt, resolve));
-
-  try {
-    while (true) {
-      const userInput = (await askLine("> ")).trim();
-      if (!userInput) continue;
-      if (userInput.toLowerCase() === "quit" || userInput.toLowerCase() === "exit" || userInput.toLowerCase() === "/q") break;
-      if (userInput.toLowerCase() === "/clear") {
-        messages.length = 0;
-        cache.reset();
-        gdnState.reset();
-        console.log("Conversation cleared.\n");
-        continue;
-      }
-
-      messages.push({ role: "user", content: userInput });
-      const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
-
-      if (inputIds.length > args.maxSeqLen - args.maxNewTokens) {
-        console.log(`Warning: prompt (${inputIds.length} tokens) too long, truncating conversation`);
-        while (inputIds.length > args.maxSeqLen - args.maxNewTokens && messages.length > 1) {
-          messages.splice(1, 2);
-          const retryIds = tokenizeMessages(tokenizer, messages, args.thinking);
-          if (retryIds.length <= args.maxSeqLen - args.maxNewTokens) break;
-        }
-        if (messages.length === 1 && tokenizeMessages(tokenizer, messages, args.thinking).length > args.maxSeqLen - args.maxNewTokens) {
-          console.log("Conversation too long even after truncation. Use /clear to reset.");
-          messages.pop();
-          continue;
-        }
-      }
-
-      process.stdout.write("Assistant: ");
-      const t0 = performance.now();
-      let tokCount = 0;
-      const generatedIds: number[] = [];
-
-      for (const tokenId of model.streamTokens([inputIds], cache, gdnState, args.maxNewTokens, eosIds, sp)) {
-        generatedIds.push(tokenId);
-        tokCount++;
-        const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
-        process.stdout.write(chunk);
-        if (eosIds.has(tokenId)) break;
-      }
-
-      const elapsed = performance.now() - t0;
-      console.log(`\n  [${tokCount} tokens, ${(elapsed / 1000).toFixed(1)}s, ${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s]`);
-
-      const responseText = tokenizer.decode(generatedIds.filter(t => !eosIds.has(t)), { skip_special_tokens: true });
-      messages.push({ role: "assistant", content: responseText });
-    }
-  } finally {
-    gdnState.free();
-    cache.free();
-    model.free();
-    rl.close();
-  }
-}
-
-async function singlePromptQwen35(
-  model: Qwen35Model, cache: FlatKVCache, gdnState: Qwen35GdnState, tokenizer: any, args: CliArgs,
-): Promise<void> {
-  const sp = makeSamplingParams(args);
-  const eosIds = QWEN35_EOS;
-  const messages = [{ role: "user", content: args.prompt! }];
-  const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
-
-  console.log(`Prompt: ${args.prompt}`);
-  console.log(`Tokens: ${inputIds.length}  |  ${samplingLabel(sp)}`);
-
-  process.stdout.write("\n");
-  const t0 = performance.now();
-  let tokCount = 0;
-  const generatedIds: number[] = [];
-
-  for (const tokenId of model.streamTokens([inputIds], cache, gdnState, args.maxNewTokens, eosIds, sp)) {
-    generatedIds.push(tokenId);
-    tokCount++;
-    const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
-    process.stdout.write(chunk);
-    if (eosIds.has(tokenId)) break;
-  }
-
-  const elapsed = performance.now() - t0;
-  console.log(`\n\n${tokCount} tokens in ${elapsed.toFixed(1)}ms (${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s)`);
-
-  gdnState.free();
-  cache.free();
-  model.free();
+function streamArgs(args: CliArgs): StreamArgs {
+  return {
+    maxSeqLen: args.maxSeqLen,
+    maxNewTokens: args.maxNewTokens,
+    thinking: args.thinking,
+    temperature: args.temperature,
+    topP: args.topP,
+    topK: args.topK,
+    repetitionPenalty: args.repetitionPenalty,
+    presencePenalty: args.presencePenalty,
+    repetitionPenaltyWindow: args.repetitionPenaltyWindow,
+  };
 }
 
 async function main(): Promise<void> {
@@ -716,17 +677,29 @@ async function main(): Promise<void> {
 
   if (args.useQwen35) {
     console.log(`Loading ${modelLabel(args)} on GPU ${args.gpu}...`);
-    const model = Qwen35Model.fromPretrained(glm, QWEN35_REPO, 1, args.maxSeqLen);
-    const cache = model.createFlatKVCache();
-    const gdnState = model.createGdnState();
+    const maxBatch = args.useBatch ? args.maxBatch : 1;
+    const model = Qwen35Model.fromPretrained(glm, QWEN35_REPO, maxBatch, args.maxSeqLen);
+    const ws = new WorkspaceBuffers(glm);
+    const cache = model.createChatCache(args.maxPages);
 
     const modelDir = resolveModelPath(QWEN35_REPO);
     const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
 
-    if (args.prompt) {
-      await singlePromptQwen35(model, cache, gdnState, tokenizer, args);
+    if (args.useBatch) {
+      await interactiveQwen35Batch(model, cache, ws, tokenizer, args);
     } else {
-      await interactiveQwen35(model, cache, gdnState, tokenizer, args);
+      const sp = makeSamplingParams(args);
+      console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  streaming`);
+      console.log(`Max ${args.maxNewTokens} tokens/turn  |  ${samplingLabel(sp)}`);
+      if (args.prompt) {
+        console.log("Type /quit to exit, /clear to reset conversation\n");
+      }
+
+      if (args.prompt) {
+        await singlePromptStream(model as ChatModel, cache, ws, tokenizer, { ...streamArgs(args), prompt: args.prompt });
+      } else {
+        await interactiveStream(model as ChatModel, cache, ws, tokenizer, streamArgs(args));
+      }
     }
   } else {
     const repoId = args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO;
@@ -734,25 +707,17 @@ async function main(): Promise<void> {
 
     if (args.useBatch) {
       const model = Qwen3Model.fromPretrained(glm, repoId, args.maxBatch, args.maxSeqLen);
-      const cfg = (model as any).cfg;
-      const nKv = cfg.numKeyValueHeads;
-      const hd = cfg.headDim;
-      const nLayers = cfg.numHiddenLayers;
       const ws = new WorkspaceBuffers(glm);
-      const pagedKV = new PagedKVCache(glm, nKv, hd, nLayers, args.maxPages, args.maxBatch);
+      const cache = model.createChatCache(args.maxPages);
 
       const modelDir = resolveModelPath(repoId);
       const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
 
-      await interactiveQwen3Batch(model, glm, ws, pagedKV, tokenizer, args);
+      await interactiveQwen3Batch(model, glm, ws, cache, tokenizer, args);
     } else if (args.useCudaGraph) {
       const model = Qwen3Model.fromPretrained(glm, repoId, 1, args.maxSeqLen);
-      const cfg = (model as any).cfg;
-      const nKv = cfg.numKeyValueHeads;
-      const hd = cfg.headDim;
-      const nLayers = cfg.numHiddenLayers;
       const ws = new WorkspaceBuffers(glm);
-      const pagedKV = new PagedKVCache(glm, nKv, hd, nLayers, args.maxPages, 1);
+      const pagedKV = new PagedKVCache(glm, model.cfg.numKeyValueHeads, model.cfg.headDim, model.cfg.numHiddenLayers, args.maxPages, 1);
 
       const modelDir = resolveModelPath(repoId);
       const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
@@ -764,15 +729,22 @@ async function main(): Promise<void> {
       }
     } else {
       const model = Qwen3Model.fromPretrained(glm, repoId, 1, args.maxSeqLen);
-      const cache = model.createFlatKVCache();
+      const ws = new WorkspaceBuffers(glm);
+      const cache = model.createChatCache();
 
       const modelDir = resolveModelPath(repoId);
       const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
 
+      const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
+      console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  streaming`);
+      if (sp) console.log(`Sampling: ${samplingLabel(sp)}`);
+      console.log(`Max ${args.maxNewTokens} tokens/turn`);
+      console.log("Type a message to chat. /clear to reset, /quit to exit.\n");
+
       if (args.prompt) {
-        await singlePromptQwen3Stream(model, cache, tokenizer, args);
+        await singlePromptStream(model as ChatModel, cache, ws, tokenizer, { ...streamArgs(args), prompt: args.prompt });
       } else {
-        await interactiveQwen3Stream(model, cache, tokenizer, args);
+        await interactiveStream(model as ChatModel, cache, ws, tokenizer, streamArgs(args));
       }
     }
   }

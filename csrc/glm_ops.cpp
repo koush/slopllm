@@ -890,8 +890,8 @@ static Napi::Value WritePinned(const Napi::CallbackInfo& info) {
 
 static Napi::Value BatchDecodePlan(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 13) {
-        Napi::TypeError::New(env, "Expected (ctx, float_ws, float_ws_size, int_ws, pinned_int_ws, int_ws_size, plan_info, indptr_h, batch_size, num_qo_heads, num_kv_heads, page_size, enable_cuda_graph)").ThrowAsJavaScriptException();
+    if (info.Length() < 14) {
+        Napi::TypeError::New(env, "Expected (ctx, float_ws, float_ws_size, int_ws, pinned_int_ws, int_ws_size, plan_info, indptr_h, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, enable_cuda_graph)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -905,15 +905,16 @@ static Napi::Value BatchDecodePlan(const Napi::CallbackInfo& info) {
     uint32_t batch_size = info[8].As<Napi::Number>().Uint32Value();
     uint32_t num_qo_heads = info[9].As<Napi::Number>().Uint32Value();
     uint32_t num_kv_heads = info[10].As<Napi::Number>().Uint32Value();
-    uint32_t page_size = info[11].As<Napi::Number>().Uint32Value();
-    bool enable_cuda_graph = info[12].As<Napi::Boolean>().Value();
+    uint32_t head_dim = info[11].As<Napi::Number>().Uint32Value();
+    uint32_t page_size = info[12].As<Napi::Number>().Uint32Value();
+    bool enable_cuda_graph = info[13].As<Napi::Boolean>().Value();
     glm_batch_decode_plan(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(float_ws), float_ws_size,
         reinterpret_cast<void*>(int_ws), reinterpret_cast<void*>(pinned_int_ws), int_ws_size,
         reinterpret_cast<int64_t*>(plan_info_ptr),
         reinterpret_cast<int32_t*>(indptr_h_ptr),
-        batch_size, num_qo_heads, num_kv_heads, page_size,
+        batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
         enable_cuda_graph);
     return env.Undefined();
 }

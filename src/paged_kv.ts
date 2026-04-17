@@ -1,4 +1,5 @@
 import { GlmOps, BF16, I32 } from "./glm_ops";
+import type { ChatCache } from "./chat_model";
 
 export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
@@ -7,7 +8,7 @@ export const PAGE_SIZE = 16;
 export const DECODE_PLAN_INFO_SIZE = 10;
 export const PREFILL_PLAN_INFO_SIZE = 15;
 
-export class PagedKVCache {
+export class PagedKVCache implements ChatCache {
   private glm: GlmOps;
   readonly nKv: number;
   readonly hd: number;
