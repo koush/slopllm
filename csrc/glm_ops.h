@@ -357,18 +357,23 @@ void glm_interleaved_split(GlmCtx* ctx, void* q_out, void* gate_out,
                             const void* qg_in,
                             int batch_seq, int num_heads, int head_dim);
 
-// GPU sampling: temperature, repetition/presence penalty, top-K, softmax, top-P, multinomial
-// out_token: [1] int32 - sampled token ID
-// topk_vals: [SAMPLING_MAX_TOPK] float32 - workspace for top-K values
-// topk_idxs: [SAMPLING_MAX_TOPK] int32 - workspace for top-K indices
-// workspace: [vocab_size] float32 - workspace for F32 logits
-// logits: [vocab_size] bfloat16 - input logits
-// penalty_tokens: [num_penalty_tokens] int32 - token IDs for penalty
-void glm_sample(GlmCtx* ctx, int* out_token, float* topk_vals, int* topk_idxs,
-                float* workspace, const void* logits, const int* penalty_tokens,
-                int vocab_size, int num_penalty_tokens,
-                float temperature, float repetition_penalty, float presence_penalty,
-                int top_k, float top_p, float random_val);
+// GPU batch sampling: each block handles one sequence
+// out_tokens: [batch_size] int32 - sampled token IDs
+// topk_vals: [batch_size * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE] float32 - workspace
+// topk_idxs: [batch_size * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE] int32 - workspace
+// workspace: [batch_size * vocab_size] float32 - F32 logits workspace
+// logits: [batch_size * vocab_size] bfloat16 - input logits
+// penalty_tokens: flat jagged array of all penalty token IDs
+// penalty_offsets: [batch_size + 1] int32 - offsets into penalty_tokens
+// temperatures, repetition_penalties, presence_penalties, top_ks, top_ps, random_vals: [batch_size]
+void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_idxs,
+                      float* workspace, const void* logits,
+                      const int* penalty_tokens, const int* penalty_offsets,
+                      int vocab_size, int batch_size,
+                      const float* temperatures, const float* repetition_penalties,
+                      const float* presence_penalties, const int* top_ks,
+                      const float* top_ps, const float* random_vals,
+                      int max_effective_k);
 
 #ifdef __cplusplus
 }

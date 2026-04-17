@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, I32, SAMPLING_MAX_TOPK } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, I32, SAMPLING_MAX_TOPK, SAMPLING_BLOCK_SIZE } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
@@ -163,6 +163,13 @@ class Qwen35Workspace {
   sampleTopkIdxs: Tensor;
   sampleWorkspace: Tensor;
   samplePenaltyTokens: Tensor;
+  samplePenaltyOffsets: Tensor;
+  sampleTemperatures: Tensor;
+  sampleRepPenalties: Tensor;
+  samplePresPenalties: Tensor;
+  sampleTopKs: Tensor;
+  sampleTopPs: Tensor;
+  sampleRandomVals: Tensor;
   qoIndptrD: Tensor;
   prefillSlotMapping: Tensor;
   tensors = new Map<string, Tensor>();
@@ -236,11 +243,18 @@ class Qwen35Workspace {
     this.attnKRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
     this.attnSigBuf = Tensor.alloc(glm, [BS * nHeads * hd], "BF16");
 
-    this.sampleOutToken = Tensor.alloc(glm, [1], "I32");
-    this.sampleTopkVals = Tensor.alloc(glm, [SAMPLING_MAX_TOPK * 256], "F32");
-    this.sampleTopkIdxs = Tensor.alloc(glm, [SAMPLING_MAX_TOPK * 256], "I32");
-    this.sampleWorkspace = Tensor.alloc(glm, [vs], "F32");
-    this.samplePenaltyTokens = Tensor.alloc(glm, [1024], "I32");
+    this.sampleOutToken = Tensor.alloc(glm, [B], "I32");
+    this.sampleTopkVals = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
+    this.sampleTopkIdxs = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
+    this.sampleWorkspace = Tensor.alloc(glm, [B * vs], "F32");
+    this.samplePenaltyTokens = Tensor.alloc(glm, [B * 1024], "I32");
+    this.samplePenaltyOffsets = Tensor.alloc(glm, [B + 1], "I32");
+    this.sampleTemperatures = Tensor.alloc(glm, [B], "F32");
+    this.sampleRepPenalties = Tensor.alloc(glm, [B], "F32");
+    this.samplePresPenalties = Tensor.alloc(glm, [B], "F32");
+    this.sampleTopKs = Tensor.alloc(glm, [B], "I32");
+    this.sampleTopPs = Tensor.alloc(glm, [B], "F32");
+    this.sampleRandomVals = Tensor.alloc(glm, [B], "F32");
 
     this.qoIndptrD = Tensor.alloc(glm, [B + 1], "I32");
     this.prefillSlotMapping = Tensor.alloc(glm, [B * S], "I32");

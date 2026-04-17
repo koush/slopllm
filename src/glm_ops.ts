@@ -79,7 +79,7 @@ interface NativeAddon {
   rmsnormGated(ctx: number, output: number, input: number, gate: number, weight: number, eps: number, dim: number, batch: number): void;
   qkvSplit(ctx: number, qOut: number, kOut: number, vOut: number, qkvIn: number, seqLen: number, numHeads: number, dK: number, dV: number): void;
   interleavedSplit(ctx: number, qOut: number, gateOut: number, qgIn: number, batchSeq: number, numHeads: number, headDim: number): void;
-  sample(ctx: number, outToken: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, vocabSize: number, numPenaltyTokens: number, temperature: number, repetitionPenalty: number, presencePenalty: number, topK: number, topP: number, randomVal: number): void;
+  sampleBatch(ctx: number, outTokens: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, penaltyOffsets: number, vocabSize: number, batchSize: number, temperatures: number, repPenalties: number, presPenalties: number, topKs: number, topPs: number, randomVals: number, maxEffectiveK: number): void;
   memcpy2d(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void;
   ncclUniqueId(outId: Buffer): void;
   ncclCommInitRank(rank: number, worldSize: number, uniqueId: number): number;
@@ -341,8 +341,8 @@ export class GlmOps {
     this.native.interleavedSplit(this.ctx, qOut, gateOut, qgIn, batchSeq, numHeads, headDim);
   }
 
-  sample(outToken: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, vocabSize: number, numPenaltyTokens: number, temperature: number, repetitionPenalty: number, presencePenalty: number, topK: number, topP: number, randomVal: number): void {
-    this.native.sample(this.ctx, outToken, topkVals, topkIdxs, workspace, logits, penaltyTokens, vocabSize, numPenaltyTokens, temperature, repetitionPenalty, presencePenalty, topK, topP, randomVal);
+  sampleBatch(outTokens: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, penaltyOffsets: number, vocabSize: number, batchSize: number, temperatures: number, repPenalties: number, presPenalties: number, topKs: number, topPs: number, randomVals: number, maxEffectiveK: number): void {
+    this.native.sampleBatch(this.ctx, outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyOffsets, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, randomVals, maxEffectiveK);
   }
 
   memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void {
@@ -372,6 +372,7 @@ export const BF16 = 2;
 export const I32 = 4;
 export const F32 = 4;
 export const SAMPLING_MAX_TOPK = 256;
+export const SAMPLING_BLOCK_SIZE = 256;
 export const FLASH_TMP_SIZE = 32 * 1024 * 1024;
 export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;

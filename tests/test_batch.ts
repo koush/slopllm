@@ -4,6 +4,7 @@ import { GlmOps } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
 import { PagedKVCache, WorkspaceBuffers } from "../src/paged_kv";
 import { generateBatchTokens, generateTokens } from "./test_helper";
+import { SamplingParams, makeSamplingParams } from "../src/chat_model";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const PROMPT1 = [151643, 151644, 151645, 1, 2, 3];
@@ -322,6 +323,65 @@ describe("Qwen3-0.6B batch tests", () => {
         `Token sequence mismatch: graph=${graphTokens}, ref=${refTokens}`);
 
       glm.graphExecDestroy(graphExec);
+    } finally {
+      pagedKV.free();
+    }
+  });
+
+  it("batch sampling matches sequential sampling", () => {
+    const pagedKV = model.createChatCache() as PagedKVCache;
+    try {
+      const greedy: SamplingParams = makeSamplingParams({
+        temperature: 0, topP: 1.0, topK: 0,
+        repetitionPenalty: 1.0, presencePenalty: 0, repetitionPenaltyWindow: 64,
+      });
+      const sampling: SamplingParams = makeSamplingParams({
+        temperature: 0.8, topP: 0.95, topK: 20,
+        repetitionPenalty: 1.05, presencePenalty: 0.0, repetitionPenaltyWindow: 64,
+      });
+
+      pagedKV.reset(1);
+      const tokens = model.forwardEager([PROMPT_GRAPH], ws, pagedKV);
+      pagedKV.updateIndptr();
+
+      const firstToken = tokens[0];
+      const history = [...PROMPT_GRAPH, firstToken];
+
+      const greedySingle = model.sampleTokenGPU(greedy, history);
+
+      const batchResults = model.sampleBatchGPU([greedy, sampling], [history, history]);
+
+      assert.equal(batchResults[0], greedySingle,
+        `Batch greedy[0] != sequential greedy: ${batchResults[0]} != ${greedySingle}`);
+      assert.ok(Number.isInteger(batchResults[1]),
+        `Sampling token should be integer: ${batchResults[1]}`);
+      assert.ok(batchResults[1] >= 0 && batchResults[1] < model.cfg.vocabSize,
+        `Sampling token out of range: ${batchResults[1]}`);
+    } finally {
+      pagedKV.free();
+    }
+  });
+
+  it("batch sampling with different histories", () => {
+    const pagedKV = model.createChatCache(4) as PagedKVCache;
+    try {
+      const greedy: SamplingParams = makeSamplingParams({
+        temperature: 0, topP: 1.0, topK: 0,
+        repetitionPenalty: 1.0, presencePenalty: 0, repetitionPenaltyWindow: 64,
+      });
+
+      pagedKV.reset(2);
+      const tokens = model.forwardEager([PROMPT1, PROMPT2], ws, pagedKV);
+
+      const history1 = [...PROMPT1, tokens[0]];
+      const history2 = [...PROMPT2, tokens[1]];
+
+      const batchResults = model.sampleBatchGPU([greedy, greedy], [history1, history2]);
+
+      assert.equal(batchResults[0], tokens[0],
+        `Batch greedy[0] != argmax: ${batchResults[0]} != ${tokens[0]}`);
+      assert.equal(batchResults[1], tokens[1],
+        `Batch greedy[1] != argmax: ${batchResults[1]} != ${tokens[1]}`);
     } finally {
       pagedKV.free();
     }
