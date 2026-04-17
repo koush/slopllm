@@ -1,10 +1,10 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { GlmOps } from "./glm_ops";
-import { Qwen3Model } from "./qwen3_model";
-import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
+import { GlmOps } from "../src/glm_ops";
+import { Qwen3Model } from "../src/qwen3_model";
+import { PagedKVCache, WorkspaceBuffers } from "../src/paged_kv";
 import { AutoTokenizer } from "@huggingface/transformers";
-import { resolveModelPath } from "./model_path";
+import { resolveModelPath } from "../src/model_path";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const EOS_TOKEN_IDS = new Set([151645, 151643]);

@@ -82,7 +82,7 @@ export class GlmOps {
   device: number;
 
   constructor(deviceId: number = 0, libPath?: string) {
-    const p = libPath ?? path.join(__dirname, "..", "build", "Release", "glm.node");
+    const p = libPath ?? path.join(__dirname, "..", "..", "build", "Release", "glm.node");
     this.native = require(p) as NativeAddon;
     this.ctx = this.native.init(deviceId);
     if (!this.ctx) {

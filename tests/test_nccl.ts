@@ -12,7 +12,7 @@ import {
   NCCL_BFLOAT16,
   NCCL_FLOAT32,
   NCCL_SUM,
-} from "./glm_ops";
+} from "../src/glm_ops";
 
 function bf16RoundTrip(values: Float32Array): { gpuPtr: number; count: number } {
   throw new Error("Use glm.alloc/h2d instead");

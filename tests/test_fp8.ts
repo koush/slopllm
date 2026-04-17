@@ -1,8 +1,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { GlmOps, bf16BytesToF32 } from "./glm_ops";
-import { Qwen3Model } from "./qwen3_model";
-import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
+import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
+import { Qwen3Model } from "../src/qwen3_model";
+import { PagedKVCache, WorkspaceBuffers } from "../src/paged_kv";
 
 const FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const BF16_REPO = "Qwen/Qwen3-0.6B";
