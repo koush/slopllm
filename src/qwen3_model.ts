@@ -5,10 +5,11 @@ import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { Tensor, OpContext } from "./tensor";
-import type { ChatModel, ChatCache } from "./chat_model";
+import type { ChatModel, ChatCache, DecodeState, PrefillState } from "./chat_model";
 import { SamplingParams } from "./chat_model";
 
 export type { SamplingParams };
+export type { DecodeState, PrefillState };
 
 export interface Qwen3Config {
   hiddenSize: number;
@@ -145,17 +146,6 @@ class Qwen3Workspace {
     }
     this.tensors.clear();
   }
-}
-
-export interface DecodeState {
-  batchSize: number;
-}
-
-export interface PrefillState {
-  batchSize: number;
-  totalTokens: number;
-  seqLens: number[];
-  pageAllocs: [number, number][];
 }
 
 export class Qwen3Model implements OpContext, ChatModel {
@@ -315,22 +305,26 @@ export class Qwen3Model implements OpContext, ChatModel {
     return result;
   }
 
-  prefill(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number {
-    return this.prefillBatch(inputIds, ws, pagedKV)[0];
+  prefill(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache): number {
+    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
+    return this.prefillBatch(inputIds, ws, cache)[0];
   }
 
-  decode(tokenId: number, ws: WorkspaceBuffers, pagedKV: PagedKVCache): number {
-    return this.decodeBatch([tokenId], ws, pagedKV)[0];
+  decode(tokenId: number, ws: WorkspaceBuffers, cache: ChatCache): number {
+    return this.decodeBatch([tokenId], ws, cache)[0];
   }
 
-  generateTokens(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[] {
-    return [...this.streamTokens(inputIds, ws, pagedKV, maxNewTokens, eosTokenIds)];
+  generateTokens(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[] {
+    return [...this.streamTokens(inputIds, ws, cache, maxNewTokens, eosTokenIds)];
   }
 
-  *streamTokens(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643]), sampling?: SamplingParams): Generator<number> {
+  *streamTokens(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643]), sampling?: SamplingParams): Generator<number> {
+    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
+    const pagedKV = cache;
     const vs = this.cfg.vocabSize;
     if (inputIds.length !== 1) throw new Error("streamTokens only supports batch=1");
 
+    pagedKV.reset(inputIds.length);
     const firstTokens = this.prefillBatch(inputIds, ws, pagedKV);
     let nextToken = firstTokens[0];
     yield nextToken;
@@ -410,163 +404,9 @@ export class Qwen3Model implements OpContext, ChatModel {
     this.finalNormAndLogits(count, this.ws.hiddenLast);
   }
 
-  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): PrefillState {
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const pageSize = pagedKV.pageSize;
-    const batchSize = inputIdsList.length;
-
-    pagedKV.reset(batchSize);
-
-    const seqLens = inputIdsList.map(ids => ids.length);
-    const totalTokens = seqLens.reduce((a, b) => a + b, 0);
-
-    const pageAllocs: [number, number][] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      pageAllocs.push(pagedKV.allocPrefillPages(seqIdx, seqLens[seqIdx]));
-    }
-
-    const allIds: number[] = [];
-    for (const ids of inputIdsList) allIds.push(...ids);
-    const idsBuf = Int32Array.from(allIds);
-    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
-
-    const qoIndptr = [0];
-    for (const s of seqLens) {
-      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
-    }
-    const qoIndptrBuf = Int32Array.from(qoIndptr);
-
-    pagedKV.updateIndptr();
-
-    const posIds: number[] = [];
-    for (const s of seqLens) {
-      for (let p = 0; p < s; p++) posIds.push(p);
-    }
-    const posIdsBuf = Int32Array.from(posIds);
-    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
-
-    const lastIndices: number[] = [];
-    let offset = 0;
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      lastIndices.push(offset + seqLens[seqIdx] - 1);
-      offset += seqLens[seqIdx];
-    }
-    const lastIdxBuf = Int32Array.from(lastIndices);
-    this.ws.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
-
-    const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
-    glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
-
-    glm.batchPrefillPagedPlan(
-      ws.floatWs, BATCH_FLOAT_WS_SIZE,
-      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
-      ws.prefillPlanInfo,
-      qoIndptrHostPtr, pagedKV.indptrH,
-      totalTokens, batchSize,
-      nHeads, nKv, hd,
-      pageSize,
-      1
-    );
-
-    glm.freePinned(qoIndptrHostPtr);
-
-    this.ws.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
-
-    const slotMapping: number[] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      const pages = pagedKV.seqPages[seqIdx];
-      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
-        const pageIdxInSeq = Math.floor(pos / pagedKV.pageSize);
-        const offsetInPage = pos % pagedKV.pageSize;
-        const absPage = pages[pageIdxInSeq];
-        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
-      }
-    }
-    const slotMappingBuf = Int32Array.from(slotMapping);
-    this.ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
-
-    return { batchSize, totalTokens, seqLens, pageAllocs };
-  }
-
-  prefillBatchForward(state: PrefillState, ws: WorkspaceBuffers, pagedKV: PagedKVCache): void {
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const hs = cfg.hiddenSize;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const pageSize = pagedKV.pageSize;
-    const batchSize = state.batchSize;
-    const totalTokens = state.totalTokens;
-
-    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, totalTokens);
-
-    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, 1, totalTokens);
-
-    for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const pfx = `model.layers.${i}`;
-
-      this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
-
-      this.computeQkv(pfx, totalTokens, 1, totalTokens);
-
-      glm.kvCacheWrite(
-        this.ws.kRope.data, this.ws.vT.data,
-        pagedKV.kData[i], pagedKV.vData[i],
-        this.ws.prefillSlotMapping.data,
-        totalTokens, nKv, hd, pagedKV.pageSize,
-        hd, totalTokens * hd
-      );
-
-      const qStrideN = hd;
-      const qStrideH = totalTokens * hd;
-
-      glm.batchPrefillPagedRun(
-        this.ws.qRope.data, this.ws.flashOut.data,
-        pagedKV.kData[i], pagedKV.vData[i],
-        pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
-        ws.floatWs, ws.intWs,
-        this.ws.qoIndptrD.data,
-        ws.prefillPlanInfo,
-        totalTokens, batchSize,
-        nHeads, nKv, hd,
-        pageSize,
-        qStrideN, qStrideH,
-        1, cfg.scaling
-      );
-
-      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, totalTokens, hs, nHeads * hd, this);
-      this.residualAndMlp(pfx, totalTokens);
-    }
-
-    this.ws.hiddenLast.indexSelect(this.ws.hiddenA, this.ws.lastIdx, hs, batchSize);
-    this.finalNormAndLogits(batchSize, this.ws.hiddenLast);
-
-    this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
-  }
-
-  prefillBatchRead(state: PrefillState): number[] {
-    const batchSize = state.batchSize;
-    const buf = Buffer.alloc(batchSize * I32);
-    this.ws.argmaxIdx.d2h(buf);
-    const result: number[] = [];
-    for (let i = 0; i < batchSize; i++) {
-      result.push(buf.readInt32LE(i * I32));
-    }
-    return result;
-  }
-
-  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
-    const state = this.prefillBatchPlan(inputIdsList, ws, pagedKV);
-    this.prefillBatchForward(state, ws, pagedKV);
-    return this.prefillBatchRead(state);
-  }
-
-  prefillBatchAppendPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): PrefillState {
+  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState {
+    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
+    const pagedKV = cache;
     const cfg = this.cfg;
     const glm = this.glm;
     const nHeads = cfg.numAttentionHeads;
@@ -576,7 +416,7 @@ export class Qwen3Model implements OpContext, ChatModel {
     const batchSize = inputIdsList.length;
 
     if (pagedKV.seqPages.length !== batchSize) {
-      throw new Error(`prefillBatchAppend: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+      throw new Error(`prefillBatchPlan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
     }
 
     const seqLens = inputIdsList.map(ids => ids.length);
@@ -654,13 +494,86 @@ export class Qwen3Model implements OpContext, ChatModel {
     return { batchSize, totalTokens, seqLens, pageAllocs };
   }
 
-  prefillBatchAppend(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
-    const state = this.prefillBatchAppendPlan(inputIdsList, ws, pagedKV);
-    this.prefillBatchForward(state, ws, pagedKV);
+  prefillBatchForward(state: PrefillState, ws: WorkspaceBuffers, cache: ChatCache): void {
+    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
+    const pagedKV = cache;
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const hs = cfg.hiddenSize;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const pageSize = pagedKV.pageSize;
+    const batchSize = state.batchSize;
+    const totalTokens = state.totalTokens;
+
+    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, totalTokens);
+
+    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, 1, totalTokens);
+
+    for (let i = 0; i < cfg.numHiddenLayers; i++) {
+      const pfx = `model.layers.${i}`;
+
+      this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+
+      this.computeQkv(pfx, totalTokens, 1, totalTokens);
+
+      glm.kvCacheWrite(
+        this.ws.kRope.data, this.ws.vT.data,
+        pagedKV.kData[i], pagedKV.vData[i],
+        this.ws.prefillSlotMapping.data,
+        totalTokens, nKv, hd, pagedKV.pageSize,
+        hd, totalTokens * hd
+      );
+
+      const qStrideN = hd;
+      const qStrideH = totalTokens * hd;
+
+      glm.batchPrefillPagedRun(
+        this.ws.qRope.data, this.ws.flashOut.data,
+        pagedKV.kData[i], pagedKV.vData[i],
+        pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
+        ws.floatWs, ws.intWs,
+        this.ws.qoIndptrD.data,
+        ws.prefillPlanInfo,
+        totalTokens, batchSize,
+        nHeads, nKv, hd,
+        pageSize,
+        qStrideN, qStrideH,
+        1, cfg.scaling
+      );
+
+      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, totalTokens, hs, nHeads * hd, this);
+      this.residualAndMlp(pfx, totalTokens);
+    }
+
+    this.ws.hiddenLast.indexSelect(this.ws.hiddenA, this.ws.lastIdx, hs, batchSize);
+    this.finalNormAndLogits(batchSize, this.ws.hiddenLast);
+
+    this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
+  }
+
+  prefillBatchRead(state: PrefillState): number[] {
+    const batchSize = state.batchSize;
+    const buf = Buffer.alloc(batchSize * I32);
+    this.ws.argmaxIdx.d2h(buf);
+    const result: number[] = [];
+    for (let i = 0; i < batchSize; i++) {
+      result.push(buf.readInt32LE(i * I32));
+    }
+    return result;
+  }
+
+  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[] {
+    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
+    const state = this.prefillBatchPlan(inputIdsList, ws, cache);
+    this.prefillBatchForward(state, ws, cache);
     return this.prefillBatchRead(state);
   }
 
-  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache, enableCudaGraph = false): DecodeState {
+  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): DecodeState {
+    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
+    const pagedKV = cache;
     const cfg = this.cfg;
     const glm = this.glm;
     const nHeads = cfg.numAttentionHeads;
@@ -700,7 +613,9 @@ export class Qwen3Model implements OpContext, ChatModel {
     return { batchSize };
   }
 
-  decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, pagedKV: PagedKVCache): void {
+  decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void {
+    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
+    const pagedKV = cache;
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -759,9 +674,11 @@ export class Qwen3Model implements OpContext, ChatModel {
     return result;
   }
 
-  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache): number[] {
-    const state = this.decodeBatchPlan(tokenIdsList, ws, pagedKV);
-    this.decodeBatchForward(state, ws, pagedKV);
+  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[] {
+    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
+    const pagedKV = cache;
+    const state = this.decodeBatchPlan(tokenIdsList, ws, cache);
+    this.decodeBatchForward(state, ws, cache);
     return this.decodeBatchRead(state);
   }
 
@@ -771,6 +688,7 @@ export class Qwen3Model implements OpContext, ChatModel {
     const batchSize = inputIdsList.length;
     const vs = this.cfg.vocabSize;
 
+    pagedKV.reset(batchSize);
     const firstTokens = this.prefillBatch(inputIdsList, ws, pagedKV);
 
     const nextTokens = [...firstTokens];

@@ -38,6 +38,7 @@ describe("Qwen3-0.6B batch tests", () => {
     const pagedKV = makePagedKV();
     const singleKV = makePagedKV(1);
     try {
+      pagedKV.reset(2);
       const batchTokens = model.prefillBatch([PROMPT1, PROMPT2], ws, pagedKV);
 
       singleKV.reset(1);
@@ -59,6 +60,7 @@ describe("Qwen3-0.6B batch tests", () => {
   it("batch prefill paged then decode", () => {
     const pagedKV = makePagedKV();
     try {
+      pagedKV.reset(2);
       const batchTokens = model.prefillBatch([PROMPT1, PROMPT2], ws, pagedKV);
       pagedKV.updateIndptr();
 
@@ -84,7 +86,7 @@ describe("Qwen3-0.6B batch tests", () => {
       pagedKV.reset(1);
       model.prefillBatch([PROMPT1], ws, pagedKV);
       pagedKV.updateIndptr();
-      const tokensAppend = model.prefillBatchAppend([suffix], ws, pagedKV);
+      const tokensAppend = model.prefillBatch([suffix], ws, pagedKV);
 
       singleKV.reset(1);
       const singleToken = model.prefill([fullPrompt], ws, singleKV);
@@ -109,12 +111,12 @@ describe("Qwen3-0.6B batch tests", () => {
       pagedKV.reset(1);
       model.prefillBatch([PROMPT1], ws, pagedKV);
       pagedKV.updateIndptr();
-      model.prefillBatchAppend([suffix], ws, pagedKV);
+      model.prefillBatch([suffix], ws, pagedKV);
       pagedKV.updateIndptr();
 
       pagedKV.truncate(0, PROMPT1.length);
       pagedKV.updateIndptr();
-      const tokensTruncAppend = model.prefillBatchAppend([suffix], ws, pagedKV);
+      const tokensTruncAppend = model.prefillBatch([suffix], ws, pagedKV);
 
       const pagedKV2 = makePagedKV(1, 256);
       try {
@@ -141,6 +143,7 @@ describe("Qwen3-0.6B batch tests", () => {
     const pagedKV = makePagedKV();
     const singleKV = makePagedKV(1);
     try {
+      pagedKV.reset(2);
       const batchTokens = model.prefillBatch([PROMPT1, PROMPT2], ws, pagedKV);
       const token1 = batchTokens[0];
       const token2 = batchTokens[1];
@@ -168,6 +171,7 @@ describe("Qwen3-0.6B batch tests", () => {
   it("batch multi-step decode", () => {
     const pagedKV = makePagedKV();
     try {
+      pagedKV.reset(2);
       const batchTokens = model.prefillBatch([PROMPT1, PROMPT2], ws, pagedKV);
       pagedKV.updateIndptr();
 
@@ -220,6 +224,7 @@ describe("Qwen3-0.6B batch tests", () => {
     try {
       const prompt = PROMPT_GRAPH;
 
+      pagedKV.reset(1);
       const tokens = model.prefillBatch([prompt], ws, pagedKV);
       pagedKV.updateIndptr();
 

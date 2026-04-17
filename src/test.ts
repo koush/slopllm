@@ -26,7 +26,7 @@ describe("Qwen3-0.6B batch smoke test", () => {
   let model: Qwen3Model;
   let tokenizer: any;
   let ws: WorkspaceBuffers;
-  let pagedKV: PagedKVCache;
+  let cache: PagedKVCache;
 
   before(async () => {
     process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
@@ -34,20 +34,20 @@ describe("Qwen3-0.6B batch smoke test", () => {
     model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 4, 2048);
     const cfg = model.cfg;
     ws = new WorkspaceBuffers(glm);
-    pagedKV = new PagedKVCache(glm, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, 128, 4);
+    cache = new PagedKVCache(glm, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, 128, 4);
     const modelDir = resolveModelPath(QWEN3_REPO);
     tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
   });
 
   after(() => {
-    pagedKV.free();
+    cache.free();
     ws.free();
     model.free();
   });
 
   it("2 identical 'hi' prompts produce responses containing 'hello' and 'assist'", () => {
     const promptIds = tokenizePrompt(tokenizer, "hi");
-    const generated = model.generateBatch([promptIds, promptIds], ws, pagedKV, 128, EOS_TOKEN_IDS);
+    const generated = model.generateBatch([promptIds, promptIds], ws, cache, 128, EOS_TOKEN_IDS);
 
     assert.equal(generated.length, 2);
 

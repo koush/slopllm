@@ -8,6 +8,14 @@ export const PAGE_SIZE = 16;
 export const DECODE_PLAN_INFO_SIZE = 10;
 export const PREFILL_PLAN_INFO_SIZE = 15;
 
+function longestPrefix(a: number[], b: number[]): number {
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    if (a[i] !== b[i]) return i;
+  }
+  return len;
+}
+
 export class PagedKVCache implements ChatCache {
   private glm: GlmOps;
   readonly nKv: number;
@@ -28,6 +36,7 @@ export class PagedKVCache implements ChatCache {
   numPagesUsed: number;
   seqPages: number[][];
   seqKvLens: number[];
+  cachedTokenIds: number[][];
 
   constructor(glm: GlmOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE) {
     this.glm = glm;
@@ -53,6 +62,7 @@ export class PagedKVCache implements ChatCache {
     this.numPagesUsed = 0;
     this.seqPages = [];
     this.seqKvLens = [];
+    this.cachedTokenIds = [];
   }
 
   free(): void {
@@ -77,6 +87,41 @@ export class PagedKVCache implements ChatCache {
     this.numPagesUsed = 0;
     this.seqPages = Array.from({ length: batchSize }, () => []);
     this.seqKvLens = new Array(batchSize).fill(0);
+    this.cachedTokenIds = Array.from({ length: batchSize }, () => []);
+  }
+
+  prefixMatch(seqIdx: number, inputIds: number[]): number[] {
+    if (seqIdx >= this.cachedTokenIds.length) {
+      this.cachedTokenIds.length = seqIdx + 1;
+      for (let i = 0; i <= seqIdx; i++) {
+        if (!this.cachedTokenIds[i]) this.cachedTokenIds[i] = [];
+      }
+    }
+    const cached = this.cachedTokenIds[seqIdx];
+    const matchLen = cached.length > 0 ? longestPrefix(cached, inputIds) : 0;
+
+    if (matchLen > 0 && matchLen < inputIds.length) {
+      if (matchLen < cached.length) {
+        this.truncate(seqIdx, matchLen);
+      }
+      this.cachedTokenIds[seqIdx] = cached.slice(0, matchLen);
+      return inputIds.slice(matchLen);
+    }
+
+    if (this.seqPages.length > seqIdx) {
+      this.truncate(seqIdx, 0);
+    } else {
+      this.reset(seqIdx + 1);
+    }
+    this.cachedTokenIds[seqIdx] = [];
+    return inputIds.slice();
+  }
+
+  appendTokens(seqIdx: number, tokens: number[]): void {
+    if (seqIdx >= this.cachedTokenIds.length) {
+      this.cachedTokenIds[seqIdx] = [];
+    }
+    this.cachedTokenIds[seqIdx].push(...tokens);
   }
 
   truncate(seqIdx: number, newLen: number): void {

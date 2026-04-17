@@ -2,7 +2,7 @@ import { GlmOps } from "./glm_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model } from "./qwen35_model";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
-import { ChatModel, ChatCache, Qwen35ChatCache, SamplingParams, makeSamplingParams, needsSampling, samplingLabel } from "./chat_model";
+import { ChatModel, ChatCache, SamplingParams, makeSamplingParams, needsSampling, samplingLabel } from "./chat_model";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
@@ -17,14 +17,6 @@ interface TimingInfo {
   warmupMs: number[];
   captureMs: number;
   replayMs: number[];
-}
-
-function longestPrefix(a: number[], b: number[]): number {
-  const len = Math.min(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    if (a[i] !== b[i]) return i;
-  }
-  return len;
 }
 
 interface CliArgs {
@@ -106,10 +98,6 @@ function parseArgs(argv: string[]): CliArgs {
     console.error("Error: --fp8 is not supported with --qwen35");
     process.exit(1);
   }
-  if (args.useQwen35 && args.useCudaGraph) {
-    console.error("Error: --cuda-graph is not supported with --qwen35");
-    process.exit(1);
-  }
   if (args.useBatch && args.useCudaGraph) {
     console.error("Error: --batch and --cuda-graph are mutually exclusive");
     process.exit(1);
@@ -140,115 +128,79 @@ function printTiming(timing: TimingInfo): void {
 // --- Qwen3 + CUDA Graph path (PagedKVCache, single batch) ---
 
 function generateResponseCudaGraph(
-  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, pagedKV: PagedKVCache,
-  inputIds: number[], cachedTokenIds: number[], graphExec: number | null,
+  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, cache: PagedKVCache,
+  inputIds: number[], graphExec: number | null,
   maxNewTokens: number, warmupSteps: number, sp: SamplingParams | undefined,
-): { tokens: number[]; graphExec: number | null; timing: TimingInfo; cachedTokenIds: number[]; matchLen: number } {
+): { tokens: number[]; graphExec: number | null; timing: TimingInfo; matchLen: number } {
   const timing: TimingInfo = { prefillMs: 0, warmupMs: [], captureMs: 0, replayMs: [] };
   const generatedTokens: number[] = [];
 
-  let matchLen: number;
-  if (cachedTokenIds.length > 0) {
-    matchLen = longestPrefix(cachedTokenIds, inputIds);
-  } else {
-    matchLen = 0;
-  }
-
-  let suffixIds: number[];
-  if (matchLen > 0 && matchLen < inputIds.length) {
-    if (matchLen < cachedTokenIds.length) {
-      pagedKV.truncate(0, matchLen);
-    }
-    suffixIds = inputIds.slice(matchLen);
-  } else {
-    matchLen = 0;
-    suffixIds = inputIds;
-    pagedKV.reset(1);
-  }
+  const suffixIds = cache.prefixMatch(0, inputIds);
+  cache.appendTokens(0, suffixIds);
+  const matchLen = inputIds.length - suffixIds.length;
 
   const t0 = performance.now();
-  let tokens: number[];
-  if (matchLen > 0) {
-    tokens = model.prefillBatchAppend([suffixIds], ws, pagedKV);
-  } else {
-    tokens = model.prefillBatch([suffixIds], ws, pagedKV);
-  }
-  pagedKV.updateIndptr();
+  const tokens = model.prefillBatch([suffixIds], ws, cache);
+  cache.updateIndptr();
   timing.prefillMs = performance.now() - t0;
 
   let currentToken = tokens[0];
   generatedTokens.push(currentToken);
-
-  if (QWEN3_EOS.has(currentToken)) {
-    const newCachedTokenIds = inputIds.slice(0, matchLen).concat(suffixIds).concat(generatedTokens);
-    return { tokens: generatedTokens, graphExec, timing, cachedTokenIds: newCachedTokenIds, matchLen };
-  }
+  cache.appendTokens(0, [currentToken]);
 
   const tokenHistory = [...inputIds, currentToken];
+  let warmupRemaining = graphExec === null ? warmupSteps : 0;
+  let capturing = false;
 
-  if (graphExec === null) {
-    for (let i = 0; i < warmupSteps; i++) {
-      if (QWEN3_EOS.has(currentToken)) {
-        const newCachedTokenIds = inputIds.slice(0, matchLen).concat(suffixIds).concat(generatedTokens);
-        return { tokens: generatedTokens, graphExec: null, timing, cachedTokenIds: newCachedTokenIds, matchLen };
+  for (let i = 1; i < maxNewTokens && !QWEN3_EOS.has(currentToken); i++) {
+    const t = performance.now();
+    const state = model.decodeBatchPlan([currentToken], ws, cache, true);
+
+    if (graphExec !== null) {
+      glm.graphLaunch(graphExec);
+      glm.synchronize();
+    } else {
+      if (warmupRemaining === 0 && !capturing) {
+        capturing = true;
+        glm.graphBeginCapture();
       }
-      const t1 = performance.now();
-      const state = model.decodeBatchPlan([currentToken], ws, pagedKV, true);
-      model.decodeBatchForward(state, ws, pagedKV);
-      currentToken = model.decodeBatchRead(state)[0];
-      timing.warmupMs.push(performance.now() - t1);
-      generatedTokens.push(currentToken);
-      tokenHistory.push(currentToken);
+      model.decodeBatchForward(state, ws, cache);
+      if (warmupRemaining === 0 && capturing) {
+        const graph = glm.graphEndCapture();
+        if (!graph) throw new Error("Graph capture failed");
+        graphExec = glm.graphInstantiate(graph);
+        if (!graphExec) throw new Error("Graph instantiation failed");
+        glm.graphDestroy(graph);
+      }
+      warmupRemaining = Math.max(0, warmupRemaining - 1);
     }
 
-    if (QWEN3_EOS.has(currentToken)) {
-      const newCachedTokenIds = inputIds.slice(0, matchLen).concat(suffixIds).concat(generatedTokens);
-      return { tokens: generatedTokens, graphExec: null, timing, cachedTokenIds: newCachedTokenIds, matchLen };
-    }
-
-    const t2 = performance.now();
-    const state = model.decodeBatchPlan([currentToken], ws, pagedKV, true);
-    glm.graphBeginCapture();
-    model.decodeBatchForward(state, ws, pagedKV);
-    const graph = glm.graphEndCapture();
-    if (!graph) throw new Error("Graph capture failed");
-    graphExec = glm.graphInstantiate(graph);
-    if (!graphExec) throw new Error("Graph instantiation failed");
-    glm.graphDestroy(graph);
-    timing.captureMs = performance.now() - t2;
-
-    glm.graphLaunch(graphExec);
-    glm.synchronize();
     currentToken = model.decodeBatchRead(state)[0];
+
+    if (capturing) {
+      timing.captureMs = performance.now() - t;
+      capturing = false;
+    } else if (graphExec !== null) {
+      timing.replayMs.push(performance.now() - t);
+    } else {
+      timing.warmupMs.push(performance.now() - t);
+    }
+
     generatedTokens.push(currentToken);
+    cache.appendTokens(0, [currentToken]);
     tokenHistory.push(currentToken);
   }
 
-  const remaining = maxNewTokens - generatedTokens.length;
-  for (let i = 0; i < remaining; i++) {
-    if (QWEN3_EOS.has(currentToken)) break;
-    const t3 = performance.now();
-    const state = model.decodeBatchPlan([currentToken], ws, pagedKV, true);
-    glm.graphLaunch(graphExec);
-    glm.synchronize();
-    currentToken = model.decodeBatchRead(state)[0];
-    timing.replayMs.push(performance.now() - t3);
-    generatedTokens.push(currentToken);
-    tokenHistory.push(currentToken);
-  }
-
-  const newCachedTokenIds = inputIds.slice(0, matchLen).concat(suffixIds).concat(generatedTokens);
-  return { tokens: generatedTokens, graphExec, timing, cachedTokenIds: newCachedTokenIds, matchLen };
+  return { tokens: generatedTokens, graphExec, timing, matchLen };
 }
 
 async function interactiveQwen3CudaGraph(
-  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, pagedKV: PagedKVCache,
+  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, cache: PagedKVCache,
   tokenizer: any, args: CliArgs,
 ): Promise<void> {
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
   const messages: Array<{ role: string; content: string }> = [];
   let graphExec: number | null = null;
-  let cachedTokenIds: number[] = [];
 
   console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  kv_persist=${args.noReset ? "on" : "off"}  |  cuda_graph=on`);
   if (sp) console.log(`Sampling: ${samplingLabel(sp)}`);
@@ -266,9 +218,8 @@ async function interactiveQwen3CudaGraph(
       if (userInput === "/quit") break;
       if (userInput === "/clear") {
         messages.length = 0;
-        cachedTokenIds = [];
         graphExec = null;
-        pagedKV.reset(1);
+        cache.reset(1);
         console.log("Conversation cleared.\n");
         continue;
       }
@@ -291,17 +242,17 @@ async function interactiveQwen3CudaGraph(
       }
 
       const result = generateResponseCudaGraph(
-        model, glm, ws, pagedKV, inputIds, cachedTokenIds, graphExec,
+        model, glm, ws, cache, inputIds, graphExec,
         args.maxNewTokens, args.warmupSteps, sp,
       );
 
       graphExec = result.graphExec;
-      cachedTokenIds = result.cachedTokenIds;
 
-      if (cachedTokenIds.length > 0) {
+      const cachedLen = cache.cachedTokenIds[0]?.length ?? 0;
+      if (cachedLen > 0) {
         if (result.matchLen > 0) {
           const suffixLen = inputIds.length - result.matchLen;
-          console.log(`  [cache hit ${result.matchLen}/${cachedTokenIds.length} tokens, appending ${suffixLen} new]`);
+          console.log(`  [cache hit ${result.matchLen}/${cachedLen} tokens, appending ${suffixLen} new]`);
         } else {
           console.log("  [cache miss, full prefill]");
         }
@@ -316,7 +267,7 @@ async function interactiveQwen3CudaGraph(
     }
   } finally {
     if (graphExec !== null) glm.graphExecDestroy(graphExec);
-    pagedKV.free();
+    cache.free();
     ws.free();
     model.free();
     rl.close();
@@ -324,7 +275,7 @@ async function interactiveQwen3CudaGraph(
 }
 
 async function singlePromptQwen3CudaGraph(
-  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, pagedKV: PagedKVCache,
+  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, cache: PagedKVCache,
   tokenizer: any, args: CliArgs,
 ): Promise<void> {
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
@@ -334,9 +285,9 @@ async function singlePromptQwen3CudaGraph(
   console.log(`Prompt: ${args.prompt}`);
   console.log(`Tokens: ${inputIds.length}`);
 
-  pagedKV.reset(1);
+  cache.reset(1);
   const result = generateResponseCudaGraph(
-    model, glm, ws, pagedKV, inputIds, [], null,
+    model, glm, ws, cache, inputIds, null,
     args.maxNewTokens, args.warmupSteps, sp,
   );
 
@@ -358,7 +309,7 @@ async function singlePromptQwen3CudaGraph(
   console.log(`\nResponse: ${responseText}`);
 
   if (result.graphExec !== null) glm.graphExecDestroy(result.graphExec);
-  pagedKV.free();
+  cache.free();
   ws.free();
   model.free();
 }
@@ -717,15 +668,15 @@ async function main(): Promise<void> {
     } else if (args.useCudaGraph) {
       const model = Qwen3Model.fromPretrained(glm, repoId, 1, args.maxSeqLen);
       const ws = new WorkspaceBuffers(glm);
-      const pagedKV = new PagedKVCache(glm, model.cfg.numKeyValueHeads, model.cfg.headDim, model.cfg.numHiddenLayers, args.maxPages, 1);
+      const cache = model.createChatCache(args.maxPages) as PagedKVCache;
 
       const modelDir = resolveModelPath(repoId);
       const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
 
       if (args.prompt) {
-        await singlePromptQwen3CudaGraph(model, glm, ws, pagedKV, tokenizer, args);
+        await singlePromptQwen3CudaGraph(model, glm, ws, cache, tokenizer, args);
       } else {
-        await interactiveQwen3CudaGraph(model, glm, ws, pagedKV, tokenizer, args);
+        await interactiveQwen3CudaGraph(model, glm, ws, cache, tokenizer, args);
       }
     } else {
       const model = Qwen3Model.fromPretrained(glm, repoId, 1, args.maxSeqLen);

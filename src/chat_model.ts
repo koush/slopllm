@@ -1,6 +1,4 @@
 import { WorkspaceBuffers } from "./paged_kv";
-import { PagedKVCache } from "./paged_kv";
-import { Qwen35GdnState } from "./qwen35_gdn_state";
 
 export interface SamplingParams {
   temperature: number;
@@ -14,6 +12,19 @@ export interface SamplingParams {
 export interface ChatCache {
   reset(batchSize: number): void;
   free(): void;
+  prefixMatch(seqIdx: number, inputIds: number[]): number[];
+  appendTokens(seqIdx: number, tokens: number[]): void;
+}
+
+export interface DecodeState {
+  batchSize: number;
+}
+
+export interface PrefillState {
+  batchSize: number;
+  totalTokens: number;
+  seqLens: number[];
+  pageAllocs: [number, number][];
 }
 
 export interface ChatModel {
@@ -27,24 +38,11 @@ export interface ChatModel {
     eosIds?: Set<number>,
     sampling?: SamplingParams,
   ): Generator<number>;
+  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[];
+  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): DecodeState;
+  decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void;
+  decodeBatchRead(state: DecodeState): number[];
   free(): void;
-}
-
-export class Qwen35ChatCache implements ChatCache {
-  constructor(
-    public readonly pagedKV: PagedKVCache,
-    public readonly gdnState: Qwen35GdnState,
-  ) {}
-
-  reset(batchSize: number): void {
-    this.pagedKV.reset(batchSize);
-    this.gdnState.reset();
-  }
-
-  free(): void {
-    this.gdnState.free();
-    this.pagedKV.free();
-  }
 }
 
 export function makeSamplingParams(args: {
@@ -78,5 +76,3 @@ export function samplingLabel(sp: SamplingParams): string {
   if (sp.presencePenalty !== 0) parts.push(`pres_pen=${sp.presencePenalty}`);
   return parts.join(" ");
 }
-
-

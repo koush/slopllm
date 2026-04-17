@@ -6,8 +6,36 @@ import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { Tensor, OpContext } from "./tensor";
 import { Qwen35GdnState } from "./qwen35_gdn_state";
-import type { ChatModel, ChatCache } from "./chat_model";
-import { SamplingParams, Qwen35ChatCache } from "./chat_model";
+import type { ChatModel, ChatCache, DecodeState, PrefillState } from "./chat_model";
+import { SamplingParams } from "./chat_model";
+
+class Qwen35ChatCache implements ChatCache {
+  constructor(
+    public readonly pagedKV: PagedKVCache,
+    public readonly gdnState: Qwen35GdnState,
+  ) {}
+
+  reset(batchSize: number): void {
+    this.pagedKV.reset(batchSize);
+    this.gdnState.reset();
+  }
+
+  free(): void {
+    this.gdnState.free();
+    this.pagedKV.free();
+  }
+
+  prefixMatch(seqIdx: number, inputIds: number[]): number[] {
+    const batchSize = Math.max(this.pagedKV.seqPages.length, 1);
+    this.pagedKV.reset(batchSize);
+    this.gdnState.reset();
+    return inputIds.slice();
+  }
+
+  appendTokens(seqIdx: number, tokens: number[]): void {
+    this.pagedKV.appendTokens(seqIdx, tokens);
+  }
+}
 
 export type { SamplingParams };
 
@@ -238,17 +266,6 @@ class Qwen35Workspace {
 }
 
 
-export interface Qwen35DecodeState {
-  batchSize: number;
-}
-
-export interface Qwen35PrefillState {
-  batchSize: number;
-  totalTokens: number;
-  seqLens: number[];
-  pageAllocs: [number, number][];
-}
-
 export class Qwen35Model implements OpContext, ChatModel {
   readonly eosIds = new Set([248044]);
   glm: GlmOps;
@@ -404,7 +421,7 @@ export class Qwen35Model implements OpContext, ChatModel {
 
   *chatStream(inputIds: number[][], cache: ChatCache, ws: WorkspaceBuffers, maxNewTokens = 100, eosIds?: Set<number>, sampling?: SamplingParams): Generator<number> {
     if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
-    yield* this.streamTokens(inputIds, ws, cache.pagedKV, cache.gdnState, maxNewTokens, eosIds ?? this.eosIds, sampling);
+    yield* this.streamTokens(inputIds, ws, cache, maxNewTokens, eosIds ?? this.eosIds, sampling);
   }
 
   private fullAttnCacheIdx(layerIdx: number): number {
@@ -806,7 +823,9 @@ export class Qwen35Model implements OpContext, ChatModel {
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
   }
 
-  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): Qwen35PrefillState {
+  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState {
+    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+    const { pagedKV, gdnState } = cache;
     const cfg = this.cfg;
     const glm = this.glm;
     const nHeads = cfg.numAttentionHeads;
@@ -815,12 +834,14 @@ export class Qwen35Model implements OpContext, ChatModel {
     const pageSize = pagedKV.pageSize;
     const batchSize = inputIdsList.length;
 
-    pagedKV.reset(batchSize);
+    if (pagedKV.seqPages.length !== batchSize) {
+      throw new Error(`prefillBatchPlan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+    }
 
     const seqLens = inputIdsList.map(ids => ids.length);
     const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+    const startPos = pagedKV.seqKvLens.slice();
 
-    gdnState.reset();
     gdnState.uploadCuSeqlens(seqLens);
 
     if (totalTokens > this.maxBatch * this.maxSeqLen) {
@@ -829,7 +850,7 @@ export class Qwen35Model implements OpContext, ChatModel {
 
     const pageAllocs: [number, number][] = [];
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      pageAllocs.push(pagedKV.allocPrefillPages(seqIdx, seqLens[seqIdx]));
+      pageAllocs.push(pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]));
     }
 
     const allIds: number[] = [];
@@ -846,8 +867,10 @@ export class Qwen35Model implements OpContext, ChatModel {
     pagedKV.updateIndptr();
 
     const posIds: number[] = [];
-    for (const s of seqLens) {
-      for (let p = 0; p < s; p++) posIds.push(p);
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      for (let p = 0; p < seqLens[seqIdx]; p++) {
+        posIds.push(startPos[seqIdx] + p);
+      }
     }
     const posIdsBuf = Int32Array.from(posIds);
     this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
@@ -883,8 +906,9 @@ export class Qwen35Model implements OpContext, ChatModel {
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       const pages = pagedKV.seqPages[seqIdx];
       for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
-        const pageIdxInSeq = Math.floor(pos / pagedKV.pageSize);
-        const offsetInPage = pos % pagedKV.pageSize;
+        const kvPos = startPos[seqIdx] + pos;
+        const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
+        const offsetInPage = kvPos % pagedKV.pageSize;
         const absPage = pages[pageIdxInSeq];
         slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
       }
@@ -895,7 +919,9 @@ export class Qwen35Model implements OpContext, ChatModel {
     return { batchSize, totalTokens, seqLens, pageAllocs };
   }
 
-  prefillBatchForward(state: Qwen35PrefillState, ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): void {
+  prefillBatchForward(state: PrefillState, ws: WorkspaceBuffers, cache: ChatCache): void {
+    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+    const { pagedKV, gdnState } = cache;
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -922,7 +948,7 @@ export class Qwen35Model implements OpContext, ChatModel {
     this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
   }
 
-  prefillBatchRead(state: Qwen35PrefillState): number[] {
+  prefillBatchRead(state: PrefillState): number[] {
     const batchSize = state.batchSize;
     const buf = Buffer.alloc(batchSize * I32);
     this.ws.argmaxIdx.d2h(buf);
@@ -933,116 +959,16 @@ export class Qwen35Model implements OpContext, ChatModel {
     return result;
   }
 
-  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): number[] {
-    const state = this.prefillBatchPlan(inputIdsList, ws, pagedKV, gdnState);
-    this.prefillBatchForward(state, ws, pagedKV, gdnState);
+  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[] {
+    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+    const state = this.prefillBatchPlan(inputIdsList, ws, cache);
+    this.prefillBatchForward(state, ws, cache);
     return this.prefillBatchRead(state);
   }
 
-  prefillBatchAppendPlan(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): Qwen35PrefillState {
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const pageSize = pagedKV.pageSize;
-    const batchSize = inputIdsList.length;
-
-    if (pagedKV.seqPages.length !== batchSize) {
-      throw new Error(`prefillBatchAppend: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
-    }
-
-    const seqLens = inputIdsList.map(ids => ids.length);
-    const totalTokens = seqLens.reduce((a, b) => a + b, 0);
-
-    gdnState.uploadCuSeqlens(seqLens);
-
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);
-    }
-
-    const allIds: number[] = [];
-    for (const ids of inputIdsList) allIds.push(...ids);
-    const idsBuf = Int32Array.from(allIds);
-    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
-
-    const qoIndptr = [0];
-    for (const s of seqLens) {
-      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
-    }
-    const qoIndptrBuf = Int32Array.from(qoIndptr);
-
-    pagedKV.updateIndptr();
-
-    const posIds: number[] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      const startPos = pagedKV.seqKvLens[seqIdx] - seqLens[seqIdx];
-      for (let p = 0; p < seqLens[seqIdx]; p++) {
-        posIds.push(startPos + p);
-      }
-    }
-    const posIdsBuf = Int32Array.from(posIds);
-    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
-
-    const lastIndices: number[] = [];
-    let offset = 0;
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      lastIndices.push(offset + seqLens[seqIdx] - 1);
-      offset += seqLens[seqIdx];
-    }
-    const lastIdxBuf = Int32Array.from(lastIndices);
-    this.ws.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
-
-    const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
-    glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
-
-    glm.batchPrefillPagedPlan(
-      ws.floatWs, BATCH_FLOAT_WS_SIZE,
-      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
-      ws.prefillPlanInfo,
-      qoIndptrHostPtr, pagedKV.indptrH,
-      totalTokens, batchSize,
-      nHeads, nKv, hd,
-      pageSize,
-      1
-    );
-
-    glm.freePinned(qoIndptrHostPtr);
-
-    this.ws.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
-
-    const slotMapping: number[] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      const pages = pagedKV.seqPages[seqIdx];
-      const startPos = pagedKV.seqKvLens[seqIdx] - seqLens[seqIdx];
-      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
-        const kvPos = startPos + pos;
-        const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
-        const offsetInPage = kvPos % pagedKV.pageSize;
-        const absPage = pages[pageIdxInSeq];
-        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
-      }
-    }
-    const slotMappingBuf = Int32Array.from(slotMapping);
-    this.ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
-
-    const seqLensResult = seqLens.slice();
-    const pageAllocs: [number, number][] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      const pages = pagedKV.seqPages[seqIdx];
-      pageAllocs.push([pages[0], pages.length]);
-    }
-
-    return { batchSize, totalTokens, seqLens: seqLensResult, pageAllocs };
-  }
-
-  prefillBatchAppend(inputIdsList: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): number[] {
-    const state = this.prefillBatchAppendPlan(inputIdsList, ws, pagedKV, gdnState);
-    this.prefillBatchForward(state, ws, pagedKV, gdnState);
-    return this.prefillBatchRead(state);
-  }
-
-  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState, enableCudaGraph = false): Qwen35DecodeState {
+  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): DecodeState {
+    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+    const { pagedKV, gdnState } = cache;
     const cfg = this.cfg;
     const glm = this.glm;
     const nHeads = cfg.numAttentionHeads;
@@ -1082,7 +1008,9 @@ export class Qwen35Model implements OpContext, ChatModel {
     return { batchSize };
   }
 
-  decodeBatchForward(state: Qwen35DecodeState, ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): void {
+  decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void {
+    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+    const { pagedKV, gdnState } = cache;
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -1107,7 +1035,7 @@ export class Qwen35Model implements OpContext, ChatModel {
     this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
   }
 
-  decodeBatchRead(state: Qwen35DecodeState): number[] {
+  decodeBatchRead(state: DecodeState): number[] {
     const batchSize = state.batchSize;
     const buf = Buffer.alloc(batchSize * I32);
     this.ws.argmaxIdx.d2h(buf);
@@ -1118,29 +1046,35 @@ export class Qwen35Model implements OpContext, ChatModel {
     return result;
   }
 
-  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): number[] {
-    const state = this.decodeBatchPlan(tokenIdsList, ws, pagedKV, gdnState);
-    this.decodeBatchForward(state, ws, pagedKV, gdnState);
+  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[] {
+    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+    const state = this.decodeBatchPlan(tokenIdsList, ws, cache);
+    this.decodeBatchForward(state, ws, cache);
     return this.decodeBatchRead(state);
   }
 
-  prefill(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): number {
-    return this.prefillBatch(inputIds, ws, pagedKV, gdnState)[0];
+  prefill(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache): number {
+    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+    return this.prefillBatch(inputIds, ws, cache)[0];
   }
 
-  decode(tokenId: number, ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState): number {
-    return this.decodeBatch([tokenId], ws, pagedKV, gdnState)[0];
+  decode(tokenId: number, ws: WorkspaceBuffers, cache: ChatCache): number {
+    return this.decodeBatch([tokenId], ws, cache)[0];
   }
 
-  generateTokens(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): number[] {
-    return [...this.streamTokens(inputIds, ws, pagedKV, gdnState, maxNewTokens, eosTokenIds, sampling)];
+  generateTokens(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): number[] {
+    return [...this.streamTokens(inputIds, ws, cache, maxNewTokens, eosTokenIds, sampling)];
   }
 
-  *streamTokens(inputIds: number[][], ws: WorkspaceBuffers, pagedKV: PagedKVCache, gdnState: Qwen35GdnState, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): Generator<number> {
+  *streamTokens(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache, maxNewTokens = 100, eosTokenIds = EOS_TOKEN_IDS, sampling?: SamplingParams): Generator<number> {
+    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+    const { pagedKV, gdnState } = cache;
     const vs = this.cfg.vocabSize;
     if (inputIds.length !== 1) throw new Error("streamTokens only supports batch=1");
 
-    const firstTokens = this.prefillBatch(inputIds, ws, pagedKV, gdnState);
+    pagedKV.reset(1);
+    gdnState.reset();
+    const firstTokens = this.prefillBatch(inputIds, ws, cache);
     let nextToken = firstTokens[0];
     yield nextToken;
 
@@ -1149,7 +1083,7 @@ export class Qwen35Model implements OpContext, ChatModel {
     for (let i = 0; i < maxNewTokens - 1; i++) {
       if (eosTokenIds.has(nextToken)) break;
 
-      const decodeTokens = this.decodeBatch([nextToken], ws, pagedKV, gdnState);
+      const decodeTokens = this.decodeBatch([nextToken], ws, cache);
       nextToken = decodeTokens[0];
 
       if (sampling && (sampling.temperature > 0 || sampling.repetitionPenalty !== 1.0 || sampling.presencePenalty !== 0 || sampling.topK > 0 || sampling.topP < 1.0)) {
@@ -1165,14 +1099,16 @@ export class Qwen35Model implements OpContext, ChatModel {
     if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
     const { pagedKV, gdnState } = cache;
     const batchSize = inputIdsList.length;
-    const firstTokens = this.prefillBatch(inputIdsList, ws, pagedKV, gdnState);
+    pagedKV.reset(batchSize);
+    gdnState.reset();
+    const firstTokens = this.prefillBatch(inputIdsList, ws, cache);
     const results: number[][] = firstTokens.map(t => [t]);
 
     let current = firstTokens.slice();
     for (let step = 0; step < maxNewTokens - 1; step++) {
       const done = current.every((t, i) => eosTokenIds.has(t) && results[i].length > 1);
       if (done) break;
-      current = this.decodeBatch(current, ws, pagedKV, gdnState);
+      current = this.decodeBatch(current, ws, cache);
       for (let i = 0; i < batchSize; i++) {
         if (!eosTokenIds.has(results[i][results[i].length - 1]) || results[i].length === 1) {
           results[i].push(current[i]);
