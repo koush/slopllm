@@ -1,13 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, I32, SAMPLING_MAX_TOPK, SAMPLING_BLOCK_SIZE } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, I32 } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { Tensor } from "./tensor";
 import { Qwen35GdnState } from "./qwen35_gdn_state";
 import type { ChatCache } from "./chat_model";
-import { ChatModelBase, type BatchState, SamplingParams } from "./chat_model";
+import { ChatModelBase, type BatchState, SamplingParams, WorkspaceBase } from "./chat_model";
 
 class Qwen35ChatCache implements ChatCache {
   constructor(
@@ -107,7 +107,7 @@ function loadConfig(modelDir: string): Qwen35Config {
   };
 }
 
-class Qwen35Workspace {
+class Qwen35Workspace extends WorkspaceBase {
   hiddenA: Tensor;
   hiddenB: Tensor;
   normed: Tensor;
@@ -149,26 +149,13 @@ class Qwen35Workspace {
   attnVT: Tensor;
   attnQRope: Tensor;
   attnKRope: Tensor;
-  sampleOutToken: Tensor;
-  sampleTopkVals: Tensor;
-  sampleTopkIdxs: Tensor;
-  sampleWorkspace: Tensor;
-  samplePenaltyTokens: Tensor;
-  samplePenaltyOffsets: Tensor;
-  sampleTemperatures: Tensor;
-  sampleRepPenalties: Tensor;
-  samplePresPenalties: Tensor;
-  sampleTopKs: Tensor;
-  sampleTopPs: Tensor;
-  sampleRandomVals: Tensor;
   qoIndptrD: Tensor;
   prefillSlotMapping: Tensor;
-  tensors = new Map<string, Tensor>();
 
   constructor(glm: GlmOps, B: number, S: number, cfg: Qwen35Config) {
+    super(glm, B, cfg.vocabSize);
     const hs = cfg.hiddenSize;
     const inter = cfg.intermediateSize;
-    const vs = cfg.vocabSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
@@ -186,7 +173,7 @@ class Qwen35Workspace {
     this.upBuf = Tensor.alloc(glm, [B, S, inter], "BF16");
     this.siluBuf = Tensor.alloc(glm, [B, S, inter], "BF16");
     this.downBuf = Tensor.alloc(glm, [B, S, hs], "BF16");
-    this.logitsBuf = Tensor.alloc(glm, [B, vs], "BF16");
+    this.logitsBuf = Tensor.alloc(glm, [B, cfg.vocabSize], "BF16");
     this.hiddenLast = Tensor.alloc(glm, [B, hs], "BF16");
     this.lastIdx = Tensor.alloc(glm, [B], "I32");
     this.argmaxIdx = Tensor.alloc(glm, [B], "I32");
@@ -225,35 +212,10 @@ class Qwen35Workspace {
     this.attnQRope = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
     this.attnKRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
 
-    this.sampleOutToken = Tensor.alloc(glm, [B], "I32");
-    this.sampleTopkVals = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
-    this.sampleTopkIdxs = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
-    this.sampleWorkspace = Tensor.alloc(glm, [B * vs], "F32");
-    this.samplePenaltyTokens = Tensor.alloc(glm, [B * 1024], "I32");
-    this.samplePenaltyOffsets = Tensor.alloc(glm, [B + 1], "I32");
-    this.sampleTemperatures = Tensor.alloc(glm, [B], "F32");
-    this.sampleRepPenalties = Tensor.alloc(glm, [B], "F32");
-    this.samplePresPenalties = Tensor.alloc(glm, [B], "F32");
-    this.sampleTopKs = Tensor.alloc(glm, [B], "I32");
-    this.sampleTopPs = Tensor.alloc(glm, [B], "F32");
-    this.sampleRandomVals = Tensor.alloc(glm, [B], "F32");
-
     this.qoIndptrD = Tensor.alloc(glm, [B + 1], "I32");
     this.prefillSlotMapping = Tensor.alloc(glm, [B * S], "I32");
 
-    for (const key of Object.keys(this) as (keyof this)[]) {
-      const value = this[key];
-      if (value instanceof Tensor && typeof key === 'string') {
-        this.tensors.set(key, value);
-      }
-    }
-  }
-
-  free(): void {
-    for (const tensor of this.tensors.values()) {
-      tensor.free();
-    }
-    this.tensors.clear();
+    this.buildTensorMap();
   }
 }
 

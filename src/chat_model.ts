@@ -71,6 +71,60 @@ export interface CommonModelWorkspace {
   sampleRandomVals: Tensor;
 }
 
+export abstract class WorkspaceBase implements CommonModelWorkspace {
+  abstract argmaxIdx: Tensor;
+  abstract inputIdsBuf: Tensor;
+  abstract positionIds: Tensor;
+  abstract lastIdx: Tensor;
+  abstract qoIndptrD: Tensor;
+  abstract prefillSlotMapping: Tensor;
+  abstract logitsBuf: Tensor;
+  sampleOutToken: Tensor;
+  sampleTopkVals: Tensor;
+  sampleTopkIdxs: Tensor;
+  sampleWorkspace: Tensor;
+  samplePenaltyTokens: Tensor;
+  samplePenaltyOffsets: Tensor;
+  sampleTemperatures: Tensor;
+  sampleRepPenalties: Tensor;
+  samplePresPenalties: Tensor;
+  sampleTopKs: Tensor;
+  sampleTopPs: Tensor;
+  sampleRandomVals: Tensor;
+  tensors = new Map<string, Tensor>();
+
+  constructor(glm: GlmOps, B: number, vs: number) {
+    this.sampleOutToken = Tensor.alloc(glm, [B], "I32");
+    this.sampleTopkVals = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
+    this.sampleTopkIdxs = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
+    this.sampleWorkspace = Tensor.alloc(glm, [B * vs], "F32");
+    this.samplePenaltyTokens = Tensor.alloc(glm, [B * 1024], "I32");
+    this.samplePenaltyOffsets = Tensor.alloc(glm, [B + 1], "I32");
+    this.sampleTemperatures = Tensor.alloc(glm, [B], "F32");
+    this.sampleRepPenalties = Tensor.alloc(glm, [B], "F32");
+    this.samplePresPenalties = Tensor.alloc(glm, [B], "F32");
+    this.sampleTopKs = Tensor.alloc(glm, [B], "I32");
+    this.sampleTopPs = Tensor.alloc(glm, [B], "F32");
+    this.sampleRandomVals = Tensor.alloc(glm, [B], "F32");
+  }
+
+  protected buildTensorMap(): void {
+    for (const key of Object.keys(this) as (keyof this)[]) {
+      const value = this[key];
+      if (value instanceof Tensor && typeof key === 'string') {
+        this.tensors.set(key, value);
+      }
+    }
+  }
+
+  free(): void {
+    for (const tensor of this.tensors.values()) {
+      tensor.free();
+    }
+    this.tensors.clear();
+  }
+}
+
 export abstract class ChatModelBase implements ChatModel {
   abstract readonly eosIds: Set<number>;
   protected abstract readonly glm: GlmOps;
