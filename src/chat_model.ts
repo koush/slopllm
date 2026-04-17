@@ -41,6 +41,7 @@ export interface ChatModel {
     sampling?: SamplingParams,
   ): Generator<number>;
   prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[];
+  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState;
   decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): DecodeState;
   decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void;
   decodeBatchRead(state: DecodeState): number[];
@@ -59,6 +60,9 @@ export interface CommonModelWorkspace {
   argmaxIdx: Tensor;
   inputIdsBuf: Tensor;
   positionIds: Tensor;
+  lastIdx: Tensor;
+  qoIndptrD: Tensor;
+  prefillSlotMapping: Tensor;
   logitsBuf: Tensor;
   sampleOutToken: Tensor;
   sampleTopkVals: Tensor;
@@ -75,12 +79,107 @@ export abstract class ChatModelBase implements ChatModel {
   protected abstract readonly weights: Map<string, Tensor>;
 
   abstract createChatCache(maxPages?: number): ChatCache;
-  abstract prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState;
   abstract prefillBatchForward(state: PrefillState, ws: WorkspaceBuffers, cache: ChatCache): void;
   abstract decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void;
   abstract free(): void;
 
   protected abstract getPagedKV(cache: ChatCache): PagedKVCache;
+
+  protected prefillBatchPlanHook(
+    _inputIdsList: number[][], _seqLens: number[], _totalTokens: number,
+    _startPos: number[], _cache: ChatCache,
+  ): void {}
+
+  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState {
+    const pagedKV = this.getPagedKV(cache);
+    const cfg = this.cfg;
+    const glm = this.glm;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const pageSize = pagedKV.pageSize;
+    const batchSize = inputIdsList.length;
+
+    if (pagedKV.seqPages.length !== batchSize) {
+      throw new Error(`prefillBatchPlan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+    }
+
+    const seqLens = inputIdsList.map(ids => ids.length);
+    const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+    const startPos = pagedKV.seqKvLens.slice();
+
+    this.prefillBatchPlanHook(inputIdsList, seqLens, totalTokens, startPos, cache);
+
+    const pageAllocs: [number, number][] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      pageAllocs.push(pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]));
+    }
+
+    const allIds: number[] = [];
+    for (const ids of inputIdsList) allIds.push(...ids);
+    const idsBuf = Int32Array.from(allIds);
+    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+
+    const qoIndptr = [0];
+    for (const s of seqLens) {
+      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
+    }
+    const qoIndptrBuf = Int32Array.from(qoIndptr);
+
+    pagedKV.updateIndptr();
+
+    const posIds: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      for (let p = 0; p < seqLens[seqIdx]; p++) {
+        posIds.push(startPos[seqIdx] + p);
+      }
+    }
+    const posIdsBuf = Int32Array.from(posIds);
+    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+
+    const lastIndices: number[] = [];
+    let offset = 0;
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      lastIndices.push(offset + seqLens[seqIdx] - 1);
+      offset += seqLens[seqIdx];
+    }
+    const lastIdxBuf = Int32Array.from(lastIndices);
+    this.ws.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+
+    const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
+    glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    glm.batchPrefillPagedPlan(
+      ws.floatWs, BATCH_FLOAT_WS_SIZE,
+      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
+      ws.prefillPlanInfo,
+      qoIndptrHostPtr, pagedKV.indptrH,
+      totalTokens, batchSize,
+      nHeads, nKv, hd,
+      pageSize,
+      1
+    );
+
+    glm.freePinned(qoIndptrHostPtr);
+
+    this.ws.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    const slotMapping: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const pages = pagedKV.seqPages[seqIdx];
+      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
+        const kvPos = startPos[seqIdx] + pos;
+        const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
+        const offsetInPage = kvPos % pagedKV.pageSize;
+        const absPage = pages[pageIdxInSeq];
+        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
+      }
+    }
+    const slotMappingBuf = Int32Array.from(slotMapping);
+    this.ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+
+    return { batchSize, totalTokens, seqLens, pageAllocs };
+  }
 
   *chatStream(
     inputIds: number[][], cache: ChatCache, ws: WorkspaceBuffers,

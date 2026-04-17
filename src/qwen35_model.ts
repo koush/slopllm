@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, I32, SAMPLING_MAX_TOPK, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, I32, SAMPLING_MAX_TOPK } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
@@ -736,100 +736,15 @@ export class Qwen35Model extends ChatModelBase {
     this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
   }
 
-  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState {
-    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
-    const { pagedKV, gdnState } = cache;
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const pageSize = pagedKV.pageSize;
-    const batchSize = inputIdsList.length;
-
-    if (pagedKV.seqPages.length !== batchSize) {
-      throw new Error(`prefillBatchPlan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
-    }
-
-    const seqLens = inputIdsList.map(ids => ids.length);
-    const totalTokens = seqLens.reduce((a, b) => a + b, 0);
-    const startPos = pagedKV.seqKvLens.slice();
-
+  protected prefillBatchPlanHook(
+    _inputIdsList: number[][], seqLens: number[], totalTokens: number,
+    _startPos: number[], cache: ChatCache,
+  ): void {
+    const { gdnState } = cache as Qwen35ChatCache;
     gdnState.uploadCuSeqlens(seqLens);
-
     if (totalTokens > this.maxBatch * this.maxSeqLen) {
       throw new Error(`Total tokens ${totalTokens} exceeds max (B=${this.maxBatch}, S=${this.maxSeqLen})`);
     }
-
-    const pageAllocs: [number, number][] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      pageAllocs.push(pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]));
-    }
-
-    const allIds: number[] = [];
-    for (const ids of inputIdsList) allIds.push(...ids);
-    const idsBuf = Int32Array.from(allIds);
-    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
-
-    const qoIndptr = [0];
-    for (const s of seqLens) {
-      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
-    }
-    const qoIndptrBuf = Int32Array.from(qoIndptr);
-
-    pagedKV.updateIndptr();
-
-    const posIds: number[] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      for (let p = 0; p < seqLens[seqIdx]; p++) {
-        posIds.push(startPos[seqIdx] + p);
-      }
-    }
-    const posIdsBuf = Int32Array.from(posIds);
-    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
-
-    const lastIndices: number[] = [];
-    let offset = 0;
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      lastIndices.push(offset + seqLens[seqIdx] - 1);
-      offset += seqLens[seqIdx];
-    }
-    const lastIdxBuf = Int32Array.from(lastIndices);
-    this.ws.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
-
-    const qoIndptrHostPtr = glm.allocPinned((batchSize + 1) * I32);
-    glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
-
-    glm.batchPrefillPagedPlan(
-      ws.floatWs, BATCH_FLOAT_WS_SIZE,
-      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
-      ws.prefillPlanInfo,
-      qoIndptrHostPtr, pagedKV.indptrH,
-      totalTokens, batchSize,
-      nHeads, nKv, hd,
-      pageSize,
-      1
-    );
-
-    glm.freePinned(qoIndptrHostPtr);
-
-    this.ws.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
-
-    const slotMapping: number[] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      const pages = pagedKV.seqPages[seqIdx];
-      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
-        const kvPos = startPos[seqIdx] + pos;
-        const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
-        const offsetInPage = kvPos % pagedKV.pageSize;
-        const absPage = pages[pageIdxInSeq];
-        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
-      }
-    }
-    const slotMappingBuf = Int32Array.from(slotMapping);
-    this.ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
-
-    return { batchSize, totalTokens, seqLens, pageAllocs };
   }
 
   prefillBatchForward(state: PrefillState, ws: WorkspaceBuffers, cache: ChatCache): void {
