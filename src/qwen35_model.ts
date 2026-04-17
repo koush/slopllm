@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, F32, SAMPLING_MAX_TOPK, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, PAGE_SIZE } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, I32, SAMPLING_MAX_TOPK, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
-import { Tensor, OpContext } from "./tensor";
+import { Tensor } from "./tensor";
 import { Qwen35GdnState } from "./qwen35_gdn_state";
 import type { ChatCache, DecodeState, PrefillState } from "./chat_model";
 import { ChatModelBase, SamplingParams } from "./chat_model";
@@ -124,9 +124,7 @@ class Qwen35Workspace {
   sin: Tensor;
   inputIdsBuf: Tensor;
   flashOut: Tensor;
-  flashTmp: Tensor;
   oProjBuf: Tensor;
-  decodeId: Tensor;
   gdnQkvBuf: Tensor;
   gdnABuf: Tensor;
   gdnBBuf: Tensor;
@@ -199,9 +197,7 @@ class Qwen35Workspace {
     this.sin = Tensor.alloc(glm, [B, S, hd], "BF16");
     this.inputIdsBuf = Tensor.alloc(glm, [B * S], "I32");
     this.flashOut = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
-    this.flashTmp = Tensor.alloc(glm, [32 * 1024 * 1024], "U8");
     this.oProjBuf = Tensor.alloc(glm, [B, S, hs], "BF16");
-    this.decodeId = Tensor.alloc(glm, [1], "I32");
 
     this.gdnQkvBuf = Tensor.alloc(glm, [B * convDim], "BF16");
     this.gdnABuf = Tensor.alloc(glm, [B * linHeads], "BF16");
@@ -433,25 +429,12 @@ export class Qwen35Model extends ChatModelBase {
     return cache.pagedKV;
   }
 
-  readLogits(): Float32Array {
-    const vs = this.cfg.vocabSize;
-    const buf = Buffer.alloc(vs * BF16);
-    this.glm.d2h(buf, this.ws.logitsBuf.data, vs * BF16);
-    return bf16BytesToF32(buf);
-  }
-
   private finalNormAndLogits(count: number, src?: Tensor): void {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const vs = cfg.vocabSize;
     this.ws.normed.rmsnorm(src ?? this.ws.hiddenA, this.weights.get("norm.weight")!, cfg.rmsNormEps, hs, count);
     this.ws.logitsBuf.linear(this.ws.normed, this.weights.get("lm_head.weight")!, count, vs, hs, this);
-  }
-
-  private extractLastLogits(count: number, lastIndicesBuf: Buffer): void {
-    this.ws.lastIdx.h2d(lastIndicesBuf);
-    this.ws.hiddenLast.indexSelect(this.ws.hiddenA, this.ws.lastIdx, this.cfg.hiddenSize, count);
-    this.finalNormAndLogits(count, this.ws.hiddenLast);
   }
 
   private mlp(pfx: string, BS: number): void {

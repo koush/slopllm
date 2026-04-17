@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, BF16, I32, F32, SAMPLING_MAX_TOPK, FLASH_TMP_SIZE, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, I32, SAMPLING_MAX_TOPK, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
-import { Tensor, OpContext } from "./tensor";
+import { Tensor } from "./tensor";
 import type { ChatCache, DecodeState, PrefillState } from "./chat_model";
 import { ChatModelBase, SamplingParams } from "./chat_model";
 
@@ -72,9 +72,7 @@ class Qwen3Workspace {
   hiddenLast: Tensor;
   lastIdx: Tensor;
   argmaxIdx: Tensor;
-  decodeId: Tensor;
   flashOut: Tensor;
-  flashTmp: Tensor;
   inputIdsBuf: Tensor;
   qoIndptrD: Tensor;
   prefillSlotMapping: Tensor;
@@ -119,9 +117,7 @@ class Qwen3Workspace {
     this.hiddenLast = Tensor.alloc(glm, [B, hs], "BF16");
     this.lastIdx = Tensor.alloc(glm, [B], "I32");
     this.argmaxIdx = Tensor.alloc(glm, [B], "I32");
-    this.decodeId = Tensor.alloc(glm, [1], "I32");
     this.flashOut = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
-    this.flashTmp = Tensor.alloc(glm, [FLASH_TMP_SIZE], "U8");
     this.inputIdsBuf = Tensor.alloc(glm, [B * S], "I32");
     this.qoIndptrD = Tensor.alloc(glm, [B + 1], "I32");
     this.prefillSlotMapping = Tensor.alloc(glm, [B * S], "I32");
@@ -287,12 +283,6 @@ export class Qwen3Model extends ChatModelBase {
     this.ws.logitsBuf.linear(this.ws.normed, this.weights.get("lm_head.weight")!, count, vs, hs, this);
   }
 
-  private extractLastLogits(count: number, lastIndicesBuf: Buffer): void {
-    this.ws.lastIdx.h2d(lastIndicesBuf);
-    this.ws.hiddenLast.indexSelect(this.ws.hiddenA, this.ws.lastIdx, this.cfg.hiddenSize, count);
-    this.finalNormAndLogits(count, this.ws.hiddenLast);
-  }
-
   prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState {
     const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
@@ -438,47 +428,6 @@ export class Qwen3Model extends ChatModelBase {
     this.finalNormAndLogits(batchSize, this.ws.hiddenLast);
 
     this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
-  }
-
-  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): DecodeState {
-    const pagedKV = this.getPagedKV(cache);
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const pageSize = pagedKV.pageSize;
-    const batchSize = tokenIdsList.length;
-
-    const writeLocations: [number, number][] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
-    }
-
-    pagedKV.updateIndptr();
-    pagedKV.updateSlotMapping(writeLocations, pageSize);
-
-    const idsBuf = Int32Array.from(tokenIdsList);
-    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
-
-    const posIds = new Array(batchSize);
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      posIds[seqIdx] = pagedKV.seqKvLens[seqIdx] - 1;
-    }
-    const posIdsBuf = Int32Array.from(posIds);
-    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
-
-    glm.batchDecodePlan(
-      ws.floatWs, BATCH_FLOAT_WS_SIZE,
-      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
-      ws.decodePlanInfo,
-      pagedKV.indptrH,
-      batchSize,
-      nHeads, nKv, hd, pageSize,
-      enableCudaGraph
-    );
-
-    return { batchSize };
   }
 
   decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void {
