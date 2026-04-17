@@ -34,9 +34,9 @@ export interface ChatModel {
   read(state: BatchState): number[];
   forwardEager(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[];
   planDecode(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): BatchState;
-  decodeForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
-  decodeRead(state: BatchState): number[];
-  decodeEager(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[];
+  forwardDecode(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
+  readDecode(state: BatchState): number[];
+  forwardEagerDecode(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[];
   sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number;
   free(): void;
 }
@@ -228,15 +228,15 @@ export abstract class ChatModelBase implements ChatModel {
     return this.plan(tokenIdsList.map(t => [t]), ws, cache, enableCudaGraph);
   }
 
-  decodeForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
+  forwardDecode(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
     this.forward(state, ws, cache);
   }
 
-  decodeRead(state: BatchState): number[] {
+  readDecode(state: BatchState): number[] {
     return this.read(state);
   }
 
-  decodeEager(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[] {
+  forwardEagerDecode(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[] {
     return this.forwardEager(tokenIdsList.map(t => [t]), ws, cache);
   }
 

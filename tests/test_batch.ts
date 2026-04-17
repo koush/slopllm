@@ -65,7 +65,7 @@ describe("Qwen3-0.6B batch tests", () => {
       const batchTokens = model.forwardEager([PROMPT1, PROMPT2], ws, pagedKV);
       pagedKV.updateIndptr();
 
-      const decodeTokens = model.decodeEager(batchTokens, ws, pagedKV);
+      const decodeTokens = model.forwardEagerDecode(batchTokens, ws, pagedKV);
 
       assert.equal(typeof decodeTokens[0], "number", `Decode token 0 not a number: ${decodeTokens[0]}`);
       assert.equal(typeof decodeTokens[1], "number", `Decode token 1 not a number: ${decodeTokens[1]}`);
@@ -151,13 +151,13 @@ describe("Qwen3-0.6B batch tests", () => {
 
       singleKV.reset(1);
       const singleFirst1 = model.forwardEager([PROMPT1], ws, singleKV)[0];
-      const singleDecode1 = model.decodeEager([singleFirst1], ws, singleKV)[0];
+      const singleDecode1 = model.forwardEagerDecode([singleFirst1], ws, singleKV)[0];
 
       singleKV.reset(1);
       const singleFirst2 = model.forwardEager([PROMPT2], ws, singleKV)[0];
-      const singleDecode2 = model.decodeEager([singleFirst2], ws, singleKV)[0];
+      const singleDecode2 = model.forwardEagerDecode([singleFirst2], ws, singleKV)[0];
 
-      const batchDecodeTokens = model.decodeEager([token1, token2], ws, pagedKV);
+      const batchDecodeTokens = model.forwardEagerDecode([token1, token2], ws, pagedKV);
 
       assert.equal(batchDecodeTokens[0], singleDecode1,
         `Seq1 decode token mismatch: batch=${batchDecodeTokens[0]}, single=${singleDecode1}`);
@@ -180,7 +180,7 @@ describe("Qwen3-0.6B batch tests", () => {
       const numSteps = 5;
 
       for (let step = 0; step < numSteps; step++) {
-        current = model.decodeEager(current, ws, pagedKV);
+        current = model.forwardEagerDecode(current, ws, pagedKV);
       }
 
       assert.equal(current.length, 2);
@@ -230,8 +230,8 @@ describe("Qwen3-0.6B batch tests", () => {
       pagedKV.updateIndptr();
 
       const stateRef = model.planDecode([tokens[0]], ws, pagedKV, true);
-      model.decodeForward(stateRef, ws, pagedKV);
-      const tokensRef = model.decodeRead(stateRef);
+      model.forwardDecode(stateRef, ws, pagedKV);
+      const tokensRef = model.readDecode(stateRef);
 
       pagedKV.reset(1);
       const tokens2 = model.forwardEager([prompt], ws, pagedKV);
@@ -239,7 +239,7 @@ describe("Qwen3-0.6B batch tests", () => {
       const state = model.planDecode([tokens2[0]], ws, pagedKV, true);
 
       glm.graphBeginCapture();
-      model.decodeForward(state, ws, pagedKV);
+      model.forwardDecode(state, ws, pagedKV);
       const graph = glm.graphEndCapture();
       assert.ok(graph, "graph_end_capture returned null");
       const graphExec = glm.graphInstantiate(graph);
@@ -253,7 +253,7 @@ describe("Qwen3-0.6B batch tests", () => {
       glm.graphLaunch(graphExec);
       glm.synchronize();
 
-      const tokensReplay = model.decodeRead(state2);
+      const tokensReplay = model.readDecode(state2);
       assert.deepEqual(tokensReplay, tokensRef,
         `Graph replay mismatch: replay=${tokensReplay}, ref=${tokensRef}`);
 
@@ -278,8 +278,8 @@ describe("Qwen3-0.6B batch tests", () => {
       let current = tokens[0];
       for (let step = 0; step < numSteps; step++) {
         const state = model.planDecode([current], ws, pagedKV, true);
-        model.decodeForward(state, ws, pagedKV);
-        current = model.decodeRead(state)[0];
+        model.forwardDecode(state, ws, pagedKV);
+        current = model.readDecode(state)[0];
         refTokens.push(current);
       }
 
@@ -289,13 +289,13 @@ describe("Qwen3-0.6B batch tests", () => {
 
       current = tokens[0];
       const warmupState = model.planDecode([current], ws, pagedKV, true);
-      model.decodeForward(warmupState, ws, pagedKV);
-      current = model.decodeRead(warmupState)[0];
+      model.forwardDecode(warmupState, ws, pagedKV);
+      current = model.readDecode(warmupState)[0];
       assert.equal(current, refTokens[0], `Warmup mismatch: ${current} != ${refTokens[0]}`);
 
       const state = model.planDecode([current], ws, pagedKV, true);
       glm.graphBeginCapture();
-      model.decodeForward(state, ws, pagedKV);
+      model.forwardDecode(state, ws, pagedKV);
       const graph = glm.graphEndCapture();
       assert.ok(graph, "graph_end_capture returned null");
       const graphExec = glm.graphInstantiate(graph);
@@ -304,7 +304,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
       glm.graphLaunch(graphExec);
       glm.synchronize();
-      current = model.decodeRead(state)[0];
+      current = model.readDecode(state)[0];
       const graphTokens: number[] = [refTokens[0], current];
       assert.equal(current, refTokens[1], `Replay step 1 mismatch: ${current} != ${refTokens[1]}`);
 
@@ -312,7 +312,7 @@ describe("Qwen3-0.6B batch tests", () => {
         const s = model.planDecode([current], ws, pagedKV, true);
         glm.graphLaunch(graphExec);
         glm.synchronize();
-        current = model.decodeRead(s)[0];
+        current = model.readDecode(s)[0];
         graphTokens.push(current);
         assert.equal(current, refTokens[step],
           `Replay step ${step} mismatch: ${current} != ${refTokens[step]}`);

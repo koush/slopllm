@@ -162,7 +162,7 @@ export function* generateStream(
         glm.graphBeginCapture();
       }
 
-      model.decodeForward(state, ws, cache);
+      model.forwardDecode(state, ws, cache);
 
       if (capturing) {
         const graph = glm.graphEndCapture();
@@ -175,7 +175,7 @@ export function* generateStream(
       if (useGraph) graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
     }
 
-    currentToken = model.decodeRead(state)[0];
+    currentToken = model.readDecode(state)[0];
 
     if (sampling && needsSampling(sampling)) {
       currentToken = model.sampleTokenGPU(sampling, tokenHistory);
@@ -202,7 +202,7 @@ export function generateBatchTokens(
   for (let step = 0; step < maxNewTokens - 1; step++) {
     if (finished.every(f => f)) break;
 
-    const newTokens = model.decodeEager(nextTokens, ws, cache);
+    const newTokens = model.forwardEagerDecode(nextTokens, ws, cache);
 
     for (let i = 0; i < batchSize; i++) {
       nextTokens[i] = newTokens[i];

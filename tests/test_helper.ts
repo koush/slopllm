@@ -16,7 +16,7 @@ export function generateBatchTokens(
   for (let step = 0; step < maxNewTokens - 1; step++) {
     if (finished.every(f => f)) break;
 
-    const newTokens = model.decodeEager(nextTokens, ws, cache);
+    const newTokens = model.forwardEagerDecode(nextTokens, ws, cache);
 
     for (let i = 0; i < batchSize; i++) {
       nextTokens[i] = newTokens[i];
@@ -48,7 +48,7 @@ export function* generateTokens(
   for (let i = 0; i < maxNewTokens - 1; i++) {
     if (eosIds.has(nextToken)) break;
 
-    const decodeTokens = model.decodeEager([nextToken], ws, cache);
+    const decodeTokens = model.forwardEagerDecode([nextToken], ws, cache);
     nextToken = decodeTokens[0];
 
     if (sampling && needsSampling(sampling)) {
