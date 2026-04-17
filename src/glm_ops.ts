@@ -60,10 +60,10 @@ interface NativeAddon {
   mmapLoad(ctx: number, gpuDst: number, mmapPtr: number, offset: number, nbytes: number): void;
   mmapClose(mmapPtr: number, size: number): void;
   fp8LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, m: number, n: number, k: number): void;
-  gdnRecurrentStep(ctx: number, output: number, state: number, q: number, k: number, v: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, numHeads: number, dK: number, dV: number): void;
-  gdnPrefill(ctx: number, output: number, state: number, q: number, k: number, v: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, seqLen: number, numHeads: number, dK: number, dV: number): void;
-  causalConv1d(ctx: number, output: number, convState: number, input: number, weight: number, convDim: number, seqLen: number, kernelSize: number): void;
-  causalConv1dUpdate(ctx: number, output: number, convState: number, input: number, weight: number, convDim: number, kernelSize: number): void;
+  gdnRecurrentStep(ctx: number, output: number, state: number, q: number, k: number, v: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number): void;
+  gdnPrefill(ctx: number, output: number, state: number, q: number, k: number, v: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, cuSeqlens: number, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number): void;
+  causalConv1d(ctx: number, output: number, convState: number, input: number, weight: number, cuSeqlens: number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number): void;
+  causalConv1dUpdate(ctx: number, output: number, convState: number, input: number, weight: number, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): void;
   rmsnormGated(ctx: number, output: number, input: number, gate: number, weight: number, eps: number, dim: number, batch: number): void;
   qkvSplit(ctx: number, qOut: number, kOut: number, vOut: number, qkvIn: number, seqLen: number, numHeads: number, dK: number, dV: number): void;
   interleavedSplit(ctx: number, qOut: number, gateOut: number, qgIn: number, batchSeq: number, numHeads: number, headDim: number): void;
@@ -279,20 +279,20 @@ export class GlmOps {
     this.native.fp8LinearDecode(this.ctx, bf16Out, bf16Input, fp8Weight, weightScale, m, n, k);
   }
 
-  gdnRecurrentStep(output: number, state: number, q: number, k: number, v: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, numHeads: number, dK: number, dV: number): void {
-    this.native.gdnRecurrentStep(this.ctx, output, state, q, k, v, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV);
+  gdnRecurrentStep(output: number, state: number, q: number, k: number, v: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number): void {
+    this.native.gdnRecurrentStep(this.ctx, output, state, q, k, v, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride);
   }
 
-  gdnPrefill(output: number, state: number, q: number, k: number, v: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, seqLen: number, numHeads: number, dK: number, dV: number): void {
-    this.native.gdnPrefill(this.ctx, output, state, q, k, v, aRaw, bRaw, aLog, dtBias, seqLen, numHeads, dK, dV);
+  gdnPrefill(output: number, state: number, q: number, k: number, v: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, cuSeqlens: number, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number): void {
+    this.native.gdnPrefill(this.ctx, output, state, q, k, v, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride);
   }
 
-  causalConv1d(output: number, convState: number, input: number, weight: number, convDim: number, seqLen: number, kernelSize: number): void {
-    this.native.causalConv1d(this.ctx, output, convState, input, weight, convDim, seqLen, kernelSize);
+  causalConv1d(output: number, convState: number, input: number, weight: number, cuSeqlens: number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number): void {
+    this.native.causalConv1d(this.ctx, output, convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride);
   }
 
-  causalConv1dUpdate(output: number, convState: number, input: number, weight: number, convDim: number, kernelSize: number): void {
-    this.native.causalConv1dUpdate(this.ctx, output, convState, input, weight, convDim, kernelSize);
+  causalConv1dUpdate(output: number, convState: number, input: number, weight: number, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): void {
+    this.native.causalConv1dUpdate(this.ctx, output, convState, input, weight, convDim, kernelSize, batchSize, convStateStride);
   }
 
   rmsnormGated(output: number, input: number, gate: number, weight: number, eps: number, dim: number, batch: number): void {

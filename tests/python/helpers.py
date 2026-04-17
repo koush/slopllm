@@ -467,6 +467,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_gdn_prefill.restype = None
@@ -476,15 +477,18 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_causal_conv1d.restype = None
         self.lib.glm_causal_conv1d.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_causal_conv1d_update.restype = None
@@ -492,6 +496,7 @@ class GlmOps:
             ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int,
         ]
 
@@ -999,42 +1004,56 @@ class GlmOps:
         )
 
     def gdn_recurrent_step(self, output, state, q, k, v, a_raw, b_raw, A_log, dt_bias,
-                            num_heads, d_k, d_v):
+                            num_heads, d_k, d_v, batch_size=1, state_stride=None):
+        if state_stride is None:
+            state_stride = num_heads * d_k * d_v
         self.lib.glm_gdn_recurrent_step(
             self.ctx,
             self._ptr(output), self._ptr(state),
             self._ptr(q), self._ptr(k), self._ptr(v),
             self._ptr(a_raw), self._ptr(b_raw),
             self._ptr(A_log), self._ptr(dt_bias),
-            num_heads, d_k, d_v
+            num_heads, d_k, d_v,
+            batch_size, state_stride
         )
 
     def gdn_prefill(self, output, state, q, k, v, a_raw, b_raw, A_log, dt_bias,
-                     seq_len, num_heads, d_k, d_v):
+                     cu_seqlens, total_seq_len, num_heads, d_k, d_v, batch_size=1, state_stride=None):
+        if state_stride is None:
+            state_stride = num_heads * d_k * d_v
         self.lib.glm_gdn_prefill(
             self.ctx,
             self._ptr(output), self._ptr(state),
             self._ptr(q), self._ptr(k), self._ptr(v),
             self._ptr(a_raw), self._ptr(b_raw),
             self._ptr(A_log), self._ptr(dt_bias),
-            seq_len, num_heads, d_k, d_v
+            self._ptr(cu_seqlens),
+            total_seq_len, num_heads, d_k, d_v,
+            batch_size, state_stride
         )
 
-    def causal_conv1d(self, output, conv_state, input, weight, conv_dim, seq_len, kernel_size):
+    def causal_conv1d(self, output, conv_state, input, weight, cu_seqlens, conv_dim, total_seq_len, kernel_size, batch_size=1, conv_state_stride=None):
         cs_ptr = self._ptr(conv_state) if conv_state is not None else ctypes.c_void_p(0)
+        if conv_state_stride is None:
+            conv_state_stride = conv_dim * (kernel_size - 1)
         self.lib.glm_causal_conv1d(
             self.ctx,
             self._ptr(output), cs_ptr,
             self._ptr(input), self._ptr(weight),
-            conv_dim, seq_len, kernel_size
+            self._ptr(cu_seqlens),
+            conv_dim, total_seq_len, kernel_size,
+            batch_size, conv_state_stride
         )
 
-    def causal_conv1d_update(self, output, conv_state, input, weight, conv_dim, kernel_size):
+    def causal_conv1d_update(self, output, conv_state, input, weight, conv_dim, kernel_size, batch_size=1, conv_state_stride=None):
+        if conv_state_stride is None:
+            conv_state_stride = conv_dim * (kernel_size - 1)
         self.lib.glm_causal_conv1d_update(
             self.ctx,
             self._ptr(output), self._ptr(conv_state),
             self._ptr(input), self._ptr(weight),
-            conv_dim, kernel_size
+            conv_dim, kernel_size,
+            batch_size, conv_state_stride
         )
 
     def rmsnorm_gated(self, output, input, gate, weight, eps, dim, batch):

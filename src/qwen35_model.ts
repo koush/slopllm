@@ -175,15 +175,15 @@ class Qwen35Workspace {
     this.oProjBuf = Tensor.alloc(glm, [B, S, hs], "BF16");
     this.decodeId = Tensor.alloc(glm, [1], "I32");
 
-    this.gdnQkvBuf = Tensor.alloc(glm, [convDim], "BF16");
-    this.gdnABuf = Tensor.alloc(glm, [linHeads], "BF16");
-    this.gdnBBuf = Tensor.alloc(glm, [linHeads], "BF16");
-    this.gdnZBuf = Tensor.alloc(glm, [1, zDim], "BF16");
-    this.gdnQBuf = Tensor.alloc(glm, [linHeads, linKDim], "BF16");
-    this.gdnKBuf = Tensor.alloc(glm, [linHeads, linKDim], "BF16");
-    this.gdnVBuf = Tensor.alloc(glm, [linHeads, linVDim], "BF16");
-    this.gdnOut = Tensor.alloc(glm, [linHeads, linVDim], "BF16");
-    this.gdnGatedOut = Tensor.alloc(glm, [linHeads, linVDim], "BF16");
+    this.gdnQkvBuf = Tensor.alloc(glm, [B * convDim], "BF16");
+    this.gdnABuf = Tensor.alloc(glm, [B * linHeads], "BF16");
+    this.gdnBBuf = Tensor.alloc(glm, [B * linHeads], "BF16");
+    this.gdnZBuf = Tensor.alloc(glm, [B * zDim], "BF16");
+    this.gdnQBuf = Tensor.alloc(glm, [B * linHeads * linKDim], "BF16");
+    this.gdnKBuf = Tensor.alloc(glm, [B * linHeads * linKDim], "BF16");
+    this.gdnVBuf = Tensor.alloc(glm, [B * linHeads * linVDim], "BF16");
+    this.gdnOut = Tensor.alloc(glm, [B * linHeads * linVDim], "BF16");
+    this.gdnGatedOut = Tensor.alloc(glm, [B * linHeads * linVDim], "BF16");
 
     this.gdnPrefillQkvLinear = Tensor.alloc(glm, [BS, convDim], "BF16");
     this.gdnPrefillQkvBuf = Tensor.alloc(glm, [convDim, S], "BF16");
@@ -392,13 +392,13 @@ export class Qwen35Model implements OpContext, ChatModel {
     this.weights = new Map();
   }
 
-  createGdnState(): Qwen35GdnState {
-    return new Qwen35GdnState(this.glm, this.cfg);
+  createGdnState(batchSize = 1): Qwen35GdnState {
+    return new Qwen35GdnState(this.glm, this.cfg, batchSize);
   }
 
   createChatCache(maxPages = 256): ChatCache {
     const pagedKV = new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, this.maxBatch);
-    const gdnState = this.createGdnState();
+    const gdnState = this.createGdnState(this.maxBatch);
     return new Qwen35ChatCache(pagedKV, gdnState);
   }
 
@@ -528,6 +528,7 @@ export class Qwen35Model implements OpContext, ChatModel {
     const zDim = linHeads * linVDim;
     const pfx = `layers.${layerIdx}.linear_attn`;
     const BS = S;
+    const batchSize = gdnState.batchSize;
 
     this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`layers.${layerIdx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
@@ -549,7 +550,7 @@ export class Qwen35Model implements OpContext, ChatModel {
     const kernelSize = cfg.linearConvKernelDim;
 
     const convOut = this.ws.gdnPrefillConvOut;
-    glm.causalConv1d(convOut.data, convState.data, qkvBuf.data, this.weights.get(`${pfx}.conv1d.weight`)!.data, convDim, S, kernelSize);
+    glm.causalConv1d(convOut.data, convState.data, qkvBuf.data, this.weights.get(`${pfx}.conv1d.weight`)!.data, gdnState.cuSeqlens.data, convDim, S, kernelSize, batchSize, gdnState.convStateStride);
 
     const qBuf = this.ws.gdnPrefillQBuf;
     const kBuf = this.ws.gdnPrefillKBuf;
@@ -565,7 +566,8 @@ export class Qwen35Model implements OpContext, ChatModel {
       aBuf.data, bBuf.data,
       this.weights.get(`${pfx}.A_log`)!.data,
       this.weights.get(`${pfx}.dt_bias`)!.data,
-      S, linHeads, linKDim, linVDim,
+      gdnState.cuSeqlens.data, S, linHeads, linKDim, linVDim,
+      batchSize, gdnState.recurrentStateStride,
     );
 
     const gatedOut = this.ws.gdnPrefillGatedOut;
@@ -589,7 +591,7 @@ export class Qwen35Model implements OpContext, ChatModel {
     const convDim = linHeads * (linKDim * 2 + linVDim);
     const zDim = linHeads * linVDim;
     const pfx = `layers.${layerIdx}.linear_attn`;
-    const BS = 1;
+    const BS = gdnState.batchSize;
 
     this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`layers.${layerIdx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
@@ -607,17 +609,16 @@ export class Qwen35Model implements OpContext, ChatModel {
     const recurrentState = gdnState.recurrentState[layerIdx];
     const kernelSize = cfg.linearConvKernelDim;
 
-    glm.causalConv1dUpdate(qkvBuf.data, convState.data, qkvBuf.data, this.weights.get(`${pfx}.conv1d.weight`)!.data, convDim, kernelSize);
+    glm.causalConv1dUpdate(qkvBuf.data, convState.data, qkvBuf.data, this.weights.get(`${pfx}.conv1d.weight`)!.data, convDim, kernelSize, BS, gdnState.convStateStride);
+
+    const qkvT = this.ws.gdnPrefillQkvBuf;
+    qkvT.transpose4d(qkvBuf, 1, BS, convDim, 1, 0, 2, 1, 3);
 
     const qBuf = this.ws.gdnQBuf;
     const kBuf = this.ws.gdnKBuf;
     const vBuf = this.ws.gdnVBuf;
 
-    const keyDim = linHeads * linKDim;
-    const valueDim = linHeads * linVDim;
-    glm.memcpy(qBuf.data, qkvBuf.data, keyDim * BF16);
-    glm.memcpy(kBuf.data, qkvBuf.data + keyDim * BF16, keyDim * BF16);
-    glm.memcpy(vBuf.data, qkvBuf.data + keyDim * 2 * BF16, valueDim * BF16);
+    qBuf.qkvSplit(kBuf, vBuf, qkvT, BS, linHeads, linKDim, linVDim);
 
     const gdnOut = this.ws.gdnOut;
 
@@ -628,10 +629,11 @@ export class Qwen35Model implements OpContext, ChatModel {
       this.weights.get(`${pfx}.A_log`)!.data,
       this.weights.get(`${pfx}.dt_bias`)!.data,
       linHeads, linKDim, linVDim,
+      BS, gdnState.recurrentStateStride,
     );
 
     const gatedOut = this.ws.gdnGatedOut;
-    gatedOut.rmsnormGated(gdnOut, zBuf, this.weights.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, linHeads);
+    gatedOut.rmsnormGated(gdnOut, zBuf, this.weights.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, BS * linHeads);
 
     this.ws.oProjBuf.linear(gatedOut, this.weights.get(`${pfx}.out_proj.weight`)!, BS, hs, zDim, this);
 
@@ -814,10 +816,12 @@ export class Qwen35Model implements OpContext, ChatModel {
     const batchSize = inputIdsList.length;
 
     pagedKV.reset(batchSize);
-    gdnState.reset();
 
     const seqLens = inputIdsList.map(ids => ids.length);
     const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+
+    gdnState.reset();
+    gdnState.uploadCuSeqlens(seqLens);
 
     if (totalTokens > this.maxBatch * this.maxSeqLen) {
       throw new Error(`Total tokens ${totalTokens} exceeds max (B=${this.maxBatch}, S=${this.maxSeqLen})`);
@@ -950,6 +954,8 @@ export class Qwen35Model implements OpContext, ChatModel {
 
     const seqLens = inputIdsList.map(ids => ids.length);
     const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+
+    gdnState.uploadCuSeqlens(seqLens);
 
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);

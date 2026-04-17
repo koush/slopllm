@@ -221,54 +221,66 @@ void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
                             const void* fp8_weight, const float* weight_scale,
                             int m, int n, int k);
 
-// Gated DeltaNet recurrent step (decode, T=1)
+// Gated DeltaNet recurrent step (decode, T=1, batched)
 // Fused: L2 norm q,k + gate computation + delta rule update
-// output: [num_heads, d_v] BF16
-// state: [num_heads, d_k, d_v] FP32 (updated in-place)
-// q: [num_heads, d_k] BF16
-// k: [num_heads, d_k] BF16
-// v: [num_heads, d_v] BF16
-// a_raw: [num_heads] BF16 (gate input, before softplus)
-// b_raw: [num_heads] BF16 (beta input, before sigmoid)
-// A_log: [num_heads] FP32 (learned log decay rate)
-// dt_bias: [num_heads] FP32 (gate bias)
+// output: [batch_size, num_heads, d_v] BF16
+// state: [batch_size, state_stride] FP32 (updated in-place)
+// q: [batch_size, num_heads, d_k] BF16
+// k: [batch_size, num_heads, d_k] BF16
+// v: [batch_size, num_heads, d_v] BF16
+// a_raw: [batch_size, num_heads] BF16
+// b_raw: [batch_size, num_heads] BF16
+// A_log: [num_heads] FP32 (shared across batch)
+// dt_bias: [num_heads] FP32 (shared across batch)
+// state_stride: stride (in float elements) between batch elements in state
 void glm_gdn_recurrent_step(GlmCtx* ctx, void* output, void* state,
-                             const void* q, const void* k, const void* v,
-                             const void* a_raw, const void* b_raw,
-                             const float* A_log, const float* dt_bias,
-                             int num_heads, int d_k, int d_v);
+                              const void* q, const void* k, const void* v,
+                              const void* a_raw, const void* b_raw,
+                              const float* A_log, const float* dt_bias,
+                              int num_heads, int d_k, int d_v,
+                              int batch_size, int state_stride);
 
-// Gated DeltaNet prefill (sequential over tokens)
-// output: [seq_len, num_heads, d_v] BF16
-// state: [num_heads, d_k, d_v] FP32 (updated in-place, initial state should be zero-initialized)
-// q: [seq_len, num_heads, d_k] BF16
-// k: [seq_len, num_heads, d_k] BF16
-// v: [seq_len, num_heads, d_v] BF16
-// a_raw: [seq_len, num_heads] BF16
-// b_raw: [seq_len, num_heads] BF16
-// A_log: [num_heads] FP32
-// dt_bias: [num_heads] FP32
+// Gated DeltaNet prefill (sequential over tokens, batched with cu_seqlens)
+// output: [total_seq_len, num_heads, d_v] BF16 (packed)
+// state: [batch_size, state_stride] FP32 (updated in-place, should be zero-initialized)
+// q: [total_seq_len, num_heads, d_k] BF16 (packed)
+// k: [total_seq_len, num_heads, d_k] BF16 (packed)
+// v: [total_seq_len, num_heads, d_v] BF16 (packed)
+// a_raw: [total_seq_len, num_heads] BF16 (packed)
+// b_raw: [total_seq_len, num_heads] BF16 (packed)
+// cu_seqlens: [batch_size + 1] int32 (cumulative sequence lengths)
+// A_log: [num_heads] FP32 (shared across batch)
+// dt_bias: [num_heads] FP32 (shared across batch)
+// state_stride: stride (in float elements) between batch elements in state
 void glm_gdn_prefill(GlmCtx* ctx, void* output, void* state,
                       const void* q, const void* k, const void* v,
                       const void* a_raw, const void* b_raw,
                       const float* A_log, const float* dt_bias,
-                      int seq_len, int num_heads, int d_k, int d_v);
+                      const int* cu_seqlens,
+                      int total_seq_len, int num_heads, int d_k, int d_v,
+                      int batch_size, int state_stride);
 
-// Causal conv1d with SiLU activation (prefill, full sequence)
-// input/output layout: [conv_dim, seq_len] (channel-first, BF16)
+// Causal conv1d with SiLU activation (batched prefill with cu_seqlens)
+// input/output layout: [conv_dim, total_seq_len] (channel-first, packed sequences, BF16)
 // weight layout: [conv_dim, kernel_size] (BF16)
-// conv_state: [conv_dim, kernel_size-1] BF16 (initialized with last K-1 values after prefill, can be NULL)
+// conv_state: [batch_size, conv_state_stride] BF16 (per-batch conv state, updated in-place)
+// cu_seqlens: [batch_size + 1] int32 (cumulative sequence lengths)
+// conv_state_stride: stride (in bf16 elements) between batch elements in conv_state
 void glm_causal_conv1d(GlmCtx* ctx, void* output, void* conv_state,
                         const void* input, const void* weight,
-                        int conv_dim, int seq_len, int kernel_size);
+                        const int* cu_seqlens,
+                        int conv_dim, int total_seq_len, int kernel_size,
+                        int batch_size, int conv_state_stride);
 
-// Causal conv1d update with SiLU activation (decode, single token)
-// input/output layout: [conv_dim] (single token, BF16)
-// conv_state: [conv_dim, kernel_size-1] BF16 (updated in-place)
+// Causal conv1d update with SiLU activation (batched decode)
+// input/output layout: [batch_size, conv_dim] BF16
+// conv_state: [batch_size, conv_state_stride] BF16 (per-batch conv state, updated in-place)
 // weight layout: [conv_dim, kernel_size] (BF16)
+// conv_state_stride: stride (in bf16 elements) between batch elements in conv_state
 void glm_causal_conv1d_update(GlmCtx* ctx, void* output, void* conv_state,
                                const void* input, const void* weight,
-                               int conv_dim, int kernel_size);
+                               int conv_dim, int kernel_size,
+                               int batch_size, int conv_state_stride);
 
 // RMSNorm gated: output = RMSNorm(input) * weight * SiLU(gate)
 // output: [batch, dim] BF16

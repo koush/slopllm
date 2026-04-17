@@ -108,20 +108,20 @@ export class Tensor {
     this.glm.indexSelect(this.data, ptr(src), ptr(indices), dim, k);
   }
 
-  gdnRecurrentStep(state: Tensor | number, q: Tensor | number, k: Tensor | number, v: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, numHeads: number, dK: number, dV: number): void {
-    this.glm.gdnRecurrentStep(this.data, ptr(state), ptr(q), ptr(k), ptr(v), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), numHeads, dK, dV);
+  gdnRecurrentStep(state: Tensor | number, q: Tensor | number, k: Tensor | number, v: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number): void {
+    this.glm.gdnRecurrentStep(this.data, ptr(state), ptr(q), ptr(k), ptr(v), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), numHeads, dK, dV, batchSize, stateStride);
   }
 
-  gdnPrefill(state: Tensor | number, q: Tensor | number, k: Tensor | number, v: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, seqLen: number, numHeads: number, dK: number, dV: number): void {
-    this.glm.gdnPrefill(this.data, ptr(state), ptr(q), ptr(k), ptr(v), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), seqLen, numHeads, dK, dV);
+  gdnPrefill(state: Tensor | number, q: Tensor | number, k: Tensor | number, v: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, cuSeqlens: Tensor | number, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number): void {
+    this.glm.gdnPrefill(this.data, ptr(state), ptr(q), ptr(k), ptr(v), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), ptr(cuSeqlens), totalSeqLen, numHeads, dK, dV, batchSize, stateStride);
   }
 
-  causalConv1d(convState: Tensor | number, input: Tensor | number, weight: Tensor | number, convDim: number, seqLen: number, kernelSize: number): void {
-    this.glm.causalConv1d(this.data, ptr(convState), ptr(input), ptr(weight), convDim, seqLen, kernelSize);
+  causalConv1d(convState: Tensor | number, input: Tensor | number, weight: Tensor | number, cuSeqlens: Tensor | number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number): void {
+    this.glm.causalConv1d(this.data, ptr(convState), ptr(input), ptr(weight), ptr(cuSeqlens), convDim, totalSeqLen, kernelSize, batchSize, convStateStride);
   }
 
-  causalConv1dUpdate(convState: Tensor | number, input: Tensor | number, weight: Tensor | number, convDim: number, kernelSize: number): void {
-    this.glm.causalConv1dUpdate(this.data, ptr(convState), ptr(input), ptr(weight), convDim, kernelSize);
+  causalConv1dUpdate(convState: Tensor | number, input: Tensor | number, weight: Tensor | number, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): void {
+    this.glm.causalConv1dUpdate(this.data, ptr(convState), ptr(input), ptr(weight), convDim, kernelSize, batchSize, convStateStride);
   }
 
   rmsnormGated(input: Tensor | number, gate: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
