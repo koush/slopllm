@@ -273,40 +273,40 @@ void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
 // Fused: L2 norm q,k + gate computation + delta rule update
 // output: [batch_size, num_heads, d_v] BF16
 // state: [batch_size, state_stride] FP32 (updated in-place)
-// q: [batch_size, num_heads, d_k] BF16
-// k: [batch_size, num_heads, d_k] BF16
-// v: [batch_size, num_heads, d_v] BF16
+// qkv: [convDim, batch_size] BF16 (channel-first fused QKV, output of conv1d)
+//   convDim = num_heads * (2*d_k + d_v), Q channels first, then K, then V
 // a_raw: [batch_size, num_heads] BF16
 // b_raw: [batch_size, num_heads] BF16
 // A_log: [num_heads] FP32 (shared across batch)
 // dt_bias: [num_heads] FP32 (shared across batch)
 // state_stride: stride (in float elements) between batch elements in state
+// qkv_seq_stride: stride between positions in channel-first QKV layout (= batch_size)
 void glm_gdn_recurrent_step(GlmCtx* ctx, void* output, void* state,
-                              const void* q, const void* k, const void* v,
+                              const void* qkv,
                               const void* a_raw, const void* b_raw,
                               const float* A_log, const float* dt_bias,
                               int num_heads, int d_k, int d_v,
-                              int batch_size, int state_stride);
+                              int batch_size, int state_stride, int qkv_seq_stride);
 
 // Gated DeltaNet prefill (sequential over tokens, batched with cu_seqlens)
 // output: [total_seq_len, num_heads, d_v] BF16 (packed)
 // state: [batch_size, state_stride] FP32 (updated in-place, should be zero-initialized)
-// q: [total_seq_len, num_heads, d_k] BF16 (packed)
-// k: [total_seq_len, num_heads, d_k] BF16 (packed)
-// v: [total_seq_len, num_heads, d_v] BF16 (packed)
+// qkv: [convDim, total_seq_len] BF16 (channel-first fused QKV, output of conv1d)
+//   convDim = num_heads * (2*d_k + d_v), Q channels first, then K, then V
 // a_raw: [total_seq_len, num_heads] BF16 (packed)
 // b_raw: [total_seq_len, num_heads] BF16 (packed)
 // cu_seqlens: [batch_size + 1] int32 (cumulative sequence lengths)
 // A_log: [num_heads] FP32 (shared across batch)
 // dt_bias: [num_heads] FP32 (shared across batch)
 // state_stride: stride (in float elements) between batch elements in state
+// qkv_seq_stride: stride between positions in channel-first QKV layout (= total_seq_len)
 void glm_gdn_prefill(GlmCtx* ctx, void* output, void* state,
-                      const void* q, const void* k, const void* v,
+                      const void* qkv,
                       const void* a_raw, const void* b_raw,
                       const float* A_log, const float* dt_bias,
                       const int* cu_seqlens,
                       int total_seq_len, int num_heads, int d_k, int d_v,
-                      int batch_size, int state_stride);
+                      int batch_size, int state_stride, int qkv_seq_stride);
 
 // Causal conv1d with SiLU activation (batched prefill with cu_seqlens)
 // input/output layout: [conv_dim, total_seq_len] (channel-first, packed sequences, BF16)
@@ -338,16 +338,6 @@ void glm_causal_conv1d_update(GlmCtx* ctx, void* output, void* conv_state,
 void glm_rmsnorm_gated(GlmCtx* ctx, void* output, const void* input,
                         const void* gate, const void* weight,
                         float eps, int dim, int batch);
-
-// QKV split from conv1d output [convDim, S] to GDN prefill layout
-// qkv_in: [num_heads * qkv_stride, seq_len] BF16 (channel-first, output of causal_conv1d)
-// q_out: [seq_len, num_heads, d_k] BF16
-// k_out: [seq_len, num_heads, d_k] BF16
-// v_out: [seq_len, num_heads, d_v] BF16
-// qkv_stride = 2 * d_k + d_v (per-head QKV channel stride)
-void glm_qkv_split(GlmCtx* ctx, void* q_out, void* k_out, void* v_out,
-                    const void* qkv_in,
-                    int seq_len, int num_heads, int d_k, int d_v);
 
 // Split interleaved [query|gate] per head:
 // qg_in: [batch_seq, num_heads, head_dim * 2] BF16 (row-major)

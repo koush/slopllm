@@ -1193,76 +1193,70 @@ static Napi::Value Fp8LinearDecode(const Napi::CallbackInfo& info) {
 
 static Napi::Value GdnRecurrentStep(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 15) {
-        Napi::TypeError::New(env, "Expected (ctx, output, state, q, k, v, a_raw, b_raw, A_log, dt_bias, num_heads, d_k, d_v, batch_size, state_stride)").ThrowAsJavaScriptException();
+    if (info.Length() < 14) {
+        Napi::TypeError::New(env, "Expected (ctx, output, state, qkv, a_raw, b_raw, A_log, dt_bias, num_heads, d_k, d_v, batch_size, state_stride, qkv_seq_stride)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
     uintptr_t state_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t q_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t k_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t v_ptr = info[5].As<Napi::Number>().Int64Value();
-    uintptr_t a_ptr = info[6].As<Napi::Number>().Int64Value();
-    uintptr_t b_ptr = info[7].As<Napi::Number>().Int64Value();
-    uintptr_t alog_ptr = info[8].As<Napi::Number>().Int64Value();
-    uintptr_t dtb_ptr = info[9].As<Napi::Number>().Int64Value();
-    int num_heads = info[10].As<Napi::Number>().Int32Value();
-    int d_k = info[11].As<Napi::Number>().Int32Value();
-    int d_v = info[12].As<Napi::Number>().Int32Value();
-    int batch_size = info[13].As<Napi::Number>().Int32Value();
-    int state_stride = info[14].As<Napi::Number>().Int32Value();
+    uintptr_t qkv_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t a_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t b_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t alog_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t dtb_ptr = info[7].As<Napi::Number>().Int64Value();
+    int num_heads = info[8].As<Napi::Number>().Int32Value();
+    int d_k = info[9].As<Napi::Number>().Int32Value();
+    int d_v = info[10].As<Napi::Number>().Int32Value();
+    int batch_size = info[11].As<Napi::Number>().Int32Value();
+    int state_stride = info[12].As<Napi::Number>().Int32Value();
+    int qkv_seq_stride = info[13].As<Napi::Number>().Int32Value();
     glm_gdn_recurrent_step(reinterpret_cast<GlmCtx*>(ctx_ptr),
                             reinterpret_cast<void*>(out_ptr),
                             reinterpret_cast<float*>(state_ptr),
-                            reinterpret_cast<const void*>(q_ptr),
-                            reinterpret_cast<const void*>(k_ptr),
-                            reinterpret_cast<const void*>(v_ptr),
+                            reinterpret_cast<const void*>(qkv_ptr),
                             reinterpret_cast<const void*>(a_ptr),
                             reinterpret_cast<const void*>(b_ptr),
                             reinterpret_cast<const float*>(alog_ptr),
                             reinterpret_cast<const float*>(dtb_ptr),
                             num_heads, d_k, d_v,
-                            batch_size, state_stride);
+                            batch_size, state_stride, qkv_seq_stride);
     return env.Undefined();
 }
 
 static Napi::Value GdnPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 17) {
-        Napi::TypeError::New(env, "Expected (ctx, output, state, q, k, v, a_raw, b_raw, A_log, dt_bias, cu_seqlens, total_seq_len, num_heads, d_k, d_v, batch_size, state_stride)").ThrowAsJavaScriptException();
+    if (info.Length() < 15) {
+        Napi::TypeError::New(env, "Expected (ctx, output, state, qkv, a_raw, b_raw, A_log, dt_bias, cu_seqlens, total_seq_len, num_heads, d_k, d_v, batch_size, state_stride, qkv_seq_stride)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
     uintptr_t state_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t q_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t k_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t v_ptr = info[5].As<Napi::Number>().Int64Value();
-    uintptr_t a_ptr = info[6].As<Napi::Number>().Int64Value();
-    uintptr_t b_ptr = info[7].As<Napi::Number>().Int64Value();
-    uintptr_t alog_ptr = info[8].As<Napi::Number>().Int64Value();
-    uintptr_t dtb_ptr = info[9].As<Napi::Number>().Int64Value();
-    uintptr_t cu_seqlens_ptr = info[10].As<Napi::Number>().Int64Value();
-    int total_seq_len = info[11].As<Napi::Number>().Int32Value();
-    int num_heads = info[12].As<Napi::Number>().Int32Value();
-    int d_k = info[13].As<Napi::Number>().Int32Value();
-    int d_v = info[14].As<Napi::Number>().Int32Value();
-    int batch_size = info[15].As<Napi::Number>().Int32Value();
-    int state_stride = info[16].As<Napi::Number>().Int32Value();
+    uintptr_t qkv_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t a_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t b_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t alog_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t dtb_ptr = info[7].As<Napi::Number>().Int64Value();
+    uintptr_t cu_seqlens_ptr = info[8].As<Napi::Number>().Int64Value();
+    int total_seq_len = info[9].As<Napi::Number>().Int32Value();
+    int num_heads = info[10].As<Napi::Number>().Int32Value();
+    int d_k = info[11].As<Napi::Number>().Int32Value();
+    int d_v = info[12].As<Napi::Number>().Int32Value();
+    int batch_size = info[13].As<Napi::Number>().Int32Value();
+    int state_stride = info[14].As<Napi::Number>().Int32Value();
+    int qkv_seq_stride = info[15].As<Napi::Number>().Int32Value();
     glm_gdn_prefill(reinterpret_cast<GlmCtx*>(ctx_ptr),
                      reinterpret_cast<void*>(out_ptr),
                      reinterpret_cast<float*>(state_ptr),
-                     reinterpret_cast<const void*>(q_ptr),
-                     reinterpret_cast<const void*>(k_ptr),
-                     reinterpret_cast<const void*>(v_ptr),
+                     reinterpret_cast<const void*>(qkv_ptr),
                      reinterpret_cast<const void*>(a_ptr),
                      reinterpret_cast<const void*>(b_ptr),
                      reinterpret_cast<const float*>(alog_ptr),
                      reinterpret_cast<const float*>(dtb_ptr),
                      reinterpret_cast<const int*>(cu_seqlens_ptr),
                      total_seq_len, num_heads, d_k, d_v,
-                     batch_size, state_stride);
+                     batch_size, state_stride, qkv_seq_stride);
     return env.Undefined();
 }
 
@@ -1339,30 +1333,6 @@ static Napi::Value RmsnormGated(const Napi::CallbackInfo& info) {
                        reinterpret_cast<const void*>(gate_ptr),
                        reinterpret_cast<const void*>(w_ptr),
                        eps, dim, batch);
-    return env.Undefined();
-}
-
-static Napi::Value QkvSplit(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 9) {
-        Napi::TypeError::New(env, "Expected (ctx, q_out, k_out, v_out, qkv_in, seq_len, num_heads, d_k, d_v)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t k_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t v_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t qkv_ptr = info[4].As<Napi::Number>().Int64Value();
-    int seq_len = info[5].As<Napi::Number>().Int32Value();
-    int num_heads = info[6].As<Napi::Number>().Int32Value();
-    int d_k = info[7].As<Napi::Number>().Int32Value();
-    int d_v = info[8].As<Napi::Number>().Int32Value();
-    glm_qkv_split(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                   reinterpret_cast<void*>(q_ptr),
-                   reinterpret_cast<void*>(k_ptr),
-                   reinterpret_cast<void*>(v_ptr),
-                   reinterpret_cast<const void*>(qkv_ptr),
-                   seq_len, num_heads, d_k, d_v);
     return env.Undefined();
 }
 
@@ -1598,7 +1568,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "causalConv1d"), Napi::Function::New(env, CausalConv1d));
     exports.Set(Napi::String::New(env, "causalConv1dUpdate"), Napi::Function::New(env, CausalConv1dUpdate));
     exports.Set(Napi::String::New(env, "rmsnormGated"), Napi::Function::New(env, RmsnormGated));
-    exports.Set(Napi::String::New(env, "qkvSplit"), Napi::Function::New(env, QkvSplit));
     exports.Set(Napi::String::New(env, "interleavedSplit"), Napi::Function::New(env, InterleavedSplit));
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
     exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));

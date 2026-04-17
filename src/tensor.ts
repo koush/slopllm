@@ -116,12 +116,12 @@ export class Tensor {
     this.glm.indexSelect(this.data, ptr(src), ptr(indices), dim, k);
   }
 
-  gdnRecurrentStep(state: Tensor | number, q: Tensor | number, k: Tensor | number, v: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number): void {
-    this.glm.gdnRecurrentStep(this.data, ptr(state), ptr(q), ptr(k), ptr(v), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), numHeads, dK, dV, batchSize, stateStride);
+  gdnRecurrentStep(state: Tensor | number, qkv: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvSeqStride: number): void {
+    this.glm.gdnRecurrentStep(this.data, ptr(state), ptr(qkv), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), numHeads, dK, dV, batchSize, stateStride, qkvSeqStride);
   }
 
-  gdnPrefill(state: Tensor | number, q: Tensor | number, k: Tensor | number, v: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, cuSeqlens: Tensor | number, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number): void {
-    this.glm.gdnPrefill(this.data, ptr(state), ptr(q), ptr(k), ptr(v), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), ptr(cuSeqlens), totalSeqLen, numHeads, dK, dV, batchSize, stateStride);
+  gdnPrefill(state: Tensor | number, qkv: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, cuSeqlens: Tensor | number, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvSeqStride: number): void {
+    this.glm.gdnPrefill(this.data, ptr(state), ptr(qkv), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), ptr(cuSeqlens), totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvSeqStride);
   }
 
   causalConv1d(convState: Tensor | number, input: Tensor | number, weight: Tensor | number, cuSeqlens: Tensor | number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number): void {
@@ -142,9 +142,5 @@ export class Tensor {
 
   mul(a: Tensor | number, b: Tensor | number, n: number): void {
     this.glm.mul(this.data, ptr(a), ptr(b), n);
-  }
-
-  qkvSplit(kOut: Tensor | number, vOut: Tensor | number, qkvIn: Tensor | number, seqLen: number, numHeads: number, dK: number, dV: number): void {
-    this.glm.qkvSplit(this.data, ptr(kOut), ptr(vOut), ptr(qkvIn), seqLen, numHeads, dK, dV);
   }
 }

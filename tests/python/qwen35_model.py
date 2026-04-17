@@ -393,16 +393,13 @@ class Qwen35Model:
                            self.weights[f"{pfx}.conv1d.weight"],
                            ws["cu_seqlens"], conv_dim, S, kernel_size)
 
-        glm.qkv_split(ws["gdn_q"], ws["gdn_k"], ws["gdn_v"],
-                       ws["gdn_conv_out"],
-                       S, lin_h, lin_kd, lin_vd)
-
         glm.gdn_prefill(ws["gdn_out"], recurrent_state,
-                         ws["gdn_q"], ws["gdn_k"], ws["gdn_v"],
+                         ws["gdn_conv_out"],
                          ws["gdn_a"], ws["gdn_b"],
                          self.weights[f"{pfx}.A_log"],
                          self.weights[f"{pfx}.dt_bias"],
-                         ws["cu_seqlens"], S, lin_h, lin_kd, lin_vd)
+                         ws["cu_seqlens"], S, lin_h, lin_kd, lin_vd,
+                         1, lin_h * lin_kd * lin_vd, S)
 
         glm.rmsnorm_gated(ws["gdn_gated"], ws["gdn_out"], ws["gdn_z"],
                            self.weights[f"{pfx}.norm.weight"],
@@ -458,19 +455,13 @@ class Qwen35Model:
                                   self.weights[f"{pfx}.conv1d.weight"],
                                   conv_dim, kernel_size)
 
-        qkv_total = lin_kd * 2 + lin_vd
-        key_dim = lin_h * lin_kd
-        value_dim = lin_h * lin_vd
-        glm.memcpy(ws["gdn_q"], ws["gdn_qkv_linear"], key_dim * BF16)
-        glm.memcpy(ws["gdn_k"], ws["gdn_qkv_linear"] + key_dim * BF16, key_dim * BF16)
-        glm.memcpy(ws["gdn_v"], ws["gdn_qkv_linear"] + key_dim * 2 * BF16, value_dim * BF16)
-
         glm.gdn_recurrent_step(ws["gdn_out"], recurrent_state,
-                                ws["gdn_q"], ws["gdn_k"], ws["gdn_v"],
+                                ws["gdn_qkv_linear"],
                                 ws["gdn_a"], ws["gdn_b"],
                                 self.weights[f"{pfx}.A_log"],
                                 self.weights[f"{pfx}.dt_bias"],
-                                lin_h, lin_kd, lin_vd)
+                                lin_h, lin_kd, lin_vd, 1,
+                                lin_h * lin_kd * lin_vd, 1)
 
         glm.rmsnorm_gated(ws["gdn_gated"], ws["gdn_out"], ws["gdn_z"],
                            self.weights[f"{pfx}.norm.weight"],

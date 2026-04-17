@@ -129,9 +129,16 @@ class TestGdnRecurrentStep:
 
         ref_o, ref_state = _torch_gdn_recurrent_step(q_bf, k_bf, v_bf, beta, g, state, d_k, d_v)
 
-        q_gpu = _upload_bf16(glm, q.reshape(H, d_k).numpy())
-        k_gpu = _upload_bf16(glm, k.reshape(H, d_k).numpy())
-        v_gpu = _upload_bf16(glm, v.reshape(H, d_v).numpy())
+        k_total = H * d_k
+        conv_dim = 2 * k_total + H * d_v
+        qkv = np.zeros(conv_dim, dtype=np.float32)
+        for h in range(H):
+            for d in range(d_k):
+                qkv[h * d_k + d] = q_bf[0, h, d].item()
+                qkv[k_total + h * d_k + d] = k_bf[0, h, d].item()
+            for d in range(d_v):
+                qkv[2 * k_total + h * d_v + d] = v_bf[0, h, d].item()
+        qkv_gpu = _upload_bf16(glm, qkv)
         a_gpu = _upload_bf16(glm, a_raw.reshape(H).numpy())
         b_gpu = _upload_bf16(glm, b_raw.reshape(H).numpy())
         alog_gpu = _upload_f32(glm, A_log.numpy())
@@ -139,9 +146,9 @@ class TestGdnRecurrentStep:
         state_gpu = _upload_f32(glm, state.reshape(H, d_k, d_v).numpy())
         out_gpu = glm.alloc(H * d_v * BF16)
 
-        glm.gdn_recurrent_step(out_gpu, state_gpu, q_gpu, k_gpu, v_gpu,
+        glm.gdn_recurrent_step(out_gpu, state_gpu, qkv_gpu,
                                 a_gpu, b_gpu, alog_gpu, dtb_gpu,
-                                H, d_k, d_v, 1, H * d_k * d_v)
+                                H, d_k, d_v, 1, H * d_k * d_v, 1)
         glm.synchronize()
 
         out_np = _download_bf16(glm, out_gpu, H * d_v)
@@ -159,7 +166,7 @@ class TestGdnRecurrentStep:
         assert torch.allclose(state_torch, ref_state.squeeze(0), atol=atol, rtol=rtol), \
             f"State mismatch: max diff={max_state_diff:.6f}"
 
-        for p in [q_gpu, k_gpu, v_gpu, a_gpu, b_gpu, alog_gpu, dtb_gpu, state_gpu, out_gpu]:
+        for p in [qkv_gpu, a_gpu, b_gpu, alog_gpu, dtb_gpu, state_gpu, out_gpu]:
             glm.free_buf(p)
 
     @pytest.mark.parametrize("d_k,d_v", [(128, 128), (64, 64)])
@@ -186,9 +193,16 @@ class TestGdnRecurrentStep:
 
         ref_o, ref_state = _torch_gdn_recurrent_step(q_bf, k_bf, v_bf, beta, g, state, d_k, d_v)
 
-        q_gpu = _upload_bf16(glm, q.reshape(H, d_k).numpy())
-        k_gpu = _upload_bf16(glm, k.reshape(H, d_k).numpy())
-        v_gpu = _upload_bf16(glm, v.reshape(H, d_v).numpy())
+        k_total = H * d_k
+        conv_dim = 2 * k_total + H * d_v
+        qkv = np.zeros(conv_dim, dtype=np.float32)
+        for h in range(H):
+            for d in range(d_k):
+                qkv[h * d_k + d] = q_bf[0, h, d].item()
+                qkv[k_total + h * d_k + d] = k_bf[0, h, d].item()
+            for d in range(d_v):
+                qkv[2 * k_total + h * d_v + d] = v_bf[0, h, d].item()
+        qkv_gpu = _upload_bf16(glm, qkv)
         a_gpu = _upload_bf16(glm, a_raw.reshape(H).numpy())
         b_gpu = _upload_bf16(glm, b_raw.reshape(H).numpy())
         alog_gpu = _upload_f32(glm, A_log.numpy())
@@ -196,9 +210,9 @@ class TestGdnRecurrentStep:
         state_gpu = _upload_f32(glm, state.reshape(H, d_k, d_v).numpy())
         out_gpu = glm.alloc(H * d_v * BF16)
 
-        glm.gdn_recurrent_step(out_gpu, state_gpu, q_gpu, k_gpu, v_gpu,
+        glm.gdn_recurrent_step(out_gpu, state_gpu, qkv_gpu,
                                 a_gpu, b_gpu, alog_gpu, dtb_gpu,
-                                H, d_k, d_v, 1, H * d_k * d_v)
+                                H, d_k, d_v, 1, H * d_k * d_v, 1)
         glm.synchronize()
 
         out_np = _download_bf16(glm, out_gpu, H * d_v)
@@ -216,7 +230,7 @@ class TestGdnRecurrentStep:
         assert torch.allclose(state_torch, ref_state.squeeze(0), atol=atol, rtol=rtol), \
             f"State mismatch: max diff={max_state_diff:.6f}"
 
-        for p in [q_gpu, k_gpu, v_gpu, a_gpu, b_gpu, alog_gpu, dtb_gpu, state_gpu, out_gpu]:
+        for p in [qkv_gpu, a_gpu, b_gpu, alog_gpu, dtb_gpu, state_gpu, out_gpu]:
             glm.free_buf(p)
 
 
@@ -255,9 +269,17 @@ class TestGdnPrefill:
             ref_outputs.append(o_t.squeeze(0))
         ref_out = torch.stack(ref_outputs)
 
-        q_gpu = _upload_bf16(glm, q.reshape(S * H, d_k).numpy())
-        k_gpu = _upload_bf16(glm, k.reshape(S * H, d_k).numpy())
-        v_gpu = _upload_bf16(glm, v.reshape(S * H, d_v).numpy())
+        k_total = H * d_k
+        conv_dim = 2 * k_total + H * d_v
+        qkv = np.zeros((conv_dim, S), dtype=np.float32)
+        for t in range(S):
+            for h in range(H):
+                for d in range(d_k):
+                    qkv[h * d_k + d, t] = q_bf[t, h, d].item()
+                    qkv[k_total + h * d_k + d, t] = k_bf[t, h, d].item()
+                for d in range(d_v):
+                    qkv[2 * k_total + h * d_v + d, t] = v_bf[t, h, d].item()
+        qkv_gpu = _upload_bf16(glm, qkv)
         a_gpu = _upload_bf16(glm, a_raw.reshape(S * H).numpy())
         b_gpu = _upload_bf16(glm, b_raw.reshape(S * H).numpy())
         alog_gpu = _upload_f32(glm, A_log.numpy())
@@ -268,9 +290,9 @@ class TestGdnPrefill:
         cu_seqlens = np.array([0, S], dtype=np.int32)
         cu_gpu = _upload_i32(glm, cu_seqlens)
 
-        glm.gdn_prefill(out_gpu, state_gpu, q_gpu, k_gpu, v_gpu,
+        glm.gdn_prefill(out_gpu, state_gpu, qkv_gpu,
                          a_gpu, b_gpu, alog_gpu, dtb_gpu,
-                         cu_gpu, S, H, d_k, d_v)
+                         cu_gpu, S, H, d_k, d_v, 1, H * d_k * d_v, S)
         glm.synchronize()
 
         out_np = _download_bf16(glm, out_gpu, S * H * d_v)
@@ -284,7 +306,7 @@ class TestGdnPrefill:
         assert max_out_diff < 0.02, f"Output mismatch: max diff={max_out_diff:.6f}"
         assert max_state_diff < 0.02, f"State mismatch: max diff={max_state_diff:.6f}"
 
-        for p in [q_gpu, k_gpu, v_gpu, a_gpu, b_gpu, alog_gpu, dtb_gpu, state_gpu, out_gpu, cu_gpu]:
+        for p in [qkv_gpu, a_gpu, b_gpu, alog_gpu, dtb_gpu, state_gpu, out_gpu, cu_gpu]:
             glm.free_buf(p)
 
 
@@ -406,72 +428,6 @@ class TestRmsnormGated:
             glm.free_buf(p)
 
 
-class TestQkvSplit:
-    def test_basic(self):
-        """Test QKV split from [convDim, S] to [S, H, d_k], [S, H, d_k], [S, H, d_v]"""
-        glm = GlmOps()
-        try:
-            S = 8
-            H = 4
-            d_k = 16
-            d_v = 16
-            k_total = H * d_k  # 64
-            v_total = H * d_v  # 64
-            conv_dim = 2 * k_total + v_total  # 192
-
-            # Create QKV input in [convDim, S] layout (channel-first, non-interleaved)
-            # Channels 0..k_total-1 are Q for all heads
-            # Channels k_total..2*k_total-1 are K for all heads
-            # Channels 2*k_total..conv_dim-1 are V for all heads
-            qkv_np = np.random.randn(conv_dim, S).astype(np.float32)
-            qkv_gpu = _upload_bf16(glm, qkv_np)
-
-            q_size = S * H * d_k
-            k_size = S * H * d_k
-            v_size = S * H * d_v
-            q_gpu = glm.alloc(q_size * BF16)
-            k_gpu = glm.alloc(k_size * BF16)
-            v_gpu = glm.alloc(v_size * BF16)
-
-            glm.qkv_split(q_gpu, k_gpu, v_gpu, qkv_gpu, S, H, d_k, d_v)
-            glm.synchronize()
-
-            q_np = _download_bf16(glm, q_gpu, q_size).reshape(S, H, d_k)
-            k_np = _download_bf16(glm, k_gpu, k_size).reshape(S, H, d_k)
-            v_np = _download_bf16(glm, v_gpu, v_size).reshape(S, H, d_v)
-
-            # Build reference from qkv_np (non-interleaved layout)
-            q_ref = np.zeros((S, H, d_k), dtype=np.float32)
-            k_ref = np.zeros((S, H, d_k), dtype=np.float32)
-            v_ref = np.zeros((S, H, d_v), dtype=np.float32)
-            for t in range(S):
-                for h in range(H):
-                    for d in range(d_k):
-                        q_ref[t, h, d] = qkv_np[h * d_k + d, t]
-                        k_ref[t, h, d] = qkv_np[k_total + h * d_k + d, t]
-                    for d in range(d_v):
-                        v_ref[t, h, d] = qkv_np[2 * k_total + h * d_v + d, t]
-
-            q_torch = torch.from_numpy(q_np)
-            k_torch = torch.from_numpy(k_np)
-            v_torch = torch.from_numpy(v_np)
-            q_ref_torch = torch.from_numpy(q_ref)
-            k_ref_torch = torch.from_numpy(k_ref)
-            v_ref_torch = torch.from_numpy(v_ref)
-
-            assert torch.allclose(q_torch, q_ref_torch, atol=ATOL, rtol=RTOL), \
-                f"Q mismatch: max diff={torch.max(torch.abs(q_torch - q_ref_torch)):.6f}"
-            assert torch.allclose(k_torch, k_ref_torch, atol=ATOL, rtol=RTOL), \
-                f"K mismatch: max diff={torch.max(torch.abs(k_torch - k_ref_torch)):.6f}"
-            assert torch.allclose(v_torch, v_ref_torch, atol=ATOL, rtol=RTOL), \
-                f"V mismatch: max diff={torch.max(torch.abs(v_torch - v_ref_torch)):.6f}"
-
-        finally:
-            for p in [qkv_gpu, q_gpu, k_gpu, v_gpu]:
-                glm.free_buf(p)
-            del glm
-
-
 class TestGdnRecurrentStepBatch:
     def test_batch2(self, glm):
         H = 4
@@ -507,9 +463,17 @@ class TestGdnRecurrentStepBatch:
         ref_state = torch.stack(ref_states)
 
         state_stride = H * d_k * d_v
-        q_gpu = _upload_bf16(glm, q.reshape(B * H, d_k).numpy())
-        k_gpu = _upload_bf16(glm, k.reshape(B * H, d_k).numpy())
-        v_gpu = _upload_bf16(glm, v.reshape(B * H, d_v).numpy())
+        k_total = H * d_k
+        conv_dim = 2 * k_total + H * d_v
+        qkv = np.zeros((conv_dim, B), dtype=np.float32)
+        for b in range(B):
+            for h in range(H):
+                for d in range(d_k):
+                    qkv[h * d_k + d, b] = q_bf[b, h, d].item()
+                    qkv[k_total + h * d_k + d, b] = k_bf[b, h, d].item()
+                for d in range(d_v):
+                    qkv[2 * k_total + h * d_v + d, b] = v_bf[b, h, d].item()
+        qkv_gpu = _upload_bf16(glm, qkv)
         a_gpu = _upload_bf16(glm, a_raw.reshape(B * H).numpy())
         b_gpu = _upload_bf16(glm, b_raw.reshape(B * H).numpy())
         alog_gpu = _upload_f32(glm, A_log.numpy())
@@ -517,9 +481,9 @@ class TestGdnRecurrentStepBatch:
         state_gpu = _upload_f32(glm, state.reshape(B * H * d_k * d_v).numpy())
         out_gpu = glm.alloc(B * H * d_v * BF16)
 
-        glm.gdn_recurrent_step(out_gpu, state_gpu, q_gpu, k_gpu, v_gpu,
+        glm.gdn_recurrent_step(out_gpu, state_gpu, qkv_gpu,
                                 a_gpu, b_gpu, alog_gpu, dtb_gpu,
-                                H, d_k, d_v, B, state_stride)
+                                H, d_k, d_v, B, state_stride, B)
         glm.synchronize()
 
         out_np = _download_bf16(glm, out_gpu, B * H * d_v)
@@ -533,7 +497,7 @@ class TestGdnRecurrentStepBatch:
         assert torch.allclose(state_torch, ref_state, atol=5e-3, rtol=1e-2), \
             f"Batch state mismatch: max diff={torch.max(torch.abs(state_torch - ref_state)):.6f}"
 
-        for p in [q_gpu, k_gpu, v_gpu, a_gpu, b_gpu, alog_gpu, dtb_gpu, state_gpu, out_gpu]:
+        for p in [qkv_gpu, a_gpu, b_gpu, alog_gpu, dtb_gpu, state_gpu, out_gpu]:
             glm.free_buf(p)
 
 
@@ -583,15 +547,24 @@ class TestGdnPrefillBatch:
 
         total_S = B * S
         state_stride = H * d_k * d_v
-        q_packed = q_bf.reshape(total_S, H, d_k)
-        k_packed = k_bf.reshape(total_S, H, d_k)
-        v_packed = v_bf.reshape(total_S, H, d_v)
+
+        k_total = H * d_k
+        conv_dim = 2 * k_total + H * d_v
+        qkv = np.zeros((conv_dim, total_S), dtype=np.float32)
+        for b in range(B):
+            for t in range(S):
+                gt = b * S + t
+                for h in range(H):
+                    for d in range(d_k):
+                        qkv[h * d_k + d, gt] = q_bf[b, t, h, d].item()
+                        qkv[k_total + h * d_k + d, gt] = k_bf[b, t, h, d].item()
+                    for d in range(d_v):
+                        qkv[2 * k_total + h * d_v + d, gt] = v_bf[b, t, h, d].item()
+
         a_packed = a_bf.reshape(total_S, H)
         b_packed = b_bf.reshape(total_S, H)
 
-        q_gpu = _upload_bf16(glm, q_packed.reshape(total_S * H, d_k).numpy())
-        k_gpu = _upload_bf16(glm, k_packed.reshape(total_S * H, d_k).numpy())
-        v_gpu = _upload_bf16(glm, v_packed.reshape(total_S * H, d_v).numpy())
+        qkv_gpu = _upload_bf16(glm, qkv)
         a_gpu = _upload_bf16(glm, a_packed.reshape(total_S * H).numpy())
         b_gpu = _upload_bf16(glm, b_packed.reshape(total_S * H).numpy())
         alog_gpu = _upload_f32(glm, A_log.numpy())
@@ -602,9 +575,9 @@ class TestGdnPrefillBatch:
         cu_seqlens = np.array([0, S, 2 * S], dtype=np.int32)
         cu_gpu = _upload_i32(glm, cu_seqlens)
 
-        glm.gdn_prefill(out_gpu, state_gpu, q_gpu, k_gpu, v_gpu,
+        glm.gdn_prefill(out_gpu, state_gpu, qkv_gpu,
                          a_gpu, b_gpu, alog_gpu, dtb_gpu,
-                         cu_gpu, total_S, H, d_k, d_v, B, state_stride)
+                         cu_gpu, total_S, H, d_k, d_v, B, state_stride, total_S)
         glm.synchronize()
 
         out_np = _download_bf16(glm, out_gpu, total_S * H * d_v)
@@ -618,7 +591,7 @@ class TestGdnPrefillBatch:
         assert max_out_diff < 0.02, f"Batch prefill output mismatch: max diff={max_out_diff:.6f}"
         assert max_state_diff < 0.02, f"Batch prefill state mismatch: max diff={max_state_diff:.6f}"
 
-        for p in [q_gpu, k_gpu, v_gpu, a_gpu, b_gpu, alog_gpu, dtb_gpu, state_gpu, out_gpu, cu_gpu]:
+        for p in [qkv_gpu, a_gpu, b_gpu, alog_gpu, dtb_gpu, state_gpu, out_gpu, cu_gpu]:
             glm.free_buf(p)
 
 

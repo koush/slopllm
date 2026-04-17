@@ -129,9 +129,6 @@ class Qwen35Workspace {
   gdnABuf: Tensor;
   gdnBBuf: Tensor;
   gdnZBuf: Tensor;
-  gdnQBuf: Tensor;
-  gdnKBuf: Tensor;
-  gdnVBuf: Tensor;
   gdnOut: Tensor;
   gdnGatedOut: Tensor;
   gdnPrefillQkvLinear: Tensor;
@@ -140,9 +137,6 @@ class Qwen35Workspace {
   gdnPrefillBBuf: Tensor;
   gdnPrefillZBuf: Tensor;
   gdnPrefillConvOut: Tensor;
-  gdnPrefillQBuf: Tensor;
-  gdnPrefillKBuf: Tensor;
-  gdnPrefillVBuf: Tensor;
   gdnPrefillOut: Tensor;
   gdnPrefillGatedOut: Tensor;
   attnQBuf: Tensor;
@@ -210,9 +204,6 @@ class Qwen35Workspace {
     this.gdnABuf = Tensor.alloc(glm, [B * linHeads], "BF16");
     this.gdnBBuf = Tensor.alloc(glm, [B * linHeads], "BF16");
     this.gdnZBuf = Tensor.alloc(glm, [B * zDim], "BF16");
-    this.gdnQBuf = Tensor.alloc(glm, [B * linHeads * linKDim], "BF16");
-    this.gdnKBuf = Tensor.alloc(glm, [B * linHeads * linKDim], "BF16");
-    this.gdnVBuf = Tensor.alloc(glm, [B * linHeads * linVDim], "BF16");
     this.gdnOut = Tensor.alloc(glm, [B * linHeads * linVDim], "BF16");
     this.gdnGatedOut = Tensor.alloc(glm, [B * linHeads * linVDim], "BF16");
 
@@ -222,9 +213,6 @@ class Qwen35Workspace {
     this.gdnPrefillBBuf = Tensor.alloc(glm, [BS * linHeads], "BF16");
     this.gdnPrefillZBuf = Tensor.alloc(glm, [BS, zDim], "BF16");
     this.gdnPrefillConvOut = Tensor.alloc(glm, [convDim, S], "BF16");
-    this.gdnPrefillQBuf = Tensor.alloc(glm, [S * linHeads * linKDim], "BF16");
-    this.gdnPrefillKBuf = Tensor.alloc(glm, [S * linHeads * linKDim], "BF16");
-    this.gdnPrefillVBuf = Tensor.alloc(glm, [S * linHeads * linVDim], "BF16");
     this.gdnPrefillOut = Tensor.alloc(glm, [S * linHeads, linVDim], "BF16");
     this.gdnPrefillGatedOut = Tensor.alloc(glm, [S * linHeads, linVDim], "BF16");
 
@@ -486,22 +474,16 @@ export class Qwen35Model extends ChatModelBase {
     const convOut = this.ws.gdnPrefillConvOut;
     glm.causalConv1d(convOut.data, convState.data, qkvBuf.data, this.weights.get(`${pfx}.conv1d.weight`)!.data, gdnState.cuSeqlens.data, convDim, S, kernelSize, batchSize, gdnState.convStateStride);
 
-    const qBuf = this.ws.gdnPrefillQBuf;
-    const kBuf = this.ws.gdnPrefillKBuf;
-    const vBuf = this.ws.gdnPrefillVBuf;
-
-    qBuf.qkvSplit(kBuf, vBuf, convOut, S, linHeads, linKDim, linVDim);
-
     const gdnOut = this.ws.gdnPrefillOut;
 
     glm.gdnPrefill(
       gdnOut.data, recurrentState.data,
-      qBuf.data, kBuf.data, vBuf.data,
+      convOut.data,
       aBuf.data, bBuf.data,
       this.weights.get(`${pfx}.A_log`)!.data,
       this.weights.get(`${pfx}.dt_bias`)!.data,
       gdnState.cuSeqlens.data, S, linHeads, linKDim, linVDim,
-      batchSize, gdnState.recurrentStateStride,
+      batchSize, gdnState.recurrentStateStride, S,
     );
 
     const gatedOut = this.ws.gdnPrefillGatedOut;
@@ -547,22 +529,16 @@ export class Qwen35Model extends ChatModelBase {
     }
     const qkvSrc = BS === 1 ? qkvBuf.data : qkvT.data;
 
-    const qBuf = this.ws.gdnQBuf;
-    const kBuf = this.ws.gdnKBuf;
-    const vBuf = this.ws.gdnVBuf;
-
-    qBuf.qkvSplit(kBuf, vBuf, qkvSrc, BS, linHeads, linKDim, linVDim);
-
     const gdnOut = this.ws.gdnOut;
 
     glm.gdnRecurrentStep(
       gdnOut.data, recurrentState.data,
-      qBuf.data, kBuf.data, vBuf.data,
+      qkvSrc,
       aBuf.data, bBuf.data,
       this.weights.get(`${pfx}.A_log`)!.data,
       this.weights.get(`${pfx}.dt_bias`)!.data,
       linHeads, linKDim, linVDim,
-      BS, gdnState.recurrentStateStride,
+      BS, gdnState.recurrentStateStride, BS,
     );
 
     const gatedOut = this.ws.gdnGatedOut;

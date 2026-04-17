@@ -62,15 +62,13 @@ __device__ int find_seq_idx(int t, const int* cu_seqlens, int batch_size) {
 __global__ void gdn_recurrent_step_kernel(
     nv_bfloat16* __restrict__ output,
     float* __restrict__ state,
-    const nv_bfloat16* __restrict__ q,
-    const nv_bfloat16* __restrict__ k,
-    const nv_bfloat16* __restrict__ v,
+    const nv_bfloat16* __restrict__ qkv,
     const nv_bfloat16* __restrict__ a_raw,
     const nv_bfloat16* __restrict__ b_raw,
     const float* __restrict__ A_log,
     const float* __restrict__ dt_bias,
     int num_heads, int d_k, int d_v,
-    int batch_size, int state_stride
+    int batch_size, int state_stride, int qkv_seq_stride
 ) {
     int block_idx = blockIdx.x;
     int b = block_idx / num_heads;
@@ -87,16 +85,17 @@ __global__ void gdn_recurrent_step_kernel(
     float* s_delta = s_v_old + d_v;
     float* s_partial = s_delta + d_v;
 
-    int qkv_stride = num_heads * d_k;
-    int v_stride = num_heads * d_v;
+    int q_channel_base = h * d_k;
+    int k_channel_base = num_heads * d_k + h * d_k;
+    int v_channel_base = 2 * num_heads * d_k + h * d_v;
     int ab_stride = num_heads;
 
     for (int i = tid; i < d_k; i += blockDimX) {
-        s_q[i] = bf162float(q[b * qkv_stride + h * d_k + i]);
-        s_k[i] = bf162float(k[b * qkv_stride + h * d_k + i]);
+        s_q[i] = bf162float(qkv[(q_channel_base + i) * qkv_seq_stride + b]);
+        s_k[i] = bf162float(qkv[(k_channel_base + i) * qkv_seq_stride + b]);
     }
     for (int i = tid; i < d_v; i += blockDimX) {
-        s_v[i] = bf162float(v[b * v_stride + h * d_v + i]);
+        s_v[i] = bf162float(qkv[(v_channel_base + i) * qkv_seq_stride + b]);
     }
     __syncthreads();
 
@@ -177,45 +176,39 @@ void glm_gdn_recurrent_step(
     GlmCtx* ctx,
     void* output,
     void* state,
-    const void* q,
-    const void* k,
-    const void* v,
+    const void* qkv,
     const void* a_raw,
     const void* b_raw,
     const float* A_log,
     const float* dt_bias,
     int num_heads, int d_k, int d_v,
-    int batch_size, int state_stride
+    int batch_size, int state_stride, int qkv_seq_stride
 ) {
     int smem_size = (2 * d_k + 3 * d_v + 128) * sizeof(float);
     gdn_recurrent_step_kernel<<<batch_size * num_heads, 128, smem_size, ctx->stream>>>(
         (nv_bfloat16*)output,
         (float*)state,
-        (const nv_bfloat16*)q,
-        (const nv_bfloat16*)k,
-        (const nv_bfloat16*)v,
+        (const nv_bfloat16*)qkv,
         (const nv_bfloat16*)a_raw,
         (const nv_bfloat16*)b_raw,
         A_log,
         dt_bias,
         num_heads, d_k, d_v,
-        batch_size, state_stride
+        batch_size, state_stride, qkv_seq_stride
     );
 }
 
 __global__ void gdn_prefill_kernel(
     nv_bfloat16* __restrict__ output,
     float* __restrict__ state,
-    const nv_bfloat16* __restrict__ q,
-    const nv_bfloat16* __restrict__ k,
-    const nv_bfloat16* __restrict__ v,
+    const nv_bfloat16* __restrict__ qkv,
     const nv_bfloat16* __restrict__ a_raw,
     const nv_bfloat16* __restrict__ b_raw,
     const float* __restrict__ A_log,
     const float* __restrict__ dt_bias,
     const int* __restrict__ cu_seqlens,
     int total_seq_len, int num_heads, int d_k, int d_v,
-    int batch_size, int state_stride
+    int batch_size, int state_stride, int qkv_seq_stride
 ) {
     int block_idx = blockIdx.x;
     int b = block_idx / num_heads;
@@ -237,6 +230,10 @@ __global__ void gdn_prefill_kernel(
     float dtb = dt_bias[h];
     float neg_exp_al = -expf(al);
 
+    int q_channel_base = h * d_k;
+    int k_channel_base = num_heads * d_k + h * d_k;
+    int v_channel_base = 2 * num_heads * d_k + h * d_v;
+
     int seq_start = cu_seqlens[b];
     int seq_end = cu_seqlens[b + 1];
     int seq_len = seq_end - seq_start;
@@ -244,11 +241,11 @@ __global__ void gdn_prefill_kernel(
     for (int t = 0; t < seq_len; t++) {
         int gt = seq_start + t;
         for (int i = tid; i < d_k; i += blockDimX) {
-            s_q[i] = bf162float(q[gt * num_heads * d_k + h * d_k + i]);
-            s_k[i] = bf162float(k[gt * num_heads * d_k + h * d_k + i]);
+            s_q[i] = bf162float(qkv[(q_channel_base + i) * qkv_seq_stride + gt]);
+            s_k[i] = bf162float(qkv[(k_channel_base + i) * qkv_seq_stride + gt]);
         }
         for (int i = tid; i < d_v; i += blockDimX) {
-            s_v[i] = bf162float(v[gt * num_heads * d_v + h * d_v + i]);
+            s_v[i] = bf162float(qkv[(v_channel_base + i) * qkv_seq_stride + gt]);
         }
         __syncthreads();
 
@@ -327,31 +324,27 @@ void glm_gdn_prefill(
     GlmCtx* ctx,
     void* output,
     void* state,
-    const void* q,
-    const void* k,
-    const void* v,
+    const void* qkv,
     const void* a_raw,
     const void* b_raw,
     const float* A_log,
     const float* dt_bias,
     const int* cu_seqlens,
     int total_seq_len, int num_heads, int d_k, int d_v,
-    int batch_size, int state_stride
+    int batch_size, int state_stride, int qkv_seq_stride
 ) {
     int smem_size = (2 * d_k + 3 * d_v + 128) * sizeof(float);
     gdn_prefill_kernel<<<batch_size * num_heads, 128, smem_size, ctx->stream>>>(
         (nv_bfloat16*)output,
         (float*)state,
-        (const nv_bfloat16*)q,
-        (const nv_bfloat16*)k,
-        (const nv_bfloat16*)v,
+        (const nv_bfloat16*)qkv,
         (const nv_bfloat16*)a_raw,
         (const nv_bfloat16*)b_raw,
         A_log,
         dt_bias,
         cu_seqlens,
         total_seq_len, num_heads, d_k, d_v,
-        batch_size, state_stride
+        batch_size, state_stride, qkv_seq_stride
     );
 }
 
@@ -540,72 +533,6 @@ void glm_rmsnorm_gated(
         (const nv_bfloat16*)gate,
         (const nv_bfloat16*)weight,
         eps, dim, batch
-    );
-}
-
-__global__ void qkv_split_kernel(
-    nv_bfloat16* __restrict__ q_out,
-    nv_bfloat16* __restrict__ k_out,
-    nv_bfloat16* __restrict__ v_out,
-    const nv_bfloat16* __restrict__ qkv_in,
-    int seq_len, int num_heads, int d_k, int d_v
-) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int k_total = num_heads * d_k;
-    int v_total = num_heads * d_v;
-    int q_size = seq_len * k_total;
-    int k_size = seq_len * k_total;
-    int v_size = seq_len * v_total;
-    int total = q_size + k_size + v_size;
-
-    if (tid >= total) return;
-
-    if (tid < q_size) {
-        int d = tid % d_k;
-        int rest = tid / d_k;
-        int h = rest % num_heads;
-        int t = rest / num_heads;
-        int src_channel = h * d_k + d;
-        q_out[tid] = qkv_in[src_channel * seq_len + t];
-    } else if (tid < q_size + k_size) {
-        int kid = tid - q_size;
-        int d = kid % d_k;
-        int rest = kid / d_k;
-        int h = rest % num_heads;
-        int t = rest / num_heads;
-        int src_channel = k_total + h * d_k + d;
-        k_out[kid] = qkv_in[src_channel * seq_len + t];
-    } else {
-        int vid = tid - q_size - k_size;
-        int d = vid % d_v;
-        int rest = vid / d_v;
-        int h = rest % num_heads;
-        int t = rest / num_heads;
-        int src_channel = 2 * k_total + h * d_v + d;
-        v_out[vid] = qkv_in[src_channel * seq_len + t];
-    }
-}
-
-void glm_qkv_split(
-    GlmCtx* ctx,
-    void* q_out, void* k_out, void* v_out,
-    const void* qkv_in,
-    int seq_len, int num_heads, int d_k, int d_v
-) {
-    int k_total = num_heads * d_k;
-    int v_total = num_heads * d_v;
-    int q_size = seq_len * k_total;
-    int k_size = seq_len * k_total;
-    int v_size = seq_len * v_total;
-    int total = q_size + k_size + v_size;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    qkv_split_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        (nv_bfloat16*)q_out,
-        (nv_bfloat16*)k_out,
-        (nv_bfloat16*)v_out,
-        (nv_bfloat16*)qkv_in,
-        seq_len, num_heads, d_k, d_v
     );
 }
 

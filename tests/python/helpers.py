@@ -463,23 +463,23 @@ class GlmOps:
         self.lib.glm_gdn_recurrent_step.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_gdn_prefill.restype = None
         self.lib.glm_gdn_prefill.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_causal_conv1d.restype = None
@@ -522,13 +522,6 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ]
-
-        self.lib.glm_qkv_split.restype = None
-        self.lib.glm_qkv_split.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_interleaved_split.restype = None
@@ -1020,33 +1013,37 @@ class GlmOps:
             m, n, k
         )
 
-    def gdn_recurrent_step(self, output, state, q, k, v, a_raw, b_raw, A_log, dt_bias,
-                            num_heads, d_k, d_v, batch_size=1, state_stride=None):
+    def gdn_recurrent_step(self, output, state, qkv, a_raw, b_raw, A_log, dt_bias,
+                            num_heads, d_k, d_v, batch_size=1, state_stride=None, qkv_seq_stride=None):
         if state_stride is None:
             state_stride = num_heads * d_k * d_v
+        if qkv_seq_stride is None:
+            qkv_seq_stride = batch_size
         self.lib.glm_gdn_recurrent_step(
             self.ctx,
             self._ptr(output), self._ptr(state),
-            self._ptr(q), self._ptr(k), self._ptr(v),
+            self._ptr(qkv),
             self._ptr(a_raw), self._ptr(b_raw),
             self._ptr(A_log), self._ptr(dt_bias),
             num_heads, d_k, d_v,
-            batch_size, state_stride
+            batch_size, state_stride, qkv_seq_stride
         )
 
-    def gdn_prefill(self, output, state, q, k, v, a_raw, b_raw, A_log, dt_bias,
-                     cu_seqlens, total_seq_len, num_heads, d_k, d_v, batch_size=1, state_stride=None):
+    def gdn_prefill(self, output, state, qkv, a_raw, b_raw, A_log, dt_bias,
+                     cu_seqlens, total_seq_len, num_heads, d_k, d_v, batch_size=1, state_stride=None, qkv_seq_stride=None):
         if state_stride is None:
             state_stride = num_heads * d_k * d_v
+        if qkv_seq_stride is None:
+            qkv_seq_stride = total_seq_len
         self.lib.glm_gdn_prefill(
             self.ctx,
             self._ptr(output), self._ptr(state),
-            self._ptr(q), self._ptr(k), self._ptr(v),
+            self._ptr(qkv),
             self._ptr(a_raw), self._ptr(b_raw),
             self._ptr(A_log), self._ptr(dt_bias),
             self._ptr(cu_seqlens),
             total_seq_len, num_heads, d_k, d_v,
-            batch_size, state_stride
+            batch_size, state_stride, qkv_seq_stride
         )
 
     def causal_conv1d(self, output, conv_state, input, weight, cu_seqlens, conv_dim, total_seq_len, kernel_size, batch_size=1, conv_state_stride=None):
@@ -1103,14 +1100,6 @@ class GlmOps:
             self._ptr(cos),
             self._ptr(sin),
             ctypes.c_float(eps), rope_dim, head_dim, n_heads, seq_len, batch
-        )
-
-    def qkv_split(self, q_out, k_out, v_out, qkv_in, seq_len, num_heads, d_k, d_v):
-        self.lib.glm_qkv_split(
-            self.ctx,
-            self._ptr(q_out), self._ptr(k_out), self._ptr(v_out),
-            self._ptr(qkv_in),
-            seq_len, num_heads, d_k, d_v
         )
 
     def interleaved_split(self, q_out, gate_out, qg_in, batch_seq, num_heads, head_dim):
