@@ -246,24 +246,6 @@ void glm_flash_decode(
   }
 }
 
-void* glm_alloc_pinned(size_t bytes) {
-  void* ptr = nullptr;
-  cudaError_t status = cudaMallocHost(&ptr, bytes);
-  if (status != cudaSuccess) {
-    fprintf(stderr, "glm_alloc_pinned failed: %s\n", cudaGetErrorString(status));
-    return nullptr;
-  }
-  return ptr;
-}
-
-void glm_free_pinned(void* ptr) {
-  if (ptr) cudaFreeHost(ptr);
-}
-
-void glm_write_pinned(void* dst, const void* src, size_t size) {
-  memcpy(dst, src, size);
-}
-
 void glm_batch_decode_plan(
     GlmCtx* ctx,
     void* float_ws, size_t float_ws_size,

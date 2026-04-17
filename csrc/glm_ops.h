@@ -122,6 +122,41 @@ void glm_argmax(GlmCtx* ctx, int* out_index, const void* input, int dim, int bat
 
 void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes);
 
+// 2D memory copy (async on stream)
+// kind: cudaMemcpyKind values (0=H2H, 1=H2D, 2=D2H, 3=D2D)
+void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,
+                  const void* src, size_t spitch,
+                  size_t width, size_t height, int kind);
+
+// ---------------------------------------------------------------------------
+// NCCL operations
+// ---------------------------------------------------------------------------
+
+#define GLM_NCCL_UNIQUE_ID_BYTES 128
+
+// Write NCCL unique ID (128 bytes) to out_id (host memory)
+void glm_nccl_unique_id(void* out_id);
+
+// Initialize NCCL communicator for a given rank
+// Returns opaque ncclComm_t pointer (0 on failure)
+void* glm_nccl_comm_init_rank(int rank, int world_size, const void* unique_id);
+
+// Destroy NCCL communicator
+void glm_nccl_comm_destroy(void* comm);
+
+// All-reduce: sendbuff and recvbuff are device pointers
+// datatype: ncclDataType_t values (7=float32, 9=bfloat16)
+// op: ncclRedOp_t values (0=sum, 1=prod, 2=max, 3=min)
+void glm_nccl_all_reduce(void* comm, GlmCtx* ctx,
+                          const void* sendbuff, void* recvbuff,
+                          size_t count, int datatype, int op);
+
+// All-gather: sendbuff and recvbuff are device pointers
+// recvbuff must be world_size * sendcount elements
+void glm_nccl_all_gather(void* comm, GlmCtx* ctx,
+                          const void* sendbuff, void* recvbuff,
+                          size_t count, int datatype);
+
 void glm_kv_cache_write(GlmCtx* ctx,
                          void* src_k, void* src_v,
                          void* dst_k, void* dst_v,

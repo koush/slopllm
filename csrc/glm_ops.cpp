@@ -1368,6 +1368,108 @@ static Napi::Value InterleavedSplit(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value Memcpy2d(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (ctx, dst, dpitch, src, spitch, width, height, kind)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t dst_ptr = info[1].As<Napi::Number>().Int64Value();
+    size_t dpitch = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t src_ptr = info[3].As<Napi::Number>().Int64Value();
+    size_t spitch = info[4].As<Napi::Number>().Int64Value();
+    size_t width = info[5].As<Napi::Number>().Int64Value();
+    size_t height = info[6].As<Napi::Number>().Int64Value();
+    int kind = info[7].As<Napi::Number>().Int32Value();
+    glm_memcpy2d(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                 reinterpret_cast<void*>(dst_ptr), dpitch,
+                 reinterpret_cast<const void*>(src_ptr), spitch,
+                 width, height, kind);
+    return env.Undefined();
+}
+
+static Napi::Value NcclUniqueId(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBuffer()) {
+        Napi::TypeError::New(env, "Expected (outId: Buffer of 128 bytes)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Buffer<char> buf = info[0].As<Napi::Buffer<char>>();
+    if (buf.Length() < GLM_NCCL_UNIQUE_ID_BYTES) {
+        Napi::TypeError::New(env, "outId buffer must be at least 128 bytes").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_nccl_unique_id(buf.Data());
+    return env.Undefined();
+}
+
+static Napi::Value NcclCommInitRank(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3) {
+        Napi::TypeError::New(env, "Expected (rank, worldSize, uniqueId)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    int rank = info[0].As<Napi::Number>().Int32Value();
+    int world_size = info[1].As<Napi::Number>().Int32Value();
+    uintptr_t unique_id_ptr = info[2].As<Napi::Number>().Int64Value();
+    void* comm = glm_nccl_comm_init_rank(rank, world_size,
+                   reinterpret_cast<const void*>(unique_id_ptr));
+    return Napi::Number::New(env, reinterpret_cast<uintptr_t>(comm));
+}
+
+static Napi::Value NcclCommDestroy(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1) {
+        Napi::TypeError::New(env, "Expected (comm)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t comm_ptr = info[0].As<Napi::Number>().Int64Value();
+    glm_nccl_comm_destroy(reinterpret_cast<void*>(comm_ptr));
+    return env.Undefined();
+}
+
+static Napi::Value NcclAllReduce(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (comm, ctx, sendbuff, recvbuff, count, datatype, op)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t comm_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t ctx_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t send_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t recv_ptr = info[3].As<Napi::Number>().Int64Value();
+    size_t count = info[4].As<Napi::Number>().Int64Value();
+    int datatype = info[5].As<Napi::Number>().Int32Value();
+    int op = info[6].As<Napi::Number>().Int32Value();
+    glm_nccl_all_reduce(reinterpret_cast<void*>(comm_ptr),
+                         reinterpret_cast<GlmCtx*>(ctx_ptr),
+                         reinterpret_cast<const void*>(send_ptr),
+                         reinterpret_cast<void*>(recv_ptr),
+                         count, datatype, op);
+    return env.Undefined();
+}
+
+static Napi::Value NcclAllGather(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (comm, ctx, sendbuff, recvbuff, count, datatype)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t comm_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t ctx_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t send_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t recv_ptr = info[3].As<Napi::Number>().Int64Value();
+    size_t count = info[4].As<Napi::Number>().Int64Value();
+    int datatype = info[5].As<Napi::Number>().Int32Value();
+    glm_nccl_all_gather(reinterpret_cast<void*>(comm_ptr),
+                         reinterpret_cast<GlmCtx*>(ctx_ptr),
+                         reinterpret_cast<const void*>(send_ptr),
+                         reinterpret_cast<void*>(recv_ptr),
+                         count, datatype);
+    return env.Undefined();
+}
+
 static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "init"), Napi::Function::New(env, Init));
     exports.Set(Napi::String::New(env, "free"), Napi::Function::New(env, Free));
@@ -1436,6 +1538,12 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "qkvSplit"), Napi::Function::New(env, QkvSplit));
     exports.Set(Napi::String::New(env, "interleavedSplit"), Napi::Function::New(env, InterleavedSplit));
     exports.Set(Napi::String::New(env, "sample"), Napi::Function::New(env, Sample));
+    exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));
+    exports.Set(Napi::String::New(env, "ncclUniqueId"), Napi::Function::New(env, NcclUniqueId));
+    exports.Set(Napi::String::New(env, "ncclCommInitRank"), Napi::Function::New(env, NcclCommInitRank));
+    exports.Set(Napi::String::New(env, "ncclCommDestroy"), Napi::Function::New(env, NcclCommDestroy));
+    exports.Set(Napi::String::New(env, "ncclAllReduce"), Napi::Function::New(env, NcclAllReduce));
+    exports.Set(Napi::String::New(env, "ncclAllGather"), Napi::Function::New(env, NcclAllGather));
     return exports;
 }
 

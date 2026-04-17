@@ -10,11 +10,11 @@ BUILD_DIR := build/Release
 
 all: $(BUILD_DIR)/$(LIB_NAME)
 
-$(BUILD_DIR)/$(LIB_NAME): csrc/glm_ops.cu csrc/glm_flash.cu csrc/glm_fp8.cu csrc/glm_gdn.cu csrc/glm_sampling.cu | $(BUILD_DIR)
+$(BUILD_DIR)/$(LIB_NAME): csrc/glm_ops.cu csrc/glm_flash.cu csrc/glm_fp8.cu csrc/glm_gdn.cu csrc/glm_sampling.cu csrc/glm_nccl.cpp csrc/glm_device.cpp | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -shared -o $@ $^ \
 		$(FLASHINFER_INC) \
 		-I$(CUDA_PATH)/include \
-		-L$(CUDA_PATH)/lib64 -lcublas -lcudart
+		-L$(CUDA_PATH)/lib64 -lcublas -lcudart -lnccl
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)

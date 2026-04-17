@@ -68,10 +68,16 @@ interface NativeAddon {
   qkvSplit(ctx: number, qOut: number, kOut: number, vOut: number, qkvIn: number, seqLen: number, numHeads: number, dK: number, dV: number): void;
   interleavedSplit(ctx: number, qOut: number, gateOut: number, qgIn: number, batchSeq: number, numHeads: number, headDim: number): void;
   sample(ctx: number, outToken: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, vocabSize: number, numPenaltyTokens: number, temperature: number, repetitionPenalty: number, presencePenalty: number, topK: number, topP: number, randomVal: number): void;
+  memcpy2d(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void;
+  ncclUniqueId(outId: Buffer): void;
+  ncclCommInitRank(rank: number, worldSize: number, uniqueId: number): number;
+  ncclCommDestroy(comm: number): void;
+  ncclAllReduce(comm: number, ctx: number, sendbuff: number, recvbuff: number, count: number, datatype: number, op: number): void;
+  ncclAllGather(comm: number, ctx: number, sendbuff: number, recvbuff: number, count: number, datatype: number): void;
 }
 
 export class GlmOps {
-  private native: NativeAddon;
+  native: NativeAddon;
   ctx: number;
   device: number;
 
@@ -318,6 +324,10 @@ export class GlmOps {
   sample(outToken: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, vocabSize: number, numPenaltyTokens: number, temperature: number, repetitionPenalty: number, presencePenalty: number, topK: number, topP: number, randomVal: number): void {
     this.native.sample(this.ctx, outToken, topkVals, topkIdxs, workspace, logits, penaltyTokens, vocabSize, numPenaltyTokens, temperature, repetitionPenalty, presencePenalty, topK, topP, randomVal);
   }
+
+  memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void {
+    this.native.memcpy2d(this.ctx, dst, dpitch, src, spitch, width, height, kind);
+  }
 }
 
 export function f32ToBf16Bytes(arr: Float32Array): Buffer {
@@ -347,3 +357,24 @@ export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
 export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 export const PAGE_SIZE = 16;
+
+export const MEMCPY_H2H = 0;
+export const MEMCPY_H2D = 1;
+export const MEMCPY_D2H = 2;
+export const MEMCPY_D2D = 3;
+
+export const NCCL_UNIQUE_ID_BYTES = 128;
+export const NCCL_INT8 = 0;
+export const NCCL_UINT8 = 1;
+export const NCCL_INT32 = 2;
+export const NCCL_UINT32 = 3;
+export const NCCL_INT64 = 4;
+export const NCCL_UINT64 = 5;
+export const NCCL_FLOAT16 = 6;
+export const NCCL_FLOAT32 = 7;
+export const NCCL_FLOAT64 = 8;
+export const NCCL_BFLOAT16 = 9;
+export const NCCL_SUM = 0;
+export const NCCL_PROD = 1;
+export const NCCL_MAX = 2;
+export const NCCL_MIN = 3;
