@@ -5,11 +5,11 @@ import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { Tensor } from "./tensor";
-import type { ChatCache, DecodeState, PrefillState } from "./chat_model";
-import { ChatModelBase, SamplingParams } from "./chat_model";
+import type { ChatCache } from "./chat_model";
+import { ChatModelBase, type BatchState, SamplingParams } from "./chat_model";
 
 export type { SamplingParams };
-export type { DecodeState, PrefillState };
+export type { BatchState };
 
 export interface Qwen3Config {
   hiddenSize: number;
@@ -263,7 +263,7 @@ export class Qwen3Model extends ChatModelBase {
     return S === 1 ? this.ws.vBuf.data : this.ws.vT.data;
   }
 
-  prefillBatchForward(state: PrefillState, ws: WorkspaceBuffers, cache: ChatCache): void {
+  batchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
     const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;
@@ -274,114 +274,77 @@ export class Qwen3Model extends ChatModelBase {
     const pageSize = pagedKV.pageSize;
     const batchSize = state.batchSize;
     const totalTokens = state.totalTokens;
+    const BS = totalTokens;
+    const B = state.isDecode ? batchSize : 1;
+    const S = state.isDecode ? 1 : totalTokens;
 
-    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, totalTokens);
+    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
 
-    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, 1, totalTokens);
+    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, B, S);
 
-    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
 
-      this.computeQkv(pfx, totalTokens, 1, totalTokens);
+      this.computeQkv(pfx, BS, B, S);
 
+      const slotMapping = state.isDecode ? pagedKV.slotMapping : this.ws.prefillSlotMapping.data;
+      const kStride = state.isDecode ? nKv * hd : hd;
+      const vStride = state.isDecode ? hd : totalTokens * hd;
       glm.kvCacheWrite(
-        this.ws.kRope.data, this.vData(totalTokens),
+        this.ws.kRope.data, this.vData(S),
         pagedKV.kData[i], pagedKV.vData[i],
-        this.ws.prefillSlotMapping.data,
-        totalTokens, nKv, hd, pagedKV.pageSize,
-        hd, totalTokens * hd
+        slotMapping,
+        BS, nKv, hd, pageSize,
+        kStride, vStride
       );
 
-      const qStrideN = hd;
-      const qStrideH = totalTokens * hd;
-
-      glm.batchPrefillPagedRun(
-        this.ws.qRope.data, this.ws.flashOut.data,
-        pagedKV.kData[i], pagedKV.vData[i],
-        pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
-        ws.floatWs, ws.intWs,
-        this.ws.qoIndptrD.data,
-        ws.prefillPlanInfo,
-        totalTokens, batchSize,
-        nHeads, nKv, hd,
-        pageSize,
-        qStrideN, qStrideH,
-        1, cfg.scaling
-      );
-
-      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, totalTokens, hs, nHeads * hd, this);
-
-      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, this.ws.oProjBuf, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
-
-      this.mlp(totalTokens, pfx);
-
-      if (i < cfg.numHiddenLayers - 1) {
-        const nextPfx = `model.layers.${i + 1}`;
-        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get(`${nextPfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+      if (state.isDecode) {
+        glm.batchDecodeRun(
+          this.ws.qRope.data, this.ws.flashOut.data,
+          pagedKV.kData[i], pagedKV.vData[i],
+          pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
+          ws.floatWs, ws.intWs,
+          ws.decodePlanInfo,
+          batchSize,
+          nHeads, nKv, hd, pageSize, cfg.scaling
+        );
       } else {
-        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, totalTokens);
-        this.ws.hiddenLast.indexSelect(this.ws.normed, this.ws.lastIdx, hs, batchSize);
-        this.ws.logitsBuf.linear(this.ws.hiddenLast, this.weights.get("lm_head.weight")!, batchSize, cfg.vocabSize, hs, this);
+        const qStrideN = hd;
+        const qStrideH = totalTokens * hd;
+        glm.batchPrefillPagedRun(
+          this.ws.qRope.data, this.ws.flashOut.data,
+          pagedKV.kData[i], pagedKV.vData[i],
+          pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
+          ws.floatWs, ws.intWs,
+          this.ws.qoIndptrD.data,
+          ws.prefillPlanInfo,
+          totalTokens, batchSize,
+          nHeads, nKv, hd,
+          pageSize,
+          qStrideN, qStrideH,
+          1, cfg.scaling
+        );
       }
-    }
 
-    this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
-  }
+      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd, this);
 
-  decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void {
-    const pagedKV = this.getPagedKV(cache);
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const hs = cfg.hiddenSize;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const pageSize = pagedKV.pageSize;
-    const batchSize = state.batchSize;
+      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, this.ws.oProjBuf, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
-    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, batchSize);
-
-    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, batchSize, 1);
-
-    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
-
-    for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const pfx = `model.layers.${i}`;
-
-      this.computeQkv(pfx, batchSize, batchSize, 1);
-
-      glm.kvCacheWrite(
-        this.ws.kRope.data, this.vData(1),
-        pagedKV.kData[i], pagedKV.vData[i],
-        pagedKV.slotMapping,
-        batchSize, nKv, hd, pageSize,
-        nKv * hd, hd
-      );
-
-      glm.batchDecodeRun(
-        this.ws.qRope.data, this.ws.flashOut.data,
-        pagedKV.kData[i], pagedKV.vData[i],
-        pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
-        ws.floatWs, ws.intWs,
-        ws.decodePlanInfo,
-        batchSize,
-        nHeads, nKv, hd, pageSize, cfg.scaling
-      );
-
-      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, batchSize, hs, nHeads * hd, this);
-
-      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, this.ws.oProjBuf, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
-
-      this.mlp(batchSize, pfx);
+      this.mlp(BS, pfx);
 
       if (i < cfg.numHiddenLayers - 1) {
         const nextPfx = `model.layers.${i + 1}`;
-        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get(`${nextPfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get(`${nextPfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
       } else {
-        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, batchSize);
-        this.ws.logitsBuf.linear(this.ws.normed, this.weights.get("lm_head.weight")!, batchSize, cfg.vocabSize, hs, this);
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, BS);
+        if (state.isDecode) {
+          this.ws.logitsBuf.linear(this.ws.normed, this.weights.get("lm_head.weight")!, batchSize, cfg.vocabSize, hs, this);
+        } else {
+          this.ws.hiddenLast.indexSelect(this.ws.normed, this.ws.lastIdx, hs, batchSize);
+          this.ws.logitsBuf.linear(this.ws.hiddenLast, this.weights.get("lm_head.weight")!, batchSize, cfg.vocabSize, hs, this);
+        }
       }
     }
 

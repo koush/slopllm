@@ -18,26 +18,28 @@ export interface ChatCache {
   appendTokens(seqIdx: number, tokens: number[]): void;
 }
 
-export interface DecodeState {
-  batchSize: number;
-}
-
-export interface PrefillState {
+export interface BatchState {
   batchSize: number;
   totalTokens: number;
   seqLens: number[];
   pageAllocs: [number, number][];
+  readonly isDecode: boolean;
 }
 
 export interface ChatModel {
   readonly eosIds: Set<number>;
   createChatCache(maxPages?: number): ChatCache;
+  batchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): BatchState;
+  batchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
+  batchRead(state: BatchState): number[];
+  batch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[];
   prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[];
-  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState;
-  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): DecodeState;
-  decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void;
-  decodeBatchRead(state: DecodeState): number[];
+  prefill(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache): number;
+  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): BatchState;
+  decodeBatchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
+  decodeBatchRead(state: BatchState): number[];
   decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[];
+  decode(tokenId: number, ws: WorkspaceBuffers, cache: ChatCache): number;
   sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number;
   free(): void;
 }
@@ -72,8 +74,6 @@ export abstract class ChatModelBase implements ChatModel {
   protected abstract readonly weights: Map<string, Tensor>;
 
   abstract createChatCache(maxPages?: number): ChatCache;
-  abstract prefillBatchForward(state: PrefillState, ws: WorkspaceBuffers, cache: ChatCache): void;
-  abstract decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void;
   abstract free(): void;
 
   protected abstract getPagedKV(cache: ChatCache): PagedKVCache;
@@ -83,7 +83,7 @@ export abstract class ChatModelBase implements ChatModel {
     _startPos: number[], _cache: ChatCache,
   ): void {}
 
-  prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState {
+  batchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): BatchState {
     const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;
@@ -92,13 +92,52 @@ export abstract class ChatModelBase implements ChatModel {
     const hd = cfg.headDim;
     const pageSize = pagedKV.pageSize;
     const batchSize = inputIdsList.length;
-
-    if (pagedKV.seqPages.length !== batchSize) {
-      throw new Error(`prefillBatchPlan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
-    }
-
     const seqLens = inputIdsList.map(ids => ids.length);
     const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+    const isDecode = seqLens.every(s => s === 1);
+
+    if (enableCudaGraph && !isDecode) {
+      throw new Error("enableCudaGraph requires all sequences to have length 1 (decode mode)");
+    }
+
+    if (pagedKV.seqPages.length !== batchSize) {
+      throw new Error(`batchPlan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+    }
+
+    const allIds: number[] = [];
+    for (const ids of inputIdsList) allIds.push(...ids);
+    const idsBuf = Int32Array.from(allIds);
+    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+
+    if (isDecode) {
+      const writeLocations: [number, number][] = [];
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
+      }
+
+      pagedKV.updateIndptr();
+      pagedKV.updateSlotMapping(writeLocations, pageSize);
+
+      const posIds = new Array(batchSize);
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        posIds[seqIdx] = pagedKV.seqKvLens[seqIdx] - 1;
+      }
+      const posIdsBuf = Int32Array.from(posIds);
+      this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+
+      glm.batchDecodePlan(
+        ws.floatWs, BATCH_FLOAT_WS_SIZE,
+        ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
+        ws.decodePlanInfo,
+        pagedKV.indptrH,
+        batchSize,
+        nHeads, nKv, hd, pageSize,
+        enableCudaGraph
+      );
+
+      return { batchSize, totalTokens, seqLens, pageAllocs: [], isDecode: true };
+    }
+
     const startPos = pagedKV.seqKvLens.slice();
 
     this.prefillBatchPlanHook(inputIdsList, seqLens, totalTokens, startPos, cache);
@@ -107,11 +146,6 @@ export abstract class ChatModelBase implements ChatModel {
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       pageAllocs.push(pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]));
     }
-
-    const allIds: number[] = [];
-    for (const ids of inputIdsList) allIds.push(...ids);
-    const idsBuf = Int32Array.from(allIds);
-    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
 
     const qoIndptr = [0];
     for (const s of seqLens) {
@@ -171,90 +205,54 @@ export abstract class ChatModelBase implements ChatModel {
     const slotMappingBuf = Int32Array.from(slotMapping);
     this.ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
 
-    return { batchSize, totalTokens, seqLens, pageAllocs };
+    return { batchSize, totalTokens, seqLens, pageAllocs, isDecode: false };
+  }
+
+  abstract batchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void;
+
+  batchRead(state: BatchState): number[] {
+    const batchSize = state.batchSize;
+    const buf = Buffer.alloc(batchSize * I32);
+    this.ws.argmaxIdx.d2h(buf);
+    const result: number[] = [];
+    for (let i = 0; i < batchSize; i++) {
+      result.push(buf.readInt32LE(i * I32));
+    }
+    return result;
+  }
+
+  batch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[] {
+    const state = this.batchPlan(inputIdsList, ws, cache);
+    this.batchForward(state, ws, cache);
+    return this.batchRead(state);
+  }
+
+  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[] {
+    return this.batch(inputIdsList, ws, cache);
   }
 
   prefill(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache): number {
-    return this.prefillBatch(inputIds, ws, cache)[0];
+    return this.batch(inputIds, ws, cache)[0];
+  }
+
+  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): BatchState {
+    return this.batchPlan(tokenIdsList.map(t => [t]), ws, cache, enableCudaGraph);
+  }
+
+  decodeBatchForward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
+    this.batchForward(state, ws, cache);
+  }
+
+  decodeBatchRead(state: BatchState): number[] {
+    return this.batchRead(state);
+  }
+
+  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[] {
+    return this.batch(tokenIdsList.map(t => [t]), ws, cache);
   }
 
   decode(tokenId: number, ws: WorkspaceBuffers, cache: ChatCache): number {
     return this.decodeBatch([tokenId], ws, cache)[0];
-  }
-
-  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[] {
-    const state = this.prefillBatchPlan(inputIdsList, ws, cache);
-    this.prefillBatchForward(state, ws, cache);
-    return this.prefillBatchRead(state);
-  }
-
-  prefillBatchRead(state: PrefillState): number[] {
-    const batchSize = state.batchSize;
-    const buf = Buffer.alloc(batchSize * I32);
-    this.ws.argmaxIdx.d2h(buf);
-    const result: number[] = [];
-    for (let i = 0; i < batchSize; i++) {
-      result.push(buf.readInt32LE(i * I32));
-    }
-    return result;
-  }
-
-  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[] {
-    const state = this.decodeBatchPlan(tokenIdsList, ws, cache);
-    this.decodeBatchForward(state, ws, cache);
-    return this.decodeBatchRead(state);
-  }
-
-  decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): DecodeState {
-    const pagedKV = this.getPagedKV(cache);
-    const cfg = this.cfg;
-    const glm = this.glm;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-    const pageSize = pagedKV.pageSize;
-    const batchSize = tokenIdsList.length;
-
-    const writeLocations: [number, number][] = [];
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
-    }
-
-    pagedKV.updateIndptr();
-    pagedKV.updateSlotMapping(writeLocations, pageSize);
-
-    const idsBuf = Int32Array.from(tokenIdsList);
-    this.ws.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
-
-    const posIds = new Array(batchSize);
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      posIds[seqIdx] = pagedKV.seqKvLens[seqIdx] - 1;
-    }
-    const posIdsBuf = Int32Array.from(posIds);
-    this.ws.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
-
-    glm.batchDecodePlan(
-      ws.floatWs, BATCH_FLOAT_WS_SIZE,
-      ws.intWs, ws.pinnedIntWs, BATCH_INT_WS_SIZE,
-      ws.decodePlanInfo,
-      pagedKV.indptrH,
-      batchSize,
-      nHeads, nKv, hd, pageSize,
-      enableCudaGraph
-    );
-
-    return { batchSize };
-  }
-
-  decodeBatchRead(state: DecodeState): number[] {
-    const batchSize = state.batchSize;
-    const buf = Buffer.alloc(batchSize * I32);
-    this.ws.argmaxIdx.d2h(buf);
-    const result: number[] = [];
-    for (let i = 0; i < batchSize; i++) {
-      result.push(buf.readInt32LE(i * I32));
-    }
-    return result;
   }
 
   protected readArgmax(ptr: Tensor | number, count: number): number {
