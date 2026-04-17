@@ -206,14 +206,14 @@ __global__ void fused_norm_rope_kernel(
     const __nv_bfloat16* __restrict__ cos_emb,
     const __nv_bfloat16* __restrict__ sin_emb,
     float eps, int rope_dim, int head_dim,
-    int n_heads, int seq_len, int batch
+    int n_heads, int seq_len, int batch, int in_stride
 ) {
     int bhs = blockIdx.x;
     int s = bhs % seq_len;
     int h = (bhs / seq_len) % n_heads;
     int b = bhs / (seq_len * n_heads);
 
-    const __nv_bfloat16* x = in + (b * seq_len + s) * n_heads * head_dim + h * head_dim;
+    const __nv_bfloat16* x = in + (b * seq_len + s) * n_heads * in_stride + h * in_stride;
     __nv_bfloat16* o = out + ((b * n_heads + h) * seq_len + s) * head_dim;
 
     extern __shared__ float sdata[];
@@ -257,7 +257,7 @@ __global__ void fused_norm_rope_kernel(
 void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
                           const void* weight, const void* cos_emb, const void* sin_emb,
                           float eps, int rope_dim, int head_dim,
-                          int n_heads, int seq_len, int batch) {
+                          int n_heads, int seq_len, int batch, int in_stride) {
     cudaSetDevice(ctx->device_id);
     int total_rows = batch * n_heads * seq_len;
     int block_size = 256;
@@ -267,7 +267,7 @@ void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
         (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
         (const __nv_bfloat16*)weight,
         (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
-        eps, rope_dim, head_dim, n_heads, seq_len, batch);
+        eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +457,59 @@ __global__ void ew_binary_kernel(__nv_bfloat16* out, const __nv_bfloat16* a, con
     } else if (idx < n) {
         out[idx] = __float2bfloat16(F(__bfloat162float(a[idx]), __bfloat162float(b[idx])));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Element-wise unary 2D kernel (templated) — pitched input
+// Reads from a 2D pitched view of input: element(r, c) = in[r * pitch + c]
+// F: (float, float) -> float, receives (out_val, in_val)
+// out: [rows * cols] contiguous
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ float sigmoid_mul_f(float val, float gate) {
+    float sig = 1.0f / (1.0f + expf(-gate));
+    return val * sig;
+}
+
+template<auto F>
+__global__ void ew_unary_2d_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ in,
+    int rows, int cols, int pitch
+) {
+    int total = rows * cols;
+    int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
+    if (idx + 1 < total) {
+        int r0 = idx / cols, c0 = idx % cols;
+        int r1 = (idx + 1) / cols, c1 = (idx + 1) % cols;
+        float v0 = __bfloat162float(out[idx]);
+        float v1 = __bfloat162float(out[idx + 1]);
+        float g0 = __bfloat162float(in[r0 * pitch + c0]);
+        float g1 = __bfloat162float(in[r1 * pitch + c1]);
+        store_bf16x2(out + idx, F(v0, g0), F(v1, g1));
+    } else if (idx < total) {
+        int r = idx / cols, c = idx % cols;
+        float v = __bfloat162float(out[idx]);
+        float g = __bfloat162float(in[r * pitch + c]);
+        out[idx] = __float2bfloat16(F(v, g));
+    }
+}
+
+void glm_gate_sigmoid_mul(
+    GlmCtx* ctx, void* attn_out, const void* gate_interleaved,
+    int batch_seq, int num_heads, int head_dim
+) {
+    cudaSetDevice(ctx->device_id);
+    int rows = batch_seq * num_heads;
+    int cols = head_dim;
+    int pitch = head_dim * 2;
+    int total = rows * cols;
+    int block_size = 256;
+    int grid = (total + block_size - 1) / block_size;
+    ew_unary_2d_kernel<sigmoid_mul_f><<<grid, block_size, 0, ctx->stream>>>(
+        (__nv_bfloat16*)attn_out,
+        (const __nv_bfloat16*)gate_interleaved,
+        rows, cols, pitch);
 }
 
 // ---------------------------------------------------------------------------

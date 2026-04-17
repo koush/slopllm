@@ -124,8 +124,8 @@ static Napi::Value FusedAddRmsnorm(const Napi::CallbackInfo& info) {
 
 static Napi::Value FusedNormRope(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 12) {
-        Napi::TypeError::New(env, "Expected (ctx, out, in, weight, cos, sin, eps, rope_dim, head_dim, n_heads, seq_len, batch)").ThrowAsJavaScriptException();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, out, in, weight, cos, sin, eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -140,13 +140,14 @@ static Napi::Value FusedNormRope(const Napi::CallbackInfo& info) {
     int n_heads = info[9].As<Napi::Number>().Int32Value();
     int seq_len = info[10].As<Napi::Number>().Int32Value();
     int batch = info[11].As<Napi::Number>().Int32Value();
+    int in_stride = info[12].As<Napi::Number>().Int32Value();
     glm_fused_norm_rope(reinterpret_cast<GlmCtx*>(ctx_ptr),
                          reinterpret_cast<void*>(out_ptr),
                          reinterpret_cast<const void*>(in_ptr),
                          reinterpret_cast<const void*>(wt_ptr),
                          reinterpret_cast<const void*>(cos_ptr),
                          reinterpret_cast<const void*>(sin_ptr),
-                         eps, rope_dim, head_dim, n_heads, seq_len, batch);
+                         eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
     return env.Undefined();
 }
 
@@ -1378,24 +1379,22 @@ static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value InterleavedSplit(const Napi::CallbackInfo& info) {
+static Napi::Value GateSigmoidMul(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 7) {
-        Napi::TypeError::New(env, "Expected (ctx, q_out, gate_out, qg_in, batch_seq, num_heads, head_dim)").ThrowAsJavaScriptException();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, attn_out, gate_interleaved, batch_seq, num_heads, head_dim)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
     uintptr_t gate_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t qg_ptr = info[3].As<Napi::Number>().Int64Value();
-    int batch_seq = info[4].As<Napi::Number>().Int32Value();
-    int num_heads = info[5].As<Napi::Number>().Int32Value();
-    int head_dim = info[6].As<Napi::Number>().Int32Value();
-    glm_interleaved_split(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                           reinterpret_cast<void*>(q_ptr),
-                           reinterpret_cast<void*>(gate_ptr),
-                           reinterpret_cast<const void*>(qg_ptr),
-                           batch_seq, num_heads, head_dim);
+    int batch_seq = info[3].As<Napi::Number>().Int32Value();
+    int num_heads = info[4].As<Napi::Number>().Int32Value();
+    int head_dim = info[5].As<Napi::Number>().Int32Value();
+    glm_gate_sigmoid_mul(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                          reinterpret_cast<void*>(out_ptr),
+                          reinterpret_cast<const void*>(gate_ptr),
+                          batch_seq, num_heads, head_dim);
     return env.Undefined();
 }
 
@@ -1568,7 +1567,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "causalConv1d"), Napi::Function::New(env, CausalConv1d));
     exports.Set(Napi::String::New(env, "causalConv1dUpdate"), Napi::Function::New(env, CausalConv1dUpdate));
     exports.Set(Napi::String::New(env, "rmsnormGated"), Napi::Function::New(env, RmsnormGated));
-    exports.Set(Napi::String::New(env, "interleavedSplit"), Napi::Function::New(env, InterleavedSplit));
+    exports.Set(Napi::String::New(env, "gateSigmoidMul"), Napi::Function::New(env, GateSigmoidMul));
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
     exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));
     exports.Set(Napi::String::New(env, "ncclUniqueId"), Napi::Function::New(env, NcclUniqueId));

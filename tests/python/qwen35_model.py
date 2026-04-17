@@ -249,10 +249,8 @@ class Qwen35Model:
             "hidden_b": glm.alloc(BS * hs * BF16),
             "normed": glm.alloc(BS * hs * BF16),
             "q_buf": glm.alloc(BS * q_total_dim * 2 * BF16),
-            "q_only": glm.alloc(BS * q_total_dim * BF16),
             "k_buf": glm.alloc(BS * n_kv * hd * BF16),
             "v_buf": glm.alloc(BS * n_kv * hd * BF16),
-            "gate_buf": glm.alloc(BS * q_total_dim * BF16),
             "q_normed": glm.alloc(BS * q_total_dim * BF16),
             "k_normed": glm.alloc(BS * n_kv * hd * BF16),
             "q_t": glm.alloc(B * n_heads * S * hd * BF16),
@@ -287,7 +285,6 @@ class Qwen35Model:
             "gdn_v": glm.alloc(S * lin_h * lin_vd * BF16),
             "gdn_out": glm.alloc(S * lin_h * lin_vd * BF16),
             "gdn_gated": glm.alloc(S * lin_h * lin_vd * BF16),
-            "sig_buf": glm.alloc(BS * q_total_dim * BF16),
             "cu_seqlens": glm.alloc(2 * I32),
         }
 
@@ -499,8 +496,6 @@ class Qwen35Model:
         glm.linear(ws["q_buf"], ws["normed"],
                     self.weights[f"{pfx}.q_proj.weight"],
                     BS, q_total_dim * 2, hs)
-        glm.interleaved_split(ws["q_only"], ws["gate_buf"],
-                               ws["q_buf"], BS, n_heads, hd)
 
         glm.linear(ws["k_buf"], ws["normed"],
                     self.weights[f"{pfx}.k_proj.weight"],
@@ -509,27 +504,18 @@ class Qwen35Model:
                     self.weights[f"{pfx}.v_proj.weight"],
                     BS, n_kv * hd, hs)
 
-        glm.rmsnorm(ws["q_normed"], ws["q_only"],
-                     self.weights[f"{pfx}.q_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_heads)
-        glm.rmsnorm(ws["k_normed"], ws["k_buf"],
-                     self.weights[f"{pfx}.k_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_kv)
+        rope_dim = int(hd * cfg.partial_rotary_factor)
+        glm.fused_norm_rope(ws["q_rope"], ws["q_buf"],
+                            self.weights[f"{pfx}.q_norm.weight"],
+                            ws["cos"], ws["sin"],
+                            cfg.rms_norm_eps, rope_dim, hd, n_heads, S, B, hd * 2)
+        glm.fused_norm_rope(ws["k_rope"], ws["k_buf"],
+                            self.weights[f"{pfx}.k_norm.weight"],
+                            ws["cos"], ws["sin"],
+                            cfg.rms_norm_eps, rope_dim, hd, n_kv, S, B)
 
-        glm.transpose_4d(ws["q_t"], ws["q_normed"],
-                          B, S, n_heads, hd, 0, 2, 1, 3)
-        glm.transpose_4d(ws["k_t"], ws["k_normed"],
-                          B, S, n_kv, hd, 0, 2, 1, 3)
         glm.transpose_4d(ws["v_t"], ws["v_buf"],
                           B, S, n_kv, hd, 0, 2, 1, 3)
-
-        rope_dim = int(hd * cfg.partial_rotary_factor)
-        glm.apply_rotary_pos_emb_partial(ws["q_rope"], ws["q_t"],
-                                  ws["cos"], ws["sin"],
-                                  rope_dim, hd, n_heads, S, B, 1)
-        glm.apply_rotary_pos_emb_partial(ws["k_rope"], ws["k_t"],
-                                  ws["cos"], ws["sin"],
-                                  rope_dim, hd, n_kv, S, B, 1)
 
         kv_stride_h = max_S * hd
         kv_stride_n = hd
@@ -559,8 +545,7 @@ class Qwen35Model:
         )
 
         if cfg.attn_output_gate:
-            glm.sigmoid(ws["sig_buf"], ws["gate_buf"], BS * n_heads * hd)
-            glm.mul(ws["flash_out"], ws["flash_out"], ws["sig_buf"], BS * n_heads * hd)
+            glm.gate_sigmoid_mul(ws["flash_out"], ws["q_buf"], BS, n_heads, hd)
 
         glm.linear(ws["o_proj_buf"], ws["flash_out"],
                     self.weights[f"{pfx}.o_proj.weight"],
@@ -596,8 +581,6 @@ class Qwen35Model:
         glm.linear(ws["q_buf"], ws["normed"],
                     self.weights[f"{pfx}.q_proj.weight"],
                     BS, q_total_dim * 2, hs)
-        glm.interleaved_split(ws["q_only"], ws["gate_buf"],
-                               ws["q_buf"], BS, n_heads, hd)
 
         glm.linear(ws["k_buf"], ws["normed"],
                     self.weights[f"{pfx}.k_proj.weight"],
@@ -606,27 +589,15 @@ class Qwen35Model:
                     self.weights[f"{pfx}.v_proj.weight"],
                     BS, n_kv * hd, hs)
 
-        glm.rmsnorm(ws["q_normed"], ws["q_only"],
-                     self.weights[f"{pfx}.q_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_heads)
-        glm.rmsnorm(ws["k_normed"], ws["k_buf"],
-                     self.weights[f"{pfx}.k_norm.weight"],
-                     cfg.rms_norm_eps, hd, BS * n_kv)
-
-        glm.transpose_4d(ws["q_t"], ws["q_normed"],
-                          BS, S, n_heads, hd, 0, 2, 1, 3)
-        glm.transpose_4d(ws["k_t"], ws["k_normed"],
-                          BS, S, n_kv, hd, 0, 2, 1, 3)
-        glm.transpose_4d(ws["v_t"], ws["v_buf"],
-                          BS, S, n_kv, hd, 0, 2, 1, 3)
-
         rope_dim = int(hd * cfg.partial_rotary_factor)
-        glm.apply_rotary_pos_emb_partial(ws["q_rope"], ws["q_t"],
-                                  ws["cos"], ws["sin"],
-                                  rope_dim, hd, n_heads, S, BS, 1)
-        glm.apply_rotary_pos_emb_partial(ws["k_rope"], ws["k_t"],
-                                  ws["cos"], ws["sin"],
-                                  rope_dim, hd, n_kv, S, BS, 1)
+        glm.fused_norm_rope(ws["q_rope"], ws["q_buf"],
+                            self.weights[f"{pfx}.q_norm.weight"],
+                            ws["cos"], ws["sin"],
+                            cfg.rms_norm_eps, rope_dim, hd, n_heads, S, BS, hd * 2)
+        glm.fused_norm_rope(ws["k_rope"], ws["k_buf"],
+                            self.weights[f"{pfx}.k_norm.weight"],
+                            ws["cos"], ws["sin"],
+                            cfg.rms_norm_eps, rope_dim, hd, n_kv, S, BS)
 
         kv_stride_h = max_S * hd
         kv_stride_n = hd
@@ -654,8 +625,7 @@ class Qwen35Model:
         )
 
         if cfg.attn_output_gate:
-            glm.sigmoid(ws["sig_buf"], ws["gate_buf"], BS * n_heads * hd)
-            glm.mul(ws["flash_out"], ws["flash_out"], ws["sig_buf"], BS * n_heads * hd)
+            glm.gate_sigmoid_mul(ws["flash_out"], ws["q_buf"], BS, n_heads, hd)
 
         glm.linear(ws["o_proj_buf"], ws["flash_out"],
                     self.weights[f"{pfx}.o_proj.weight"],

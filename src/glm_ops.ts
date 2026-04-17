@@ -19,7 +19,7 @@ interface NativeAddon {
   d2h(ctx: number, dst: Buffer, src: number, size: number): void;
   rmsnorm(ctx: number, out: number, input: number, weight: number, eps: number, dim: number, batch: number): void;
   fusedAddRmsnorm(ctx: number, out: number, residual: number, inputA: number, inputB: number, weight: number, eps: number, dim: number, batch: number): void;
-  fusedNormRope(ctx: number, out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number): void;
+  fusedNormRope(ctx: number, out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void;
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
   linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number): void;
   embedding(ctx: number, out: number, table: number, ids: number, hidden: number, seqLen: number): void;
@@ -77,7 +77,7 @@ interface NativeAddon {
   causalConv1d(ctx: number, output: number, convState: number, input: number, weight: number, cuSeqlens: number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number): void;
   causalConv1dUpdate(ctx: number, output: number, convState: number, input: number, weight: number, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): void;
   rmsnormGated(ctx: number, output: number, input: number, gate: number, weight: number, eps: number, dim: number, batch: number): void;
-  interleavedSplit(ctx: number, qOut: number, gateOut: number, qgIn: number, batchSeq: number, numHeads: number, headDim: number): void;
+  gateSigmoidMul(ctx: number, attnOut: number, gateInterleaved: number, batchSeq: number, numHeads: number, headDim: number): void;
   sampleBatch(ctx: number, outTokens: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, penaltyOffsets: number, vocabSize: number, batchSize: number, temperatures: number, repPenalties: number, presPenalties: number, topKs: number, topPs: number, randomVals: number, maxEffectiveK: number): void;
   memcpy2d(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void;
   ncclUniqueId(outId: Buffer): void;
@@ -136,8 +136,8 @@ export class GlmOps {
     this.native.fusedAddRmsnorm(this.ctx, out, residual, inputA, inputB, weight, eps, dim, batch);
   }
 
-  fusedNormRope(out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number): void {
-    this.native.fusedNormRope(this.ctx, out, input, weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch);
+  fusedNormRope(out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void {
+    this.native.fusedNormRope(this.ctx, out, input, weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
   }
 
   siluAndMul(out: number, gate: number, up: number, intermediate: number, batch: number): void {
@@ -332,8 +332,8 @@ export class GlmOps {
     this.native.mul(this.ctx, out, a, b, n);
   }
 
-  interleavedSplit(qOut: number, gateOut: number, qgIn: number, batchSeq: number, numHeads: number, headDim: number): void {
-    this.native.interleavedSplit(this.ctx, qOut, gateOut, qgIn, batchSeq, numHeads, headDim);
+  gateSigmoidMul(attnOut: number, gateInterleaved: number, batchSeq: number, numHeads: number, headDim: number): void {
+    this.native.gateSigmoidMul(this.ctx, attnOut, gateInterleaved, batchSeq, numHeads, headDim);
   }
 
   sampleBatch(outTokens: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, penaltyOffsets: number, vocabSize: number, batchSize: number, temperatures: number, repPenalties: number, presPenalties: number, topKs: number, topPs: number, randomVals: number, maxEffectiveK: number): void {

@@ -522,12 +522,13 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
         ]
 
-        self.lib.glm_interleaved_split.restype = None
-        self.lib.glm_interleaved_split.argtypes = [
+        self.lib.glm_gate_sigmoid_mul.restype = None
+        self.lib.glm_gate_sigmoid_mul.argtypes = [
             ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
@@ -1091,7 +1092,9 @@ class GlmOps:
             ctypes.c_float(eps), dim, batch
         )
 
-    def fused_norm_rope(self, output, input_tensor, weight, cos, sin, eps, rope_dim, head_dim, n_heads, seq_len, batch):
+    def fused_norm_rope(self, output, input_tensor, weight, cos, sin, eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride=None):
+        if in_stride is None:
+            in_stride = head_dim
         self.lib.glm_fused_norm_rope(
             self.ctx,
             self._ptr(output),
@@ -1099,13 +1102,13 @@ class GlmOps:
             self._ptr(weight),
             self._ptr(cos),
             self._ptr(sin),
-            ctypes.c_float(eps), rope_dim, head_dim, n_heads, seq_len, batch
+            ctypes.c_float(eps), rope_dim, head_dim, n_heads, seq_len, batch, in_stride
         )
 
-    def interleaved_split(self, q_out, gate_out, qg_in, batch_seq, num_heads, head_dim):
-        self.lib.glm_interleaved_split(
+    def gate_sigmoid_mul(self, attn_out, gate_interleaved, batch_seq, num_heads, head_dim):
+        self.lib.glm_gate_sigmoid_mul(
             self.ctx,
-            self._ptr(q_out), self._ptr(gate_out),
-            self._ptr(qg_in),
+            self._ptr(attn_out),
+            self._ptr(gate_interleaved),
             batch_seq, num_heads, head_dim
         )

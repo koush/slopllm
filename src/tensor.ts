@@ -76,8 +76,8 @@ export class Tensor {
     this.glm.fusedAddRmsnorm(this.data, ptr(residual), ptr(inputA), ptr(inputB), ptr(weight), eps, dim, batch);
   }
 
-  fusedNormRope(input: Tensor | number, weight: Tensor | number, cos: Tensor | number, sin: Tensor | number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number): void {
-    this.glm.fusedNormRope(this.data, ptr(input), ptr(weight), ptr(cos), ptr(sin), eps, ropeDim, headDim, nHeads, seqLen, batch);
+  fusedNormRope(input: Tensor | number, weight: Tensor | number, cos: Tensor | number, sin: Tensor | number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): void {
+    this.glm.fusedNormRope(this.data, ptr(input), ptr(weight), ptr(cos), ptr(sin), eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
   }
 
   embedding(table: Tensor | number, ids: Tensor | number, hidden: number, seqLen: number): void {

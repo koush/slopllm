@@ -536,44 +536,4 @@ void glm_rmsnorm_gated(
     );
 }
 
-__global__ void interleaved_split_kernel(
-    nv_bfloat16* __restrict__ q_out,
-    nv_bfloat16* __restrict__ gate_out,
-    const nv_bfloat16* __restrict__ qg_in,
-    int batch_seq, int num_heads, int head_dim
-) {
-    int total = batch_seq * num_heads * head_dim;
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= total) return;
 
-    int hd2 = head_dim * 2;
-    int s = tid / (num_heads * head_dim);
-    int rest = tid % (num_heads * head_dim);
-    int h = rest / head_dim;
-    int d = rest % head_dim;
-
-    int src_offset = s * num_heads * hd2 + h * hd2 + d;
-    int gate_src_offset = src_offset + head_dim;
-    int dst_offset = s * num_heads * head_dim + h * head_dim + d;
-
-    q_out[dst_offset] = qg_in[src_offset];
-    gate_out[dst_offset] = qg_in[gate_src_offset];
-}
-
-void glm_interleaved_split(
-    GlmCtx* ctx,
-    void* q_out,
-    void* gate_out,
-    const void* qg_in,
-    int batch_seq, int num_heads, int head_dim
-) {
-    int total = batch_seq * num_heads * head_dim;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    interleaved_split_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        (nv_bfloat16*)q_out,
-        (nv_bfloat16*)gate_out,
-        (nv_bfloat16*)qg_in,
-        batch_seq, num_heads, head_dim
-    );
-}

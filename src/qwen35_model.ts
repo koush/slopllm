@@ -140,10 +140,8 @@ class Qwen35Workspace {
   gdnPrefillOut: Tensor;
   gdnPrefillGatedOut: Tensor;
   attnQBuf: Tensor;
-  attnQOnly: Tensor;
   attnKBuf: Tensor;
   attnVBuf: Tensor;
-  attnGateBuf: Tensor;
   attnQNormed: Tensor;
   attnKNormed: Tensor;
   attnQT: Tensor;
@@ -151,7 +149,6 @@ class Qwen35Workspace {
   attnVT: Tensor;
   attnQRope: Tensor;
   attnKRope: Tensor;
-  attnSigBuf: Tensor;
   sampleOutToken: Tensor;
   sampleTopkVals: Tensor;
   sampleTopkIdxs: Tensor;
@@ -218,10 +215,8 @@ class Qwen35Workspace {
 
     const qTotalDim = nHeads * hd;
     this.attnQBuf = Tensor.alloc(glm, [BS, qTotalDim * 2], "BF16");
-    this.attnQOnly = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
     this.attnKBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
     this.attnVBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
-    this.attnGateBuf = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
     this.attnQNormed = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
     this.attnKNormed = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
     this.attnQT = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
@@ -229,7 +224,6 @@ class Qwen35Workspace {
     this.attnVT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
     this.attnQRope = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
     this.attnKRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
-    this.attnSigBuf = Tensor.alloc(glm, [BS * nHeads * hd], "BF16");
 
     this.sampleOutToken = Tensor.alloc(glm, [B], "I32");
     this.sampleTopkVals = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
@@ -568,13 +562,10 @@ export class Qwen35Model extends ChatModelBase {
     const S = state.isDecode ? 1 : totalTokens;
 
     const qBuf = this.ws.attnQBuf;
-    const qOnly = this.ws.attnQOnly;
     const kBuf = this.ws.attnKBuf;
     const vBuf = this.ws.attnVBuf;
-    const gateBuf = this.ws.attnGateBuf;
 
     qBuf.linear(this.ws.normed, this.weights.get(`${pfx}.q_proj.weight`)!, BS, qTotalDim * 2, hs, this);
-    glm.interleavedSplit(qOnly.data, gateBuf.data, qBuf.data, BS, nHeads, hd);
     kBuf.linear(this.ws.normed, this.weights.get(`${pfx}.k_proj.weight`)!, BS, nKv * hd, hs, this);
     vBuf.linear(this.ws.normed, this.weights.get(`${pfx}.v_proj.weight`)!, BS, nKv * hd, hs, this);
 
@@ -582,7 +573,7 @@ export class Qwen35Model extends ChatModelBase {
     const qRope = this.ws.attnQRope;
     const kRope = this.ws.attnKRope;
 
-    qRope.fusedNormRope(qOnly, this.weights.get(`${pfx}.q_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, ropeDim, hd, nHeads, S, B);
+    qRope.fusedNormRope(qBuf, this.weights.get(`${pfx}.q_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, ropeDim, hd, nHeads, S, B, hd * 2);
     kRope.fusedNormRope(kBuf, this.weights.get(`${pfx}.k_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, ropeDim, hd, nKv, S, B);
 
     const vData = S === 1 ? vBuf.data : this.ws.attnVT.data;
@@ -629,9 +620,7 @@ export class Qwen35Model extends ChatModelBase {
     }
 
     if (cfg.attnOutputGate) {
-      const sigBuf = this.ws.attnSigBuf;
-      sigBuf.sigmoid(gateBuf, BS * nHeads * hd);
-      this.ws.flashOut.mul(this.ws.flashOut, sigBuf, BS * nHeads * hd);
+      glm.gateSigmoidMul(this.ws.flashOut.data, qBuf.data, BS, nHeads, hd);
     }
 
     this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.o_proj.weight`)!, BS, hs, nHeads * hd, this);

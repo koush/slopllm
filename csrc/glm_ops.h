@@ -43,10 +43,11 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
 // Input: [batch * seq_len, n_heads * head_dim] (projection output)
 // Output: [batch, n_heads, seq_len, head_dim] (HND layout for attention)
 // Applies per-head RMSNorm then RoPE, with [NSHD -> HNSD] transpose.
+// in_stride: per-head stride in input (head_dim for contiguous, head_dim*2 for interleaved [Q|gate])
 void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
                           const void* weight, const void* cos_emb, const void* sin_emb,
                           float eps, int rope_dim, int head_dim,
-                          int n_heads, int seq_len, int batch);
+                          int n_heads, int seq_len, int batch, int in_stride);
 
 void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
                       const void* up, int intermediate, int batch);
@@ -339,13 +340,12 @@ void glm_rmsnorm_gated(GlmCtx* ctx, void* output, const void* input,
                         const void* gate, const void* weight,
                         float eps, int dim, int batch);
 
-// Split interleaved [query|gate] per head:
-// qg_in: [batch_seq, num_heads, head_dim * 2] BF16 (row-major)
-// q_out: [batch_seq, num_heads * head_dim] BF16
-// gate_out: [batch_seq, num_heads * head_dim] BF16
-void glm_interleaved_split(GlmCtx* ctx, void* q_out, void* gate_out,
-                            const void* qg_in,
-                            int batch_seq, int num_heads, int head_dim);
+// Gate sigmoid multiply: attn_out[i] *= sigmoid(gate_interleaved[r * pitch + c])
+// attn_out: [batch_seq * num_heads * head_dim] BF16 (in-place, contiguous)
+// gate_interleaved: [batch_seq, num_heads, head_dim * 2] BF16 (pitched, reads gate portion at offset head_dim per head)
+// pitch = head_dim * 2 (row stride in elements for the pitched 2D view)
+void glm_gate_sigmoid_mul(GlmCtx* ctx, void* attn_out, const void* gate_interleaved,
+                           int batch_seq, int num_heads, int head_dim);
 
 // GPU batch sampling: each block handles one sequence
 // out_tokens: [batch_size] int32 - sampled token IDs
