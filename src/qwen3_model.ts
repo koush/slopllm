@@ -5,8 +5,8 @@ import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { Tensor, OpContext } from "./tensor";
-import type { ChatModel, ChatCache, DecodeState, PrefillState } from "./chat_model";
-import { SamplingParams } from "./chat_model";
+import type { ChatCache, DecodeState, PrefillState } from "./chat_model";
+import { ChatModelBase, SamplingParams } from "./chat_model";
 
 export type { SamplingParams };
 export type { DecodeState, PrefillState };
@@ -148,17 +148,18 @@ class Qwen3Workspace {
   }
 }
 
-export class Qwen3Model implements OpContext, ChatModel {
+export class Qwen3Model extends ChatModelBase {
   readonly eosIds = new Set([151645, 151643]);
-  glm: GlmOps;
+  declare glm: GlmOps;
   cfg: Qwen3Config;
-  weights: Map<string, Tensor>;
+  declare weights: Map<string, Tensor>;
   maxBatch: number;
   maxSeqLen: number;
   invFreq: Tensor;
-  ws: Qwen3Workspace;
+  declare ws: Qwen3Workspace;
 
   private constructor(glm: GlmOps, config: Qwen3Config, weights: Map<string, Tensor>, maxBatch: number, maxSeqLen: number) {
+    super();
     this.glm = glm;
     this.cfg = config;
     this.weights = weights;
@@ -229,121 +230,9 @@ export class Qwen3Model implements OpContext, ChatModel {
     return new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, maxPages, this.maxBatch);
   }
 
-  *chatStream(inputIds: number[][], cache: ChatCache, ws: WorkspaceBuffers, maxNewTokens = 100, eosIds?: Set<number>, sampling?: SamplingParams): Generator<number> {
+  protected getPagedKV(cache: ChatCache): PagedKVCache {
     if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    yield* this.streamTokens(inputIds, ws, cache, maxNewTokens, eosIds ?? this.eosIds, sampling);
-  }
-
-  private readArgmax(ptr: Tensor | number, count: number): number {
-    this.ws.argmaxIdx.argmax(ptr, count);
-    const buf = Buffer.alloc(I32);
-    this.ws.argmaxIdx.d2h(buf);
-    return buf.readInt32LE(0);
-  }
-
-  private sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number {
-    const vs = this.cfg.vocabSize;
-    const glm = this.glm;
-
-    const hasRepPenalty = params.repetitionPenalty !== 1.0;
-    const hasPresPenalty = params.presencePenalty !== 0;
-
-    let numPenaltyTokens = 0;
-    if (hasRepPenalty || hasPresPenalty) {
-      const seen = new Set<number>();
-      const start = Math.max(0, tokenHistory.length - params.repetitionPenaltyWindow);
-      for (let i = start; i < tokenHistory.length; i++) seen.add(tokenHistory[i]);
-      const penaltyBuf = Buffer.alloc(seen.size * I32);
-      let offset = 0;
-      for (const tid of seen) {
-        if (tid < vs) {
-          penaltyBuf.writeInt32LE(tid, offset);
-          offset += I32;
-          numPenaltyTokens++;
-        }
-      }
-      if (numPenaltyTokens > 0) {
-        this.ws.samplePenaltyTokens.h2d(penaltyBuf, numPenaltyTokens * I32);
-      }
-    }
-
-    const randomVal = Math.random();
-    const topK = params.topK > 0 ? params.topK : 0;
-    const temperature = params.temperature > 0 ? params.temperature : 0;
-
-    glm.sample(
-      this.ws.sampleOutToken.data,
-      this.ws.sampleTopkVals.data,
-      this.ws.sampleTopkIdxs.data,
-      this.ws.sampleWorkspace.data,
-      this.ws.logitsBuf.data,
-      this.ws.samplePenaltyTokens.data,
-      vs,
-      numPenaltyTokens,
-      temperature,
-      params.repetitionPenalty,
-      params.presencePenalty,
-      topK,
-      params.topP,
-      randomVal,
-    );
-
-    const buf = Buffer.alloc(I32);
-    this.ws.sampleOutToken.d2h(buf);
-    return buf.readInt32LE(0);
-  }
-
-  private readArgmaxBatch(batchSize: number): number[] {
-    const vs = this.cfg.vocabSize;
-    this.ws.argmaxIdx.argmax(this.ws.logitsBuf, vs, batchSize);
-    const buf = Buffer.alloc(batchSize * I32);
-    this.ws.argmaxIdx.d2h(buf);
-    const result: number[] = [];
-    for (let i = 0; i < batchSize; i++) {
-      result.push(buf.readInt32LE(i * I32));
-    }
-    return result;
-  }
-
-  prefill(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache): number {
-    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    return this.prefillBatch(inputIds, ws, cache)[0];
-  }
-
-  decode(tokenId: number, ws: WorkspaceBuffers, cache: ChatCache): number {
-    return this.decodeBatch([tokenId], ws, cache)[0];
-  }
-
-  generateTokens(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[] {
-    return [...this.streamTokens(inputIds, ws, cache, maxNewTokens, eosTokenIds)];
-  }
-
-  *streamTokens(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643]), sampling?: SamplingParams): Generator<number> {
-    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    const pagedKV = cache;
-    const vs = this.cfg.vocabSize;
-    if (inputIds.length !== 1) throw new Error("streamTokens only supports batch=1");
-
-    pagedKV.reset(inputIds.length);
-    const firstTokens = this.prefillBatch(inputIds, ws, pagedKV);
-    let nextToken = firstTokens[0];
-    yield nextToken;
-
-    const tokenHistory = [...inputIds[0], nextToken];
-
-    for (let i = 0; i < maxNewTokens - 1; i++) {
-      if (eosTokenIds.has(nextToken)) break;
-
-      const decodeTokens = this.decodeBatch([nextToken], ws, pagedKV);
-      nextToken = decodeTokens[0];
-
-      if (sampling && (sampling.temperature > 0 || sampling.repetitionPenalty !== 1.0 || sampling.presencePenalty !== 0 || sampling.topK > 0 || sampling.topP < 1.0)) {
-        nextToken = this.sampleTokenGPU(sampling, tokenHistory);
-      }
-
-      tokenHistory.push(nextToken);
-      yield nextToken;
-    }
+    return cache;
   }
 
   private mlp(BS: number, pfx: string): void {
@@ -405,8 +294,7 @@ export class Qwen3Model implements OpContext, ChatModel {
   }
 
   prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState {
-    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    const pagedKV = cache;
+    const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;
     const nHeads = cfg.numAttentionHeads;
@@ -495,8 +383,7 @@ export class Qwen3Model implements OpContext, ChatModel {
   }
 
   prefillBatchForward(state: PrefillState, ws: WorkspaceBuffers, cache: ChatCache): void {
-    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    const pagedKV = cache;
+    const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -553,27 +440,8 @@ export class Qwen3Model implements OpContext, ChatModel {
     this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
   }
 
-  prefillBatchRead(state: PrefillState): number[] {
-    const batchSize = state.batchSize;
-    const buf = Buffer.alloc(batchSize * I32);
-    this.ws.argmaxIdx.d2h(buf);
-    const result: number[] = [];
-    for (let i = 0; i < batchSize; i++) {
-      result.push(buf.readInt32LE(i * I32));
-    }
-    return result;
-  }
-
-  prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[] {
-    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    const state = this.prefillBatchPlan(inputIdsList, ws, cache);
-    this.prefillBatchForward(state, ws, cache);
-    return this.prefillBatchRead(state);
-  }
-
   decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph = false): DecodeState {
-    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    const pagedKV = cache;
+    const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;
     const nHeads = cfg.numAttentionHeads;
@@ -614,8 +482,7 @@ export class Qwen3Model implements OpContext, ChatModel {
   }
 
   decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void {
-    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    const pagedKV = cache;
+    const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -661,57 +528,5 @@ export class Qwen3Model implements OpContext, ChatModel {
     this.finalNormAndLogits(batchSize);
 
     this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
-  }
-
-  decodeBatchRead(state: DecodeState): number[] {
-    const batchSize = state.batchSize;
-    const buf = Buffer.alloc(batchSize * I32);
-    this.ws.argmaxIdx.d2h(buf);
-    const result: number[] = [];
-    for (let i = 0; i < batchSize; i++) {
-      result.push(buf.readInt32LE(i * I32));
-    }
-    return result;
-  }
-
-  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[] {
-    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    const pagedKV = cache;
-    const state = this.decodeBatchPlan(tokenIdsList, ws, cache);
-    this.decodeBatchForward(state, ws, cache);
-    return this.decodeBatchRead(state);
-  }
-
-  generateBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache, maxNewTokens = 100, eosTokenIds = new Set([151645, 151643])): number[][] {
-    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    const pagedKV = cache;
-    const batchSize = inputIdsList.length;
-    const vs = this.cfg.vocabSize;
-
-    pagedKV.reset(batchSize);
-    const firstTokens = this.prefillBatch(inputIdsList, ws, pagedKV);
-
-    const nextTokens = [...firstTokens];
-    const generated: number[][] = nextTokens.map(t => [t]);
-    const finished = nextTokens.map(t => eosTokenIds.has(t));
-
-    for (let step = 0; step < maxNewTokens - 1; step++) {
-      if (finished.every(f => f)) break;
-
-      const newTokens = this.decodeBatch(nextTokens, ws, pagedKV);
-
-      for (let i = 0; i < batchSize; i++) {
-        nextTokens[i] = newTokens[i];
-        if (!finished[i]) {
-          if (eosTokenIds.has(newTokens[i])) {
-            finished[i] = true;
-          } else {
-            generated[i].push(newTokens[i]);
-          }
-        }
-      }
-    }
-
-    return generated;
   }
 }

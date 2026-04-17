@@ -1,7 +1,7 @@
 import { GlmOps } from "./glm_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model } from "./qwen35_model";
-import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
+import { WorkspaceBuffers } from "./paged_kv";
 import { ChatModel, ChatCache, SamplingParams, makeSamplingParams, needsSampling, samplingLabel } from "./chat_model";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
@@ -128,7 +128,7 @@ function printTiming(timing: TimingInfo): void {
 // --- Qwen3 + CUDA Graph path (PagedKVCache, single batch) ---
 
 function generateResponseCudaGraph(
-  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, cache: PagedKVCache,
+  model: ChatModel, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
   inputIds: number[], graphExec: number | null,
   maxNewTokens: number, warmupSteps: number, sp: SamplingParams | undefined,
 ): { tokens: number[]; graphExec: number | null; timing: TimingInfo; matchLen: number } {
@@ -141,7 +141,6 @@ function generateResponseCudaGraph(
 
   const t0 = performance.now();
   const tokens = model.prefillBatch([suffixIds], ws, cache);
-  cache.updateIndptr();
   timing.prefillMs = performance.now() - t0;
 
   let currentToken = tokens[0];
@@ -152,7 +151,7 @@ function generateResponseCudaGraph(
   let warmupRemaining = graphExec === null ? warmupSteps : 0;
   let capturing = false;
 
-  for (let i = 1; i < maxNewTokens && !QWEN3_EOS.has(currentToken); i++) {
+  for (let i = 1; i < maxNewTokens && !model.eosIds.has(currentToken); i++) {
     const t = performance.now();
     const state = model.decodeBatchPlan([currentToken], ws, cache, true);
 
@@ -195,7 +194,7 @@ function generateResponseCudaGraph(
 }
 
 async function interactiveQwen3CudaGraph(
-  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, cache: PagedKVCache,
+  model: ChatModel, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
   tokenizer: any, args: CliArgs,
 ): Promise<void> {
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
@@ -248,17 +247,14 @@ async function interactiveQwen3CudaGraph(
 
       graphExec = result.graphExec;
 
-      const cachedLen = cache.cachedTokenIds[0]?.length ?? 0;
-      if (cachedLen > 0) {
-        if (result.matchLen > 0) {
-          const suffixLen = inputIds.length - result.matchLen;
-          console.log(`  [cache hit ${result.matchLen}/${cachedLen} tokens, appending ${suffixLen} new]`);
-        } else {
-          console.log("  [cache miss, full prefill]");
-        }
+      if (result.matchLen > 0) {
+        const suffixLen = inputIds.length - result.matchLen;
+        console.log(`  [cache hit ${result.matchLen} tokens, appending ${suffixLen} new]`);
+      } else {
+        console.log("  [cache miss, full prefill]");
       }
 
-      const responseTokens = result.tokens.filter(t => !QWEN3_EOS.has(t));
+      const responseTokens = result.tokens.filter(t => !model.eosIds.has(t));
       const responseText = tokenizer.decode(responseTokens, { skip_special_tokens: true });
       process.stdout.write(responseText + "\n\n");
 
@@ -275,7 +271,7 @@ async function interactiveQwen3CudaGraph(
 }
 
 async function singlePromptQwen3CudaGraph(
-  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, cache: PagedKVCache,
+  model: ChatModel, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
   tokenizer: any, args: CliArgs,
 ): Promise<void> {
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
@@ -291,7 +287,7 @@ async function singlePromptQwen3CudaGraph(
     args.maxNewTokens, args.warmupSteps, sp,
   );
 
-  const responseTokens = result.tokens.filter(t => !QWEN3_EOS.has(t));
+  const responseTokens = result.tokens.filter(t => !model.eosIds.has(t));
   const responseText = tokenizer.decode(responseTokens, { skip_special_tokens: true });
 
   console.log(`\nPrefill: ${result.timing.prefillMs.toFixed(1)}ms`);
@@ -317,7 +313,7 @@ async function singlePromptQwen3CudaGraph(
 // --- Qwen3 + Batch path ---
 
 async function interactiveQwen3Batch(
-  model: Qwen3Model, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
+  model: ChatModel, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
   tokenizer: any, args: CliArgs,
 ): Promise<void> {
   const enableThinking = args.thinking;
@@ -374,7 +370,7 @@ async function interactiveQwen3Batch(
       }
 
       const start = Date.now();
-      const generatedIds = model.generateBatch(inputIdsList, ws, cache, args.maxNewTokens, QWEN3_EOS);
+      const generatedIds = model.generateBatch(inputIdsList, ws, cache, args.maxNewTokens, model.eosIds);
       const elapsed = (Date.now() - start) / 1000;
       const totalTokens = generatedIds.reduce((sum, ids) => sum + ids.length, 0);
 
@@ -397,7 +393,7 @@ async function interactiveQwen3Batch(
 // --- Qwen3.5 + Batch path ---
 
 async function interactiveQwen35Batch(
-  model: Qwen35Model, cache: ChatCache, ws: WorkspaceBuffers,
+  model: ChatModel, cache: ChatCache, ws: WorkspaceBuffers,
   tokenizer: any, args: CliArgs,
 ): Promise<void> {
   const enableThinking = args.thinking;
@@ -668,7 +664,7 @@ async function main(): Promise<void> {
     } else if (args.useCudaGraph) {
       const model = Qwen3Model.fromPretrained(glm, repoId, 1, args.maxSeqLen);
       const ws = new WorkspaceBuffers(glm);
-      const cache = model.createChatCache(args.maxPages) as PagedKVCache;
+      const cache = model.createChatCache(args.maxPages);
 
       const modelDir = resolveModelPath(repoId);
       const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
