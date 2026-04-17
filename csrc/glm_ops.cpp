@@ -97,6 +97,59 @@ static Napi::Value Rmsnorm(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value FusedAddRmsnorm(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 9) {
+        Napi::TypeError::New(env, "Expected (ctx, out, residual, input_a, input_b, weight, eps, dim, batch)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t res_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t a_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t b_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t wt_ptr = info[5].As<Napi::Number>().Int64Value();
+    float eps = info[6].As<Napi::Number>().FloatValue();
+    int dim = info[7].As<Napi::Number>().Int32Value();
+    int batch = info[8].As<Napi::Number>().Int32Value();
+    glm_fused_add_rmsnorm(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                           reinterpret_cast<void*>(out_ptr),
+                           reinterpret_cast<void*>(res_ptr),
+                           reinterpret_cast<const void*>(a_ptr),
+                           reinterpret_cast<const void*>(b_ptr),
+                           reinterpret_cast<const void*>(wt_ptr),
+                           eps, dim, batch);
+    return env.Undefined();
+}
+
+static Napi::Value FusedNormRope(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, out, in, weight, cos, sin, eps, rope_dim, head_dim, n_heads, seq_len, batch)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t wt_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t cos_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t sin_ptr = info[5].As<Napi::Number>().Int64Value();
+    float eps = info[6].As<Napi::Number>().FloatValue();
+    int rope_dim = info[7].As<Napi::Number>().Int32Value();
+    int head_dim = info[8].As<Napi::Number>().Int32Value();
+    int n_heads = info[9].As<Napi::Number>().Int32Value();
+    int seq_len = info[10].As<Napi::Number>().Int32Value();
+    int batch = info[11].As<Napi::Number>().Int32Value();
+    glm_fused_norm_rope(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                         reinterpret_cast<void*>(out_ptr),
+                         reinterpret_cast<const void*>(in_ptr),
+                         reinterpret_cast<const void*>(wt_ptr),
+                         reinterpret_cast<const void*>(cos_ptr),
+                         reinterpret_cast<const void*>(sin_ptr),
+                         eps, rope_dim, head_dim, n_heads, seq_len, batch);
+    return env.Undefined();
+}
+
 static Napi::Value SiluAndMul(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -1478,6 +1531,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "h2d"), Napi::Function::New(env, H2D));
     exports.Set(Napi::String::New(env, "d2h"), Napi::Function::New(env, D2H));
     exports.Set(Napi::String::New(env, "rmsnorm"), Napi::Function::New(env, Rmsnorm));
+    exports.Set(Napi::String::New(env, "fusedAddRmsnorm"), Napi::Function::New(env, FusedAddRmsnorm));
+    exports.Set(Napi::String::New(env, "fusedNormRope"), Napi::Function::New(env, FusedNormRope));
     exports.Set(Napi::String::New(env, "siluAndMul"), Napi::Function::New(env, SiluAndMul));
     exports.Set(Napi::String::New(env, "linear"), Napi::Function::New(env, Linear));
     exports.Set(Napi::String::New(env, "embedding"), Napi::Function::New(env, Embedding));

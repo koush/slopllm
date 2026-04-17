@@ -19,7 +19,7 @@ export interface OpContext {
 }
 
 export class Tensor {
-  data: number;
+  readonly data: number;
   readonly type: string;
   readonly shape: number[];
   private glm: GlmOps;
@@ -46,7 +46,7 @@ export class Tensor {
   free(): void {
     if (this.data !== 0) {
       this.glm.freeBuf(this.data);
-      this.data = 0;
+      (this as { data: number }).data = 0;
     }
   }
 
@@ -70,6 +70,14 @@ export class Tensor {
 
   rmsnorm(input: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
     this.glm.rmsnorm(this.data, ptr(input), ptr(weight), eps, dim, batch);
+  }
+
+  fusedAddRmsnorm(residual: Tensor | number, inputA: Tensor | number, inputB: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
+    this.glm.fusedAddRmsnorm(this.data, ptr(residual), ptr(inputA), ptr(inputB), ptr(weight), eps, dim, batch);
+  }
+
+  fusedNormRope(input: Tensor | number, weight: Tensor | number, cos: Tensor | number, sin: Tensor | number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number): void {
+    this.glm.fusedNormRope(this.data, ptr(input), ptr(weight), ptr(cos), ptr(sin), eps, ropeDim, headDim, nHeads, seqLen, batch);
   }
 
   embedding(table: Tensor | number, ids: Tensor | number, hidden: number, seqLen: number): void {

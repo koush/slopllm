@@ -116,6 +116,161 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
 }
 
 // ---------------------------------------------------------------------------
+// Fused Add + RMSNorm kernel
+// out[i] = weight[i] * (input_a[i] + input_b[i]) * inv_rms
+// residual[i] = input_a[i] + input_b[i]
+// ---------------------------------------------------------------------------
+
+__global__ void fused_add_rmsnorm_kernel(
+    __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ input_a,
+    const __nv_bfloat16* __restrict__ input_b,
+    const __nv_bfloat16* __restrict__ weight,
+    float eps, int dim
+) {
+    int row = blockIdx.x;
+    const __nv_bfloat16* a = input_a + row * dim;
+    const __nv_bfloat16* b = input_b + row * dim;
+    __nv_bfloat16* o = out + row * dim;
+    __nv_bfloat16* r = residual + row * dim;
+
+    extern __shared__ float sdata[];
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
+        float a0, a1, b0, b1;
+        load_bf16x2(a + i, a0, a1);
+        load_bf16x2(b + i, b0, b1);
+        float s0 = a0 + b0;
+        float s1 = a1 + b1;
+        sum += s0 * s0 + s1 * s1;
+    }
+    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+        float ai = __bfloat162float(a[dim - 1]);
+        float bi = __bfloat162float(b[dim - 1]);
+        float si = ai + bi;
+        sum += si * si;
+    }
+
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    block_reduce_sum(sdata, threadIdx.x);
+
+    float inv_rms = rsqrtf(sdata[0] / dim + eps);
+
+    for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
+        float a0, a1, b0, b1, w0, w1;
+        load_bf16x2(a + i, a0, a1);
+        load_bf16x2(b + i, b0, b1);
+        load_bf16x2(weight + i, w0, w1);
+        float s0 = a0 + b0;
+        float s1 = a1 + b1;
+        store_bf16x2(r + i, s0, s1);
+        store_bf16x2(o + i, w0 * s0 * inv_rms, w1 * s1 * inv_rms);
+    }
+    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+        float ai = __bfloat162float(a[dim - 1]);
+        float bi = __bfloat162float(b[dim - 1]);
+        float wi = __bfloat162float(weight[dim - 1]);
+        float si = ai + bi;
+        r[dim - 1] = __float2bfloat16(si);
+        o[dim - 1] = __float2bfloat16(wi * si * inv_rms);
+    }
+}
+
+void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
+                            const void* input_a, const void* input_b,
+                            const void* weight, float eps, int dim, int batch) {
+    cudaSetDevice(ctx->device_id);
+    int block_size = 256;
+    if (block_size > dim) block_size = (dim + 31) / 32 * 32;
+    size_t shared_mem = block_size * sizeof(float);
+    fused_add_rmsnorm_kernel<<<batch, block_size, shared_mem, ctx->stream>>>(
+        (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
+        (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
+        (const __nv_bfloat16*)weight, eps, dim);
+}
+
+// ---------------------------------------------------------------------------
+// Fused per-head RMSNorm + RoPE kernel
+// Input: [batch * seq_len, n_heads * head_dim] (projection output, row-major)
+// Output: [batch, n_heads, seq_len, head_dim] (HND layout for attention)
+// Applies per-head RMSNorm then RoPE, with layout transpose.
+// ---------------------------------------------------------------------------
+
+__global__ void fused_norm_rope_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ in,
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ cos_emb,
+    const __nv_bfloat16* __restrict__ sin_emb,
+    float eps, int rope_dim, int head_dim,
+    int n_heads, int seq_len, int batch
+) {
+    int bhs = blockIdx.x;
+    int s = bhs % seq_len;
+    int h = (bhs / seq_len) % n_heads;
+    int b = bhs / (seq_len * n_heads);
+
+    const __nv_bfloat16* x = in + (b * seq_len + s) * n_heads * head_dim + h * head_dim;
+    __nv_bfloat16* o = out + ((b * n_heads + h) * seq_len + s) * head_dim;
+
+    extern __shared__ float sdata[];
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x * 2; i + 1 < head_dim; i += blockDim.x * 2) {
+        float x0, x1;
+        load_bf16x2(x + i, x0, x1);
+        sum += x0 * x0 + x1 * x1;
+    }
+    if ((head_dim & 1) && threadIdx.x == (head_dim / 2) % blockDim.x) {
+        float xi = __bfloat162float(x[head_dim - 1]);
+        sum += xi * xi;
+    }
+
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    block_reduce_sum(sdata, threadIdx.x);
+
+    float inv_rms = rsqrtf(sdata[0] / head_dim + eps);
+    int half = rope_dim / 2;
+    int cos_base = (b * seq_len + s) * rope_dim;
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float xi = __bfloat162float(x[i]);
+        float wi = __bfloat162float(weight[i]);
+        float ni = wi * xi * inv_rms;
+
+        if (i < rope_dim) {
+            float ci = __bfloat162float(cos_emb[cos_base + i]);
+            float si = __bfloat162float(sin_emb[cos_base + i]);
+            float ni_rot = (i < half)
+                ? -__bfloat162float(weight[i + half]) * __bfloat162float(x[i + half]) * inv_rms
+                : __bfloat162float(weight[i - half]) * __bfloat162float(x[i - half]) * inv_rms;
+            ni = ni * ci + ni_rot * si;
+        }
+        o[i] = __float2bfloat16(ni);
+    }
+}
+
+void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
+                          const void* weight, const void* cos_emb, const void* sin_emb,
+                          float eps, int rope_dim, int head_dim,
+                          int n_heads, int seq_len, int batch) {
+    cudaSetDevice(ctx->device_id);
+    int total_rows = batch * n_heads * seq_len;
+    int block_size = 256;
+    if (block_size > head_dim) block_size = (head_dim + 31) / 32 * 32;
+    size_t shared_mem = block_size * sizeof(float);
+    fused_norm_rope_kernel<<<total_rows, block_size, shared_mem, ctx->stream>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
+        (const __nv_bfloat16*)weight,
+        (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
+        eps, rope_dim, head_dim, n_heads, seq_len, batch);
+}
+
+// ---------------------------------------------------------------------------
 // SiLU + Mul kernel
 // ---------------------------------------------------------------------------
 

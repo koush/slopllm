@@ -35,6 +35,19 @@ void glm_mmap_load(GlmCtx* ctx, void* gpu_dst, const void* mmap_ptr,
 void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
                  const void* weight, float eps, int dim, int batch);
 
+void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
+                            const void* input_a, const void* input_b,
+                            const void* weight, float eps, int dim, int batch);
+
+// Fused per-head RMSNorm + RoPE with layout transpose
+// Input: [batch * seq_len, n_heads * head_dim] (projection output)
+// Output: [batch, n_heads, seq_len, head_dim] (HND layout for attention)
+// Applies per-head RMSNorm then RoPE, with [NSHD -> HNSD] transpose.
+void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
+                          const void* weight, const void* cos_emb, const void* sin_emb,
+                          float eps, int rope_dim, int head_dim,
+                          int n_heads, int seq_len, int batch);
+
 void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
                       const void* up, int intermediate, int batch);
 

@@ -1,4 +1,14 @@
 import path from "node:path";
+import fs from "node:fs";
+
+function findProjectRoot(dir: string): string {
+  let d = dir;
+  while (d !== path.dirname(d)) {
+    if (fs.existsSync(path.join(d, "package.json"))) return d;
+    d = path.dirname(d);
+  }
+  return dir;
+}
 
 interface NativeAddon {
   init(deviceId: number): number;
@@ -8,6 +18,8 @@ interface NativeAddon {
   h2d(ctx: number, dst: number, src: Buffer, size: number): void;
   d2h(ctx: number, dst: Buffer, src: number, size: number): void;
   rmsnorm(ctx: number, out: number, input: number, weight: number, eps: number, dim: number, batch: number): void;
+  fusedAddRmsnorm(ctx: number, out: number, residual: number, inputA: number, inputB: number, weight: number, eps: number, dim: number, batch: number): void;
+  fusedNormRope(ctx: number, out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number): void;
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
   linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number): void;
   embedding(ctx: number, out: number, table: number, ids: number, hidden: number, seqLen: number): void;
@@ -82,7 +94,7 @@ export class GlmOps {
   device: number;
 
   constructor(deviceId: number = 0, libPath?: string) {
-    const p = libPath ?? path.join(__dirname, "..", "..", "build", "Release", "glm.node");
+    const p = libPath ?? path.join(findProjectRoot(__dirname), "build", "Release", "glm.node");
     this.native = require(p) as NativeAddon;
     this.ctx = this.native.init(deviceId);
     if (!this.ctx) {
@@ -119,6 +131,14 @@ export class GlmOps {
 
   rmsnorm(out: number, input: number, weight: number, eps: number, dim: number, batch: number): void {
     this.native.rmsnorm(this.ctx, out, input, weight, eps, dim, batch);
+  }
+
+  fusedAddRmsnorm(out: number, residual: number, inputA: number, inputB: number, weight: number, eps: number, dim: number, batch: number): void {
+    this.native.fusedAddRmsnorm(this.ctx, out, residual, inputA, inputB, weight, eps, dim, batch);
+  }
+
+  fusedNormRope(out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number): void {
+    this.native.fusedNormRope(this.ctx, out, input, weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch);
   }
 
   siluAndMul(out: number, gate: number, up: number, intermediate: number, batch: number): void {

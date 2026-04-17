@@ -233,23 +233,12 @@ export class Qwen3Model extends ChatModelBase {
 
   private mlp(BS: number, pfx: string): void {
     const cfg = this.cfg;
-    const hs = cfg.hiddenSize;
     const inter = cfg.intermediateSize;
 
-    this.ws.gateBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.gate_proj.weight`)!, BS, inter, hs, this);
-    this.ws.upBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.up_proj.weight`)!, BS, inter, hs, this);
+    this.ws.gateBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.gate_proj.weight`)!, BS, inter, cfg.hiddenSize, this);
+    this.ws.upBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.up_proj.weight`)!, BS, inter, cfg.hiddenSize, this);
     this.ws.siluBuf.siluAndMul(this.ws.gateBuf, this.ws.upBuf, inter, BS);
-    this.ws.downBuf.linear(this.ws.siluBuf, this.weights.get(`${pfx}.mlp.down_proj.weight`)!, BS, hs, inter, this);
-    this.ws.hiddenA.add(this.ws.hiddenB, this.ws.downBuf, BS * hs);
-  }
-
-  private residualAndMlp(pfx: string, BS: number): void {
-    const cfg = this.cfg;
-    const hs = cfg.hiddenSize;
-
-    this.ws.hiddenB.add(this.ws.hiddenA, this.ws.oProjBuf, BS * hs);
-    this.ws.normed.rmsnorm(this.ws.hiddenB, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-    this.mlp(BS, pfx);
+    this.ws.downBuf.linear(this.ws.siluBuf, this.weights.get(`${pfx}.mlp.down_proj.weight`)!, BS, cfg.hiddenSize, inter, this);
   }
 
   private computeQkv(pfx: string, BS: number, B: number, S: number): void {
@@ -263,24 +252,15 @@ export class Qwen3Model extends ChatModelBase {
     this.ws.kBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.k_proj.weight`)!, BS, nKv * hd, hs, this);
     this.ws.vBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.v_proj.weight`)!, BS, nKv * hd, hs, this);
 
-    this.ws.qNormed.rmsnorm(this.ws.qBuf, this.weights.get(`${pfx}.self_attn.q_norm.weight`)!, cfg.rmsNormEps, hd, BS * nHeads);
-    this.ws.kNormed.rmsnorm(this.ws.kBuf, this.weights.get(`${pfx}.self_attn.k_norm.weight`)!, cfg.rmsNormEps, hd, BS * nKv);
-
-    this.ws.qT.transpose4d(this.ws.qNormed, B, S, nHeads, hd, 0, 2, 1, 3);
-    this.ws.kT.transpose4d(this.ws.kNormed, B, S, nKv, hd, 0, 2, 1, 3);
-    this.ws.vT.transpose4d(this.ws.vBuf, B, S, nKv, hd, 0, 2, 1, 3);
-
-    this.ws.qRope.applyRotaryPosEmb(this.ws.qT, this.ws.cos, this.ws.sin, hd, nHeads, S, B, 1);
-    this.ws.kRope.applyRotaryPosEmb(this.ws.kT, this.ws.cos, this.ws.sin, hd, nKv, S, B, 1);
+    this.ws.qRope.fusedNormRope(this.ws.qBuf, this.weights.get(`${pfx}.self_attn.q_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
+    this.ws.kRope.fusedNormRope(this.ws.kBuf, this.weights.get(`${pfx}.self_attn.k_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
+    if (S > 1) {
+      this.ws.vT.transpose4d(this.ws.vBuf, B, S, nKv, hd, 0, 2, 1, 3);
+    }
   }
 
-  private finalNormAndLogits(count: number, src?: Tensor): void {
-    const cfg = this.cfg;
-    const hs = cfg.hiddenSize;
-    const vs = cfg.vocabSize;
-
-    this.ws.normed.rmsnorm(src ?? this.ws.hiddenA, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, count);
-    this.ws.logitsBuf.linear(this.ws.normed, this.weights.get("lm_head.weight")!, count, vs, hs, this);
+  private vData(S: number): number {
+    return S === 1 ? this.ws.vBuf.data : this.ws.vT.data;
   }
 
   prefillBatchForward(state: PrefillState, ws: WorkspaceBuffers, cache: ChatCache): void {
@@ -299,15 +279,15 @@ export class Qwen3Model extends ChatModelBase {
 
     glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, 1, totalTokens);
 
+    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
-
-      this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
 
       this.computeQkv(pfx, totalTokens, 1, totalTokens);
 
       glm.kvCacheWrite(
-        this.ws.kRope.data, this.ws.vT.data,
+        this.ws.kRope.data, this.vData(totalTokens),
         pagedKV.kData[i], pagedKV.vData[i],
         this.ws.prefillSlotMapping.data,
         totalTokens, nKv, hd, pagedKV.pageSize,
@@ -332,11 +312,20 @@ export class Qwen3Model extends ChatModelBase {
       );
 
       this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, totalTokens, hs, nHeads * hd, this);
-      this.residualAndMlp(pfx, totalTokens);
-    }
 
-    this.ws.hiddenLast.indexSelect(this.ws.hiddenA, this.ws.lastIdx, hs, batchSize);
-    this.finalNormAndLogits(batchSize, this.ws.hiddenLast);
+      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, this.ws.oProjBuf, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+
+      this.mlp(totalTokens, pfx);
+
+      if (i < cfg.numHiddenLayers - 1) {
+        const nextPfx = `model.layers.${i + 1}`;
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get(`${nextPfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, totalTokens);
+      } else {
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, totalTokens);
+        this.ws.hiddenLast.indexSelect(this.ws.normed, this.ws.lastIdx, hs, batchSize);
+        this.ws.logitsBuf.linear(this.ws.hiddenLast, this.weights.get("lm_head.weight")!, batchSize, cfg.vocabSize, hs, this);
+      }
+    }
 
     this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
   }
@@ -356,15 +345,15 @@ export class Qwen3Model extends ChatModelBase {
 
     glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, batchSize, 1);
 
+    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
+
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
-
-      this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`${pfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
 
       this.computeQkv(pfx, batchSize, batchSize, 1);
 
       glm.kvCacheWrite(
-        this.ws.kRope.data, this.ws.vT.data,
+        this.ws.kRope.data, this.vData(1),
         pagedKV.kData[i], pagedKV.vData[i],
         pagedKV.slotMapping,
         batchSize, nKv, hd, pageSize,
@@ -382,10 +371,19 @@ export class Qwen3Model extends ChatModelBase {
       );
 
       this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, batchSize, hs, nHeads * hd, this);
-      this.residualAndMlp(pfx, batchSize);
-    }
 
-    this.finalNormAndLogits(batchSize);
+      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, this.ws.oProjBuf, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
+
+      this.mlp(batchSize, pfx);
+
+      if (i < cfg.numHiddenLayers - 1) {
+        const nextPfx = `model.layers.${i + 1}`;
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get(`${nextPfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, batchSize);
+      } else {
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, batchSize);
+        this.ws.logitsBuf.linear(this.ws.normed, this.weights.get("lm_head.weight")!, batchSize, cfg.vocabSize, hs, this);
+      }
+    }
 
     this.ws.argmaxIdx.argmax(this.ws.logitsBuf, cfg.vocabSize, batchSize);
   }

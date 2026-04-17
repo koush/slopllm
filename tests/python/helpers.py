@@ -507,6 +507,23 @@ class GlmOps:
             ctypes.c_float, ctypes.c_int, ctypes.c_int,
         ]
 
+        self.lib.glm_fused_add_rmsnorm.restype = None
+        self.lib.glm_fused_add_rmsnorm.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_float, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_fused_norm_rope.restype = None
+        self.lib.glm_fused_norm_rope.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_float, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
         self.lib.glm_qkv_split.restype = None
         self.lib.glm_qkv_split.argtypes = [
             ctypes.c_void_p,
@@ -1064,6 +1081,28 @@ class GlmOps:
             self._ptr(gate),
             self._ptr(weight),
             ctypes.c_float(eps), dim, batch
+        )
+
+    def fused_add_rmsnorm(self, output, residual, input_a, input_b, weight, eps, dim, batch):
+        self.lib.glm_fused_add_rmsnorm(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(residual),
+            self._ptr(input_a),
+            self._ptr(input_b),
+            self._ptr(weight),
+            ctypes.c_float(eps), dim, batch
+        )
+
+    def fused_norm_rope(self, output, input_tensor, weight, cos, sin, eps, rope_dim, head_dim, n_heads, seq_len, batch):
+        self.lib.glm_fused_norm_rope(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input_tensor),
+            self._ptr(weight),
+            self._ptr(cos),
+            self._ptr(sin),
+            ctypes.c_float(eps), rope_dim, head_dim, n_heads, seq_len, batch
         )
 
     def qkv_split(self, q_out, k_out, v_out, qkv_in, seq_len, num_heads, d_k, d_v):
