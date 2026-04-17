@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
 import { PagedKVCache, WorkspaceBuffers } from "../src/paged_kv";
+import { generateTokens } from "./test_helper";
 
 const FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const BF16_REPO = "Qwen/Qwen3-0.6B";
@@ -84,7 +85,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
     const pagedKV = makeKV(model);
     const ws = new WorkspaceBuffers(glm);
     try {
-      const tokens = [...model.streamTokens([[1, 2, 3, 4, 5]], ws, pagedKV, 10)];
+      const tokens = [...generateTokens(model, ws, pagedKV, [1, 2, 3, 4, 5], 10, model.eosIds)];
       assert.ok(tokens.length > 0, "should produce at least one token");
       for (const t of tokens) {
         assert.ok(Number.isInteger(t), `token ${t} should be an integer`);

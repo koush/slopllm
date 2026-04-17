@@ -11,11 +11,9 @@ const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
 
-interface TimingInfo {
-  prefillMs: number;
-  warmupMs: number[];
-  captureMs: number;
-  replayMs: number[];
+export interface GraphState {
+  graphExec: number | null;
+  warmupRemaining: number;
 }
 
 interface CliArgs {
@@ -31,7 +29,7 @@ interface CliArgs {
   useQwen35: boolean;
   useFp8: boolean;
   useBatch: boolean;
-  useCudaGraph: boolean;
+  noCudaGraph: boolean;
   temperature: number;
   topP: number;
   topK: number;
@@ -54,7 +52,7 @@ function parseArgs(argv: string[]): CliArgs {
     useQwen35: false,
     useFp8: false,
     useBatch: false,
-    useCudaGraph: false,
+    noCudaGraph: false,
     temperature: 0.6,
     topP: 0.95,
     topK: 0,
@@ -77,7 +75,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--qwen35") args.useQwen35 = true;
     else if (a === "--fp8") args.useFp8 = true;
     else if (a === "--batch") args.useBatch = true;
-    else if (a === "--cuda-graph") args.useCudaGraph = true;
+    else if (a === "--no-cuda-graph") args.noCudaGraph = true;
     else if (a === "--temperature" && i + 1 < argv.length) args.temperature = parseFloat(argv[++i]);
     else if (a === "--top-p" && i + 1 < argv.length) args.topP = parseFloat(argv[++i]);
     else if (a === "--top-k" && i + 1 < argv.length) args.topK = parseInt(argv[++i], 10);
@@ -97,10 +95,6 @@ function parseArgs(argv: string[]): CliArgs {
     console.error("Error: --fp8 is not supported with --qwen35");
     process.exit(1);
   }
-  if (args.useBatch && args.useCudaGraph) {
-    console.error("Error: --batch and --cuda-graph are mutually exclusive");
-    process.exit(1);
-  }
 
   if (args.useQwen35 && args.temperature > 0 && args.topP === 0.95 && args.topK === 0 && args.repetitionPenalty === 1.0 && args.presencePenalty === 0) {
     args.topK = 20;
@@ -113,15 +107,6 @@ function parseArgs(argv: string[]): CliArgs {
 function modelLabel(args: CliArgs): string {
   if (args.useQwen35) return "Qwen3.5-0.8B";
   return args.useFp8 ? "Qwen3-0.6B-FP8" : "Qwen3-0.6B";
-}
-
-function printTiming(timing: TimingInfo): void {
-  if (timing.captureMs > 0) {
-    const avg = timing.replayMs.length > 0
-      ? timing.replayMs.reduce((a, b) => a + b, 0) / timing.replayMs.length
-      : 0;
-    console.log(`  [prefill ${timing.prefillMs.toFixed(0)}ms + capture ${timing.captureMs.toFixed(0)}ms + ${timing.warmupMs.length} warmup]${avg > 0 ? ` replay avg=${avg.toFixed(2)}ms (${(1000 / avg).toFixed(0)} tok/s)` : ""}`);
-  }
 }
 
 function tokenizeMessages(
@@ -149,85 +134,109 @@ function tokenizeMessages(
   }
 }
 
-// --- CUDA Graph path ---
+// --- Generation primitives ---
 
-function generateResponseCudaGraph(
+export function* generateStream(
   model: ChatModel, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
-  inputIds: number[], graphExec: number | null,
-  maxNewTokens: number, warmupSteps: number, sp: SamplingParams | undefined,
-): { tokens: number[]; graphExec: number | null; timing: TimingInfo; matchLen: number } {
-  const timing: TimingInfo = { prefillMs: 0, warmupMs: [], captureMs: 0, replayMs: [] };
-  const generatedTokens: number[] = [];
-
+  inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
+  sampling: SamplingParams | undefined, graphState?: GraphState,
+): Generator<number> {
   const suffixIds = cache.prefixMatch(0, inputIds);
   cache.appendTokens(0, suffixIds);
-  const matchLen = inputIds.length - suffixIds.length;
 
-  const t0 = performance.now();
-  const tokens = model.prefillBatch([suffixIds], ws, cache);
-  timing.prefillMs = performance.now() - t0;
-
-  let currentToken = tokens[0];
-  generatedTokens.push(currentToken);
+  const firstTokens = model.prefillBatch([suffixIds], ws, cache);
+  let currentToken = firstTokens[0];
+  yield currentToken;
   cache.appendTokens(0, [currentToken]);
 
   const tokenHistory = [...inputIds, currentToken];
-  let warmupRemaining = graphExec === null ? warmupSteps : 0;
+  const useGraph = graphState !== undefined;
   let capturing = false;
 
-  for (let i = 1; i < maxNewTokens && !model.eosIds.has(currentToken); i++) {
-    const t = performance.now();
-    const state = model.decodeBatchPlan([currentToken], ws, cache, true);
+  for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
+    const state = model.decodeBatchPlan([currentToken], ws, cache, useGraph);
 
-    if (graphExec !== null) {
-      glm.graphLaunch(graphExec);
+    if (useGraph && graphState!.graphExec !== null) {
+      glm.graphLaunch(graphState!.graphExec);
       glm.synchronize();
     } else {
-      if (warmupRemaining === 0 && !capturing) {
+      if (useGraph && graphState!.warmupRemaining === 0 && !capturing) {
         capturing = true;
         glm.graphBeginCapture();
       }
+
       model.decodeBatchForward(state, ws, cache);
-      if (warmupRemaining === 0 && capturing) {
+
+      if (capturing) {
         const graph = glm.graphEndCapture();
         if (!graph) throw new Error("Graph capture failed");
-        graphExec = glm.graphInstantiate(graph);
-        if (!graphExec) throw new Error("Graph instantiation failed");
+        graphState!.graphExec = glm.graphInstantiate(graph);
+        if (!graphState!.graphExec) throw new Error("Graph instantiation failed");
         glm.graphDestroy(graph);
+        capturing = false;
       }
-      warmupRemaining = Math.max(0, warmupRemaining - 1);
+      if (useGraph) graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
     }
 
     currentToken = model.decodeBatchRead(state)[0];
 
-    if (capturing) {
-      timing.captureMs = performance.now() - t;
-      capturing = false;
-    } else if (graphExec !== null) {
-      timing.replayMs.push(performance.now() - t);
-    } else {
-      timing.warmupMs.push(performance.now() - t);
+    if (sampling && needsSampling(sampling)) {
+      currentToken = model.sampleTokenGPU(sampling, tokenHistory);
     }
 
-    generatedTokens.push(currentToken);
     cache.appendTokens(0, [currentToken]);
     tokenHistory.push(currentToken);
+    yield currentToken;
   }
-
-  return { tokens: generatedTokens, graphExec, timing, matchLen };
 }
 
-async function interactiveCudaGraph(
+export function generateBatchTokens(
+  model: ChatModel, ws: WorkspaceBuffers, cache: ChatCache,
+  inputIdsList: number[][], maxNewTokens: number, eosIds: Set<number>,
+): number[][] {
+  const batchSize = inputIdsList.length;
+  cache.reset(batchSize);
+  const firstTokens = model.prefillBatch(inputIdsList, ws, cache);
+
+  const nextTokens = [...firstTokens];
+  const generated: number[][] = nextTokens.map(t => [t]);
+  const finished = nextTokens.map(t => eosIds.has(t));
+
+  for (let step = 0; step < maxNewTokens - 1; step++) {
+    if (finished.every(f => f)) break;
+
+    const newTokens = model.decodeBatch(nextTokens, ws, cache);
+
+    for (let i = 0; i < batchSize; i++) {
+      nextTokens[i] = newTokens[i];
+      if (!finished[i]) {
+        if (eosIds.has(newTokens[i])) {
+          finished[i] = true;
+        } else {
+          generated[i].push(newTokens[i]);
+        }
+      }
+    }
+  }
+
+  return generated;
+}
+
+// --- Interactive / single-prompt modes ---
+
+async function interactiveChat(
   model: ChatModel, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
-  tokenizer: any, args: CliArgs,
+  tokenizer: any, args: CliArgs, graphState?: GraphState,
 ): Promise<void> {
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
+  const eosIds = model.eosIds;
   const messages: Array<{ role: string; content: string }> = [];
-  let graphExec: number | null = null;
 
-  console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  kv_persist=${args.noReset ? "on" : "off"}  |  cuda_graph=on`);
+  const graphLabel = graphState ? "cuda_graph=on" : "streaming";
+  console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  ${graphLabel}`);
   if (sp) console.log(`Sampling: ${samplingLabel(sp)}`);
-  console.log(`Graph capture: ${args.warmupSteps} warmup steps, max ${args.maxNewTokens} tokens/turn`);
+  if (graphState) console.log(`Graph capture: ${args.warmupSteps} warmup steps`);
+  console.log(`Max ${args.maxNewTokens} tokens/turn`);
   console.log("Type /quit to exit, /clear to reset conversation\n");
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -238,10 +247,10 @@ async function interactiveCudaGraph(
     while (true) {
       const userInput = (await askLine("> ")).trim();
       if (!userInput) continue;
-      if (userInput === "/quit") break;
-      if (userInput === "/clear") {
+      if (userInput.toLowerCase() === "quit" || userInput.toLowerCase() === "exit" || userInput.toLowerCase() === "/q") break;
+      if (userInput.toLowerCase() === "/clear") {
         messages.length = 0;
-        graphExec = null;
+        if (graphState) graphState.graphExec = null;
         cache.reset(1);
         console.log("Conversation cleared.\n");
         continue;
@@ -264,29 +273,27 @@ async function interactiveCudaGraph(
         }
       }
 
-      const result = generateResponseCudaGraph(
-        model, glm, ws, cache, inputIds, graphExec,
-        args.maxNewTokens, args.warmupSteps, sp,
-      );
+      process.stdout.write("Assistant: ");
+      const t0 = performance.now();
+      let tokCount = 0;
+      const generatedIds: number[] = [];
 
-      graphExec = result.graphExec;
-
-      if (result.matchLen > 0) {
-        const suffixLen = inputIds.length - result.matchLen;
-        console.log(`  [cache hit ${result.matchLen} tokens, appending ${suffixLen} new]`);
-      } else {
-        console.log("  [cache miss, full prefill]");
+      for (const tokenId of generateStream(model, glm, ws, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState)) {
+        generatedIds.push(tokenId);
+        tokCount++;
+        const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
+        process.stdout.write(chunk);
+        if (eosIds.has(tokenId)) break;
       }
 
-      const responseTokens = result.tokens.filter(t => !model.eosIds.has(t));
-      const responseText = tokenizer.decode(responseTokens, { skip_special_tokens: true });
-      process.stdout.write(responseText + "\n\n");
+      const elapsed = performance.now() - t0;
+      console.log(`\n  [${tokCount} tokens in ${(elapsed / 1000).toFixed(1)}s, ${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s]`);
 
+      const responseText = tokenizer.decode(generatedIds.filter(t => !eosIds.has(t)), { skip_special_tokens: true });
       messages.push({ role: "assistant", content: responseText });
-      printTiming(result.timing);
     }
   } finally {
-    if (graphExec !== null) glm.graphExecDestroy(graphExec);
+    if (graphState?.graphExec) glm.graphExecDestroy(graphState.graphExec);
     cache.free();
     ws.free();
     model.free();
@@ -294,47 +301,41 @@ async function interactiveCudaGraph(
   }
 }
 
-async function singlePromptCudaGraph(
+async function singlePrompt(
   model: ChatModel, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
-  tokenizer: any, args: CliArgs,
+  tokenizer: any, args: CliArgs, graphState?: GraphState,
 ): Promise<void> {
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
+  const eosIds = model.eosIds;
   const messages = [{ role: "user", content: args.prompt! }];
   const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
 
   console.log(`Prompt: ${args.prompt}`);
-  console.log(`Tokens: ${inputIds.length}`);
+  console.log(`Tokens: ${inputIds.length}${sp ? "  |  " + samplingLabel(sp) : ""}`);
 
-  cache.reset(1);
-  const result = generateResponseCudaGraph(
-    model, glm, ws, cache, inputIds, null,
-    args.maxNewTokens, args.warmupSteps, sp,
-  );
+  process.stdout.write("\n");
+  const t0 = performance.now();
+  let tokCount = 0;
+  const generatedIds: number[] = [];
 
-  const responseTokens = result.tokens.filter(t => !model.eosIds.has(t));
-  const responseText = tokenizer.decode(responseTokens, { skip_special_tokens: true });
-
-  console.log(`\nPrefill: ${result.timing.prefillMs.toFixed(1)}ms`);
-  if (result.timing.captureMs > 0) console.log(`Graph capture: ${result.timing.captureMs.toFixed(1)}ms`);
-  if (result.timing.warmupMs.length > 0) {
-    const avg = result.timing.warmupMs.reduce((a, b) => a + b, 0) / result.timing.warmupMs.length;
-    console.log(`Warmup decode: ${avg.toFixed(2)}ms avg (${result.timing.warmupMs.length} steps)`);
+  for (const tokenId of generateStream(model, glm, ws, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState)) {
+    generatedIds.push(tokenId);
+    tokCount++;
+    const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
+    process.stdout.write(chunk);
+    if (eosIds.has(tokenId)) break;
   }
-  if (result.timing.replayMs.length > 0) {
-    const avg = result.timing.replayMs.reduce((a, b) => a + b, 0) / result.timing.replayMs.length;
-    const sorted = [...result.timing.replayMs].sort((a, b) => a - b);
-    const p50 = sorted[Math.floor(sorted.length / 2)];
-    console.log(`Graph replay: avg=${avg.toFixed(2)}ms  p50=${p50.toFixed(2)}ms  min=${Math.min(...result.timing.replayMs).toFixed(2)}ms  max=${Math.max(...result.timing.replayMs).toFixed(2)}ms  (${result.timing.replayMs.length} steps, ${Math.round(1000 / avg)} tok/s)`);
-  }
-  console.log(`\nResponse: ${responseText}`);
 
-  if (result.graphExec !== null) glm.graphExecDestroy(result.graphExec);
+  const elapsed = performance.now() - t0;
+  console.log(`\n\n${tokCount} tokens in ${elapsed.toFixed(1)}ms (${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s)`);
+
+  if (graphState?.graphExec) glm.graphExecDestroy(graphState.graphExec);
   cache.free();
   ws.free();
   model.free();
 }
 
-// --- Batch path ---
+// --- Batch mode ---
 
 async function interactiveBatch(
   model: ChatModel, cache: ChatCache, ws: WorkspaceBuffers,
@@ -385,9 +386,9 @@ async function interactiveBatch(
       }
 
       const start = Date.now();
-      const generatedIds = model.generateBatch(inputIdsList, ws, cache, args.maxNewTokens, model.eosIds);
+      const generatedIds = generateBatchTokens(model, ws, cache, inputIdsList, args.maxNewTokens, model.eosIds);
       const elapsed = (Date.now() - start) / 1000;
-      const totalTokens = generatedIds.reduce((sum, ids) => sum + ids.length, 0);
+      const totalTokens = generatedIds.reduce((sum: number, ids: number[]) => sum + ids.length, 0);
 
       for (let i = 0; i < prompts.length; i++) {
         const text = tokenizer.decode(generatedIds[i], { skip_special_tokens: true });
@@ -405,134 +406,7 @@ async function interactiveBatch(
   }
 }
 
-// --- Stream path ---
-
-interface StreamArgs {
-  maxSeqLen: number;
-  maxNewTokens: number;
-  thinking: boolean;
-  temperature: number;
-  topP: number;
-  topK: number;
-  repetitionPenalty: number;
-  presencePenalty: number;
-  repetitionPenaltyWindow: number;
-}
-
-async function interactiveStream(
-  model: ChatModel, cache: ChatCache, ws: WorkspaceBuffers,
-  tokenizer: any, args: StreamArgs,
-): Promise<void> {
-  const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
-  const eosIds = model.eosIds;
-  const messages: Array<{ role: string; content: string }> = [];
-
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const askLine = (prompt: string): Promise<string> =>
-    new Promise((resolve) => rl.question(prompt, resolve));
-
-  try {
-    while (true) {
-      const userInput = (await askLine("> ")).trim();
-      if (!userInput) continue;
-      if (userInput.toLowerCase() === "quit" || userInput.toLowerCase() === "exit" || userInput.toLowerCase() === "/q") break;
-      if (userInput.toLowerCase() === "/clear") {
-        messages.length = 0;
-        cache.reset(1);
-        console.log("Conversation cleared.\n");
-        continue;
-      }
-
-      messages.push({ role: "user", content: userInput });
-      const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
-
-      if (inputIds.length > args.maxSeqLen - args.maxNewTokens) {
-        console.log(`Warning: prompt (${inputIds.length} tokens) too long, truncating conversation`);
-        while (inputIds.length > args.maxSeqLen - args.maxNewTokens && messages.length > 1) {
-          messages.splice(1, 2);
-          const retryIds = tokenizeMessages(tokenizer, messages, args.thinking);
-          if (retryIds.length <= args.maxSeqLen - args.maxNewTokens) break;
-        }
-        if (messages.length === 1 && tokenizeMessages(tokenizer, messages, args.thinking).length > args.maxSeqLen - args.maxNewTokens) {
-          console.log("Conversation too long even after truncation. Use /clear to reset.");
-          messages.pop();
-          continue;
-        }
-      }
-
-      process.stdout.write("Assistant: ");
-      const t0 = performance.now();
-      let tokCount = 0;
-      const generatedIds: number[] = [];
-
-      for (const tokenId of model.chatStream([inputIds], cache, ws, args.maxNewTokens, eosIds, sp)) {
-        generatedIds.push(tokenId);
-        tokCount++;
-        const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
-        process.stdout.write(chunk);
-        if (eosIds.has(tokenId)) break;
-      }
-
-      const elapsed = performance.now() - t0;
-      console.log(`\n  [${tokCount} tokens, ${(elapsed / 1000).toFixed(1)}s, ${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s]`);
-
-      const responseText = tokenizer.decode(generatedIds.filter(t => !eosIds.has(t)), { skip_special_tokens: true });
-      messages.push({ role: "assistant", content: responseText });
-    }
-  } finally {
-    cache.free();
-    ws.free();
-    model.free();
-    rl.close();
-  }
-}
-
-async function singlePromptStream(
-  model: ChatModel, cache: ChatCache, ws: WorkspaceBuffers,
-  tokenizer: any, args: StreamArgs & { prompt: string },
-): Promise<void> {
-  const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
-  const eosIds = model.eosIds;
-  const messages = [{ role: "user", content: args.prompt }];
-  const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
-
-  console.log(`Prompt: ${args.prompt}`);
-  console.log(`Tokens: ${inputIds.length}${sp ? "  |  " + samplingLabel(sp) : ""}`);
-
-  process.stdout.write("\n");
-  const t0 = performance.now();
-  let tokCount = 0;
-  const generatedIds: number[] = [];
-
-  for (const tokenId of model.chatStream([inputIds], cache, ws, args.maxNewTokens, eosIds, sp)) {
-    generatedIds.push(tokenId);
-    tokCount++;
-    const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
-    process.stdout.write(chunk);
-    if (eosIds.has(tokenId)) break;
-  }
-
-  const elapsed = performance.now() - t0;
-  console.log(`\n\n${tokCount} tokens in ${elapsed.toFixed(1)}ms (${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s)`);
-
-  cache.free();
-  ws.free();
-  model.free();
-}
-
-function streamArgs(args: CliArgs): StreamArgs {
-  return {
-    maxSeqLen: args.maxSeqLen,
-    maxNewTokens: args.maxNewTokens,
-    thinking: args.thinking,
-    temperature: args.temperature,
-    topP: args.topP,
-    topK: args.topK,
-    repetitionPenalty: args.repetitionPenalty,
-    presencePenalty: args.presencePenalty,
-    repetitionPenaltyWindow: args.repetitionPenaltyWindow,
-  };
-}
+// --- Main ---
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
@@ -556,22 +430,13 @@ async function main(): Promise<void> {
 
   if (args.useBatch) {
     await interactiveBatch(model, cache, ws, tokenizer, args);
-  } else if (args.useCudaGraph) {
-    if (args.prompt) {
-      await singlePromptCudaGraph(model, glm, ws, cache, tokenizer, args);
-    } else {
-      await interactiveCudaGraph(model, glm, ws, cache, tokenizer, args);
-    }
   } else {
-    const sp = makeSamplingParams(args);
-    console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  streaming`);
-    console.log(`Max ${args.maxNewTokens} tokens/turn  |  ${samplingLabel(sp)}`);
+    const graphState = args.noCudaGraph ? undefined : { graphExec: null as number | null, warmupRemaining: args.warmupSteps };
 
     if (args.prompt) {
-      await singlePromptStream(model, cache, ws, tokenizer, { ...streamArgs(args), prompt: args.prompt });
+      await singlePrompt(model, glm, ws, cache, tokenizer, args, graphState);
     } else {
-      console.log("Type a message to chat. /clear to reset, /quit to exit.\n");
-      await interactiveStream(model, cache, ws, tokenizer, streamArgs(args));
+      await interactiveChat(model, glm, ws, cache, tokenizer, args, graphState);
     }
   }
 }

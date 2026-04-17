@@ -5,6 +5,7 @@ import { Qwen3Model } from "../src/qwen3_model";
 import { PagedKVCache, WorkspaceBuffers } from "../src/paged_kv";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "../src/model_path";
+import { generateBatchTokens } from "./test_helper";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const EOS_TOKEN_IDS = new Set([151645, 151643]);
@@ -47,7 +48,7 @@ describe("Qwen3-0.6B batch smoke test", () => {
 
   it("2 identical 'hi' prompts produce responses containing 'hello' and 'assist'", () => {
     const promptIds = tokenizePrompt(tokenizer, "hi");
-    const generated = model.generateBatch([promptIds, promptIds], ws, cache, 128, EOS_TOKEN_IDS);
+    const generated = generateBatchTokens(model, ws, cache, [promptIds, promptIds], 128, EOS_TOKEN_IDS);
 
     assert.equal(generated.length, 2);
 

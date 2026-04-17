@@ -32,20 +32,13 @@ export interface PrefillState {
 export interface ChatModel {
   readonly eosIds: Set<number>;
   createChatCache(maxPages?: number): ChatCache;
-  chatStream(
-    inputIds: number[][],
-    cache: ChatCache,
-    ws: WorkspaceBuffers,
-    maxNewTokens: number,
-    eosIds?: Set<number>,
-    sampling?: SamplingParams,
-  ): Generator<number>;
   prefillBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): number[];
   prefillBatchPlan(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache): PrefillState;
   decodeBatchPlan(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache, enableCudaGraph?: boolean): DecodeState;
   decodeBatchForward(state: DecodeState, ws: WorkspaceBuffers, cache: ChatCache): void;
   decodeBatchRead(state: DecodeState): number[];
-  generateBatch(inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache, maxNewTokens?: number, eosTokenIds?: Set<number>): number[][];
+  decodeBatch(tokenIdsList: number[], ws: WorkspaceBuffers, cache: ChatCache): number[];
+  sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number;
   free(): void;
 }
 
@@ -181,81 +174,6 @@ export abstract class ChatModelBase implements ChatModel {
     return { batchSize, totalTokens, seqLens, pageAllocs };
   }
 
-  *chatStream(
-    inputIds: number[][], cache: ChatCache, ws: WorkspaceBuffers,
-    maxNewTokens = 100, eosIds?: Set<number>, sampling?: SamplingParams,
-  ): Generator<number> {
-    yield* this.streamTokens(inputIds, ws, cache, maxNewTokens, eosIds ?? this.eosIds, sampling);
-  }
-
-  *streamTokens(
-    inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache,
-    maxNewTokens = 100, eosTokenIds?: Set<number>, sampling?: SamplingParams,
-  ): Generator<number> {
-    if (inputIds.length !== 1) throw new Error("streamTokens only supports batch=1");
-    const effectiveEosIds = eosTokenIds ?? this.eosIds;
-    cache.reset(1);
-    const firstTokens = this.prefillBatch(inputIds, ws, cache);
-    let nextToken = firstTokens[0];
-    yield nextToken;
-
-    const tokenHistory = [...inputIds[0], nextToken];
-
-    for (let i = 0; i < maxNewTokens - 1; i++) {
-      if (effectiveEosIds.has(nextToken)) break;
-
-      const decodeTokens = this.decodeBatch([nextToken], ws, cache);
-      nextToken = decodeTokens[0];
-
-      if (sampling && needsSampling(sampling)) {
-        nextToken = this.sampleTokenGPU(sampling, tokenHistory);
-      }
-
-      tokenHistory.push(nextToken);
-      yield nextToken;
-    }
-  }
-
-  generateTokens(
-    inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache,
-    maxNewTokens = 100, eosTokenIds?: Set<number>, sampling?: SamplingParams,
-  ): number[] {
-    return [...this.streamTokens(inputIds, ws, cache, maxNewTokens, eosTokenIds, sampling)];
-  }
-
-  generateBatch(
-    inputIdsList: number[][], ws: WorkspaceBuffers, cache: ChatCache,
-    maxNewTokens = 100, eosTokenIds?: Set<number>,
-  ): number[][] {
-    eosTokenIds = eosTokenIds ?? this.eosIds;
-    const batchSize = inputIdsList.length;
-    cache.reset(batchSize);
-    const firstTokens = this.prefillBatch(inputIdsList, ws, cache);
-
-    const nextTokens = [...firstTokens];
-    const generated: number[][] = nextTokens.map(t => [t]);
-    const finished = nextTokens.map(t => eosTokenIds.has(t));
-
-    for (let step = 0; step < maxNewTokens - 1; step++) {
-      if (finished.every(f => f)) break;
-
-      const newTokens = this.decodeBatch(nextTokens, ws, cache);
-
-      for (let i = 0; i < batchSize; i++) {
-        nextTokens[i] = newTokens[i];
-        if (!finished[i]) {
-          if (eosTokenIds.has(newTokens[i])) {
-            finished[i] = true;
-          } else {
-            generated[i].push(newTokens[i]);
-          }
-        }
-      }
-    }
-
-    return generated;
-  }
-
   prefill(inputIds: number[][], ws: WorkspaceBuffers, cache: ChatCache): number {
     return this.prefillBatch(inputIds, ws, cache)[0];
   }
@@ -358,7 +276,7 @@ export abstract class ChatModelBase implements ChatModel {
     return result;
   }
 
-  protected sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number {
+  sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number {
     const vs = this.cfg.vocabSize;
     const glm = this.glm;
 

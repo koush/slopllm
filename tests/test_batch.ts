@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { GlmOps } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
 import { PagedKVCache, WorkspaceBuffers } from "../src/paged_kv";
+import { generateBatchTokens, generateTokens } from "./test_helper";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const PROMPT1 = [151643, 151644, 151645, 1, 2, 3];
@@ -195,19 +196,19 @@ describe("Qwen3-0.6B batch tests", () => {
     const singleKV = makePagedKV(1, 256);
     const maxNewTokens = 20;
     try {
-      const batchGenerated = model.generateBatch([PROMPT_LONG1, PROMPT_LONG2], ws, pagedKV, maxNewTokens);
+      const batchGenerated = generateBatchTokens(model, ws, pagedKV, [PROMPT_LONG1, PROMPT_LONG2], maxNewTokens, EOS_TOKEN_IDS);
 
       singleKV.reset(1);
-      const single1 = model.generateTokens([PROMPT_LONG1], ws, singleKV, maxNewTokens);
+      const single1 = [...generateTokens(model, ws, singleKV, PROMPT_LONG1, maxNewTokens, EOS_TOKEN_IDS)];
 
       singleKV.reset(1);
-      const single2 = model.generateTokens([PROMPT_LONG2], ws, singleKV, maxNewTokens);
+      const single2 = [...generateTokens(model, ws, singleKV, PROMPT_LONG2, maxNewTokens, EOS_TOKEN_IDS)];
 
       assert.ok(batchGenerated[0].length > 0, "Seq1 generated no tokens");
       assert.ok(batchGenerated[1].length > 0, "Seq2 generated no tokens");
 
-      const match1 = batchGenerated[0].slice(0, 3).every((t, i) => t === single1[i]);
-      const match2 = batchGenerated[1].slice(0, 3).every((t, i) => t === single2[i]);
+      const match1 = batchGenerated[0].slice(0, 3).every((t: number, i: number) => t === single1[i]);
+      const match2 = batchGenerated[1].slice(0, 3).every((t: number, i: number) => t === single2[i]);
 
       assert.ok(match1,
         `Seq1 first 3 tokens mismatch: batch=${batchGenerated[0].slice(0, 3)}, single=${single1.slice(0, 3)}`);
