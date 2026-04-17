@@ -232,11 +232,6 @@ async function interactiveChat(
   const eosIds = model.eosIds;
   const messages: Array<{ role: string; content: string }> = [];
 
-  const graphLabel = graphState ? "cuda_graph=on" : "streaming";
-  console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  ${graphLabel}`);
-  if (sp) console.log(`Sampling: ${samplingLabel(sp)}`);
-  if (graphState) console.log(`Graph capture: ${args.warmupSteps} warmup steps`);
-  console.log(`Max ${args.maxNewTokens} tokens/turn`);
   console.log("Type /quit to exit, /clear to reset conversation\n");
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -311,7 +306,7 @@ async function singlePrompt(
   const inputIds = tokenizeMessages(tokenizer, messages, args.thinking);
 
   console.log(`Prompt: ${args.prompt}`);
-  console.log(`Tokens: ${inputIds.length}${sp ? "  |  " + samplingLabel(sp) : ""}`);
+  console.log(`Tokens: ${inputIds.length}`);
 
   process.stdout.write("\n");
   const t0 = performance.now();
@@ -341,7 +336,6 @@ async function interactiveBatch(
   model: ChatModel, cache: ChatCache, ws: WorkspaceBuffers,
   tokenizer: any, args: CliArgs,
 ): Promise<void> {
-  console.log(`${modelLabel(args)} batch  |  GPU ${args.gpu}  |  max_batch=${args.maxBatch}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}`);
   console.log("Enter prompts one per line. Empty line to submit batch. /clear to reset, /q to quit.");
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -427,6 +421,17 @@ async function main(): Promise<void> {
 
   const modelDir = resolveModelPath(repoId);
   const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
+
+  const sp = makeSamplingParams(args);
+  const samplingParts: string[] = [];
+  if (sp.temperature > 0) samplingParts.push(`temp=${sp.temperature}`);
+  if (sp.topP < 1.0) samplingParts.push(`top_p=${sp.topP}`);
+  if (sp.topK > 0) samplingParts.push(`top_k=${sp.topK}`);
+  if (sp.repetitionPenalty !== 1.0) samplingParts.push(`rep_pen=${sp.repetitionPenalty}`);
+  if (sp.presencePenalty !== 0) samplingParts.push(`pres_pen=${sp.presencePenalty}`);
+  const samplingStr = samplingParts.length > 0 ? samplingParts.join(" ") : "greedy";
+
+  console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}${args.thinking ? "  |  thinking" : ""}`);
 
   if (args.useBatch) {
     await interactiveBatch(model, cache, ws, tokenizer, args);
