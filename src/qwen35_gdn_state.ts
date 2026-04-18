@@ -7,7 +7,6 @@ export class Qwen35GdnState extends WorkspaceBase {
   convState: Tensor[];
   recurrentState: Tensor[];
   cuSeqlens: Tensor;
-  private glm: GlmOps;
   private cfg: Qwen35Config;
   readonly batchSize: number;
 
@@ -17,8 +16,7 @@ export class Qwen35GdnState extends WorkspaceBase {
   readonly recurrentStateStride: number;
 
   constructor(glm: GlmOps, cfg: Qwen35Config, batchSize = 1) {
-    super();
-    this.glm = glm;
+    super(glm);
     this.cfg = cfg;
     this.batchSize = batchSize;
     const linHeads = cfg.linearNumKeyHeads;
@@ -34,14 +32,14 @@ export class Qwen35GdnState extends WorkspaceBase {
     this.recurrentState = [];
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       if (cfg.layerTypes[i] === "linear_attention") {
-        this.convState.push(this.alloc(glm, [batchSize * this.convStateSize], "BF16"));
-        this.recurrentState.push(this.alloc(glm, [batchSize * this.recurrentStateSize], "F32"));
+        this.convState.push(this.alloc([batchSize * this.convStateSize], "BF16"));
+        this.recurrentState.push(this.alloc([batchSize * this.recurrentStateSize], "F32"));
       } else {
         this.convState.push(null!);
         this.recurrentState.push(null!);
       }
     }
-    this.cuSeqlens = this.alloc(glm, [batchSize + 1], "I32", "cuSeqlens");
+    this.cuSeqlens = this.alloc([batchSize + 1], "I32", "cuSeqlens");
     this.zeroStates();
   }
 

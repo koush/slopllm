@@ -82,37 +82,36 @@ class Qwen3Workspace extends SamplingWorkspaceBase {
     const inter = cfg.intermediateSize;
     const BS = B * S;
 
-    this.hiddenA = this.alloc(glm, [B, S, hs], "BF16", "hiddenA");
-    this.hiddenB = this.alloc(glm, [B, S, hs], "BF16", "hiddenB");
-    this.normed = this.alloc(glm, [B, S, hs], "BF16", "normed");
-    this.qBuf = this.alloc(glm, [B, S, nHeads * hd], "BF16", "qBuf");
-    this.kBuf = this.alloc(glm, [B, S, nKv * hd], "BF16", "kBuf");
-    this.vBuf = this.alloc(glm, [B, S, nKv * hd], "BF16", "vBuf");
-    this.vT = this.alloc(glm, [B, nKv, S, hd], "BF16", "vT");
-    this.qRope = this.alloc(glm, [B, nHeads, S, hd], "BF16", "qRope");
-    this.kRope = this.alloc(glm, [B, nKv, S, hd], "BF16", "kRope");
-    this.oProjBuf = this.alloc(glm, [B, S, hs], "BF16", "oProjBuf");
-    this.gateBuf = this.alloc(glm, [B, S, inter], "BF16", "gateBuf");
-    this.upBuf = this.alloc(glm, [B, S, inter], "BF16", "upBuf");
-    this.siluBuf = this.alloc(glm, [B, S, inter], "BF16", "siluBuf");
-    this.downBuf = this.alloc(glm, [B, S, hs], "BF16", "downBuf");
-    this.cos = this.alloc(glm, [B, S, hd], "BF16", "cos");
-    this.sin = this.alloc(glm, [B, S, hd], "BF16", "sin");
-    this.positionIds = this.alloc(glm, [B * S], "I32", "positionIds");
-    this.logitsBuf = this.alloc(glm, [B, cfg.vocabSize], "BF16", "logitsBuf");
-    this.hiddenLast = this.alloc(glm, [B, hs], "BF16", "hiddenLast");
-    this.lastIdx = this.alloc(glm, [B], "I32", "lastIdx");
-    this.argmaxIdx = this.alloc(glm, [B], "I32", "argmaxIdx");
-    this.flashOut = this.alloc(glm, [B, nHeads, S, hd], "BF16", "flashOut");
-    this.inputIdsBuf = this.alloc(glm, [B * S], "I32", "inputIdsBuf");
-    this.qoIndptrD = this.alloc(glm, [B + 1], "I32", "qoIndptrD");
-    this.prefillSlotMapping = this.alloc(glm, [B * S], "I32", "prefillSlotMapping");
+    this.hiddenA = this.alloc([B, S, hs], "BF16", "hiddenA");
+    this.hiddenB = this.alloc([B, S, hs], "BF16", "hiddenB");
+    this.normed = this.alloc([B, S, hs], "BF16", "normed");
+    this.qBuf = this.alloc([B, S, nHeads * hd], "BF16", "qBuf");
+    this.kBuf = this.alloc([B, S, nKv * hd], "BF16", "kBuf");
+    this.vBuf = this.alloc([B, S, nKv * hd], "BF16", "vBuf");
+    this.vT = this.alloc([B, nKv, S, hd], "BF16", "vT");
+    this.qRope = this.alloc([B, nHeads, S, hd], "BF16", "qRope");
+    this.kRope = this.alloc([B, nKv, S, hd], "BF16", "kRope");
+    this.oProjBuf = this.alloc([B, S, hs], "BF16", "oProjBuf");
+    this.gateBuf = this.alloc([B, S, inter], "BF16", "gateBuf");
+    this.upBuf = this.alloc([B, S, inter], "BF16", "upBuf");
+    this.siluBuf = this.alloc([B, S, inter], "BF16", "siluBuf");
+    this.downBuf = this.alloc([B, S, hs], "BF16", "downBuf");
+    this.cos = this.alloc([B, S, hd], "BF16", "cos");
+    this.sin = this.alloc([B, S, hd], "BF16", "sin");
+    this.positionIds = this.alloc([B * S], "I32", "positionIds");
+    this.logitsBuf = this.alloc([B, cfg.vocabSize], "BF16", "logitsBuf");
+    this.hiddenLast = this.alloc([B, hs], "BF16", "hiddenLast");
+    this.lastIdx = this.alloc([B], "I32", "lastIdx");
+    this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
+    this.flashOut = this.alloc([B, nHeads, S, hd], "BF16", "flashOut");
+    this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
+    this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
+    this.prefillSlotMapping = this.alloc([B * S], "I32", "prefillSlotMapping");
   }
 }
 
 export class Qwen3Model extends ChatModelBase {
   readonly eosIds = new Set([151645, 151643]);
-  declare glm: GlmOps;
   cfg: Qwen3Config;
   maxBatch: number;
   maxSeqLen: number;
@@ -120,8 +119,7 @@ export class Qwen3Model extends ChatModelBase {
   declare ws: Qwen3Workspace;
 
   private constructor(glm: GlmOps, config: Qwen3Config, maxBatch: number, maxSeqLen: number) {
-    super();
-    this.glm = glm;
+    super(glm);
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
@@ -131,7 +129,7 @@ export class Qwen3Model extends ChatModelBase {
     for (let i = 0; i < halfDim; i++) {
       invFreqF32[i] = 1.0 / Math.pow(config.ropeTheta, (2 * i) / config.headDim);
     }
-    this.invFreq = this.alloc(glm, [halfDim], "BF16", "invFreq");
+    this.invFreq = this.alloc([halfDim], "BF16", "invFreq");
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
 
     this.ws = new Qwen3Workspace(glm, maxBatch, maxSeqLen, config);
@@ -154,10 +152,10 @@ export class Qwen3Model extends ChatModelBase {
         const bf16Bytes = st.readTensor(name);
         const f32Array = bf16BytesToF32(bf16Bytes);
         const f32Buffer = Buffer.from(f32Array.buffer, f32Array.byteOffset, f32Array.byteLength);
-        const tensor = model.alloc(glm, meta.shape, "F32", name);
+        const tensor = model.alloc(meta.shape, "F32", name);
         tensor.h2d(f32Buffer);
       } else {
-        const tensor = model.alloc(glm, meta.shape, meta.dtype, name);
+        const tensor = model.alloc(meta.shape, meta.dtype, name);
         const offset = st.dataStart + meta.dataOffsets[0];
         glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
       }

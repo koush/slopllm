@@ -1,6 +1,6 @@
 import { GlmOps, I32, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, SAMPLING_MAX_TOPK, SAMPLING_BLOCK_SIZE } from "./glm_ops";
 import { PagedKVCache, DECODE_PLAN_INFO_SIZE, PREFILL_PLAN_INFO_SIZE } from "./paged_kv";
-import { Tensor } from "./tensor";
+import { Tensor, type TensorWorkspace } from "./tensor";
 
 export interface SamplingParams {
   temperature: number;
@@ -76,27 +76,67 @@ export interface CommonModelWorkspace {
   sampleRandomVals: Tensor;
 }
 
-export abstract class WorkspaceBase {
+export abstract class WorkspaceBase implements TensorWorkspace {
+  readonly glm: GlmOps;
   tensors = new Map<string, Tensor>();
   tracked = new Set<Tensor>();
+  disposed = new Set<Tensor>();
 
-  alloc(glm: GlmOps, shape: number[], type: string, name?: string): Tensor {
-    const tensor = Tensor.alloc(glm, shape, type, name);
+  constructor(glm: GlmOps) {
+    this.glm = glm;
+  }
+
+  alloc(shape: number[], type: string, name?: string): Tensor {
+    const bytes = Tensor.byteCount(shape, type);
+
     if (name !== undefined) {
+      const data = this.glm.alloc(bytes);
+      const tensor = new Tensor(this, data, bytes, shape, type, name, false);
       this.tensors.set(name, tensor);
-    } else {
-      this.tracked.add(tensor);
+      return tensor;
     }
+
+    for (const t of this.disposed) {
+      if (!t.pinned && t.allocSize >= bytes) {
+        this.disposed.delete(t);
+        const data = t.data;
+        (t as { data: number }).data = 0;
+        const tensor = new Tensor(this, data, t.allocSize, shape, type, undefined, false);
+        this.tracked.add(tensor);
+        return tensor;
+      }
+    }
+
+    const data = this.glm.alloc(bytes);
+    const tensor = new Tensor(this, data, bytes, shape, type, undefined, false);
+    this.tracked.add(tensor);
     return tensor;
   }
 
-  allocPinned(glm: GlmOps, shape: number[], type: string, name?: string): Tensor {
-    const tensor = Tensor.allocPinned(glm, shape, type, name);
+  allocPinned(shape: number[], type: string, name?: string): Tensor {
+    const bytes = Tensor.byteCount(shape, type);
+
     if (name !== undefined) {
+      const data = this.glm.allocPinned(bytes);
+      const tensor = new Tensor(this, data, bytes, shape, type, name, true);
       this.tensors.set(name, tensor);
-    } else {
-      this.tracked.add(tensor);
+      return tensor;
     }
+
+    for (const t of this.disposed) {
+      if (t.pinned && t.allocSize >= bytes) {
+        this.disposed.delete(t);
+        const data = t.data;
+        (t as { data: number }).data = 0;
+        const tensor = new Tensor(this, data, t.allocSize, shape, type, undefined, true);
+        this.tracked.add(tensor);
+        return tensor;
+      }
+    }
+
+    const data = this.glm.allocPinned(bytes);
+    const tensor = new Tensor(this, data, bytes, shape, type, undefined, true);
+    this.tracked.add(tensor);
     return tensor;
   }
 
@@ -107,8 +147,12 @@ export abstract class WorkspaceBase {
     for (const tensor of this.tracked) {
       tensor.free();
     }
+    for (const tensor of this.disposed) {
+      tensor.free();
+    }
     this.tensors.clear();
     this.tracked.clear();
+    this.disposed.clear();
   }
 }
 
@@ -139,34 +183,37 @@ export abstract class SamplingWorkspaceBase extends WorkspaceBase implements Com
   sampleRandomVals: Tensor;
 
   constructor(glm: GlmOps, B: number, vs: number) {
-    super();
+    super(glm);
 
-    this.floatWs = this.alloc(glm, [BATCH_FLOAT_WS_SIZE], "U8", "floatWs");
-    this.intWs = this.alloc(glm, [BATCH_INT_WS_SIZE], "U8", "intWs");
-    this.pinnedIntWs = this.allocPinned(glm, [BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
-    this.decodePlanInfo = this.allocPinned(glm, [DECODE_PLAN_INFO_SIZE * 8], "U8", "decodePlanInfo");
-    this.prefillPlanInfo = this.allocPinned(glm, [PREFILL_PLAN_INFO_SIZE * 8], "U8", "prefillPlanInfo");
+    this.floatWs = this.alloc([BATCH_FLOAT_WS_SIZE], "U8", "floatWs");
+    this.intWs = this.alloc([BATCH_INT_WS_SIZE], "U8", "intWs");
+    this.pinnedIntWs = this.allocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
+    this.decodePlanInfo = this.allocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", "decodePlanInfo");
+    this.prefillPlanInfo = this.allocPinned([PREFILL_PLAN_INFO_SIZE * 8], "U8", "prefillPlanInfo");
 
-    this.sampleOutToken = this.alloc(glm, [B], "I32", "sampleOutToken");
-    this.sampleTopkVals = this.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32", "sampleTopkVals");
-    this.sampleTopkIdxs = this.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32", "sampleTopkIdxs");
-    this.sampleWorkspace = this.alloc(glm, [B * vs], "F32", "sampleWorkspace");
-    this.samplePenaltyTokens = this.alloc(glm, [B * 1024], "I32", "samplePenaltyTokens");
-    this.samplePenaltyOffsets = this.alloc(glm, [B + 1], "I32", "samplePenaltyOffsets");
-    this.sampleTemperatures = this.alloc(glm, [B], "F32", "sampleTemperatures");
-    this.sampleRepPenalties = this.alloc(glm, [B], "F32", "sampleRepPenalties");
-    this.samplePresPenalties = this.alloc(glm, [B], "F32", "samplePresPenalties");
-    this.sampleTopKs = this.alloc(glm, [B], "I32", "sampleTopKs");
-    this.sampleTopPs = this.alloc(glm, [B], "F32", "sampleTopPs");
-    this.sampleRandomVals = this.alloc(glm, [B], "F32", "sampleRandomVals");
+    this.sampleOutToken = this.alloc([B], "I32", "sampleOutToken");
+    this.sampleTopkVals = this.alloc([B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32", "sampleTopkVals");
+    this.sampleTopkIdxs = this.alloc([B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32", "sampleTopkIdxs");
+    this.sampleWorkspace = this.alloc([B * vs], "F32", "sampleWorkspace");
+    this.samplePenaltyTokens = this.alloc([B * 1024], "I32", "samplePenaltyTokens");
+    this.samplePenaltyOffsets = this.alloc([B + 1], "I32", "samplePenaltyOffsets");
+    this.sampleTemperatures = this.alloc([B], "F32", "sampleTemperatures");
+    this.sampleRepPenalties = this.alloc([B], "F32", "sampleRepPenalties");
+    this.samplePresPenalties = this.alloc([B], "F32", "samplePresPenalties");
+    this.sampleTopKs = this.alloc([B], "I32", "sampleTopKs");
+    this.sampleTopPs = this.alloc([B], "F32", "sampleTopPs");
+    this.sampleRandomVals = this.alloc([B], "F32", "sampleRandomVals");
   }
 }
 
 export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
   abstract readonly eosIds: Set<number>;
-  protected abstract readonly glm: GlmOps;
   protected abstract readonly cfg: CommonModelConfig;
   protected abstract readonly ws: CommonModelWorkspace;
+
+  protected constructor(glm: GlmOps) {
+    super(glm);
+  }
 
   abstract createChatCache(maxPages?: number): ChatCache;
 

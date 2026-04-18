@@ -19,7 +19,6 @@ function longestPrefix(a: number[], b: number[]): number {
 }
 
 export class PagedKVCache extends WorkspaceBase implements ChatCache {
-  private glm: GlmOps;
   readonly nKv: number;
   readonly hd: number;
   readonly nLayers: number;
@@ -41,8 +40,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   cachedTokenIds: number[][];
 
   constructor(glm: GlmOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE) {
-    super();
-    this.glm = glm;
+    super(glm);
     this.nKv = nKv;
     this.hd = hd;
     this.nLayers = nLayers;
@@ -52,16 +50,16 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.kData = [];
     this.vData = [];
     for (let i = 0; i < nLayers; i++) {
-      this.kData.push(this.alloc(glm, [maxPages * nKv * pageSize * hd * BF16], "U8"));
-      this.vData.push(this.alloc(glm, [maxPages * nKv * pageSize * hd * BF16], "U8"));
+      this.kData.push(this.alloc([maxPages * nKv * pageSize * hd * BF16], "U8"));
+      this.vData.push(this.alloc([maxPages * nKv * pageSize * hd * BF16], "U8"));
     }
-    this.indices = this.alloc(glm, [maxPages * I32], "I32", "indices");
-    this.indptrD = this.alloc(glm, [(maxBatch + 1) * I32], "I32", "indptrD");
-    this.lastPageLen = this.alloc(glm, [maxBatch * I32], "I32", "lastPageLen");
-    this.indptrH = this.allocPinned(glm, [(maxBatch + 1) * I32], "I32", "indptrH");
-    this.lastPageLenH = this.allocPinned(glm, [maxBatch * I32], "I32", "lastPageLenH");
-    this.slotMapping = this.alloc(glm, [maxBatch * I32], "I32", "slotMapping");
-    this.slotMappingH = this.allocPinned(glm, [maxBatch * I32], "I32", "slotMappingH");
+    this.indices = this.alloc([maxPages * I32], "I32", "indices");
+    this.indptrD = this.alloc([(maxBatch + 1) * I32], "I32", "indptrD");
+    this.lastPageLen = this.alloc([maxBatch * I32], "I32", "lastPageLen");
+    this.indptrH = this.allocPinned([(maxBatch + 1) * I32], "I32", "indptrH");
+    this.lastPageLenH = this.allocPinned([maxBatch * I32], "I32", "lastPageLenH");
+    this.slotMapping = this.alloc([maxBatch * I32], "I32", "slotMapping");
+    this.slotMappingH = this.allocPinned([maxBatch * I32], "I32", "slotMappingH");
     this.numPagesUsed = 0;
     this.seqPages = [];
     this.seqKvLens = [];

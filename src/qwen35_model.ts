@@ -162,57 +162,56 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
     const zDim = linHeads * linVDim;
     const BS = B * S;
 
-    this.hiddenA = this.alloc(glm, [B, S, hs], "BF16", "hiddenA");
-    this.hiddenB = this.alloc(glm, [B, S, hs], "BF16", "hiddenB");
-    this.normed = this.alloc(glm, [B, S, hs], "BF16", "normed");
-    this.gateBuf = this.alloc(glm, [B, S, inter], "BF16", "gateBuf");
-    this.upBuf = this.alloc(glm, [B, S, inter], "BF16", "upBuf");
-    this.siluBuf = this.alloc(glm, [B, S, inter], "BF16", "siluBuf");
-    this.downBuf = this.alloc(glm, [B, S, hs], "BF16", "downBuf");
-    this.logitsBuf = this.alloc(glm, [B, cfg.vocabSize], "BF16", "logitsBuf");
-    this.hiddenLast = this.alloc(glm, [B, hs], "BF16", "hiddenLast");
-    this.lastIdx = this.alloc(glm, [B], "I32", "lastIdx");
-    this.argmaxIdx = this.alloc(glm, [B], "I32", "argmaxIdx");
-    this.positionIds = this.alloc(glm, [B * S], "I32", "positionIds");
-    this.cos = this.alloc(glm, [B, S, hd], "BF16", "cos");
-    this.sin = this.alloc(glm, [B, S, hd], "BF16", "sin");
-    this.inputIdsBuf = this.alloc(glm, [B * S], "I32", "inputIdsBuf");
-    this.flashOut = this.alloc(glm, [B, nHeads, S, hd], "BF16", "flashOut");
-    this.oProjBuf = this.alloc(glm, [B, S, hs], "BF16", "oProjBuf");
+    this.hiddenA = this.alloc([B, S, hs], "BF16", "hiddenA");
+    this.hiddenB = this.alloc([B, S, hs], "BF16", "hiddenB");
+    this.normed = this.alloc([B, S, hs], "BF16", "normed");
+    this.gateBuf = this.alloc([B, S, inter], "BF16", "gateBuf");
+    this.upBuf = this.alloc([B, S, inter], "BF16", "upBuf");
+    this.siluBuf = this.alloc([B, S, inter], "BF16", "siluBuf");
+    this.downBuf = this.alloc([B, S, hs], "BF16", "downBuf");
+    this.logitsBuf = this.alloc([B, cfg.vocabSize], "BF16", "logitsBuf");
+    this.hiddenLast = this.alloc([B, hs], "BF16", "hiddenLast");
+    this.lastIdx = this.alloc([B], "I32", "lastIdx");
+    this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
+    this.positionIds = this.alloc([B * S], "I32", "positionIds");
+    this.cos = this.alloc([B, S, hd], "BF16", "cos");
+    this.sin = this.alloc([B, S, hd], "BF16", "sin");
+    this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
+    this.flashOut = this.alloc([B, nHeads, S, hd], "BF16", "flashOut");
+    this.oProjBuf = this.alloc([B, S, hs], "BF16", "oProjBuf");
 
-    this.gdnQkvBuf = this.alloc(glm, [B * convDim], "BF16", "gdnQkvBuf");
-    this.gdnABuf = this.alloc(glm, [B * linHeads], "BF16", "gdnABuf");
-    this.gdnBBuf = this.alloc(glm, [B * linHeads], "BF16", "gdnBBuf");
-    this.gdnZBuf = this.alloc(glm, [B * zDim], "BF16", "gdnZBuf");
-    this.gdnOut = this.alloc(glm, [B * linHeads * linVDim], "BF16", "gdnOut");
-    this.gdnGatedOut = this.alloc(glm, [B * linHeads * linVDim], "BF16", "gdnGatedOut");
+    this.gdnQkvBuf = this.alloc([B * convDim], "BF16", "gdnQkvBuf");
+    this.gdnABuf = this.alloc([B * linHeads], "BF16", "gdnABuf");
+    this.gdnBBuf = this.alloc([B * linHeads], "BF16", "gdnBBuf");
+    this.gdnZBuf = this.alloc([B * zDim], "BF16", "gdnZBuf");
+    this.gdnOut = this.alloc([B * linHeads * linVDim], "BF16", "gdnOut");
+    this.gdnGatedOut = this.alloc([B * linHeads * linVDim], "BF16", "gdnGatedOut");
 
-    this.gdnPrefillQkvLinear = this.alloc(glm, [BS, convDim], "BF16", "gdnPrefillQkvLinear");
-    this.gdnPrefillQkvBuf = this.alloc(glm, [convDim, S], "BF16", "gdnPrefillQkvBuf");
-    this.gdnPrefillABuf = this.alloc(glm, [BS * linHeads], "BF16", "gdnPrefillABuf");
-    this.gdnPrefillBBuf = this.alloc(glm, [BS * linHeads], "BF16", "gdnPrefillBBuf");
-    this.gdnPrefillZBuf = this.alloc(glm, [BS, zDim], "BF16", "gdnPrefillZBuf");
-    this.gdnPrefillConvOut = this.alloc(glm, [convDim, S], "BF16", "gdnPrefillConvOut");
-    this.gdnPrefillOut = this.alloc(glm, [S * linHeads, linVDim], "BF16", "gdnPrefillOut");
-    this.gdnPrefillGatedOut = this.alloc(glm, [S * linHeads, linVDim], "BF16", "gdnPrefillGatedOut");
+    this.gdnPrefillQkvLinear = this.alloc([BS, convDim], "BF16", "gdnPrefillQkvLinear");
+    this.gdnPrefillQkvBuf = this.alloc([convDim, S], "BF16", "gdnPrefillQkvBuf");
+    this.gdnPrefillABuf = this.alloc([BS * linHeads], "BF16", "gdnPrefillABuf");
+    this.gdnPrefillBBuf = this.alloc([BS * linHeads], "BF16", "gdnPrefillBBuf");
+    this.gdnPrefillZBuf = this.alloc([BS, zDim], "BF16", "gdnPrefillZBuf");
+    this.gdnPrefillConvOut = this.alloc([convDim, S], "BF16", "gdnPrefillConvOut");
+    this.gdnPrefillOut = this.alloc([S * linHeads, linVDim], "BF16", "gdnPrefillOut");
+    this.gdnPrefillGatedOut = this.alloc([S * linHeads, linVDim], "BF16", "gdnPrefillGatedOut");
 
     const qTotalDim = nHeads * hd;
-    this.attnQBuf = this.alloc(glm, [BS, qTotalDim * 2], "BF16", "attnQBuf");
-    this.attnKBuf = this.alloc(glm, [BS, nKv * hd], "BF16", "attnKBuf");
-    this.attnVBuf = this.alloc(glm, [BS, nKv * hd], "BF16", "attnVBuf");
-    this.attnVT = this.alloc(glm, [B, nKv, S, hd], "BF16", "attnVT");
-    this.attnQRope = this.alloc(glm, [B, nHeads, S, hd], "BF16", "attnQRope");
-    this.attnKRope = this.alloc(glm, [B, nKv, S, hd], "BF16", "attnKRope");
+    this.attnQBuf = this.alloc([BS, qTotalDim * 2], "BF16", "attnQBuf");
+    this.attnKBuf = this.alloc([BS, nKv * hd], "BF16", "attnKBuf");
+    this.attnVBuf = this.alloc([BS, nKv * hd], "BF16", "attnVBuf");
+    this.attnVT = this.alloc([B, nKv, S, hd], "BF16", "attnVT");
+    this.attnQRope = this.alloc([B, nHeads, S, hd], "BF16", "attnQRope");
+    this.attnKRope = this.alloc([B, nKv, S, hd], "BF16", "attnKRope");
 
-    this.qoIndptrD = this.alloc(glm, [B + 1], "I32", "qoIndptrD");
-    this.prefillSlotMapping = this.alloc(glm, [B * S], "I32", "prefillSlotMapping");
+    this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
+    this.prefillSlotMapping = this.alloc([B * S], "I32", "prefillSlotMapping");
   }
 }
 
 
 export class Qwen35Model extends ChatModelBase {
   readonly eosIds = new Set([248044]);
-  declare glm: GlmOps;
   cfg: Qwen35Config;
   maxBatch: number;
   maxSeqLen: number;
@@ -220,8 +219,7 @@ export class Qwen35Model extends ChatModelBase {
   declare ws: Qwen35Workspace;
 
   private constructor(glm: GlmOps, config: Qwen35Config, maxBatch: number, maxSeqLen: number) {
-    super();
-    this.glm = glm;
+    super(glm);
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
@@ -232,7 +230,7 @@ export class Qwen35Model extends ChatModelBase {
     for (let i = 0; i < halfRopeDim; i++) {
       invFreqF32[i] = 1.0 / Math.pow(config.ropeTheta, (2 * i) / ropeDim);
     }
-    this.invFreq = this.alloc(glm, [halfRopeDim], "BF16", "invFreq");
+    this.invFreq = this.alloc([halfRopeDim], "BF16", "invFreq");
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
 
     this.ws = new Qwen35Workspace(glm, maxBatch, maxSeqLen, config);
@@ -282,8 +280,8 @@ export class Qwen35Model extends ChatModelBase {
           gemmaNormSuffixes.some(s => weightName.endsWith(s));
 
         if (weightName.includes("A_log") || weightName.includes("dt_bias")) {
-          const numElements = meta.shape.reduce((a, b) => a + b, 1);
-          const tensor = model.alloc(glm, meta.shape, "F32", weightName);
+          const numElements = meta.shape.reduce((a, b) => a * b, 1);
+          const tensor = model.alloc(meta.shape, "F32", weightName);
           if (meta.dtype === "F32") {
             const offset = st.dataStart + meta.dataOffsets[0];
             glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
@@ -298,8 +296,8 @@ export class Qwen35Model extends ChatModelBase {
             tensor.h2d(Buffer.from(f32Arr.buffer));
           }
         } else if (meta.dtype === "F32") {
-          const numElements = meta.shape.reduce((a, b) => a + b, 1);
-          const tensor = model.alloc(glm, meta.shape, "BF16", weightName);
+          const numElements = meta.shape.reduce((a, b) => a * b, 1);
+          const tensor = model.alloc(meta.shape, "BF16", weightName);
           const f32Bytes = st.readTensor(name);
           const f32Arr = new Float32Array(f32Bytes.buffer, f32Bytes.byteOffset, numElements);
           if (isGemmaNorm) {
@@ -307,8 +305,8 @@ export class Qwen35Model extends ChatModelBase {
           }
           tensor.h2d(f32ToBf16Bytes(f32Arr));
         } else if (isGemmaNorm) {
-          const numElements = meta.shape.reduce((a, b) => a + b, 1);
-          const tensor = model.alloc(glm, meta.shape, "BF16", weightName);
+          const numElements = meta.shape.reduce((a, b) => a * b, 1);
+          const tensor = model.alloc(meta.shape, "BF16", weightName);
           const rawBytes = st.readTensor(name);
           const f32Arr = new Float32Array(numElements);
           for (let i = 0; i < numElements; i++) {
@@ -319,7 +317,7 @@ export class Qwen35Model extends ChatModelBase {
           tensor.h2d(f32ToBf16Bytes(f32Arr));
         } else {
           const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
-          const tensor = model.alloc(glm, meta.shape, dtype, weightName);
+          const tensor = model.alloc(meta.shape, dtype, weightName);
           const offset = st.dataStart + meta.dataOffsets[0];
           glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
         }
