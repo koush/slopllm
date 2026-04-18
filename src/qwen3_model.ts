@@ -53,10 +53,6 @@ class Qwen3Workspace extends WorkspaceBase {
   qBuf: Tensor;
   kBuf: Tensor;
   vBuf: Tensor;
-  qNormed: Tensor;
-  kNormed: Tensor;
-  qT: Tensor;
-  kT: Tensor;
   vT: Tensor;
   qRope: Tensor;
   kRope: Tensor;
@@ -92,10 +88,6 @@ class Qwen3Workspace extends WorkspaceBase {
     this.qBuf = Tensor.alloc(glm, [B, S, nHeads * hd], "BF16");
     this.kBuf = Tensor.alloc(glm, [B, S, nKv * hd], "BF16");
     this.vBuf = Tensor.alloc(glm, [B, S, nKv * hd], "BF16");
-    this.qNormed = Tensor.alloc(glm, [B, S, nHeads * hd], "BF16");
-    this.kNormed = Tensor.alloc(glm, [B, S, nKv * hd], "BF16");
-    this.qT = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
-    this.kT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
     this.vT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
     this.qRope = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
     this.kRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");

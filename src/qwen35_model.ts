@@ -142,10 +142,6 @@ class Qwen35Workspace extends WorkspaceBase {
   attnQBuf: Tensor;
   attnKBuf: Tensor;
   attnVBuf: Tensor;
-  attnQNormed: Tensor;
-  attnKNormed: Tensor;
-  attnQT: Tensor;
-  attnKT: Tensor;
   attnVT: Tensor;
   attnQRope: Tensor;
   attnKRope: Tensor;
@@ -204,10 +200,6 @@ class Qwen35Workspace extends WorkspaceBase {
     this.attnQBuf = Tensor.alloc(glm, [BS, qTotalDim * 2], "BF16");
     this.attnKBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
     this.attnVBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
-    this.attnQNormed = Tensor.alloc(glm, [BS, qTotalDim], "BF16");
-    this.attnKNormed = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
-    this.attnQT = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
-    this.attnKT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
     this.attnVT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
     this.attnQRope = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
     this.attnKRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
