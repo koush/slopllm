@@ -96,12 +96,16 @@ export class Tensor implements Disposable {
     return out;
   }
 
-  rmsnorm(input: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
-    this.workspace.glm.rmsnorm(this.data, ptr(input), ptr(weight), eps, dim, batch);
+  rmsnorm(weight: Tensor | number, eps: number, dim: number, batch: number): Tensor {
+    const out = this.workspace.alloc([batch, dim], this.type);
+    this.workspace.glm.rmsnorm(out.data, this.data, ptr(weight), eps, dim, batch);
+    return out;
   }
 
-  fusedAddRmsnorm(residual: Tensor | number, inputA: Tensor | number, inputB: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
-    this.workspace.glm.fusedAddRmsnorm(this.data, ptr(residual), ptr(inputA), ptr(inputB), ptr(weight), eps, dim, batch);
+  fusedAddRmsnorm(residualOut: Tensor | number, input: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): Tensor {
+    const out = this.workspace.alloc([batch, dim], this.type);
+    this.workspace.glm.fusedAddRmsnorm(out.data, ptr(residualOut), this.data, ptr(input), ptr(weight), eps, dim, batch);
+    return out;
   }
 
   fusedNormRope(weight: Tensor | number, cos: Tensor | number, sin: Tensor | number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
