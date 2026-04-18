@@ -13,9 +13,6 @@ export interface OpContext {
   glm: GlmOps;
   cfg: { hiddenSize: number; intermediateSize: number };
   tensors: Map<string, Tensor>;
-  ws: {
-    tensors: Map<string, Tensor>;
-  };
 }
 
 export class Tensor {
