@@ -111,7 +111,6 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
   hiddenA: Tensor;
   hiddenB: Tensor;
   normed: Tensor;
-  hiddenLast: Tensor;
   lastIdx: Tensor;
   argmaxIdx: Tensor;
   positionIds: Tensor;
@@ -142,7 +141,6 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
     this.hiddenA = this.alloc([B, S, hs], "BF16", "hiddenA");
     this.hiddenB = this.alloc([B, S, hs], "BF16", "hiddenB");
     this.normed = this.alloc([B, S, hs], "BF16", "normed");
-    this.hiddenLast = this.alloc([B, hs], "BF16", "hiddenLast");
     this.lastIdx = this.alloc([B], "I32", "lastIdx");
     this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
     this.positionIds = this.alloc([B * S], "I32", "positionIds");
@@ -562,8 +560,8 @@ export class Qwen35Model extends ChatModelBase {
     if (state.isDecode) {
       logitsBuf = this.ws.normed.linear(this.tensors.get("lm_head.weight")!, batchSize);
     } else {
-      this.ws.hiddenLast.indexSelect(this.ws.normed, this.ws.lastIdx, hs, batchSize);
-      logitsBuf = this.ws.hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
+      using hiddenLast = this.ws.normed.indexSelect(this.ws.lastIdx, hs, batchSize);
+      logitsBuf = hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
     }
 
     this.ws.argmaxIdx.argmax(logitsBuf, cfg.vocabSize, batchSize);

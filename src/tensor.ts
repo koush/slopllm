@@ -147,8 +147,10 @@ export class Tensor implements Disposable {
     this.workspace.glm.argmax(this.data, ptr(input), dim, batch);
   }
 
-  indexSelect(src: Tensor | number, indices: Tensor | number, dim: number, k: number): void {
-    this.workspace.glm.indexSelect(this.data, ptr(src), ptr(indices), dim, k);
+  indexSelect(indices: Tensor | number, dim: number, batch: number): Tensor {
+    const out = this.workspace.alloc([batch, dim], this.type);
+    this.workspace.glm.indexSelect(out.data, this.data, ptr(indices), dim, batch);
+    return out;
   }
 
   gdnRecurrentStep(state: Tensor | number, qkv: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvSeqStride: number): void {

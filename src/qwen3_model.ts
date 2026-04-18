@@ -53,7 +53,6 @@ class Qwen3Workspace extends SamplingWorkspaceBase {
   cos: Tensor;
   sin: Tensor;
   positionIds: Tensor;
-  hiddenLast: Tensor;
   lastIdx: Tensor;
   argmaxIdx: Tensor;
   flashOut: Tensor;
@@ -74,7 +73,6 @@ class Qwen3Workspace extends SamplingWorkspaceBase {
     this.cos = this.alloc([B, S, hd], "BF16", "cos");
     this.sin = this.alloc([B, S, hd], "BF16", "sin");
     this.positionIds = this.alloc([B * S], "I32", "positionIds");
-    this.hiddenLast = this.alloc([B, hs], "BF16", "hiddenLast");
     this.lastIdx = this.alloc([B], "I32", "lastIdx");
     this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
     this.flashOut = this.alloc([B, nHeads, S, hd], "BF16", "flashOut");
@@ -273,8 +271,8 @@ export class Qwen3Model extends ChatModelBase {
     if (state.isDecode) {
       logitsBuf = this.ws.normed.linear(this.tensors.get("lm_head.weight")!, batchSize);
     } else {
-      this.ws.hiddenLast.indexSelect(this.ws.normed, this.ws.lastIdx, hs, batchSize);
-      logitsBuf = this.ws.hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
+      using hiddenLast = this.ws.normed.indexSelect(this.ws.lastIdx, hs, batchSize);
+      logitsBuf = hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
     }
     this.ws.argmaxIdx.argmax(logitsBuf, cfg.vocabSize, batchSize);
     return logitsBuf.removeTracking();
