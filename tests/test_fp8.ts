@@ -46,25 +46,25 @@ describe("Qwen3-0.6B-FP8 model", () => {
   });
 
   it("loads FP8 weights as F8_E4M3 and scale_inv as F32", () => {
-    const qWeight = model.weights.get("model.layers.0.self_attn.q_proj.weight")!;
+    const qWeight = model.tensors.get("model.layers.0.self_attn.q_proj.weight")!;
     assert.equal(qWeight.type, "F8_E4M3", "q_proj weight should be F8_E4M3");
     assert.ok(qWeight.name!.endsWith("_scale_inv") === false, "weight name should not end with _scale_inv");
 
-    const qScale = model.weights.get("model.layers.0.self_attn.q_proj.weight_scale_inv")!;
+    const qScale = model.tensors.get("model.layers.0.self_attn.q_proj.weight_scale_inv")!;
     assert.equal(qScale.type, "F32", "q_proj scale should be F32");
     assert.deepEqual(qScale.shape, [2048 / 128, 1024 / 128], "q_proj scale shape should be [16, 8]");
 
-    const gateWeight = model.weights.get("model.layers.0.mlp.gate_proj.weight")!;
+    const gateWeight = model.tensors.get("model.layers.0.mlp.gate_proj.weight")!;
     assert.equal(gateWeight.type, "F8_E4M3", "gate_proj weight should be F8_E4M3");
 
-    const gateScale = model.weights.get("model.layers.0.mlp.gate_proj.weight_scale_inv")!;
+    const gateScale = model.tensors.get("model.layers.0.mlp.gate_proj.weight_scale_inv")!;
     assert.equal(gateScale.type, "F32", "gate_proj scale should be F32");
     assert.deepEqual(gateScale.shape, [3072 / 128, 1024 / 128], "gate_proj scale shape should be [24, 8]");
 
-    const norm = model.weights.get("model.layers.0.input_layernorm.weight")!;
+    const norm = model.tensors.get("model.layers.0.input_layernorm.weight")!;
     assert.equal(norm.type, "BF16", "layernorm weight should be BF16");
 
-    const embed = model.weights.get("model.embed_tokens.weight")!;
+    const embed = model.tensors.get("model.embed_tokens.weight")!;
     assert.equal(embed.type, "BF16", "embed_tokens should be BF16");
   });
 
@@ -72,6 +72,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
     const pagedKV = makeKV(model);
     const ws = new WorkspaceBuffers(glm);
     try {
+      pagedKV.reset(1);
       const token = model.forwardEager([[1, 2, 3, 4, 5]], ws, pagedKV)[0];
       assert.ok(Number.isInteger(token), "prefill should return an integer token");
       assert.ok(token >= 0 && token < model.cfg.vocabSize, `token ${token} out of vocab range [0, ${model.cfg.vocabSize})`);
@@ -104,9 +105,11 @@ describe("Qwen3-0.6B-FP8 model", () => {
     const bf16KV = makeKV(bf16Model);
     const bf16Ws = new WorkspaceBuffers(glm);
     try {
+      fp8KV.reset(1);
       model.forwardEager([[1, 2, 3, 4, 5]], ws, fp8KV);
       const fp8Logits = readLogits(model);
 
+      bf16KV.reset(1);
       bf16Model.forwardEager([[1, 2, 3, 4, 5]], bf16Ws, bf16KV);
       const bf16Logits = readLogits(bf16Model);
 

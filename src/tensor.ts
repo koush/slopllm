@@ -12,7 +12,7 @@ function numElements(shape: number[]): number {
 export interface OpContext {
   glm: GlmOps;
   cfg: { hiddenSize: number; intermediateSize: number };
-  weights: Map<string, Tensor>;
+  tensors: Map<string, Tensor>;
   ws: {
     tensors: Map<string, Tensor>;
   };
@@ -61,7 +61,7 @@ export class Tensor {
   linear(input: Tensor | number, weight: Tensor | number, batch: number, n: number, k: number, context?: OpContext): void {
     const w = typeof weight === "number" ? undefined : weight;
     if (context && w && w.type === "F8_E4M3") {
-      const scale = context.weights.get(w.name! + "_scale_inv")!;
+      const scale = context.tensors.get(w.name! + "_scale_inv")!;
       context.glm.fp8LinearDecode(this.data, ptr(input), w.data, scale.data, batch, n, k);
     } else {
       this.glm.linear(this.data, ptr(input), ptr(weight), batch, n, k);

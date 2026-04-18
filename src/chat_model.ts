@@ -1,5 +1,6 @@
 import { GlmOps, I32, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, SAMPLING_MAX_TOPK, SAMPLING_BLOCK_SIZE } from "./glm_ops";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
+import { SafeTensorFile } from "./safetensors";
 import { Tensor } from "./tensor";
 
 export interface SamplingParams {
@@ -71,41 +72,13 @@ export interface CommonModelWorkspace {
   sampleRandomVals: Tensor;
 }
 
-export abstract class WorkspaceBase implements CommonModelWorkspace {
-  abstract argmaxIdx: Tensor;
-  abstract inputIdsBuf: Tensor;
-  abstract positionIds: Tensor;
-  abstract lastIdx: Tensor;
-  abstract qoIndptrD: Tensor;
-  abstract prefillSlotMapping: Tensor;
-  abstract logitsBuf: Tensor;
-  sampleOutToken: Tensor;
-  sampleTopkVals: Tensor;
-  sampleTopkIdxs: Tensor;
-  sampleWorkspace: Tensor;
-  samplePenaltyTokens: Tensor;
-  samplePenaltyOffsets: Tensor;
-  sampleTemperatures: Tensor;
-  sampleRepPenalties: Tensor;
-  samplePresPenalties: Tensor;
-  sampleTopKs: Tensor;
-  sampleTopPs: Tensor;
-  sampleRandomVals: Tensor;
+export abstract class WorkspaceBase {
   tensors = new Map<string, Tensor>();
 
-  constructor(glm: GlmOps, B: number, vs: number) {
-    this.sampleOutToken = Tensor.alloc(glm, [B], "I32");
-    this.sampleTopkVals = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
-    this.sampleTopkIdxs = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
-    this.sampleWorkspace = Tensor.alloc(glm, [B * vs], "F32");
-    this.samplePenaltyTokens = Tensor.alloc(glm, [B * 1024], "I32");
-    this.samplePenaltyOffsets = Tensor.alloc(glm, [B + 1], "I32");
-    this.sampleTemperatures = Tensor.alloc(glm, [B], "F32");
-    this.sampleRepPenalties = Tensor.alloc(glm, [B], "F32");
-    this.samplePresPenalties = Tensor.alloc(glm, [B], "F32");
-    this.sampleTopKs = Tensor.alloc(glm, [B], "I32");
-    this.sampleTopPs = Tensor.alloc(glm, [B], "F32");
-    this.sampleRandomVals = Tensor.alloc(glm, [B], "F32");
+  alloc(glm: GlmOps, shape: number[], type: string, name: string): Tensor {
+    const tensor = Tensor.alloc(glm, shape, type, name);
+    this.tensors.set(name!, tensor);
+    return tensor;
   }
 
   protected buildTensorMap(): void {
@@ -125,15 +98,52 @@ export abstract class WorkspaceBase implements CommonModelWorkspace {
   }
 }
 
-export abstract class ChatModelBase implements ChatModel {
+export abstract class SamplingWorkspaceBase extends WorkspaceBase implements CommonModelWorkspace {
+  abstract argmaxIdx: Tensor;
+  abstract inputIdsBuf: Tensor;
+  abstract positionIds: Tensor;
+  abstract lastIdx: Tensor;
+  abstract qoIndptrD: Tensor;
+  abstract prefillSlotMapping: Tensor;
+  abstract logitsBuf: Tensor;
+  sampleOutToken: Tensor;
+  sampleTopkVals: Tensor;
+  sampleTopkIdxs: Tensor;
+  sampleWorkspace: Tensor;
+  samplePenaltyTokens: Tensor;
+  samplePenaltyOffsets: Tensor;
+  sampleTemperatures: Tensor;
+  sampleRepPenalties: Tensor;
+  samplePresPenalties: Tensor;
+  sampleTopKs: Tensor;
+  sampleTopPs: Tensor;
+  sampleRandomVals: Tensor;
+
+  constructor(glm: GlmOps, B: number, vs: number) {
+    super();
+
+    this.sampleOutToken = Tensor.alloc(glm, [B], "I32");
+    this.sampleTopkVals = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
+    this.sampleTopkIdxs = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
+    this.sampleWorkspace = Tensor.alloc(glm, [B * vs], "F32");
+    this.samplePenaltyTokens = Tensor.alloc(glm, [B * 1024], "I32");
+    this.samplePenaltyOffsets = Tensor.alloc(glm, [B + 1], "I32");
+    this.sampleTemperatures = Tensor.alloc(glm, [B], "F32");
+    this.sampleRepPenalties = Tensor.alloc(glm, [B], "F32");
+    this.samplePresPenalties = Tensor.alloc(glm, [B], "F32");
+    this.sampleTopKs = Tensor.alloc(glm, [B], "I32");
+    this.sampleTopPs = Tensor.alloc(glm, [B], "F32");
+    this.sampleRandomVals = Tensor.alloc(glm, [B], "F32");
+  }
+}
+
+export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
   abstract readonly eosIds: Set<number>;
   protected abstract readonly glm: GlmOps;
   protected abstract readonly cfg: CommonModelConfig;
   protected abstract readonly ws: CommonModelWorkspace;
-  protected abstract readonly weights: Map<string, Tensor>;
 
   abstract createChatCache(maxPages?: number): ChatCache;
-  abstract free(): void;
 
   protected abstract getPagedKV(cache: ChatCache): PagedKVCache;
 

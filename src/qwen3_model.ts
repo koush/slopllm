@@ -6,7 +6,7 @@ import { resolveModelPath } from "./model_path";
 import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
 import { Tensor } from "./tensor";
 import type { ChatCache } from "./chat_model";
-import { ChatModelBase, type BatchState, SamplingParams, WorkspaceBase } from "./chat_model";
+import { ChatModelBase, type BatchState, SamplingParams, SamplingWorkspaceBase } from "./chat_model";
 
 export type { SamplingParams };
 export type { BatchState };
@@ -46,7 +46,7 @@ function loadConfig(modelDir: string): Qwen3Config {
   };
 }
 
-class Qwen3Workspace extends WorkspaceBase {
+class Qwen3Workspace extends SamplingWorkspaceBase {
   hiddenA: Tensor;
   hiddenB: Tensor;
   normed: Tensor;
@@ -116,17 +116,15 @@ export class Qwen3Model extends ChatModelBase {
   readonly eosIds = new Set([151645, 151643]);
   declare glm: GlmOps;
   cfg: Qwen3Config;
-  declare weights: Map<string, Tensor>;
   maxBatch: number;
   maxSeqLen: number;
   invFreq: Tensor;
   declare ws: Qwen3Workspace;
 
-  private constructor(glm: GlmOps, config: Qwen3Config, weights: Map<string, Tensor>, maxBatch: number, maxSeqLen: number) {
+  private constructor(glm: GlmOps, config: Qwen3Config, maxBatch: number, maxSeqLen: number) {
     super();
     this.glm = glm;
     this.cfg = config;
-    this.weights = weights;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
 
@@ -135,7 +133,7 @@ export class Qwen3Model extends ChatModelBase {
     for (let i = 0; i < halfDim; i++) {
       invFreqF32[i] = 1.0 / Math.pow(config.ropeTheta, (2 * i) / config.headDim);
     }
-    this.invFreq = Tensor.alloc(glm, [halfDim], "BF16");
+    this.invFreq = this.alloc(glm, [halfDim], "BF16", "invFreq");
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
 
     this.ws = new Qwen3Workspace(glm, maxBatch, maxSeqLen, config);
@@ -150,21 +148,20 @@ export class Qwen3Model extends ChatModelBase {
     const mmapPtr = glm.mmapOpen(stPath);
     const fileSize = fs.statSync(stPath).size;
 
-    const weights = new Map<string, Tensor>();
+    const model = new Qwen3Model(glm, config, maxBatch, maxSeqLen);
+
     for (const name of st.tensorNames()) {
       const meta = st.meta(name);
       if (name.endsWith("_scale_inv")) {
         const bf16Bytes = st.readTensor(name);
         const f32Array = bf16BytesToF32(bf16Bytes);
         const f32Buffer = Buffer.from(f32Array.buffer, f32Array.byteOffset, f32Array.byteLength);
-        const tensor = Tensor.alloc(glm, meta.shape, "F32", name);
+        const tensor = model.alloc(glm, meta.shape, "F32", name);
         tensor.h2d(f32Buffer);
-        weights.set(name, tensor);
       } else {
-        const tensor = Tensor.alloc(glm, meta.shape, meta.dtype, name);
+        const tensor = model.alloc(glm, meta.shape, meta.dtype, name);
         const offset = st.dataStart + meta.dataOffsets[0];
         glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
-        weights.set(name, tensor);
       }
     }
 
@@ -172,22 +169,17 @@ export class Qwen3Model extends ChatModelBase {
     st.close();
     glm.mmapClose(mmapPtr, fileSize);
 
-    if (config.tieWordEmbeddings && !weights.has("lm_head.weight")) {
-      const embedTensor = weights.get("model.embed_tokens.weight")!;
-      weights.set("lm_head.weight", embedTensor);
+    if (config.tieWordEmbeddings && !model.tensors.has("lm_head.weight")) {
+      const embedTensor = model.tensors.get("model.embed_tokens.weight")!;
+      model.tensors.set("lm_head.weight", embedTensor);
     }
 
-    return new Qwen3Model(glm, config, weights, maxBatch, maxSeqLen);
+    return model;
   }
 
   free(): void {
     this.ws.free();
-    this.invFreq.free();
-    for (const tensor of this.weights.values()) {
-      tensor.free();
-    }
-    this.ws = null!;
-    this.weights = new Map();
+    super.free();
   }
 
   createChatCache(maxPages = 256): ChatCache {
@@ -203,10 +195,10 @@ export class Qwen3Model extends ChatModelBase {
     const cfg = this.cfg;
     const inter = cfg.intermediateSize;
 
-    this.ws.gateBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.gate_proj.weight`)!, BS, inter, cfg.hiddenSize, this);
-    this.ws.upBuf.linear(this.ws.normed, this.weights.get(`${pfx}.mlp.up_proj.weight`)!, BS, inter, cfg.hiddenSize, this);
+    this.ws.gateBuf.linear(this.ws.normed, this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS, inter, cfg.hiddenSize, this);
+    this.ws.upBuf.linear(this.ws.normed, this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS, inter, cfg.hiddenSize, this);
     this.ws.siluBuf.siluAndMul(this.ws.gateBuf, this.ws.upBuf, inter, BS);
-    this.ws.downBuf.linear(this.ws.siluBuf, this.weights.get(`${pfx}.mlp.down_proj.weight`)!, BS, cfg.hiddenSize, inter, this);
+    this.ws.downBuf.linear(this.ws.siluBuf, this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS, cfg.hiddenSize, inter, this);
   }
 
   private computeQkv(pfx: string, BS: number, B: number, S: number): void {
@@ -216,12 +208,12 @@ export class Qwen3Model extends ChatModelBase {
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
 
-    this.ws.qBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.q_proj.weight`)!, BS, nHeads * hd, hs, this);
-    this.ws.kBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.k_proj.weight`)!, BS, nKv * hd, hs, this);
-    this.ws.vBuf.linear(this.ws.normed, this.weights.get(`${pfx}.self_attn.v_proj.weight`)!, BS, nKv * hd, hs, this);
+    this.ws.qBuf.linear(this.ws.normed, this.tensors.get(`${pfx}.self_attn.q_proj.weight`)!, BS, nHeads * hd, hs, this);
+    this.ws.kBuf.linear(this.ws.normed, this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS, nKv * hd, hs, this);
+    this.ws.vBuf.linear(this.ws.normed, this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!, BS, nKv * hd, hs, this);
 
-    this.ws.qRope.fusedNormRope(this.ws.qBuf, this.weights.get(`${pfx}.self_attn.q_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
-    this.ws.kRope.fusedNormRope(this.ws.kBuf, this.weights.get(`${pfx}.self_attn.k_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
+    this.ws.qRope.fusedNormRope(this.ws.qBuf, this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
+    this.ws.kRope.fusedNormRope(this.ws.kBuf, this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
     if (S > 1) {
       this.ws.vT.transpose4d(this.ws.vBuf, B, S, nKv, hd, 0, 2, 1, 3);
     }
@@ -246,11 +238,11 @@ export class Qwen3Model extends ChatModelBase {
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : totalTokens;
 
-    this.ws.hiddenA.embedding(this.weights.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
+    this.ws.hiddenA.embedding(this.tensors.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
 
     glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, B, S);
 
-    this.ws.normed.rmsnorm(this.ws.hiddenA, this.weights.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+    this.ws.normed.rmsnorm(this.ws.hiddenA, this.tensors.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
@@ -296,22 +288,22 @@ export class Qwen3Model extends ChatModelBase {
         );
       }
 
-      this.ws.oProjBuf.linear(this.ws.flashOut, this.weights.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd, this);
+      this.ws.oProjBuf.linear(this.ws.flashOut, this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS, hs, nHeads * hd, this);
 
-      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, this.ws.oProjBuf, this.weights.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, this.ws.oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
       this.mlp(BS, pfx);
 
       if (i < cfg.numHiddenLayers - 1) {
         const nextPfx = `model.layers.${i + 1}`;
-        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get(`${nextPfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.tensors.get(`${nextPfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
       } else {
-        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.weights.get("model.norm.weight")!, cfg.rmsNormEps, hs, BS);
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, this.ws.downBuf, this.tensors.get("model.norm.weight")!, cfg.rmsNormEps, hs, BS);
         if (state.isDecode) {
-          this.ws.logitsBuf.linear(this.ws.normed, this.weights.get("lm_head.weight")!, batchSize, cfg.vocabSize, hs, this);
+          this.ws.logitsBuf.linear(this.ws.normed, this.tensors.get("lm_head.weight")!, batchSize, cfg.vocabSize, hs, this);
         } else {
           this.ws.hiddenLast.indexSelect(this.ws.normed, this.ws.lastIdx, hs, batchSize);
-          this.ws.logitsBuf.linear(this.ws.hiddenLast, this.weights.get("lm_head.weight")!, batchSize, cfg.vocabSize, hs, this);
+          this.ws.logitsBuf.linear(this.ws.hiddenLast, this.tensors.get("lm_head.weight")!, batchSize, cfg.vocabSize, hs, this);
         }
       }
     }
