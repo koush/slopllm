@@ -114,8 +114,6 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
   lastIdx: Tensor;
   argmaxIdx: Tensor;
   positionIds: Tensor;
-  cos: Tensor;
-  sin: Tensor;
   inputIdsBuf: Tensor;
   gdnOut: Tensor;
   gdnGatedOut: Tensor;
@@ -143,8 +141,6 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
     this.lastIdx = this.alloc([B], "I32", "lastIdx");
     this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
     this.positionIds = this.alloc([B * S], "I32", "positionIds");
-    this.cos = this.alloc([B, S, hd], "BF16", "cos");
-    this.sin = this.alloc([B, S, hd], "BF16", "sin");
     this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
 
     this.gdnOut = this.alloc([B * linHeads * linVDim], "BF16", "gdnOut");
@@ -426,7 +422,7 @@ export class Qwen35Model extends ChatModelBase {
     }
   }
 
-  private fullAttnLayer(layerIdx: number, state: BatchState, pagedKV: PagedKVCache): void {
+  private fullAttnLayer(layerIdx: number, state: BatchState, pagedKV: PagedKVCache, cos: Tensor, sin: Tensor): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -448,9 +444,9 @@ export class Qwen35Model extends ChatModelBase {
     using vBuf = this.ws.normed.linear(this.tensors.get(`${pfx}.v_proj.weight`)!, BS);
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    const qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.q_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, ropeDim, hd, nHeads, S, B, hd * 2);
+    const qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nHeads, S, B, hd * 2);
     using _qRope = qRope;
-    const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.k_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, ropeDim, hd, nKv, S, B);
+    const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nKv, S, B);
     using _kRope = kRope;
 
     const vT = S > 1 ? vBuf.transpose4d(B, S, nKv, hd, 0, 2, 1, 3) : null;
@@ -548,7 +544,9 @@ export class Qwen35Model extends ChatModelBase {
     this.ws.hiddenA.embedding(this.tensors.get("embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, ropeDim / 2, B, S);
+    using cos = this.ws.alloc([B, S, hd], "BF16");
+    using sin = this.ws.alloc([B, S, hd], "BF16");
+    glm.rotaryEmbedding(cos.data, sin.data, this.invFreq.data, this.ws.positionIds.data, ropeDim / 2, B, S);
 
     this.ws.normed.rmsnorm(this.ws.hiddenA, this.tensors.get(`layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
@@ -560,7 +558,7 @@ export class Qwen35Model extends ChatModelBase {
           this.gdnLayerPrefill(i, totalTokens, gdnState);
         }
       } else {
-        this.fullAttnLayer(i, state, pagedKV);
+        this.fullAttnLayer(i, state, pagedKV, cos, sin);
       }
     }
 

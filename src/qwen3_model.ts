@@ -50,8 +50,6 @@ class Qwen3Workspace extends SamplingWorkspaceBase {
   hiddenA: Tensor;
   hiddenB: Tensor;
   normed: Tensor;
-  cos: Tensor;
-  sin: Tensor;
   positionIds: Tensor;
   lastIdx: Tensor;
   argmaxIdx: Tensor;
@@ -69,8 +67,6 @@ class Qwen3Workspace extends SamplingWorkspaceBase {
     this.hiddenA = this.alloc([B, S, hs], "BF16", "hiddenA");
     this.hiddenB = this.alloc([B, S, hs], "BF16", "hiddenB");
     this.normed = this.alloc([B, S, hs], "BF16", "normed");
-    this.cos = this.alloc([B, S, hd], "BF16", "cos");
-    this.sin = this.alloc([B, S, hd], "BF16", "sin");
     this.positionIds = this.alloc([B * S], "I32", "positionIds");
     this.lastIdx = this.alloc([B], "I32", "lastIdx");
     this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
@@ -164,7 +160,7 @@ export class Qwen3Model extends ChatModelBase {
     return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
   }
 
-  private computeQkv(pfx: string, BS: number, B: number, S: number): { qRope: Tensor, kRope: Tensor, vBuf: Tensor, vT: Tensor | null } {
+  private computeQkv(pfx: string, BS: number, B: number, S: number, cos: Tensor, sin: Tensor): { qRope: Tensor, kRope: Tensor, vBuf: Tensor, vT: Tensor | null } {
     const cfg = this.cfg;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
@@ -174,8 +170,8 @@ export class Qwen3Model extends ChatModelBase {
     using kBuf = this.ws.normed.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS);
     const vBuf = this.ws.normed.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!, BS);
 
-    const qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
-    const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, this.ws.cos, this.ws.sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
+    const qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
+    const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
     const vT = S > 1 ? vBuf.transpose4d(B, S, nKv, hd, 0, 2, 1, 3) : null;
     return { qRope, kRope, vBuf, vT };
   }
@@ -199,14 +195,16 @@ export class Qwen3Model extends ChatModelBase {
 
     this.ws.hiddenA.embedding(this.tensors.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
 
-    glm.rotaryEmbedding(this.ws.cos.data, this.ws.sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, B, S);
+    using cos = this.ws.alloc([B, S, hd], "BF16");
+    using sin = this.ws.alloc([B, S, hd], "BF16");
+    glm.rotaryEmbedding(cos.data, sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, B, S);
 
     this.ws.normed.rmsnorm(this.ws.hiddenA, this.tensors.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
 
-      const qkv = this.computeQkv(pfx, BS, B, S);
+      const qkv = this.computeQkv(pfx, BS, B, S, cos, sin);
       using _qRope = qkv.qRope;
       using _kRope = qkv.kRope;
       using _vBuf = qkv.vBuf;
