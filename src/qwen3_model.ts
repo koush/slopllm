@@ -55,7 +55,6 @@ class Qwen3Workspace extends SamplingWorkspaceBase {
   positionIds: Tensor;
   lastIdx: Tensor;
   argmaxIdx: Tensor;
-  flashOut: Tensor;
   inputIdsBuf: Tensor;
   qoIndptrD: Tensor;
   prefillSlotMapping: Tensor;
@@ -75,7 +74,6 @@ class Qwen3Workspace extends SamplingWorkspaceBase {
     this.positionIds = this.alloc([B * S], "I32", "positionIds");
     this.lastIdx = this.alloc([B], "I32", "lastIdx");
     this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
-    this.flashOut = this.alloc([B, nHeads, S, hd], "BF16", "flashOut");
     this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
     this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
     this.prefillSlotMapping = this.alloc([B * S], "I32", "prefillSlotMapping");
@@ -226,8 +224,9 @@ export class Qwen3Model extends ChatModelBase {
       );
 
       if (state.isDecode) {
+        const flashOut = this.ws.alloc([batchSize, nHeads, 1, hd], "BF16");
         glm.batchDecodeRun(
-          qkv.qRope.data, this.ws.flashOut.data,
+          qkv.qRope.data, flashOut.data,
           pagedKV.kData[i].data, pagedKV.vData[i].data,
           pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
           ws.floatWs.data, ws.intWs.data,
@@ -235,11 +234,14 @@ export class Qwen3Model extends ChatModelBase {
           batchSize,
           nHeads, nKv, hd, pageSize, cfg.scaling
         );
+        using oProjBuf = flashOut.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
       } else {
+        const flashOut = this.ws.alloc([1, nHeads, totalTokens, hd], "BF16");
         const qStrideN = hd;
         const qStrideH = totalTokens * hd;
         glm.batchPrefillPagedRun(
-          qkv.qRope.data, this.ws.flashOut.data,
+          qkv.qRope.data, flashOut.data,
           pagedKV.kData[i].data, pagedKV.vData[i].data,
           pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
           ws.floatWs.data, ws.intWs.data,
@@ -251,11 +253,9 @@ export class Qwen3Model extends ChatModelBase {
           qStrideN, qStrideH,
           1, cfg.scaling
         );
+        using oProjBuf = flashOut.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
       }
-
-      using oProjBuf = this.ws.flashOut.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
-
-      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
       using downBuf = this.mlp(BS, pfx);
 

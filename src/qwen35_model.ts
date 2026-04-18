@@ -117,7 +117,6 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
   cos: Tensor;
   sin: Tensor;
   inputIdsBuf: Tensor;
-  flashOut: Tensor;
   gdnOut: Tensor;
   gdnGatedOut: Tensor;
   gdnPrefillConvOut: Tensor;
@@ -147,7 +146,6 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
     this.cos = this.alloc([B, S, hd], "BF16", "cos");
     this.sin = this.alloc([B, S, hd], "BF16", "sin");
     this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
-    this.flashOut = this.alloc([B, nHeads, S, hd], "BF16", "flashOut");
 
     this.gdnOut = this.alloc([B * linHeads * linVDim], "BF16", "gdnOut");
     this.gdnGatedOut = this.alloc([B * linHeads * linVDim], "BF16", "gdnGatedOut");
@@ -471,8 +469,9 @@ export class Qwen35Model extends ChatModelBase {
     );
 
     if (state.isDecode) {
+      const flashOut = this.ws.alloc([batchSize, nHeads, 1, hd], "BF16");
       glm.batchDecodeRun(
-        qRope.data, this.ws.flashOut.data,
+        qRope.data, flashOut.data,
         pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
         pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
         this.ws.floatWs.data, this.ws.intWs.data,
@@ -481,11 +480,23 @@ export class Qwen35Model extends ChatModelBase {
         nHeads, nKv, hd, pageSize,
         cfg.scaling
       );
+      if (cfg.attnOutputGate) {
+        glm.gateSigmoidMul(flashOut.data, qBuf.data, BS, nHeads, hd);
+      }
+      using oProjBuf = flashOut.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
+      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, oProjBuf, this.tensors.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      using downBuf = this.mlp(`layers.${layerIdx}`, BS);
+      if (layerIdx < cfg.numHiddenLayers - 1) {
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, downBuf, this.tensors.get(`layers.${layerIdx + 1}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      } else {
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, downBuf, this.tensors.get("norm.weight")!, cfg.rmsNormEps, hs, BS);
+      }
     } else {
+      const flashOut = this.ws.alloc([1, nHeads, totalTokens, hd], "BF16");
       const qStrideN = hd;
       const qStrideH = BS * hd;
       glm.batchPrefillPagedRun(
-        qRope.data, this.ws.flashOut.data,
+        qRope.data, flashOut.data,
         pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
         pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
         this.ws.floatWs.data, this.ws.intWs.data,
@@ -495,20 +506,17 @@ export class Qwen35Model extends ChatModelBase {
         nHeads, nKv, hd, pageSize,
         qStrideN, qStrideH, 1, cfg.scaling
       );
-    }
-
-    if (cfg.attnOutputGate) {
-      glm.gateSigmoidMul(this.ws.flashOut.data, qBuf.data, BS, nHeads, hd);
-    }
-
-    using oProjBuf = this.ws.flashOut.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
-
-    this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, oProjBuf, this.tensors.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-    using downBuf = this.mlp(`layers.${layerIdx}`, BS);
-    if (layerIdx < cfg.numHiddenLayers - 1) {
-      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, downBuf, this.tensors.get(`layers.${layerIdx + 1}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-    } else {
-      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, downBuf, this.tensors.get("norm.weight")!, cfg.rmsNormEps, hs, BS);
+      if (cfg.attnOutputGate) {
+        glm.gateSigmoidMul(flashOut.data, qBuf.data, BS, nHeads, hd);
+      }
+      using oProjBuf = flashOut.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
+      this.ws.normed.fusedAddRmsnorm(this.ws.hiddenB, this.ws.hiddenA, oProjBuf, this.tensors.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      using downBuf = this.mlp(`layers.${layerIdx}`, BS);
+      if (layerIdx < cfg.numHiddenLayers - 1) {
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, downBuf, this.tensors.get(`layers.${layerIdx + 1}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      } else {
+        this.ws.normed.fusedAddRmsnorm(this.ws.hiddenA, this.ws.hiddenB, downBuf, this.tensors.get("norm.weight")!, cfg.rmsNormEps, hs, BS);
+      }
     }
   }
 
