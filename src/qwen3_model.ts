@@ -47,33 +47,13 @@ function loadConfig(modelDir: string): Qwen3Config {
   };
 }
 
-class Qwen3Workspace extends SamplingWorkspaceBase {
-  positionIds: Tensor;
-  lastIdx: Tensor;
-  argmaxIdx: Tensor;
-  inputIdsBuf: Tensor;
-  qoIndptrD: Tensor;
-  prefillSlotMapping: Tensor;
-
-  constructor(glm: GlmOps, B: number, S: number, cfg: Qwen3Config) {
-    super(glm, B, cfg.vocabSize);
-
-    this.positionIds = this.alloc([B * S], "I32", "positionIds");
-    this.lastIdx = this.alloc([B], "I32", "lastIdx");
-    this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
-    this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
-    this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
-    this.prefillSlotMapping = this.alloc([B * S], "I32", "prefillSlotMapping");
-  }
-}
-
 export class Qwen3Model extends ChatModelBase {
   readonly eosIds = new Set([151645, 151643]);
   cfg: Qwen3Config;
   maxBatch: number;
   maxSeqLen: number;
   invFreq: Tensor;
-  declare ws: Qwen3Workspace;
+  declare ws: SamplingWorkspaceBase;
 
   private constructor(glm: GlmOps, config: Qwen3Config, maxBatch: number, maxSeqLen: number) {
     super(glm);
@@ -89,7 +69,7 @@ export class Qwen3Model extends ChatModelBase {
     this.invFreq = this.alloc([halfDim], "BF16", "invFreq");
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
 
-    this.ws = new Qwen3Workspace(glm, maxBatch, maxSeqLen, config);
+    this.ws = new SamplingWorkspaceBase(glm, maxBatch, maxSeqLen, config.vocabSize);
   }
 
   static fromPretrained(glm: GlmOps, repoId: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {

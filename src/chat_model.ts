@@ -175,18 +175,18 @@ export abstract class WorkspaceBase implements TensorWorkspace {
   }
 }
 
-export abstract class SamplingWorkspaceBase extends WorkspaceBase implements CommonModelWorkspace {
+export class SamplingWorkspaceBase extends WorkspaceBase implements CommonModelWorkspace {
   floatWs: Tensor;
   intWs: Tensor;
   pinnedIntWs: Tensor;
   decodePlanInfo: Tensor;
   prefillPlanInfo: Tensor;
-  abstract argmaxIdx: Tensor;
-  abstract inputIdsBuf: Tensor;
-  abstract positionIds: Tensor;
-  abstract lastIdx: Tensor;
-  abstract qoIndptrD: Tensor;
-  abstract prefillSlotMapping: Tensor;
+  argmaxIdx: Tensor;
+  inputIdsBuf: Tensor;
+  positionIds: Tensor;
+  lastIdx: Tensor;
+  qoIndptrD: Tensor;
+  prefillSlotMapping: Tensor;
   sampleOutToken: Tensor;
   sampleTopkVals: Tensor;
   sampleTopkIdxs: Tensor;
@@ -200,7 +200,7 @@ export abstract class SamplingWorkspaceBase extends WorkspaceBase implements Com
   sampleTopPs: Tensor;
   sampleRandomVals: Tensor;
 
-  constructor(glm: GlmOps, B: number, vs: number) {
+  constructor(glm: GlmOps, B: number, S: number, vs: number) {
     super(glm);
 
     this.floatWs = this.alloc([BATCH_FLOAT_WS_SIZE], "U8", "floatWs");
@@ -208,6 +208,13 @@ export abstract class SamplingWorkspaceBase extends WorkspaceBase implements Com
     this.pinnedIntWs = this.allocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
     this.decodePlanInfo = this.allocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", "decodePlanInfo");
     this.prefillPlanInfo = this.allocPinned([PREFILL_PLAN_INFO_SIZE * 8], "U8", "prefillPlanInfo");
+
+    this.positionIds = this.alloc([B * S], "I32", "positionIds");
+    this.lastIdx = this.alloc([B], "I32", "lastIdx");
+    this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
+    this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
+    this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
+    this.prefillSlotMapping = this.alloc([B * S], "I32", "prefillSlotMapping");
 
     this.sampleOutToken = this.alloc([B], "I32", "sampleOutToken");
     this.sampleTopkVals = this.alloc([B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32", "sampleTopkVals");
