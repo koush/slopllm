@@ -115,11 +115,6 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
   argmaxIdx: Tensor;
   positionIds: Tensor;
   inputIdsBuf: Tensor;
-  gdnOut: Tensor;
-  gdnGatedOut: Tensor;
-  gdnPrefillConvOut: Tensor;
-  gdnPrefillOut: Tensor;
-  gdnPrefillGatedOut: Tensor;
   qoIndptrD: Tensor;
   prefillSlotMapping: Tensor;
 
@@ -132,8 +127,6 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
     const linHeads = cfg.linearNumKeyHeads;
     const linKDim = cfg.linearKeyHeadDim;
     const linVDim = cfg.linearValueHeadDim;
-    const convDim = linHeads * (linKDim * 2 + linVDim);
-    const zDim = linHeads * linVDim;
 
     this.hiddenA = this.alloc([B, S, hs], "BF16", "hiddenA");
     this.hiddenB = this.alloc([B, S, hs], "BF16", "hiddenB");
@@ -142,12 +135,6 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
     this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
     this.positionIds = this.alloc([B * S], "I32", "positionIds");
     this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
-
-    this.gdnOut = this.alloc([B * linHeads * linVDim], "BF16", "gdnOut");
-    this.gdnGatedOut = this.alloc([B * linHeads * linVDim], "BF16", "gdnGatedOut");
-    this.gdnPrefillConvOut = this.alloc([convDim, S], "BF16", "gdnPrefillConvOut");
-    this.gdnPrefillOut = this.alloc([S * linHeads, linVDim], "BF16", "gdnPrefillOut");
-    this.gdnPrefillGatedOut = this.alloc([S * linHeads, linVDim], "BF16", "gdnPrefillGatedOut");
     this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
     this.prefillSlotMapping = this.alloc([B * S], "I32", "prefillSlotMapping");
   }
@@ -323,7 +310,6 @@ export class Qwen35Model extends ChatModelBase {
     const linKDim = cfg.linearKeyHeadDim;
     const linVDim = cfg.linearValueHeadDim;
     const convDim = linHeads * (linKDim * 2 + linVDim);
-    const zDim = linHeads * linVDim;
     const pfx = `layers.${layerIdx}.linear_attn`;
     const BS = S;
     const batchSize = gdnState.batchSize;
@@ -340,10 +326,10 @@ export class Qwen35Model extends ChatModelBase {
     const recurrentState = gdnState.recurrentState[layerIdx];
     const kernelSize = cfg.linearConvKernelDim;
 
-    const convOut = this.ws.gdnPrefillConvOut;
+    const convOut = this.ws.alloc([convDim, S], "BF16");
     glm.causalConv1d(convOut.data, convState.data, qkvBuf.data, this.tensors.get(`${pfx}.conv1d.weight`)!.data, gdnState.cuSeqlens.data, convDim, S, kernelSize, batchSize, gdnState.convStateStride);
 
-    const gdnOut = this.ws.gdnPrefillOut;
+    const gdnOut = this.ws.alloc([S * linHeads, linVDim], "BF16");
 
     glm.gdnPrefill(
       gdnOut.data, recurrentState.data,
@@ -355,7 +341,7 @@ export class Qwen35Model extends ChatModelBase {
       batchSize, gdnState.recurrentStateStride, S,
     );
 
-    const gatedOut = this.ws.gdnPrefillGatedOut;
+    const gatedOut = this.ws.alloc([S * linHeads, linVDim], "BF16");
     gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, S * linHeads);
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!, BS);
@@ -377,7 +363,6 @@ export class Qwen35Model extends ChatModelBase {
     const linKDim = cfg.linearKeyHeadDim;
     const linVDim = cfg.linearValueHeadDim;
     const convDim = linHeads * (linKDim * 2 + linVDim);
-    const zDim = linHeads * linVDim;
     const pfx = `layers.${layerIdx}.linear_attn`;
     const BS = gdnState.batchSize;
 
@@ -396,7 +381,7 @@ export class Qwen35Model extends ChatModelBase {
     using _qkvT = qkvT;
     const qkvSrc = BS === 1 ? qkvBuf.data : qkvT!.data;
 
-    const gdnOut = this.ws.gdnOut;
+    const gdnOut = this.ws.alloc([BS * linHeads * linVDim], "BF16");
 
     glm.gdnRecurrentStep(
       gdnOut.data, recurrentState.data,
@@ -408,7 +393,7 @@ export class Qwen35Model extends ChatModelBase {
       BS, gdnState.recurrentStateStride, BS,
     );
 
-    const gatedOut = this.ws.gdnGatedOut;
+    const gatedOut = this.ws.alloc([BS * linHeads * linVDim], "BF16");
     gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, BS * linHeads);
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!, BS);
