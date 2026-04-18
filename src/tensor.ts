@@ -102,10 +102,11 @@ export class Tensor implements Disposable {
     return out;
   }
 
-  fusedAddRmsnorm(residualOut: Tensor | number, input: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): Tensor {
-    const out = this.workspace.alloc([batch, dim], this.type);
-    this.workspace.glm.fusedAddRmsnorm(out.data, ptr(residualOut), this.data, ptr(input), ptr(weight), eps, dim, batch);
-    return out;
+  fusedAddRmsnorm(input: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
+    const normed = this.workspace.alloc([batch, dim], this.type);
+    const residual = this.workspace.alloc([batch, dim], this.type);
+    this.workspace.glm.fusedAddRmsnorm(normed.data, residual.data, this.data, ptr(input), ptr(weight), eps, dim, batch);
+    return { normed, residual };
   }
 
   fusedNormRope(weight: Tensor | number, cos: Tensor | number, sin: Tensor | number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
@@ -114,8 +115,10 @@ export class Tensor implements Disposable {
     return out;
   }
 
-  embedding(table: Tensor | number, ids: Tensor | number, hidden: number, seqLen: number): void {
-    this.workspace.glm.embedding(this.data, ptr(table), ptr(ids), hidden, seqLen);
+  embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
+    const out = ids.workspace.alloc([seqLen, hidden], this.type);
+    this.workspace.glm.embedding(out.data, this.data, ptr(ids), hidden, seqLen);
+    return out;
   }
 
   siluAndMul(gate: Tensor | number, up: Tensor | number, intermediate: number, batch: number): Tensor {

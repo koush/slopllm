@@ -82,55 +82,41 @@ export abstract class WorkspaceBase implements TensorWorkspace {
   disposed = new Set<Tensor>();
   exported = new Set<Tensor>();
   private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
+  frozen = false;
 
   constructor(glm: GlmOps) {
     this.glm = glm;
   }
 
+  freeze() {
+    this.frozen = true;
+  }
+
   alloc(shape: number[], type: string, name?: string): Tensor {
-    const bytes = Tensor.byteCount(shape, type);
-
-    if (name !== undefined) {
-      const data = this.glm.alloc(bytes);
-      const tensor = new Tensor(this, data, bytes, shape, type, name, false);
-      this.tensors.set(name, tensor);
-      return tensor;
-    }
-
-    let best: Tensor | undefined;
-    for (const t of this.disposed) {
-      if (!t.pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
-        best = t;
-      }
-    }
-    if (best !== undefined) {
-      this.disposed.delete(best);
-      const data = best.data;
-      (best as { data: number }).data = 0;
-      const tensor = new Tensor(this, data, best.allocSize, shape, type, undefined, false);
-      this.tracked.add(tensor);
-      return tensor;
-    }
-
-    const data = this.glm.alloc(bytes);
-    const tensor = new Tensor(this, data, bytes, shape, type, undefined, false);
-    this.tracked.add(tensor);
-    return tensor;
+    return this._alloc(shape, type, false, name);
   }
 
   allocPinned(shape: number[], type: string, name?: string): Tensor {
+    return this._alloc(shape, type, true, name);
+  }
+
+  private _alloc(shape: number[], type: string, pinned: boolean, name?: string): Tensor {
+    if (this.frozen) {
+      throw new Error("Workspace is frozen");
+    }
+
     const bytes = Tensor.byteCount(shape, type);
 
     if (name !== undefined) {
-      const data = this.glm.allocPinned(bytes);
-      const tensor = new Tensor(this, data, bytes, shape, type, name, true);
+      const data = pinned ? this.glm.allocPinned(bytes) : this.glm.alloc(bytes);
+      const tensor = new Tensor(this, data, bytes, shape, type, name, pinned);
       this.tensors.set(name, tensor);
       return tensor;
     }
 
     let best: Tensor | undefined;
     for (const t of this.disposed) {
-      if (t.pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
+      if (t.pinned === pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
         best = t;
       }
     }
@@ -138,13 +124,13 @@ export abstract class WorkspaceBase implements TensorWorkspace {
       this.disposed.delete(best);
       const data = best.data;
       (best as { data: number }).data = 0;
-      const tensor = new Tensor(this, data, best.allocSize, shape, type, undefined, true);
+      const tensor = new Tensor(this, data, best.allocSize, shape, type, undefined, pinned);
       this.tracked.add(tensor);
       return tensor;
     }
 
-    const data = this.glm.allocPinned(bytes);
-    const tensor = new Tensor(this, data, bytes, shape, type, undefined, true);
+    const data = pinned ? this.glm.allocPinned(bytes) : this.glm.alloc(bytes);
+    const tensor = new Tensor(this, data, bytes, shape, type, undefined, pinned);
     this.tracked.add(tensor);
     return tensor;
   }
@@ -171,7 +157,7 @@ export abstract class WorkspaceBase implements TensorWorkspace {
   startTracking(): Disposable & { [Symbol.dispose](): void } {
     if (this.tracking !== null) throw new Error("startTracking already active");
     for (const tensor of this.exported) {
-      this.tracked.add(tensor);
+      this.disposed.add(tensor);
     }
     this.exported.clear();
     const ws = this;

@@ -48,8 +48,6 @@ function loadConfig(modelDir: string): Qwen3Config {
 }
 
 class Qwen3Workspace extends SamplingWorkspaceBase {
-  hiddenA: Tensor;
-  hiddenB: Tensor;
   positionIds: Tensor;
   lastIdx: Tensor;
   argmaxIdx: Tensor;
@@ -59,13 +57,7 @@ class Qwen3Workspace extends SamplingWorkspaceBase {
 
   constructor(glm: GlmOps, B: number, S: number, cfg: Qwen3Config) {
     super(glm, B, cfg.vocabSize);
-    const hs = cfg.hiddenSize;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
 
-    this.hiddenA = this.alloc([B, S, hs], "BF16", "hiddenA");
-    this.hiddenB = this.alloc([B, S, hs], "BF16", "hiddenB");
     this.positionIds = this.alloc([B * S], "I32", "positionIds");
     this.lastIdx = this.alloc([B], "I32", "lastIdx");
     this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
@@ -135,6 +127,7 @@ export class Qwen3Model extends ChatModelBase {
       model.tensors.set("lm_head.weight", embedTensor);
     }
 
+    model.freeze();
     return model;
   }
 
@@ -192,13 +185,14 @@ export class Qwen3Model extends ChatModelBase {
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : totalTokens;
 
-    this.ws.hiddenA.embedding(this.tensors.get("model.embed_tokens.weight")!, this.ws.inputIdsBuf, hs, BS);
+    const embedTable = this.tensors.get("model.embed_tokens.weight")!;
+    using residual = new UsingHolder(embedTable.embedding(ws.inputIdsBuf, hs, BS));
 
-    using cos = this.ws.alloc([B, S, hd], "BF16");
-    using sin = this.ws.alloc([B, S, hd], "BF16");
-    glm.rotaryEmbedding(cos.data, sin.data, this.invFreq.data, this.ws.positionIds.data, hd / 2, B, S);
+    using cos = ws.alloc([B, S, hd], "BF16");
+    using sin = ws.alloc([B, S, hd], "BF16");
+    glm.rotaryEmbedding(cos.data, sin.data, this.invFreq.data, ws.positionIds.data, hd / 2, B, S);
 
-    using normed = new UsingHolder(this.ws.hiddenA.rmsnorm(this.tensors.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
+    using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
@@ -209,7 +203,7 @@ export class Qwen3Model extends ChatModelBase {
       using _vBuf = qkv.vBuf;
       if (qkv.vT) { using _ = qkv.vT; }
 
-      const slotMapping = state.isDecode ? pagedKV.slotMapping.data : this.ws.prefillSlotMapping.data;
+      const slotMapping = state.isDecode ? pagedKV.slotMapping.data : ws.prefillSlotMapping.data;
       const kStride = state.isDecode ? nKv * hd : hd;
       const vStride = state.isDecode ? hd : totalTokens * hd;
       glm.kvCacheWrite(
@@ -220,8 +214,9 @@ export class Qwen3Model extends ChatModelBase {
         kStride, vStride
       );
 
+      let flashOut: Tensor;
       if (state.isDecode) {
-        const flashOut = this.ws.alloc([batchSize, nHeads, 1, hd], "BF16");
+        flashOut = ws.alloc([batchSize, nHeads, 1, hd], "BF16");
         glm.batchDecodeRun(
           qkv.qRope.data, flashOut.data,
           pagedKV.kData[i].data, pagedKV.vData[i].data,
@@ -231,17 +226,8 @@ export class Qwen3Model extends ChatModelBase {
           batchSize,
           nHeads, nKv, hd, pageSize, cfg.scaling
         );
-        using oProjBuf = flashOut.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
-        using postAttnNormed = this.ws.hiddenA.fusedAddRmsnorm(this.ws.hiddenB, oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-        using downBuf = this.mlp(postAttnNormed, BS, pfx);
-        if (i < cfg.numHiddenLayers - 1) {
-          const nextPfx = `model.layers.${i + 1}`;
-          normed.replace(this.ws.hiddenB.fusedAddRmsnorm(this.ws.hiddenA, downBuf, this.tensors.get(`${nextPfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
-        } else {
-          normed.replace(this.ws.hiddenB.fusedAddRmsnorm(this.ws.hiddenA, downBuf, this.tensors.get("model.norm.weight")!, cfg.rmsNormEps, hs, BS));
-        }
       } else {
-        const flashOut = this.ws.alloc([1, nHeads, totalTokens, hd], "BF16");
+        flashOut = ws.alloc([1, nHeads, totalTokens, hd], "BF16");
         const qStrideN = hd;
         const qStrideH = totalTokens * hd;
         glm.batchPrefillPagedRun(
@@ -249,7 +235,7 @@ export class Qwen3Model extends ChatModelBase {
           pagedKV.kData[i].data, pagedKV.vData[i].data,
           pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
           ws.floatWs.data, ws.intWs.data,
-          this.ws.qoIndptrD.data,
+          ws.qoIndptrD.data,
           ws.prefillPlanInfo.data,
           totalTokens, batchSize,
           nHeads, nKv, hd,
@@ -257,26 +243,31 @@ export class Qwen3Model extends ChatModelBase {
           qStrideN, qStrideH,
           1, cfg.scaling
         );
-        using oProjBuf = flashOut.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
-        using postAttnNormed = this.ws.hiddenA.fusedAddRmsnorm(this.ws.hiddenB, oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-        using downBuf = this.mlp(postAttnNormed, BS, pfx);
-        if (i < cfg.numHiddenLayers - 1) {
-          const nextPfx = `model.layers.${i + 1}`;
-          normed.replace(this.ws.hiddenB.fusedAddRmsnorm(this.ws.hiddenA, downBuf, this.tensors.get(`${nextPfx}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
-        } else {
-          normed.replace(this.ws.hiddenB.fusedAddRmsnorm(this.ws.hiddenA, downBuf, this.tensors.get("model.norm.weight")!, cfg.rmsNormEps, hs, BS));
-        }
       }
+      using _flashOut = flashOut;
+
+      using oProjBuf = flashOut.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
+      const attnResult = residual.value.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      using _attnNormed = attnResult.normed;
+      residual.replace(attnResult.residual);
+
+      using downBuf = this.mlp(attnResult.normed, BS, pfx);
+      const nextWeight = i < cfg.numHiddenLayers - 1
+        ? this.tensors.get(`model.layers.${i + 1}.input_layernorm.weight`)!
+        : this.tensors.get("model.norm.weight")!;
+      const mlpResult = residual.value.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
+      normed.replace(mlpResult.normed);
+      residual.replace(mlpResult.residual);
     }
 
     let logitsBuf: Tensor;
     if (state.isDecode) {
       logitsBuf = normed.value.linear(this.tensors.get("lm_head.weight")!, batchSize);
     } else {
-      using hiddenLast = normed.value.indexSelect(this.ws.lastIdx, hs, batchSize);
+      using hiddenLast = normed.value.indexSelect(ws.lastIdx, hs, batchSize);
       logitsBuf = hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
     }
-    this.ws.argmaxIdx.argmax(logitsBuf, cfg.vocabSize, batchSize);
+    ws.argmaxIdx.argmax(logitsBuf, cfg.vocabSize, batchSize);
     return logitsBuf.removeTracking();
   }
 }
