@@ -2,7 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { GlmOps } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
-import { PagedKVCache, WorkspaceBuffers } from "../src/paged_kv";
+import { PagedKVCache } from "../src/paged_kv";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "../src/model_path";
 import { generateBatchTokens } from "./test_helper";
@@ -26,7 +26,6 @@ describe("Qwen3-0.6B batch smoke test", () => {
   let glm: GlmOps;
   let model: Qwen3Model;
   let tokenizer: any;
-  let ws: WorkspaceBuffers;
   let cache: PagedKVCache;
 
   before(async () => {
@@ -34,7 +33,6 @@ describe("Qwen3-0.6B batch smoke test", () => {
     glm = new GlmOps(0);
     model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 4, 2048);
     const cfg = model.cfg;
-    ws = new WorkspaceBuffers(glm);
     cache = new PagedKVCache(glm, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, 128, 4);
     const modelDir = resolveModelPath(QWEN3_REPO);
     tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
@@ -42,13 +40,12 @@ describe("Qwen3-0.6B batch smoke test", () => {
 
   after(() => {
     cache.free();
-    ws.free();
     model.free();
   });
 
   it("2 identical 'hi' prompts produce responses containing 'hello' and 'assist'", () => {
     const promptIds = tokenizePrompt(tokenizer, "hi");
-    const generated = generateBatchTokens(model, ws, cache, [promptIds, promptIds], 128, EOS_TOKEN_IDS);
+    const generated = generateBatchTokens(model, cache, [promptIds, promptIds], 128, EOS_TOKEN_IDS);
 
     assert.equal(generated.length, 2);
 

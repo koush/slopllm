@@ -1,7 +1,6 @@
 import { GlmOps } from "./glm_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model } from "./qwen35_model";
-import { WorkspaceBuffers } from "./paged_kv";
 import { ChatModel, ChatCache, SamplingParams, makeSamplingParams, needsSampling, samplingLabel } from "./chat_model";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
@@ -134,14 +133,14 @@ function tokenizeMessages(
 // --- Generation primitives ---
 
 export function* generateStream(
-  model: ChatModel, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
+  model: ChatModel, glm: GlmOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
 ): Generator<number> {
   const suffixIds = cache.prefixMatch(0, inputIds);
   cache.appendTokens(0, suffixIds);
 
-  const firstTokens = model.forwardEager([suffixIds], ws, cache);
+  const firstTokens = model.forwardEager([suffixIds], cache);
   let currentToken = firstTokens[0];
   yield currentToken;
   cache.appendTokens(0, [currentToken]);
@@ -151,7 +150,7 @@ export function* generateStream(
   let capturing = false;
 
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
-    const state = model.planDecode([currentToken], ws, cache, useGraph);
+    const state = model.planDecode([currentToken], cache, useGraph);
 
     if (useGraph && graphState!.graphExec !== null) {
       glm.graphLaunch(graphState!.graphExec);
@@ -162,7 +161,7 @@ export function* generateStream(
         glm.graphBeginCapture();
       }
 
-      model.forwardDecode(state, ws, cache);
+      model.forwardDecode(state, cache);
 
       if (capturing) {
         const graph = glm.graphEndCapture();
@@ -188,12 +187,12 @@ export function* generateStream(
 }
 
 export function generateBatchTokens(
-  model: ChatModel, ws: WorkspaceBuffers, cache: ChatCache,
+  model: ChatModel, cache: ChatCache,
   inputIdsList: number[][], maxNewTokens: number, eosIds: Set<number>,
 ): number[][] {
   const batchSize = inputIdsList.length;
   cache.reset(batchSize);
-  const firstTokens = model.forwardEager(inputIdsList, ws, cache);
+  const firstTokens = model.forwardEager(inputIdsList, cache);
 
   const nextTokens = [...firstTokens];
   const generated: number[][] = nextTokens.map(t => [t]);
@@ -202,7 +201,7 @@ export function generateBatchTokens(
   for (let step = 0; step < maxNewTokens - 1; step++) {
     if (finished.every(f => f)) break;
 
-    const newTokens = model.forwardEagerDecode(nextTokens, ws, cache);
+    const newTokens = model.forwardEagerDecode(nextTokens, cache);
 
     for (let i = 0; i < batchSize; i++) {
       nextTokens[i] = newTokens[i];
@@ -222,7 +221,7 @@ export function generateBatchTokens(
 // --- Interactive / single-prompt modes ---
 
 async function interactiveChat(
-  model: ChatModel, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
+  model: ChatModel, glm: GlmOps, cache: ChatCache,
   tokenizer: any, args: CliArgs, graphState?: GraphState,
 ): Promise<void> {
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
@@ -270,7 +269,7 @@ async function interactiveChat(
       let tokCount = 0;
       const generatedIds: number[] = [];
 
-      for (const tokenId of generateStream(model, glm, ws, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState)) {
+      for (const tokenId of generateStream(model, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState)) {
         generatedIds.push(tokenId);
         tokCount++;
         const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -287,14 +286,13 @@ async function interactiveChat(
   } finally {
     if (graphState?.graphExec) glm.graphExecDestroy(graphState.graphExec);
     cache.free();
-    ws.free();
     model.free();
     rl.close();
   }
 }
 
 async function singlePrompt(
-  model: ChatModel, glm: GlmOps, ws: WorkspaceBuffers, cache: ChatCache,
+  model: ChatModel, glm: GlmOps, cache: ChatCache,
   tokenizer: any, args: CliArgs, graphState?: GraphState,
 ): Promise<void> {
   const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
@@ -310,7 +308,7 @@ async function singlePrompt(
   let tokCount = 0;
   const generatedIds: number[] = [];
 
-  for (const tokenId of generateStream(model, glm, ws, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState)) {
+  for (const tokenId of generateStream(model, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -323,14 +321,13 @@ async function singlePrompt(
 
   if (graphState?.graphExec) glm.graphExecDestroy(graphState.graphExec);
   cache.free();
-  ws.free();
   model.free();
 }
 
 // --- Batch mode ---
 
 async function interactiveBatch(
-  model: ChatModel, cache: ChatCache, ws: WorkspaceBuffers,
+  model: ChatModel, cache: ChatCache,
   tokenizer: any, args: CliArgs,
 ): Promise<void> {
   console.log("Enter prompts one per line. Empty line to submit batch. /clear to reset, /q to quit.");
@@ -377,7 +374,7 @@ async function interactiveBatch(
       }
 
       const start = Date.now();
-      const generatedIds = generateBatchTokens(model, ws, cache, inputIdsList, args.maxNewTokens, model.eosIds);
+      const generatedIds = generateBatchTokens(model, cache, inputIdsList, args.maxNewTokens, model.eosIds);
       const elapsed = (Date.now() - start) / 1000;
       const totalTokens = generatedIds.reduce((sum: number, ids: number[]) => sum + ids.length, 0);
 
@@ -391,7 +388,6 @@ async function interactiveBatch(
     }
   } finally {
     cache.free();
-    ws.free();
     model.free();
     rl.close();
   }
@@ -413,7 +409,6 @@ async function main(): Promise<void> {
   const model: ChatModel = args.useQwen35
     ? Qwen35Model.fromPretrained(glm, QWEN35_REPO, maxBatch, args.maxSeqLen)
     : Qwen3Model.fromPretrained(glm, repoId, maxBatch, args.maxSeqLen);
-  const ws = new WorkspaceBuffers(glm);
   const cache = model.createChatCache(args.maxPages);
 
   const modelDir = resolveModelPath(repoId);
@@ -431,14 +426,14 @@ async function main(): Promise<void> {
   console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}`);
 
   if (args.useBatch) {
-    await interactiveBatch(model, cache, ws, tokenizer, args);
+    await interactiveBatch(model, cache, tokenizer, args);
   } else {
     const graphState = args.noCudaGraph ? undefined : { graphExec: null as number | null, warmupRemaining: args.warmupSteps };
 
     if (args.prompt) {
-      await singlePrompt(model, glm, ws, cache, tokenizer, args, graphState);
+      await singlePrompt(model, glm, cache, tokenizer, args, graphState);
     } else {
-      await interactiveChat(model, glm, ws, cache, tokenizer, args, graphState);
+      await interactiveChat(model, glm, cache, tokenizer, args, graphState);
     }
   }
 }

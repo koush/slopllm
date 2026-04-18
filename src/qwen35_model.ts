@@ -3,7 +3,7 @@ import path from "node:path";
 import { GlmOps, f32ToBf16Bytes, I32 } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
-import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
+import { PagedKVCache } from "./paged_kv";
 import { Tensor } from "./tensor";
 import { Qwen35GdnState } from "./qwen35_gdn_state";
 import type { ChatCache } from "./chat_model";
@@ -487,7 +487,7 @@ export class Qwen35Model extends ChatModelBase {
     this.mlp(`layers.${layerIdx}`, BS);
   }
 
-  private fullAttnLayer(layerIdx: number, state: BatchState, pagedKV: PagedKVCache, ws: WorkspaceBuffers): void {
+  private fullAttnLayer(layerIdx: number, state: BatchState, pagedKV: PagedKVCache): void {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -540,8 +540,8 @@ export class Qwen35Model extends ChatModelBase {
         qRope.data, this.ws.flashOut.data,
         pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
         pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
-        ws.floatWs, ws.intWs,
-        ws.decodePlanInfo,
+        this.ws.floatWs.data, this.ws.intWs.data,
+        this.ws.decodePlanInfo.data,
         batchSize,
         nHeads, nKv, hd, pageSize,
         cfg.scaling
@@ -553,9 +553,9 @@ export class Qwen35Model extends ChatModelBase {
         qRope.data, this.ws.flashOut.data,
         pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
         pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
-        ws.floatWs, ws.intWs,
+        this.ws.floatWs.data, this.ws.intWs.data,
         this.ws.qoIndptrD.data,
-        ws.prefillPlanInfo,
+        this.ws.prefillPlanInfo.data,
         BS, batchSize,
         nHeads, nKv, hd, pageSize,
         qStrideN, qStrideH, 1, cfg.scaling
@@ -583,7 +583,7 @@ export class Qwen35Model extends ChatModelBase {
     }
   }
 
-  forward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
+  forward(state: BatchState, cache: ChatCache): void {
     if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
     const { pagedKV, gdnState } = cache;
     const cfg = this.cfg;
@@ -611,7 +611,7 @@ export class Qwen35Model extends ChatModelBase {
           this.gdnLayerPrefill(i, totalTokens, gdnState);
         }
       } else {
-        this.fullAttnLayer(i, state, pagedKV, ws);
+        this.fullAttnLayer(i, state, pagedKV);
       }
 
       if (i < cfg.numHiddenLayers - 1) {

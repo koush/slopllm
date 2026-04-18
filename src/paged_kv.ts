@@ -224,32 +224,3 @@ export class PagedKVCache implements ChatCache {
     this.glm.h2d(this.slotMapping, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
   }
 }
-
-export class WorkspaceBuffers {
-  private glm: GlmOps;
-  floatWs: number;
-  intWs: number;
-  pinnedIntWs: number;
-  decodePlanInfo: number;
-  prefillPlanInfo: number;
-
-  constructor(glm: GlmOps) {
-    this.glm = glm;
-    this.floatWs = glm.alloc(BATCH_FLOAT_WS_SIZE);
-    this.intWs = glm.alloc(BATCH_INT_WS_SIZE);
-    this.pinnedIntWs = glm.allocPinned(BATCH_PINNED_INT_WS_SIZE);
-    this.decodePlanInfo = glm.allocPinned(DECODE_PLAN_INFO_SIZE * 8);
-    this.prefillPlanInfo = glm.allocPinned(PREFILL_PLAN_INFO_SIZE * 8);
-  }
-
-  free(): void {
-    const glm = this.glm;
-    glm.freeBuf(this.floatWs);
-    glm.freeBuf(this.intWs);
-    glm.freePinned(this.pinnedIntWs);
-    glm.freePinned(this.decodePlanInfo);
-    glm.freePinned(this.prefillPlanInfo);
-    this.floatWs = 0;
-    this.intWs = 0;
-  }
-}

@@ -3,7 +3,7 @@ import path from "node:path";
 import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, I32 } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { resolveModelPath } from "./model_path";
-import { PagedKVCache, WorkspaceBuffers } from "./paged_kv";
+import { PagedKVCache } from "./paged_kv";
 import { Tensor } from "./tensor";
 import type { ChatCache } from "./chat_model";
 import { ChatModelBase, type BatchState, SamplingParams, SamplingWorkspaceBase } from "./chat_model";
@@ -223,10 +223,11 @@ export class Qwen3Model extends ChatModelBase {
     return S === 1 ? this.ws.vBuf.data : this.ws.vT.data;
   }
 
-  forward(state: BatchState, ws: WorkspaceBuffers, cache: ChatCache): void {
+  forward(state: BatchState, cache: ChatCache): void {
     const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;
+    const ws = this.ws;
     const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
@@ -265,8 +266,8 @@ export class Qwen3Model extends ChatModelBase {
           this.ws.qRope.data, this.ws.flashOut.data,
           pagedKV.kData[i], pagedKV.vData[i],
           pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
-          ws.floatWs, ws.intWs,
-          ws.decodePlanInfo,
+          ws.floatWs.data, ws.intWs.data,
+          ws.decodePlanInfo.data,
           batchSize,
           nHeads, nKv, hd, pageSize, cfg.scaling
         );
@@ -277,9 +278,9 @@ export class Qwen3Model extends ChatModelBase {
           this.ws.qRope.data, this.ws.flashOut.data,
           pagedKV.kData[i], pagedKV.vData[i],
           pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
-          ws.floatWs, ws.intWs,
+          ws.floatWs.data, ws.intWs.data,
           this.ws.qoIndptrD.data,
-          ws.prefillPlanInfo,
+          ws.prefillPlanInfo.data,
           totalTokens, batchSize,
           nHeads, nKv, hd,
           pageSize,

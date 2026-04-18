@@ -1,13 +1,12 @@
 import { ChatModel, ChatCache, SamplingParams, needsSampling } from "../src/chat_model";
-import { WorkspaceBuffers } from "../src/paged_kv";
 
 export function generateBatchTokens(
-  model: ChatModel, ws: WorkspaceBuffers, cache: ChatCache,
+  model: ChatModel, cache: ChatCache,
   inputIdsList: number[][], maxNewTokens: number, eosIds: Set<number>,
 ): number[][] {
   const batchSize = inputIdsList.length;
   cache.reset(batchSize);
-  const firstTokens = model.forwardEager(inputIdsList, ws, cache);
+  const firstTokens = model.forwardEager(inputIdsList, cache);
 
   const nextTokens = [...firstTokens];
   const generated: number[][] = nextTokens.map(t => [t]);
@@ -16,7 +15,7 @@ export function generateBatchTokens(
   for (let step = 0; step < maxNewTokens - 1; step++) {
     if (finished.every(f => f)) break;
 
-    const newTokens = model.forwardEagerDecode(nextTokens, ws, cache);
+    const newTokens = model.forwardEagerDecode(nextTokens, cache);
 
     for (let i = 0; i < batchSize; i++) {
       nextTokens[i] = newTokens[i];
@@ -34,12 +33,12 @@ export function generateBatchTokens(
 }
 
 export function* generateTokens(
-  model: ChatModel, ws: WorkspaceBuffers, cache: ChatCache,
+  model: ChatModel, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling?: SamplingParams,
 ): Generator<number> {
   cache.reset(1);
-  const firstTokens = model.forwardEager([inputIds], ws, cache);
+  const firstTokens = model.forwardEager([inputIds], cache);
   let nextToken = firstTokens[0];
   yield nextToken;
 
@@ -48,7 +47,7 @@ export function* generateTokens(
   for (let i = 0; i < maxNewTokens - 1; i++) {
     if (eosIds.has(nextToken)) break;
 
-    const decodeTokens = model.forwardEagerDecode([nextToken], ws, cache);
+    const decodeTokens = model.forwardEagerDecode([nextToken], cache);
     nextToken = decodeTokens[0];
 
     if (sampling && needsSampling(sampling)) {

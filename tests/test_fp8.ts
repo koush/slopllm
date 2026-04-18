@@ -2,7 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
-import { PagedKVCache, WorkspaceBuffers } from "../src/paged_kv";
+import { PagedKVCache } from "../src/paged_kv";
 import { generateTokens } from "./test_helper";
 
 const FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -70,23 +70,20 @@ describe("Qwen3-0.6B-FP8 model", () => {
 
   it("prefills and produces a valid token", () => {
     const pagedKV = makeKV(model);
-    const ws = new WorkspaceBuffers(glm);
     try {
       pagedKV.reset(1);
-      const token = model.forwardEager([[1, 2, 3, 4, 5]], ws, pagedKV)[0];
+      const token = model.forwardEager([[1, 2, 3, 4, 5]], pagedKV)[0];
       assert.ok(Number.isInteger(token), "prefill should return an integer token");
       assert.ok(token >= 0 && token < model.cfg.vocabSize, `token ${token} out of vocab range [0, ${model.cfg.vocabSize})`);
     } finally {
       pagedKV.free();
-      ws.free();
     }
   });
 
   it("decodes tokens after prefill", () => {
     const pagedKV = makeKV(model);
-    const ws = new WorkspaceBuffers(glm);
     try {
-      const tokens = [...generateTokens(model, ws, pagedKV, [1, 2, 3, 4, 5], 10, model.eosIds)];
+      const tokens = [...generateTokens(model, pagedKV, [1, 2, 3, 4, 5], 10, model.eosIds)];
       assert.ok(tokens.length > 0, "should produce at least one token");
       for (const t of tokens) {
         assert.ok(Number.isInteger(t), `token ${t} should be an integer`);
@@ -94,23 +91,20 @@ describe("Qwen3-0.6B-FP8 model", () => {
       }
     } finally {
       pagedKV.free();
-      ws.free();
     }
   });
 
   it("FP8 logits correlate with BF16 logits (cosine sim >= 0.99)", () => {
     const fp8KV = makeKV(model);
-    const ws = new WorkspaceBuffers(glm);
     const bf16Model = Qwen3Model.fromPretrained(glm, BF16_REPO, 1, 64);
     const bf16KV = makeKV(bf16Model);
-    const bf16Ws = new WorkspaceBuffers(glm);
     try {
       fp8KV.reset(1);
-      model.forwardEager([[1, 2, 3, 4, 5]], ws, fp8KV);
+      model.forwardEager([[1, 2, 3, 4, 5]], fp8KV);
       const fp8Logits = readLogits(model);
 
       bf16KV.reset(1);
-      bf16Model.forwardEager([[1, 2, 3, 4, 5]], bf16Ws, bf16KV);
+      bf16Model.forwardEager([[1, 2, 3, 4, 5]], bf16KV);
       const bf16Logits = readLogits(bf16Model);
 
       assert.equal(fp8Logits.length, bf16Logits.length, "logits length mismatch");
@@ -119,9 +113,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
       assert.ok(sim >= 0.95, `cosine similarity ${sim.toFixed(6)} < 0.95`);
     } finally {
       fp8KV.free();
-      ws.free();
       bf16KV.free();
-      bf16Ws.free();
       bf16Model.free();
     }
   });

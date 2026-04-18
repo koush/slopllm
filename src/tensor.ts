@@ -24,19 +24,27 @@ export class Tensor {
   readonly shape: number[];
   private glm: GlmOps;
   readonly name?: string;
+  private pinned: boolean;
 
-  private constructor(glm: GlmOps, data: number, shape: number[], type: string, name?: string) {
+  private constructor(glm: GlmOps, data: number, shape: number[], type: string, name: string | undefined, pinned: boolean) {
     this.glm = glm;
     this.data = data;
     this.shape = shape;
     this.type = type;
     this.name = name;
+    this.pinned = pinned;
   }
 
   static alloc(glm: GlmOps, shape: number[], type: string, name?: string): Tensor {
     const bytes = Math.ceil(numElements(shape) * SafeTensorFile.dtypeBytes(type));
     const data = glm.alloc(bytes);
-    return new Tensor(glm, data, shape, type, name);
+    return new Tensor(glm, data, shape, type, name, false);
+  }
+
+  static allocPinned(glm: GlmOps, shape: number[], type: string, name?: string): Tensor {
+    const bytes = Math.ceil(numElements(shape) * SafeTensorFile.dtypeBytes(type));
+    const data = glm.allocPinned(bytes);
+    return new Tensor(glm, data, shape, type, name, true);
   }
 
   get bytes(): number {
@@ -45,7 +53,11 @@ export class Tensor {
 
   free(): void {
     if (this.data !== 0) {
-      this.glm.freeBuf(this.data);
+      if (this.pinned) {
+        this.glm.freePinned(this.data);
+      } else {
+        this.glm.freeBuf(this.data);
+      }
       (this as { data: number }).data = 0;
     }
   }
