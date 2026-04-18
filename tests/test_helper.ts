@@ -47,11 +47,13 @@ export function* generateTokens(
   for (let i = 0; i < maxNewTokens - 1; i++) {
     if (eosIds.has(nextToken)) break;
 
-    const decodeTokens = model.forwardEagerDecode([nextToken], cache);
-    nextToken = decodeTokens[0];
-
     if (sampling && needsSampling(sampling)) {
-      nextToken = model.sampleTokenGPU(sampling, tokenHistory);
+      const state = model.planDecode([nextToken], cache);
+      const logits = model.forwardDecode(state, cache);
+      nextToken = model.sampleTokenGPU(logits, sampling, tokenHistory);
+    } else {
+      const decodeTokens = model.forwardEagerDecode([nextToken], cache);
+      nextToken = decodeTokens[0];
     }
 
     tokenHistory.push(nextToken);

@@ -30,15 +30,15 @@ export interface ChatModel {
   readonly eosIds: Set<number>;
   createChatCache(maxPages?: number): ChatCache;
   plan(inputIdsList: number[][], cache: ChatCache, enableCudaGraph?: boolean): BatchState;
-  forward(state: BatchState, cache: ChatCache): void;
+  forward(state: BatchState, cache: ChatCache): Tensor;
   read(state: BatchState): number[];
   forwardEager(inputIdsList: number[][], cache: ChatCache): number[];
   planDecode(tokenIdsList: number[], cache: ChatCache, enableCudaGraph?: boolean): BatchState;
-  forwardDecode(state: BatchState, cache: ChatCache): void;
+  forwardDecode(state: BatchState, cache: ChatCache): Tensor;
   readDecode(state: BatchState): number[];
   forwardEagerDecode(tokenIdsList: number[], cache: ChatCache): number[];
-  sampleBatchGPU(params: SamplingParams[], tokenHistories: number[][]): number[];
-  sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number;
+  sampleBatchGPU(logitsBuf: Tensor, params: SamplingParams[], tokenHistories: number[][]): number[];
+  sampleTokenGPU(logitsBuf: Tensor, params: SamplingParams, tokenHistory: number[]): number;
   free(): void;
 }
 
@@ -61,7 +61,6 @@ export interface CommonModelWorkspace {
   lastIdx: Tensor;
   qoIndptrD: Tensor;
   prefillSlotMapping: Tensor;
-  logitsBuf: Tensor;
   sampleOutToken: Tensor;
   sampleTopkVals: Tensor;
   sampleTopkIdxs: Tensor;
@@ -81,6 +80,8 @@ export abstract class WorkspaceBase implements TensorWorkspace {
   tensors = new Map<string, Tensor>();
   tracked = new Set<Tensor>();
   disposed = new Set<Tensor>();
+  exported = new Set<Tensor>();
+  private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
 
   constructor(glm: GlmOps) {
     this.glm = glm;
@@ -96,15 +97,19 @@ export abstract class WorkspaceBase implements TensorWorkspace {
       return tensor;
     }
 
+    let best: Tensor | undefined;
     for (const t of this.disposed) {
-      if (!t.pinned && t.allocSize >= bytes) {
-        this.disposed.delete(t);
-        const data = t.data;
-        (t as { data: number }).data = 0;
-        const tensor = new Tensor(this, data, t.allocSize, shape, type, undefined, false);
-        this.tracked.add(tensor);
-        return tensor;
+      if (!t.pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
+        best = t;
       }
+    }
+    if (best !== undefined) {
+      this.disposed.delete(best);
+      const data = best.data;
+      (best as { data: number }).data = 0;
+      const tensor = new Tensor(this, data, best.allocSize, shape, type, undefined, false);
+      this.tracked.add(tensor);
+      return tensor;
     }
 
     const data = this.glm.alloc(bytes);
@@ -123,15 +128,19 @@ export abstract class WorkspaceBase implements TensorWorkspace {
       return tensor;
     }
 
+    let best: Tensor | undefined;
     for (const t of this.disposed) {
-      if (t.pinned && t.allocSize >= bytes) {
-        this.disposed.delete(t);
-        const data = t.data;
-        (t as { data: number }).data = 0;
-        const tensor = new Tensor(this, data, t.allocSize, shape, type, undefined, true);
-        this.tracked.add(tensor);
-        return tensor;
+      if (t.pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
+        best = t;
       }
+    }
+    if (best !== undefined) {
+      this.disposed.delete(best);
+      const data = best.data;
+      (best as { data: number }).data = 0;
+      const tensor = new Tensor(this, data, best.allocSize, shape, type, undefined, true);
+      this.tracked.add(tensor);
+      return tensor;
     }
 
     const data = this.glm.allocPinned(bytes);
@@ -150,9 +159,33 @@ export abstract class WorkspaceBase implements TensorWorkspace {
     for (const tensor of this.disposed) {
       tensor.free();
     }
+    for (const tensor of this.exported) {
+      tensor.free();
+    }
     this.tensors.clear();
     this.tracked.clear();
     this.disposed.clear();
+    this.exported.clear();
+  }
+
+  startTracking(): Disposable & { [Symbol.dispose](): void } {
+    if (this.tracking !== null) throw new Error("startTracking already active");
+    for (const tensor of this.exported) {
+      this.tracked.add(tensor);
+    }
+    this.exported.clear();
+    const ws = this;
+    const tracker: Disposable & { [Symbol.dispose](): void } = {
+      [Symbol.dispose]() {
+        for (const tensor of ws.tracked) {
+          ws.disposed.add(tensor);
+        }
+        ws.tracked.clear();
+        ws.tracking = null;
+      },
+    };
+    this.tracking = tracker;
+    return tracker;
   }
 }
 
@@ -168,7 +201,6 @@ export abstract class SamplingWorkspaceBase extends WorkspaceBase implements Com
   abstract lastIdx: Tensor;
   abstract qoIndptrD: Tensor;
   abstract prefillSlotMapping: Tensor;
-  abstract logitsBuf: Tensor;
   sampleOutToken: Tensor;
   sampleTopkVals: Tensor;
   sampleTopkIdxs: Tensor;
@@ -350,7 +382,7 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     return { batchSize, totalTokens, seqLens, pageAllocs, isDecode: false };
   }
 
-  abstract forward(state: BatchState, cache: ChatCache): void;
+  abstract forward(state: BatchState, cache: ChatCache): Tensor;
 
   read(state: BatchState): number[] {
     const batchSize = state.batchSize;
@@ -373,8 +405,8 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     return this.plan(tokenIdsList.map(t => [t]), cache, enableCudaGraph);
   }
 
-  forwardDecode(state: BatchState, cache: ChatCache): void {
-    this.forward(state, cache);
+  forwardDecode(state: BatchState, cache: ChatCache): Tensor {
+    return this.forward(state, cache);
   }
 
   readDecode(state: BatchState): number[] {
@@ -392,9 +424,9 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     return buf.readInt32LE(0);
   }
 
-  protected readArgmaxBatch(batchSize: number): number[] {
+  protected readArgmaxBatch(logitsBuf: Tensor, batchSize: number): number[] {
     const vs = this.cfg.vocabSize;
-    this.ws.argmaxIdx.argmax(this.ws.logitsBuf, vs, batchSize);
+    this.ws.argmaxIdx.argmax(logitsBuf, vs, batchSize);
     const buf = Buffer.alloc(batchSize * I32);
     this.ws.argmaxIdx.d2h(buf);
     const result: number[] = [];
@@ -404,7 +436,7 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     return result;
   }
 
-  sampleBatchGPU(params: SamplingParams[], tokenHistories: number[][]): number[] {
+  sampleBatchGPU(logitsBuf: Tensor, params: SamplingParams[], tokenHistories: number[][]): number[] {
     const batchSize = params.length;
     if (batchSize !== tokenHistories.length) {
       throw new Error(`sampleBatchGPU: params length ${batchSize} != tokenHistories length ${tokenHistories.length}`);
@@ -488,7 +520,7 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
       ws.sampleTopkVals.data,
       ws.sampleTopkIdxs.data,
       ws.sampleWorkspace.data,
-      ws.logitsBuf.data,
+      logitsBuf.data,
       ws.samplePenaltyTokens.data,
       ws.samplePenaltyOffsets.data,
       vs,
@@ -511,8 +543,8 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     return result;
   }
 
-  sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): number {
-    return this.sampleBatchGPU([params], [tokenHistory])[0];
+  sampleTokenGPU(logitsBuf: Tensor, params: SamplingParams, tokenHistory: number[]): number {
+    return this.sampleBatchGPU(logitsBuf, [params], [tokenHistory])[0];
   }
 }
 

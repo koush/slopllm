@@ -338,15 +338,17 @@ describe("Qwen3-0.6B batch tests", () => {
       });
 
       pagedKV.reset(1);
-      const tokens = model.forwardEager([PROMPT_GRAPH], pagedKV);
+      const state = model.plan([PROMPT_GRAPH], pagedKV);
+      const logits = model.forward(state, pagedKV);
+      const tokens = model.read(state);
       pagedKV.updateIndptr();
 
       const firstToken = tokens[0];
       const history = [...PROMPT_GRAPH, firstToken];
 
-      const greedySingle = model.sampleTokenGPU(greedy, history);
+      const greedySingle = model.sampleTokenGPU(logits, greedy, history);
 
-      const batchResults = model.sampleBatchGPU([greedy, sampling], [history, history]);
+      const batchResults = model.sampleBatchGPU(logits, [greedy, sampling], [history, history]);
 
       assert.equal(batchResults[0], greedySingle,
         `Batch greedy[0] != sequential greedy: ${batchResults[0]} != ${greedySingle}`);
@@ -368,12 +370,14 @@ describe("Qwen3-0.6B batch tests", () => {
       });
 
       pagedKV.reset(2);
-      const tokens = model.forwardEager([PROMPT1, PROMPT2], pagedKV);
+      const state = model.plan([PROMPT1, PROMPT2], pagedKV);
+      const logits = model.forward(state, pagedKV);
+      const tokens = model.read(state);
 
       const history1 = [...PROMPT1, tokens[0]];
       const history2 = [...PROMPT2, tokens[1]];
 
-      const batchResults = model.sampleBatchGPU([greedy, greedy], [history1, history2]);
+      const batchResults = model.sampleBatchGPU(logits, [greedy, greedy], [history1, history2]);
 
       assert.equal(batchResults[0], tokens[0],
         `Batch greedy[0] != argmax: ${batchResults[0]} != ${tokens[0]}`);

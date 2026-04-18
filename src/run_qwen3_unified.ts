@@ -2,6 +2,7 @@ import { GlmOps } from "./glm_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model } from "./qwen35_model";
 import { ChatModel, ChatCache, SamplingParams, makeSamplingParams, needsSampling, samplingLabel } from "./chat_model";
+import { Tensor } from "./tensor";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
@@ -148,6 +149,7 @@ export function* generateStream(
   const tokenHistory = [...inputIds, currentToken];
   const useGraph = graphState !== undefined;
   let capturing = false;
+  let logits: Tensor | null = null;
 
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
     const state = model.planDecode([currentToken], cache, useGraph);
@@ -155,13 +157,14 @@ export function* generateStream(
     if (useGraph && graphState!.graphExec !== null) {
       glm.graphLaunch(graphState!.graphExec);
       glm.synchronize();
+      logits = null;
     } else {
       if (useGraph && graphState!.warmupRemaining === 0 && !capturing) {
         capturing = true;
         glm.graphBeginCapture();
       }
 
-      model.forwardDecode(state, cache);
+      logits = model.forwardDecode(state, cache);
 
       if (capturing) {
         const graph = glm.graphEndCapture();
@@ -176,8 +179,8 @@ export function* generateStream(
 
     currentToken = model.readDecode(state)[0];
 
-    if (sampling && needsSampling(sampling)) {
-      currentToken = model.sampleTokenGPU(sampling, tokenHistory);
+    if (sampling && needsSampling(sampling) && logits) {
+      currentToken = model.sampleTokenGPU(logits, sampling, tokenHistory);
     }
 
     cache.appendTokens(0, [currentToken]);

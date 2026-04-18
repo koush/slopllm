@@ -14,11 +14,8 @@ export interface TensorWorkspace {
   readonly tensors: Map<string, Tensor>;
   readonly tracked: Set<Tensor>;
   readonly disposed: Set<Tensor>;
-}
-
-export interface OpContext {
-  cfg: { hiddenSize: number; intermediateSize: number };
-  tensors: Map<string, Tensor>;
+  readonly exported: Set<Tensor>;
+  alloc(shape: number[], type: string, name?: string): Tensor;
 }
 
 export class Tensor implements Disposable {
@@ -68,6 +65,15 @@ export class Tensor implements Disposable {
     this.workspace.disposed.add(this);
   }
 
+  removeTracking(): this {
+    if (this.name !== undefined) {
+      throw new Error("Cannot removeTracking on named tensor");
+    }
+    this.workspace.tracked.delete(this);
+    this.workspace.exported.add(this);
+    return this;
+  }
+
   h2d(data: Buffer, size?: number): void {
     this.workspace.glm.h2d(this.data, data, size);
   }
@@ -76,14 +82,18 @@ export class Tensor implements Disposable {
     this.workspace.glm.d2h(buf, this.data, size);
   }
 
-  linear(input: Tensor | number, weight: Tensor | number, batch: number, n: number, k: number, context?: OpContext): void {
-    const w = typeof weight === "number" ? undefined : weight;
-    if (context && w && w.type === "F8_E4M3") {
-      const scale = context.tensors.get(w.name! + "_scale_inv")!;
-      this.workspace.glm.fp8LinearDecode(this.data, ptr(input), w.data, scale.data, batch, n, k);
+  linear(weight: Tensor, batch: number): Tensor {
+    const n = weight.shape[0];
+    const k = weight.shape[1];
+    const outShape = [batch, n];
+    const out = this.workspace.alloc(outShape, this.type);
+    if (weight.type === "F8_E4M3") {
+      const scale = weight.workspace.tensors.get(weight.name! + "_scale_inv")!;
+      this.workspace.glm.fp8LinearDecode(out.data, this.data, weight.data, scale.data, batch, n, k);
     } else {
-      this.workspace.glm.linear(this.data, ptr(input), ptr(weight), batch, n, k);
+      this.workspace.glm.linear(out.data, this.data, weight.data, batch, n, k);
     }
+    return out;
   }
 
   rmsnorm(input: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
@@ -94,24 +104,31 @@ export class Tensor implements Disposable {
     this.workspace.glm.fusedAddRmsnorm(this.data, ptr(residual), ptr(inputA), ptr(inputB), ptr(weight), eps, dim, batch);
   }
 
-  fusedNormRope(input: Tensor | number, weight: Tensor | number, cos: Tensor | number, sin: Tensor | number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): void {
-    this.workspace.glm.fusedNormRope(this.data, ptr(input), ptr(weight), ptr(cos), ptr(sin), eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
+  fusedNormRope(weight: Tensor | number, cos: Tensor | number, sin: Tensor | number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+    const out = this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
+    this.workspace.glm.fusedNormRope(out.data, this.data, ptr(weight), ptr(cos), ptr(sin), eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
+    return out;
   }
 
   embedding(table: Tensor | number, ids: Tensor | number, hidden: number, seqLen: number): void {
     this.workspace.glm.embedding(this.data, ptr(table), ptr(ids), hidden, seqLen);
   }
 
-  siluAndMul(gate: Tensor | number, up: Tensor | number, intermediate: number, batch: number): void {
-    this.workspace.glm.siluAndMul(this.data, ptr(gate), ptr(up), intermediate, batch);
+  siluAndMul(gate: Tensor | number, up: Tensor | number, intermediate: number, batch: number): Tensor {
+    const out = this.workspace.alloc([batch, intermediate], this.type);
+    this.workspace.glm.siluAndMul(out.data, ptr(gate), ptr(up), intermediate, batch);
+    return out;
   }
 
   add(a: Tensor | number, b: Tensor | number, n: number): void {
     this.workspace.glm.add(this.data, ptr(a), ptr(b), n);
   }
 
-  transpose4d(input: Tensor | number, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): void {
-    this.workspace.glm.transpose4d(this.data, ptr(input), d0, d1, d2, d3, p0, p1, p2, p3);
+  transpose4d(d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): Tensor {
+    const dims = [d0, d1, d2, d3];
+    const out = this.workspace.alloc([dims[p0], dims[p1], dims[p2], dims[p3]], this.type);
+    this.workspace.glm.transpose4d(out.data, this.data, d0, d1, d2, d3, p0, p1, p2, p3);
+    return out;
   }
 
   applyRotaryPosEmb(x: Tensor | number, cos: Tensor | number, sin: Tensor | number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {

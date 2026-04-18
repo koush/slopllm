@@ -2,6 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
+import { Tensor } from "../src/tensor";
 import { PagedKVCache } from "../src/paged_kv";
 import { generateTokens } from "./test_helper";
 
@@ -24,10 +25,10 @@ function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-function readLogits(model: Qwen3Model): Float32Array {
-  const vs = model.cfg.vocabSize;
+function readLogits(logitsBuf: Tensor): Float32Array {
+  const vs = logitsBuf.shape[1];
   const buf = Buffer.alloc(vs * 2);
-  model.ws.logitsBuf.d2h(buf);
+  logitsBuf.d2h(buf);
   return bf16BytesToF32(buf);
 }
 
@@ -100,12 +101,14 @@ describe("Qwen3-0.6B-FP8 model", () => {
     const bf16KV = makeKV(bf16Model);
     try {
       fp8KV.reset(1);
-      model.forwardEager([[1, 2, 3, 4, 5]], fp8KV);
-      const fp8Logits = readLogits(model);
+      const fp8State = model.plan([[1, 2, 3, 4, 5]], fp8KV);
+      const fp8LogitsBuf = model.forward(fp8State, fp8KV);
+      const fp8Logits = readLogits(fp8LogitsBuf);
 
       bf16KV.reset(1);
-      bf16Model.forwardEager([[1, 2, 3, 4, 5]], bf16KV);
-      const bf16Logits = readLogits(bf16Model);
+      const bf16State = bf16Model.plan([[1, 2, 3, 4, 5]], bf16KV);
+      const bf16LogitsBuf = bf16Model.forward(bf16State, bf16KV);
+      const bf16Logits = readLogits(bf16LogitsBuf);
 
       assert.equal(fp8Logits.length, bf16Logits.length, "logits length mismatch");
 
