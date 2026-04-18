@@ -1,5 +1,7 @@
 import { GlmOps, BF16, I32 } from "./glm_ops";
+import { WorkspaceBase } from "./chat_model";
 import type { ChatCache } from "./chat_model";
+import { Tensor } from "./tensor";
 
 export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
@@ -16,7 +18,7 @@ function longestPrefix(a: number[], b: number[]): number {
   return len;
 }
 
-export class PagedKVCache implements ChatCache {
+export class PagedKVCache extends WorkspaceBase implements ChatCache {
   private glm: GlmOps;
   readonly nKv: number;
   readonly hd: number;
@@ -24,21 +26,22 @@ export class PagedKVCache implements ChatCache {
   readonly maxPages: number;
   readonly maxBatch: number;
   readonly pageSize: number;
-  kData: number[];
-  vData: number[];
-  indices: number;
-  indptrD: number;
-  lastPageLen: number;
-  indptrH: number;
-  lastPageLenH: number;
-  slotMapping: number;
-  slotMappingH: number;
+  kData: Tensor[];
+  vData: Tensor[];
+  indices: Tensor;
+  indptrD: Tensor;
+  lastPageLen: Tensor;
+  indptrH: Tensor;
+  lastPageLenH: Tensor;
+  slotMapping: Tensor;
+  slotMappingH: Tensor;
   numPagesUsed: number;
   seqPages: number[][];
   seqKvLens: number[];
   cachedTokenIds: number[][];
 
   constructor(glm: GlmOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE) {
+    super();
     this.glm = glm;
     this.nKv = nKv;
     this.hd = hd;
@@ -49,35 +52,20 @@ export class PagedKVCache implements ChatCache {
     this.kData = [];
     this.vData = [];
     for (let i = 0; i < nLayers; i++) {
-      this.kData.push(glm.alloc(maxPages * nKv * pageSize * hd * BF16));
-      this.vData.push(glm.alloc(maxPages * nKv * pageSize * hd * BF16));
+      this.kData.push(this.alloc(glm, [maxPages * nKv * pageSize * hd * BF16], "U8"));
+      this.vData.push(this.alloc(glm, [maxPages * nKv * pageSize * hd * BF16], "U8"));
     }
-    this.indices = glm.alloc(maxPages * I32);
-    this.indptrD = glm.alloc((maxBatch + 1) * I32);
-    this.lastPageLen = glm.alloc(maxBatch * I32);
-    this.indptrH = glm.allocPinned((maxBatch + 1) * I32);
-    this.lastPageLenH = glm.allocPinned(maxBatch * I32);
-    this.slotMapping = glm.alloc(maxBatch * I32);
-    this.slotMappingH = glm.allocPinned(maxBatch * I32);
+    this.indices = this.alloc(glm, [maxPages * I32], "I32", "indices");
+    this.indptrD = this.alloc(glm, [(maxBatch + 1) * I32], "I32", "indptrD");
+    this.lastPageLen = this.alloc(glm, [maxBatch * I32], "I32", "lastPageLen");
+    this.indptrH = this.allocPinned(glm, [(maxBatch + 1) * I32], "I32", "indptrH");
+    this.lastPageLenH = this.allocPinned(glm, [maxBatch * I32], "I32", "lastPageLenH");
+    this.slotMapping = this.alloc(glm, [maxBatch * I32], "I32", "slotMapping");
+    this.slotMappingH = this.allocPinned(glm, [maxBatch * I32], "I32", "slotMappingH");
     this.numPagesUsed = 0;
     this.seqPages = [];
     this.seqKvLens = [];
     this.cachedTokenIds = [];
-  }
-
-  free(): void {
-    const glm = this.glm;
-    for (const ptr of this.kData) glm.freeBuf(ptr);
-    for (const ptr of this.vData) glm.freeBuf(ptr);
-    glm.freeBuf(this.indices);
-    glm.freeBuf(this.indptrD);
-    glm.freeBuf(this.lastPageLen);
-    glm.freePinned(this.indptrH);
-    glm.freePinned(this.lastPageLenH);
-    glm.freeBuf(this.slotMapping);
-    glm.freePinned(this.slotMappingH);
-    this.kData = [];
-    this.vData = [];
   }
 
   reset(batchSize: number): void {
@@ -206,11 +194,11 @@ export class PagedKVCache implements ChatCache {
     }
     const lastPageLenBuf = Int32Array.from(lastPageLenList);
 
-    this.glm.writePinned(this.indptrH, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
-    this.glm.writePinned(this.lastPageLenH, Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
-    this.glm.h2d(this.indices, Buffer.from(indicesBuf.buffer, indicesBuf.byteOffset, indicesBuf.byteLength));
-    this.glm.h2d(this.indptrD, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
-    this.glm.h2d(this.lastPageLen, Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
+    this.glm.writePinned(this.indptrH.data, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
+    this.glm.writePinned(this.lastPageLenH.data, Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
+    this.glm.h2d(this.indices.data, Buffer.from(indicesBuf.buffer, indicesBuf.byteOffset, indicesBuf.byteLength));
+    this.glm.h2d(this.indptrD.data, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
+    this.glm.h2d(this.lastPageLen.data, Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
   }
 
   updateSlotMapping(writeLocations: [number, number][], pageSize: number): void {
@@ -220,7 +208,7 @@ export class PagedKVCache implements ChatCache {
       const [absPage, slotInPage] = writeLocations[i];
       slotMappingBuf[i] = absPage * pageSize + slotInPage;
     }
-    this.glm.writePinned(this.slotMappingH, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
-    this.glm.h2d(this.slotMapping, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+    this.glm.writePinned(this.slotMappingH.data, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+    this.glm.h2d(this.slotMapping.data, Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
   }
 }

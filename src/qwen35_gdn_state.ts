@@ -1,8 +1,9 @@
-import { GlmOps, BF16, I32 } from "./glm_ops";
+import { GlmOps } from "./glm_ops";
+import { WorkspaceBase } from "./chat_model";
 import { Tensor } from "./tensor";
 import { Qwen35Config } from "./qwen35_model";
 
-export class Qwen35GdnState {
+export class Qwen35GdnState extends WorkspaceBase {
   convState: Tensor[];
   recurrentState: Tensor[];
   cuSeqlens: Tensor;
@@ -16,6 +17,7 @@ export class Qwen35GdnState {
   readonly recurrentStateStride: number;
 
   constructor(glm: GlmOps, cfg: Qwen35Config, batchSize = 1) {
+    super();
     this.glm = glm;
     this.cfg = cfg;
     this.batchSize = batchSize;
@@ -32,14 +34,14 @@ export class Qwen35GdnState {
     this.recurrentState = [];
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       if (cfg.layerTypes[i] === "linear_attention") {
-        this.convState.push(Tensor.alloc(glm, [batchSize * this.convStateSize], "BF16"));
-        this.recurrentState.push(Tensor.alloc(glm, [batchSize * this.recurrentStateSize], "F32"));
+        this.convState.push(this.alloc(glm, [batchSize * this.convStateSize], "BF16"));
+        this.recurrentState.push(this.alloc(glm, [batchSize * this.recurrentStateSize], "F32"));
       } else {
         this.convState.push(null!);
         this.recurrentState.push(null!);
       }
     }
-    this.cuSeqlens = Tensor.alloc(glm, [batchSize + 1], "I32");
+    this.cuSeqlens = this.alloc(glm, [batchSize + 1], "I32", "cuSeqlens");
     this.zeroStates();
   }
 
@@ -63,13 +65,5 @@ export class Qwen35GdnState {
 
   reset(): void {
     this.zeroStates();
-  }
-
-  free(): void {
-    for (const t of this.convState) { if (t) t.free(); }
-    for (const t of this.recurrentState) { if (t) t.free(); }
-    this.convState = [];
-    this.recurrentState = [];
-    this.cuSeqlens.free();
   }
 }

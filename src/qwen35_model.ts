@@ -162,52 +162,50 @@ class Qwen35Workspace extends SamplingWorkspaceBase {
     const zDim = linHeads * linVDim;
     const BS = B * S;
 
-    this.hiddenA = Tensor.alloc(glm, [B, S, hs], "BF16");
-    this.hiddenB = Tensor.alloc(glm, [B, S, hs], "BF16");
-    this.normed = Tensor.alloc(glm, [B, S, hs], "BF16");
-    this.gateBuf = Tensor.alloc(glm, [B, S, inter], "BF16");
-    this.upBuf = Tensor.alloc(glm, [B, S, inter], "BF16");
-    this.siluBuf = Tensor.alloc(glm, [B, S, inter], "BF16");
-    this.downBuf = Tensor.alloc(glm, [B, S, hs], "BF16");
-    this.logitsBuf = Tensor.alloc(glm, [B, cfg.vocabSize], "BF16");
-    this.hiddenLast = Tensor.alloc(glm, [B, hs], "BF16");
-    this.lastIdx = Tensor.alloc(glm, [B], "I32");
-    this.argmaxIdx = Tensor.alloc(glm, [B], "I32");
-    this.positionIds = Tensor.alloc(glm, [B * S], "I32");
-    this.cos = Tensor.alloc(glm, [B, S, hd], "BF16");
-    this.sin = Tensor.alloc(glm, [B, S, hd], "BF16");
-    this.inputIdsBuf = Tensor.alloc(glm, [B * S], "I32");
-    this.flashOut = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
-    this.oProjBuf = Tensor.alloc(glm, [B, S, hs], "BF16");
+    this.hiddenA = this.alloc(glm, [B, S, hs], "BF16", "hiddenA");
+    this.hiddenB = this.alloc(glm, [B, S, hs], "BF16", "hiddenB");
+    this.normed = this.alloc(glm, [B, S, hs], "BF16", "normed");
+    this.gateBuf = this.alloc(glm, [B, S, inter], "BF16", "gateBuf");
+    this.upBuf = this.alloc(glm, [B, S, inter], "BF16", "upBuf");
+    this.siluBuf = this.alloc(glm, [B, S, inter], "BF16", "siluBuf");
+    this.downBuf = this.alloc(glm, [B, S, hs], "BF16", "downBuf");
+    this.logitsBuf = this.alloc(glm, [B, cfg.vocabSize], "BF16", "logitsBuf");
+    this.hiddenLast = this.alloc(glm, [B, hs], "BF16", "hiddenLast");
+    this.lastIdx = this.alloc(glm, [B], "I32", "lastIdx");
+    this.argmaxIdx = this.alloc(glm, [B], "I32", "argmaxIdx");
+    this.positionIds = this.alloc(glm, [B * S], "I32", "positionIds");
+    this.cos = this.alloc(glm, [B, S, hd], "BF16", "cos");
+    this.sin = this.alloc(glm, [B, S, hd], "BF16", "sin");
+    this.inputIdsBuf = this.alloc(glm, [B * S], "I32", "inputIdsBuf");
+    this.flashOut = this.alloc(glm, [B, nHeads, S, hd], "BF16", "flashOut");
+    this.oProjBuf = this.alloc(glm, [B, S, hs], "BF16", "oProjBuf");
 
-    this.gdnQkvBuf = Tensor.alloc(glm, [B * convDim], "BF16");
-    this.gdnABuf = Tensor.alloc(glm, [B * linHeads], "BF16");
-    this.gdnBBuf = Tensor.alloc(glm, [B * linHeads], "BF16");
-    this.gdnZBuf = Tensor.alloc(glm, [B * zDim], "BF16");
-    this.gdnOut = Tensor.alloc(glm, [B * linHeads * linVDim], "BF16");
-    this.gdnGatedOut = Tensor.alloc(glm, [B * linHeads * linVDim], "BF16");
+    this.gdnQkvBuf = this.alloc(glm, [B * convDim], "BF16", "gdnQkvBuf");
+    this.gdnABuf = this.alloc(glm, [B * linHeads], "BF16", "gdnABuf");
+    this.gdnBBuf = this.alloc(glm, [B * linHeads], "BF16", "gdnBBuf");
+    this.gdnZBuf = this.alloc(glm, [B * zDim], "BF16", "gdnZBuf");
+    this.gdnOut = this.alloc(glm, [B * linHeads * linVDim], "BF16", "gdnOut");
+    this.gdnGatedOut = this.alloc(glm, [B * linHeads * linVDim], "BF16", "gdnGatedOut");
 
-    this.gdnPrefillQkvLinear = Tensor.alloc(glm, [BS, convDim], "BF16");
-    this.gdnPrefillQkvBuf = Tensor.alloc(glm, [convDim, S], "BF16");
-    this.gdnPrefillABuf = Tensor.alloc(glm, [BS * linHeads], "BF16");
-    this.gdnPrefillBBuf = Tensor.alloc(glm, [BS * linHeads], "BF16");
-    this.gdnPrefillZBuf = Tensor.alloc(glm, [BS, zDim], "BF16");
-    this.gdnPrefillConvOut = Tensor.alloc(glm, [convDim, S], "BF16");
-    this.gdnPrefillOut = Tensor.alloc(glm, [S * linHeads, linVDim], "BF16");
-    this.gdnPrefillGatedOut = Tensor.alloc(glm, [S * linHeads, linVDim], "BF16");
+    this.gdnPrefillQkvLinear = this.alloc(glm, [BS, convDim], "BF16", "gdnPrefillQkvLinear");
+    this.gdnPrefillQkvBuf = this.alloc(glm, [convDim, S], "BF16", "gdnPrefillQkvBuf");
+    this.gdnPrefillABuf = this.alloc(glm, [BS * linHeads], "BF16", "gdnPrefillABuf");
+    this.gdnPrefillBBuf = this.alloc(glm, [BS * linHeads], "BF16", "gdnPrefillBBuf");
+    this.gdnPrefillZBuf = this.alloc(glm, [BS, zDim], "BF16", "gdnPrefillZBuf");
+    this.gdnPrefillConvOut = this.alloc(glm, [convDim, S], "BF16", "gdnPrefillConvOut");
+    this.gdnPrefillOut = this.alloc(glm, [S * linHeads, linVDim], "BF16", "gdnPrefillOut");
+    this.gdnPrefillGatedOut = this.alloc(glm, [S * linHeads, linVDim], "BF16", "gdnPrefillGatedOut");
 
     const qTotalDim = nHeads * hd;
-    this.attnQBuf = Tensor.alloc(glm, [BS, qTotalDim * 2], "BF16");
-    this.attnKBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
-    this.attnVBuf = Tensor.alloc(glm, [BS, nKv * hd], "BF16");
-    this.attnVT = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
-    this.attnQRope = Tensor.alloc(glm, [B, nHeads, S, hd], "BF16");
-    this.attnKRope = Tensor.alloc(glm, [B, nKv, S, hd], "BF16");
+    this.attnQBuf = this.alloc(glm, [BS, qTotalDim * 2], "BF16", "attnQBuf");
+    this.attnKBuf = this.alloc(glm, [BS, nKv * hd], "BF16", "attnKBuf");
+    this.attnVBuf = this.alloc(glm, [BS, nKv * hd], "BF16", "attnVBuf");
+    this.attnVT = this.alloc(glm, [B, nKv, S, hd], "BF16", "attnVT");
+    this.attnQRope = this.alloc(glm, [B, nHeads, S, hd], "BF16", "attnQRope");
+    this.attnKRope = this.alloc(glm, [B, nKv, S, hd], "BF16", "attnKRope");
 
-    this.qoIndptrD = Tensor.alloc(glm, [B + 1], "I32");
-    this.prefillSlotMapping = Tensor.alloc(glm, [B * S], "I32");
-
-    this.buildTensorMap();
+    this.qoIndptrD = this.alloc(glm, [B + 1], "I32", "qoIndptrD");
+    this.prefillSlotMapping = this.alloc(glm, [B * S], "I32", "prefillSlotMapping");
   }
 }
 
@@ -524,13 +522,13 @@ export class Qwen35Model extends ChatModelBase {
       this.ws.attnVT.transpose4d(vBuf, B, S, nKv, hd, 0, 2, 1, 3);
     }
 
-    const slotMapping = state.isDecode ? pagedKV.slotMapping : this.ws.prefillSlotMapping.data;
+    const slotMapping = state.isDecode ? pagedKV.slotMapping.data : this.ws.prefillSlotMapping.data;
     const kStride = state.isDecode ? nKv * hd : hd;
     const vStride = state.isDecode ? hd : BS * hd;
 
     glm.kvCacheWrite(
       kRope.data, vData,
-      pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
+      pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
       slotMapping, BS, nKv, hd, pageSize,
       kStride, vStride
     );
@@ -538,8 +536,8 @@ export class Qwen35Model extends ChatModelBase {
     if (state.isDecode) {
       glm.batchDecodeRun(
         qRope.data, this.ws.flashOut.data,
-        pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
-        pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
+        pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
+        pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
         this.ws.floatWs.data, this.ws.intWs.data,
         this.ws.decodePlanInfo.data,
         batchSize,
@@ -551,8 +549,8 @@ export class Qwen35Model extends ChatModelBase {
       const qStrideH = BS * hd;
       glm.batchPrefillPagedRun(
         qRope.data, this.ws.flashOut.data,
-        pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
-        pagedKV.indices, pagedKV.indptrD, pagedKV.lastPageLen,
+        pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
+        pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
         this.ws.floatWs.data, this.ws.intWs.data,
         this.ws.qoIndptrD.data,
         this.ws.prefillPlanInfo.data,

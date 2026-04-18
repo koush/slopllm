@@ -78,27 +78,37 @@ export interface CommonModelWorkspace {
 
 export abstract class WorkspaceBase {
   tensors = new Map<string, Tensor>();
+  tracked = new Set<Tensor>();
 
-  alloc(glm: GlmOps, shape: number[], type: string, name: string): Tensor {
+  alloc(glm: GlmOps, shape: number[], type: string, name?: string): Tensor {
     const tensor = Tensor.alloc(glm, shape, type, name);
-    this.tensors.set(name!, tensor);
+    if (name !== undefined) {
+      this.tensors.set(name, tensor);
+    } else {
+      this.tracked.add(tensor);
+    }
     return tensor;
   }
 
-  protected buildTensorMap(): void {
-    for (const key of Object.keys(this) as (keyof this)[]) {
-      const value = this[key];
-      if (value instanceof Tensor && typeof key === 'string') {
-        this.tensors.set(key, value);
-      }
+  allocPinned(glm: GlmOps, shape: number[], type: string, name?: string): Tensor {
+    const tensor = Tensor.allocPinned(glm, shape, type, name);
+    if (name !== undefined) {
+      this.tensors.set(name, tensor);
+    } else {
+      this.tracked.add(tensor);
     }
+    return tensor;
   }
 
   free(): void {
     for (const tensor of this.tensors.values()) {
       tensor.free();
     }
+    for (const tensor of this.tracked) {
+      tensor.free();
+    }
     this.tensors.clear();
+    this.tracked.clear();
   }
 }
 
@@ -131,24 +141,24 @@ export abstract class SamplingWorkspaceBase extends WorkspaceBase implements Com
   constructor(glm: GlmOps, B: number, vs: number) {
     super();
 
-    this.floatWs = Tensor.alloc(glm, [BATCH_FLOAT_WS_SIZE], "U8", "floatWs");
-    this.intWs = Tensor.alloc(glm, [BATCH_INT_WS_SIZE], "U8", "intWs");
-    this.pinnedIntWs = Tensor.allocPinned(glm, [BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
-    this.decodePlanInfo = Tensor.allocPinned(glm, [DECODE_PLAN_INFO_SIZE * 8], "U8", "decodePlanInfo");
-    this.prefillPlanInfo = Tensor.allocPinned(glm, [PREFILL_PLAN_INFO_SIZE * 8], "U8", "prefillPlanInfo");
+    this.floatWs = this.alloc(glm, [BATCH_FLOAT_WS_SIZE], "U8", "floatWs");
+    this.intWs = this.alloc(glm, [BATCH_INT_WS_SIZE], "U8", "intWs");
+    this.pinnedIntWs = this.allocPinned(glm, [BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
+    this.decodePlanInfo = this.allocPinned(glm, [DECODE_PLAN_INFO_SIZE * 8], "U8", "decodePlanInfo");
+    this.prefillPlanInfo = this.allocPinned(glm, [PREFILL_PLAN_INFO_SIZE * 8], "U8", "prefillPlanInfo");
 
-    this.sampleOutToken = Tensor.alloc(glm, [B], "I32");
-    this.sampleTopkVals = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
-    this.sampleTopkIdxs = Tensor.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
-    this.sampleWorkspace = Tensor.alloc(glm, [B * vs], "F32");
-    this.samplePenaltyTokens = Tensor.alloc(glm, [B * 1024], "I32");
-    this.samplePenaltyOffsets = Tensor.alloc(glm, [B + 1], "I32");
-    this.sampleTemperatures = Tensor.alloc(glm, [B], "F32");
-    this.sampleRepPenalties = Tensor.alloc(glm, [B], "F32");
-    this.samplePresPenalties = Tensor.alloc(glm, [B], "F32");
-    this.sampleTopKs = Tensor.alloc(glm, [B], "I32");
-    this.sampleTopPs = Tensor.alloc(glm, [B], "F32");
-    this.sampleRandomVals = Tensor.alloc(glm, [B], "F32");
+    this.sampleOutToken = this.alloc(glm, [B], "I32", "sampleOutToken");
+    this.sampleTopkVals = this.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32", "sampleTopkVals");
+    this.sampleTopkIdxs = this.alloc(glm, [B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32", "sampleTopkIdxs");
+    this.sampleWorkspace = this.alloc(glm, [B * vs], "F32", "sampleWorkspace");
+    this.samplePenaltyTokens = this.alloc(glm, [B * 1024], "I32", "samplePenaltyTokens");
+    this.samplePenaltyOffsets = this.alloc(glm, [B + 1], "I32", "samplePenaltyOffsets");
+    this.sampleTemperatures = this.alloc(glm, [B], "F32", "sampleTemperatures");
+    this.sampleRepPenalties = this.alloc(glm, [B], "F32", "sampleRepPenalties");
+    this.samplePresPenalties = this.alloc(glm, [B], "F32", "samplePresPenalties");
+    this.sampleTopKs = this.alloc(glm, [B], "I32", "sampleTopKs");
+    this.sampleTopPs = this.alloc(glm, [B], "F32", "sampleTopPs");
+    this.sampleRandomVals = this.alloc(glm, [B], "F32", "sampleRandomVals");
   }
 }
 
@@ -214,7 +224,7 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
         ws.floatWs.data, BATCH_FLOAT_WS_SIZE,
         ws.intWs.data, ws.pinnedIntWs.data, BATCH_INT_WS_SIZE,
         ws.decodePlanInfo.data,
-        pagedKV.indptrH,
+        pagedKV.indptrH.data,
         batchSize,
         nHeads, nKv, hd, pageSize,
         enableCudaGraph
@@ -265,7 +275,7 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
       ws.floatWs.data, BATCH_FLOAT_WS_SIZE,
       ws.intWs.data, ws.pinnedIntWs.data, BATCH_INT_WS_SIZE,
       ws.prefillPlanInfo.data,
-      qoIndptrHostPtr, pagedKV.indptrH,
+      qoIndptrHostPtr, pagedKV.indptrH.data,
       totalTokens, batchSize,
       nHeads, nKv, hd,
       pageSize,
