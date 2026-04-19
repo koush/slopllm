@@ -409,36 +409,15 @@ export class Qwen35Model extends ChatModelBase {
 
     using flashOut = new UsingHolder<Tensor>(undefined!);
     if (state.isDecode) {
-      flashOut.replace(this.ws.alloc([batchSize, nHeads, 1, hd], "BF16"));
-      glm.batchDecodeRun(
-        qRope.data, flashOut.value.data,
-        pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
-        pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
-        this.ws.floatWs.data, this.ws.intWs.data,
-        this.ws.decodePlanInfo.data,
-        batchSize,
-        nHeads, nKv, hd, pageSize,
-        cfg.scaling
-      );
+      flashOut.replace(qRope.flashDecode(pagedKV, cacheIdx, batchSize, nHeads, nKv, hd, cfg.scaling));
     } else {
-      flashOut.replace(this.ws.alloc([1, nHeads, totalTokens, hd], "BF16"));
       const qStrideN = hd;
       const qStrideH = BS * hd;
-      glm.batchPrefillPagedRun(
-        qRope.data, flashOut.value.data,
-        pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
-        pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
-        this.ws.floatWs.data, this.ws.intWs.data,
-        this.ws.qoIndptrD.data,
-        this.ws.prefillPlanInfo.data,
-        BS, batchSize,
-        nHeads, nKv, hd, pageSize,
-        qStrideN, qStrideH, 1, cfg.scaling
-      );
+      flashOut.replace(qRope.flashPrefillPaged(pagedKV, cacheIdx, BS, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
     }
 
     if (cfg.attnOutputGate) {
-      glm.gateSigmoidMul(flashOut.value.data, qBuf.data, BS, nHeads, hd);
+      flashOut.value.gateSigmoidMul(qBuf, BS, nHeads, hd);
     }
 
     using oProjBuf = flashOut.value.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
@@ -483,9 +462,9 @@ export class Qwen35Model extends ChatModelBase {
     using residual = new UsingHolder(embedTable.embedding(this.ws.inputIdsBuf, hs, BS));
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    using cos = this.ws.alloc([B, S, hd], "BF16");
-    using sin = this.ws.alloc([B, S, hd], "BF16");
-    glm.rotaryEmbedding(cos.data, sin.data, this.invFreq.data, this.ws.positionIds.data, ropeDim / 2, B, S);
+    const rotaryEmbedding = this.invFreq.rotaryEmbedding(this.ws.positionIds, ropeDim / 2, B, S);
+    using cos = rotaryEmbedding.cos;
+    using sin = rotaryEmbedding.sin;
 
     using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
 

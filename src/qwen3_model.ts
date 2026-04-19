@@ -167,9 +167,9 @@ export class Qwen3Model extends ChatModelBase {
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
     using residual = new UsingHolder(embedTable.embedding(ws.inputIdsBuf, hs, BS));
 
-    using cos = ws.alloc([B, S, hd], "BF16");
-    using sin = ws.alloc([B, S, hd], "BF16");
-    glm.rotaryEmbedding(cos.data, sin.data, this.invFreq.data, ws.positionIds.data, hd / 2, B, S);
+    const rotaryEmbedding = this.invFreq.rotaryEmbedding(ws.positionIds, hd / 2, B, S);
+    using cos = rotaryEmbedding.cos;
+    using sin = rotaryEmbedding.sin;
 
     using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
 
@@ -196,33 +196,11 @@ export class Qwen3Model extends ChatModelBase {
 
       using flashOut = new UsingHolder<Tensor>(undefined!);
       if (state.isDecode) {
-        flashOut.replace(ws.alloc([batchSize, nHeads, 1, hd], "BF16"));
-        glm.batchDecodeRun(
-          qRope.data, flashOut.value.data,
-          pagedKV.kData[i].data, pagedKV.vData[i].data,
-          pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
-          ws.floatWs.data, ws.intWs.data,
-          ws.decodePlanInfo.data,
-          batchSize,
-          nHeads, nKv, hd, pageSize, cfg.scaling
-        );
+        flashOut.replace(qRope.flashDecode(pagedKV, i, batchSize, nHeads, nKv, hd, cfg.scaling));
       } else {
-        flashOut.replace(ws.alloc([1, nHeads, totalTokens, hd], "BF16"));
         const qStrideN = hd;
         const qStrideH = totalTokens * hd;
-        glm.batchPrefillPagedRun(
-          qRope.data, flashOut.value.data,
-          pagedKV.kData[i].data, pagedKV.vData[i].data,
-          pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
-          ws.floatWs.data, ws.intWs.data,
-          ws.qoIndptrD.data,
-          ws.prefillPlanInfo.data,
-          totalTokens, batchSize,
-          nHeads, nKv, hd,
-          pageSize,
-          qStrideN, qStrideH,
-          1, cfg.scaling
-        );
+        flashOut.replace(qRope.flashPrefillPaged(pagedKV, i, totalTokens, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
       }
 
       using oProjBuf = flashOut.value.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);

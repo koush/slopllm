@@ -1,5 +1,7 @@
 import { GlmOps } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
+import type { PagedKVCache } from "./paged_kv";
+import type { CommonModelWorkspace } from "./chat_model";
 
 function ptr(t: Tensor | number): number {
   return typeof t === "number" ? t : t.data;
@@ -183,5 +185,47 @@ export class Tensor implements Disposable {
 
   mul(a: Tensor | number, b: Tensor | number, n: number): void {
     this.workspace.glm.mul(this.data, ptr(a), ptr(b), n);
+  }
+
+  flashDecode(pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
+    const ws = this.workspace as unknown as CommonModelWorkspace;
+    const out = this.workspace.alloc([batchSize, nHeads, 1, hd], this.type);
+    this.workspace.glm.batchDecodeRun(
+      this.data, out.data,
+      pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
+      pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
+      ws.floatWs.data, ws.intWs.data,
+      ws.decodePlanInfo.data,
+      batchSize, nHeads, nKv, hd, pagedKV.pageSize, smScale
+    );
+    return out;
+  }
+
+  flashPrefillPaged(pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): Tensor {
+    const ws = this.workspace as unknown as CommonModelWorkspace;
+    const out = this.workspace.alloc([1, nHeads, totalTokens, hd], this.type);
+    this.workspace.glm.batchPrefillPagedRun(
+      this.data, out.data,
+      pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
+      pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
+      ws.floatWs.data, ws.intWs.data,
+      ws.qoIndptrD.data,
+      ws.prefillPlanInfo.data,
+      totalTokens, batchSize, nHeads, nKv, hd, pagedKV.pageSize,
+      qStrideN, qStrideH, maskMode, smScale
+    );
+    return out;
+  }
+
+  gateSigmoidMul(gate: Tensor | number, batchSeq: number, numHeads: number, headDim: number): void {
+    this.workspace.glm.gateSigmoidMul(this.data, ptr(gate), batchSeq, numHeads, headDim);
+  }
+
+  rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
+    const hd = dimHalf * 2;
+    const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
+    const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
+    this.workspace.glm.rotaryEmbedding(cos.data, sin.data, this.data, positionIds.data, dimHalf, batch, seqLen);
+    return { cos, sin };
   }
 }
