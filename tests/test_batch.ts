@@ -349,9 +349,9 @@ describe("Qwen3-0.6B batch tests", () => {
       const firstToken = tokens[0];
       const history = [...PROMPT_GRAPH, firstToken];
 
-      const greedySingle = model.sampleTokenGPU(state, logits, greedy, history);
+      const greedySingle = state.ws.sampleTokenGPU(logits, greedy, history);
 
-      const batchResults = model.sampleBatchGPU(state, logits, [greedy, sampling], [history, history]);
+      const batchResults = state.ws.sampleBatchGPU(logits, [greedy, sampling], [history, history]);
 
       assert.equal(batchResults[0], greedySingle,
         `Batch greedy[0] != sequential greedy: ${batchResults[0]} != ${greedySingle}`);
@@ -380,7 +380,7 @@ describe("Qwen3-0.6B batch tests", () => {
       const history1 = [...PROMPT1, tokens[0]];
       const history2 = [...PROMPT2, tokens[1]];
 
-      const batchResults = model.sampleBatchGPU(state, logits, [greedy, greedy], [history1, history2]);
+      const batchResults = state.ws.sampleBatchGPU(logits, [greedy, greedy], [history1, history2]);
 
       assert.equal(batchResults[0], tokens[0],
         `Batch greedy[0] != argmax: ${batchResults[0]} != ${tokens[0]}`);

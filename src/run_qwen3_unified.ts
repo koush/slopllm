@@ -180,7 +180,7 @@ export function* generateStream(
     currentToken = model.readDecode(state)[0];
 
     if (sampling && needsSampling(sampling) && logits) {
-      currentToken = model.sampleTokenGPU(state, logits, sampling, tokenHistory);
+      currentToken = state.ws.sampleTokenGPU(logits, sampling, tokenHistory);
     }
 
     cache.appendTokens(0, [currentToken]);

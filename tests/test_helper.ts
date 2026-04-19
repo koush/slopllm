@@ -50,7 +50,7 @@ export function* generateTokens(
     if (sampling && needsSampling(sampling)) {
       const state = model.planDecode(ws, [nextToken], cache);
       const logits = model.forwardDecode(state);
-      nextToken = model.sampleTokenGPU(state, logits, sampling, tokenHistory);
+      nextToken = state.ws.sampleTokenGPU(logits, sampling, tokenHistory);
     } else {
       const decodeTokens = model.forwardEagerDecode(ws, [nextToken], cache);
       nextToken = decodeTokens[0];
