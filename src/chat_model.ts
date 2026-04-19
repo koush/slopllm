@@ -24,21 +24,24 @@ export interface BatchState {
   seqLens: number[];
   pageAllocs: [number, number][];
   readonly isDecode: boolean;
+  readonly ws: SamplingWorkspaceBase;
+  readonly cache: ChatCache;
 }
 
 export interface ChatModel {
   readonly eosIds: Set<number>;
+  readonly vocabSize: number;
   createChatCache(maxPages?: number): ChatCache;
-  plan(inputIdsList: number[][], cache: ChatCache, enableCudaGraph?: boolean): BatchState;
-  forward(state: BatchState, cache: ChatCache): Tensor;
+  plan(ws: SamplingWorkspaceBase, inputIdsList: number[][], cache: ChatCache, enableCudaGraph?: boolean): BatchState;
+  forward(state: BatchState): Tensor;
   read(state: BatchState): number[];
-  forwardEager(inputIdsList: number[][], cache: ChatCache): number[];
-  planDecode(tokenIdsList: number[], cache: ChatCache, enableCudaGraph?: boolean): BatchState;
-  forwardDecode(state: BatchState, cache: ChatCache): Tensor;
+  forwardEager(ws: SamplingWorkspaceBase, inputIdsList: number[][], cache: ChatCache): number[];
+  planDecode(ws: SamplingWorkspaceBase, tokenIdsList: number[], cache: ChatCache, enableCudaGraph?: boolean): BatchState;
+  forwardDecode(state: BatchState): Tensor;
   readDecode(state: BatchState): number[];
-  forwardEagerDecode(tokenIdsList: number[], cache: ChatCache): number[];
-  sampleBatchGPU(logitsBuf: Tensor, params: SamplingParams[], tokenHistories: number[][]): number[];
-  sampleTokenGPU(logitsBuf: Tensor, params: SamplingParams, tokenHistory: number[]): number;
+  forwardEagerDecode(ws: SamplingWorkspaceBase, tokenIdsList: number[], cache: ChatCache): number[];
+  sampleBatchGPU(state: BatchState, logitsBuf: Tensor, params: SamplingParams[], tokenHistories: number[][]): number[];
+  sampleTokenGPU(state: BatchState, logitsBuf: Tensor, params: SamplingParams, tokenHistory: number[]): number;
   free(): void;
 }
 
@@ -234,10 +237,15 @@ export class SamplingWorkspaceBase extends WorkspaceBase implements CommonModelW
 export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
   abstract readonly eosIds: Set<number>;
   protected abstract readonly cfg: CommonModelConfig;
-  protected abstract readonly ws: CommonModelWorkspace;
+  readonly vocabSize: number;
 
   protected constructor(glm: GlmOps) {
     super(glm);
+    this.vocabSize = 0;
+  }
+
+  protected setVocabSize(vs: number) {
+    (this as { vocabSize: number }).vocabSize = vs;
   }
 
   abstract createChatCache(maxPages?: number): ChatCache;
@@ -249,11 +257,10 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     _startPos: number[], _cache: ChatCache,
   ): void {}
 
-  plan(inputIdsList: number[][], cache: ChatCache, enableCudaGraph = false): BatchState {
+  plan(ws: SamplingWorkspaceBase, inputIdsList: number[][], cache: ChatCache, enableCudaGraph = false): BatchState {
     const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;
-    const ws = this.ws;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
@@ -302,7 +309,7 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
         enableCudaGraph
       );
 
-      return { batchSize, totalTokens, seqLens, pageAllocs: [], isDecode: true };
+      return { batchSize, totalTokens, seqLens, pageAllocs: [], isDecode: true, ws, cache };
     }
 
     const startPos = pagedKV.seqKvLens.slice();
@@ -372,15 +379,15 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     const slotMappingBuf = Int32Array.from(slotMapping);
     ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
 
-    return { batchSize, totalTokens, seqLens, pageAllocs, isDecode: false };
+    return { batchSize, totalTokens, seqLens, pageAllocs, isDecode: false, ws, cache };
   }
 
-  abstract forward(state: BatchState, cache: ChatCache): Tensor;
+  abstract forward(state: BatchState): Tensor;
 
   read(state: BatchState): number[] {
     const batchSize = state.batchSize;
     const buf = Buffer.alloc(batchSize * I32);
-    this.ws.argmaxIdx.d2h(buf);
+    state.ws.argmaxIdx.d2h(buf);
     const result: number[] = [];
     for (let i = 0; i < batchSize; i++) {
       result.push(buf.readInt32LE(i * I32));
@@ -388,40 +395,40 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     return result;
   }
 
-  forwardEager(inputIdsList: number[][], cache: ChatCache): number[] {
-    const state = this.plan(inputIdsList, cache);
-    this.forward(state, cache);
+  forwardEager(ws: SamplingWorkspaceBase, inputIdsList: number[][], cache: ChatCache): number[] {
+    const state = this.plan(ws, inputIdsList, cache);
+    this.forward(state);
     return this.read(state);
   }
 
-  planDecode(tokenIdsList: number[], cache: ChatCache, enableCudaGraph = false): BatchState {
-    return this.plan(tokenIdsList.map(t => [t]), cache, enableCudaGraph);
+  planDecode(ws: SamplingWorkspaceBase, tokenIdsList: number[], cache: ChatCache, enableCudaGraph = false): BatchState {
+    return this.plan(ws, tokenIdsList.map(t => [t]), cache, enableCudaGraph);
   }
 
-  forwardDecode(state: BatchState, cache: ChatCache): Tensor {
-    return this.forward(state, cache);
+  forwardDecode(state: BatchState): Tensor {
+    return this.forward(state);
   }
 
   readDecode(state: BatchState): number[] {
     return this.read(state);
   }
 
-  forwardEagerDecode(tokenIdsList: number[], cache: ChatCache): number[] {
-    return this.forwardEager(tokenIdsList.map(t => [t]), cache);
+  forwardEagerDecode(ws: SamplingWorkspaceBase, tokenIdsList: number[], cache: ChatCache): number[] {
+    return this.forwardEager(ws, tokenIdsList.map(t => [t]), cache);
   }
 
-  protected readArgmax(ptr: Tensor | number, count: number): number {
-    this.ws.argmaxIdx.argmax(ptr, count);
+  protected readArgmax(ws: SamplingWorkspaceBase, ptr: Tensor | number, count: number): number {
+    ws.argmaxIdx.argmax(ptr, count);
     const buf = Buffer.alloc(I32);
-    this.ws.argmaxIdx.d2h(buf);
+    ws.argmaxIdx.d2h(buf);
     return buf.readInt32LE(0);
   }
 
-  protected readArgmaxBatch(logitsBuf: Tensor, batchSize: number): number[] {
+  protected readArgmaxBatch(ws: SamplingWorkspaceBase, logitsBuf: Tensor, batchSize: number): number[] {
     const vs = this.cfg.vocabSize;
-    this.ws.argmaxIdx.argmax(logitsBuf, vs, batchSize);
+    ws.argmaxIdx.argmax(logitsBuf, vs, batchSize);
     const buf = Buffer.alloc(batchSize * I32);
-    this.ws.argmaxIdx.d2h(buf);
+    ws.argmaxIdx.d2h(buf);
     const result: number[] = [];
     for (let i = 0; i < batchSize; i++) {
       result.push(buf.readInt32LE(i * I32));
@@ -429,14 +436,14 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     return result;
   }
 
-  sampleBatchGPU(logitsBuf: Tensor, params: SamplingParams[], tokenHistories: number[][]): number[] {
+  sampleBatchGPU(state: BatchState, logitsBuf: Tensor, params: SamplingParams[], tokenHistories: number[][]): number[] {
     const batchSize = params.length;
     if (batchSize !== tokenHistories.length) {
       throw new Error(`sampleBatchGPU: params length ${batchSize} != tokenHistories length ${tokenHistories.length}`);
     }
     const vs = this.cfg.vocabSize;
     const glm = this.glm;
-    const ws = this.ws;
+    const ws = state.ws;
 
     const penaltyBufSize = batchSize * 1024 * I32;
     const penaltyBuf = Buffer.alloc(penaltyBufSize);
@@ -536,8 +543,8 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     return result;
   }
 
-  sampleTokenGPU(logitsBuf: Tensor, params: SamplingParams, tokenHistory: number[]): number {
-    return this.sampleBatchGPU(logitsBuf, [params], [tokenHistory])[0];
+  sampleTokenGPU(state: BatchState, logitsBuf: Tensor, params: SamplingParams, tokenHistory: number[]): number {
+    return this.sampleBatchGPU(state, logitsBuf, [params], [tokenHistory])[0];
   }
 }
 

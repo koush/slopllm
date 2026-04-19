@@ -4,6 +4,7 @@ import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
 import { Tensor } from "../src/tensor";
 import { PagedKVCache } from "../src/paged_kv";
+import { SamplingWorkspaceBase } from "../src/chat_model";
 import { generateTokens } from "./test_helper";
 
 const FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -35,14 +36,17 @@ function readLogits(logitsBuf: Tensor): Float32Array {
 describe("Qwen3-0.6B-FP8 model", () => {
   let glm: GlmOps;
   let model: Qwen3Model;
+  let ws: SamplingWorkspaceBase;
 
   before(() => {
     process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
     glm = new GlmOps(0);
     model = Qwen3Model.fromPretrained(glm, FP8_REPO, 1, 64);
+    ws = new SamplingWorkspaceBase(glm, 1, 64, model.vocabSize);
   });
 
   after(() => {
+    ws.free();
     model.free();
   });
 
@@ -73,9 +77,9 @@ describe("Qwen3-0.6B-FP8 model", () => {
     const pagedKV = makeKV(model);
     try {
       pagedKV.reset(1);
-      const token = model.forwardEager([[1, 2, 3, 4, 5]], pagedKV)[0];
+      const token = model.forwardEager(ws, [[1, 2, 3, 4, 5]], pagedKV)[0];
       assert.ok(Number.isInteger(token), "prefill should return an integer token");
-      assert.ok(token >= 0 && token < model.cfg.vocabSize, `token ${token} out of vocab range [0, ${model.cfg.vocabSize})`);
+      assert.ok(token >= 0 && token < model.vocabSize, `token ${token} out of vocab range [0, ${model.vocabSize})`);
     } finally {
       pagedKV.free();
     }
@@ -84,11 +88,11 @@ describe("Qwen3-0.6B-FP8 model", () => {
   it("decodes tokens after prefill", () => {
     const pagedKV = makeKV(model);
     try {
-      const tokens = [...generateTokens(model, pagedKV, [1, 2, 3, 4, 5], 10, model.eosIds)];
+      const tokens = [...generateTokens(model, ws, pagedKV, [1, 2, 3, 4, 5], 10, model.eosIds)];
       assert.ok(tokens.length > 0, "should produce at least one token");
       for (const t of tokens) {
         assert.ok(Number.isInteger(t), `token ${t} should be an integer`);
-        assert.ok(t >= 0 && t < model.cfg.vocabSize, `token ${t} out of vocab range`);
+        assert.ok(t >= 0 && t < model.vocabSize, `token ${t} out of vocab range`);
       }
     } finally {
       pagedKV.free();
@@ -98,16 +102,17 @@ describe("Qwen3-0.6B-FP8 model", () => {
   it("FP8 logits correlate with BF16 logits (cosine sim >= 0.99)", () => {
     const fp8KV = makeKV(model);
     const bf16Model = Qwen3Model.fromPretrained(glm, BF16_REPO, 1, 64);
+    const bf16Ws = new SamplingWorkspaceBase(glm, 1, 64, bf16Model.vocabSize);
     const bf16KV = makeKV(bf16Model);
     try {
       fp8KV.reset(1);
-      const fp8State = model.plan([[1, 2, 3, 4, 5]], fp8KV);
-      const fp8LogitsBuf = model.forward(fp8State, fp8KV);
+      const fp8State = model.plan(ws, [[1, 2, 3, 4, 5]], fp8KV);
+      const fp8LogitsBuf = model.forward(fp8State);
       const fp8Logits = readLogits(fp8LogitsBuf);
 
       bf16KV.reset(1);
-      const bf16State = bf16Model.plan([[1, 2, 3, 4, 5]], bf16KV);
-      const bf16LogitsBuf = bf16Model.forward(bf16State, bf16KV);
+      const bf16State = bf16Model.plan(bf16Ws, [[1, 2, 3, 4, 5]], bf16KV);
+      const bf16LogitsBuf = bf16Model.forward(bf16State);
       const bf16Logits = readLogits(bf16LogitsBuf);
 
       assert.equal(fp8Logits.length, bf16Logits.length, "logits length mismatch");
@@ -117,6 +122,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
     } finally {
       fp8KV.free();
       bf16KV.free();
+      bf16Ws.free();
       bf16Model.free();
     }
   });

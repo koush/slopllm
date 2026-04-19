@@ -114,13 +114,13 @@ export class Qwen35Model extends ChatModelBase {
   maxBatch: number;
   maxSeqLen: number;
   invFreq: Tensor;
-  declare ws: SamplingWorkspaceBase;
 
   private constructor(glm: GlmOps, config: Qwen35Config, maxBatch: number, maxSeqLen: number) {
     super(glm);
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
+    this.setVocabSize(config.vocabSize);
 
     const ropeDim = Math.floor(config.headDim * config.partialRotaryFactor);
     const halfRopeDim = ropeDim / 2;
@@ -130,8 +130,6 @@ export class Qwen35Model extends ChatModelBase {
     }
     this.invFreq = this.alloc([halfRopeDim], "BF16", "invFreq");
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
-
-    this.ws = new SamplingWorkspaceBase(glm, maxBatch, maxSeqLen, config.vocabSize);
   }
 
   static fromPretrained(glm: GlmOps, repoId: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Qwen35Model {
@@ -236,7 +234,6 @@ export class Qwen35Model extends ChatModelBase {
   }
 
   free(): void {
-    this.ws.free();
     super.free();
   }
 
@@ -270,7 +267,7 @@ export class Qwen35Model extends ChatModelBase {
     return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
   }
 
-  private gdnLayerPrefill(normed: Tensor, residual: Tensor, layerIdx: number, S: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
+  private gdnLayerPrefill(ws: SamplingWorkspaceBase, normed: Tensor, residual: Tensor, layerIdx: number, S: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -291,10 +288,10 @@ export class Qwen35Model extends ChatModelBase {
     const recurrentState = gdnState.recurrentState[layerIdx];
     const kernelSize = cfg.linearConvKernelDim;
 
-    using convOut = this.ws.alloc([S, convDim], "BF16");
+    using convOut = ws.alloc([S, convDim], "BF16");
     convOut.causalConv1d(convState, qkvLinear, this.tensors.get(`${pfx}.conv1d.weight`)!, gdnState.cuSeqlens, convDim, S, kernelSize, batchSize, gdnState.convStateStride, 1, convDim);
 
-    using gdnOut = this.ws.alloc([S * linHeads, linVDim], "BF16");
+    using gdnOut = ws.alloc([S * linHeads, linVDim], "BF16");
 
     gdnOut.gdnPrefill(
       recurrentState, convOut,
@@ -304,7 +301,7 @@ export class Qwen35Model extends ChatModelBase {
       batchSize, gdnState.recurrentStateStride, 1, convDim,
     );
 
-    using gatedOut = this.ws.alloc([S * linHeads, linVDim], "BF16");
+    using gatedOut = ws.alloc([S * linHeads, linVDim], "BF16");
     gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, S * linHeads);
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!, BS);
@@ -321,7 +318,7 @@ export class Qwen35Model extends ChatModelBase {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  private gdnLayerDecode(normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
+  private gdnLayerDecode(ws: SamplingWorkspaceBase, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
@@ -343,7 +340,7 @@ export class Qwen35Model extends ChatModelBase {
 
     glm.causalConv1dUpdate(qkvBuf.data, convState.data, qkvBuf.data, this.tensors.get(`${pfx}.conv1d.weight`)!.data, convDim, kernelSize, BS, gdnState.convStateStride);
 
-    using gdnOut = this.ws.alloc([BS * linHeads * linVDim], "BF16");
+    using gdnOut = ws.alloc([BS * linHeads * linVDim], "BF16");
 
     gdnOut.gdnRecurrentStep(
       recurrentState, qkvBuf,
@@ -353,7 +350,7 @@ export class Qwen35Model extends ChatModelBase {
       BS, gdnState.recurrentStateStride, 1, convDim,
     );
 
-    using gatedOut = this.ws.alloc([BS * linHeads * linVDim], "BF16");
+    using gatedOut = ws.alloc([BS * linHeads * linVDim], "BF16");
     gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, BS * linHeads);
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!, BS);
@@ -370,13 +367,14 @@ export class Qwen35Model extends ChatModelBase {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  private fullAttnLayer(normed: Tensor, residual: Tensor, layerIdx: number, state: BatchState, pagedKV: PagedKVCache, cos: Tensor, sin: Tensor): { normed: Tensor, residual: Tensor } {
+  private fullAttnLayer(normed: Tensor, residual: Tensor, layerIdx: number, state: BatchState, cos: Tensor, sin: Tensor): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const glm = this.glm;
     const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
+    const pagedKV = this.getPagedKV(state.cache);
     const pageSize = pagedKV.pageSize;
     const cacheIdx = this.fullAttnCacheIdx(layerIdx);
     const pfx = `layers.${layerIdx}.self_attn`;
@@ -394,7 +392,7 @@ export class Qwen35Model extends ChatModelBase {
     using qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nHeads, S, B, hd * 2);
     using kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nKv, S, B);
 
-    const slotMapping = state.isDecode ? pagedKV.slotMapping.data : this.ws.prefillSlotMapping.data;
+    const slotMapping = state.isDecode ? pagedKV.slotMapping.data : state.ws.prefillSlotMapping.data;
     const kTokenStride = state.isDecode ? nKv * hd : hd;
     const kHeadStride = state.isDecode ? hd : BS * hd;
     const vTokenStride = nKv * hd;
@@ -444,9 +442,10 @@ export class Qwen35Model extends ChatModelBase {
     }
   }
 
-  forward(state: BatchState, cache: ChatCache): Tensor {
-    using _tracker = this.ws.startTracking();
-    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
+  forward(state: BatchState): Tensor {
+    const ws = state.ws;
+    using _tracker = ws.startTracking();
+    const cache = state.cache as Qwen35ChatCache;
     const { pagedKV, gdnState } = cache;
     const cfg = this.cfg;
     const glm = this.glm;
@@ -459,10 +458,10 @@ export class Qwen35Model extends ChatModelBase {
     const S = state.isDecode ? 1 : totalTokens;
 
     const embedTable = this.tensors.get("embed_tokens.weight")!;
-    using residual = new UsingHolder(embedTable.embedding(this.ws.inputIdsBuf, hs, BS));
+    using residual = new UsingHolder(embedTable.embedding(ws.inputIdsBuf, hs, BS));
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    const rotaryEmbedding = this.invFreq.rotaryEmbedding(this.ws.positionIds, ropeDim / 2, B, S);
+    const rotaryEmbedding = this.invFreq.rotaryEmbedding(ws.positionIds, ropeDim / 2, B, S);
     using cos = rotaryEmbedding.cos;
     using sin = rotaryEmbedding.sin;
 
@@ -472,12 +471,12 @@ export class Qwen35Model extends ChatModelBase {
       let result: { normed: Tensor, residual: Tensor };
       if (cfg.layerTypes[i] === "linear_attention") {
         if (state.isDecode) {
-          result = this.gdnLayerDecode(normed.value, residual.value, i, gdnState);
+          result = this.gdnLayerDecode(ws, normed.value, residual.value, i, gdnState);
         } else {
-          result = this.gdnLayerPrefill(normed.value, residual.value, i, totalTokens, gdnState);
+          result = this.gdnLayerPrefill(ws, normed.value, residual.value, i, totalTokens, gdnState);
         }
       } else {
-        result = this.fullAttnLayer(normed.value, residual.value, i, state, pagedKV, cos, sin);
+        result = this.fullAttnLayer(normed.value, residual.value, i, state, cos, sin);
       }
       normed.replace(result.normed);
       residual.replace(result.residual);
@@ -487,11 +486,11 @@ export class Qwen35Model extends ChatModelBase {
     if (state.isDecode) {
       logitsBuf = normed.value.linear(this.tensors.get("lm_head.weight")!, batchSize);
     } else {
-      using hiddenLast = normed.value.indexSelect(this.ws.lastIdx, hs, batchSize);
+      using hiddenLast = normed.value.indexSelect(ws.lastIdx, hs, batchSize);
       logitsBuf = hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
     }
 
-    this.ws.argmaxIdx.argmax(logitsBuf, cfg.vocabSize, batchSize);
+    ws.argmaxIdx.argmax(logitsBuf, cfg.vocabSize, batchSize);
     return logitsBuf.removeTracking();
   }
 }

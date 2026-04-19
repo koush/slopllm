@@ -6,7 +6,7 @@ import { resolveModelPath } from "./model_path";
 import { PagedKVCache } from "./paged_kv";
 import { Tensor } from "./tensor";
 import type { ChatCache } from "./chat_model";
-import { ChatModelBase, type BatchState, SamplingParams, SamplingWorkspaceBase } from "./chat_model";
+import { ChatModelBase, type BatchState, SamplingParams } from "./chat_model";
 import { UsingHolder } from "./using-holder";
 
 export type { SamplingParams };
@@ -53,13 +53,13 @@ export class Qwen3Model extends ChatModelBase {
   maxBatch: number;
   maxSeqLen: number;
   invFreq: Tensor;
-  declare ws: SamplingWorkspaceBase;
 
   private constructor(glm: GlmOps, config: Qwen3Config, maxBatch: number, maxSeqLen: number) {
     super(glm);
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
+    this.setVocabSize(config.vocabSize);
 
     const halfDim = config.headDim / 2;
     const invFreqF32 = new Float32Array(halfDim);
@@ -68,8 +68,6 @@ export class Qwen3Model extends ChatModelBase {
     }
     this.invFreq = this.alloc([halfDim], "BF16", "invFreq");
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
-
-    this.ws = new SamplingWorkspaceBase(glm, maxBatch, maxSeqLen, config.vocabSize);
   }
 
   static fromPretrained(glm: GlmOps, repoId: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {
@@ -112,7 +110,6 @@ export class Qwen3Model extends ChatModelBase {
   }
 
   free(): void {
-    this.ws.free();
     super.free();
   }
 
@@ -147,12 +144,12 @@ export class Qwen3Model extends ChatModelBase {
     return { qRope, kRope, vBuf };
   }
 
-  forward(state: BatchState, cache: ChatCache): Tensor {
-    using _tracker = this.ws.startTracking();
-    const pagedKV = this.getPagedKV(cache);
+  forward(state: BatchState): Tensor {
+    const ws = state.ws;
+    using _tracker = ws.startTracking();
+    const pagedKV = this.getPagedKV(state.cache);
     const cfg = this.cfg;
     const glm = this.glm;
-    const ws = this.ws;
     const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
