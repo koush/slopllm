@@ -132,7 +132,7 @@ export class Qwen3Model extends ChatModelBase {
     return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
   }
 
-  private computeQkv(normed: Tensor, pfx: string, BS: number, B: number, S: number, cos: Tensor, sin: Tensor): { qRope: Tensor, kRope: Tensor, vBuf: Tensor, vT: Tensor | null } {
+  private computeQkv(normed: Tensor, pfx: string, BS: number, B: number, S: number, cos: Tensor, sin: Tensor): { qRope: Tensor, kRope: Tensor, vBuf: Tensor } {
     const cfg = this.cfg;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
@@ -144,8 +144,7 @@ export class Qwen3Model extends ChatModelBase {
 
     const qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
     const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
-    const vT = S > 1 ? vBuf.transpose4d(B, S, nKv, hd, 0, 2, 1, 3) : null;
-    return { qRope, kRope, vBuf, vT };
+    return { qRope, kRope, vBuf };
   }
 
   forward(state: BatchState, cache: ChatCache): Tensor {
@@ -177,28 +176,29 @@ export class Qwen3Model extends ChatModelBase {
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
 
-      const qkv = this.computeQkv(normed.value, pfx, BS, B, S, cos, sin);
-      using _qRope = qkv.qRope;
-      using _kRope = qkv.kRope;
-      using _vBuf = qkv.vBuf;
-      if (qkv.vT) { using _ = qkv.vT; }
+      const _qkv = this.computeQkv(normed.value, pfx, BS, B, S, cos, sin);
+      using qRope = _qkv.qRope;
+      using kRope = _qkv.kRope;
+      using vBuf = _qkv.vBuf;
 
       const slotMapping = state.isDecode ? pagedKV.slotMapping.data : ws.prefillSlotMapping.data;
-      const kStride = state.isDecode ? nKv * hd : hd;
-      const vStride = state.isDecode ? hd : totalTokens * hd;
+      const kTokenStride = state.isDecode ? nKv * hd : hd;
+      const kHeadStride = state.isDecode ? hd : BS * hd;
+      const vTokenStride = nKv * hd;
+      const vHeadStride = hd;
       glm.kvCacheWrite(
-        qkv.kRope.data, qkv.vT ? qkv.vT.data : qkv.vBuf.data,
+        kRope.data, vBuf.data,
         pagedKV.kData[i].data, pagedKV.vData[i].data,
         slotMapping,
         BS, nKv, hd, pageSize,
-        kStride, vStride
+        kTokenStride, kHeadStride, vTokenStride, vHeadStride
       );
 
       let flashOut: Tensor;
       if (state.isDecode) {
         flashOut = ws.alloc([batchSize, nHeads, 1, hd], "BF16");
         glm.batchDecodeRun(
-          qkv.qRope.data, flashOut.data,
+          qRope.data, flashOut.data,
           pagedKV.kData[i].data, pagedKV.vData[i].data,
           pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
           ws.floatWs.data, ws.intWs.data,
@@ -211,7 +211,7 @@ export class Qwen3Model extends ChatModelBase {
         const qStrideN = hd;
         const qStrideH = totalTokens * hd;
         glm.batchPrefillPagedRun(
-          qkv.qRope.data, flashOut.data,
+          qRope.data, flashOut.data,
           pagedKV.kData[i].data, pagedKV.vData[i].data,
           pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
           ws.floatWs.data, ws.intWs.data,

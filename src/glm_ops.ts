@@ -50,7 +50,7 @@ interface NativeAddon {
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   argmax(ctx: number, outIndex: number, input: number, dim: number, batch: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number): void;
-  kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcTokenStride: number, srcHeadStride: number): void;
+  kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
   synchronize(ctx: number): void;
   flashPrefill(ctx: number, q: number, k: number, v: number, o: number, tmp: number, qoLen: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: number, kvLayout: number, smScale: number): void;
   flashDecode(ctx: number, q: number, k: number, v: number, o: number, tmp: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, smScale: number): void;
@@ -184,8 +184,8 @@ export class GlmOps {
     this.native.memcpy(this.ctx, dst, src, bytes);
   }
 
-  kvCacheWrite(srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcTokenStride: number, srcHeadStride: number): void {
-    this.native.kvCacheWrite(this.ctx, srcK, srcV, dstK, dstV, slotMapping, batchSize, nKv, hd, pageSize, srcTokenStride, srcHeadStride);
+  kvCacheWrite(srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void {
+    this.native.kvCacheWrite(this.ctx, srcK, srcV, dstK, dstV, slotMapping, batchSize, nKv, hd, pageSize, srcKTokenStride, srcKHeadStride, srcVTokenStride, srcVHeadStride);
   }
 
   rotaryEmbedding(cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void {

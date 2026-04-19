@@ -449,6 +449,7 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
         ]
 
         self.lib.glm_fp8_linear_decode.restype = None
@@ -995,7 +996,8 @@ class GlmOps:
 
     def kv_cache_write(self, src_k, src_v, dst_k, dst_v, slot_mapping,
                         batch_size, n_kv, hd, page_size,
-                        src_token_stride, src_head_stride):
+                        src_k_token_stride, src_k_head_stride,
+                        src_v_token_stride, src_v_head_stride):
         self.lib.glm_kv_cache_write(
             self.ctx,
             ctypes.c_void_p(src_k), ctypes.c_void_p(src_v),
@@ -1003,7 +1005,8 @@ class GlmOps:
             ctypes.c_void_p(slot_mapping),
             ctypes.c_uint32(batch_size), ctypes.c_uint32(n_kv),
             ctypes.c_uint32(hd), ctypes.c_uint32(page_size),
-            ctypes.c_uint32(src_token_stride), ctypes.c_uint32(src_head_stride)
+            ctypes.c_uint32(src_k_token_stride), ctypes.c_uint32(src_k_head_stride),
+            ctypes.c_uint32(src_v_token_stride), ctypes.c_uint32(src_v_head_stride)
         )
 
     def fp8_linear_decode(self, bf16_out, bf16_input, fp8_weight, weight_scale, m, n, k):

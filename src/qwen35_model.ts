@@ -402,24 +402,20 @@ export class Qwen35Model extends ChatModelBase {
     using vBuf = normed.linear(this.tensors.get(`${pfx}.v_proj.weight`)!, BS);
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    const qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nHeads, S, B, hd * 2);
-    using _qRope = qRope;
-    const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nKv, S, B);
-    using _kRope = kRope;
-
-    const vT = S > 1 ? vBuf.transpose4d(B, S, nKv, hd, 0, 2, 1, 3) : null;
-    using _vT = vT;
-    const vData = S === 1 ? vBuf.data : vT!.data;
+    using qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nHeads, S, B, hd * 2);
+    using kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nKv, S, B);
 
     const slotMapping = state.isDecode ? pagedKV.slotMapping.data : this.ws.prefillSlotMapping.data;
-    const kStride = state.isDecode ? nKv * hd : hd;
-    const vStride = state.isDecode ? hd : BS * hd;
+    const kTokenStride = state.isDecode ? nKv * hd : hd;
+    const kHeadStride = state.isDecode ? hd : BS * hd;
+    const vTokenStride = nKv * hd;
+    const vHeadStride = hd;
 
     glm.kvCacheWrite(
-      kRope.data, vData,
+      kRope.data, vBuf.data,
       pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
       slotMapping, BS, nKv, hd, pageSize,
-      kStride, vStride
+      kTokenStride, kHeadStride, vTokenStride, vHeadStride
     );
 
     let flashOut: Tensor;

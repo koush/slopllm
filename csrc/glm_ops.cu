@@ -1486,9 +1486,11 @@ void glm_arange(GlmCtx* ctx, int* out, int start, int step, int count) {
 
 // ---------------------------------------------------------------------------
 // KV cache write kernel (vLLM-style slot_mapping scatter)
-// src_k, src_v: [batch, n_kv, hd] contiguous BF16
+// src_k: [batch, n_kv, hd] or [n_kv, batch, hd] BF16 — layout described by strides
+// src_v: [batch, n_kv, hd] or [n_kv, batch, hd] BF16 — layout described by strides
 // dst_k, dst_v: [max_pages, n_kv, page_size, hd] BF16
 // slot_mapping: [batch] int32 — slot = page * page_size + slot_in_page, -1 = skip
+// K and V can have different layouts (different strides).
 // ---------------------------------------------------------------------------
 
 __global__ void kv_cache_write_kernel(
@@ -1500,8 +1502,10 @@ __global__ void kv_cache_write_kernel(
     uint32_t n_kv,
     uint32_t page_size,
     uint32_t hd,
-    uint32_t src_token_stride,
-    uint32_t src_head_stride
+    uint32_t src_k_token_stride,
+    uint32_t src_k_head_stride,
+    uint32_t src_v_token_stride,
+    uint32_t src_v_head_stride
 ) {
     int token = blockIdx.x;
     int h = blockIdx.y;
@@ -1516,11 +1520,12 @@ __global__ void kv_cache_write_kernel(
     int64_t dst_off = (int64_t)page * n_kv * page_size * hd
                      + (int64_t)h * page_size * hd
                      + (int64_t)slot_in_page * hd;
-    int64_t src_off = (int64_t)token * src_token_stride + (int64_t)h * src_head_stride;
+    int64_t src_k_off = (int64_t)token * src_k_token_stride + (int64_t)h * src_k_head_stride;
+    int64_t src_v_off = (int64_t)token * src_v_token_stride + (int64_t)h * src_v_head_stride;
 
     for (int d = threadIdx.x; d < (int)hd; d += blockDim.x) {
-        dst_k[dst_off + d] = src_k[src_off + d];
-        dst_v[dst_off + d] = src_v[src_off + d];
+        dst_k[dst_off + d] = src_k[src_k_off + d];
+        dst_v[dst_off + d] = src_v[src_v_off + d];
     }
 }
 
@@ -1530,7 +1535,8 @@ void glm_kv_cache_write(GlmCtx* ctx,
                           int32_t* slot_mapping,
                           uint32_t batch_size, uint32_t n_kv,
                           uint32_t hd, uint32_t page_size,
-                          uint32_t src_token_stride, uint32_t src_head_stride) {
+                          uint32_t src_k_token_stride, uint32_t src_k_head_stride,
+                          uint32_t src_v_token_stride, uint32_t src_v_head_stride) {
     cudaSetDevice(ctx->device_id);
     dim3 grid(batch_size, n_kv);
     dim3 block(hd);
@@ -1538,7 +1544,8 @@ void glm_kv_cache_write(GlmCtx* ctx,
         (__nv_bfloat16*)dst_k, (__nv_bfloat16*)dst_v,
         (const __nv_bfloat16*)src_k, (const __nv_bfloat16*)src_v,
         slot_mapping, n_kv, page_size, hd,
-        src_token_stride, src_head_stride);
+        src_k_token_stride, src_k_head_stride,
+        src_v_token_stride, src_v_head_stride);
 }
 
 
