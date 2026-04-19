@@ -7,14 +7,17 @@ namespace {
 
 // ---------------------------------------------------------------------------
 // GEMV kernel: optimized for M=1 decode
-// Each warp computes one output element. No shared memory tiling.
+// Each warp computes one output element. Input tiles are cooperatively loaded
+// into shared memory to avoid redundant global reads across warps in a block.
 // ---------------------------------------------------------------------------
 
 constexpr int FP8_GEMV_WARP_SIZE = 32;
 constexpr int FP8_GEMV_ROWS_PER_BLOCK = 4;
 constexpr int FP8_GEMV_BLOCK_SIZE = FP8_GEMV_ROWS_PER_BLOCK * FP8_GEMV_WARP_SIZE;
+constexpr int FP8_GEMV_K_TILE = 128;
 
-__global__ void fp8_dequantize_gemv_kernel(
+__global__ void __launch_bounds__(FP8_GEMV_BLOCK_SIZE, 8)
+fp8_dequantize_gemv_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
     const __nv_fp8_e4m3* __restrict__ weight,
@@ -27,43 +30,68 @@ __global__ void fp8_dequantize_gemv_kernel(
     int row = row_group * FP8_GEMV_ROWS_PER_BLOCK + threadIdx.x / FP8_GEMV_WARP_SIZE;
     int lane = threadIdx.x % FP8_GEMV_WARP_SIZE;
 
-    if (m >= M || row >= N) return;
+    bool valid = m < M && row < N;
+
+    __shared__ __nv_bfloat16 smem_input[FP8_GEMV_K_TILE];
 
     int num_k_blocks = K / 128;
-    int n_block = row / 128;
-    const __nv_fp8_e4m3* weight_row = weight + (size_t)row * K;
     const __nv_bfloat16* input_row = input + (size_t)m * K;
+    const __nv_fp8_e4m3* weight_row = weight + (size_t)row * K;
+    int n_block = row / 128;
 
     float sum = 0.0f;
 
     for (int kb = 0; kb < num_k_blocks; kb++) {
-        float scale = scale_inv[n_block * num_k_blocks + kb];
         int k_start = kb << 7;
 
-        #pragma unroll
-        for (int ki = lane; ki < 128; ki += FP8_GEMV_WARP_SIZE) {
-            int k = k_start + ki;
-            float w_val = static_cast<float>(weight_row[k]) * scale;
-            float x_val = __bfloat162float(input_row[k]);
-            sum += w_val * x_val;
+        for (int i = threadIdx.x; i < FP8_GEMV_K_TILE; i += FP8_GEMV_BLOCK_SIZE) {
+            smem_input[i] = input_row[k_start + i];
         }
+        __syncthreads();
+
+        if (valid) {
+            float scale = scale_inv[n_block * num_k_blocks + kb];
+
+            #pragma unroll
+            for (int ki = lane; ki < FP8_GEMV_K_TILE; ki += FP8_GEMV_WARP_SIZE) {
+                float w_val = static_cast<float>(weight_row[k_start + ki]) * scale;
+                float x_val = __bfloat162float(smem_input[ki]);
+                sum += w_val * x_val;
+            }
+        }
+
+        __syncthreads();
     }
 
     int remaining_start = num_k_blocks * 128;
-    for (int k = remaining_start + lane; k < K; k += FP8_GEMV_WARP_SIZE) {
-        int kb = k / 128;
-        float scale = scale_inv[n_block * num_k_blocks + kb];
-        float w_val = static_cast<float>(weight_row[k]) * scale;
-        float x_val = __bfloat162float(input_row[k]);
-        sum += w_val * x_val;
+    int remaining = K - remaining_start;
+    if (remaining > 0) {
+        for (int i = threadIdx.x; i < remaining; i += FP8_GEMV_BLOCK_SIZE) {
+            smem_input[i] = input_row[remaining_start + i];
+        }
+        __syncthreads();
+
+        if (valid) {
+            int kb = remaining_start / 128;
+            float scale = scale_inv[n_block * num_k_blocks + kb];
+            for (int k = remaining_start + lane; k < K; k += FP8_GEMV_WARP_SIZE) {
+                int ki = k - remaining_start;
+                float w_val = static_cast<float>(weight_row[k]) * scale;
+                float x_val = __bfloat162float(smem_input[ki]);
+                sum += w_val * x_val;
+            }
+        }
+
+        __syncthreads();
     }
 
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-    }
-
-    if (lane == 0) {
-        output[(size_t)m * N + row] = __float2bfloat16(sum);
+    if (valid) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        }
+        if (lane == 0) {
+            output[(size_t)m * N + row] = __float2bfloat16(sum);
+        }
     }
 }
 
@@ -79,7 +107,8 @@ constexpr int FP8_GEMM_K_TILE = 128;
 constexpr int FP8_GEMM_BLOCK_DIM = FP8_GEMM_M_TILE * FP8_GEMM_N_TILE;
 constexpr int FP8_GEMM_WEIGHT_PAD = 4;
 
-__global__ void fp8_dequantize_gemm_smem_kernel(
+__global__ void __launch_bounds__(FP8_GEMM_BLOCK_DIM, 4)
+fp8_dequantize_gemm_smem_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
     const __nv_fp8_e4m3* __restrict__ weight,
