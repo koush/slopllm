@@ -1197,8 +1197,8 @@ static Napi::Value Fp8LinearDecode(const Napi::CallbackInfo& info) {
 
 static Napi::Value GdnRecurrentStep(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 14) {
-        Napi::TypeError::New(env, "Expected (ctx, output, state, qkv, a_raw, b_raw, A_log, dt_bias, num_heads, d_k, d_v, batch_size, state_stride, qkv_seq_stride)").ThrowAsJavaScriptException();
+    if (info.Length() < 15) {
+        Napi::TypeError::New(env, "Expected (ctx, output, state, qkv, a_raw, b_raw, A_log, dt_bias, num_heads, d_k, d_v, batch_size, state_stride, qkv_ch_stride, qkv_seq_stride)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1214,7 +1214,8 @@ static Napi::Value GdnRecurrentStep(const Napi::CallbackInfo& info) {
     int d_v = info[10].As<Napi::Number>().Int32Value();
     int batch_size = info[11].As<Napi::Number>().Int32Value();
     int state_stride = info[12].As<Napi::Number>().Int32Value();
-    int qkv_seq_stride = info[13].As<Napi::Number>().Int32Value();
+    int qkv_ch_stride = info[13].As<Napi::Number>().Int32Value();
+    int qkv_seq_stride = info[14].As<Napi::Number>().Int32Value();
     glm_gdn_recurrent_step(reinterpret_cast<GlmCtx*>(ctx_ptr),
                             reinterpret_cast<void*>(out_ptr),
                             reinterpret_cast<float*>(state_ptr),
@@ -1224,14 +1225,14 @@ static Napi::Value GdnRecurrentStep(const Napi::CallbackInfo& info) {
                             reinterpret_cast<const float*>(alog_ptr),
                             reinterpret_cast<const float*>(dtb_ptr),
                             num_heads, d_k, d_v,
-                            batch_size, state_stride, qkv_seq_stride);
+                            batch_size, state_stride, qkv_ch_stride, qkv_seq_stride);
     return env.Undefined();
 }
 
 static Napi::Value GdnPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 15) {
-        Napi::TypeError::New(env, "Expected (ctx, output, state, qkv, a_raw, b_raw, A_log, dt_bias, cu_seqlens, total_seq_len, num_heads, d_k, d_v, batch_size, state_stride, qkv_seq_stride)").ThrowAsJavaScriptException();
+    if (info.Length() < 17) {
+        Napi::TypeError::New(env, "Expected (ctx, output, state, qkv, a_raw, b_raw, A_log, dt_bias, cu_seqlens, total_seq_len, num_heads, d_k, d_v, batch_size, state_stride, qkv_ch_stride, qkv_seq_stride)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1249,7 +1250,8 @@ static Napi::Value GdnPrefill(const Napi::CallbackInfo& info) {
     int d_v = info[12].As<Napi::Number>().Int32Value();
     int batch_size = info[13].As<Napi::Number>().Int32Value();
     int state_stride = info[14].As<Napi::Number>().Int32Value();
-    int qkv_seq_stride = info[15].As<Napi::Number>().Int32Value();
+    int qkv_ch_stride = info[15].As<Napi::Number>().Int32Value();
+    int qkv_seq_stride = info[16].As<Napi::Number>().Int32Value();
     glm_gdn_prefill(reinterpret_cast<GlmCtx*>(ctx_ptr),
                      reinterpret_cast<void*>(out_ptr),
                      reinterpret_cast<float*>(state_ptr),
@@ -1260,14 +1262,14 @@ static Napi::Value GdnPrefill(const Napi::CallbackInfo& info) {
                      reinterpret_cast<const float*>(dtb_ptr),
                      reinterpret_cast<const int*>(cu_seqlens_ptr),
                      total_seq_len, num_heads, d_k, d_v,
-                     batch_size, state_stride, qkv_seq_stride);
+                     batch_size, state_stride, qkv_ch_stride, qkv_seq_stride);
     return env.Undefined();
 }
 
 static Napi::Value CausalConv1d(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, output, conv_state, input, weight, cu_seqlens, conv_dim, total_seq_len, kernel_size, batch_size, conv_state_stride)").ThrowAsJavaScriptException();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, output, conv_state, input, weight, cu_seqlens, conv_dim, total_seq_len, kernel_size, batch_size, conv_state_stride, ch_stride, seq_stride)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1281,6 +1283,8 @@ static Napi::Value CausalConv1d(const Napi::CallbackInfo& info) {
     int kernel_size = info[8].As<Napi::Number>().Int32Value();
     int batch_size = info[9].As<Napi::Number>().Int32Value();
     int conv_state_stride = info[10].As<Napi::Number>().Int32Value();
+    int ch_stride = info[11].As<Napi::Number>().Int32Value();
+    int seq_stride = info[12].As<Napi::Number>().Int32Value();
     glm_causal_conv1d(reinterpret_cast<GlmCtx*>(ctx_ptr),
                        reinterpret_cast<void*>(out_ptr),
                        reinterpret_cast<void*>(cs_ptr),
@@ -1288,7 +1292,7 @@ static Napi::Value CausalConv1d(const Napi::CallbackInfo& info) {
                        reinterpret_cast<const void*>(w_ptr),
                        reinterpret_cast<const int*>(cu_seqlens_ptr),
                        conv_dim, total_seq_len, kernel_size,
-                       batch_size, conv_state_stride);
+                       batch_size, conv_state_stride, ch_stride, seq_stride);
     return env.Undefined();
 }
 

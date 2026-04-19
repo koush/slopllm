@@ -275,25 +275,28 @@ void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
 // Fused: L2 norm q,k + gate computation + delta rule update
 // output: [batch_size, num_heads, d_v] BF16
 // state: [batch_size, state_stride] FP32 (updated in-place)
-// qkv: [convDim, batch_size] BF16 (channel-first fused QKV, output of conv1d)
+// qkv: fused QKV tensor — layout described by qkv_ch_stride and qkv_seq_stride
+//   For [convDim, batch] layout: qkv_ch_stride=batch, qkv_seq_stride=1
+//   For [batch, convDim] layout: qkv_ch_stride=1, qkv_seq_stride=convDim
 //   convDim = num_heads * (2*d_k + d_v), Q channels first, then K, then V
 // a_raw: [batch_size, num_heads] BF16
 // b_raw: [batch_size, num_heads] BF16
 // A_log: [num_heads] FP32 (shared across batch)
 // dt_bias: [num_heads] FP32 (shared across batch)
 // state_stride: stride (in float elements) between batch elements in state
-// qkv_seq_stride: stride between positions in channel-first QKV layout (= batch_size)
 void glm_gdn_recurrent_step(GlmCtx* ctx, void* output, void* state,
                               const void* qkv,
                               const void* a_raw, const void* b_raw,
                               const float* A_log, const float* dt_bias,
                               int num_heads, int d_k, int d_v,
-                              int batch_size, int state_stride, int qkv_seq_stride);
+                              int batch_size, int state_stride, int qkv_ch_stride, int qkv_seq_stride);
 
 // Gated DeltaNet prefill (sequential over tokens, batched with cu_seqlens)
 // output: [total_seq_len, num_heads, d_v] BF16 (packed)
 // state: [batch_size, state_stride] FP32 (updated in-place, should be zero-initialized)
-// qkv: [convDim, total_seq_len] BF16 (channel-first fused QKV, output of conv1d)
+// qkv: fused QKV tensor — layout described by qkv_ch_stride and qkv_seq_stride
+//   For [convDim, total_seq_len] layout: qkv_ch_stride=total_seq_len, qkv_seq_stride=1
+//   For [total_seq_len, convDim] layout: qkv_ch_stride=1, qkv_seq_stride=convDim
 //   convDim = num_heads * (2*d_k + d_v), Q channels first, then K, then V
 // a_raw: [total_seq_len, num_heads] BF16 (packed)
 // b_raw: [total_seq_len, num_heads] BF16 (packed)
@@ -301,17 +304,18 @@ void glm_gdn_recurrent_step(GlmCtx* ctx, void* output, void* state,
 // A_log: [num_heads] FP32 (shared across batch)
 // dt_bias: [num_heads] FP32 (shared across batch)
 // state_stride: stride (in float elements) between batch elements in state
-// qkv_seq_stride: stride between positions in channel-first QKV layout (= total_seq_len)
 void glm_gdn_prefill(GlmCtx* ctx, void* output, void* state,
                       const void* qkv,
                       const void* a_raw, const void* b_raw,
                       const float* A_log, const float* dt_bias,
                       const int* cu_seqlens,
                       int total_seq_len, int num_heads, int d_k, int d_v,
-                      int batch_size, int state_stride, int qkv_seq_stride);
+                      int batch_size, int state_stride, int qkv_ch_stride, int qkv_seq_stride);
 
 // Causal conv1d with SiLU activation (batched prefill with cu_seqlens)
-// input/output layout: [conv_dim, total_seq_len] (channel-first, packed sequences, BF16)
+// input/output layout described by ch_stride and seq_stride:
+//   For [conv_dim, total_seq_len] layout: ch_stride=total_seq_len, seq_stride=1
+//   For [total_seq_len, conv_dim] layout: ch_stride=1, seq_stride=conv_dim
 // weight layout: [conv_dim, kernel_size] (BF16)
 // conv_state: [batch_size, conv_state_stride] BF16 (per-batch conv state, updated in-place)
 // cu_seqlens: [batch_size + 1] int32 (cumulative sequence lengths)
@@ -320,7 +324,8 @@ void glm_causal_conv1d(GlmCtx* ctx, void* output, void* conv_state,
                         const void* input, const void* weight,
                         const int* cu_seqlens,
                         int conv_dim, int total_seq_len, int kernel_size,
-                        int batch_size, int conv_state_stride);
+                        int batch_size, int conv_state_stride,
+                        int ch_stride, int seq_stride);
 
 // Causal conv1d update with SiLU activation (batched decode)
 // input/output layout: [batch_size, conv_dim] BF16

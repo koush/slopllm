@@ -287,42 +287,37 @@ export class Qwen35Model extends ChatModelBase {
     using bBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_b.weight`)!, BS);
     using zBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_z.weight`)!, BS);
 
-    const qkvBuf = qkvLinear.transpose4d(1, S, convDim, 1, 0, 2, 1, 3);
-    using _qkvBuf = qkvBuf;
-
     const convState = gdnState.convState[layerIdx];
     const recurrentState = gdnState.recurrentState[layerIdx];
     const kernelSize = cfg.linearConvKernelDim;
 
-    const convOut = this.ws.alloc([convDim, S], "BF16");
-    glm.causalConv1d(convOut.data, convState.data, qkvBuf.data, this.tensors.get(`${pfx}.conv1d.weight`)!.data, gdnState.cuSeqlens.data, convDim, S, kernelSize, batchSize, gdnState.convStateStride);
+    using convOut = this.ws.alloc([S, convDim], "BF16");
+    convOut.causalConv1d(convState, qkvLinear, this.tensors.get(`${pfx}.conv1d.weight`)!, gdnState.cuSeqlens, convDim, S, kernelSize, batchSize, gdnState.convStateStride, 1, convDim);
 
-    const gdnOut = this.ws.alloc([S * linHeads, linVDim], "BF16");
+    using gdnOut = this.ws.alloc([S * linHeads, linVDim], "BF16");
 
-    glm.gdnPrefill(
-      gdnOut.data, recurrentState.data,
-      convOut.data,
-      aBuf.data, bBuf.data,
-      this.tensors.get(`${pfx}.A_log`)!.data,
-      this.tensors.get(`${pfx}.dt_bias`)!.data,
-      gdnState.cuSeqlens.data, S, linHeads, linKDim, linVDim,
-      batchSize, gdnState.recurrentStateStride, S,
+    gdnOut.gdnPrefill(
+      recurrentState, convOut,
+      aBuf, bBuf,
+      this.tensors.get(`${pfx}.A_log`)!, this.tensors.get(`${pfx}.dt_bias`)!,
+      gdnState.cuSeqlens, S, linHeads, linKDim, linVDim,
+      batchSize, gdnState.recurrentStateStride, 1, convDim,
     );
 
-    const gatedOut = this.ws.alloc([S * linHeads, linVDim], "BF16");
+    using gatedOut = this.ws.alloc([S * linHeads, linVDim], "BF16");
     gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, S * linHeads);
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!, BS);
 
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-    using _attnNormed = attnResult.normed;
+    using attnNormed = attnResult.normed;
+    using attnResidual = attnResult.residual;
 
-    using downBuf = this.mlp(attnResult.normed, `layers.${layerIdx}`, BS);
+    using downBuf = this.mlp(attnNormed, `layers.${layerIdx}`, BS);
     const nextWeight = layerIdx < cfg.numHiddenLayers - 1
       ? this.tensors.get(`layers.${layerIdx + 1}.input_layernorm.weight`)!
       : this.tensors.get("norm.weight")!;
-    const mlpResult = attnResult.residual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
-    attnResult.residual[Symbol.dispose]();
+    const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
@@ -348,36 +343,30 @@ export class Qwen35Model extends ChatModelBase {
 
     glm.causalConv1dUpdate(qkvBuf.data, convState.data, qkvBuf.data, this.tensors.get(`${pfx}.conv1d.weight`)!.data, convDim, kernelSize, BS, gdnState.convStateStride);
 
-    const qkvT = BS > 1 ? qkvBuf.transpose4d(1, BS, convDim, 1, 0, 2, 1, 3) : null;
-    using _qkvT = qkvT;
-    const qkvSrc = BS === 1 ? qkvBuf.data : qkvT!.data;
+    using gdnOut = this.ws.alloc([BS * linHeads * linVDim], "BF16");
 
-    const gdnOut = this.ws.alloc([BS * linHeads * linVDim], "BF16");
-
-    glm.gdnRecurrentStep(
-      gdnOut.data, recurrentState.data,
-      qkvSrc,
-      aBuf.data, bBuf.data,
-      this.tensors.get(`${pfx}.A_log`)!.data,
-      this.tensors.get(`${pfx}.dt_bias`)!.data,
+    gdnOut.gdnRecurrentStep(
+      recurrentState, qkvBuf,
+      aBuf, bBuf,
+      this.tensors.get(`${pfx}.A_log`)!, this.tensors.get(`${pfx}.dt_bias`)!,
       linHeads, linKDim, linVDim,
-      BS, gdnState.recurrentStateStride, BS,
+      BS, gdnState.recurrentStateStride, 1, convDim,
     );
 
-    const gatedOut = this.ws.alloc([BS * linHeads * linVDim], "BF16");
+    using gatedOut = this.ws.alloc([BS * linHeads * linVDim], "BF16");
     gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, BS * linHeads);
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!, BS);
 
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-    using _attnNormed = attnResult.normed;
+    using attnNormed = attnResult.normed;
+    using attnResidual = attnResult.residual;
 
-    using downBuf = this.mlp(attnResult.normed, `layers.${layerIdx}`, BS);
+    using downBuf = this.mlp(attnNormed, `layers.${layerIdx}`, BS);
     const nextWeight = layerIdx < cfg.numHiddenLayers - 1
       ? this.tensors.get(`layers.${layerIdx + 1}.input_layernorm.weight`)!
       : this.tensors.get("norm.weight")!;
-    const mlpResult = attnResult.residual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
-    attnResult.residual[Symbol.dispose]();
+    const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
@@ -418,11 +407,11 @@ export class Qwen35Model extends ChatModelBase {
       kTokenStride, kHeadStride, vTokenStride, vHeadStride
     );
 
-    let flashOut: Tensor;
+    using flashOut = new UsingHolder<Tensor>(undefined!);
     if (state.isDecode) {
-      flashOut = this.ws.alloc([batchSize, nHeads, 1, hd], "BF16");
+      flashOut.replace(this.ws.alloc([batchSize, nHeads, 1, hd], "BF16"));
       glm.batchDecodeRun(
-        qRope.data, flashOut.data,
+        qRope.data, flashOut.value.data,
         pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
         pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
         this.ws.floatWs.data, this.ws.intWs.data,
@@ -432,11 +421,11 @@ export class Qwen35Model extends ChatModelBase {
         cfg.scaling
       );
     } else {
-      flashOut = this.ws.alloc([1, nHeads, totalTokens, hd], "BF16");
+      flashOut.replace(this.ws.alloc([1, nHeads, totalTokens, hd], "BF16"));
       const qStrideN = hd;
       const qStrideH = BS * hd;
       glm.batchPrefillPagedRun(
-        qRope.data, flashOut.data,
+        qRope.data, flashOut.value.data,
         pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
         pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
         this.ws.floatWs.data, this.ws.intWs.data,
@@ -447,22 +436,21 @@ export class Qwen35Model extends ChatModelBase {
         qStrideN, qStrideH, 1, cfg.scaling
       );
     }
-    using _flashOut = flashOut;
 
     if (cfg.attnOutputGate) {
-      glm.gateSigmoidMul(flashOut.data, qBuf.data, BS, nHeads, hd);
+      glm.gateSigmoidMul(flashOut.value.data, qBuf.data, BS, nHeads, hd);
     }
 
-    using oProjBuf = flashOut.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
+    using oProjBuf = flashOut.value.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-    using _attnNormed = attnResult.normed;
+    using attnNormed = attnResult.normed;
+    using attnResidual = attnResult.residual;
 
-    using downBuf = this.mlp(attnResult.normed, `layers.${layerIdx}`, BS);
+    using downBuf = this.mlp(attnNormed, `layers.${layerIdx}`, BS);
     const nextWeight = layerIdx < cfg.numHiddenLayers - 1
       ? this.tensors.get(`layers.${layerIdx + 1}.input_layernorm.weight`)!
       : this.tensors.get("norm.weight")!;
-    const mlpResult = attnResult.residual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
-    attnResult.residual[Symbol.dispose]();
+    const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 

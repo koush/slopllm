@@ -275,8 +275,7 @@ class Qwen35Model:
             "input_ids_buf": glm.alloc(BS * I32),
             "decode_id": glm.alloc(I32),
             "gdn_qkv_linear": glm.alloc(BS * conv_dim * BF16),
-            "gdn_qkv_transposed": glm.alloc(conv_dim * S * BF16),
-            "gdn_conv_out": glm.alloc(conv_dim * S * BF16),
+            "gdn_conv_out": glm.alloc(S * conv_dim * BF16),
             "gdn_a": glm.alloc(BS * lin_h * BF16),
             "gdn_b": glm.alloc(BS * lin_h * BF16),
             "gdn_z": glm.alloc(BS * z_dim * BF16),
@@ -378,17 +377,16 @@ class Qwen35Model:
                     self.weights[f"{pfx}.in_proj_z.weight"],
                     BS, z_dim, hs)
 
-        glm.transpose_4d(ws["gdn_qkv_transposed"], ws["gdn_qkv_linear"],
-                          1, S, conv_dim, 1, 0, 2, 1, 3)
-
         conv_state = gdn_state.conv_state_ptrs[layer_idx]
         recurrent_state = gdn_state.recurrent_state_ptrs[layer_idx]
         kernel_size = cfg.linear_conv_kernel_dim
 
         glm.causal_conv1d(ws["gdn_conv_out"], conv_state,
-                           ws["gdn_qkv_transposed"],
+                           ws["gdn_qkv_linear"],
                            self.weights[f"{pfx}.conv1d.weight"],
-                           ws["cu_seqlens"], conv_dim, S, kernel_size)
+                           ws["cu_seqlens"], conv_dim, S, kernel_size,
+                           batch_size=1, conv_state_stride=conv_dim * (kernel_size - 1),
+                           ch_stride=1, seq_stride=conv_dim)
 
         glm.gdn_prefill(ws["gdn_out"], recurrent_state,
                          ws["gdn_conv_out"],
@@ -396,7 +394,8 @@ class Qwen35Model:
                          self.weights[f"{pfx}.A_log"],
                          self.weights[f"{pfx}.dt_bias"],
                          ws["cu_seqlens"], S, lin_h, lin_kd, lin_vd,
-                         1, lin_h * lin_kd * lin_vd, S)
+                         1, lin_h * lin_kd * lin_vd,
+                         qkv_ch_stride=1, qkv_seq_stride=conv_dim)
 
         glm.rmsnorm_gated(ws["gdn_gated"], ws["gdn_out"], ws["gdn_z"],
                            self.weights[f"{pfx}.norm.weight"],
@@ -458,7 +457,8 @@ class Qwen35Model:
                                 self.weights[f"{pfx}.A_log"],
                                 self.weights[f"{pfx}.dt_bias"],
                                 lin_h, lin_kd, lin_vd, 1,
-                                lin_h * lin_kd * lin_vd, 1)
+                                lin_h * lin_kd * lin_vd,
+                                qkv_ch_stride=1, qkv_seq_stride=conv_dim)
 
         glm.rmsnorm_gated(ws["gdn_gated"], ws["gdn_out"], ws["gdn_z"],
                            self.weights[f"{pfx}.norm.weight"],

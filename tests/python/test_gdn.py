@@ -395,6 +395,46 @@ class TestCausalConv1d:
             glm.free_buf(p)
 
 
+class TestCausalConv1dStrided:
+    def test_prefill(self, glm):
+        conv_dim = 64
+        kernel_size = 4
+        S = 16
+        torch.manual_seed(42)
+
+        x = torch.randn(1, conv_dim, S, dtype=torch.float32)
+        weight = torch.randn(conv_dim, kernel_size, dtype=torch.float32)
+
+        ref_out = _torch_causal_conv1d(x, weight, kernel_size)
+
+        x_transposed = x.squeeze(0).t().contiguous().numpy()
+        w_flat = weight.numpy()
+        x_gpu = _upload_bf16(glm, x_transposed)
+        w_gpu = _upload_bf16(glm, w_flat)
+        out_gpu = glm.alloc(conv_dim * S * BF16)
+        cs_gpu = glm.alloc(conv_dim * (kernel_size - 1) * BF16)
+        glm.fill(cs_gpu, 0, conv_dim * (kernel_size - 1))
+        cu_seqlens = np.array([0, S], dtype=np.int32)
+        cu_gpu = _upload_i32(glm, cu_seqlens)
+
+        glm.causal_conv1d(out_gpu, cs_gpu, x_gpu, w_gpu, cu_gpu,
+                           conv_dim, S, kernel_size,
+                           ch_stride=1, seq_stride=conv_dim)
+        glm.synchronize()
+
+        out_np = _download_bf16(glm, out_gpu, conv_dim * S)
+        out_torch = torch.from_numpy(out_np.reshape(S, conv_dim)).t()
+
+        atol = max(ATOL, 0.02)
+        rtol = max(RTOL, 0.02)
+        ref_flat = ref_out.squeeze(0)
+        assert torch.allclose(out_torch, ref_flat, atol=atol, rtol=rtol), \
+            f"Strided conv1d prefill mismatch: max diff={torch.max(torch.abs(out_torch - ref_flat)):.6f}"
+
+        for p in [x_gpu, w_gpu, out_gpu, cs_gpu, cu_gpu]:
+            glm.free_buf(p)
+
+
 class TestRmsnormGated:
     def test_basic(self, glm):
         dim = 128

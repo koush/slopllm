@@ -68,7 +68,7 @@ __global__ void gdn_recurrent_step_kernel(
     const float* __restrict__ A_log,
     const float* __restrict__ dt_bias,
     int num_heads, int d_k, int d_v,
-    int batch_size, int state_stride, int qkv_seq_stride
+    int batch_size, int state_stride, int qkv_ch_stride, int qkv_seq_stride
 ) {
     int block_idx = blockIdx.x;
     int b = block_idx / num_heads;
@@ -91,11 +91,11 @@ __global__ void gdn_recurrent_step_kernel(
     int ab_stride = num_heads;
 
     for (int i = tid; i < d_k; i += blockDimX) {
-        s_q[i] = bf162float(qkv[(q_channel_base + i) * qkv_seq_stride + b]);
-        s_k[i] = bf162float(qkv[(k_channel_base + i) * qkv_seq_stride + b]);
+        s_q[i] = bf162float(qkv[(q_channel_base + i) * qkv_ch_stride + b * qkv_seq_stride]);
+        s_k[i] = bf162float(qkv[(k_channel_base + i) * qkv_ch_stride + b * qkv_seq_stride]);
     }
     for (int i = tid; i < d_v; i += blockDimX) {
-        s_v[i] = bf162float(qkv[(v_channel_base + i) * qkv_seq_stride + b]);
+        s_v[i] = bf162float(qkv[(v_channel_base + i) * qkv_ch_stride + b * qkv_seq_stride]);
     }
     __syncthreads();
 
@@ -182,7 +182,7 @@ void glm_gdn_recurrent_step(
     const float* A_log,
     const float* dt_bias,
     int num_heads, int d_k, int d_v,
-    int batch_size, int state_stride, int qkv_seq_stride
+    int batch_size, int state_stride, int qkv_ch_stride, int qkv_seq_stride
 ) {
     int smem_size = (2 * d_k + 3 * d_v + 128) * sizeof(float);
     gdn_recurrent_step_kernel<<<batch_size * num_heads, 128, smem_size, ctx->stream>>>(
@@ -194,7 +194,7 @@ void glm_gdn_recurrent_step(
         A_log,
         dt_bias,
         num_heads, d_k, d_v,
-        batch_size, state_stride, qkv_seq_stride
+        batch_size, state_stride, qkv_ch_stride, qkv_seq_stride
     );
 }
 
@@ -208,7 +208,7 @@ __global__ void gdn_prefill_kernel(
     const float* __restrict__ dt_bias,
     const int* __restrict__ cu_seqlens,
     int total_seq_len, int num_heads, int d_k, int d_v,
-    int batch_size, int state_stride, int qkv_seq_stride
+    int batch_size, int state_stride, int qkv_ch_stride, int qkv_seq_stride
 ) {
     int block_idx = blockIdx.x;
     int b = block_idx / num_heads;
@@ -241,11 +241,11 @@ __global__ void gdn_prefill_kernel(
     for (int t = 0; t < seq_len; t++) {
         int gt = seq_start + t;
         for (int i = tid; i < d_k; i += blockDimX) {
-            s_q[i] = bf162float(qkv[(q_channel_base + i) * qkv_seq_stride + gt]);
-            s_k[i] = bf162float(qkv[(k_channel_base + i) * qkv_seq_stride + gt]);
+            s_q[i] = bf162float(qkv[(q_channel_base + i) * qkv_ch_stride + gt * qkv_seq_stride]);
+            s_k[i] = bf162float(qkv[(k_channel_base + i) * qkv_ch_stride + gt * qkv_seq_stride]);
         }
         for (int i = tid; i < d_v; i += blockDimX) {
-            s_v[i] = bf162float(qkv[(v_channel_base + i) * qkv_seq_stride + gt]);
+            s_v[i] = bf162float(qkv[(v_channel_base + i) * qkv_ch_stride + gt * qkv_seq_stride]);
         }
         __syncthreads();
 
@@ -331,7 +331,7 @@ void glm_gdn_prefill(
     const float* dt_bias,
     const int* cu_seqlens,
     int total_seq_len, int num_heads, int d_k, int d_v,
-    int batch_size, int state_stride, int qkv_seq_stride
+    int batch_size, int state_stride, int qkv_ch_stride, int qkv_seq_stride
 ) {
     int smem_size = (2 * d_k + 3 * d_v + 128) * sizeof(float);
     gdn_prefill_kernel<<<batch_size * num_heads, 128, smem_size, ctx->stream>>>(
@@ -344,7 +344,7 @@ void glm_gdn_prefill(
         dt_bias,
         cu_seqlens,
         total_seq_len, num_heads, d_k, d_v,
-        batch_size, state_stride, qkv_seq_stride
+        batch_size, state_stride, qkv_ch_stride, qkv_seq_stride
     );
 }
 
@@ -355,7 +355,8 @@ __global__ void causal_conv1d_kernel(
     const nv_bfloat16* __restrict__ weight,
     const int* __restrict__ cu_seqlens,
     int conv_dim, int total_seq_len, int kernel_size,
-    int batch_size, int conv_state_stride
+    int batch_size, int conv_state_stride,
+    int ch_stride, int seq_stride
 ) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= conv_dim * batch_size) return;
@@ -369,16 +370,13 @@ __global__ void causal_conv1d_kernel(
     int seq_end = cu_seqlens[b + 1];
     int seq_len = seq_end - seq_start;
 
-    const nv_bfloat16* x = input + ch * total_seq_len + seq_start;
-    nv_bfloat16* out = output + ch * total_seq_len + seq_start;
+    int ch_offset = ch * ch_stride + seq_start * seq_stride;
+    const nv_bfloat16* x = input + ch_offset;
+    nv_bfloat16* out = output + ch_offset;
 
-    // Load initial conv state for this batch element + channel
-    // conv_state layout: [batch, conv_dim, kernel_size-1] with conv_state_stride per batch
     nv_bfloat16* cs_base = conv_state + b * conv_state_stride + ch * state_len;
 
-    // Use shared memory for state if it fits, otherwise just use registers
-    // For kernel_size <= 4 (typical), state_len <= 3, so just use local array
-    float state_buf[8]; // max kernel_size = 8
+    float state_buf[8];
     for (int i = 0; i < state_len && i < 8; i++) {
         state_buf[i] = bf162float(cs_base[i]);
     }
@@ -389,20 +387,19 @@ __global__ void causal_conv1d_kernel(
             int xt = t - (kernel_size - 1) + k;
             float xv;
             if (xt >= 0) {
-                xv = bf162float(x[xt]);
+                xv = bf162float(x[xt * seq_stride]);
             } else {
                 int si = xt + state_len;
                 xv = (si >= 0) ? state_buf[si] : 0.0f;
             }
             sum += bf162float(w[k]) * xv;
         }
-        out[t] = float2bf16(silu_f(sum));
+        out[t * seq_stride] = float2bf16(silu_f(sum));
     }
 
-    // Update conv state: last (kernel_size-1) values of the sequence
     for (int i = 0; i < state_len && i < 8; i++) {
         int src_t = seq_len - state_len + i;
-        cs_base[i] = (src_t >= 0) ? x[src_t] : float2bf16(0.0f);
+        cs_base[i] = (src_t >= 0) ? x[src_t * seq_stride] : float2bf16(0.0f);
     }
 }
 
@@ -414,7 +411,8 @@ void glm_causal_conv1d(
     const void* weight,
     const int* cu_seqlens,
     int conv_dim, int total_seq_len, int kernel_size,
-    int batch_size, int conv_state_stride
+    int batch_size, int conv_state_stride,
+    int ch_stride, int seq_stride
 ) {
     int threads = 256;
     int blocks = (conv_dim * batch_size + threads - 1) / threads;
@@ -425,7 +423,8 @@ void glm_causal_conv1d(
         (const nv_bfloat16*)weight,
         cu_seqlens,
         conv_dim, total_seq_len, kernel_size,
-        batch_size, conv_state_stride
+        batch_size, conv_state_stride,
+        ch_stride, seq_stride
     );
 }
 

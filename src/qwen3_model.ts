@@ -194,11 +194,11 @@ export class Qwen3Model extends ChatModelBase {
         kTokenStride, kHeadStride, vTokenStride, vHeadStride
       );
 
-      let flashOut: Tensor;
+      using flashOut = new UsingHolder<Tensor>(undefined!);
       if (state.isDecode) {
-        flashOut = ws.alloc([batchSize, nHeads, 1, hd], "BF16");
+        flashOut.replace(ws.alloc([batchSize, nHeads, 1, hd], "BF16"));
         glm.batchDecodeRun(
-          qRope.data, flashOut.data,
+          qRope.data, flashOut.value.data,
           pagedKV.kData[i].data, pagedKV.vData[i].data,
           pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
           ws.floatWs.data, ws.intWs.data,
@@ -207,11 +207,11 @@ export class Qwen3Model extends ChatModelBase {
           nHeads, nKv, hd, pageSize, cfg.scaling
         );
       } else {
-        flashOut = ws.alloc([1, nHeads, totalTokens, hd], "BF16");
+        flashOut.replace(ws.alloc([1, nHeads, totalTokens, hd], "BF16"));
         const qStrideN = hd;
         const qStrideH = totalTokens * hd;
         glm.batchPrefillPagedRun(
-          qRope.data, flashOut.data,
+          qRope.data, flashOut.value.data,
           pagedKV.kData[i].data, pagedKV.vData[i].data,
           pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
           ws.floatWs.data, ws.intWs.data,
@@ -224,14 +224,13 @@ export class Qwen3Model extends ChatModelBase {
           1, cfg.scaling
         );
       }
-      using _flashOut = flashOut;
 
-      using oProjBuf = flashOut.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
+      using oProjBuf = flashOut.value.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
       const attnResult = residual.value.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
-      using _attnNormed = attnResult.normed;
+      using attnNormed = attnResult.normed;
       residual.replace(attnResult.residual);
 
-      using downBuf = this.mlp(attnResult.normed, BS, pfx);
+      using downBuf = this.mlp(attnNormed, BS, pfx);
       const nextWeight = i < cfg.numHiddenLayers - 1
         ? this.tensors.get(`model.layers.${i + 1}.input_layernorm.weight`)!
         : this.tensors.get("model.norm.weight")!;

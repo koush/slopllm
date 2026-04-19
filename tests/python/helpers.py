@@ -468,7 +468,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_gdn_prefill.restype = None
@@ -480,7 +480,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_causal_conv1d.restype = None
@@ -489,7 +489,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_causal_conv1d_update.restype = None
@@ -1018,11 +1018,14 @@ class GlmOps:
         )
 
     def gdn_recurrent_step(self, output, state, qkv, a_raw, b_raw, A_log, dt_bias,
-                            num_heads, d_k, d_v, batch_size=1, state_stride=None, qkv_seq_stride=None):
+                            num_heads, d_k, d_v, batch_size=1, state_stride=None, qkv_ch_stride=None, qkv_seq_stride=None):
         if state_stride is None:
             state_stride = num_heads * d_k * d_v
+        conv_dim = num_heads * (2 * d_k + d_v)
+        if qkv_ch_stride is None:
+            qkv_ch_stride = batch_size  # default: [convDim, batch] layout
         if qkv_seq_stride is None:
-            qkv_seq_stride = batch_size
+            qkv_seq_stride = 1  # default: [convDim, batch] layout
         self.lib.glm_gdn_recurrent_step(
             self.ctx,
             self._ptr(output), self._ptr(state),
@@ -1030,15 +1033,17 @@ class GlmOps:
             self._ptr(a_raw), self._ptr(b_raw),
             self._ptr(A_log), self._ptr(dt_bias),
             num_heads, d_k, d_v,
-            batch_size, state_stride, qkv_seq_stride
+            batch_size, state_stride, qkv_ch_stride, qkv_seq_stride
         )
 
     def gdn_prefill(self, output, state, qkv, a_raw, b_raw, A_log, dt_bias,
-                     cu_seqlens, total_seq_len, num_heads, d_k, d_v, batch_size=1, state_stride=None, qkv_seq_stride=None):
+                     cu_seqlens, total_seq_len, num_heads, d_k, d_v, batch_size=1, state_stride=None, qkv_ch_stride=None, qkv_seq_stride=None):
         if state_stride is None:
             state_stride = num_heads * d_k * d_v
+        if qkv_ch_stride is None:
+            qkv_ch_stride = total_seq_len  # default: [convDim, total_seq_len] layout
         if qkv_seq_stride is None:
-            qkv_seq_stride = total_seq_len
+            qkv_seq_stride = 1  # default: [convDim, total_seq_len] layout
         self.lib.glm_gdn_prefill(
             self.ctx,
             self._ptr(output), self._ptr(state),
@@ -1047,20 +1052,22 @@ class GlmOps:
             self._ptr(A_log), self._ptr(dt_bias),
             self._ptr(cu_seqlens),
             total_seq_len, num_heads, d_k, d_v,
-            batch_size, state_stride, qkv_seq_stride
+            batch_size, state_stride, qkv_ch_stride, qkv_seq_stride
         )
 
-    def causal_conv1d(self, output, conv_state, input, weight, cu_seqlens, conv_dim, total_seq_len, kernel_size, batch_size=1, conv_state_stride=None):
+    def causal_conv1d(self, output, conv_state, input, weight, cu_seqlens, conv_dim, total_seq_len, kernel_size, batch_size=1, conv_state_stride=None, ch_stride=None, seq_stride=1):
         cs_ptr = self._ptr(conv_state) if conv_state is not None else ctypes.c_void_p(0)
         if conv_state_stride is None:
             conv_state_stride = conv_dim * (kernel_size - 1)
+        if ch_stride is None:
+            ch_stride = total_seq_len  # default: [conv_dim, total_seq_len] layout
         self.lib.glm_causal_conv1d(
             self.ctx,
             self._ptr(output), cs_ptr,
             self._ptr(input), self._ptr(weight),
             self._ptr(cu_seqlens),
             conv_dim, total_seq_len, kernel_size,
-            batch_size, conv_state_stride
+            batch_size, conv_state_stride, ch_stride, seq_stride
         )
 
     def causal_conv1d_update(self, output, conv_state, input, weight, conv_dim, kernel_size, batch_size=1, conv_state_stride=None):
