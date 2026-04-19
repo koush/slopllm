@@ -25,6 +25,7 @@ interface NativeAddon {
   embedding(ctx: number, out: number, table: number, ids: number, hidden: number, seqLen: number): void;
   layernorm(ctx: number, out: number, input: number, weight: number, bias: number, eps: number, dim: number, batch: number): void;
   relu(ctx: number, out: number, input: number, n: number): void;
+  // currently unused as Tensor method
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   softmax(ctx: number, out: number, input: number, mask: number, dim: number, batch: number): void;
   causalMask(ctx: number, out: number, seqLen: number): void;
@@ -35,18 +36,24 @@ interface NativeAddon {
   maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
+  // currently unused as Tensor method
   applyRotaryPosEmb(ctx: number, out: number, x: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
+  // currently unused as Tensor method
   applyRotaryPosEmbPartial(ctx: number, out: number, x: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
   bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transB: number): void;
   scale(ctx: number, out: number, input: number, s: number, n: number): void;
+  // currently unused as Tensor method
   add(ctx: number, out: number, a: number, b: number, n: number): void;
   expandDim1(ctx: number, out: number, input: number, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number): void;
   expandDim1Strided(ctx: number, out: number, input: number, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number, headStride: number): void;
+  // currently unused as Tensor method
   transpose4d(ctx: number, out: number, input: number, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): void;
+  // currently unused as Tensor method
   mul(ctx: number, out: number, a: number, b: number, n: number): void;
   reduceSum(ctx: number, out: number, input: number, rows: number, cols: number): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number): void;
+  // currently unused as Tensor method
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   argmax(ctx: number, outIndex: number, input: number, dim: number, batch: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number): void;
@@ -168,10 +175,12 @@ export class GlmOps {
     this.native.fill(this.ctx, out, value, n);
   }
 
+  // currently unused as Tensor method
   add(out: number, a: number, b: number, n: number): void {
     this.native.add(this.ctx, out, a, b, n);
   }
 
+  // currently unused as Tensor method
   arange(out: number, start: number, step: number, count: number): void {
     this.native.arange(this.ctx, out, start, step, count);
   }
@@ -192,10 +201,12 @@ export class GlmOps {
     this.native.rotaryEmbedding(this.ctx, cosOut, sinOut, invFreq, positionIds, dimHalf, batch, seqLen);
   }
 
+  // currently unused as Tensor method
   applyRotaryPosEmb(out: number, x: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
     this.native.applyRotaryPosEmb(this.ctx, out, x, cos, sin, ropeDim, nHeads, seqLen, batch, unsqueezeDim);
   }
 
+  // currently unused as Tensor method
   applyRotaryPosEmbPartial(out: number, x: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
     this.native.applyRotaryPosEmbPartial(this.ctx, out, x, cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim);
   }
@@ -212,6 +223,7 @@ export class GlmOps {
     this.native.indexSelect(this.ctx, out, src, indices, dim, k);
   }
 
+  // currently unused as Tensor method
   transpose4d(out: number, input: number, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): void {
     this.native.transpose4d(this.ctx, out, input, d0, d1, d2, d3, p0, p1, p2, p3);
   }
@@ -324,10 +336,12 @@ export class GlmOps {
     this.native.rmsnormGated(this.ctx, output, input, gate, weight, eps, dim, batch);
   }
 
+  // currently unused as Tensor method
   sigmoid(out: number, input: number, n: number): void {
     this.native.sigmoid(this.ctx, out, input, n);
   }
 
+  // currently unused as Tensor method
   mul(out: number, a: number, b: number, n: number): void {
     this.native.mul(this.ctx, out, a, b, n);
   }

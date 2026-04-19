@@ -129,25 +129,6 @@ export class Tensor implements Disposable {
     return out;
   }
 
-  add(a: Tensor | number, b: Tensor | number, n: number): void {
-    this.workspace.glm.add(this.data, ptr(a), ptr(b), n);
-  }
-
-  transpose4d(d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): Tensor {
-    const dims = [d0, d1, d2, d3];
-    const out = this.workspace.alloc([dims[p0], dims[p1], dims[p2], dims[p3]], this.type);
-    this.workspace.glm.transpose4d(out.data, this.data, d0, d1, d2, d3, p0, p1, p2, p3);
-    return out;
-  }
-
-  applyRotaryPosEmb(x: Tensor | number, cos: Tensor | number, sin: Tensor | number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
-    this.workspace.glm.applyRotaryPosEmb(this.data, ptr(x), ptr(cos), ptr(sin), ropeDim, nHeads, seqLen, batch, unsqueezeDim);
-  }
-
-  applyRotaryPosEmbPartial(x: Tensor | number, cos: Tensor | number, sin: Tensor | number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
-    this.workspace.glm.applyRotaryPosEmbPartial(this.data, ptr(x), ptr(cos), ptr(sin), ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim);
-  }
-
   arange(start: number, step: number, count: number): void {
     this.workspace.glm.arange(this.data, start, step, count);
   }
@@ -177,14 +158,6 @@ export class Tensor implements Disposable {
 
   rmsnormGated(input: Tensor | number, gate: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
     this.workspace.glm.rmsnormGated(this.data, ptr(input), ptr(gate), ptr(weight), eps, dim, batch);
-  }
-
-  sigmoid(input: Tensor | number, n: number): void {
-    this.workspace.glm.sigmoid(this.data, ptr(input), n);
-  }
-
-  mul(a: Tensor | number, b: Tensor | number, n: number): void {
-    this.workspace.glm.mul(this.data, ptr(a), ptr(b), n);
   }
 
   flashDecode(pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
