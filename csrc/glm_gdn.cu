@@ -59,7 +59,7 @@ __device__ int find_seq_idx(int t, const int* cu_seqlens, int batch_size) {
     return lo;
 }
 
-__global__ void gdn_recurrent_step_kernel(
+__global__ void __launch_bounds__(128, 4) gdn_recurrent_step_kernel(
     nv_bfloat16* __restrict__ output,
     float* __restrict__ state,
     const nv_bfloat16* __restrict__ qkv,
@@ -198,7 +198,7 @@ void glm_gdn_recurrent_step(
     );
 }
 
-__global__ void gdn_prefill_kernel(
+__global__ void __launch_bounds__(128, 4) gdn_prefill_kernel(
     nv_bfloat16* __restrict__ output,
     float* __restrict__ state,
     const nv_bfloat16* __restrict__ qkv,
@@ -348,7 +348,7 @@ void glm_gdn_prefill(
     );
 }
 
-__global__ void causal_conv1d_kernel(
+__global__ void __launch_bounds__(256, 4) causal_conv1d_kernel(
     nv_bfloat16* __restrict__ output,
     nv_bfloat16* __restrict__ conv_state,
     const nv_bfloat16* __restrict__ input,
@@ -428,7 +428,7 @@ void glm_causal_conv1d(
     );
 }
 
-__global__ void causal_conv1d_update_kernel(
+__global__ void __launch_bounds__(256, 4) causal_conv1d_update_kernel(
     nv_bfloat16* __restrict__ output,
     nv_bfloat16* __restrict__ conv_state,
     const nv_bfloat16* __restrict__ input,
@@ -482,7 +482,7 @@ void glm_causal_conv1d_update(
     );
 }
 
-__global__ void rmsnorm_gated_kernel(
+__global__ void __launch_bounds__(128, 4) rmsnorm_gated_kernel(
     nv_bfloat16* __restrict__ output,
     const nv_bfloat16* __restrict__ input,
     const nv_bfloat16* __restrict__ gate,

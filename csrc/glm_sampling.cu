@@ -55,7 +55,7 @@ __device__ void heap_insert(HeapEntry* heap, int& size, int capacity, float val,
 // ---------------------------------------------------------------------------
 
 template<int MAX_K>
-__global__ void sampling_kernel_batch(
+__global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
     int* __restrict__ out_tokens,
     float* __restrict__ topk_vals,
     int* __restrict__ topk_idxs,
@@ -219,7 +219,7 @@ __global__ void sampling_kernel_batch(
 // Batch argmax kernel (fallback for large K)
 // ---------------------------------------------------------------------------
 
-__global__ void sampling_kernel_argmax_batch(
+__global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_argmax_batch(
     int* __restrict__ out_tokens,
     float* __restrict__ topk_vals,
     int* __restrict__ topk_idxs,

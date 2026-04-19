@@ -61,7 +61,7 @@ __device__ inline void store_bf16x2(__nv_bfloat16* ptr, float v0, float v1) {
 // RMSNorm kernel
 // ---------------------------------------------------------------------------
 
-__global__ void rmsnorm_kernel(
+__global__ void __launch_bounds__(256, 4) rmsnorm_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
@@ -121,7 +121,7 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
 // residual[i] = input_a[i] + input_b[i]
 // ---------------------------------------------------------------------------
 
-__global__ void fused_add_rmsnorm_kernel(
+__global__ void __launch_bounds__(256, 4) fused_add_rmsnorm_kernel(
     __nv_bfloat16* __restrict__ out,
     __nv_bfloat16* __restrict__ residual,
     const __nv_bfloat16* __restrict__ input_a,
@@ -199,7 +199,7 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
 // Applies per-head RMSNorm then RoPE, with layout transpose.
 // ---------------------------------------------------------------------------
 
-__global__ void fused_norm_rope_kernel(
+__global__ void __launch_bounds__(256, 4) fused_norm_rope_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ in,
     const __nv_bfloat16* __restrict__ weight,
@@ -274,7 +274,7 @@ void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
 // SiLU + Mul kernel
 // ---------------------------------------------------------------------------
 
-__global__ void silu_and_mul_kernel(
+__global__ void __launch_bounds__(256, 4) silu_and_mul_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* gate,
     const __nv_bfloat16* up,
@@ -351,7 +351,7 @@ void glm_embedding(GlmCtx* ctx, void* out, const void* table,
 // LayerNorm kernel (with bias)
 // ---------------------------------------------------------------------------
 
-__global__ void layernorm_kernel(
+__global__ void __launch_bounds__(256, 4) layernorm_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
@@ -430,7 +430,7 @@ void glm_layernorm(GlmCtx* ctx, void* out, const void* input,
 // ---------------------------------------------------------------------------
 
 template<auto F>
-__global__ void ew_unary_kernel(__nv_bfloat16* out, const __nv_bfloat16* input, int n) {
+__global__ void __launch_bounds__(256, 4) ew_unary_kernel(__nv_bfloat16* out, const __nv_bfloat16* input, int n) {
     int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
     if (idx + 1 < n) {
         float v0, v1;
@@ -447,7 +447,7 @@ __global__ void ew_unary_kernel(__nv_bfloat16* out, const __nv_bfloat16* input, 
 // ---------------------------------------------------------------------------
 
 template<auto F>
-__global__ void ew_binary_kernel(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b, int n) {
+__global__ void __launch_bounds__(256, 4) ew_binary_kernel(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b, int n) {
     int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
     if (idx + 1 < n) {
         float a0, a1, b0, b1;
@@ -472,7 +472,7 @@ static __device__ __forceinline__ float sigmoid_mul_f(float val, float gate) {
 }
 
 template<auto F>
-__global__ void ew_unary_2d_kernel(
+__global__ void __launch_bounds__(256, 4) ew_unary_2d_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ in,
     int rows, int cols, int pitch, int col_offset
@@ -544,7 +544,7 @@ void glm_sigmoid(GlmCtx* ctx, void* out, const void* input, int n) {
 // mask values: 0.0 = keep, -inf = masked out
 // ---------------------------------------------------------------------------
 
-__global__ void softmax_kernel(
+__global__ void __launch_bounds__(256, 4) softmax_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* mask,
@@ -584,7 +584,7 @@ __global__ void softmax_kernel(
     }
 }
 
-__global__ void softmax_kernel_uncached(
+__global__ void __launch_bounds__(256, 4) softmax_kernel_uncached(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* mask,
@@ -649,7 +649,7 @@ void glm_softmax(GlmCtx* ctx, void* out, const void* input,
 // out: [seq_len, seq_len] BF16
 // ---------------------------------------------------------------------------
 
-__global__ void causal_mask_kernel(
+__global__ void __launch_bounds__(256, 4) causal_mask_kernel(
     __nv_bfloat16* out,
     int seq_len
 ) {
@@ -676,7 +676,7 @@ void glm_causal_mask(GlmCtx* ctx, void* out, int seq_len) {
 // Fill kernel
 // ---------------------------------------------------------------------------
 
-__global__ void fill_kernel(__nv_bfloat16* out, float value, int n) {
+__global__ void __launch_bounds__(256, 4) fill_kernel(__nv_bfloat16* out, float value, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         out[idx] = __float2bfloat16(value);
@@ -700,7 +700,7 @@ void glm_fill(GlmCtx* ctx, void* out, float value, int n) {
 // out[b, i] = input[b, indices[b, i]]
 // ---------------------------------------------------------------------------
 
-__global__ void gather_kernel(
+__global__ void __launch_bounds__(256, 4) gather_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const int* indices,
@@ -734,7 +734,7 @@ void glm_gather(GlmCtx* ctx, void* out, const void* input, const int* indices,
 // out[b, indices[b, i]] = value
 // ---------------------------------------------------------------------------
 
-__global__ void scatter_scalar_kernel(
+__global__ void __launch_bounds__(256, 4) scatter_scalar_kernel(
     __nv_bfloat16* out,
     const int* indices,
     float value,
@@ -767,7 +767,7 @@ void glm_scatter_scalar(GlmCtx* ctx, void* out, const int* indices, float value,
 // out[i, :a_dim] = a[i, :], out[i, a_dim:] = b[i, :]
 // ---------------------------------------------------------------------------
 
-__global__ void cat_last_dim_kernel(
+__global__ void __launch_bounds__(256, 4) cat_last_dim_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* a,
     const __nv_bfloat16* b,
@@ -805,7 +805,7 @@ void glm_cat_last_dim(GlmCtx* ctx, void* out, const void* a, const void* b,
 // out[i] = (mask[i] != 0) ? value : input[i]
 // ---------------------------------------------------------------------------
 
-__global__ void masked_fill_kernel(
+__global__ void __launch_bounds__(256, 4) masked_fill_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* mask,
@@ -839,7 +839,7 @@ void glm_masked_fill(GlmCtx* ctx, void* out, const void* input, const void* mask
 // NOTE: indices must be unique within a call for correctness.
 // ---------------------------------------------------------------------------
 
-__global__ void index_add_kernel(
+__global__ void __launch_bounds__(256, 4) index_add_kernel(
     __nv_bfloat16* out,
     const int* indices,
     const __nv_bfloat16* values,
@@ -876,7 +876,7 @@ void glm_index_add(GlmCtx* ctx, void* out, const int* indices, const void* value
 // inv_freq: [dim_half], position_ids: [batch, seq_len] (int32)
 // ---------------------------------------------------------------------------
 
-__global__ void rotary_embedding_kernel(
+__global__ void __launch_bounds__(256, 4) rotary_embedding_kernel(
     __nv_bfloat16* cos_out,
     __nv_bfloat16* sin_out,
     const __nv_bfloat16* inv_freq,
@@ -927,7 +927,7 @@ void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
 // When head_dim == rope_dim, this reduces to the original behavior.
 // ---------------------------------------------------------------------------
 
-__global__ void apply_rotary_pos_emb_kernel(
+__global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* x,
     const __nv_bfloat16* cos_emb,
@@ -1017,7 +1017,7 @@ void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
 // Shared memory: dim * (sizeof(float) + sizeof(int)) + blockDim * (sizeof(float) + sizeof(int))
 // ---------------------------------------------------------------------------
 
-__global__ void topk_kernel(
+__global__ void __launch_bounds__(256, 4) topk_kernel(
     __nv_bfloat16* out_values,
     int* out_indices,
     const __nv_bfloat16* input,
@@ -1143,7 +1143,7 @@ void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
 // Scale kernel: out = input * scale
 // ---------------------------------------------------------------------------
 
-__global__ void scale_kernel(
+__global__ void __launch_bounds__(256, 4) scale_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     float scale,
@@ -1189,7 +1189,7 @@ void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
 // Requires dim1_out % dim1_in == 0
 // ---------------------------------------------------------------------------
 
-__global__ void expand_dim1_kernel(
+__global__ void __launch_bounds__(256, 4) expand_dim1_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     int dim1_out,
@@ -1247,7 +1247,7 @@ void glm_expand_dim1_strided(GlmCtx* ctx, void* out, const void* input,
 // out[b, s, h, d] = in[b, h, s, d]
 // ---------------------------------------------------------------------------
 
-__global__ void transpose_0213_kernel(
+__global__ void __launch_bounds__(256, 4) transpose_0213_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     int dim0, int dim1, int dim2, int dim3
@@ -1275,7 +1275,7 @@ __global__ void transpose_0213_kernel(
 // e.g., perm={0,2,1,3} swaps dims 1 and 2
 // ---------------------------------------------------------------------------
 
-__global__ void transpose_4d_kernel(
+__global__ void __launch_bounds__(256, 4) transpose_4d_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     int dim0, int dim1, int dim2, int dim3,
@@ -1351,7 +1351,7 @@ void glm_mul(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
 //   out[i] = sum(input[i, :])
 // ---------------------------------------------------------------------------
 
-__global__ void reduce_sum_kernel(
+__global__ void __launch_bounds__(256, 4) reduce_sum_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     int cols
@@ -1394,7 +1394,7 @@ void glm_reduce_sum(GlmCtx* ctx, void* out, const void* input, int rows, int col
 //   out[i, :] = src[indices[i], :]
 // ---------------------------------------------------------------------------
 
-__global__ void index_select_kernel(
+__global__ void __launch_bounds__(256, 4) index_select_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* src,
     const int* indices,
@@ -1425,7 +1425,7 @@ void glm_index_select(GlmCtx* ctx, void* out, const void* src,
 //   out_indices[row] = argmax(input[row * dim : (row+1) * dim])
 // ---------------------------------------------------------------------------
 
-__global__ void argmax_kernel(int* out_indices, const __nv_bfloat16* input,
+__global__ void __launch_bounds__(256, 4) argmax_kernel(int* out_indices, const __nv_bfloat16* input,
                               int dim, int batch) {
     int row = blockIdx.x;
     if (row >= batch) return;
@@ -1470,7 +1470,7 @@ void glm_argmax(GlmCtx* ctx, int* out_index, const void* input, int dim, int bat
 //   out[i] = start + i * step
 // ---------------------------------------------------------------------------
 
-__global__ void arange_kernel(int* out, int start, int step, int count) {
+__global__ void __launch_bounds__(256, 4) arange_kernel(int* out, int start, int step, int count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count) {
         out[idx] = start + idx * step;
@@ -1493,7 +1493,7 @@ void glm_arange(GlmCtx* ctx, int* out, int start, int step, int count) {
 // K and V can have different layouts (different strides).
 // ---------------------------------------------------------------------------
 
-__global__ void kv_cache_write_kernel(
+__global__ void __launch_bounds__(256, 4) kv_cache_write_kernel(
     __nv_bfloat16* dst_k,
     __nv_bfloat16* dst_v,
     const __nv_bfloat16* src_k,
