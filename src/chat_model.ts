@@ -2,6 +2,10 @@ import { ExecutionWorkspace, PagedKVCache, type BatchState } from "./paged_kv";
 import { GlmOps } from "./glm_ops";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
+import fs from "node:fs";
+import path from "node:path";
+import { SafeTensorFile, type TensorMeta } from "./safetensors";
+import { resolveModelPath } from "./model_path";
 
 export interface SamplingParams {
   temperature: number;
@@ -39,6 +43,45 @@ export abstract class ChatModel extends WorkspaceBase {
   abstract forward(state: BatchState): Tensor;
 
   prefillBatchPlanHook(_inputIdsList: number[][], _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void {}
+
+  protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void;  protected tieWeights(): void {}
+
+  protected loadWeights(modelDir: string): void {
+    const stFiles = fs.readdirSync(modelDir).filter(f => f.endsWith('.safetensors') || f.endsWith('.safetensors.json'));
+    const shards: string[] = [];
+    if (stFiles.some(f => f === 'model.safetensors')) {
+      shards.push(path.join(modelDir, 'model.safetensors'));
+    } else {
+      const indexFile = stFiles.find(f => f.endsWith('.json'));
+      if (indexFile) {
+        const idx = JSON.parse(fs.readFileSync(path.join(modelDir, indexFile), 'utf-8'));
+        for (const f of Object.keys(idx.weight_map ?? idx)) {
+          if (f.endsWith('.safetensors') && !shards.includes(path.join(modelDir, f))) {
+            shards.push(path.join(modelDir, f));
+          }
+        }
+      } else {
+        shards.push(...stFiles.filter(f => f.endsWith('.safetensors')).map(f => path.join(modelDir, f)));
+      }
+    }
+
+    for (const stPath of shards) {
+      const st = SafeTensorFile.open(stPath);
+      const mmapPtr = this.glm.mmapOpen(stPath);
+      const fileSize = fs.statSync(stPath).size;
+
+      for (const name of st.tensorNames()) {
+        this.loadTensor(name, st.meta(name), st, mmapPtr);
+      }
+
+      this.glm.synchronize();
+      st.close();
+      this.glm.mmapClose(mmapPtr, fileSize);
+    }
+
+    this.tieWeights();
+    this.freeze();
+  }
 }
 
 export function makeSamplingParams(args: {

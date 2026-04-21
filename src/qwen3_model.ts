@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, I32 } from "./glm_ops";
-import { SafeTensorFile } from "./safetensors";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "./glm_ops";
+import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache } from "./paged_kv";
 import { Tensor } from "./tensor";
@@ -73,40 +73,31 @@ export class Qwen3Model extends ChatModel {
   static fromPretrained(glm: GlmOps, repoId: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {
     const modelDir = resolveModelPath(repoId);
     const config = loadConfig(modelDir);
-
-    const stPath = path.join(modelDir, "model.safetensors");
-    const st = SafeTensorFile.open(stPath);
-    const mmapPtr = glm.mmapOpen(stPath);
-    const fileSize = fs.statSync(stPath).size;
-
     const model = new Qwen3Model(glm, config, maxBatch, maxSeqLen);
-
-    for (const name of st.tensorNames()) {
-      const meta = st.meta(name);
-      if (name.endsWith("_scale_inv")) {
-        const bf16Bytes = st.readTensor(name);
-        const f32Array = bf16BytesToF32(bf16Bytes);
-        const f32Buffer = Buffer.from(f32Array.buffer, f32Array.byteOffset, f32Array.byteLength);
-        const tensor = model.alloc(meta.shape, "F32", name);
-        tensor.h2d(f32Buffer);
-      } else {
-        const tensor = model.alloc(meta.shape, meta.dtype, name);
-        const offset = st.dataStart + meta.dataOffsets[0];
-        glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
-      }
-    }
-
-    glm.synchronize();
-    st.close();
-    glm.mmapClose(mmapPtr, fileSize);
-
-    if (config.tieWordEmbeddings && !model.tensors.has("lm_head.weight")) {
-      const embedTensor = model.tensors.get("model.embed_tokens.weight")!;
-      model.tensors.set("lm_head.weight", embedTensor);
-    }
-
-    model.freeze();
+    model.loadWeights(modelDir);
     return model;
+  }
+
+  protected loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void {
+    if (name.endsWith("_scale_inv")) {
+      const bf16Bytes = st.readTensor(name);
+      const f32Array = bf16BytesToF32(bf16Bytes);
+      const f32Buffer = Buffer.from(f32Array.buffer, f32Array.byteOffset, f32Array.byteLength);
+      const tensor = this.alloc(meta.shape, "F32", name);
+      tensor.h2d(f32Buffer);
+    } else {
+      const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
+      const tensor = this.alloc(meta.shape, dtype, name);
+      const offset = st.dataStart + meta.dataOffsets[0];
+      this.glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
+    }
+  }
+
+  protected tieWeights(): void {
+    if (this.cfg.tieWordEmbeddings && !this.tensors.has("lm_head.weight")) {
+      const embedTensor = this.tensors.get("model.embed_tokens.weight")!;
+      this.tensors.set("lm_head.weight", embedTensor);
+    }
   }
 
   createChatCache(maxPages = 256): ChatCache {

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, I32 } from "./glm_ops";
-import { SafeTensorFile } from "./safetensors";
+import { GlmOps, f32ToBf16Bytes } from "./glm_ops";
+import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { resolveModelPath } from "./model_path";
 import { ExecutionWorkspace, PagedKVCache } from "./paged_kv";
 import { Tensor } from "./tensor";
@@ -137,27 +137,12 @@ export class Qwen35Model extends ChatModel {
   static fromPretrained(glm: GlmOps, repoId: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Qwen35Model {
     const modelDir = resolveModelPath(repoId);
     const config = loadConfig(modelDir);
-
-    const stFiles = fs.readdirSync(modelDir).filter(f => f.endsWith('.safetensors') || f.endsWith('.safetensors.json'));
-    const shards: string[] = [];
-    if (stFiles.some(f => f === 'model.safetensors')) {
-      shards.push(path.join(modelDir, 'model.safetensors'));
-    } else {
-      const indexFile = stFiles.find(f => f.endsWith('.json'));
-      if (indexFile) {
-        const idx = JSON.parse(fs.readFileSync(path.join(modelDir, indexFile), 'utf-8'));
-        for (const f of Object.keys(idx.weight_map ?? idx)) {
-          if (f.endsWith('.safetensors') && !shards.includes(path.join(modelDir, f))) {
-            shards.push(path.join(modelDir, f));
-          }
-        }
-      } else {
-        shards.push(...stFiles.filter(f => f.endsWith('.safetensors')).map(f => path.join(modelDir, f)));
-      }
-    }
-
     const model = new Qwen35Model(glm, config, maxBatch, maxSeqLen);
+    model.loadWeights(modelDir);
+    return model;
+  }
 
+  protected loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void {
     const prefix = Qwen35Model.WEIGHT_PREFIX;
     const gemmaNormSuffixes = [
       "input_layernorm.weight",
@@ -165,73 +150,58 @@ export class Qwen35Model extends ChatModel {
       "q_norm.weight",
       "k_norm.weight",
     ];
+    const isGemmaNorm = name === `${prefix}norm.weight` ||
+      gemmaNormSuffixes.some(s => name.endsWith(s));
 
-    for (const stPath of shards) {
-      const st = SafeTensorFile.open(stPath);
-      const mmapPtr = glm.mmapOpen(stPath);
-      const fileSize = fs.statSync(stPath).size;
-
-      for (const name of st.tensorNames()) {
-        const meta = st.meta(name);
-        const isGemmaNorm = name === `${prefix}norm.weight` ||
-          gemmaNormSuffixes.some(s => name.endsWith(s));
-
-        if (name.includes("A_log") || name.includes("dt_bias")) {
-          const numElements = meta.shape.reduce((a, b) => a * b, 1);
-          const tensor = model.alloc(meta.shape, "F32", name);
-          if (meta.dtype === "F32") {
-            const offset = st.dataStart + meta.dataOffsets[0];
-            glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
-          } else {
-            const rawBytes = st.readTensor(name);
-            const f32Arr = new Float32Array(numElements);
-            for (let i = 0; i < numElements; i++) {
-              const u16 = rawBytes.readUInt16LE(i * 2);
-              const u32 = u16 << 16;
-              f32Arr[i] = new Float32Array(new Uint32Array([u32]).buffer)[0];
-            }
-            tensor.h2d(Buffer.from(f32Arr.buffer));
-          }
-        } else if (meta.dtype === "F32") {
-          const numElements = meta.shape.reduce((a, b) => a * b, 1);
-          const tensor = model.alloc(meta.shape, "BF16", name);
-          const f32Bytes = st.readTensor(name);
-          const f32Arr = new Float32Array(f32Bytes.buffer, f32Bytes.byteOffset, numElements);
-          if (isGemmaNorm) {
-            for (let i = 0; i < numElements; i++) f32Arr[i] += 1.0;
-          }
-          tensor.h2d(f32ToBf16Bytes(f32Arr));
-        } else if (isGemmaNorm) {
-          const numElements = meta.shape.reduce((a, b) => a * b, 1);
-          const tensor = model.alloc(meta.shape, "BF16", name);
-          const rawBytes = st.readTensor(name);
-          const f32Arr = new Float32Array(numElements);
-          for (let i = 0; i < numElements; i++) {
-            const u16 = rawBytes.readUInt16LE(i * 2);
-            const u32 = u16 << 16;
-            f32Arr[i] = (new Float32Array(new Uint32Array([u32]).buffer)[0]) + 1.0;
-          }
-          tensor.h2d(f32ToBf16Bytes(f32Arr));
-        } else {
-          const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
-          const tensor = model.alloc(meta.shape, dtype, name);
-          const offset = st.dataStart + meta.dataOffsets[0];
-          glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
+    if (name.includes("A_log") || name.includes("dt_bias")) {
+      const numElements = meta.shape.reduce((a, b) => a * b, 1);
+      const tensor = this.alloc(meta.shape, "F32", name);
+      if (meta.dtype === "F32") {
+        const offset = st.dataStart + meta.dataOffsets[0];
+        this.glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
+      } else {
+        const rawBytes = st.readTensor(name);
+        const f32Arr = new Float32Array(numElements);
+        for (let i = 0; i < numElements; i++) {
+          const u16 = rawBytes.readUInt16LE(i * 2);
+          const u32 = u16 << 16;
+          f32Arr[i] = new Float32Array(new Uint32Array([u32]).buffer)[0];
         }
+        tensor.h2d(Buffer.from(f32Arr.buffer));
       }
-
-      glm.synchronize();
-      st.close();
-      glm.mmapClose(mmapPtr, fileSize);
+    } else if (meta.dtype === "F32") {
+      const numElements = meta.shape.reduce((a, b) => a * b, 1);
+      const tensor = this.alloc(meta.shape, "BF16", name);
+      const f32Bytes = st.readTensor(name);
+      const f32Arr = new Float32Array(f32Bytes.buffer, f32Bytes.byteOffset, numElements);
+      if (isGemmaNorm) {
+        for (let i = 0; i < numElements; i++) f32Arr[i] += 1.0;
+      }
+      tensor.h2d(f32ToBf16Bytes(f32Arr));
+    } else if (isGemmaNorm) {
+      const numElements = meta.shape.reduce((a, b) => a * b, 1);
+      const tensor = this.alloc(meta.shape, "BF16", name);
+      const rawBytes = st.readTensor(name);
+      const f32Arr = new Float32Array(numElements);
+      for (let i = 0; i < numElements; i++) {
+        const u16 = rawBytes.readUInt16LE(i * 2);
+        const u32 = u16 << 16;
+        f32Arr[i] = (new Float32Array(new Uint32Array([u32]).buffer)[0]) + 1.0;
+      }
+      tensor.h2d(f32ToBf16Bytes(f32Arr));
+    } else {
+      const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
+      const tensor = this.alloc(meta.shape, dtype, name);
+      const offset = st.dataStart + meta.dataOffsets[0];
+      this.glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
     }
+  }
 
-    if (config.tieWordEmbeddings && !model.tensors.has("lm_head.weight")) {
-      const embedTensor = model.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}embed_tokens.weight`)!;
-      model.tensors.set("lm_head.weight", embedTensor);
+  protected tieWeights(): void {
+    if (this.cfg.tieWordEmbeddings && !this.tensors.has("lm_head.weight")) {
+      const embedTensor = this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}embed_tokens.weight`)!;
+      this.tensors.set("lm_head.weight", embedTensor);
     }
-
-    model.freeze();
-    return model;
   }
 
   createGdnState(batchSize = 1): Qwen35GdnState {
