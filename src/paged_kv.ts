@@ -1,14 +1,20 @@
-import { GlmOps, BF16, I32 } from "./glm_ops";
+import { GlmOps, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, I32, BF16 } from "./glm_ops";
 import { WorkspaceBase } from "./workspace";
-import type { ChatCache } from "./chat_model";
+import type { ChatCache, ChatModel } from "./chat_model";
 import { Tensor } from "./tensor";
 
-export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
-export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
-export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 export const PAGE_SIZE = 16;
 export const DECODE_PLAN_INFO_SIZE = 10;
 export const PREFILL_PLAN_INFO_SIZE = 15;
+
+export interface BatchState {
+  batchSize: number;
+  totalTokens: number;
+  seqLens: number[];
+  readonly isDecode: boolean;
+  readonly ws: ExecutionWorkspace;
+  readonly cache: ChatCache;
+}
 
 function longestPrefix(a: number[], b: number[]): number {
   const len = Math.min(a.length, b.length);
@@ -81,6 +87,170 @@ export class ExecutionWorkspace extends WorkspaceBase {
     );
     return out;
   }
+
+  kvCacheWrite(kRope: Tensor, vBuf: Tensor, state: BatchState, cacheIdx: number, nKv: number, hd: number): void {
+    const pagedKV = state.cache.getPagedKV();
+    const BS = state.totalTokens;
+    const kTokenStride = state.isDecode ? nKv * hd : hd;
+    const kHeadStride = state.isDecode ? hd : BS * hd;
+    const vTokenStride = nKv * hd;
+    const vHeadStride = hd;
+    this.glm.kvCacheWrite(
+      kRope.data, vBuf.data,
+      pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
+      this.slotMapping.data,
+      BS, nKv, hd, pagedKV.pageSize,
+      kTokenStride, kHeadStride, vTokenStride, vHeadStride
+    );
+  }
+
+  plan(model: ChatModel, inputIdsList: number[][], cache: ChatCache, enableCudaGraph = false): BatchState {
+    const pagedKV = cache.getPagedKV();
+    const cfg = model.cfg;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const pageSize = pagedKV.pageSize;
+    const batchSize = inputIdsList.length;
+    const seqLens = inputIdsList.map(ids => ids.length);
+    const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+    const isDecode = seqLens.every(s => s === 1);
+
+    if (enableCudaGraph && !isDecode) {
+      throw new Error("enableCudaGraph requires all sequences to have length 1 (decode mode)");
+    }
+
+    if (pagedKV.seqPages.length !== batchSize) {
+      throw new Error(`plan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+    }
+
+    const allIds: number[] = [];
+    for (const ids of inputIdsList) allIds.push(...ids);
+    const idsBuf = Int32Array.from(allIds);
+    this.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+
+    if (isDecode) {
+      const writeLocations: [number, number][] = [];
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
+      }
+
+      pagedKV.updateIndptr(this);
+
+      const slotMappingBuf = new Int32Array(batchSize);
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        const [absPage, slotInPage] = writeLocations[seqIdx];
+        slotMappingBuf[seqIdx] = absPage * pageSize + slotInPage;
+      }
+      this.slotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+
+      const posIds = new Array(batchSize);
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        posIds[seqIdx] = pagedKV.seqKvLens[seqIdx] - 1;
+      }
+      const posIdsBuf = Int32Array.from(posIds);
+      this.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+
+      this.glm.batchDecodePlan(
+        this.floatWs.data, BATCH_FLOAT_WS_SIZE,
+        this.intWs.data, this.pinnedIntWs.data, BATCH_INT_WS_SIZE,
+        this.decodePlanInfo.data,
+        this.indptrH.data,
+        batchSize,
+        nHeads, nKv, hd, pageSize,
+        enableCudaGraph
+      );
+
+      return { batchSize, totalTokens, seqLens, isDecode: true, ws: this, cache };
+    }
+
+    const startPos = pagedKV.seqKvLens.slice();
+
+    model.prefillBatchPlanHook(inputIdsList, seqLens, totalTokens, startPos, cache);
+
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);
+    }
+
+    const qoIndptr = [0];
+    for (const s of seqLens) {
+      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
+    }
+    const qoIndptrBuf = Int32Array.from(qoIndptr);
+
+    pagedKV.updateIndptr(this);
+
+    const posIds: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      for (let p = 0; p < seqLens[seqIdx]; p++) {
+        posIds.push(startPos[seqIdx] + p);
+      }
+    }
+    const posIdsBuf = Int32Array.from(posIds);
+    this.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+
+    const lastIndices: number[] = [];
+    let offset = 0;
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      lastIndices.push(offset + seqLens[seqIdx] - 1);
+      offset += seqLens[seqIdx];
+    }
+    const lastIdxBuf = Int32Array.from(lastIndices);
+    this.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
+
+    const qoIndptrHostPtr = this.glm.allocPinned((batchSize + 1) * I32);
+    this.glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    this.glm.batchPrefillPagedPlan(
+      this.floatWs.data, BATCH_FLOAT_WS_SIZE,
+      this.intWs.data, this.pinnedIntWs.data, BATCH_INT_WS_SIZE,
+      this.prefillPlanInfo.data,
+      qoIndptrHostPtr, this.indptrH.data,
+      totalTokens, batchSize,
+      nHeads, nKv, hd,
+      pageSize,
+      1
+    );
+
+    this.glm.freePinned(qoIndptrHostPtr);
+
+    this.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+
+    const slotMapping: number[] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      const pages = pagedKV.seqPages[seqIdx];
+      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
+        const kvPos = startPos[seqIdx] + pos;
+        const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
+        const offsetInPage = kvPos % pagedKV.pageSize;
+        const absPage = pages[pageIdxInSeq];
+        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
+      }
+    }
+    const slotMappingBuf = Int32Array.from(slotMapping);
+    this.slotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+
+    return { batchSize, totalTokens, seqLens, isDecode: false, ws: this, cache };
+  }
+
+  planDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache, enableCudaGraph = false): BatchState {
+    return this.plan(model, tokenIdsList.map(t => [t]), cache, enableCudaGraph);
+  }
+
+  forwardEager(model: ChatModel, inputIdsList: number[][], cache: ChatCache): number[] {
+    const state = this.plan(model, inputIdsList, cache);
+    const logits = model.forward(state);
+    using argmaxResult = logits.argmax();
+    return argmaxResult.readInt32LE();
+  }
+
+  forwardDecode(model: ChatModel, state: BatchState): Tensor {
+    return model.forward(state);
+  }
+
+  forwardEagerDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache): number[] {
+    return this.forwardEager(model, tokenIdsList.map(t => [t]), cache);
+  }
 }
 
 export class PagedKVCache extends WorkspaceBase implements ChatCache {
@@ -97,6 +267,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   seqPages: number[][];
   seqKvLens: number[];
   cachedTokenIds: number[][];
+
+  getPagedKV(): PagedKVCache { return this; }
 
   constructor(glm: GlmOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE) {
     super(glm);

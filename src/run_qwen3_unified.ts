@@ -140,7 +140,7 @@ export function* generateStream(
   const suffixIds = cache.prefixMatch(0, inputIds);
   cache.appendTokens(0, suffixIds);
 
-  const firstTokens = model.forwardEager(ws, [suffixIds], cache);
+  const firstTokens = ws.forwardEager(model, [suffixIds], cache);
   let currentToken = firstTokens[0];
   yield currentToken;
   cache.appendTokens(0, [currentToken]);
@@ -152,7 +152,7 @@ export function* generateStream(
   let argmaxResult: Tensor | null = null;
 
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
-    const state = model.planDecode(ws, [currentToken], cache, useGraph);
+    const state = ws.planDecode(model, [currentToken], cache, useGraph);
 
     if (useGraph && graphState!.graphExec !== null) {
       glm.graphLaunch(graphState!.graphExec);
@@ -163,7 +163,7 @@ export function* generateStream(
         glm.graphBeginCapture();
       }
 
-      logits = model.forwardDecode(state);
+      logits = model.forward(state);
       if (!sampling  ) {
         argmaxResult = logits.argmax();
       }
@@ -198,7 +198,7 @@ export function generateBatchTokens(
 ): number[][] {
   const batchSize = inputIdsList.length;
   cache.reset(batchSize);
-  const firstTokens = model.forwardEager(ws, inputIdsList, cache);
+  const firstTokens = ws.forwardEager(model, inputIdsList, cache);
 
   const nextTokens = [...firstTokens];
   const generated: number[][] = nextTokens.map(t => [t]);
@@ -207,7 +207,7 @@ export function generateBatchTokens(
   for (let step = 0; step < maxNewTokens - 1; step++) {
     if (finished.every(f => f)) break;
 
-    const newTokens = model.forwardEagerDecode(ws, nextTokens, cache);
+    const newTokens = ws.forwardEagerDecode(model, nextTokens, cache);
 
     for (let i = 0; i < batchSize; i++) {
       nextTokens[i] = newTokens[i];

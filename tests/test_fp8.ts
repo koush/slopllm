@@ -76,9 +76,9 @@ describe("Qwen3-0.6B-FP8 model", () => {
     const pagedKV = makeKV(model);
     try {
       pagedKV.reset(1);
-      const token = model.forwardEager(ws, [[1, 2, 3, 4, 5]], pagedKV)[0];
+      const token = ws.forwardEager(model, [[1, 2, 3, 4, 5]], pagedKV)[0];
       assert.ok(Number.isInteger(token), "prefill should return an integer token");
-      assert.ok(token >= 0 && token < model.vocabSize, `token ${token} out of vocab range [0, ${model.vocabSize})`);
+      assert.ok(token >= 0 && token < model.cfg.vocabSize, `token ${token} out of vocab range [0, ${model.cfg.vocabSize})`);
     } finally {
       pagedKV.free();
     }
@@ -91,7 +91,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
       assert.ok(tokens.length > 0, "should produce at least one token");
       for (const t of tokens) {
         assert.ok(Number.isInteger(t), `token ${t} should be an integer`);
-        assert.ok(t >= 0 && t < model.vocabSize, `token ${t} out of vocab range`);
+        assert.ok(t >= 0 && t < model.cfg.vocabSize, `token ${t} out of vocab range`);
       }
     } finally {
       pagedKV.free();
@@ -105,12 +105,12 @@ describe("Qwen3-0.6B-FP8 model", () => {
     const bf16KV = makeKV(bf16Model);
     try {
       fp8KV.reset(1);
-      const fp8State = model.plan(ws, [[1, 2, 3, 4, 5]], fp8KV);
+      const fp8State = ws.plan(model, [[1, 2, 3, 4, 5]], fp8KV);
       const fp8LogitsBuf = model.forward(fp8State);
       const fp8Logits = readLogits(fp8LogitsBuf);
 
       bf16KV.reset(1);
-      const bf16State = bf16Model.plan(bf16Ws, [[1, 2, 3, 4, 5]], bf16KV);
+      const bf16State = bf16Ws.plan(bf16Model, [[1, 2, 3, 4, 5]], bf16KV);
       const bf16LogitsBuf = bf16Model.forward(bf16State);
       const bf16Logits = readLogits(bf16LogitsBuf);
 

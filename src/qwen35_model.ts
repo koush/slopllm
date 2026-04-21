@@ -7,7 +7,8 @@ import { ExecutionWorkspace, PagedKVCache } from "./paged_kv";
 import { Tensor } from "./tensor";
 import { Qwen35GdnState } from "./qwen35_gdn_state";
 import type { ChatCache } from "./chat_model";
-import { ChatModelBase, type BatchState, SamplingParams } from "./chat_model";
+import { ChatModel, SamplingParams } from "./chat_model";
+import type { BatchState } from "./paged_kv";
 import { UsingHolder } from "./using-holder";
 
 class Qwen35ChatCache implements ChatCache {
@@ -15,6 +16,8 @@ class Qwen35ChatCache implements ChatCache {
     public readonly pagedKV: PagedKVCache,
     public readonly gdnState: Qwen35GdnState,
   ) {}
+
+  getPagedKV(): PagedKVCache { return this.pagedKV; }
 
   reset(batchSize: number): void {
     this.pagedKV.reset(batchSize);
@@ -41,7 +44,6 @@ class Qwen35ChatCache implements ChatCache {
 export type { SamplingParams };
 
 const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
-const EOS_TOKEN_IDS = new Set([248044]);
 
 export interface Qwen35Config {
   hiddenSize: number;
@@ -108,7 +110,7 @@ function loadConfig(modelDir: string): Qwen35Config {
   };
 }
 
-export class Qwen35Model extends ChatModelBase {
+export class Qwen35Model extends ChatModel {
   readonly eosIds = new Set([248044]);
   cfg: Qwen35Config;
   maxBatch: number;
@@ -254,11 +256,6 @@ export class Qwen35Model extends ChatModelBase {
     return idx;
   }
 
-  protected getPagedKV(cache: ChatCache): PagedKVCache {
-    if (!(cache instanceof Qwen35ChatCache)) throw new Error("Expected Qwen35ChatCache");
-    return cache.pagedKV;
-  }
-
   private mlp(normed: Tensor, pfx: string, BS: number): Tensor {
     using gateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS);
     using upBuf = normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS);
@@ -268,7 +265,6 @@ export class Qwen35Model extends ChatModelBase {
 
   private gdnLayerPrefill(ws: ExecutionWorkspace, normed: Tensor, residual: Tensor, layerIdx: number, S: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
-    const glm = this.glm;
     const hs = cfg.hiddenSize;
     const linHeads = cfg.linearNumKeyHeads;
     const linKDim = cfg.linearKeyHeadDim;
@@ -368,14 +364,12 @@ export class Qwen35Model extends ChatModelBase {
 
   private fullAttnLayer(normed: Tensor, residual: Tensor, layerIdx: number, state: BatchState, cos: Tensor, sin: Tensor): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
-    const glm = this.glm;
     const ws = state.ws;
     const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
-    const pagedKV = this.getPagedKV(state.cache);
-    const pageSize = pagedKV.pageSize;
+    const pagedKV = state.cache.getPagedKV();
     const cacheIdx = this.fullAttnCacheIdx(layerIdx);
     const pfx = `layers.${layerIdx}.self_attn`;
     const batchSize = state.batchSize;
@@ -392,18 +386,7 @@ export class Qwen35Model extends ChatModelBase {
     using qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nHeads, S, B, hd * 2);
     using kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nKv, S, B);
 
-    const slotMapping = ws.slotMapping.data;
-    const kTokenStride = state.isDecode ? nKv * hd : hd;
-    const kHeadStride = state.isDecode ? hd : BS * hd;
-    const vTokenStride = nKv * hd;
-    const vHeadStride = hd;
-
-    glm.kvCacheWrite(
-      kRope.data, vBuf.data,
-      pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
-      slotMapping, BS, nKv, hd, pageSize,
-      kTokenStride, kHeadStride, vTokenStride, vHeadStride
-    );
+    ws.kvCacheWrite(kRope, vBuf, state, cacheIdx, nKv, hd);
 
     using flashOut = new UsingHolder<Tensor>(undefined!);
     if (state.isDecode) {
@@ -431,7 +414,7 @@ export class Qwen35Model extends ChatModelBase {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  protected prefillBatchPlanHook(
+  prefillBatchPlanHook(
     _inputIdsList: number[][], seqLens: number[], totalTokens: number,
     _startPos: number[], cache: ChatCache,
   ): void {
@@ -446,9 +429,8 @@ export class Qwen35Model extends ChatModelBase {
     const ws = state.ws;
     using _tracker = ws.startTracking();
     const cache = state.cache as Qwen35ChatCache;
-    const { pagedKV, gdnState } = cache;
+    const { gdnState } = cache;
     const cfg = this.cfg;
-    const glm = this.glm;
     const hs = cfg.hiddenSize;
     const hd = cfg.headDim;
     const batchSize = state.batchSize;

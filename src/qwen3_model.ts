@@ -6,7 +6,8 @@ import { resolveModelPath } from "./model_path";
 import { PagedKVCache } from "./paged_kv";
 import { Tensor } from "./tensor";
 import type { ChatCache } from "./chat_model";
-import { ChatModelBase, type BatchState, SamplingParams } from "./chat_model";
+import { ChatModel, SamplingParams } from "./chat_model";
+import type { BatchState } from "./paged_kv";
 import { UsingHolder } from "./using-holder";
 
 export type { SamplingParams };
@@ -47,7 +48,7 @@ function loadConfig(modelDir: string): Qwen3Config {
   };
 }
 
-export class Qwen3Model extends ChatModelBase {
+export class Qwen3Model extends ChatModel {
   readonly eosIds = new Set([151645, 151643]);
   cfg: Qwen3Config;
   maxBatch: number;
@@ -116,11 +117,6 @@ export class Qwen3Model extends ChatModelBase {
     return new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, maxPages, this.maxBatch);
   }
 
-  protected getPagedKV(cache: ChatCache): PagedKVCache {
-    if (!(cache instanceof PagedKVCache)) throw new Error("Expected PagedKVCache");
-    return cache;
-  }
-
   private mlp(normed: Tensor, BS: number, pfx: string): Tensor {
     using gateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS);
     using upBuf = normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS);
@@ -146,14 +142,12 @@ export class Qwen3Model extends ChatModelBase {
   forward(state: BatchState): Tensor {
     const ws = state.ws;
     using _tracker = ws.startTracking();
-    const pagedKV = this.getPagedKV(state.cache);
+    const pagedKV = state.cache.getPagedKV();
     const cfg = this.cfg;
-    const glm = this.glm;
     const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
-    const pageSize = pagedKV.pageSize;
     const batchSize = state.batchSize;
     const totalTokens = state.totalTokens;
     const BS = totalTokens;
@@ -177,18 +171,7 @@ export class Qwen3Model extends ChatModelBase {
       using kRope = _qkv.kRope;
       using vBuf = _qkv.vBuf;
 
-      const slotMapping = ws.slotMapping.data;
-      const kTokenStride = state.isDecode ? nKv * hd : hd;
-      const kHeadStride = state.isDecode ? hd : BS * hd;
-      const vTokenStride = nKv * hd;
-      const vHeadStride = hd;
-      glm.kvCacheWrite(
-        kRope.data, vBuf.data,
-        pagedKV.kData[i].data, pagedKV.vData[i].data,
-        slotMapping,
-        BS, nKv, hd, pageSize,
-        kTokenStride, kHeadStride, vTokenStride, vHeadStride
-      );
+      ws.kvCacheWrite(kRope, vBuf, state, i, nKv, hd);
 
       using flashOut = new UsingHolder<Tensor>(undefined!);
       if (state.isDecode) {
