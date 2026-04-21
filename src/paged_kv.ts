@@ -1,7 +1,8 @@
-import { GlmOps, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, I32, BF16 } from "./glm_ops";
-import { WorkspaceBase } from "./workspace";
 import type { ChatCache, ChatModel } from "./chat_model";
+import { DeviceOps } from "./device_ops";
+import { BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, BF16, I32 } from "./glm_ops";
 import { Tensor } from "./tensor";
+import { WorkspaceBase } from "./workspace";
 
 export const PAGE_SIZE = 16;
 export const DECODE_PLAN_INFO_SIZE = 10;
@@ -40,7 +41,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   lastPageLen: Tensor;
   lastPageLenH: Tensor;
 
-  constructor(glm: GlmOps, B: number, S: number) {
+  constructor(glm: DeviceOps, B: number, S: number) {
     super(glm);
 
     this.floatWs = this.alloc([BATCH_FLOAT_WS_SIZE], "U8", "floatWs");
@@ -270,7 +271,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
   getPagedKV(): PagedKVCache { return this; }
 
-  constructor(glm: GlmOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE) {
+  constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE) {
     super(glm);
     this.nKv = nKv;
     this.hd = hd;

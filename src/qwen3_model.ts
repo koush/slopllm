@@ -1,17 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "./glm_ops";
-import { SafeTensorFile, type TensorMeta } from "./safetensors";
-import { resolveModelPath } from "./model_path";
-import { PagedKVCache } from "./paged_kv";
-import { Tensor } from "./tensor";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, SamplingParams } from "./chat_model";
+import { DeviceOps } from "./device_ops";
+import { bf16BytesToF32, f32ToBf16Bytes } from "./glm_ops";
+import { resolveModelPath } from "./model_path";
 import type { BatchState } from "./paged_kv";
+import { PagedKVCache } from "./paged_kv";
+import { SafeTensorFile, type TensorMeta } from "./safetensors";
+import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 
-export type { SamplingParams };
-export type { BatchState };
+export type { BatchState, SamplingParams };
 
 export interface Qwen3Config {
   hiddenSize: number;
@@ -55,7 +55,7 @@ export class Qwen3Model extends ChatModel {
   maxSeqLen: number;
   invFreq: Tensor;
 
-  private constructor(glm: GlmOps, config: Qwen3Config, maxBatch: number, maxSeqLen: number) {
+  private constructor(glm: DeviceOps, config: Qwen3Config, maxBatch: number, maxSeqLen: number) {
     super(glm);
     this.cfg = config;
     this.maxBatch = maxBatch;
@@ -70,7 +70,7 @@ export class Qwen3Model extends ChatModel {
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
   }
 
-  static fromPretrained(glm: GlmOps, repoId: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {
+  static fromPretrained(glm: DeviceOps, repoId: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {
     const modelDir = resolveModelPath(repoId);
     const config = loadConfig(modelDir);
     const model = new Qwen3Model(glm, config, maxBatch, maxSeqLen);

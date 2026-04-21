@@ -1,7 +1,7 @@
-import { GlmOps } from "./glm_ops";
-import { WorkspaceBase } from "./workspace";
-import { Tensor } from "./tensor";
+import { DeviceOps } from "./device_ops";
 import { Qwen35Config } from "./qwen35_model";
+import { Tensor } from "./tensor";
+import { WorkspaceBase } from "./workspace";
 
 export class Qwen35GdnState extends WorkspaceBase {
   convState: Tensor[];
@@ -15,7 +15,7 @@ export class Qwen35GdnState extends WorkspaceBase {
   readonly convStateStride: number;
   readonly recurrentStateStride: number;
 
-  constructor(glm: GlmOps, cfg: Qwen35Config, batchSize = 1) {
+  constructor(glm: DeviceOps, cfg: Qwen35Config, batchSize = 1) {
     super(glm);
     this.cfg = cfg;
     this.batchSize = batchSize;

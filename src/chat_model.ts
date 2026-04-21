@@ -1,11 +1,10 @@
-import { ExecutionWorkspace, PagedKVCache, type BatchState } from "./paged_kv";
-import { GlmOps } from "./glm_ops";
-import { Tensor } from "./tensor";
-import { WorkspaceBase } from "./workspace";
 import fs from "node:fs";
 import path from "node:path";
+import { DeviceOps } from "./device_ops";
+import { PagedKVCache, type BatchState } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
-import { resolveModelPath } from "./model_path";
+import { Tensor } from "./tensor";
+import { WorkspaceBase } from "./workspace";
 
 export interface SamplingParams {
   temperature: number;
@@ -35,7 +34,7 @@ export abstract class ChatModel extends WorkspaceBase {
   abstract readonly eosIds: Set<number>;
   abstract readonly cfg: CommonModelConfig;
 
-  constructor(glm: GlmOps) {
+  constructor(glm: DeviceOps) {
     super(glm);
   }
 

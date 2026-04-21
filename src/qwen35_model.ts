@@ -1,14 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GlmOps, f32ToBf16Bytes } from "./glm_ops";
-import { SafeTensorFile, type TensorMeta } from "./safetensors";
-import { resolveModelPath } from "./model_path";
-import { ExecutionWorkspace, PagedKVCache } from "./paged_kv";
-import { Tensor } from "./tensor";
-import { Qwen35GdnState } from "./qwen35_gdn_state";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, SamplingParams } from "./chat_model";
+import { DeviceOps } from "./device_ops";
+import { f32ToBf16Bytes } from "./glm_ops";
+import { resolveModelPath } from "./model_path";
 import type { BatchState } from "./paged_kv";
+import { ExecutionWorkspace, PagedKVCache } from "./paged_kv";
+import { Qwen35GdnState } from "./qwen35_gdn_state";
+import { SafeTensorFile, type TensorMeta } from "./safetensors";
+import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 
 class Qwen35ChatCache implements ChatCache {
@@ -118,7 +119,7 @@ export class Qwen35Model extends ChatModel {
   maxSeqLen: number;
   invFreq: Tensor;
 
-  private constructor(glm: GlmOps, config: Qwen35Config, maxBatch: number, maxSeqLen: number) {
+  private constructor(glm: DeviceOps, config: Qwen35Config, maxBatch: number, maxSeqLen: number) {
     super(glm);
     this.cfg = config;
     this.maxBatch = maxBatch;
@@ -134,7 +135,7 @@ export class Qwen35Model extends ChatModel {
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
   }
 
-  static fromPretrained(glm: GlmOps, repoId: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Qwen35Model {
+  static fromPretrained(glm: DeviceOps, repoId: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Qwen35Model {
     const modelDir = resolveModelPath(repoId);
     const config = loadConfig(modelDir);
     const model = new Qwen35Model(glm, config, maxBatch, maxSeqLen);

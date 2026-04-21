@@ -1,8 +1,8 @@
-import { GlmOps } from "./glm_ops";
+import { DeviceOps } from "./device_ops";
 import { Tensor } from "./tensor";
 
 export class WorkspaceBase {
-  readonly glm: GlmOps;
+  readonly glm: DeviceOps;
   tensors = new Map<string, Tensor>();
   tracked = new Set<Tensor>();
   disposed = new Set<Tensor>();
@@ -10,7 +10,7 @@ export class WorkspaceBase {
   private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
   frozen = false;
 
-  constructor(glm: GlmOps) {
+  constructor(glm: DeviceOps) {
     this.glm = glm;
   }
 
