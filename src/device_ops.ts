@@ -37,6 +37,13 @@ export interface DeviceOps {
 
   sampleBatch(outTokens: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, penaltyOffsets: number, vocabSize: number, batchSize: number, temperatures: number, repPenalties: number, presPenalties: number, topKs: number, topPs: number, randomVals: number, maxEffectiveK: number): void;
 
+  graphBeginCapture(): void;
+  graphEndCapture(): number;
+  graphInstantiate(graph: number): number;
+  graphLaunch(graphExec: number): void;
+  graphDestroy(graph: number): void;
+  graphExecDestroy(graphExec: number): void;
+
   mmapOpen(filePath: string): number;
   mmapLoad(gpuDst: number, mmapPtr: number, offset: number, nbytes: number): void;
   mmapClose(mmapPtr: number, size: number): void;

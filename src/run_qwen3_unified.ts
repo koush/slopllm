@@ -7,6 +7,7 @@ import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
 import { ExecutionWorkspace } from "./paged_kv";
+import { DeviceOps } from "./device_ops";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -133,7 +134,7 @@ function tokenizeMessages(
 // --- Generation primitives ---
 
 export function* generateStream(
-  model: ChatModel, ws: ExecutionWorkspace, glm: GlmOps, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
 ): Generator<number> {
@@ -227,7 +228,7 @@ export function generateBatchTokens(
 // --- Interactive / single-prompt modes ---
 
 async function interactiveChat(
-  model: ChatModel, ws: ExecutionWorkspace, glm: GlmOps, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   tokenizer: any, args: CliArgs, graphState?: GraphState,
 ): Promise<void> {
   const sp = makeSamplingParams(args);
@@ -299,7 +300,7 @@ async function interactiveChat(
 }
 
 async function singlePrompt(
-  model: ChatModel, ws: ExecutionWorkspace, glm: GlmOps, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   tokenizer: any, args: CliArgs, graphState?: GraphState,
 ): Promise<void> {
   const sp = !args.greedy ? makeSamplingParams(args) : undefined;
