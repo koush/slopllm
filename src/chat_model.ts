@@ -1,6 +1,7 @@
-import { GlmOps, I32, BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, SAMPLING_MAX_TOPK, SAMPLING_BLOCK_SIZE } from "./glm_ops";
-import { PagedKVCache, DECODE_PLAN_INFO_SIZE, PREFILL_PLAN_INFO_SIZE } from "./paged_kv";
-import { Tensor, type TensorWorkspace } from "./tensor";
+import { BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, GlmOps, I32 } from "./glm_ops";
+import { ExecutionWorkspace, PagedKVCache } from "./paged_kv";
+import { Tensor } from "./tensor";
+import { WorkspaceBase } from "./workspace";
 
 export interface SamplingParams {
   temperature: number;
@@ -24,7 +25,7 @@ export interface BatchState {
   seqLens: number[];
   pageAllocs: [number, number][];
   readonly isDecode: boolean;
-  readonly ws: SamplingWorkspaceBase;
+  readonly ws: ExecutionWorkspace;
   readonly cache: ChatCache;
 }
 
@@ -32,14 +33,12 @@ export interface ChatModel {
   readonly eosIds: Set<number>;
   readonly vocabSize: number;
   createChatCache(maxPages?: number): ChatCache;
-  plan(ws: SamplingWorkspaceBase, inputIdsList: number[][], cache: ChatCache, enableCudaGraph?: boolean): BatchState;
+  plan(ws: ExecutionWorkspace, inputIdsList: number[][], cache: ChatCache, enableCudaGraph?: boolean): BatchState;
   forward(state: BatchState): Tensor;
-  read(state: BatchState): number[];
-  forwardEager(ws: SamplingWorkspaceBase, inputIdsList: number[][], cache: ChatCache): number[];
-  planDecode(ws: SamplingWorkspaceBase, tokenIdsList: number[], cache: ChatCache, enableCudaGraph?: boolean): BatchState;
+  forwardEager(ws: ExecutionWorkspace, inputIdsList: number[][], cache: ChatCache): number[];
+  planDecode(ws: ExecutionWorkspace, tokenIdsList: number[], cache: ChatCache, enableCudaGraph?: boolean): BatchState;
   forwardDecode(state: BatchState): Tensor;
-  readDecode(state: BatchState): number[];
-  forwardEagerDecode(ws: SamplingWorkspaceBase, tokenIdsList: number[], cache: ChatCache): number[];
+  forwardEagerDecode(ws: ExecutionWorkspace, tokenIdsList: number[], cache: ChatCache): number[];
   free(): void;
 }
 
@@ -50,309 +49,13 @@ export interface CommonModelConfig {
   vocabSize: number;
 }
 
-export interface CommonModelWorkspace {
-  floatWs: Tensor;
-  intWs: Tensor;
-  pinnedIntWs: Tensor;
-  decodePlanInfo: Tensor;
-  prefillPlanInfo: Tensor;
-  argmaxIdx: Tensor;
-  inputIdsBuf: Tensor;
-  positionIds: Tensor;
-  lastIdx: Tensor;
-  qoIndptrD: Tensor;
-  prefillSlotMapping: Tensor;
-  sampleOutToken: Tensor;
-  sampleTopkVals: Tensor;
-  sampleTopkIdxs: Tensor;
-  sampleWorkspace: Tensor;
-  samplePenaltyTokens: Tensor;
-  samplePenaltyOffsets: Tensor;
-  sampleTemperatures: Tensor;
-  sampleRepPenalties: Tensor;
-  samplePresPenalties: Tensor;
-  sampleTopKs: Tensor;
-  sampleTopPs: Tensor;
-  sampleRandomVals: Tensor;
-}
-
-export abstract class WorkspaceBase implements TensorWorkspace {
-  readonly glm: GlmOps;
-  tensors = new Map<string, Tensor>();
-  tracked = new Set<Tensor>();
-  disposed = new Set<Tensor>();
-  exported = new Set<Tensor>();
-  private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
-  frozen = false;
-
-  constructor(glm: GlmOps) {
-    this.glm = glm;
-  }
-
-  freeze() {
-    this.frozen = true;
-  }
-
-  alloc(shape: number[], type: string, name?: string): Tensor {
-    return this._alloc(shape, type, false, name);
-  }
-
-  allocPinned(shape: number[], type: string, name?: string): Tensor {
-    return this._alloc(shape, type, true, name);
-  }
-
-  private _alloc(shape: number[], type: string, pinned: boolean, name?: string): Tensor {
-    if (this.frozen) {
-      throw new Error("Workspace is frozen");
-    }
-
-    const bytes = Tensor.byteCount(shape, type);
-
-    if (name !== undefined) {
-      const data = pinned ? this.glm.allocPinned(bytes) : this.glm.alloc(bytes);
-      const tensor = new Tensor(this, data, bytes, shape, type, name, pinned);
-      this.tensors.set(name, tensor);
-      return tensor;
-    }
-
-    let best: Tensor | undefined;
-    for (const t of this.disposed) {
-      if (t.pinned === pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
-        best = t;
-      }
-    }
-    if (best !== undefined) {
-      this.disposed.delete(best);
-      const data = best.data;
-      (best as { data: number }).data = 0;
-      const tensor = new Tensor(this, data, best.allocSize, shape, type, undefined, pinned);
-      this.tracked.add(tensor);
-      return tensor;
-    }
-
-    const data = pinned ? this.glm.allocPinned(bytes) : this.glm.alloc(bytes);
-    const tensor = new Tensor(this, data, bytes, shape, type, undefined, pinned);
-    this.tracked.add(tensor);
-    return tensor;
-  }
-
-  free(): void {
-    for (const tensor of this.tensors.values()) {
-      tensor.free();
-    }
-    for (const tensor of this.tracked) {
-      tensor.free();
-    }
-    for (const tensor of this.disposed) {
-      tensor.free();
-    }
-    for (const tensor of this.exported) {
-      tensor.free();
-    }
-    this.tensors.clear();
-    this.tracked.clear();
-    this.disposed.clear();
-    this.exported.clear();
-  }
-
-  startTracking(): Disposable & { [Symbol.dispose](): void } {
-    if (this.tracking !== null) throw new Error("startTracking already active");
-    for (const tensor of this.exported) {
-      this.disposed.add(tensor);
-    }
-    this.exported.clear();
-    const ws = this;
-    const tracker: Disposable & { [Symbol.dispose](): void } = {
-      [Symbol.dispose]() {
-        for (const tensor of ws.tracked) {
-          ws.disposed.add(tensor);
-        }
-        ws.tracked.clear();
-        ws.tracking = null;
-      },
-    };
-    this.tracking = tracker;
-    return tracker;
-  }
-}
-
-export class SamplingWorkspaceBase extends WorkspaceBase implements CommonModelWorkspace {
-  readonly vocabSize: number;
-  floatWs: Tensor;
-  intWs: Tensor;
-  pinnedIntWs: Tensor;
-  decodePlanInfo: Tensor;
-  prefillPlanInfo: Tensor;
-  argmaxIdx: Tensor;
-  inputIdsBuf: Tensor;
-  positionIds: Tensor;
-  lastIdx: Tensor;
-  qoIndptrD: Tensor;
-  prefillSlotMapping: Tensor;
-  sampleOutToken: Tensor;
-  sampleTopkVals: Tensor;
-  sampleTopkIdxs: Tensor;
-  sampleWorkspace: Tensor;
-  samplePenaltyTokens: Tensor;
-  samplePenaltyOffsets: Tensor;
-  sampleTemperatures: Tensor;
-  sampleRepPenalties: Tensor;
-  samplePresPenalties: Tensor;
-  sampleTopKs: Tensor;
-  sampleTopPs: Tensor;
-  sampleRandomVals: Tensor;
-
-  constructor(glm: GlmOps, B: number, S: number, vs: number) {
-    super(glm);
-    this.vocabSize = vs;
-
-    this.floatWs = this.alloc([BATCH_FLOAT_WS_SIZE], "U8", "floatWs");
-    this.intWs = this.alloc([BATCH_INT_WS_SIZE], "U8", "intWs");
-    this.pinnedIntWs = this.allocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
-    this.decodePlanInfo = this.allocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", "decodePlanInfo");
-    this.prefillPlanInfo = this.allocPinned([PREFILL_PLAN_INFO_SIZE * 8], "U8", "prefillPlanInfo");
-
-    this.positionIds = this.alloc([B * S], "I32", "positionIds");
-    this.lastIdx = this.alloc([B], "I32", "lastIdx");
-    this.argmaxIdx = this.alloc([B], "I32", "argmaxIdx");
-    this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
-    this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
-    this.prefillSlotMapping = this.alloc([B * S], "I32", "prefillSlotMapping");
-
-    this.sampleOutToken = this.alloc([B], "I32", "sampleOutToken");
-    this.sampleTopkVals = this.alloc([B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32", "sampleTopkVals");
-    this.sampleTopkIdxs = this.alloc([B * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32", "sampleTopkIdxs");
-    this.sampleWorkspace = this.alloc([B * vs], "F32", "sampleWorkspace");
-    this.samplePenaltyTokens = this.alloc([B * 1024], "I32", "samplePenaltyTokens");
-    this.samplePenaltyOffsets = this.alloc([B + 1], "I32", "samplePenaltyOffsets");
-    this.sampleTemperatures = this.alloc([B], "F32", "sampleTemperatures");
-    this.sampleRepPenalties = this.alloc([B], "F32", "sampleRepPenalties");
-    this.samplePresPenalties = this.alloc([B], "F32", "samplePresPenalties");
-    this.sampleTopKs = this.alloc([B], "I32", "sampleTopKs");
-    this.sampleTopPs = this.alloc([B], "F32", "sampleTopPs");
-    this.sampleRandomVals = this.alloc([B], "F32", "sampleRandomVals");
-  }
-
-  sampleBatchGPU(logitsBuf: Tensor, params: SamplingParams[], tokenHistories: number[][]): number[] {
-    const batchSize = params.length;
-    if (batchSize !== tokenHistories.length) {
-      throw new Error(`sampleBatchGPU: params length ${batchSize} != tokenHistories length ${tokenHistories.length}`);
-    }
-    const vs = this.vocabSize;
-
-    const penaltyBufSize = batchSize * 1024 * I32;
-    const penaltyBuf = Buffer.alloc(penaltyBufSize);
-    const offsetsBuf = Buffer.alloc((batchSize + 1) * I32);
-    const tempBuf = Buffer.alloc(batchSize * 4);
-    const repBuf = Buffer.alloc(batchSize * 4);
-    const presBuf = Buffer.alloc(batchSize * 4);
-    const topKBuf = Buffer.alloc(batchSize * I32);
-    const topPBuf = Buffer.alloc(batchSize * 4);
-    const randBuf = Buffer.alloc(batchSize * 4);
-
-    let maxEffectiveK = 0;
-    let penaltyOffset = 0;
-    offsetsBuf.writeInt32LE(0, 0);
-
-    for (let i = 0; i < batchSize; i++) {
-      const p = params[i];
-      const history = tokenHistories[i];
-
-      const hasRepPenalty = p.repetitionPenalty !== 1.0;
-      const hasPresPenalty = p.presencePenalty !== 0;
-
-      let numPenaltyTokens = 0;
-      if (hasRepPenalty || hasPresPenalty) {
-        const seen = new Set<number>();
-        const start = Math.max(0, history.length - p.repetitionPenaltyWindow);
-        for (let j = start; j < history.length; j++) seen.add(history[j]);
-        for (const tid of seen) {
-          if (tid < vs) {
-            penaltyBuf.writeInt32LE(tid, penaltyOffset * I32 + numPenaltyTokens * I32);
-            numPenaltyTokens++;
-          }
-        }
-      }
-      penaltyOffset += numPenaltyTokens;
-      offsetsBuf.writeInt32LE(penaltyOffset, (i + 1) * I32);
-
-      const topK = p.topK > 0 ? p.topK : 0;
-      const temperature = p.temperature > 0 ? p.temperature : 0;
-
-      let effectiveK: number;
-      if (temperature <= 0 && topK <= 0) {
-        effectiveK = 1;
-      } else if (topK > 0) {
-        effectiveK = topK < vs ? topK : vs;
-      } else {
-        effectiveK = 64;
-      }
-      if (effectiveK > maxEffectiveK) maxEffectiveK = effectiveK;
-
-      tempBuf.writeFloatLE(temperature, i * 4);
-      repBuf.writeFloatLE(p.repetitionPenalty, i * 4);
-      presBuf.writeFloatLE(p.presencePenalty, i * 4);
-      topKBuf.writeInt32LE(topK, i * I32);
-      topPBuf.writeFloatLE(p.topP, i * 4);
-      randBuf.writeFloatLE(Math.random(), i * 4);
-    }
-
-    if (penaltyOffset > 0) {
-      this.samplePenaltyTokens.h2d(penaltyBuf, penaltyOffset * I32);
-    }
-    this.samplePenaltyOffsets.h2d(offsetsBuf);
-    this.sampleTemperatures.h2d(tempBuf);
-    this.sampleRepPenalties.h2d(repBuf);
-    this.samplePresPenalties.h2d(presBuf);
-    this.sampleTopKs.h2d(topKBuf);
-    this.sampleTopPs.h2d(topPBuf);
-    this.sampleRandomVals.h2d(randBuf);
-
-    this.glm.sampleBatch(
-      this.sampleOutToken.data,
-      this.sampleTopkVals.data,
-      this.sampleTopkIdxs.data,
-      this.sampleWorkspace.data,
-      logitsBuf.data,
-      this.samplePenaltyTokens.data,
-      this.samplePenaltyOffsets.data,
-      vs,
-      batchSize,
-      this.sampleTemperatures.data,
-      this.sampleRepPenalties.data,
-      this.samplePresPenalties.data,
-      this.sampleTopKs.data,
-      this.sampleTopPs.data,
-      this.sampleRandomVals.data,
-      maxEffectiveK,
-    );
-
-    const outBuf = Buffer.alloc(batchSize * I32);
-    this.sampleOutToken.d2h(outBuf);
-    const result: number[] = [];
-    for (let i = 0; i < batchSize; i++) {
-      result.push(outBuf.readInt32LE(i * I32));
-    }
-    return result;
-  }
-
-  sampleTokenGPU(logitsBuf: Tensor, params: SamplingParams, tokenHistory: number[]): number {
-    return this.sampleBatchGPU(logitsBuf, [params], [tokenHistory])[0];
-  }
-}
-
 export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
   abstract readonly eosIds: Set<number>;
   protected abstract readonly cfg: CommonModelConfig;
-  readonly vocabSize: number;
+  get vocabSize(): number { return this.cfg.vocabSize; }
 
   protected constructor(glm: GlmOps) {
     super(glm);
-    this.vocabSize = 0;
-  }
-
-  protected setVocabSize(vs: number) {
-    (this as { vocabSize: number }).vocabSize = vs;
   }
 
   abstract createChatCache(maxPages?: number): ChatCache;
@@ -364,7 +67,7 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     _startPos: number[], _cache: ChatCache,
   ): void {}
 
-  plan(ws: SamplingWorkspaceBase, inputIdsList: number[][], cache: ChatCache, enableCudaGraph = false): BatchState {
+  plan(ws: ExecutionWorkspace, inputIdsList: number[][], cache: ChatCache, enableCudaGraph = false): BatchState {
     const pagedKV = this.getPagedKV(cache);
     const cfg = this.cfg;
     const glm = this.glm;
@@ -396,8 +99,14 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
         writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
       }
 
-      pagedKV.updateIndptr();
-      pagedKV.updateSlotMapping(writeLocations, pageSize);
+      pagedKV.updateIndptr(ws);
+
+      const slotMappingBuf = new Int32Array(batchSize);
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        const [absPage, slotInPage] = writeLocations[seqIdx];
+        slotMappingBuf[seqIdx] = absPage * pageSize + slotInPage;
+      }
+      ws.slotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
 
       const posIds = new Array(batchSize);
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -410,7 +119,7 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
         ws.floatWs.data, BATCH_FLOAT_WS_SIZE,
         ws.intWs.data, ws.pinnedIntWs.data, BATCH_INT_WS_SIZE,
         ws.decodePlanInfo.data,
-        pagedKV.indptrH.data,
+        ws.indptrH.data,
         batchSize,
         nHeads, nKv, hd, pageSize,
         enableCudaGraph
@@ -434,7 +143,7 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     }
     const qoIndptrBuf = Int32Array.from(qoIndptr);
 
-    pagedKV.updateIndptr();
+    pagedKV.updateIndptr(ws);
 
     const posIds: number[] = [];
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -461,7 +170,7 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
       ws.floatWs.data, BATCH_FLOAT_WS_SIZE,
       ws.intWs.data, ws.pinnedIntWs.data, BATCH_INT_WS_SIZE,
       ws.prefillPlanInfo.data,
-      qoIndptrHostPtr, pagedKV.indptrH.data,
+      qoIndptrHostPtr, ws.indptrH.data,
       totalTokens, batchSize,
       nHeads, nKv, hd,
       pageSize,
@@ -484,31 +193,21 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
       }
     }
     const slotMappingBuf = Int32Array.from(slotMapping);
-    ws.prefillSlotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+    ws.slotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
 
     return { batchSize, totalTokens, seqLens, pageAllocs, isDecode: false, ws, cache };
   }
 
   abstract forward(state: BatchState): Tensor;
 
-  read(state: BatchState): number[] {
-    const batchSize = state.batchSize;
-    const buf = Buffer.alloc(batchSize * I32);
-    state.ws.argmaxIdx.d2h(buf);
-    const result: number[] = [];
-    for (let i = 0; i < batchSize; i++) {
-      result.push(buf.readInt32LE(i * I32));
-    }
-    return result;
-  }
-
-  forwardEager(ws: SamplingWorkspaceBase, inputIdsList: number[][], cache: ChatCache): number[] {
+  forwardEager(ws: ExecutionWorkspace, inputIdsList: number[][], cache: ChatCache): number[] {
     const state = this.plan(ws, inputIdsList, cache);
-    this.forward(state);
-    return this.read(state);
+    const logits = this.forward(state);
+    using argmaxResult = logits.argmax();
+    return argmaxResult.readInt32LE();
   }
 
-  planDecode(ws: SamplingWorkspaceBase, tokenIdsList: number[], cache: ChatCache, enableCudaGraph = false): BatchState {
+  planDecode(ws: ExecutionWorkspace, tokenIdsList: number[], cache: ChatCache, enableCudaGraph = false): BatchState {
     return this.plan(ws, tokenIdsList.map(t => [t]), cache, enableCudaGraph);
   }
 
@@ -516,31 +215,8 @@ export abstract class ChatModelBase extends WorkspaceBase implements ChatModel {
     return this.forward(state);
   }
 
-  readDecode(state: BatchState): number[] {
-    return this.read(state);
-  }
-
-  forwardEagerDecode(ws: SamplingWorkspaceBase, tokenIdsList: number[], cache: ChatCache): number[] {
+  forwardEagerDecode(ws: ExecutionWorkspace, tokenIdsList: number[], cache: ChatCache): number[] {
     return this.forwardEager(ws, tokenIdsList.map(t => [t]), cache);
-  }
-
-  protected readArgmax(ws: SamplingWorkspaceBase, ptr: Tensor | number, count: number): number {
-    ws.argmaxIdx.argmax(ptr, count);
-    const buf = Buffer.alloc(I32);
-    ws.argmaxIdx.d2h(buf);
-    return buf.readInt32LE(0);
-  }
-
-  protected readArgmaxBatch(ws: SamplingWorkspaceBase, logitsBuf: Tensor, batchSize: number): number[] {
-    const vs = this.cfg.vocabSize;
-    ws.argmaxIdx.argmax(logitsBuf, vs, batchSize);
-    const buf = Buffer.alloc(batchSize * I32);
-    ws.argmaxIdx.d2h(buf);
-    const result: number[] = [];
-    for (let i = 0; i < batchSize; i++) {
-      result.push(buf.readInt32LE(i * I32));
-    }
-    return result;
   }
 
 }
@@ -561,10 +237,6 @@ export function makeSamplingParams(args: {
     presencePenalty: args.presencePenalty,
     repetitionPenaltyWindow: args.repetitionPenaltyWindow,
   };
-}
-
-export function needsSampling(sp: SamplingParams): boolean {
-  return sp.temperature > 0 || sp.repetitionPenalty !== 1.0 || sp.presencePenalty !== 0 || sp.topK > 0 || sp.topP < 1.0;
 }
 
 export function samplingLabel(sp: SamplingParams): string {

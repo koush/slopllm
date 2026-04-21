@@ -59,7 +59,6 @@ export class Qwen3Model extends ChatModelBase {
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
-    this.setVocabSize(config.vocabSize);
 
     const halfDim = config.headDim / 2;
     const invFreqF32 = new Float32Array(halfDim);
@@ -178,7 +177,7 @@ export class Qwen3Model extends ChatModelBase {
       using kRope = _qkv.kRope;
       using vBuf = _qkv.vBuf;
 
-      const slotMapping = state.isDecode ? pagedKV.slotMapping.data : ws.prefillSlotMapping.data;
+      const slotMapping = ws.slotMapping.data;
       const kTokenStride = state.isDecode ? nKv * hd : hd;
       const kHeadStride = state.isDecode ? hd : BS * hd;
       const vTokenStride = nKv * hd;
@@ -193,11 +192,11 @@ export class Qwen3Model extends ChatModelBase {
 
       using flashOut = new UsingHolder<Tensor>(undefined!);
       if (state.isDecode) {
-        flashOut.replace(qRope.flashDecode(pagedKV, i, batchSize, nHeads, nKv, hd, cfg.scaling));
+        flashOut.replace(ws.flashDecode(qRope, pagedKV, i, batchSize, nHeads, nKv, hd, cfg.scaling));
       } else {
         const qStrideN = hd;
         const qStrideH = totalTokens * hd;
-        flashOut.replace(qRope.flashPrefillPaged(pagedKV, i, totalTokens, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
+        flashOut.replace(ws.flashPrefillPaged(qRope, pagedKV, i, totalTokens, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
       }
 
       using oProjBuf = flashOut.value.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
@@ -221,7 +220,7 @@ export class Qwen3Model extends ChatModelBase {
       using hiddenLast = normed.value.indexSelect(ws.lastIdx, hs, batchSize);
       logitsBuf = hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
     }
-    ws.argmaxIdx.argmax(logitsBuf, cfg.vocabSize, batchSize);
+
     return logitsBuf.removeTracking();
   }
 }

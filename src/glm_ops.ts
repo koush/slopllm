@@ -1,5 +1,8 @@
 import path from "node:path";
 import fs from "node:fs";
+import { WorkspaceBase } from "./workspace";
+import { Tensor } from "./tensor";
+import { DECODE_PLAN_INFO_SIZE, PREFILL_PLAN_INFO_SIZE } from "./paged_kv";
 
 function findProjectRoot(dir: string): string {
   let d = dir;

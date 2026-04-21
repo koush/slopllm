@@ -1,7 +1,7 @@
-import { GlmOps } from "./glm_ops";
+import { type SamplingParams } from "./chat_model";
+import { I32, SAMPLING_BLOCK_SIZE, SAMPLING_MAX_TOPK } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
-import type { PagedKVCache } from "./paged_kv";
-import type { CommonModelWorkspace } from "./chat_model";
+import { WorkspaceBase } from "./workspace";
 
 function ptr(t: Tensor | number): number {
   return typeof t === "number" ? t : t.data;
@@ -11,25 +11,16 @@ function numElements(shape: number[]): number {
   return shape.reduce((a, b) => a * b, 1);
 }
 
-export interface TensorWorkspace {
-  readonly glm: GlmOps;
-  readonly tensors: Map<string, Tensor>;
-  readonly tracked: Set<Tensor>;
-  readonly disposed: Set<Tensor>;
-  readonly exported: Set<Tensor>;
-  alloc(shape: number[], type: string, name?: string): Tensor;
-}
-
 export class Tensor implements Disposable {
   data: number;
   readonly allocSize: number;
   readonly shape: number[];
   readonly type: string;
   readonly name?: string;
-  private readonly workspace: TensorWorkspace;
+  private readonly workspace: WorkspaceBase;
   readonly pinned: boolean;
 
-  constructor(workspace: TensorWorkspace, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean) {
+  constructor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean) {
     this.workspace = workspace;
     this.data = data;
     this.allocSize = allocSize;
@@ -133,8 +124,23 @@ export class Tensor implements Disposable {
     this.workspace.glm.arange(this.data, start, step, count);
   }
 
-  argmax(input: Tensor | number, dim: number, batch: number = 1): void {
-    this.workspace.glm.argmax(this.data, ptr(input), dim, batch);
+  argmax(): Tensor {
+    const batch = this.shape[0];
+    const dim = this.shape[1];
+    const out = this.workspace.alloc([batch], "I32");
+    this.workspace.glm.argmax(out.data, this.data, dim, batch);
+    return out;
+  }
+
+  readInt32LE(): number[] {
+    const count = numElements(this.shape);
+    const buf = Buffer.alloc(count * I32);
+    this.d2h(buf);
+    const result: number[] = [];
+    for (let i = 0; i < count; i++) {
+      result.push(buf.readInt32LE(i * I32));
+    }
+    return result;
   }
 
   indexSelect(indices: Tensor | number, dim: number, batch: number): Tensor {
@@ -160,36 +166,6 @@ export class Tensor implements Disposable {
     this.workspace.glm.rmsnormGated(this.data, ptr(input), ptr(gate), ptr(weight), eps, dim, batch);
   }
 
-  flashDecode(pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
-    const ws = this.workspace as unknown as CommonModelWorkspace;
-    const out = this.workspace.alloc([batchSize, nHeads, 1, hd], this.type);
-    this.workspace.glm.batchDecodeRun(
-      this.data, out.data,
-      pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
-      pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
-      ws.floatWs.data, ws.intWs.data,
-      ws.decodePlanInfo.data,
-      batchSize, nHeads, nKv, hd, pagedKV.pageSize, smScale
-    );
-    return out;
-  }
-
-  flashPrefillPaged(pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): Tensor {
-    const ws = this.workspace as unknown as CommonModelWorkspace;
-    const out = this.workspace.alloc([1, nHeads, totalTokens, hd], this.type);
-    this.workspace.glm.batchPrefillPagedRun(
-      this.data, out.data,
-      pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
-      pagedKV.indices.data, pagedKV.indptrD.data, pagedKV.lastPageLen.data,
-      ws.floatWs.data, ws.intWs.data,
-      ws.qoIndptrD.data,
-      ws.prefillPlanInfo.data,
-      totalTokens, batchSize, nHeads, nKv, hd, pagedKV.pageSize,
-      qStrideN, qStrideH, maskMode, smScale
-    );
-    return out;
-  }
-
   gateSigmoidMul(gate: Tensor | number, batchSeq: number, numHeads: number, headDim: number): void {
     this.workspace.glm.gateSigmoidMul(this.data, ptr(gate), batchSeq, numHeads, headDim);
   }
@@ -200,5 +176,119 @@ export class Tensor implements Disposable {
     const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
     this.workspace.glm.rotaryEmbedding(cos.data, sin.data, this.data, positionIds.data, dimHalf, batch, seqLen);
     return { cos, sin };
+  }
+
+  sampleBatchGPU(params: SamplingParams[], tokenHistories: number[][]): Tensor {
+    const batchSize = params.length;
+    if (batchSize !== tokenHistories.length) {
+      throw new Error(`sampleBatchGPU: params length ${batchSize} != tokenHistories length ${tokenHistories.length}`);
+    }
+    const vs = this.shape[this.shape.length - 1];
+
+    const penaltyBufSize = batchSize * 1024 * I32;
+    const penaltyBuf = Buffer.alloc(penaltyBufSize);
+    const offsetsBuf = Buffer.alloc((batchSize + 1) * I32);
+    const tempBuf = Buffer.alloc(batchSize * 4);
+    const repBuf = Buffer.alloc(batchSize * 4);
+    const presBuf = Buffer.alloc(batchSize * 4);
+    const topKBuf = Buffer.alloc(batchSize * I32);
+    const topPBuf = Buffer.alloc(batchSize * 4);
+    const randBuf = Buffer.alloc(batchSize * 4);
+
+    let maxEffectiveK = 0;
+    let penaltyOffset = 0;
+    offsetsBuf.writeInt32LE(0, 0);
+
+    for (let i = 0; i < batchSize; i++) {
+      const p = params[i];
+      const history = tokenHistories[i];
+
+      const hasRepPenalty = p.repetitionPenalty !== 1.0;
+      const hasPresPenalty = p.presencePenalty !== 0;
+
+      let numPenaltyTokens = 0;
+      if (hasRepPenalty || hasPresPenalty) {
+        const seen = new Set<number>();
+        const start = Math.max(0, history.length - p.repetitionPenaltyWindow);
+        for (let j = start; j < history.length; j++) seen.add(history[j]);
+        for (const tid of seen) {
+          if (tid < vs) {
+            penaltyBuf.writeInt32LE(tid, penaltyOffset * I32 + numPenaltyTokens * I32);
+            numPenaltyTokens++;
+          }
+        }
+      }
+      penaltyOffset += numPenaltyTokens;
+      offsetsBuf.writeInt32LE(penaltyOffset, (i + 1) * I32);
+
+      const topK = p.topK > 0 ? p.topK : 0;
+      const temperature = p.temperature > 0 ? p.temperature : 0;
+
+      let effectiveK: number;
+      if (temperature <= 0 && topK <= 0) {
+        effectiveK = 1;
+      } else if (topK > 0) {
+        effectiveK = topK < vs ? topK : vs;
+      } else {
+        effectiveK = 64;
+      }
+      if (effectiveK > maxEffectiveK) maxEffectiveK = effectiveK;
+
+      tempBuf.writeFloatLE(temperature, i * 4);
+      repBuf.writeFloatLE(p.repetitionPenalty, i * 4);
+      presBuf.writeFloatLE(p.presencePenalty, i * 4);
+      topKBuf.writeInt32LE(topK, i * I32);
+      topPBuf.writeFloatLE(p.topP, i * 4);
+      randBuf.writeFloatLE(Math.random(), i * 4);
+    }
+
+    using topkVals = this.workspace.alloc([batchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
+    using topkIdxs = this.workspace.alloc([batchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
+    using sampleWorkspace = this.workspace.alloc([batchSize * vs], "F32");
+    using penaltyTokens = this.workspace.alloc([batchSize * 1024], "I32");
+    using penaltyOffsets = this.workspace.alloc([batchSize + 1], "I32");
+    using temperatures = this.workspace.alloc([batchSize], "F32");
+    using repPenalties = this.workspace.alloc([batchSize], "F32");
+    using presPenalties = this.workspace.alloc([batchSize], "F32");
+    using topKs = this.workspace.alloc([batchSize], "I32");
+    using topPs = this.workspace.alloc([batchSize], "F32");
+    using randomVals = this.workspace.alloc([batchSize], "F32");
+    const outToken = this.workspace.alloc([batchSize], "I32");
+
+    if (penaltyOffset > 0) {
+      penaltyTokens.h2d(penaltyBuf, penaltyOffset * I32);
+    }
+    penaltyOffsets.h2d(offsetsBuf);
+    temperatures.h2d(tempBuf);
+    repPenalties.h2d(repBuf);
+    presPenalties.h2d(presBuf);
+    topKs.h2d(topKBuf);
+    topPs.h2d(topPBuf);
+    randomVals.h2d(randBuf);
+
+    this.workspace.glm.sampleBatch(
+      outToken.data,
+      topkVals.data,
+      topkIdxs.data,
+      sampleWorkspace.data,
+      this.data,
+      penaltyTokens.data,
+      penaltyOffsets.data,
+      vs,
+      batchSize,
+      temperatures.data,
+      repPenalties.data,
+      presPenalties.data,
+      topKs.data,
+      topPs.data,
+      randomVals.data,
+      maxEffectiveK,
+    );
+
+    return outToken;
+  }
+
+  sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): Tensor {
+    return this.sampleBatchGPU([params], [tokenHistory]);
   }
 }

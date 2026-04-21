@@ -2,8 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { GlmOps } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
-import { PagedKVCache } from "../src/paged_kv";
-import { SamplingWorkspaceBase } from "../src/chat_model";
+import { ExecutionWorkspace, PagedKVCache } from "../src/paged_kv";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "../src/model_path";
 import { generateBatchTokens } from "./test_helper";
@@ -26,7 +25,7 @@ function tokenizePrompt(tokenizer: any, prompt: string): number[] {
 describe("Qwen3-0.6B batch smoke test", () => {
   let glm: GlmOps;
   let model: Qwen3Model;
-  let ws: SamplingWorkspaceBase;
+  let ws: ExecutionWorkspace;
   let tokenizer: any;
   let cache: PagedKVCache;
 
@@ -34,7 +33,7 @@ describe("Qwen3-0.6B batch smoke test", () => {
     process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
     glm = new GlmOps(0);
     model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 4, 2048);
-    ws = new SamplingWorkspaceBase(glm, 4, 2048, model.vocabSize);
+    ws = new ExecutionWorkspace(glm, 4, 2048);
     const cfg = model.cfg;
     cache = new PagedKVCache(glm, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, 128, 4);
     const modelDir = resolveModelPath(QWEN3_REPO);

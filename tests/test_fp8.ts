@@ -3,8 +3,7 @@ import assert from "node:assert/strict";
 import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
 import { Tensor } from "../src/tensor";
-import { PagedKVCache } from "../src/paged_kv";
-import { SamplingWorkspaceBase } from "../src/chat_model";
+import { ExecutionWorkspace, PagedKVCache } from "../src/paged_kv";
 import { generateTokens } from "./test_helper";
 
 const FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -36,13 +35,13 @@ function readLogits(logitsBuf: Tensor): Float32Array {
 describe("Qwen3-0.6B-FP8 model", () => {
   let glm: GlmOps;
   let model: Qwen3Model;
-  let ws: SamplingWorkspaceBase;
+  let ws: ExecutionWorkspace;
 
   before(() => {
     process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
     glm = new GlmOps(0);
     model = Qwen3Model.fromPretrained(glm, FP8_REPO, 1, 64);
-    ws = new SamplingWorkspaceBase(glm, 1, 64, model.vocabSize);
+    ws = new ExecutionWorkspace(glm, 1, 64);
   });
 
   after(() => {
@@ -102,7 +101,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
   it("FP8 logits correlate with BF16 logits (cosine sim >= 0.99)", () => {
     const fp8KV = makeKV(model);
     const bf16Model = Qwen3Model.fromPretrained(glm, BF16_REPO, 1, 64);
-    const bf16Ws = new SamplingWorkspaceBase(glm, 1, 64, bf16Model.vocabSize);
+    const bf16Ws = new ExecutionWorkspace(glm, 1, 64);
     const bf16KV = makeKV(bf16Model);
     try {
       fp8KV.reset(1);

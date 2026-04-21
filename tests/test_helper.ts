@@ -1,7 +1,8 @@
-import { ChatModel, ChatCache, SamplingParams, SamplingWorkspaceBase, needsSampling } from "../src/chat_model";
+import { ChatModel, ChatCache, SamplingParams } from "../src/chat_model";
+import { ExecutionWorkspace } from "../src/paged_kv";
 
 export function generateBatchTokens(
-  model: ChatModel, ws: SamplingWorkspaceBase, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache,
   inputIdsList: number[][], maxNewTokens: number, eosIds: Set<number>,
 ): number[][] {
   const batchSize = inputIdsList.length;
@@ -33,7 +34,7 @@ export function generateBatchTokens(
 }
 
 export function* generateTokens(
-  model: ChatModel, ws: SamplingWorkspaceBase, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling?: SamplingParams,
 ): Generator<number> {
@@ -47,10 +48,10 @@ export function* generateTokens(
   for (let i = 0; i < maxNewTokens - 1; i++) {
     if (eosIds.has(nextToken)) break;
 
-    if (sampling && needsSampling(sampling)) {
+    if (sampling) {
       const state = model.planDecode(ws, [nextToken], cache);
       const logits = model.forwardDecode(state);
-      nextToken = state.ws.sampleTokenGPU(logits, sampling, tokenHistory);
+      nextToken = logits.sampleTokenGPU(sampling, tokenHistory).readInt32LE()[0];
     } else {
       const decodeTokens = model.forwardEagerDecode(ws, [nextToken], cache);
       nextToken = decodeTokens[0];

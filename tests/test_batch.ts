@@ -2,9 +2,9 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { GlmOps } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
-import { PagedKVCache } from "../src/paged_kv";
+import { ExecutionWorkspace, PagedKVCache } from "../src/paged_kv";
 import { generateBatchTokens, generateTokens } from "./test_helper";
-import { SamplingParams, SamplingWorkspaceBase, makeSamplingParams } from "../src/chat_model";
+import { SamplingParams, makeSamplingParams } from "../src/chat_model";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const PROMPT1 = [151643, 151644, 151645, 1, 2, 3];
@@ -17,13 +17,13 @@ const EOS_TOKEN_IDS = new Set([151645, 151643]);
 describe("Qwen3-0.6B batch tests", () => {
   let glm: GlmOps;
   let model: Qwen3Model;
-  let ws: SamplingWorkspaceBase;
+  let ws: ExecutionWorkspace;
 
   before(() => {
     process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
     glm = new GlmOps(0);
     model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 4, 4096);
-    ws = new SamplingWorkspaceBase(glm, 4, 4096, model.vocabSize);
+    ws = new ExecutionWorkspace(glm, 4, 4096);
   });
 
   after(() => {
@@ -64,7 +64,7 @@ describe("Qwen3-0.6B batch tests", () => {
     try {
       pagedKV.reset(2);
       const batchTokens = model.forwardEager(ws, [PROMPT1, PROMPT2], pagedKV);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
 
       const decodeTokens = model.forwardEagerDecode(ws, batchTokens, pagedKV);
 
@@ -87,7 +87,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
       pagedKV.reset(1);
       model.forwardEager(ws, [PROMPT1], pagedKV);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
       const tokensAppend = model.forwardEager(ws, [suffix], pagedKV);
 
       singleKV.reset(1);
@@ -112,12 +112,12 @@ describe("Qwen3-0.6B batch tests", () => {
 
       pagedKV.reset(1);
       model.forwardEager(ws, [PROMPT1], pagedKV);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
       model.forwardEager(ws, [suffix], pagedKV);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
 
       pagedKV.truncate(0, PROMPT1.length);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
       const tokensTruncAppend = model.forwardEager(ws, [suffix], pagedKV);
 
       const pagedKV2 = makePagedKV(1, 256);
@@ -175,7 +175,7 @@ describe("Qwen3-0.6B batch tests", () => {
     try {
       pagedKV.reset(2);
       const batchTokens = model.forwardEager(ws, [PROMPT1, PROMPT2], pagedKV);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
 
       let current = [batchTokens[0], batchTokens[1]];
       const numSteps = 5;
@@ -228,19 +228,21 @@ describe("Qwen3-0.6B batch tests", () => {
 
       pagedKV.reset(1);
       const tokens = model.forwardEager(ws, [prompt], pagedKV);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
 
       const stateRef = model.planDecode(ws, [tokens[0]], pagedKV, true);
-      model.forwardDecode(stateRef);
-      const tokensRef = model.readDecode(stateRef);
+      const logitsRef = model.forwardDecode(stateRef);
+      using argmaxRef = logitsRef.argmax();
+      const tokensRef = argmaxRef.readInt32LE();
 
       pagedKV.reset(1);
       const tokens2 = model.forwardEager(ws, [prompt], pagedKV);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
       const state = model.planDecode(ws, [tokens2[0]], pagedKV, true);
 
       glm.graphBeginCapture();
-      model.forwardDecode(state);
+      const captureLogits = model.forwardDecode(state);
+      const captureArgmax = captureLogits.argmax();
       const graph = glm.graphEndCapture();
       assert.ok(graph, "graph_end_capture returned null");
       const graphExec = glm.graphInstantiate(graph);
@@ -248,13 +250,13 @@ describe("Qwen3-0.6B batch tests", () => {
 
       pagedKV.reset(1);
       const tokens3 = model.forwardEager(ws, [prompt], pagedKV);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
       const state2 = model.planDecode(ws, [tokens3[0]], pagedKV, true);
 
       glm.graphLaunch(graphExec);
       glm.synchronize();
 
-      const tokensReplay = model.readDecode(state2);
+      const tokensReplay = captureArgmax.readInt32LE();
       assert.deepEqual(tokensReplay, tokensRef,
         `Graph replay mismatch: replay=${tokensReplay}, ref=${tokensRef}`);
 
@@ -273,30 +275,33 @@ describe("Qwen3-0.6B batch tests", () => {
 
       pagedKV.reset(1);
       let tokens = model.forwardEager(ws, [prompt], pagedKV);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
 
       const refTokens: number[] = [];
       let current = tokens[0];
       for (let step = 0; step < numSteps; step++) {
         const state = model.planDecode(ws, [current], pagedKV, true);
-        model.forwardDecode(state);
-        current = model.readDecode(state)[0];
+        const logits = model.forwardDecode(state);
+        using argmaxResult = logits.argmax();
+        current = argmaxResult.readInt32LE()[0];
         refTokens.push(current);
       }
 
       pagedKV.reset(1);
       tokens = model.forwardEager(ws, [prompt], pagedKV);
-      pagedKV.updateIndptr();
+      pagedKV.updateIndptr(ws);
 
       current = tokens[0];
       const warmupState = model.planDecode(ws, [current], pagedKV, true);
-      model.forwardDecode(warmupState);
-      current = model.readDecode(warmupState)[0];
+      const warmupLogits = model.forwardDecode(warmupState);
+      using warmupArgmax = warmupLogits.argmax();
+      current = warmupArgmax.readInt32LE()[0];
       assert.equal(current, refTokens[0], `Warmup mismatch: ${current} != ${refTokens[0]}`);
 
       const state = model.planDecode(ws, [current], pagedKV, true);
       glm.graphBeginCapture();
-      model.forwardDecode(state);
+      const captureLogits = model.forwardDecode(state);
+      const captureArgmax = captureLogits.argmax();
       const graph = glm.graphEndCapture();
       assert.ok(graph, "graph_end_capture returned null");
       const graphExec = glm.graphInstantiate(graph);
@@ -305,7 +310,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
       glm.graphLaunch(graphExec);
       glm.synchronize();
-      current = model.readDecode(state)[0];
+      current = captureArgmax.readInt32LE()[0];
       const graphTokens: number[] = [refTokens[0], current];
       assert.equal(current, refTokens[1], `Replay step 1 mismatch: ${current} != ${refTokens[1]}`);
 
@@ -313,7 +318,7 @@ describe("Qwen3-0.6B batch tests", () => {
         const s = model.planDecode(ws, [current], pagedKV, true);
         glm.graphLaunch(graphExec);
         glm.synchronize();
-        current = model.readDecode(s)[0];
+        current = captureArgmax.readInt32LE()[0];
         graphTokens.push(current);
         assert.equal(current, refTokens[step],
           `Replay step ${step} mismatch: ${current} != ${refTokens[step]}`);
@@ -343,15 +348,16 @@ describe("Qwen3-0.6B batch tests", () => {
       pagedKV.reset(1);
       const state = model.plan(ws, [PROMPT_GRAPH], pagedKV);
       const logits = model.forward(state);
-      const tokens = model.read(state);
-      pagedKV.updateIndptr();
+      using argmaxOut = logits.argmax();
+      const tokens = argmaxOut.readInt32LE();
+      pagedKV.updateIndptr(ws);
 
       const firstToken = tokens[0];
       const history = [...PROMPT_GRAPH, firstToken];
 
-      const greedySingle = state.ws.sampleTokenGPU(logits, greedy, history);
+      const greedySingle = logits.sampleTokenGPU(greedy, history).readInt32LE()[0];
 
-      const batchResults = state.ws.sampleBatchGPU(logits, [greedy, sampling], [history, history]);
+      const batchResults = logits.sampleBatchGPU([greedy, sampling], [history, history]).readInt32LE();
 
       assert.equal(batchResults[0], greedySingle,
         `Batch greedy[0] != sequential greedy: ${batchResults[0]} != ${greedySingle}`);
@@ -375,12 +381,13 @@ describe("Qwen3-0.6B batch tests", () => {
       pagedKV.reset(2);
       const state = model.plan(ws, [PROMPT1, PROMPT2], pagedKV);
       const logits = model.forward(state);
-      const tokens = model.read(state);
+      using argmaxOut2 = logits.argmax();
+      const tokens = argmaxOut2.readInt32LE();
 
       const history1 = [...PROMPT1, tokens[0]];
       const history2 = [...PROMPT2, tokens[1]];
 
-      const batchResults = state.ws.sampleBatchGPU(logits, [greedy, greedy], [history1, history2]);
+      const batchResults = logits.sampleBatchGPU([greedy, greedy], [history1, history2]).readInt32LE();
 
       assert.equal(batchResults[0], tokens[0],
         `Batch greedy[0] != argmax: ${batchResults[0]} != ${tokens[0]}`);

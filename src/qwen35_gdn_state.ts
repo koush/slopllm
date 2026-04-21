@@ -1,5 +1,5 @@
 import { GlmOps } from "./glm_ops";
-import { WorkspaceBase } from "./chat_model";
+import { WorkspaceBase } from "./workspace";
 import { Tensor } from "./tensor";
 import { Qwen35Config } from "./qwen35_model";
 

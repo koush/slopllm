@@ -1,11 +1,12 @@
 import { GlmOps } from "./glm_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model } from "./qwen35_model";
-import { ChatModel, ChatCache, SamplingParams, SamplingWorkspaceBase, makeSamplingParams, needsSampling, samplingLabel } from "./chat_model";
+import { ChatModel, ChatCache, SamplingParams, makeSamplingParams } from "./chat_model";
 import { Tensor } from "./tensor";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
+import { ExecutionWorkspace } from "./paged_kv";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -35,6 +36,7 @@ interface CliArgs {
   repetitionPenalty: number;
   presencePenalty: number;
   repetitionPenaltyWindow: number;
+  greedy: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -57,6 +59,7 @@ function parseArgs(argv: string[]): CliArgs {
     repetitionPenalty: 1.0,
     presencePenalty: 0,
     repetitionPenaltyWindow: 64,
+    greedy: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -80,11 +83,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--repetition-penalty" && i + 1 < argv.length) args.repetitionPenalty = parseFloat(argv[++i]);
     else if (a === "--repetition-penalty-window" && i + 1 < argv.length) args.repetitionPenaltyWindow = parseInt(argv[++i], 10);
     else if (a === "--greedy") {
-      args.temperature = 0;
-      args.topK = 0;
-      args.topP = 1.0;
-      args.repetitionPenalty = 1.0;
-      args.presencePenalty = 0;
+      args.greedy = true;
     }
   }
 
@@ -134,7 +133,7 @@ function tokenizeMessages(
 // --- Generation primitives ---
 
 export function* generateStream(
-  model: ChatModel, ws: SamplingWorkspaceBase, glm: GlmOps, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, glm: GlmOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
 ): Generator<number> {
@@ -150,6 +149,7 @@ export function* generateStream(
   const useGraph = graphState !== undefined;
   let capturing = false;
   let logits: Tensor | null = null;
+  let argmaxResult: Tensor | null = null;
 
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
     const state = model.planDecode(ws, [currentToken], cache, useGraph);
@@ -157,7 +157,6 @@ export function* generateStream(
     if (useGraph && graphState!.graphExec !== null) {
       glm.graphLaunch(graphState!.graphExec);
       glm.synchronize();
-      logits = null;
     } else {
       if (useGraph && graphState!.warmupRemaining === 0 && !capturing) {
         capturing = true;
@@ -165,6 +164,10 @@ export function* generateStream(
       }
 
       logits = model.forwardDecode(state);
+      if (!sampling  ) {
+        argmaxResult = logits.argmax();
+      }
+
 
       if (capturing) {
         const graph = glm.graphEndCapture();
@@ -177,10 +180,10 @@ export function* generateStream(
       if (useGraph) graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
     }
 
-    currentToken = model.readDecode(state)[0];
-
-    if (sampling && needsSampling(sampling) && logits) {
-      currentToken = state.ws.sampleTokenGPU(logits, sampling, tokenHistory);
+    if (sampling  ) {
+      currentToken = logits!.sampleTokenGPU(sampling, tokenHistory).readInt32LE()[0];
+    } else {
+      currentToken = argmaxResult!.readInt32LE()[0];
     }
 
     cache.appendTokens(0, [currentToken]);
@@ -190,7 +193,7 @@ export function* generateStream(
 }
 
 export function generateBatchTokens(
-  model: ChatModel, ws: SamplingWorkspaceBase, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache,
   inputIdsList: number[][], maxNewTokens: number, eosIds: Set<number>,
 ): number[][] {
   const batchSize = inputIdsList.length;
@@ -224,10 +227,10 @@ export function generateBatchTokens(
 // --- Interactive / single-prompt modes ---
 
 async function interactiveChat(
-  model: ChatModel, ws: SamplingWorkspaceBase, glm: GlmOps, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, glm: GlmOps, cache: ChatCache,
   tokenizer: any, args: CliArgs, graphState?: GraphState,
 ): Promise<void> {
-  const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
+  const sp = makeSamplingParams(args);
   const eosIds = model.eosIds;
   const messages: Array<{ role: string; content: string }> = [];
 
@@ -296,10 +299,10 @@ async function interactiveChat(
 }
 
 async function singlePrompt(
-  model: ChatModel, ws: SamplingWorkspaceBase, glm: GlmOps, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, glm: GlmOps, cache: ChatCache,
   tokenizer: any, args: CliArgs, graphState?: GraphState,
 ): Promise<void> {
-  const sp = needsSampling(makeSamplingParams(args)) ? makeSamplingParams(args) : undefined;
+  const sp = !args.greedy ? makeSamplingParams(args) : undefined;
   const eosIds = model.eosIds;
   const messages = [{ role: "user", content: args.prompt! }];
   const inputIds = tokenizeMessages(tokenizer, messages, true);
@@ -332,7 +335,7 @@ async function singlePrompt(
 // --- Batch mode ---
 
 async function interactiveBatch(
-  model: ChatModel, ws: SamplingWorkspaceBase, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache,
   tokenizer: any, args: CliArgs,
 ): Promise<void> {
   console.log("Enter prompts one per line. Empty line to submit batch. /clear to reset, /q to quit.");
@@ -416,7 +419,7 @@ async function main(): Promise<void> {
     ? Qwen35Model.fromPretrained(glm, QWEN35_REPO, maxBatch, args.maxSeqLen)
     : Qwen3Model.fromPretrained(glm, repoId, maxBatch, args.maxSeqLen);
   const cache = model.createChatCache(args.maxPages);
-  const ws = new SamplingWorkspaceBase(glm, maxBatch, args.maxSeqLen, model.vocabSize);
+  const ws = new ExecutionWorkspace(glm, maxBatch, args.maxSeqLen);
 
   const modelDir = resolveModelPath(repoId);
   const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
@@ -428,7 +431,7 @@ async function main(): Promise<void> {
   if (sp.topK > 0) samplingParts.push(`top_k=${sp.topK}`);
   if (sp.repetitionPenalty !== 1.0) samplingParts.push(`rep_pen=${sp.repetitionPenalty}`);
   if (sp.presencePenalty !== 0) samplingParts.push(`pres_pen=${sp.presencePenalty}`);
-  const samplingStr = samplingParts.length > 0 ? samplingParts.join(" ") : "greedy";
+  const samplingStr = !args.greedy ? samplingParts.join(" ") : "greedy";
 
   console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}`);
 
