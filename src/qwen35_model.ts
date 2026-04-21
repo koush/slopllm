@@ -234,10 +234,6 @@ export class Qwen35Model extends ChatModel {
     return model;
   }
 
-  free(): void {
-    super.free();
-  }
-
   createGdnState(batchSize = 1): Qwen35GdnState {
     return new Qwen35GdnState(this.glm, this.cfg, batchSize);
   }
@@ -333,12 +329,12 @@ export class Qwen35Model extends ChatModel {
     const recurrentState = gdnState.recurrentState[layerIdx];
     const kernelSize = cfg.linearConvKernelDim;
 
-    glm.causalConv1dUpdate(qkvBuf.data, convState.data, qkvBuf.data, this.tensors.get(`${pfx}.conv1d.weight`)!.data, convDim, kernelSize, BS, gdnState.convStateStride);
+    using convOut = qkvBuf.causalConv1dUpdate(convState, qkvBuf, this.tensors.get(`${pfx}.conv1d.weight`)!, convDim, kernelSize, BS, gdnState.convStateStride);
 
     using gdnOut = ws.alloc([BS * linHeads * linVDim], "BF16");
 
     gdnOut.gdnRecurrentStep(
-      recurrentState, qkvBuf,
+      recurrentState, convOut,
       aBuf, bBuf,
       this.tensors.get(`${pfx}.A_log`)!, this.tensors.get(`${pfx}.dt_bias`)!,
       linHeads, linKDim, linVDim,

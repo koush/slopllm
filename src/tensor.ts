@@ -161,6 +161,11 @@ export class Tensor implements Disposable {
     this.workspace.glm.causalConv1d(this.data, ptr(convState), ptr(input), ptr(weight), ptr(cuSeqlens), convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
   }
 
+  causalConv1dUpdate(convState: Tensor | number, input: Tensor | number, weight: Tensor | number, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor {
+    const out = this.workspace.alloc([batchSize * convDim], this.type);
+    this.workspace.glm.causalConv1dUpdate(out.data, ptr(convState), ptr(input), ptr(weight), convDim, kernelSize, batchSize, convStateStride);
+    return out;
+  }
 
   rmsnormGated(input: Tensor | number, gate: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
     this.workspace.glm.rmsnormGated(this.data, ptr(input), ptr(gate), ptr(weight), eps, dim, batch);

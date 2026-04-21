@@ -109,10 +109,6 @@ export class Qwen3Model extends ChatModel {
     return model;
   }
 
-  free(): void {
-    super.free();
-  }
-
   createChatCache(maxPages = 256): ChatCache {
     return new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, maxPages, this.maxBatch);
   }
