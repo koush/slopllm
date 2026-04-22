@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { GlmOps } from "../src/glm_ops";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { TensorParallelism } from "../src/device_ops";
 import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
@@ -82,6 +82,11 @@ describe("ParallelOps shardShape", () => {
 
   it("row parallel throws on 1D shape", () => {
     assert.throws(() => po.shardShape([4], TensorParallelism.Row), /2D/);
+  });
+
+  it("partial_sum preserves shape like replicated", () => {
+    assert.deepEqual(po.shardShape([8, 16], TensorParallelism.PartialSum), [8, 16]);
+    assert.deepEqual(po.shardShape([2, 4], TensorParallelism.PartialSum), [2, 4]);
   });
 });
 
@@ -374,5 +379,160 @@ describe("ParallelTensor disposal and recycling", () => {
     ws2.free();
     glm0.free();
     glm1.free();
+  });
+});
+
+function refLinear(x: Float32Array, w: Float32Array, batch: number, n: number, k: number): Float32Array {
+  const y = new Float32Array(batch * n);
+  for (let b = 0; b < batch; b++) {
+    for (let j = 0; j < n; j++) {
+      let sum = 0;
+      for (let i = 0; i < k; i++) {
+        sum += x[b * k + i] * w[j * k + i];
+      }
+      y[b * n + j] = sum;
+    }
+  }
+  return y;
+}
+
+describe("ParallelOps.linear", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("Column W + Replicated X → Row Y (BF16)", () => {
+    const batch = 2;
+    const n = 8;
+    const k = 16;
+
+    const weightF32 = new Float32Array(n * k);
+    const inputF32 = new Float32Array(batch * k);
+    for (let i = 0; i < n * k; i++) weightF32[i] = (i % 7 - 3) * 0.1;
+    for (let i = 0; i < batch * k; i++) inputF32[i] = (i % 5 - 2) * 0.1;
+
+    const expectedF32 = refLinear(inputF32, weightF32, batch, n, k);
+
+    const weight = ws.alloc([n, k], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    const input = ws.alloc([batch, k], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const output = ws.alloc([batch, n], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+
+    weight.h2d(f32ToBf16Bytes(weightF32));
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    po.linear(output, input, weight, batch, n, k);
+    po.synchronize();
+
+    const outputBuf = Buffer.alloc(batch * n * 2);
+    output.d2h(outputBuf);
+    const outputF32 = bf16BytesToF32(outputBuf);
+
+    for (let i = 0; i < batch * n; i++) {
+      const relErr = Math.abs(outputF32[i] - expectedF32[i]) / Math.max(Math.abs(expectedF32[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expectedF32[i]}, got ${outputF32[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("Row W + Row X → PartialSum Y (BF16)", () => {
+    const batch = 2;
+    const n = 8;
+    const k = 16;
+
+    const weightF32 = new Float32Array(n * k);
+    const inputF32 = new Float32Array(batch * k);
+    for (let i = 0; i < n * k; i++) weightF32[i] = (i % 7 - 3) * 0.1;
+    for (let i = 0; i < batch * k; i++) inputF32[i] = (i % 5 - 2) * 0.1;
+
+    const expectedF32 = refLinear(inputF32, weightF32, batch, n, k);
+
+    const weight = ws.alloc([n, k], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    const input = ws.alloc([batch, k], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    const output = ws.alloc([batch, n], "BF16", undefined, TensorParallelism.PartialSum) as ParallelTensor;
+
+    weight.h2d(f32ToBf16Bytes(weightF32));
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    po.linear(output, input, weight, batch, n, k);
+    po.synchronize();
+
+    const outputBuf = Buffer.alloc(batch * n * 2);
+    output.d2h(outputBuf);
+    const outputF32 = bf16BytesToF32(outputBuf);
+
+    for (let i = 0; i < batch * n; i++) {
+      const relErr = Math.abs(outputF32[i] - expectedF32[i]) / Math.max(Math.abs(expectedF32[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expectedF32[i]}, got ${outputF32[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("Replicated W + Replicated X → Replicated Y (BF16)", () => {
+    const batch = 2;
+    const n = 8;
+    const k = 16;
+
+    const weightF32 = new Float32Array(n * k);
+    const inputF32 = new Float32Array(batch * k);
+    for (let i = 0; i < n * k; i++) weightF32[i] = (i % 7 - 3) * 0.1;
+    for (let i = 0; i < batch * k; i++) inputF32[i] = (i % 5 - 2) * 0.1;
+
+    const expectedF32 = refLinear(inputF32, weightF32, batch, n, k);
+
+    const weight = ws.alloc([n, k], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const input = ws.alloc([batch, k], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const output = ws.alloc([batch, n], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    weight.h2d(f32ToBf16Bytes(weightF32));
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    po.linear(output, input, weight, batch, n, k);
+    po.synchronize();
+
+    const outputBuf = Buffer.alloc(batch * n * 2);
+    output.d2h(outputBuf);
+    const outputF32 = bf16BytesToF32(outputBuf);
+
+    for (let i = 0; i < batch * n; i++) {
+      const relErr = Math.abs(outputF32[i] - expectedF32[i]) / Math.max(Math.abs(expectedF32[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expectedF32[i]}, got ${outputF32[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("linearOutputParallelism returns correct types", () => {
+    assert.equal(ParallelOps.linearOutputParallelism(TensorParallelism.Column, TensorParallelism.Replicated), TensorParallelism.Row);
+    assert.equal(ParallelOps.linearOutputParallelism(TensorParallelism.Row, TensorParallelism.Row), TensorParallelism.PartialSum);
+    assert.equal(ParallelOps.linearOutputParallelism(TensorParallelism.Replicated, TensorParallelism.Replicated), TensorParallelism.Replicated);
+  });
+
+  it("linear rejects unsupported parallelism combinations", () => {
+    const weight = ws.alloc([8, 16], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    const input = ws.alloc([2, 16], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    const output = ws.alloc([2, 8], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+
+    assert.throws(() => po.linear(output, input, weight, 2, 8, 16), /unsupported parallelism/);
+  });
+
+  it("linear rejects wrong output parallelism", () => {
+    const weight = ws.alloc([8, 16], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    const input = ws.alloc([2, 16], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const output = ws.alloc([2, 8], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    assert.throws(() => po.linear(output, input, weight, 2, 8, 16), /does not match expected/);
   });
 });

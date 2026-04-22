@@ -5,6 +5,7 @@ export enum TensorParallelism {
   Replicated = "replicated",
   Column = "column",
   Row = "row",
+  PartialSum = "partial_sum",
 }
 
 export interface DeviceOps {

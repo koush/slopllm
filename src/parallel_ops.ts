@@ -1,5 +1,5 @@
 import { DeviceOps, TensorParallelism } from "./device_ops";
-import { GlmOps } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "./glm_ops";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
@@ -106,9 +106,23 @@ export class ParallelOps implements DeviceOps {
         }
         return [fullShape[0], fullShape[1] / this.worldSize, ...fullShape.slice(2)];
       case TensorParallelism.Replicated:
+      case TensorParallelism.PartialSum:
       default:
         return [...fullShape];
     }
+  }
+
+  static linearOutputParallelism(weightPar: TensorParallelism, inputPar: TensorParallelism): TensorParallelism {
+    if (weightPar === TensorParallelism.Column && inputPar === TensorParallelism.Replicated) {
+      return TensorParallelism.Row;
+    }
+    if (weightPar === TensorParallelism.Row && inputPar === TensorParallelism.Row) {
+      return TensorParallelism.PartialSum;
+    }
+    if (weightPar === TensorParallelism.Replicated && inputPar === TensorParallelism.Replicated) {
+      return TensorParallelism.Replicated;
+    }
+    throw new Error(`linear: unsupported parallelism combination W=${weightPar}, X=${inputPar}`);
   }
 
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): ParallelTensor {
@@ -121,16 +135,202 @@ export class ParallelOps implements DeviceOps {
     return new ParallelTensor(workspace, this.devices, par, shards, shape, type, name, pinned);
   }
 
+  linear(out: Tensor, input: Tensor, weight: Tensor, batch: number, n: number, k: number): void {
+    const pOut = out as ParallelTensor;
+    const pInput = input as ParallelTensor;
+    const pWeight = weight as ParallelTensor;
+
+    if (!(pOut instanceof ParallelTensor) || !(pInput instanceof ParallelTensor) || !(pWeight instanceof ParallelTensor)) {
+      throw new Error("ParallelOps.linear requires ParallelTensor arguments");
+    }
+
+    const expectedPar = ParallelOps.linearOutputParallelism(pWeight.parallelism, pInput.parallelism);
+    if (pOut.parallelism !== expectedPar) {
+      throw new Error(`linear: output parallelism ${pOut.parallelism} does not match expected ${expectedPar} for W=${pWeight.parallelism}, X=${pInput.parallelism}`);
+    }
+
+    if (pWeight.parallelism === TensorParallelism.Column && pInput.parallelism === TensorParallelism.Replicated) {
+      const shardN = n / this.worldSize;
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].linear(pOut.shards[i], pInput.shards[i], pWeight.shards[i], batch, shardN, k);
+      }
+    } else if (pWeight.parallelism === TensorParallelism.Row && pInput.parallelism === TensorParallelism.Row) {
+      const shardK = k / this.worldSize;
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].linear(pOut.shards[i], pInput.shards[i], pWeight.shards[i], batch, n, shardK);
+      }
+    } else if (pWeight.parallelism === TensorParallelism.Replicated && pInput.parallelism === TensorParallelism.Replicated) {
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].linear(pOut.shards[i], pInput.shards[i], pWeight.shards[i], batch, n, k);
+      }
+    } else {
+      throw new Error(`linear: unsupported parallelism combination W=${pWeight.parallelism}, X=${pInput.parallelism}`);
+    }
+  }
+
+  synchronize(): void {
+    for (const device of this.devices) {
+      device.synchronize();
+    }
+  }
+
+  private elemBytes(type: string): number {
+    switch (type) {
+      case "BF16": return 2;
+      case "I32": return 4;
+      case "F32": return 4;
+      default: return 1;
+    }
+  }
+
+  private shapeElems(shape: number[]): number {
+    return shape.reduce((a, b) => a * b, 1);
+  }
+
+  h2d(dst: Tensor, cpuData: Buffer, size?: number): void {
+    const pt = dst as ParallelTensor;
+    if (!(pt instanceof ParallelTensor)) {
+      throw new Error("ParallelOps.h2d requires ParallelTensor");
+    }
+    const eb = this.elemBytes(pt.type);
+
+    if (pt.parallelism === TensorParallelism.Replicated || pt.parallelism === TensorParallelism.PartialSum) {
+      const sz = size ?? cpuData.length;
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].h2d(pt.shards[i], cpuData.subarray(0, sz));
+      }
+      return;
+    }
+
+    if (pt.parallelism === TensorParallelism.Column) {
+      const totalElems = this.shapeElems(pt.fullShape);
+      const shardBytes = (totalElems / this.worldSize) * eb;
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].h2d(pt.shards[i], cpuData.subarray(i * shardBytes, (i + 1) * shardBytes));
+      }
+      return;
+    }
+
+    if (pt.parallelism === TensorParallelism.Row) {
+      const outer = pt.fullShape[0];
+      const inner = this.shapeElems(pt.fullShape.slice(2));
+      const shardDim1 = pt.fullShape[1] / this.worldSize;
+      const fullStride = pt.fullShape[1] * inner * eb;
+      const shardStride = shardDim1 * inner * eb;
+      for (let i = 0; i < this.worldSize; i++) {
+        const shardBuf = Buffer.alloc(outer * shardStride);
+        for (let r = 0; r < outer; r++) {
+          cpuData.copy(
+            shardBuf,
+            r * shardStride,
+            r * fullStride + i * shardStride,
+            r * fullStride + i * shardStride + shardStride,
+          );
+        }
+        this.devices[i].h2d(pt.shards[i], shardBuf);
+      }
+      return;
+    }
+
+    throw new Error(`ParallelOps.h2d: unsupported parallelism ${pt.parallelism}`);
+  }
+
+  d2h(cpuBuf: Buffer, src: Tensor, size?: number): void {
+    const pt = src as ParallelTensor;
+    if (!(pt instanceof ParallelTensor)) {
+      throw new Error("ParallelOps.d2h requires ParallelTensor");
+    }
+    const eb = this.elemBytes(pt.type);
+
+    if (pt.parallelism === TensorParallelism.Replicated) {
+      const shardBytes = this.shapeElems(pt.shards[0].shape) * eb;
+      this.devices[0].d2h(cpuBuf.subarray(0, shardBytes), pt.shards[0]);
+      return;
+    }
+
+    if (pt.parallelism === TensorParallelism.Column) {
+      const totalElems = this.shapeElems(pt.fullShape);
+      const shardBytes = (totalElems / this.worldSize) * eb;
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].d2h(cpuBuf.subarray(i * shardBytes, (i + 1) * shardBytes), pt.shards[i]);
+      }
+      return;
+    }
+
+    if (pt.parallelism === TensorParallelism.Row) {
+      const outer = pt.fullShape[0];
+      const inner = this.shapeElems(pt.fullShape.slice(2));
+      const shardDim1 = pt.fullShape[1] / this.worldSize;
+      const fullStride = pt.fullShape[1] * inner * eb;
+      const shardStride = shardDim1 * inner * eb;
+      for (let i = 0; i < this.worldSize; i++) {
+        const shardBuf = Buffer.alloc(outer * shardStride);
+        this.devices[i].d2h(shardBuf, pt.shards[i]);
+        for (let r = 0; r < outer; r++) {
+          shardBuf.copy(
+            cpuBuf,
+            r * fullStride + i * shardStride,
+            r * shardStride,
+            r * shardStride + shardStride,
+          );
+        }
+      }
+      return;
+    }
+
+    if (pt.parallelism === TensorParallelism.PartialSum) {
+      const totalElems = this.shapeElems(pt.fullShape);
+      const shardBytes = totalElems * eb;
+
+      if (pt.type === "F32") {
+        const result = new Float32Array(totalElems);
+        for (let i = 0; i < this.worldSize; i++) {
+          const shardBuf = Buffer.alloc(shardBytes);
+          this.devices[i].d2h(shardBuf, pt.shards[i]);
+          const shardArr = new Float32Array(shardBuf.buffer, shardBuf.byteOffset, totalElems);
+          for (let j = 0; j < totalElems; j++) {
+            result[j] += shardArr[j];
+          }
+        }
+        Buffer.from(result.buffer, result.byteOffset, result.byteLength).copy(cpuBuf, 0);
+      } else if (pt.type === "BF16") {
+        const result = new Float32Array(totalElems);
+        for (let i = 0; i < this.worldSize; i++) {
+          const shardBuf = Buffer.alloc(shardBytes);
+          this.devices[i].d2h(shardBuf, pt.shards[i]);
+          const shardF32 = bf16BytesToF32(shardBuf);
+          for (let j = 0; j < totalElems; j++) {
+            result[j] += shardF32[j];
+          }
+        }
+        const bf16Buf = f32ToBf16Bytes(result);
+        bf16Buf.copy(cpuBuf, 0);
+      } else if (pt.type === "I32") {
+        const result = new Int32Array(totalElems);
+        for (let i = 0; i < this.worldSize; i++) {
+          const shardBuf = Buffer.alloc(shardBytes);
+          this.devices[i].d2h(shardBuf, pt.shards[i]);
+          const shardArr = new Int32Array(shardBuf.buffer, shardBuf.byteOffset, totalElems);
+          for (let j = 0; j < totalElems; j++) {
+            result[j] += shardArr[j];
+          }
+        }
+        Buffer.from(result.buffer, result.byteOffset, result.byteLength).copy(cpuBuf, 0);
+      } else {
+        throw new Error(`ParallelOps.d2h with PartialSum does not support type ${pt.type}`);
+      }
+      return;
+    }
+
+    throw new Error(`ParallelOps.d2h: unsupported parallelism ${pt.parallelism}`);
+  }
+
   freeBuf(_ptr: Tensor): void { throw new Error("ParallelOps.freeBuf not implemented"); }
   freePinned(_ptr: Tensor): void { throw new Error("ParallelOps.freePinned not implemented"); }
-  h2d(): void { throw new Error("ParallelOps.h2d not implemented"); }
-  d2h(): void { throw new Error("ParallelOps.d2h not implemented"); }
-  synchronize(): void { throw new Error("ParallelOps.synchronize not implemented"); }
   rmsnorm(): void { throw new Error("ParallelOps.rmsnorm not implemented"); }
   fusedAddRmsnorm(): void { throw new Error("ParallelOps.fusedAddRmsnorm not implemented"); }
   fusedNormRope(): void { throw new Error("ParallelOps.fusedNormRope not implemented"); }
   siluAndMul(): void { throw new Error("ParallelOps.siluAndMul not implemented"); }
-  linear(): void { throw new Error("ParallelOps.linear not implemented"); }
   embedding(): void { throw new Error("ParallelOps.embedding not implemented"); }
   fill(): void { throw new Error("ParallelOps.fill not implemented"); }
   arange(): void { throw new Error("ParallelOps.arange not implemented"); }
