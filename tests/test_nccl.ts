@@ -2,6 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import {
   GlmOps,
+  GlmTensor,
   f32ToBf16Bytes,
   bf16BytesToF32,
   BF16,
@@ -113,7 +114,7 @@ describe("memcpy2d", () => {
 
     const hostBuf = f32ToBf16Bytes(srcF32);
     const hostPtr = glm.allocPinned(hostBuf.length);
-    const hostTensor = new Tensor(ws, hostPtr, hostBuf.length, [hostBuf.length], "U8", undefined, true);
+    const hostTensor = new GlmTensor(ws, glm, hostPtr, hostBuf.length, [hostBuf.length], "U8", undefined, true);
     glm.writePinned(hostTensor, hostBuf);
 
     const dstGpu = ws.alloc([rows * shardCols * elemBytes], "U8");
@@ -173,7 +174,7 @@ describe("NCCL single-rank", () => {
     const idBuf = Buffer.alloc(NCCL_UNIQUE_ID_BYTES);
     glm.native.ncclUniqueId(idBuf);
     const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
-    const idTensor = new Tensor(ws, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
+    const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
     glm.writePinned(idTensor, idBuf);
 
     const comm = glm.native.ncclCommInitRank(0, 0, 1, idPtr);
@@ -187,7 +188,7 @@ describe("NCCL single-rank", () => {
     const idBuf = Buffer.alloc(NCCL_UNIQUE_ID_BYTES);
     glm.native.ncclUniqueId(idBuf);
     const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
-    const idTensor = new Tensor(ws, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
+    const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
     glm.writePinned(idTensor, idBuf);
 
     const comm = glm.native.ncclCommInitRank(0, 0, 1, idPtr);
@@ -224,7 +225,7 @@ describe("NCCL single-rank", () => {
     const idBuf = Buffer.alloc(NCCL_UNIQUE_ID_BYTES);
     glm.native.ncclUniqueId(idBuf);
     const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
-    const idTensor = new Tensor(ws, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
+    const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
     glm.writePinned(idTensor, idBuf);
 
     const comm = glm.native.ncclCommInitRank(0, 0, 1, idPtr);
@@ -261,7 +262,7 @@ describe("NCCL single-rank", () => {
     const idBuf = Buffer.alloc(NCCL_UNIQUE_ID_BYTES);
     glm.native.ncclUniqueId(idBuf);
     const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
-    const idTensor = new Tensor(ws, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
+    const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
     glm.writePinned(idTensor, idBuf);
 
     const comm = glm.native.ncclCommInitRank(0, 0, 1, idPtr);

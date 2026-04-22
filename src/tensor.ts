@@ -1,6 +1,5 @@
 import { type SamplingParams } from "./chat_model";
 import { TensorParallelism } from "./device_ops";
-import { I32, SAMPLING_BLOCK_SIZE, SAMPLING_MAX_TOPK } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { WorkspaceBase } from "./workspace";
 
@@ -8,7 +7,7 @@ function numElements(shape: number[]): number {
   return shape.reduce((a, b) => a * b, 1);
 }
 
-export class Tensor implements Disposable {
+export abstract class Tensor implements Disposable {
   parallelism: TensorParallelism = TensorParallelism.Replicated;
   constructor(public readonly workspace: WorkspaceBase, public data: number, public readonly allocSize: number, public readonly shape: number[], public readonly type: string, public readonly name: string | undefined, public readonly pinned: boolean) {
     this.data = data;
@@ -56,121 +55,39 @@ export class Tensor implements Disposable {
     return this;
   }
 
-  h2d(data: Buffer, size?: number): void {
-    this.workspace.glm.h2d(this, data, size);
-  }
+  abstract h2d(data: Buffer, size?: number): void;
+  abstract d2h(buf: Buffer, size?: number): void;
 
-  d2h(buf: Buffer, size?: number): void {
-    this.workspace.glm.d2h(buf, this, size);
-  }
+  abstract linear(weight: Tensor, batch: number): Tensor;
+  abstract rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor;
+  abstract fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor };
+  abstract fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor;
+  abstract embedding(ids: Tensor, hidden: number, seqLen: number): Tensor;
+  abstract siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor;
+  abstract arange(start: number, step: number, count: number): void;
+  abstract argmax(): Tensor;
+  abstract indexSelect(indices: Tensor, dim: number, batch: number): Tensor;
 
-  linear(weight: Tensor, batch: number): Tensor {
-    const n = weight.shape[0];
-    const k = weight.shape[1];
-    const outShape = [batch, n];
-    const out = this.workspace.alloc(outShape, this.type);
-    if (weight.type === "F8_E4M3") {
-      const scale = weight.workspace.tensors.get(weight.name! + "_scale_inv")!;
-      this.workspace.glm.fp8LinearDecode(out, this, weight, scale, batch, n, k);
-    } else {
-      this.workspace.glm.linear(out, this, weight, batch, n, k);
-    }
-    return out;
-  }
-
-  rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
-    const out = this.workspace.alloc([batch, dim], this.type);
-    this.workspace.glm.rmsnorm(out, this, weight, eps, dim, batch);
-    return out;
-  }
-
-  fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
-    const normed = this.workspace.alloc([batch, dim], this.type);
-    const residual = this.workspace.alloc([batch, dim], this.type);
-    this.workspace.glm.fusedAddRmsnorm(normed, residual, this, input, weight, eps, dim, batch);
-    return { normed, residual };
-  }
-
-  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
-    const out = this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
-    this.workspace.glm.fusedNormRope(out, this, weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
-    return out;
-  }
-
-  embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
-    const out = ids.workspace.alloc([seqLen, hidden], this.type);
-    this.workspace.glm.embedding(out, this, ids, hidden, seqLen);
-    return out;
-  }
-
-  siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
-    const out = this.workspace.alloc([batch, intermediate], this.type);
-    this.workspace.glm.siluAndMul(out, gate, up, intermediate, batch);
-    return out;
-  }
-
-  arange(start: number, step: number, count: number): void {
-    this.workspace.glm.arange(this, start, step, count);
-  }
-
-  argmax(): Tensor {
-    const batch = this.shape[0];
-    const dim = this.shape[1];
-    const out = this.workspace.alloc([batch], "I32");
-    this.workspace.glm.argmax(out, this, dim, batch);
-    return out;
-  }
+  abstract gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
+  abstract gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
+  abstract causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void;
+  abstract causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor;
+  abstract rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void;
+  abstract gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void;
+  abstract rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor };
 
   readInt32LE(): number[] {
     const count = numElements(this.shape);
-    const buf = Buffer.alloc(count * I32);
+    const buf = Buffer.alloc(count * 4);
     this.d2h(buf);
     const result: number[] = [];
     for (let i = 0; i < count; i++) {
-      result.push(buf.readInt32LE(i * I32));
+      result.push(buf.readInt32LE(i * 4));
     }
     return result;
   }
 
-  indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
-    const out = this.workspace.alloc([batch, dim], this.type);
-    this.workspace.glm.indexSelect(out, this, indices, dim, batch);
-    return out;
-  }
-
-  gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    this.workspace.glm.gdnRecurrentStep(this, state, qkv, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
-  }
-
-  gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    this.workspace.glm.gdnPrefill(this, state, qkv, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
-  }
-
-  causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
-    this.workspace.glm.causalConv1d(this, convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
-  }
-
-  causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor {
-    const out = this.workspace.alloc([batchSize * convDim], this.type);
-    this.workspace.glm.causalConv1dUpdate(out, convState, input, weight, convDim, kernelSize, batchSize, convStateStride);
-    return out;
-  }
-
-  rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
-    this.workspace.glm.rmsnormGated(this, input, gate, weight, eps, dim, batch);
-  }
-
-  gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
-    this.workspace.glm.gateSigmoidMul(this, gate, batchSeq, numHeads, headDim);
-  }
-
-  rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
-    const hd = dimHalf * 2;
-    const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
-    const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
-    this.workspace.glm.rotaryEmbedding(cos, sin, this, positionIds, dimHalf, batch, seqLen);
-    return { cos, sin };
-  }
+  protected abstract doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyOffsets: Tensor, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, randomVals: Tensor, maxEffectiveK: number): void;
 
   sampleBatchGPU(params: SamplingParams[], tokenHistories: number[][]): Tensor {
     const batchSize = params.length;
@@ -178,6 +95,10 @@ export class Tensor implements Disposable {
       throw new Error(`sampleBatchGPU: params length ${batchSize} != tokenHistories length ${tokenHistories.length}`);
     }
     const vs = this.shape[this.shape.length - 1];
+
+    const I32 = 4;
+    const SAMPLING_MAX_TOPK = 256;
+    const SAMPLING_BLOCK_SIZE = 256;
 
     const penaltyBufSize = batchSize * 1024 * I32;
     const penaltyBuf = Buffer.alloc(penaltyBufSize);
@@ -260,7 +181,7 @@ export class Tensor implements Disposable {
     topPs.h2d(topPBuf);
     randomVals.h2d(randBuf);
 
-    this.workspace.glm.sampleBatch(
+    this.doSampleBatch(
       outToken,
       topkVals,
       topkIdxs,

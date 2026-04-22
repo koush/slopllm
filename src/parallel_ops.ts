@@ -162,6 +162,14 @@ export class ParallelTensor extends Tensor {
     }
   }
 
+  h2d(data: Buffer, size?: number): void {
+    this.parallelOps.h2d(this, data, size);
+  }
+
+  d2h(buf: Buffer, size?: number): void {
+    this.parallelOps.d2h(buf, this, size);
+  }
+
   override linear(weight: Tensor, batch: number): Tensor {
     const pWeight = weight as ParallelTensor;
     const n = weight.shape[0];
@@ -172,25 +180,30 @@ export class ParallelTensor extends Tensor {
     const out = this.workspace.alloc([batch, n], this.type, undefined, outPar);
     if (weight.type === "F8_E4M3") {
       const scale = weight.workspace.tensors.get(weight.name! + "_scale_inv")!;
-      this.workspace.glm.fp8LinearDecode(out, this, weight, scale, batch, n, k);
+      this.parallelOps.fp8LinearDecode(out, this, weight, scale, batch, n, k);
     } else {
-      this.workspace.glm.linear(out, this, weight, batch, n, k);
+      this.parallelOps.linear(out, this, weight, batch, n, k);
     }
     return out;
   }
 
-  override siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
-    const pGate = gate as ParallelTensor;
-    const outPar = (pGate instanceof ParallelTensor) ? pGate.parallelism : TensorParallelism.Replicated;
-    const out = this.workspace.alloc([batch, intermediate], this.type, undefined, outPar);
-    this.workspace.glm.siluAndMul(out, gate, up, intermediate, batch);
+  rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
+    const out = this.workspace.alloc([batch, dim], this.type);
+    this.parallelOps.rmsnorm(out, this, weight, eps, dim, batch);
     return out;
+  }
+
+  fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
+    const normed = this.workspace.alloc([batch, dim], this.type);
+    const residual = this.workspace.alloc([batch, dim], this.type);
+    this.parallelOps.fusedAddRmsnorm(normed, residual, this, input, weight, eps, dim, batch);
+    return { normed, residual };
   }
 
   override fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
     const outPar = this instanceof ParallelTensor ? this.parallelism : TensorParallelism.Replicated;
     const out = this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type, undefined, outPar);
-    this.workspace.glm.fusedNormRope(out, this, weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
+    this.parallelOps.fusedNormRope(out, this, weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
     return out;
   }
 
@@ -200,8 +213,70 @@ export class ParallelTensor extends Tensor {
       ? TensorParallelism.Row
       : TensorParallelism.Replicated;
     const out = ids.workspace.alloc([seqLen, hidden], this.type, undefined, outPar);
-    this.workspace.glm.embedding(out, this, ids, hidden, seqLen);
+    this.parallelOps.embedding(out, this, ids, hidden, seqLen);
     return out;
+  }
+
+  override siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
+    const pGate = gate as ParallelTensor;
+    const outPar = (pGate instanceof ParallelTensor) ? pGate.parallelism : TensorParallelism.Replicated;
+    const out = this.workspace.alloc([batch, intermediate], this.type, undefined, outPar);
+    this.parallelOps.siluAndMul(out, gate, up, intermediate, batch);
+    return out;
+  }
+
+  arange(start: number, step: number, count: number): void {
+    this.parallelOps.arange(this, start, step, count);
+  }
+
+  argmax(): Tensor {
+    const batch = this.shape[0];
+    const dim = this.shape[1];
+    const out = this.workspace.alloc([batch], "I32");
+    this.parallelOps.argmax(out, this, dim, batch);
+    return out;
+  }
+
+  indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
+    const out = this.workspace.alloc([batch, dim], this.type);
+    this.parallelOps.indexSelect(out, this, indices, dim, batch);
+    return out;
+  }
+
+  gdnRecurrentStep(_state: Tensor, _qkv: Tensor, _aRaw: Tensor, _bRaw: Tensor, _aLog: Tensor, _dtBias: Tensor, _numHeads: number, _dK: number, _dV: number, _batchSize: number, _stateStride: number, _qkvChStride: number, _qkvSeqStride: number): void {
+    throw new Error("ParallelTensor.gdnRecurrentStep not implemented");
+  }
+
+  gdnPrefill(_state: Tensor, _qkv: Tensor, _aRaw: Tensor, _bRaw: Tensor, _aLog: Tensor, _dtBias: Tensor, _cuSeqlens: Tensor, _totalSeqLen: number, _numHeads: number, _dK: number, _dV: number, _batchSize: number, _stateStride: number, _qkvChStride: number, _qkvSeqStride: number): void {
+    throw new Error("ParallelTensor.gdnPrefill not implemented");
+  }
+
+  causalConv1d(_convState: Tensor, _input: Tensor, _weight: Tensor, _cuSeqlens: Tensor, _convDim: number, _totalSeqLen: number, _kernelSize: number, _batchSize: number, _convStateStride: number, _chStride: number, _seqStride: number): void {
+    throw new Error("ParallelTensor.causalConv1d not implemented");
+  }
+
+  causalConv1dUpdate(_convState: Tensor, _input: Tensor, _weight: Tensor, _convDim: number, _kernelSize: number, _batchSize: number, _convStateStride: number): Tensor {
+    throw new Error("ParallelTensor.causalConv1dUpdate not implemented");
+  }
+
+  rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
+    this.parallelOps.rmsnormGated(this, input, gate, weight, eps, dim, batch);
+  }
+
+  gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
+    this.parallelOps.gateSigmoidMul(this, gate, batchSeq, numHeads, headDim);
+  }
+
+  rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
+    const hd = dimHalf * 2;
+    const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
+    const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
+    this.parallelOps.rotaryEmbedding(cos, sin, this, positionIds, dimHalf, batch, seqLen);
+    return { cos, sin };
+  }
+
+  protected doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyOffsets: Tensor, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, randomVals: Tensor, maxEffectiveK: number): void {
+    this.parallelOps.sampleBatch(outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyOffsets, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, randomVals, maxEffectiveK);
   }
 }
 
@@ -301,6 +376,10 @@ export class ParallelOps implements DeviceOps {
       pinned ? ws.allocPinned(ss, type) : ws.alloc(ss, type),
     );
     return new ParallelTensor(workspace, this, par, shards, shape, type, name, pinned);
+  }
+
+  wrapTensor(_workspace: WorkspaceBase, _data: number, _allocSize: number, _shape: number[], _type: string, _pinned: boolean): Tensor {
+    throw new Error("ParallelOps.wrapTensor not supported; tensor recycling happens at shard level");
   }
 
   linear(out: Tensor, input: Tensor, weight: Tensor, batch: number, n: number, k: number): void {

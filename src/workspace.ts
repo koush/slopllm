@@ -53,7 +53,7 @@ export class WorkspaceBase {
       this.disposed.delete(best);
       const data = best.data;
       (best as { data: number }).data = 0;
-      const tensor = new Tensor(this, data, best.allocSize, shape, type, undefined, pinned);
+      const tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned);
       this.tracked.add(tensor);
       return tensor;
     }
