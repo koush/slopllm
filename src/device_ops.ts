@@ -11,8 +11,6 @@ export enum TensorParallelism {
 export interface DeviceOps {
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean): Tensor;
-  freeBuf(ptr: Tensor): void;
-  freePinned(ptr: Tensor): void;
   synchronize(): void;
 
   fill(out: Tensor, value: number, n: number): void;

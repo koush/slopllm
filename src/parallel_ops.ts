@@ -572,9 +572,6 @@ export class ParallelOps implements DeviceOps {
     throw new Error(`ParallelOps.d2h: unsupported parallelism ${pt.parallelism}`);
   }
 
-  freeBuf(_ptr: Tensor): void { throw new Error("ParallelOps.freeBuf not implemented"); }
-  freePinned(_ptr: Tensor): void { throw new Error("ParallelOps.freePinned not implemented"); }
-
   private assertParallel(name: string, tensor: ParallelTensor, ...allowed: TensorParallelism[]): void {
     if (!allowed.includes(tensor.parallelism)) {
       throw new Error(`${name}: unsupported parallelism ${tensor.parallelism}, expected ${allowed.join(" or ")}`);

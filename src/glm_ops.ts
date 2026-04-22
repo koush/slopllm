@@ -103,6 +103,17 @@ export class GlmTensor extends Tensor {
     super(workspace, data, allocSize, shape, type, name, pinned);
   }
 
+  free(): void {
+    if (this.data !== 0) {
+      if (this.pinned) {
+        this.glm.freePinned(this);
+      } else {
+        this.glm.freeBuf(this);
+      }
+      (this as { data: number }).data = 0;
+    }
+  }
+
   h2d(data: Buffer, size?: number): void {
     this.glm.h2d(this, data, size);
   }

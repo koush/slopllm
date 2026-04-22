@@ -26,16 +26,7 @@ export abstract class Tensor implements Disposable {
     return Math.ceil(numElements(this.shape) * SafeTensorFile.dtypeBytes(this.type));
   }
 
-  free(): void {
-    if (this.data !== 0) {
-      if (this.pinned) {
-        this.workspace.glm.freePinned(this);
-      } else {
-        this.workspace.glm.freeBuf(this);
-      }
-      (this as { data: number }).data = 0;
-    }
-  }
+  abstract free(): void;
 
   [Symbol.dispose](): void {
     if (this.name !== undefined) {
