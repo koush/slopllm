@@ -200,7 +200,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
 
     using qoIndptrHost = this.allocPinned([(batchSize + 1)], "I32");
-    this.glm.writePinned(qoIndptrHost, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+    qoIndptrHost.writePinned(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
 
     this.glm.batchPrefillPagedPlan(
       this.floatWs, BATCH_FLOAT_WS_SIZE,
@@ -416,8 +416,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
     const lastPageLenBuf = Int32Array.from(lastPageLenList);
 
-    this.glm.writePinned(ws.indptrH, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
-    this.glm.writePinned(ws.lastPageLenH, Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
+    ws.indptrH.writePinned(Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
+    ws.lastPageLenH.writePinned(Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
     this.indices.h2d(Buffer.from(indicesBuf.buffer, indicesBuf.byteOffset, indicesBuf.byteLength));
     ws.indptrD.h2d(Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
     ws.lastPageLen.h2d(Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));

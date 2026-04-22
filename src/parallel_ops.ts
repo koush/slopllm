@@ -268,6 +268,10 @@ export class ParallelTensor extends Tensor {
     this.parallelOps.fill(this, value, n);
   }
 
+  writePinned(src: Buffer, size?: number): void {
+    this.parallelOps.writePinned(this, src, size);
+  }
+
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     const hd = dimHalf * 2;
     const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
