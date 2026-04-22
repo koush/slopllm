@@ -264,6 +264,10 @@ export class ParallelTensor extends Tensor {
     this.parallelOps.gateSigmoidMul(this, gate, batchSeq, numHeads, headDim);
   }
 
+  fill(value: number, n: number): void {
+    this.parallelOps.fill(this, value, n);
+  }
+
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     const hd = dimHalf * 2;
     const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);

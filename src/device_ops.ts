@@ -13,7 +13,6 @@ export interface DeviceOps {
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean): Tensor;
   synchronize(): void;
 
-  fill(out: Tensor, value: number, n: number): void;
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
 
   writePinned(dst: Tensor, src: Buffer, size?: number): void;

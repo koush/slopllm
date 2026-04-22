@@ -65,6 +65,7 @@ export abstract class Tensor implements Disposable {
   abstract causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor;
   abstract rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void;
   abstract gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void;
+  abstract fill(value: number, n: number): void;
   abstract rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor };
 
   readInt32LE(): number[] {
