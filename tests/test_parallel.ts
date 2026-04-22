@@ -1,11 +1,9 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "../src/glm_ops";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_SUM } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { TensorParallelism } from "../src/device_ops";
 import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
-
-process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0,1";
 
 describe("ParallelOps construction", () => {
   it("accepts a single device", () => {
@@ -13,6 +11,8 @@ describe("ParallelOps construction", () => {
     const po = new ParallelOps([glm]);
     assert.equal(po.worldSize, 1);
     assert.equal(po.devices.length, 1);
+    assert.equal(po.comms.length, 0);
+    po.free();
     glm.free();
   });
 
@@ -22,6 +22,8 @@ describe("ParallelOps construction", () => {
     const po = new ParallelOps([glm0, glm1]);
     assert.equal(po.worldSize, 2);
     assert.equal(po.devices.length, 2);
+    assert.equal(po.comms.length, 2);
+    po.free();
     glm0.free();
     glm1.free();
   });
@@ -53,6 +55,7 @@ describe("ParallelOps shardShape", () => {
   });
 
   after(() => {
+    po.free();
     glm0.free();
     glm1.free();
   });
@@ -105,6 +108,7 @@ describe("ParallelTensor allocation and properties", () => {
 
   after(() => {
     ws.free();
+    po.free();
     glm0.free();
     glm1.free();
   });
@@ -172,6 +176,7 @@ describe("ParallelTensor h2d/d2h round-trip", () => {
 
   after(() => {
     ws.free();
+    po.free();
     glm0.free();
     glm1.free();
   });
@@ -289,6 +294,7 @@ describe("ParallelTensor disposal and recycling", () => {
     assert.equal(sws[1].disposed.size, 1, "shard 1 should be in device 1 workspace disposed");
 
     ws.free();
+    po.free();
     glm0.free();
     glm1.free();
   });
@@ -320,6 +326,7 @@ describe("ParallelTensor disposal and recycling", () => {
     assert.equal(pt2.shard(1).data, s1_data, "shard 1 buffer should be recycled");
 
     ws.free();
+    po.free();
     glm0.free();
     glm1.free();
   });
@@ -343,6 +350,7 @@ describe("ParallelTensor disposal and recycling", () => {
     assert.equal(sws[1].disposed.size, 1, "shard 1 should be recycled after using scope");
 
     ws.free();
+    po.free();
     glm0.free();
     glm1.free();
   });
@@ -377,6 +385,7 @@ describe("ParallelTensor disposal and recycling", () => {
 
     ws1.free();
     ws2.free();
+    po.free();
     glm0.free();
     glm1.free();
   });
@@ -411,6 +420,7 @@ describe("ParallelOps.linear", () => {
 
   after(() => {
     ws.free();
+    po.free();
     glm0.free();
     glm1.free();
   });
@@ -534,5 +544,289 @@ describe("ParallelOps.linear", () => {
     const output = ws.alloc([2, 8], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     assert.throws(() => po.linear(output, input, weight, 2, 8, 16), /does not match expected/);
+  });
+});
+
+describe("ParallelTensor.allReduce", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("allReduce BF16 PartialSum → Replicated", () => {
+    const rows = 4;
+    const cols = 8;
+    const totalElems = rows * cols;
+
+    const pt = ws.alloc([rows, cols], "BF16", undefined, TensorParallelism.PartialSum) as ParallelTensor;
+    assert.equal(pt.parallelism, TensorParallelism.PartialSum);
+
+    const shard0F32 = new Float32Array(totalElems);
+    const shard1F32 = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) {
+      shard0F32[i] = (i % 7 - 3) * 0.1;
+      shard1F32[i] = (i % 5 + 1) * 0.15;
+    }
+
+    pt.shard(0).h2d(f32ToBf16Bytes(shard0F32));
+    pt.shard(1).h2d(f32ToBf16Bytes(shard1F32));
+    po.synchronize();
+
+    const result = pt.allReduce();
+    assert.equal(result, pt, "allReduce should return same tensor");
+    assert.equal(pt.parallelism, TensorParallelism.Replicated, "parallelism should be Replicated after allReduce");
+    po.synchronize();
+
+    const expected = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) {
+      expected[i] = shard0F32[i] + shard1F32[i];
+    }
+
+    const dstBuf = Buffer.alloc(totalElems * 2);
+    pt.d2h(dstBuf);
+    const actual = bf16BytesToF32(dstBuf);
+
+    for (let i = 0; i < totalElems; i++) {
+      const relErr = Math.abs(actual[i] - expected[i]) / Math.max(Math.abs(expected[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expected[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("allReduce F32 PartialSum → Replicated", () => {
+    const rows = 3;
+    const cols = 6;
+    const totalElems = rows * cols;
+
+    const pt = ws.alloc([rows, cols], "F32", undefined, TensorParallelism.PartialSum) as ParallelTensor;
+
+    const shard0F32 = new Float32Array(totalElems);
+    const shard1F32 = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) {
+      shard0F32[i] = (i + 1) * 0.5;
+      shard1F32[i] = (i + 1) * -0.3;
+    }
+
+    pt.shard(0).h2d(Buffer.from(shard0F32.buffer));
+    pt.shard(1).h2d(Buffer.from(shard1F32.buffer));
+    po.synchronize();
+
+    pt.allReduce();
+    assert.equal(pt.parallelism, TensorParallelism.Replicated);
+    po.synchronize();
+
+    const expected = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) {
+      expected[i] = shard0F32[i] + shard1F32[i];
+    }
+
+    const dstBuf = Buffer.alloc(totalElems * 4);
+    pt.d2h(dstBuf);
+    const actual = new Float32Array(dstBuf.buffer, dstBuf.byteOffset, totalElems);
+
+    for (let i = 0; i < totalElems; i++) {
+      const relErr = Math.abs(actual[i] - expected[i]) / Math.max(Math.abs(expected[i]), 1e-6);
+      assert.ok(relErr < 1e-5, `i=${i}: expected ${expected[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("allReduce rejects non-PartialSum tensor", () => {
+    const pt = ws.alloc([4, 4], "F32", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    assert.throws(() => pt.allReduce(), /PartialSum/);
+  });
+});
+
+describe("ParallelTensor.allGather", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+  let ref: GlmOps;
+  let refWs: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+    ref = new GlmOps(2);
+    refWs = new WorkspaceBase(ref);
+  });
+
+  after(() => {
+    refWs.free();
+    ref.free();
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("allGather Row BF16 → Replicated", () => {
+    const rows = 4;
+    const cols = 8;
+    const totalElems = rows * cols;
+
+    const fullF32 = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) fullF32[i] = (i % 11 - 5) * 0.1;
+
+    const pt = ws.alloc([rows, cols], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    pt.h2d(f32ToBf16Bytes(fullF32));
+    po.synchronize();
+
+    const gathered = pt.allGather(ws);
+    assert.equal(gathered.parallelism, TensorParallelism.Replicated);
+    assert.equal(gathered.fullShape[0], rows);
+    assert.equal(gathered.fullShape[1], cols);
+    assert.notStrictEqual(gathered, pt, "allGather should return new tensor for Row");
+    po.synchronize();
+
+    const dstBuf = Buffer.alloc(totalElems * 2);
+    gathered.d2h(dstBuf);
+    const actual = bf16BytesToF32(dstBuf);
+
+    for (let i = 0; i < totalElems; i++) {
+      const relErr = Math.abs(actual[i] - fullF32[i]) / Math.max(Math.abs(fullF32[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${fullF32[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("allGather Column F32 → Replicated", () => {
+    const rows = 8;
+    const cols = 4;
+    const totalElems = rows * cols;
+
+    const fullF32 = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) fullF32[i] = (i + 1) * 0.25;
+
+    const pt = ws.alloc([rows, cols], "F32", undefined, TensorParallelism.Column) as ParallelTensor;
+    pt.h2d(Buffer.from(fullF32.buffer));
+    po.synchronize();
+
+    const gathered = pt.allGather(ws);
+    assert.equal(gathered.parallelism, TensorParallelism.Replicated);
+    assert.notStrictEqual(gathered, pt, "allGather should return new tensor for Column");
+    po.synchronize();
+
+    const dstBuf = Buffer.alloc(totalElems * 4);
+    gathered.d2h(dstBuf);
+    const actual = new Float32Array(dstBuf.buffer, dstBuf.byteOffset, totalElems);
+
+    for (let i = 0; i < totalElems; i++) {
+      const relErr = Math.abs(actual[i] - fullF32[i]) / Math.max(Math.abs(fullF32[i]), 1e-6);
+      assert.ok(relErr < 1e-5, `i=${i}: expected ${fullF32[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("allGather Replicated returns same tensor", () => {
+    const pt = ws.alloc([4, 4], "F32", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const result = pt.allGather(ws);
+    assert.strictEqual(result, pt, "allGather on Replicated should return same tensor");
+  });
+
+  it("allGather rejects PartialSum tensor", () => {
+    const pt = ws.alloc([4, 4], "F32", undefined, TensorParallelism.PartialSum) as ParallelTensor;
+    assert.throws(() => pt.allGather(ws), /PartialSum/);
+  });
+});
+
+describe("ParallelTensor.all", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("all() on Replicated returns same tensor", () => {
+    const pt = ws.alloc([4, 4], "F32", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const result = pt.all(ws);
+    assert.strictEqual(result, pt);
+  });
+
+  it("all() on PartialSum calls allReduce", () => {
+    const totalElems = 4 * 4;
+    const pt = ws.alloc([4, 4], "F32", undefined, TensorParallelism.PartialSum) as ParallelTensor;
+
+    const shard0F32 = new Float32Array(totalElems);
+    const shard1F32 = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) {
+      shard0F32[i] = i * 0.1;
+      shard1F32[i] = i * 0.2;
+    }
+
+    pt.shard(0).h2d(Buffer.from(shard0F32.buffer));
+    pt.shard(1).h2d(Buffer.from(shard1F32.buffer));
+    po.synchronize();
+
+    const result = pt.all(ws);
+    assert.strictEqual(result, pt, "all() on PartialSum should return same tensor (allReduce is in-place)");
+    assert.equal(pt.parallelism, TensorParallelism.Replicated, "parallelism should be Replicated after all()");
+    po.synchronize();
+
+    const expected = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) expected[i] = shard0F32[i] + shard1F32[i];
+
+    const dstBuf = Buffer.alloc(totalElems * 4);
+    pt.d2h(dstBuf);
+    const actual = new Float32Array(dstBuf.buffer, dstBuf.byteOffset, totalElems);
+
+    for (let i = 0; i < totalElems; i++) {
+      const relErr = Math.abs(actual[i] - expected[i]) / Math.max(Math.abs(expected[i]), 1e-6);
+      assert.ok(relErr < 1e-5, `i=${i}: expected ${expected[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("all() on Row calls allGather and returns new Replicated tensor", () => {
+    const rows = 4;
+    const cols = 8;
+    const totalElems = rows * cols;
+
+    const fullF32 = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) fullF32[i] = (i % 9 - 4) * 0.1;
+
+    const pt = ws.alloc([rows, cols], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    pt.h2d(f32ToBf16Bytes(fullF32));
+    po.synchronize();
+
+    const result = pt.all(ws);
+    assert.notStrictEqual(result, pt, "all() on Row should return new tensor");
+    assert.equal(result.parallelism, TensorParallelism.Replicated);
+    assert.equal(pt.parallelism, TensorParallelism.Row, "original tensor should still be Row");
+    po.synchronize();
+
+    const dstBuf = Buffer.alloc(totalElems * 2);
+    result.d2h(dstBuf);
+    const actual = bf16BytesToF32(dstBuf);
+
+    for (let i = 0; i < totalElems; i++) {
+      const relErr = Math.abs(actual[i] - fullF32[i]) / Math.max(Math.abs(fullF32[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${fullF32[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
   });
 });

@@ -1,18 +1,19 @@
 import { DeviceOps, TensorParallelism } from "./device_ops";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "./glm_ops";
+import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM } from "./glm_ops";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
 export class ParallelTensor extends Tensor {
-  readonly parallelism: TensorParallelism;
+  parallelism: TensorParallelism;
   readonly shards: readonly Tensor[];
   readonly fullShape: number[];
   private readonly devices: readonly GlmOps[];
+  private readonly parallelOps: ParallelOps;
   private _disposed = false;
 
   constructor(
     workspace: WorkspaceBase,
-    devices: readonly GlmOps[],
+    parallelOps: ParallelOps,
     parallelism: TensorParallelism,
     shards: readonly Tensor[],
     fullShape: number[],
@@ -21,7 +22,8 @@ export class ParallelTensor extends Tensor {
     pinned: boolean,
   ) {
     super(workspace, 0, 0, fullShape, type, name, pinned);
-    this.devices = devices;
+    this.parallelOps = parallelOps;
+    this.devices = parallelOps.devices;
     this.parallelism = parallelism;
     this.shards = shards;
     this.fullShape = fullShape;
@@ -59,11 +61,112 @@ export class ParallelTensor extends Tensor {
   shard(rank: number): Tensor {
     return this.shards[rank];
   }
+
+  allReduce(): ParallelTensor {
+    if (this.parallelism !== TensorParallelism.PartialSum) {
+      throw new Error(`allReduce requires PartialSum tensor, got ${this.parallelism}`);
+    }
+    const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
+    const dtype = this.parallelOps.ncclDatatype(this.type);
+    const comms = this.parallelOps.comms;
+    this.devices[0].native.ncclGroupStart();
+    for (let i = 0; i < this.devices.length; i++) {
+      this.devices[i].native.ncclAllReduce(
+        comms[i], this.devices[i].ctx,
+        this.shards[i].data, this.shards[i].data,
+        count, dtype, NCCL_SUM,
+      );
+    }
+    this.devices[0].native.ncclGroupEnd();
+    this.parallelism = TensorParallelism.Replicated;
+    return this;
+  }
+
+  allGather(workspace: WorkspaceBase): ParallelTensor {
+    if (this.parallelism === TensorParallelism.Replicated) {
+      return this;
+    }
+    if (this.parallelism === TensorParallelism.PartialSum) {
+      throw new Error("allGather cannot be used on PartialSum tensors; use allReduce instead");
+    }
+    const output = this.parallelOps.newTensor(workspace, this.fullShape, this.type, false, undefined, TensorParallelism.Replicated);
+    const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
+    const dtype = this.parallelOps.ncclDatatype(this.type);
+    const comms = this.parallelOps.comms;
+
+    if (this.parallelism === TensorParallelism.Column) {
+      this.devices[0].native.ncclGroupStart();
+      for (let i = 0; i < this.devices.length; i++) {
+        this.devices[i].native.ncclAllGather(
+          comms[i], this.devices[i].ctx,
+          this.shards[i].data, output.shards[i].data,
+          count, dtype,
+        );
+      }
+      this.devices[0].native.ncclGroupEnd();
+      return output;
+    }
+
+    if (this.parallelism === TensorParallelism.Row) {
+      const eb = this.type === "BF16" ? 2 : this.type === "F32" ? 4 : this.type === "I32" ? 4 : 1;
+      const outer = this.fullShape[0];
+      const inner = this.fullShape.slice(2).reduce((a, b) => a * b, 1);
+      const shardDim1 = this.fullShape[1] / this.devices.length;
+      const shardBytes = count * eb;
+      const totalElems = this.fullShape.reduce((a, b) => a * b, 1);
+      const totalBytes = totalElems * eb;
+
+      const shardWss = this.parallelOps.getShardWorkspaces(workspace);
+      const tempTensors = shardWss.map(ws => ws.alloc([totalBytes], "U8"));
+
+      this.devices[0].native.ncclGroupStart();
+      for (let i = 0; i < this.devices.length; i++) {
+        this.devices[i].native.ncclAllGather(
+          comms[i], this.devices[i].ctx,
+          this.shards[i].data, tempTensors[i].data,
+          count, dtype,
+        );
+      }
+      this.devices[0].native.ncclGroupEnd();
+
+      for (let i = 0; i < this.devices.length; i++) {
+        for (let r = 0; r < this.devices.length; r++) {
+          this.devices[i].memcpy2d(
+            output.shards[i].data + r * shardDim1 * inner * eb,
+            this.fullShape[1] * inner * eb,
+            tempTensors[i].data + r * shardBytes,
+            shardDim1 * inner * eb,
+            shardDim1 * inner * eb,
+            outer,
+            3,
+          );
+        }
+        tempTensors[i][Symbol.dispose]();
+      }
+
+      return output;
+    }
+
+    throw new Error(`allGather: unsupported parallelism ${this.parallelism}`);
+  }
+
+  all(workspace: WorkspaceBase): ParallelTensor {
+    switch (this.parallelism) {
+      case TensorParallelism.Replicated:
+        return this;
+      case TensorParallelism.PartialSum:
+        return this.allReduce();
+      case TensorParallelism.Row:
+      case TensorParallelism.Column:
+        return this.allGather(workspace);
+    }
+  }
 }
 
 export class ParallelOps implements DeviceOps {
   readonly devices: readonly GlmOps[];
   readonly worldSize: number;
+  readonly comms: number[];
   private readonly shardWorkspaces = new WeakMap<WorkspaceBase, WorkspaceBase[]>();
 
   constructor(devices: GlmOps[]) {
@@ -75,9 +178,32 @@ export class ParallelOps implements DeviceOps {
     }
     this.devices = devices;
     this.worldSize = devices.length;
+    if (devices.length > 1) {
+      const deviceIds = devices.map(d => d.device);
+      this.comms = devices[0].native.ncclCommInitAll(deviceIds);
+    } else {
+      this.comms = [];
+    }
   }
 
-  private getShardWorkspaces(workspace: WorkspaceBase): WorkspaceBase[] {
+  free(): void {
+    if (this.comms.length > 0) {
+      for (const comm of this.comms) {
+        this.devices[0].native.ncclCommDestroy(comm);
+      }
+    }
+  }
+
+  ncclDatatype(type: string): number {
+    switch (type) {
+      case "BF16": return NCCL_BFLOAT16;
+      case "F32": return NCCL_FLOAT32;
+      case "I32": return NCCL_INT32;
+      default: throw new Error(`Unsupported NCCL datatype for type ${type}`);
+    }
+  }
+
+  getShardWorkspaces(workspace: WorkspaceBase): WorkspaceBase[] {
     let wss = this.shardWorkspaces.get(workspace);
     if (wss === undefined) {
       wss = this.devices.map(glm => new WorkspaceBase(glm));
@@ -132,7 +258,7 @@ export class ParallelOps implements DeviceOps {
     const shards: Tensor[] = shardWss.map(ws =>
       pinned ? ws.allocPinned(ss, type) : ws.alloc(ss, type),
     );
-    return new ParallelTensor(workspace, this.devices, par, shards, shape, type, name, pinned);
+    return new ParallelTensor(workspace, this, par, shards, shape, type, name, pinned);
   }
 
   linear(out: Tensor, input: Tensor, weight: Tensor, batch: number, n: number, k: number): void {
