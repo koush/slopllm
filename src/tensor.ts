@@ -8,15 +8,7 @@ function numElements(shape: number[]): number {
 }
 
 export class Tensor implements Disposable {
-  data: number;
-  readonly allocSize: number;
-  readonly shape: number[];
-  readonly type: string;
-  readonly name?: string;
-  workspace!: WorkspaceBase;
-  readonly pinned: boolean;
-
-  constructor(data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean) {
+  constructor(public readonly workspace: WorkspaceBase, public data: number, public readonly allocSize: number, public readonly shape: number[], public readonly type: string, public readonly name: string | undefined, public readonly pinned: boolean) {
     this.data = data;
     this.allocSize = allocSize;
     this.shape = shape;

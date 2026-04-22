@@ -1,9 +1,16 @@
 import type { Tensor } from "./tensor";
+import type { WorkspaceBase } from "./workspace";
+
+export enum TensorParallelism {
+  Replicated = "replicated",
+  Column = "column",
+  Row = "row",
+}
 
 export interface DeviceOps {
   // alloc(size: number): number;
   // allocPinned(bytes: number): number;
-  newTensor(shape: number[], type: string, pinned: boolean, name?: string): Tensor;
+  newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
   freeBuf(ptr: Tensor): void;
   freePinned(ptr: Tensor): void;
   h2d(dst: Tensor, cpuData: Buffer, size?: number): void;

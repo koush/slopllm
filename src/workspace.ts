@@ -1,4 +1,4 @@
-import { DeviceOps } from "./device_ops";
+import { DeviceOps, TensorParallelism } from "./device_ops";
 import { Tensor } from "./tensor";
 
 export class WorkspaceBase {
@@ -18,15 +18,15 @@ export class WorkspaceBase {
     this.frozen = true;
   }
 
-  alloc(shape: number[], type: string, name?: string): Tensor {
-    return this._alloc(shape, type, false, name);
+  alloc(shape: number[], type: string, name?: string, parallelism?: TensorParallelism): Tensor {
+    return this._alloc(shape, type, false, name, parallelism);
   }
 
-  allocPinned(shape: number[], type: string, name?: string): Tensor {
-    return this._alloc(shape, type, true, name);
+  allocPinned(shape: number[], type: string, name?: string, parallelism?: TensorParallelism): Tensor {
+    return this._alloc(shape, type, true, name, parallelism);
   }
 
-  private _alloc(shape: number[], type: string, pinned: boolean, name?: string): Tensor {
+  private _alloc(shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor {
     if (this.frozen) {
       throw new Error("Workspace is frozen");
     }
@@ -34,19 +34,24 @@ export class WorkspaceBase {
     const bytes = Tensor.byteCount(shape, type);
 
     if (name !== undefined) {
-      const tensor = this.glm.newTensor(shape, type, pinned, name);
-      tensor.workspace = this;
+      const tensor = this.glm.newTensor(this, shape, type, pinned, name, parallelism);
       const existing = this.tensors.get(name);
       if (existing !== undefined) {
-        this.disposed.add(existing);
+        existing[Symbol.dispose]();
       }
       this.tensors.set(name, tensor);
       return tensor;
     }
 
+    if (parallelism !== undefined) {
+      const tensor = this.glm.newTensor(this, shape, type, pinned, undefined, parallelism);
+      this.tracked.add(tensor);
+      return tensor;
+    }
+
     let best: Tensor | undefined;
     for (const t of this.disposed) {
-      if (t.pinned === pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
+      if (t.pinned === pinned && t.data !== 0 && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
         best = t;
       }
     }
@@ -54,14 +59,13 @@ export class WorkspaceBase {
       this.disposed.delete(best);
       const data = best.data;
       (best as { data: number }).data = 0;
-      const tensor = new Tensor(data, best.allocSize, shape, type, undefined, pinned);
-      tensor.workspace = this;
+      const tensor = new Tensor(this, data, best.allocSize, shape, type, undefined, pinned);
       this.tracked.add(tensor);
       return tensor;
     }
 
-    const tensor = this.glm.newTensor(shape, type, pinned, undefined);
-    tensor.workspace = this;
+    const tensor = this.glm.newTensor(this, shape, type, pinned, undefined);
+
     this.tracked.add(tensor);
     return tensor;
   }
@@ -88,14 +92,14 @@ export class WorkspaceBase {
   startTracking(): Disposable & { [Symbol.dispose](): void } {
     if (this.tracking !== null) throw new Error("startTracking already active");
     for (const tensor of this.exported) {
-      this.disposed.add(tensor);
+      tensor[Symbol.dispose]();
     }
     this.exported.clear();
     const ws = this;
     const tracker: Disposable & { [Symbol.dispose](): void } = {
       [Symbol.dispose]() {
         for (const tensor of ws.tracked) {
-          ws.disposed.add(tensor);
+          tensor[Symbol.dispose]();
         }
         ws.tracked.clear();
         ws.tracking = null;

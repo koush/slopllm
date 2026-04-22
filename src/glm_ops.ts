@@ -1,8 +1,8 @@
-import path from "node:path";
 import fs from "node:fs";
-import { WorkspaceBase } from "./workspace";
+import path from "node:path";
+import { TensorParallelism } from "./device_ops";
 import { Tensor } from "./tensor";
-import { DECODE_PLAN_INFO_SIZE, PREFILL_PLAN_INFO_SIZE } from "./paged_kv";
+import type { WorkspaceBase } from "./workspace";
 
 function findProjectRoot(dir: string): string {
   let d = dir;
@@ -125,10 +125,10 @@ export class GlmOps {
     return p;
   }
 
-  newTensor(shape: number[], type: string, pinned: boolean, name?: string): Tensor {
+  newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, _parallelism?: TensorParallelism): Tensor {
     const size = Tensor.byteCount(shape, type);
     const data = pinned ? this.allocPinned(size) : this.alloc(size);
-    return new Tensor(data, size, shape, type, name, pinned);
+    return new Tensor(workspace, data, size, shape, type, name, pinned);
   }
 
   freeBuf(ptr: Tensor): void {

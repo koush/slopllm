@@ -19,6 +19,7 @@
     "test:batch": "node --test dist/tests/test_batch.js",
     "test:fp8": "node --test dist/tests/test_fp8.js",
     "test:nccl": "node --test dist/tests/test_nccl.js",
+    "test:parallel": "node --test dist/tests/test_parallel.js",
     "test": "npm run test:python && npm run test:node && npm run test:batch"
   },
   "keywords": [],
