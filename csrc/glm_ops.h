@@ -151,9 +151,19 @@ void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,
 // Write NCCL unique ID (128 bytes) to out_id (host memory)
 void glm_nccl_unique_id(void* out_id);
 
+// Group start/end: fuse multiple NCCL operations across devices
+int glm_nccl_group_start();
+int glm_nccl_group_end();
+
 // Initialize NCCL communicator for a given rank
 // Returns opaque ncclComm_t pointer (0 on failure)
-void* glm_nccl_comm_init_rank(int rank, int world_size, const void* unique_id);
+void* glm_nccl_comm_init_rank(int device_id, int rank, int world_size, const void* unique_id);
+
+// Initialize NCCL communicators for all devices in a single process
+// comms: output array of ndev void* pointers (caller-allocated)
+// devlist: array of ndev device IDs
+// Returns 0 on success, -1 on failure
+int glm_nccl_comm_init_all(void** comms, int ndev, const int* devlist);
 
 // Destroy NCCL communicator
 void glm_nccl_comm_destroy(void* comm);

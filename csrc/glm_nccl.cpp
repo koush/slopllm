@@ -9,9 +9,27 @@ void glm_nccl_unique_id(void* out_id) {
     }
 }
 
-void* glm_nccl_comm_init_rank(int rank, int world_size, const void* unique_id) {
+int glm_nccl_group_start() {
+    ncclResult_t result = ncclGroupStart();
+    if (result != ncclSuccess) {
+        fprintf(stderr, "glm_nccl_group_start failed: %s\n", ncclGetErrorString(result));
+        return -1;
+    }
+    return 0;
+}
+
+int glm_nccl_group_end() {
+    ncclResult_t result = ncclGroupEnd();
+    if (result != ncclSuccess) {
+        fprintf(stderr, "glm_nccl_group_end failed: %s\n", ncclGetErrorString(result));
+        return -1;
+    }
+    return 0;
+}
+
+void* glm_nccl_comm_init_rank(int device_id, int rank, int world_size, const void* unique_id) {
     ncclComm_t comm = nullptr;
-    cudaSetDevice(0); // caller should have set device via GlmCtx
+    cudaSetDevice(device_id);
     ncclResult_t result = ncclCommInitRank(&comm, world_size,
                          *static_cast<const ncclUniqueId*>(unique_id), rank);
     if (result != ncclSuccess) {
@@ -19,6 +37,15 @@ void* glm_nccl_comm_init_rank(int rank, int world_size, const void* unique_id) {
         return nullptr;
     }
     return static_cast<void*>(comm);
+}
+
+int glm_nccl_comm_init_all(void** comms, int ndev, const int* devlist) {
+    ncclResult_t result = ncclCommInitAll(reinterpret_cast<ncclComm_t*>(comms), ndev, devlist);
+    if (result != ncclSuccess) {
+        fprintf(stderr, "glm_nccl_comm_init_all failed: %s\n", ncclGetErrorString(result));
+        return -1;
+    }
+    return 0;
 }
 
 void glm_nccl_comm_destroy(void* comm) {

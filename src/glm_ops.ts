@@ -88,7 +88,10 @@ interface NativeAddon {
   sampleBatch(ctx: number, outTokens: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, penaltyOffsets: number, vocabSize: number, batchSize: number, temperatures: number, repPenalties: number, presPenalties: number, topKs: number, topPs: number, randomVals: number, maxEffectiveK: number): void;
   memcpy2d(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void;
   ncclUniqueId(outId: Buffer): void;
-  ncclCommInitRank(rank: number, worldSize: number, uniqueId: number): number;
+  ncclGroupStart(): void;
+  ncclGroupEnd(): void;
+  ncclCommInitRank(deviceId: number, rank: number, worldSize: number, uniqueId: number): number;
+  ncclCommInitAll(deviceIds: number[]): number[];
   ncclCommDestroy(comm: number): void;
   ncclAllReduce(comm: number, ctx: number, sendbuff: number, recvbuff: number, count: number, datatype: number, op: number): void;
   ncclAllGather(comm: number, ctx: number, sendbuff: number, recvbuff: number, count: number, datatype: number): void;

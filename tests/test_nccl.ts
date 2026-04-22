@@ -21,7 +21,6 @@ describe("memcpy2d", () => {
   let ws: WorkspaceBase;
 
   before(() => {
-    process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
     glm = new GlmOps(0);
     ws = new WorkspaceBase(glm);
   });
@@ -154,7 +153,6 @@ describe("NCCL single-rank", () => {
   let ws: WorkspaceBase;
 
   before(() => {
-    process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
     glm = new GlmOps(0);
     ws = new WorkspaceBase(glm);
   });
@@ -178,7 +176,7 @@ describe("NCCL single-rank", () => {
     const idTensor = new Tensor(ws, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
     glm.writePinned(idTensor, idBuf);
 
-    const comm = glm.native.ncclCommInitRank(0, 1, idPtr);
+    const comm = glm.native.ncclCommInitRank(0, 0, 1, idPtr);
     assert.ok(comm !== 0, "comm should not be null");
 
     glm.native.ncclCommDestroy(comm);
@@ -192,7 +190,7 @@ describe("NCCL single-rank", () => {
     const idTensor = new Tensor(ws, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
     glm.writePinned(idTensor, idBuf);
 
-    const comm = glm.native.ncclCommInitRank(0, 1, idPtr);
+    const comm = glm.native.ncclCommInitRank(0, 0, 1, idPtr);
 
     const count = 16;
     const bytes = count * 2;
@@ -229,7 +227,7 @@ describe("NCCL single-rank", () => {
     const idTensor = new Tensor(ws, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
     glm.writePinned(idTensor, idBuf);
 
-    const comm = glm.native.ncclCommInitRank(0, 1, idPtr);
+    const comm = glm.native.ncclCommInitRank(0, 0, 1, idPtr);
 
     const count = 16;
     const bytes = count * 4;
@@ -266,7 +264,7 @@ describe("NCCL single-rank", () => {
     const idTensor = new Tensor(ws, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true);
     glm.writePinned(idTensor, idBuf);
 
-    const comm = glm.native.ncclCommInitRank(0, 1, idPtr);
+    const comm = glm.native.ncclCommInitRank(0, 0, 1, idPtr);
 
     const count = 16;
     const bytes = count * 2;

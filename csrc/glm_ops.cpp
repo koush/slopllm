@@ -1441,16 +1441,35 @@ static Napi::Value NcclUniqueId(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value NcclGroupStart(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    int result = glm_nccl_group_start();
+    if (result != 0) {
+        Napi::Error::New(env, "ncclGroupStart failed").ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value NcclGroupEnd(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    int result = glm_nccl_group_end();
+    if (result != 0) {
+        Napi::Error::New(env, "ncclGroupEnd failed").ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value NcclCommInitRank(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 3) {
-        Napi::TypeError::New(env, "Expected (rank, worldSize, uniqueId)").ThrowAsJavaScriptException();
+    if (info.Length() < 4) {
+        Napi::TypeError::New(env, "Expected (deviceId, rank, worldSize, uniqueId)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    int rank = info[0].As<Napi::Number>().Int32Value();
-    int world_size = info[1].As<Napi::Number>().Int32Value();
-    uintptr_t unique_id_ptr = info[2].As<Napi::Number>().Int64Value();
-    void* comm = glm_nccl_comm_init_rank(rank, world_size,
+    int device_id = info[0].As<Napi::Number>().Int32Value();
+    int rank = info[1].As<Napi::Number>().Int32Value();
+    int world_size = info[2].As<Napi::Number>().Int32Value();
+    uintptr_t unique_id_ptr = info[3].As<Napi::Number>().Int64Value();
+    void* comm = glm_nccl_comm_init_rank(device_id, rank, world_size,
                    reinterpret_cast<const void*>(unique_id_ptr));
     return Napi::Number::New(env, reinterpret_cast<uintptr_t>(comm));
 }
@@ -1464,6 +1483,31 @@ static Napi::Value NcclCommDestroy(const Napi::CallbackInfo& info) {
     uintptr_t comm_ptr = info[0].As<Napi::Number>().Int64Value();
     glm_nccl_comm_destroy(reinterpret_cast<void*>(comm_ptr));
     return env.Undefined();
+}
+
+static Napi::Value NcclCommInitAll(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsArray()) {
+        Napi::TypeError::New(env, "Expected (deviceIds: number[])").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Array devArr = info[0].As<Napi::Array>();
+    int ndev = devArr.Length();
+    std::vector<int> devlist(ndev);
+    for (int i = 0; i < ndev; i++) {
+        devlist[i] = devArr.Get(i).As<Napi::Number>().Int32Value();
+    }
+    std::vector<void*> comms(ndev, nullptr);
+    int result = glm_nccl_comm_init_all(comms.data(), ndev, devlist.data());
+    if (result != 0) {
+        Napi::Error::New(env, "ncclCommInitAll failed").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Array resultArr = Napi::Array::New(env, ndev);
+    for (int i = 0; i < ndev; i++) {
+        resultArr.Set(i, Napi::Number::New(env, reinterpret_cast<uintptr_t>(comms[i])));
+    }
+    return resultArr;
 }
 
 static Napi::Value NcclAllReduce(const Napi::CallbackInfo& info) {
@@ -1578,7 +1622,10 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
     exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));
     exports.Set(Napi::String::New(env, "ncclUniqueId"), Napi::Function::New(env, NcclUniqueId));
+    exports.Set(Napi::String::New(env, "ncclGroupStart"), Napi::Function::New(env, NcclGroupStart));
+    exports.Set(Napi::String::New(env, "ncclGroupEnd"), Napi::Function::New(env, NcclGroupEnd));
     exports.Set(Napi::String::New(env, "ncclCommInitRank"), Napi::Function::New(env, NcclCommInitRank));
+    exports.Set(Napi::String::New(env, "ncclCommInitAll"), Napi::Function::New(env, NcclCommInitAll));
     exports.Set(Napi::String::New(env, "ncclCommDestroy"), Napi::Function::New(env, NcclCommDestroy));
     exports.Set(Napi::String::New(env, "ncclAllReduce"), Napi::Function::New(env, NcclAllReduce));
     exports.Set(Napi::String::New(env, "ncclAllGather"), Napi::Function::New(env, NcclAllGather));
