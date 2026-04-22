@@ -43,12 +43,6 @@ export class WorkspaceBase {
       return tensor;
     }
 
-    if (parallelism !== undefined) {
-      const tensor = this.glm.newTensor(this, shape, type, pinned, undefined, parallelism);
-      this.tracked.add(tensor);
-      return tensor;
-    }
-
     let best: Tensor | undefined;
     for (const t of this.disposed) {
       if (t.pinned === pinned && t.data !== 0 && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
