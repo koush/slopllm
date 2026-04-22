@@ -119,6 +119,18 @@ export class GlmOps {
     return p;
   }
 
+  allocPinned(bytes: number): number {
+    const p = this.native.allocPinned(bytes);
+    if (!p) throw new Error(`allocPinned failed for size ${bytes}`);
+    return p;
+  }
+
+  newTensor(shape: number[], type: string, pinned: boolean, name?: string): Tensor {
+    const size = Tensor.byteCount(shape, type);
+    const data = pinned ? this.allocPinned(size) : this.alloc(size);
+    return new Tensor(data, size, shape, type, name, pinned);
+  }
+
   freeBuf(ptr: Tensor): void {
     this.native.freeBuf(this.ctx, ptr.data);
   }
@@ -233,12 +245,6 @@ export class GlmOps {
 
   flashDecode(q: Tensor, k: Tensor, v: Tensor, o: Tensor, tmp: Tensor, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, smScale: number): void {
     this.native.flashDecode(this.ctx, ptr(q), ptr(k), ptr(v), ptr(o), ptr(tmp), kvLen, numQoHeads, numKvHeads, headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, smScale);
-  }
-
-  allocPinned(bytes: number): number {
-    const p = this.native.allocPinned(bytes);
-    if (!p) throw new Error(`allocPinned failed for size ${bytes}`);
-    return p;
   }
 
   freePinned(ptr: Tensor): void {

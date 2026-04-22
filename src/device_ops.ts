@@ -1,8 +1,9 @@
 import type { Tensor } from "./tensor";
 
 export interface DeviceOps {
-  alloc(size: number): number;
-  allocPinned(bytes: number): number;
+  // alloc(size: number): number;
+  // allocPinned(bytes: number): number;
+  newTensor(shape: number[], type: string, pinned: boolean, name?: string): Tensor;
   freeBuf(ptr: Tensor): void;
   freePinned(ptr: Tensor): void;
   h2d(dst: Tensor, cpuData: Buffer, size?: number): void;

@@ -13,11 +13,10 @@ export class Tensor implements Disposable {
   readonly shape: number[];
   readonly type: string;
   readonly name?: string;
-  private readonly workspace: WorkspaceBase;
+  workspace!: WorkspaceBase;
   readonly pinned: boolean;
 
-  constructor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean) {
-    this.workspace = workspace;
+  constructor(data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean) {
     this.data = data;
     this.allocSize = allocSize;
     this.shape = shape;

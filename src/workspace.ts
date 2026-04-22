@@ -34,8 +34,8 @@ export class WorkspaceBase {
     const bytes = Tensor.byteCount(shape, type);
 
     if (name !== undefined) {
-      const data = pinned ? this.glm.allocPinned(bytes) : this.glm.alloc(bytes);
-      const tensor = new Tensor(this, data, bytes, shape, type, name, pinned);
+      const tensor = this.glm.newTensor(shape, type, pinned, name);
+      tensor.workspace = this;
       const existing = this.tensors.get(name);
       if (existing !== undefined) {
         this.disposed.add(existing);
@@ -54,13 +54,14 @@ export class WorkspaceBase {
       this.disposed.delete(best);
       const data = best.data;
       (best as { data: number }).data = 0;
-      const tensor = new Tensor(this, data, best.allocSize, shape, type, undefined, pinned);
+      const tensor = new Tensor(data, best.allocSize, shape, type, undefined, pinned);
+      tensor.workspace = this;
       this.tracked.add(tensor);
       return tensor;
     }
 
-    const data = pinned ? this.glm.allocPinned(bytes) : this.glm.alloc(bytes);
-    const tensor = new Tensor(this, data, bytes, shape, type, undefined, pinned);
+    const tensor = this.glm.newTensor(shape, type, pinned, undefined);
+    tensor.workspace = this;
     this.tracked.add(tensor);
     return tensor;
   }
