@@ -13,6 +13,10 @@ function findProjectRoot(dir: string): string {
   return dir;
 }
 
+function ptr(t: Tensor): number {
+  return t.data;
+}
+
 interface NativeAddon {
   init(deviceId: number): number;
   free(ctx: number): void;
@@ -28,7 +32,6 @@ interface NativeAddon {
   embedding(ctx: number, out: number, table: number, ids: number, hidden: number, seqLen: number): void;
   layernorm(ctx: number, out: number, input: number, weight: number, bias: number, eps: number, dim: number, batch: number): void;
   relu(ctx: number, out: number, input: number, n: number): void;
-  // currently unused as Tensor method
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   softmax(ctx: number, out: number, input: number, mask: number, dim: number, batch: number): void;
   causalMask(ctx: number, out: number, seqLen: number): void;
@@ -39,24 +42,18 @@ interface NativeAddon {
   maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
-  // currently unused as Tensor method
   applyRotaryPosEmb(ctx: number, out: number, x: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
-  // currently unused as Tensor method
   applyRotaryPosEmbPartial(ctx: number, out: number, x: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
   bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transB: number): void;
   scale(ctx: number, out: number, input: number, s: number, n: number): void;
-  // currently unused as Tensor method
   add(ctx: number, out: number, a: number, b: number, n: number): void;
   expandDim1(ctx: number, out: number, input: number, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number): void;
   expandDim1Strided(ctx: number, out: number, input: number, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number, headStride: number): void;
-  // currently unused as Tensor method
   transpose4d(ctx: number, out: number, input: number, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): void;
-  // currently unused as Tensor method
   mul(ctx: number, out: number, a: number, b: number, n: number): void;
   reduceSum(ctx: number, out: number, input: number, rows: number, cols: number): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number): void;
-  // currently unused as Tensor method
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   argmax(ctx: number, outIndex: number, input: number, dim: number, batch: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number): void;
@@ -117,170 +114,165 @@ export class GlmOps {
   }
 
   alloc(size: number): number {
-    const ptr = this.native.alloc(this.ctx, size);
-    if (!ptr) throw new Error(`glm_alloc failed for size ${size}`);
-    return ptr;
+    const p = this.native.alloc(this.ctx, size);
+    if (!p) throw new Error(`glm_alloc failed for size ${size}`);
+    return p;
   }
 
-  freeBuf(ptr: number): void {
-    this.native.freeBuf(this.ctx, ptr);
+  freeBuf(ptr: Tensor): void {
+    this.native.freeBuf(this.ctx, ptr.data);
   }
 
-  h2d(gpuPtr: number, cpuData: Buffer, size?: number): void {
-    this.native.h2d(this.ctx, gpuPtr, cpuData, size ?? cpuData.length);
+  h2d(dst: Tensor, cpuData: Buffer, size?: number): void {
+    this.native.h2d(this.ctx, dst.data, cpuData, size ?? cpuData.length);
   }
 
-  d2h(cpuBuf: Buffer, gpuPtr: number, size?: number): void {
-    this.native.d2h(this.ctx, cpuBuf, gpuPtr, size ?? cpuBuf.length);
+  d2h(cpuBuf: Buffer, src: Tensor, size?: number): void {
+    this.native.d2h(this.ctx, cpuBuf, src.data, size ?? cpuBuf.length);
   }
 
   synchronize(): void {
     this.native.synchronize(this.ctx);
   }
 
-  rmsnorm(out: number, input: number, weight: number, eps: number, dim: number, batch: number): void {
-    this.native.rmsnorm(this.ctx, out, input, weight, eps, dim, batch);
+  rmsnorm(out: Tensor, input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
+    this.native.rmsnorm(this.ctx, ptr(out), ptr(input), ptr(weight), eps, dim, batch);
   }
 
-  fusedAddRmsnorm(out: number, residual: number, inputA: number, inputB: number, weight: number, eps: number, dim: number, batch: number): void {
-    this.native.fusedAddRmsnorm(this.ctx, out, residual, inputA, inputB, weight, eps, dim, batch);
+  fusedAddRmsnorm(out: Tensor, residual: Tensor, inputA: Tensor, inputB: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
+    this.native.fusedAddRmsnorm(this.ctx, ptr(out), ptr(residual), ptr(inputA), ptr(inputB), ptr(weight), eps, dim, batch);
   }
 
-  fusedNormRope(out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void {
-    this.native.fusedNormRope(this.ctx, out, input, weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+  fusedNormRope(out: Tensor, input: Tensor, weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void {
+    this.native.fusedNormRope(this.ctx, ptr(out), ptr(input), ptr(weight), ptr(cos), ptr(sin), eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
   }
 
-  siluAndMul(out: number, gate: number, up: number, intermediate: number, batch: number): void {
-    this.native.siluAndMul(this.ctx, out, gate, up, intermediate, batch);
+  siluAndMul(out: Tensor, gate: Tensor, up: Tensor, intermediate: number, batch: number): void {
+    this.native.siluAndMul(this.ctx, ptr(out), ptr(gate), ptr(up), intermediate, batch);
   }
 
-  linear(out: number, input: number, weight: number, batch: number, n: number, k: number): void {
-    this.native.linear(this.ctx, out, input, weight, batch, n, k);
+  linear(out: Tensor, input: Tensor, weight: Tensor, batch: number, n: number, k: number): void {
+    this.native.linear(this.ctx, ptr(out), ptr(input), ptr(weight), batch, n, k);
   }
 
-  embedding(out: number, table: number, ids: number, hidden: number, seqLen: number): void {
-    this.native.embedding(this.ctx, out, table, ids, hidden, seqLen);
+  embedding(out: Tensor, table: Tensor, ids: Tensor, hidden: number, seqLen: number): void {
+    this.native.embedding(this.ctx, ptr(out), ptr(table), ptr(ids), hidden, seqLen);
   }
 
-  layernorm(out: number, input: number, weight: number, bias: number, eps: number, dim: number, batch: number): void {
-    this.native.layernorm(this.ctx, out, input, weight, bias, eps, dim, batch);
+  layernorm(out: Tensor, input: Tensor, weight: Tensor, bias: Tensor, eps: number, dim: number, batch: number): void {
+    this.native.layernorm(this.ctx, ptr(out), ptr(input), ptr(weight), ptr(bias), eps, dim, batch);
   }
 
-  softmax(out: number, input: number, mask: number, dim: number, batch: number): void {
-    this.native.softmax(this.ctx, out, input, mask, dim, batch);
+  softmax(out: Tensor, input: Tensor, mask: Tensor, dim: number, batch: number): void {
+    this.native.softmax(this.ctx, ptr(out), ptr(input), ptr(mask), dim, batch);
   }
 
-  causalMask(out: number, seqLen: number): void {
-    this.native.causalMask(this.ctx, out, seqLen);
+  causalMask(out: Tensor, seqLen: number): void {
+    this.native.causalMask(this.ctx, ptr(out), seqLen);
   }
 
-  fill(out: number, value: number, n: number): void {
-    this.native.fill(this.ctx, out, value, n);
+  fill(out: Tensor, value: number, n: number): void {
+    this.native.fill(this.ctx, ptr(out), value, n);
   }
 
-  // currently unused as Tensor method
-  add(out: number, a: number, b: number, n: number): void {
-    this.native.add(this.ctx, out, a, b, n);
+  add(out: Tensor, a: Tensor, b: Tensor, n: number): void {
+    this.native.add(this.ctx, ptr(out), ptr(a), ptr(b), n);
   }
 
-  // currently unused as Tensor method
-  arange(out: number, start: number, step: number, count: number): void {
-    this.native.arange(this.ctx, out, start, step, count);
+  arange(out: Tensor, start: number, step: number, count: number): void {
+    this.native.arange(this.ctx, ptr(out), start, step, count);
   }
 
-  argmax(outIndex: number, input: number, dim: number, batch: number = 1): void {
-    this.native.argmax(this.ctx, outIndex, input, dim, batch);
+  argmax(outIndex: Tensor, input: Tensor, dim: number, batch: number = 1): void {
+    this.native.argmax(this.ctx, ptr(outIndex), ptr(input), dim, batch);
   }
 
   memcpy(dst: number, src: number, bytes: number): void {
     this.native.memcpy(this.ctx, dst, src, bytes);
   }
 
-  kvCacheWrite(srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void {
-    this.native.kvCacheWrite(this.ctx, srcK, srcV, dstK, dstV, slotMapping, batchSize, nKv, hd, pageSize, srcKTokenStride, srcKHeadStride, srcVTokenStride, srcVHeadStride);
+  kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void {
+    this.native.kvCacheWrite(this.ctx, ptr(srcK), ptr(srcV), ptr(dstK), ptr(dstV), ptr(slotMapping), batchSize, nKv, hd, pageSize, srcKTokenStride, srcKHeadStride, srcVTokenStride, srcVHeadStride);
   }
 
-  rotaryEmbedding(cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void {
-    this.native.rotaryEmbedding(this.ctx, cosOut, sinOut, invFreq, positionIds, dimHalf, batch, seqLen);
+  rotaryEmbedding(cosOut: Tensor, sinOut: Tensor, invFreq: Tensor, positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): void {
+    this.native.rotaryEmbedding(this.ctx, ptr(cosOut), ptr(sinOut), ptr(invFreq), ptr(positionIds), dimHalf, batch, seqLen);
   }
 
-  // currently unused as Tensor method
-  applyRotaryPosEmb(out: number, x: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
-    this.native.applyRotaryPosEmb(this.ctx, out, x, cos, sin, ropeDim, nHeads, seqLen, batch, unsqueezeDim);
+  applyRotaryPosEmb(out: Tensor, x: Tensor, cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
+    this.native.applyRotaryPosEmb(this.ctx, ptr(out), ptr(x), ptr(cos), ptr(sin), ropeDim, nHeads, seqLen, batch, unsqueezeDim);
   }
 
-  // currently unused as Tensor method
-  applyRotaryPosEmbPartial(out: number, x: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
-    this.native.applyRotaryPosEmbPartial(this.ctx, out, x, cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim);
+  applyRotaryPosEmbPartial(out: Tensor, x: Tensor, cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
+    this.native.applyRotaryPosEmbPartial(this.ctx, ptr(out), ptr(x), ptr(cos), ptr(sin), ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim);
   }
 
-  expandDim1(out: number, input: number, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number): void {
-    this.native.expandDim1(this.ctx, out, input, dim1Out, dim1In, seqLen, headDim, batch);
+  expandDim1(out: Tensor, input: Tensor, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number): void {
+    this.native.expandDim1(this.ctx, ptr(out), ptr(input), dim1Out, dim1In, seqLen, headDim, batch);
   }
 
-  expandDim1Strided(out: number, input: number, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number, headStride: number): void {
-    this.native.expandDim1Strided(this.ctx, out, input, dim1Out, dim1In, seqLen, headDim, batch, headStride);
+  expandDim1Strided(out: Tensor, input: Tensor, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number, headStride: number): void {
+    this.native.expandDim1Strided(this.ctx, ptr(out), ptr(input), dim1Out, dim1In, seqLen, headDim, batch, headStride);
   }
 
-  indexSelect(out: number, src: number, indices: number, dim: number, k: number): void {
-    this.native.indexSelect(this.ctx, out, src, indices, dim, k);
+  indexSelect(out: Tensor, src: Tensor, indices: Tensor, dim: number, k: number): void {
+    this.native.indexSelect(this.ctx, ptr(out), ptr(src), ptr(indices), dim, k);
   }
 
-  // currently unused as Tensor method
-  transpose4d(out: number, input: number, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): void {
-    this.native.transpose4d(this.ctx, out, input, d0, d1, d2, d3, p0, p1, p2, p3);
+  transpose4d(out: Tensor, input: Tensor, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): void {
+    this.native.transpose4d(this.ctx, ptr(out), ptr(input), d0, d1, d2, d3, p0, p1, p2, p3);
   }
 
-  bmm(C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transB: number): void {
-    this.native.bmm(this.ctx, C, A, B, alpha, beta, batch, M, N, K, transB);
+  bmm(C: Tensor, A: Tensor, B: Tensor, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transB: number): void {
+    this.native.bmm(this.ctx, ptr(C), ptr(A), ptr(B), alpha, beta, batch, M, N, K, transB);
   }
 
-  flashPrefill(q: number, k: number, v: number, o: number, tmp: number, qoLen: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: number, kvLayout: number, smScale: number): void {
-    this.native.flashPrefill(this.ctx, q, k, v, o, tmp, qoLen, kvLen, numQoHeads, numKvHeads, headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, vStrideN, vStrideH, maskMode, kvLayout, smScale);
+  flashPrefill(q: Tensor, k: Tensor, v: Tensor, o: Tensor, tmp: Tensor, qoLen: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: number, kvLayout: number, smScale: number): void {
+    this.native.flashPrefill(this.ctx, ptr(q), ptr(k), ptr(v), ptr(o), ptr(tmp), qoLen, kvLen, numQoHeads, numKvHeads, headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, vStrideN, vStrideH, maskMode, kvLayout, smScale);
   }
 
-  flashDecode(q: number, k: number, v: number, o: number, tmp: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, smScale: number): void {
-    this.native.flashDecode(this.ctx, q, k, v, o, tmp, kvLen, numQoHeads, numKvHeads, headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, smScale);
+  flashDecode(q: Tensor, k: Tensor, v: Tensor, o: Tensor, tmp: Tensor, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, smScale: number): void {
+    this.native.flashDecode(this.ctx, ptr(q), ptr(k), ptr(v), ptr(o), ptr(tmp), kvLen, numQoHeads, numKvHeads, headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, smScale);
   }
 
   allocPinned(bytes: number): number {
-    const ptr = this.native.allocPinned(bytes);
-    if (!ptr) throw new Error(`allocPinned failed for size ${bytes}`);
-    return ptr;
+    const p = this.native.allocPinned(bytes);
+    if (!p) throw new Error(`allocPinned failed for size ${bytes}`);
+    return p;
   }
 
-  freePinned(ptr: number): void {
-    this.native.freePinned(ptr);
+  freePinned(ptr: Tensor): void {
+    this.native.freePinned(ptr.data);
   }
 
-  writePinned(dst: number, src: Buffer, size?: number): void {
-    this.native.writePinned(dst, src, size ?? src.length);
+  writePinned(dst: Tensor, src: Buffer, size?: number): void {
+    this.native.writePinned(dst.data, src, size ?? src.length);
   }
 
-  batchDecodePlan(floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, indptrH: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, enableCudaGraph: boolean): void {
-    this.native.batchDecodePlan(this.ctx, floatWs, floatWsSize, intWs, pinnedIntWs, intWsSize, planInfo, indptrH, batchSize, numQoHeads, numKvHeads, headDim, pageSize, enableCudaGraph);
+  batchDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, enableCudaGraph: boolean): void {
+    this.native.batchDecodePlan(this.ctx, ptr(floatWs), floatWsSize, ptr(intWs), ptr(pinnedIntWs), intWsSize, ptr(planInfo), ptr(indptrH), batchSize, numQoHeads, numKvHeads, headDim, pageSize, enableCudaGraph);
   }
 
-  batchDecodeRun(q: number, o: number, kData: number, vData: number, indices: number, indptrD: number, lastPageLen: number, floatWs: number, intWs: number, planInfo: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, smScale: number): void {
-    this.native.batchDecodeRun(this.ctx, q, o, kData, vData, indices, indptrD, lastPageLen, floatWs, intWs, planInfo, batchSize, numQoHeads, numKvHeads, headDim, pageSize, smScale);
+  batchDecodeRun(q: Tensor, o: Tensor, kData: Tensor, vData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, smScale: number): void {
+    this.native.batchDecodeRun(this.ctx, ptr(q), ptr(o), ptr(kData), ptr(vData), ptr(indices), ptr(indptrD), ptr(lastPageLen), ptr(floatWs), ptr(intWs), ptr(planInfo), batchSize, numQoHeads, numKvHeads, headDim, pageSize, smScale);
   }
 
-  batchPrefillPagedPlan(floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, qoIndptrH: number, pagedKvIndptrH: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, maskMode: number): void {
-    this.native.batchPrefillPagedPlan(this.ctx, floatWs, floatWsSize, intWs, pinnedIntWs, intWsSize, planInfo, qoIndptrH, pagedKvIndptrH, totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, pageSize, maskMode);
+  batchPrefillPagedPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, pagedKvIndptrH: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, maskMode: number): void {
+    this.native.batchPrefillPagedPlan(this.ctx, ptr(floatWs), floatWsSize, ptr(intWs), ptr(pinnedIntWs), intWsSize, ptr(planInfo), ptr(qoIndptrH), ptr(pagedKvIndptrH), totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, pageSize, maskMode);
   }
 
-  batchPrefillPagedRun(q: number, o: number, kData: number, vData: number, indices: number, indptrD: number, lastPageLen: number, floatWs: number, intWs: number, qIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): void {
-    this.native.batchPrefillPagedRun(this.ctx, q, o, kData, vData, indices, indptrD, lastPageLen, floatWs, intWs, qIndptrD, planInfo, totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, pageSize, qStrideN, qStrideH, maskMode, smScale);
+  batchPrefillPagedRun(q: Tensor, o: Tensor, kData: Tensor, vData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, qIndptrD: Tensor, planInfo: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): void {
+    this.native.batchPrefillPagedRun(this.ctx, ptr(q), ptr(o), ptr(kData), ptr(vData), ptr(indices), ptr(indptrD), ptr(lastPageLen), ptr(floatWs), ptr(intWs), ptr(qIndptrD), ptr(planInfo), totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, pageSize, qStrideN, qStrideH, maskMode, smScale);
   }
 
   mmapOpen(filePath: string): number {
-    const ptr = this.native.mmapOpen(filePath);
-    if (!ptr) throw new Error(`glm_mmap_open failed for ${filePath}`);
-    return ptr;
+    const p = this.native.mmapOpen(filePath);
+    if (!p) throw new Error(`glm_mmap_open failed for ${filePath}`);
+    return p;
   }
 
-  mmapLoad(gpuDst: number, mmapPtr: number, offset: number, nbytes: number): void {
-    this.native.mmapLoad(this.ctx, gpuDst, mmapPtr, offset, nbytes);
+  mmapLoad(gpuDst: Tensor, mmapPtr: number, offset: number, nbytes: number): void {
+    this.native.mmapLoad(this.ctx, ptr(gpuDst), mmapPtr, offset, nbytes);
   }
 
   mmapClose(mmapPtr: number, size: number): void {
@@ -315,46 +307,44 @@ export class GlmOps {
     this.native.graphExecDestroy(graphExec);
   }
 
-  fp8LinearDecode(bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, m: number, n: number, k: number): void {
-    this.native.fp8LinearDecode(this.ctx, bf16Out, bf16Input, fp8Weight, weightScale, m, n, k);
+  fp8LinearDecode(bf16Out: Tensor, bf16Input: Tensor, fp8Weight: Tensor, weightScale: Tensor, m: number, n: number, k: number): void {
+    this.native.fp8LinearDecode(this.ctx, ptr(bf16Out), ptr(bf16Input), ptr(fp8Weight), ptr(weightScale), m, n, k);
   }
 
-  gdnRecurrentStep(output: number, state: number, qkv: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    this.native.gdnRecurrentStep(this.ctx, output, state, qkv, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
+  gdnRecurrentStep(output: Tensor, state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    this.native.gdnRecurrentStep(this.ctx, ptr(output), ptr(state), ptr(qkv), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
-  gdnPrefill(output: number, state: number, qkv: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, cuSeqlens: number, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    this.native.gdnPrefill(this.ctx, output, state, qkv, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
+  gdnPrefill(output: Tensor, state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    this.native.gdnPrefill(this.ctx, ptr(output), ptr(state), ptr(qkv), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), ptr(cuSeqlens), totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
-  causalConv1d(output: number, convState: number, input: number, weight: number, cuSeqlens: number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
-    this.native.causalConv1d(this.ctx, output, convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
+  causalConv1d(output: Tensor, convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
+    this.native.causalConv1d(this.ctx, ptr(output), ptr(convState), ptr(input), ptr(weight), ptr(cuSeqlens), convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
   }
 
-  causalConv1dUpdate(output: number, convState: number, input: number, weight: number, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): void {
-    this.native.causalConv1dUpdate(this.ctx, output, convState, input, weight, convDim, kernelSize, batchSize, convStateStride);
+  causalConv1dUpdate(output: Tensor, convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): void {
+    this.native.causalConv1dUpdate(this.ctx, ptr(output), ptr(convState), ptr(input), ptr(weight), convDim, kernelSize, batchSize, convStateStride);
   }
 
-  rmsnormGated(output: number, input: number, gate: number, weight: number, eps: number, dim: number, batch: number): void {
-    this.native.rmsnormGated(this.ctx, output, input, gate, weight, eps, dim, batch);
+  rmsnormGated(output: Tensor, input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
+    this.native.rmsnormGated(this.ctx, ptr(output), ptr(input), ptr(gate), ptr(weight), eps, dim, batch);
   }
 
-  // currently unused as Tensor method
-  sigmoid(out: number, input: number, n: number): void {
-    this.native.sigmoid(this.ctx, out, input, n);
+  sigmoid(out: Tensor, input: Tensor, n: number): void {
+    this.native.sigmoid(this.ctx, ptr(out), ptr(input), n);
   }
 
-  // currently unused as Tensor method
-  mul(out: number, a: number, b: number, n: number): void {
-    this.native.mul(this.ctx, out, a, b, n);
+  mul(out: Tensor, a: Tensor, b: Tensor, n: number): void {
+    this.native.mul(this.ctx, ptr(out), ptr(a), ptr(b), n);
   }
 
-  gateSigmoidMul(attnOut: number, gateInterleaved: number, batchSeq: number, numHeads: number, headDim: number): void {
-    this.native.gateSigmoidMul(this.ctx, attnOut, gateInterleaved, batchSeq, numHeads, headDim);
+  gateSigmoidMul(attnOut: Tensor, gateInterleaved: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
+    this.native.gateSigmoidMul(this.ctx, ptr(attnOut), ptr(gateInterleaved), batchSeq, numHeads, headDim);
   }
 
-  sampleBatch(outTokens: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, penaltyOffsets: number, vocabSize: number, batchSize: number, temperatures: number, repPenalties: number, presPenalties: number, topKs: number, topPs: number, randomVals: number, maxEffectiveK: number): void {
-    this.native.sampleBatch(this.ctx, outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyOffsets, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, randomVals, maxEffectiveK);
+  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyOffsets: Tensor, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, randomVals: Tensor, maxEffectiveK: number): void {
+    this.native.sampleBatch(this.ctx, ptr(outTokens), ptr(topkVals), ptr(topkIdxs), ptr(workspace), ptr(logits), ptr(penaltyTokens), ptr(penaltyOffsets), vocabSize, batchSize, ptr(temperatures), ptr(repPenalties), ptr(presPenalties), ptr(topKs), ptr(topPs), ptr(randomVals), maxEffectiveK);
   }
 
   memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void {

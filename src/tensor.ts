@@ -3,10 +3,6 @@ import { I32, SAMPLING_BLOCK_SIZE, SAMPLING_MAX_TOPK } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { WorkspaceBase } from "./workspace";
 
-function ptr(t: Tensor | number): number {
-  return typeof t === "number" ? t : t.data;
-}
-
 function numElements(shape: number[]): number {
   return shape.reduce((a, b) => a * b, 1);
 }
@@ -41,9 +37,9 @@ export class Tensor implements Disposable {
   free(): void {
     if (this.data !== 0) {
       if (this.pinned) {
-        this.workspace.glm.freePinned(this.data);
+        this.workspace.glm.freePinned(this);
       } else {
-        this.workspace.glm.freeBuf(this.data);
+        this.workspace.glm.freeBuf(this);
       }
       (this as { data: number }).data = 0;
     }
@@ -68,11 +64,11 @@ export class Tensor implements Disposable {
   }
 
   h2d(data: Buffer, size?: number): void {
-    this.workspace.glm.h2d(this.data, data, size);
+    this.workspace.glm.h2d(this, data, size);
   }
 
   d2h(buf: Buffer, size?: number): void {
-    this.workspace.glm.d2h(buf, this.data, size);
+    this.workspace.glm.d2h(buf, this, size);
   }
 
   linear(weight: Tensor, batch: number): Tensor {
@@ -82,53 +78,53 @@ export class Tensor implements Disposable {
     const out = this.workspace.alloc(outShape, this.type);
     if (weight.type === "F8_E4M3") {
       const scale = weight.workspace.tensors.get(weight.name! + "_scale_inv")!;
-      this.workspace.glm.fp8LinearDecode(out.data, this.data, weight.data, scale.data, batch, n, k);
+      this.workspace.glm.fp8LinearDecode(out, this, weight, scale, batch, n, k);
     } else {
-      this.workspace.glm.linear(out.data, this.data, weight.data, batch, n, k);
+      this.workspace.glm.linear(out, this, weight, batch, n, k);
     }
     return out;
   }
 
-  rmsnorm(weight: Tensor | number, eps: number, dim: number, batch: number): Tensor {
+  rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
     const out = this.workspace.alloc([batch, dim], this.type);
-    this.workspace.glm.rmsnorm(out.data, this.data, ptr(weight), eps, dim, batch);
+    this.workspace.glm.rmsnorm(out, this, weight, eps, dim, batch);
     return out;
   }
 
-  fusedAddRmsnorm(input: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
+  fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
     const normed = this.workspace.alloc([batch, dim], this.type);
     const residual = this.workspace.alloc([batch, dim], this.type);
-    this.workspace.glm.fusedAddRmsnorm(normed.data, residual.data, this.data, ptr(input), ptr(weight), eps, dim, batch);
+    this.workspace.glm.fusedAddRmsnorm(normed, residual, this, input, weight, eps, dim, batch);
     return { normed, residual };
   }
 
-  fusedNormRope(weight: Tensor | number, cos: Tensor | number, sin: Tensor | number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
     const out = this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
-    this.workspace.glm.fusedNormRope(out.data, this.data, ptr(weight), ptr(cos), ptr(sin), eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
+    this.workspace.glm.fusedNormRope(out, this, weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
     return out;
   }
 
   embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
     const out = ids.workspace.alloc([seqLen, hidden], this.type);
-    this.workspace.glm.embedding(out.data, this.data, ptr(ids), hidden, seqLen);
+    this.workspace.glm.embedding(out, this, ids, hidden, seqLen);
     return out;
   }
 
-  siluAndMul(gate: Tensor | number, up: Tensor | number, intermediate: number, batch: number): Tensor {
+  siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
     const out = this.workspace.alloc([batch, intermediate], this.type);
-    this.workspace.glm.siluAndMul(out.data, ptr(gate), ptr(up), intermediate, batch);
+    this.workspace.glm.siluAndMul(out, gate, up, intermediate, batch);
     return out;
   }
 
   arange(start: number, step: number, count: number): void {
-    this.workspace.glm.arange(this.data, start, step, count);
+    this.workspace.glm.arange(this, start, step, count);
   }
 
   argmax(): Tensor {
     const batch = this.shape[0];
     const dim = this.shape[1];
     const out = this.workspace.alloc([batch], "I32");
-    this.workspace.glm.argmax(out.data, this.data, dim, batch);
+    this.workspace.glm.argmax(out, this, dim, batch);
     return out;
   }
 
@@ -143,43 +139,43 @@ export class Tensor implements Disposable {
     return result;
   }
 
-  indexSelect(indices: Tensor | number, dim: number, batch: number): Tensor {
+  indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
     const out = this.workspace.alloc([batch, dim], this.type);
-    this.workspace.glm.indexSelect(out.data, this.data, ptr(indices), dim, batch);
+    this.workspace.glm.indexSelect(out, this, indices, dim, batch);
     return out;
   }
 
-  gdnRecurrentStep(state: Tensor | number, qkv: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    this.workspace.glm.gdnRecurrentStep(this.data, ptr(state), ptr(qkv), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
+  gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    this.workspace.glm.gdnRecurrentStep(this, state, qkv, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
-  gdnPrefill(state: Tensor | number, qkv: Tensor | number, aRaw: Tensor | number, bRaw: Tensor | number, aLog: Tensor | number, dtBias: Tensor | number, cuSeqlens: Tensor | number, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    this.workspace.glm.gdnPrefill(this.data, ptr(state), ptr(qkv), ptr(aRaw), ptr(bRaw), ptr(aLog), ptr(dtBias), ptr(cuSeqlens), totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
+  gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    this.workspace.glm.gdnPrefill(this, state, qkv, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
-  causalConv1d(convState: Tensor | number, input: Tensor | number, weight: Tensor | number, cuSeqlens: Tensor | number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
-    this.workspace.glm.causalConv1d(this.data, ptr(convState), ptr(input), ptr(weight), ptr(cuSeqlens), convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
+  causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
+    this.workspace.glm.causalConv1d(this, convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
   }
 
-  causalConv1dUpdate(convState: Tensor | number, input: Tensor | number, weight: Tensor | number, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor {
+  causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor {
     const out = this.workspace.alloc([batchSize * convDim], this.type);
-    this.workspace.glm.causalConv1dUpdate(out.data, ptr(convState), ptr(input), ptr(weight), convDim, kernelSize, batchSize, convStateStride);
+    this.workspace.glm.causalConv1dUpdate(out, convState, input, weight, convDim, kernelSize, batchSize, convStateStride);
     return out;
   }
 
-  rmsnormGated(input: Tensor | number, gate: Tensor | number, weight: Tensor | number, eps: number, dim: number, batch: number): void {
-    this.workspace.glm.rmsnormGated(this.data, ptr(input), ptr(gate), ptr(weight), eps, dim, batch);
+  rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
+    this.workspace.glm.rmsnormGated(this, input, gate, weight, eps, dim, batch);
   }
 
-  gateSigmoidMul(gate: Tensor | number, batchSeq: number, numHeads: number, headDim: number): void {
-    this.workspace.glm.gateSigmoidMul(this.data, ptr(gate), batchSeq, numHeads, headDim);
+  gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
+    this.workspace.glm.gateSigmoidMul(this, gate, batchSeq, numHeads, headDim);
   }
 
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     const hd = dimHalf * 2;
     const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
     const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
-    this.workspace.glm.rotaryEmbedding(cos.data, sin.data, this.data, positionIds.data, dimHalf, batch, seqLen);
+    this.workspace.glm.rotaryEmbedding(cos, sin, this, positionIds, dimHalf, batch, seqLen);
     return { cos, sin };
   }
 
@@ -272,21 +268,21 @@ export class Tensor implements Disposable {
     randomVals.h2d(randBuf);
 
     this.workspace.glm.sampleBatch(
-      outToken.data,
-      topkVals.data,
-      topkIdxs.data,
-      sampleWorkspace.data,
-      this.data,
-      penaltyTokens.data,
-      penaltyOffsets.data,
+      outToken,
+      topkVals,
+      topkIdxs,
+      sampleWorkspace,
+      this,
+      penaltyTokens,
+      penaltyOffsets,
       vs,
       batchSize,
-      temperatures.data,
-      repPenalties.data,
-      presPenalties.data,
-      topKs.data,
-      topPs.data,
-      randomVals.data,
+      temperatures,
+      repPenalties,
+      presPenalties,
+      topKs,
+      topPs,
+      randomVals,
       maxEffectiveK,
     );
 

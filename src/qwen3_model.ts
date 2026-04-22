@@ -89,7 +89,7 @@ export class Qwen3Model extends ChatModel {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name);
       const offset = st.dataStart + meta.dataOffsets[0];
-      this.glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
+      this.glm.mmapLoad(tensor, mmapPtr, offset, tensor.bytes);
     }
   }
 

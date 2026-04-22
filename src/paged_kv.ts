@@ -64,11 +64,11 @@ export class ExecutionWorkspace extends WorkspaceBase {
   flashDecode(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
     const out = this.alloc([batchSize, nHeads, 1, hd], query.type);
     this.glm.batchDecodeRun(
-      query.data, out.data,
-      pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
-      pagedKV.indices.data, this.indptrD.data, this.lastPageLen.data,
-      this.floatWs.data, this.intWs.data,
-      this.decodePlanInfo.data,
+      query, out,
+      pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
+      pagedKV.indices, this.indptrD, this.lastPageLen,
+      this.floatWs, this.intWs,
+      this.decodePlanInfo,
       batchSize, nHeads, nKv, hd, pagedKV.pageSize, smScale
     );
     return out;
@@ -77,12 +77,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
   flashPrefillPaged(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): Tensor {
     const out = this.alloc([1, nHeads, totalTokens, hd], query.type);
     this.glm.batchPrefillPagedRun(
-      query.data, out.data,
-      pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
-      pagedKV.indices.data, this.indptrD.data, this.lastPageLen.data,
-      this.floatWs.data, this.intWs.data,
-      this.qoIndptrD.data,
-      this.prefillPlanInfo.data,
+      query, out,
+      pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
+      pagedKV.indices, this.indptrD, this.lastPageLen,
+      this.floatWs, this.intWs,
+      this.qoIndptrD,
+      this.prefillPlanInfo,
       totalTokens, batchSize, nHeads, nKv, hd, pagedKV.pageSize,
       qStrideN, qStrideH, maskMode, smScale
     );
@@ -97,9 +97,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const vTokenStride = nKv * hd;
     const vHeadStride = hd;
     this.glm.kvCacheWrite(
-      kRope.data, vBuf.data,
-      pagedKV.kData[cacheIdx].data, pagedKV.vData[cacheIdx].data,
-      this.slotMapping.data,
+      kRope, vBuf,
+      pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
+      this.slotMapping,
       BS, nKv, hd, pagedKV.pageSize,
       kTokenStride, kHeadStride, vTokenStride, vHeadStride
     );
@@ -153,10 +153,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
 
       this.glm.batchDecodePlan(
-        this.floatWs.data, BATCH_FLOAT_WS_SIZE,
-        this.intWs.data, this.pinnedIntWs.data, BATCH_INT_WS_SIZE,
-        this.decodePlanInfo.data,
-        this.indptrH.data,
+        this.floatWs, BATCH_FLOAT_WS_SIZE,
+        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+        this.decodePlanInfo,
+        this.indptrH,
         batchSize,
         nHeads, nKv, hd, pageSize,
         enableCudaGraph
@@ -199,21 +199,19 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const lastIdxBuf = Int32Array.from(lastIndices);
     this.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
 
-    const qoIndptrHostPtr = this.glm.allocPinned((batchSize + 1) * I32);
-    this.glm.writePinned(qoIndptrHostPtr, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+    using qoIndptrHost = this.allocPinned([(batchSize + 1)], "I32");
+    this.glm.writePinned(qoIndptrHost, Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
 
     this.glm.batchPrefillPagedPlan(
-      this.floatWs.data, BATCH_FLOAT_WS_SIZE,
-      this.intWs.data, this.pinnedIntWs.data, BATCH_INT_WS_SIZE,
-      this.prefillPlanInfo.data,
-      qoIndptrHostPtr, this.indptrH.data,
+      this.floatWs, BATCH_FLOAT_WS_SIZE,
+      this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+      this.prefillPlanInfo,
+      qoIndptrHost, this.indptrH,
       totalTokens, batchSize,
       nHeads, nKv, hd,
       pageSize,
       1
     );
-
-    this.glm.freePinned(qoIndptrHostPtr);
 
     this.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
 
@@ -418,9 +416,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
     const lastPageLenBuf = Int32Array.from(lastPageLenList);
 
-    this.glm.writePinned(ws.indptrH.data, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
-    this.glm.writePinned(ws.lastPageLenH.data, Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
-    this.glm.h2d(this.indices.data, Buffer.from(indicesBuf.buffer, indicesBuf.byteOffset, indicesBuf.byteLength));
+    this.glm.writePinned(ws.indptrH, Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
+    this.glm.writePinned(ws.lastPageLenH, Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
+    this.glm.h2d(this.indices, Buffer.from(indicesBuf.buffer, indicesBuf.byteOffset, indicesBuf.byteLength));
     ws.indptrD.h2d(Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
     ws.lastPageLen.h2d(Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
   }

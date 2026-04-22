@@ -159,7 +159,7 @@ export class Qwen35Model extends ChatModel {
       const tensor = this.alloc(meta.shape, "F32", name);
       if (meta.dtype === "F32") {
         const offset = st.dataStart + meta.dataOffsets[0];
-        this.glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
+        this.glm.mmapLoad(tensor, mmapPtr, offset, tensor.bytes);
       } else {
         const rawBytes = st.readTensor(name);
         const f32Arr = new Float32Array(numElements);
@@ -194,7 +194,7 @@ export class Qwen35Model extends ChatModel {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name);
       const offset = st.dataStart + meta.dataOffsets[0];
-      this.glm.mmapLoad(tensor.data, mmapPtr, offset, tensor.bytes);
+      this.glm.mmapLoad(tensor, mmapPtr, offset, tensor.bytes);
     }
   }
 

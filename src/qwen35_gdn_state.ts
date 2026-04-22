@@ -46,8 +46,8 @@ export class Qwen35GdnState extends WorkspaceBase {
   private zeroStates(): void {
     for (let i = 0; i < this.cfg.numHiddenLayers; i++) {
       if (this.cfg.layerTypes[i] === "linear_attention") {
-        this.glm.fill(this.recurrentState[i].data, 0, 2 * this.batchSize * this.recurrentStateSize);
-        this.glm.fill(this.convState[i].data, 0, this.batchSize * this.convStateSize);
+        this.glm.fill(this.recurrentState[i], 0, 2 * this.batchSize * this.recurrentStateSize);
+        this.glm.fill(this.convState[i], 0, this.batchSize * this.convStateSize);
       }
     }
   }

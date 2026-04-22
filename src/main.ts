@@ -2,14 +2,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { GlmOps } from "./glm_ops";
 import { resolveModelPath, listSafetensorsShards } from "./model_path";
+import { WorkspaceBase } from "./workspace";
+import { Tensor } from "./tensor";
 
 async function main() {
   const glm = new GlmOps(0);
   console.log("GLM context:", glm.ctx);
 
-  const buf = glm.alloc(256);
-  console.log("GPU buffer:", buf);
-  glm.freeBuf(buf);
+  const ws = new WorkspaceBase(glm);
+  const buf = ws.alloc([256], "U8");
+  console.log("GPU buffer:", buf.data);
+  buf.free();
 
   const modelDir = resolveModelPath("zai-org/GLM-5.1");
   console.log("Model path:", modelDir);
