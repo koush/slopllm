@@ -62,7 +62,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   flashDecode(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
-    const out = this.alloc([batchSize, nHeads, 1, hd], query.type);
+    const out = this.alloc([batchSize, nHeads, 1, hd], query.type, undefined, query.parallelism);
     this.glm.batchDecodeRun(
       query, out,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
@@ -75,7 +75,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   flashPrefillPaged(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): Tensor {
-    const out = this.alloc([1, nHeads, totalTokens, hd], query.type);
+    const out = this.alloc([1, nHeads, totalTokens, hd], query.type, undefined, query.parallelism);
     this.glm.batchPrefillPagedRun(
       query, out,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],

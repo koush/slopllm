@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { TensorParallelism } from "./device_ops";
+import { DeviceOps, TensorParallelism } from "./device_ops";
 import { Tensor } from "./tensor";
 import type { WorkspaceBase } from "./workspace";
 
@@ -97,7 +97,7 @@ interface NativeAddon {
   ncclAllGather(comm: number, ctx: number, sendbuff: number, recvbuff: number, count: number, datatype: number): void;
 }
 
-export class GlmOps {
+export class GlmOps implements DeviceOps {
   native: NativeAddon;
   ctx: number;
   device: number;

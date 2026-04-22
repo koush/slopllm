@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, SamplingParams } from "./chat_model";
-import { DeviceOps } from "./device_ops";
+import { DeviceOps, TensorParallelism } from "./device_ops";
 import { bf16BytesToF32, f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import type { BatchState } from "./paged_kv";
@@ -78,18 +78,45 @@ export class Qwen3Model extends ChatModel {
     return model;
   }
 
+  private weightParallelism(name: string): TensorParallelism {
+    if (name === "lm_head.weight") return TensorParallelism.Column;
+    if (name === "model.embed_tokens.weight") return TensorParallelism.Row;
+    if (name.endsWith(".self_attn.q_proj.weight") ||
+        name.endsWith(".self_attn.k_proj.weight") ||
+        name.endsWith(".self_attn.v_proj.weight") ||
+        name.endsWith(".mlp.gate_proj.weight") ||
+        name.endsWith(".mlp.up_proj.weight")) return TensorParallelism.Column;
+    if (name.endsWith(".self_attn.q_proj.weight_scale_inv") ||
+        name.endsWith(".self_attn.k_proj.weight_scale_inv") ||
+        name.endsWith(".self_attn.v_proj.weight_scale_inv") ||
+        name.endsWith(".mlp.gate_proj.weight_scale_inv") ||
+        name.endsWith(".mlp.up_proj.weight_scale_inv")) return TensorParallelism.Column;
+    if (name.endsWith(".self_attn.o_proj.weight") ||
+        name.endsWith(".mlp.down_proj.weight")) return TensorParallelism.Row;
+    if (name.endsWith(".self_attn.o_proj.weight_scale_inv") ||
+        name.endsWith(".mlp.down_proj.weight_scale_inv")) return TensorParallelism.Row;
+    return TensorParallelism.Replicated;
+  }
+
   protected loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void {
+    const par = this.weightParallelism(name);
+
     if (name.endsWith("_scale_inv")) {
       const bf16Bytes = st.readTensor(name);
       const f32Array = bf16BytesToF32(bf16Bytes);
       const f32Buffer = Buffer.from(f32Array.buffer, f32Array.byteOffset, f32Array.byteLength);
-      const tensor = this.alloc(meta.shape, "F32", name);
+      const tensor = this.alloc(meta.shape, "F32", name, par);
       tensor.h2d(f32Buffer);
     } else {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
-      const tensor = this.alloc(meta.shape, dtype, name);
+      const tensor = this.alloc(meta.shape, dtype, name, par);
       const offset = st.dataStart + meta.dataOffsets[0];
       this.glm.mmapLoad(tensor, mmapPtr, offset, tensor.bytes);
+
+      if (this.cfg.tieWordEmbeddings && name === "model.embed_tokens.weight" && !this.tensors.has("lm_head.weight")) {
+        const lmHead = this.alloc(meta.shape, dtype, "lm_head.weight", TensorParallelism.Column);
+        this.glm.mmapLoad(lmHead, mmapPtr, offset, lmHead.bytes);
+      }
     }
   }
 

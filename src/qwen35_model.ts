@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, SamplingParams } from "./chat_model";
-import { DeviceOps } from "./device_ops";
+import { DeviceOps, TensorParallelism } from "./device_ops";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import type { BatchState } from "./paged_kv";
@@ -143,8 +143,22 @@ export class Qwen35Model extends ChatModel {
     return model;
   }
 
+  private weightParallelism(name: string): TensorParallelism {
+    if (name === "lm_head.weight") return TensorParallelism.Column;
+    if (name === `${Qwen35Model.WEIGHT_PREFIX}embed_tokens.weight`) return TensorParallelism.Row;
+    if (name.endsWith(".self_attn.q_proj.weight") ||
+        name.endsWith(".self_attn.k_proj.weight") ||
+        name.endsWith(".self_attn.v_proj.weight") ||
+        name.endsWith(".mlp.gate_proj.weight") ||
+        name.endsWith(".mlp.up_proj.weight")) return TensorParallelism.Column;
+    if (name.endsWith(".self_attn.o_proj.weight") ||
+        name.endsWith(".mlp.down_proj.weight")) return TensorParallelism.Row;
+    return TensorParallelism.Replicated;
+  }
+
   protected loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void {
     const prefix = Qwen35Model.WEIGHT_PREFIX;
+    const par = this.weightParallelism(name);
     const gemmaNormSuffixes = [
       "input_layernorm.weight",
       "post_attention_layernorm.weight",
@@ -156,7 +170,7 @@ export class Qwen35Model extends ChatModel {
 
     if (name.includes("A_log") || name.includes("dt_bias")) {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
-      const tensor = this.alloc(meta.shape, "F32", name);
+      const tensor = this.alloc(meta.shape, "F32", name, par);
       if (meta.dtype === "F32") {
         const offset = st.dataStart + meta.dataOffsets[0];
         this.glm.mmapLoad(tensor, mmapPtr, offset, tensor.bytes);
@@ -172,7 +186,7 @@ export class Qwen35Model extends ChatModel {
       }
     } else if (meta.dtype === "F32") {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
-      const tensor = this.alloc(meta.shape, "BF16", name);
+      const tensor = this.alloc(meta.shape, "BF16", name, par);
       const f32Bytes = st.readTensor(name);
       const f32Arr = new Float32Array(f32Bytes.buffer, f32Bytes.byteOffset, numElements);
       if (isGemmaNorm) {
@@ -181,7 +195,7 @@ export class Qwen35Model extends ChatModel {
       tensor.h2d(f32ToBf16Bytes(f32Arr));
     } else if (isGemmaNorm) {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
-      const tensor = this.alloc(meta.shape, "BF16", name);
+      const tensor = this.alloc(meta.shape, "BF16", name, par);
       const rawBytes = st.readTensor(name);
       const f32Arr = new Float32Array(numElements);
       for (let i = 0; i < numElements; i++) {
@@ -192,9 +206,14 @@ export class Qwen35Model extends ChatModel {
       tensor.h2d(f32ToBf16Bytes(f32Arr));
     } else {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
-      const tensor = this.alloc(meta.shape, dtype, name);
+      const tensor = this.alloc(meta.shape, dtype, name, par);
       const offset = st.dataStart + meta.dataOffsets[0];
       this.glm.mmapLoad(tensor, mmapPtr, offset, tensor.bytes);
+
+      if (this.cfg.tieWordEmbeddings && name === `${prefix}embed_tokens.weight` && !this.tensors.has("lm_head.weight")) {
+        const lmHead = this.alloc(meta.shape, dtype, "lm_head.weight", TensorParallelism.Column);
+        this.glm.mmapLoad(lmHead, mmapPtr, offset, lmHead.bytes);
+      }
     }
   }
 
