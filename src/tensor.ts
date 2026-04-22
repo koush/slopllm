@@ -1,4 +1,5 @@
 import { type SamplingParams } from "./chat_model";
+import { TensorParallelism } from "./device_ops";
 import { I32, SAMPLING_BLOCK_SIZE, SAMPLING_MAX_TOPK } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { WorkspaceBase } from "./workspace";
@@ -8,6 +9,7 @@ function numElements(shape: number[]): number {
 }
 
 export class Tensor implements Disposable {
+  parallelism: TensorParallelism = TensorParallelism.Replicated;
   constructor(public readonly workspace: WorkspaceBase, public data: number, public readonly allocSize: number, public readonly shape: number[], public readonly type: string, public readonly name: string | undefined, public readonly pinned: boolean) {
     this.data = data;
     this.allocSize = allocSize;
