@@ -9,7 +9,6 @@ export class ParallelTensor extends Tensor {
   readonly fullShape: number[];
   private readonly devices: readonly GlmOps[];
   private readonly parallelOps: ParallelOps;
-  private _disposed = false;
 
   constructor(
     workspace: WorkspaceBase,
@@ -30,7 +29,6 @@ export class ParallelTensor extends Tensor {
   }
 
   free(): void {
-    this._disposed = true;
     for (let i = 0; i < this.shards.length; i++) {
       const shard = this.shards[i];
       if (shard.data !== 0) {
@@ -48,14 +46,13 @@ export class ParallelTensor extends Tensor {
     if (this.name !== undefined) {
       throw new Error("Cannot dispose named tensor");
     }
-    if (this._disposed) return;
-    this._disposed = true;
     this.workspace.tracked.delete(this);
     for (const shard of this.shards) {
       if (shard.data !== 0) {
         shard[Symbol.dispose]();
       }
     }
+    (this.shards as Tensor[]).length = 0;
   }
 
   shard(rank: number): Tensor {
