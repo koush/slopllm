@@ -830,3 +830,646 @@ describe("ParallelTensor.all", () => {
     }
   });
 });
+
+function refSiluAndMul(gate: Float32Array, up: Float32Array, intermediate: number, batch: number): Float32Array {
+  const out = new Float32Array(batch * intermediate);
+  for (let b = 0; b < batch; b++) {
+    for (let j = 0; j < intermediate; j++) {
+      const g = gate[b * intermediate + j];
+      const u = up[b * intermediate + j];
+      out[b * intermediate + j] = g / (1 + Math.exp(-g)) * u;
+    }
+  }
+  return out;
+}
+
+function refRmsnorm(input: Float32Array, weight: Float32Array, eps: number, dim: number, batch: number): Float32Array {
+  const out = new Float32Array(batch * dim);
+  for (let b = 0; b < batch; b++) {
+    let ss = 0;
+    for (let j = 0; j < dim; j++) {
+      const v = input[b * dim + j];
+      ss += v * v;
+    }
+    const rms = Math.sqrt(ss / dim + eps);
+    for (let j = 0; j < dim; j++) {
+      out[b * dim + j] = (input[b * dim + j] / rms) * weight[j];
+    }
+  }
+  return out;
+}
+
+function refFusedAddRmsnorm(inputA: Float32Array, inputB: Float32Array, weight: Float32Array, eps: number, dim: number, batch: number): { normed: Float32Array, residual: Float32Array } {
+  const residual = new Float32Array(batch * dim);
+  const normed = new Float32Array(batch * dim);
+  for (let b = 0; b < batch; b++) {
+    for (let j = 0; j < dim; j++) {
+      residual[b * dim + j] = inputA[b * dim + j] + inputB[b * dim + j];
+    }
+    let ss = 0;
+    for (let j = 0; j < dim; j++) {
+      const v = residual[b * dim + j];
+      ss += v * v;
+    }
+    const rms = Math.sqrt(ss / dim + eps);
+    for (let j = 0; j < dim; j++) {
+      normed[b * dim + j] = (residual[b * dim + j] / rms) * weight[j];
+    }
+  }
+  return { normed, residual };
+}
+
+describe("ParallelOps.siluAndMul", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("siluAndMul on Row-parallel tensors (BF16)", () => {
+    const batch = 2;
+    const intermediate = 16;
+
+    const gateF32 = new Float32Array(batch * intermediate);
+    const upF32 = new Float32Array(batch * intermediate);
+    for (let i = 0; i < batch * intermediate; i++) {
+      gateF32[i] = (i % 7 - 3) * 0.1;
+      upF32[i] = (i % 5 + 1) * 0.1;
+    }
+    const expected = refSiluAndMul(gateF32, upF32, intermediate, batch);
+
+    const gate = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    const up = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    const out = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+
+    gate.h2d(f32ToBf16Bytes(gateF32));
+    up.h2d(f32ToBf16Bytes(upF32));
+    po.synchronize();
+
+    po.siluAndMul(out, gate, up, intermediate, batch);
+    po.synchronize();
+
+    const outBuf = Buffer.alloc(batch * intermediate * 2);
+    out.d2h(outBuf);
+    const actual = bf16BytesToF32(outBuf);
+
+    for (let i = 0; i < batch * intermediate; i++) {
+      const relErr = Math.abs(actual[i] - expected[i]) / Math.max(Math.abs(expected[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expected[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("siluAndMul on Replicated tensors (BF16)", () => {
+    const batch = 2;
+    const intermediate = 8;
+
+    const gateF32 = new Float32Array(batch * intermediate);
+    const upF32 = new Float32Array(batch * intermediate);
+    for (let i = 0; i < batch * intermediate; i++) {
+      gateF32[i] = (i % 9 - 4) * 0.1;
+      upF32[i] = (i % 3 + 1) * 0.15;
+    }
+    const expected = refSiluAndMul(gateF32, upF32, intermediate, batch);
+
+    const gate = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const up = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const out = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    gate.h2d(f32ToBf16Bytes(gateF32));
+    up.h2d(f32ToBf16Bytes(upF32));
+    po.synchronize();
+
+    po.siluAndMul(out, gate, up, intermediate, batch);
+    po.synchronize();
+
+    const outBuf = Buffer.alloc(batch * intermediate * 2);
+    out.d2h(outBuf);
+    const actual = bf16BytesToF32(outBuf);
+
+    for (let i = 0; i < batch * intermediate; i++) {
+      const relErr = Math.abs(actual[i] - expected[i]) / Math.max(Math.abs(expected[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expected[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+});
+
+describe("ParallelOps.fill and arange", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("fill on Replicated BF16 tensor", () => {
+    const n = 8;
+    const pt = ws.alloc([n], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    po.fill(pt, 3.14, n);
+    po.synchronize();
+
+    const buf = Buffer.alloc(n * 2);
+    pt.d2h(buf);
+    const arr = bf16BytesToF32(buf);
+    for (let i = 0; i < n; i++) {
+      assert.ok(Math.abs(arr[i] - 3.14) < 0.02, `fill: i=${i}, expected ~3.14, got ${arr[i]}`);
+    }
+  });
+
+  it("fill on Row-parallel BF16 tensor fills each shard", () => {
+    const rows = 2;
+    const cols = 8;
+    const n = rows * cols;
+    const pt = ws.alloc([rows, cols], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    po.fill(pt, 2.5, n);
+    po.synchronize();
+
+    const buf = Buffer.alloc(n * 2);
+    pt.d2h(buf);
+    const arr = bf16BytesToF32(buf);
+    for (let i = 0; i < n; i++) {
+      assert.ok(Math.abs(arr[i] - 2.5) < 0.02, `fill Row: i=${i}, expected ~2.5, got ${arr[i]}`);
+    }
+  });
+
+  it("arange on Replicated I32 tensor", () => {
+    const count = 8;
+    const pt = ws.alloc([count], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    po.arange(pt, 0, 1, count);
+    po.synchronize();
+
+    const buf = Buffer.alloc(count * 4);
+    pt.d2h(buf);
+    for (let i = 0; i < count; i++) {
+      assert.equal(buf.readInt32LE(i * 4), i, `arange: i=${i}, expected ${i}`);
+    }
+  });
+});
+
+describe("ParallelOps.rmsnorm", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("rmsnorm on Replicated tensor (BF16)", () => {
+    const batch = 2;
+    const dim = 8;
+    const eps = 1e-6;
+
+    const inputF32 = new Float32Array(batch * dim);
+    const weightF32 = new Float32Array(dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = (i % 7 - 3) * 0.1;
+    for (let i = 0; i < dim; i++) weightF32[i] = 0.5 + i * 0.05;
+
+    const expected = refRmsnorm(inputF32, weightF32, eps, dim, batch);
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const weight = ws.alloc([dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const out = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    input.h2d(f32ToBf16Bytes(inputF32));
+    weight.h2d(f32ToBf16Bytes(weightF32));
+    po.synchronize();
+
+    po.rmsnorm(out, input, weight, eps, dim, batch);
+    po.synchronize();
+
+    const outBuf = Buffer.alloc(batch * dim * 2);
+    out.d2h(outBuf);
+    const actual = bf16BytesToF32(outBuf);
+
+    for (let i = 0; i < batch * dim; i++) {
+      const relErr = Math.abs(actual[i] - expected[i]) / Math.max(Math.abs(expected[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expected[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("rmsnorm auto-allReduces PartialSum input (BF16)", () => {
+    const batch = 2;
+    const dim = 8;
+    const eps = 1e-6;
+
+    const shard0F32 = new Float32Array(batch * dim);
+    const shard1F32 = new Float32Array(batch * dim);
+    const weightF32 = new Float32Array(dim);
+    for (let i = 0; i < batch * dim; i++) {
+      shard0F32[i] = (i % 7 - 3) * 0.05;
+      shard1F32[i] = (i % 5 + 1) * 0.05;
+    }
+    for (let i = 0; i < dim; i++) weightF32[i] = 0.5 + i * 0.05;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = shard0F32[i] + shard1F32[i];
+    const expected = refRmsnorm(inputF32, weightF32, eps, dim, batch);
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.PartialSum) as ParallelTensor;
+    const weight = ws.alloc([dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const out = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    input.shard(0).h2d(f32ToBf16Bytes(shard0F32));
+    input.shard(1).h2d(f32ToBf16Bytes(shard1F32));
+    weight.h2d(f32ToBf16Bytes(weightF32));
+    po.synchronize();
+
+    assert.equal(input.parallelism, TensorParallelism.PartialSum);
+    po.rmsnorm(out, input, weight, eps, dim, batch);
+    assert.equal(input.parallelism, TensorParallelism.Replicated, "rmsnorm should auto-allReduce PartialSum input");
+    po.synchronize();
+
+    const outBuf = Buffer.alloc(batch * dim * 2);
+    out.d2h(outBuf);
+    const actual = bf16BytesToF32(outBuf);
+
+    for (let i = 0; i < batch * dim; i++) {
+      const relErr = Math.abs(actual[i] - expected[i]) / Math.max(Math.abs(expected[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expected[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+});
+
+describe("ParallelOps.fusedAddRmsnorm", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("fusedAddRmsnorm on Replicated tensors (BF16)", () => {
+    const batch = 2;
+    const dim = 8;
+    const eps = 1e-6;
+
+    const inputAF32 = new Float32Array(batch * dim);
+    const inputBF32 = new Float32Array(batch * dim);
+    const weightF32 = new Float32Array(dim);
+    for (let i = 0; i < batch * dim; i++) {
+      inputAF32[i] = (i % 7 - 3) * 0.1;
+      inputBF32[i] = (i % 5 + 1) * 0.08;
+    }
+    for (let i = 0; i < dim; i++) weightF32[i] = 0.5 + i * 0.05;
+
+    const expected = refFusedAddRmsnorm(inputAF32, inputBF32, weightF32, eps, dim, batch);
+
+    const inputA = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const inputB = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const weight = ws.alloc([dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const normed = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const residual = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    inputA.h2d(f32ToBf16Bytes(inputAF32));
+    inputB.h2d(f32ToBf16Bytes(inputBF32));
+    weight.h2d(f32ToBf16Bytes(weightF32));
+    po.synchronize();
+
+    po.fusedAddRmsnorm(normed, residual, inputA, inputB, weight, eps, dim, batch);
+    po.synchronize();
+
+    const normedBuf = Buffer.alloc(batch * dim * 2);
+    const residualBuf = Buffer.alloc(batch * dim * 2);
+    normed.d2h(normedBuf);
+    residual.d2h(residualBuf);
+    const actualNormed = bf16BytesToF32(normedBuf);
+    const actualResidual = bf16BytesToF32(residualBuf);
+
+    for (let i = 0; i < batch * dim; i++) {
+      const nRelErr = Math.abs(actualNormed[i] - expected.normed[i]) / Math.max(Math.abs(expected.normed[i]), 1e-6);
+      assert.ok(nRelErr < 0.05, `normed i=${i}: expected ${expected.normed[i]}, got ${actualNormed[i]} (relErr=${nRelErr})`);
+      const rRelErr = Math.abs(actualResidual[i] - expected.residual[i]) / Math.max(Math.abs(expected.residual[i]), 1e-6);
+      assert.ok(rRelErr < 0.05, `residual i=${i}: expected ${expected.residual[i]}, got ${actualResidual[i]} (relErr=${rRelErr})`);
+    }
+  });
+
+  it("fusedAddRmsnorm auto-allReduces PartialSum inputA (BF16)", () => {
+    const batch = 2;
+    const dim = 8;
+    const eps = 1e-6;
+
+    const shard0F32 = new Float32Array(batch * dim);
+    const shard1F32 = new Float32Array(batch * dim);
+    const inputBF32 = new Float32Array(batch * dim);
+    const weightF32 = new Float32Array(dim);
+    for (let i = 0; i < batch * dim; i++) {
+      shard0F32[i] = (i % 7 - 3) * 0.05;
+      shard1F32[i] = (i % 5 + 1) * 0.05;
+      inputBF32[i] = (i % 3 + 1) * 0.1;
+    }
+    for (let i = 0; i < dim; i++) weightF32[i] = 0.5 + i * 0.05;
+
+    const inputAF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputAF32[i] = shard0F32[i] + shard1F32[i];
+    const expected = refFusedAddRmsnorm(inputAF32, inputBF32, weightF32, eps, dim, batch);
+
+    const inputA = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.PartialSum) as ParallelTensor;
+    const inputB = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const weight = ws.alloc([dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const normed = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const residual = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    inputA.shard(0).h2d(f32ToBf16Bytes(shard0F32));
+    inputA.shard(1).h2d(f32ToBf16Bytes(shard1F32));
+    inputB.h2d(f32ToBf16Bytes(inputBF32));
+    weight.h2d(f32ToBf16Bytes(weightF32));
+    po.synchronize();
+
+    assert.equal(inputA.parallelism, TensorParallelism.PartialSum);
+    po.fusedAddRmsnorm(normed, residual, inputA, inputB, weight, eps, dim, batch);
+    assert.equal(inputA.parallelism, TensorParallelism.Replicated, "fusedAddRmsnorm should auto-allReduce PartialSum inputA");
+    po.synchronize();
+
+    const normedBuf = Buffer.alloc(batch * dim * 2);
+    const residualBuf = Buffer.alloc(batch * dim * 2);
+    normed.d2h(normedBuf);
+    residual.d2h(residualBuf);
+    const actualNormed = bf16BytesToF32(normedBuf);
+    const actualResidual = bf16BytesToF32(residualBuf);
+
+    for (let i = 0; i < batch * dim; i++) {
+      const nRelErr = Math.abs(actualNormed[i] - expected.normed[i]) / Math.max(Math.abs(expected.normed[i]), 1e-6);
+      assert.ok(nRelErr < 0.05, `normed i=${i}: expected ${expected.normed[i]}, got ${actualNormed[i]} (relErr=${nRelErr})`);
+      const rRelErr = Math.abs(actualResidual[i] - expected.residual[i]) / Math.max(Math.abs(expected.residual[i]), 1e-6);
+      assert.ok(rRelErr < 0.05, `residual i=${i}: expected ${expected.residual[i]}, got ${actualResidual[i]} (relErr=${rRelErr})`);
+    }
+  });
+});
+
+describe("ParallelOps.embedding", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("Row-parallel embedding lookup (BF16)", () => {
+    const vocabSize = 8;
+    const hidden = 16;
+    const seqLen = 3;
+    const ids = [2, 0, 5];
+
+    const tableF32 = new Float32Array(vocabSize * hidden);
+    for (let i = 0; i < vocabSize * hidden; i++) tableF32[i] = (i % 11 - 5) * 0.1;
+
+    const expectedF32 = new Float32Array(seqLen * hidden);
+    for (let s = 0; s < seqLen; s++) {
+      for (let h = 0; h < hidden; h++) {
+        expectedF32[s * hidden + h] = tableF32[ids[s] * hidden + h];
+      }
+    }
+
+    const table = ws.alloc([vocabSize, hidden], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    const idsBuf = Buffer.alloc(seqLen * 4);
+    for (let s = 0; s < seqLen; s++) idsBuf.writeInt32LE(ids[s], s * 4);
+
+    const inputIds = ws.alloc([seqLen], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const out = ws.alloc([seqLen, hidden], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+
+    table.h2d(f32ToBf16Bytes(tableF32));
+    inputIds.h2d(idsBuf);
+    po.synchronize();
+
+    po.embedding(out, table, inputIds, hidden, seqLen);
+    po.synchronize();
+
+    const outBuf = Buffer.alloc(seqLen * hidden * 2);
+    out.d2h(outBuf);
+    const actual = bf16BytesToF32(outBuf);
+
+    for (let i = 0; i < seqLen * hidden; i++) {
+      const relErr = Math.abs(actual[i] - expectedF32[i]) / Math.max(Math.abs(expectedF32[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expectedF32[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+
+  it("Replicated embedding lookup (BF16)", () => {
+    const vocabSize = 4;
+    const hidden = 8;
+    const seqLen = 2;
+    const ids = [1, 3];
+
+    const tableF32 = new Float32Array(vocabSize * hidden);
+    for (let i = 0; i < vocabSize * hidden; i++) tableF32[i] = i * 0.25;
+
+    const expectedF32 = new Float32Array(seqLen * hidden);
+    for (let s = 0; s < seqLen; s++) {
+      for (let h = 0; h < hidden; h++) {
+        expectedF32[s * hidden + h] = tableF32[ids[s] * hidden + h];
+      }
+    }
+
+    const table = ws.alloc([vocabSize, hidden], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const idsBuf = Buffer.alloc(seqLen * 4);
+    for (let s = 0; s < seqLen; s++) idsBuf.writeInt32LE(ids[s], s * 4);
+
+    const inputIds = ws.alloc([seqLen], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const out = ws.alloc([seqLen, hidden], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    table.h2d(f32ToBf16Bytes(tableF32));
+    inputIds.h2d(idsBuf);
+    po.synchronize();
+
+    po.embedding(out, table, inputIds, hidden, seqLen);
+    po.synchronize();
+
+    const outBuf = Buffer.alloc(seqLen * hidden * 2);
+    out.d2h(outBuf);
+    const actual = bf16BytesToF32(outBuf);
+
+    for (let i = 0; i < seqLen * hidden; i++) {
+      const relErr = Math.abs(actual[i] - expectedF32[i]) / Math.max(Math.abs(expectedF32[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expectedF32[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+});
+
+describe("ParallelOps.argmax", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("argmax on Replicated tensor (BF16)", () => {
+    const batch = 2;
+    const dim = 8;
+
+    const inputF32 = new Float32Array(batch * dim);
+    inputF32[3] = 10;
+    inputF32[5 + dim] = 7;
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const out = ws.alloc([batch], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    po.argmax(out, input, dim, batch);
+    po.synchronize();
+
+    const outBuf = Buffer.alloc(batch * 4);
+    out.d2h(outBuf);
+    assert.equal(outBuf.readInt32LE(0), 3, "batch 0 argmax should be 3");
+    assert.equal(outBuf.readInt32LE(4), 5, "batch 1 argmax should be 5");
+  });
+
+  it("argmax auto-allGathers Row tensor (BF16)", () => {
+    const batch = 2;
+    const dim = 8;
+
+    const inputF32 = new Float32Array(batch * dim);
+    inputF32[3] = 10;
+    inputF32[5 + dim] = 7;
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    const out = ws.alloc([batch], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    po.argmax(out, input, dim, batch);
+    po.synchronize();
+
+    const outBuf = Buffer.alloc(batch * 4);
+    out.d2h(outBuf);
+    assert.equal(outBuf.readInt32LE(0), 3, "batch 0 argmax should be 3 after allGather");
+    assert.equal(outBuf.readInt32LE(4), 5, "batch 1 argmax should be 5 after allGather");
+  });
+});
+
+describe("ParallelOps.indexSelect", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("indexSelect on Replicated tensors (BF16)", () => {
+    const srcRows = 4;
+    const srcDim = 8;
+    const k = 2;
+    const batch = k;
+
+    const srcF32 = new Float32Array(srcRows * srcDim);
+    for (let i = 0; i < srcRows * srcDim; i++) srcF32[i] = i * 0.1;
+
+    const indices = new Int32Array([1, 3]);
+    const indicesBuf = Buffer.alloc(k * 4);
+    for (let i = 0; i < k; i++) indicesBuf.writeInt32LE(indices[i], i * 4);
+
+    const expected = new Float32Array(k * srcDim);
+    for (let i = 0; i < k; i++) {
+      for (let j = 0; j < srcDim; j++) {
+        expected[i * srcDim + j] = srcF32[indices[i] * srcDim + j];
+      }
+    }
+
+    const src = ws.alloc([srcRows, srcDim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const idx = ws.alloc([k], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const out = ws.alloc([k, srcDim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    src.h2d(f32ToBf16Bytes(srcF32));
+    idx.h2d(indicesBuf);
+    po.synchronize();
+
+    po.indexSelect(out, src, idx, srcDim, batch);
+    po.synchronize();
+
+    const outBuf = Buffer.alloc(k * srcDim * 2);
+    out.d2h(outBuf);
+    const actual = bf16BytesToF32(outBuf);
+
+    for (let i = 0; i < k * srcDim; i++) {
+      const relErr = Math.abs(actual[i] - expected[i]) / Math.max(Math.abs(expected[i]), 1e-6);
+      assert.ok(relErr < 0.05, `i=${i}: expected ${expected[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+});
