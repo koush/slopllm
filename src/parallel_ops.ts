@@ -1,5 +1,5 @@
 import { DeviceOps, TensorParallelism } from "./device_ops";
-import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, MEMCPY_H2D, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM } from "./glm_ops";
+import { GlmOps, getNative, f32ToBf16Bytes, bf16BytesToF32, MEMCPY_H2D, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM } from "./glm_ops";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
@@ -66,15 +66,15 @@ export class ParallelTensor extends Tensor {
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     const dtype = this.parallelOps.ncclDatatype(this.type);
     const comms = this.parallelOps.comms;
-    this.devices[0].native.ncclGroupStart();
+    getNative().ncclGroupStart();
     for (let i = 0; i < this.devices.length; i++) {
-      this.devices[i].native.ncclAllReduce(
+      getNative().ncclAllReduce(
         comms[i], this.devices[i].ctx,
         this.shards[i].data, this.shards[i].data,
         count, dtype, NCCL_SUM,
       );
     }
-    this.devices[0].native.ncclGroupEnd();
+    getNative().ncclGroupEnd();
     this.parallelism = TensorParallelism.Replicated;
     return this;
   }
@@ -92,15 +92,15 @@ export class ParallelTensor extends Tensor {
     const comms = this.parallelOps.comms;
 
     if (this.parallelism === TensorParallelism.Column) {
-      this.devices[0].native.ncclGroupStart();
+      getNative().ncclGroupStart();
       for (let i = 0; i < this.devices.length; i++) {
-        this.devices[i].native.ncclAllGather(
+        getNative().ncclAllGather(
           comms[i], this.devices[i].ctx,
           this.shards[i].data, output.shards[i].data,
           count, dtype,
         );
       }
-      this.devices[0].native.ncclGroupEnd();
+      getNative().ncclGroupEnd();
       return output;
     }
 
@@ -116,15 +116,15 @@ export class ParallelTensor extends Tensor {
       const shardWss = this.parallelOps.getShardWorkspaces(workspace);
       const tempTensors = shardWss.map(ws => ws.alloc([totalBytes], "U8"));
 
-      this.devices[0].native.ncclGroupStart();
+      getNative().ncclGroupStart();
       for (let i = 0; i < this.devices.length; i++) {
-        this.devices[i].native.ncclAllGather(
+        getNative().ncclAllGather(
           comms[i], this.devices[i].ctx,
           this.shards[i].data, tempTensors[i].data,
           count, dtype,
         );
       }
-      this.devices[0].native.ncclGroupEnd();
+      getNative().ncclGroupEnd();
 
       for (let i = 0; i < this.devices.length; i++) {
         for (let r = 0; r < this.devices.length; r++) {
@@ -302,7 +302,7 @@ export class ParallelOps implements DeviceOps {
     this.worldSize = devices.length;
     if (devices.length > 1) {
       const deviceIds = devices.map(d => d.device);
-      this.comms = devices[0].native.ncclCommInitAll(deviceIds);
+      this.comms = getNative().ncclCommInitAll(deviceIds);
     } else {
       this.comms = [];
     }
@@ -311,7 +311,7 @@ export class ParallelOps implements DeviceOps {
   free(): void {
     if (this.comms.length > 0) {
       for (const comm of this.comms) {
-        this.devices[0].native.ncclCommDestroy(comm);
+        getNative().ncclCommDestroy(comm);
       }
     }
   }

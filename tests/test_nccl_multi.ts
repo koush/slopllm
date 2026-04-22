@@ -2,6 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import {
   GlmOps,
+  getNative,
   f32ToBf16Bytes,
   bf16BytesToF32,
   NCCL_BFLOAT16,
@@ -23,13 +24,13 @@ for (const numGpus of GPU_COUNTS) {
       const deviceIds = Array.from({ length: numGpus }, (_, i) => i);
       devices = deviceIds.map(id => new GlmOps(id));
       workspaces = devices.map(glm => new WorkspaceBase(glm));
-      comms = devices[0].native.ncclCommInitAll(deviceIds);
+      comms = getNative().ncclCommInitAll(deviceIds);
       assert.equal(comms.length, numGpus, "should return one comm per device");
     });
 
     after(() => {
       for (const comm of comms) {
-        devices[0].native.ncclCommDestroy(comm);
+        getNative().ncclCommDestroy(comm);
       }
       for (const ws of workspaces) ws.free();
       for (const glm of devices) glm.free();
@@ -55,15 +56,15 @@ for (const numGpus of GPU_COUNTS) {
         recvGpus.push(recvGpu);
       }
 
-      devices[0].native.ncclGroupStart();
+      getNative().ncclGroupStart();
       for (let rank = 0; rank < numGpus; rank++) {
-        devices[rank].native.ncclAllReduce(
+        getNative().ncclAllReduce(
           comms[rank], devices[rank].ctx,
           sendGpus[rank].data, recvGpus[rank].data,
           count, NCCL_BFLOAT16, NCCL_SUM
         );
       }
-      devices[0].native.ncclGroupEnd();
+      getNative().ncclGroupEnd();
 
       for (let rank = 0; rank < numGpus; rank++) {
         devices[rank].synchronize();
@@ -110,15 +111,15 @@ for (const numGpus of GPU_COUNTS) {
         recvGpus.push(recvGpu);
       }
 
-      devices[0].native.ncclGroupStart();
+      getNative().ncclGroupStart();
       for (let rank = 0; rank < numGpus; rank++) {
-        devices[rank].native.ncclAllReduce(
+        getNative().ncclAllReduce(
           comms[rank], devices[rank].ctx,
           sendGpus[rank].data, recvGpus[rank].data,
           count, NCCL_FLOAT32, NCCL_SUM
         );
       }
-      devices[0].native.ncclGroupEnd();
+      getNative().ncclGroupEnd();
 
       for (let rank = 0; rank < numGpus; rank++) {
         devices[rank].synchronize();
@@ -166,15 +167,15 @@ for (const numGpus of GPU_COUNTS) {
         recvGpus.push(recvGpu);
       }
 
-      devices[0].native.ncclGroupStart();
+      getNative().ncclGroupStart();
       for (let rank = 0; rank < numGpus; rank++) {
-        devices[rank].native.ncclAllGather(
+        getNative().ncclAllGather(
           comms[rank], devices[rank].ctx,
           sendGpus[rank].data, recvGpus[rank].data,
           sendCount, NCCL_BFLOAT16
         );
       }
-      devices[0].native.ncclGroupEnd();
+      getNative().ncclGroupEnd();
 
       for (let rank = 0; rank < numGpus; rank++) {
         devices[rank].synchronize();
@@ -219,15 +220,15 @@ for (const numGpus of GPU_COUNTS) {
         recvGpus.push(recvGpu);
       }
 
-      devices[0].native.ncclGroupStart();
+      getNative().ncclGroupStart();
       for (let rank = 0; rank < numGpus; rank++) {
-        devices[rank].native.ncclAllGather(
+        getNative().ncclAllGather(
           comms[rank], devices[rank].ctx,
           sendGpus[rank].data, recvGpus[rank].data,
           sendCount, NCCL_FLOAT32
         );
       }
-      devices[0].native.ncclGroupEnd();
+      getNative().ncclGroupEnd();
 
       for (let rank = 0; rank < numGpus; rank++) {
         devices[rank].synchronize();
