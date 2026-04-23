@@ -235,7 +235,7 @@ export class GlmTensor extends Tensor {
     this.glm.fill(this, value, n);
   }
 
-  mmapLoad(mmapPtr: number, offset: number, nbytes: number): void {
+  mmapLoad(mmapPtr: number, offset: number, nbytes: number, _gdnQkvLayout?: import("./device_ops").GdnQkvLayout): void {
     this.glm.mmapLoad(this, mmapPtr, offset, nbytes);
   }
 
@@ -257,6 +257,7 @@ export class GlmTensor extends Tensor {
 }
 
 export class GlmOps implements DeviceOps {
+  readonly worldSize = 1;
   ctx: number;
   device: number;
 

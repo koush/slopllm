@@ -8,7 +8,15 @@ export enum TensorParallelism {
   PartialSum = "partial_sum",
 }
 
+export interface GdnQkvLayout {
+  numHeads: number;
+  dK: number;
+  dV: number;
+}
+
 export interface DeviceOps {
+  readonly worldSize: number;
+
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean): Tensor;
   synchronize(): void;

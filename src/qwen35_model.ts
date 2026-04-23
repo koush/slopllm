@@ -2,8 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, SamplingParams } from "./chat_model";
-import { DeviceOps, TensorParallelism } from "./device_ops";
-import { f32ToBf16Bytes } from "./glm_ops";
+import { DeviceOps, GdnQkvLayout, TensorParallelism } from "./device_ops";
+import { f32ToBf16Bytes, GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import type { BatchState } from "./paged_kv";
 import { ExecutionWorkspace, PagedKVCache } from "./paged_kv";
@@ -150,9 +150,15 @@ export class Qwen35Model extends ChatModel {
         name.endsWith(".self_attn.k_proj.weight") ||
         name.endsWith(".self_attn.v_proj.weight") ||
         name.endsWith(".mlp.gate_proj.weight") ||
-        name.endsWith(".mlp.up_proj.weight")) return TensorParallelism.Column;
+        name.endsWith(".mlp.up_proj.weight") ||
+        name.endsWith(".linear_attn.in_proj_qkv.weight") ||
+        name.endsWith(".linear_attn.in_proj_a.weight") ||
+        name.endsWith(".linear_attn.in_proj_b.weight") ||
+        name.endsWith(".linear_attn.in_proj_z.weight") ||
+        name.endsWith(".linear_attn.conv1d.weight")) return TensorParallelism.Column;
     if (name.endsWith(".self_attn.o_proj.weight") ||
-        name.endsWith(".mlp.down_proj.weight")) return TensorParallelism.Row;
+        name.endsWith(".mlp.down_proj.weight") ||
+        name.endsWith(".linear_attn.out_proj.weight")) return TensorParallelism.Row;
     return TensorParallelism.Replicated;
   }
 
@@ -167,6 +173,9 @@ export class Qwen35Model extends ChatModel {
     ];
     const isGemmaNorm = name === `${prefix}norm.weight` ||
       gemmaNormSuffixes.some(s => name.endsWith(s));
+
+    const isGdnQkv = name.endsWith(".linear_attn.in_proj_qkv.weight");
+    const isGdnConv1d = name.endsWith(".linear_attn.conv1d.weight");
 
     if (name.includes("A_log") || name.includes("dt_bias")) {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
@@ -184,6 +193,12 @@ export class Qwen35Model extends ChatModel {
         }
         tensor.h2d(Buffer.from(f32Arr.buffer));
       }
+    } else if (isGdnQkv || isGdnConv1d) {
+      const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
+      const tensor = this.alloc(meta.shape, dtype, name, par);
+      const offset = st.dataStart + meta.dataOffsets[0];
+      const gdnLayout: GdnQkvLayout = { numHeads: this.cfg.linearNumKeyHeads, dK: this.cfg.linearKeyHeadDim, dV: this.cfg.linearValueHeadDim };
+      tensor.mmapLoad(mmapPtr, offset, tensor.bytes, gdnLayout);
     } else if (meta.dtype === "F32") {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
       const tensor = this.alloc(meta.shape, "BF16", name, par);
@@ -252,10 +267,13 @@ export class Qwen35Model extends ChatModel {
   private gdnLayerPrefill(ws: ExecutionWorkspace, normed: Tensor, residual: Tensor, layerIdx: number, S: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
-    const linHeads = cfg.linearNumKeyHeads;
     const linKDim = cfg.linearKeyHeadDim;
     const linVDim = cfg.linearValueHeadDim;
-    const convDim = linHeads * (linKDim * 2 + linVDim);
+    const fullLinHeads = cfg.linearNumKeyHeads;
+    const fullConvDim = fullLinHeads * (linKDim * 2 + linVDim);
+    const fullZDim = fullLinHeads * linVDim;
+    const fullConvStateStride = fullConvDim * (cfg.linearConvKernelDim - 1);
+    const fullRecurrentStateStride = fullLinHeads * linKDim * linVDim;
     const pfx = `${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.linear_attn`;
     const BS = S;
     const batchSize = gdnState.batchSize;
@@ -269,21 +287,21 @@ export class Qwen35Model extends ChatModel {
     const recurrentState = gdnState.recurrentState[layerIdx];
     const kernelSize = cfg.linearConvKernelDim;
 
-    using convOut = ws.alloc([S, convDim], "BF16");
-    convOut.causalConv1d(convState, qkvLinear, this.tensors.get(`${pfx}.conv1d.weight`)!, gdnState.cuSeqlens, convDim, S, kernelSize, batchSize, gdnState.convStateStride, 1, convDim);
+    using convOut = ws.alloc([S, fullConvDim], "BF16", undefined, TensorParallelism.Row);
+    convOut.causalConv1d(convState, qkvLinear, this.tensors.get(`${pfx}.conv1d.weight`)!, gdnState.cuSeqlens, fullConvDim, S, kernelSize, batchSize, fullConvStateStride, 1, fullConvDim);
 
-    using gdnOut = ws.alloc([S * linHeads, linVDim], "BF16");
+    using gdnOut = ws.alloc([S, fullZDim], "BF16", undefined, TensorParallelism.Row);
 
     gdnOut.gdnPrefill(
       recurrentState, convOut,
       aBuf, bBuf,
       this.tensors.get(`${pfx}.A_log`)!, this.tensors.get(`${pfx}.dt_bias`)!,
-      gdnState.cuSeqlens, S, linHeads, linKDim, linVDim,
-      batchSize, gdnState.recurrentStateStride, 1, convDim,
+      gdnState.cuSeqlens, S, fullLinHeads, linKDim, linVDim,
+      batchSize, fullRecurrentStateStride, 1, fullConvDim,
     );
 
-    using gatedOut = ws.alloc([S * linHeads, linVDim], "BF16");
-    gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, S * linHeads);
+    using gatedOut = ws.alloc([S, fullZDim], "BF16", undefined, TensorParallelism.Row);
+    gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, S * fullLinHeads);
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!, BS);
 
@@ -302,10 +320,13 @@ export class Qwen35Model extends ChatModel {
   private gdnLayerDecode(ws: ExecutionWorkspace, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
-    const linHeads = cfg.linearNumKeyHeads;
     const linKDim = cfg.linearKeyHeadDim;
     const linVDim = cfg.linearValueHeadDim;
-    const convDim = linHeads * (linKDim * 2 + linVDim);
+    const fullLinHeads = cfg.linearNumKeyHeads;
+    const fullConvDim = fullLinHeads * (linKDim * 2 + linVDim);
+    const fullZDim = fullLinHeads * linVDim;
+    const fullConvStateStride = fullConvDim * (cfg.linearConvKernelDim - 1);
+    const fullRecurrentStateStride = fullLinHeads * linKDim * linVDim;
     const pfx = `${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.linear_attn`;
     const BS = gdnState.batchSize;
 
@@ -318,20 +339,20 @@ export class Qwen35Model extends ChatModel {
     const recurrentState = gdnState.recurrentState[layerIdx];
     const kernelSize = cfg.linearConvKernelDim;
 
-    using convOut = qkvBuf.causalConv1dUpdate(convState, qkvBuf, this.tensors.get(`${pfx}.conv1d.weight`)!, convDim, kernelSize, BS, gdnState.convStateStride);
+    using convOut = qkvBuf.causalConv1dUpdate(convState, qkvBuf, this.tensors.get(`${pfx}.conv1d.weight`)!, fullConvDim, kernelSize, BS, fullConvStateStride);
 
-    using gdnOut = ws.alloc([BS * linHeads * linVDim], "BF16");
+    using gdnOut = ws.alloc([BS, fullZDim], "BF16", undefined, TensorParallelism.Row);
 
     gdnOut.gdnRecurrentStep(
       recurrentState, convOut,
       aBuf, bBuf,
       this.tensors.get(`${pfx}.A_log`)!, this.tensors.get(`${pfx}.dt_bias`)!,
-      linHeads, linKDim, linVDim,
-      BS, gdnState.recurrentStateStride, 1, convDim,
+      fullLinHeads, linKDim, linVDim,
+      BS, fullRecurrentStateStride, 1, fullConvDim,
     );
 
-    using gatedOut = ws.alloc([BS * linHeads * linVDim], "BF16");
-    gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, BS * linHeads);
+    using gatedOut = ws.alloc([BS, fullZDim], "BF16", undefined, TensorParallelism.Row);
+    gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, BS * fullLinHeads);
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!, BS);
 

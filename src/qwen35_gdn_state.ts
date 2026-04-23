@@ -9,25 +9,20 @@ export class Qwen35GdnState extends WorkspaceBase {
   cuSeqlens: Tensor;
   private cfg: Qwen35Config;
   readonly batchSize: number;
-
-  readonly convStateSize: number;
-  readonly recurrentStateSize: number;
-  readonly convStateStride: number;
-  readonly recurrentStateStride: number;
+  private readonly convStateSize: number;
+  private readonly recurrentStateSize: number;
 
   constructor(glm: DeviceOps, cfg: Qwen35Config, batchSize = 1) {
     super(glm);
     this.cfg = cfg;
     this.batchSize = batchSize;
-    const linHeads = cfg.linearNumKeyHeads;
+    const fullLinHeads = cfg.linearNumKeyHeads;
     const linKDim = cfg.linearKeyHeadDim;
     const linVDim = cfg.linearValueHeadDim;
+    const linHeads = fullLinHeads / glm.worldSize;
     const convDim = linHeads * (linKDim * 2 + linVDim);
-    const kernelSize = cfg.linearConvKernelDim;
-    this.convStateSize = convDim * (kernelSize - 1);
+    this.convStateSize = convDim * (cfg.linearConvKernelDim - 1);
     this.recurrentStateSize = linHeads * linKDim * linVDim;
-    this.convStateStride = this.convStateSize;
-    this.recurrentStateStride = this.recurrentStateSize;
     this.convState = [];
     this.recurrentState = [];
     for (let i = 0; i < cfg.numHiddenLayers; i++) {

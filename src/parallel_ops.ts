@@ -1,4 +1,4 @@
-import { DeviceOps, TensorParallelism } from "./device_ops";
+import { DeviceOps, GdnQkvLayout, TensorParallelism } from "./device_ops";
 import { GlmOps, getNativeAddon, f32ToBf16Bytes, bf16BytesToF32, MEMCPY_H2D, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM } from "./glm_ops";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
@@ -240,20 +240,24 @@ export class ParallelTensor extends Tensor {
     return out;
   }
 
-  gdnRecurrentStep(_state: Tensor, _qkv: Tensor, _aRaw: Tensor, _bRaw: Tensor, _aLog: Tensor, _dtBias: Tensor, _numHeads: number, _dK: number, _dV: number, _batchSize: number, _stateStride: number, _qkvChStride: number, _qkvSeqStride: number): void {
-    throw new Error("ParallelTensor.gdnRecurrentStep not implemented");
+  gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    this.parallelOps.gdnRecurrentStep(this, state, qkv, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
-  gdnPrefill(_state: Tensor, _qkv: Tensor, _aRaw: Tensor, _bRaw: Tensor, _aLog: Tensor, _dtBias: Tensor, _cuSeqlens: Tensor, _totalSeqLen: number, _numHeads: number, _dK: number, _dV: number, _batchSize: number, _stateStride: number, _qkvChStride: number, _qkvSeqStride: number): void {
-    throw new Error("ParallelTensor.gdnPrefill not implemented");
+  gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    this.parallelOps.gdnPrefill(this, state, qkv, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
-  causalConv1d(_convState: Tensor, _input: Tensor, _weight: Tensor, _cuSeqlens: Tensor, _convDim: number, _totalSeqLen: number, _kernelSize: number, _batchSize: number, _convStateStride: number, _chStride: number, _seqStride: number): void {
-    throw new Error("ParallelTensor.causalConv1d not implemented");
+  causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
+    this.parallelOps.causalConv1d(this, convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
   }
 
-  causalConv1dUpdate(_convState: Tensor, _input: Tensor, _weight: Tensor, _convDim: number, _kernelSize: number, _batchSize: number, _convStateStride: number): Tensor {
-    throw new Error("ParallelTensor.causalConv1dUpdate not implemented");
+  causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor {
+    const isRowPar = (input as ParallelTensor).parallelism === TensorParallelism.Row || (input as ParallelTensor).parallelism === TensorParallelism.Column;
+    const parallelism = isRowPar ? TensorParallelism.Row : TensorParallelism.Replicated;
+    const out = this.workspace.alloc([batchSize, convDim], this.type, undefined, parallelism);
+    this.parallelOps.causalConv1dUpdate(out, convState, this, weight, convDim, kernelSize, batchSize, convStateStride);
+    return out;
   }
 
   rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
@@ -268,8 +272,8 @@ export class ParallelTensor extends Tensor {
     this.parallelOps.fill(this, value, n);
   }
 
-  mmapLoad(mmapPtr: number, offset: number, nbytes: number): void {
-    this.parallelOps.mmapLoad(this, mmapPtr, offset, nbytes);
+  mmapLoad(mmapPtr: number, offset: number, nbytes: number, gdnQkvLayout?: import("./device_ops").GdnQkvLayout): void {
+    this.parallelOps.mmapLoad(this, mmapPtr, offset, nbytes, gdnQkvLayout);
   }
 
   writePinned(src: Buffer, size?: number): void {
@@ -822,7 +826,24 @@ export class ParallelOps implements DeviceOps {
     const pGate = this.cast(gate);
     const pWeight = this.cast(weight);
 
-    if (pInput.parallelism === TensorParallelism.Row || pInput.parallelism === TensorParallelism.Column) {
+    if (pInput.parallelism === TensorParallelism.Row && pGate.parallelism === TensorParallelism.Row &&
+        pOutput.parallelism === TensorParallelism.Row && pWeight.parallelism === TensorParallelism.Replicated) {
+      const shardBatch = batch / this.worldSize;
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].rmsnormGated(pOutput.shards[i], pInput.shards[i], pGate.shards[i], pWeight.shards[i], eps, dim, shardBatch);
+      }
+      return;
+    }
+
+    if (pInput.parallelism === TensorParallelism.Column) {
+      const shardBatch = batch / this.worldSize;
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].rmsnormGated(pOutput.shards[i], pInput.shards[i], pGate.shards[i], pWeight.shards[i], eps, dim, shardBatch);
+      }
+      return;
+    }
+
+    if (pInput.parallelism === TensorParallelism.Row) {
       const gathered = pInput.allGather(pInput.workspace);
       this.rmsnormGated(output, gathered, gate, weight, eps, dim, batch);
       gathered[Symbol.dispose]();
@@ -904,10 +925,68 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  gdnRecurrentStep(): void { throw new Error("ParallelOps.gdnRecurrentStep not implemented"); }
-  gdnPrefill(): void { throw new Error("ParallelOps.gdnPrefill not implemented"); }
-  causalConv1d(): void { throw new Error("ParallelOps.causalConv1d not implemented"); }
-  causalConv1dUpdate(): void { throw new Error("ParallelOps.causalConv1dUpdate not implemented"); }
+  causalConv1d(output: Tensor, convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
+    const pOutput = this.cast(output);
+    const pConvState = this.cast(convState);
+    const pInput = this.cast(input);
+    const pWeight = this.cast(weight);
+    const pCuSeqlens = this.cast(cuSeqlens);
+    const isRowPar = pInput.parallelism === TensorParallelism.Row || pInput.parallelism === TensorParallelism.Column;
+    const shardConvDim = isRowPar ? convDim / this.worldSize : convDim;
+    const shardConvStateStride = isRowPar ? convStateStride / this.worldSize : convStateStride;
+    const shardSeqStride = isRowPar ? seqStride / this.worldSize : seqStride;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].causalConv1d(pOutput.shards[i], pConvState.shards[i], pInput.shards[i], pWeight.shards[i], pCuSeqlens.shards[i], shardConvDim, totalSeqLen, kernelSize, batchSize, shardConvStateStride, chStride, shardSeqStride);
+    }
+  }
+
+  causalConv1dUpdate(output: Tensor, convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): void {
+    const pOutput = this.cast(output);
+    const pConvState = this.cast(convState);
+    const pInput = this.cast(input);
+    const pWeight = this.cast(weight);
+    const isRowPar = pInput.parallelism === TensorParallelism.Row || pInput.parallelism === TensorParallelism.Column;
+    const shardConvDim = isRowPar ? convDim / this.worldSize : convDim;
+    const shardConvStateStride = isRowPar ? convStateStride / this.worldSize : convStateStride;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].causalConv1dUpdate(pOutput.shards[i], pConvState.shards[i], pInput.shards[i], pWeight.shards[i], shardConvDim, kernelSize, batchSize, shardConvStateStride);
+    }
+  }
+
+  gdnPrefill(output: Tensor, state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    const pOutput = this.cast(output);
+    const pState = this.cast(state);
+    const pQkv = this.cast(qkv);
+    const pARaw = this.cast(aRaw);
+    const pBRaw = this.cast(bRaw);
+    const pALog = this.cast(aLog);
+    const pDtBias = this.cast(dtBias);
+    const pCuSeqlens = this.cast(cuSeqlens);
+    const isRowPar = pQkv.parallelism === TensorParallelism.Row || pQkv.parallelism === TensorParallelism.Column;
+    const shardHeads = isRowPar ? numHeads / this.worldSize : numHeads;
+    const shardStateStride = isRowPar ? stateStride / this.worldSize : stateStride;
+    const shardSeqStride = isRowPar ? qkvSeqStride / this.worldSize : qkvSeqStride;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].gdnPrefill(pOutput.shards[i], pState.shards[i], pQkv.shards[i], pARaw.shards[i], pBRaw.shards[i], pALog.shards[i], pDtBias.shards[i], pCuSeqlens.shards[i], totalSeqLen, shardHeads, dK, dV, batchSize, shardStateStride, qkvChStride, shardSeqStride);
+    }
+  }
+
+  gdnRecurrentStep(output: Tensor, state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    const pOutput = this.cast(output);
+    const pState = this.cast(state);
+    const pQkv = this.cast(qkv);
+    const pARaw = this.cast(aRaw);
+    const pBRaw = this.cast(bRaw);
+    const pALog = this.cast(aLog);
+    const pDtBias = this.cast(dtBias);
+    const isRowPar = pQkv.parallelism === TensorParallelism.Row || pQkv.parallelism === TensorParallelism.Column;
+    const shardHeads = isRowPar ? numHeads / this.worldSize : numHeads;
+    const shardStateStride = isRowPar ? stateStride / this.worldSize : stateStride;
+    const shardSeqStride = isRowPar ? qkvSeqStride / this.worldSize : qkvSeqStride;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].gdnRecurrentStep(pOutput.shards[i], pState.shards[i], pQkv.shards[i], pARaw.shards[i], pBRaw.shards[i], pALog.shards[i], pDtBias.shards[i], shardHeads, dK, dV, batchSize, shardStateStride, qkvChStride, shardSeqStride);
+    }
+  }
   batchDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, enableCudaGraph: boolean): void {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
@@ -967,8 +1046,39 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mmapLoad(gpuDst: Tensor, mmapPtr: number, offset: number, nbytes: number): void {
+  mmapLoad(gpuDst: Tensor, mmapPtr: number, offset: number, nbytes: number, gdnQkvLayout?: GdnQkvLayout): void {
     const pDst = this.cast(gpuDst);
+
+    if (gdnQkvLayout && pDst.parallelism === TensorParallelism.Column) {
+      const { numHeads, dK, dV } = gdnQkvLayout;
+      const Hlocal = numHeads / this.worldSize;
+      const qRows = numHeads * dK;
+      const bytesPerRow = pDst.fullShape.slice(1).reduce((a, b) => a * b, 1) * this.elemBytes(pDst.type);
+      const srcBase = mmapPtr + offset;
+      for (let i = 0; i < this.worldSize; i++) {
+        const hStart = i * Hlocal;
+        const shardData = pDst.shards[i].data;
+        this.devices[i].memcpy2d(
+          shardData, bytesPerRow,
+          srcBase + hStart * dK * bytesPerRow, bytesPerRow,
+          bytesPerRow, Hlocal * dK,
+          MEMCPY_H2D,
+        );
+        this.devices[i].memcpy2d(
+          shardData + Hlocal * dK * bytesPerRow, bytesPerRow,
+          srcBase + (qRows + hStart * dK) * bytesPerRow, bytesPerRow,
+          bytesPerRow, Hlocal * dK,
+          MEMCPY_H2D,
+        );
+        this.devices[i].memcpy2d(
+          shardData + 2 * Hlocal * dK * bytesPerRow, bytesPerRow,
+          srcBase + (2 * qRows + hStart * dV) * bytesPerRow, bytesPerRow,
+          bytesPerRow, Hlocal * dV,
+          MEMCPY_H2D,
+        );
+      }
+      return;
+    }
 
     if (pDst.parallelism === TensorParallelism.Replicated || pDst.parallelism === TensorParallelism.PartialSum) {
       for (let i = 0; i < this.worldSize; i++) {
