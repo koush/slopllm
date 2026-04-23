@@ -1,5 +1,5 @@
 import { DeviceOps, TensorParallelism } from "./device_ops";
-import { GlmOps, getNative, f32ToBf16Bytes, bf16BytesToF32, MEMCPY_H2D, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM } from "./glm_ops";
+import { GlmOps, getNativeAddon, f32ToBf16Bytes, bf16BytesToF32, MEMCPY_H2D, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM } from "./glm_ops";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
@@ -66,15 +66,15 @@ export class ParallelTensor extends Tensor {
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     const dtype = this.parallelOps.ncclDatatype(this.type);
     const comms = this.parallelOps.comms;
-    getNative().ncclGroupStart();
+    getNativeAddon().ncclGroupStart();
     for (let i = 0; i < this.devices.length; i++) {
-      getNative().ncclAllReduce(
+      getNativeAddon().ncclAllReduce(
         comms[i], this.devices[i].ctx,
         this.shards[i].data, this.shards[i].data,
         count, dtype, NCCL_SUM,
       );
     }
-    getNative().ncclGroupEnd();
+    getNativeAddon().ncclGroupEnd();
     this.parallelism = TensorParallelism.Replicated;
     return this;
   }
@@ -92,15 +92,15 @@ export class ParallelTensor extends Tensor {
     const comms = this.parallelOps.comms;
 
     if (this.parallelism === TensorParallelism.Column) {
-      getNative().ncclGroupStart();
+      getNativeAddon().ncclGroupStart();
       for (let i = 0; i < this.devices.length; i++) {
-        getNative().ncclAllGather(
+        getNativeAddon().ncclAllGather(
           comms[i], this.devices[i].ctx,
           this.shards[i].data, output.shards[i].data,
           count, dtype,
         );
       }
-      getNative().ncclGroupEnd();
+      getNativeAddon().ncclGroupEnd();
       return output;
     }
 
@@ -116,15 +116,15 @@ export class ParallelTensor extends Tensor {
       const shardWss = this.parallelOps.getShardWorkspaces(workspace);
       const tempTensors = shardWss.map(ws => ws.alloc([totalBytes], "U8"));
 
-      getNative().ncclGroupStart();
+      getNativeAddon().ncclGroupStart();
       for (let i = 0; i < this.devices.length; i++) {
-        getNative().ncclAllGather(
+        getNativeAddon().ncclAllGather(
           comms[i], this.devices[i].ctx,
           this.shards[i].data, tempTensors[i].data,
           count, dtype,
         );
       }
-      getNative().ncclGroupEnd();
+      getNativeAddon().ncclGroupEnd();
 
       for (let i = 0; i < this.devices.length; i++) {
         for (let r = 0; r < this.devices.length; r++) {
@@ -268,6 +268,10 @@ export class ParallelTensor extends Tensor {
     this.parallelOps.fill(this, value, n);
   }
 
+  mmapLoad(mmapPtr: number, offset: number, nbytes: number): void {
+    this.parallelOps.mmapLoad(this, mmapPtr, offset, nbytes);
+  }
+
   writePinned(src: Buffer, size?: number): void {
     this.parallelOps.writePinned(this, src, size);
   }
@@ -302,7 +306,7 @@ export class ParallelOps implements DeviceOps {
     this.worldSize = devices.length;
     if (devices.length > 1) {
       const deviceIds = devices.map(d => d.device);
-      this.comms = getNative().ncclCommInitAll(deviceIds);
+      this.comms = getNativeAddon().ncclCommInitAll(deviceIds);
     } else {
       this.comms = [];
     }
@@ -311,7 +315,7 @@ export class ParallelOps implements DeviceOps {
   free(): void {
     if (this.comms.length > 0) {
       for (const comm of this.comms) {
-        getNative().ncclCommDestroy(comm);
+        getNativeAddon().ncclCommDestroy(comm);
       }
     }
   }
@@ -964,10 +968,6 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mmapOpen(filePath: string): number {
-    return this.devices[0].mmapOpen(filePath);
-  }
-
   mmapLoad(gpuDst: Tensor, mmapPtr: number, offset: number, nbytes: number): void {
     const pDst = this.cast(gpuDst);
 
@@ -1008,10 +1008,6 @@ export class ParallelOps implements DeviceOps {
     }
 
     throw new Error(`mmapLoad: unsupported parallelism ${pDst.parallelism}`);
-  }
-
-  mmapClose(mmapPtr: number, size: number): void {
-    this.devices[0].mmapClose(mmapPtr, size);
   }
 
   sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyOffsets: Tensor, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, randomVals: Tensor, maxEffectiveK: number): void {

@@ -66,6 +66,7 @@ export abstract class Tensor implements Disposable {
   abstract rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void;
   abstract gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void;
   abstract fill(value: number, n: number): void;
+  abstract mmapLoad(mmapPtr: number, offset: number, nbytes: number): void;
   abstract writePinned(src: Buffer, size?: number): void;
   abstract rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor };
 

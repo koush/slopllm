@@ -20,10 +20,6 @@ export interface DeviceOps {
   batchPrefillPagedPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, pagedKvIndptrH: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, maskMode: number): void;
   batchPrefillPagedRun(q: Tensor, o: Tensor, kData: Tensor, vData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, qIndptrD: Tensor, planInfo: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): void;
 
-  mmapOpen(filePath: string): number;
-  mmapLoad(gpuDst: Tensor, mmapPtr: number, offset: number, nbytes: number): void;
-  mmapClose(mmapPtr: number, size: number): void;
-
   graphBeginCapture(): void;
   graphEndCapture(): number;
   graphInstantiate(graph: number): number;

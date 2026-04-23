@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DeviceOps } from "./device_ops";
+import { mmapOpen, mmapClose } from "./glm_ops";
 import { PagedKVCache, type BatchState } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
@@ -66,7 +67,7 @@ export abstract class ChatModel extends WorkspaceBase {
 
     for (const stPath of shards) {
       const st = SafeTensorFile.open(stPath);
-      const mmapPtr = this.glm.mmapOpen(stPath);
+      const mmapPtr = mmapOpen(stPath);
       const fileSize = fs.statSync(stPath).size;
 
       for (const name of st.tensorNames()) {
@@ -75,7 +76,7 @@ export abstract class ChatModel extends WorkspaceBase {
 
       this.glm.synchronize();
       st.close();
-      this.glm.mmapClose(mmapPtr, fileSize);
+      mmapClose(mmapPtr, fileSize);
     }
 
     this.tieWeights();

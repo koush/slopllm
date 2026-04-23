@@ -173,7 +173,7 @@ export class Qwen35Model extends ChatModel {
       const tensor = this.alloc(meta.shape, "F32", name, par);
       if (meta.dtype === "F32") {
         const offset = st.dataStart + meta.dataOffsets[0];
-        this.glm.mmapLoad(tensor, mmapPtr, offset, tensor.bytes);
+        tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
       } else {
         const rawBytes = st.readTensor(name);
         const f32Arr = new Float32Array(numElements);
@@ -208,11 +208,11 @@ export class Qwen35Model extends ChatModel {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name, par);
       const offset = st.dataStart + meta.dataOffsets[0];
-      this.glm.mmapLoad(tensor, mmapPtr, offset, tensor.bytes);
+      tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
 
       if (this.cfg.tieWordEmbeddings && name === `${prefix}embed_tokens.weight` && !this.tensors.has("lm_head.weight")) {
         const lmHead = this.alloc(meta.shape, dtype, "lm_head.weight", TensorParallelism.Column);
-        this.glm.mmapLoad(lmHead, mmapPtr, offset, lmHead.bytes);
+        lmHead.mmapLoad(mmapPtr, offset, lmHead.bytes);
       }
     }
   }
