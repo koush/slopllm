@@ -65,16 +65,22 @@ export abstract class ChatModel extends WorkspaceBase {
       }
     }
 
-    for (const stPath of shards) {
+    const openShards = shards.map(stPath => {
       const st = SafeTensorFile.open(stPath);
       const mmapPtr = mmapOpen(stPath);
       const fileSize = fs.statSync(stPath).size;
+      return { st, mmapPtr, fileSize };
+    });
 
+    for (const { st, mmapPtr } of openShards) {
       for (const name of st.tensorNames()) {
         this.loadTensor(name, st.meta(name), st, mmapPtr);
       }
+    }
 
-      this.glm.synchronize();
+    this.glm.synchronize();
+
+    for (const { st, mmapPtr, fileSize } of openShards) {
       st.close();
       mmapClose(mmapPtr, fileSize);
     }
