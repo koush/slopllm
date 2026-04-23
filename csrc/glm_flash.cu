@@ -119,6 +119,8 @@ void glm_flash_prefill(
     int v_stride_n, int v_stride_h,
     int mask_mode, int kv_layout, float sm_scale) {
 
+  cudaSetDevice(ctx->device_id);
+
   using Params = flashinfer::SinglePrefillParams<DType, DType, DTypeO>;
 
   Params params;
@@ -203,6 +205,8 @@ void glm_flash_decode(
     int kv_stride_n, int kv_stride_h,
     float sm_scale) {
 
+  cudaSetDevice(ctx->device_id);
+
   using Params = flashinfer::SingleDecodeParams<DType, DType, DTypeO>;
 
   Params params;
@@ -257,6 +261,8 @@ void glm_batch_decode_plan(
     uint32_t head_dim, uint32_t page_size,
     bool enable_cuda_graph) {
 
+  cudaSetDevice(ctx->device_id);
+
   if (head_dim == 256) {
     glm_batch_decode_plan_impl<256>(ctx, float_ws, float_ws_size,
         int_ws, pinned_int_ws, int_ws_size,
@@ -280,6 +286,8 @@ void glm_batch_decode_run(
     uint32_t batch_size,
     uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim, uint32_t page_size, float sm_scale) {
+
+  cudaSetDevice(ctx->device_id);
 
   using DecodeParams = flashinfer::BatchDecodeParams<DType, DType, DTypeO, IdType>;
 
@@ -354,6 +362,8 @@ void glm_batch_prefill_paged_plan(
     uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim, uint32_t page_size, int mask_mode) {
 
+  cudaSetDevice(ctx->device_id);
+
   flashinfer::PrefillPlanInfo info;
 
   cudaError_t status = flashinfer::PrefillPlan<IdType>(
@@ -399,6 +409,8 @@ void glm_batch_prefill_paged_run(
     uint32_t page_size,
     int32_t q_stride_n, int32_t q_stride_h,
     int mask_mode, float sm_scale) {
+
+  cudaSetDevice(ctx->device_id);
 
   using PrefillParams = flashinfer::BatchPrefillPagedParams<DType, DType, DTypeO, IdType>;
 

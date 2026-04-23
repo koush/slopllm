@@ -273,7 +273,9 @@ export class ParallelTensor extends Tensor {
   }
 
   writePinned(src: Buffer, size?: number): void {
-    this.parallelOps.writePinned(this, src, size);
+    for (let i = 0; i < this.shards.length; i++) {
+      this.devices[i].writePinned(this.shards[i], src, size);
+    }
   }
 
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
@@ -893,15 +895,6 @@ export class ParallelOps implements DeviceOps {
     const shardVTokenStride = isRowPar ? srcVTokenStride / this.worldSize : srcVTokenStride;
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].kvCacheWrite(pSrcK.shards[i], pSrcV.shards[i], pDstK.shards[i], pDstV.shards[i], pSlotMapping.shards[i], batchSize, shardNKv, hd, pageSize, shardKTokenStride, srcKHeadStride, shardVTokenStride, srcVHeadStride);
-    }
-  }
-
-  writePinned(dst: Tensor, src: Buffer, size?: number): void {
-    const pDst = this.cast(dst);
-    this.assertParallel("writePinned", pDst, TensorParallelism.Replicated);
-    this.devices[0].writePinned(pDst.shards[0], src, size);
-    for (let i = 1; i < this.worldSize; i++) {
-      this.devices[i].h2d(pDst.shards[i], src, size ?? src.length);
     }
   }
 
