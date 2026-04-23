@@ -139,7 +139,7 @@ void glm_d2h(GlmCtx* ctx, void* dst, const void* src, size_t bytes) {
 // ---------------------------------------------------------------------------
 
 void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes) {
-    cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, ctx->stream);
+    cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, ctx->stream);
 }
 
 void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,

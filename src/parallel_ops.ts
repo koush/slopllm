@@ -282,6 +282,16 @@ export class ParallelTensor extends Tensor {
     }
   }
 
+  memcpy(src: Tensor, size?: number): void {
+    if (!(src instanceof ParallelTensor)) {
+      throw new Error("ParallelTensor.memcpy requires ParallelTensor source");
+    }
+    const bytes = size ?? Math.min(this.allocSize, src.allocSize);
+    for (let i = 0; i < this.shards.length; i++) {
+      this.devices[i].memcpy(this.shards[i].data, src.shards[i].data, bytes);
+    }
+  }
+
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     const hd = dimHalf * 2;
     const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);

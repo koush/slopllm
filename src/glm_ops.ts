@@ -243,6 +243,14 @@ export class GlmTensor extends Tensor {
     this.glm.writePinned(this, src, size);
   }
 
+  memcpy(src: Tensor, size?: number): void {
+    if (!(src instanceof GlmTensor)) {
+      throw new Error("GlmTensor.memcpy requires GlmTensor source");
+    }
+    const bytes = size ?? Math.min(this.allocSize, src.allocSize);
+    this.glm.memcpy(this.data, src.data, bytes);
+  }
+
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     const hd = dimHalf * 2;
     const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
