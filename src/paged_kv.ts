@@ -39,7 +39,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
   indptrD: Tensor;
   indptrH: Tensor;
   lastPageLen: Tensor;
-  lastPageLenH: Tensor;
 
   constructor(glm: DeviceOps, B: number, S: number) {
     super(glm);
@@ -58,7 +57,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.indptrD = this.alloc([(B + 1) * I32], "I32", "indptrD");
     this.indptrH = this.allocPinned([(B + 1) * I32], "I32", "indptrH");
     this.lastPageLen = this.alloc([B * I32], "I32", "lastPageLen");
-    this.lastPageLenH = this.allocPinned([B * I32], "I32", "lastPageLenH");
   }
 
   flashDecode(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
@@ -417,7 +415,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const lastPageLenBuf = Int32Array.from(lastPageLenList);
 
     ws.indptrH.writePinned(Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
-    ws.lastPageLenH.writePinned(Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
     this.indices.h2d(Buffer.from(indicesBuf.buffer, indicesBuf.byteOffset, indicesBuf.byteLength));
     ws.indptrD.h2d(Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
     ws.lastPageLen.h2d(Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
