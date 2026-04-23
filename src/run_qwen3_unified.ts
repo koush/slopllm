@@ -136,10 +136,19 @@ function tokenizeMessages(
 
 // --- Generation primitives ---
 
+export interface DecodeTiming {
+  planMs: number;
+  execMs: number;
+  sampleMs: number;
+  warmupSteps: number;
+  graphSteps: number;
+}
+
 export function* generateStream(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
+  timing?: DecodeTiming,
 ): Generator<number> {
   const suffixIds = cache.prefixMatch(0, inputIds);
   cache.appendTokens(0, suffixIds);
@@ -155,12 +164,23 @@ export function* generateStream(
   let logits: Tensor | null = null;
   let argmaxResult: Tensor | null = null;
 
-  for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
-    const state = ws.planDecode(model, [currentToken], cache, useGraph);
+  let planMs = 0;
+  let execMs = 0;
+  let sampleMs = 0;
+  let warmupSteps = 0;
+  let graphSteps = 0;
 
+  try {
+  for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
+    const tPlan = performance.now();
+    const state = ws.planDecode(model, [currentToken], cache, useGraph);
+    planMs += performance.now() - tPlan;
+
+    const tExec = performance.now();
     if (useGraph && graphState!.graphExec !== null) {
       glm.graphLaunch(graphState!.graphExec);
       glm.synchronize();
+      graphSteps++;
     } else {
       if (useGraph && graphState!.warmupRemaining === 0 && !capturing) {
         capturing = true;
@@ -180,17 +200,31 @@ export function* generateStream(
         capturing = false;
       }
       if (useGraph) graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
+      warmupSteps++;
     }
+    execMs += performance.now() - tExec;
 
+    const tSample = performance.now();
     if (sampling  ) {
-      currentToken = logits!.sampleTokenGPU(sampling, tokenHistory).readInt32LE()[0];
+      using sampleResult = logits!.sampleTokenGPU(sampling, tokenHistory);
+      currentToken = sampleResult.readInt32LE()[0];
     } else {
       currentToken = argmaxResult!.readInt32LE()[0];
     }
+    sampleMs += performance.now() - tSample;
 
     cache.appendTokens(0, [currentToken]);
     tokenHistory.push(currentToken);
     yield currentToken;
+  }
+  } finally {
+    if (timing) {
+      timing.planMs = planMs;
+      timing.execMs = execMs;
+      timing.sampleMs = sampleMs;
+      timing.warmupSteps = warmupSteps;
+      timing.graphSteps = graphSteps;
+    }
   }
 }
 
@@ -276,8 +310,9 @@ async function interactiveChat(
       const t0 = performance.now();
       let tokCount = 0;
       const generatedIds: number[] = [];
+      const timing: DecodeTiming = { planMs: 0, execMs: 0, sampleMs: 0, warmupSteps: 0, graphSteps: 0 };
 
-      for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState)) {
+      for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing)) {
         generatedIds.push(tokenId);
         tokCount++;
         const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -286,7 +321,9 @@ async function interactiveChat(
       }
 
       const elapsed = performance.now() - t0;
+      const totalMs = timing.planMs + timing.execMs + timing.sampleMs;
       console.log(`\n  [${tokCount} tokens in ${(elapsed / 1000).toFixed(1)}s, ${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s]`);
+      console.log(`  timing: plan=${timing.planMs.toFixed(1)}ms exec=${timing.execMs.toFixed(1)}ms sample=${timing.sampleMs.toFixed(1)}ms other=${(elapsed - totalMs).toFixed(1)}ms (warmup=${timing.warmupSteps} graph=${timing.graphSteps})`);
 
       const responseText = tokenizer.decode(generatedIds.filter(t => !eosIds.has(t)), { skip_special_tokens: true });
       messages.push({ role: "assistant", content: responseText });
@@ -313,8 +350,9 @@ async function singlePrompt(
   const t0 = performance.now();
   let tokCount = 0;
   const generatedIds: number[] = [];
+  const timing: DecodeTiming = { planMs: 0, execMs: 0, sampleMs: 0, warmupSteps: 0, graphSteps: 0 };
 
-  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState)) {
+  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -323,7 +361,9 @@ async function singlePrompt(
   }
 
   const elapsed = performance.now() - t0;
+  const totalMs = timing.planMs + timing.execMs + timing.sampleMs;
   console.log(`\n\n${tokCount} tokens in ${elapsed.toFixed(1)}ms (${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s)`);
+  console.log(`timing: plan=${timing.planMs.toFixed(1)}ms exec=${timing.execMs.toFixed(1)}ms sample=${timing.sampleMs.toFixed(1)}ms other=${(elapsed - totalMs).toFixed(1)}ms (warmup=${timing.warmupSteps} graph=${timing.graphSteps})`);
 
   if (graphState?.graphExec !== null && graphState?.graphExec !== undefined) glm.graphExecDestroy(graphState.graphExec);
 }
