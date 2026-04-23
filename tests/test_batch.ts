@@ -244,9 +244,7 @@ describe("Qwen3-0.6B batch tests", () => {
       const captureLogits = model.forward(state);
       const captureArgmax = captureLogits.argmax();
       const graph = glm.graphEndCapture();
-      assert.ok(graph, "graph_end_capture returned null");
       const graphExec = glm.graphInstantiate(graph);
-      assert.ok(graphExec, "graph_instantiate returned null");
 
       pagedKV.reset(1);
       const tokens3 = ws.forwardEager(model, [prompt], pagedKV);
@@ -303,9 +301,7 @@ describe("Qwen3-0.6B batch tests", () => {
       const captureLogits = model.forward(state);
       const captureArgmax = captureLogits.argmax();
       const graph = glm.graphEndCapture();
-      assert.ok(graph, "graph_end_capture returned null");
       const graphExec = glm.graphInstantiate(graph);
-      assert.ok(graphExec, "graph_instantiate returned null");
       glm.graphDestroy(graph);
 
       glm.graphLaunch(graphExec);

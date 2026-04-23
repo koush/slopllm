@@ -87,9 +87,7 @@ describe("Qwen3-0.6B generate Paris with CUDA graphs (2-GPU ParallelOps)", () =>
 
         if (capturing) {
           graphIdx = po.graphEndCapture();
-          if (graphIdx === null || graphIdx === undefined) throw new Error("Graph capture failed");
           graphExec = po.graphInstantiate(graphIdx);
-          if (graphExec === null || graphExec === undefined) throw new Error("Graph instantiation failed");
           po.graphDestroy(graphIdx);
           capturing = false;
         }

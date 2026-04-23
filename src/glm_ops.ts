@@ -447,11 +447,15 @@ export class GlmOps implements DeviceOps {
   }
 
   graphEndCapture(): number {
-    return getNativeAddon().graphEndCapture(this.ctx);
+    const graph = getNativeAddon().graphEndCapture(this.ctx);
+    if (!graph) throw new Error("CUDA graph capture failed");
+    return graph;
   }
 
   graphInstantiate(graph: number): number {
-    return getNativeAddon().graphInstantiate(graph);
+    const exec = getNativeAddon().graphInstantiate(graph);
+    if (!exec) throw new Error("CUDA graph instantiation failed");
+    return exec;
   }
 
   graphLaunch(graphExec: number): void {

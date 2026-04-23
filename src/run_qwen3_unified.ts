@@ -1,4 +1,5 @@
 import { GlmOps } from "./glm_ops";
+import { ParallelOps } from "./parallel_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model } from "./qwen35_model";
 import { ChatModel, ChatCache, SamplingParams, makeSamplingParams } from "./chat_model";
@@ -19,7 +20,7 @@ export interface GraphState {
 }
 
 interface CliArgs {
-  gpu: number;
+  gpus: number[];
   maxNewTokens: number;
   maxSeqLen: number;
   warmupSteps: number;
@@ -41,8 +42,9 @@ interface CliArgs {
 }
 
 function parseArgs(argv: string[]): CliArgs {
+  const gpusEnv = process.env.GLM_GPUS ?? process.env.GLM_GPU ?? "0";
   const args: CliArgs = {
-    gpu: parseInt(process.env.GLM_GPU ?? "0", 10),
+    gpus: gpusEnv.split(",").map(s => parseInt(s.trim(), 10)),
     maxNewTokens: 256,
     maxSeqLen: 4096,
     warmupSteps: 3,
@@ -68,7 +70,8 @@ function parseArgs(argv: string[]): CliArgs {
     if (a === "--prompt" && i + 1 < argv.length) args.prompt = argv[++i];
     else if (a === "--max-new-tokens" && i + 1 < argv.length) args.maxNewTokens = parseInt(argv[++i], 10);
     else if (a === "--warmup-steps" && i + 1 < argv.length) args.warmupSteps = parseInt(argv[++i], 10);
-    else if (a === "--gpu" && i + 1 < argv.length) args.gpu = parseInt(argv[++i], 10);
+    else if (a === "--gpus" && i + 1 < argv.length) args.gpus = argv[++i].split(",").map(s => parseInt(s.trim(), 10));
+    else if (a === "--gpu" && i + 1 < argv.length) args.gpus = [parseInt(argv[++i], 10)];
     else if (a === "--max-seq-len" && i + 1 < argv.length) args.maxSeqLen = parseInt(argv[++i], 10);
     else if (a === "--max-pages" && i + 1 < argv.length) args.maxPages = parseInt(argv[++i], 10);
     else if (a === "--max-batch" && i + 1 < argv.length) args.maxBatch = parseInt(argv[++i], 10);
@@ -172,9 +175,7 @@ export function* generateStream(
 
       if (capturing) {
         const graph = glm.graphEndCapture();
-        if (!graph) throw new Error("Graph capture failed");
         graphState!.graphExec = glm.graphInstantiate(graph);
-        if (!graphState!.graphExec) throw new Error("Graph instantiation failed");
         glm.graphDestroy(graph);
         capturing = false;
       }
@@ -291,10 +292,7 @@ async function interactiveChat(
       messages.push({ role: "assistant", content: responseText });
     }
   } finally {
-    if (graphState?.graphExec) glm.graphExecDestroy(graphState.graphExec);
-    cache.free();
-    ws.free();
-    model.free();
+    if (graphState?.graphExec !== null && graphState?.graphExec !== undefined) glm.graphExecDestroy(graphState.graphExec);
     rl.close();
   }
 }
@@ -327,10 +325,7 @@ async function singlePrompt(
   const elapsed = performance.now() - t0;
   console.log(`\n\n${tokCount} tokens in ${elapsed.toFixed(1)}ms (${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s)`);
 
-  if (graphState?.graphExec) glm.graphExecDestroy(graphState.graphExec);
-  cache.free();
-  ws.free();
-  model.free();
+  if (graphState?.graphExec !== null && graphState?.graphExec !== undefined) glm.graphExecDestroy(graphState.graphExec);
 }
 
 // --- Batch mode ---
@@ -396,9 +391,6 @@ async function interactiveBatch(
       console.log(`\n  [${prompts.length} prompts, ${totalTokens} tokens, ${elapsed.toFixed(1)}s, ${(totalTokens / elapsed).toFixed(1)} tok/s]`);
     }
   } finally {
-    cache.free();
-    ws.free();
-    model.free();
     rl.close();
   }
 }
@@ -408,14 +400,16 @@ async function interactiveBatch(
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
-  process.env.CUDA_VISIBLE_DEVICES = String(args.gpu);
-
-  const glm = new GlmOps(0);
+  const gpuDevices = args.gpus.map(id => new GlmOps(id));
+  const glm: DeviceOps = gpuDevices.length > 1
+    ? new ParallelOps(gpuDevices)
+    : gpuDevices[0];
+  const gpuLabel = args.gpus.join(",");
 
   const repoId = args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
   const maxBatch = args.useBatch ? args.maxBatch : 1;
 
-  console.log(`Loading ${modelLabel(args)} on GPU ${args.gpu}...`);
+  console.log(`Loading ${modelLabel(args)} on GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}...`);
   const model: ChatModel = args.useQwen35
     ? Qwen35Model.fromPretrained(glm, QWEN35_REPO, maxBatch, args.maxSeqLen)
     : Qwen3Model.fromPretrained(glm, repoId, maxBatch, args.maxSeqLen);
@@ -434,7 +428,16 @@ async function main(): Promise<void> {
   if (sp.presencePenalty !== 0) samplingParts.push(`pres_pen=${sp.presencePenalty}`);
   const samplingStr = !args.greedy ? samplingParts.join(" ") : "greedy";
 
-  console.log(`${modelLabel(args)}  |  GPU ${args.gpu}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}`);
+  console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}`);
+
+  const cleanup = () => {
+    glm.synchronize();
+    cache.free();
+    ws.free();
+    model.free();
+    if (glm instanceof ParallelOps) glm.free();
+    for (const d of gpuDevices) d.free();
+  };
 
   if (args.useBatch) {
     await interactiveBatch(model, ws, cache, tokenizer, args);
@@ -447,6 +450,8 @@ async function main(): Promise<void> {
       await interactiveChat(model, ws, glm, cache, tokenizer, args, graphState);
     }
   }
+
+  cleanup();
 }
 
 main().catch((err) => {
