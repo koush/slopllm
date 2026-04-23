@@ -634,6 +634,7 @@ export class ParallelOps implements DeviceOps {
     if (pInput.parallelism === TensorParallelism.Row || pInput.parallelism === TensorParallelism.Column) {
       const gathered = pInput.allGather(pInput.workspace);
       this.rmsnorm(out, gathered, weight, eps, dim, batch);
+      gathered[Symbol.dispose]();
       return;
     }
 
@@ -668,6 +669,7 @@ export class ParallelOps implements DeviceOps {
     if (pInputA.parallelism === TensorParallelism.Row || pInputA.parallelism === TensorParallelism.Column) {
       const gathered = pInputA.allGather(pInputA.workspace);
       this.fusedAddRmsnorm(out, residual, gathered, inputB, weight, eps, dim, batch);
+      gathered[Symbol.dispose]();
       return;
     }
 
@@ -680,6 +682,7 @@ export class ParallelOps implements DeviceOps {
     if (pInputB.parallelism === TensorParallelism.Row || pInputB.parallelism === TensorParallelism.Column) {
       const gathered = pInputB.allGather(pInputB.workspace);
       this.fusedAddRmsnorm(out, residual, inputA, gathered, weight, eps, dim, batch);
+      gathered[Symbol.dispose]();
       return;
     }
 
@@ -725,6 +728,7 @@ export class ParallelOps implements DeviceOps {
     if (pInput.parallelism === TensorParallelism.Column) {
       const gathered = pInput.allGather(pInput.workspace);
       this.fusedNormRope(out, gathered, weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+      gathered[Symbol.dispose]();
       return;
     }
 
@@ -774,6 +778,7 @@ export class ParallelOps implements DeviceOps {
     if (pInput.parallelism === TensorParallelism.Row || pInput.parallelism === TensorParallelism.Column) {
       const gathered = pInput.allGather(pInput.workspace);
       this.argmax(outIndex, gathered, dim, batch);
+      gathered[Symbol.dispose]();
       return;
     }
 
@@ -820,6 +825,7 @@ export class ParallelOps implements DeviceOps {
     if (pInput.parallelism === TensorParallelism.Row || pInput.parallelism === TensorParallelism.Column) {
       const gathered = pInput.allGather(pInput.workspace);
       this.rmsnormGated(output, gathered, gate, weight, eps, dim, batch);
+      gathered[Symbol.dispose]();
       return;
     }
 
@@ -1034,6 +1040,9 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  private graphHandles: (number | undefined)[][] = [];
+  private graphExecHandles: number[][] = [];
+
   graphBeginCapture(): void {
     for (const device of this.devices) {
       device.graphBeginCapture();
@@ -1042,29 +1051,41 @@ export class ParallelOps implements DeviceOps {
 
   graphEndCapture(): number {
     const graphs = this.devices.map(d => d.graphEndCapture());
-    return graphs[0];
+    const idx = this.graphHandles.length;
+    this.graphHandles.push(graphs);
+    return idx;
   }
 
   graphInstantiate(graph: number): number {
-    const execs = this.devices.map(d => d.graphInstantiate(graph));
-    return execs[0];
+    const handles = this.graphHandles[graph]!;
+    const execs = this.devices.map((d, i) => d.graphInstantiate(handles[i]!));
+    const idx = this.graphExecHandles.length;
+    this.graphExecHandles.push(execs);
+    return idx;
   }
 
   graphLaunch(graphExec: number): void {
-    for (const device of this.devices) {
-      device.graphLaunch(graphExec);
+    const execs = this.graphExecHandles[graphExec];
+    for (let i = 0; i < this.devices.length; i++) {
+      this.devices[i].graphLaunch(execs[i]);
     }
   }
 
   graphDestroy(graph: number): void {
-    for (const device of this.devices) {
-      device.graphDestroy(graph);
+    const handles = this.graphHandles[graph];
+    if (handles !== undefined) {
+      for (let i = 0; i < this.devices.length; i++) {
+        this.devices[i].graphDestroy(handles[i]!);
+      }
+      delete this.graphHandles[graph];
     }
   }
 
   graphExecDestroy(graphExec: number): void {
-    for (const device of this.devices) {
-      device.graphExecDestroy(graphExec);
+    const execs = this.graphExecHandles[graphExec];
+    for (let i = 0; i < this.devices.length; i++) {
+      this.devices[i].graphExecDestroy(execs[i]);
     }
+    delete this.graphExecHandles[graphExec];
   }
 }
