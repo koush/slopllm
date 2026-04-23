@@ -15,8 +15,6 @@ export interface GdnQkvLayout {
 }
 
 export interface DeviceOps {
-  readonly worldSize: number;
-
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean): Tensor;
   synchronize(): void;

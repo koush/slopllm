@@ -257,7 +257,6 @@ export class GlmTensor extends Tensor {
 }
 
 export class GlmOps implements DeviceOps {
-  readonly worldSize = 1;
   ctx: number;
   device: number;
 
