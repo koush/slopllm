@@ -58,7 +58,7 @@ export class WorkspaceBase {
       return tensor;
     }
 
-    const tensor = this.glm.newTensor(this, shape, type, pinned, undefined);
+    const tensor = this.glm.newTensor(this, shape, type, pinned, undefined, parallelism);
 
     this.tracked.add(tensor);
     return tensor;
