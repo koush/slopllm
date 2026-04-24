@@ -51,37 +51,14 @@ interface NativeAddon {
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
   linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number): void;
   embedding(ctx: number, out: number, table: number, ids: number, hidden: number, seqLen: number): void;
-  layernorm(ctx: number, out: number, input: number, weight: number, bias: number, eps: number, dim: number, batch: number): void;
-  relu(ctx: number, out: number, input: number, n: number): void;
-  sigmoid(ctx: number, out: number, input: number, n: number): void;
-  softmax(ctx: number, out: number, input: number, mask: number, dim: number, batch: number): void;
-  causalMask(ctx: number, out: number, seqLen: number): void;
   fill(ctx: number, out: number, value: number, n: number): void;
-  gather(ctx: number, out: number, input: number, indices: number, k: number, inDim: number, batch: number): void;
-  scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
-  catLastDim(ctx: number, out: number, a: number, b: number, aLastDim: number, bLastDim: number, outer: number): void;
-  maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void;
-  indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
-  applyRotaryPosEmb(ctx: number, out: number, x: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
-  applyRotaryPosEmbPartial(ctx: number, out: number, x: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
-  topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
-  bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transB: number): void;
-  scale(ctx: number, out: number, input: number, s: number, n: number): void;
-  add(ctx: number, out: number, a: number, b: number, n: number): void;
-  expandDim1(ctx: number, out: number, input: number, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number): void;
-  expandDim1Strided(ctx: number, out: number, input: number, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number, headStride: number): void;
-  transpose4d(ctx: number, out: number, input: number, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): void;
-  mul(ctx: number, out: number, a: number, b: number, n: number): void;
-  reduceSum(ctx: number, out: number, input: number, rows: number, cols: number): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number): void;
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   argmax(ctx: number, outIndex: number, input: number, dim: number, batch: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
   synchronize(ctx: number): void;
-  flashPrefill(ctx: number, q: number, k: number, v: number, o: number, tmp: number, qoLen: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: number, kvLayout: number, smScale: number): void;
-  flashDecode(ctx: number, q: number, k: number, v: number, o: number, tmp: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, smScale: number): void;
   allocPinned(bytes: number): number;
   freePinned(ptr: number): void;
   writePinned(dst: number, src: Buffer, size: number): void;
@@ -93,7 +70,6 @@ interface NativeAddon {
   graphEndCapture(ctx: number): number;
   graphInstantiate(graph: number): number;
   graphLaunch(graphExec: number, ctx: number): void;
-  graphExecUpdate(graphExec: number, graph: number): number;
   graphDestroy(graph: number): void;
   graphExecDestroy(graphExec: number): void;
   mmapOpen(path: string): number;
@@ -323,56 +299,12 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().synchronize(this.ctx);
   }
 
-  rmsnorm(out: Tensor, input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
-    getNativeAddon().rmsnorm(this.ctx, ptr(out), ptr(input), ptr(weight), eps, dim, batch);
-  }
-
-  fusedAddRmsnorm(out: Tensor, residual: Tensor, inputA: Tensor, inputB: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
-    getNativeAddon().fusedAddRmsnorm(this.ctx, ptr(out), ptr(residual), ptr(inputA), ptr(inputB), ptr(weight), eps, dim, batch);
-  }
-
-  fusedNormRope(out: Tensor, input: Tensor, weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void {
-    getNativeAddon().fusedNormRope(this.ctx, ptr(out), ptr(input), ptr(weight), ptr(cos), ptr(sin), eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
-  }
-
-  siluAndMul(out: Tensor, gate: Tensor, up: Tensor, intermediate: number, batch: number): void {
-    getNativeAddon().siluAndMul(this.ctx, ptr(out), ptr(gate), ptr(up), intermediate, batch);
-  }
-
-  linear(out: Tensor, input: Tensor, weight: Tensor, batch: number, n: number, k: number): void {
-    getNativeAddon().linear(this.ctx, ptr(out), ptr(input), ptr(weight), batch, n, k);
-  }
-
-  embedding(out: Tensor, table: Tensor, ids: Tensor, hidden: number, seqLen: number): void {
-    getNativeAddon().embedding(this.ctx, ptr(out), ptr(table), ptr(ids), hidden, seqLen);
-  }
-
-  layernorm(out: Tensor, input: Tensor, weight: Tensor, bias: Tensor, eps: number, dim: number, batch: number): void {
-    getNativeAddon().layernorm(this.ctx, ptr(out), ptr(input), ptr(weight), ptr(bias), eps, dim, batch);
-  }
-
-  softmax(out: Tensor, input: Tensor, mask: Tensor, dim: number, batch: number): void {
-    getNativeAddon().softmax(this.ctx, ptr(out), ptr(input), ptr(mask), dim, batch);
-  }
-
-  causalMask(out: Tensor, seqLen: number): void {
-    getNativeAddon().causalMask(this.ctx, ptr(out), seqLen);
-  }
-
   fill(out: Tensor, value: number, n: number): void {
     getNativeAddon().fill(this.ctx, ptr(out), value, n);
   }
 
-  add(out: Tensor, a: Tensor, b: Tensor, n: number): void {
-    getNativeAddon().add(this.ctx, ptr(out), ptr(a), ptr(b), n);
-  }
-
   arange(out: Tensor, start: number, step: number, count: number): void {
     getNativeAddon().arange(this.ctx, ptr(out), start, step, count);
-  }
-
-  argmax(outIndex: Tensor, input: Tensor, dim: number, batch: number = 1): void {
-    getNativeAddon().argmax(this.ctx, ptr(outIndex), ptr(input), dim, batch);
   }
 
   memcpy(dst: number, src: number, bytes: number, kind: MemcpyKind): void {
@@ -381,46 +313,6 @@ export class GlmOps implements DeviceOps {
 
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void {
     getNativeAddon().kvCacheWrite(this.ctx, ptr(srcK), ptr(srcV), ptr(dstK), ptr(dstV), ptr(slotMapping), batchSize, nKv, hd, pageSize, srcKTokenStride, srcKHeadStride, srcVTokenStride, srcVHeadStride);
-  }
-
-  rotaryEmbedding(cosOut: Tensor, sinOut: Tensor, invFreq: Tensor, positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): void {
-    getNativeAddon().rotaryEmbedding(this.ctx, ptr(cosOut), ptr(sinOut), ptr(invFreq), ptr(positionIds), dimHalf, batch, seqLen);
-  }
-
-  applyRotaryPosEmb(out: Tensor, x: Tensor, cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
-    getNativeAddon().applyRotaryPosEmb(this.ctx, ptr(out), ptr(x), ptr(cos), ptr(sin), ropeDim, nHeads, seqLen, batch, unsqueezeDim);
-  }
-
-  applyRotaryPosEmbPartial(out: Tensor, x: Tensor, cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
-    getNativeAddon().applyRotaryPosEmbPartial(this.ctx, ptr(out), ptr(x), ptr(cos), ptr(sin), ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim);
-  }
-
-  expandDim1(out: Tensor, input: Tensor, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number): void {
-    getNativeAddon().expandDim1(this.ctx, ptr(out), ptr(input), dim1Out, dim1In, seqLen, headDim, batch);
-  }
-
-  expandDim1Strided(out: Tensor, input: Tensor, dim1Out: number, dim1In: number, seqLen: number, headDim: number, batch: number, headStride: number): void {
-    getNativeAddon().expandDim1Strided(this.ctx, ptr(out), ptr(input), dim1Out, dim1In, seqLen, headDim, batch, headStride);
-  }
-
-  indexSelect(out: Tensor, src: Tensor, indices: Tensor, dim: number, k: number): void {
-    getNativeAddon().indexSelect(this.ctx, ptr(out), ptr(src), ptr(indices), dim, k);
-  }
-
-  transpose4d(out: Tensor, input: Tensor, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): void {
-    getNativeAddon().transpose4d(this.ctx, ptr(out), ptr(input), d0, d1, d2, d3, p0, p1, p2, p3);
-  }
-
-  bmm(C: Tensor, A: Tensor, B: Tensor, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transB: number): void {
-    getNativeAddon().bmm(this.ctx, ptr(C), ptr(A), ptr(B), alpha, beta, batch, M, N, K, transB);
-  }
-
-  flashPrefill(q: Tensor, k: Tensor, v: Tensor, o: Tensor, tmp: Tensor, qoLen: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: number, kvLayout: number, smScale: number): void {
-    getNativeAddon().flashPrefill(this.ctx, ptr(q), ptr(k), ptr(v), ptr(o), ptr(tmp), qoLen, kvLen, numQoHeads, numKvHeads, headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, vStrideN, vStrideH, maskMode, kvLayout, smScale);
-  }
-
-  flashDecode(q: Tensor, k: Tensor, v: Tensor, o: Tensor, tmp: Tensor, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, smScale: number): void {
-    getNativeAddon().flashDecode(this.ctx, ptr(q), ptr(k), ptr(v), ptr(o), ptr(tmp), kvLen, numQoHeads, numKvHeads, headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, smScale);
   }
 
   freePinned(ptr: Tensor): void {
@@ -471,10 +363,6 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().graphLaunch(graphExec, this.ctx);
   }
 
-  graphExecUpdate(graphExec: number, graph: number): number {
-    return getNativeAddon().graphExecUpdate(graphExec, graph);
-  }
-
   graphDestroy(graph: number): void {
     getNativeAddon().graphDestroy(graph);
   }
@@ -505,14 +393,6 @@ export class GlmOps implements DeviceOps {
 
   rmsnormGated(output: Tensor, input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
     getNativeAddon().rmsnormGated(this.ctx, ptr(output), ptr(input), ptr(gate), ptr(weight), eps, dim, batch);
-  }
-
-  sigmoid(out: Tensor, input: Tensor, n: number): void {
-    getNativeAddon().sigmoid(this.ctx, ptr(out), ptr(input), n);
-  }
-
-  mul(out: Tensor, a: Tensor, b: Tensor, n: number): void {
-    getNativeAddon().mul(this.ctx, ptr(out), ptr(a), ptr(b), n);
   }
 
   gateSigmoidMul(attnOut: Tensor, gateInterleaved: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
