@@ -160,8 +160,10 @@ export function* generateStream(
 
   const tokenHistory = [...inputIds, currentToken];
   const useGraph = graphState !== undefined;
+  const greedy = !sampling;
   let capturing = false;
   let logits: Tensor | null = null;
+  let greedyArgmaxResult: Tensor | null = null;
 
   let planMs = 0;
   let execMs = 0;
@@ -178,7 +180,6 @@ export function* generateStream(
     const tExec = performance.now();
     if (useGraph && graphState!.graphExec !== null) {
       glm.graphLaunch(graphState!.graphExec);
-      glm.synchronize();
       graphSteps++;
     } else {
       if (useGraph && graphState!.warmupRemaining === 0 && !capturing) {
@@ -188,6 +189,11 @@ export function* generateStream(
 
       logits = model.forward(state);
 
+      if (useGraph && greedy && capturing) {
+        greedyArgmaxResult = logits.argmax();
+      }
+
+      const wasCapturing = capturing;
       if (capturing) {
         const graph = glm.graphEndCapture();
         graphState!.graphExec = glm.graphInstantiate(graph);
@@ -196,11 +202,15 @@ export function* generateStream(
       }
       if (useGraph) graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
       warmupSteps++;
+
+      if (wasCapturing) continue;
     }
     execMs += performance.now() - tExec;
 
     const tSample = performance.now();
-    if (sampling) {
+    if (greedyArgmaxResult) {
+      currentToken = greedyArgmaxResult.readInt32LE()[0];
+    } else if (sampling) {
       using sampleResult = logits!.sampleTokenGPU(sampling, tokenHistory);
       currentToken = sampleResult.readInt32LE()[0];
     } else {

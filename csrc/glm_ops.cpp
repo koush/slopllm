@@ -765,6 +765,10 @@ static Napi::Value Synchronize(const Napi::CallbackInfo& info) {
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     glm_synchronize(reinterpret_cast<GlmCtx*>(ctx_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("synchronize failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -974,6 +978,10 @@ static Napi::Value BatchDecodePlan(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(indptr_h_ptr),
         batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
         enable_cuda_graph);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("batchDecodePlan failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1010,6 +1018,12 @@ static Napi::Value BatchDecodeRun(const Napi::CallbackInfo& info) {
         reinterpret_cast<void*>(float_ws_ptr), reinterpret_cast<void*>(int_ws_ptr),
         reinterpret_cast<int64_t*>(plan_info_ptr),
         batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            Napi::Error::New(env, std::string("batchDecodeRun failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+        }
+    }
     return env.Undefined();
 }
 
@@ -1044,6 +1058,12 @@ static Napi::Value BatchPrefillPagedPlan(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(paged_kv_indptr_h_ptr),
         total_qo_rows, batch_size,
         num_qo_heads, num_kv_heads, head_dim, page_size, mask_mode);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            Napi::Error::New(env, std::string("batchPrefillPagedPlan failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+        }
+    }
     return env.Undefined();
 }
 
@@ -1089,6 +1109,12 @@ static Napi::Value BatchPrefillPagedRun(const Napi::CallbackInfo& info) {
         num_qo_heads, num_kv_heads, head_dim, page_size,
         q_stride_n, q_stride_h,
         mask_mode, sm_scale);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            Napi::Error::New(env, std::string("batchPrefillPagedRun failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+        }
+    }
     return env.Undefined();
 }
 
@@ -1100,6 +1126,10 @@ static Napi::Value GraphBeginCapture(const Napi::CallbackInfo& info) {
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     glm_graph_begin_capture(reinterpret_cast<GlmCtx*>(ctx_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("graphBeginCapture failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1111,6 +1141,17 @@ static Napi::Value GraphEndCapture(const Napi::CallbackInfo& info) {
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     void* graph = glm_graph_end_capture(reinterpret_cast<GlmCtx*>(ctx_ptr));
+    if (!graph) {
+        cudaError_t err = cudaGetLastError();
+        std::string msg = "graphEndCapture failed: null graph returned";
+        if (err != cudaSuccess) msg += std::string(" (") + cudaGetErrorString(err) + ")";
+        Napi::Error::New(env, msg).ThrowAsJavaScriptException();
+        return Napi::Number::New(env, 0);
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("graphEndCapture failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return Napi::Number::New(env, reinterpret_cast<uintptr_t>(graph));
 }
 
@@ -1122,6 +1163,17 @@ static Napi::Value GraphInstantiate(const Napi::CallbackInfo& info) {
     }
     uintptr_t graph_ptr = info[0].As<Napi::Number>().Int64Value();
     void* graph_exec = glm_graph_instantiate(reinterpret_cast<void*>(graph_ptr));
+    if (!graph_exec) {
+        cudaError_t err = cudaGetLastError();
+        std::string msg = "graphInstantiate failed: null graph_exec returned";
+        if (err != cudaSuccess) msg += std::string(" (") + cudaGetErrorString(err) + ")";
+        Napi::Error::New(env, msg).ThrowAsJavaScriptException();
+        return Napi::Number::New(env, 0);
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("graphInstantiate failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return Napi::Number::New(env, reinterpret_cast<uintptr_t>(graph_exec));
 }
 
@@ -1135,6 +1187,10 @@ static Napi::Value GraphLaunch(const Napi::CallbackInfo& info) {
     uintptr_t ctx_ptr = info[1].As<Napi::Number>().Int64Value();
     glm_graph_launch(reinterpret_cast<void*>(graph_exec_ptr),
                      reinterpret_cast<GlmCtx*>(ctx_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("graphLaunch failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1159,6 +1215,10 @@ static Napi::Value GraphDestroy(const Napi::CallbackInfo& info) {
     }
     uintptr_t graph_ptr = info[0].As<Napi::Number>().Int64Value();
     glm_graph_destroy(reinterpret_cast<void*>(graph_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("graphDestroy failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1170,6 +1230,10 @@ static Napi::Value GraphExecDestroy(const Napi::CallbackInfo& info) {
     }
     uintptr_t graph_exec_ptr = info[0].As<Napi::Number>().Int64Value();
     glm_graph_exec_destroy(reinterpret_cast<void*>(graph_exec_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("graphExecDestroy failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
