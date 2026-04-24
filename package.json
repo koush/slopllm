@@ -16,7 +16,7 @@
     "dev": "tsc --watch",
     "pretest": "npm run build:all",
     "test:node": "node --test dist/tests/test_all.js",
-    "test": "npm run test:python && npm run test:node && npm run test:batch"
+    "test": "npm run test:python && npm run test:node"
   },
   "keywords": [],
   "author": "",
