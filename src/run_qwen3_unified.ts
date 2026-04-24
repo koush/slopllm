@@ -162,7 +162,6 @@ export function* generateStream(
   const useGraph = graphState !== undefined;
   let capturing = false;
   let logits: Tensor | null = null;
-  let argmaxResult: Tensor | null = null;
 
   let planMs = 0;
   let execMs = 0;
@@ -188,9 +187,6 @@ export function* generateStream(
       }
 
       logits = model.forward(state);
-      if (!sampling) {
-        argmaxResult = logits.argmax();
-      }
 
       if (capturing) {
         const graph = glm.graphEndCapture();
@@ -208,6 +204,7 @@ export function* generateStream(
       using sampleResult = logits!.sampleTokenGPU(sampling, tokenHistory);
       currentToken = sampleResult.readInt32LE()[0];
     } else {
+      using argmaxResult = logits!.argmax();
       currentToken = argmaxResult!.readInt32LE()[0];
     }
     sampleMs += performance.now() - tSample;
