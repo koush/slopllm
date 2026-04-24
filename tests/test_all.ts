@@ -1,0 +1,13 @@
+import "./test_parallel.js";
+import "./test_nccl.js";
+import "./test_nccl_multi.js";
+import "./test.js";
+import "./test_batch.js";
+import "./test_fp8.js";
+import "./test_qwen3_paris.js";
+import "./test_qwen3_paris_parallel.js";
+import "./test_qwen3_paris_parallel_graph.js";
+import "./test_qwen3_paris_parallel_graph_fp8.js";
+import "./test_qwen35_paris.js";
+import "./test_qwen35_paris_parallel.js";
+import "./test_qwen35_paris_parallel_graph.js";

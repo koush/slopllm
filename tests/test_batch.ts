@@ -20,8 +20,8 @@ describe("Qwen3-0.6B batch tests", () => {
   let ws: ExecutionWorkspace;
 
   before(() => {
-    process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
-    glm = new GlmOps(0);
+    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    glm = new GlmOps(deviceId);
     model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 4, 4096);
     ws = new ExecutionWorkspace(glm, 4, 4096);
   });
@@ -29,6 +29,7 @@ describe("Qwen3-0.6B batch tests", () => {
   after(() => {
     ws.free();
     model.free();
+    glm.free();
   });
 
   function makePagedKV(maxBatch = 4, maxPages = 128): PagedKVCache {

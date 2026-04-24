@@ -30,8 +30,8 @@ describe("Qwen3-0.6B batch smoke test", () => {
   let cache: PagedKVCache;
 
   before(async () => {
-    process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
-    glm = new GlmOps(0);
+    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    glm = new GlmOps(deviceId);
     model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 4, 2048);
     ws = new ExecutionWorkspace(glm, 4, 2048);
     const cfg = model.cfg;
@@ -44,6 +44,7 @@ describe("Qwen3-0.6B batch smoke test", () => {
     cache.free();
     ws.free();
     model.free();
+    glm.free();
   });
 
   it("2 identical 'hi' prompts produce responses containing 'hello' and 'assist'", () => {

@@ -15,7 +15,7 @@
     "start:unified": "node dist/src/run_qwen3_unified.js",
     "dev": "tsc --watch",
     "pretest": "npm run build:all",
-    "test:node": "node --test dist/tests/test.js",
+    "test:node": "node --test dist/tests/test_all.js",
     "test:batch": "node --test dist/tests/test_batch.js",
     "test:fp8": "node --test dist/tests/test_fp8.js",
     "test:nccl": "node --test dist/tests/test_nccl.js",

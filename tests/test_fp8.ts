@@ -38,8 +38,8 @@ describe("Qwen3-0.6B-FP8 model", () => {
   let ws: ExecutionWorkspace;
 
   before(() => {
-    process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
-    glm = new GlmOps(0);
+    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    glm = new GlmOps(deviceId);
     model = Qwen3Model.fromPretrained(glm, FP8_REPO, 1, 64);
     ws = new ExecutionWorkspace(glm, 1, 64);
   });
@@ -47,6 +47,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
   after(() => {
     ws.free();
     model.free();
+    glm.free();
   });
 
   it("loads FP8 weights as F8_E4M3 and scale_inv as F32", () => {

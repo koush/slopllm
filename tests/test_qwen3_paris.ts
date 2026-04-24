@@ -28,8 +28,8 @@ describe("Qwen3-0.6B generate Paris", () => {
   let cache: PagedKVCache;
 
   before(async () => {
-    process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
-    glm = new GlmOps(0);
+    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    glm = new GlmOps(deviceId);
     model = Qwen3Model.fromPretrained(glm, QWEN3_REPO, 1, 128);
     ws = new ExecutionWorkspace(glm, 1, 128);
     const cfg = model.cfg;
@@ -42,6 +42,7 @@ describe("Qwen3-0.6B generate Paris", () => {
     cache.free();
     ws.free();
     model.free();
+    glm.free();
   });
 
   it("generates 'Paris' from 'The capital of France is' prompt (greedy)", () => {

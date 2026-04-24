@@ -28,8 +28,8 @@ describe("Qwen3.5-0.8B generate Paris", () => {
   let cache: ReturnType<Qwen35Model["createChatCache"]>;
 
   before(async () => {
-    process.env.CUDA_VISIBLE_DEVICES = process.env.GLM_GPU ?? "0";
-    glm = new GlmOps(0);
+    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    glm = new GlmOps(deviceId);
     model = Qwen35Model.fromPretrained(glm, QWEN35_REPO, 1, 128);
     ws = new ExecutionWorkspace(glm, 1, 128);
     cache = model.createChatCache(256);
@@ -41,6 +41,7 @@ describe("Qwen3.5-0.8B generate Paris", () => {
     cache.free();
     ws.free();
     model.free();
+    glm.free();
   });
 
   it("generates 'Paris' from 'The capital of France is' prompt (greedy)", () => {
