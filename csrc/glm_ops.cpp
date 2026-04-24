@@ -742,17 +742,18 @@ static Napi::Value KvCacheWrite(const Napi::CallbackInfo& info) {
 
 static Napi::Value Memcpy(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 4) {
-        Napi::TypeError::New(env, "Expected (ctx, dst, src, bytes)").ThrowAsJavaScriptException();
+    if (info.Length() < 5) {
+        Napi::TypeError::New(env, "Expected (ctx, dst, src, bytes, kind)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t dst_ptr = info[1].As<Napi::Number>().Int64Value();
     uintptr_t src_ptr = info[2].As<Napi::Number>().Int64Value();
     size_t bytes = info[3].As<Napi::Number>().Int64Value();
+    int kind = info[4].As<Napi::Number>().Int32Value();
     glm_memcpy(reinterpret_cast<GlmCtx*>(ctx_ptr),
                reinterpret_cast<void*>(dst_ptr),
-               reinterpret_cast<const void*>(src_ptr), bytes);
+               reinterpret_cast<const void*>(src_ptr), bytes, kind);
     return env.Undefined();
 }
 

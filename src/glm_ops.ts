@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import type { SamplingParams } from "./chat_model";
-import { Tensor } from "./tensor";
+import { MemcpyKind, Tensor } from "./tensor";
 import type { WorkspaceBase } from "./workspace";
 
 function findProjectRoot(dir: string): string {
@@ -77,7 +77,7 @@ interface NativeAddon {
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number): void;
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   argmax(ctx: number, outIndex: number, input: number, dim: number, batch: number): void;
-  memcpy(ctx: number, dst: number, src: number, bytes: number): void;
+  memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
   synchronize(ctx: number): void;
   flashPrefill(ctx: number, q: number, k: number, v: number, o: number, tmp: number, qoLen: number, kvLen: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: number, kvLayout: number, smScale: number): void;
@@ -126,20 +126,20 @@ export class GlmTensor extends Tensor {
   free(): void {
     if (this.data !== 0) {
       if (this.pinned) {
-        this.glm.freePinned(this);
+        getNativeAddon().freePinned(this.data);
       } else {
-        this.glm.freeBuf(this);
+        getNativeAddon().freeBuf(this.glm.ctx, this.data);
       }
       (this as { data: number }).data = 0;
     }
   }
 
   h2d(data: Buffer, size?: number): void {
-    this.glm.h2d(this, data, size);
+    getNativeAddon().h2d(this.glm.ctx, this.data, data, size ?? data.length);
   }
 
   d2h(buf: Buffer, size?: number): void {
-    this.glm.d2h(buf, this, size);
+    getNativeAddon().d2h(this.glm.ctx, buf, this.data, size ?? buf.length);
   }
 
   linear(weight: Tensor, batch: number): Tensor {
@@ -149,118 +149,119 @@ export class GlmTensor extends Tensor {
     const out = this.workspace.alloc(outShape, this.type);
     if (weight.type === "F8_E4M3") {
       const scale = weight.workspace.tensors.get(weight.name! + "_scale_inv")!;
-      this.glm.fp8LinearDecode(out, this, weight, scale, batch, n, k);
+      getNativeAddon().fp8LinearDecode(this.glm.ctx, out.data, this.data, weight.data, scale.data, batch, n, k);
     } else {
-      this.glm.linear(out, this, weight, batch, n, k);
+      getNativeAddon().linear(this.glm.ctx, out.data, this.data, weight.data, batch, n, k);
     }
     return out;
   }
 
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
     const out = this.workspace.alloc([batch, dim], this.type);
-    this.glm.rmsnorm(out, this, weight, eps, dim, batch);
+    getNativeAddon().rmsnorm(this.glm.ctx, out.data, this.data, weight.data, eps, dim, batch);
     return out;
   }
 
   fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
     const normed = this.workspace.alloc([batch, dim], this.type);
     const residual = this.workspace.alloc([batch, dim], this.type);
-    this.glm.fusedAddRmsnorm(normed, residual, this, input, weight, eps, dim, batch);
+    getNativeAddon().fusedAddRmsnorm(this.glm.ctx, normed.data, residual.data, this.data, input.data, weight.data, eps, dim, batch);
     return { normed, residual };
   }
 
   fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
     const out = this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
-    this.glm.fusedNormRope(out, this, weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
+    getNativeAddon().fusedNormRope(this.glm.ctx, out.data, this.data, weight.data, cos.data, sin.data, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
     return out;
   }
 
   embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
     const out = ids.workspace.alloc([seqLen, hidden], this.type);
-    this.glm.embedding(out, this, ids, hidden, seqLen);
+    getNativeAddon().embedding(this.glm.ctx, out.data, this.data, ids.data, hidden, seqLen);
     return out;
   }
 
   siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
     const out = this.workspace.alloc([batch, intermediate], this.type);
-    this.glm.siluAndMul(out, gate, up, intermediate, batch);
+    getNativeAddon().siluAndMul(this.glm.ctx, out.data, gate.data, up.data, intermediate, batch);
     return out;
   }
 
   arange(start: number, step: number, count: number): void {
-    this.glm.arange(this, start, step, count);
+    getNativeAddon().arange(this.glm.ctx, this.data, start, step, count);
   }
 
   argmax(): Tensor {
     const batch = this.shape[0];
     const dim = this.shape[1];
     const out = this.workspace.alloc([batch], "I32");
-    this.glm.argmax(out, this, dim, batch);
+    getNativeAddon().argmax(this.glm.ctx, out.data, this.data, dim, batch);
     return out;
   }
 
   indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
     const out = this.workspace.alloc([batch, dim], this.type);
-    this.glm.indexSelect(out, this, indices, dim, batch);
+    getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, indices.data, dim, batch);
     return out;
   }
 
   gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    this.glm.gdnRecurrentStep(this, state, qkv, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
+    getNativeAddon().gdnRecurrentStep(this.glm.ctx, this.data, state.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
   gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    this.glm.gdnPrefill(this, state, qkv, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
+    getNativeAddon().gdnPrefill(this.glm.ctx, this.data, state.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, cuSeqlens.data, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
   causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
-    this.glm.causalConv1d(this, convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
+    getNativeAddon().causalConv1d(this.glm.ctx, this.data, convState.data, input.data, weight.data, cuSeqlens.data, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
   }
 
   causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor {
     const out = this.workspace.alloc([batchSize * convDim], this.type);
-    this.glm.causalConv1dUpdate(out, convState, input, weight, convDim, kernelSize, batchSize, convStateStride);
+    getNativeAddon().causalConv1dUpdate(this.glm.ctx, out.data, convState.data, input.data, weight.data, convDim, kernelSize, batchSize, convStateStride);
     return out;
   }
 
   rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
-    this.glm.rmsnormGated(this, input, gate, weight, eps, dim, batch);
+    getNativeAddon().rmsnormGated(this.glm.ctx, this.data, input.data, gate.data, weight.data, eps, dim, batch);
   }
 
   gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
-    this.glm.gateSigmoidMul(this, gate, batchSeq, numHeads, headDim);
+    getNativeAddon().gateSigmoidMul(this.glm.ctx, this.data, gate.data, batchSeq, numHeads, headDim);
   }
 
   fill(value: number, n: number): void {
-    this.glm.fill(this, value, n);
+    getNativeAddon().fill(this.glm.ctx, this.data, value, n);
   }
 
   mmapLoad(mmapPtr: number, offset: number, nbytes: number, _gdnQkvLayout?: import("./device_ops").GdnQkvLayout): void {
-    this.glm.mmapLoad(this, mmapPtr, offset, nbytes);
+    getNativeAddon().mmapLoad(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
   }
 
   writePinned(src: Buffer, size?: number): void {
-    this.glm.writePinned(this, src, size);
+    getNativeAddon().writePinned(this.data, src, size ?? src.length);
   }
 
-  memcpy(src: Tensor, size?: number): void {
+  memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {
     if (!(src instanceof GlmTensor)) {
       throw new Error("GlmTensor.memcpy requires GlmTensor source");
     }
     const bytes = size ?? Math.min(this.allocSize, src.allocSize);
-    this.glm.memcpy(this.data, src.data, bytes);
+    const copyKind = kind ?? (src.pinned ? MemcpyKind.HostToDevice : MemcpyKind.DeviceToDevice);
+    getNativeAddon().memcpy(this.glm.ctx, this.data, src.data, bytes, memcpyKindToNative(copyKind));
   }
 
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     const hd = dimHalf * 2;
     const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
     const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
-    this.glm.rotaryEmbedding(cos, sin, this, positionIds, dimHalf, batch, seqLen);
+    getNativeAddon().rotaryEmbedding(this.glm.ctx, cos.data, sin.data, this.data, positionIds.data, dimHalf, batch, seqLen);
     return { cos, sin };
   }
 
   protected doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyOffsets: Tensor, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, randomVals: Tensor, maxEffectiveK: number): void {
-    this.glm.sampleBatch(outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyOffsets, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, randomVals, maxEffectiveK);
+    getNativeAddon().sampleBatch(this.glm.ctx, outTokens.data, topkVals.data, topkIdxs.data, workspace.data, logits.data, penaltyTokens.data, penaltyOffsets.data, vocabSize, batchSize, temperatures.data, repPenalties.data, presPenalties.data, topKs.data, topPs.data, randomVals.data, maxEffectiveK);
   }
 }
 
@@ -374,8 +375,8 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().argmax(this.ctx, ptr(outIndex), ptr(input), dim, batch);
   }
 
-  memcpy(dst: number, src: number, bytes: number): void {
-    getNativeAddon().memcpy(this.ctx, dst, src, bytes);
+  memcpy(dst: number, src: number, bytes: number, kind: MemcpyKind): void {
+    getNativeAddon().memcpy(this.ctx, dst, src, bytes, memcpyKindToNative(kind));
   }
 
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void {
@@ -522,8 +523,8 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().sampleBatch(this.ctx, ptr(outTokens), ptr(topkVals), ptr(topkIdxs), ptr(workspace), ptr(logits), ptr(penaltyTokens), ptr(penaltyOffsets), vocabSize, batchSize, ptr(temperatures), ptr(repPenalties), ptr(presPenalties), ptr(topKs), ptr(topPs), ptr(randomVals), maxEffectiveK);
   }
 
-  memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void {
-    getNativeAddon().memcpy2d(this.ctx, dst, dpitch, src, spitch, width, height, kind);
+  memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+    getNativeAddon().memcpy2d(this.ctx, dst, dpitch, src, spitch, width, height, memcpyKindToNative(kind));
   }
 }
 
@@ -556,10 +557,20 @@ export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
 export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 export const PAGE_SIZE = 16;
 
-export const MEMCPY_H2H = 0;
-export const MEMCPY_H2D = 1;
-export const MEMCPY_D2H = 2;
-export const MEMCPY_D2D = 3;
+const MEMCPY_H2H = 0;
+const MEMCPY_H2D = 1;
+const MEMCPY_D2H = 2;
+const MEMCPY_D2D = 3;
+
+function memcpyKindToNative(kind: MemcpyKind): number {
+  switch (kind) {
+    case MemcpyKind.HostToHost: return MEMCPY_H2H;
+    case MemcpyKind.HostToDevice: return MEMCPY_H2D;
+    case MemcpyKind.DeviceToHost: return MEMCPY_D2H;
+    case MemcpyKind.DeviceToDevice: return MEMCPY_D2D;
+    case MemcpyKind.Default: return 4;
+  }
+}
 
 export const NCCL_UNIQUE_ID_BYTES = 128;
 export const NCCL_INT8 = 0;

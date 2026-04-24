@@ -6,15 +6,12 @@ import {
   getNativeAddon,
   f32ToBf16Bytes,
   bf16BytesToF32,
-  BF16,
-  MEMCPY_H2D,
-  MEMCPY_D2D,
-  MEMCPY_D2H,
   NCCL_UNIQUE_ID_BYTES,
   NCCL_BFLOAT16,
   NCCL_FLOAT32,
   NCCL_SUM,
 } from "../src/glm_ops";
+import { MemcpyKind } from "../src/tensor";
 import { WorkspaceBase } from "../src/workspace";
 import { Tensor } from "../src/tensor";
 
@@ -53,7 +50,7 @@ describe("memcpy2d", () => {
     const spitch = cols * elemBytes;
     const dpitch = shardCols * elemBytes;
 
-    glm.memcpy2d(dstGpu.data, dpitch, srcGpu.data + shardOffset * elemBytes, spitch, width, rows, MEMCPY_D2D);
+    glm.memcpy2d(dstGpu.data, dpitch, srcGpu.data + shardOffset * elemBytes, spitch, width, rows, MemcpyKind.DeviceToDevice);
 
     const dstBuf = Buffer.alloc(rows * shardCols * elemBytes);
     dstGpu.d2h(dstBuf, rows * shardCols * elemBytes);
@@ -88,7 +85,7 @@ describe("memcpy2d", () => {
 
     srcGpu.h2d(srcBuf);
     const pitch = cols * elemBytes;
-    glm.memcpy2d(dstGpu.data, pitch, srcGpu.data, pitch, pitch, rows, MEMCPY_D2D);
+    glm.memcpy2d(dstGpu.data, pitch, srcGpu.data, pitch, pitch, rows, MemcpyKind.DeviceToDevice);
 
     const dstBuf = Buffer.alloc(totalBytes);
     dstGpu.d2h(dstBuf, totalBytes);
@@ -126,7 +123,7 @@ describe("memcpy2d", () => {
     glm.memcpy2d(
       dstGpu.data, dpitch,
       hostPtr + shardOffset * elemBytes, spitch,
-      width, rows, MEMCPY_H2D
+      width, rows, MemcpyKind.HostToDevice
     );
 
     const dstBuf = Buffer.alloc(rows * shardCols * elemBytes);

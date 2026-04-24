@@ -138,8 +138,8 @@ void glm_d2h(GlmCtx* ctx, void* dst, const void* src, size_t bytes) {
 // Device <-> Device memory copy
 // ---------------------------------------------------------------------------
 
-void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes) {
-    cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, ctx->stream);
+void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes, int kind) {
+    cudaMemcpyAsync(dst, src, bytes, static_cast<cudaMemcpyKind>(kind), ctx->stream);
 }
 
 void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,
@@ -154,7 +154,10 @@ void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,
 // ---------------------------------------------------------------------------
 
 void glm_synchronize(GlmCtx* ctx) {
-    cudaStreamSynchronize(ctx->stream);
+    cudaError_t err = cudaStreamSynchronize(ctx->stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm_synchronize failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,25 +166,42 @@ void glm_synchronize(GlmCtx* ctx) {
 
 void glm_graph_begin_capture(GlmCtx* ctx) {
     cudaSetDevice(ctx->device_id);
-    cudaStreamBeginCapture(ctx->stream, cudaStreamCaptureModeGlobal);
+    cudaError_t err = cudaStreamBeginCapture(ctx->stream, cudaStreamCaptureModeGlobal);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm_graph_begin_capture failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 void* glm_graph_end_capture(GlmCtx* ctx) {
     cudaSetDevice(ctx->device_id);
     cudaGraph_t graph = nullptr;
-    cudaStreamEndCapture(ctx->stream, &graph);
+    cudaError_t err = cudaStreamEndCapture(ctx->stream, &graph);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm_graph_end_capture failed: %s\n", cudaGetErrorString(err));
+        return nullptr;
+    }
+    if (!graph) {
+        fprintf(stderr, "glm_graph_end_capture returned null graph\n");
+    }
     return reinterpret_cast<void*>(graph);
 }
 
 void* glm_graph_instantiate(void* graph) {
     cudaGraphExec_t graph_exec = nullptr;
-    cudaGraphInstantiate(&graph_exec, reinterpret_cast<cudaGraph_t>(graph), nullptr, nullptr, 0);
+    cudaError_t err = cudaGraphInstantiate(&graph_exec, reinterpret_cast<cudaGraph_t>(graph), nullptr, nullptr, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm_graph_instantiate failed: %s\n", cudaGetErrorString(err));
+        return nullptr;
+    }
     return reinterpret_cast<void*>(graph_exec);
 }
 
 void glm_graph_launch(void* graph_exec, GlmCtx* ctx) {
     cudaSetDevice(ctx->device_id);
-    cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(graph_exec), ctx->stream);
+    cudaError_t err = cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(graph_exec), ctx->stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm_graph_launch failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 int glm_graph_exec_update(void* graph_exec, void* graph) {
@@ -194,12 +214,18 @@ int glm_graph_exec_update(void* graph_exec, void* graph) {
 
 void glm_graph_destroy(void* graph) {
     if (graph) {
-        cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(graph));
+        cudaError_t err = cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(graph));
+        if (err != cudaSuccess) {
+            fprintf(stderr, "glm_graph_destroy failed: %s\n", cudaGetErrorString(err));
+        }
     }
 }
 
 void glm_graph_exec_destroy(void* graph_exec) {
     if (graph_exec) {
-        cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(graph_exec));
+        cudaError_t err = cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(graph_exec));
+        if (err != cudaSuccess) {
+            fprintf(stderr, "glm_graph_exec_destroy failed: %s\n", cudaGetErrorString(err));
+        }
     }
 }

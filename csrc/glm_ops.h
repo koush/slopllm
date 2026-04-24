@@ -134,10 +134,10 @@ void glm_arange(GlmCtx* ctx, int* out, int start, int step, int count);
 
 void glm_argmax(GlmCtx* ctx, int* out_index, const void* input, int dim, int batch);
 
-void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes);
+void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes, int kind);
 
 // 2D memory copy (async on stream)
-// kind: cudaMemcpyKind values (0=H2H, 1=H2D, 2=D2H, 3=D2D)
+// kind: MemcpyKind values (0=H2H, 1=H2D, 2=D2H, 3=D2D, 4=Default)
 void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,
                   const void* src, size_t spitch,
                   size_t width, size_t height, int kind);

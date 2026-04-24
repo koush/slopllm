@@ -1,6 +1,7 @@
 import type { ChatCache, ChatModel } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, BF16, I32 } from "./glm_ops";
+import { MemcpyKind } from "./tensor";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
@@ -137,7 +138,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
     if (isDecode) {
       this.inputIdsBufH.writePinned(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
-      this.inputIdsBuf.memcpy(this.inputIdsBufH, batchSize * I32);
+      this.inputIdsBuf.memcpy(this.inputIdsBufH, batchSize * I32, MemcpyKind.HostToDevice);
       const writeLocations: [number, number][] = [];
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
         writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
@@ -151,7 +152,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         slotMappingBuf[seqIdx] = absPage * pageSize + slotInPage;
       }
       this.slotMappingH.writePinned(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
-      this.slotMapping.memcpy(this.slotMappingH, batchSize * I32);
+      this.slotMapping.memcpy(this.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
 
       const posIds = new Array(batchSize);
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -159,7 +160,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       }
       const posIdsBuf = Int32Array.from(posIds);
       this.positionIdsH.writePinned(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
-      this.positionIds.memcpy(this.positionIdsH, batchSize * I32);
+      this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
 
       this.glm.batchDecodePlan(
         this.floatWs, BATCH_FLOAT_WS_SIZE,
@@ -431,9 +432,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
     ws.indptrH.writePinned(Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
     this.indicesH.writePinned(Buffer.from(indicesBuf.buffer, indicesBuf.byteOffset, indicesBuf.byteLength));
-    this.indices.memcpy(this.indicesH, this.numPagesUsed * I32);
-    ws.indptrD.memcpy(ws.indptrH, (batchSize + 1) * I32);
+    this.indices.memcpy(this.indicesH, this.numPagesUsed * I32, MemcpyKind.HostToDevice);
+    ws.indptrD.memcpy(ws.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     ws.lastPageLenH.writePinned(Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
-    ws.lastPageLen.memcpy(ws.lastPageLenH, batchSize * I32);
+    ws.lastPageLen.memcpy(ws.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
   }
 }

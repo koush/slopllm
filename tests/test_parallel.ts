@@ -439,13 +439,13 @@ describe("ParallelOps.linear", () => {
 
     const weight = ws.alloc([n, k], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
     const input = ws.alloc([batch, k], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const output = ws.alloc([batch, n], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
 
     weight.h2d(f32ToBf16Bytes(weightF32));
     input.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    po.linear(output, input, weight, batch, n, k);
+    using output = input.linear(weight, batch);
+    assert.equal(output.parallelism, TensorParallelism.Row, "output should be Row-parallel");
     po.synchronize();
 
     const outputBuf = Buffer.alloc(batch * n * 2);
@@ -472,13 +472,13 @@ describe("ParallelOps.linear", () => {
 
     const weight = ws.alloc([n, k], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
     const input = ws.alloc([batch, k], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
-    const output = ws.alloc([batch, n], "BF16", undefined, TensorParallelism.PartialSum) as ParallelTensor;
 
     weight.h2d(f32ToBf16Bytes(weightF32));
     input.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    po.linear(output, input, weight, batch, n, k);
+    using output = input.linear(weight, batch);
+    assert.equal(output.parallelism, TensorParallelism.PartialSum, "output should be PartialSum");
     po.synchronize();
 
     const outputBuf = Buffer.alloc(batch * n * 2);
@@ -505,13 +505,13 @@ describe("ParallelOps.linear", () => {
 
     const weight = ws.alloc([n, k], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     const input = ws.alloc([batch, k], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const output = ws.alloc([batch, n], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     weight.h2d(f32ToBf16Bytes(weightF32));
     input.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    po.linear(output, input, weight, batch, n, k);
+    using output = input.linear(weight, batch);
+    assert.equal(output.parallelism, TensorParallelism.Replicated, "output should be Replicated");
     po.synchronize();
 
     const outputBuf = Buffer.alloc(batch * n * 2);
@@ -533,17 +533,12 @@ describe("ParallelOps.linear", () => {
   it("linear rejects unsupported parallelism combinations", () => {
     const weight = ws.alloc([8, 16], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
     const input = ws.alloc([2, 16], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
-    const output = ws.alloc([2, 8], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
 
-    assert.throws(() => po.linear(output, input, weight, 2, 8, 16), /unsupported parallelism/);
+    assert.throws(() => input.linear(weight, 2), /unsupported parallelism/);
   });
 
-  it("linear rejects wrong output parallelism", () => {
-    const weight = ws.alloc([8, 16], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
-    const input = ws.alloc([2, 16], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const output = ws.alloc([2, 8], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-
-    assert.throws(() => po.linear(output, input, weight, 2, 8, 16), /does not match expected/);
+  it("linearOutputParallelism rejects invalid combinations", () => {
+    assert.throws(() => ParallelOps.linearOutputParallelism(TensorParallelism.Column, TensorParallelism.Row), /unsupported parallelism/);
   });
 });
 
@@ -913,13 +908,12 @@ describe("ParallelOps.siluAndMul", () => {
 
     const gate = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
     const up = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
-    const out = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
 
     gate.h2d(f32ToBf16Bytes(gateF32));
     up.h2d(f32ToBf16Bytes(upF32));
     po.synchronize();
 
-    po.siluAndMul(out, gate, up, intermediate, batch);
+    using out = gate.siluAndMul(gate, up, intermediate, batch);
     po.synchronize();
 
     const outBuf = Buffer.alloc(batch * intermediate * 2);
@@ -946,13 +940,12 @@ describe("ParallelOps.siluAndMul", () => {
 
     const gate = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     const up = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const out = ws.alloc([batch, intermediate], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     gate.h2d(f32ToBf16Bytes(gateF32));
     up.h2d(f32ToBf16Bytes(upF32));
     po.synchronize();
 
-    po.siluAndMul(out, gate, up, intermediate, batch);
+    using out = gate.siluAndMul(gate, up, intermediate, batch);
     po.synchronize();
 
     const outBuf = Buffer.alloc(batch * intermediate * 2);
@@ -989,7 +982,7 @@ describe("ParallelOps.fill and arange", () => {
   it("fill on Replicated BF16 tensor", () => {
     const n = 8;
     const pt = ws.alloc([n], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    po.fill(pt, 3.14, n);
+    pt.fill(3.14, n);
     po.synchronize();
 
     const buf = Buffer.alloc(n * 2);
@@ -1005,7 +998,7 @@ describe("ParallelOps.fill and arange", () => {
     const cols = 8;
     const n = rows * cols;
     const pt = ws.alloc([rows, cols], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
-    po.fill(pt, 2.5, n);
+    pt.fill(2.5, n);
     po.synchronize();
 
     const buf = Buffer.alloc(n * 2);
@@ -1019,7 +1012,7 @@ describe("ParallelOps.fill and arange", () => {
   it("arange on Replicated I32 tensor", () => {
     const count = 8;
     const pt = ws.alloc([count], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    po.arange(pt, 0, 1, count);
+    pt.arange(0, 1, count);
     po.synchronize();
 
     const buf = Buffer.alloc(count * 4);
@@ -1064,13 +1057,12 @@ describe("ParallelOps.rmsnorm", () => {
 
     const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     const weight = ws.alloc([dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const out = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     input.h2d(f32ToBf16Bytes(inputF32));
     weight.h2d(f32ToBf16Bytes(weightF32));
     po.synchronize();
 
-    po.rmsnorm(out, input, weight, eps, dim, batch);
+    using out = input.rmsnorm(weight, eps, dim, batch);
     po.synchronize();
 
     const outBuf = Buffer.alloc(batch * dim * 2);
@@ -1103,7 +1095,6 @@ describe("ParallelOps.rmsnorm", () => {
 
     const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.PartialSum) as ParallelTensor;
     const weight = ws.alloc([dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const out = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     input.shard(0).h2d(f32ToBf16Bytes(shard0F32));
     input.shard(1).h2d(f32ToBf16Bytes(shard1F32));
@@ -1111,7 +1102,7 @@ describe("ParallelOps.rmsnorm", () => {
     po.synchronize();
 
     assert.equal(input.parallelism, TensorParallelism.PartialSum);
-    po.rmsnorm(out, input, weight, eps, dim, batch);
+    using out = input.rmsnorm(weight, eps, dim, batch);
     assert.equal(input.parallelism, TensorParallelism.Replicated, "rmsnorm should auto-allReduce PartialSum input");
     po.synchronize();
 
@@ -1165,15 +1156,13 @@ describe("ParallelOps.fusedAddRmsnorm", () => {
     const inputA = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     const inputB = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     const weight = ws.alloc([dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const normed = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const residual = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     inputA.h2d(f32ToBf16Bytes(inputAF32));
     inputB.h2d(f32ToBf16Bytes(inputBF32));
     weight.h2d(f32ToBf16Bytes(weightF32));
     po.synchronize();
 
-    po.fusedAddRmsnorm(normed, residual, inputA, inputB, weight, eps, dim, batch);
+    const { normed, residual } = inputA.fusedAddRmsnorm(inputB, weight, eps, dim, batch);
     po.synchronize();
 
     const normedBuf = Buffer.alloc(batch * dim * 2);
@@ -1214,8 +1203,6 @@ describe("ParallelOps.fusedAddRmsnorm", () => {
     const inputA = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.PartialSum) as ParallelTensor;
     const inputB = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     const weight = ws.alloc([dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const normed = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const residual = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     inputA.shard(0).h2d(f32ToBf16Bytes(shard0F32));
     inputA.shard(1).h2d(f32ToBf16Bytes(shard1F32));
@@ -1224,7 +1211,7 @@ describe("ParallelOps.fusedAddRmsnorm", () => {
     po.synchronize();
 
     assert.equal(inputA.parallelism, TensorParallelism.PartialSum);
-    po.fusedAddRmsnorm(normed, residual, inputA, inputB, weight, eps, dim, batch);
+    const { normed, residual } = inputA.fusedAddRmsnorm(inputB, weight, eps, dim, batch);
     assert.equal(inputA.parallelism, TensorParallelism.Replicated, "fusedAddRmsnorm should auto-allReduce PartialSum inputA");
     po.synchronize();
 
@@ -1285,13 +1272,12 @@ describe("ParallelOps.embedding", () => {
     for (let s = 0; s < seqLen; s++) idsBuf.writeInt32LE(ids[s], s * 4);
 
     const inputIds = ws.alloc([seqLen], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const out = ws.alloc([seqLen, hidden], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
 
     table.h2d(f32ToBf16Bytes(tableF32));
     inputIds.h2d(idsBuf);
     po.synchronize();
 
-    po.embedding(out, table, inputIds, hidden, seqLen);
+    using out = table.embedding(inputIds, hidden, seqLen);
     po.synchronize();
 
     const outBuf = Buffer.alloc(seqLen * hidden * 2);
@@ -1325,13 +1311,12 @@ describe("ParallelOps.embedding", () => {
     for (let s = 0; s < seqLen; s++) idsBuf.writeInt32LE(ids[s], s * 4);
 
     const inputIds = ws.alloc([seqLen], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const out = ws.alloc([seqLen, hidden], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     table.h2d(f32ToBf16Bytes(tableF32));
     inputIds.h2d(idsBuf);
     po.synchronize();
 
-    po.embedding(out, table, inputIds, hidden, seqLen);
+    using out = table.embedding(inputIds, hidden, seqLen);
     po.synchronize();
 
     const outBuf = Buffer.alloc(seqLen * hidden * 2);
@@ -1374,12 +1359,11 @@ describe("ParallelOps.argmax", () => {
     inputF32[5 + dim] = 7;
 
     const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const out = ws.alloc([batch], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     input.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    po.argmax(out, input, dim, batch);
+    using out = input.argmax();
     po.synchronize();
 
     const outBuf = Buffer.alloc(batch * 4);
@@ -1397,12 +1381,11 @@ describe("ParallelOps.argmax", () => {
     inputF32[5 + dim] = 7;
 
     const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
-    const out = ws.alloc([batch], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     input.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    po.argmax(out, input, dim, batch);
+    using out = input.argmax();
     po.synchronize();
 
     const outBuf = Buffer.alloc(batch * 4);
@@ -1454,13 +1437,12 @@ describe("ParallelOps.indexSelect", () => {
 
     const src = ws.alloc([srcRows, srcDim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     const idx = ws.alloc([k], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const out = ws.alloc([k, srcDim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     src.h2d(f32ToBf16Bytes(srcF32));
     idx.h2d(indicesBuf);
     po.synchronize();
 
-    po.indexSelect(out, src, idx, srcDim, batch);
+    using out = src.indexSelect(idx, srcDim, batch);
     po.synchronize();
 
     const outBuf = Buffer.alloc(k * srcDim * 2);

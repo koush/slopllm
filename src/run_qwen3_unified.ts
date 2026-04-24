@@ -188,10 +188,9 @@ export function* generateStream(
       }
 
       logits = model.forward(state);
-      if (!sampling  ) {
+      if (!sampling) {
         argmaxResult = logits.argmax();
       }
-
 
       if (capturing) {
         const graph = glm.graphEndCapture();
@@ -205,7 +204,7 @@ export function* generateStream(
     execMs += performance.now() - tExec;
 
     const tSample = performance.now();
-    if (sampling  ) {
+    if (sampling) {
       using sampleResult = logits!.sampleTokenGPU(sampling, tokenHistory);
       currentToken = sampleResult.readInt32LE()[0];
     } else {

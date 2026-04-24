@@ -3,6 +3,14 @@ import { TensorParallelism } from "./device_ops";
 import { SafeTensorFile } from "./safetensors";
 import { WorkspaceBase } from "./workspace";
 
+export const enum MemcpyKind {
+  HostToHost = 0,
+  HostToDevice = 1,
+  DeviceToHost = 2,
+  DeviceToDevice = 3,
+  Default = 4,
+}
+
 function numElements(shape: number[]): number {
   return shape.reduce((a, b) => a * b, 1);
 }
@@ -68,7 +76,7 @@ export abstract class Tensor implements Disposable {
   abstract fill(value: number, n: number): void;
   abstract mmapLoad(mmapPtr: number, offset: number, nbytes: number, gdnQkvLayout?: import("./device_ops").GdnQkvLayout): void;
   abstract writePinned(src: Buffer, size?: number): void;
-  abstract memcpy(src: Tensor, size?: number): void;
+  abstract memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void;
   abstract rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor };
 
   readInt32LE(): number[] {
