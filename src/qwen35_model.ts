@@ -30,6 +30,10 @@ class Qwen35ChatCache implements ChatCache {
     this.pagedKV.free();
   }
 
+  [Symbol.dispose](): void {
+    this.free();
+  }
+
   prefixMatch(seqIdx: number, inputIds: number[]): number[] {
     const batchSize = Math.max(this.pagedKV.seqPages.length, 1);
     this.pagedKV.reset(batchSize);

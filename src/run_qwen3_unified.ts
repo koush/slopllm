@@ -196,6 +196,7 @@ export function* generateStream(
       const wasCapturing = capturing;
       if (capturing) {
         const graph = glm.graphEndCapture();
+        ws.freeze();
         graphState!.graphExec = glm.graphInstantiate(graph);
         glm.graphDestroy(graph);
         capturing = false;

@@ -14,13 +14,12 @@ const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
 
-interface ModelContext {
+interface ModelContext extends Disposable {
   model: Qwen3Model | Qwen35Model;
   ws: ExecutionWorkspace;
   cache: ChatCache;
   eosIds: Set<number>;
   parisTokenId: number;
-  free: () => void;
 }
 
 interface GraphOps {
@@ -53,7 +52,7 @@ function loadQwen3(glm: DeviceOps, repoId: string): ModelContext {
     model, ws, cache,
     eosIds: model.eosIds,
     parisTokenId: 59604,
-    free: () => { cache.free(); ws.free(); model.free(); },
+    [Symbol.dispose]() { cache[Symbol.dispose](); ws[Symbol.dispose](); model[Symbol.dispose](); },
   };
 }
 
@@ -65,7 +64,7 @@ function loadQwen35(glm: DeviceOps): ModelContext {
     model, ws, cache,
     eosIds: model.eosIds,
     parisTokenId: 57590,
-    free: () => { cache.free(); ws.free(); model.free(); },
+    [Symbol.dispose]() { cache[Symbol.dispose](); ws[Symbol.dispose](); model[Symbol.dispose](); },
   };
 }
 
@@ -102,6 +101,7 @@ function generateWithGraph(
 
       if (capturing) {
         const graphIdx = graph.graphEndCapture();
+        ws.freeze();
         graphExec = graph.graphInstantiate(graphIdx);
         graph.graphDestroy(graphIdx);
         capturing = false;
@@ -141,7 +141,7 @@ describe("Qwen3-0.6B Paris (1 GPU, graph)", () => {
     ctx = loadQwen3(glm, QWEN3_REPO);
     tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN3_REPO), { local_files_only: true });
   });
-  after(() => { ctx.free(); glm.free(); });
+  after(() => { ctx[Symbol.dispose](); glm.free(); });
 
   it("generates 'Paris'", () => {
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
@@ -160,7 +160,7 @@ describe("Qwen3-0.6B-FP8 Paris (1 GPU, graph)", () => {
     ctx = loadQwen3(glm, FP8_REPO);
     tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(FP8_REPO), { local_files_only: true });
   });
-  after(() => { ctx.free(); glm.free(); });
+  after(() => { ctx[Symbol.dispose](); glm.free(); });
 
   it("generates 'Paris'", () => {
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
@@ -179,7 +179,7 @@ describe("Qwen3.5-0.8B Paris (1 GPU, graph)", () => {
     ctx = loadQwen35(glm);
     tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN35_REPO), { local_files_only: true });
   });
-  after(() => { ctx.free(); glm.free(); });
+  after(() => { ctx[Symbol.dispose](); glm.free(); });
 
   it("generates 'Paris'", () => {
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
@@ -204,7 +204,7 @@ describe("Qwen3-0.6B Paris (2 GPU, graph)", () => {
     ctx = loadQwen3(po as any, QWEN3_REPO);
     tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN3_REPO), { local_files_only: true });
   });
-  after(() => { ctx.free(); po.free(); glm0.free(); glm1.free(); });
+  after(() => { ctx[Symbol.dispose](); po.free(); glm0.free(); glm1.free(); });
 
   it("generates 'Paris'", () => {
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
@@ -227,7 +227,7 @@ describe("Qwen3-0.6B-FP8 Paris (2 GPU, graph)", () => {
     ctx = loadQwen3(po as any, FP8_REPO);
     tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(FP8_REPO), { local_files_only: true });
   });
-  after(() => { ctx.free(); po.free(); glm0.free(); glm1.free(); });
+  after(() => { ctx[Symbol.dispose](); po.free(); glm0.free(); glm1.free(); });
 
   it("generates 'Paris'", () => {
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
@@ -250,7 +250,7 @@ describe("Qwen3.5-0.8B Paris (2 GPU, graph)", () => {
     ctx = loadQwen35(po as any);
     tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN35_REPO), { local_files_only: true });
   });
-  after(() => { ctx.free(); po.free(); glm0.free(); glm1.free(); });
+  after(() => { ctx[Symbol.dispose](); po.free(); glm0.free(); glm1.free(); });
 
   it("generates 'Paris'", () => {
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");

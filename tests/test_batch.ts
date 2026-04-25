@@ -27,7 +27,7 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   after(() => {
-    ws.free();
+    ws[Symbol.dispose]();
     model.free();
     glm.free();
   });
@@ -38,360 +38,312 @@ describe("Qwen3-0.6B batch tests", () => {
   }
 
   it("batch prefill vs single prefill", () => {
-    const pagedKV = makePagedKV();
-    const singleKV = makePagedKV(1);
-    try {
-      pagedKV.reset(2);
-      const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
+    using pagedKV = makePagedKV();
+    using singleKV = makePagedKV(1);
+    pagedKV.reset(2);
+    const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
 
-      singleKV.reset(1);
-      const singleToken1 = ws.forwardEager(model, [PROMPT1], singleKV)[0];
+    singleKV.reset(1);
+    const singleToken1 = ws.forwardEager(model, [PROMPT1], singleKV)[0];
 
-      singleKV.reset(1);
-      const singleToken2 = ws.forwardEager(model, [PROMPT2], singleKV)[0];
+    singleKV.reset(1);
+    const singleToken2 = ws.forwardEager(model, [PROMPT2], singleKV)[0];
 
-      assert.equal(batchTokens[0], singleToken1,
-        `Seq1 prefill token mismatch: batch=${batchTokens[0]}, single=${singleToken1}`);
-      assert.equal(batchTokens[1], singleToken2,
-        `Seq2 prefill token mismatch: batch=${batchTokens[1]}, single=${singleToken2}`);
-    } finally {
-      pagedKV.free();
-      singleKV.free();
-    }
+    assert.equal(batchTokens[0], singleToken1,
+      `Seq1 prefill token mismatch: batch=${batchTokens[0]}, single=${singleToken1}`);
+    assert.equal(batchTokens[1], singleToken2,
+      `Seq2 prefill token mismatch: batch=${batchTokens[1]}, single=${singleToken2}`);
   });
 
   it("batch prefill paged then decode", () => {
-    const pagedKV = makePagedKV();
-    try {
-      pagedKV.reset(2);
-      const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
-      pagedKV.updateIndptr(ws);
+    using pagedKV = makePagedKV();
+    pagedKV.reset(2);
+    const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
+    pagedKV.updateIndptr(ws);
 
-      const decodeTokens = ws.forwardEagerDecode(model, batchTokens, pagedKV);
+    const decodeTokens = ws.forwardEagerDecode(model, batchTokens, pagedKV);
 
-      assert.equal(typeof decodeTokens[0], "number", `Decode token 0 not a number: ${decodeTokens[0]}`);
-      assert.equal(typeof decodeTokens[1], "number", `Decode token 1 not a number: ${decodeTokens[1]}`);
-    } finally {
-      pagedKV.free();
-    }
+    assert.equal(typeof decodeTokens[0], "number", `Decode token 0 not a number: ${decodeTokens[0]}`);
+    assert.equal(typeof decodeTokens[1], "number", `Decode token 1 not a number: ${decodeTokens[1]}`);
   });
 
   it("batch prefill append", () => {
-    const pagedKV = makePagedKV(1, 256);
-    const singleKV = makePagedKV(1, 256);
-    try {
-      const suffix = [4, 5, 6, 7];
-      const fullPrompt = [...PROMPT1, ...suffix];
+    using pagedKV = makePagedKV(1, 256);
+    using singleKV = makePagedKV(1, 256);
+    const suffix = [4, 5, 6, 7];
+    const fullPrompt = [...PROMPT1, ...suffix];
 
-      pagedKV.reset(1);
-      const tokensFull = ws.forwardEager(model, [fullPrompt], pagedKV);
+    pagedKV.reset(1);
+    const tokensFull = ws.forwardEager(model, [fullPrompt], pagedKV);
 
-      pagedKV.reset(1);
-      ws.forwardEager(model, [PROMPT1], pagedKV);
-      pagedKV.updateIndptr(ws);
-      const tokensAppend = ws.forwardEager(model, [suffix], pagedKV);
+    pagedKV.reset(1);
+    ws.forwardEager(model, [PROMPT1], pagedKV);
+    pagedKV.updateIndptr(ws);
+    const tokensAppend = ws.forwardEager(model, [suffix], pagedKV);
 
-      singleKV.reset(1);
-      const singleToken = ws.forwardEager(model, [fullPrompt], singleKV)[0];
+    singleKV.reset(1);
+    const singleToken = ws.forwardEager(model, [fullPrompt], singleKV)[0];
 
-      assert.equal(tokensFull[0], singleToken,
-        `Full paged prefill mismatch: paged=${tokensFull[0]}, single=${singleToken}`);
-      assert.equal(tokensAppend[0], tokensFull[0],
-        `Append prefill mismatch: append=${tokensAppend[0]}, full=${tokensFull[0]}`);
-    } finally {
-      pagedKV.free();
-      singleKV.free();
-    }
+    assert.equal(tokensFull[0], singleToken,
+      `Full paged prefill mismatch: paged=${tokensFull[0]}, single=${singleToken}`);
+    assert.equal(tokensAppend[0], tokensFull[0],
+      `Append prefill mismatch: append=${tokensAppend[0]}, full=${tokensFull[0]}`);
   });
 
   it("batch prefill truncate append", () => {
-    const pagedKV = makePagedKV(1, 256);
-    const singleKV = makePagedKV(1, 256);
-    try {
-      const suffix = [4, 5, 6, 7];
-      const fullPrompt = [...PROMPT1, ...suffix];
+    using pagedKV = makePagedKV(1, 256);
+    using singleKV = makePagedKV(1, 256);
+    const suffix = [4, 5, 6, 7];
+    const fullPrompt = [...PROMPT1, ...suffix];
 
-      pagedKV.reset(1);
-      ws.forwardEager(model, [PROMPT1], pagedKV);
-      pagedKV.updateIndptr(ws);
-      ws.forwardEager(model, [suffix], pagedKV);
-      pagedKV.updateIndptr(ws);
+    pagedKV.reset(1);
+    ws.forwardEager(model, [PROMPT1], pagedKV);
+    pagedKV.updateIndptr(ws);
+    ws.forwardEager(model, [suffix], pagedKV);
+    pagedKV.updateIndptr(ws);
 
-      pagedKV.truncate(0, PROMPT1.length);
-      pagedKV.updateIndptr(ws);
-      const tokensTruncAppend = ws.forwardEager(model, [suffix], pagedKV);
+    pagedKV.truncate(0, PROMPT1.length);
+    pagedKV.updateIndptr(ws);
+    const tokensTruncAppend = ws.forwardEager(model, [suffix], pagedKV);
 
-      const pagedKV2 = makePagedKV(1, 256);
-      try {
-        pagedKV2.reset(1);
-        const tokensFull = ws.forwardEager(model, [fullPrompt], pagedKV2);
+    using pagedKV2 = makePagedKV(1, 256);
+    pagedKV2.reset(1);
+    const tokensFull = ws.forwardEager(model, [fullPrompt], pagedKV2);
 
-        assert.equal(tokensTruncAppend[0], tokensFull[0],
-          `Truncate+append mismatch: trunc_append=${tokensTruncAppend[0]}, full=${tokensFull[0]}`);
-      } finally {
-        pagedKV2.free();
-      }
+    assert.equal(tokensTruncAppend[0], tokensFull[0],
+      `Truncate+append mismatch: trunc_append=${tokensTruncAppend[0]}, full=${tokensFull[0]}`);
 
-      singleKV.reset(1);
-      const singleToken = ws.forwardEager(model, [fullPrompt], singleKV)[0];
-      assert.equal(tokensTruncAppend[0], singleToken,
-        `Truncate+append vs single mismatch: trunc_append=${tokensTruncAppend[0]}, single=${singleToken}`);
-    } finally {
-      pagedKV.free();
-      singleKV.free();
-    }
+    singleKV.reset(1);
+    const singleToken = ws.forwardEager(model, [fullPrompt], singleKV)[0];
+    assert.equal(tokensTruncAppend[0], singleToken,
+      `Truncate+append vs single mismatch: trunc_append=${tokensTruncAppend[0]}, single=${singleToken}`);
   });
 
   it("batch decode vs single decode", () => {
-    const pagedKV = makePagedKV();
-    const singleKV = makePagedKV(1);
-    try {
-      pagedKV.reset(2);
-      const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
-      const token1 = batchTokens[0];
-      const token2 = batchTokens[1];
+    using pagedKV = makePagedKV();
+    using singleKV = makePagedKV(1);
+    pagedKV.reset(2);
+    const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
+    const token1 = batchTokens[0];
+    const token2 = batchTokens[1];
 
-      singleKV.reset(1);
-      const singleFirst1 = ws.forwardEager(model, [PROMPT1], singleKV)[0];
-      const singleDecode1 = ws.forwardEagerDecode(model, [singleFirst1], singleKV)[0];
+    singleKV.reset(1);
+    const singleFirst1 = ws.forwardEager(model, [PROMPT1], singleKV)[0];
+    const singleDecode1 = ws.forwardEagerDecode(model, [singleFirst1], singleKV)[0];
 
-      singleKV.reset(1);
-      const singleFirst2 = ws.forwardEager(model, [PROMPT2], singleKV)[0];
-      const singleDecode2 = ws.forwardEagerDecode(model, [singleFirst2], singleKV)[0];
+    singleKV.reset(1);
+    const singleFirst2 = ws.forwardEager(model, [PROMPT2], singleKV)[0];
+    const singleDecode2 = ws.forwardEagerDecode(model, [singleFirst2], singleKV)[0];
 
-      const batchDecodeTokens = ws.forwardEagerDecode(model, [token1, token2], pagedKV);
+    const batchDecodeTokens = ws.forwardEagerDecode(model, [token1, token2], pagedKV);
 
-      assert.equal(batchDecodeTokens[0], singleDecode1,
-        `Seq1 decode token mismatch: batch=${batchDecodeTokens[0]}, single=${singleDecode1}`);
-      assert.equal(batchDecodeTokens[1], singleDecode2,
-        `Seq2 decode token mismatch: batch=${batchDecodeTokens[1]}, single=${singleDecode2}`);
-    } finally {
-      pagedKV.free();
-      singleKV.free();
-    }
+    assert.equal(batchDecodeTokens[0], singleDecode1,
+      `Seq1 decode token mismatch: batch=${batchDecodeTokens[0]}, single=${singleDecode1}`);
+    assert.equal(batchDecodeTokens[1], singleDecode2,
+      `Seq2 decode token mismatch: batch=${batchDecodeTokens[1]}, single=${singleDecode2}`);
   });
 
   it("batch multi-step decode", () => {
-    const pagedKV = makePagedKV();
-    try {
-      pagedKV.reset(2);
-      const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
-      pagedKV.updateIndptr(ws);
+    using pagedKV = makePagedKV();
+    pagedKV.reset(2);
+    const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
+    pagedKV.updateIndptr(ws);
 
-      let current = [batchTokens[0], batchTokens[1]];
-      const numSteps = 5;
+    let current = [batchTokens[0], batchTokens[1]];
+    const numSteps = 5;
 
-      for (let step = 0; step < numSteps; step++) {
-        current = ws.forwardEagerDecode(model, current, pagedKV);
-      }
-
-      assert.equal(current.length, 2);
-      assert.equal(typeof current[0], "number");
-      assert.equal(typeof current[1], "number");
-    } finally {
-      pagedKV.free();
+    for (let step = 0; step < numSteps; step++) {
+      current = ws.forwardEagerDecode(model, current, pagedKV);
     }
+
+    assert.equal(current.length, 2);
+    assert.equal(typeof current[0], "number");
+    assert.equal(typeof current[1], "number");
   });
 
   it("batch generate vs single generate", () => {
-    const pagedKV = makePagedKV();
-    const singleKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV();
+    using singleKV = makePagedKV(1, 256);
     const maxNewTokens = 20;
-    try {
-      const batchGenerated = generateBatchTokens(model, ws, pagedKV, [PROMPT_LONG1, PROMPT_LONG2], maxNewTokens, EOS_TOKEN_IDS);
+    const batchGenerated = generateBatchTokens(model, ws, pagedKV, [PROMPT_LONG1, PROMPT_LONG2], maxNewTokens, EOS_TOKEN_IDS);
 
-      singleKV.reset(1);
-      const single1 = [...generateTokens(model, ws, singleKV, PROMPT_LONG1, maxNewTokens, EOS_TOKEN_IDS)];
+    singleKV.reset(1);
+    const single1 = [...generateTokens(model, ws, singleKV, PROMPT_LONG1, maxNewTokens, EOS_TOKEN_IDS)];
 
-      singleKV.reset(1);
-      const single2 = [...generateTokens(model, ws, singleKV, PROMPT_LONG2, maxNewTokens, EOS_TOKEN_IDS)];
+    singleKV.reset(1);
+    const single2 = [...generateTokens(model, ws, singleKV, PROMPT_LONG2, maxNewTokens, EOS_TOKEN_IDS)];
 
-      assert.ok(batchGenerated[0].length > 0, "Seq1 generated no tokens");
-      assert.ok(batchGenerated[1].length > 0, "Seq2 generated no tokens");
+    assert.ok(batchGenerated[0].length > 0, "Seq1 generated no tokens");
+    assert.ok(batchGenerated[1].length > 0, "Seq2 generated no tokens");
 
-      const match1 = batchGenerated[0].slice(0, 3).every((t: number, i: number) => t === single1[i]);
-      const match2 = batchGenerated[1].slice(0, 3).every((t: number, i: number) => t === single2[i]);
+    const match1 = batchGenerated[0].slice(0, 3).every((t: number, i: number) => t === single1[i]);
+    const match2 = batchGenerated[1].slice(0, 3).every((t: number, i: number) => t === single2[i]);
 
-      assert.ok(match1,
-        `Seq1 first 3 tokens mismatch: batch=${batchGenerated[0].slice(0, 3)}, single=${single1.slice(0, 3)}`);
-      assert.ok(match2,
-        `Seq2 first 3 tokens mismatch: batch=${batchGenerated[1].slice(0, 3)}, single=${single2.slice(0, 3)}`);
-    } finally {
-      pagedKV.free();
-      singleKV.free();
-    }
+    assert.ok(match1,
+      `Seq1 first 3 tokens mismatch: batch=${batchGenerated[0].slice(0, 3)}, single=${single1.slice(0, 3)}`);
+    assert.ok(match2,
+      `Seq2 first 3 tokens mismatch: batch=${batchGenerated[1].slice(0, 3)}, single=${single2.slice(0, 3)}`);
   });
 
   it("cuda graph decode", () => {
-    const pagedKV = makePagedKV();
-    try {
-      const prompt = PROMPT_GRAPH;
+    using gws = new ExecutionWorkspace(glm, 4, 4096);
+    using pagedKV = makePagedKV();
+    const prompt = PROMPT_GRAPH;
 
-      pagedKV.reset(1);
-      const tokens = ws.forwardEager(model, [prompt], pagedKV);
-      pagedKV.updateIndptr(ws);
+    pagedKV.reset(1);
+    const tokens = gws.forwardEager(model, [prompt], pagedKV);
+    pagedKV.updateIndptr(gws);
 
-      const stateRef = ws.planDecode(model, [tokens[0]], pagedKV, true);
-      const logitsRef = model.forward(stateRef);
-      using argmaxRef = logitsRef.argmax();
-      const tokensRef = argmaxRef.readInt32LE();
+    const stateRef = gws.planDecode(model, [tokens[0]], pagedKV, true);
+    const logitsRef = model.forward(stateRef);
+    using argmaxRef = logitsRef.argmax();
+    const tokensRef = argmaxRef.readInt32LE();
 
-      pagedKV.reset(1);
-      const tokens2 = ws.forwardEager(model, [prompt], pagedKV);
-      pagedKV.updateIndptr(ws);
-      const state = ws.planDecode(model, [tokens2[0]], pagedKV, true);
+    pagedKV.reset(1);
+    const tokens2 = gws.forwardEager(model, [prompt], pagedKV);
+    pagedKV.updateIndptr(gws);
+    const state = gws.planDecode(model, [tokens2[0]], pagedKV, true);
 
-      glm.graphBeginCapture();
-      const captureLogits = model.forward(state);
-      const captureArgmax = captureLogits.argmax();
-      const graph = glm.graphEndCapture();
-      const graphExec = glm.graphInstantiate(graph);
+    glm.graphBeginCapture();
+    const captureLogits = model.forward(state);
+    const captureArgmax = captureLogits.argmax();
+    const graph = glm.graphEndCapture();
+    gws.freeze();
+    const graphExec = glm.graphInstantiate(graph);
 
-      pagedKV.reset(1);
-      const tokens3 = ws.forwardEager(model, [prompt], pagedKV);
-      pagedKV.updateIndptr(ws);
-      const state2 = ws.planDecode(model, [tokens3[0]], pagedKV, true);
+    using ws2 = new ExecutionWorkspace(glm, 4, 4096);
+    pagedKV.reset(1);
+    const tokens3 = ws2.forwardEager(model, [prompt], pagedKV);
+    pagedKV.updateIndptr(ws2);
+    gws.planDecode(model, [tokens3[0]], pagedKV, true);
 
-      glm.graphLaunch(graphExec);
-      glm.synchronize();
+    glm.graphLaunch(graphExec);
+    glm.synchronize();
 
-      const tokensReplay = captureArgmax.readInt32LE();
-      assert.deepEqual(tokensReplay, tokensRef,
-        `Graph replay mismatch: replay=${tokensReplay}, ref=${tokensRef}`);
+    const tokensReplay = captureArgmax.readInt32LE();
+    assert.deepEqual(tokensReplay, tokensRef,
+      `Graph replay mismatch: replay=${tokensReplay}, ref=${tokensRef}`);
 
-      glm.graphExecDestroy(graphExec);
-      glm.graphDestroy(graph);
-    } finally {
-      pagedKV.free();
-    }
+    glm.graphExecDestroy(graphExec);
+    glm.graphDestroy(graph);
   });
 
   it("cuda graph multi-step decode", () => {
-    const pagedKV = makePagedKV();
+    using gws = new ExecutionWorkspace(glm, 4, 4096);
+    using pagedKV = makePagedKV();
     const numSteps = 10;
-    try {
-      const prompt = PROMPT_GRAPH;
+    const prompt = PROMPT_GRAPH;
 
-      pagedKV.reset(1);
-      let tokens = ws.forwardEager(model, [prompt], pagedKV);
-      pagedKV.updateIndptr(ws);
+    pagedKV.reset(1);
+    let tokens = gws.forwardEager(model, [prompt], pagedKV);
+    pagedKV.updateIndptr(gws);
 
-      const refTokens: number[] = [];
-      let current = tokens[0];
-      for (let step = 0; step < numSteps; step++) {
-        const state = ws.planDecode(model, [current], pagedKV, true);
-        const logits = model.forward(state);
-        using argmaxResult = logits.argmax();
-        current = argmaxResult.readInt32LE()[0];
-        refTokens.push(current);
-      }
+    const refTokens: number[] = [];
+    let current = tokens[0];
+    for (let step = 0; step < numSteps; step++) {
+      const state = gws.planDecode(model, [current], pagedKV, true);
+      const logits = model.forward(state);
+      using argmaxResult = logits.argmax();
+      current = argmaxResult.readInt32LE()[0];
+      refTokens.push(current);
+    }
 
-      pagedKV.reset(1);
-      tokens = ws.forwardEager(model, [prompt], pagedKV);
-      pagedKV.updateIndptr(ws);
+    pagedKV.reset(1);
+    tokens = gws.forwardEager(model, [prompt], pagedKV);
+    pagedKV.updateIndptr(gws);
 
-      current = tokens[0];
-      const warmupState = ws.planDecode(model, [current], pagedKV, true);
-      const warmupLogits = model.forward(warmupState);
-      using warmupArgmax = warmupLogits.argmax();
-      current = warmupArgmax.readInt32LE()[0];
-      assert.equal(current, refTokens[0], `Warmup mismatch: ${current} != ${refTokens[0]}`);
+    current = tokens[0];
+    const warmupState = gws.planDecode(model, [current], pagedKV, true);
+    const warmupLogits = model.forward(warmupState);
+    using warmupArgmax = warmupLogits.argmax();
+    current = warmupArgmax.readInt32LE()[0];
+    assert.equal(current, refTokens[0], `Warmup mismatch: ${current} != ${refTokens[0]}`);
 
-      const state = ws.planDecode(model, [current], pagedKV, true);
-      glm.graphBeginCapture();
-      const captureLogits = model.forward(state);
-      const captureArgmax = captureLogits.argmax();
-      const graph = glm.graphEndCapture();
-      const graphExec = glm.graphInstantiate(graph);
-      glm.graphDestroy(graph);
+    const state = gws.planDecode(model, [current], pagedKV, true);
+    glm.graphBeginCapture();
+    const captureLogits = model.forward(state);
+    const captureArgmax = captureLogits.argmax();
+    const graph = glm.graphEndCapture();
+    gws.freeze();
+    const graphExec = glm.graphInstantiate(graph);
+    glm.graphDestroy(graph);
 
+    glm.graphLaunch(graphExec);
+    glm.synchronize();
+    current = captureArgmax.readInt32LE()[0];
+    const graphTokens: number[] = [refTokens[0], current];
+    assert.equal(current, refTokens[1], `Replay step 1 mismatch: ${current} != ${refTokens[1]}`);
+
+    for (let step = 2; step < numSteps; step++) {
+      gws.planDecode(model, [current], pagedKV, true);
       glm.graphLaunch(graphExec);
       glm.synchronize();
       current = captureArgmax.readInt32LE()[0];
-      const graphTokens: number[] = [refTokens[0], current];
-      assert.equal(current, refTokens[1], `Replay step 1 mismatch: ${current} != ${refTokens[1]}`);
-
-      for (let step = 2; step < numSteps; step++) {
-        const s = ws.planDecode(model, [current], pagedKV, true);
-        glm.graphLaunch(graphExec);
-        glm.synchronize();
-        current = captureArgmax.readInt32LE()[0];
-        graphTokens.push(current);
-        assert.equal(current, refTokens[step],
-          `Replay step ${step} mismatch: ${current} != ${refTokens[step]}`);
-      }
-
-      assert.deepEqual(graphTokens, refTokens,
-        `Token sequence mismatch: graph=${graphTokens}, ref=${refTokens}`);
-
-      glm.graphExecDestroy(graphExec);
-    } finally {
-      pagedKV.free();
+      graphTokens.push(current);
+      assert.equal(current, refTokens[step],
+        `Replay step ${step} mismatch: ${current} != ${refTokens[step]}`);
     }
+
+    assert.deepEqual(graphTokens, refTokens,
+      `Token sequence mismatch: graph=${graphTokens}, ref=${refTokens}`);
+
+    glm.graphExecDestroy(graphExec);
   });
 
   it("batch sampling matches sequential sampling", () => {
-    const pagedKV = model.createChatCache() as PagedKVCache;
-    try {
-      const greedy: SamplingParams = makeSamplingParams({
-        temperature: 0, topP: 1.0, topK: 0,
-        repetitionPenalty: 1.0, presencePenalty: 0, repetitionPenaltyWindow: 64,
-      });
-      const sampling: SamplingParams = makeSamplingParams({
-        temperature: 0.8, topP: 0.95, topK: 20,
-        repetitionPenalty: 1.05, presencePenalty: 0.0, repetitionPenaltyWindow: 64,
-      });
+    using pagedKV = model.createChatCache() as PagedKVCache;
+    const greedy: SamplingParams = makeSamplingParams({
+      temperature: 0, topP: 1.0, topK: 0,
+      repetitionPenalty: 1.0, presencePenalty: 0, repetitionPenaltyWindow: 64,
+    });
+    const sampling: SamplingParams = makeSamplingParams({
+      temperature: 0.8, topP: 0.95, topK: 20,
+      repetitionPenalty: 1.05, presencePenalty: 0.0, repetitionPenaltyWindow: 64,
+    });
 
-      pagedKV.reset(1);
-      const state = ws.plan(model, [PROMPT_GRAPH], pagedKV);
-      const logits = model.forward(state);
-      using argmaxOut = logits.argmax();
-      const tokens = argmaxOut.readInt32LE();
-      pagedKV.updateIndptr(ws);
+    pagedKV.reset(1);
+    const state = ws.plan(model, [PROMPT_GRAPH], pagedKV);
+    const logits = model.forward(state);
+    using argmaxOut = logits.argmax();
+    const tokens = argmaxOut.readInt32LE();
+    pagedKV.updateIndptr(ws);
 
-      const firstToken = tokens[0];
-      const history = [...PROMPT_GRAPH, firstToken];
+    const firstToken = tokens[0];
+    const history = [...PROMPT_GRAPH, firstToken];
 
-      const greedySingle = logits.sampleTokenGPU(greedy, history).readInt32LE()[0];
+    const greedySingle = logits.sampleTokenGPU(greedy, history).readInt32LE()[0];
 
-      const batchResults = logits.sampleBatchGPU([greedy, sampling], [history, history]).readInt32LE();
+    const batchResults = logits.sampleBatchGPU([greedy, sampling], [history, history]).readInt32LE();
 
-      assert.equal(batchResults[0], greedySingle,
-        `Batch greedy[0] != sequential greedy: ${batchResults[0]} != ${greedySingle}`);
-      assert.ok(Number.isInteger(batchResults[1]),
-        `Sampling token should be integer: ${batchResults[1]}`);
-      assert.ok(batchResults[1] >= 0 && batchResults[1] < model.cfg.vocabSize,
-        `Sampling token out of range: ${batchResults[1]}`);
-    } finally {
-      pagedKV.free();
-    }
+    assert.equal(batchResults[0], greedySingle,
+      `Batch greedy[0] != sequential greedy: ${batchResults[0]} != ${greedySingle}`);
+    assert.ok(Number.isInteger(batchResults[1]),
+      `Sampling token should be integer: ${batchResults[1]}`);
+    assert.ok(batchResults[1] >= 0 && batchResults[1] < model.cfg.vocabSize,
+      `Sampling token out of range: ${batchResults[1]}`);
   });
 
   it("batch sampling with different histories", () => {
-    const pagedKV = model.createChatCache(4) as PagedKVCache;
-    try {
-      const greedy: SamplingParams = makeSamplingParams({
-        temperature: 0, topP: 1.0, topK: 0,
-        repetitionPenalty: 1.0, presencePenalty: 0, repetitionPenaltyWindow: 64,
-      });
+    using pagedKV = model.createChatCache(4) as PagedKVCache;
+    const greedy: SamplingParams = makeSamplingParams({
+      temperature: 0, topP: 1.0, topK: 0,
+      repetitionPenalty: 1.0, presencePenalty: 0, repetitionPenaltyWindow: 64,
+    });
 
-      pagedKV.reset(2);
-      const state = ws.plan(model, [PROMPT1, PROMPT2], pagedKV);
-      const logits = model.forward(state);
-      using argmaxOut2 = logits.argmax();
-      const tokens = argmaxOut2.readInt32LE();
+    pagedKV.reset(2);
+    const state = ws.plan(model, [PROMPT1, PROMPT2], pagedKV);
+    const logits = model.forward(state);
+    using argmaxOut2 = logits.argmax();
+    const tokens = argmaxOut2.readInt32LE();
 
-      const history1 = [...PROMPT1, tokens[0]];
-      const history2 = [...PROMPT2, tokens[1]];
+    const history1 = [...PROMPT1, tokens[0]];
+    const history2 = [...PROMPT2, tokens[1]];
 
-      const batchResults = logits.sampleBatchGPU([greedy, greedy], [history1, history2]).readInt32LE();
+    const batchResults = logits.sampleBatchGPU([greedy, greedy], [history1, history2]).readInt32LE();
 
-      assert.equal(batchResults[0], tokens[0],
-        `Batch greedy[0] != argmax: ${batchResults[0]} != ${tokens[0]}`);
-      assert.equal(batchResults[1], tokens[1],
-        `Batch greedy[1] != argmax: ${batchResults[1]} != ${tokens[1]}`);
-    } finally {
-      pagedKV.free();
-    }
+    assert.equal(batchResults[0], tokens[0],
+      `Batch greedy[0] != argmax: ${batchResults[0]} != ${tokens[0]}`);
+    assert.equal(batchResults[1], tokens[1],
+      `Batch greedy[1] != argmax: ${batchResults[1]} != ${tokens[1]}`);
   });
 });

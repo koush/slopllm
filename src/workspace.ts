@@ -1,7 +1,7 @@
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import { Tensor } from "./tensor";
 
-export class WorkspaceBase {
+export class WorkspaceBase implements Disposable {
   readonly glm: DeviceOps;
   tensors = new Map<string, Tensor>();
   tracked = new Set<Tensor>();
@@ -81,6 +81,10 @@ export class WorkspaceBase {
     this.tracked.clear();
     this.disposed.clear();
     this.exported.clear();
+  }
+
+  [Symbol.dispose](): void {
+    this.free();
   }
 
   startTracking(): Disposable & { [Symbol.dispose](): void } {

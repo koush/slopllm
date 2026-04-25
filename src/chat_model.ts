@@ -16,7 +16,7 @@ export interface SamplingParams {
   repetitionPenaltyWindow: number;
 }
 
-export interface ChatCache {
+export interface ChatCache extends Disposable {
   getPagedKV(): PagedKVCache;
   reset(batchSize: number): void;
   free(): void;
