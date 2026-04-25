@@ -514,25 +514,9 @@ export class ParallelTensor extends Tensor {
   }
 
   argmax(): Tensor {
-    if (this.parallelism === TensorParallelism.PartialSum) {
-      this.allReduce();
-      return this.argmax();
-    }
-
-    if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
-      const gathered = this.allGather(this.workspace);
-      const result = gathered.argmax();
-      gathered[Symbol.dispose]();
-      return result;
-    }
-
-    this.assertParallel("argmax input", this, TensorParallelism.Replicated);
-
-    const shards: Tensor[] = [];
-    for (let i = 0; i < this.worldSize; i++) {
-      shards.push(this.shards[i].argmax());
-    }
-    return this.parallelOps.wrapShards(this.workspace, shards, [this.shape[0]], "I32", TensorParallelism.Replicated);
+    const { indices, values} = this.max();
+    values[Symbol.dispose]();
+    return indices;
   }
 
   max(): { values: Tensor, indices: Tensor } {
