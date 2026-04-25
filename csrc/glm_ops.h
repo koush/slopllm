@@ -73,7 +73,7 @@ void glm_causal_mask(GlmCtx* ctx, void* out, int seq_len);
 void glm_fill(GlmCtx* ctx, void* out, float value, int n);
 
 void glm_gather(GlmCtx* ctx, void* out, const void* input, const int* indices,
-                int k, int in_dim, int batch);
+                int k, int in_dim, int batch, int elem_size);
 
 void glm_scatter_scalar(GlmCtx* ctx, void* out, const int* indices, float value,
                         int k, int out_dim, int batch);

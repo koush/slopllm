@@ -197,7 +197,7 @@ class GlmOps:
         self.lib.glm_gather.restype = None
         self.lib.glm_gather.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
         self.lib.glm_scatter_scalar.restype = None
@@ -687,13 +687,13 @@ class GlmOps:
             n
         )
 
-    def gather(self, output, input, indices, k, in_dim, batch):
+    def gather(self, output, input, indices, k, in_dim, batch, elem_size=2):
         self.lib.glm_gather(
             self.ctx,
             self._ptr(output),
             self._ptr(input),
             self._ptr(indices),
-            k, in_dim, batch
+            k, in_dim, batch, elem_size
         )
 
     def scatter_scalar(self, output, indices, value, k, out_dim, batch):

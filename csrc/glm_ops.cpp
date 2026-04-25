@@ -318,8 +318,8 @@ static Napi::Value Fill(const Napi::CallbackInfo& info) {
 
 static Napi::Value Gather(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 7) {
-        Napi::TypeError::New(env, "Expected (ctx, out, input, indices, k, in_dim, batch)").ThrowAsJavaScriptException();
+    if (info.Length() < 8) {
+        Napi::TypeError::New(env, "Expected (ctx, out, input, indices, k, in_dim, batch, elem_size)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -329,11 +329,12 @@ static Napi::Value Gather(const Napi::CallbackInfo& info) {
     int k = info[4].As<Napi::Number>().Int32Value();
     int in_dim = info[5].As<Napi::Number>().Int32Value();
     int batch = info[6].As<Napi::Number>().Int32Value();
+    int elem_size = info[7].As<Napi::Number>().Int32Value();
     glm_gather(reinterpret_cast<GlmCtx*>(ctx_ptr),
                reinterpret_cast<void*>(out_ptr),
                reinterpret_cast<const void*>(in_ptr),
                reinterpret_cast<const int*>(idx_ptr),
-               k, in_dim, batch);
+               k, in_dim, batch, elem_size);
     return env.Undefined();
 }
 

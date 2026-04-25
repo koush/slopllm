@@ -558,6 +558,18 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, shards, [batch, dim], this.type, TensorParallelism.Replicated);
   }
 
+  gather(indices: Tensor, k: number, inDim: number, batch: number): Tensor {
+    const pIndices = indices as ParallelTensor;
+    this.assertParallel("gather src", this, TensorParallelism.Replicated);
+    this.assertParallel("gather indices", pIndices, TensorParallelism.Replicated, TensorParallelism.PartialSum);
+
+    const shards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      shards.push(this.shards[i].gather(pIndices.shards[i], k, inDim, batch));
+    }
+    return this.parallelOps.wrapShards(this.workspace, shards, [batch, k], this.type, TensorParallelism.Replicated);
+  }
+
   gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
     const pState = this.cast(state);
     const pQkv = this.cast(qkv);

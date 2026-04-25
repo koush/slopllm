@@ -696,13 +696,14 @@ void glm_fill(GlmCtx* ctx, void* out, float value, int n) {
 }
 
 // ---------------------------------------------------------------------------
-// Gather kernel (along last dim)
+// Gather kernel (along last dim, type-agnostic via ELEM_SIZE template)
 // out[b, i] = input[b, indices[b, i]]
 // ---------------------------------------------------------------------------
 
+template<int ELEM_SIZE>
 __global__ void __launch_bounds__(256, 4) gather_kernel(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* input,
+    char* __restrict__ out,
+    const char* __restrict__ input,
     const int* indices,
     int k,
     int in_dim,
@@ -714,19 +715,41 @@ __global__ void __launch_bounds__(256, 4) gather_kernel(
         int b = idx / k;
         int i = idx % k;
         int col = indices[b * k + i];
-        out[idx] = input[b * in_dim + col];
+        const char* src = input + (size_t)(b * in_dim + col) * ELEM_SIZE;
+        char* dst = out + (size_t)idx * ELEM_SIZE;
+        if constexpr (ELEM_SIZE == 4) {
+            *reinterpret_cast<int*>(dst) = *reinterpret_cast<const int*>(src);
+        } else if constexpr (ELEM_SIZE == 2) {
+            *reinterpret_cast<uint16_t*>(dst) = *reinterpret_cast<const uint16_t*>(src);
+        } else {
+            *reinterpret_cast<uint8_t*>(dst) = *reinterpret_cast<const uint8_t*>(src);
+        }
     }
 }
 
 void glm_gather(GlmCtx* ctx, void* out, const void* input, const int* indices,
-                int k, int in_dim, int batch) {
+                int k, int in_dim, int batch, int elem_size) {
     cudaSetDevice(ctx->device_id);
     int total = batch * k;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    gather_kernel<<<grid, block_size, 0, ctx->stream>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-        indices, k, in_dim, batch);
+    switch (elem_size) {
+        case 1:
+            gather_kernel<1><<<grid, block_size, 0, ctx->stream>>>(
+                (char*)out, (const char*)input, indices, k, in_dim, batch);
+            break;
+        case 2:
+            gather_kernel<2><<<grid, block_size, 0, ctx->stream>>>(
+                (char*)out, (const char*)input, indices, k, in_dim, batch);
+            break;
+        case 4:
+            gather_kernel<4><<<grid, block_size, 0, ctx->stream>>>(
+                (char*)out, (const char*)input, indices, k, in_dim, batch);
+            break;
+        default:
+            fprintf(stderr, "glm_gather: unsupported elem_size %d\n", elem_size);
+            break;
+    }
 }
 
 // ---------------------------------------------------------------------------

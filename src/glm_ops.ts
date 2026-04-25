@@ -3,6 +3,7 @@ import path from "node:path";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import type { SamplingParams } from "./chat_model";
 import { MemcpyKind, Tensor } from "./tensor";
+import { SafeTensorFile } from "./safetensors";
 import type { WorkspaceBase } from "./workspace";
 
 function findProjectRoot(dir: string): string {
@@ -54,6 +55,7 @@ interface NativeAddon {
   fill(ctx: number, out: number, value: number, n: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number): void;
+  gather(ctx: number, out: number, input: number, indices: number, k: number, inDim: number, batch: number, elemSize: number): void;
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
@@ -185,6 +187,13 @@ export class GlmTensor extends Tensor {
   indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
     const out = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, indices.data, dim, batch);
+    return out;
+  }
+
+  gather(indices: Tensor, k: number, inDim: number, batch: number): Tensor {
+    const out = this.workspace.alloc([batch, k], this.type);
+    const elemSize = SafeTensorFile.dtypeBytes(this.type);
+    getNativeAddon().gather(this.glm.ctx, out.data, this.data, indices.data, k, inDim, batch, elemSize);
     return out;
   }
 
