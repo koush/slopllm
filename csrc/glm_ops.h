@@ -132,8 +132,6 @@ void glm_index_select(GlmCtx* ctx, void* out, const void* src,
 
 void glm_arange(GlmCtx* ctx, int* out, int start, int step, int count);
 
-void glm_argmax(GlmCtx* ctx, int* out_index, const void* input, int dim, int batch);
-
 void glm_max(GlmCtx* ctx, void* out_values, int* out_indices, const void* input, int dim, int batch);
 
 void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes, int kind);
