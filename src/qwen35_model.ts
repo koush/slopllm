@@ -159,7 +159,9 @@ export class Qwen35Model extends ChatModel {
         name.endsWith(".linear_attn.in_proj_a.weight") ||
         name.endsWith(".linear_attn.in_proj_b.weight") ||
         name.endsWith(".linear_attn.in_proj_z.weight") ||
-        name.endsWith(".linear_attn.conv1d.weight")) return TensorParallelism.Column;
+        name.endsWith(".linear_attn.conv1d.weight") ||
+        name.endsWith(".linear_attn.A_log") ||
+        name.endsWith(".linear_attn.dt_bias")) return TensorParallelism.Column;
     if (name.endsWith(".self_attn.o_proj.weight") ||
         name.endsWith(".mlp.down_proj.weight") ||
         name.endsWith(".linear_attn.out_proj.weight")) return TensorParallelism.Row;
