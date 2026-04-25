@@ -307,7 +307,9 @@ export class Qwen35Model extends ChatModel {
     );
 
     using gatedOut = ws.alloc([S, fullZDim], "BF16", undefined, TensorParallelism.Row);
-    gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, S * fullLinHeads);
+    using reshapedGdnOut = gdnOut.reshape([S * fullLinHeads, linVDim]);
+    using reshapedZBuf = zBuf.reshape([S * fullLinHeads, linVDim]);
+    gatedOut.rmsnormGated(reshapedGdnOut, reshapedZBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, S * fullLinHeads);
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!, BS);
 
@@ -358,7 +360,9 @@ export class Qwen35Model extends ChatModel {
     );
 
     using gatedOut = ws.alloc([BS, fullZDim], "BF16", undefined, TensorParallelism.Row);
-    gatedOut.rmsnormGated(gdnOut, zBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, BS * fullLinHeads);
+    using reshapedGdnOut = gdnOut.reshape([BS * fullLinHeads, linVDim]);
+    using reshapedZBuf = zBuf.reshape([BS * fullLinHeads, linVDim]);
+    gatedOut.rmsnormGated(reshapedGdnOut, reshapedZBuf, this.tensors.get(`${pfx}.norm.weight`)!, cfg.rmsNormEps, linVDim, BS * fullLinHeads);
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!, BS);
 
@@ -413,7 +417,8 @@ export class Qwen35Model extends ChatModel {
       flashOut.value.gateSigmoidMul(qBuf, BS, nHeads, hd);
     }
 
-    using oProjBuf = flashOut.value.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
+    using reshapedFlashOut = flashOut.value.reshape([BS, nHeads * hd]);
+    using oProjBuf = reshapedFlashOut.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;

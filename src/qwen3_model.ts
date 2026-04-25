@@ -196,7 +196,8 @@ export class Qwen3Model extends ChatModel {
         flashOut.replace(ws.flashPrefillPaged(qRope, pagedKV, i, totalTokens, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
       }
 
-      using oProjBuf = flashOut.value.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
+      using reshapedFlashOut = flashOut.value.reshape([BS, nHeads * hd]);
+      using oProjBuf = reshapedFlashOut.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
       const attnResult = residual.value.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
       using attnNormed = attnResult.normed;
       residual.replace(attnResult.residual);

@@ -97,8 +97,8 @@ interface NativeAddon {
 }
 
 export class GlmTensor extends Tensor {
-  constructor(workspace: WorkspaceBase, public readonly glm: GlmOps, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean) {
-    super(workspace, data, allocSize, shape, type, name, pinned);
+  constructor(workspace: WorkspaceBase, public readonly glm: GlmOps, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean, view: GlmTensor | undefined) {
+    super(workspace, data, allocSize, shape, type, name, pinned, view);
   }
 
   free(): void {
@@ -121,6 +121,7 @@ export class GlmTensor extends Tensor {
   }
 
   linear(weight: Tensor, batch: number): Tensor {
+    super.linear(weight, batch);
     const n = weight.shape[0];
     const k = weight.shape[1];
     const outShape = [batch, n];
@@ -135,12 +136,14 @@ export class GlmTensor extends Tensor {
   }
 
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
+    super.rmsnorm(weight, eps, dim, batch);
     const out = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().rmsnorm(this.glm.ctx, out.data, this.data, weight.data, eps, dim, batch);
     return out;
   }
 
   fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
+    super.fusedAddRmsnorm(input, weight, eps, dim, batch);
     const normed = this.workspace.alloc([batch, dim], this.type);
     const residual = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().fusedAddRmsnorm(this.glm.ctx, normed.data, residual.data, this.data, input.data, weight.data, eps, dim, batch);
@@ -148,34 +151,40 @@ export class GlmTensor extends Tensor {
   }
 
   fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+    super.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
     const out = this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
     getNativeAddon().fusedNormRope(this.glm.ctx, out.data, this.data, weight.data, cos.data, sin.data, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
     return out;
   }
 
   embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
+    super.embedding(ids, hidden, seqLen);
     const out = ids.workspace.alloc([seqLen, hidden], this.type);
     getNativeAddon().embedding(this.glm.ctx, out.data, this.data, ids.data, hidden, seqLen);
     return out;
   }
 
   siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
+    super.siluAndMul(gate, up, intermediate, batch);
     const out = this.workspace.alloc([batch, intermediate], this.type);
     getNativeAddon().siluAndMul(this.glm.ctx, out.data, gate.data, up.data, intermediate, batch);
     return out;
   }
 
   arange(start: number, step: number, count: number): void {
+    super.arange(start, step, count);
     getNativeAddon().arange(this.glm.ctx, this.data, start, step, count);
   }
 
   argmax(): Tensor {
+    super.argmax();
     const { indices, values} = this.max();
     values[Symbol.dispose]();
     return indices;
   }
 
   max(offset: number = 0): { values: Tensor, indices: Tensor } {
+    super.max(offset);
     const batch = this.shape[0];
     const dim = this.shape[1];
     const values = this.workspace.alloc([batch], this.type);
@@ -185,12 +194,14 @@ export class GlmTensor extends Tensor {
   }
 
   indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
+    super.indexSelect(indices, dim, batch);
     const out = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, indices.data, dim, batch);
     return out;
   }
 
   gather(indices: Tensor, k: number, inDim: number, batch: number): Tensor {
+    super.gather(indices, k, inDim, batch);
     const out = this.workspace.alloc([batch, k], this.type);
     const elemSize = SafeTensorFile.dtypeBytes(this.type);
     getNativeAddon().gather(this.glm.ctx, out.data, this.data, indices.data, k, inDim, batch, elemSize);
@@ -198,28 +209,34 @@ export class GlmTensor extends Tensor {
   }
 
   gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    super.gdnRecurrentStep(state, qkv, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
     getNativeAddon().gdnRecurrentStep(this.glm.ctx, this.data, state.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
   gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    super.gdnPrefill(state, qkv, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
     getNativeAddon().gdnPrefill(this.glm.ctx, this.data, state.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, cuSeqlens.data, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
   causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
+    super.causalConv1d(convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
     getNativeAddon().causalConv1d(this.glm.ctx, this.data, convState.data, input.data, weight.data, cuSeqlens.data, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
   }
 
   causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor {
+    super.causalConv1dUpdate(convState, input, weight, convDim, kernelSize, batchSize, convStateStride);
     const out = this.workspace.alloc([batchSize * convDim], this.type);
     getNativeAddon().causalConv1dUpdate(this.glm.ctx, out.data, convState.data, input.data, weight.data, convDim, kernelSize, batchSize, convStateStride);
     return out;
   }
 
   rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
+    super.rmsnormGated(input, gate, weight, eps, dim, batch);
     getNativeAddon().rmsnormGated(this.glm.ctx, this.data, input.data, gate.data, weight.data, eps, dim, batch);
   }
 
   gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
+    super.gateSigmoidMul(gate, batchSeq, numHeads, headDim);
     getNativeAddon().gateSigmoidMul(this.glm.ctx, this.data, gate.data, batchSeq, numHeads, headDim);
   }
 
@@ -245,6 +262,7 @@ export class GlmTensor extends Tensor {
   }
 
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
+    super.rotaryEmbedding(positionIds, dimHalf, batch, seqLen);
     const hd = dimHalf * 2;
     const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
     const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
@@ -292,11 +310,11 @@ export class GlmOps implements DeviceOps {
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, _parallelism?: TensorParallelism): GlmTensor {
     const size = Tensor.byteCount(shape, type);
     const data = pinned ? this.allocPinned(size) : this.alloc(size);
-    return new GlmTensor(workspace, this, data, size, shape, type, name, pinned);
+    return new GlmTensor(workspace, this, data, size, shape, type, name, pinned, undefined);
   }
 
-  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean): Tensor {
-    return new GlmTensor(workspace, this, data, allocSize, shape, type, undefined, pinned);
+  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: GlmTensor | undefined): Tensor {
+    return new GlmTensor(workspace, this, data, allocSize, shape, type, undefined, pinned, view);
   }
 
   freeBuf(ptr: Tensor): void {

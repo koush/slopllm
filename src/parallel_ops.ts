@@ -20,8 +20,9 @@ export class ParallelTensor extends Tensor {
     type: string,
     name: string | undefined,
     pinned: boolean,
+    view: ParallelTensor | undefined,
   ) {
-    super(workspace, 0, 0, fullShape, type, name, pinned);
+    super(workspace, 0, 0, fullShape, type, name, pinned, view);
     this.parallelOps = parallelOps;
     this.devices = parallelOps.devices;
     this.parallelism = parallelism;
@@ -85,6 +86,20 @@ export class ParallelTensor extends Tensor {
 
   shard(rank: number): Tensor {
     return this.shards[rank];
+  }
+
+  override reshape(newShape: number[]): Tensor {
+    const current = this.shape.reduce((a, b) => a * b, 1);
+    const target = newShape.reduce((a, b) => a * b, 1);
+    if (current !== target) {
+      throw new Error(`reshape: cannot reshape [${this.shape}] (${current} elements) to [${newShape}] (${target} elements)`);
+    }
+    const newShardShape = this.parallelOps.shardShape(newShape, this.parallelism);
+    const reshapedShards: Tensor[] = this.shards.map(s => s.reshape(newShardShape));
+    return new ParallelTensor(
+      this.workspace, this.parallelOps, this.parallelism,
+      reshapedShards, newShape, this.type, undefined, this.pinned, this,
+    );
   }
 
   allReduce(): ParallelTensor {
@@ -318,6 +333,7 @@ export class ParallelTensor extends Tensor {
   }
 
   override linear(weight: Tensor, batch: number): Tensor {
+    super.linear(weight, batch);
     const pWeight = weight as ParallelTensor;
     const n = weight.shape[0];
     const k = weight.shape[1];
@@ -356,6 +372,7 @@ export class ParallelTensor extends Tensor {
   }
 
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
+    super.rmsnorm(weight, eps, dim, batch);
     if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
       const gathered = this.allGather(this.workspace);
       const result = gathered.rmsnorm(weight, eps, dim, batch);
@@ -380,6 +397,7 @@ export class ParallelTensor extends Tensor {
   }
 
   fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
+    super.fusedAddRmsnorm(input, weight, eps, dim, batch);
     const pInput = input as ParallelTensor;
 
     if (this.parallelism === TensorParallelism.PartialSum) {
@@ -424,6 +442,7 @@ export class ParallelTensor extends Tensor {
   }
 
   override fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+    super.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
     if (this.parallelism === TensorParallelism.PartialSum) {
       this.allReduce();
       return this.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
@@ -469,6 +488,7 @@ export class ParallelTensor extends Tensor {
   }
 
   override embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
+    super.embedding(ids, hidden, seqLen);
     const pIds = ids as ParallelTensor;
     this.assertParallel("embedding ids", pIds, TensorParallelism.Replicated, TensorParallelism.PartialSum);
 
@@ -490,6 +510,7 @@ export class ParallelTensor extends Tensor {
   }
 
   override siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
+    super.siluAndMul(gate, up, intermediate, batch);
     const pGate = gate as ParallelTensor;
     const pUp = up as ParallelTensor;
     if (pGate.parallelism !== pUp.parallelism) {
@@ -507,6 +528,7 @@ export class ParallelTensor extends Tensor {
   }
 
   arange(start: number, step: number, count: number): void {
+    super.arange(start, step, count);
     this.assertParallel("arange", this, TensorParallelism.Replicated, TensorParallelism.PartialSum);
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].arange(this.shards[i], start, step, count);
@@ -514,12 +536,14 @@ export class ParallelTensor extends Tensor {
   }
 
   argmax(): Tensor {
+    super.argmax();
     const { indices, values} = this.max();
     values[Symbol.dispose]();
     return indices;
   }
 
   max(offset: number = 0): { values: Tensor, indices: Tensor } {
+    super.max(offset);
     if (this.parallelism === TensorParallelism.PartialSum) {
       this.allReduce();
       return this.max(offset);
@@ -597,6 +621,7 @@ export class ParallelTensor extends Tensor {
   }
 
   indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
+    super.indexSelect(indices, dim, batch);
     const pIndices = indices as ParallelTensor;
     this.assertParallel("indexSelect src", this, TensorParallelism.Replicated);
     this.assertParallel("indexSelect indices", pIndices, TensorParallelism.Replicated, TensorParallelism.PartialSum);
@@ -609,6 +634,7 @@ export class ParallelTensor extends Tensor {
   }
 
   gather(indices: Tensor, k: number, inDim: number, batch: number): Tensor {
+    super.gather(indices, k, inDim, batch);
     const pIndices = indices as ParallelTensor;
     this.assertParallel("gather src", this, TensorParallelism.Replicated);
     this.assertParallel("gather indices", pIndices, TensorParallelism.Replicated, TensorParallelism.PartialSum);
@@ -621,6 +647,7 @@ export class ParallelTensor extends Tensor {
   }
 
   gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    super.gdnRecurrentStep(state, qkv, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
     const pState = this.cast(state);
     const pQkv = this.cast(qkv);
     const pARaw = this.cast(aRaw);
@@ -637,6 +664,7 @@ export class ParallelTensor extends Tensor {
   }
 
   gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    super.gdnPrefill(state, qkv, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
     const pState = this.cast(state);
     const pQkv = this.cast(qkv);
     const pARaw = this.cast(aRaw);
@@ -654,6 +682,7 @@ export class ParallelTensor extends Tensor {
   }
 
   causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
+    super.causalConv1d(convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
     const pConvState = this.cast(convState);
     const pInput = this.cast(input);
     const pWeight = this.cast(weight);
@@ -668,6 +697,7 @@ export class ParallelTensor extends Tensor {
   }
 
   causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor {
+    super.causalConv1dUpdate(convState, input, weight, convDim, kernelSize, batchSize, convStateStride);
     const pConvState = this.cast(convState);
     const pInput = input as ParallelTensor;
     const pWeight = this.cast(weight);
@@ -683,6 +713,7 @@ export class ParallelTensor extends Tensor {
   }
 
   rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
+    super.rmsnormGated(input, gate, weight, eps, dim, batch);
     const pInput = input as ParallelTensor;
     const pGate = gate as ParallelTensor;
     const pWeight = weight as ParallelTensor;
@@ -728,6 +759,7 @@ export class ParallelTensor extends Tensor {
   }
 
   gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
+    super.gateSigmoidMul(gate, batchSeq, numHeads, headDim);
     const pGate = gate as ParallelTensor;
     const shardNumHeads = this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column
       ? numHeads / this.worldSize
@@ -835,6 +867,7 @@ export class ParallelTensor extends Tensor {
   }
 
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
+    super.rotaryEmbedding(positionIds, dimHalf, batch, seqLen);
     const pPositionIds = positionIds as ParallelTensor;
     this.assertParallel("rotaryEmbedding invFreq", this, TensorParallelism.Replicated);
     this.assertParallel("rotaryEmbedding positionIds", pPositionIds, TensorParallelism.Replicated);
@@ -979,15 +1012,17 @@ export class ParallelOps implements DeviceOps {
     const shards: Tensor[] = shardWss.map(ws =>
       pinned ? ws.allocPinned(ss, type) : ws.alloc(ss, type),
     );
-    return new ParallelTensor(workspace, this, par, shards, shape, type, name, pinned);
+    return new ParallelTensor(workspace, this, par, shards, shape, type, name, pinned, undefined);
   }
 
-  wrapTensor(_workspace: WorkspaceBase, _data: number, _allocSize: number, _shape: number[], _type: string, _pinned: boolean): Tensor {
-    throw new Error("ParallelOps.wrapTensor not supported; tensor recycling happens at shard level");
+  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: ParallelTensor | undefined): Tensor {
+    if (!view)
+      throw new Error("ParallelOps.wrapTensor not supported; tensor recycling happens at shard level");
+    return new ParallelTensor(workspace, this, view.parallelism, view.shards, shape, type, undefined, pinned, view);
   }
 
   wrapShards(workspace: WorkspaceBase, shards: Tensor[], fullShape: number[], type: string, parallelism: TensorParallelism): ParallelTensor {
-    const pt = new ParallelTensor(workspace, this, parallelism, shards, fullShape, type, undefined, false);
+    const pt = new ParallelTensor(workspace, this, parallelism, shards, fullShape, type, undefined, false, undefined);
     workspace.tracked.add(pt);
     return pt;
   }

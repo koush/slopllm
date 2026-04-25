@@ -45,6 +45,9 @@ export class WorkspaceBase implements Disposable {
 
     let best: Tensor | undefined;
     for (const t of this.disposed) {
+      // shouldn't be possible but defensive check.
+      if (t.view)
+        throw new Error("disposed tensor should not have a view");
       if (t.pinned === pinned && t.data !== 0 && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
         best = t;
       }
@@ -53,7 +56,7 @@ export class WorkspaceBase implements Disposable {
       this.disposed.delete(best);
       const data = best.data;
       (best as { data: number }).data = 0;
-      const tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned);
+      const tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned, undefined);
       this.tracked.add(tensor);
       return tensor;
     }

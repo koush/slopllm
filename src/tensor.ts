@@ -17,13 +17,21 @@ function numElements(shape: number[]): number {
 
 export abstract class Tensor implements Disposable {
   parallelism: TensorParallelism = TensorParallelism.Replicated;
-  constructor(public readonly workspace: WorkspaceBase, public data: number, public readonly allocSize: number, public readonly shape: number[], public readonly type: string, public readonly name: string | undefined, public readonly pinned: boolean) {
+  constructor(public readonly workspace: WorkspaceBase,
+    public data: number,
+    public readonly allocSize: number,
+    public readonly shape: number[],
+    public readonly type: string,
+    public readonly name: string | undefined,
+    public readonly pinned: boolean,
+    public readonly view: Tensor | undefined) {
     this.data = data;
     this.allocSize = allocSize;
     this.shape = shape;
     this.type = type;
     this.name = name;
     this.pinned = pinned;
+    this.view = view;
   }
 
   static byteCount(shape: number[], type: string): number {
@@ -34,6 +42,17 @@ export abstract class Tensor implements Disposable {
     return Math.ceil(numElements(this.shape) * SafeTensorFile.dtypeBytes(this.type));
   }
 
+  reshape(newShape: number[]): Tensor {
+    const current = numElements(this.shape);
+    const target = numElements(newShape);
+    if (current !== target) {
+      throw new Error(`reshape: cannot reshape [${this.shape}] (${current} elements) to [${newShape}] (${target} elements)`);
+    }
+
+    const reshaped = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, newShape, this.type, this.pinned, this);
+    return reshaped;
+  }
+
   abstract free(): void;
 
   [Symbol.dispose](): void {
@@ -42,6 +61,7 @@ export abstract class Tensor implements Disposable {
     }
     if (this.data === 0) return;
     this.workspace.tracked.delete(this);
+    if (this.view) return;
     this.workspace.disposed.add(this);
   }
 
@@ -57,29 +77,137 @@ export abstract class Tensor implements Disposable {
   abstract h2d(data: Buffer, size?: number): void;
   abstract d2h(buf: Buffer, size?: number): void;
 
-  abstract linear(weight: Tensor, batch: number): Tensor;
-  abstract rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor;
-  abstract fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor };
-  abstract fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor;
-  abstract embedding(ids: Tensor, hidden: number, seqLen: number): Tensor;
-  abstract siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor;
-  abstract arange(start: number, step: number, count: number): void;
-  abstract argmax(): Tensor;
-  abstract max(offset?: number): { values: Tensor, indices: Tensor };
-  abstract gather(indices: Tensor, k: number, inDim: number, batch: number): Tensor;
-  abstract indexSelect(indices: Tensor, dim: number, batch: number): Tensor;
+  linear(weight: Tensor, batch: number): Tensor {
+    if (this.shape.length !== 2) throw new Error(`linear: input must be 2D, got shape [${this.shape}]`);
+    if (weight.shape.length !== 2) throw new Error(`linear: weight must be 2D, got shape [${weight.shape}]`);
+    if (this.shape[0] < batch) throw new Error(`linear: input batch ${this.shape[0]} < ${batch}`);
+    if (this.shape[1] !== weight.shape[1]) throw new Error(`linear: input dim ${this.shape[1]} != weight dim ${weight.shape[1]}`);
+    if (weight.type !== "BF16" && weight.type !== "F8_E4M3") throw new Error(`linear: weight type must be BF16 or F8_E4M3, got ${weight.type}`);
+    return undefined as never;
+  }
 
-  abstract gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
-  abstract gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
-  abstract causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void;
-  abstract causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor;
-  abstract rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void;
-  abstract gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void;
+  rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
+    if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== dim) {
+      throw new Error(`rmsnorm: input shape [${this.shape}] incompatible with batch=${batch}, dim=${dim}`);
+    }
+    if (numElements(weight.shape) !== dim) throw new Error(`rmsnorm: weight has ${numElements(weight.shape)} elements, expected ${dim}`);
+    return undefined as never;
+  }
+
+  fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
+    if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== dim) {
+      throw new Error(`fusedAddRmsnorm: residual shape [${this.shape}] incompatible with batch=${batch}, dim=${dim}`);
+    }
+    if (input.shape.length !== 2 || input.shape[0] < batch || input.shape[1] !== dim) {
+      throw new Error(`fusedAddRmsnorm: input shape [${input.shape}] incompatible with batch=${batch}, dim=${dim}`);
+    }
+    if (numElements(weight.shape) !== dim) throw new Error(`fusedAddRmsnorm: weight has ${numElements(weight.shape)} elements, expected ${dim}`);
+    return undefined as never;
+  }
+
+  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+    if (numElements(weight.shape) !== headDim) throw new Error(`fusedNormRope: weight has ${numElements(weight.shape)} elements, expected ${headDim}`);
+    if (cos.shape.length !== sin.shape.length) throw new Error(`fusedNormRope: cos ndim ${cos.shape.length} != sin ndim ${sin.shape.length}`);
+    for (let i = 0; i < cos.shape.length; i++) {
+      if (cos.shape[i] !== sin.shape[i]) throw new Error(`fusedNormRope: cos shape [${cos.shape}] != sin shape [${sin.shape}]`);
+    }
+    return undefined as never;
+  }
+
+  embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
+    if (this.shape.length !== 2 || this.shape[1] !== hidden) {
+      throw new Error(`embedding: table shape [${this.shape}] incompatible with hidden=${hidden}`);
+    }
+    if (ids.type !== "I32") throw new Error(`embedding: ids must be I32, got ${ids.type}`);
+    if (ids.shape.length !== 1 || ids.shape[0] < seqLen) {
+      throw new Error(`embedding: ids shape [${ids.shape}] insufficient for seqLen=${seqLen}`);
+    }
+    return undefined as never;
+  }
+
+  siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
+    if (gate.shape.length !== 2 || gate.shape[0] < batch || gate.shape[1] !== intermediate) {
+      throw new Error(`siluAndMul: gate shape [${gate.shape}] incompatible with batch=${batch}, intermediate=${intermediate}`);
+    }
+    if (up.shape.length !== 2 || up.shape[0] < batch || up.shape[1] !== intermediate) {
+      throw new Error(`siluAndMul: up shape [${up.shape}] incompatible with batch=${batch}, intermediate=${intermediate}`);
+    }
+    if (gate.type !== up.type) throw new Error(`siluAndMul: gate type ${gate.type} != up type ${up.type}`);
+    return undefined as never;
+  }
+
+  arange(start: number, step: number, count: number): void {
+    if (count <= 0) throw new Error(`arange: count must be positive, got ${count}`);
+  }
+
+  argmax(): Tensor {
+    if (this.shape.length !== 2) throw new Error(`argmax: expected 2D tensor, got ${this.shape.length}D shape [${this.shape}]`);
+    return undefined as never;
+  }
+
+  max(offset?: number): { values: Tensor, indices: Tensor } {
+    if (this.shape.length !== 2) throw new Error(`max: expected 2D tensor, got ${this.shape.length}D shape [${this.shape}]`);
+    return undefined as never;
+  }
+
+  gather(indices: Tensor, k: number, inDim: number, batch: number): Tensor {
+    if (numElements(this.shape) < batch * inDim) throw new Error(`gather: source has ${numElements(this.shape)} elements (shape [${this.shape}]${this.view ? ', view of [' + this.view.shape + ']' : ''}), needs ${batch * inDim} (batch=${batch}, inDim=${inDim})`);
+    if (indices.type !== "I32") throw new Error(`gather: indices must be I32, got ${indices.type}`);
+    if (numElements(indices.shape) < batch * k) throw new Error(`gather: indices has ${numElements(indices.shape)} elements (shape [${indices.shape}]${indices.view ? ', view of [' + indices.view.shape + ']' : ''}), needs ${batch * k} (batch=${batch}, k=${k})`);
+    return undefined as never;
+  }
+
+  indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
+    if (indices.type !== "I32") throw new Error(`indexSelect: indices must be I32, got ${indices.type}`);
+    if (numElements(indices.shape) < batch) {
+      throw new Error(`indexSelect: indices has ${numElements(indices.shape)} elements (shape [${indices.shape}]${indices.view ? ', view of [' + indices.view.shape + ']' : ''}), insufficient for batch=${batch}`);
+    }
+    return undefined as never;
+  }
+
+  gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    if (state.type !== "F32") throw new Error(`gdnRecurrentStep: state must be F32, got ${state.type}`);
+    if (aLog.type !== "F32") throw new Error(`gdnRecurrentStep: aLog must be F32, got ${aLog.type}`);
+    if (dtBias.type !== "F32") throw new Error(`gdnRecurrentStep: dtBias must be F32, got ${dtBias.type}`);
+  }
+
+  gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    if (state.type !== "F32") throw new Error(`gdnPrefill: state must be F32, got ${state.type}`);
+    if (aLog.type !== "F32") throw new Error(`gdnPrefill: aLog must be F32, got ${aLog.type}`);
+    if (dtBias.type !== "F32") throw new Error(`gdnPrefill: dtBias must be F32, got ${dtBias.type}`);
+    if (cuSeqlens.type !== "I32") throw new Error(`gdnPrefill: cuSeqlens must be I32, got ${cuSeqlens.type}`);
+  }
+
+  causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
+    if (cuSeqlens.type !== "I32") throw new Error(`causalConv1d: cuSeqlens must be I32, got ${cuSeqlens.type}`);
+  }
+
+  causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor {
+    return undefined as never;
+  }
+
+  rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
+    if (input.shape.length !== 2 || input.shape[0] < batch || input.shape[1] !== dim) {
+      throw new Error(`rmsnormGated: input shape [${input.shape}] incompatible with batch=${batch}, dim=${dim}`);
+    }
+    if (gate.shape.length !== 2 || gate.shape[0] < batch || gate.shape[1] !== dim) {
+      throw new Error(`rmsnormGated: gate shape [${gate.shape}] incompatible with batch=${batch}, dim=${dim}`);
+    }
+    if (numElements(weight.shape) !== dim) throw new Error(`rmsnormGated: weight has ${numElements(weight.shape)} elements, expected ${dim}`);
+  }
+
+  gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
+    if (gate.type !== this.type) throw new Error(`gateSigmoidMul: gate type ${gate.type} != output type ${this.type}`);
+  }
+
   abstract fill(value: number, n: number): void;
   abstract mmapLoad(mmapPtr: number, offset: number, nbytes: number, gdnQkvLayout?: import("./device_ops").GdnQkvLayout): void;
   abstract writePinned(src: Buffer, size?: number): void;
   abstract memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void;
-  abstract rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor };
+  rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
+    if (positionIds.type !== "I32") throw new Error(`rotaryEmbedding: positionIds must be I32, got ${positionIds.type}`);
+    return undefined as never;
+  }
 
   readInt32LE(): number[] {
     const count = numElements(this.shape);
