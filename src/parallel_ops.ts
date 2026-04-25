@@ -53,6 +53,13 @@ export class ParallelTensor extends Tensor {
     }
   }
 
+  private shardDim(dim: number, name: string): number {
+    if (dim % this.worldSize !== 0) {
+      throw new Error(`${name}: dimension ${dim} not divisible by worldSize=${this.worldSize}`);
+    }
+    return dim / this.worldSize;
+  }
+
   private cast(tensor: Tensor): ParallelTensor {
     return tensor as ParallelTensor;
   }
@@ -461,7 +468,7 @@ export class ParallelTensor extends Tensor {
     const stride = inStride ?? headDim;
 
     if (this.parallelism === TensorParallelism.Row) {
-      const shardNHeads = nHeads / this.worldSize;
+      const shardNHeads = this.shardDim(nHeads, "fusedNormRope nHeads");
       const shardInStride = this.fullShape[2] === this.fullShape[1]
         ? stride / this.worldSize
         : stride;
@@ -655,7 +662,7 @@ export class ParallelTensor extends Tensor {
     const pALog = this.cast(aLog);
     const pDtBias = this.cast(dtBias);
     const isRowPar = pQkv.parallelism === TensorParallelism.Row || pQkv.parallelism === TensorParallelism.Column;
-    const shardHeads = isRowPar ? numHeads / this.worldSize : numHeads;
+    const shardHeads = isRowPar ? this.shardDim(numHeads, "gdnRecurrentStep numHeads") : numHeads;
     const shardStateStride = isRowPar ? stateStride / this.worldSize : stateStride;
     const shardSeqStride = isRowPar ? qkvSeqStride / this.worldSize : qkvSeqStride;
     for (let i = 0; i < this.worldSize; i++) {
@@ -673,7 +680,7 @@ export class ParallelTensor extends Tensor {
     const pDtBias = this.cast(dtBias);
     const pCuSeqlens = this.cast(cuSeqlens);
     const isRowPar = pQkv.parallelism === TensorParallelism.Row || pQkv.parallelism === TensorParallelism.Column;
-    const shardHeads = isRowPar ? numHeads / this.worldSize : numHeads;
+    const shardHeads = isRowPar ? this.shardDim(numHeads, "gdnPrefill numHeads") : numHeads;
     const shardStateStride = isRowPar ? stateStride / this.worldSize : stateStride;
     const shardSeqStride = isRowPar ? qkvSeqStride / this.worldSize : qkvSeqStride;
     for (let i = 0; i < this.worldSize; i++) {
@@ -762,7 +769,7 @@ export class ParallelTensor extends Tensor {
     super.gateSigmoidMul(gate, batchSeq, numHeads, headDim);
     const pGate = gate as ParallelTensor;
     const shardNumHeads = this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column
-      ? numHeads / this.worldSize
+      ? this.shardDim(numHeads, "gateSigmoidMul numHeads")
       : numHeads;
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].gateSigmoidMul(this.shards[i], pGate.shards[i], batchSeq, shardNumHeads, headDim);
@@ -781,7 +788,7 @@ export class ParallelTensor extends Tensor {
   mmapLoad(mmapPtr: number, offset: number, nbytes: number, gdnQkvLayout?: GdnQkvLayout): void {
     if (gdnQkvLayout && this.parallelism === TensorParallelism.Column) {
       const { numHeads, dK, dV } = gdnQkvLayout;
-      const Hlocal = numHeads / this.worldSize;
+      const Hlocal = this.shardDim(numHeads, "mmapLoad numHeads");
       const qRows = numHeads * dK;
       const bytesPerRow = this.fullShape.slice(1).reduce((a, b) => a * b, 1) * ParallelTensor.elemBytes(this.type);
       const srcBase = mmapPtr + offset;
@@ -948,6 +955,13 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  shardDim(dim: number, name: string): number {
+    if (dim % this.worldSize !== 0) {
+      throw new Error(`${name}: dimension ${dim} not divisible by worldSize=${this.worldSize}`);
+    }
+    return dim / this.worldSize;
+  }
+
   ncclDatatype(type: string): number {
     switch (type) {
       case "BF16": return NCCL_BFLOAT16;
@@ -1052,7 +1066,7 @@ export class ParallelOps implements DeviceOps {
 
     this.assertParallel("kvCacheWrite slotMapping", pSlotMapping, TensorParallelism.Replicated);
 
-    const shardNKv = nKv / this.worldSize;
+    const shardNKv = this.shardDim(nKv, "kvCacheWrite nKv");
     const isRowPar = pSrcK.parallelism === TensorParallelism.Row || pSrcK.parallelism === TensorParallelism.Column;
     const shardKTokenStride = isRowPar && srcKTokenStride !== hd ? srcKTokenStride / this.worldSize : srcKTokenStride;
     const shardVTokenStride = isRowPar ? srcVTokenStride / this.worldSize : srcVTokenStride;
@@ -1071,7 +1085,7 @@ export class ParallelOps implements DeviceOps {
     this.assertParallel("batchDecodePlan intWs", pIntWs, TensorParallelism.Replicated);
     this.assertParallel("batchDecodePlan planInfo", pPlanInfo, TensorParallelism.Replicated);
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].batchDecodePlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pIndptrH.shards[i], batchSize, numQoHeads / this.worldSize, numKvHeads / this.worldSize, headDim, pageSize, enableCudaGraph);
+      this.devices[i].batchDecodePlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pIndptrH.shards[i], batchSize, this.shardDim(numQoHeads, "batchDecodePlan numQoHeads"), this.shardDim(numKvHeads, "batchDecodePlan numKvHeads"), headDim, pageSize, enableCudaGraph);
     }
   }
 
@@ -1087,7 +1101,7 @@ export class ParallelOps implements DeviceOps {
     const pIntWs = this.cast(intWs);
     const pPlanInfo = this.cast(planInfo);
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].batchDecodeRun(pQ.shards[i], pO.shards[i], pKData.shards[i], pVData.shards[i], pIndices.shards[i], pIndptrD.shards[i], pLastPageLen.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], batchSize, numQoHeads / this.worldSize, numKvHeads / this.worldSize, headDim, pageSize, smScale);
+      this.devices[i].batchDecodeRun(pQ.shards[i], pO.shards[i], pKData.shards[i], pVData.shards[i], pIndices.shards[i], pIndptrD.shards[i], pLastPageLen.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], batchSize, this.shardDim(numQoHeads, "batchDecodeRun numQoHeads"), this.shardDim(numKvHeads, "batchDecodeRun numKvHeads"), headDim, pageSize, smScale);
     }
   }
 
@@ -1099,7 +1113,7 @@ export class ParallelOps implements DeviceOps {
     const pQoIndptrH = this.cast(qoIndptrH);
     const pPagedKvIndptrH = this.cast(pagedKvIndptrH);
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].batchPrefillPagedPlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pQoIndptrH.shards[i], pPagedKvIndptrH.shards[i], totalQoRows, batchSize, numQoHeads / this.worldSize, numKvHeads / this.worldSize, headDim, pageSize, maskMode);
+      this.devices[i].batchPrefillPagedPlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pQoIndptrH.shards[i], pPagedKvIndptrH.shards[i], totalQoRows, batchSize, this.shardDim(numQoHeads, "batchPrefillPagedPlan numQoHeads"), this.shardDim(numKvHeads, "batchPrefillPagedPlan numKvHeads"), headDim, pageSize, maskMode);
     }
   }
 
@@ -1116,7 +1130,7 @@ export class ParallelOps implements DeviceOps {
     const pQIndptrD = this.cast(qIndptrD);
     const pPlanInfo = this.cast(planInfo);
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].batchPrefillPagedRun(pQ.shards[i], pO.shards[i], pKData.shards[i], pVData.shards[i], pIndices.shards[i], pIndptrD.shards[i], pLastPageLen.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pQIndptrD.shards[i], pPlanInfo.shards[i], totalQoRows, batchSize, numQoHeads / this.worldSize, numKvHeads / this.worldSize, headDim, pageSize, qStrideN, qStrideH, maskMode, smScale);
+      this.devices[i].batchPrefillPagedRun(pQ.shards[i], pO.shards[i], pKData.shards[i], pVData.shards[i], pIndices.shards[i], pIndptrD.shards[i], pLastPageLen.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pQIndptrD.shards[i], pPlanInfo.shards[i], totalQoRows, batchSize, this.shardDim(numQoHeads, "batchPrefillPagedRun numQoHeads"), this.shardDim(numKvHeads, "batchPrefillPagedRun numKvHeads"), headDim, pageSize, qStrideN, qStrideH, maskMode, smScale);
     }
   }
 
