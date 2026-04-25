@@ -525,11 +525,61 @@ export class ParallelTensor extends Tensor {
       return this.max(offset);
     }
 
-    if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
-      const gathered = this.allGather(this.workspace);
-      const result = gathered.max(offset);
-      gathered[Symbol.dispose]();
-      return result;
+    if (this.parallelism === TensorParallelism.Row) {
+      const batch = this.fullShape[0];
+      const dim = this.fullShape[1];
+      const ws = this.worldSize;
+      const shardDim = dim / ws;
+
+      const localValuesShards: Tensor[] = [];
+      const localIndicesShards: Tensor[] = [];
+      for (let i = 0; i < ws; i++) {
+        const { values, indices } = this.shards[i].max(i * shardDim + offset);
+        localValuesShards.push(values);
+        localIndicesShards.push(indices);
+      }
+
+      const allValuesPar = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch, ws], this.type, TensorParallelism.Row);
+      const allIndicesPar = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch, ws], "I32", TensorParallelism.Row);
+
+      const allValues = allValuesPar.allGather(this.workspace);
+      const allIndices = allIndicesPar.allGather(this.workspace);
+      allValuesPar[Symbol.dispose]();
+      allIndicesPar[Symbol.dispose]();
+
+      const { values: rankValues, indices: rankIndices } = allValues.max(0);
+      allValues[Symbol.dispose]();
+
+      const gatheredIndices = allIndices.gather(rankIndices, 1, ws, batch);
+      allIndices[Symbol.dispose]();
+      rankIndices[Symbol.dispose]();
+
+      const finalIndices = this.parallelOps.newTensor(this.workspace, [batch], "I32", false, undefined, TensorParallelism.Replicated);
+      const pGatheredIndices = gatheredIndices as ParallelTensor;
+      const idxBytes = batch * 4;
+      for (let i = 0; i < ws; i++) {
+        finalIndices.shards[i].memcpy(pGatheredIndices.shards[i], idxBytes);
+      }
+      gatheredIndices[Symbol.dispose]();
+
+      return { values: rankValues, indices: finalIndices };
+    }
+
+    if (this.parallelism === TensorParallelism.Column) {
+      const batch = this.fullShape[0];
+
+      const localValuesShards: Tensor[] = [];
+      const localIndicesShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        const { values, indices } = this.shards[i].max(offset);
+        localValuesShards.push(values);
+        localIndicesShards.push(indices);
+      }
+
+      const values = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch], this.type, TensorParallelism.Column);
+      const indices = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch], "I32", TensorParallelism.Column);
+
+      return { values, indices };
     }
 
     this.assertParallel("max input", this, TensorParallelism.Replicated);

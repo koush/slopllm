@@ -105,6 +105,8 @@ function generateWithGraph(
         graphExec = graph.graphInstantiate(graphIdx);
         graph.graphDestroy(graphIdx);
         capturing = false;
+        warmupRemaining = 0;
+        continue;
       }
 
       if (warmupRemaining > 0) warmupRemaining--;

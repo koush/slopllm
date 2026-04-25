@@ -1395,6 +1395,271 @@ describe("ParallelOps.argmax", () => {
   });
 });
 
+describe("ParallelTensor.max", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("max on Replicated BF16 tensor", () => {
+    const batch = 4;
+    const dim = 8;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = (i % 13 - 6) * 0.5;
+    inputF32[3] = 100;
+    inputF32[dim + 7] = 99;
+    inputF32[2 * dim + 1] = 98;
+    inputF32[3 * dim + 5] = 97;
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const { values, indices } = input.max();
+    po.synchronize();
+
+    assert.equal((values as ParallelTensor).parallelism, TensorParallelism.Replicated);
+    assert.equal((indices as ParallelTensor).parallelism, TensorParallelism.Replicated);
+
+    const valuesBuf = Buffer.alloc(batch * 2);
+    const indicesBuf = Buffer.alloc(batch * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    assert.ok(Math.abs(valuesArr[0] - 100) < 0.1, `batch 0 value: ${valuesArr[0]}`);
+    assert.ok(Math.abs(valuesArr[1] - 99) < 0.1, `batch 1 value: ${valuesArr[1]}`);
+    assert.ok(Math.abs(valuesArr[2] - 98) < 0.1, `batch 2 value: ${valuesArr[2]}`);
+    assert.ok(Math.abs(valuesArr[3] - 97) < 0.1, `batch 3 value: ${valuesArr[3]}`);
+    assert.equal(indicesBuf.readInt32LE(0), 3);
+    assert.equal(indicesBuf.readInt32LE(4), 7);
+    assert.equal(indicesBuf.readInt32LE(8), 1);
+    assert.equal(indicesBuf.readInt32LE(12), 5);
+  });
+
+  it("max on Row-parallel BF16 tensor returns Replicated result", () => {
+    const batch = 4;
+    const dim = 8;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = (i % 13 - 6) * 0.5;
+    inputF32[3] = 100;
+    inputF32[dim + 7] = 99;
+    inputF32[2 * dim + 1] = 98;
+    inputF32[3 * dim + 5] = 97;
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const { values, indices } = input.max();
+    po.synchronize();
+
+    assert.equal((values as ParallelTensor).parallelism, TensorParallelism.Replicated, "Row max values should be Replicated");
+    assert.equal((indices as ParallelTensor).parallelism, TensorParallelism.Replicated, "Row max indices should be Replicated");
+
+    const valuesBuf = Buffer.alloc(batch * 2);
+    const indicesBuf = Buffer.alloc(batch * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    assert.ok(Math.abs(valuesArr[0] - 100) < 0.1, `batch 0 value: ${valuesArr[0]}`);
+    assert.ok(Math.abs(valuesArr[1] - 99) < 0.1, `batch 1 value: ${valuesArr[1]}`);
+    assert.ok(Math.abs(valuesArr[2] - 98) < 0.1, `batch 2 value: ${valuesArr[2]}`);
+    assert.ok(Math.abs(valuesArr[3] - 97) < 0.1, `batch 3 value: ${valuesArr[3]}`);
+    assert.equal(indicesBuf.readInt32LE(0), 3);
+    assert.equal(indicesBuf.readInt32LE(4), 7);
+    assert.equal(indicesBuf.readInt32LE(8), 1);
+    assert.equal(indicesBuf.readInt32LE(12), 5);
+  });
+
+  it("max on Column-parallel BF16 tensor returns Column result", () => {
+    const batch = 4;
+    const dim = 8;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = (i % 13 - 6) * 0.5;
+    inputF32[3] = 100;
+    inputF32[dim + 7] = 99;
+    inputF32[2 * dim + 1] = 98;
+    inputF32[3 * dim + 5] = 97;
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const { values, indices } = input.max();
+    po.synchronize();
+
+    assert.equal((values as ParallelTensor).parallelism, TensorParallelism.Column, "Column max values should be Column");
+    assert.equal((indices as ParallelTensor).parallelism, TensorParallelism.Column, "Column max indices should be Column");
+
+    const valuesBuf = Buffer.alloc(batch * 2);
+    const indicesBuf = Buffer.alloc(batch * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    assert.ok(Math.abs(valuesArr[0] - 100) < 0.1, `batch 0 value: ${valuesArr[0]}`);
+    assert.ok(Math.abs(valuesArr[1] - 99) < 0.1, `batch 1 value: ${valuesArr[1]}`);
+    assert.ok(Math.abs(valuesArr[2] - 98) < 0.1, `batch 2 value: ${valuesArr[2]}`);
+    assert.ok(Math.abs(valuesArr[3] - 97) < 0.1, `batch 3 value: ${valuesArr[3]}`);
+    assert.equal(indicesBuf.readInt32LE(0), 3);
+    assert.equal(indicesBuf.readInt32LE(4), 7);
+    assert.equal(indicesBuf.readInt32LE(8), 1);
+    assert.equal(indicesBuf.readInt32LE(12), 5);
+  });
+
+  it("max with offset on Row-parallel BF16 tensor", () => {
+    const batch = 2;
+    const dim = 8;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = (i % 7 - 3) * 0.5;
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const offset = 100;
+    const { values, indices } = input.max(offset);
+    po.synchronize();
+
+    const expectedIndices = new Int32Array(batch);
+    const expectedValues = new Float32Array(batch);
+    for (let b = 0; b < batch; b++) {
+      let maxVal = -Infinity;
+      let maxIdx = -1;
+      for (let j = 0; j < dim; j++) {
+        if (inputF32[b * dim + j] > maxVal) {
+          maxVal = inputF32[b * dim + j];
+          maxIdx = j;
+        }
+      }
+      expectedValues[b] = maxVal;
+      expectedIndices[b] = maxIdx + offset;
+    }
+
+    const valuesBuf = Buffer.alloc(batch * 2);
+    const indicesBuf = Buffer.alloc(batch * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    for (let b = 0; b < batch; b++) {
+      const relErr = Math.abs(valuesArr[b] - expectedValues[b]) / Math.max(Math.abs(expectedValues[b]), 1e-6);
+      assert.ok(relErr < 0.05, `batch ${b} value: expected ${expectedValues[b]}, got ${valuesArr[b]}`);
+      assert.equal(indicesBuf.readInt32LE(b * 4), expectedIndices[b], `batch ${b} index with offset`);
+    }
+  });
+
+  it("max on Row-parallel BF16 matches single-GPU reference", () => {
+    const batch = 3;
+    const dim = 16;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = Math.sin(i * 0.7) * 10;
+
+    const refGlm = new GlmOps(2);
+    const refWs = new WorkspaceBase(refGlm);
+    const refInput = refWs.alloc([batch, dim], "BF16");
+    refInput.h2d(f32ToBf16Bytes(inputF32));
+    refGlm.synchronize();
+
+    const { values: refValues, indices: refIndices } = refInput.max();
+    refGlm.synchronize();
+
+    const refValuesBuf = Buffer.alloc(batch * 2);
+    const refIndicesBuf = Buffer.alloc(batch * 4);
+    refValues.d2h(refValuesBuf);
+    refIndices.d2h(refIndicesBuf);
+    const refValuesArr = bf16BytesToF32(refValuesBuf);
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const { values, indices } = input.max();
+    po.synchronize();
+
+    const valuesBuf = Buffer.alloc(batch * 2);
+    const indicesBuf = Buffer.alloc(batch * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    for (let b = 0; b < batch; b++) {
+      const relErr = Math.abs(valuesArr[b] - refValuesArr[b]) / Math.max(Math.abs(refValuesArr[b]), 1e-6);
+      assert.ok(relErr < 0.05, `batch ${b} value: ref=${refValuesArr[b]}, got=${valuesArr[b]}`);
+      assert.equal(indicesBuf.readInt32LE(b * 4), refIndicesBuf.readInt32LE(b * 4), `batch ${b} index`);
+    }
+
+    refWs.free();
+    refGlm.free();
+  });
+
+  it("max on Column-parallel BF16 matches single-GPU reference", () => {
+    const batch = 4;
+    const dim = 12;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = Math.cos(i * 0.3) * 5;
+
+    const refGlm = new GlmOps(2);
+    const refWs = new WorkspaceBase(refGlm);
+    const refInput = refWs.alloc([batch, dim], "BF16");
+    refInput.h2d(f32ToBf16Bytes(inputF32));
+    refGlm.synchronize();
+
+    const { values: refValues, indices: refIndices } = refInput.max();
+    refGlm.synchronize();
+
+    const refValuesBuf = Buffer.alloc(batch * 2);
+    const refIndicesBuf = Buffer.alloc(batch * 4);
+    refValues.d2h(refValuesBuf);
+    refIndices.d2h(refIndicesBuf);
+    const refValuesArr = bf16BytesToF32(refValuesBuf);
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const { values, indices } = input.max();
+    po.synchronize();
+
+    const valuesBuf = Buffer.alloc(batch * 2);
+    const indicesBuf = Buffer.alloc(batch * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    for (let b = 0; b < batch; b++) {
+      const relErr = Math.abs(valuesArr[b] - refValuesArr[b]) / Math.max(Math.abs(refValuesArr[b]), 1e-6);
+      assert.ok(relErr < 0.05, `batch ${b} value: ref=${refValuesArr[b]}, got=${valuesArr[b]}`);
+      assert.equal(indicesBuf.readInt32LE(b * 4), refIndicesBuf.readInt32LE(b * 4), `batch ${b} index`);
+    }
+
+    refWs.free();
+    refGlm.free();
+  });
+});
+
 describe("ParallelOps.indexSelect", () => {
   let glm0: GlmOps;
   let glm1: GlmOps;
