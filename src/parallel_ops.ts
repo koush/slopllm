@@ -522,12 +522,12 @@ export class ParallelTensor extends Tensor {
   max(offset: number = 0): { values: Tensor, indices: Tensor } {
     if (this.parallelism === TensorParallelism.PartialSum) {
       this.allReduce();
-      return this.max();
+      return this.max(offset);
     }
 
     if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
       const gathered = this.allGather(this.workspace);
-      const result = gathered.max();
+      const result = gathered.max(offset);
       gathered[Symbol.dispose]();
       return result;
     }
@@ -537,7 +537,7 @@ export class ParallelTensor extends Tensor {
     const valuesShards: Tensor[] = [];
     const indicesShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const { values, indices } = this.shards[i].max();
+      const { values, indices } = this.shards[i].max(offset);
       valuesShards.push(values);
       indicesShards.push(indices);
     }
