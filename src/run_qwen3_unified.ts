@@ -164,6 +164,7 @@ export function* generateStream(
   let capturing = false;
   let logits: Tensor | null = null;
   let greedyArgmaxResult: Tensor | null = null;
+  let sampleResult: Tensor | null = null;
 
   let planMs = 0;
   let execMs = 0;
@@ -192,6 +193,9 @@ export function* generateStream(
       if (useGraph && greedy && capturing) {
         greedyArgmaxResult = logits.argmax();
       }
+      else if (useGraph && sampling && capturing) {
+        sampleResult = logits.sampleTokenGPU(sampling, tokenHistory);
+      }
 
       const wasCapturing = capturing;
       if (capturing) {
@@ -211,6 +215,8 @@ export function* generateStream(
     const tSample = performance.now();
     if (greedyArgmaxResult) {
       currentToken = greedyArgmaxResult.readInt32LE()[0];
+    } else if (sampleResult) {
+      currentToken = sampleResult.readInt32LE()[0];
     } else if (sampling) {
       using sampleResult = logits!.sampleTokenGPU(sampling, tokenHistory);
       currentToken = sampleResult.readInt32LE()[0];
