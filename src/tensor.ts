@@ -65,7 +65,7 @@ export abstract class Tensor implements Disposable {
   abstract siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor;
   abstract arange(start: number, step: number, count: number): void;
   abstract argmax(): Tensor;
-  abstract max(): { values: Tensor, indices: Tensor };
+  abstract max(offset?: number): { values: Tensor, indices: Tensor };
   abstract indexSelect(indices: Tensor, dim: number, batch: number): Tensor;
 
   abstract gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;

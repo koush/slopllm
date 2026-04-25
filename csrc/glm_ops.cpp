@@ -694,7 +694,7 @@ static Napi::Value Arange(const Napi::CallbackInfo& info) {
 static Napi::Value Max(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
-        Napi::TypeError::New(env, "Expected (ctx, out_values, out_indices, input, dim, batch)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, out_values, out_indices, input, dim, batch[, offset])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -703,10 +703,11 @@ static Napi::Value Max(const Napi::CallbackInfo& info) {
     uintptr_t in_ptr = info[3].As<Napi::Number>().Int64Value();
     int dim = info[4].As<Napi::Number>().Int32Value();
     int batch = info[5].As<Napi::Number>().Int32Value();
+    int offset = info.Length() > 6 ? info[6].As<Napi::Number>().Int32Value() : 0;
     glm_max(reinterpret_cast<GlmCtx*>(ctx_ptr),
             reinterpret_cast<void*>(out_vals_ptr),
             reinterpret_cast<int*>(out_idxs_ptr),
-            reinterpret_cast<const void*>(in_ptr), dim, batch);
+            reinterpret_cast<const void*>(in_ptr), dim, batch, offset);
     return env.Undefined();
 }
 

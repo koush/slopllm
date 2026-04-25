@@ -80,3 +80,22 @@ def test_max_negative_values(glm, device):
             f"Index mismatch at batch {b}: cuda={out_idxs[b].item()}, ref={ref_idxs[b].item()}"
         assert abs(out_vals[b].float().item() - ref_vals[b].item()) < 0.01, \
             f"Value mismatch at batch {b}: cuda={out_vals[b].float().item()}, ref={ref_vals[b].item()}"
+
+
+@pytest.mark.parametrize("offset", [0, 5, 100, 256])
+def test_max_offset(glm, device, offset):
+    batch, dim = 4, 32
+    torch.manual_seed(42 + offset)
+    x = torch.randn(batch, dim, dtype=torch.bfloat16, device=device)
+    out_vals = torch.empty(batch, dtype=torch.bfloat16, device=device)
+    out_idxs = torch.empty(batch, dtype=torch.int32, device=device)
+
+    glm.max(out_vals, out_idxs, x, dim, batch, offset=offset)
+
+    ref_vals, ref_idxs = x.float().max(dim=-1)
+
+    for b in range(batch):
+        assert out_idxs[b].item() == ref_idxs[b].item() + offset, \
+            f"Offset index mismatch at batch {b}: cuda={out_idxs[b].item()}, ref={ref_idxs[b].item() + offset}, offset={offset}"
+        assert abs(out_vals[b].float().item() - ref_vals[b].item()) < 0.01, \
+            f"Value mismatch at batch {b}: cuda={out_vals[b].float().item()}, ref={ref_vals[b].item()}"

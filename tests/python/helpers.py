@@ -315,7 +315,7 @@ class GlmOps:
         self.lib.glm_max.restype = None
         self.lib.glm_max.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int
+            ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
         self.lib.glm_memcpy.restype = None
@@ -589,12 +589,12 @@ class GlmOps:
         self.lib.glm_arange(self.ctx, self._ptr(out), start, step, count)
 
     def argmax(self, out_index, input, dim, batch=1):
-        tmp_vals = self.alloc(batch * 2)  # BF16 values buffer
-        self.max(tmp_vals, out_index, input, dim, batch)
+        tmp_vals = self.alloc(batch * 2)
+        self.max(tmp_vals, out_index, input, dim, batch, offset=0)
         self.free_buf(tmp_vals)
 
-    def max(self, out_values, out_indices, input, dim, batch=1):
-        self.lib.glm_max(self.ctx, self._ptr(out_values), self._ptr(out_indices), self._ptr(input), dim, batch)
+    def max(self, out_values, out_indices, input, dim, batch=1, offset=0):
+        self.lib.glm_max(self.ctx, self._ptr(out_values), self._ptr(out_indices), self._ptr(input), dim, batch, offset)
 
     def memcpy(self, dst, src, bytes, kind=4):
         self.lib.glm_memcpy(self.ctx, self._ptr(dst), self._ptr(src), bytes, kind)

@@ -1427,7 +1427,7 @@ void glm_index_select(GlmCtx* ctx, void* out, const void* src,
 // ---------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(256, 4) max_kernel(__nv_bfloat16* out_values, int* out_indices,
-                              const __nv_bfloat16* input, int dim, int batch) {
+                              const __nv_bfloat16* input, int dim, int batch, int offset) {
     int row = blockIdx.x;
     if (row >= batch) return;
 
@@ -1454,17 +1454,17 @@ __global__ void __launch_bounds__(256, 4) max_kernel(__nv_bfloat16* out_values, 
 
     if (threadIdx.x == 0) {
         out_values[row] = __float2bfloat16(s_vals[0]);
-        out_indices[row] = s_idxs[0];
+        out_indices[row] = s_idxs[0] + offset;
     }
 }
 
-void glm_max(GlmCtx* ctx, void* out_values, int* out_indices, const void* input, int dim, int batch) {
+void glm_max(GlmCtx* ctx, void* out_values, int* out_indices, const void* input, int dim, int batch, int offset) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = batch;
     size_t shared_mem = block_size * sizeof(float) + block_size * sizeof(int);
     max_kernel<<<grid, block_size, shared_mem, ctx->stream>>>(
-        (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch);
+        (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset);
 }
 
 // ---------------------------------------------------------------------------

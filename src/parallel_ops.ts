@@ -519,7 +519,7 @@ export class ParallelTensor extends Tensor {
     return indices;
   }
 
-  max(): { values: Tensor, indices: Tensor } {
+  max(offset: number = 0): { values: Tensor, indices: Tensor } {
     if (this.parallelism === TensorParallelism.PartialSum) {
       this.allReduce();
       return this.max();

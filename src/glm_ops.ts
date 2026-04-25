@@ -55,7 +55,7 @@ interface NativeAddon {
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number): void;
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
-  max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number): void;
+  max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
   synchronize(ctx: number): void;
@@ -173,12 +173,12 @@ export class GlmTensor extends Tensor {
     return indices;
   }
 
-  max(): { values: Tensor, indices: Tensor } {
+  max(offset: number = 0): { values: Tensor, indices: Tensor } {
     const batch = this.shape[0];
     const dim = this.shape[1];
     const values = this.workspace.alloc([batch], this.type);
     const indices = this.workspace.alloc([batch], "I32");
-    getNativeAddon().max(this.glm.ctx, values.data, indices.data, this.data, dim, batch);
+    getNativeAddon().max(this.glm.ctx, values.data, indices.data, this.data, dim, batch, offset);
     return { values, indices };
   }
 
