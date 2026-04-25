@@ -25,19 +25,12 @@
       "actions": [
         {
           "action_name": "build_libglm",
-          "inputs": [ "csrc/glm_ops.cu", "csrc/glm_flash.cu", "csrc/glm_fp8.cu", "csrc/glm_gdn.cu", "csrc/glm_sampling.cu", "csrc/glm_nccl.cpp", "csrc/glm_device.cpp" ],
+          "inputs": [ "Makefile", "csrc/glm_ops.cu", "csrc/glm_flash.cu", "csrc/glm_fp8.cu", "csrc/glm_gdn.cu", "csrc/glm_sampling.cu", "csrc/glm_nccl.cpp", "csrc/glm_device.cpp" ],
           "outputs": [ "<(PRODUCT_DIR)/libglm_ops.so" ],
           "action": [
-            "nvcc", "-O2", "-Xcompiler", "-fPIC", "-shared",
-            "-gencode", "arch=compute_120a,code=sm_120a",
-            "--expt-relaxed-constexpr",
-            "-o", "<@(_outputs)", "<@(_inputs)",
-            "-Ivendor/flashinfer/include",
-            "-I/usr/local/cuda/include",
-            "-L/usr/local/cuda/lib64", "-lcublas", "-lcudart", "-lnccl",
-            "-Xcompiler", "-fPIC"
+            "make", "-j", "<!@(nproc)"
           ],
-          "message": "Building libglm_ops.so"
+          "message": "Building libglm_ops.so (parallel)"
         }
       ],
       "xcode_settings": {

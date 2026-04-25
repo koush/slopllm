@@ -4,9 +4,11 @@
   "main": "dist/src/main.js",
   "scripts": {
     "build": "tsc",
-    "build:cuda": "make",
-    "build:addon": "npm run build:cuda && node-gyp rebuild",
+    "build:cuda": "make -j32",
+    "build:addon": "npm run build:cuda && node-gyp build",
     "build:all": "npm run build:addon && npm run build",
+    "clean": "rimraf build dist",
+    "configure": "node-gyp configure",
     "test:python": "cd tests/python && pytest -v .",
     "start": "node dist/src/main.js",
     "start:qwen3": "node dist/src/run_qwen3_unified.js",
@@ -24,6 +26,7 @@
   "description": "",
   "devDependencies": {
     "@types/node": "^25.6.0",
+    "rimraf": "^6.1.3",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
   },
