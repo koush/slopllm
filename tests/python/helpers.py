@@ -317,6 +317,12 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int
         ]
 
+        self.lib.glm_max.restype = None
+        self.lib.glm_max.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int
+        ]
+
         self.lib.glm_memcpy.restype = None
         self.lib.glm_memcpy.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int
@@ -589,6 +595,9 @@ class GlmOps:
 
     def argmax(self, out_index, input, dim, batch=1):
         self.lib.glm_argmax(self.ctx, self._ptr(out_index), self._ptr(input), dim, batch)
+
+    def max(self, out_values, out_indices, input, dim, batch=1):
+        self.lib.glm_max(self.ctx, self._ptr(out_values), self._ptr(out_indices), self._ptr(input), dim, batch)
 
     def memcpy(self, dst, src, bytes, kind=4):
         self.lib.glm_memcpy(self.ctx, self._ptr(dst), self._ptr(src), bytes, kind)

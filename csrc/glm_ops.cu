@@ -1466,6 +1466,53 @@ void glm_argmax(GlmCtx* ctx, int* out_index, const void* input, int dim, int bat
 }
 
 // ---------------------------------------------------------------------------
+// Max kernel (find max value and index per row in BF16 input)
+//   out_values[row] = max(input[row * dim : (row+1) * dim])
+//   out_indices[row] = argmax(input[row * dim : (row+1) * dim])
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) max_kernel(__nv_bfloat16* out_values, int* out_indices,
+                              const __nv_bfloat16* input, int dim, int batch) {
+    int row = blockIdx.x;
+    if (row >= batch) return;
+
+    const __nv_bfloat16* row_in = input + row * dim;
+
+    extern __shared__ char smem[];
+    float* s_vals = reinterpret_cast<float*>(smem);
+    int* s_idxs = reinterpret_cast<int*>(s_vals + blockDim.x);
+
+    float my_max = -INFINITY;
+    int my_idx = -1;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float val = __bfloat162float(row_in[i]);
+        if (val > my_max || (val == my_max && i < my_idx)) {
+            my_max = val;
+            my_idx = i;
+        }
+    }
+    s_vals[threadIdx.x] = my_max;
+    s_idxs[threadIdx.x] = my_idx;
+    __syncthreads();
+
+    block_reduce_max_idx(s_vals, s_idxs, threadIdx.x);
+
+    if (threadIdx.x == 0) {
+        out_values[row] = __float2bfloat16(s_vals[0]);
+        out_indices[row] = s_idxs[0];
+    }
+}
+
+void glm_max(GlmCtx* ctx, void* out_values, int* out_indices, const void* input, int dim, int batch) {
+    cudaSetDevice(ctx->device_id);
+    int block_size = 256;
+    int grid = batch;
+    size_t shared_mem = block_size * sizeof(float) + block_size * sizeof(int);
+    max_kernel<<<grid, block_size, shared_mem, ctx->stream>>>(
+        (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch);
+}
+
+// ---------------------------------------------------------------------------
 // Arange kernel (fill int32 buffer with sequential values)
 //   out[i] = start + i * step
 // ---------------------------------------------------------------------------

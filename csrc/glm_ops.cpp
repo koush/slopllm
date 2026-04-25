@@ -708,6 +708,25 @@ static Napi::Value Argmax(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value Max(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, out_values, out_indices, input, dim, batch)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_vals_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t out_idxs_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[3].As<Napi::Number>().Int64Value();
+    int dim = info[4].As<Napi::Number>().Int32Value();
+    int batch = info[5].As<Napi::Number>().Int32Value();
+    glm_max(reinterpret_cast<GlmCtx*>(ctx_ptr),
+            reinterpret_cast<void*>(out_vals_ptr),
+            reinterpret_cast<int*>(out_idxs_ptr),
+            reinterpret_cast<const void*>(in_ptr), dim, batch);
+    return env.Undefined();
+}
+
 static Napi::Value KvCacheWrite(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 14) {
@@ -1654,6 +1673,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "indexSelect"), Napi::Function::New(env, IndexSelect));
     exports.Set(Napi::String::New(env, "arange"), Napi::Function::New(env, Arange));
     exports.Set(Napi::String::New(env, "argmax"), Napi::Function::New(env, Argmax));
+    exports.Set(Napi::String::New(env, "max"), Napi::Function::New(env, Max));
     exports.Set(Napi::String::New(env, "memcpy"), Napi::Function::New(env, Memcpy));
     exports.Set(Napi::String::New(env, "kvCacheWrite"), Napi::Function::New(env, KvCacheWrite));
     exports.Set(Napi::String::New(env, "synchronize"), Napi::Function::New(env, Synchronize));

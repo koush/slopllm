@@ -535,6 +535,33 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, shards, [this.shape[0]], "I32", TensorParallelism.Replicated);
   }
 
+  max(): { values: Tensor, indices: Tensor } {
+    if (this.parallelism === TensorParallelism.PartialSum) {
+      this.allReduce();
+      return this.max();
+    }
+
+    if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
+      const gathered = this.allGather(this.workspace);
+      const result = gathered.max();
+      gathered[Symbol.dispose]();
+      return result;
+    }
+
+    this.assertParallel("max input", this, TensorParallelism.Replicated);
+
+    const valuesShards: Tensor[] = [];
+    const indicesShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      const { values, indices } = this.shards[i].max();
+      valuesShards.push(values);
+      indicesShards.push(indices);
+    }
+    const values = this.parallelOps.wrapShards(this.workspace, valuesShards, [this.shape[0]], this.type, TensorParallelism.Replicated);
+    const indices = this.parallelOps.wrapShards(this.workspace, indicesShards, [this.shape[0]], "I32", TensorParallelism.Replicated);
+    return { values, indices };
+  }
+
   indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
     const pIndices = indices as ParallelTensor;
     this.assertParallel("indexSelect src", this, TensorParallelism.Replicated);
