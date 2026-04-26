@@ -376,38 +376,38 @@ void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_
     int block_size = SAMPLING_BLOCK_SIZE;
 
     if (max_effective_k <= 1) {
-        sampling_kernel_batch<2><<<batch_size, block_size, 0, ctx->stream>>>(
+        sampling_kernel_batch<2><<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_offsets,
             vocab_size, temperatures, repetition_penalties, presence_penalties,
             top_ks, top_ps, random_vals);
     } else if (max_effective_k <= 8) {
-        sampling_kernel_batch<8><<<batch_size, block_size, 0, ctx->stream>>>(
+        sampling_kernel_batch<8><<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_offsets,
             vocab_size, temperatures, repetition_penalties, presence_penalties,
             top_ks, top_ps, random_vals);
     } else if (max_effective_k <= 16) {
-        sampling_kernel_batch<16><<<batch_size, block_size, 0, ctx->stream>>>(
+        sampling_kernel_batch<16><<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_offsets,
             vocab_size, temperatures, repetition_penalties, presence_penalties,
             top_ks, top_ps, random_vals);
     } else if (max_effective_k <= 32) {
-        sampling_kernel_batch<32><<<batch_size, block_size, 0, ctx->stream>>>(
+        sampling_kernel_batch<32><<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_offsets,
             vocab_size, temperatures, repetition_penalties, presence_penalties,
             top_ks, top_ps, random_vals);
     } else if (max_effective_k <= 64) {
-        sampling_kernel_batch<64><<<batch_size, block_size, 0, ctx->stream>>>(
+        sampling_kernel_batch<64><<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_offsets,
             vocab_size, temperatures, repetition_penalties, presence_penalties,
             top_ks, top_ps, random_vals);
     } else {
         size_t shared_mem = block_size * (sizeof(float) + sizeof(int));
-        sampling_kernel_argmax_batch<<<batch_size, block_size, shared_mem, ctx->stream>>>(
+        sampling_kernel_argmax_batch<<<batch_size, block_size, shared_mem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_offsets,
             vocab_size, temperatures, repetition_penalties, presence_penalties,

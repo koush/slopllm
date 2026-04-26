@@ -61,6 +61,9 @@ interface NativeAddon {
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
   synchronize(ctx: number): void;
+  setStream(ctx: number, streamIdx: number): void;
+  eventRecord(ctx: number, eventIdx: number, streamIdx: number): void;
+  streamWaitEvent(ctx: number, streamIdx: number, eventIdx: number): void;
   allocPinned(bytes: number): number;
   freePinned(ptr: number): void;
   writePinned(dst: number, src: Buffer, size: number): void;
@@ -331,6 +334,18 @@ export class GlmOps implements DeviceOps {
 
   synchronize(): void {
     getNativeAddon().synchronize(this.ctx);
+  }
+
+  setStream(streamIdx: number): void {
+    getNativeAddon().setStream(this.ctx, streamIdx);
+  }
+
+  eventRecord(eventIdx: number, streamIdx: number): void {
+    getNativeAddon().eventRecord(this.ctx, eventIdx, streamIdx);
+  }
+
+  streamWaitEvent(streamIdx: number, eventIdx: number): void {
+    getNativeAddon().streamWaitEvent(this.ctx, streamIdx, eventIdx);
   }
 
   fill(out: Tensor, value: number, n: number): void {

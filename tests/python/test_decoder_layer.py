@@ -166,7 +166,7 @@ def test_decoder_layer_dense(glm, device):
         input_layernorm_w, post_attn_layernorm_w,
         attn_weights, mlp_weights, "dense", eps)
 
-    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.3, rtol=5e-2)
+    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.1, rtol=5e-3)
 
 
 def test_decoder_layer_no_mask_dense(glm, device):
@@ -242,7 +242,7 @@ def test_decoder_layer_no_mask_dense(glm, device):
         input_layernorm_w, post_attn_layernorm_w,
         attn_weights, mlp_weights, "dense", eps)
 
-    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.3, rtol=5e-2)
+    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.1, rtol=5e-3)
 
 
 def test_decoder_layer_moe(glm, device):
@@ -340,4 +340,4 @@ def test_decoder_layer_moe(glm, device):
         input_layernorm_w, post_attn_layernorm_w,
         attn_weights, mlp_weights, "sparse", eps)
 
-    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.5, rtol=1e-1)
+    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.25, rtol=5e-2)

@@ -93,7 +93,7 @@ void glm_batch_decode_plan_impl(
       num_qo_heads,
       page_size,
       enable_cuda_graph,
-      ctx->stream,
+      GLM_STREAM(ctx),
       work_est);
 
   if (status != cudaSuccess) {
@@ -161,7 +161,7 @@ void glm_flash_prefill(
           false,
           flashinfer::MaskMode::kCausal,
           AttentionVariant, Params>(
-          params, static_cast<DTypeO*>(tmp), ctx->stream);
+          params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
     } else {
       status = flashinfer::SinglePrefillWithKVCacheDispatched<
           256, 256,
@@ -169,7 +169,7 @@ void glm_flash_prefill(
           false,
           flashinfer::MaskMode::kNone,
           AttentionVariant, Params>(
-          params, static_cast<DTypeO*>(tmp), ctx->stream);
+          params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
     }
   } else {
     if (flash_mask == flashinfer::MaskMode::kCausal) {
@@ -179,7 +179,7 @@ void glm_flash_prefill(
           false,
           flashinfer::MaskMode::kCausal,
           AttentionVariant, Params>(
-          params, static_cast<DTypeO*>(tmp), ctx->stream);
+          params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
     } else {
       status = flashinfer::SinglePrefillWithKVCacheDispatched<
           128, 128,
@@ -187,7 +187,7 @@ void glm_flash_prefill(
           false,
           flashinfer::MaskMode::kNone,
           AttentionVariant, Params>(
-          params, static_cast<DTypeO*>(tmp), ctx->stream);
+          params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
     }
   }
 
@@ -236,13 +236,13 @@ void glm_flash_decode(
         256,
         flashinfer::PosEncodingMode::kNone,
         AttentionVariant, Params>(
-        params, static_cast<DTypeO*>(tmp), ctx->stream);
+        params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
   } else {
     status = flashinfer::SingleDecodeWithKVCacheDispatched<
         128,
         flashinfer::PosEncodingMode::kNone,
         AttentionVariant, Params>(
-        params, static_cast<DTypeO*>(tmp), ctx->stream);
+        params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
   }
 
   if (status != cudaSuccess) {
@@ -340,11 +340,11 @@ void glm_batch_decode_run(
   if (head_dim == 256) {
       status =
       flashinfer::BatchDecodeWithPagedKVCacheDispatched<256, POS_ENC, AttentionVariant, DecodeParams>(
-          params, tmp_v, tmp_s, false, ctx->stream);
+          params, tmp_v, tmp_s, false, GLM_STREAM(ctx));
   } else {
       status =
       flashinfer::BatchDecodeWithPagedKVCacheDispatched<128, POS_ENC, AttentionVariant, DecodeParams>(
-          params, tmp_v, tmp_s, false, ctx->stream);
+          params, tmp_v, tmp_s, false, GLM_STREAM(ctx));
   }
 
   if (status != cudaSuccess) {
@@ -385,7 +385,7 @@ void glm_batch_prefill_paged_plan(
       -1, // fixed_split_size
       false, // disable_split_kv
       0, // num_colocated_ctas
-      ctx->stream);
+      GLM_STREAM(ctx));
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_batch_prefill_paged_plan failed: %s\n", cudaGetErrorString(status));
@@ -484,36 +484,36 @@ void glm_batch_prefill_paged_run(
   if (head_dim == 256) {
     if (flash_mask == flashinfer::MaskMode::kCausal) {
       switch (cta_tile_q) {
-        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
         default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
       }
     } else {
       switch (cta_tile_q) {
-        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
         default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
       }
     }
   } else {
     if (flash_mask == flashinfer::MaskMode::kCausal) {
       switch (cta_tile_q) {
-        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
         default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
       }
     } else {
       switch (cta_tile_q) {
-        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
-        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, ctx->stream); break;
+        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
         default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
       }
     }

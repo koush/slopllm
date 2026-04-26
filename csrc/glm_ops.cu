@@ -110,7 +110,7 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
     int block_size = 256;
     if (block_size > dim) block_size = (dim + 31) / 32 * 32;
     size_t shared_mem = block_size * sizeof(float);
-    rmsnorm_kernel<<<batch, block_size, shared_mem, ctx->stream>>>(
+    rmsnorm_kernel<<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
         (const __nv_bfloat16*)weight, eps, dim);
 }
@@ -186,7 +186,7 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
     int block_size = 256;
     if (block_size > dim) block_size = (dim + 31) / 32 * 32;
     size_t shared_mem = block_size * sizeof(float);
-    fused_add_rmsnorm_kernel<<<batch, block_size, shared_mem, ctx->stream>>>(
+    fused_add_rmsnorm_kernel<<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
         (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
         (const __nv_bfloat16*)weight, eps, dim);
@@ -263,7 +263,7 @@ void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
     int block_size = 256;
     if (block_size > head_dim) block_size = (head_dim + 31) / 32 * 32;
     size_t shared_mem = block_size * sizeof(float);
-    fused_norm_rope_kernel<<<total_rows, block_size, shared_mem, ctx->stream>>>(
+    fused_norm_rope_kernel<<<total_rows, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
         (const __nv_bfloat16*)weight,
         (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
@@ -299,7 +299,7 @@ void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
     int total = batch * intermediate;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    silu_and_mul_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    silu_and_mul_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)gate,
         (const __nv_bfloat16*)up, total);
 }
@@ -386,7 +386,7 @@ void glm_layernorm(GlmCtx* ctx, void* out, const void* input,
     int block_size = 256;
     if (block_size > dim) block_size = (dim + 31) / 32 * 32;
     size_t shared_mem = block_size * sizeof(float);
-    layernorm_kernel<<<batch, block_size, shared_mem, ctx->stream>>>(
+    layernorm_kernel<<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
         (const __nv_bfloat16*)weight, (const __nv_bfloat16*)bias,
         eps, dim);
@@ -474,7 +474,7 @@ void glm_gate_sigmoid_mul(
     int total = rows * cols;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    ew_unary_2d_kernel<sigmoid_mul_f><<<grid, block_size, 0, ctx->stream>>>(
+    ew_unary_2d_kernel<sigmoid_mul_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)attn_out,
         (const __nv_bfloat16*)gate_interleaved,
         rows, cols, pitch, head_dim);
@@ -490,7 +490,7 @@ void glm_relu(GlmCtx* ctx, void* out, const void* input, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    ew_unary_kernel<relu_f><<<grid, block_size, 0, ctx->stream>>>(
+    ew_unary_kernel<relu_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input, n);
 }
 
@@ -502,7 +502,7 @@ void glm_sigmoid(GlmCtx* ctx, void* out, const void* input, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    ew_unary_kernel<sigmoid_f><<<grid, block_size, 0, ctx->stream>>>(
+    ew_unary_kernel<sigmoid_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input, n);
 }
 
@@ -603,10 +603,10 @@ void glm_softmax(GlmCtx* ctx, void* out, const void* input,
     const __nv_bfloat16* mask_ptr = mask ? (const __nv_bfloat16*)mask : nullptr;
     if ((dim + block_size) * sizeof(float) <= 48 * 1024) {
         shared_mem = (dim + block_size) * sizeof(float);
-        softmax_kernel<<<batch, block_size, shared_mem, ctx->stream>>>(
+        softmax_kernel<<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input, mask_ptr, dim);
     } else {
-        softmax_kernel_uncached<<<batch, block_size, shared_mem, ctx->stream>>>(
+        softmax_kernel_uncached<<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input, mask_ptr, dim);
     }
 }
@@ -636,7 +636,7 @@ void glm_causal_mask(GlmCtx* ctx, void* out, int seq_len) {
     int total = seq_len * seq_len;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    causal_mask_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    causal_mask_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, seq_len);
 }
 
@@ -654,11 +654,11 @@ __global__ void __launch_bounds__(256, 4) fill_kernel(__nv_bfloat16* out, float 
 void glm_fill(GlmCtx* ctx, void* out, float value, int n) {
     cudaSetDevice(ctx->device_id);
     if (value == 0.0f) {
-        cudaMemsetAsync(out, 0, n * sizeof(__nv_bfloat16), ctx->stream);
+        cudaMemsetAsync(out, 0, n * sizeof(__nv_bfloat16), GLM_STREAM(ctx));
     } else {
         int block_size = 256;
         int grid = (n + block_size - 1) / block_size;
-        fill_kernel<<<grid, block_size, 0, ctx->stream>>>(
+        fill_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, value, n);
     }
 }
@@ -703,15 +703,15 @@ void glm_gather(GlmCtx* ctx, void* out, const void* input, const int* indices,
     int grid = (total + block_size - 1) / block_size;
     switch (elem_size) {
         case 1:
-            gather_kernel<1><<<grid, block_size, 0, ctx->stream>>>(
+            gather_kernel<1><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
                 (char*)out, (const char*)input, indices, k, in_dim, batch);
             break;
         case 2:
-            gather_kernel<2><<<grid, block_size, 0, ctx->stream>>>(
+            gather_kernel<2><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
                 (char*)out, (const char*)input, indices, k, in_dim, batch);
             break;
         case 4:
-            gather_kernel<4><<<grid, block_size, 0, ctx->stream>>>(
+            gather_kernel<4><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
                 (char*)out, (const char*)input, indices, k, in_dim, batch);
             break;
         default:
@@ -749,7 +749,7 @@ void glm_scatter_scalar(GlmCtx* ctx, void* out, const int* indices, float value,
     int total = batch * k;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    scatter_scalar_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    scatter_scalar_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, indices, value, k, out_dim, batch);
 }
 
@@ -786,7 +786,7 @@ void glm_cat_last_dim(GlmCtx* ctx, void* out, const void* a, const void* b,
     int total = outer * (a_last_dim + b_last_dim);
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    cat_last_dim_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    cat_last_dim_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)a,
         (const __nv_bfloat16*)b, a_last_dim, b_last_dim, outer);
 }
@@ -819,7 +819,7 @@ void glm_masked_fill(GlmCtx* ctx, void* out, const void* input, const void* mask
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    masked_fill_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    masked_fill_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
         (const __nv_bfloat16*)mask, value, n);
 }
@@ -855,7 +855,7 @@ void glm_index_add(GlmCtx* ctx, void* out, const int* indices, const void* value
     int total = n_indices * dim;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    index_add_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    index_add_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, indices, (const __nv_bfloat16*)values,
         n_indices, dim);
 }
@@ -900,7 +900,7 @@ void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
     int total = batch * seq_len * dim;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    rotary_embedding_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    rotary_embedding_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)cos_out, (__nv_bfloat16*)sin_out,
         (const __nv_bfloat16*)inv_freq, position_ids,
         dim_half, seq_len, batch);
@@ -995,7 +995,7 @@ void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
     int total = batch * n_heads * seq_len * head_dim;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    apply_rotary_pos_emb_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    apply_rotary_pos_emb_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
         (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
         rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim);
@@ -1074,7 +1074,7 @@ void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
     int grid = batch;
     size_t shared_mem = dim * sizeof(float) + dim * sizeof(int) +
                         block_size * sizeof(float) + block_size * sizeof(int);
-    topk_kernel<<<grid, block_size, shared_mem, ctx->stream>>>(
+    topk_kernel<<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out_values, out_indices,
         (const __nv_bfloat16*)input, k, dim, batch);
 }
@@ -1154,7 +1154,7 @@ void glm_scale(GlmCtx* ctx, void* out, const void* input, float scale, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    scale_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    scale_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input, scale, n);
 }
 
@@ -1168,7 +1168,7 @@ void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    ew_binary_kernel<add_f><<<grid, block_size, 0, ctx->stream>>>(
+    ew_binary_kernel<add_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b, n);
 }
 
@@ -1213,7 +1213,7 @@ void glm_expand_dim1(GlmCtx* ctx, void* out, const void* input,
     int total = batch * dim1_out * seq_len * head_dim;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    expand_dim1_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    expand_dim1_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
         dim1_out, dim1_in, seq_len, head_dim, batch, seq_len * head_dim,
         dim1_out / dim1_in);
@@ -1226,7 +1226,7 @@ void glm_expand_dim1_strided(GlmCtx* ctx, void* out, const void* input,
     int total = batch * dim1_out * seq_len * head_dim;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    expand_dim1_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    expand_dim1_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
         dim1_out, dim1_in, seq_len, head_dim, batch, head_stride,
         dim1_out / dim1_in);
@@ -1310,11 +1310,11 @@ void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
     if (perm0 == 0 && perm1 == 2 && perm2 == 1 && perm3 == 3) {
-        transpose_0213_kernel<<<grid, block_size, 0, ctx->stream>>>(
+        transpose_0213_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
             dim0, dim1, dim2, dim3);
     } else {
-        transpose_4d_kernel<<<grid, block_size, 0, ctx->stream>>>(
+        transpose_4d_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
             dim0, dim1, dim2, dim3, perm0, perm1, perm2, perm3);
     }
@@ -1330,7 +1330,7 @@ void glm_mul(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    ew_binary_kernel<mul_f><<<grid, block_size, 0, ctx->stream>>>(
+    ew_binary_kernel<mul_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)a,
         (const __nv_bfloat16*)b, n);
 }
@@ -1373,7 +1373,7 @@ void glm_reduce_sum(GlmCtx* ctx, void* out, const void* input, int rows, int col
     if (block_size > cols) block_size = (cols + 31) / 32 * 32;
     if (block_size < 32) block_size = 32;
     size_t shared_mem = block_size * sizeof(float);
-    reduce_sum_kernel<<<rows, block_size, shared_mem, ctx->stream>>>(
+    reduce_sum_kernel<<<rows, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input, cols);
 }
 
@@ -1406,7 +1406,7 @@ void glm_index_select(GlmCtx* ctx, void* out, const void* src,
     int total = k * dim;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    index_select_kernel<<<grid, block_size, 0, ctx->stream>>>(
+    index_select_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)src,
         (const int*)indices, dim, k);
 }
@@ -1457,7 +1457,7 @@ void glm_max(GlmCtx* ctx, void* out_values, int* out_indices, const void* input,
     int block_size = 256;
     int grid = batch;
     size_t shared_mem = block_size * sizeof(float) + block_size * sizeof(int);
-    max_kernel<<<grid, block_size, shared_mem, ctx->stream>>>(
+    max_kernel<<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset);
 }
 
@@ -1477,7 +1477,7 @@ void glm_arange(GlmCtx* ctx, int* out, int start, int step, int count) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (count + block_size - 1) / block_size;
-    arange_kernel<<<grid, block_size, 0, ctx->stream>>>(out, start, step, count);
+    arange_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(out, start, step, count);
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,7 +1536,7 @@ void glm_kv_cache_write(GlmCtx* ctx,
     cudaSetDevice(ctx->device_id);
     dim3 grid(batch_size, n_kv);
     dim3 block(hd);
-    kv_cache_write_kernel<<<grid, block, 0, ctx->stream>>>(
+    kv_cache_write_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)dst_k, (__nv_bfloat16*)dst_v,
         (const __nv_bfloat16*)src_k, (const __nv_bfloat16*)src_v,
         slot_mapping, n_kv, page_size, hd,

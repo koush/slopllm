@@ -260,7 +260,7 @@ def test_moe_forward_small(glm, device):
         n_group, topk_group, top_k, num_experts,
         norm_topk_prob, routed_scaling_factor, hidden, moe_inter)
 
-    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.5, rtol=1e-1)
+    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.1, rtol=5e-3)
 
 
 def test_moe_forward_no_norm(glm, device):
@@ -299,4 +299,4 @@ def test_moe_forward_no_norm(glm, device):
         n_group, topk_group, top_k, num_experts,
         norm_topk_prob, routed_scaling_factor, hidden, moe_inter)
 
-    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.5, rtol=1e-1)
+    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.1, rtol=5e-3)

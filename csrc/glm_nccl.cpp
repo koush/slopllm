@@ -60,7 +60,7 @@ void glm_nccl_all_reduce(void* comm, GlmCtx* ctx,
     ncclResult_t result = ncclAllReduce(sendbuff, recvbuff, count,
                           static_cast<ncclDataType_t>(datatype),
                           static_cast<ncclRedOp_t>(op),
-                          static_cast<ncclComm_t>(comm), ctx->stream);
+                          static_cast<ncclComm_t>(comm), GLM_STREAM(ctx));
     if (result != ncclSuccess) {
         fprintf(stderr, "glm_nccl_all_reduce failed: %s\n", ncclGetErrorString(result));
     }
@@ -71,7 +71,7 @@ void glm_nccl_all_gather(void* comm, GlmCtx* ctx,
                           size_t count, int datatype) {
     ncclResult_t result = ncclAllGather(sendbuff, recvbuff, count,
                           static_cast<ncclDataType_t>(datatype),
-                          static_cast<ncclComm_t>(comm), ctx->stream);
+                          static_cast<ncclComm_t>(comm), GLM_STREAM(ctx));
     if (result != ncclSuccess) {
         fprintf(stderr, "glm_nccl_all_gather failed: %s\n", ncclGetErrorString(result));
     }

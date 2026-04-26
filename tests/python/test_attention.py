@@ -260,7 +260,7 @@ def test_attention_small(glm, device):
         num_heads, qk_nope_dim, qk_rope_dim, v_head_dim,
         q_lora_rank, kv_lora_rank, hidden_size, eps)
 
-    torch.testing.assert_close(cuda_output.cpu(), ref_output.cpu(), atol=0.3, rtol=5e-2)
+    torch.testing.assert_close(cuda_output.cpu(), ref_output.cpu(), atol=0.1, rtol=5e-3)
     torch.testing.assert_close(cuda_q_resid.cpu(), ref_q_resid.cpu(), atol=5e-3, rtol=5e-3)
 
 def test_attention_no_mask(glm, device):
@@ -323,5 +323,5 @@ def test_attention_no_mask(glm, device):
         num_heads, qk_nope_dim, qk_rope_dim, v_head_dim,
         q_lora_rank, kv_lora_rank, hidden_size, eps)
 
-    torch.testing.assert_close(cuda_output.cpu(), ref_output.cpu(), atol=0.3, rtol=5e-2)
+    torch.testing.assert_close(cuda_output.cpu(), ref_output.cpu(), atol=0.1, rtol=5e-3)
     torch.testing.assert_close(cuda_q_resid.cpu(), ref_q_resid.cpu(), atol=5e-3, rtol=5e-3)

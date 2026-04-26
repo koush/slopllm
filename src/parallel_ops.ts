@@ -1047,6 +1047,18 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  setStream(_streamIdx: number): void {
+    // no-op: multi-stream dispatch handled at per-device level
+  }
+
+  eventRecord(_eventIdx: number, _streamIdx: number): void {
+    // no-op: multi-stream dispatch handled at per-device level
+  }
+
+  streamWaitEvent(_streamIdx: number, _eventIdx: number): void {
+    // no-op: multi-stream dispatch handled at per-device level
+  }
+
   private cast(tensor: Tensor): ParallelTensor {
     return tensor as ParallelTensor;
   }

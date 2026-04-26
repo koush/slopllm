@@ -186,7 +186,7 @@ void glm_gdn_recurrent_step(
 ) {
     cudaSetDevice(ctx->device_id);
     int smem_size = (2 * d_k + 3 * d_v + 128) * sizeof(float);
-    gdn_recurrent_step_kernel<<<batch_size * num_heads, 128, smem_size, ctx->stream>>>(
+    gdn_recurrent_step_kernel<<<batch_size * num_heads, 128, smem_size, GLM_STREAM(ctx)>>>(
         (nv_bfloat16*)output,
         (float*)state,
         (const nv_bfloat16*)qkv,
@@ -336,7 +336,7 @@ void glm_gdn_prefill(
 ) {
     cudaSetDevice(ctx->device_id);
     int smem_size = (2 * d_k + 3 * d_v + 128) * sizeof(float);
-    gdn_prefill_kernel<<<batch_size * num_heads, 128, smem_size, ctx->stream>>>(
+    gdn_prefill_kernel<<<batch_size * num_heads, 128, smem_size, GLM_STREAM(ctx)>>>(
         (nv_bfloat16*)output,
         (float*)state,
         (const nv_bfloat16*)qkv,
@@ -419,7 +419,7 @@ void glm_causal_conv1d(
     cudaSetDevice(ctx->device_id);
     int threads = 256;
     int blocks = (conv_dim * batch_size + threads - 1) / threads;
-    causal_conv1d_kernel<<<blocks, threads, 0, ctx->stream>>>(
+    causal_conv1d_kernel<<<blocks, threads, 0, GLM_STREAM(ctx)>>>(
         (nv_bfloat16*)output,
         (nv_bfloat16*)conv_state,
         (const nv_bfloat16*)input,
@@ -476,7 +476,7 @@ void glm_causal_conv1d_update(
     cudaSetDevice(ctx->device_id);
     int threads = 256;
     int blocks = (conv_dim * batch_size + threads - 1) / threads;
-    causal_conv1d_update_kernel<<<blocks, threads, 0, ctx->stream>>>(
+    causal_conv1d_update_kernel<<<blocks, threads, 0, GLM_STREAM(ctx)>>>(
         (nv_bfloat16*)output,
         (nv_bfloat16*)conv_state,
         (const nv_bfloat16*)input,
@@ -531,7 +531,7 @@ void glm_rmsnorm_gated(
 ) {
     cudaSetDevice(ctx->device_id);
     int smem_size = 128 * sizeof(float);
-    rmsnorm_gated_kernel<<<batch, 128, smem_size, ctx->stream>>>(
+    rmsnorm_gated_kernel<<<batch, 128, smem_size, GLM_STREAM(ctx)>>>(
         (nv_bfloat16*)output,
         (const nv_bfloat16*)input,
         (const nv_bfloat16*)gate,

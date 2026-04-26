@@ -776,6 +776,44 @@ static Napi::Value Synchronize(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value SetStream(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected (ctx, stream_idx)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    int stream_idx = info[1].As<Napi::Number>().Int32Value();
+    glm_set_stream(reinterpret_cast<GlmCtx*>(ctx_ptr), stream_idx);
+    return env.Undefined();
+}
+
+static Napi::Value EventRecord(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[1].IsNumber() || !info[2].IsNumber()) {
+        Napi::TypeError::New(env, "Expected (ctx, event_idx, stream_idx)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    int event_idx = info[1].As<Napi::Number>().Int32Value();
+    int stream_idx = info[2].As<Napi::Number>().Int32Value();
+    glm_event_record(reinterpret_cast<GlmCtx*>(ctx_ptr), event_idx, stream_idx);
+    return env.Undefined();
+}
+
+static Napi::Value StreamWaitEvent(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[1].IsNumber() || !info[2].IsNumber()) {
+        Napi::TypeError::New(env, "Expected (ctx, stream_idx, event_idx)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    int stream_idx = info[1].As<Napi::Number>().Int32Value();
+    int event_idx = info[2].As<Napi::Number>().Int32Value();
+    glm_stream_wait_event(reinterpret_cast<GlmCtx*>(ctx_ptr), stream_idx, event_idx);
+    return env.Undefined();
+}
+
 static Napi::Value ExpandDim1Strided(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 9) {
@@ -1661,6 +1699,9 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "memcpy"), Napi::Function::New(env, Memcpy));
     exports.Set(Napi::String::New(env, "kvCacheWrite"), Napi::Function::New(env, KvCacheWrite));
     exports.Set(Napi::String::New(env, "synchronize"), Napi::Function::New(env, Synchronize));
+    exports.Set(Napi::String::New(env, "setStream"), Napi::Function::New(env, SetStream));
+    exports.Set(Napi::String::New(env, "eventRecord"), Napi::Function::New(env, EventRecord));
+    exports.Set(Napi::String::New(env, "streamWaitEvent"), Napi::Function::New(env, StreamWaitEvent));
     exports.Set(Napi::String::New(env, "expandDim1Strided"), Napi::Function::New(env, ExpandDim1Strided));
     exports.Set(Napi::String::New(env, "flashPrefill"), Napi::Function::New(env, FlashPrefill));
     exports.Set(Napi::String::New(env, "flashDecode"), Napi::Function::New(env, FlashDecode));

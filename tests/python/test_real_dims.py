@@ -92,11 +92,13 @@ def test_dense_layer_real_dims(glm, device):
         input_layernorm_w, post_attn_layernorm_w,
         attn_weights, mlp_weights, "dense", EPS)
 
-    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.5, rtol=1e-1)
+    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.1, rtol=5e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_moe_layer_real_dims(glm, device):
+    num_distinct_experts = 32
+
     B, S = 1, 4
     idx_topk = min(IDX_TOPK, S)
     idx_softmax_scale = IDX_HEAD_DIM ** -0.5
@@ -146,12 +148,12 @@ def test_moe_layer_real_dims(glm, device):
     gate_weight = torch.randn(N_ROUTED_EXPERTS, HIDDEN, dtype=torch.bfloat16, device=device)
     e_score_correction_bias = torch.randn(N_ROUTED_EXPERTS, dtype=torch.bfloat16, device=device)
 
-    expert_gate = torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device)
-    expert_up = torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device)
-    expert_down = torch.randn(HIDDEN, MOE_INTER, dtype=torch.bfloat16, device=device)
-    expert_gates = [expert_gate] * N_ROUTED_EXPERTS
-    expert_ups = [expert_up] * N_ROUTED_EXPERTS
-    expert_downs = [expert_down] * N_ROUTED_EXPERTS
+    pool_gates = [torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device) for _ in range(num_distinct_experts)]
+    pool_ups = [torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device) for _ in range(num_distinct_experts)]
+    pool_downs = [torch.randn(HIDDEN, MOE_INTER, dtype=torch.bfloat16, device=device) for _ in range(num_distinct_experts)]
+    expert_gates = [pool_gates[i % num_distinct_experts] for i in range(N_ROUTED_EXPERTS)]
+    expert_ups = [pool_ups[i % num_distinct_experts] for i in range(N_ROUTED_EXPERTS)]
+    expert_downs = [pool_downs[i % num_distinct_experts] for i in range(N_ROUTED_EXPERTS)]
 
     shared_gate_w = torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device)
     shared_up_w = torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device)
@@ -175,4 +177,4 @@ def test_moe_layer_real_dims(glm, device):
         input_layernorm_w, post_attn_layernorm_w,
         attn_weights, mlp_weights, "sparse", EPS)
 
-    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.5, rtol=1e-1)
+    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.1, rtol=5e-3)

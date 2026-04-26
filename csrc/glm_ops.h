@@ -10,13 +10,19 @@
 extern "C" {
 #endif
 
+#define GLM_MAX_STREAMS 8
+
 struct GlmCtx {
     int device_id;
-    cudaStream_t stream;
+    cudaStream_t streams[GLM_MAX_STREAMS];
+    int active_stream;
+    cudaEvent_t events[GLM_MAX_STREAMS];
     void* cublas_handle;
 };
 
 typedef struct GlmCtx GlmCtx;
+
+#define GLM_STREAM(ctx) ((ctx)->streams[(ctx)->active_stream])
 
 GlmCtx* glm_init(int device_id);
 void glm_free(GlmCtx* ctx);
@@ -191,6 +197,12 @@ void glm_kv_cache_write(GlmCtx* ctx,
                          uint32_t src_v_token_stride, uint32_t src_v_head_stride);
 
 void glm_synchronize(GlmCtx* ctx);
+
+void glm_set_stream(GlmCtx* ctx, int stream_idx);
+
+void glm_event_record(GlmCtx* ctx, int event_idx, int stream_idx);
+
+void glm_stream_wait_event(GlmCtx* ctx, int stream_idx, int event_idx);
 
 void glm_flash_prefill(
     GlmCtx* ctx,

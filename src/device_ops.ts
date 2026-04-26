@@ -18,6 +18,9 @@ export interface DeviceOps {
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined): Tensor;
   synchronize(): void;
+  setStream(streamIdx: number): void;
+  eventRecord(eventIdx: number, streamIdx: number): void;
+  streamWaitEvent(streamIdx: number, eventIdx: number): void;
 
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
 
