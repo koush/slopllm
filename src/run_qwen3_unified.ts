@@ -192,6 +192,7 @@ export function* generateStream(
         glm.graphBeginCapture();
       }
 
+      ws.forwardInput(state);
       logits = model.forward(state);
 
       if (useGraph && greedy && capturing) {

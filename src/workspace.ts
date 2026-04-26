@@ -55,7 +55,7 @@ export class WorkspaceBase implements Disposable {
     if (best !== undefined) {
       this.disposed.delete(best);
       const data = best.data;
-      (best as { data: number }).data = 0;
+      best.detachData();
       const tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned, undefined);
       this.tracked.add(tensor);
       return tensor;

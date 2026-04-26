@@ -50,6 +50,7 @@ export function* generateTokens(
 
     if (sampling) {
       const state = ws.planDecode(model, [nextToken], cache);
+      ws.forwardInput(state);
       const logits = model.forward(state);
       nextToken = logits.sampleTokenGPU(sampling, tokenHistory).readInt32LE()[0];
     } else {

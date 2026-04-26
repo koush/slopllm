@@ -16,6 +16,7 @@ export interface BatchState {
   readonly isDecode: boolean;
   readonly ws: ExecutionWorkspace;
   readonly cache: ChatCache;
+  readonly qoIndptrHost?: Tensor;
 }
 
 function longestPrefix(a: number[], b: number[]): number {
@@ -68,7 +69,20 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.lastPageLenH = this.allocPinned([B], "I32", "lastPageLenH");
   }
 
+  forwardInput(state: BatchState): void {
+    if (state.isDecode) {
+      const batchSize = state.batchSize;
+      this.inputIdsBuf.memcpy(this.inputIdsBufH, batchSize * I32, MemcpyKind.HostToDevice);
+      this.slotMapping.memcpy(this.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
+      this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
+    }
+  }
+
   flashDecode(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
+    pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
+    this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
+
     const out = this.alloc([batchSize, nHeads, 1, hd], query.type, undefined, query.parallelism);
     this.glm.batchDecodeRun(
       query, out,
@@ -81,7 +95,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  flashPrefillPaged(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): Tensor {
+  flashPrefillPaged(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number, qoIndptrHost?: Tensor): Tensor {
+    pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
+    this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
+    if (qoIndptrHost) {
+      this.qoIndptrD.memcpy(qoIndptrHost, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    }
+
     const out = this.alloc([1, nHeads, totalTokens, hd], query.type, undefined, query.parallelism);
     this.glm.batchPrefillPagedRun(
       query, out,
@@ -142,7 +163,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
           }
         }
       });
-      this.inputIdsBuf.memcpy(this.inputIdsBufH, batchSize * I32, MemcpyKind.HostToDevice);
       const writeLocations: [number, number][] = [];
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
         writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
@@ -156,14 +176,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
           buf.writeInt32LE(absPage * pageSize + slotInPage, seqIdx * I32);
         }
       });
-      this.slotMapping.memcpy(this.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
 
       this.positionIdsH.withPinnedBuffer(buf => {
         for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
           buf.writeInt32LE(pagedKV.seqKvLens[seqIdx] - 1, seqIdx * I32);
         }
       });
-      this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
 
       this.glm.batchDecodePlan(
         this.floatWs, BATCH_FLOAT_WS_SIZE,
@@ -196,7 +214,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);
     }
 
-    using qoIndptrHost = this.allocPinned([(batchSize + 1)], "I32");
+    const qoIndptrHost = this.allocPinned([(batchSize + 1)], "I32");
     qoIndptrHost.withPinnedBuffer(buf => {
       buf.writeInt32LE(0, 0);
       for (let i = 0; i < batchSize; i++) {
@@ -235,8 +253,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
       1
     );
 
-    this.qoIndptrD.memcpy(qoIndptrHost, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-
     const slotMappingBuf = Buffer.alloc(totalTokens * I32);
     let slotOff = 0;
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -252,7 +268,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
     this.slotMapping.h2d(slotMappingBuf);
 
-    return { batchSize, totalTokens, seqLens, isDecode: false, ws: this, cache };
+    return { batchSize, totalTokens, seqLens, isDecode: false, ws: this, cache, qoIndptrHost };
   }
 
   planDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache, enableCudaGraph = false): BatchState {
@@ -261,12 +277,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
   forwardEager(model: ChatModel, inputIdsList: number[][], cache: ChatCache): number[] {
     const state = this.plan(model, inputIdsList, cache);
+    this.forwardInput(state);
     const logits = model.forward(state);
     using argmaxResult = logits.argmax();
     return argmaxResult.readInt32LE();
   }
 
   forwardDecode(model: ChatModel, state: BatchState): Tensor {
+    this.forwardInput(state);
     return model.forward(state);
   }
 
@@ -440,8 +458,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
         }
       }
     });
-    this.indices.memcpy(this.indicesH, this.numPagesUsed * I32, MemcpyKind.HostToDevice);
-    ws.indptrD.memcpy(ws.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
 
     ws.lastPageLenH.withPinnedBuffer(buf => {
       for (let i = 0; i < batchSize; i++) {
@@ -450,6 +466,5 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
         buf.writeInt32LE(remainder !== 0 ? remainder : (kvLen > 0 ? this.pageSize : 0), i * I32);
       }
     });
-    ws.lastPageLen.memcpy(ws.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
   }
 }

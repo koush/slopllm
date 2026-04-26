@@ -195,7 +195,7 @@ export class Qwen3Model extends ChatModel {
       } else {
         const qStrideN = hd;
         const qStrideH = totalTokens * hd;
-        flashOut.replace(ws.flashPrefillPaged(qRope, pagedKV, i, totalTokens, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
+        flashOut.replace(ws.flashPrefillPaged(qRope, pagedKV, i, totalTokens, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling, state.qoIndptrHost));
       }
 
       using reshapedFlashOut = flashOut.value.reshape([BS, nHeads * hd]);

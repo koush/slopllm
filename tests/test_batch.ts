@@ -195,6 +195,7 @@ describe("Qwen3-0.6B batch tests", () => {
     pagedKV.updateIndptr(gws);
 
     const stateRef = gws.planDecode(model, [tokens[0]], pagedKV, true);
+    gws.forwardInput(stateRef);
     const logitsRef = model.forward(stateRef);
     using argmaxRef = logitsRef.argmax();
     const tokensRef = argmaxRef.readInt32LE();
@@ -205,6 +206,7 @@ describe("Qwen3-0.6B batch tests", () => {
     const state = gws.planDecode(model, [tokens2[0]], pagedKV, true);
 
     glm.graphBeginCapture();
+    gws.forwardInput(state);
     const captureLogits = model.forward(state);
     const captureArgmax = captureLogits.argmax();
     const graph = glm.graphEndCapture();
@@ -242,6 +244,7 @@ describe("Qwen3-0.6B batch tests", () => {
     let current = tokens[0];
     for (let step = 0; step < numSteps; step++) {
       const state = gws.planDecode(model, [current], pagedKV, true);
+      gws.forwardInput(state);
       const logits = model.forward(state);
       using argmaxResult = logits.argmax();
       current = argmaxResult.readInt32LE()[0];
@@ -254,6 +257,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     current = tokens[0];
     const warmupState = gws.planDecode(model, [current], pagedKV, true);
+    gws.forwardInput(warmupState);
     const warmupLogits = model.forward(warmupState);
     using warmupArgmax = warmupLogits.argmax();
     current = warmupArgmax.readInt32LE()[0];
@@ -261,6 +265,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     const state = gws.planDecode(model, [current], pagedKV, true);
     glm.graphBeginCapture();
+    gws.forwardInput(state);
     const captureLogits = model.forward(state);
     const captureArgmax = captureLogits.argmax();
     const graph = glm.graphEndCapture();
@@ -303,6 +308,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     pagedKV.reset(1);
     const state = ws.plan(model, [PROMPT_GRAPH], pagedKV);
+    ws.forwardInput(state);
     const logits = model.forward(state);
     using argmaxOut = logits.argmax();
     const tokens = argmaxOut.readInt32LE();
@@ -332,6 +338,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     pagedKV.reset(2);
     const state = ws.plan(model, [PROMPT1, PROMPT2], pagedKV);
+    ws.forwardInput(state);
     const logits = model.forward(state);
     using argmaxOut2 = logits.argmax();
     const tokens = argmaxOut2.readInt32LE();
