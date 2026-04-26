@@ -410,7 +410,7 @@ export class Qwen35Model extends ChatModel {
     } else {
       const qStrideN = hd;
       const qStrideH = BS * hd;
-      flashOut.replace(ws.flashPrefillPaged(qRope, pagedKV, cacheIdx, BS, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling, state.qoIndptrHost));
+      flashOut.replace(ws.flashPrefillPaged(qRope, pagedKV, cacheIdx, BS, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
     }
 
     if (cfg.attnOutputGate) {

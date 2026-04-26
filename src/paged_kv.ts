@@ -70,19 +70,23 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   forwardInput(state: BatchState): void {
-    if (state.isDecode) {
-      const batchSize = state.batchSize;
-      this.inputIdsBuf.memcpy(this.inputIdsBufH, batchSize * I32, MemcpyKind.HostToDevice);
-      this.slotMapping.memcpy(this.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
-      this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
-    }
-  }
+    const pagedKV = state.cache.getPagedKV();
+    const batchSize = state.batchSize;
 
-  flashDecode(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
     pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
     this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
 
+    if (state.isDecode) {
+      this.inputIdsBuf.memcpy(this.inputIdsBufH, batchSize * I32, MemcpyKind.HostToDevice);
+      this.slotMapping.memcpy(this.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
+      this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
+    } else if (state.qoIndptrHost) {
+      this.qoIndptrD.memcpy(state.qoIndptrHost, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    }
+  }
+
+  flashDecode(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
     const out = this.alloc([batchSize, nHeads, 1, hd], query.type, undefined, query.parallelism);
     this.glm.batchDecodeRun(
       query, out,
@@ -95,14 +99,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  flashPrefillPaged(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number, qoIndptrHost?: Tensor): Tensor {
-    pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
-    this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-    this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
-    if (qoIndptrHost) {
-      this.qoIndptrD.memcpy(qoIndptrHost, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-    }
-
+  flashPrefillPaged(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): Tensor {
     const out = this.alloc([1, nHeads, totalTokens, hd], query.type, undefined, query.parallelism);
     this.glm.batchPrefillPagedRun(
       query, out,
