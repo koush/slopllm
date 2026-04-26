@@ -73,7 +73,7 @@ export class ParallelTensor extends Tensor {
         } else {
           this.devices[i].freeBuf(shard);
         }
-        (shard as { data: number }).data = 0;
+        shard.detachData();
       }
     }
   }
@@ -856,9 +856,9 @@ export class ParallelTensor extends Tensor {
     throw new Error(`mmapLoad: unsupported parallelism ${this.parallelism}`);
   }
 
-  writePinned(src: Buffer, size?: number): void {
+  withPinnedBuffer(fn: (buf: Buffer) => void): void {
     for (let i = 0; i < this.shards.length; i++) {
-      this.devices[i].writePinned(this.shards[i], src, size);
+      this.shards[i].withPinnedBuffer(fn);
     }
   }
 

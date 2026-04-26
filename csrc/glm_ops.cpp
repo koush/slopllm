@@ -979,17 +979,15 @@ static Napi::Value FreePinned(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value WritePinned(const Napi::CallbackInfo& info) {
+static Napi::Value HostPointerToBuffer(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 3) {
-        Napi::TypeError::New(env, "Expected (dst, src_buffer, size)").ThrowAsJavaScriptException();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ptr, size)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    uintptr_t dst = info[0].As<Napi::Number>().Int64Value();
-    auto src_buf = info[1].As<Napi::Buffer<uint8_t>>();
-    size_t size = info[2].As<Napi::Number>().Uint32Value();
-    glm_write_pinned(reinterpret_cast<void*>(dst), src_buf.Data(), size);
-    return env.Undefined();
+    uintptr_t ptr = info[0].As<Napi::Number>().Int64Value();
+    size_t size = info[1].As<Napi::Number>().Int64Value();
+    return Napi::Buffer<uint8_t>::New(env, reinterpret_cast<uint8_t*>(ptr), size);
 }
 
 static Napi::Value BatchDecodePlan(const Napi::CallbackInfo& info) {
@@ -1710,7 +1708,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "mmapClose"), Napi::Function::New(env, MmapClose));
     exports.Set(Napi::String::New(env, "allocPinned"), Napi::Function::New(env, AllocPinned));
     exports.Set(Napi::String::New(env, "freePinned"), Napi::Function::New(env, FreePinned));
-    exports.Set(Napi::String::New(env, "writePinned"), Napi::Function::New(env, WritePinned));
+    exports.Set(Napi::String::New(env, "hostPointerToBuffer"), Napi::Function::New(env, HostPointerToBuffer));
     exports.Set(Napi::String::New(env, "batchDecodePlan"), Napi::Function::New(env, BatchDecodePlan));
     exports.Set(Napi::String::New(env, "batchDecodeRun"), Napi::Function::New(env, BatchDecodeRun));
     exports.Set(Napi::String::New(env, "batchPrefillPagedPlan"), Napi::Function::New(env, BatchPrefillPagedPlan));

@@ -1,5 +1,6 @@
 import { type SamplingParams } from "./chat_model";
 import { TensorParallelism } from "./device_ops";
+import { getNativeAddon } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { WorkspaceBase } from "./workspace";
 
@@ -17,8 +18,10 @@ function numElements(shape: number[]): number {
 
 export abstract class Tensor implements Disposable {
   parallelism: TensorParallelism = TensorParallelism.Replicated;
+  private pinnedBuffer?: Buffer;
+
   constructor(public readonly workspace: WorkspaceBase,
-    public data: number,
+    public readonly data: number,
     public readonly allocSize: number,
     public readonly shape: number[],
     public readonly type: string,
@@ -40,6 +43,22 @@ export abstract class Tensor implements Disposable {
 
   get bytes(): number {
     return Math.ceil(numElements(this.shape) * SafeTensorFile.dtypeBytes(this.type));
+  }
+
+  withPinnedBuffer(fn: (buf: Buffer) => void) {
+    if (!this.pinned) {
+      throw new Error("Tensor is not pinned");
+    }
+    if (this.data === 0) {
+      throw new Error("Tensor has no data");
+    }
+    this.pinnedBuffer ||= getNativeAddon().hostPointerToBuffer(this.data, this.allocSize);
+    fn(this.pinnedBuffer);
+  }
+
+  detachData() {
+    (this as { data: number }).data = 0;
+    this.pinnedBuffer = undefined;
   }
 
   reshape(newShape: number[]): Tensor {
@@ -202,7 +221,6 @@ export abstract class Tensor implements Disposable {
 
   abstract fill(value: number, n: number): void;
   abstract mmapLoad(mmapPtr: number, offset: number, nbytes: number, gdnQkvLayout?: import("./device_ops").GdnQkvLayout): void;
-  abstract writePinned(src: Buffer, size?: number): void;
   abstract memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void;
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     if (positionIds.type !== "I32") throw new Error(`rotaryEmbedding: positionIds must be I32, got ${positionIds.type}`);

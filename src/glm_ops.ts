@@ -66,7 +66,7 @@ interface NativeAddon {
   streamWaitEvent(ctx: number, streamIdx: number, eventIdx: number): void;
   allocPinned(bytes: number): number;
   freePinned(ptr: number): void;
-  writePinned(dst: number, src: Buffer, size: number): void;
+  hostPointerToBuffer(ptr: number, size: number): Buffer;
   batchDecodePlan(ctx: number, floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, indptrH: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, enableCudaGraph: boolean): void;
   batchDecodeRun(ctx: number, q: number, o: number, kData: number, vData: number, indices: number, indptrD: number, lastPageLen: number, floatWs: number, intWs: number, planInfo: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, smScale: number): void;
   batchPrefillPagedPlan(ctx: number, floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, qoIndptrH: number, pagedKvIndptrH: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, maskMode: number): void;
@@ -111,7 +111,7 @@ export class GlmTensor extends Tensor {
       } else {
         getNativeAddon().freeBuf(this.glm.ctx, this.data);
       }
-      (this as { data: number }).data = 0;
+      this.detachData();
     }
   }
 
@@ -251,10 +251,6 @@ export class GlmTensor extends Tensor {
     getNativeAddon().mmapLoad(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
   }
 
-  writePinned(src: Buffer, size?: number): void {
-    getNativeAddon().writePinned(this.data, src, size ?? src.length);
-  }
-
   memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {
     if (!(src instanceof GlmTensor)) {
       throw new Error("GlmTensor.memcpy requires GlmTensor source");
@@ -389,8 +385,8 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().freePinned(ptr.data);
   }
 
-  writePinned(dst: Tensor, src: Buffer, size?: number): void {
-    getNativeAddon().writePinned(dst.data, src, size ?? src.length);
+  hostPointerToBuffer(ptr: number, size: number): Buffer {
+    return getNativeAddon().hostPointerToBuffer(ptr, size);
   }
 
   batchDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, enableCudaGraph: boolean): void {

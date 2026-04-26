@@ -113,7 +113,7 @@ describe("memcpy2d", () => {
     const hostBuf = f32ToBf16Bytes(srcF32);
     const hostPtr = glm.allocPinned(hostBuf.length);
     const hostTensor = new GlmTensor(ws, glm, hostPtr, hostBuf.length, [hostBuf.length], "U8", undefined, true, undefined);
-    glm.writePinned(hostTensor, hostBuf);
+    hostTensor.withPinnedBuffer(buf => buf.set(hostBuf));
 
     const dstGpu = ws.alloc([rows * shardCols * elemBytes], "U8");
     const dpitch = shardCols * elemBytes;
@@ -173,7 +173,7 @@ describe("NCCL single-rank", () => {
     getNativeAddon().ncclUniqueId(idBuf);
     const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
     const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
-    glm.writePinned(idTensor, idBuf);
+    idTensor.withPinnedBuffer(buf => buf.set(idBuf));
 
     const comm = getNativeAddon().ncclCommInitRank(0, 0, 1, idPtr);
     assert.ok(comm !== 0, "comm should not be null");
@@ -187,7 +187,7 @@ describe("NCCL single-rank", () => {
     getNativeAddon().ncclUniqueId(idBuf);
     const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
     const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
-    glm.writePinned(idTensor, idBuf);
+    idTensor.withPinnedBuffer(buf => buf.set(idBuf));
 
     const comm = getNativeAddon().ncclCommInitRank(0, 0, 1, idPtr);
 
@@ -224,7 +224,7 @@ describe("NCCL single-rank", () => {
     getNativeAddon().ncclUniqueId(idBuf);
     const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
     const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
-    glm.writePinned(idTensor, idBuf);
+    idTensor.withPinnedBuffer(buf => buf.set(idBuf));
 
     const comm = getNativeAddon().ncclCommInitRank(0, 0, 1, idPtr);
 
@@ -261,7 +261,7 @@ describe("NCCL single-rank", () => {
     getNativeAddon().ncclUniqueId(idBuf);
     const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
     const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
-    glm.writePinned(idTensor, idBuf);
+    idTensor.withPinnedBuffer(buf => buf.set(idBuf));
 
     const comm = getNativeAddon().ncclCommInitRank(0, 0, 1, idPtr);
 

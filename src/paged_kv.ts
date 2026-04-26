@@ -132,12 +132,16 @@ export class ExecutionWorkspace extends WorkspaceBase {
       throw new Error(`plan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
     }
 
-    const allIds: number[] = [];
-    for (const ids of inputIdsList) allIds.push(...ids);
-    const idsBuf = Int32Array.from(allIds);
-
     if (isDecode) {
-      this.inputIdsBufH.writePinned(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+      this.inputIdsBufH.withPinnedBuffer(buf => {
+        let idsOff = 0;
+        for (const ids of inputIdsList) {
+          for (const id of ids) {
+            buf.writeInt32LE(id, idsOff);
+            idsOff += I32;
+          }
+        }
+      });
       this.inputIdsBuf.memcpy(this.inputIdsBufH, batchSize * I32, MemcpyKind.HostToDevice);
       const writeLocations: [number, number][] = [];
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -146,20 +150,19 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
       pagedKV.updateIndptr(this);
 
-      const slotMappingBuf = new Int32Array(batchSize);
-      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-        const [absPage, slotInPage] = writeLocations[seqIdx];
-        slotMappingBuf[seqIdx] = absPage * pageSize + slotInPage;
-      }
-      this.slotMappingH.writePinned(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+      this.slotMappingH.withPinnedBuffer(buf => {
+        for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+          const [absPage, slotInPage] = writeLocations[seqIdx];
+          buf.writeInt32LE(absPage * pageSize + slotInPage, seqIdx * I32);
+        }
+      });
       this.slotMapping.memcpy(this.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
 
-      const posIds = new Array(batchSize);
-      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-        posIds[seqIdx] = pagedKV.seqKvLens[seqIdx] - 1;
-      }
-      const posIdsBuf = Int32Array.from(posIds);
-      this.positionIdsH.writePinned(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+      this.positionIdsH.withPinnedBuffer(buf => {
+        for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+          buf.writeInt32LE(pagedKV.seqKvLens[seqIdx] - 1, seqIdx * I32);
+        }
+      });
       this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
 
       this.glm.batchDecodePlan(
@@ -175,7 +178,15 @@ export class ExecutionWorkspace extends WorkspaceBase {
       return { batchSize, totalTokens, seqLens, isDecode: true, ws: this, cache };
     }
 
-    this.inputIdsBuf.h2d(Buffer.from(idsBuf.buffer, idsBuf.byteOffset, idsBuf.byteLength));
+    const inputIdsBuf = Buffer.alloc(totalTokens * I32);
+    let idsOff = 0;
+    for (const ids of inputIdsList) {
+      for (const id of ids) {
+        inputIdsBuf.writeInt32LE(id, idsOff);
+        idsOff += I32;
+      }
+    }
+    this.inputIdsBuf.h2d(inputIdsBuf);
 
     const startPos = pagedKV.seqKvLens.slice();
 
@@ -185,34 +196,33 @@ export class ExecutionWorkspace extends WorkspaceBase {
       pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);
     }
 
-    const qoIndptr = [0];
-    for (const s of seqLens) {
-      qoIndptr.push(qoIndptr[qoIndptr.length - 1] + s);
-    }
-    const qoIndptrBuf = Int32Array.from(qoIndptr);
+    using qoIndptrHost = this.allocPinned([(batchSize + 1)], "I32");
+    qoIndptrHost.withPinnedBuffer(buf => {
+      buf.writeInt32LE(0, 0);
+      for (let i = 0; i < batchSize; i++) {
+        buf.writeInt32LE(buf.readInt32LE(i * I32) + seqLens[i], (i + 1) * I32);
+      }
+    });
 
     pagedKV.updateIndptr(this);
 
-    const posIds: number[] = [];
+    const positionIdsBuf = Buffer.alloc(totalTokens * I32);
+    let posOff = 0;
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       for (let p = 0; p < seqLens[seqIdx]; p++) {
-        posIds.push(startPos[seqIdx] + p);
+        positionIdsBuf.writeInt32LE(startPos[seqIdx] + p, posOff * I32);
+        posOff++;
       }
     }
-    const posIdsBuf = Int32Array.from(posIds);
-    this.positionIds.h2d(Buffer.from(posIdsBuf.buffer, posIdsBuf.byteOffset, posIdsBuf.byteLength));
+    this.positionIds.h2d(positionIdsBuf);
 
-    const lastIndices: number[] = [];
-    let offset = 0;
+    const lastIdxBuf = Buffer.alloc(batchSize * I32);
+    let lastOff = 0;
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      lastIndices.push(offset + seqLens[seqIdx] - 1);
-      offset += seqLens[seqIdx];
+      lastIdxBuf.writeInt32LE(lastOff + seqLens[seqIdx] - 1, seqIdx * I32);
+      lastOff += seqLens[seqIdx];
     }
-    const lastIdxBuf = Int32Array.from(lastIndices);
-    this.lastIdx.h2d(Buffer.from(lastIdxBuf.buffer, lastIdxBuf.byteOffset, lastIdxBuf.byteLength));
-
-    using qoIndptrHost = this.allocPinned([(batchSize + 1)], "I32");
-    qoIndptrHost.writePinned(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+    this.lastIdx.h2d(lastIdxBuf);
 
     this.glm.batchPrefillPagedPlan(
       this.floatWs, BATCH_FLOAT_WS_SIZE,
@@ -225,9 +235,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
       1
     );
 
-    this.qoIndptrD.h2d(Buffer.from(qoIndptrBuf.buffer, qoIndptrBuf.byteOffset, qoIndptrBuf.byteLength));
+    this.qoIndptrD.memcpy(qoIndptrHost, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
 
-    const slotMapping: number[] = [];
+    const slotMappingBuf = Buffer.alloc(totalTokens * I32);
+    let slotOff = 0;
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       const pages = pagedKV.seqPages[seqIdx];
       for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
@@ -235,11 +246,11 @@ export class ExecutionWorkspace extends WorkspaceBase {
         const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
         const offsetInPage = kvPos % pagedKV.pageSize;
         const absPage = pages[pageIdxInSeq];
-        slotMapping.push(absPage * pagedKV.pageSize + offsetInPage);
+        slotMappingBuf.writeInt32LE(absPage * pagedKV.pageSize + offsetInPage, slotOff * I32);
+        slotOff++;
       }
     }
-    const slotMappingBuf = Int32Array.from(slotMapping);
-    this.slotMapping.h2d(Buffer.from(slotMappingBuf.buffer, slotMappingBuf.byteOffset, slotMappingBuf.byteLength));
+    this.slotMapping.h2d(slotMappingBuf);
 
     return { batchSize, totalTokens, seqLens, isDecode: false, ws: this, cache };
   }
@@ -411,30 +422,34 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
   updateIndptr(ws: ExecutionWorkspace): void {
     const batchSize = this.seqPages.length;
-    const indptr = new Array(batchSize + 1).fill(0);
-    for (let i = 0; i < batchSize; i++) {
-      indptr[i + 1] = indptr[i] + this.seqPages[i].length;
-    }
-    const allIndices: number[] = [];
-    for (let i = 0; i < batchSize; i++) {
-      allIndices.push(...this.seqPages[i]);
-    }
-    const indicesBuf = Int32Array.from(allIndices);
-    const indptrBuf = Int32Array.from(indptr);
+    ws.indptrH.withPinnedBuffer(buf => {
+      buf.writeInt32LE(0, 0);
+      let cumulative = 0;
+      for (let i = 0; i < batchSize; i++) {
+        cumulative += this.seqPages[i].length;
+        buf.writeInt32LE(cumulative, (i + 1) * I32);
+      }
+    });
 
-    const lastPageLenList = new Array(batchSize);
-    for (let i = 0; i < batchSize; i++) {
-      const kvLen = this.seqKvLens[i];
-      const remainder = kvLen % this.pageSize;
-      lastPageLenList[i] = remainder !== 0 ? remainder : (kvLen > 0 ? this.pageSize : 0);
-    }
-    const lastPageLenBuf = Int32Array.from(lastPageLenList);
-
-    ws.indptrH.writePinned(Buffer.from(indptrBuf.buffer, indptrBuf.byteOffset, indptrBuf.byteLength));
-    this.indicesH.writePinned(Buffer.from(indicesBuf.buffer, indicesBuf.byteOffset, indicesBuf.byteLength));
+    this.indicesH.withPinnedBuffer(buf => {
+      let indicesOff = 0;
+      for (let i = 0; i < batchSize; i++) {
+        for (const page of this.seqPages[i]) {
+          buf.writeInt32LE(page, indicesOff * I32);
+          indicesOff++;
+        }
+      }
+    });
     this.indices.memcpy(this.indicesH, this.numPagesUsed * I32, MemcpyKind.HostToDevice);
     ws.indptrD.memcpy(ws.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-    ws.lastPageLenH.writePinned(Buffer.from(lastPageLenBuf.buffer, lastPageLenBuf.byteOffset, lastPageLenBuf.byteLength));
+
+    ws.lastPageLenH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        const kvLen = this.seqKvLens[i];
+        const remainder = kvLen % this.pageSize;
+        buf.writeInt32LE(remainder !== 0 ? remainder : (kvLen > 0 ? this.pageSize : 0), i * I32);
+      }
+    });
     ws.lastPageLen.memcpy(ws.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
   }
 }
