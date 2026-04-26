@@ -132,8 +132,9 @@ export class Qwen3Model extends ChatModel {
   }
 
   private mlp(normed: Tensor, BS: number, pfx: string): Tensor {
+    const syncUp = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS));
     using gateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS);
-    using upBuf = normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS);
+    using upBuf = syncUp();
     using siluBuf = gateBuf.siluAndMul(gateBuf, upBuf, this.cfg.intermediateSize, BS);
     return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
   }
@@ -144,12 +145,13 @@ export class Qwen3Model extends ChatModel {
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
 
+    const syncK = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS));
+    const syncV = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!, BS));
     using qBuf = normed.linear(this.tensors.get(`${pfx}.self_attn.q_proj.weight`)!, BS);
-    using kBuf = normed.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS);
-    const vBuf = normed.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!, BS);
-
     const qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
+    using kBuf = syncK();
     const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
+    const vBuf = syncV();
     return { qRope, kRope, vBuf };
   }
 
