@@ -25,7 +25,7 @@
       "actions": [
         {
           "action_name": "build_libglm",
-          "inputs": [ "Makefile", "csrc/glm_ops.cu", "csrc/glm_flash.cu", "csrc/glm_fp8.cu", "csrc/glm_gdn.cu", "csrc/glm_sampling.cu", "csrc/glm_nccl.cpp", "csrc/glm_device.cpp" ],
+          "inputs": [ "Makefile", "csrc/glm_ops.cu", "csrc/glm_flash.cu", "csrc/glm_gemv.cu", "csrc/glm_gdn.cu", "csrc/glm_sampling.cu", "csrc/glm_nccl.cpp", "csrc/glm_device.cpp" ],
           "outputs": [ "<(PRODUCT_DIR)/libglm_ops.so" ],
           "action": [
             "make", "-j", "<!@(nproc)"

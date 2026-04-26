@@ -1,7 +1,10 @@
 #include "glm_ops.h"
 
+#include <cublas_v2.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+
+#define CUBLAS(ctx) (*reinterpret_cast<cublasHandle_t*>(&(ctx)->cublas_handle))
 
 namespace {
 
@@ -198,6 +201,129 @@ void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
             weight_scale,
             m, n, k);
     }
+}
+
+// ---------------------------------------------------------------------------
+// BF16 GEMV kernel: optimized for M=1 (single-token decode)
+// Each warp computes one output element. Input tiles are cooperatively loaded
+// into shared memory to avoid redundant global reads across warps in a block.
+// ---------------------------------------------------------------------------
+
+constexpr int BF16_GEMV_WARP_SIZE = 32;
+constexpr int BF16_GEMV_ROWS_PER_BLOCK = 4;
+constexpr int BF16_GEMV_BLOCK_SIZE = BF16_GEMV_ROWS_PER_BLOCK * BF16_GEMV_WARP_SIZE;
+constexpr int BF16_GEMV_K_TILE = 128;
+
+__global__ void __launch_bounds__(BF16_GEMV_BLOCK_SIZE, 8)
+bf16_gemv_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    int M, int N, int K) {
+
+    int num_row_groups = (N + BF16_GEMV_ROWS_PER_BLOCK - 1) / BF16_GEMV_ROWS_PER_BLOCK;
+    int m = blockIdx.x / num_row_groups;
+    int row_group = blockIdx.x % num_row_groups;
+    int row = row_group * BF16_GEMV_ROWS_PER_BLOCK + threadIdx.x / BF16_GEMV_WARP_SIZE;
+    int lane = threadIdx.x % BF16_GEMV_WARP_SIZE;
+
+    bool valid = m < M && row < N;
+
+    __shared__ __nv_bfloat16 smem_input[BF16_GEMV_K_TILE];
+
+    const __nv_bfloat16* input_row = input + (size_t)m * K;
+    const __nv_bfloat16* weight_row = weight + (size_t)row * K;
+
+    float sum = 0.0f;
+
+    int num_k_tiles = K / BF16_GEMV_K_TILE;
+    int remaining_start = num_k_tiles * BF16_GEMV_K_TILE;
+
+    for (int kb = 0; kb < num_k_tiles; kb++) {
+        int k_start = kb * BF16_GEMV_K_TILE;
+
+        for (int i = threadIdx.x; i < BF16_GEMV_K_TILE; i += BF16_GEMV_BLOCK_SIZE) {
+            smem_input[i] = input_row[k_start + i];
+        }
+        __syncthreads();
+
+        if (valid) {
+            #pragma unroll
+            for (int ki = lane; ki < BF16_GEMV_K_TILE; ki += BF16_GEMV_WARP_SIZE) {
+                float w_val = __bfloat162float(weight_row[k_start + ki]);
+                float x_val = __bfloat162float(smem_input[ki]);
+                sum += w_val * x_val;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    int remaining = K - remaining_start;
+    if (remaining > 0) {
+        for (int i = threadIdx.x; i < remaining; i += BF16_GEMV_BLOCK_SIZE) {
+            smem_input[i] = input_row[remaining_start + i];
+        }
+        __syncthreads();
+
+        if (valid) {
+            for (int k = remaining_start + lane; k < K; k += BF16_GEMV_WARP_SIZE) {
+                int ki = k - remaining_start;
+                float w_val = __bfloat162float(weight_row[k]);
+                float x_val = __bfloat162float(smem_input[ki]);
+                sum += w_val * x_val;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (valid) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        }
+        if (lane == 0) {
+            output[(size_t)m * N + row] = __float2bfloat16(sum);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linear (BF16 GEMM via cuBLAS, or custom GEMV for M=1 decode)
+//   out = input @ weight.T
+//   input:  [batch, k]  row-major BF16
+//   weight: [n, k]      row-major BF16
+//   out:    [batch, n]  row-major BF16
+// ---------------------------------------------------------------------------
+
+void glm_linear(GlmCtx* ctx, void* out, const void* input,
+                const void* weight, int batch, int n, int k) {
+    cudaSetDevice(ctx->device_id);
+
+    if (batch == 1) {
+        int num_row_groups = (n + BF16_GEMV_ROWS_PER_BLOCK - 1) / BF16_GEMV_ROWS_PER_BLOCK;
+        int grid_size = batch * num_row_groups;
+        bf16_gemv_kernel<<<grid_size, BF16_GEMV_BLOCK_SIZE, 0, ctx->stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(out),
+            reinterpret_cast<const __nv_bfloat16*>(input),
+            reinterpret_cast<const __nv_bfloat16*>(weight),
+            batch, n, k);
+        return;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasGemmEx(CUBLAS(ctx),
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        n, batch, k,
+        &alpha,
+        weight, CUDA_R_16BF, k,
+        input,  CUDA_R_16BF, k,
+        &beta,
+        out,    CUDA_R_16BF, n,
+        CUDA_R_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 } // extern "C"

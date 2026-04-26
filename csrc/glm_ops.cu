@@ -37,7 +37,7 @@ __device__ void block_reduce_max(float* sdata, int tid) {
 }
 
 __device__ float sigmoid_f(float x) {
-    return 1.0f / (1.0f + expf(-x));
+    return 1.0f / (1.0f + __expf(-x));
 }
 
 // ---------------------------------------------------------------------------
@@ -304,39 +304,7 @@ void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
         (const __nv_bfloat16*)up, total);
 }
 
-// ---------------------------------------------------------------------------
-// Linear (BF16 GEMM via cuBLAS)
-//   out = input @ weight.T
-//   input:  [batch, k]  row-major BF16
-//   weight: [n, k]      row-major BF16
-//   out:    [batch, n]  row-major BF16
-// ---------------------------------------------------------------------------
 
-void glm_linear(GlmCtx* ctx, void* out, const void* input,
-                const void* weight, int batch, int n, int k) {
-    cudaSetDevice(ctx->device_id);
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    // Row-major GEMM: C[b,n] = A[b,k] @ B[n,k]^T
-    // cuBLAS col-major: C^T[n,b] = B[n,k] @ A^T[k,b]
-    // cublasGemmEx: op(A)=B, op(B)=A^T
-    //   op(A): [n, k], transa=N, lda=k
-    //   op(B): [k, b], transb=T, ldb=k
-    //   C:    [n, b], ldc=n
-    cublasGemmEx(CUBLAS(ctx),
-        CUBLAS_OP_T,      // transa: A^T from row-major input
-        CUBLAS_OP_N,       // transb: weight stays as-is
-        n,                 // m of output
-        batch,             // n of output
-        k,                 // k (inner dim)
-        &alpha,
-        weight, CUDA_R_16BF, k,    // A = weight [n,k] row-maj -> col-maj [k,n], op(A)=T -> [n,k]
-        input,  CUDA_R_16BF, k,    // B = input [b,k] row-maj -> col-maj [k,b], op(B)=N -> [k,b]
-        &beta,
-        out,    CUDA_R_16BF, n,    // C = out [b,n] row-maj -> col-maj [n,b]
-        CUDA_R_32F,                  // compute type: FP32 accumulation
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-}
 
 // ---------------------------------------------------------------------------
 // Embedding lookup kernel
@@ -1462,12 +1430,15 @@ __global__ void __launch_bounds__(256, 4) max_kernel(__nv_bfloat16* out_values, 
 
     float my_max = -INFINITY;
     int my_idx = -1;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float val = __bfloat162float(row_in[i]);
-        if (val > my_max || (val == my_max && i < my_idx)) {
-            my_max = val;
-            my_idx = i;
-        }
+    for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
+        float v0, v1;
+        load_bf16x2(row_in + i, v0, v1);
+        if (v0 > my_max || (v0 == my_max && i < my_idx)) { my_max = v0; my_idx = i; }
+        if (v1 > my_max || (v1 == my_max && (i + 1) < my_idx)) { my_max = v1; my_idx = i + 1; }
+    }
+    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+        float val = __bfloat162float(row_in[dim - 1]);
+        if (val > my_max || (val == my_max && (dim - 1) < my_idx)) { my_max = val; my_idx = dim - 1; }
     }
     s_vals[threadIdx.x] = my_max;
     s_idxs[threadIdx.x] = my_idx;

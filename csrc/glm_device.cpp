@@ -25,6 +25,7 @@ GlmCtx* glm_init(int device_id) {
     cudaStreamCreate(&ctx->stream);
     cublasCreate(&CUBLAS(ctx));
     cublasSetStream(CUBLAS(ctx), ctx->stream);
+    cublasSetMathMode(CUBLAS(ctx), CUBLAS_TENSOR_OP_MATH);
 
     return ctx;
 }

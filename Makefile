@@ -6,7 +6,7 @@ LIB_NAME = libglm_ops.so
 
 BUILD_DIR := build/Release
 
-SRCS_CU := csrc/glm_ops.cu csrc/glm_flash.cu csrc/glm_fp8.cu csrc/glm_gdn.cu csrc/glm_sampling.cu
+SRCS_CU := csrc/glm_ops.cu csrc/glm_flash.cu csrc/glm_gemv.cu csrc/glm_gdn.cu csrc/glm_sampling.cu
 SRCS_CPP := csrc/glm_nccl.cpp csrc/glm_device.cpp
 OBJS := $(SRCS_CU:csrc/%.cu=$(BUILD_DIR)/%.o) $(SRCS_CPP:csrc/%.cpp=$(BUILD_DIR)/%.o)
 
