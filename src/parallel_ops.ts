@@ -1047,16 +1047,33 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  setStream(_streamIdx: number): void {
-    // no-op: multi-stream dispatch handled at per-device level
+  setStream(streamIdx: number): void {
+    for (const device of this.devices) {
+      device.setStream(streamIdx);
+    }
   }
 
-  eventRecord(_eventIdx: number, _streamIdx: number): void {
-    // no-op: multi-stream dispatch handled at per-device level
+  eventRecord(eventIdx: number, streamIdx: number): void {
+    for (const device of this.devices) {
+      device.eventRecord(eventIdx, streamIdx);
+    }
   }
 
-  streamWaitEvent(_streamIdx: number, _eventIdx: number): void {
-    // no-op: multi-stream dispatch handled at per-device level
+  streamWaitEvent(streamIdx: number, eventIdx: number): void {
+    for (const device of this.devices) {
+      device.streamWaitEvent(streamIdx, eventIdx);
+    }
+  }
+
+  withStream(fn: () => void): Disposable {
+    const disposables = this.devices.map(device => device.withStream(fn));
+    return {
+      [Symbol.dispose]: () => {
+        for (const d of disposables) {
+          d[Symbol.dispose]();
+        }
+      }
+    };
   }
 
   private cast(tensor: Tensor): ParallelTensor {

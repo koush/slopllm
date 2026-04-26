@@ -340,6 +340,28 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().setStream(this.ctx, streamIdx);
   }
 
+  private availableStreams = [1, 2, 3, 4, 5, 6, 7];
+  withStream(fn: () => void): Disposable {
+    const stream = this.availableStreams.pop();
+    if (stream === undefined)
+      throw new Error("No available streams");
+    // Record event on stream 0 so the alternate stream can wait for
+    // all prior work (e.g. rmsnorm output that K/V will read).
+    getNativeAddon().eventRecord(this.ctx, 0, 0);
+    this.setStream(stream);
+    getNativeAddon().streamWaitEvent(this.ctx, stream, 0);
+    fn();
+    // Record event on the alternate stream so stream 0 can wait at dispose.
+    getNativeAddon().eventRecord(this.ctx, stream, stream);
+    this.setStream(0);
+    return {
+      [Symbol.dispose]: () => {
+        getNativeAddon().streamWaitEvent(this.ctx, 0, stream);
+        this.availableStreams.push(stream);
+      }
+    }
+  }
+
   eventRecord(eventIdx: number, streamIdx: number): void {
     getNativeAddon().eventRecord(this.ctx, eventIdx, streamIdx);
   }
