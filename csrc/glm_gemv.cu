@@ -11,15 +11,20 @@ namespace {
 // ---------------------------------------------------------------------------
 // GEMV kernel: optimized for M=1 decode
 // Each warp computes one output element. Input tiles are cooperatively loaded
-// into shared memory to avoid redundant global reads across warps in a block.
+// into shared memory as bfloat162 vectors to avoid redundant global reads and
+// eliminate bank conflicts (each 4-byte bfloat162 maps to one bank, so 32
+// consecutive elements span 32 banks conflict-free when accessed by a warp).
+// ROWS_PER_BLOCK=8 amortizes the shared input tile across more warps and
+// improves occupancy for small N.
 // ---------------------------------------------------------------------------
 
 constexpr int FP8_GEMV_WARP_SIZE = 32;
-constexpr int FP8_GEMV_ROWS_PER_BLOCK = 4;
+constexpr int FP8_GEMV_ROWS_PER_BLOCK = 8;
 constexpr int FP8_GEMV_BLOCK_SIZE = FP8_GEMV_ROWS_PER_BLOCK * FP8_GEMV_WARP_SIZE;
 constexpr int FP8_GEMV_K_TILE = 128;
+constexpr int FP8_GEMV_K_TILE_VEC = FP8_GEMV_K_TILE / 2;
 
-__global__ void __launch_bounds__(FP8_GEMV_BLOCK_SIZE, 8)
+__global__ void __launch_bounds__(FP8_GEMV_BLOCK_SIZE, 4)
 fp8_dequantize_gemv_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
@@ -35,7 +40,7 @@ fp8_dequantize_gemv_kernel(
 
     bool valid = m < M && row < N;
 
-    __shared__ __nv_bfloat16 smem_input[FP8_GEMV_K_TILE];
+    __shared__ __nv_bfloat162 smem_vec[FP8_GEMV_K_TILE_VEC];
 
     int num_k_blocks = K / 128;
     const __nv_bfloat16* input_row = input + (size_t)m * K;
@@ -47,8 +52,9 @@ fp8_dequantize_gemv_kernel(
     for (int kb = 0; kb < num_k_blocks; kb++) {
         int k_start = kb << 7;
 
-        for (int i = threadIdx.x; i < FP8_GEMV_K_TILE; i += FP8_GEMV_BLOCK_SIZE) {
-            smem_input[i] = input_row[k_start + i];
+        const __nv_bfloat162* input_vec = reinterpret_cast<const __nv_bfloat162*>(input_row + k_start);
+        for (int i = threadIdx.x; i < FP8_GEMV_K_TILE_VEC; i += FP8_GEMV_BLOCK_SIZE) {
+            smem_vec[i] = input_vec[i];
         }
         __syncthreads();
 
@@ -56,10 +62,13 @@ fp8_dequantize_gemv_kernel(
             float scale = scale_inv[n_block * num_k_blocks + kb];
 
             #pragma unroll
-            for (int ki = lane; ki < FP8_GEMV_K_TILE; ki += FP8_GEMV_WARP_SIZE) {
-                float w_val = static_cast<float>(weight_row[k_start + ki]) * scale;
-                float x_val = __bfloat162float(smem_input[ki]);
-                sum += w_val * x_val;
+            for (int ki = lane; ki < FP8_GEMV_K_TILE_VEC; ki += FP8_GEMV_WARP_SIZE) {
+                __nv_bfloat162 x2 = smem_vec[ki];
+                float x0 = __bfloat162float(x2.x);
+                float x1 = __bfloat162float(x2.y);
+                float w0 = static_cast<float>(weight_row[k_start + ki * 2]) * scale;
+                float w1 = static_cast<float>(weight_row[k_start + ki * 2 + 1]) * scale;
+                sum += w0 * x0 + w1 * x1;
             }
         }
 
@@ -69,8 +78,9 @@ fp8_dequantize_gemv_kernel(
     int remaining_start = num_k_blocks * 128;
     int remaining = K - remaining_start;
     if (remaining > 0) {
+        __nv_bfloat16* smem = reinterpret_cast<__nv_bfloat16*>(smem_vec);
         for (int i = threadIdx.x; i < remaining; i += FP8_GEMV_BLOCK_SIZE) {
-            smem_input[i] = input_row[remaining_start + i];
+            smem[i] = input_row[remaining_start + i];
         }
         __syncthreads();
 
@@ -80,7 +90,7 @@ fp8_dequantize_gemv_kernel(
             for (int k = remaining_start + lane; k < K; k += FP8_GEMV_WARP_SIZE) {
                 int ki = k - remaining_start;
                 float w_val = static_cast<float>(weight_row[k]) * scale;
-                float x_val = __bfloat162float(smem_input[ki]);
+                float x_val = __bfloat162float(smem[ki]);
                 sum += w_val * x_val;
             }
         }
@@ -177,15 +187,21 @@ fp8_dequantize_gemm_smem_kernel(
 // ---------------------------------------------------------------------------
 // BF16 GEMV kernel: optimized for M=1 (single-token decode)
 // Each warp computes one output element. Input tiles are cooperatively loaded
-// into shared memory to avoid redundant global reads across warps in a block.
+// into shared memory as bfloat162 vectors to avoid redundant global reads and
+// eliminate bank conflicts (each 4-byte bfloat162 maps to one bank, so 32
+// consecutive elements span 32 banks conflict-free when accessed by a warp).
+// Weight rows are also read via bfloat162 vector loads for 2x load throughput.
+// ROWS_PER_BLOCK=8 amortizes the shared input tile across more warps and
+// improves occupancy for small N.
 // ---------------------------------------------------------------------------
 
 constexpr int BF16_GEMV_WARP_SIZE = 32;
-constexpr int BF16_GEMV_ROWS_PER_BLOCK = 4;
+constexpr int BF16_GEMV_ROWS_PER_BLOCK = 8;
 constexpr int BF16_GEMV_BLOCK_SIZE = BF16_GEMV_ROWS_PER_BLOCK * BF16_GEMV_WARP_SIZE;
 constexpr int BF16_GEMV_K_TILE = 128;
+constexpr int BF16_GEMV_K_TILE_VEC = BF16_GEMV_K_TILE / 2;
 
-__global__ void __launch_bounds__(BF16_GEMV_BLOCK_SIZE, 8)
+__global__ void __launch_bounds__(BF16_GEMV_BLOCK_SIZE, 4)
 bf16_gemv_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
@@ -202,7 +218,7 @@ bf16_gemv_kernel(
 
     bool valid = m < M && row < N;
 
-    __shared__ __nv_bfloat16 smem_input[BF16_GEMV_K_TILE];
+    __shared__ __nv_bfloat162 smem_vec[BF16_GEMV_K_TILE_VEC];
 
     if (m < M) {
         const __nv_bfloat16* input_row = input + (size_t)m * K;
@@ -216,17 +232,23 @@ bf16_gemv_kernel(
         for (int kb = 0; kb < num_k_tiles; kb++) {
             int k_start = kb * BF16_GEMV_K_TILE;
 
-            for (int i = threadIdx.x; i < BF16_GEMV_K_TILE; i += BF16_GEMV_BLOCK_SIZE) {
-                smem_input[i] = input_row[k_start + i];
+            const __nv_bfloat162* input_vec = reinterpret_cast<const __nv_bfloat162*>(input_row + k_start);
+            for (int i = threadIdx.x; i < BF16_GEMV_K_TILE_VEC; i += BF16_GEMV_BLOCK_SIZE) {
+                smem_vec[i] = input_vec[i];
             }
             __syncthreads();
 
             if (valid) {
+                const __nv_bfloat162* weight_vec = reinterpret_cast<const __nv_bfloat162*>(weight_row + k_start);
                 #pragma unroll
-                for (int ki = lane; ki < BF16_GEMV_K_TILE; ki += BF16_GEMV_WARP_SIZE) {
-                    float w_val = __bfloat162float(weight_row[k_start + ki]);
-                    float x_val = __bfloat162float(smem_input[ki]);
-                    sum += w_val * x_val;
+                for (int ki = lane; ki < BF16_GEMV_K_TILE_VEC; ki += BF16_GEMV_WARP_SIZE) {
+                    __nv_bfloat162 w2 = weight_vec[ki];
+                    __nv_bfloat162 x2 = smem_vec[ki];
+                    float w0 = __bfloat162float(w2.x);
+                    float w1 = __bfloat162float(w2.y);
+                    float x0 = __bfloat162float(x2.x);
+                    float x1 = __bfloat162float(x2.y);
+                    sum += w0 * x0 + w1 * x1;
                 }
             }
 
@@ -235,8 +257,9 @@ bf16_gemv_kernel(
 
         int remaining = K - remaining_start;
         if (remaining > 0) {
+            __nv_bfloat16* smem = reinterpret_cast<__nv_bfloat16*>(smem_vec);
             for (int i = threadIdx.x; i < remaining; i += BF16_GEMV_BLOCK_SIZE) {
-                smem_input[i] = input_row[remaining_start + i];
+                smem[i] = input_row[remaining_start + i];
             }
             __syncthreads();
 
@@ -244,7 +267,7 @@ bf16_gemv_kernel(
                 for (int k = remaining_start + lane; k < K; k += BF16_GEMV_WARP_SIZE) {
                     int ki = k - remaining_start;
                     float w_val = __bfloat162float(weight_row[k]);
-                    float x_val = __bfloat162float(smem_input[ki]);
+                    float x_val = __bfloat162float(smem[ki]);
                     sum += w_val * x_val;
                 }
             }
