@@ -142,6 +142,7 @@ export interface DecodeTiming {
   sampleMs: number;
   warmupSteps: number;
   graphSteps: number;
+  warmupTokPerSec: number;
 }
 
 export function* generateStream(
@@ -171,6 +172,9 @@ export function* generateStream(
   let sampleMs = 0;
   let warmupSteps = 0;
   let graphSteps = 0;
+  let firstPostWarmupTime = 0;
+  let lastTokenTime = 0;
+  let postWarmupTokenCount = 0;
 
   try {
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
@@ -226,6 +230,14 @@ export function* generateStream(
     }
     sampleMs += performance.now() - tSample;
 
+    const isPostWarmupToken = !useGraph || (graphState?.graphExec !== null);
+    if (isPostWarmupToken) {
+      const now = performance.now();
+      if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
+      lastTokenTime = now;
+      postWarmupTokenCount++;
+    }
+
     cache.appendTokens(0, [currentToken]);
     tokenHistory.push(currentToken);
     yield currentToken;
@@ -237,6 +249,9 @@ export function* generateStream(
       timing.sampleMs = sampleMs;
       timing.warmupSteps = warmupSteps;
       timing.graphSteps = graphSteps;
+      timing.warmupTokPerSec = (postWarmupTokenCount > 1 && firstPostWarmupTime > 0)
+        ? postWarmupTokenCount / ((lastTokenTime - firstPostWarmupTime) / 1000)
+        : 0;
     }
   }
 }
@@ -323,7 +338,7 @@ async function interactiveChat(
       const t0 = performance.now();
       let tokCount = 0;
       const generatedIds: number[] = [];
-      const timing: DecodeTiming = { planMs: 0, execMs: 0, sampleMs: 0, warmupSteps: 0, graphSteps: 0 };
+      const timing: DecodeTiming = { planMs: 0, execMs: 0, sampleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
       for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing)) {
         generatedIds.push(tokenId);
@@ -336,7 +351,7 @@ async function interactiveChat(
       const elapsed = performance.now() - t0;
       const totalMs = timing.planMs + timing.execMs + timing.sampleMs;
       console.log(`\n  [${tokCount} tokens in ${(elapsed / 1000).toFixed(1)}s, ${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s]`);
-      console.log(`  timing: plan=${timing.planMs.toFixed(1)}ms exec=${timing.execMs.toFixed(1)}ms sample=${timing.sampleMs.toFixed(1)}ms other=${(elapsed - totalMs).toFixed(1)}ms (warmup=${timing.warmupSteps} graph=${timing.graphSteps})`);
+      console.log(`  timing: plan=${timing.planMs.toFixed(1)}ms exec=${timing.execMs.toFixed(1)}ms sample=${timing.sampleMs.toFixed(1)}ms other=${(elapsed - totalMs).toFixed(1)}ms (warmup=${timing.warmupSteps} graph=${timing.graphSteps}) decode=${timing.warmupTokPerSec.toFixed(1)} tok/s`);
 
       const responseText = tokenizer.decode(generatedIds.filter(t => !eosIds.has(t)), { skip_special_tokens: true });
       messages.push({ role: "assistant", content: responseText });
@@ -363,7 +378,7 @@ async function singlePrompt(
   const t0 = performance.now();
   let tokCount = 0;
   const generatedIds: number[] = [];
-  const timing: DecodeTiming = { planMs: 0, execMs: 0, sampleMs: 0, warmupSteps: 0, graphSteps: 0 };
+  const timing: DecodeTiming = { planMs: 0, execMs: 0, sampleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
   for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing)) {
     generatedIds.push(tokenId);
@@ -376,7 +391,7 @@ async function singlePrompt(
   const elapsed = performance.now() - t0;
   const totalMs = timing.planMs + timing.execMs + timing.sampleMs;
   console.log(`\n\n${tokCount} tokens in ${elapsed.toFixed(1)}ms (${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s)`);
-  console.log(`timing: plan=${timing.planMs.toFixed(1)}ms exec=${timing.execMs.toFixed(1)}ms sample=${timing.sampleMs.toFixed(1)}ms other=${(elapsed - totalMs).toFixed(1)}ms (warmup=${timing.warmupSteps} graph=${timing.graphSteps})`);
+  console.log(`timing: plan=${timing.planMs.toFixed(1)}ms exec=${timing.execMs.toFixed(1)}ms sample=${timing.sampleMs.toFixed(1)}ms other=${(elapsed - totalMs).toFixed(1)}ms (warmup=${timing.warmupSteps} graph=${timing.graphSteps}) decode=${timing.warmupTokPerSec.toFixed(1)} tok/s`);
 
   if (graphState?.graphExec !== null && graphState?.graphExec !== undefined) glm.graphExecDestroy(graphState.graphExec);
 }
