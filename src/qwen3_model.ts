@@ -5,7 +5,7 @@ import { ChatModel, SamplingParams } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import { bf16BytesToF32, f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
-import type { BatchState, ExecutionWorkspace } from "./paged_kv";
+import type { BatchState } from "./paged_kv";
 import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
@@ -82,19 +82,19 @@ export class Qwen3Model extends ChatModel {
     if (name === "lm_head.weight") return TensorParallelism.Column;
     if (name === "model.embed_tokens.weight") return TensorParallelism.Row;
     if (name.endsWith(".self_attn.q_proj.weight") ||
-        name.endsWith(".self_attn.k_proj.weight") ||
-        name.endsWith(".self_attn.v_proj.weight") ||
-        name.endsWith(".mlp.gate_proj.weight") ||
-        name.endsWith(".mlp.up_proj.weight")) return TensorParallelism.Column;
+      name.endsWith(".self_attn.k_proj.weight") ||
+      name.endsWith(".self_attn.v_proj.weight") ||
+      name.endsWith(".mlp.gate_proj.weight") ||
+      name.endsWith(".mlp.up_proj.weight")) return TensorParallelism.Column;
     if (name.endsWith(".self_attn.q_proj.weight_scale_inv") ||
-        name.endsWith(".self_attn.k_proj.weight_scale_inv") ||
-        name.endsWith(".self_attn.v_proj.weight_scale_inv") ||
-        name.endsWith(".mlp.gate_proj.weight_scale_inv") ||
-        name.endsWith(".mlp.up_proj.weight_scale_inv")) return TensorParallelism.Column;
+      name.endsWith(".self_attn.k_proj.weight_scale_inv") ||
+      name.endsWith(".self_attn.v_proj.weight_scale_inv") ||
+      name.endsWith(".mlp.gate_proj.weight_scale_inv") ||
+      name.endsWith(".mlp.up_proj.weight_scale_inv")) return TensorParallelism.Column;
     if (name.endsWith(".self_attn.o_proj.weight") ||
-        name.endsWith(".mlp.down_proj.weight")) return TensorParallelism.Row;
+      name.endsWith(".mlp.down_proj.weight")) return TensorParallelism.Row;
     if (name.endsWith(".self_attn.o_proj.weight_scale_inv") ||
-        name.endsWith(".mlp.down_proj.weight_scale_inv")) return TensorParallelism.Row;
+      name.endsWith(".mlp.down_proj.weight_scale_inv")) return TensorParallelism.Row;
     return TensorParallelism.Replicated;
   }
 
@@ -132,35 +132,12 @@ export class Qwen3Model extends ChatModel {
   }
 
   private mlp(normed: Tensor, BS: number, pfx: string): Tensor {
-    const syncUp = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS));
+    using upStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS));
+    using upBuf = upStream.result;
     using gateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS);
-    using upBuf = syncUp();
+    upStream.sync();
     using siluBuf = gateBuf.siluAndMul(gateBuf, upBuf, this.cfg.intermediateSize, BS);
     return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
-  }
-
-  private computeQkv(ws: ExecutionWorkspace, state: BatchState, i: number, normed: Tensor, pfx: string, BS: number, B: number, S: number, cos: Tensor, sin: Tensor): { qRope: Tensor, kRope: Tensor, vBuf: Tensor } {
-    const cfg = this.cfg;
-    const nHeads = cfg.numAttentionHeads;
-    const nKv = cfg.numKeyValueHeads;
-    const hd = cfg.headDim;
-
-    const sync = this.glm.withStream(() => {
-      const syncV = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!, BS));
-      const kBuf = normed.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS);
-      const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
-      const vBuf = syncV();
-      ws.kvCacheWrite(kRope, vBuf, state, i, nKv, hd);
-      return {
-        kBuf,
-        kRope,
-        vBuf,
-      }
-    });
-    using qBuf = normed.linear(this.tensors.get(`${pfx}.self_attn.q_proj.weight`)!, BS);
-    const qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
-    const { kRope, vBuf } = sync();
-    return { qRope, kRope, vBuf };
   }
 
   forward(state: BatchState): Tensor {
@@ -181,19 +158,40 @@ export class Qwen3Model extends ChatModel {
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
     using residual = new UsingHolder(embedTable.embedding(ws.inputIdsBuf, hs, BS));
 
-    const rotaryEmbedding = this.invFreq.rotaryEmbedding(ws.positionIds, hd / 2, B, S);
-    using cos = rotaryEmbedding.cos;
-    using sin = rotaryEmbedding.sin;
+    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, hd / 2, B, S));
+    using cos = rotaryEmbedding.result.cos;
+    using sin = rotaryEmbedding.result.sin;
 
     using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
 
-      const _qkv = this.computeQkv(ws, state, i, normed.value, pfx, BS, B, S, cos, sin);
-      using qRope = _qkv.qRope;
-      using _kRope = _qkv.kRope;
-      using _vBuf = _qkv.vBuf;
+      using vStream = this.glm.withStream(() => normed.value.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!, BS));
+      using vBuf = vStream.result;
+
+      using kStream = this.glm.withStream(() => {
+        const kBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS);
+
+        if (!i) {
+          rotaryEmbedding.sync();
+        }
+
+        const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
+        vStream.sync();
+        ws.kvCacheWrite(kRope, vBuf, state, i, nKv, hd);
+        return { kBuf, kRope };
+      });
+      using _kBuf = kStream.result.kBuf;
+      using _kRope = kStream.result.kRope;
+
+      using qBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.q_proj.weight`)!, BS);
+      if (!i) {
+        rotaryEmbedding.sync();
+      }
+      using qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
+
+      kStream.sync();
 
       using flashOut = new UsingHolder<Tensor>(undefined!);
       if (state.isDecode) {

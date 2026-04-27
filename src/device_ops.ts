@@ -23,7 +23,7 @@ export interface DeviceOps {
   streamWaitEvent(streamIdx: number, eventIdx: number): void;
   currentStream: number;
   availableStreams: number[];
-  withStream<T>(fn: () => T): () => T;
+  withStream<T>(fn: () => T): Disposable  & { result: T, sync(): void };
 
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
 

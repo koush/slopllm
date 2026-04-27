@@ -1067,7 +1067,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  withStream<T>(fn: () => T): () => T {
+  withStream<T>(fn: () => T) {
     const currentStreams = this.devices.map(device => device.currentStream);
     const streams = this.devices.map(device => device.availableStreams.pop());
     if (streams.includes(undefined)) {
@@ -1083,12 +1083,18 @@ export class ParallelOps implements DeviceOps {
       this.devices[i].eventRecord(streams[i]!, streams[i]!);
       this.devices[i].setStream(currentStreams[i]);
     }
-    return () => {
-      for (let i = 0; i < this.devices.length; i++) {
-        this.devices[i].streamWaitEvent(currentStreams[i], streams[i]!);
-        this.devices[i].availableStreams.push(streams[i]!);
-      }
-      return result;
+    return {
+      [Symbol.dispose]: () => {
+        for (let i = 0; i < this.devices.length; i++) {
+          this.devices[i].availableStreams.push(streams[i]!);
+        }
+      },
+      sync: () => {
+        for (let i = 0; i < this.devices.length; i++) {
+          this.devices[i].streamWaitEvent(this.devices[i].currentStream, streams[i]!);
+        }
+      },
+      result,
     };
   }
 
