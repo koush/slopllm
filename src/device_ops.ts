@@ -21,6 +21,7 @@ export interface DeviceOps {
   setStream(streamIdx: number): void;
   eventRecord(eventIdx: number, streamIdx: number): void;
   streamWaitEvent(streamIdx: number, eventIdx: number): void;
+  currentStream: number;
   availableStreams: number[];
   withStream<T>(fn: () => T): () => T;
 

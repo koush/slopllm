@@ -334,6 +334,7 @@ export class GlmOps implements DeviceOps {
 
   setStream(streamIdx: number): void {
     getNativeAddon().setStream(this.ctx, streamIdx);
+    this.currentStream = streamIdx;
   }
 
   currentStream = 0;
@@ -343,7 +344,6 @@ export class GlmOps implements DeviceOps {
     if (stream === undefined)
       throw new Error("No available streams");
     const currentStream = this.currentStream;
-    this.currentStream = stream;
     // Record event on stream 0 so the alternate stream can wait for
     // all prior work (e.g. rmsnorm output that K/V will read).
     getNativeAddon().eventRecord(this.ctx, currentStream, currentStream);
@@ -356,7 +356,6 @@ export class GlmOps implements DeviceOps {
     return () => {
         getNativeAddon().streamWaitEvent(this.ctx, currentStream, stream);
         this.availableStreams.push(stream);
-        this.currentStream = currentStream;
         return result;
     }
   }

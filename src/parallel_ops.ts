@@ -1048,7 +1048,7 @@ export class ParallelOps implements DeviceOps {
   }
 
   availableStreams: number[] = [];
-
+  currentStream = 0;
   setStream(streamIdx: number): void {
     for (const device of this.devices) {
       device.setStream(streamIdx);
@@ -1068,23 +1068,24 @@ export class ParallelOps implements DeviceOps {
   }
 
   withStream<T>(fn: () => T): () => T {
+    const currentStreams = this.devices.map(device => device.currentStream);
     const streams = this.devices.map(device => device.availableStreams.pop());
     if (streams.includes(undefined)) {
       throw new Error("Not enough available streams on devices");
     }
     for (let i = 0; i < this.devices.length; i++) {
-      this.devices[i].eventRecord(0, 0);
+      this.devices[i].eventRecord(currentStreams[i], currentStreams[i]);
       this.devices[i].setStream(streams[i]!);
-      this.devices[i].streamWaitEvent(streams[i]!, 0);
+      this.devices[i].streamWaitEvent(streams[i]!, currentStreams[i]);
     }
     const result = fn();
     for (let i = 0; i < this.devices.length; i++) {
       this.devices[i].eventRecord(streams[i]!, streams[i]!);
-      this.devices[i].setStream(0);
+      this.devices[i].setStream(currentStreams[i]);
     }
     return () => {
       for (let i = 0; i < this.devices.length; i++) {
-        this.devices[i].streamWaitEvent(0, streams[i]!);
+        this.devices[i].streamWaitEvent(currentStreams[i], streams[i]!);
         this.devices[i].availableStreams.push(streams[i]!);
       }
       return result;
