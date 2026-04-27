@@ -862,6 +862,10 @@ export class ParallelTensor extends Tensor {
     }
   }
 
+  readPinnedBuffer(): Buffer {
+    return this.shards[0].readPinnedBuffer();
+  }
+
   memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {
     if (!(src instanceof ParallelTensor)) {
       throw new Error("ParallelTensor.memcpy requires ParallelTensor source");

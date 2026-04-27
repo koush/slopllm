@@ -3,14 +3,14 @@ import { ParallelOps } from "./parallel_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model } from "./qwen35_model";
 import { ChatModel, ChatCache, SamplingParams, makeSamplingParams } from "./chat_model";
-import { Tensor } from "./tensor";
+import { MemcpyKind, Tensor } from "./tensor";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
 import { ExecutionWorkspace } from "./paged_kv";
 import { DeviceOps } from "./device_ops";
 
-const QWEN3_REPO = "Qwen/Qwen3-0.6B";
+const QWEN3_REPO = "Qwen/Qwen3-32B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
 
@@ -196,10 +196,14 @@ export function* generateStream(
       logits = model.forward(state);
 
       if (useGraph && greedy && capturing) {
-        greedyArgmaxResult = logits.argmax();
+        using gpuGreedyArgmaxResult = logits.argmax();
+        greedyArgmaxResult = gpuGreedyArgmaxResult.workspace.allocPinned(gpuGreedyArgmaxResult.shape, gpuGreedyArgmaxResult.type);
+        greedyArgmaxResult.memcpy(gpuGreedyArgmaxResult, gpuGreedyArgmaxResult.bytes, MemcpyKind.DeviceToHost);
       }
       else if (useGraph && sampling && capturing) {
-        sampleResult = logits.sampleTokenGPU(sampling, tokenHistory);
+        using gpuSampleResult = logits.sampleTokenGPU(sampling, tokenHistory);
+        sampleResult = gpuSampleResult.workspace.allocPinned(gpuSampleResult.shape, gpuSampleResult.type);
+        sampleResult.memcpy(gpuSampleResult, gpuSampleResult.bytes, MemcpyKind.DeviceToHost);
       }
 
       const wasCapturing = capturing;
@@ -215,13 +219,14 @@ export function* generateStream(
 
       if (wasCapturing) continue;
     }
+    glm.synchronize();
     execMs += performance.now() - tExec;
 
     const tSample = performance.now();
     if (greedyArgmaxResult) {
-      currentToken = greedyArgmaxResult.readInt32LE()[0];
+      currentToken = greedyArgmaxResult.readPinnedBuffer().readInt32LE();
     } else if (sampleResult) {
-      currentToken = sampleResult.readInt32LE()[0];
+      currentToken = sampleResult.readPinnedBuffer().readInt32LE();
     } else if (sampling) {
       using sampleResult = logits!.sampleTokenGPU(sampling, tokenHistory);
       currentToken = sampleResult.readInt32LE()[0];

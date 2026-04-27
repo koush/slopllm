@@ -56,6 +56,17 @@ export abstract class Tensor implements Disposable {
     fn(this.pinnedBuffer);
   }
 
+  readPinnedBuffer(): Buffer {
+    if (!this.pinned) {
+      throw new Error("Tensor is not pinned");
+    }
+    if (this.data === 0) {
+      throw new Error("Tensor has no data");
+    }
+    this.pinnedBuffer ||= getNativeAddon().hostPointerToBuffer(this.data, this.allocSize);
+    return this.pinnedBuffer;
+  }
+
   detachData() {
     (this as { data: number }).data = 0;
     this.pinnedBuffer = undefined;
