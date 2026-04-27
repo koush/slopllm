@@ -33,17 +33,22 @@ export class ExecutionState {
     this.qoIndptrHost = qoIndptrHost;
   }
 
-  prepareInput(tokenIds: number[]) {
+  prepareInput(tokenIds: number[]|Tensor) {
     if (!this.isDecode)
       throw new Error("decodeInput should be null in prefill");
 
-    const batchSize = tokenIds.length;
-    this.ws.inputIdsBufH.withPinnedBuffer(buf => {
-      for (let i = 0; i < batchSize; i++) {
-        buf.writeInt32LE(tokenIds[i], i * I32);
-      }
-    });
-    this.decodeInput = this.ws.inputIdsBufH;
+    if (tokenIds instanceof Tensor) {
+      this.decodeInput = tokenIds;
+    }
+    else {
+      const batchSize = tokenIds.length;
+      this.ws.inputIdsBufH.withPinnedBuffer(buf => {
+        for (let i = 0; i < batchSize; i++) {
+          buf.writeInt32LE(tokenIds[i], i * I32);
+        }
+      });
+      this.decodeInput = this.ws.inputIdsBufH;
+    }
   }
 }
 
@@ -114,9 +119,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
       if (decodeInput.pinned) {
         this.inputIdsBuf.memcpy(decodeInput, batchSize * I32, MemcpyKind.HostToDevice);
       }
-      else {
-        this.inputIdsBuf.memcpy(decodeInput, batchSize * I32, MemcpyKind.DeviceToDevice);
-      }
       this.slotMapping.memcpy(this.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
       this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
     } else if (state.qoIndptrHost) {
@@ -124,7 +126,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
   }
 
-  decodeStep(pagedKV: PagedKVCache, batchSize: number): void {
+  decodeStep(state: ExecutionState): void {
+    const pagedKV = state.cache.getPagedKV();
+    const batchSize = state.batchSize;
     this.glm.decodeStep(
       this.positionIds, this.lastPageLen, this.slotMapping,
       this.indptrD, pagedKV.indices,
@@ -313,10 +317,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, qoIndptrHost);
   }
 
-  forwardEagerPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): number[] {
+  forwardPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): Tensor {
     const state = this.planPrefill(model, inputIdsList, cache);
     this.forwardInput(state);
-    const logits = model.forward(state);
+    return model.forward(state);
+  }
+
+  forwardEagerPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): number[] {
+    const logits = this.forwardPrefill(model, inputIdsList, cache);
     using argmaxResult = logits.argmax();
     return argmaxResult.readInt32LE();
   }

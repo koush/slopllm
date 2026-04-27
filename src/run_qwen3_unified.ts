@@ -9,6 +9,8 @@ import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
 import { ExecutionWorkspace } from "./paged_kv";
 import { DeviceOps } from "./device_ops";
+import { WorkspaceBase } from "./workspace";
+import { UsingHolder } from "./using-holder";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -154,18 +156,38 @@ export function* generateStream(
   const suffixIds = cache.prefixMatch(0, inputIds);
   cache.appendTokens(0, suffixIds);
 
-  const firstTokens = ws.forwardEagerPrefill(model, [suffixIds], cache);
-  let currentToken = firstTokens[0];
-  yield currentToken;
+  using sampleWorkspace = new WorkspaceBase(glm);
+  const greedy = !sampling;
+  let sampleResult: Tensor | null = null;
+  let gpuSampleResult: Tensor | null = null;
+  function doSample(logits: Tensor) {
+    using argmax = new UsingHolder<Tensor>(undefined!);
+    if (greedy) {
+      argmax.replace(logits.argmax());
+    }
+    else {
+      argmax.replace(logits.sampleTokenGPU(sampling, tokenHistory));
+    }
+    const argmaxValue = argmax.value;
+    sampleResult ||= sampleWorkspace.allocPinned(argmaxValue.shape, argmaxValue.type);
+    sampleResult.memcpy(argmaxValue, argmaxValue.bytes, MemcpyKind.DeviceToHost);
+    gpuSampleResult ||= sampleWorkspace.alloc(argmaxValue.shape, argmaxValue.type);
+    gpuSampleResult.memcpy(argmaxValue, argmaxValue.bytes, MemcpyKind.DeviceToDevice);
+  }
+
+  let currentToken: number;
+  {
+    using firstTokens = ws.forwardPrefill(model, [suffixIds], cache);
+    doSample(firstTokens);
+    currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
+    glm.synchronize();
+    // the decode is pipelined and then the token is yielded
+  }
   cache.appendTokens(0, [currentToken]);
 
   const tokenHistory = [...inputIds, currentToken];
   const useGraph = graphState !== undefined;
-  const greedy = !sampling;
   let capturing = false;
-  let logits: Tensor | null = null;
-  let greedyArgmaxResult: Tensor | null = null;
-  let sampleResult: Tensor | null = null;
 
   let planMs = 0;
   let execMs = 0;
@@ -178,73 +200,69 @@ export function* generateStream(
   let tAfterSync = 0;
 
   try {
-  for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
-    const tPlan = performance.now();
-    const state = ws.planDecode(model, 1, cache, useGraph);
-    state.prepareInput([currentToken]);
-    planMs += performance.now() - tPlan;
+    for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
+      const tPlan = performance.now();
+      const state = ws.planDecode(model, 1, cache, useGraph);
+      planMs += performance.now() - tPlan;
 
-    const tExec = performance.now();
-    if (useGraph && graphState!.graphExec !== null) {
-      if (tAfterSync > 0) idleMs += performance.now() - tAfterSync;
-      glm.graphLaunch(graphState!.graphExec);
-      graphSteps++;
-    } else {
-      if (useGraph && graphState!.warmupRemaining === 0 && !capturing) {
-        capturing = true;
-        glm.graphBeginCapture();
-      }
-
-      ws.forwardInput(state);
-      logits = model.forward(state);
-
-      if (greedy) {
-        using gpuGreedyArgmaxResult = logits.argmax();
-        greedyArgmaxResult = gpuGreedyArgmaxResult.workspace.allocPinned(gpuGreedyArgmaxResult.shape, gpuGreedyArgmaxResult.type);
-        greedyArgmaxResult.memcpy(gpuGreedyArgmaxResult, gpuGreedyArgmaxResult.bytes, MemcpyKind.DeviceToHost);
+      const tExec = performance.now();
+      if (useGraph && graphState!.graphExec !== null) {
+        if (tAfterSync > 0) idleMs += performance.now() - tAfterSync;
+        // only host pinned is automatically copied. if using a device pinned, must be explicitly copied.
+        ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
+        glm.graphLaunch(graphState!.graphExec);
+        graphSteps++;
       }
       else {
-        using gpuSampleResult = logits.sampleTokenGPU(sampling, tokenHistory);
-        sampleResult = gpuSampleResult.workspace.allocPinned(gpuSampleResult.shape, gpuSampleResult.type);
-        sampleResult.memcpy(gpuSampleResult, gpuSampleResult.bytes, MemcpyKind.DeviceToHost);
+        ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
+        state.prepareInput(gpuSampleResult!);
+
+        if (useGraph && graphState!.warmupRemaining === 0 && !capturing) {
+          capturing = true;
+          glm.graphBeginCapture();
+        }
+
+        ws.forwardInput(state);
+        using logits = model.forward(state);
+        doSample(logits);
+
+        const wasCapturing = capturing;
+        if (capturing) {
+          const graph = glm.graphEndCapture();
+          ws.freeze();
+          graphState!.graphExec = glm.graphInstantiate(graph);
+          glm.graphDestroy(graph);
+          capturing = false;
+        }
+        if (useGraph) graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
+        warmupSteps++;
+
+        if (wasCapturing) {
+          // when cuda graph captures it is NOT executing. must run again.
+          continue;
+        }
       }
+      yield currentToken;
+      glm.synchronize();
+      execMs += performance.now() - tExec;
+      tAfterSync = performance.now();
 
-      const wasCapturing = capturing;
-      if (capturing) {
-        const graph = glm.graphEndCapture();
-        ws.freeze();
-        graphState!.graphExec = glm.graphInstantiate(graph);
-        glm.graphDestroy(graph);
-        capturing = false;
-      }
-      if (useGraph) graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
-      warmupSteps++;
-
-      if (wasCapturing) continue;
-    }
-    glm.synchronize();
-    execMs += performance.now() - tExec;
-    tAfterSync = performance.now();
-
-    if (greedy) {
-      currentToken = greedyArgmaxResult!.readPinnedBuffer().readInt32LE();
-    }
-    else {
       currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
+
+      const isPostWarmupToken = !useGraph || (graphState?.graphExec !== null);
+      if (isPostWarmupToken) {
+        const now = performance.now();
+        if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
+        lastTokenTime = now;
+        postWarmupTokenCount++;
+      }
+
+      cache.appendTokens(0, [currentToken]);
+      tokenHistory.push(currentToken);
     }
 
-    const isPostWarmupToken = !useGraph || (graphState?.graphExec !== null);
-    if (isPostWarmupToken) {
-      const now = performance.now();
-      if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
-      lastTokenTime = now;
-      postWarmupTokenCount++;
-    }
-
-    cache.appendTokens(0, [currentToken]);
-    tokenHistory.push(currentToken);
+    // yield the final pipelined token
     yield currentToken;
-  }
   } finally {
     if (timing) {
       timing.planMs = planMs;
