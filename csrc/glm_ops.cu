@@ -440,7 +440,7 @@ __global__ void __launch_bounds__(256, 4) ew_binary_kernel(__nv_bfloat16* out, c
 // ---------------------------------------------------------------------------
 
 static __device__ __forceinline__ float sigmoid_mul_f(float val, float gate) {
-    float sig = 1.0f / (1.0f + expf(-gate));
+    float sig = 1.0f / (1.0f + __expf(-gate));
     return val * sig;
 }
 
@@ -545,7 +545,7 @@ __global__ void __launch_bounds__(256, 4) softmax_kernel(
 
     float sum = 0.0f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        sum += expf(s_cache[i] - max_val);
+        sum += __expf(s_cache[i] - max_val);
     }
     sdata[threadIdx.x] = sum;
     __syncthreads();
@@ -585,7 +585,7 @@ __global__ void __launch_bounds__(256, 4) softmax_kernel_uncached(
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float val = __bfloat162float(x[i]);
         if (m) val += __bfloat162float(m[i]);
-        sum += expf(val - max_val);
+        sum += __expf(val - max_val);
     }
     sdata[threadIdx.x] = sum;
     __syncthreads();

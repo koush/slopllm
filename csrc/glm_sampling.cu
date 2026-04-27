@@ -176,7 +176,7 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
         float max_val = seq_topk_vals[0];
         float sum = 0.0f;
         for (int i = 0; i < merge_size; i++) {
-            float v = expf(seq_topk_vals[i] - max_val);
+            float v = __expf(seq_topk_vals[i] - max_val);
             seq_topk_vals[i] = v;
             sum += v;
         }
@@ -328,7 +328,7 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_argmax
         float max_val = seq_topk_vals[0];
         float sum = 0.0f;
         for (int i = 0; i < effective_k; i++) {
-            float v = expf(seq_topk_vals[i] - max_val);
+            float v = __expf(seq_topk_vals[i] - max_val);
             seq_topk_vals[i] = v;
             sum += v;
         }

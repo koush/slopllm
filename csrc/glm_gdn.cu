@@ -23,12 +23,12 @@ __device__ __forceinline__ nv_bfloat16 float2bf16(float v) {
 
 __device__ __forceinline__ float softplus_f(float x) {
     if (x > 20.0f) return x;
-    if (x < -20.0f) return expf(x);
-    return logf(1.0f + expf(x));
+    if (x < -20.0f) return __expf(x);
+    return logf(1.0f + __expf(x));
 }
 
 __device__ __forceinline__ float sigmoid_f(float x) {
-    return 1.0f / (1.0f + expf(-x));
+    return 1.0f / (1.0f + __expf(-x));
 }
 
 __device__ __forceinline__ float silu_f(float x) {
@@ -128,7 +128,7 @@ __global__ void __launch_bounds__(128, 4) gdn_recurrent_step_kernel(
         float al = A_log[h];
         float dtb = dt_bias[h];
         s_partial[0] = sigmoid_f(bv);
-        s_partial[1] = expf(-expf(al) * softplus_f(a + dtb));
+        s_partial[1] = __expf(-expf(al) * softplus_f(a + dtb));
     }
     __syncthreads();
     beta = s_partial[0];
@@ -277,7 +277,7 @@ __global__ void __launch_bounds__(128, 4) gdn_prefill_kernel(
             float a = bf162float(a_raw[gt * num_heads + h]);
             float bv = bf162float(b_raw[gt * num_heads + h]);
             s_partial[0] = sigmoid_f(bv);
-            s_partial[1] = expf(neg_exp_al * softplus_f(a + dtb));
+            s_partial[1] = __expf(neg_exp_al * softplus_f(a + dtb));
         }
         __syncthreads();
         beta = s_partial[0];
