@@ -5,7 +5,7 @@ import { ChatModel, SamplingParams } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import { bf16BytesToF32, f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
-import type { BatchState } from "./paged_kv";
+import type { BatchState, ExecutionWorkspace } from "./paged_kv";
 import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
@@ -139,19 +139,27 @@ export class Qwen3Model extends ChatModel {
     return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
   }
 
-  private computeQkv(normed: Tensor, pfx: string, BS: number, B: number, S: number, cos: Tensor, sin: Tensor): { qRope: Tensor, kRope: Tensor, vBuf: Tensor } {
+  private computeQkv(ws: ExecutionWorkspace, state: BatchState, i: number, normed: Tensor, pfx: string, BS: number, B: number, S: number, cos: Tensor, sin: Tensor): { qRope: Tensor, kRope: Tensor, vBuf: Tensor } {
     const cfg = this.cfg;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
 
-    const syncK = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS));
-    const syncV = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!, BS));
+    const sync = this.glm.withStream(() => {
+      const syncV = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!, BS));
+      const kBuf = normed.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS);
+      const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
+      const vBuf = syncV();
+      ws.kvCacheWrite(kRope, vBuf, state, i, nKv, hd);
+      return {
+        kBuf,
+        kRope,
+        vBuf,
+      }
+    });
     using qBuf = normed.linear(this.tensors.get(`${pfx}.self_attn.q_proj.weight`)!, BS);
     const qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
-    using kBuf = syncK();
-    const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
-    const vBuf = syncV();
+    const { kRope, vBuf } = sync();
     return { qRope, kRope, vBuf };
   }
 
@@ -182,12 +190,10 @@ export class Qwen3Model extends ChatModel {
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
 
-      const _qkv = this.computeQkv(normed.value, pfx, BS, B, S, cos, sin);
+      const _qkv = this.computeQkv(ws, state, i, normed.value, pfx, BS, B, S, cos, sin);
       using qRope = _qkv.qRope;
-      using kRope = _qkv.kRope;
-      using vBuf = _qkv.vBuf;
-
-      ws.kvCacheWrite(kRope, vBuf, state, i, nKv, hd);
+      using _kRope = _qkv.kRope;
+      using _vBuf = _qkv.vBuf;
 
       using flashOut = new UsingHolder<Tensor>(undefined!);
       if (state.isDecode) {
