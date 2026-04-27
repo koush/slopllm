@@ -5,13 +5,14 @@ import { ChatModel, SamplingParams } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import { bf16BytesToF32, f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
-import type { BatchState } from "./paged_kv";
+import { ExecutionState } from "./paged_kv";
 import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 
-export type { BatchState, SamplingParams };
+export { ExecutionState as BatchState };
+export type { SamplingParams };
 
 export interface Qwen3Config {
   hiddenSize: number;
@@ -140,7 +141,7 @@ export class Qwen3Model extends ChatModel {
     return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
   }
 
-  forward(state: BatchState): Tensor {
+  forward(state: ExecutionState): Tensor {
     const ws = state.ws;
     using _tracker = ws.startTracking();
     const pagedKV = state.cache.getPagedKV();

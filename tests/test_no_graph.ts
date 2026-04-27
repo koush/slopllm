@@ -84,7 +84,7 @@ describe("Qwen3-0.6B Paris (1 GPU, no graph)", () => {
     const { eosIds, cache, ws, model, parisTokenId } = ctx;
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
     cache.reset(1);
-    let currentToken = ws.forwardEager(model, [inputIds], cache)[0];
+    let currentToken = ws.forwardEagerPrefill(model, [inputIds], cache)[0];
     const generated: number[] = [currentToken];
     for (let i = 1; i < 64 && !eosIds.has(currentToken); i++) {
       currentToken = ws.forwardEagerDecode(model, [currentToken], cache)[0];
@@ -110,7 +110,7 @@ describe("Qwen3-0.6B-FP8 Paris (1 GPU, no graph)", () => {
     const { eosIds, cache, ws, model, parisTokenId } = ctx;
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
     cache.reset(1);
-    let currentToken = ws.forwardEager(model, [inputIds], cache)[0];
+    let currentToken = ws.forwardEagerPrefill(model, [inputIds], cache)[0];
     const generated: number[] = [currentToken];
     for (let i = 1; i < 64 && !eosIds.has(currentToken); i++) {
       currentToken = ws.forwardEagerDecode(model, [currentToken], cache)[0];
@@ -136,7 +136,7 @@ describe("Qwen3.5-0.8B Paris (1 GPU, no graph)", () => {
     const { eosIds, cache, ws, model, parisTokenId } = ctx;
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
     cache.reset(1);
-    let currentToken = ws.forwardEager(model, [inputIds], cache)[0];
+    let currentToken = ws.forwardEagerPrefill(model, [inputIds], cache)[0];
     const generated: number[] = [currentToken];
     for (let i = 1; i < 20 && !eosIds.has(currentToken); i++) {
       currentToken = ws.forwardEagerDecode(model, [currentToken], cache)[0];
@@ -168,7 +168,7 @@ describe("Qwen3-0.6B Paris (2 GPU, no graph)", () => {
     const { eosIds, cache, ws, model, parisTokenId } = ctx;
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
     cache.reset(1);
-    let currentToken = ws.forwardEager(model, [inputIds], cache)[0];
+    let currentToken = ws.forwardEagerPrefill(model, [inputIds], cache)[0];
     const generated: number[] = [currentToken];
     for (let i = 1; i < 64 && !eosIds.has(currentToken); i++) {
       currentToken = ws.forwardEagerDecode(model, [currentToken], cache)[0];
@@ -198,7 +198,7 @@ describe("Qwen3-0.6B-FP8 Paris (2 GPU, no graph)", () => {
     const { eosIds, cache, ws, model, parisTokenId } = ctx;
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
     cache.reset(1);
-    let currentToken = ws.forwardEager(model, [inputIds], cache)[0];
+    let currentToken = ws.forwardEagerPrefill(model, [inputIds], cache)[0];
     const generated: number[] = [currentToken];
     for (let i = 1; i < 64 && !eosIds.has(currentToken); i++) {
       currentToken = ws.forwardEagerDecode(model, [currentToken], cache)[0];
@@ -228,7 +228,7 @@ describe("Qwen3.5-0.8B Paris (2 GPU, no graph)", () => {
     const { eosIds, cache, ws, model, parisTokenId } = ctx;
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
     cache.reset(1);
-    let currentToken = ws.forwardEager(model, [inputIds], cache)[0];
+    let currentToken = ws.forwardEagerPrefill(model, [inputIds], cache)[0];
     const generated: number[] = [currentToken];
     for (let i = 1; i < 20 && !eosIds.has(currentToken); i++) {
       currentToken = ws.forwardEagerDecode(model, [currentToken], cache)[0];

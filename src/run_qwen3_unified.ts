@@ -154,7 +154,7 @@ export function* generateStream(
   const suffixIds = cache.prefixMatch(0, inputIds);
   cache.appendTokens(0, suffixIds);
 
-  const firstTokens = ws.forwardEager(model, [suffixIds], cache);
+  const firstTokens = ws.forwardEagerPrefill(model, [suffixIds], cache);
   let currentToken = firstTokens[0];
   yield currentToken;
   cache.appendTokens(0, [currentToken]);
@@ -180,7 +180,8 @@ export function* generateStream(
   try {
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
     const tPlan = performance.now();
-    const state = ws.planDecode(model, [currentToken], cache, useGraph);
+    const state = ws.planDecode(model, 1, cache, useGraph);
+    state.prepareInput([currentToken]);
     planMs += performance.now() - tPlan;
 
     const tExec = performance.now();
@@ -264,7 +265,7 @@ export function generateBatchTokens(
 ): number[][] {
   const batchSize = inputIdsList.length;
   cache.reset(batchSize);
-  const firstTokens = ws.forwardEager(model, inputIdsList, cache);
+  const firstTokens = ws.forwardEagerPrefill(model, inputIdsList, cache);
 
   const nextTokens = [...firstTokens];
   const generated: number[][] = nextTokens.map(t => [t]);

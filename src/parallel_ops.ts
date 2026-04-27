@@ -1130,6 +1130,17 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number): void {
+    const pPositionIds = this.cast(positionIds);
+    const pLastPageLen = this.cast(lastPageLen);
+    const pSlotMapping = this.cast(slotMapping);
+    const pIndptr = this.cast(indptr);
+    const pIndices = this.cast(indices);
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].decodeStep(pPositionIds.shards[i], pLastPageLen.shards[i], pSlotMapping.shards[i], pIndptr.shards[i], pIndices.shards[i], pageSize, batchSize);
+    }
+  }
+
   batchDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, enableCudaGraph: boolean): void {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);

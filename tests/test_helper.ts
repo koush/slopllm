@@ -7,7 +7,7 @@ export function generateBatchTokens(
 ): number[][] {
   const batchSize = inputIdsList.length;
   cache.reset(batchSize);
-  const firstTokens = ws.forwardEager(model, inputIdsList, cache);
+  const firstTokens = ws.forwardEagerPrefill(model, inputIdsList, cache);
 
   const nextTokens = [...firstTokens];
   const generated: number[][] = nextTokens.map(t => [t]);
@@ -39,7 +39,7 @@ export function* generateTokens(
   sampling?: SamplingParams,
 ): Generator<number> {
   cache.reset(1);
-  const firstTokens = ws.forwardEager(model, [inputIds], cache);
+  const firstTokens = ws.forwardEagerPrefill(model, [inputIds], cache);
   let nextToken = firstTokens[0];
   yield nextToken;
 
@@ -49,7 +49,8 @@ export function* generateTokens(
     if (eosIds.has(nextToken)) break;
 
     if (sampling) {
-      const state = ws.planDecode(model, [nextToken], cache);
+      const state = ws.planDecode(model, 1, cache);
+      state.prepareInput([nextToken]);
       ws.forwardInput(state);
       const logits = model.forward(state);
       nextToken = logits.sampleTokenGPU(sampling, tokenHistory).readInt32LE()[0];

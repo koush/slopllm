@@ -41,13 +41,13 @@ describe("Qwen3-0.6B batch tests", () => {
     using pagedKV = makePagedKV();
     using singleKV = makePagedKV(1);
     pagedKV.reset(2);
-    const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
+    const batchTokens = ws.forwardEagerPrefill(model, [PROMPT1, PROMPT2], pagedKV);
 
     singleKV.reset(1);
-    const singleToken1 = ws.forwardEager(model, [PROMPT1], singleKV)[0];
+    const singleToken1 = ws.forwardEagerPrefill(model, [PROMPT1], singleKV)[0];
 
     singleKV.reset(1);
-    const singleToken2 = ws.forwardEager(model, [PROMPT2], singleKV)[0];
+    const singleToken2 = ws.forwardEagerPrefill(model, [PROMPT2], singleKV)[0];
 
     assert.equal(batchTokens[0], singleToken1,
       `Seq1 prefill token mismatch: batch=${batchTokens[0]}, single=${singleToken1}`);
@@ -58,7 +58,7 @@ describe("Qwen3-0.6B batch tests", () => {
   it("batch prefill paged then decode", () => {
     using pagedKV = makePagedKV();
     pagedKV.reset(2);
-    const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
+    const batchTokens = ws.forwardEagerPrefill(model, [PROMPT1, PROMPT2], pagedKV);
     pagedKV.updateIndptr(ws);
 
     const decodeTokens = ws.forwardEagerDecode(model, batchTokens, pagedKV);
@@ -74,15 +74,15 @@ describe("Qwen3-0.6B batch tests", () => {
     const fullPrompt = [...PROMPT1, ...suffix];
 
     pagedKV.reset(1);
-    const tokensFull = ws.forwardEager(model, [fullPrompt], pagedKV);
+    const tokensFull = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
 
     pagedKV.reset(1);
-    ws.forwardEager(model, [PROMPT1], pagedKV);
+    ws.forwardEagerPrefill(model, [PROMPT1], pagedKV);
     pagedKV.updateIndptr(ws);
-    const tokensAppend = ws.forwardEager(model, [suffix], pagedKV);
+    const tokensAppend = ws.forwardEagerPrefill(model, [suffix], pagedKV);
 
     singleKV.reset(1);
-    const singleToken = ws.forwardEager(model, [fullPrompt], singleKV)[0];
+    const singleToken = ws.forwardEagerPrefill(model, [fullPrompt], singleKV)[0];
 
     assert.equal(tokensFull[0], singleToken,
       `Full paged prefill mismatch: paged=${tokensFull[0]}, single=${singleToken}`);
@@ -97,24 +97,24 @@ describe("Qwen3-0.6B batch tests", () => {
     const fullPrompt = [...PROMPT1, ...suffix];
 
     pagedKV.reset(1);
-    ws.forwardEager(model, [PROMPT1], pagedKV);
+    ws.forwardEagerPrefill(model, [PROMPT1], pagedKV);
     pagedKV.updateIndptr(ws);
-    ws.forwardEager(model, [suffix], pagedKV);
+    ws.forwardEagerPrefill(model, [suffix], pagedKV);
     pagedKV.updateIndptr(ws);
 
     pagedKV.truncate(0, PROMPT1.length);
     pagedKV.updateIndptr(ws);
-    const tokensTruncAppend = ws.forwardEager(model, [suffix], pagedKV);
+    const tokensTruncAppend = ws.forwardEagerPrefill(model, [suffix], pagedKV);
 
     using pagedKV2 = makePagedKV(1, 256);
     pagedKV2.reset(1);
-    const tokensFull = ws.forwardEager(model, [fullPrompt], pagedKV2);
+    const tokensFull = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV2);
 
     assert.equal(tokensTruncAppend[0], tokensFull[0],
       `Truncate+append mismatch: trunc_append=${tokensTruncAppend[0]}, full=${tokensFull[0]}`);
 
     singleKV.reset(1);
-    const singleToken = ws.forwardEager(model, [fullPrompt], singleKV)[0];
+    const singleToken = ws.forwardEagerPrefill(model, [fullPrompt], singleKV)[0];
     assert.equal(tokensTruncAppend[0], singleToken,
       `Truncate+append vs single mismatch: trunc_append=${tokensTruncAppend[0]}, single=${singleToken}`);
   });
@@ -123,16 +123,16 @@ describe("Qwen3-0.6B batch tests", () => {
     using pagedKV = makePagedKV();
     using singleKV = makePagedKV(1);
     pagedKV.reset(2);
-    const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
+    const batchTokens = ws.forwardEagerPrefill(model, [PROMPT1, PROMPT2], pagedKV);
     const token1 = batchTokens[0];
     const token2 = batchTokens[1];
 
     singleKV.reset(1);
-    const singleFirst1 = ws.forwardEager(model, [PROMPT1], singleKV)[0];
+    const singleFirst1 = ws.forwardEagerPrefill(model, [PROMPT1], singleKV)[0];
     const singleDecode1 = ws.forwardEagerDecode(model, [singleFirst1], singleKV)[0];
 
     singleKV.reset(1);
-    const singleFirst2 = ws.forwardEager(model, [PROMPT2], singleKV)[0];
+    const singleFirst2 = ws.forwardEagerPrefill(model, [PROMPT2], singleKV)[0];
     const singleDecode2 = ws.forwardEagerDecode(model, [singleFirst2], singleKV)[0];
 
     const batchDecodeTokens = ws.forwardEagerDecode(model, [token1, token2], pagedKV);
@@ -146,7 +146,7 @@ describe("Qwen3-0.6B batch tests", () => {
   it("batch multi-step decode", () => {
     using pagedKV = makePagedKV();
     pagedKV.reset(2);
-    const batchTokens = ws.forwardEager(model, [PROMPT1, PROMPT2], pagedKV);
+    const batchTokens = ws.forwardEagerPrefill(model, [PROMPT1, PROMPT2], pagedKV);
     pagedKV.updateIndptr(ws);
 
     let current = [batchTokens[0], batchTokens[1]];
@@ -191,19 +191,21 @@ describe("Qwen3-0.6B batch tests", () => {
     const prompt = PROMPT_GRAPH;
 
     pagedKV.reset(1);
-    const tokens = gws.forwardEager(model, [prompt], pagedKV);
+    const tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
     pagedKV.updateIndptr(gws);
 
-    const stateRef = gws.planDecode(model, [tokens[0]], pagedKV, true);
+    const stateRef = gws.planDecode(model, 1, pagedKV, true);
+    stateRef.prepareInput([tokens[0]]);
     gws.forwardInput(stateRef);
     const logitsRef = model.forward(stateRef);
     using argmaxRef = logitsRef.argmax();
     const tokensRef = argmaxRef.readInt32LE();
 
     pagedKV.reset(1);
-    const tokens2 = gws.forwardEager(model, [prompt], pagedKV);
+    const tokens2 = gws.forwardEagerPrefill(model, [prompt], pagedKV);
     pagedKV.updateIndptr(gws);
-    const state = gws.planDecode(model, [tokens2[0]], pagedKV, true);
+    const state = gws.planDecode(model, 1, pagedKV, true);
+    state.prepareInput([tokens2[0]]);
 
     glm.graphBeginCapture();
     gws.forwardInput(state);
@@ -215,9 +217,10 @@ describe("Qwen3-0.6B batch tests", () => {
 
     using ws2 = new ExecutionWorkspace(glm, 4, 4096);
     pagedKV.reset(1);
-    const tokens3 = ws2.forwardEager(model, [prompt], pagedKV);
+    const tokens3 = ws2.forwardEagerPrefill(model, [prompt], pagedKV);
     pagedKV.updateIndptr(ws2);
-    gws.planDecode(model, [tokens3[0]], pagedKV, true);
+    const replayState = gws.planDecode(model, 1, pagedKV, true);
+    replayState.prepareInput([tokens3[0]]);
 
     glm.graphLaunch(graphExec);
     glm.synchronize();
@@ -237,13 +240,14 @@ describe("Qwen3-0.6B batch tests", () => {
     const prompt = PROMPT_GRAPH;
 
     pagedKV.reset(1);
-    let tokens = gws.forwardEager(model, [prompt], pagedKV);
+    let tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
     pagedKV.updateIndptr(gws);
 
     const refTokens: number[] = [];
     let current = tokens[0];
     for (let step = 0; step < numSteps; step++) {
-      const state = gws.planDecode(model, [current], pagedKV, true);
+      const state = gws.planDecode(model, 1, pagedKV, true);
+      state.prepareInput([current]);
       gws.forwardInput(state);
       const logits = model.forward(state);
       using argmaxResult = logits.argmax();
@@ -252,18 +256,20 @@ describe("Qwen3-0.6B batch tests", () => {
     }
 
     pagedKV.reset(1);
-    tokens = gws.forwardEager(model, [prompt], pagedKV);
+    tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
     pagedKV.updateIndptr(gws);
 
     current = tokens[0];
-    const warmupState = gws.planDecode(model, [current], pagedKV, true);
+    const warmupState = gws.planDecode(model, 1, pagedKV, true);
+    warmupState.prepareInput([current]);
     gws.forwardInput(warmupState);
     const warmupLogits = model.forward(warmupState);
     using warmupArgmax = warmupLogits.argmax();
     current = warmupArgmax.readInt32LE()[0];
     assert.equal(current, refTokens[0], `Warmup mismatch: ${current} != ${refTokens[0]}`);
 
-    const state = gws.planDecode(model, [current], pagedKV, true);
+    const state = gws.planDecode(model, 1, pagedKV, true);
+    state.prepareInput([current]);
     glm.graphBeginCapture();
     gws.forwardInput(state);
     const captureLogits = model.forward(state);
@@ -280,7 +286,8 @@ describe("Qwen3-0.6B batch tests", () => {
     assert.equal(current, refTokens[1], `Replay step 1 mismatch: ${current} != ${refTokens[1]}`);
 
     for (let step = 2; step < numSteps; step++) {
-      gws.planDecode(model, [current], pagedKV, true);
+      const replayState = gws.planDecode(model, 1, pagedKV, true);
+      replayState.prepareInput([current]);
       glm.graphLaunch(graphExec);
       glm.synchronize();
       current = captureArgmax.readInt32LE()[0];
@@ -307,7 +314,7 @@ describe("Qwen3-0.6B batch tests", () => {
     });
 
     pagedKV.reset(1);
-    const state = ws.plan(model, [PROMPT_GRAPH], pagedKV);
+    const state = ws.planPrefill(model, [PROMPT_GRAPH], pagedKV);
     ws.forwardInput(state);
     const logits = model.forward(state);
     using argmaxOut = logits.argmax();
@@ -337,7 +344,7 @@ describe("Qwen3-0.6B batch tests", () => {
     });
 
     pagedKV.reset(2);
-    const state = ws.plan(model, [PROMPT1, PROMPT2], pagedKV);
+    const state = ws.planPrefill(model, [PROMPT1, PROMPT2], pagedKV);
     ws.forwardInput(state);
     const logits = model.forward(state);
     using argmaxOut2 = logits.argmax();

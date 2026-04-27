@@ -744,6 +744,30 @@ static Napi::Value KvCacheWrite(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value DecodeStep(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (ctx, position_ids, last_page_len, slot_mapping, indptr, indices, page_size, batch_size)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t position_ids_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t last_page_len_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t slot_mapping_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t indptr_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t indices_ptr = info[5].As<Napi::Number>().Int64Value();
+    uint32_t page_size = info[6].As<Napi::Number>().Uint32Value();
+    uint32_t batch_size = info[7].As<Napi::Number>().Uint32Value();
+    glm_decode_step(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                     reinterpret_cast<int32_t*>(position_ids_ptr),
+                     reinterpret_cast<int32_t*>(last_page_len_ptr),
+                     reinterpret_cast<int32_t*>(slot_mapping_ptr),
+                     reinterpret_cast<const int32_t*>(indptr_ptr),
+                     reinterpret_cast<const int32_t*>(indices_ptr),
+                     page_size, batch_size);
+    return env.Undefined();
+}
+
 static Napi::Value Memcpy(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 5) {
@@ -1696,6 +1720,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "max"), Napi::Function::New(env, Max));
     exports.Set(Napi::String::New(env, "memcpy"), Napi::Function::New(env, Memcpy));
     exports.Set(Napi::String::New(env, "kvCacheWrite"), Napi::Function::New(env, KvCacheWrite));
+    exports.Set(Napi::String::New(env, "decodeStep"), Napi::Function::New(env, DecodeStep));
     exports.Set(Napi::String::New(env, "synchronize"), Napi::Function::New(env, Synchronize));
     exports.Set(Napi::String::New(env, "setStream"), Napi::Function::New(env, SetStream));
     exports.Set(Napi::String::New(env, "eventRecord"), Napi::Function::New(env, EventRecord));

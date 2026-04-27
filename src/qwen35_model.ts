@@ -5,7 +5,7 @@ import { ChatModel, SamplingParams } from "./chat_model";
 import { DeviceOps, GdnQkvLayout, TensorParallelism } from "./device_ops";
 import { f32ToBf16Bytes, GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
-import type { BatchState } from "./paged_kv";
+import { ExecutionState } from "./paged_kv";
 import { ExecutionWorkspace, PagedKVCache } from "./paged_kv";
 import { Qwen35GdnState } from "./qwen35_gdn_state";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
@@ -378,7 +378,7 @@ export class Qwen35Model extends ChatModel {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  private fullAttnLayer(normed: Tensor, residual: Tensor, layerIdx: number, state: BatchState, cos: Tensor, sin: Tensor): { normed: Tensor, residual: Tensor } {
+  private fullAttnLayer(normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState, cos: Tensor, sin: Tensor): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const ws = state.ws;
     const hs = cfg.hiddenSize;
@@ -442,7 +442,7 @@ export class Qwen35Model extends ChatModel {
     }
   }
 
-  forward(state: BatchState): Tensor {
+  forward(state: ExecutionState): Tensor {
     const ws = state.ws;
     using _tracker = ws.startTracking();
     const cache = state.cache as Qwen35ChatCache;

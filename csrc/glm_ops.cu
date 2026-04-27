@@ -1549,4 +1549,57 @@ void glm_kv_cache_write(GlmCtx* ctx,
         src_v_token_stride, src_v_head_stride);
 }
 
+// ---------------------------------------------------------------------------
+// Decode step bookkeeping kernel
+// Increments position_ids, computes slot_mapping and last_page_len
+// for batch decode. All tensors are device-side.
+// position_ids: [batch_size] int32 — incremented by 1 in-place
+// last_page_len: [batch_size] int32 — computed from position + page_size
+// slot_mapping: [batch_size] int32 — computed from position + indices + indptr
+// indptr: [batch_size + 1] int32 — page table indptr (read-only)
+// indices: [max_pages] int32 — page table indices (read-only)
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(128) decode_step_kernel(
+    int32_t* position_ids,
+    int32_t* last_page_len,
+    int32_t* slot_mapping,
+    const int32_t* indptr,
+    const int32_t* indices,
+    uint32_t page_size,
+    uint32_t batch_size
+) {
+    uint32_t seq = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seq >= batch_size) return;
+
+    int32_t pos = position_ids[seq] + 1;
+    position_ids[seq] = pos;
+
+    int32_t kv_len = pos + 1;
+    int32_t remainder = kv_len % (int32_t)page_size;
+    last_page_len[seq] = (remainder != 0) ? remainder : (int32_t)page_size;
+
+    int32_t page_idx = pos / (int32_t)page_size;
+    int32_t page_offset = pos % (int32_t)page_size;
+    int32_t seq_page_start = indptr[seq];
+    int32_t abs_page = indices[seq_page_start + page_idx];
+    slot_mapping[seq] = abs_page * (int32_t)page_size + page_offset;
+}
+
+void glm_decode_step(GlmCtx* ctx,
+                      int32_t* position_ids,
+                      int32_t* last_page_len,
+                      int32_t* slot_mapping,
+                      const int32_t* indptr,
+                      const int32_t* indices,
+                      uint32_t page_size,
+                      uint32_t batch_size) {
+    cudaSetDevice(ctx->device_id);
+    dim3 grid((batch_size + 127) / 128);
+    dim3 block(128);
+    decode_step_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
+        position_ids, last_page_len, slot_mapping,
+        indptr, indices, page_size, batch_size);
+}
+
 

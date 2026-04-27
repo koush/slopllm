@@ -74,7 +74,7 @@ function generateWithGraph(
   const { eosIds, cache, ws, model } = ctx;
   cache.reset(1);
 
-  const firstTokens = ws.forwardEager(model, [inputIds], cache);
+  const firstTokens = ws.forwardEagerPrefill(model, [inputIds], cache);
   let currentToken = firstTokens[0];
   const generated: number[] = [currentToken];
   cache.appendTokens(0, [currentToken]);
@@ -85,7 +85,8 @@ function generateWithGraph(
   let argmaxResult: any = null;
 
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
-    const state = ws.planDecode(model, [currentToken], cache, true);
+    const state = ws.planDecode(model, 1, cache, true);
+    state.prepareInput([currentToken]);
 
     if (graphExec !== null) {
       graph.graphLaunch(graphExec);

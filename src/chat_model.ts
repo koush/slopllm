@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DeviceOps } from "./device_ops";
 import { mmapOpen, mmapClose } from "./glm_ops";
-import { PagedKVCache, type BatchState } from "./paged_kv";
+import { PagedKVCache, ExecutionState } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
@@ -40,7 +40,7 @@ export abstract class ChatModel extends WorkspaceBase {
   }
 
   abstract createChatCache(maxPages?: number): ChatCache;
-  abstract forward(state: BatchState): Tensor;
+  abstract forward(state: ExecutionState): Tensor;
 
   prefillBatchPlanHook(_inputIdsList: number[][], _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void {}
 

@@ -16,8 +16,8 @@
     "start:qwen35-chat": "node dist/src/run_qwen3_unified.js --qwen35",
     "start:unified": "node dist/src/run_qwen3_unified.js",
     "dev": "tsc --watch",
-    "pretest": "npm run build:all",
-    "test:node": "node --test dist/tests/test_all.js",
+    "pretest": "npm run build:addon",
+    "test:node": "tsx --test tests/test_all.ts",
     "test": "npm run test:python && npm run test:node"
   },
   "keywords": [],

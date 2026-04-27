@@ -9,14 +9,42 @@ export const PAGE_SIZE = 16;
 export const DECODE_PLAN_INFO_SIZE = 10;
 export const PREFILL_PLAN_INFO_SIZE = 15;
 
-export interface BatchState {
+export class ExecutionState {
   batchSize: number;
   totalTokens: number;
   seqLens: number[];
+  decodeInput?: Tensor;
   readonly isDecode: boolean;
   readonly ws: ExecutionWorkspace;
   readonly cache: ChatCache;
   readonly qoIndptrHost?: Tensor;
+
+  constructor(
+    batchSize: number, totalTokens: number, seqLens: number[],
+    isDecode: boolean, ws: ExecutionWorkspace, cache: ChatCache,
+    qoIndptrHost?: Tensor,
+  ) {
+    this.batchSize = batchSize;
+    this.totalTokens = totalTokens;
+    this.seqLens = seqLens;
+    this.isDecode = isDecode;
+    this.ws = ws;
+    this.cache = cache;
+    this.qoIndptrHost = qoIndptrHost;
+  }
+
+  prepareInput(tokenIds: number[]) {
+    if (!this.isDecode)
+      throw new Error("decodeInput should be null in prefill");
+
+    const batchSize = tokenIds.length;
+    this.ws.inputIdsBufH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        buf.writeInt32LE(tokenIds[i], i * I32);
+      }
+    });
+    this.decodeInput = this.ws.inputIdsBufH;
+  }
 }
 
 function longestPrefix(a: number[], b: number[]): number {
@@ -69,21 +97,39 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.lastPageLenH = this.allocPinned([B], "I32", "lastPageLenH");
   }
 
-  forwardInput(state: BatchState): void {
+  forwardInput(state: ExecutionState): void {
     const pagedKV = state.cache.getPagedKV();
     const batchSize = state.batchSize;
+    let decodeInput = state.decodeInput;
 
     pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
     this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
 
     if (state.isDecode) {
-      this.inputIdsBuf.memcpy(this.inputIdsBufH, batchSize * I32, MemcpyKind.HostToDevice);
+      if (!decodeInput) {
+        throw new Error("decodeInput tensor is required for decode mode");
+      }
+
+      if (decodeInput.pinned) {
+        this.inputIdsBuf.memcpy(decodeInput, batchSize * I32, MemcpyKind.HostToDevice);
+      }
+      else {
+        this.inputIdsBuf.memcpy(decodeInput, batchSize * I32, MemcpyKind.DeviceToDevice);
+      }
       this.slotMapping.memcpy(this.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
       this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
     } else if (state.qoIndptrHost) {
       this.qoIndptrD.memcpy(state.qoIndptrHost, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     }
+  }
+
+  decodeStep(pagedKV: PagedKVCache, batchSize: number): void {
+    this.glm.decodeStep(
+      this.positionIds, this.lastPageLen, this.slotMapping,
+      this.indptrD, pagedKV.indices,
+      pagedKV.pageSize, batchSize
+    );
   }
 
   flashDecode(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
@@ -114,7 +160,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  kvCacheWrite(kRope: Tensor, vBuf: Tensor, state: BatchState, cacheIdx: number, nKv: number, hd: number): void {
+  kvCacheWrite(kRope: Tensor, vBuf: Tensor, state: ExecutionState, cacheIdx: number, nKv: number, hd: number): void {
     const pagedKV = state.cache.getPagedKV();
     const BS = state.totalTokens;
     const kTokenStride = state.isDecode ? nKv * hd : hd;
@@ -130,26 +176,19 @@ export class ExecutionWorkspace extends WorkspaceBase {
     );
   }
 
-  planDecode(model: ChatModel, tokenIds: number[], cache: ChatCache, enableCudaGraph = false): BatchState {
+  planDecode(model: ChatModel, batchSize: number, cache: ChatCache, enableCudaGraph = false): ExecutionState {
     const pagedKV = cache.getPagedKV();
     const cfg = model.cfg;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
     const pageSize = pagedKV.pageSize;
-    const batchSize = tokenIds.length;
     const seqLens = new Array(batchSize).fill(1) as number[];
     const totalTokens = batchSize;
 
     if (pagedKV.seqPages.length !== batchSize) {
       throw new Error(`planDecode: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
     }
-
-    this.inputIdsBufH.withPinnedBuffer(buf => {
-      for (let i = 0; i < batchSize; i++) {
-        buf.writeInt32LE(tokenIds[i], i * I32);
-      }
-    });
 
     const writeLocations: [number, number][] = [];
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -181,10 +220,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
       enableCudaGraph
     );
 
-    return { batchSize, totalTokens, seqLens, isDecode: true, ws: this, cache };
+    return new ExecutionState(batchSize, totalTokens, seqLens, true, this, cache);
   }
 
-  planPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): BatchState {
+  planPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): ExecutionState {
     const pagedKV = cache.getPagedKV();
     const cfg = model.cfg;
     const nHeads = cfg.numAttentionHeads;
@@ -271,35 +310,25 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
     this.slotMapping.h2d(slotMappingBuf);
 
-    return { batchSize, totalTokens, seqLens, isDecode: false, ws: this, cache, qoIndptrHost };
+    return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, qoIndptrHost);
   }
 
-  plan(model: ChatModel, inputIdsList: number[][], cache: ChatCache, enableCudaGraph = false): BatchState {
-    const isDecode = inputIdsList.every(ids => ids.length === 1);
-    if (isDecode) {
-      return this.planDecode(model, inputIdsList.map(ids => ids[0]), cache, enableCudaGraph);
-    }
-    if (enableCudaGraph) {
-      throw new Error("enableCudaGraph requires all sequences to have length 1 (decode mode)");
-    }
-    return this.planPrefill(model, inputIdsList, cache);
-  }
-
-  forwardEager(model: ChatModel, inputIdsList: number[][], cache: ChatCache): number[] {
-    const state = this.plan(model, inputIdsList, cache);
+  forwardEagerPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): number[] {
+    const state = this.planPrefill(model, inputIdsList, cache);
     this.forwardInput(state);
     const logits = model.forward(state);
     using argmaxResult = logits.argmax();
     return argmaxResult.readInt32LE();
   }
 
-  forwardDecode(model: ChatModel, state: BatchState): Tensor {
+  forwardDecode(model: ChatModel, state: ExecutionState): Tensor {
     this.forwardInput(state);
     return model.forward(state);
   }
 
   forwardEagerDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache): number[] {
-    const state = this.planDecode(model, tokenIdsList, cache);
+    const state = this.planDecode(model, tokenIdsList.length, cache);
+    state.prepareInput(tokenIdsList);
     this.forwardInput(state);
     const logits = model.forward(state);
     using argmaxResult = logits.argmax();
