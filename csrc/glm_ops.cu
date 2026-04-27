@@ -262,6 +262,11 @@ void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
     int total_rows = batch * n_heads * seq_len;
     int block_size = 256;
     if (block_size > head_dim) block_size = (head_dim + 31) / 32 * 32;
+    int p = 1;
+    while (p < block_size) p <<= 1;
+    block_size = p;
+    if (block_size > 256) block_size = 256;
+    if (block_size < 32) block_size = 32;
     size_t shared_mem = block_size * sizeof(float);
     fused_norm_rope_kernel<<<total_rows, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
