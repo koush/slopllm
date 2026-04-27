@@ -50,10 +50,10 @@ describe("withStream", () => {
     glm.synchronize();
     const refData = readBf16(refResult, M * N);
 
-    const syncStream = glm.withStream(() => input.linear(weight, M));
-    using streamOut = syncStream();
+    using syncStream = glm.withStream(() => input.linear(weight, M));
+    syncStream.sync();
     glm.synchronize();
-    const streamData = readBf16(streamOut, M * N);
+    const streamData = readBf16(syncStream.result, M * N);
     assert.ok(bf16Near(refData, streamData), "stream result should match reference");
   });
 
@@ -80,12 +80,12 @@ describe("withStream", () => {
     const refAData = readBf16(refA, M * N);
     const refBData = readBf16(refB, M * N);
 
-    const syncA = glm.withStream(() => input.linear(wA, M));
+    using syncA = glm.withStream(() => input.linear(wA, M));
     const refMain = input.linear(wB, M);
-    using streamOutA = syncA();
+    syncA.sync();
 
     glm.synchronize();
-    const streamAData = readBf16(streamOutA, M * N);
+    const streamAData = readBf16(syncA.result, M * N);
     const streamBData = readBf16(refMain, M * N);
 
     assert.ok(bf16Near(refAData, streamAData), "stream A result should match reference");
@@ -107,23 +107,20 @@ describe("withStream", () => {
     input.h2d(f32ToBf16Bytes(inputF32));
     weight.h2d(f32ToBf16Bytes(weightF32));
 
-    // Reference: linear on stream 0
     native.linear(glm.ctx, output.data, input.data, weight.data, M, N, K);
     glm.synchronize();
     const refData = readBf16(output, M * N);
 
-    // Warmup
     for (let i = 0; i < 2; i++) {
-      const sync = glm.withStream(() => { native.linear(glm.ctx, output.data, input.data, weight.data, M, N, K); });
-      sync();
+      using sync = glm.withStream(() => { native.linear(glm.ctx, output.data, input.data, weight.data, M, N, K); });
+      sync.sync();
       native.linear(glm.ctx, output.data, input.data, weight.data, M, N, K);
     }
     glm.synchronize();
 
-    // Capture graph with withStream
     glm.graphBeginCapture();
-    const sync = glm.withStream(() => { native.linear(glm.ctx, output.data, input.data, weight.data, M, N, K); });
-    sync();
+    using sync = glm.withStream(() => { native.linear(glm.ctx, output.data, input.data, weight.data, M, N, K); });
+    sync.sync();
     native.linear(glm.ctx, output.data, input.data, weight.data, M, N, K);
     const graph = glm.graphEndCapture();
     const graphExec = glm.graphInstantiate(graph);
@@ -159,25 +156,22 @@ describe("withStream", () => {
     wA.h2d(f32ToBf16Bytes(wAF32));
     wB.h2d(f32ToBf16Bytes(wBF32));
 
-    // Reference: serial execution
     native.linear(glm.ctx, outA.data, input.data, wA.data, M, N, K);
     native.linear(glm.ctx, outB.data, input.data, wB.data, M, N, K);
     glm.synchronize();
     const refAData = readBf16(outA, M * N);
     const refBData = readBf16(outB, M * N);
 
-    // Warmup
     for (let i = 0; i < 2; i++) {
-      const syncA = glm.withStream(() => { native.linear(glm.ctx, outA.data, input.data, wA.data, M, N, K); });
-      syncA();
+      using syncA = glm.withStream(() => { native.linear(glm.ctx, outA.data, input.data, wA.data, M, N, K); });
+      syncA.sync();
       native.linear(glm.ctx, outB.data, input.data, wB.data, M, N, K);
     }
     glm.synchronize();
 
-    // Capture: stream A does linear(wA), stream 0 does linear(wB)
     glm.graphBeginCapture();
-    const syncA = glm.withStream(() => { native.linear(glm.ctx, outA.data, input.data, wA.data, M, N, K); });
-    syncA();
+    using syncA = glm.withStream(() => { native.linear(glm.ctx, outA.data, input.data, wA.data, M, N, K); });
+    syncA.sync();
     native.linear(glm.ctx, outB.data, input.data, wB.data, M, N, K);
     const graph = glm.graphEndCapture();
     const graphExec = glm.graphInstantiate(graph);
@@ -207,22 +201,23 @@ describe("withStream", () => {
     input.h2d(f32ToBf16Bytes(inputF32));
     weight.h2d(f32ToBf16Bytes(weightF32));
 
-    const syncs: (() => unknown)[] = [];
+    type StreamSync = Disposable & { result: Tensor; sync(): void };
+    const syncs: StreamSync[] = [];
     for (let i = 0; i < 7; i++) {
-      syncs.push(glm.withStream(() => input.linear(weight, M)));
+      syncs.push(glm.withStream(() => input.linear(weight, M)) as StreamSync);
     }
 
     assert.throws(() => {
       glm.withStream(() => {});
     }, /No available streams/);
 
-    for (const sync of syncs) sync();
+    for (const sync of syncs) { sync.sync(); (sync as Disposable)[Symbol.dispose](); }
 
     {
-      const sync = glm.withStream(() => input.linear(weight, M));
-      using result = sync();
+      using sync = glm.withStream(() => input.linear(weight, M));
+      sync.sync();
       glm.synchronize();
-      const data = readBf16(result, M * N);
+      const data = readBf16(sync.result, M * N);
       assert.ok(data.length === M * N, "result should have correct length");
     }
   });

@@ -130,7 +130,61 @@ export class ExecutionWorkspace extends WorkspaceBase {
     );
   }
 
-  plan(model: ChatModel, inputIdsList: number[][], cache: ChatCache, enableCudaGraph = false): BatchState {
+  planDecode(model: ChatModel, tokenIds: number[], cache: ChatCache, enableCudaGraph = false): BatchState {
+    const pagedKV = cache.getPagedKV();
+    const cfg = model.cfg;
+    const nHeads = cfg.numAttentionHeads;
+    const nKv = cfg.numKeyValueHeads;
+    const hd = cfg.headDim;
+    const pageSize = pagedKV.pageSize;
+    const batchSize = tokenIds.length;
+    const seqLens = new Array(batchSize).fill(1) as number[];
+    const totalTokens = batchSize;
+
+    if (pagedKV.seqPages.length !== batchSize) {
+      throw new Error(`planDecode: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+    }
+
+    this.inputIdsBufH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        buf.writeInt32LE(tokenIds[i], i * I32);
+      }
+    });
+
+    const writeLocations: [number, number][] = [];
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
+    }
+
+    pagedKV.updateIndptr(this);
+
+    this.slotMappingH.withPinnedBuffer(buf => {
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        const [absPage, slotInPage] = writeLocations[seqIdx];
+        buf.writeInt32LE(absPage * pageSize + slotInPage, seqIdx * I32);
+      }
+    });
+
+    this.positionIdsH.withPinnedBuffer(buf => {
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        buf.writeInt32LE(pagedKV.seqKvLens[seqIdx] - 1, seqIdx * I32);
+      }
+    });
+
+    this.glm.batchDecodePlan(
+      this.floatWs, BATCH_FLOAT_WS_SIZE,
+      this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+      this.decodePlanInfo,
+      this.indptrH,
+      batchSize,
+      nHeads, nKv, hd, pageSize,
+      enableCudaGraph
+    );
+
+    return { batchSize, totalTokens, seqLens, isDecode: true, ws: this, cache };
+  }
+
+  planPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): BatchState {
     const pagedKV = cache.getPagedKV();
     const cfg = model.cfg;
     const nHeads = cfg.numAttentionHeads;
@@ -140,57 +194,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const batchSize = inputIdsList.length;
     const seqLens = inputIdsList.map(ids => ids.length);
     const totalTokens = seqLens.reduce((a, b) => a + b, 0);
-    const isDecode = seqLens.every(s => s === 1);
-
-    if (enableCudaGraph && !isDecode) {
-      throw new Error("enableCudaGraph requires all sequences to have length 1 (decode mode)");
-    }
 
     if (pagedKV.seqPages.length !== batchSize) {
-      throw new Error(`plan: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
-    }
-
-    if (isDecode) {
-      this.inputIdsBufH.withPinnedBuffer(buf => {
-        let idsOff = 0;
-        for (const ids of inputIdsList) {
-          for (const id of ids) {
-            buf.writeInt32LE(id, idsOff);
-            idsOff += I32;
-          }
-        }
-      });
-      const writeLocations: [number, number][] = [];
-      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-        writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
-      }
-
-      pagedKV.updateIndptr(this);
-
-      this.slotMappingH.withPinnedBuffer(buf => {
-        for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-          const [absPage, slotInPage] = writeLocations[seqIdx];
-          buf.writeInt32LE(absPage * pageSize + slotInPage, seqIdx * I32);
-        }
-      });
-
-      this.positionIdsH.withPinnedBuffer(buf => {
-        for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-          buf.writeInt32LE(pagedKV.seqKvLens[seqIdx] - 1, seqIdx * I32);
-        }
-      });
-
-      this.glm.batchDecodePlan(
-        this.floatWs, BATCH_FLOAT_WS_SIZE,
-        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
-        this.decodePlanInfo,
-        this.indptrH,
-        batchSize,
-        nHeads, nKv, hd, pageSize,
-        enableCudaGraph
-      );
-
-      return { batchSize, totalTokens, seqLens, isDecode: true, ws: this, cache };
+      throw new Error(`planPrefill: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
     }
 
     const inputIdsBuf = Buffer.alloc(totalTokens * I32);
@@ -268,8 +274,15 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return { batchSize, totalTokens, seqLens, isDecode: false, ws: this, cache, qoIndptrHost };
   }
 
-  planDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache, enableCudaGraph = false): BatchState {
-    return this.plan(model, tokenIdsList.map(t => [t]), cache, enableCudaGraph);
+  plan(model: ChatModel, inputIdsList: number[][], cache: ChatCache, enableCudaGraph = false): BatchState {
+    const isDecode = inputIdsList.every(ids => ids.length === 1);
+    if (isDecode) {
+      return this.planDecode(model, inputIdsList.map(ids => ids[0]), cache, enableCudaGraph);
+    }
+    if (enableCudaGraph) {
+      throw new Error("enableCudaGraph requires all sequences to have length 1 (decode mode)");
+    }
+    return this.planPrefill(model, inputIdsList, cache);
   }
 
   forwardEager(model: ChatModel, inputIdsList: number[][], cache: ChatCache): number[] {
@@ -286,7 +299,11 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   forwardEagerDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache): number[] {
-    return this.forwardEager(model, tokenIdsList.map(t => [t]), cache);
+    const state = this.planDecode(model, tokenIdsList, cache);
+    this.forwardInput(state);
+    const logits = model.forward(state);
+    using argmaxResult = logits.argmax();
+    return argmaxResult.readInt32LE();
   }
 }
 
