@@ -136,6 +136,42 @@ export class ExecutionWorkspace extends WorkspaceBase {
     );
   }
 
+  advanceDecode(state: ExecutionState, model: ChatModel, enableCudaGraph = false): void {
+    const pagedKV = state.cache.getPagedKV();
+    const batchSize = state.batchSize;
+
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      pagedKV.allocDecodeToken(seqIdx);
+    }
+
+    if (pagedKV.pagesChanged) {
+      pagedKV.updateIndptr(this);
+
+      pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
+      this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+
+      const cfg = model.cfg;
+      this.glm.batchDecodePlan(
+        this.floatWs, BATCH_FLOAT_WS_SIZE,
+        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+        this.decodePlanInfo,
+        this.indptrH,
+        batchSize,
+        cfg.numAttentionHeads, cfg.numKeyValueHeads, cfg.headDim, pagedKV.pageSize,
+        enableCudaGraph
+      );
+
+      pagedKV.pagesChanged = false;
+    }
+  }
+
+  forwardInputDecode(state: ExecutionState): void {
+    const decodeInput = state.decodeInput;
+    if (state.isDecode && decodeInput && decodeInput.pinned) {
+      this.inputIdsBuf.memcpy(decodeInput, state.batchSize * I32, MemcpyKind.HostToDevice);
+    }
+  }
+
   flashDecode(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
     const out = this.alloc([batchSize, nHeads, 1, hd], query.type, undefined, query.parallelism);
     this.glm.batchDecodeRun(
@@ -359,6 +395,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   seqPages: number[][];
   seqKvLens: number[];
   cachedTokenIds: number[][];
+  pagesChanged: boolean;
 
   getPagedKV(): PagedKVCache { return this; }
 
@@ -382,6 +419,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.seqPages = [];
     this.seqKvLens = [];
     this.cachedTokenIds = [];
+    this.pagesChanged = false;
   }
 
   reset(batchSize: number): void {
@@ -392,6 +430,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.seqPages = Array.from({ length: batchSize }, () => []);
     this.seqKvLens = new Array(batchSize).fill(0);
     this.cachedTokenIds = Array.from({ length: batchSize }, () => []);
+    this.pagesChanged = false;
   }
 
   prefixMatch(seqIdx: number, inputIds: number[]): number[] {
@@ -455,6 +494,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.numPagesUsed += numPages;
     this.seqPages[seqIdx] = Array.from({ length: numPages }, (_, i) => startPage + i);
     this.seqKvLens[seqIdx] = seqLen;
+    this.pagesChanged = true;
     return [startPage, numPages];
   }
 
@@ -471,6 +511,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
     this.numPagesUsed += numNewPages;
     this.seqKvLens[seqIdx] = newTotalLen;
+    if (numNewPages > 0) this.pagesChanged = true;
     return [startPage, numNewPages];
   }
 
@@ -482,6 +523,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       const newPage = this.numPagesUsed;
       this.numPagesUsed += 1;
       this.seqPages[seqIdx].push(newPage);
+      this.pagesChanged = true;
     }
     this.seqKvLens[seqIdx] = kvLen + 1;
     const absPage = this.seqPages[seqIdx][pageIdxInSeq];

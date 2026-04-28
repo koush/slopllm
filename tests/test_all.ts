@@ -6,3 +6,4 @@ import "./test_batch.js";
 import "./test_fp8.js";
 import "./test_no_graph.js";
 import "./test_graph.js";
+import "./test_decode_step.js";
