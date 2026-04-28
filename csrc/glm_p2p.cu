@@ -7,9 +7,13 @@
 //   - Mapping every peer's data buffer directly via cudaDeviceEnablePeerAccess
 //     (single-process, all-GPUs-in-same-cuCtx topology).
 //   - Each rank scatters its local input into its peer-visible buffer.
-//   - Each rank publishes a per-call sequence number to a flag word visible to
-//     all peers.
-//   - Each rank busy-waits on every peer's flag until it reaches the local seq.
+//   - Each rank uses a two-phase flag protocol per call (even = arrival,
+//     odd = data-ready) with a single flag word visible to all peers.
+//   - Arrival phase: each rank publishes its flag and waits for all peers,
+//     preventing a fast rank from overwriting its buffer before slow peers
+//     finish reading from the prior call.
+//   - Data-ready phase: after writing data, each rank publishes an odd flag
+//     value and waits for all peers before reading their data.
 //   - Each rank reads from every peer's data buffer in parallel and sums.
 //
 // We use a *single block* per AllReduce — fine for hidden sizes up to
@@ -64,11 +68,11 @@ p2p_allreduce_oneshot_kernel(
     __shared__ void*       s_peer_data[P2P_AR_MAX_WORLD];
     __shared__ int*        s_peer_flags[P2P_AR_MAX_WORLD];
 
-    // Cache peer pointers + grab fresh seq.
+    // Cache peer pointers + grab fresh seq (two phases per call: arrival + data-ready).
     if (tid == 0) {
-        unsigned long long s = atomicAdd(my_seq_counter, 1ULL) + 1ULL;
-        s_seq = (unsigned int)(s & 0x7FFFFFFFu);  // keep positive int range
-        if (s_seq == 0) s_seq = 1;  // seq 0 collides with reset state
+        unsigned long long s = atomicAdd(my_seq_counter, 2ULL) + 2ULL;
+        s_seq = (unsigned int)(s & 0x7FFFFFFEu);  // keep even, positive int range
+        if (s_seq == 0) s_seq = 2;  // seq 0 collides with reset state; must be even
     }
     if (tid < world_size) {
         s_peer_data[tid]  = peer_data[tid];
@@ -78,6 +82,20 @@ p2p_allreduce_oneshot_kernel(
 
     int seq = (int)s_seq;
     T* my_data = static_cast<T*>(s_peer_data[my_rank]);
+
+    // ---- Step 0: arrival barrier.
+    // Each rank publishes its arrival (even seq) and waits for all peers.
+    // This prevents a fast rank from overwriting its data buffer before
+    // slow peers finish reading from the prior call.
+    if (tid == 0) {
+        volatile int* mf = s_peer_flags[my_rank];
+        *mf = seq;
+    }
+    if (tid < world_size) {
+        volatile int* pf = s_peer_flags[tid];
+        spin_until(pf, seq);
+    }
+    __syncthreads();
 
     // ---- Step 1: scatter local input into our peer-visible data buffer.
     if (in != my_data) {
@@ -93,24 +111,18 @@ p2p_allreduce_oneshot_kernel(
         }
     }
 
-    // ---- Step 2: ensure all writes visible system-wide, then publish flag.
+    // ---- Step 2: ensure all writes visible system-wide, then publish data-ready flag.
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
-        // Write seq to our local flag (peers read this directly via P2P).
         volatile int* mf = s_peer_flags[my_rank];
-        *mf = seq;
+        *mf = seq + 1;  // data-ready phase: odd value
     }
 
-    // ---- Step 3: each thread waits on one peer's flag.
+    // ---- Step 3: each thread waits on one peer's data-ready flag.
     if (tid < world_size) {
         volatile int* pf = s_peer_flags[tid];
-        // We wait for *any* value >= seq. Each rank uses its own seq counter
-        // and all ranks call AllReduce in the same lock-step program order,
-        // so the (k+1)-th call produces matching seq values across ranks.
-        // Tolerate >= seq in case a peer has raced ahead by one or more
-        // AllReduces.
-        spin_until(pf, seq);
+        spin_until(pf, seq + 1);
     }
     __syncthreads();
     // Acquire-fence: ensure subsequent peer data loads are not reordered
