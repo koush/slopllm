@@ -99,6 +99,13 @@ interface NativeAddon {
   ncclCommDestroy(comm: number): void;
   ncclAllReduce(comm: number, ctx: number, sendbuff: number, recvbuff: number, count: number, datatype: number, op: number): void;
   ncclAllGather(comm: number, ctx: number, sendbuff: number, recvbuff: number, count: number, datatype: number): void;
+  p2pEnablePeerAccess(ctx: number, peerDevice: number): number;
+  p2pCreateInstance(ctx: number, myRank: number, worldSize: number, maxBytes: number): number;
+  p2pDestroyInstance(instance: number): void;
+  p2pGetDataPtr(instance: number): number;
+  p2pGetFlagPtr(instance: number): number;
+  p2pSetPeers(ctx: number, instance: number, dataPtrs: number[], flagPtrs: number[]): void;
+  p2pAllReduce(ctx: number, instance: number, in_: number, out: number, count: number, dtype: number): void;
 }
 
 export class GlmTensor extends Tensor {

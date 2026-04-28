@@ -187,6 +187,60 @@ void glm_nccl_all_gather(void* comm, GlmCtx* ctx,
                           const void* sendbuff, void* recvbuff,
                           size_t count, int datatype);
 
+// ---------------------------------------------------------------------------
+// Custom P2P AllReduce (small messages, single-process multi-GPU).
+//
+// On systems where NCCL ring AllReduce is latency-bound (PCIe-only, no
+// NVLink), this primitive completes ~3-5x faster for small payloads by
+// using direct peer-mapped reads.
+//
+// Usage:
+//   1) For each (rank, peer) pair where rank != peer:
+//        glm_p2p_enable_peer_access(ctx[rank], peer)
+//   2) For each rank:
+//        inst[rank] = glm_p2p_create_instance(ctx[rank], rank, world, max_bytes)
+//   3) Build a host-side array of N data ptrs and N flag ptrs from the
+//      instance accessors, then for each rank call:
+//        glm_p2p_set_peers(ctx[rank], inst[rank], data_ptrs, flag_ptrs)
+//   4) For each AllReduce, every rank calls (in lock-step program order):
+//        glm_p2p_allreduce(ctx[rank], inst[rank], in, out, count, dtype)
+//
+// dtype follows NCCL convention: 9 = bfloat16, 7 = float32.
+// ---------------------------------------------------------------------------
+
+struct GlmP2PInstance;
+
+// Enable peer access from this ctx's device to peer_device. Idempotent.
+// Returns 0 on success, -1 if peer access cannot be enabled.
+int glm_p2p_enable_peer_access(GlmCtx* ctx, int peer_device);
+
+// Create an AllReduce instance state on this device. max_bytes is the
+// maximum payload size this instance will ever AllReduce.
+GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank,
+                                         int world_size, size_t max_bytes);
+
+// Free instance state.
+void glm_p2p_destroy_instance(GlmP2PInstance* inst);
+
+// Get this rank's peer-visible data buffer pointer (max_bytes capacity).
+void* glm_p2p_get_data_ptr(GlmP2PInstance* inst);
+
+// Get this rank's peer-visible flag pointer (single int).
+int* glm_p2p_get_flag_ptr(GlmP2PInstance* inst);
+
+// Configure this rank's view of all peers' data + flag pointers.
+// peer_data_ptrs[r] = device pointer (on rank r) to rank r's data buffer.
+// peer_flag_ptrs[r] = device pointer (on rank r) to rank r's flag.
+void glm_p2p_set_peers(GlmCtx* ctx, GlmP2PInstance* inst,
+                       const void* const* peer_data_ptrs,
+                       int* const* peer_flag_ptrs);
+
+// Run AllReduce on this rank's active stream.
+void glm_p2p_allreduce(GlmCtx* ctx, GlmP2PInstance* inst,
+                       const void* in, void* out, int count, int dtype);
+
+size_t glm_p2p_max_bytes(GlmP2PInstance* inst);
+
 void glm_kv_cache_write(GlmCtx* ctx,
                          void* src_k, void* src_v,
                          void* dst_k, void* dst_v,

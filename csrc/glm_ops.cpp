@@ -1696,6 +1696,105 @@ static Napi::Value NcclAllGather(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+// ---------------------------------------------------------------------------
+// Custom P2P AllReduce bindings
+// ---------------------------------------------------------------------------
+
+static Napi::Value P2PEnablePeerAccess(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, peerDevice)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    int peer_device = info[1].As<Napi::Number>().Int32Value();
+    int rc = glm_p2p_enable_peer_access(reinterpret_cast<GlmCtx*>(ctx_ptr), peer_device);
+    return Napi::Number::New(env, rc);
+}
+
+static Napi::Value P2PCreateInstance(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4) {
+        Napi::TypeError::New(env, "Expected (ctx, myRank, worldSize, maxBytes)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    int my_rank = info[1].As<Napi::Number>().Int32Value();
+    int world_size = info[2].As<Napi::Number>().Int32Value();
+    size_t max_bytes = info[3].As<Napi::Number>().Int64Value();
+    GlmP2PInstance* inst = glm_p2p_create_instance(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                                    my_rank, world_size, max_bytes);
+    return Napi::Number::New(env, reinterpret_cast<uintptr_t>(inst));
+}
+
+static Napi::Value P2PDestroyInstance(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1) {
+        Napi::TypeError::New(env, "Expected (instance)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t inst_ptr = info[0].As<Napi::Number>().Int64Value();
+    glm_p2p_destroy_instance(reinterpret_cast<GlmP2PInstance*>(inst_ptr));
+    return env.Undefined();
+}
+
+static Napi::Value P2PGetDataPtr(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    uintptr_t inst_ptr = info[0].As<Napi::Number>().Int64Value();
+    void* p = glm_p2p_get_data_ptr(reinterpret_cast<GlmP2PInstance*>(inst_ptr));
+    return Napi::Number::New(env, reinterpret_cast<uintptr_t>(p));
+}
+
+static Napi::Value P2PGetFlagPtr(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    uintptr_t inst_ptr = info[0].As<Napi::Number>().Int64Value();
+    void* p = glm_p2p_get_flag_ptr(reinterpret_cast<GlmP2PInstance*>(inst_ptr));
+    return Napi::Number::New(env, reinterpret_cast<uintptr_t>(p));
+}
+
+static Napi::Value P2PSetPeers(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4) {
+        Napi::TypeError::New(env, "Expected (ctx, instance, dataPtrs[], flagPtrs[])").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
+    Napi::Array dataArr = info[2].As<Napi::Array>();
+    Napi::Array flagArr = info[3].As<Napi::Array>();
+    int N = dataArr.Length();
+    std::vector<void*> data_ptrs(N);
+    std::vector<int*>  flag_ptrs(N);
+    for (int i = 0; i < N; ++i) {
+        data_ptrs[i] = reinterpret_cast<void*>(dataArr.Get(i).As<Napi::Number>().Int64Value());
+        flag_ptrs[i] = reinterpret_cast<int*>(flagArr.Get(i).As<Napi::Number>().Int64Value());
+    }
+    glm_p2p_set_peers(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                      reinterpret_cast<GlmP2PInstance*>(inst_ptr),
+                      data_ptrs.data(), flag_ptrs.data());
+    return env.Undefined();
+}
+
+static Napi::Value P2PAllReduce(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, instance, in, out, count, dtype)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[3].As<Napi::Number>().Int64Value();
+    int count = info[4].As<Napi::Number>().Int32Value();
+    int dtype = info[5].As<Napi::Number>().Int32Value();
+    glm_p2p_allreduce(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                      reinterpret_cast<GlmP2PInstance*>(inst_ptr),
+                      reinterpret_cast<const void*>(in_ptr),
+                      reinterpret_cast<void*>(out_ptr),
+                      count, dtype);
+    return env.Undefined();
+}
+
 static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "init"), Napi::Function::New(env, Init));
     exports.Set(Napi::String::New(env, "free"), Napi::Function::New(env, Free));
@@ -1779,6 +1878,13 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "ncclCommDestroy"), Napi::Function::New(env, NcclCommDestroy));
     exports.Set(Napi::String::New(env, "ncclAllReduce"), Napi::Function::New(env, NcclAllReduce));
     exports.Set(Napi::String::New(env, "ncclAllGather"), Napi::Function::New(env, NcclAllGather));
+    exports.Set(Napi::String::New(env, "p2pEnablePeerAccess"), Napi::Function::New(env, P2PEnablePeerAccess));
+    exports.Set(Napi::String::New(env, "p2pCreateInstance"), Napi::Function::New(env, P2PCreateInstance));
+    exports.Set(Napi::String::New(env, "p2pDestroyInstance"), Napi::Function::New(env, P2PDestroyInstance));
+    exports.Set(Napi::String::New(env, "p2pGetDataPtr"), Napi::Function::New(env, P2PGetDataPtr));
+    exports.Set(Napi::String::New(env, "p2pGetFlagPtr"), Napi::Function::New(env, P2PGetFlagPtr));
+    exports.Set(Napi::String::New(env, "p2pSetPeers"), Napi::Function::New(env, P2PSetPeers));
+    exports.Set(Napi::String::New(env, "p2pAllReduce"), Napi::Function::New(env, P2PAllReduce));
     return exports;
 }
 

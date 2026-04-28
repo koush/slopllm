@@ -115,16 +115,7 @@ export class ParallelTensor extends Tensor {
     }
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     const dtype = this.parallelOps.ncclDatatype(this.type);
-    const comms = this.parallelOps.comms;
-    getNativeAddon().ncclGroupStart();
-    for (let i = 0; i < this.devices.length; i++) {
-      getNativeAddon().ncclAllReduce(
-        comms[i], this.devices[i].ctx,
-        this.shards[i].data, this.shards[i].data,
-        count, dtype, NCCL_SUM,
-      );
-    }
-    getNativeAddon().ncclGroupEnd();
+    this.parallelOps.doAllReduce(this.shards, count, dtype);
     this.parallelism = TensorParallelism.Replicated;
     return this;
   }
@@ -928,11 +919,68 @@ export class ParallelTensor extends Tensor {
   }
 }
 
+/**
+ * Custom one-shot AllReduce group using direct peer-mapped reads, intended
+ * for small messages on PCIe-only (no-NVLink) topologies where NCCL ring
+ * AllReduce is latency-bound. The group owns one device-side instance per
+ * rank, and a kernel call from each rank participates in the same lock-step
+ * AllReduce. Concurrent AllReduces from the same group on different streams
+ * would race and are not supported.
+ */
+class P2PAllReduceGroup {
+  /** Per-rank GlmP2PInstance native pointers. */
+  readonly instances: number[];
+  readonly maxBytes: number;
+  readonly worldSize: number;
+
+  constructor(devices: readonly GlmOps[], maxBytes: number) {
+    this.worldSize = devices.length;
+    this.maxBytes = maxBytes;
+    const N = devices.length;
+    const addon = getNativeAddon();
+
+    // 1. Enable peer access in both directions for every pair.
+    for (let i = 0; i < N; ++i) {
+      for (let j = 0; j < N; ++j) {
+        if (i === j) continue;
+        const rc = addon.p2pEnablePeerAccess(devices[i].ctx, devices[j].device);
+        if (rc !== 0) {
+          throw new Error(`P2P enable failed dev ${devices[i].device} -> ${devices[j].device}`);
+        }
+      }
+    }
+
+    // 2. Create one instance per rank.
+    this.instances = devices.map((dev, rank) =>
+      addon.p2pCreateInstance(dev.ctx, rank, N, maxBytes));
+
+    // 3. Collect per-rank data + flag pointers.
+    const dataPtrs = this.instances.map(inst => addon.p2pGetDataPtr(inst));
+    const flagPtrs = this.instances.map(inst => addon.p2pGetFlagPtr(inst));
+
+    // 4. Tell each rank about all peers' pointers.
+    for (let i = 0; i < N; ++i) {
+      addon.p2pSetPeers(devices[i].ctx, this.instances[i], dataPtrs, flagPtrs);
+    }
+  }
+
+  free(): void {
+    for (const inst of this.instances) {
+      getNativeAddon().p2pDestroyInstance(inst);
+    }
+  }
+}
+
 export class ParallelOps implements DeviceOps {
   readonly devices: readonly GlmOps[];
   readonly worldSize: number;
   readonly comms: number[];
   private readonly shardWorkspaces = new WeakMap<WorkspaceBase, WorkspaceBase[]>();
+  /** Lazy-initialized custom one-shot AllReduce group for small messages. */
+  private p2pGroup: P2PAllReduceGroup | null = null;
+  /** Max BF16 elements per shard for which P2P AllReduce is used. */
+  private readonly p2pMaxElems: number;
+  private readonly p2pEnabled: boolean;
 
   constructor(devices: GlmOps[]) {
     if (devices.length === 0) {
@@ -949,9 +997,61 @@ export class ParallelOps implements DeviceOps {
     } else {
       this.comms = [];
     }
+    // P2P AllReduce: opt-out via env var. Block-size 1024 * vec 8 = 8192
+    // BF16 elements max per call. We allocate 16 KB per rank's data buf.
+    this.p2pEnabled = process.env.GLM_DISABLE_P2P_ALLREDUCE !== "1" && devices.length > 1;
+    this.p2pMaxElems = 8192;  // matches kernel block_size * vec
+  }
+
+  /** Get (and lazily create) the P2P AllReduce group sized for small messages. */
+  private getP2PGroup(): P2PAllReduceGroup | null {
+    if (!this.p2pEnabled) return null;
+    if (this.p2pGroup === null) {
+      // 16 KB per rank covers BF16 [hidden=8192] or F32 [hidden=4096].
+      this.p2pGroup = new P2PAllReduceGroup(this.devices, 16 * 1024);
+    }
+    return this.p2pGroup;
+  }
+
+  /**
+   * Try to AllReduce via the custom P2P kernel. Returns true on success
+   * (caller must skip the NCCL fallback). Returns false if the message is
+   * too large for the P2P group, in which case the caller should NCCL.
+   */
+  private tryP2PAllReduce(shards: readonly Tensor[], count: number, dtype: number): boolean {
+    if (!this.p2pEnabled) return false;
+    if (dtype !== NCCL_BFLOAT16 && dtype !== NCCL_FLOAT32) return false;
+    if (count > this.p2pMaxElems) return false;
+    const group = this.getP2PGroup();
+    if (!group) return false;
+    const addon = getNativeAddon();
+    for (let i = 0; i < this.worldSize; ++i) {
+      addon.p2pAllReduce(this.devices[i].ctx, group.instances[i],
+                         shards[i].data, shards[i].data, count, dtype);
+    }
+    return true;
+  }
+
+  /** Public wrapper used by ParallelTensor.allReduce. */
+  doAllReduce(shards: readonly Tensor[], count: number, dtype: number): void {
+    if (this.tryP2PAllReduce(shards, count, dtype)) return;
+    const addon = getNativeAddon();
+    addon.ncclGroupStart();
+    for (let i = 0; i < this.worldSize; ++i) {
+      addon.ncclAllReduce(
+        this.comms[i], this.devices[i].ctx,
+        shards[i].data, shards[i].data,
+        count, dtype, NCCL_SUM,
+      );
+    }
+    addon.ncclGroupEnd();
   }
 
   free(): void {
+    if (this.p2pGroup !== null) {
+      this.p2pGroup.free();
+      this.p2pGroup = null;
+    }
     if (this.comms.length > 0) {
       for (const comm of this.comms) {
         getNativeAddon().ncclCommDestroy(comm);
