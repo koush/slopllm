@@ -7,14 +7,13 @@
 //   - Mapping every peer's data buffer directly via cudaDeviceEnablePeerAccess
 //     (single-process, all-GPUs-in-same-cuCtx topology).
 //   - Each rank scatters its local input into a double-buffered slot
-//     (selected by the call counter) before waiting for peers to arrive.
-//   - Each rank uses a two-phase flag protocol per call (even = arrival,
-//     odd = data-ready) with a single flag word visible to all peers.
-//   - Arrival phase: each rank publishes its flag and waits for all peers.
-//     The arrival barrier prevents any rank from getting 2+ calls ahead,
-//     which would cause it to overwrite the slot a slow peer is reading.
-//   - Data-ready phase: after the arrival barrier, each rank publishes an
-//     odd flag value and waits for all peers before reading their data.
+//     (selected by the call counter) before waiting for peers.
+//   - Each rank publishes a data-ready flag (odd seq value) and waits for
+//     all peers' data-ready flags before reading their data.
+//   - Double buffering + the data-ready wait prevents any rank from getting
+//     2+ calls ahead: a rank cannot complete call N+1 until all peers
+//     publish data-ready for N+1, which requires them to have finished
+//     call N, so the next call's slot is safe to reuse.
 //   - Each rank reads from every peer's data buffer (at the current slot)
 //     in parallel and sums.
 //
@@ -91,9 +90,9 @@ p2p_allreduce_oneshot_kernel(
         static_cast<char*>(s_peer_data[my_rank]) + slot_offset);
 
     // ---- Step 1: scatter local input into our peer-visible data buffer.
-    // This happens before the arrival barrier because double buffering
-    // ensures we write to a different slot than the one peers are reading
-    // from the prior call.
+    // Double buffering ensures we write to a different slot than the one
+    // peers are reading from the prior call, so this can happen before
+    // waiting for peers.
     if (in != my_data) {
         const uint4* in_v4 = reinterpret_cast<const uint4*>(in);
         uint4*       out_v4 = reinterpret_cast<uint4*>(my_data);
@@ -107,29 +106,19 @@ p2p_allreduce_oneshot_kernel(
         }
     }
 
-    // ---- Step 2: arrival barrier.
-    // Each rank publishes its arrival (even seq) and waits for all peers.
-    // This prevents any rank from getting 2+ calls ahead, which would
-    // cause it to overwrite the slot a slow peer is still reading.
-    if (tid == 0) {
-        volatile int* mf = s_peer_flags[my_rank];
-        *mf = seq;
-    }
-    if (tid < world_size) {
-        volatile int* pf = s_peer_flags[tid];
-        spin_until(pf, seq);
-    }
-    __syncthreads();
-
-    // ---- Step 3: ensure all writes visible system-wide, then publish data-ready flag.
+    // ---- Step 2: ensure all writes visible system-wide, then publish data-ready flag.
+    // The seq counter uses even values for the per-call base; data-ready is seq + 1 (odd).
+    // Double buffering + the data-ready wait prevents any rank from getting 2+ calls
+    // ahead: a rank cannot complete call N+1 (and thus start N+2) until all peers
+    // publish data-ready for N+1, which requires them to have finished call N.
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
         volatile int* mf = s_peer_flags[my_rank];
-        *mf = seq + 1;  // data-ready phase: odd value
+        *mf = seq + 1;
     }
 
-    // ---- Step 4: each thread waits on one peer's data-ready flag.
+    // ---- Step 3: each thread waits on one peer's data-ready flag.
     if (tid < world_size) {
         volatile int* pf = s_peer_flags[tid];
         spin_until(pf, seq + 1);
@@ -141,7 +130,7 @@ p2p_allreduce_oneshot_kernel(
     // PCIe domain.
     __threadfence_system();
 
-    // ---- Step 5: read all peers at current slot, sum, write to local output.
+    // ---- Step 4: read all peers at current slot, sum, write to local output.
     if constexpr (VEC == 8) {
         int count_v = count / 8;
         for (int i = tid; i < count_v; i += bs) {
