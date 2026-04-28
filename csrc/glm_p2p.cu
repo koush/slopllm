@@ -6,15 +6,17 @@
 // 10 KB AllReduce in ~5-10 us by:
 //   - Mapping every peer's data buffer directly via cudaDeviceEnablePeerAccess
 //     (single-process, all-GPUs-in-same-cuCtx topology).
-//   - Each rank scatters its local input into its peer-visible buffer.
+//   - Each rank scatters its local input into a double-buffered slot
+//     (selected by the call counter) before waiting for peers to arrive.
 //   - Each rank uses a two-phase flag protocol per call (even = arrival,
 //     odd = data-ready) with a single flag word visible to all peers.
-//   - Arrival phase: each rank publishes its flag and waits for all peers,
-//     preventing a fast rank from overwriting its buffer before slow peers
-//     finish reading from the prior call.
-//   - Data-ready phase: after writing data, each rank publishes an odd flag
-//     value and waits for all peers before reading their data.
-//   - Each rank reads from every peer's data buffer in parallel and sums.
+//   - Arrival phase: each rank publishes its flag and waits for all peers.
+//     The arrival barrier prevents any rank from getting 2+ calls ahead,
+//     which would cause it to overwrite the slot a slow peer is reading.
+//   - Data-ready phase: after the arrival barrier, each rank publishes an
+//     odd flag value and waits for all peers before reading their data.
+//   - Each rank reads from every peer's data buffer (at the current slot)
+//     in parallel and sums.
 //
 // We use a *single block* per AllReduce — fine for hidden sizes up to
 // block_size * VEC = 1024 * 8 = 8192 BF16 elements (16 KB). For Qwen3-32B
@@ -56,6 +58,7 @@ p2p_allreduce_oneshot_kernel(
     unsigned long long* my_seq_counter,
     int my_rank,
     int world_size,
+    int max_slot_bytes,               // bytes per double-buffer slot
     const T* __restrict__ in,
     T* __restrict__ out,
     int count) {
@@ -64,15 +67,17 @@ p2p_allreduce_oneshot_kernel(
     int tid = threadIdx.x;
     int bs  = blockDim.x;
 
-    __shared__ unsigned int s_seq;       // truncated 32-bit seq for flag sig
-    __shared__ void*       s_peer_data[P2P_AR_MAX_WORLD];
-    __shared__ int*        s_peer_flags[P2P_AR_MAX_WORLD];
+    __shared__ unsigned int s_seq;
+    __shared__ int          s_slot_offset;
+    __shared__ void*        s_peer_data[P2P_AR_MAX_WORLD];
+    __shared__ int*         s_peer_flags[P2P_AR_MAX_WORLD];
 
     // Cache peer pointers + grab fresh seq (two phases per call: arrival + data-ready).
     if (tid == 0) {
         unsigned long long s = atomicAdd(my_seq_counter, 2ULL) + 2ULL;
         s_seq = (unsigned int)(s & 0x7FFFFFFEu);  // keep even, positive int range
         if (s_seq == 0) s_seq = 2;  // seq 0 collides with reset state; must be even
+        s_slot_offset = ((s_seq >> 1) & 1) * max_slot_bytes;
     }
     if (tid < world_size) {
         s_peer_data[tid]  = peer_data[tid];
@@ -81,23 +86,14 @@ p2p_allreduce_oneshot_kernel(
     __syncthreads();
 
     int seq = (int)s_seq;
-    T* my_data = static_cast<T*>(s_peer_data[my_rank]);
-
-    // ---- Step 0: arrival barrier.
-    // Each rank publishes its arrival (even seq) and waits for all peers.
-    // This prevents a fast rank from overwriting its data buffer before
-    // slow peers finish reading from the prior call.
-    if (tid == 0) {
-        volatile int* mf = s_peer_flags[my_rank];
-        *mf = seq;
-    }
-    if (tid < world_size) {
-        volatile int* pf = s_peer_flags[tid];
-        spin_until(pf, seq);
-    }
-    __syncthreads();
+    int slot_offset = s_slot_offset;
+    T* my_data = reinterpret_cast<T*>(
+        static_cast<char*>(s_peer_data[my_rank]) + slot_offset);
 
     // ---- Step 1: scatter local input into our peer-visible data buffer.
+    // This happens before the arrival barrier because double buffering
+    // ensures we write to a different slot than the one peers are reading
+    // from the prior call.
     if (in != my_data) {
         const uint4* in_v4 = reinterpret_cast<const uint4*>(in);
         uint4*       out_v4 = reinterpret_cast<uint4*>(my_data);
@@ -111,7 +107,21 @@ p2p_allreduce_oneshot_kernel(
         }
     }
 
-    // ---- Step 2: ensure all writes visible system-wide, then publish data-ready flag.
+    // ---- Step 2: arrival barrier.
+    // Each rank publishes its arrival (even seq) and waits for all peers.
+    // This prevents any rank from getting 2+ calls ahead, which would
+    // cause it to overwrite the slot a slow peer is still reading.
+    if (tid == 0) {
+        volatile int* mf = s_peer_flags[my_rank];
+        *mf = seq;
+    }
+    if (tid < world_size) {
+        volatile int* pf = s_peer_flags[tid];
+        spin_until(pf, seq);
+    }
+    __syncthreads();
+
+    // ---- Step 3: ensure all writes visible system-wide, then publish data-ready flag.
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
@@ -119,7 +129,7 @@ p2p_allreduce_oneshot_kernel(
         *mf = seq + 1;  // data-ready phase: odd value
     }
 
-    // ---- Step 3: each thread waits on one peer's data-ready flag.
+    // ---- Step 4: each thread waits on one peer's data-ready flag.
     if (tid < world_size) {
         volatile int* pf = s_peer_flags[tid];
         spin_until(pf, seq + 1);
@@ -131,7 +141,7 @@ p2p_allreduce_oneshot_kernel(
     // PCIe domain.
     __threadfence_system();
 
-    // ---- Step 4: read all peers, sum, write to local output.
+    // ---- Step 5: read all peers at current slot, sum, write to local output.
     if constexpr (VEC == 8) {
         int count_v = count / 8;
         for (int i = tid; i < count_v; i += bs) {
@@ -139,7 +149,8 @@ p2p_allreduce_oneshot_kernel(
             #pragma unroll
             for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
                 if (r >= world_size) break;
-                const uint4* pv = reinterpret_cast<const uint4*>(s_peer_data[r]);
+                const uint4* pv = reinterpret_cast<const uint4*>(
+                    static_cast<const char*>(s_peer_data[r]) + slot_offset);
                 uint4 raw = pv[i];
                 auto* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
                 a0 += __bfloat162float(h[0]);
@@ -167,7 +178,8 @@ p2p_allreduce_oneshot_kernel(
             #pragma unroll
             for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
                 if (r >= world_size) break;
-                const __nv_bfloat16* p = static_cast<const __nv_bfloat16*>(s_peer_data[r]);
+                const __nv_bfloat16* p = reinterpret_cast<const __nv_bfloat16*>(
+                    static_cast<const char*>(s_peer_data[r]) + slot_offset);
                 s += __bfloat162float(p[i]);
             }
             out[i] = __float2bfloat16(s);
@@ -179,7 +191,8 @@ p2p_allreduce_oneshot_kernel(
             #pragma unroll
             for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
                 if (r >= world_size) break;
-                const uint4* pv = reinterpret_cast<const uint4*>(s_peer_data[r]);
+                const uint4* pv = reinterpret_cast<const uint4*>(
+                    static_cast<const char*>(s_peer_data[r]) + slot_offset);
                 uint4 raw = pv[i];
                 auto* f = reinterpret_cast<const float*>(&raw);
                 a0 += f[0]; a1 += f[1]; a2 += f[2]; a3 += f[3];
@@ -195,7 +208,8 @@ p2p_allreduce_oneshot_kernel(
             #pragma unroll
             for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
                 if (r >= world_size) break;
-                const float* p = static_cast<const float*>(s_peer_data[r]);
+                const float* p = reinterpret_cast<const float*>(
+                    static_cast<const char*>(s_peer_data[r]) + slot_offset);
                 s += p[i];
             }
             out[i] = s;
@@ -259,13 +273,14 @@ GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size
     inst->max_bytes = max_bytes;
     inst->device_id = ctx->device_id;
 
-    // Combined allocation: peer_data[N] | peer_flags[N] | seq_counter | flag | data_buffer
+    // Combined allocation: peer_data[N] | peer_flags[N] | seq_counter | flag | data_buffer[2]
+    // Data buffer is doubled for ping-pong double buffering across calls.
     size_t header = sizeof(void*) * world_size
-                  + sizeof(int*)  * world_size
-                  + sizeof(unsigned long long)
-                  + sizeof(int);
+                   + sizeof(int*)  * world_size
+                   + sizeof(unsigned long long)
+                   + sizeof(int);
     size_t header_aligned = (header + 255) & ~size_t(255);  // 256B align data
-    size_t total = header_aligned + max_bytes;
+    size_t total = header_aligned + max_bytes * 2;
 
     void* base = nullptr;
     cudaError_t err = cudaMalloc(&base, total);
@@ -324,7 +339,7 @@ void glm_p2p_allreduce(GlmCtx* ctx, GlmP2PInstance* inst,
         p2p_allreduce_oneshot_kernel<__nv_bfloat16, P2P_AR_VEC_BF16>
             <<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
                 inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
-                inst->my_rank, inst->world_size,
+                inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(in),
                 static_cast<__nv_bfloat16*>(out),
                 count);
@@ -336,7 +351,7 @@ void glm_p2p_allreduce(GlmCtx* ctx, GlmP2PInstance* inst,
         p2p_allreduce_oneshot_kernel<float, P2P_AR_VEC_F32>
             <<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
                 inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
-                inst->my_rank, inst->world_size,
+                inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const float*>(in),
                 static_cast<float*>(out),
                 count);
