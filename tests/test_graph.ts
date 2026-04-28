@@ -88,10 +88,7 @@ function generateWithGraph(
     const state = ws.planDecode(model, 1, cache, true);
     state.prepareInput([currentToken]);
 
-    if (graphExec !== null) {
-      graph.graphLaunch(graphExec);
-      graph.synchronize();
-    } else {
+    if (graphExec === null) {
       if (warmupRemaining === 0 && !capturing) {
         capturing = true;
         graph.graphBeginCapture();
@@ -109,10 +106,14 @@ function generateWithGraph(
         graph.graphDestroy(graphIdx);
         capturing = false;
         warmupRemaining = 0;
-        continue;
       }
 
       if (warmupRemaining > 0) warmupRemaining--;
+    }
+
+    if (graphExec !== null) {
+      graph.graphLaunch(graphExec);
+      graph.synchronize();
     }
 
     currentToken = argmaxResult.readInt32LE()[0];
