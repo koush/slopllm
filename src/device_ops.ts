@@ -18,12 +18,13 @@ export interface DeviceOps {
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined): Tensor;
   synchronize(): void;
+  synchronizeStream(streamIdx: number): void;
   setStream(streamIdx: number): void;
   eventRecord(eventIdx: number, streamIdx: number): void;
   streamWaitEvent(streamIdx: number, eventIdx: number): void;
   currentStream: number;
   availableStreams: number[];
-  withStream<T>(fn: () => T): Disposable  & { result: T, sync(): void };
+  withStream<T>(fn: () => T): Disposable  & { result: T, streamWaitEvent(): void, synchronize(): void };
 
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
 

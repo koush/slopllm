@@ -800,6 +800,22 @@ static Napi::Value Synchronize(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value SynchronizeStream(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected (ctx, stream_idx)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    int stream_idx = info[1].As<Napi::Number>().Int32Value();
+    glm_synchronize_stream(reinterpret_cast<GlmCtx*>(ctx_ptr), stream_idx);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("synchronizeStream failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value SetStream(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2 || !info[1].IsNumber()) {
@@ -1722,6 +1738,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "kvCacheWrite"), Napi::Function::New(env, KvCacheWrite));
     exports.Set(Napi::String::New(env, "decodeStep"), Napi::Function::New(env, DecodeStep));
     exports.Set(Napi::String::New(env, "synchronize"), Napi::Function::New(env, Synchronize));
+    exports.Set(Napi::String::New(env, "synchronizeStream"), Napi::Function::New(env, SynchronizeStream));
     exports.Set(Napi::String::New(env, "setStream"), Napi::Function::New(env, SetStream));
     exports.Set(Napi::String::New(env, "eventRecord"), Napi::Function::New(env, EventRecord));
     exports.Set(Napi::String::New(env, "streamWaitEvent"), Napi::Function::New(env, StreamWaitEvent));

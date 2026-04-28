@@ -1051,6 +1051,12 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  synchronizeStream(streamIdx: number): void {
+    for (const device of this.devices) {
+      device.synchronizeStream(streamIdx);
+    }
+  }
+
   availableStreams: number[] = [];
   currentStream = 0;
   setStream(streamIdx: number): void {
@@ -1066,9 +1072,7 @@ export class ParallelOps implements DeviceOps {
   }
 
   streamWaitEvent(streamIdx: number, eventIdx: number): void {
-    for (const device of this.devices) {
-      device.streamWaitEvent(streamIdx, eventIdx);
-    }
+    throw new Error("ParallelOps.streamWaitEvent should be used on the device level, not on ParallelOps");
   }
 
   withStream<T>(fn: () => T) {
@@ -1093,9 +1097,14 @@ export class ParallelOps implements DeviceOps {
           this.devices[i].availableStreams.push(streams[i]!);
         }
       },
-      sync: () => {
+      streamWaitEvent: () => {
         for (let i = 0; i < this.devices.length; i++) {
           this.devices[i].streamWaitEvent(this.devices[i].currentStream, streams[i]!);
+        }
+      },
+      synchronize: () => {
+        for (let i = 0; i < this.devices.length; i++) {
+          this.devices[i].synchronizeStream(this.devices[i].currentStream);
         }
       },
       result,

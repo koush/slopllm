@@ -160,32 +160,38 @@ export function* generateStream(
   const greedy = !sampling;
   let sampleResult: Tensor | null = null;
   let gpuSampleResult: Tensor | null = null;
+  const sampledLogits = new UsingHolder<Tensor>(undefined!);
   function doSample(logits: Tensor) {
-    using argmax = new UsingHolder<Tensor>(undefined!);
     if (greedy) {
-      argmax.replace(logits.argmax());
+      sampledLogits.replace(logits.argmax());
     }
     else {
-      argmax.replace(logits.sampleTokenGPU(sampling, tokenHistory));
+      sampledLogits.replace(logits.sampleTokenGPU(sampling, tokenHistory));
     }
-    const argmaxValue = argmax.value;
-    sampleResult ||= sampleWorkspace.allocPinned(argmaxValue.shape, argmaxValue.type);
-    sampleResult.memcpy(argmaxValue, argmaxValue.bytes, MemcpyKind.DeviceToHost);
+    const argmaxValue = sampledLogits.value;
     gpuSampleResult ||= sampleWorkspace.alloc(argmaxValue.shape, argmaxValue.type);
     gpuSampleResult.memcpy(argmaxValue, argmaxValue.bytes, MemcpyKind.DeviceToDevice);
   }
 
-  let currentToken: number;
+  const tokenHistory = inputIds.slice();
+  const sampleStream = new UsingHolder<ReturnType<typeof glm.withStream<void>>>(undefined!);
+
+  function readSample() {
+    sampleStream.replace(glm.withStream(() => {
+      const argmaxValue = sampledLogits.value;
+      sampleResult ||= sampleWorkspace.allocPinned(argmaxValue.shape, argmaxValue.type);
+      sampleResult.memcpy(argmaxValue, argmaxValue.bytes, MemcpyKind.DeviceToHost);
+    }));
+  }
+
   {
     using firstTokens = ws.forwardPrefill(model, [suffixIds], cache);
     doSample(firstTokens);
-    currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
-    glm.synchronize();
+    readSample();
     // the decode is pipelined and then the token is yielded
   }
-  cache.appendTokens(0, [currentToken]);
+  // cache.appendTokens(0, [currentToken]);
 
-  const tokenHistory = [...inputIds, currentToken];
   const useGraph = graphState !== undefined;
   let capturing = false;
 
@@ -200,13 +206,13 @@ export function* generateStream(
   let tAfterSync = 0;
 
   try {
-    for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
+    for (let i = 1; i < maxNewTokens; i++) {
       const tPlan = performance.now();
       const state = ws.planDecode(model, 1, cache, useGraph);
       planMs += performance.now() - tPlan;
 
       const tExec = performance.now();
-      if (graphState!.graphExec === null) {
+      if (graphState?.graphExec == null) {
         ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
         state.prepareInput(gpuSampleResult!);
 
@@ -227,13 +233,15 @@ export function* generateStream(
           glm.graphDestroy(graph);
           capturing = false;
         }
-        if (useGraph) graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
+        if (useGraph) {
+          graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
+        }
         warmupSteps++;
       }
 
       // when cuda graph captures it is NOT executing. it must run again.
       // thats why it is not else if, the actual execution must run again after capture.
-      if (graphState?.graphExec !== null) {
+      if (graphState?.graphExec != null) {
         if (tAfterSync > 0) idleMs += performance.now() - tAfterSync;
         // only host pinned is automatically copied. if using a device pinned, must be explicitly copied.
         ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
@@ -241,12 +249,21 @@ export function* generateStream(
         graphSteps++;
       }
 
-      yield currentToken;
-      glm.synchronize();
+      // sync on the previous token
+      sampleStream.value.synchronize();
+      const currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
+      // kick off next sample read
+      readSample();
+
       execMs += performance.now() - tExec;
       tAfterSync = performance.now();
+      cache.appendTokens(0, [currentToken]);
+      tokenHistory.push(currentToken);
 
-      currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
+      // yield previous token
+      yield currentToken;
+      if (eosIds.has(currentToken))
+        return;
 
       const isPostWarmupToken = !useGraph || (graphState?.graphExec !== null);
       if (isPostWarmupToken) {
@@ -255,13 +272,7 @@ export function* generateStream(
         lastTokenTime = now;
         postWarmupTokenCount++;
       }
-
-      cache.appendTokens(0, [currentToken]);
-      tokenHistory.push(currentToken);
     }
-
-    // yield the final pipelined token
-    yield currentToken;
   } finally {
     if (timing) {
       timing.planMs = planMs;

@@ -168,6 +168,17 @@ void glm_synchronize(GlmCtx* ctx) {
     }
 }
 
+void glm_synchronize_stream(GlmCtx* ctx, int stream_idx) {
+    if (stream_idx < 0 || stream_idx >= GLM_MAX_STREAMS) {
+        fprintf(stderr, "glm_synchronize_stream: invalid stream index %d\n", stream_idx);
+        return;
+    }
+    cudaError_t err = cudaStreamSynchronize(ctx->streams[stream_idx]);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm_synchronize_stream failed: %s\n", cudaGetErrorString(err));
+    }
+}
+
 void glm_set_stream(GlmCtx* ctx, int stream_idx) {
     if (stream_idx < 0 || stream_idx >= GLM_MAX_STREAMS) {
         fprintf(stderr, "glm_set_stream: invalid stream index %d (max %d)\n", stream_idx, GLM_MAX_STREAMS - 1);

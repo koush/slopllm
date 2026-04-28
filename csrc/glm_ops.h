@@ -207,6 +207,8 @@ void glm_decode_step(GlmCtx* ctx,
 
 void glm_synchronize(GlmCtx* ctx);
 
+void glm_synchronize_stream(GlmCtx* ctx, int stream_idx);
+
 void glm_set_stream(GlmCtx* ctx, int stream_idx);
 
 void glm_event_record(GlmCtx* ctx, int event_idx, int stream_idx);

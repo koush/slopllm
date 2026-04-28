@@ -136,7 +136,7 @@ export class Qwen3Model extends ChatModel {
     using upStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS));
     using upBuf = upStream.result;
     using gateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS);
-    upStream.sync();
+    upStream.streamWaitEvent();
     using siluBuf = gateBuf.siluAndMul(gateBuf, upBuf, this.cfg.intermediateSize, BS);
     return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
   }
@@ -175,11 +175,11 @@ export class Qwen3Model extends ChatModel {
         const kBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS);
 
         if (!i) {
-          rotaryEmbedding.sync();
+          rotaryEmbedding.streamWaitEvent();
         }
 
         const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
-        vStream.sync();
+        vStream.streamWaitEvent();
         ws.kvCacheWrite(kRope, vBuf, state, i, nKv, hd);
         return { kBuf, kRope };
       });
@@ -188,11 +188,11 @@ export class Qwen3Model extends ChatModel {
 
       using qBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.q_proj.weight`)!, BS);
       if (!i) {
-        rotaryEmbedding.sync();
+        rotaryEmbedding.streamWaitEvent();
       }
       using qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
 
-      kStream.sync();
+      kStream.streamWaitEvent();
 
       using flashOut = new UsingHolder<Tensor>(undefined!);
       if (state.isDecode) {

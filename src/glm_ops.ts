@@ -62,6 +62,7 @@ interface NativeAddon {
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
   decodeStep(ctx: number, positionIds: number, lastPageLen: number, slotMapping: number, indptr: number, indices: number, pageSize: number, batchSize: number): void;
   synchronize(ctx: number): void;
+  synchronizeStream(ctx: number, streamIdx: number): void;
   setStream(ctx: number, streamIdx: number): void;
   eventRecord(ctx: number, eventIdx: number, streamIdx: number): void;
   streamWaitEvent(ctx: number, streamIdx: number, eventIdx: number): void;
@@ -333,6 +334,10 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().synchronize(this.ctx);
   }
 
+  synchronizeStream(streamIdx: number): void {
+    getNativeAddon().synchronizeStream(this.ctx, streamIdx);
+  }
+
   setStream(streamIdx: number): void {
     getNativeAddon().setStream(this.ctx, streamIdx);
     this.currentStream = streamIdx;
@@ -361,7 +366,10 @@ export class GlmOps implements DeviceOps {
         this.availableStreams.push(stream);
       },
       result,
-      sync: () => {
+      synchronize: () => {
+        getNativeAddon().synchronizeStream(this.ctx, stream);
+      },
+      streamWaitEvent: () => {
         getNativeAddon().streamWaitEvent(this.ctx, this.currentStream, stream);
       }
     }
