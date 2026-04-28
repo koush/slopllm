@@ -61,22 +61,39 @@ function longestPrefix(a: number[], b: number[]): number {
 }
 
 export class ExecutionWorkspace extends WorkspaceBase {
+  /** GPU float workspace: written by FlashInfer plan, read by FlashInfer run. */
   floatWs: Tensor;
+  /** GPU int workspace: written by FlashInfer plan, read by FlashInfer run. */
   intWs: Tensor;
+  /** Pinned host int workspace: scratch space used internally by FlashInfer plan (read+write within plan call). */
   pinnedIntWs: Tensor;
+  /** Pinned host buffer: written by batchDecodePlan, read by batchDecodeRun. */
   decodePlanInfo: Tensor;
+  /** Pinned host buffer: written by batchPrefillPagedPlan, read by batchPrefillPagedRun. */
   prefillPlanInfo: Tensor;
+  /** GPU buffer [B*S] of I32: written by host (h2d), read by embedding lookup. */
   inputIdsBuf: Tensor;
+  /** Pinned host buffer [B] of I32: written by host, read via memcpy to inputIdsBuf. */
   inputIdsBufH: Tensor;
+  /** GPU buffer [B*S] of I32: written by host (h2d), read by RoPE kernel. */
   positionIds: Tensor;
+  /** Pinned host buffer [B] of I32: written by host, read via memcpy to positionIds. */
   positionIdsH: Tensor;
+  /** GPU buffer [B] of I32: written by host (h2d), read to extract last-token logits per sequence (prefill). */
   lastIdx: Tensor;
+  /** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer prefill run. */
   qoIndptrD: Tensor;
+  /** GPU buffer [B*S] of I32: written by host (h2d) or memcpy, read by kvCacheWrite to scatter K/V into cache. */
   slotMapping: Tensor;
+  /** Pinned host buffer [B] of I32: written by host, read via memcpy to slotMapping. */
   slotMappingH: Tensor;
+  /** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer run (page indptr). */
   indptrD: Tensor;
+  /** Pinned host buffer [B+1] of I32: written by updateIndptr, read by memcpy to indptrD and by FlashInfer plan. */
   indptrH: Tensor;
+  /** GPU buffer [B] of I32: written by host via memcpy, read by FlashInfer run. */
   lastPageLen: Tensor;
+  /** Pinned host buffer [B] of I32: written by updateIndptr, read via memcpy to lastPageLen. */
   lastPageLenH: Tensor;
 
   constructor(glm: DeviceOps, B: number, S: number) {
@@ -107,10 +124,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const batchSize = state.batchSize;
     let decodeInput = state.decodeInput;
 
-    pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
-    this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-    this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
-
     if (state.isDecode) {
       if (!decodeInput) {
         throw new Error("decodeInput tensor is required for decode mode");
@@ -119,9 +132,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
       if (decodeInput.pinned) {
         this.inputIdsBuf.memcpy(decodeInput, batchSize * I32, MemcpyKind.HostToDevice);
       }
-      this.slotMapping.memcpy(this.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
-      this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
     } else if (state.qoIndptrHost) {
+      pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
+      this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+      this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
       this.qoIndptrD.memcpy(state.qoIndptrHost, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     }
   }
@@ -136,41 +150,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     );
   }
 
-  advanceDecode(state: ExecutionState, model: ChatModel, enableCudaGraph = false): void {
-    const pagedKV = state.cache.getPagedKV();
-    const batchSize = state.batchSize;
-
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      pagedKV.allocDecodeToken(seqIdx);
-    }
-
-    if (pagedKV.pagesChanged) {
-      pagedKV.updateIndptr(this);
-
-      pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
-      this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-
-      const cfg = model.cfg;
-      this.glm.batchDecodePlan(
-        this.floatWs, BATCH_FLOAT_WS_SIZE,
-        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
-        this.decodePlanInfo,
-        this.indptrH,
-        batchSize,
-        cfg.numAttentionHeads, cfg.numKeyValueHeads, cfg.headDim, pagedKV.pageSize,
-        enableCudaGraph
-      );
-
-      pagedKV.pagesChanged = false;
-    }
-  }
-
-  forwardInputDecode(state: ExecutionState): void {
-    const decodeInput = state.decodeInput;
-    if (state.isDecode && decodeInput && decodeInput.pinned) {
-      this.inputIdsBuf.memcpy(decodeInput, state.batchSize * I32, MemcpyKind.HostToDevice);
-    }
-  }
 
   flashDecode(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
     const out = this.alloc([batchSize, nHeads, 1, hd], query.type, undefined, query.parallelism);
@@ -230,35 +209,30 @@ export class ExecutionWorkspace extends WorkspaceBase {
       throw new Error(`planDecode: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
     }
 
-    const writeLocations: [number, number][] = [];
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      writeLocations.push(pagedKV.allocDecodeToken(seqIdx));
+      pagedKV.allocDecodeToken(seqIdx);
     }
 
-    pagedKV.updateIndptr(this);
+    if (pagedKV.pagesDirtyHost) {
+      pagedKV.updateIndptr(this);
 
-    this.slotMappingH.withPinnedBuffer(buf => {
-      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-        const [absPage, slotInPage] = writeLocations[seqIdx];
-        buf.writeInt32LE(absPage * pageSize + slotInPage, seqIdx * I32);
-      }
-    });
+      this.glm.batchDecodePlan(
+        this.floatWs, BATCH_FLOAT_WS_SIZE,
+        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+        this.decodePlanInfo,
+        this.indptrH,
+        batchSize,
+        nHeads, nKv, hd, pageSize,
+        enableCudaGraph
+      );
+      pagedKV.pagesDirtyHost = false;
+    }
 
-    this.positionIdsH.withPinnedBuffer(buf => {
-      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-        buf.writeInt32LE(pagedKV.seqKvLens[seqIdx] - 1, seqIdx * I32);
-      }
-    });
-
-    this.glm.batchDecodePlan(
-      this.floatWs, BATCH_FLOAT_WS_SIZE,
-      this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
-      this.decodePlanInfo,
-      this.indptrH,
-      batchSize,
-      nHeads, nKv, hd, pageSize,
-      enableCudaGraph
-    );
+    if (pagedKV.pagesDirtyDevice) {
+      pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
+      this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+      pagedKV.pagesDirtyDevice = false;
+    }
 
     return new ExecutionState(batchSize, totalTokens, seqLens, true, this, cache);
   }
@@ -356,7 +330,18 @@ export class ExecutionWorkspace extends WorkspaceBase {
   forwardPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): Tensor {
     const state = this.planPrefill(model, inputIdsList, cache);
     this.forwardInput(state);
-    return model.forward(state);
+    const logits = model.forward(state);
+
+    const pagedKV = state.cache.getPagedKV();
+    const batchSize = state.batchSize;
+    this.positionIdsH.withPinnedBuffer(buf => {
+      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        buf.writeInt32LE(pagedKV.seqKvLens[seqIdx] - 1, seqIdx * I32);
+      }
+    });
+    this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
+
+    return logits;
   }
 
   forwardEagerPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): number[] {
@@ -373,6 +358,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   forwardEagerDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache): number[] {
     const state = this.planDecode(model, tokenIdsList.length, cache);
     state.prepareInput(tokenIdsList);
+    this.decodeStep(state);
     this.forwardInput(state);
     const logits = model.forward(state);
     using argmaxResult = logits.argmax();
@@ -395,7 +381,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   seqPages: number[][];
   seqKvLens: number[];
   cachedTokenIds: number[][];
-  pagesChanged: boolean;
+  pagesDirtyHost: boolean;
+  pagesDirtyDevice: boolean;
 
   getPagedKV(): PagedKVCache { return this; }
 
@@ -419,7 +406,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.seqPages = [];
     this.seqKvLens = [];
     this.cachedTokenIds = [];
-    this.pagesChanged = false;
+    this.pagesDirtyHost = true;
+    this.pagesDirtyDevice = true;
   }
 
   reset(batchSize: number): void {
@@ -430,7 +418,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.seqPages = Array.from({ length: batchSize }, () => []);
     this.seqKvLens = new Array(batchSize).fill(0);
     this.cachedTokenIds = Array.from({ length: batchSize }, () => []);
-    this.pagesChanged = false;
+    this.pagesDirtyHost = true;
+    this.pagesDirtyDevice = true;
   }
 
   prefixMatch(seqIdx: number, inputIds: number[]): number[] {
@@ -487,17 +476,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.seqKvLens[seqIdx] = newLen;
   }
 
-  allocPrefillPages(seqIdx: number, seqLen: number): [number, number] {
-    const pageSize = this.pageSize;
-    const numPages = Math.ceil(seqLen / pageSize);
-    const startPage = this.numPagesUsed;
-    this.numPagesUsed += numPages;
-    this.seqPages[seqIdx] = Array.from({ length: numPages }, (_, i) => startPage + i);
-    this.seqKvLens[seqIdx] = seqLen;
-    this.pagesChanged = true;
-    return [startPage, numPages];
-  }
-
   allocAppendPages(seqIdx: number, numNewTokens: number): [number, number] {
     const pageSize = this.pageSize;
     const currentLen = this.seqKvLens[seqIdx];
@@ -511,7 +489,10 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
     this.numPagesUsed += numNewPages;
     this.seqKvLens[seqIdx] = newTotalLen;
-    if (numNewPages > 0) this.pagesChanged = true;
+    if (numNewPages > 0) {
+      this.pagesDirtyHost = true;
+      this.pagesDirtyDevice = true;
+    }
     return [startPage, numNewPages];
   }
 
@@ -523,7 +504,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       const newPage = this.numPagesUsed;
       this.numPagesUsed += 1;
       this.seqPages[seqIdx].push(newPage);
-      this.pagesChanged = true;
+      this.pagesDirtyHost = true;
+      this.pagesDirtyDevice = true;
     }
     this.seqKvLens[seqIdx] = kvLen + 1;
     const absPage = this.seqPages[seqIdx][pageIdxInSeq];

@@ -1,9 +1,8 @@
-import "./test_parallel.js";
-import "./test_nccl.js";
-import "./test_nccl_multi.js";
-import "./test.js";
-import "./test_batch.js";
-import "./test_fp8.js";
-import "./test_no_graph.js";
-import "./test_graph.js";
-import "./test_decode_step.js";
+import "./test_parallel";
+import "./test_nccl";
+import "./test_nccl_multi";
+import "./test";
+import "./test_batch";
+import "./test_fp8";
+import "./test_no_graph";
+import "./test_graph";

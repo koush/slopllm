@@ -122,18 +122,19 @@ describe("Qwen3-0.6B batch tests", () => {
   it("batch decode vs single decode", () => {
     using pagedKV = makePagedKV();
     using singleKV = makePagedKV(1);
+    using singleWs = new ExecutionWorkspace(glm, 1, 4096);
     pagedKV.reset(2);
     const batchTokens = ws.forwardEagerPrefill(model, [PROMPT1, PROMPT2], pagedKV);
     const token1 = batchTokens[0];
     const token2 = batchTokens[1];
 
     singleKV.reset(1);
-    const singleFirst1 = ws.forwardEagerPrefill(model, [PROMPT1], singleKV)[0];
-    const singleDecode1 = ws.forwardEagerDecode(model, [singleFirst1], singleKV)[0];
+    const singleFirst1 = singleWs.forwardEagerPrefill(model, [PROMPT1], singleKV)[0];
+    const singleDecode1 = singleWs.forwardEagerDecode(model, [singleFirst1], singleKV)[0];
 
     singleKV.reset(1);
-    const singleFirst2 = ws.forwardEagerPrefill(model, [PROMPT2], singleKV)[0];
-    const singleDecode2 = ws.forwardEagerDecode(model, [singleFirst2], singleKV)[0];
+    const singleFirst2 = singleWs.forwardEagerPrefill(model, [PROMPT2], singleKV)[0];
+    const singleDecode2 = singleWs.forwardEagerDecode(model, [singleFirst2], singleKV)[0];
 
     const batchDecodeTokens = ws.forwardEagerDecode(model, [token1, token2], pagedKV);
 

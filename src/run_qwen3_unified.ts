@@ -7,7 +7,7 @@ import { MemcpyKind, Tensor } from "./tensor";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
-import { ExecutionWorkspace } from "./paged_kv";
+import { ExecutionState, ExecutionWorkspace } from "./paged_kv";
 import { DeviceOps } from "./device_ops";
 import { WorkspaceBase } from "./workspace";
 import { UsingHolder } from "./using-holder";
@@ -206,14 +206,7 @@ export function* generateStream(
       planMs += performance.now() - tPlan;
 
       const tExec = performance.now();
-      if (useGraph && graphState!.graphExec !== null) {
-        if (tAfterSync > 0) idleMs += performance.now() - tAfterSync;
-        // only host pinned is automatically copied. if using a device pinned, must be explicitly copied.
-        ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
-        glm.graphLaunch(graphState!.graphExec);
-        graphSteps++;
-      }
-      else {
+      if (graphState!.graphExec === null) {
         ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
         state.prepareInput(gpuSampleResult!);
 
@@ -222,11 +215,11 @@ export function* generateStream(
           glm.graphBeginCapture();
         }
 
+        ws.decodeStep(state);
         ws.forwardInput(state);
         using logits = model.forward(state);
         doSample(logits);
 
-        const wasCapturing = capturing;
         if (capturing) {
           const graph = glm.graphEndCapture();
           ws.freeze();
@@ -236,12 +229,18 @@ export function* generateStream(
         }
         if (useGraph) graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
         warmupSteps++;
-
-        if (wasCapturing) {
-          // when cuda graph captures it is NOT executing. must run again.
-          continue;
-        }
       }
+
+      // when cuda graph captures it is NOT executing. it must run again.
+      // thats why it is not else if, the actual execution must run again after capture.
+      if (graphState?.graphExec !== null) {
+        if (tAfterSync > 0) idleMs += performance.now() - tAfterSync;
+        // only host pinned is automatically copied. if using a device pinned, must be explicitly copied.
+        ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
+        glm.graphLaunch(graphState!.graphExec);
+        graphSteps++;
+      }
+
       yield currentToken;
       glm.synchronize();
       execMs += performance.now() - tExec;
