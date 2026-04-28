@@ -114,7 +114,6 @@ function modelLabel(args: CliArgs): string {
 function tokenizeMessages(
   tokenizer: any,
   messages: Array<{ role: string; content: string }>,
-  enableThinking: boolean,
 ): number[] {
   try {
     const result = tokenizer.apply_chat_template(messages, {
@@ -122,7 +121,6 @@ function tokenizeMessages(
       add_generation_prompt: true,
       return_tensor: false,
       return_dict: true,
-      tokenizer_kwargs: { enable_thinking: enableThinking },
     }) as { input_ids: number[] | number[][] };
     return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
   } catch {
@@ -349,16 +347,16 @@ async function interactiveChat(
       }
 
       messages.push({ role: "user", content: userInput });
-      const inputIds = tokenizeMessages(tokenizer, messages, true);
+      const inputIds = tokenizeMessages(tokenizer, messages);
 
       if (inputIds.length > args.maxSeqLen - args.maxNewTokens) {
         console.log(`Warning: prompt (${inputIds.length} tokens) too long, truncating conversation`);
         while (inputIds.length > args.maxSeqLen - args.maxNewTokens && messages.length > 1) {
           messages.splice(1, 2);
-          const retryIds = tokenizeMessages(tokenizer, messages, true);
+          const retryIds = tokenizeMessages(tokenizer, messages);
           if (retryIds.length <= args.maxSeqLen - args.maxNewTokens) break;
         }
-        if (messages.length === 1 && tokenizeMessages(tokenizer, messages, true).length > args.maxSeqLen - args.maxNewTokens) {
+        if (messages.length === 1 && tokenizeMessages(tokenizer, messages).length > args.maxSeqLen - args.maxNewTokens) {
           console.log("Conversation too long even after truncation. Use /clear to reset.");
           messages.pop();
           continue;
@@ -399,7 +397,7 @@ async function singlePrompt(
   const sp = !args.greedy ? makeSamplingParams(args) : undefined;
   const eosIds = model.eosIds;
   const messages = [{ role: "user", content: args.prompt! }];
-  const inputIds = tokenizeMessages(tokenizer, messages, true);
+  const inputIds = tokenizeMessages(tokenizer, messages);
 
   console.log(`Prompt: ${args.prompt}`);
   console.log(`Tokens: ${inputIds.length}`);
@@ -464,7 +462,7 @@ async function interactiveBatch(
       const inputIdsList: number[][] = [];
       for (const prompt of prompts) {
         const messages = [{ role: "user" as const, content: prompt }];
-        const ids = tokenizeMessages(tokenizer, messages, true);
+        const ids = tokenizeMessages(tokenizer, messages);
         inputIdsList.push(ids);
       }
 
