@@ -259,7 +259,8 @@ export abstract class Tensor implements Disposable {
     const vs = this.shape[this.shape.length - 1];
     const maxWindow = Math.max(...params.map(p => p.repetitionPenaltyWindow));
     using ws = new SamplingWorkspace(this.workspace.glm, params, vs, maxWindow, tokenHistories);
-    return ws.sample(this);
+    const outToken = this.workspace.alloc([ws.batchSize], "I32");
+    return ws.sampleInto(this, outToken);
   }
 }
 
@@ -382,6 +383,10 @@ export class SamplingWorkspace extends WorkspaceBase {
   }
 
   sample(logits: Tensor): Tensor {
+    return this.sampleInto(logits, this.outToken);
+  }
+
+  sampleInto(logits: Tensor, outToken: Tensor): Tensor {
     const batchSize = this.batchSize;
     const vs = this.vocabSize;
 
@@ -402,7 +407,7 @@ export class SamplingWorkspace extends WorkspaceBase {
     }
 
     logits.doSampleBatch(
-      this.outToken,
+      outToken,
       this.topkVals,
       this.topkIdxs,
       this.sampleWorkspaceBuf,
@@ -421,6 +426,6 @@ export class SamplingWorkspace extends WorkspaceBase {
       maxEffectiveK,
     );
 
-    return this.outToken;
+    return outToken;
   }
 }
