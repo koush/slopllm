@@ -608,7 +608,7 @@ class Qwen35Model:
                         ws["k_rope"] + src_off,
                         hd * BF16)
             glm.memcpy(cache.v_data[cache_idx] + dst_off,
-                        ws["v_t"] + src_off,
+                        ws["v_buf"] + src_off,
                         hd * BF16)
 
         glm.flash_decode(
