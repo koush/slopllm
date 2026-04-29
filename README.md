@@ -50,6 +50,47 @@ Or directly:
 cd tests/python && pytest -v .
 ```
 
+Install Python dependencies:
+
+```bash
+pip install pytest torch safetensors
+```
+
+## Profiling
+
+Capture an Nsight Systems trace of a Qwen3-32B 8-GPU decode run (skips
+prefill via `--delay`, captures 4s of steady-state decode):
+
+```bash
+HF_HOME=/mnt/storage/.cache/huggingface nsys profile \
+    --trace=cuda \
+    --output=/tmp/qwen3_p2p \
+    --force-overwrite=true \
+    --duration=10 \
+  npx tsx src/run_qwen3_unified.ts \
+    --gpus 0,1,2,3,4,5,6,7 \
+    --prompt "tell me a 1000 word story" \
+    --greedy \
+    --max-new-tokens 1500 \
+    --no-cuda-graph
+```
+
+Get the per-kernel breakdown:
+
+```bash
+nsys stats --report cuda_gpu_kern_sum --force-export=true --format=csv \
+  /tmp/qwen3_p2p.nsys-rep | head -20
+```
+
+To compare with the NCCL-only baseline, prefix the run with
+`GLM_DISABLE_P2P_ALLREDUCE=1`.
+
+Or directly:
+
+```bash
+cd tests/python && pytest -v .
+```
+
 Node tests:
 
 ```bash
