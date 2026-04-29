@@ -57,6 +57,18 @@ __device__ float hash_to_random(unsigned int seed) {
     return (float)seed / (float)0xFFFFFFFFu;
 }
 
+__device__ void insertion_sort_descending(HeapEntry* arr, int size) {
+    for (int i = 1; i < size; i++) {
+        HeapEntry key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j].val < key.val) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
 struct SamplingParams {
     float temperature;
     float repetition_penalty;
@@ -262,13 +274,38 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
         }
     }
 
-    for (int i = 0; i < local_size; i++) {
-        seq_topk_vals[tid * MAX_K + i] = local_heap[i].val;
-        seq_topk_idxs[tid * MAX_K + i] = local_heap[i].idx;
-    }
     for (int i = local_size; i < p.effective_k; i++) {
-        seq_topk_vals[tid * MAX_K + i] = -FLT_MAX;
-        seq_topk_idxs[tid * MAX_K + i] = -1;
+        local_heap[i].val = -FLT_MAX;
+        local_heap[i].idx = -1;
+    }
+    local_size = p.effective_k;
+    for (int i = (p.effective_k / 2) - 1; i >= 0; i--) {
+        heap_sift_down(local_heap, i, p.effective_k);
+    }
+
+    int lane_id = tid & 31;
+    int warp_id = tid >> 5;
+    int num_warps = block_size >> 5;
+
+    for (int stride = 16; stride >= 1; stride >>= 1) {
+        for (int i = 0; i < p.effective_k; i++) {
+            float partner_val = __shfl_xor_sync(0xFFFFFFFF, local_heap[i].val, stride);
+            int partner_idx = __shfl_xor_sync(0xFFFFFFFF, local_heap[i].idx, stride);
+            if ((lane_id & stride) == 0 && partner_idx >= 0) {
+                heap_insert(local_heap, local_size, p.effective_k, partner_val, partner_idx);
+            }
+        }
+    }
+
+    extern __shared__ char smem[];
+    float* smem_warp_vals = reinterpret_cast<float*>(smem);
+    int* smem_warp_idxs = reinterpret_cast<int*>(smem + num_warps * MAX_K * sizeof(float));
+
+    if (lane_id == 0) {
+        for (int i = 0; i < p.effective_k; i++) {
+            smem_warp_vals[warp_id * MAX_K + i] = local_heap[i].val;
+            smem_warp_idxs[warp_id * MAX_K + i] = local_heap[i].idx;
+        }
     }
     __syncthreads();
 
@@ -276,32 +313,20 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
         HeapEntry merge_heap[MAX_K];
         int merge_size = 0;
 
-        for (int t = 0; t < block_size; t++) {
+        for (int w = 0; w < num_warps; w++) {
             for (int i = 0; i < p.effective_k; i++) {
-                float val = seq_topk_vals[t * MAX_K + i];
-                int idx = seq_topk_idxs[t * MAX_K + i];
+                float val = smem_warp_vals[w * MAX_K + i];
+                int idx = smem_warp_idxs[w * MAX_K + i];
                 if (idx >= 0) {
                     heap_insert(merge_heap, merge_size, p.effective_k, val, idx);
                 }
             }
         }
 
+        insertion_sort_descending(merge_heap, merge_size);
         for (int i = 0; i < merge_size; i++) {
             seq_topk_vals[i] = merge_heap[i].val;
             seq_topk_idxs[i] = merge_heap[i].idx;
-        }
-
-        for (int i = 1; i < merge_size; i++) {
-            float key_val = seq_topk_vals[i];
-            int key_idx = seq_topk_idxs[i];
-            int j = i - 1;
-            while (j >= 0 && seq_topk_vals[j] < key_val) {
-                seq_topk_vals[j + 1] = seq_topk_vals[j];
-                seq_topk_idxs[j + 1] = seq_topk_idxs[j];
-                j--;
-            }
-            seq_topk_vals[j + 1] = key_val;
-            seq_topk_idxs[j + 1] = key_idx;
         }
 
         sampling_softmax_topp_sample_and_append(seq_idx, p, seq_topk_vals, nullptr, seq_topk_idxs,
@@ -411,32 +436,39 @@ void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_
 
     int block_size = SAMPLING_BLOCK_SIZE;
 
+    int num_warps = block_size / 32;
+
     if (max_effective_k <= 1) {
-        sampling_kernel_batch<2><<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
+        size_t smem = num_warps * 2 * (sizeof(float) + sizeof(int));
+        sampling_kernel_batch<2><<<batch_size, block_size, smem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
             top_ks, top_ps, step_counter);
     } else if (max_effective_k <= 8) {
-        sampling_kernel_batch<8><<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
+        size_t smem = num_warps * 8 * (sizeof(float) + sizeof(int));
+        sampling_kernel_batch<8><<<batch_size, block_size, smem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
             top_ks, top_ps, step_counter);
     } else if (max_effective_k <= 16) {
-        sampling_kernel_batch<16><<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
+        size_t smem = num_warps * 16 * (sizeof(float) + sizeof(int));
+        sampling_kernel_batch<16><<<batch_size, block_size, smem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
             top_ks, top_ps, step_counter);
     } else if (max_effective_k <= 32) {
-        sampling_kernel_batch<32><<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
+        size_t smem = num_warps * 32 * (sizeof(float) + sizeof(int));
+        sampling_kernel_batch<32><<<batch_size, block_size, smem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
             top_ks, top_ps, step_counter);
     } else if (max_effective_k <= 64) {
-        sampling_kernel_batch<64><<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
+        size_t smem = num_warps * 64 * (sizeof(float) + sizeof(int));
+        sampling_kernel_batch<64><<<batch_size, block_size, smem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
