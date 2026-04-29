@@ -887,17 +887,17 @@ export class ParallelTensor extends Tensor {
     return { cos, sin };
   }
 
-  protected doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyOffsets: Tensor, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, randomVals: Tensor, maxEffectiveK: number): void {
+  doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
     const pLogits = logits as ParallelTensor;
     if (pLogits.parallelism === TensorParallelism.Row || pLogits.parallelism === TensorParallelism.Column) {
       const gathered = pLogits.allGather(pLogits.workspace);
-      this.doSampleBatch(outTokens, topkVals, topkIdxs, workspace, gathered, penaltyTokens, penaltyOffsets, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, randomVals, maxEffectiveK);
+      this.doSampleBatch(outTokens, topkVals, topkIdxs, workspace, gathered, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
       gathered[Symbol.dispose]();
       return;
     }
     if (pLogits.parallelism === TensorParallelism.PartialSum) {
       pLogits.allReduce();
-      this.doSampleBatch(outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyOffsets, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, randomVals, maxEffectiveK);
+      this.doSampleBatch(outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
       return;
     }
     const pOut = this.cast(outTokens);
@@ -905,16 +905,16 @@ export class ParallelTensor extends Tensor {
     const pTopkIdxs = this.cast(topkIdxs);
     const pWorkspace = this.cast(workspace);
     const pPenaltyTokens = this.cast(penaltyTokens);
-    const pPenaltyOffsets = this.cast(penaltyOffsets);
+    const pPenaltyCount = this.cast(penaltyCount);
     const pTemps = this.cast(temperatures);
     const pRepPen = this.cast(repPenalties);
     const pPresPen = this.cast(presPenalties);
     const pTopKs = this.cast(topKs);
     const pTopPs = this.cast(topPs);
-    const pRandomVals = this.cast(randomVals);
+    const pStepCounter = this.cast(stepCounter);
     this.assertParallel("sampleBatch logits", pLogits, TensorParallelism.Replicated);
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].sampleBatch(pOut.shards[i], pTopkVals.shards[i], pTopkIdxs.shards[i], pWorkspace.shards[i], pLogits.shards[i], pPenaltyTokens.shards[i], pPenaltyOffsets.shards[i], vocabSize, batchSize, pTemps.shards[i], pRepPen.shards[i], pPresPen.shards[i], pTopKs.shards[i], pTopPs.shards[i], pRandomVals.shards[i], maxEffectiveK);
+      this.devices[i].sampleBatch(pOut.shards[i], pTopkVals.shards[i], pTopkIdxs.shards[i], pWorkspace.shards[i], pLogits.shards[i], pPenaltyTokens.shards[i], pPenaltyCount.shards[i], maxWindow, vocabSize, batchSize, pTemps.shards[i], pRepPen.shards[i], pPresPen.shards[i], pTopKs.shards[i], pTopPs.shards[i], pStepCounter.shards[i], maxEffectiveK);
     }
   }
 }

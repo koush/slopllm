@@ -1491,8 +1491,8 @@ static Napi::Value RmsnormGated(const Napi::CallbackInfo& info) {
 
 static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 17) {
-        Napi::TypeError::New(env, "Expected (ctx, out_tokens, topk_vals, topk_idxs, workspace, logits, penalty_tokens, penalty_offsets, vocab_size, batch_size, temperatures, repetition_penalties, presence_penalties, top_ks, top_ps, random_vals, max_effective_k)").ThrowAsJavaScriptException();
+    if (info.Length() < 18) {
+        Napi::TypeError::New(env, "Expected (ctx, out_tokens, topk_vals, topk_idxs, workspace, logits, penalty_tokens, penalty_count, max_window, vocab_size, batch_size, temperatures, repetition_penalties, presence_penalties, top_ks, top_ps, step_counter, max_effective_k)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1502,31 +1502,32 @@ static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
     uintptr_t workspace_ptr = info[4].As<Napi::Number>().Int64Value();
     uintptr_t logits_ptr = info[5].As<Napi::Number>().Int64Value();
     uintptr_t penalty_tokens_ptr = info[6].As<Napi::Number>().Int64Value();
-    uintptr_t penalty_offsets_ptr = info[7].As<Napi::Number>().Int64Value();
-    int vocab_size = info[8].As<Napi::Number>().Int32Value();
-    int batch_size = info[9].As<Napi::Number>().Int32Value();
-    uintptr_t temperatures_ptr = info[10].As<Napi::Number>().Int64Value();
-    uintptr_t rep_penalties_ptr = info[11].As<Napi::Number>().Int64Value();
-    uintptr_t pres_penalties_ptr = info[12].As<Napi::Number>().Int64Value();
-    uintptr_t top_ks_ptr = info[13].As<Napi::Number>().Int64Value();
-    uintptr_t top_ps_ptr = info[14].As<Napi::Number>().Int64Value();
-    uintptr_t random_vals_ptr = info[15].As<Napi::Number>().Int64Value();
-    int max_effective_k = info[16].As<Napi::Number>().Int32Value();
+    uintptr_t penalty_count_ptr = info[7].As<Napi::Number>().Int64Value();
+    int max_window = info[8].As<Napi::Number>().Int32Value();
+    int vocab_size = info[9].As<Napi::Number>().Int32Value();
+    int batch_size = info[10].As<Napi::Number>().Int32Value();
+    uintptr_t temperatures_ptr = info[11].As<Napi::Number>().Int64Value();
+    uintptr_t rep_penalties_ptr = info[12].As<Napi::Number>().Int64Value();
+    uintptr_t pres_penalties_ptr = info[13].As<Napi::Number>().Int64Value();
+    uintptr_t top_ks_ptr = info[14].As<Napi::Number>().Int64Value();
+    uintptr_t top_ps_ptr = info[15].As<Napi::Number>().Int64Value();
+    uintptr_t step_counter_ptr = info[16].As<Napi::Number>().Int64Value();
+    int max_effective_k = info[17].As<Napi::Number>().Int32Value();
     glm_sample_batch(reinterpret_cast<GlmCtx*>(ctx_ptr),
                reinterpret_cast<int*>(out_tokens_ptr),
                reinterpret_cast<float*>(topk_vals_ptr),
                reinterpret_cast<int*>(topk_idxs_ptr),
                reinterpret_cast<float*>(workspace_ptr),
                reinterpret_cast<const void*>(logits_ptr),
-               reinterpret_cast<const int*>(penalty_tokens_ptr),
-               reinterpret_cast<const int*>(penalty_offsets_ptr),
-               vocab_size, batch_size,
+               reinterpret_cast<int*>(penalty_tokens_ptr),
+               reinterpret_cast<int*>(penalty_count_ptr),
+               max_window, vocab_size, batch_size,
                reinterpret_cast<const float*>(temperatures_ptr),
                reinterpret_cast<const float*>(rep_penalties_ptr),
                reinterpret_cast<const float*>(pres_penalties_ptr),
                reinterpret_cast<const int*>(top_ks_ptr),
                reinterpret_cast<const float*>(top_ps_ptr),
-               reinterpret_cast<const float*>(random_vals_ptr),
+               reinterpret_cast<unsigned int*>(step_counter_ptr),
                max_effective_k);
     return env.Undefined();
 }

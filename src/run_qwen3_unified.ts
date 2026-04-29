@@ -3,7 +3,7 @@ import { ParallelOps } from "./parallel_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model } from "./qwen35_model";
 import { ChatModel, ChatCache, SamplingParams, makeSamplingParams } from "./chat_model";
-import { MemcpyKind, Tensor } from "./tensor";
+import { MemcpyKind, Tensor, SamplingWorkspace } from "./tensor";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
 import { createInterface } from "node:readline";
@@ -159,12 +159,13 @@ export function* generateStream(
   let sampleResult: Tensor | null = null;
   let gpuSampleResult: Tensor | null = null;
   const sampledLogits = new UsingHolder<Tensor>(undefined!);
+  using samplingWorkspace = new SamplingWorkspace(glm, [sampling!], model.cfg.vocabSize, sampling!.repetitionPenaltyWindow, [inputIds]);
   function doSample(logits: Tensor) {
     if (greedy) {
       sampledLogits.replace(logits.argmax());
     }
     else {
-      sampledLogits.replace(logits.sampleTokenGPU(sampling, tokenHistory));
+      sampledLogits.replace(samplingWorkspace!.sample(logits));
     }
     const argmaxValue = sampledLogits.value;
     gpuSampleResult ||= sampleWorkspace.alloc(argmaxValue.shape, argmaxValue.type);

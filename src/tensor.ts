@@ -1,5 +1,5 @@
 import { type SamplingParams } from "./chat_model";
-import { TensorParallelism } from "./device_ops";
+import { DeviceOps, TensorParallelism } from "./device_ops";
 import { getNativeAddon } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { WorkspaceBase } from "./workspace";
@@ -249,58 +249,145 @@ export abstract class Tensor implements Disposable {
     return result;
   }
 
-  protected abstract doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyOffsets: Tensor, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, randomVals: Tensor, maxEffectiveK: number): void;
+  abstract doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void;
+
+  sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): Tensor {
+    return this.sampleBatchGPU([params], [tokenHistory]);
+  }
 
   sampleBatchGPU(params: SamplingParams[], tokenHistories: number[][]): Tensor {
-    const batchSize = params.length;
-    if (batchSize !== tokenHistories.length) {
-      throw new Error(`sampleBatchGPU: params length ${batchSize} != tokenHistories length ${tokenHistories.length}`);
-    }
     const vs = this.shape[this.shape.length - 1];
+    const maxWindow = Math.max(...params.map(p => p.repetitionPenaltyWindow));
+    using ws = new SamplingWorkspace(this.workspace.glm, params, vs, maxWindow, tokenHistories);
+    return ws.sample(this);
+  }
+}
+
+export class SamplingWorkspace extends WorkspaceBase {
+  readonly vocabSize: number;
+  readonly batchSize: number;
+  readonly maxWindow: number;
+  params!: SamplingParams[];
+
+  readonly penaltyTokens: Tensor;
+  readonly penaltyCount: Tensor;
+  readonly stepCounter: Tensor;
+  readonly temperatures: Tensor;
+  readonly repPenalties: Tensor;
+  readonly presPenalties: Tensor;
+  readonly topKs: Tensor;
+  readonly topPs: Tensor;
+  readonly outToken: Tensor;
+
+  private readonly topkVals: Tensor;
+  private readonly topkIdxs: Tensor;
+  private readonly sampleWorkspaceBuf: Tensor;
+
+  constructor(glm: DeviceOps, params: SamplingParams[], vocabSize: number, maxWindow: number, tokenHistories?: number[][]) {
+    super(glm);
+    this.vocabSize = vocabSize;
+    this.batchSize = params.length;
+    this.maxWindow = maxWindow;
 
     const I32 = 4;
+
+    this.penaltyTokens = this.alloc([maxWindow > 0 ? this.batchSize * maxWindow : this.batchSize], "I32");
+    this.penaltyCount = this.alloc([this.batchSize], "I32");
+    this.stepCounter = this.alloc([1], "U32");
+    this.temperatures = this.alloc([this.batchSize], "F32");
+    this.repPenalties = this.alloc([this.batchSize], "F32");
+    this.presPenalties = this.alloc([this.batchSize], "F32");
+    this.topKs = this.alloc([this.batchSize], "I32");
+    this.topPs = this.alloc([this.batchSize], "F32");
+    this.outToken = this.alloc([this.batchSize], "I32");
+
     const SAMPLING_MAX_TOPK = 256;
     const SAMPLING_BLOCK_SIZE = 256;
+    this.topkVals = this.alloc([this.batchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
+    this.topkIdxs = this.alloc([this.batchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
+    this.sampleWorkspaceBuf = this.alloc([this.batchSize * vocabSize], "F32");
 
-    const penaltyBufSize = batchSize * 1024 * I32;
-    const penaltyBuf = Buffer.alloc(penaltyBufSize);
-    const offsetsBuf = Buffer.alloc((batchSize + 1) * I32);
+    const seedBuf = Buffer.alloc(4);
+    seedBuf.writeUInt32LE(Math.floor(Math.random() * 0xFFFFFFFF) >>> 0, 0);
+    this.stepCounter.h2d(seedBuf);
+
+    this.updateSampler(params, tokenHistories);
+  }
+
+  updateSampler(params: SamplingParams[], tokenHistories?: number[][]): void {
+    if (params.length !== this.batchSize) {
+      throw new Error(`updateSampler: expected ${this.batchSize} params, got ${params.length}`);
+    }
+    this.params = params;
+
+    const I32 = 4;
+    const batchSize = this.batchSize;
+    const vs = this.vocabSize;
+    const maxWindow = this.maxWindow;
+
     const tempBuf = Buffer.alloc(batchSize * 4);
     const repBuf = Buffer.alloc(batchSize * 4);
     const presBuf = Buffer.alloc(batchSize * 4);
     const topKBuf = Buffer.alloc(batchSize * I32);
     const topPBuf = Buffer.alloc(batchSize * 4);
-    const randBuf = Buffer.alloc(batchSize * 4);
-
-    let maxEffectiveK = 0;
-    let penaltyOffset = 0;
-    offsetsBuf.writeInt32LE(0, 0);
 
     for (let i = 0; i < batchSize; i++) {
       const p = params[i];
-      const history = tokenHistories[i];
-
-      const hasRepPenalty = p.repetitionPenalty !== 1.0;
-      const hasPresPenalty = p.presencePenalty !== 0;
-
-      let numPenaltyTokens = 0;
-      if (hasRepPenalty || hasPresPenalty) {
-        const seen = new Set<number>();
-        const start = Math.max(0, history.length - p.repetitionPenaltyWindow);
-        for (let j = start; j < history.length; j++) seen.add(history[j]);
-        for (const tid of seen) {
-          if (tid < vs) {
-            penaltyBuf.writeInt32LE(tid, penaltyOffset * I32 + numPenaltyTokens * I32);
-            numPenaltyTokens++;
-          }
-        }
-      }
-      penaltyOffset += numPenaltyTokens;
-      offsetsBuf.writeInt32LE(penaltyOffset, (i + 1) * I32);
-
       const topK = p.topK > 0 ? p.topK : 0;
       const temperature = p.temperature > 0 ? p.temperature : 0;
+      tempBuf.writeFloatLE(temperature, i * 4);
+      repBuf.writeFloatLE(p.repetitionPenalty, i * 4);
+      presBuf.writeFloatLE(p.presencePenalty, i * 4);
+      topKBuf.writeInt32LE(topK, i * I32);
+      topPBuf.writeFloatLE(p.topP, i * 4);
+    }
 
+    this.temperatures.h2d(tempBuf);
+    this.repPenalties.h2d(repBuf);
+    this.presPenalties.h2d(presBuf);
+    this.topKs.h2d(topKBuf);
+    this.topPs.h2d(topPBuf);
+
+    if (tokenHistories !== undefined) {
+      const penaltyBufSize = maxWindow > 0 ? batchSize * maxWindow * I32 : batchSize * I32;
+      const penaltyBuf = Buffer.alloc(penaltyBufSize);
+      const countBuf = Buffer.alloc(batchSize * I32);
+
+      for (let i = 0; i < batchSize; i++) {
+        const p = params[i];
+        const hasPenalty = p.repetitionPenalty !== 1.0 || p.presencePenalty !== 0;
+        let numTokens = 0;
+        if (hasPenalty && maxWindow > 0) {
+          const history = tokenHistories[i];
+          const seen = new Set<number>();
+          const start = Math.max(0, history.length - maxWindow);
+          for (let j = start; j < history.length; j++) seen.add(history[j]);
+          for (const tid of seen) {
+            if (tid < vs) {
+              penaltyBuf.writeInt32LE(tid, (i * maxWindow + numTokens) * I32);
+              numTokens++;
+            }
+          }
+        }
+        countBuf.writeInt32LE(numTokens, i * I32);
+      }
+
+      if (maxWindow > 0) {
+        this.penaltyTokens.h2d(penaltyBuf, penaltyBufSize);
+      }
+      this.penaltyCount.h2d(countBuf);
+    }
+  }
+
+  sample(logits: Tensor): Tensor {
+    const batchSize = this.batchSize;
+    const vs = this.vocabSize;
+
+    let maxEffectiveK = 0;
+    for (let i = 0; i < batchSize; i++) {
+      const p = this.params[i];
+      const topK = p.topK > 0 ? p.topK : 0;
+      const temperature = p.temperature > 0 ? p.temperature : 0;
       let effectiveK: number;
       if (temperature <= 0 && topK <= 0) {
         effectiveK = 1;
@@ -310,62 +397,28 @@ export abstract class Tensor implements Disposable {
         effectiveK = 64;
       }
       if (effectiveK > maxEffectiveK) maxEffectiveK = effectiveK;
-
-      tempBuf.writeFloatLE(temperature, i * 4);
-      repBuf.writeFloatLE(p.repetitionPenalty, i * 4);
-      presBuf.writeFloatLE(p.presencePenalty, i * 4);
-      topKBuf.writeInt32LE(topK, i * I32);
-      topPBuf.writeFloatLE(p.topP, i * 4);
-      randBuf.writeFloatLE(Math.random(), i * 4);
     }
 
-    using topkVals = this.workspace.alloc([batchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
-    using topkIdxs = this.workspace.alloc([batchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
-    using sampleWorkspace = this.workspace.alloc([batchSize * vs], "F32");
-    using penaltyTokens = this.workspace.alloc([batchSize * 1024], "I32");
-    using penaltyOffsets = this.workspace.alloc([batchSize + 1], "I32");
-    using temperatures = this.workspace.alloc([batchSize], "F32");
-    using repPenalties = this.workspace.alloc([batchSize], "F32");
-    using presPenalties = this.workspace.alloc([batchSize], "F32");
-    using topKs = this.workspace.alloc([batchSize], "I32");
-    using topPs = this.workspace.alloc([batchSize], "F32");
-    using randomVals = this.workspace.alloc([batchSize], "F32");
-    const outToken = this.workspace.alloc([batchSize], "I32");
-
-    if (penaltyOffset > 0) {
-      penaltyTokens.h2d(penaltyBuf, penaltyOffset * I32);
-    }
-    penaltyOffsets.h2d(offsetsBuf);
-    temperatures.h2d(tempBuf);
-    repPenalties.h2d(repBuf);
-    presPenalties.h2d(presBuf);
-    topKs.h2d(topKBuf);
-    topPs.h2d(topPBuf);
-    randomVals.h2d(randBuf);
-
-    this.doSampleBatch(
-      outToken,
-      topkVals,
-      topkIdxs,
-      sampleWorkspace,
-      this,
-      penaltyTokens,
-      penaltyOffsets,
+    logits.doSampleBatch(
+      this.outToken,
+      this.topkVals,
+      this.topkIdxs,
+      this.sampleWorkspaceBuf,
+      logits,
+      this.penaltyTokens,
+      this.penaltyCount,
+      this.maxWindow,
       vs,
       batchSize,
-      temperatures,
-      repPenalties,
-      presPenalties,
-      topKs,
-      topPs,
-      randomVals,
+      this.temperatures,
+      this.repPenalties,
+      this.presPenalties,
+      this.topKs,
+      this.topPs,
+      this.stepCounter,
       maxEffectiveK,
     );
 
-    return outToken;
-  }
-
-  sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): Tensor {
-    return this.sampleBatchGPU([params], [tokenHistory]);
+    return this.outToken;
   }
 }

@@ -446,16 +446,18 @@ void glm_gate_sigmoid_mul(GlmCtx* ctx, void* attn_out, const void* gate_interlea
 // topk_idxs: [batch_size * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE] int32 - workspace
 // workspace: [batch_size * vocab_size] float32 - F32 logits workspace
 // logits: [batch_size * vocab_size] bfloat16 - input logits
-// penalty_tokens: flat jagged array of all penalty token IDs
-// penalty_offsets: [batch_size + 1] int32 - offsets into penalty_tokens
-// temperatures, repetition_penalties, presence_penalties, top_ks, top_ps, random_vals: [batch_size]
+// penalty_tokens: [batch_size * max_window] int32 - circular buffer of penalty token IDs (writable)
+// penalty_count: [batch_size] int32 - number of entries per sequence (writable, incremented by kernel)
+// max_window: maximum penalty window size (circular buffer stride per sequence)
+// temperatures, repetition_penalties, presence_penalties, top_ks, top_ps: [batch_size]
+// step_counter: [1] uint32 - atomic counter for device-side RNG (writable)
 void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_idxs,
                       float* workspace, const void* logits,
-                      const int* penalty_tokens, const int* penalty_offsets,
-                      int vocab_size, int batch_size,
+                      int* penalty_tokens, int* penalty_count,
+                      int max_window, int vocab_size, int batch_size,
                       const float* temperatures, const float* repetition_penalties,
                       const float* presence_penalties, const int* top_ks,
-                      const float* top_ps, const float* random_vals,
+                      const float* top_ps, unsigned int* step_counter,
                       int max_effective_k);
 
 #ifdef __cplusplus
