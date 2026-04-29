@@ -1,6 +1,6 @@
 import type { ChatCache, ChatModel } from "./chat_model";
 import { DeviceOps } from "./device_ops";
-import { BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, BF16, I32 } from "./glm_ops";
+import { BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, I32 } from "./glm_ops";
 import { MemcpyKind } from "./tensor";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
@@ -31,6 +31,22 @@ export class ExecutionState {
     this.ws = ws;
     this.cache = cache;
     this.qoIndptrHost = qoIndptrHost;
+  }
+
+  kvCacheWrite(kRope: Tensor, vBuf: Tensor, cacheIdx: number, nKv: number, hd: number): void {
+    const pagedKV = this.cache.getPagedKV();
+    const BS = this.totalTokens;
+    const kTokenStride = this.isDecode ? nKv * hd : hd;
+    const kHeadStride = this.isDecode ? hd : BS * hd;
+    const vTokenStride = nKv * hd;
+    const vHeadStride = hd;
+    this.ws.glm.kvCacheWrite(
+      kRope, vBuf,
+      pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
+      this.ws.slotMapping,
+      BS, nKv, hd, pagedKV.pageSize,
+      kTokenStride, kHeadStride, vTokenStride, vHeadStride
+    );
   }
 
   prepareInput(tokenIds: number[]|Tensor) {
@@ -179,21 +195,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  kvCacheWrite(kRope: Tensor, vBuf: Tensor, state: ExecutionState, cacheIdx: number, nKv: number, hd: number): void {
-    const pagedKV = state.cache.getPagedKV();
-    const BS = state.totalTokens;
-    const kTokenStride = state.isDecode ? nKv * hd : hd;
-    const kHeadStride = state.isDecode ? hd : BS * hd;
-    const vTokenStride = nKv * hd;
-    const vHeadStride = hd;
-    this.glm.kvCacheWrite(
-      kRope, vBuf,
-      pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
-      this.slotMapping,
-      BS, nKv, hd, pagedKV.pageSize,
-      kTokenStride, kHeadStride, vTokenStride, vHeadStride
-    );
-  }
+
 
   planDecode(model: ChatModel, batchSize: number, cache: ChatCache, enableCudaGraph = false): ExecutionState {
     const pagedKV = cache.getPagedKV();
@@ -397,8 +399,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.kData = [];
     this.vData = [];
     for (let i = 0; i < nLayers; i++) {
-      this.kData.push(this.alloc([maxPages * nKv * pageSize * hd * BF16], "U8"));
-      this.vData.push(this.alloc([maxPages * nKv * pageSize * hd * BF16], "U8"));
+      this.kData.push(this.alloc([maxPages * nKv * pageSize * hd], "BF16"));
+      this.vData.push(this.alloc([maxPages * nKv * pageSize * hd], "BF16"));
     }
     this.indices = this.alloc([maxPages * I32], "I32", "indices");
     this.indicesH = this.allocPinned([maxPages], "I32", "indicesH");

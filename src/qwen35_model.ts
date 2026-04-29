@@ -402,7 +402,7 @@ export class Qwen35Model extends ChatModel {
     using qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nHeads, S, B, hd * 2);
     using kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nKv, S, B);
 
-    ws.kvCacheWrite(kRope, vBuf, state, cacheIdx, nKv, hd);
+    state.kvCacheWrite(kRope, vBuf, cacheIdx, nKv, hd);
 
     using flashOut = new UsingHolder<Tensor>(undefined!);
     if (state.isDecode) {

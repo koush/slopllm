@@ -180,7 +180,7 @@ export class Qwen3Model extends ChatModel {
 
         const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
         vStream.streamWaitEvent();
-        ws.kvCacheWrite(kRope, vBuf, state, i, nKv, hd);
+        state.kvCacheWrite(kRope, vBuf, i, nKv, hd);
         return { kBuf, kRope };
       });
       using _kBuf = kStream.result.kBuf;
