@@ -50,10 +50,10 @@ Or directly:
 cd tests/python && pytest -v .
 ```
 
-Install Python dependencies:
+Node tests:
 
 ```bash
-pip install pytest torch safetensors
+npm run test:node
 ```
 
 ## Project Structure
@@ -73,15 +73,3 @@ vendor/
 binding.gyp          # node-gyp config
 Makefile             # CUDA shared library build
 ```
-
-## Status
-
-- [x] Phase 1: Foundation + DenseMLP (4 kernels)
-- [x] Phase 2: All kernels (29 total)
-- [x] Phase 3: Composed modules (Indexer, Attention, MoE, DecoderLayer)
-- [x] Phase 4: Precision fixes + tolerance audit
-- [x] Phase 5: Real model dimension tests
-- [ ] Safetensors weight loading
-- [ ] Full model forward pass (78 layers)
-- [ ] KV-cache for autoregressive generation
-- [ ] Tokenizer + sampling + decode loop
