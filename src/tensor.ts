@@ -289,8 +289,6 @@ export class SamplingWorkspace extends WorkspaceBase {
     this.batchSize = params.length;
     this.maxWindow = maxWindow;
 
-    const I32 = 4;
-
     this.penaltyTokens = this.alloc([maxWindow > 0 ? this.batchSize * maxWindow : this.batchSize], "I32");
     this.penaltyCount = this.alloc([this.batchSize], "I32");
     this.stepCounter = this.alloc([1], "U32");
@@ -311,10 +309,46 @@ export class SamplingWorkspace extends WorkspaceBase {
     seedBuf.writeUInt32LE(Math.floor(Math.random() * 0xFFFFFFFF) >>> 0, 0);
     this.stepCounter.h2d(seedBuf);
 
-    this.updateSampler(params, tokenHistories);
+    this.initPenaltyState(params, tokenHistories ?? []);
+    this.updateSampler(params);
   }
 
-  updateSampler(params: SamplingParams[], tokenHistories?: number[][]): void {
+  private initPenaltyState(params: SamplingParams[], tokenHistories: number[][]): void {
+    const I32 = 4;
+    const batchSize = this.batchSize;
+    const vs = this.vocabSize;
+    const maxWindow = this.maxWindow;
+
+    const penaltyBufSize = maxWindow > 0 ? batchSize * maxWindow * I32 : batchSize * I32;
+    const penaltyBuf = Buffer.alloc(penaltyBufSize);
+    const countBuf = Buffer.alloc(batchSize * I32);
+
+    for (let i = 0; i < batchSize; i++) {
+      const p = params[i];
+      const hasPenalty = p.repetitionPenalty !== 1.0 || p.presencePenalty !== 0;
+      let numTokens = 0;
+      if (hasPenalty && maxWindow > 0) {
+        const history = tokenHistories[i];
+        const seen = new Set<number>();
+        const start = Math.max(0, history.length - maxWindow);
+        for (let j = start; j < history.length; j++) seen.add(history[j]);
+        for (const tid of seen) {
+          if (tid < vs) {
+            penaltyBuf.writeInt32LE(tid, (i * maxWindow + numTokens) * I32);
+            numTokens++;
+          }
+        }
+      }
+      countBuf.writeInt32LE(numTokens, i * I32);
+    }
+
+    if (maxWindow > 0) {
+      this.penaltyTokens.h2d(penaltyBuf, penaltyBufSize);
+    }
+    this.penaltyCount.h2d(countBuf);
+  }
+
+  updateSampler(params: SamplingParams[]): void {
     if (params.length !== this.batchSize) {
       throw new Error(`updateSampler: expected ${this.batchSize} params, got ${params.length}`);
     }
@@ -322,8 +356,6 @@ export class SamplingWorkspace extends WorkspaceBase {
 
     const I32 = 4;
     const batchSize = this.batchSize;
-    const vs = this.vocabSize;
-    const maxWindow = this.maxWindow;
 
     const tempBuf = Buffer.alloc(batchSize * 4);
     const repBuf = Buffer.alloc(batchSize * 4);
@@ -347,36 +379,6 @@ export class SamplingWorkspace extends WorkspaceBase {
     this.presPenalties.h2d(presBuf);
     this.topKs.h2d(topKBuf);
     this.topPs.h2d(topPBuf);
-
-    if (tokenHistories !== undefined) {
-      const penaltyBufSize = maxWindow > 0 ? batchSize * maxWindow * I32 : batchSize * I32;
-      const penaltyBuf = Buffer.alloc(penaltyBufSize);
-      const countBuf = Buffer.alloc(batchSize * I32);
-
-      for (let i = 0; i < batchSize; i++) {
-        const p = params[i];
-        const hasPenalty = p.repetitionPenalty !== 1.0 || p.presencePenalty !== 0;
-        let numTokens = 0;
-        if (hasPenalty && maxWindow > 0) {
-          const history = tokenHistories[i];
-          const seen = new Set<number>();
-          const start = Math.max(0, history.length - maxWindow);
-          for (let j = start; j < history.length; j++) seen.add(history[j]);
-          for (const tid of seen) {
-            if (tid < vs) {
-              penaltyBuf.writeInt32LE(tid, (i * maxWindow + numTokens) * I32);
-              numTokens++;
-            }
-          }
-        }
-        countBuf.writeInt32LE(numTokens, i * I32);
-      }
-
-      if (maxWindow > 0) {
-        this.penaltyTokens.h2d(penaltyBuf, penaltyBufSize);
-      }
-      this.penaltyCount.h2d(countBuf);
-    }
   }
 
   sample(logits: Tensor): Tensor {
