@@ -24,7 +24,7 @@
                 "${workspaceFolder}/src/run_qwen3_unified.ts",
                 "--gpus", "0,1,2,3,4,5,6,7",
                 "--prompt", "what is the capital of france",
-                "--greedy",
+                // "--greedy",
             ],
             "skipFiles": [
                 "<node_internals>/**"

@@ -19,6 +19,8 @@ export abstract class UsingHolderBase<T> {
     }
 
     replace(value: T) {
+        if (this._value === value)
+            return;
         this.release();
         this._value = value;
     }

@@ -159,7 +159,7 @@ export function* generateStream(
   let sampleResult: Tensor | null = null;
   let gpuSampleResult: Tensor | null = null;
   const sampledLogits = new UsingHolder<Tensor>(undefined!);
-  using samplingWorkspace = new SamplingWorkspace(glm, [sampling!], model.cfg.vocabSize, sampling!.repetitionPenaltyWindow, [inputIds]);
+  using samplingWorkspace = sampling ? new SamplingWorkspace(glm, [sampling!], model.cfg.vocabSize, sampling!.repetitionPenaltyWindow, [inputIds]) : undefined;
   function doSample(logits: Tensor) {
     if (greedy) {
       sampledLogits.replace(logits.argmax());
