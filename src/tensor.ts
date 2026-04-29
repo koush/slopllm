@@ -401,7 +401,7 @@ export class SamplingWorkspace extends WorkspaceBase {
       } else if (topK > 0) {
         effectiveK = topK < vs ? topK : vs;
       } else {
-        effectiveK = 64;
+        effectiveK = 32;
       }
       if (effectiveK > maxEffectiveK) maxEffectiveK = effectiveK;
     }

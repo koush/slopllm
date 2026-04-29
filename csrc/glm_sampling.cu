@@ -98,7 +98,7 @@ __device__ SamplingParams sampling_load_params(
     } else if (p.top_k > 0) {
         p.effective_k = (p.top_k < vocab_size) ? p.top_k : vocab_size;
     } else {
-        p.effective_k = 64;
+        p.effective_k = 32;
     }
     return p;
 }
@@ -246,14 +246,20 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
     int local_size = 0;
 
     float inv_temp = (p.temperature > 0.0f) ? (1.0f / p.temperature) : 1.0f;
-    sampling_scale_logits(tid, block_size, seq_logits, seq_workspace, vocab_size, inv_temp);
-    __syncthreads();
 
-    sampling_apply_penalties(tid, p, penalty_tokens, seq_workspace, vocab_size, max_window);
-    __syncthreads();
-
-    for (int i = tid; i < vocab_size; i += block_size) {
-        heap_insert(local_heap, local_size, p.effective_k, seq_workspace[i], i);
+    if (p.num_penalty_tokens > 0 && (p.repetition_penalty != 1.0f || p.presence_penalty != 0.0f)) {
+        sampling_scale_logits(tid, block_size, seq_logits, seq_workspace, vocab_size, inv_temp);
+        __syncthreads();
+        sampling_apply_penalties(tid, p, penalty_tokens, seq_workspace, vocab_size, max_window);
+        __syncthreads();
+        for (int i = tid; i < vocab_size; i += block_size) {
+            heap_insert(local_heap, local_size, p.effective_k, seq_workspace[i], i);
+        }
+    } else {
+        for (int i = tid; i < vocab_size; i += block_size) {
+            float val = __bfloat162float(seq_logits[i]) * inv_temp;
+            heap_insert(local_heap, local_size, p.effective_k, val, i);
+        }
     }
 
     for (int i = 0; i < local_size; i++) {
@@ -342,17 +348,20 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_argmax
     int* s_idxs = reinterpret_cast<int*>(s_vals + blockDim.x);
 
     float inv_temp = (p.temperature > 0.0f) ? (1.0f / p.temperature) : 1.0f;
-    sampling_scale_logits(tid, blockDim.x, seq_logits, seq_workspace, vocab_size, inv_temp);
-    __syncthreads();
 
-    sampling_apply_penalties(tid, p, penalty_tokens, seq_workspace, vocab_size, max_window);
-    __syncthreads();
+    bool has_penalties = (p.num_penalty_tokens > 0) && (p.repetition_penalty != 1.0f || p.presence_penalty != 0.0f);
+    if (has_penalties) {
+        sampling_scale_logits(tid, blockDim.x, seq_logits, seq_workspace, vocab_size, inv_temp);
+        __syncthreads();
+        sampling_apply_penalties(tid, p, penalty_tokens, seq_workspace, vocab_size, max_window);
+        __syncthreads();
+    }
 
     for (int k = 0; k < p.effective_k; k++) {
         float my_max = -FLT_MAX;
         int my_idx = -1;
         for (int i = tid; i < vocab_size; i += blockDim.x) {
-            float val = seq_workspace[i];
+            float val = has_penalties ? seq_workspace[i] : (__bfloat162float(seq_logits[i]) * inv_temp);
             if (val > my_max) {
                 my_max = val;
                 my_idx = i;
