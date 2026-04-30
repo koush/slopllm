@@ -1086,53 +1086,84 @@ void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
 
 // ---------------------------------------------------------------------------
 // Batched matrix multiply (contiguous row-major tensors)
-// transB=1: C[b] = alpha * A[b] @ B[b]^T + beta * C[b]
-//   A: [batch, M, K],  B: [batch, N, K],  C: [batch, M, N]
-// transB=0: C[b] = alpha * A[b] @ B[b] + beta * C[b]
+// transA=0, transB=0: C[b] = alpha * A[b] @ B[b] + beta * C[b]
 //   A: [batch, M, K],  B: [batch, K, N],  C: [batch, M, N]
+// transA=0, transB=1: C[b] = alpha * A[b] @ B[b]^T + beta * C[b]
+//   A: [batch, M, K],  B: [batch, N, K],  C: [batch, M, N]
+// transA=1, transB=0: C[b] = alpha * A[b]^T @ B[b] + beta * C[b]
+//   A: [batch, K, M],  B: [batch, K, N],  C: [batch, M, N]
+// transA=1, transB=1: C[b] = alpha * A[b]^T @ B[b]^T + beta * C[b]
+//   A: [batch, K, M],  B: [batch, N, K],  C: [batch, M, N]
 // ---------------------------------------------------------------------------
 
 void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
              float alpha, float beta,
-             int batch, int M, int N, int K, int transB) {
+             int batch, int M, int N, int K, int transA, int transB) {
     cudaSetDevice(ctx->device_id);
+
+    // cuBLAS computes C_cm = op(A_gemm) @ op(B_gemm) in column-major.
+    // We derive the cuBLAS parameters from the row-major intent.
+    //
+    // Row-major result: C_rm = op(A_rm) @ op(B_rm)
+    // Column-major result: C_cm = C_rm^T = op(B_rm)^T @ op(A_rm)^T
+    //   = op(B_cm) @ op(A_cm)^T
+    //
+    // So: A_gemm = B (col-major), B_gemm = A (col-major)
+    //     transa_gemm depends on transB, transb_gemm depends on transA
+
+    cublasOperation_t transa_gemm, transb_gemm;
+    int m_gemm, n_gemm, k_gemm;
+    int lda_gemm, ldb_gemm, ldc_gemm;
+    long long strideA_gemm, strideB_gemm, strideC;
+
+    // Row-major shapes:
+    //   A_rm: [K, M] if transA, else [M, K]  → A_cm: [M, K] or [K, M]
+    //   B_rm: [N, K] if transB, else [K, N]  → B_cm: [K, N] or [N, K]
+    //   C_rm: [M, N]                          → C_cm: [N, M]
+
+    // A_gemm = B (col-major):
     if (transB) {
-        // A @ B^T:  A=[M,K], B=[N,K], C=[M,N]
-        // cuBLAS col-major: op(A_gemm)=B^T[N,K], op(B_gemm)=A[K,M]
-        // transa=T, transb=N, m=N, n=M, k=K
-        long long strideA = (long long)M * K;
-        long long strideB = (long long)N * K;
-        long long strideC = (long long)M * N;
-        cublasGemmStridedBatchedEx(CUBLAS(ctx),
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            B, CUDA_R_16BF, K, strideB,
-            A, CUDA_R_16BF, K, strideA,
-            &beta,
-            C, CUDA_R_16BF, N, strideC,
-            batch,
-            CUDA_R_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        // B_rm = [N, K], B_cm = [K, N]
+        transa_gemm = CUBLAS_OP_T;  // op(B_cm) = B_cm^T = [N, K]
+        lda_gemm = K;               // rows of B_cm
+        strideA_gemm = (long long)N * K;
     } else {
-        // A @ B:  A=[M,K], B=[K,N], C=[M,N]
-        // cuBLAS col-major: op(A_gemm)=B[N,K], op(B_gemm)=A[K,M]
-        // transa=N, transb=N, m=N, n=M, k=K
-        long long strideA = (long long)M * K;
-        long long strideB = (long long)K * N;
-        long long strideC = (long long)M * N;
-        cublasGemmStridedBatchedEx(CUBLAS(ctx),
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            B, CUDA_R_16BF, N, strideB,
-            A, CUDA_R_16BF, K, strideA,
-            &beta,
-            C, CUDA_R_16BF, N, strideC,
-            batch,
-            CUDA_R_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        // B_rm = [K, N], B_cm = [N, K]
+        transa_gemm = CUBLAS_OP_N;  // op(B_cm) = B_cm = [N, K]
+        lda_gemm = N;               // rows of B_cm
+        strideA_gemm = (long long)K * N;
     }
+
+    // B_gemm = A (col-major):
+    if (transA) {
+        // A_rm = [K, M], A_cm = [M, K]
+        transb_gemm = CUBLAS_OP_T;  // op(A_cm) = A_cm^T = [K, M]
+        ldb_gemm = M;               // rows of A_cm
+        strideB_gemm = (long long)K * M;
+    } else {
+        // A_rm = [M, K], A_cm = [K, M]
+        transb_gemm = CUBLAS_OP_N;  // op(A_cm) = A_cm = [K, M]
+        ldb_gemm = K;               // rows of A_cm
+        strideB_gemm = (long long)M * K;
+    }
+
+    m_gemm = N;  // rows of op(A_gemm)
+    n_gemm = M;  // cols of op(B_gemm)
+    k_gemm = K;  // cols of op(A_gemm) = rows of op(B_gemm)
+    ldc_gemm = N;
+    strideC = (long long)M * N;
+
+    cublasGemmStridedBatchedEx(CUBLAS(ctx),
+        transa_gemm, transb_gemm,
+        m_gemm, n_gemm, k_gemm,
+        &alpha,
+        B, CUDA_R_16BF, lda_gemm, strideA_gemm,
+        A, CUDA_R_16BF, ldb_gemm, strideB_gemm,
+        &beta,
+        C, CUDA_R_16BF, ldc_gemm, strideC,
+        batch,
+        CUDA_R_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 // ---------------------------------------------------------------------------

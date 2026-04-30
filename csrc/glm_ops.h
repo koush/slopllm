@@ -112,7 +112,7 @@ void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
 
 void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
              float alpha, float beta,
-             int batch, int M, int N, int K, int transB);
+             int batch, int M, int N, int K, int transA, int transB);
 
 void glm_scale(GlmCtx* ctx, void* out, const void* input, float scale, int n);
 

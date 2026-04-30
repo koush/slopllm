@@ -123,7 +123,7 @@ def attention_forward_absorbed_cuda(glm, device, hidden_states, cos, sin, attent
                      B, num_heads, S, qk_nope_dim, 1, 0, 2, 3)
     q_absorbed_hb = torch.empty(num_heads, B * S, kv_lora_rank, dtype=torch.bfloat16, device=device)
     glm.bmm(q_absorbed_hb, q_nope_hb.reshape(num_heads, B * S, qk_nope_dim),
-            W_k_nope, 1.0, 0.0, num_heads, B * S, kv_lora_rank, qk_nope_dim, 0)
+             W_k_nope, 1.0, 0.0, num_heads, B * S, kv_lora_rank, qk_nope_dim, 0, 0)
     q_absorbed_4d = q_absorbed_hb.reshape(num_heads, B, S, kv_lora_rank)
     glm.transpose_4d(q_absorbed.reshape(-1), q_absorbed_4d.reshape(-1),
                      num_heads, B, S, kv_lora_rank, 1, 0, 2, 3)
@@ -174,9 +174,9 @@ def attention_forward_absorbed_cuda(glm, device, hidden_states, cos, sin, attent
 
     attn_scores = torch.empty(B * num_heads, S, total_len, dtype=torch.bfloat16, device=device)
     glm.bmm(attn_scores, q_absorbed, kv_c_for_bmm, scaling, 0.0,
-             B * num_heads, S, total_len, kv_lora_rank, 1)
+             B * num_heads, S, total_len, kv_lora_rank, 0, 1)
     glm.bmm(attn_scores, q_pe_rope, k_pe_for_bmm, scaling, 1.0,
-             B * num_heads, S, total_len, qk_rope_dim, 1)
+             B * num_heads, S, total_len, qk_rope_dim, 0, 1)
 
     glm.add(attn_scores.reshape(-1), attn_scores.reshape(-1),
             combined_mask_expanded.reshape(-1), B * num_heads * S * total_len)
@@ -187,7 +187,7 @@ def attention_forward_absorbed_cuda(glm, device, hidden_states, cos, sin, attent
 
     c = torch.empty(B * num_heads, S, kv_lora_rank, dtype=torch.bfloat16, device=device)
     glm.bmm(c, attn_scores, kv_c_for_bmm, 1.0, 0.0,
-             B * num_heads, S, kv_lora_rank, total_len, 0)
+             B * num_heads, S, kv_lora_rank, total_len, 0, 0)
 
     W_v = kv_b_proj_w.reshape(num_heads, stride, kv_lora_rank)[:, qk_nope_dim:, :].contiguous()
     c_4d = c.reshape(B, num_heads, S, kv_lora_rank)
@@ -196,7 +196,7 @@ def attention_forward_absorbed_cuda(glm, device, hidden_states, cos, sin, attent
                      B, num_heads, S, kv_lora_rank, 1, 0, 2, 3)
     output_hb = torch.empty(num_heads, B * S, v_head_dim, dtype=torch.bfloat16, device=device)
     glm.bmm(output_hb, c_hb.reshape(num_heads, B * S, kv_lora_rank),
-            W_v, 1.0, 0.0, num_heads, B * S, v_head_dim, kv_lora_rank, 1)
+             W_v, 1.0, 0.0, num_heads, B * S, v_head_dim, kv_lora_rank, 0, 1)
     output_4d = output_hb.reshape(num_heads, B, S, v_head_dim)
     output_per_head = torch.empty(B, num_heads, S, v_head_dim, dtype=torch.bfloat16, device=device)
     glm.transpose_4d(output_per_head.reshape(-1), output_4d.reshape(-1),

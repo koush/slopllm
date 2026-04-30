@@ -254,7 +254,7 @@ class GlmOps:
         self.lib.glm_bmm.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_float,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
         self.lib.glm_scale.restype = None
@@ -850,14 +850,14 @@ class GlmOps:
             k, dim, batch
         )
 
-    def bmm(self, C, A, B, alpha, beta, batch, M, N, K, transB):
+    def bmm(self, C, A, B, alpha, beta, batch, M, N, K, transA=0, transB=0):
         self.lib.glm_bmm(
             self.ctx,
             self._ptr(C),
             self._ptr(A),
             self._ptr(B),
             ctypes.c_float(alpha), ctypes.c_float(beta),
-            batch, M, N, K, transB
+            batch, M, N, K, transA, transB
         )
 
     def scale(self, output, input, scale, n):

@@ -8,6 +8,8 @@ import { WorkspaceBase } from "./workspace";
 export const PAGE_SIZE = 16;
 export const DECODE_PLAN_INFO_SIZE = 10;
 export const PREFILL_PLAN_INFO_SIZE = 15;
+export const MLA_PREFILL_PLAN_INFO_SIZE = 18;
+export const MLA_DECODE_PLAN_INFO_SIZE = 10;
 
 export class ExecutionState {
   batchSize: number;
@@ -87,6 +89,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
   decodePlanInfo: Tensor;
   /** Pinned host buffer: written by batchPrefillPagedPlan, read by batchPrefillPagedRun. */
   prefillPlanInfo: Tensor;
+  /** Pinned host buffer: written by mlaPrefillPlan, read by mlaPrefillRun. */
+  mlaPrefillPlanInfo: Tensor;
+  /** Pinned host buffer: written by mlaDecodePlan, read by mlaDecodeRun. */
+  mlaDecodePlanInfo: Tensor;
   /** GPU buffer [B*S] of I32: written by host (h2d), read by embedding lookup. */
   inputIdsBuf: Tensor;
   /** Pinned host buffer [B] of I32: written by host, read via memcpy to inputIdsBuf. */
@@ -111,6 +117,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
   lastPageLen: Tensor;
   /** Pinned host buffer [B] of I32: written by updateIndptr, read via memcpy to lastPageLen. */
   lastPageLenH: Tensor;
+  /** Pinned host buffer [B] of I32: KV lengths per batch entry, used by MLA prefill plan. */
+  kvLenH: Tensor;
 
   constructor(glm: DeviceOps, B: number, S: number) {
     super(glm);
@@ -120,6 +128,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.pinnedIntWs = this.allocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
     this.decodePlanInfo = this.allocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", "decodePlanInfo");
     this.prefillPlanInfo = this.allocPinned([PREFILL_PLAN_INFO_SIZE * 8], "U8", "prefillPlanInfo");
+    this.mlaPrefillPlanInfo = this.allocPinned([MLA_PREFILL_PLAN_INFO_SIZE * 8], "U8", "mlaPrefillPlanInfo");
+    this.mlaDecodePlanInfo = this.allocPinned([MLA_DECODE_PLAN_INFO_SIZE * 8], "U8", "mlaDecodePlanInfo");
 
     this.positionIds = this.alloc([B * S], "I32", "positionIds");
     this.positionIdsH = this.allocPinned([B], "I32", "positionIdsH");
@@ -133,6 +143,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.indptrH = this.allocPinned([(B + 1) * I32], "I32", "indptrH");
     this.lastPageLen = this.alloc([B * I32], "I32", "lastPageLen");
     this.lastPageLenH = this.allocPinned([B], "I32", "lastPageLenH");
+    this.kvLenH = this.allocPinned([B], "I32", "kvLenH");
   }
 
   forwardInput(state: ExecutionState): void {
@@ -193,6 +204,66 @@ export class ExecutionWorkspace extends WorkspaceBase {
       qStrideN, qStrideH, maskMode, smScale
     );
     return out;
+  }
+
+  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): Tensor {
+    const headDimCkv = kvLoraRank;
+    const headDimKpe = qkRopeDim;
+    const out = this.alloc([1, nHeads, totalTokens, headDimCkv], qNope.type, undefined, qNope.parallelism);
+    const pageSize = pagedKV.pageSize;
+    const qNopeStrideN = headDimCkv;
+    const qNopeStrideH = totalTokens * headDimCkv;
+    const qPeStrideN = headDimKpe;
+    const qPeStrideH = totalTokens * headDimKpe;
+    const ckvStridePage = headDimCkv;
+    const ckvStrideN = pageSize * headDimCkv;
+    const kpeStridePage = headDimKpe;
+    const kpeStrideN = pageSize * headDimKpe;
+    const oStrideN = headDimCkv;
+    const oStrideH = nHeads * headDimCkv;
+    this.glm.mlaPrefillRun(
+      qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
+      pagedKV.indices,
+      out,
+      this.floatWs, this.intWs,
+      this.mlaPrefillPlanInfo,
+      nHeads, pageSize, 1, smScale,
+      qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH,
+      ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
+      oStrideN, oStrideH
+    );
+    return out;
+  }
+
+  mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): Tensor {
+    const headDimCkv = kvLoraRank;
+    const out = this.alloc([batchSize, nHeads, 1, headDimCkv], qNope.type, undefined, qNope.parallelism);
+    this.glm.mlaDecodeRun(
+      qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
+      pagedKV.indices, this.indptrD, this.lastPageLen,
+      out,
+      this.floatWs, this.intWs,
+      this.mlaDecodePlanInfo,
+      batchSize, nHeads, pagedKV.pageSize, smScale
+    );
+    return out;
+  }
+
+  mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, kvLoraRank: number, qkRopeDim: number): void {
+    const headDimCkv = kvLoraRank;
+    const headDimKpe = qkRopeDim;
+    const pageSize = pagedKV.pageSize;
+    const nnz = pagedKV.seqKvLens.reduce((a, b) => a + b, 0) || batchSize;
+    const appendCkvStrideN = headDimCkv;
+    const appendKpeStrideN = headDimKpe;
+    appendCkv.mlaKvCacheAppend(
+      pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
+      pagedKV.indices, this.indptrD, this.lastPageLen,
+      appendCkv, appendKpe,
+      this.slotMapping, this.positionIds,
+      nnz, pageSize, headDimCkv, headDimKpe,
+      appendCkvStrideN, appendKpeStrideN
+    );
   }
 
 
@@ -292,6 +363,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
     this.positionIds.h2d(positionIdsBuf);
 
+    this.kvLenH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        buf.writeInt32LE(seqLens[i], i * I32);
+      }
+    });
+
     const lastIdxBuf = Buffer.alloc(batchSize * I32);
     let lastOff = 0;
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -377,6 +454,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   readonly pageSize: number;
   kData: Tensor[];
   vData: Tensor[];
+  ckvData: Tensor[];
+  kpeData: Tensor[];
   indices: Tensor;
   indicesH: Tensor;
   numPagesUsed: number;
@@ -388,7 +467,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
   getPagedKV(): PagedKVCache { return this; }
 
-  constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE) {
+  constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0) {
     super(glm);
     this.nKv = nKv;
     this.hd = hd;
@@ -398,9 +477,16 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.pageSize = pageSize;
     this.kData = [];
     this.vData = [];
+    this.ckvData = [];
+    this.kpeData = [];
     for (let i = 0; i < nLayers; i++) {
-      this.kData.push(this.alloc([maxPages * nKv * pageSize * hd], "BF16"));
-      this.vData.push(this.alloc([maxPages * nKv * pageSize * hd], "BF16"));
+      if (kvLoraRank > 0) {
+        this.ckvData.push(this.alloc([maxPages * pageSize * kvLoraRank], "BF16"));
+        this.kpeData.push(this.alloc([maxPages * pageSize * qkRopeDim], "BF16"));
+      } else {
+        this.kData.push(this.alloc([maxPages * nKv * pageSize * hd], "BF16"));
+        this.vData.push(this.alloc([maxPages * nKv * pageSize * hd], "BF16"));
+      }
     }
     this.indices = this.alloc([maxPages * I32], "I32", "indices");
     this.indicesH = this.allocPinned([maxPages], "I32", "indicesH");

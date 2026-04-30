@@ -67,6 +67,15 @@ export abstract class Tensor implements Disposable {
     return this.pinnedBuffer;
   }
 
+  setName(name: string) {
+    if (this.name)
+      throw new Error(`Tensor already has name ${this.name}, cannot rename to ${name}`);
+    (this as { name: string }).name = name;
+    this.workspace.tracked.delete(this);
+    this.workspace.exported.delete(this);
+    this.workspace.tensors.set(name, this);
+  }
+
   detachData() {
     (this as { data: number }).data = 0;
     this.pinnedBuffer = undefined;
@@ -228,6 +237,9 @@ export abstract class Tensor implements Disposable {
 
   gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
     if (gate.type !== this.type) throw new Error(`gateSigmoidMul: gate type ${gate.type} != output type ${this.type}`);
+  }
+
+  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number): void {
   }
 
   abstract fill(value: number, n: number): void;

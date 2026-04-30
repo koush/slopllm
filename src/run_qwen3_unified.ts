@@ -2,6 +2,7 @@ import { GlmOps } from "./glm_ops";
 import { ParallelOps } from "./parallel_ops";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model } from "./qwen35_model";
+import { Glm51Model } from "./glm51_model";
 import { ChatModel, ChatCache, SamplingParams, makeSamplingParams } from "./chat_model";
 import { MemcpyKind, Tensor, SamplingWorkspace } from "./tensor";
 import { AutoTokenizer } from "@huggingface/transformers";
@@ -15,6 +16,7 @@ import { UsingHolder } from "./using-holder";
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
+const GLM51_REPO = "zai-org/GLM-5.1";
 
 export interface GraphState {
   graphExec: number | null;
@@ -31,6 +33,7 @@ interface CliArgs {
   noReset: boolean;
   prompt: string | undefined;
   useQwen35: boolean;
+  useGlm51: boolean;
   useFp8: boolean;
   useBatch: boolean;
   noCudaGraph: boolean;
@@ -55,6 +58,7 @@ function parseArgs(argv: string[]): CliArgs {
     noReset: true,
     prompt: undefined,
     useQwen35: false,
+    useGlm51: false,
     useFp8: false,
     useBatch: false,
     noCudaGraph: false,
@@ -79,6 +83,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--max-batch" && i + 1 < argv.length) args.maxBatch = parseInt(argv[++i], 10);
     else if (a === "--no-kv-persist") args.noReset = false;
     else if (a === "--qwen35") args.useQwen35 = true;
+    else if (a === "--glm51") args.useGlm51 = true;
     else if (a === "--fp8") args.useFp8 = true;
     else if (a === "--batch") args.useBatch = true;
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
@@ -97,6 +102,10 @@ function parseArgs(argv: string[]): CliArgs {
     console.error("Error: --fp8 is not supported with --qwen35");
     process.exit(1);
   }
+  if (args.useGlm51 && args.useFp8) {
+    console.error("Error: --fp8 is not supported with --glm51");
+    process.exit(1);
+  }
 
   if (args.useQwen35 && args.temperature > 0 && args.topP === 0.95 && args.topK === 0 && args.repetitionPenalty === 1.0 && args.presencePenalty === 0) {
     args.topK = 20;
@@ -108,6 +117,7 @@ function parseArgs(argv: string[]): CliArgs {
 
 function modelLabel(args: CliArgs): string {
   if (args.useQwen35) return "Qwen3.5-0.8B";
+  if (args.useGlm51) return "GLM-5.1";
   return args.useFp8 ? "Qwen3-0.6B-FP8" : "Qwen3-0.6B";
 }
 
@@ -502,15 +512,17 @@ async function main(): Promise<void> {
     : gpuDevices[0];
   const gpuLabel = args.gpus.join(",");
 
-  const repoId = args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
-  const maxBatch = args.useBatch ? args.maxBatch : 1;
+  const repoId = args.useGlm51 ? GLM51_REPO
+    : args.useQwen35 ? QWEN35_REPO
+    : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
 
-  console.log(`Loading ${modelLabel(args)} on GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}...`);
-  const model: ChatModel = args.useQwen35
-    ? Qwen35Model.fromPretrained(glm, QWEN35_REPO, maxBatch, args.maxSeqLen)
-    : Qwen3Model.fromPretrained(glm, repoId, maxBatch, args.maxSeqLen);
+  const model: ChatModel = args.useGlm51
+    ? Glm51Model.fromPretrained(glm, GLM51_REPO, args.maxBatch, args.maxSeqLen)
+    : args.useQwen35
+    ? Qwen35Model.fromPretrained(glm, QWEN35_REPO, args.maxBatch, args.maxSeqLen)
+    : Qwen3Model.fromPretrained(glm, repoId, args.maxBatch, args.maxSeqLen);
   const cache = model.createChatCache(args.maxPages);
-  const ws = new ExecutionWorkspace(glm, maxBatch, args.maxSeqLen);
+  const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
 
   const modelDir = resolveModelPath(repoId);
   const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
@@ -524,7 +536,7 @@ async function main(): Promise<void> {
   if (sp.presencePenalty !== 0) samplingParts.push(`pres_pen=${sp.presencePenalty}`);
   const samplingStr = !args.greedy ? samplingParts.join(" ") : "greedy";
 
-  console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}`);
+  console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${args.maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}`);
 
   const cleanup = () => {
     glm.synchronize();

@@ -212,7 +212,7 @@ class Qwen3FP8Model(Qwen3Model):
             glm.memcpy(self._ws["v_expanded"], self._ws["v_t"], B * n_heads * S * hd * BF16)
 
         glm.bmm(self._ws["attn_scores"], self._ws["q_rope"], self._ws["k_expanded"],
-                 cfg.scaling, 0.0, B * n_heads, S, S, hd, 1)
+                 cfg.scaling, 0.0, B * n_heads, S, S, hd, 0, 1)
 
         glm.expand_dim1(self._ws["mask_expanded"], self._ws["causal_mask"],
                         n_heads, 1, S, S, B)
@@ -222,7 +222,7 @@ class Qwen3FP8Model(Qwen3Model):
                      S, B * n_heads * S)
 
         glm.bmm(self._ws["attn_out"], self._ws["attn_scores"], self._ws["v_expanded"],
-                 1.0, 0.0, B * n_heads, S, hd, S, 0)
+                 1.0, 0.0, B * n_heads, S, hd, S, 0, 0)
 
         glm.transpose_4d(self._ws["attn_out_t"], self._ws["attn_out"],
                           B, n_heads, S, hd, 0, 2, 1, 3)

@@ -174,7 +174,7 @@ def attention_forward_cuda(glm, device, hidden_states, cos, sin, attention_mask,
                      num_heads, 1, S, total_len, B)
 
     attn_w = torch.empty(B * num_heads, S, total_len, dtype=torch.bfloat16, device=device)
-    glm.bmm(attn_w, query_full, key_full, scaling, 0.0, B * num_heads, S, total_len, qk_head_dim, 1)
+    glm.bmm(attn_w, query_full, key_full, scaling, 0.0, B * num_heads, S, total_len, qk_head_dim, 0, 1)
     glm.add(attn_w.reshape(-1), attn_w.reshape(-1), combined_mask_expanded.reshape(-1), B * num_heads * S * total_len)
 
     softmax_mask_2d = combined_mask_expanded.reshape(B * num_heads, S, total_len)
@@ -183,7 +183,7 @@ def attention_forward_cuda(glm, device, hidden_states, cos, sin, attention_mask,
 
     attn_out = torch.empty(B * num_heads, S, v_head_dim, dtype=torch.bfloat16, device=device)
     glm.bmm(attn_out, attn_w, value_t.reshape(B * num_heads, S, v_head_dim),
-             1.0, 0.0, B * num_heads, S, v_head_dim, total_len, 0)
+             1.0, 0.0, B * num_heads, S, v_head_dim, total_len, 0, 0)
 
     attn_out_t = torch.empty(B, S, num_heads, v_head_dim, dtype=torch.bfloat16, device=device)
     glm.transpose_4d(attn_out_t.reshape(-1), attn_out.reshape(-1),

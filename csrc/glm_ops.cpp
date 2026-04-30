@@ -516,8 +516,8 @@ static Napi::Value Topk(const Napi::CallbackInfo& info) {
 
 static Napi::Value Bmm(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, C, A, B, alpha, beta, batch, M, N, K, transB)").ThrowAsJavaScriptException();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, C, A, B, alpha, beta, batch, M, N, K, transA, transB)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -530,12 +530,13 @@ static Napi::Value Bmm(const Napi::CallbackInfo& info) {
     int M = info[7].As<Napi::Number>().Int32Value();
     int N = info[8].As<Napi::Number>().Int32Value();
     int K = info[9].As<Napi::Number>().Int32Value();
-    int transB = info[10].As<Napi::Number>().Int32Value();
+    int transA = info[10].As<Napi::Number>().Int32Value();
+    int transB = info[11].As<Napi::Number>().Int32Value();
     glm_bmm(reinterpret_cast<GlmCtx*>(ctx_ptr),
             reinterpret_cast<void*>(c_ptr),
             reinterpret_cast<const void*>(a_ptr),
             reinterpret_cast<const void*>(b_ptr),
-            alpha, beta, batch, M, N, K, transB);
+            alpha, beta, batch, M, N, K, transA, transB);
     return env.Undefined();
 }
 
