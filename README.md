@@ -114,3 +114,4 @@ vendor/
 binding.gyp          # node-gyp config
 Makefile             # CUDA shared library build
 ```
+# slopllm
