@@ -49,7 +49,7 @@ def mla_prefill_reference(q_nope, q_pe_rope, ckv, kpe_rope, sm_scale, causal=Tru
     return output
 
 
-def mla_decode_reference(q_nope_absorbed, q_pe_rope, ckv, kpe, positions, sm_scale, rope_theta=10000000.0):
+def mla_decode_reference(q_nope_absorbed, q_pe_rope, ckv, kpe, positions, sm_scale, rope_theta=1000000.0):
     B, H, D_CKV = q_nope_absorbed.shape
     S = ckv.shape[1]
     D_KPE = q_pe_rope.shape[-1]
@@ -239,7 +239,7 @@ def test_mla_decode_single(glm, device):
     S = 8
     num_heads = 4
     sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
-    rope_theta = 10000000.0
+    rope_theta = 1000000.0
 
     torch.manual_seed(42)
     q_nope = torch.randn(B, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
@@ -315,7 +315,7 @@ def test_mla_decode_batch(glm, device):
     seq_lens = [4, 7, 2]
     num_heads = 4
     sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
-    rope_theta = 10000000.0
+    rope_theta = 1000000.0
 
     torch.manual_seed(123)
     max_S = max(seq_lens)
@@ -450,7 +450,7 @@ def test_mla_decode_with_append(glm, device):
     num_pages = 8
     num_heads = 4
     sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
-    rope_theta = 10000000.0
+    rope_theta = 1000000.0
 
     torch.manual_seed(99)
     ckv_tokens = torch.randn(num_pages, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)

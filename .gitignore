@@ -19,6 +19,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 
+# Test model checkpoints
+tests/python/test_models/**/*.safetensors
+
 # IDE
 .idea/
 

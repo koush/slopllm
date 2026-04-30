@@ -750,7 +750,7 @@ void glm_mla_decode_run(
       0.0f, // logits_soft_cap
       sm_scale,
       1.0f, // rope_scale
-      10000000.0f); // rope_theta (GLM-5.1 uses 10M)
+      1000000.0f); // rope_theta (GLM-5.1 uses 1M)
 
   params.padded_batch_size = info.padded_batch_size;
   params.request_indices = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.request_indices_offset);
