@@ -257,6 +257,19 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
+        self.lib.glm_rope_transpose.restype = None
+        self.lib.glm_rope_transpose.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+        ]
+
+        self.lib.glm_mla_v_expand.restype = None
+        self.lib.glm_mla_v_expand.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+        ]
+
         self.lib.glm_scale.restype = None
         self.lib.glm_scale.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -267,6 +280,12 @@ class GlmOps:
         self.lib.glm_add.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int
+        ]
+
+        self.lib.glm_row_scale_add.restype = None
+        self.lib.glm_row_scale_add.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int
         ]
 
         self.lib.glm_expand_dim1.restype = None
@@ -860,6 +879,22 @@ class GlmOps:
             batch, M, N, K, transA, transB
         )
 
+    def ropeTranspose(self, output, input, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, in_stride):
+        self.lib.glm_rope_transpose(
+            self.ctx,
+            self._ptr(output), self._ptr(input),
+            self._ptr(cos) if cos is not None else ctypes.c_void_p(0),
+            self._ptr(sin) if sin is not None else ctypes.c_void_p(0),
+            rope_dim, head_dim, n_heads, seq_len, batch, in_stride
+        )
+
+    def mlaVExpand(self, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch):
+        self.lib.glm_mla_v_expand(
+            self.ctx,
+            self._ptr(result), self._ptr(attn_out), self._ptr(v_proj),
+            kv_lora_rank, v_head_dim, n_heads, seq_len, batch
+        )
+
     def scale(self, output, input, scale, n):
         self.lib.glm_scale(
             self.ctx,
@@ -876,6 +911,15 @@ class GlmOps:
             self._ptr(a),
             self._ptr(b),
             n
+        )
+
+    def row_scale_add(self, output, input, scales, rows, dim):
+        self.lib.glm_row_scale_add(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input),
+            self._ptr(scales),
+            rows, dim
         )
 
     def expand_dim1(self, output, input, dim1_out, dim1_in, seq_len, head_dim, batch):

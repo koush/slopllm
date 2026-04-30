@@ -493,6 +493,55 @@ static Napi::Value ApplyRotaryPosEmbPartial(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value RopeTranspose(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, out, in, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, in_stride)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t cos_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t sin_ptr = info[4].As<Napi::Number>().Int64Value();
+    int rope_dim = info[5].As<Napi::Number>().Int32Value();
+    int head_dim = info[6].As<Napi::Number>().Int32Value();
+    int n_heads = info[7].As<Napi::Number>().Int32Value();
+    int seq_len = info[8].As<Napi::Number>().Int32Value();
+    int batch = info[9].As<Napi::Number>().Int32Value();
+    int in_stride = info[10].As<Napi::Number>().Int32Value();
+    glm_rope_transpose(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                        reinterpret_cast<void*>(out_ptr),
+                        reinterpret_cast<const void*>(in_ptr),
+                        reinterpret_cast<const void*>(cos_ptr),
+                        reinterpret_cast<const void*>(sin_ptr),
+                        rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
+    return env.Undefined();
+}
+
+static Napi::Value MlaVExpand(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 10) {
+        Napi::TypeError::New(env, "Expected (ctx, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t result_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t attn_out_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t v_proj_ptr = info[3].As<Napi::Number>().Int64Value();
+    int kv_lora_rank = info[4].As<Napi::Number>().Int32Value();
+    int v_head_dim = info[5].As<Napi::Number>().Int32Value();
+    int n_heads = info[6].As<Napi::Number>().Int32Value();
+    int seq_len = info[7].As<Napi::Number>().Int32Value();
+    int batch = info[8].As<Napi::Number>().Int32Value();
+    glm_mla_v_expand(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                      reinterpret_cast<void*>(result_ptr),
+                      reinterpret_cast<const void*>(attn_out_ptr),
+                      reinterpret_cast<const void*>(v_proj_ptr),
+                      kv_lora_rank, v_head_dim, n_heads, seq_len, batch);
+    return env.Undefined();
+}
+
 static Napi::Value Topk(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 7) {
@@ -572,6 +621,26 @@ static Napi::Value Add(const Napi::CallbackInfo& info) {
             reinterpret_cast<void*>(out_ptr),
             reinterpret_cast<const void*>(a_ptr),
             reinterpret_cast<const void*>(b_ptr), n);
+    return env.Undefined();
+}
+
+static Napi::Value RowScaleAdd(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, out, input, scales, rows, dim)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t scales_ptr = info[3].As<Napi::Number>().Int64Value();
+    int rows = info[4].As<Napi::Number>().Int32Value();
+    int dim = info[5].As<Napi::Number>().Int32Value();
+    glm_row_scale_add(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                      reinterpret_cast<void*>(out_ptr),
+                      reinterpret_cast<const void*>(in_ptr),
+                      reinterpret_cast<const void*>(scales_ptr),
+                      rows, dim);
     return env.Undefined();
 }
 
@@ -2051,10 +2120,13 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "rotaryEmbedding"), Napi::Function::New(env, RotaryEmbedding));
     exports.Set(Napi::String::New(env, "applyRotaryPosEmb"), Napi::Function::New(env, ApplyRotaryPosEmb));
     exports.Set(Napi::String::New(env, "applyRotaryPosEmbPartial"), Napi::Function::New(env, ApplyRotaryPosEmbPartial));
+    exports.Set(Napi::String::New(env, "ropeTranspose"), Napi::Function::New(env, RopeTranspose));
+    exports.Set(Napi::String::New(env, "mlaVExpand"), Napi::Function::New(env, MlaVExpand));
     exports.Set(Napi::String::New(env, "topk"), Napi::Function::New(env, Topk));
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));
     exports.Set(Napi::String::New(env, "scale"), Napi::Function::New(env, Scale));
     exports.Set(Napi::String::New(env, "add"), Napi::Function::New(env, Add));
+    exports.Set(Napi::String::New(env, "rowScaleAdd"), Napi::Function::New(env, RowScaleAdd));
     exports.Set(Napi::String::New(env, "expandDim1"), Napi::Function::New(env, ExpandDim1));
     exports.Set(Napi::String::New(env, "transpose4d"), Napi::Function::New(env, Transpose4d));
     exports.Set(Napi::String::New(env, "mul"), Napi::Function::New(env, Mul));

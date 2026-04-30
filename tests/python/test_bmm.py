@@ -67,3 +67,23 @@ def test_bmm_batch1(glm, device):
     glm.bmm(C_cuda, A, B, 1.0, 0.0, 1, M, N, K, transB=1)
     C_ref = A @ B.transpose(-1, -2)
     torch.testing.assert_close(C_cuda.cpu(), C_ref.cpu(), atol=5e-2, rtol=5e-3)
+
+
+def test_bmm_transA_absorbed_weight(glm, device):
+    batch, M, N, K = 4, 512, 256, 192
+    A = torch.randn(batch, K, M, dtype=torch.bfloat16, device=device)
+    B = torch.randn(batch, K, N, dtype=torch.bfloat16, device=device)
+    C_cuda = torch.empty(batch, M, N, dtype=torch.bfloat16, device=device)
+    glm.bmm(C_cuda, A, B, 1.0, 0.0, batch, M, N, K, transA=1, transB=0)
+    C_ref = A.transpose(-1, -2) @ B
+    torch.testing.assert_close(C_cuda.cpu(), C_ref.cpu(), atol=5e-2, rtol=5e-3)
+
+
+def test_bmm_transA_transB(glm, device):
+    batch, M, N, K = 2, 4, 4, 8
+    A = torch.randn(batch, K, M, dtype=torch.bfloat16, device=device)
+    B = torch.randn(batch, N, K, dtype=torch.bfloat16, device=device)
+    C_cuda = torch.empty(batch, M, N, dtype=torch.bfloat16, device=device)
+    glm.bmm(C_cuda, A, B, 1.0, 0.0, batch, M, N, K, transA=1, transB=1)
+    C_ref = A.transpose(-1, -2) @ B.transpose(-1, -2)
+    torch.testing.assert_close(C_cuda.cpu(), C_ref.cpu(), atol=5e-2, rtol=5e-3)

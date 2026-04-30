@@ -103,9 +103,26 @@ void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
                               int batch, int unsqueeze_dim);
 
 void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
-                                       const void* cos, const void* sin,
-                                       int rope_dim, int head_dim, int n_heads, int seq_len,
-                                       int batch, int unsqueeze_dim);
+                                        const void* cos, const void* sin,
+                                        int rope_dim, int head_dim, int n_heads, int seq_len,
+                                        int batch, int unsqueeze_dim);
+
+// RoPE + Head Transpose: [B*S, nH*in_stride] -> [B*nH, S, head_dim]
+// Applies RoPE to first rope_dim dims (if rope_dim > 0), then transposes
+// from interleaved-heads input to per-head-contiguous output.
+// cos/sin: [B, S, rope_dim] (may be NULL if rope_dim == 0)
+void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
+                         const void* cos_emb, const void* sin_emb,
+                         int rope_dim, int head_dim, int n_heads,
+                         int seq_len, int batch, int in_stride);
+
+// MLA V-Expand: per-head matmul attn_out @ v_proj^T
+// attn_out: [B, nH, S, kv_lora_rank] (HND), v_proj: [nH*v_head_dim, kv_lora_rank]
+// result: [B, nH, S, v_head_dim] (HND)
+void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
+                       const void* v_proj,
+                       int kv_lora_rank, int v_head_dim, int n_heads,
+                       int seq_len, int batch);
 
 void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
               const void* input, int k, int dim, int batch);
@@ -117,6 +134,9 @@ void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
 void glm_scale(GlmCtx* ctx, void* out, const void* input, float scale, int n);
 
 void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n);
+
+void glm_row_scale_add(GlmCtx* ctx, void* out, const void* input,
+                        const void* scales, int rows, int dim);
 
 void glm_expand_dim1(GlmCtx* ctx, void* out, const void* input,
                      int dim1_out, int dim1_in, int seq_len, int head_dim, int batch);

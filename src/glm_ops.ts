@@ -54,6 +54,7 @@ interface NativeAddon {
   embedding(ctx: number, out: number, table: number, ids: number, hidden: number, seqLen: number): void;
   fill(ctx: number, out: number, value: number, n: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
+  applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number): void;
   gather(ctx: number, out: number, input: number, indices: number, k: number, inDim: number, batch: number, elemSize: number): void;
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
@@ -98,6 +99,8 @@ interface NativeAddon {
   sampleBatch(ctx: number, outTokens: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, penaltyCount: number, maxWindow: number, vocabSize: number, batchSize: number, temperatures: number, repPenalties: number, presPenalties: number, topKs: number, topPs: number, stepCounter: number, maxEffectiveK: number): void;
   memcpy2d(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void;
   bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number): void;
+  ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void;
+  mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): void;
   ncclUniqueId(outId: Buffer): void;
   ncclGroupStart(): void;
   ncclGroupEnd(): void;
@@ -113,6 +116,16 @@ interface NativeAddon {
   p2pGetFlagPtr(instance: number): number;
   p2pSetPeers(ctx: number, instance: number, dataPtrs: number[], flagPtrs: number[]): void;
   p2pAllReduce(ctx: number, instance: number, in_: number, out: number, count: number, dtype: number): void;
+  sigmoid(ctx: number, out: number, input: number, n: number): void;
+  topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
+  indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
+  add(ctx: number, out: number, a: number, b: number, n: number): void;
+  scale(ctx: number, out: number, input: number, scale: number, n: number): void;
+  mul(ctx: number, out: number, a: number, b: number, n: number): void;
+  scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
+  maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void;
+  applyRotaryPosEmbPartial(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
+  rowScaleAdd(ctx: number, out: number, input: number, scales: number, rows: number, dim: number): void;
 }
 
 export class GlmTensor extends Tensor {
@@ -291,6 +304,82 @@ export class GlmTensor extends Tensor {
     const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
     getNativeAddon().rotaryEmbedding(this.glm.ctx, cos.data, sin.data, this.data, positionIds.data, dimHalf, batch, seqLen);
     return { cos, sin };
+  }
+
+  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+    super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+    const out = this.workspace.alloc([batch * nHeads, seqLen, headDim], this.type);
+    getNativeAddon().ropeTranspose(this.glm.ctx, out.data, this.data, ropeDim > 0 ? cos.data : 0, ropeDim > 0 ? sin.data : 0, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
+    return out;
+  }
+
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+    const out = this.workspace.alloc(this.shape, this.type);
+    getNativeAddon().applyRotaryPosEmb(this.glm.ctx, out.data, this.data, cos.data, sin.data, ropeDim, nHeads, seqLen, batch, unsqueezeDim);
+    return out;
+  }
+
+  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): Tensor {
+    super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
+    const BS = batch * seqLen;
+    const out = this.workspace.alloc([BS, nHeads * vHeadDim], this.type);
+    getNativeAddon().mlaVExpand(this.glm.ctx, out.data, this.data, vProj.data, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
+    return out;
+  }
+
+  sigmoid(): Tensor {
+    const n = this.shape.reduce((a, b) => a * b, 1);
+    const out = this.workspace.alloc(this.shape, this.type);
+    getNativeAddon().sigmoid(this.glm.ctx, out.data, this.data, n);
+    return out;
+  }
+
+  topk(k: number, dim: number): { values: Tensor, indices: Tensor } {
+    const batch = this.shape.reduce((a, b) => a * b, 1) / dim;
+    const values = this.workspace.alloc([batch, k], this.type);
+    const indices = this.workspace.alloc([batch, k], "I32");
+    getNativeAddon().topk(this.glm.ctx, values.data, indices.data, this.data, k, dim, batch);
+    return { values, indices };
+  }
+
+  indexAdd(indices: Tensor, values: Tensor, nIndices: number, dim: number): void {
+    getNativeAddon().indexAdd(this.glm.ctx, this.data, indices.data, values.data, nIndices, dim);
+  }
+
+  add(other: Tensor, n?: number): Tensor {
+    const count = n ?? this.shape.reduce((a, b) => a * b, 1);
+    const out = this.workspace.alloc(this.shape, this.type);
+    getNativeAddon().add(this.glm.ctx, out.data, this.data, other.data, count);
+    return out;
+  }
+
+  scaleInPlace(scale: number, n: number): void {
+    getNativeAddon().scale(this.glm.ctx, this.data, this.data, scale, n);
+  }
+
+  mul(other: Tensor, n?: number): Tensor {
+    const count = n ?? this.shape.reduce((a, b) => a * b, 1);
+    const out = this.workspace.alloc(this.shape, this.type);
+    getNativeAddon().mul(this.glm.ctx, out.data, this.data, other.data, count);
+    return out;
+  }
+
+  scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
+    getNativeAddon().scatterScalar(this.glm.ctx, this.data, indices.data, value, k, outDim, batch);
+  }
+
+  maskedFill(mask: Tensor, value: number, n: number): void {
+    getNativeAddon().maskedFill(this.glm.ctx, this.data, this.data, mask.data, value, n);
+  }
+
+  applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+    const out = this.workspace.alloc(this.shape, this.type);
+    getNativeAddon().applyRotaryPosEmbPartial(this.glm.ctx, out.data, this.data, cos.data, sin.data, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim);
+    return out;
+  }
+
+  rowScaleAdd(input: Tensor, scales: Tensor, rows: number, dim: number): void {
+    getNativeAddon().rowScaleAdd(this.glm.ctx, this.data, input.data, scales.data, rows, dim);
   }
 
   doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
@@ -543,6 +632,54 @@ export class GlmOps implements DeviceOps {
 
   bmm(C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number): void {
     getNativeAddon().bmm(this.ctx, C, A, B, alpha, beta, batch, M, N, K, transA, transB);
+  }
+
+  ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void {
+    getNativeAddon().ropeTranspose(ctx, out, input, cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+  }
+
+  mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): void {
+    getNativeAddon().mlaVExpand(ctx, result, attnOut, vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
+  }
+
+  sigmoid(ctx: number, out: number, input: number, n: number): void {
+    getNativeAddon().sigmoid(ctx, out, input, n);
+  }
+
+  topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void {
+    getNativeAddon().topk(ctx, outValues, outIndices, input, k, dim, batch);
+  }
+
+  indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void {
+    getNativeAddon().indexAdd(ctx, out, indices, values, nIndices, dim);
+  }
+
+  add(ctx: number, out: number, a: number, b: number, n: number): void {
+    getNativeAddon().add(ctx, out, a, b, n);
+  }
+
+  scale(ctx: number, out: number, input: number, scale: number, n: number): void {
+    getNativeAddon().scale(ctx, out, input, scale, n);
+  }
+
+  mul(ctx: number, out: number, a: number, b: number, n: number): void {
+    getNativeAddon().mul(ctx, out, a, b, n);
+  }
+
+  scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void {
+    getNativeAddon().scatterScalar(ctx, out, indices, value, k, outDim, batch);
+  }
+
+  maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void {
+    getNativeAddon().maskedFill(ctx, out, input, mask, value, n);
+  }
+
+  applyRotaryPosEmbPartial(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
+    getNativeAddon().applyRotaryPosEmbPartial(ctx, out, input, cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim);
+  }
+
+  rowScaleAdd(ctx: number, out: number, input: number, scales: number, rows: number, dim: number): void {
+    getNativeAddon().rowScaleAdd(ctx, out, input, scales, rows, dim);
   }
 }
 

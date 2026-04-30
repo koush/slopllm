@@ -250,6 +250,54 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
+  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+    if (cos.shape.length !== sin.shape.length) throw new Error(`ropeTranspose: cos ndim ${cos.shape.length} != sin ndim ${sin.shape.length}`);
+    return undefined as never;
+  }
+
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+    return undefined as never;
+  }
+
+  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): Tensor {
+    return undefined as never;
+  }
+
+  sigmoid(): Tensor {
+    return undefined as never;
+  }
+
+  topk(k: number, dim: number): { values: Tensor, indices: Tensor } {
+    return undefined as never;
+  }
+
+  indexAdd(indices: Tensor, values: Tensor, nIndices: number, dim: number): void {
+  }
+
+  add(other: Tensor, n?: number): Tensor {
+    return undefined as never;
+  }
+
+  scaleInPlace(scale: number, n: number): void {
+  }
+
+  mul(other: Tensor, n?: number): Tensor {
+    return undefined as never;
+  }
+
+  scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
+  }
+
+  maskedFill(mask: Tensor, value: number, n: number): void {
+  }
+
+  applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+    return undefined as never;
+  }
+
+  rowScaleAdd(input: Tensor, scales: Tensor, rows: number, dim: number): void {
+  }
+
   readInt32LE(): number[] {
     const count = numElements(this.shape);
     const buf = Buffer.alloc(count * 4);

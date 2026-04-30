@@ -1414,6 +1414,78 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].ropeTranspose(ctx, out, input, cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+    }
+  }
+
+  mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].mlaVExpand(ctx, result, attnOut, vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
+    }
+  }
+
+  sigmoid(ctx: number, out: number, input: number, n: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].sigmoid(ctx, out, input, n);
+    }
+  }
+
+  topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].topk(ctx, outValues, outIndices, input, k, dim, batch);
+    }
+  }
+
+  indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].indexAdd(ctx, out, indices, values, nIndices, dim);
+    }
+  }
+
+  add(ctx: number, out: number, a: number, b: number, n: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].add(ctx, out, a, b, n);
+    }
+  }
+
+  scale(ctx: number, out: number, input: number, scale: number, n: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].scale(ctx, out, input, scale, n);
+    }
+  }
+
+  mul(ctx: number, out: number, a: number, b: number, n: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].mul(ctx, out, a, b, n);
+    }
+  }
+
+  scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].scatterScalar(ctx, out, indices, value, k, outDim, batch);
+    }
+  }
+
+  maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].maskedFill(ctx, out, input, mask, value, n);
+    }
+  }
+
+  applyRotaryPosEmbPartial(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].applyRotaryPosEmbPartial(ctx, out, input, cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim);
+    }
+  }
+
+  rowScaleAdd(ctx: number, out: number, input: number, scales: number, rows: number, dim: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].rowScaleAdd(ctx, out, input, scales, rows, dim);
+    }
+  }
+
   private graphHandles: (number | undefined)[][] = [];
   private graphExecHandles: number[][] = [];
 

@@ -276,6 +276,122 @@ void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
 }
 
 // ---------------------------------------------------------------------------
+// RoPE + Head Transpose kernel
+// Input: [batch * seq_len, n_heads * in_stride] (projection output, interleaved heads)
+// Output: [batch * n_heads, seq_len, head_dim] (per-head contiguous for attention)
+// Applies RoPE to first rope_dim dimensions if rope_dim > 0; otherwise just transposes.
+// Cos/sin embeddings: [batch, seq_len, rope_dim] (only used if rope_dim > 0)
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) rope_transpose_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ in,
+    const __nv_bfloat16* __restrict__ cos_emb,
+    const __nv_bfloat16* __restrict__ sin_emb,
+    int rope_dim, int head_dim, int n_heads,
+    int seq_len, int batch, int in_stride
+) {
+    int bhs = blockIdx.x;
+    int s = bhs % seq_len;
+    int h = (bhs / seq_len) % n_heads;
+    int b = bhs / (seq_len * n_heads);
+
+    const __nv_bfloat16* x = in + (b * seq_len + s) * n_heads * in_stride + h * in_stride;
+    __nv_bfloat16* o = out + ((b * n_heads + h) * seq_len + s) * head_dim;
+
+    int half = rope_dim / 2;
+    int cos_base = (b * seq_len + s) * rope_dim;
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float xi = __bfloat162float(x[i]);
+        if (i < rope_dim && rope_dim > 0) {
+            float ci = __bfloat162float(cos_emb[cos_base + i]);
+            float si = __bfloat162float(sin_emb[cos_base + i]);
+            float xi_rot;
+            if (i < half) {
+                xi_rot = -__bfloat162float(x[i + half]);
+            } else {
+                xi_rot = __bfloat162float(x[i - half]);
+            }
+            o[i] = __float2bfloat16(xi * ci + xi_rot * si);
+        } else {
+            o[i] = __float2bfloat16(xi);
+        }
+    }
+}
+
+void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
+                         const void* cos_emb, const void* sin_emb,
+                         int rope_dim, int head_dim, int n_heads,
+                         int seq_len, int batch, int in_stride) {
+    cudaSetDevice(ctx->device_id);
+    int total_rows = batch * n_heads * seq_len;
+    int block_size = 256;
+    if (block_size > head_dim) block_size = (head_dim + 31) / 32 * 32;
+    int p = 1;
+    while (p < block_size) p <<= 1;
+    block_size = p;
+    if (block_size > 256) block_size = 256;
+    if (block_size < 32) block_size = 32;
+    rope_transpose_kernel<<<total_rows, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
+        (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
+        rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
+}
+
+// ---------------------------------------------------------------------------
+// MLA V-Expand kernel
+// attn_out: [batch, n_heads, seq_len, kv_lora_rank] (HND layout from FlashInfer)
+// v_proj: [n_heads * v_head_dim, kv_lora_rank] (row-major, per-head weights)
+// result: [batch, n_heads, seq_len, v_head_dim] (HND layout)
+// Computes result[b,h,s,j] = sum_k(attn_out[b,h,s,k] * v_proj[h*v_head_dim+j, k])
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) mla_v_expand_kernel(
+    __nv_bfloat16* __restrict__ result,
+    const __nv_bfloat16* __restrict__ attn_out,
+    const __nv_bfloat16* __restrict__ v_proj,
+    int kv_lora_rank, int v_head_dim, int n_heads,
+    int seq_len, int batch
+) {
+    int bhs = blockIdx.x;
+    int s = bhs % seq_len;
+    int h = (bhs / seq_len) % n_heads;
+    int b = bhs / (seq_len * n_heads);
+
+    const __nv_bfloat16* attn_row = attn_out + ((b * n_heads + h) * seq_len + s) * kv_lora_rank;
+    const __nv_bfloat16* w_base = v_proj + h * v_head_dim * kv_lora_rank;
+
+    for (int j = threadIdx.x; j < v_head_dim; j += blockDim.x) {
+        float sum = 0.0f;
+        const __nv_bfloat16* w_row = w_base + j * kv_lora_rank;
+        for (int k = 0; k < kv_lora_rank; k++) {
+            sum += __bfloat162float(attn_row[k]) * __bfloat162float(w_row[k]);
+        }
+        result[(b * seq_len + s) * (n_heads * v_head_dim) + h * v_head_dim + j] = __float2bfloat16(sum);
+    }
+}
+
+void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
+                       const void* v_proj,
+                       int kv_lora_rank, int v_head_dim, int n_heads,
+                       int seq_len, int batch) {
+    cudaSetDevice(ctx->device_id);
+    int total_rows = batch * n_heads * seq_len;
+    int block_size = 256;
+    if (block_size > v_head_dim) block_size = (v_head_dim + 31) / 32 * 32;
+    int p = 1;
+    while (p < block_size) p <<= 1;
+    block_size = p;
+    if (block_size > 256) block_size = 256;
+    if (block_size < 32) block_size = 32;
+    mla_v_expand_kernel<<<total_rows, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
+        (const __nv_bfloat16*)v_proj,
+        kv_lora_rank, v_head_dim, n_heads, seq_len, batch);
+}
+
+// ---------------------------------------------------------------------------
 // SiLU + Mul kernel
 // ---------------------------------------------------------------------------
 
@@ -1206,6 +1322,42 @@ void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
     int grid = (n + block_size - 1) / block_size;
     ew_binary_kernel<add_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b, n);
+}
+
+// ---------------------------------------------------------------------------
+// Row-scale-add: out[i, d] += scale[i] * input[i, d]
+// out:     [rows, dim] BF16 (in-place accumulation)
+// input:   [rows, dim] BF16
+// scales:  [rows] BF16 (per-row scaling factor)
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) row_scale_add_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* scales,
+    int rows,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * dim;
+    if (idx < total) {
+        int row = idx / dim;
+        float s = __bfloat162float(scales[row]);
+        float v = __bfloat162float(input[idx]);
+        float o = __bfloat162float(out[idx]);
+        out[idx] = __float2bfloat16(o + s * v);
+    }
+}
+
+void glm_row_scale_add(GlmCtx* ctx, void* out, const void* input,
+                        const void* scales, int rows, int dim) {
+    cudaSetDevice(ctx->device_id);
+    int total = rows * dim;
+    int block_size = 256;
+    int grid = (total + block_size - 1) / block_size;
+    row_scale_add_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+        (const __nv_bfloat16*)scales, rows, dim);
 }
 
 // ---------------------------------------------------------------------------

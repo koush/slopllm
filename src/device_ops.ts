@@ -42,6 +42,20 @@ export interface DeviceOps {
 
   bmm(C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number): void;
 
+  ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void;
+  mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): void;
+
+  sigmoid(ctx: number, out: number, input: number, n: number): void;
+  topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
+  indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
+  add(ctx: number, out: number, a: number, b: number, n: number): void;
+  scale(ctx: number, out: number, input: number, scale: number, n: number): void;
+  mul(ctx: number, out: number, a: number, b: number, n: number): void;
+  scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
+  maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void;
+  applyRotaryPosEmbPartial(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
+  rowScaleAdd(ctx: number, out: number, input: number, scales: number, rows: number, dim: number): void;
+
   graphBeginCapture(): void;
   graphEndCapture(): number;
   graphInstantiate(graph: number): number;
