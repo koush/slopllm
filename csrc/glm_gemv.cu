@@ -198,7 +198,7 @@ fp8_dequantize_gemv_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
     const __nv_fp8_e4m3* __restrict__ weight,
-    const float* __restrict__ scale_inv,
+    const __nv_bfloat16* __restrict__ scale_inv,
     int M, int N, int K) {
 
     constexpr int K_TILE_VEC = K_TILE / 2;
@@ -235,7 +235,7 @@ fp8_dequantize_gemv_kernel(
             #pragma unroll
             for (int b = 0; b < BLOCKS_PER_TILE; b++) {
                 int kb = tile * BLOCKS_PER_TILE + b;
-                float scale = scale_inv[n_block * num_k_blocks + kb];
+                float scale = __bfloat162float(scale_inv[n_block * num_k_blocks + kb]);
                 #pragma unroll
                 for (int ki = lane; ki < FP8_QUANT_BLOCK / 2; ki += GEMV_WARP_SIZE) {
                     __nv_bfloat162 x2 = smem_vec[b * (FP8_QUANT_BLOCK / 2) + ki];
@@ -265,7 +265,7 @@ fp8_dequantize_gemv_kernel(
             int remaining_k_blocks = remaining / FP8_QUANT_BLOCK;
             for (int b = 0; b < remaining_k_blocks; b++) {
                 int kb = remaining_k_blocks_start + b;
-                float scale = scale_inv[n_block * num_k_blocks + kb];
+                float scale = __bfloat162float(scale_inv[n_block * num_k_blocks + kb]);
                 int b_start = b * FP8_QUANT_BLOCK;
                 for (int k = b_start + lane; k < b_start + FP8_QUANT_BLOCK; k += GEMV_WARP_SIZE) {
                     float w_val = static_cast<float>(weight_row[remaining_start + k]) * scale;
@@ -305,7 +305,7 @@ fp8_dequantize_gemm_smem_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
     const __nv_fp8_e4m3* __restrict__ weight,
-    const float* __restrict__ scale_inv,
+    const __nv_bfloat16* __restrict__ scale_inv,
     int M, int N, int K) {
 
     int m_start = blockIdx.y * FP8_GEMM_M_TILE;
@@ -344,7 +344,7 @@ fp8_dequantize_gemm_smem_kernel(
 
         if (m < M && n < N) {
             int n_block = n / 128;
-            float scale = scale_inv[n_block * num_k_blocks + kb];
+            float scale = __bfloat162float(scale_inv[n_block * num_k_blocks + kb]);
 
             #pragma unroll
             for (int k = 0; k < FP8_GEMM_K_TILE; k++) {
@@ -364,14 +364,209 @@ fp8_dequantize_gemm_smem_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// NVFP4 (W4A16) dequantize + GEMV for decode
+// FP4 E2M1 weights packed as uint8 (2 per byte), double quantization:
+//   weight_scale  (FP8 E4M3, per-block) + weight_scale_2 (F32, global)
+//   dequant: LUT[nibble] * float(weight_scale[block]) * weight_scale_2
+// GROUP_SIZE = 16
+// ---------------------------------------------------------------------------
+
+constexpr int NVFP4_QUANT_GROUP = 16;
+
+__constant__ float c_fp4_e2m1_lut[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+template<int K_TILE>
+__global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
+nvfp4_dequantize_gemv_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const uint8_t* __restrict__ weight,
+    const __nv_fp8_e4m3* __restrict__ weight_scale,
+    const float* __restrict__ weight_scale_2,
+    int M, int N, int K) {
+
+    constexpr int K_TILE_VEC = K_TILE / 2;
+    constexpr int GROUPS_PER_TILE = K_TILE / NVFP4_QUANT_GROUP;
+
+    int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+    int m = blockIdx.x / num_row_groups;
+    int row_group = blockIdx.x % num_row_groups;
+    int row = row_group * GEMV_ROWS_PER_BLOCK + threadIdx.x / GEMV_WARP_SIZE;
+    int lane = threadIdx.x % GEMV_WARP_SIZE;
+
+    bool valid = m < M && row < N;
+
+    __shared__ __nv_bfloat162 smem_vec[K_TILE_VEC];
+
+    int num_k_tiles = K / K_TILE;
+    int num_k_groups = K / NVFP4_QUANT_GROUP;
+    const __nv_bfloat16* input_row = input + (size_t)m * K;
+    const uint8_t* weight_row = weight + (size_t)row * (K / 2);
+    float scale_2_val = *weight_scale_2;
+
+    float sum = 0.0f;
+
+    for (int tile = 0; tile < num_k_tiles; tile++) {
+        int k_start = tile * K_TILE;
+
+        const __nv_bfloat162* input_vec = reinterpret_cast<const __nv_bfloat162*>(input_row + k_start);
+        for (int i = threadIdx.x; i < K_TILE_VEC; i += GEMV_BLOCK_SIZE) {
+            smem_vec[i] = input_vec[i];
+        }
+        __syncthreads();
+
+        if (valid) {
+            #pragma unroll
+            for (int g = 0; g < GROUPS_PER_TILE; g++) {
+                int kg = tile * GROUPS_PER_TILE + g;
+                float scale = static_cast<float>(weight_scale[row * num_k_groups + kg]) * scale_2_val;
+                int g_start = g * NVFP4_QUANT_GROUP;
+                #pragma unroll
+                for (int ki = lane; ki < NVFP4_QUANT_GROUP / 2; ki += GEMV_WARP_SIZE) {
+                    __nv_bfloat162 x2 = smem_vec[(g_start + ki * 2) / 2];
+                    float x0 = __bfloat162float(x2.x);
+                    float x1 = __bfloat162float(x2.y);
+                    uint8_t packed = weight_row[(k_start + g_start) / 2 + ki];
+                    float w0 = c_fp4_e2m1_lut[packed & 0x0F] * scale;
+                    float w1 = c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale;
+                    sum += w0 * x0 + w1 * x1;
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    int remaining_start = num_k_tiles * K_TILE;
+    int remaining = K - remaining_start;
+    if (remaining > 0) {
+        __nv_bfloat16* smem = reinterpret_cast<__nv_bfloat16*>(smem_vec);
+        for (int i = threadIdx.x; i < remaining; i += GEMV_BLOCK_SIZE) {
+            smem[i] = input_row[remaining_start + i];
+        }
+        __syncthreads();
+
+        if (valid) {
+            int remaining_groups_start = num_k_tiles * GROUPS_PER_TILE;
+            int remaining_groups = remaining / NVFP4_QUANT_GROUP;
+            for (int g = 0; g < remaining_groups; g++) {
+                int kg = remaining_groups_start + g;
+                float scale = static_cast<float>(weight_scale[row * num_k_groups + kg]) * scale_2_val;
+                int g_start = g * NVFP4_QUANT_GROUP;
+                for (int k = g_start + lane; k < g_start + NVFP4_QUANT_GROUP; k += GEMV_WARP_SIZE) {
+                    uint8_t packed = weight_row[(remaining_start + k) / 2];
+                    float w0 = c_fp4_e2m1_lut[packed & 0x0F] * scale;
+                    float w1 = c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale;
+                    float x_val = __bfloat162float(smem[k]);
+                    sum += (k % 2 == 0 ? w0 : w1) * x_val;
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (valid) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        }
+        if (lane == 0) {
+            output[(size_t)m * N + row] = __float2bfloat16(sum);
+        }
+    }
+}
+
+constexpr int NVFP4_GEMM_M_TILE = 16;
+constexpr int NVFP4_GEMM_N_TILE = 32;
+constexpr int NVFP4_GEMM_K_TILE = 128;
+constexpr int NVFP4_GEMM_BLOCK_DIM = NVFP4_GEMM_M_TILE * NVFP4_GEMM_N_TILE;
+
+__global__ void __launch_bounds__(NVFP4_GEMM_BLOCK_DIM, 4)
+nvfp4_dequantize_gemm_smem_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const uint8_t* __restrict__ weight,
+    const __nv_fp8_e4m3* __restrict__ weight_scale,
+    const float* __restrict__ weight_scale_2,
+    int M, int N, int K) {
+
+    int m_start = blockIdx.y * NVFP4_GEMM_M_TILE;
+    int n_start = blockIdx.x * NVFP4_GEMM_N_TILE;
+    int local_m = threadIdx.x / NVFP4_GEMM_N_TILE;
+    int local_n = threadIdx.x % NVFP4_GEMM_N_TILE;
+    int m = m_start + local_m;
+    int n = n_start + local_n;
+
+    __shared__ __nv_bfloat16 smem_input[NVFP4_GEMM_M_TILE][NVFP4_GEMM_K_TILE];
+    __shared__ uint8_t smem_weight[NVFP4_GEMM_N_TILE][NVFP4_GEMM_K_TILE / 2];
+
+    float sum = 0.0f;
+    int num_k_tiles = (K + NVFP4_GEMM_K_TILE - 1) / NVFP4_GEMM_K_TILE;
+    int num_k_groups = K / NVFP4_QUANT_GROUP;
+    int valid_m = min(NVFP4_GEMM_M_TILE, M - m_start);
+    int valid_n = min(NVFP4_GEMM_N_TILE, N - n_start);
+    float scale_2_val = *weight_scale_2;
+
+    for (int kb = 0; kb < num_k_tiles; kb++) {
+        int k_start = kb * NVFP4_GEMM_K_TILE;
+        int k_tile = min(NVFP4_GEMM_K_TILE, K - k_start);
+
+        for (int i = threadIdx.x; i < valid_m * k_tile; i += NVFP4_GEMM_BLOCK_DIM) {
+            int lm = i / k_tile;
+            int lk = i % k_tile;
+            smem_input[lm][lk] = input[(m_start + lm) * K + k_start + lk];
+        }
+
+        for (int i = threadIdx.x; i < valid_n * (k_tile / 2); i += NVFP4_GEMM_BLOCK_DIM) {
+            int ln = i / (k_tile / 2);
+            int lk = i % (k_tile / 2);
+            smem_weight[ln][lk] = weight[(n_start + ln) * (K / 2) + k_start / 2 + lk];
+        }
+
+        __syncthreads();
+
+        if (m < M && n < N) {
+            constexpr int GROUPS_PER_K_TILE = NVFP4_GEMM_K_TILE / NVFP4_QUANT_GROUP;
+            #pragma unroll
+            for (int g = 0; g < GROUPS_PER_K_TILE; g++) {
+                int kg = kb * GROUPS_PER_K_TILE + g;
+                float scale = static_cast<float>(weight_scale[n * num_k_groups + kg]) * scale_2_val;
+                int g_start = g * NVFP4_QUANT_GROUP;
+                #pragma unroll
+                for (int k = g_start; k < g_start + NVFP4_QUANT_GROUP; k += 2) {
+                    if (k < k_tile) {
+                        float x_val = __bfloat162float(smem_input[local_m][k]);
+                        uint8_t packed = smem_weight[local_n][k / 2];
+                        float w0 = c_fp4_e2m1_lut[packed & 0x0F] * scale;
+                        float w1 = c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale;
+                        float x_val_next = __bfloat162float(smem_input[local_m][k + 1]);
+                        sum += w0 * x_val + w1 * x_val_next;
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (m < M && n < N) {
+        output[(size_t)m * N + n] = __float2bfloat16(sum);
+    }
+}
+
 } // namespace
 
 extern "C" {
 
 void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
-                            const void* fp8_weight, const float* weight_scale,
+                            const void* fp8_weight, const void* weight_scale,
                             int m, int n, int k) {
     cudaSetDevice(ctx->device_id);
+    const __nv_bfloat16* scale_ptr = reinterpret_cast<const __nv_bfloat16*>(weight_scale);
     if (m == 1) {
         int num_row_groups = (n + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
         int grid_size = m * num_row_groups;
@@ -380,19 +575,19 @@ void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
                 reinterpret_cast<__nv_bfloat16*>(bf16_out),
                 reinterpret_cast<const __nv_bfloat16*>(bf16_input),
                 reinterpret_cast<const __nv_fp8_e4m3*>(fp8_weight),
-                weight_scale, m, n, k);
+                scale_ptr, m, n, k);
         } else if (k >= 256) {
             fp8_dequantize_gemv_kernel<256><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
                 reinterpret_cast<__nv_bfloat16*>(bf16_out),
                 reinterpret_cast<const __nv_bfloat16*>(bf16_input),
                 reinterpret_cast<const __nv_fp8_e4m3*>(fp8_weight),
-                weight_scale, m, n, k);
+                scale_ptr, m, n, k);
         } else {
             fp8_dequantize_gemv_kernel<128><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
                 reinterpret_cast<__nv_bfloat16*>(bf16_out),
                 reinterpret_cast<const __nv_bfloat16*>(bf16_input),
                 reinterpret_cast<const __nv_fp8_e4m3*>(fp8_weight),
-                weight_scale, m, n, k);
+                scale_ptr, m, n, k);
         }
     } else {
         dim3 grid((n + FP8_GEMM_N_TILE - 1) / FP8_GEMM_N_TILE,
@@ -401,8 +596,46 @@ void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
             reinterpret_cast<__nv_bfloat16*>(bf16_out),
             reinterpret_cast<const __nv_bfloat16*>(bf16_input),
             reinterpret_cast<const __nv_fp8_e4m3*>(fp8_weight),
-            weight_scale,
+            scale_ptr,
             m, n, k);
+    }
+}
+
+void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
+                              const void* fp4_weight, const void* weight_scale,
+                              const float* weight_scale_2, int m, int n, int k) {
+    cudaSetDevice(ctx->device_id);
+    const __nv_fp8_e4m3* scale_ptr = reinterpret_cast<const __nv_fp8_e4m3*>(weight_scale);
+    if (m == 1) {
+        int num_row_groups = (n + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+        int grid_size = m * num_row_groups;
+        if (k >= 512) {
+            nvfp4_dequantize_gemv_kernel<512><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                reinterpret_cast<__nv_bfloat16*>(bf16_out),
+                reinterpret_cast<const __nv_bfloat16*>(bf16_input),
+                reinterpret_cast<const uint8_t*>(fp4_weight),
+                scale_ptr, weight_scale_2, m, n, k);
+        } else if (k >= 256) {
+            nvfp4_dequantize_gemv_kernel<256><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                reinterpret_cast<__nv_bfloat16*>(bf16_out),
+                reinterpret_cast<const __nv_bfloat16*>(bf16_input),
+                reinterpret_cast<const uint8_t*>(fp4_weight),
+                scale_ptr, weight_scale_2, m, n, k);
+        } else {
+            nvfp4_dequantize_gemv_kernel<128><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                reinterpret_cast<__nv_bfloat16*>(bf16_out),
+                reinterpret_cast<const __nv_bfloat16*>(bf16_input),
+                reinterpret_cast<const uint8_t*>(fp4_weight),
+                scale_ptr, weight_scale_2, m, n, k);
+        }
+    } else {
+        dim3 grid((n + NVFP4_GEMM_N_TILE - 1) / NVFP4_GEMM_N_TILE,
+                  (m + NVFP4_GEMM_M_TILE - 1) / NVFP4_GEMM_M_TILE);
+        nvfp4_dequantize_gemm_smem_kernel<<<grid, NVFP4_GEMM_BLOCK_DIM, 0, GLM_STREAM(ctx)>>>(
+            reinterpret_cast<__nv_bfloat16*>(bf16_out),
+            reinterpret_cast<const __nv_bfloat16*>(bf16_input),
+            reinterpret_cast<const uint8_t*>(fp4_weight),
+            scale_ptr, weight_scale_2, m, n, k);
     }
 }
 

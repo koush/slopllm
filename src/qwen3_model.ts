@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, SamplingParams } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
-import { bf16BytesToF32, f32ToBf16Bytes } from "./glm_ops";
+import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { ExecutionState } from "./paged_kv";
 import { PagedKVCache } from "./paged_kv";
@@ -103,11 +103,9 @@ export class Qwen3Model extends ChatModel {
     const par = this.weightParallelism(name);
 
     if (name.endsWith("_scale_inv")) {
-      const bf16Bytes = st.readTensor(name);
-      const f32Array = bf16BytesToF32(bf16Bytes);
-      const f32Buffer = Buffer.from(f32Array.buffer, f32Array.byteOffset, f32Array.byteLength);
-      const tensor = this.alloc(meta.shape, "F32", name, par);
-      tensor.h2d(f32Buffer);
+      const tensor = this.alloc(meta.shape, "BF16", name, par);
+      const offset = st.dataStart + meta.dataOffsets[0];
+      tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
     } else {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name, par);

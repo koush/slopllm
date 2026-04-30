@@ -83,6 +83,7 @@ interface NativeAddon {
   mmapLoad(ctx: number, gpuDst: number, mmapPtr: number, offset: number, nbytes: number): void;
   mmapClose(mmapPtr: number, size: number): void;
   fp8LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, m: number, n: number, k: number): void;
+  nvfp4LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp4Weight: number, weightScale: number, weightScale2: number, m: number, n: number, k: number): void;
   gdnRecurrentStep(ctx: number, output: number, state: number, qkv: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
   gdnPrefill(ctx: number, output: number, state: number, qkv: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, cuSeqlens: number, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
   causalConv1d(ctx: number, output: number, convState: number, input: number, weight: number, cuSeqlens: number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void;
@@ -141,6 +142,10 @@ export class GlmTensor extends Tensor {
     if (weight.type === "F8_E4M3") {
       const scale = weight.workspace.tensors.get(weight.name! + "_scale_inv")!;
       getNativeAddon().fp8LinearDecode(this.glm.ctx, out.data, this.data, weight.data, scale.data, batch, n, k);
+    } else if (weight.type === "U8") {
+      const scale = weight.workspace.tensors.get(weight.name! + "_weight_scale")!;
+      const scale2 = weight.workspace.tensors.get(weight.name! + "_weight_scale_2")!;
+      getNativeAddon().nvfp4LinearDecode(this.glm.ctx, out.data, this.data, weight.data, scale.data, scale2.data, batch, n, k);
     } else {
       getNativeAddon().linear(this.glm.ctx, out.data, this.data, weight.data, batch, n, k);
     }
@@ -468,6 +473,10 @@ export class GlmOps implements DeviceOps {
 
   fp8LinearDecode(bf16Out: Tensor, bf16Input: Tensor, fp8Weight: Tensor, weightScale: Tensor, m: number, n: number, k: number): void {
     getNativeAddon().fp8LinearDecode(this.ctx, ptr(bf16Out), ptr(bf16Input), ptr(fp8Weight), ptr(weightScale), m, n, k);
+  }
+
+  nvfp4LinearDecode(bf16Out: Tensor, bf16Input: Tensor, fp4Weight: Tensor, weightScale: Tensor, weightScale2: Tensor, m: number, n: number, k: number): void {
+    getNativeAddon().nvfp4LinearDecode(this.ctx, ptr(bf16Out), ptr(bf16Input), ptr(fp4Weight), ptr(weightScale), ptr(weightScale2), m, n, k);
   }
 
   gdnRecurrentStep(output: Tensor, state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {

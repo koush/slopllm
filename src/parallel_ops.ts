@@ -362,6 +362,33 @@ export class ParallelTensor extends Tensor {
       return out;
     }
 
+    if (weight.type === "U8") {
+      const scale = weight.workspace.tensors.get(weight.name! + "_weight_scale")!;
+      const scale2 = weight.workspace.tensors.get(weight.name! + "_weight_scale_2")!;
+      const pScale = scale as ParallelTensor;
+      const pScale2 = scale2 as ParallelTensor;
+      const out = this.workspace.alloc([batch, n], this.type, undefined, outPar) as ParallelTensor;
+
+      if (pWeight.parallelism === TensorParallelism.Column && this.parallelism === TensorParallelism.Replicated) {
+        const shardN = n / this.worldSize;
+        for (let i = 0; i < this.worldSize; i++) {
+          this.devices[i].nvfp4LinearDecode(out.shards[i], this.shards[i], pWeight.shards[i], pScale.shards[i], pScale2.shards[i], batch, shardN, k);
+        }
+      } else if (pWeight.parallelism === TensorParallelism.Row && this.parallelism === TensorParallelism.Row) {
+        const shardK = k / this.worldSize;
+        for (let i = 0; i < this.worldSize; i++) {
+          this.devices[i].nvfp4LinearDecode(out.shards[i], this.shards[i], pWeight.shards[i], pScale.shards[i], pScale2.shards[i], batch, n, shardK);
+        }
+      } else if (pWeight.parallelism === TensorParallelism.Replicated && this.parallelism === TensorParallelism.Replicated) {
+        for (let i = 0; i < this.worldSize; i++) {
+          this.devices[i].nvfp4LinearDecode(out.shards[i], this.shards[i], pWeight.shards[i], pScale.shards[i], pScale2.shards[i], batch, n, k);
+        }
+      } else {
+        throw new Error(`nvfp4LinearDecode: unsupported parallelism W=${pWeight.parallelism}, X=${this.parallelism}`);
+      }
+      return out;
+    }
+
     const shards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       shards.push(this.shards[i].linear(pWeight.shards[i], batch));

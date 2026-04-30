@@ -338,6 +338,86 @@ void glm_batch_prefill_paged_run(
     int32_t q_stride_n, int32_t q_stride_h,
     int mask_mode, float sm_scale);
 
+// ---------------------------------------------------------------------------
+// MLA (Multi-head Latent Attention) operations
+// ---------------------------------------------------------------------------
+
+// MLA Prefill: Plan phase
+// Allocates workspace and computes scheduling metadata for MLA prefill.
+// plan_info: output array of at least 18 int64_t elements (MLAPlanInfo)
+void glm_mla_prefill_plan(
+    GlmCtx* ctx,
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
+    int64_t* plan_info,
+    int32_t* qo_indptr_h, int32_t* kv_indptr_h, int32_t* kv_len_h,
+    uint32_t batch_size, uint32_t num_heads, uint32_t head_dim_o,
+    bool causal);
+
+// MLA Prefill: Run phase
+// Executes MLA paged attention (prefill/incremental-prefill).
+// q_nope: [packed_qo_len, num_heads, head_dim_ckv] BF16
+// q_pe:   [packed_qo_len, num_heads, head_dim_kpe] BF16
+// ckv_data: [num_pages, page_size, head_dim_ckv] BF16
+// kpe_data: [num_pages, page_size, head_dim_kpe] BF16
+// o: [packed_qo_len, num_heads, head_dim_ckv] BF16
+void glm_mla_prefill_run(
+    GlmCtx* ctx,
+    void* q_nope, void* q_pe,
+    void* ckv_data, void* kpe_data,
+    int32_t* kv_indices,
+    void* o,
+    void* float_ws, void* int_ws,
+    int64_t* plan_info,
+    uint32_t num_heads, uint32_t page_size,
+    int mask_mode, float sm_scale,
+    uint32_t q_nope_stride_n, uint32_t q_nope_stride_h,
+    uint32_t q_pe_stride_n, uint32_t q_pe_stride_h,
+    uint32_t ckv_stride_page, uint32_t ckv_stride_n,
+    uint32_t kpe_stride_page, uint32_t kpe_stride_n,
+    uint32_t o_stride_n, uint32_t o_stride_h);
+
+// MLA Decode: Plan phase
+// plan_info: output array of at least 10 int64_t elements (DecodePlanInfo)
+void glm_mla_decode_plan(
+    GlmCtx* ctx,
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
+    int64_t* plan_info,
+    int32_t* indptr_h,
+    uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t page_size, bool enable_cuda_graph);
+
+// MLA Decode: Run phase
+// q_nope: [batch_size, num_heads, head_dim_ckv] BF16
+// q_pe:   [batch_size, num_heads, head_dim_kpe] BF16
+// ckv_data: [num_pages, page_size, head_dim_ckv] BF16
+// kpe_data: [num_pages, page_size, head_dim_kpe] BF16
+// o: [batch_size, num_heads, head_dim_ckv] BF16
+void glm_mla_decode_run(
+    GlmCtx* ctx,
+    void* q_nope, void* q_pe,
+    void* ckv_data, void* kpe_data,
+    int32_t* indices, int32_t* indptr_d, int32_t* last_page_len,
+    void* o,
+    void* float_ws, void* int_ws,
+    int64_t* plan_info,
+    uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t page_size, float sm_scale);
+
+// MLA: Append entries to paged KV cache
+// append_ckv: [nnz, head_dim_ckv] BF16
+// append_kpe: [nnz, head_dim_kpe] BF16
+void glm_mla_kv_cache_append(
+    GlmCtx* ctx,
+    void* ckv_data, void* kpe_data,
+    int32_t* indices, int32_t* indptr, int32_t* last_page_len,
+    void* append_ckv, void* append_kpe,
+    int32_t* batch_indices, int32_t* positions,
+    uint32_t nnz, uint32_t page_size,
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe,
+    size_t append_ckv_stride_n, size_t append_kpe_stride_n);
+
 // CUDA Graph operations
 void glm_graph_begin_capture(GlmCtx* ctx);
 void* glm_graph_end_capture(GlmCtx* ctx);
@@ -348,15 +428,27 @@ void glm_graph_destroy(void* graph);
 void glm_graph_exec_destroy(void* graph_exec);
 
 // Fused FP8 dequantize + GEMV for decode (any M)
-// Computes: output[m, j] = sum_k(bf16_input[m, k] * fp8_weight[j, k] * weight_scale[j/128, k/128])
+// Computes: output[m, j] = sum_k(bf16_input[m, k] * fp8_weight[j, k] * bf16_scale_inv[j/128, k/128])
 // No activation quantization — BF16 input used directly.
 // bf16_out: row-major [M, N] BF16
 // bf16_input: row-major [M, K] BF16
 // fp8_weight: row-major [N, K] FP8 E4M3
-// weight_scale: row-major [N/128, K/128] float32 (block-wise scale_inv)
+// weight_scale: row-major [N/128, K/128] BF16 (block-wise scale_inv, dequantized in kernel)
 void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
-                            const void* fp8_weight, const float* weight_scale,
+                            const void* fp8_weight, const void* weight_scale,
                             int m, int n, int k);
+
+// Fused NVFP4 dequantize + GEMV/GEMM for decode (any M)
+// W4A16: FP4 E2M1 weights (uint8 packed), BF16 input, double quantization scales
+// Computes: output[m, j] = sum_k(bf16_input[m, k] * fp4_lut[weight[j,k/2]] * float(weight_scale[j, k/16]) * weight_scale_2)
+// bf16_out: row-major [M, N] BF16
+// bf16_input: row-major [M, K] BF16
+// fp4_weight: row-major [N, K/2] uint8 (two FP4 E2M1 values per byte)
+// weight_scale: row-major [N, K/16] FP8 E4M3 (per-block scale, dequantized in kernel)
+// weight_scale_2: scalar F32 (global scale = amax / (6*448))
+void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
+                              const void* fp4_weight, const void* weight_scale,
+                              const float* weight_scale_2, int m, int n, int k);
 
 // Gated DeltaNet recurrent step (decode, T=1, batched)
 // Fused: L2 norm q,k + gate computation + delta rule update

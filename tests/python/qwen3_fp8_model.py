@@ -49,11 +49,11 @@ class Qwen3FP8Model(Qwen3Model):
                 is_fp8_weight = any(key.endswith(sfx) for sfx in FP8_LINEAR_SUFFIXES)
 
                 if is_scale:
-                    scale_f32 = t.float().contiguous()
-                    nbytes = scale_f32.numel() * 4
+                    scale_bf16 = t.to(torch.bfloat16).contiguous()
+                    nbytes = scale_bf16.numel() * BF16
                     gpu_ptr = glm.alloc(nbytes)
                     glm.lib.glm_h2d(glm.ctx, ctypes.c_void_p(gpu_ptr),
-                                     ctypes.c_void_p(scale_f32.data_ptr()), nbytes)
+                                     ctypes.c_void_p(scale_bf16.data_ptr()), nbytes)
                     weight_scales[key] = gpu_ptr
                 elif is_fp8_weight:
                     fp8_bytes = t.view(torch.uint8).contiguous()

@@ -7,6 +7,8 @@
 #include <flashinfer/attention/default_decode_params.cuh>
 #include <flashinfer/attention/decode.cuh>
 #include <flashinfer/attention/mask.cuh>
+#include <flashinfer/attention/mla.cuh>
+#include <flashinfer/attention/mla_params.cuh>
 #include <flashinfer/attention/prefill.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
@@ -521,6 +523,296 @@ void glm_batch_prefill_paged_run(
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_batch_prefill_paged_run failed: %s\n", cudaGetErrorString(status));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MLA Prefill
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t MLA_HEAD_DIM_CKV = 512;
+constexpr uint32_t MLA_HEAD_DIM_KPE = 64;
+
+void glm_mla_prefill_plan(
+    GlmCtx* ctx,
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
+    int64_t* plan_info,
+    int32_t* qo_indptr_h, int32_t* kv_indptr_h, int32_t* kv_len_h,
+    uint32_t batch_size, uint32_t num_heads, uint32_t head_dim_o,
+    bool causal) {
+
+  cudaSetDevice(ctx->device_id);
+
+  flashinfer::MLAPlanInfo info;
+  cudaError_t status = flashinfer::MLAPlan<IdType>(
+      float_ws, float_ws_size,
+      int_ws, pinned_int_ws, int_ws_size,
+      info,
+      qo_indptr_h, kv_indptr_h, kv_len_h,
+      batch_size, num_heads, head_dim_o,
+      causal, GLM_STREAM(ctx));
+
+  if (status != cudaSuccess) {
+    fprintf(stderr, "glm_mla_prefill_plan failed: %s\n", cudaGetErrorString(status));
+    return;
+  }
+
+  auto vec = info.ToVector();
+  memcpy(plan_info, vec.data(), sizeof(int64_t) * vec.size());
+}
+
+void glm_mla_prefill_run(
+    GlmCtx* ctx,
+    void* q_nope, void* q_pe,
+    void* ckv_data, void* kpe_data,
+    int32_t* kv_indices,
+    void* o,
+    void* float_ws, void* int_ws,
+    int64_t* plan_info,
+    uint32_t num_heads, uint32_t page_size,
+    int mask_mode, float sm_scale,
+    uint32_t q_nope_stride_n, uint32_t q_nope_stride_h,
+    uint32_t q_pe_stride_n, uint32_t q_pe_stride_h,
+    uint32_t ckv_stride_page, uint32_t ckv_stride_n,
+    uint32_t kpe_stride_page, uint32_t kpe_stride_n,
+    uint32_t o_stride_n, uint32_t o_stride_h) {
+
+  cudaSetDevice(ctx->device_id);
+
+  using MLAParams = flashinfer::MLAParams<DType, DType, DTypeO, IdType>;
+
+  flashinfer::MLAPlanInfo info;
+  info.FromVector(std::vector<int64_t>(plan_info, plan_info + 18));
+
+  MLAParams params;
+  params.q_nope = static_cast<DType*>(q_nope);
+  params.q_pe = static_cast<DType*>(q_pe);
+  params.ckv = static_cast<DType*>(ckv_data);
+  params.kpe = static_cast<DType*>(kpe_data);
+
+  params.q_indptr = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.q_indptr_offset);
+  params.kv_indptr = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.kv_indptr_offset);
+  params.partial_indptr = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.partial_indptr_offset);
+  params.kv_indices = static_cast<IdType*>(kv_indices);
+  params.q_len = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.q_len_offset);
+  params.kv_len = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.kv_len_offset);
+  params.q_start = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.q_start_offset);
+  params.kv_start = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.kv_start_offset);
+  params.kv_end = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.kv_end_offset);
+  params.work_indptr = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.work_indptr_offset);
+  params.merge_packed_offset_start = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.merge_packed_offset_start_offset);
+  params.merge_packed_offset_end = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.merge_packed_offset_end_offset);
+  params.merge_partial_packed_offset_start = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.merge_partial_packed_offset_start_offset);
+  params.merge_partial_packed_offset_end = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.merge_partial_packed_offset_end_offset);
+  params.merge_partial_stride = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.merge_partial_stride_offset);
+
+  params.final_o = static_cast<DTypeO*>(o);
+  params.final_lse = nullptr;
+  params.partial_o = reinterpret_cast<DTypeO*>(static_cast<char*>(float_ws) + info.partial_o_offset);
+  params.partial_lse = reinterpret_cast<float*>(static_cast<char*>(float_ws) + info.partial_lse_offset);
+
+  params.num_heads = flashinfer::uint_fastdiv(num_heads);
+  params.block_size = flashinfer::uint_fastdiv(page_size);
+
+  params.q_nope_stride_n = q_nope_stride_n;
+  params.q_nope_stride_h = q_nope_stride_h;
+  params.q_pe_stride_n = q_pe_stride_n;
+  params.q_pe_stride_h = q_pe_stride_h;
+  params.ckv_stride_page = ckv_stride_page;
+  params.ckv_stride_n = ckv_stride_n;
+  params.kpe_stride_page = kpe_stride_page;
+  params.kpe_stride_n = kpe_stride_n;
+  params.o_stride_n = o_stride_n;
+  params.o_stride_h = o_stride_h;
+
+  params.sm_scale = sm_scale;
+  params.return_lse_base_on_e = false;
+
+  flashinfer::MaskMode flash_mask = static_cast<flashinfer::MaskMode>(mask_mode);
+
+  cudaError_t status;
+  if (flash_mask == flashinfer::MaskMode::kCausal) {
+    status = flashinfer::mla::BatchMLAPagedAttention<
+        flashinfer::MaskMode::kCausal, MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAParams>(
+        params, info.num_blks_x, info.num_blks_y, GLM_STREAM(ctx));
+  } else {
+    status = flashinfer::mla::BatchMLAPagedAttention<
+        flashinfer::MaskMode::kNone, MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAParams>(
+        params, info.num_blks_x, info.num_blks_y, GLM_STREAM(ctx));
+  }
+
+  if (status != cudaSuccess) {
+    fprintf(stderr, "glm_mla_prefill_run failed: %s\n", cudaGetErrorString(status));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MLA Decode
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using MLADecodeParams = flashinfer::BatchDecodeParamsMLA<DType, DType, DTypeO, IdType>;
+using MLAAttentionVariant = flashinfer::DefaultAttention<false, false, false, false>;
+
+cudaError_t mla_decode_work_est(
+    bool& split_kv, uint32_t& max_grid_size,
+    uint32_t& max_num_pages_per_batch,
+    uint32_t& new_batch_size, uint32_t& gdy,
+    uint32_t batch_size, IdType* kv_indptr_h,
+    uint32_t num_qo_heads, uint32_t page_size,
+    bool enable_cuda_graph, cudaStream_t stream) {
+  return flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<
+      MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAAttentionVariant, MLADecodeParams>(
+      split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
+      batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
+}
+
+} // anonymous namespace
+
+void glm_mla_decode_plan(
+    GlmCtx* ctx,
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
+    int64_t* plan_info,
+    int32_t* indptr_h,
+    uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t page_size, bool enable_cuda_graph) {
+
+  cudaSetDevice(ctx->device_id);
+
+  flashinfer::DecodePlanInfo info;
+
+  auto work_est = [&](bool& split_kv, uint32_t& max_grid_size,
+                      uint32_t& max_num_pages_per_batch,
+                      uint32_t& new_batch_size, uint32_t& gdy,
+                      uint32_t bs, IdType* kv_indptr,
+                      uint32_t nqh, uint32_t ps,
+                      bool ecg, cudaStream_t s) -> cudaError_t {
+    return mla_decode_work_est(split_kv, max_grid_size, max_num_pages_per_batch,
+                               new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
+  };
+
+  cudaError_t status = flashinfer::DecodePlan<
+      MLA_HEAD_DIM_CKV, flashinfer::PosEncodingMode::kRoPELlama,
+      MLAAttentionVariant, MLADecodeParams>(
+      float_ws, float_ws_size,
+      int_ws, pinned_int_ws, int_ws_size,
+      info,
+      indptr_h,
+      batch_size,
+      num_qo_heads,
+      page_size,
+      enable_cuda_graph,
+      GLM_STREAM(ctx),
+      work_est);
+
+  if (status != cudaSuccess) {
+    fprintf(stderr, "glm_mla_decode_plan failed: %s\n", cudaGetErrorString(status));
+    return;
+  }
+
+  auto vec = info.ToVector();
+  memcpy(plan_info, vec.data(), sizeof(int64_t) * vec.size());
+}
+
+void glm_mla_decode_run(
+    GlmCtx* ctx,
+    void* q_nope, void* q_pe,
+    void* ckv_data, void* kpe_data,
+    int32_t* indices, int32_t* indptr_d, int32_t* last_page_len,
+    void* o,
+    void* float_ws, void* int_ws,
+    int64_t* plan_info,
+    uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t page_size, float sm_scale) {
+
+  cudaSetDevice(ctx->device_id);
+
+  flashinfer::DecodePlanInfo info;
+  info.FromVector(std::vector<int64_t>(plan_info, plan_info + 10));
+
+  flashinfer::paged_kv_mla_t<DType, IdType> paged_kv(
+      page_size, MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, batch_size,
+      static_cast<DType*>(ckv_data), static_cast<DType*>(kpe_data),
+      indices, indptr_d, last_page_len, nullptr);
+
+  MLADecodeParams params(
+      static_cast<DType*>(q_nope),
+      static_cast<DType*>(q_pe),
+      nullptr, // q_rope_offset (use seq_len - 1 as default)
+      paged_kv,
+      static_cast<DTypeO*>(o),
+      nullptr, // lse
+      num_qo_heads,
+      -1, // window_left
+      0.0f, // logits_soft_cap
+      sm_scale,
+      1.0f, // rope_scale
+      10000000.0f); // rope_theta (GLM-5.1 uses 10M)
+
+  params.padded_batch_size = info.padded_batch_size;
+  params.request_indices = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.request_indices_offset);
+  params.kv_tile_indices = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.kv_tile_indices_offset);
+  params.o_indptr = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.o_indptr_offset);
+  params.kv_chunk_size_ptr = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.kv_chunk_size_ptr_offset);
+  params.block_valid_mask = info.split_kv
+      ? reinterpret_cast<bool*>(static_cast<char*>(int_ws) + info.block_valid_mask_offset)
+      : nullptr;
+  params.partition_kv = info.split_kv;
+
+  DTypeO* tmp_v = info.split_kv
+      ? reinterpret_cast<DTypeO*>(static_cast<char*>(float_ws) + info.v_offset)
+      : nullptr;
+  float* tmp_s = info.split_kv
+      ? reinterpret_cast<float*>(static_cast<char*>(float_ws) + info.s_offset)
+      : nullptr;
+
+  cudaError_t status =
+      flashinfer::BatchDecodeWithPagedKVCacheDispatchedMLA<
+          MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAAttentionVariant, MLADecodeParams>(
+          params, tmp_v, tmp_s, false, GLM_STREAM(ctx));
+
+  if (status != cudaSuccess) {
+    fprintf(stderr, "glm_mla_decode_run failed: %s\n", cudaGetErrorString(status));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MLA KV Cache Append
+// ---------------------------------------------------------------------------
+
+void glm_mla_kv_cache_append(
+    GlmCtx* ctx,
+    void* ckv_data, void* kpe_data,
+    int32_t* indices, int32_t* indptr, int32_t* last_page_len,
+    void* append_ckv, void* append_kpe,
+    int32_t* batch_indices, int32_t* positions,
+    uint32_t nnz, uint32_t page_size,
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe,
+    size_t append_ckv_stride_n, size_t append_kpe_stride_n) {
+
+  cudaSetDevice(ctx->device_id);
+
+  flashinfer::paged_kv_mla_t<DType, IdType> paged_kv(
+      page_size, head_dim_ckv, head_dim_kpe, 0,
+      static_cast<DType*>(ckv_data), static_cast<DType*>(kpe_data),
+      indices, indptr, last_page_len, nullptr);
+
+  cudaError_t status = flashinfer::AppendPagedKVMlaCache(
+      paged_kv,
+      static_cast<DType*>(append_ckv),
+      static_cast<DType*>(append_kpe),
+      batch_indices,
+      positions,
+      nnz,
+      append_ckv_stride_n,
+      append_kpe_stride_n,
+      GLM_STREAM(ctx));
+
+  if (status != cudaSuccess) {
+    fprintf(stderr, "glm_mla_kv_cache_append failed: %s\n", cudaGetErrorString(status));
   }
 }
 

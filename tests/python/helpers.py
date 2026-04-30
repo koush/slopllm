@@ -420,6 +420,71 @@ class GlmOps:
             ctypes.c_int32, ctypes.c_float,
         ]
 
+        self.lib.glm_mla_prefill_plan.restype = None
+        self.lib.glm_mla_prefill_plan.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_bool,
+        ]
+
+        self.lib.glm_mla_prefill_run.restype = None
+        self.lib.glm_mla_prefill_run.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_int, ctypes.c_float,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+        ]
+
+        self.lib.glm_mla_decode_plan.restype = None
+        self.lib.glm_mla_decode_plan.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_bool,
+        ]
+
+        self.lib.glm_mla_decode_run.restype = None
+        self.lib.glm_mla_decode_run.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_float,
+        ]
+
+        self.lib.glm_mla_kv_cache_append.restype = None
+        self.lib.glm_mla_kv_cache_append.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_size_t, ctypes.c_size_t,
+        ]
+
         self.lib.glm_graph_begin_capture.restype = None
         self.lib.glm_graph_begin_capture.argtypes = [ctypes.c_void_p]
 
@@ -458,6 +523,14 @@ class GlmOps:
             ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_nvfp4_linear_decode.restype = None
+        self.lib.glm_nvfp4_linear_decode.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
@@ -977,6 +1050,95 @@ class GlmOps:
             ctypes.c_int32(mask_mode),             ctypes.c_float(sm_scale)
         )
 
+    def mla_prefill_plan(self, float_ws, float_ws_size,
+                         int_ws, pinned_int_ws, int_ws_size,
+                         plan_info, qo_indptr_h, kv_indptr_h, kv_len_h,
+                         batch_size, num_heads, head_dim_o,
+                         causal=False):
+        self.lib.glm_mla_prefill_plan(
+            self.ctx,
+            ctypes.c_void_p(float_ws), ctypes.c_size_t(float_ws_size),
+            ctypes.c_void_p(int_ws), ctypes.c_void_p(pinned_int_ws), ctypes.c_size_t(int_ws_size),
+            ctypes.c_void_p(plan_info),
+            ctypes.c_void_p(qo_indptr_h), ctypes.c_void_p(kv_indptr_h), ctypes.c_void_p(kv_len_h),
+            ctypes.c_uint32(batch_size), ctypes.c_uint32(num_heads), ctypes.c_uint32(head_dim_o),
+            ctypes.c_bool(causal)
+        )
+
+    def mla_prefill_run(self, q_nope, q_pe, ckv_data, kpe_data,
+                        kv_indices, o, float_ws, int_ws, plan_info,
+                        num_heads, page_size, mask_mode, sm_scale,
+                        q_nope_stride_n, q_nope_stride_h,
+                        q_pe_stride_n, q_pe_stride_h,
+                        ckv_stride_page, ckv_stride_n,
+                        kpe_stride_page, kpe_stride_n,
+                        o_stride_n, o_stride_h):
+        self.lib.glm_mla_prefill_run(
+            self.ctx,
+            ctypes.c_void_p(q_nope), ctypes.c_void_p(q_pe),
+            ctypes.c_void_p(ckv_data), ctypes.c_void_p(kpe_data),
+            ctypes.c_void_p(kv_indices),
+            ctypes.c_void_p(o),
+            ctypes.c_void_p(float_ws), ctypes.c_void_p(int_ws),
+            ctypes.c_void_p(plan_info),
+            ctypes.c_uint32(num_heads), ctypes.c_uint32(page_size),
+            ctypes.c_int(mask_mode), ctypes.c_float(sm_scale),
+            ctypes.c_uint32(q_nope_stride_n), ctypes.c_uint32(q_nope_stride_h),
+            ctypes.c_uint32(q_pe_stride_n), ctypes.c_uint32(q_pe_stride_h),
+            ctypes.c_uint32(ckv_stride_page), ctypes.c_uint32(ckv_stride_n),
+            ctypes.c_uint32(kpe_stride_page), ctypes.c_uint32(kpe_stride_n),
+            ctypes.c_uint32(o_stride_n), ctypes.c_uint32(o_stride_h)
+        )
+
+    def mla_decode_plan(self, float_ws, float_ws_size,
+                        int_ws, pinned_int_ws, int_ws_size,
+                        plan_info, indptr_h,
+                        batch_size, num_qo_heads, page_size,
+                        enable_cuda_graph=False):
+        self.lib.glm_mla_decode_plan(
+            self.ctx,
+            ctypes.c_void_p(float_ws), ctypes.c_size_t(float_ws_size),
+            ctypes.c_void_p(int_ws), ctypes.c_void_p(pinned_int_ws), ctypes.c_size_t(int_ws_size),
+            ctypes.c_void_p(plan_info),
+            ctypes.c_void_p(indptr_h),
+            ctypes.c_uint32(batch_size), ctypes.c_uint32(num_qo_heads),
+            ctypes.c_uint32(page_size), ctypes.c_bool(enable_cuda_graph)
+        )
+
+    def mla_decode_run(self, q_nope, q_pe, ckv_data, kpe_data,
+                       indices, indptr_d, last_page_len,
+                       o, float_ws, int_ws, plan_info,
+                       batch_size, num_qo_heads, page_size, sm_scale):
+        self.lib.glm_mla_decode_run(
+            self.ctx,
+            ctypes.c_void_p(q_nope), ctypes.c_void_p(q_pe),
+            ctypes.c_void_p(ckv_data), ctypes.c_void_p(kpe_data),
+            ctypes.c_void_p(indices), ctypes.c_void_p(indptr_d), ctypes.c_void_p(last_page_len),
+            ctypes.c_void_p(o),
+            ctypes.c_void_p(float_ws), ctypes.c_void_p(int_ws),
+            ctypes.c_void_p(plan_info),
+            ctypes.c_uint32(batch_size), ctypes.c_uint32(num_qo_heads),
+            ctypes.c_uint32(page_size), ctypes.c_float(sm_scale)
+        )
+
+    def mla_kv_cache_append(self, ckv_data, kpe_data,
+                            indices, indptr, last_page_len,
+                            append_ckv, append_kpe,
+                            batch_indices, positions,
+                            nnz, page_size,
+                            head_dim_ckv, head_dim_kpe,
+                            append_ckv_stride_n, append_kpe_stride_n):
+        self.lib.glm_mla_kv_cache_append(
+            self.ctx,
+            ctypes.c_void_p(ckv_data), ctypes.c_void_p(kpe_data),
+            ctypes.c_void_p(indices), ctypes.c_void_p(indptr), ctypes.c_void_p(last_page_len),
+            ctypes.c_void_p(append_ckv), ctypes.c_void_p(append_kpe),
+            ctypes.c_void_p(batch_indices), ctypes.c_void_p(positions),
+            ctypes.c_uint32(nnz), ctypes.c_uint32(page_size),
+            ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe),
+            ctypes.c_size_t(append_ckv_stride_n), ctypes.c_size_t(append_kpe_stride_n)
+        )
+
     def graph_begin_capture(self):
         self.lib.glm_graph_begin_capture(self.ctx)
 
@@ -1020,6 +1182,14 @@ class GlmOps:
             self.ctx,
             self._ptr(bf16_out), self._ptr(bf16_input),
             self._ptr(fp8_weight), self._ptr(weight_scale),
+            m, n, k
+        )
+
+    def nvfp4_linear_decode(self, bf16_out, bf16_input, fp4_weight, weight_scale, weight_scale_2, m, n, k):
+        self.lib.glm_nvfp4_linear_decode(
+            self.ctx,
+            self._ptr(bf16_out), self._ptr(bf16_input),
+            self._ptr(fp4_weight), self._ptr(weight_scale), self._ptr(weight_scale_2),
             m, n, k
         )
 

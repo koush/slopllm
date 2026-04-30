@@ -53,19 +53,20 @@ class TestFP8LinearDecode:
         num_groups_k = k // 128
 
         fp8_w, weight_scales = blockwise_quantize_weight(w_bf16.cpu())
-        weight_scales_f32 = weight_scales.float()
+        weight_scales_bf16 = weight_scales.to(torch.bfloat16)
 
         fp8_w_gpu = glm.alloc(n * k)
-        scales_w_f32_gpu = glm.alloc(num_groups_n * num_groups_k * 4)
+        scales_w_bf16_gpu = glm.alloc(num_groups_n * num_groups_k * 2)
         out_gpu = glm.alloc(m * n * 2)
 
         fp8_w_bytes = fp8_w.view(torch.uint8)
         glm.h2d(fp8_w_gpu, fp8_w_bytes.cpu().numpy().ctypes.data_as(ctypes.c_void_p), n * k)
-        glm.h2d(scales_w_f32_gpu, weight_scales_f32.cpu().numpy().ctypes.data_as(ctypes.c_void_p),
-                num_groups_n * num_groups_k * 4)
+        scales_bf16_bytes = weight_scales_bf16.view(torch.uint16)
+        glm.h2d(scales_w_bf16_gpu, scales_bf16_bytes.cpu().numpy().ctypes.data_as(ctypes.c_void_p),
+                num_groups_n * num_groups_k * 2)
 
         glm.fp8_linear_decode(out_gpu, x_bf16.data_ptr(), fp8_w_gpu,
-                              scales_w_f32_gpu, m, n, k)
+                              scales_w_bf16_gpu, m, n, k)
 
         glm.synchronize()
 
@@ -73,7 +74,7 @@ class TestFP8LinearDecode:
         glm.d2h(out_raw.numpy().ctypes.data_as(ctypes.c_void_p), out_gpu, m * n * 2)
         out_decode = out_raw.view(torch.bfloat16).float()
 
-        for ptr in [fp8_w_gpu, scales_w_f32_gpu, out_gpu]:
+        for ptr in [fp8_w_gpu, scales_w_bf16_gpu, out_gpu]:
             glm.free_buf(ptr)
 
         mean_err = (out_decode - ref_out).abs().mean().item()
@@ -91,25 +92,26 @@ class TestFP8LinearDecode:
         ref_out = torch.nn.functional.linear(x_bf16.cpu().float(), w_bf16.cpu().float())
 
         fp8_w, weight_scales = blockwise_quantize_weight(w_bf16.cpu())
-        weight_scales_f32 = weight_scales.float()
+        weight_scales_bf16 = weight_scales.to(torch.bfloat16)
 
         fp8_w_gpu = glm.alloc(n * k)
-        scales_w_gpu = glm.alloc(1 * 1 * 4)
+        scales_w_bf16_gpu = glm.alloc(1 * 1 * 2)
         out_gpu = glm.alloc(1 * n * 2)
 
         fp8_w_bytes = fp8_w.view(torch.uint8)
         glm.h2d(fp8_w_gpu, fp8_w_bytes.cpu().numpy().ctypes.data_as(ctypes.c_void_p), n * k)
-        glm.h2d(scales_w_gpu, weight_scales_f32.cpu().numpy().ctypes.data_as(ctypes.c_void_p), 4)
+        scales_bf16_bytes = weight_scales_bf16.view(torch.uint16)
+        glm.h2d(scales_w_bf16_gpu, scales_bf16_bytes.cpu().numpy().ctypes.data_as(ctypes.c_void_p), 2)
 
         glm.fp8_linear_decode(out_gpu, x_bf16.data_ptr(), fp8_w_gpu,
-                              scales_w_gpu, 1, n, k)
+                              scales_w_bf16_gpu, 1, n, k)
         glm.synchronize()
 
         out_raw = torch.empty(1, n, dtype=torch.uint16, device='cpu')
         glm.d2h(out_raw.numpy().ctypes.data_as(ctypes.c_void_p), out_gpu, n * 2)
         out_bf16 = out_raw.view(torch.bfloat16)
 
-        for ptr in [fp8_w_gpu, scales_w_gpu, out_gpu]:
+        for ptr in [fp8_w_gpu, scales_w_bf16_gpu, out_gpu]:
             glm.free_buf(ptr)
 
         diff = (out_bf16.float() - ref_out).abs().mean().item()
