@@ -107,7 +107,7 @@ def indexer_forward_cuda(glm, device, hidden_states, q_resid, cos, sin, attentio
 
     q_2d = q_out.reshape(B, S * n_heads, head_dim).contiguous()
     scores_2d = torch.empty(B, S * n_heads, S, dtype=torch.bfloat16, device=device)
-    glm.bmm(scores_2d, q_2d, k_out, softmax_scale, 0.0, B, S * n_heads, S, head_dim, 1)
+    glm.bmm(scores_2d, q_2d, k_out, softmax_scale, 0.0, B, S * n_heads, S, head_dim, 0, 1)
     scores = scores_2d.reshape(B, S, n_heads, S)
 
     scores_flat = scores.reshape(-1)

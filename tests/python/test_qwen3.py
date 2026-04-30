@@ -240,7 +240,7 @@ def qwen3_attention_cuda(glm, device, hidden_states, cos, sin, causal_mask,
     attn_scores = torch.empty(B * num_heads, S, S, dtype=torch.bfloat16, device=device)
     glm.bmm(attn_scores, q_rope.reshape(B * num_heads, S, head_dim),
             k_expanded.reshape(B * num_heads, S, head_dim),
-            scaling, 0.0, B * num_heads, S, S, head_dim, 1)
+            scaling, 0.0, B * num_heads, S, S, head_dim, 0, 1)
 
     if causal_mask is not None:
         mask_expanded = torch.empty(B, num_heads, S, S, dtype=torch.bfloat16, device=device)
