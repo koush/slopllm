@@ -56,14 +56,14 @@ describe("Qwen3-0.6B-FP8 model", () => {
     assert.ok(qWeight.name!.endsWith("_scale_inv") === false, "weight name should not end with _scale_inv");
 
     const qScale = model.tensors.get("model.layers.0.self_attn.q_proj.weight_scale_inv")!;
-    assert.equal(qScale.type, "F32", "q_proj scale should be F32");
+    assert.equal(qScale.type, "BF16", "q_proj scale should be BF16");
     assert.deepEqual(qScale.shape, [2048 / 128, 1024 / 128], "q_proj scale shape should be [16, 8]");
 
     const gateWeight = model.tensors.get("model.layers.0.mlp.gate_proj.weight")!;
     assert.equal(gateWeight.type, "F8_E4M3", "gate_proj weight should be F8_E4M3");
 
     const gateScale = model.tensors.get("model.layers.0.mlp.gate_proj.weight_scale_inv")!;
-    assert.equal(gateScale.type, "F32", "gate_proj scale should be F32");
+    assert.equal(gateScale.type, "BF16", "gate_proj scale should be BF16");
     assert.deepEqual(gateScale.shape, [3072 / 128, 1024 / 128], "gate_proj scale shape should be [24, 8]");
 
     const norm = model.tensors.get("model.layers.0.input_layernorm.weight")!;
