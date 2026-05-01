@@ -1,4 +1,5 @@
 import ctypes
+import gc
 import json
 import os
 
@@ -83,7 +84,7 @@ def qwen35_model(glm):
     model = Qwen35Model.from_pretrained(glm, QWEN35_REPO, max_batch=1, max_seq_len=64)
     yield model
     model.free()
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="module")
@@ -490,4 +491,4 @@ def test_qwen35_generate_paris(glm):
         gdn_state.free()
 
     model.free()
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()

@@ -1,4 +1,5 @@
 import pytest
+import gc
 import torch
 import sys
 import os
@@ -14,8 +15,17 @@ def glm():
     ops = GlmOps(device_id=GPU_ID)
     yield ops
     del ops
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture
 def device():
     return torch.device(f"cuda:{GPU_ID}")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _gc_between_modules():
+    yield
+    gc.collect()
+    torch.cuda.empty_cache()

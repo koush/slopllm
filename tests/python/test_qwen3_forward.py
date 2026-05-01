@@ -1,3 +1,4 @@
+import gc
 import pytest
 import torch
 from helpers import GlmOps, has_model_cached
@@ -21,7 +22,7 @@ def qwen3_model(glm):
     model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=1, max_seq_len=16)
     yield model
     model.free()
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
 
 def test_qwen3_forward_vs_reference(qwen3_model, glm):
@@ -62,7 +63,7 @@ def test_qwen3_forward_vs_hf(glm):
 
     model.free()
     del model
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
     hf_model = AutoModelForCausalLM.from_pretrained(
         QWEN3_REPO, torch_dtype=torch.bfloat16, device_map=device
@@ -83,7 +84,7 @@ def test_qwen3_forward_vs_hf(glm):
     assert our_top5 == hf_top5, f"Top-5 mismatch: ours={our_top5}, hf={hf_top5}"
 
     del hf_model
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
 
 def test_qwen3_forward_multitoken(glm):
@@ -111,7 +112,7 @@ def test_qwen3_forward_multitoken(glm):
     del weights
     model.free()
     del model
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
 
 def test_qwen3_prefill_vs_forward(qwen3_model, glm):
@@ -195,7 +196,7 @@ def test_qwen3_prefill_decode(glm):
     del weights
     model.free()
     del model
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
 
 def test_qwen3_prefill_decode_vs_hf(glm):
@@ -229,7 +230,7 @@ def test_qwen3_prefill_decode_vs_hf(glm):
 
     model.free()
     del model
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
     hf_model = AutoModelForCausalLM.from_pretrained(
         QWEN3_REPO, torch_dtype=torch.bfloat16, device_map=device
@@ -262,7 +263,7 @@ def test_qwen3_prefill_decode_vs_hf(glm):
             f"Decode step {step}: Top-1 mismatch: decode={decode_top1}, hf={hf_top1}"
 
     del hf_model
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
 
 def test_qwen3_generate(glm):
@@ -285,7 +286,7 @@ def test_qwen3_generate(glm):
         cache.free()
 
     model.free()
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
 
 def test_qwen3_generate_tokens(glm):
@@ -308,7 +309,7 @@ def test_qwen3_generate_tokens(glm):
         cache.free()
 
     model.free()
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
 
 def test_qwen3_generate_text(glm):
@@ -329,7 +330,7 @@ def test_qwen3_generate_text(glm):
         cache.free()
 
     model.free()
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
 
 def test_qwen3_flash_vs_bmm_attention(glm):
@@ -356,4 +357,4 @@ def test_qwen3_flash_vs_bmm_attention(glm):
     assert flash_top5 == bmm_top5, f"Top-5 mismatch: flash={flash_top5}, bmm={bmm_top5}"
 
     model.free()
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
