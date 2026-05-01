@@ -37,6 +37,7 @@ interface CliArgs {
   useQwen35: boolean;
   useGlm51: boolean;
   useFp8: boolean;
+  useNvfp4: boolean;
   useBatch: boolean;
   modelDir: string | undefined;
   noCudaGraph: boolean;
@@ -64,6 +65,7 @@ function parseArgs(argv: string[]): CliArgs {
     useQwen35: false,
     useGlm51: false,
     useFp8: false,
+    useNvfp4: false,
     useBatch: false,
     noCudaGraph: false,
     temperature: 0.6,
@@ -90,6 +92,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--glm51") args.useGlm51 = true;
     else if (a === "--model-dir" && i + 1 < argv.length) args.modelDir = argv[++i];
     else if (a === "--fp8") args.useFp8 = true;
+    else if (a === "--nvfp4") args.useNvfp4 = true;
     else if (a === "--batch") args.useBatch = true;
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
     else if (a === "--temperature" && i + 1 < argv.length) args.temperature = parseFloat(argv[++i]);
@@ -111,6 +114,13 @@ function parseArgs(argv: string[]): CliArgs {
     console.error("Error: --fp8 is not supported with --glm51");
     process.exit(1);
   }
+  if (args.useNvfp4 && !args.useGlm51) {
+    console.error("Error: --nvfp4 is only supported with --glm51");
+    process.exit(1);
+  }
+  if (args.useNvfp4) {
+    args.noCudaGraph = true;
+  }
 
   if (args.useQwen35 && args.temperature > 0 && args.topP === 0.95 && args.topK === 0 && args.repetitionPenalty === 1.0 && args.presencePenalty === 0) {
     args.topK = 20;
@@ -122,7 +132,7 @@ function parseArgs(argv: string[]): CliArgs {
 
 function modelLabel(args: CliArgs): string {
   if (args.useQwen35) return "Qwen3.5-0.8B";
-  if (args.useGlm51) return "GLM-5.1";
+  if (args.useGlm51) return args.useNvfp4 ? "GLM-5.1-NVFP4" : "GLM-5.1";
   return args.useFp8 ? "Qwen3-0.6B-FP8" : "Qwen3-0.6B";
 }
 
@@ -382,12 +392,12 @@ async function interactiveChat(
       const generatedIds: number[] = [];
       const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-      for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing)) {
-        generatedIds.push(tokenId);
-        tokCount++;
-        const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
-        process.stdout.write(chunk);
-        if (eosIds.has(tokenId)) break;
+    for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing)) {
+    generatedIds.push(tokenId);
+    tokCount++;
+    const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
+    process.stdout.write(chunk);
+    if (eosIds.has(tokenId)) break;
       }
 
       const elapsed = performance.now() - t0;
@@ -518,7 +528,9 @@ async function main(): Promise<void> {
     : args.useQwen35 ? QWEN35_REPO
     : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
 
-  const modelDir = args.modelDir ?? (args.useGlm51 ? "tests/python/test_models/glm51_small/glm51_small_bf16" : resolveModelPath(repoId));
+  const modelDir = args.modelDir ?? (args.useGlm51
+    ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
+    : resolveModelPath(repoId));
   const model: ChatModel = args.useGlm51
     ? Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
     : args.useQwen35

@@ -334,7 +334,8 @@ export class ParallelTensor extends Tensor {
     super.linear(weight, batch);
     const pWeight = weight as ParallelTensor;
     const n = weight.shape[0];
-    const k = weight.shape[1];
+    let k = weight.shape[1];
+    if (weight.type === "U8") k = k * 2; // NVFP4: weight is [N, K/2] packed, kernel expects K
     const outPar = ParallelOps.linearOutputParallelism(pWeight.parallelism, this.parallelism);
 
     if (weight.type === "F8_E4M3") {

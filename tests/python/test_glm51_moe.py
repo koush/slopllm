@@ -93,10 +93,17 @@ def run_moe_cuda(glm, cfg, layer, post_normed_gpu, B, S):
     logits = torch.sigmoid(gate_logits_f32)
 
     bias_gpu = _upload_tensor(glm, layer.mlp.e_score_correction_bias)
-    bias_bytes = torch.empty(num_experts, dtype=torch.uint16, device="cpu")
-    glm.d2h(bias_bytes.numpy().ctypes.data_as(ctypes.c_void_p),
-             bias_gpu.data_ptr(), num_experts * 2)
-    bias_f32 = _bf16_to_f32(bias_bytes.view(torch.bfloat16))
+    bias_dtype = layer.mlp.e_score_correction_bias.dtype
+    if bias_dtype == torch.float32:
+        bias_bytes = torch.empty(num_experts, dtype=torch.float32, device="cpu")
+        glm.d2h(bias_bytes.numpy().ctypes.data_as(ctypes.c_void_p),
+                 bias_gpu.data_ptr(), num_experts * 4)
+        bias_f32 = bias_bytes
+    else:
+        bias_bytes = torch.empty(num_experts, dtype=torch.uint16, device="cpu")
+        glm.d2h(bias_bytes.numpy().ctypes.data_as(ctypes.c_void_p),
+                 bias_gpu.data_ptr(), num_experts * 2)
+        bias_f32 = _bf16_to_f32(bias_bytes.view(torch.bfloat16))
 
     logits_corrected = logits + bias_f32.unsqueeze(0)
 

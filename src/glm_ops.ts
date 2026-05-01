@@ -161,13 +161,14 @@ export class GlmTensor extends Tensor {
   linear(weight: Tensor, batch: number): Tensor {
     super.linear(weight, batch);
     const n = weight.shape[0];
-    const k = weight.shape[1];
+    let k = weight.shape[1];
     const outShape = [batch, n];
     const out = this.workspace.alloc(outShape, this.type);
     if (weight.type === "F8_E4M3") {
       const scale = weight.workspace.tensors.get(weight.name! + "_scale_inv")!;
       getNativeAddon().fp8LinearDecode(this.glm.ctx, out.data, this.data, weight.data, scale.data, batch, n, k);
     } else if (weight.type === "U8") {
+      k = k * 2; // NVFP4: weight is [N, K/2] packed, kernel expects K
       const scale = weight.workspace.tensors.get(weight.name! + "_weight_scale")!;
       const scale2 = weight.workspace.tensors.get(weight.name! + "_weight_scale_2")!;
       getNativeAddon().nvfp4LinearDecode(this.glm.ctx, out.data, this.data, weight.data, scale.data, scale2.data, batch, n, k);

@@ -120,7 +120,8 @@ export abstract class Tensor implements Disposable {
     if (this.shape.length !== 2) throw new Error(`linear: input must be 2D, got shape [${this.shape}]`);
     if (weight.shape.length !== 2) throw new Error(`linear: weight must be 2D, got shape [${weight.shape}]`);
     if (this.shape[0] < batch) throw new Error(`linear: input batch ${this.shape[0]} < ${batch}`);
-    if (this.shape[1] !== weight.shape[1]) throw new Error(`linear: input dim ${this.shape[1]} != weight dim ${weight.shape[1]}`);
+    const weightK = weight.type === "U8" ? weight.shape[1] * 2 : weight.shape[1]; // NVFP4: packed K/2
+    if (this.shape[1] !== weightK) throw new Error(`linear: input dim ${this.shape[1]} != weight dim ${weightK} (weight type ${weight.type}, shape [${weight.shape}])`);
     if (weight.type !== "BF16" && weight.type !== "F8_E4M3" && weight.type !== "U8") throw new Error(`linear: weight type must be BF16, F8_E4M3, or U8, got ${weight.type}`);
     return undefined as never;
   }
