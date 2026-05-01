@@ -869,3 +869,97 @@ class TestHuggingFaceModel:
 
         assert mean_diff < mean_abs * 0.15, f"Mean diff {mean_diff:.4f} > 15% of ref mean {mean_abs:.4f}"
         assert max_diff < mean_abs * 2.0, f"Max diff {max_diff:.4f} > 2x ref mean {mean_abs:.4f}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestCudaVsHuggingFace:
+    def test_cuda_forward_vs_hf(self, glm, device, cfg):
+        """CUDA forward pass vs HuggingFace Transformers output."""
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(
+            str(REFERENCE_DIR / "glm51_small_bf16"),
+            dtype=torch.bfloat16,
+            device_map="cpu",
+        )
+
+        B, S = 1, 4
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, min(cfg["vocab_size"], 1000), (B, S))
+
+        with torch.no_grad():
+            hf_logits = model(input_ids).logits
+
+        qk_rope_dim = cfg["qk_rope_head_dim"]
+        cos, sin = _make_rotary_embed(glm, device, qk_rope_dim // 2, B, S)
+
+        causal_mask = torch.empty(S, S, dtype=torch.bfloat16, device=device)
+        glm.causal_mask(causal_mask, S)
+
+        ref_model_local = Glm51SmallModel()
+        hidden_gpu = _upload_tensor(glm, ref_model_local.embed(input_ids))
+
+        for i in range(cfg["num_hidden_layers"]):
+            layer = ref_model_local.layers[i]
+            ln_w_gpu = _upload_tensor(glm, layer.input_layernorm_w)
+            post_ln_w_gpu = _upload_tensor(glm, layer.post_attention_layernorm_w)
+
+            normed_gpu = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
+            glm.rmsnorm(normed_gpu, hidden_gpu, ln_w_gpu, cfg["rms_norm_eps"], cfg["hidden_size"], B * S)
+
+            attn_out_gpu = _cuda_mla_attention_bmm(
+                glm, device, layer, normed_gpu, cos, sin, causal_mask, B, S, cfg)
+
+            residual_gpu = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
+            glm.add(residual_gpu, hidden_gpu, attn_out_gpu, B * S * cfg["hidden_size"])
+
+            post_normed_gpu = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
+            glm.rmsnorm(post_normed_gpu, residual_gpu, post_ln_w_gpu, cfg["rms_norm_eps"], cfg["hidden_size"], B * S)
+
+            if layer.is_sparse:
+                mlp_out_gpu = _run_moe_cuda(glm, cfg, layer, post_normed_gpu, B, S)
+            else:
+                mlp_out_gpu = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
+                intermediate = cfg["intermediate_size"]
+                gate_out = torch.empty(B * S, intermediate, dtype=torch.bfloat16, device=device)
+                up_out = torch.empty(B * S, intermediate, dtype=torch.bfloat16, device=device)
+                inter = torch.empty(B * S, intermediate, dtype=torch.bfloat16, device=device)
+                glm.linear(gate_out, post_normed_gpu, _upload_tensor(glm, layer.mlp.gate_proj_w),
+                           B * S, intermediate, cfg["hidden_size"])
+                glm.linear(up_out, post_normed_gpu, _upload_tensor(glm, layer.mlp.up_proj_w),
+                           B * S, intermediate, cfg["hidden_size"])
+                glm.silu_and_mul(inter, gate_out, up_out, intermediate, B * S)
+                glm.linear(mlp_out_gpu, inter, _upload_tensor(glm, layer.mlp.down_proj_w),
+                           B * S, cfg["hidden_size"], intermediate)
+
+            hidden_gpu = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
+            glm.add(hidden_gpu, residual_gpu, mlp_out_gpu, B * S * cfg["hidden_size"])
+
+        norm_w_gpu = _upload_tensor(glm, ref_model_local.norm_w)
+        final_normed = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
+        glm.rmsnorm(final_normed, hidden_gpu, norm_w_gpu, cfg["rms_norm_eps"], cfg["hidden_size"], B * S)
+
+        lm_head_gpu = _upload_tensor(glm, ref_model_local.embed_tokens_w)
+        logits_gpu = torch.empty(B * S, cfg["vocab_size"], dtype=torch.bfloat16, device=device)
+        glm.linear(logits_gpu, final_normed, lm_head_gpu, B * S, cfg["vocab_size"], cfg["hidden_size"])
+        glm.synchronize()
+
+        cuda_logits = logits_gpu.cpu().view(B, S, cfg["vocab_size"]).float()
+        hf_f = hf_logits.float()
+        max_diff = (cuda_logits - hf_f).abs().max().item()
+        mean_diff = (cuda_logits - hf_f).abs().mean().item()
+        mean_abs = hf_f.abs().mean().item()
+        print(f"  CUDA vs HF: max_diff={max_diff:.4f}, mean_diff={mean_diff:.4f}, mean_abs={mean_abs:.4f}")
+
+        assert max_diff < mean_abs * 10.0, f"Max diff {max_diff:.4f} > 10x mean_abs {mean_abs:.4f}"
+
+        cuda_top1 = cuda_logits[0, -1].topk(1).indices.tolist()
+        hf_top1 = hf_f[0, -1].topk(1).indices.tolist()
+        print(f"  CUDA top-1: {cuda_top1}, HF top-1: {hf_top1}")
+        assert cuda_top1 == hf_top1, f"Top-1 mismatch: cuda={cuda_top1}, hf={hf_top1}"
+
+        cuda_top5 = cuda_logits[0, -1].topk(5).indices.tolist()
+        hf_top5 = hf_f[0, -1].topk(5).indices.tolist()
+        top5_overlap = len(set(cuda_top5) & set(hf_top5))
+        print(f"  CUDA top-5: {cuda_top5}, HF top-5: {hf_top5}, overlap: {top5_overlap}/5")
+        assert top5_overlap >= 2, f"Top-5 overlap too low: {top5_overlap}/5"
