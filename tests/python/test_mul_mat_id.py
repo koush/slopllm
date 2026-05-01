@@ -280,7 +280,8 @@ class TestScatterAddRows:
             input_bf16.data_ptr(),
             scales.data_ptr(),
             batch_ids.data_ptr(),
-            dim, count
+            dim, count, rows_out,
+            0  # workspace (unused)
         )
 
         ref = torch.zeros(rows_out, dim, dtype=torch.float32, device=device)
@@ -288,7 +289,7 @@ class TestScatterAddRows:
             bid = batch_ids[i].item()
             ref[bid] += scales[i].float() * input_bf16[i].float()
 
-        torch.testing.assert_close(out.cpu().float(), ref.cpu(), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(out.cpu().float(), ref.cpu(), atol=1e-2, rtol=1e-2)
 
     def test_scatter_add_rows_single_batch(self, glm, device):
         rows_out = 1
@@ -305,14 +306,15 @@ class TestScatterAddRows:
             input_bf16.data_ptr(),
             scales.data_ptr(),
             batch_ids.data_ptr(),
-            dim, count
+            dim, count, rows_out,
+            0  # workspace (unused)
         )
 
         ref = torch.zeros(rows_out, dim, dtype=torch.float32, device=device)
         for i in range(count):
             ref[0] += scales[i].float() * input_bf16[i].float()
 
-        torch.testing.assert_close(out.cpu().float(), ref.cpu(), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(out.cpu().float(), ref.cpu(), atol=1e-2, rtol=1e-2)
 
     def test_scatter_add_rows_moe_routing(self, glm, device):
         BS = 4
@@ -330,7 +332,8 @@ class TestScatterAddRows:
             input_bf16.data_ptr(),
             scales.data_ptr(),
             batch_ids.data_ptr(),
-            hs, count
+            hs, count, BS,
+            0  # workspace (unused)
         )
 
         ref = torch.zeros(BS, hs, dtype=torch.float32, device=device)
@@ -338,4 +341,4 @@ class TestScatterAddRows:
             bid = batch_ids[i].item()
             ref[bid] += scales[i].float() * input_bf16[i].float()
 
-        torch.testing.assert_close(out.cpu().float(), ref.cpu(), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(out.cpu().float(), ref.cpu(), atol=1e-2, rtol=1e-2)

@@ -6,7 +6,6 @@ import { DeviceOps, TensorParallelism } from "./device_ops";
 import { bf16BytesToF32, f32ToBf16Bytes, getNativeAddon, GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { ExecutionState, ExecutionWorkspace, PagedKVCache } from "./paged_kv";
-import { WorkspaceBase } from "./workspace";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
@@ -122,6 +121,7 @@ export class Glm51Model extends ChatModel {
   maxBatch: number;
   maxSeqLen: number;
   invFreq: Tensor;
+  private moeAuxReady = false;
 
   private constructor(glm: DeviceOps, config: Glm51Config, maxBatch: number, maxSeqLen: number) {
     super(glm);
@@ -300,6 +300,8 @@ export class Glm51Model extends ChatModel {
       const wAbsorbed = this.alloc([nHeads * kvLoraRank, qLoraRank], "BF16", absorbedName, TensorParallelism.Column);
       this.glm.bmm(wAbsorbed.data, kNopeProj.data, qNopeProj.data, 1.0, 0.0, nHeads, kvLoraRank, qLoraRank, qkNopeDim, 1, 0);
     }
+
+    this.initMoeAuxBuffers();
   }
 
   createChatCache(maxPages = 256): ChatCache {
@@ -313,14 +315,56 @@ export class Glm51Model extends ChatModel {
     return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
   }
 
-  private createExpertWeightPtrs(pfx: string, projection: string, numExperts: number, ws: WorkspaceBase): Tensor {
+  private initMoeAuxBuffers(): void {
+    if (this.moeAuxReady) return;
+    this.moeAuxReady = true;
+    const cfg = this.cfg;
+    const numExperts = cfg.nRoutedExperts;
+    const topK = cfg.numExpertsPerTok;
+
+    for (let i = 0; i < cfg.numHiddenLayers; i++) {
+      const pfx = `${Glm51Model.WEIGHT_PREFIX}${i}`;
+      if (!this.tensors.has(`${pfx}.mlp.experts.0.gate_proj.weight`)) continue;
+
+      for (const proj of ["gate_proj", "up_proj", "down_proj"]) {
+        const ptrs = new BigInt64Array(numExperts);
+        for (let e = 0; e < numExperts; e++) {
+          ptrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight`)!.data);
+        }
+        const name = `__moe_ptrs.${pfx}.${proj}`;
+        const buf = this.alloc([numExperts], "I64", name);
+        buf.h2d(Buffer.from(ptrs.buffer));
+      }
+    }
+
+    const count = this.maxBatch * topK;
+    const batchIdsArr = new Int32Array(count);
+    for (let i = 0; i < count; i++) batchIdsArr[i] = Math.floor(i / topK);
+    const batchIdsBuf = this.alloc([count], "I32", "__moe_batch_ids");
+    batchIdsBuf.h2d(Buffer.from(batchIdsArr.buffer));
+
+    const downBatchIdsArr = new Int32Array(count);
+    for (let i = 0; i < count; i++) downBatchIdsArr[i] = i;
+    const downBatchIdsBuf = this.alloc([count], "I32", "__moe_down_batch_ids");
+    downBatchIdsBuf.h2d(Buffer.from(downBatchIdsArr.buffer));
+
+    const allZeroIndices = new Int32Array(this.maxBatch).fill(0);
+    const allZeroIdxBuf = this.alloc([this.maxBatch], "I32", "__moe_all_zero_idx");
+    allZeroIdxBuf.h2d(Buffer.from(allZeroIndices.buffer));
+  }
+
+  private createExpertWeightPtrs(pfx: string, projection: string): Tensor {
+    const name = `__moe_ptrs.${pfx}.${projection}`;
+    const existing = this.tensors.get(name);
+    if (existing) return existing;
+    const numExperts = this.cfg.nRoutedExperts;
     const ptrs = new BigInt64Array(numExperts);
     for (let e = 0; e < numExperts; e++) {
       ptrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${projection}.weight`)!.data);
     }
-    const ptrsBuf = ws.alloc([numExperts], "I64");
-    ptrsBuf.h2d(Buffer.from(ptrs.buffer));
-    return ptrsBuf;
+    const buf = this.alloc([numExperts], "I64", name);
+    buf.h2d(Buffer.from(ptrs.buffer));
+    return buf;
   }
 
   private mlpSparse(normed: Tensor, pfx: string, BS: number): Tensor {
@@ -342,9 +386,7 @@ export class Glm51Model extends ChatModel {
     const eScoreBias = this.tensors.get(`${pfx}.mlp.gate.e_score_correction_bias`);
     if (eScoreBias) {
       using biasBuf = ws.alloc([BS, numExperts], "BF16");
-      const allZeroIndices = new Int32Array(BS).fill(0);
-      using allZeroIdxBuf = ws.alloc([BS], "I32");
-      allZeroIdxBuf.h2d(Buffer.from(allZeroIndices.buffer));
+      const allZeroIdxBuf = this.tensors.get("__moe_all_zero_idx")!;
       getNativeAddon().indexSelect((this.glm as GlmOps).ctx, biasBuf.data, eScoreBias.data, allZeroIdxBuf.data, numExperts, BS);
       topkInput = gateSigmoid.add(biasBuf, BS * numExperts);
       topkInputHolder.replace(topkInput);
@@ -381,30 +423,22 @@ export class Glm51Model extends ChatModel {
     const count = BS * topK;
     const topkIndicesFlat = topkIndices.reshape([count]);
 
-    const batchIdsArr = new Int32Array(count);
-    for (let i = 0; i < count; i++) batchIdsArr[i] = Math.floor(i / topK);
-    using batchIdsBuf = ws.alloc([count], "I32");
-    batchIdsBuf.h2d(Buffer.from(batchIdsArr.buffer));
+    const batchIdsBuf = this.tensors.get("__moe_batch_ids")!;
+    const downBatchIdsBuf = this.tensors.get("__moe_down_batch_ids")!;
 
-    using gateWeightPtrs = this.createExpertWeightPtrs(pfx, "gate_proj", numExperts, ws);
-    using upWeightPtrs = this.createExpertWeightPtrs(pfx, "up_proj", numExperts, ws);
-    using downWeightPtrs = this.createExpertWeightPtrs(pfx, "down_proj", numExperts, ws);
+    const gateWeightPtrs = this.createExpertWeightPtrs(pfx, "gate_proj");
+    const upWeightPtrs = this.createExpertWeightPtrs(pfx, "up_proj");
+    const downWeightPtrs = this.createExpertWeightPtrs(pfx, "down_proj");
 
     using gateOut = normed.mulMatId(normed, gateWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
     using upOut = normed.mulMatId(normed, upWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
     using siluOut = gateOut.siluAndMul(gateOut, upOut, moeIntermediate, count);
 
-    const downBatchIdsArr = new Int32Array(count);
-    for (let i = 0; i < count; i++) downBatchIdsArr[i] = i;
-    using downBatchIdsBuf = ws.alloc([count], "I32");
-    downBatchIdsBuf.h2d(Buffer.from(downBatchIdsArr.buffer));
-
     using downOut = siluOut.mulMatId(siluOut, downWeightPtrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
 
     using routedOut = ws.alloc([BS, hs], "BF16");
-    routedOut.fill(0, BS * hs);
     using normalizedWeightsFlat = normalizedWeights.reshape([count]);
-    routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIdsBuf, hs, count);
+    routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIdsBuf, hs, count, BS);
 
     using sharedGateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS);
     using sharedUpBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.up_proj.weight`)!, BS);

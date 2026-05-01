@@ -1880,34 +1880,59 @@ void glm_decode_step(GlmCtx* ctx,
 //     out[batch_ids[i], d] += scales[i] * input[i, d]  for all d
 // ---------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(256, 4) scatter_add_rows_kernel(
+__global__ void __launch_bounds__(256) scatter_add_rows_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* scales,
     const int* batch_ids,
     int dim, int count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = count * dim;
+    if (idx >= dim) return;
+    float accum = 0.0f;
+    for (int i = 0; i < count; i++) {
+        accum += __bfloat162float(scales[i]) * __bfloat162float(input[(size_t)i * dim + idx]);
+    }
+    out[idx] = __float2bfloat16(accum);
+}
+
+__global__ void __launch_bounds__(256, 4) scatter_add_rows_batched_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* scales,
+    const int* batch_ids,
+    int dim, int count, int num_rows) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_rows * dim;
     if (idx >= total) return;
-    int i = idx / dim;
+    int row = idx / dim;
     int d = idx % dim;
-    int row = batch_ids[i];
-    float scale_val = __bfloat162float(scales[i]);
-    float input_val = __bfloat162float(input[idx]);
-    __nv_bfloat16 add_val = __float2bfloat16(scale_val * input_val);
-    atomicAdd(out + (size_t)row * dim + d, add_val);
+    float accum = 0.0f;
+    for (int i = 0; i < count; i++) {
+        if (batch_ids[i] == row) {
+            accum += __bfloat162float(scales[i]) * __bfloat162float(input[(size_t)i * dim + d]);
+        }
+    }
+    out[idx] = __float2bfloat16(accum);
 }
 
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
                             const void* scales, const int* batch_ids,
-                            int dim, int count) {
+                            int dim, int count, int num_rows, void* workspace) {
     cudaSetDevice(ctx->device_id);
-    int total = count * dim;
+    (void)workspace;
     int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
-    scatter_add_rows_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-        (const __nv_bfloat16*)scales, batch_ids, dim, count);
+    if (num_rows == 1) {
+        int grid = (dim + block_size - 1) / block_size;
+        scatter_add_rows_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+            (const __nv_bfloat16*)scales, batch_ids, dim, count);
+    } else {
+        int total = num_rows * dim;
+        int grid = (total + block_size - 1) / block_size;
+        scatter_add_rows_batched_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+            (const __nv_bfloat16*)scales, batch_ids, dim, count, num_rows);
+    }
 }
 
 

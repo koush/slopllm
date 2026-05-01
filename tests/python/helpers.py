@@ -669,7 +669,8 @@ class GlmOps:
         self.lib.glm_scatter_add_rows.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p,
         ]
 
     def __del__(self):
@@ -1433,12 +1434,13 @@ class GlmOps:
             count, N, K
         )
 
-    def scatter_add_rows(self, out, input, scales, batch_ids, dim, count):
+    def scatter_add_rows(self, out, input, scales, batch_ids, dim, count, num_rows, workspace):
         self.lib.glm_scatter_add_rows(
             self.ctx,
             self._ptr(out),
             self._ptr(input),
             self._ptr(scales),
             self._ptr(batch_ids),
-            dim, count
+            dim, count, num_rows,
+            self._ptr(workspace)
         )

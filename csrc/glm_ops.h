@@ -169,7 +169,7 @@ void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
 
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
                             const void* scales, const int* batch_ids,
-                            int dim, int count);
+                            int dim, int count, int num_rows, void* workspace);
 
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
                        const void* indices, int dim, int k);
