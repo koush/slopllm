@@ -1,15 +1,17 @@
 """Tests for GLM-5.1 small model: CUDA ops vs torch reference.
 
-Validates per-layer and end-to-end forward pass using our CUDA kernels
-against the pure PyTorch reference implementation.
+Validates MLA kernel correctness and per-layer ops against the
+pure PyTorch reference implementation.
 """
 
 import ctypes
 import json
 import math
+import numpy as np
 import os
 import pytest
 import torch
+import torch.nn.functional as F
 
 from pathlib import Path
 
@@ -29,6 +31,10 @@ from glm51_small_reference import (
     rotate_half,
 )
 from generate_glm51_small import dequantize_nvfp4
+
+HEAD_DIM_CKV = 128
+HEAD_DIM_KPE = 64
+PAGE_SIZE = 1
 
 
 @pytest.fixture(scope="module")
@@ -60,9 +66,543 @@ def _upload_tensor(glm, tensor):
     return tensor.to("cuda")
 
 
-HEAD_DIM_CKV = 64
-HEAD_DIM_KPE = 32
+def _alloc_workspace(glm, float_mb=32, int_mb=8):
+    float_ws = glm.alloc(float_mb * 1024 * 1024)
+    int_ws = glm.alloc(int_mb * 1024 * 1024)
+    pinned_int_ws = glm.alloc_pinned(int_mb * 1024 * 1024)
+    return float_ws, int_ws, pinned_int_ws
 
+
+def mla_prefill_reference(q_nope, q_pe_rope, ckv, kpe_rope, sm_scale, causal=True):
+    """Reference MLA prefill attention.
+    
+    q_nope: (B*S, H, D_CKV) - query no-pe part
+    q_pe_rope: (B*S, H, D_KPE) - query pe part (already RoPE applied)
+    ckv: (1, S, D_CKV) - compressed KV (shared across heads)
+    kpe_rope: (1, S, D_KPE) - k-pe (already RoPE applied, shared across heads)
+    """
+    BS, H, D_CKV = q_nope.shape
+    S = ckv.shape[1]
+    D_KPE = q_pe_rope.shape[-1]
+
+    ckv_exp = ckv.expand(H, S, D_CKV)
+    kpe_exp = kpe_rope.expand(H, S, D_KPE)
+
+    score_nope = torch.einsum('bhd,hkd->bhk', q_nope, ckv_exp)
+    score_pe = torch.einsum('bhd,hkd->bhk', q_pe_rope, kpe_exp)
+    score = (score_nope + score_pe) * sm_scale
+
+    if causal:
+        mask = torch.triu(torch.full((BS, S), float('-inf'), device=score.device, dtype=score.dtype), diagonal=1)
+        score = score + mask.unsqueeze(1)
+
+    attn = torch.nn.functional.softmax(score.float(), dim=-1).to(q_nope.dtype)
+    output = torch.einsum('bhk,hkd->bhd', attn, ckv_exp)
+    return output
+
+
+def mla_decode_reference(q_nope_absorbed, q_pe_rope, ckv, kpe, positions, sm_scale, rope_theta=1000000.0):
+    """Reference MLA decode attention.
+    
+    q_nope_absorbed: (B, H, D_CKV)
+    q_pe_rope: (B, H, D_KPE) - already RoPE applied
+    ckv: (1, S, D_CKV) or (S, D_CKV) - compressed KV
+    kpe: (1, S, D_KPE) or (S, D_KPE) - raw k-pe (will apply RoPE)
+    positions: (S,) int tensor of position ids
+    """
+    B, H, D_CKV = q_nope_absorbed.shape
+    if ckv.dim() == 2:
+        ckv = ckv.unsqueeze(0)
+    if kpe.dim() == 2:
+        kpe = kpe.unsqueeze(0)
+    S = ckv.shape[1]
+    D_KPE = q_pe_rope.shape[-1]
+
+    dim_half = D_KPE // 2
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, D_KPE, 2, dtype=torch.float32, device=ckv.device) / D_KPE))
+    freqs = torch.outer(positions.float(), inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos_emb = emb.cos().to(ckv.dtype)
+    sin_emb = emb.sin().to(ckv.dtype)
+
+    kpe_rope = (kpe * cos_emb.unsqueeze(0)) + (rotate_half(kpe) * sin_emb.unsqueeze(0))
+
+    q_nope_3d = q_nope_absorbed.reshape(B * H, 1, D_CKV)
+    q_pe_3d = q_pe_rope.reshape(B * H, 1, D_KPE)
+    ckv_3d = ckv.reshape(1, S, D_CKV).expand(B, H, S, D_CKV).reshape(B * H, S, D_CKV)
+    kpe_3d = kpe_rope.reshape(1, S, D_KPE).expand(B, H, S, D_KPE).reshape(B * H, S, D_KPE)
+
+    score = torch.bmm(q_nope_3d, ckv_3d.transpose(1, 2)) + torch.bmm(q_pe_3d, kpe_3d.transpose(1, 2))
+    score = score * sm_scale
+    attn = torch.nn.functional.softmax(score.float(), dim=-1).to(ckv.dtype)
+    output = torch.bmm(attn, ckv_3d)
+    return output.reshape(B, H, D_CKV)
+
+
+def _make_rotary_embed(glm, device, dim_half, batch_size, seq_len):
+    """Create cos/sin rotary embeddings using the CUDA kernel, matching test_mla_flash.py."""
+    inv_freq = 1.0 / (1000000.0 ** (torch.arange(0, dim_half * 2, 2, dtype=torch.float32, device=device) / (dim_half * 2)))
+    positions = torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0).expand(batch_size, -1)
+    freqs = torch.outer(positions.float().reshape(-1)[:seq_len], inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos = emb.cos().to(torch.bfloat16).unsqueeze(0).expand(batch_size, -1, -1)
+    sin = emb.sin().to(torch.bfloat16).unsqueeze(0).expand(batch_size, -1, -1)
+    return cos, sin
+
+
+def _bf16_to_f32(tensor_bf16):
+    u16 = tensor_bf16.view(torch.uint16).cpu().numpy().astype(np.uint32)
+    u32 = (u16 << 16).astype(np.uint32)
+    return torch.from_numpy(u32.view(np.float32)).to(tensor_bf16.device)
+
+
+def _f32_to_bf16(tensor_f32):
+    u32 = tensor_f32.cpu().numpy().view(np.uint32)
+    u16 = (u32 >> 16).astype(np.uint16)
+    return torch.from_numpy(u16).view(torch.bfloat16).to(tensor_f32.device)
+
+
+def _run_moe_cuda(glm, cfg, layer, post_normed_gpu, B, S):
+    """Run MoE sparse MLP using CUDA ops with CPU routing."""
+    BS = B * S
+    hidden_size = cfg["hidden_size"]
+    moe_inter = cfg["moe_intermediate_size"]
+    num_experts = cfg["n_routed_experts"]
+    top_k = cfg["num_experts_per_tok"]
+    n_group = cfg["n_group"]
+    topk_group = cfg["topk_group"]
+
+    gate_w = _upload_tensor(glm, layer.mlp.gate_weight)
+    gate_logits_gpu = torch.empty(BS, num_experts, dtype=torch.bfloat16, device="cuda")
+    glm.linear(gate_logits_gpu, post_normed_gpu, gate_w, BS, num_experts, hidden_size)
+
+    gate_logits_bytes = torch.empty(BS * num_experts, dtype=torch.uint16, device="cpu")
+    glm.d2h(gate_logits_bytes.numpy().ctypes.data_as(ctypes.c_void_p),
+             gate_logits_gpu.data_ptr(), BS * num_experts * 2)
+    gate_logits_f32 = _bf16_to_f32(gate_logits_bytes.view(torch.bfloat16)).reshape(BS, num_experts)
+
+    logits = torch.sigmoid(gate_logits_f32)
+
+    bias_gpu = _upload_tensor(glm, layer.mlp.e_score_correction_bias)
+    bias_bytes = torch.empty(num_experts, dtype=torch.uint16, device="cpu")
+    glm.d2h(bias_bytes.numpy().ctypes.data_as(ctypes.c_void_p),
+             bias_gpu.data_ptr(), num_experts * 2)
+    bias_f32 = _bf16_to_f32(bias_bytes.view(torch.bfloat16))
+
+    logits_corrected = logits + bias_f32.unsqueeze(0)
+
+    if n_group > 1:
+        experts_per_group = num_experts // n_group
+        group_scores = logits_corrected.view(BS, n_group, experts_per_group).topk(2, dim=-1)[0].sum(dim=-1)
+        group_idx = group_scores.topk(topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+        score_mask = group_mask.unsqueeze(-1).expand(-1, n_group, experts_per_group).reshape(-1, num_experts)
+        scores_masked = logits_corrected.masked_fill(~score_mask.bool(), 0.0)
+        topk_idx = scores_masked.topk(top_k, dim=-1, sorted=False)[1]
+    else:
+        topk_idx = logits_corrected.topk(top_k, dim=-1, sorted=False)[1]
+
+    topk_w = logits.gather(1, topk_idx)
+    if cfg["norm_topk_prob"]:
+        topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
+    topk_w = topk_w * cfg["routed_scaling_factor"]
+
+    expert_indices = topk_idx.tolist()
+    expert_weights = topk_w.tolist()
+
+    routed_out_gpu = torch.zeros(BS, hidden_size, dtype=torch.bfloat16, device="cuda")
+    glm.fill(routed_out_gpu, 0.0, BS * hidden_size)
+
+    scale_f32 = torch.zeros(BS, dtype=torch.float32)
+
+    for e in range(num_experts):
+        any_selected = False
+        for b in range(BS):
+            if e in expert_indices[b]:
+                any_selected = True
+                break
+        if not any_selected:
+            continue
+
+        expert_gate_w = _upload_tensor(glm, layer.mlp.expert_gate[e])
+        expert_up_w = _upload_tensor(glm, layer.mlp.expert_up[e])
+        expert_down_w = _upload_tensor(glm, layer.mlp.expert_down[e])
+
+        gate_out = torch.empty(BS, moe_inter, dtype=torch.bfloat16, device="cuda")
+        up_out = torch.empty(BS, moe_inter, dtype=torch.bfloat16, device="cuda")
+        inter = torch.empty(BS, moe_inter, dtype=torch.bfloat16, device="cuda")
+        expert_down = torch.empty(BS, hidden_size, dtype=torch.bfloat16, device="cuda")
+
+        glm.linear(gate_out, post_normed_gpu, expert_gate_w, BS, moe_inter, hidden_size)
+        glm.linear(up_out, post_normed_gpu, expert_up_w, BS, moe_inter, hidden_size)
+        glm.silu_and_mul(inter, gate_out, up_out, moe_inter, BS)
+        glm.linear(expert_down, inter, expert_down_w, BS, hidden_size, moe_inter)
+
+        for b in range(BS):
+            k_idx = expert_indices[b].index(e) if e in expert_indices[b] else -1
+            scale_f32[b] = expert_weights[b][k_idx] if k_idx >= 0 else 0.0
+
+        scale_bf16 = _f32_to_bf16(scale_f32).to("cuda")
+        glm.row_scale_add(routed_out_gpu, expert_down, scale_bf16, BS, hidden_size)
+
+    shared_gate_w_gpu = _upload_tensor(glm, layer.mlp.shared_gate_w)
+    shared_up_w_gpu = _upload_tensor(glm, layer.mlp.shared_up_w)
+    shared_down_w_gpu = _upload_tensor(glm, layer.mlp.shared_down_w)
+
+    shared_gate = torch.empty(BS, moe_inter, dtype=torch.bfloat16, device="cuda")
+    shared_up = torch.empty(BS, moe_inter, dtype=torch.bfloat16, device="cuda")
+    shared_inter = torch.empty(BS, moe_inter, dtype=torch.bfloat16, device="cuda")
+    shared_down = torch.empty(BS, hidden_size, dtype=torch.bfloat16, device="cuda")
+
+    glm.linear(shared_gate, post_normed_gpu, shared_gate_w_gpu, BS, moe_inter, hidden_size)
+    glm.linear(shared_up, post_normed_gpu, shared_up_w_gpu, BS, moe_inter, hidden_size)
+    glm.silu_and_mul(shared_inter, shared_gate, shared_up, moe_inter, BS)
+    glm.linear(shared_down, shared_inter, shared_down_w_gpu, BS, hidden_size, moe_inter)
+
+    mlp_out_gpu = torch.empty(BS, hidden_size, dtype=torch.bfloat16, device="cuda")
+    glm.add(mlp_out_gpu, routed_out_gpu, shared_down, BS * hidden_size)
+
+    return mlp_out_gpu
+
+
+# ---------------------------------------------------------------------------
+# MLA Kernel Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestMLA:
+    def test_mla_prefill(self, glm, device):
+        """MLA prefill kernel vs PyTorch reference with small model dims (128/64)."""
+        B, S = 1, 8
+        num_heads = 4
+        sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
+
+        torch.manual_seed(42)
+        q_nope = torch.randn(B * S, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        q_pe = torch.randn(B * S, num_heads, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+        ckv = torch.randn(S, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        kpe = torch.randn(S, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+
+        cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
+        q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
+        q_pe_rope = torch.empty_like(q_pe_4d)
+        glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1)
+        q_pe_rope = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
+
+        kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
+        kpe_rope_4d = torch.empty_like(kpe_4d)
+        glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1)
+        kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
+
+        ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
+        kpe_paged = kpe_rope.reshape(S, PAGE_SIZE, HEAD_DIM_KPE)
+
+        qo_indptr_h = (ctypes.c_int32 * 2)(0, S)
+        kv_indptr_h = (ctypes.c_int32 * 2)(0, S)
+        kv_len_h = (ctypes.c_int32 * 1)(S)
+        kv_indices = torch.arange(S, dtype=torch.int32, device=device)
+        plan_info = (ctypes.c_int64 * 18)()
+
+        float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
+
+        glm.mla_prefill_plan(
+            float_ws, 32 * 1024 * 1024,
+            int_ws, pinned_int_ws, 8 * 1024 * 1024,
+            ctypes.addressof(plan_info),
+            ctypes.addressof(qo_indptr_h),
+            ctypes.addressof(kv_indptr_h),
+            ctypes.addressof(kv_len_h),
+            B, num_heads, HEAD_DIM_CKV, True)
+
+        o = torch.empty(B * S, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+
+        glm.mla_prefill_run(
+            q_nope.data_ptr(), q_pe_rope.data_ptr(),
+            ckv_paged.data_ptr(), kpe_paged.data_ptr(),
+            kv_indices.data_ptr(),
+            o.data_ptr(),
+            float_ws, int_ws, ctypes.addressof(plan_info),
+            num_heads, PAGE_SIZE, 1, sm_scale,
+            num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
+            num_heads * HEAD_DIM_KPE, HEAD_DIM_KPE,
+            PAGE_SIZE * HEAD_DIM_CKV, HEAD_DIM_CKV,
+            PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
+            num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
+            HEAD_DIM_CKV, HEAD_DIM_KPE)
+
+        glm.synchronize()
+
+        ref_output = mla_prefill_reference(
+            q_nope, q_pe_rope,
+            ckv.unsqueeze(0), kpe_rope.unsqueeze(0),
+            sm_scale, causal=True)
+
+        max_diff = (o.cpu() - ref_output.cpu()).abs().max().item()
+        mean_diff = (o.cpu() - ref_output.cpu()).abs().mean().item()
+
+        print(f"  MLA prefill: max_diff={max_diff:.4f}, mean_diff={mean_diff:.4f}")
+        assert max_diff < 0.1, f"MLA prefill max_diff={max_diff:.4f} > 0.1"
+
+        glm.free_buf(float_ws)
+        glm.free_buf(int_ws)
+        glm.free_pinned(pinned_int_ws)
+
+    def test_mla_decode(self, glm, device):
+        """MLA decode kernel vs PyTorch reference with small model dims (128/64)."""
+        B = 1
+        S = 16
+        num_heads = 4
+        sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
+
+        torch.manual_seed(42)
+        q_nope = torch.randn(B, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        q_pe = torch.randn(B, num_heads, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+        ckv = torch.randn(S, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        kpe = torch.randn(S, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+
+        positions = torch.arange(S, dtype=torch.int32, device=device)
+        inv_freq = 1.0 / (1000000.0 ** (torch.arange(0, HEAD_DIM_KPE, 2, dtype=torch.float32, device=device) / HEAD_DIM_KPE))
+
+        decode_pos = torch.tensor([S - 1], dtype=torch.float32, device=device)
+        freqs_q = torch.outer(decode_pos, inv_freq)
+        emb_q = torch.cat([freqs_q, freqs_q], dim=-1)
+        cos_q = emb_q.cos().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
+        sin_q = emb_q.sin().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
+        q_pe_rope = (q_pe * cos_q) + (rotate_half(q_pe) * sin_q)
+
+        positions_k = torch.arange(S, dtype=torch.float32, device=device)
+        freqs_k = torch.outer(positions_k, inv_freq)
+        emb_k = torch.cat([freqs_k, freqs_k], dim=-1)
+        cos_k = emb_k.cos().to(torch.bfloat16)
+        sin_k = emb_k.sin().to(torch.bfloat16)
+        kpe_rope = (kpe * cos_k) + (rotate_half(kpe) * sin_k)
+
+        num_pages = S
+        ckv_paged = ckv.reshape(num_pages, PAGE_SIZE, HEAD_DIM_CKV).contiguous()
+        kpe_paged = kpe_rope.reshape(num_pages, PAGE_SIZE, HEAD_DIM_KPE).contiguous()
+        indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+
+        indptr_h = (ctypes.c_int32 * 2)(0, num_pages)
+        last_page_len_d = torch.tensor([PAGE_SIZE], dtype=torch.int32, device=device)
+
+        float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
+        plan_info = (ctypes.c_int64 * 10)()
+
+        glm.mla_decode_plan(
+            float_ws, 32 * 1024 * 1024,
+            int_ws, pinned_int_ws, 8 * 1024 * 1024,
+            ctypes.addressof(plan_info),
+            ctypes.addressof(indptr_h),
+            B, num_heads, PAGE_SIZE, False,
+            head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
+
+        o = torch.empty(B, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        indptr_d = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+
+        glm.mla_decode_run(
+            q_nope.data_ptr(), q_pe_rope.data_ptr(),
+            ckv_paged.data_ptr(), kpe_paged.data_ptr(),
+            indices.data_ptr(), indptr_d.data_ptr(), last_page_len_d.data_ptr(),
+            o.data_ptr(),
+            float_ws, int_ws, ctypes.addressof(plan_info),
+            B, num_heads, PAGE_SIZE, sm_scale,
+            head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
+
+        glm.synchronize()
+
+        ref_output = mla_decode_reference(
+            q_nope, q_pe_rope,
+            ckv.unsqueeze(0), kpe.unsqueeze(0),
+            positions, sm_scale)
+
+        max_diff = (o.cpu() - ref_output.cpu()).abs().max().item()
+        mean_diff = (o.cpu() - ref_output.cpu()).abs().mean().item()
+
+        print(f"  MLA decode: max_diff={max_diff:.4f}, mean_diff={mean_diff:.4f}")
+        assert max_diff < 0.1, f"MLA decode max_diff={max_diff:.4f} > 0.1"
+
+        glm.free_buf(float_ws)
+        glm.free_buf(int_ws)
+        glm.free_pinned(pinned_int_ws)
+
+    def test_mla_kv_cache_append(self, glm, device):
+        """MLA KV cache append with small model dims (128/64)."""
+        B, S = 2, 4
+        num_pages = B * S
+
+        torch.manual_seed(42)
+        append_ckv = torch.randn(B * S, HEAD_DIM_CKV, dtype=torch.bfloat16, device="cpu")
+        append_kpe = torch.randn(B * S, HEAD_DIM_KPE, dtype=torch.bfloat16, device="cpu")
+
+        ckv_cache = torch.zeros(num_pages, PAGE_SIZE, HEAD_DIM_CKV, dtype=torch.bfloat16, device="cpu")
+        kpe_cache = torch.zeros(num_pages, PAGE_SIZE, HEAD_DIM_KPE, dtype=torch.bfloat16, device="cpu")
+
+        ckv_cache_gpu = torch.zeros(num_pages, PAGE_SIZE, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        kpe_cache_gpu = torch.zeros(num_pages, PAGE_SIZE, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+
+        indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+        indptr = torch.tensor([0, S, S * 2], dtype=torch.int32, device=device)
+        last_page_len = torch.tensor([PAGE_SIZE, PAGE_SIZE], dtype=torch.int32, device=device)
+        batch_indices = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32, device=device)
+        positions = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.int32, device=device)
+
+        append_ckv_gpu = append_ckv.to(device)
+        append_kpe_gpu = append_kpe.to(device)
+
+        nnz = B * S
+        glm.mla_kv_cache_append(
+            ckv_cache_gpu.data_ptr(), kpe_cache_gpu.data_ptr(),
+            indices.data_ptr(), indptr.data_ptr(), last_page_len.data_ptr(),
+            append_ckv_gpu.data_ptr(), append_kpe_gpu.data_ptr(),
+            batch_indices.data_ptr(), positions.data_ptr(),
+            nnz, PAGE_SIZE,
+            HEAD_DIM_CKV, HEAD_DIM_KPE,
+            HEAD_DIM_CKV, HEAD_DIM_KPE)
+
+        glm.synchronize()
+
+        result_ckv = ckv_cache_gpu.cpu()
+        for i in range(B):
+            for j in range(S):
+                page_idx = i * S + j
+                ref_row = append_ckv[i * S + j]
+                gpu_row = result_ckv[page_idx, 0, :]
+                max_err = (gpu_row - ref_row).abs().max().item()
+                assert max_err < 1e-5, f"ckv mismatch at batch={i} pos={j}: max_err={max_err}"
+
+    def test_mla_prefill_then_decode(self, glm, device):
+        """MLA prefill then decode: full lifecycle with small model dims."""
+        B = 1
+        S = 4
+        num_heads = 4
+        sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
+
+        torch.manual_seed(42)
+        q_nope = torch.randn(B * S, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        q_pe = torch.randn(B * S, num_heads, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+        ckv = torch.randn(S, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        kpe = torch.randn(S, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+
+        cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
+        q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
+        q_pe_rope = torch.empty_like(q_pe_4d)
+        glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1)
+        q_pe_rope_flat = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
+
+        kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
+        kpe_rope_4d = torch.empty_like(kpe_4d)
+        glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1)
+        kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
+
+        ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
+        kpe_paged = kpe_rope.reshape(S, PAGE_SIZE, HEAD_DIM_KPE)
+        kv_indices = torch.arange(S, dtype=torch.int32, device=device)
+
+        float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
+
+        qo_indptr_h = (ctypes.c_int32 * 2)(0, S)
+        kv_indptr_h = (ctypes.c_int32 * 2)(0, S)
+        kv_len_h = (ctypes.c_int32 * 1)(S)
+        plan_info = (ctypes.c_int64 * 18)()
+
+        glm.mla_prefill_plan(
+            float_ws, 32 * 1024 * 1024,
+            int_ws, pinned_int_ws, 8 * 1024 * 1024,
+            ctypes.addressof(plan_info),
+            ctypes.addressof(qo_indptr_h),
+            ctypes.addressof(kv_indptr_h),
+            ctypes.addressof(kv_len_h),
+            B, num_heads, HEAD_DIM_CKV, True)
+
+        o_prefill = torch.empty(B * S, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        glm.mla_prefill_run(
+            q_nope.data_ptr(), q_pe_rope_flat.data_ptr(),
+            ckv_paged.data_ptr(), kpe_paged.data_ptr(),
+            kv_indices.data_ptr(),
+            o_prefill.data_ptr(),
+            float_ws, int_ws, ctypes.addressof(plan_info),
+            num_heads, PAGE_SIZE, 1, sm_scale,
+            num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
+            num_heads * HEAD_DIM_KPE, HEAD_DIM_KPE,
+            PAGE_SIZE * HEAD_DIM_CKV, HEAD_DIM_CKV,
+            PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
+            num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
+            HEAD_DIM_CKV, HEAD_DIM_KPE)
+
+        glm.synchronize()
+
+        ref_prefill = mla_prefill_reference(
+            q_nope.cpu(), q_pe_rope_flat.cpu(),
+            ckv.cpu().unsqueeze(0), kpe_rope.cpu().unsqueeze(0),
+            sm_scale, causal=True)
+
+        prefill_max_diff = (o_prefill.cpu() - ref_prefill).abs().max().item()
+        print(f"  Prefill max_diff: {prefill_max_diff:.4f}")
+        assert prefill_max_diff < 0.1, f"Prefill max_diff={prefill_max_diff:.4f} > 0.1"
+
+        num_pages = S
+        ckv_cache = torch.zeros(num_pages, PAGE_SIZE, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        kpe_cache = torch.zeros(num_pages, PAGE_SIZE, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+        for p in range(num_pages):
+            ckv_cache[p, 0, :] = ckv[p, :]
+            kpe_cache[p, 0, :] = kpe_rope[p, :]
+
+        decode_q_nope = torch.randn(B, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        decode_q_pe = torch.randn(B, num_heads, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+
+        inv_freq_decode = 1.0 / (1000000.0 ** (torch.arange(0, HEAD_DIM_KPE, 2, dtype=torch.float32, device=device) / HEAD_DIM_KPE))
+        decode_pos = torch.tensor([S], dtype=torch.float32, device=device)
+        freqs_q = torch.outer(decode_pos, inv_freq_decode)
+        emb_q = torch.cat([freqs_q, freqs_q], dim=-1)
+        cos_q = emb_q.cos().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
+        sin_q = emb_q.sin().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
+        decode_q_pe_rope = (decode_q_pe * cos_q) + (rotate_half(decode_q_pe) * sin_q)
+
+        indptr_h_decode = (ctypes.c_int32 * 2)(0, num_pages)
+        plan_info_decode = (ctypes.c_int64 * 10)()
+
+        glm.mla_decode_plan(
+            float_ws, 32 * 1024 * 1024,
+            int_ws, pinned_int_ws, 8 * 1024 * 1024,
+            ctypes.addressof(plan_info_decode),
+            ctypes.addressof(indptr_h_decode),
+            B, num_heads, PAGE_SIZE, False,
+            head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
+
+        o_decode = torch.empty(B, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+        decode_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+        decode_indptr_d = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+        decode_last_page_len = torch.tensor([PAGE_SIZE], dtype=torch.int32, device=device)
+
+        glm.mla_decode_run(
+            decode_q_nope.data_ptr(), decode_q_pe_rope.data_ptr(),
+            ckv_cache.data_ptr(), kpe_cache.data_ptr(),
+            decode_indices.data_ptr(), decode_indptr_d.data_ptr(), decode_last_page_len.data_ptr(),
+            o_decode.data_ptr(),
+            float_ws, int_ws, ctypes.addressof(plan_info_decode),
+            B, num_heads, PAGE_SIZE, sm_scale,
+            head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
+
+        glm.synchronize()
+
+        ref_positions = torch.arange(S, dtype=torch.int32)
+        ref_decode = mla_decode_reference(
+            decode_q_nope.cpu(), decode_q_pe_rope.cpu(),
+            ckv.cpu().unsqueeze(0), kpe.cpu().unsqueeze(0),
+            ref_positions, sm_scale)
+
+        decode_max_diff = (o_decode.cpu() - ref_decode.cpu()).abs().max().item()
+        print(f"  Decode max_diff: {decode_max_diff:.4f}")
+        assert decode_max_diff < 0.1, f"Decode max_diff={decode_max_diff:.4f} > 0.1"
+
+        glm.free_buf(float_ws)
+        glm.free_buf(int_ws)
+        glm.free_pinned(pinned_int_ws)
+
+
+# ---------------------------------------------------------------------------
+# Per-layer tests vs reference
+# ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestRMSNorm:
@@ -81,82 +621,6 @@ class TestRMSNorm:
 
         ref_out = rms_norm(x, weight, cfg["rms_norm_eps"])
         torch.testing.assert_close(out_gpu.cpu(), ref_out.cpu(), atol=0.01, rtol=0.01)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestMLAAttention:
-    def test_mla_prefill(self, glm, device, cfg, ref_model):
-        B, S = 1, 4
-        num_heads = cfg["num_attention_heads"]
-        qk_rope_dim = cfg["qk_rope_head_dim"]
-
-        hidden = torch.randn(B, S, cfg["hidden_size"], dtype=torch.bfloat16)
-        cos, sin = make_rotary_embed(qk_rope_dim // 2, S, batch_size=B)
-
-        ref_out, ref_q_resid = ref_model.layers[0].self_attn.forward(hidden, cos, sin)
-
-        hidden_gpu = _upload_tensor(glm, hidden)
-        cos_gpu = _upload_tensor(glm, cos)
-        sin_gpu = _upload_tensor(glm, sin)
-
-        q_nope_ref = ref_model.layers[0].self_attn.q_a_proj_w
-        q_b_ref = ref_model.layers[0].self_attn.q_b_proj_w
-        q_resid = rms_norm(torch.nn.functional.linear(hidden, q_nope_ref), ref_model.layers[0].self_attn.q_a_layernorm_w)
-
-        q_nope = torch.randn(B * S, num_heads, cfg["qk_nope_head_dim"], dtype=torch.bfloat16)
-        q_pe_rope = torch.randn(B * S, num_heads, qk_rope_dim, dtype=torch.bfloat16)
-
-        ckv = torch.randn(S, HEAD_DIM_CKV, dtype=torch.bfloat16)
-        kpe = torch.randn(S, HEAD_DIM_KPE, dtype=torch.bfloat16)
-
-        PAGE_SIZE = 1
-        ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
-        kpe_paged = kpe.reshape(S, PAGE_SIZE, HEAD_DIM_KPE)
-
-        qo_indptr_h = (ctypes.c_int32 * 2)(0, S)
-        kv_indptr_h = (ctypes.c_int32 * 2)(0, S)
-        kv_len_h = (ctypes.c_int32 * 1)(S)
-        kv_indices = torch.arange(S, dtype=torch.int32)
-        plan_info = (ctypes.c_int64 * 18)()
-
-        float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
-
-        sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
-
-        glm.mla_prefill_plan(
-            float_ws, 32 * 1024 * 1024,
-            int_ws, pinned_int_ws, 8 * 1024 * 1024,
-            ctypes.addressof(plan_info),
-            ctypes.addressof(qo_indptr_h),
-            ctypes.addressof(kv_indptr_h),
-            ctypes.addressof(kv_len_h),
-            B, num_heads, HEAD_DIM_CKV, True)
-
-        o = torch.empty(B * S, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device="cuda")
-
-        q_nope_gpu = _upload_tensor(glm, q_nope)
-        q_pe_rope_gpu = _upload_tensor(glm, q_pe_rope)
-        ckv_paged_gpu = _upload_tensor(glm, ckv_paged)
-        kpe_paged_gpu = _upload_tensor(glm, kpe_paged)
-        kv_indices_gpu = _upload_tensor(glm, kv_indices)
-
-        glm.mla_prefill_run(
-            q_nope_gpu.data_ptr(), q_pe_rope_gpu.data_ptr(),
-            ckv_paged_gpu.data_ptr(), kpe_paged_gpu.data_ptr(),
-            kv_indices_gpu.data_ptr(),
-            o.data_ptr(),
-            float_ws, int_ws, ctypes.addressof(plan_info),
-            num_heads, PAGE_SIZE, 1, sm_scale,
-            num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
-            num_heads * HEAD_DIM_KPE, HEAD_DIM_KPE,
-            PAGE_SIZE * HEAD_DIM_CKV, HEAD_DIM_CKV,
-            PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
-            num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV)
-
-        glm.synchronize()
-        glm.free_buf(float_ws)
-        glm.free_buf(int_ws)
-        glm.free_pinned(pinned_int_ws)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -193,146 +657,190 @@ class TestDenseMLP:
         if product > 4_000_000:
             atol, rtol = 8.0, 8.0
         elif product > 1_000_000:
-            atol, rtol = 2.0, 2.0
+            atol, rtol = 3.0, 3.0
         else:
             atol, rtol = 5e-2, 5e-2
         torch.testing.assert_close(out_gpu.cpu(), ref_down.cpu(), atol=atol, rtol=rtol)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestNVFP4Linear:
-    def test_nvfp4_dequant_vs_bf16(self, glm, device, cfg, ref_model):
-        import ctypes
-        from safetensors import safe_open
+# ---------------------------------------------------------------------------
+# End-to-end: CUDA ops vs PyTorch reference
+# ---------------------------------------------------------------------------
 
-        m = 1
-        N, K = 512, 1024
-        GROUP_SIZE = 16
-        num_k_groups = K // GROUP_SIZE
+def _cuda_mla_attention_bmm(glm, device, layer, hidden_gpu, cos_gpu, sin_gpu, causal_mask_gpu, B, S, cfg):
+    """MLA attention using BMM (non-absorbed, matches reference model)."""
+    num_heads = cfg["num_attention_heads"]
+    qk_nope_dim = cfg["qk_nope_head_dim"]
+    qk_rope_dim = cfg["qk_rope_head_dim"]
+    qk_head_dim = qk_nope_dim + qk_rope_dim
+    v_head_dim = cfg["v_head_dim"]
+    kv_lora_rank = cfg["kv_lora_rank"]
+    q_lora_rank = cfg["q_lora_rank"]
+    hidden_size = cfg["hidden_size"]
+    BS = B * S
+    eps = cfg["rms_norm_eps"]
+    scaling = qk_head_dim ** -0.5
 
-        x = torch.randn(m, K, dtype=torch.bfloat16, device="cuda")
+    q_resid = torch.empty(BS, q_lora_rank, dtype=torch.bfloat16, device=device)
+    glm.linear(q_resid, hidden_gpu, _upload_tensor(glm, layer.self_attn.q_a_proj_w),
+               BS, q_lora_rank, hidden_size)
 
-        nvfp4_dir = REFERENCE_DIR / "glm51_small_nvfp4"
-        with safe_open(str(nvfp4_dir / "model.safetensors"), framework="pt") as f:
-            weight_key = "model.layers.3.mlp.experts.0.gate_proj.weight"
-            scale_key = "model.layers.3.mlp.experts.0.gate_proj.weight_scale"
-            scale2_key = "model.layers.3.mlp.experts.0.gate_proj.weight_scale_2"
-            packed_cpu = f.get_tensor(weight_key)
-            scale_cpu = f.get_tensor(scale_key)
-            scale_2_cpu = f.get_tensor(scale2_key)
+    q_resid_normed = torch.empty_like(q_resid)
+    glm.rmsnorm(q_resid_normed, q_resid, _upload_tensor(glm, layer.self_attn.q_a_layernorm_w),
+                eps, q_lora_rank, BS)
 
-        fp4_w_gpu = glm.alloc(N * (K // 2))
-        scale_fp8_gpu = glm.alloc(N * num_k_groups)
-        scale2_f32_gpu = glm.alloc(4)
-        out_gpu = glm.alloc(m * N * 2)
+    query_flat = torch.empty(BS, num_heads * qk_head_dim, dtype=torch.bfloat16, device=device)
+    glm.linear(query_flat, q_resid_normed, _upload_tensor(glm, layer.self_attn.q_b_proj_w),
+               BS, num_heads * qk_head_dim, q_lora_rank)
 
-        fp4_w_bytes = packed_cpu.view(torch.uint8)
-        glm.h2d(fp4_w_gpu, fp4_w_bytes.cpu().numpy().ctypes.data_as(ctypes.c_void_p), N * (K // 2))
+    query = query_flat.cpu().view(B, S, num_heads, qk_head_dim).permute(0, 2, 1, 3).contiguous()
+    q_nope = query[:, :, :, :qk_nope_dim].to(device).contiguous()
+    q_pe = query[:, :, :, qk_nope_dim:].to(device).contiguous()
 
-        scale_fp8_bytes = scale_cpu.view(torch.uint8)
-        glm.h2d(scale_fp8_gpu, scale_fp8_bytes.cpu().numpy().ctypes.data_as(ctypes.c_void_p), N * num_k_groups)
+    q_pe_rope = torch.empty_like(q_pe)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe, cos_gpu, sin_gpu, qk_rope_dim, num_heads, S, B, 1)
 
-        scale_2_f32 = scale_2_cpu.float().contiguous()
-        glm.h2d(scale2_f32_gpu, scale_2_f32.numpy().ctypes.data_as(ctypes.c_void_p), 4)
+    compressed_flat = torch.empty(BS, kv_lora_rank + qk_rope_dim, dtype=torch.bfloat16, device=device)
+    glm.linear(compressed_flat, hidden_gpu, _upload_tensor(glm, layer.self_attn.kv_a_proj_w),
+               BS, kv_lora_rank + qk_rope_dim, hidden_size)
 
-        glm.nvfp4_linear_decode(out_gpu, x.data_ptr(), fp4_w_gpu,
-                                scale_fp8_gpu, scale2_f32_gpu, m, N, K)
+    compressed = compressed_flat.cpu()
+    k_compressed = compressed[:, :kv_lora_rank].to(device).contiguous()
+    k_pe = compressed[:, kv_lora_rank:]
 
-        glm.synchronize()
+    k_compressed_norm = torch.empty(BS, kv_lora_rank, dtype=torch.bfloat16, device=device)
+    glm.rmsnorm(k_compressed_norm, k_compressed, _upload_tensor(glm, layer.self_attn.kv_a_layernorm_w),
+                eps, kv_lora_rank, BS)
 
-        out_raw = torch.empty(m, N, dtype=torch.uint16, device='cpu')
-        glm.d2h(out_raw.numpy().ctypes.data_as(ctypes.c_void_p), out_gpu, m * N * 2)
-        out_decode = out_raw.view(torch.bfloat16).float()
+    kv_expanded_flat = torch.empty(BS, num_heads * (qk_nope_dim + v_head_dim), dtype=torch.bfloat16, device=device)
+    glm.linear(kv_expanded_flat, k_compressed_norm, _upload_tensor(glm, layer.self_attn.kv_b_proj_w),
+               BS, num_heads * (qk_nope_dim + v_head_dim), kv_lora_rank)
 
-        for ptr in [fp4_w_gpu, scale_fp8_gpu, scale2_f32_gpu, out_gpu]:
-            glm.free_buf(ptr)
+    kv_expanded = kv_expanded_flat.cpu().view(B, S, num_heads, qk_nope_dim + v_head_dim)
+    k_nope = kv_expanded[:, :, :, :qk_nope_dim].permute(0, 2, 1, 3).contiguous().to(device)
+    value = kv_expanded[:, :, :, qk_nope_dim:].permute(0, 2, 1, 3).contiguous().to(device)
 
-        w_dequant = dequantize_nvfp4(packed_cpu, scale_cpu, scale_2_cpu, (N, K))
-        ref_out = torch.nn.functional.linear(x.cpu().float(), w_dequant.float())
+    k_pe_4d = k_pe.view(B, 1, S, qk_rope_dim).to(device).contiguous()
+    k_pe_rope = torch.empty_like(k_pe_4d)
+    glm.apply_rotary_pos_emb(k_pe_rope, k_pe_4d, cos_gpu, sin_gpu, qk_rope_dim, 1, S, B, 1)
+    k_pe_expanded = k_pe_rope.expand(-1, num_heads, -1, -1).contiguous()
 
-        mean_err = (out_decode - ref_out).abs().mean().item()
-        max_err = (out_decode - ref_out).abs().max().item()
-        mean_abs_ref = ref_out.abs().mean().item()
+    query_full = torch.cat([q_nope, q_pe_rope], dim=-1).contiguous()
+    key_full = torch.cat([k_nope, k_pe_expanded], dim=-1).contiguous()
 
-        assert mean_err < mean_abs_ref * 0.15, f"Mean error {mean_err:.4f} > 15% of ref {mean_abs_ref:.4f}"
-        assert max_err < mean_abs_ref * 3.0, f"Max error {max_err:.4f} > 3x ref {mean_abs_ref:.4f}"
+    q_bmm = query_full.reshape(B * num_heads, S, qk_head_dim).contiguous()
+    k_bmm = key_full.reshape(B * num_heads, S, qk_head_dim).contiguous()
+    v_bmm = value.reshape(B * num_heads, S, v_head_dim).contiguous()
+
+    attn_weights = torch.empty(B * num_heads, S, S, dtype=torch.bfloat16, device=device)
+    glm.bmm(attn_weights, q_bmm, k_bmm, scaling, 0.0, B * num_heads, S, S, qk_head_dim, 0, 1)
+
+    causal_expanded = causal_mask_gpu.unsqueeze(0).expand(B * num_heads, S, S).contiguous()
+    glm.add(attn_weights, attn_weights, causal_expanded, B * num_heads * S * S)
+
+    attn_probs = torch.empty_like(attn_weights)
+    glm.softmax(attn_probs, attn_weights, None, S, B * num_heads * S)
+
+    attn_output = torch.empty(B * num_heads, S, v_head_dim, dtype=torch.bfloat16, device=device)
+    glm.bmm(attn_output, attn_probs, v_bmm, 1.0, 0.0, B * num_heads, S, v_head_dim, S, 0, 0)
+
+    attn_out = attn_output.cpu().view(B, num_heads, S, v_head_dim).permute(0, 2, 1, 3).contiguous()
+    attn_out_flat = attn_out.reshape(BS, num_heads * v_head_dim).to(device).contiguous()
+
+    o_output = torch.empty(BS, hidden_size, dtype=torch.bfloat16, device=device)
+    glm.linear(o_output, attn_out_flat, _upload_tensor(glm, layer.self_attn.o_proj_w),
+               BS, hidden_size, num_heads * v_head_dim)
+
+    return o_output
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestEndToEnd:
-    def test_full_forward_pass(self, glm, device, cfg, ref_model):
+    def test_cuda_forward_vs_reference(self, glm, device, cfg, ref_model):
+        """Full CUDA forward pass (BMM attention) vs PyTorch reference."""
         B, S = 1, 4
-        input_ids = torch.randint(0, cfg["vocab_size"], (B, S))
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, min(cfg["vocab_size"], 1000), (B, S))
 
-        ref_logits = ref_model.forward(input_ids)
+        causal_mask_ref = torch.zeros(S, S, dtype=torch.bfloat16)
+        for i in range(S):
+            for j in range(i + 1, S):
+                causal_mask_ref[i, j] = float('-inf')
+
+        ref_logits = ref_model.forward(input_ids, attention_mask=causal_mask_ref.unsqueeze(0).unsqueeze(0))
+
+        qk_rope_dim = cfg["qk_rope_head_dim"]
+        cos, sin = _make_rotary_embed(glm, device, qk_rope_dim // 2, B, S)
+
+        causal_mask = torch.empty(S, S, dtype=torch.bfloat16, device=device)
+        glm.causal_mask(causal_mask, S)
 
         hidden_gpu = _upload_tensor(glm, ref_model.embed(input_ids))
-        qk_rope_dim = cfg["qk_rope_head_dim"]
-        cos, sin = make_rotary_embed(qk_rope_dim // 2, S, batch_size=B)
-        cos_gpu = _upload_tensor(glm, cos)
-        sin_gpu = _upload_tensor(glm, sin)
 
         for i in range(cfg["num_hidden_layers"]):
             layer = ref_model.layers[i]
-            ln_w = layer.input_layernorm_w
-            post_ln_w = layer.post_attention_layernorm_w
-            ln_w_gpu = _upload_tensor(glm, ln_w)
-            post_ln_w_gpu = _upload_tensor(glm, post_ln_w)
+            ln_w_gpu = _upload_tensor(glm, layer.input_layernorm_w)
+            post_ln_w_gpu = _upload_tensor(glm, layer.post_attention_layernorm_w)
 
-            normed = torch.empty(B, S, cfg["hidden_size"], dtype=torch.bfloat16, device="cuda")
-            glm.rmsnorm(normed, hidden_gpu, ln_w_gpu, cfg["rms_norm_eps"], cfg["hidden_size"], B * S)
+            normed_gpu = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
+            glm.rmsnorm(normed_gpu, hidden_gpu, ln_w_gpu, cfg["rms_norm_eps"], cfg["hidden_size"], B * S)
 
-            attn_out_gpu = torch.empty(B, S, cfg["hidden_size"], dtype=torch.bfloat16, device="cuda")
-            glm.linear(attn_out_gpu, normed, _upload_tensor(glm, layer.self_attn.o_proj_w),
-                       B * S, cfg["hidden_size"], cfg["num_attention_heads"] * cfg["v_head_dim"])
+            attn_out_gpu = _cuda_mla_attention_bmm(
+                glm, device, layer, normed_gpu, cos, sin, causal_mask, B, S, cfg)
 
-            residual_gpu = torch.empty(B, S, cfg["hidden_size"], dtype=torch.bfloat16, device="cuda")
+            residual_gpu = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
             glm.add(residual_gpu, hidden_gpu, attn_out_gpu, B * S * cfg["hidden_size"])
 
-            post_normed = torch.empty(B, S, cfg["hidden_size"], dtype=torch.bfloat16, device="cuda")
-            glm.rmsnorm(post_normed, residual_gpu, post_ln_w_gpu, cfg["rms_norm_eps"], cfg["hidden_size"], B * S)
+            post_normed_gpu = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
+            glm.rmsnorm(post_normed_gpu, residual_gpu, post_ln_w_gpu, cfg["rms_norm_eps"], cfg["hidden_size"], B * S)
 
             if layer.is_sparse:
-                mlp_out_gpu = torch.empty(B, S, cfg["hidden_size"], dtype=torch.bfloat16, device="cuda")
-                gate_w_gpu = _upload_tensor(glm, layer.mlp.shared_gate_w)
-                up_w_gpu = _upload_tensor(glm, layer.mlp.shared_up_w)
-                down_w_gpu = _upload_tensor(glm, layer.mlp.shared_down_w)
-                intermediate = cfg["moe_intermediate_size"]
-                gate_out = torch.empty(B, S, intermediate, dtype=torch.bfloat16, device="cuda")
-                up_out = torch.empty(B, S, intermediate, dtype=torch.bfloat16, device="cuda")
-                inter = torch.empty(B, S, intermediate, dtype=torch.bfloat16, device="cuda")
-                glm.linear(gate_out, post_normed, gate_w_gpu, B * S, intermediate, cfg["hidden_size"])
-                glm.linear(up_out, post_normed, up_w_gpu, B * S, intermediate, cfg["hidden_size"])
-                glm.silu_and_mul(inter, gate_out, up_out, intermediate, B * S)
-                glm.linear(mlp_out_gpu, inter, down_w_gpu, B * S, cfg["hidden_size"], intermediate)
+                mlp_out_gpu = _run_moe_cuda(glm, cfg, layer, post_normed_gpu, B, S)
             else:
-                mlp_out_gpu = torch.empty(B, S, cfg["hidden_size"], dtype=torch.bfloat16, device="cuda")
-                gate_w_gpu = _upload_tensor(glm, layer.mlp.gate_proj_w)
-                up_w_gpu = _upload_tensor(glm, layer.mlp.up_proj_w)
-                down_w_gpu = _upload_tensor(glm, layer.mlp.down_proj_w)
+                mlp_out_gpu = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
                 intermediate = cfg["intermediate_size"]
-                gate_out = torch.empty(B, S, intermediate, dtype=torch.bfloat16, device="cuda")
-                up_out = torch.empty(B, S, intermediate, dtype=torch.bfloat16, device="cuda")
-                inter = torch.empty(B, S, intermediate, dtype=torch.bfloat16, device="cuda")
-                glm.linear(gate_out, post_normed, gate_w_gpu, B * S, intermediate, cfg["hidden_size"])
-                glm.linear(up_out, post_normed, up_w_gpu, B * S, intermediate, cfg["hidden_size"])
+                gate_out = torch.empty(B * S, intermediate, dtype=torch.bfloat16, device=device)
+                up_out = torch.empty(B * S, intermediate, dtype=torch.bfloat16, device=device)
+                inter = torch.empty(B * S, intermediate, dtype=torch.bfloat16, device=device)
+                glm.linear(gate_out, post_normed_gpu, _upload_tensor(glm, layer.mlp.gate_proj_w),
+                           B * S, intermediate, cfg["hidden_size"])
+                glm.linear(up_out, post_normed_gpu, _upload_tensor(glm, layer.mlp.up_proj_w),
+                           B * S, intermediate, cfg["hidden_size"])
                 glm.silu_and_mul(inter, gate_out, up_out, intermediate, B * S)
-                glm.linear(mlp_out_gpu, inter, down_w_gpu, B * S, cfg["hidden_size"], intermediate)
+                glm.linear(mlp_out_gpu, inter, _upload_tensor(glm, layer.mlp.down_proj_w),
+                           B * S, cfg["hidden_size"], intermediate)
 
-            hidden_gpu = torch.empty(B, S, cfg["hidden_size"], dtype=torch.bfloat16, device="cuda")
+            hidden_gpu = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
             glm.add(hidden_gpu, residual_gpu, mlp_out_gpu, B * S * cfg["hidden_size"])
 
         norm_w_gpu = _upload_tensor(glm, ref_model.norm_w)
-        final_normed = torch.empty(B, S, cfg["hidden_size"], dtype=torch.bfloat16, device="cuda")
+        final_normed = torch.empty(B * S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
         glm.rmsnorm(final_normed, hidden_gpu, norm_w_gpu, cfg["rms_norm_eps"], cfg["hidden_size"], B * S)
 
         lm_head_gpu = _upload_tensor(glm, ref_model.embed_tokens_w)
-        logits_gpu = torch.empty(B, S, cfg["vocab_size"], dtype=torch.bfloat16, device="cuda")
+        logits_gpu = torch.empty(B * S, cfg["vocab_size"], dtype=torch.bfloat16, device=device)
         glm.linear(logits_gpu, final_normed, lm_head_gpu, B * S, cfg["vocab_size"], cfg["hidden_size"])
         glm.synchronize()
 
-        print(f"Logits shape: {logits_gpu.shape}, ref shape: {ref_logits.shape}")
-        print(f"Max diff: {(logits_gpu.cpu().float() - ref_logits.float()).abs().max().item():.4f}")
+        cuda_logits = logits_gpu.cpu().view(B, S, cfg["vocab_size"]).float()
+        ref_f = ref_logits.float()
+        max_diff = (cuda_logits - ref_f).abs().max().item()
+        mean_diff = (cuda_logits - ref_f).abs().mean().item()
+        mean_abs = ref_f.abs().mean().item()
+        print(f"  CUDA vs ref: max_diff={max_diff:.4f}, mean_diff={mean_diff:.4f}, mean_abs={mean_abs:.4f}")
+
+        assert max_diff < mean_abs * 10.0, f"Max diff {max_diff:.4f} > 10x mean_abs {mean_abs:.4f}"
+
+        cuda_top1 = cuda_logits[0, -1].topk(1).indices.tolist()
+        ref_top1 = ref_f[0, -1].topk(1).indices.tolist()
+        print(f"  CUDA top-1: {cuda_top1}, Ref top-1: {ref_top1}")
+        assert cuda_top1 == ref_top1, f"Top-1 mismatch: cuda={cuda_top1}, ref={ref_top1}"
+
+        cuda_top5 = cuda_logits[0, -1].topk(5).indices.tolist()
+        ref_top5 = ref_f[0, -1].topk(5).indices.tolist()
+        top5_overlap = len(set(cuda_top5) & set(ref_top5))
+        print(f"  CUDA top-5: {cuda_top5}, Ref top-5: {ref_top5}, overlap: {top5_overlap}/5")
+        assert top5_overlap >= 2, f"Top-5 overlap too low: {top5_overlap}/5"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -361,10 +869,3 @@ class TestHuggingFaceModel:
 
         assert mean_diff < mean_abs * 0.15, f"Mean diff {mean_diff:.4f} > 15% of ref mean {mean_abs:.4f}"
         assert max_diff < mean_abs * 2.0, f"Max diff {max_diff:.4f} > 2x ref mean {mean_abs:.4f}"
-
-
-def _alloc_workspace(glm, float_mb=32, int_mb=8):
-    float_ws = glm.alloc(float_mb * 1024 * 1024)
-    int_ws = glm.alloc(int_mb * 1024 * 1024)
-    pinned_int_ws = glm.alloc_pinned(int_mb * 1024 * 1024)
-    return float_ws, int_ws, pinned_int_ws

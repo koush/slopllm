@@ -71,8 +71,8 @@ export class Qwen3Model extends ChatModel {
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
   }
 
-  static fromPretrained(glm: DeviceOps, repoId: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {
-    const modelDir = resolveModelPath(repoId);
+  static fromPretrained(glm: DeviceOps, repoIdOrDir: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {
+    const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Qwen3Model(glm, config, maxBatch, maxSeqLen);
     model.loadWeights(modelDir);

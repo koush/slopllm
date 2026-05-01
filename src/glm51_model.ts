@@ -150,8 +150,8 @@ export class Glm51Model extends ChatModel {
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
   }
 
-  static fromPretrained(glm: DeviceOps, repoId: string = GLM51_REPO, maxBatch = 1, maxSeqLen = 4096): Glm51Model {
-    const modelDir = resolveModelPath(repoId);
+  static fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_REPO, maxBatch = 1, maxSeqLen = 4096): Glm51Model {
+    const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Glm51Model(glm, config, maxBatch, maxSeqLen);
     model.loadWeights(modelDir);
@@ -496,7 +496,8 @@ export class Glm51Model extends ChatModel {
         ws.intWs, ws.pinnedIntWs, 8 * 1024 * 1024,
         ws.mlaDecodePlanInfo,
         ws.indptrH,
-        batchSize, nHeads, pagedKV.pageSize, false
+        batchSize, nHeads, pagedKV.pageSize, false,
+        kvLoraRank, qkRopeDim
       );
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else if (useMla && !state.isDecode) {
@@ -515,9 +516,9 @@ export class Glm51Model extends ChatModel {
         ws.floatWs, 128 * 1024 * 1024,
         ws.intWs, ws.pinnedIntWs, 8 * 1024 * 1024,
         ws.mlaPrefillPlanInfo,
-        ws.qoIndptrD, ws.indptrH,
+        ws.qoIndptrH, ws.indptrH,
         ws.kvLenH,
-        batchSize, nHeads, kvLoraRank, 1
+        batchSize, nHeads, kvLoraRank, true
       );
       ws.mlaKvCacheAppend(ckvNormed, kPeRope, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim);
       rotaryEmbedding.streamWaitEvent();

@@ -105,6 +105,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
   lastIdx: Tensor;
   /** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer prefill run. */
   qoIndptrD: Tensor;
+  /** Pinned host buffer [B+1] of I32: written by host, read by MLA prefill plan and memcpy to qoIndptrD. */
+  qoIndptrH: Tensor;
   /** GPU buffer [B*S] of I32: written by host (h2d) or memcpy, read by kvCacheWrite to scatter K/V into cache. */
   slotMapping: Tensor;
   /** Pinned host buffer [B] of I32: written by host, read via memcpy to slotMapping. */
@@ -137,6 +139,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
     this.inputIdsBufH = this.allocPinned([B], "I32", "inputIdsBufH");
     this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
+    this.qoIndptrH = this.allocPinned([B + 1], "I32", "qoIndptrH");
     this.slotMapping = this.alloc([B * S], "I32", "slotMapping");
     this.slotMappingH = this.allocPinned([B], "I32", "slotMappingH");
     this.indptrD = this.alloc([(B + 1) * I32], "I32", "indptrD");
@@ -163,7 +166,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
       this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
       this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
-      this.qoIndptrD.memcpy(state.qoIndptrHost, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+      this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     }
   }
 
@@ -230,13 +233,15 @@ export class ExecutionWorkspace extends WorkspaceBase {
       nHeads, pageSize, 1, smScale,
       qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH,
       ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
-      oStrideN, oStrideH
+      oStrideN, oStrideH,
+      headDimCkv, headDimKpe
     );
     return out;
   }
 
   mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): Tensor {
     const headDimCkv = kvLoraRank;
+    const headDimKpe = qkRopeDim;
     const out = this.alloc([batchSize, nHeads, 1, headDimCkv], qNope.type, undefined, qNope.parallelism);
     this.glm.mlaDecodeRun(
       qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
@@ -244,7 +249,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
       out,
       this.floatWs, this.intWs,
       this.mlaDecodePlanInfo,
-      batchSize, nHeads, pagedKV.pageSize, smScale
+      batchSize, nHeads, pagedKV.pageSize, smScale,
+      headDimCkv, headDimKpe
     );
     return out;
   }
@@ -343,8 +349,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);
     }
 
-    const qoIndptrHost = this.allocPinned([(batchSize + 1)], "I32");
-    qoIndptrHost.withPinnedBuffer(buf => {
+    this.qoIndptrH.withPinnedBuffer(buf => {
       buf.writeInt32LE(0, 0);
       for (let i = 0; i < batchSize; i++) {
         buf.writeInt32LE(buf.readInt32LE(i * I32) + seqLens[i], (i + 1) * I32);
@@ -381,7 +386,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.floatWs, BATCH_FLOAT_WS_SIZE,
       this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
       this.prefillPlanInfo,
-      qoIndptrHost, this.indptrH,
+      this.qoIndptrH, this.indptrH,
       totalTokens, batchSize,
       nHeads, nKv, hd,
       pageSize,
@@ -403,7 +408,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
     this.slotMapping.h2d(slotMappingBuf);
 
-    return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, qoIndptrHost);
+    return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, this.qoIndptrH);
   }
 
   forwardPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): Tensor {

@@ -532,6 +532,23 @@ void glm_batch_prefill_paged_run(
 
 constexpr uint32_t MLA_HEAD_DIM_CKV = 512;
 constexpr uint32_t MLA_HEAD_DIM_KPE = 64;
+constexpr uint32_t MLA_HEAD_DIM_CKV_SMALL = 128;
+constexpr uint32_t MLA_HEAD_DIM_KPE_SMALL = 64;
+
+#define DISPATCH_MLA_HEAD_DIMS(HEAD_DIM_CKV_VAL, HEAD_DIM_KPE_VAL, ...) \
+  do { \
+    if ((HEAD_DIM_CKV_VAL) == MLA_HEAD_DIM_CKV && (HEAD_DIM_KPE_VAL) == MLA_HEAD_DIM_KPE) { \
+      constexpr uint32_t HEAD_DIM_CKV = MLA_HEAD_DIM_CKV; \
+      constexpr uint32_t HEAD_DIM_KPE = MLA_HEAD_DIM_KPE; \
+      __VA_ARGS__; \
+    } else if ((HEAD_DIM_CKV_VAL) == MLA_HEAD_DIM_CKV_SMALL && (HEAD_DIM_KPE_VAL) == MLA_HEAD_DIM_KPE_SMALL) { \
+      constexpr uint32_t HEAD_DIM_CKV = MLA_HEAD_DIM_CKV_SMALL; \
+      constexpr uint32_t HEAD_DIM_KPE = MLA_HEAD_DIM_KPE_SMALL; \
+      __VA_ARGS__; \
+    } else { \
+      fprintf(stderr, "Unsupported MLA head dims: ckv=%u kpe=%u\n", HEAD_DIM_CKV_VAL, HEAD_DIM_KPE_VAL); \
+    } \
+  } while (0)
 
 void glm_mla_prefill_plan(
     GlmCtx* ctx,
@@ -576,7 +593,8 @@ void glm_mla_prefill_run(
     uint32_t q_pe_stride_n, uint32_t q_pe_stride_h,
     uint32_t ckv_stride_page, uint32_t ckv_stride_n,
     uint32_t kpe_stride_page, uint32_t kpe_stride_n,
-    uint32_t o_stride_n, uint32_t o_stride_h) {
+    uint32_t o_stride_n, uint32_t o_stride_h,
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe) {
 
   cudaSetDevice(ctx->device_id);
 
@@ -632,15 +650,17 @@ void glm_mla_prefill_run(
   flashinfer::MaskMode flash_mask = static_cast<flashinfer::MaskMode>(mask_mode);
 
   cudaError_t status;
-  if (flash_mask == flashinfer::MaskMode::kCausal) {
-    status = flashinfer::mla::BatchMLAPagedAttention<
-        flashinfer::MaskMode::kCausal, MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAParams>(
-        params, info.num_blks_x, info.num_blks_y, GLM_STREAM(ctx));
-  } else {
-    status = flashinfer::mla::BatchMLAPagedAttention<
-        flashinfer::MaskMode::kNone, MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAParams>(
-        params, info.num_blks_x, info.num_blks_y, GLM_STREAM(ctx));
-  }
+  DISPATCH_MLA_HEAD_DIMS(head_dim_ckv, head_dim_kpe, {
+    if (flash_mask == flashinfer::MaskMode::kCausal) {
+      status = flashinfer::mla::BatchMLAPagedAttention<
+          flashinfer::MaskMode::kCausal, HEAD_DIM_CKV, HEAD_DIM_KPE, MLAParams>(
+          params, info.num_blks_x, info.num_blks_y, GLM_STREAM(ctx));
+    } else {
+      status = flashinfer::mla::BatchMLAPagedAttention<
+          flashinfer::MaskMode::kNone, HEAD_DIM_CKV, HEAD_DIM_KPE, MLAParams>(
+          params, info.num_blks_x, info.num_blks_y, GLM_STREAM(ctx));
+    }
+  });
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_mla_prefill_run failed: %s\n", cudaGetErrorString(status));
@@ -662,11 +682,22 @@ cudaError_t mla_decode_work_est(
     uint32_t& new_batch_size, uint32_t& gdy,
     uint32_t batch_size, IdType* kv_indptr_h,
     uint32_t num_qo_heads, uint32_t page_size,
-    bool enable_cuda_graph, cudaStream_t stream) {
-  return flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<
-      MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAAttentionVariant, MLADecodeParams>(
-      split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
-      batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
+    bool enable_cuda_graph, cudaStream_t stream,
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe) {
+  if (head_dim_ckv == MLA_HEAD_DIM_CKV && head_dim_kpe == MLA_HEAD_DIM_KPE) {
+    return flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<
+        MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAAttentionVariant, MLADecodeParams>(
+        split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
+        batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
+  } else if (head_dim_ckv == MLA_HEAD_DIM_CKV_SMALL && head_dim_kpe == MLA_HEAD_DIM_KPE_SMALL) {
+    return flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<
+        MLA_HEAD_DIM_CKV_SMALL, MLA_HEAD_DIM_KPE_SMALL, MLAAttentionVariant, MLADecodeParams>(
+        split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
+        batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
+  } else {
+    fprintf(stderr, "Unsupported MLA head dims for decode: ckv=%u kpe=%u\n", head_dim_ckv, head_dim_kpe);
+    return cudaErrorNotSupported;
+  }
 }
 
 } // anonymous namespace
@@ -678,7 +709,8 @@ void glm_mla_decode_plan(
     int64_t* plan_info,
     int32_t* indptr_h,
     uint32_t batch_size, uint32_t num_qo_heads,
-    uint32_t page_size, bool enable_cuda_graph) {
+    uint32_t page_size, bool enable_cuda_graph,
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe) {
 
   cudaSetDevice(ctx->device_id);
 
@@ -691,22 +723,43 @@ void glm_mla_decode_plan(
                       uint32_t nqh, uint32_t ps,
                       bool ecg, cudaStream_t s) -> cudaError_t {
     return mla_decode_work_est(split_kv, max_grid_size, max_num_pages_per_batch,
-                               new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s);
+                               new_batch_size, gdy, bs, kv_indptr, nqh, ps, ecg, s,
+                               head_dim_ckv, head_dim_kpe);
   };
 
-  cudaError_t status = flashinfer::DecodePlan<
-      MLA_HEAD_DIM_CKV, flashinfer::PosEncodingMode::kRoPELlama,
-      MLAAttentionVariant, MLADecodeParams>(
-      float_ws, float_ws_size,
-      int_ws, pinned_int_ws, int_ws_size,
-      info,
-      indptr_h,
-      batch_size,
-      num_qo_heads,
-      page_size,
-      enable_cuda_graph,
-      GLM_STREAM(ctx),
-      work_est);
+  cudaError_t status;
+  if (head_dim_ckv == MLA_HEAD_DIM_CKV && head_dim_kpe == MLA_HEAD_DIM_KPE) {
+    status = flashinfer::DecodePlan<
+        MLA_HEAD_DIM_CKV, flashinfer::PosEncodingMode::kRoPELlama,
+        MLAAttentionVariant, MLADecodeParams>(
+        float_ws, float_ws_size,
+        int_ws, pinned_int_ws, int_ws_size,
+        info,
+        indptr_h,
+        batch_size,
+        num_qo_heads,
+        page_size,
+        enable_cuda_graph,
+        GLM_STREAM(ctx),
+        work_est);
+  } else if (head_dim_ckv == MLA_HEAD_DIM_CKV_SMALL && head_dim_kpe == MLA_HEAD_DIM_KPE_SMALL) {
+    status = flashinfer::DecodePlan<
+        MLA_HEAD_DIM_CKV_SMALL, flashinfer::PosEncodingMode::kRoPELlama,
+        MLAAttentionVariant, MLADecodeParams>(
+        float_ws, float_ws_size,
+        int_ws, pinned_int_ws, int_ws_size,
+        info,
+        indptr_h,
+        batch_size,
+        num_qo_heads,
+        page_size,
+        enable_cuda_graph,
+        GLM_STREAM(ctx),
+        work_est);
+  } else {
+    fprintf(stderr, "glm_mla_decode_plan: unsupported MLA head dims: ckv=%u kpe=%u\n", head_dim_ckv, head_dim_kpe);
+    return;
+  }
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_mla_decode_plan failed: %s\n", cudaGetErrorString(status));
@@ -726,7 +779,8 @@ void glm_mla_decode_run(
     void* float_ws, void* int_ws,
     int64_t* plan_info,
     uint32_t batch_size, uint32_t num_qo_heads,
-    uint32_t page_size, float sm_scale) {
+    uint32_t page_size, float sm_scale,
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe) {
 
   cudaSetDevice(ctx->device_id);
 
@@ -734,7 +788,7 @@ void glm_mla_decode_run(
   info.FromVector(std::vector<int64_t>(plan_info, plan_info + 10));
 
   flashinfer::paged_kv_mla_t<DType, IdType> paged_kv(
-      page_size, MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, batch_size,
+      page_size, head_dim_ckv, head_dim_kpe, batch_size,
       static_cast<DType*>(ckv_data), static_cast<DType*>(kpe_data),
       indices, indptr_d, last_page_len, nullptr);
 
@@ -769,10 +823,19 @@ void glm_mla_decode_run(
       ? reinterpret_cast<float*>(static_cast<char*>(float_ws) + info.s_offset)
       : nullptr;
 
-  cudaError_t status =
-      flashinfer::BatchDecodeWithPagedKVCacheDispatchedMLA<
-          MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAAttentionVariant, MLADecodeParams>(
-          params, tmp_v, tmp_s, false, GLM_STREAM(ctx));
+  cudaError_t status;
+  if (head_dim_ckv == MLA_HEAD_DIM_CKV && head_dim_kpe == MLA_HEAD_DIM_KPE) {
+    status = flashinfer::BatchDecodeWithPagedKVCacheDispatchedMLA<
+        MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAAttentionVariant, MLADecodeParams>(
+        params, tmp_v, tmp_s, false, GLM_STREAM(ctx));
+  } else if (head_dim_ckv == MLA_HEAD_DIM_CKV_SMALL && head_dim_kpe == MLA_HEAD_DIM_KPE_SMALL) {
+    status = flashinfer::BatchDecodeWithPagedKVCacheDispatchedMLA<
+        MLA_HEAD_DIM_CKV_SMALL, MLA_HEAD_DIM_KPE_SMALL, MLAAttentionVariant, MLADecodeParams>(
+        params, tmp_v, tmp_s, false, GLM_STREAM(ctx));
+  } else {
+    fprintf(stderr, "glm_mla_decode_run: unsupported MLA head dims: ckv=%u kpe=%u\n", head_dim_ckv, head_dim_kpe);
+    return;
+  }
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_mla_decode_run failed: %s\n", cudaGetErrorString(status));
@@ -800,16 +863,26 @@ void glm_mla_kv_cache_append(
       static_cast<DType*>(ckv_data), static_cast<DType*>(kpe_data),
       indices, indptr, last_page_len, nullptr);
 
-  cudaError_t status = flashinfer::AppendPagedKVMlaCache(
-      paged_kv,
-      static_cast<DType*>(append_ckv),
-      static_cast<DType*>(append_kpe),
-      batch_indices,
-      positions,
-      nnz,
-      append_ckv_stride_n,
-      append_kpe_stride_n,
-      GLM_STREAM(ctx));
+  int num_sms = 0;
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, ctx->device_id);
+
+  constexpr uint32_t vec_size = 2;
+  cudaError_t status = cudaSuccess;
+
+  DISPATCH_MLA_HEAD_DIMS(head_dim_ckv, head_dim_kpe, {
+    uint32_t bdx = HEAD_DIM_CKV / vec_size;
+    auto kernel = flashinfer::AppendPagedKVMlaCacheKernel<HEAD_DIM_CKV, HEAD_DIM_KPE, vec_size, DType, IdType>;
+    int num_blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, bdx, 0);
+    num_blocks_per_sm = std::min(num_blocks_per_sm, (int)((nnz + num_sms - 1) / num_sms));
+    dim3 nblks(num_blocks_per_sm * num_sms);
+    dim3 nthrs(bdx);
+    void* args[] = {(void*)&paged_kv, (void*)&append_ckv, (void*)&append_kpe,
+                    (void*)&batch_indices, (void*)&positions, (void*)&nnz,
+                    (void*)&append_ckv_stride_n, (void*)&append_kpe_stride_n};
+    cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, GLM_STREAM(ctx));
+    status = cudaGetLastError();
+  });
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_mla_kv_cache_append failed: %s\n", cudaGetErrorString(status));

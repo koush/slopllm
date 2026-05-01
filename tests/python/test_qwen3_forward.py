@@ -72,7 +72,7 @@ def test_qwen3_forward_vs_hf(glm):
     with torch.no_grad():
         hf_logits = hf_model(input_ids).logits
 
-    max_diff = (our_logits - hf_logits.cpu()).abs().max().item()
+    max_diff = (our_logits - hf_logits.cpu()).abs().max().item() 
     mean_diff = (our_logits - hf_logits.cpu()).abs().mean().item()
     print(f"  Max diff vs HF: {max_diff:.4f}, Mean diff: {mean_diff:.4f}")
 

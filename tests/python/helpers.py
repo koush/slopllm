@@ -466,6 +466,7 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
         ]
 
         self.lib.glm_mla_decode_plan.restype = None
@@ -477,6 +478,7 @@ class GlmOps:
             ctypes.c_void_p,
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_bool,
+            ctypes.c_uint32, ctypes.c_uint32,
         ]
 
         self.lib.glm_mla_decode_run.restype = None
@@ -490,6 +492,7 @@ class GlmOps:
             ctypes.c_void_p,
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_float,
+            ctypes.c_uint32, ctypes.c_uint32,
         ]
 
         self.lib.glm_mla_kv_cache_append.restype = None
@@ -1118,7 +1121,8 @@ class GlmOps:
                         q_pe_stride_n, q_pe_stride_h,
                         ckv_stride_page, ckv_stride_n,
                         kpe_stride_page, kpe_stride_n,
-                        o_stride_n, o_stride_h):
+                        o_stride_n, o_stride_h,
+                        head_dim_ckv, head_dim_kpe):
         self.lib.glm_mla_prefill_run(
             self.ctx,
             ctypes.c_void_p(q_nope), ctypes.c_void_p(q_pe),
@@ -1133,14 +1137,16 @@ class GlmOps:
             ctypes.c_uint32(q_pe_stride_n), ctypes.c_uint32(q_pe_stride_h),
             ctypes.c_uint32(ckv_stride_page), ctypes.c_uint32(ckv_stride_n),
             ctypes.c_uint32(kpe_stride_page), ctypes.c_uint32(kpe_stride_n),
-            ctypes.c_uint32(o_stride_n), ctypes.c_uint32(o_stride_h)
+            ctypes.c_uint32(o_stride_n), ctypes.c_uint32(o_stride_h),
+            ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe)
         )
 
     def mla_decode_plan(self, float_ws, float_ws_size,
                         int_ws, pinned_int_ws, int_ws_size,
                         plan_info, indptr_h,
                         batch_size, num_qo_heads, page_size,
-                        enable_cuda_graph=False):
+                        enable_cuda_graph=False,
+                        head_dim_ckv=512, head_dim_kpe=64):
         self.lib.glm_mla_decode_plan(
             self.ctx,
             ctypes.c_void_p(float_ws), ctypes.c_size_t(float_ws_size),
@@ -1148,13 +1154,15 @@ class GlmOps:
             ctypes.c_void_p(plan_info),
             ctypes.c_void_p(indptr_h),
             ctypes.c_uint32(batch_size), ctypes.c_uint32(num_qo_heads),
-            ctypes.c_uint32(page_size), ctypes.c_bool(enable_cuda_graph)
+            ctypes.c_uint32(page_size), ctypes.c_bool(enable_cuda_graph),
+            ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe)
         )
 
     def mla_decode_run(self, q_nope, q_pe, ckv_data, kpe_data,
                        indices, indptr_d, last_page_len,
                        o, float_ws, int_ws, plan_info,
-                       batch_size, num_qo_heads, page_size, sm_scale):
+                       batch_size, num_qo_heads, page_size, sm_scale,
+                       head_dim_ckv=512, head_dim_kpe=64):
         self.lib.glm_mla_decode_run(
             self.ctx,
             ctypes.c_void_p(q_nope), ctypes.c_void_p(q_pe),
@@ -1164,7 +1172,8 @@ class GlmOps:
             ctypes.c_void_p(float_ws), ctypes.c_void_p(int_ws),
             ctypes.c_void_p(plan_info),
             ctypes.c_uint32(batch_size), ctypes.c_uint32(num_qo_heads),
-            ctypes.c_uint32(page_size), ctypes.c_float(sm_scale)
+            ctypes.c_uint32(page_size), ctypes.c_float(sm_scale),
+            ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe)
         )
 
     def mla_kv_cache_append(self, ckv_data, kpe_data,

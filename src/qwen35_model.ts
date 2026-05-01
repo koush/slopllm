@@ -139,8 +139,8 @@ export class Qwen35Model extends ChatModel {
     this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
   }
 
-  static fromPretrained(glm: DeviceOps, repoId: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Qwen35Model {
-    const modelDir = resolveModelPath(repoId);
+  static fromPretrained(glm: DeviceOps, repoIdOrDir: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Qwen35Model {
+    const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Qwen35Model(glm, config, maxBatch, maxSeqLen);
     model.loadWeights(modelDir);

@@ -395,7 +395,8 @@ void glm_mla_prefill_run(
     uint32_t q_pe_stride_n, uint32_t q_pe_stride_h,
     uint32_t ckv_stride_page, uint32_t ckv_stride_n,
     uint32_t kpe_stride_page, uint32_t kpe_stride_n,
-    uint32_t o_stride_n, uint32_t o_stride_h);
+    uint32_t o_stride_n, uint32_t o_stride_h,
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe);
 
 // MLA Decode: Plan phase
 // plan_info: output array of at least 10 int64_t elements (DecodePlanInfo)
@@ -406,7 +407,8 @@ void glm_mla_decode_plan(
     int64_t* plan_info,
     int32_t* indptr_h,
     uint32_t batch_size, uint32_t num_qo_heads,
-    uint32_t page_size, bool enable_cuda_graph);
+    uint32_t page_size, bool enable_cuda_graph,
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe);
 
 // MLA Decode: Run phase
 // q_nope: [batch_size, num_heads, head_dim_ckv] BF16
@@ -423,7 +425,8 @@ void glm_mla_decode_run(
     void* float_ws, void* int_ws,
     int64_t* plan_info,
     uint32_t batch_size, uint32_t num_qo_heads,
-    uint32_t page_size, float sm_scale);
+    uint32_t page_size, float sm_scale,
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe);
 
 // MLA: Append entries to paged KV cache
 // append_ckv: [nnz, head_dim_ckv] BF16

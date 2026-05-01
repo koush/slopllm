@@ -144,7 +144,8 @@ def test_mla_prefill_causal(glm, device):
         num_heads * HEAD_DIM_KPE, HEAD_DIM_KPE,
         PAGE_SIZE * HEAD_DIM_CKV, HEAD_DIM_CKV,
         PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
-        num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV)
+        num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
+        HEAD_DIM_CKV, HEAD_DIM_KPE)
 
     glm.synchronize()
 
@@ -217,7 +218,8 @@ def test_mla_prefill_noncausal(glm, device):
         num_heads * HEAD_DIM_KPE, HEAD_DIM_KPE,
         PAGE_SIZE * HEAD_DIM_CKV, HEAD_DIM_CKV,
         PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
-        num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV)
+        num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
+        HEAD_DIM_CKV, HEAD_DIM_KPE)
 
     glm.synchronize()
 
@@ -284,7 +286,8 @@ def test_mla_decode_single(glm, device):
         int_ws, pinned_int_ws, 8 * 1024 * 1024,
         ctypes.addressof(plan_info),
         ctypes.addressof(indptr_h),
-        B, num_heads, PAGE_SIZE, False)
+        B, num_heads, PAGE_SIZE, False,
+        head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
 
     o = torch.empty(B, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
     indptr_d = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
@@ -295,7 +298,8 @@ def test_mla_decode_single(glm, device):
         indices.data_ptr(), indptr_d.data_ptr(), last_page_len_d.data_ptr(),
         o.data_ptr(),
         float_ws, int_ws, ctypes.addressof(plan_info),
-        B, num_heads, PAGE_SIZE, sm_scale)
+        B, num_heads, PAGE_SIZE, sm_scale,
+        head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
 
     glm.synchronize()
 
@@ -374,7 +378,8 @@ def test_mla_decode_batch(glm, device):
         int_ws, pinned_int_ws, 8 * 1024 * 1024,
         ctypes.addressof(plan_info),
         ctypes.addressof(indptr_h),
-        B, num_heads, PAGE_SIZE, False)
+        B, num_heads, PAGE_SIZE, False,
+        head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
 
     o = torch.empty(B, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
 
@@ -384,7 +389,8 @@ def test_mla_decode_batch(glm, device):
         indices.data_ptr(), indptr_d.data_ptr(), last_page_len_d.data_ptr(),
         o.data_ptr(),
         float_ws, int_ws, ctypes.addressof(plan_info),
-        B, num_heads, PAGE_SIZE, sm_scale)
+        B, num_heads, PAGE_SIZE, sm_scale,
+        head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
 
     glm.synchronize()
 
@@ -507,7 +513,8 @@ def test_mla_decode_with_append(glm, device):
         int_ws, pinned_int_ws, 8 * 1024 * 1024,
         ctypes.addressof(plan_info),
         ctypes.addressof(indptr_h),
-        B, num_heads, PAGE_SIZE, False)
+        B, num_heads, PAGE_SIZE, False,
+        head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
 
     o = torch.empty(B, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
     indptr_d = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
@@ -518,7 +525,8 @@ def test_mla_decode_with_append(glm, device):
         indices.data_ptr(), indptr_d.data_ptr(), last_page_len.data_ptr(),
         o.data_ptr(),
         float_ws, int_ws, ctypes.addressof(plan_info),
-        B, num_heads, PAGE_SIZE, sm_scale)
+        B, num_heads, PAGE_SIZE, sm_scale,
+        head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
 
     glm.synchronize()
 
