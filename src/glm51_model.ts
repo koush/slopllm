@@ -14,6 +14,7 @@ export type { SamplingParams };
 export { ExecutionState as BatchState };
 
 const GLM51_REPO = "zai-org/GLM-5.1";
+const GLM51_MODEL_DIR = "tests/python/test_models/glm51_small/glm51_small_bf16";
 
 export interface Glm51Config extends CommonModelConfig {
   moeIntermediateSize: number;
@@ -130,7 +131,7 @@ export class Glm51Model extends ChatModel {
     this.invFreq = this.initInvFreq(config.qkRopeHeadDim, config.ropeTheta);
   }
 
-  static fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_REPO, maxBatch = 1, maxSeqLen = 4096): Glm51Model {
+  static fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, maxBatch = 1, maxSeqLen = 4096): Glm51Model {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Glm51Model(glm, config, maxBatch, maxSeqLen);
@@ -464,15 +465,7 @@ export class Glm51Model extends ChatModel {
       using _qAbsorbedR = qAbsorbedR;
       const qPeR = qPeLin.ropeTranspose(undefined!, undefined!, 0, qkRopeDim, nHeads, S, B, qkRopeDim);
       using _qPeR = qPeR;
-      ws.mlaKvCacheAppend(ckvNormed, kPeRaw, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim);
-      this.glm.mlaDecodePlan(
-        ws.floatWs, 128 * 1024 * 1024,
-        ws.intWs, ws.pinnedIntWs, 8 * 1024 * 1024,
-        ws.mlaDecodePlanInfo,
-        ws.indptrH,
-        batchSize, nHeads, pagedKV.pageSize, false,
-        kvLoraRank, qkRopeDim
-      );
+      ws.mlaKvCacheAppend(ckvNormed, kPeRaw, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim, state.isDecode);
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else if (useMla && !state.isDecode) {
       using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, qkRopeDim / 2, B, S));
@@ -497,7 +490,7 @@ export class Glm51Model extends ChatModel {
       const kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1);
       using _kPeRope = kPeRope;
 
-      ws.mlaKvCacheAppend(ckvNormed, kPeRope, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim);
+      ws.mlaKvCacheAppend(ckvNormed, kPeRope, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim, false);
       attnOut.replace(ws.mlaPrefillPaged(qAbsorbedR, qPeFinal, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else {
       throw new Error("GLM-5.1 requires MLA KV cache");

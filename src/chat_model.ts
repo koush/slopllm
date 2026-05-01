@@ -38,6 +38,7 @@ export interface CommonModelConfig {
   numKeyValueGroups: number;
   scaling: number;
   kvLoraRank?: number;
+  qkRopeHeadDim?: number;
 }
 
 export abstract class ChatModel extends WorkspaceBase {

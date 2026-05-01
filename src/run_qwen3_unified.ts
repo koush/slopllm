@@ -7,6 +7,8 @@ import { ChatModel, ChatCache, SamplingParams, makeSamplingParams } from "./chat
 import { MemcpyKind, Tensor, SamplingWorkspace } from "./tensor";
 import { AutoTokenizer } from "@huggingface/transformers";
 import { resolveModelPath } from "./model_path";
+import fs from "node:fs";
+import path from "node:path";
 import { createInterface } from "node:readline";
 import { ExecutionState, ExecutionWorkspace } from "./paged_kv";
 import { DeviceOps } from "./device_ops";
@@ -36,6 +38,7 @@ interface CliArgs {
   useGlm51: boolean;
   useFp8: boolean;
   useBatch: boolean;
+  modelDir: string | undefined;
   noCudaGraph: boolean;
   temperature: number;
   topP: number;
@@ -56,6 +59,7 @@ function parseArgs(argv: string[]): CliArgs {
     maxPages: 256,
     maxBatch: 4,
     noReset: true,
+    modelDir: undefined,
     prompt: undefined,
     useQwen35: false,
     useGlm51: false,
@@ -84,6 +88,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--no-kv-persist") args.noReset = false;
     else if (a === "--qwen35") args.useQwen35 = true;
     else if (a === "--glm51") args.useGlm51 = true;
+    else if (a === "--model-dir" && i + 1 < argv.length) args.modelDir = argv[++i];
     else if (a === "--fp8") args.useFp8 = true;
     else if (a === "--batch") args.useBatch = true;
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
@@ -124,23 +129,21 @@ function modelLabel(args: CliArgs): string {
 function tokenizeMessages(
   tokenizer: any,
   messages: Array<{ role: string; content: string }>,
+  chatTemplate?: string,
 ): number[] {
   try {
-    const result = tokenizer.apply_chat_template(messages, {
+    const opts: any = {
       tokenize: true,
       add_generation_prompt: true,
       return_tensor: false,
       return_dict: true,
-    }) as { input_ids: number[] | number[][] };
+    };
+    if (chatTemplate) opts.chat_template = chatTemplate;
+    const result = tokenizer.apply_chat_template(messages, opts) as { input_ids: number[] | number[][] };
     return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
   } catch {
-    const result = tokenizer.apply_chat_template(messages, {
-      tokenize: true,
-      add_generation_prompt: true,
-      return_tensor: false,
-      return_dict: true,
-    }) as { input_ids: number[] | number[][] };
-    return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
+    const text = messages.map(m => `<|${m.role}|>\n${m.content}`).join("\n") + "\n<|assistant|>\n";
+    return tokenizer.encode(text, { add_special_tokens: false });
   }
 }
 
@@ -332,7 +335,7 @@ export function generateBatchTokens(
 
 async function interactiveChat(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
-  tokenizer: any, args: CliArgs, graphState?: GraphState,
+  tokenizer: any, args: CliArgs, graphState: GraphState | undefined, chatTemplate?: string,
 ): Promise<void> {
   const sp = makeSamplingParams(args);
   const eosIds = model.eosIds;
@@ -358,16 +361,16 @@ async function interactiveChat(
       }
 
       messages.push({ role: "user", content: userInput });
-      const inputIds = tokenizeMessages(tokenizer, messages);
+      const inputIds = tokenizeMessages(tokenizer, messages, chatTemplate);
 
       if (inputIds.length > args.maxSeqLen - args.maxNewTokens) {
         console.log(`Warning: prompt (${inputIds.length} tokens) too long, truncating conversation`);
         while (inputIds.length > args.maxSeqLen - args.maxNewTokens && messages.length > 1) {
           messages.splice(1, 2);
-          const retryIds = tokenizeMessages(tokenizer, messages);
+          const retryIds = tokenizeMessages(tokenizer, messages, chatTemplate);
           if (retryIds.length <= args.maxSeqLen - args.maxNewTokens) break;
         }
-        if (messages.length === 1 && tokenizeMessages(tokenizer, messages).length > args.maxSeqLen - args.maxNewTokens) {
+        if (messages.length === 1 && tokenizeMessages(tokenizer, messages, chatTemplate).length > args.maxSeqLen - args.maxNewTokens) {
           console.log("Conversation too long even after truncation. Use /clear to reset.");
           messages.pop();
           continue;
@@ -403,12 +406,12 @@ async function interactiveChat(
 
 async function singlePrompt(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
-  tokenizer: any, args: CliArgs, graphState?: GraphState,
+  tokenizer: any, args: CliArgs, graphState: GraphState | undefined, chatTemplate?: string,
 ): Promise<void> {
   const sp = !args.greedy ? makeSamplingParams(args) : undefined;
   const eosIds = model.eosIds;
   const messages = [{ role: "user", content: args.prompt! }];
-  const inputIds = tokenizeMessages(tokenizer, messages);
+  const inputIds = tokenizeMessages(tokenizer, messages, chatTemplate);
 
   console.log(`Prompt: ${args.prompt}`);
   console.log(`Tokens: ${inputIds.length}`);
@@ -438,7 +441,7 @@ async function singlePrompt(
 
 async function interactiveBatch(
   model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache,
-  tokenizer: any, args: CliArgs,
+  tokenizer: any, args: CliArgs, chatTemplate?: string,
 ): Promise<void> {
   console.log("Enter prompts one per line. Empty line to submit batch. /clear to reset, /q to quit.");
 
@@ -473,7 +476,7 @@ async function interactiveBatch(
       const inputIdsList: number[][] = [];
       for (const prompt of prompts) {
         const messages = [{ role: "user" as const, content: prompt }];
-        const ids = tokenizeMessages(tokenizer, messages);
+        const ids = tokenizeMessages(tokenizer, messages, chatTemplate);
         inputIdsList.push(ids);
       }
 
@@ -516,16 +519,20 @@ async function main(): Promise<void> {
     : args.useQwen35 ? QWEN35_REPO
     : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
 
+  const modelDir = args.modelDir ?? (args.useGlm51 ? "tests/python/test_models/glm51_small/glm51_small_bf16" : resolveModelPath(repoId));
   const model: ChatModel = args.useGlm51
-    ? Glm51Model.fromPretrained(glm, GLM51_REPO, args.maxBatch, args.maxSeqLen)
+    ? Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
     : args.useQwen35
-    ? Qwen35Model.fromPretrained(glm, QWEN35_REPO, args.maxBatch, args.maxSeqLen)
-    : Qwen3Model.fromPretrained(glm, repoId, args.maxBatch, args.maxSeqLen);
+    ? Qwen35Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
+    : Qwen3Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen);
   const cache = model.createChatCache(args.maxPages);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
 
-  const modelDir = resolveModelPath(repoId);
-  const tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
+  const tokenizerDir = args.modelDir && fs.existsSync(path.join(args.modelDir, "tokenizer_config.json"))
+    ? args.modelDir : resolveModelPath(repoId);
+  const tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
+  const chatTemplatePath = path.join(tokenizerDir, "chat_template.jinja");
+  const chatTemplate = fs.existsSync(chatTemplatePath) ? fs.readFileSync(chatTemplatePath, "utf-8") : undefined;
 
   const sp = makeSamplingParams(args);
   const samplingParts: string[] = [];
@@ -548,14 +555,14 @@ async function main(): Promise<void> {
   };
 
   if (args.useBatch) {
-    await interactiveBatch(model, ws, cache, tokenizer, args);
+    await interactiveBatch(model, ws, cache, tokenizer, args, chatTemplate);
   } else {
     const graphState = args.noCudaGraph ? undefined : { graphExec: null as number | null, warmupRemaining: args.warmupSteps };
 
     if (args.prompt) {
-      await singlePrompt(model, ws, glm, cache, tokenizer, args, graphState);
+      await singlePrompt(model, ws, glm, cache, tokenizer, args, graphState, chatTemplate);
     } else {
-      await interactiveChat(model, ws, glm, cache, tokenizer, args, graphState);
+      await interactiveChat(model, ws, glm, cache, tokenizer, args, graphState, chatTemplate);
     }
   }
 
