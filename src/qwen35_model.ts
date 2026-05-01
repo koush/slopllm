@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
-import { ChatModel, SamplingParams } from "./chat_model";
+import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, GdnQkvLayout, TensorParallelism } from "./device_ops";
 import { f32ToBf16Bytes, GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
@@ -50,20 +50,10 @@ export type { SamplingParams };
 
 const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
 
-export interface Qwen35Config {
-  hiddenSize: number;
-  intermediateSize: number;
-  numHiddenLayers: number;
-  rmsNormEps: number;
-  vocabSize: number;
-  tieWordEmbeddings: boolean;
-  numAttentionHeads: number;
-  numKeyValueHeads: number;
-  headDim: number;
+export interface Qwen35Config extends CommonModelConfig {
   partialRotaryFactor: number;
   mropeSection: number[];
   mropeInterleaved: boolean;
-  ropeTheta: number;
   attnOutputGate: boolean;
   linearNumKeyHeads: number;
   linearKeyHeadDim: number;
@@ -71,8 +61,6 @@ export interface Qwen35Config {
   linearValueHeadDim: number;
   linearConvKernelDim: number;
   layerTypes: string[];
-  numKeyValueGroups: number;
-  scaling: number;
   numFullAttnLayers: number;
   numGdnLayers: number;
   fullAttnLayerIndices: number[];
@@ -96,10 +84,12 @@ function loadConfig(modelDir: string): Qwen35Config {
     numAttentionHeads: tc.num_attention_heads,
     numKeyValueHeads: tc.num_key_value_heads,
     headDim: tc.head_dim,
+    ropeTheta: ropeParams.rope_theta ?? 1000000,
+    numKeyValueGroups: tc.num_attention_heads / tc.num_key_value_heads,
+    scaling: Math.pow(tc.head_dim, -0.5),
     partialRotaryFactor: ropeParams.partial_rotary_factor ?? 1.0,
     mropeSection: ropeParams.mrope_section ?? [],
     mropeInterleaved: ropeParams.mrope_interleaved ?? false,
-    ropeTheta: ropeParams.rope_theta ?? 1000000,
     attnOutputGate: tc.attn_output_gate ?? false,
     linearNumKeyHeads: tc.linear_num_key_heads ?? 16,
     linearKeyHeadDim: tc.linear_key_head_dim ?? 128,
@@ -107,8 +97,6 @@ function loadConfig(modelDir: string): Qwen35Config {
     linearValueHeadDim: tc.linear_value_head_dim ?? 128,
     linearConvKernelDim: tc.linear_conv_kernel_dim ?? 4,
     layerTypes,
-    numKeyValueGroups: tc.num_attention_heads / tc.num_key_value_heads,
-    scaling: Math.pow(tc.head_dim, -0.5),
     numFullAttnLayers,
     numGdnLayers,
     fullAttnLayerIndices,
@@ -128,15 +116,8 @@ export class Qwen35Model extends ChatModel {
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
-
     const ropeDim = Math.floor(config.headDim * config.partialRotaryFactor);
-    const halfRopeDim = ropeDim / 2;
-    const invFreqF32 = new Float32Array(halfRopeDim);
-    for (let i = 0; i < halfRopeDim; i++) {
-      invFreqF32[i] = 1.0 / Math.pow(config.ropeTheta, (2 * i) / ropeDim);
-    }
-    this.invFreq = this.alloc([halfRopeDim], "BF16", "invFreq");
-    this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
+    this.invFreq = this.initInvFreq(ropeDim, config.ropeTheta);
   }
 
   static fromPretrained(glm: DeviceOps, repoIdOrDir: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Qwen35Model {
@@ -239,10 +220,7 @@ export class Qwen35Model extends ChatModel {
   }
 
   protected tieWeights(): void {
-    if (this.cfg.tieWordEmbeddings && !this.tensors.has("lm_head.weight")) {
-      const embedTensor = this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}embed_tokens.weight`)!;
-      this.tensors.set("lm_head.weight", embedTensor);
-    }
+    this.tieEmbeddingToLmHead(`${Qwen35Model.WEIGHT_PREFIX}embed_tokens.weight`);
   }
 
   createGdnState(batchSize = 1): Qwen35GdnState {
@@ -264,10 +242,7 @@ export class Qwen35Model extends ChatModel {
   }
 
   private mlp(normed: Tensor, pfx: string, BS: number): Tensor {
-    using gateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS);
-    using upBuf = normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS);
-    using siluBuf = gateBuf.siluAndMul(gateBuf, upBuf, this.cfg.intermediateSize, BS);
-    return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
+    return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
   }
 
   private gdnLayerPrefill(ws: ExecutionWorkspace, normed: Tensor, residual: Tensor, layerIdx: number, S: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
@@ -325,7 +300,7 @@ export class Qwen35Model extends ChatModel {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  private gdnLayerDecode(ws: ExecutionWorkspace, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
+  private gdnLayerDecode(ws: ExecutionWorkspace, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState, batchSize: number): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const linKDim = cfg.linearKeyHeadDim;
@@ -336,7 +311,7 @@ export class Qwen35Model extends ChatModel {
     const fullConvStateStride = fullConvDim * (cfg.linearConvKernelDim - 1);
     const fullRecurrentStateStride = fullLinHeads * linKDim * linVDim;
     const pfx = `${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.linear_attn`;
-    const BS = gdnState.batchSize;
+    const BS = batchSize;
 
     using qkvBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_qkv.weight`)!, BS);
     using aBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_a.weight`)!, BS);
@@ -470,7 +445,7 @@ export class Qwen35Model extends ChatModel {
       let result: { normed: Tensor, residual: Tensor };
       if (cfg.layerTypes[i] === "linear_attention") {
         if (state.isDecode) {
-          result = this.gdnLayerDecode(ws, normed.value, residual.value, i, gdnState);
+          result = this.gdnLayerDecode(ws, normed.value, residual.value, i, gdnState, batchSize);
         } else {
           result = this.gdnLayerPrefill(ws, normed.value, residual.value, i, totalTokens, gdnState);
         }
@@ -481,14 +456,6 @@ export class Qwen35Model extends ChatModel {
       residual.replace(result.residual);
     }
 
-    let logitsBuf: Tensor;
-    if (state.isDecode) {
-      logitsBuf = normed.value.linear(this.tensors.get("lm_head.weight")!, batchSize);
-    } else {
-      using hiddenLast = normed.value.indexSelect(ws.lastIdx, hs, batchSize);
-      logitsBuf = hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
-    }
-
-    return logitsBuf.removeTracking();
+    return this.computeLogits(normed.value, state);
   }
 }

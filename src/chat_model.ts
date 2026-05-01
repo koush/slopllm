@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DeviceOps } from "./device_ops";
-import { mmapOpen, mmapClose } from "./glm_ops";
+import { f32ToBf16Bytes, mmapOpen, mmapClose } from "./glm_ops";
 import { PagedKVCache, ExecutionState } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
@@ -25,10 +25,18 @@ export interface ChatCache extends Disposable {
 }
 
 export interface CommonModelConfig {
+  hiddenSize: number;
+  intermediateSize: number;
+  numHiddenLayers: number;
+  rmsNormEps: number;
+  vocabSize: number;
+  tieWordEmbeddings: boolean;
   numAttentionHeads: number;
   numKeyValueHeads: number;
   headDim: number;
-  vocabSize: number;
+  ropeTheta: number;
+  numKeyValueGroups: number;
+  scaling: number;
   kvLoraRank?: number;
 }
 
@@ -44,6 +52,47 @@ export abstract class ChatModel extends WorkspaceBase {
   abstract forward(state: ExecutionState): Tensor;
 
   prefillBatchPlanHook(_inputIdsList: number[][], _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void {}
+
+  protected initInvFreq(ropeDim: number, ropeTheta: number): Tensor {
+    const halfDim = ropeDim / 2;
+    const invFreqF32 = new Float32Array(halfDim);
+    for (let i = 0; i < halfDim; i++) {
+      invFreqF32[i] = 1.0 / Math.pow(ropeTheta, (2 * i) / ropeDim);
+    }
+    const invFreq = this.alloc([halfDim], "BF16", "invFreq");
+    invFreq.h2d(f32ToBf16Bytes(invFreqF32));
+    return invFreq;
+  }
+
+  protected swiGluMlp(normed: Tensor, pfx: string, intermediateSize: number, BS: number): Tensor {
+    using upStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS));
+    using upBuf = upStream.result;
+    using gateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS);
+    upStream.streamWaitEvent();
+    using siluBuf = gateBuf.siluAndMul(gateBuf, upBuf, intermediateSize, BS);
+    return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
+  }
+
+  protected computeLogits(normed: Tensor, state: ExecutionState): Tensor {
+    const hs = this.cfg.hiddenSize;
+    const ws = state.ws;
+    const batchSize = state.batchSize;
+    let logitsBuf: Tensor;
+    if (state.isDecode) {
+      logitsBuf = normed.linear(this.tensors.get("lm_head.weight")!, batchSize);
+    } else {
+      using hiddenLast = normed.indexSelect(ws.lastIdx, hs, batchSize);
+      logitsBuf = hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
+    }
+    return logitsBuf.removeTracking();
+  }
+
+  protected tieEmbeddingToLmHead(embedName: string): void {
+    if (this.cfg.tieWordEmbeddings && !this.tensors.has("lm_head.weight")) {
+      const embedTensor = this.tensors.get(embedName);
+      if (embedTensor) this.tensors.set("lm_head.weight", embedTensor);
+    }
+  }
 
   protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void;  protected tieWeights(): void {}
 

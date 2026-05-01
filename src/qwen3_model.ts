@@ -1,9 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
-import { ChatModel, SamplingParams } from "./chat_model";
+import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
-import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { ExecutionState } from "./paged_kv";
 import { PagedKVCache } from "./paged_kv";
@@ -14,38 +13,26 @@ import { UsingHolder } from "./using-holder";
 export { ExecutionState as BatchState };
 export type { SamplingParams };
 
-export interface Qwen3Config {
-  hiddenSize: number;
-  numAttentionHeads: number;
-  numKeyValueHeads: number;
-  headDim: number;
-  intermediateSize: number;
-  numHiddenLayers: number;
-  rmsNormEps: number;
-  ropeTheta: number;
-  vocabSize: number;
-  tieWordEmbeddings: boolean;
+export interface Qwen3Config extends CommonModelConfig {
   attentionBias: boolean;
-  numKeyValueGroups: number;
-  scaling: number;
 }
 
 function loadConfig(modelDir: string): Qwen3Config {
   const raw = JSON.parse(fs.readFileSync(path.join(modelDir, "config.json"), "utf-8"));
   return {
     hiddenSize: raw.hidden_size,
-    numAttentionHeads: raw.num_attention_heads,
-    numKeyValueHeads: raw.num_key_value_heads,
-    headDim: raw.head_dim,
     intermediateSize: raw.intermediate_size,
     numHiddenLayers: raw.num_hidden_layers,
     rmsNormEps: raw.rms_norm_eps,
-    ropeTheta: raw.rope_theta,
     vocabSize: raw.vocab_size,
     tieWordEmbeddings: raw.tie_word_embeddings ?? false,
-    attentionBias: raw.attention_bias ?? false,
+    numAttentionHeads: raw.num_attention_heads,
+    numKeyValueHeads: raw.num_key_value_heads,
+    headDim: raw.head_dim,
+    ropeTheta: raw.rope_theta,
     numKeyValueGroups: raw.num_attention_heads / raw.num_key_value_heads,
     scaling: Math.pow(raw.head_dim, -0.5),
+    attentionBias: raw.attention_bias ?? false,
   };
 }
 
@@ -61,14 +48,7 @@ export class Qwen3Model extends ChatModel {
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
-
-    const halfDim = config.headDim / 2;
-    const invFreqF32 = new Float32Array(halfDim);
-    for (let i = 0; i < halfDim; i++) {
-      invFreqF32[i] = 1.0 / Math.pow(config.ropeTheta, (2 * i) / config.headDim);
-    }
-    this.invFreq = this.alloc([halfDim], "BF16", "invFreq");
-    this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
+    this.invFreq = this.initInvFreq(config.headDim, config.ropeTheta);
   }
 
   static fromPretrained(glm: DeviceOps, repoIdOrDir: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {
@@ -120,10 +100,7 @@ export class Qwen3Model extends ChatModel {
   }
 
   protected tieWeights(): void {
-    if (this.cfg.tieWordEmbeddings && !this.tensors.has("lm_head.weight")) {
-      const embedTensor = this.tensors.get("model.embed_tokens.weight")!;
-      this.tensors.set("lm_head.weight", embedTensor);
-    }
+    this.tieEmbeddingToLmHead("model.embed_tokens.weight");
   }
 
   createChatCache(maxPages = 256): ChatCache {
@@ -131,12 +108,7 @@ export class Qwen3Model extends ChatModel {
   }
 
   private mlp(normed: Tensor, BS: number, pfx: string): Tensor {
-    using upStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS));
-    using upBuf = upStream.result;
-    using gateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS);
-    upStream.streamWaitEvent();
-    using siluBuf = gateBuf.siluAndMul(gateBuf, upBuf, this.cfg.intermediateSize, BS);
-    return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
+    return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
   }
 
   forward(state: ExecutionState): Tensor {
@@ -216,14 +188,6 @@ export class Qwen3Model extends ChatModel {
       residual.replace(mlpResult.residual);
     }
 
-    let logitsBuf: Tensor;
-    if (state.isDecode) {
-      logitsBuf = normed.value.linear(this.tensors.get("lm_head.weight")!, batchSize);
-    } else {
-      using hiddenLast = normed.value.indexSelect(ws.lastIdx, hs, batchSize);
-      logitsBuf = hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
-    }
-
-    return logitsBuf.removeTracking();
+    return this.computeLogits(normed.value, state);
   }
 }

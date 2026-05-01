@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
-import { ChatModel, SamplingParams } from "./chat_model";
+import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import { bf16BytesToF32, f32ToBf16Bytes, GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
@@ -15,17 +15,8 @@ export { ExecutionState as BatchState };
 
 const GLM51_REPO = "zai-org/GLM-5.1";
 
-export interface Glm51Config {
-  hiddenSize: number;
-  intermediateSize: number;
+export interface Glm51Config extends CommonModelConfig {
   moeIntermediateSize: number;
-  numHiddenLayers: number;
-  rmsNormEps: number;
-  vocabSize: number;
-  tieWordEmbeddings: boolean;
-  numAttentionHeads: number;
-  numKeyValueHeads: number;
-  headDim: number;
   kvLoraRank: number;
   qLoraRank: number;
   qkNopeHeadDim: number;
@@ -42,12 +33,9 @@ export interface Glm51Config {
   indexTopk: number;
   indexHeadDim: number;
   indexNHeads: number;
-  ropeTheta: number;
-  scaling: number;
   mlpLayerTypes: string[];
   numDenseMlpLayers: number;
   firstSparseMlpLayer: number;
-  numKeyValueGroups: number;
 }
 
 function loadConfig(modelDir: string): Glm51Config {
@@ -70,6 +58,9 @@ function loadConfig(modelDir: string): Glm51Config {
     numAttentionHeads: raw.num_attention_heads,
     numKeyValueHeads: raw.num_key_value_heads,
     headDim: qkHeadDim,
+    ropeTheta: raw.rope_parameters?.rope_theta ?? raw.rope_theta ?? 1000000,
+    numKeyValueGroups: raw.num_attention_heads / raw.num_key_value_heads,
+    scaling: Math.pow(qkHeadDim, -0.5),
     kvLoraRank: raw.kv_lora_rank,
     qLoraRank: raw.q_lora_rank,
     qkNopeHeadDim,
@@ -86,12 +77,9 @@ function loadConfig(modelDir: string): Glm51Config {
     indexTopk: raw.index_topk ?? 256,
     indexHeadDim: raw.index_head_dim ?? 64,
     indexNHeads: raw.index_n_heads ?? 4,
-    ropeTheta: raw.rope_parameters?.rope_theta ?? raw.rope_theta ?? 1000000,
-    scaling: Math.pow(qkHeadDim, -0.5),
     mlpLayerTypes,
     numDenseMlpLayers,
     firstSparseMlpLayer: firstSparseMlpLayer >= 0 ? firstSparseMlpLayer : numDenseMlpLayers,
-    numKeyValueGroups: raw.num_attention_heads / raw.num_key_value_heads,
   };
 }
 
@@ -139,15 +127,7 @@ export class Glm51Model extends ChatModel {
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
     this.eosIds = new Set(config.vocabSize > 200000 ? [154820, 154827, 154829] : [151645, 151643]);
-
-    const ropeDim = config.qkRopeHeadDim;
-    const halfRopeDim = ropeDim / 2;
-    const invFreqF32 = new Float32Array(halfRopeDim);
-    for (let i = 0; i < halfRopeDim; i++) {
-      invFreqF32[i] = 1.0 / Math.pow(config.ropeTheta, (2 * i) / ropeDim);
-    }
-    this.invFreq = this.alloc([halfRopeDim], "BF16", "invFreq");
-    this.invFreq.h2d(f32ToBf16Bytes(invFreqF32));
+    this.invFreq = this.initInvFreq(config.qkRopeHeadDim, config.ropeTheta);
   }
 
   static fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_REPO, maxBatch = 1, maxSeqLen = 4096): Glm51Model {
@@ -300,10 +280,7 @@ export class Glm51Model extends ChatModel {
   }
 
   protected tieWeights(): void {
-    if (this.cfg.tieWordEmbeddings && !this.tensors.has("lm_head.weight")) {
-      const embedTensor = this.tensors.get("model.embed_tokens.weight")!;
-      this.tensors.set("lm_head.weight", embedTensor);
-    }
+    this.tieEmbeddingToLmHead("model.embed_tokens.weight");
 
     const cfg = this.cfg;
     const nHeads = cfg.numAttentionHeads;
@@ -331,10 +308,7 @@ export class Glm51Model extends ChatModel {
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
-    using gateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS);
-    using upBuf = normed.linear(this.tensors.get(`${pfx}.mlp.up_proj.weight`)!, BS);
-    using siluBuf = gateBuf.siluAndMul(gateBuf, upBuf, this.cfg.intermediateSize, BS);
-    return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
+    return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
   }
 
   private mlpSparse(normed: Tensor, pfx: string, BS: number): Tensor {
@@ -570,14 +544,6 @@ export class Glm51Model extends ChatModel {
       residual.replace(result.residual);
     }
 
-    let logitsBuf: Tensor;
-    if (state.isDecode) {
-      logitsBuf = normed.value.linear(this.tensors.get("lm_head.weight")!, batchSize);
-    } else {
-      using hiddenLast = normed.value.indexSelect(ws.lastIdx, hs, batchSize);
-      logitsBuf = hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
-    }
-
-    return logitsBuf.removeTracking();
+    return this.computeLogits(normed.value, state);
   }
 }
