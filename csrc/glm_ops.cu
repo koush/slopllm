@@ -1520,6 +1520,137 @@ void glm_reduce_sum(GlmCtx* ctx, void* out, const void* input, int rows, int col
 }
 
 // ---------------------------------------------------------------------------
+// Row-normalize kernel (L1-normalize rows and scale)
+//   input:  [rows, cols]  BF16
+//   output: [rows, cols]  BF16
+//   if normalize: output[i,:] = input[i,:] / sum(|input[i,:]|) * scale
+//   else:         output[i,:] = input[i,:] * scale
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) row_normalize_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* input,
+    float scale,
+    int rows, int cols, bool normalize
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const __nv_bfloat16* row_in = input + row * cols;
+    __nv_bfloat16* row_out = out + row * cols;
+
+    if (!normalize) {
+        for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+            row_out[c] = __float2bfloat16(__bfloat162float(row_in[c]) * scale);
+        }
+        return;
+    }
+
+    extern __shared__ float sdata[];
+    float thread_sum = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        float v = __bfloat162float(row_in[c]);
+        thread_sum += fabsf(v);
+    }
+    sdata[threadIdx.x] = thread_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    float row_sum = sdata[0];
+    float inv_sum = (row_sum > 0.0f) ? (scale / row_sum) : 0.0f;
+
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        row_out[c] = __float2bfloat16(__bfloat162float(row_in[c]) * inv_sum);
+    }
+}
+
+void glm_row_normalize(GlmCtx* ctx, void* out, const void* input,
+                        float scale, int rows, int cols, bool normalize) {
+    cudaSetDevice(ctx->device_id);
+    int block_size = compute_block_size(cols);
+    size_t shared_mem = block_size * sizeof(float);
+    row_normalize_kernel<<<rows, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+        scale, rows, cols, normalize);
+}
+
+// ---------------------------------------------------------------------------
+// Group-mask multiply kernel
+//   scores:     [batch, num_experts]       BF16 (in-place)
+//   group_mask: [batch, n_group]           BF16
+//   For each batch b and expert e:
+//     group = e / experts_per_group
+//     scores[b, e] *= group_mask[b, group]
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) group_mask_mul_kernel(
+    __nv_bfloat16* scores,
+    const __nv_bfloat16* group_mask,
+    int num_experts, int experts_per_group, int n_group, int batch
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * num_experts;
+    if (idx >= total) return;
+    int b = idx / num_experts;
+    int e = idx % num_experts;
+    int g = e / experts_per_group;
+    float mask_val = __bfloat162float(group_mask[b * n_group + g]);
+    float score_val = __bfloat162float(scores[idx]);
+    scores[idx] = __float2bfloat16(score_val * mask_val);
+}
+
+void glm_group_mask_mul(GlmCtx* ctx, void* scores, const void* group_mask,
+                         int num_experts, int experts_per_group, int n_group, int batch) {
+    cudaSetDevice(ctx->device_id);
+    int total = batch * num_experts;
+    int block_size = 256;
+    int grid = (total + block_size - 1) / block_size;
+    group_mask_mul_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)scores, (const __nv_bfloat16*)group_mask,
+        num_experts, experts_per_group, n_group, batch);
+}
+
+// ---------------------------------------------------------------------------
+// Expert-scale kernel
+//   out:      [batch]       BF16
+//   weights:  [batch, topK] BF16
+//   indices:  [batch, topK] int32
+//   For each batch b, find the first k where indices[b, k] == expert_id,
+//   then out[b] = weights[b, k]. If not found, out[b] = 0.
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) expert_scale_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* weights,
+    const int* indices,
+    int expert_id, int topK, int batch
+) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) return;
+    float scale = 0.0f;
+    for (int k = 0; k < topK; k++) {
+        if (indices[b * topK + k] == expert_id) {
+            scale = __bfloat162float(weights[b * topK + k]);
+            break;
+        }
+    }
+    out[b] = __float2bfloat16(scale);
+}
+
+void glm_expert_scale(GlmCtx* ctx, void* out, const void* weights,
+                       const int* indices, int expert_id, int topK, int batch) {
+    cudaSetDevice(ctx->device_id);
+    int block_size = 256;
+    int grid = (batch + block_size - 1) / block_size;
+    expert_scale_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)weights,
+        indices, expert_id, topK, batch);
+}
+
+// ---------------------------------------------------------------------------
 // Index-select kernel (gather rows by index)
 //   src:      [src_rows, dim]  BF16
 //   indices:  [k]              int32

@@ -153,6 +153,15 @@ void glm_mul(GlmCtx* ctx, void* out, const void* a, const void* b, int n);
 
 void glm_reduce_sum(GlmCtx* ctx, void* out, const void* input, int rows, int cols);
 
+void glm_row_normalize(GlmCtx* ctx, void* out, const void* input,
+                        float scale, int rows, int cols, bool normalize);
+
+void glm_group_mask_mul(GlmCtx* ctx, void* scores, const void* group_mask,
+                         int num_experts, int experts_per_group, int n_group, int batch);
+
+void glm_expert_scale(GlmCtx* ctx, void* out, const void* weights,
+                       const int* indices, int expert_id, int topK, int batch);
+
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
                        const void* indices, int dim, int k);
 

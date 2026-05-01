@@ -629,6 +629,24 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
+        self.lib.glm_row_normalize.restype = None
+        self.lib.glm_row_normalize.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_bool,
+        ]
+
+        self.lib.glm_group_mask_mul.restype = None
+        self.lib.glm_group_mask_mul.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_expert_scale.restype = None
+        self.lib.glm_expert_scale.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
             self.lib.glm_free(self.ctx)
@@ -1352,4 +1370,29 @@ class GlmOps:
             self._ptr(attn_out),
             self._ptr(gate_interleaved),
             batch_seq, num_heads, head_dim
+        )
+
+    def row_normalize(self, output, input, scale, rows, cols, normalize=True):
+        self.lib.glm_row_normalize(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input),
+            ctypes.c_float(scale), rows, cols, ctypes.c_bool(normalize)
+        )
+
+    def group_mask_mul(self, scores, group_mask, num_experts, experts_per_group, n_group, batch):
+        self.lib.glm_group_mask_mul(
+            self.ctx,
+            self._ptr(scores),
+            self._ptr(group_mask),
+            num_experts, experts_per_group, n_group, batch
+        )
+
+    def expert_scale(self, output, weights, indices, expert_id, top_k, batch):
+        self.lib.glm_expert_scale(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(weights),
+            self._ptr(indices),
+            expert_id, top_k, batch
         )

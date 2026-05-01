@@ -126,6 +126,10 @@ interface NativeAddon {
   maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void;
   applyRotaryPosEmbPartial(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
   rowScaleAdd(ctx: number, out: number, input: number, scales: number, rows: number, dim: number): void;
+  reduceSum(ctx: number, out: number, input: number, rows: number, cols: number): void;
+  rowNormalize(ctx: number, out: number, input: number, scale: number, rows: number, cols: number, normalize: boolean): void;
+  groupMaskMul(ctx: number, scores: number, groupMask: number, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void;
+  expertScale(ctx: number, out: number, weights: number, indices: number, expertId: number, topK: number, batch: number): void;
 }
 
 export class GlmTensor extends Tensor {
@@ -380,6 +384,26 @@ export class GlmTensor extends Tensor {
 
   rowScaleAdd(input: Tensor, scales: Tensor, rows: number, dim: number): void {
     getNativeAddon().rowScaleAdd(this.glm.ctx, this.data, input.data, scales.data, rows, dim);
+  }
+
+  reduceSum(dim: number, batch: number): Tensor {
+    const out = this.workspace.alloc([batch], this.type);
+    getNativeAddon().reduceSum(this.glm.ctx, out.data, this.data, batch, dim);
+    return out;
+  }
+
+  rowNormalize(scale: number, dim: number, batch: number, normalize: boolean = true): Tensor {
+    const out = this.workspace.alloc([batch, dim], this.type);
+    getNativeAddon().rowNormalize(this.glm.ctx, out.data, this.data, scale, batch, dim, normalize);
+    return out;
+  }
+
+  groupMaskMul(groupMask: Tensor, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void {
+    getNativeAddon().groupMaskMul(this.glm.ctx, this.data, groupMask.data, numExperts, expertsPerGroup, nGroup, batch);
+  }
+
+  expertScale(weights: Tensor, indices: Tensor, expertId: number, topK: number, batch: number): void {
+    getNativeAddon().expertScale(this.glm.ctx, this.data, weights.data, indices.data, expertId, topK, batch);
   }
 
   doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
@@ -680,6 +704,18 @@ export class GlmOps implements DeviceOps {
 
   rowScaleAdd(ctx: number, out: number, input: number, scales: number, rows: number, dim: number): void {
     getNativeAddon().rowScaleAdd(ctx, out, input, scales, rows, dim);
+  }
+
+  rowNormalize(ctx: number, out: number, input: number, scale: number, rows: number, cols: number, normalize: boolean): void {
+    getNativeAddon().rowNormalize(ctx, out, input, scale, rows, cols, normalize);
+  }
+
+  groupMaskMul(ctx: number, scores: number, groupMask: number, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void {
+    getNativeAddon().groupMaskMul(ctx, scores, groupMask, numExperts, expertsPerGroup, nGroup, batch);
+  }
+
+  expertScale(ctx: number, out: number, weights: number, indices: number, expertId: number, topK: number, batch: number): void {
+    getNativeAddon().expertScale(ctx, out, weights, indices, expertId, topK, batch);
   }
 }
 

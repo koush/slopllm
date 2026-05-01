@@ -298,6 +298,20 @@ export abstract class Tensor implements Disposable {
   rowScaleAdd(input: Tensor, scales: Tensor, rows: number, dim: number): void {
   }
 
+  reduceSum(dim: number, batch: number): Tensor {
+    return undefined as never;
+  }
+
+  rowNormalize(scale: number, dim: number, batch: number, normalize?: boolean): Tensor {
+    return undefined as never;
+  }
+
+  groupMaskMul(groupMask: Tensor, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void {
+  }
+
+  expertScale(weights: Tensor, indices: Tensor, expertId: number, topK: number, batch: number): void {
+  }
+
   readInt32LE(): number[] {
     const count = numElements(this.shape);
     const buf = Buffer.alloc(count * 4);

@@ -726,6 +726,67 @@ static Napi::Value ReduceSum(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value RowNormalize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (ctx, out, input, scale, rows, cols, normalize)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    float scale = info[3].As<Napi::Number>().FloatValue();
+    int rows = info[4].As<Napi::Number>().Int32Value();
+    int cols = info[5].As<Napi::Number>().Int32Value();
+    bool normalize = info[6].As<Napi::Boolean>().Value();
+    glm_row_normalize(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                       reinterpret_cast<void*>(out_ptr),
+                       reinterpret_cast<const void*>(in_ptr),
+                       scale, rows, cols, normalize);
+    return env.Undefined();
+}
+
+static Napi::Value GroupMaskMul(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (ctx, scores, group_mask, num_experts, experts_per_group, n_group, batch)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t scores_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t mask_ptr = info[2].As<Napi::Number>().Int64Value();
+    int num_experts = info[3].As<Napi::Number>().Int32Value();
+    int experts_per_group = info[4].As<Napi::Number>().Int32Value();
+    int n_group = info[5].As<Napi::Number>().Int32Value();
+    int batch = info[6].As<Napi::Number>().Int32Value();
+    glm_group_mask_mul(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                        reinterpret_cast<void*>(scores_ptr),
+                        reinterpret_cast<const void*>(mask_ptr),
+                        num_experts, experts_per_group, n_group, batch);
+    return env.Undefined();
+}
+
+static Napi::Value ExpertScale(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (ctx, out, weights, indices, expert_id, topK, batch)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t weights_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t indices_ptr = info[3].As<Napi::Number>().Int64Value();
+    int expert_id = info[4].As<Napi::Number>().Int32Value();
+    int topK = info[5].As<Napi::Number>().Int32Value();
+    int batch = info[6].As<Napi::Number>().Int32Value();
+    glm_expert_scale(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                      reinterpret_cast<void*>(out_ptr),
+                      reinterpret_cast<const void*>(weights_ptr),
+                      reinterpret_cast<const int*>(indices_ptr),
+                      expert_id, topK, batch);
+    return env.Undefined();
+}
+
 static Napi::Value IndexSelect(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -2140,6 +2201,9 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "transpose4d"), Napi::Function::New(env, Transpose4d));
     exports.Set(Napi::String::New(env, "mul"), Napi::Function::New(env, Mul));
     exports.Set(Napi::String::New(env, "reduceSum"), Napi::Function::New(env, ReduceSum));
+    exports.Set(Napi::String::New(env, "rowNormalize"), Napi::Function::New(env, RowNormalize));
+    exports.Set(Napi::String::New(env, "groupMaskMul"), Napi::Function::New(env, GroupMaskMul));
+    exports.Set(Napi::String::New(env, "expertScale"), Napi::Function::New(env, ExpertScale));
     exports.Set(Napi::String::New(env, "indexSelect"), Napi::Function::New(env, IndexSelect));
     exports.Set(Napi::String::New(env, "arange"), Napi::Function::New(env, Arange));
     exports.Set(Napi::String::New(env, "max"), Napi::Function::New(env, Max));

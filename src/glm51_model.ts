@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
-import { bf16BytesToF32, f32ToBf16Bytes, GlmOps } from "./glm_ops";
+import { bf16BytesToF32, f32ToBf16Bytes, getNativeAddon, GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { ExecutionState, ExecutionWorkspace, PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
@@ -321,83 +321,65 @@ export class Glm51Model extends ChatModel {
     const moeIntermediate = cfg.moeIntermediateSize;
     const hs = cfg.hiddenSize;
     const expertsPerGroup = numExperts / nGroup;
+    const ws = normed.workspace;
 
     using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!, BS);
-    const gateLogitsBytes = Buffer.alloc(BS * numExperts * 2);
-    gateLogitsBuf.d2h(gateLogitsBytes);
-    const gateLogitsF32 = bf16BytesToF32(gateLogitsBytes);
+    using gateSigmoid = gateLogitsBuf.sigmoid();
 
+    let topkInput: Tensor;
+    using topkInputHolder = new UsingHolder<Tensor>(undefined!);
     const eScoreBias = this.tensors.get(`${pfx}.mlp.gate.e_score_correction_bias`);
-    let biasF32: Float32Array | null = null;
     if (eScoreBias) {
-      const biasBytes = Buffer.alloc(numExperts * 2);
-      eScoreBias.d2h(biasBytes);
-      biasF32 = bf16BytesToF32(biasBytes);
+      using biasBuf = ws.alloc([BS, numExperts], "BF16");
+      const allZeroIndices = new Int32Array(BS).fill(0);
+      using allZeroIdxBuf = ws.alloc([BS], "I32");
+      allZeroIdxBuf.h2d(Buffer.from(allZeroIndices.buffer));
+      getNativeAddon().indexSelect((this.glm as GlmOps).ctx, biasBuf.data, eScoreBias.data, allZeroIdxBuf.data, numExperts, BS);
+      topkInput = gateSigmoid.add(biasBuf, BS * numExperts);
+      topkInputHolder.replace(topkInput);
+    } else if (nGroup > 1) {
+      using zeros = ws.alloc([BS, numExperts], "BF16");
+      zeros.fill(0, BS * numExperts);
+      topkInput = gateSigmoid.add(zeros, BS * numExperts);
+      topkInputHolder.replace(topkInput);
+    } else {
+      topkInput = gateSigmoid;
     }
 
+    if (nGroup > 1) {
+      const groupTopk = topkInput.reshape([BS * nGroup, expertsPerGroup]).topk(2, expertsPerGroup);
+      using _groupTopkValues = groupTopk.values;
+      using groupSums = groupTopk.values.reduceSum(2, BS * nGroup);
+      using groupSums2d = groupSums.reshape([BS, nGroup]);
+      const groupIdxTopk = groupSums2d.topk(topkGroup, nGroup);
+      using _groupIdxValues = groupIdxTopk.values;
+      using groupIdx = groupIdxTopk.indices;
+      using groupMask = ws.alloc([BS, nGroup], "BF16");
+      groupMask.fill(0, BS * nGroup);
+      groupMask.scatterScalar(groupIdx, 1.0, topkGroup, nGroup, BS);
+      topkInput.groupMaskMul(groupMask, numExperts, expertsPerGroup, nGroup, BS);
+    }
+
+    const topkResult = topkInput.topk(topK, numExperts);
+    using _topkValues = topkResult.values;
+    using topkIndices = topkResult.indices;
+
+    using selectedScores = gateSigmoid.gather(topkIndices, topK, numExperts, BS);
+    using normalizedWeights = selectedScores.rowNormalize(cfg.routedScalingFactor, topK, BS, cfg.normTopkProb);
+
+    const topkIndicesBytes = Buffer.alloc(BS * topK * 4);
+    topkIndices.d2h(topkIndicesBytes);
     const expertIndices: number[][] = [];
-    const expertWeights: number[][] = [];
     for (let b = 0; b < BS; b++) {
-      const logits = new Float32Array(numExperts);
-      for (let e = 0; e < numExperts; e++) {
-        logits[e] = 1.0 / (1.0 + Math.exp(-gateLogitsF32[b * numExperts + e]));
-      }
-
-      const logitsCorrected = new Float32Array(numExperts);
-      for (let e = 0; e < numExperts; e++) {
-        logitsCorrected[e] = logits[e] + (biasF32 ? biasF32[e] : 0);
-      }
-
-      if (nGroup > 1) {
-        const groupScores = new Float32Array(nGroup);
-        for (let g = 0; g < nGroup; g++) {
-          const top2: number[] = [];
-          for (let j = 0; j < expertsPerGroup; j++) {
-            const score = logitsCorrected[g * expertsPerGroup + j];
-            if (top2.length < 2) { top2.push(score); top2.sort((a, b) => b - a); }
-            else if (score > top2[1]) { top2[1] = score; top2.sort((a, b) => b - a); }
-          }
-          groupScores[g] = top2[0] + top2[1];
-        }
-
-        const groupIdx: number[] = [];
-        for (let g = 0; g < nGroup; g++) groupIdx.push(g);
-        groupIdx.sort((a, b) => groupScores[b] - groupScores[a]);
-        const selectedGroups = new Set(groupIdx.slice(0, topkGroup));
-
-        for (let e = 0; e < numExperts; e++) {
-          const g = Math.floor(e / expertsPerGroup);
-          if (!selectedGroups.has(g)) logitsCorrected[e] = 0;
-        }
-      }
-
-      const scored: { val: number; idx: number }[] = [];
-      for (let e = 0; e < numExperts; e++) {
-        scored.push({ val: logitsCorrected[e], idx: e });
-      }
-      scored.sort((a, b) => b.val - a.val);
-
-      const selected: number[] = [];
-      const weights: number[] = [];
-      let weightSum = 0;
+      const row: number[] = [];
       for (let k = 0; k < topK; k++) {
-        selected.push(scored[k].idx);
-        weights.push(logits[scored[k].idx]);
-        weightSum += logits[scored[k].idx];
+        row.push(topkIndicesBytes.readInt32LE((b * topK + k) * 4));
       }
-      if (cfg.normTopkProb && weightSum > 0) {
-        for (let k = 0; k < topK; k++) weights[k] /= weightSum;
-      }
-      for (let k = 0; k < topK; k++) weights[k] *= cfg.routedScalingFactor;
-      expertIndices.push(selected);
-      expertWeights.push(weights);
+      expertIndices.push(row);
     }
 
-    const ws = normed.workspace;
     using routedOut = ws.alloc([BS, hs], "BF16");
     routedOut.fill(0, BS * hs);
-
-    const scaleF32 = new Float32Array(BS);
     using scaleBuf = ws.alloc([BS], "BF16");
 
     for (let e = 0; e < numExperts; e++) {
@@ -412,12 +394,7 @@ export class Glm51Model extends ChatModel {
       using expertSiluBuf = expertGateBuf.siluAndMul(expertGateBuf, expertUpBuf, moeIntermediate, BS);
       using expertDownBuf = expertSiluBuf.linear(this.tensors.get(`${pfx}.mlp.experts.${e}.down_proj.weight`)!, BS);
 
-      for (let b = 0; b < BS; b++) {
-        const kIdx = expertIndices[b].indexOf(e);
-        scaleF32[b] = kIdx !== -1 ? expertWeights[b][kIdx] : 0;
-      }
-      scaleBuf.h2d(f32ToBf16Bytes(scaleF32));
-
+      scaleBuf.expertScale(normalizedWeights, topkIndices, e, topK, BS);
       routedOut.rowScaleAdd(expertDownBuf, scaleBuf, BS, hs);
     }
 
