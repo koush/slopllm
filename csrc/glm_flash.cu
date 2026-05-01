@@ -23,6 +23,19 @@ using IdType = int32_t;
 using AttentionVariant = flashinfer::DefaultAttention<false, false, false, false>;
 constexpr auto POS_ENC = flashinfer::PosEncodingMode::kNone;
 
+#define DISPATCH_HEAD_DIM(HEAD_DIM_VAL, ...) \
+  do { \
+    if ((HEAD_DIM_VAL) == 256) { \
+      constexpr uint32_t HEAD_DIM = 256; \
+      __VA_ARGS__; \
+    } else if ((HEAD_DIM_VAL) == 128) { \
+      constexpr uint32_t HEAD_DIM = 128; \
+      __VA_ARGS__; \
+    } else { \
+      fprintf(stderr, "Unsupported head_dim: %u\n", HEAD_DIM_VAL); \
+    } \
+  } while (0)
+
 namespace {
 
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM>
@@ -155,10 +168,10 @@ void glm_flash_prefill(
   flashinfer::MaskMode flash_mask = static_cast<flashinfer::MaskMode>(mask_mode);
 
   cudaError_t status;
-  if (head_dim == 256) {
+  DISPATCH_HEAD_DIM(head_dim, {
     if (flash_mask == flashinfer::MaskMode::kCausal) {
       status = flashinfer::SinglePrefillWithKVCacheDispatched<
-          256, 256,
+          HEAD_DIM, HEAD_DIM,
           flashinfer::PosEncodingMode::kNone,
           false,
           flashinfer::MaskMode::kCausal,
@@ -166,32 +179,14 @@ void glm_flash_prefill(
           params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
     } else {
       status = flashinfer::SinglePrefillWithKVCacheDispatched<
-          256, 256,
+          HEAD_DIM, HEAD_DIM,
           flashinfer::PosEncodingMode::kNone,
           false,
           flashinfer::MaskMode::kNone,
           AttentionVariant, Params>(
           params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
     }
-  } else {
-    if (flash_mask == flashinfer::MaskMode::kCausal) {
-      status = flashinfer::SinglePrefillWithKVCacheDispatched<
-          128, 128,
-          flashinfer::PosEncodingMode::kNone,
-          false,
-          flashinfer::MaskMode::kCausal,
-          AttentionVariant, Params>(
-          params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
-    } else {
-      status = flashinfer::SinglePrefillWithKVCacheDispatched<
-          128, 128,
-          flashinfer::PosEncodingMode::kNone,
-          false,
-          flashinfer::MaskMode::kNone,
-          AttentionVariant, Params>(
-          params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
-    }
-  }
+  });
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_flash_prefill failed: %s\n", cudaGetErrorString(status));
@@ -233,19 +228,13 @@ void glm_flash_decode(
   params.kv_chunk_size = 0;
 
   cudaError_t status;
-  if (head_dim == 256) {
+  DISPATCH_HEAD_DIM(head_dim, {
     status = flashinfer::SingleDecodeWithKVCacheDispatched<
-        256,
+        HEAD_DIM,
         flashinfer::PosEncodingMode::kNone,
         AttentionVariant, Params>(
         params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
-  } else {
-    status = flashinfer::SingleDecodeWithKVCacheDispatched<
-        128,
-        flashinfer::PosEncodingMode::kNone,
-        AttentionVariant, Params>(
-        params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
-  }
+  });
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_flash_decode failed: %s\n", cudaGetErrorString(status));
@@ -265,17 +254,12 @@ void glm_batch_decode_plan(
 
   cudaSetDevice(ctx->device_id);
 
-  if (head_dim == 256) {
-    glm_batch_decode_plan_impl<256>(ctx, float_ws, float_ws_size,
+  DISPATCH_HEAD_DIM(head_dim, {
+    glm_batch_decode_plan_impl<HEAD_DIM>(ctx, float_ws, float_ws_size,
         int_ws, pinned_int_ws, int_ws_size,
         plan_info, indptr_h, batch_size,
         num_qo_heads, num_kv_heads, page_size, enable_cuda_graph);
-  } else {
-    glm_batch_decode_plan_impl<128>(ctx, float_ws, float_ws_size,
-        int_ws, pinned_int_ws, int_ws_size,
-        plan_info, indptr_h, batch_size,
-        num_qo_heads, num_kv_heads, page_size, enable_cuda_graph);
-  }
+  });
 }
 
 void glm_batch_decode_run(
@@ -339,15 +323,11 @@ void glm_batch_decode_run(
       : nullptr;
 
   cudaError_t status;
-  if (head_dim == 256) {
+  DISPATCH_HEAD_DIM(head_dim, {
       status =
-      flashinfer::BatchDecodeWithPagedKVCacheDispatched<256, POS_ENC, AttentionVariant, DecodeParams>(
+      flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENC, AttentionVariant, DecodeParams>(
           params, tmp_v, tmp_s, false, GLM_STREAM(ctx));
-  } else {
-      status =
-      flashinfer::BatchDecodeWithPagedKVCacheDispatched<128, POS_ENC, AttentionVariant, DecodeParams>(
-          params, tmp_v, tmp_s, false, GLM_STREAM(ctx));
-  }
+  });
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_batch_decode_run failed: %s\n", cudaGetErrorString(status));
@@ -483,43 +463,25 @@ void glm_batch_prefill_paged_run(
 
   cudaError_t status = cudaSuccess;
 
-  if (head_dim == 256) {
+  DISPATCH_HEAD_DIM(head_dim, {
     if (flash_mask == flashinfer::MaskMode::kCausal) {
       switch (cta_tile_q) {
-        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 256, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 128: status = dispatch_batch_prefill_paged_run_inner<128, HEAD_DIM, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 64: status = dispatch_batch_prefill_paged_run_inner<64, HEAD_DIM, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 16: status = dispatch_batch_prefill_paged_run_inner<16, HEAD_DIM, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 1: status = dispatch_batch_prefill_paged_run_inner<1, HEAD_DIM, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
         default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
       }
     } else {
       switch (cta_tile_q) {
-        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 256, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 128: status = dispatch_batch_prefill_paged_run_inner<128, HEAD_DIM, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 64: status = dispatch_batch_prefill_paged_run_inner<64, HEAD_DIM, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 16: status = dispatch_batch_prefill_paged_run_inner<16, HEAD_DIM, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 1: status = dispatch_batch_prefill_paged_run_inner<1, HEAD_DIM, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
         default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
       }
     }
-  } else {
-    if (flash_mask == flashinfer::MaskMode::kCausal) {
-      switch (cta_tile_q) {
-        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 128, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
-      }
-    } else {
-      switch (cta_tile_q) {
-        case 128: status = dispatch_batch_prefill_paged_run_inner<128, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 64: status = dispatch_batch_prefill_paged_run_inner<64, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 16: status = dispatch_batch_prefill_paged_run_inner<16, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        case 1: status = dispatch_batch_prefill_paged_run_inner<1, 128, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
-        default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
-      }
-    }
-  }
+  });
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_batch_prefill_paged_run failed: %s\n", cudaGetErrorString(status));
@@ -684,20 +646,14 @@ cudaError_t mla_decode_work_est(
     uint32_t num_qo_heads, uint32_t page_size,
     bool enable_cuda_graph, cudaStream_t stream,
     uint32_t head_dim_ckv, uint32_t head_dim_kpe) {
-  if (head_dim_ckv == MLA_HEAD_DIM_CKV && head_dim_kpe == MLA_HEAD_DIM_KPE) {
-    return flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<
-        MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAAttentionVariant, MLADecodeParams>(
+  cudaError_t status = cudaErrorNotSupported;
+  DISPATCH_MLA_HEAD_DIMS(head_dim_ckv, head_dim_kpe, {
+    status = flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<
+        HEAD_DIM_CKV, HEAD_DIM_KPE, MLAAttentionVariant, MLADecodeParams>(
         split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
         batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
-  } else if (head_dim_ckv == MLA_HEAD_DIM_CKV_SMALL && head_dim_kpe == MLA_HEAD_DIM_KPE_SMALL) {
-    return flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<
-        MLA_HEAD_DIM_CKV_SMALL, MLA_HEAD_DIM_KPE_SMALL, MLAAttentionVariant, MLADecodeParams>(
-        split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
-        batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
-  } else {
-    fprintf(stderr, "Unsupported MLA head dims for decode: ckv=%u kpe=%u\n", head_dim_ckv, head_dim_kpe);
-    return cudaErrorNotSupported;
-  }
+  });
+  return status;
 }
 
 } // anonymous namespace
@@ -728,9 +684,9 @@ void glm_mla_decode_plan(
   };
 
   cudaError_t status;
-  if (head_dim_ckv == MLA_HEAD_DIM_CKV && head_dim_kpe == MLA_HEAD_DIM_KPE) {
+  DISPATCH_MLA_HEAD_DIMS(head_dim_ckv, head_dim_kpe, {
     status = flashinfer::DecodePlan<
-        MLA_HEAD_DIM_CKV, flashinfer::PosEncodingMode::kRoPELlama,
+        HEAD_DIM_CKV, flashinfer::PosEncodingMode::kRoPELlama,
         MLAAttentionVariant, MLADecodeParams>(
         float_ws, float_ws_size,
         int_ws, pinned_int_ws, int_ws_size,
@@ -742,24 +698,7 @@ void glm_mla_decode_plan(
         enable_cuda_graph,
         GLM_STREAM(ctx),
         work_est);
-  } else if (head_dim_ckv == MLA_HEAD_DIM_CKV_SMALL && head_dim_kpe == MLA_HEAD_DIM_KPE_SMALL) {
-    status = flashinfer::DecodePlan<
-        MLA_HEAD_DIM_CKV_SMALL, flashinfer::PosEncodingMode::kRoPELlama,
-        MLAAttentionVariant, MLADecodeParams>(
-        float_ws, float_ws_size,
-        int_ws, pinned_int_ws, int_ws_size,
-        info,
-        indptr_h,
-        batch_size,
-        num_qo_heads,
-        page_size,
-        enable_cuda_graph,
-        GLM_STREAM(ctx),
-        work_est);
-  } else {
-    fprintf(stderr, "glm_mla_decode_plan: unsupported MLA head dims: ckv=%u kpe=%u\n", head_dim_ckv, head_dim_kpe);
-    return;
-  }
+  });
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_mla_decode_plan failed: %s\n", cudaGetErrorString(status));
@@ -824,18 +763,11 @@ void glm_mla_decode_run(
       : nullptr;
 
   cudaError_t status;
-  if (head_dim_ckv == MLA_HEAD_DIM_CKV && head_dim_kpe == MLA_HEAD_DIM_KPE) {
+  DISPATCH_MLA_HEAD_DIMS(head_dim_ckv, head_dim_kpe, {
     status = flashinfer::BatchDecodeWithPagedKVCacheDispatchedMLA<
-        MLA_HEAD_DIM_CKV, MLA_HEAD_DIM_KPE, MLAAttentionVariant, MLADecodeParams>(
+        HEAD_DIM_CKV, HEAD_DIM_KPE, MLAAttentionVariant, MLADecodeParams>(
         params, tmp_v, tmp_s, false, GLM_STREAM(ctx));
-  } else if (head_dim_ckv == MLA_HEAD_DIM_CKV_SMALL && head_dim_kpe == MLA_HEAD_DIM_KPE_SMALL) {
-    status = flashinfer::BatchDecodeWithPagedKVCacheDispatchedMLA<
-        MLA_HEAD_DIM_CKV_SMALL, MLA_HEAD_DIM_KPE_SMALL, MLAAttentionVariant, MLADecodeParams>(
-        params, tmp_v, tmp_s, false, GLM_STREAM(ctx));
-  } else {
-    fprintf(stderr, "glm_mla_decode_run: unsupported MLA head dims: ckv=%u kpe=%u\n", head_dim_ckv, head_dim_kpe);
-    return;
-  }
+  });
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_mla_decode_run failed: %s\n", cudaGetErrorString(status));
