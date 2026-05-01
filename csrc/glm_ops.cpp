@@ -812,6 +812,35 @@ static Napi::Value MulMatId(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value Nvfp4MulMatId(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 10) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, batch_ids, count, N, K)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t wptrs_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t sptrs_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t s2ptrs_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t eids_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t bids_ptr = info[7].As<Napi::Number>().Int64Value();
+    int count = info[8].As<Napi::Number>().Int32Value();
+    int N = info[9].As<Napi::Number>().Int32Value();
+    int K = info[10].As<Napi::Number>().Int32Value();
+    glm_nvfp4_mul_mat_id(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                          reinterpret_cast<void*>(out_ptr),
+                          reinterpret_cast<const void*>(in_ptr),
+                          reinterpret_cast<const void* const*>(wptrs_ptr),
+                          reinterpret_cast<const void* const*>(sptrs_ptr),
+                          reinterpret_cast<const void* const*>(s2ptrs_ptr),
+                          reinterpret_cast<const int*>(eids_ptr),
+                          reinterpret_cast<const int*>(bids_ptr),
+                          count, N, K);
+    return env.Undefined();
+}
+
 static Napi::Value ScatterAddRows(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 9) {
@@ -2255,6 +2284,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "groupMaskMul"), Napi::Function::New(env, GroupMaskMul));
     exports.Set(Napi::String::New(env, "expertScale"), Napi::Function::New(env, ExpertScale));
     exports.Set(Napi::String::New(env, "mulMatId"), Napi::Function::New(env, MulMatId));
+    exports.Set(Napi::String::New(env, "nvfp4MulMatId"), Napi::Function::New(env, Nvfp4MulMatId));
     exports.Set(Napi::String::New(env, "scatterAddRows"), Napi::Function::New(env, ScatterAddRows));
     exports.Set(Napi::String::New(env, "indexSelect"), Napi::Function::New(env, IndexSelect));
     exports.Set(Napi::String::New(env, "arange"), Napi::Function::New(env, Arange));

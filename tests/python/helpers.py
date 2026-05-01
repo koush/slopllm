@@ -665,6 +665,14 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
+        self.lib.glm_nvfp4_mul_mat_id.restype = None
+        self.lib.glm_nvfp4_mul_mat_id.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
         self.lib.glm_scatter_add_rows.restype = None
         self.lib.glm_scatter_add_rows.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -1429,6 +1437,19 @@ class GlmOps:
             self._ptr(output),
             self._ptr(input),
             ctypes.c_void_p(weight_ptrs),
+            self._ptr(expert_ids),
+            self._ptr(batch_ids),
+            count, N, K
+        )
+
+    def nvfp4_mul_mat_id(self, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, batch_ids, count, N, K):
+        self.lib.glm_nvfp4_mul_mat_id(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input),
+            ctypes.c_void_p(weight_ptrs),
+            ctypes.c_void_p(scale_ptrs),
+            ctypes.c_void_p(scale2_ptrs),
             self._ptr(expert_ids),
             self._ptr(batch_ids),
             count, N, K

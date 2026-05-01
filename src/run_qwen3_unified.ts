@@ -118,9 +118,6 @@ function parseArgs(argv: string[]): CliArgs {
     console.error("Error: --nvfp4 is only supported with --glm51");
     process.exit(1);
   }
-  if (args.useNvfp4) {
-    args.noCudaGraph = true;
-  }
 
   if (args.useQwen35 && args.temperature > 0 && args.topP === 0.95 && args.topK === 0 && args.repetitionPenalty === 1.0 && args.presencePenalty === 0) {
     args.topK = 20;

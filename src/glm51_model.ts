@@ -354,6 +354,8 @@ export class Glm51Model extends ChatModel {
       const pfx = `${Glm51Model.WEIGHT_PREFIX}${i}`;
       if (!this.tensors.has(`${pfx}.mlp.experts.0.gate_proj.weight`)) continue;
 
+      const isNvfp4 = this.tensors.get(`${pfx}.mlp.experts.0.gate_proj.weight`)?.type === "U8";
+
       for (const proj of ["gate_proj", "up_proj", "down_proj"]) {
         const ptrs = new BigInt64Array(numExperts);
         for (let e = 0; e < numExperts; e++) {
@@ -362,6 +364,21 @@ export class Glm51Model extends ChatModel {
         const name = `__moe_ptrs.${pfx}.${proj}`;
         const buf = this.alloc([numExperts], "I64", name);
         buf.h2d(Buffer.from(ptrs.buffer));
+
+        if (isNvfp4) {
+          const scalePtrs = new BigInt64Array(numExperts);
+          const scale2Ptrs = new BigInt64Array(numExperts);
+          for (let e = 0; e < numExperts; e++) {
+            scalePtrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight_weight_scale`)!.data);
+            scale2Ptrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight_weight_scale_2`)!.data);
+          }
+          const scaleName = `__moe_nvfp4_ptrs.${pfx}.${proj}.weight_weight_scale`;
+          const scale2Name = `__moe_nvfp4_ptrs.${pfx}.${proj}.weight_weight_scale_2`;
+          const scaleBuf = this.alloc([numExperts], "I64", scaleName);
+          scaleBuf.h2d(Buffer.from(scalePtrs.buffer));
+          const scale2Buf = this.alloc([numExperts], "I64", scale2Name);
+          scale2Buf.h2d(Buffer.from(scale2Ptrs.buffer));
+        }
       }
     }
 
@@ -389,6 +406,20 @@ export class Glm51Model extends ChatModel {
     const ptrs = new BigInt64Array(numExperts);
     for (let e = 0; e < numExperts; e++) {
       ptrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${projection}.weight`)!.data);
+    }
+    const buf = this.alloc([numExperts], "I64", name);
+    buf.h2d(Buffer.from(ptrs.buffer));
+    return buf;
+  }
+
+  private createNvfp4ExpertPtrs(pfx: string, projection: string, suffix: string): Tensor {
+    const name = `__moe_nvfp4_ptrs.${pfx}.${projection}.${suffix}`;
+    const existing = this.tensors.get(name);
+    if (existing) return existing;
+    const numExperts = this.cfg.nRoutedExperts;
+    const ptrs = new BigInt64Array(numExperts);
+    for (let e = 0; e < numExperts; e++) {
+      ptrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${projection}.${suffix}`)!.data);
     }
     const buf = this.alloc([numExperts], "I64", name);
     buf.h2d(Buffer.from(ptrs.buffer));
@@ -457,7 +488,31 @@ export class Glm51Model extends ChatModel {
     routedOut.fill(0, BS * hs);
 
     if (isNvfp4) {
-      this.mlpSparseNvfp4(normed, pfx, BS, topkIndicesFlat, normalizedWeights, count, topK, moeIntermediate, hs, routedOut);
+      const batchIdsBuf = this.tensors.get("__moe_batch_ids")!;
+      const downBatchIdsBuf = this.tensors.get("__moe_down_batch_ids")!;
+
+      const gateWeightPtrs = this.createExpertWeightPtrs(pfx, "gate_proj");
+      const gateScalePtrs = this.createNvfp4ExpertPtrs(pfx, "gate_proj", "weight_weight_scale");
+      const gateScale2Ptrs = this.createNvfp4ExpertPtrs(pfx, "gate_proj", "weight_weight_scale_2");
+      const upWeightPtrs = this.createExpertWeightPtrs(pfx, "up_proj");
+      const upScalePtrs = this.createNvfp4ExpertPtrs(pfx, "up_proj", "weight_weight_scale");
+      const upScale2Ptrs = this.createNvfp4ExpertPtrs(pfx, "up_proj", "weight_weight_scale_2");
+      const downWeightPtrs = this.createExpertWeightPtrs(pfx, "down_proj");
+      const downScalePtrs = this.createNvfp4ExpertPtrs(pfx, "down_proj", "weight_weight_scale");
+      const downScale2Ptrs = this.createNvfp4ExpertPtrs(pfx, "down_proj", "weight_weight_scale_2");
+
+      const gateK = hs;
+      const upK = hs;
+      const downK = moeIntermediate;
+
+      using gateOut = normed.nvfp4MulMatId(normed, gateWeightPtrs, gateScalePtrs, gateScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, gateK);
+      using upOut = normed.nvfp4MulMatId(normed, upWeightPtrs, upScalePtrs, upScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, upK);
+      using siluOut = gateOut.siluAndMul(gateOut, upOut, moeIntermediate, count);
+
+      using downOut = siluOut.nvfp4MulMatId(siluOut, downWeightPtrs, downScalePtrs, downScale2Ptrs, topkIndicesFlat, downBatchIdsBuf, count, hs, downK);
+
+      using normalizedWeightsFlat = normalizedWeights.reshape([count]);
+      routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIdsBuf, hs, count, BS);
     } else {
       const batchIdsBuf = this.tensors.get("__moe_batch_ids")!;
       const downBatchIdsBuf = this.tensors.get("__moe_down_batch_ids")!;
@@ -483,65 +538,6 @@ export class Glm51Model extends ChatModel {
 
     const result = routedOut.add(sharedDownBuf, BS * hs);
     return result.reshape([BS, hs]);
-  }
-
-  private mlpSparseNvfp4(
-    normed: Tensor, pfx: string, BS: number,
-    topkIndicesFlat: Tensor, normalizedWeights: Tensor,
-    count: number, topK: number, moeIntermediate: number, hs: number,
-    routedOut: Tensor
-  ): void {
-    const ws = normed.workspace;
-    const numExperts = this.cfg.nRoutedExperts;
-
-    // Download topk indices and weights to CPU for expert loop
-    const topkCpu = new Int32Array(count);
-    getNativeAddon().d2h((this.glm as GlmOps).ctx, Buffer.from(topkCpu.buffer), topkIndicesFlat.data, count * 4);
-    const weightsFlat = normalizedWeights.reshape([count]);
-    const weightsCpuBuf = Buffer.alloc(count * 2);
-    getNativeAddon().d2h((this.glm as GlmOps).ctx, weightsCpuBuf, weightsFlat.data, count * 2);
-
-    // Build per-expert token lists
-    const expertTokens: number[][] = Array.from({ length: numExperts }, () => []);
-    for (let i = 0; i < count; i++) {
-      expertTokens[topkCpu[i]].push(i);
-    }
-
-    for (let e = 0; e < numExperts; e++) {
-      const tokens = expertTokens[e];
-      if (tokens.length === 0) continue;
-
-      const epfx = `${pfx}.mlp.experts.${e}`;
-      const gateW = this.tensors.get(`${epfx}.gate_proj.weight`)!;
-      const upW = this.tensors.get(`${epfx}.up_proj.weight`)!;
-      const downW = this.tensors.get(`${epfx}.down_proj.weight`)!;
-      const expertCount = tokens.length;
-
-      // Build index select buffer: batch IDs for tokens assigned to this expert
-      const batchIdsArr = new Int32Array(expertCount);
-      for (let j = 0; j < expertCount; j++) batchIdsArr[j] = Math.floor(tokens[j] / topK);
-      using expertIdsBuf = ws.alloc([expertCount], "I32");
-      expertIdsBuf.h2d(Buffer.from(batchIdsArr.buffer));
-
-      // Gather input tokens for this expert
-      using expertInput = normed.indexSelect(expertIdsBuf, hs, expertCount);
-
-      // Expert MLP: gate, up, silu*mul, down
-      using gateOut = expertInput.linear(gateW, expertCount);
-      using upOut = expertInput.linear(upW, expertCount);
-      using siluOut = gateOut.siluAndMul(gateOut, upOut, moeIntermediate, expertCount);
-      using downOut = siluOut.linear(downW, expertCount);
-
-      // Build scales and scatter-add info for this expert
-      const scalesArr = new Uint16Array(expertCount);
-      for (let j = 0; j < expertCount; j++) {
-        scalesArr[j] = weightsCpuBuf.readUInt16LE(tokens[j] * 2);
-      }
-      using scalesBuf = ws.alloc([expertCount], "BF16");
-      scalesBuf.h2d(Buffer.from(scalesArr.buffer));
-
-      routedOut.scatterAddRows(downOut, scalesBuf, expertIdsBuf, hs, expertCount, BS);
-    }
   }
 
   private mlaLayer(normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState): { normed: Tensor, residual: Tensor } {

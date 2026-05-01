@@ -201,3 +201,90 @@ class TestNVFP4LinearDecode:
 
         assert not torch.isnan(gate_ref).any(), "Gate dequant with shared scale_2 contains NaN"
         assert not torch.isnan(up_ref).any(), "Up dequant with shared scale_2 contains NaN"
+
+
+class TestNVFP4MulMatId:
+
+    @pytest.mark.parametrize("num_experts,bs,topk,N,K", [
+        (4, 2, 2, 128, 128),
+        (4, 2, 3, 1024, 256),
+        (8, 4, 4, 2048, 1024),
+        (8, 1, 1, 256, 512),
+    ])
+    def test_nvfp4_mul_mat_id_vs_per_expert(self, glm, device, num_experts, bs, topk, N, K):
+        torch.manual_seed(42)
+        count = bs * topk
+
+        x_bf16 = torch.randn(bs, K, dtype=torch.bfloat16, device=device) * 0.5
+
+        expert_ids_host = torch.randint(0, num_experts, (count,), dtype=torch.int32)
+        batch_ids_host = torch.tensor([i // topk for i in range(count)], dtype=torch.int32)
+
+        weight_ptrs_list = []
+        scale_ptrs_list = []
+        scale2_ptrs_list = []
+        ref_outputs = []
+
+        for e in range(num_experts):
+            w_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device) * 0.5
+            packed, scale, scale_2 = quantize_weight_nvfp4(w_bf16.cpu())
+            w_dequant = dequantize_nvfp4(packed, scale, scale_2, (N, K))
+            ref_outputs.append(w_dequant)
+
+            fp4_gpu = glm.alloc(N * (K // 2))
+            scale_fp8_bytes = scale.view(torch.uint8)
+            num_k_groups = K // GROUP_SIZE
+            scale_gpu = glm.alloc(N * num_k_groups)
+            scale2_f32 = scale_2.float().contiguous()
+            scale2_gpu = glm.alloc(4)
+
+            glm.h2d(fp4_gpu, packed.view(torch.uint8).numpy().ctypes.data_as(ctypes.c_void_p), N * (K // 2))
+            glm.h2d(scale_gpu, scale_fp8_bytes.numpy().ctypes.data_as(ctypes.c_void_p), N * num_k_groups)
+            glm.h2d(scale2_gpu, scale_2.numpy().ctypes.data_as(ctypes.c_void_p), 4)
+
+            weight_ptrs_list.append(fp4_gpu)
+            scale_ptrs_list.append(scale_gpu)
+            scale2_ptrs_list.append(scale2_gpu)
+
+        from helpers import GpuPtrs
+        weight_ptrs = GpuPtrs(weight_ptrs_list, device)
+        scale_ptrs = GpuPtrs(scale_ptrs_list, device)
+        scale2_ptrs = GpuPtrs(scale2_ptrs_list, device)
+
+        expert_ids_gpu = glm.alloc(count * 4)
+        batch_ids_gpu = glm.alloc(count * 4)
+        glm.h2d(expert_ids_gpu, expert_ids_host.numpy().ctypes.data_as(ctypes.c_void_p), count * 4)
+        glm.h2d(batch_ids_gpu, batch_ids_host.numpy().ctypes.data_as(ctypes.c_void_p), count * 4)
+
+        out_gpu = glm.alloc(count * N * 2)
+
+        glm.nvfp4_mul_mat_id(out_gpu, x_bf16.data_ptr(),
+                             weight_ptrs.data_ptr, scale_ptrs.data_ptr, scale2_ptrs.data_ptr,
+                             expert_ids_gpu, batch_ids_gpu,
+                             count, N, K)
+
+        glm.synchronize()
+
+        out_raw = torch.empty(count, N, dtype=torch.uint16, device='cpu')
+        glm.d2h(out_raw.numpy().ctypes.data_as(ctypes.c_void_p), out_gpu, count * N * 2)
+        out_bf16 = out_raw.view(torch.bfloat16).float()
+
+        ref_out = torch.zeros(count, N, dtype=torch.float32)
+        for i in range(count):
+            bid = batch_ids_host[i].item()
+            eid = expert_ids_host[i].item()
+            ref_out[i] = torch.nn.functional.linear(x_bf16[bid].cpu().float(), ref_outputs[eid].float())
+
+        mean_err = (out_bf16 - ref_out).abs().mean().item()
+        max_err = (out_bf16 - ref_out).abs().max().item()
+        mean_abs_ref = ref_out.abs().mean().item()
+
+        assert mean_err < mean_abs_ref * 0.2, f"mean error {mean_err:.4f} > 20% of ref {mean_abs_ref:.4f}"
+        assert max_err < mean_abs_ref * 4.0, f"max error {max_err:.4f} > 4x ref {mean_abs_ref:.4f}"
+
+        for ptrs in [weight_ptrs_list, scale_ptrs_list, scale2_ptrs_list]:
+            for p in ptrs:
+                glm.free_buf(p)
+        glm.free_buf(expert_ids_gpu)
+        glm.free_buf(batch_ids_gpu)
+        glm.free_buf(out_gpu)

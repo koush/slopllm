@@ -131,6 +131,7 @@ interface NativeAddon {
   groupMaskMul(ctx: number, scores: number, groupMask: number, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void;
   expertScale(ctx: number, out: number, weights: number, indices: number, expertId: number, topK: number, batch: number): void;
   mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, batchIds: number, count: number, N: number, K: number): void;
+  nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, batchIds: number, count: number, N: number, K: number): void;
   scatterAddRows(ctx: number, out: number, input: number, scales: number, batchIds: number, dim: number, count: number, numRows: number, workspace: number): void;
 }
 
@@ -412,6 +413,12 @@ export class GlmTensor extends Tensor {
   mulMatId(input: Tensor, weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
     const out = this.workspace.alloc([count, N], this.type);
     getNativeAddon().mulMatId(this.glm.ctx, out.data, input.data, weightPtrs.data, expertIds.data, batchIds.data, count, N, K);
+    return out;
+  }
+
+  nvfp4MulMatId(input: Tensor, weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
+    const out = this.workspace.alloc([count, N], this.type);
+    getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, input.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, batchIds.data, count, N, K);
     return out;
   }
 
@@ -733,6 +740,10 @@ export class GlmOps implements DeviceOps {
 
   mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, batchIds: number, count: number, N: number, K: number): void {
     getNativeAddon().mulMatId(ctx, output, input, weightPtrs, expertIds, batchIds, count, N, K);
+  }
+
+  nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, batchIds: number, count: number, N: number, K: number): void {
+    getNativeAddon().nvfp4MulMatId(ctx, output, input, weightPtrs, scalePtrs, scale2Ptrs, expertIds, batchIds, count, N, K);
   }
 
   scatterAddRows(ctx: number, out: number, input: number, scales: number, batchIds: number, dim: number, count: number, numRows: number, workspace: number): void {

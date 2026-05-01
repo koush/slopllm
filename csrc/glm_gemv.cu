@@ -558,6 +558,165 @@ nvfp4_dequantize_gemm_smem_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// nvfp4_mul_mat_id kernels (must be outside extern "C" due to templates)
+// No shared memory — each warp reads input directly from global memory (L1-cached).
+// This eliminates __syncthreads() barriers present in the tiled version.
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
+nvfp4_mul_mat_id_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const uint8_t* const* __restrict__ weight_ptrs,
+    const __nv_fp8_e4m3* const* __restrict__ scale_ptrs,
+    const float* const* __restrict__ scale2_ptrs,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ batch_ids,
+    int count, int N, int K) {
+
+    int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+    int entry = blockIdx.x / num_row_groups;
+    int row_group = blockIdx.x % num_row_groups;
+    int warp_id = threadIdx.x / GEMV_WARP_SIZE;
+    int row = row_group * GEMV_ROWS_PER_BLOCK + warp_id;
+    int lane = threadIdx.x % GEMV_WARP_SIZE;
+
+    if (entry >= count) return;
+
+    int bid = batch_ids[entry];
+    int eid = expert_ids[entry];
+    const __nv_bfloat16* input_row  = input + (size_t)bid * K;
+    const uint8_t* weight_row = weight_ptrs[eid] + (size_t)row * (K / 2);
+    const __nv_fp8_e4m3* scale_row = scale_ptrs[eid] + (size_t)row * (K / NVFP4_QUANT_GROUP);
+    float scale_2_val = *scale2_ptrs[eid];
+
+    int num_k_groups = K / NVFP4_QUANT_GROUP;
+    bool row_valid = row < N;
+
+    float sum = 0.0f;
+
+    if (row_valid) {
+        for (int g = lane; g < num_k_groups; g += GEMV_WARP_SIZE) {
+            float scale = static_cast<float>(scale_row[g]) * scale_2_val;
+            int k_start = g * NVFP4_QUANT_GROUP;
+
+            const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row + k_start);
+            uint4 xv0 = input_v4[0];
+            uint4 xv1 = input_v4[1];
+            __nv_bfloat16 xb0[8], xb1[8];
+            uint4_to_bf16x8(xv0, xb0);
+            uint4_to_bf16x8(xv1, xb1);
+
+            uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
+            uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
+
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                uint8_t packed = (w_lo >> (j * 8)) & 0xFF;
+                sum += c_fp4_e2m1_lut[packed & 0x0F] * scale * __bfloat162float(xb0[j * 2])
+                     + c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale * __bfloat162float(xb0[j * 2 + 1]);
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                uint8_t packed = (w_hi >> (j * 8)) & 0xFF;
+                sum += c_fp4_e2m1_lut[packed & 0x0F] * scale * __bfloat162float(xb1[j * 2])
+                     + c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale * __bfloat162float(xb1[j * 2 + 1]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+    if (row_valid && lane == 0) {
+        output[(size_t)entry * N + row] = __float2bfloat16(sum);
+    }
+}
+
+// Split-K variant for small N — no input shared memory, warp_sums for reduction
+__global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS, 2)
+nvfp4_mul_mat_id_splitk_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const uint8_t* const* __restrict__ weight_ptrs,
+    const __nv_fp8_e4m3* const* __restrict__ scale_ptrs,
+    const float* const* __restrict__ scale2_ptrs,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ batch_ids,
+    int count, int N, int K) {
+
+    int entry = blockIdx.x / N;
+    int row = blockIdx.x % N;
+
+    constexpr int TOTAL_WARPS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS;
+    int tid = threadIdx.x;
+    int warp_id = tid / GEMV_WARP_SIZE;
+    int lane = tid % GEMV_WARP_SIZE;
+
+    int bid = batch_ids[entry];
+    int eid = expert_ids[entry];
+    const __nv_bfloat16* input_row  = input + (size_t)bid * K;
+    const uint8_t* weight_row = weight_ptrs[eid] + (size_t)row * (K / 2);
+    const __nv_fp8_e4m3* scale_row = scale_ptrs[eid] + (size_t)row * (K / NVFP4_QUANT_GROUP);
+    float scale_2_val = *scale2_ptrs[eid];
+
+    int num_k_groups = K / NVFP4_QUANT_GROUP;
+    int g_thread = warp_id * GEMV_WARP_SIZE + lane;
+    int g_threads = TOTAL_WARPS * GEMV_WARP_SIZE;
+
+    float sum = 0.0f;
+
+    for (int g = g_thread; g < num_k_groups; g += g_threads) {
+        float scale = static_cast<float>(scale_row[g]) * scale_2_val;
+        int k_start = g * NVFP4_QUANT_GROUP;
+
+        const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row + k_start);
+        uint4 xv0 = input_v4[0];
+        uint4 xv1 = input_v4[1];
+        __nv_bfloat16 xb0[8], xb1[8];
+        uint4_to_bf16x8(xv0, xb0);
+        uint4_to_bf16x8(xv1, xb1);
+
+        uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
+        uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint8_t packed = (w_lo >> (j * 8)) & 0xFF;
+            sum += c_fp4_e2m1_lut[packed & 0x0F] * scale * __bfloat162float(xb0[j * 2])
+                 + c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale * __bfloat162float(xb0[j * 2 + 1]);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint8_t packed = (w_hi >> (j * 8)) & 0xFF;
+            sum += c_fp4_e2m1_lut[packed & 0x0F] * scale * __bfloat162float(xb1[j * 2])
+                 + c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale * __bfloat162float(xb1[j * 2 + 1]);
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+
+    __shared__ float warp_sums[TOTAL_WARPS];
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float s = (lane < TOTAL_WARPS) ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = TOTAL_WARPS / 2; offset > 0; offset >>= 1) {
+            s += __shfl_down_sync(0xFFFFFFFF, s, offset);
+        }
+        if (lane == 0) {
+            output[(size_t)entry * N + row] = __float2bfloat16(s);
+        }
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -636,6 +795,41 @@ void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input
             reinterpret_cast<const __nv_bfloat16*>(bf16_input),
             reinterpret_cast<const uint8_t*>(fp4_weight),
             scale_ptr, weight_scale_2, m, n, k);
+    }
+}
+
+void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
+                            const void* const* weight_ptrs,
+                            const void* const* scale_ptrs,
+                            const void* const* scale2_ptrs,
+                            const int* expert_ids, const int* batch_ids,
+                            int count, int N, int K) {
+    cudaSetDevice(ctx->device_id);
+    if (count == 0 || N == 0 || K == 0) return;
+
+    constexpr int SPLITK_THRESHOLD = 1024;
+    if (N < SPLITK_THRESHOLD) {
+        int grid_size = count * N;
+        constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS;
+        nvfp4_mul_mat_id_splitk_kernel<<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)output,
+            (const __nv_bfloat16*)input,
+            (const uint8_t* const*)weight_ptrs,
+            (const __nv_fp8_e4m3* const*)scale_ptrs,
+            (const float* const*)scale2_ptrs,
+            expert_ids, batch_ids,
+            count, N, K);
+    } else {
+        int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+        int grid_size = count * num_row_groups;
+        nvfp4_mul_mat_id_kernel<<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)output,
+            (const __nv_bfloat16*)input,
+            (const uint8_t* const*)weight_ptrs,
+            (const __nv_fp8_e4m3* const*)scale_ptrs,
+            (const float* const*)scale2_ptrs,
+            expert_ids, batch_ids,
+            count, N, K);
     }
 }
 
