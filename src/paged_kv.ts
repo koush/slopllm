@@ -153,6 +153,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.kvLenH = this.allocPinned([B], "I32", "kvLenH");
     this.mlaBatchIndices = this.alloc([B * S], "I32", "mlaBatchIndices");
     this.mlaBatchIndicesH = this.allocPinned([B * S], "I32", "mlaBatchIndicesH");
+
+    // Initialize mlaBatchIndices for decode: [0, 1, 2, ..., B-1]
+    // This identity mapping never changes for decode; prefill overwrites it with
+    // per-token batch indices in planPrefill.
+    this.mlaBatchIndicesH.withPinnedBuffer(buf => {
+      for (let i = 0; i < B; i++) buf.writeInt32LE(i, i * I32);
+    });
+    this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, B * I32, MemcpyKind.HostToDevice);
   }
 
   forwardInput(state: ExecutionState): void {
@@ -312,12 +320,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
           enableCudaGraph
         );
       } else {
-        this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-        this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
-        this.mlaBatchIndicesH.withPinnedBuffer(buf => {
-          for (let i = 0; i < batchSize; i++) buf.writeInt32LE(i, i * I32);
-        });
-        this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, batchSize * I32, MemcpyKind.HostToDevice);
         this.glm.mlaDecodePlan(
           this.floatWs, 128 * 1024 * 1024,
           this.intWs, this.pinnedIntWs, 8 * 1024 * 1024,
