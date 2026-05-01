@@ -200,7 +200,6 @@ export function* generateStream(
     using firstTokens = ws.forwardPrefill(model, [suffixIds], cache);
     doSample(firstTokens);
     readSample();
-    // the decode is pipelined and then the token is yielded
   }
   // cache.appendTokens(0, [currentToken]);
 

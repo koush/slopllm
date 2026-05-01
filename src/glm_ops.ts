@@ -131,6 +131,7 @@ interface NativeAddon {
   groupMaskMul(ctx: number, scores: number, groupMask: number, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void;
   expertScale(ctx: number, out: number, weights: number, indices: number, expertId: number, topK: number, batch: number): void;
   mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, batchIds: number, count: number, N: number, K: number): void;
+  scatterAddRows(ctx: number, out: number, input: number, scales: number, batchIds: number, dim: number, count: number): void;
 }
 
 export class GlmTensor extends Tensor {
@@ -411,6 +412,10 @@ export class GlmTensor extends Tensor {
     const out = this.workspace.alloc([count, N], this.type);
     getNativeAddon().mulMatId(this.glm.ctx, out.data, input.data, weightPtrs.data, expertIds.data, batchIds.data, count, N, K);
     return out;
+  }
+
+  scatterAddRows(input: Tensor, scales: Tensor, batchIds: Tensor, dim: number, count: number): void {
+    getNativeAddon().scatterAddRows(this.glm.ctx, this.data, input.data, scales.data, batchIds.data, dim, count);
   }
 
   doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
@@ -727,6 +732,10 @@ export class GlmOps implements DeviceOps {
 
   mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, batchIds: number, count: number, N: number, K: number): void {
     getNativeAddon().mulMatId(ctx, output, input, weightPtrs, expertIds, batchIds, count, N, K);
+  }
+
+  scatterAddRows(ctx: number, out: number, input: number, scales: number, batchIds: number, dim: number, count: number): void {
+    getNativeAddon().scatterAddRows(ctx, out, input, scales, batchIds, dim, count);
   }
 }
 

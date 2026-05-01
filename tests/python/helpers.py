@@ -665,6 +665,13 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
+        self.lib.glm_scatter_add_rows.restype = None
+        self.lib.glm_scatter_add_rows.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+        ]
+
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
             self.lib.glm_free(self.ctx)
@@ -1424,4 +1431,14 @@ class GlmOps:
             self._ptr(expert_ids),
             self._ptr(batch_ids),
             count, N, K
+        )
+
+    def scatter_add_rows(self, out, input, scales, batch_ids, dim, count):
+        self.lib.glm_scatter_add_rows(
+            self.ctx,
+            self._ptr(out),
+            self._ptr(input),
+            self._ptr(scales),
+            self._ptr(batch_ids),
+            dim, count
         )
