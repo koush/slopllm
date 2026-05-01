@@ -42,6 +42,7 @@ cd tests/python && pytest -v .
 - hidden_size=6144, moe_intermediate_size=2048, dense_intermediate=12288
 - GPU: NVIDIA RTX PRO 6000 Blackwell (sm_120), PyTorch nightly required
 - Build with `-gencode arch=compute_120,code=sm_120`
+- **Standard RMSNorm** for all layer norms (input_layernorm, post_attention_layernorm, q_a_layernorm, kv_a_layernorm, model.norm) — do NOT add +1 during loading (unlike Qwen3.5 which uses GemmaRMSNorm)
 
 ### Qwen3-0.6B
 - Model: `Qwen/Qwen3-0.6B`, cached at `/mnt/storage/.cache/huggingface/`

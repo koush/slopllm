@@ -188,34 +188,12 @@ export class Glm51Model extends ChatModel {
     }
 
     const par = this.weightParallelism(name);
-    const gemmaNormSuffixes = [
-      "input_layernorm.weight",
-      "post_attention_layernorm.weight",
-      "q_a_layernorm.weight",
-      "kv_a_layernorm.weight",
-    ];
-    const isGemmaNorm = name === "model.norm.weight" ||
-      gemmaNormSuffixes.some(s => name.endsWith(s));
 
     if (meta.dtype === "F32") {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
       const tensor = this.alloc(meta.shape, "BF16", name, par);
       const f32Bytes = st.readTensor(name);
       const f32Arr = new Float32Array(f32Bytes.buffer, f32Bytes.byteOffset, numElements);
-      if (isGemmaNorm) {
-        for (let i = 0; i < numElements; i++) f32Arr[i] += 1.0;
-      }
-      tensor.h2d(f32ToBf16Bytes(f32Arr));
-    } else if (isGemmaNorm) {
-      const numElements = meta.shape.reduce((a, b) => a * b, 1);
-      const tensor = this.alloc(meta.shape, "BF16", name, par);
-      const rawBytes = st.readTensor(name);
-      const f32Arr = new Float32Array(numElements);
-      for (let i = 0; i < numElements; i++) {
-        const u16 = rawBytes.readUInt16LE(i * 2);
-        const u32 = u16 << 16;
-        f32Arr[i] = (new Float32Array(new Uint32Array([u32]).buffer)[0]) + 1.0;
-      }
       tensor.h2d(f32ToBf16Bytes(f32Arr));
     } else {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;

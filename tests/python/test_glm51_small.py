@@ -346,6 +346,7 @@ class TestHuggingFaceModel:
             device_map="cpu",
         )
 
+        torch.manual_seed(42)
         input_ids = torch.randint(0, min(cfg["vocab_size"], 1000), (1, 4))
         with torch.no_grad():
             hf_logits = model(input_ids).logits
