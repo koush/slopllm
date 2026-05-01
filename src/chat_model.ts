@@ -29,6 +29,7 @@ export interface CommonModelConfig {
   numKeyValueHeads: number;
   headDim: number;
   vocabSize: number;
+  kvLoraRank?: number;
 }
 
 export abstract class ChatModel extends WorkspaceBase {

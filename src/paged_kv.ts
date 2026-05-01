@@ -218,12 +218,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const qNopeStrideH = totalTokens * headDimCkv;
     const qPeStrideN = headDimKpe;
     const qPeStrideH = totalTokens * headDimKpe;
-    const ckvStridePage = headDimCkv;
-    const ckvStrideN = pageSize * headDimCkv;
-    const kpeStridePage = headDimKpe;
-    const kpeStrideN = pageSize * headDimKpe;
+    const ckvStridePage = pageSize * headDimCkv;
+    const ckvStrideN = headDimCkv;
+    const kpeStridePage = pageSize * headDimKpe;
+    const kpeStrideN = headDimKpe;
     const oStrideN = headDimCkv;
-    const oStrideH = nHeads * headDimCkv;
+    const oStrideH = totalTokens * headDimCkv;
     this.glm.mlaPrefillRun(
       qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       pagedKV.indices,
@@ -382,16 +382,18 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
     this.lastIdx.h2d(lastIdxBuf);
 
-    this.glm.batchPrefillPagedPlan(
-      this.floatWs, BATCH_FLOAT_WS_SIZE,
-      this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
-      this.prefillPlanInfo,
-      this.qoIndptrH, this.indptrH,
-      totalTokens, batchSize,
-      nHeads, nKv, hd,
-      pageSize,
-      1
-    );
+    if (!cfg.kvLoraRank) {
+      this.glm.batchPrefillPagedPlan(
+        this.floatWs, BATCH_FLOAT_WS_SIZE,
+        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+        this.prefillPlanInfo,
+        this.qoIndptrH, this.indptrH,
+        totalTokens, batchSize,
+        nHeads, nKv, hd,
+        pageSize,
+        1
+      );
+    }
 
     const slotMappingBuf = Buffer.alloc(totalTokens * I32);
     let slotOff = 0;

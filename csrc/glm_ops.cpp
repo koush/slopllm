@@ -521,7 +521,7 @@ static Napi::Value RopeTranspose(const Napi::CallbackInfo& info) {
 
 static Napi::Value MlaVExpand(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 10) {
+    if (info.Length() < 9) {
         Napi::TypeError::New(env, "Expected (ctx, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch)").ThrowAsJavaScriptException();
         return env.Undefined();
     }

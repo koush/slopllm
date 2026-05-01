@@ -418,11 +418,12 @@ export class Glm51Model extends ChatModel {
       expertWeights.push(weights);
     }
 
-    using routedOut = this.alloc([BS, hs], "BF16");
+    const ws = normed.workspace;
+    using routedOut = ws.alloc([BS, hs], "BF16");
     routedOut.fill(0, BS * hs);
 
     const scaleF32 = new Float32Array(BS);
-    const scaleBuf = this.alloc([BS], "BF16");
+    using scaleBuf = ws.alloc([BS], "BF16");
 
     for (let e = 0; e < numExperts; e++) {
       let anySelected = false;
@@ -444,7 +445,6 @@ export class Glm51Model extends ChatModel {
 
       routedOut.rowScaleAdd(expertDownBuf, scaleBuf, BS, hs);
     }
-    scaleBuf[Symbol.dispose]();
 
     using sharedGateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS);
     using sharedUpBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.up_proj.weight`)!, BS);
@@ -505,13 +505,6 @@ export class Glm51Model extends ChatModel {
       using cos = rotaryEmbedding.result.cos;
       using sin = rotaryEmbedding.result.sin;
 
-      const qAbsorbedR = qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-      using _qAbsorbedR = qAbsorbedR;
-      const qPeFinal = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim);
-      using _qPeFinal = qPeFinal;
-      const kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1);
-      using _kPeRope = kPeRope;
-
       this.glm.mlaPrefillPlan(
         ws.floatWs, 128 * 1024 * 1024,
         ws.intWs, ws.pinnedIntWs, 8 * 1024 * 1024,
@@ -520,8 +513,17 @@ export class Glm51Model extends ChatModel {
         ws.kvLenH,
         batchSize, nHeads, kvLoraRank, true
       );
-      ws.mlaKvCacheAppend(ckvNormed, kPeRope, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim);
+
       rotaryEmbedding.streamWaitEvent();
+
+      const qAbsorbedR = qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
+      using _qAbsorbedR = qAbsorbedR;
+      const qPeFinal = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim);
+      using _qPeFinal = qPeFinal;
+      const kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1);
+      using _kPeRope = kPeRope;
+
+      ws.mlaKvCacheAppend(ckvNormed, kPeRope, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim);
       attnOut.replace(ws.mlaPrefillPaged(qAbsorbedR, qPeFinal, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else {
       throw new Error("GLM-5.1 requires MLA KV cache");
