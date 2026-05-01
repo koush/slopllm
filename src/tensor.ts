@@ -312,6 +312,10 @@ export abstract class Tensor implements Disposable {
   expertScale(weights: Tensor, indices: Tensor, expertId: number, topK: number, batch: number): void {
   }
 
+  mulMatId(input: Tensor, weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
+    return undefined as never;
+  }
+
   readInt32LE(): number[] {
     const count = numElements(this.shape);
     const buf = Buffer.alloc(count * 4);

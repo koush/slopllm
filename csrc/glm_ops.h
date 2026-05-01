@@ -162,6 +162,11 @@ void glm_group_mask_mul(GlmCtx* ctx, void* scores, const void* group_mask,
 void glm_expert_scale(GlmCtx* ctx, void* out, const void* weights,
                        const int* indices, int expert_id, int topK, int batch);
 
+void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
+                     const void* const* weight_ptrs,
+                     const int* expert_ids, const int* batch_ids,
+                     int count, int N, int K);
+
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
                        const void* indices, int dim, int k);
 

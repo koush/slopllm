@@ -75,6 +75,17 @@ class GpuBuffer:
             self.free()
 
 
+class GpuPtrs:
+    """Array of GPU pointers stored on device. Used for mul_mat_id weight pointer arrays."""
+    def __init__(self, ptrs, device):
+        import torch
+        self._ptrs_tensor = torch.tensor(ptrs, dtype=torch.int64, device=device)
+
+    @property
+    def data_ptr(self):
+        return self._ptrs_tensor.data_ptr()
+
+
 class MmapFile:
     def __init__(self, ops, ptr, path, size):
         self._ops = ops
@@ -644,6 +655,13 @@ class GlmOps:
         self.lib.glm_expert_scale.restype = None
         self.lib.glm_expert_scale.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_mul_mat_id.restype = None
+        self.lib.glm_mul_mat_id.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
@@ -1395,4 +1413,15 @@ class GlmOps:
             self._ptr(weights),
             self._ptr(indices),
             expert_id, top_k, batch
+        )
+
+    def mul_mat_id(self, output, input, weight_ptrs, expert_ids, batch_ids, count, N, K):
+        self.lib.glm_mul_mat_id(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input),
+            ctypes.c_void_p(weight_ptrs),
+            self._ptr(expert_ids),
+            self._ptr(batch_ids),
+            count, N, K
         )

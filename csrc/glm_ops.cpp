@@ -787,6 +787,31 @@ static Napi::Value ExpertScale(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value MulMatId(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 8) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weight_ptrs, expert_ids, batch_ids, count, N, K)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t wptrs_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t eids_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t bids_ptr = info[5].As<Napi::Number>().Int64Value();
+    int count = info[6].As<Napi::Number>().Int32Value();
+    int N = info[7].As<Napi::Number>().Int32Value();
+    int K = info[8].As<Napi::Number>().Int32Value();
+    glm_mul_mat_id(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                    reinterpret_cast<void*>(out_ptr),
+                    reinterpret_cast<const void*>(in_ptr),
+                    reinterpret_cast<const void* const*>(wptrs_ptr),
+                    reinterpret_cast<const int*>(eids_ptr),
+                    reinterpret_cast<const int*>(bids_ptr),
+                    count, N, K);
+    return env.Undefined();
+}
+
 static Napi::Value IndexSelect(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -2204,6 +2229,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "rowNormalize"), Napi::Function::New(env, RowNormalize));
     exports.Set(Napi::String::New(env, "groupMaskMul"), Napi::Function::New(env, GroupMaskMul));
     exports.Set(Napi::String::New(env, "expertScale"), Napi::Function::New(env, ExpertScale));
+    exports.Set(Napi::String::New(env, "mulMatId"), Napi::Function::New(env, MulMatId));
     exports.Set(Napi::String::New(env, "indexSelect"), Napi::Function::New(env, IndexSelect));
     exports.Set(Napi::String::New(env, "arange"), Napi::Function::New(env, Arange));
     exports.Set(Napi::String::New(env, "max"), Napi::Function::New(env, Max));
