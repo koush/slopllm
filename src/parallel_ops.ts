@@ -395,9 +395,10 @@ export class ParallelTensor extends Tensor {
 
   bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
     const pB = B as ParallelTensor;
+    const shardBatch = (this.parallelism === TensorParallelism.Column) ? batch / this.worldSize : batch;
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      outShards.push(this.shards[i].bmm(pB.shards[i], batch, M, N, K, transA, transB));
+      outShards.push(this.shards[i].bmm(pB.shards[i], shardBatch, M, N, K, transA, transB));
     }
     return this.parallelOps.wrapShards(this.workspace, outShards, [batch * M, N], this.type, this.parallelism);
   }
@@ -961,6 +962,171 @@ export class ParallelTensor extends Tensor {
     }
   }
 
+  sigmoid(): Tensor {
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].sigmoid());
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, this.fullShape, this.type, this.parallelism);
+  }
+
+  topk(k: number, dim: number): { values: Tensor, indices: Tensor } {
+    const valuesShards: Tensor[] = [];
+    const indicesShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      const result = this.shards[i].topk(k, dim);
+      valuesShards.push(result.values);
+      indicesShards.push(result.indices);
+    }
+    const values = this.parallelOps.wrapShards(this.workspace, valuesShards, [...this.fullShape.slice(0, -1), k], this.type, this.parallelism);
+    const indices = this.parallelOps.wrapShards(this.workspace, indicesShards, [...this.fullShape.slice(0, -1), k], "I32", this.parallelism);
+    return { values, indices };
+  }
+
+  reduceSum(dim: number, batch: number): Tensor {
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].reduceSum(dim, batch));
+    }
+    const shardBatch = this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column
+      ? batch / this.worldSize : batch;
+    return this.parallelOps.wrapShards(this.workspace, outShards, [shardBatch], this.type, this.parallelism);
+  }
+
+  rowNormalize(scale: number, dim: number, batch: number, normalize: boolean = true): Tensor {
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].rowNormalize(scale, dim, batch, normalize));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, this.fullShape, this.type, this.parallelism);
+  }
+
+  scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
+    const pIndices = indices as ParallelTensor;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.shards[i].scatterScalar(pIndices.shards[i], value, k, outDim, batch);
+    }
+  }
+
+  groupMaskMul(groupMask: Tensor, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void {
+    const pGroupMask = groupMask as ParallelTensor;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.shards[i].groupMaskMul(pGroupMask.shards[i], numExperts, expertsPerGroup, nGroup, batch);
+    }
+  }
+
+  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+    super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+    const pCos = cos ? cos as ParallelTensor : undefined;
+    const pSin = sin ? sin as ParallelTensor : undefined;
+    const shardNHeads = (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column)
+      ? this.parallelOps.shardDim(nHeads, "ropeTranspose nHeads")
+      : nHeads;
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      const shardCos = pCos ? pCos.shards[i] : undefined!;
+      const shardSin = pSin ? pSin.shards[i] : undefined!;
+      outShards.push(this.shards[i].ropeTranspose(shardCos, shardSin, ropeDim, headDim, shardNHeads, seqLen, batch, inStride ?? headDim));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, [batch * nHeads, seqLen, headDim], this.type, this.parallelism);
+  }
+
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+    super.applyRotaryPosEmb(cos, sin, ropeDim, nHeads, seqLen, batch, unsqueezeDim);
+    const pCos = cos as ParallelTensor;
+    const pSin = sin as ParallelTensor;
+    const shardNHeads = (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column)
+      ? this.parallelOps.shardDim(nHeads, "applyRotaryPosEmb nHeads")
+      : nHeads;
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].applyRotaryPosEmb(pCos.shards[i], pSin.shards[i], ropeDim, shardNHeads, seqLen, batch, unsqueezeDim));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, this.fullShape, this.type, this.parallelism);
+  }
+
+  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): Tensor {
+    super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
+    const pVProj = vProj as ParallelTensor;
+    const shardNHeads = (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column)
+      ? this.parallelOps.shardDim(nHeads, "mlaVExpand nHeads")
+      : nHeads;
+    const BS = batch * seqLen;
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].mlaVExpand(pVProj.shards[i], kvLoraRank, vHeadDim, shardNHeads, seqLen, batch));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, [BS, nHeads * vHeadDim], this.type, this.parallelism);
+  }
+
+  mulMatId(input: Tensor, weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
+    const pInput = input as ParallelTensor;
+    const pWeightPtrs = weightPtrs as ParallelTensor;
+    const pExpertIds = expertIds as ParallelTensor;
+    const pBatchIds = batchIds as ParallelTensor;
+    const weightPar = pWeightPtrs.parallelism;
+    if (weightPar !== TensorParallelism.Replicated) {
+      throw new Error(`mulMatId: weight pointers must be Replicated, got ${weightPar}`);
+    }
+    const inputPar = pInput.parallelism;
+    let outN = N, outK = K, outPar: TensorParallelism;
+    if (inputPar === TensorParallelism.Replicated) {
+      outN = this.parallelOps.shardDim(N, "mulMatId N");
+      outPar = TensorParallelism.Row;
+    } else if (inputPar === TensorParallelism.Row) {
+      outK = this.parallelOps.shardDim(K, "mulMatId K");
+      outPar = TensorParallelism.PartialSum;
+    } else {
+      throw new Error(`mulMatId: unsupported input parallelism ${inputPar}`);
+    }
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(pInput.shards[i].mulMatId(pInput.shards[i], pWeightPtrs.shards[i], pExpertIds.shards[i], pBatchIds.shards[i], count, outN, outK));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, [count, N], this.type, outPar);
+  }
+
+  nvfp4MulMatId(input: Tensor, weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
+    const pInput = input as ParallelTensor;
+    const pWeightPtrs = weightPtrs as ParallelTensor;
+    const pScalePtrs = scalePtrs as ParallelTensor;
+    const pScale2Ptrs = scale2Ptrs as ParallelTensor;
+    const pExpertIds = expertIds as ParallelTensor;
+    const pBatchIds = batchIds as ParallelTensor;
+    const weightPar = pWeightPtrs.parallelism;
+    if (weightPar !== TensorParallelism.Replicated) {
+      throw new Error(`nvfp4MulMatId: weight pointers must be Replicated, got ${weightPar}`);
+    }
+    const inputPar = pInput.parallelism;
+    let outN = N, outK = K, outPar: TensorParallelism;
+    if (inputPar === TensorParallelism.Replicated) {
+      outN = this.parallelOps.shardDim(N, "nvfp4MulMatId N");
+      outPar = TensorParallelism.Row;
+    } else if (inputPar === TensorParallelism.Row) {
+      outK = this.parallelOps.shardDim(K, "nvfp4MulMatId K");
+      outPar = TensorParallelism.PartialSum;
+    } else {
+      throw new Error(`nvfp4MulMatId: unsupported input parallelism ${inputPar}`);
+    }
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(pInput.shards[i].nvfp4MulMatId(pInput.shards[i], pWeightPtrs.shards[i], pScalePtrs.shards[i], pScale2Ptrs.shards[i], pExpertIds.shards[i], pBatchIds.shards[i], count, outN, outK));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, [count, N], this.type, outPar);
+  }
+
+  scatterAddRows(input: Tensor, scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number, _workspace?: Tensor): void {
+    const pInput = input as ParallelTensor;
+    const pScales = scales as ParallelTensor;
+    const pBatchIds = batchIds as ParallelTensor;
+    if (pInput.parallelism === TensorParallelism.PartialSum) {
+      pInput.allReduce();
+    }
+    for (let i = 0; i < this.worldSize; i++) {
+      this.shards[i].scatterAddRows(pInput.shards[i], pScales.shards[i], pBatchIds.shards[i], dim, count, numRows);
+    }
+  }
+
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     super.rotaryEmbedding(positionIds, dimHalf, batch, seqLen);
     const pPositionIds = positionIds as ParallelTensor;
@@ -1087,6 +1253,9 @@ export class ParallelOps implements DeviceOps {
     if (devices.length > 1) {
       const deviceIds = devices.map(d => d.device);
       this.comms = getNativeAddon().ncclCommInitAll(deviceIds);
+      for (const device of devices) {
+        device.synchronize();
+      }
     } else {
       this.comms = [];
     }
@@ -1410,8 +1579,9 @@ export class ParallelOps implements DeviceOps {
     const pQoIndptrH = this.cast(qoIndptrH);
     const pKvIndptrH = this.cast(kvIndptrH);
     const pKvLenH = this.cast(kvLenH);
+    const shardNumHeads = this.shardDim(numHeads, "mlaPrefillPlan numHeads");
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaPrefillPlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pQoIndptrH.shards[i], pKvIndptrH.shards[i], pKvLenH.shards[i], batchSize, numHeads, headDimO, causal);
+      this.devices[i].mlaPrefillPlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pQoIndptrH.shards[i], pKvIndptrH.shards[i], pKvLenH.shards[i], batchSize, shardNumHeads, headDimO, causal);
     }
   }
 
@@ -1425,8 +1595,9 @@ export class ParallelOps implements DeviceOps {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPlanInfo = this.cast(planInfo);
+    const shardNumHeads = this.shardDim(numHeads, "mlaPrefillRun numHeads");
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], numHeads, pageSize, maskMode, smScale, qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH, ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe);
+      this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], shardNumHeads, pageSize, maskMode, smScale, qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH, ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe);
     }
   }
 
@@ -1436,8 +1607,9 @@ export class ParallelOps implements DeviceOps {
     const pPinnedIntWs = this.cast(pinnedIntWs);
     const pPlanInfo = this.cast(planInfo);
     const pIndptrH = this.cast(indptrH);
+    const shardNumQoHeads = this.shardDim(numQoHeads, "mlaDecodePlan numQoHeads");
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaDecodePlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pIndptrH.shards[i], batchSize, numQoHeads, pageSize, enableCudaGraph, headDimCkv, headDimKpe);
+      this.devices[i].mlaDecodePlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pIndptrH.shards[i], batchSize, shardNumQoHeads, pageSize, enableCudaGraph, headDimCkv, headDimKpe);
     }
   }
 
@@ -1453,8 +1625,9 @@ export class ParallelOps implements DeviceOps {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPlanInfo = this.cast(planInfo);
+    const shardNumQoHeads = this.shardDim(numQoHeads, "mlaDecodeRun numQoHeads");
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaDecodeRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptrD.shards[i], pLastPageLen.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], batchSize, numQoHeads, pageSize, smScale, headDimCkv, headDimKpe);
+      this.devices[i].mlaDecodeRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptrD.shards[i], pLastPageLen.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], batchSize, shardNumQoHeads, pageSize, smScale, headDimCkv, headDimKpe);
     }
   }
 

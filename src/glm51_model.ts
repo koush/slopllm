@@ -148,7 +148,6 @@ export class Glm51Model extends ChatModel {
         name.endsWith(".self_attn.kv_a_proj_with_mqa.weight") ||
         name.endsWith(".mlp.gate_proj.weight") ||
         name.endsWith(".mlp.up_proj.weight") ||
-        name.endsWith(".mlp.gate.weight") ||
         (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight")) ||
         (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".up_proj.weight")) ||
         name.endsWith(".mlp.shared_experts.gate_proj.weight") ||
@@ -300,7 +299,7 @@ export class Glm51Model extends ChatModel {
       this.splitWeightByHeads(f32Arr, inDim, 1, kvLoraRank + qkRopeDim,
         name.replace(".kv_a_proj_with_mqa.weight", ".ckv_proj.weight"), kvLoraRank, inDim,
         name.replace(".kv_a_proj_with_mqa.weight", ".k_pe_proj.weight"), qkRopeDim, inDim,
-        colPar);
+        TensorParallelism.Replicated);
     }
   }
 
@@ -544,7 +543,8 @@ export class Glm51Model extends ChatModel {
       using _qAbsorbedR = qAbsorbedR;
       const qPeR = qPeLin.ropeTranspose(undefined!, undefined!, 0, qkRopeDim, nHeads, S, B, qkRopeDim);
       using _qPeR = qPeR;
-      ws.mlaKvCacheAppend(ckvNormed, kPeRaw, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim, state.isDecode);
+      using kPeFull = kPeRaw.all(ws);
+      ws.mlaKvCacheAppend(ckvNormed, kPeFull, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim, state.isDecode);
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else if (useMla && !state.isDecode) {
       using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, qkRopeDim / 2, B, S));
@@ -568,8 +568,9 @@ export class Glm51Model extends ChatModel {
       using _qPeFinal = qPeFinal;
       const kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1);
       using _kPeRope = kPeRope;
+      using kPeFull = kPeRope.all(ws);
 
-      ws.mlaKvCacheAppend(ckvNormed, kPeRope, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim, false);
+      ws.mlaKvCacheAppend(ckvNormed, kPeFull, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim, false);
       attnOut.replace(ws.mlaPrefillPaged(qAbsorbedR, qPeFinal, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else {
       throw new Error("GLM-5.1 requires MLA KV cache");

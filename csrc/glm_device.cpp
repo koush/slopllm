@@ -36,7 +36,7 @@ GlmCtx* glm_init(int device_id) {
 
 void glm_free(GlmCtx* ctx) {
     if (!ctx) return;
-
+    cudaSetDevice(ctx->device_id);
     cublasDestroy(CUBLAS(ctx));
     for (int i = 0; i < GLM_MAX_STREAMS; i++) {
         cudaStreamDestroy(ctx->streams[i]);
@@ -52,16 +52,20 @@ void glm_free(GlmCtx* ctx) {
 void* glm_alloc(GlmCtx* ctx, size_t bytes) {
     void* ptr = nullptr;
     cudaSetDevice(ctx->device_id);
+    cudaError_t prev = cudaGetLastError();
+    if (prev != cudaSuccess) {
+        fprintf(stderr, "glm_alloc: pending CUDA error on device %d before alloc: %s\n", ctx->device_id, cudaGetErrorString(prev));
+    }
     cudaError_t err = cudaMalloc(&ptr, bytes);
     if (err != cudaSuccess) {
-        fprintf(stderr, "glm_alloc: cudaMalloc(%zu) failed: %s\n", bytes, cudaGetErrorString(err));
+        fprintf(stderr, "glm_alloc: cudaMalloc(%zu) failed on device %d: %s\n", bytes, ctx->device_id, cudaGetErrorString(err));
         return nullptr;
     }
     return ptr;
 }
 
 void glm_free_buf(GlmCtx* ctx, void* ptr) {
-    (void)ctx;
+    cudaSetDevice(ctx->device_id);
     if (ptr) cudaFree(ptr);
 }
 
@@ -125,6 +129,7 @@ void glm_mmap_close(void* ptr, uint64_t size) {
 
 void glm_mmap_load(GlmCtx* ctx, void* gpu_dst, const void* mmap_ptr,
                    uint64_t offset, uint64_t nbytes) {
+    cudaSetDevice(ctx->device_id);
     const void* src = (const char*)mmap_ptr + offset;
     cudaMemcpyAsync(gpu_dst, src, nbytes, cudaMemcpyHostToDevice, GLM_STREAM(ctx));
 }
@@ -134,10 +139,12 @@ void glm_mmap_load(GlmCtx* ctx, void* gpu_dst, const void* mmap_ptr,
 // ---------------------------------------------------------------------------
 
 void glm_h2d(GlmCtx* ctx, void* dst, const void* src, size_t bytes) {
+    cudaSetDevice(ctx->device_id);
     cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, GLM_STREAM(ctx));
 }
 
 void glm_d2h(GlmCtx* ctx, void* dst, const void* src, size_t bytes) {
+    cudaSetDevice(ctx->device_id);
     cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, GLM_STREAM(ctx));
     cudaStreamSynchronize(GLM_STREAM(ctx));
 }
@@ -147,12 +154,14 @@ void glm_d2h(GlmCtx* ctx, void* dst, const void* src, size_t bytes) {
 // ---------------------------------------------------------------------------
 
 void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes, int kind) {
+    cudaSetDevice(ctx->device_id);
     cudaMemcpyAsync(dst, src, bytes, static_cast<cudaMemcpyKind>(kind), GLM_STREAM(ctx));
 }
 
 void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,
                    const void* src, size_t spitch,
                    size_t width, size_t height, int kind) {
+    cudaSetDevice(ctx->device_id);
     cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height,
                        static_cast<cudaMemcpyKind>(kind), GLM_STREAM(ctx));
 }
