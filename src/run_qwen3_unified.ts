@@ -525,6 +525,11 @@ async function main(): Promise<void> {
     : args.useQwen35 ? QWEN35_REPO
     : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
 
+  if (args.useGlm51 && gpuDevices.length > 1) {
+    console.error("Error: --glm51 does not yet support multi-GPU (tensor parallelism). Use a single GPU.");
+    process.exit(1);
+  }
+
   const modelDir = args.modelDir ?? (args.useGlm51
     ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
     : resolveModelPath(repoId));
