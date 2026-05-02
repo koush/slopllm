@@ -179,6 +179,12 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
+  bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
+    const out = this.workspace.alloc([batch * M, N], this.type);
+    getNativeAddon().bmm(this.glm.ctx, out.data, this.data, B.data, 1.0, 0.0, batch, M, N, K, transA ? 1 : 0, transB ? 1 : 0);
+    return out;
+  }
+
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
     super.rmsnorm(weight, eps, dim, batch);
     const out = this.workspace.alloc([batch, dim], this.type);
@@ -672,10 +678,6 @@ export class GlmOps implements DeviceOps {
 
   memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
     getNativeAddon().memcpy2d(this.ctx, dst, dpitch, src, spitch, width, height, memcpyKindToNative(kind));
-  }
-
-  bmm(C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number): void {
-    getNativeAddon().bmm(this.ctx, C, A, B, alpha, beta, batch, M, N, K, transA, transB);
   }
 
   ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void {

@@ -95,7 +95,7 @@ export abstract class ChatModel extends WorkspaceBase {
     }
   }
 
-  protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void;  protected tieWeights(): void {}
+  protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void;
 
   protected loadWeights(modelDir: string): void {
     const stFiles = fs.readdirSync(modelDir).filter(f => f.endsWith('.safetensors') || f.endsWith('.safetensors.json'));
@@ -135,8 +135,10 @@ export abstract class ChatModel extends WorkspaceBase {
       st.close();
       mmapClose(mmapPtr, fileSize);
     }
+  }
 
-    this.tieWeights();
+  protected fromPretrained(modelDir: string): void {
+    this.loadWeights(modelDir);
     this.freeze();
   }
 }

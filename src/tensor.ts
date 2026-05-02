@@ -67,7 +67,14 @@ export abstract class Tensor implements Disposable {
     return this.pinnedBuffer;
   }
 
-  setName(name: string) {
+  setName(name: string | undefined) {
+    if (name === undefined) {
+      if (this.name !== undefined) {
+        this.workspace.tensors.delete(this.name);
+        (this as { name: string | undefined }).name = undefined;
+      }
+      return;
+    }
     if (this.name)
       throw new Error(`Tensor already has name ${this.name}, cannot rename to ${name}`);
     (this as { name: string }).name = name;
@@ -123,6 +130,10 @@ export abstract class Tensor implements Disposable {
     const weightK = weight.type === "U8" ? weight.shape[1] * 2 : weight.shape[1]; // NVFP4: packed K/2
     if (this.shape[1] !== weightK) throw new Error(`linear: input dim ${this.shape[1]} != weight dim ${weightK} (weight type ${weight.type}, shape [${weight.shape}])`);
     if (weight.type !== "BF16" && weight.type !== "F8_E4M3" && weight.type !== "U8") throw new Error(`linear: weight type must be BF16, F8_E4M3, or U8, got ${weight.type}`);
+    return undefined as never;
+  }
+
+  bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
     return undefined as never;
   }
 

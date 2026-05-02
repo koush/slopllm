@@ -52,7 +52,9 @@ export class WorkspaceBase implements Disposable {
       // shouldn't be possible but defensive check.
       if (t.view)
         throw new Error("disposed tensor should not have a view");
-      if (t.pinned === pinned && t.data !== 0 && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
+      if (!t.data)
+        throw new Error("disposed tensor should have data");
+      if (t.pinned === pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
         best = t;
       }
     }

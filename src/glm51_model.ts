@@ -3,15 +3,15 @@ import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
-import { bf16BytesToF32, f32ToBf16Bytes, getNativeAddon, GlmOps } from "./glm_ops";
+import { f32ToBf16Bytes, getNativeAddon, GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
-import { ExecutionState, ExecutionWorkspace, PagedKVCache } from "./paged_kv";
+import { ExecutionState, PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 
-export type { SamplingParams };
 export { ExecutionState as BatchState };
+export type { SamplingParams };
 
 const GLM51_REPO = "zai-org/GLM-5.1";
 const GLM51_MODEL_DIR = "tests/python/test_models/glm51_small/glm51_small_bf16";
@@ -136,7 +136,7 @@ export class Glm51Model extends ChatModel {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Glm51Model(glm, config, maxBatch, maxSeqLen);
-    model.loadWeights(modelDir);
+    model.fromPretrained(modelDir);
     return model;
   }
 
@@ -218,6 +218,45 @@ export class Glm51Model extends ChatModel {
     }
   }
 
+  private splitWeightByHeads(
+    src: Float32Array, inDim: number, nHeads: number, headDim: number,
+    name0: string, rowsPerHead0: number, outDim0: number,
+    name1: string, rowsPerHead1: number, outDim1: number,
+    par: TensorParallelism,
+  ): [Tensor, Tensor] {
+    const f320 = new Float32Array(nHeads * rowsPerHead0 * outDim0);
+    const f321 = new Float32Array(nHeads * rowsPerHead1 * outDim1);
+    for (let h = 0; h < nHeads; h++) {
+      for (let i = 0; i < rowsPerHead0; i++) {
+        for (let j = 0; j < outDim0; j++) {
+          f320[(h * rowsPerHead0 + i) * outDim0 + j] = src[(h * headDim + i) * inDim + j];
+        }
+      }
+      for (let i = 0; i < rowsPerHead1; i++) {
+        for (let j = 0; j < outDim1; j++) {
+          f321[(h * rowsPerHead1 + i) * outDim1 + j] = src[(h * headDim + rowsPerHead0 + i) * inDim + j];
+        }
+      }
+    }
+    const t0 = this.alloc([nHeads * rowsPerHead0, outDim0], "BF16", name0, par);
+    t0.h2d(f32ToBf16Bytes(f320));
+    const t1 = this.alloc([nHeads * rowsPerHead1, outDim1], "BF16", name1, par);
+    t1.h2d(f32ToBf16Bytes(f321));
+    return [t0, t1];
+  }
+
+  private tryComputeAbsorbed(layerPfx: string, nHeads: number, kvLoraRank: number, qLoraRank: number, qkNopeDim: number): void {
+    const kNopeProj = this.tensors.get(`${layerPfx}.k_nope_proj.weight`);
+    const qNopeProj = this.tensors.get(`${layerPfx}.q_nope_proj.weight`);
+    if (!kNopeProj || !qNopeProj) return;
+    const wAbsorbed = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
+    wAbsorbed.setName(`${layerPfx}.absorbed.weight`);
+    kNopeProj.setName(undefined);
+    qNopeProj.setName(undefined);
+    kNopeProj[Symbol.dispose]();
+    qNopeProj[Symbol.dispose]();
+  }
+
   private loadMlaWeight(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void {
     const cfg = this.cfg;
     const nHeads = cfg.numAttentionHeads;
@@ -243,91 +282,32 @@ export class Glm51Model extends ChatModel {
     }
 
     const inDim = meta.shape[1];
+    const layerPfx = name.replace(/\.(q_b_proj|kv_b_proj|kv_a_proj_with_mqa)\.weight$/, "");
 
     if (name.endsWith(".q_b_proj.weight")) {
-      const qNopeProjName = name.replace(".q_b_proj.weight", ".q_nope_proj.weight");
-      const qPeProjName = name.replace(".q_b_proj.weight", ".q_pe_proj.weight");
-      const qNopeProjF32 = new Float32Array(nHeads * qkNopeDim * qLoraRank);
-      const qPeProjF32 = new Float32Array(nHeads * qkRopeDim * qLoraRank);
-      for (let h = 0; h < nHeads; h++) {
-        for (let i = 0; i < qkNopeDim; i++) {
-          for (let j = 0; j < qLoraRank; j++) {
-            qNopeProjF32[(h * qkNopeDim + i) * qLoraRank + j] = f32Arr[(h * qkHeadDim + i) * inDim + j];
-          }
-        }
-        for (let i = 0; i < qkRopeDim; i++) {
-          for (let j = 0; j < qLoraRank; j++) {
-            qPeProjF32[(h * qkRopeDim + i) * qLoraRank + j] = f32Arr[(h * qkHeadDim + qkNopeDim + i) * inDim + j];
-          }
-        }
-      }
-      const qNopeProj = this.alloc([nHeads * qkNopeDim, qLoraRank], "BF16", qNopeProjName, colPar);
-      qNopeProj.h2d(f32ToBf16Bytes(qNopeProjF32));
-      const qPeProj = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", qPeProjName, colPar);
-      qPeProj.h2d(f32ToBf16Bytes(qPeProjF32));
+      this.splitWeightByHeads(f32Arr, inDim, nHeads, qkHeadDim,
+        name.replace(".q_b_proj.weight", ".q_nope_proj.weight"), qkNopeDim, qLoraRank,
+        name.replace(".q_b_proj.weight", ".q_pe_proj.weight"), qkRopeDim, qLoraRank,
+        colPar);
+      this.tryComputeAbsorbed(layerPfx, nHeads, kvLoraRank, qLoraRank, qkNopeDim);
     } else if (name.endsWith(".kv_b_proj.weight")) {
-      const kNopeProjName = name.replace(".kv_b_proj.weight", ".k_nope_proj.weight");
-      const vProjName = name.replace(".kv_b_proj.weight", ".v_proj.weight");
-      const kvExpandedDim = qkNopeDim + vHeadDim;
-      const kNopeProjF32 = new Float32Array(nHeads * qkNopeDim * kvLoraRank);
-      const vProjF32 = new Float32Array(nHeads * vHeadDim * kvLoraRank);
-      for (let h = 0; h < nHeads; h++) {
-        for (let i = 0; i < qkNopeDim; i++) {
-          for (let j = 0; j < kvLoraRank; j++) {
-            kNopeProjF32[(h * qkNopeDim + i) * kvLoraRank + j] = f32Arr[(h * kvExpandedDim + i) * inDim + j];
-          }
-        }
-        for (let i = 0; i < vHeadDim; i++) {
-          for (let j = 0; j < kvLoraRank; j++) {
-            vProjF32[(h * vHeadDim + i) * kvLoraRank + j] = f32Arr[(h * kvExpandedDim + qkNopeDim + i) * inDim + j];
-          }
-        }
-      }
-      const kNopeProj = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", kNopeProjName, colPar);
-      kNopeProj.h2d(f32ToBf16Bytes(kNopeProjF32));
-      const vProj = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", vProjName, colPar);
-      vProj.h2d(f32ToBf16Bytes(vProjF32));
+      this.splitWeightByHeads(f32Arr, inDim, nHeads, qkNopeDim + vHeadDim,
+        name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), qkNopeDim, kvLoraRank,
+        name.replace(".kv_b_proj.weight", ".v_proj.weight"), vHeadDim, kvLoraRank,
+        colPar);
+      this.tryComputeAbsorbed(layerPfx, nHeads, kvLoraRank, qLoraRank, qkNopeDim);
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
-      const ckvProjName = name.replace(".kv_a_proj_with_mqa.weight", ".ckv_proj.weight");
-      const kPeProjName = name.replace(".kv_a_proj_with_mqa.weight", ".k_pe_proj.weight");
-      const ckvProjF32 = new Float32Array(kvLoraRank * inDim);
-      const kPeProjF32 = new Float32Array(qkRopeDim * inDim);
-      for (let i = 0; i < kvLoraRank; i++) {
-        for (let j = 0; j < inDim; j++) {
-          ckvProjF32[i * inDim + j] = f32Arr[i * inDim + j];
-        }
-      }
-      for (let i = 0; i < qkRopeDim; i++) {
-        for (let j = 0; j < inDim; j++) {
-          kPeProjF32[i * inDim + j] = f32Arr[(kvLoraRank + i) * inDim + j];
-        }
-      }
-      const ckvProj = this.alloc([kvLoraRank, inDim], "BF16", ckvProjName, colPar);
-      ckvProj.h2d(f32ToBf16Bytes(ckvProjF32));
-      const kPeProj = this.alloc([qkRopeDim, inDim], "BF16", kPeProjName, colPar);
-      kPeProj.h2d(f32ToBf16Bytes(kPeProjF32));
+      this.splitWeightByHeads(f32Arr, inDim, 1, kvLoraRank + qkRopeDim,
+        name.replace(".kv_a_proj_with_mqa.weight", ".ckv_proj.weight"), kvLoraRank, inDim,
+        name.replace(".kv_a_proj_with_mqa.weight", ".k_pe_proj.weight"), qkRopeDim, inDim,
+        colPar);
     }
   }
 
-  protected tieWeights(): void {
+  protected loadWeights(modelDir: string): void {
+    super.loadWeights(modelDir);
+
     this.tieEmbeddingToLmHead("model.embed_tokens.weight");
-
-    const cfg = this.cfg;
-    const nHeads = cfg.numAttentionHeads;
-    const qkNopeDim = cfg.qkNopeHeadDim;
-    const kvLoraRank = cfg.kvLoraRank;
-    const qLoraRank = cfg.qLoraRank;
-
-    for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const pfx = `${Glm51Model.WEIGHT_PREFIX}${i}.self_attn`;
-      const kNopeProj = this.tensors.get(`${pfx}.k_nope_proj.weight`);
-      const qNopeProj = this.tensors.get(`${pfx}.q_nope_proj.weight`);
-      if (!kNopeProj || !qNopeProj) continue;
-
-      const absorbedName = `${pfx}.absorbed.weight`;
-      const wAbsorbed = this.alloc([nHeads * kvLoraRank, qLoraRank], "BF16", absorbedName, TensorParallelism.Column);
-      this.glm.bmm(wAbsorbed.data, kNopeProj.data, qNopeProj.data, 1.0, 0.0, nHeads, kvLoraRank, qLoraRank, qkNopeDim, 1, 0);
-    }
 
     this.initMoeAuxBuffers();
   }

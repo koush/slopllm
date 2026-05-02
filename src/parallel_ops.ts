@@ -67,14 +67,12 @@ export class ParallelTensor extends Tensor {
   free(): void {
     for (let i = 0; i < this.shards.length; i++) {
       const shard = this.shards[i];
-      if (shard.data !== 0) {
-        if (this.pinned) {
-          this.devices[i].freePinned(shard);
-        } else {
-          this.devices[i].freeBuf(shard);
-        }
-        shard.detachData();
+      if (this.pinned) {
+        this.devices[i].freePinned(shard);
+      } else {
+        this.devices[i].freeBuf(shard);
       }
+      shard.detachData();
     }
   }
 
@@ -84,9 +82,7 @@ export class ParallelTensor extends Tensor {
     }
     this.workspace.tracked.delete(this);
     for (const shard of this.shards) {
-      if (shard.data !== 0) {
-        shard[Symbol.dispose]();
-      }
+      shard[Symbol.dispose]();
     }
     (this.shards as Tensor[]).length = 0;
   }
@@ -395,6 +391,15 @@ export class ParallelTensor extends Tensor {
       shards.push(this.shards[i].linear(pWeight.shards[i], batch));
     }
     return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], this.type, outPar);
+  }
+
+  bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
+    const pB = B as ParallelTensor;
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].bmm(pB.shards[i], batch, M, N, K, transA, transB));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, [batch * M, N], this.type, this.parallelism);
   }
 
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
@@ -1406,12 +1411,6 @@ export class ParallelOps implements DeviceOps {
     const pPlanInfo = this.cast(planInfo);
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].mlaDecodeRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptrD.shards[i], pLastPageLen.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], batchSize, numQoHeads, pageSize, smScale, headDimCkv, headDimKpe);
-    }
-  }
-
-  bmm(C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number): void {
-    for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].bmm(C, A, B, alpha, beta, batch, M, N, K, transA, transB);
     }
   }
 

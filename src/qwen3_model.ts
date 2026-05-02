@@ -55,7 +55,7 @@ export class Qwen3Model extends ChatModel {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Qwen3Model(glm, config, maxBatch, maxSeqLen);
-    model.loadWeights(modelDir);
+    model.fromPretrained(modelDir);
     return model;
   }
 
@@ -99,7 +99,8 @@ export class Qwen3Model extends ChatModel {
     }
   }
 
-  protected tieWeights(): void {
+  protected loadWeights(modelDir: string): void {
+    super.loadWeights(modelDir);
     this.tieEmbeddingToLmHead("model.embed_tokens.weight");
   }
 
