@@ -300,7 +300,7 @@ __global__ void __launch_bounds__(256, 4) rope_transpose_kernel(
     int b = bhs / (seq_len * n_heads);
 
     const __nv_bfloat16* x = in + (b * seq_len + s) * n_heads * in_stride + h * in_stride;
-    __nv_bfloat16* o = out + ((b * n_heads + h) * seq_len + s) * head_dim;
+    __nv_bfloat16* o = out + ((b * seq_len + s) * n_heads + h) * head_dim;
 
     int half = rope_dim / 2;
     int cos_base = (b * seq_len + s) * rope_dim;

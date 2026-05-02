@@ -1030,7 +1030,7 @@ export class ParallelTensor extends Tensor {
       const shardSin = pSin ? pSin.shards[i] : undefined!;
       outShards.push(this.shards[i].ropeTranspose(shardCos, shardSin, ropeDim, headDim, shardNHeads, seqLen, batch, inStride ?? headDim));
     }
-    return this.parallelOps.wrapShards(this.workspace, outShards, [batch * nHeads, seqLen, headDim], this.type, this.parallelism);
+    return this.parallelOps.wrapShards(this.workspace, outShards, [batch * seqLen, nHeads, headDim], this.type, this.parallelism);
   }
 
   applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
@@ -1598,8 +1598,10 @@ export class ParallelOps implements DeviceOps {
     const pIntWs = this.cast(intWs);
     const pPlanInfo = this.cast(planInfo);
     const shardNumHeads = this.shardDim(numHeads, "mlaPrefillRun numHeads");
+    const shardQNopeStrideN = shardNumHeads * headDimCkv;
+    const shardQPeStrideN = shardNumHeads * headDimKpe;
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], shardNumHeads, pageSize, maskMode, smScale, qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH, ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe);
+      this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], shardNumHeads, pageSize, maskMode, smScale, shardQNopeStrideN, qNopeStrideH, shardQPeStrideN, qPeStrideH, ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe);
     }
   }
 

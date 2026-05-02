@@ -228,10 +228,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const headDimKpe = qkRopeDim;
     const out = this.alloc([1, nHeads, totalTokens, headDimCkv], qNope.type, undefined, qNope.parallelism);
     const pageSize = pagedKV.pageSize;
-    const qNopeStrideN = headDimCkv;
-    const qNopeStrideH = totalTokens * headDimCkv;
-    const qPeStrideN = headDimKpe;
-    const qPeStrideH = totalTokens * headDimKpe;
+    const qNopeStrideN = nHeads * headDimCkv;
+    const qNopeStrideH = headDimCkv;
+    const qPeStrideN = nHeads * headDimKpe;
+    const qPeStrideH = headDimKpe;
     const ckvStridePage = pageSize * headDimCkv;
     const ckvStrideN = headDimCkv;
     const kpeStridePage = pageSize * headDimKpe;

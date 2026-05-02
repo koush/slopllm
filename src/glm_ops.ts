@@ -334,7 +334,7 @@ export class GlmTensor extends Tensor {
 
   ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
     super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride);
-    const out = this.workspace.alloc([batch * nHeads, seqLen, headDim], this.type);
+    const out = this.workspace.alloc([batch * seqLen, nHeads, headDim], this.type);
     getNativeAddon().ropeTranspose(this.glm.ctx, out.data, this.data, ropeDim > 0 ? cos.data : 0, ropeDim > 0 ? sin.data : 0, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
     return out;
   }

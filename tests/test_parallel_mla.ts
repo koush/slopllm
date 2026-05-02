@@ -91,15 +91,15 @@ function gatherRopeTransposeOutput(
   const shardHeads = nHeads / 2;
   const s0 = bf16BytesToF32(shard0Buf);
   const s1 = bf16BytesToF32(shard1Buf);
-  const result = new Float32Array(batch * nHeads * seqLen * headDim);
+  const result = new Float32Array(batch * seqLen * nHeads * headDim);
   for (let b = 0; b < batch; b++) {
-    for (let h = 0; h < nHeads; h++) {
-      const fullRow = b * nHeads + h;
-      const shardRow = b * shardHeads + (h < shardHeads ? h : h - shardHeads);
-      const src = h < shardHeads ? s0 : s1;
-      for (let s = 0; s < seqLen; s++) {
+    for (let s = 0; s < seqLen; s++) {
+      for (let h = 0; h < nHeads; h++) {
+        const src = h < shardHeads ? s0 : s1;
+        const shardH = h < shardHeads ? h : h - shardHeads;
         for (let d = 0; d < headDim; d++) {
-          result[fullRow * seqLen * headDim + s * headDim + d] = src[shardRow * seqLen * headDim + s * headDim + d];
+          result[((b * seqLen + s) * nHeads + h) * headDim + d] =
+            src[((b * seqLen + s) * shardHeads + shardH) * headDim + d];
         }
       }
     }
@@ -165,11 +165,11 @@ describe("ParallelOps.ropeTranspose", () => {
     po.synchronize();
 
     assert.equal(pOut.parallelism, TensorParallelism.Column);
-    assert.deepEqual(pOut.fullShape, [batch * nHeads, seqLen, headDim]);
-    assert.deepEqual(pOut.shard(0).shape, [batch * nHeads / 2, seqLen, headDim]);
+    assert.deepEqual(pOut.fullShape, [batch * seqLen, nHeads, headDim]);
+    assert.deepEqual(pOut.shard(0).shape, [batch * seqLen, nHeads / 2, headDim]);
 
-    const out0Buf = Buffer.alloc(batch * nHeads / 2 * seqLen * headDim * 2);
-    const out1Buf = Buffer.alloc(batch * nHeads / 2 * seqLen * headDim * 2);
+    const out0Buf = Buffer.alloc(batch * seqLen * nHeads / 2 * headDim * 2);
+    const out1Buf = Buffer.alloc(batch * seqLen * nHeads / 2 * headDim * 2);
     pOut.shard(0).d2h(out0Buf);
     pOut.shard(1).d2h(out1Buf);
     const gatheredF32 = gatherRopeTransposeOutput(out0Buf, out1Buf, batch, nHeads, seqLen, headDim);
@@ -214,7 +214,7 @@ describe("ParallelOps.ropeTranspose", () => {
     po.synchronize();
 
     assert.equal(pOut.parallelism, TensorParallelism.Replicated);
-    assert.deepEqual(pOut.fullShape, [batch * nHeads, seqLen, headDim]);
+    assert.deepEqual(pOut.fullShape, [batch * seqLen, nHeads, headDim]);
 
     const outBuf = Buffer.alloc(batch * nHeads * seqLen * headDim * 2);
     pOut.d2h(outBuf);
@@ -293,8 +293,8 @@ describe("ParallelOps.ropeTranspose", () => {
     const pOut = pInput.ropeTranspose(pCos, pSin, ropeDim, headDim, nHeads, seqLen, batch) as ParallelTensor;
     po.synchronize();
 
-    const out0Buf = Buffer.alloc(batch * nHeads / 2 * seqLen * headDim * 2);
-    const out1Buf = Buffer.alloc(batch * nHeads / 2 * seqLen * headDim * 2);
+    const out0Buf = Buffer.alloc(batch * seqLen * nHeads / 2 * headDim * 2);
+    const out1Buf = Buffer.alloc(batch * seqLen * nHeads / 2 * headDim * 2);
     pOut.shard(0).d2h(out0Buf);
     pOut.shard(1).d2h(out1Buf);
     const gatheredF32 = gatherRopeTransposeOutput(out0Buf, out1Buf, batch, nHeads, seqLen, headDim);
