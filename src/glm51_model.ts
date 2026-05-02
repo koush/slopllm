@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
-import { f32ToBf16Bytes, getNativeAddon, GlmOps } from "./glm_ops";
+import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { ExecutionState, PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
@@ -337,27 +337,27 @@ export class Glm51Model extends ChatModel {
       const isNvfp4 = this.tensors.get(`${pfx}.mlp.experts.0.gate_proj.weight`)?.type === "U8";
 
       for (const proj of ["gate_proj", "up_proj", "down_proj"]) {
-        const ptrs = new BigInt64Array(numExperts);
+        const experts: Tensor[] = [];
         for (let e = 0; e < numExperts; e++) {
-          ptrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight`)!.data);
+          experts.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight`)!);
         }
         const name = `__moe_ptrs.${pfx}.${proj}`;
         const buf = this.alloc([numExperts], "I64", name);
-        buf.h2d(Buffer.from(ptrs.buffer));
+        buf.writePointers(experts);
 
         if (isNvfp4) {
-          const scalePtrs = new BigInt64Array(numExperts);
-          const scale2Ptrs = new BigInt64Array(numExperts);
+          const scaleExperts: Tensor[] = [];
+          const scale2Experts: Tensor[] = [];
           for (let e = 0; e < numExperts; e++) {
-            scalePtrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight_weight_scale`)!.data);
-            scale2Ptrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight_weight_scale_2`)!.data);
+            scaleExperts.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight_weight_scale`)!);
+            scale2Experts.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight_weight_scale_2`)!);
           }
           const scaleName = `__moe_nvfp4_ptrs.${pfx}.${proj}.weight_weight_scale`;
           const scale2Name = `__moe_nvfp4_ptrs.${pfx}.${proj}.weight_weight_scale_2`;
           const scaleBuf = this.alloc([numExperts], "I64", scaleName);
-          scaleBuf.h2d(Buffer.from(scalePtrs.buffer));
+          scaleBuf.writePointers(scaleExperts);
           const scale2Buf = this.alloc([numExperts], "I64", scale2Name);
-          scale2Buf.h2d(Buffer.from(scale2Ptrs.buffer));
+          scale2Buf.writePointers(scale2Experts);
         }
       }
     }
@@ -372,10 +372,6 @@ export class Glm51Model extends ChatModel {
     for (let i = 0; i < count; i++) downBatchIdsArr[i] = i;
     const downBatchIdsBuf = this.alloc([count], "I32", "__moe_down_batch_ids");
     downBatchIdsBuf.h2d(Buffer.from(downBatchIdsArr.buffer));
-
-    const allZeroIndices = new Int32Array(this.maxBatch).fill(0);
-    const allZeroIdxBuf = this.alloc([this.maxBatch], "I32", "__moe_all_zero_idx");
-    allZeroIdxBuf.h2d(Buffer.from(allZeroIndices.buffer));
   }
 
   private createExpertWeightPtrs(pfx: string, projection: string): Tensor {
@@ -383,12 +379,12 @@ export class Glm51Model extends ChatModel {
     const existing = this.tensors.get(name);
     if (existing) return existing;
     const numExperts = this.cfg.nRoutedExperts;
-    const ptrs = new BigInt64Array(numExperts);
+    const experts: Tensor[] = [];
     for (let e = 0; e < numExperts; e++) {
-      ptrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${projection}.weight`)!.data);
+      experts.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${projection}.weight`)!);
     }
     const buf = this.alloc([numExperts], "I64", name);
-    buf.h2d(Buffer.from(ptrs.buffer));
+    buf.writePointers(experts);
     return buf;
   }
 
@@ -397,12 +393,12 @@ export class Glm51Model extends ChatModel {
     const existing = this.tensors.get(name);
     if (existing) return existing;
     const numExperts = this.cfg.nRoutedExperts;
-    const ptrs = new BigInt64Array(numExperts);
+    const experts: Tensor[] = [];
     for (let e = 0; e < numExperts; e++) {
-      ptrs[e] = BigInt(this.tensors.get(`${pfx}.mlp.experts.${e}.${projection}.${suffix}`)!.data);
+      experts.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${projection}.${suffix}`)!);
     }
     const buf = this.alloc([numExperts], "I64", name);
-    buf.h2d(Buffer.from(ptrs.buffer));
+    buf.writePointers(experts);
     return buf;
   }
 
@@ -426,10 +422,7 @@ export class Glm51Model extends ChatModel {
     using topkInputHolder = new UsingHolder<Tensor>(undefined!);
     const eScoreBias = this.tensors.get(`${pfx}.mlp.gate.e_score_correction_bias`);
     if (eScoreBias) {
-      using biasBuf = ws.alloc([BS, numExperts], "BF16");
-      const allZeroIdxBuf = this.tensors.get("__moe_all_zero_idx")!;
-      getNativeAddon().indexSelect((this.glm as GlmOps).ctx, biasBuf.data, eScoreBias.data, allZeroIdxBuf.data, numExperts, BS);
-      topkInput = gateSigmoid.add(biasBuf, BS * numExperts);
+      topkInput = gateSigmoid.add(eScoreBias);
       topkInputHolder.replace(topkInput);
     } else if (nGroup > 1) {
       using zeros = ws.alloc([BS, numExperts], "BF16");

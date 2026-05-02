@@ -120,8 +120,10 @@ interface NativeAddon {
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
   add(ctx: number, out: number, a: number, b: number, n: number): void;
+  addBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scale(ctx: number, out: number, input: number, scale: number, n: number): void;
   mul(ctx: number, out: number, a: number, b: number, n: number): void;
+  mulBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
   maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void;
   applyRotaryPosEmbPartial(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
@@ -183,6 +185,16 @@ export class GlmTensor extends Tensor {
     const out = this.workspace.alloc([batch * M, N], this.type);
     getNativeAddon().bmm(this.glm.ctx, out.data, this.data, B.data, 1.0, 0.0, batch, M, N, K, transA ? 1 : 0, transB ? 1 : 0);
     return out;
+  }
+
+  writePointers(tensors: Tensor[]): void {
+    super.writePointers(tensors);
+    const n = tensors.length;
+    const ptrs = new BigInt64Array(n);
+    for (let i = 0; i < n; i++) {
+      ptrs[i] = BigInt(tensors[i].data);
+    }
+    this.h2d(Buffer.from(ptrs.buffer));
   }
 
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
@@ -361,6 +373,11 @@ export class GlmTensor extends Tensor {
   }
 
   add(other: Tensor, n?: number): Tensor {
+    if (this.shape.length === 2 && other.shape.length === 1 && this.shape[1] === other.shape[0]) {
+      const out = this.workspace.alloc(this.shape, this.type);
+      getNativeAddon().addBroadcast(this.glm.ctx, out.data, this.data, other.data, this.shape[1], this.shape[0]);
+      return out;
+    }
     const count = n ?? this.shape.reduce((a, b) => a * b, 1);
     const out = this.workspace.alloc(this.shape, this.type);
     getNativeAddon().add(this.glm.ctx, out.data, this.data, other.data, count);
@@ -372,6 +389,11 @@ export class GlmTensor extends Tensor {
   }
 
   mul(other: Tensor, n?: number): Tensor {
+    if (this.shape.length === 2 && other.shape.length === 1 && this.shape[1] === other.shape[0]) {
+      const out = this.workspace.alloc(this.shape, this.type);
+      getNativeAddon().mulBroadcast(this.glm.ctx, out.data, this.data, other.data, this.shape[1], this.shape[0]);
+      return out;
+    }
     const count = n ?? this.shape.reduce((a, b) => a * b, 1);
     const out = this.workspace.alloc(this.shape, this.type);
     getNativeAddon().mul(this.glm.ctx, out.data, this.data, other.data, count);
@@ -704,12 +726,20 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().add(ctx, out, a, b, n);
   }
 
+  addBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void {
+    getNativeAddon().addBroadcast(ctx, out, a, b, dim, rows);
+  }
+
   scale(ctx: number, out: number, input: number, scale: number, n: number): void {
     getNativeAddon().scale(ctx, out, input, scale, n);
   }
 
   mul(ctx: number, out: number, a: number, b: number, n: number): void {
     getNativeAddon().mul(ctx, out, a, b, n);
+  }
+
+  mulBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void {
+    getNativeAddon().mulBroadcast(ctx, out, a, b, dim, rows);
   }
 
   scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void {

@@ -624,6 +624,25 @@ static Napi::Value Add(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value AddBroadcast(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, out, a, b, dim, rows)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t a_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t b_ptr = info[3].As<Napi::Number>().Int64Value();
+    int dim = info[4].As<Napi::Number>().Int32Value();
+    int rows = info[5].As<Napi::Number>().Int32Value();
+    glm_add_broadcast(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                       reinterpret_cast<void*>(out_ptr),
+                       reinterpret_cast<const void*>(a_ptr),
+                       reinterpret_cast<const void*>(b_ptr), dim, rows);
+    return env.Undefined();
+}
+
 static Napi::Value RowScaleAdd(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -705,6 +724,25 @@ static Napi::Value Mul(const Napi::CallbackInfo& info) {
             reinterpret_cast<const void*>(a_ptr),
             reinterpret_cast<const void*>(b_ptr),
             n);
+    return env.Undefined();
+}
+
+static Napi::Value MulBroadcast(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, out, a, b, dim, rows)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t a_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t b_ptr = info[3].As<Napi::Number>().Int64Value();
+    int dim = info[4].As<Napi::Number>().Int32Value();
+    int rows = info[5].As<Napi::Number>().Int32Value();
+    glm_mul_broadcast(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                       reinterpret_cast<void*>(out_ptr),
+                       reinterpret_cast<const void*>(a_ptr),
+                       reinterpret_cast<const void*>(b_ptr), dim, rows);
     return env.Undefined();
 }
 
@@ -2275,10 +2313,12 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));
     exports.Set(Napi::String::New(env, "scale"), Napi::Function::New(env, Scale));
     exports.Set(Napi::String::New(env, "add"), Napi::Function::New(env, Add));
+    exports.Set(Napi::String::New(env, "addBroadcast"), Napi::Function::New(env, AddBroadcast));
     exports.Set(Napi::String::New(env, "rowScaleAdd"), Napi::Function::New(env, RowScaleAdd));
     exports.Set(Napi::String::New(env, "expandDim1"), Napi::Function::New(env, ExpandDim1));
     exports.Set(Napi::String::New(env, "transpose4d"), Napi::Function::New(env, Transpose4d));
     exports.Set(Napi::String::New(env, "mul"), Napi::Function::New(env, Mul));
+    exports.Set(Napi::String::New(env, "mulBroadcast"), Napi::Function::New(env, MulBroadcast));
     exports.Set(Napi::String::New(env, "reduceSum"), Napi::Function::New(env, ReduceSum));
     exports.Set(Napi::String::New(env, "rowNormalize"), Napi::Function::New(env, RowNormalize));
     exports.Set(Napi::String::New(env, "groupMaskMul"), Napi::Function::New(env, GroupMaskMul));

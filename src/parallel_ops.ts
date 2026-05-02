@@ -402,6 +402,50 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, [batch * M, N], this.type, this.parallelism);
   }
 
+  writePointers(tensors: Tensor[]): void {
+    super.writePointers(tensors);
+    const n = tensors.length;
+    for (let d = 0; d < this.worldSize; d++) {
+      const shardPtrs: Tensor[] = [];
+      for (let i = 0; i < n; i++) {
+        shardPtrs.push((tensors[i] as ParallelTensor).shards[d]);
+      }
+      this.shards[d].writePointers(shardPtrs);
+    }
+  }
+
+  add(other: Tensor, n?: number): Tensor {
+    const pOther = other as ParallelTensor;
+    if (this.shape.length === 2 && other.shape.length === 1 && this.shape[1] === other.shape[0]) {
+      const outShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        outShards.push(this.shards[i].add(pOther.shards[i], n));
+      }
+      return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
+    }
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].add(pOther.shards[i], n));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
+  }
+
+  mul(other: Tensor, n?: number): Tensor {
+    const pOther = other as ParallelTensor;
+    if (this.shape.length === 2 && other.shape.length === 1 && this.shape[1] === other.shape[0]) {
+      const outShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        outShards.push(this.shards[i].mul(pOther.shards[i], n));
+      }
+      return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
+    }
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].mul(pOther.shards[i], n));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
+  }
+
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
     super.rmsnorm(weight, eps, dim, batch);
     if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
@@ -1450,6 +1494,12 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  addBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].addBroadcast(ctx, out, a, b, dim, rows);
+    }
+  }
+
   scale(ctx: number, out: number, input: number, scale: number, n: number): void {
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].scale(ctx, out, input, scale, n);
@@ -1459,6 +1509,12 @@ export class ParallelOps implements DeviceOps {
   mul(ctx: number, out: number, a: number, b: number, n: number): void {
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].mul(ctx, out, a, b, n);
+    }
+  }
+
+  mulBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void {
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].mulBroadcast(ctx, out, a, b, dim, rows);
     }
   }
 

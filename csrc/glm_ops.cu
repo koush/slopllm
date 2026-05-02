@@ -518,20 +518,34 @@ __global__ void __launch_bounds__(256, 4) ew_unary_kernel(__nv_bfloat16* out, co
 }
 
 // ---------------------------------------------------------------------------
-// Element-wise binary kernel (templated)
+// Element-wise binary 2D kernel (templated)
 // F: (float, float) -> float
+// out[r, c] = F(a[r * a_stride + c], b[r * b_stride + c])
+// out: [rows * dim] contiguous
+// a:   row stride = a_stride (a_stride == dim for contiguous, 0 for broadcast)
+// b:   row stride = b_stride (b_stride == dim for contiguous, 0 for broadcast)
 // ---------------------------------------------------------------------------
 
 template<auto F>
-__global__ void __launch_bounds__(256, 4) ew_binary_kernel(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b, int n) {
+__global__ void __launch_bounds__(256, 4) ew_binary_2d_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    int dim, int rows, int a_stride, int b_stride
+) {
+    int total = rows * dim;
     int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
-    if (idx + 1 < n) {
+    if (idx + 1 < total) {
+        int r = idx / dim;
+        int c = idx % dim;
         float a0, a1, b0, b1;
-        load_bf16x2(a + idx, a0, a1);
-        load_bf16x2(b + idx, b0, b1);
+        load_bf16x2(a + r * a_stride + c, a0, a1);
+        load_bf16x2(b + r * b_stride + c, b0, b1);
         store_bf16x2(out + idx, F(a0, b0), F(a1, b1));
-    } else if (idx < n) {
-        out[idx] = __float2bfloat16(F(__bfloat162float(a[idx]), __bfloat162float(b[idx])));
+    } else if (idx < total) {
+        int r = idx / dim;
+        int c = idx % dim;
+        out[idx] = __float2bfloat16(F(__bfloat162float(a[r * a_stride + c]), __bfloat162float(b[r * b_stride + c])));
     }
 }
 
@@ -1276,8 +1290,19 @@ void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    ew_binary_kernel<add_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b, n);
+    ew_binary_2d_kernel<add_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b,
+        n, 1, n, n);
+}
+
+void glm_add_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int dim, int rows) {
+    cudaSetDevice(ctx->device_id);
+    int total = rows * dim;
+    int block_size = 256;
+    int grid = (total + block_size - 1) / block_size;
+    ew_binary_2d_kernel<add_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b,
+        dim, rows, dim, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1474,9 +1499,19 @@ void glm_mul(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    ew_binary_kernel<mul_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)a,
-        (const __nv_bfloat16*)b, n);
+    ew_binary_2d_kernel<mul_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b,
+        n, 1, n, n);
+}
+
+void glm_mul_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int dim, int rows) {
+    cudaSetDevice(ctx->device_id);
+    int total = rows * dim;
+    int block_size = 256;
+    int grid = (total + block_size - 1) / block_size;
+    ew_binary_2d_kernel<mul_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b,
+        dim, rows, dim, 0);
 }
 
 // ---------------------------------------------------------------------------

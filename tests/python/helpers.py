@@ -293,6 +293,12 @@ class GlmOps:
             ctypes.c_int
         ]
 
+        self.lib.glm_add_broadcast.restype = None
+        self.lib.glm_add_broadcast.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int
+        ]
+
         self.lib.glm_row_scale_add.restype = None
         self.lib.glm_row_scale_add.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -323,6 +329,12 @@ class GlmOps:
         self.lib.glm_mul.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_int
+        ]
+
+        self.lib.glm_mul_broadcast.restype = None
+        self.lib.glm_mul_broadcast.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int
         ]
 
         self.lib.glm_reduce_sum.restype = None
@@ -970,6 +982,16 @@ class GlmOps:
             n
         )
 
+    def add_broadcast(self, output, a, b, dim, rows):
+        self.lib.glm_add_broadcast(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(a),
+            self._ptr(b),
+            dim,
+            rows
+        )
+
     def row_scale_add(self, output, input, scales, rows, dim):
         self.lib.glm_row_scale_add(
             self.ctx,
@@ -1010,6 +1032,16 @@ class GlmOps:
             self._ptr(a),
             self._ptr(b),
             n
+        )
+
+    def mul_broadcast(self, output, a, b, dim, rows):
+        self.lib.glm_mul_broadcast(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(a),
+            self._ptr(b),
+            dim,
+            rows
         )
 
     def reduce_sum(self, output, input, rows, cols):

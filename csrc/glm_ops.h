@@ -135,6 +135,8 @@ void glm_scale(GlmCtx* ctx, void* out, const void* input, float scale, int n);
 
 void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n);
 
+void glm_add_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int dim, int rows);
+
 void glm_row_scale_add(GlmCtx* ctx, void* out, const void* input,
                         const void* scales, int rows, int dim);
 
@@ -150,6 +152,8 @@ void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
                       int perm0, int perm1, int perm2, int perm3);
 
 void glm_mul(GlmCtx* ctx, void* out, const void* a, const void* b, int n);
+
+void glm_mul_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int dim, int rows);
 
 void glm_reduce_sum(GlmCtx* ctx, void* out, const void* input, int rows, int cols);
 

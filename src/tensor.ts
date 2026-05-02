@@ -137,6 +137,13 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
+  writePointers(tensors: Tensor[]): void {
+    if (this.type !== "I64") throw new Error(`writePointers: expected I64 tensor, got ${this.type}`);
+    const n = tensors.length;
+    if (numElements(this.shape) < n) throw new Error(`writePointers: tensor has ${numElements(this.shape)} elements, need ${n}`);
+    return undefined as never;
+  }
+
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
     if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== dim) {
       throw new Error(`rmsnorm: input shape [${this.shape}] incompatible with batch=${batch}, dim=${dim}`);
@@ -287,6 +294,9 @@ export abstract class Tensor implements Disposable {
   }
 
   add(other: Tensor, n?: number): Tensor {
+    if (this.shape.length === 2 && other.shape.length === 1 && this.shape[1] === other.shape[0]) {
+      return undefined as never;
+    }
     return undefined as never;
   }
 
@@ -294,6 +304,9 @@ export abstract class Tensor implements Disposable {
   }
 
   mul(other: Tensor, n?: number): Tensor {
+    if (this.shape.length === 2 && other.shape.length === 1 && this.shape[1] === other.shape[0]) {
+      return undefined as never;
+    }
     return undefined as never;
   }
 
