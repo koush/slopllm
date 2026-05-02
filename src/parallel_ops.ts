@@ -985,12 +985,14 @@ export class ParallelTensor extends Tensor {
 
   reduceSum(dim: number, batch: number): Tensor {
     const outShards: Tensor[] = [];
+    const isSharded = this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column;
+    const shardDim = isSharded ? this.parallelOps.shardDim(dim, "reduceSum dim") : dim;
+    const shardBatch = isSharded ? batch : batch;
     for (let i = 0; i < this.worldSize; i++) {
-      outShards.push(this.shards[i].reduceSum(dim, batch));
+      outShards.push(this.shards[i].reduceSum(shardDim, shardBatch));
     }
-    const shardBatch = this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column
-      ? batch / this.worldSize : batch;
-    return this.parallelOps.wrapShards(this.workspace, outShards, [shardBatch], this.type, this.parallelism);
+    const outPar = isSharded ? TensorParallelism.PartialSum : this.parallelism;
+    return this.parallelOps.wrapShards(this.workspace, outShards, [batch], this.type, outPar);
   }
 
   rowNormalize(scale: number, dim: number, batch: number, normalize: boolean = true): Tensor {

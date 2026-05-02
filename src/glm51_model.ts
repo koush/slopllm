@@ -503,6 +503,7 @@ export class Glm51Model extends ChatModel {
     using sharedUpBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.up_proj.weight`)!, BS);
     using sharedSiluBuf = sharedGateBuf.siluAndMul(sharedGateBuf, sharedUpBuf, moeIntermediate, BS);
     using sharedDownBuf = sharedSiluBuf.linear(this.tensors.get(`${pfx}.mlp.shared_experts.down_proj.weight`)!, BS);
+    sharedDownBuf.all(ws);
 
     const result = routedOut.add(sharedDownBuf, BS * hs);
     return result.reshape([BS, hs]);

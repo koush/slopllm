@@ -1,4 +1,5 @@
 import "./test_parallel";
+import "./test_parallel_mla";
 import "./test_nccl";
 import "./test_nccl_multi";
 import "./test";
