@@ -540,10 +540,8 @@ export class Glm51Model extends ChatModel {
     using attnOut = new UsingHolder<Tensor>(undefined!);
 
     if (useMla && state.isDecode) {
-      const qAbsorbedR = qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-      using _qAbsorbedR = qAbsorbedR;
-      const qPeR = qPeLin.ropeTranspose(undefined!, undefined!, 0, qkRopeDim, nHeads, S, B, qkRopeDim);
-      using _qPeR = qPeR;
+      using qAbsorbedR = qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
+      using qPeR = qPeLin.ropeTranspose(undefined!, undefined!, 0, qkRopeDim, nHeads, S, B, qkRopeDim);
       using kPeFull = kPeRaw.all(ws);
       ws.mlaKvCacheAppend(ckvNormed, kPeFull, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim, state.isDecode);
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
@@ -563,12 +561,9 @@ export class Glm51Model extends ChatModel {
 
       rotaryEmbedding.streamWaitEvent();
 
-      const qAbsorbedR = qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-      using _qAbsorbedR = qAbsorbedR;
-      const qPeFinal = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim);
-      using _qPeFinal = qPeFinal;
-      const kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1);
-      using _kPeRope = kPeRope;
+      using qAbsorbedR = qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
+      using qPeFinal = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim);
+      using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1);
       using kPeFull = kPeRope.all(ws);
 
       ws.mlaKvCacheAppend(ckvNormed, kPeFull, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim, false);
