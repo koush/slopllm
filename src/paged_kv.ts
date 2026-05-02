@@ -1,5 +1,5 @@
 import type { ChatCache, ChatModel } from "./chat_model";
-import { DeviceOps } from "./device_ops";
+import { DeviceOps, TensorParallelism } from "./device_ops";
 import { BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, I32 } from "./glm_ops";
 import { MemcpyKind } from "./tensor";
 import { Tensor } from "./tensor";
@@ -526,8 +526,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
         this.ckvData.push(this.alloc([maxPages * pageSize * kvLoraRank], "BF16"));
         this.kpeData.push(this.alloc([maxPages * pageSize * qkRopeDim], "BF16"));
       } else {
-        this.kData.push(this.alloc([maxPages * nKv * pageSize * hd], "BF16"));
-        this.vData.push(this.alloc([maxPages * nKv * pageSize * hd], "BF16"));
+        this.kData.push(this.alloc([maxPages, nKv * pageSize * hd], "BF16", undefined, TensorParallelism.Row));
+        this.vData.push(this.alloc([maxPages, nKv * pageSize * hd], "BF16", undefined, TensorParallelism.Row));
       }
     }
     this.indices = this.alloc([maxPages * I32], "I32", "indices");
