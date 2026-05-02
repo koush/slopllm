@@ -26,6 +26,10 @@ export class WorkspaceBase implements Disposable {
     return this._alloc(shape, type, true, name, parallelism);
   }
 
+  allocRaw(bytes: number, name: string): Tensor {
+    return this.alloc([bytes], "U8", name);
+  }
+
   private _alloc(shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor {
     if (this.frozen) {
       throw new Error("Workspace is frozen");

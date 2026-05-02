@@ -13,6 +13,22 @@ constexpr int GEMV_ROWS_PER_BLOCK = 8;
 constexpr int GEMV_BLOCK_SIZE = GEMV_ROWS_PER_BLOCK * GEMV_WARP_SIZE;
 constexpr int FP8_QUANT_BLOCK = 128;
 
+__device__ __forceinline__ float warp_reduce_max(float x) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x = fmaxf(x, __shfl_xor_sync(0xFFFFFFFF, x, offset));
+    }
+    return x;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float x) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x += __shfl_xor_sync(0xFFFFFFFF, x, offset);
+    }
+    return x;
+}
+
 // ---------------------------------------------------------------------------
 // BF16 GEMV kernel: optimized for M=1 (single-token decode)
 // Each warp computes one output element. ROWS_PER_BLOCK=8 amortizes launch
