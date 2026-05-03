@@ -37,7 +37,7 @@ Per GPU (shard i):
   5. RoPE on Q (Replicated — all heads available)
   6. MLA attention: all Q heads × THIS GPU's KV shard
      → partial_attn_out [BS, nHeads, 1, kvLoraRank]  (decode S=1)
-     → partial_lse [nHeads, BS]  (NEW — log-sum-exp per head per query)
+     → partial_lse [BS, nHeads]  (NEW — log-sum-exp per head per query, base-2)
   7. v_expand: partial_v_out [BS, nHeads*vHeadDim]  (v_expand BEFORE merge)
 
 Cross-GPU communication:
@@ -127,8 +127,8 @@ FlashInfer already computes `final_lse` internally. We just need to allocate a b
 7. **Tests**: `tests/python/test_mla_kernels.py` — Add LSE validation tests.
 
 **LSE output shapes:**
-- Prefill: `[nHeads, totalTokens]` (F32, one value per head per query position)
-- Decode: `[nHeads, batchSize]` (F32, one value per head per batch element)
+- Prefill: `[totalTokens, numHeads]` (F32, one value per head per query position; FlashInfer writes `final_lse[q * num_heads + r]`)
+- Decode: `[batchSize, numHeads]` (F32, one value per head per batch element; FlashInfer writes `lse[batch * num_qo_heads + head]`)
 
 ### Phase 2: Custom Softmax Merge + Scale/Divide Kernels
 
@@ -137,19 +137,19 @@ New CUDA kernels for the cross-GPU softmax correction.
 **New file: `csrc/glm_context_parallel.cu`**
 
 1. **`mla_scale_lse_kernel`**: Scale v_out by LSE correction factor and compute correction sum
-   ```cuda
-   // Input: partial_v_out [BS, nHeads * vHeadDim], partial_lse [nHeads, BS], global_lse [nHeads, BS]
-   // Output: scaled_v_out [BS, nHeads * vHeadDim], scaled_sum [nHeads, BS]
-   // Per element: scaled_v_out[b,h,j] = exp2(partial_lse[h,b] - global_lse[h,b]) * partial_v_out[b,h,j]
-   // Per element: scaled_sum[h,b] = exp2(partial_lse[h,b] - global_lse[h,b])
+    ```cuda
+    // Input: partial_v_out [BS, nHeads * vHeadDim], partial_lse [BS, nHeads], global_lse [BS, nHeads]
+    // Output: scaled_v_out [BS, nHeads * vHeadDim], scaled_sum [BS, nHeads]
+    // Per element: scaled_v_out[b,h,j] = exp2(partial_lse[b,h] - global_lse[b,h]) * partial_v_out[b,h,j]
+    // Per element: scaled_sum[b,h] = exp2(partial_lse[b,h] - global_lse[b,h])
    ```
    This fuses the per-head scale factor broadcast with the element-wise multiply. The `partial_lse[h,b] - global_lse[h,b]` is a per-head-per-position scalar broadcast across `vHeadDim` dimensions.
 
 2. **`mla_softmax_divide_kernel`**: Normalize combined v_out by combined sum
-   ```cuda
-   // Input: combined_v_out [BS, nHeads * vHeadDim], combined_sum [nHeads, BS]
-   // Output: merged_v_out [BS, nHeads * vHeadDim]
-   // Per element: result[b,h,j] = combined_v_out[b,h,j] / combined_sum[h,b]
+    ```cuda
+    // Input: combined_v_out [BS, nHeads * vHeadDim], combined_sum [BS, nHeads]
+    // Output: merged_v_out [BS, nHeads * vHeadDim]
+    // Per element: result[b,h,j] = combined_v_out[b,h,j] / combined_sum[b,h]
    ```
 
 **New TypeScript APIs:**

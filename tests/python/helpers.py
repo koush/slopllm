@@ -654,6 +654,15 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
+        self.lib.glm_context_parallel_merge.restype = None
+        self.lib.glm_context_parallel_merge.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
         self.lib.glm_row_normalize.restype = None
         self.lib.glm_row_normalize.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -1502,4 +1511,18 @@ class GlmOps:
             self._ptr(batch_ids),
             dim, count, num_rows,
             self._ptr(workspace)
+        )
+
+    def context_parallel_merge(self, partial_v_outs, partial_lses, num_shards,
+                               merged_v_out, merged_lse,
+                               batch_size, num_heads, v_head_dim):
+        v_ptrs = (ctypes.c_void_p * num_shards)(*[ctypes.c_void_p(int(p)) for p in partial_v_outs])
+        lse_ptrs = (ctypes.c_void_p * num_shards)(*[ctypes.c_void_p(int(p)) for p in partial_lses])
+        self.lib.glm_context_parallel_merge(
+            self.ctx,
+            v_ptrs, lse_ptrs,
+            num_shards,
+            ctypes.c_void_p(int(merged_v_out)),
+            ctypes.c_void_p(int(merged_lse)) if merged_lse is not None else ctypes.c_void_p(0),
+            batch_size, num_heads, v_head_dim
         )

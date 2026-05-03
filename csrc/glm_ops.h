@@ -572,6 +572,25 @@ void glm_causal_conv1d_update(GlmCtx* ctx, void* output, void* conv_state,
                                int conv_dim, int kernel_size,
                                int batch_size, int conv_state_stride);
 
+// Context Parallelism: Online softmax merge of partial attention outputs.
+// Merges N partial (v_out, lse) pairs using FlashInfer's state_t::merge.
+// partial_v_outs[i]: [batch_size * num_heads * v_head_dim] BF16
+// partial_lses[i]:   [batch_size * num_heads] F32 (base-2 log-sum-exp)
+// merged_v_out:      [batch_size * num_heads * v_head_dim] BF16
+// merged_lse:        [batch_size * num_heads] F32 (optional, pass nullptr to skip)
+// num_shards: number of partial attention outputs (1, 2, 4, 8, or 16)
+// v_head_dim: per-head output dimension (32, 64, 128, 256, or 512)
+void glm_context_parallel_merge(
+    GlmCtx* ctx,
+    const void* const* partial_v_outs,
+    const float* const* partial_lses,
+    int num_shards,
+    void* merged_v_out,
+    float* merged_lse,
+    int batch_size,
+    int num_heads,
+    int v_head_dim);
+
 // RMSNorm gated: output = RMSNorm(input) * weight * SiLU(gate)
 // output: [batch, dim] BF16
 // input: [batch, dim] BF16
