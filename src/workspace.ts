@@ -18,6 +18,35 @@ export class WorkspaceBase implements Disposable {
     this.frozen = true;
   }
 
+  stats(): { namedCount: number; namedBytes: number; namedDetails: { name: string; shape: number[]; type: string; allocSize: number; parallelism: string }[]; disposedCount: number; disposedBytes: number; disposedDetails: { shape: number[]; type: string; allocSize: number }[]; trackedCount: number; trackedBytes: number; exportedCount: number; exportedBytes: number } {
+    const namedDetails: { name: string; shape: number[]; type: string; allocSize: number; parallelism: string }[] = [];
+    let namedBytes = 0;
+    for (const [name, t] of this.tensors) {
+      namedBytes += t.allocSize;
+      namedDetails.push({ name, shape: t.shape, type: t.type, allocSize: t.allocSize, parallelism: t.parallelism ?? "none" });
+    }
+    const disposedDetails: { shape: number[]; type: string; allocSize: number }[] = [];
+    let disposedBytes = 0;
+    for (const t of this.disposed) {
+      disposedBytes += t.allocSize;
+      disposedDetails.push({ shape: t.shape, type: t.type, allocSize: t.allocSize });
+    }
+    let trackedBytes = 0;
+    for (const t of this.tracked) {
+      trackedBytes += t.allocSize;
+    }
+    let exportedBytes = 0;
+    for (const t of this.exported) {
+      exportedBytes += t.allocSize;
+    }
+    return {
+      namedCount: this.tensors.size, namedBytes, namedDetails,
+      disposedCount: this.disposed.size, disposedBytes, disposedDetails,
+      trackedCount: this.tracked.size, trackedBytes,
+      exportedCount: this.exported.size, exportedBytes,
+    };
+  }
+
   alloc(shape: number[], type: string, name?: string, parallelism?: TensorParallelism): Tensor {
     return this._alloc(shape, type, false, name, parallelism);
   }
@@ -38,38 +67,41 @@ export class WorkspaceBase implements Disposable {
     const bytes = Tensor.byteCount(shape, type);
 
     if (name !== undefined) {
-      const tensor = this.glm.newTensor(this, shape, type, pinned, name, parallelism);
       const existing = this.tensors.get(name);
       if (existing !== undefined) {
         existing[Symbol.dispose]();
       }
-      this.tensors.set(name, tensor);
-      return tensor;
+
     }
 
     let best: Tensor | undefined;
     for (const t of this.disposed) {
-      // shouldn't be possible but defensive check.
       if (t.view)
         throw new Error("disposed tensor should not have a view");
       if (!t.data)
         throw new Error("disposed tensor should have data");
       if (t.pinned === pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
-        best = t;
+        if (name === undefined || t.allocSize === bytes) {
+          best = t;
+        }
       }
     }
+    let tensor: Tensor;
     if (best !== undefined) {
       this.disposed.delete(best);
       const data = best.data;
       best.detachData();
-      const tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned, undefined);
-      this.tracked.add(tensor);
-      return tensor;
+      tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned, undefined);
+    } else {
+      tensor = this.glm.newTensor(this, shape, type, pinned, undefined, parallelism);
     }
 
-    const tensor = this.glm.newTensor(this, shape, type, pinned, undefined, parallelism);
-
-    this.tracked.add(tensor);
+    if (name !== undefined) {
+      tensor.setName(name);
+      this.tensors.set(name, tensor);
+    } else {
+      this.tracked.add(tensor);
+    }
     return tensor;
   }
 

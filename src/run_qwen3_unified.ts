@@ -48,6 +48,7 @@ interface CliArgs {
   presencePenalty: number;
   repetitionPenaltyWindow: number;
   greedy: boolean;
+  stats: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -75,6 +76,7 @@ function parseArgs(argv: string[]): CliArgs {
     presencePenalty: 0,
     repetitionPenaltyWindow: 64,
     greedy: false,
+    stats: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -104,6 +106,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--greedy") {
       args.greedy = true;
     }
+    else if (a === "--stats") args.stats = true;
   }
 
   if (args.useQwen35 && args.useFp8) {
@@ -527,12 +530,46 @@ async function main(): Promise<void> {
 
   const modelDir = args.modelDir ?? (args.useGlm51
     ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
+    // ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
     : resolveModelPath(repoId));
   const model: ChatModel = args.useGlm51
     ? Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
     : args.useQwen35
     ? Qwen35Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
     : Qwen3Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen);
+
+  if (args.stats) {
+    const printWsStats = (label: string, s: ReturnType<WorkspaceBase["stats"]>) => {
+      const mb = (b: number) => (b / (1024 * 1024)).toFixed(1);
+      console.log(`[${label}] named: ${s.namedCount} (${mb(s.namedBytes)} MB), disposed: ${s.disposedCount} (${mb(s.disposedBytes)} MB), tracked: ${s.trackedCount} (${mb(s.trackedBytes)} MB), exported: ${s.exportedCount} (${mb(s.exportedBytes)} MB)`);
+      if (s.disposedCount > 0) {
+        console.log(`  disposed tensors:`);
+        for (const d of s.disposedDetails) {
+          console.log(`    [${d.shape}] ${d.type} allocSize=${d.allocSize}`);
+        }
+      }
+      const byPrefix: Record<string, { count: number; bytes: number }> = {};
+      for (const d of s.namedDetails) {
+        const pfx = d.name.replace(/model\.layers\.\d+/, "model.layers.N");
+        const key = `${pfx} [${d.shape}] ${d.type} ${d.parallelism}`;
+        if (!byPrefix[key]) byPrefix[key] = { count: 0, bytes: 0 };
+        byPrefix[key].count++;
+        byPrefix[key].bytes += d.allocSize;
+      }
+      const sorted = Object.entries(byPrefix).sort((a, b) => b[1].bytes - a[1].bytes);
+      console.log(`  named by pattern (top 30):`);
+      for (let i = 0; i < Math.min(30, sorted.length); i++) {
+        const [key, v] = sorted[i];
+        console.log(`    ${v.count}x ${key} = ${mb(v.bytes)} MB`);
+      }
+    };
+    printWsStats("model workspace", model.stats());
+    if (glm instanceof ParallelOps) {
+      for (const [i, ws] of glm.shardWorkspacesFor(model as WorkspaceBase).entries()) {
+        printWsStats(`GPU ${i} workspace`, ws.stats());
+      }
+    }
+  }
   const cache = model.createChatCache(args.maxPages);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
 
