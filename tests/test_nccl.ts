@@ -143,7 +143,7 @@ describe("memcpy2d", () => {
       }
     }
 
-    glm.freePinned(hostTensor);
+    hostTensor.free();
   });
 });
 
@@ -179,7 +179,7 @@ describe("NCCL single-rank", () => {
     assert.ok(comm !== 0, "comm should not be null");
 
     getNativeAddon().ncclCommDestroy(comm);
-    glm.freePinned(idTensor);
+    idTensor.free();
   });
 
   it("allReduce with worldSize=1 is identity (BF16)", () => {
@@ -216,7 +216,7 @@ describe("NCCL single-rank", () => {
     }
 
     getNativeAddon().ncclCommDestroy(comm);
-    glm.freePinned(idTensor);
+    idTensor.free();
   });
 
   it("allReduce with worldSize=1 is identity (F32)", () => {
@@ -253,7 +253,7 @@ describe("NCCL single-rank", () => {
     }
 
     getNativeAddon().ncclCommDestroy(comm);
-    glm.freePinned(idTensor);
+    idTensor.free();
   });
 
   it("allGather with worldSize=1 is identity (BF16)", () => {
@@ -290,6 +290,6 @@ describe("NCCL single-rank", () => {
     }
 
     getNativeAddon().ncclCommDestroy(comm);
-    glm.freePinned(idTensor);
+    idTensor.free();
   });
 });
