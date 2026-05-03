@@ -263,7 +263,7 @@ export abstract class Tensor implements Disposable {
   }
 
   abstract fill(value: number, n: number): void;
-  abstract mmapLoad(mmapPtr: number, offset: number, nbytes: number, gdnQkvLayout?: import("./device_ops").GdnQkvLayout): void;
+  abstract mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: import("./device_ops").StridedMmap): void;
   abstract memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void;
   abstract memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void;
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {

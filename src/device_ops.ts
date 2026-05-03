@@ -8,10 +8,13 @@ export enum TensorParallelism {
   PartialSum = "partial_sum",
 }
 
-export interface GdnQkvLayout {
-  numHeads: number;
-  dK: number;
-  dV: number;
+export interface StridedMmap {
+  srcOffset: number;
+  dstOffset: number;
+  srcPitch: number;
+  dstPitch: number;
+  width: number;
+  height: number;
 }
 
 export interface DeviceOps {

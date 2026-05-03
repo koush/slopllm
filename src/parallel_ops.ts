@@ -1,4 +1,4 @@
-import { DeviceOps, GdnQkvLayout, TensorParallelism } from "./device_ops";
+import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
 import { GlmOps, getNativeAddon, f32ToBf16Bytes, bf16BytesToF32, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM } from "./glm_ops";
 import { MemcpyKind } from "./tensor";
 import { Tensor } from "./tensor";
@@ -832,34 +832,43 @@ export class ParallelTensor extends Tensor {
     }
   }
 
-  mmapLoad(mmapPtr: number, offset: number, nbytes: number, gdnQkvLayout?: GdnQkvLayout): void {
-    if (gdnQkvLayout && this.parallelism === TensorParallelism.Column) {
-      const { numHeads, dK, dV } = gdnQkvLayout;
-      const Hlocal = this.shardDim(numHeads, "mmapLoad numHeads");
-      const qRows = numHeads * dK;
-      const bytesPerRow = this.fullShape.slice(1).reduce((a, b) => a * b, 1) * ParallelTensor.elemBytes(this.type);
-      const srcBase = mmapPtr + offset;
-      for (let i = 0; i < this.worldSize; i++) {
-        const hStart = i * Hlocal;
-        const shardData = this.shards[i].data;
-        this.shards[i].memcpy2d(
-          shardData, bytesPerRow,
-          srcBase + hStart * dK * bytesPerRow, bytesPerRow,
-          bytesPerRow, Hlocal * dK,
-          MemcpyKind.HostToDevice,
-        );
-        this.shards[i].memcpy2d(
-          shardData + Hlocal * dK * bytesPerRow, bytesPerRow,
-          srcBase + (qRows + hStart * dK) * bytesPerRow, bytesPerRow,
-          bytesPerRow, Hlocal * dK,
-          MemcpyKind.HostToDevice,
-        );
-        this.shards[i].memcpy2d(
-          shardData + 2 * Hlocal * dK * bytesPerRow, bytesPerRow,
-          srcBase + (2 * qRows + hStart * dV) * bytesPerRow, bytesPerRow,
-          bytesPerRow, Hlocal * dV,
-          MemcpyKind.HostToDevice,
-        );
+  mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): void {
+    if (strided) {
+      if (this.parallelism === TensorParallelism.Replicated || this.parallelism === TensorParallelism.PartialSum) {
+        for (let i = 0; i < this.shards.length; i++) {
+          this.shards[i].memcpy2d(
+            this.shards[i].data + strided.dstOffset, strided.dstPitch,
+            mmapPtr + offset + strided.srcOffset, strided.srcPitch,
+            strided.width, strided.height,
+            MemcpyKind.HostToDevice,
+          );
+        }
+      } else if (this.parallelism === TensorParallelism.Column) {
+        const shardHeight = strided.height / this.shards.length;
+        const shardDstOffset = Math.trunc(strided.dstOffset * shardHeight / strided.height);
+        for (let i = 0; i < this.shards.length; i++) {
+          const srcOff = strided.srcOffset + i * shardHeight * strided.srcPitch;
+          this.shards[i].memcpy2d(
+            this.shards[i].data + shardDstOffset, strided.dstPitch,
+            mmapPtr + offset + srcOff, strided.srcPitch,
+            strided.width, shardHeight,
+            MemcpyKind.HostToDevice,
+          );
+        }
+      } else if (this.parallelism === TensorParallelism.Row) {
+        const shardWidth = strided.width / this.shards.length;
+        const shardDstPitch = strided.dstPitch / this.shards.length;
+        for (let i = 0; i < this.shards.length; i++) {
+          const srcOff = strided.srcOffset + i * shardWidth;
+          this.shards[i].memcpy2d(
+            this.shards[i].data + strided.dstOffset, shardDstPitch,
+            mmapPtr + offset + srcOff, strided.srcPitch,
+            shardWidth, strided.height,
+            MemcpyKind.HostToDevice,
+          );
+        }
+      } else {
+        throw new Error(`mmapLoad strided: unsupported parallelism ${this.parallelism}`);
       }
       return;
     }

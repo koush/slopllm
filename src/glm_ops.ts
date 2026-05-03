@@ -306,8 +306,12 @@ export class GlmTensor extends Tensor {
     getNativeAddon().fill(this.glm.ctx, this.data, value, n);
   }
 
-  mmapLoad(mmapPtr: number, offset: number, nbytes: number, _gdnQkvLayout?: import("./device_ops").GdnQkvLayout): void {
-    getNativeAddon().mmapLoad(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
+  mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: import("./device_ops").StridedMmap): void {
+    if (strided) {
+      getNativeAddon().memcpy2d(this.glm.ctx, this.data + strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height, memcpyKindToNative(MemcpyKind.HostToDevice));
+    } else {
+      getNativeAddon().mmapLoad(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
+    }
   }
 
   memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {

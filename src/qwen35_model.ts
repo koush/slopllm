@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
-import { DeviceOps, GdnQkvLayout, TensorParallelism } from "./device_ops";
+import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
 import { f32ToBf16Bytes, GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { ExecutionState } from "./paged_kv";
@@ -184,8 +184,16 @@ export class Qwen35Model extends ChatModel {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name, par);
       const offset = st.dataStart + meta.dataOffsets[0];
-      const gdnLayout: GdnQkvLayout = { numHeads: this.cfg.linearNumKeyHeads, dK: this.cfg.linearKeyHeadDim, dV: this.cfg.linearValueHeadDim };
-      tensor.mmapLoad(mmapPtr, offset, tensor.bytes, gdnLayout);
+      const numHeads = this.cfg.linearNumKeyHeads;
+      const dK = this.cfg.linearKeyHeadDim;
+      const dV = this.cfg.linearValueHeadDim;
+      const inner = meta.shape.slice(1).reduce((a, b) => a * b, 1);
+      const bpr = inner * (dtype === "F32" ? 4 : 2);
+      const qRows = numHeads * dK;
+      const strided: StridedMmap = { srcOffset: 0, dstOffset: 0, srcPitch: bpr, dstPitch: bpr, width: bpr, height: qRows };
+      tensor.mmapLoad(mmapPtr, offset, tensor.bytes, strided);
+      tensor.mmapLoad(mmapPtr, offset, tensor.bytes, { ...strided, srcOffset: qRows * bpr, dstOffset: qRows * bpr, height: numHeads * dK });
+      tensor.mmapLoad(mmapPtr, offset, tensor.bytes, { ...strided, srcOffset: 2 * qRows * bpr, dstOffset: 2 * qRows * bpr, height: numHeads * dV });
     } else if (meta.dtype === "F32") {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
       const tensor = this.alloc(meta.shape, "BF16", name, par);

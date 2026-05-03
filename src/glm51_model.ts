@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
-import { DeviceOps, TensorParallelism } from "./device_ops";
+import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { ExecutionState, PagedKVCache } from "./paged_kv";
@@ -217,30 +217,20 @@ export class Glm51Model extends ChatModel {
     }
   }
 
-  private splitWeightByHeads(
-    src: Float32Array, inDim: number, nHeads: number, headDim: number,
+  private splitMlaWeightMmap(
+    mmapPtr: number, offset: number,
+    nHeads: number, headDim: number, inDim: number,
     name0: string, rowsPerHead0: number, outDim0: number,
     name1: string, rowsPerHead1: number, outDim1: number,
     par: TensorParallelism,
   ): [Tensor, Tensor] {
-    const f320 = new Float32Array(nHeads * rowsPerHead0 * outDim0);
-    const f321 = new Float32Array(nHeads * rowsPerHead1 * outDim1);
-    for (let h = 0; h < nHeads; h++) {
-      for (let i = 0; i < rowsPerHead0; i++) {
-        for (let j = 0; j < outDim0; j++) {
-          f320[(h * rowsPerHead0 + i) * outDim0 + j] = src[(h * headDim + i) * inDim + j];
-        }
-      }
-      for (let i = 0; i < rowsPerHead1; i++) {
-        for (let j = 0; j < outDim1; j++) {
-          f321[(h * rowsPerHead1 + i) * outDim1 + j] = src[(h * headDim + rowsPerHead0 + i) * inDim + j];
-        }
-      }
-    }
+    const eb = 2;
+    const srcPitch = headDim * inDim * eb;
     const t0 = this.alloc([nHeads * rowsPerHead0, outDim0], "BF16", name0, par);
-    t0.h2d(f32ToBf16Bytes(f320));
     const t1 = this.alloc([nHeads * rowsPerHead1, outDim1], "BF16", name1, par);
-    t1.h2d(f32ToBf16Bytes(f321));
+    const strided: StridedMmap = { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: rowsPerHead0 * inDim * eb, width: rowsPerHead0 * inDim * eb, height: nHeads };
+    t0.mmapLoad(mmapPtr, offset, t0.bytes, strided);
+    t1.mmapLoad(mmapPtr, offset, t1.bytes, { srcOffset: rowsPerHead0 * inDim * eb, dstOffset: 0, srcPitch, dstPitch: rowsPerHead1 * inDim * eb, width: rowsPerHead1 * inDim * eb, height: nHeads });
     return [t0, t1];
   }
 
@@ -266,40 +256,36 @@ export class Glm51Model extends ChatModel {
     const qLoraRank = cfg.qLoraRank;
     const qkHeadDim = cfg.qkHeadDim;
     const colPar = TensorParallelism.Column;
-
-    const rawBytes = st.readTensor(name);
-    const numElements = meta.shape.reduce((a, b) => a * b, 1);
-    const f32Arr = new Float32Array(numElements);
-    if (meta.dtype === "BF16") {
-      for (let i = 0; i < numElements; i++) {
-        const u16 = rawBytes.readUInt16LE(i * 2);
-        const u32 = u16 << 16;
-        f32Arr[i] = new Float32Array(new Uint32Array([u32]).buffer)[0];
-      }
-    } else {
-      f32Arr.set(new Float32Array(rawBytes.buffer, rawBytes.byteOffset, numElements));
-    }
-
     const inDim = meta.shape[1];
+    const offset = st.dataStart + meta.dataOffsets[0];
     const layerPfx = name.replace(/\.(q_b_proj|kv_b_proj|kv_a_proj_with_mqa)\.weight$/, "");
 
+    if (meta.dtype !== "BF16") {
+      throw new Error(`loadMlaWeight: expected BF16, got ${meta.dtype}`);
+    }
+
     if (name.endsWith(".q_b_proj.weight")) {
-      this.splitWeightByHeads(f32Arr, inDim, nHeads, qkHeadDim,
+      this.splitMlaWeightMmap(mmapPtr, offset,
+        nHeads, qkHeadDim, inDim,
         name.replace(".q_b_proj.weight", ".q_nope_proj.weight"), qkNopeDim, qLoraRank,
         name.replace(".q_b_proj.weight", ".q_pe_proj.weight"), qkRopeDim, qLoraRank,
         colPar);
-      this.tryComputeAbsorbed(layerPfx, nHeads, kvLoraRank, qLoraRank, qkNopeDim);
     } else if (name.endsWith(".kv_b_proj.weight")) {
-      this.splitWeightByHeads(f32Arr, inDim, nHeads, qkNopeDim + vHeadDim,
+      this.splitMlaWeightMmap(mmapPtr, offset,
+        nHeads, qkNopeDim + vHeadDim, inDim,
         name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), qkNopeDim, kvLoraRank,
         name.replace(".kv_b_proj.weight", ".v_proj.weight"), vHeadDim, kvLoraRank,
         colPar);
-      this.tryComputeAbsorbed(layerPfx, nHeads, kvLoraRank, qLoraRank, qkNopeDim);
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
-      this.splitWeightByHeads(f32Arr, inDim, 1, kvLoraRank + qkRopeDim,
+      this.splitMlaWeightMmap(mmapPtr, offset,
+        1, kvLoraRank + qkRopeDim, inDim,
         name.replace(".kv_a_proj_with_mqa.weight", ".ckv_proj.weight"), kvLoraRank, inDim,
         name.replace(".kv_a_proj_with_mqa.weight", ".k_pe_proj.weight"), qkRopeDim, inDim,
         TensorParallelism.Replicated);
+    }
+
+    if (name.endsWith(".q_b_proj.weight") || name.endsWith(".kv_b_proj.weight")) {
+      this.tryComputeAbsorbed(layerPfx, nHeads, kvLoraRank, qLoraRank, qkNopeDim);
     }
   }
 
