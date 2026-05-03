@@ -1175,26 +1175,18 @@ class P2PAllReduceGroup {
     const N = devices.length;
     const addon = getNativeAddon();
 
-    // 1. Enable peer access in both directions for every pair.
-    for (let i = 0; i < N; ++i) {
-      for (let j = 0; j < N; ++j) {
-        if (i === j) continue;
-        const rc = addon.p2pEnablePeerAccess(devices[i].ctx, devices[j].device);
-        if (rc !== 0) {
-          throw new Error(`P2P enable failed dev ${devices[i].device} -> ${devices[j].device}`);
-        }
-      }
-    }
+    // Peer access must already be enabled (done in ParallelOps constructor
+    // before model weights are loaded, to avoid VA-space fragmentation).
 
-    // 2. Create one instance per rank.
+    // 1. Create one instance per rank.
     this.instances = devices.map((dev, rank) =>
       addon.p2pCreateInstance(dev.ctx, rank, N, maxBytes));
 
-    // 3. Collect per-rank data + flag pointers.
+    // 2. Collect per-rank data + flag pointers.
     const dataPtrs = this.instances.map(inst => addon.p2pGetDataPtr(inst));
     const flagPtrs = this.instances.map(inst => addon.p2pGetFlagPtr(inst));
 
-    // 4. Tell each rank about all peers' pointers.
+    // 3. Tell each rank about all peers' pointers.
     for (let i = 0; i < N; ++i) {
       addon.p2pSetPeers(devices[i].ctx, this.instances[i], dataPtrs, flagPtrs);
     }
@@ -1216,7 +1208,7 @@ export class ParallelOps implements DeviceOps {
   private p2pGroup: P2PAllReduceGroup | null = null;
   /** Max BF16 elements per shard for which P2P AllReduce is used. */
   private readonly p2pMaxElems: number;
-  private readonly p2pEnabled: boolean;
+  private p2pEnabled: boolean;
 
   constructor(devices: GlmOps[]) {
     if (devices.length === 0) {
@@ -1236,18 +1228,46 @@ export class ParallelOps implements DeviceOps {
     } else {
       this.comms = [];
     }
-    // P2P AllReduce: opt-out via env var. Block-size 1024 * vec 8 = 8192
-    // BF16 elements max per call. We allocate 16 KB per rank's data buf.
+    // Enable P2P peer access early, before model weights are loaded,
+    // to avoid VA-space fragmentation that can cause cudaDeviceEnablePeerAccess
+    // to fail with cudaErrorMemoryAllocation on large models.
     this.p2pEnabled = process.env.GLM_DISABLE_P2P_ALLREDUCE !== "1" && devices.length > 1;
+    if (this.p2pEnabled) {
+      this.p2pEnabled = this.enablePeerAccess(devices);
+    }
     this.p2pMaxElems = 8192;  // matches kernel block_size * vec
+  }
+
+  /** Enable P2P peer access between all device pairs. Returns true on success. */
+  private enablePeerAccess(devices: readonly GlmOps[]): boolean {
+    const N = devices.length;
+    const addon = getNativeAddon();
+    for (let i = 0; i < N; ++i) {
+      for (let j = 0; j < N; ++j) {
+        if (i === j) continue;
+        const rc = addon.p2pEnablePeerAccess(devices[i].ctx, devices[j].device);
+        if (rc !== 0) {
+          console.warn(`P2P peer access dev ${devices[i].device} -> ${devices[j].device} failed; ` +
+            `falling back to NCCL for small AllReduce`);
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   /** Get (and lazily create) the P2P AllReduce group sized for small messages. */
   private getP2PGroup(): P2PAllReduceGroup | null {
     if (!this.p2pEnabled) return null;
     if (this.p2pGroup === null) {
-      // 16 KB per rank covers BF16 [hidden=8192] or F32 [hidden=4096].
-      this.p2pGroup = new P2PAllReduceGroup(this.devices, 16 * 1024);
+      try {
+        // 16 KB per rank covers BF16 [hidden=8192] or F32 [hidden=4096].
+        this.p2pGroup = new P2PAllReduceGroup(this.devices, 16 * 1024);
+      } catch (e) {
+        console.warn(`P2P AllReduce group creation failed (${e}); falling back to NCCL`);
+        this.p2pEnabled = false;
+        return null;
+      }
     }
     return this.p2pGroup;
   }
