@@ -39,7 +39,6 @@
 
 namespace {
 
-constexpr int P2P_AR_MAX_WORLD = 8;
 constexpr int P2P_AR_BLOCK_SIZE = 1024;
 constexpr int P2P_AR_VEC_BF16 = 8;   // uint4 = 8 bf16
 constexpr int P2P_AR_VEC_F32 = 4;    // uint4 = 4 fp32
@@ -211,19 +210,6 @@ p2p_allreduce_oneshot_kernel(
 // ---------------------------------------------------------------------------
 // Public C API
 // ---------------------------------------------------------------------------
-
-struct GlmP2PInstance {
-    void**              peer_data_arr_d;   // device array of N peer data ptrs
-    int**               peer_flags_arr_d;  // device array of N peer flag ptrs
-    unsigned long long* seq_counter_d;     // device-resident seq counter
-    int*                my_flag_d;         // device pointer to this rank's flag
-    void*               my_data_d;         // device pointer to this rank's data buf
-    void*               base_alloc_d;      // base alloc to free
-    size_t              max_bytes;
-    int                 world_size;
-    int                 my_rank;
-    int                 device_id;
-};
 
 extern "C" {
 

@@ -257,7 +257,20 @@ void glm_nccl_all_gather(void* comm, GlmCtx* ctx,
 // dtype follows NCCL convention: 9 = bfloat16, 7 = float32.
 // ---------------------------------------------------------------------------
 
-struct GlmP2PInstance;
+struct GlmP2PInstance {
+    void**              peer_data_arr_d;
+    int**               peer_flags_arr_d;
+    unsigned long long* seq_counter_d;
+    int*                my_flag_d;
+    void*               my_data_d;
+    void*               base_alloc_d;
+    size_t              max_bytes;
+    int                 world_size;
+    int                 my_rank;
+    int                 device_id;
+};
+
+static constexpr int P2P_AR_MAX_WORLD = 8;
 
 // Enable peer access from this ctx's device to peer_device. Idempotent.
 // Returns 0 on success, -1 if peer access cannot be enabled.
@@ -587,6 +600,27 @@ void glm_context_parallel_merge(
     int num_shards,
     void* merged_v_out,
     float* merged_lse,
+    int batch_size,
+    int num_heads,
+    int v_head_dim);
+
+// P2P context parallel merge: fused P2P sync + online softmax merge.
+// Uses GlmP2PInstance for peer-to-peer data exchange (no NCCL needed).
+// inst: P2P instance with peers already configured
+// my_v_out: [batch_size * num_heads * v_head_dim] BF16 (local partial attention output)
+// my_lse: [batch_size * num_heads] F32 (local partial log-sum-exp)
+// merged_v_out: [batch_size * num_heads * v_head_dim] BF16 (output)
+// merged_lse: [batch_size * num_heads] F32 (output, optional - pass nullptr to skip)
+// num_shards: number of context-parallel shards (2, 4, 8, or 16)
+// v_head_dim: per-head output dimension (32, 64, 128, 256, or 512)
+void glm_p2p_cp_merge(
+    GlmCtx* ctx,
+    GlmP2PInstance* inst,
+    const void* my_v_out,
+    const float* my_lse,
+    void* merged_v_out,
+    float* merged_lse,
+    int num_shards,
     int batch_size,
     int num_heads,
     int v_head_dim);

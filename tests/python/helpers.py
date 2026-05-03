@@ -663,6 +663,49 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
+        self.lib.glm_p2p_enable_peer_access.restype = ctypes.c_int
+        self.lib.glm_p2p_enable_peer_access.argtypes = [
+            ctypes.c_void_p, ctypes.c_int,
+        ]
+
+        self.lib.glm_p2p_create_instance.restype = ctypes.c_void_p
+        self.lib.glm_p2p_create_instance.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_size_t,
+        ]
+
+        self.lib.glm_p2p_destroy_instance.restype = None
+        self.lib.glm_p2p_destroy_instance.argtypes = [ctypes.c_void_p]
+
+        self.lib.glm_p2p_get_data_ptr.restype = ctypes.c_void_p
+        self.lib.glm_p2p_get_data_ptr.argtypes = [ctypes.c_void_p]
+
+        self.lib.glm_p2p_get_flag_ptr.restype = ctypes.c_void_p
+        self.lib.glm_p2p_get_flag_ptr.argtypes = [ctypes.c_void_p]
+
+        self.lib.glm_p2p_set_peers.restype = None
+        self.lib.glm_p2p_set_peers.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ]
+
+        self.lib.glm_p2p_allreduce.restype = None
+        self.lib.glm_p2p_allreduce.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_p2p_max_bytes.restype = ctypes.c_size_t
+        self.lib.glm_p2p_max_bytes.argtypes = [ctypes.c_void_p]
+
+        self.lib.glm_p2p_cp_merge.restype = None
+        self.lib.glm_p2p_cp_merge.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
         self.lib.glm_row_normalize.restype = None
         self.lib.glm_row_normalize.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -1525,4 +1568,41 @@ class GlmOps:
             ctypes.c_void_p(int(merged_v_out)),
             ctypes.c_void_p(int(merged_lse)) if merged_lse is not None else ctypes.c_void_p(0),
             batch_size, num_heads, v_head_dim
+        )
+
+    def p2p_enable_peer_access(self, peer_device):
+        return self.lib.glm_p2p_enable_peer_access(self.ctx, peer_device)
+
+    def p2p_create_instance(self, my_rank, world_size, max_bytes):
+        return self.lib.glm_p2p_create_instance(self.ctx, my_rank, world_size, max_bytes)
+
+    def p2p_destroy_instance(self, inst):
+        self.lib.glm_p2p_destroy_instance(inst)
+
+    def p2p_get_data_ptr(self, inst):
+        return self.lib.glm_p2p_get_data_ptr(inst)
+
+    def p2p_get_flag_ptr(self, inst):
+        return self.lib.glm_p2p_get_flag_ptr(inst)
+
+    def p2p_set_peers(self, inst, peer_data_ptrs, peer_flag_ptrs, world_size):
+        data_arr = (ctypes.c_void_p * world_size)(*[ctypes.c_void_p(int(p)) for p in peer_data_ptrs])
+        flag_arr = (ctypes.c_void_p * world_size)(*[ctypes.c_void_p(int(p)) for p in peer_flag_ptrs])
+        self.lib.glm_p2p_set_peers(self.ctx, inst, data_arr, flag_arr)
+
+    def p2p_allreduce(self, inst, inp, out, count, dtype=9):
+        self.lib.glm_p2p_allreduce(self.ctx, inst, self._ptr(inp), self._ptr(out), count, dtype)
+
+    def p2p_max_bytes(self, inst):
+        return self.lib.glm_p2p_max_bytes(inst)
+
+    def p2p_cp_merge(self, inst, my_v_out, my_lse, merged_v_out, merged_lse,
+                     num_shards, batch_size, num_heads, v_head_dim):
+        self.lib.glm_p2p_cp_merge(
+            self.ctx, inst,
+            ctypes.c_void_p(int(my_v_out)),
+            ctypes.c_void_p(int(my_lse)),
+            ctypes.c_void_p(int(merged_v_out)),
+            ctypes.c_void_p(int(merged_lse)) if merged_lse is not None else ctypes.c_void_p(0),
+            num_shards, batch_size, num_heads, v_head_dim
         )

@@ -2064,6 +2064,39 @@ static Napi::Value ContextParallelMerge(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value P2PCpMerge(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 10) {
+        Napi::TypeError::New(env, "Expected (ctx, inst, my_v_out, my_lse, merged_v_out, merged_lse, num_shards, batch_size, num_heads, v_head_dim)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t my_v_out_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t my_lse_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t merged_v_out_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t merged_lse_ptr = info[5].As<Napi::Number>().Int64Value();
+    int num_shards = info[6].As<Napi::Number>().Int32Value();
+    int batch_size = info[7].As<Napi::Number>().Int32Value();
+    int num_heads = info[8].As<Napi::Number>().Int32Value();
+    int v_head_dim = info[9].As<Napi::Number>().Int32Value();
+
+    glm_p2p_cp_merge(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<GlmP2PInstance*>(inst_ptr),
+        reinterpret_cast<const void*>(my_v_out_ptr),
+        reinterpret_cast<const float*>(my_lse_ptr),
+        reinterpret_cast<void*>(merged_v_out_ptr),
+        reinterpret_cast<float*>(merged_lse_ptr),
+        num_shards, batch_size, num_heads, v_head_dim);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2pCpMerge failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value GateSigmoidMul(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -2419,6 +2452,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "rmsnormGated"), Napi::Function::New(env, RmsnormGated));
     exports.Set(Napi::String::New(env, "gateSigmoidMul"), Napi::Function::New(env, GateSigmoidMul));
     exports.Set(Napi::String::New(env, "contextParallelMerge"), Napi::Function::New(env, ContextParallelMerge));
+    exports.Set(Napi::String::New(env, "p2pCpMerge"), Napi::Function::New(env, P2PCpMerge));
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
     exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));
     exports.Set(Napi::String::New(env, "ncclUniqueId"), Napi::Function::New(env, NcclUniqueId));
