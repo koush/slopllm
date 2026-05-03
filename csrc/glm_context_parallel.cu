@@ -25,6 +25,7 @@
 #include "flashinfer/attention/state.cuh"
 #include "flashinfer/vec_dtypes.cuh"
 #include "flashinfer/math.cuh"
+#include "cp_merge_impl.cuh"
 
 namespace {
 
@@ -44,7 +45,6 @@ cp_merge_kernel(
     int batch_size,
     int num_heads)
 {
-    constexpr int head_dim = VEC_SIZE * BDX;
     int tid = threadIdx.x;
     int bh = blockIdx.x;
     int b = bh / num_heads;
@@ -54,29 +54,21 @@ cp_merge_kernel(
 
     __shared__ float s_lse[CP_MAX_SHARDS];
 
-    if (tid < NUM_SHARDS) {
-        s_lse[tid] = params.lse_ptrs[tid][b * num_heads + h];
-    }
-    __syncthreads();
+    auto load_lse = [&](float* slse, int b_, int h_, int nh) {
+        if (tid < NUM_SHARDS) {
+            slse[tid] = params.lse_ptrs[tid][b_ * nh + h_];
+        }
+    };
 
-    flashinfer::state_t<VEC_SIZE> st;
-    st.init();
-
-    #pragma unroll
-    for (int s = 0; s < NUM_SHARDS; ++s) {
+    auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int h_, int nh, int hd, int tid_) {
         const __nv_bfloat16* v_ptr = static_cast<const __nv_bfloat16*>(params.v_ptrs[s]);
-        flashinfer::vec_t<float, VEC_SIZE> v;
-        v.cast_load(v_ptr + (b * num_heads + h) * head_dim + tid * VEC_SIZE);
-        st.merge(v, s_lse[s], 1.0f);
-    }
+        v.cast_load(v_ptr + (b_ * nh + h_) * hd + tid_ * VEC_SIZE);
+    };
 
-    st.normalize();
-
-    st.o.cast_store(merged_v_out + (b * num_heads + h) * head_dim + tid * VEC_SIZE);
-
-    if (merged_lse != nullptr && tid == 0) {
-        merged_lse[b * num_heads + h] = st.get_lse();
-    }
+    cp_merge_one_pair<VEC_SIZE, BDX, NUM_SHARDS>(
+        tid, b, h, num_heads, s_lse,
+        load_lse, load_v,
+        merged_v_out, merged_lse);
 }
 
 template <int VEC_SIZE, int BDX>
@@ -305,34 +297,25 @@ p2p_cp_merge_kernel(
         int b = bh / num_heads;
         int h = bh % num_heads;
 
-        // Load LSE from all peers
-        if (tid < NUM_SHARDS) {
-            const float* peer_lse = reinterpret_cast<const float*>(
-                static_cast<char*>(s_peer_data[tid]) + slot_offset + v_out_bytes);
-            s_lse[tid] = peer_lse[b * num_heads + h];
-        }
-        __syncthreads();
-
-        if (tid < BDX) {
-            flashinfer::state_t<VEC_SIZE> st;
-            st.init();
-
-            #pragma unroll
-            for (int s = 0; s < NUM_SHARDS; ++s) {
-                const __nv_bfloat16* peer_v = reinterpret_cast<const __nv_bfloat16*>(
-                    static_cast<char*>(s_peer_data[s]) + slot_offset);
-                flashinfer::vec_t<float, VEC_SIZE> v;
-                v.cast_load(peer_v + (b * num_heads + h) * head_dim + tid * VEC_SIZE);
-                st.merge(v, s_lse[s], 1.0f);
+        auto load_lse = [&](float* slse, int b_, int h_, int nh) {
+            if (tid < NUM_SHARDS) {
+                const float* peer_lse = reinterpret_cast<const float*>(
+                    static_cast<char*>(s_peer_data[tid]) + slot_offset + v_out_bytes);
+                slse[tid] = peer_lse[b_ * nh + h_];
             }
+        };
 
-            st.normalize();
-            st.o.cast_store(merged_v_out + (b * num_heads + h) * head_dim + tid * VEC_SIZE);
+        auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int h_, int nh, int hd, int tid_) {
+            const __nv_bfloat16* peer_v = reinterpret_cast<const __nv_bfloat16*>(
+                static_cast<char*>(s_peer_data[s]) + slot_offset);
+            v.cast_load(peer_v + (b_ * nh + h_) * hd + tid_ * VEC_SIZE);
+        };
 
-            if (merged_lse != nullptr && tid == 0) {
-                merged_lse[b * num_heads + h] = st.get_lse();
-            }
-        }
+        cp_merge_one_pair<VEC_SIZE, BDX, NUM_SHARDS>(
+            tid, b, h, num_heads, s_lse,
+            load_lse, load_v,
+            merged_v_out, merged_lse);
+
         __syncthreads();
     }
 }
