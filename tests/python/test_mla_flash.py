@@ -541,3 +541,226 @@ def test_mla_decode_with_append(glm, device):
     glm.free_buf(float_ws)
     glm.free_buf(int_ws)
     glm.free_pinned(pinned_int_ws)
+
+
+# FlashInfer LSE is log-base-2: lse = log2(sum(exp(sm_scale * logits)))
+# Reference: score.logsumexp(dim=-1) * log2(e)  converts base-e to base-2
+
+def mla_prefill_reference_with_lse(q_nope, q_pe_rope, ckv, kpe_rope, sm_scale, causal=True):
+    BS, H, D_CKV = q_nope.shape
+    S = ckv.shape[1]
+    D_KPE = q_pe_rope.shape[-1]
+
+    ckv_exp = ckv.expand(H, S, D_CKV)
+    kpe_exp = kpe_rope.expand(H, S, D_KPE)
+
+    score_nope = torch.einsum('bhd,hkd->bhk', q_nope, ckv_exp)
+    score_pe = torch.einsum('bhd,hkd->bhk', q_pe_rope, kpe_exp)
+    score = (score_nope + score_pe) * sm_scale
+
+    if causal:
+        mask = torch.triu(torch.full((BS, S), float('-inf'), device=score.device, dtype=score.dtype), diagonal=1)
+        score = score + mask.unsqueeze(1)
+
+    score_f = score.float()
+    # FlashInfer LSE is base-2: log2(sum(exp(score)))
+    lse = score_f.logsumexp(dim=-1) * math.log2(math.e)
+
+    attn = torch.nn.functional.softmax(score_f, dim=-1).to(q_nope.dtype)
+    output = torch.einsum('bhk,hkd->bhd', attn, ckv_exp)
+    return output, lse
+
+
+def mla_decode_reference_with_lse(q_nope_absorbed, q_pe_rope, ckv, kpe, positions, sm_scale, rope_theta=1000000.0):
+    B, H, D_CKV = q_nope_absorbed.shape
+    S = ckv.shape[1]
+    D_KPE = q_pe_rope.shape[-1]
+
+    dim_half = D_KPE // 2
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, D_KPE, 2, dtype=torch.float32, device=ckv.device) / D_KPE))
+    freqs = torch.outer(positions.float(), inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos_emb = emb.cos().to(ckv.dtype)
+    sin_emb = emb.sin().to(ckv.dtype)
+
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    kpe_rope = (kpe * cos_emb.unsqueeze(0)) + (rotate_half(kpe) * sin_emb.unsqueeze(0))
+
+    q_nope_3d = q_nope_absorbed.reshape(B * H, 1, D_CKV)
+    q_pe_3d = q_pe_rope.reshape(B * H, 1, D_KPE)
+    ckv_3d = ckv.reshape(B, 1, S, D_CKV).expand(B, H, S, D_CKV).reshape(B * H, S, D_CKV)
+    kpe_3d = kpe_rope.reshape(B, 1, S, D_KPE).expand(B, H, S, D_KPE).reshape(B * H, S, D_KPE)
+
+    score = torch.bmm(q_nope_3d, ckv_3d.transpose(1, 2)) + torch.bmm(q_pe_3d, kpe_3d.transpose(1, 2))
+    score = score * sm_scale
+    score_f = score.float()
+    # FlashInfer LSE is base-2: log2(sum(exp(score)))
+    lse = score_f.logsumexp(dim=-1) * math.log2(math.e)
+
+    attn = torch.nn.functional.softmax(score_f, dim=-1).to(ckv.dtype)
+    output = torch.bmm(attn, ckv_3d)
+    return output.reshape(B, H, D_CKV), lse.reshape(B, H)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mla_prefill_lse(glm, device):
+    B = 1
+    S = 8
+    num_heads = 4
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
+
+    torch.manual_seed(42)
+    q_nope = torch.randn(B * S, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn(B * S, num_heads, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+    ckv = torch.randn(S, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    kpe = torch.randn(S, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+
+    cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
+    q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
+    q_pe_rope = torch.empty_like(q_pe_4d)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1)
+    q_pe_rope = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
+
+    kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
+    kpe_rope_4d = torch.empty_like(kpe_4d)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1)
+    kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
+
+    ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
+    kpe_paged = kpe_rope.reshape(S, PAGE_SIZE, HEAD_DIM_KPE)
+
+    qo_indptr_h = (ctypes.c_int32 * 2)(0, S)
+    kv_indptr_h = (ctypes.c_int32 * 2)(0, S)
+    kv_len_h = (ctypes.c_int32 * 1)(S)
+    kv_indices = torch.arange(S, dtype=torch.int32, device=device)
+    plan_info = (ctypes.c_int64 * 18)()
+
+    float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
+
+    glm.mla_prefill_plan(
+        float_ws, 32 * 1024 * 1024,
+        int_ws, pinned_int_ws, 8 * 1024 * 1024,
+        ctypes.addressof(plan_info),
+        ctypes.addressof(qo_indptr_h),
+        ctypes.addressof(kv_indptr_h),
+        ctypes.addressof(kv_len_h),
+        B, num_heads, HEAD_DIM_CKV, True)
+
+    o = torch.empty(B * S, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    # FlashInfer prefill LSE layout: [totalTokens, numHeads]
+    lse = torch.empty(B * S, num_heads, dtype=torch.float32, device=device)
+
+    glm.mla_prefill_run(
+        q_nope.data_ptr(), q_pe_rope.data_ptr(),
+        ckv_paged.data_ptr(), kpe_paged.data_ptr(),
+        kv_indices.data_ptr(),
+        o.data_ptr(),
+        float_ws, int_ws, ctypes.addressof(plan_info),
+        num_heads, PAGE_SIZE, 1, sm_scale,
+        num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
+        num_heads * HEAD_DIM_KPE, HEAD_DIM_KPE,
+        PAGE_SIZE * HEAD_DIM_CKV, HEAD_DIM_CKV,
+        PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
+        num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
+        HEAD_DIM_CKV, HEAD_DIM_KPE,
+        lse.data_ptr())
+
+    glm.synchronize()
+
+    ref_output, ref_lse = mla_prefill_reference_with_lse(
+        q_nope, q_pe_rope,
+        ckv.unsqueeze(0), kpe_rope.unsqueeze(0),
+        sm_scale, causal=True)
+
+    torch.testing.assert_close(o.cpu(), ref_output.cpu(), atol=0.05, rtol=0.02)
+    torch.testing.assert_close(lse.cpu(), ref_lse.cpu(), atol=0.1, rtol=0.05)
+
+    glm.free_buf(float_ws)
+    glm.free_buf(int_ws)
+    glm.free_pinned(pinned_int_ws)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mla_decode_lse(glm, device):
+    B = 1
+    S = 8
+    num_heads = 4
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
+    rope_theta = 1000000.0
+
+    torch.manual_seed(42)
+    q_nope = torch.randn(B, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn(B, num_heads, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+    ckv = torch.randn(S, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    kpe = torch.randn(S, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, HEAD_DIM_KPE, 2, dtype=torch.float32, device=device) / HEAD_DIM_KPE))
+
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    decode_pos = torch.tensor([S - 1], dtype=torch.float32, device=device)
+    freqs_q = torch.outer(decode_pos, inv_freq)
+    emb_q = torch.cat([freqs_q, freqs_q], dim=-1)
+    cos_q = emb_q.cos().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
+    sin_q = emb_q.sin().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
+    q_pe_rope = (q_pe * cos_q) + (rotate_half(q_pe) * sin_q)
+
+    positions_k = torch.arange(S, dtype=torch.float32, device=device)
+    freqs_k = torch.outer(positions_k, inv_freq)
+    emb_k = torch.cat([freqs_k, freqs_k], dim=-1)
+    cos_k = emb_k.cos().to(torch.bfloat16)
+    sin_k = emb_k.sin().to(torch.bfloat16)
+    kpe_rope = (kpe * cos_k) + (rotate_half(kpe) * sin_k)
+
+    ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV).contiguous()
+    kpe_paged = kpe_rope.reshape(S, PAGE_SIZE, HEAD_DIM_KPE).contiguous()
+
+    num_pages = S
+    indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    indptr_h = (ctypes.c_int32 * 2)(0, num_pages)
+    last_page_len_d = torch.tensor([PAGE_SIZE], dtype=torch.int32, device=device)
+
+    float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
+    plan_info = (ctypes.c_int64 * 10)()
+
+    glm.mla_decode_plan(
+        float_ws, 32 * 1024 * 1024,
+        int_ws, pinned_int_ws, 8 * 1024 * 1024,
+        ctypes.addressof(plan_info),
+        ctypes.addressof(indptr_h),
+        B, num_heads, PAGE_SIZE, False,
+        head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE)
+
+    o = torch.empty(B, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    # FlashInfer decode LSE layout: [batchSize, numHeads]
+    lse = torch.empty(B, num_heads, dtype=torch.float32, device=device)
+    indptr_d = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+
+    glm.mla_decode_run(
+        q_nope.data_ptr(), q_pe_rope.data_ptr(),
+        ckv_paged.data_ptr(), kpe_paged.data_ptr(),
+        indices.data_ptr(), indptr_d.data_ptr(), last_page_len_d.data_ptr(),
+        o.data_ptr(),
+        float_ws, int_ws, ctypes.addressof(plan_info),
+        B, num_heads, PAGE_SIZE, sm_scale,
+        head_dim_ckv=HEAD_DIM_CKV, head_dim_kpe=HEAD_DIM_KPE,
+        lse=lse.data_ptr())
+
+    glm.synchronize()
+
+    positions = torch.arange(S, dtype=torch.int32, device=device)
+    ref_output, ref_lse = mla_decode_reference_with_lse(q_nope, q_pe_rope, ckv.unsqueeze(0), kpe.unsqueeze(0), positions, sm_scale)
+
+    torch.testing.assert_close(o.cpu(), ref_output.cpu(), atol=0.05, rtol=0.02)
+    torch.testing.assert_close(lse.cpu(), ref_lse.cpu(), atol=0.1, rtol=0.05)
+
+    glm.free_buf(float_ws)
+    glm.free_buf(int_ws)
+    glm.free_pinned(pinned_int_ws)
