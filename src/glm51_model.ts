@@ -152,7 +152,7 @@ export class Glm51Model extends ChatModel {
         (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".up_proj.weight")) ||
         name.endsWith(".mlp.shared_experts.gate_proj.weight") ||
         name.endsWith(".mlp.shared_experts.up_proj.weight") ||
-        // NVFP4 scale tensors follow same parallelism as their weight
+        // NVFP4 block scale tensors follow same parallelism as their weight (weight_scale, not weight_scale_2 which is scalar)
         name.endsWith(".gate_proj.weight_weight_scale") ||
         name.endsWith(".up_proj.weight_weight_scale") ||
         (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight_weight_scale")) ||
@@ -163,7 +163,7 @@ export class Glm51Model extends ChatModel {
         name.endsWith(".mlp.down_proj.weight") ||
         (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".down_proj.weight")) ||
         name.endsWith(".mlp.shared_experts.down_proj.weight") ||
-        // NVFP4 scale tensors follow same parallelism as their weight
+        // NVFP4 block scale tensors follow same parallelism as their weight (weight_scale, not weight_scale_2 which is scalar)
         name.endsWith(".down_proj.weight_weight_scale") ||
         (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".down_proj.weight_weight_scale")) ||
         name.endsWith(".mlp.shared_experts.down_proj.weight_weight_scale")) return TensorParallelism.Row;
@@ -190,7 +190,7 @@ export class Glm51Model extends ChatModel {
       return;
     }
 
-    const par = this.weightParallelism(name);
+    const par = this.weightParallelism(storeName);
 
     if (meta.dtype === "F32" && !name.endsWith(".weight_scale_2")) {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
