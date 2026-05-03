@@ -51,6 +51,24 @@ export class ExecutionState {
     );
   }
 
+  mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number): void {
+    const pagedKV = this.cache.getPagedKV();
+    const headDimCkv = kvLoraRank;
+    const headDimKpe = qkRopeDim;
+    const pageSize = pagedKV.pageSize;
+    const nnz = this.isDecode ? this.batchSize : pagedKV.seqKvLens.reduce((a, b) => a + b, 0);
+    const appendCkvStrideN = headDimCkv;
+    const appendKpeStrideN = headDimKpe;
+    this.ws.glm.mlaKvCacheAppend(
+      pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
+      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen,
+      appendCkv, appendKpe,
+      this.ws.mlaBatchIndices, this.ws.positionIds,
+      nnz, pageSize, headDimCkv, headDimKpe,
+      appendCkvStrideN, appendKpeStrideN
+    );
+  }
+
   prepareInput(tokenIds: number[]|Tensor) {
     if (!this.isDecode)
       throw new Error("decodeInput should be null in prefill");
@@ -270,24 +288,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     );
     return out;
   }
-
-  mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, kvLoraRank: number, qkRopeDim: number, isDecode: boolean): void {
-    const headDimCkv = kvLoraRank;
-    const headDimKpe = qkRopeDim;
-    const pageSize = pagedKV.pageSize;
-    const nnz = isDecode ? batchSize : pagedKV.seqKvLens.reduce((a, b) => a + b, 0);
-    const appendCkvStrideN = headDimCkv;
-    const appendKpeStrideN = headDimKpe;
-    appendCkv.mlaKvCacheAppend(
-      pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
-      pagedKV.indices, this.indptrD, this.lastPageLen,
-      appendCkv, appendKpe,
-      this.mlaBatchIndices, this.positionIds,
-      nnz, pageSize, headDimCkv, headDimKpe,
-      appendCkvStrideN, appendKpeStrideN
-    );
-  }
-
 
 
   planDecode(model: ChatModel, batchSize: number, cache: ChatCache, enableCudaGraph = false): ExecutionState {

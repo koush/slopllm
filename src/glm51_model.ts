@@ -543,7 +543,7 @@ export class Glm51Model extends ChatModel {
       using qAbsorbedR = qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
       using qPeR = qPeLin.ropeTranspose(undefined!, undefined!, 0, qkRopeDim, nHeads, S, B, qkRopeDim);
       using kPeFull = kPeRaw.all(ws);
-      ws.mlaKvCacheAppend(ckvNormed, kPeFull, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim, state.isDecode);
+      state.mlaKvCacheAppend(ckvNormed, kPeFull, layerIdx, kvLoraRank, qkRopeDim);
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else if (useMla && !state.isDecode) {
       using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, qkRopeDim / 2, B, S));
@@ -566,7 +566,7 @@ export class Glm51Model extends ChatModel {
       using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1);
       using kPeFull = kPeRope.all(ws);
 
-      ws.mlaKvCacheAppend(ckvNormed, kPeFull, pagedKV, layerIdx, batchSize, kvLoraRank, qkRopeDim, false);
+      state.mlaKvCacheAppend(ckvNormed, kPeFull, layerIdx, kvLoraRank, qkRopeDim);
       attnOut.replace(ws.mlaPrefillPaged(qAbsorbedR, qPeFinal, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else {
       throw new Error("GLM-5.1 requires MLA KV cache");

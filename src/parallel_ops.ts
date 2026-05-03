@@ -757,22 +757,6 @@ export class ParallelTensor extends Tensor {
     }
   }
 
-  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number): void {
-    super.mlaKvCacheAppend(ckvData, kpeData, indices, indptr, lastPageLen, appendCkv, appendKpe, batchIndices, positions, nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN);
-    const pCkvData = this.cast(ckvData);
-    const pKpeData = this.cast(kpeData);
-    const pIndices = this.cast(indices);
-    const pIndptr = this.cast(indptr);
-    const pLastPageLen = this.cast(lastPageLen);
-    const pAppendCkv = this.cast(appendCkv);
-    const pAppendKpe = this.cast(appendKpe);
-    const pBatchIndices = this.cast(batchIndices);
-    const pPositions = this.cast(positions);
-    for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN);
-    }
-  }
-
   causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
     super.causalConv1d(convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
     const pConvState = this.cast(convState);
@@ -1634,6 +1618,21 @@ export class ParallelOps implements DeviceOps {
     const shardNumQoHeads = this.shardDim(numQoHeads, "mlaDecodeRun numQoHeads");
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].mlaDecodeRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptrD.shards[i], pLastPageLen.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], batchSize, shardNumQoHeads, pageSize, smScale, headDimCkv, headDimKpe, pLse ? pLse.shards[i] : null);
+    }
+  }
+
+  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number): void {
+    const pCkvData = this.cast(ckvData);
+    const pKpeData = this.cast(kpeData);
+    const pIndices = this.cast(indices);
+    const pIndptr = this.cast(indptr);
+    const pLastPageLen = this.cast(lastPageLen);
+    const pAppendCkv = this.cast(appendCkv);
+    const pAppendKpe = this.cast(appendKpe);
+    const pBatchIndices = this.cast(batchIndices);
+    const pPositions = this.cast(positions);
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN);
     }
   }
 
