@@ -167,20 +167,24 @@ Currently only `NCCL_SUM` is used. Need `NCCL_MAX` for the LSE AllReduce.
 
 ### Phase 4: Sequence-Sharded KV Cache
 
+**Page ownership:** Pages are assigned to GPUs round-robin: GPU `r` owns page `p` where `p % worldSize == r`. Each page is a contiguous block of `pageSize` tokens (currently 16). This means:
+- GPU 0 (4 GPUs): pages 0, 4, 8, 12, ... → positions 0-15, 64-79, 128-143, 192-207, ...
+- Each GPU's page table is compact — just its own pages, no gaps
+- Position IDs passed to FlashInfer are the real (non-contiguous) positions, which is fine — FlashInfer uses them for RoPE, not for indexing
+- Memory: each GPU stores `ceil(totalPages / worldSize)` pages ≈ 1/N of total KV
+
+During decode, token at position `S` falls in page `S // pageSize`, owned by GPU `(S // pageSize) % worldSize`. Only that GPU appends to its KV cache.
+
 **Files to modify:**
 
 1. **`src/paged_kv.ts`** — `PagedKVCache`
    - Add `sequenceShardIndex: number` and `worldSize: number` properties (0 for single-GPU, >0 for context parallelism).
-   - Modify `mlaKvCacheAppend`: Only append to this GPU's shard. If the new position belongs to another GPU, skip.
-   - Modify page allocation: Each GPU allocates `maxPages / worldSize` pages (saves memory).
+   - Modify `mlaKvCacheAppend`: Only append to this GPU's shard. If the new position falls in a page owned by another GPU, skip.
+   - Modify page allocation: Each GPU allocates `ceil(maxPages / worldSize)` pages (saves memory).
    - Modify `seqKvLens` tracking: Each GPU tracks its shard of positions.
 
 2. **`src/parallel_ops.ts`** — KV cache operations
-   - Modify `mlaKvCacheAppend` for context parallelism: each GPU appends only positions it owns.
-   - Add `shardKvCache()` method: After prefill (head parallelism), redistribute the KV cache. Each GPU keeps only its shard of pages. This involves:
-     a. Computing which pages belong to each shard (based on position ranges)
-     b. Compacting the ckvData/kpeData tensors (or adjusting the page table)
-     c. Freeing unused memory
+   - Modify `mlaKvCacheAppend` for context parallelism: each GPU appends only tokens in pages it owns.
 
 ### Phase 5: Parallel MLA Attention with Context Parallelism
 
