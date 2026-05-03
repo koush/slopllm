@@ -265,6 +265,7 @@ export abstract class Tensor implements Disposable {
   abstract fill(value: number, n: number): void;
   abstract mmapLoad(mmapPtr: number, offset: number, nbytes: number, gdnQkvLayout?: import("./device_ops").GdnQkvLayout): void;
   abstract memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void;
+  abstract memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void;
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     if (positionIds.type !== "I32") throw new Error(`rotaryEmbedding: positionIds must be I32, got ${positionIds.type}`);
     return undefined as never;
@@ -360,7 +361,7 @@ export abstract class Tensor implements Disposable {
     return result;
   }
 
-  abstract doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void;
+  abstract sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void;
 
   sampleTokenGPU(params: SamplingParams, tokenHistory: number[]): Tensor {
     return this.sampleBatchGPU([params], [tokenHistory]);
@@ -517,7 +518,7 @@ export class SamplingWorkspace extends WorkspaceBase {
       if (effectiveK > maxEffectiveK) maxEffectiveK = effectiveK;
     }
 
-    logits.doSampleBatch(
+    logits.sampleBatch(
       outToken,
       this.topkVals,
       this.topkIdxs,

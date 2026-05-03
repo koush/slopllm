@@ -165,7 +165,7 @@ export class ParallelTensor extends Tensor {
 
       for (let i = 0; i < this.devices.length; i++) {
         for (let r = 0; r < this.devices.length; r++) {
-          this.devices[i].memcpy2d(
+          this.shards[i].memcpy2d(
             output.shards[i].data + r * shardDim1 * inner * eb,
             this.fullShape[1] * inner * eb,
             tempTensors[i].data + r * shardBytes,
@@ -202,7 +202,7 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism === TensorParallelism.Replicated || this.parallelism === TensorParallelism.PartialSum) {
       const sz = size ?? data.length;
       for (let i = 0; i < this.worldSize; i++) {
-        this.devices[i].h2d(this.shards[i], data.subarray(0, sz));
+        this.shards[i].h2d(data.subarray(0, sz));
       }
       return;
     }
@@ -211,7 +211,7 @@ export class ParallelTensor extends Tensor {
       const totalElems = ParallelTensor.shapeElems(this.fullShape);
       const shardBytes = (totalElems / this.worldSize) * eb;
       for (let i = 0; i < this.worldSize; i++) {
-        this.devices[i].h2d(this.shards[i], data.subarray(i * shardBytes, (i + 1) * shardBytes));
+        this.shards[i].h2d(data.subarray(i * shardBytes, (i + 1) * shardBytes));
       }
       return;
     }
@@ -232,7 +232,7 @@ export class ParallelTensor extends Tensor {
             r * fullStride + i * shardStride + shardStride,
           );
         }
-        this.devices[i].h2d(this.shards[i], shardBuf);
+        this.shards[i].h2d(shardBuf);
       }
       return;
     }
@@ -245,7 +245,7 @@ export class ParallelTensor extends Tensor {
 
     if (this.parallelism === TensorParallelism.Replicated) {
       const shardBytes = ParallelTensor.shapeElems(this.shards[0].shape) * eb;
-      this.devices[0].d2h(buf.subarray(0, shardBytes), this.shards[0]);
+      this.shards[0].d2h(buf.subarray(0, shardBytes));
       return;
     }
 
@@ -253,7 +253,7 @@ export class ParallelTensor extends Tensor {
       const totalElems = ParallelTensor.shapeElems(this.fullShape);
       const shardBytes = (totalElems / this.worldSize) * eb;
       for (let i = 0; i < this.worldSize; i++) {
-        this.devices[i].d2h(buf.subarray(i * shardBytes, (i + 1) * shardBytes), this.shards[i]);
+        this.shards[i].d2h(buf.subarray(i * shardBytes, (i + 1) * shardBytes));
       }
       return;
     }
@@ -266,7 +266,7 @@ export class ParallelTensor extends Tensor {
       const shardStride = shardDim1 * inner * eb;
       for (let i = 0; i < this.worldSize; i++) {
         const shardBuf = Buffer.alloc(outer * shardStride);
-        this.devices[i].d2h(shardBuf, this.shards[i]);
+        this.shards[i].d2h(shardBuf);
         for (let r = 0; r < outer; r++) {
           shardBuf.copy(
             buf,
@@ -287,7 +287,7 @@ export class ParallelTensor extends Tensor {
         const result = new Float32Array(totalElems);
         for (let i = 0; i < this.worldSize; i++) {
           const shardBuf = Buffer.alloc(shardBytes);
-          this.devices[i].d2h(shardBuf, this.shards[i]);
+          this.shards[i].d2h(shardBuf);
           const shardArr = new Float32Array(shardBuf.buffer, shardBuf.byteOffset, totalElems);
           for (let j = 0; j < totalElems; j++) {
             result[j] += shardArr[j];
@@ -298,7 +298,7 @@ export class ParallelTensor extends Tensor {
         const result = new Float32Array(totalElems);
         for (let i = 0; i < this.worldSize; i++) {
           const shardBuf = Buffer.alloc(shardBytes);
-          this.devices[i].d2h(shardBuf, this.shards[i]);
+          this.shards[i].d2h(shardBuf);
           const shardF32 = bf16BytesToF32(shardBuf);
           for (let j = 0; j < totalElems; j++) {
             result[j] += shardF32[j];
@@ -310,7 +310,7 @@ export class ParallelTensor extends Tensor {
         const result = new Int32Array(totalElems);
         for (let i = 0; i < this.worldSize; i++) {
           const shardBuf = Buffer.alloc(shardBytes);
-          this.devices[i].d2h(shardBuf, this.shards[i]);
+          this.shards[i].d2h(shardBuf);
           const shardArr = new Int32Array(shardBuf.buffer, shardBuf.byteOffset, totalElems);
           for (let j = 0; j < totalElems; j++) {
             result[j] += shardArr[j];
@@ -607,7 +607,7 @@ export class ParallelTensor extends Tensor {
     super.arange(start, step, count);
     this.assertParallel("arange", this, TensorParallelism.Replicated, TensorParallelism.PartialSum);
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].arange(this.shards[i], start, step, count);
+      this.shards[i].arange(start, step, count);
     }
   }
 
@@ -864,19 +864,19 @@ export class ParallelTensor extends Tensor {
       for (let i = 0; i < this.worldSize; i++) {
         const hStart = i * Hlocal;
         const shardData = this.shards[i].data;
-        this.devices[i].memcpy2d(
+        this.shards[i].memcpy2d(
           shardData, bytesPerRow,
           srcBase + hStart * dK * bytesPerRow, bytesPerRow,
           bytesPerRow, Hlocal * dK,
           MemcpyKind.HostToDevice,
         );
-        this.devices[i].memcpy2d(
+        this.shards[i].memcpy2d(
           shardData + Hlocal * dK * bytesPerRow, bytesPerRow,
           srcBase + (qRows + hStart * dK) * bytesPerRow, bytesPerRow,
           bytesPerRow, Hlocal * dK,
           MemcpyKind.HostToDevice,
         );
-        this.devices[i].memcpy2d(
+        this.shards[i].memcpy2d(
           shardData + 2 * Hlocal * dK * bytesPerRow, bytesPerRow,
           srcBase + (2 * qRows + hStart * dV) * bytesPerRow, bytesPerRow,
           bytesPerRow, Hlocal * dV,
@@ -897,7 +897,7 @@ export class ParallelTensor extends Tensor {
       const shardElems = this.shards[0].shape.reduce((a, b) => a * b, 1);
       const shardBytes = shardElems * ParallelTensor.elemBytes(this.type);
       for (let i = 0; i < this.worldSize; i++) {
-        this.devices[i].mmapLoad(this.shards[i], mmapPtr, offset + i * shardBytes, shardBytes);
+        this.shards[i].mmapLoad(mmapPtr, offset + i * shardBytes, shardBytes);
       }
       return;
     }
@@ -912,7 +912,7 @@ export class ParallelTensor extends Tensor {
       const dstPitch = shardDim1 * inner * eb;
       const srcBase = mmapPtr + offset;
       for (let i = 0; i < this.worldSize; i++) {
-        this.devices[i].memcpy2d(
+        this.shards[i].memcpy2d(
           this.shards[i].data, dstPitch,
           srcBase + i * dstPitch, srcPitch,
           dstPitch, outer,
@@ -942,8 +942,12 @@ export class ParallelTensor extends Tensor {
     const bytes = size ?? Math.min(this.allocSize, src.allocSize);
     const copyKind = kind ?? MemcpyKind.DeviceToDevice;
     for (let i = 0; i < this.shards.length; i++) {
-      this.devices[i].memcpy(this.shards[i].data, src.shards[i].data, bytes, copyKind);
+      this.shards[i].memcpy(src.shards[i], bytes, copyKind);
     }
+  }
+
+  memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+    throw new Error("ParallelTensor.memcpy2d: use shard tensors directly");
   }
 
   sigmoid(): Tensor {
@@ -1132,17 +1136,17 @@ export class ParallelTensor extends Tensor {
     return { cos, sin };
   }
 
-  doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
+  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
     const pLogits = logits as ParallelTensor;
     if (pLogits.parallelism === TensorParallelism.Row || pLogits.parallelism === TensorParallelism.Column) {
       const gathered = pLogits.allGather(pLogits.workspace);
-      this.doSampleBatch(outTokens, topkVals, topkIdxs, workspace, gathered, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
+      this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, gathered, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
       gathered[Symbol.dispose]();
       return;
     }
     if (pLogits.parallelism === TensorParallelism.PartialSum) {
       pLogits.allReduce();
-      this.doSampleBatch(outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
+      this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
       return;
     }
     const pOut = this.cast(outTokens);
@@ -1159,7 +1163,7 @@ export class ParallelTensor extends Tensor {
     const pStepCounter = this.cast(stepCounter);
     this.assertParallel("sampleBatch logits", pLogits, TensorParallelism.Replicated);
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].sampleBatch(pOut.shards[i], pTopkVals.shards[i], pTopkIdxs.shards[i], pWorkspace.shards[i], pLogits.shards[i], pPenaltyTokens.shards[i], pPenaltyCount.shards[i], maxWindow, vocabSize, batchSize, pTemps.shards[i], pRepPen.shards[i], pPresPen.shards[i], pTopKs.shards[i], pTopPs.shards[i], pStepCounter.shards[i], maxEffectiveK);
+      pLogits.shards[i].sampleBatch(pOut.shards[i], pTopkVals.shards[i], pTopkIdxs.shards[i], pWorkspace.shards[i], pLogits.shards[i], pPenaltyTokens.shards[i], pPenaltyCount.shards[i], maxWindow, vocabSize, batchSize, pTemps.shards[i], pRepPen.shards[i], pPresPen.shards[i], pTopKs.shards[i], pTopPs.shards[i], pStepCounter.shards[i], maxEffectiveK);
     }
   }
 }

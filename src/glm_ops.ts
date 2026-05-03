@@ -319,6 +319,10 @@ export class GlmTensor extends Tensor {
     getNativeAddon().memcpy(this.glm.ctx, this.data, src.data, bytes, memcpyKindToNative(copyKind));
   }
 
+  memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+    getNativeAddon().memcpy2d(this.glm.ctx, dst, dpitch, src, spitch, width, height, memcpyKindToNative(kind));
+  }
+
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     super.rotaryEmbedding(positionIds, dimHalf, batch, seqLen);
     const hd = dimHalf * 2;
@@ -450,7 +454,7 @@ export class GlmTensor extends Tensor {
     getNativeAddon().scatterAddRows(this.glm.ctx, this.data, input.data, scales.data, batchIds.data, dim, count, numRows, 0);
   }
 
-  doSampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
+  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
     getNativeAddon().sampleBatch(this.glm.ctx, outTokens.data, topkVals.data, topkIdxs.data, workspace.data, logits.data, penaltyTokens.data, penaltyCount.data, maxWindow, vocabSize, batchSize, temperatures.data, repPenalties.data, presPenalties.data, topKs.data, topPs.data, stepCounter.data, maxEffectiveK);
   }
 }
@@ -499,14 +503,6 @@ export class GlmOps implements DeviceOps {
 
   freeBuf(ptr: Tensor): void {
     getNativeAddon().freeBuf(this.ctx, ptr.data);
-  }
-
-  h2d(dst: Tensor, cpuData: Buffer, size?: number): void {
-    getNativeAddon().h2d(this.ctx, dst.data, cpuData, size ?? cpuData.length);
-  }
-
-  d2h(cpuBuf: Buffer, src: Tensor, size?: number): void {
-    getNativeAddon().d2h(this.ctx, cpuBuf, src.data, size ?? cpuBuf.length);
   }
 
   synchronize(): void {
@@ -564,14 +560,6 @@ export class GlmOps implements DeviceOps {
 
   fill(out: Tensor, value: number, n: number): void {
     getNativeAddon().fill(this.ctx, ptr(out), value, n);
-  }
-
-  arange(out: Tensor, start: number, step: number, count: number): void {
-    getNativeAddon().arange(this.ctx, ptr(out), start, step, count);
-  }
-
-  memcpy(dst: number, src: number, bytes: number, kind: MemcpyKind): void {
-    getNativeAddon().memcpy(this.ctx, dst, src, bytes, memcpyKindToNative(kind));
   }
 
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void {
@@ -688,14 +676,6 @@ export class GlmOps implements DeviceOps {
 
   gateSigmoidMul(attnOut: Tensor, gateInterleaved: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
     getNativeAddon().gateSigmoidMul(this.ctx, ptr(attnOut), ptr(gateInterleaved), batchSeq, numHeads, headDim);
-  }
-
-  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
-    getNativeAddon().sampleBatch(this.ctx, ptr(outTokens), ptr(topkVals), ptr(topkIdxs), ptr(workspace), ptr(logits), ptr(penaltyTokens), ptr(penaltyCount), maxWindow, vocabSize, batchSize, ptr(temperatures), ptr(repPenalties), ptr(presPenalties), ptr(topKs), ptr(topPs), ptr(stepCounter), maxEffectiveK);
-  }
-
-  memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
-    getNativeAddon().memcpy2d(this.ctx, dst, dpitch, src, spitch, width, height, memcpyKindToNative(kind));
   }
 
 
