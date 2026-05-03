@@ -1587,7 +1587,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, o: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: number, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number): void {
+  mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, o: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: number, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, lse: Tensor | null): void {
     const pQNope = this.cast(qNope);
     const pQPe = this.cast(qPe);
     const pCkvData = this.cast(ckvData);
@@ -1597,11 +1597,12 @@ export class ParallelOps implements DeviceOps {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPlanInfo = this.cast(planInfo);
+    const pLse = lse ? this.cast(lse) : null;
     const shardNumHeads = this.shardDim(numHeads, "mlaPrefillRun numHeads");
     const shardQNopeStrideN = shardNumHeads * headDimCkv;
     const shardQPeStrideN = shardNumHeads * headDimKpe;
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], shardNumHeads, pageSize, maskMode, smScale, shardQNopeStrideN, qNopeStrideH, shardQPeStrideN, qPeStrideH, ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe);
+      this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], shardNumHeads, pageSize, maskMode, smScale, shardQNopeStrideN, qNopeStrideH, shardQPeStrideN, qPeStrideH, ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, pLse ? pLse.shards[i] : null);
     }
   }
 
@@ -1617,7 +1618,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mlaDecodeRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, o: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, batchSize: number, numQoHeads: number, pageSize: number, smScale: number, headDimCkv: number, headDimKpe: number): void {
+  mlaDecodeRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, o: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, batchSize: number, numQoHeads: number, pageSize: number, smScale: number, headDimCkv: number, headDimKpe: number, lse: Tensor | null): void {
     const pQNope = this.cast(qNope);
     const pQPe = this.cast(qPe);
     const pCkvData = this.cast(ckvData);
@@ -1629,9 +1630,10 @@ export class ParallelOps implements DeviceOps {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPlanInfo = this.cast(planInfo);
+    const pLse = lse ? this.cast(lse) : null;
     const shardNumQoHeads = this.shardDim(numQoHeads, "mlaDecodeRun numQoHeads");
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaDecodeRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptrD.shards[i], pLastPageLen.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], batchSize, shardNumQoHeads, pageSize, smScale, headDimCkv, headDimKpe);
+      this.devices[i].mlaDecodeRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptrD.shards[i], pLastPageLen.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], batchSize, shardNumQoHeads, pageSize, smScale, headDimCkv, headDimKpe, pLse ? pLse.shards[i] : null);
     }
   }
 

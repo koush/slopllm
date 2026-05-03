@@ -223,7 +223,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): Tensor {
+  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, lseOut?: Tensor): Tensor {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const out = this.alloc([1, nHeads, totalTokens, headDimCkv], qNope.type, undefined, qNope.parallelism);
@@ -248,12 +248,13 @@ export class ExecutionWorkspace extends WorkspaceBase {
       qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH,
       ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
       oStrideN, oStrideH,
-      headDimCkv, headDimKpe
+      headDimCkv, headDimKpe,
+      lseOut ?? null
     );
     return out;
   }
 
-  mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): Tensor {
+  mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, lseOut?: Tensor): Tensor {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const out = this.alloc([batchSize, nHeads, 1, headDimCkv], qNope.type, undefined, qNope.parallelism);
@@ -264,7 +265,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.floatWs, this.intWs,
       this.mlaDecodePlanInfo,
       batchSize, nHeads, pagedKV.pageSize, smScale,
-      headDimCkv, headDimKpe
+      headDimCkv, headDimKpe,
+      lseOut ?? null
     );
     return out;
   }

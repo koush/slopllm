@@ -490,6 +490,7 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p,  # lse (optional, nullptr to skip)
         ]
 
         self.lib.glm_mla_decode_plan.restype = None
@@ -516,6 +517,7 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_float,
             ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p,  # lse (optional, nullptr to skip)
         ]
 
         self.lib.glm_mla_kv_cache_append.restype = None
@@ -1206,7 +1208,8 @@ class GlmOps:
                         ckv_stride_page, ckv_stride_n,
                         kpe_stride_page, kpe_stride_n,
                         o_stride_n, o_stride_h,
-                        head_dim_ckv, head_dim_kpe):
+                        head_dim_ckv, head_dim_kpe,
+                        lse=None):
         self.lib.glm_mla_prefill_run(
             self.ctx,
             ctypes.c_void_p(q_nope), ctypes.c_void_p(q_pe),
@@ -1222,7 +1225,8 @@ class GlmOps:
             ctypes.c_uint32(ckv_stride_page), ctypes.c_uint32(ckv_stride_n),
             ctypes.c_uint32(kpe_stride_page), ctypes.c_uint32(kpe_stride_n),
             ctypes.c_uint32(o_stride_n), ctypes.c_uint32(o_stride_h),
-            ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe)
+            ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe),
+            ctypes.c_void_p(lse)
         )
 
     def mla_decode_plan(self, float_ws, float_ws_size,
@@ -1246,7 +1250,8 @@ class GlmOps:
                        indices, indptr_d, last_page_len,
                        o, float_ws, int_ws, plan_info,
                        batch_size, num_qo_heads, page_size, sm_scale,
-                       head_dim_ckv=512, head_dim_kpe=64):
+                       head_dim_ckv=512, head_dim_kpe=64,
+                       lse=None):
         self.lib.glm_mla_decode_run(
             self.ctx,
             ctypes.c_void_p(q_nope), ctypes.c_void_p(q_pe),
@@ -1257,7 +1262,8 @@ class GlmOps:
             ctypes.c_void_p(plan_info),
             ctypes.c_uint32(batch_size), ctypes.c_uint32(num_qo_heads),
             ctypes.c_uint32(page_size), ctypes.c_float(sm_scale),
-            ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe)
+            ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe),
+            ctypes.c_void_p(lse)
         )
 
     def mla_kv_cache_append(self, ckv_data, kpe_data,

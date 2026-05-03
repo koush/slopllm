@@ -556,7 +556,8 @@ void glm_mla_prefill_run(
     uint32_t ckv_stride_page, uint32_t ckv_stride_n,
     uint32_t kpe_stride_page, uint32_t kpe_stride_n,
     uint32_t o_stride_n, uint32_t o_stride_h,
-    uint32_t head_dim_ckv, uint32_t head_dim_kpe) {
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe,
+    float* lse) {
 
   cudaSetDevice(ctx->device_id);
 
@@ -588,7 +589,7 @@ void glm_mla_prefill_run(
   params.merge_partial_stride = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.merge_partial_stride_offset);
 
   params.final_o = static_cast<DTypeO*>(o);
-  params.final_lse = nullptr;
+  params.final_lse = lse;
   params.partial_o = reinterpret_cast<DTypeO*>(static_cast<char*>(float_ws) + info.partial_o_offset);
   params.partial_lse = reinterpret_cast<float*>(static_cast<char*>(float_ws) + info.partial_lse_offset);
 
@@ -719,7 +720,8 @@ void glm_mla_decode_run(
     int64_t* plan_info,
     uint32_t batch_size, uint32_t num_qo_heads,
     uint32_t page_size, float sm_scale,
-    uint32_t head_dim_ckv, uint32_t head_dim_kpe) {
+    uint32_t head_dim_ckv, uint32_t head_dim_kpe,
+    float* lse) {
 
   cudaSetDevice(ctx->device_id);
 
@@ -737,7 +739,7 @@ void glm_mla_decode_run(
       nullptr, // q_rope_offset (use seq_len - 1 as default)
       paged_kv,
       static_cast<DTypeO*>(o),
-      nullptr, // lse
+      lse,     // lse (optional, nullptr to skip)
       num_qo_heads,
       -1, // window_left
       0.0f, // logits_soft_cap
