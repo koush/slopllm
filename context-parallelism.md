@@ -77,22 +77,16 @@ This reduces AllReduce volume by **4×** (vHeadDim=128 vs kvLoraRank=512 per hea
 
 ### Prefill Strategy
 
-Two options:
+Context parallelism applies to both prefill and decode — each GPU builds and maintains only its KV shard from the start.
 
-**Option A: Prefill with head parallelism, then switch** (simpler)
-- Prefill uses head parallelism (full KV on each GPU, as today)
-- After prefill, shard the KV cache: each GPU keeps only positions `shard * ceil(S/N)` to `(shard+1) * ceil(S/N) - 1`
-- Subsequent decode uses context parallelism
-- KV memory savings only during decode, not prefill
+- Each GPU appends only positions it owns to its KV cache (position `p` is owned by GPU `p % worldSize`)
+- Each GPU runs MLA prefill/decode against its KV shard (all Q heads × partial KV)
+- Merge partial results after each layer using the softmax merge kernel
+- KV memory savings apply from the start, not just during decode
 
-**Option B: Prefill with context parallelism** (maximum KV savings)
-- Each GPU builds only its KV shard from the start
-- Each GPU runs MLA prefill against its KV shard
-- Merge partial results using same softmax correction
-- KV memory savings from the start
-- More complex: requires sharding the page table and position tracking
+Prefill is compute-bound (attention FLOPS dominate). The extra merge communication (~32 KB/layer) adds <0.004% overhead per layer and is negligible compared to attention compute (~135 ms/layer at S=128K). There is no performance reason to use head parallelism for prefill.
 
-Recommend starting with **Option A** (simpler, still saves KV memory for long decode sequences).
+Using context parallelism throughout avoids the complexity of a mode switch (no KV cache redistribution, no dual parallelism modes, no page table compaction after prefill).
 
 ## Implementation Plan
 
@@ -194,20 +188,20 @@ Currently only `NCCL_SUM` is used. Need `NCCL_MAX` for the LSE AllReduce.
 
 1. **`src/parallel_ops.ts`** — New `mlaContextParallelDecode()` method
    ```typescript
-   mlaContextParallelDecode(
-     qAbsorbedR: ParallelTensor,  // AllGathered to Replicated (all heads)
-     qPeR: ParallelTensor,        // AllGathered to Replicated (all heads)
-     pagedKV: PagedKVCache,       // Sharded KV cache
-     layerIdx: number,
-     batchSize: number,
-     nHeads: number,
-     kvLoraRank: number,
-     qkRopeDim: number,
-     vHeadDim: number,
-     vProj: ParallelTensor,       // v_proj weight (Replicated)
-     smScale: number,
-   ): ParallelTensor {
-     // 1. MLA decode attention against this GPU's KV shard
+    mlaContextParallelAttention(
+      qAbsorbedR: ParallelTensor,  // AllGathered to Replicated (all heads)
+      qPeR: ParallelTensor,        // AllGathered to Replicated (all heads)
+      pagedKV: PagedKVCache,       // Sharded KV cache
+      layerIdx: number,
+      batchSize: number,
+      nHeads: number,
+      kvLoraRank: number,
+      qkRopeDim: number,
+      vHeadDim: number,
+      vProj: ParallelTensor,       // v_proj weight (Replicated)
+      smScale: number,
+    ): ParallelTensor {
+      // 1. MLA attention (prefill or decode) against this GPU's KV shard
      //    → partial_attn_out, partial_lse
      // 2. v_expand partial_attn_out → partial_v_out
      // 3. AllReduce MAX partial_lse → global_lse
@@ -219,34 +213,30 @@ Currently only `NCCL_SUM` is used. Need `NCCL_MAX` for the LSE AllReduce.
    }
    ```
 
-2. **`src/glm51_model.ts`** — Modify `mlaLayer`
-   - Add context parallelism mode flag
-   - In context parallelism mode:
-     a. AllGather Q projections (absorbed, q_pe) from Column → Replicated
-     b. Call `mlaContextParallelDecode()` instead of the standard decode path
-     c. v_expand is done inside `mlaContextParallelDecode()` (before merge)
-   - In head parallelism mode: existing flow unchanged
+ 2. **`src/glm51_model.ts`** — Modify `mlaLayer`
+    - Add context parallelism mode flag
+    - In context parallelism mode:
+      a. AllGather Q projections (absorbed, q_pe) from Column → Replicated
+      b. Call `mlaContextParallelAttention()` instead of the standard attention path
+      c. v_expand is done inside `mlaContextParallelAttention()` (before merge)
+    - In head parallelism mode: existing flow unchanged
+    - Same flow for both prefill and decode — the merge is on the critical path between layers but adds <0.004% overhead per layer
 
-3. **Q projection AllGather**: The `absorbed` and `q_pe_proj` weights are Column parallel. Their output needs to be AllGathered before MLA attention in context parallelism mode.
-   - `absorbed`: `[BS, shardNHeads * kvLoraRank]` → AllGather → `[BS, nHeads * kvLoraRank]`
-   - `qPeLin`: `[BS, shardNHeads * qkRopeDim]` → AllGather → `[BS, nHeads * qkRopeDim]`
-   - These become Replicated tensors after AllGather.
+ 3. **Q projection AllGather**: The `absorbed` and `q_pe_proj` weights are Column parallel. Their output needs to be AllGathered before MLA attention in context parallelism mode.
+    - `absorbed`: `[BS, shardNHeads * kvLoraRank]` → AllGather → `[BS, nHeads * kvLoraRank]`
+    - `qPeLin`: `[BS, shardNHeads * qkRopeDim]` → AllGather → `[BS, nHeads * qkRopeDim]`
+    - These become Replicated tensors after AllGather.
 
-### Phase 6: Prefill with Context Parallelism (Optional)
+### Phase 6: Prefill with Context Parallelism
 
-For prefill, each GPU builds only its KV shard and computes partial attention. The merge flow is identical to decode.
+Prefill uses the same context-parallel flow as decode. Each GPU builds only its KV shard and computes partial attention. The merge is identical.
 
-**Key consideration for prefill:** Causal masking means each token only attends to tokens at positions ≤ its own position. With sequence-sharded KV:
-- GPU 0 has KV for positions 0..S/2-1
-- GPU 1 has KV for positions S/2..S-1
-- Tokens at position S/2 on GPU 1 can only attend to positions 0..S/2 (which spans both GPUs)
-
-This is fine — each GPU computes partial attention against its KV shard, and the softmax merge combines the results correctly. The causal mask is already handled by FlashInfer internally.
+**Causal masking with sequence-sharded KV:** Each GPU computes partial attention against its KV shard. The causal mask is handled by FlashInfer internally — tokens only attend to positions ≤ their own. The softmax merge combines partial results correctly regardless of which GPU holds which positions.
 
 **Prefill-specific changes:**
-- Each GPU only appends its shard of tokens to the KV cache during prefill
+- Each GPU only appends its shard of tokens to the KV cache during prefill (position `p` owned by GPU `p % worldSize`)
 - `mlaPrefillPaged` is called with each GPU's shard of the page table
-- Merge flow is the same as decode (LSE AllGather + v_expand + scale + AllReduce + divide)
+- Merge flow is the same as decode (LSE output + v_expand + scale + AllReduce + divide)
 
 ### Phase 7: Testing & Validation
 
@@ -258,22 +248,13 @@ This is fine — each GPU computes partial attention against its KV shard, and t
 
 ## Open Questions
 
-1. **Prefill strategy**: Start with Option A (head parallelism for prefill, switch to context parallelism for decode) or Option B (context parallelism for both)?
-   - **Recommendation**: Option A first — simpler, still saves KV memory for long decode runs
-
-2. **KV cache redistribution**: After prefill (Option A), how to shard the KV cache? Options:
-   a. Adjust page tables only (no data movement, but memory not freed)
-   b. Compact data and free unused pages (saves memory but complex)
-   c. Rebuild KV cache from scratch with context parallelism (simplest but requires re-running prefill)
-   - **Recommendation**: Option (b) — compact and free, for real memory savings
-
-3. **Hybrid parallelism**: Should we support head parallelism + context parallelism simultaneously (e.g., 4 GPUs = 2 head shards × 2 sequence shards)?
+1. **Hybrid parallelism**: Should we support head parallelism + context parallelism simultaneously (e.g., 4 GPUs = 2 head shards × 2 sequence shards)?
    - **Recommendation**: Defer to future work. Start with pure context parallelism.
 
-4. **AllGather Q overhead**: For decode, AllGathering the Q projections adds ~144 KB/GPU/layer. Is this acceptable?
+2. **AllGather Q overhead**: For decode, AllGathering the Q projections adds ~144 KB/GPU/layer. Is this acceptable?
    - **Recommendation**: Yes — NVLink bandwidth (300 GB/s) makes this ~0.5 μs, negligible vs attention compute time
 
-5. **P2P for LSE AllReduce**: The LSE is tiny (`nHeads × 4 = 512 B` for full model decode). P2P AllReduce (max 8192 elements) could handle this without NCCL.
+3. **P2P for LSE AllReduce**: The LSE is tiny (`nHeads × 4 = 512 B` for full model decode). P2P AllReduce (max 8192 elements) could handle this without NCCL.
    - **Recommendation**: Use P2P for LSE AllReduce MAX if `nHeads × batchSize ≤ 8192`; otherwise fall back to NCCL.
 
 ## Estimated Effort
@@ -284,12 +265,12 @@ This is fine — each GPU computes partial attention against its KV shard, and t
 | 2 | Custom softmax merge kernels | 2-3 days |
 | 3 | AllReduce MAX support | 0.5 days |
 | 4 | Sequence-sharded KV cache | 2-3 days |
-| 5 | Parallel MLA with context parallelism | 3-4 days |
+| 5 | Parallel MLA with context parallelism (decode) | 3-4 days |
 | 6 | Prefill with context parallelism | 2-3 days |
 | 7 | Testing & validation | 2-3 days |
 | **Total** | | **13-19 days** |
 
-Phases 1-3 are foundational and can be done first. Phases 4-5 are the core implementation. Phases 6-7 can be done incrementally.
+Phases 1-3 are foundational and can be done first. Phases 4-5 are the core implementation. Phases 6-7 build on top.
 
 ## Key Reference: FlashInfer LSE Format
 
