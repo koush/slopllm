@@ -41,23 +41,6 @@ export interface DeviceOps {
   mlaDecodeRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, o: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, batchSize: number, numQoHeads: number, pageSize: number, smScale: number, headDimCkv: number, headDimKpe: number, lse: Tensor | null): void;
   mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number): void;
 
-
-  ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void;
-  mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): void;
-
-  sigmoid(ctx: number, out: number, input: number, n: number): void;
-  topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
-  indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
-  add(ctx: number, out: number, a: number, b: number, n: number): void;
-  addBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
-  scale(ctx: number, out: number, input: number, scale: number, n: number): void;
-  mul(ctx: number, out: number, a: number, b: number, n: number): void;
-  mulBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
-  scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
-  maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void;
-  applyRotaryPosEmbPartial(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
-  rowScaleAdd(ctx: number, out: number, input: number, scales: number, rows: number, dim: number): void;
-
   graphBeginCapture(): void;
   graphEndCapture(): number;
   graphInstantiate(graph: number): number;
