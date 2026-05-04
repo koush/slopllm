@@ -379,7 +379,7 @@ export class Glm51Model extends ChatModel {
       }
     }
 
-    const count = this.maxBatch * topK;
+    const count = this.maxSeqLen * topK;
     const batchIdsArr = new Int32Array(count);
     for (let i = 0; i < count; i++) batchIdsArr[i] = Math.floor(i / topK);
     const batchIdsBuf = this.alloc([count], "I32", "__moe_batch_ids");

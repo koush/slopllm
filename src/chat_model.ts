@@ -125,6 +125,7 @@ export abstract class ChatModel extends WorkspaceBase {
 
     for (const { st, mmapPtr } of openShards) {
       for (const name of st.tensorNames()) {
+        console.log('Loading tensor', name);
         this.loadTensor(name, st.meta(name), st, mmapPtr);
       }
     }

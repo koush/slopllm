@@ -41,8 +41,14 @@ export class ParallelTensor extends Tensor {
     switch (type) {
       case "BF16": return 2;
       case "I32": return 4;
+      case "I64": return 8;
       case "F32": return 4;
-      default: return 1;
+      case "U8": return 1;
+      case "F8_E5M2": return 1;
+      case "F8_E4M3": return 1;
+      default:
+        console.warn(`Unknown type ${type}, assuming 1 byte per element`);
+        return 1;
     }
   }
 

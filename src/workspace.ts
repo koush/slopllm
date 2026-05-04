@@ -9,6 +9,7 @@ export class WorkspaceBase implements Disposable {
   exported = new Set<Tensor>();
   private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
   frozen = false;
+  allocLogger = false;
 
   constructor(glm: DeviceOps) {
     this.glm = glm;
@@ -88,11 +89,17 @@ export class WorkspaceBase implements Disposable {
     }
     let tensor: Tensor;
     if (best !== undefined) {
+      if (best.allocSize !== bytes && this.allocLogger) {
+        console.warn(`Reusing disposed tensor of size ${best.allocSize} bytes for allocation of ${bytes} bytes (${shape.join("x")} ${type}${pinned ? " pinned" : ""}${parallelism ? ` ${parallelism}` : ""})`);
+      }
       this.disposed.delete(best);
       const data = best.data;
       best.detachData();
       tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned, undefined);
     } else {
+      if (this.allocLogger) {
+        console.warn(`Allocating new tensor ${name ?? "<unnamed>"} of size ${bytes} bytes (${shape.join("x")} ${type}${pinned ? " pinned" : ""}${parallelism ? ` ${parallelism}` : ""})`);
+      }
       tensor = this.glm.newTensor(this, shape, type, pinned, undefined, parallelism);
     }
 

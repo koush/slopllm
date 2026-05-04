@@ -497,12 +497,6 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().free(this.ctx);
   }
 
-  alloc(size: number): number {
-    const p = getNativeAddon().alloc(this.ctx, size);
-    if (!p) throw new Error(`glm_alloc failed for size ${size}`);
-    return p;
-  }
-
   allocPinned(bytes: number): number {
     const p = getNativeAddon().allocPinned(bytes);
     if (!p) throw new Error(`allocPinned failed for size ${bytes}`);
