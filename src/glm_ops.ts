@@ -5,6 +5,7 @@ import type { SamplingParams } from "./chat_model";
 import { MemcpyKind, Tensor } from "./tensor";
 import { SafeTensorFile } from "./safetensors";
 import type { WorkspaceBase } from "./workspace";
+import { Allocator, ArenaAllocator } from "./allocator";
 
 function findProjectRoot(dir: string): string {
   let d = dir;
@@ -147,7 +148,7 @@ export class GlmTensor extends Tensor {
       if (this.pinned) {
         getNativeAddon().freePinned(this.data);
       } else {
-        getNativeAddon().freeBuf(this.glm.ctx, this.data);
+        this.glm.allocator.free(this.data);
       }
       this.detachData();
     }
@@ -466,8 +467,9 @@ export class GlmTensor extends Tensor {
 export class GlmOps implements DeviceOps {
   ctx: number;
   device: number;
+  allocator: Allocator;
 
-  constructor(deviceId: number = 0, libPath?: string) {
+  constructor(deviceId: number = 0, libPath?: string, arenaGb?: number) {
     if (libPath) {
       nativeAddon = require(libPath) as NativeAddon;
     }
@@ -477,6 +479,18 @@ export class GlmOps implements DeviceOps {
       throw new Error(`glm_init failed on device ${deviceId}`);
     }
     this.device = deviceId;
+
+    if (arenaGb) {
+      const size = arenaGb * 1024 * 1024 * 1024;
+      const base = getNativeAddon().alloc(this.ctx, size);
+      this.allocator = new ArenaAllocator(base, size);
+    }
+    else {
+      this.allocator = {
+        alloc: (size: number) => getNativeAddon().alloc(this.ctx, size),
+        free: (ptr: number) => getNativeAddon().freeBuf(this.ctx, ptr),
+      }
+    }
   }
 
   free(): void {
@@ -497,7 +511,7 @@ export class GlmOps implements DeviceOps {
 
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, _parallelism?: TensorParallelism): GlmTensor {
     const size = Tensor.byteCount(shape, type);
-    const data = pinned ? this.allocPinned(size) : this.alloc(size);
+    const data = pinned ? this.allocPinned(size) : this.allocator.alloc(size);
     return new GlmTensor(workspace, this, data, size, shape, type, name, pinned, undefined);
   }
 

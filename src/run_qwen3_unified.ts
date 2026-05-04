@@ -51,6 +51,7 @@ interface CliArgs {
   greedy: boolean;
   stats: boolean;
   meta: boolean;
+  arena: number;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -80,6 +81,7 @@ function parseArgs(argv: string[]): CliArgs {
     greedy: false,
     stats: false,
     meta: false,
+    arena: 0,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -111,6 +113,7 @@ function parseArgs(argv: string[]): CliArgs {
     }
     else if (a === "--stats") args.stats = true;
     else if (a === "--meta") args.meta = true;
+    else if (a === "--arena" && i + 1 < argv.length) args.arena = parseInt(argv[++i], 10);
   }
 
   if (args.useQwen35 && args.useFp8) {
@@ -557,7 +560,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const gpuDevices = args.gpus.map(id => new GlmOps(id));
+  const gpuDevices = args.gpus.map(id => new GlmOps(id, undefined, args.arena || undefined));
   const glm: DeviceOps = gpuDevices.length > 1
     ? new ParallelOps(gpuDevices)
     : gpuDevices[0];
@@ -623,7 +626,8 @@ async function main(): Promise<void> {
   if (sp.presencePenalty !== 0) samplingParts.push(`pres_pen=${sp.presencePenalty}`);
   const samplingStr = !args.greedy ? samplingParts.join(" ") : "greedy";
 
-  console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${args.maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}`);
+  const arenaStr = args.arena ? `  |  arena=${args.arena}GB` : "";
+  console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${args.maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}${arenaStr}`);
 
   const cleanup = () => {
     glm.synchronize();
