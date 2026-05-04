@@ -558,9 +558,14 @@ export class Glm51Model extends ChatModel {
     using attnOut = new UsingHolder<Tensor>(undefined!);
 
     if (useMla && state.isDecode) {
+      using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, qkRopeDim / 2, B, S));
+      using cos = rotaryEmbedding.result.cos;
+      using sin = rotaryEmbedding.result.sin;
+      rotaryEmbedding.streamWaitEvent();
       using qAbsorbedR = qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-      using qPeR = qPeLin.ropeTranspose(undefined!, undefined!, 0, qkRopeDim, nHeads, S, B, qkRopeDim);
-      using kPeFull = kPeRaw.all(ws);
+      using qPeR = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim);
+      using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1);
+      using kPeFull = kPeRope.all(ws);
       state.mlaKvCacheAppend(ckvNormed, kPeFull, layerIdx, kvLoraRank, qkRopeDim);
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else if (useMla && !state.isDecode) {

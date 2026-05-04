@@ -687,7 +687,7 @@ void glm_mla_decode_plan(
   cudaError_t status;
   DISPATCH_MLA_HEAD_DIMS(head_dim_ckv, head_dim_kpe, {
     status = flashinfer::DecodePlan<
-        HEAD_DIM_CKV, flashinfer::PosEncodingMode::kRoPELlama,
+        HEAD_DIM_CKV, flashinfer::PosEncodingMode::kNone,
         MLAAttentionVariant, MLADecodeParams>(
         float_ws, float_ws_size,
         int_ws, pinned_int_ws, int_ws_size,
