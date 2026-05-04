@@ -14,6 +14,7 @@ import { ExecutionState, ExecutionWorkspace } from "./paged_kv";
 import { DeviceOps } from "./device_ops";
 import { WorkspaceBase } from "./workspace";
 import { UsingHolder } from "./using-holder";
+import { MetaOps } from "./meta_ops";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -49,6 +50,7 @@ interface CliArgs {
   repetitionPenaltyWindow: number;
   greedy: boolean;
   stats: boolean;
+  meta: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -77,6 +79,7 @@ function parseArgs(argv: string[]): CliArgs {
     repetitionPenaltyWindow: 64,
     greedy: false,
     stats: false,
+    meta: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -107,6 +110,7 @@ function parseArgs(argv: string[]): CliArgs {
       args.greedy = true;
     }
     else if (a === "--stats") args.stats = true;
+    else if (a === "--meta") args.meta = true;
   }
 
   if (args.useQwen35 && args.useFp8) {
@@ -518,6 +522,41 @@ async function interactiveBatch(
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
+  const modelDir = args.modelDir ?? (args.useGlm51
+    ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
+    // ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
+    : resolveModelPath(args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO)));
+
+  if (args.meta) {
+    const metaOps = new MetaOps();
+    const model: ChatModel = args.useGlm51
+      ? Glm51Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
+      : args.useQwen35
+      ? Qwen35Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
+      : Qwen3Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen);
+    const loadAllocs = metaOps.totalAllocs;
+    const loadBytes = metaOps.totalBytes;
+    const loadStats = model.stats();
+
+    const cache = model.createChatCache(args.maxPages);
+    const ws = new ExecutionWorkspace(metaOps, args.maxBatch, args.maxSeqLen);
+    const inputIds = [1, 2, 3, 4, 5];
+    cache.appendTokens(0, cache.prefixMatch(0, inputIds));
+    const logits = ws.forwardPrefill(model, [inputIds], cache);
+    const forwardAllocs = metaOps.totalAllocs;
+    const forwardBytes = metaOps.totalBytes;
+
+    const mb = (b: number) => (b / (1024 * 1024)).toFixed(1);
+    console.log(`Meta mode: ${modelLabel(args)}`);
+    console.log(`  model weight allocs: ${loadAllocs} (${mb(loadBytes)} MB)`);
+    console.log(`  + workspace/cache allocs: ${forwardAllocs - loadAllocs} (${mb(forwardBytes - loadBytes)} MB)`);
+    console.log(`  total allocs: ${forwardAllocs} (${mb(forwardBytes)} MB)`);
+    console.log(`  named tensors: ${loadStats.namedCount} (${mb(loadStats.namedBytes)} MB)`);
+    console.log(`  disposed tensors: ${loadStats.disposedCount} (${mb(loadStats.disposedBytes)} MB)`);
+    console.log(`  tracked tensors: ${loadStats.trackedCount} (${mb(loadStats.trackedBytes)} MB)`);
+    return;
+  }
+
   const gpuDevices = args.gpus.map(id => new GlmOps(id));
   const glm: DeviceOps = gpuDevices.length > 1
     ? new ParallelOps(gpuDevices)
@@ -528,10 +567,6 @@ async function main(): Promise<void> {
     : args.useQwen35 ? QWEN35_REPO
     : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
 
-  const modelDir = args.modelDir ?? (args.useGlm51
-    // ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
-    ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
-    : resolveModelPath(repoId));
   const model: ChatModel = args.useGlm51
     ? Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
     : args.useQwen35
