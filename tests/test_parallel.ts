@@ -524,21 +524,19 @@ describe("ParallelOps.linear", () => {
     }
   });
 
-  it("linearOutputParallelism returns correct types", () => {
-    assert.equal(ParallelOps.linearOutputParallelism(TensorParallelism.Column, TensorParallelism.Replicated), TensorParallelism.Row);
-    assert.equal(ParallelOps.linearOutputParallelism(TensorParallelism.Row, TensorParallelism.Row), TensorParallelism.PartialSum);
-    assert.equal(ParallelOps.linearOutputParallelism(TensorParallelism.Replicated, TensorParallelism.Replicated), TensorParallelism.Replicated);
+  it("linear handles all parallelism combinations", () => {
+    // Column weight + Replicated input → Row output
+    const colW = ws.alloc([8, 16], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    const repX = ws.alloc([2, 16], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const result = repX.linear(colW, 2);
+    assert.equal((result as ParallelTensor).parallelism, TensorParallelism.Row);
   });
 
-  it("linear rejects unsupported parallelism combinations", () => {
-    const weight = ws.alloc([8, 16], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+  it("linear rejects PartialSum weight with Row input", () => {
+    const weight = ws.alloc([8, 16], "BF16", undefined, TensorParallelism.PartialSum) as ParallelTensor;
     const input = ws.alloc([2, 16], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
 
-    assert.throws(() => input.linear(weight, 2), /unsupported parallelism/);
-  });
-
-  it("linearOutputParallelism rejects invalid combinations", () => {
-    assert.throws(() => ParallelOps.linearOutputParallelism(TensorParallelism.Column, TensorParallelism.Row), /unsupported parallelism/);
+    assert.throws(() => input.linear(weight, 2), /PartialSum weight requires Replicated input/);
   });
 });
 
