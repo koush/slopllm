@@ -53,7 +53,7 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
 void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
                           const void* weight, const void* cos_emb, const void* sin_emb,
                           float eps, int rope_dim, int head_dim,
-                          int n_heads, int seq_len, int batch, int in_stride);
+                          int n_heads, int seq_len, int batch, int in_stride, bool interleaved);
 
 void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
                       const void* up, int intermediate, int batch);
@@ -100,12 +100,12 @@ void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
 void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
                               const void* cos, const void* sin,
                               int rope_dim, int n_heads, int seq_len,
-                              int batch, int unsqueeze_dim);
+                              int batch, int unsqueeze_dim, bool interleaved);
 
 void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
                                         const void* cos, const void* sin,
                                         int rope_dim, int head_dim, int n_heads, int seq_len,
-                                        int batch, int unsqueeze_dim);
+                                        int batch, int unsqueeze_dim, bool interleaved);
 
 // RoPE + Head Transpose: [B*S, nH*in_stride] -> [B*nH, S, head_dim]
 // Applies RoPE to first rope_dim dims (if rope_dim > 0), then transposes
@@ -114,7 +114,7 @@ void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
 void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
                          const void* cos_emb, const void* sin_emb,
                          int rope_dim, int head_dim, int n_heads,
-                         int seq_len, int batch, int in_stride);
+                         int seq_len, int batch, int in_stride, bool interleaved);
 
 // MLA V-Expand: per-head matmul attn_out @ v_proj^T
 // attn_out: [B, nH, S, kv_lora_rank] (HND), v_proj: [nH*v_head_dim, kv_lora_rank]

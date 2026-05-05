@@ -34,6 +34,7 @@ export interface Glm51Config extends CommonModelConfig {
   indexTopk: number;
   indexHeadDim: number;
   indexNHeads: number;
+  ropeInterleave: boolean;
   mlpLayerTypes: string[];
   numDenseMlpLayers: number;
   firstSparseMlpLayer: number;
@@ -78,6 +79,7 @@ function loadConfig(modelDir: string): Glm51Config {
     indexTopk: raw.index_topk ?? 256,
     indexHeadDim: raw.index_head_dim ?? 64,
     indexNHeads: raw.index_n_heads ?? 4,
+    ropeInterleave: raw.rope_interleave ?? false,
     mlpLayerTypes,
     numDenseMlpLayers,
     firstSparseMlpLayer: firstSparseMlpLayer >= 0 ? firstSparseMlpLayer : numDenseMlpLayers,
@@ -87,7 +89,7 @@ function loadConfig(modelDir: string): Glm51Config {
 class Glm51ChatCache implements ChatCache {
   constructor(
     public readonly pagedKV: PagedKVCache,
-  ) {}
+  ) { }
 
   getPagedKV(): PagedKVCache { return this.pagedKV; }
 
@@ -158,28 +160,28 @@ export class Glm51Model extends ChatModel {
     if (name === "model.embed_tokens.weight") return TensorParallelism.Row;
     const pfx = Glm51Model.WEIGHT_PREFIX;
     if (name.endsWith(".self_attn.q_a_proj.weight") ||
-        name.endsWith(".self_attn.kv_a_proj_with_mqa.weight") ||
-        name.endsWith(".mlp.gate_proj.weight") ||
-        name.endsWith(".mlp.up_proj.weight") ||
-        (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight")) ||
-        (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".up_proj.weight")) ||
-        name.endsWith(".mlp.shared_experts.gate_proj.weight") ||
-        name.endsWith(".mlp.shared_experts.up_proj.weight") ||
-        // NVFP4 block scale tensors follow same parallelism as their weight (weight_scale, not weight_scale_2 which is scalar)
-        name.endsWith(".gate_proj.weight_weight_scale") ||
-        name.endsWith(".up_proj.weight_weight_scale") ||
-        (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight_weight_scale")) ||
-        (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".up_proj.weight_weight_scale")) ||
-        name.endsWith(".mlp.shared_experts.gate_proj.weight_weight_scale") ||
-        name.endsWith(".mlp.shared_experts.up_proj.weight_weight_scale")) return TensorParallelism.Column;
+      name.endsWith(".self_attn.kv_a_proj_with_mqa.weight") ||
+      name.endsWith(".mlp.gate_proj.weight") ||
+      name.endsWith(".mlp.up_proj.weight") ||
+      (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight")) ||
+      (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".up_proj.weight")) ||
+      name.endsWith(".mlp.shared_experts.gate_proj.weight") ||
+      name.endsWith(".mlp.shared_experts.up_proj.weight") ||
+      // NVFP4 block scale tensors follow same parallelism as their weight (weight_scale, not weight_scale_2 which is scalar)
+      name.endsWith(".gate_proj.weight_weight_scale") ||
+      name.endsWith(".up_proj.weight_weight_scale") ||
+      (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight_weight_scale")) ||
+      (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".up_proj.weight_weight_scale")) ||
+      name.endsWith(".mlp.shared_experts.gate_proj.weight_weight_scale") ||
+      name.endsWith(".mlp.shared_experts.up_proj.weight_weight_scale")) return TensorParallelism.Column;
     if (name.endsWith(".self_attn.o_proj.weight") ||
-        name.endsWith(".mlp.down_proj.weight") ||
-        (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".down_proj.weight")) ||
-        name.endsWith(".mlp.shared_experts.down_proj.weight") ||
-        // NVFP4 block scale tensors follow same parallelism as their weight (weight_scale, not weight_scale_2 which is scalar)
-        name.endsWith(".down_proj.weight_weight_scale") ||
-        (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".down_proj.weight_weight_scale")) ||
-        name.endsWith(".mlp.shared_experts.down_proj.weight_weight_scale")) return TensorParallelism.Row;
+      name.endsWith(".mlp.down_proj.weight") ||
+      (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".down_proj.weight")) ||
+      name.endsWith(".mlp.shared_experts.down_proj.weight") ||
+      // NVFP4 block scale tensors follow same parallelism as their weight (weight_scale, not weight_scale_2 which is scalar)
+      name.endsWith(".down_proj.weight_weight_scale") ||
+      (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".down_proj.weight_weight_scale")) ||
+      name.endsWith(".mlp.shared_experts.down_proj.weight_weight_scale")) return TensorParallelism.Row;
     return TensorParallelism.Replicated;
   }
 
@@ -197,8 +199,8 @@ export class Glm51Model extends ChatModel {
     }
 
     if (name.endsWith(".self_attn.q_b_proj.weight") ||
-        name.endsWith(".self_attn.kv_b_proj.weight") ||
-        name.endsWith(".self_attn.kv_a_proj_with_mqa.weight")) {
+      name.endsWith(".self_attn.kv_b_proj.weight") ||
+      name.endsWith(".self_attn.kv_a_proj_with_mqa.weight")) {
       this.loadMlaWeight(name, meta, st, mmapPtr);
       return;
     }
@@ -563,8 +565,8 @@ export class Glm51Model extends ChatModel {
       using sin = rotaryEmbedding.result.sin;
       rotaryEmbedding.streamWaitEvent();
       using qAbsorbedR = qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-      using qPeR = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim);
-      using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1);
+      using qPeR = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
+      using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave);
       using kPeFull = kPeRope.all(ws);
       state.mlaKvCacheAppend(ckvNormed, kPeFull, layerIdx, kvLoraRank, qkRopeDim);
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
@@ -585,8 +587,8 @@ export class Glm51Model extends ChatModel {
       rotaryEmbedding.streamWaitEvent();
 
       using qAbsorbedR = qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-      using qPeFinal = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim);
-      using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1);
+      using qPeFinal = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
+      using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave);
       using kPeFull = kPeRope.all(ws);
 
       state.mlaKvCacheAppend(ckvNormed, kPeFull, layerIdx, kvLoraRank, qkRopeDim);

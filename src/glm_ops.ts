@@ -49,13 +49,13 @@ interface NativeAddon {
   d2h(ctx: number, dst: Buffer, src: number, size: number): void;
   rmsnorm(ctx: number, out: number, input: number, weight: number, eps: number, dim: number, batch: number): void;
   fusedAddRmsnorm(ctx: number, out: number, residual: number, inputA: number, inputB: number, weight: number, eps: number, dim: number, batch: number): void;
-  fusedNormRope(ctx: number, out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void;
+  fusedNormRope(ctx: number, out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
   linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number): void;
   embedding(ctx: number, out: number, table: number, ids: number, hidden: number, seqLen: number): void;
   fill(ctx: number, out: number, value: number, n: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
-  applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
+  applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number): void;
   gather(ctx: number, out: number, input: number, indices: number, k: number, inDim: number, batch: number, elemSize: number): void;
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
@@ -100,7 +100,7 @@ interface NativeAddon {
   sampleBatch(ctx: number, outTokens: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, penaltyCount: number, maxWindow: number, vocabSize: number, batchSize: number, temperatures: number, repPenalties: number, presPenalties: number, topKs: number, topPs: number, stepCounter: number, maxEffectiveK: number): void;
   memcpy2d(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void;
   bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number): void;
-  ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number): void;
+  ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): void;
   ncclUniqueId(outId: Buffer): void;
   ncclGroupStart(): void;
@@ -127,7 +127,7 @@ interface NativeAddon {
   mulBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
   maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void;
-  applyRotaryPosEmbPartial(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): void;
+  applyRotaryPosEmbPartial(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
   rowScaleAdd(ctx: number, out: number, input: number, scales: number, rows: number, dim: number): void;
   reduceSum(ctx: number, out: number, input: number, rows: number, cols: number): void;
   rowNormalize(ctx: number, out: number, input: number, scale: number, rows: number, cols: number, normalize: boolean): void;
@@ -213,10 +213,10 @@ export class GlmTensor extends Tensor {
     return { normed, residual };
   }
 
-  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
     super.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
     const out = this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
-    getNativeAddon().fusedNormRope(this.glm.ctx, out.data, this.data, weight.data, cos.data, sin.data, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
+    getNativeAddon().fusedNormRope(this.glm.ctx, out.data, this.data, weight.data, cos.data, sin.data, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim, interleaved ?? false);
     return out;
   }
 
@@ -337,16 +337,16 @@ export class GlmTensor extends Tensor {
     return { cos, sin };
   }
 
-  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
     super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride);
     const out = this.workspace.alloc([batch * seqLen, nHeads, headDim], this.type);
-    getNativeAddon().ropeTranspose(this.glm.ctx, out.data, this.data, ropeDim > 0 ? cos.data : 0, ropeDim > 0 ? sin.data : 0, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim);
+    getNativeAddon().ropeTranspose(this.glm.ctx, out.data, this.data, ropeDim > 0 ? cos.data : 0, ropeDim > 0 ? sin.data : 0, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim, interleaved ?? false);
     return out;
   }
 
-  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
     const out = this.workspace.alloc(this.shape, this.type);
-    getNativeAddon().applyRotaryPosEmb(this.glm.ctx, out.data, this.data, cos.data, sin.data, ropeDim, nHeads, seqLen, batch, unsqueezeDim);
+    getNativeAddon().applyRotaryPosEmb(this.glm.ctx, out.data, this.data, cos.data, sin.data, ropeDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false);
     return out;
   }
 
@@ -413,9 +413,9 @@ export class GlmTensor extends Tensor {
     getNativeAddon().maskedFill(this.glm.ctx, this.data, this.data, mask.data, value, n);
   }
 
-  applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+  applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
     const out = this.workspace.alloc(this.shape, this.type);
-    getNativeAddon().applyRotaryPosEmbPartial(this.glm.ctx, out.data, this.data, cos.data, sin.data, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim);
+    getNativeAddon().applyRotaryPosEmbPartial(this.glm.ctx, out.data, this.data, cos.data, sin.data, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false);
     return out;
   }
 

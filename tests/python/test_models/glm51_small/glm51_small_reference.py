@@ -36,6 +36,40 @@ def apply_rotary_pos_emb(x, cos, sin, unsqueeze_dim=1):
     return (x * cos) + (rotate_half(x) * sin)
 
 
+def rotate_half_interleaved(x):
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    interleaved = torch.stack((-x2, x1), dim=-1)
+    return interleaved.reshape(x.shape)
+
+
+def apply_rotary_pos_emb_interleaved(x, cos, sin, unsqueeze_dim=1):
+    dim_half = cos.shape[-1] // 2
+    cos_half = cos[..., :dim_half].unsqueeze(unsqueeze_dim)
+    sin_half = sin[..., :dim_half].unsqueeze(unsqueeze_dim)
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    o1 = x1.float() * cos_half.float() - x2.float() * sin_half.float()
+    o2 = x2.float() * cos_half.float() + x1.float() * sin_half.float()
+    return torch.stack((o1, o2), dim=-1).flatten(-2).to(x.dtype)
+
+
+def apply_interleaved_rope(x, cos, sin):
+    dim_half = cos.shape[-1] // 2
+    cos_half = cos[..., :dim_half]
+    sin_half = sin[..., :dim_half]
+    x1 = x[..., 0::2].float()
+    x2 = x[..., 1::2].float()
+    c = cos_half.float()
+    s = sin_half.float()
+    while c.ndim < x1.ndim:
+        c = c.unsqueeze(0)
+        s = s.unsqueeze(0)
+    o1 = x1 * c - x2 * s
+    o2 = x2 * c + x1 * s
+    return torch.stack((o1, o2), dim=-1).flatten(-2).to(x.dtype)
+
+
 def make_rotary_embed(dim_half, seq_len, theta=1000000.0, device="cpu", batch_size=1):
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim_half * 2, 2, dtype=torch.float32, device=device) / (dim_half * 2)))
     positions = torch.arange(seq_len, dtype=torch.float32, device=device)
@@ -72,7 +106,7 @@ class MLAAttention:
         q_resid = rms_norm(F.linear(hidden_states, self.q_a_proj_w), self.q_a_layernorm_w)
         query = F.linear(q_resid, self.q_b_proj_w).view(B, S, self.num_heads, self.qk_head_dim).transpose(1, 2)
         q_nope, q_pe = query.split([self.qk_nope_dim, self.qk_rope_dim], dim=-1)
-        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=1)
+        q_pe = apply_rotary_pos_emb_interleaved(q_pe, cos, sin, unsqueeze_dim=1)
 
         compressed = F.linear(hidden_states, self.kv_a_proj_w)
         k_compressed, k_pe = compressed.split([self.kv_lora_rank, self.qk_rope_dim], dim=-1)
@@ -82,7 +116,7 @@ class MLAAttention:
         k_nope = k_nope.transpose(1, 2)
         value = value.transpose(1, 2)
         k_pe = k_pe.view(B, 1, S, self.qk_rope_dim)
-        k_pe = apply_rotary_pos_emb(k_pe, cos, sin, unsqueeze_dim=1)
+        k_pe = apply_rotary_pos_emb_interleaved(k_pe, cos, sin, unsqueeze_dim=1)
         k_pe = k_pe.expand(-1, k_nope.shape[1], -1, -1)
 
         query = torch.cat([q_nope, q_pe], dim=-1)
@@ -109,7 +143,13 @@ class MLAAttention:
         cos_emb = emb.cos().to(ckv.dtype)
         sin_emb = emb.sin().to(ckv.dtype)
 
-        kpe_rope = (kpe * cos_emb.unsqueeze(0)) + (rotate_half(kpe) * sin_emb.unsqueeze(0))
+        kpe_cos_half = cos_emb[:, :dim_half].unsqueeze(0)
+        kpe_sin_half = sin_emb[:, :dim_half].unsqueeze(0)
+        kpe_x1 = kpe[..., 0::2]
+        kpe_x2 = kpe[..., 1::2]
+        kpe_o1 = kpe_x1.float() * kpe_cos_half.float() - kpe_x2.float() * kpe_sin_half.float()
+        kpe_o2 = kpe_x2.float() * kpe_cos_half.float() + kpe_x1.float() * kpe_sin_half.float()
+        kpe_rope = torch.stack((kpe_o1, kpe_o2), dim=-1).flatten(-2).to(kpe.dtype)
 
         q_nope_3d = q_nope_absorbed.reshape(B * H, 1, D_CKV)
         q_pe_3d = q_pe_rope.reshape(B * H, 1, D_KPE)
@@ -121,6 +161,114 @@ class MLAAttention:
         attn = F.softmax(score.float(), dim=-1).to(ckv.dtype)
         output = torch.bmm(attn, ckv_3d)
         return output.reshape(B, H, D_CKV)
+
+    def forward_prefill(self, hidden_states, cos, sin):
+        B, S, _ = hidden_states.shape
+        H = self.num_heads
+        D_CKV = self.kv_lora_rank
+        D_KPE = self.qk_rope_dim
+
+        q_resid = rms_norm(F.linear(hidden_states, self.q_a_proj_w), self.q_a_layernorm_w)
+        query = F.linear(q_resid, self.q_b_proj_w).view(B, S, H, self.qk_head_dim).transpose(1, 2)
+        q_nope, q_pe = query.split([self.qk_nope_dim, self.qk_rope_dim], dim=-1)
+        q_pe = apply_rotary_pos_emb_interleaved(q_pe, cos, sin, unsqueeze_dim=1)
+
+        compressed = F.linear(hidden_states, self.kv_a_proj_w)
+        k_compressed, k_pe = compressed.split([D_CKV, D_KPE], dim=-1)
+        ckv = rms_norm(k_compressed, self.kv_a_layernorm_w)
+        kv_expanded = F.linear(ckv, self.kv_b_proj_w).view(B, S, H, self.qk_nope_dim + self.v_head_dim)
+        k_nope, value = kv_expanded.split([self.qk_nope_dim, self.v_head_dim], dim=-1)
+        k_nope = k_nope.transpose(1, 2)
+        value = value.transpose(1, 2)
+        k_pe = k_pe.view(B, 1, S, D_KPE)
+        k_pe_rope = apply_rotary_pos_emb_interleaved(k_pe, cos, sin, unsqueeze_dim=1)
+        k_pe_expanded = k_pe_rope.expand(-1, k_nope.shape[1], -1, -1)
+
+        query = torch.cat([q_nope, q_pe], dim=-1)
+        key = torch.cat([k_nope, k_pe_expanded], dim=-1)
+        attn_w = (query @ key.transpose(2, 3)) * self.scaling
+        causal_mask = torch.triu(torch.full((S, S), float('-inf'), device=attn_w.device, dtype=attn_w.dtype), diagonal=1)
+        attn_w = attn_w + causal_mask
+        attn_w = F.softmax(attn_w.float(), dim=-1).to(query.dtype)
+        out = (attn_w @ value).transpose(1, 2).reshape(B, S, -1)
+        out = F.linear(out, self.o_proj_w)
+
+        ckv_out = ckv[:, :, :]         # [B, S, D_CKV]
+        kpe_out = k_pe_rope[:, 0, :, :] # [B, S, D_KPE]
+        return out, q_resid, ckv_out.squeeze(0), kpe_out.squeeze(0)
+
+    def forward_decode(self, hidden_state, cos, sin, ckv_cache, kpe_cache, positions):
+        B = 1
+        S = 1
+        H = self.num_heads
+        D_CKV = self.kv_lora_rank
+        D_KPE = self.qk_rope_dim
+        q_lora_rank = self.q_b_proj_w.shape[1]
+
+        q_resid = rms_norm(F.linear(hidden_state, self.q_a_proj_w), self.q_a_layernorm_w)
+
+        q_b = F.linear(q_resid, self.q_b_proj_w).view(B, S, H, self.qk_head_dim)
+        q_nope = q_b[:, :, :, :self.qk_nope_dim]
+        q_pe = q_b[:, :, :, self.qk_nope_dim:]
+        q_pe = apply_rotary_pos_emb_interleaved(q_pe, cos, sin, unsqueeze_dim=1)
+
+        compressed = F.linear(hidden_state, self.kv_a_proj_w)
+        k_compressed, k_pe_new = compressed.split([D_CKV, D_KPE], dim=-1)
+        ckv_new = rms_norm(k_compressed, self.kv_a_layernorm_w)
+        k_pe_new_rope = apply_rotary_pos_emb_interleaved(k_pe_new.view(B, 1, S, D_KPE), cos, sin, unsqueeze_dim=1)
+
+        W_absorbed = self._compute_absorbed_weight()
+        q_nope_absorbed = F.linear(q_resid, W_absorbed).view(B, H, D_CKV)
+
+        all_ckv = torch.cat([ckv_cache, ckv_new.squeeze(1)], dim=0)
+        all_kpe = torch.cat([kpe_cache, k_pe_new_rope.squeeze(1).squeeze(1)], dim=0)
+
+        # MLA attention with pre-rotated kpe (no internal RoPE application)
+        total_S = all_ckv.shape[0]
+        q_nope_3d = q_nope_absorbed.reshape(B * H, 1, D_CKV)
+        q_pe_3d = q_pe.squeeze(2).reshape(B * H, 1, D_KPE)
+        ckv_3d = all_ckv.reshape(B, 1, total_S, D_CKV).expand(B, H, total_S, D_CKV).reshape(B * H, total_S, D_CKV)
+        kpe_3d = all_kpe.reshape(B, 1, total_S, D_KPE).expand(B, H, total_S, D_KPE).reshape(B * H, total_S, D_KPE)
+
+        score = torch.bmm(q_nope_3d, ckv_3d.transpose(1, 2)) + torch.bmm(q_pe_3d, kpe_3d.transpose(1, 2))
+        score = score * self.scaling
+        attn = F.softmax(score.float(), dim=-1).to(ckv_new.dtype)
+        attn_out = torch.bmm(attn, ckv_3d).reshape(B, H, D_CKV)
+
+        # V-expand
+        v_proj_per_head = []
+        for h in range(H):
+            start = h * (self.qk_nope_dim + self.v_head_dim) + self.qk_nope_dim
+            v_proj_per_head.append(self.kv_b_proj_w[start:start + self.v_head_dim, :])
+        v_proj_per_head = torch.stack(v_proj_per_head)
+        v_expanded = torch.einsum('bhd,hvd->bhv', attn_out, v_proj_per_head)
+        out = v_expanded.reshape(B, H * self.v_head_dim).unsqueeze(1)
+        out = F.linear(out, self.o_proj_w).squeeze(1)
+
+        return out, q_resid, ckv_new.squeeze(1), k_pe_new_rope.squeeze(1).squeeze(1)
+
+    def _compute_absorbed_weight(self):
+        H = self.num_heads
+        D_CKV = self.kv_lora_rank
+        q_lora_rank = self.q_b_proj_w.shape[1]
+        qk_nope_dim = self.qk_nope_dim
+        qk_head_dim = self.qk_head_dim
+        v_head_dim = self.v_head_dim
+
+        q_nope_proj = []
+        for h in range(H):
+            start = h * qk_head_dim
+            q_nope_proj.append(self.q_b_proj_w[start:start + qk_nope_dim, :])
+        q_nope_proj = torch.stack(q_nope_proj)  # [H, qk_nope_dim, q_lora_rank]
+
+        k_nope_proj = []
+        for h in range(H):
+            start = h * (qk_nope_dim + v_head_dim)
+            k_nope_proj.append(self.kv_b_proj_w[start:start + qk_nope_dim, :])
+        k_nope_proj = torch.stack(k_nope_proj)  # [H, qk_nope_dim, D_CKV]
+
+        W_absorbed = torch.bmm(k_nope_proj.transpose(1, 2), q_nope_proj)  # [H, D_CKV, q_lora_rank]
+        return W_absorbed.reshape(H * D_CKV, q_lora_rank)
 
 
 class DenseMLP:
@@ -269,6 +417,24 @@ class Glm51SmallModel:
             logits = F.linear(hidden_states, self.lm_head_w)
         return logits
 
+    def forward_causal(self, input_ids):
+        B, S = input_ids.shape
+        hidden_states = self.embed(input_ids)
+
+        qk_rope_dim = self.cfg["qk_rope_head_dim"]
+        cos, sin = make_rotary_embed(qk_rope_dim // 2, S, device=self.device, batch_size=B)
+        causal_mask = torch.triu(torch.full((S, S), float('-inf'), device=self.device, dtype=hidden_states.dtype), diagonal=1)
+
+        for layer in self.layers:
+            hidden_states = layer.forward(hidden_states, cos, sin, causal_mask)
+
+        hidden_states = rms_norm(hidden_states, self.norm_w)
+        if self.tie_word_embeddings:
+            logits = F.linear(hidden_states, self.embed_tokens_w)
+        else:
+            logits = F.linear(hidden_states, self.lm_head_w)
+        return logits
+
     def forward_hidden_states(self, hidden_states, cos=None, sin=None, attention_mask=None):
         B, S, _ = hidden_states.shape
         if cos is None or sin is None:
@@ -291,3 +457,106 @@ class Glm51SmallModel:
             qk_rope_dim = self.cfg["qk_rope_head_dim"]
             cos, sin = make_rotary_embed(qk_rope_dim // 2, S, device=self.device, batch_size=B)
         return self.layers[layer_idx].forward(hidden_states, cos, sin, attention_mask)
+
+    def forward_prefill(self, input_ids):
+        B, S = input_ids.shape
+        hidden_states = self.embed(input_ids)
+        qk_rope_dim = self.cfg["qk_rope_head_dim"]
+        cos, sin = make_rotary_embed(qk_rope_dim // 2, S, device=self.device, batch_size=B)
+
+        kv_cache = []
+        for i, layer in enumerate(self.layers):
+            residual = hidden_states
+            normed = rms_norm(hidden_states, layer.input_layernorm_w)
+            attn_out, q_resid, ckv, kpe = layer.self_attn.forward_prefill(normed, cos, sin)
+            hidden_states = residual + attn_out
+            residual = hidden_states
+            normed = rms_norm(hidden_states, layer.post_attention_layernorm_w)
+            mlp_out = layer.mlp.forward(normed)
+            hidden_states = residual + mlp_out
+            kv_cache.append((ckv, kpe))
+
+        hidden_states = rms_norm(hidden_states, self.norm_w)
+        if self.tie_word_embeddings:
+            logits = F.linear(hidden_states, self.embed_tokens_w)
+        else:
+            logits = F.linear(hidden_states, self.lm_head_w)
+        return logits, kv_cache
+
+    def forward_decode_step(self, token_id, kv_cache, position):
+        B = 1
+        qk_rope_dim = self.cfg["qk_rope_head_dim"]
+        cos, sin = make_rotary_embed(qk_rope_dim // 2, position + 1, device=self.device, batch_size=B)
+        cos = cos[:, -1:, :]
+        sin = sin[:, -1:, :]
+
+        hidden_state = F.embedding(token_id, self.embed_tokens_w)  # [1, 1, hidden_size]
+
+        new_kv_cache = []
+        for i, layer in enumerate(self.layers):
+            ckv_cache, kpe_cache = kv_cache[i]
+            residual = hidden_state
+            normed = rms_norm(hidden_state, layer.input_layernorm_w)
+            attn_out, q_resid, ckv_new, kpe_new = layer.self_attn.forward_decode(
+                normed, cos, sin, ckv_cache, kpe_cache,
+                torch.arange(position + 1, dtype=torch.int32, device=self.device)
+            )
+            hidden_state = residual + attn_out
+            residual = hidden_state
+            normed = rms_norm(hidden_state, layer.post_attention_layernorm_w)
+            mlp_out = layer.mlp.forward(normed)
+            hidden_state = residual + mlp_out
+            new_kv_cache.append((torch.cat([ckv_cache, ckv_new], dim=0),
+                                  torch.cat([kpe_cache, kpe_new], dim=0)))
+
+        hidden_state = rms_norm(hidden_state, self.norm_w)
+        if self.tie_word_embeddings:
+            logits = F.linear(hidden_state, self.embed_tokens_w)
+        else:
+            logits = F.linear(hidden_state, self.lm_head_w)
+        return logits, new_kv_cache
+
+    def forward_decode_step_with_hidden(self, token_id, kv_cache, position):
+        """Like forward_decode_step but also returns per-layer hidden states."""
+        B = 1
+        qk_rope_dim = self.cfg["qk_rope_head_dim"]
+        cos, sin = make_rotary_embed(qk_rope_dim // 2, position + 1, device=self.device, batch_size=B)
+        cos = cos[:, -1:, :]
+        sin = sin[:, -1:, :]
+
+        hidden_state = F.embedding(token_id, self.embed_tokens_w)
+        hidden_states = [hidden_state[0, 0].float().clone()]
+
+        new_kv_cache = []
+        for i, layer in enumerate(self.layers):
+            ckv_cache, kpe_cache = kv_cache[i]
+            residual = hidden_state
+            normed = rms_norm(hidden_state, layer.input_layernorm_w)
+            attn_out, q_resid, ckv_new, kpe_new = layer.self_attn.forward_decode(
+                normed, cos, sin, ckv_cache, kpe_cache,
+                torch.arange(position + 1, dtype=torch.int32, device=self.device)
+            )
+            hidden_state = residual + attn_out
+            residual = hidden_state
+            normed = rms_norm(hidden_state, layer.post_attention_layernorm_w)
+            mlp_out = layer.mlp.forward(normed)
+            hidden_state = residual + mlp_out
+            hidden_states.append(hidden_state[0, 0].float().clone())
+            new_kv_cache.append((torch.cat([ckv_cache, ckv_new], dim=0),
+                                  torch.cat([kpe_cache, kpe_new], dim=0)))
+
+        hidden_state = rms_norm(hidden_state, self.norm_w)
+        if self.tie_word_embeddings:
+            logits = F.linear(hidden_state, self.embed_tokens_w)
+        else:
+            logits = F.linear(hidden_state, self.lm_head_w)
+        return logits, new_kv_cache, hidden_states
+
+    def greedy_decode(self, input_ids, max_new_tokens=10):
+        logits, kv_cache = self.forward_prefill(input_ids)
+        tokens = [logits[0, -1].argmax().item()]
+        for i in range(max_new_tokens - 1):
+            token_tensor = torch.tensor([[tokens[-1]]], device=self.device)
+            logits, kv_cache = self.forward_decode_step(token_tensor, kv_cache, len(tokens) - 1 + input_ids.shape[1])
+            tokens.append(logits[0, -1].argmax().item())
+        return tokens

@@ -125,7 +125,7 @@ static Napi::Value FusedAddRmsnorm(const Napi::CallbackInfo& info) {
 static Napi::Value FusedNormRope(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 13) {
-        Napi::TypeError::New(env, "Expected (ctx, out, in, weight, cos, sin, eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, out, in, weight, cos, sin, eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride[, interleaved])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -141,13 +141,14 @@ static Napi::Value FusedNormRope(const Napi::CallbackInfo& info) {
     int seq_len = info[10].As<Napi::Number>().Int32Value();
     int batch = info[11].As<Napi::Number>().Int32Value();
     int in_stride = info[12].As<Napi::Number>().Int32Value();
+    bool interleaved = info.Length() > 13 ? info[13].As<Napi::Boolean>().Value() : false;
     glm_fused_norm_rope(reinterpret_cast<GlmCtx*>(ctx_ptr),
                          reinterpret_cast<void*>(out_ptr),
                          reinterpret_cast<const void*>(in_ptr),
                          reinterpret_cast<const void*>(wt_ptr),
                          reinterpret_cast<const void*>(cos_ptr),
                          reinterpret_cast<const void*>(sin_ptr),
-                         eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
+                         eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved);
     return env.Undefined();
 }
 
@@ -445,7 +446,7 @@ static Napi::Value RotaryEmbedding(const Napi::CallbackInfo& info) {
 static Napi::Value ApplyRotaryPosEmb(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 10) {
-        Napi::TypeError::New(env, "Expected (ctx, out, x, cos, sin, rope_dim, n_heads, seq_len, batch, unsqueeze_dim)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, out, x, cos, sin, rope_dim, n_heads, seq_len, batch, unsqueeze_dim[, interleaved])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -458,19 +459,20 @@ static Napi::Value ApplyRotaryPosEmb(const Napi::CallbackInfo& info) {
     int seq_len = info[7].As<Napi::Number>().Int32Value();
     int batch = info[8].As<Napi::Number>().Int32Value();
     int unsqueeze_dim = info[9].As<Napi::Number>().Int32Value();
+    bool interleaved = info.Length() > 10 ? info[10].As<Napi::Boolean>().Value() : false;
     glm_apply_rotary_pos_emb(reinterpret_cast<GlmCtx*>(ctx_ptr),
                              reinterpret_cast<void*>(out_ptr),
                              reinterpret_cast<const void*>(x_ptr),
                              reinterpret_cast<const void*>(cos_ptr),
                              reinterpret_cast<const void*>(sin_ptr),
-                             rope_dim, n_heads, seq_len, batch, unsqueeze_dim);
+                             rope_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved);
     return env.Undefined();
 }
 
 static Napi::Value ApplyRotaryPosEmbPartial(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, out, x, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, out, x, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim[, interleaved])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -484,19 +486,20 @@ static Napi::Value ApplyRotaryPosEmbPartial(const Napi::CallbackInfo& info) {
     int seq_len = info[8].As<Napi::Number>().Int32Value();
     int batch = info[9].As<Napi::Number>().Int32Value();
     int unsqueeze_dim = info[10].As<Napi::Number>().Int32Value();
+    bool interleaved = info.Length() > 11 ? info[11].As<Napi::Boolean>().Value() : false;
     glm_apply_rotary_pos_emb_partial(reinterpret_cast<GlmCtx*>(ctx_ptr),
                                       reinterpret_cast<void*>(out_ptr),
                                       reinterpret_cast<const void*>(x_ptr),
                                       reinterpret_cast<const void*>(cos_ptr),
                                       reinterpret_cast<const void*>(sin_ptr),
-                                      rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim);
+                                      rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved);
     return env.Undefined();
 }
 
 static Napi::Value RopeTranspose(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, out, in, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, in_stride)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, out, in, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, in_stride[, interleaved])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -510,12 +513,13 @@ static Napi::Value RopeTranspose(const Napi::CallbackInfo& info) {
     int seq_len = info[8].As<Napi::Number>().Int32Value();
     int batch = info[9].As<Napi::Number>().Int32Value();
     int in_stride = info[10].As<Napi::Number>().Int32Value();
+    bool interleaved = info.Length() > 11 ? info[11].As<Napi::Boolean>().Value() : false;
     glm_rope_transpose(reinterpret_cast<GlmCtx*>(ctx_ptr),
                         reinterpret_cast<void*>(out_ptr),
                         reinterpret_cast<const void*>(in_ptr),
                         reinterpret_cast<const void*>(cos_ptr),
                         reinterpret_cast<const void*>(sin_ptr),
-                        rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
+                        rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved);
     return env.Undefined();
 }
 

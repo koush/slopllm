@@ -19,6 +19,23 @@ def apply_rotary_pos_emb_torch(x, cos, sin, unsqueeze_dim):
     return (x.float() * cos.float() + rotate_half(x.float()) * sin.float()).to(torch.bfloat16)
 
 
+def apply_rotary_pos_emb_torch_interleaved(x, cos, sin, unsqueeze_dim):
+    dim_half = cos.shape[-1] // 2
+    cos_half = cos[..., :dim_half]
+    sin_half = sin[..., :dim_half]
+    if unsqueeze_dim == 1:
+        cos_half = cos_half.unsqueeze(1)
+        sin_half = sin_half.unsqueeze(1)
+    elif unsqueeze_dim == 2:
+        cos_half = cos_half.unsqueeze(2)
+        sin_half = sin_half.unsqueeze(2)
+    x1 = x[..., 0::2].float()
+    x2 = x[..., 1::2].float()
+    o1 = x1 * cos_half.float() - x2 * sin_half.float()
+    o2 = x2 * cos_half.float() + x1 * sin_half.float()
+    return torch.stack((o1, o2), dim=-1).flatten(-2).to(torch.bfloat16)
+
+
 def indexer_forward_torch(hidden_states, q_resid, cos, sin, attention_mask,
                            wq_b_w, wk_w, k_norm_w, k_norm_b, weights_proj_w,
                            n_heads, head_dim, qk_rope_dim, topk, softmax_scale, eps=1e-6):
@@ -28,7 +45,7 @@ def indexer_forward_torch(hidden_states, q_resid, cos, sin, attention_mask,
     q = torch.nn.functional.linear(q_resid, wq_b_w)
     q = q.view(B, S, n_heads, head_dim)
     q_pe, q_nope = q.split([qk_rope_dim, nope_dim], dim=-1)
-    q_pe = apply_rotary_pos_emb_torch(q_pe, cos, sin, unsqueeze_dim=2)
+    q_pe = apply_rotary_pos_emb_torch_interleaved(q_pe, cos, sin, unsqueeze_dim=2)
     q = torch.cat([q_pe, q_nope], dim=-1)
 
     k = torch.nn.functional.layer_norm(
@@ -36,7 +53,7 @@ def indexer_forward_torch(hidden_states, q_resid, cos, sin, attention_mask,
         [head_dim], k_norm_w.float(), k_norm_b.float(), eps=eps
     ).to(torch.bfloat16)
     k_pe, k_nope = k.split([qk_rope_dim, nope_dim], dim=-1)
-    k_pe = apply_rotary_pos_emb_torch(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)
+    k_pe = apply_rotary_pos_emb_torch_interleaved(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)
     k = torch.cat([k_pe, k_nope], dim=-1)
 
     weights = torch.nn.functional.linear(hidden_states, weights_proj_w)
@@ -69,7 +86,7 @@ def indexer_forward_cuda(glm, device, hidden_states, q_resid, cos, sin, attentio
     q_nope = idx_q[:, :, :, qk_rope_dim:].contiguous()
 
     q_pe_rope = torch.empty_like(q_pe)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe, cos, sin, qk_rope_dim, n_heads, S, B, 2)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe, cos, sin, qk_rope_dim, n_heads, S, B, 2, interleaved=True)
 
     q_out = torch.empty(B * S * n_heads, head_dim, dtype=torch.bfloat16, device=device)
     glm.cat_last_dim(q_out, q_pe_rope.reshape(-1, qk_rope_dim), q_nope.reshape(-1, nope_dim),
@@ -89,7 +106,7 @@ def indexer_forward_cuda(glm, device, hidden_states, q_resid, cos, sin, attentio
 
     k_pe_4d = k_pe.reshape(B, S, 1, qk_rope_dim).contiguous()
     k_pe_rope_4d = torch.empty_like(k_pe_4d)
-    glm.apply_rotary_pos_emb(k_pe_rope_4d, k_pe_4d, cos, sin, qk_rope_dim, 1, S, B, 2)
+    glm.apply_rotary_pos_emb(k_pe_rope_4d, k_pe_4d, cos, sin, qk_rope_dim, 1, S, B, 2, interleaved=True)
     k_pe_rope = k_pe_rope_4d.reshape(B, S, qk_rope_dim)
 
     k_out = torch.empty(B * S, head_dim, dtype=torch.bfloat16, device=device)

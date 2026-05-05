@@ -61,8 +61,8 @@ export class MetaTensor extends Tensor {
         return { normed, residual };
     }
 
-    fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
-        super.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+    fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
+        super.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
         return this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
     }
 
@@ -137,12 +137,12 @@ export class MetaTensor extends Tensor {
         return { cos, sin };
     }
 
-    ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
-        super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+    ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
+        super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
         return this.workspace.alloc([batch * seqLen, nHeads, headDim], this.type);
     }
 
-    applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+    applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
         return this.workspace.alloc(this.shape, this.type);
     }
 
@@ -189,7 +189,7 @@ export class MetaTensor extends Tensor {
     maskedFill(mask: Tensor, value: number, n: number): void {
     }
 
-    applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+    applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
         return this.workspace.alloc(this.shape, this.type);
     }
 

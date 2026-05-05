@@ -28,6 +28,37 @@ def apply_rotary_pos_emb_torch(x, cos, sin, unsqueeze_dim=1):
     return (x * cos) + (rotate_half(x) * sin)
 
 
+def apply_rotary_pos_emb_torch_interleaved(x, cos, sin, unsqueeze_dim=1):
+    dim_half = cos.shape[-1] // 2
+    cos_half = cos[..., :dim_half]
+    sin_half = sin[..., :dim_half]
+    if unsqueeze_dim == 1:
+        cos_half = cos_half.unsqueeze(1)
+        sin_half = sin_half.unsqueeze(1)
+    elif unsqueeze_dim == 2:
+        cos_half = cos_half.unsqueeze(2)
+        sin_half = sin_half.unsqueeze(2)
+    x1 = x[..., 0::2].float()
+    x2 = x[..., 1::2].float()
+    o1 = x1 * cos_half.float() - x2 * sin_half.float()
+    o2 = x2 * cos_half.float() + x1 * sin_half.float()
+    return torch.stack((o1, o2), dim=-1).flatten(-2).to(x.dtype)
+
+
+def _apply_interleaved_rope(x, cos, sin):
+    dim_half = cos.shape[-1] // 2
+    cos_half = cos[..., :dim_half]
+    sin_half = sin[..., :dim_half]
+    while cos_half.ndim < x.ndim:
+        cos_half = cos_half.unsqueeze(0)
+        sin_half = sin_half.unsqueeze(0)
+    x1 = x[..., 0::2].float()
+    x2 = x[..., 1::2].float()
+    o1 = x1 * cos_half.float() - x2 * sin_half.float()
+    o2 = x2 * cos_half.float() + x1 * sin_half.float()
+    return torch.stack((o1, o2), dim=-1).flatten(-2).to(x.dtype)
+
+
 def mla_prefill_reference(q_nope, q_pe_rope, ckv, kpe_rope, sm_scale, causal=True):
     BS, H, D_CKV = q_nope.shape
     S = ckv.shape[1]
@@ -61,12 +92,13 @@ def mla_decode_reference(q_nope_absorbed, q_pe_rope, ckv, kpe, positions, sm_sca
     cos_emb = emb.cos().to(ckv.dtype)
     sin_emb = emb.sin().to(ckv.dtype)
 
-    def rotate_half(x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    kpe_rope = (kpe * cos_emb.unsqueeze(0)) + (rotate_half(kpe) * sin_emb.unsqueeze(0))
+    kpe_cos_half = cos_emb[:, :dim_half].unsqueeze(0)
+    kpe_sin_half = sin_emb[:, :dim_half].unsqueeze(0)
+    kpe_x1 = kpe[..., 0::2].float()
+    kpe_x2 = kpe[..., 1::2].float()
+    kpe_o1 = kpe_x1 * kpe_cos_half.float() - kpe_x2 * kpe_sin_half.float()
+    kpe_o2 = kpe_x2 * kpe_cos_half.float() + kpe_x1 * kpe_sin_half.float()
+    kpe_rope = torch.stack((kpe_o1, kpe_o2), dim=-1).flatten(-2).to(kpe.dtype)
 
     q_nope_3d = q_nope_absorbed.reshape(B * H, 1, D_CKV)
     q_pe_3d = q_pe_rope.reshape(B * H, 1, D_KPE)
@@ -103,12 +135,12 @@ def test_mla_prefill_causal(glm, device):
     cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
     q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
 
     kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
@@ -177,12 +209,12 @@ def test_mla_prefill_noncausal(glm, device):
     cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
     q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
 
     kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
@@ -251,24 +283,19 @@ def test_mla_decode_single(glm, device):
 
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, HEAD_DIM_KPE, 2, dtype=torch.float32, device=device) / HEAD_DIM_KPE))
 
-    def rotate_half(x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
     decode_pos = torch.tensor([S - 1], dtype=torch.float32, device=device)
     freqs_q = torch.outer(decode_pos, inv_freq)
     emb_q = torch.cat([freqs_q, freqs_q], dim=-1)
     cos_q = emb_q.cos().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
     sin_q = emb_q.sin().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
-    q_pe_rope = (q_pe * cos_q) + (rotate_half(q_pe) * sin_q)
+    q_pe_rope = _apply_interleaved_rope(q_pe, cos_q, sin_q)
 
     positions_k = torch.arange(S, dtype=torch.float32, device=device)
     freqs_k = torch.outer(positions_k, inv_freq)
     emb_k = torch.cat([freqs_k, freqs_k], dim=-1)
     cos_k = emb_k.cos().to(torch.bfloat16)
     sin_k = emb_k.sin().to(torch.bfloat16)
-    kpe_rope = (kpe * cos_k) + (rotate_half(kpe) * sin_k)
+    kpe_rope = _apply_interleaved_rope(kpe, cos_k, sin_k)
 
     ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV).contiguous()
     kpe_paged = kpe_rope.reshape(S, PAGE_SIZE, HEAD_DIM_KPE).contiguous()
@@ -329,11 +356,6 @@ def test_mla_decode_batch(glm, device):
 
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, HEAD_DIM_KPE, 2, dtype=torch.float32, device=device) / HEAD_DIM_KPE))
 
-    def rotate_half(x):
-        x1 = x[..., :x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
-
     for b in range(B):
         pos = seq_lens[b]
         decode_pos = torch.tensor([pos - 1], dtype=torch.float32, device=device)
@@ -341,7 +363,7 @@ def test_mla_decode_batch(glm, device):
         emb_q = torch.cat([freqs_q, freqs_q], dim=-1)
         cos_q = emb_q.cos().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
         sin_q = emb_q.sin().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
-        q_pe[b] = (q_pe[b:b+1] * cos_q) + (rotate_half(q_pe[b:b+1]) * sin_q)
+        q_pe[b] = _apply_interleaved_rope(q_pe[b:b+1], cos_q, sin_q)
 
     all_ckv = []
     all_kpe = []
@@ -355,7 +377,7 @@ def test_mla_decode_batch(glm, device):
         emb_k = torch.cat([freqs_k, freqs_k], dim=-1)
         cos_k = emb_k.cos().to(torch.bfloat16)
         sin_k = emb_k.sin().to(torch.bfloat16)
-        kpe_rope = (raw_kpe * cos_k) + (rotate_half(raw_kpe) * sin_k)
+        kpe_rope = _apply_interleaved_rope(raw_kpe, cos_k, sin_k)
         all_kpe.append(kpe_rope)
 
     total_pages = sum(seq_lens)
@@ -464,17 +486,12 @@ def test_mla_decode_with_append(glm, device):
 
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, HEAD_DIM_KPE, 2, dtype=torch.float32, device=device) / HEAD_DIM_KPE))
 
-    def rotate_half(x):
-        x1 = x[..., :x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
-
     positions_k = torch.arange(num_pages, dtype=torch.float32, device=device)
     freqs_k = torch.outer(positions_k, inv_freq)
     emb_k = torch.cat([freqs_k, freqs_k], dim=-1)
     cos_k = emb_k.cos().to(torch.bfloat16)
     sin_k = emb_k.sin().to(torch.bfloat16)
-    kpe_tokens_rope = (kpe_tokens * cos_k) + (rotate_half(kpe_tokens) * sin_k)
+    kpe_tokens_rope = _apply_interleaved_rope(kpe_tokens, cos_k, sin_k)
 
     ckv_cache = torch.zeros(num_pages, PAGE_SIZE, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
     kpe_cache = torch.zeros(num_pages, PAGE_SIZE, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
@@ -502,7 +519,7 @@ def test_mla_decode_with_append(glm, device):
     emb_q = torch.cat([freqs_q, freqs_q], dim=-1)
     cos_q = emb_q.cos().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
     sin_q = emb_q.sin().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
-    q_pe_rope = (q_pe * cos_q) + (rotate_half(q_pe) * sin_q)
+    q_pe_rope = _apply_interleaved_rope(q_pe, cos_q, sin_q)
 
     indptr_h = (ctypes.c_int32 * 2)(0, num_pages)
     float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
@@ -583,12 +600,13 @@ def mla_decode_reference_with_lse(q_nope_absorbed, q_pe_rope, ckv, kpe, position
     cos_emb = emb.cos().to(ckv.dtype)
     sin_emb = emb.sin().to(ckv.dtype)
 
-    def rotate_half(x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    kpe_rope = (kpe * cos_emb.unsqueeze(0)) + (rotate_half(kpe) * sin_emb.unsqueeze(0))
+    kpe_cos_half = cos_emb[:, :dim_half].unsqueeze(0)
+    kpe_sin_half = sin_emb[:, :dim_half].unsqueeze(0)
+    kpe_x1 = kpe[..., 0::2].float()
+    kpe_x2 = kpe[..., 1::2].float()
+    kpe_o1 = kpe_x1 * kpe_cos_half.float() - kpe_x2 * kpe_sin_half.float()
+    kpe_o2 = kpe_x2 * kpe_cos_half.float() + kpe_x1 * kpe_sin_half.float()
+    kpe_rope = torch.stack((kpe_o1, kpe_o2), dim=-1).flatten(-2).to(kpe.dtype)
 
     q_nope_3d = q_nope_absorbed.reshape(B * H, 1, D_CKV)
     q_pe_3d = q_pe_rope.reshape(B * H, 1, D_KPE)
@@ -622,12 +640,12 @@ def test_mla_prefill_lse(glm, device):
     cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
     q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
 
     kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
@@ -700,24 +718,19 @@ def test_mla_decode_lse(glm, device):
 
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, HEAD_DIM_KPE, 2, dtype=torch.float32, device=device) / HEAD_DIM_KPE))
 
-    def rotate_half(x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
     decode_pos = torch.tensor([S - 1], dtype=torch.float32, device=device)
     freqs_q = torch.outer(decode_pos, inv_freq)
     emb_q = torch.cat([freqs_q, freqs_q], dim=-1)
     cos_q = emb_q.cos().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
     sin_q = emb_q.sin().to(torch.bfloat16).reshape(1, 1, HEAD_DIM_KPE)
-    q_pe_rope = (q_pe * cos_q) + (rotate_half(q_pe) * sin_q)
+    q_pe_rope = _apply_interleaved_rope(q_pe, cos_q, sin_q)
 
     positions_k = torch.arange(S, dtype=torch.float32, device=device)
     freqs_k = torch.outer(positions_k, inv_freq)
     emb_k = torch.cat([freqs_k, freqs_k], dim=-1)
     cos_k = emb_k.cos().to(torch.bfloat16)
     sin_k = emb_k.sin().to(torch.bfloat16)
-    kpe_rope = (kpe * cos_k) + (rotate_half(kpe) * sin_k)
+    kpe_rope = _apply_interleaved_rope(kpe, cos_k, sin_k)
 
     ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV).contiguous()
     kpe_paged = kpe_rope.reshape(S, PAGE_SIZE, HEAD_DIM_KPE).contiguous()

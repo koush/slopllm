@@ -501,16 +501,16 @@ export class ParallelTensor extends Tensor {
     return { normed, residual };
   }
 
-  override fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
-    super.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+  override fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
+    super.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
     if (this.parallelism === TensorParallelism.PartialSum) {
       this.allReduce();
-      return this.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+      return this.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
     }
 
     if (this.parallelism === TensorParallelism.Column) {
       const gathered = this.allGather(this.workspace);
-      const result = gathered.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+      const result = gathered.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
       gathered[Symbol.dispose]();
       return result;
     }
@@ -530,7 +530,7 @@ export class ParallelTensor extends Tensor {
       this.assertParallel("fusedNormRope sin", pSin, TensorParallelism.Replicated);
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.shards[i].fusedNormRope(pWeight.shards[i], pCos.shards[i], pSin.shards[i], eps, ropeDim, headDim, shardNHeads, seqLen, batch, shardInStride));
+        shards.push(this.shards[i].fusedNormRope(pWeight.shards[i], pCos.shards[i], pSin.shards[i], eps, ropeDim, headDim, shardNHeads, seqLen, batch, shardInStride, interleaved));
       }
       return this.parallelOps.wrapShards(this.workspace, shards, [batch, nHeads, seqLen, headDim], this.type, TensorParallelism.Row);
     }
@@ -542,7 +542,7 @@ export class ParallelTensor extends Tensor {
 
     const shards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      shards.push(this.shards[i].fusedNormRope(pWeight.shards[i], pCos.shards[i], pSin.shards[i], eps, ropeDim, headDim, nHeads, seqLen, batch, stride));
+      shards.push(this.shards[i].fusedNormRope(pWeight.shards[i], pCos.shards[i], pSin.shards[i], eps, ropeDim, headDim, nHeads, seqLen, batch, stride, interleaved));
     }
     return this.parallelOps.wrapShards(this.workspace, shards, [batch, nHeads, seqLen, headDim], this.type, TensorParallelism.Replicated);
   }
@@ -998,8 +998,8 @@ export class ParallelTensor extends Tensor {
     }
   }
 
-  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
-    super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
+    super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
     const pCos = cos ? cos as ParallelTensor : undefined;
     const pSin = sin ? sin as ParallelTensor : undefined;
     const shardNHeads = (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column)
@@ -1009,13 +1009,13 @@ export class ParallelTensor extends Tensor {
     for (let i = 0; i < this.worldSize; i++) {
       const shardCos = pCos ? pCos.shards[i] : undefined!;
       const shardSin = pSin ? pSin.shards[i] : undefined!;
-      outShards.push(this.shards[i].ropeTranspose(shardCos, shardSin, ropeDim, headDim, shardNHeads, seqLen, batch, inStride ?? headDim));
+      outShards.push(this.shards[i].ropeTranspose(shardCos, shardSin, ropeDim, headDim, shardNHeads, seqLen, batch, inStride ?? headDim, interleaved));
     }
     return this.parallelOps.wrapShards(this.workspace, outShards, [batch * seqLen, nHeads, headDim], this.type, this.parallelism);
   }
 
-  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
-    super.applyRotaryPosEmb(cos, sin, ropeDim, nHeads, seqLen, batch, unsqueezeDim);
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+    super.applyRotaryPosEmb(cos, sin, ropeDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
     const pCos = cos as ParallelTensor;
     const pSin = sin as ParallelTensor;
     const shardNHeads = (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column)
@@ -1023,7 +1023,7 @@ export class ParallelTensor extends Tensor {
       : nHeads;
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      outShards.push(this.shards[i].applyRotaryPosEmb(pCos.shards[i], pSin.shards[i], ropeDim, shardNHeads, seqLen, batch, unsqueezeDim));
+      outShards.push(this.shards[i].applyRotaryPosEmb(pCos.shards[i], pSin.shards[i], ropeDim, shardNHeads, seqLen, batch, unsqueezeDim, interleaved));
     }
     return this.parallelOps.wrapShards(this.workspace, outShards, this.fullShape, this.type, this.parallelism);
   }

@@ -8,6 +8,7 @@
 - **Indexer scoring uses ReLU** (not softmax) on scores before weighted sum
 - **Main attention softmax** operates in float32 for numerical stability, then casts back to BF16
 - **MoE dispatch**: per-expert Python loop (`for i in range(num_experts)`) — same pattern as our CUDA impl
+- **Interleaved RoPE**: Main attention uses interleaved RoPE (`rope_interleave: true`), NOT non-interleaved (Neox-style). HuggingFace `transformers` is wrong here — see GLM-5.1 section below
 - **Rope/nope ordering differs by module**:
   - Main attention: `[nope | pe]` — first qk_nope_dim=192 dims are non-positional, last qk_rope_dim=64 are positional
   - Indexer: `[pe | nope]` — first qk_rope_dim=64 dims are positional, remaining are non-positional
@@ -43,6 +44,14 @@ cd tests/python && pytest -v .
 - GPU: NVIDIA RTX PRO 6000 Blackwell (sm_120), PyTorch nightly required
 - Build with `-gencode arch=compute_120,code=sm_120`
 - **Standard RMSNorm** for all layer norms (input_layernorm, post_attention_layernorm, q_a_layernorm, kv_a_layernorm, model.norm) — do NOT add +1 during loading (unlike Qwen3.5 which uses GemmaRMSNorm)
+- **Interleaved RoPE**: Config has `rope_interleave: true`; our implementation uses interleaved RoPE for main attention. HuggingFace `transformers` library is **wrong** — it uses non-interleaved `rotate_half` despite the config, and `rope_interleave` raises `AttributeError`. Do NOT use HuggingFace output as a reference for GLM-5.1. SGLang and vLLM both confirm interleaved RoPE for this model.
+
+### GLM-5.1 Test Models
+- These models are untrained test models used to validate model loading and architecture. They return garbage output as a result, this is expected.
+- Around 1B in size, same architecture as full model but with less layers.
+- tests/python/test_models/glm51_small/glm51_small_nvfp4
+- tests/python/test_models/glm51_small/glm51_small_bf16
+- **HuggingFace comparison tests are skipped** (`TestHuggingFaceModel`, `TestCudaVsHuggingFace`) because HuggingFace `transformers` uses non-interleaved RoPE for GLM-5.1 despite `rope_interleave=true` in config — outputs diverge and comparison is meaningless
 
 ### Qwen3-0.6B
 - Model: `Qwen/Qwen3-0.6B`, cached at `/mnt/storage/.cache/huggingface/`
@@ -91,6 +100,7 @@ FlashInfer's FA2 CUDA attention kernels are compiled into `libglm_ops.so` (Path 
 
 ## Python Code
 
-- All Python code lives in `tests/python/` — verification only against torch operations and transformers models, not production
+- All Python code lives in `tests/python/` — verification only against torch operations, not production
 - Use `json.load()` for config parsing (no transformers dependency)
 - Use `safetensors.safe_open()` for weight loading
+- **Do NOT use HuggingFace `transformers` as a reference for GLM-5.1** — it uses non-interleaved RoPE despite `rope_interleave=true` in config, producing incorrect output. Use the vendor reference script or SGLang/vLLM instead

@@ -216,9 +216,25 @@ export function* generateStream(
   {
     using firstTokens = ws.forwardPrefill(model, [suffixIds], cache);
     doSample(firstTokens);
-    readSample();
   }
-  // cache.appendTokens(0, [currentToken]);
+
+  // Read the first token synchronously to avoid use-after-free:
+  // sampledLogits.replace() in the decode loop's doSample() would free
+  // the prefill argmax tensor while the async D2H copy may still be in flight.
+  glm.synchronize();
+  const firstTokenArr = sampledLogits.value.readInt32LE();
+  const firstToken = Array.isArray(firstTokenArr) ? firstTokenArr[0] : firstTokenArr;
+  cache.appendTokens(0, [firstToken]);
+  tokenHistory.push(firstToken);
+
+  // Start async D2H copy of the first token (already read, but keeps
+  // gpuSampleResult in sync for the decode loop's prepareInput)
+  gpuSampleResult!.memcpy(sampledLogits.value, sampledLogits.value.bytes, MemcpyKind.DeviceToDevice);
+
+  // Yield the first token before starting decode
+  yield firstToken;
+  if (eosIds.has(firstToken))
+    return;
 
   const useGraph = graphState !== undefined;
   let capturing = false;
@@ -277,18 +293,19 @@ export function* generateStream(
         graphSteps++;
       }
 
-      // sync on the previous token
+      // Start async D2H copy of this decode step's sample result
+      readSample();
+
+      // Wait for the D2H copy to complete
       sampleStream.value.synchronize();
       const currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
-      // kick off next sample read
-      readSample();
 
       execMs += performance.now() - tExec;
       tAfterSync = performance.now();
       cache.appendTokens(0, [currentToken]);
       tokenHistory.push(currentToken);
 
-      // yield previous token
+      // yield token
       yield currentToken;
       if (eosIds.has(currentToken))
         return;
@@ -377,7 +394,7 @@ async function interactiveChat(
       }
 
       messages.push({ role: "user", content: userInput });
-      const inputIds = tokenizeMessages(tokenizer, messages, chatTemplate);
+  const inputIds = tokenizeMessages(tokenizer, messages, chatTemplate);
 
       if (inputIds.length > args.maxSeqLen - args.maxNewTokens) {
         console.log(`Warning: prompt (${inputIds.length} tokens) too long, truncating conversation`);
@@ -526,8 +543,8 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   const modelDir = args.modelDir ?? (args.useGlm51
-    // ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
-    ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
+    ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
+    // ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
     : resolveModelPath(args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO)));
 
   if (args.meta) {

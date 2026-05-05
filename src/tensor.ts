@@ -167,7 +167,7 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
     if (numElements(weight.shape) !== headDim) throw new Error(`fusedNormRope: weight has ${numElements(weight.shape)} elements, expected ${headDim}`);
     if (cos.shape.length !== sin.shape.length) throw new Error(`fusedNormRope: cos ndim ${cos.shape.length} != sin ndim ${sin.shape.length}`);
     for (let i = 0; i < cos.shape.length; i++) {
@@ -271,12 +271,12 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number): Tensor {
+  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
     if (ropeDim > 0 && cos.shape.length !== sin.shape.length) throw new Error(`ropeTranspose: cos ndim ${cos.shape.length} != sin ndim ${sin.shape.length}`);
     return undefined as never;
   }
 
-  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
     return undefined as never;
   }
 
@@ -318,7 +318,7 @@ export abstract class Tensor implements Disposable {
   maskedFill(mask: Tensor, value: number, n: number): void {
   }
 
-  applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number): Tensor {
+  applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
     return undefined as never;
   }
 
