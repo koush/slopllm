@@ -1,4 +1,4 @@
-import { DeviceOps, TensorParallelism } from "./device_ops";
+import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
 import { MemcpyKind, Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
@@ -27,13 +27,22 @@ export class MetaTensor extends Tensor {
     fill(value: number, n: number): void {
     }
 
-    mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: import("./device_ops").StridedMmap): void {
+    mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
+      return Promise.resolve();
+    }
+
+    mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
+      return Promise.resolve();
+    }
+
+    memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void> {
+      return Promise.resolve();
     }
 
     memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {
     }
 
-    memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+    memcpy2d(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
     }
 
     linear(weight: Tensor, batch: number): Tensor {

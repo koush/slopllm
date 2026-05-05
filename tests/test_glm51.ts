@@ -18,7 +18,7 @@ describe("GLM-5.1 small model smoke test", () => {
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
-    model = Glm51Model.fromPretrained(glm, SMALL_MODEL_DIR, 2, 128);
+    model = await Glm51Model.fromPretrained(glm, SMALL_MODEL_DIR, 2, 128);
     ws = new ExecutionWorkspace(glm, 2, 128);
   });
 

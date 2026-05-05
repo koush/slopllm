@@ -1219,7 +1219,102 @@ static Napi::Value MmapOpen(const Napi::CallbackInfo& info) {
     return Napi::Number::New(env, reinterpret_cast<uintptr_t>(ptr));
 }
 
-static Napi::Value MmapLoad(const Napi::CallbackInfo& info) {
+// ---------------------------------------------------------------------------
+// Async H2D workers (mmapLoad, memcpyHostToDevice, memcpy2dHostToDevice)
+// ---------------------------------------------------------------------------
+
+class MmapLoadWorker : public Napi::AsyncWorker {
+public:
+    MmapLoadWorker(Napi::Promise::Deferred deferred, GlmCtx* ctx,
+                   void* gpu_dst, const void* mmap_ptr, uint64_t offset, uint64_t nbytes)
+        : Napi::AsyncWorker(deferred.Env()),
+          deferred_(deferred), ctx_(ctx),
+          gpu_dst_(gpu_dst), mmap_ptr_(mmap_ptr), offset_(offset), nbytes_(nbytes) {}
+
+    void Execute() override {
+        glm_mmap_load(ctx_, gpu_dst_, mmap_ptr_, offset_, nbytes_);
+    }
+
+    void OnOK() override {
+        deferred_.Resolve(Env().Undefined());
+    }
+
+    void OnError(const Napi::Error& error) override {
+        deferred_.Reject(error.Value());
+    }
+
+private:
+    Napi::Promise::Deferred deferred_;
+    GlmCtx* ctx_;
+    void* gpu_dst_;
+    const void* mmap_ptr_;
+    uint64_t offset_;
+    uint64_t nbytes_;
+};
+
+class MemcpyHostToDeviceWorker : public Napi::AsyncWorker {
+public:
+    MemcpyHostToDeviceWorker(Napi::Promise::Deferred deferred, GlmCtx* ctx,
+                             void* dst, const void* src, size_t bytes)
+        : Napi::AsyncWorker(deferred.Env()),
+          deferred_(deferred), ctx_(ctx),
+          dst_(dst), src_(src), bytes_(bytes) {}
+
+    void Execute() override {
+        glm_h2d(ctx_, dst_, src_, bytes_);
+    }
+
+    void OnOK() override {
+        deferred_.Resolve(Env().Undefined());
+    }
+
+    void OnError(const Napi::Error& error) override {
+        deferred_.Reject(error.Value());
+    }
+
+private:
+    Napi::Promise::Deferred deferred_;
+    GlmCtx* ctx_;
+    void* dst_;
+    const void* src_;
+    size_t bytes_;
+};
+
+class Memcpy2dHostToDeviceWorker : public Napi::AsyncWorker {
+public:
+    Memcpy2dHostToDeviceWorker(Napi::Promise::Deferred deferred, GlmCtx* ctx,
+                               void* dst, size_t dpitch, const void* src, size_t spitch,
+                               size_t width, size_t height)
+        : Napi::AsyncWorker(deferred.Env()),
+          deferred_(deferred), ctx_(ctx),
+          dst_(dst), dpitch_(dpitch), src_(src), spitch_(spitch),
+          width_(width), height_(height) {}
+
+    void Execute() override {
+        glm_memcpy2d(ctx_, dst_, dpitch_, src_, spitch_, width_, height_,
+                     cudaMemcpyHostToDevice);
+    }
+
+    void OnOK() override {
+        deferred_.Resolve(Env().Undefined());
+    }
+
+    void OnError(const Napi::Error& error) override {
+        deferred_.Reject(error.Value());
+    }
+
+private:
+    Napi::Promise::Deferred deferred_;
+    GlmCtx* ctx_;
+    void* dst_;
+    size_t dpitch_;
+    const void* src_;
+    size_t spitch_;
+    size_t width_;
+    size_t height_;
+};
+
+static Napi::Value MmapLoadAsync(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 5) {
         Napi::TypeError::New(env, "Expected (ctx, gpu_dst, mmap_ptr, offset, nbytes)").ThrowAsJavaScriptException();
@@ -1230,11 +1325,60 @@ static Napi::Value MmapLoad(const Napi::CallbackInfo& info) {
     uintptr_t mmap_ptr = info[2].As<Napi::Number>().Int64Value();
     uint64_t offset = info[3].As<Napi::Number>().Int64Value();
     uint64_t nbytes = info[4].As<Napi::Number>().Int64Value();
-    glm_mmap_load(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                  reinterpret_cast<void*>(gpu_dst),
-                  reinterpret_cast<const void*>(mmap_ptr),
-                  offset, nbytes);
-    return env.Undefined();
+
+    GlmCtx* ctx = reinterpret_cast<GlmCtx*>(ctx_ptr);
+
+    Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+    auto worker = new MmapLoadWorker(deferred, ctx,
+        reinterpret_cast<void*>(gpu_dst), reinterpret_cast<const void*>(mmap_ptr),
+        offset, nbytes);
+    worker->Queue();
+    return deferred.Promise();
+}
+
+static Napi::Value MemcpyHostToDeviceAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4) {
+        Napi::TypeError::New(env, "Expected (ctx, dst, src, nbytes)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t dst_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t src_ptr = info[2].As<Napi::Number>().Int64Value();
+    size_t bytes = info[3].As<Napi::Number>().Int64Value();
+
+    GlmCtx* ctx = reinterpret_cast<GlmCtx*>(ctx_ptr);
+
+    Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+    auto worker = new MemcpyHostToDeviceWorker(deferred, ctx,
+        reinterpret_cast<void*>(dst_ptr), reinterpret_cast<const void*>(src_ptr), bytes);
+    worker->Queue();
+    return deferred.Promise();
+}
+
+static Napi::Value Memcpy2dHostToDeviceAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (ctx, dst, dpitch, src, spitch, width, height)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t dst_ptr = info[1].As<Napi::Number>().Int64Value();
+    size_t dpitch = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t src_ptr = info[3].As<Napi::Number>().Int64Value();
+    size_t spitch = info[4].As<Napi::Number>().Int64Value();
+    size_t width = info[5].As<Napi::Number>().Int64Value();
+    size_t height = info[6].As<Napi::Number>().Int64Value();
+
+    GlmCtx* ctx = reinterpret_cast<GlmCtx*>(ctx_ptr);
+
+    Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+    auto worker = new Memcpy2dHostToDeviceWorker(deferred, ctx,
+        reinterpret_cast<void*>(dst_ptr), dpitch,
+        reinterpret_cast<const void*>(src_ptr), spitch,
+        width, height);
+    worker->Queue();
+    return deferred.Promise();
 }
 
 static Napi::Value MmapClose(const Napi::CallbackInfo& info) {
@@ -2426,7 +2570,9 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "flashPrefill"), Napi::Function::New(env, FlashPrefill));
     exports.Set(Napi::String::New(env, "flashDecode"), Napi::Function::New(env, FlashDecode));
     exports.Set(Napi::String::New(env, "mmapOpen"), Napi::Function::New(env, MmapOpen));
-    exports.Set(Napi::String::New(env, "mmapLoad"), Napi::Function::New(env, MmapLoad));
+    exports.Set(Napi::String::New(env, "mmapLoadAsync"), Napi::Function::New(env, MmapLoadAsync));
+    exports.Set(Napi::String::New(env, "memcpyHostToDeviceAsync"), Napi::Function::New(env, MemcpyHostToDeviceAsync));
+    exports.Set(Napi::String::New(env, "memcpy2dHostToDeviceAsync"), Napi::Function::New(env, Memcpy2dHostToDeviceAsync));
     exports.Set(Napi::String::New(env, "mmapClose"), Napi::Function::New(env, MmapClose));
     exports.Set(Napi::String::New(env, "allocPinned"), Napi::Function::New(env, AllocPinned));
     exports.Set(Napi::String::New(env, "freePinned"), Napi::Function::New(env, FreePinned));

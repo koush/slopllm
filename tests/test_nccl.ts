@@ -50,7 +50,7 @@ describe("memcpy2d", () => {
     const spitch = cols * elemBytes;
     const dpitch = shardCols * elemBytes;
 
-    srcGpu.memcpy2d(dstGpu.data, dpitch, srcGpu.data + shardOffset * elemBytes, spitch, width, rows, MemcpyKind.DeviceToDevice);
+    dstGpu.memcpy2d(0, dpitch, srcGpu.data + shardOffset * elemBytes, spitch, width, rows, MemcpyKind.DeviceToDevice);
 
     const dstBuf = Buffer.alloc(rows * shardCols * elemBytes);
     dstGpu.d2h(dstBuf, rows * shardCols * elemBytes);
@@ -85,7 +85,7 @@ describe("memcpy2d", () => {
 
     srcGpu.h2d(srcBuf);
     const pitch = cols * elemBytes;
-    srcGpu.memcpy2d(dstGpu.data, pitch, srcGpu.data, pitch, pitch, rows, MemcpyKind.DeviceToDevice);
+    dstGpu.memcpy2d(0, pitch, srcGpu.data, pitch, pitch, rows, MemcpyKind.DeviceToDevice);
 
     const dstBuf = Buffer.alloc(totalBytes);
     dstGpu.d2h(dstBuf, totalBytes);
@@ -121,7 +121,7 @@ describe("memcpy2d", () => {
     const width = shardCols * elemBytes;
 
     dstGpu.memcpy2d(
-      dstGpu.data, dpitch,
+      0, dpitch,
       hostPtr + shardOffset * elemBytes, spitch,
       width, rows, MemcpyKind.HostToDevice
     );

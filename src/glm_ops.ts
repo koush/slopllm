@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { DeviceOps, TensorParallelism } from "./device_ops";
+import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
 import type { SamplingParams } from "./chat_model";
 import { MemcpyKind, Tensor } from "./tensor";
 import { SafeTensorFile } from "./safetensors";
@@ -82,7 +82,9 @@ interface NativeAddon {
   graphDestroy(graph: number): void;
   graphExecDestroy(graphExec: number): void;
   mmapOpen(path: string): number;
-  mmapLoad(ctx: number, gpuDst: number, mmapPtr: number, offset: number, nbytes: number): void;
+  mmapLoadAsync(ctx: number, gpuDst: number, mmapPtr: number, offset: number, nbytes: number): Promise<void>;
+  memcpyHostToDeviceAsync(ctx: number, dst: number, src: number, nbytes: number): Promise<void>;
+  memcpy2dHostToDeviceAsync(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void>;
   mmapClose(mmapPtr: number, size: number): void;
   fp8LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, m: number, n: number, k: number): void;
   nvfp4LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp4Weight: number, weightScale: number, weightScale2: number, m: number, n: number, k: number): void;
@@ -307,12 +309,20 @@ export class GlmTensor extends Tensor {
     getNativeAddon().fill(this.glm.ctx, this.data, value, n);
   }
 
-  mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: import("./device_ops").StridedMmap): void {
+  mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
     if (strided) {
-      getNativeAddon().memcpy2d(this.glm.ctx, this.data + strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height, memcpyKindToNative(MemcpyKind.HostToDevice));
+      return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
     } else {
-      getNativeAddon().mmapLoad(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
+      return this.mmapLoadAsync(mmapPtr, offset, nbytes);
     }
+  }
+
+  mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
+    return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
+  }
+
+  memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void> {
+    return getNativeAddon().memcpy2dHostToDeviceAsync(this.glm.ctx, this.data + dstOffset, dpitch, src, spitch, width, height);
   }
 
   memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {
@@ -324,8 +334,8 @@ export class GlmTensor extends Tensor {
     getNativeAddon().memcpy(this.glm.ctx, this.data, src.data, bytes, memcpyKindToNative(copyKind));
   }
 
-  memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
-    getNativeAddon().memcpy2d(this.glm.ctx, dst, dpitch, src, spitch, width, height, memcpyKindToNative(kind));
+  memcpy2d(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+    getNativeAddon().memcpy2d(this.glm.ctx, this.data + dstOffset, dpitch, src, spitch, width, height, memcpyKindToNative(kind));
   }
 
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {

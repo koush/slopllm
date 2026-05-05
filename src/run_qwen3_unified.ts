@@ -533,10 +533,10 @@ async function main(): Promise<void> {
   if (args.meta) {
     const metaOps = new MetaOps();
     const model: ChatModel = args.useGlm51
-      ? Glm51Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
+      ? await Glm51Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
       : args.useQwen35
-      ? Qwen35Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
-      : Qwen3Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen);
+      ? await Qwen35Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
+      : await Qwen3Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen);
     const loadAllocs = metaOps.totalAllocs;
     const loadBytes = metaOps.totalBytes;
     const loadStats = model.stats();
@@ -571,10 +571,10 @@ async function main(): Promise<void> {
     : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
 
   const model: ChatModel = args.useGlm51
-    ? Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
+    ? await Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
     : args.useQwen35
-    ? Qwen35Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
-    : Qwen3Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen);
+    ? await Qwen35Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
+    : await Qwen3Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen);
 
   if (args.stats) {
     const printWsStats = (label: string, s: ReturnType<WorkspaceBase["stats"]>) => {

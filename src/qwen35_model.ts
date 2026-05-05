@@ -126,11 +126,11 @@ export class Qwen35Model extends ChatModel {
     this.invFreq = this.initInvFreq(ropeDim, config.ropeTheta);
   }
 
-  static fromPretrained(glm: DeviceOps, repoIdOrDir: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Qwen35Model {
+  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Promise<Qwen35Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Qwen35Model(glm, config, maxBatch, maxSeqLen);
-    model.fromPretrained(modelDir);
+    await model.fromPretrained(modelDir);
     return model;
   }
 
@@ -155,7 +155,7 @@ export class Qwen35Model extends ChatModel {
     return TensorParallelism.Replicated;
   }
 
-  protected loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void {
+  protected async loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
     const prefix = Qwen35Model.WEIGHT_PREFIX;
     const par = this.weightParallelism(name);
     const gemmaNormSuffixes = [
@@ -175,7 +175,7 @@ export class Qwen35Model extends ChatModel {
       const tensor = this.alloc(meta.shape, "F32", name, par);
       if (meta.dtype === "F32") {
         const offset = st.dataStart + meta.dataOffsets[0];
-        tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
+        await tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
       } else {
         const rawBytes = st.readTensor(name);
         const f32Arr = new Float32Array(numElements);
@@ -197,9 +197,9 @@ export class Qwen35Model extends ChatModel {
       const bpr = inner * (dtype === "F32" ? 4 : 2);
       const qRows = numHeads * dK;
       const strided: StridedMmap = { srcOffset: 0, dstOffset: 0, srcPitch: bpr, dstPitch: bpr, width: bpr, height: qRows };
-      tensor.mmapLoad(mmapPtr, offset, tensor.bytes, strided);
-      tensor.mmapLoad(mmapPtr, offset, tensor.bytes, { ...strided, srcOffset: qRows * bpr, dstOffset: qRows * bpr, height: numHeads * dK });
-      tensor.mmapLoad(mmapPtr, offset, tensor.bytes, { ...strided, srcOffset: 2 * qRows * bpr, dstOffset: 2 * qRows * bpr, height: numHeads * dV });
+      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes, strided);
+      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes, { ...strided, srcOffset: qRows * bpr, dstOffset: qRows * bpr, height: numHeads * dK });
+      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes, { ...strided, srcOffset: 2 * qRows * bpr, dstOffset: 2 * qRows * bpr, height: numHeads * dV });
     } else if (meta.dtype === "F32") {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
       const tensor = this.alloc(meta.shape, "BF16", name, par);
@@ -224,18 +224,13 @@ export class Qwen35Model extends ChatModel {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name, par);
       const offset = st.dataStart + meta.dataOffsets[0];
-      tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
+      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
 
       if (this.cfg.tieWordEmbeddings && name === `${prefix}embed_tokens.weight` && !this.tensors.has("lm_head.weight")) {
         const lmHead = this.alloc(meta.shape, dtype, "lm_head.weight", TensorParallelism.Column);
-        lmHead.mmapLoad(mmapPtr, offset, lmHead.bytes);
+        await lmHead.mmapLoad(mmapPtr, offset, lmHead.bytes);
       }
     }
-  }
-
-  protected loadWeights(modelDir: string): void {
-    super.loadWeights(modelDir);
-    this.tieEmbeddingToLmHead(`${Qwen35Model.WEIGHT_PREFIX}embed_tokens.weight`);
   }
 
   createGdnState(batchSize = 1): Qwen35GdnState {

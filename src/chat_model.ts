@@ -95,9 +95,9 @@ export abstract class ChatModel extends WorkspaceBase {
     }
   }
 
-  protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void;
+  protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void>;
 
-  protected loadWeights(modelDir: string): void {
+  protected async loadWeights(modelDir: string): Promise<void> {
     const stFiles = fs.readdirSync(modelDir).filter(f => f.endsWith('.safetensors') || f.endsWith('.safetensors.json'));
     const shards: string[] = [];
     if (stFiles.some(f => f === 'model.safetensors')) {
@@ -126,7 +126,7 @@ export abstract class ChatModel extends WorkspaceBase {
     for (const { st, mmapPtr } of openShards) {
       for (const name of st.tensorNames()) {
         console.log('Loading tensor', name);
-        this.loadTensor(name, st.meta(name), st, mmapPtr);
+        await this.loadTensor(name, st.meta(name), st, mmapPtr);
       }
     }
 
@@ -138,8 +138,8 @@ export abstract class ChatModel extends WorkspaceBase {
     }
   }
 
-  protected fromPretrained(modelDir: string): void {
-    this.loadWeights(modelDir);
+  protected async fromPretrained(modelDir: string): Promise<void> {
+    await this.loadWeights(modelDir);
     this.freeze();
   }
 }

@@ -203,8 +203,8 @@ export class ParallelTensor extends Tensor {
 
       for (let i = 0; i < this.devices.length; i++) {
         for (let r = 0; r < this.devices.length; r++) {
-          this.shards[i].memcpy2d(
-            output.shards[i].data + r * shardDim1 * inner * eb,
+          output.shards[i].memcpy2d(
+            r * shardDim1 * inner * eb,
             this.fullShape[1] * inner * eb,
             tempTensors[i].data + r * shardBytes,
             shardDim1 * inner * eb,
@@ -838,60 +838,49 @@ export class ParallelTensor extends Tensor {
     }
   }
 
-  mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): void {
+  async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
     if (strided) {
       if (this.parallelism === TensorParallelism.Replicated || this.parallelism === TensorParallelism.PartialSum) {
-        for (let i = 0; i < this.shards.length; i++) {
-          this.shards[i].memcpy2d(
-            this.shards[i].data + strided.dstOffset, strided.dstPitch,
-            mmapPtr + offset + strided.srcOffset, strided.srcPitch,
-            strided.width, strided.height,
-            MemcpyKind.HostToDevice,
-          );
-        }
+        await Promise.all(this.shards.map(s => s.mmapLoad(mmapPtr, offset, nbytes, strided)));
+        return;
       } else if (this.parallelism === TensorParallelism.Column) {
         const shardHeight = strided.height / this.shards.length;
         const shardDstOffset = Math.trunc(strided.dstOffset * shardHeight / strided.height);
-        for (let i = 0; i < this.shards.length; i++) {
-          const srcOff = strided.srcOffset + i * shardHeight * strided.srcPitch;
-          this.shards[i].memcpy2d(
-            this.shards[i].data + shardDstOffset, strided.dstPitch,
-            mmapPtr + offset + srcOff, strided.srcPitch,
-            strided.width, shardHeight,
-            MemcpyKind.HostToDevice,
-          );
-        }
+        await Promise.all(this.shards.map((s, i) => s.mmapLoad(mmapPtr, offset, nbytes, {
+          srcOffset: strided.srcOffset + i * shardHeight * strided.srcPitch,
+          dstOffset: shardDstOffset,
+          srcPitch: strided.srcPitch,
+          dstPitch: strided.dstPitch,
+          width: strided.width,
+          height: shardHeight,
+        })));
+        return;
       } else if (this.parallelism === TensorParallelism.Row) {
         const shardWidth = strided.width / this.shards.length;
         const shardDstPitch = strided.dstPitch / this.shards.length;
-        for (let i = 0; i < this.shards.length; i++) {
-          const srcOff = strided.srcOffset + i * shardWidth;
-          this.shards[i].memcpy2d(
-            this.shards[i].data + strided.dstOffset, shardDstPitch,
-            mmapPtr + offset + srcOff, strided.srcPitch,
-            shardWidth, strided.height,
-            MemcpyKind.HostToDevice,
-          );
-        }
+        await Promise.all(this.shards.map((s, i) => s.mmapLoad(mmapPtr, offset, nbytes, {
+          srcOffset: strided.srcOffset + i * shardWidth,
+          dstOffset: strided.dstOffset,
+          srcPitch: strided.srcPitch,
+          dstPitch: shardDstPitch,
+          width: shardWidth,
+          height: strided.height,
+        })));
+        return;
       } else {
         throw new Error(`mmapLoad strided: unsupported parallelism ${this.parallelism}`);
       }
-      return;
     }
 
     if (this.parallelism === TensorParallelism.Replicated || this.parallelism === TensorParallelism.PartialSum) {
-      for (let i = 0; i < this.worldSize; i++) {
-        this.shards[i].mmapLoad(mmapPtr, offset, nbytes);
-      }
+      await Promise.all(this.shards.map(s => s.mmapLoad(mmapPtr, offset, nbytes)));
       return;
     }
 
     if (this.parallelism === TensorParallelism.Column) {
       const shardElems = this.shards[0].shape.reduce((a, b) => a * b, 1);
       const shardBytes = shardElems * ParallelTensor.elemBytes(this.type);
-      for (let i = 0; i < this.worldSize; i++) {
-        this.shards[i].mmapLoad(mmapPtr, offset + i * shardBytes, shardBytes);
-      }
+      await Promise.all(this.shards.map((s, i) => s.mmapLoad(mmapPtr, offset + i * shardBytes, shardBytes)));
       return;
     }
 
@@ -903,19 +892,26 @@ export class ParallelTensor extends Tensor {
       const eb = ParallelTensor.elemBytes(this.type);
       const srcPitch = fullDim1 * inner * eb;
       const dstPitch = shardDim1 * inner * eb;
-      const srcBase = mmapPtr + offset;
-      for (let i = 0; i < this.worldSize; i++) {
-        this.shards[i].memcpy2d(
-          this.shards[i].data, dstPitch,
-          srcBase + i * dstPitch, srcPitch,
-          dstPitch, outer,
-          MemcpyKind.HostToDevice,
-        );
-      }
+      await Promise.all(this.shards.map((s, i) => s.mmapLoad(mmapPtr, offset, nbytes, {
+        srcOffset: i * dstPitch,
+        dstOffset: 0,
+        srcPitch,
+        dstPitch,
+        width: dstPitch,
+        height: outer,
+      })));
       return;
     }
 
     throw new Error(`mmapLoad: unsupported parallelism ${this.parallelism}`);
+  }
+
+  mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
+    throw new Error("ParallelTensor.mmapLoadAsync: use mmapLoad instead");
+  }
+
+  memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void> {
+    throw new Error("ParallelTensor.memcpy2dHostToDeviceAsync: use mmapLoad instead");
   }
 
   withPinnedBuffer(fn: (buf: Buffer) => void): void {
@@ -939,7 +935,7 @@ export class ParallelTensor extends Tensor {
     }
   }
 
-  memcpy2d(dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+  memcpy2d(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
     throw new Error("ParallelTensor.memcpy2d: use shard tensors directly");
   }
 

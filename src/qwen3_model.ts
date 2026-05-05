@@ -54,11 +54,11 @@ export class Qwen3Model extends ChatModel {
     this.invFreq = this.initInvFreq(config.headDim, config.ropeTheta);
   }
 
-  static fromPretrained(glm: DeviceOps, repoIdOrDir: string, maxBatch = 1, maxSeqLen = 4096): Qwen3Model {
+  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string, maxBatch = 1, maxSeqLen = 4096): Promise<Qwen3Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Qwen3Model(glm, config, maxBatch, maxSeqLen);
-    model.fromPretrained(modelDir);
+    await model.fromPretrained(modelDir);
     return model;
   }
 
@@ -82,29 +82,24 @@ export class Qwen3Model extends ChatModel {
     return TensorParallelism.Replicated;
   }
 
-  protected loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): void {
+  protected async loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
     const par = this.weightParallelism(name);
 
     if (name.endsWith("_scale_inv")) {
       const tensor = this.alloc(meta.shape, "BF16", name, par);
       const offset = st.dataStart + meta.dataOffsets[0];
-      tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
+      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
     } else {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name, par);
       const offset = st.dataStart + meta.dataOffsets[0];
-      tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
+      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
 
       if (this.cfg.tieWordEmbeddings && name === "model.embed_tokens.weight" && !this.tensors.has("lm_head.weight")) {
         const lmHead = this.alloc(meta.shape, dtype, "lm_head.weight", TensorParallelism.Column);
-        lmHead.mmapLoad(mmapPtr, offset, lmHead.bytes);
+        await lmHead.mmapLoad(mmapPtr, offset, lmHead.bytes);
       }
     }
-  }
-
-  protected loadWeights(modelDir: string): void {
-    super.loadWeights(modelDir);
-    this.tieEmbeddingToLmHead("model.embed_tokens.weight");
   }
 
   createChatCache(maxPages = 256): ChatCache {

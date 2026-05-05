@@ -37,10 +37,10 @@ describe("Qwen3-0.6B-FP8 model", () => {
   let model: Qwen3Model;
   let ws: ExecutionWorkspace;
 
-  before(() => {
+  before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
-    model = Qwen3Model.fromPretrained(glm, FP8_REPO, 1, 64);
+    model = await Qwen3Model.fromPretrained(glm, FP8_REPO, 1, 64);
     ws = new ExecutionWorkspace(glm, 1, 64);
   });
 
@@ -99,9 +99,9 @@ describe("Qwen3-0.6B-FP8 model", () => {
     }
   });
 
-  it("FP8 logits correlate with BF16 logits (cosine sim >= 0.99)", () => {
+  it("FP8 logits correlate with BF16 logits (cosine sim >= 0.99)", async () => {
     const fp8KV = makeKV(model);
-    const bf16Model = Qwen3Model.fromPretrained(glm, BF16_REPO, 1, 64);
+    const bf16Model = await Qwen3Model.fromPretrained(glm, BF16_REPO, 1, 64);
     const bf16Ws = new ExecutionWorkspace(glm, 1, 64);
     const bf16KV = makeKV(bf16Model);
     try {
