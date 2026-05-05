@@ -159,10 +159,13 @@ export class Glm51Model extends ChatModel {
 
   private weightParallelism(name: string): TensorParallelism {
     if (name === "lm_head.weight") return TensorParallelism.Column;
-    if (name === "model.embed_tokens.weight") return TensorParallelism.Row;
+    if (name === "model.embed_tokens.weight") return TensorParallelism.Replicated;
     const pfx = Glm51Model.WEIGHT_PREFIX;
-    if (name.endsWith(".self_attn.q_a_proj.weight") ||
-      name.endsWith(".self_attn.kv_a_proj_with_mqa.weight") ||
+    if (
+      // very small and immediately rmsnorm
+      //name.endsWith(".self_attn.q_a_proj.weight") ||
+      // very small, output goes through kv_a_layernorm, split into replicated ckv/k_pe_proj anyway
+      //name.endsWith(".self_attn.kv_a_proj_with_mqa.weight") ||
       name.endsWith(".mlp.gate_proj.weight") ||
       name.endsWith(".mlp.up_proj.weight") ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight")) ||
@@ -525,7 +528,6 @@ export class Glm51Model extends ChatModel {
     using sharedUpBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.up_proj.weight`)!, BS);
     using sharedSiluBuf = sharedGateBuf.siluAndMul(sharedGateBuf, sharedUpBuf, moeIntermediate, BS);
     using sharedDownBuf = sharedSiluBuf.linear(this.tensors.get(`${pfx}.mlp.shared_experts.down_proj.weight`)!, BS);
-    sharedDownBuf.all(ws);
 
     const result = routedOut.add(sharedDownBuf, BS * hs);
     return result.reshape([BS, hs]);
@@ -569,8 +571,7 @@ export class Glm51Model extends ChatModel {
       using qAbsorbedR = qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
       using qPeR = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
       using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave);
-      using kPeFull = kPeRope.all(ws);
-      state.mlaKvCacheAppend(ckvNormed, kPeFull, layerIdx, kvLoraRank, qkRopeDim);
+      state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else if (useMla && !state.isDecode) {
       using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, qkRopeDim / 2, B, S));
@@ -591,9 +592,8 @@ export class Glm51Model extends ChatModel {
       using qAbsorbedR = qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
       using qPeFinal = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
       using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave);
-      using kPeFull = kPeRope.all(ws);
 
-      state.mlaKvCacheAppend(ckvNormed, kPeFull, layerIdx, kvLoraRank, qkRopeDim);
+      state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
       attnOut.replace(ws.mlaPrefillPaged(qAbsorbedR, qPeFinal, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else {
       throw new Error("GLM-5.1 requires MLA KV cache");

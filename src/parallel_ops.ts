@@ -401,13 +401,32 @@ export class ParallelTensor extends Tensor {
 
   add(other: Tensor, n?: number): Tensor {
     const pOther = other as ParallelTensor;
-    if (this.shape.length === 2 && other.shape.length === 1 && this.shape[1] === other.shape[0]) {
-      const outShards: Tensor[] = [];
-      for (let i = 0; i < this.worldSize; i++) {
-        outShards.push(this.shards[i].add(pOther.shards[i], n));
+
+    if (this.parallelism !== pOther.parallelism) {
+      const partial = this.parallelism === TensorParallelism.PartialSum ? this : pOther.parallelism === TensorParallelism.PartialSum ? pOther : null;
+      const replicated = partial === this ? pOther : this;
+      if (partial !== null) {
+        const outShards: Tensor[] = [];
+        outShards.push(partial.shards[0].add(replicated.shards[0], n));
+        const shardWss = this.parallelOps.getShardWorkspaces(this.workspace);
+        for (let i = 1; i < this.worldSize; i++) {
+          const shard = shardWss[i].alloc(partial.shards[i].shape, partial.type);
+          shard.memcpy(partial.shards[i]);
+          outShards.push(shard);
+        }
+        return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, TensorParallelism.PartialSum);
       }
-      return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
+      if ((this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) && pOther.parallelism === TensorParallelism.Replicated) {
+        using gathered = this.allGather(this.workspace);
+        return gathered.add(pOther, n);
+      }
+      if (this.parallelism === TensorParallelism.Replicated && (pOther.parallelism === TensorParallelism.Row || pOther.parallelism === TensorParallelism.Column)) {
+        using gathered = pOther.allGather(pOther.workspace);
+        return this.add(gathered, n);
+      }
+      throw new Error(`add: unsupported parallelism combination ${this.parallelism} + ${pOther.parallelism}`);
     }
+
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       outShards.push(this.shards[i].add(pOther.shards[i], n));
@@ -434,9 +453,8 @@ export class ParallelTensor extends Tensor {
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
     super.rmsnorm(weight, eps, dim, batch);
     if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
-      const gathered = this.allGather(this.workspace);
+      using gathered = this.allGather(this.workspace);
       const result = gathered.rmsnorm(weight, eps, dim, batch);
-      gathered[Symbol.dispose]();
       return result;
     }
 
@@ -466,10 +484,8 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
-      const gathered = this.allGather(this.workspace);
-      const result = gathered.fusedAddRmsnorm(input, weight, eps, dim, batch);
-      gathered[Symbol.dispose]();
-      return result;
+      using gathered = this.allGather(this.workspace);
+      return gathered.fusedAddRmsnorm(input, weight, eps, dim, batch);
     }
 
     if (pInput.parallelism === TensorParallelism.PartialSum) {
@@ -478,10 +494,8 @@ export class ParallelTensor extends Tensor {
     }
 
     if (pInput.parallelism === TensorParallelism.Row || pInput.parallelism === TensorParallelism.Column) {
-      const gathered = pInput.allGather(pInput.workspace);
-      const result = this.fusedAddRmsnorm(gathered, weight, eps, dim, batch);
-      gathered[Symbol.dispose]();
-      return result;
+      using gathered = pInput.allGather(pInput.workspace);
+      return this.fusedAddRmsnorm(gathered, weight, eps, dim, batch);
     }
 
     const pWeight = weight as ParallelTensor;
@@ -509,10 +523,8 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.Column) {
-      const gathered = this.allGather(this.workspace);
-      const result = gathered.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
-      gathered[Symbol.dispose]();
-      return result;
+      using gathered = this.allGather(this.workspace);
+      return gathered.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
     }
 
     const pWeight = weight as ParallelTensor;
@@ -597,7 +609,7 @@ export class ParallelTensor extends Tensor {
 
   argmax(): Tensor {
     super.argmax();
-    const { indices, values} = this.max();
+    const { indices, values } = this.max();
     values[Symbol.dispose]();
     return indices;
   }
@@ -623,20 +635,16 @@ export class ParallelTensor extends Tensor {
         localIndicesShards.push(indices);
       }
 
-      const allValuesPar = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch, ws], this.type, TensorParallelism.Row);
-      const allIndicesPar = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch, ws], "I32", TensorParallelism.Row);
+      using allValuesPar = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch, ws], this.type, TensorParallelism.Row);
+      using allIndicesPar = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch, ws], "I32", TensorParallelism.Row);
 
-      const allValues = allValuesPar.allGather(this.workspace);
-      const allIndices = allIndicesPar.allGather(this.workspace);
-      allValuesPar[Symbol.dispose]();
-      allIndicesPar[Symbol.dispose]();
+      using allValues = allValuesPar.allGather(this.workspace);
+      using allIndices = allIndicesPar.allGather(this.workspace);
 
       const { values: rankValues, indices: rankIndices } = allValues.max(0);
-      allValues[Symbol.dispose]();
 
-      const gatheredIndices = allIndices.gather(rankIndices, 1, ws, batch);
-      allIndices[Symbol.dispose]();
-      rankIndices[Symbol.dispose]();
+      using _rankIndices = rankIndices;
+      using gatheredIndices = allIndices.gather(rankIndices, 1, ws, batch);
 
       const finalIndices = this.parallelOps.newTensor(this.workspace, [batch], "I32", false, undefined, TensorParallelism.Replicated);
       const pGatheredIndices = gatheredIndices as ParallelTensor;
@@ -644,7 +652,6 @@ export class ParallelTensor extends Tensor {
       for (let i = 0; i < ws; i++) {
         finalIndices.shards[i].memcpy(pGatheredIndices.shards[i], idxBytes);
       }
-      gatheredIndices[Symbol.dispose]();
 
       return { values: rankValues, indices: finalIndices };
     }
@@ -779,7 +786,7 @@ export class ParallelTensor extends Tensor {
     const pWeight = weight as ParallelTensor;
 
     if (this.parallelism === TensorParallelism.Row && pGate.parallelism === TensorParallelism.Row &&
-        pInput.parallelism === TensorParallelism.Row && pWeight.parallelism === TensorParallelism.Replicated) {
+      pInput.parallelism === TensorParallelism.Row && pWeight.parallelism === TensorParallelism.Replicated) {
       const shardBatch = batch / this.worldSize;
       for (let i = 0; i < this.worldSize; i++) {
         this.shards[i].rmsnormGated(pInput.shards[i], pGate.shards[i], pWeight.shards[i], eps, dim, shardBatch);
@@ -796,9 +803,8 @@ export class ParallelTensor extends Tensor {
     }
 
     if (pInput.parallelism === TensorParallelism.Row) {
-      const gathered = pInput.allGather(pInput.workspace);
+      using gathered = pInput.allGather(pInput.workspace);
       this.rmsnormGated(gathered, gate, weight, eps, dim, batch);
-      gathered[Symbol.dispose]();
       return;
     }
 
@@ -1128,9 +1134,8 @@ export class ParallelTensor extends Tensor {
   sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
     const pLogits = logits as ParallelTensor;
     if (pLogits.parallelism === TensorParallelism.Row || pLogits.parallelism === TensorParallelism.Column) {
-      const gathered = pLogits.allGather(pLogits.workspace);
+      using gathered = pLogits.allGather(pLogits.workspace);
       this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, gathered, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
-      gathered[Symbol.dispose]();
       return;
     }
     if (pLogits.parallelism === TensorParallelism.PartialSum) {
@@ -1280,22 +1285,27 @@ export class ParallelOps implements DeviceOps {
    * too large for the P2P group, in which case the caller should NCCL.
    */
   private tryP2PAllReduce(shards: readonly Tensor[], count: number, dtype: number): boolean {
-    if (!this.p2pEnabled) return false;
-    if (dtype !== NCCL_BFLOAT16 && dtype !== NCCL_FLOAT32) return false;
-    if (count > this.p2pMaxElems) return false;
+    if (!this.p2pEnabled)
+      return false;
+    if (dtype !== NCCL_BFLOAT16 && dtype !== NCCL_FLOAT32)
+      return false;
+    if (count > this.p2pMaxElems)
+      return false;
     const group = this.getP2PGroup();
-    if (!group) return false;
+    if (!group)
+      return false;
     const addon = getNativeAddon();
     for (let i = 0; i < this.worldSize; ++i) {
       addon.p2pAllReduce(this.devices[i].ctx, group.instances[i],
-                         shards[i].data, shards[i].data, count, dtype);
+        shards[i].data, shards[i].data, count, dtype);
     }
     return true;
   }
 
   /** Public wrapper used by ParallelTensor.allReduce. */
   doAllReduce(shards: readonly Tensor[], count: number, dtype: number): void {
-    if (this.tryP2PAllReduce(shards, count, dtype)) return;
+    if (this.tryP2PAllReduce(shards, count, dtype))
+      return;
     const addon = getNativeAddon();
     addon.ncclGroupStart();
     for (let i = 0; i < this.worldSize; ++i) {
