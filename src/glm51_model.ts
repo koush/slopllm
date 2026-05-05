@@ -38,6 +38,7 @@ export interface Glm51Config extends CommonModelConfig {
   mlpLayerTypes: string[];
   numDenseMlpLayers: number;
   firstSparseMlpLayer: number;
+  eosTokenIds: number[];
 }
 
 function loadConfig(modelDir: string): Glm51Config {
@@ -83,6 +84,7 @@ function loadConfig(modelDir: string): Glm51Config {
     mlpLayerTypes,
     numDenseMlpLayers,
     firstSparseMlpLayer: firstSparseMlpLayer >= 0 ? firstSparseMlpLayer : numDenseMlpLayers,
+    eosTokenIds: Array.isArray(raw.eos_token_id) ? raw.eos_token_id : [raw.eos_token_id ?? 2],
   };
 }
 
@@ -143,7 +145,7 @@ export class Glm51Model extends ChatModel {
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
-    this.eosIds = new Set(config.vocabSize > 200000 ? [154820, 154827, 154829] : [151645, 151643]);
+    this.eosIds = new Set(config.eosTokenIds);
     this.invFreq = this.initInvFreq(config.qkRopeHeadDim, config.ropeTheta);
   }
 

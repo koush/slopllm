@@ -15,6 +15,7 @@ export type { SamplingParams };
 
 export interface Qwen3Config extends CommonModelConfig {
   attentionBias: boolean;
+  eosTokenIds: number[];
 }
 
 function loadConfig(modelDir: string): Qwen3Config {
@@ -33,11 +34,12 @@ function loadConfig(modelDir: string): Qwen3Config {
     numKeyValueGroups: raw.num_attention_heads / raw.num_key_value_heads,
     scaling: Math.pow(raw.head_dim, -0.5),
     attentionBias: raw.attention_bias ?? false,
+    eosTokenIds: Array.isArray(raw.eos_token_id) ? raw.eos_token_id : [raw.eos_token_id ?? 151645],
   };
 }
 
 export class Qwen3Model extends ChatModel {
-  readonly eosIds = new Set([151645, 151643]);
+  readonly eosIds: Set<number>;
   cfg: Qwen3Config;
   maxBatch: number;
   maxSeqLen: number;
@@ -48,6 +50,7 @@ export class Qwen3Model extends ChatModel {
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
+    this.eosIds = new Set(config.eosTokenIds);
     this.invFreq = this.initInvFreq(config.headDim, config.ropeTheta);
   }
 

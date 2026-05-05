@@ -64,6 +64,7 @@ export interface Qwen35Config extends CommonModelConfig {
   numFullAttnLayers: number;
   numGdnLayers: number;
   fullAttnLayerIndices: number[];
+  eosTokenIds: number[];
 }
 
 function loadConfig(modelDir: string): Qwen35Config {
@@ -74,6 +75,9 @@ function loadConfig(modelDir: string): Qwen35Config {
   const numGdnLayers = layerTypes.filter((t: string) => t === "linear_attention").length;
   const fullAttnLayerIndices = layerTypes.map((t: string, i: number) => t === "full_attention" ? i : -1).filter((i: number) => i >= 0);
   const ropeParams = tc.rope_parameters ?? {};
+  const eosTokenIds = Array.isArray(raw.eos_token_id) ? raw.eos_token_id
+    : Array.isArray(tc.eos_token_id) ? tc.eos_token_id
+    : [raw.eos_token_id ?? tc.eos_token_id ?? 248044];
   return {
     hiddenSize: tc.hidden_size,
     intermediateSize: tc.intermediate_size,
@@ -100,12 +104,13 @@ function loadConfig(modelDir: string): Qwen35Config {
     numFullAttnLayers,
     numGdnLayers,
     fullAttnLayerIndices,
+    eosTokenIds,
   };
 }
 
 export class Qwen35Model extends ChatModel {
   static readonly WEIGHT_PREFIX = "model.language_model.";
-  readonly eosIds = new Set([248044]);
+  readonly eosIds: Set<number>;
   cfg: Qwen35Config;
   maxBatch: number;
   maxSeqLen: number;
@@ -116,6 +121,7 @@ export class Qwen35Model extends ChatModel {
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
+    this.eosIds = new Set(config.eosTokenIds);
     const ropeDim = Math.floor(config.headDim * config.partialRotaryFactor);
     this.invFreq = this.initInvFreq(ropeDim, config.ropeTheta);
   }
