@@ -31,7 +31,6 @@
     "typescript": "^6.0.2"
   },
   "dependencies": {
-    "@huggingface/jinja": "./vendor/huggingface.js/packages/jinja/dist",
     "@huggingface/transformers": "./vendor/transformers.js/packages/transformers",
     "node-addon-api": "^8.7.0"
   }
