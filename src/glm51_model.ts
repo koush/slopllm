@@ -514,11 +514,11 @@ export class Glm51Model extends ChatModel {
       const upWeightPtrs = this.createExpertWeightPtrs(pfx, "up_proj");
       const downWeightPtrs = this.createExpertWeightPtrs(pfx, "down_proj");
 
-      using gateOut = normed.mulMatId(normed, gateWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
-      using upOut = normed.mulMatId(normed, upWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
+      using gateOut = normed.mulMatId(gateWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
+      using upOut = normed.mulMatId(upWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
       using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
 
-      using downOut = siluOut.mulMatId(siluOut, downWeightPtrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
+      using downOut = siluOut.mulMatId(downWeightPtrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
 
       using normalizedWeightsFlat = normalizedWeights.reshape([count]);
       routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIdsBuf, hs, count, BS);

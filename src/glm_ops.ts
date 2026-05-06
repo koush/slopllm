@@ -469,9 +469,9 @@ export class GlmTensor extends Tensor {
     getNativeAddon().expertScale(this.glm.ctx, this.data, weights.data, indices.data, expertId, topK, batch);
   }
 
-  mulMatId(input: Tensor, weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
+  mulMatId(weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
     const out = this.workspace.alloc([count, N], this.type);
-    getNativeAddon().mulMatId(this.glm.ctx, out.data, input.data, weightPtrs.data, expertIds.data, batchIds.data, count, N, K);
+    getNativeAddon().mulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, batchIds.data, count, N, K);
     return out;
   }
 

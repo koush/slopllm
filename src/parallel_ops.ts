@@ -1290,8 +1290,7 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, [BS, nHeads * vHeadDim], this.type, this.parallelism);
   }
 
-  mulMatId(input: Tensor, weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
-    const pInput = input as ParallelTensor;
+  mulMatId(weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
     const pWeightPtrs = weightPtrs as ParallelTensor;
     const pExpertIds = expertIds as ParallelTensor;
     const pBatchIds = batchIds as ParallelTensor;
@@ -1299,7 +1298,7 @@ export class ParallelTensor extends Tensor {
     if (weightPar !== TensorParallelism.Replicated) {
       throw new Error(`mulMatId: weight pointers must be Replicated, got ${weightPar}`);
     }
-    const inputPar = pInput.parallelism;
+    const inputPar = this.parallelism;
     let outN = N, outK = K, outPar: TensorParallelism;
     if (inputPar === TensorParallelism.Replicated) {
       outN = this.parallelOps.shardDim(N, "mulMatId N");
@@ -1312,7 +1311,7 @@ export class ParallelTensor extends Tensor {
     }
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      outShards.push(pInput.shards[i].mulMatId(pInput.shards[i], pWeightPtrs.shards[i], pExpertIds.shards[i], pBatchIds.shards[i], count, outN, outK));
+      outShards.push(this.shards[i].mulMatId(pWeightPtrs.shards[i], pExpertIds.shards[i], pBatchIds.shards[i], count, outN, outK));
     }
     return this.parallelOps.wrapShards(this.workspace, outShards, [count, N], this.type, outPar);
   }
