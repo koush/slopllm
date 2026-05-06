@@ -245,10 +245,10 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
-    super.siluAndMul(gate, up, intermediate, batch);
+  siluAndMul(up: Tensor, intermediate: number, batch: number): Tensor {
+    super.siluAndMul(up, intermediate, batch);
     const out = this.workspace.alloc([batch, intermediate], this.type);
-    getNativeAddon().siluAndMul(this.glm.ctx, out.data, gate.data, up.data, intermediate, batch);
+    getNativeAddon().siluAndMul(this.glm.ctx, out.data, this.data, up.data, intermediate, batch);
     return out;
   }
 

@@ -187,14 +187,14 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
-    if (gate.shape.length !== 2 || gate.shape[0] < batch || gate.shape[1] !== intermediate) {
-      throw new Error(`siluAndMul: gate shape [${gate.shape}] incompatible with batch=${batch}, intermediate=${intermediate}`);
+  siluAndMul(up: Tensor, intermediate: number, batch: number): Tensor {
+    if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== intermediate) {
+      throw new Error(`siluAndMul: gate shape [${this.shape}] incompatible with batch=${batch}, intermediate=${intermediate}`);
     }
     if (up.shape.length !== 2 || up.shape[0] < batch || up.shape[1] !== intermediate) {
       throw new Error(`siluAndMul: up shape [${up.shape}] incompatible with batch=${batch}, intermediate=${intermediate}`);
     }
-    if (gate.type !== up.type) throw new Error(`siluAndMul: gate type ${gate.type} != up type ${up.type}`);
+    if (this.type !== up.type) throw new Error(`siluAndMul: gate type ${this.type} != up type ${up.type}`);
     return undefined as never;
   }
 

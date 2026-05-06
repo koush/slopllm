@@ -70,7 +70,7 @@ export abstract class ChatModel extends WorkspaceBase {
     using upBuf = upStream.result;
     using gateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate_proj.weight`)!, BS);
     upStream.streamWaitEvent();
-    using siluBuf = gateBuf.siluAndMul(gateBuf, upBuf, intermediateSize, BS);
+    using siluBuf = gateBuf.siluAndMul(upBuf, intermediateSize, BS);
     return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
   }
 

@@ -911,7 +911,7 @@ describe("ParallelOps.siluAndMul", () => {
     up.h2d(f32ToBf16Bytes(upF32));
     po.synchronize();
 
-    using out = gate.siluAndMul(gate, up, intermediate, batch);
+    using out = gate.siluAndMul(up, intermediate, batch);
     po.synchronize();
 
     const outBuf = Buffer.alloc(batch * intermediate * 2);
@@ -943,7 +943,7 @@ describe("ParallelOps.siluAndMul", () => {
     up.h2d(f32ToBf16Bytes(upF32));
     po.synchronize();
 
-    using out = gate.siluAndMul(gate, up, intermediate, batch);
+    using out = gate.siluAndMul(up, intermediate, batch);
     po.synchronize();
 
     const outBuf = Buffer.alloc(batch * intermediate * 2);

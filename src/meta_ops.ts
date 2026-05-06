@@ -80,8 +80,8 @@ export class MetaTensor extends Tensor {
         return ids.workspace.alloc([seqLen, hidden], this.type);
     }
 
-    siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
-        super.siluAndMul(gate, up, intermediate, batch);
+    siluAndMul(up: Tensor, intermediate: number, batch: number): Tensor {
+        super.siluAndMul(up, intermediate, batch);
         return this.workspace.alloc([batch, intermediate], this.type);
     }
 

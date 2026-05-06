@@ -744,35 +744,34 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(pIds.workspace, shards, [seqLen, hidden], this.type, TensorParallelism.Replicated);
   }
 
-  override siluAndMul(gate: Tensor, up: Tensor, intermediate: number, batch: number): Tensor {
-    super.siluAndMul(gate, up, intermediate, batch);
-    const pGate = gate as ParallelTensor;
+  override siluAndMul(up: Tensor, intermediate: number, batch: number): Tensor {
+    super.siluAndMul(up, intermediate, batch);
     const pUp = up as ParallelTensor;
 
-    if (pGate.parallelism === pUp.parallelism) {
-      const outPar = pGate.parallelism;
-      const shardIntermediate = pGate.parallelism === TensorParallelism.Row || pGate.parallelism === TensorParallelism.Column
+    if (this.parallelism === pUp.parallelism) {
+      const outPar = this.parallelism;
+      const shardIntermediate = this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column
         ? intermediate / this.worldSize
         : intermediate;
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.shards[i].siluAndMul(pGate.shards[i], pUp.shards[i], shardIntermediate, batch));
+        shards.push(this.shards[i].siluAndMul(pUp.shards[i], shardIntermediate, batch));
       }
       return this.parallelOps.wrapShards(this.workspace, shards, [batch, intermediate], this.type, outPar);
     }
 
-    if (pGate.parallelism === TensorParallelism.PartialSum) {
-      pGate.allReduce();
-      return this.siluAndMul(pGate, up, intermediate, batch);
+    if (this.parallelism === TensorParallelism.PartialSum) {
+      this.allReduce();
+      return this.siluAndMul(up, intermediate, batch);
     }
     if (pUp.parallelism === TensorParallelism.PartialSum) {
       pUp.allReduce();
-      return this.siluAndMul(gate, pUp, intermediate, batch);
+      return this.siluAndMul(pUp, intermediate, batch);
     }
 
-    using gatheredGate = pGate.allGather(pGate.workspace);
+    using gatheredGate = this.allGather(this.workspace);
     using gatheredUp = pUp.allGather(pUp.workspace);
-    return this.siluAndMul(gatheredGate, gatheredUp, intermediate, batch);
+    return gatheredGate.siluAndMul(gatheredUp, intermediate, batch);
   }
 
   arange(start: number, step: number, count: number): void {

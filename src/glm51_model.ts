@@ -500,7 +500,7 @@ export class Glm51Model extends ChatModel {
 
       using gateOut = normed.nvfp4MulMatId(gateWeightPtrs, gateScalePtrs, gateScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
       using upOut = normed.nvfp4MulMatId(upWeightPtrs, upScalePtrs, upScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
-      using siluOut = gateOut.siluAndMul(gateOut, upOut, moeIntermediate, count);
+      using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
 
       using downOut = siluOut.nvfp4MulMatId(downWeightPtrs, downScalePtrs, downScale2Ptrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
 
@@ -516,7 +516,7 @@ export class Glm51Model extends ChatModel {
 
       using gateOut = normed.mulMatId(normed, gateWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
       using upOut = normed.mulMatId(normed, upWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
-      using siluOut = gateOut.siluAndMul(gateOut, upOut, moeIntermediate, count);
+      using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
 
       using downOut = siluOut.mulMatId(siluOut, downWeightPtrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
 
@@ -526,7 +526,7 @@ export class Glm51Model extends ChatModel {
 
     using sharedGateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS);
     using sharedUpBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.up_proj.weight`)!, BS);
-    using sharedSiluBuf = sharedGateBuf.siluAndMul(sharedGateBuf, sharedUpBuf, moeIntermediate, BS);
+    using sharedSiluBuf = sharedGateBuf.siluAndMul(sharedUpBuf, moeIntermediate, BS);
     using sharedDownBuf = sharedSiluBuf.linear(this.tensors.get(`${pfx}.mlp.shared_experts.down_proj.weight`)!, BS);
 
     const result = routedOut.add(sharedDownBuf, BS * hs);
