@@ -223,7 +223,7 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([count, N], this.type);
     }
 
-    nvfp4MulMatId(input: Tensor, weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
+    nvfp4MulMatId(weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
         return this.workspace.alloc([count, N], this.type);
     }
 

@@ -475,9 +475,9 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  nvfp4MulMatId(input: Tensor, weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
+  nvfp4MulMatId(weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
     const out = this.workspace.alloc([count, N], this.type);
-    getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, input.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, batchIds.data, count, N, K);
+    getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, batchIds.data, count, N, K);
     return out;
   }
 

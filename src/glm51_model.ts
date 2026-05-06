@@ -498,11 +498,11 @@ export class Glm51Model extends ChatModel {
       const downScalePtrs = this.createNvfp4ExpertPtrs(pfx, "down_proj", "weight_weight_scale");
       const downScale2Ptrs = this.createNvfp4ExpertPtrs(pfx, "down_proj", "weight_weight_scale_2");
 
-      using gateOut = normed.nvfp4MulMatId(normed, gateWeightPtrs, gateScalePtrs, gateScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
-      using upOut = normed.nvfp4MulMatId(normed, upWeightPtrs, upScalePtrs, upScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
+      using gateOut = normed.nvfp4MulMatId(gateWeightPtrs, gateScalePtrs, gateScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
+      using upOut = normed.nvfp4MulMatId(upWeightPtrs, upScalePtrs, upScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
       using siluOut = gateOut.siluAndMul(gateOut, upOut, moeIntermediate, count);
 
-      using downOut = siluOut.nvfp4MulMatId(siluOut, downWeightPtrs, downScalePtrs, downScale2Ptrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
+      using downOut = siluOut.nvfp4MulMatId(downWeightPtrs, downScalePtrs, downScale2Ptrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
 
       using normalizedWeightsFlat = normalizedWeights.reshape([count]);
       routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIdsBuf, hs, count, BS);
