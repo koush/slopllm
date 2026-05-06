@@ -9,6 +9,7 @@ import { ExecutionState, PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
+import { WorkspaceBase } from "./workspace";
 
 export { ExecutionState as BatchState };
 export type { SamplingParams };
@@ -136,7 +137,6 @@ export class Glm51Model extends ChatModel {
   maxBatch: number;
   maxSeqLen: number;
   invFreq: Tensor;
-  private moeAuxReady = false;
   private readonly pendingKNope = new Map<string, MlaDeferred>();
   private readonly pendingQNope = new Map<string, MlaDeferred>();
 
@@ -332,8 +332,6 @@ export class Glm51Model extends ChatModel {
     await super.loadWeights(modelDir);
 
     this.tieEmbeddingToLmHead("model.embed_tokens.weight");
-
-    this.initMoeAuxBuffers();
   }
 
   createChatCache(maxPages = 256): ChatCache {
@@ -347,22 +345,16 @@ export class Glm51Model extends ChatModel {
     return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
   }
 
-  private initMoeAuxBuffers(): void {
-    if (this.moeAuxReady) return;
-    this.moeAuxReady = true;
-    const cfg = this.cfg;
-    const topK = cfg.numExpertsPerTok;
-
-    const count = this.maxSeqLen * topK;
-    const batchIdsArr = new Int32Array(count);
-    for (let i = 0; i < count; i++) batchIdsArr[i] = Math.floor(i / topK);
-    const batchIdsBuf = this.alloc([count], "I32", "__moe_batch_ids");
-    batchIdsBuf.h2d(Buffer.from(batchIdsArr.buffer));
-
-    const downBatchIdsArr = new Int32Array(count);
-    for (let i = 0; i < count; i++) downBatchIdsArr[i] = i;
-    const downBatchIdsBuf = this.alloc([count], "I32", "__moe_down_batch_ids");
-    downBatchIdsBuf.h2d(Buffer.from(downBatchIdsArr.buffer));
+  private getBatchIds(ws: WorkspaceBase, count: number, topK: number): Tensor {
+    const key = `__moe_batch_ids_top${topK}`;
+    let batchIds = ws.tensors.get(key);
+    if (!batchIds || batchIds.shape[0] < count) {
+      batchIds = ws.alloc([count], "I32", key);
+      const arr = new Int32Array(count);
+      for (let i = 0; i < count; i++) arr[i] = Math.floor(i / topK);
+      batchIds.h2d(Buffer.from(arr.buffer));
+    }
+    return batchIds;
   }
 
   private getExpertWeights(pfx: string, proj: string): Tensor[] {
@@ -430,23 +422,23 @@ export class Glm51Model extends ChatModel {
     using routedOut = ws.alloc([BS, hs], "BF16");
     routedOut.fill(0, BS * hs);
 
-    const batchIdsBuf = this.tensors.get("__moe_batch_ids")!;
-    const downBatchIdsBuf = this.tensors.get("__moe_down_batch_ids")!;
+    const batchIds = this.getBatchIds(ws, count, topK);
+    const downBatchIds = this.getBatchIds(ws, count, 1);
 
     const gateWeights = this.getExpertWeights(pfx, "gate_proj");
     const upWeights = this.getExpertWeights(pfx, "up_proj");
     const downWeights = this.getExpertWeights(pfx, "down_proj");
 
-    using gateOutStream = this.glm.withStream(() => normed.mulMatId(gateWeights, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs, `${pfx}.gate_proj`));
+    using gateOutStream = this.glm.withStream(() => normed.mulMatId(gateWeights, topkIndicesFlat, batchIds, count, moeIntermediate, hs, `${pfx}.gate_proj`));
     using gateOut = gateOutStream.result;
-    using upOut = normed.mulMatId(upWeights, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs, `${pfx}.up_proj`);
+    using upOut = normed.mulMatId(upWeights, topkIndicesFlat, batchIds, count, moeIntermediate, hs, `${pfx}.up_proj`);
     gateOutStream.streamWaitEvent();
     using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
 
-    using downOut = siluOut.mulMatId(downWeights, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate, `${pfx}.down_proj`);
+    using downOut = siluOut.mulMatId(downWeights, topkIndicesFlat, downBatchIds, count, hs, moeIntermediate, `${pfx}.down_proj`);
 
     using normalizedWeightsFlat = normalizedWeights.reshape([count]);
-    routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIdsBuf, hs, count, BS);
+    routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIds, hs, count, BS);
 
     using sharedGateBufStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS));
     using sharedGateBuf = sharedGateBufStream.result;
