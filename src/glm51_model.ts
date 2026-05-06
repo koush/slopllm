@@ -159,7 +159,7 @@ export class Glm51Model extends ChatModel {
 
   private weightParallelism(name: string): TensorParallelism {
     if (name === "lm_head.weight") return TensorParallelism.Column;
-    if (name === "model.embed_tokens.weight") return TensorParallelism.Replicated;
+    if (name === "model.embed_tokens.weight") return TensorParallelism.Row;
     const pfx = Glm51Model.WEIGHT_PREFIX;
     if (
       // very small and immediately rmsnorm
@@ -548,14 +548,42 @@ export class Glm51Model extends ChatModel {
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : totalTokens;
 
-    using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
-    using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps, cfg.qLoraRank, BS);
+    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, qkRopeDim / 2, B, S));
+    using cos = rotaryEmbedding.result.cos;
+    using sin = rotaryEmbedding.result.sin;
 
-    using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!, BS);
-    using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!, BS);
+    using q = this.glm.withStream(() => {
+      using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
+      using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps, cfg.qLoraRank, BS);
+
+      using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!, BS);
+      using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!, BS);
+
+      rotaryEmbedding.streamWaitEvent();
+      using qPeR = this.glm.withStream(() => qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave));
+
+      const qAbsorbedR = state.isDecode
+        ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
+        : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
+
+      qPeR.streamWaitEvent();
+      return {
+        qAbsorbedR,
+        qPeR: qPeR.result,
+      }
+    });
+    
+    using kPeRopeStream = this.glm.withStream(() => {
+      using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!, BS);
+      rotaryEmbedding.streamWaitEvent();
+      return kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave)
+    });
+    using kPeRope = kPeRopeStream.result;
+
+    using qAbsorbedR = q.result.qAbsorbedR;
+    using qPeR = q.result.qPeR;
 
     using ckv = normed.linear(this.tensors.get(`${pfx}.ckv_proj.weight`)!, BS);
-    using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!, BS);
     using ckvNormed = ckv.rmsnorm(this.tensors.get(`${pfx}.kv_a_layernorm.weight`)!, cfg.rmsNormEps, kvLoraRank, BS);
 
     const pagedKV = state.cache.getPagedKV();
@@ -564,20 +592,11 @@ export class Glm51Model extends ChatModel {
     using attnOut = new UsingHolder<Tensor>(undefined!);
 
     if (useMla && state.isDecode) {
-      using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, qkRopeDim / 2, B, S));
-      using cos = rotaryEmbedding.result.cos;
-      using sin = rotaryEmbedding.result.sin;
-      rotaryEmbedding.streamWaitEvent();
-      using qAbsorbedR = qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-      using qPeR = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
-      using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave);
+      kPeRopeStream.streamWaitEvent();
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
+      q.streamWaitEvent();
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else if (useMla && !state.isDecode) {
-      using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, qkRopeDim / 2, B, S));
-      using cos = rotaryEmbedding.result.cos;
-      using sin = rotaryEmbedding.result.sin;
-
       this.glm.mlaPrefillPlan(
         ws.floatWs, 128 * 1024 * 1024,
         ws.intWs, ws.pinnedIntWs, 8 * 1024 * 1024,
@@ -587,14 +606,10 @@ export class Glm51Model extends ChatModel {
         batchSize, nHeads, kvLoraRank, true
       );
 
-      rotaryEmbedding.streamWaitEvent();
-
-      using qAbsorbedR = qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-      using qPeFinal = qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
-      using kPeRope = kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave);
-
+      kPeRopeStream.streamWaitEvent();
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
-      attnOut.replace(ws.mlaPrefillPaged(qAbsorbedR, qPeFinal, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
+      q.streamWaitEvent();
+      attnOut.replace(ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     } else {
       throw new Error("GLM-5.1 requires MLA KV cache");
     }

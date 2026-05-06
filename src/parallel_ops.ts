@@ -147,6 +147,7 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism !== TensorParallelism.PartialSum) {
       throw new Error(`allReduce requires PartialSum tensor, got ${this.parallelism}`);
     }
+    // console.warn(`Performing allReduce on PartialSum tensor with shape [${this.fullShape}] and type ${this.type}, this may be slow`);
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     const dtype = this.parallelOps.ncclDatatype(this.type);
     this.parallelOps.doAllReduce(this.shards, count, dtype);
@@ -168,6 +169,8 @@ export class ParallelTensor extends Tensor {
     if (this.parallelOps.tryP2PAllGather(this.shards, output.shards, count, elemBytes, this.parallelism, this.fullShape)) {
       return output;
     }
+
+    // console.warn(`Falling back to NCCL allGather for parallelism ${this.parallelism}, this may be slow`);
 
     const dtype = this.parallelOps.ncclDatatype(this.type);
     const comms = this.parallelOps.comms;
@@ -1456,7 +1459,7 @@ export class ParallelOps implements DeviceOps {
   readonly comms: number[];
   private readonly shardWorkspaces = new WeakMap<WorkspaceBase, WorkspaceBase[]>();
   /** Lazy-initialized custom one-shot AllReduce group for small messages. */
-  private p2pGroup: P2PAllReduceGroup | null = null;
+  private p2pGroups = new Map<number, P2PAllReduceGroup>();
   /** Max BF16 elements per shard for which P2P AllReduce is used. */
   private readonly p2pMaxElems: number;
   private p2pEnabled: boolean;
@@ -1508,19 +1511,19 @@ export class ParallelOps implements DeviceOps {
   }
 
   /** Get (and lazily create) the P2P AllReduce group sized for small messages. */
-  private getP2PGroup(): P2PAllReduceGroup | null {
+  private getP2PGroup(stream: number): P2PAllReduceGroup | null {
     if (!this.p2pEnabled) return null;
-    if (this.p2pGroup === null) {
+    if (!this.p2pGroups.has(stream)) {
       try {
         // 16 KB per rank covers BF16 [hidden=8192] or F32 [hidden=4096].
-        this.p2pGroup = new P2PAllReduceGroup(this.devices, 16 * 1024);
+        this.p2pGroups.set(stream, new P2PAllReduceGroup(this.devices, 16 * 1024));
       } catch (e) {
         console.warn(`P2P AllReduce group creation failed (${e}); falling back to NCCL`);
         this.p2pEnabled = false;
         return null;
       }
     }
-    return this.p2pGroup;
+    return this.p2pGroups.get(stream) || null;
   }
 
   /**
@@ -1535,7 +1538,7 @@ export class ParallelOps implements DeviceOps {
       return false;
     if (count > this.p2pMaxElems)
       return false;
-    const group = this.getP2PGroup();
+    const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
     if (!group)
       return false;
     const addon = getNativeAddon();
@@ -1565,7 +1568,7 @@ export class ParallelOps implements DeviceOps {
     const shardBytes = count * elemBytes;
     if (shardBytes > 16 * 1024)
       return false;
-    const group = this.getP2PGroup();
+    const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
     if (!group)
       return false;
     const addon = getNativeAddon();
@@ -1617,10 +1620,10 @@ export class ParallelOps implements DeviceOps {
   }
 
   free(): void {
-    if (this.p2pGroup !== null) {
-      this.p2pGroup.free();
-      this.p2pGroup = null;
+    for (const group of this.p2pGroups.values()) {
+      group.free();
     }
+    this.p2pGroups.clear();
     if (this.comms.length > 0) {
       for (const comm of this.comms) {
         getNativeAddon().ncclCommDestroy(comm);
@@ -1750,7 +1753,7 @@ export class ParallelOps implements DeviceOps {
     return {
       [Symbol.dispose]: () => {
         for (let i = 0; i < this.devices.length; i++) {
-          this.devices[i].availableStreams.push(streams[i]!);
+          this.devices[i].disposeStream(streams[i]!);
         }
       },
       streamWaitEvent: () => {

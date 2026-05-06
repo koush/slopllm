@@ -141,19 +141,16 @@ export class Qwen3Model extends ChatModel {
       using vBuf = vStream.result;
 
       using kStream = this.glm.withStream(() => {
-        const kBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS);
+        using kBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS);
 
         if (!i) {
           rotaryEmbedding.streamWaitEvent();
         }
 
-        const kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
+        using kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
         vStream.streamWaitEvent();
         state.kvCacheWrite(kRope, vBuf, i, nKv, hd);
-        return { kBuf, kRope };
       });
-      using _kBuf = kStream.result.kBuf;
-      using _kRope = kStream.result.kRope;
 
       using qBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.q_proj.weight`)!, BS);
       if (!i) {

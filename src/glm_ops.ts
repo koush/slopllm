@@ -147,6 +147,20 @@ export class GlmTensor extends Tensor {
     super(workspace, data, allocSize, shape, type, name, pinned, view);
   }
 
+  dispose() {
+    super[Symbol.dispose]();
+  }
+
+  [Symbol.dispose](): void {
+    // if stream is active, defer disposal until stream switch
+    if (this.glm.currentStream) {
+      this.glm.streamTensors.get(this.glm.currentStream)!.add(this);
+    }
+    else {
+      this.dispose();
+    }
+  }
+
   free(): void {
     if (this.data !== 0) {
       if (this.pinned) {
@@ -533,13 +547,28 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().synchronizeStream(this.ctx, streamIdx);
   }
 
+  streamTensors = new Map<number, Set<GlmTensor>>();
   setStream(streamIdx: number): void {
     getNativeAddon().setStream(this.ctx, streamIdx);
     this.currentStream = streamIdx;
+    if (streamIdx) {
+      this.streamTensors.set(streamIdx, new Set());
+    }
   }
 
   currentStream = 0;
   availableStreams = [1, 2, 3, 4, 5, 6, 7];
+  disposeStream(stream: number) {
+    if (this.availableStreams.includes(stream))
+      throw new Error(`Stream ${stream} already disposed`);
+    this.availableStreams.push(stream);
+    const tensors = this.streamTensors.get(stream);
+    this.streamTensors.delete(stream);
+    for (const tensor of tensors!) {
+      tensor.dispose();
+    }
+  }
+
   withStream<T>(fn: () => T) {
     const stream = this.availableStreams.pop();
     if (stream === undefined)
@@ -548,6 +577,9 @@ export class GlmOps implements DeviceOps {
     // Record event on stream 0 so the alternate stream can wait for
     // all prior work (e.g. rmsnorm output that K/V will read).
     getNativeAddon().eventRecord(this.ctx, currentStream, currentStream);
+    if (this.streamTensors.has(stream)) {
+      throw new Error(`Stream ${stream} already in use`);
+    }
     this.setStream(stream);
     getNativeAddon().streamWaitEvent(this.ctx, stream, currentStream);
     const result = fn();
@@ -556,9 +588,7 @@ export class GlmOps implements DeviceOps {
     this.setStream(currentStream);
     return {
       [Symbol.dispose]: () => {
-        if (this.availableStreams.includes(stream))
-          throw new Error(`Stream ${stream} already disposed`);
-        this.availableStreams.push(stream);
+        this.disposeStream(stream);
       },
       result,
       synchronize: () => {
