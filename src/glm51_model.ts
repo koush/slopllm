@@ -498,8 +498,10 @@ export class Glm51Model extends ChatModel {
       const downScalePtrs = this.createNvfp4ExpertPtrs(pfx, "down_proj", "weight_weight_scale");
       const downScale2Ptrs = this.createNvfp4ExpertPtrs(pfx, "down_proj", "weight_weight_scale_2");
 
-      using gateOut = normed.nvfp4MulMatId(gateWeightPtrs, gateScalePtrs, gateScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
+      using gateOutStream = this.glm.withStream(() => normed.nvfp4MulMatId(gateWeightPtrs, gateScalePtrs, gateScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs));
+      using gateOut = gateOutStream.result;
       using upOut = normed.nvfp4MulMatId(upWeightPtrs, upScalePtrs, upScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
+      gateOutStream.streamWaitEvent();
       using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
 
       using downOut = siluOut.nvfp4MulMatId(downWeightPtrs, downScalePtrs, downScale2Ptrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
@@ -514,8 +516,10 @@ export class Glm51Model extends ChatModel {
       const upWeightPtrs = this.createExpertWeightPtrs(pfx, "up_proj");
       const downWeightPtrs = this.createExpertWeightPtrs(pfx, "down_proj");
 
-      using gateOut = normed.mulMatId(gateWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
+      using gateOutStream = this.glm.withStream(() => normed.mulMatId(gateWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs));
+      using gateOut = gateOutStream.result;
       using upOut = normed.mulMatId(upWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
+      gateOutStream.streamWaitEvent();
       using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
 
       using downOut = siluOut.mulMatId(downWeightPtrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
@@ -524,8 +528,10 @@ export class Glm51Model extends ChatModel {
       routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIdsBuf, hs, count, BS);
     }
 
-    using sharedGateBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS);
+    using sharedGateBufStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS));
+    using sharedGateBuf = sharedGateBufStream.result;
     using sharedUpBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.up_proj.weight`)!, BS);
+    sharedGateBufStream.streamWaitEvent();
     using sharedSiluBuf = sharedGateBuf.siluAndMul(sharedUpBuf, moeIntermediate, BS);
     using sharedDownBuf = sharedSiluBuf.linear(this.tensors.get(`${pfx}.mlp.shared_experts.down_proj.weight`)!, BS);
 

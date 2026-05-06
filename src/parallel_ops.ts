@@ -1349,10 +1349,14 @@ export class ParallelTensor extends Tensor {
     const pScales = scales as ParallelTensor;
     const pBatchIds = batchIds as ParallelTensor;
     if (pInput.parallelism === TensorParallelism.PartialSum) {
-      pInput.allReduce();
-    }
-    for (let i = 0; i < this.worldSize; i++) {
-      this.shards[i].scatterAddRows(pInput.shards[i], pScales.shards[i], pBatchIds.shards[i], dim, count, numRows);
+      for (let i = 0; i < this.worldSize; i++) {
+        this.shards[i].scatterAddRows(pInput.shards[i], pScales.shards[i], pBatchIds.shards[i], dim, count, numRows);
+      }
+      this.parallelism = TensorParallelism.PartialSum;
+    } else {
+      for (let i = 0; i < this.worldSize; i++) {
+        this.shards[i].scatterAddRows(pInput.shards[i], pScales.shards[i], pBatchIds.shards[i], dim, count, numRows);
+      }
     }
   }
 
