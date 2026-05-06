@@ -119,6 +119,8 @@ interface NativeAddon {
   p2pGetFlagPtr(instance: number): number;
   p2pSetPeers(ctx: number, instance: number, dataPtrs: number[], flagPtrs: number[]): void;
   p2pAllReduce(ctx: number, instance: number, in_: number, out: number, count: number, dtype: number): void;
+  p2pAllGather(ctx: number, instance: number, sendbuf: number, recvbuf: number, count: number, dtype: number): void;
+  p2pAllGatherRow(ctx: number, instance: number, sendbuf: number, recvbuf: number, shardCount: number, shardDim1Elems: number, fullDim1Elems: number, outer: number, dtype: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;

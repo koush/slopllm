@@ -303,6 +303,23 @@ void glm_p2p_allreduce(GlmCtx* ctx, GlmP2PInstance* inst,
 
 size_t glm_p2p_max_bytes(GlmP2PInstance* inst);
 
+// Run AllGather (Column layout – contiguous per rank) on this rank's active stream.
+// Each rank contributes `count` elements from sendbuf; recvbuf receives the
+// concatenated result from all ranks (world_size * count elements total).
+void glm_p2p_allgather(GlmCtx* ctx, GlmP2PInstance* inst,
+                        const void* sendbuf, void* recvbuf,
+                        int count, int dtype);
+
+// Run AllGather (Row layout – interleaved) on this rank's active stream.
+// Each rank contributes shard_count elements from sendbuf.
+// Output is written in interleaved layout:
+//   out[row * full_dim1_elems + rank * shard_dim1_elems + j]
+//       = peer_shard[rank][row * shard_dim1_elems + j]
+void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
+                             const void* sendbuf, void* recvbuf,
+                             int shard_count, int shard_dim1_elems,
+                             int full_dim1_elems, int outer, int dtype);
+
 void glm_kv_cache_write(GlmCtx* ctx,
                          void* src_k, void* src_v,
                          void* dst_k, void* dst_v,
