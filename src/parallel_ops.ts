@@ -962,7 +962,8 @@ export class ParallelTensor extends Tensor {
     }
 
     if (pInput.parallelism === TensorParallelism.Column && pGate.parallelism === TensorParallelism.Column &&
-      this.parallelism === TensorParallelism.Column && pWeight.parallelism === TensorParallelism.Replicated) {
+      pWeight.parallelism === TensorParallelism.Replicated &&
+      (this.parallelism === TensorParallelism.Column || this.parallelism === TensorParallelism.Row)) {
       const shardBatch = batch / this.worldSize;
       for (let i = 0; i < this.worldSize; i++) {
         this.shards[i].rmsnormGated(pInput.shards[i], pGate.shards[i], pWeight.shards[i], eps, dim, shardBatch);
