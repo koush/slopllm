@@ -341,11 +341,7 @@ export abstract class Tensor implements Disposable {
   expertScale(weights: Tensor, indices: Tensor, expertId: number, topK: number, batch: number): void {
   }
 
-  mulMatId(weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
-    return undefined as never;
-  }
-
-  nvfp4MulMatId(weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
+  mulMatId(weights: Tensor[], expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number, name: string): Tensor {
     return undefined as never;
   }
 

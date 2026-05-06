@@ -219,11 +219,7 @@ export class MetaTensor extends Tensor {
     expertScale(weights: Tensor, indices: Tensor, expertId: number, topK: number, batch: number): void {
     }
 
-    mulMatId(weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
-        return this.workspace.alloc([count, N], this.type);
-    }
-
-    nvfp4MulMatId(weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
+    mulMatId(weights: Tensor[], expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number, name: string): Tensor {
         return this.workspace.alloc([count, N], this.type);
     }
 

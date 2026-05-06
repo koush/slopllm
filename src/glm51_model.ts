@@ -351,40 +351,7 @@ export class Glm51Model extends ChatModel {
     if (this.moeAuxReady) return;
     this.moeAuxReady = true;
     const cfg = this.cfg;
-    const numExperts = cfg.nRoutedExperts;
     const topK = cfg.numExpertsPerTok;
-
-    for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const pfx = `${Glm51Model.WEIGHT_PREFIX}${i}`;
-      if (!this.tensors.has(`${pfx}.mlp.experts.0.gate_proj.weight`)) continue;
-
-      const isNvfp4 = this.tensors.get(`${pfx}.mlp.experts.0.gate_proj.weight`)?.type === "U8";
-
-      for (const proj of ["gate_proj", "up_proj", "down_proj"]) {
-        const experts: Tensor[] = [];
-        for (let e = 0; e < numExperts; e++) {
-          experts.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight`)!);
-        }
-        const name = `__moe_ptrs.${pfx}.${proj}`;
-        const buf = this.alloc([numExperts], "I64", name);
-        buf.writePointers(experts);
-
-        if (isNvfp4) {
-          const scaleExperts: Tensor[] = [];
-          const scale2Experts: Tensor[] = [];
-          for (let e = 0; e < numExperts; e++) {
-            scaleExperts.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight_weight_scale`)!);
-            scale2Experts.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight_weight_scale_2`)!);
-          }
-          const scaleName = `__moe_nvfp4_ptrs.${pfx}.${proj}.weight_weight_scale`;
-          const scale2Name = `__moe_nvfp4_ptrs.${pfx}.${proj}.weight_weight_scale_2`;
-          const scaleBuf = this.alloc([numExperts], "I64", scaleName);
-          scaleBuf.writePointers(scaleExperts);
-          const scale2Buf = this.alloc([numExperts], "I64", scale2Name);
-          scale2Buf.writePointers(scale2Experts);
-        }
-      }
-    }
 
     const count = this.maxSeqLen * topK;
     const batchIdsArr = new Int32Array(count);
@@ -398,32 +365,13 @@ export class Glm51Model extends ChatModel {
     downBatchIdsBuf.h2d(Buffer.from(downBatchIdsArr.buffer));
   }
 
-  private createExpertWeightPtrs(pfx: string, projection: string): Tensor {
-    const name = `__moe_ptrs.${pfx}.${projection}`;
-    const existing = this.tensors.get(name);
-    if (existing) return existing;
+  private getExpertWeights(pfx: string, proj: string): Tensor[] {
     const numExperts = this.cfg.nRoutedExperts;
-    const experts: Tensor[] = [];
+    const weights: Tensor[] = [];
     for (let e = 0; e < numExperts; e++) {
-      experts.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${projection}.weight`)!);
+      weights.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${proj}.weight`)!);
     }
-    const buf = this.alloc([numExperts], "I64", name);
-    buf.writePointers(experts);
-    return buf;
-  }
-
-  private createNvfp4ExpertPtrs(pfx: string, projection: string, suffix: string): Tensor {
-    const name = `__moe_nvfp4_ptrs.${pfx}.${projection}.${suffix}`;
-    const existing = this.tensors.get(name);
-    if (existing) return existing;
-    const numExperts = this.cfg.nRoutedExperts;
-    const experts: Tensor[] = [];
-    for (let e = 0; e < numExperts; e++) {
-      experts.push(this.tensors.get(`${pfx}.mlp.experts.${e}.${projection}.${suffix}`)!);
-    }
-    const buf = this.alloc([numExperts], "I64", name);
-    buf.writePointers(experts);
-    return buf;
+    return weights;
   }
 
   private mlpSparse(normed: Tensor, pfx: string, BS: number): Tensor {
@@ -436,8 +384,6 @@ export class Glm51Model extends ChatModel {
     const hs = cfg.hiddenSize;
     const expertsPerGroup = numExperts / nGroup;
     const ws = normed.workspace;
-
-    const isNvfp4 = this.tensors.get(`${pfx}.mlp.experts.0.gate_proj.weight`)?.type === "U8";
 
     using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!, BS);
     using gateSigmoid = gateLogitsBuf.sigmoid();
@@ -484,49 +430,23 @@ export class Glm51Model extends ChatModel {
     using routedOut = ws.alloc([BS, hs], "BF16");
     routedOut.fill(0, BS * hs);
 
-    if (isNvfp4) {
-      const batchIdsBuf = this.tensors.get("__moe_batch_ids")!;
-      const downBatchIdsBuf = this.tensors.get("__moe_down_batch_ids")!;
+    const batchIdsBuf = this.tensors.get("__moe_batch_ids")!;
+    const downBatchIdsBuf = this.tensors.get("__moe_down_batch_ids")!;
 
-      const gateWeightPtrs = this.createExpertWeightPtrs(pfx, "gate_proj");
-      const gateScalePtrs = this.createNvfp4ExpertPtrs(pfx, "gate_proj", "weight_weight_scale");
-      const gateScale2Ptrs = this.createNvfp4ExpertPtrs(pfx, "gate_proj", "weight_weight_scale_2");
-      const upWeightPtrs = this.createExpertWeightPtrs(pfx, "up_proj");
-      const upScalePtrs = this.createNvfp4ExpertPtrs(pfx, "up_proj", "weight_weight_scale");
-      const upScale2Ptrs = this.createNvfp4ExpertPtrs(pfx, "up_proj", "weight_weight_scale_2");
-      const downWeightPtrs = this.createExpertWeightPtrs(pfx, "down_proj");
-      const downScalePtrs = this.createNvfp4ExpertPtrs(pfx, "down_proj", "weight_weight_scale");
-      const downScale2Ptrs = this.createNvfp4ExpertPtrs(pfx, "down_proj", "weight_weight_scale_2");
+    const gateWeights = this.getExpertWeights(pfx, "gate_proj");
+    const upWeights = this.getExpertWeights(pfx, "up_proj");
+    const downWeights = this.getExpertWeights(pfx, "down_proj");
 
-      using gateOutStream = this.glm.withStream(() => normed.nvfp4MulMatId(gateWeightPtrs, gateScalePtrs, gateScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs));
-      using gateOut = gateOutStream.result;
-      using upOut = normed.nvfp4MulMatId(upWeightPtrs, upScalePtrs, upScale2Ptrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
-      gateOutStream.streamWaitEvent();
-      using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
+    using gateOutStream = this.glm.withStream(() => normed.mulMatId(gateWeights, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs, `${pfx}.gate_proj`));
+    using gateOut = gateOutStream.result;
+    using upOut = normed.mulMatId(upWeights, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs, `${pfx}.up_proj`);
+    gateOutStream.streamWaitEvent();
+    using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
 
-      using downOut = siluOut.nvfp4MulMatId(downWeightPtrs, downScalePtrs, downScale2Ptrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
+    using downOut = siluOut.mulMatId(downWeights, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate, `${pfx}.down_proj`);
 
-      using normalizedWeightsFlat = normalizedWeights.reshape([count]);
-      routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIdsBuf, hs, count, BS);
-    } else {
-      const batchIdsBuf = this.tensors.get("__moe_batch_ids")!;
-      const downBatchIdsBuf = this.tensors.get("__moe_down_batch_ids")!;
-
-      const gateWeightPtrs = this.createExpertWeightPtrs(pfx, "gate_proj");
-      const upWeightPtrs = this.createExpertWeightPtrs(pfx, "up_proj");
-      const downWeightPtrs = this.createExpertWeightPtrs(pfx, "down_proj");
-
-      using gateOutStream = this.glm.withStream(() => normed.mulMatId(gateWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs));
-      using gateOut = gateOutStream.result;
-      using upOut = normed.mulMatId(upWeightPtrs, topkIndicesFlat, batchIdsBuf, count, moeIntermediate, hs);
-      gateOutStream.streamWaitEvent();
-      using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
-
-      using downOut = siluOut.mulMatId(downWeightPtrs, topkIndicesFlat, downBatchIdsBuf, count, hs, moeIntermediate);
-
-      using normalizedWeightsFlat = normalizedWeights.reshape([count]);
-      routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIdsBuf, hs, count, BS);
-    }
+    using normalizedWeightsFlat = normalizedWeights.reshape([count]);
+    routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIdsBuf, hs, count, BS);
 
     using sharedGateBufStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS));
     using sharedGateBuf = sharedGateBufStream.result;

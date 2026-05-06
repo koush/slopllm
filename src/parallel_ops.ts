@@ -1290,14 +1290,10 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, [BS, nHeads * vHeadDim], this.type, this.parallelism);
   }
 
-  mulMatId(weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
-    const pWeightPtrs = weightPtrs as ParallelTensor;
+  mulMatId(weights: Tensor[], expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number, name: string): Tensor {
+    const pWeights = weights.map(w => w as ParallelTensor);
     const pExpertIds = expertIds as ParallelTensor;
     const pBatchIds = batchIds as ParallelTensor;
-    const weightPar = pWeightPtrs.parallelism;
-    if (weightPar !== TensorParallelism.Replicated) {
-      throw new Error(`mulMatId: weight pointers must be Replicated, got ${weightPar}`);
-    }
     const inputPar = this.parallelism;
     let outN = N, outK = K, outPar: TensorParallelism;
     if (inputPar === TensorParallelism.Replicated) {
@@ -1311,35 +1307,8 @@ export class ParallelTensor extends Tensor {
     }
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      outShards.push(this.shards[i].mulMatId(pWeightPtrs.shards[i], pExpertIds.shards[i], pBatchIds.shards[i], count, outN, outK));
-    }
-    return this.parallelOps.wrapShards(this.workspace, outShards, [count, N], this.type, outPar);
-  }
-
-  nvfp4MulMatId(weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
-    const pWeightPtrs = weightPtrs as ParallelTensor;
-    const pScalePtrs = scalePtrs as ParallelTensor;
-    const pScale2Ptrs = scale2Ptrs as ParallelTensor;
-    const pExpertIds = expertIds as ParallelTensor;
-    const pBatchIds = batchIds as ParallelTensor;
-    const weightPar = pWeightPtrs.parallelism;
-    if (weightPar !== TensorParallelism.Replicated) {
-      throw new Error(`nvfp4MulMatId: weight pointers must be Replicated, got ${weightPar}`);
-    }
-    const inputPar = this.parallelism;
-    let outN = N, outK = K, outPar: TensorParallelism;
-    if (inputPar === TensorParallelism.Replicated) {
-      outN = this.parallelOps.shardDim(N, "nvfp4MulMatId N");
-      outPar = TensorParallelism.Row;
-    } else if (inputPar === TensorParallelism.Row) {
-      outK = this.parallelOps.shardDim(K, "nvfp4MulMatId K");
-      outPar = TensorParallelism.PartialSum;
-    } else {
-      throw new Error(`nvfp4MulMatId: unsupported input parallelism ${inputPar}`);
-    }
-    const outShards: Tensor[] = [];
-    for (let i = 0; i < this.worldSize; i++) {
-      outShards.push(this.shards[i].nvfp4MulMatId(pWeightPtrs.shards[i], pScalePtrs.shards[i], pScale2Ptrs.shards[i], pExpertIds.shards[i], pBatchIds.shards[i], count, outN, outK));
+      const shardWeights = pWeights.map(w => w.shards[i]);
+      outShards.push(this.shards[i].mulMatId(shardWeights, pExpertIds.shards[i], pBatchIds.shards[i], count, outN, outK, name));
     }
     return this.parallelOps.wrapShards(this.workspace, outShards, [count, N], this.type, outPar);
   }

@@ -469,15 +469,33 @@ export class GlmTensor extends Tensor {
     getNativeAddon().expertScale(this.glm.ctx, this.data, weights.data, indices.data, expertId, topK, batch);
   }
 
-  mulMatId(weightPtrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
+  mulMatId(weights: Tensor[], expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number, name: string): Tensor {
     const out = this.workspace.alloc([count, N], this.type);
-    getNativeAddon().mulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, batchIds.data, count, N, K);
-    return out;
-  }
-
-  nvfp4MulMatId(weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor, expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number): Tensor {
-    const out = this.workspace.alloc([count, N], this.type);
-    getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, batchIds.data, count, N, K);
+    const ptrName = `__moe_ptrs.${name}`;
+    let weightPtrs = this.workspace.tensors.get(ptrName);
+    if (!weightPtrs) {
+      weightPtrs = this.workspace.alloc([weights.length], "I64", ptrName);
+      weightPtrs.writePointers(weights);
+    }
+    if (weights[0].type === "U8") {
+      const scalePtrName = ptrName + "_weight_scale";
+      const scale2PtrName = ptrName + "_weight_scale_2";
+      let scalePtrs = this.workspace.tensors.get(scalePtrName);
+      if (!scalePtrs) {
+        const scaleTensors = weights.map(w => w.workspace.tensors.get(w.name! + "_weight_scale")!);
+        scalePtrs = this.workspace.alloc([weights.length], "I64", scalePtrName);
+        scalePtrs.writePointers(scaleTensors);
+      }
+      let scale2Ptrs = this.workspace.tensors.get(scale2PtrName);
+      if (!scale2Ptrs) {
+        const scale2Tensors = weights.map(w => w.workspace.tensors.get(w.name! + "_weight_scale_2")!);
+        scale2Ptrs = this.workspace.alloc([weights.length], "I64", scale2PtrName);
+        scale2Ptrs.writePointers(scale2Tensors);
+      }
+      getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, batchIds.data, count, N, K);
+    } else {
+      getNativeAddon().mulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, batchIds.data, count, N, K);
+    }
     return out;
   }
 
