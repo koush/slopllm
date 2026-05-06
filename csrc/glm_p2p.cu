@@ -210,21 +210,21 @@ p2p_allreduce_oneshot_kernel(
 //
 // Each rank scatters its shard to its P2P data buffer, then reads all peers'
 // shards and writes them contiguously to the output:
-//   output[rank * count .. (rank+1) * count] = peer_shard[rank]
+//   output[rank * shard_bytes .. (rank+1) * shard_bytes] = peer_shard[rank]
 //
+// Dtype-agnostic: copies raw bytes using uint4 (16-byte) vectorisation.
 // Uses the same double-buffered synchronisation as p2p_allreduce_oneshot_kernel.
 // ---------------------------------------------------------------------------
 
-template <typename T, int VEC>
 __global__ void __launch_bounds__(P2P_AR_BLOCK_SIZE, 1)
 p2p_allgather_column_kernel(
     void* const* peer_data,
     int* const* peer_flags,
     unsigned long long* my_seq_counter,
     int my_rank, int world_size, int max_slot_bytes,
-    const T* __restrict__ in,
-    T* __restrict__ out,
-    int count)
+    const void* __restrict__ in,
+    void* __restrict__ out,
+    int shard_bytes)
 {
     int tid = threadIdx.x;
     int bs  = blockDim.x;
@@ -248,20 +248,20 @@ p2p_allgather_column_kernel(
 
     int seq = (int)s_seq;
     int slot_offset = s_slot_offset;
-    T* my_data = reinterpret_cast<T*>(
-        static_cast<char*>(s_peer_data[my_rank]) + slot_offset);
+    char* my_data = static_cast<char*>(s_peer_data[my_rank]) + slot_offset;
 
     // ---- Step 1: scatter local shard into our peer-visible data buffer.
     {
-        const uint4* in_v4 = reinterpret_cast<const uint4*>(in);
-        uint4*       my_v4 = reinterpret_cast<uint4*>(my_data);
-        int count_v = count / VEC;
-        for (int i = tid; i < count_v; i += bs) {
+        const uint4* in_v4  = reinterpret_cast<const uint4*>(in);
+        uint4*       my_v4  = reinterpret_cast<uint4*>(my_data);
+        int num_vec = shard_bytes / 16;
+        for (int i = tid; i < num_vec; i += bs) {
             my_v4[i] = in_v4[i];
         }
-        int tail = count_v * VEC;
-        for (int i = tail + tid; i < count; i += bs) {
-            my_data[i] = in[i];
+        int tail_start = num_vec * 16;
+        const char* in_b = static_cast<const char*>(in);
+        for (int i = tail_start + tid; i < shard_bytes; i += bs) {
+            my_data[i] = in_b[i];
         }
     }
 
@@ -280,19 +280,19 @@ p2p_allgather_column_kernel(
     __threadfence_system();
 
     // ---- Step 3: copy all peers' shards into output (contiguous per rank).
+    char* out_b = static_cast<char*>(out);
     for (int r = 0; r < world_size; ++r) {
-        const T* src = reinterpret_cast<const T*>(
-            static_cast<const char*>(s_peer_data[r]) + slot_offset);
-        T* dst = out + r * count;
+        const char* src = static_cast<const char*>(s_peer_data[r]) + slot_offset;
+        char* dst = out_b + (size_t)r * shard_bytes;
 
         const uint4* src_v4 = reinterpret_cast<const uint4*>(src);
         uint4*       dst_v4 = reinterpret_cast<uint4*>(dst);
-        int count_v = count / VEC;
-        for (int i = tid; i < count_v; i += bs) {
+        int num_vec = shard_bytes / 16;
+        for (int i = tid; i < num_vec; i += bs) {
             dst_v4[i] = src_v4[i];
         }
-        int tail = count_v * VEC;
-        for (int i = tail + tid; i < count; i += bs) {
+        int tail_start = num_vec * 16;
+        for (int i = tail_start + tid; i < shard_bytes; i += bs) {
             dst[i] = src[i];
         }
     }
@@ -303,25 +303,25 @@ p2p_allgather_column_kernel(
 //
 // Each rank scatters its shard to its P2P data buffer, then reads all peers'
 // shards and writes them in interleaved layout:
-//   output[row * full_dim1_elems + rank * shard_dim1_elems + j]
-//       = peer_shard[rank][row * shard_dim1_elems + j]
+//   dst = out + row * full_dim1_bytes + rank * shard_dim1_bytes
+//   src = peer_shard[rank] + row * shard_dim1_bytes
 //
+// Dtype-agnostic: copies raw bytes using uint4 (16-byte) vectorisation.
 // This eliminates the temp-buffer + memcpy2d that the NCCL Row AllGather
 // path requires.
 // ---------------------------------------------------------------------------
 
-template <typename T, int VEC>
 __global__ void __launch_bounds__(P2P_AR_BLOCK_SIZE, 1)
 p2p_allgather_row_kernel(
     void* const* peer_data,
     int* const* peer_flags,
     unsigned long long* my_seq_counter,
     int my_rank, int world_size, int max_slot_bytes,
-    const T* __restrict__ in,
-    T* __restrict__ out,
-    int shard_count,
-    int shard_dim1_elems,
-    int full_dim1_elems,
+    const void* __restrict__ in,
+    void* __restrict__ out,
+    int shard_bytes,
+    int shard_dim1_bytes,
+    int full_dim1_bytes,
     int outer)
 {
     int tid = threadIdx.x;
@@ -346,20 +346,20 @@ p2p_allgather_row_kernel(
 
     int seq = (int)s_seq;
     int slot_offset = s_slot_offset;
-    T* my_data = reinterpret_cast<T*>(
-        static_cast<char*>(s_peer_data[my_rank]) + slot_offset);
+    char* my_data = static_cast<char*>(s_peer_data[my_rank]) + slot_offset;
 
     // ---- Step 1: scatter local shard into our peer-visible data buffer.
     {
-        const uint4* in_v4 = reinterpret_cast<const uint4*>(in);
-        uint4*       my_v4 = reinterpret_cast<uint4*>(my_data);
-        int count_v = shard_count / VEC;
-        for (int i = tid; i < count_v; i += bs) {
+        const uint4* in_v4  = reinterpret_cast<const uint4*>(in);
+        uint4*       my_v4  = reinterpret_cast<uint4*>(my_data);
+        int num_vec = shard_bytes / 16;
+        for (int i = tid; i < num_vec; i += bs) {
             my_v4[i] = in_v4[i];
         }
-        int tail = count_v * VEC;
-        for (int i = tail + tid; i < shard_count; i += bs) {
-            my_data[i] = in[i];
+        int tail_start = num_vec * 16;
+        const char* in_b = static_cast<const char*>(in);
+        for (int i = tail_start + tid; i < shard_bytes; i += bs) {
+            my_data[i] = in_b[i];
         }
     }
 
@@ -378,22 +378,22 @@ p2p_allgather_row_kernel(
     __threadfence_system();
 
     // ---- Step 3: copy all peers' shards into output in interleaved layout.
+    char* out_b = static_cast<char*>(out);
     for (int r = 0; r < world_size; ++r) {
-        const T* src_base = reinterpret_cast<const T*>(
-            static_cast<const char*>(s_peer_data[r]) + slot_offset);
+        const char* src_base = static_cast<const char*>(s_peer_data[r]) + slot_offset;
 
         for (int row = 0; row < outer; ++row) {
-            const T* src = src_base + row * shard_dim1_elems;
-            T* dst = out + row * full_dim1_elems + r * shard_dim1_elems;
+            const char* src = src_base + (size_t)row * shard_dim1_bytes;
+            char* dst = out_b + (size_t)row * full_dim1_bytes + (size_t)r * shard_dim1_bytes;
 
             const uint4* src_v4 = reinterpret_cast<const uint4*>(src);
             uint4*       dst_v4 = reinterpret_cast<uint4*>(dst);
-            int row_v = shard_dim1_elems / VEC;
-            for (int i = tid; i < row_v; i += bs) {
+            int num_vec = shard_dim1_bytes / 16;
+            for (int i = tid; i < num_vec; i += bs) {
                 dst_v4[i] = src_v4[i];
             }
-            int tail = row_v * VEC;
-            for (int i = tail + tid; i < shard_dim1_elems; i += bs) {
+            int tail_start = num_vec * 16;
+            for (int i = tail_start + tid; i < shard_dim1_bytes; i += bs) {
                 dst[i] = src[i];
             }
         }
@@ -536,71 +536,33 @@ size_t glm_p2p_max_bytes(GlmP2PInstance* inst) {
 
 void glm_p2p_allgather(GlmCtx* ctx, GlmP2PInstance* inst,
                         const void* sendbuf, void* recvbuf,
-                        int count, int dtype) {
+                        int num_bytes) {
     cudaSetDevice(ctx->device_id);
 
-    if (dtype == 9) {
-        if ((size_t)count * 2 > inst->max_bytes) {
-            fprintf(stderr, "glm_p2p_allgather: count %d * 2 > max_bytes %zu\n", count, inst->max_bytes);
-            return;
-        }
-        p2p_allgather_column_kernel<__nv_bfloat16, P2P_AR_VEC_BF16>
-            <<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-                inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
-                inst->my_rank, inst->world_size, (int)inst->max_bytes,
-                static_cast<const __nv_bfloat16*>(sendbuf),
-                static_cast<__nv_bfloat16*>(recvbuf),
-                count);
-    } else if (dtype == 7) {
-        if ((size_t)count * 4 > inst->max_bytes) {
-            fprintf(stderr, "glm_p2p_allgather: count %d * 4 > max_bytes %zu\n", count, inst->max_bytes);
-            return;
-        }
-        p2p_allgather_column_kernel<float, P2P_AR_VEC_F32>
-            <<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-                inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
-                inst->my_rank, inst->world_size, (int)inst->max_bytes,
-                static_cast<const float*>(sendbuf),
-                static_cast<float*>(recvbuf),
-                count);
-    } else {
-        fprintf(stderr, "glm_p2p_allgather: unsupported dtype %d\n", dtype);
+    if ((size_t)num_bytes > inst->max_bytes) {
+        fprintf(stderr, "glm_p2p_allgather: num_bytes %d > max_bytes %zu\n", num_bytes, inst->max_bytes);
+        return;
     }
+    p2p_allgather_column_kernel<<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
+        inst->my_rank, inst->world_size, (int)inst->max_bytes,
+        sendbuf, recvbuf, num_bytes);
 }
 
 void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
                              const void* sendbuf, void* recvbuf,
-                             int shard_count, int shard_dim1_elems,
-                             int full_dim1_elems, int outer, int dtype) {
+                             int shard_bytes, int shard_dim1_bytes,
+                             int full_dim1_bytes, int outer) {
     cudaSetDevice(ctx->device_id);
 
-    if (dtype == 9) {
-        if ((size_t)shard_count * 2 > inst->max_bytes) {
-            fprintf(stderr, "glm_p2p_allgather_row: shard_count %d * 2 > max_bytes %zu\n", shard_count, inst->max_bytes);
-            return;
-        }
-        p2p_allgather_row_kernel<__nv_bfloat16, P2P_AR_VEC_BF16>
-            <<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-                inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
-                inst->my_rank, inst->world_size, (int)inst->max_bytes,
-                static_cast<const __nv_bfloat16*>(sendbuf),
-                static_cast<__nv_bfloat16*>(recvbuf),
-                shard_count, shard_dim1_elems, full_dim1_elems, outer);
-    } else if (dtype == 7) {
-        if ((size_t)shard_count * 4 > inst->max_bytes) {
-            fprintf(stderr, "glm_p2p_allgather_row: shard_count %d * 4 > max_bytes %zu\n", shard_count, inst->max_bytes);
-            return;
-        }
-        p2p_allgather_row_kernel<float, P2P_AR_VEC_F32>
-            <<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-                inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
-                inst->my_rank, inst->world_size, (int)inst->max_bytes,
-                static_cast<const float*>(sendbuf),
-                static_cast<float*>(recvbuf),
-                shard_count, shard_dim1_elems, full_dim1_elems, outer);
-    } else {
-        fprintf(stderr, "glm_p2p_allgather_row: unsupported dtype %d\n", dtype);
+    if ((size_t)shard_bytes > inst->max_bytes) {
+        fprintf(stderr, "glm_p2p_allgather_row: shard_bytes %d > max_bytes %zu\n", shard_bytes, inst->max_bytes);
+        return;
     }
+    p2p_allgather_row_kernel<<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
+        inst->my_rank, inst->world_size, (int)inst->max_bytes,
+        sendbuf, recvbuf, shard_bytes, shard_dim1_bytes, full_dim1_bytes, outer);
 }
 
 } // extern "C"

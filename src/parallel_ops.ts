@@ -163,12 +163,13 @@ export class ParallelTensor extends Tensor {
     }
     const output = this.parallelOps.newTensor(workspace, this.fullShape, this.type, false, undefined, TensorParallelism.Replicated);
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
-    const dtype = this.parallelOps.ncclDatatype(this.type);
+    const elemBytes = ParallelTensor.elemBytes(this.type);
 
-    if (this.parallelOps.tryP2PAllGather(this.shards, output.shards, count, dtype, this.parallelism, this.fullShape)) {
+    if (this.parallelOps.tryP2PAllGather(this.shards, output.shards, count, elemBytes, this.parallelism, this.fullShape)) {
       return output;
     }
 
+    const dtype = this.parallelOps.ncclDatatype(this.type);
     const comms = this.parallelOps.comms;
 
     if (this.parallelism === TensorParallelism.Column) {
@@ -1549,20 +1550,20 @@ export class ParallelOps implements DeviceOps {
    * Try to AllGather via the custom P2P kernel. Returns true on success
    * (caller must skip the NCCL fallback). Returns false if the shard is
    * too large for the P2P group, in which case the caller should use NCCL.
+   * Dtype-agnostic: copies raw bytes, supports all element types.
    */
   tryP2PAllGather(
     shards: readonly Tensor[],
     outputShards: readonly Tensor[],
     count: number,
-    dtype: number,
+    elemBytes: number,
     parallelism: TensorParallelism,
     fullShape: number[],
   ): boolean {
     if (!this.p2pEnabled)
       return false;
-    if (dtype !== NCCL_BFLOAT16 && dtype !== NCCL_FLOAT32)
-      return false;
-    if (count > this.p2pMaxElems)
+    const shardBytes = count * elemBytes;
+    if (shardBytes > 16 * 1024)
       return false;
     const group = this.getP2PGroup();
     if (!group)
@@ -1574,7 +1575,7 @@ export class ParallelOps implements DeviceOps {
         addon.p2pAllGather(
           this.devices[i].ctx, group.instances[i],
           shards[i].data, outputShards[i].data,
-          count, dtype,
+          shardBytes,
         );
       }
       return true;
@@ -1584,13 +1585,13 @@ export class ParallelOps implements DeviceOps {
       const outer = fullShape[0];
       const inner = fullShape.slice(2).reduce((a, b) => a * b, 1);
       const shardDim1 = fullShape[1] / this.worldSize;
-      const shardDim1Elems = shardDim1 * inner;
-      const fullDim1Elems = fullShape[1] * inner;
+      const shardDim1Bytes = shardDim1 * inner * elemBytes;
+      const fullDim1Bytes = fullShape[1] * inner * elemBytes;
       for (let i = 0; i < this.worldSize; ++i) {
         addon.p2pAllGatherRow(
           this.devices[i].ctx, group.instances[i],
           shards[i].data, outputShards[i].data,
-          count, shardDim1Elems, fullDim1Elems, outer, dtype,
+          shardBytes, shardDim1Bytes, fullDim1Bytes, outer,
         );
       }
       return true;

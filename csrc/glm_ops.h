@@ -304,21 +304,23 @@ void glm_p2p_allreduce(GlmCtx* ctx, GlmP2PInstance* inst,
 size_t glm_p2p_max_bytes(GlmP2PInstance* inst);
 
 // Run AllGather (Column layout – contiguous per rank) on this rank's active stream.
-// Each rank contributes `count` elements from sendbuf; recvbuf receives the
-// concatenated result from all ranks (world_size * count elements total).
+// Each rank contributes `num_bytes` bytes from sendbuf; recvbuf receives the
+// concatenated result from all ranks (world_size * num_bytes bytes total).
+// Dtype-agnostic: copies raw bytes with uint4 vectorisation.
 void glm_p2p_allgather(GlmCtx* ctx, GlmP2PInstance* inst,
                         const void* sendbuf, void* recvbuf,
-                        int count, int dtype);
+                        int num_bytes);
 
 // Run AllGather (Row layout – interleaved) on this rank's active stream.
-// Each rank contributes shard_count elements from sendbuf.
-// Output is written in interleaved layout:
-//   out[row * full_dim1_elems + rank * shard_dim1_elems + j]
-//       = peer_shard[rank][row * shard_dim1_elems + j]
+// Each rank contributes shard_bytes from sendbuf.
+// Output is written in interleaved byte layout:
+//   dst = recvbuf + row * full_dim1_bytes + rank * shard_dim1_bytes
+//   src = peer_shard[rank] + row * shard_dim1_bytes
+// Dtype-agnostic: copies raw bytes with uint4 vectorisation.
 void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
                              const void* sendbuf, void* recvbuf,
-                             int shard_count, int shard_dim1_elems,
-                             int full_dim1_elems, int outer, int dtype);
+                             int shard_bytes, int shard_dim1_bytes,
+                             int full_dim1_bytes, int outer);
 
 void glm_kv_cache_write(GlmCtx* ctx,
                          void* src_k, void* src_v,

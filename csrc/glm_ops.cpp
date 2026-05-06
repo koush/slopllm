@@ -2511,44 +2511,42 @@ static Napi::Value P2PAllReduce(const Napi::CallbackInfo& info) {
 
 static Napi::Value P2PAllGather(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 6) {
-        Napi::TypeError::New(env, "Expected (ctx, instance, sendbuf, recvbuf, count, dtype)").ThrowAsJavaScriptException();
+    if (info.Length() < 5) {
+        Napi::TypeError::New(env, "Expected (ctx, instance, sendbuf, recvbuf, numBytes)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
     uintptr_t sendbuf_ptr = info[2].As<Napi::Number>().Int64Value();
     uintptr_t recvbuf_ptr = info[3].As<Napi::Number>().Int64Value();
-    int count = info[4].As<Napi::Number>().Int32Value();
-    int dtype = info[5].As<Napi::Number>().Int32Value();
+    int num_bytes = info[4].As<Napi::Number>().Int32Value();
     glm_p2p_allgather(reinterpret_cast<GlmCtx*>(ctx_ptr),
                        reinterpret_cast<GlmP2PInstance*>(inst_ptr),
                        reinterpret_cast<const void*>(sendbuf_ptr),
                        reinterpret_cast<void*>(recvbuf_ptr),
-                       count, dtype);
+                       num_bytes);
     return env.Undefined();
 }
 
 static Napi::Value P2PAllGatherRow(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 9) {
-        Napi::TypeError::New(env, "Expected (ctx, instance, sendbuf, recvbuf, shardCount, shardDim1Elems, fullDim1Elems, outer, dtype)").ThrowAsJavaScriptException();
+    if (info.Length() < 8) {
+        Napi::TypeError::New(env, "Expected (ctx, instance, sendbuf, recvbuf, shardBytes, shardDim1Bytes, fullDim1Bytes, outer)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
     uintptr_t sendbuf_ptr = info[2].As<Napi::Number>().Int64Value();
     uintptr_t recvbuf_ptr = info[3].As<Napi::Number>().Int64Value();
-    int shard_count = info[4].As<Napi::Number>().Int32Value();
-    int shard_dim1_elems = info[5].As<Napi::Number>().Int32Value();
-    int full_dim1_elems = info[6].As<Napi::Number>().Int32Value();
+    int shard_bytes = info[4].As<Napi::Number>().Int32Value();
+    int shard_dim1_bytes = info[5].As<Napi::Number>().Int32Value();
+    int full_dim1_bytes = info[6].As<Napi::Number>().Int32Value();
     int outer = info[7].As<Napi::Number>().Int32Value();
-    int dtype = info[8].As<Napi::Number>().Int32Value();
     glm_p2p_allgather_row(reinterpret_cast<GlmCtx*>(ctx_ptr),
                            reinterpret_cast<GlmP2PInstance*>(inst_ptr),
                            reinterpret_cast<const void*>(sendbuf_ptr),
                            reinterpret_cast<void*>(recvbuf_ptr),
-                           shard_count, shard_dim1_elems, full_dim1_elems, outer, dtype);
+                           shard_bytes, shard_dim1_bytes, full_dim1_bytes, outer);
     return env.Undefined();
 }
 
