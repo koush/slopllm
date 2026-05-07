@@ -429,9 +429,6 @@ export class Glm51Model extends ChatModel {
     const count = BS * topK;
     const topkIndicesFlat = topkIndices.reshape([count]);
 
-    using routedOut = ws.alloc([BS, hs], "BF16");
-    routedOut.fill(0, BS * hs);
-
     const batchIds = this.getBatchIds(ws, count, topK);
     const downBatchIds = this.getBatchIds(ws, count, 1);
 
@@ -448,7 +445,7 @@ export class Glm51Model extends ChatModel {
     using downOut = siluOut.mulMatId(downWeights, topkIndicesFlat, downBatchIds, count, hs, moeIntermediate, `${pfx}.down_proj`);
 
     using normalizedWeightsFlat = normalizedWeights.reshape([count]);
-    routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIds, hs, count, BS);
+    using routedOut = downOut.scatterAddRows(normalizedWeightsFlat, batchIds, hs, count, BS);
 
     sharedDownBufStream.streamWaitEvent();
     using sharedDownBuf = sharedDownBufStream.result;
@@ -523,8 +520,6 @@ export class Glm51Model extends ChatModel {
 
     using qAbsorbedR = q.result.qAbsorbedR;
     using qPeR = q.result.qPeR;
-
-
 
     using attnOut = new UsingHolder<Tensor>(undefined!);
     if (state.isDecode) {

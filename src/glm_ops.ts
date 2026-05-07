@@ -499,8 +499,10 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  scatterAddRows(input: Tensor, scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number, _workspace?: Tensor): void {
-    getNativeAddon().scatterAddRows(this.glm.ctx, this.data, input.data, scales.data, batchIds.data, dim, count, numRows, 0);
+  scatterAddRows(scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number): Tensor {
+    const out = this.workspace.alloc([numRows, dim], this.type);
+    getNativeAddon().scatterAddRows(this.glm.ctx, out.data, this.data, scales.data, batchIds.data, dim, count, numRows, 0);
+    return out;
   }
 
   sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {

@@ -345,7 +345,8 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  scatterAddRows(input: Tensor, scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number, _workspace?: Tensor): void {
+  scatterAddRows(scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number): Tensor {
+    return undefined as never;
   }
 
   readInt32LE(): number[] {

@@ -1313,19 +1313,20 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, [count, N], this.type, outPar);
   }
 
-  scatterAddRows(input: Tensor, scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number, _workspace?: Tensor): void {
-    const pInput = input as ParallelTensor;
+  scatterAddRows(scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number): Tensor {
     const pScales = scales as ParallelTensor;
     const pBatchIds = batchIds as ParallelTensor;
-    if (pInput.parallelism === TensorParallelism.PartialSum) {
+    const outShards: Tensor[] = [];
+    if (this.parallelism === TensorParallelism.PartialSum) {
       for (let i = 0; i < this.worldSize; i++) {
-        this.shards[i].scatterAddRows(pInput.shards[i], pScales.shards[i], pBatchIds.shards[i], dim, count, numRows);
+        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], pBatchIds.shards[i], dim, count, numRows));
       }
-      this.parallelism = TensorParallelism.PartialSum;
+      return this.parallelOps.wrapShards(this.workspace, outShards, [numRows, dim], this.type, TensorParallelism.PartialSum);
     } else {
       for (let i = 0; i < this.worldSize; i++) {
-        this.shards[i].scatterAddRows(pInput.shards[i], pScales.shards[i], pBatchIds.shards[i], dim, count, numRows);
+        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], pBatchIds.shards[i], dim, count, numRows));
       }
+      return this.parallelOps.wrapShards(this.workspace, outShards, [numRows, dim], this.type, this.parallelism);
     }
   }
 
