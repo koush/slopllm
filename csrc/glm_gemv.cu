@@ -390,10 +390,19 @@ fp8_dequantize_gemm_smem_kernel(
 
 constexpr int NVFP4_QUANT_GROUP = 16;
 
-__constant__ float c_fp4_e2m1_lut[16] = {
-    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-};
+// Decode 4-bit E2M1 float to float32 using register arithmetic only.
+// Constant memory LUT with divergent warp access serializes to 32 sequential
+// fetches; this replaces it with pure register ops (no memory traffic).
+// Bit layout: [sign][exp1][exp0][mantissa], exponent bias = 1.
+// Values: 0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6
+__device__ __forceinline__ float fp4_e2m1_decode(uint8_t nibble) {
+    uint32_t n = (uint32_t)nibble & 0x7u;
+    // n=0 → 0.0, n=1 → 0.5 (subnormal), n≥2 → normal: 1.m * 2^(e-1)
+    uint32_t fp = (n < 2u) ? (n * 0x3F000000u)
+                            : (((126u + (n >> 1u)) << 23u) | ((n & 1u) << 22u));
+    fp |= (uint32_t)(nibble >> 3u) << 31u;
+    return __uint_as_float(fp);
+}
 
 template<int K_TILE>
 __global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
@@ -447,8 +456,8 @@ nvfp4_dequantize_gemv_kernel(
                     float x0 = __bfloat162float(x2.x);
                     float x1 = __bfloat162float(x2.y);
                     uint8_t packed = weight_row[(k_start + g_start) / 2 + ki];
-                    float w0 = c_fp4_e2m1_lut[packed & 0x0F] * scale;
-                    float w1 = c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale;
+                    float w0 = fp4_e2m1_decode(packed & 0x0Fu) * scale;
+                    float w1 = fp4_e2m1_decode(packed >> 4u) * scale;
                     sum += w0 * x0 + w1 * x1;
                 }
             }
@@ -475,8 +484,8 @@ nvfp4_dequantize_gemv_kernel(
                 int g_start = g * NVFP4_QUANT_GROUP;
                 for (int k = g_start + lane; k < g_start + NVFP4_QUANT_GROUP; k += GEMV_WARP_SIZE) {
                     uint8_t packed = weight_row[(remaining_start + k) / 2];
-                    float w0 = c_fp4_e2m1_lut[packed & 0x0F] * scale;
-                    float w1 = c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale;
+                    float w0 = fp4_e2m1_decode(packed & 0x0Fu) * scale;
+                    float w1 = fp4_e2m1_decode(packed >> 4u) * scale;
                     float x_val = __bfloat162float(smem[k]);
                     sum += (k % 2 == 0 ? w0 : w1) * x_val;
                 }
@@ -557,8 +566,8 @@ nvfp4_dequantize_gemm_smem_kernel(
                     if (k < k_tile) {
                         float x_val = __bfloat162float(smem_input[local_m][k]);
                         uint8_t packed = smem_weight[local_n][k / 2];
-                        float w0 = c_fp4_e2m1_lut[packed & 0x0F] * scale;
-                        float w1 = c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale;
+                        float w0 = fp4_e2m1_decode(packed & 0x0Fu) * scale;
+                        float w1 = fp4_e2m1_decode(packed >> 4u) * scale;
                         float x_val_next = __bfloat162float(smem_input[local_m][k + 1]);
                         sum += w0 * x_val + w1 * x_val_next;
                     }
@@ -629,15 +638,15 @@ nvfp4_mul_mat_id_kernel(
 
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                uint8_t packed = (w_lo >> (j * 8)) & 0xFF;
-                sum += c_fp4_e2m1_lut[packed & 0x0F] * scale * __bfloat162float(xb0[j * 2])
-                     + c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale * __bfloat162float(xb0[j * 2 + 1]);
+                uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
+                sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb0[j * 2])
+                     + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb0[j * 2 + 1]);
             }
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                uint8_t packed = (w_hi >> (j * 8)) & 0xFF;
-                sum += c_fp4_e2m1_lut[packed & 0x0F] * scale * __bfloat162float(xb1[j * 2])
-                     + c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale * __bfloat162float(xb1[j * 2 + 1]);
+                uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
+                sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb1[j * 2])
+                     + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb1[j * 2 + 1]);
             }
         }
     }
@@ -700,15 +709,15 @@ nvfp4_mul_mat_id_splitk_kernel(
 
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            uint8_t packed = (w_lo >> (j * 8)) & 0xFF;
-            sum += c_fp4_e2m1_lut[packed & 0x0F] * scale * __bfloat162float(xb0[j * 2])
-                 + c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale * __bfloat162float(xb0[j * 2 + 1]);
+            uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
+            sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb0[j * 2])
+                 + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb0[j * 2 + 1]);
         }
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            uint8_t packed = (w_hi >> (j * 8)) & 0xFF;
-            sum += c_fp4_e2m1_lut[packed & 0x0F] * scale * __bfloat162float(xb1[j * 2])
-                 + c_fp4_e2m1_lut[(packed >> 4) & 0x0F] * scale * __bfloat162float(xb1[j * 2 + 1]);
+            uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
+            sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb1[j * 2])
+                 + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb1[j * 2 + 1]);
         }
     }
 
