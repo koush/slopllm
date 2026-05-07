@@ -451,11 +451,10 @@ export class Glm51Model extends ChatModel {
     routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIds, hs, count, BS);
 
     sharedDownBufStream.streamWaitEvent();
+    using sharedDownBuf = sharedDownBufStream.result;
 
-    const sharedDownBuf = sharedDownBufStream.result;
-
-    sharedDownBuf.scatterAddRows(downOut, normalizedWeightsFlat, batchIds, hs, count, BS);
-    return sharedDownBuf.reshape([BS, hs]);
+    const result = routedOut.add(sharedDownBuf, BS * hs);
+    return result.reshape([BS, hs]);
   }
 
   private mlaLayer(normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState): { normed: Tensor, residual: Tensor } {
