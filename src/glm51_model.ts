@@ -377,6 +377,16 @@ export class Glm51Model extends ChatModel {
     const expertsPerGroup = numExperts / nGroup;
     const ws = normed.workspace;
 
+    // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
+    using sharedGateBufStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS));
+    using sharedGateBuf = sharedGateBufStream.result;
+    using sharedDownBufStream = this.glm.withStream(() => {
+      using sharedUpBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.up_proj.weight`)!, BS);
+      sharedGateBufStream.streamWaitEvent();
+      using sharedSiluBuf = sharedGateBuf.siluAndMul(sharedUpBuf, moeIntermediate, BS);
+      return sharedSiluBuf.linear(this.tensors.get(`${pfx}.mlp.shared_experts.down_proj.weight`)!, BS);
+    });
+
     using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!, BS);
     using gateSigmoid = gateLogitsBuf.sigmoid();
 
@@ -440,15 +450,12 @@ export class Glm51Model extends ChatModel {
     using normalizedWeightsFlat = normalizedWeights.reshape([count]);
     routedOut.scatterAddRows(downOut, normalizedWeightsFlat, batchIds, hs, count, BS);
 
-    using sharedGateBufStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS));
-    using sharedGateBuf = sharedGateBufStream.result;
-    using sharedUpBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.up_proj.weight`)!, BS);
-    sharedGateBufStream.streamWaitEvent();
-    using sharedSiluBuf = sharedGateBuf.siluAndMul(sharedUpBuf, moeIntermediate, BS);
-    using sharedDownBuf = sharedSiluBuf.linear(this.tensors.get(`${pfx}.mlp.shared_experts.down_proj.weight`)!, BS);
+    sharedDownBufStream.streamWaitEvent();
 
-    const result = routedOut.add(sharedDownBuf, BS * hs);
-    return result.reshape([BS, hs]);
+    const sharedDownBuf = sharedDownBufStream.result;
+
+    sharedDownBuf.scatterAddRows(downOut, normalizedWeightsFlat, batchIds, hs, count, BS);
+    return sharedDownBuf.reshape([BS, hs]);
   }
 
   private mlaLayer(normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState): { normed: Tensor, residual: Tensor } {
@@ -490,7 +497,7 @@ export class Glm51Model extends ChatModel {
         qPeR: qPeR.result,
       }
     });
-    
+
     using kPeRopeStream = this.glm.withStream(() => {
       using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!, BS);
       rotaryEmbedding.streamWaitEvent();

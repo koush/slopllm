@@ -27,6 +27,7 @@
                 "--glm51",
                 "--greedy",
                 "--nvfp4",
+                "--meta",
             ],
             "skipFiles": [
                 "<node_internals>/**"
