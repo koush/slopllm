@@ -476,6 +476,30 @@ export class Glm51Model extends ChatModel {
     using cos = rotaryEmbedding.result.cos;
     using sin = rotaryEmbedding.result.sin;
 
+
+    using kvcache = this.glm.withStream(() => {
+      using kPeRopeStream = this.glm.withStream(() => {
+        using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!, BS);
+        rotaryEmbedding.streamWaitEvent();
+        return kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave)
+      });
+      using kPeRope = kPeRopeStream.result;
+
+      using ckv = normed.linear(this.tensors.get(`${pfx}.ckv_proj.weight`)!, BS);
+      using ckvNormed = ckv.rmsnorm(this.tensors.get(`${pfx}.kv_a_layernorm.weight`)!, cfg.rmsNormEps, kvLoraRank, BS);
+
+      kPeRopeStream.streamWaitEvent();
+      state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
+    });
+
+    const pagedKV = state.cache.getPagedKV();
+    const useMla = pagedKV.ckvData.length > 0;
+    if (!useMla) {
+      throw new Error("GLM-5.1 requires MLA KV cache, but no KV data was appended. This likely means the MLA-specific weights were not loaded correctly.");
+    }
+
+
+
     using q = this.glm.withStream(() => {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
       using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps, cfg.qLoraRank, BS);
@@ -497,30 +521,19 @@ export class Glm51Model extends ChatModel {
       }
     });
 
-    using kPeRopeStream = this.glm.withStream(() => {
-      using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!, BS);
-      rotaryEmbedding.streamWaitEvent();
-      return kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave)
-    });
-    using kPeRope = kPeRopeStream.result;
-
     using qAbsorbedR = q.result.qAbsorbedR;
     using qPeR = q.result.qPeR;
 
-    using ckv = normed.linear(this.tensors.get(`${pfx}.ckv_proj.weight`)!, BS);
-    using ckvNormed = ckv.rmsnorm(this.tensors.get(`${pfx}.kv_a_layernorm.weight`)!, cfg.rmsNormEps, kvLoraRank, BS);
 
-    const pagedKV = state.cache.getPagedKV();
-    const useMla = pagedKV.ckvData.length > 0;
 
     using attnOut = new UsingHolder<Tensor>(undefined!);
-
-    if (useMla && state.isDecode) {
-      kPeRopeStream.streamWaitEvent();
-      state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
+    if (state.isDecode) {
+      kvcache.streamWaitEvent();
       q.streamWaitEvent();
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
-    } else if (useMla && !state.isDecode) {
+    }
+    else {
+      // this should not be here what the heck
       this.glm.mlaPrefillPlan(
         ws.floatWs, 128 * 1024 * 1024,
         ws.intWs, ws.pinnedIntWs, 8 * 1024 * 1024,
@@ -530,12 +543,9 @@ export class Glm51Model extends ChatModel {
         batchSize, nHeads, kvLoraRank, true
       );
 
-      kPeRopeStream.streamWaitEvent();
-      state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
+      kvcache.streamWaitEvent();
       q.streamWaitEvent();
       attnOut.replace(ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
-    } else {
-      throw new Error("GLM-5.1 requires MLA KV cache");
     }
 
     const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
