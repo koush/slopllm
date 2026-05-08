@@ -615,6 +615,21 @@ export class ParallelTensor extends Tensor {
 
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
     super.rmsnorm(weight, eps, dim, batch);
+
+    // not worth it because attention as it only delays the gather by a little bit and introduces more gpu-gpu comms
+    // if (this.parallelism === TensorParallelism.Row) {
+    //   const shardDim = dim / this.worldSize;
+    //   const pWeight = weight as ParallelTensor;
+    //   const output = this.parallelOps.newTensor(this.workspace, this.fullShape, this.type, false, undefined, TensorParallelism.Row);
+    //   if (this.parallelOps.tryP2PRmsnorm(this.shards, pWeight.shards, output.shards, eps, shardDim, dim, batch, false)) {
+    //     return output;
+    //   }
+    //   using gathered = this.allGather(this.workspace);
+    //   const result = gathered.rmsnorm(weight, eps, dim, batch);
+    //   output[Symbol.dispose]();
+    //   return result;
+    // }
+
     if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
       using gathered = this.allGather(this.workspace);
       const result = gathered.rmsnorm(weight, eps, dim, batch);
@@ -1572,6 +1587,37 @@ export class ParallelOps implements DeviceOps {
     }
 
     return false;
+  }
+
+  tryP2PRmsnorm(
+    inputShards: readonly Tensor[],
+    weightShards: readonly Tensor[],
+    outputShards: readonly Tensor[],
+    eps: number,
+    shardDim: number,
+    fullDim: number,
+    batch: number,
+    weightIsSharded: boolean,
+  ): boolean {
+    if (!this.p2pEnabled)
+      return false;
+    if (batch * 4 > 16 * 1024)
+      return false;
+    const group = this.getP2PGroup(inputShards[0].workspace.glm.currentStream);
+    if (!group)
+      return false;
+    const addon = getNativeAddon();
+    for (let i = 0; i < this.worldSize; ++i) {
+      const weightPtr = weightIsSharded
+        ? weightShards[i].data
+        : weightShards[i].data + i * shardDim * 2;
+      addon.p2pRmsnorm(
+        this.devices[i].ctx, group.instances[i],
+        inputShards[i].data, weightPtr, outputShards[i].data,
+        eps, shardDim, fullDim, batch,
+      );
+    }
+    return true;
   }
 
   /** Public wrapper used by ParallelTensor.allReduce. */

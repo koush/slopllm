@@ -2550,6 +2550,30 @@ static Napi::Value P2PAllGatherRow(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value P2PRmsnorm(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 9) {
+        Napi::TypeError::New(env, "Expected (ctx, instance, input, weight, output, eps, shardDim, fullDim, batch)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t input_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t weight_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t output_ptr = info[4].As<Napi::Number>().Int64Value();
+    float eps = info[5].As<Napi::Number>().FloatValue();
+    int shard_dim = info[6].As<Napi::Number>().Int32Value();
+    int full_dim = info[7].As<Napi::Number>().Int32Value();
+    int batch = info[8].As<Napi::Number>().Int32Value();
+    glm_p2p_rmsnorm(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                     reinterpret_cast<GlmP2PInstance*>(inst_ptr),
+                     reinterpret_cast<const void*>(input_ptr),
+                     reinterpret_cast<const void*>(weight_ptr),
+                     reinterpret_cast<void*>(output_ptr),
+                     eps, shard_dim, full_dim, batch);
+    return env.Undefined();
+}
+
 static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "init"), Napi::Function::New(env, Init));
     exports.Set(Napi::String::New(env, "free"), Napi::Function::New(env, Free));
@@ -2663,6 +2687,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "p2pAllReduce"), Napi::Function::New(env, P2PAllReduce));
     exports.Set(Napi::String::New(env, "p2pAllGather"), Napi::Function::New(env, P2PAllGather));
     exports.Set(Napi::String::New(env, "p2pAllGatherRow"), Napi::Function::New(env, P2PAllGatherRow));
+    exports.Set(Napi::String::New(env, "p2pRmsnorm"), Napi::Function::New(env, P2PRmsnorm));
     return exports;
 }
 

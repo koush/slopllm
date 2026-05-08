@@ -318,9 +318,21 @@ void glm_p2p_allgather(GlmCtx* ctx, GlmP2PInstance* inst,
 //   src = peer_shard[rank] + row * shard_dim1_bytes
 // Dtype-agnostic: copies raw bytes with uint4 vectorisation.
 void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
-                             const void* sendbuf, void* recvbuf,
-                             int shard_bytes, int shard_dim1_bytes,
-                             int full_dim1_bytes, int outer);
+                              const void* sendbuf, void* recvbuf,
+                              int shard_bytes, int shard_dim1_bytes,
+                              int full_dim1_bytes, int outer);
+
+// P2P Row-parallel RMSNorm: computes RMSNorm on row-parallel tensors without
+// allGathering the full hidden dimension. Each rank computes local sum of squares,
+// exchanges via P2P, then normalizes locally. Output remains row-parallel.
+// input:  [batch, shard_dim] BF16 (this rank's shard of the hidden dim)
+// weight: [shard_dim] BF16   (this rank's shard of the weight vector)
+// output: [batch, shard_dim] BF16 (row-parallel output)
+// full_dim: total hidden dimension across all ranks (shard_dim * world_size)
+// Requires: P2P instance with max_bytes >= batch * sizeof(float)
+void glm_p2p_rmsnorm(GlmCtx* ctx, GlmP2PInstance* inst,
+                      const void* input, const void* weight, void* output,
+                      float eps, int shard_dim, int full_dim, int batch);
 
 void glm_kv_cache_write(GlmCtx* ctx,
                          void* src_k, void* src_v,

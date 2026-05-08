@@ -707,6 +707,13 @@ class GlmOps:
         self.lib.glm_p2p_max_bytes.restype = ctypes.c_size_t
         self.lib.glm_p2p_max_bytes.argtypes = [ctypes.c_void_p]
 
+        self.lib.glm_p2p_rmsnorm.restype = None
+        self.lib.glm_p2p_rmsnorm.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
         self.lib.glm_p2p_cp_merge.restype = None
         self.lib.glm_p2p_cp_merge.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p,
@@ -1614,6 +1621,15 @@ class GlmOps:
 
     def p2p_max_bytes(self, inst):
         return self.lib.glm_p2p_max_bytes(inst)
+
+    def p2p_rmsnorm(self, inst, input_ptr, weight_ptr, output_ptr, eps, shard_dim, full_dim, batch):
+        self.lib.glm_p2p_rmsnorm(
+            self.ctx, inst,
+            ctypes.c_void_p(int(input_ptr)),
+            ctypes.c_void_p(int(weight_ptr)),
+            ctypes.c_void_p(int(output_ptr)),
+            ctypes.c_float(eps), shard_dim, full_dim, batch
+        )
 
     def p2p_cp_merge(self, inst, my_v_out, my_lse, merged_v_out, merged_lse,
                      num_shards, batch_size, num_heads, v_head_dim):

@@ -400,6 +400,123 @@ p2p_allgather_row_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// P2P Row-parallel RMSNorm
+//
+// Computes RMSNorm on a row-parallel tensor (each rank holds shard_dim columns
+// of the full hidden dimension). Instead of allGathering the full tensor, this
+// kernel only communicates a scalar (sum of squares) per row across ranks:
+//
+//   1. Each rank computes local sum(x_shard^2) per row
+//   2. P2P sync: each rank writes its partial sums to its P2P buffer,
+//      waits for all peers, then reads all peers' partial sums and sums them
+//   3. Each rank computes inv_rms = rsqrt(total_sum / full_dim + eps)
+//   4. Each rank normalizes its local shard: out = weight * x * inv_rms
+//
+// Communication cost: batch * sizeof(float) per rank (vs batch * full_dim * sizeof(bf16)
+// for allGather). Output remains row-parallel (shard_dim columns per rank).
+//
+// Layout:
+//   input:  [batch, shard_dim] BF16  (row-parallel shard)
+//   weight: [shard_dim] BF16        (row-parallel shard of the weight vector)
+//   output: [batch, shard_dim] BF16  (row-parallel shard)
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(P2P_AR_BLOCK_SIZE, 1)
+p2p_rmsnorm_kernel(
+    void* const* peer_data,
+    int* const* peer_flags,
+    unsigned long long* my_seq_counter,
+    int my_rank,
+    int world_size,
+    int max_slot_bytes,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output,
+    float eps,
+    int shard_dim,
+    int full_dim,
+    int batch)
+{
+    int tid = threadIdx.x;
+    int bs  = blockDim.x;
+
+    __shared__ unsigned int s_seq;
+    __shared__ int          s_slot_offset;
+    __shared__ void*        s_peer_data[P2P_AR_MAX_WORLD];
+    __shared__ int*         s_peer_flags[P2P_AR_MAX_WORLD];
+    __shared__ float        s_inv_rms[2048];
+
+    if (tid == 0) {
+        unsigned long long s = atomicAdd(my_seq_counter, 2ULL) + 2ULL;
+        s_seq = (unsigned int)(s & 0x7FFFFFFEu);
+        if (s_seq == 0) s_seq = 2;
+        s_slot_offset = ((s_seq >> 1) & 1) * max_slot_bytes;
+    }
+    if (tid < world_size) {
+        s_peer_data[tid]  = peer_data[tid];
+        s_peer_flags[tid] = peer_flags[tid];
+    }
+    __syncthreads();
+
+    int seq = (int)s_seq;
+    int slot_offset = s_slot_offset;
+    float* my_data = reinterpret_cast<float*>(
+        static_cast<char*>(s_peer_data[my_rank]) + slot_offset);
+
+    // ---- Step 1: Compute local sum of squares per row, write to P2P buffer.
+    for (int row = tid; row < batch; row += bs) {
+        float local_sum = 0.0f;
+        const __nv_bfloat16* x = input + (size_t)row * shard_dim;
+        for (int i = 0; i < shard_dim; ++i) {
+            float f = __bfloat162float(x[i]);
+            local_sum += f * f;
+        }
+        my_data[row] = local_sum;
+    }
+
+    // ---- Step 2: Publish data-ready, wait for peers.
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        volatile int* mf = s_peer_flags[my_rank];
+        *mf = seq + 1;
+    }
+    if (tid < world_size) {
+        volatile int* pf = s_peer_flags[tid];
+        spin_until(pf, seq + 1);
+    }
+    __syncthreads();
+    __threadfence_system();
+
+    // ---- Step 3: Read all peers' partial sums, compute inv_rms per row.
+    for (int row = tid; row < batch; row += bs) {
+        float total_sum = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
+            if (r >= world_size) break;
+            const float* peer_buf = reinterpret_cast<const float*>(
+                static_cast<const char*>(s_peer_data[r]) + slot_offset);
+            total_sum += peer_buf[row];
+        }
+        s_inv_rms[row] = rsqrtf(total_sum / (float)full_dim + eps);
+    }
+    __syncthreads();
+
+    // ---- Step 4: Normalize and apply weight.
+    for (int row = 0; row < batch; ++row) {
+        const __nv_bfloat16* x = input + (size_t)row * shard_dim;
+        __nv_bfloat16* o = output + (size_t)row * shard_dim;
+        float inv_rms = s_inv_rms[row];
+
+        for (int i = tid; i < shard_dim; i += bs) {
+            float f = __bfloat162float(x[i]);
+            float w = __bfloat162float(weight[i]);
+            o[i] = __float2bfloat16(w * f * inv_rms);
+        }
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -563,6 +680,27 @@ void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
         inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
         inst->my_rank, inst->world_size, (int)inst->max_bytes,
         sendbuf, recvbuf, shard_bytes, shard_dim1_bytes, full_dim1_bytes, outer);
+}
+
+void glm_p2p_rmsnorm(GlmCtx* ctx, GlmP2PInstance* inst,
+                      const void* input, const void* weight, void* output,
+                      float eps, int shard_dim, int full_dim, int batch) {
+    cudaSetDevice(ctx->device_id);
+
+    size_t required_bytes = (size_t)batch * sizeof(float);
+    if (required_bytes > inst->max_bytes) {
+        fprintf(stderr, "glm_p2p_rmsnorm: batch %d requires %zu bytes > max_bytes %zu\n",
+                batch, required_bytes, inst->max_bytes);
+        return;
+    }
+
+    p2p_rmsnorm_kernel<<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
+        inst->my_rank, inst->world_size, (int)inst->max_bytes,
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_bfloat16*>(output),
+        eps, shard_dim, full_dim, batch);
 }
 
 } // extern "C"

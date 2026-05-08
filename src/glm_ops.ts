@@ -121,6 +121,7 @@ interface NativeAddon {
   p2pAllReduce(ctx: number, instance: number, in_: number, out: number, count: number, dtype: number): void;
   p2pAllGather(ctx: number, instance: number, sendbuf: number, recvbuf: number, numBytes: number): void;
   p2pAllGatherRow(ctx: number, instance: number, sendbuf: number, recvbuf: number, shardBytes: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number): void;
+  p2pRmsnorm(ctx: number, instance: number, input: number, weight: number, output: number, eps: number, shardDim: number, fullDim: number, batch: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
@@ -572,7 +573,8 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().setStream(this.ctx, streamIdx);
     this.currentStream = streamIdx;
     if (streamIdx) {
-      this.streamTensors.set(streamIdx, new Set());
+      if (!this.streamTensors.has(streamIdx))
+        this.streamTensors.set(streamIdx, new Set());
     }
   }
 
