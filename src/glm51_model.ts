@@ -528,16 +528,6 @@ export class Glm51Model extends ChatModel {
       attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
     }
     else {
-      // this should not be here what the heck
-      this.glm.mlaPrefillPlan(
-        ws.floatWs, 128 * 1024 * 1024,
-        ws.intWs, ws.pinnedIntWs, 8 * 1024 * 1024,
-        ws.mlaPrefillPlanInfo,
-        ws.qoIndptrH, ws.indptrH,
-        ws.kvLenH,
-        batchSize, nHeads, kvLoraRank, true
-      );
-
       kvcache.streamWaitEvent();
       q.streamWaitEvent();
       attnOut.replace(ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));

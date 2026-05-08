@@ -420,6 +420,15 @@ export class ExecutionWorkspace extends WorkspaceBase {
         pageSize,
         1
       );
+    } else {
+      this.glm.mlaPrefillPlan(
+        this.floatWs, 128 * 1024 * 1024,
+        this.intWs, this.pinnedIntWs, 8 * 1024 * 1024,
+        this.mlaPrefillPlanInfo,
+        this.qoIndptrH, this.indptrH,
+        this.kvLenH,
+        batchSize, nHeads, cfg.kvLoraRank!, true
+      );
     }
 
     const slotMappingBuf = Buffer.alloc(totalTokens * I32);
