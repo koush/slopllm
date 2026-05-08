@@ -473,7 +473,6 @@ export class Glm51Model extends ChatModel {
     using cos = rotaryEmbedding.result.cos;
     using sin = rotaryEmbedding.result.sin;
 
-
     using kvcache = this.glm.withStream(() => {
       using kPeRopeStream = this.glm.withStream(() => {
         using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!, BS);
@@ -494,8 +493,6 @@ export class Glm51Model extends ChatModel {
     if (!useMla) {
       throw new Error("GLM-5.1 requires MLA KV cache, but no KV data was appended. This likely means the MLA-specific weights were not loaded correctly.");
     }
-
-
 
     using q = this.glm.withStream(() => {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
@@ -521,20 +518,15 @@ export class Glm51Model extends ChatModel {
     using qAbsorbedR = q.result.qAbsorbedR;
     using qPeR = q.result.qPeR;
 
-    using attnOut = new UsingHolder<Tensor>(undefined!);
-    if (state.isDecode) {
-      kvcache.streamWaitEvent();
-      q.streamWaitEvent();
-      attnOut.replace(ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
-    }
-    else {
-      kvcache.streamWaitEvent();
-      q.streamWaitEvent();
-      attnOut.replace(ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling));
-    }
+    kvcache.streamWaitEvent();
+    q.streamWaitEvent();
+
+    using attnOut = state.isDecode
+      ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling)
+      : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling)
 
     const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
-    using vExpanded = attnOut.value.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, S, B);
+    using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, S, B);
     using oProjBuf = vExpanded.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
 
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
