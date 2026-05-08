@@ -2428,16 +2428,15 @@ static Napi::Value P2PEnablePeerAccess(const Napi::CallbackInfo& info) {
 
 static Napi::Value P2PCreateInstance(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 4) {
-        Napi::TypeError::New(env, "Expected (ctx, myRank, worldSize, maxBytes)").ThrowAsJavaScriptException();
+    if (info.Length() < 3) {
+        Napi::TypeError::New(env, "Expected (ctx, myRank, worldSize)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     int my_rank = info[1].As<Napi::Number>().Int32Value();
     int world_size = info[2].As<Napi::Number>().Int32Value();
-    size_t max_bytes = info[3].As<Napi::Number>().Int64Value();
     GlmP2PInstance* inst = glm_p2p_create_instance(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                                                    my_rank, world_size, max_bytes);
+                                                    my_rank, world_size);
     return Napi::Number::New(env, reinterpret_cast<uintptr_t>(inst));
 }
 
@@ -2452,11 +2451,16 @@ static Napi::Value P2PDestroyInstance(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value P2PGetDataPtr(const Napi::CallbackInfo& info) {
+static Napi::Value P2PSetMaxBytes(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (instance, maxBytes)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
     uintptr_t inst_ptr = info[0].As<Napi::Number>().Int64Value();
-    void* p = glm_p2p_get_data_ptr(reinterpret_cast<GlmP2PInstance*>(inst_ptr));
-    return Napi::Number::New(env, reinterpret_cast<uintptr_t>(p));
+    size_t max_bytes = info[1].As<Napi::Number>().Int64Value();
+    glm_p2p_set_max_bytes(reinterpret_cast<GlmP2PInstance*>(inst_ptr), max_bytes);
+    return env.Undefined();
 }
 
 static Napi::Value P2PGetFlagPtr(const Napi::CallbackInfo& info) {
@@ -2681,7 +2685,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "p2pEnablePeerAccess"), Napi::Function::New(env, P2PEnablePeerAccess));
     exports.Set(Napi::String::New(env, "p2pCreateInstance"), Napi::Function::New(env, P2PCreateInstance));
     exports.Set(Napi::String::New(env, "p2pDestroyInstance"), Napi::Function::New(env, P2PDestroyInstance));
-    exports.Set(Napi::String::New(env, "p2pGetDataPtr"), Napi::Function::New(env, P2PGetDataPtr));
+    exports.Set(Napi::String::New(env, "p2pSetMaxBytes"), Napi::Function::New(env, P2PSetMaxBytes));
     exports.Set(Napi::String::New(env, "p2pGetFlagPtr"), Napi::Function::New(env, P2PGetFlagPtr));
     exports.Set(Napi::String::New(env, "p2pSetPeers"), Napi::Function::New(env, P2PSetPeers));
     exports.Set(Napi::String::New(env, "p2pAllReduce"), Napi::Function::New(env, P2PAllReduce));

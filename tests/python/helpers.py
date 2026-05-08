@@ -679,17 +679,17 @@ class GlmOps:
 
         self.lib.glm_p2p_create_instance.restype = ctypes.c_void_p
         self.lib.glm_p2p_create_instance.argtypes = [
-            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_p2p_destroy_instance.restype = None
         self.lib.glm_p2p_destroy_instance.argtypes = [ctypes.c_void_p]
 
-        self.lib.glm_p2p_get_data_ptr.restype = ctypes.c_void_p
-        self.lib.glm_p2p_get_data_ptr.argtypes = [ctypes.c_void_p]
-
         self.lib.glm_p2p_get_flag_ptr.restype = ctypes.c_void_p
         self.lib.glm_p2p_get_flag_ptr.argtypes = [ctypes.c_void_p]
+
+        self.lib.glm_p2p_set_max_bytes.restype = None
+        self.lib.glm_p2p_set_max_bytes.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 
         self.lib.glm_p2p_set_peers.restype = None
         self.lib.glm_p2p_set_peers.argtypes = [
@@ -703,9 +703,6 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int,
         ]
-
-        self.lib.glm_p2p_max_bytes.restype = ctypes.c_size_t
-        self.lib.glm_p2p_max_bytes.argtypes = [ctypes.c_void_p]
 
         self.lib.glm_p2p_rmsnorm.restype = None
         self.lib.glm_p2p_rmsnorm.argtypes = [
@@ -1599,17 +1596,17 @@ class GlmOps:
     def p2p_enable_peer_access(self, peer_device):
         return self.lib.glm_p2p_enable_peer_access(self.ctx, peer_device)
 
-    def p2p_create_instance(self, my_rank, world_size, max_bytes):
-        return self.lib.glm_p2p_create_instance(self.ctx, my_rank, world_size, max_bytes)
+    def p2p_create_instance(self, my_rank, world_size):
+        return self.lib.glm_p2p_create_instance(self.ctx, my_rank, world_size)
 
     def p2p_destroy_instance(self, inst):
         self.lib.glm_p2p_destroy_instance(inst)
 
-    def p2p_get_data_ptr(self, inst):
-        return self.lib.glm_p2p_get_data_ptr(inst)
-
     def p2p_get_flag_ptr(self, inst):
         return self.lib.glm_p2p_get_flag_ptr(inst)
+
+    def p2p_set_max_bytes(self, inst, max_bytes):
+        self.lib.glm_p2p_set_max_bytes(inst, max_bytes)
 
     def p2p_set_peers(self, inst, peer_data_ptrs, peer_flag_ptrs, world_size):
         data_arr = (ctypes.c_void_p * world_size)(*[ctypes.c_void_p(int(p)) for p in peer_data_ptrs])
@@ -1618,9 +1615,6 @@ class GlmOps:
 
     def p2p_allreduce(self, inst, inp, out, count, dtype=9):
         self.lib.glm_p2p_allreduce(self.ctx, inst, self._ptr(inp), self._ptr(out), count, dtype)
-
-    def p2p_max_bytes(self, inst):
-        return self.lib.glm_p2p_max_bytes(inst)
 
     def p2p_rmsnorm(self, inst, input_ptr, weight_ptr, output_ptr, eps, shard_dim, full_dim, batch):
         self.lib.glm_p2p_rmsnorm(

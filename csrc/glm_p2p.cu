@@ -548,7 +548,7 @@ int glm_p2p_enable_peer_access(GlmCtx* ctx, int peer_device) {
     return 0;
 }
 
-GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size, size_t max_bytes) {
+GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size) {
     if (world_size > P2P_AR_MAX_WORLD || world_size <= 0) {
         fprintf(stderr, "glm_p2p_create_instance: invalid world_size %d\n", world_size);
         return nullptr;
@@ -557,50 +557,48 @@ GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size
     auto* inst = new GlmP2PInstance();
     inst->world_size = world_size;
     inst->my_rank = my_rank;
-    inst->max_bytes = max_bytes;
+    inst->max_bytes = 0;
     inst->device_id = ctx->device_id;
 
-    // Combined allocation: peer_data[N] | peer_flags[N] | seq_counter | flag | data_buffer[2]
-    // Data buffer is doubled for ping-pong double buffering across calls.
+    // Metadata-only allocation: peer_data[N] | peer_flags[N] | seq_counter | flag
+    // Data buffer is provided externally via p2pSetPeers.
     size_t header = sizeof(void*) * world_size
                    + sizeof(int*)  * world_size
                    + sizeof(unsigned long long)
                    + sizeof(int);
-    size_t header_aligned = (header + 255) & ~size_t(255);  // 256B align data
-    size_t total = header_aligned + max_bytes * 2;
+    size_t header_aligned = (header + 255) & ~size_t(255);  // 256B align
 
     void* base = nullptr;
-    cudaError_t err = cudaMalloc(&base, total);
+    cudaError_t err = cudaMalloc(&base, header_aligned);
     if (err != cudaSuccess) {
-        fprintf(stderr, "glm_p2p_create_instance: cudaMalloc(%zu) failed: %s\n", total, cudaGetErrorString(err));
+        fprintf(stderr, "glm_p2p_create_instance: cudaMalloc(%zu) failed: %s\n", header_aligned, cudaGetErrorString(err));
         delete inst;
         return nullptr;
     }
-    cudaMemset(base, 0, total);  // synchronous zero so seq=0, flag=0 are safe initial state.
+    cudaMemset(base, 0, header_aligned);  // zero so peer_data ptrs are null, seq=0, flag=0
 
     char* p = static_cast<char*>(base);
-    inst->base_alloc_d = base;
+    inst->metadata_alloc_d = base;
     inst->peer_data_arr_d  = reinterpret_cast<void**>(p); p += sizeof(void*) * world_size;
     inst->peer_flags_arr_d = reinterpret_cast<int**>(p);  p += sizeof(int*)  * world_size;
     inst->seq_counter_d    = reinterpret_cast<unsigned long long*>(p); p += sizeof(unsigned long long);
-    inst->my_flag_d        = reinterpret_cast<int*>(p);   p += sizeof(int);
-    inst->my_data_d        = static_cast<char*>(base) + header_aligned;
+    inst->my_flag_d        = reinterpret_cast<int*>(p);
     return inst;
 }
 
 void glm_p2p_destroy_instance(GlmP2PInstance* inst) {
     if (!inst) return;
     cudaSetDevice(inst->device_id);
-    cudaFree(inst->base_alloc_d);
+    cudaFree(inst->metadata_alloc_d);
     delete inst;
-}
-
-void* glm_p2p_get_data_ptr(GlmP2PInstance* inst) {
-    return inst ? inst->my_data_d : nullptr;
 }
 
 int* glm_p2p_get_flag_ptr(GlmP2PInstance* inst) {
     return inst ? inst->my_flag_d : nullptr;
+}
+
+void glm_p2p_set_max_bytes(GlmP2PInstance* inst, size_t max_bytes) {
+    if (inst) inst->max_bytes = max_bytes;
 }
 
 void glm_p2p_set_peers(GlmCtx* ctx, GlmP2PInstance* inst,
@@ -645,10 +643,6 @@ void glm_p2p_allreduce(GlmCtx* ctx, GlmP2PInstance* inst,
     } else {
         fprintf(stderr, "glm_p2p_allreduce: unsupported dtype %d\n", dtype);
     }
-}
-
-size_t glm_p2p_max_bytes(GlmP2PInstance* inst) {
-    return inst ? inst->max_bytes : 0;
 }
 
 void glm_p2p_allgather(GlmCtx* ctx, GlmP2PInstance* inst,

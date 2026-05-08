@@ -247,11 +247,13 @@ void glm_nccl_all_gather(void* comm, GlmCtx* ctx,
 //   1) For each (rank, peer) pair where rank != peer:
 //        glm_p2p_enable_peer_access(ctx[rank], peer)
 //   2) For each rank:
-//        inst[rank] = glm_p2p_create_instance(ctx[rank], rank, world, max_bytes)
-//   3) Build a host-side array of N data ptrs and N flag ptrs from the
-//      instance accessors, then for each rank call:
+//        inst[rank] = glm_p2p_create_instance(ctx[rank], rank, world)
+//   3) Allocate data buffers (2 * slot_bytes per rank, double-buffered):
+//        data_bufs[rank] = cudaMalloc(2 * slot_bytes)
+//   4) Set max_bytes and build peer pointer arrays:
+//        glm_p2p_set_max_bytes(inst[rank], slot_bytes)
 //        glm_p2p_set_peers(ctx[rank], inst[rank], data_ptrs, flag_ptrs)
-//   4) For each AllReduce, every rank calls (in lock-step program order):
+//   5) For each AllReduce, every rank calls (in lock-step program order):
 //        glm_p2p_allreduce(ctx[rank], inst[rank], in, out, count, dtype)
 //
 // dtype follows NCCL convention: 9 = bfloat16, 7 = float32.
@@ -262,8 +264,7 @@ struct GlmP2PInstance {
     int**               peer_flags_arr_d;
     unsigned long long* seq_counter_d;
     int*                my_flag_d;
-    void*               my_data_d;
-    void*               base_alloc_d;
+    void*               metadata_alloc_d;
     size_t              max_bytes;
     int                 world_size;
     int                 my_rank;
@@ -276,19 +277,20 @@ static constexpr int P2P_AR_MAX_WORLD = 8;
 // Returns 0 on success, -1 if peer access cannot be enabled.
 int glm_p2p_enable_peer_access(GlmCtx* ctx, int peer_device);
 
-// Create an AllReduce instance state on this device. max_bytes is the
-// maximum payload size this instance will ever AllReduce.
+// Create a P2P instance on this device (metadata only, no data buffer).
+// Call glm_p2p_set_peers and glm_p2p_set_max_bytes before use.
 GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank,
-                                         int world_size, size_t max_bytes);
+                                         int world_size);
 
 // Free instance state.
 void glm_p2p_destroy_instance(GlmP2PInstance* inst);
 
-// Get this rank's peer-visible data buffer pointer (max_bytes capacity).
-void* glm_p2p_get_data_ptr(GlmP2PInstance* inst);
-
 // Get this rank's peer-visible flag pointer (single int).
 int* glm_p2p_get_flag_ptr(GlmP2PInstance* inst);
+
+// Set the max slot capacity (bytes per double-buffer slot).
+// Must be called after data buffers are allocated and before any P2P operation.
+void glm_p2p_set_max_bytes(GlmP2PInstance* inst, size_t max_bytes);
 
 // Configure this rank's view of all peers' data + flag pointers.
 // peer_data_ptrs[r] = device pointer (on rank r) to rank r's data buffer.
@@ -300,8 +302,6 @@ void glm_p2p_set_peers(GlmCtx* ctx, GlmP2PInstance* inst,
 // Run AllReduce on this rank's active stream.
 void glm_p2p_allreduce(GlmCtx* ctx, GlmP2PInstance* inst,
                        const void* in, void* out, int count, int dtype);
-
-size_t glm_p2p_max_bytes(GlmP2PInstance* inst);
 
 // Run AllGather (Column layout – contiguous per rank) on this rank's active stream.
 // Each rank contributes `num_bytes` bytes from sendbuf; recvbuf receives the
@@ -329,7 +329,7 @@ void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
 // weight: [shard_dim] BF16   (this rank's shard of the weight vector)
 // output: [batch, shard_dim] BF16 (row-parallel output)
 // full_dim: total hidden dimension across all ranks (shard_dim * world_size)
-// Requires: P2P instance with max_bytes >= batch * sizeof(float)
+// Requires: P2P instance data buffer >= batch * sizeof(float) per slot
 void glm_p2p_rmsnorm(GlmCtx* ctx, GlmP2PInstance* inst,
                       const void* input, const void* weight, void* output,
                       float eps, int shard_dim, int full_dim, int batch);

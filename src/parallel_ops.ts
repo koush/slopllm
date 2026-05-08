@@ -1406,33 +1406,65 @@ export class ParallelTensor extends Tensor {
 class P2PAllReduceGroup {
   /** Per-rank GlmP2PInstance native pointers. */
   readonly instances: number[];
-  readonly maxBytes: number;
+  private readonly flagPtrs: number[];
+  private dataBufs: (Tensor | null)[];
+  private maxSlotBytes: number = 0;
   readonly worldSize: number;
+  private readonly devices: readonly GlmOps[];
 
-  constructor(devices: readonly GlmOps[], maxBytes: number) {
+  constructor(devices: readonly GlmOps[]) {
     this.worldSize = devices.length;
-    this.maxBytes = maxBytes;
-    const N = devices.length;
+    this.devices = devices;
+    this.dataBufs = new Array(devices.length).fill(null);
     const addon = getNativeAddon();
 
-    // Peer access must already be enabled (done in ParallelOps constructor
-    // before model weights are loaded, to avoid VA-space fragmentation).
-
-    // 1. Create one instance per rank.
+    // 1. Create one instance per rank (metadata only, no data buffer).
     this.instances = devices.map((dev, rank) =>
-      addon.p2pCreateInstance(dev.ctx, rank, N, maxBytes));
+      addon.p2pCreateInstance(dev.ctx, rank, devices.length));
 
-    // 2. Collect per-rank data + flag pointers.
-    const dataPtrs = this.instances.map(inst => addon.p2pGetDataPtr(inst));
-    const flagPtrs = this.instances.map(inst => addon.p2pGetFlagPtr(inst));
+    // 2. Cache flag pointers (never changes).
+    this.flagPtrs = this.instances.map(inst => addon.p2pGetFlagPtr(inst));
+  }
 
-    // 3. Tell each rank about all peers' pointers.
-    for (let i = 0; i < N; ++i) {
-      addon.p2pSetPeers(devices[i].ctx, this.instances[i], dataPtrs, flagPtrs);
+  /**
+   * Ensure the P2P data buffer is at least `slotBytes` per slot.
+   * Allocates or grows the buffer as needed. Each buffer is `2 * slotBytes`
+   * for double buffering.
+   */
+  ensureCapacity(slotBytes: number, shardWorkspaces: WorkspaceBase[]): void {
+    if (slotBytes <= this.maxSlotBytes) return;
+    const bufBytes = slotBytes * 2;
+    const addon = getNativeAddon();
+
+    // Allocate new data buffer tensors on each device.
+    const newBufs = this.devices.map((_, i) =>
+      shardWorkspaces[i].allocRaw(bufBytes));
+
+    // Dispose old buffers (returns memory to workspace for reuse).
+    for (const buf of this.dataBufs) {
+      if (buf) buf[Symbol.dispose]();
+    }
+    this.dataBufs = newBufs;
+    this.maxSlotBytes = slotBytes;
+
+    // Update max_bytes on all instances.
+    for (let i = 0; i < this.worldSize; ++i) {
+      addon.p2pSetMaxBytes(this.instances[i], slotBytes);
+    }
+
+    // Update peer pointers on all ranks.
+    const dataPtrs = newBufs.map(buf => buf.data);
+    for (let i = 0; i < this.worldSize; ++i) {
+      addon.p2pSetPeers(this.devices[i].ctx, this.instances[i], dataPtrs, this.flagPtrs);
     }
   }
 
   free(): void {
+    for (const buf of this.dataBufs) {
+      if (buf) buf[Symbol.dispose]();
+    }
+    this.dataBufs = new Array(this.worldSize).fill(null);
+    this.maxSlotBytes = 0;
     for (const inst of this.instances) {
       getNativeAddon().p2pDestroyInstance(inst);
     }
@@ -1444,10 +1476,8 @@ export class ParallelOps implements DeviceOps {
   readonly worldSize: number;
   readonly comms: number[];
   private readonly shardWorkspaces = new WeakMap<WorkspaceBase, WorkspaceBase[]>();
-  /** Lazy-initialized custom one-shot AllReduce group for small messages. */
+  /** Lazy-initialized P2P groups per stream. */
   private p2pGroups = new Map<number, P2PAllReduceGroup>();
-  /** Max BF16 elements per shard for which P2P AllReduce is used. */
-  private readonly p2pMaxElems: number;
   private p2pEnabled: boolean;
 
   constructor(devices: GlmOps[]) {
@@ -1475,7 +1505,6 @@ export class ParallelOps implements DeviceOps {
     if (this.p2pEnabled) {
       this.p2pEnabled = this.enablePeerAccess(devices);
     }
-    this.p2pMaxElems = 8192;  // matches kernel block_size * vec
   }
 
   /** Enable P2P peer access between all device pairs. Returns true on success. */
@@ -1496,13 +1525,12 @@ export class ParallelOps implements DeviceOps {
     return true;
   }
 
-  /** Get (and lazily create) the P2P AllReduce group sized for small messages. */
+  /** Get (and lazily create) the P2P group for the given stream. */
   private getP2PGroup(stream: number): P2PAllReduceGroup | null {
     if (!this.p2pEnabled) return null;
     if (!this.p2pGroups.has(stream)) {
       try {
-        // 16 KB per rank covers BF16 [hidden=8192] or F32 [hidden=4096].
-        this.p2pGroups.set(stream, new P2PAllReduceGroup(this.devices, 16 * 1024));
+        this.p2pGroups.set(stream, new P2PAllReduceGroup(this.devices));
       } catch (e) {
         console.warn(`P2P AllReduce group creation failed (${e}); falling back to NCCL`);
         this.p2pEnabled = false;
@@ -1522,11 +1550,16 @@ export class ParallelOps implements DeviceOps {
       return false;
     if (dtype !== NCCL_BFLOAT16 && dtype !== NCCL_FLOAT32)
       return false;
-    if (count > this.p2pMaxElems)
+    // Single-block kernel limit: 1024 threads * 8 vec = 8192 elements.
+    if (count > 8192)
       return false;
     const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
     if (!group)
       return false;
+    const elemBytes = dtype === NCCL_BFLOAT16 ? 2 : 4;
+    const slotBytes = count * elemBytes;
+    const shardWorkspaces = this.getShardWorkspaces(shards[0].workspace);
+    group.ensureCapacity(slotBytes, shardWorkspaces);
     const addon = getNativeAddon();
     for (let i = 0; i < this.worldSize; ++i) {
       addon.p2pAllReduce(this.devices[i].ctx, group.instances[i],
@@ -1552,11 +1585,11 @@ export class ParallelOps implements DeviceOps {
     if (!this.p2pEnabled)
       return false;
     const shardBytes = count * elemBytes;
-    if (shardBytes > 16 * 1024)
-      return false;
     const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
     if (!group)
       return false;
+    const shardWorkspaces = this.getShardWorkspaces(shards[0].workspace);
+    group.ensureCapacity(shardBytes, shardWorkspaces);
     const addon = getNativeAddon();
 
     if (parallelism === TensorParallelism.Column) {
@@ -1601,11 +1634,12 @@ export class ParallelOps implements DeviceOps {
   ): boolean {
     if (!this.p2pEnabled)
       return false;
-    if (batch * 4 > 16 * 1024)
-      return false;
     const group = this.getP2PGroup(inputShards[0].workspace.glm.currentStream);
     if (!group)
       return false;
+    const slotBytes = batch * 4;
+    const shardWorkspaces = this.getShardWorkspaces(inputShards[0].workspace);
+    group.ensureCapacity(slotBytes, shardWorkspaces);
     const addon = getNativeAddon();
     for (let i = 0; i < this.worldSize; ++i) {
       const weightPtr = weightIsSharded
@@ -1634,6 +1668,168 @@ export class ParallelOps implements DeviceOps {
       );
     }
     addon.ncclGroupEnd();
+  }
+
+  /**
+   * Merge partial attention outputs from context-parallel shards using
+   * NCCL AllGather + local merge.
+   *
+   * Each GPU has partial_v_out [batch, nHeads * vHeadDim] (BF16)
+   * and partial_lse [batch, nHeads] (F32).
+   *
+   * Returns merged_v_out [batch, nHeads * vHeadDim] (BF16, Replicated).
+   * If mergedLse is provided, also writes merged_lse [batch, nHeads] (F32).
+   */
+  contextParallelMerge(
+    partialVOuts: readonly Tensor[],
+    partialLses: readonly Tensor[],
+    batchSize: number,
+    numHeads: number,
+    vHeadDim: number,
+    mergedLse: Tensor | null,
+    workspace: WorkspaceBase,
+  ): ParallelTensor {
+    const numShards = partialVOuts.length;
+    if (numShards !== this.worldSize) {
+      throw new Error(`contextParallelMerge: numShards=${numShards} != worldSize=${this.worldSize}`);
+    }
+    if (numShards === 1) {
+      return new ParallelTensor(
+        workspace, this,
+        TensorParallelism.Replicated,
+        [partialVOuts[0]], partialVOuts[0].shape,
+        partialVOuts[0].type, undefined, false, undefined,
+      );
+    }
+
+    const addon = getNativeAddon();
+    const shardWss = this.getShardWorkspaces(workspace);
+    const fullVOutShape = [batchSize, numHeads * vHeadDim];
+
+    const mergedVOutShards = shardWss.map(ws => ws.alloc(fullVOutShape, "BF16"));
+    let mergedLseShards: Tensor[] | null = null;
+    if (mergedLse) {
+      const lseShape = [batchSize, numHeads];
+      mergedLseShards = shardWss.map(ws => ws.alloc(lseShape, "F32"));
+    }
+
+    // AllGather each shard's partial_v_out and partial_lse to all GPUs.
+    // After AllGather, each GPU has all shards' data and can run cp_merge locally.
+    const vOutElemBytes = 2; // BF16
+    const lseElemBytes = 4;  // F32
+    const vOutElemsPerShard = batchSize * numHeads * vHeadDim;
+    const lseElemsPerShard = batchSize * numHeads;
+
+    // Allocate receive buffers for AllGather on each device.
+    const gatheredVOutShards = shardWss.map(ws => ws.alloc([numShards * vOutElemsPerShard], "BF16"));
+    const gatheredLseShards = shardWss.map(ws => ws.alloc([numShards * lseElemsPerShard], "F32"));
+
+    // AllGather v_out shards.
+    addon.ncclGroupStart();
+    for (let i = 0; i < this.worldSize; i++) {
+      addon.ncclAllGather(
+        this.comms[i], this.devices[i].ctx,
+        partialVOuts[i].data, gatheredVOutShards[i].data,
+        vOutElemsPerShard, NCCL_BFLOAT16,
+      );
+    }
+    addon.ncclGroupEnd();
+
+    // AllGather lse shards.
+    addon.ncclGroupStart();
+    for (let i = 0; i < this.worldSize; i++) {
+      addon.ncclAllGather(
+        this.comms[i], this.devices[i].ctx,
+        partialLses[i].data, gatheredLseShards[i].data,
+        lseElemsPerShard, NCCL_FLOAT32,
+      );
+    }
+    addon.ncclGroupEnd();
+
+    // Build pointer arrays and run cp_merge on each device.
+    for (let i = 0; i < this.worldSize; i++) {
+      const vPtrs: number[] = [];
+      const lsePtrs: number[] = [];
+      for (let s = 0; s < numShards; s++) {
+        vPtrs.push(gatheredVOutShards[i].data + s * vOutElemsPerShard * vOutElemBytes);
+        lsePtrs.push(gatheredLseShards[i].data + s * lseElemsPerShard * lseElemBytes);
+      }
+      this.devices[i].contextParallelMerge(
+        vPtrs, lsePtrs, numShards,
+        mergedVOutShards[i], mergedLseShards ? mergedLseShards[i] : null,
+        batchSize, numHeads, vHeadDim,
+      );
+    }
+
+    return new ParallelTensor(
+      workspace, this,
+      TensorParallelism.Replicated,
+      mergedVOutShards, fullVOutShape,
+      "BF16", undefined, false, undefined,
+    );
+  }
+
+  /**
+   * Merge partial attention outputs using fused P2P + online softmax merge.
+   * This avoids NCCL overhead for small payloads.
+   *
+   * Each GPU has partial_v_out [batch, nHeads * vHeadDim] (BF16)
+   * and partial_lse [batch, nHeads] (F32).
+   *
+   * Returns merged_v_out [batch, nHeads * vHeadDim] (BF16, Replicated).
+   * If mergedLse is provided, also writes merged_lse [batch, nHeads] (F32).
+   */
+  p2pCpMerge(
+    partialVOuts: readonly Tensor[],
+    partialLses: readonly Tensor[],
+    batchSize: number,
+    numHeads: number,
+    vHeadDim: number,
+    mergedLse: Tensor | null,
+    workspace: WorkspaceBase,
+  ): ParallelTensor {
+    const numShards = partialVOuts.length;
+    if (numShards !== this.worldSize) {
+      throw new Error(`p2pCpMerge: numShards=${numShards} != worldSize=${this.worldSize}`);
+    }
+    if (numShards < 2) {
+      throw new Error(`p2pCpMerge: requires at least 2 shards, got ${numShards}`);
+    }
+
+    const vOutBytes = batchSize * numHeads * vHeadDim * 2; // BF16
+    const lseBytes = batchSize * numHeads * 4;             // F32
+    const slotBytes = vOutBytes + lseBytes;
+
+    const group = this.getP2PGroup(partialVOuts[0].workspace.glm.currentStream);
+    if (!group) {
+      throw new Error("p2pCpMerge: P2P not available");
+    }
+    const shardWorkspaces = this.getShardWorkspaces(partialVOuts[0].workspace);
+    group.ensureCapacity(slotBytes, shardWorkspaces);
+    const fullVOutShape = [batchSize, numHeads * vHeadDim];
+
+    const mergedVOutShards = shardWorkspaces.map(ws => ws.alloc(fullVOutShape, "BF16"));
+    let mergedLseShards: Tensor[] | null = null;
+    if (mergedLse) {
+      const lseShape = [batchSize, numHeads];
+      mergedLseShards = shardWorkspaces.map(ws => ws.alloc(lseShape, "F32"));
+    }
+
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].p2pCpMerge(
+        group.instances[i],
+        partialVOuts[i], partialLses[i],
+        mergedVOutShards[i], mergedLseShards ? mergedLseShards[i] : null,
+        numShards, batchSize, numHeads, vHeadDim,
+      );
+    }
+
+    return new ParallelTensor(
+      workspace, this,
+      TensorParallelism.Replicated,
+      mergedVOutShards, fullVOutShape,
+      "BF16", undefined, false, undefined,
+    );
   }
 
   free(): void {

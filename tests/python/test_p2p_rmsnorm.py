@@ -14,9 +14,13 @@ class TestP2PRmsnorm:
     def setup_p2p(self):
         self.ops = []
         self.instances = []
+        self.data_ptrs = []
         for rank in range(NUM_GPUS):
             self.ops.append(GlmOps(device_id=rank))
         yield
+        for data_ptrs in self.data_ptrs:
+            for rank, ptr in enumerate(data_ptrs):
+                self.ops[rank].free_buf(ptr)
         for inst in self.instances:
             for rank in range(NUM_GPUS):
                 self.ops[rank].p2p_destroy_instance(inst[rank])
@@ -32,14 +36,21 @@ class TestP2PRmsnorm:
                 if peer != rank:
                     rc = self.ops[rank].p2p_enable_peer_access(peer)
                     assert rc == 0, f"Peer access failed: GPU {rank} -> {peer}"
-            inst = self.ops[rank].p2p_create_instance(rank, world_size, max_bytes)
+            inst = self.ops[rank].p2p_create_instance(rank, world_size)
             assert inst is not None and inst != 0, f"p2p_create_instance failed for rank {rank}"
             instances.append(inst)
 
-        data_ptrs = [self.ops[r].p2p_get_data_ptr(instances[r]) for r in range(world_size)]
+        # Allocate data buffers (2 * max_bytes for double buffering).
+        buf_bytes = max_bytes * 2
+        data_ptrs = []
+        for rank in range(world_size):
+            ptr = self.ops[rank].alloc(buf_bytes)
+            data_ptrs.append(ptr)
+
         flag_ptrs = [self.ops[r].p2p_get_flag_ptr(instances[r]) for r in range(world_size)]
 
         for rank in range(world_size):
+            self.ops[rank].p2p_set_max_bytes(instances[rank], max_bytes)
             self.ops[rank].p2p_set_peers(
                 instances[rank],
                 data_ptrs,
@@ -48,6 +59,7 @@ class TestP2PRmsnorm:
             )
 
         self.instances.append(instances)
+        self.data_ptrs.append(data_ptrs)
         return instances
 
     def _synchronize_all(self):

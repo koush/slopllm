@@ -56,7 +56,7 @@ export class WorkspaceBase implements Disposable {
     return this._alloc(shape, type, true, name, parallelism);
   }
 
-  allocRaw(bytes: number, name: string): Tensor {
+  allocRaw(bytes: number, name?: string): Tensor {
     return this.alloc([bytes], "U8", name);
   }
 
