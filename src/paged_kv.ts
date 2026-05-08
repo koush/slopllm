@@ -304,6 +304,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
       throw new Error(`planDecode: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
     }
 
+    let decodePagesNeeded = 0;
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      decodePagesNeeded += pagedKV.pagesNeededForDecodeToken(seqIdx);
+    }
+    if (decodePagesNeeded > pagedKV.availablePages.length) {
+      throw new Error(`planDecode: need ${decodePagesNeeded} pages, ${pagedKV.availablePages.length} available`);
+    }
+
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       pagedKV.allocDecodeToken(seqIdx);
     }
@@ -371,6 +379,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const startPos = pagedKV.seqKvLens.slice();
 
     model.prefillBatchPlanHook(inputIdsList, seqLens, totalTokens, startPos, cache);
+
+    let prefillPagesNeeded = 0;
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      prefillPagesNeeded += pagedKV.pagesNeededForAppend(seqIdx, seqLens[seqIdx]);
+    }
+    if (prefillPagesNeeded > pagedKV.availablePages.length) {
+      throw new Error(`planPrefill: need ${prefillPagesNeeded} pages, ${pagedKV.availablePages.length} available`);
+    }
 
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);
@@ -511,7 +527,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   kpeData: Tensor[];
   indices: Tensor;
   indicesH: Tensor;
-  numPagesUsed: number;
+  availablePages: number[];
   seqPages: number[][];
   seqKvLens: number[];
   cachedTokenIds: number[][];
@@ -543,7 +559,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
     this.indices = this.alloc([maxPages * I32], "I32", "indices");
     this.indicesH = this.allocPinned([maxPages], "I32", "indicesH");
-    this.numPagesUsed = 0;
+    this.availablePages = Array.from({length: maxPages}, (_, i) => i);
     this.seqPages = [];
     this.seqKvLens = [];
     this.cachedTokenIds = [];
@@ -555,7 +571,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     if (batchSize > this.maxBatch) {
       throw new Error(`batchSize ${batchSize} exceeds maxBatch ${this.maxBatch}`);
     }
-    this.numPagesUsed = 0;
+    this.availablePages = Array.from({length: this.maxPages}, (_, i) => i);
     this.seqPages = Array.from({ length: batchSize }, () => []);
     this.seqKvLens = new Array(batchSize).fill(0);
     this.cachedTokenIds = Array.from({ length: batchSize }, () => []);
@@ -602,6 +618,10 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       throw new Error(`truncate: newLen ${newLen} > current seqKvLens ${this.seqKvLens[seqIdx]}`);
     }
     if (newLen === 0) {
+      const freedPages = this.seqPages[seqIdx];
+      for (let i = freedPages.length - 1; i >= 0; i--) {
+        this.availablePages.unshift(freedPages[i]);
+      }
       this.seqPages[seqIdx] = [];
       this.seqKvLens[seqIdx] = 0;
       return;
@@ -609,12 +629,25 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const pageSize = this.pageSize;
     const newPageCount = Math.ceil(newLen / pageSize);
     const oldPageCount = this.seqPages[seqIdx].length;
-    const removedPages = oldPageCount - newPageCount;
-    if (removedPages > 0 && this.seqPages[seqIdx][oldPageCount - 1] === this.numPagesUsed - 1) {
-      this.numPagesUsed -= removedPages;
+    const freedPages = this.seqPages[seqIdx].slice(newPageCount);
+    for (let i = freedPages.length - 1; i >= 0; i--) {
+      this.availablePages.unshift(freedPages[i]);
     }
     this.seqPages[seqIdx] = this.seqPages[seqIdx].slice(0, newPageCount);
     this.seqKvLens[seqIdx] = newLen;
+  }
+
+  pagesNeededForDecodeToken(seqIdx: number): number {
+    const kvLen = this.seqKvLens[seqIdx];
+    const pageIdxInSeq = Math.floor(kvLen / this.pageSize);
+    return pageIdxInSeq >= this.seqPages[seqIdx].length ? 1 : 0;
+  }
+
+  pagesNeededForAppend(seqIdx: number, numNewTokens: number): number {
+    const currentLen = this.seqKvLens[seqIdx];
+    const currentPageCount = this.seqPages[seqIdx].length;
+    const newPageCount = Math.ceil((currentLen + numNewTokens) / this.pageSize);
+    return Math.max(0, newPageCount - currentPageCount);
   }
 
   allocAppendPages(seqIdx: number, numNewTokens: number): [number, number] {
@@ -624,11 +657,15 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const newTotalLen = currentLen + numNewTokens;
     const newPageCount = Math.ceil(newTotalLen / pageSize);
     const numNewPages = newPageCount - currentPageCount;
-    const startPage = this.numPagesUsed;
-    for (let i = 0; i < numNewPages; i++) {
-      this.seqPages[seqIdx].push(startPage + i);
+    if (numNewPages > this.availablePages.length) {
+      throw new Error(`allocAppendPages: need ${numNewPages} pages, ${this.availablePages.length} available`);
     }
-    this.numPagesUsed += numNewPages;
+    let startPage = -1;
+    for (let i = 0; i < numNewPages; i++) {
+      const page = this.availablePages.shift()!;
+      if (i === 0) startPage = page;
+      this.seqPages[seqIdx].push(page);
+    }
     this.seqKvLens[seqIdx] = newTotalLen;
     if (numNewPages > 0) {
       this.pagesDirtyHost = true;
@@ -642,8 +679,10 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const pageSize = this.pageSize;
     const pageIdxInSeq = Math.floor(kvLen / pageSize);
     if (pageIdxInSeq >= this.seqPages[seqIdx].length) {
-      const newPage = this.numPagesUsed;
-      this.numPagesUsed += 1;
+      if (this.availablePages.length === 0) {
+        throw new Error(`allocDecodeToken: no pages available`);
+      }
+      const newPage = this.availablePages.shift()!;
       this.seqPages[seqIdx].push(newPage);
       this.pagesDirtyHost = true;
       this.pagesDirtyDevice = true;
