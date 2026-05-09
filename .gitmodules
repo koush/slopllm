@@ -1,6 +1,7 @@
 [submodule "vendor/flashinfer"]
 	path = vendor/flashinfer
-	url = https://github.com/flashinfer-ai/flashinfer.git
+	url = git@github.com:koush/flashinfer.git
+	branch = main
 [submodule "vendor/huggingface.js"]
 	path = vendor/huggingface.js
 	url = https://github.com/koush/huggingface.js

@@ -1632,8 +1632,8 @@ static Napi::Value MlaPrefillPlan(const Napi::CallbackInfo& info) {
 
 static Napi::Value MlaPrefillRun(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 27) {
-        Napi::TypeError::New(env, "Expected (ctx, q_nope, q_pe, ckv_data, kpe_data, kv_indices, o, float_ws, int_ws, plan_info, num_heads, page_size, mask_mode, sm_scale, q_nope_stride_n, q_nope_stride_h, q_pe_stride_n, q_pe_stride_h, ckv_stride_page, ckv_stride_n, kpe_stride_page, kpe_stride_n, o_stride_n, o_stride_h, head_dim_ckv, head_dim_kpe, lse) — note 27+ params").ThrowAsJavaScriptException();
+    if (info.Length() < 30) {
+        Napi::TypeError::New(env, "Expected (ctx, q_nope, q_pe, ckv_data, kpe_data, kv_indices, o, float_ws, int_ws, plan_info, num_heads, page_size, mask_mode, sm_scale, q_nope_stride_n, q_nope_stride_h, q_pe_stride_n, q_pe_stride_h, ckv_stride_page, ckv_stride_n, kpe_stride_page, kpe_stride_n, o_stride_n, o_stride_h, head_dim_ckv, head_dim_kpe, lse, cp_world_size, cp_rank, cp_kv_len) — note 30+ params").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1663,6 +1663,9 @@ static Napi::Value MlaPrefillRun(const Napi::CallbackInfo& info) {
     uint32_t head_dim_ckv = info[24].As<Napi::Number>().Uint32Value();
     uint32_t head_dim_kpe = info[25].As<Napi::Number>().Uint32Value();
     uintptr_t lse_ptr = info[26].As<Napi::Number>().Int64Value();
+    uint32_t cp_world_size = info[27].As<Napi::Number>().Uint32Value();
+    uint32_t cp_rank = info[28].As<Napi::Number>().Uint32Value();
+    uintptr_t cp_kv_len_ptr = info[29].As<Napi::Number>().Int64Value();
     glm_mla_prefill_run(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(q_nope_ptr), reinterpret_cast<void*>(q_pe_ptr),
@@ -1677,7 +1680,9 @@ static Napi::Value MlaPrefillRun(const Napi::CallbackInfo& info) {
         kpe_stride_page, kpe_stride_n,
         o_stride_n, o_stride_h,
         head_dim_ckv, head_dim_kpe,
-        reinterpret_cast<float*>(lse_ptr));
+        reinterpret_cast<float*>(lse_ptr),
+        cp_world_size, cp_rank,
+        reinterpret_cast<int32_t*>(cp_kv_len_ptr));
     {
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -1772,7 +1777,7 @@ static Napi::Value MlaDecodeRun(const Napi::CallbackInfo& info) {
 static Napi::Value MlaKvCacheAppend(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 16) {
-        Napi::TypeError::New(env, "Expected (ctx, ckv_data, kpe_data, indices, indptr, last_page_len, append_ckv, append_kpe, batch_indices, positions, nnz, page_size, head_dim_ckv, head_dim_kpe, append_ckv_stride_n, append_kpe_stride_n)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected at least 16 args (ctx, ckv_data, kpe_data, indices, indptr, last_page_len, append_ckv, append_kpe, batch_indices, positions, nnz, page_size, head_dim_ckv, head_dim_kpe, append_ckv_stride_n, append_kpe_stride_n[, cp_rank, cp_world_size])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1791,6 +1796,8 @@ static Napi::Value MlaKvCacheAppend(const Napi::CallbackInfo& info) {
     uint32_t head_dim_kpe = info[13].As<Napi::Number>().Uint32Value();
     size_t append_ckv_stride_n = info[14].As<Napi::Number>().Int64Value();
     size_t append_kpe_stride_n = info[15].As<Napi::Number>().Int64Value();
+    uint32_t cp_rank = (info.Length() >= 17) ? info[16].As<Napi::Number>().Uint32Value() : 0;
+    uint32_t cp_world_size = (info.Length() >= 18) ? info[17].As<Napi::Number>().Uint32Value() : 1;
     glm_mla_kv_cache_append(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(ckv_data_ptr), reinterpret_cast<void*>(kpe_data_ptr),
@@ -1801,7 +1808,8 @@ static Napi::Value MlaKvCacheAppend(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(batch_indices_ptr),
         reinterpret_cast<int32_t*>(positions_ptr),
         nnz, page_size, head_dim_ckv, head_dim_kpe,
-        append_ckv_stride_n, append_kpe_stride_n);
+        append_ckv_stride_n, append_kpe_stride_n,
+        cp_rank, cp_world_size);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("mlaKvCacheAppend failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

@@ -557,7 +557,9 @@ void glm_mla_prefill_run(
     uint32_t kpe_stride_page, uint32_t kpe_stride_n,
     uint32_t o_stride_n, uint32_t o_stride_h,
     uint32_t head_dim_ckv, uint32_t head_dim_kpe,
-    float* lse) {
+    float* lse,
+    uint32_t cp_world_size, uint32_t cp_rank,
+    int32_t* cp_kv_len) {
 
   cudaSetDevice(ctx->device_id);
 
@@ -609,6 +611,9 @@ void glm_mla_prefill_run(
 
   params.sm_scale = sm_scale;
   params.return_lse_base_on_e = false;
+  params.cp_world_size = cp_world_size;
+  params.cp_rank = cp_rank;
+  params.cp_kv_len = reinterpret_cast<IdType*>(cp_kv_len);
 
   flashinfer::MaskMode flash_mask = static_cast<flashinfer::MaskMode>(mask_mode);
 
@@ -788,12 +793,15 @@ void glm_mla_kv_cache_append(
     int32_t* batch_indices, int32_t* positions,
     uint32_t nnz, uint32_t page_size,
     uint32_t head_dim_ckv, uint32_t head_dim_kpe,
-    size_t append_ckv_stride_n, size_t append_kpe_stride_n) {
+    size_t append_ckv_stride_n, size_t append_kpe_stride_n,
+    uint32_t cp_rank, uint32_t cp_world_size) {
 
   cudaSetDevice(ctx->device_id);
 
+  uint32_t vPS = (cp_world_size > 1) ? (page_size / cp_world_size) : page_size;
+
   flashinfer::paged_kv_mla_t<DType, IdType> paged_kv(
-      page_size, head_dim_ckv, head_dim_kpe, 0,
+      vPS, head_dim_ckv, head_dim_kpe, 0,
       static_cast<DType*>(ckv_data), static_cast<DType*>(kpe_data),
       indices, indptr, last_page_len, nullptr);
 
@@ -813,7 +821,8 @@ void glm_mla_kv_cache_append(
     dim3 nthrs(bdx);
     void* args[] = {(void*)&paged_kv, (void*)&append_ckv, (void*)&append_kpe,
                     (void*)&batch_indices, (void*)&positions, (void*)&nnz,
-                    (void*)&append_ckv_stride_n, (void*)&append_kpe_stride_n};
+                    (void*)&append_ckv_stride_n, (void*)&append_kpe_stride_n,
+                    (void*)&cp_rank, (void*)&cp_world_size};
     cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, GLM_STREAM(ctx));
     status = cudaGetLastError();
   });
