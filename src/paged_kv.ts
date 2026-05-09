@@ -552,6 +552,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       if (kvLoraRank > 0) {
         this.ckvData.push(this.alloc([maxPages * pageSize * kvLoraRank], "BF16"));
         this.kpeData.push(this.alloc([maxPages * pageSize * qkRopeDim], "BF16"));
+        // token level interleave parallelism
+        // this.ckvData.push(this.alloc([maxPages, pageSize, kvLoraRank], "BF16", undefined, TensorParallelism.Row));
+        // this.kpeData.push(this.alloc([maxPages, pageSize, qkRopeDim], "BF16", undefined, TensorParallelism.Row));
       } else {
         this.kData.push(this.alloc([maxPages, nKv * pageSize * hd], "BF16", undefined, TensorParallelism.Row));
         this.vData.push(this.alloc([maxPages, nKv * pageSize * hd], "BF16", undefined, TensorParallelism.Row));
