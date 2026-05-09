@@ -472,6 +472,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_bool,
+            ctypes.c_uint32, ctypes.c_uint32,  # cp_world_size, cp_rank
         ]
 
         self.lib.glm_mla_prefill_run.restype = None
@@ -1257,7 +1258,7 @@ class GlmOps:
                          int_ws, pinned_int_ws, int_ws_size,
                          plan_info, qo_indptr_h, kv_indptr_h, kv_len_h,
                          batch_size, num_heads, head_dim_o,
-                         causal=False):
+                         causal=False, cp_world_size=0, cp_rank=0):
         self.lib.glm_mla_prefill_plan(
             self.ctx,
             ctypes.c_void_p(float_ws), ctypes.c_size_t(float_ws_size),
@@ -1265,7 +1266,8 @@ class GlmOps:
             ctypes.c_void_p(plan_info),
             ctypes.c_void_p(qo_indptr_h), ctypes.c_void_p(kv_indptr_h), ctypes.c_void_p(kv_len_h),
             ctypes.c_uint32(batch_size), ctypes.c_uint32(num_heads), ctypes.c_uint32(head_dim_o),
-            ctypes.c_bool(causal)
+            ctypes.c_bool(causal),
+            ctypes.c_uint32(cp_world_size), ctypes.c_uint32(cp_rank)
         )
 
     def mla_prefill_run(self, q_nope, q_pe, ckv_data, kpe_data,

@@ -1479,6 +1479,8 @@ export class ParallelOps implements DeviceOps {
   /** Lazy-initialized P2P groups per stream. */
   private p2pGroups = new Map<number, P2PAllReduceGroup>();
   private p2pEnabled: boolean;
+  /** When true, all GPUs are context-parallel shards. MLA ops auto-inject cpWorldSize/cpRank. */
+  contextParallel: boolean = false;
 
   constructor(devices: GlmOps[]) {
     if (devices.length === 0) {
@@ -2081,7 +2083,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mlaPrefillPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, kvIndptrH: Tensor, kvLenH: Tensor, batchSize: number, numHeads: number, headDimO: number, causal: boolean): void {
+  mlaPrefillPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, kvIndptrH: Tensor, kvLenH: Tensor, batchSize: number, numHeads: number, headDimO: number, causal: boolean, cpWorldSize: number = 0, cpRank: number = 0): void {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPinnedIntWs = this.cast(pinnedIntWs);
@@ -2090,8 +2092,10 @@ export class ParallelOps implements DeviceOps {
     const pKvIndptrH = this.cast(kvIndptrH);
     const pKvLenH = this.cast(kvLenH);
     const shardNumHeads = this.shardDim(numHeads, "mlaPrefillPlan numHeads");
+    const effectiveCpWorldSize = this.contextParallel ? this.worldSize : cpWorldSize;
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaPrefillPlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pQoIndptrH.shards[i], pKvIndptrH.shards[i], pKvLenH.shards[i], batchSize, shardNumHeads, headDimO, causal);
+      const effectiveCpRank = this.contextParallel ? i : cpRank;
+      this.devices[i].mlaPrefillPlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pQoIndptrH.shards[i], pKvIndptrH.shards[i], pKvLenH.shards[i], batchSize, shardNumHeads, headDimO, causal, effectiveCpWorldSize, effectiveCpRank);
     }
   }
 
@@ -2110,8 +2114,10 @@ export class ParallelOps implements DeviceOps {
     const shardNumHeads = this.shardDim(numHeads, "mlaPrefillRun numHeads");
     const shardQNopeStrideN = shardNumHeads * headDimCkv;
     const shardQPeStrideN = shardNumHeads * headDimKpe;
+    const effectiveCpWorldSize = this.contextParallel ? this.worldSize : cpWorldSize;
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], shardNumHeads, pageSize, maskMode, smScale, shardQNopeStrideN, qNopeStrideH, shardQPeStrideN, qPeStrideH, ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, pLse ? pLse.shards[i] : null, cpWorldSize, cpRank, pCpKvLen ? pCpKvLen.shards[i] : null);
+      const effectiveCpRank = this.contextParallel ? i : cpRank;
+      this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], shardNumHeads, pageSize, maskMode, smScale, shardQNopeStrideN, qNopeStrideH, shardQPeStrideN, qPeStrideH, ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, pLse ? pLse.shards[i] : null, effectiveCpWorldSize, effectiveCpRank, pCpKvLen ? pCpKvLen.shards[i] : null);
     }
   }
 
@@ -2156,8 +2162,10 @@ export class ParallelOps implements DeviceOps {
     const pAppendKpe = this.cast(appendKpe);
     const pBatchIndices = this.cast(batchIndices);
     const pPositions = this.cast(positions);
+    const effectiveCpWorldSize = this.contextParallel ? this.worldSize : cpWorldSize;
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpRank, cpWorldSize);
+      const effectiveCpRank = this.contextParallel ? i : cpRank;
+      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, effectiveCpRank, effectiveCpWorldSize);
     }
   }
 

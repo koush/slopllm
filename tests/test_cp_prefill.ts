@@ -113,13 +113,13 @@ function runMlaPrefill(
   const qoIndptrH = allocPinnedI32(ws, [batchSize + 1]);
   qoIndptrH.h2d(i32Buf(new Int32Array([0, totalQTokens])));
 
-  const causal = cpWorldSize > 0 ? false : true;
   glm.mlaPrefillPlan(
     floatWs, 128 * 1024 * 1024,
     intWs, pinnedIntWs, 8 * 1024 * 1024,
     planInfo,
     qoIndptrH, indptrH, kvLenH,
-    batchSize, nHeads, headDimCkv, causal,
+    batchSize, nHeads, headDimCkv, true,
+    cpWorldSize, cpRank,
   );
 
   const vOut = allocBf16(ws, [1, nHeads, totalQTokens, headDimCkv]);

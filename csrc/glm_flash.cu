@@ -519,7 +519,7 @@ void glm_mla_prefill_plan(
     int64_t* plan_info,
     int32_t* qo_indptr_h, int32_t* kv_indptr_h, int32_t* kv_len_h,
     uint32_t batch_size, uint32_t num_heads, uint32_t head_dim_o,
-    bool causal) {
+    bool causal, uint32_t cp_world_size, uint32_t cp_rank) {
 
   cudaSetDevice(ctx->device_id);
 
@@ -530,7 +530,7 @@ void glm_mla_prefill_plan(
       info,
       qo_indptr_h, kv_indptr_h, kv_len_h,
       batch_size, num_heads, head_dim_o,
-      causal, GLM_STREAM(ctx));
+      causal, cp_world_size, cp_rank, GLM_STREAM(ctx));
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_mla_prefill_plan failed: %s\n", cudaGetErrorString(status));

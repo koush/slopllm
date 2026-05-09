@@ -1597,7 +1597,7 @@ static Napi::Value BatchPrefillPagedRun(const Napi::CallbackInfo& info) {
 static Napi::Value MlaPrefillPlan(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 14) {
-        Napi::TypeError::New(env, "Expected (ctx, float_ws, float_ws_size, int_ws, pinned_int_ws, int_ws_size, plan_info, qo_indptr_h, kv_indptr_h, kv_len_h, batch_size, num_heads, head_dim_o, causal)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, float_ws, float_ws_size, int_ws, pinned_int_ws, int_ws_size, plan_info, qo_indptr_h, kv_indptr_h, kv_len_h, batch_size, num_heads, head_dim_o, causal, [cp_world_size, cp_rank])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1614,6 +1614,8 @@ static Napi::Value MlaPrefillPlan(const Napi::CallbackInfo& info) {
     uint32_t num_heads = info[11].As<Napi::Number>().Uint32Value();
     uint32_t head_dim_o = info[12].As<Napi::Number>().Uint32Value();
     bool causal = info[13].As<Napi::Boolean>().Value();
+    uint32_t cp_world_size = info.Length() > 14 ? info[14].As<Napi::Number>().Uint32Value() : 0;
+    uint32_t cp_rank = info.Length() > 15 ? info[15].As<Napi::Number>().Uint32Value() : 0;
     glm_mla_prefill_plan(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(float_ws), float_ws_size,
@@ -1622,7 +1624,7 @@ static Napi::Value MlaPrefillPlan(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(qo_indptr_h_ptr),
         reinterpret_cast<int32_t*>(kv_indptr_h_ptr),
         reinterpret_cast<int32_t*>(kv_len_h_ptr),
-        batch_size, num_heads, head_dim_o, causal);
+        batch_size, num_heads, head_dim_o, causal, cp_world_size, cp_rank);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("mlaPrefillPlan failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

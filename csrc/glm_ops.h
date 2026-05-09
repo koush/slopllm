@@ -445,7 +445,7 @@ void glm_mla_prefill_plan(
     int64_t* plan_info,
     int32_t* qo_indptr_h, int32_t* kv_indptr_h, int32_t* kv_len_h,
     uint32_t batch_size, uint32_t num_heads, uint32_t head_dim_o,
-    bool causal);
+    bool causal, uint32_t cp_world_size = 0, uint32_t cp_rank = 0);
 
 // MLA Prefill: Run phase
 // Executes MLA paged attention (prefill/incremental-prefill).
