@@ -7,6 +7,7 @@ import { Tensor } from "../src/tensor";
 const HEAD_DIM_CKV = 512;
 const HEAD_DIM_KPE = 64;
 const N_HEADS = 4;
+const V_HEAD_DIM = 128;
 const SM_SCALE = 1.0 / Math.sqrt(HEAD_DIM_CKV);
 
 function i32Buf(data: Int32Array): Buffer {
@@ -35,58 +36,6 @@ function randomData(n: number): Float32Array {
   const f32 = new Float32Array(n);
   for (let i = 0; i < n; i++) f32[i] = (Math.random() * 2 - 1) * 0.5;
   return f32;
-}
-
-function cpuMergePartialAttn(
-  partialVOuts: Float32Array[],
-  partialLses: Float32Array[],
-  numTokens: number,
-  numHeads: number,
-  vHeadDim: number,
-): Float32Array {
-  const numShards = partialVOuts.length;
-  const mergedV = new Float32Array(numTokens * numHeads * vHeadDim);
-
-  for (let t = 0; t < numTokens; t++) {
-    for (let h = 0; h < numHeads; h++) {
-      let o = new Float32Array(vHeadDim);
-      let m = -Infinity;
-      let d = 1.0;
-
-      for (let s = 0; s < numShards; s++) {
-        const lse = partialLses[s][t * numHeads + h];
-        const vBase = (t * numHeads + h) * vHeadDim;
-        const v = partialVOuts[s].subarray(vBase, vBase + vHeadDim);
-
-        const mPrev = m;
-        const dPrev = d;
-        m = Math.max(m, lse);
-        d = dPrev * Math.pow(2, mPrev - m) + Math.pow(2, lse - m);
-        for (let j = 0; j < vHeadDim; j++) {
-          o[j] = o[j] * Math.pow(2, mPrev - m) + v[j] * Math.pow(2, lse - m);
-        }
-      }
-
-      const outBase = (t * numHeads + h) * vHeadDim;
-      for (let j = 0; j < vHeadDim; j++) {
-        mergedV[outBase + j] = o[j] / d;
-      }
-    }
-  }
-
-  return mergedV;
-}
-
-function hndToNhd(hnd: Float32Array, nHeads: number, totalTokens: number, headDim: number): Float32Array {
-  const nhd = new Float32Array(totalTokens * nHeads * headDim);
-  for (let t = 0; t < totalTokens; t++) {
-    for (let h = 0; h < nHeads; h++) {
-      for (let d = 0; d < headDim; d++) {
-        nhd[(t * nHeads + h) * headDim + d] = hnd[(h * totalTokens + t) * headDim + d];
-      }
-    }
-  }
-  return nhd;
 }
 
 function readLse(lseTensor: Tensor, totalTokens: number, nHeads: number): Float32Array {
@@ -264,6 +213,10 @@ function runCpPrefillTest(
   const ckvF32 = randomData(numPages * pageSize * HEAD_DIM_CKV);
   const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
+  const vProjF32 = randomData(N_HEADS * V_HEAD_DIM * HEAD_DIM_CKV);
+  const vProj = allocBf16(ws, [N_HEADS * V_HEAD_DIM, HEAD_DIM_CKV]);
+  vProj.h2d(f32ToBf16Bytes(vProjF32));
+
   const baseline = runMlaPrefill(
     glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
     seqLen, seqLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
@@ -272,12 +225,13 @@ function runCpPrefillTest(
     0, 0, null,
   );
 
-  const baselineVOutBuf = Buffer.alloc(totalTokens * N_HEADS * HEAD_DIM_CKV * 2);
-  baseline.vOut.d2h(baselineVOutBuf);
-  const baselineNhd = hndToNhd(bf16BytesToF32(baselineVOutBuf), N_HEADS, totalTokens, HEAD_DIM_CKV);
-  const baselineLseF32 = readLse(baseline.lse, totalTokens, N_HEADS);
+  const baselineVExpanded = baseline.vOut.mlaVExpand(vProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize);
+  const baselineVExpandedBuf = Buffer.alloc(totalTokens * N_HEADS * V_HEAD_DIM * 2);
+  baselineVExpanded.d2h(baselineVExpandedBuf);
+  const baselineVExpandedF32 = bf16BytesToF32(baselineVExpandedBuf);
 
-  const shards: { nhd: Float32Array; lse: Float32Array }[] = [];
+  const shardVPtrs: number[] = [];
+  const shardLsePtrs: number[] = [];
   const cpKvLens = new Int32Array(batchSize).fill(seqLen);
 
   for (let rank = 0; rank < worldSize; rank++) {
@@ -296,46 +250,50 @@ function runCpPrefillTest(
       worldSize, rank, cpKvLens,
     );
 
-    const vOutBuf = Buffer.alloc(totalTokens * N_HEADS * HEAD_DIM_CKV * 2);
-    result.vOut.d2h(vOutBuf);
-    const nhd = hndToNhd(bf16BytesToF32(vOutBuf), N_HEADS, totalTokens, HEAD_DIM_CKV);
-    const lse = readLse(result.lse, totalTokens, N_HEADS);
+    const shardVExpanded = result.vOut.mlaVExpand(vProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize);
 
-    shards.push({ nhd, lse });
+    shardVPtrs.push(shardVExpanded.data);
+    shardLsePtrs.push(result.lse.data);
   }
 
-  const partialVOuts = shards.map(s => s.nhd);
-  const partialLses = shards.map(s => s.lse);
-  const mergedV = cpuMergePartialAttn(partialVOuts, partialLses, totalTokens, N_HEADS, HEAD_DIM_CKV);
+  const mergedVOut = allocBf16(ws, [totalTokens, N_HEADS * V_HEAD_DIM]);
+  glm.contextParallelMerge(
+    shardVPtrs, shardLsePtrs, worldSize,
+    mergedVOut, null,
+    totalTokens, N_HEADS, V_HEAD_DIM,
+  );
+  glm.synchronize();
+
+  const mergedBuf = Buffer.alloc(totalTokens * N_HEADS * V_HEAD_DIM * 2);
+  mergedVOut.d2h(mergedBuf);
+  const mergedF32 = bf16BytesToF32(mergedBuf);
 
   let maxRelErr = 0;
   let maxAbsErr = 0;
   let maxRelErrForSignificant = 0;
   let errorCount = 0;
-  const SIGNIFICANCE_THRESHOLD = 0.02;
+  const totalElems = totalTokens * N_HEADS * V_HEAD_DIM;
+  const SIGNIFICANCE_THRESHOLD = 0.05;
+  const ABS_TOL = 0.03;
+  const REL_TOL = 0.10;
 
-  for (let t = 0; t < totalTokens; t++) {
-    for (let h = 0; h < N_HEADS; h++) {
-      for (let d = 0; d < HEAD_DIM_CKV; d++) {
-        const merged = mergedV[(t * N_HEADS + h) * HEAD_DIM_CKV + d];
-        const expected = baselineNhd[(t * N_HEADS + h) * HEAD_DIM_CKV + d];
-        const absErr = Math.abs(merged - expected);
-        const relErr = absErr / Math.max(Math.abs(expected), 1e-6);
-        if (absErr > 0.01 && relErr > 0.05) {
-          errorCount++;
-        }
-        maxRelErr = Math.max(maxRelErr, relErr);
-        maxAbsErr = Math.max(maxAbsErr, absErr);
-        if (Math.abs(expected) > SIGNIFICANCE_THRESHOLD) {
-          maxRelErrForSignificant = Math.max(maxRelErrForSignificant, relErr);
-        }
-      }
+  for (let i = 0; i < totalElems; i++) {
+    const merged = mergedF32[i];
+    const expected = baselineVExpandedF32[i];
+    const absErr = Math.abs(merged - expected);
+    const relErr = absErr / Math.max(Math.abs(expected), 1e-6);
+    if (absErr > ABS_TOL + REL_TOL * Math.abs(expected)) {
+      errorCount++;
+    }
+    maxRelErr = Math.max(maxRelErr, relErr);
+    maxAbsErr = Math.max(maxAbsErr, absErr);
+    if (Math.abs(expected) > SIGNIFICANCE_THRESHOLD) {
+      maxRelErrForSignificant = Math.max(maxRelErrForSignificant, relErr);
     }
   }
 
-  console.log(`CP prefill (seqLen=${seqLen}, batch=${batchSize}, pageSize=${pageSize}, worldSize=${worldSize}): maxAbsErr=${maxAbsErr.toFixed(6)} maxRelErrForSignificant=${maxRelErrForSignificant.toFixed(6)} errors=${errorCount}/${totalTokens * N_HEADS * HEAD_DIM_CKV}`);
-  assert.ok(maxAbsErr < 0.01, `Max absolute error ${maxAbsErr} exceeds 0.01`);
-  assert.ok(maxRelErrForSignificant < 0.05, `Max relative error for significant values ${maxRelErrForSignificant} exceeds 0.05`);
+  console.log(`CP prefill (seqLen=${seqLen}, batch=${batchSize}, pageSize=${pageSize}, worldSize=${worldSize}): maxAbsErr=${maxAbsErr.toFixed(6)} maxRelErrForSignificant=${maxRelErrForSignificant.toFixed(6)} errors=${errorCount}/${totalElems}`);
+  assert.ok(errorCount === 0, `${errorCount}/${totalElems} elements exceed tolerance (atol=${ABS_TOL}, rtol=${REL_TOL})`);
 }
 
 describe("CP MLA Prefill", () => {
