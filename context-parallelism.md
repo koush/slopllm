@@ -14,8 +14,8 @@ Context parallelism shards the KV sequence across GPUs, cutting KV memory by ~1/
 
 | | Head Parallelism (current) | Context Parallelism (new) |
 |---|---|---|
-| KV cache | Replicated (full copy per GPU) | Sharded by sequence position |
-| Q heads | Sharded across GPUs | Replicated (all heads per GPU) |
+| KV cache | Replicated (full copy per GPU) | Sharded by sequence position (all pages, 1/N tokens per page) |
+| Q heads | Sharded across GPUs | Replicated (all heads per GPU — needed for CP merge) |
 | MLA attention | Each GPU: partial heads × full KV | Each GPU: all heads × partial KV |
 | Post-attention merge | AllReduce o_proj output | Softmax merge + AllReduce v_expand |
 | KV memory | Full per GPU | 1/N per GPU |
@@ -167,21 +167,64 @@ Currently only `NCCL_SUM` is used. Need `NCCL_MAX` for the LSE AllReduce.
 
 ### Phase 4: Sequence-Sharded KV Cache
 
-**Page ownership:** Pages are assigned to GPUs round-robin: GPU `r` owns page `p` where `p % worldSize == r`. Each page is a contiguous block of `pageSize` tokens (currently 16). This means:
-- GPU 0 (4 GPUs): pages 0, 4, 8, 12, ... → positions 0-15, 64-79, 128-143, 192-207, ...
-- Each GPU's page table is compact — just its own pages, no gaps
-- Position IDs passed to FlashInfer are the real (non-contiguous) positions, which is fine — FlashInfer uses them for RoPE, not for indexing
-- Memory: each GPU stores `ceil(totalPages / worldSize)` pages ≈ 1/N of total KV
+**Sharding schemes considered:**
 
-During decode, token at position `S` falls in page `S // pageSize`, owned by GPU `(S // pageSize) % worldSize`. Only that GPU appends to its KV cache.
+With `pageSize=4`, `worldSize=2`, a sequence of 8 tokens (pages: [0,1,2,3] [4,5,6,7]):
+
+1. **Page-level contiguous** — Each GPU owns a contiguous range of whole pages.
+   - GPU 0: pages 0,1 → tokens 0,1,2,3,4,5,6,7 (first half of pages)
+   - GPU 1: pages 2,3 → tokens 8,9,10,11,... (second half of pages)
+   - Local→global: trivial (`page * pageSize + slot`), no kernel changes needed for causal masking
+   - ✅ Simplest causal masking (pages map to contiguous global positions)
+   - ❌ **Decode load imbalance**: all tokens appending to one page go to the same GPU; one GPU is idle until that page fills
+   - ❌ **Per-GPU page management**: each GPU allocates/free its own pages; complex bookkeeping
+   - ❌ **Empty-KV problem**: short sequences may have fewer pages than GPUs, leaving some GPUs with no KV data
+   - ❌ **Unbalanced KV size**: page allocation patterns cause uneven distribution across GPUs
+
+2. **Page-level round-robin** — Pages assigned round-robin: GPU `r` owns page `p` where `p % worldSize == r`.
+   - GPU 0: pages 0,2,4,... → tokens 0-15, 32-47, 64-79,...
+   - GPU 1: pages 1,3,5,... → tokens 16-31, 48-63, 80-95,...
+   - Local→global: trivial (contiguous within each owned page)
+   - ✅ Better page distribution than contiguous
+   - ✅ Simple causal masking (pages map to contiguous global positions)
+   - ❌ **Decode load imbalance**: tokens appending to the same page all go to one GPU
+   - ❌ **Causal masking gaps**: GPU 0's page 0 (positions 0-15) and page 2 (positions 32-47) have a gap at positions 16-31 (on GPU 1); per-page position offsets still needed
+   - ❌ **Per-GPU page management**: each GPU manages its own subset of pages
+   - ❌ **Empty-KV problem**: fewer pages than GPUs still leaves some GPUs empty
+
+3. **Token-level contiguous blocks** — Within each page, GPU `r` holds positions `[r*vPS, (r+1)*vPS)`.
+   - GPU 0: positions 0,1 from every page → tokens 0,1,4,5
+   - GPU 1: positions 2,3 from every page → tokens 2,3,6,7
+   - Local→global: `global = (local / vPS) * globalPS + rank * vPS + (local % vPS)` — **non-linear** (jump at page boundaries: local 1→global 1, local 2→global 4)
+   - ✅ Even decode load (tokens distributed across GPUs within each page)
+   - ✅ No empty-KV (all pages have tokens on all GPUs)
+   - ✅ All pages on all GPUs (replicated indices/indptr)
+   - ❌ **Non-linear position mapping**: requires `uint_fastdiv` division or per-page offset array in kernel hot path
+   - ❌ Causal mask fix needs per-page computation or integer division per element
+
+4. **Token-level interleave** (chosen) — Within each page, GPU `r` holds positions where `position % worldSize == r`.
+   - GPU 0: every other token starting from 0 → tokens 0,2,4,6
+   - GPU 1: every other token starting from 1 → tokens 1,3,5,7
+   - Local→global: `global = local * worldSize + rank` — **linear** (uniform stride, no page-boundary jumps: local 0→global 0, local 1→global 2, local 2→global 4, local 3→global 6)
+   - ✅ Even decode load (every `worldSize`-th token goes to each GPU)
+   - ✅ No empty-KV (all pages have tokens on all GPUs)
+   - ✅ All pages on all GPUs (replicated indices/indptr)
+   - ✅ **Linear position mapping**: causal mask fix needs only `kv_idx_scale` and `kv_idx_offset` (two scalars) — no division or per-page lookup
+   - ✅ Simplest kernel modification of all token-level schemes
+
+**Why token-level interleave over the others:**
+
+The linear mapping `global_pos = local_pos * worldSize + rank` means the FlashInfer kernel needs only three new scalars (`kv_idx_scale`, `kv_idx_offset`, `global_kv_len`) to fix causal masking — no arrays, no integer division, no per-page computation. This is significantly simpler than the per-page offset or `uint_fastdiv` division required by contiguous blocks, and avoids the decode imbalance and per-GPU page management of page-level schemes.
 
 **Files to modify:**
 
 1. **`src/paged_kv.ts`** — `PagedKVCache`
-   - Add `sequenceShardIndex: number` and `worldSize: number` properties (0 for single-GPU, >0 for context parallelism).
-   - Modify `mlaKvCacheAppend`: Only append to this GPU's shard. If the new position falls in a page owned by another GPU, skip.
-   - Modify page allocation: Each GPU allocates `ceil(maxPages / worldSize)` pages (saves memory).
-   - Modify `seqKvLens` tracking: Each GPU tracks its shard of positions.
+    - Add `worldSize: number` and `rank: number` properties (worldSize=0 for single-GPU, >0 for context parallelism).
+    - KV cache data (`ckvData`, `kpeData`) allocated as `[maxPages, pageSize, dim]` with `TensorParallelism.Row` — each GPU shard is `[maxPages, pageSize/worldSize, dim]` (all pages, `pageSize/worldSize` tokens per page).
+    - Modify `mlaKvCacheAppend`: Only append tokens owned by this GPU. Position `p` is owned by GPU `p % worldSize`. Within each page, the local slot for position `p` is `(p % pageSize) / worldSize`.
+    - All pages exist on all GPUs — no per-GPU page table management needed. `indices` and `indptr` are replicated (same on all GPUs).
+    - **Append filter for token-level interleave**: during prefill, each GPU appends only positions where `position % worldSize == rank`. During decode (single token), only one GPU appends (position `S` → GPU `S % worldSize`).
+    - **Storage layout**: within each page, GPU r's tokens are stored compacted — local slot `s` holds the page's token at position `s * worldSize + rank`. E.g., with `worldSize=2, pageSize=4`, GPU 0's local page slots are [pos0, pos2] and GPU 1's are [pos1, pos3].
 
 2. **`src/parallel_ops.ts`** — KV cache operations
    - Modify `mlaKvCacheAppend` for context parallelism: each GPU appends only tokens in pages it owns.
@@ -235,7 +278,40 @@ During decode, token at position `S` falls in page `S // pageSize`, owned by GPU
 
 Prefill uses the same context-parallel flow as decode. Each GPU builds only its KV shard and computes partial attention. The merge is identical.
 
-**Causal masking with sequence-sharded KV:** Each GPU computes partial attention against its KV shard. The causal mask is handled by FlashInfer internally — tokens only attend to positions ≤ their own. The softmax merge combines partial results correctly regardless of which GPU holds which positions.
+**Causal masking is NOT handled automatically by FlashInfer in CP mode.** FlashInfer's prefill kernel computes `kv_idx` as a linear position in the local KV shard and uses `kv_len` (local shard length) for the causal comparison. With token-level interleaving, local positions don't correspond to global positions:
+
+```
+FlashInfer mask:  kv_idx + qo_len > kv_len + q_idx          (WRONG in CP)
+Correct mask:     (kv_idx * scale + offset) + qo_len > global_kv_len + q_idx
+```
+
+Example (worldSize=2, 8-token prefill, query at q=3):
+- GPU 0 holds tokens at global positions 0,2,4,6 (local 0,1,2,3, local_kv_len=4)
+- GPU 1 holds tokens at global positions 1,3,5,7 (local 0,1,2,3, local_kv_len=4)
+- FlashInfer evaluates `kv_idx + 8 > 4 + 3` → always true → masks everything
+- Correct: GPU 0 local 0→global 0 should be unmasked (0 ≤ 3), local 2→global 4 should be masked (4 > 3)
+
+**Required FlashInfer modifications** (3 new parameters in `MLAParams`):
+
+| Parameter | Type | Default (non-CP) | CP value | Purpose |
+|---|---|---|---|---|
+| `kv_idx_scale` | `uint32_t` | 1 | `worldSize` | Converts local `kv_idx` to global: `global = kv_idx * scale + offset` |
+| `kv_idx_offset` | `uint32_t` | 0 | `rank` | GPU rank offset for position mapping |
+| `global_kv_len` | `IdType*` | same as `kv_len` | per-work-item total seq len | Replaces `kv_len` in causal comparisons |
+
+**4 causal uses of `kv_len` must switch to `global_kv_len` + scale/offset:**
+
+1. `kv_tile_idx` computation — determines last KV tile to process
+2. `mask_tile_idx` computation — determines first tile needing per-element masking
+3. `logits_mask_` call (×2) — per-element causal mask
+
+**1 bounds-check use of `kv_len` stays as `local_kv_len`:**
+
+4. `packed_kv_bound = kv_indptr * block_size + kv_len` — out-of-range guard in `load_kv`
+
+**Decode is unaffected** — the MLA decode kernel has no position-based causal masking (only boundary masking `iter_base + j < iter_bound`), so token-level interleaving requires no FlashInfer changes for decode.
+
+**Scheduler approach:** Pass `causal=false` to the MLA planner for CP prefill (all QO tiles process all local KV tiles), but `mask_mode=kCausal` to the kernel (causal mask applied per-element with global positions). This avoids modifying the scheduler's causal tile optimization (~2x KV tile processing cost, acceptable for initial implementation).
 
 **Prefill-specific changes:**
 - Each GPU only appends its shard of tokens to the KV cache during prefill (position `p` owned by GPU `p % worldSize`)
