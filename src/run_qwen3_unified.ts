@@ -536,7 +536,7 @@ async function main(): Promise<void> {
   if (args.meta) {
     const metaOps = new MetaOps();
     const model: ChatModel = args.useGlm51
-      ? await Glm51Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
+      ? await Glm51Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen, args.cp)
       : args.useQwen35
       ? await Qwen35Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
       : await Qwen3Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen);
@@ -544,7 +544,7 @@ async function main(): Promise<void> {
     const loadBytes = metaOps.totalBytes;
     const loadStats = model.stats();
 
-    const cache = model.createChatCache(args.maxPages, args.cp);
+    const cache = model.createChatCache(args.maxPages);
     const ws = new ExecutionWorkspace(metaOps, args.maxBatch, args.maxSeqLen);
     const inputIds = [1, 2, 3, 4, 5];
     cache.appendTokens(0, cache.prefixMatch(0, inputIds));
@@ -567,9 +567,7 @@ async function main(): Promise<void> {
   const glm: DeviceOps = gpuDevices.length > 1
     ? new ParallelOps(gpuDevices)
     : gpuDevices[0];
-  if (args.cp && glm instanceof ParallelOps) {
-    glm.contextParallel = true;
-  }
+
   const gpuLabel = args.gpus.join(",");
 
   const repoId = args.useGlm51 ? GLM51_REPO
@@ -577,7 +575,7 @@ async function main(): Promise<void> {
     : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
 
   const model: ChatModel = args.useGlm51
-    ? await Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
+    ? await Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen, args.cp)
     : args.useQwen35
     ? await Qwen35Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
     : await Qwen3Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen);
@@ -614,7 +612,7 @@ async function main(): Promise<void> {
       }
     }
   }
-  const cache = model.createChatCache(args.maxPages, args.cp);
+  const cache = model.createChatCache(args.maxPages);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
 
   const tokenizerDir = args.modelDir && fs.existsSync(path.join(args.modelDir, "tokenizer_config.json"))

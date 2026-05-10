@@ -520,7 +520,7 @@ void glm_mla_kv_cache_append(
     uint32_t nnz, uint32_t page_size,
     uint32_t head_dim_ckv, uint32_t head_dim_kpe,
     size_t append_ckv_stride_n, size_t append_kpe_stride_n,
-    uint32_t cp_rank = 0, uint32_t cp_world_size = 1);
+    uint32_t cp_world_size = 1, uint32_t cp_rank = 0);
 
 // CUDA Graph operations
 void glm_graph_begin_capture(GlmCtx* ctx);

@@ -137,22 +137,24 @@ export class Glm51Model extends ChatModel {
   maxBatch: number;
   maxSeqLen: number;
   invFreq: Tensor;
+  readonly contextParallel: boolean;
   private readonly pendingKNope = new Map<string, MlaDeferred>();
   private readonly pendingQNope = new Map<string, MlaDeferred>();
 
-  private constructor(glm: DeviceOps, config: Glm51Config, maxBatch: number, maxSeqLen: number) {
+  private constructor(glm: DeviceOps, config: Glm51Config, maxBatch: number, maxSeqLen: number, contextParallel = false) {
     super(glm);
     this.cfg = config;
     this.maxBatch = maxBatch;
     this.maxSeqLen = maxSeqLen;
     this.eosIds = new Set(config.eosTokenIds);
     this.invFreq = this.initInvFreq(config.qkRopeHeadDim, config.ropeTheta);
+    this.contextParallel = contextParallel;
   }
 
-  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, maxBatch = 1, maxSeqLen = 4096): Promise<Glm51Model> {
+  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, maxBatch = 1, maxSeqLen = 4096, contextParallel = false): Promise<Glm51Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
-    const model = new Glm51Model(glm, config, maxBatch, maxSeqLen);
+    const model = new Glm51Model(glm, config, maxBatch, maxSeqLen, contextParallel);
     await model.fromPretrained(modelDir);
     return model;
   }
@@ -334,11 +336,11 @@ export class Glm51Model extends ChatModel {
     this.tieEmbeddingToLmHead("model.embed_tokens.weight");
   }
 
-  createChatCache(maxPages = 256, contextParallel = false): ChatCache {
+  createChatCache(maxPages = 256): ChatCache {
     const cfg = this.cfg;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
-    return new PagedKVCache(this.glm, nKv, hd, cfg.numHiddenLayers, maxPages, this.maxBatch, 16, cfg.kvLoraRank, cfg.qkRopeHeadDim, contextParallel);
+    return new PagedKVCache(this.glm, nKv, hd, cfg.numHiddenLayers, maxPages, this.maxBatch, 16, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel);
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
@@ -522,8 +524,8 @@ export class Glm51Model extends ChatModel {
     q.streamWaitEvent();
 
     const mlaResult = state.isDecode
-      ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling)
-      : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling);
+      ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel)
+      : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel);
     using attnOut = mlaResult.o;
     using lseBuf = mlaResult.lse;
 

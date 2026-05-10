@@ -792,7 +792,7 @@ void glm_mla_kv_cache_append(
     uint32_t nnz, uint32_t page_size,
     uint32_t head_dim_ckv, uint32_t head_dim_kpe,
     size_t append_ckv_stride_n, size_t append_kpe_stride_n,
-    uint32_t cp_rank, uint32_t cp_world_size) {
+    uint32_t cp_world_size, uint32_t cp_rank) {
 
   cudaSetDevice(ctx->device_id);
 

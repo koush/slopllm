@@ -1780,7 +1780,7 @@ static Napi::Value MlaDecodeRun(const Napi::CallbackInfo& info) {
 static Napi::Value MlaKvCacheAppend(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 16) {
-        Napi::TypeError::New(env, "Expected at least 16 args (ctx, ckv_data, kpe_data, indices, indptr, last_page_len, append_ckv, append_kpe, batch_indices, positions, nnz, page_size, head_dim_ckv, head_dim_kpe, append_ckv_stride_n, append_kpe_stride_n[, cp_rank, cp_world_size])").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected at least 16 args (ctx, ckv_data, kpe_data, indices, indptr, last_page_len, append_ckv, append_kpe, batch_indices, positions, nnz, page_size, head_dim_ckv, head_dim_kpe, append_ckv_stride_n, append_kpe_stride_n[, cp_world_size, cp_rank])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1799,8 +1799,8 @@ static Napi::Value MlaKvCacheAppend(const Napi::CallbackInfo& info) {
     uint32_t head_dim_kpe = info[13].As<Napi::Number>().Uint32Value();
     size_t append_ckv_stride_n = info[14].As<Napi::Number>().Int64Value();
     size_t append_kpe_stride_n = info[15].As<Napi::Number>().Int64Value();
-    uint32_t cp_rank = (info.Length() >= 17) ? info[16].As<Napi::Number>().Uint32Value() : 0;
-    uint32_t cp_world_size = (info.Length() >= 18) ? info[17].As<Napi::Number>().Uint32Value() : 1;
+    uint32_t cp_world_size = (info.Length() >= 17) ? info[16].As<Napi::Number>().Uint32Value() : 1;
+    uint32_t cp_rank = (info.Length() >= 18) ? info[17].As<Napi::Number>().Uint32Value() : 0;
     glm_mla_kv_cache_append(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(ckv_data_ptr), reinterpret_cast<void*>(kpe_data_ptr),
@@ -1812,7 +1812,7 @@ static Napi::Value MlaKvCacheAppend(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(positions_ptr),
         nnz, page_size, head_dim_ckv, head_dim_kpe,
         append_ckv_stride_n, append_kpe_stride_n,
-        cp_rank, cp_world_size);
+        cp_world_size, cp_rank);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("mlaKvCacheAppend failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

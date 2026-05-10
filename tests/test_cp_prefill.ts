@@ -122,7 +122,7 @@ function runMlaPrefill(
     planInfo,
     qoIndptrH, indptrH, kvLenH,
     batchSize, nHeads, headDimCkv, true,
-    cpWorldSize, cpRank,
+    true, cpWorldSize, cpRank,
   );
 
   const ckvStrideN = headDimCkv;
@@ -142,7 +142,7 @@ function runMlaPrefill(
     ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
     oStrideN, oStrideH,
     headDimCkv, headDimKpe,
-    cpWorldSize, cpRank,
+    true, cpWorldSize, cpRank,
   );
   glm.synchronize();
 
@@ -371,7 +371,6 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
     glm1 = new GlmOps(1);
     ref = new GlmOps(2);
     po = new ParallelOps([glm0, glm1]);
-    po.contextParallel = true;
     ws = new WorkspaceBase(po);
     refWs = new WorkspaceBase(ref);
   });
@@ -479,6 +478,7 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
       planInfo,
       qoIndptrH, indptrH, kvLenH,
       batchSize, N_HEADS, HEAD_DIM_CKV, true,
+      true,
     );
 
     // Run MLA prefill — ParallelOps adjusts strides for CP and AllGathers Row-parallel Q
@@ -492,6 +492,7 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
       ckvStridePage, HEAD_DIM_CKV, kpeStridePage, HEAD_DIM_KPE,
       HEAD_DIM_CKV, totalTokens * HEAD_DIM_CKV,
       HEAD_DIM_CKV, HEAD_DIM_KPE,
+      true,
     );
     po.synchronize();
 

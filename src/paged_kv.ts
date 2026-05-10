@@ -241,7 +241,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): { o: Tensor, lse: Tensor } {
+  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, contextParallel?: boolean): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const pageSize = pagedKV.pageSize;
@@ -265,10 +265,11 @@ export class ExecutionWorkspace extends WorkspaceBase {
       ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
       oStrideN, oStrideH,
       headDimCkv, headDimKpe,
+      contextParallel
     );
   }
 
-  mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): { o: Tensor, lse: Tensor } {
+  mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, contextParallel?: boolean): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     return this.glm.mlaDecodeRun(
@@ -278,6 +279,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.mlaDecodePlanInfo,
       batchSize, nHeads, pagedKV.pageSize, smScale,
       headDimCkv, headDimKpe,
+      contextParallel
     );
   }
 
@@ -513,7 +515,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   readonly maxPages: number;
   readonly maxBatch: number;
   readonly pageSize: number;
-  readonly contextParallel: boolean;
   kData: Tensor[];
   vData: Tensor[];
   ckvData: Tensor[];
@@ -537,7 +538,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.maxPages = maxPages;
     this.maxBatch = maxBatch;
     this.pageSize = pageSize;
-    this.contextParallel = contextParallel;
     this.kData = [];
     this.vData = [];
     this.ckvData = [];
