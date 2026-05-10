@@ -30,7 +30,8 @@
                 "--glm51",
                 "--greedy",
                 // "--nvfp4",
-                // "--cp",
+                "--no-cuda-graph",
+                "--cp",
             ],
             "skipFiles": [
                 "<node_internals>/**"

@@ -64,16 +64,44 @@ Per GPU (shard i):
 
 **KV memory savings:** 50% per GPU (2 GPUs), 75% per GPU (4 GPUs)
 
-### Why v_expand BEFORE the AllReduce
+### v_expand Ordering: Before vs After Merge
 
-v_expand is a per-head linear operation: `v_expand(scale * attn) = scale * v_expand(attn)`. This means we can merge after v_expand:
+v_expand is a per-head linear operation: `v_expand(scale * attn) = scale * v_expand(attn)`. This means we can merge either before or after v_expand:
 
 ```
 merged = (scale_0 * attn_0 + scale_1 * attn_1) / (scale_0 + scale_1)
 v_expand(merged) = (scale_0 * v_expand(attn_0) + scale_1 * v_expand(attn_1)) / (scale_0 + scale_1)
 ```
 
-This reduces AllReduce volume by **4×** (vHeadDim=128 vs kvLoraRank=512 per head per position).
+**Option A: v_expand BEFORE merge** (current design)
+- Each GPU v_expands its partial attnOut → partial vExpanded
+- CP merge on vExpanded (smaller: `nHeads × vHeadDim` per token per layer)
+- Requires v_proj **Replicated** (each GPU needs all heads' v_proj rows to v_expand all heads)
+- AllReduce volume: `nHeads × vHeadDim × 2 = 128 × 128 × 2 = 32 KB/layer`
+
+**Option B: merge BEFORE v_expand**
+- CP merge on attnOut first → merged attnOut (correct values on each GPU)
+- Each GPU v_expands only its TP-rank's heads using Column v_proj
+- Requires v_proj **Column** (no replication needed, each GPU uses its shard)
+- AllReduce volume: `nHeads × kvLoraRank × 2 = 128 × 512 × 2 = 128 KB/layer`
+
+**Tradeoff analysis (full model, 78 layers):**
+
+| | v_expand → merge | merge → v_expand |
+|---|---|---|
+| AllReduce per layer | 32 KB | 128 KB |
+| AllReduce per decode token (×78) | 2.5 MB | 10 MB |
+| NVLink latency (300 GB/s) | ~8 µs | ~33 µs |
+| Decode overhead vs ~10ms/token | <0.1% | <0.4% |
+| v_proj VRAM per GPU | **2.16 GB** (Replicated) | **270 MB** (1/8 Column) |
+| Extra VRAM vs Column | **+1.89 GB/GPU** | baseline |
+| Kernel changes needed | none | `headOffset` + `attnNHeads` params |
+
+The 4× AllReduce savings (32 KB vs 128 KB/layer) is negligible in practice — both are dwarfed by attention compute time in prefill (~135 ms/layer) and decode attention (~10 ms/token). The ~25 µs difference per decode token is immaterial.
+
+Replicating v_proj costs ~1.89 GB/GPU of additional VRAM, which is significant for memory-constrained deployments.
+
+**Option B (merge → v_expand)** keeps v_proj Column-parallel, avoiding the VRAM cost at the expense of negligible communication increase. It requires adding `attnNHeads` and `headOffset` parameters to the `mlaVExpand` kernel so each GPU reads the correct head slice from the merged attnOut.
 
 ### Prefill Strategy
 
