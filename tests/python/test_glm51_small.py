@@ -356,7 +356,7 @@ class TestMLA:
             PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
             num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
             HEAD_DIM_CKV, HEAD_DIM_KPE,
-            None, 0, 0, None)
+            None, 0, 0)
 
         glm.synchronize()
 
@@ -829,7 +829,7 @@ class TestMLA:
             PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
             num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
             HEAD_DIM_CKV, HEAD_DIM_KPE,
-            None, 0, 0, None)
+            None, 0, 0)
 
         glm.synchronize()
 

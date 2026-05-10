@@ -178,7 +178,7 @@ def test_mla_prefill_causal(glm, device):
         PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
         num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
         HEAD_DIM_CKV, HEAD_DIM_KPE,
-        None, 0, 0, None)
+        None, 0, 0)
 
     glm.synchronize()
 
@@ -253,7 +253,7 @@ def test_mla_prefill_noncausal(glm, device):
         PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
         num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
         HEAD_DIM_CKV, HEAD_DIM_KPE,
-        None, 0, 0, None)
+        None, 0, 0)
 
     glm.synchronize()
 
@@ -687,7 +687,7 @@ def test_mla_prefill_lse(glm, device):
         PAGE_SIZE * HEAD_DIM_KPE, HEAD_DIM_KPE,
         num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
         HEAD_DIM_CKV, HEAD_DIM_KPE,
-        lse.data_ptr(), 0, 0, None)
+        lse.data_ptr(), 0, 0)
 
     glm.synchronize()
 

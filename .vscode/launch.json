@@ -20,6 +20,9 @@
             "name": "Greedy 8-GPU",
             "runtimeExecutable": "tsx",
             "console": "integratedTerminal",
+            "env": {
+                "NCCL_DEBUG": "INFO",
+            },
             "runtimeArgs": [
                 "${workspaceFolder}/src/run_qwen3_unified.ts",
                 "--gpus", "0,1,2,3,4,5,6,7",
@@ -27,7 +30,7 @@
                 "--glm51",
                 "--greedy",
                 "--nvfp4",
-                // "--meta",
+                "--cp",
             ],
             "skipFiles": [
                 "<node_internals>/**"

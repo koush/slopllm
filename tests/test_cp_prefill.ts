@@ -1,6 +1,9 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "../src/glm_ops";
+import { TensorParallelism } from "../src/device_ops";
+import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
+import { PagedKVCache } from "../src/paged_kv";
 import { WorkspaceBase } from "../src/workspace";
 import { Tensor } from "../src/tensor";
 
@@ -60,6 +63,7 @@ function runMlaPrefill(
   kpeF32: Float32Array,
   qSeqLen: number,
   kvSeqLen: number,
+  globalKvLen: number,
   batchSize: number,
   nHeads: number,
   headDimCkv: number,
@@ -70,7 +74,6 @@ function runMlaPrefill(
   kpeStridePage: number,
   cpWorldSize: number,
   cpRank: number,
-  cpKvLensArr: Int32Array | null,
 ): PrefillResult {
   const totalQTokens = batchSize * qSeqLen;
   const numPages = Math.ceil(kvSeqLen / pageSize);
@@ -108,7 +111,7 @@ function runMlaPrefill(
   const planInfo = allocPinnedI32(ws, [18]);
 
   const kvLenH = allocPinnedI32(ws, [batchSize]);
-  kvLenH.h2d(i32Buf(new Int32Array([kvSeqLen])));
+  kvLenH.h2d(i32Buf(new Int32Array([globalKvLen])));
 
   const qoIndptrH = allocPinnedI32(ws, [batchSize + 1]);
   qoIndptrH.h2d(i32Buf(new Int32Array([0, totalQTokens])));
@@ -123,7 +126,6 @@ function runMlaPrefill(
   );
 
   const vOut = allocBf16(ws, [1, nHeads, totalQTokens, headDimCkv]);
-  const lse = allocF32(ws, [totalQTokens, nHeads]);
 
   const ckvStrideN = headDimCkv;
   const kpeStrideN = headDimKpe;
@@ -134,16 +136,7 @@ function runMlaPrefill(
   const oStrideN = headDimCkv;
   const oStrideH = totalQTokens * headDimCkv;
 
-  let cpKvLenTensor: Tensor | null = null;
-  if (cpWorldSize > 0 && cpKvLensArr) {
-    const maxWorks = 16384;
-    cpKvLenTensor = allocI32(ws, [maxWorks]);
-    const cpKvLenData = new Int32Array(maxWorks);
-    for (let i = 0; i < maxWorks; i++) cpKvLenData[i] = cpKvLensArr[i % batchSize];
-    cpKvLenTensor.h2d(i32Buf(cpKvLenData));
-  }
-
-  glm.mlaPrefillRun(
+  const lse = glm.mlaPrefillRun(
     qNope, qPe, ckv, kpe, indices, vOut,
     floatWs, intWs, planInfo,
     nHeads, pageSize, 1, SM_SCALE,
@@ -151,8 +144,7 @@ function runMlaPrefill(
     ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
     oStrideN, oStrideH,
     headDimCkv, headDimKpe,
-    lse,
-    cpWorldSize, cpRank, cpKvLenTensor,
+    cpWorldSize, cpRank,
   );
   glm.synchronize();
 
@@ -219,10 +211,10 @@ function runCpPrefillTest(
 
   const baseline = runMlaPrefill(
     glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
-    seqLen, seqLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
+    seqLen, seqLen, seqLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
     pageSize, maxPages,
     pageSize * HEAD_DIM_CKV, pageSize * HEAD_DIM_KPE,
-    0, 0, null,
+    0, 0,
   );
 
   const baselineVExpanded = baseline.vOut.mlaVExpand(vProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize);
@@ -232,7 +224,6 @@ function runCpPrefillTest(
 
   const shardVPtrs: number[] = [];
   const shardLsePtrs: number[] = [];
-  const cpKvLens = new Int32Array(batchSize).fill(seqLen);
 
   for (let rank = 0; rank < worldSize; rank++) {
     const { ckvShard, kpeShard, shardLen, maxShardPages } = shardKV(
@@ -244,10 +235,10 @@ function runCpPrefillTest(
 
     const result = runMlaPrefill(
       glm, ws, qNopeF32, qPeF32, ckvShard, kpeShard,
-      seqLen, shardLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
+      seqLen, shardLen, seqLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       vPS, maxShardPages,
       ckvStridePageShard, kpeStridePageShard,
-      worldSize, rank, cpKvLens,
+      worldSize, rank,
     );
 
     const shardVExpanded = result.vOut.mlaVExpand(vProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize);
@@ -332,5 +323,236 @@ describe("CP MLA Prefill", () => {
 
   it("2-shard CP prefill matches baseline (seqLen=128, batch=1, pageSize=16)", () => {
     runCpPrefillTest(glm, ws, 128, 1, 16, 2);
+  });
+});
+
+function shardKVParallel(
+  ckvF32: Float32Array,
+  kpeF32: Float32Array,
+  seqLen: number,
+  pageSize: number,
+  worldSize: number,
+  rank: number,
+  headDimCkv: number,
+  headDimKpe: number,
+): { ckvShard: Float32Array; kpeShard: Float32Array; shardLen: number } {
+  const vPS = pageSize / worldSize;
+  const shardLen = rank < (seqLen % worldSize) ? Math.ceil(seqLen / worldSize) : Math.floor(seqLen / worldSize);
+  const numPages = Math.ceil(seqLen / pageSize);
+  const shardPages = Math.ceil(shardLen / vPS);
+
+  const ckvShard = new Float32Array(shardPages * vPS * headDimCkv);
+  const kpeShard = new Float32Array(shardPages * vPS * headDimKpe);
+
+  for (let localPos = 0; localPos < shardLen; localPos++) {
+    const globalPos = localPos * worldSize + rank;
+    const localPage = Math.floor(localPos / vPS);
+    const localOffset = localPos % vPS;
+
+    for (let d = 0; d < headDimCkv; d++) {
+      ckvShard[(localPage * vPS + localOffset) * headDimCkv + d] = ckvF32[globalPos * headDimCkv + d];
+    }
+    for (let d = 0; d < headDimKpe; d++) {
+      kpeShard[(localPage * vPS + localOffset) * headDimKpe + d] = kpeF32[globalPos * headDimKpe + d];
+    }
+  }
+
+  return { ckvShard, kpeShard, shardLen };
+}
+
+describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let ref: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+  let refWs: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    ref = new GlmOps(2);
+    po = new ParallelOps([glm0, glm1]);
+    po.contextParallel = true;
+    ws = new WorkspaceBase(po);
+    refWs = new WorkspaceBase(ref);
+  });
+
+  after(() => {
+    refWs.free();
+    ref.free();
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  function runParallelCpPrefillTest(
+    seqLen: number,
+    batchSize: number,
+    pageSize: number,
+  ): void {
+    const worldSize = 2;
+    const totalTokens = batchSize * seqLen;
+    const numPages = Math.ceil(seqLen / pageSize);
+    const maxPages = numPages + 1;
+    const nLayers = 1;
+
+    const qNopeF32 = randomData(totalTokens * N_HEADS * HEAD_DIM_CKV);
+    const qPeF32 = randomData(totalTokens * N_HEADS * HEAD_DIM_KPE);
+    const ckvF32 = randomData(numPages * pageSize * HEAD_DIM_CKV);
+    const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
+    const vProjF32 = randomData(N_HEADS * V_HEAD_DIM * HEAD_DIM_CKV);
+
+    // --- Baseline: single-GPU, no CP ---
+    const baseline = runMlaPrefill(
+      ref, refWs, qNopeF32, qPeF32, ckvF32, kpeF32,
+      seqLen, seqLen, seqLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
+      pageSize, maxPages,
+      pageSize * HEAD_DIM_CKV, pageSize * HEAD_DIM_KPE,
+      0, 0,
+    );
+    const vProjRef = refWs.alloc([N_HEADS * V_HEAD_DIM, HEAD_DIM_CKV], "BF16");
+    vProjRef.h2d(f32ToBf16Bytes(vProjF32));
+    const baselineVExpanded = baseline.vOut.mlaVExpand(vProjRef, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize);
+    const baselineVExpandedBuf = Buffer.alloc(totalTokens * N_HEADS * V_HEAD_DIM * 2);
+    baselineVExpanded.d2h(baselineVExpandedBuf);
+    const baselineVExpandedF32 = bf16BytesToF32(baselineVExpandedBuf);
+
+    // --- CP via ParallelOps ---
+    // Create PagedKVCache with contextParallel=true (allocates Row-parallel ckv/kpe)
+    const pagedKV = new PagedKVCache(po, 1, HEAD_DIM_CKV, nLayers, maxPages, batchSize, pageSize, HEAD_DIM_CKV, HEAD_DIM_KPE, true);
+
+    // Setup PagedKVCache page allocation manually
+    pagedKV.reset(batchSize);
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      pagedKV.allocAppendPages(seqIdx, seqLen);
+    }
+
+    // Manually write indices, indptr, lastPageLen via host buffers
+    const indicesData = new Int32Array(maxPages);
+    for (let i = 0; i < numPages; i++) indicesData[i] = i;
+    pagedKV.indicesH.h2d(i32Buf(indicesData));
+    pagedKV.pagesDirtyHost = false;
+    pagedKV.pagesDirtyDevice = true;
+    pagedKV.indices.memcpy(pagedKV.indicesH, maxPages * 4, 1 /* HostToDevice */);
+
+    // Fill each shard's ckv/kpe with interleaved data
+    const ckvData = pagedKV.ckvData[0] as ParallelTensor;
+    const kpeData = pagedKV.kpeData[0] as ParallelTensor;
+    for (let rank = 0; rank < worldSize; rank++) {
+      const { ckvShard, kpeShard } = shardKVParallel(
+        ckvF32, kpeF32, seqLen, pageSize, worldSize, rank, HEAD_DIM_CKV, HEAD_DIM_KPE,
+      );
+      ckvData.shards[rank].h2d(f32ToBf16Bytes(ckvShard));
+      kpeData.shards[rank].h2d(f32ToBf16Bytes(kpeShard));
+    }
+
+    // Allocate Q as Replicated (all shards need all Q heads for CP)
+    const pQNope = ws.alloc([1, totalTokens, N_HEADS * HEAD_DIM_CKV], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const pQPe = ws.alloc([1, totalTokens, N_HEADS * HEAD_DIM_KPE], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    pQNope.h2d(f32ToBf16Bytes(qNopeF32));
+    pQPe.h2d(f32ToBf16Bytes(qPeF32));
+
+    // Allocate v_proj as Replicated (for simplicity)
+    const pVProj = ws.alloc([N_HEADS * V_HEAD_DIM, HEAD_DIM_CKV], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    pVProj.h2d(f32ToBf16Bytes(vProjF32));
+
+    // Allocate workspace tensors (Replicated — same on each GPU)
+    const floatWs = ws.alloc([128 * 1024 * 1024 / 2], "BF16", undefined, TensorParallelism.Replicated);
+    const intWs = ws.alloc([8 * 1024 * 1024 / 4], "I32", undefined, TensorParallelism.Replicated);
+    const pinnedIntWs = ws.allocPinned([8 * 1024 * 1024 / 4], "I32", undefined, TensorParallelism.Replicated);
+    const planInfo = ws.allocPinned([18], "I32", undefined, TensorParallelism.Replicated);
+
+    // Setup indptr, kvLenH — Replicated, same on each shard
+    // kvLenH always contains the GLOBAL KV length; kernel derives local shard length from cp_world_size/cp_rank
+    const shardLen = Math.floor(seqLen / worldSize);
+    const indptrH = ws.allocPinned([batchSize + 1], "I32", undefined, TensorParallelism.Replicated);
+    const kvLenH = ws.allocPinned([batchSize], "I32", undefined, TensorParallelism.Replicated);
+    const qoIndptrH = ws.allocPinned([batchSize + 1], "I32", undefined, TensorParallelism.Replicated);
+    indptrH.h2d(i32Buf(new Int32Array([0, numPages])));
+    kvLenH.h2d(i32Buf(new Int32Array([seqLen])));
+    qoIndptrH.h2d(i32Buf(new Int32Array([0, totalTokens])));
+
+    // Plan MLA prefill — ParallelOps injects cpWorldSize=2, cpRank=i
+    po.mlaPrefillPlan(
+      floatWs, 128 * 1024 * 1024,
+      intWs, pinnedIntWs, 8 * 1024 * 1024,
+      planInfo,
+      qoIndptrH, indptrH, kvLenH,
+      batchSize, N_HEADS, HEAD_DIM_CKV, true,
+    );
+
+    // Allocate output
+    const pOut = ws.alloc([1, N_HEADS, totalTokens, HEAD_DIM_CKV], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    // Run MLA prefill — ParallelOps adjusts strides for CP and AllGathers Row-parallel Q
+    const ckvStridePage = pageSize * HEAD_DIM_CKV;
+    const kpeStridePage = pageSize * HEAD_DIM_KPE;
+    const pLse = po.mlaPrefillRun(
+      pQNope, pQPe, ckvData, kpeData, pagedKV.indices,
+      pOut,
+      floatWs, intWs, planInfo,
+      N_HEADS, pageSize, 1, SM_SCALE,
+      N_HEADS * HEAD_DIM_CKV, HEAD_DIM_CKV, N_HEADS * HEAD_DIM_KPE, HEAD_DIM_KPE,
+      ckvStridePage, HEAD_DIM_CKV, kpeStridePage, HEAD_DIM_KPE,
+      HEAD_DIM_CKV, totalTokens * HEAD_DIM_CKV,
+      HEAD_DIM_CKV, HEAD_DIM_KPE,
+    );
+    po.synchronize();
+
+    // mlaVExpand with LSE — triggers CP merge when contextParallel=true
+    const pVExpanded = pOut.mlaVExpand(pVProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize, pLse) as ParallelTensor;
+    po.synchronize();
+
+    // Verify result is Replicated (CP merge should produce Replicated output)
+    assert.equal(pVExpanded.parallelism, TensorParallelism.Replicated, "CP merge should produce Replicated output");
+
+    // Compare with baseline
+    const mergedBuf = Buffer.alloc(totalTokens * N_HEADS * V_HEAD_DIM * 2);
+    pVExpanded.d2h(mergedBuf);
+    const mergedF32 = bf16BytesToF32(mergedBuf);
+
+    let maxRelErr = 0;
+    let maxAbsErr = 0;
+    let errorCount = 0;
+    const totalElems = totalTokens * N_HEADS * V_HEAD_DIM;
+    const SIGNIFICANCE_THRESHOLD = 0.05;
+    const ABS_TOL = 0.03;
+    const REL_TOL = 0.10;
+    let maxRelErrForSignificant = 0;
+
+    for (let i = 0; i < totalElems; i++) {
+      const merged = mergedF32[i];
+      const expected = baselineVExpandedF32[i];
+      const absErr = Math.abs(merged - expected);
+      const relErr = absErr / Math.max(Math.abs(expected), 1e-6);
+      if (absErr > ABS_TOL + REL_TOL * Math.abs(expected)) {
+        errorCount++;
+      }
+      maxRelErr = Math.max(maxRelErr, relErr);
+      maxAbsErr = Math.max(maxAbsErr, absErr);
+      if (Math.abs(expected) > SIGNIFICANCE_THRESHOLD) {
+        maxRelErrForSignificant = Math.max(maxRelErrForSignificant, relErr);
+      }
+    }
+
+    console.log(`ParallelOps CP prefill (seqLen=${seqLen}, batch=${batchSize}, pageSize=${pageSize}): maxAbsErr=${maxAbsErr.toFixed(6)} maxRelErrForSignificant=${maxRelErrForSignificant.toFixed(6)} errors=${errorCount}/${totalElems}`);
+    assert.ok(errorCount === 0, `${errorCount}/${totalElems} elements exceed tolerance (atol=${ABS_TOL}, rtol=${REL_TOL})`);
+
+    // Cleanup
+    baseline.vOut[Symbol.dispose]();
+    baseline.lse[Symbol.dispose]();
+    vProjRef[Symbol.dispose]();
+    baselineVExpanded[Symbol.dispose]();
+    pagedKV.free();
+  }
+
+  it("2-GPU CP prefill via ParallelOps matches baseline (seqLen=32, batch=1, pageSize=16)", () => {
+    runParallelCpPrefillTest(32, 1, 16);
+  });
+
+  it("2-GPU CP prefill via ParallelOps matches baseline (seqLen=64, batch=1, pageSize=16)", () => {
+    runParallelCpPrefillTest(64, 1, 16);
   });
 });

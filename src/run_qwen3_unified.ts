@@ -52,6 +52,7 @@ interface CliArgs {
   stats: boolean;
   meta: boolean;
   arena: number;
+  cp: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -82,6 +83,7 @@ function parseArgs(argv: string[]): CliArgs {
     stats: false,
     meta: false,
     arena: 0,
+    cp: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -114,6 +116,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--stats") args.stats = true;
     else if (a === "--meta") args.meta = true;
     else if (a === "--arena" && i + 1 < argv.length) args.arena = parseInt(argv[++i], 10);
+    else if (a === "--cp") args.cp = true;
   }
 
   if (args.useQwen35 && args.useFp8) {
@@ -541,7 +544,7 @@ async function main(): Promise<void> {
     const loadBytes = metaOps.totalBytes;
     const loadStats = model.stats();
 
-    const cache = model.createChatCache(args.maxPages);
+    const cache = model.createChatCache(args.maxPages, args.cp);
     const ws = new ExecutionWorkspace(metaOps, args.maxBatch, args.maxSeqLen);
     const inputIds = [1, 2, 3, 4, 5];
     cache.appendTokens(0, cache.prefixMatch(0, inputIds));
@@ -564,6 +567,9 @@ async function main(): Promise<void> {
   const glm: DeviceOps = gpuDevices.length > 1
     ? new ParallelOps(gpuDevices)
     : gpuDevices[0];
+  if (args.cp && glm instanceof ParallelOps) {
+    glm.contextParallel = true;
+  }
   const gpuLabel = args.gpus.join(",");
 
   const repoId = args.useGlm51 ? GLM51_REPO
@@ -608,7 +614,7 @@ async function main(): Promise<void> {
       }
     }
   }
-  const cache = model.createChatCache(args.maxPages);
+  const cache = model.createChatCache(args.maxPages, args.cp);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
 
   const tokenizerDir = args.modelDir && fs.existsSync(path.join(args.modelDir, "tokenizer_config.json"))

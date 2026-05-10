@@ -282,7 +282,11 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): Tensor {
+  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, lse?: Tensor): Tensor {
+    return undefined as never;
+  }
+
+  contextParallelMerge(lse: Tensor, vHeadDim: number, nHeads: number, seqLen: number, batch: number): Tensor {
     return undefined as never;
   }
 

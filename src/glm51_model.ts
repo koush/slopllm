@@ -334,11 +334,11 @@ export class Glm51Model extends ChatModel {
     this.tieEmbeddingToLmHead("model.embed_tokens.weight");
   }
 
-  createChatCache(maxPages = 256): ChatCache {
+  createChatCache(maxPages = 256, contextParallel = false): ChatCache {
     const cfg = this.cfg;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
-    return new PagedKVCache(this.glm, nKv, hd, cfg.numHiddenLayers, maxPages, this.maxBatch, 16, cfg.kvLoraRank, cfg.qkRopeHeadDim);
+    return new PagedKVCache(this.glm, nKv, hd, cfg.numHiddenLayers, maxPages, this.maxBatch, 16, cfg.kvLoraRank, cfg.qkRopeHeadDim, contextParallel);
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
@@ -521,12 +521,14 @@ export class Glm51Model extends ChatModel {
     kvcache.streamWaitEvent();
     q.streamWaitEvent();
 
-    using attnOut = state.isDecode
+    const mlaResult = state.isDecode
       ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling)
-      : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling)
+      : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling);
+    using attnOut = mlaResult.o;
+    using lseBuf = mlaResult.lse;
 
     const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
-    using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, S, B);
+    using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, S, B, lseBuf);
     using oProjBuf = vExpanded.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
 
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);

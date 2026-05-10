@@ -241,7 +241,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, lseOut?: Tensor): Tensor {
+  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const out = this.alloc([1, nHeads, totalTokens, headDimCkv], qNope.type, undefined, qNope.parallelism);
@@ -256,7 +256,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const kpeStrideN = headDimKpe;
     const oStrideN = headDimCkv;
     const oStrideH = totalTokens * headDimCkv;
-    this.glm.mlaPrefillRun(
+    const lse = this.glm.mlaPrefillRun(
       qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       pagedKV.indices,
       out,
@@ -267,16 +267,15 @@ export class ExecutionWorkspace extends WorkspaceBase {
       ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
       oStrideN, oStrideH,
       headDimCkv, headDimKpe,
-      lseOut ?? null
     );
-    return out;
+    return { o: out, lse };
   }
 
-  mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, lseOut?: Tensor): Tensor {
+  mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const out = this.alloc([batchSize, nHeads, 1, headDimCkv], qNope.type, undefined, qNope.parallelism);
-    this.glm.mlaDecodeRun(
+    const lse = this.glm.mlaDecodeRun(
       qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       pagedKV.indices, this.indptrD, this.lastPageLen,
       out,
@@ -284,9 +283,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.mlaDecodePlanInfo,
       batchSize, nHeads, pagedKV.pageSize, smScale,
       headDimCkv, headDimKpe,
-      lseOut ?? null
     );
-    return out;
+    return { o: out, lse };
   }
 
 
@@ -521,6 +519,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   readonly maxPages: number;
   readonly maxBatch: number;
   readonly pageSize: number;
+  readonly contextParallel: boolean;
   kData: Tensor[];
   vData: Tensor[];
   ckvData: Tensor[];
@@ -536,7 +535,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
   getPagedKV(): PagedKVCache { return this; }
 
-  constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0) {
+  constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false) {
     super(glm);
     this.nKv = nKv;
     this.hd = hd;
@@ -544,17 +543,15 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.maxPages = maxPages;
     this.maxBatch = maxBatch;
     this.pageSize = pageSize;
+    this.contextParallel = contextParallel;
     this.kData = [];
     this.vData = [];
     this.ckvData = [];
     this.kpeData = [];
     for (let i = 0; i < nLayers; i++) {
       if (kvLoraRank > 0) {
-        this.ckvData.push(this.alloc([maxPages * pageSize * kvLoraRank], "BF16"));
-        this.kpeData.push(this.alloc([maxPages * pageSize * qkRopeDim], "BF16"));
-        // token level interleave parallelism
-        // this.ckvData.push(this.alloc([maxPages, pageSize, kvLoraRank], "BF16", undefined, TensorParallelism.Row));
-        // this.kpeData.push(this.alloc([maxPages, pageSize, qkRopeDim], "BF16", undefined, TensorParallelism.Row));
+        this.ckvData.push(this.alloc([maxPages, pageSize, kvLoraRank], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
+        this.kpeData.push(this.alloc([maxPages, pageSize, qkRopeDim], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
       } else {
         this.kData.push(this.alloc([maxPages, nKv * pageSize * hd], "BF16", undefined, TensorParallelism.Row));
         this.vData.push(this.alloc([maxPages, nKv * pageSize * hd], "BF16", undefined, TensorParallelism.Row));

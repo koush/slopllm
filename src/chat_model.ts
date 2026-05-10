@@ -49,7 +49,7 @@ export abstract class ChatModel extends WorkspaceBase {
     super(glm);
   }
 
-  abstract createChatCache(maxPages?: number): ChatCache;
+  abstract createChatCache(maxPages?: number, contextParallel?: boolean): ChatCache;
   abstract forward(state: ExecutionState): Tensor;
 
   prefillBatchPlanHook(_inputIdsList: number[][], _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void {}

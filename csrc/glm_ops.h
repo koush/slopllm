@@ -472,8 +472,7 @@ void glm_mla_prefill_run(
     uint32_t o_stride_n, uint32_t o_stride_h,
     uint32_t head_dim_ckv, uint32_t head_dim_kpe,
     float* lse,
-    uint32_t cp_world_size, uint32_t cp_rank,
-    int32_t* cp_kv_len);
+    uint32_t cp_world_size, uint32_t cp_rank);
 
 // MLA Decode: Plan phase
 // plan_info: output array of at least 10 int64_t elements (DecodePlanInfo)
