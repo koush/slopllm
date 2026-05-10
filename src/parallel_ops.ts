@@ -1286,10 +1286,6 @@ export class ParallelTensor extends Tensor {
   mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, lse?: Tensor): Tensor {
     super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
     const pVProj = vProj as ParallelTensor;
-    for (const device of this.devices) {
-      device.synchronize();
-    }
-
     if (this.parallelism === TensorParallelism.PartialSum || pVProj.parallelism === TensorParallelism.PartialSum) {
       throw new Error(`mlaVExpand: unsupported parallelism this=${this.parallelism}, vProj=${pVProj.parallelism}`);
     }
@@ -1505,9 +1501,6 @@ export class ParallelOps implements DeviceOps {
     if (devices.length > 1) {
       const deviceIds = devices.map(d => d.device);
       this.comms = getNativeAddon().ncclCommInitAll(deviceIds);
-      for (const device of devices) {
-        device.synchronize();
-      }
     } else {
       this.comms = [];
     }
@@ -1702,17 +1695,8 @@ export class ParallelOps implements DeviceOps {
     mergedLse: Tensor | null,
     workspace: WorkspaceBase,
   ): ParallelTensor {
-    for (const device of this.devices) {
-      device.synchronize();
-    }
     using gatheredVOutShards = partialVOuts.allGather(partialVOuts.workspace);
-    for (const device of this.devices) {
-      device.synchronize();
-    }
     using gatheredLseShards = partialLses.allGather(partialLses.workspace);
-    for (const device of this.devices) {
-      device.synchronize();
-    }
     const shardWss = this.getShardWorkspaces(workspace);
     const fullVOutShape = [batchSize, numHeads * vHeadDim];
     const mergedVOutShards = shardWss.map(ws => ws.alloc(fullVOutShape, "BF16"));
@@ -2075,10 +2059,6 @@ export class ParallelOps implements DeviceOps {
   }
 
   mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: number, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, cpWorldSize: number = 0, cpRank: number = 0): { o: Tensor, lse: Tensor } {
-    for (const device of this.devices) {
-      device.synchronize();
-    }
-    
     let pQNope = this.cast(qNope);
     let pQPe = this.cast(qPe);
     const pCkvData = this.cast(ckvData);
@@ -2097,7 +2077,7 @@ export class ParallelOps implements DeviceOps {
     const totalTokens = oStrideH / headDimCkv;
     const lsePar = this.contextParallel ? TensorParallelism.Column : TensorParallelism.Replicated;
     const lseFullShape = this.contextParallel ? [totalTokens * this.worldSize, numHeads] : [totalTokens, numHeads];
-    const oPar = this.contextParallel ? TensorParallelism.Replicated : TensorParallelism.Column;
+    const oPar = this.contextParallel ? TensorParallelism.Replicated : qNope.parallelism;
     const oFullShape = [1, numHeads, totalTokens, headDimCkv];
     // In CP mode, Q may be Row-parallel (head-sharded from Column-parallel weights).
     // AllGather to Replicated so each GPU has all heads for its KV shard.
@@ -2127,8 +2107,8 @@ export class ParallelOps implements DeviceOps {
       if (gatheredQNope) gatheredQNope[Symbol.dispose]();
       if (gatheredQPe) gatheredQPe[Symbol.dispose]();
     }
-    const o = new ParallelTensor(pFloatWs.workspace, this, oPar, oShards, oFullShape, qNope.type, "mlaPrefillO", false, undefined);
-    const lse = new ParallelTensor(pFloatWs.workspace, this, lsePar, lseShards, lseFullShape, "F32", "mlaPrefillLse", false, undefined);
+    const o = new ParallelTensor(pFloatWs.workspace, this, oPar, oShards, oFullShape, qNope.type, undefined, false, undefined);
+    const lse = new ParallelTensor(pFloatWs.workspace, this, lsePar, lseShards, lseFullShape, "F32", undefined, false, undefined);
     return { o, lse };
   }
 
@@ -2160,7 +2140,7 @@ export class ParallelOps implements DeviceOps {
     const effectivePageSize = this.contextParallel ? pageSize / this.worldSize : pageSize;
     const lsePar = this.contextParallel ? TensorParallelism.Column : TensorParallelism.Replicated;
     const lseFullShape = this.contextParallel ? [batchSize * this.worldSize, numQoHeads] : [batchSize, numQoHeads];
-    const oPar = this.contextParallel ? TensorParallelism.Replicated : TensorParallelism.Column;
+    const oPar = this.contextParallel ? TensorParallelism.Replicated : qNope.parallelism;
     const oFullShape = [batchSize, numQoHeads, 1, headDimCkv];
     let gatheredQNope: ParallelTensor | undefined;
     let gatheredQPe: ParallelTensor | undefined;
@@ -2186,8 +2166,8 @@ export class ParallelOps implements DeviceOps {
       if (gatheredQNope) gatheredQNope[Symbol.dispose]();
       if (gatheredQPe) gatheredQPe[Symbol.dispose]();
     }
-    const o = new ParallelTensor(pFloatWs.workspace, this, oPar, oShards, oFullShape, qNope.type, "mlaDecodeO", false, undefined);
-    const lse = new ParallelTensor(pFloatWs.workspace, this, lsePar, lseShards, lseFullShape, "F32", "mlaDecodeLse", false, undefined);
+    const o = new ParallelTensor(pFloatWs.workspace, this, oPar, oShards, oFullShape, qNope.type, undefined, false, undefined);
+    const lse = new ParallelTensor(pFloatWs.workspace, this, lsePar, lseShards, lseFullShape, "F32", undefined, false, undefined);
     return { o, lse };
   }
 
