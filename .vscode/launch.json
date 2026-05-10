@@ -29,8 +29,8 @@
                 "--prompt", "what is the capital of france",
                 "--glm51",
                 "--greedy",
-                "--nvfp4",
-                "--cp",
+                // "--nvfp4",
+                // "--cp",
             ],
             "skipFiles": [
                 "<node_internals>/**"
