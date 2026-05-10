@@ -73,35 +73,55 @@ merged = (scale_0 * attn_0 + scale_1 * attn_1) / (scale_0 + scale_1)
 v_expand(merged) = (scale_0 * v_expand(attn_0) + scale_1 * v_expand(attn_1)) / (scale_0 + scale_1)
 ```
 
-**Option A: v_expand BEFORE merge** (current design)
-- Each GPU v_expands its partial attnOut → partial vExpanded
-- CP merge on vExpanded (smaller: `nHeads × vHeadDim` per token per layer)
-- Requires v_proj **Replicated** (each GPU needs all heads' v_proj rows to v_expand all heads)
+**Option A: v_expand BEFORE merge, v_proj Replicated**
+- Each GPU v_expands all heads from partial attnOut → partial vExpanded (all heads)
+- CP merge on vExpanded across all GPUs
+- Requires v_proj **Replicated** (each GPU needs all heads' v_proj rows)
 - AllReduce volume: `nHeads × vHeadDim × 2 = 128 × 128 × 2 = 32 KB/layer`
+- No kernel changes or TP grouping needed
 
-**Option B: merge BEFORE v_expand**
+**Option B: merge BEFORE v_expand, v_proj Column**
 - CP merge on attnOut first → merged attnOut (correct values on each GPU)
 - Each GPU v_expands only its TP-rank's heads using Column v_proj
-- Requires v_proj **Column** (no replication needed, each GPU uses its shard)
+- Requires v_proj **Column** (no replication, each GPU uses its shard)
 - AllReduce volume: `nHeads × kvLoraRank × 2 = 128 × 512 × 2 = 128 KB/layer`
+- Requires `headOffset` + `attnNHeads` kernel params so each GPU reads the correct head slice from merged attnOut
+
+**Option C: v_expand BEFORE merge, v_proj Column**
+- Each GPU v_expands only its TP-rank's heads from partial attnOut (using headOffset)
+- CP merge **within each TP rank group** combines partial vExpanded for those heads
+- Requires v_proj **Column** (no replication)
+- AllReduce volume: `nHeads × vHeadDim × 2 = 128 × 128 × 2 = 32 KB/layer` (same as Option A)
+- Requires `headOffset` + `attnNHeads` kernel params
+- Requires **grouped CP merge**: merge within TP rank groups, not across all GPUs
+
+Example with 8 GPUs as 2 TP × 4 CP:
+```
+TP rank 0: GPU 0 (cp=0), GPU 2 (cp=1), GPU 4 (cp=2), GPU 6 (cp=3)
+  → v_expand heads [0..3], merge partial results across these 4 GPUs
+
+TP rank 1: GPU 1 (cp=0), GPU 3 (cp=1), GPU 5 (cp=2), GPU 7 (cp=3)
+  → v_expand heads [4..7], merge partial results across these 4 GPUs
+```
 
 **Tradeoff analysis (full model, 78 layers):**
 
-| | v_expand → merge | merge → v_expand |
-|---|---|---|
-| AllReduce per layer | 32 KB | 128 KB |
-| AllReduce per decode token (×78) | 2.5 MB | 10 MB |
-| NVLink latency (300 GB/s) | ~8 µs | ~33 µs |
-| Decode overhead vs ~10ms/token | <0.1% | <0.4% |
-| v_proj VRAM per GPU | **2.16 GB** (Replicated) | **270 MB** (1/8 Column) |
-| Extra VRAM vs Column | **+1.89 GB/GPU** | baseline |
-| Kernel changes needed | none | `headOffset` + `attnNHeads` params |
+| | A: v_expand→merge, Replicated | B: merge→v_expand, Column | C: v_expand→merge, Column |
+|---|---|---|---|
+| AllReduce per layer | 32 KB | 128 KB | 32 KB |
+| AllReduce per decode token (×78) | 2.5 MB | 10 MB | 2.5 MB |
+| NVLink latency (300 GB/s) | ~8 µs | ~33 µs | ~8 µs |
+| Decode overhead vs ~10ms/token | <0.1% | <0.4% | <0.1% |
+| v_proj VRAM per GPU | **2.16 GB** (Replicated) | **270 MB** (1/8 Column) | **270 MB** (1/8 Column) |
+| Extra VRAM vs Column | **+1.89 GB/GPU** | baseline | baseline |
+| Kernel changes | none | `headOffset` + `attnNHeads` | `headOffset` + `attnNHeads` |
+| CP merge | simple (all GPUs) | simple (all GPUs) | **grouped by TP rank** |
 
 The 4× AllReduce savings (32 KB vs 128 KB/layer) is negligible in practice — both are dwarfed by attention compute time in prefill (~135 ms/layer) and decode attention (~10 ms/token). The ~25 µs difference per decode token is immaterial.
 
-Replicating v_proj costs ~1.89 GB/GPU of additional VRAM, which is significant for memory-constrained deployments.
+Replicating v_proj costs ~1.89 GB/GPU of additional VRAM (Option A), which is significant for memory-constrained deployments.
 
-**Option B (merge → v_expand)** keeps v_proj Column-parallel, avoiding the VRAM cost at the expense of negligible communication increase. It requires adding `attnNHeads` and `headOffset` parameters to the `mlaVExpand` kernel so each GPU reads the correct head slice from the merged attnOut.
+**Option C** achieves the best of both: Column v_proj (270 MB/GPU) with the smaller AllReduce volume (32 KB/layer). The cost is kernel changes (`headOffset`/`attnNHeads`) and grouped CP merge (merging within TP rank groups instead of across all GPUs). The current `contextParallelMerge` implementation merges across all GPUs as a single group; supporting Option C requires it to merge only GPUs sharing the same TP rank.
 
 ### Prefill Strategy
 

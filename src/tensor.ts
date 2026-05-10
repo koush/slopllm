@@ -101,10 +101,6 @@ export abstract class Tensor implements Disposable {
 
   abstract free(): void;
 
-  all(_workspace: WorkspaceBase): Tensor {
-    return this;
-  }
-
   [Symbol.dispose](): void {
     if (this.name !== undefined) {
       throw new Error("Cannot dispose named tensor");

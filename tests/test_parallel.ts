@@ -758,7 +758,7 @@ describe("ParallelTensor.all", () => {
 
   it("all() on Replicated returns same tensor", () => {
     const pt = ws.alloc([4, 4], "F32", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const result = pt.all(ws);
+    const result = pt.allGather(ws);
     assert.strictEqual(result, pt);
   });
 
@@ -777,7 +777,7 @@ describe("ParallelTensor.all", () => {
     pt.shard(1).h2d(Buffer.from(shard1F32.buffer));
     po.synchronize();
 
-    const result = pt.all(ws);
+    const result = pt.allGather(ws);
     assert.strictEqual(result, pt, "all() on PartialSum should return same tensor (allReduce is in-place)");
     assert.equal(pt.parallelism, TensorParallelism.Replicated, "parallelism should be Replicated after all()");
     po.synchronize();
@@ -807,7 +807,7 @@ describe("ParallelTensor.all", () => {
     pt.h2d(f32ToBf16Bytes(fullF32));
     po.synchronize();
 
-    const result = pt.all(ws);
+    const result = pt.allGather(ws);
     assert.notStrictEqual(result, pt, "all() on Row should return new tensor");
     assert.equal(result.parallelism, TensorParallelism.Replicated);
     assert.equal(pt.parallelism, TensorParallelism.Row, "original tensor should still be Row");

@@ -231,18 +231,6 @@ export class ParallelTensor extends Tensor {
     throw new Error(`allGather: unsupported parallelism ${this.parallelism}`);
   }
 
-  all(workspace: WorkspaceBase): ParallelTensor {
-    switch (this.parallelism) {
-      case TensorParallelism.Replicated:
-        return this;
-      case TensorParallelism.PartialSum:
-        return this.allReduce();
-      case TensorParallelism.Row:
-      case TensorParallelism.Column:
-        return this.allGather(workspace);
-    }
-  }
-
   h2d(data: Buffer, size?: number): void {
     const eb = ParallelTensor.elemBytes(this.type);
 
@@ -2077,7 +2065,7 @@ export class ParallelOps implements DeviceOps {
     const totalTokens = oStrideH / headDimCkv;
     const lsePar = this.contextParallel ? TensorParallelism.Column : TensorParallelism.Replicated;
     const lseFullShape = this.contextParallel ? [totalTokens * this.worldSize, numHeads] : [totalTokens, numHeads];
-    const oPar = this.contextParallel ? TensorParallelism.Replicated : qNope.parallelism;
+    const oPar = this.contextParallel ? TensorParallelism.PartialSoftmax : qNope.parallelism;
     const oFullShape = [1, numHeads, totalTokens, headDimCkv];
     // In CP mode, Q may be Row-parallel (head-sharded from Column-parallel weights).
     // AllGather to Replicated so each GPU has all heads for its KV shard.
@@ -2139,7 +2127,7 @@ export class ParallelOps implements DeviceOps {
     const effectivePageSize = this.contextParallel ? pageSize / this.worldSize : pageSize;
     const lsePar = this.contextParallel ? TensorParallelism.Column : TensorParallelism.Replicated;
     const lseFullShape = this.contextParallel ? [batchSize * this.worldSize, numQoHeads] : [batchSize, numQoHeads];
-    const oPar = this.contextParallel ? TensorParallelism.Replicated : qNope.parallelism;
+    const oPar = this.contextParallel ? TensorParallelism.PartialSoftmax : qNope.parallelism;
     const oFullShape = [batchSize, numQoHeads, 1, headDimCkv];
     let gatheredQNope: ParallelTensor | undefined;
     let gatheredQPe: ParallelTensor | undefined;

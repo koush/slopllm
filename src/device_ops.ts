@@ -6,6 +6,7 @@ export enum TensorParallelism {
   Column = "column",
   Row = "row",
   PartialSum = "partial_sum",
+  PartialSoftmax = "partial_softmax",
 }
 
 export interface StridedMmap {
