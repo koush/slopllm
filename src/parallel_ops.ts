@@ -2101,7 +2101,6 @@ export class ParallelOps implements DeviceOps {
         const shardResult = this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], effectiveNumHeads, effectivePageSize, maskMode, smScale, effectiveQNopeStrideN, qNopeStrideH, effectiveQPeStrideN, qPeStrideH, effectiveCkvStridePage, ckvStrideN, effectiveKpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, effectiveCpWorldSize, effectiveCpRank);
         oShards.push(shardResult.o);
         lseShards.push(shardResult.lse);
-        this.devices[i].synchronize();
       }
     } finally {
       if (gatheredQNope) gatheredQNope[Symbol.dispose]();
