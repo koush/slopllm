@@ -777,8 +777,8 @@ describe("ParallelTensor.all", () => {
     pt.shard(1).h2d(Buffer.from(shard1F32.buffer));
     po.synchronize();
 
-    const result = pt.allGather(ws);
-    assert.strictEqual(result, pt, "all() on PartialSum should return same tensor (allReduce is in-place)");
+    const result = pt.allReduce();
+    assert.strictEqual(result, pt, "allReduce() on PartialSum should return same tensor (allReduce is in-place)");
     assert.equal(pt.parallelism, TensorParallelism.Replicated, "parallelism should be Replicated after all()");
     po.synchronize();
 
