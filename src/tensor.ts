@@ -278,7 +278,7 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, lse?: Tensor): Tensor {
+  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, lse?: Tensor, headOffset?: number, attnNHeads?: number): Tensor {
     return undefined as never;
   }
 

@@ -103,7 +103,7 @@ interface NativeAddon {
   memcpy2d(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void;
   bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number): void;
   ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
-  mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): void;
+  mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, attnNHeads: number, headOffset: number): void;
   ncclUniqueId(outId: Buffer): void;
   ncclGroupStart(): void;
   ncclGroupEnd(): void;
@@ -379,11 +379,11 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number): Tensor {
+  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, _lse?: Tensor, headOffset: number = 0, attnNHeads: number = nHeads): Tensor {
     super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
     const BS = batch * seqLen;
     const out = this.workspace.alloc([BS, nHeads * vHeadDim], this.type);
-    getNativeAddon().mlaVExpand(this.glm.ctx, out.data, this.data, vProj.data, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
+    getNativeAddon().mlaVExpand(this.glm.ctx, out.data, this.data, vProj.data, kvLoraRank, vHeadDim, nHeads, seqLen, batch, attnNHeads, headOffset);
     return out;
   }
 

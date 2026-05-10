@@ -538,11 +538,14 @@ static Napi::Value MlaVExpand(const Napi::CallbackInfo& info) {
     int n_heads = info[6].As<Napi::Number>().Int32Value();
     int seq_len = info[7].As<Napi::Number>().Int32Value();
     int batch = info[8].As<Napi::Number>().Int32Value();
+    int attn_n_heads = info[9].As<Napi::Number>().Int32Value();
+    int head_offset = info[10].As<Napi::Number>().Int32Value();
     glm_mla_v_expand(reinterpret_cast<GlmCtx*>(ctx_ptr),
                       reinterpret_cast<void*>(result_ptr),
                       reinterpret_cast<const void*>(attn_out_ptr),
                       reinterpret_cast<const void*>(v_proj_ptr),
-                      kv_lora_rank, v_head_dim, n_heads, seq_len, batch);
+                      kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
+                      attn_n_heads, head_offset);
     return env.Undefined();
 }
 

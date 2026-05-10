@@ -369,14 +369,15 @@ __global__ void __launch_bounds__(256, 4) mla_v_expand_kernel(
     const __nv_bfloat16* __restrict__ attn_out,
     const __nv_bfloat16* __restrict__ v_proj,
     int kv_lora_rank, int v_head_dim, int n_heads,
-    int seq_len, int batch
+    int seq_len, int batch,
+    int attn_n_heads, int head_offset
 ) {
     int bhs = blockIdx.x;
     int s = bhs % seq_len;
     int h = (bhs / seq_len) % n_heads;
     int b = bhs / (seq_len * n_heads);
 
-    const __nv_bfloat16* attn_row = attn_out + ((b * n_heads + h) * seq_len + s) * kv_lora_rank;
+    const __nv_bfloat16* attn_row = attn_out + ((b * attn_n_heads + h + head_offset) * seq_len + s) * kv_lora_rank;
     const __nv_bfloat16* w_base = v_proj + h * v_head_dim * kv_lora_rank;
 
     for (int j = threadIdx.x; j < v_head_dim; j += blockDim.x) {
@@ -392,14 +393,16 @@ __global__ void __launch_bounds__(256, 4) mla_v_expand_kernel(
 void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        const void* v_proj,
                        int kv_lora_rank, int v_head_dim, int n_heads,
-                       int seq_len, int batch) {
+                       int seq_len, int batch,
+                       int attn_n_heads, int head_offset) {
     cudaSetDevice(ctx->device_id);
     int total_rows = batch * n_heads * seq_len;
     int block_size = compute_block_size(v_head_dim, true);
     mla_v_expand_kernel<<<total_rows, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
         (const __nv_bfloat16*)v_proj,
-        kv_lora_rank, v_head_dim, n_heads, seq_len, batch);
+        kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
+        attn_n_heads, head_offset);
 }
 
 // ---------------------------------------------------------------------------

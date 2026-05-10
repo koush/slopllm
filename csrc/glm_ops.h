@@ -117,12 +117,14 @@ void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
                          int seq_len, int batch, int in_stride, bool interleaved);
 
 // MLA V-Expand: per-head matmul attn_out @ v_proj^T
-// attn_out: [B, nH, S, kv_lora_rank] (HND), v_proj: [nH*v_head_dim, kv_lora_rank]
-// result: [B, nH, S, v_head_dim] (HND)
+// attn_out: [B, attn_n_heads, S, kv_lora_rank] (HND), v_proj: [n_heads*v_head_dim, kv_lora_rank]
+// result: [B, n_heads, S, v_head_dim] (HND)
+// head_offset: offset into attn_n_heads dimension of attn_out for this shard
 void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        const void* v_proj,
                        int kv_lora_rank, int v_head_dim, int n_heads,
-                       int seq_len, int batch);
+                       int seq_len, int batch,
+                       int attn_n_heads, int head_offset);
 
 void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
               const void* input, int k, int dim, int batch);

@@ -1277,13 +1277,17 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism === TensorParallelism.PartialSum || pVProj.parallelism === TensorParallelism.PartialSum) {
       throw new Error(`mlaVExpand: unsupported parallelism this=${this.parallelism}, vProj=${pVProj.parallelism}`);
     }
-    const shardNHeads = (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column)
+    const shardNHeads = (pVProj.parallelism === TensorParallelism.Row || pVProj.parallelism === TensorParallelism.Column)
       ? this.parallelOps.shardDim(nHeads, "mlaVExpand nHeads")
       : nHeads;
+    const isPartialSoftmax = this.parallelism === TensorParallelism.PartialSoftmax;
+    const attnNHeads = isPartialSoftmax ? nHeads : shardNHeads;
+    const isVProjSharded = pVProj.parallelism === TensorParallelism.Row || pVProj.parallelism === TensorParallelism.Column;
     const BS = batch * seqLen;
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      outShards.push(this.shards[i].mlaVExpand(pVProj.shards[i], kvLoraRank, vHeadDim, shardNHeads, seqLen, batch));
+      const shardHeadOffset = (isPartialSoftmax && isVProjSharded) ? i * shardNHeads : 0;
+      outShards.push(this.shards[i].mlaVExpand(pVProj.shards[i], kvLoraRank, vHeadDim, shardNHeads, seqLen, batch, undefined, shardHeadOffset, attnNHeads));
     }
     const isCp = this.parallelOps.contextParallel && !!lse;
     const vExpandedPar = isCp ? TensorParallelism.Column : this.parallelism;
