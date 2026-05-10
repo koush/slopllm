@@ -125,8 +125,6 @@ function runMlaPrefill(
     cpWorldSize, cpRank,
   );
 
-  const vOut = allocBf16(ws, [1, nHeads, totalQTokens, headDimCkv]);
-
   const ckvStrideN = headDimCkv;
   const kpeStrideN = headDimKpe;
   const qNopeStrideN = nHeads * headDimCkv;
@@ -136,8 +134,8 @@ function runMlaPrefill(
   const oStrideN = headDimCkv;
   const oStrideH = totalQTokens * headDimCkv;
 
-  const lse = glm.mlaPrefillRun(
-    qNope, qPe, ckv, kpe, indices, vOut,
+  const { o: vOut, lse } = glm.mlaPrefillRun(
+    qNope, qPe, ckv, kpe, indices,
     floatWs, intWs, planInfo,
     nHeads, pageSize, 1, SM_SCALE,
     qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH,
@@ -483,15 +481,11 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
       batchSize, N_HEADS, HEAD_DIM_CKV, true,
     );
 
-    // Allocate output
-    const pOut = ws.alloc([1, N_HEADS, totalTokens, HEAD_DIM_CKV], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-
     // Run MLA prefill — ParallelOps adjusts strides for CP and AllGathers Row-parallel Q
     const ckvStridePage = pageSize * HEAD_DIM_CKV;
     const kpeStridePage = pageSize * HEAD_DIM_KPE;
-    const pLse = po.mlaPrefillRun(
+    const { o: pOut, lse: pLse } = po.mlaPrefillRun(
       pQNope, pQPe, ckvData, kpeData, pagedKV.indices,
-      pOut,
       floatWs, intWs, planInfo,
       N_HEADS, pageSize, 1, SM_SCALE,
       N_HEADS * HEAD_DIM_CKV, HEAD_DIM_CKV, N_HEADS * HEAD_DIM_KPE, HEAD_DIM_KPE,

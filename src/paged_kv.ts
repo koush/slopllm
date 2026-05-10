@@ -244,7 +244,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
   mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
-    const out = this.alloc([1, nHeads, totalTokens, headDimCkv], qNope.type, undefined, qNope.parallelism);
     const pageSize = pagedKV.pageSize;
     const qNopeStrideN = nHeads * headDimCkv;
     const qNopeStrideH = headDimCkv;
@@ -256,10 +255,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const kpeStrideN = headDimKpe;
     const oStrideN = headDimCkv;
     const oStrideH = totalTokens * headDimCkv;
-    const lse = this.glm.mlaPrefillRun(
+    return this.glm.mlaPrefillRun(
       qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       pagedKV.indices,
-      out,
       this.floatWs, this.intWs,
       this.mlaPrefillPlanInfo,
       nHeads, pageSize, 1, smScale,
@@ -268,23 +266,19 @@ export class ExecutionWorkspace extends WorkspaceBase {
       oStrideN, oStrideH,
       headDimCkv, headDimKpe,
     );
-    return { o: out, lse };
   }
 
   mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
-    const out = this.alloc([batchSize, nHeads, 1, headDimCkv], qNope.type, undefined, qNope.parallelism);
-    const lse = this.glm.mlaDecodeRun(
+    return this.glm.mlaDecodeRun(
       qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       pagedKV.indices, this.indptrD, this.lastPageLen,
-      out,
       this.floatWs, this.intWs,
       this.mlaDecodePlanInfo,
       batchSize, nHeads, pagedKV.pageSize, smScale,
       headDimCkv, headDimKpe,
     );
-    return { o: out, lse };
   }
 
 
