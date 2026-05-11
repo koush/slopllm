@@ -639,8 +639,8 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().kvCacheWrite(this.ctx, ptr(srcK), ptr(srcV), ptr(dstK), ptr(dstV), ptr(slotMapping), batchSize, nKv, hd, pageSize, srcKTokenStride, srcKHeadStride, srcVTokenStride, srcVHeadStride);
   }
 
-  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number, _contextParallel?: boolean, cpWorldSize = 1, cpRank = 0): void {
-    getNativeAddon().decodeStep(this.ctx, ptr(positionIds), ptr(lastPageLen), ptr(slotMapping), ptr(indptr), ptr(indices), pageSize, batchSize, cpWorldSize, cpRank);
+  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number): void {
+    getNativeAddon().decodeStep(this.ctx, ptr(positionIds), ptr(lastPageLen), ptr(slotMapping), ptr(indptr), ptr(indices), pageSize, batchSize, 1, 0);
   }
 
   mlaDecodeStep(positionIds: Tensor, lastPageLen: Tensor, indptr: Tensor, pageSize: number, batchSize: number, _contextParallel?: boolean, cpWorldSize = 1, cpRank = 0): void {

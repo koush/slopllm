@@ -1983,16 +1983,14 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
+  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number): void {
     const pPositionIds = this.cast(positionIds);
     const pLastPageLen = this.cast(lastPageLen);
     const pSlotMapping = this.cast(slotMapping);
     const pIndptr = this.cast(indptr);
     const pIndices = this.cast(indices);
-    const cpWs = contextParallel ? this.worldSize : 1;
     for (let i = 0; i < this.worldSize; i++) {
-      const cpR = contextParallel ? i : 0;
-      this.devices[i].decodeStep(pPositionIds.shards[i], pLastPageLen.shards[i], pSlotMapping.shards[i], pIndptr.shards[i], pIndices.shards[i], pageSize, batchSize, contextParallel, cpWs, cpR);
+      this.devices[i].decodeStep(pPositionIds.shards[i], pLastPageLen.shards[i], pSlotMapping.shards[i], pIndptr.shards[i], pIndices.shards[i], pageSize, batchSize);
     }
   }
 

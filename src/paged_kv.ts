@@ -210,8 +210,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.glm.decodeStep(
         this.positionIds, this.lastPageLen, this.slotMapping,
         this.indptrD, pagedKV.indices,
-        pagedKV.pageSize, batchSize,
-        pagedKV.contextParallel
+        pagedKV.pageSize, batchSize
       );
     } else {
       this.glm.mlaDecodeStep(
