@@ -448,7 +448,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
         this.mlaPrefillPlanInfo,
         this.qoIndptrH, this.indptrH,
         this.kvLenH,
-        batchSize, nHeads, cfg.kvLoraRank!, true, pagedKV.contextParallel
+        batchSize, nHeads, cfg.kvLoraRank!, true,
+        pagedKV.pageSize, pagedKV.seqKvLens,
+        pagedKV.contextParallel
       );
     }
 

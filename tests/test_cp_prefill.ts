@@ -122,6 +122,7 @@ function runMlaPrefill(
     planInfo,
     qoIndptrH, indptrH, kvLenH,
     batchSize, nHeads, headDimCkv, true,
+    pageSize, [kvSeqLen],
     true, cpWorldSize, cpRank,
   );
 
@@ -478,6 +479,7 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
       planInfo,
       qoIndptrH, indptrH, kvLenH,
       batchSize, N_HEADS, HEAD_DIM_CKV, true,
+      pageSize, [seqLen],
       true,
     );
 
