@@ -113,6 +113,9 @@ function runMlaPrefill(
   const kvLenH = allocPinnedI32(ws, [batchSize]);
   kvLenH.h2d(i32Buf(new Int32Array([globalKvLen])));
 
+  const lastPageLenH = allocPinnedI32(ws, [batchSize]);
+  lastPageLenH.h2d(i32Buf(new Int32Array([lastPageLen])));
+
   const qoIndptrH = allocPinnedI32(ws, [batchSize + 1]);
   qoIndptrH.h2d(i32Buf(new Int32Array([0, totalQTokens])));
 
@@ -120,7 +123,7 @@ function runMlaPrefill(
     floatWs, 128 * 1024 * 1024,
     intWs, pinnedIntWs, 8 * 1024 * 1024,
     planInfo,
-    qoIndptrH, indptrH, kvLenH,
+    qoIndptrH, indptrH, kvLenH, lastPageLenH,
     batchSize, nHeads, headDimCkv, true,
     pageSize, [kvSeqLen],
     true, cpWorldSize, cpRank,
@@ -467,6 +470,7 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
     const shardLen = Math.floor(seqLen / worldSize);
     const indptrH = ws.allocPinned([batchSize + 1], "I32", undefined, TensorParallelism.Replicated);
     const kvLenH = ws.allocPinned([batchSize], "I32", undefined, TensorParallelism.Replicated);
+    const lastPageLenH = ws.allocPinned([batchSize], "I32", undefined, TensorParallelism.Replicated);
     const qoIndptrH = ws.allocPinned([batchSize + 1], "I32", undefined, TensorParallelism.Replicated);
     indptrH.h2d(i32Buf(new Int32Array([0, numPages])));
     kvLenH.h2d(i32Buf(new Int32Array([seqLen])));
@@ -477,7 +481,7 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
       floatWs, 128 * 1024 * 1024,
       intWs, pinnedIntWs, 8 * 1024 * 1024,
       planInfo,
-      qoIndptrH, indptrH, kvLenH,
+      qoIndptrH, indptrH, kvLenH, lastPageLenH,
       batchSize, N_HEADS, HEAD_DIM_CKV, true,
       pageSize, [seqLen],
       true,

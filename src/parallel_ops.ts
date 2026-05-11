@@ -2064,7 +2064,33 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mlaPrefillPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, kvIndptrH: Tensor, kvLenH: Tensor, batchSize: number, numHeads: number, headDimO: number, causal: boolean, pageSize: number, seqKvLens: number[], contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
+  private adjustCpPagedKvMeta(kvIndptrH: ParallelTensor, lastPageLenH: ParallelTensor, batchSize: number, seqKvLens: number[], pageSize: number): void {
+    const cpWorldSize = this.worldSize;
+    const effectivePageSize = pageSize / cpWorldSize;
+    for (let r = 0; r < cpWorldSize; r++) {
+      kvIndptrH.shards[r].withPinnedBuffer(buf => {
+        let cumulative = 0;
+        buf.writeInt32LE(0, 0);
+        for (let s = 0; s < batchSize; s++) {
+          const N = seqKvLens[s];
+          const localKvLen = N > r ? Math.floor((N - 1 - r) / cpWorldSize) + 1 : 0;
+          const logicalPages = localKvLen > 0 ? Math.ceil(localKvLen / effectivePageSize) : 0;
+          cumulative += logicalPages;
+          buf.writeInt32LE(cumulative, (s + 1) * 4);
+        }
+      });
+      lastPageLenH.shards[r].withPinnedBuffer(buf => {
+        for (let s = 0; s < batchSize; s++) {
+          const N = seqKvLens[s];
+          const localKvLen = N > r ? Math.floor((N - 1 - r) / cpWorldSize) + 1 : 0;
+          const remainder = localKvLen % effectivePageSize;
+          buf.writeInt32LE(localKvLen > 0 ? (remainder !== 0 ? remainder : effectivePageSize) : 0, s * 4);
+        }
+      });
+    }
+  }
+
+  mlaPrefillPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, kvIndptrH: Tensor, kvLenH: Tensor, lastPageLenH: Tensor, batchSize: number, numHeads: number, headDimO: number, causal: boolean, pageSize: number, seqKvLens: number[], contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPinnedIntWs = this.cast(pinnedIntWs);
@@ -2072,28 +2098,15 @@ export class ParallelOps implements DeviceOps {
     const pQoIndptrH = this.cast(qoIndptrH);
     const pKvIndptrH = this.cast(kvIndptrH);
     const pKvLenH = this.cast(kvLenH);
+    const pLastPageLenH = this.cast(lastPageLenH);
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "mlaPrefillPlan numHeads");
     const effectiveCpWorldSize = contextParallel ? this.worldSize : undefined;
-    const effectivePageSize = contextParallel ? pageSize / this.worldSize : pageSize;
     if (contextParallel) {
-      const cpWorldSize = this.worldSize;
-      for (let r = 0; r < cpWorldSize; r++) {
-        pKvIndptrH.shards[r].withPinnedBuffer(buf => {
-          let cumulative = 0;
-          buf.writeInt32LE(0, 0);
-          for (let s = 0; s < batchSize; s++) {
-            const N = seqKvLens[s];
-            const localKvLen = N > r ? Math.floor((N - 1 - r) / cpWorldSize) + 1 : 0;
-            const logicalPages = localKvLen > 0 ? Math.ceil(localKvLen / effectivePageSize) : 0;
-            cumulative += logicalPages;
-            buf.writeInt32LE(cumulative, (s + 1) * 4);
-          }
-        });
-      }
+      this.adjustCpPagedKvMeta(pKvIndptrH, pLastPageLenH, batchSize, seqKvLens, pageSize);
     }
     for (let i = 0; i < this.worldSize; i++) {
       const effectiveCpRank = contextParallel ? i : undefined;
-      this.devices[i].mlaPrefillPlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pQoIndptrH.shards[i], pKvIndptrH.shards[i], pKvLenH.shards[i], batchSize, effectiveNumHeads, headDimO, causal, pageSize, seqKvLens, contextParallel, effectiveCpWorldSize, effectiveCpRank);
+      this.devices[i].mlaPrefillPlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pQoIndptrH.shards[i], pKvIndptrH.shards[i], pKvLenH.shards[i], pLastPageLenH.shards[i], batchSize, effectiveNumHeads, headDimO, causal, pageSize, seqKvLens, contextParallel, effectiveCpWorldSize, effectiveCpRank);
     }
   }
 
@@ -2150,32 +2163,20 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, batchSize: number, numQoHeads: number, pageSize: number, enableCudaGraph: boolean, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, seqKvLens?: number[]): void {
+  mlaDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, lastPageLenH: Tensor, batchSize: number, numQoHeads: number, pageSize: number, enableCudaGraph: boolean, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, seqKvLens?: number[]): void {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPinnedIntWs = this.cast(pinnedIntWs);
     const pPlanInfo = this.cast(planInfo);
     const pIndptrH = this.cast(indptrH);
+    const pLastPageLenH = this.cast(lastPageLenH);
     const effectiveNumQoHeads = contextParallel ? numQoHeads : this.shardDim(numQoHeads, "mlaDecodePlan numQoHeads");
     const effectivePageSize = contextParallel ? pageSize / this.worldSize : pageSize;
     if (contextParallel && seqKvLens) {
-      const cpWorldSize = this.worldSize;
-      for (let r = 0; r < cpWorldSize; r++) {
-        pIndptrH.shards[r].withPinnedBuffer(buf => {
-          let cumulative = 0;
-          buf.writeInt32LE(0, 0);
-          for (let s = 0; s < batchSize; s++) {
-            const N = seqKvLens[s];
-            const localKvLen = N > r ? Math.floor((N - 1 - r) / cpWorldSize) + 1 : 0;
-            const logicalPages = localKvLen > 0 ? Math.ceil(localKvLen / effectivePageSize) : 0;
-            cumulative += logicalPages;
-            buf.writeInt32LE(cumulative, (s + 1) * 4);
-          }
-        });
-      }
+      this.adjustCpPagedKvMeta(pIndptrH, pLastPageLenH, batchSize, seqKvLens, pageSize);
     }
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaDecodePlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pIndptrH.shards[i], batchSize, effectiveNumQoHeads, effectivePageSize, enableCudaGraph, headDimCkv, headDimKpe, contextParallel);
+      this.devices[i].mlaDecodePlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pIndptrH.shards[i], pLastPageLenH.shards[i], batchSize, effectiveNumQoHeads, effectivePageSize, enableCudaGraph, headDimCkv, headDimKpe, contextParallel);
     }
   }
 

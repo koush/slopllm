@@ -338,7 +338,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
           this.floatWs, 128 * 1024 * 1024,
           this.intWs, this.pinnedIntWs, 8 * 1024 * 1024,
           this.mlaDecodePlanInfo,
-          this.indptrH,
+          this.indptrH, this.lastPageLenH,
           batchSize, model.cfg.numAttentionHeads, pagedKV.pageSize, enableCudaGraph,
           model.cfg.kvLoraRank!, model.cfg.qkRopeHeadDim!, pagedKV.contextParallel,
           undefined, undefined, pagedKV.seqKvLens
@@ -447,7 +447,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         this.intWs, this.pinnedIntWs, 8 * 1024 * 1024,
         this.mlaPrefillPlanInfo,
         this.qoIndptrH, this.indptrH,
-        this.kvLenH,
+        this.kvLenH, this.lastPageLenH,
         batchSize, nHeads, cfg.kvLoraRank!, true,
         pagedKV.pageSize, pagedKV.seqKvLens,
         pagedKV.contextParallel
