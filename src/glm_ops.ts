@@ -122,8 +122,10 @@ interface NativeAddon {
   p2pAllGather(ctx: number, instance: number, sendbuf: number, recvbuf: number, numBytes: number): void;
   p2pAllGatherRow(ctx: number, instance: number, sendbuf: number, recvbuf: number, shardBytes: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number): void;
   p2pRmsnorm(ctx: number, instance: number, input: number, weight: number, output: number, eps: number, shardDim: number, fullDim: number, batch: number): void;
-  contextParallelMerge(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, vHeadDim: number): void;
-  p2pCpMerge(ctx: number, instance: number, myVOut: number, myLse: number, mergedVOut: number, mergedLse: number, numShards: number, batchSize: number, numHeads: number, vHeadDim: number): void;
+  contextParallelMerge(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number): void;
+  p2pCpMerge(ctx: number, instance: number, myVOut: number, myLse: number, mergedVOut: number, mergedLse: number, numShards: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number): void;
+  contextParallelMergeHeads(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, shardNHeads: number, headOffset: number, vHeadDim: number): void;
+  p2pCpMergeHeads(ctx: number, instance: number, myVOut: number, myLse: number, mergedVOut: number, mergedLse: number, numShards: number, batchSize: number, numHeads: number, shardNHeads: number, headOffset: number, vHeadDim: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
@@ -715,12 +717,24 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), ptr(kpeData), ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), ptr(appendKpe), ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
   }
 
-  contextParallelMerge(vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: Tensor, mergedLse: Tensor | null, batchSize: number, numHeads: number, vHeadDim: number): void {
-    getNativeAddon().contextParallelMerge(this.ctx, vPtrs, lsePtrs, numShards, ptr(mergedVOut), mergedLse ? ptr(mergedLse) : 0, batchSize, numHeads, vHeadDim);
+  contextParallelMerge(vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: Tensor, mergedLse: Tensor | null, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number): void {
+    const snh = shardNHeads ?? numHeads;
+    const ho = headOffset ?? 0;
+    if (snh === numHeads && ho === 0) {
+      getNativeAddon().contextParallelMerge(this.ctx, vPtrs, lsePtrs, numShards, ptr(mergedVOut), mergedLse ? ptr(mergedLse) : 0, batchSize, numHeads, vHeadDim);
+    } else {
+      getNativeAddon().contextParallelMergeHeads(this.ctx, vPtrs, lsePtrs, numShards, ptr(mergedVOut), mergedLse ? ptr(mergedLse) : 0, batchSize, numHeads, snh, ho, vHeadDim);
+    }
   }
 
-  p2pCpMerge(instance: number, myVOut: Tensor, myLse: Tensor, mergedVOut: Tensor, mergedLse: Tensor | null, numShards: number, batchSize: number, numHeads: number, vHeadDim: number): void {
-    getNativeAddon().p2pCpMerge(this.ctx, instance, ptr(myVOut), ptr(myLse), ptr(mergedVOut), mergedLse ? ptr(mergedLse) : 0, numShards, batchSize, numHeads, vHeadDim);
+  p2pCpMerge(instance: number, myVOut: Tensor, myLse: Tensor, mergedVOut: Tensor, mergedLse: Tensor | null, numShards: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number): void {
+    const snh = shardNHeads ?? numHeads;
+    const ho = headOffset ?? 0;
+    if (snh === numHeads && ho === 0) {
+      getNativeAddon().p2pCpMerge(this.ctx, instance, ptr(myVOut), ptr(myLse), ptr(mergedVOut), mergedLse ? ptr(mergedLse) : 0, numShards, batchSize, numHeads, vHeadDim);
+    } else {
+      getNativeAddon().p2pCpMergeHeads(this.ctx, instance, ptr(myVOut), ptr(myLse), ptr(mergedVOut), mergedLse ? ptr(mergedLse) : 0, numShards, batchSize, numHeads, snh, ho, vHeadDim);
+    }
   }
 }
 
