@@ -1295,12 +1295,13 @@ export class ParallelTensor extends Tensor {
     const vExpanded = this.parallelOps.wrapShards(this.workspace, outShards, vExpandedFullShape, this.type, vExpandedPar);
     if (isCp) {
       const pLse = lse as ParallelTensor;
-      const cpShardNHeads = isVProjSharded ? shardNHeads : undefined;
+      const cpShardNHeads = isVProjSharded ? shardNHeads : this.parallelOps.shardDim(nHeads, "mlaVExpand cpShardNHeads");
+      const cpInputNHeads = isVProjSharded ? shardNHeads : nHeads;
       return this.parallelOps.contextParallelMerge(
         vExpanded, pLse,
         BS, nHeads, vHeadDim,
         null, this.workspace,
-        cpShardNHeads,
+        cpShardNHeads, cpInputNHeads,
       );
     }
     return vExpanded;
@@ -1691,8 +1692,10 @@ export class ParallelOps implements DeviceOps {
     mergedLse: Tensor | null,
     workspace: WorkspaceBase,
     shardNHeads?: number,
+    inputNHeads?: number,
   ): ParallelTensor {
     const snh = shardNHeads ?? numHeads;
+    const inh = inputNHeads ?? snh;
     const isHeads = snh !== numHeads;
     using gatheredVOutShards = partialVOuts.allGather(partialVOuts.workspace);
     using gatheredLseShards = partialLses.allGather(partialLses.workspace);
@@ -1706,7 +1709,7 @@ export class ParallelOps implements DeviceOps {
     // After AllGather, each GPU has all shards' data and can run cp_merge locally.
     const vOutElemBytes = 2; // BF16
     const lseElemBytes = 4;  // F32
-    const vOutElemsPerShard = batchSize * snh * vHeadDim;
+    const vOutElemsPerShard = batchSize * inh * vHeadDim;
     const lseElemsPerShard = batchSize * numHeads;
     const numShards = this.worldSize;
 
@@ -1722,7 +1725,7 @@ export class ParallelOps implements DeviceOps {
       this.devices[i].contextParallelMerge(
         vPtrs, lsePtrs, numShards,
         mergedVOutShards[i], mergedLseShards ? mergedLseShards[i] : null,
-        batchSize, numHeads, vHeadDim, snh, headOffset,
+        batchSize, numHeads, vHeadDim, snh, headOffset, inh,
       );
     }
 
@@ -1753,8 +1756,10 @@ export class ParallelOps implements DeviceOps {
     mergedLse: Tensor | null,
     workspace: WorkspaceBase,
     shardNHeads?: number,
+    inputNHeads?: number,
   ): ParallelTensor {
     const snh = shardNHeads ?? numHeads;
+    const inh = inputNHeads ?? snh;
     const isHeads = snh !== numHeads;
     const numShards = partialVOuts.length;
     if (numShards !== this.worldSize) {
@@ -1764,9 +1769,9 @@ export class ParallelOps implements DeviceOps {
       throw new Error(`p2pCpMerge: requires at least 2 shards, got ${numShards}`);
     }
 
-    // P2P buffer holds per-shard data: v_out is [B, snh, D] (column-parallel),
+    // P2P buffer holds per-shard data: v_out is [B, inh, D] (input_n_heads stride),
     // lse is [B, numHeads] (full heads).
-    const vOutBytes = batchSize * snh * vHeadDim * 2; // BF16
+    const vOutBytes = batchSize * inh * vHeadDim * 2; // BF16
     const lseBytes = batchSize * numHeads * 4;             // F32
     const slotBytes = vOutBytes + lseBytes;
 
@@ -1791,7 +1796,7 @@ export class ParallelOps implements DeviceOps {
         group.instances[i],
         partialVOuts[i], partialLses[i],
         mergedVOutShards[i], mergedLseShards ? mergedLseShards[i] : null,
-        numShards, batchSize, numHeads, vHeadDim, snh, headOffset,
+        numShards, batchSize, numHeads, vHeadDim, snh, headOffset, inh,
       );
     }
 

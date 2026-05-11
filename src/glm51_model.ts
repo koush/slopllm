@@ -316,7 +316,8 @@ export class Glm51Model extends ChatModel {
         mmapPtr, offset, nHeads, headDim: qkNopeDim + vHeadDim, inDim, rowsPerHead: qkNopeDim, outDim: kvLoraRank, par: colPar,
       });
       const vName = name.replace(".kv_b_proj.weight", ".v_proj.weight");
-      const tV = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", vName, colPar);
+      const vPar = this.contextParallel ? TensorParallelism.Replicated : colPar;
+      const tV = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", vName, vPar);
       await tV.mmapLoad(mmapPtr, offset, tV.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: vHeadDim * inDim * eb, width: vHeadDim * inDim * eb, height: nHeads });
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
       await this.splitMlaWeightMmap(mmapPtr, offset,

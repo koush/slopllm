@@ -652,10 +652,12 @@ void glm_context_parallel_merge(
 
 // Head-grouped context parallel merge: only processes and outputs heads
 // [head_offset, head_offset + shard_n_heads). Output is contiguous
-// [batch_size * shard_n_heads * v_head_dim] (Column-parallel layout).
-// Input partial_v_outs/lse still use num_heads stride for indexing.
-// When shard_n_heads == num_heads and head_offset == 0, equivalent to
-// glm_context_parallel_merge.
+// [batch_size * shard_n_heads * v_head_dim] (Row-parallel layout).
+// input_n_heads: number of heads per input shard (stride for v_out indexing).
+//   Equals num_heads when v_proj is replicated (each shard has all heads),
+//   or shard_n_heads when v_proj is column-parallel (each shard has its head group).
+// When shard_n_heads == num_heads, head_offset == 0, and input_n_heads == num_heads,
+// equivalent to glm_context_parallel_merge.
 void glm_context_parallel_merge_heads(
     GlmCtx* ctx,
     const void* const* partial_v_outs,
@@ -667,6 +669,7 @@ void glm_context_parallel_merge_heads(
     int num_heads,
     int shard_n_heads,
     int head_offset,
+    int input_n_heads,
     int v_head_dim);
 
 // P2P context parallel merge: fused P2P sync + online softmax merge.
@@ -692,10 +695,12 @@ void glm_p2p_cp_merge(
 
 // P2P head-grouped context parallel merge: fused P2P sync + online softmax merge,
 // only processing heads [head_offset, head_offset + shard_n_heads).
+// input_n_heads: number of heads per input shard (stride for v_out indexing).
 // P2P buffer holds full head data (scatter/sync unchanged), only merge phase
 // processes shard_n_heads starting at head_offset.
-// Output: [batch_size * shard_n_heads * v_head_dim] BF16 (contiguous Column layout)
-// When shard_n_heads == num_heads and head_offset == 0, equivalent to glm_p2p_cp_merge.
+// Output: [batch_size * shard_n_heads * v_head_dim] BF16 (contiguous Row layout)
+// When shard_n_heads == num_heads, head_offset == 0, and input_n_heads == num_heads,
+// equivalent to glm_p2p_cp_merge.
 void glm_p2p_cp_merge_heads(
     GlmCtx* ctx,
     GlmP2PInstance* inst,
@@ -708,6 +713,7 @@ void glm_p2p_cp_merge_heads(
     int num_heads,
     int shard_n_heads,
     int head_offset,
+    int input_n_heads,
     int v_head_dim);
 
 // RMSNorm gated: output = RMSNorm(input) * weight * SiLU(gate)

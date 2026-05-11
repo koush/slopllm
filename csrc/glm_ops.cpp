@@ -2249,8 +2249,8 @@ static Napi::Value ContextParallelMerge(const Napi::CallbackInfo& info) {
 
 static Napi::Value ContextParallelMergeHeads(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, v_ptrs, lse_ptrs, num_shards, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset, v_head_dim)").ThrowAsJavaScriptException();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, v_ptrs, lse_ptrs, num_shards, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_head_dim)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -2263,7 +2263,8 @@ static Napi::Value ContextParallelMergeHeads(const Napi::CallbackInfo& info) {
     int num_heads = info[7].As<Napi::Number>().Int32Value();
     int shard_n_heads = info[8].As<Napi::Number>().Int32Value();
     int head_offset = info[9].As<Napi::Number>().Int32Value();
-    int v_head_dim = info[10].As<Napi::Number>().Int32Value();
+    int input_n_heads = info[10].As<Napi::Number>().Int32Value();
+    int v_head_dim = info[11].As<Napi::Number>().Int32Value();
 
     if (v_ptrs_arr.Length() != (uint32_t)num_shards || lse_ptrs_arr.Length() != (uint32_t)num_shards) {
         Napi::TypeError::New(env, "v_ptrs and lse_ptrs arrays must have num_shards elements").ThrowAsJavaScriptException();
@@ -2284,7 +2285,7 @@ static Napi::Value ContextParallelMergeHeads(const Napi::CallbackInfo& info) {
         v_ptrs, lse_ptrs, num_shards,
         reinterpret_cast<void*>(merged_v_out_ptr),
         reinterpret_cast<float*>(merged_lse_ptr),
-        batch_size, num_heads, shard_n_heads, head_offset, v_head_dim);
+        batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_head_dim);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -2328,8 +2329,8 @@ static Napi::Value P2PCpMerge(const Napi::CallbackInfo& info) {
 
 static Napi::Value P2PCpMergeHeads(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 12) {
-        Napi::TypeError::New(env, "Expected (ctx, inst, my_v_out, my_lse, merged_v_out, merged_lse, num_shards, batch_size, num_heads, shard_n_heads, head_offset, v_head_dim)").ThrowAsJavaScriptException();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, inst, my_v_out, my_lse, merged_v_out, merged_lse, num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_head_dim)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -2343,7 +2344,8 @@ static Napi::Value P2PCpMergeHeads(const Napi::CallbackInfo& info) {
     int num_heads = info[8].As<Napi::Number>().Int32Value();
     int shard_n_heads = info[9].As<Napi::Number>().Int32Value();
     int head_offset = info[10].As<Napi::Number>().Int32Value();
-    int v_head_dim = info[11].As<Napi::Number>().Int32Value();
+    int input_n_heads = info[11].As<Napi::Number>().Int32Value();
+    int v_head_dim = info[12].As<Napi::Number>().Int32Value();
 
     glm_p2p_cp_merge_heads(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
@@ -2352,7 +2354,7 @@ static Napi::Value P2PCpMergeHeads(const Napi::CallbackInfo& info) {
         reinterpret_cast<const float*>(my_lse_ptr),
         reinterpret_cast<void*>(merged_v_out_ptr),
         reinterpret_cast<float*>(merged_lse_ptr),
-        num_shards, batch_size, num_heads, shard_n_heads, head_offset, v_head_dim);
+        num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_head_dim);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

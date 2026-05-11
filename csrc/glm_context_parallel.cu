@@ -5,7 +5,7 @@
 // FlashInfer's state_t::merge (online softmax correction).
 //
 // Each shard produces:
-//   - partial_v_out: [B, shard_n_heads, head_dim] BF16 (after column-parallel v_expand)
+//   - partial_v_out: [B, input_n_heads, head_dim] BF16 (after v_expand)
 //   - partial_lse:   [B, num_heads] F32 (base-2 log-sum-exp, all heads)
 //
 // The merge computes:
@@ -18,10 +18,13 @@
 //
 // Head-grouped merge: when shard_n_heads < num_heads, only processes and
 // outputs heads [head_offset, head_offset + shard_n_heads). Input v_out uses
-// shard_n_heads stride (column-parallel layout). Input lse uses num_heads stride
-// (full head layout). Output uses shard_n_heads stride, producing contiguous
+// input_n_heads stride (specifies how many heads per input shard; equals
+// shard_n_heads for column-parallel v_proj, or num_heads for replicated v_proj
+// producing Row-parallel output). Input lse uses num_heads stride (full head
+// layout). Output uses shard_n_heads stride, producing contiguous
 // [B * shard_n_heads * head_dim] (Row-parallel layout).
-// When shard_n_heads == num_heads and head_offset == 0, equivalent to full merge.
+// When shard_n_heads == num_heads, head_offset == 0, and input_n_heads == num_heads,
+// equivalent to full merge.
 // ---------------------------------------------------------------------------
 
 #include "glm_ops.h"
@@ -60,7 +63,7 @@ __device__ __forceinline__ void cp_merge_one_pair(
         #pragma unroll
         for (int s = 0; s < NUM_SHARDS; ++s) {
             flashinfer::vec_t<float, VEC_SIZE> v;
-            load_v(v, s, b, local_h, shard_n_heads, head_dim, tid);
+            load_v(v, s, b, h, head_dim, tid);
             st.merge(v, s_lse[s], 1.0f);
         }
 
@@ -87,7 +90,8 @@ cp_merge_kernel(
     int batch_size,
     int num_heads,
     int shard_n_heads,
-    int head_offset)
+    int head_offset,
+    int input_n_heads)
 {
     int tid = threadIdx.x;
     int bh = blockIdx.x;
@@ -105,9 +109,9 @@ cp_merge_kernel(
         }
     };
 
-    auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int lh_, int snh_, int hd, int tid_) {
+    auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int h_, int hd, int tid_) {
         const __nv_bfloat16* v_ptr = static_cast<const __nv_bfloat16*>(params.v_ptrs[s]);
-        v.cast_load(v_ptr + (b_ * snh_ + lh_) * hd + tid_ * VEC_SIZE);
+        v.cast_load(v_ptr + (b_ * input_n_heads + h_) * hd + tid_ * VEC_SIZE);
     };
 
     cp_merge_one_pair<VEC_SIZE, BDX, NUM_SHARDS>(
@@ -126,33 +130,34 @@ void launch_cp_merge(
     int num_heads,
     int shard_n_heads,
     int head_offset,
+    int input_n_heads,
     cudaStream_t stream)
 {
     int grid = batch_size * shard_n_heads;
     switch (num_shards) {
         case 1:
             cp_merge_kernel<VEC_SIZE, BDX, 1><<<grid, BDX, 0, stream>>>(
-                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset);
+                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads);
             break;
         case 2:
             cp_merge_kernel<VEC_SIZE, BDX, 2><<<grid, BDX, 0, stream>>>(
-                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset);
+                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads);
             break;
         case 3:
             cp_merge_kernel<VEC_SIZE, BDX, 3><<<grid, BDX, 0, stream>>>(
-                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset);
+                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads);
             break;
         case 4:
             cp_merge_kernel<VEC_SIZE, BDX, 4><<<grid, BDX, 0, stream>>>(
-                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset);
+                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads);
             break;
         case 8:
             cp_merge_kernel<VEC_SIZE, BDX, 8><<<grid, BDX, 0, stream>>>(
-                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset);
+                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads);
             break;
         case 16:
             cp_merge_kernel<VEC_SIZE, BDX, 16><<<grid, BDX, 0, stream>>>(
-                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset);
+                params, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads);
             break;
         default:
             fprintf(stderr, "launch_cp_merge: unsupported num_shards=%d (must be 1-4, 8, or 16)\n", num_shards);
@@ -177,7 +182,7 @@ void glm_context_parallel_merge(
 {
     glm_context_parallel_merge_heads(ctx, partial_v_outs, partial_lses,
         num_shards, merged_v_out, merged_lse,
-        batch_size, num_heads, num_heads, 0, v_head_dim);
+        batch_size, num_heads, num_heads, 0, num_heads, v_head_dim);
 }
 
 void glm_context_parallel_merge_heads(
@@ -191,6 +196,7 @@ void glm_context_parallel_merge_heads(
     int num_heads,
     int shard_n_heads,
     int head_offset,
+    int input_n_heads,
     int v_head_dim)
 {
     cudaSetDevice(ctx->device_id);
@@ -203,6 +209,11 @@ void glm_context_parallel_merge_heads(
     if (head_offset < 0 || shard_n_heads < 1 || head_offset + shard_n_heads > num_heads) {
         fprintf(stderr, "glm_context_parallel_merge_heads: head_offset=%d + shard_n_heads=%d > num_heads=%d\n",
                 head_offset, shard_n_heads, num_heads);
+        return;
+    }
+    if (input_n_heads < shard_n_heads || input_n_heads > num_heads) {
+        fprintf(stderr, "glm_context_parallel_merge_heads: input_n_heads=%d out of range [shard_n_heads=%d, num_heads=%d]\n",
+                input_n_heads, shard_n_heads, num_heads);
         return;
     }
 
@@ -220,27 +231,27 @@ void glm_context_parallel_merge_heads(
         case 32:
             launch_cp_merge<4, 8>(params,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
-                num_shards, batch_size, num_heads, shard_n_heads, head_offset, GLM_STREAM(ctx));
+                num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, GLM_STREAM(ctx));
             break;
         case 64:
             launch_cp_merge<4, 16>(params,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
-                num_shards, batch_size, num_heads, shard_n_heads, head_offset, GLM_STREAM(ctx));
+                num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, GLM_STREAM(ctx));
             break;
         case 128:
             launch_cp_merge<4, 32>(params,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
-                num_shards, batch_size, num_heads, shard_n_heads, head_offset, GLM_STREAM(ctx));
+                num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, GLM_STREAM(ctx));
             break;
         case 256:
             launch_cp_merge<4, 64>(params,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
-                num_shards, batch_size, num_heads, shard_n_heads, head_offset, GLM_STREAM(ctx));
+                num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, GLM_STREAM(ctx));
             break;
         case 512:
             launch_cp_merge<4, 128>(params,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
-                num_shards, batch_size, num_heads, shard_n_heads, head_offset, GLM_STREAM(ctx));
+                num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, GLM_STREAM(ctx));
             break;
         default:
             fprintf(stderr, "glm_context_parallel_merge_heads: unsupported v_head_dim=%d "
@@ -291,7 +302,8 @@ p2p_cp_merge_kernel(
     int num_heads,
     int shard_n_heads,
     int head_offset,
-    int v_out_bytes)              // B * H * vHeadDim * sizeof(bf16)
+    int input_n_heads,
+    int v_out_bytes)              // B * input_n_heads * vHeadDim * sizeof(bf16)
 {
     constexpr int head_dim = VEC_SIZE * BDX;
     int tid = threadIdx.x;
@@ -378,10 +390,10 @@ p2p_cp_merge_kernel(
             }
         };
 
-        auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int lh_, int snh_, int hd, int tid_) {
+        auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int h_, int hd, int tid_) {
             const __nv_bfloat16* peer_v = reinterpret_cast<const __nv_bfloat16*>(
                 static_cast<char*>(s_peer_data[s]) + slot_offset);
-            v.cast_load(peer_v + (b_ * snh_ + lh_) * hd + tid_ * VEC_SIZE);
+            v.cast_load(peer_v + (b_ * input_n_heads + h_) * hd + tid_ * VEC_SIZE);
         };
 
         cp_merge_one_pair<VEC_SIZE, BDX, NUM_SHARDS>(
@@ -400,7 +412,7 @@ void launch_p2p_cp_merge(
     const __nv_bfloat16* my_v_out, const float* my_lse,
     __nv_bfloat16* merged_v_out, float* merged_lse,
     int num_shards, int batch_size, int num_heads, int shard_n_heads, int head_offset,
-    int v_out_bytes,
+    int input_n_heads, int v_out_bytes,
     cudaStream_t stream)
 {
     switch (num_shards) {
@@ -409,28 +421,28 @@ void launch_p2p_cp_merge(
                 peer_data, peer_flags, seq_counter,
                 my_rank, world_size, max_slot_bytes,
                 my_v_out, my_lse, merged_v_out, merged_lse,
-                batch_size, num_heads, shard_n_heads, head_offset, v_out_bytes);
+                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
             break;
         case 4:
             p2p_cp_merge_kernel<VEC_SIZE, BDX, 4><<<1, P2P_CP_BLOCK_SIZE, 0, stream>>>(
                 peer_data, peer_flags, seq_counter,
                 my_rank, world_size, max_slot_bytes,
                 my_v_out, my_lse, merged_v_out, merged_lse,
-                batch_size, num_heads, shard_n_heads, head_offset, v_out_bytes);
+                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
             break;
         case 8:
             p2p_cp_merge_kernel<VEC_SIZE, BDX, 8><<<1, P2P_CP_BLOCK_SIZE, 0, stream>>>(
                 peer_data, peer_flags, seq_counter,
                 my_rank, world_size, max_slot_bytes,
                 my_v_out, my_lse, merged_v_out, merged_lse,
-                batch_size, num_heads, shard_n_heads, head_offset, v_out_bytes);
+                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
             break;
         case 16:
             p2p_cp_merge_kernel<VEC_SIZE, BDX, 16><<<1, P2P_CP_BLOCK_SIZE, 0, stream>>>(
                 peer_data, peer_flags, seq_counter,
                 my_rank, world_size, max_slot_bytes,
                 my_v_out, my_lse, merged_v_out, merged_lse,
-                batch_size, num_heads, shard_n_heads, head_offset, v_out_bytes);
+                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
             break;
         default:
             fprintf(stderr, "launch_p2p_cp_merge: unsupported num_shards=%d (must be 2, 4, 8, or 16)\n", num_shards);
@@ -454,7 +466,7 @@ void glm_p2p_cp_merge(
 {
     glm_p2p_cp_merge_heads(ctx, inst, my_v_out, my_lse,
         merged_v_out, merged_lse,
-        num_shards, batch_size, num_heads, num_heads, 0, v_head_dim);
+        num_shards, batch_size, num_heads, num_heads, 0, num_heads, v_head_dim);
 }
 
 void glm_p2p_cp_merge_heads(
@@ -469,6 +481,7 @@ void glm_p2p_cp_merge_heads(
     int num_heads,
     int shard_n_heads,
     int head_offset,
+    int input_n_heads,
     int v_head_dim)
 {
     cudaSetDevice(ctx->device_id);
@@ -483,11 +496,16 @@ void glm_p2p_cp_merge_heads(
                 head_offset, shard_n_heads, num_heads);
         return;
     }
+    if (input_n_heads < shard_n_heads || input_n_heads > num_heads) {
+        fprintf(stderr, "glm_p2p_cp_merge_heads: input_n_heads=%d out of range [shard_n_heads=%d, num_heads=%d]\n",
+                input_n_heads, shard_n_heads, num_heads);
+        return;
+    }
 
-    // P2P buffer holds per-shard data: v_out is [B, shard_n_heads, D] (column-parallel),
+    // P2P buffer holds per-shard data: v_out is [B, input_n_heads, D],
     // lse is [B, num_heads] (full heads). Only the merge phase processes
     // shard_n_heads starting at head_offset.
-    int v_out_bytes = batch_size * shard_n_heads * v_head_dim * 2;
+    int v_out_bytes = batch_size * input_n_heads * v_head_dim * 2;
     int lse_bytes = batch_size * num_heads * 4;
     int slot_bytes = v_out_bytes + lse_bytes;
 
@@ -504,7 +522,7 @@ void glm_p2p_cp_merge_heads(
                 inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(my_v_out), my_lse,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
-                num_shards, batch_size, num_heads, shard_n_heads, head_offset, v_out_bytes,
+                num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes,
                 GLM_STREAM(ctx));
             break;
         case 64:
@@ -513,7 +531,7 @@ void glm_p2p_cp_merge_heads(
                 inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(my_v_out), my_lse,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
-                num_shards, batch_size, num_heads, shard_n_heads, head_offset, v_out_bytes,
+                num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes,
                 GLM_STREAM(ctx));
             break;
         case 128:
@@ -522,7 +540,7 @@ void glm_p2p_cp_merge_heads(
                 inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(my_v_out), my_lse,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
-                num_shards, batch_size, num_heads, shard_n_heads, head_offset, v_out_bytes,
+                num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes,
                 GLM_STREAM(ctx));
             break;
         case 256:
@@ -531,7 +549,7 @@ void glm_p2p_cp_merge_heads(
                 inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(my_v_out), my_lse,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
-                num_shards, batch_size, num_heads, shard_n_heads, head_offset, v_out_bytes,
+                num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes,
                 GLM_STREAM(ctx));
             break;
         case 512:
@@ -540,7 +558,7 @@ void glm_p2p_cp_merge_heads(
                 inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(my_v_out), my_lse,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
-                num_shards, batch_size, num_heads, shard_n_heads, head_offset, v_out_bytes,
+                num_shards, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes,
                 GLM_STREAM(ctx));
             break;
         default:

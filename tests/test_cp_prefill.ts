@@ -506,8 +506,8 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
     const pVExpanded = pOut.mlaVExpand(pVProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize, pLse) as ParallelTensor;
     po.synchronize();
 
-    // Verify result is Replicated (CP merge should produce Replicated output)
-    assert.equal(pVExpanded.parallelism, TensorParallelism.Replicated, "CP merge should produce Replicated output");
+    // Verify result is Row (CP merge with replicated v_proj produces Row-parallel output)
+    assert.equal(pVExpanded.parallelism, TensorParallelism.Row, "CP merge should produce Row output");
 
     // Compare with baseline
     const mergedBuf = Buffer.alloc(totalTokens * N_HEADS * V_HEAD_DIM * 2);
