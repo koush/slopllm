@@ -252,7 +252,7 @@ export function* generateStream(
           glm.graphBeginCapture();
         }
 
-        ws.decodeStep(state);
+        ws.decodeStep(state, model);
         ws.forwardInput(state);
         using logits = model.forward(state);
         doSample(logits);

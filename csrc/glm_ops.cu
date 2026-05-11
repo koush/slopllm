@@ -1969,6 +1969,61 @@ void glm_decode_step(GlmCtx* ctx,
 }
 
 // ---------------------------------------------------------------------------
+// MLA decode step kernel
+// Same as decode_step_kernel but without slot_mapping computation.
+// MLA uses mlaKvCacheAppend (batchIndices + positionIds) instead of
+// kvCacheWrite (slotMapping), so slot_mapping is not needed.
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(128) mla_decode_step_kernel(
+    int32_t* position_ids,
+    int32_t* last_page_len,
+    const int32_t* indptr,
+    uint32_t page_size,
+    uint32_t batch_size,
+    uint32_t cp_world_size,
+    uint32_t cp_rank
+) {
+    uint32_t seq = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seq >= batch_size) return;
+
+    int32_t pos = position_ids[seq] + 1;
+    position_ids[seq] = pos;
+
+    if (cp_world_size > 1) {
+        uint32_t eps = page_size / cp_world_size;
+        int32_t local_kv_len = (pos >= (int32_t)cp_rank)
+            ? (pos - (int32_t)cp_rank) / (int32_t)cp_world_size + 1
+            : 0;
+        int32_t remainder = local_kv_len % (int32_t)eps;
+        last_page_len[seq] = (local_kv_len > 0)
+            ? ((remainder != 0) ? remainder : (int32_t)eps)
+            : 0;
+    } else {
+        int32_t kv_len = pos + 1;
+        int32_t remainder = kv_len % (int32_t)page_size;
+        last_page_len[seq] = (remainder != 0) ? remainder : (int32_t)page_size;
+    }
+}
+
+void glm_mla_decode_step(GlmCtx* ctx,
+                          int32_t* position_ids,
+                          int32_t* last_page_len,
+                          const int32_t* indptr,
+                          uint32_t page_size,
+                          uint32_t batch_size,
+                          uint32_t cp_world_size,
+                          uint32_t cp_rank) {
+    cudaSetDevice(ctx->device_id);
+    dim3 grid((batch_size + 127) / 128);
+    dim3 block(128);
+    mla_decode_step_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
+        position_ids, last_page_len, indptr,
+        page_size, batch_size,
+        cp_world_size, cp_rank);
+}
+
+// ---------------------------------------------------------------------------
 // Scatter-add with row-wise scaling (atomic BF16 addition)
 //   out:      [rows_out, dim]   BF16 (accumulated in-place)
 //   input:    [count, dim]      BF16

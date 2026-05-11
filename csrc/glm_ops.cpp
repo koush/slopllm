@@ -1025,6 +1025,28 @@ static Napi::Value DecodeStep(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value MlaDecodeStep(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5) {
+        Napi::TypeError::New(env, "Expected (ctx, position_ids, last_page_len, indptr, page_size, batch_size[, cp_world_size, cp_rank])").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t position_ids_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t last_page_len_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t indptr_ptr = info[3].As<Napi::Number>().Int64Value();
+    uint32_t page_size = info[4].As<Napi::Number>().Uint32Value();
+    uint32_t batch_size = info[5].As<Napi::Number>().Uint32Value();
+    uint32_t cp_world_size = (info.Length() > 6) ? info[6].As<Napi::Number>().Uint32Value() : 1;
+    uint32_t cp_rank = (info.Length() > 7) ? info[7].As<Napi::Number>().Uint32Value() : 0;
+    glm_mla_decode_step(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                         reinterpret_cast<int32_t*>(position_ids_ptr),
+                         reinterpret_cast<int32_t*>(last_page_len_ptr),
+                         reinterpret_cast<const int32_t*>(indptr_ptr),
+                         page_size, batch_size, cp_world_size, cp_rank);
+    return env.Undefined();
+}
+
 static Napi::Value Memcpy(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 5) {
@@ -2724,6 +2746,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "memcpy"), Napi::Function::New(env, Memcpy));
     exports.Set(Napi::String::New(env, "kvCacheWrite"), Napi::Function::New(env, KvCacheWrite));
     exports.Set(Napi::String::New(env, "decodeStep"), Napi::Function::New(env, DecodeStep));
+    exports.Set(Napi::String::New(env, "mlaDecodeStep"), Napi::Function::New(env, MlaDecodeStep));
     exports.Set(Napi::String::New(env, "synchronize"), Napi::Function::New(env, Synchronize));
     exports.Set(Napi::String::New(env, "synchronizeStream"), Napi::Function::New(env, SynchronizeStream));
     exports.Set(Napi::String::New(env, "setStream"), Napi::Function::New(env, SetStream));

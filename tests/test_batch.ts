@@ -196,7 +196,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     const stateRef = gws.planDecode(model, 1, pagedKV, true);
     stateRef.prepareInput([tokens[0]]);
-    gws.decodeStep(stateRef);
+    gws.decodeStep(stateRef, model);
     gws.forwardInput(stateRef);
     const logitsRef = model.forward(stateRef);
     using argmaxRef = logitsRef.argmax();
@@ -208,7 +208,7 @@ describe("Qwen3-0.6B batch tests", () => {
     state.prepareInput([tokens2[0]]);
 
     glm.graphBeginCapture();
-    gws.decodeStep(state);
+    gws.decodeStep(state, model);
     gws.forwardInput(state);
     const captureLogits = model.forward(state);
     const captureArgmax = captureLogits.argmax();
@@ -241,7 +241,7 @@ describe("Qwen3-0.6B batch tests", () => {
     for (let step = 0; step < numSteps; step++) {
       const state = gws.planDecode(model, 1, pagedKV, true);
       state.prepareInput([current]);
-      gws.decodeStep(state);
+      gws.decodeStep(state, model);
       gws.forwardInput(state);
       const logits = model.forward(state);
       using argmaxResult = logits.argmax();
@@ -268,7 +268,7 @@ describe("Qwen3-0.6B batch tests", () => {
           glm.graphBeginCapture();
         }
 
-        gws.decodeStep(state);
+    gws.decodeStep(state, model);
         gws.forwardInput(state);
         const logits = model.forward(state);
         captureArgmax = logits.argmax();

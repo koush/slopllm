@@ -203,15 +203,24 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
   }
 
-  decodeStep(state: ExecutionState): void {
+  decodeStep(state: ExecutionState, model: ChatModel): void {
     const pagedKV = state.cache.getPagedKV();
     const batchSize = state.batchSize;
-    this.glm.decodeStep(
-      this.positionIds, this.lastPageLen, this.slotMapping,
-      this.indptrD, pagedKV.indices,
-      pagedKV.pageSize, batchSize,
-      pagedKV.contextParallel
-    );
+    if (!model.cfg.kvLoraRank) {
+      this.glm.decodeStep(
+        this.positionIds, this.lastPageLen, this.slotMapping,
+        this.indptrD, pagedKV.indices,
+        pagedKV.pageSize, batchSize,
+        pagedKV.contextParallel
+      );
+    } else {
+      this.glm.mlaDecodeStep(
+        this.positionIds, this.lastPageLen,
+        this.indptrD,
+        pagedKV.pageSize, batchSize,
+        pagedKV.contextParallel
+      );
+    }
   }
 
 
@@ -503,7 +512,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   forwardEagerDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache): number[] {
     const state = this.planDecode(model, tokenIdsList.length, cache);
     state.prepareInput(tokenIdsList);
-    this.decodeStep(state);
+    this.decodeStep(state, model);
     this.forwardInput(state);
     const logits = model.forward(state);
     using argmaxResult = logits.argmax();

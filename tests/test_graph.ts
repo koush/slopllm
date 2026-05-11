@@ -94,7 +94,7 @@ function generateWithGraph(
         graph.graphBeginCapture();
       }
 
-      ws.decodeStep(state);
+      ws.decodeStep(state, model);
       ws.forwardInput(state);
       const logits = model.forward(state);
       argmaxResult = logits.argmax();
