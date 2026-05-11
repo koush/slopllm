@@ -5,8 +5,8 @@
 // FlashInfer's state_t::merge (online softmax correction).
 //
 // Each shard produces:
-//   - partial_v_out: [B, H, head_dim] BF16 (after v_expand)
-//   - partial_lse:   [B, H] F32 (base-2 log-sum-exp)
+//   - partial_v_out: [B, shard_n_heads, head_dim] BF16 (after column-parallel v_expand)
+//   - partial_lse:   [B, num_heads] F32 (base-2 log-sum-exp, all heads)
 //
 // The merge computes:
 //   For each (batch, head):
@@ -17,9 +17,10 @@
 // BF16 input -> FP32 cast_load, merge in FP32, cast_store -> BF16 output.
 //
 // Head-grouped merge: when shard_n_heads < num_heads, only processes and
-// outputs heads [head_offset, head_offset + shard_n_heads). Input still
-// uses num_heads stride for indexing. Output uses shard_n_heads stride,
-// producing contiguous [B * shard_n_heads * head_dim] (Column-parallel layout).
+// outputs heads [head_offset, head_offset + shard_n_heads). Input v_out uses
+// shard_n_heads stride (column-parallel layout). Input lse uses num_heads stride
+// (full head layout). Output uses shard_n_heads stride, producing contiguous
+// [B * shard_n_heads * head_dim] (Row-parallel layout).
 // When shard_n_heads == num_heads and head_offset == 0, equivalent to full merge.
 // ---------------------------------------------------------------------------
 
@@ -59,7 +60,7 @@ __device__ __forceinline__ void cp_merge_one_pair(
         #pragma unroll
         for (int s = 0; s < NUM_SHARDS; ++s) {
             flashinfer::vec_t<float, VEC_SIZE> v;
-            load_v(v, s, b, h, num_heads, head_dim, tid);
+            load_v(v, s, b, local_h, shard_n_heads, head_dim, tid);
             st.merge(v, s_lse[s], 1.0f);
         }
 
@@ -104,9 +105,9 @@ cp_merge_kernel(
         }
     };
 
-    auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int h_, int nh, int hd, int tid_) {
+    auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int lh_, int snh_, int hd, int tid_) {
         const __nv_bfloat16* v_ptr = static_cast<const __nv_bfloat16*>(params.v_ptrs[s]);
-        v.cast_load(v_ptr + (b_ * nh + h_) * hd + tid_ * VEC_SIZE);
+        v.cast_load(v_ptr + (b_ * snh_ + lh_) * hd + tid_ * VEC_SIZE);
     };
 
     cp_merge_one_pair<VEC_SIZE, BDX, NUM_SHARDS>(
@@ -377,10 +378,10 @@ p2p_cp_merge_kernel(
             }
         };
 
-        auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int h_, int nh, int hd, int tid_) {
+        auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int lh_, int snh_, int hd, int tid_) {
             const __nv_bfloat16* peer_v = reinterpret_cast<const __nv_bfloat16*>(
                 static_cast<char*>(s_peer_data[s]) + slot_offset);
-            v.cast_load(peer_v + (b_ * nh + h_) * hd + tid_ * VEC_SIZE);
+            v.cast_load(peer_v + (b_ * snh_ + lh_) * hd + tid_ * VEC_SIZE);
         };
 
         cp_merge_one_pair<VEC_SIZE, BDX, NUM_SHARDS>(
@@ -483,9 +484,10 @@ void glm_p2p_cp_merge_heads(
         return;
     }
 
-    // P2P buffer always holds full head data (all heads), scatter/sync is unchanged.
-    // Only the merge phase processes shard_n_heads starting at head_offset.
-    int v_out_bytes = batch_size * num_heads * v_head_dim * 2;
+    // P2P buffer holds per-shard data: v_out is [B, shard_n_heads, D] (column-parallel),
+    // lse is [B, num_heads] (full heads). Only the merge phase processes
+    // shard_n_heads starting at head_offset.
+    int v_out_bytes = batch_size * shard_n_heads * v_head_dim * 2;
     int lse_bytes = batch_size * num_heads * 4;
     int slot_bytes = v_out_bytes + lse_bytes;
 

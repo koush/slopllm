@@ -1706,7 +1706,7 @@ export class ParallelOps implements DeviceOps {
     // After AllGather, each GPU has all shards' data and can run cp_merge locally.
     const vOutElemBytes = 2; // BF16
     const lseElemBytes = 4;  // F32
-    const vOutElemsPerShard = batchSize * numHeads * vHeadDim;
+    const vOutElemsPerShard = batchSize * snh * vHeadDim;
     const lseElemsPerShard = batchSize * numHeads;
     const numShards = this.worldSize;
 
@@ -1764,8 +1764,9 @@ export class ParallelOps implements DeviceOps {
       throw new Error(`p2pCpMerge: requires at least 2 shards, got ${numShards}`);
     }
 
-    // P2P buffer holds full head data (all heads), scatter/sync unchanged.
-    const vOutBytes = batchSize * numHeads * vHeadDim * 2; // BF16
+    // P2P buffer holds per-shard data: v_out is [B, snh, D] (column-parallel),
+    // lse is [B, numHeads] (full heads).
+    const vOutBytes = batchSize * snh * vHeadDim * 2; // BF16
     const lseBytes = batchSize * numHeads * 4;             // F32
     const slotBytes = vOutBytes + lseBytes;
 

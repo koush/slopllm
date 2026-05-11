@@ -69,6 +69,11 @@ def torch_merge_partial_attn_heads(partial_v_outs, partial_lses,
     return merged_o.bfloat16(), merged_lse
 
 
+def shard_v_outs_from_full(full_v_outs, head_offset, shard_n_heads):
+    """Extract shard-layout v_outs [B, snh, D] from full-layout [B, H, D]."""
+    return [v[:, head_offset:head_offset + shard_n_heads, :].contiguous() for v in full_v_outs]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestContextParallelMergeHeads:
 
@@ -114,11 +119,12 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
+        shard_v_outs = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
@@ -145,11 +151,12 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
+        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
@@ -173,10 +180,11 @@ class TestContextParallelMergeHeads:
 
         merged_v_ref, merged_lse_ref = torch_merge_partial_attn(partial_v_outs, partial_lses)
 
+        shard_v0 = shard_v_outs_from_full(partial_v_outs, 0, shard_n_heads)
         merged_v_shard0 = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_shard0 = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v0],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_shard0.data_ptr(),
@@ -184,10 +192,11 @@ class TestContextParallelMergeHeads:
             B, H, shard_n_heads, 0, D
         )
 
+        shard_v1 = shard_v_outs_from_full(partial_v_outs, shard_n_heads, shard_n_heads)
         merged_v_shard1 = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_shard1 = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v1],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_shard1.data_ptr(),
@@ -219,10 +228,11 @@ class TestContextParallelMergeHeads:
         merged_lse_shards = []
         for tp_rank in range(tp_size):
             offset = tp_rank * shard_n_heads
+            shard_v = shard_v_outs_from_full(partial_v_outs, offset, shard_n_heads)
             merged_v = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
             merged_lse = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
             glm.context_parallel_merge_heads(
-                [t.data_ptr() for t in partial_v_outs],
+                [t.data_ptr() for t in shard_v],
                 [t.data_ptr() for t in partial_lses],
                 num_shards,
                 merged_v.data_ptr(),
@@ -252,10 +262,11 @@ class TestContextParallelMergeHeads:
         merged_v_ref, merged_lse_ref = torch_merge_partial_attn(partial_v_outs, partial_lses)
 
         for h in range(H):
+            shard_v = shard_v_outs_from_full(partial_v_outs, h, 1)
             merged_v = torch.empty(B, 1, D, dtype=torch.bfloat16, device=device)
             merged_lse = torch.empty(B, 1, dtype=torch.float32, device=device)
             glm.context_parallel_merge_heads(
-                [t.data_ptr() for t in partial_v_outs],
+                [t.data_ptr() for t in shard_v],
                 [t.data_ptr() for t in partial_lses],
                 num_shards,
                 merged_v.data_ptr(),
@@ -281,11 +292,12 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
+        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
@@ -312,11 +324,12 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
+        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
@@ -343,11 +356,12 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
+        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
@@ -374,11 +388,12 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
+        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
@@ -404,10 +419,11 @@ class TestContextParallelMergeHeads:
         merged_v_ref, _ = torch_merge_partial_attn(partial_v_outs, partial_lses)
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
 
+        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
@@ -433,10 +449,11 @@ class TestContextParallelMergeHeads:
 
         for tp_rank in range(tp_size):
             offset = tp_rank * shard_n_heads
+            shard_v = shard_v_outs_from_full(partial_v_outs, offset, shard_n_heads)
             merged_v = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
             merged_lse = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
             glm.context_parallel_merge_heads(
-                [t.data_ptr() for t in partial_v_outs],
+                [t.data_ptr() for t in shard_v],
                 [t.data_ptr() for t in partial_lses],
                 num_shards,
                 merged_v.data_ptr(),
@@ -466,11 +483,12 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
+        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
@@ -495,15 +513,17 @@ class TestContextParallelMergeHeads:
         merged_v0 = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_v1 = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
 
+        shard_v0 = shard_v_outs_from_full(partial_v_outs, 0, shard_n_heads)
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v0],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v0.data_ptr(), None,
             B, H, shard_n_heads, 0, D
         )
+        shard_v1 = shard_v_outs_from_full(partial_v_outs, shard_n_heads, shard_n_heads)
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v1],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v1.data_ptr(), None,
@@ -525,11 +545,12 @@ class TestContextParallelMergeHeads:
         v = torch.randn(B, H, D, dtype=torch.bfloat16, device=device)
         lse = torch.randn(B, H, dtype=torch.float32, device=device)
 
+        shard_v = shard_v_outs_from_full([v], head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [v.data_ptr()],
+            [t.data_ptr() for t in shard_v],
             [lse.data_ptr()],
             1,
             merged_v_heads.data_ptr(),
@@ -559,11 +580,12 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
+        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
@@ -590,11 +612,12 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
+        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
@@ -623,10 +646,11 @@ class TestContextParallelMergeHeads:
         partial_v_outs = [torch.randn(B, H, D, dtype=torch.bfloat16, device=device) for _ in range(num_shards)]
         partial_lses = [torch.randn(B, H, dtype=torch.float32, device=device) for _ in range(num_shards)]
 
+        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in partial_v_outs],
+            [t.data_ptr() for t in shard_v],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
