@@ -209,7 +209,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.glm.decodeStep(
       this.positionIds, this.lastPageLen, this.slotMapping,
       this.indptrD, pagedKV.indices,
-      pagedKV.pageSize, batchSize
+      pagedKV.pageSize, batchSize,
+      pagedKV.contextParallel
     );
   }
 
@@ -331,7 +332,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
           this.mlaDecodePlanInfo,
           this.indptrH,
           batchSize, model.cfg.numAttentionHeads, pagedKV.pageSize, enableCudaGraph,
-          model.cfg.kvLoraRank!, model.cfg.qkRopeHeadDim!, pagedKV.contextParallel
+          model.cfg.kvLoraRank!, model.cfg.qkRopeHeadDim!, pagedKV.contextParallel,
+          undefined, undefined, pagedKV.seqKvLens
         );
       }
       pagedKV.pagesDirtyHost = false;

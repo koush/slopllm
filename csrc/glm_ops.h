@@ -352,7 +352,9 @@ void glm_decode_step(GlmCtx* ctx,
                       const int32_t* indptr,
                       const int32_t* indices,
                       uint32_t page_size,
-                      uint32_t batch_size);
+                      uint32_t batch_size,
+                      uint32_t cp_world_size,
+                      uint32_t cp_rank);
 
 void glm_synchronize(GlmCtx* ctx);
 

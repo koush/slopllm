@@ -1379,13 +1379,15 @@ class GlmOps:
         )
 
     def decode_step(self, position_ids, last_page_len, slot_mapping,
-                     indptr, indices, page_size, batch_size):
+                     indptr, indices, page_size, batch_size,
+                     cp_world_size=1, cp_rank=0):
         self.lib.glm_decode_step(
             self.ctx,
             ctypes.c_void_p(position_ids), ctypes.c_void_p(last_page_len),
             ctypes.c_void_p(slot_mapping),
             ctypes.c_void_p(indptr), ctypes.c_void_p(indices),
-            ctypes.c_uint32(page_size), ctypes.c_uint32(batch_size)
+            ctypes.c_uint32(page_size), ctypes.c_uint32(batch_size),
+            ctypes.c_uint32(cp_world_size), ctypes.c_uint32(cp_rank)
         )
 
     def graph_begin_capture(self):

@@ -1983,14 +1983,16 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number): void {
+  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
     const pPositionIds = this.cast(positionIds);
     const pLastPageLen = this.cast(lastPageLen);
     const pSlotMapping = this.cast(slotMapping);
     const pIndptr = this.cast(indptr);
     const pIndices = this.cast(indices);
+    const cpWs = contextParallel ? this.worldSize : 1;
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].decodeStep(pPositionIds.shards[i], pLastPageLen.shards[i], pSlotMapping.shards[i], pIndptr.shards[i], pIndices.shards[i], pageSize, batchSize);
+      const cpR = contextParallel ? i : 0;
+      this.devices[i].decodeStep(pPositionIds.shards[i], pLastPageLen.shards[i], pSlotMapping.shards[i], pIndptr.shards[i], pIndices.shards[i], pageSize, batchSize, contextParallel, cpWs, cpR);
     }
   }
 
@@ -2122,7 +2124,7 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, batchSize: number, numQoHeads: number, pageSize: number, enableCudaGraph: boolean, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
+  mlaDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, batchSize: number, numQoHeads: number, pageSize: number, enableCudaGraph: boolean, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, seqKvLens?: number[]): void {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPinnedIntWs = this.cast(pinnedIntWs);
@@ -2130,6 +2132,22 @@ export class ParallelOps implements DeviceOps {
     const pIndptrH = this.cast(indptrH);
     const effectiveNumQoHeads = contextParallel ? numQoHeads : this.shardDim(numQoHeads, "mlaDecodePlan numQoHeads");
     const effectivePageSize = contextParallel ? pageSize / this.worldSize : pageSize;
+    if (contextParallel && seqKvLens) {
+      const cpWorldSize = this.worldSize;
+      for (let r = 0; r < cpWorldSize; r++) {
+        pIndptrH.shards[r].withPinnedBuffer(buf => {
+          let cumulative = 0;
+          buf.writeInt32LE(0, 0);
+          for (let s = 0; s < batchSize; s++) {
+            const N = seqKvLens[s];
+            const localKvLen = N > r ? Math.floor((N - 1 - r) / cpWorldSize) + 1 : 0;
+            const logicalPages = localKvLen > 0 ? Math.ceil(localKvLen / effectivePageSize) : 0;
+            cumulative += logicalPages;
+            buf.writeInt32LE(cumulative, (s + 1) * 4);
+          }
+        });
+      }
+    }
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].mlaDecodePlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pIndptrH.shards[i], batchSize, effectiveNumQoHeads, effectivePageSize, enableCudaGraph, headDimCkv, headDimKpe, contextParallel);
     }
