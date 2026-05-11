@@ -1678,7 +1678,7 @@ export class ParallelOps implements DeviceOps {
    *
    * When shardNHeads is provided, only processes and outputs heads
    * [i * shardNHeads, (i+1) * shardNHeads) per device i, producing
-   * contiguous Column-parallel output [batch, shardNHeads * vHeadDim].
+   * contiguous Row-parallel output [batch, shardNHeads * vHeadDim].
    *
    * When shardNHeads is omitted, outputs all heads (Replicated).
    */
@@ -1697,10 +1697,10 @@ export class ParallelOps implements DeviceOps {
     using gatheredVOutShards = partialVOuts.allGather(partialVOuts.workspace);
     using gatheredLseShards = partialLses.allGather(partialLses.workspace);
     const shardWss = this.getShardWorkspaces(workspace);
-    const outVOutShape = isHeads ? [batchSize, snh * vHeadDim] : [batchSize, numHeads * vHeadDim];
-    const mergedVOutShards = shardWss.map(ws => ws.alloc(outVOutShape, "BF16"));
-    const outLseShape = isHeads ? [batchSize, snh] : [batchSize, numHeads];
-    const mergedLseShards = mergedLse ? shardWss.map(ws => ws.alloc(outLseShape, "F32")) : null;
+    const shardVOutShape = isHeads ? [batchSize, snh * vHeadDim] : [batchSize, numHeads * vHeadDim];
+    const mergedVOutShards = shardWss.map(ws => ws.alloc(shardVOutShape, "BF16"));
+    const shardLseShape = isHeads ? [batchSize, snh] : [batchSize, numHeads];
+    const mergedLseShards = mergedLse ? shardWss.map(ws => ws.alloc(shardLseShape, "F32")) : null;
 
     // AllGather each shard's partial_v_out and partial_lse to all GPUs.
     // After AllGather, each GPU has all shards' data and can run cp_merge locally.
@@ -1726,8 +1726,9 @@ export class ParallelOps implements DeviceOps {
       );
     }
 
-    const outParallelism = isHeads ? TensorParallelism.Column : TensorParallelism.Replicated;
-    return this.wrapShards(workspace, mergedVOutShards, outVOutShape, "BF16", outParallelism);
+    const outParallelism = isHeads ? TensorParallelism.Row : TensorParallelism.Replicated;
+    const fullVOutShape = [batchSize, numHeads * vHeadDim];
+    return this.wrapShards(workspace, mergedVOutShards, fullVOutShape, "BF16", outParallelism);
   }
 
   /**
@@ -1739,7 +1740,7 @@ export class ParallelOps implements DeviceOps {
    *
    * When shardNHeads is provided, only processes and outputs heads
    * [i * shardNHeads, (i+1) * shardNHeads) per device i, producing
-   * contiguous Column-parallel output [batch, shardNHeads * vHeadDim].
+   * contiguous Row-parallel output [batch, shardNHeads * vHeadDim].
    *
    * When shardNHeads is omitted, outputs all heads (Replicated).
    */
@@ -1774,13 +1775,13 @@ export class ParallelOps implements DeviceOps {
     }
     const shardWorkspaces = this.getShardWorkspaces(partialVOuts[0].workspace);
     group.ensureCapacity(slotBytes, shardWorkspaces);
-    const outVOutShape = isHeads ? [batchSize, snh * vHeadDim] : [batchSize, numHeads * vHeadDim];
+    const shardVOutShape = isHeads ? [batchSize, snh * vHeadDim] : [batchSize, numHeads * vHeadDim];
 
-    const mergedVOutShards = shardWorkspaces.map(ws => ws.alloc(outVOutShape, "BF16"));
+    const mergedVOutShards = shardWorkspaces.map(ws => ws.alloc(shardVOutShape, "BF16"));
     let mergedLseShards: Tensor[] | null = null;
     if (mergedLse) {
-      const outLseShape = isHeads ? [batchSize, snh] : [batchSize, numHeads];
-      mergedLseShards = shardWorkspaces.map(ws => ws.alloc(outLseShape, "F32"));
+      const shardLseShape = isHeads ? [batchSize, snh] : [batchSize, numHeads];
+      mergedLseShards = shardWorkspaces.map(ws => ws.alloc(shardLseShape, "F32"));
     }
 
     for (let i = 0; i < this.worldSize; i++) {
@@ -1793,11 +1794,12 @@ export class ParallelOps implements DeviceOps {
       );
     }
 
-    const outParallelism = isHeads ? TensorParallelism.Column : TensorParallelism.Replicated;
+    const outParallelism = isHeads ? TensorParallelism.Row : TensorParallelism.Replicated;
+    const fullVOutShape = [batchSize, numHeads * vHeadDim];
     return new ParallelTensor(
       workspace, this,
       outParallelism,
-      mergedVOutShards, outVOutShape,
+      mergedVOutShards, fullVOutShape,
       "BF16", undefined, false, undefined,
     );
   }

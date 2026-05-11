@@ -331,7 +331,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
           this.mlaDecodePlanInfo,
           this.indptrH,
           batchSize, model.cfg.numAttentionHeads, pagedKV.pageSize, enableCudaGraph,
-          model.cfg.kvLoraRank!, model.cfg.qkRopeHeadDim!
+          model.cfg.kvLoraRank!, model.cfg.qkRopeHeadDim!, pagedKV.contextParallel
         );
       }
       pagedKV.pagesDirtyHost = false;
@@ -438,7 +438,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         this.mlaPrefillPlanInfo,
         this.qoIndptrH, this.indptrH,
         this.kvLenH,
-        batchSize, nHeads, cfg.kvLoraRank!, true
+        batchSize, nHeads, cfg.kvLoraRank!, true, pagedKV.contextParallel
       );
     }
 

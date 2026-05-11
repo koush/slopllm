@@ -607,11 +607,12 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), merged_lse_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_output_contiguous_column_layout(self, glm, device):
-        """Verify output is contiguous [B, shard_n_heads, D] (Column-parallel layout).
+        """Verify output is contiguous [B, shard_n_heads, D] (Row-parallel layout).
         
         The head-grouped kernel writes output at stride (shard_n_heads * D) per batch,
         not (num_heads * D) per batch. This means the output is contiguous in
-        Column-parallel layout, suitable for direct use with Column v_proj.
+        Row-parallel layout (split along dim 1 / features), suitable for direct
+        use with Row-parallel v_proj (o_proj).
         """
         B, H, D = 2, 8, 128
         shard_n_heads = H // 2

@@ -281,7 +281,9 @@ export function* generateStream(
       }
 
       // sync on the previous token
+      console.log('sync', tokenHistory.length)
       sampleStream.value.synchronize();
+      console.log('done sync')
       const currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
       // kick off next sample read
       readSample();
@@ -634,6 +636,7 @@ async function main(): Promise<void> {
   console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${args.maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}${arenaStr}`);
 
   const cleanup = () => {
+    console.log('cleanup')
     glm.synchronize();
     cache.free();
     ws.free();
