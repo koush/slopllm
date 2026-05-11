@@ -309,3 +309,139 @@ class TestP2PCpMerge:
 
         torch.testing.assert_close(merged_v_outs[0].cpu(), merged_v_ref.cpu(), atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(merged_lse_outs[0].cpu(), merged_lse_ref.cpu(), atol=1e-3, rtol=1e-3)
+
+    def test_p2p_cp_merge_heads_first_half(self):
+        """P2P head-grouped merge: only first half of heads."""
+        B, H, D = 1, 8, 128
+        shard_n_heads = H // 2
+        head_offset = 0
+        num_shards = NUM_GPUS
+        torch.manual_seed(42)
+
+        v_out_bytes = B * H * D * 2
+        lse_bytes = B * H * 4
+        max_bytes = v_out_bytes + lse_bytes + 256
+        instances = self._setup_p2p(max_bytes)
+
+        partial_v_outs = [torch.randn(B, H, D, dtype=torch.bfloat16, device=f"cuda:{r}") for r in range(num_shards)]
+        partial_lses = [torch.randn(B, H, dtype=torch.float32, device=f"cuda:{r}") for r in range(num_shards)]
+
+        all_v_on_gpu0 = [t.to("cuda:0") for t in partial_v_outs]
+        all_lse_on_gpu0 = [t.to("cuda:0") for t in partial_lses]
+        merged_v_ref, merged_lse_ref = torch_merge_partial_attn(all_v_on_gpu0, all_lse_on_gpu0)
+        merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
+        merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
+
+        merged_v_outs = [torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=f"cuda:{r}") for r in range(num_shards)]
+        merged_lse_outs = [torch.empty(B, shard_n_heads, dtype=torch.float32, device=f"cuda:{r}") for r in range(num_shards)]
+
+        for rank in range(num_shards):
+            self.ops[rank].p2p_cp_merge_heads(
+                instances[rank],
+                partial_v_outs[rank].data_ptr(),
+                partial_lses[rank].data_ptr(),
+                merged_v_outs[rank].data_ptr(),
+                merged_lse_outs[rank].data_ptr(),
+                num_shards, B, H, shard_n_heads, head_offset, D,
+            )
+
+        for rank in range(num_shards):
+            self.ops[rank].synchronize()
+
+        torch.testing.assert_close(merged_v_outs[0].cpu(), merged_v_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(merged_lse_outs[0].cpu(), merged_lse_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
+
+    def test_p2p_cp_merge_heads_two_tp_shards(self):
+        """P2P head-grouped merge simulating 2-way TP: merge heads [0,H/2) and [H/2,H) separately."""
+        B, H, D = 1, 8, 128
+        shard_n_heads = H // 2
+        num_shards = NUM_GPUS
+        torch.manual_seed(99)
+
+        v_out_bytes = B * H * D * 2
+        lse_bytes = B * H * 4
+        max_bytes = v_out_bytes + lse_bytes + 256
+        instances = self._setup_p2p(max_bytes)
+
+        partial_v_outs = [torch.randn(B, H, D, dtype=torch.bfloat16, device=f"cuda:{r}") for r in range(num_shards)]
+        partial_lses = [torch.randn(B, H, dtype=torch.float32, device=f"cuda:{r}") for r in range(num_shards)]
+
+        all_v_on_gpu0 = [t.to("cuda:0") for t in partial_v_outs]
+        all_lse_on_gpu0 = [t.to("cuda:0") for t in partial_lses]
+        merged_v_ref, merged_lse_ref = torch_merge_partial_attn(all_v_on_gpu0, all_lse_on_gpu0)
+
+        for tp_rank in range(2):
+            offset = tp_rank * shard_n_heads
+            merged_v_outs = [torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=f"cuda:{r}") for r in range(num_shards)]
+            merged_lse_outs = [torch.empty(B, shard_n_heads, dtype=torch.float32, device=f"cuda:{r}") for r in range(num_shards)]
+
+            for rank in range(num_shards):
+                self.ops[rank].p2p_cp_merge_heads(
+                    instances[rank],
+                    partial_v_outs[rank].data_ptr(),
+                    partial_lses[rank].data_ptr(),
+                    merged_v_outs[rank].data_ptr(),
+                    merged_lse_outs[rank].data_ptr(),
+                    num_shards, B, H, shard_n_heads, offset, D,
+                )
+
+            for rank in range(num_shards):
+                self.ops[rank].synchronize()
+
+            torch.testing.assert_close(
+                merged_v_outs[0].cpu(), merged_v_ref[:, offset:offset + shard_n_heads, :].cpu(),
+                atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(
+                merged_lse_outs[0].cpu(), merged_lse_ref[:, offset:offset + shard_n_heads].cpu(),
+                atol=1e-3, rtol=1e-3)
+
+    def test_p2p_cp_merge_heads_matches_single_gpu(self):
+        """P2P head-grouped merge should match single-GPU context_parallel_merge_heads."""
+        B, H, D = 1, 8, 128
+        shard_n_heads = H // 2
+        head_offset = H // 2
+        num_shards = NUM_GPUS
+        torch.manual_seed(77)
+
+        v_out_bytes = B * H * D * 2
+        lse_bytes = B * H * 4
+        max_bytes = v_out_bytes + lse_bytes + 256
+        instances = self._setup_p2p(max_bytes)
+
+        partial_v_outs = [torch.randn(B, H, D, dtype=torch.bfloat16, device=f"cuda:{r}") for r in range(num_shards)]
+        partial_lses = [torch.randn(B, H, dtype=torch.float32, device=f"cuda:{r}") for r in range(num_shards)]
+
+        merged_v_p2p = [torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=f"cuda:{r}") for r in range(num_shards)]
+        merged_lse_p2p = [torch.empty(B, shard_n_heads, dtype=torch.float32, device=f"cuda:{r}") for r in range(num_shards)]
+
+        for rank in range(num_shards):
+            self.ops[rank].p2p_cp_merge_heads(
+                instances[rank],
+                partial_v_outs[rank].data_ptr(),
+                partial_lses[rank].data_ptr(),
+                merged_v_p2p[rank].data_ptr(),
+                merged_lse_p2p[rank].data_ptr(),
+                num_shards, B, H, shard_n_heads, head_offset, D,
+            )
+
+        for rank in range(num_shards):
+            self.ops[rank].synchronize()
+
+        all_v_on_gpu0 = [partial_v_outs[r].to("cuda:0") for r in range(num_shards)]
+        all_lse_on_gpu0 = [partial_lses[r].to("cuda:0") for r in range(num_shards)]
+
+        merged_v_single = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device="cuda:0")
+        merged_lse_single = torch.empty(B, shard_n_heads, dtype=torch.float32, device="cuda:0")
+
+        self.ops[0].context_parallel_merge_heads(
+            [t.data_ptr() for t in all_v_on_gpu0],
+            [t.data_ptr() for t in all_lse_on_gpu0],
+            num_shards,
+            merged_v_single.data_ptr(),
+            merged_lse_single.data_ptr(),
+            B, H, shard_n_heads, head_offset, D,
+        )
+        self.ops[0].synchronize()
+
+        torch.testing.assert_close(merged_v_p2p[0].cpu(), merged_v_single.cpu(), atol=0, rtol=0)
+        torch.testing.assert_close(merged_lse_p2p[0].cpu(), merged_lse_single.cpu(), atol=1e-6, rtol=1e-6)

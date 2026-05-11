@@ -65,7 +65,8 @@ export class ExecutionState {
       appendCkv, appendKpe,
       this.ws.mlaBatchIndices, this.ws.positionIds,
       nnz, pageSize, headDimCkv, headDimKpe,
-      appendCkvStrideN, appendKpeStrideN
+      appendCkvStrideN, appendKpeStrideN,
+      pagedKV.contextParallel,
     );
   }
 
@@ -515,6 +516,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   readonly maxPages: number;
   readonly maxBatch: number;
   readonly pageSize: number;
+  readonly contextParallel: boolean;
   kData: Tensor[];
   vData: Tensor[];
   ckvData: Tensor[];
@@ -538,6 +540,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.maxPages = maxPages;
     this.maxBatch = maxBatch;
     this.pageSize = pageSize;
+    this.contextParallel = contextParallel;
     this.kData = [];
     this.vData = [];
     this.ckvData = [];

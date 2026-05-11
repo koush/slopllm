@@ -270,9 +270,9 @@ export class Glm51Model extends ChatModel {
     const kNopeKey = `${layerPfx}.k_nope_proj.weight`;
     const qNopeKey = `${layerPfx}.q_nope_proj.weight`;
     if (!this.pendingKNope.has(kNopeKey) || !this.pendingQNope.has(qNopeKey)) return;
-    const colPar = TensorParallelism.Column;
-    const kNopeProj = await this.loadDeferredMlaWeight(kNopeKey, colPar);
-    const qNopeProj = await this.loadDeferredMlaWeight(qNopeKey, colPar);
+    const par = this.contextParallel ? TensorParallelism.Replicated : TensorParallelism.Column;
+    const kNopeProj = await this.loadDeferredMlaWeight(kNopeKey, par);
+    const qNopeProj = await this.loadDeferredMlaWeight(qNopeKey, par);
     const wAbsorbed = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
     wAbsorbed.setName(`${layerPfx}.absorbed.weight`);
     kNopeProj[Symbol.dispose]();
@@ -306,7 +306,8 @@ export class Glm51Model extends ChatModel {
         mmapPtr, offset, nHeads, headDim: qkHeadDim, inDim, rowsPerHead: qkNopeDim, outDim: qLoraRank, par: colPar,
       });
       const peName = name.replace(".q_b_proj.weight", ".q_pe_proj.weight");
-      const tPe = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", peName, colPar);
+      const par = this.contextParallel ? TensorParallelism.Replicated : colPar;
+      const tPe = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", peName, par);
       await tPe.mmapLoad(mmapPtr, offset, tPe.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: qkRopeDim * inDim * eb, width: qkRopeDim * inDim * eb, height: nHeads });
     } else if (name.endsWith(".kv_b_proj.weight")) {
       const eb = 2;
@@ -541,6 +542,7 @@ export class Glm51Model extends ChatModel {
     using downBuf = layerIdx >= cfg.firstSparseMlpLayer
       ? this.mlpSparse(attnNormed, mlpPfx, BS)
       : this.mlpDense(attnNormed, mlpPfx, BS);
+
     const nextWeight = layerIdx < cfg.numHiddenLayers - 1
       ? this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx + 1}.input_layernorm.weight`)!
       : this.tensors.get("model.norm.weight")!;

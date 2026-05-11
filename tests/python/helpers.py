@@ -676,6 +676,15 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
+        self.lib.glm_context_parallel_merge_heads.restype = None
+        self.lib.glm_context_parallel_merge_heads.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
         self.lib.glm_p2p_enable_peer_access.restype = ctypes.c_int
         self.lib.glm_p2p_enable_peer_access.argtypes = [
             ctypes.c_void_p, ctypes.c_int,
@@ -721,6 +730,14 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_p2p_cp_merge_heads.restype = None
+        self.lib.glm_p2p_cp_merge_heads.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_row_normalize.restype = None
@@ -1605,6 +1622,20 @@ class GlmOps:
             batch_size, num_heads, v_head_dim
         )
 
+    def context_parallel_merge_heads(self, partial_v_outs, partial_lses, num_shards,
+                                     merged_v_out, merged_lse,
+                                     batch_size, num_heads, shard_n_heads, head_offset, v_head_dim):
+        v_ptrs = (ctypes.c_void_p * num_shards)(*[ctypes.c_void_p(int(p)) for p in partial_v_outs])
+        lse_ptrs = (ctypes.c_void_p * num_shards)(*[ctypes.c_void_p(int(p)) for p in partial_lses])
+        self.lib.glm_context_parallel_merge_heads(
+            self.ctx,
+            v_ptrs, lse_ptrs,
+            num_shards,
+            ctypes.c_void_p(int(merged_v_out)),
+            ctypes.c_void_p(int(merged_lse)) if merged_lse is not None else ctypes.c_void_p(0),
+            batch_size, num_heads, shard_n_heads, head_offset, v_head_dim
+        )
+
     def p2p_enable_peer_access(self, peer_device):
         return self.lib.glm_p2p_enable_peer_access(self.ctx, peer_device)
 
@@ -1646,4 +1677,15 @@ class GlmOps:
             ctypes.c_void_p(int(merged_v_out)),
             ctypes.c_void_p(int(merged_lse)) if merged_lse is not None else ctypes.c_void_p(0),
             num_shards, batch_size, num_heads, v_head_dim
+        )
+
+    def p2p_cp_merge_heads(self, inst, my_v_out, my_lse, merged_v_out, merged_lse,
+                           num_shards, batch_size, num_heads, shard_n_heads, head_offset, v_head_dim):
+        self.lib.glm_p2p_cp_merge_heads(
+            self.ctx, inst,
+            ctypes.c_void_p(int(my_v_out)),
+            ctypes.c_void_p(int(my_lse)),
+            ctypes.c_void_p(int(merged_v_out)),
+            ctypes.c_void_p(int(merged_lse)) if merged_lse is not None else ctypes.c_void_p(0),
+            num_shards, batch_size, num_heads, shard_n_heads, head_offset, v_head_dim
         )

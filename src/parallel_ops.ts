@@ -1702,7 +1702,7 @@ export class ParallelOps implements DeviceOps {
     const lseElemsPerShard = batchSize * numHeads;
     const numShards = this.worldSize;
 
-    
+
     // Build pointer arrays and run cp_merge on each device.
     for (let i = 0; i < this.worldSize; i++) {
       const vPtrs: number[] = [];

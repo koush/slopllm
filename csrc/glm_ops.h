@@ -639,6 +639,25 @@ void glm_context_parallel_merge(
     int num_heads,
     int v_head_dim);
 
+// Head-grouped context parallel merge: only processes and outputs heads
+// [head_offset, head_offset + shard_n_heads). Output is contiguous
+// [batch_size * shard_n_heads * v_head_dim] (Column-parallel layout).
+// Input partial_v_outs/lse still use num_heads stride for indexing.
+// When shard_n_heads == num_heads and head_offset == 0, equivalent to
+// glm_context_parallel_merge.
+void glm_context_parallel_merge_heads(
+    GlmCtx* ctx,
+    const void* const* partial_v_outs,
+    const float* const* partial_lses,
+    int num_shards,
+    void* merged_v_out,
+    float* merged_lse,
+    int batch_size,
+    int num_heads,
+    int shard_n_heads,
+    int head_offset,
+    int v_head_dim);
+
 // P2P context parallel merge: fused P2P sync + online softmax merge.
 // Uses GlmP2PInstance for peer-to-peer data exchange (no NCCL needed).
 // inst: P2P instance with peers already configured
@@ -658,6 +677,26 @@ void glm_p2p_cp_merge(
     int num_shards,
     int batch_size,
     int num_heads,
+    int v_head_dim);
+
+// P2P head-grouped context parallel merge: fused P2P sync + online softmax merge,
+// only processing heads [head_offset, head_offset + shard_n_heads).
+// P2P buffer holds full head data (scatter/sync unchanged), only merge phase
+// processes shard_n_heads starting at head_offset.
+// Output: [batch_size * shard_n_heads * v_head_dim] BF16 (contiguous Column layout)
+// When shard_n_heads == num_heads and head_offset == 0, equivalent to glm_p2p_cp_merge.
+void glm_p2p_cp_merge_heads(
+    GlmCtx* ctx,
+    GlmP2PInstance* inst,
+    const void* my_v_out,
+    const float* my_lse,
+    void* merged_v_out,
+    float* merged_lse,
+    int num_shards,
+    int batch_size,
+    int num_heads,
+    int shard_n_heads,
+    int head_offset,
     int v_head_dim);
 
 // RMSNorm gated: output = RMSNorm(input) * weight * SiLU(gate)
