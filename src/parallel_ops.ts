@@ -2070,21 +2070,10 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  private adjustCpPagedKvMeta(kvIndptrH: ParallelTensor, lastPageLenH: ParallelTensor, batchSize: number, seqKvLens: number[], pageSize: number): void {
+  private adjustCpLastPageLen(lastPageLenH: ParallelTensor, batchSize: number, seqKvLens: number[], pageSize: number): void {
     const cpWorldSize = this.worldSize;
     const effectivePageSize = pageSize / cpWorldSize;
     for (let r = 0; r < cpWorldSize; r++) {
-      kvIndptrH.shards[r].withPinnedBuffer(buf => {
-        let cumulative = 0;
-        buf.writeInt32LE(0, 0);
-        for (let s = 0; s < batchSize; s++) {
-          const N = seqKvLens[s];
-          const localKvLen = N > r ? Math.floor((N - 1 - r) / cpWorldSize) + 1 : 0;
-          const logicalPages = localKvLen > 0 ? Math.ceil(localKvLen / effectivePageSize) : 0;
-          cumulative += logicalPages;
-          buf.writeInt32LE(cumulative, (s + 1) * 4);
-        }
-      });
       lastPageLenH.shards[r].withPinnedBuffer(buf => {
         for (let s = 0; s < batchSize; s++) {
           const N = seqKvLens[s];
@@ -2108,7 +2097,7 @@ export class ParallelOps implements DeviceOps {
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "mlaPrefillPlan numHeads");
     const effectiveCpWorldSize = contextParallel ? this.worldSize : undefined;
     if (contextParallel) {
-      this.adjustCpPagedKvMeta(pKvIndptrH, pLastPageLenH, batchSize, seqKvLens, pageSize);
+      this.adjustCpLastPageLen(pLastPageLenH, batchSize, seqKvLens, pageSize);
     }
     for (let i = 0; i < this.worldSize; i++) {
       const effectiveCpRank = contextParallel ? i : undefined;
@@ -2179,7 +2168,7 @@ export class ParallelOps implements DeviceOps {
     const effectiveNumQoHeads = contextParallel ? numQoHeads : this.shardDim(numQoHeads, "mlaDecodePlan numQoHeads");
     const effectivePageSize = contextParallel ? pageSize / this.worldSize : pageSize;
     if (contextParallel && seqKvLens) {
-      this.adjustCpPagedKvMeta(pIndptrH, pLastPageLenH, batchSize, seqKvLens, pageSize);
+      this.adjustCpLastPageLen(pLastPageLenH, batchSize, seqKvLens, pageSize);
     }
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].mlaDecodePlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pIndptrH.shards[i], pLastPageLenH.shards[i], batchSize, effectiveNumQoHeads, effectivePageSize, enableCudaGraph, headDimCkv, headDimKpe, contextParallel);
