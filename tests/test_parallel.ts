@@ -579,8 +579,7 @@ describe("ParallelTensor.allReduce", () => {
     pt.shard(1).h2d(f32ToBf16Bytes(shard1F32));
     po.synchronize();
 
-    const result = pt.allReduce();
-    assert.equal(result, pt, "allReduce should return same tensor");
+    pt.allReduce();
     assert.equal(pt.parallelism, TensorParallelism.Replicated, "parallelism should be Replicated after allReduce");
     po.synchronize();
 

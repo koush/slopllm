@@ -37,12 +37,16 @@ export abstract class Tensor implements Disposable {
     this.view = view;
   }
 
+  get numElements(): number {
+    return numElements(this.shape);
+  }
+
   static byteCount(shape: number[], type: string): number {
     return Math.ceil(numElements(shape) * SafeTensorFile.dtypeBytes(type));
   }
 
   get bytes(): number {
-    return Math.ceil(numElements(this.shape) * SafeTensorFile.dtypeBytes(this.type));
+    return Math.ceil(this.numElements * SafeTensorFile.dtypeBytes(this.type));
   }
 
   withPinnedBuffer(fn: (buf: Buffer) => void) {
@@ -89,7 +93,7 @@ export abstract class Tensor implements Disposable {
   }
 
   reshape(newShape: number[]): Tensor {
-    const current = numElements(this.shape);
+    const current = this.numElements;
     const target = numElements(newShape);
     if (current !== target) {
       throw new Error(`reshape: cannot reshape [${this.shape}] (${current} elements) to [${newShape}] (${target} elements)`);
@@ -140,7 +144,7 @@ export abstract class Tensor implements Disposable {
   writePointers(tensors: Tensor[]): void {
     if (this.type !== "I64") throw new Error(`writePointers: expected I64 tensor, got ${this.type}`);
     const n = tensors.length;
-    if (numElements(this.shape) < n) throw new Error(`writePointers: tensor has ${numElements(this.shape)} elements, need ${n}`);
+    if (this.numElements < n) throw new Error(`writePointers: tensor has ${this.numElements} elements, need ${n}`);
     return undefined as never;
   }
 
@@ -148,7 +152,7 @@ export abstract class Tensor implements Disposable {
     if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== dim) {
       throw new Error(`rmsnorm: input shape [${this.shape}] incompatible with batch=${batch}, dim=${dim}`);
     }
-    if (numElements(weight.shape) !== dim) throw new Error(`rmsnorm: weight has ${numElements(weight.shape)} elements, expected ${dim}`);
+    if (weight.numElements !== dim) throw new Error(`rmsnorm: weight has ${weight.numElements} elements, expected ${dim}`);
     return undefined as never;
   }
 
@@ -159,12 +163,12 @@ export abstract class Tensor implements Disposable {
     if (input.shape.length !== 2 || input.shape[0] < batch || input.shape[1] !== dim) {
       throw new Error(`fusedAddRmsnorm: input shape [${input.shape}] incompatible with batch=${batch}, dim=${dim}`);
     }
-    if (numElements(weight.shape) !== dim) throw new Error(`fusedAddRmsnorm: weight has ${numElements(weight.shape)} elements, expected ${dim}`);
+    if (weight.numElements !== dim) throw new Error(`fusedAddRmsnorm: weight has ${weight.numElements} elements, expected ${dim}`);
     return undefined as never;
   }
 
   fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
-    if (numElements(weight.shape) !== headDim) throw new Error(`fusedNormRope: weight has ${numElements(weight.shape)} elements, expected ${headDim}`);
+    if (weight.numElements !== headDim) throw new Error(`fusedNormRope: weight has ${weight.numElements} elements, expected ${headDim}`);
     if (cos.shape.length !== sin.shape.length) throw new Error(`fusedNormRope: cos ndim ${cos.shape.length} != sin ndim ${sin.shape.length}`);
     for (let i = 0; i < cos.shape.length; i++) {
       if (cos.shape[i] !== sin.shape[i]) throw new Error(`fusedNormRope: cos shape [${cos.shape}] != sin shape [${sin.shape}]`);
@@ -209,16 +213,16 @@ export abstract class Tensor implements Disposable {
   }
 
   gather(indices: Tensor, k: number, inDim: number, batch: number): Tensor {
-    if (numElements(this.shape) < batch * inDim) throw new Error(`gather: source has ${numElements(this.shape)} elements (shape [${this.shape}]${this.view ? ', view of [' + this.view.shape + ']' : ''}), needs ${batch * inDim} (batch=${batch}, inDim=${inDim})`);
+    if (this.numElements < batch * inDim) throw new Error(`gather: source has ${this.numElements} elements (shape [${this.shape}]${this.view ? ', view of [' + this.view.shape + ']' : ''}), needs ${batch * inDim} (batch=${batch}, inDim=${inDim})`);
     if (indices.type !== "I32") throw new Error(`gather: indices must be I32, got ${indices.type}`);
-    if (numElements(indices.shape) < batch * k) throw new Error(`gather: indices has ${numElements(indices.shape)} elements (shape [${indices.shape}]${indices.view ? ', view of [' + indices.view.shape + ']' : ''}), needs ${batch * k} (batch=${batch}, k=${k})`);
+    if (indices.numElements < batch * k) throw new Error(`gather: indices has ${indices.numElements} elements (shape [${indices.shape}]${indices.view ? ', view of [' + indices.view.shape + ']' : ''}), needs ${batch * k} (batch=${batch}, k=${k})`);
     return undefined as never;
   }
 
   indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
     if (indices.type !== "I32") throw new Error(`indexSelect: indices must be I32, got ${indices.type}`);
-    if (numElements(indices.shape) < batch) {
-      throw new Error(`indexSelect: indices has ${numElements(indices.shape)} elements (shape [${indices.shape}]${indices.view ? ', view of [' + indices.view.shape + ']' : ''}), insufficient for batch=${batch}`);
+    if (indices.numElements < batch) {
+      throw new Error(`indexSelect: indices has ${indices.numElements} elements (shape [${indices.shape}]${indices.view ? ', view of [' + indices.view.shape + ']' : ''}), insufficient for batch=${batch}`);
     }
     return undefined as never;
   }
@@ -251,7 +255,7 @@ export abstract class Tensor implements Disposable {
     if (gate.shape.length !== 2 || gate.shape[0] < batch || gate.shape[1] !== dim) {
       throw new Error(`rmsnormGated: gate shape [${gate.shape}] incompatible with batch=${batch}, dim=${dim}`);
     }
-    if (numElements(weight.shape) !== dim) throw new Error(`rmsnormGated: weight has ${numElements(weight.shape)} elements, expected ${dim}`);
+    if (weight.numElements !== dim) throw new Error(`rmsnormGated: weight has ${weight.numElements} elements, expected ${dim}`);
   }
 
   gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
@@ -350,7 +354,7 @@ export abstract class Tensor implements Disposable {
   }
 
   readInt32LE(): number[] {
-    const count = numElements(this.shape);
+    const count = this.numElements;
     const buf = Buffer.alloc(count * 4);
     this.d2h(buf);
     const result: number[] = [];

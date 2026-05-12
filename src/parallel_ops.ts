@@ -143,7 +143,7 @@ export class ParallelTensor extends Tensor {
     );
   }
 
-  allReduce(): ParallelTensor {
+  allReduce(): void {
     if (this.parallelism !== TensorParallelism.PartialSum) {
       throw new Error(`allReduce requires PartialSum tensor, got ${this.parallelism}`);
     }
@@ -152,7 +152,6 @@ export class ParallelTensor extends Tensor {
     const dtype = this.parallelOps.ncclDatatype(this.type);
     this.parallelOps.doAllReduce(this.shards, count, dtype);
     this.parallelism = TensorParallelism.Replicated;
-    return this;
   }
 
   allGather(workspace: WorkspaceBase): ParallelTensor {
@@ -643,6 +642,37 @@ export class ParallelTensor extends Tensor {
   fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
     super.fusedAddRmsnorm(input, weight, eps, dim, batch);
     const pInput = input as ParallelTensor;
+
+    if (this.parallelism === 'row' && input.parallelism === 'partial_sum') {
+      const eb = 2;
+      const rows = this.fullShape[0];
+      const fullDim = this.fullShape[1];
+      const shardDim = fullDim / this.worldSize;
+      const shardWss = this.parallelOps.getShardWorkspaces(this.workspace);
+
+      const residualShards = shardWss.map((ws, i) => {
+        using tempTensor = ws.alloc([rows, fullDim], input.type);
+        tempTensor.fill(0, tempTensor.numElements);
+        tempTensor.memcpy2d(
+          i * shardDim * eb,
+          fullDim * eb,
+          this.shards[i].data,
+          shardDim * eb,
+          shardDim * eb,
+          rows,
+          MemcpyKind.DeviceToDevice,
+        );
+        return tempTensor.add(pInput.shards[i]);
+      });
+
+      const residual = this.parallelOps.wrapShards(this.workspace, residualShards, input.shape, this.type, TensorParallelism.PartialSum);
+      residual.allReduce();
+
+      return {
+        normed: residual.rmsnorm(weight, eps, dim, batch),
+        residual,
+      }
+    }
 
     if (this.parallelism === TensorParallelism.PartialSum) {
       this.allReduce();
@@ -2147,9 +2177,9 @@ export class ParallelOps implements DeviceOps {
           stream.streamWaitEvent();
         }
         else {
-            gatheredQNope = pQNope.allGather(pQNope.workspace);
-            pQNope = gatheredQNope;
-            gatheredQPe = pQPe;
+          gatheredQNope = pQNope.allGather(pQNope.workspace);
+          pQNope = gatheredQNope;
+          gatheredQPe = pQPe;
         }
       }
     }
