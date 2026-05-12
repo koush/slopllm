@@ -270,7 +270,7 @@ export class Glm51Model extends ChatModel {
     const kNopeKey = `${layerPfx}.k_nope_proj.weight`;
     const qNopeKey = `${layerPfx}.q_nope_proj.weight`;
     if (!this.pendingKNope.has(kNopeKey) || !this.pendingQNope.has(qNopeKey)) return;
-    const par = this.contextParallel ? TensorParallelism.Replicated : TensorParallelism.Column;
+    const par = TensorParallelism.Column;
     const kNopeProj = await this.loadDeferredMlaWeight(kNopeKey, par);
     const qNopeProj = await this.loadDeferredMlaWeight(qNopeKey, par);
     const wAbsorbed = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);

@@ -1694,6 +1694,9 @@ export class ParallelOps implements DeviceOps {
     shardNHeads?: number,
     inputNHeads?: number,
   ): ParallelTensor {
+    if (this.p2pEnabled) {
+      return this.p2pCpMerge(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, mergedLse, workspace, shardNHeads, inputNHeads);
+    }
     const snh = shardNHeads ?? numHeads;
     const inh = inputNHeads ?? snh;
     const isHeads = snh !== numHeads;
@@ -2132,12 +2135,22 @@ export class ParallelOps implements DeviceOps {
     let gatheredQPe: ParallelTensor | undefined;
     if (contextParallel) {
       if (pQNope.parallelism === TensorParallelism.Row) {
-        gatheredQNope = pQNope.allGather(pQNope.workspace);
-        pQNope = gatheredQNope;
-      }
-      if (pQPe.parallelism === TensorParallelism.Row) {
-        gatheredQPe = pQPe.allGather(pQPe.workspace);
-        pQPe = gatheredQPe;
+        if (pQPe.parallelism === TensorParallelism.Row) {
+          using stream = this.withStream(() => {
+            gatheredQPe = pQPe.allGather(pQPe.workspace);
+            pQPe = gatheredQPe;
+          });
+
+          gatheredQNope = pQNope.allGather(pQNope.workspace);
+          pQNope = gatheredQNope;
+
+          stream.streamWaitEvent();
+        }
+        else {
+            gatheredQNope = pQNope.allGather(pQNope.workspace);
+            pQNope = gatheredQNope;
+            gatheredQPe = pQPe;
+        }
       }
     }
     const oShards: Tensor[] = [];
