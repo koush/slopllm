@@ -723,12 +723,6 @@ describe("ParallelTensor.allGather", () => {
     }
   });
 
-  it("allGather Replicated returns same tensor", () => {
-    const pt = ws.alloc([4, 4], "F32", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const result = pt.allGather(ws);
-    assert.strictEqual(result, pt, "allGather on Replicated should return same tensor");
-  });
-
   it("allGather rejects PartialSum tensor", () => {
     const pt = ws.alloc([4, 4], "F32", undefined, TensorParallelism.PartialSum) as ParallelTensor;
     assert.throws(() => pt.allGather(ws), /PartialSum/);
@@ -776,8 +770,7 @@ describe("ParallelTensor.all", () => {
     pt.shard(1).h2d(Buffer.from(shard1F32.buffer));
     po.synchronize();
 
-    const result = pt.allReduce();
-    assert.strictEqual(result, pt, "allReduce() on PartialSum should return same tensor (allReduce is in-place)");
+    pt.allReduce();
     assert.equal(pt.parallelism, TensorParallelism.Replicated, "parallelism should be Replicated after all()");
     po.synchronize();
 

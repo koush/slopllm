@@ -97,7 +97,7 @@ class TestContextParallelMergeHeads:
             num_shards,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, H, 0, D
+            B, H, H, 0, H, D
         )
         glm.synchronize()
 
@@ -105,7 +105,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), merged_lse_ref.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_first_half(self, glm, device):
-        """Merge only first half of heads, verify matches slice of full merge."""
+        """Merge only first half of heads, verify matches slice of full merge.
+
+        Uses shard-layout v_out [B, snh, D] with head_offset=0 and input_n_heads=shard_n_heads.
+        """
         B, H, D = 2, 8, 128
         shard_n_heads = H // 2
         head_offset = 0
@@ -129,7 +132,7 @@ class TestContextParallelMergeHeads:
             num_shards,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, shard_n_heads, D
         )
         glm.synchronize()
 
@@ -137,7 +140,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), merged_lse_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_second_half(self, glm, device):
-        """Merge only second half of heads, verify matches slice of full merge."""
+        """Merge only second half of heads, verify matches slice of full merge.
+
+        Uses full-layout v_out [B, H, D] with input_n_heads=num_heads because head_offset>0.
+        """
         B, H, D = 2, 8, 128
         shard_n_heads = H // 2
         head_offset = H // 2
@@ -151,17 +157,16 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
-        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, H, D
         )
         glm.synchronize()
 
@@ -169,7 +174,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), merged_lse_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_two_tp_shards_reconstruct(self, glm, device):
-        """Simulate 2-way TP: merge heads [0,H/2) and [H/2,H) separately, combine = full merge."""
+        """Simulate 2-way TP: merge heads [0,H/2) and [H/2,H) separately, combine = full merge.
+
+        Uses full-layout v_out with input_n_heads=num_heads because head_offset>0 for second group.
+        """
         B, H, D = 2, 8, 128
         shard_n_heads = H // 2
         num_shards = 2
@@ -180,28 +188,26 @@ class TestContextParallelMergeHeads:
 
         merged_v_ref, merged_lse_ref = torch_merge_partial_attn(partial_v_outs, partial_lses)
 
-        shard_v0 = shard_v_outs_from_full(partial_v_outs, 0, shard_n_heads)
         merged_v_shard0 = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_shard0 = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v0],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_shard0.data_ptr(),
             merged_lse_shard0.data_ptr(),
-            B, H, shard_n_heads, 0, D
+            B, H, shard_n_heads, 0, H, D
         )
 
-        shard_v1 = shard_v_outs_from_full(partial_v_outs, shard_n_heads, shard_n_heads)
         merged_v_shard1 = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_shard1 = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v1],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_shard1.data_ptr(),
             merged_lse_shard1.data_ptr(),
-            B, H, shard_n_heads, shard_n_heads, D
+            B, H, shard_n_heads, shard_n_heads, H, D
         )
 
         glm.synchronize()
@@ -212,7 +218,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_shard1.cpu(), merged_lse_ref[:, shard_n_heads:].cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_four_way_tp(self, glm, device):
-        """Simulate 4-way TP: merge 4 head groups separately, combine = full merge."""
+        """Simulate 4-way TP: merge 4 head groups separately, combine = full merge.
+
+        Uses full-layout v_out with input_n_heads=num_heads.
+        """
         B, H, D = 1, 8, 128
         tp_size = 4
         shard_n_heads = H // tp_size
@@ -228,16 +237,15 @@ class TestContextParallelMergeHeads:
         merged_lse_shards = []
         for tp_rank in range(tp_size):
             offset = tp_rank * shard_n_heads
-            shard_v = shard_v_outs_from_full(partial_v_outs, offset, shard_n_heads)
             merged_v = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
             merged_lse = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
             glm.context_parallel_merge_heads(
-                [t.data_ptr() for t in shard_v],
+                [t.data_ptr() for t in partial_v_outs],
                 [t.data_ptr() for t in partial_lses],
                 num_shards,
                 merged_v.data_ptr(),
                 merged_lse.data_ptr(),
-                B, H, shard_n_heads, offset, D
+                B, H, shard_n_heads, offset, H, D
             )
             merged_v_shards.append(merged_v)
             merged_lse_shards.append(merged_lse)
@@ -251,7 +259,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(reconstructed_lse.cpu(), merged_lse_ref.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_single_head(self, glm, device):
-        """Merge a single head (shard_n_heads=1) at various offsets."""
+        """Merge a single head (shard_n_heads=1) at various offsets.
+
+        Uses full-layout v_out with input_n_heads=num_heads.
+        """
         B, H, D = 2, 8, 128
         num_shards = 2
         torch.manual_seed(42)
@@ -262,23 +273,25 @@ class TestContextParallelMergeHeads:
         merged_v_ref, merged_lse_ref = torch_merge_partial_attn(partial_v_outs, partial_lses)
 
         for h in range(H):
-            shard_v = shard_v_outs_from_full(partial_v_outs, h, 1)
             merged_v = torch.empty(B, 1, D, dtype=torch.bfloat16, device=device)
             merged_lse = torch.empty(B, 1, dtype=torch.float32, device=device)
             glm.context_parallel_merge_heads(
-                [t.data_ptr() for t in shard_v],
+                [t.data_ptr() for t in partial_v_outs],
                 [t.data_ptr() for t in partial_lses],
                 num_shards,
                 merged_v.data_ptr(),
                 merged_lse.data_ptr(),
-                B, H, 1, h, D
+                B, H, 1, h, H, D
             )
             glm.synchronize()
             torch.testing.assert_close(merged_v.cpu(), merged_v_ref[:, h:h+1, :].cpu(), atol=1e-3, rtol=1e-3)
             torch.testing.assert_close(merged_lse.cpu(), merged_lse_ref[:, h:h+1].cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_4_shards(self, glm, device):
-        """Head-grouped merge with 4 CP shards."""
+        """Head-grouped merge with 4 CP shards.
+
+        Uses full-layout v_out with input_n_heads=num_heads because head_offset>0.
+        """
         B, H, D = 2, 8, 128
         shard_n_heads = H // 2
         head_offset = shard_n_heads
@@ -292,17 +305,16 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
-        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, H, D
         )
         glm.synchronize()
 
@@ -310,7 +322,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), merged_lse_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_8_shards(self, glm, device):
-        """Head-grouped merge with 8 CP shards."""
+        """Head-grouped merge with 8 CP shards.
+
+        Uses full-layout v_out with input_n_heads=num_heads because head_offset>0.
+        """
         B, H, D = 1, 16, 64
         shard_n_heads = H // 4
         head_offset = shard_n_heads * 2
@@ -324,17 +339,16 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
-        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, H, D
         )
         glm.synchronize()
 
@@ -342,7 +356,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), merged_lse_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_head_dim_256(self, glm, device):
-        """Head-grouped merge with v_head_dim=256 (Qwen3.5 full attention)."""
+        """Head-grouped merge with v_head_dim=256 (Qwen3.5 full attention).
+
+        Uses shard-layout v_out with head_offset=0 and input_n_heads=shard_n_heads.
+        """
         B, H, D = 1, 8, 256
         shard_n_heads = H // 2
         head_offset = 0
@@ -366,7 +383,7 @@ class TestContextParallelMergeHeads:
             num_shards,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, shard_n_heads, D
         )
         glm.synchronize()
 
@@ -374,7 +391,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), merged_lse_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_head_dim_512(self, glm, device):
-        """Head-grouped merge with v_head_dim=512 (GLM-5.1 merge before v_expand)."""
+        """Head-grouped merge with v_head_dim=512 (GLM-5.1 merge before v_expand).
+
+        Uses full-layout v_out with input_n_heads=num_heads because head_offset>0.
+        """
         B, H, D = 1, 4, 512
         shard_n_heads = H // 2
         head_offset = shard_n_heads
@@ -388,17 +408,16 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
-        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, H, D
         )
         glm.synchronize()
 
@@ -406,7 +425,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), merged_lse_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_nullptr_lse(self, glm, device):
-        """Head-grouped merge with merged_lse=nullptr (skip LSE output)."""
+        """Head-grouped merge with merged_lse=nullptr (skip LSE output).
+
+        Uses full-layout v_out with input_n_heads=num_heads because head_offset>0.
+        """
         B, H, D = 2, 8, 128
         shard_n_heads = H // 2
         head_offset = H // 2
@@ -419,23 +441,25 @@ class TestContextParallelMergeHeads:
         merged_v_ref, _ = torch_merge_partial_attn(partial_v_outs, partial_lses)
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
 
-        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
             None,
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, H, D
         )
         glm.synchronize()
 
         torch.testing.assert_close(merged_v_heads.cpu(), merged_v_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_glm51_like(self, glm, device):
-        """GLM-5.1-like config: 128 heads, 8-way TP (16 heads each), 2 CP shards, v_head_dim=128."""
+        """GLM-5.1-like config: 128 heads, 8-way TP (16 heads each), 2 CP shards, v_head_dim=128.
+
+        Uses full-layout v_out with input_n_heads=num_heads.
+        """
         B, H, D = 1, 128, 128
         tp_size = 8
         shard_n_heads = H // tp_size
@@ -449,16 +473,15 @@ class TestContextParallelMergeHeads:
 
         for tp_rank in range(tp_size):
             offset = tp_rank * shard_n_heads
-            shard_v = shard_v_outs_from_full(partial_v_outs, offset, shard_n_heads)
             merged_v = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
             merged_lse = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
             glm.context_parallel_merge_heads(
-                [t.data_ptr() for t in shard_v],
+                [t.data_ptr() for t in partial_v_outs],
                 [t.data_ptr() for t in partial_lses],
                 num_shards,
                 merged_v.data_ptr(),
                 merged_lse.data_ptr(),
-                B, H, shard_n_heads, offset, D
+                B, H, shard_n_heads, offset, H, D
             )
             glm.synchronize()
             torch.testing.assert_close(
@@ -469,7 +492,10 @@ class TestContextParallelMergeHeads:
                 atol=1e-3, rtol=1e-3)
 
     def test_heads_non_divisible_batch(self, glm, device):
-        """Head-grouped merge with batch_size > 1 and non-zero offset."""
+        """Head-grouped merge with batch_size > 1 and non-zero offset.
+
+        Uses full-layout v_out with input_n_heads=num_heads because head_offset>0.
+        """
         B, H, D = 3, 6, 128
         shard_n_heads = 2
         head_offset = 2
@@ -483,17 +509,16 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
-        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, H, D
         )
         glm.synchronize()
 
@@ -501,7 +526,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), merged_lse_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_commutativity(self, glm, device):
-        """Head-grouped merge should be consistent regardless of which heads are merged first."""
+        """Head-grouped merge should be consistent regardless of which heads are merged first.
+
+        Uses full-layout v_out with input_n_heads=num_heads.
+        """
         B, H, D = 2, 8, 128
         shard_n_heads = H // 2
         num_shards = 2
@@ -513,21 +541,19 @@ class TestContextParallelMergeHeads:
         merged_v0 = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_v1 = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
 
-        shard_v0 = shard_v_outs_from_full(partial_v_outs, 0, shard_n_heads)
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v0],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v0.data_ptr(), None,
-            B, H, shard_n_heads, 0, D
+            B, H, shard_n_heads, 0, H, D
         )
-        shard_v1 = shard_v_outs_from_full(partial_v_outs, shard_n_heads, shard_n_heads)
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v1],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v1.data_ptr(), None,
-            B, H, shard_n_heads, shard_n_heads, D
+            B, H, shard_n_heads, shard_n_heads, H, D
         )
         glm.synchronize()
 
@@ -536,7 +562,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_v1.cpu(), full_v_ref[:, shard_n_heads:, :].cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_1_shard_identity(self, glm, device):
-        """1-shard head-grouped merge should return the input unchanged."""
+        """1-shard head-grouped merge should return the input unchanged.
+
+        Uses full-layout v_out with input_n_heads=num_heads because head_offset>0.
+        """
         B, H, D = 2, 8, 128
         shard_n_heads = H // 2
         head_offset = shard_n_heads
@@ -545,17 +574,16 @@ class TestContextParallelMergeHeads:
         v = torch.randn(B, H, D, dtype=torch.bfloat16, device=device)
         lse = torch.randn(B, H, dtype=torch.float32, device=device)
 
-        shard_v = shard_v_outs_from_full([v], head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v],
+            [v.data_ptr()],
             [lse.data_ptr()],
             1,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, H, D
         )
         glm.synchronize()
 
@@ -566,7 +594,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), expected_lse.cpu(), atol=1e-6, rtol=1e-6)
 
     def test_heads_head_dim_32(self, glm, device):
-        """Head-grouped merge with v_head_dim=32."""
+        """Head-grouped merge with v_head_dim=32.
+
+        Uses full-layout v_out with input_n_heads=num_heads because head_offset>0.
+        """
         B, H, D = 2, 4, 32
         shard_n_heads = 2
         head_offset = 1
@@ -580,17 +611,16 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
-        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, H, D
         )
         glm.synchronize()
 
@@ -598,7 +628,10 @@ class TestContextParallelMergeHeads:
         torch.testing.assert_close(merged_lse_heads.cpu(), merged_lse_ref_slice.cpu(), atol=1e-3, rtol=1e-3)
 
     def test_heads_head_dim_64(self, glm, device):
-        """Head-grouped merge with v_head_dim=64."""
+        """Head-grouped merge with v_head_dim=64.
+
+        Uses full-layout v_out with input_n_heads=num_heads because head_offset>0.
+        """
         B, H, D = 2, 8, 64
         shard_n_heads = 4
         head_offset = 2
@@ -612,17 +645,16 @@ class TestContextParallelMergeHeads:
         merged_v_ref_slice = merged_v_ref[:, head_offset:head_offset + shard_n_heads, :]
         merged_lse_ref_slice = merged_lse_ref[:, head_offset:head_offset + shard_n_heads]
 
-        shard_v = shard_v_outs_from_full(partial_v_outs, head_offset, shard_n_heads)
         merged_v_heads = torch.empty(B, shard_n_heads, D, dtype=torch.bfloat16, device=device)
         merged_lse_heads = torch.empty(B, shard_n_heads, dtype=torch.float32, device=device)
 
         glm.context_parallel_merge_heads(
-            [t.data_ptr() for t in shard_v],
+            [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_heads.data_ptr(),
             merged_lse_heads.data_ptr(),
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, H, D
         )
         glm.synchronize()
 
@@ -631,11 +663,8 @@ class TestContextParallelMergeHeads:
 
     def test_heads_output_contiguous_column_layout(self, glm, device):
         """Verify output is contiguous [B, shard_n_heads, D] (Row-parallel layout).
-        
-        The head-grouped kernel writes output at stride (shard_n_heads * D) per batch,
-        not (num_heads * D) per batch. This means the output is contiguous in
-        Row-parallel layout (split along dim 1 / features), suitable for direct
-        use with Row-parallel v_proj (o_proj).
+
+        Uses shard-layout v_out with head_offset=0 and input_n_heads=shard_n_heads.
         """
         B, H, D = 2, 8, 128
         shard_n_heads = H // 2
@@ -655,7 +684,7 @@ class TestContextParallelMergeHeads:
             num_shards,
             merged_v_heads.data_ptr(),
             None,
-            B, H, shard_n_heads, head_offset, D
+            B, H, shard_n_heads, head_offset, shard_n_heads, D
         )
         glm.synchronize()
 
