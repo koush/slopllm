@@ -1233,6 +1233,36 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, this.fullShape, this.type, this.parallelism);
   }
 
+  cat(tensors: Tensor[], dim: number): Tensor {
+    super.cat(tensors, dim);
+    const pTensors = tensors.map(t => t as ParallelTensor);
+    const allPar = [this.parallelism, ...pTensors.map(t => t.parallelism)];
+    const hasNonReplicated = allPar.some(p => p !== TensorParallelism.Replicated);
+
+    if (hasNonReplicated) {
+      if (this.parallelism === TensorParallelism.PartialSum) {
+        this.allReduce();
+      }
+      const gatheredSelf = this.parallelism === TensorParallelism.Replicated ? this : this.allGather(this.workspace);
+      const gatheredTensors: Tensor[] = [];
+      for (const t of pTensors) {
+        if (t.parallelism === TensorParallelism.PartialSum) {
+          t.allReduce();
+        }
+        gatheredTensors.push(t.parallelism === TensorParallelism.Replicated ? t : t.allGather(t.workspace));
+      }
+      return gatheredSelf.cat(gatheredTensors, dim);
+    }
+
+    const outShape = [...this.fullShape];
+    for (const t of pTensors) outShape[dim] += t.fullShape[dim];
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].cat(pTensors.map(t => t.shards[i]), dim));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, outShape, this.type, TensorParallelism.Replicated);
+  }
+
   scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
     const pIndices = indices as ParallelTensor;
     if (this.parallelism !== pIndices.parallelism) {

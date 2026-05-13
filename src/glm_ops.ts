@@ -437,6 +437,34 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
+  cat(tensors: Tensor[], dim: number): Tensor {
+    super.cat(tensors, dim);
+    const all = [this as Tensor, ...tensors];
+    const outShape = [...this.shape];
+    for (const t of tensors) outShape[dim] += t.shape[dim];
+    const out = this.workspace.alloc(outShape, this.type);
+    const elemBytes = SafeTensorFile.dtypeBytes(this.type);
+    const outerStrides = this.shape.slice(0, dim).reduce((a, b) => a * b, 1);
+    const innerStride = this.shape.slice(dim + 1).reduce((a, b) => a * b, 1);
+    const dstRowBytes = outShape[dim] * innerStride * elemBytes;
+    let offset = 0;
+    for (const t of all) {
+      const src = t as GlmTensor;
+      const srcRowBytes = t.shape[dim] * innerStride * elemBytes;
+      out.memcpy2d(
+        offset,
+        dstRowBytes,
+        src.data,
+        srcRowBytes,
+        srcRowBytes,
+        outerStrides,
+        MemcpyKind.DeviceToDevice,
+      );
+      offset += srcRowBytes;
+    }
+    return out;
+  }
+
   scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
     getNativeAddon().scatterScalar(this.glm.ctx, this.data, indices.data, value, k, outDim, batch);
   }

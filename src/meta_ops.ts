@@ -192,6 +192,13 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc(this.shape, this.type);
     }
 
+    cat(tensors: Tensor[], dim: number): Tensor {
+        super.cat(tensors, dim);
+        const outShape = [...this.shape];
+        for (const t of tensors) outShape[dim] += t.shape[dim];
+        return this.workspace.alloc(outShape, this.type);
+    }
+
     scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
     }
 

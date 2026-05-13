@@ -318,6 +318,22 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
+  cat(tensors: Tensor[], dim: number): Tensor {
+    if (tensors.length === 0) throw new Error("cat: requires at least one tensor");
+    const ndim = this.shape.length;
+    for (let i = 0; i < tensors.length; i++) {
+      if (tensors[i].shape.length !== ndim) {
+        throw new Error(`cat: tensor ${i} has ${tensors[i].shape.length}D shape, expected ${ndim}D`);
+      }
+      for (let d = 0; d < ndim; d++) {
+        if (d !== dim && tensors[i].shape[d] !== this.shape[d]) {
+          throw new Error(`cat: tensor ${i} shape [${tensors[i].shape}] mismatch on dim ${d} (expected ${this.shape[d]})`);
+        }
+      }
+    }
+    return undefined as never;
+  }
+
   scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
   }
 

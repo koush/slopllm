@@ -8,3 +8,4 @@ import "./test_fp8";
 import "./test_no_graph";
 import "./test_graph";
 import "./test_cp_prefill";
+import "./test_cat";
