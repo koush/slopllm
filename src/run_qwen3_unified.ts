@@ -253,7 +253,6 @@ export function* generateStream(
     doSample(firstTokens);
     readSample();
   }
-  // cache.appendTokens(0, [currentToken]);
 
   let capturing = false;
 

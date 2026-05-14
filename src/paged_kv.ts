@@ -211,7 +211,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   forwardInput(state: ExecutionState): void {
-    const pagedKV = state.cache.getPagedKV();
     const batchSize = state.batchSize;
     let input = state.input;
 
