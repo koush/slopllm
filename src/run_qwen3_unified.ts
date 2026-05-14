@@ -216,6 +216,41 @@ export function* generateStream(
     }));
   }
 
+  const useGraph = graphState !== undefined;
+  if (useGraph) {
+    for (let i = 0; i < 3; i++) {
+      const state = ws.planPrefill(model, 1, [suffixIds.length], cache);
+      state.prepareInput([suffixIds]);
+      ws.forwardInput(state);
+      using hiddenStates = model.forward(state);
+      state.finishPrefill();
+
+      using firstTokens = state.computeLogits(hiddenStates, model);
+      doSample(firstTokens);
+      cache.reset(1);
+    }
+
+    {
+      const state = ws.planPrefill(model, 1, [suffixIds.length], cache);
+      state.prepareInput([suffixIds]);
+      ws.forwardInput(state);
+
+      glm.graphBeginCapture();
+      using hiddenStates = model.forward(state);
+      state.finishPrefill();
+      using firstTokens = state.computeLogits(hiddenStates, model);
+      const graph = glm.graphEndCapture();
+      const graphExec = glm.graphInstantiate(graph);
+      glm.graphDestroy(graph);
+
+      glm.graphLaunch(graphExec);
+      doSample(firstTokens);
+      readSample();
+
+      glm.graphExecDestroy(graphExec);
+    }
+  }
+  else
   {
     using firstTokens = ws.forwardPrefill(model, [suffixIds], cache);
     doSample(firstTokens);
@@ -223,7 +258,6 @@ export function* generateStream(
   }
   // cache.appendTokens(0, [currentToken]);
 
-  const useGraph = graphState !== undefined;
   let capturing = false;
 
   let planMs = 0;

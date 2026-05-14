@@ -99,6 +99,19 @@ export class ExecutionState {
       this.input = this.ws.inputIdsBufH;
     }
   }
+
+  finishPrefill() {
+    if (this.isDecode) {
+      throw new Error("finishPrefill should not be called in decode mode");
+    }
+    const pagedKV = this.cache.getPagedKV();
+    this.ws.positionIdsH.withPinnedBuffer(buf => {
+      for (let seqIdx = 0; seqIdx < this.batchSize; seqIdx++) {
+        buf.writeInt32LE(pagedKV.seqKvLens[seqIdx] - 1, seqIdx * I32);
+      }
+    });
+    this.ws.positionIds.memcpy(this.ws.positionIdsH, this.batchSize * I32, MemcpyKind.HostToDevice);
+  }
 }
 
 function longestPrefix(a: number[], b: number[]): number {
@@ -494,17 +507,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const state = this.planPrefill(model, batchSize, seqLens, cache);
     state.prepareInput(inputIdsList);
     this.forwardInput(state);
-    const hiddenStates = model.forward(state);
+    using hiddenStates = model.forward(state);
     const logits = state.computeLogits(hiddenStates, model);
-
-    const pagedKV = state.cache.getPagedKV();
-    this.positionIdsH.withPinnedBuffer(buf => {
-      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-        buf.writeInt32LE(pagedKV.seqKvLens[seqIdx] - 1, seqIdx * I32);
-      }
-    });
-    this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
-
+    state.finishPrefill();
     return logits;
   }
 
