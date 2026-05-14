@@ -143,9 +143,9 @@ interface NativeAddon {
   rowNormalize(ctx: number, out: number, input: number, scale: number, rows: number, cols: number, normalize: boolean): void;
   groupMaskMul(ctx: number, scores: number, groupMask: number, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void;
   expertScale(ctx: number, out: number, weights: number, indices: number, expertId: number, topK: number, batch: number): void;
-  mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, batchIds: number, count: number, N: number, K: number): void;
-  nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, batchIds: number, count: number, N: number, K: number): void;
-  scatterAddRows(ctx: number, out: number, input: number, scales: number, batchIds: number, dim: number, count: number, numRows: number, workspace: number): void;
+  mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
+  nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
+  scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, count: number, numRows: number, workspace: number): void;
 }
 
 export class GlmTensor extends Tensor {
@@ -503,7 +503,7 @@ export class GlmTensor extends Tensor {
     getNativeAddon().expertScale(this.glm.ctx, this.data, weights.data, indices.data, expertId, topK, batch);
   }
 
-  mulMatId(weights: Tensor[], expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number, name: string): Tensor {
+  mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
     const out = this.workspace.alloc([count, N], this.type);
     const ptrName = `__moe_ptrs.${name}`;
     let weightPtrs = this.workspace.tensors.get(ptrName);
@@ -526,16 +526,16 @@ export class GlmTensor extends Tensor {
         scale2Ptrs = this.workspace.alloc([weights.length], "I64", scale2PtrName);
         scale2Ptrs.writePointers(scale2Tensors);
       }
-      getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, batchIds.data, count, N, K);
+      getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K);
     } else {
-      getNativeAddon().mulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, batchIds.data, count, N, K);
+      getNativeAddon().mulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K);
     }
     return out;
   }
 
-  scatterAddRows(scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number): Tensor {
+  scatterAddRows(scales: Tensor, topK: number, dim: number, count: number, numRows: number): Tensor {
     const out = this.workspace.alloc([numRows, dim], this.type);
-    getNativeAddon().scatterAddRows(this.glm.ctx, out.data, this.data, scales.data, batchIds.data, dim, count, numRows, 0);
+    getNativeAddon().scatterAddRows(this.glm.ctx, out.data, this.data, scales.data, topK, dim, count, numRows, 0);
     return out;
   }
 

@@ -9,7 +9,6 @@ import { ExecutionState, PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
-import { WorkspaceBase } from "./workspace";
 
 export { ExecutionState as BatchState };
 export type { SamplingParams };
@@ -324,18 +323,6 @@ export class Glm51Model extends ChatModel {
     return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
   }
 
-  private getBatchIds(ws: WorkspaceBase, count: number, topK: number): Tensor {
-    const key = `__moe_batch_ids_top${topK}`;
-    let batchIds = ws.tensors.get(key);
-    if (!batchIds || batchIds.shape[0] < count) {
-      batchIds = ws.alloc([count], "I32", key);
-      const arr = new Int32Array(count);
-      for (let i = 0; i < count; i++) arr[i] = Math.floor(i / topK);
-      batchIds.h2d(Buffer.from(arr.buffer));
-    }
-    return batchIds;
-  }
-
   private getExpertWeights(pfx: string, proj: string): Tensor[] {
     const numExperts = this.cfg.nRoutedExperts;
     const weights: Tensor[] = [];
@@ -408,23 +395,20 @@ export class Glm51Model extends ChatModel {
     const count = BS * topK;
     const topkIndicesFlat = topkIndices.reshape([count]);
 
-    const batchIds = this.getBatchIds(ws, count, topK);
-    const downBatchIds = this.getBatchIds(ws, count, 1);
-
     const gateWeights = this.getExpertWeights(pfx, "gate_proj");
     const upWeights = this.getExpertWeights(pfx, "up_proj");
     const downWeights = this.getExpertWeights(pfx, "down_proj");
 
-    using gateOutStream = this.glm.withStream(() => normed.mulMatId(gateWeights, topkIndicesFlat, batchIds, count, moeIntermediate, hs, `${pfx}.gate_proj`));
+    using gateOutStream = this.glm.withStream(() => normed.mulMatId(gateWeights, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
     using gateOut = gateOutStream.result;
-    using upOut = normed.mulMatId(upWeights, topkIndicesFlat, batchIds, count, moeIntermediate, hs, `${pfx}.up_proj`);
+    using upOut = normed.mulMatId(upWeights, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
     gateOutStream.streamWaitEvent();
     using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
 
-    using downOut = siluOut.mulMatId(downWeights, topkIndicesFlat, downBatchIds, count, hs, moeIntermediate, `${pfx}.down_proj`);
+    using downOut = siluOut.mulMatId(downWeights, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
 
     using normalizedWeightsFlat = normalizedWeights.reshape([count]);
-    using routedOut = downOut.scatterAddRows(normalizedWeightsFlat, batchIds, hs, count, BS);
+    using routedOut = downOut.scatterAddRows(normalizedWeightsFlat, topK, hs, count, BS);
 
     sharedDownBufStream.streamWaitEvent();
     using sharedDownBuf = sharedDownBufStream.result;

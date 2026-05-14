@@ -2037,7 +2037,6 @@ __global__ void __launch_bounds__(256) scatter_add_rows_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* scales,
-    const int* batch_ids,
     int dim, int count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= dim) return;
@@ -2052,8 +2051,7 @@ __global__ void __launch_bounds__(256, 4) scatter_add_rows_batched_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* scales,
-    const int* batch_ids,
-    int dim, int count, int num_rows) {
+    int top_k, int dim, int count, int num_rows) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_rows * dim;
     if (idx >= total) return;
@@ -2061,15 +2059,17 @@ __global__ void __launch_bounds__(256, 4) scatter_add_rows_batched_kernel(
     int d = idx % dim;
     float accum = 0.0f;
     for (int i = 0; i < count; i++) {
-        if (batch_ids[i] == row) {
+        if (i / top_k == row) {
             accum += __bfloat162float(scales[i]) * __bfloat162float(input[(size_t)i * dim + d]);
         }
     }
     out[idx] = __float2bfloat16(accum);
 }
 
+extern "C" {
+
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
-                            const void* scales, const int* batch_ids,
+                            const void* scales, int top_k,
                             int dim, int count, int num_rows, void* workspace) {
     cudaSetDevice(ctx->device_id);
     (void)workspace;
@@ -2078,14 +2078,15 @@ void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
         int grid = (dim + block_size - 1) / block_size;
         scatter_add_rows_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-            (const __nv_bfloat16*)scales, batch_ids, dim, count);
+            (const __nv_bfloat16*)scales, dim, count);
     } else {
         int total = num_rows * dim;
         int grid = (total + block_size - 1) / block_size;
         scatter_add_rows_batched_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-            (const __nv_bfloat16*)scales, batch_ids, dim, count, num_rows);
+            (const __nv_bfloat16*)scales, top_k, dim, count, num_rows);
     }
 }
 
+} // extern "C"
 

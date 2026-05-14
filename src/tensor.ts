@@ -361,11 +361,11 @@ export abstract class Tensor implements Disposable {
   expertScale(weights: Tensor, indices: Tensor, expertId: number, topK: number, batch: number): void {
   }
 
-  mulMatId(weights: Tensor[], expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number, name: string): Tensor {
+  mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
     return undefined as never;
   }
 
-  scatterAddRows(scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number): Tensor {
+  scatterAddRows(scales: Tensor, topK: number, dim: number, count: number, numRows: number): Tensor {
     return undefined as never;
   }
 

@@ -2,9 +2,11 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { GlmOps } from "../src/glm_ops";
 import { Qwen3Model } from "../src/qwen3_model";
+import { Qwen35Model } from "../src/qwen35_model";
 import { ExecutionWorkspace, PagedKVCache } from "../src/paged_kv";
+import { Tensor } from "../src/tensor";
 import { generateBatchTokens, generateTokens } from "./test_helper";
-import { SamplingParams, makeSamplingParams } from "../src/chat_model";
+import { SamplingParams, makeSamplingParams, type ChatModel, type ChatCache } from "../src/chat_model";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const PROMPT1 = [151643, 151644, 151645, 1, 2, 3];
@@ -365,5 +367,192 @@ describe("Qwen3-0.6B batch tests", () => {
       `Batch greedy[0] != argmax: ${batchResults[0]} != ${tokens[0]}`);
     assert.equal(batchResults[1], tokens[1],
       `Batch greedy[1] != argmax: ${batchResults[1]} != ${tokens[1]}`);
+  });
+
+  function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[], chunkSizes: number[]): number[] {
+    let offset = 0;
+    let logits: ReturnType<Tensor["argmax"]> | null = null;
+    for (let i = 0; i < chunkSizes.length; i++) {
+      const chunk = inputIds.slice(offset, offset + chunkSizes[i]);
+      offset += chunkSizes[i];
+      const state = ws.planPrefill(model, 1, [chunk.length], cache);
+      state.prepareInput([chunk]);
+      ws.forwardInput(state);
+      const hiddenStates = model.forward(state);
+      if (i < chunkSizes.length - 1) {
+        hiddenStates[Symbol.dispose]();
+      } else {
+        logits = state.computeLogits(hiddenStates, model);
+        hiddenStates[Symbol.dispose]();
+        state.finishPrefill();
+      }
+    }
+    using argmaxOut = logits!.argmax();
+    return argmaxOut.readInt32LEArray();
+  }
+
+  it("chunked prefill: two even halves", () => {
+    using pagedKV = makePagedKV(1, 256);
+    using pagedKV2 = makePagedKV(1, 256);
+    const fullPrompt = PROMPT_LONG1;
+    const mid = Math.floor(fullPrompt.length / 2);
+    const firstHalf = fullPrompt.slice(0, mid);
+    const secondHalf = fullPrompt.slice(mid);
+
+    pagedKV.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
+
+    pagedKV2.reset(1);
+    const chunkedTokens = chunkedPrefill(model, ws, pagedKV2, fullPrompt, [firstHalf.length, secondHalf.length]);
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Chunked prefill mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+  });
+
+  it("chunked prefill: uneven split", () => {
+    using pagedKV = makePagedKV(1, 256);
+    using pagedKV2 = makePagedKV(1, 256);
+    const fullPrompt = PROMPT_LONG1;
+
+    pagedKV.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
+
+    pagedKV2.reset(1);
+    const chunkedTokens = chunkedPrefill(model, ws, pagedKV2, fullPrompt, [3, fullPrompt.length - 3]);
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Chunked prefill mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+  });
+
+  it("chunked prefill: three chunks", () => {
+    using pagedKV = makePagedKV(1, 256);
+    using pagedKV2 = makePagedKV(1, 256);
+    const fullPrompt = PROMPT_LONG1;
+
+    pagedKV.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
+
+    pagedKV2.reset(1);
+    const chunkedTokens = chunkedPrefill(model, ws, pagedKV2, fullPrompt, [3, 3, fullPrompt.length - 6]);
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Chunked prefill mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+  });
+
+  it("chunked prefill + decode matches full prefill + decode", () => {
+    using pagedKV = makePagedKV(1, 256);
+    using pagedKV2 = makePagedKV(1, 256);
+    const fullPrompt = PROMPT_LONG1;
+    const mid = Math.floor(fullPrompt.length / 2);
+
+    pagedKV.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
+    pagedKV.updateIndptr(ws);
+    const fullDecode = ws.forwardEagerDecode(model, [fullTokens[0]], pagedKV)[0];
+
+    pagedKV2.reset(1);
+    const chunkedTokens = chunkedPrefill(model, ws, pagedKV2, fullPrompt, [mid, fullPrompt.length - mid]);
+    pagedKV2.updateIndptr(ws);
+    const chunkedDecode = ws.forwardEagerDecode(model, [chunkedTokens[0]], pagedKV2)[0];
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Chunked prefill token mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+    assert.equal(chunkedDecode, fullDecode,
+      `Chunked decode token mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
+  });
+});
+
+describe("Qwen3.5-0.8B chunked prefill tests", () => {
+  let glm: GlmOps;
+  let model: Qwen35Model;
+  let ws: ExecutionWorkspace;
+  const PROMPT = [151643, 151644, 151645, 1, 2, 3, 4, 5, 6, 7];
+
+  before(async () => {
+    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    glm = new GlmOps(deviceId);
+    model = await Qwen35Model.fromPretrained(glm, "Qwen/Qwen3.5-0.8B", 1, 128);
+    ws = new ExecutionWorkspace(glm, 1, 128);
+  });
+
+  after(() => {
+    ws[Symbol.dispose]();
+    model.free();
+    glm.free();
+  });
+
+  function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[], chunkSizes: number[]): number[] {
+    let offset = 0;
+    let logits: ReturnType<Tensor["argmax"]> | null = null;
+    for (let i = 0; i < chunkSizes.length; i++) {
+      const chunk = inputIds.slice(offset, offset + chunkSizes[i]);
+      offset += chunkSizes[i];
+      const state = ws.planPrefill(model, 1, [chunk.length], cache);
+      state.prepareInput([chunk]);
+      ws.forwardInput(state);
+      const hiddenStates = model.forward(state);
+      if (i < chunkSizes.length - 1) {
+        hiddenStates[Symbol.dispose]();
+      } else {
+        logits = state.computeLogits(hiddenStates, model);
+        hiddenStates[Symbol.dispose]();
+        state.finishPrefill();
+      }
+    }
+    using argmaxOut = logits!.argmax();
+    return argmaxOut.readInt32LEArray();
+  }
+
+  it("chunked prefill: two even halves", () => {
+    using cache1 = model.createChatCache(128);
+    using cache2 = model.createChatCache(128);
+    const fullPrompt = PROMPT;
+    const mid = Math.floor(fullPrompt.length / 2);
+
+    cache1.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], cache1);
+
+    cache2.reset(1);
+    const chunkedTokens = chunkedPrefill(model, ws, cache2, fullPrompt, [mid, fullPrompt.length - mid]);
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Qwen3.5 chunked prefill mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+  });
+
+  it("chunked prefill: uneven split", () => {
+    using cache1 = model.createChatCache(128);
+    using cache2 = model.createChatCache(128);
+    const fullPrompt = PROMPT;
+
+    cache1.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], cache1);
+
+    cache2.reset(1);
+    const chunkedTokens = chunkedPrefill(model, ws, cache2, fullPrompt, [3, fullPrompt.length - 3]);
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Qwen3.5 chunked prefill mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+  });
+
+  it("chunked prefill + decode matches full prefill + decode", () => {
+    using cache1 = model.createChatCache(128);
+    using cache2 = model.createChatCache(128);
+    const fullPrompt = PROMPT;
+    const mid = Math.floor(fullPrompt.length / 2);
+
+    cache1.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], cache1);
+    cache1.getPagedKV().updateIndptr(ws);
+    const fullDecode = ws.forwardEagerDecode(model, [fullTokens[0]], cache1)[0];
+
+    cache2.reset(1);
+    const chunkedTokens = chunkedPrefill(model, ws, cache2, fullPrompt, [mid, fullPrompt.length - mid]);
+    cache2.getPagedKV().updateIndptr(ws);
+    const chunkedDecode = ws.forwardEagerDecode(model, [chunkedTokens[0]], cache2)[0];
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Qwen3.5 chunked prefill token mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+    assert.equal(chunkedDecode, fullDecode,
+      `Qwen3.5 chunked decode token mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
   });
 });

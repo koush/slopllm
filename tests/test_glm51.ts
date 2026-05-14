@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { GlmOps } from "../src/glm_ops";
 import { Glm51Model } from "../src/glm51_model";
-import { ExecutionWorkspace } from "../src/paged_kv";
+import { ExecutionWorkspace, PagedKVCache } from "../src/paged_kv";
+import { Tensor } from "../src/tensor";
+import type { ChatModel, ChatCache } from "../src/chat_model";
 
 const SMALL_MODEL_DIR = path.resolve(
   __dirname,
@@ -106,5 +108,80 @@ describe("GLM-5.1 small model smoke test", () => {
     }
 
     cache.free();
+  });
+
+  function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[], chunkSizes: number[]): number[] {
+    let offset = 0;
+    let logits: ReturnType<Tensor["argmax"]> | null = null;
+    for (let i = 0; i < chunkSizes.length; i++) {
+      const chunk = inputIds.slice(offset, offset + chunkSizes[i]);
+      offset += chunkSizes[i];
+      const state = ws.planPrefill(model, 1, [chunk.length], cache);
+      state.prepareInput([chunk]);
+      ws.forwardInput(state);
+      const hiddenStates = model.forward(state);
+      if (i < chunkSizes.length - 1) {
+        hiddenStates[Symbol.dispose]();
+      } else {
+        logits = state.computeLogits(hiddenStates, model);
+        hiddenStates[Symbol.dispose]();
+        state.finishPrefill();
+      }
+    }
+    using argmaxOut = logits!.argmax();
+    return argmaxOut.readInt32LEArray();
+  }
+
+  it("chunked prefill: two halves", () => {
+    using cache1 = model.createChatCache(32);
+    using cache2 = model.createChatCache(32);
+    const fullPrompt = [1, 2, 3, 4, 5, 6, 7];
+    const mid = Math.floor(fullPrompt.length / 2);
+
+    cache1.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], cache1);
+
+    cache2.reset(1);
+    const chunkedTokens = chunkedPrefill(model, ws, cache2, fullPrompt, [mid, fullPrompt.length - mid]);
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Chunked prefill mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+  });
+
+  it("chunked prefill: uneven split", () => {
+    using cache1 = model.createChatCache(32);
+    using cache2 = model.createChatCache(32);
+    const fullPrompt = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    cache1.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], cache1);
+
+    cache2.reset(1);
+    const chunkedTokens = chunkedPrefill(model, ws, cache2, fullPrompt, [3, fullPrompt.length - 3]);
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Chunked prefill mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+  });
+
+  it("chunked prefill + decode", () => {
+    using cache1 = model.createChatCache(32);
+    using cache2 = model.createChatCache(32);
+    const fullPrompt = [1, 2, 3, 4, 5, 6, 7];
+    const mid = Math.floor(fullPrompt.length / 2);
+
+    cache1.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], cache1);
+    cache1.getPagedKV().updateIndptr(ws);
+    const fullDecode = ws.forwardEagerDecode(model, [fullTokens[0]], cache1)[0];
+
+    cache2.reset(1);
+    const chunkedTokens = chunkedPrefill(model, ws, cache2, fullPrompt, [mid, fullPrompt.length - mid]);
+    cache2.getPagedKV().updateIndptr(ws);
+    const chunkedDecode = ws.forwardEagerDecode(model, [chunkedTokens[0]], cache2)[0];
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Chunked prefill token mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+    assert.equal(chunkedDecode, fullDecode,
+      `Chunked decode token mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
   });
 });

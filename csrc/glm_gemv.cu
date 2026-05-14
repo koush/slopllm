@@ -597,8 +597,7 @@ nvfp4_mul_mat_id_kernel(
     const __nv_fp8_e4m3* const* __restrict__ scale_ptrs,
     const float* const* __restrict__ scale2_ptrs,
     const int* __restrict__ expert_ids,
-    const int* __restrict__ batch_ids,
-    int count, int N, int K) {
+    int top_k, int count, int N, int K) {
 
     int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
     int entry = blockIdx.x / num_row_groups;
@@ -609,7 +608,7 @@ nvfp4_mul_mat_id_kernel(
 
     if (entry >= count) return;
 
-    int bid = batch_ids[entry];
+    int bid = entry / top_k;
     int eid = expert_ids[entry];
     const __nv_bfloat16* input_row  = input + (size_t)bid * K;
     const uint8_t* weight_row = weight_ptrs[eid] + (size_t)row * (K / 2);
@@ -669,8 +668,7 @@ nvfp4_mul_mat_id_splitk_kernel(
     const __nv_fp8_e4m3* const* __restrict__ scale_ptrs,
     const float* const* __restrict__ scale2_ptrs,
     const int* __restrict__ expert_ids,
-    const int* __restrict__ batch_ids,
-    int count, int N, int K) {
+    int top_k, int count, int N, int K) {
 
     int entry = blockIdx.x / N;
     int row = blockIdx.x % N;
@@ -680,7 +678,7 @@ nvfp4_mul_mat_id_splitk_kernel(
     int warp_id = tid / GEMV_WARP_SIZE;
     int lane = tid % GEMV_WARP_SIZE;
 
-    int bid = batch_ids[entry];
+    int bid = entry / top_k;
     int eid = expert_ids[entry];
     const __nv_bfloat16* input_row  = input + (size_t)bid * K;
     const uint8_t* weight_row = weight_ptrs[eid] + (size_t)row * (K / 2);
@@ -827,7 +825,7 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
                             const void* const* weight_ptrs,
                             const void* const* scale_ptrs,
                             const void* const* scale2_ptrs,
-                            const int* expert_ids, const int* batch_ids,
+                            const int* expert_ids, int top_k,
                             int count, int N, int K) {
     cudaSetDevice(ctx->device_id);
     if (count == 0 || N == 0 || K == 0) return;
@@ -842,7 +840,7 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
             (const uint8_t* const*)weight_ptrs,
             (const __nv_fp8_e4m3* const*)scale_ptrs,
             (const float* const*)scale2_ptrs,
-            expert_ids, batch_ids,
+            expert_ids, top_k,
             count, N, K);
     } else {
         int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
@@ -853,7 +851,7 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
             (const uint8_t* const*)weight_ptrs,
             (const __nv_fp8_e4m3* const*)scale_ptrs,
             (const float* const*)scale2_ptrs,
-            expert_ids, batch_ids,
+            expert_ids, top_k,
             count, N, K);
     }
 }
@@ -917,12 +915,12 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
 // mul_mat_id: Indexed matrix-vector multiplication for MoE expert dispatch.
 //
 // For each entry i in [0, count), computes:
-//   output[i, :] = input[batch_ids[i], :] @ weights[expert_ids[i], :, :].T
+//   output[i, :] = input[i / top_k, :] @ weights[expert_ids[i], :, :].T
 //
 // input:       [batch, K]          BF16
 // weight_ptrs: [num_experts]       array of device pointers, each [N, K] BF16
 // expert_ids:  [count]             int32
-// batch_ids:   [count]             int32
+// top_k:       number of experts per token (batch_id = entry / top_k)
 // output:      [count, N]          BF16
 // count:       total (token, expert) pairs
 // N:           output dimension (weight rows)
@@ -935,8 +933,7 @@ bf16_mul_mat_id_kernel(
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* const* __restrict__ weight_ptrs,
     const int* __restrict__ expert_ids,
-    const int* __restrict__ batch_ids,
-    int count, int N, int K) {
+    int top_k, int count, int N, int K) {
 
     if (N == 0 || count == 0 || K == 0) return;
 
@@ -949,7 +946,7 @@ bf16_mul_mat_id_kernel(
 
     if (entry >= count) return;
 
-    int bid = batch_ids[entry];
+    int bid = entry / top_k;
     int eid = expert_ids[entry];
     const __nv_bfloat16* input_row  = input  + (size_t)bid * K;
     const __nv_bfloat16* weight_mat = weight_ptrs[eid];
@@ -998,8 +995,7 @@ bf16_mul_mat_id_splitk_kernel(
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* const* __restrict__ weight_ptrs,
     const int* __restrict__ expert_ids,
-    const int* __restrict__ batch_ids,
-    int count, int N, int K) {
+    int top_k, int count, int N, int K) {
 
     if (N == 0 || count == 0 || K == 0) return;
 
@@ -1011,7 +1007,7 @@ bf16_mul_mat_id_splitk_kernel(
     int warp_id = tid / GEMV_WARP_SIZE;
     int lane = tid % GEMV_WARP_SIZE;
 
-    int bid = batch_ids[entry];
+    int bid = entry / top_k;
     int eid = expert_ids[entry];
     const __nv_bfloat16* input_row  = input  + (size_t)bid * K;
     const __nv_bfloat16* weight_mat = weight_ptrs[eid];
@@ -1064,7 +1060,7 @@ bf16_mul_mat_id_splitk_kernel(
 
 void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
                      const void* const* weight_ptrs,
-                     const int* expert_ids, const int* batch_ids,
+                     const int* expert_ids, int top_k,
                      int count, int N, int K) {
     cudaSetDevice(ctx->device_id);
     if (count == 0 || N == 0 || K == 0) return;
@@ -1077,7 +1073,7 @@ void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
             (__nv_bfloat16*)output,
             (const __nv_bfloat16*)input,
             (const __nv_bfloat16* const*)weight_ptrs,
-            expert_ids, batch_ids,
+            expert_ids, top_k,
             count, N, K);
     } else {
         int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
@@ -1086,7 +1082,7 @@ void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
             (__nv_bfloat16*)output,
             (const __nv_bfloat16*)input,
             (const __nv_bfloat16* const*)weight_ptrs,
-            expert_ids, batch_ids,
+            expert_ids, top_k,
             count, N, K);
     }
 }

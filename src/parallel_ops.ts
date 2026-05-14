@@ -1368,10 +1368,9 @@ export class ParallelTensor extends Tensor {
     return vExpanded;
   }
 
-  mulMatId(weights: Tensor[], expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number, name: string): Tensor {
+  mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
     const pWeights = weights.map(w => w as ParallelTensor);
     const pExpertIds = expertIds as ParallelTensor;
-    const pBatchIds = batchIds as ParallelTensor;
     const inputPar = this.parallelism;
     let outN = N, outK = K, outPar: TensorParallelism;
     if (inputPar === TensorParallelism.Replicated) {
@@ -1386,23 +1385,22 @@ export class ParallelTensor extends Tensor {
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       const shardWeights = pWeights.map(w => w.shards[i]);
-      outShards.push(this.shards[i].mulMatId(shardWeights, pExpertIds.shards[i], pBatchIds.shards[i], count, outN, outK, name));
+      outShards.push(this.shards[i].mulMatId(shardWeights, pExpertIds.shards[i], topK, count, outN, outK, name));
     }
     return this.parallelOps.wrapShards(this.workspace, outShards, [count, N], this.type, outPar);
   }
 
-  scatterAddRows(scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number): Tensor {
+  scatterAddRows(scales: Tensor, topK: number, dim: number, count: number, numRows: number): Tensor {
     const pScales = scales as ParallelTensor;
-    const pBatchIds = batchIds as ParallelTensor;
     const outShards: Tensor[] = [];
     if (this.parallelism === TensorParallelism.PartialSum) {
       for (let i = 0; i < this.worldSize; i++) {
-        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], pBatchIds.shards[i], dim, count, numRows));
+        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], topK, dim, count, numRows));
       }
       return this.parallelOps.wrapShards(this.workspace, outShards, [numRows, dim], this.type, TensorParallelism.PartialSum);
     } else {
       for (let i = 0; i < this.worldSize; i++) {
-        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], pBatchIds.shards[i], dim, count, numRows));
+        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], topK, dim, count, numRows));
       }
       return this.parallelOps.wrapShards(this.workspace, outShards, [numRows, dim], this.type, this.parallelism);
     }

@@ -761,22 +761,23 @@ class GlmOps:
         self.lib.glm_mul_mat_id.restype = None
         self.lib.glm_mul_mat_id.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_nvfp4_mul_mat_id.restype = None
         self.lib.glm_nvfp4_mul_mat_id.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_scatter_add_rows.restype = None
         self.lib.glm_scatter_add_rows.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
+            ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_void_p,
         ]
@@ -1575,18 +1576,17 @@ class GlmOps:
             expert_id, top_k, batch
         )
 
-    def mul_mat_id(self, output, input, weight_ptrs, expert_ids, batch_ids, count, N, K):
+    def mul_mat_id(self, output, input, weight_ptrs, expert_ids, top_k, count, N, K):
         self.lib.glm_mul_mat_id(
             self.ctx,
             self._ptr(output),
             self._ptr(input),
             ctypes.c_void_p(weight_ptrs),
             self._ptr(expert_ids),
-            self._ptr(batch_ids),
-            count, N, K
+            top_k, count, N, K
         )
 
-    def nvfp4_mul_mat_id(self, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, batch_ids, count, N, K):
+    def nvfp4_mul_mat_id(self, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, top_k, count, N, K):
         self.lib.glm_nvfp4_mul_mat_id(
             self.ctx,
             self._ptr(output),
@@ -1595,18 +1595,16 @@ class GlmOps:
             ctypes.c_void_p(scale_ptrs),
             ctypes.c_void_p(scale2_ptrs),
             self._ptr(expert_ids),
-            self._ptr(batch_ids),
-            count, N, K
+            top_k, count, N, K
         )
 
-    def scatter_add_rows(self, out, input, scales, batch_ids, dim, count, num_rows, workspace):
+    def scatter_add_rows(self, out, input, scales, top_k, dim, count, num_rows, workspace):
         self.lib.glm_scatter_add_rows(
             self.ctx,
             self._ptr(out),
             self._ptr(input),
             self._ptr(scales),
-            self._ptr(batch_ids),
-            dim, count, num_rows,
+            top_k, dim, count, num_rows,
             self._ptr(workspace)
         )
 

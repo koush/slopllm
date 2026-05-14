@@ -226,11 +226,11 @@ export class MetaTensor extends Tensor {
     expertScale(weights: Tensor, indices: Tensor, expertId: number, topK: number, batch: number): void {
     }
 
-    mulMatId(weights: Tensor[], expertIds: Tensor, batchIds: Tensor, count: number, N: number, K: number, name: string): Tensor {
+    mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
         return this.workspace.alloc([count, N], this.type);
     }
 
-    scatterAddRows(scales: Tensor, batchIds: Tensor, dim: number, count: number, numRows: number): Tensor {
+    scatterAddRows(scales: Tensor, topK: number, dim: number, count: number, numRows: number): Tensor {
         return this.workspace.alloc([numRows, dim], this.type);
     }
 

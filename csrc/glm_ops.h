@@ -170,18 +170,18 @@ void glm_expert_scale(GlmCtx* ctx, void* out, const void* weights,
 
 void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
                      const void* const* weight_ptrs,
-                     const int* expert_ids, const int* batch_ids,
+                     const int* expert_ids, int top_k,
                      int count, int N, int K);
 
 void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
                              const void* const* weight_ptrs,
                              const void* const* scale_ptrs,
                              const void* const* scale2_ptrs,
-                             const int* expert_ids, const int* batch_ids,
+                             const int* expert_ids, int top_k,
                              int count, int N, int K);
 
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
-                            const void* scales, const int* batch_ids,
+                            const void* scales, int top_k,
                             int dim, int count, int num_rows, void* workspace);
 
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,

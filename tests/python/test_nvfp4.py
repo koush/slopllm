@@ -218,7 +218,6 @@ class TestNVFP4MulMatId:
         x_bf16 = torch.randn(bs, K, dtype=torch.bfloat16, device=device) * 0.5
 
         expert_ids_host = torch.randint(0, num_experts, (count,), dtype=torch.int32)
-        batch_ids_host = torch.tensor([i // topk for i in range(count)], dtype=torch.int32)
 
         weight_ptrs_list = []
         scale_ptrs_list = []
@@ -252,15 +251,13 @@ class TestNVFP4MulMatId:
         scale2_ptrs = GpuPtrs(scale2_ptrs_list, device)
 
         expert_ids_gpu = glm.alloc(count * 4)
-        batch_ids_gpu = glm.alloc(count * 4)
         glm.h2d(expert_ids_gpu, expert_ids_host.numpy().ctypes.data_as(ctypes.c_void_p), count * 4)
-        glm.h2d(batch_ids_gpu, batch_ids_host.numpy().ctypes.data_as(ctypes.c_void_p), count * 4)
 
         out_gpu = glm.alloc(count * N * 2)
 
         glm.nvfp4_mul_mat_id(out_gpu, x_bf16.data_ptr(),
                              weight_ptrs.data_ptr, scale_ptrs.data_ptr, scale2_ptrs.data_ptr,
-                             expert_ids_gpu, batch_ids_gpu,
+                             expert_ids_gpu, topk,
                              count, N, K)
 
         glm.synchronize()
@@ -271,7 +268,7 @@ class TestNVFP4MulMatId:
 
         ref_out = torch.zeros(count, N, dtype=torch.float32)
         for i in range(count):
-            bid = batch_ids_host[i].item()
+            bid = i // topk
             eid = expert_ids_host[i].item()
             ref_out[i] = torch.nn.functional.linear(x_bf16[bid].cpu().float(), ref_outputs[eid].float())
 
@@ -286,5 +283,4 @@ class TestNVFP4MulMatId:
             for p in ptrs:
                 glm.free_buf(p)
         glm.free_buf(expert_ids_gpu)
-        glm.free_buf(batch_ids_gpu)
         glm.free_buf(out_gpu)

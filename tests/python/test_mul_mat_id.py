@@ -1,7 +1,7 @@
 """Tests for glm_mul_mat_id: indexed matrix-vector multiplication for MoE expert dispatch.
 
 For each (token, expert) pair, computes:
-  output[i] = input[batch_ids[i]] @ weights[expert_ids[i]].T
+  output[i] = input[i // top_k] @ weights[expert_ids[i]].T
 
 Tests correctness against PyTorch reference using BF16 throughout.
 """
@@ -24,7 +24,6 @@ class TestMulMatId:
         weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
 
         expert_ids = torch.tensor([[0, 2], [1, 3]], dtype=torch.int32, device=device)
-        batch_ids = torch.arange(batch).unsqueeze(1).expand(batch, topK).reshape(-1).int().to(device)
         expert_ids_flat = expert_ids.reshape(-1)
 
         output_bf16 = torch.empty(count, N, dtype=torch.bfloat16, device=device)
@@ -36,13 +35,12 @@ class TestMulMatId:
             input_bf16.data_ptr(),
             weight_ptrs.data_ptr,
             expert_ids_flat.data_ptr(),
-            batch_ids.data_ptr(),
-            count, N, K
+            topK, count, N, K
         )
 
         ref = torch.zeros(count, N, dtype=torch.float32, device=device)
         for i in range(count):
-            bid = batch_ids[i].item()
+            bid = i // topK
             eid = expert_ids_flat[i].item()
             ref[i] = input_bf16[bid].float() @ weights[eid].float().T
 
@@ -60,7 +58,6 @@ class TestMulMatId:
         weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
 
         expert_ids = torch.tensor([[0, 2, 5, 7]], dtype=torch.int32, device=device)
-        batch_ids = torch.zeros(count, dtype=torch.int32, device=device)
         expert_ids_flat = expert_ids.reshape(-1)
 
         output_bf16 = torch.empty(count, N, dtype=torch.bfloat16, device=device)
@@ -72,8 +69,7 @@ class TestMulMatId:
             input_bf16.data_ptr(),
             weight_ptrs.data_ptr,
             expert_ids_flat.data_ptr(),
-            batch_ids.data_ptr(),
-            count, N, K
+            topK, count, N, K
         )
 
         ref = torch.zeros(count, N, dtype=torch.float32, device=device)
@@ -95,7 +91,6 @@ class TestMulMatId:
         weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
 
         expert_ids = torch.tensor([[1, 3]], dtype=torch.int32, device=device)
-        batch_ids = torch.zeros(count, dtype=torch.int32, device=device)
         expert_ids_flat = expert_ids.reshape(-1)
 
         output_bf16 = torch.empty(count, N, dtype=torch.bfloat16, device=device)
@@ -107,8 +102,7 @@ class TestMulMatId:
             input_bf16.data_ptr(),
             weight_ptrs.data_ptr,
             expert_ids_flat.data_ptr(),
-            batch_ids.data_ptr(),
-            count, N, K
+            topK, count, N, K
         )
 
         ref = torch.zeros(count, N, dtype=torch.float32, device=device)
@@ -130,7 +124,6 @@ class TestMulMatId:
         weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
 
         expert_ids = torch.randint(0, num_experts, (batch, topK), dtype=torch.int32, device=device)
-        batch_ids = torch.arange(batch).unsqueeze(1).expand(batch, topK).reshape(-1).int().to(device)
         expert_ids_flat = expert_ids.reshape(-1)
 
         output_bf16 = torch.empty(count, N, dtype=torch.bfloat16, device=device)
@@ -142,13 +135,12 @@ class TestMulMatId:
             input_bf16.data_ptr(),
             weight_ptrs.data_ptr,
             expert_ids_flat.data_ptr(),
-            batch_ids.data_ptr(),
-            count, N, K
+            topK, count, N, K
         )
 
         ref = torch.zeros(count, N, dtype=torch.float32, device=device)
         for i in range(count):
-            bid = batch_ids[i].item()
+            bid = i // topK
             eid = expert_ids_flat[i].item()
             ref[i] = input_bf16[bid].float() @ weights[eid].float().T
 
@@ -167,7 +159,6 @@ class TestMulMatId:
         weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
 
         expert_ids = torch.tensor([[0, 1], [0, 2], [0, 3]], dtype=torch.int32, device=device)
-        batch_ids = torch.arange(batch).unsqueeze(1).expand(batch, topK).reshape(-1).int().to(device)
         expert_ids_flat = expert_ids.reshape(-1)
 
         output_bf16 = torch.empty(count, N, dtype=torch.bfloat16, device=device)
@@ -179,13 +170,12 @@ class TestMulMatId:
             input_bf16.data_ptr(),
             weight_ptrs.data_ptr,
             expert_ids_flat.data_ptr(),
-            batch_ids.data_ptr(),
-            count, N, K
+            topK, count, N, K
         )
 
         ref = torch.zeros(count, N, dtype=torch.float32, device=device)
         for i in range(count):
-            bid = batch_ids[i].item()
+            bid = i // topK
             eid = expert_ids_flat[i].item()
             ref[i] = input_bf16[bid].float() @ weights[eid].float().T
 
@@ -204,7 +194,6 @@ class TestMulMatId:
         weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
 
         expert_ids = torch.tensor([[0, 2, 5, 7]], dtype=torch.int32, device=device)
-        batch_ids = torch.zeros(count, dtype=torch.int32, device=device)
         expert_ids_flat = expert_ids.reshape(-1)
 
         output_bf16 = torch.empty(count, N, dtype=torch.bfloat16, device=device)
@@ -216,8 +205,7 @@ class TestMulMatId:
             input_bf16.data_ptr(),
             weight_ptrs.data_ptr,
             expert_ids_flat.data_ptr(),
-            batch_ids.data_ptr(),
-            count, N, K
+            topK, count, N, K
         )
 
         ref = torch.zeros(count, N, dtype=torch.float32, device=device)
@@ -240,7 +228,6 @@ class TestMulMatId:
         weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
 
         expert_ids = torch.tensor([[1, 3, 5, 7]], dtype=torch.int32, device=device)
-        batch_ids = torch.zeros(count, dtype=torch.int32, device=device)
         expert_ids_flat = expert_ids.reshape(-1)
 
         output_bf16 = torch.empty(count, N, dtype=torch.bfloat16, device=device)
@@ -252,13 +239,12 @@ class TestMulMatId:
             input_bf16.data_ptr(),
             weight_ptrs.data_ptr,
             expert_ids_flat.data_ptr(),
-            batch_ids.data_ptr(),
-            count, N, K
+            topK, count, N, K
         )
 
         ref = torch.zeros(count, N, dtype=torch.float32, device=device)
         for i in range(count):
-            bid = batch_ids[i].item()
+            bid = i // topK
             eid = expert_ids_flat[i].item()
             ref[i] = input_bf16[bid].float() @ weights[eid].float().T
 
@@ -268,25 +254,24 @@ class TestScatterAddRows:
     def test_scatter_add_rows_basic(self, glm, device):
         rows_out = 2
         dim = 64
-        count = 4
+        topK = 2
+        count = rows_out * topK
 
         out = torch.zeros(rows_out, dim, dtype=torch.bfloat16, device=device)
         input_bf16 = torch.randn(count, dim, dtype=torch.bfloat16, device=device)
         scales = torch.randn(count, dtype=torch.bfloat16, device=device)
-        batch_ids = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
 
         glm.scatter_add_rows(
             out.data_ptr(),
             input_bf16.data_ptr(),
             scales.data_ptr(),
-            batch_ids.data_ptr(),
-            dim, count, rows_out,
+            topK, dim, count, rows_out,
             0  # workspace (unused)
         )
 
         ref = torch.zeros(rows_out, dim, dtype=torch.float32, device=device)
         for i in range(count):
-            bid = batch_ids[i].item()
+            bid = i // topK
             ref[bid] += scales[i].float() * input_bf16[i].float()
 
         torch.testing.assert_close(out.cpu().float(), ref.cpu(), atol=1e-2, rtol=1e-2)
@@ -294,19 +279,18 @@ class TestScatterAddRows:
     def test_scatter_add_rows_single_batch(self, glm, device):
         rows_out = 1
         dim = 128
-        count = 8
+        topK = 8
+        count = rows_out * topK
 
         out = torch.zeros(rows_out, dim, dtype=torch.bfloat16, device=device)
         input_bf16 = torch.randn(count, dim, dtype=torch.bfloat16, device=device)
         scales = torch.randn(count, dtype=torch.bfloat16, device=device)
-        batch_ids = torch.zeros(count, dtype=torch.int32, device=device)
 
         glm.scatter_add_rows(
             out.data_ptr(),
             input_bf16.data_ptr(),
             scales.data_ptr(),
-            batch_ids.data_ptr(),
-            dim, count, rows_out,
+            topK, dim, count, rows_out,
             0  # workspace (unused)
         )
 
@@ -325,20 +309,18 @@ class TestScatterAddRows:
         out = torch.zeros(BS, hs, dtype=torch.bfloat16, device=device)
         input_bf16 = torch.randn(count, hs, dtype=torch.bfloat16, device=device)
         scales = torch.rand(count, dtype=torch.bfloat16, device=device) + 0.1
-        batch_ids = torch.arange(BS).unsqueeze(1).expand(BS, topK).reshape(-1).int().to(device)
 
         glm.scatter_add_rows(
             out.data_ptr(),
             input_bf16.data_ptr(),
             scales.data_ptr(),
-            batch_ids.data_ptr(),
-            hs, count, BS,
+            topK, hs, count, BS,
             0  # workspace (unused)
         )
 
         ref = torch.zeros(BS, hs, dtype=torch.float32, device=device)
         for i in range(count):
-            bid = batch_ids[i].item()
+            bid = i // topK
             ref[bid] += scales[i].float() * input_bf16[i].float()
 
         torch.testing.assert_close(out.cpu().float(), ref.cpu(), atol=1e-2, rtol=1e-2)

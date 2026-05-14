@@ -68,7 +68,7 @@ export class ExecutionState {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const pageSize = pagedKV.pageSize;
-    const nnz = this.isDecode ? this.batchSize : pagedKV.seqKvLens.reduce((a, b) => a + b, 0);
+    const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     const appendCkvStrideN = headDimCkv;
     const appendKpeStrideN = headDimKpe;
     this.ws.glm.mlaKvCacheAppend(
@@ -429,7 +429,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
     this.kvLenH.withPinnedBuffer(buf => {
       for (let i = 0; i < batchSize; i++) {
-        buf.writeInt32LE(seqLens[i], i * I32);
+        buf.writeInt32LE(pagedKV.seqKvLens[i], i * I32);
       }
     });
 
