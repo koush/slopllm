@@ -222,11 +222,8 @@ export function* generateStream(
       const state = ws.planPrefill(model, 1, [suffixIds.length], cache);
       state.prepareInput([suffixIds]);
       ws.forwardInput(state);
-      using hiddenStates = model.forward(state);
+      model.forward(state);
       state.finishPrefill();
-
-      using firstTokens = state.computeLogits(hiddenStates, model);
-      doSample(firstTokens);
       cache.reset(1);
     }
 
