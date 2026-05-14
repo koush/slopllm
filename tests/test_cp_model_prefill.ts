@@ -199,7 +199,7 @@ describe("CP vs non-CP model prefill", () => {
           normed.replace(r.normed);
           residual.replace(r.residual);
         }
-        return (model as any).computeLogits(normed.value, state);
+        return state.computeLogits(normed.value, model as any);
       };
 
       return { origForward, origMlaLayer };
@@ -365,7 +365,7 @@ describe("CP vs non-CP model prefill", () => {
           normed.replace(r.normed);
           residual.replace(r.residual);
         }
-        return (model as any).computeLogits(normed.value, state);
+        return state.computeLogits(normed.value, model as any);
       };
 
       return { origForward, origMlaLayer };

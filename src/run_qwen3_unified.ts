@@ -254,8 +254,8 @@ export function* generateStream(
 
         ws.decodeStep(state, model);
         ws.forwardInput(state);
-        using logits = model.forward(state);
-        doSample(logits);
+        using hiddenStates = model.forward(state);
+        doSample(state.computeLogits(hiddenStates, model));
 
         if (capturing) {
           const graph = glm.graphEndCapture();

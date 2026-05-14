@@ -52,8 +52,8 @@ export function* generateTokens(
       const state = ws.planDecode(model, 1, cache);
       state.prepareInput([[nextToken]]);
       ws.forwardInput(state);
-      const logits = model.forward(state);
-      nextToken = logits.sampleTokenGPU(sampling, tokenHistory).readInt32LEArray()[0];
+      const hiddenStates = model.forward(state);
+      nextToken = state.computeLogits(hiddenStates, model).sampleTokenGPU(sampling, tokenHistory).readInt32LEArray()[0];
     } else {
       const decodeTokens = ws.forwardEagerDecode(model, [nextToken], cache);
       nextToken = decodeTokens[0];

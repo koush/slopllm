@@ -898,14 +898,15 @@ export class ParallelTensor extends Tensor {
   indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
     super.indexSelect(indices, dim, batch);
     const pIndices = indices as ParallelTensor;
-    this.assertParallel("indexSelect src", this, TensorParallelism.Replicated);
+    this.assertParallel("indexSelect src", this, TensorParallelism.Replicated, TensorParallelism.Row);
     this.assertParallel("indexSelect indices", pIndices, TensorParallelism.Replicated, TensorParallelism.PartialSum);
 
+    const shardDim = this.parallelism === TensorParallelism.Row ? this.shardDim(dim, "indexSelect dim") : dim;
     const shards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      shards.push(this.shards[i].indexSelect(pIndices.shards[i], dim, batch));
+      shards.push(this.shards[i].indexSelect(pIndices.shards[i], shardDim, batch));
     }
-    return this.parallelOps.wrapShards(this.workspace, shards, [batch, dim], this.type, TensorParallelism.Replicated);
+    return this.parallelOps.wrapShards(this.workspace, shards, [batch, dim], this.type, this.parallelism);
   }
 
   gather(indices: Tensor, k: number, inDim: number, batch: number): Tensor {

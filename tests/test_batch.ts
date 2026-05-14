@@ -198,7 +198,8 @@ describe("Qwen3-0.6B batch tests", () => {
     stateRef.prepareInput([[tokens[0]]]);
     gws.decodeStep(stateRef, model);
     gws.forwardInput(stateRef);
-    const logitsRef = model.forward(stateRef);
+    const hiddenStatesRef = model.forward(stateRef);
+    const logitsRef = stateRef.computeLogits(hiddenStatesRef, model);
     using argmaxRef = logitsRef.argmax();
     const tokensRef = argmaxRef.readInt32LEArray();
 
@@ -210,7 +211,8 @@ describe("Qwen3-0.6B batch tests", () => {
     glm.graphBeginCapture();
     gws.decodeStep(state, model);
     gws.forwardInput(state);
-    const captureLogits = model.forward(state);
+    const captureHiddenStates = model.forward(state);
+    const captureLogits = state.computeLogits(captureHiddenStates, model);
     const captureArgmax = captureLogits.argmax();
     const graph = glm.graphEndCapture();
     gws.freeze();
@@ -243,8 +245,9 @@ describe("Qwen3-0.6B batch tests", () => {
       state.prepareInput([[current]]);
       gws.decodeStep(state, model);
       gws.forwardInput(state);
-      const logits = model.forward(state);
-      using argmaxResult = logits.argmax();
+      const hiddenStates = model.forward(state);
+      const lastLogits = state.computeLogits(hiddenStates, model);
+      using argmaxResult = lastLogits.argmax();
       current = argmaxResult.readInt32LEArray()[0];
       refTokens.push(current);
     }
@@ -270,8 +273,8 @@ describe("Qwen3-0.6B batch tests", () => {
 
     gws.decodeStep(state, model);
         gws.forwardInput(state);
-        const logits = model.forward(state);
-        captureArgmax = logits.argmax();
+        const hiddenStates = model.forward(state);
+        captureArgmax = state.computeLogits(hiddenStates, model).argmax();
 
         if (capturing) {
           const graph = glm.graphEndCapture();
@@ -316,7 +319,8 @@ describe("Qwen3-0.6B batch tests", () => {
     const state = ws.planPrefill(model, 1, [PROMPT_GRAPH.length], pagedKV);
     state.prepareInput([PROMPT_GRAPH]);
     ws.forwardInput(state);
-    const logits = model.forward(state);
+    const hiddenStates = model.forward(state);
+    const logits = state.computeLogits(hiddenStates, model);
     using argmaxOut = logits.argmax();
     const tokens = argmaxOut.readInt32LEArray();
     pagedKV.updateIndptr(ws);
@@ -347,7 +351,8 @@ describe("Qwen3-0.6B batch tests", () => {
     const state = ws.planPrefill(model, 2, [PROMPT1.length, PROMPT2.length], pagedKV);
     state.prepareInput([PROMPT1, PROMPT2]);
     ws.forwardInput(state);
-    const logits = model.forward(state);
+    const hiddenStates = model.forward(state);
+    const logits = state.computeLogits(hiddenStates, model);
     using argmaxOut2 = logits.argmax();
     const tokens = argmaxOut2.readInt32LEArray();
 

@@ -75,20 +75,6 @@ export abstract class ChatModel extends WorkspaceBase {
     return siluBuf.linear(this.tensors.get(`${pfx}.mlp.down_proj.weight`)!, BS);
   }
 
-  protected computeLogits(normed: Tensor, state: ExecutionState): Tensor {
-    const hs = this.cfg.hiddenSize;
-    const ws = state.ws;
-    const batchSize = state.batchSize;
-    let logitsBuf: Tensor;
-    if (state.isDecode) {
-      logitsBuf = normed.linear(this.tensors.get("lm_head.weight")!, batchSize);
-    } else {
-      using hiddenLast = normed.indexSelect(ws.lastIdx, hs, batchSize);
-      logitsBuf = hiddenLast.linear(this.tensors.get("lm_head.weight")!, batchSize);
-    }
-    return logitsBuf.removeTracking();
-  }
-
   protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void>;
 
   protected async loadWeights(modelDir: string): Promise<void> {

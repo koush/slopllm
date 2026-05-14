@@ -1,4 +1,4 @@
-import type { ChatCache, ChatModel } from "./chat_model";
+import { ChatModel, type ChatCache } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import { BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, I32 } from "./glm_ops";
 import { MemcpyKind } from "./tensor";
@@ -33,6 +33,18 @@ export class ExecutionState {
     this.ws = ws;
     this.cache = cache;
     this.qoIndptrHost = qoIndptrHost;
+  }
+
+  computeLogits(hiddenStates: Tensor, model: ChatModel): Tensor {
+    const lmHead = model.tensors.get("lm_head.weight")!;
+    const hs = model.cfg.hiddenSize;
+    const batchSize = this.batchSize;
+    if (this.isDecode) {
+      return hiddenStates.linear(lmHead, batchSize).removeTracking();
+    } else {
+      using hiddenLast = hiddenStates.indexSelect(this.ws.lastIdx, hs, batchSize);
+      return hiddenLast.linear(lmHead, batchSize).removeTracking();
+    }
   }
 
   kvCacheWrite(kRope: Tensor, vBuf: Tensor, cacheIdx: number, nKv: number, hd: number): void {
@@ -482,7 +494,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const state = this.planPrefill(model, batchSize, seqLens, cache);
     state.prepareInput(inputIdsList);
     this.forwardInput(state);
-    const logits = model.forward(state);
+    const hiddenStates = model.forward(state);
+    const logits = state.computeLogits(hiddenStates, model);
 
     const pagedKV = state.cache.getPagedKV();
     this.positionIdsH.withPinnedBuffer(buf => {
@@ -503,7 +516,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
   forwardDecode(model: ChatModel, state: ExecutionState): Tensor {
     this.forwardInput(state);
-    return model.forward(state);
+    const hiddenStates = model.forward(state);
+    return state.computeLogits(hiddenStates, model);
   }
 
   forwardEagerDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache): number[] {
@@ -511,7 +525,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     state.prepareInput([tokenIdsList]);
     this.decodeStep(state, model);
     this.forwardInput(state);
-    const logits = model.forward(state);
+    const hiddenStates = model.forward(state);
+    const logits = state.computeLogits(hiddenStates, model);
     using argmaxResult = logits.argmax();
     return argmaxResult.readInt32LEArray();
   }

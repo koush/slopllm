@@ -96,8 +96,8 @@ function generateWithGraph(
 
       ws.decodeStep(state, model);
       ws.forwardInput(state);
-      const logits = model.forward(state);
-      argmaxResult = logits.argmax();
+      const hiddenStates = model.forward(state);
+      argmaxResult = state.computeLogits(hiddenStates, model).argmax();
 
       if (capturing) {
         const graphIdx = graph.graphEndCapture();
