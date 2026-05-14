@@ -307,8 +307,10 @@ export class Glm51Model extends ChatModel {
 
   protected async loadWeights(modelDir: string): Promise<void> {
     await super.loadWeights(modelDir);
-
-    this.tieEmbeddingToLmHead("model.embed_tokens.weight");
+    if (this.cfg.tieWordEmbeddings && !this.tensors.has("lm_head.weight")) {
+      const embedTensor = this.tensors.get("model.embed_tokens.weight");
+      if (embedTensor) this.tensors.set("lm_head.weight", embedTensor);
+    }
   }
 
   createChatCache(maxPages = 256): ChatCache {

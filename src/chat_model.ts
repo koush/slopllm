@@ -89,13 +89,6 @@ export abstract class ChatModel extends WorkspaceBase {
     return logitsBuf.removeTracking();
   }
 
-  protected tieEmbeddingToLmHead(embedName: string): void {
-    if (this.cfg.tieWordEmbeddings && !this.tensors.has("lm_head.weight")) {
-      const embedTensor = this.tensors.get(embedName);
-      if (embedTensor) this.tensors.set("lm_head.weight", embedTensor);
-    }
-  }
-
   protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void>;
 
   protected async loadWeights(modelDir: string): Promise<void> {
