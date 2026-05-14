@@ -128,7 +128,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   qoIndptrH: Tensor;
   /** GPU buffer [B*S] of I32: written by host (h2d) or memcpy, read by kvCacheWrite to scatter K/V into cache. */
   slotMapping: Tensor;
-  /** Pinned host buffer [B] of I32: written by host, read via memcpy to slotMapping. */
+  /** Pinned host buffer [B*S] of I32: written by host, read via memcpy to slotMapping. */
   slotMappingH: Tensor;
   /** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer run (page indptr). */
   indptrD: Tensor;
@@ -164,7 +164,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
     this.qoIndptrH = this.allocPinned([B + 1], "I32", "qoIndptrH");
     this.slotMapping = this.alloc([B * S], "I32", "slotMapping");
-    this.slotMappingH = this.allocPinned([B], "I32", "slotMappingH");
+    this.slotMappingH = this.allocPinned([B * S], "I32", "slotMappingH");
     this.indptrD = this.alloc([(B + 1) * I32], "I32", "indptrD");
     this.indptrH = this.allocPinned([(B + 1) * I32], "I32", "indptrH");
     this.lastPageLen = this.alloc([B * I32], "I32", "lastPageLen");
@@ -194,13 +194,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     if (input.pinned) {
       const count = state.isDecode ? batchSize : state.totalTokens;
       this.inputIdsBuf.memcpy(input, count * I32, MemcpyKind.HostToDevice);
-    }
-
-    if (!state.isDecode && state.qoIndptrHost) {
-      pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
-      this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-      this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
-      this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     }
   }
 
@@ -349,7 +342,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
 
     if (pagedKV.pagesDirtyDevice) {
-      pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
+      const usedPages = pagedKV.seqPages.reduce((sum, sp) => sum + sp.length, 0);
+      pagedKV.indices.memcpy(pagedKV.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
       this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
       pagedKV.pagesDirtyDevice = false;
     }
@@ -443,30 +437,27 @@ export class ExecutionWorkspace extends WorkspaceBase {
       );
     }
 
-    const slotMappingBuf = Buffer.alloc(totalTokens * I32);
-    this.mlaBatchIndicesH.withPinnedBuffer(buf => {
-      let off = 0;
+    this.slotMappingH.withPinnedBuffer(buf => {
+      let slotOff = 0;
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+        const pages = pagedKV.seqPages[seqIdx];
         for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
-          buf.writeInt32LE(seqIdx, off * I32);
-          off++;
+          const kvPos = startPos[seqIdx] + pos;
+          const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
+          const offsetInPage = kvPos % pagedKV.pageSize;
+          const absPage = pages[pageIdxInSeq];
+          buf.writeInt32LE(absPage * pagedKV.pageSize + offsetInPage, slotOff * I32);
+          slotOff++;
         }
       }
     });
-    let slotOff = 0;
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      const pages = pagedKV.seqPages[seqIdx];
-      for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
-        const kvPos = startPos[seqIdx] + pos;
-        const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
-        const offsetInPage = kvPos % pagedKV.pageSize;
-        const absPage = pages[pageIdxInSeq];
-        slotMappingBuf.writeInt32LE(absPage * pagedKV.pageSize + offsetInPage, slotOff * I32);
-        slotOff++;
-      }
-    }
-    this.slotMapping.h2d(slotMappingBuf);
+    this.slotMapping.memcpy(this.slotMappingH, totalTokens * I32, MemcpyKind.HostToDevice);
     this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, totalTokens * I32, MemcpyKind.HostToDevice);
+    const usedPages = pagedKV.seqPages.reduce((sum, sp) => sum + sp.length, 0);
+    pagedKV.indices.memcpy(pagedKV.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
+    this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
+    this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
 
     return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, this.qoIndptrH);
   }
