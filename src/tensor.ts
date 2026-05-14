@@ -369,7 +369,7 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  readInt32LE(): number[] {
+  readInt32LEArray(): number[] {
     const count = this.numElements;
     const buf = Buffer.alloc(count * 4);
     this.d2h(buf);

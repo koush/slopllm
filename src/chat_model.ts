@@ -53,7 +53,7 @@ export abstract class ChatModel extends WorkspaceBase {
   abstract createChatCache(maxPages?: number): ChatCache;
   abstract forward(state: ExecutionState): Tensor;
 
-  prefillBatchPlanHook(_inputIdsList: number[][], _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void {}
+  prefillBatchPlanHook(_batchSize: number, _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void {}
 
   protected initInvFreq(ropeDim: number, ropeTheta: number): Tensor {
     const halfDim = ropeDim / 2;

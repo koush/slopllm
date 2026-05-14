@@ -106,13 +106,15 @@ describe("Qwen3-0.6B-FP8 model", () => {
     const bf16KV = makeKV(bf16Model);
     try {
       fp8KV.reset(1);
-      const fp8State = ws.planPrefill(model, [[1, 2, 3, 4, 5]], fp8KV);
+      const fp8State = ws.planPrefill(model, 1, [5], fp8KV);
+      fp8State.prepareInput([[1, 2, 3, 4, 5]]);
       ws.forwardInput(fp8State);
       const fp8LogitsBuf = model.forward(fp8State);
       const fp8Logits = readLogits(fp8LogitsBuf);
 
       bf16KV.reset(1);
-      const bf16State = bf16Ws.planPrefill(bf16Model, [[1, 2, 3, 4, 5]], bf16KV);
+      const bf16State = bf16Ws.planPrefill(bf16Model, 1, [5], bf16KV);
+      bf16State.prepareInput([[1, 2, 3, 4, 5]]);
       bf16Ws.forwardInput(bf16State);
       const bf16LogitsBuf = bf16Model.forward(bf16State);
       const bf16Logits = readLogits(bf16LogitsBuf);

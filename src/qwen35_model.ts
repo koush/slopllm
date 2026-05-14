@@ -417,7 +417,7 @@ export class Qwen35Model extends ChatModel {
   }
 
   prefillBatchPlanHook(
-    _inputIdsList: number[][], seqLens: number[], totalTokens: number,
+    _batchSize: number, seqLens: number[], totalTokens: number,
     _startPos: number[], cache: ChatCache,
   ): void {
     const { gdnState } = cache as Qwen35ChatCache;

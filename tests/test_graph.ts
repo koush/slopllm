@@ -86,7 +86,7 @@ function generateWithGraph(
 
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
     const state = ws.planDecode(model, 1, cache, true);
-    state.prepareInput([currentToken]);
+    state.prepareInput([[currentToken]]);
 
     if (graphExec === null) {
       if (warmupRemaining === 0 && !capturing) {
@@ -116,7 +116,7 @@ function generateWithGraph(
       graph.synchronize();
     }
 
-    currentToken = argmaxResult.readInt32LE()[0];
+    currentToken = argmaxResult.readInt32LEArray()[0];
     generated.push(currentToken);
     cache.appendTokens(0, [currentToken]);
   }

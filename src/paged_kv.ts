@@ -15,7 +15,7 @@ export class ExecutionState {
   batchSize: number;
   totalTokens: number;
   seqLens: number[];
-  decodeInput?: Tensor;
+  input?: Tensor;
   readonly isDecode: boolean;
   readonly ws: ExecutionWorkspace;
   readonly cache: ChatCache;
@@ -70,21 +70,21 @@ export class ExecutionState {
     );
   }
 
-  prepareInput(tokenIds: number[]|Tensor) {
-    if (!this.isDecode)
-      throw new Error("decodeInput should be null in prefill");
-
+  prepareInput(tokenIds: number[][]|Tensor) {
     if (tokenIds instanceof Tensor) {
-      this.decodeInput = tokenIds;
+      this.input = tokenIds;
     }
     else {
-      const batchSize = tokenIds.length;
       this.ws.inputIdsBufH.withPinnedBuffer(buf => {
-        for (let i = 0; i < batchSize; i++) {
-          buf.writeInt32LE(tokenIds[i], i * I32);
+        let idsOff = 0;
+        for (const ids of tokenIds) {
+          for (const id of ids) {
+            buf.writeInt32LE(id, idsOff);
+            idsOff += I32;
+          }
         }
       });
-      this.decodeInput = this.ws.inputIdsBufH;
+      this.input = this.ws.inputIdsBufH;
     }
   }
 }
@@ -160,7 +160,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.positionIdsH = this.allocPinned([B], "I32", "positionIdsH");
     this.lastIdx = this.alloc([B], "I32", "lastIdx");
     this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
-    this.inputIdsBufH = this.allocPinned([B], "I32", "inputIdsBufH");
+    this.inputIdsBufH = this.allocPinned([B * S], "I32", "inputIdsBufH");
     this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
     this.qoIndptrH = this.allocPinned([B + 1], "I32", "qoIndptrH");
     this.slotMapping = this.alloc([B * S], "I32", "slotMapping");
@@ -185,17 +185,18 @@ export class ExecutionWorkspace extends WorkspaceBase {
   forwardInput(state: ExecutionState): void {
     const pagedKV = state.cache.getPagedKV();
     const batchSize = state.batchSize;
-    let decodeInput = state.decodeInput;
+    let input = state.input;
 
-    if (state.isDecode) {
-      if (!decodeInput) {
-        throw new Error("decodeInput tensor is required for decode mode");
-      }
+    if (!input) {
+      throw new Error("input tensor is required");
+    }
 
-      if (decodeInput.pinned) {
-        this.inputIdsBuf.memcpy(decodeInput, batchSize * I32, MemcpyKind.HostToDevice);
-      }
-    } else if (state.qoIndptrHost) {
+    if (input.pinned) {
+      const count = state.isDecode ? batchSize : state.totalTokens;
+      this.inputIdsBuf.memcpy(input, count * I32, MemcpyKind.HostToDevice);
+    }
+
+    if (!state.isDecode && state.qoIndptrHost) {
       pagedKV.indices.memcpy(pagedKV.indicesH, pagedKV.maxPages * I32, MemcpyKind.HostToDevice);
       this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
       this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
@@ -356,34 +357,22 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return new ExecutionState(batchSize, totalTokens, seqLens, true, this, cache);
   }
 
-  planPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): ExecutionState {
+  planPrefill(model: ChatModel, batchSize: number, seqLens: number[], cache: ChatCache): ExecutionState {
     const pagedKV = cache.getPagedKV();
     const cfg = model.cfg;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
     const pageSize = pagedKV.pageSize;
-    const batchSize = inputIdsList.length;
-    const seqLens = inputIdsList.map(ids => ids.length);
     const totalTokens = seqLens.reduce((a, b) => a + b, 0);
 
     if (pagedKV.seqPages.length !== batchSize) {
       throw new Error(`planPrefill: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
     }
 
-    const inputIdsBuf = Buffer.alloc(totalTokens * I32);
-    let idsOff = 0;
-    for (const ids of inputIdsList) {
-      for (const id of ids) {
-        inputIdsBuf.writeInt32LE(id, idsOff);
-        idsOff += I32;
-      }
-    }
-    this.inputIdsBuf.h2d(inputIdsBuf);
-
     const startPos = pagedKV.seqKvLens.slice();
 
-    model.prefillBatchPlanHook(inputIdsList, seqLens, totalTokens, startPos, cache);
+    model.prefillBatchPlanHook(batchSize, seqLens, totalTokens, startPos, cache);
 
     let prefillPagesNeeded = 0;
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -483,12 +472,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   forwardPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): Tensor {
-    const state = this.planPrefill(model, inputIdsList, cache);
+    const batchSize = inputIdsList.length;
+    const seqLens = inputIdsList.map(ids => ids.length);
+    const state = this.planPrefill(model, batchSize, seqLens, cache);
+    state.prepareInput(inputIdsList);
     this.forwardInput(state);
     const logits = model.forward(state);
 
     const pagedKV = state.cache.getPagedKV();
-    const batchSize = state.batchSize;
     this.positionIdsH.withPinnedBuffer(buf => {
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
         buf.writeInt32LE(pagedKV.seqKvLens[seqIdx] - 1, seqIdx * I32);
@@ -502,7 +493,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   forwardEagerPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): number[] {
     const logits = this.forwardPrefill(model, inputIdsList, cache);
     using argmaxResult = logits.argmax();
-    return argmaxResult.readInt32LE();
+    return argmaxResult.readInt32LEArray();
   }
 
   forwardDecode(model: ChatModel, state: ExecutionState): Tensor {
@@ -512,12 +503,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
   forwardEagerDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache): number[] {
     const state = this.planDecode(model, tokenIdsList.length, cache);
-    state.prepareInput(tokenIdsList);
+    state.prepareInput([tokenIdsList]);
     this.decodeStep(state, model);
     this.forwardInput(state);
     const logits = model.forward(state);
     using argmaxResult = logits.argmax();
-    return argmaxResult.readInt32LE();
+    return argmaxResult.readInt32LEArray();
   }
 }
 

@@ -195,17 +195,17 @@ describe("Qwen3-0.6B batch tests", () => {
     const tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
 
     const stateRef = gws.planDecode(model, 1, pagedKV, true);
-    stateRef.prepareInput([tokens[0]]);
+    stateRef.prepareInput([[tokens[0]]]);
     gws.decodeStep(stateRef, model);
     gws.forwardInput(stateRef);
     const logitsRef = model.forward(stateRef);
     using argmaxRef = logitsRef.argmax();
-    const tokensRef = argmaxRef.readInt32LE();
+    const tokensRef = argmaxRef.readInt32LEArray();
 
     pagedKV.reset(1);
     const tokens2 = gws.forwardEagerPrefill(model, [prompt], pagedKV);
     const state = gws.planDecode(model, 1, pagedKV, true);
-    state.prepareInput([tokens2[0]]);
+    state.prepareInput([[tokens2[0]]]);
 
     glm.graphBeginCapture();
     gws.decodeStep(state, model);
@@ -220,7 +220,7 @@ describe("Qwen3-0.6B batch tests", () => {
     glm.graphLaunch(graphExec);
     glm.synchronize();
 
-    const tokensReplay = captureArgmax.readInt32LE();
+    const tokensReplay = captureArgmax.readInt32LEArray();
     assert.deepEqual(tokensReplay, tokensRef,
       `Graph replay mismatch: replay=${tokensReplay}, ref=${tokensRef}`);
 
@@ -240,12 +240,12 @@ describe("Qwen3-0.6B batch tests", () => {
     let current = tokens[0];
     for (let step = 0; step < numSteps; step++) {
       const state = gws.planDecode(model, 1, pagedKV, true);
-      state.prepareInput([current]);
+      state.prepareInput([[current]]);
       gws.decodeStep(state, model);
       gws.forwardInput(state);
       const logits = model.forward(state);
       using argmaxResult = logits.argmax();
-      current = argmaxResult.readInt32LE()[0];
+      current = argmaxResult.readInt32LEArray()[0];
       refTokens.push(current);
     }
 
@@ -260,7 +260,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     for (let step = 0; step < numSteps; step++) {
       const state = gws.planDecode(model, 1, pagedKV, true);
-      state.prepareInput([current]);
+      state.prepareInput([[current]]);
 
       if (graphExec === null) {
         if (warmupRemaining === 0 && !capturing) {
@@ -290,7 +290,7 @@ describe("Qwen3-0.6B batch tests", () => {
         glm.synchronize();
       }
 
-      current = captureArgmax.readInt32LE()[0];
+      current = captureArgmax.readInt32LEArray()[0];
       const expected = refTokens[step];
       assert.equal(current, expected,
         `Step ${step} mismatch: ${current} != ${expected}`);
@@ -313,19 +313,20 @@ describe("Qwen3-0.6B batch tests", () => {
     });
 
     pagedKV.reset(1);
-    const state = ws.planPrefill(model, [PROMPT_GRAPH], pagedKV);
+    const state = ws.planPrefill(model, 1, [PROMPT_GRAPH.length], pagedKV);
+    state.prepareInput([PROMPT_GRAPH]);
     ws.forwardInput(state);
     const logits = model.forward(state);
     using argmaxOut = logits.argmax();
-    const tokens = argmaxOut.readInt32LE();
+    const tokens = argmaxOut.readInt32LEArray();
     pagedKV.updateIndptr(ws);
 
     const firstToken = tokens[0];
     const history = [...PROMPT_GRAPH, firstToken];
 
-    const greedySingle = logits.sampleTokenGPU(greedy, history).readInt32LE()[0];
+    const greedySingle = logits.sampleTokenGPU(greedy, history).readInt32LEArray()[0];
 
-    const batchResults = logits.sampleBatchGPU([greedy, sampling], [history, history]).readInt32LE();
+    const batchResults = logits.sampleBatchGPU([greedy, sampling], [history, history]).readInt32LEArray();
 
     assert.equal(batchResults[0], greedySingle,
       `Batch greedy[0] != sequential greedy: ${batchResults[0]} != ${greedySingle}`);
@@ -343,16 +344,17 @@ describe("Qwen3-0.6B batch tests", () => {
     });
 
     pagedKV.reset(2);
-    const state = ws.planPrefill(model, [PROMPT1, PROMPT2], pagedKV);
+    const state = ws.planPrefill(model, 2, [PROMPT1.length, PROMPT2.length], pagedKV);
+    state.prepareInput([PROMPT1, PROMPT2]);
     ws.forwardInput(state);
     const logits = model.forward(state);
     using argmaxOut2 = logits.argmax();
-    const tokens = argmaxOut2.readInt32LE();
+    const tokens = argmaxOut2.readInt32LEArray();
 
     const history1 = [...PROMPT1, tokens[0]];
     const history2 = [...PROMPT2, tokens[1]];
 
-    const batchResults = logits.sampleBatchGPU([greedy, greedy], [history1, history2]).readInt32LE();
+    const batchResults = logits.sampleBatchGPU([greedy, greedy], [history1, history2]).readInt32LEArray();
 
     assert.equal(batchResults[0], tokens[0],
       `Batch greedy[0] != argmax: ${batchResults[0]} != ${tokens[0]}`);
