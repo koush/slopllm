@@ -56,6 +56,7 @@ function loadConfig(modelDir: string): Glm51Config {
     intermediateSize: raw.intermediate_size,
     moeIntermediateSize: raw.moe_intermediate_size ?? raw.intermediate_size,
     numHiddenLayers: raw.num_hidden_layers,
+    numNextNPredictLayers: raw.num_nextn_predict_layers,
     rmsNormEps: raw.rms_norm_eps ?? 1e-5,
     vocabSize: raw.vocab_size,
     tieWordEmbeddings: raw.tie_word_embeddings ?? false,
@@ -89,36 +90,6 @@ function loadConfig(modelDir: string): Glm51Config {
   };
 }
 
-class Glm51ChatCache implements ChatCache {
-  constructor(
-    public readonly pagedKV: PagedKVCache,
-  ) { }
-
-  getPagedKV(): PagedKVCache { return this.pagedKV; }
-
-  reset(batchSize: number): void {
-    this.pagedKV.reset(batchSize);
-  }
-
-  free(): void {
-    this.pagedKV.free();
-  }
-
-  [Symbol.dispose](): void {
-    this.free();
-  }
-
-  prefixMatch(seqIdx: number, inputIds: number[]): number[] {
-    const batchSize = Math.max(this.pagedKV.seqPages.length, 1);
-    this.pagedKV.reset(batchSize);
-    return inputIds.slice();
-  }
-
-  appendTokens(seqIdx: number, tokens: number[]): void {
-    this.pagedKV.appendTokens(seqIdx, tokens);
-  }
-}
-
 interface MlaDeferred {
   mmapPtr: number;
   offset: number;
@@ -140,8 +111,9 @@ export class Glm51Model extends ChatModel {
   readonly contextParallel: boolean;
   private readonly pendingKNope = new Map<string, MlaDeferred>();
   private readonly pendingQNope = new Map<string, MlaDeferred>();
+  private readonly mtp: boolean;
 
-  private constructor(glm: DeviceOps, config: Glm51Config, maxBatch: number, maxSeqLen: number, contextParallel = false) {
+  private constructor(glm: DeviceOps, config: Glm51Config, maxBatch: number, maxSeqLen: number, contextParallel = false, mtp = false) {
     super(glm);
     this.cfg = config;
     this.maxBatch = maxBatch;
@@ -149,12 +121,13 @@ export class Glm51Model extends ChatModel {
     this.eosIds = new Set(config.eosTokenIds);
     this.invFreq = this.initInvFreq(config.qkRopeHeadDim, config.ropeTheta);
     this.contextParallel = contextParallel;
+    this.mtp = mtp;
   }
 
-  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, maxBatch = 1, maxSeqLen = 4096, contextParallel = false): Promise<Glm51Model> {
+  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, maxBatch = 1, maxSeqLen = 4096, contextParallel = false, mtp = false): Promise<Glm51Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
-    const model = new Glm51Model(glm, config, maxBatch, maxSeqLen, contextParallel);
+    const model = new Glm51Model(glm, config, maxBatch, maxSeqLen, contextParallel, mtp);
     await model.fromPretrained(modelDir);
     return model;
   }
@@ -493,10 +466,6 @@ export class Glm51Model extends ChatModel {
     });
 
     const pagedKV = state.cache.getPagedKV();
-    const useMla = pagedKV.ckvData.length > 0;
-    if (!useMla) {
-      throw new Error("GLM-5.1 requires MLA KV cache, but no KV data was appended. This likely means the MLA-specific weights were not loaded correctly.");
-    }
 
     using q = this.glm.withStream(() => {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
@@ -552,6 +521,16 @@ export class Glm51Model extends ChatModel {
   }
 
   forward(state: ExecutionState): Tensor {
+    const results = this.forwardTarget(state);
+    const { logits } = results;
+    using _ = results.normed;
+    return logits;
+  }
+
+  forwardTarget(state: ExecutionState): {
+    normed: Tensor,
+    logits: Tensor,
+  } {
     const ws = state.ws;
     using _tracker = ws.startTracking();
     const cfg = this.cfg;
@@ -563,8 +542,8 @@ export class Glm51Model extends ChatModel {
     const S = state.isDecode ? 1 : totalTokens;
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
-    using residual = new UsingHolder(embedTable.embedding(ws.inputIdsBuf, hs, BS));
 
+    using residual = new UsingHolder(embedTable.embedding(ws.inputIdsBuf, hs, BS));
     using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
@@ -573,7 +552,47 @@ export class Glm51Model extends ChatModel {
       residual.replace(result.residual);
     }
 
-    const result = this.computeLogits(normed.value, state);
-    return result;
+
+    const logits = this.computeLogits(normed.value, state);
+    return { normed: normed.detach(), logits };
+  }
+
+  forwardMtp(state: ExecutionState, targetNormed: Tensor, token: Tensor) {
+    const cfg = this.cfg;
+    const hs = cfg.hiddenSize;
+    const batchSize = state.batchSize;
+    const totalTokens = state.totalTokens;
+    const BS = totalTokens;
+    const B = state.isDecode ? batchSize : 1;
+    const S = state.isDecode ? 1 : totalTokens;
+
+    if (this.mtp && cfg.numNextNPredictLayers) {
+      const embedTable = this.tensors.get("model.embed_tokens.weight")!;
+      using embedding = embedTable.embedding(token, hs, BS);
+      using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      using hnorm = targetNormed.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      using cat = enorm.cat([hnorm], 1);
+
+      using residual = new UsingHolder(cat.linear(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.eh_proj.weight`)!, BS));
+      using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
+
+      for (let i = cfg.numHiddenLayers; i < cfg.numHiddenLayers + cfg.numNextNPredictLayers; i++) {
+        const result = this.mlaLayer(normed.value, residual.value, i, state);
+        normed.replace(result.normed);
+        residual.replace(result.residual);
+      }
+
+      const mtpResult = residual.value.fusedAddRmsnorm(
+        normed.value,
+        this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.shared_head.norm.weight`)!,
+        cfg.rmsNormEps, hs, BS
+      );
+      residual.replace(mtpResult.residual);
+      const logits = this.computeLogits(mtpResult.normed, state);
+      return {
+        normed: mtpResult.normed,
+        logits,
+      };
+    }
   }
 }

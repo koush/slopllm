@@ -28,6 +28,7 @@ export interface CommonModelConfig {
   hiddenSize: number;
   intermediateSize: number;
   numHiddenLayers: number;
+  numNextNPredictLayers?: number;
   rmsNormEps: number;
   vocabSize: number;
   tieWordEmbeddings: boolean;
