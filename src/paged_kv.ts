@@ -15,7 +15,82 @@ function longestPrefix(a: number[], b: number[]): number {
   return len;
 }
 
+interface Page {
+  id: number;
+  tokenIds: number[];
+  refs: number;
+}
 
+class Sequence {
+  pages: Page[] = [];
+  kvlen = 0;
+
+  constructor(public pagedKvCache: PagedKVCache) {
+  }
+
+  pushPage(page: Page) {
+    this.pages.push(page);
+    this.kvlen += page.tokenIds.length;
+    page.refs++;
+  }
+
+  popPage() {
+    const page = this.pages.pop()!;
+    this.kvlen -= page.tokenIds.length;
+    page.refs--;
+    if (!page.refs) {
+      this.pagedKvCache.availablePages.push(page.id);
+    }
+  }
+
+  // return the number of full pages that match
+  prefixMatch(inputIds: number[]) {
+    let bestPageIndex = 0;
+    let bestPageLength = -1;
+
+    const checkBest = (pageIndex: number, matchLen: number) => {
+      if (matchLen > bestPageLength) {
+        bestPageIndex = pageIndex;
+        bestPageLength = matchLen;
+      }
+    }
+
+    const tokenIds = this.pages.map(p => p.tokenIds).flat();
+    const prefixLen = longestPrefix(tokenIds, inputIds);
+    const pageIndex = Math.floor(prefixLen / this.pagedKvCache.pageSize);
+    checkBest(pageIndex, prefixLen);
+    return pageIndex;
+  }
+
+  slice(numPages: number) {
+    const newSequence = new Sequence(this.pagedKvCache);
+    for (let i = 0; i < numPages; i++) {
+      const page = this.pages[i];
+      newSequence.pages.push(page);
+      page.refs++;
+      newSequence.kvlen += page.tokenIds.length;
+    }
+    return newSequence;
+  }
+
+  appendTokens(tokenIds: number[]) {
+    let currentPageIndex = Math.floor(this.kvlen / this.pagedKvCache.pageSize);
+    let offset = this.kvlen % this.pagedKvCache.pageSize;
+    while (tokenIds.length) {
+      const tokenId = tokenIds.shift()!;
+      if (!this.pages[currentPageIndex]) {
+        throw new Error(`No page allocated for currentPageIndex ${currentPageIndex}, offset ${offset}`);
+      }
+      this.pages[currentPageIndex].tokenIds.push(tokenId);
+      this.kvlen++;
+
+      offset = (offset + 1) % this.pagedKvCache.pageSize;
+      if (!offset) {
+        currentPageIndex++;
+      }
+    }
+  }
+}
 
 export class PagedKVCache extends WorkspaceBase implements ChatCache {
   readonly nKv: number;
@@ -64,7 +139,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
     this.indices = this.alloc([maxPages * I32], "I32", "indices");
     this.indicesH = this.allocPinned([maxPages], "I32", "indicesH");
-    this.availablePages = Array.from({length: maxPages}, (_, i) => i);
+    this.availablePages = Array.from({ length: maxPages }, (_, i) => i);
     this.seqPages = [];
     this.seqKvLens = [];
     this.cachedTokenIds = [];
@@ -76,7 +151,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     if (batchSize > this.maxBatch) {
       throw new Error(`batchSize ${batchSize} exceeds maxBatch ${this.maxBatch}`);
     }
-    this.availablePages = Array.from({length: this.maxPages}, (_, i) => i);
+    this.availablePages = Array.from({ length: this.maxPages }, (_, i) => i);
     this.seqPages = Array.from({ length: batchSize }, () => []);
     this.seqKvLens = new Array(batchSize).fill(0);
     this.cachedTokenIds = Array.from({ length: batchSize }, () => []);
