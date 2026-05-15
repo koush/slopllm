@@ -78,19 +78,25 @@ describe("Qwen3-0.6B batch tests", () => {
 
     pagedKV.reset(1);
     const tokensFull = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
+    pagedKV.appendTokens(0, fullPrompt);
 
     pagedKV.reset(1);
-    ws.forwardEagerPrefill(model, [PROMPT1], pagedKV);
+    const suffix1 = pagedKV.prefixMatch(0, PROMPT1);
+    assert.deepStrictEqual(suffix1, PROMPT1, "prefixMatch on empty cache should return full input");
+    ws.forwardEagerPrefill(model, [suffix1], pagedKV);
+    pagedKV.appendTokens(0, suffix1);
     pagedKV.updateIndptr(ws);
-    const tokensAppend = ws.forwardEagerPrefill(model, [suffix], pagedKV);
+    const suffix2 = pagedKV.prefixMatch(0, fullPrompt);
+    assert.deepStrictEqual(suffix2, suffix, `prefixMatch should return suffix after PROMPT1, got ${suffix2}`);
+    ws.forwardEagerPrefill(model, [suffix2], pagedKV);
+    pagedKV.appendTokens(0, suffix2);
 
     singleKV.reset(1);
     const singleToken = ws.forwardEagerPrefill(model, [fullPrompt], singleKV)[0];
 
     assert.equal(tokensFull[0], singleToken,
       `Full paged prefill mismatch: paged=${tokensFull[0]}, single=${singleToken}`);
-    assert.equal(tokensAppend[0], tokensFull[0],
-      `Append prefill mismatch: append=${tokensAppend[0]}, full=${tokensFull[0]}`);
+    assert.equal(pagedKV.sequences[0].pages.length, 1, "should have 1 page for 6+4=10 tokens with pageSize=16");
   });
 
   it("batch prefill truncate append", () => {
@@ -100,21 +106,22 @@ describe("Qwen3-0.6B batch tests", () => {
     const fullPrompt = [...PROMPT1, ...suffix];
 
     pagedKV.reset(1);
-    let suffix1 = pagedKV.prefixMatch(0, PROMPT1);
-    ws.forwardEagerPrefill(model, [suffix1], pagedKV);
-    pagedKV.appendTokens(0, suffix1);
+    ws.forwardEagerPrefill(model, [PROMPT1], pagedKV);
+    pagedKV.appendTokens(0, PROMPT1);
     pagedKV.updateIndptr(ws);
-    let suffix2 = pagedKV.prefixMatch(0, fullPrompt);
-    ws.forwardEagerPrefill(model, [suffix2], pagedKV);
-    pagedKV.appendTokens(0, suffix2);
+    let suffixA = pagedKV.prefixMatch(0, fullPrompt);
+    assert.deepStrictEqual(suffixA, suffix, `prefixMatch after PROMPT1 should return suffix, got ${suffixA}`);
+    ws.forwardEagerPrefill(model, [suffixA], pagedKV);
+    pagedKV.appendTokens(0, suffixA);
     pagedKV.updateIndptr(ws);
 
     pagedKV.prefixMatch(0, PROMPT1);
     pagedKV.updateIndptr(ws);
-    const suffix3 = pagedKV.prefixMatch(0, fullPrompt);
+    const suffixB = pagedKV.prefixMatch(0, fullPrompt);
+    assert.deepStrictEqual(suffixB, suffix, `prefixMatch after truncate should return suffix, got ${suffixB}`);
     pagedKV.updateIndptr(ws);
-    const tokensTruncAppend = ws.forwardEagerPrefill(model, [suffix3], pagedKV);
-    pagedKV.appendTokens(0, suffix3);
+    const tokensTruncAppend = ws.forwardEagerPrefill(model, [suffixB], pagedKV);
+    pagedKV.appendTokens(0, suffixB);
 
     using pagedKV2 = makePagedKV(1, 256);
     pagedKV2.reset(1);

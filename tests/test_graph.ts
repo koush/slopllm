@@ -75,9 +75,8 @@ function generateWithGraph(
   const { eosIds, cache, ws, model } = ctx;
   cache.reset(1);
 
-  const suffixIds = cache.prefixMatch(0, inputIds);
-  const firstTokens = ws.forwardEagerPrefill(model, [suffixIds], cache);
-  cache.appendTokens(0, suffixIds);
+  const firstTokens = ws.forwardEagerPrefill(model, [inputIds], cache);
+  cache.appendTokens(0, inputIds);
   let currentToken = firstTokens[0];
   const generated: number[] = [currentToken];
 

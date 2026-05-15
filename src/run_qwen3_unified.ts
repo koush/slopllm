@@ -580,9 +580,8 @@ async function main(): Promise<void> {
     const cache = model.createChatCache(args.maxPages);
     const ws = new ExecutionWorkspace(metaOps, args.maxBatch, args.maxSeqLen);
     const inputIds = [1, 2, 3, 4, 5];
-    const suffixIds = cache.prefixMatch(0, inputIds);
-    const logits = ws.forwardPrefill(model, [suffixIds], cache);
-    cache.appendTokens(0, suffixIds);
+    const logits = ws.forwardPrefill(model, [inputIds], cache);
+    cache.appendTokens(0, inputIds);
     const forwardAllocs = metaOps.totalAllocs;
     const forwardBytes = metaOps.totalBytes;
 
