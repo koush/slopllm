@@ -9,6 +9,8 @@ import { ExecutionWorkspace } from "../src/execution-workspace";
 import { PagedKVCache } from "../src/paged_kv";
 import { generateBatchTokens, generateTokens } from "./test_helper";
 
+import { PAGE_SIZE } from "../src/paged_kv";
+
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const PROMPT1 = [151643, 151644, 151645, 1, 2, 3];
 const PROMPT2 = [151643, 151644, 1, 2, 3, 4, 5];
@@ -16,6 +18,10 @@ const PROMPT_LONG1 = [151643, 151644, 151645, 1, 2, 3, 4, 5, 6, 7];
 const PROMPT_LONG2 = [151643, 151644, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 const PROMPT_GRAPH = [151643, 151644, 151645, 1, 2988, 279, 1716, 364];
 const EOS_TOKEN_IDS = new Set([151645, 151643]);
+
+function makeLongPrompt(length: number, prefix: number[] = [151643, 151644, 151645]): number[] {
+  return [...prefix, ...Array.from({ length: length - prefix.length }, (_, i) => 100 + i)];
+}
 
 describe("Qwen3-0.6B batch tests", () => {
   let glm: GlmOps;
@@ -102,20 +108,21 @@ describe("Qwen3-0.6B batch tests", () => {
   it("batch prefill truncate append", () => {
     using pagedKV = makePagedKV(1, 256);
     using singleKV = makePagedKV(1, 256);
-    const suffix = [4, 5, 6, 7];
-    const fullPrompt = [...PROMPT1, ...suffix];
+    const base = makeLongPrompt(PAGE_SIZE);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
 
     pagedKV.reset(1);
-    ws.forwardEagerPrefill(model, [PROMPT1], pagedKV);
-    pagedKV.appendTokens(0, PROMPT1);
+    ws.forwardEagerPrefill(model, [base], pagedKV);
+    pagedKV.appendTokens(0, base);
     pagedKV.updateIndptr(ws);
     let suffixA = pagedKV.prefixMatch(0, fullPrompt);
-    assert.deepStrictEqual(suffixA, suffix, `prefixMatch after PROMPT1 should return suffix, got ${suffixA}`);
+    assert.deepStrictEqual(suffixA, suffix, `prefixMatch after base should return suffix, got ${suffixA}`);
     ws.forwardEagerPrefill(model, [suffixA], pagedKV);
     pagedKV.appendTokens(0, suffixA);
     pagedKV.updateIndptr(ws);
 
-    pagedKV.prefixMatch(0, PROMPT1);
+    pagedKV.prefixMatch(0, base);
     pagedKV.updateIndptr(ws);
     const suffixB = pagedKV.prefixMatch(0, fullPrompt);
     assert.deepStrictEqual(suffixB, suffix, `prefixMatch after truncate should return suffix, got ${suffixB}`);
@@ -569,5 +576,261 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
       `Qwen3.5 chunked prefill token mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
     assert.equal(chunkedDecode, fullDecode,
       `Qwen3.5 chunked decode token mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
+  });
+});
+
+describe("PagedKVCache prefix matching", () => {
+  let glm: GlmOps;
+  let model: Qwen3Model;
+  let ws: ExecutionWorkspace;
+
+  before(async () => {
+    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    glm = new GlmOps(deviceId);
+    model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO, 4, 4096);
+    ws = new ExecutionWorkspace(glm, 4, 4096);
+  });
+
+  after(() => {
+    ws[Symbol.dispose]();
+    model.free();
+    glm.free();
+  });
+
+  function makePagedKV(maxBatch = 4, maxPages = 128): PagedKVCache {
+    const cfg = model.cfg;
+    return new PagedKVCache(glm, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, maxPages, maxBatch);
+  }
+
+  it("self-match: prefix shorter than pageSize returns suffix", () => {
+    using pagedKV = makePagedKV(1, 256);
+    const prompt = PROMPT1;
+    const suffix = [100, 101, 102, 103];
+    const fullPrompt = [...prompt, ...suffix];
+
+    pagedKV.reset(1);
+    ws.forwardEagerPrefill(model, [prompt], pagedKV);
+    pagedKV.appendTokens(0, prompt);
+    pagedKV.updateIndptr(ws);
+
+    const result = pagedKV.prefixMatch(0, fullPrompt);
+    assert.deepStrictEqual(result, suffix, `self-match short prefix should return suffix, got ${result}`);
+    assert.equal(pagedKV.sequences[0].pages.length, 1, "self-match should keep existing pages");
+  });
+
+  it("self-match: truncate longer cache returns suffix", () => {
+    using pagedKV = makePagedKV(1, 256);
+    const base = makeLongPrompt(PAGE_SIZE);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(1);
+    ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
+    pagedKV.appendTokens(0, fullPrompt);
+    pagedKV.updateIndptr(ws);
+
+    const result = pagedKV.prefixMatch(0, base);
+    assert.deepStrictEqual(result, [], `truncate should return empty suffix, got ${result}`);
+    assert.equal(pagedKV.sequences[0].pages.length, 1, "should keep 1 page after truncate");
+
+    const suffixResult = pagedKV.prefixMatch(0, fullPrompt);
+    assert.deepStrictEqual(suffixResult, suffix, `after truncate, prefixMatch should return suffix, got ${suffixResult}`);
+  });
+
+  it("cross-sequence: share full pages between sequences", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const baseLen = PAGE_SIZE * 2;
+    const base = makeLongPrompt(baseLen);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.appendTokens(0, base);
+    pagedKV.updateIndptr(ws2);
+
+    const result = pagedKV.prefixMatch(1, fullPrompt);
+    assert.deepStrictEqual(result, suffix, `cross-sequence prefix match should return suffix, got ${result}`);
+    assert.equal(pagedKV.sequences[1].pages.length, 2, "seq1 should share 2 pages from seq0");
+    assert.equal(pagedKV.sequences[1].allocLen, baseLen, `seq1 allocLen should be ${baseLen}, got ${pagedKV.sequences[1].allocLen}`);
+
+    for (let i = 0; i < 2; i++) {
+      assert.equal(pagedKV.sequences[0].pages[i].refs, 2, `page ${i} should have ref count 2`);
+    }
+  });
+
+  it("cross-sequence: only full pages shared, partial page not shared", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const baseLen = PAGE_SIZE + 4;
+    const base = makeLongPrompt(baseLen);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.appendTokens(0, base);
+    pagedKV.updateIndptr(ws2);
+
+    const result = pagedKV.prefixMatch(1, fullPrompt);
+    assert.deepStrictEqual(result, fullPrompt.slice(PAGE_SIZE),
+      `should share only full page, got suffix starting with ${result.slice(0, 3)}`);
+    assert.equal(pagedKV.sequences[1].pages.length, 1, "seq1 should share 1 full page from seq0");
+  });
+
+  it("cross-sequence: page extending past match is not shared", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const baseLen = PAGE_SIZE + 4;
+    const base = makeLongPrompt(baseLen);
+    const matchLen = PAGE_SIZE + 2;
+    const matchInput = base.slice(0, matchLen);
+    const suffix = [200, 201];
+    const fullPrompt = [...matchInput, ...suffix];
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.appendTokens(0, base);
+    pagedKV.updateIndptr(ws2);
+
+    const result = pagedKV.prefixMatch(1, fullPrompt);
+    assert.deepStrictEqual(result, fullPrompt.slice(PAGE_SIZE),
+      `page extending past match should not be shared, got suffix starting with ${result.slice(0, 3)}`);
+    assert.equal(pagedKV.sequences[1].pages.length, 1, "seq1 should share only 1 page (page1 extends past match)");
+  });
+
+  it("self-match wins tie when cross-match has same token count", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const shortPrefix = PROMPT1;
+    const longerBase = makeLongPrompt(PAGE_SIZE + 2);
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [shortPrefix, longerBase], pagedKV);
+    pagedKV.appendTokens(0, shortPrefix);
+    pagedKV.appendTokens(1, longerBase);
+    pagedKV.updateIndptr(ws2);
+
+    const fullForSeq0 = [...shortPrefix, 999, 998];
+    const result = pagedKV.prefixMatch(0, fullForSeq0);
+    assert.deepStrictEqual(result, [999, 998],
+      `self-match keeps pages when tied with cross-match, got ${result}`);
+    assert.equal(pagedKV.sequences[0].pages.length, 1, "seq0 should keep its page");
+  });
+
+  it("no pages shared when all matching tokens in partial page", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const base = makeLongPrompt(PAGE_SIZE + 2);
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [[], base], pagedKV);
+    pagedKV.appendTokens(1, base);
+    pagedKV.updateIndptr(ws2);
+
+    const input = base.slice(0, 10);
+    const result = pagedKV.prefixMatch(0, input);
+    assert.deepStrictEqual(result, input,
+      `full input returned when match falls in partial page, got ${result}`);
+    assert.equal(pagedKV.sequences[0].pages.length, 0, "seq0 should be cleared");
+  });
+
+  it("cross-sequence sharing produces correct prefill output", () => {
+    using pagedKV = makePagedKV(1, 256);
+    using singleKV = makePagedKV(1, 256);
+    const baseLen = PAGE_SIZE * 2;
+    const base = makeLongPrompt(baseLen);
+    const suffix = makeLongPrompt(8, [200]);
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(1);
+    ws.forwardEagerPrefill(model, [base], pagedKV);
+    pagedKV.appendTokens(0, base);
+    pagedKV.updateIndptr(ws);
+
+    const sharedSuffix = pagedKV.prefixMatch(0, fullPrompt);
+    ws.forwardEagerPrefill(model, [sharedSuffix], pagedKV);
+    pagedKV.appendTokens(0, sharedSuffix);
+
+    singleKV.reset(1);
+    const singleTokens = ws.forwardEagerPrefill(model, [fullPrompt], singleKV);
+
+    assert.equal(pagedKV.sequences[0].pages.length, singleKV.sequences[0].pages.length,
+      "page count should match");
+  });
+
+  it("self-match: full cache match continues from partial page", () => {
+    using pagedKV = makePagedKV(1, 256);
+    using singleKV = makePagedKV(1, 256);
+    const prompt = PROMPT1;
+    const suffix = [100, 101, 102, 103];
+    const fullPrompt = [...prompt, ...suffix];
+
+    pagedKV.reset(1);
+    ws.forwardEagerPrefill(model, [prompt], pagedKV);
+    pagedKV.appendTokens(0, prompt);
+    pagedKV.updateIndptr(ws);
+
+    const pagesBefore = pagedKV.sequences[0].pages.length;
+    const result = pagedKV.prefixMatch(0, fullPrompt);
+    assert.deepStrictEqual(result, suffix, `full cache match should return suffix, got ${result}`);
+    assert.equal(pagedKV.sequences[0].pages.length, pagesBefore, "no pages should be popped on full match");
+
+    ws.forwardEagerPrefill(model, [suffix], pagedKV);
+    pagedKV.appendTokens(0, suffix);
+
+    singleKV.reset(1);
+    ws.forwardEagerPrefill(model, [fullPrompt], singleKV);
+
+    assert.equal(pagedKV.sequences[0].tokenCount(), fullPrompt.length, "tokenCount should equal full prompt length");
+  });
+
+  it("self-match: full cache match at page boundary", () => {
+    using pagedKV = makePagedKV(1, 256);
+    const base = makeLongPrompt(PAGE_SIZE * 2);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(1);
+    ws.forwardEagerPrefill(model, [base], pagedKV);
+    pagedKV.appendTokens(0, base);
+    pagedKV.updateIndptr(ws);
+
+    const pagesBefore = pagedKV.sequences[0].pages.length;
+    const result = pagedKV.prefixMatch(0, fullPrompt);
+    assert.deepStrictEqual(result, suffix, `full cache match at boundary should return suffix, got ${result}`);
+    assert.equal(pagedKV.sequences[0].pages.length, pagesBefore, "no pages should be popped on full match");
+  });
+
+  it("empty cache returns full input", () => {
+    using pagedKV = makePagedKV(1, 256);
+    pagedKV.reset(1);
+    const result = pagedKV.prefixMatch(0, PROMPT1);
+    assert.deepStrictEqual(result, PROMPT1, "empty cache should return full input");
+  });
+
+  it("truncate and re-extend produces correct decode", () => {
+    using pagedKV = makePagedKV(1, 256);
+    const base = makeLongPrompt(PAGE_SIZE);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(1);
+    const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
+    pagedKV.appendTokens(0, fullPrompt);
+    pagedKV.updateIndptr(ws);
+
+    pagedKV.prefixMatch(0, base);
+    pagedKV.updateIndptr(ws);
+
+    const suffixResult = pagedKV.prefixMatch(0, fullPrompt);
+    assert.deepStrictEqual(suffixResult, suffix, `after truncate, prefixMatch should return suffix`);
+    ws.forwardEagerPrefill(model, [suffixResult], pagedKV);
+    pagedKV.appendTokens(0, suffixResult);
+    pagedKV.updateIndptr(ws);
+
+    const decodeToken = ws.forwardEagerDecode(model, [fullTokens[0]], pagedKV)[0];
+    assert.equal(typeof decodeToken, "number", "decode should produce a valid token");
   });
 });

@@ -15,12 +15,17 @@ function longestPrefix(a: number[], b: number[]): number {
   return len;
 }
 
+// Pages are write-only until filled and ref-counted for cross-sequence sharing.
+// Only full pages (pageSize tokens) can be shared — a partial last page must never
+// be shared because the receiving sequence would need to write suffix tokens into it.
 interface Page {
   id: number;
   tokenIds: number[];
   refs: number;
 }
 
+// Ordered list of pages with ref-counted sharing. Pages are filled sequentially
+// (all but the last are full), and tokenIds must never be mutated after writing.
 class Sequence {
   pages: Page[] = [];
   allocLen = 0;
@@ -49,12 +54,19 @@ class Sequence {
     }
   }
 
+  // Returns the number of matching tokens at the start of this sequence and inputIds.
   prefixMatch(inputIds: number[]): number {
     const tokenIds = this.pages.map(p => p.tokenIds).flat();
-    const prefixLen = longestPrefix(tokenIds, inputIds);
-    return Math.floor(prefixLen / this.pagedKvCache.pageSize);
+    return longestPrefix(tokenIds, inputIds);
   }
 
+  tokenCount(): number {
+    let count = 0;
+    for (const page of this.pages) count += page.tokenIds.length;
+    return count;
+  }
+
+  // Shares the first numPages pages with a new sequence (increments ref counts).
   slice(numPages: number): Sequence {
     const newSequence = new Sequence(this.pagedKvCache);
     for (let i = 0; i < numPages; i++) {
@@ -143,32 +155,52 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.pagesDirtyDevice = true;
   }
 
+  // Finds the best prefix match across all sequences and returns the unmatched suffix.
+  // Only full pages are kept/shared — the partial last page is never shared because
+  // the receiving sequence would write into it. For self-match, pages beyond the
+  // match are popped; for cross-match, full pages are sliced (ref-counted) into
+  // the target sequence. If the entire cache matches (self, no truncation needed),
+  // returns the suffix immediately without touching pages.
   prefixMatch(seqIdx: number, inputIds: number[]): number[] {
     while (this.sequences.length <= seqIdx) {
       this.sequences.push(new Sequence(this));
     }
 
     let bestSeqIdx = -1;
-    let bestMatchPages = 0;
+    let bestMatchTokens = 0;
     for (let i = 0; i < this.sequences.length; i++) {
       if (this.sequences[i].pages.length === 0) continue;
-      const matchPages = this.sequences[i].prefixMatch(inputIds);
-      if (matchPages > bestMatchPages) {
-        bestMatchPages = matchPages;
+      const matchTokens = this.sequences[i].prefixMatch(inputIds);
+      if (matchTokens > bestMatchTokens) {
+        bestMatchTokens = matchTokens;
         bestSeqIdx = i;
       }
     }
 
-    if (bestSeqIdx >= 0 && bestMatchPages > 0) {
-      const bestSeq = this.sequences[bestSeqIdx];
-      let matchTokens = 0;
-      for (let i = 0; i < bestMatchPages; i++) {
-        matchTokens += bestSeq.pages[i].tokenIds.length;
+    if (bestSeqIdx === seqIdx && bestMatchTokens === this.sequences[seqIdx].tokenCount()) {
+      return inputIds.slice(bestMatchTokens);
+    }
+
+    if (bestSeqIdx < 0 || bestMatchTokens === 0) {
+      this.sequences[seqIdx].clear();
+      return inputIds.slice();
+    }
+
+    const keepPages = Math.floor(bestMatchTokens / this.pageSize);
+    const cumulativeTokens = keepPages * this.pageSize;
+
+    if (bestSeqIdx === seqIdx) {
+      while (this.sequences[seqIdx].pages.length > keepPages) {
+        this.sequences[seqIdx].popPage();
       }
-      const newSeq = bestSeq.slice(bestMatchPages);
+      return inputIds.slice(this.sequences[seqIdx].tokenCount());
+    }
+
+    if (keepPages > 0) {
+      const newSeq = this.sequences[bestSeqIdx].slice(keepPages);
       this.sequences[seqIdx].clear();
       this.sequences[seqIdx] = newSeq;
-      return inputIds.slice(matchTokens);
+      return inputIds.slice(cumulativeTokens);
     }
 
     this.sequences[seqIdx].clear();
