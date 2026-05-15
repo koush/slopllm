@@ -18,9 +18,6 @@ model's quantization_config.ignore list.
 """
 
 import json
-import math
-import os
-import sys
 from pathlib import Path
 
 import torch
@@ -174,6 +171,28 @@ def make_moe_mlp_weights(cfg, layer_idx, device):
     return weights
 
 
+def make_mtp_weights(cfg, layer_idx, device):
+    """Generate MTP-specific weights for a multi-token prediction layer.
+
+    The MTP layer is a full MoE decoder layer plus:
+    - eh_proj: Linear(hidden_size*2, hidden_size) — projects concatenated (embed + hidden)
+    - enorm: RMSNorm(hidden_size) — norm on embedded token before projection
+    - hnorm: RMSNorm(hidden_size) — norm on hidden state before projection
+    - shared_head.norm: RMSNorm(hidden_size) — norm before shared LM head
+    """
+    hidden = cfg["hidden_size"]
+    pfx = f"model.layers.{layer_idx}"
+    weights = {}
+
+    # MTP-specific weights (BF16)
+    weights[f"{pfx}.eh_proj.weight"] = torch.randn(hidden, 2 * hidden, dtype=torch.bfloat16, device=device)
+    weights[f"{pfx}.enorm.weight"] = torch.randn(hidden, dtype=torch.bfloat16, device=device)
+    weights[f"{pfx}.hnorm.weight"] = torch.randn(hidden, dtype=torch.bfloat16, device=device)
+    weights[f"{pfx}.shared_head.norm.weight"] = torch.randn(hidden, dtype=torch.bfloat16, device=device)
+
+    return weights
+
+
 def make_layer_weights(cfg, layer_idx, device):
     hidden = cfg["hidden_size"]
     weights = {}
@@ -188,6 +207,11 @@ def make_layer_weights(cfg, layer_idx, device):
         weights.update(make_dense_mlp_weights(cfg, layer_idx, device))
     else:
         weights.update(make_moe_mlp_weights(cfg, layer_idx, device))
+
+    # MTP layer gets additional MTP-specific weights
+    num_nextn = cfg.get("num_nextn_predict_layers", 0)
+    if num_nextn > 0 and layer_idx >= cfg["num_hidden_layers"]:
+        weights.update(make_mtp_weights(cfg, layer_idx, device))
 
     return weights
 
@@ -228,6 +252,7 @@ def build_quantization_config(cfg):
     """Build quantization_config matching the full model's format."""
     mlp_types = cfg.get("mlp_layer_types", ["dense"] * min(3, cfg["num_hidden_layers"]) + ["sparse"] * (cfg["num_hidden_layers"] - 3))
     num_layers = cfg["num_hidden_layers"]
+    num_nextn = cfg.get("num_nextn_predict_layers", 0)
 
     ignore = ["lm_head"]
 
@@ -239,6 +264,18 @@ def build_quantization_config(cfg):
     for i, mlp_type in enumerate(mlp_types):
         if mlp_type == "dense":
             ignore.append(f"model.layers.{i}.mlp*")
+
+    # MTP layer weights are entirely ignored (kept BF16)
+    for i in range(num_nextn):
+        mtp_idx = num_layers + i
+        ignore.append(f"model.layers.{mtp_idx}.eh_proj*")
+        ignore.append(f"model.layers.{mtp_idx}.enorm*")
+        ignore.append(f"model.layers.{mtp_idx}.hnorm*")
+        ignore.append(f"model.layers.{mtp_idx}.input_layernorm*")
+        ignore.append(f"model.layers.{mtp_idx}.mlp*")
+        ignore.append(f"model.layers.{mtp_idx}.post_attention_layernorm*")
+        ignore.append(f"model.layers.{mtp_idx}.self_attn*")
+        ignore.append(f"model.layers.{mtp_idx}.shared_head*")
 
     return {
         "config_groups": {
@@ -279,12 +316,20 @@ def generate(cfg, seed=42, device="cpu"):
     for i in range(num_layers):
         bf16_all.update(make_layer_weights(cfg, i, device))
 
+    # MTP layers (layer indices num_layers .. num_layers + num_nextn_predict_layers - 1)
+    num_nextn = cfg.get("num_nextn_predict_layers", 0)
+    for i in range(num_nextn):
+        mtp_idx = num_layers + i
+        bf16_all.update(make_layer_weights(cfg, mtp_idx, device))
+
     bf16_dir = DIR / "glm51_small_bf16"
     bf16_dir.mkdir(exist_ok=True)
 
     # Replace MoE MLP weights with dequantized FP4 values so BF16 and NVFP4
     # models use numerically identical weights (differences come only from
     # kernel arithmetic: BF16 tensor cores vs FP32 accumulation).
+    # Note: MTP layer MoE MLP weights are NOT quantized (BF16 in NVFP4 too),
+    # so we skip them here.
     mlp_types = cfg.get("mlp_layer_types", ["dense"] * min(3, cfg["num_hidden_layers"]) + ["sparse"] * (cfg["num_hidden_layers"] - 3))
     first_k = sum(1 for t in mlp_types if t == "dense")
 
@@ -314,14 +359,19 @@ def generate(cfg, seed=42, device="cpu"):
     # Build NVFP4 weights:
     # 1. Copy all non-MLP BF16 weights as-is
     # 2. For dense MLP layers: copy BF16 weights as-is (not quantized)
-    # 3. For MoE MLP layers: replace with NVFP4 quantized weights
+    # 3. For MoE MLP layers (non-MTP): replace with NVFP4 quantized weights
+    # 4. MTP layer weights stay BF16 entirely (not quantized)
     mlp_types = cfg.get("mlp_layer_types", ["dense"] * min(3, cfg["num_hidden_layers"]) + ["sparse"] * (cfg["num_hidden_layers"] - 3))
     first_k = sum(1 for t in mlp_types if t == "dense")
+
+    # MTP layer indices: num_layers .. num_layers + num_nextn_predict_layers - 1
+    num_nextn = cfg.get("num_nextn_predict_layers", 0)
+    mtp_layer_indices = set(range(num_layers, num_layers + num_nextn))
 
     nvfp4_all = {}
     for name, tensor in bf16_all.items():
         # Skip MoE MLP .weight keys (they'll be replaced with NVFP4 versions)
-        # MoE layers: layer_idx >= first_k
+        # Only non-MTP MoE layers: layer_idx in [first_k, num_layers)
         is_moe_mlp_weight = False
         for li in range(first_k, num_layers):
             pfx = f"model.layers.{li}.mlp."
@@ -342,7 +392,7 @@ def generate(cfg, seed=42, device="cpu"):
             continue
         nvfp4_all[name] = tensor
 
-    # Add NVFP4 quantized weights for MoE layers
+    # Add NVFP4 quantized weights for non-MTP MoE layers only
     for i in range(num_layers):
         nvfp4_all.update(quantize_mlp_nvfp4(bf16_all, cfg, i, device))
 
