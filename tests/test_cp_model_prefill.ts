@@ -1,13 +1,12 @@
-import { describe, it, before, after } from "node:test";
-import assert from "node:assert/strict";
 import path from "node:path";
-import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
-import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
+import { after, before, describe, it } from "node:test";
+import { ExecutionState, ExecutionWorkspace } from "../src/execution-workspace";
 import { Glm51Model } from "../src/glm51_model";
-import { ExecutionState, ExecutionWorkspace, PagedKVCache } from "../src/paged_kv";
+import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
+import { PagedKVCache } from "../src/paged_kv";
+import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
 import { Tensor } from "../src/tensor";
 import { UsingHolder } from "../src/using-holder";
-import { DeviceOps } from "../src/device_ops";
 
 const SMALL_MODEL_DIR = path.resolve(
   __dirname,

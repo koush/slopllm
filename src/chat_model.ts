@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DeviceOps } from "./device_ops";
-import { f32ToBf16Bytes, mmapOpen, mmapClose } from "./glm_ops";
-import { PagedKVCache, ExecutionState } from "./paged_kv";
+import { ExecutionState } from "./execution-workspace";
+import { f32ToBf16Bytes, mmapClose, mmapOpen } from "./glm_ops";
+import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";

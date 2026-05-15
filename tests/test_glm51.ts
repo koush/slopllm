@@ -1,11 +1,11 @@
-import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { GlmOps } from "../src/glm_ops";
+import { after, before, describe, it } from "node:test";
+import type { ChatCache, ChatModel } from "../src/chat_model";
+import { ExecutionWorkspace } from "../src/execution-workspace";
 import { Glm51Model } from "../src/glm51_model";
-import { ExecutionWorkspace, PagedKVCache } from "../src/paged_kv";
+import { GlmOps } from "../src/glm_ops";
 import { Tensor } from "../src/tensor";
-import type { ChatModel, ChatCache } from "../src/chat_model";
 
 const SMALL_MODEL_DIR = path.resolve(
   __dirname,

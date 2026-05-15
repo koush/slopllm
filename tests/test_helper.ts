@@ -1,5 +1,5 @@
-import { ChatModel, ChatCache, SamplingParams } from "../src/chat_model";
-import { ExecutionWorkspace } from "../src/paged_kv";
+import { ChatCache, ChatModel, SamplingParams } from "../src/chat_model";
+import { ExecutionWorkspace } from "../src/execution-workspace";
 
 export function generateBatchTokens(
   model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache,
