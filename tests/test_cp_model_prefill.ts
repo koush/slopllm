@@ -112,11 +112,13 @@ describe("CP vs non-CP model prefill", () => {
     const cacheRef = modelRef.createChatCache(MAX_PAGES);
     const cacheCp = modelCp.createChatCache(MAX_PAGES);
     cacheRef.reset(1); cacheCp.reset(1);
-    cacheRef.appendTokens(0, cacheRef.prefixMatch(0, INPUT_IDS));
-    cacheCp.appendTokens(0, cacheCp.prefixMatch(0, INPUT_IDS));
+    const suffixRef = cacheRef.prefixMatch(0, INPUT_IDS);
+    const suffixCp = cacheCp.prefixMatch(0, INPUT_IDS);
 
-    wsRef.forwardEagerPrefill(modelRef, [INPUT_IDS], cacheRef);
-    wsCp.forwardEagerPrefill(modelCp, [INPUT_IDS], cacheCp);
+    wsRef.forwardEagerPrefill(modelRef, [suffixRef], cacheRef);
+    wsCp.forwardEagerPrefill(modelCp, [suffixCp], cacheCp);
+    cacheRef.appendTokens(0, suffixRef);
+    cacheCp.appendTokens(0, suffixCp);
 
     const pagedKVRef = cacheRef.getPagedKV() as PagedKVCache;
     const pagedKVCp = cacheCp.getPagedKV() as PagedKVCache;
@@ -210,11 +212,13 @@ describe("CP vs non-CP model prefill", () => {
     const cacheRef = modelRef.createChatCache(MAX_PAGES);
     const cacheCp = modelCp.createChatCache(MAX_PAGES);
     cacheRef.reset(1); cacheCp.reset(1);
-    cacheRef.appendTokens(0, cacheRef.prefixMatch(0, INPUT_IDS));
-    cacheCp.appendTokens(0, cacheCp.prefixMatch(0, INPUT_IDS));
+    const suffixRefPipe = cacheRef.prefixMatch(0, INPUT_IDS);
+    const suffixCpPipe = cacheCp.prefixMatch(0, INPUT_IDS);
 
-    wsRef.forwardEagerPrefill(modelRef, [INPUT_IDS], cacheRef);
-    wsCp.forwardEagerPrefill(modelCp, [INPUT_IDS], cacheCp);
+    wsRef.forwardEagerPrefill(modelRef, [suffixRefPipe], cacheRef);
+    wsCp.forwardEagerPrefill(modelCp, [suffixCpPipe], cacheCp);
+    cacheRef.appendTokens(0, suffixRefPipe);
+    cacheCp.appendTokens(0, suffixCpPipe);
 
     (modelRef as any).forward = refRestore.origForward;
     (modelRef as any).mlaLayer = refRestore.origMlaLayer;
@@ -376,11 +380,13 @@ describe("CP vs non-CP model prefill", () => {
     const cacheRef = modelRef.createChatCache(MAX_PAGES);
     const cacheCp = modelCp.createChatCache(MAX_PAGES);
     cacheRef.reset(1); cacheCp.reset(1);
-    cacheRef.appendTokens(0, cacheRef.prefixMatch(0, INPUT_IDS));
-    cacheCp.appendTokens(0, cacheCp.prefixMatch(0, INPUT_IDS));
+    const suffixRefLayer = cacheRef.prefixMatch(0, INPUT_IDS);
+    const suffixCpLayer = cacheCp.prefixMatch(0, INPUT_IDS);
 
-    wsRef.forwardEagerPrefill(modelRef, [INPUT_IDS], cacheRef);
-    wsCp.forwardEagerPrefill(modelCp, [INPUT_IDS], cacheCp);
+    wsRef.forwardEagerPrefill(modelRef, [suffixRefLayer], cacheRef);
+    wsCp.forwardEagerPrefill(modelCp, [suffixCpLayer], cacheCp);
+    cacheRef.appendTokens(0, suffixRefLayer);
+    cacheCp.appendTokens(0, suffixCpLayer);
 
     (modelRef as any).forward = refRestore.origForward;
     (modelRef as any).mlaLayer = refRestore.origMlaLayer;

@@ -35,7 +35,7 @@ class Qwen35ChatCache implements ChatCache {
   }
 
   prefixMatch(seqIdx: number, inputIds: number[]): number[] {
-    const batchSize = Math.max(this.pagedKV.seqPages.length, 1);
+    const batchSize = Math.max(this.pagedKV.sequences.length, 1);
     this.pagedKV.reset(batchSize);
     this.gdnState.reset();
     return inputIds.slice();

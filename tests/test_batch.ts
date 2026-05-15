@@ -100,14 +100,21 @@ describe("Qwen3-0.6B batch tests", () => {
     const fullPrompt = [...PROMPT1, ...suffix];
 
     pagedKV.reset(1);
-    ws.forwardEagerPrefill(model, [PROMPT1], pagedKV);
+    let suffix1 = pagedKV.prefixMatch(0, PROMPT1);
+    ws.forwardEagerPrefill(model, [suffix1], pagedKV);
+    pagedKV.appendTokens(0, suffix1);
     pagedKV.updateIndptr(ws);
-    ws.forwardEagerPrefill(model, [suffix], pagedKV);
+    let suffix2 = pagedKV.prefixMatch(0, fullPrompt);
+    ws.forwardEagerPrefill(model, [suffix2], pagedKV);
+    pagedKV.appendTokens(0, suffix2);
     pagedKV.updateIndptr(ws);
 
-    pagedKV.truncate(0, PROMPT1.length);
+    pagedKV.prefixMatch(0, PROMPT1);
     pagedKV.updateIndptr(ws);
-    const tokensTruncAppend = ws.forwardEagerPrefill(model, [suffix], pagedKV);
+    const suffix3 = pagedKV.prefixMatch(0, fullPrompt);
+    pagedKV.updateIndptr(ws);
+    const tokensTruncAppend = ws.forwardEagerPrefill(model, [suffix3], pagedKV);
+    pagedKV.appendTokens(0, suffix3);
 
     using pagedKV2 = makePagedKV(1, 256);
     pagedKV2.reset(1);

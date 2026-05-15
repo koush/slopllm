@@ -75,10 +75,11 @@ function generateWithGraph(
   const { eosIds, cache, ws, model } = ctx;
   cache.reset(1);
 
-  const firstTokens = ws.forwardEagerPrefill(model, [inputIds], cache);
+  const suffixIds = cache.prefixMatch(0, inputIds);
+  const firstTokens = ws.forwardEagerPrefill(model, [suffixIds], cache);
+  cache.appendTokens(0, suffixIds);
   let currentToken = firstTokens[0];
   const generated: number[] = [currentToken];
-  cache.appendTokens(0, [currentToken]);
 
   let graphExec: number | null = null;
   let warmupRemaining = 3;

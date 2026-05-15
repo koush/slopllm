@@ -107,7 +107,7 @@ export class ExecutionState {
     const pagedKV = this.cache.getPagedKV();
     this.ws.positionIdsH.withPinnedBuffer(buf => {
       for (let seqIdx = 0; seqIdx < this.batchSize; seqIdx++) {
-        buf.writeInt32LE(pagedKV.seqKvLens[seqIdx] - 1, seqIdx * I32);
+        buf.writeInt32LE(pagedKV.sequences[seqIdx].allocLen - 1, seqIdx * I32);
       }
     });
     this.ws.positionIds.memcpy(this.ws.positionIdsH, this.batchSize * I32, MemcpyKind.HostToDevice);
@@ -318,8 +318,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const seqLens = new Array(batchSize).fill(1) as number[];
     const totalTokens = batchSize;
 
-    if (pagedKV.seqPages.length !== batchSize) {
-      throw new Error(`planDecode: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+    if (pagedKV.sequences.length !== batchSize) {
+      throw new Error(`planDecode: pagedKV has ${pagedKV.sequences.length} sequences, expected ${batchSize}`);
     }
 
     let decodePagesNeeded = 0;
@@ -355,14 +355,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
           this.indptrH, this.lastPageLenH,
           batchSize, model.cfg.numAttentionHeads, pagedKV.pageSize, enableCudaGraph,
           model.cfg.kvLoraRank!, model.cfg.qkRopeHeadDim!, pagedKV.contextParallel,
-          undefined, undefined, pagedKV.seqKvLens
+          undefined, undefined, pagedKV.sequences.map(s => s.allocLen)
         );
       }
       pagedKV.pagesDirtyHost = false;
     }
 
     if (pagedKV.pagesDirtyDevice) {
-      const usedPages = pagedKV.seqPages.reduce((sum, sp) => sum + sp.length, 0);
+      const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.pages.length, 0);
       pagedKV.indices.memcpy(pagedKV.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
       this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
       pagedKV.pagesDirtyDevice = false;
@@ -380,11 +380,11 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const pageSize = pagedKV.pageSize;
     const totalTokens = seqLens.reduce((a, b) => a + b, 0);
 
-    if (pagedKV.seqPages.length !== batchSize) {
-      throw new Error(`planPrefill: pagedKV has ${pagedKV.seqPages.length} sequences, expected ${batchSize}`);
+    if (pagedKV.sequences.length !== batchSize) {
+      throw new Error(`planPrefill: pagedKV has ${pagedKV.sequences.length} sequences, expected ${batchSize}`);
     }
 
-    const startPos = pagedKV.seqKvLens.slice();
+    const startPos = pagedKV.sequences.map(s => s.allocLen);
 
     model.prefillBatchPlanHook(batchSize, seqLens, totalTokens, startPos, cache);
 
@@ -422,7 +422,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
     this.kvLenH.withPinnedBuffer(buf => {
       for (let i = 0; i < batchSize; i++) {
-        buf.writeInt32LE(pagedKV.seqKvLens[i], i * I32);
+        buf.writeInt32LE(pagedKV.sequences[i].allocLen, i * I32);
       }
     });
 
@@ -443,7 +443,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         this.qoIndptrH, this.indptrH,
         this.kvLenH, this.lastPageLenH,
         batchSize, nHeads, cfg.kvLoraRank!, true,
-        pagedKV.pageSize, pagedKV.seqKvLens,
+        pagedKV.pageSize, pagedKV.sequences.map(s => s.allocLen),
         pagedKV.contextParallel
       );
       this.mlaBatchIndicesH.withPinnedBuffer(buf => {
@@ -470,12 +470,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.slotMappingH.withPinnedBuffer(buf => {
         let slotOff = 0;
         for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-          const pages = pagedKV.seqPages[seqIdx];
+          const pages = pagedKV.sequences[seqIdx].pages;
           for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
             const kvPos = startPos[seqIdx] + pos;
             const pageIdxInSeq = Math.floor(kvPos / pagedKV.pageSize);
             const offsetInPage = kvPos % pagedKV.pageSize;
-            const absPage = pages[pageIdxInSeq];
+            const absPage = pages[pageIdxInSeq].id;
             buf.writeInt32LE(absPage * pagedKV.pageSize + offsetInPage, slotOff * I32);
             slotOff++;
           }
@@ -485,7 +485,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     }
 
-    const usedPages = pagedKV.seqPages.reduce((sum, sp) => sum + sp.length, 0);
+    const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.pages.length, 0);
     pagedKV.indices.memcpy(pagedKV.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
     this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);

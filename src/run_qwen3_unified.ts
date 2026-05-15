@@ -185,7 +185,6 @@ export function* generateStream(
   timing?: DecodeTiming,
 ): Generator<number> {
   const suffixIds = cache.prefixMatch(0, inputIds);
-  cache.appendTokens(0, suffixIds);
 
   using sampleWorkspace = new WorkspaceBase(glm);
   const greedy = !sampling;
@@ -256,6 +255,7 @@ export function* generateStream(
     doSample(firstTokens);
     readSample();
   }
+  cache.appendTokens(0, suffixIds);
 
   let capturing = false;
 
@@ -580,8 +580,9 @@ async function main(): Promise<void> {
     const cache = model.createChatCache(args.maxPages);
     const ws = new ExecutionWorkspace(metaOps, args.maxBatch, args.maxSeqLen);
     const inputIds = [1, 2, 3, 4, 5];
-    cache.appendTokens(0, cache.prefixMatch(0, inputIds));
-    const logits = ws.forwardPrefill(model, [inputIds], cache);
+    const suffixIds = cache.prefixMatch(0, inputIds);
+    const logits = ws.forwardPrefill(model, [suffixIds], cache);
+    cache.appendTokens(0, suffixIds);
     const forwardAllocs = metaOps.totalAllocs;
     const forwardBytes = metaOps.totalBytes;
 
