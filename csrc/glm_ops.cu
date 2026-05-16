@@ -1907,12 +1907,13 @@ __global__ void __launch_bounds__(128) decode_step_kernel(
     uint32_t page_size,
     uint32_t batch_size,
     uint32_t cp_world_size,
-    uint32_t cp_rank
+    uint32_t cp_rank,
+    int32_t steps
 ) {
     uint32_t seq = blockIdx.x * blockDim.x + threadIdx.x;
     if (seq >= batch_size) return;
 
-    int32_t pos = position_ids[seq] + 1;
+    int32_t pos = position_ids[seq] + steps;
     position_ids[seq] = pos;
 
     if (cp_world_size > 1) {
@@ -1958,14 +1959,15 @@ void glm_decode_step(GlmCtx* ctx,
                       uint32_t page_size,
                       uint32_t batch_size,
                       uint32_t cp_world_size,
-                      uint32_t cp_rank) {
+                      uint32_t cp_rank,
+                      int32_t steps) {
     cudaSetDevice(ctx->device_id);
     dim3 grid((batch_size + 127) / 128);
     dim3 block(128);
     decode_step_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
         position_ids, last_page_len, slot_mapping,
         indptr, indices, page_size, batch_size,
-        cp_world_size, cp_rank);
+        cp_world_size, cp_rank, steps);
 }
 
 // ---------------------------------------------------------------------------
@@ -1982,12 +1984,13 @@ __global__ void __launch_bounds__(128) mla_decode_step_kernel(
     uint32_t page_size,
     uint32_t batch_size,
     uint32_t cp_world_size,
-    uint32_t cp_rank
+    uint32_t cp_rank,
+    int32_t steps
 ) {
     uint32_t seq = blockIdx.x * blockDim.x + threadIdx.x;
     if (seq >= batch_size) return;
 
-    int32_t pos = position_ids[seq] + 1;
+    int32_t pos = position_ids[seq] + steps;
     position_ids[seq] = pos;
 
     if (cp_world_size > 1) {
@@ -2007,20 +2010,21 @@ __global__ void __launch_bounds__(128) mla_decode_step_kernel(
 }
 
 void glm_mla_decode_step(GlmCtx* ctx,
-                          int32_t* position_ids,
-                          int32_t* last_page_len,
-                          const int32_t* indptr,
-                          uint32_t page_size,
-                          uint32_t batch_size,
-                          uint32_t cp_world_size,
-                          uint32_t cp_rank) {
+                           int32_t* position_ids,
+                           int32_t* last_page_len,
+                           const int32_t* indptr,
+                           uint32_t page_size,
+                           uint32_t batch_size,
+                           uint32_t cp_world_size,
+                           uint32_t cp_rank,
+                           int32_t steps) {
     cudaSetDevice(ctx->device_id);
     dim3 grid((batch_size + 127) / 128);
     dim3 block(128);
     mla_decode_step_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
         position_ids, last_page_len, indptr,
         page_size, batch_size,
-        cp_world_size, cp_rank);
+        cp_world_size, cp_rank, steps);
 }
 
 // ---------------------------------------------------------------------------

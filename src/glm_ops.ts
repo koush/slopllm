@@ -62,8 +62,8 @@ interface NativeAddon {
   max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
-  decodeStep(ctx: number, positionIds: number, lastPageLen: number, slotMapping: number, indptr: number, indices: number, pageSize: number, batchSize: number, cpWorldSize: number, cpRank: number): void;
-  mlaDecodeStep(ctx: number, positionIds: number, lastPageLen: number, indptr: number, pageSize: number, batchSize: number, cpWorldSize: number, cpRank: number): void;
+  decodeStep(ctx: number, positionIds: number, lastPageLen: number, slotMapping: number, indptr: number, indices: number, pageSize: number, batchSize: number, cpWorldSize: number, cpRank: number, steps: number): void;
+  mlaDecodeStep(ctx: number, positionIds: number, lastPageLen: number, indptr: number, pageSize: number, batchSize: number, cpWorldSize: number, cpRank: number, steps: number): void;
   synchronize(ctx: number): void;
   synchronizeStream(ctx: number, streamIdx: number): void;
   setStream(ctx: number, streamIdx: number): void;
@@ -667,12 +667,12 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().kvCacheWrite(this.ctx, ptr(srcK), ptr(srcV), ptr(dstK), ptr(dstV), ptr(slotMapping), batchSize, nKv, hd, pageSize, srcKTokenStride, srcKHeadStride, srcVTokenStride, srcVHeadStride);
   }
 
-  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number): void {
-    getNativeAddon().decodeStep(this.ctx, ptr(positionIds), ptr(lastPageLen), ptr(slotMapping), ptr(indptr), ptr(indices), pageSize, batchSize, 1, 0);
+  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number, steps = 1, _contextParallel?: boolean, cpWorldSize = 1, cpRank = 0): void {
+    getNativeAddon().decodeStep(this.ctx, ptr(positionIds), ptr(lastPageLen), ptr(slotMapping), ptr(indptr), ptr(indices), pageSize, batchSize, cpWorldSize, cpRank, steps);
   }
 
-  mlaDecodeStep(positionIds: Tensor, lastPageLen: Tensor, indptr: Tensor, pageSize: number, batchSize: number, _contextParallel?: boolean, cpWorldSize = 1, cpRank = 0): void {
-    getNativeAddon().mlaDecodeStep(this.ctx, ptr(positionIds), ptr(lastPageLen), ptr(indptr), pageSize, batchSize, cpWorldSize, cpRank);
+  mlaDecodeStep(positionIds: Tensor, lastPageLen: Tensor, indptr: Tensor, pageSize: number, batchSize: number, _contextParallel?: boolean, cpWorldSize = 1, cpRank = 0, steps = 1): void {
+    getNativeAddon().mlaDecodeStep(this.ctx, ptr(positionIds), ptr(lastPageLen), ptr(indptr), pageSize, batchSize, cpWorldSize, cpRank, steps);
   }
 
   hostPointerToBuffer(ptr: number, size: number): Buffer {

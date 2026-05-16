@@ -217,21 +217,23 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
   }
 
-  decodeStep(state: ExecutionState, model: ChatModel): void {
+  decodeStep(state: ExecutionState, model: ChatModel, steps = 1): void {
     const pagedKV = state.cache.getPagedKV();
     const batchSize = state.batchSize;
     if (!model.cfg.kvLoraRank) {
       this.glm.decodeStep(
         this.positionIds, this.lastPageLen, this.slotMapping,
         this.indptrD, pagedKV.indices,
-        pagedKV.pageSize, batchSize
+        pagedKV.pageSize, batchSize, steps,
+        pagedKV.contextParallel
       );
     } else {
       this.glm.mlaDecodeStep(
         this.positionIds, this.lastPageLen,
         this.indptrD,
         pagedKV.pageSize, batchSize,
-        pagedKV.contextParallel
+        pagedKV.contextParallel,
+        undefined, undefined, steps
       );
     }
   }

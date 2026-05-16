@@ -2051,25 +2051,27 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number): void {
+  decodeStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number, steps?: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
     const pPositionIds = this.cast(positionIds);
     const pLastPageLen = this.cast(lastPageLen);
     const pSlotMapping = this.cast(slotMapping);
     const pIndptr = this.cast(indptr);
     const pIndices = this.cast(indices);
+    const cpWs = contextParallel ? this.worldSize : 1;
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].decodeStep(pPositionIds.shards[i], pLastPageLen.shards[i], pSlotMapping.shards[i], pIndptr.shards[i], pIndices.shards[i], pageSize, batchSize);
+      const cpR = contextParallel ? i : 0;
+      this.devices[i].decodeStep(pPositionIds.shards[i], pLastPageLen.shards[i], pSlotMapping.shards[i], pIndptr.shards[i], pIndices.shards[i], pageSize, batchSize, steps, contextParallel, cpWs, cpR);
     }
   }
 
-  mlaDecodeStep(positionIds: Tensor, lastPageLen: Tensor, indptr: Tensor, pageSize: number, batchSize: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
+  mlaDecodeStep(positionIds: Tensor, lastPageLen: Tensor, indptr: Tensor, pageSize: number, batchSize: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, steps?: number): void {
     const pPositionIds = this.cast(positionIds);
     const pLastPageLen = this.cast(lastPageLen);
     const pIndptr = this.cast(indptr);
     const cpWs = contextParallel ? this.worldSize : 1;
     for (let i = 0; i < this.worldSize; i++) {
       const cpR = contextParallel ? i : 0;
-      this.devices[i].mlaDecodeStep(pPositionIds.shards[i], pLastPageLen.shards[i], pIndptr.shards[i], pageSize, batchSize, contextParallel, cpWs, cpR);
+      this.devices[i].mlaDecodeStep(pPositionIds.shards[i], pLastPageLen.shards[i], pIndptr.shards[i], pageSize, batchSize, contextParallel, cpWs, cpR, steps);
     }
   }
 
