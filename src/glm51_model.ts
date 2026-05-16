@@ -10,6 +10,7 @@ import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
+import { reverseDictionary } from "../vendor/transformers.js/packages/transformers/types/utils/core";
 
 export { ExecutionState as BatchState };
 export type { SamplingParams };
@@ -317,7 +318,8 @@ export class Glm51Model extends ChatModel {
     const cfg = this.cfg;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
-    return new PagedKVCache(this.glm, nKv, hd, cfg.numHiddenLayers, maxPages, this.maxBatch, 16, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel);
+    const nLayers = cfg.numHiddenLayers + (this.mtp ? cfg.numNextNPredictLayers ?? 0 : 0);
+    return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, this.maxBatch, 16, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel);
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
@@ -500,9 +502,16 @@ export class Glm51Model extends ChatModel {
       ? this.mlpSparse(attnNormed, mlpPfx, BS)
       : this.mlpDense(attnNormed, mlpPfx, BS);
 
-    const nextWeight = layerIdx < cfg.numHiddenLayers - 1
-      ? this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx + 1}.input_layernorm.weight`)!
-      : this.tensors.get("model.norm.weight")!;
+    let nextWeight: Tensor;
+    if (layerIdx < cfg.numHiddenLayers - 1) {
+      nextWeight = this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx + 1}.input_layernorm.weight`)!;
+    } else if (layerIdx === cfg.numHiddenLayers - 1) {
+      nextWeight = this.tensors.get("model.norm.weight")!;
+    } else if (layerIdx < cfg.numHiddenLayers + (cfg.numNextNPredictLayers ?? 0) - 1) {
+      nextWeight = this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx + 1}.input_layernorm.weight`)!;
+    } else {
+      nextWeight = this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.shared_head.norm.weight`)!;
+    }
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
@@ -537,7 +546,7 @@ export class Glm51Model extends ChatModel {
     return normed.detach().removeTracking();
   }
 
-  forwardMtp(state: ExecutionState, targetNormed: Tensor, token: Tensor) {
+  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, token: Tensor) {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const batchSize = state.batchSize;
@@ -550,7 +559,7 @@ export class Glm51Model extends ChatModel {
       const embedTable = this.tensors.get("model.embed_tokens.weight")!;
       using embedding = embedTable.embedding(token, hs, BS);
       using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps, hs, BS);
-      using hnorm = targetNormed.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      using hnorm = previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps, hs, BS);
       using cat = enorm.cat([hnorm], 1);
 
       using residual = new UsingHolder(cat.linear(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.eh_proj.weight`)!, BS));
@@ -562,13 +571,9 @@ export class Glm51Model extends ChatModel {
         residual.replace(result.residual);
       }
 
-      const mtpResult = residual.value.fusedAddRmsnorm(
-        normed.value,
-        this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.shared_head.norm.weight`)!,
-        cfg.rmsNormEps, hs, BS
-      );
-      residual.replace(mtpResult.residual);
-      return mtpResult.normed;
+      return normed.detach().removeTracking();
     }
+    
+    throw new Error("forwardMtp called but model is not configured for MTP or has no next-n predict layers");
   }
 }
