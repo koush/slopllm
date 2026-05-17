@@ -2,7 +2,7 @@ import { type ChatCache } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import type { ExecutionWorkspace } from "./execution-workspace";
 import { I32 } from "./glm_ops";
-import { Tensor } from "./tensor";
+import { MemcpyKind, Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
 export const PAGE_SIZE = 16;
@@ -152,7 +152,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   // match are popped; for cross-match, full pages are sliced (ref-counted) into
   // the target sequence. If the entire cache matches (self, no truncation needed),
   // returns the suffix immediately without touching pages.
-  prefixMatch(seqIdx: number, inputIds: number[]): number[] {
+  prefixMatch(seqIdx: number, inputIds: number[], copyPartial?: boolean): number[] {
     while (this.sequences.length <= seqIdx) {
       this.sequences.push(new Sequence(this));
     }
@@ -177,9 +177,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       return inputIds.slice();
     }
 
-    // only keep full pages, so no memcpy is needed for a partial page.
+    // full pages can be shared, memcpy is needed for a partial page.
     const keepPages = Math.floor(bestMatchTokens / this.pageSize);
-    const cumulativeTokens = keepPages * this.pageSize;
 
     if (bestSeqIdx === seqIdx) {
       while (this.sequences[seqIdx].pages.length > keepPages) {
@@ -195,11 +194,36 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       }
       this.sequences[seqIdx].clear();
       this.sequences[seqIdx] = newSeq;
-      return inputIds.slice(cumulativeTokens);
+      const partialPage = Math.ceil(bestMatchTokens / this.pageSize) > keepPages;
+      if (copyPartial && partialPage) {
+        this.allocAppendPages(seqIdx, this.pageSize);
+        const srcPage = this.sequences[bestSeqIdx].pages[keepPages];
+        const dstPage = this.sequences[seqIdx].pages[keepPages];
+        this.copyPage(srcPage.id, dstPage.id);
+        dstPage.tokenIds.push(...srcPage.tokenIds);
+        this.sequences[seqIdx].allocLen = bestMatchTokens;
+      }
+      return inputIds.slice(newSeq.tokenCount());
     }
 
     this.sequences[seqIdx].clear();
     return inputIds.slice();
+  }
+
+  copyPage(srcPageId: number, dstPageId: number): void {
+    const dataArrays = this.ckvData.length
+      ? this.ckvData.concat(this.kpeData)
+      : this.kData.concat(this.vData);
+    for (const tensor of dataArrays) {
+      const rowElements = tensor.shape.slice(1).reduce((a, b) => a * b, 1);
+      const rowBytes = rowElements * 2;
+      tensor.memcpy2d(
+        dstPageId * rowBytes, rowBytes,
+        tensor.data + srcPageId * rowBytes, rowBytes,
+        rowBytes, 1,
+        MemcpyKind.DeviceToDevice,
+      );
+    }
   }
 
   appendTokens(seqIdx: number, tokens: number[]): void {

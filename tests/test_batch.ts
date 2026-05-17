@@ -833,4 +833,148 @@ describe("PagedKVCache prefix matching", () => {
     const decodeToken = ws.forwardEagerDecode(model, [fullTokens[0]], pagedKV)[0];
     assert.equal(typeof decodeToken, "number", "decode should produce a valid token");
   });
+
+  it("cross-sequence copyPartial: copies partial page tokens and sets allocLen", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const baseLen = PAGE_SIZE + 4;
+    const base = makeLongPrompt(baseLen);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.appendTokens(0, base);
+    pagedKV.updateIndptr(ws2);
+
+    const pageBytes = pagedKV.nKv * PAGE_SIZE * pagedKV.hd * 2;
+    const srcPageId = pagedKV.sequences[0].pages[1].id;
+    const dstPageId = pagedKV.availablePages[0];
+    const srcOff = srcPageId * pageBytes;
+    const dstOff = dstPageId * pageBytes;
+
+    const preCopyK: Buffer[] = [];
+    const preCopyV: Buffer[] = [];
+    for (let layer = 0; layer < pagedKV.kData.length; layer++) {
+      const kvBytes = pagedKV.maxPages * pageBytes;
+      const kBuf = Buffer.alloc(kvBytes);
+      const vBuf = Buffer.alloc(kvBytes);
+      pagedKV.kData[layer].d2h(kBuf);
+      pagedKV.vData[layer].d2h(vBuf);
+      preCopyK.push(kBuf);
+      preCopyV.push(vBuf);
+    }
+
+    const result = pagedKV.prefixMatch(1, fullPrompt, true);
+    const expectedSuffixLen = fullPrompt.length - baseLen;
+    assert.deepStrictEqual(result, suffix, `copyPartial should return suffix of ${expectedSuffixLen} tokens, got ${result.length} tokens`);
+    assert.equal(pagedKV.sequences[1].pages.length, 2, "seq1 should have 2 pages (1 full + 1 partial copy)");
+    assert.equal(pagedKV.sequences[1].allocLen, baseLen, `seq1 allocLen should be ${baseLen}, got ${pagedKV.sequences[1].allocLen}`);
+    assert.equal(pagedKV.sequences[1].tokenCount(), baseLen, `seq1 tokenCount should be ${baseLen}, got ${pagedKV.sequences[1].tokenCount()}`);
+    const srcPartialPage = pagedKV.sequences[0].pages[1];
+    const dstPartialPage = pagedKV.sequences[1].pages[1];
+    assert.notEqual(dstPartialPage.id, srcPartialPage.id, "copied partial page should have a different page id");
+    assert.equal(dstPartialPage.id, dstPageId, "copied partial page should use the expected available page");
+    const lastPageTokens = dstPartialPage.tokenIds;
+    assert.deepStrictEqual(lastPageTokens, base.slice(PAGE_SIZE),
+      `partial page tokenIds should match source, got ${lastPageTokens}`);
+    for (let layer = 0; layer < pagedKV.kData.length; layer++) {
+      const kvBytes = pagedKV.maxPages * pageBytes;
+      const kBuf = Buffer.alloc(kvBytes);
+      const vBuf = Buffer.alloc(kvBytes);
+      pagedKV.kData[layer].d2h(kBuf);
+      pagedKV.vData[layer].d2h(vBuf);
+      const srcKPage = kBuf.subarray(srcOff, srcOff + pageBytes);
+      const srcVPage = vBuf.subarray(srcOff, srcOff + pageBytes);
+      const preKDst = preCopyK[layer].subarray(dstOff, dstOff + pageBytes);
+      const preVDst = preCopyV[layer].subarray(dstOff, dstOff + pageBytes);
+      assert.ok(!preKDst.equals(srcKPage), `kData layer ${layer}: dst page should differ from source before copy`);
+      assert.ok(!preVDst.equals(srcVPage), `vData layer ${layer}: dst page should differ from source before copy`);
+      assert.deepStrictEqual(kBuf.subarray(dstOff, dstOff + pageBytes), srcKPage,
+        `kData layer ${layer}: partial page data should match source after copy`);
+      assert.deepStrictEqual(vBuf.subarray(dstOff, dstOff + pageBytes), srcVPage,
+        `vData layer ${layer}: partial page data should match source after copy`);
+    }
+  });
+
+  it("cross-sequence copyPartial: ref count unchanged on source pages", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const baseLen = PAGE_SIZE + 4;
+    const base = makeLongPrompt(baseLen);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.appendTokens(0, base);
+    pagedKV.updateIndptr(ws2);
+
+    pagedKV.prefixMatch(1, fullPrompt, true);
+    assert.equal(pagedKV.sequences[0].pages[0].refs, 2, "full page should have ref count 2 (shared)");
+    assert.equal(pagedKV.sequences[0].pages[1].refs, 1, "source partial page should still have ref count 1 (not shared)");
+    assert.equal(pagedKV.sequences[1].pages[1].refs, 1, "copied partial page should have ref count 1");
+  });
+
+  it("cross-sequence copyPartial=false: partial page not copied (original behavior)", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const baseLen = PAGE_SIZE + 4;
+    const base = makeLongPrompt(baseLen);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.appendTokens(0, base);
+    pagedKV.updateIndptr(ws2);
+
+    const result = pagedKV.prefixMatch(1, fullPrompt, false);
+    assert.deepStrictEqual(result, fullPrompt.slice(PAGE_SIZE),
+      `copyPartial=false should only share full pages, got suffix starting with ${result.slice(0, 3)}`);
+    assert.equal(pagedKV.sequences[1].pages.length, 1, "seq1 should share only 1 full page");
+    assert.equal(pagedKV.sequences[1].allocLen, PAGE_SIZE, `seq1 allocLen should be ${PAGE_SIZE}`);
+  });
+
+  it("cross-sequence copyPartial: no partial page when match is page-aligned", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const baseLen = PAGE_SIZE * 2;
+    const base = makeLongPrompt(baseLen);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.appendTokens(0, base);
+    pagedKV.updateIndptr(ws2);
+
+    const result = pagedKV.prefixMatch(1, fullPrompt, true);
+    assert.deepStrictEqual(result, suffix, `page-aligned match should return suffix, got ${result}`);
+    assert.equal(pagedKV.sequences[1].pages.length, 2, "seq1 should share 2 full pages");
+    assert.equal(pagedKV.sequences[1].allocLen, baseLen, `seq1 allocLen should be ${baseLen}`);
+  });
+
+  it("cross-sequence copyPartial: subsequent appendTokens places tokens correctly", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const baseLen = PAGE_SIZE + 4;
+    const base = makeLongPrompt(baseLen);
+    const suffix = [200, 201, 202, 203];
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.appendTokens(0, base);
+    pagedKV.updateIndptr(ws2);
+
+    const result = pagedKV.prefixMatch(1, fullPrompt, true);
+    assert.deepStrictEqual(result, suffix, `copyPartial should return suffix`);
+
+    pagedKV.appendTokens(1, result);
+    assert.equal(pagedKV.sequences[1].tokenCount(), fullPrompt.length,
+      `after appendTokens, tokenCount should be ${fullPrompt.length}, got ${pagedKV.sequences[1].tokenCount()}`);
+    const allTokens = pagedKV.sequences[1].pages.map(p => p.tokenIds).flat();
+    assert.deepStrictEqual(allTokens, fullPrompt, "all tokens should match full prompt after append");
+  });
 });
