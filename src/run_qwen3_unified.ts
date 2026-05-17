@@ -53,6 +53,7 @@ interface CliArgs {
   meta: boolean;
   arena: number;
   cp: boolean;
+  mtp: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -84,6 +85,7 @@ function parseArgs(argv: string[]): CliArgs {
     meta: false,
     arena: 0,
     cp: false,
+    mtp: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -117,6 +119,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--meta") args.meta = true;
     else if (a === "--arena" && i + 1 < argv.length) args.arena = parseInt(argv[++i], 10);
     else if (a === "--cp") args.cp = true;
+    else if (a === "--mtp") args.mtp = true;
   }
 
   if (args.useQwen35 && args.useFp8) {
@@ -182,7 +185,7 @@ export function* generateStream(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
-  timing?: DecodeTiming,
+  timing?: DecodeTiming, mtp?: boolean,
 ): Generator<number> {
   const suffixIds = cache.prefixMatch(0, inputIds);
 
@@ -287,8 +290,16 @@ export function* generateStream(
 
         ws.decodeStep(state, model);
         ws.forwardInput(state);
-        using hiddenStates = model.forward(state);
-        doSample(state.computeLogits(hiddenStates, model));
+        using hiddenStates = new UsingHolder(model.forward(state));
+        doSample(state.computeLogits(hiddenStates.value, model));
+        if (mtp && model.forwardMtp) {
+          const nextn = 3;
+          for (let i = 0; i < nextn; i++) {
+            ws.decodeStep(state, model);
+            hiddenStates.replace(model.forwardMtp(state, hiddenStates.value, gpuSampleResult!));
+          }
+          ws.decodeStep(state, model, -nextn);
+        }
 
         if (capturing) {
           const graph = glm.graphEndCapture();
@@ -435,7 +446,7 @@ async function interactiveChat(
       const generatedIds: number[] = [];
       const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-    for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing)) {
+    for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -474,7 +485,7 @@ async function singlePrompt(
   const generatedIds: number[] = [];
   const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing)) {
+  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -569,7 +580,7 @@ async function main(): Promise<void> {
   if (args.meta) {
     const metaOps = new MetaOps();
     const model: ChatModel = args.useGlm51
-      ? await Glm51Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen, args.cp)
+      ? await Glm51Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen, args.cp, args.mtp)
       : args.useQwen35
       ? await Qwen35Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
       : await Qwen3Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen);
@@ -608,7 +619,7 @@ async function main(): Promise<void> {
     : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
 
   const model: ChatModel = args.useGlm51
-    ? await Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen, args.cp)
+    ? await Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen, args.cp, args.mtp)
     : args.useQwen35
     ? await Qwen35Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
     : await Qwen3Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen);

@@ -66,15 +66,6 @@ class Sequence {
     return count;
   }
 
-  // Shares the first numPages pages with a new sequence (increments ref counts).
-  slice(numPages: number): Sequence {
-    const newSequence = new Sequence(this.pagedKvCache);
-    for (let i = 0; i < numPages; i++) {
-      newSequence.pushPage(this.pages[i]);
-    }
-    return newSequence;
-  }
-
   appendTokens(tokenIds: number[]) {
     let pos = this.allocLen - tokenIds.length;
     let currentPageIndex = Math.floor(pos / this.pagedKvCache.pageSize);
@@ -186,6 +177,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       return inputIds.slice();
     }
 
+    // only keep full pages, so no memcpy is needed for a partial page.
     const keepPages = Math.floor(bestMatchTokens / this.pageSize);
     const cumulativeTokens = keepPages * this.pageSize;
 
@@ -197,7 +189,10 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
 
     if (keepPages > 0) {
-      const newSeq = this.sequences[bestSeqIdx].slice(keepPages);
+      const newSeq = new Sequence(this);
+      for (let i = 0; i < keepPages; i++) {
+        newSeq.pushPage(this.sequences[bestSeqIdx].pages[i]);
+      }
       this.sequences[seqIdx].clear();
       this.sequences[seqIdx] = newSeq;
       return inputIds.slice(cumulativeTokens);
