@@ -182,7 +182,7 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
 
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
                             const void* scales, int top_k,
-                            int dim, int count, int num_rows, void* workspace);
+                            int dim, int num_rows, void* workspace);
 
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
                        const void* indices, int dim, int k);

@@ -265,7 +265,7 @@ class TestScatterAddRows:
             out.data_ptr(),
             input_bf16.data_ptr(),
             scales.data_ptr(),
-            topK, dim, count, rows_out,
+            topK, dim, rows_out,
             0  # workspace (unused)
         )
 
@@ -290,7 +290,7 @@ class TestScatterAddRows:
             out.data_ptr(),
             input_bf16.data_ptr(),
             scales.data_ptr(),
-            topK, dim, count, rows_out,
+            topK, dim, rows_out,
             0  # workspace (unused)
         )
 
@@ -314,7 +314,7 @@ class TestScatterAddRows:
             out.data_ptr(),
             input_bf16.data_ptr(),
             scales.data_ptr(),
-            topK, hs, count, BS,
+            topK, hs, BS,
             0  # workspace (unused)
         )
 

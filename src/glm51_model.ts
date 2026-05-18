@@ -411,7 +411,7 @@ export class Glm51Model extends ChatModel {
     using downOut = siluOut.mulMatId(downWeights, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
 
     using normalizedWeightsFlat = normalizedWeights.reshape([count]);
-    using routedOut = downOut.scatterAddRows(normalizedWeightsFlat, topK, hs, count, BS);
+    using routedOut = downOut.scatterAddRows(normalizedWeightsFlat, topK, hs, BS);
 
     sharedDownBufStream.streamWaitEvent();
     using sharedDownBuf = sharedDownBufStream.result;

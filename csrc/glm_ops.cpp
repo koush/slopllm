@@ -886,8 +886,8 @@ static Napi::Value Nvfp4MulMatId(const Napi::CallbackInfo& info) {
 
 static Napi::Value ScatterAddRows(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 9) {
-        Napi::TypeError::New(env, "Expected (ctx, out, input, scales, top_k, dim, count, num_rows, workspace)").ThrowAsJavaScriptException();
+    if (info.Length() < 8) {
+        Napi::TypeError::New(env, "Expected (ctx, out, input, scales, top_k, dim, num_rows, workspace)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -896,14 +896,13 @@ static Napi::Value ScatterAddRows(const Napi::CallbackInfo& info) {
     uintptr_t scales_ptr = info[3].As<Napi::Number>().Int64Value();
     int top_k = info[4].As<Napi::Number>().Int32Value();
     int dim = info[5].As<Napi::Number>().Int32Value();
-    int count = info[6].As<Napi::Number>().Int32Value();
-    int num_rows = info[7].As<Napi::Number>().Int32Value();
-    uintptr_t ws_ptr = info[8].As<Napi::Number>().Int64Value();
+    int num_rows = info[6].As<Napi::Number>().Int32Value();
+    uintptr_t ws_ptr = info[7].As<Napi::Number>().Int64Value();
     glm_scatter_add_rows(reinterpret_cast<GlmCtx*>(ctx_ptr),
                           reinterpret_cast<void*>(out_ptr),
                           reinterpret_cast<const void*>(in_ptr),
                           reinterpret_cast<const void*>(scales_ptr),
-                          top_k, dim, count, num_rows,
+                          top_k, dim, num_rows,
                           reinterpret_cast<void*>(ws_ptr));
     return env.Undefined();
 }

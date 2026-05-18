@@ -2028,25 +2028,25 @@ void glm_mla_decode_step(GlmCtx* ctx,
 }
 
 // ---------------------------------------------------------------------------
-// Scatter-add with row-wise scaling (atomic BF16 addition)
-//   out:      [rows_out, dim]   BF16 (accumulated in-place)
-//   input:    [count, dim]      BF16
+// Scatter-add with row-wise scaling
+//   out:      [num_rows, dim]   BF16
+//   input:    [count, dim]      BF16   (count = num_rows * top_k)
 //   scales:   [count]           BF16
-//   batch_ids:[count]           int32
-//   For each i in [0, count):
-//     out[batch_ids[i], d] += scales[i] * input[i, d]  for all d
+//   top_k:    number of expert entries per row
+//   For each row r in [0, num_rows), for each j in [0, top_k):
+//     out[r, d] += scales[r * top_k + j] * input[r * top_k + j, d]
 // ---------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(256) scatter_add_rows_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* scales,
-    int dim, int count) {
+    int top_k, int dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= dim) return;
     float accum = 0.0f;
-    for (int i = 0; i < count; i++) {
-        accum += __bfloat162float(scales[i]) * __bfloat162float(input[(size_t)i * dim + idx]);
+    for (int j = 0; j < top_k; j++) {
+        accum += __bfloat162float(scales[j]) * __bfloat162float(input[(size_t)j * dim + idx]);
     }
     out[idx] = __float2bfloat16(accum);
 }
@@ -2055,17 +2055,16 @@ __global__ void __launch_bounds__(256, 4) scatter_add_rows_batched_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* scales,
-    int top_k, int dim, int count, int num_rows) {
+    int top_k, int dim, int num_rows) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_rows * dim;
     if (idx >= total) return;
     int row = idx / dim;
     int d = idx % dim;
     float accum = 0.0f;
-    for (int i = 0; i < count; i++) {
-        if (i / top_k == row) {
-            accum += __bfloat162float(scales[i]) * __bfloat162float(input[(size_t)i * dim + d]);
-        }
+    int base = row * top_k;
+    for (int j = 0; j < top_k; j++) {
+        accum += __bfloat162float(scales[base + j]) * __bfloat162float(input[(size_t)(base + j) * dim + d]);
     }
     out[idx] = __float2bfloat16(accum);
 }
@@ -2074,7 +2073,7 @@ extern "C" {
 
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
                             const void* scales, int top_k,
-                            int dim, int count, int num_rows, void* workspace) {
+                            int dim, int num_rows, void* workspace) {
     cudaSetDevice(ctx->device_id);
     (void)workspace;
     int block_size = 256;
@@ -2082,13 +2081,13 @@ void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
         int grid = (dim + block_size - 1) / block_size;
         scatter_add_rows_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-            (const __nv_bfloat16*)scales, dim, count);
+            (const __nv_bfloat16*)scales, top_k, dim);
     } else {
         int total = num_rows * dim;
         int grid = (total + block_size - 1) / block_size;
         scatter_add_rows_batched_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-            (const __nv_bfloat16*)scales, top_k, dim, count, num_rows);
+            (const __nv_bfloat16*)scales, top_k, dim, num_rows);
     }
 }
 

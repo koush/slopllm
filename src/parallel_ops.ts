@@ -1174,8 +1174,12 @@ export class ParallelTensor extends Tensor {
 
   memcpy2d(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
     const shardRowBytes = this.shards[0].shape.slice(1).reduce((a, b) => a * b, 1) * 2;
-    if (width !== shardRowBytes || dpitch !== spitch || height !== 1) {
-      throw new Error("ParallelTensor.memcpy2d: only supports full-row copies along non-sharded dimension (width must equal shard row bytes, height must be 1)");
+    const fullRowBytes = shardRowBytes * this.worldSize;
+    if (height !== 1 || dpitch !== spitch) {
+      throw new Error("ParallelTensor.memcpy2d: only supports single-row copies with dpitch === spitch");
+    }
+    if (width !== shardRowBytes && width !== fullRowBytes) {
+      throw new Error(`ParallelTensor.memcpy2d: unsupported width=${width} (shardRowBytes=${shardRowBytes}, fullRowBytes=${fullRowBytes})`);
     }
     const dstPageId = dstOffset / dpitch;
     const srcPageId = src / spitch;
@@ -1403,17 +1407,17 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, [count, N], this.type, outPar);
   }
 
-  scatterAddRows(scales: Tensor, topK: number, dim: number, count: number, numRows: number): Tensor {
+  scatterAddRows(scales: Tensor, topK: number, dim: number, numRows: number): Tensor {
     const pScales = scales as ParallelTensor;
     const outShards: Tensor[] = [];
     if (this.parallelism === TensorParallelism.PartialSum) {
       for (let i = 0; i < this.worldSize; i++) {
-        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], topK, dim, count, numRows));
+        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], topK, dim, numRows));
       }
       return this.parallelOps.wrapShards(this.workspace, outShards, [numRows, dim], this.type, TensorParallelism.PartialSum);
     } else {
       for (let i = 0; i < this.worldSize; i++) {
-        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], topK, dim, count, numRows));
+        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], topK, dim, numRows));
       }
       return this.parallelOps.wrapShards(this.workspace, outShards, [numRows, dim], this.type, this.parallelism);
     }

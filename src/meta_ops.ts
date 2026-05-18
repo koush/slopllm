@@ -230,7 +230,7 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([count, N], this.type);
     }
 
-    scatterAddRows(scales: Tensor, topK: number, dim: number, count: number, numRows: number): Tensor {
+    scatterAddRows(scales: Tensor, topK: number, dim: number, numRows: number): Tensor {
         return this.workspace.alloc([numRows, dim], this.type);
     }
 

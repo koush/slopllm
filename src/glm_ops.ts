@@ -145,7 +145,7 @@ interface NativeAddon {
   expertScale(ctx: number, out: number, weights: number, indices: number, expertId: number, topK: number, batch: number): void;
   mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
   nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
-  scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, count: number, numRows: number, workspace: number): void;
+  scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number): void;
 }
 
 export class GlmTensor extends Tensor {
@@ -533,9 +533,9 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  scatterAddRows(scales: Tensor, topK: number, dim: number, count: number, numRows: number): Tensor {
+  scatterAddRows(scales: Tensor, topK: number, dim: number, numRows: number): Tensor {
     const out = this.workspace.alloc([numRows, dim], this.type);
-    getNativeAddon().scatterAddRows(this.glm.ctx, out.data, this.data, scales.data, topK, dim, count, numRows, 0);
+    getNativeAddon().scatterAddRows(this.glm.ctx, out.data, this.data, scales.data, topK, dim, numRows, 0);
     return out;
   }
 

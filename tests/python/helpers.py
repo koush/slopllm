@@ -780,7 +780,7 @@ class GlmOps:
         self.lib.glm_scatter_add_rows.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
             ctypes.c_void_p,
         ]
 
@@ -1601,13 +1601,13 @@ class GlmOps:
             top_k, count, N, K
         )
 
-    def scatter_add_rows(self, out, input, scales, top_k, dim, count, num_rows, workspace):
+    def scatter_add_rows(self, out, input, scales, top_k, dim, num_rows, workspace):
         self.lib.glm_scatter_add_rows(
             self.ctx,
             self._ptr(out),
             self._ptr(input),
             self._ptr(scales),
-            top_k, dim, count, num_rows,
+            top_k, dim, num_rows,
             self._ptr(workspace)
         )
 

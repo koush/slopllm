@@ -365,7 +365,7 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  scatterAddRows(scales: Tensor, topK: number, dim: number, count: number, numRows: number): Tensor {
+  scatterAddRows(scales: Tensor, topK: number, dim: number, numRows: number): Tensor {
     return undefined as never;
   }
 
