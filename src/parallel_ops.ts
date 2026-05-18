@@ -823,75 +823,11 @@ export class ParallelTensor extends Tensor {
   }
 
   max(offset: number = 0): { values: Tensor, indices: Tensor } {
-    super.max(offset);
-    if (this.parallelism === TensorParallelism.PartialSum) {
-      this.allReduce();
-      return this.max(offset);
-    }
-
-    if (this.parallelism === TensorParallelism.Row) {
-      const batch = this.fullShape[0];
-      const dim = this.fullShape[1];
-      const ws = this.worldSize;
-      const shardDim = dim / ws;
-
-      const localValuesShards: Tensor[] = [];
-      const localIndicesShards: Tensor[] = [];
-      for (let i = 0; i < ws; i++) {
-        const { values, indices } = this.shards[i].max(i * shardDim + offset);
-        localValuesShards.push(values);
-        localIndicesShards.push(indices);
-      }
-
-      using allValuesPar = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch, ws], this.type, TensorParallelism.Row);
-      using allIndicesPar = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch, ws], "I32", TensorParallelism.Row);
-
-      using allValues = allValuesPar.allGather(this.workspace);
-      using allIndices = allIndicesPar.allGather(this.workspace);
-
-      const { values: rankValues, indices: rankIndices } = allValues.max(0);
-
-      using _rankIndices = rankIndices;
-      using gatheredIndices = allIndices.gather(rankIndices, 1, ws, batch);
-
-      const finalIndices = this.parallelOps.newTensor(this.workspace, [batch], "I32", false, undefined, TensorParallelism.Replicated);
-      const pGatheredIndices = gatheredIndices as ParallelTensor;
-      const idxBytes = batch * 4;
-      for (let i = 0; i < ws; i++) {
-        finalIndices.shards[i].memcpy(pGatheredIndices.shards[i], idxBytes);
-      }
-
-      return { values: rankValues, indices: finalIndices };
-    }
-
-    if (this.parallelism === TensorParallelism.Column) {
-      const batch = this.fullShape[0];
-
-      const localValuesShards: Tensor[] = [];
-      const localIndicesShards: Tensor[] = [];
-      for (let i = 0; i < this.worldSize; i++) {
-        const { values, indices } = this.shards[i].max(offset);
-        localValuesShards.push(values);
-        localIndicesShards.push(indices);
-      }
-
-      const values = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch], this.type, TensorParallelism.Column);
-      const indices = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch], "I32", TensorParallelism.Column);
-
-      return { values, indices };
-    }
-
-    this.assertParallel("max input", this, TensorParallelism.Replicated);
-
-    const valuesShards: Tensor[] = [];
-    const indicesShards: Tensor[] = [];
-    for (let i = 0; i < this.worldSize; i++) {
-      const { values, indices } = this.shards[i].max(offset);
-      valuesShards.push(values);
-      indicesShards.push(indices);
-    }
-    const values = this.parallelOps.wrapShards(this.workspace, valuesShards, [this.shape[0]], this.type, TensorParallelism.Replicated);
-    const indices = this.parallelOps.wrapShards(this.workspace, indicesShards, [this.shape[0]], "I32", TensorParallelism.Replicated);
+    const dim = this.fullShape[1];
+    const result = this.topk(1, dim, offset);
+    const batch = this.fullShape[0];
+    const values = result.values.reshape([batch]);
+    const indices = result.indices.reshape([batch]);
     return { values, indices };
   }
 
@@ -1205,18 +1141,48 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, this.fullShape, this.type, this.parallelism);
   }
 
-  topk(k: number, dim: number): { values: Tensor, indices: Tensor } {
+  topk(k: number, dim: number, offset = 0): { values: Tensor, indices: Tensor } {
     if (this.parallelism === TensorParallelism.PartialSum) {
       this.allReduce();
-      return this.topk(k, dim);
+      return this.topk(k, dim, offset);
     }
-    if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
-      throw new Error(`topk: unsupported parallelism ${this.parallelism} (dimension is sharded, results would be incomplete)`);
+    if (this.parallelism === TensorParallelism.Row) {
+      const batch = this.fullShape[0];
+      const shardDim = this.shardDim(dim, "topk dim");
+      const localValuesShards: Tensor[] = [];
+      const localIndicesShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        const shardOffset = i * shardDim + offset;
+        const result = this.shards[i].topk(k, shardDim, shardOffset);
+        localValuesShards.push(result.values);
+        localIndicesShards.push(result.indices);
+      }
+      const localValues = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch, k * this.worldSize], this.type, TensorParallelism.Row);
+      const localIndices = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch, k * this.worldSize], "I32", TensorParallelism.Row);
+      using gatheredValues = localValues.allGather(this.workspace);
+      using gatheredIndices = localIndices.allGather(this.workspace);
+      const kTotal = k * this.worldSize;
+      const { values: rankValues, indices: rankIndices } = gatheredValues.topk(k, kTotal);
+      using _rankIndices = rankIndices as ParallelTensor;
+      const finalIndices = gatheredIndices.gather(rankIndices, k, kTotal, batch);
+      return { values: rankValues, indices: finalIndices };
+    }
+    if (this.parallelism === TensorParallelism.Column) {
+      const valuesShards: Tensor[] = [];
+      const indicesShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        const result = this.shards[i].topk(k, dim, offset);
+        valuesShards.push(result.values);
+        indicesShards.push(result.indices);
+      }
+      const values = this.parallelOps.wrapShards(this.workspace, valuesShards, [...this.fullShape.slice(0, -1), k], this.type, TensorParallelism.Column);
+      const indices = this.parallelOps.wrapShards(this.workspace, indicesShards, [...this.fullShape.slice(0, -1), k], "I32", TensorParallelism.Column);
+      return { values, indices };
     }
     const valuesShards: Tensor[] = [];
     const indicesShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.shards[i].topk(k, dim);
+      const result = this.shards[i].topk(k, dim, offset);
       valuesShards.push(result.values);
       indicesShards.push(result.indices);
     }

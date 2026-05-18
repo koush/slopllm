@@ -97,10 +97,10 @@ export class MetaTensor extends Tensor {
 
     max(offset: number = 0): { values: Tensor, indices: Tensor } {
         super.max(offset);
+        const dim = this.shape[1];
+        const result = this.topk(1, dim, offset);
         const batch = this.shape[0];
-        const values = this.workspace.alloc([batch], this.type);
-        const indices = this.workspace.alloc([batch], "I32");
-        return { values, indices };
+        return { values: result.values.reshape([batch]), indices: result.indices.reshape([batch]) };
     }
 
     indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
@@ -166,7 +166,7 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc(this.shape, this.type);
     }
 
-    topk(k: number, dim: number): { values: Tensor, indices: Tensor } {
+    topk(k: number, dim: number, offset?: number): { values: Tensor, indices: Tensor } {
         const batch = this.shape.reduce((a, b) => a * b, 1) / dim;
         const values = this.workspace.alloc([batch, k], this.type);
         const indices = this.workspace.alloc([batch, k], "I32");

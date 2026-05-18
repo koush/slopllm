@@ -294,7 +294,7 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  topk(k: number, dim: number): { values: Tensor, indices: Tensor } {
+  topk(k: number, dim: number, offset?: number): { values: Tensor, indices: Tensor } {
     return undefined as never;
   }
 

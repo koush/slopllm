@@ -258,7 +258,7 @@ class GlmOps:
         self.lib.glm_topk.restype = None
         self.lib.glm_topk.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
         self.lib.glm_bmm.restype = None
@@ -1020,13 +1020,13 @@ class GlmOps:
             rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved
         )
 
-    def topk(self, out_values, out_indices, input, k, dim, batch):
+    def topk(self, out_values, out_indices, input, k, dim, batch, offset=0):
         self.lib.glm_topk(
             self.ctx,
             self._ptr(out_values),
             self._ptr(out_indices),
             self._ptr(input),
-            k, dim, batch
+            k, dim, batch, offset
         )
 
     def bmm(self, C, A, B, alpha, beta, batch, M, N, K, transA=0, transB=0):

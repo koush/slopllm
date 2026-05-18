@@ -252,16 +252,23 @@ p2p_allgather_column_kernel(
 
     // ---- Step 1: scatter local shard into our peer-visible data buffer.
     {
-        const uint4* in_v4  = reinterpret_cast<const uint4*>(in);
-        uint4*       my_v4  = reinterpret_cast<uint4*>(my_data);
-        int num_vec = shard_bytes / 16;
-        for (int i = tid; i < num_vec; i += bs) {
-            my_v4[i] = in_v4[i];
-        }
-        int tail_start = num_vec * 16;
         const char* in_b = static_cast<const char*>(in);
-        for (int i = tail_start + tid; i < shard_bytes; i += bs) {
-            my_data[i] = in_b[i];
+        bool aligned16 = (((size_t)in | (size_t)my_data) & 15) == 0;
+        if (aligned16 && shard_bytes >= 16) {
+            const uint4* in_v4  = reinterpret_cast<const uint4*>(in);
+            uint4*       my_v4  = reinterpret_cast<uint4*>(my_data);
+            int num_vec = shard_bytes / 16;
+            for (int i = tid; i < num_vec; i += bs) {
+                my_v4[i] = in_v4[i];
+            }
+            int tail_start = num_vec * 16;
+            for (int i = tail_start + tid; i < shard_bytes; i += bs) {
+                my_data[i] = in_b[i];
+            }
+        } else {
+            for (int i = tid; i < shard_bytes; i += bs) {
+                my_data[i] = in_b[i];
+            }
         }
     }
 
@@ -285,15 +292,22 @@ p2p_allgather_column_kernel(
         const char* src = static_cast<const char*>(s_peer_data[r]) + slot_offset;
         char* dst = out_b + (size_t)r * shard_bytes;
 
-        const uint4* src_v4 = reinterpret_cast<const uint4*>(src);
-        uint4*       dst_v4 = reinterpret_cast<uint4*>(dst);
-        int num_vec = shard_bytes / 16;
-        for (int i = tid; i < num_vec; i += bs) {
-            dst_v4[i] = src_v4[i];
-        }
-        int tail_start = num_vec * 16;
-        for (int i = tail_start + tid; i < shard_bytes; i += bs) {
-            dst[i] = src[i];
+        bool aligned16 = (((size_t)src | (size_t)dst) & 15) == 0;
+        if (aligned16 && shard_bytes >= 16) {
+            const uint4* src_v4 = reinterpret_cast<const uint4*>(src);
+            uint4*       dst_v4 = reinterpret_cast<uint4*>(dst);
+            int num_vec = shard_bytes / 16;
+            for (int i = tid; i < num_vec; i += bs) {
+                dst_v4[i] = src_v4[i];
+            }
+            int tail_start = num_vec * 16;
+            for (int i = tail_start + tid; i < shard_bytes; i += bs) {
+                dst[i] = src[i];
+            }
+        } else {
+            for (int i = tid; i < shard_bytes; i += bs) {
+                dst[i] = src[i];
+            }
         }
     }
 }
@@ -350,16 +364,23 @@ p2p_allgather_row_kernel(
 
     // ---- Step 1: scatter local shard into our peer-visible data buffer.
     {
-        const uint4* in_v4  = reinterpret_cast<const uint4*>(in);
-        uint4*       my_v4  = reinterpret_cast<uint4*>(my_data);
-        int num_vec = shard_bytes / 16;
-        for (int i = tid; i < num_vec; i += bs) {
-            my_v4[i] = in_v4[i];
-        }
-        int tail_start = num_vec * 16;
         const char* in_b = static_cast<const char*>(in);
-        for (int i = tail_start + tid; i < shard_bytes; i += bs) {
-            my_data[i] = in_b[i];
+        bool aligned16 = (((size_t)in | (size_t)my_data) & 15) == 0;
+        if (aligned16 && shard_bytes >= 16) {
+            const uint4* in_v4  = reinterpret_cast<const uint4*>(in);
+            uint4*       my_v4  = reinterpret_cast<uint4*>(my_data);
+            int num_vec = shard_bytes / 16;
+            for (int i = tid; i < num_vec; i += bs) {
+                my_v4[i] = in_v4[i];
+            }
+            int tail_start = num_vec * 16;
+            for (int i = tail_start + tid; i < shard_bytes; i += bs) {
+                my_data[i] = in_b[i];
+            }
+        } else {
+            for (int i = tid; i < shard_bytes; i += bs) {
+                my_data[i] = in_b[i];
+            }
         }
     }
 
@@ -378,6 +399,8 @@ p2p_allgather_row_kernel(
     __threadfence_system();
 
     // ---- Step 3: copy all peers' shards into output in interleaved layout.
+    // Use alignment-aware copy to avoid misaligned address errors when
+    // shard_dim1_bytes is not a multiple of 16 (uint4 requires 16-byte alignment).
     char* out_b = static_cast<char*>(out);
     for (int r = 0; r < world_size; ++r) {
         const char* src_base = static_cast<const char*>(s_peer_data[r]) + slot_offset;
@@ -386,15 +409,34 @@ p2p_allgather_row_kernel(
             const char* src = src_base + (size_t)row * shard_dim1_bytes;
             char* dst = out_b + (size_t)row * full_dim1_bytes + (size_t)r * shard_dim1_bytes;
 
-            const uint4* src_v4 = reinterpret_cast<const uint4*>(src);
-            uint4*       dst_v4 = reinterpret_cast<uint4*>(dst);
-            int num_vec = shard_dim1_bytes / 16;
-            for (int i = tid; i < num_vec; i += bs) {
-                dst_v4[i] = src_v4[i];
-            }
-            int tail_start = num_vec * 16;
-            for (int i = tail_start + tid; i < shard_dim1_bytes; i += bs) {
-                dst[i] = src[i];
+            bool src_aligned16 = ((size_t)src & 15) == 0;
+            bool dst_aligned16 = ((size_t)dst & 15) == 0;
+            if (src_aligned16 && dst_aligned16 && shard_dim1_bytes >= 16) {
+                const uint4* src_v4 = reinterpret_cast<const uint4*>(src);
+                uint4*       dst_v4 = reinterpret_cast<uint4*>(dst);
+                int num_vec = shard_dim1_bytes / 16;
+                for (int i = tid; i < num_vec; i += bs) {
+                    dst_v4[i] = src_v4[i];
+                }
+                int tail_start = num_vec * 16;
+                for (int i = tail_start + tid; i < shard_dim1_bytes; i += bs) {
+                    dst[i] = src[i];
+                }
+            } else if (shard_dim1_bytes >= 4 && (((size_t)src | (size_t)dst) & 3) == 0) {
+                const uint32_t* src_u32 = reinterpret_cast<const uint32_t*>(src);
+                uint32_t*       dst_u32 = reinterpret_cast<uint32_t*>(dst);
+                int num_u32 = shard_dim1_bytes / 4;
+                for (int i = tid; i < num_u32; i += bs) {
+                    dst_u32[i] = src_u32[i];
+                }
+                int tail_start = num_u32 * 4;
+                for (int i = tail_start + tid; i < shard_dim1_bytes; i += bs) {
+                    dst[i] = src[i];
+                }
+            } else {
+                for (int i = tid; i < shard_dim1_bytes; i += bs) {
+                    dst[i] = src[i];
+                }
             }
         }
     }

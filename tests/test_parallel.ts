@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_SUM } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { TensorParallelism } from "../src/device_ops";
+import { MemcpyKind } from "../src/tensor";
 import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
 
 describe("ParallelOps construction", () => {
@@ -1650,6 +1651,221 @@ describe("ParallelTensor.max", () => {
   });
 });
 
+describe("ParallelTensor.topk", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("topk on Replicated BF16 tensor", () => {
+    const batch = 2;
+    const dim = 8;
+    const k = 3;
+
+    const inputF32 = new Float32Array(batch * dim);
+    inputF32[3] = 100;
+    inputF32[5] = 90;
+    inputF32[1] = 80;
+    inputF32[dim + 7] = 97;
+    inputF32[dim + 2] = 95;
+    inputF32[dim + 4] = 93;
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const { values, indices } = input.topk(k, dim);
+    po.synchronize();
+
+    const valuesBuf = Buffer.alloc(batch * k * 2);
+    const indicesBuf = Buffer.alloc(batch * k * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    assert.ok(Math.abs(valuesArr[0] - 100) < 0.5, `batch 0 val 0: ${valuesArr[0]}`);
+    assert.ok(Math.abs(valuesArr[1] - 90) < 0.5, `batch 0 val 1: ${valuesArr[1]}`);
+    assert.ok(Math.abs(valuesArr[2] - 80) < 0.5, `batch 0 val 2: ${valuesArr[2]}`);
+    assert.equal(indicesBuf.readInt32LE(0), 3);
+    assert.equal(indicesBuf.readInt32LE(4), 5);
+    assert.equal(indicesBuf.readInt32LE(8), 1);
+    assert.ok(Math.abs(valuesArr[3] - 97) < 0.5, `batch 1 val 0: ${valuesArr[3]}`);
+    assert.ok(Math.abs(valuesArr[4] - 95) < 0.5, `batch 1 val 1: ${valuesArr[4]}`);
+    assert.ok(Math.abs(valuesArr[5] - 93) < 0.5, `batch 1 val 2: ${valuesArr[5]}`);
+    assert.equal(indicesBuf.readInt32LE(12), 7);
+    assert.equal(indicesBuf.readInt32LE(16), 2);
+    assert.equal(indicesBuf.readInt32LE(20), 4);
+  });
+
+  it("topk on Row-parallel BF16 tensor matches single-GPU reference", () => {
+    const batch = 3;
+    const dim = 16;
+    const k = 4;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = Math.sin(i * 0.7) * 10;
+
+    const refGlm = new GlmOps(2);
+    const refWs = new WorkspaceBase(refGlm);
+    const refInput = refWs.alloc([batch, dim], "BF16");
+    refInput.h2d(f32ToBf16Bytes(inputF32));
+    refGlm.synchronize();
+
+    const { values: refValues, indices: refIndices } = refInput.topk(k, dim);
+    refGlm.synchronize();
+
+    const refValuesBuf = Buffer.alloc(batch * k * 2);
+    const refIndicesBuf = Buffer.alloc(batch * k * 4);
+    refValues.d2h(refValuesBuf);
+    refIndices.d2h(refIndicesBuf);
+    const refValuesArr = bf16BytesToF32(refValuesBuf);
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const { values, indices } = input.topk(k, dim);
+    po.synchronize();
+
+    assert.equal((values as ParallelTensor).parallelism, TensorParallelism.Replicated);
+    assert.equal((indices as ParallelTensor).parallelism, TensorParallelism.Replicated);
+
+    const valuesBuf = Buffer.alloc(batch * k * 2);
+    const indicesBuf = Buffer.alloc(batch * k * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    for (let b = 0; b < batch; b++) {
+      for (let j = 0; j < k; j++) {
+        const idx = b * k + j;
+        const relErr = Math.abs(valuesArr[idx] - refValuesArr[idx]) / Math.max(Math.abs(refValuesArr[idx]), 1e-6);
+        assert.ok(relErr < 0.05, `batch ${b} pos ${j} value: ref=${refValuesArr[idx]}, got=${valuesArr[idx]}`);
+        assert.equal(indicesBuf.readInt32LE(idx * 4), refIndicesBuf.readInt32LE(idx * 4), `batch ${b} pos ${j} index`);
+      }
+    }
+
+    refWs.free();
+    refGlm.free();
+  });
+
+  it("topk on Column-parallel BF16 tensor matches single-GPU reference", () => {
+    const batch = 4;
+    const dim = 12;
+    const k = 3;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = Math.cos(i * 0.3) * 5;
+
+    const refGlm = new GlmOps(2);
+    const refWs = new WorkspaceBase(refGlm);
+    const refInput = refWs.alloc([batch, dim], "BF16");
+    refInput.h2d(f32ToBf16Bytes(inputF32));
+    refGlm.synchronize();
+
+    const { values: refValues, indices: refIndices } = refInput.topk(k, dim);
+    refGlm.synchronize();
+
+    const refValuesBuf = Buffer.alloc(batch * k * 2);
+    const refIndicesBuf = Buffer.alloc(batch * k * 4);
+    refValues.d2h(refValuesBuf);
+    refIndices.d2h(refIndicesBuf);
+    const refValuesArr = bf16BytesToF32(refValuesBuf);
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const { values, indices } = input.topk(k, dim);
+    po.synchronize();
+
+    assert.equal((values as ParallelTensor).parallelism, TensorParallelism.Column);
+    assert.equal((indices as ParallelTensor).parallelism, TensorParallelism.Column);
+
+    const valuesBuf = Buffer.alloc(batch * k * 2);
+    const indicesBuf = Buffer.alloc(batch * k * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    for (let b = 0; b < batch; b++) {
+      for (let j = 0; j < k; j++) {
+        const idx = b * k + j;
+        const relErr = Math.abs(valuesArr[idx] - refValuesArr[idx]) / Math.max(Math.abs(refValuesArr[idx]), 1e-6);
+        assert.ok(relErr < 0.05, `batch ${b} pos ${j} value: ref=${refValuesArr[idx]}, got=${valuesArr[idx]}`);
+        assert.equal(indicesBuf.readInt32LE(idx * 4), refIndicesBuf.readInt32LE(idx * 4), `batch ${b} pos ${j} index`);
+      }
+    }
+
+    refWs.free();
+    refGlm.free();
+  });
+
+  it("topk with offset on Row-parallel BF16 tensor", () => {
+    const batch = 2;
+    const dim = 8;
+    const k = 2;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = (i % 7 - 3) * 0.5;
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const offset = 100;
+    const { values, indices } = input.topk(k, dim, offset);
+    po.synchronize();
+
+    const refGlm = new GlmOps(2);
+    const refWs = new WorkspaceBase(refGlm);
+    const refInput = refWs.alloc([batch, dim], "BF16");
+    refInput.h2d(f32ToBf16Bytes(inputF32));
+    refGlm.synchronize();
+
+    const { values: refValues, indices: refIndices } = refInput.topk(k, dim, offset);
+    refGlm.synchronize();
+
+    const refValuesBuf = Buffer.alloc(batch * k * 2);
+    const refIndicesBuf = Buffer.alloc(batch * k * 4);
+    refValues.d2h(refValuesBuf);
+    refIndices.d2h(refIndicesBuf);
+    const refValuesArr = bf16BytesToF32(refValuesBuf);
+
+    const valuesBuf = Buffer.alloc(batch * k * 2);
+    const indicesBuf = Buffer.alloc(batch * k * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    for (let b = 0; b < batch; b++) {
+      for (let j = 0; j < k; j++) {
+        const idx = b * k + j;
+        const relErr = Math.abs(valuesArr[idx] - refValuesArr[idx]) / Math.max(Math.abs(refValuesArr[idx]), 1e-6);
+        assert.ok(relErr < 0.05, `batch ${b} pos ${j} value: ref=${refValuesArr[idx]}, got=${valuesArr[idx]}`);
+        assert.equal(indicesBuf.readInt32LE(idx * 4), refIndicesBuf.readInt32LE(idx * 4), `batch ${b} pos ${j} index with offset`);
+      }
+    }
+
+    refWs.free();
+    refGlm.free();
+  });
+});
+
 describe("ParallelOps.indexSelect", () => {
   let glm0: GlmOps;
   let glm1: GlmOps;
@@ -1707,6 +1923,155 @@ describe("ParallelOps.indexSelect", () => {
     for (let i = 0; i < k * srcDim; i++) {
       const relErr = Math.abs(actual[i] - expected[i]) / Math.max(Math.abs(expected[i]), 1e-6);
       assert.ok(relErr < 0.05, `i=${i}: expected ${expected[i]}, got ${actual[i]} (relErr=${relErr})`);
+    }
+  });
+});
+
+describe("ParallelTensor.memcpy2d", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let po: ParallelOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    po = new ParallelOps([glm0, glm1]);
+    ws = new WorkspaceBase(po);
+  });
+
+  after(() => {
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
+  it("Row parallel: full-row copy (width === fullRowBytes) copies page in-place (BF16)", () => {
+    const pages = 4;
+    const cols = 8;
+    const pt = ws.alloc([pages, cols], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+
+    const fullRowBytes = cols * 2;
+    const totalElems = pages * cols;
+    const srcF32 = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) srcF32[i] = i;
+    pt.h2d(f32ToBf16Bytes(srcF32));
+    po.synchronize();
+
+    const srcPageId = 1;
+    const dstPageId = 3;
+    pt.memcpy2d(
+      dstPageId * fullRowBytes, fullRowBytes,
+      0 + srcPageId * fullRowBytes, fullRowBytes,
+      fullRowBytes, 1,
+      MemcpyKind.DeviceToDevice,
+    );
+    po.synchronize();
+
+    const dstBuf = Buffer.alloc(totalElems * 2);
+    pt.d2h(dstBuf);
+    const dstF32 = bf16BytesToF32(dstBuf);
+
+    for (let c = 0; c < cols; c++) {
+      const expected = srcF32[srcPageId * cols + c];
+      const actual = dstF32[dstPageId * cols + c];
+      assert.ok(Math.abs(actual - expected) < 0.01, `col=${c}: expected ${expected}, got ${actual}`);
+    }
+  });
+
+  it("Row parallel: shard-row copy (width === shardRowBytes) copies page in-place (BF16)", () => {
+    const pages = 4;
+    const cols = 8;
+    const eb = 2;
+    const pt = ws.alloc([pages, cols], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+
+    const shardRowBytes = (cols / po.worldSize) * eb;
+
+    const shardCols = cols / po.worldSize;
+    const shardElems = pages * shardCols;
+
+    for (let rank = 0; rank < po.worldSize; rank++) {
+      const shardF32 = new Float32Array(shardElems);
+      for (let p = 0; p < pages; p++) {
+        for (let c = 0; c < shardCols; c++) {
+          shardF32[p * shardCols + c] = rank * 50 + p * 10 + c;
+        }
+      }
+      pt.shard(rank).h2d(f32ToBf16Bytes(shardF32));
+    }
+    po.synchronize();
+
+    const srcPageId = 1;
+    const dstPageId = 3;
+    pt.memcpy2d(
+      dstPageId * shardRowBytes, shardRowBytes,
+      srcPageId * shardRowBytes, shardRowBytes,
+      shardRowBytes, 1,
+      MemcpyKind.DeviceToDevice,
+    );
+    po.synchronize();
+
+    for (let rank = 0; rank < po.worldSize; rank++) {
+      const dstShardBuf = Buffer.alloc(shardElems * eb);
+      pt.shard(rank).d2h(dstShardBuf);
+      const dstShardF32 = bf16BytesToF32(dstShardBuf);
+
+      for (let c = 0; c < shardCols; c++) {
+        const expected = rank * 50 + srcPageId * 10 + c;
+        const actual = dstShardF32[dstPageId * shardCols + c];
+        assert.ok(Math.abs(actual - expected) < 0.01, `rank=${rank} col=${c}: expected ${expected}, got ${actual}`);
+      }
+    }
+  });
+
+  it("Row parallel: rejects unsupported width", () => {
+    const pt = ws.alloc([4, 8], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    const shardRowBytes = 8;
+    assert.throws(() => {
+      pt.memcpy2d(0, shardRowBytes * 3, 0, shardRowBytes * 3, shardRowBytes * 3, 1, MemcpyKind.DeviceToDevice);
+    }, /unsupported width/);
+  });
+
+  it("Row parallel: rejects height > 1", () => {
+    const pt = ws.alloc([4, 8], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    const shardRowBytes = 8;
+    assert.throws(() => {
+      pt.memcpy2d(0, shardRowBytes, 0, shardRowBytes, shardRowBytes, 2, MemcpyKind.DeviceToDevice);
+    }, /single-row copies/);
+  });
+
+  it("Replicated: full-row copy works (BF16)", () => {
+    const pages = 3;
+    const cols = 4;
+    const eb = 2;
+    const pt = ws.alloc([pages, cols], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    const fullRowBytes = cols * eb;
+    const totalElems = pages * cols;
+    const srcF32 = new Float32Array(totalElems);
+    for (let i = 0; i < totalElems; i++) srcF32[i] = i;
+    pt.h2d(f32ToBf16Bytes(srcF32));
+    po.synchronize();
+
+    const srcPageId = 0;
+    const dstPageId = 2;
+    pt.memcpy2d(
+      dstPageId * fullRowBytes, fullRowBytes,
+      0 + srcPageId * fullRowBytes, fullRowBytes,
+      fullRowBytes, 1,
+      MemcpyKind.DeviceToDevice,
+    );
+    po.synchronize();
+
+    const dstBuf = Buffer.alloc(totalElems * eb);
+    pt.d2h(dstBuf);
+    const dstF32 = bf16BytesToF32(dstBuf);
+
+    for (let c = 0; c < cols; c++) {
+      const expected = srcF32[srcPageId * cols + c];
+      const actual = dstF32[dstPageId * cols + c];
+      assert.ok(Math.abs(actual - expected) < 0.01, `col=${c}: expected ${expected}, got ${actual}`);
     }
   });
 });

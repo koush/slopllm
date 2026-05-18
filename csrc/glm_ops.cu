@@ -1128,10 +1128,156 @@ void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
 }
 
 // ---------------------------------------------------------------------------
-// TopK kernel (along last dim, unsorted)
+// TopK kernel - two-phase register + warp shuffle approach
+// Each thread streams its elements, maintaining top-K in registers.
+// Then warp-level bitonic merge via shuffles reduces to warp top-K.
+// Finally cross-warp reduction via shared memory.
+// Works for any dim (no smem proportional to dim).
+// Template specialized for K=1,2,4,8.
+// ---------------------------------------------------------------------------
+
+template<int K>
+__device__ inline void insert_topk(float top_vals[K], int top_idxs[K], float val, int idx) {
+    // Find insertion point: top_vals is sorted descending
+    // If val <= top_vals[K-1], reject
+    if (val <= top_vals[K - 1]) return;
+    // Find where to insert
+    int pos = K - 1;
+    while (pos > 0 && val > top_vals[pos - 1]) {
+        top_vals[pos] = top_vals[pos - 1];
+        top_idxs[pos] = top_idxs[pos - 1];
+        pos--;
+    }
+    top_vals[pos] = val;
+    top_idxs[pos] = idx;
+}
+
+template<int K>
+__device__ inline void merge_topk(float top_vals[K], int top_idxs[K],
+                                   const float partner_vals[K], const int partner_idxs[K]) {
+    // Merge two sorted descending lists of size K, keep top K
+    // Use a temporary buffer
+    float tmp_vals[K];
+    int tmp_idxs[K];
+    int i = 0, j = 0, m = 0;
+    while (m < K && (i < K || j < K)) {
+        float vi = (i < K) ? top_vals[i] : -INFINITY;
+        float vj = (j < K) ? partner_vals[j] : -INFINITY;
+        if (vi > vj || (vi == vj && (i < K) && ((j >= K) || top_idxs[i] < partner_idxs[j]))) {
+            tmp_vals[m] = vi;
+            tmp_idxs[m] = top_idxs[i];
+            i++;
+        } else {
+            tmp_vals[m] = vj;
+            tmp_idxs[m] = partner_idxs[j];
+            j++;
+        }
+        m++;
+    }
+    for (int n = 0; n < K; n++) {
+        top_vals[n] = tmp_vals[n];
+        top_idxs[n] = tmp_idxs[n];
+    }
+}
+
+template<int K>
+__global__ void __launch_bounds__(256, 4) topk_kernel_v2(
+    __nv_bfloat16* out_values,
+    int* out_indices,
+    const __nv_bfloat16* input,
+    int dim,
+    int batch,
+    int offset
+) {
+    int row = blockIdx.x;
+    if (row >= batch) return;
+
+    const __nv_bfloat16* row_in = input + row * dim;
+    __nv_bfloat16* row_vals = out_values + row * K;
+    int* row_idxs = out_indices + row * K;
+
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    int num_warps = blockDim.x >> 5;
+
+    // Phase 1: Each thread streams its elements, maintaining top-K in registers
+    float top_vals[K];
+    int top_idxs[K];
+    for (int j = 0; j < K; j++) {
+        top_vals[j] = -INFINITY;
+        top_idxs[j] = -1;
+    }
+
+    for (int i = tid * 2; i + 1 < dim; i += blockDim.x * 2) {
+        float v0, v1;
+        load_bf16x2(row_in + i, v0, v1);
+        insert_topk<K>(top_vals, top_idxs, v0, i + offset);
+        insert_topk<K>(top_vals, top_idxs, v1, i + 1 + offset);
+    }
+    if ((dim & 1) && tid == (dim / 2) % blockDim.x) {
+        float val = __bfloat162float(row_in[dim - 1]);
+        insert_topk<K>(top_vals, top_idxs, val, (dim - 1) + offset);
+    }
+
+    // Phase 2: Warp-level bitonic merge via shuffles
+    // After log2(32)=5 stages, all lanes in a warp have the warp's top-K
+    for (int stage = 0; stage < 5; stage++) {
+        int partner_lane = lane ^ (1 << stage);
+        float partner_vals[K];
+        int partner_idxs[K];
+        for (int j = 0; j < K; j++) {
+            partner_vals[j] = __shfl_sync(0xffffffff, top_vals[j], partner_lane);
+            partner_idxs[j] = __shfl_sync(0xffffffff, top_idxs[j], partner_lane);
+        }
+        merge_topk<K>(top_vals, top_idxs, partner_vals, partner_idxs);
+    }
+
+    // Phase 3: Cross-warp reduction via shared memory
+    // Lane 0 of each warp writes its top-K to smem
+    extern __shared__ char smem[];
+    float* s_vals = reinterpret_cast<float*>(smem);
+    int* s_idxs = reinterpret_cast<int*>(s_vals + num_warps * K);
+
+    if (lane == 0) {
+        for (int j = 0; j < K; j++) {
+            s_vals[warp_id * K + j] = top_vals[j];
+            s_idxs[warp_id * K + j] = top_idxs[j];
+        }
+    }
+    __syncthreads();
+
+    // Thread 0 merges all warps' top-K into final result
+    if (tid == 0) {
+        // Initialize with warp 0's candidates
+        for (int j = 0; j < K; j++) {
+            top_vals[j] = s_vals[j];
+            top_idxs[j] = s_idxs[j];
+        }
+        // Merge remaining warps
+        for (int w = 1; w < num_warps; w++) {
+            float w_vals[K];
+            int w_idxs[K];
+            for (int j = 0; j < K; j++) {
+                w_vals[j] = s_vals[w * K + j];
+                w_idxs[j] = s_idxs[w * K + j];
+            }
+            merge_topk<K>(top_vals, top_idxs, w_vals, w_idxs);
+        }
+        // Write output
+        for (int j = 0; j < K; j++) {
+            row_vals[j] = __float2bfloat16(top_vals[j]);
+            row_idxs[j] = top_idxs[j];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TopK kernel (along last dim, unsorted) - legacy smem-based approach
 // One block per row. Loads row into shared memory, finds top-k by
 // k passes of parallel argmax.
 // Shared memory: dim * (sizeof(float) + sizeof(int)) + blockDim * (sizeof(float) + sizeof(int))
+// Only suitable for small dim (e.g., MoE routing with 256 experts)
 // ---------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(256, 4) topk_kernel(
@@ -1140,7 +1286,8 @@ __global__ void __launch_bounds__(256, 4) topk_kernel(
     const __nv_bfloat16* input,
     int k,
     int dim,
-    int batch
+    int batch,
+    int offset
 ) {
     int row = blockIdx.x;
     if (row >= batch) return;
@@ -1182,7 +1329,7 @@ __global__ void __launch_bounds__(256, 4) topk_kernel(
             int best = s_reduce_idx[0];
             if (best >= 0) {
                 row_vals[j] = __float2bfloat16(s_vals[best]);
-                row_idxs[j] = s_idxs[best];
+                row_idxs[j] = s_idxs[best] + offset;
                 s_vals[best] = __int_as_float(0x7fc00000);
             } else {
                 row_vals[j] = __float2bfloat16(-INFINITY);
@@ -1194,15 +1341,42 @@ __global__ void __launch_bounds__(256, 4) topk_kernel(
 }
 
 void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
-              const void* input, int k, int dim, int batch) {
+              const void* input, int k, int dim, int batch, int offset) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = batch;
-    size_t shared_mem = dim * sizeof(float) + dim * sizeof(int) +
-                        block_size * sizeof(float) + block_size * sizeof(int);
-    topk_kernel<<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out_values, out_indices,
-        (const __nv_bfloat16*)input, k, dim, batch);
+
+    if (k <= 8) {
+        // Two-phase register + warp shuffle kernel: O(1) shared memory, works for any dim
+        int num_warps = block_size / 32;
+        size_t shared_mem = num_warps * k * sizeof(float) + num_warps * k * sizeof(int);
+
+        switch (k) {
+            case 1: topk_kernel_v2<1><<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset); break;
+            case 2: topk_kernel_v2<2><<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset); break;
+            case 3: topk_kernel_v2<3><<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset); break;
+            case 4: topk_kernel_v2<4><<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset); break;
+            case 5: topk_kernel_v2<5><<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset); break;
+            case 6: topk_kernel_v2<6><<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset); break;
+            case 7: topk_kernel_v2<7><<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset); break;
+            case 8: topk_kernel_v2<8><<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset); break;
+        }
+    } else {
+        // Legacy smem kernel: O(dim) shared memory, only for small dim
+        size_t shared_mem = dim * sizeof(float) + dim * sizeof(int) +
+                            block_size * sizeof(float) + block_size * sizeof(int);
+        topk_kernel<<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out_values, out_indices,
+            (const __nv_bfloat16*)input, k, dim, batch, offset);
+    }
 }
 
 // ---------------------------------------------------------------------------

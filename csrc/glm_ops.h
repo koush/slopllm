@@ -127,7 +127,7 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        int attn_n_heads, int head_offset);
 
 void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
-              const void* input, int k, int dim, int batch);
+              const void* input, int k, int dim, int batch, int offset);
 
 void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
              float alpha, float beta,

@@ -107,3 +107,29 @@ def test_topk_k_equals_dim(glm, device):
     cuda_sorted_vals, _ = out_vals[0].cpu().sort(descending=True)
     ref_sorted_vals, _ = ref_vals[0].cpu().sort(descending=True)
     assert torch.equal(cuda_sorted_vals, ref_sorted_vals)
+
+
+@pytest.mark.parametrize("offset", [0, 100, 512])
+def test_topk_with_offset(glm, device, offset):
+    batch, dim, k = 2, 16, 4
+    torch.manual_seed(42 + offset)
+    x = torch.randn(batch, dim, dtype=torch.bfloat16, device=device)
+    out_vals = torch.empty(batch, k, dtype=torch.bfloat16, device=device)
+    out_idxs = torch.empty(batch, k, dtype=torch.int32, device=device)
+
+    glm.topk(out_vals, out_idxs, x, k, dim, batch, offset)
+
+    ref_vals, ref_idxs = torch.topk(x.float(), k, dim=-1)
+    ref_vals = ref_vals.to(torch.bfloat16)
+    ref_idxs_shifted = ref_idxs + offset
+
+    for b in range(batch):
+        cuda_vals_sorted, _ = out_vals[b].cpu().sort(descending=True)
+        ref_vals_sorted, _ = ref_vals[b].cpu().sort(descending=True)
+        assert torch.equal(cuda_vals_sorted.float(), ref_vals_sorted.float()), \
+            f"Top-k values mismatch at batch {b}, offset={offset}"
+
+        cuda_set = set(out_idxs[b].cpu().tolist())
+        ref_set = set(ref_idxs_shifted[b].cpu().tolist())
+        assert cuda_set == ref_set, \
+            f"Top-k indices mismatch at batch {b}, offset={offset}: cuda={cuda_set}, ref={ref_set}"

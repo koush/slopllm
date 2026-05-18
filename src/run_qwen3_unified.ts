@@ -258,7 +258,7 @@ export function* generateStream(
     doSample(firstTokens);
     readSample();
   }
-  cache.appendTokens(0, suffixIds);
+  cache.reportTokens(0, suffixIds);
 
   let capturing = false;
 
@@ -294,9 +294,31 @@ export function* generateStream(
         doSample(state.computeLogits(hiddenStates.value, model));
         if (mtp && model.forwardMtp) {
           const nextn = 3;
+          let total = 1;
+
+          const mtpSampleResult = new UsingHolder<Tensor>(undefined!);
           for (let i = 0; i < nextn; i++) {
+            if (total != 1) {
+              // fork each sequence
+              for (let j = total / 2 - 1; j >= 0; j--) {
+                const seqIdx = j * 2 + 1;
+                cache.getPagedKV().copySequence(seqIdx, j);
+              }
+            }
+
+            const state = ws.planDecode(model, 1 << i, cache, useGraph);
+            if (mtpSampleResult.value) {
+              const reshaped = mtpSampleResult.value.reshape([1 << i, 1]);
+              state.prepareInput(reshaped);
+            }
+
             ws.decodeStep(state, model);
-            hiddenStates.replace(model.forwardMtp(state, hiddenStates.value, gpuSampleResult!));
+            hiddenStates.replace(model.forwardMtp(state, hiddenStates.value, mtpSampleResult.value || gpuSampleResult!));
+            mtpSampleResult.replace(state.computeLogits(hiddenStates.value, model));
+            const topk = mtpSampleResult.value.topk(2, model.cfg.vocabSize);
+            using _values = topk.values;
+            mtpSampleResult.replace(topk.indices);
+            total *= 2;
           }
           ws.decodeStep(state, model, -nextn);
         }
@@ -332,7 +354,7 @@ export function* generateStream(
 
       execMs += performance.now() - tExec;
       tAfterSync = performance.now();
-      cache.appendTokens(0, [currentToken]);
+      cache.reportTokens(0, [currentToken]);
       tokenHistory.push(currentToken);
 
       // yield previous token
@@ -592,7 +614,7 @@ async function main(): Promise<void> {
     const ws = new ExecutionWorkspace(metaOps, args.maxBatch, args.maxSeqLen);
     const inputIds = [1, 2, 3, 4, 5];
     const logits = ws.forwardPrefill(model, [inputIds], cache);
-    cache.appendTokens(0, inputIds);
+    cache.reportTokens(0, inputIds);
     const forwardAllocs = metaOps.totalAllocs;
     const forwardBytes = metaOps.totalBytes;
 

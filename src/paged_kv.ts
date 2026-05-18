@@ -159,7 +159,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     if (dstSeqIdx === srcSeqIdx)
       return;
     const srcSeq = this.sequences[srcSeqIdx];
-    const dstSeq = this.sequences[dstSeqIdx];
+    const dstSeq = this.ensureSequence(dstSeqIdx);
 
     const keepPages = Math.floor(srcSeq.allocLen / this.pageSize);
     dstSeq.clear();
@@ -177,6 +177,11 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
   }
 
+  ensureSequence(seqIdx: number) {
+    this.sequences[seqIdx] ??= new Sequence(this);
+    return this.sequences[seqIdx];
+  }
+
   // Finds the best prefix match across all sequences and returns the unmatched suffix.
   // Only full pages are kept/shared — the partial last page is never shared because
   // the receiving sequence would write into it. For self-match, pages beyond the
@@ -184,7 +189,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   // the target sequence. If the entire cache matches (self, no truncation needed),
   // returns the suffix immediately without touching pages.
   prefixMatch(seqIdx: number, inputIds: number[], copyPartial?: boolean): number[] {
-    if (seqIdx >= this.sequences.length) throw new Error(`prefixMatch: seqIdx ${seqIdx} out of range (${this.sequences.length} sequences)`);
+    this.ensureSequence(seqIdx);
 
     let bestSeqIdx = -1;
     let bestMatchTokens = 0;

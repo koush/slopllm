@@ -128,7 +128,7 @@ interface NativeAddon {
   contextParallelMergeHeads(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, shardNHeads: number, headOffset: number, inputNHeads: number, vHeadDim: number): void;
   p2pCpMergeHeads(ctx: number, instance: number, myVOut: number, myLse: number, mergedVOut: number, mergedLse: number, numShards: number, batchSize: number, numHeads: number, shardNHeads: number, headOffset: number, inputNHeads: number, vHeadDim: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
-  topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number): void;
+  topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number, offset: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
   add(ctx: number, out: number, a: number, b: number, n: number): void;
   addBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
@@ -272,8 +272,8 @@ export class GlmTensor extends Tensor {
 
   max(offset: number = 0): { values: Tensor, indices: Tensor } {
     super.max(offset);
-    const batch = this.shape[0];
     const dim = this.shape[1];
+    const batch = this.shape[0];
     const values = this.workspace.alloc([batch], this.type);
     const indices = this.workspace.alloc([batch], "I32");
     getNativeAddon().max(this.glm.ctx, values.data, indices.data, this.data, dim, batch, offset);
@@ -397,11 +397,11 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  topk(k: number, dim: number): { values: Tensor, indices: Tensor } {
+  topk(k: number, dim: number, offset = 0): { values: Tensor, indices: Tensor } {
     const batch = this.shape.reduce((a, b) => a * b, 1) / dim;
     const values = this.workspace.alloc([batch, k], this.type);
     const indices = this.workspace.alloc([batch, k], "I32");
-    getNativeAddon().topk(this.glm.ctx, values.data, indices.data, this.data, k, dim, batch);
+    getNativeAddon().topk(this.glm.ctx, values.data, indices.data, this.data, k, dim, batch, offset);
     return { values, indices };
   }
 
