@@ -76,7 +76,7 @@ function generateWithGraph(
   cache.reset(1);
 
   const firstTokens = ws.forwardEagerPrefill(model, [inputIds], cache);
-  cache.appendTokens(0, inputIds);
+  cache.reportTokens(0, inputIds);
   let currentToken = firstTokens[0];
   const generated: number[] = [currentToken];
 
@@ -119,7 +119,7 @@ function generateWithGraph(
 
     currentToken = argmaxResult.readInt32LEArray()[0];
     generated.push(currentToken);
-    cache.appendTokens(0, [currentToken]);
+    cache.reportTokens(0, [currentToken]);
   }
 
   if (graphExec !== null) {

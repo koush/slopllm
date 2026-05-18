@@ -33,19 +33,23 @@ class Sequence {
   constructor(public pagedKvCache: PagedKVCache) {
   }
 
-  pushPage(page: Page) {
+  pushPage(page: Page, pageLen = this.pagedKvCache.pageSize) {
     this.pages.push(page);
-    this.allocLen += page.tokenIds.length;
+    this.allocLen += pageLen;
     page.refs++;
+    this.pagedKvCache.pagesDirtyHost = true;
+    this.pagedKvCache.pagesDirtyDevice = true;
   }
 
   popPage() {
     const page = this.pages.pop()!;
-    this.allocLen -= page.tokenIds.length;
+    this.allocLen = Math.min(this.allocLen, this.pages.length * this.pagedKvCache.pageSize);
     page.refs--;
     if (!page.refs) {
       this.pagedKvCache.availablePages.push(page.id);
     }
+    this.pagedKvCache.pagesDirtyHost = true;
+    this.pagedKvCache.pagesDirtyDevice = true;
   }
 
   clear() {
@@ -60,13 +64,18 @@ class Sequence {
     return longestPrefix(tokenIds, inputIds);
   }
 
-  tokenCount(): number {
+  // Number of tokens that have been reported via reportTokens (sum of page.tokenIds).
+  // May be less than allocLen when pages have been allocated but tokens not yet
+  // appended — e.g. after allocAppendPages/allocDecodeToken reserves space for a
+  // prefill/decode that hasn't written its tokenIds yet. prefixMatch uses this
+  // (not allocLen) because it can only compare against materialized tokens.
+  reportedTokenCount(): number {
     let count = 0;
     for (const page of this.pages) count += page.tokenIds.length;
     return count;
   }
 
-  appendTokens(tokenIds: number[]) {
+  reportTokens(tokenIds: number[]) {
     let pos = this.allocLen - tokenIds.length;
     let currentPageIndex = Math.floor(pos / this.pagedKvCache.pageSize);
     let offset = pos % this.pagedKvCache.pageSize;
@@ -146,6 +155,28 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.pagesDirtyDevice = true;
   }
 
+  copySequence(dstSeqIdx: number, srcSeqIdx: number) {
+    if (dstSeqIdx === srcSeqIdx)
+      return;
+    const srcSeq = this.sequences[srcSeqIdx];
+    const dstSeq = this.sequences[dstSeqIdx];
+
+    const keepPages = Math.floor(srcSeq.allocLen / this.pageSize);
+    dstSeq.clear();
+    for (let i = 0; i < keepPages; i++) {
+      dstSeq.pushPage(srcSeq.pages[i], this.pageSize);
+    }
+    const partialPage = srcSeq.allocLen % this.pageSize !== 0;
+    if (partialPage) {
+      this.allocAppendPages(dstSeqIdx, this.pageSize);
+      const srcPage = srcSeq.pages[keepPages];
+      const dstPage = dstSeq.pages[keepPages];
+      this.copyPage(srcPage.id, dstPage.id);
+      dstPage.tokenIds.push(...srcPage.tokenIds);
+      dstSeq.allocLen = srcSeq.allocLen;
+    }
+  }
+
   // Finds the best prefix match across all sequences and returns the unmatched suffix.
   // Only full pages are kept/shared — the partial last page is never shared because
   // the receiving sequence would write into it. For self-match, pages beyond the
@@ -153,9 +184,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   // the target sequence. If the entire cache matches (self, no truncation needed),
   // returns the suffix immediately without touching pages.
   prefixMatch(seqIdx: number, inputIds: number[], copyPartial?: boolean): number[] {
-    while (this.sequences.length <= seqIdx) {
-      this.sequences.push(new Sequence(this));
-    }
+    if (seqIdx >= this.sequences.length) throw new Error(`prefixMatch: seqIdx ${seqIdx} out of range (${this.sequences.length} sequences)`);
 
     let bestSeqIdx = -1;
     let bestMatchTokens = 0;
@@ -168,7 +197,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       }
     }
 
-    if (bestSeqIdx === seqIdx && bestMatchTokens === this.sequences[seqIdx].tokenCount()) {
+    if (bestSeqIdx === seqIdx && bestMatchTokens === this.sequences[seqIdx].reportedTokenCount()) {
       return inputIds.slice(bestMatchTokens);
     }
 
@@ -184,17 +213,17 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       while (this.sequences[seqIdx].pages.length > keepPages) {
         this.sequences[seqIdx].popPage();
       }
-      return inputIds.slice(this.sequences[seqIdx].tokenCount());
+      return inputIds.slice(this.sequences[seqIdx].allocLen);
     }
 
     if (keepPages > 0) {
       const newSeq = new Sequence(this);
       for (let i = 0; i < keepPages; i++) {
-        newSeq.pushPage(this.sequences[bestSeqIdx].pages[i]);
+        newSeq.pushPage(this.sequences[bestSeqIdx].pages[i], this.pageSize);
       }
       this.sequences[seqIdx].clear();
       this.sequences[seqIdx] = newSeq;
-      const partialPage = Math.ceil(bestMatchTokens / this.pageSize) > keepPages;
+      const partialPage = bestMatchTokens % this.pageSize !== 0;
       if (copyPartial && partialPage) {
         this.allocAppendPages(seqIdx, this.pageSize);
         const srcPage = this.sequences[bestSeqIdx].pages[keepPages];
@@ -203,7 +232,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
         dstPage.tokenIds.push(...srcPage.tokenIds);
         this.sequences[seqIdx].allocLen = bestMatchTokens;
       }
-      return inputIds.slice(newSeq.tokenCount());
+      return inputIds.slice(this.sequences[seqIdx].allocLen);
     }
 
     this.sequences[seqIdx].clear();
@@ -211,26 +240,29 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   }
 
   copyPage(srcPageId: number, dstPageId: number): void {
-    const dataArrays = this.ckvData.length
-      ? this.ckvData.concat(this.kpeData)
-      : this.kData.concat(this.vData);
-    for (const tensor of dataArrays) {
-      const rowElements = tensor.shape.slice(1).reduce((a, b) => a * b, 1);
-      const rowBytes = rowElements * 2;
-      tensor.memcpy2d(
-        dstPageId * rowBytes, rowBytes,
-        tensor.data + srcPageId * rowBytes, rowBytes,
-        rowBytes, 1,
-        MemcpyKind.DeviceToDevice,
-      );
+    for (let i = 0; i < this.kData.length; i++) {
+      this.copyPageRow(this.kData[i], srcPageId, dstPageId);
+      this.copyPageRow(this.vData[i], srcPageId, dstPageId);
+    }
+    for (let i = 0; i < this.ckvData.length; i++) {
+      this.copyPageRow(this.ckvData[i], srcPageId, dstPageId);
+      this.copyPageRow(this.kpeData[i], srcPageId, dstPageId);
     }
   }
 
-  appendTokens(seqIdx: number, tokens: number[]): void {
-    while (this.sequences.length <= seqIdx) {
-      this.sequences.push(new Sequence(this));
-    }
-    this.sequences[seqIdx].appendTokens(tokens);
+  copyPageRow(tensor: Tensor, srcPageId: number, dstPageId: number): void {
+    const rowBytes = tensor.shape.slice(1).reduce((a, b) => a * b, 1) * 2;
+    tensor.memcpy2d(
+      dstPageId * rowBytes, rowBytes,
+      tensor.data + srcPageId * rowBytes, rowBytes,
+      rowBytes, 1,
+      MemcpyKind.DeviceToDevice,
+    );
+  }
+
+  reportTokens(seqIdx: number, tokens: number[]): void {
+    if (seqIdx >= this.sequences.length) throw new Error(`reportTokens: seqIdx ${seqIdx} out of range (${this.sequences.length} sequences)`);
+    this.sequences[seqIdx].reportTokens(tokens);
   }
 
   pagesNeededForDecodeToken(seqIdx: number): number {
@@ -259,13 +291,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     for (let i = 0; i < numNewPages; i++) {
       const pageId = this.availablePages.shift()!;
       const page: Page = { id: pageId, tokenIds: [], refs: 0 };
-      sequence.pushPage(page);
+      sequence.pushPage(page, 0);
     }
     sequence.allocLen = newTotalLen;
-    if (numNewPages > 0) {
-      this.pagesDirtyHost = true;
-      this.pagesDirtyDevice = true;
-    }
   }
 
   allocDecodeToken(seqIdx: number): void {
@@ -278,9 +306,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       }
       const pageId = this.availablePages.shift()!;
       const page: Page = { id: pageId, tokenIds: [], refs: 0 };
-      sequence.pushPage(page);
-      this.pagesDirtyHost = true;
-      this.pagesDirtyDevice = true;
+      sequence.pushPage(page, 0);
     }
     sequence.allocLen = allocLen + 1;
   }

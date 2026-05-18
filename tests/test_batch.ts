@@ -84,18 +84,18 @@ describe("Qwen3-0.6B batch tests", () => {
 
     pagedKV.reset(1);
     const tokensFull = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
-    pagedKV.appendTokens(0, fullPrompt);
+    pagedKV.reportTokens(0, fullPrompt);
 
     pagedKV.reset(1);
     const suffix1 = pagedKV.prefixMatch(0, PROMPT1);
     assert.deepStrictEqual(suffix1, PROMPT1, "prefixMatch on empty cache should return full input");
     ws.forwardEagerPrefill(model, [suffix1], pagedKV);
-    pagedKV.appendTokens(0, suffix1);
+    pagedKV.reportTokens(0, suffix1);
     pagedKV.updateIndptr(ws);
     const suffix2 = pagedKV.prefixMatch(0, fullPrompt);
     assert.deepStrictEqual(suffix2, suffix, `prefixMatch should return suffix after PROMPT1, got ${suffix2}`);
     ws.forwardEagerPrefill(model, [suffix2], pagedKV);
-    pagedKV.appendTokens(0, suffix2);
+    pagedKV.reportTokens(0, suffix2);
 
     singleKV.reset(1);
     const singleToken = ws.forwardEagerPrefill(model, [fullPrompt], singleKV)[0];
@@ -114,12 +114,12 @@ describe("Qwen3-0.6B batch tests", () => {
 
     pagedKV.reset(1);
     ws.forwardEagerPrefill(model, [base], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws);
     let suffixA = pagedKV.prefixMatch(0, fullPrompt);
     assert.deepStrictEqual(suffixA, suffix, `prefixMatch after base should return suffix, got ${suffixA}`);
     ws.forwardEagerPrefill(model, [suffixA], pagedKV);
-    pagedKV.appendTokens(0, suffixA);
+    pagedKV.reportTokens(0, suffixA);
     pagedKV.updateIndptr(ws);
 
     pagedKV.prefixMatch(0, base);
@@ -128,7 +128,7 @@ describe("Qwen3-0.6B batch tests", () => {
     assert.deepStrictEqual(suffixB, suffix, `prefixMatch after truncate should return suffix, got ${suffixB}`);
     pagedKV.updateIndptr(ws);
     const tokensTruncAppend = ws.forwardEagerPrefill(model, [suffixB], pagedKV);
-    pagedKV.appendTokens(0, suffixB);
+    pagedKV.reportTokens(0, suffixB);
 
     using pagedKV2 = makePagedKV(1, 256);
     pagedKV2.reset(1);
@@ -610,7 +610,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(1);
     ws.forwardEagerPrefill(model, [prompt], pagedKV);
-    pagedKV.appendTokens(0, prompt);
+    pagedKV.reportTokens(0, prompt);
     pagedKV.updateIndptr(ws);
 
     const result = pagedKV.prefixMatch(0, fullPrompt);
@@ -626,7 +626,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(1);
     ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
-    pagedKV.appendTokens(0, fullPrompt);
+    pagedKV.reportTokens(0, fullPrompt);
     pagedKV.updateIndptr(ws);
 
     const result = pagedKV.prefixMatch(0, base);
@@ -647,7 +647,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(2);
     ws2.forwardEagerPrefill(model, [base, []], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws2);
 
     const result = pagedKV.prefixMatch(1, fullPrompt);
@@ -670,7 +670,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(2);
     ws2.forwardEagerPrefill(model, [base, []], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws2);
 
     const result = pagedKV.prefixMatch(1, fullPrompt);
@@ -691,7 +691,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(2);
     ws2.forwardEagerPrefill(model, [base, []], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws2);
 
     const result = pagedKV.prefixMatch(1, fullPrompt);
@@ -708,8 +708,8 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(2);
     ws2.forwardEagerPrefill(model, [shortPrefix, longerBase], pagedKV);
-    pagedKV.appendTokens(0, shortPrefix);
-    pagedKV.appendTokens(1, longerBase);
+    pagedKV.reportTokens(0, shortPrefix);
+    pagedKV.reportTokens(1, longerBase);
     pagedKV.updateIndptr(ws2);
 
     const fullForSeq0 = [...shortPrefix, 999, 998];
@@ -726,7 +726,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(2);
     ws2.forwardEagerPrefill(model, [[], base], pagedKV);
-    pagedKV.appendTokens(1, base);
+    pagedKV.reportTokens(1, base);
     pagedKV.updateIndptr(ws2);
 
     const input = base.slice(0, 10);
@@ -746,12 +746,12 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(1);
     ws.forwardEagerPrefill(model, [base], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws);
 
     const sharedSuffix = pagedKV.prefixMatch(0, fullPrompt);
     ws.forwardEagerPrefill(model, [sharedSuffix], pagedKV);
-    pagedKV.appendTokens(0, sharedSuffix);
+    pagedKV.reportTokens(0, sharedSuffix);
 
     singleKV.reset(1);
     const singleTokens = ws.forwardEagerPrefill(model, [fullPrompt], singleKV);
@@ -769,7 +769,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(1);
     ws.forwardEagerPrefill(model, [prompt], pagedKV);
-    pagedKV.appendTokens(0, prompt);
+    pagedKV.reportTokens(0, prompt);
     pagedKV.updateIndptr(ws);
 
     const pagesBefore = pagedKV.sequences[0].pages.length;
@@ -778,12 +778,12 @@ describe("PagedKVCache prefix matching", () => {
     assert.equal(pagedKV.sequences[0].pages.length, pagesBefore, "no pages should be popped on full match");
 
     ws.forwardEagerPrefill(model, [suffix], pagedKV);
-    pagedKV.appendTokens(0, suffix);
+    pagedKV.reportTokens(0, suffix);
 
     singleKV.reset(1);
     ws.forwardEagerPrefill(model, [fullPrompt], singleKV);
 
-    assert.equal(pagedKV.sequences[0].tokenCount(), fullPrompt.length, "tokenCount should equal full prompt length");
+    assert.equal(pagedKV.sequences[0].reportedTokenCount(), fullPrompt.length, "reportedTokenCount should equal full prompt length");
   });
 
   it("self-match: full cache match at page boundary", () => {
@@ -794,7 +794,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(1);
     ws.forwardEagerPrefill(model, [base], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws);
 
     const pagesBefore = pagedKV.sequences[0].pages.length;
@@ -818,7 +818,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(1);
     const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV);
-    pagedKV.appendTokens(0, fullPrompt);
+    pagedKV.reportTokens(0, fullPrompt);
     pagedKV.updateIndptr(ws);
 
     pagedKV.prefixMatch(0, base);
@@ -827,7 +827,7 @@ describe("PagedKVCache prefix matching", () => {
     const suffixResult = pagedKV.prefixMatch(0, fullPrompt);
     assert.deepStrictEqual(suffixResult, suffix, `after truncate, prefixMatch should return suffix`);
     ws.forwardEagerPrefill(model, [suffixResult], pagedKV);
-    pagedKV.appendTokens(0, suffixResult);
+    pagedKV.reportTokens(0, suffixResult);
     pagedKV.updateIndptr(ws);
 
     const decodeToken = ws.forwardEagerDecode(model, [fullTokens[0]], pagedKV)[0];
@@ -844,7 +844,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(2);
     ws2.forwardEagerPrefill(model, [base, []], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws2);
 
     const pageBytes = pagedKV.nKv * PAGE_SIZE * pagedKV.hd * 2;
@@ -870,7 +870,7 @@ describe("PagedKVCache prefix matching", () => {
     assert.deepStrictEqual(result, suffix, `copyPartial should return suffix of ${expectedSuffixLen} tokens, got ${result.length} tokens`);
     assert.equal(pagedKV.sequences[1].pages.length, 2, "seq1 should have 2 pages (1 full + 1 partial copy)");
     assert.equal(pagedKV.sequences[1].allocLen, baseLen, `seq1 allocLen should be ${baseLen}, got ${pagedKV.sequences[1].allocLen}`);
-    assert.equal(pagedKV.sequences[1].tokenCount(), baseLen, `seq1 tokenCount should be ${baseLen}, got ${pagedKV.sequences[1].tokenCount()}`);
+    assert.equal(pagedKV.sequences[1].reportedTokenCount(), baseLen, `seq1 reportedTokenCount should be ${baseLen}, got ${pagedKV.sequences[1].reportedTokenCount()}`);
     const srcPartialPage = pagedKV.sequences[0].pages[1];
     const dstPartialPage = pagedKV.sequences[1].pages[1];
     assert.notEqual(dstPartialPage.id, srcPartialPage.id, "copied partial page should have a different page id");
@@ -907,7 +907,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(2);
     ws2.forwardEagerPrefill(model, [base, []], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws2);
 
     pagedKV.prefixMatch(1, fullPrompt, true);
@@ -926,7 +926,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(2);
     ws2.forwardEagerPrefill(model, [base, []], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws2);
 
     const result = pagedKV.prefixMatch(1, fullPrompt, false);
@@ -946,7 +946,7 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(2);
     ws2.forwardEagerPrefill(model, [base, []], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws2);
 
     const result = pagedKV.prefixMatch(1, fullPrompt, true);
@@ -955,7 +955,7 @@ describe("PagedKVCache prefix matching", () => {
     assert.equal(pagedKV.sequences[1].allocLen, baseLen, `seq1 allocLen should be ${baseLen}`);
   });
 
-  it("cross-sequence copyPartial: subsequent appendTokens places tokens correctly", () => {
+  it("cross-sequence copyPartial: subsequent reportTokens places tokens correctly", () => {
     using pagedKV = makePagedKV(2, 256);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const baseLen = PAGE_SIZE + 4;
@@ -965,16 +965,126 @@ describe("PagedKVCache prefix matching", () => {
 
     pagedKV.reset(2);
     ws2.forwardEagerPrefill(model, [base, []], pagedKV);
-    pagedKV.appendTokens(0, base);
+    pagedKV.reportTokens(0, base);
     pagedKV.updateIndptr(ws2);
 
     const result = pagedKV.prefixMatch(1, fullPrompt, true);
     assert.deepStrictEqual(result, suffix, `copyPartial should return suffix`);
 
-    pagedKV.appendTokens(1, result);
-    assert.equal(pagedKV.sequences[1].tokenCount(), fullPrompt.length,
-      `after appendTokens, tokenCount should be ${fullPrompt.length}, got ${pagedKV.sequences[1].tokenCount()}`);
+    pagedKV.reportTokens(1, result);
+    assert.equal(pagedKV.sequences[1].reportedTokenCount(), fullPrompt.length,
+      `after reportTokens, reportedTokenCount should be ${fullPrompt.length}, got ${pagedKV.sequences[1].reportedTokenCount()}`);
     const allTokens = pagedKV.sequences[1].pages.map(p => p.tokenIds).flat();
     assert.deepStrictEqual(allTokens, fullPrompt, "all tokens should match full prompt after append");
+  });
+
+  it("cross-sequence sharing: prefill + decode matches full prefill + decode", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    using refKV = makePagedKV(1, 256);
+    const baseLen = PAGE_SIZE * 2;
+    const base = makeLongPrompt(baseLen);
+    const suffix = makeLongPrompt(8, [200]);
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(2);
+    const prefillTokens = ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.reportTokens(0, base);
+    pagedKV.updateIndptr(ws2);
+
+    const sharedSuffix = pagedKV.prefixMatch(1, fullPrompt);
+    assert.deepStrictEqual(sharedSuffix, suffix, `prefixMatch should return suffix`);
+    const suffixTokens = ws2.forwardEagerPrefill(model, [[], sharedSuffix], pagedKV);
+    pagedKV.reportTokens(1, sharedSuffix);
+    pagedKV.updateIndptr(ws2);
+
+    refKV.reset(1);
+    const refTokens = ws.forwardEagerPrefill(model, [fullPrompt], refKV);
+    refKV.reportTokens(0, fullPrompt);
+    refKV.updateIndptr(ws);
+
+    const numDecodeSteps = 5;
+    let lastSeq0 = prefillTokens[0];
+    let lastSeq1 = suffixTokens[1];
+    let lastRef = refTokens[0];
+
+    const seq1Tokens: number[] = [];
+    const refDecoded: number[] = [];
+
+    for (let step = 0; step < numDecodeSteps; step++) {
+      const decoded = ws2.forwardEagerDecode(model, [lastSeq0, lastSeq1], pagedKV);
+      const refStep = ws.forwardEagerDecode(model, [lastRef], refKV);
+      pagedKV.allocDecodeToken(0);
+      pagedKV.allocDecodeToken(1);
+      pagedKV.reportTokens(0, [decoded[0]]);
+      pagedKV.reportTokens(1, [decoded[1]]);
+      pagedKV.updateIndptr(ws2);
+      refKV.allocDecodeToken(0);
+      refKV.reportTokens(0, [refStep[0]]);
+      refKV.updateIndptr(ws);
+      lastSeq0 = decoded[0];
+      lastSeq1 = decoded[1];
+      lastRef = refStep[0];
+      seq1Tokens.push(lastSeq1);
+      refDecoded.push(lastRef);
+    }
+
+    assert.deepStrictEqual(seq1Tokens, refDecoded,
+      `shared-page decode tokens should match reference: shared=${seq1Tokens}, ref=${refDecoded}`);
+  });
+
+  it("cross-sequence copyPartial: prefill + decode matches full prefill + decode", () => {
+    using pagedKV = makePagedKV(2, 256);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    using refKV = makePagedKV(1, 256);
+    const baseLen = PAGE_SIZE + 4;
+    const base = makeLongPrompt(baseLen);
+    const suffix = makeLongPrompt(8, [200]);
+    const fullPrompt = [...base, ...suffix];
+
+    pagedKV.reset(2);
+    const prefillTokens = ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.reportTokens(0, base);
+    pagedKV.updateIndptr(ws2);
+
+    const sharedSuffix = pagedKV.prefixMatch(1, fullPrompt, true);
+    assert.deepStrictEqual(sharedSuffix, suffix, `prefixMatch with copyPartial should return suffix`);
+    const suffixTokens = ws2.forwardEagerPrefill(model, [[], sharedSuffix], pagedKV);
+    pagedKV.reportTokens(1, sharedSuffix);
+    pagedKV.updateIndptr(ws2);
+
+    refKV.reset(1);
+    const refTokens = ws.forwardEagerPrefill(model, [fullPrompt], refKV);
+    refKV.reportTokens(0, fullPrompt);
+    refKV.updateIndptr(ws);
+
+    const numDecodeSteps = 5;
+    let lastSeq0 = prefillTokens[0];
+    let lastSeq1 = suffixTokens[1];
+    let lastRef = refTokens[0];
+
+    const seq1Tokens: number[] = [];
+    const refDecoded: number[] = [];
+
+    for (let step = 0; step < numDecodeSteps; step++) {
+      const decoded = ws2.forwardEagerDecode(model, [lastSeq0, lastSeq1], pagedKV);
+      const refStep = ws.forwardEagerDecode(model, [lastRef], refKV);
+      pagedKV.allocDecodeToken(0);
+      pagedKV.allocDecodeToken(1);
+      pagedKV.reportTokens(0, [decoded[0]]);
+      pagedKV.reportTokens(1, [decoded[1]]);
+      pagedKV.updateIndptr(ws2);
+      refKV.allocDecodeToken(0);
+      refKV.reportTokens(0, [refStep[0]]);
+      refKV.updateIndptr(ws);
+      lastSeq0 = decoded[0];
+      lastSeq1 = decoded[1];
+      lastRef = refStep[0];
+      seq1Tokens.push(lastSeq1);
+      refDecoded.push(lastRef);
+    }
+
+    assert.deepStrictEqual(seq1Tokens, refDecoded,
+      `copyPartial decode tokens should match reference: copyPartial=${seq1Tokens}, ref=${refDecoded}`);
   });
 });

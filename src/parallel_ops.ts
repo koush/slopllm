@@ -1173,7 +1173,20 @@ export class ParallelTensor extends Tensor {
   }
 
   memcpy2d(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
-    throw new Error("ParallelTensor.memcpy2d: use shard tensors directly");
+    const shardRowBytes = this.shards[0].shape.slice(1).reduce((a, b) => a * b, 1) * 2;
+    if (width !== shardRowBytes || dpitch !== spitch || height !== 1) {
+      throw new Error("ParallelTensor.memcpy2d: only supports full-row copies along non-sharded dimension (width must equal shard row bytes, height must be 1)");
+    }
+    const dstPageId = dstOffset / dpitch;
+    const srcPageId = src / spitch;
+    for (let i = 0; i < this.shards.length; i++) {
+      this.shards[i].memcpy2d(
+        dstPageId * shardRowBytes, shardRowBytes,
+        this.shards[i].data + srcPageId * shardRowBytes, shardRowBytes,
+        shardRowBytes, 1,
+        kind,
+      );
+    }
   }
 
   sigmoid(): Tensor {

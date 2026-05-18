@@ -41,8 +41,8 @@ class Qwen35ChatCache implements ChatCache {
     return inputIds.slice();
   }
 
-  appendTokens(seqIdx: number, tokens: number[]): void {
-    this.pagedKV.appendTokens(seqIdx, tokens);
+  reportTokens(seqIdx: number, tokens: number[]): void {
+    this.pagedKV.reportTokens(seqIdx, tokens);
   }
 }
 

@@ -22,7 +22,7 @@ export interface ChatCache extends Disposable {
   reset(batchSize: number): void;
   free(): void;
   prefixMatch(seqIdx: number, inputIds: number[]): number[];
-  appendTokens(seqIdx: number, tokens: number[]): void;
+  reportTokens(seqIdx: number, tokens: number[]): void;
 }
 
 export interface CommonModelConfig {

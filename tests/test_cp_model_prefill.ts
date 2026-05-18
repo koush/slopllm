@@ -115,8 +115,8 @@ describe("CP vs non-CP model prefill", () => {
 
     wsRef.forwardEagerPrefill(modelRef, [INPUT_IDS], cacheRef);
     wsCp.forwardEagerPrefill(modelCp, [INPUT_IDS], cacheCp);
-    cacheRef.appendTokens(0, INPUT_IDS);
-    cacheCp.appendTokens(0, INPUT_IDS);
+    cacheRef.reportTokens(0, INPUT_IDS);
+    cacheCp.reportTokens(0, INPUT_IDS);
 
     const pagedKVRef = cacheRef.getPagedKV() as PagedKVCache;
     const pagedKVCp = cacheCp.getPagedKV() as PagedKVCache;
@@ -213,8 +213,8 @@ describe("CP vs non-CP model prefill", () => {
 
     wsRef.forwardEagerPrefill(modelRef, [INPUT_IDS], cacheRef);
     wsCp.forwardEagerPrefill(modelCp, [INPUT_IDS], cacheCp);
-    cacheRef.appendTokens(0, INPUT_IDS);
-    cacheCp.appendTokens(0, INPUT_IDS);
+    cacheRef.reportTokens(0, INPUT_IDS);
+    cacheCp.reportTokens(0, INPUT_IDS);
 
     (modelRef as any).forward = refRestore.origForward;
     (modelRef as any).mlaLayer = refRestore.origMlaLayer;
@@ -379,8 +379,8 @@ describe("CP vs non-CP model prefill", () => {
 
     wsRef.forwardEagerPrefill(modelRef, [INPUT_IDS], cacheRef);
     wsCp.forwardEagerPrefill(modelCp, [INPUT_IDS], cacheCp);
-    cacheRef.appendTokens(0, INPUT_IDS);
-    cacheCp.appendTokens(0, INPUT_IDS);
+    cacheRef.reportTokens(0, INPUT_IDS);
+    cacheCp.reportTokens(0, INPUT_IDS);
 
     (modelRef as any).forward = refRestore.origForward;
     (modelRef as any).mlaLayer = refRestore.origMlaLayer;
