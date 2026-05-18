@@ -823,11 +823,75 @@ export class ParallelTensor extends Tensor {
   }
 
   max(offset: number = 0): { values: Tensor, indices: Tensor } {
-    const dim = this.fullShape[1];
-    const result = this.topk(1, dim, offset);
-    const batch = this.fullShape[0];
-    const values = result.values.reshape([batch]);
-    const indices = result.indices.reshape([batch]);
+    super.max(offset);
+    if (this.parallelism === TensorParallelism.PartialSum) {
+      this.allReduce();
+      return this.max(offset);
+    }
+
+    if (this.parallelism === TensorParallelism.Row) {
+      const batch = this.fullShape[0];
+      const dim = this.fullShape[1];
+      const ws = this.worldSize;
+      const shardDim = dim / ws;
+
+      const localValuesShards: Tensor[] = [];
+      const localIndicesShards: Tensor[] = [];
+      for (let i = 0; i < ws; i++) {
+        const { values, indices } = this.shards[i].max(i * shardDim + offset);
+        localValuesShards.push(values);
+        localIndicesShards.push(indices);
+      }
+
+      using allValuesPar = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch, ws], this.type, TensorParallelism.Row);
+      using allIndicesPar = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch, ws], "I32", TensorParallelism.Row);
+
+      using allValues = allValuesPar.allGather(this.workspace);
+      using allIndices = allIndicesPar.allGather(this.workspace);
+
+      const { values: rankValues, indices: rankIndices } = allValues.max(0);
+
+      using _rankIndices = rankIndices;
+      using gatheredIndices = allIndices.gather(rankIndices, 1, ws, batch);
+
+      const finalIndices = this.parallelOps.newTensor(this.workspace, [batch], "I32", false, undefined, TensorParallelism.Replicated);
+      const pGatheredIndices = gatheredIndices as ParallelTensor;
+      const idxBytes = batch * 4;
+      for (let i = 0; i < ws; i++) {
+        finalIndices.shards[i].memcpy(pGatheredIndices.shards[i], idxBytes);
+      }
+
+      return { values: rankValues, indices: finalIndices };
+    }
+
+    if (this.parallelism === TensorParallelism.Column) {
+      const batch = this.fullShape[0];
+
+      const localValuesShards: Tensor[] = [];
+      const localIndicesShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        const { values, indices } = this.shards[i].max(offset);
+        localValuesShards.push(values);
+        localIndicesShards.push(indices);
+      }
+
+      const values = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch], this.type, TensorParallelism.Column);
+      const indices = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch], "I32", TensorParallelism.Column);
+
+      return { values, indices };
+    }
+
+    this.assertParallel("max input", this, TensorParallelism.Replicated);
+
+    const valuesShards: Tensor[] = [];
+    const indicesShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      const { values, indices } = this.shards[i].max(offset);
+      valuesShards.push(values);
+      indicesShards.push(indices);
+    }
+    const values = this.parallelOps.wrapShards(this.workspace, valuesShards, [this.shape[0]], this.type, TensorParallelism.Replicated);
+    const indices = this.parallelOps.wrapShards(this.workspace, indicesShards, [this.shape[0]], "I32", TensorParallelism.Replicated);
     return { values, indices };
   }
 
@@ -1476,6 +1540,9 @@ class P2PAllReduceGroup {
    * for double buffering.
    */
   ensureCapacity(slotBytes: number, shardWorkspaces: WorkspaceBase[]): void {
+    // Round up to multiple of 16 so that double-buffer slot offsets are
+    // always 16-byte aligned (required by P2P kernels using uint4 copies).
+    slotBytes = (slotBytes + 15) & ~15;
     if (slotBytes <= this.maxSlotBytes) return;
     const bufBytes = slotBytes * 2;
     const addon = getNativeAddon();

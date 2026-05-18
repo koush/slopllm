@@ -97,10 +97,10 @@ export class MetaTensor extends Tensor {
 
     max(offset: number = 0): { values: Tensor, indices: Tensor } {
         super.max(offset);
-        const dim = this.shape[1];
-        const result = this.topk(1, dim, offset);
         const batch = this.shape[0];
-        return { values: result.values.reshape([batch]), indices: result.indices.reshape([batch]) };
+        const values = this.workspace.alloc([batch], this.type);
+        const indices = this.workspace.alloc([batch], "I32");
+        return { values, indices };
     }
 
     indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
