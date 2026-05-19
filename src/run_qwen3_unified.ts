@@ -292,8 +292,8 @@ export function* generateStream(
         ws.forwardInput(state);
         using hiddenStates = new UsingHolder(model.forward(state));
         doSample(state.computeLogits(hiddenStates.value, model));
-        if (mtp && model.forwardMtp) {
-          const nextn = 3;
+        const nextn = 3;
+        if (mtp && model.forwardMtp && cache.getPagedKV().sequences[0].allocLen < maxNewTokens - nextn * 2) {
           let total = 1;
 
           const mtpSampleResult = new UsingHolder<Tensor>(undefined!);
@@ -318,6 +318,7 @@ export function* generateStream(
             mtpSampleResult.replace(state.computeLogits(hiddenStates.value, model));
             const topk = mtpSampleResult.value.topk(2, model.cfg.vocabSize);
             using _values = topk.values;
+            mtpSampleResult.replace(topk.indices);
             if (total > 1) {
               // Reorder topk indices from interleaved [seq0_top0, seq0_top1, seq1_top0, seq1_top1, ...]
               // to concatenated [seq0_top0, seq1_top0, ..., seq0_top1, seq1_top1, ...]
@@ -327,12 +328,15 @@ export function* generateStream(
               reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
               reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
               mtpSampleResult.replace(reordered);
-              topk.indices[Symbol.dispose]();
-            } else {
-              mtpSampleResult.replace(topk.indices);
             }
             total *= 2;
           }
+          for (let i = 0; i < total / 2 - 1; i++) {
+            const seq = cache.getPagedKV().sequences.pop();
+            seq!.clear();
+          }
+          const seq0 = cache.getPagedKV().sequences[0];
+          seq0.truncate(seq0.allocLen - nextn);
           ws.decodeStep(state, model, -nextn);
         }
 

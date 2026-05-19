@@ -58,6 +58,17 @@ class Sequence {
     }
   }
 
+  truncate(newLen: number) {
+    if (newLen < 0 || newLen > this.allocLen) {
+      throw new Error(`truncate: newLen ${newLen} out of range [0, ${this.allocLen}]`);
+    }
+    this.allocLen = newLen;
+    const pageSize = this.pagedKvCache.pageSize;
+    while (this.pages.length > 0 && newLen <= (this.pages.length - 1) * pageSize) {
+      this.popPage();
+    }
+  }
+
   // Returns the number of matching tokens at the start of this sequence and inputIds.
   prefixMatch(inputIds: number[]): number {
     const tokenIds = this.pages.map(p => p.tokenIds).flat();
