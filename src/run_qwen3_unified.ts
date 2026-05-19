@@ -4,7 +4,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { ChatCache, ChatModel, SamplingParams, makeSamplingParams } from "./chat_model";
 import { DeviceOps } from "./device_ops";
-import { ExecutionWorkspace } from "./execution-workspace";
+import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
 import { GlmOps, I32 } from "./glm_ops";
 import { MetaOps } from "./meta_ops";
@@ -186,7 +186,7 @@ export function* generateStream(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
-  timing?: DecodeTiming, mtp?: boolean,
+  timing?: DecodeTiming, mtp?: boolean, tokenizer?: any,
 ): Generator<number> {
   const suffixIds = cache.prefixMatch(0, inputIds);
 
@@ -219,6 +219,99 @@ export function* generateStream(
     }));
   }
 
+  using captureManager = new CaptureManager(glm);
+  using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
+  using hiddenStates0 = new UsingHolder<Tensor>(undefined!);
+  using hiddenStates1 = new UsingHolder<Tensor>(undefined!);
+  using hiddenStates2 = new UsingHolder<Tensor>(undefined!);
+  using mtpDebugHost = new UsingHolder<Tensor>(undefined!);
+
+  const hiddenStatesArray = [
+    targetHiddenStates,
+    hiddenStates0,
+    hiddenStates1,
+    hiddenStates2,
+  ];
+
+  function doMtp(state: ExecutionState, prefill = false) {
+
+    const nextn = 3;
+    if (mtp && model.forwardMtp && cache.getPagedKV().sequences[0].allocLen < maxNewTokens - nextn * 2) {
+      let total = 1;
+
+      for (let i = 0; i < nextn; i++) {
+        const srcHiddenStates = hiddenStatesArray[i];
+        const dstHiddenStates = hiddenStatesArray[i + 1];
+
+        if (total != 1) {
+          // fork each sequence
+          for (let j = 0; j < total / 2; j++) {
+            const seqIdx = j + total / 2;
+            cache.getPagedKV().copySequence(seqIdx, j);
+          }
+        }
+
+        const state = ws.planDecode(model, 1 << i, cache, useGraph);
+
+        captureManager.run(() => {
+          if (total != 1) {
+            // concat to double the inputs
+            srcHiddenStates.replace(srcHiddenStates.value.cat([srcHiddenStates.value], 0));
+          }
+          ws.decodeStep(state, model);
+          dstHiddenStates.replace(model.forwardMtp!(state, srcHiddenStates.value));
+          using logits = state.computeLogits(dstHiddenStates.value, model);
+          const topk = logits.topk(2, model.cfg.vocabSize);
+          using _values = topk.values;
+
+          if (i === 0) {
+            mtpDebugHost.replace(sampleWorkspace.allocPinned(topk.indices.shape, topk.indices.type));
+            mtpDebugHost.value.memcpy(topk.indices, topk.indices.bytes, MemcpyKind.DeviceToHost);
+          }
+
+          if (i !== nextn - 1) {
+            using _indices = topk.indices;
+            const batch = total * 2;
+            // Reorder topk indices from interleaved [seq0_top0, seq0_top1, seq1_top0, seq1_top1, ...]
+            // to concatenated [seq0_top0, seq1_top0, ..., seq0_top1, seq1_top1, ...]
+            // to match the cat'd hidden states layout [seq0, seq1, seq0, seq1, ...]
+            const half = batch / 2;
+            using reordered = ws.alloc(topk.indices.shape, topk.indices.type);
+            reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
+            reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
+            ws.inputIdsBuf.memcpy(reordered, batch * I32, MemcpyKind.DeviceToDevice);
+          }
+          else {
+            // roll back after final iteration
+          }
+        }, !useGraph || prefill ? undefined : ['mtp', i]);
+        total *= 2;
+      }
+      for (let i = 0; i < total / 2 - 1; i++) {
+        const seq = cache.getPagedKV().sequences.pop();
+        seq!.clear();
+      }
+      const seq0 = cache.getPagedKV().sequences[0];
+      seq0.truncate(seq0.allocLen - nextn);
+
+      // capture this somehow in target model graph
+      ws.decodeStep(state, model, -nextn);
+
+      // print tokens for debugging
+      {
+        glm.synchronize();
+        const buf = mtpDebugHost.value.readPinnedBuffer();
+        const ids: number[] = [];
+        for (let j = 0; j < mtpDebugHost.value.numElements; j++) {
+          ids.push(buf.readInt32LE(j * 4));
+        }
+        console.log("MTP top0 tokens:", ids.filter((_, k) => k % 2 === 0).map(id => tokenizer?.decode([id]) ?? id).join(""));
+        console.log("MTP top1 tokens:", ids.filter((_, k) => k % 2 === 1).map(id => tokenizer?.decode([id]) ?? id).join(""));
+      }
+    }
+
+  }
+
   const useGraph = graphState !== undefined;
   if (useGraph) {
     for (let i = 0; i < 3; i++) {
@@ -239,9 +332,9 @@ export function* generateStream(
       ws.forwardInput(state);
 
       glm.graphBeginCapture();
-      using hiddenStates = model.forward(state);
+      targetHiddenStates.replace(model.forward(state));
       state.finishPrefill();
-      using firstTokens = state.computeLogits(hiddenStates, model);
+      using firstTokens = state.computeLogits(targetHiddenStates.value, model);
       const graph = glm.graphEndCapture();
       const graphExec = glm.graphInstantiate(graph);
       glm.graphDestroy(graph);
@@ -251,13 +344,26 @@ export function* generateStream(
       readSample();
 
       glm.graphExecDestroy(graphExec);
+
+      doMtp(state, true);
+      glm.synchronize();
     }
   }
-  else
-  {
-    using firstTokens = ws.forwardPrefill(model, [suffixIds], cache);
+  else {
+    const inputIdsList = [suffixIds];
+    const batchSize = inputIdsList.length;
+    const seqLens = inputIdsList.map(ids => ids.length);
+    const state = ws.planPrefill(model, batchSize, seqLens, cache);
+    state.prepareInput(inputIdsList);
+    ws.forwardInput(state);
+    targetHiddenStates.replace(model.forward(state));
+    using firstTokens = state.computeLogits(targetHiddenStates.value, model);
+    state.finishPrefill();
     doSample(firstTokens);
     readSample();
+
+    doMtp(state, true);
+    glm.synchronize();
   }
   cache.reportTokens(0, suffixIds);
 
@@ -270,19 +376,6 @@ export function* generateStream(
   let lastTokenTime = 0;
   let postWarmupTokenCount = 0;
   let tAfterSync = 0;
-  using captureManager = new CaptureManager(glm);
-
-  using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
-  using hiddenStates0 = new UsingHolder<Tensor>(undefined!);
-  using hiddenStates1 = new UsingHolder<Tensor>(undefined!);
-  using hiddenStates2 = new UsingHolder<Tensor>(undefined!);
-
-  const hiddenStatesArray = [
-    targetHiddenStates,
-    hiddenStates0,
-    hiddenStates1,
-    hiddenStates2,
-  ];
 
   try {
     for (let i = 1; i < maxNewTokens; i++) {
@@ -307,57 +400,7 @@ export function* generateStream(
         doSample(state.computeLogits(targetHiddenStates.value, model));
       }, !useGraph ? undefined : ['decode']);
 
-      const nextn = 3;
-      if (mtp && model.forwardMtp && cache.getPagedKV().sequences[0].allocLen < maxNewTokens - nextn * 2) {
-        let total = 1;
-
-        for (let i = 0; i < nextn; i++) {
-          const srcHiddenStates = hiddenStatesArray[i];
-          const dstHiddenStates = hiddenStatesArray[i + 1];
-
-          if (total != 1) {
-            // fork each sequence
-            for (let j = 0; j < total / 2; j++) {
-              const seqIdx = j + total / 2;
-              cache.getPagedKV().copySequence(seqIdx, j);
-            }
-          }
-
-          const state = ws.planDecode(model, 1 << i, cache, useGraph);
-
-          captureManager.run(() => {
-            if (total != 1) {
-              // concat to double the inputs
-              srcHiddenStates.replace(srcHiddenStates.value.cat([srcHiddenStates.value], 0));
-            }
-            ws.decodeStep(state, model);
-            dstHiddenStates.replace(model.forwardMtp!(state, srcHiddenStates.value));
-            using logits = state.computeLogits(dstHiddenStates.value, model);
-            const topk = logits.topk(2, model.cfg.vocabSize);
-            using _values = topk.values;
-            using _indices = topk.indices;
-            if (i !== nextn - 1) {
-              const batch = total * 2;
-              // Reorder topk indices from interleaved [seq0_top0, seq0_top1, seq1_top0, seq1_top1, ...]
-              // to concatenated [seq0_top0, seq1_top0, ..., seq0_top1, seq1_top1, ...]
-              // to match the cat'd hidden states layout [seq0, seq1, seq0, seq1, ...]
-              const half = batch / 2;
-              using reordered = ws.alloc(topk.indices.shape, topk.indices.type);
-              reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
-              reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
-              ws.inputIdsBuf.memcpy(reordered, batch * I32, MemcpyKind.DeviceToDevice);
-            }
-          }, !useGraph ? undefined : ['mtp', i]);
-          total *= 2;
-        }
-        for (let i = 0; i < total / 2 - 1; i++) {
-          const seq = cache.getPagedKV().sequences.pop();
-          seq!.clear();
-        }
-        const seq0 = cache.getPagedKV().sequences[0];
-        seq0.truncate(seq0.allocLen - nextn);
-        ws.decodeStep(state, model, -nextn);
-      }
+      doMtp(state);
 
 
 
@@ -483,12 +526,12 @@ async function interactiveChat(
       const generatedIds: number[] = [];
       const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-    for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp)) {
-    generatedIds.push(tokenId);
-    tokCount++;
-    const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
-    process.stdout.write(chunk);
-    if (eosIds.has(tokenId)) break;
+      for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, tokenizer)) {
+        generatedIds.push(tokenId);
+        tokCount++;
+        const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
+        process.stdout.write(chunk);
+        if (eosIds.has(tokenId)) break;
       }
 
       const elapsed = performance.now() - t0;
@@ -522,7 +565,7 @@ async function singlePrompt(
   const generatedIds: number[] = [];
   const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp)) {
+  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, tokenizer)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -610,8 +653,8 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   const modelDir = args.modelDir ?? (args.useGlm51
-    // ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
-    ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
+    ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
+    // ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
     : resolveModelPath(args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO)));
 
   if (args.meta) {
@@ -619,8 +662,8 @@ async function main(): Promise<void> {
     const model: ChatModel = args.useGlm51
       ? await Glm51Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen, args.cp, args.mtp)
       : args.useQwen35
-      ? await Qwen35Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
-      : await Qwen3Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen);
+        ? await Qwen35Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
+        : await Qwen3Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen);
     const loadAllocs = metaOps.totalAllocs;
     const loadBytes = metaOps.totalBytes;
     const loadStats = model.stats();
@@ -653,13 +696,13 @@ async function main(): Promise<void> {
 
   const repoId = args.useGlm51 ? GLM51_REPO
     : args.useQwen35 ? QWEN35_REPO
-    : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
+      : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
 
   const model: ChatModel = args.useGlm51
     ? await Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen, args.cp, args.mtp)
     : args.useQwen35
-    ? await Qwen35Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
-    : await Qwen3Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen);
+      ? await Qwen35Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
+      : await Qwen3Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen);
 
   if (args.stats) {
     const printWsStats = (label: string, s: ReturnType<WorkspaceBase["stats"]>) => {
