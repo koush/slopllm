@@ -259,8 +259,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const rowBytes = tensor.shape.slice(1).reduce((a, b) => a * b, 1) * 2;
     tensor.memcpy2d(
       dstPageId * rowBytes, rowBytes,
-      tensor.data + srcPageId * rowBytes, rowBytes,
-      rowBytes, 1,
+      tensor, srcPageId * rowBytes,
+      rowBytes, rowBytes, 1,
       MemcpyKind.DeviceToDevice,
     );
   }

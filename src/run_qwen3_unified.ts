@@ -6,7 +6,7 @@ import { ChatCache, ChatModel, SamplingParams, makeSamplingParams } from "./chat
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
-import { GlmOps } from "./glm_ops";
+import { GlmOps, I32 } from "./glm_ops";
 import { MetaOps } from "./meta_ops";
 import { resolveModelPath } from "./model_path";
 import { ParallelOps } from "./parallel_ops";
@@ -300,24 +300,37 @@ export function* generateStream(
           for (let i = 0; i < nextn; i++) {
             if (total != 1) {
               // fork each sequence
-              for (let j = total / 2 - 1; j >= 0; j--) {
-                const seqIdx = j * 2 + 1;
+              for (let j = 0; j < total / 2; j++) {
+                const seqIdx = j + total / 2;
                 cache.getPagedKV().copySequence(seqIdx, j);
               }
+
+              hiddenStates.replace(hiddenStates.value.cat([hiddenStates.value], 0));
             }
 
             const state = ws.planDecode(model, 1 << i, cache, useGraph);
             if (mtpSampleResult.value) {
-              const reshaped = mtpSampleResult.value.reshape([1 << i, 1]);
-              state.prepareInput(reshaped);
+              ws.inputIdsBuf.memcpy(mtpSampleResult.value, state.batchSize * I32, MemcpyKind.DeviceToDevice);
             }
 
             ws.decodeStep(state, model);
-            hiddenStates.replace(model.forwardMtp(state, hiddenStates.value, mtpSampleResult.value || gpuSampleResult!));
+            hiddenStates.replace(model.forwardMtp(state, hiddenStates.value));
             mtpSampleResult.replace(state.computeLogits(hiddenStates.value, model));
             const topk = mtpSampleResult.value.topk(2, model.cfg.vocabSize);
             using _values = topk.values;
-            mtpSampleResult.replace(topk.indices);
+            if (total > 1) {
+              // Reorder topk indices from interleaved [seq0_top0, seq0_top1, seq1_top0, seq1_top1, ...]
+              // to concatenated [seq0_top0, seq1_top0, ..., seq0_top1, seq1_top1, ...]
+              // to match the cat'd hidden states layout [seq0, seq1, seq0, seq1, ...]
+              const half = total;
+              const reordered = ws.alloc(topk.indices.shape, topk.indices.type);
+              reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
+              reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
+              mtpSampleResult.replace(reordered);
+              topk.indices[Symbol.dispose]();
+            } else {
+              mtpSampleResult.replace(topk.indices);
+            }
             total *= 2;
           }
           ws.decodeStep(state, model, -nextn);

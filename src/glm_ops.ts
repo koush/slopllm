@@ -356,8 +356,8 @@ export class GlmTensor extends Tensor {
     getNativeAddon().memcpy(this.glm.ctx, this.data, src.data, bytes, memcpyKindToNative(copyKind));
   }
 
-  memcpy2d(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
-    getNativeAddon().memcpy2d(this.glm.ctx, this.data + dstOffset, dpitch, src, spitch, width, height, memcpyKindToNative(kind));
+  memcpy2d(dstOffset: number, dpitch: number, src: Tensor, srcOffset: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+    getNativeAddon().memcpy2d(this.glm.ctx, this.data + dstOffset, dpitch, (src as GlmTensor).data + srcOffset, spitch, width, height, memcpyKindToNative(kind));
   }
 
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
@@ -449,12 +449,12 @@ export class GlmTensor extends Tensor {
     const dstRowBytes = outShape[dim] * innerStride * elemBytes;
     let offset = 0;
     for (const t of all) {
-      const src = t as GlmTensor;
       const srcRowBytes = t.shape[dim] * innerStride * elemBytes;
       out.memcpy2d(
         offset,
         dstRowBytes,
-        src.data,
+        t,
+        0,
         srcRowBytes,
         srcRowBytes,
         outerStrides,

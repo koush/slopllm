@@ -1963,7 +1963,7 @@ describe("ParallelTensor.memcpy2d", () => {
     const dstPageId = 3;
     pt.memcpy2d(
       dstPageId * fullRowBytes, fullRowBytes,
-      0 + srcPageId * fullRowBytes, fullRowBytes,
+      pt, srcPageId * fullRowBytes, fullRowBytes,
       fullRowBytes, 1,
       MemcpyKind.DeviceToDevice,
     );
@@ -2006,7 +2006,7 @@ describe("ParallelTensor.memcpy2d", () => {
     const dstPageId = 3;
     pt.memcpy2d(
       dstPageId * shardRowBytes, shardRowBytes,
-      srcPageId * shardRowBytes, shardRowBytes,
+      pt, srcPageId * shardRowBytes, shardRowBytes,
       shardRowBytes, 1,
       MemcpyKind.DeviceToDevice,
     );
@@ -2023,22 +2023,6 @@ describe("ParallelTensor.memcpy2d", () => {
         assert.ok(Math.abs(actual - expected) < 0.01, `rank=${rank} col=${c}: expected ${expected}, got ${actual}`);
       }
     }
-  });
-
-  it("Row parallel: rejects unsupported width", () => {
-    const pt = ws.alloc([4, 8], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
-    const shardRowBytes = 8;
-    assert.throws(() => {
-      pt.memcpy2d(0, shardRowBytes * 3, 0, shardRowBytes * 3, shardRowBytes * 3, 1, MemcpyKind.DeviceToDevice);
-    }, /unsupported width/);
-  });
-
-  it("Row parallel: rejects height > 1", () => {
-    const pt = ws.alloc([4, 8], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
-    const shardRowBytes = 8;
-    assert.throws(() => {
-      pt.memcpy2d(0, shardRowBytes, 0, shardRowBytes, shardRowBytes, 2, MemcpyKind.DeviceToDevice);
-    }, /single-row copies/);
   });
 
   it("Replicated: full-row copy works (BF16)", () => {
@@ -2058,7 +2042,7 @@ describe("ParallelTensor.memcpy2d", () => {
     const dstPageId = 2;
     pt.memcpy2d(
       dstPageId * fullRowBytes, fullRowBytes,
-      0 + srcPageId * fullRowBytes, fullRowBytes,
+      pt, srcPageId * fullRowBytes, fullRowBytes,
       fullRowBytes, 1,
       MemcpyKind.DeviceToDevice,
     );

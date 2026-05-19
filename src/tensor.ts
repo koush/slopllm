@@ -267,7 +267,7 @@ export abstract class Tensor implements Disposable {
   abstract mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void>;
   abstract memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void>;
   abstract memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void;
-  abstract memcpy2d(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void;
+  abstract memcpy2d(dstOffset: number, dpitch: number, src: Tensor, srcOffset: number, spitch: number, width: number, height: number, kind: MemcpyKind): void;
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     if (positionIds.type !== "I32") throw new Error(`rotaryEmbedding: positionIds must be I32, got ${positionIds.type}`);
     return undefined as never;

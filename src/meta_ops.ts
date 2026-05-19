@@ -42,7 +42,7 @@ export class MetaTensor extends Tensor {
     memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {
     }
 
-    memcpy2d(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+    memcpy2d(_dstOffset: number, _dpitch: number, _src: Tensor, _srcOffset: number, _spitch: number, _width: number, _height: number, _kind: MemcpyKind): void {
     }
 
     linear(weight: Tensor, batch: number): Tensor {

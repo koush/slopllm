@@ -214,7 +214,7 @@ export class ParallelTensor extends Tensor {
           output.shards[i].memcpy2d(
             r * shardDim1 * inner * eb,
             this.fullShape[1] * inner * eb,
-            tempTensors[i].data + r * shardBytes,
+            tempTensors[i], r * shardBytes,
             shardDim1 * inner * eb,
             shardDim1 * inner * eb,
             outer,
@@ -656,7 +656,7 @@ export class ParallelTensor extends Tensor {
         tempTensor.memcpy2d(
           i * shardDim * eb,
           fullDim * eb,
-          this.shards[i].data,
+          this.shards[i], 0,
           shardDim * eb,
           shardDim * eb,
           rows,
@@ -1172,22 +1172,23 @@ export class ParallelTensor extends Tensor {
     }
   }
 
-  memcpy2d(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+  memcpy2d(dstOffset: number, dpitch: number, src: Tensor, srcOffset: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+    if (this.parallelism === TensorParallelism.Replicated) {
+      const pSrc = src as ParallelTensor;
+      for (let i = 0; i < this.shards.length; i++) {
+        this.shards[i].memcpy2d(dstOffset, dpitch, pSrc.shards[i], srcOffset, spitch, width, height, kind);
+      }
+      return;
+    }
     const shardRowBytes = this.shards[0].shape.slice(1).reduce((a, b) => a * b, 1) * 2;
-    const fullRowBytes = shardRowBytes * this.worldSize;
-    if (height !== 1 || dpitch !== spitch) {
-      throw new Error("ParallelTensor.memcpy2d: only supports single-row copies with dpitch === spitch");
-    }
-    if (width !== shardRowBytes && width !== fullRowBytes) {
-      throw new Error(`ParallelTensor.memcpy2d: unsupported width=${width} (shardRowBytes=${shardRowBytes}, fullRowBytes=${fullRowBytes})`);
-    }
-    const dstPageId = dstOffset / dpitch;
-    const srcPageId = src / spitch;
+    const dstPageId = Math.floor(dstOffset / dpitch);
+    const srcPageId = Math.floor(srcOffset / spitch);
+    const pSrc = src as ParallelTensor;
     for (let i = 0; i < this.shards.length; i++) {
       this.shards[i].memcpy2d(
         dstPageId * shardRowBytes, shardRowBytes,
-        this.shards[i].data + srcPageId * shardRowBytes, shardRowBytes,
-        shardRowBytes, 1,
+        pSrc.shards[i], srcPageId * shardRowBytes,
+        shardRowBytes, shardRowBytes, 1,
         kind,
       );
     }
