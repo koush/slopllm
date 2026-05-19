@@ -321,32 +321,34 @@ export function* generateStream(
               const seqIdx = j + total / 2;
               cache.getPagedKV().copySequence(seqIdx, j);
             }
-
           }
 
           const state = ws.planDecode(model, 1 << i, cache, useGraph);
 
-          if (total != 1) {
-            // concat to double the inputs
-            srcHiddenStates.replace(srcHiddenStates.value.cat([srcHiddenStates.value], 0));
-          }
-          ws.decodeStep(state, model);
-          dstHiddenStates.replace(model.forwardMtp(state, srcHiddenStates.value));
-          using logits = state.computeLogits(dstHiddenStates.value, model);
-          const topk = logits.topk(2, model.cfg.vocabSize);
-          using _values = topk.values;
-          using _indices = topk.indices;
+          captureManager.run(() => {
+            if (total != 1) {
+              // concat to double the inputs
+              srcHiddenStates.replace(srcHiddenStates.value.cat([srcHiddenStates.value], 0));
+            }
+            ws.decodeStep(state, model);
+            dstHiddenStates.replace(model.forwardMtp!(state, srcHiddenStates.value));
+            using logits = state.computeLogits(dstHiddenStates.value, model);
+            const topk = logits.topk(2, model.cfg.vocabSize);
+            using _values = topk.values;
+            using _indices = topk.indices;
+            if (i !== nextn - 1) {
+              const batch = total * 2;
+              // Reorder topk indices from interleaved [seq0_top0, seq0_top1, seq1_top0, seq1_top1, ...]
+              // to concatenated [seq0_top0, seq1_top0, ..., seq0_top1, seq1_top1, ...]
+              // to match the cat'd hidden states layout [seq0, seq1, seq0, seq1, ...]
+              const half = batch / 2;
+              using reordered = ws.alloc(topk.indices.shape, topk.indices.type);
+              reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
+              reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
+              ws.inputIdsBuf.memcpy(reordered, batch * I32, MemcpyKind.DeviceToDevice);
+            }
+          }, !useGraph ? undefined : ['mtp', i]);
           total *= 2;
-          if (i !== nextn - 1) {
-            // Reorder topk indices from interleaved [seq0_top0, seq0_top1, seq1_top0, seq1_top1, ...]
-            // to concatenated [seq0_top0, seq1_top0, ..., seq0_top1, seq1_top1, ...]
-            // to match the cat'd hidden states layout [seq0, seq1, seq0, seq1, ...]
-            const half = total / 2;
-            using reordered = ws.alloc(topk.indices.shape, topk.indices.type);
-            reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
-            reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
-            ws.inputIdsBuf.memcpy(reordered, total * I32, MemcpyKind.DeviceToDevice);
-          }
         }
         for (let i = 0; i < total / 2 - 1; i++) {
           const seq = cache.getPagedKV().sequences.pop();

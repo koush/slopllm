@@ -30,7 +30,7 @@
                 "--glm51",
                 "--greedy",
                 // "--nvfp4",
-                "--no-cuda-graph",
+                // "--no-cuda-graph",
                 "--cp",
                 "--mtp",
             ],
