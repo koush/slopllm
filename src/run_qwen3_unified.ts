@@ -272,6 +272,18 @@ export function* generateStream(
   let tAfterSync = 0;
   using captureManager = new CaptureManager(glm);
 
+  using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
+  using hiddenStates0 = new UsingHolder<Tensor>(undefined!);
+  using hiddenStates1 = new UsingHolder<Tensor>(undefined!);
+  using hiddenStates2 = new UsingHolder<Tensor>(undefined!);
+
+  const hiddenStatesArray = [
+    targetHiddenStates,
+    hiddenStates0,
+    hiddenStates1,
+    hiddenStates2,
+  ];
+
   try {
     for (let i = 1; i < maxNewTokens; i++) {
       const tPlan = performance.now();
@@ -291,57 +303,60 @@ export function* generateStream(
 
       captureManager.run(() => {
         ws.decodeStep(state, model);
-        ws.forwardInput(state);
-        using hiddenStates = new UsingHolder(model.forward(state));
-        doSample(state.computeLogits(hiddenStates.value, model));
-        const nextn = 3;
-        if (mtp && model.forwardMtp && cache.getPagedKV().sequences[0].allocLen < maxNewTokens - nextn * 2) {
-          let total = 1;
-
-          const mtpSampleResult = new UsingHolder<Tensor>(undefined!);
-          for (let i = 0; i < nextn; i++) {
-            if (total != 1) {
-              // fork each sequence
-              for (let j = 0; j < total / 2; j++) {
-                const seqIdx = j + total / 2;
-                cache.getPagedKV().copySequence(seqIdx, j);
-              }
-
-              hiddenStates.replace(hiddenStates.value.cat([hiddenStates.value], 0));
-            }
-
-            const state = ws.planDecode(model, 1 << i, cache, useGraph);
-            if (mtpSampleResult.value) {
-              ws.inputIdsBuf.memcpy(mtpSampleResult.value, state.batchSize * I32, MemcpyKind.DeviceToDevice);
-            }
-
-            ws.decodeStep(state, model);
-            hiddenStates.replace(model.forwardMtp(state, hiddenStates.value));
-            mtpSampleResult.replace(state.computeLogits(hiddenStates.value, model));
-            const topk = mtpSampleResult.value.topk(2, model.cfg.vocabSize);
-            using _values = topk.values;
-            mtpSampleResult.replace(topk.indices);
-            if (total > 1) {
-              // Reorder topk indices from interleaved [seq0_top0, seq0_top1, seq1_top0, seq1_top1, ...]
-              // to concatenated [seq0_top0, seq1_top0, ..., seq0_top1, seq1_top1, ...]
-              // to match the cat'd hidden states layout [seq0, seq1, seq0, seq1, ...]
-              const half = total;
-              const reordered = ws.alloc(topk.indices.shape, topk.indices.type);
-              reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
-              reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
-              mtpSampleResult.replace(reordered);
-            }
-            total *= 2;
-          }
-          for (let i = 0; i < total / 2 - 1; i++) {
-            const seq = cache.getPagedKV().sequences.pop();
-            seq!.clear();
-          }
-          const seq0 = cache.getPagedKV().sequences[0];
-          seq0.truncate(seq0.allocLen - nextn);
-          ws.decodeStep(state, model, -nextn);
-        }
+        targetHiddenStates.replace(model.forward(state));
+        doSample(state.computeLogits(targetHiddenStates.value, model));
       }, !useGraph ? undefined : ['decode']);
+
+      const nextn = 3;
+      if (mtp && model.forwardMtp && cache.getPagedKV().sequences[0].allocLen < maxNewTokens - nextn * 2) {
+        let total = 1;
+
+        for (let i = 0; i < nextn; i++) {
+          const srcHiddenStates = hiddenStatesArray[i];
+          const dstHiddenStates = hiddenStatesArray[i + 1];
+
+          if (total != 1) {
+            // fork each sequence
+            for (let j = 0; j < total / 2; j++) {
+              const seqIdx = j + total / 2;
+              cache.getPagedKV().copySequence(seqIdx, j);
+            }
+
+          }
+
+          const state = ws.planDecode(model, 1 << i, cache, useGraph);
+
+          if (total != 1) {
+            // concat to double the inputs
+            srcHiddenStates.replace(srcHiddenStates.value.cat([srcHiddenStates.value], 0));
+          }
+          ws.decodeStep(state, model);
+          dstHiddenStates.replace(model.forwardMtp(state, srcHiddenStates.value));
+          using logits = state.computeLogits(dstHiddenStates.value, model);
+          const topk = logits.topk(2, model.cfg.vocabSize);
+          using _values = topk.values;
+          using _indices = topk.indices;
+          total *= 2;
+          if (i !== nextn - 1) {
+            // Reorder topk indices from interleaved [seq0_top0, seq0_top1, seq1_top0, seq1_top1, ...]
+            // to concatenated [seq0_top0, seq1_top0, ..., seq0_top1, seq1_top1, ...]
+            // to match the cat'd hidden states layout [seq0, seq1, seq0, seq1, ...]
+            const half = total / 2;
+            using reordered = ws.alloc(topk.indices.shape, topk.indices.type);
+            reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
+            reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
+            ws.inputIdsBuf.memcpy(reordered, total * I32, MemcpyKind.DeviceToDevice);
+          }
+        }
+        for (let i = 0; i < total / 2 - 1; i++) {
+          const seq = cache.getPagedKV().sequences.pop();
+          seq!.clear();
+        }
+        const seq0 = cache.getPagedKV().sequences[0];
+        seq0.truncate(seq0.allocLen - nextn);
+        ws.decodeStep(state, model, -nextn);
+      }
+
 
 
       // sync on the previous token
