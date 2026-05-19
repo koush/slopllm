@@ -293,7 +293,6 @@ export function* generateStream(
       const tExec = performance.now();
 
       if (!captureManager.isCaptured(['decode'])) {
-        ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
         state.prepareInput(gpuSampleResult!);
         warmupSteps++;
       }
@@ -302,6 +301,7 @@ export function* generateStream(
       }
 
       captureManager.run(() => {
+        ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
         ws.decodeStep(state, model);
         targetHiddenStates.replace(model.forward(state));
         doSample(state.computeLogits(targetHiddenStates.value, model));
