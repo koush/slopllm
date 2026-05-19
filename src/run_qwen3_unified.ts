@@ -15,6 +15,7 @@ import { Qwen3Model } from "./qwen3_model";
 import { MemcpyKind, SamplingWorkspace, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
+import { CaptureManager } from "./capture-manager";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -260,8 +261,6 @@ export function* generateStream(
   }
   cache.reportTokens(0, suffixIds);
 
-  let capturing = false;
-
   let planMs = 0;
   let execMs = 0;
   let idleMs = 0;
@@ -271,6 +270,7 @@ export function* generateStream(
   let lastTokenTime = 0;
   let postWarmupTokenCount = 0;
   let tAfterSync = 0;
+  using captureManager = new CaptureManager(glm);
 
   try {
     for (let i = 1; i < maxNewTokens; i++) {
@@ -279,15 +279,17 @@ export function* generateStream(
       planMs += performance.now() - tPlan;
 
       const tExec = performance.now();
-      if (graphState?.graphExec == null) {
+
+      if (!captureManager.isCaptured(['decode'])) {
         ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
         state.prepareInput(gpuSampleResult!);
+        warmupSteps++;
+      }
+      else {
+        graphSteps++;
+      }
 
-        if (useGraph && graphState!.warmupRemaining === 0 && !capturing) {
-          capturing = true;
-          glm.graphBeginCapture();
-        }
-
+      captureManager.run(() => {
         ws.decodeStep(state, model);
         ws.forwardInput(state);
         using hiddenStates = new UsingHolder(model.forward(state));
@@ -339,29 +341,8 @@ export function* generateStream(
           seq0.truncate(seq0.allocLen - nextn);
           ws.decodeStep(state, model, -nextn);
         }
+      }, !useGraph ? undefined : ['decode']);
 
-        if (capturing) {
-          const graph = glm.graphEndCapture();
-          ws.freeze();
-          graphState!.graphExec = glm.graphInstantiate(graph);
-          glm.graphDestroy(graph);
-          capturing = false;
-        }
-        if (useGraph) {
-          graphState!.warmupRemaining = Math.max(0, graphState!.warmupRemaining - 1);
-        }
-        warmupSteps++;
-      }
-
-      // when cuda graph captures it is NOT executing. it must run again.
-      // thats why it is not else if, the actual execution must run again after capture.
-      if (graphState?.graphExec != null) {
-        if (tAfterSync > 0) idleMs += performance.now() - tAfterSync;
-        // only host pinned is automatically copied. if using a device pinned, must be explicitly copied.
-        ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
-        glm.graphLaunch(graphState!.graphExec);
-        graphSteps++;
-      }
 
       // sync on the previous token
       sampleStream.value.synchronize();
@@ -379,7 +360,7 @@ export function* generateStream(
       if (eosIds.has(currentToken))
         return;
 
-      const isPostWarmupToken = !useGraph || (graphState?.graphExec !== null);
+      const isPostWarmupToken = !useGraph || captureManager.isCaptured(['decode']);
       if (isPostWarmupToken) {
         const now = performance.now();
         if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
