@@ -9,3 +9,4 @@ import "./test_no_graph";
 import "./test_graph";
 import "./test_cp_prefill";
 import "./test_cat";
+import "./test_staging";

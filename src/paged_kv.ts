@@ -121,8 +121,10 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   indicesH: Tensor;
   availablePages: number[];
   sequences: Sequence[];
+  staging: Map<number, Sequence>;
   pagesDirtyHost: boolean;
   pagesDirtyDevice: boolean;
+  positionIdsDirty: boolean;
 
   getPagedKV(): PagedKVCache { return this; }
 
@@ -152,18 +154,74 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.indicesH = this.allocPinned([maxPages], "I32", "indicesH");
     this.availablePages = Array.from({ length: maxPages }, (_, i) => i);
     this.sequences = [];
+    this.staging = new Map();
     this.pagesDirtyHost = true;
     this.pagesDirtyDevice = true;
+    this.positionIdsDirty = true;
   }
 
   reset(batchSize: number): void {
     if (batchSize > this.maxBatch) {
       throw new Error(`batchSize ${batchSize} exceeds maxBatch ${this.maxBatch}`);
     }
-    this.availablePages = Array.from({ length: this.maxPages }, (_, i) => i);
+    const stagedPageIds = new Set<number>();
+    for (const seq of this.staging.values()) {
+      for (const page of seq.pages) {
+        stagedPageIds.add(page.id);
+      }
+    }
+    this.availablePages = [];
+    for (let i = 0; i < this.maxPages; i++) {
+      if (!stagedPageIds.has(i)) {
+        this.availablePages.push(i);
+      }
+    }
     this.sequences = Array.from({ length: batchSize }, () => new Sequence(this));
     this.pagesDirtyHost = true;
     this.pagesDirtyDevice = true;
+    this.positionIdsDirty = true;
+  }
+
+  stageSequence(seqIdx: number, stagingKey: number): void {
+    if (seqIdx < 0 || seqIdx >= this.sequences.length) {
+      throw new Error(`stageSequence: seqIdx ${seqIdx} out of range (${this.sequences.length} sequences)`);
+    }
+    if (this.staging.has(stagingKey)) {
+      throw new Error(`stageSequence: staging key ${stagingKey} already in use`);
+    }
+    const seq = this.sequences[seqIdx];
+    this.staging.set(stagingKey, seq);
+    this.sequences.splice(seqIdx, 1);
+    this.pagesDirtyHost = true;
+    this.pagesDirtyDevice = true;
+    this.positionIdsDirty = true;
+  }
+
+  unstageSequence(stagingKey: number): Sequence {
+    const seq = this.staging.get(stagingKey);
+    if (!seq) {
+      throw new Error(`unstageSequence: no staged sequence with key ${stagingKey}`);
+    }
+    this.staging.delete(stagingKey);
+    this.sequences.push(seq);
+    this.pagesDirtyHost = true;
+    this.pagesDirtyDevice = true;
+    this.positionIdsDirty = true;
+    return seq;
+  }
+
+  unstageAll(): void {
+    const keys = [...this.staging.keys()];
+    for (const key of keys) {
+      this.unstageSequence(key);
+    }
+  }
+
+  clearStaging(): void {
+    for (const seq of this.staging.values()) {
+      seq.clear();
+    }
+    this.staging.clear();
   }
 
   copySequence(dstSeqIdx: number, srcSeqIdx: number) {

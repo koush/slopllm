@@ -1,7 +1,7 @@
 import { ChatModel, type ChatCache } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, I32 } from "./glm_ops";
-import type { PagedKVCache } from "./paged_kv";
+import { type PagedKVCache } from "./paged_kv";
 import { MemcpyKind, Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
@@ -104,13 +104,6 @@ export class ExecutionState {
     if (this.isDecode) {
       throw new Error("finishPrefill should not be called in decode mode");
     }
-    const pagedKV = this.cache.getPagedKV();
-    this.ws.positionIdsH.withPinnedBuffer(buf => {
-      for (let seqIdx = 0; seqIdx < this.batchSize; seqIdx++) {
-        buf.writeInt32LE(pagedKV.sequences[seqIdx].allocLen - 1, seqIdx * I32);
-      }
-    });
-    this.ws.positionIds.memcpy(this.ws.positionIdsH, this.batchSize * I32, MemcpyKind.HostToDevice);
   }
 }
 
@@ -164,6 +157,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   mlaBatchIndices: Tensor;
   /** Pinned host buffer [B*S] of I32: batch index per token for MLA KV cache append. */
   mlaBatchIndicesH: Tensor;
+  lastDecodePagedKV: PagedKVCache | null;
 
   constructor(glm: DeviceOps, B: number, S: number) {
     super(glm);
@@ -193,6 +187,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.kvLenH = this.allocPinned([B], "I32", "kvLenH");
     this.mlaBatchIndices = this.alloc([B * S], "I32", "mlaBatchIndices");
     this.mlaBatchIndicesH = this.allocPinned([B * S], "I32", "mlaBatchIndicesH");
+    this.lastDecodePagedKV = null;
 
     // Initialize mlaBatchIndices for decode: [0, 1, 2, ..., B-1]
     // This identity mapping never changes for decode; prefill overwrites it with
@@ -332,6 +327,17 @@ export class ExecutionWorkspace extends WorkspaceBase {
       throw new Error(`planDecode: need ${decodePagesNeeded} pages, ${pagedKV.availablePages.length} available`);
     }
 
+    if (pagedKV.positionIdsDirty || this.lastDecodePagedKV !== pagedKV) {
+      this.positionIdsH.withPinnedBuffer(buf => {
+        for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+          buf.writeInt32LE(pagedKV.sequences[seqIdx].allocLen - 1, seqIdx * I32);
+        }
+      });
+      this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
+      pagedKV.positionIdsDirty = false;
+      this.lastDecodePagedKV = pagedKV;
+    }
+
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       pagedKV.allocDecodeToken(seqIdx);
     }
@@ -401,6 +407,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);
     }
+
+    pagedKV.positionIdsDirty = true;
 
     this.qoIndptrH.withPinnedBuffer(buf => {
       buf.writeInt32LE(0, 0);
