@@ -34,7 +34,7 @@ interface ServerArgs {
 
 function parseArgs(argv: string[]): ServerArgs {
   const args: ServerArgs = {
-    port: 8000,
+    port: 8010,
     host: "0.0.0.0",
     gpu: parseInt(process.env.GLM_GPUS ?? process.env.GLM_GPU ?? "0", 10),
     ctxSize: 4096,
