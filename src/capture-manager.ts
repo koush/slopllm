@@ -2,7 +2,7 @@ import { DeviceOps } from "./device_ops";
 
 interface Captured {
     warmupSteps: number;
-    graphExec: number;
+    graphExec: number | null;
 }
 
 export class CaptureManager implements Disposable {
@@ -14,7 +14,7 @@ export class CaptureManager implements Disposable {
 
     [Symbol.dispose]() {
         for (const captured of this.captured.values()) {
-            if (captured.graphExec) {
+            if (captured.graphExec !== null) {
                 this.ops.graphExecDestroy(captured.graphExec);
             }
         }
@@ -26,21 +26,21 @@ export class CaptureManager implements Disposable {
         if (keyParams?.length) {
             const key = keyParams.join(",");
             const captured = this.captured.get(key);
-            if (captured) {
-                if (captured.graphExec) {
-                    this.ops.graphLaunch(captured.graphExec);
-                    return;
-                }
+        if (captured) {
+            if (captured.graphExec !== null) {
+                this.ops.graphLaunch(captured.graphExec);
+                return;
+            }
 
-                if (captured.warmupSteps === 3) {
-                    this.ops.graphBeginCapture();
-                    capturing = key;
-                }
-                captured.warmupSteps++;
+            if (captured.warmupSteps === 3) {
+                this.ops.graphBeginCapture();
+                capturing = key;
             }
-            else {
-                this.captured.set(key, { warmupSteps: 1, graphExec: 0 });
-            }
+            captured.warmupSteps++;
+        }
+        else {
+            this.captured.set(key, { warmupSteps: 1, graphExec: null });
+        }
         }
 
         fn();
@@ -60,6 +60,6 @@ export class CaptureManager implements Disposable {
         }
         const key = keyParams.join(",");
         const captured = this.captured.get(key);
-        return !!captured?.graphExec;
+        return captured?.graphExec !== null;
     }
 }
