@@ -500,41 +500,32 @@ export class SamplingWorkspace extends WorkspaceBase {
     const I32 = 4;
     const batchSize = this.batchSize;
 
-    this.temperaturesH.withPinnedBuffer(buf => {
-      for (let i = 0; i < batchSize; i++) {
-        const temperature = params[i].temperature > 0 ? params[i].temperature : 0;
+    for (let i = 0; i < batchSize; i++) {
+      const p = params[i];
+      const topK = p.topK > 0 ? p.topK : 0;
+      const temperature = p.temperature > 0 ? p.temperature : 0;
+
+      this.temperaturesH.withPinnedBuffer(buf => {
         buf.writeFloatLE(temperature, i * 4);
-      }
-    });
-    this.temperatures.memcpy(this.temperaturesH, batchSize * 4, MemcpyKind.HostToDevice);
-
-    this.repPenaltiesH.withPinnedBuffer(buf => {
-      for (let i = 0; i < batchSize; i++) {
-        buf.writeFloatLE(params[i].repetitionPenalty, i * 4);
-      }
-    });
-    this.repPenalties.memcpy(this.repPenaltiesH, batchSize * 4, MemcpyKind.HostToDevice);
-
-    this.presPenaltiesH.withPinnedBuffer(buf => {
-      for (let i = 0; i < batchSize; i++) {
-        buf.writeFloatLE(params[i].presencePenalty, i * 4);
-      }
-    });
-    this.presPenalties.memcpy(this.presPenaltiesH, batchSize * 4, MemcpyKind.HostToDevice);
-
-    this.topKsH.withPinnedBuffer(buf => {
-      for (let i = 0; i < batchSize; i++) {
-        const topK = params[i].topK > 0 ? params[i].topK : 0;
+      });
+      this.repPenaltiesH.withPinnedBuffer(buf => {
+        buf.writeFloatLE(p.repetitionPenalty, i * 4);
+      });
+      this.presPenaltiesH.withPinnedBuffer(buf => {
+        buf.writeFloatLE(p.presencePenalty, i * 4);
+      });
+      this.topKsH.withPinnedBuffer(buf => {
         buf.writeInt32LE(topK, i * I32);
-      }
-    });
-    this.topKs.memcpy(this.topKsH, batchSize * I32, MemcpyKind.HostToDevice);
+      });
+      this.topPsH.withPinnedBuffer(buf => {
+        buf.writeFloatLE(p.topP, i * 4);
+      });
+    }
 
-    this.topPsH.withPinnedBuffer(buf => {
-      for (let i = 0; i < batchSize; i++) {
-        buf.writeFloatLE(params[i].topP, i * 4);
-      }
-    });
+    this.temperatures.memcpy(this.temperaturesH, batchSize * 4, MemcpyKind.HostToDevice);
+    this.repPenalties.memcpy(this.repPenaltiesH, batchSize * 4, MemcpyKind.HostToDevice);
+    this.presPenalties.memcpy(this.presPenaltiesH, batchSize * 4, MemcpyKind.HostToDevice);
+    this.topKs.memcpy(this.topKsH, batchSize * I32, MemcpyKind.HostToDevice);
     this.topPs.memcpy(this.topPsH, batchSize * 4, MemcpyKind.HostToDevice);
 
     if (tokenHistories !== undefined) {
