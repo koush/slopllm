@@ -122,6 +122,28 @@ function tokenizeMessages(
   }
 }
 
+class TokenStreamDecoder {
+  private tokenCache: number[] = [];
+  private printLen = 0;
+
+  push(tokenId: number, tokenizer: any, skipSpecialTokens: boolean): string {
+    this.tokenCache.push(tokenId);
+    const text = tokenizer.decode(this.tokenCache, { skip_special_tokens: skipSpecialTokens });
+    const newText = text.slice(this.printLen);
+    this.printLen += newText.length;
+    return newText;
+  }
+
+  flush(tokenizer: any, skipSpecialTokens: boolean): string {
+    if (this.tokenCache.length === 0) return "";
+    const text = tokenizer.decode(this.tokenCache, { skip_special_tokens: skipSpecialTokens });
+    const newText = text.slice(this.printLen);
+    this.tokenCache = [];
+    this.printLen = 0;
+    return newText;
+  }
+}
+
 interface CompletionRequest {
   id: string;
   messages: Array<{ role: string; content: string }>;
@@ -132,6 +154,7 @@ interface CompletionRequest {
   stopSequences: string[];
   generatedIds: number[];
   generatedText: string;
+  decoder: TokenStreamDecoder;
   finished: boolean;
   finishReason: string;
   promptTokenCount: number;
@@ -208,13 +231,17 @@ async function generateContinuousBatch(
         pagedKV.reportTokens(i, inputIdsList[i]);
         pagedKV.reportTokens(i, [firstTokens[i]]);
         newRequests[i].generatedIds.push(firstTokens[i]);
-        const chunk = tokenizer.decode([firstTokens[i]], { skip_special_tokens: false });
-        newRequests[i].generatedText += chunk;
-        newRequests[i].onToken(firstTokens[i], chunk);
-        if (eosIds.has(firstTokens[i]) || newRequests[i].generatedIds.length >= newRequests[i].maxTokens) {
-          newRequests[i].finished = true;
-          newRequests[i].finishReason = eosIds.has(firstTokens[i]) ? "stop" : "length";
+        const isEos = eosIds.has(firstTokens[i]);
+        if (!isEos) {
+          const chunk = newRequests[i].decoder.push(firstTokens[i], tokenizer, true);
+          newRequests[i].generatedText += chunk;
+          newRequests[i].onToken(firstTokens[i], chunk);
         }
+        if (isEos || newRequests[i].generatedIds.length >= newRequests[i].maxTokens) {
+          newRequests[i].finished = true;
+          newRequests[i].finishReason = isEos ? "stop" : "length";
+      }
+
         if (!newRequests[i].finished) {
           checkStopSequences(newRequests[i]);
         }
@@ -274,12 +301,15 @@ async function generateContinuousBatch(
       pagedKV.reportTokens(i, [newTokens[i]]);
       active[i].lastToken = newTokens[i];
       req.generatedIds.push(newTokens[i]);
-      const chunk = tokenizer.decode([newTokens[i]], { skip_special_tokens: false });
-      req.generatedText += chunk;
-      req.onToken(newTokens[i], chunk);
-      if (eosIds.has(newTokens[i]) || req.generatedIds.length >= req.maxTokens) {
+      const isEos = eosIds.has(newTokens[i]);
+      if (!isEos) {
+        const chunk = req.decoder.push(newTokens[i], tokenizer, true);
+        req.generatedText += chunk;
+        req.onToken(newTokens[i], chunk);
+      }
+      if (isEos || req.generatedIds.length >= req.maxTokens) {
         req.finished = true;
-        req.finishReason = eosIds.has(newTokens[i]) ? "stop" : "length";
+        req.finishReason = isEos ? "stop" : "length";
       }
       if (!req.finished) {
         checkStopSequences(req);
@@ -339,12 +369,15 @@ async function generateBatch(
       cache.reportTokens(i, inputIdsList[i]);
       cache.reportTokens(i, [firstTokens[i]]);
       requests[i].generatedIds.push(firstTokens[i]);
-      const chunk = tokenizer.decode([firstTokens[i]], { skip_special_tokens: false });
-      requests[i].generatedText += chunk;
-      requests[i].onToken(firstTokens[i], chunk);
-      if (eosIds.has(firstTokens[i]) || requests[i].generatedIds.length >= requests[i].maxTokens) {
+      const isEos = eosIds.has(firstTokens[i]);
+      if (!isEos) {
+        const chunk = requests[i].decoder.push(firstTokens[i], tokenizer, true);
+        requests[i].generatedText += chunk;
+        requests[i].onToken(firstTokens[i], chunk);
+      }
+      if (isEos || requests[i].generatedIds.length >= requests[i].maxTokens) {
         requests[i].finished = true;
-        requests[i].finishReason = eosIds.has(firstTokens[i]) ? "stop" : "length";
+        requests[i].finishReason = isEos ? "stop" : "length";
       }
       if (!requests[i].finished) {
         checkStopSequences(requests[i]);
@@ -374,13 +407,16 @@ async function generateBatch(
         if (!finished[i]) {
           cache.reportTokens(i, [newTokens[i]]);
           requests[i].generatedIds.push(newTokens[i]);
-          const chunk = tokenizer.decode([newTokens[i]], { skip_special_tokens: false });
-          requests[i].generatedText += chunk;
-          requests[i].onToken(newTokens[i], chunk);
-          if (eosIds.has(newTokens[i]) || requests[i].generatedIds.length >= requests[i].maxTokens) {
+          const isEos = eosIds.has(newTokens[i]);
+          if (!isEos) {
+            const chunk = requests[i].decoder.push(newTokens[i], tokenizer, true);
+            requests[i].generatedText += chunk;
+            requests[i].onToken(newTokens[i], chunk);
+          }
+          if (isEos || requests[i].generatedIds.length >= requests[i].maxTokens) {
             finished[i] = true;
             requests[i].finished = true;
-            requests[i].finishReason = eosIds.has(newTokens[i]) ? "stop" : "length";
+            requests[i].finishReason = isEos ? "stop" : "length";
           }
           if (!finished[i]) {
             checkStopSequences(requests[i]);
@@ -600,6 +636,7 @@ async function main(): Promise<void> {
         stopSequences,
         generatedIds: [],
         generatedText: "",
+        decoder: new TokenStreamDecoder(),
         finished: false,
         finishReason: "stop",
         promptTokenCount: 0,
@@ -641,6 +678,8 @@ async function main(): Promise<void> {
         };
 
         completionReq.onFinish = () => {
+          const remaining = completionReq.decoder.flush(tokenizer, true);
+          if (remaining) completionReq.generatedText += remaining;
           const currentText = completionReq.generatedText;
           if (currentText.length > lastSentLen) {
             const delta = currentText.slice(lastSentLen);
@@ -686,6 +725,8 @@ async function main(): Promise<void> {
         });
       } else {
         completionReq.onFinish = () => {
+          const remaining = completionReq.decoder.flush(tokenizer, true);
+          if (remaining) completionReq.generatedText += remaining;
           const content = completionReq.generatedText;
           sendJSON(res, 200, {
             id,
