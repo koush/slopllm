@@ -168,8 +168,9 @@ async function generateBatch(
     const samplingParams = requests.map(r => r.samplingParams);
     const maxWindow = Math.max(...samplingParams.map(p => p.repetitionPenaltyWindow));
     using samplingWorkspace = new SamplingWorkspace(
-      glm, samplingParams, model.cfg.vocabSize, maxWindow, inputIdsList,
+      glm, requests.length, model.cfg.vocabSize, maxWindow,
     );
+    samplingWorkspace.updateSampler(samplingParams, inputIdsList);
 
     using prefillLogits = ws.forwardPrefill(model, inputIdsList, cache);
     const firstSampled = samplingWorkspace.sample(prefillLogits);
@@ -319,7 +320,8 @@ async function main(): Promise<void> {
     console.log("Warming up...");
     const warmupIds = tokenizeMessages(tokenizer, [{ role: "user", content: "Hello" }], chatTemplate);
     cache.reset(1);
-    using warmupSw = new SamplingWorkspace(glm, [makeSamplingParamsHelper(args)], model.cfg.vocabSize, args.repetitionPenaltyWindow, [warmupIds]);
+    using warmupSw = new SamplingWorkspace(glm, 1, model.cfg.vocabSize, args.repetitionPenaltyWindow);
+    warmupSw.updateSampler([makeSamplingParamsHelper(args)], [warmupIds]);
     using warmupLogits = ws.forwardPrefill(model, [warmupIds], cache);
     const warmupSampled = warmupSw.sample(warmupLogits);
     let lastToken = warmupSampled.readInt32LEArray()[0];

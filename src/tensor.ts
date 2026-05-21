@@ -389,7 +389,8 @@ export abstract class Tensor implements Disposable {
   sampleBatchGPU(params: SamplingParams[], tokenHistories: number[][]): Tensor {
     const vs = this.shape[this.shape.length - 1];
     const maxWindow = Math.max(...params.map(p => p.repetitionPenaltyWindow));
-    using ws = new SamplingWorkspace(this.workspace.glm, params, vs, maxWindow, tokenHistories);
+    using ws = new SamplingWorkspace(this.workspace.glm, params.length, vs, maxWindow);
+    ws.updateSampler(params, tokenHistories);
     const outToken = this.workspace.alloc([ws.batchSize], "I32");
     return ws.sampleInto(this, outToken);
   }
@@ -397,8 +398,9 @@ export abstract class Tensor implements Disposable {
 
 export class SamplingWorkspace extends WorkspaceBase {
   readonly vocabSize: number;
-  readonly batchSize: number;
+  readonly maxBatchSize: number;
   readonly maxWindow: number;
+  batchSize: number;
   params!: SamplingParams[];
 
   readonly penaltyTokens: Tensor;
@@ -415,37 +417,35 @@ export class SamplingWorkspace extends WorkspaceBase {
   private readonly topkIdxs: Tensor;
   private readonly sampleWorkspaceBuf: Tensor;
 
-  constructor(glm: DeviceOps, params: SamplingParams[], vocabSize: number, maxWindow: number, tokenHistories?: number[][]) {
+  constructor(glm: DeviceOps, maxBatchSize: number, vocabSize: number, maxWindow: number) {
     super(glm);
     this.vocabSize = vocabSize;
-    this.batchSize = params.length;
+    this.maxBatchSize = maxBatchSize;
     this.maxWindow = maxWindow;
+    this.batchSize = 0;
 
-    this.penaltyTokens = this.alloc([maxWindow > 0 ? this.batchSize * maxWindow : this.batchSize], "I32");
-    this.penaltyCount = this.alloc([this.batchSize], "I32");
+    this.penaltyTokens = this.alloc([maxWindow > 0 ? maxBatchSize * maxWindow : maxBatchSize], "I32");
+    this.penaltyCount = this.alloc([maxBatchSize], "I32");
     this.stepCounter = this.alloc([1], "U32");
-    this.temperatures = this.alloc([this.batchSize], "F32");
-    this.repPenalties = this.alloc([this.batchSize], "F32");
-    this.presPenalties = this.alloc([this.batchSize], "F32");
-    this.topKs = this.alloc([this.batchSize], "I32");
-    this.topPs = this.alloc([this.batchSize], "F32");
-    this.outToken = this.alloc([this.batchSize], "I32");
+    this.temperatures = this.alloc([maxBatchSize], "F32");
+    this.repPenalties = this.alloc([maxBatchSize], "F32");
+    this.presPenalties = this.alloc([maxBatchSize], "F32");
+    this.topKs = this.alloc([maxBatchSize], "I32");
+    this.topPs = this.alloc([maxBatchSize], "F32");
+    this.outToken = this.alloc([maxBatchSize], "I32");
 
     const SAMPLING_MAX_TOPK = 256;
     const SAMPLING_BLOCK_SIZE = 256;
-    this.topkVals = this.alloc([this.batchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
-    this.topkIdxs = this.alloc([this.batchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
-    this.sampleWorkspaceBuf = this.alloc([this.batchSize * vocabSize], "F32");
+    this.topkVals = this.alloc([maxBatchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
+    this.topkIdxs = this.alloc([maxBatchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
+    this.sampleWorkspaceBuf = this.alloc([maxBatchSize * vocabSize], "F32");
 
     const seedBuf = Buffer.alloc(4);
     seedBuf.writeUInt32LE(Math.floor(Math.random() * 0xFFFFFFFF) >>> 0, 0);
     this.stepCounter.h2d(seedBuf);
-
-    this.initPenaltyState(params, tokenHistories ?? []);
-    this.updateSampler(params);
   }
 
-  private initPenaltyState(params: SamplingParams[], tokenHistories: number[][]): void {
+  initPenaltyState(params: SamplingParams[], tokenHistories: number[][]): void {
     const I32 = 4;
     const batchSize = this.batchSize;
     const vs = this.vocabSize;
@@ -480,10 +480,11 @@ export class SamplingWorkspace extends WorkspaceBase {
     this.penaltyCount.h2d(countBuf);
   }
 
-  updateSampler(params: SamplingParams[]): void {
-    if (params.length !== this.batchSize) {
-      throw new Error(`updateSampler: expected ${this.batchSize} params, got ${params.length}`);
+  updateSampler(params: SamplingParams[], tokenHistories?: number[][]): void {
+    if (params.length > this.maxBatchSize) {
+      throw new Error(`updateSampler: ${params.length} params exceeds maxBatchSize ${this.maxBatchSize}`);
     }
+    this.batchSize = params.length;
     this.params = params;
 
     const I32 = 4;
@@ -511,6 +512,10 @@ export class SamplingWorkspace extends WorkspaceBase {
     this.presPenalties.h2d(presBuf);
     this.topKs.h2d(topKBuf);
     this.topPs.h2d(topPBuf);
+
+    if (tokenHistories !== undefined) {
+      this.initPenaltyState(params, tokenHistories);
+    }
   }
 
   sample(logits: Tensor): Tensor {
