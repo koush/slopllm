@@ -95,7 +95,7 @@ describe("Continuous batching", () => {
     // With 50ms latency per step and ~20 tokens each, each request takes ~1s.
     // Concurrent: total ~1s, spread < 500ms (all finish near same time)
     // Sequential: total ~3s, spread ~2s (each waits for previous)
-    assert.ok(spread < 2000,
+    assert.ok(spread < 1000,
       `Finish time spread ${spread}ms too large for concurrent batching (times: ${finishTimes.join(", ")}ms)`);
     assert.ok(totalElapsed < 5000,
       `Total elapsed ${totalElapsed}ms too long for concurrent batching`);
