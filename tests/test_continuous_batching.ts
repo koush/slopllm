@@ -66,9 +66,9 @@ describe("Continuous batching", () => {
 
   it("concurrent requests finish at similar times", async () => {
     const questions = [
-      "What is the capital of France?",
-      "What is the capital of Japan?",
-      "What is the capital of Germany?",
+      { q: "What is the capital of France?", expected: "Paris" },
+      { q: "What is the capital of Japan?", expected: "Tokyo" },
+      { q: "What is the capital of Germany?", expected: "Berlin" },
     ];
 
     // Send all 3 requests with streaming, track first-token and finish times
@@ -76,7 +76,7 @@ describe("Continuous batching", () => {
     const endTimes: number[] = [];
     const answers: string[] = [];
 
-    const requests = questions.map(q =>
+    const requests = questions.map(({ q }) =>
       chatCompletion({
         messages: simpleMessages(q),
         max_tokens: 64,
@@ -120,6 +120,8 @@ describe("Continuous batching", () => {
 
     for (let i = 0; i < answers.length; i++) {
       assert.ok(answers[i].length > 0, `Request ${i} returned empty answer`);
+      assert.ok(containsIgnoreCase(answers[i], questions[i].expected),
+        `Request ${i} ("${questions[i].q}"): expected "${questions[i].expected}" in "${answers[i].slice(0, 200)}"`);
     }
 
     const maxStart = Math.max(...startTimes);
