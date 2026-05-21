@@ -365,4 +365,46 @@ describe("PagedKVCache staging", () => {
     assert.ok(pagedKV.availablePages.length > availableAfterReset,
       "clearStaging should increase availablePages");
   });
+
+  it("removeSequence splices out sequence and frees its pages", () => {
+    using pagedKV = makePagedKV(3, 32);
+    pagedKV.reset(3);
+
+    pagedKV.allocAppendPages(0, 16);
+    pagedKV.allocAppendPages(1, 16);
+    pagedKV.allocAppendPages(2, 16);
+
+    const seq0Pages = pagedKV.sequences[0].pages.length;
+    const seq1Pages = pagedKV.sequences[1].pages.length;
+    const seq2Pages = pagedKV.sequences[2].pages.length;
+
+    pagedKV.removeSequence(1);
+
+    assert.equal(pagedKV.sequences.length, 2, "should have 2 sequences after removal");
+    assert.equal(pagedKV.availablePages.length, pagedKV.maxPages - seq0Pages - seq2Pages,
+      "removed sequence's pages should be freed");
+    assert.equal(pagedKV.sequences[0].pages.length, seq0Pages, "seq0 unchanged");
+    assert.equal(pagedKV.sequences[1].pages.length, seq2Pages, "former seq2 is now at index 1");
+  });
+
+  it("removeSequence throws on invalid index", () => {
+    using pagedKV = makePagedKV(2, 32);
+    pagedKV.reset(2);
+    assert.throws(() => pagedKV.removeSequence(2), /out of range/);
+    assert.throws(() => pagedKV.removeSequence(-1), /out of range/);
+  });
+
+  it("removeSequence sets dirty flags", () => {
+    using pagedKV = makePagedKV(2, 32);
+    pagedKV.reset(2);
+    pagedKV.pagesDirtyHost = false;
+    pagedKV.pagesDirtyDevice = false;
+    pagedKV.positionIdsDirty = false;
+
+    pagedKV.removeSequence(0);
+
+    assert.equal(pagedKV.pagesDirtyHost, true, "pagesDirtyHost should be set");
+    assert.equal(pagedKV.pagesDirtyDevice, true, "pagesDirtyDevice should be set");
+    assert.equal(pagedKV.positionIdsDirty, true, "positionIdsDirty should be set");
+  });
 });

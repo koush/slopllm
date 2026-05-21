@@ -224,6 +224,18 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.staging.clear();
   }
 
+  removeSequence(seqIdx: number): void {
+    if (seqIdx < 0 || seqIdx >= this.sequences.length) {
+      throw new Error(`removeSequence: seqIdx ${seqIdx} out of range (${this.sequences.length} sequences)`);
+    }
+    const seq = this.sequences[seqIdx];
+    seq.clear();
+    this.sequences.splice(seqIdx, 1);
+    this.pagesDirtyHost = true;
+    this.pagesDirtyDevice = true;
+    this.positionIdsDirty = true;
+  }
+
   copySequence(dstSeqIdx: number, srcSeqIdx: number) {
     if (dstSeqIdx === srcSeqIdx)
       return;
