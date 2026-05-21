@@ -72,50 +72,54 @@ describe("Continuous batching", () => {
     ];
 
     // Send all 3 requests with streaming, track first-token and finish times
-    const startTimes: number[] = [];
-    const endTimes: number[] = [];
-    const answers: string[] = [];
+    const startTimes: number[] = new Array(questions.length).fill(0);
+    const endTimes: number[] = new Array(questions.length).fill(0);
+    const answers: string[] = new Array(questions.length).fill("");
 
-    const requests = questions.map(({ q }) =>
-      chatCompletion({
-        messages: simpleMessages(q),
-        max_tokens: 64,
-        temperature: 0,
-        top_k: 1,
-        stream: true,
-      }).then(async res => {
-        let firstTokenTime = 0;
-        let fullContent = "";
-        const reader = res.body!.getReader();
-        const decoder = new TextDecoder();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const text = decoder.decode(value, { stream: true });
-          for (const line of text.split("\n")) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith("data: ")) continue;
-            const data = trimmed.slice(6);
-            if (data === "[DONE]") continue;
-            try {
-              const event = JSON.parse(data) as Record<string, unknown>;
-              const choice = (event.choices as Array<Record<string, unknown>> | undefined)?.[0];
-              const delta = choice?.delta as Record<string, unknown> | undefined;
-              if (delta?.content && !firstTokenTime) {
-                firstTokenTime = Date.now();
-              }
-              if (delta?.content) fullContent += delta.content as string;
-            } catch {}
+    // Stagger requests 200ms apart so they arrive at different decode steps
+    const requests: Promise<void>[] = [];
+    for (let i = 0; i < questions.length; i++) {
+      if (i > 0) await new Promise(r => setTimeout(r, 200));
+      requests.push(
+        chatCompletion({
+          messages: simpleMessages(questions[i].q),
+          max_tokens: 64,
+          temperature: 0,
+          top_k: 1,
+          stream: true,
+        }).then(async res => {
+          let firstTokenTime = 0;
+          let fullContent = "";
+          const reader = res.body!.getReader();
+          const decoder = new TextDecoder();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const text = decoder.decode(value, { stream: true });
+            for (const line of text.split("\n")) {
+              const trimmed = line.trim();
+              if (!trimmed.startsWith("data: ")) continue;
+              const data = trimmed.slice(6);
+              if (data === "[DONE]") continue;
+              try {
+                const event = JSON.parse(data) as Record<string, unknown>;
+                const choice = (event.choices as Array<Record<string, unknown>> | undefined)?.[0];
+                const delta = choice?.delta as Record<string, unknown> | undefined;
+                if (delta?.content && !firstTokenTime) {
+                  firstTokenTime = Date.now();
+                }
+                if (delta?.content) fullContent += delta.content as string;
+              } catch {}
+            }
           }
-        }
-        const endTime = Date.now();
-        if (!firstTokenTime) firstTokenTime = endTime;
-        startTimes.push(firstTokenTime);
-        endTimes.push(endTime);
-        answers.push(stripThinking(fullContent));
-      })
-    );
-
+          const endTime = Date.now();
+          if (!firstTokenTime) firstTokenTime = endTime;
+          startTimes[i] = firstTokenTime;
+          endTimes[i] = endTime;
+          answers[i] = stripThinking(fullContent);
+        })
+      );
+    }
     await Promise.all(requests);
 
     for (let i = 0; i < answers.length; i++) {
