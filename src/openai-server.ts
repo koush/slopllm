@@ -30,6 +30,7 @@ interface ServerArgs {
   repetitionPenalty: number;
   presencePenalty: number;
   repetitionPenaltyWindow: number;
+  decodeLatency: number;
 }
 
 function parseArgs(argv: string[]): ServerArgs {
@@ -48,6 +49,7 @@ function parseArgs(argv: string[]): ServerArgs {
     repetitionPenalty: 1.0,
     presencePenalty: 0,
     repetitionPenaltyWindow: 64,
+    decodeLatency: 0,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -65,6 +67,7 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--repetition-penalty" && i + 1 < argv.length) args.repetitionPenalty = parseFloat(argv[++i]);
     else if (a === "--presence-penalty" && i + 1 < argv.length) args.presencePenalty = parseFloat(argv[++i]);
     else if (a === "--repetition-penalty-window" && i + 1 < argv.length) args.repetitionPenaltyWindow = parseInt(argv[++i], 10);
+    else if (a === "--decode-latency" && i + 1 < argv.length) args.decodeLatency = parseInt(argv[++i], 10);
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
   }
   if (args.maxPages === 0) {
@@ -93,6 +96,7 @@ Options:
   --repetition-penalty <float>  Default repetition penalty (default: 1.0)
   --presence-penalty <float>    Default presence penalty (default: 0)
   --repetition-penalty-window <int>  Repetition penalty window (default: 64)
+  --decode-latency <int>        Artificial delay per decode step in ms (default: 0)
   --help, -h                    Show this help message
 `);
 }
@@ -150,6 +154,7 @@ async function generateContinuousBatch(
   pendingQueue: CompletionRequest[],
   maxSeqLen: number,
   maxBatchSize: number,
+  decodeLatencyMs: number,
 ): Promise<void> {
   const pagedKV = cache.getPagedKV();
   const eosToken = [...eosIds][0];
@@ -281,7 +286,11 @@ async function generateContinuousBatch(
       }
     }
 
-    await new Promise(resolve => setImmediate(resolve));
+    if (decodeLatencyMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, decodeLatencyMs));
+    } else {
+      await new Promise(resolve => setImmediate(resolve));
+    }
   }
 }
 
@@ -515,7 +524,7 @@ async function main(): Promise<void> {
       let totalPrompt = 0;
       const requestCount = pendingQueue.length;
       try {
-        await generateContinuousBatch(model, ws, glm, cache, tokenizer, eosIds, pendingQueue, args.ctxSize, args.batchSize);
+        await generateContinuousBatch(model, ws, glm, cache, tokenizer, eosIds, pendingQueue, args.ctxSize, args.batchSize, args.decodeLatency);
       } catch (err) {
         console.error("Continuous batch error:", err);
       }
