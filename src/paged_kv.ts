@@ -71,8 +71,12 @@ class Sequence {
 
   // Returns the number of matching tokens at the start of this sequence and inputIds.
   prefixMatch(inputIds: number[]): number {
-    const tokenIds = this.pages.map(p => p.tokenIds).flat();
+    const tokenIds = this.getTokenIds();
     return longestPrefix(tokenIds, inputIds);
+  }
+
+  getTokenIds(): number[] {
+    return this.pages.map(p => p.tokenIds).flat();
   }
 
   // Number of tokens that have been reported via reportTokens (sum of page.tokenIds).
