@@ -407,10 +407,15 @@ export class SamplingWorkspace extends WorkspaceBase {
   readonly penaltyCount: Tensor;
   readonly stepCounter: Tensor;
   readonly temperatures: Tensor;
+  readonly temperaturesH: Tensor;
   readonly repPenalties: Tensor;
+  readonly repPenaltiesH: Tensor;
   readonly presPenalties: Tensor;
+  readonly presPenaltiesH: Tensor;
   readonly topKs: Tensor;
+  readonly topKsH: Tensor;
   readonly topPs: Tensor;
+  readonly topPsH: Tensor;
   readonly outToken: Tensor;
 
   private readonly topkVals: Tensor;
@@ -428,10 +433,15 @@ export class SamplingWorkspace extends WorkspaceBase {
     this.penaltyCount = this.alloc([maxBatchSize], "I32");
     this.stepCounter = this.alloc([1], "U32");
     this.temperatures = this.alloc([maxBatchSize], "F32");
+    this.temperaturesH = this.allocPinned([maxBatchSize], "F32");
     this.repPenalties = this.alloc([maxBatchSize], "F32");
+    this.repPenaltiesH = this.allocPinned([maxBatchSize], "F32");
     this.presPenalties = this.alloc([maxBatchSize], "F32");
+    this.presPenaltiesH = this.allocPinned([maxBatchSize], "F32");
     this.topKs = this.alloc([maxBatchSize], "I32");
+    this.topKsH = this.allocPinned([maxBatchSize], "I32");
     this.topPs = this.alloc([maxBatchSize], "F32");
+    this.topPsH = this.allocPinned([maxBatchSize], "F32");
     this.outToken = this.alloc([maxBatchSize], "I32");
 
     const SAMPLING_MAX_TOPK = 256;
@@ -490,28 +500,42 @@ export class SamplingWorkspace extends WorkspaceBase {
     const I32 = 4;
     const batchSize = this.batchSize;
 
-    const tempBuf = Buffer.alloc(batchSize * 4);
-    const repBuf = Buffer.alloc(batchSize * 4);
-    const presBuf = Buffer.alloc(batchSize * 4);
-    const topKBuf = Buffer.alloc(batchSize * I32);
-    const topPBuf = Buffer.alloc(batchSize * 4);
+    this.temperaturesH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        const temperature = params[i].temperature > 0 ? params[i].temperature : 0;
+        buf.writeFloatLE(temperature, i * 4);
+      }
+    });
+    this.temperatures.memcpy(this.temperaturesH, batchSize * 4, MemcpyKind.HostToDevice);
 
-    for (let i = 0; i < batchSize; i++) {
-      const p = params[i];
-      const topK = p.topK > 0 ? p.topK : 0;
-      const temperature = p.temperature > 0 ? p.temperature : 0;
-      tempBuf.writeFloatLE(temperature, i * 4);
-      repBuf.writeFloatLE(p.repetitionPenalty, i * 4);
-      presBuf.writeFloatLE(p.presencePenalty, i * 4);
-      topKBuf.writeInt32LE(topK, i * I32);
-      topPBuf.writeFloatLE(p.topP, i * 4);
-    }
+    this.repPenaltiesH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        buf.writeFloatLE(params[i].repetitionPenalty, i * 4);
+      }
+    });
+    this.repPenalties.memcpy(this.repPenaltiesH, batchSize * 4, MemcpyKind.HostToDevice);
 
-    this.temperatures.h2d(tempBuf);
-    this.repPenalties.h2d(repBuf);
-    this.presPenalties.h2d(presBuf);
-    this.topKs.h2d(topKBuf);
-    this.topPs.h2d(topPBuf);
+    this.presPenaltiesH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        buf.writeFloatLE(params[i].presencePenalty, i * 4);
+      }
+    });
+    this.presPenalties.memcpy(this.presPenaltiesH, batchSize * 4, MemcpyKind.HostToDevice);
+
+    this.topKsH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        const topK = params[i].topK > 0 ? params[i].topK : 0;
+        buf.writeInt32LE(topK, i * I32);
+      }
+    });
+    this.topKs.memcpy(this.topKsH, batchSize * I32, MemcpyKind.HostToDevice);
+
+    this.topPsH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        buf.writeFloatLE(params[i].topP, i * 4);
+      }
+    });
+    this.topPs.memcpy(this.topPsH, batchSize * 4, MemcpyKind.HostToDevice);
 
     if (tokenHistories !== undefined) {
       this.initPenaltyState(params, tokenHistories);
