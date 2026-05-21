@@ -135,6 +135,156 @@ interface CompletionRequest {
   onFinish: () => void;
 }
 
+interface ActiveSequence {
+  request: CompletionRequest;
+  lastToken: number;
+}
+
+async function generateContinuousBatch(
+  model: ChatModel,
+  ws: ExecutionWorkspace,
+  glm: DeviceOps,
+  cache: ChatCache,
+  tokenizer: any,
+  eosIds: Set<number>,
+  pendingQueue: CompletionRequest[],
+  maxSeqLen: number,
+  maxBatchSize: number,
+): Promise<void> {
+  const pagedKV = cache.getPagedKV();
+  const eosToken = [...eosIds][0];
+  const active: ActiveSequence[] = [];
+  let nextStagingKey = 0;
+  using samplingWorkspace = new SamplingWorkspace(glm, maxBatchSize, model.cfg.vocabSize, 64);
+
+  while (active.length > 0 || pendingQueue.length > 0) {
+    // 1. Remove finished sequences (reverse order to avoid index shift)
+    for (let i = active.length - 1; i >= 0; i--) {
+      if (active[i].request.finished) {
+        pagedKV.removeSequence(i);
+        try { active[i].request.onFinish(); } catch {}
+        active.splice(i, 1);
+      }
+    }
+
+    // 2. Prefill new requests if there's room
+    const availableSlots = maxBatchSize - active.length;
+    if (pendingQueue.length > 0 && availableSlots > 0) {
+      const newCount = Math.min(pendingQueue.length, availableSlots);
+      const newRequests = pendingQueue.splice(0, newCount);
+
+      const inputIdsList: number[][] = [];
+      for (const req of newRequests) {
+        const ids = tokenizeMessages(tokenizer, req.messages);
+        req.maxTokens = Math.max(1, req.maxTokens);
+        if (ids.length > maxSeqLen - req.maxTokens) {
+          ids.splice(0, ids.length - (maxSeqLen - req.maxTokens));
+        }
+        inputIdsList.push(ids);
+        req.promptTokenCount = ids.length;
+      }
+
+      if (active.length === 0) {
+        // Fast path: no active sequences, no staging needed
+        pagedKV.reset(newCount);
+      } else {
+        // Stage active sequences to preserve their KV cache
+        for (let i = 0; i < active.length; i++) {
+          pagedKV.stageSequence(0, nextStagingKey++);
+        }
+        pagedKV.reset(newCount);
+      }
+
+      // Prefill new requests
+      const firstTokens = ws.forwardEagerPrefill(model, inputIdsList, cache);
+
+      // Report tokens and check for first-token EOS
+      for (let i = 0; i < newCount; i++) {
+        pagedKV.reportTokens(i, inputIdsList[i]);
+        pagedKV.reportTokens(i, [firstTokens[i]]);
+        newRequests[i].generatedIds.push(firstTokens[i]);
+        const chunk = tokenizer.decode([firstTokens[i]], { skip_special_tokens: false });
+        newRequests[i].generatedText += chunk;
+        newRequests[i].onToken(firstTokens[i], chunk);
+        if (eosIds.has(firstTokens[i]) || newRequests[i].generatedIds.length >= newRequests[i].maxTokens) {
+          newRequests[i].finished = true;
+          newRequests[i].finishReason = eosIds.has(firstTokens[i]) ? "stop" : "length";
+        }
+        if (!newRequests[i].finished) {
+          checkStopSequences(newRequests[i]);
+        }
+      }
+
+      pagedKV.updateIndptr(ws);
+
+      // Unstage active sequences (if any were staged)
+      if (active.length > 0) {
+        pagedKV.unstageAll();
+        pagedKV.updateIndptr(ws);
+      }
+
+      // Build new active list matching pagedKV sequence order: [new..., old...]
+      const newActiveSequences: ActiveSequence[] = [];
+      for (let i = 0; i < newCount; i++) {
+        newActiveSequences.push({
+          request: newRequests[i],
+          lastToken: firstTokens[i],
+        });
+      }
+      newActiveSequences.push(...active);
+      active.length = 0;
+      active.push(...newActiveSequences);
+    }
+
+    // 3. Remove any newly-finished sequences (e.g. first-token EOS)
+    for (let i = active.length - 1; i >= 0; i--) {
+      if (active[i].request.finished) {
+        pagedKV.removeSequence(i);
+        try { active[i].request.onFinish(); } catch {}
+        active.splice(i, 1);
+      }
+    }
+
+    if (active.length === 0) continue;
+
+    // 4. Update sampling workspace for current batch composition
+    const params = active.map(a => a.request.samplingParams);
+    const tokenHistories = pagedKV.sequences.slice(0, active.length).map(s => s.getTokenIds());
+    samplingWorkspace.updateSampler(params, tokenHistories);
+
+    // 5. Decode one step
+    const inputTokens = active.map(a => a.lastToken);
+    const state = ws.planDecode(model, active.length, cache);
+    state.prepareInput([inputTokens]);
+    ws.decodeStep(state, model);
+    ws.forwardInput(state);
+    using hiddenStates = model.forward(state);
+    using decodeLogits = state.computeLogits(hiddenStates, model);
+    const newSampled = samplingWorkspace.sample(decodeLogits);
+    const newTokens = newSampled.readInt32LEArray();
+
+    // 6. Process decoded tokens
+    for (let i = 0; i < active.length; i++) {
+      const req = active[i].request;
+      pagedKV.reportTokens(i, [newTokens[i]]);
+      active[i].lastToken = newTokens[i];
+      req.generatedIds.push(newTokens[i]);
+      const chunk = tokenizer.decode([newTokens[i]], { skip_special_tokens: false });
+      req.generatedText += chunk;
+      req.onToken(newTokens[i], chunk);
+      if (eosIds.has(newTokens[i]) || req.generatedIds.length >= req.maxTokens) {
+        req.finished = true;
+        req.finishReason = eosIds.has(newTokens[i]) ? "stop" : "length";
+      }
+      if (!req.finished) {
+        checkStopSequences(req);
+      }
+    }
+
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
 async function generateBatch(
   model: ChatModel,
   ws: ExecutionWorkspace,
@@ -360,20 +510,21 @@ async function main(): Promise<void> {
     if (busy) return;
     busy = true;
     try {
-      while (pendingQueue.length > 0) {
-        const batch = pendingQueue.splice(0, args.batchSize);
-        const t0 = performance.now();
-        try {
-          await generateBatch(model, ws, glm, cache, tokenizer, eosIds, batch, args.ctxSize);
-        } catch (err) {
-          console.error("Batch generation error:", err);
-        }
-        const elapsed = (performance.now() - t0) / 1000;
-        const totalTokens = batch.reduce((sum, r) => sum + r.generatedIds.length, 0);
-        const totalPrompt = batch.reduce((sum, r) => sum + r.promptTokenCount, 0);
-        if (elapsed > 0) {
-          console.log(`Batch done: ${batch.length} req(s), ${totalPrompt}+${totalTokens} tokens, ${elapsed.toFixed(2)}s, ${(totalTokens / elapsed).toFixed(1)} tok/s`);
-        }
+      const t0 = performance.now();
+      let totalTokens = 0;
+      let totalPrompt = 0;
+      const requestCount = pendingQueue.length;
+      try {
+        await generateContinuousBatch(model, ws, glm, cache, tokenizer, eosIds, pendingQueue, args.ctxSize, args.batchSize);
+      } catch (err) {
+        console.error("Continuous batch error:", err);
+      }
+      for (let i = 0; i < requestCount; i++) {
+        // tokens already counted per-request via onToken
+      }
+      const elapsed = (performance.now() - t0) / 1000;
+      if (elapsed > 0) {
+        console.log(`Batch done: ${requestCount} req(s), ${elapsed.toFixed(2)}s`);
       }
     } finally {
       busy = false;
