@@ -124,23 +124,42 @@ function tokenizeMessages(
 
 class TokenStreamDecoder {
   private tokenCache: number[] = [];
-  private printLen = 0;
+  private emittedText = "";
 
   push(tokenId: number, tokenizer: any, skipSpecialTokens: boolean): string {
     this.tokenCache.push(tokenId);
     const text = tokenizer.decode(this.tokenCache, { skip_special_tokens: skipSpecialTokens });
-    const newText = text.slice(this.printLen);
-    this.printLen += newText.length;
-    return newText;
+
+    let safeEnd = text.length;
+    while (safeEnd > 0 && text.charCodeAt(safeEnd - 1) === 0xFFFD) {
+      safeEnd--;
+    }
+
+    const safeText = text.slice(0, safeEnd);
+    const delta = safeText.startsWith(this.emittedText)
+      ? safeText.slice(this.emittedText.length)
+      : this._diffFrom(safeText);
+    this.emittedText = safeText;
+    return delta;
   }
 
   flush(tokenizer: any, skipSpecialTokens: boolean): string {
     if (this.tokenCache.length === 0) return "";
     const text = tokenizer.decode(this.tokenCache, { skip_special_tokens: skipSpecialTokens });
-    const newText = text.slice(this.printLen);
+    const delta = text.startsWith(this.emittedText)
+      ? text.slice(this.emittedText.length)
+      : this._diffFrom(text);
     this.tokenCache = [];
-    this.printLen = 0;
-    return newText;
+    this.emittedText = "";
+    return delta;
+  }
+
+  private _diffFrom(text: string): string {
+    let i = 0;
+    while (i < this.emittedText.length && i < text.length && this.emittedText[i] === text[i]) {
+      i++;
+    }
+    return text.slice(i);
   }
 }
 
