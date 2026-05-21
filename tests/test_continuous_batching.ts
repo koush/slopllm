@@ -71,34 +71,65 @@ describe("Continuous batching", () => {
       "What is the capital of Germany?",
     ];
 
-    const start = Date.now();
-    const results = await Promise.all(
-      questions.map(q =>
-        chatCompletionTimed({
-          messages: simpleMessages(q),
-          max_tokens: 64,
-          temperature: 0,
-          top_k: 1,
-        })
-      )
-    );
-    const totalElapsed = Date.now() - start;
+    // Send all 3 requests with streaming, track first-token and finish times
+    const startTimes: number[] = [];
+    const endTimes: number[] = [];
+    const answers: string[] = [];
 
-    for (let i = 0; i < results.length; i++) {
-      assert.ok(results[i].answer.length > 0, `Request ${i} returned empty answer`);
+    const requests = questions.map(q =>
+      chatCompletion({
+        messages: simpleMessages(q),
+        max_tokens: 64,
+        temperature: 0,
+        top_k: 1,
+        stream: true,
+      }).then(async res => {
+        let firstTokenTime = 0;
+        let fullContent = "";
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const text = decoder.decode(value, { stream: true });
+          for (const line of text.split("\n")) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data: ")) continue;
+            const data = trimmed.slice(6);
+            if (data === "[DONE]") continue;
+            try {
+              const event = JSON.parse(data) as Record<string, unknown>;
+              const choice = (event.choices as Array<Record<string, unknown>> | undefined)?.[0];
+              const delta = choice?.delta as Record<string, unknown> | undefined;
+              if (delta?.content && !firstTokenTime) {
+                firstTokenTime = Date.now();
+              }
+              if (delta?.content) fullContent += delta.content as string;
+            } catch {}
+          }
+        }
+        const endTime = Date.now();
+        if (!firstTokenTime) firstTokenTime = endTime;
+        startTimes.push(firstTokenTime);
+        endTimes.push(endTime);
+        answers.push(stripThinking(fullContent));
+      })
+    );
+
+    await Promise.all(requests);
+
+    for (let i = 0; i < answers.length; i++) {
+      assert.ok(answers[i].length > 0, `Request ${i} returned empty answer`);
     }
 
-    const finishTimes = results.map(r => r.elapsedMs);
-    const spread = Math.max(...finishTimes) - Math.min(...finishTimes);
+    const maxStart = Math.max(...startTimes);
+    const minEnd = Math.min(...endTimes);
 
-    // With continuous batching (batch-size=4, 3 requests), all decode together.
-    // With 50ms latency per step and ~20 tokens each, each request takes ~1s.
-    // Concurrent: total ~1s, spread < 500ms (all finish near same time)
-    // Sequential: total ~3s, spread ~2s (each waits for previous)
-    assert.ok(spread < 1000,
-      `Finish time spread ${spread}ms too large for concurrent batching (times: ${finishTimes.join(", ")}ms)`);
-    assert.ok(totalElapsed < 5000,
-      `Total elapsed ${totalElapsed}ms too long for concurrent batching`);
+    // If concurrent, all requests overlap: max(first-token time) < min(finish time).
+    // If sequential, request 2 starts after request 1 finishes: max(start) >= min(end).
+    assert.ok(maxStart < minEnd,
+      `Requests not concurrent: max start ${maxStart} >= min end ${minEnd} ` +
+      `(starts: ${startTimes.join(", ")}, ends: ${endTimes.join(", ")})`);
   });
 
   it("late-joining request gets prefilled mid-generation", async () => {
