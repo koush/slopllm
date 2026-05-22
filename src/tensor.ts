@@ -227,6 +227,15 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
+  rotateInputIds(qoIndptr: Tensor, newTokens: Tensor, batchSize: number): Tensor {
+    if (this.type !== "I32") throw new Error(`rotateInputIds: inputIds must be I32, got ${this.type}`);
+    if (qoIndptr.type !== "I32") throw new Error(`rotateInputIds: qoIndptr must be I32, got ${qoIndptr.type}`);
+    if (newTokens.type !== "I32") throw new Error(`rotateInputIds: newTokens must be I32, got ${newTokens.type}`);
+    if (qoIndptr.numElements < batchSize + 1) throw new Error(`rotateInputIds: qoIndptr has ${qoIndptr.numElements} elements, need ${batchSize + 1}`);
+    if (newTokens.numElements < batchSize) throw new Error(`rotateInputIds: newTokens has ${newTokens.numElements} elements, need ${batchSize}`);
+    return undefined as never;
+  }
+
   gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
     if (state.type !== "F32") throw new Error(`gdnRecurrentStep: state must be F32, got ${state.type}`);
     if (aLog.type !== "F32") throw new Error(`gdnRecurrentStep: aLog must be F32, got ${aLog.type}`);

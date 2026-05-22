@@ -2243,6 +2243,42 @@ __global__ void __launch_bounds__(256, 4) scatter_add_rows_batched_kernel(
     out[idx] = __float2bfloat16(accum);
 }
 
+// ---------------------------------------------------------------------------
+// Rotate input IDs for MTP prefill
+// ---------------------------------------------------------------------------
+
+// One block per sequence. Each block shifts its sequence left by 1
+// and appends a new token at the last position.
+// input_ids:  [totalTokens] I32  (read-only)
+// output_ids: [totalTokens] I32  (write-only)
+// qo_indptr:  [batchSize+1] I32  (cumulative offsets)
+// new_tokens: [batchSize] I32    (new token per sequence)
+__global__ void __launch_bounds__(256, 4) rotate_input_ids_kernel(
+    const int* __restrict__ input_ids,
+    int* __restrict__ output_ids,
+    const int* __restrict__ qo_indptr,
+    const int* __restrict__ new_tokens,
+    int batch_size
+) {
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    int start = qo_indptr[b];
+    int len = qo_indptr[b + 1] - qo_indptr[b];
+    int new_token = new_tokens[b];
+
+    // Shift left by 1: output[i] = input[i + 1]
+    int shift_len = len - 1;
+    for (int off = threadIdx.x; off < shift_len; off += blockDim.x) {
+        output_ids[start + off] = input_ids[start + off + 1];
+    }
+
+    // Append new token at last position
+    if (len > 0 && threadIdx.x == 0) {
+        output_ids[start + len - 1] = new_token;
+    }
+}
+
 extern "C" {
 
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
@@ -2263,6 +2299,15 @@ void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
             (const __nv_bfloat16*)scales, top_k, dim, num_rows);
     }
+}
+
+void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
+                           const int* qo_indptr, const int* new_tokens,
+                           int batch_size) {
+    cudaSetDevice(ctx->device_id);
+    int block_size = 256;
+    rotate_input_ids_kernel<<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
+        input_ids, output_ids, qo_indptr, new_tokens, batch_size);
 }
 
 } // extern "C"

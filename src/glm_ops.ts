@@ -146,6 +146,7 @@ interface NativeAddon {
   mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
   nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
   scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number): void;
+  rotateInputIds(ctx: number, outputIds: number, inputIds: number, qoIndptr: number, newTokens: number, batchSize: number): void;
 }
 
 export class GlmTensor extends Tensor {
@@ -292,6 +293,13 @@ export class GlmTensor extends Tensor {
     const out = this.workspace.alloc([batch, k], this.type);
     const elemSize = SafeTensorFile.dtypeBytes(this.type);
     getNativeAddon().gather(this.glm.ctx, out.data, this.data, indices.data, k, inDim, batch, elemSize);
+    return out;
+  }
+
+  rotateInputIds(qoIndptr: Tensor, newTokens: Tensor, batchSize: number): Tensor {
+    super.rotateInputIds(qoIndptr, newTokens, batchSize);
+    const out = this.workspace.alloc(this.shape, this.type);
+    getNativeAddon().rotateInputIds(this.glm.ctx, out.data, this.data, qoIndptr.data, newTokens.data, batchSize);
     return out;
   }
 

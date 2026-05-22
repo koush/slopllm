@@ -2695,6 +2695,27 @@ static Napi::Value P2PRmsnorm(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value RotateInputIds(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, output_ids, input_ids, qo_indptr, new_tokens, batch_size)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t output_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t input_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t indptr_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t new_tokens_ptr = info[4].As<Napi::Number>().Int64Value();
+    int batch_size = info[5].As<Napi::Number>().Int32Value();
+    glm_rotate_input_ids(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                          reinterpret_cast<int*>(output_ptr),
+                          reinterpret_cast<const int*>(input_ptr),
+                          reinterpret_cast<const int*>(indptr_ptr),
+                          reinterpret_cast<const int*>(new_tokens_ptr),
+                          batch_size);
+    return env.Undefined();
+}
+
 static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "init"), Napi::Function::New(env, Init));
     exports.Set(Napi::String::New(env, "free"), Napi::Function::New(env, Free));
@@ -2793,6 +2814,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "p2pCpMerge"), Napi::Function::New(env, P2PCpMerge));
     exports.Set(Napi::String::New(env, "p2pCpMergeHeads"), Napi::Function::New(env, P2PCpMergeHeads));
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
+    exports.Set(Napi::String::New(env, "rotateInputIds"), Napi::Function::New(env, RotateInputIds));
     exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));
     exports.Set(Napi::String::New(env, "ncclUniqueId"), Napi::Function::New(env, NcclUniqueId));
     exports.Set(Napi::String::New(env, "ncclGroupStart"), Napi::Function::New(env, NcclGroupStart));

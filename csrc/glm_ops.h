@@ -181,8 +181,17 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
                              int count, int N, int K);
 
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
-                            const void* scales, int top_k,
-                            int dim, int num_rows, void* workspace);
+                             const void* scales, int top_k,
+                             int dim, int num_rows, void* workspace);
+
+// Rotate input IDs for MTP prefill: shifts each sequence left by 1,
+// appends new_token at the last position.
+// output_ids/input_ids: [totalTokens] I32
+// qo_indptr: [batchSize+1] I32 cumulative offsets
+// new_tokens: [batchSize] I32 new token per sequence
+void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
+                           const int* qo_indptr, const int* new_tokens,
+                           int batch_size);
 
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
                        const void* indices, int dim, int k);

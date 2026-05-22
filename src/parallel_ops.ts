@@ -909,6 +909,21 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, shards, [batch, dim], this.type, this.parallelism);
   }
 
+  rotateInputIds(qoIndptr: Tensor, newTokens: Tensor, batchSize: number): Tensor {
+    super.rotateInputIds(qoIndptr, newTokens, batchSize);
+    const pQoIndptr = qoIndptr as ParallelTensor;
+    const pNewTokens = newTokens as ParallelTensor;
+    this.assertParallel("rotateInputIds inputIds", this, TensorParallelism.Replicated);
+    this.assertParallel("rotateInputIds qoIndptr", pQoIndptr, TensorParallelism.Replicated);
+    this.assertParallel("rotateInputIds newTokens", pNewTokens, TensorParallelism.Replicated);
+
+    const shards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      shards.push(this.shards[i].rotateInputIds(pQoIndptr.shards[i], pNewTokens.shards[i], batchSize));
+    }
+    return this.parallelOps.wrapShards(this.workspace, shards, this.shape, this.type, this.parallelism);
+  }
+
   gather(indices: Tensor, k: number, inDim: number, batch: number): Tensor {
     super.gather(indices, k, inDim, batch);
     const pIndices = indices as ParallelTensor;

@@ -351,6 +351,12 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int
         ]
 
+        self.lib.glm_rotate_input_ids.restype = None
+        self.lib.glm_rotate_input_ids.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int
+        ]
+
         self.lib.glm_arange.restype = None
         self.lib.glm_arange.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int
@@ -1153,6 +1159,16 @@ class GlmOps:
             self._ptr(src),
             self._ptr(indices),
             dim, k
+        )
+
+    def rotate_input_ids(self, output_ids, input_ids, qo_indptr, new_tokens, batch_size):
+        self.lib.glm_rotate_input_ids(
+            self.ctx,
+            self._ptr(output_ids),
+            self._ptr(input_ids),
+            self._ptr(qo_indptr),
+            self._ptr(new_tokens),
+            batch_size
         )
 
     def flash_prefill(self, q, k, v, o, tmp,
