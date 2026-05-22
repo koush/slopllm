@@ -546,19 +546,18 @@ export class Glm51Model extends ChatModel {
     return normed.detach().removeTracking();
   }
 
-  forwardMtp(state: ExecutionState, previousHiddenState: Tensor) {
+  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, inputIds?: Tensor) {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const ws = state.ws;
     const batchSize = state.batchSize;
     const totalTokens = state.totalTokens;
     const BS = totalTokens;
-    const B = state.isDecode ? batchSize : 1;
-    const S = state.isDecode ? 1 : totalTokens;
 
     if (this.mtp && cfg.numNextNPredictLayers) {
+      const ids = inputIds ?? ws.inputIdsBuf;
       const embedTable = this.tensors.get("model.embed_tokens.weight")!;
-      using embedding = embedTable.embedding(ws.inputIdsBuf, hs, BS);
+      using embedding = embedTable.embedding(ids, hs, BS);
       using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps, hs, BS);
       using hnorm = previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps, hs, BS);
       using cat = enorm.cat([hnorm], 1);
@@ -566,11 +565,10 @@ export class Glm51Model extends ChatModel {
       using residual = new UsingHolder(cat.linear(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.eh_proj.weight`)!, BS));
       using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
 
-      for (let i = cfg.numHiddenLayers; i < cfg.numHiddenLayers + cfg.numNextNPredictLayers; i++) {
-        const result = this.mlaLayer(normed.value, residual.value, i, state);
-        normed.replace(result.normed);
-        residual.replace(result.residual);
-      }
+      const layerIdx = cfg.numHiddenLayers;
+      const result = this.mlaLayer(normed.value, residual.value, layerIdx, state);
+      normed.replace(result.normed);
+      residual.replace(result.residual);
 
       return normed.detach().removeTracking();
     }

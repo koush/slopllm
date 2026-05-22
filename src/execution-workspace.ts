@@ -466,6 +466,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         }
       });
       this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, totalTokens * I32, MemcpyKind.HostToDevice);
+      this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     } else {
       this.glm.batchPrefillPagedPlan(
         this.floatWs, BATCH_FLOAT_WS_SIZE,

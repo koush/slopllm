@@ -6,7 +6,7 @@ import { ChatCache, ChatModel, SamplingParams, makeSamplingParams } from "./chat
 import { DeviceOps } from "./device_ops";
 import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
-import { GlmOps, I32 } from "./glm_ops";
+import { GlmOps } from "./glm_ops";
 import { MetaOps } from "./meta_ops";
 import { resolveModelPath } from "./model_path";
 import { ParallelOps } from "./parallel_ops";
@@ -16,6 +16,7 @@ import { MemcpyKind, SamplingWorkspace, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 import { CaptureManager } from "./capture-manager";
+import { mtpDecode, mtpPrefill, mtpReadDrafts, mtpVerify } from "./mtp";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -222,164 +223,11 @@ export function* generateStream(
 
   using captureManager = new CaptureManager(glm);
   using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
-  using hiddenStates0 = new UsingHolder<Tensor>(undefined!);
-  using hiddenStates1 = new UsingHolder<Tensor>(undefined!);
-  using hiddenStates2 = new UsingHolder<Tensor>(undefined!);
-  using mtpDebugHost = new UsingHolder<Tensor>(undefined!);
-  const nextn = 3;
-  // nextn + 1 tokens per sequence, nextn tokens + the target model token
-  using prefillValidationSequences = glm.newTensor(ws, [(1 << nextn) * (nextn + 1)], "I32", false)
-
-  const hiddenStatesArray = [
-    targetHiddenStates,
-    hiddenStates0,
-    hiddenStates1,
-    hiddenStates2,
-  ];
-
-  function doMtp(state: ExecutionState, prefill = false) {
-    if (mtp && model.forwardMtp && cache.getPagedKV().sequences[0].allocLen < maxNewTokens - nextn * 2) {
-      let total = 1;
-
-      // Fill column 0 (root token) for all sequences in prefillValidationSequences
-      captureManager.run(() => {
-        for (let j = 0; j < (1 << nextn); j++) {
-          prefillValidationSequences.memcpy2d(
-            j * (nextn + 1) * 4, (nextn + 1) * 4,
-            gpuSampleResult!, 0, 4,
-            4, 1,
-            MemcpyKind.DeviceToDevice,
-          );
-        }
-      }, !useGraph || prefill ? undefined : ['mtp', 'init']);
-
-      for (let i = 0; i < nextn; i++) {
-        const srcHiddenStates = hiddenStatesArray[i];
-        const dstHiddenStates = hiddenStatesArray[i + 1];
-
-        if (total != 1) {
-          // fork each sequence
-          for (let j = 0; j < total / 2; j++) {
-            const seqIdx = j + total / 2;
-            cache.getPagedKV().copySequence(seqIdx, j);
-          }
-        }
-
-        const state = ws.planDecode(model, 1 << i, cache, useGraph);
-
-        captureManager.run(() => {
-          if (total != 1) {
-            // concat to double the inputs
-            srcHiddenStates.replace(srcHiddenStates.value.cat([srcHiddenStates.value], 0));
-          }
-          ws.decodeStep(state, model);
-          dstHiddenStates.replace(model.forwardMtp!(state, srcHiddenStates.value));
-          using logits = state.computeLogits(dstHiddenStates.value, model);
-          const topk = logits.topk(2, model.cfg.vocabSize);
-          using _values = topk.values;
-
-          if (i === 0) {
-            mtpDebugHost.replace(sampleWorkspace.allocPinned(topk.indices.shape, topk.indices.type));
-            mtpDebugHost.value.memcpy(topk.indices, topk.indices.bytes, MemcpyKind.DeviceToHost);
-          }
-
-          const batch = total * 2;
-          const half = batch / 2;
-          using reordered = ws.alloc(topk.indices.shape, topk.indices.type);
-          reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
-          reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
-          using _indices = topk.indices;
-
-          if (i !== nextn - 1) {
-            ws.inputIdsBuf.memcpy(reordered, batch * I32, MemcpyKind.DeviceToDevice);
-          }
-
-          // Scatter topk predictions into prefillValidationSequences column i+1
-          const fanout = (1 << nextn) >>> (i + 1);
-          for (let j = 0; j < batch; j++) {
-            for (let k = 0; k < fanout; k++) {
-              prefillValidationSequences.memcpy2d(
-                ((j * fanout + k) * (nextn + 1) + i + 1) * 4, (nextn + 1) * 4,
-                reordered, j * 4, 4,
-                4, 1,
-                MemcpyKind.DeviceToDevice,
-              );
-            }
-          }
-        }, !useGraph || prefill ? undefined : ['mtp', i]);
-        total *= 2;
-      }
-      for (let i = 0; i < total / 2 - 1; i++) {
-        const seq = cache.getPagedKV().sequences.pop();
-        seq!.clear();
-      }
-      const seq0 = cache.getPagedKV().sequences[0];
-      seq0.truncate(seq0.allocLen - nextn);
-
-      // capture this somehow in target model graph
-      ws.decodeStep(state, model, -nextn);
-
-      // print tokens for debugging
-      {
-        using host = sampleWorkspace.allocPinned(prefillValidationSequences.shape, prefillValidationSequences.type);
-        host.memcpy(prefillValidationSequences, prefillValidationSequences.bytes, MemcpyKind.DeviceToHost);
-        glm.synchronize();
-        const buf = host.readPinnedBuffer();
-        const stride = nextn + 1;
-        const seq: number[] = [];
-        for (let j = 0; j < stride; j++) {
-          seq.push(buf.readInt32LE(j * 4));
-        }
-        console.log("MTP draft seq0:", seq.map(id => tokenizer?.decode([id]) ?? id).join(""));
-      }
-    }
-
-  }
+  const nextn = model.cfg.numNextNPredictLayers ?? 0;
+  let pendingDrafts: number[] = [];
 
   const useGraph = graphState !== undefined;
-  if (false && useGraph) {
-    for (let i = 0; i < 3; i++) {
-      const state = ws.planPrefill(model, 1, [suffixIds.length], cache);
-      state.prepareInput([suffixIds]);
-      ws.forwardInput(state);
-      using hiddenStates = model.forward(state);
-      state.finishPrefill();
-
-      using firstTokens = state.computeLogits(hiddenStates, model);
-      doSample(firstTokens);
-      cache.reset(1);
-    }
-
-    {
-      const state = ws.planPrefill(model, 1, [suffixIds.length], cache);
-      state.prepareInput([suffixIds]);
-      ws.forwardInput(state);
-
-      glm.graphBeginCapture();
-      targetHiddenStates.replace(model.forward(state));
-      if (mtp && model.forwardMtp && cache.getPagedKV().sequences[0].allocLen < maxNewTokens - nextn * 2) {
-        using mtpHiddenStates = new UsingHolder<Tensor>(undefined!);
-        for (let i = 0; i < nextn; i++) {
-          mtpHiddenStates.replace(model.forwardMtp!(state, mtpHiddenStates.value || targetHiddenStates.value));
-        }
-      }
-      state.finishPrefill();
-      using firstTokens = state.computeLogits(targetHiddenStates.value, model);
-      const graph = glm.graphEndCapture();
-      const graphExec = glm.graphInstantiate(graph);
-      glm.graphDestroy(graph);
-
-      glm.graphLaunch(graphExec);
-      doSample(firstTokens);
-      readSample();
-
-      glm.graphExecDestroy(graphExec);
-
-      doMtp(state, true);
-      glm.synchronize();
-    }
-  }
-  else {
+  {
     const inputIdsList = [suffixIds];
     const batchSize = inputIdsList.length;
     const seqLens = inputIdsList.map(ids => ids.length);
@@ -387,19 +235,28 @@ export function* generateStream(
     state.prepareInput(inputIdsList);
     ws.forwardInput(state);
     targetHiddenStates.replace(model.forward(state));
-    if (mtp && model.forwardMtp && cache.getPagedKV().sequences[0].allocLen < maxNewTokens - nextn * 2) {
-      using mtpHiddenStates = new UsingHolder<Tensor>(undefined!);
-      for (let i = 0; i < nextn; i++) {
-        mtpHiddenStates.replace(model.forwardMtp!(state, mtpHiddenStates.value || targetHiddenStates.value));
+
+    using firstTokens = state.computeLogits(targetHiddenStates.value, model);
+    doSample(firstTokens);
+
+    let draftHosts: Tensor[] = [];
+    if (mtp && model.forwardMtp && nextn > 0) {
+      const mtpPredictions = mtpPrefill(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn);
+      draftHosts = mtpReadDrafts(mtpPredictions, ws);
+      for (const pred of mtpPredictions) pred[Symbol.dispose]();
+    }
+
+    state.finishPrefill();
+    readSample();
+    glm.synchronize();
+
+    if (draftHosts.length > 0) {
+      pendingDrafts = draftHosts.map(h => h.readPinnedBuffer().readInt32LE());
+      if (pendingDrafts.length > 0) {
+        const firstToken = sampleResult!.readPinnedBuffer().readInt32LE();
+        console.log("MTP drafts:", [firstToken, ...pendingDrafts].map(id => tokenizer?.decode([id]) ?? id).join(""));
       }
     }
-    using firstTokens = state.computeLogits(targetHiddenStates.value, model);
-    state.finishPrefill();
-    doSample(firstTokens);
-    readSample();
-
-    doMtp(state, true);
-    glm.synchronize();
   }
   cache.reportTokens(0, suffixIds);
 
@@ -436,15 +293,33 @@ export function* generateStream(
         doSample(state.computeLogits(targetHiddenStates.value, model));
       }, !useGraph ? undefined : ['decode']);
 
-      doMtp(state);
-
-
-
       // sync on the previous token
       sampleStream.value.synchronize();
       const currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
       // kick off next sample read
       readSample();
+
+      // MTP draft verification
+      if (pendingDrafts.length > 0) {
+        const result = mtpVerify(currentToken, pendingDrafts);
+        if (result.acceptedCount > 0) {
+          pendingDrafts.shift();
+        } else {
+          pendingDrafts.length = 0;
+        }
+      }
+
+      // MTP decode: produce draft predictions for next steps
+      if (mtp && model.forwardMtp && nextn > 0) {
+        const mtpPredictions = mtpDecode(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
+        const draftHosts = mtpReadDrafts(mtpPredictions, ws);
+        for (const pred of mtpPredictions) pred[Symbol.dispose]();
+        glm.synchronize();
+        pendingDrafts = draftHosts.map(h => h.readPinnedBuffer().readInt32LE());
+        if (pendingDrafts.length > 0) {
+          console.log("MTP drafts:", [currentToken, ...pendingDrafts].map(id => tokenizer?.decode([id]) ?? id).join(""));
+        }
+      }
 
       execMs += performance.now() - tExec;
       tAfterSync = performance.now();
@@ -689,8 +564,8 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   const modelDir = args.modelDir ?? (args.useGlm51
-    ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
-    // ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
+    // ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
+    ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
     : resolveModelPath(args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO)));
 
   if (args.meta) {
