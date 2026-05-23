@@ -270,3 +270,259 @@ export function mtpVerify(
   const acceptedCount = (draftTokens.length > 0 && draftTokens[0] === targetToken) ? 1 : 0;
   return { acceptedCount, bonusToken: targetToken };
 }
+
+/**
+ * Result of tree-structured MTP draft generation.
+ *
+ * The validation sequences tensor has shape [(1 << nextn) * (nextn + 1)] I32,
+ * laid out as (1 << nextn) rows of (nextn + 1) columns in row-major order.
+ *
+ * Column 0 is the root token (the target model's sampled token, broadcast to all rows).
+ * Column i+1 contains MTP layer i's predictions (top-1 and top-2 interleaved).
+ *
+ * For nextn=3, the 8 rows are:
+ *   [root, D0_top1, D1_top1_of_top1, D2_top1_of_top1_of_top1]
+ *   [root, D0_top1, D1_top1_of_top1, D2_top2_of_top1_of_top1]
+ *   [root, D0_top1, D1_top2_of_top1, D2_top1_of_top2_of_top1]
+ *   [root, D0_top1, D1_top2_of_top1, D2_top2_of_top2_of_top1]
+ *   [root, D0_top2, D1_top1_of_top2, D2_top1_of_top1_of_top2]
+ *   [root, D0_top2, D1_top1_of_top2, D2_top2_of_top1_of_top2]
+ *   [root, D0_top2, D1_top2_of_top2, D2_top1_of_top2_of_top2]
+ *   [root, D0_top2, D1_top2_of_top2, D2_top2_of_top2_of_top2]
+ */
+export interface MtpTreeResult {
+  validationSequences: Tensor;
+  nextn: number;
+}
+
+/**
+ * Tree-structured MTP decode: produce draft predictions using topk=2 batch expansion.
+ *
+ * At each MTP layer, top-2 predictions are sampled, and the batch is doubled by
+ * forking KV cache sequences. This creates a binary tree of depth `nextn` with
+ * 2^nextn candidate paths. After generation, forked sequences are cleaned up and
+ * the KV cache is rewound.
+ *
+ * Prerequisites:
+ *   - The target model must have just decoded (planDecode + decodeStep + forward
+ *     already called for the current position)
+ *   - state must be the target model's decode state (batchSize = 1)
+ *   - gpuSampleResult must be [1] I32 on GPU (target model's sampled token)
+ *   - model.forwardMtp must exist (MTP enabled)
+ *   - ws.inputIdsBuf must contain gpuSampleResult (set by the caller)
+ *   - The paged KV cache must have enough pages for nextn additional tokens
+ *     and enough sequences for (1 << (nextn-1)) forked sequences
+ *   - cache.getPagedKV().maxBatch must be >= (1 << (nextn - 1))
+ *
+ * @param state - The target model's decode ExecutionState
+ * @param model - The chat model (must support forwardMtp)
+ * @param targetHiddenStates - The target model's hidden states [1, hidden] BF16
+ * @param ws - Execution workspace
+ * @param gpuSampleResult - [1] I32 GPU tensor: target model's sampled token
+ * @param nextn - Number of MTP layers (tree depth)
+ * @param cache - Chat cache (paged KV cache)
+ * @returns MtpTreeResult with validation sequences tensor and nextn
+ */
+export function mtpTreeDecode(
+  state: ExecutionState,
+  model: ChatModel,
+  targetHiddenStates: Tensor,
+  ws: ExecutionWorkspace,
+  gpuSampleResult: Tensor,
+  nextn: number,
+  cache: ChatCache,
+): MtpTreeResult {
+  if (!model.forwardMtp) {
+    throw new Error("mtpTreeDecode: model does not support MTP (forwardMtp not defined)");
+  }
+
+  const pagedKV = cache.getPagedKV();
+  const maxMtpBatch = 1 << (nextn - 1);
+  if (pagedKV.maxBatch < maxMtpBatch) {
+    throw new Error(
+      `mtpTreeDecode: maxBatch (${pagedKV.maxBatch}) too small for nextn=${nextn}, need >= ${maxMtpBatch}`,
+    );
+  }
+
+  const totalPaths = 1 << nextn;
+  const rowLen = nextn + 1;
+  const validationSequences = ws.alloc([totalPaths * rowLen], "I32");
+
+  for (let j = 0; j < totalPaths; j++) {
+    validationSequences.memcpy2d(
+      j * rowLen * 4, rowLen * 4,
+      gpuSampleResult, 0, 4,
+      4, 1,
+      MemcpyKind.DeviceToDevice,
+    );
+  }
+
+  let total = 1;
+  let doubledTargetHs: Tensor | null = null;
+
+  for (let i = 0; i < nextn; i++) {
+    const batchSize = 1 << i;
+
+    if (total > 1) {
+      for (let j = 0; j < total / 2; j++) {
+        pagedKV.copySequence(j + total / 2, j);
+      }
+    }
+
+    if (batchSize > 1) {
+      const prev: Tensor = doubledTargetHs ?? targetHiddenStates;
+      const doubled: Tensor = prev.cat([prev], 0);
+      if (doubledTargetHs) doubledTargetHs[Symbol.dispose]();
+      doubledTargetHs = doubled;
+    }
+    const hs = batchSize === 1 ? targetHiddenStates : doubledTargetHs!;
+
+    pagedKV.positionIdsDirty = true;
+    pagedKV.pagesDirtyHost = true;
+    const mtpState = ws.planDecode(model, batchSize, cache);
+    ws.decodeStep(mtpState, model);
+
+    const hiddenStates = model.forwardMtp!(mtpState, hs);
+    using logits = mtpState.computeLogits(hiddenStates, model);
+    hiddenStates[Symbol.dispose]();
+
+    const topk = logits.topk(2, model.cfg.vocabSize);
+    topk.values[Symbol.dispose]();
+
+    const batch = total * 2;
+    const half = batch / 2;
+    const reordered = ws.alloc(topk.indices.shape, topk.indices.type);
+    reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
+    reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
+
+    if (i < nextn - 1) {
+      ws.inputIdsBuf.memcpy(reordered, batch * I32, MemcpyKind.DeviceToDevice);
+    }
+
+    const fanout = totalPaths >>> (i + 1);
+    for (let j = 0; j < batch; j++) {
+      for (let k = 0; k < fanout; k++) {
+        validationSequences.memcpy2d(
+          ((j * fanout + k) * rowLen + i + 1) * 4, rowLen * 4,
+          reordered, j * 4, 4,
+          4, 1,
+          MemcpyKind.DeviceToDevice,
+        );
+      }
+    }
+
+    topk.indices[Symbol.dispose]();
+    reordered[Symbol.dispose]();
+    total *= 2;
+  }
+
+  if (doubledTargetHs) doubledTargetHs[Symbol.dispose]();
+
+  for (let i = 0; i < total / 2 - 1; i++) {
+    const seq = pagedKV.sequences.pop();
+    seq!.clear();
+  }
+
+  const seq0 = pagedKV.sequences[0];
+  seq0.truncate(seq0.allocLen - nextn);
+  pagedKV.positionIdsDirty = true;
+  pagedKV.pagesDirtyHost = true;
+  pagedKV.pagesDirtyDevice = true;
+  ws.decodeStep(state, model, -nextn);
+
+  return { validationSequences, nextn };
+}
+
+/**
+ * Initiate async GPU→Host copy of tree validation sequences.
+ *
+ * The caller MUST synchronize the stream before reading the returned buffer.
+ */
+export function mtpTreeReadDrafts(
+  result: MtpTreeResult,
+  ws: ExecutionWorkspace,
+): Tensor {
+  const host = ws.allocPinned(result.validationSequences.shape, result.validationSequences.type);
+  host.memcpy(result.validationSequences, result.validationSequences.bytes, MemcpyKind.DeviceToHost);
+  return host;
+}
+
+/**
+ * Verifies target model tokens against a tree of MTP draft predictions.
+ *
+ * At each position, the tree has 2 candidate tokens (top-1 and top-2).
+ * If the target token matches either candidate, the draft is accepted and
+ * the active subtree narrows. If neither matches, all remaining drafts are rejected.
+ *
+ * Usage:
+ *   const hostBuf = mtpTreeReadDrafts(treeResult, ws);
+ *   glm.synchronize();
+ *   const verifier = new MtpTreeVerifier(hostBuf, nextn);
+ *   // For each target model token:
+ *   if (verifier.hasPending) {
+ *     const result = verifier.verify(targetToken);
+ *     if (!result.accepted) { verifier = null; } // reject tree
+ *   }
+ */
+export class MtpTreeVerifier {
+  private sequences: number[];
+  private nextn: number;
+  private rowLen: number;
+  private activeRowStart: number;
+  private activeFanout: number;
+  private currentPosition: number;
+
+  constructor(hostBuffer: Tensor, nextn: number) {
+    this.nextn = nextn;
+    this.rowLen = nextn + 1;
+    this.activeRowStart = 0;
+    this.activeFanout = 1 << nextn;
+    this.currentPosition = 0;
+
+    const buf = hostBuffer.readPinnedBuffer();
+    const totalPaths = 1 << nextn;
+    this.sequences = new Array(totalPaths * this.rowLen);
+    for (let i = 0; i < totalPaths * this.rowLen; i++) {
+      this.sequences[i] = buf.readInt32LE(i * 4);
+    }
+  }
+
+  /**
+   * Verify a target model token against the tree at the current position.
+   *
+   * @param targetToken - The target model's decoded token (on CPU)
+   * @returns accepted=true if the token matches a draft candidate, with the matched token;
+   *          accepted=false if no match, with the target token
+   */
+  verify(targetToken: number): { accepted: boolean; token: number } {
+    if (this.currentPosition >= this.nextn) {
+      return { accepted: false, token: targetToken };
+    }
+
+    const halfFanout = this.activeFanout >>> 1;
+    const candidate1Row = this.activeRowStart;
+    const candidate2Row = this.activeRowStart + halfFanout;
+
+    const candidate1 = this.sequences[candidate1Row * this.rowLen + this.currentPosition + 1];
+    const candidate2 = this.sequences[candidate2Row * this.rowLen + this.currentPosition + 1];
+
+    this.currentPosition++;
+
+    if (targetToken === candidate1) {
+      this.activeFanout = halfFanout;
+      return { accepted: true, token: candidate1 };
+    } else if (targetToken === candidate2) {
+      this.activeRowStart = this.activeRowStart + halfFanout;
+      this.activeFanout = halfFanout;
+      return { accepted: true, token: candidate2 };
+    } else {
+      this.currentPosition = this.nextn;
+      return { accepted: false, token: targetToken };
+    }
+  }
+
+  /** Whether there are remaining unverified draft positions in the tree. */
+  get hasPending(): boolean {
+    return this.currentPosition < this.nextn;
+  }
+}

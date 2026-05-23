@@ -16,7 +16,7 @@ import { MemcpyKind, SamplingWorkspace, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 import { CaptureManager } from "./capture-manager";
-import { mtpDecode, mtpPrefill, mtpReadDrafts, mtpVerify } from "./mtp";
+import { mtpTreeDecode, mtpTreeReadDrafts, MtpTreeVerifier } from "./mtp";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -56,6 +56,7 @@ interface CliArgs {
   arena: number;
   cp: boolean;
   mtp: boolean;
+  mtpDraftTokens: number;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -88,6 +89,7 @@ function parseArgs(argv: string[]): CliArgs {
     arena: 0,
     cp: false,
     mtp: false,
+    mtpDraftTokens: 3,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -122,6 +124,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--arena" && i + 1 < argv.length) args.arena = parseInt(argv[++i], 10);
     else if (a === "--cp") args.cp = true;
     else if (a === "--mtp") args.mtp = true;
+    else if (a === "--mtp-draft-tokens" && i + 1 < argv.length) args.mtpDraftTokens = parseInt(argv[++i], 10);
   }
 
   if (args.useQwen35 && args.useFp8) {
@@ -187,7 +190,7 @@ export function* generateStream(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
-  timing?: DecodeTiming, mtp?: boolean, tokenizer?: any,
+  timing?: DecodeTiming, mtp?: boolean, mtpDraftTokens?: number, tokenizer?: any,
 ): Generator<number> {
   const suffixIds = cache.prefixMatch(0, inputIds);
 
@@ -223,8 +226,8 @@ export function* generateStream(
 
   using captureManager = new CaptureManager(glm);
   using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
-  const nextn = model.cfg.numNextNPredictLayers ?? 0;
-  let pendingDrafts: number[] = [];
+  const nextn = (mtp && model.forwardMtp) ? (mtpDraftTokens ?? 3) : 0;
+  let treeVerifier: MtpTreeVerifier | null = null;
 
   const useGraph = graphState !== undefined;
   {
@@ -239,24 +242,9 @@ export function* generateStream(
     using firstTokens = state.computeLogits(targetHiddenStates.value, model);
     doSample(firstTokens);
 
-    let draftHosts: Tensor[] = [];
-    if (mtp && model.forwardMtp && nextn > 0) {
-      const mtpPredictions = mtpPrefill(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn);
-      draftHosts = mtpReadDrafts(mtpPredictions, ws);
-      for (const pred of mtpPredictions) pred[Symbol.dispose]();
-    }
-
     state.finishPrefill();
     readSample();
     glm.synchronize();
-
-    if (draftHosts.length > 0) {
-      pendingDrafts = draftHosts.map(h => h.readPinnedBuffer().readInt32LE());
-      if (pendingDrafts.length > 0) {
-        const firstToken = sampleResult!.readPinnedBuffer().readInt32LE();
-        console.log("MTP drafts:", [firstToken, ...pendingDrafts].map(id => tokenizer?.decode([id]) ?? id).join(""));
-      }
-    }
   }
   cache.reportTokens(0, suffixIds);
 
@@ -299,25 +287,31 @@ export function* generateStream(
       // kick off next sample read
       readSample();
 
-      // MTP draft verification
-      if (pendingDrafts.length > 0) {
-        const result = mtpVerify(currentToken, pendingDrafts);
-        if (result.acceptedCount > 0) {
-          pendingDrafts.shift();
-        } else {
-          pendingDrafts.length = 0;
+      // MTP tree verification
+      if (treeVerifier && treeVerifier.hasPending) {
+        if (!treeVerifier.verify(currentToken).accepted) {
+          treeVerifier = null;
         }
+      } else if (treeVerifier && !treeVerifier.hasPending) {
+        treeVerifier = null;
       }
 
-      // MTP decode: produce draft predictions for next steps
-      if (mtp && model.forwardMtp && nextn > 0) {
-        const mtpPredictions = mtpDecode(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
-        const draftHosts = mtpReadDrafts(mtpPredictions, ws);
-        for (const pred of mtpPredictions) pred[Symbol.dispose]();
+      // MTP tree decode: produce draft predictions for next steps
+      if (mtp && model.forwardMtp && nextn > 0 && !treeVerifier) {
+        const treeResult = mtpTreeDecode(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
+        const hostBuf = mtpTreeReadDrafts(treeResult, ws);
         glm.synchronize();
-        pendingDrafts = draftHosts.map(h => h.readPinnedBuffer().readInt32LE());
-        if (pendingDrafts.length > 0) {
-          console.log("MTP drafts:", [currentToken, ...pendingDrafts].map(id => tokenizer?.decode([id]) ?? id).join(""));
+        treeVerifier = new MtpTreeVerifier(hostBuf, treeResult.nextn);
+        treeResult.validationSequences[Symbol.dispose]();
+        if (treeVerifier.hasPending) {
+          const totalPaths = 1 << treeResult.nextn;
+          const rowLen = treeResult.nextn + 1;
+          const buf = hostBuf.readPinnedBuffer();
+          for (let row = 0; row < totalPaths; row++) {
+            const ids: number[] = [];
+            for (let col = 0; col < rowLen; col++) ids.push(buf.readInt32LE((row * rowLen + col) * 4));
+            console.log(`MTP[${row}]:`, ids.map(id => tokenizer?.decode([id]) ?? id).join(""));
+          }
         }
       }
 
@@ -437,7 +431,7 @@ async function interactiveChat(
       const generatedIds: number[] = [];
       const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-      for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, tokenizer)) {
+      for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTokens, tokenizer)) {
         generatedIds.push(tokenId);
         tokCount++;
         const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -476,7 +470,7 @@ async function singlePrompt(
   const generatedIds: number[] = [];
   const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, tokenizer)) {
+  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTokens, tokenizer)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -564,8 +558,8 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   const modelDir = args.modelDir ?? (args.useGlm51
-    // ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
-    ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
+    ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
+    // ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
     : resolveModelPath(args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO)));
 
   if (args.meta) {
@@ -666,7 +660,8 @@ async function main(): Promise<void> {
   const samplingStr = !args.greedy ? samplingParts.join(" ") : "greedy";
 
   const arenaStr = args.arena ? `  |  arena=${args.arena}GB` : "";
-  console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${args.maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}${arenaStr}`);
+  const mtpStr = args.mtp ? `  |  mtp=${args.mtpDraftTokens}` : "";
+  console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${args.maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}${arenaStr}${mtpStr}`);
 
   const cleanup = () => {
     glm.synchronize();
