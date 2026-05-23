@@ -278,7 +278,8 @@ export function mtpVerify(
  * laid out as (1 << nextn) rows of (nextn + 1) columns in row-major order.
  *
  * Column 0 is the root token (the target model's sampled token, broadcast to all rows).
- * Column i+1 contains MTP layer i's predictions (top-1 and top-2 interleaved).
+ * Column i+1 contains MTP layer i's predictions (top-1 and top-2 per batch element,
+ * in natural topk order: [top1_seq0, top2_seq0, top1_seq1, top2_seq1, ...]).
  *
  * For nextn=3, the 8 rows are:
  *   [root, D0_top1, D1_top1_of_top1, D2_top1_of_top1_of_top1]
@@ -391,28 +392,28 @@ export function mtpTreeDecode(
 
     const batch = total * 2;
     const half = batch / 2;
-    const reordered = ws.alloc(topk.indices.shape, topk.indices.type);
-    reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
-    reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
-
-    if (i < nextn - 1) {
-      ws.inputIdsBuf.memcpy(reordered, batch * I32, MemcpyKind.DeviceToDevice);
-    }
 
     const fanout = totalPaths >>> (i + 1);
     for (let j = 0; j < batch; j++) {
       for (let k = 0; k < fanout; k++) {
         validationSequences.memcpy2d(
           ((j * fanout + k) * rowLen + i + 1) * 4, rowLen * 4,
-          reordered, j * 4, 4,
+          topk.indices, j * 4, 4,
           4, 1,
           MemcpyKind.DeviceToDevice,
         );
       }
     }
 
+    if (i < nextn - 1) {
+      const reordered = ws.alloc(topk.indices.shape, topk.indices.type);
+      reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
+      reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
+      ws.inputIdsBuf.memcpy(reordered, batch * I32, MemcpyKind.DeviceToDevice);
+      reordered[Symbol.dispose]();
+    }
+
     topk.indices[Symbol.dispose]();
-    reordered[Symbol.dispose]();
     total *= 2;
   }
 
