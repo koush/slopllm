@@ -16,7 +16,7 @@ import { MemcpyKind, SamplingWorkspace, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 import { CaptureManager } from "./capture-manager";
-import { mtpTreeDecode, mtpTreeReadDrafts, MtpTreeVerifier } from "./mtp";
+import { mtpPrefill, mtpTreeDecode, mtpTreeReadDrafts } from "./mtp";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -214,20 +214,10 @@ export function* generateStream(
   }
 
   const tokenHistory = inputIds.slice();
-  const sampleStream = new UsingHolder<ReturnType<typeof glm.withStream<void>>>(undefined!);
-
-  function readSample() {
-    sampleStream.replace(glm.withStream(() => {
-      const argmaxValue = sampledLogits.value;
-      sampleResult ||= sampleWorkspace.allocPinned(argmaxValue.shape, argmaxValue.type);
-      sampleResult.memcpy(argmaxValue, argmaxValue.bytes, MemcpyKind.DeviceToHost);
-    }));
-  }
 
   using captureManager = new CaptureManager(glm);
   using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
   const nextn = (mtp && model.forwardMtp) ? (mtpDraftTokens ?? 3) : 0;
-  let treeVerifier: MtpTreeVerifier | null = null;
 
   const useGraph = graphState !== undefined;
   {
@@ -242,11 +232,23 @@ export function* generateStream(
     using firstTokens = state.computeLogits(targetHiddenStates.value, model);
     doSample(firstTokens);
 
+    if (mtp && model.forwardMtp && nextn > 0) {
+      const mtpPredictions = mtpPrefill(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn);
+      for (const pred of mtpPredictions) pred[Symbol.dispose]();
+    }
+
     state.finishPrefill();
-    readSample();
-    glm.synchronize();
   }
+
+  sampleResult ||= sampleWorkspace.allocPinned(gpuSampleResult!.shape, gpuSampleResult!.type);
+  sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
+  glm.synchronize();
+  const firstToken = sampleResult!.readPinnedBuffer().readInt32LE();
   cache.reportTokens(0, suffixIds);
+  cache.reportTokens(0, [firstToken]);
+  tokenHistory.push(firstToken);
+  yield firstToken;
+  if (eosIds.has(firstToken)) return;
 
   let planMs = 0;
   let execMs = 0;
@@ -281,46 +283,16 @@ export function* generateStream(
         doSample(state.computeLogits(targetHiddenStates.value, model));
       }, !useGraph ? undefined : ['decode']);
 
-      // sync on the previous token
-      sampleStream.value.synchronize();
+      sampleResult ||= sampleWorkspace.allocPinned(gpuSampleResult!.shape, gpuSampleResult!.type);
+      sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
+      glm.synchronize();
       const currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
-      // kick off next sample read
-      readSample();
-
-      // MTP tree verification
-      if (treeVerifier && treeVerifier.hasPending) {
-        if (!treeVerifier.verify(currentToken).accepted) {
-          treeVerifier = null;
-        }
-      } else if (treeVerifier && !treeVerifier.hasPending) {
-        treeVerifier = null;
-      }
-
-      // MTP tree decode: produce draft predictions for next steps
-      if (mtp && model.forwardMtp && nextn > 0 && !treeVerifier) {
-        const treeResult = mtpTreeDecode(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
-        const hostBuf = mtpTreeReadDrafts(treeResult, ws);
-        glm.synchronize();
-        treeVerifier = new MtpTreeVerifier(hostBuf, treeResult.nextn);
-        treeResult.validationSequences[Symbol.dispose]();
-        if (treeVerifier.hasPending) {
-          const totalPaths = 1 << treeResult.nextn;
-          const rowLen = treeResult.nextn + 1;
-          const buf = hostBuf.readPinnedBuffer();
-          for (let row = 0; row < totalPaths; row++) {
-            const ids: number[] = [];
-            for (let col = 0; col < rowLen; col++) ids.push(buf.readInt32LE((row * rowLen + col) * 4));
-            console.log(`MTP[${row}]:`, ids.map(id => tokenizer?.decode([id]) ?? id).join(""));
-          }
-        }
-      }
 
       execMs += performance.now() - tExec;
       tAfterSync = performance.now();
       cache.reportTokens(0, [currentToken]);
       tokenHistory.push(currentToken);
 
-      // yield previous token
       yield currentToken;
       if (eosIds.has(currentToken))
         return;
@@ -331,6 +303,25 @@ export function* generateStream(
         if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
         lastTokenTime = now;
         postWarmupTokenCount++;
+      }
+
+      if (mtp && model.forwardMtp && nextn > 0) {
+        const treeResult = mtpTreeDecode(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
+        const hostBuf = mtpTreeReadDrafts(treeResult, ws);
+        glm.synchronize();
+        const totalPaths = 1 << treeResult.nextn;
+        const rowLen = treeResult.nextn + 1;
+        const buf = hostBuf.readPinnedBuffer();
+        const rootId = buf.readInt32LE(0);
+        console.log(`MTP target=${tokenizer?.decode([rootId]) ?? rootId}`);
+        for (let row = 0; row < totalPaths; row++) {
+          const ids: number[] = [];
+          for (let col = 1; col < rowLen; col++) ids.push(buf.readInt32LE((row * rowLen + col) * 4));
+          console.log(`  [${row}] ${ids.map(id => tokenizer?.decode([id]) ?? `?${id}`).join(" ")}`);
+        }
+        console.log();
+        treeResult.validationSequences[Symbol.dispose]();
+        hostBuf[Symbol.dispose]();
       }
     }
   } finally {

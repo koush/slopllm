@@ -19,7 +19,6 @@ import { UsingHolder } from "./using-holder";
  *   - Layer 1+: the previous MTP layer's top-1 prediction (topk.indices)
  *
  * Returns the top-1 prediction indices for each MTP layer (shape [batchSize, 1] I32 each).
- * These are token IDs, suitable for mtpReadDrafts and mtpVerify.
  * The caller is responsible for disposing the returned tensors when done.
  *
  * Prerequisites:
@@ -105,7 +104,7 @@ export function mtpPrefill(
  * target decode step starts at the correct position.
  *
  * Returns the top-1 prediction indices for each MTP layer (shape [1, 1] I32 each).
- * These are token IDs, suitable for mtpReadDrafts and mtpVerify.
+ * These are token IDs, suitable for mtpReadDrafts.
  * The caller is responsible for disposing the returned tensors when done.
  * The caller should also call `mtpReadDrafts` and synchronize before reading.
  *
@@ -212,66 +211,6 @@ export function mtpReadDrafts(
 }
 
 /**
- * Result of MTP draft verification.
- *
- * In greedy speculative decoding, each decode step produces one target token.
- * That token is compared against the oldest unverified draft prediction.
- * If they match, the draft is accepted; otherwise all remaining drafts are rejected.
- *
- * For single-token decode verification (our architecture), acceptedCount is 0 or 1.
- * The "bonus token" concept: when all drafts at a position are rejected, the target
- * model's token at that position is the correct output — this is the bonus token.
- * When a draft matches, the target's token IS that draft token (they're identical).
- */
-export interface MtpVerifyResult {
-  /** Number of draft tokens accepted (0 or 1 for single-token decode verification). */
-  acceptedCount: number;
-  /** The token to yield to the output stream — always the target model's token.
-   *  If acceptedCount > 0, this equals draftTokens[0] (verified match). */
-  bonusToken: number;
-}
-
-/**
- * Verify MTP draft predictions against the target model's decoded token.
- *
- * Greedy verification: compare the target model's token with the first pending
- * draft prediction. If they match, the draft is accepted; otherwise all remaining
- * drafts are rejected (since subsequent drafts are conditioned on the first being
- * correct, a rejection cascades).
- *
- * @param targetToken - The target model's greedy/sampled token (on CPU)
- * @param draftTokens - MTP draft predictions read back from GPU (one per layer,
- *   ordered by position: draftTokens[0] is the oldest unverified draft)
- * @returns Verification result with acceptedCount and the bonus token to yield
- *
- * @example
- * // After prefill, read back MTP predictions:
- * const draftHosts = mtpReadDrafts(mtpPredictions, ws);
- * glm.synchronize(); // wait for async GPU→Host copies
- * const pendingDrafts = draftHosts.map(h => h.readPinnedBuffer().readInt32LE());
- *
- * // In the decode loop, after reading targetToken:
- * if (pendingDrafts.length > 0) {
- *   const result = mtpVerify(targetToken, pendingDrafts);
- *   yield result.bonusToken;
- *   if (result.acceptedCount > 0) {
- *     pendingDrafts.shift(); // accepted draft[0], remaining still valid
- *   } else {
- *     pendingDrafts.length = 0; // reject all drafts
- *   }
- * } else {
- *   yield targetToken;
- * }
- */
-export function mtpVerify(
-  targetToken: number,
-  draftTokens: number[],
-): MtpVerifyResult {
-  const acceptedCount = (draftTokens.length > 0 && draftTokens[0] === targetToken) ? 1 : 0;
-  return { acceptedCount, bonusToken: targetToken };
-}
-
-/**
  * Result of tree-structured MTP draft generation.
  *
  * The validation sequences tensor has shape [(1 << nextn) * (nextn + 1)] I32,
@@ -304,15 +243,21 @@ export interface MtpTreeResult {
  * 2^nextn candidate paths. After generation, forked sequences are cleaned up and
  * the KV cache is rewound.
  *
+ * Iteration 0 processes at the target model's decode position (S), reusing its
+ * slot and decode plan. This ensures the MTP KV entry is written at position S
+ * (filling the gap that would otherwise exist) and that the MTP layer sees the
+ * correct RoPE position. Iterations 1+ advance the position normally via
+ * planDecode + decodeStep.
+ *
  * Prerequisites:
  *   - The target model must have just decoded (planDecode + decodeStep + forward
  *     already called for the current position)
  *   - state must be the target model's decode state (batchSize = 1)
- *   - gpuSampleResult must be [1] I32 on GPU (target model's sampled token)
+ *   - gpuSampleResult must be [1] I32 GPU tensor: target model's sampled token
  *   - model.forwardMtp must exist (MTP enabled)
- *   - ws.inputIdsBuf must contain gpuSampleResult (set by the caller)
- *   - The paged KV cache must have enough pages for nextn additional tokens
- *     and enough sequences for (1 << (nextn-1)) forked sequences
+ *   - The paged KV cache must have enough pages for nextn-1 additional tokens
+ *     (iteration 0 reuses the target model's slot) and enough sequences for
+ *     (1 << (nextn-1)) forked sequences
  *   - cache.getPagedKV().maxBatch must be >= (1 << (nextn - 1))
  *
  * @param state - The target model's decode ExecutionState
@@ -358,6 +303,11 @@ export function mtpTreeDecode(
     );
   }
 
+  // The target model's decode left ws.inputIdsBuf containing the previous token
+  // (set before the target forward pass). The MTP layer needs the current decoded
+  // token (gpuSampleResult) as input for iteration 0.
+  ws.inputIdsBuf.memcpy(gpuSampleResult, gpuSampleResult.bytes, MemcpyKind.DeviceToDevice);
+
   let total = 1;
   let doubledTargetHs: Tensor | null = null;
 
@@ -378,10 +328,20 @@ export function mtpTreeDecode(
     }
     const hs = batchSize === 1 ? targetHiddenStates : doubledTargetHs!;
 
-    pagedKV.positionIdsDirty = true;
-    pagedKV.pagesDirtyHost = true;
-    const mtpState = ws.planDecode(model, batchSize, cache);
-    ws.decodeStep(mtpState, model);
+    let mtpState: ExecutionState;
+    if (i === 0) {
+      // Iteration 0: process at the target model's decode position (S).
+      // The target model already allocated the slot at S and set up the decode
+      // plan. Skipping planDecode/decodeStep avoids advancing past position S,
+      // which would leave a gap in the MTP KV cache (no entry at S) and cause
+      // the MTP to process at S+1 instead of S.
+      mtpState = state;
+    } else {
+      pagedKV.positionIdsDirty = true;
+      pagedKV.pagesDirtyHost = true;
+      mtpState = ws.planDecode(model, batchSize, cache);
+      ws.decodeStep(mtpState, model);
+    }
 
     const hiddenStates = model.forwardMtp!(mtpState, hs);
     using logits = mtpState.computeLogits(hiddenStates, model);
@@ -424,12 +384,15 @@ export function mtpTreeDecode(
     seq!.clear();
   }
 
+  // Iteration 0 does not advance the position (no planDecode/decodeStep),
+  // so only nextn-1 positions were allocated beyond the target model's slot.
+  const mtpAdvance = nextn - 1;
   const seq0 = pagedKV.sequences[0];
-  seq0.truncate(seq0.allocLen - nextn);
+  seq0.truncate(seq0.allocLen - mtpAdvance);
   pagedKV.positionIdsDirty = true;
   pagedKV.pagesDirtyHost = true;
   pagedKV.pagesDirtyDevice = true;
-  ws.decodeStep(state, model, -nextn);
+  ws.decodeStep(state, model, -mtpAdvance);
 
   return { validationSequences, nextn };
 }
@@ -448,82 +411,4 @@ export function mtpTreeReadDrafts(
   return host;
 }
 
-/**
- * Verifies target model tokens against a tree of MTP draft predictions.
- *
- * At each position, the tree has 2 candidate tokens (top-1 and top-2).
- * If the target token matches either candidate, the draft is accepted and
- * the active subtree narrows. If neither matches, all remaining drafts are rejected.
- *
- * Usage:
- *   const hostBuf = mtpTreeReadDrafts(treeResult, ws);
- *   glm.synchronize();
- *   const verifier = new MtpTreeVerifier(hostBuf, nextn);
- *   // For each target model token:
- *   if (verifier.hasPending) {
- *     const result = verifier.verify(targetToken);
- *     if (!result.accepted) { verifier = null; } // reject tree
- *   }
- */
-export class MtpTreeVerifier {
-  private sequences: number[];
-  private nextn: number;
-  private rowLen: number;
-  private activeRowStart: number;
-  private activeFanout: number;
-  private currentPosition: number;
 
-  constructor(hostBuffer: Tensor, nextn: number) {
-    this.nextn = nextn;
-    this.rowLen = nextn + 1;
-    this.activeRowStart = 0;
-    this.activeFanout = 1 << nextn;
-    this.currentPosition = 0;
-
-    const buf = hostBuffer.readPinnedBuffer();
-    const totalPaths = 1 << nextn;
-    this.sequences = new Array(totalPaths * this.rowLen);
-    for (let i = 0; i < totalPaths * this.rowLen; i++) {
-      this.sequences[i] = buf.readInt32LE(i * 4);
-    }
-  }
-
-  /**
-   * Verify a target model token against the tree at the current position.
-   *
-   * @param targetToken - The target model's decoded token (on CPU)
-   * @returns accepted=true if the token matches a draft candidate, with the matched token;
-   *          accepted=false if no match, with the target token
-   */
-  verify(targetToken: number): { accepted: boolean; token: number } {
-    if (this.currentPosition >= this.nextn) {
-      return { accepted: false, token: targetToken };
-    }
-
-    const halfFanout = this.activeFanout >>> 1;
-    const candidate1Row = this.activeRowStart;
-    const candidate2Row = this.activeRowStart + halfFanout;
-
-    const candidate1 = this.sequences[candidate1Row * this.rowLen + this.currentPosition + 1];
-    const candidate2 = this.sequences[candidate2Row * this.rowLen + this.currentPosition + 1];
-
-    this.currentPosition++;
-
-    if (targetToken === candidate1) {
-      this.activeFanout = halfFanout;
-      return { accepted: true, token: candidate1 };
-    } else if (targetToken === candidate2) {
-      this.activeRowStart = this.activeRowStart + halfFanout;
-      this.activeFanout = halfFanout;
-      return { accepted: true, token: candidate2 };
-    } else {
-      this.currentPosition = this.nextn;
-      return { accepted: false, token: targetToken };
-    }
-  }
-
-  /** Whether there are remaining unverified draft positions in the tree. */
-  get hasPending(): boolean {
-    return this.currentPosition < this.nextn;
-  }
-}

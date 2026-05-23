@@ -334,6 +334,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
         }
       });
       this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
+
+      if (cfg.kvLoraRank) {
+        this.mlaBatchIndicesH.withPinnedBuffer(buf => {
+          for (let i = 0; i < batchSize; i++) buf.writeInt32LE(i, i * I32);
+        });
+        this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, batchSize * I32, MemcpyKind.HostToDevice);
+      }
+
       pagedKV.positionIdsDirty = false;
       this.lastDecodePagedKV = pagedKV;
     }
