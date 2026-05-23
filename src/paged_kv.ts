@@ -154,8 +154,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
         this.vData.push(this.alloc([maxPages, nKv * pageSize * hd], "BF16", undefined, TensorParallelism.Row));
       }
     }
-    this.indices = this.alloc([maxPages * I32], "I32", "indices");
-    this.indicesH = this.allocPinned([maxPages], "I32", "indicesH");
+    this.indices = this.alloc([maxPages * maxBatch * I32], "I32", "indices");
+    this.indicesH = this.allocPinned([maxPages * maxBatch], "I32", "indicesH");
     this.availablePages = Array.from({ length: maxPages }, (_, i) => i);
     this.sequences = [];
     this.staging = new Map();
