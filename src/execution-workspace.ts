@@ -35,15 +35,19 @@ export class ExecutionState {
     this.qoIndptrHost = qoIndptrHost;
   }
 
-  computeLogits(hiddenStates: Tensor, model: ChatModel): Tensor {
+  computeLogits(hiddenStates: Tensor, model: ChatModel, lastIdx: Tensor | undefined = this.ws.lastIdx): Tensor {
     const lmHead = model.tensors.get("lm_head.weight")!;
     const hs = model.cfg.hiddenSize;
     const batchSize = this.batchSize;
     if (this.isDecode) {
       return hiddenStates.linear(lmHead, batchSize).removeTracking();
-    } else {
-      using hiddenLast = hiddenStates.indexSelect(this.ws.lastIdx, hs, batchSize);
+    }
+    else if (lastIdx) {
+      using hiddenLast = hiddenStates.indexSelect(lastIdx, hs, batchSize);
       return hiddenLast.linear(lmHead, batchSize).removeTracking();
+    }
+    else {
+      return hiddenStates.linear(lmHead, this.totalTokens).removeTracking();
     }
   }
 
