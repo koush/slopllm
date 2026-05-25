@@ -328,6 +328,136 @@ describe("CP MLA Prefill", () => {
   });
 });
 
+function runCpAppendPrefillTest(
+  glm: GlmOps,
+  ws: WorkspaceBase,
+  prefixLen: number,
+  newLen: number,
+  batchSize: number,
+  pageSize: number,
+  worldSize: number,
+): void {
+  const totalKvLen = prefixLen + newLen;
+  const totalQTokens = batchSize * newLen;
+  const numPages = Math.ceil(totalKvLen / pageSize);
+  const maxPages = numPages + 1;
+  const vPS = pageSize / worldSize;
+
+  const qNopeF32 = randomData(totalQTokens * N_HEADS * HEAD_DIM_CKV);
+  const qPeF32 = randomData(totalQTokens * N_HEADS * HEAD_DIM_KPE);
+
+  const ckvF32 = randomData(numPages * pageSize * HEAD_DIM_CKV);
+  const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
+
+  const vProjF32 = randomData(N_HEADS * V_HEAD_DIM * HEAD_DIM_CKV);
+  const vProj = allocBf16(ws, [N_HEADS * V_HEAD_DIM, HEAD_DIM_CKV]);
+  vProj.h2d(f32ToBf16Bytes(vProjF32));
+
+  const baseline = runMlaPrefill(
+    glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+    newLen, totalKvLen, totalKvLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
+    pageSize, maxPages,
+    pageSize * HEAD_DIM_CKV, pageSize * HEAD_DIM_KPE,
+    0, 0,
+  );
+
+  const baselineVExpanded = baseline.vOut.mlaVExpand(vProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, newLen, batchSize);
+  const baselineVExpandedBuf = Buffer.alloc(totalQTokens * N_HEADS * V_HEAD_DIM * 2);
+  baselineVExpanded.d2h(baselineVExpandedBuf);
+  const baselineVExpandedF32 = bf16BytesToF32(baselineVExpandedBuf);
+
+  const shardVPtrs: number[] = [];
+  const shardLsePtrs: number[] = [];
+
+  for (let rank = 0; rank < worldSize; rank++) {
+    const { ckvShard, kpeShard, shardLen, maxShardPages } = shardKV(
+      ckvF32, kpeF32, totalKvLen, pageSize, worldSize, rank, HEAD_DIM_CKV, HEAD_DIM_KPE,
+    );
+
+    const ckvStridePageShard = vPS * HEAD_DIM_CKV;
+    const kpeStridePageShard = vPS * HEAD_DIM_KPE;
+
+    const result = runMlaPrefill(
+      glm, ws, qNopeF32, qPeF32, ckvShard, kpeShard,
+      newLen, shardLen, totalKvLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
+      vPS, maxShardPages,
+      ckvStridePageShard, kpeStridePageShard,
+      worldSize, rank,
+    );
+
+    const shardVExpanded = result.vOut.mlaVExpand(vProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, newLen, batchSize);
+
+    shardVPtrs.push(shardVExpanded.data);
+    shardLsePtrs.push(result.lse.data);
+  }
+
+  const mergedVOut = allocBf16(ws, [totalQTokens, N_HEADS * V_HEAD_DIM]);
+  glm.contextParallelMerge(
+    shardVPtrs, shardLsePtrs, worldSize,
+    mergedVOut, null,
+    totalQTokens, N_HEADS, V_HEAD_DIM,
+  );
+  glm.synchronize();
+
+  const mergedBuf = Buffer.alloc(totalQTokens * N_HEADS * V_HEAD_DIM * 2);
+  mergedVOut.d2h(mergedBuf);
+  const mergedF32 = bf16BytesToF32(mergedBuf);
+
+  let maxRelErr = 0;
+  let maxAbsErr = 0;
+  let maxRelErrForSignificant = 0;
+  let errorCount = 0;
+  const totalElems = totalQTokens * N_HEADS * V_HEAD_DIM;
+  const SIGNIFICANCE_THRESHOLD = 0.05;
+  const ABS_TOL = 0.03;
+  const REL_TOL = 0.10;
+
+  for (let i = 0; i < totalElems; i++) {
+    const merged = mergedF32[i];
+    const expected = baselineVExpandedF32[i];
+    const absErr = Math.abs(merged - expected);
+    const relErr = absErr / Math.max(Math.abs(expected), 1e-6);
+    if (absErr > ABS_TOL + REL_TOL * Math.abs(expected)) {
+      errorCount++;
+    }
+    maxRelErr = Math.max(maxRelErr, relErr);
+    maxAbsErr = Math.max(maxAbsErr, absErr);
+    if (Math.abs(expected) > SIGNIFICANCE_THRESHOLD) {
+      maxRelErrForSignificant = Math.max(maxRelErrForSignificant, relErr);
+    }
+  }
+
+  console.log(`CP append prefill (prefix=${prefixLen}, new=${newLen}, batch=${batchSize}, pageSize=${pageSize}, worldSize=${worldSize}): maxAbsErr=${maxAbsErr.toFixed(6)} maxRelErrForSignificant=${maxRelErrForSignificant.toFixed(6)} errors=${errorCount}/${totalElems}`);
+  assert.ok(errorCount === 0, `${errorCount}/${totalElems} elements exceed tolerance (atol=${ABS_TOL}, rtol=${REL_TOL})`);
+}
+
+describe("CP MLA Append Prefill (qSeqLen < kvSeqLen)", () => {
+  let glm: GlmOps;
+  let ws: WorkspaceBase;
+
+  before(() => {
+    glm = new GlmOps(0);
+    ws = new WorkspaceBase(glm);
+  });
+
+  after(() => {
+    ws.free();
+    glm.free();
+  });
+
+  it("2-shard CP append prefill matches baseline (prefix=32, new=9, pageSize=16)", () => {
+    runCpAppendPrefillTest(glm, ws, 32, 9, 1, 16, 2);
+  });
+
+  it("2-shard CP append prefill matches baseline (prefix=16, new=8, pageSize=16)", () => {
+    runCpAppendPrefillTest(glm, ws, 16, 8, 1, 16, 2);
+  });
+
+  it("2-shard CP append prefill matches baseline (prefix=16, new=1, pageSize=16)", () => {
+    runCpAppendPrefillTest(glm, ws, 16, 1, 1, 16, 2);
+  });
+});
+
 function shardKVParallel(
   ckvF32: Float32Array,
   kpeF32: Float32Array,
