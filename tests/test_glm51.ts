@@ -5,6 +5,7 @@ import type { ChatCache, ChatModel } from "../src/chat_model";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { Glm51Model } from "../src/glm51_model";
 import { GlmOps } from "../src/glm_ops";
+import { ParallelOps } from "../src/parallel_ops";
 import { Tensor } from "../src/tensor";
 import { PAGE_SIZE } from "../src/paged_kv";
 
@@ -15,6 +16,28 @@ const SMALL_MODEL_DIR = path.resolve(
 
 function makeLongPrompt(length: number, prefix: number[] = [1, 2, 3]): number[] {
   return [...prefix, ...Array.from({ length: length - prefix.length }, (_, i) => 100 + i)];
+}
+
+function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[], chunkSizes: number[]): number[] {
+  let offset = 0;
+  let logits: ReturnType<Tensor["argmax"]> | null = null;
+  for (let i = 0; i < chunkSizes.length; i++) {
+    const chunk = inputIds.slice(offset, offset + chunkSizes[i]);
+    offset += chunkSizes[i];
+    const state = ws.planPrefill(model, 1, [chunk.length], cache);
+    state.prepareInput([chunk]);
+    ws.forwardInput(state);
+    const hiddenStates = model.forward(state);
+    if (i < chunkSizes.length - 1) {
+      hiddenStates[Symbol.dispose]();
+    } else {
+      logits = state.computeLogits(hiddenStates, model);
+      hiddenStates[Symbol.dispose]();
+      state.finishPrefill();
+    }
+  }
+  using argmaxOut = logits!.argmax();
+  return argmaxOut.readInt32LEArray();
 }
 
 describe("GLM-5.1 small model smoke test", () => {
@@ -115,28 +138,6 @@ describe("GLM-5.1 small model smoke test", () => {
     cache.free();
   });
 
-  function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[], chunkSizes: number[]): number[] {
-    let offset = 0;
-    let logits: ReturnType<Tensor["argmax"]> | null = null;
-    for (let i = 0; i < chunkSizes.length; i++) {
-      const chunk = inputIds.slice(offset, offset + chunkSizes[i]);
-      offset += chunkSizes[i];
-      const state = ws.planPrefill(model, 1, [chunk.length], cache);
-      state.prepareInput([chunk]);
-      ws.forwardInput(state);
-      const hiddenStates = model.forward(state);
-      if (i < chunkSizes.length - 1) {
-        hiddenStates[Symbol.dispose]();
-      } else {
-        logits = state.computeLogits(hiddenStates, model);
-        hiddenStates[Symbol.dispose]();
-        state.finishPrefill();
-      }
-    }
-    using argmaxOut = logits!.argmax();
-    return argmaxOut.readInt32LEArray();
-  }
-
   it("chunked prefill: two halves", () => {
     using cache1 = model.createChatCache(32);
     using cache2 = model.createChatCache(32);
@@ -233,6 +234,78 @@ describe("GLM-5.1 small model smoke test", () => {
     for (let i = 0; i < expected.length; i++) {
       assert.equal(predictions[i], expected[i],
         `Position ${i}: predicted ${predictions[i]} but decode produced ${expected[i]}`);
-    }
+     }
+  });
+});
+
+describe("GLM-5.1 small model with context parallelism", () => {
+  let glm0: GlmOps;
+  let glm1: GlmOps;
+  let glm2: GlmOps;
+  let po: ParallelOps;
+  let modelCp: Glm51Model;
+  let wsCp: ExecutionWorkspace;
+
+  const MAX_BATCH = 2;
+  const MAX_SEQ_LEN = 128;
+
+  before(async () => {
+    glm0 = new GlmOps(0);
+    glm1 = new GlmOps(1);
+    glm2 = new GlmOps(2);
+    po = new ParallelOps([glm1, glm2]);
+    modelCp = await Glm51Model.fromPretrained(po, SMALL_MODEL_DIR, MAX_BATCH, MAX_SEQ_LEN, true);
+    wsCp = new ExecutionWorkspace(po, MAX_BATCH, MAX_SEQ_LEN);
+  });
+
+  after(() => {
+    wsCp.free();
+    modelCp.free();
+    po.free();
+    glm0.free(); glm1.free(); glm2.free();
+  });
+
+  it("prefill produces valid token", () => {
+    using cache = modelCp.createChatCache(32);
+    cache.reset(1);
+    const inputIds = [1, 2, 3, 4, 5];
+    const tokens = wsCp.forwardEagerPrefill(modelCp, [inputIds], cache);
+    assert.equal(tokens.length, 1, "should produce 1 token for batch=1");
+    assert.ok(tokens[0] >= 0 && tokens[0] < modelCp.cfg.vocabSize,
+      `token ${tokens[0]} out of vocab range [0, ${modelCp.cfg.vocabSize})`);
+  });
+
+  it("prefill + decode produces valid tokens", () => {
+    using cache = modelCp.createChatCache(32);
+    cache.reset(1);
+    const inputIds = [1, 2, 3];
+    const firstToken = wsCp.forwardEagerPrefill(modelCp, [inputIds], cache)[0];
+    assert.ok(firstToken >= 0 && firstToken < modelCp.cfg.vocabSize, "prefill token out of range");
+
+    cache.getPagedKV().updateIndptr(wsCp);
+    const secondToken = wsCp.forwardEagerDecode(modelCp, [firstToken], cache)[0];
+    assert.ok(secondToken >= 0 && secondToken < modelCp.cfg.vocabSize, "decode token out of range");
+  });
+
+  it("chunked prefill + decode", () => {
+    using cache1 = modelCp.createChatCache(32);
+    using cache2 = modelCp.createChatCache(32);
+    const fullPrompt = [1, 2, 3, 4, 5, 6, 7];
+    const mid = Math.floor(fullPrompt.length / 2);
+
+    cache1.reset(1);
+    const fullTokens = wsCp.forwardEagerPrefill(modelCp, [fullPrompt], cache1);
+    cache1.getPagedKV().updateIndptr(wsCp);
+    const fullDecode = wsCp.forwardEagerDecode(modelCp, [fullTokens[0]], cache1)[0];
+
+    cache2.reset(1);
+    const chunkedTokens = chunkedPrefill(modelCp, wsCp, cache2, fullPrompt, [mid, fullPrompt.length - mid]);
+    cache2.getPagedKV().updateIndptr(wsCp);
+    const chunkedDecode = wsCp.forwardEagerDecode(modelCp, [chunkedTokens[0]], cache2)[0];
+
+    assert.equal(chunkedTokens[0], fullTokens[0],
+      `Chunked prefill mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
+    assert.equal(chunkedDecode, fullDecode,
+      `Chunked decode mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
   });
 });
