@@ -6,11 +6,16 @@ import { ExecutionWorkspace } from "../src/execution-workspace";
 import { Glm51Model } from "../src/glm51_model";
 import { GlmOps } from "../src/glm_ops";
 import { Tensor } from "../src/tensor";
+import { PAGE_SIZE } from "../src/paged_kv";
 
 const SMALL_MODEL_DIR = path.resolve(
   __dirname,
   "../tests/python/test_models/glm51_small/glm51_small_bf16",
 );
+
+function makeLongPrompt(length: number, prefix: number[] = [1, 2, 3]): number[] {
+  return [...prefix, ...Array.from({ length: length - prefix.length }, (_, i) => 100 + i)];
+}
 
 describe("GLM-5.1 small model smoke test", () => {
   let glm: GlmOps;
@@ -183,5 +188,51 @@ describe("GLM-5.1 small model smoke test", () => {
       `Chunked prefill token mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
     assert.equal(chunkedDecode, fullDecode,
       `Chunked decode token mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
+  });
+
+  it("prefill after KV truncate: argmax at every position matches decode", () => {
+    using cache = model.createChatCache(256);
+    const pagedKV = cache.getPagedKV();
+    const prompt = makeLongPrompt(PAGE_SIZE * 2);
+    const numDecodeSteps = 8;
+
+    // Step 1: Prefill prompt and decode N steps greedily to collect answer tokens
+    cache.reset(1);
+    let current = ws.forwardEagerPrefill(model, [prompt], cache)[0];
+    cache.reportTokens(0, prompt);
+    pagedKV.updateIndptr(ws);
+
+    const answerTokens: number[] = [current];
+    for (let step = 0; step < numDecodeSteps; step++) {
+      const result = ws.forwardEagerDecode(model, [current], cache);
+      cache.reportTokens(0, [current]);
+      pagedKV.updateIndptr(ws);
+      current = result[0];
+      answerTokens.push(current);
+    }
+
+    // Step 2: Truncate KV cache back to the prompt
+    const suffix = pagedKV.prefixMatch(0, prompt);
+    assert.deepStrictEqual(suffix, [],
+      `prefixMatch should return empty suffix for exact prompt match, got length ${suffix.length}`);
+    pagedKV.updateIndptr(ws);
+
+    // Step 3: Prefill all answer tokens at once, get logits at every position
+    const state = ws.planPrefill(model, 1, [answerTokens.length], cache);
+    state.prepareInput([answerTokens]);
+    ws.forwardInput(state);
+    const hiddenStates = model.forward(state);
+    const allLogits = state.computeLogits(hiddenStates, model, null);
+    using argmaxResult = allLogits.argmax();
+    const predictions = argmaxResult.readInt32LEArray();
+    cache.reportTokens(0, answerTokens);
+    pagedKV.updateIndptr(ws);
+
+    // Step 4: Each position i should predict answerTokens[i+1]
+    const expected = answerTokens.slice(1);
+    for (let i = 0; i < expected.length; i++) {
+      assert.equal(predictions[i], expected[i],
+        `Position ${i}: predicted ${predictions[i]} but decode produced ${expected[i]}`);
+    }
   });
 });
