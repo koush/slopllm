@@ -482,6 +482,53 @@ describe("Qwen3-0.6B batch tests", () => {
     assert.equal(chunkedDecode, fullDecode,
       `Chunked decode token mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
   });
+
+  it("prefill after KV truncate: argmax at every position matches decode", () => {
+    using pagedKV = makePagedKV(1, 256);
+    const prompt = makeLongPrompt(PAGE_SIZE * 2);
+    const numDecodeSteps = 8;
+
+    // Step 1: Prefill prompt and decode N steps greedily to collect answer tokens
+    pagedKV.reset(1);
+    let current = ws.forwardEagerPrefill(model, [prompt], pagedKV)[0];
+    pagedKV.reportTokens(0, prompt);
+    pagedKV.updateIndptr(ws);
+
+    const answerTokens: number[] = [current];
+    for (let step = 0; step < numDecodeSteps; step++) {
+      const result = ws.forwardEagerDecode(model, [current], pagedKV);
+      pagedKV.reportTokens(0, [current]);
+      pagedKV.updateIndptr(ws);
+      current = result[0];
+      answerTokens.push(current);
+    }
+    // answerTokens = [T0, T1, ..., Tn] where T0 is from prefill, T1..Tn from decode
+
+    // Step 2: Truncate KV cache back to the prompt
+    const suffix = pagedKV.prefixMatch(0, prompt);
+    assert.deepStrictEqual(suffix, [],
+      `prefixMatch should return empty suffix for exact prompt match, got length ${suffix.length}`);
+    pagedKV.updateIndptr(ws);
+
+    // Step 3: Prefill all answer tokens at once, get logits at every position
+    const state = ws.planPrefill(model, 1, [answerTokens.length], pagedKV);
+    state.prepareInput([answerTokens]);
+    ws.forwardInput(state);
+    const hiddenStates = model.forward(state);
+    const allLogits = state.computeLogits(hiddenStates, model, null);
+    using argmaxResult = allLogits.argmax();
+    const predictions = argmaxResult.readInt32LEArray();
+    pagedKV.reportTokens(0, answerTokens);
+    pagedKV.updateIndptr(ws);
+
+    // Step 4: Each position i should predict answerTokens[i+1]
+    // (position 0 predicts T1, position 1 predicts T2, etc.)
+    const expected = answerTokens.slice(1);
+    for (let i = 0; i < expected.length; i++) {
+      assert.equal(predictions[i], expected[i],
+        `Position ${i}: predicted ${predictions[i]} but decode produced ${expected[i]}`);
+    }
+  });
 });
 
 describe("Qwen3.5-0.8B chunked prefill tests", () => {
