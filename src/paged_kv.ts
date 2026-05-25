@@ -18,7 +18,7 @@ function longestPrefix(a: number[], b: number[]): number {
 // Pages are write-only until filled and ref-counted for cross-sequence sharing.
 // Only full pages (pageSize tokens) can be shared — a partial last page must never
 // be shared because the receiving sequence would need to write suffix tokens into it.
-interface Page {
+export interface Page {
   id: number;
   tokenIds: number[];
   refs: number;
@@ -26,7 +26,7 @@ interface Page {
 
 // Ordered list of pages with ref-counted sharing. Pages are filled sequentially
 // (all but the last are full), and tokenIds must never be mutated after writing.
-class Sequence {
+export class Sequence {
   pages: Page[] = [];
   allocLen = 0;
 
