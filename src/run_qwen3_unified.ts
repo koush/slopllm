@@ -565,13 +565,13 @@ async function main(): Promise<void> {
     const model: ChatModel = args.useGlm51
       ? await Glm51Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen, args.cp, args.mtp)
       : args.useQwen35
-        ? await Qwen35Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen)
-        : await Qwen3Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen);
+        ? await Qwen35Model.fromPretrained(metaOps, modelDir)
+        : await Qwen3Model.fromPretrained(metaOps, modelDir);
     const loadAllocs = metaOps.totalAllocs;
     const loadBytes = metaOps.totalBytes;
     const loadStats = model.stats();
 
-    const cache = model.createChatCache(args.maxPages);
+    const cache = model.createChatCache(args.maxPages, args.maxBatch, args.maxSeqLen);
     const ws = new ExecutionWorkspace(metaOps, args.maxBatch, args.maxSeqLen);
     const inputIds = [1, 2, 3, 4, 5];
     const logits = ws.forwardPrefill(model, [inputIds], cache);
@@ -604,8 +604,8 @@ async function main(): Promise<void> {
   const model: ChatModel = args.useGlm51
     ? await Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen, args.cp, args.mtp)
     : args.useQwen35
-      ? await Qwen35Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen)
-      : await Qwen3Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen);
+      ? await Qwen35Model.fromPretrained(glm, modelDir)
+      : await Qwen3Model.fromPretrained(glm, modelDir);
 
   if (args.stats) {
     const printWsStats = (label: string, s: ReturnType<WorkspaceBase["stats"]>) => {

@@ -16,6 +16,8 @@ class Qwen35ChatCache implements ChatCache {
   constructor(
     public readonly pagedKV: PagedKVCache,
     public readonly gdnState: Qwen35GdnState,
+    public maxBatch = 1,
+    public maxSeqLen = 4096,
   ) {}
 
   getPagedKV(): PagedKVCache { return this.pagedKV; }
@@ -43,6 +45,17 @@ class Qwen35ChatCache implements ChatCache {
 
   reportTokens(seqIdx: number, tokens: number[]): void {
     this.pagedKV.reportTokens(seqIdx, tokens);
+  }
+
+  prefillBatchPlanHook(
+    _batchSize: number, seqLens: number[], totalTokens: number,
+    _startPos: number[], cache: ChatCache,
+  ): void {
+    const { gdnState } = cache as Qwen35ChatCache;
+    gdnState.uploadCuSeqlens(seqLens);
+    if (totalTokens > this.maxBatch * this.maxSeqLen) {
+      throw new Error(`Total tokens ${totalTokens} exceeds max (B=${this.maxBatch}, S=${this.maxSeqLen})`);
+    }
   }
 }
 
@@ -112,24 +125,20 @@ export class Qwen35Model extends ChatModel {
   static readonly WEIGHT_PREFIX = "model.language_model.";
   readonly eosIds: Set<number>;
   cfg: Qwen35Config;
-  maxBatch: number;
-  maxSeqLen: number;
   invFreq: Tensor;
 
-  private constructor(glm: DeviceOps, config: Qwen35Config, maxBatch: number, maxSeqLen: number) {
+  private constructor(glm: DeviceOps, config: Qwen35Config) {
     super(glm);
     this.cfg = config;
-    this.maxBatch = maxBatch;
-    this.maxSeqLen = maxSeqLen;
     this.eosIds = new Set(config.eosTokenIds);
     const ropeDim = Math.floor(config.headDim * config.partialRotaryFactor);
     this.invFreq = this.initInvFreq(ropeDim, config.ropeTheta);
   }
 
-  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = QWEN35_REPO, maxBatch = 1, maxSeqLen = 4096): Promise<Qwen35Model> {
+  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = QWEN35_REPO): Promise<Qwen35Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
-    const model = new Qwen35Model(glm, config, maxBatch, maxSeqLen);
+    const model = new Qwen35Model(glm, config);
     await model.fromPretrained(modelDir);
     return model;
   }
@@ -233,13 +242,9 @@ export class Qwen35Model extends ChatModel {
     }
   }
 
-  createGdnState(batchSize = 1): Qwen35GdnState {
-    return new Qwen35GdnState(this.glm, this.cfg, batchSize);
-  }
-
-  createChatCache(maxPages = 256): ChatCache {
-    const pagedKV = new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, this.maxBatch);
-    const gdnState = this.createGdnState(this.maxBatch);
+  createChatCache(maxPages = 256, maxBatch = 1, maxSeqLen = 4096): ChatCache {
+    const pagedKV = new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, maxBatch);
+    const gdnState = new Qwen35GdnState(this.glm, this.cfg, maxBatch);
     return new Qwen35ChatCache(pagedKV, gdnState);
   }
 
@@ -414,17 +419,6 @@ export class Qwen35Model extends ChatModel {
       : this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}norm.weight`)!;
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
     return { normed: mlpResult.normed, residual: mlpResult.residual };
-  }
-
-  prefillBatchPlanHook(
-    _batchSize: number, seqLens: number[], totalTokens: number,
-    _startPos: number[], cache: ChatCache,
-  ): void {
-    const { gdnState } = cache as Qwen35ChatCache;
-    gdnState.uploadCuSeqlens(seqLens);
-    if (totalTokens > this.maxBatch * this.maxSeqLen) {
-      throw new Error(`Total tokens ${totalTokens} exceeds max (B=${this.maxBatch}, S=${this.maxSeqLen})`);
-    }
   }
 
   forward(state: ExecutionState): Tensor {

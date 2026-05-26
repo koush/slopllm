@@ -400,7 +400,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
     const startPos = pagedKV.sequences.map(s => s.allocLen);
 
-    model.prefillBatchPlanHook(batchSize, seqLens, totalTokens, startPos, cache);
+    cache.prefillBatchPlanHook?.(batchSize, seqLens, totalTokens, startPos, cache);
 
     let prefillPagesNeeded = 0;
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {

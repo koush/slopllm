@@ -23,6 +23,7 @@ export interface ChatCache extends Disposable {
   free(): void;
   prefixMatch(seqIdx: number, inputIds: number[]): number[];
   reportTokens(seqIdx: number, tokens: number[]): void;
+  prefillBatchPlanHook?(_batchSize: number, _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void;
 }
 
 export interface CommonModelConfig {
@@ -51,11 +52,9 @@ export abstract class ChatModel extends WorkspaceBase {
     super(glm);
   }
 
-  abstract createChatCache(maxPages?: number): ChatCache;
+  abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number): ChatCache;
   abstract forward(state: ExecutionState): Tensor;
   forwardMtp?(state: ExecutionState, previousHiddenState: Tensor, inputIds?: Tensor): Tensor;
-
-  prefillBatchPlanHook(_batchSize: number, _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void {}
 
   protected initInvFreq(ropeDim: number, ropeTheta: number): Tensor {
     const halfDim = ropeDim / 2;

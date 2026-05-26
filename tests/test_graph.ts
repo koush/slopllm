@@ -58,7 +58,7 @@ async function loadQwen3(glm: DeviceOps, repoId: string): Promise<ModelContext> 
 }
 
 async function loadQwen35(glm: DeviceOps): Promise<ModelContext> {
-  const model = await Qwen35Model.fromPretrained(glm, QWEN35_REPO, 1, 128);
+  const model = await Qwen35Model.fromPretrained(glm, QWEN35_REPO);
   const ws = new ExecutionWorkspace(glm, 1, 128);
   const cache = model.createChatCache(256);
   return {

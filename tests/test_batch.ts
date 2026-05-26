@@ -539,7 +539,7 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
-    model = await Qwen35Model.fromPretrained(glm, "Qwen/Qwen3.5-0.8B", 1, 128);
+    model = await Qwen35Model.fromPretrained(glm, "Qwen/Qwen3.5-0.8B");
     ws = new ExecutionWorkspace(glm, 1, 128);
   });
 
