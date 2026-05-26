@@ -314,12 +314,12 @@ export class Glm51Model extends ChatModel {
     }
   }
 
-  createChatCache(maxPages = 256): ChatCache {
+  createChatCache(maxPages = 256, pageSize = 16): ChatCache {
     const cfg = this.cfg;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
     const nLayers = cfg.numHiddenLayers + (this.mtp ? cfg.numNextNPredictLayers ?? 0 : 0);
-    return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, this.maxBatch, 16, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel);
+    return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, this.maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel);
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
