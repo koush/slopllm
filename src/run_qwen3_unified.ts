@@ -2,21 +2,21 @@ import { AutoTokenizer } from "@huggingface/transformers";
 import fs from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { CaptureManager } from "./capture-manager";
 import { ChatCache, ChatModel, SamplingParams, makeSamplingParams } from "./chat_model";
 import { DeviceOps } from "./device_ops";
-import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
+import { ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { MetaOps } from "./meta_ops";
 import { resolveModelPath } from "./model_path";
+import { mtpPrefill, mtpTreeDecode, mtpTreeReadDrafts, mtpVerify } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
 import { Qwen35Model } from "./qwen35_model";
 import { Qwen3Model } from "./qwen3_model";
 import { MemcpyKind, SamplingWorkspace, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
-import { CaptureManager } from "./capture-manager";
-import { mtpPrefill, mtpTreeDecode, mtpTreeReadDrafts } from "./mtp";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -138,6 +138,10 @@ function parseArgs(argv: string[]): CliArgs {
   if (args.useNvfp4 && !args.useGlm51) {
     console.error("Error: --nvfp4 is only supported with --glm51");
     process.exit(1);
+  }
+
+  if (args.mtp && args.maxBatch < 8) {
+    args.maxBatch = 8;
   }
 
   if (args.useQwen35 && args.temperature > 0 && args.topP === 0.95 && args.topK === 0 && args.repetitionPenalty === 1.0 && args.presencePenalty === 0) {
@@ -307,11 +311,11 @@ export function* generateStream(
 
       if (mtp && model.forwardMtp && nextn > 0) {
         const treeResult = mtpTreeDecode(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
-        const hostBuf = mtpTreeReadDrafts(treeResult, ws);
+        using hostBuf = mtpTreeReadDrafts(treeResult, ws);
         glm.synchronize();
         const totalPaths = 1 << treeResult.nextn;
         const rowLen = treeResult.nextn + 1;
-        const buf = hostBuf.readPinnedBuffer();
+        const buf = Buffer.from(hostBuf.readPinnedBuffer());
         const rootId = buf.readInt32LE(0);
         console.log(`MTP target=${tokenizer?.decode([rootId]) ?? rootId}`);
         for (let row = 0; row < totalPaths; row++) {
@@ -319,9 +323,18 @@ export function* generateStream(
           for (let col = 1; col < rowLen; col++) ids.push(buf.readInt32LE((row * rowLen + col) * 4));
           console.log(`  [${row}] ${ids.map(id => tokenizer?.decode([id]) ?? `?${id}`).join(" ")}`);
         }
-        console.log();
+
+        // const originalAllocLen = cache.getPagedKV().sequences[0].allocLen;
+        // cache.getPagedKV().sequences[0].allocLen--;
+        // ws.decodeStep(state, model, -1);
+        const verifyResult = mtpVerify(model, ws, cache, treeResult, hostBuf, tokenizer);
+        // cache.getPagedKV().sequences[0].truncate(originalAllocLen);
+        console.log(`MTP accepted=${verifyResult.numAccepted}/${nextn} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
+        if (verifyResult.acceptedTokens.length > 0) {
+          console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer?.decode([t]) ?? `?${t}`).join(" ")}`);
+        }
+
         treeResult.validationSequences[Symbol.dispose]();
-        hostBuf[Symbol.dispose]();
       }
     }
   } finally {

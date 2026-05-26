@@ -91,126 +91,6 @@ export function mtpPrefill(
 }
 
 /**
- * MTP decode: produce draft predictions for the next `nextn` tokens.
- *
- * During decode, each MTP layer decodes one token using the target model's
- * hidden states and the previous layer's prediction as input:
- *   Layer 0: input = target model's sampled token → output = draft D0
- *   Layer 1: input = D0 → output = draft D1
- *   Layer 2: input = D1 → output = draft D2
- *
- * Each layer's KV cache is advanced by one position (via planDecode + decodeStep).
- * After all layers, the KV cache is rewound by `nextn` positions so the next
- * target decode step starts at the correct position.
- *
- * Returns the top-1 prediction indices for each MTP layer (shape [1, 1] I32 each).
- * These are token IDs, suitable for mtpReadDrafts.
- * The caller is responsible for disposing the returned tensors when done.
- * The caller should also call `mtpReadDrafts` and synchronize before reading.
- *
- * Prerequisites:
- *   - The target model must have just decoded (planDecode + decodeStep + forward
- *     already called for the current position)
- *   - `state` must be the target model's decode state (isDecode = true, batchSize = 1)
- *   - `gpuSampleResult` must be [1] I32 on GPU (target model's sampled token)
- *   - model.forwardMtp must exist (MTP enabled)
- *   - The paged KV cache must have enough pages for `nextn` additional tokens
- *
- * @param state - The target model's decode ExecutionState
- * @param model - The chat model (must support forwardMtp)
- * @param targetHiddenStates - The target model's hidden states from the current decode step
- * @param ws - Execution workspace
- * @param gpuSampleResult - [1] I32 GPU tensor: target model's sampled token
- * @param nextn - Number of MTP layers (draft predictions to produce)
- * @param cache - Chat cache (paged KV cache, must have 1 sequence)
- * @returns Array of prediction tensors (one per MTP layer, shape [1, 1] I32)
- */
-export function mtpDecode(
-  state: ExecutionState,
-  model: ChatModel,
-  targetHiddenStates: Tensor,
-  ws: ExecutionWorkspace,
-  gpuSampleResult: Tensor,
-  nextn: number,
-  cache: ChatCache,
-): Tensor[] {
-  if (!model.forwardMtp) {
-    throw new Error("mtpDecode: model does not support MTP (forwardMtp not defined)");
-  }
-
-  const pagedKV = cache.getPagedKV();
-  const predictions: Tensor[] = [];
-  let topkIndices: Tensor | null = null;
-
-  for (let i = 0; i < nextn; i++) {
-    // Copy input token to ws.inputIdsBuf for forwardMtp's embedding lookup.
-    // Layer 0 uses the target model's sampled token; layers 1+ use previous top-1.
-    if (i === 0) {
-      ws.inputIdsBuf.memcpy(gpuSampleResult, I32, MemcpyKind.DeviceToDevice);
-    } else {
-      // topkIndices is [1, 1] I32; copy first element to inputIdsBuf [1] I32
-      ws.inputIdsBuf.memcpy(topkIndices!, I32, MemcpyKind.DeviceToDevice);
-    }
-
-    // Force position IDs and decode plan to update for the new position.
-    // planDecode caches these; setting dirty flags ensures recalculation.
-    pagedKV.positionIdsDirty = true;
-    pagedKV.pagesDirtyHost = true;
-
-    const mtpState = ws.planDecode(model, 1, cache);
-    ws.decodeStep(mtpState, model);
-
-    // Forward through one MTP layer (uses ws.inputIdsBuf for embedding)
-    const hiddenStates = model.forwardMtp(mtpState, targetHiddenStates);
-
-    // Sample top-1 from this layer's output
-    using logits = mtpState.computeLogits(hiddenStates, model);
-    hiddenStates[Symbol.dispose]();
-    const topk = logits.topk(1, model.cfg.vocabSize);
-    topkIndices = topk.indices; // [1, 1] I32
-    topk.values[Symbol.dispose]();
-
-    predictions.push(topk.indices);
-  }
-
-  // Rewind: undo the nextn decode tokens added by planDecode.
-  // This restores the KV cache position so the next target decode
-  // starts at the correct position.
-  const seq = pagedKV.sequences[0];
-  seq.truncate(seq.allocLen - nextn);
-  pagedKV.positionIdsDirty = true;
-  pagedKV.pagesDirtyHost = true;
-  pagedKV.pagesDirtyDevice = true;
-  ws.decodeStep(state, model, -nextn);
-
-  return predictions;
-}
-
-/**
- * Initiate async GPU→Host copies of MTP draft predictions.
- *
- * Each prediction tensor is [batchSize, 1] I32 on GPU. The returned pinned host
- * buffers receive the data via async memcpy. The caller MUST synchronize the
- * stream (e.g., `glm.synchronize()`) before reading the buffers.
- *
- * @param predictions - MTP prediction tensors from mtpPrefill or mtpDecode
- * @param ws - Workspace for allocating pinned host buffers
- * @returns Array of pinned host tensors, one per MTP layer (caller reads after sync)
- */
-export function mtpReadDrafts(
-  predictions: Tensor[],
-  ws: ExecutionWorkspace,
-): Tensor[] {
-  const hosts: Tensor[] = [];
-  for (const pred of predictions) {
-    const host = ws.allocPinned(pred.shape, pred.type);
-    host.memcpy(pred, pred.bytes, MemcpyKind.DeviceToHost);
-    hosts.push(host);
-  }
-  return hosts;
-}
-
-/**
  * Result of tree-structured MTP draft generation.
  *
  * The validation sequences tensor has shape [(1 << nextn) * (nextn + 1)] I32,
@@ -409,6 +289,192 @@ export function mtpTreeReadDrafts(
   const host = ws.allocPinned(result.validationSequences.shape, result.validationSequences.type);
   host.memcpy(result.validationSequences, result.validationSequences.bytes, MemcpyKind.DeviceToHost);
   return host;
+}
+
+export interface MtpVerifyResult {
+  /** Number of draft tokens accepted (0..nextn). */
+  numAccepted: number;
+  /** The accepted draft token IDs from the winning path. */
+  acceptedTokens: number[];
+  /** Target model's argmax at the first mismatch position (or bonus token if all accepted).
+   *  This is the token the target model would generate instead of the rejected draft. */
+  replacementToken: number;
+}
+
+/**
+ * Verify MTP draft tokens against the target model via naive batch prefill.
+ *
+ * Creates 2^nextn sequences by forking the target model's KV cache, prefills
+ * each with [currentToken, D0, D1, ..., D{nextn-1}] from the validation
+ * sequences, runs the target model forward, and compares argmax logits against
+ * the draft tokens. After verification, restores the KV cache to its
+ * pre-verification state.
+ *
+ * Prerequisites:
+ *   - mtpTreeDecode + mtpTreeReadDrafts have been called, hostBuf is synchronized
+ *   - cache.getPagedKV().sequences has exactly 1 sequence (seq 0)
+ *   - cache.getPagedKV().maxBatch >= (1 << nextn)
+ *   - model.forwardMtp must exist (MTP enabled)
+ *
+ * @param model - The chat model
+ * @param ws - Execution workspace
+ * @param cache - Chat cache (paged KV cache)
+ * @param treeResult - MtpTreeResult from mtpTreeDecode
+ * @param hostBuf - Pinned host buffer from mtpTreeReadDrafts (synchronized).
+ *   Consumed (disposed) by this function — the data is copied before the forward pass
+ *   to avoid corruption from workspace tensor recycling.
+ * @param tokenizer - Optional tokenizer for debug logging
+ * @returns MtpVerifyResult with numAccepted, acceptedTokens, and replacementToken
+ */
+export function mtpVerify(
+  model: ChatModel,
+  ws: ExecutionWorkspace,
+  cache: ChatCache,
+  treeResult: MtpTreeResult,
+  hostBuf: Tensor,
+  tokenizer?: any,
+): MtpVerifyResult {
+  const pagedKV = cache.getPagedKV();
+  const nextn = treeResult.nextn;
+  const totalPaths = 1 << nextn;
+  const suffixLen = nextn + 1; // [currentToken, D0, D1, ..., D{nextn-1}]
+  const pageSize = pagedKV.pageSize;
+
+  if (pagedKV.maxBatch < totalPaths) {
+    throw new Error(
+      `mtpVerify: maxBatch (${pagedKV.maxBatch}) too small for nextn=${nextn}, need >= ${totalPaths}`,
+    );
+  }
+
+  const seq0 = pagedKV.sequences[0];
+  const originalAllocLen = seq0.allocLen;
+  const tokenIds = seq0.getTokenIds();
+
+  // allocLen = originalAllocLen → planPrefill starts at originalAllocLen, which is
+  // exactly where the next decode step would process currentToken. The existing KV
+  // at 0..originalAllocLen-1 is the correct prefix context; no prevToken prepend needed.
+  pagedKV.positionIdsDirty = true;
+  pagedKV.pagesDirtyHost = true;
+
+  // Fork copies for all verification paths (totalPaths = 2^nextn)
+  for (let i = 1; i < totalPaths; i++) {
+    pagedKV.copySequence(i, 0);
+  }
+
+  // Copy host buffer data before the forward pass — forwardTarget's startTracking()
+  // disposes all tracked tensors (including hostBuf), and subsequent allocPinned calls
+  // can reuse the memory, corrupting any live views.
+  const buf = Buffer.from(hostBuf.readPinnedBuffer());
+  hostBuf[Symbol.dispose]();
+  const inputIdsList: number[][] = [];
+  for (let path = 0; path < totalPaths; path++) {
+    const row: number[] = [];
+    for (let col = 0; col <= nextn; col++) {
+      row.push(buf.readInt32LE((path * (nextn + 1) + col) * 4));
+    }
+    inputIdsList.push(row);
+  }
+
+  // Run verification prefill: batch=totalPaths, each sequence gets suffixLen tokens
+  const seqLens = new Array(totalPaths).fill(suffixLen) as number[];
+  const state = ws.planPrefill(model, totalPaths, seqLens, cache);
+  state.prepareInput(inputIdsList);
+  ws.forwardInput(state);
+
+  const hiddenStates = model.forward(state);
+  // Pass null (not undefined) for lastIdx — undefined triggers the default
+  // parameter (this.ws.lastIdx, a truthy Tensor), which selects only the last
+  // token per sequence via indexSelect. We need all-positions logits.
+  const logits = state.computeLogits(hiddenStates, model, null);
+  hiddenStates[Symbol.dispose]();
+
+  // Argmax all positions: [totalPaths * suffixLen] I32
+  const argmaxResult = logits.argmax();
+  logits[Symbol.dispose]();
+
+  // Read argmax to host (copy before any subsequent workspace allocations can reclaim the memory)
+  const argmaxHost = ws.allocPinned(argmaxResult.shape, argmaxResult.type);
+  argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
+  ws.glm.synchronize();
+  const argmaxBuf = Buffer.from(argmaxHost.readPinnedBuffer());
+  argmaxHost[Symbol.dispose]();
+
+  // Verify: compare draft tokens vs target model argmax for each path.
+  // Suffix = [currentToken, D0, D1, ..., D{nextn-1}] starting at originalAllocLen.
+  // argmax at position j predicts the token at position j+1:
+  //   j=0 (currentToken) → predicts D0; j=1 (D0) → predicts D1; etc.
+  let bestPath = 0;
+  let bestAccepted = -1;
+  let bestReplacement = -1;
+
+  for (let path = 0; path < totalPaths; path++) {
+    let accepted = 0;
+    for (let j = 0; j < nextn; j++) {
+      const draftToken = buf.readInt32LE((path * (nextn + 1) + j + 1) * 4);
+      const targetToken = argmaxBuf.readInt32LE((path * suffixLen + j) * 4);
+      if (draftToken === targetToken) {
+        accepted++;
+      } else {
+        break;
+      }
+    }
+    const replacement = argmaxBuf.readInt32LE((path * suffixLen + accepted) * 4);
+    if (accepted > bestAccepted) {
+      bestAccepted = accepted;
+      bestPath = path;
+      bestReplacement = replacement;
+    }
+  }
+
+  const acceptedTokens: number[] = [];
+  for (let j = 0; j < bestAccepted; j++) {
+    acceptedTokens.push(buf.readInt32LE((bestPath * (nextn + 1) + j + 1) * 4));
+  }
+
+  // Log verification results
+  const currentToken = buf.readInt32LE(0);
+  console.log(`MTP Verify: root=${tokenizer?.decode([currentToken]) ?? currentToken} best=[${bestPath}] accepted=${bestAccepted}/${nextn} replacement=${tokenizer?.decode([bestReplacement]) ?? bestReplacement}`);
+  for (let path = 0; path < totalPaths; path++) {
+    const parts: string[] = [];
+    for (let j = 0; j < nextn; j++) {
+      const draftToken = buf.readInt32LE((path * (nextn + 1) + j + 1) * 4);
+      const targetToken = argmaxBuf.readInt32LE((path * suffixLen + j) * 4);
+      const ok = draftToken === targetToken;
+      parts.push(`${ok ? "✓" : "✗"}${tokenizer?.decode([draftToken]) ?? `?${draftToken}`}`);
+      if (!ok) break;
+    }
+    const marker = path === bestPath ? "*" : " ";
+    console.log(`  ${marker}[${path}] ${parts.join(" ")}`);
+  }
+
+  // Cleanup: pop forked sequences and restore seq 0 to original state.
+  // We don't integrate accepted KV entries yet — just restore and return results.
+  for (let i = totalPaths - 1; i > 0; i--) {
+    const seq = pagedKV.sequences.pop();
+    seq!.clear();
+  }
+
+  // Truncate seq 0 back to originalAllocLen. After prefill, allocLen =
+  // originalAllocLen + suffixLen. Truncating discards the suffix KV entries.
+  seq0.truncate(originalAllocLen);
+  const lastPageIdx = seq0.pages.length - 1;
+  if (lastPageIdx >= 0) {
+    const expected = tokenIds.length - lastPageIdx * pageSize;
+    if (seq0.pages[lastPageIdx].tokenIds.length > expected) {
+      seq0.pages[lastPageIdx].tokenIds.length = Math.max(0, expected);
+    }
+  }
+
+  pagedKV.positionIdsDirty = true;
+  pagedKV.pagesDirtyHost = true;
+  pagedKV.pagesDirtyDevice = true;
+
+  // Dispose tensors
+  argmaxResult[Symbol.dispose]();
+
+  state.finishPrefill();
+
+  return { numAccepted: bestAccepted, acceptedTokens, replacementToken: bestReplacement };
 }
 
 
