@@ -19,8 +19,36 @@ TypeScript inference engine for the GLM-5.1 model on NVIDIA GPUs. Ships a native
   - Named tensors: re-allocating with the same name disposes the old one, recycling its memory.
   - **`freeze()`**: after model loading, prevents further allocations — all weight addresses are stable for graph capture.
   - **`startTracking()`**: returns a scope that disposes all unnamed temporaries when exited, returning their memory to the pool for the next forward pass.
-- **`using` keyword**: Tensors implement `Disposable` via `[Symbol.dispose]()`. Use `using tensor = ws.alloc(...)` (TypeScript 5.2+ explicit resource management) to auto-dispose at scope exit. Named tensors (model weights) throw on dispose — only unnamed temporaries are disposable. `removeTracking()` opts a tensor out of tracking so it survives the `startTracking()` scope (used for forward pass outputs).
 - This pattern is what makes the inference loop graph-capturable: the same GPU addresses are reused each step deterministically.
+
+### Tensor Lifetime and `using` Pattern
+
+Tensors implement `Disposable` via `[Symbol.dispose]()`. TypeScript 5.2+ explicit resource management (`using`) provides scoped cleanup:
+
+```typescript
+// Forward pass: startTracking creates a scope where all unnamed allocs are tracked.
+// When the scope exits, every tracked tensor is disposed → its GPU memory returns
+// to the workspace's "disposed" pool for reuse next step. Same addresses, deterministic.
+using _tracker = ws.startTracking();
+
+// Unnamed temporaries auto-dispose at scope exit via "using"
+using gateBuf = normed.linear(weights.gate_proj, BS);  // disposed when scope ends
+using upBuf = normed.linear(weights.up_proj, BS);      // disposed when scope ends
+using siluBuf = gateBuf.siluAndMul(upBuf, intermediate, BS);
+
+// Named tensors (model weights) throw on dispose — they persist for the model's lifetime
+const w = ws.alloc([N, K], "BF16", "model.layers.0.mlp.gate_proj.weight");
+
+// removeTracking() opts out: tensor survives the tracking scope (used for forward outputs)
+const output = hiddenStates.linear(lmHead, BS);
+return output.removeTracking();  // caller is responsible for disposing this
+```
+
+Key rules:
+- Named tensors (`setName()` or allocated with a name) cannot be disposed — they live until replaced or the workspace is freed.
+- `using` on an unnamed tensor auto-disposes at block scope exit.
+- `startTracking()` / its `[Symbol.dispose]()` cleans up all tracked tensors at once — cheaper than individual `using` per tensor in hot loops.
+- `removeTracking()` moves a tensor from `tracked` to `exported`, exempting it from the bulk dispose.
 
 ### Allocator (`src/allocator.ts`)
 - `ArenaAllocator`: bump allocator with 256-byte alignment. `free()` is a no-op. Used for the weight arena when `--arena` flag is set — a single large `cudaMalloc` carved up linearly.
