@@ -39,7 +39,6 @@ import { UsingHolder } from "./using-holder";
  *     state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn
  *   );
  *
- *   state.finishPrefill();
  *   readSample();
  *
  *   // Use mtpPredictions[i] for layer i's top-1 prediction...
@@ -471,8 +470,6 @@ export function mtpVerify(
 
   // Dispose tensors
   argmaxResult[Symbol.dispose]();
-
-  state.finishPrefill();
 
   return { numAccepted: bestAccepted, acceptedTokens, replacementToken: bestReplacement };
 }

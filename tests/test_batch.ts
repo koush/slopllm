@@ -406,7 +406,6 @@ describe("Qwen3-0.6B batch tests", () => {
       } else {
         logits = state.computeLogits(hiddenStates, model);
         hiddenStates[Symbol.dispose]();
-        state.finishPrefill();
       }
     }
     using argmaxOut = logits!.argmax();
@@ -565,7 +564,6 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
       } else {
         logits = state.computeLogits(hiddenStates, model);
         hiddenStates[Symbol.dispose]();
-        state.finishPrefill();
       }
     }
     using argmaxOut = logits!.argmax();

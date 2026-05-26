@@ -33,7 +33,6 @@ function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCac
     } else {
       logits = state.computeLogits(hiddenStates, model);
       hiddenStates[Symbol.dispose]();
-      state.finishPrefill();
     }
   }
   using argmaxOut = logits!.argmax();

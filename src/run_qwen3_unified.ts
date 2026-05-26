@@ -240,8 +240,6 @@ export function* generateStream(
       const mtpPredictions = mtpPrefill(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn);
       for (const pred of mtpPredictions) pred[Symbol.dispose]();
     }
-
-    state.finishPrefill();
   }
 
   sampleResult ||= sampleWorkspace.allocPinned(gpuSampleResult!.shape, gpuSampleResult!.type);

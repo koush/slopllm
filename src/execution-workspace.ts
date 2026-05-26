@@ -103,12 +103,6 @@ export class ExecutionState {
       this.input = this.ws.inputIdsBufH;
     }
   }
-
-  finishPrefill() {
-    if (this.isDecode) {
-      throw new Error("finishPrefill should not be called in decode mode");
-    }
-  }
 }
 
 
@@ -524,7 +518,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.forwardInput(state);
     using hiddenStates = model.forward(state);
     const logits = state.computeLogits(hiddenStates, model);
-    state.finishPrefill();
     return logits;
   }
 
