@@ -306,9 +306,8 @@ async function generateContinuousBatch(
     // 5. Decode one step
     const inputTokens = active.map(a => a.lastToken);
     const state = ws.planDecode(model, active.length, cache);
-    state.prepareInput([inputTokens]);
+    state.setInput([inputTokens]);
     ws.decodeStep(state, model);
-    ws.forwardInput(state);
     using hiddenStates = model.forward(state);
     using decodeLogits = state.computeLogits(hiddenStates, model);
     const newSampled = samplingWorkspace.sample(decodeLogits);
@@ -414,9 +413,8 @@ async function generateBatch(
       const inputTokens = lastTokens.map((t, i) => finished[i] ? eosToken : t);
 
       const state = ws.planDecode(model, batchSize, cache);
-      state.prepareInput([inputTokens]);
+      state.setInput([inputTokens]);
       ws.decodeStep(state, model);
-      ws.forwardInput(state);
       using hiddenStates = model.forward(state);
       using decodeLogits = state.computeLogits(hiddenStates, model);
       const newSampled = samplingWorkspace.sample(decodeLogits);
@@ -543,9 +541,8 @@ async function main(): Promise<void> {
     cache.reportTokens(0, [lastToken]);
     for (let i = 0; i < 3; i++) {
       const st = ws.planDecode(model, 1, cache);
-      st.prepareInput([[lastToken]]);
+      st.setInput([[lastToken]]);
       ws.decodeStep(st, model);
-      ws.forwardInput(st);
       using hs = model.forward(st);
       using lg = st.computeLogits(hs, model);
       const ns = warmupSw.sample(lg);

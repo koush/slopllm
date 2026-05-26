@@ -219,9 +219,8 @@ describe("Qwen3-0.6B batch tests", () => {
     const tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
 
     const stateRef = gws.planDecode(model, 1, pagedKV, true);
-    stateRef.prepareInput([[tokens[0]]]);
+    stateRef.setInput([[tokens[0]]]);
     gws.decodeStep(stateRef, model);
-    gws.forwardInput(stateRef);
     const hiddenStatesRef = model.forward(stateRef);
     const logitsRef = stateRef.computeLogits(hiddenStatesRef, model);
     using argmaxRef = logitsRef.argmax();
@@ -230,11 +229,10 @@ describe("Qwen3-0.6B batch tests", () => {
     pagedKV.reset(1);
     const tokens2 = gws.forwardEagerPrefill(model, [prompt], pagedKV);
     const state = gws.planDecode(model, 1, pagedKV, true);
-    state.prepareInput([[tokens2[0]]]);
+    state.setInput([[tokens2[0]]]);
 
     glm.graphBeginCapture();
     gws.decodeStep(state, model);
-    gws.forwardInput(state);
     const captureHiddenStates = model.forward(state);
     const captureLogits = state.computeLogits(captureHiddenStates, model);
     const captureArgmax = captureLogits.argmax();
@@ -266,9 +264,8 @@ describe("Qwen3-0.6B batch tests", () => {
     let current = tokens[0];
     for (let step = 0; step < numSteps; step++) {
       const state = gws.planDecode(model, 1, pagedKV, true);
-      state.prepareInput([[current]]);
+      state.setInput([[current]]);
       gws.decodeStep(state, model);
-      gws.forwardInput(state);
       const hiddenStates = model.forward(state);
       const lastLogits = state.computeLogits(hiddenStates, model);
       using argmaxResult = lastLogits.argmax();
@@ -287,7 +284,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     for (let step = 0; step < numSteps; step++) {
       const state = gws.planDecode(model, 1, pagedKV, true);
-      state.prepareInput([[current]]);
+      state.setInput([[current]]);
 
       if (graphExec === null) {
         if (warmupRemaining === 0 && !capturing) {
@@ -296,7 +293,6 @@ describe("Qwen3-0.6B batch tests", () => {
         }
 
     gws.decodeStep(state, model);
-        gws.forwardInput(state);
         const hiddenStates = model.forward(state);
         captureArgmax = state.computeLogits(hiddenStates, model).argmax();
 
@@ -341,8 +337,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     pagedKV.reset(1);
     const state = ws.planPrefill(model, 1, [PROMPT_GRAPH.length], pagedKV);
-    state.prepareInput([PROMPT_GRAPH]);
-    ws.forwardInput(state);
+    state.setInput([PROMPT_GRAPH]);
     const hiddenStates = model.forward(state);
     const logits = state.computeLogits(hiddenStates, model);
     using argmaxOut = logits.argmax();
@@ -373,8 +368,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     pagedKV.reset(2);
     const state = ws.planPrefill(model, 2, [PROMPT1.length, PROMPT2.length], pagedKV);
-    state.prepareInput([PROMPT1, PROMPT2]);
-    ws.forwardInput(state);
+    state.setInput([PROMPT1, PROMPT2]);
     const hiddenStates = model.forward(state);
     const logits = state.computeLogits(hiddenStates, model);
     using argmaxOut2 = logits.argmax();
@@ -398,8 +392,7 @@ describe("Qwen3-0.6B batch tests", () => {
       const chunk = inputIds.slice(offset, offset + chunkSizes[i]);
       offset += chunkSizes[i];
       const state = ws.planPrefill(model, 1, [chunk.length], cache);
-      state.prepareInput([chunk]);
-      ws.forwardInput(state);
+      state.setInput([chunk]);
       const hiddenStates = model.forward(state);
       if (i < chunkSizes.length - 1) {
         hiddenStates[Symbol.dispose]();
@@ -511,8 +504,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     // Step 3: Prefill all answer tokens at once, get logits at every position
     const state = ws.planPrefill(model, 1, [answerTokens.length], pagedKV);
-    state.prepareInput([answerTokens]);
-    ws.forwardInput(state);
+    state.setInput([answerTokens]);
     const hiddenStates = model.forward(state);
     const allLogits = state.computeLogits(hiddenStates, model, null);
     using argmaxResult = allLogits.argmax();
@@ -556,8 +548,7 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
       const chunk = inputIds.slice(offset, offset + chunkSizes[i]);
       offset += chunkSizes[i];
       const state = ws.planPrefill(model, 1, [chunk.length], cache);
-      state.prepareInput([chunk]);
-      ws.forwardInput(state);
+      state.setInput([chunk]);
       const hiddenStates = model.forward(state);
       if (i < chunkSizes.length - 1) {
         hiddenStates[Symbol.dispose]();

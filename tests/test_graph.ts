@@ -87,7 +87,7 @@ function generateWithGraph(
 
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
     const state = ws.planDecode(model, 1, cache, true);
-    state.prepareInput([[currentToken]]);
+    state.setInput([[currentToken]]);
 
     if (graphExec === null) {
       if (warmupRemaining === 0 && !capturing) {
@@ -96,7 +96,6 @@ function generateWithGraph(
       }
 
       ws.decodeStep(state, model);
-      ws.forwardInput(state);
       const hiddenStates = model.forward(state);
       argmaxResult = state.computeLogits(hiddenStates, model).argmax();
 

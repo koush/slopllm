@@ -186,7 +186,7 @@ describe("CP vs non-CP model prefill", () => {
 
       (model as any).forward = function(state: ExecutionState): Tensor {
         const embedTable = (model as any).tensors.get("model.embed_tokens.weight");
-        using residual = new UsingHolder(embedTable.embedding(state.ws.inputIdsBuf, hs, BS));
+        using residual = new UsingHolder(embedTable.embedding(state.input!, hs, BS));
         using normed = new UsingHolder(residual.value.rmsnorm(
           (model as any).tensors.get(`model.layers.0.input_layernorm.weight`), cfg.rmsNormEps, hs, BS));
 
@@ -356,7 +356,7 @@ describe("CP vs non-CP model prefill", () => {
 
       (model as any).forward = function(state: ExecutionState): Tensor {
         const embedTable = (model as any).tensors.get("model.embed_tokens.weight");
-        using residual = new UsingHolder(embedTable.embedding(state.ws.inputIdsBuf, hs, BS));
+        using residual = new UsingHolder(embedTable.embedding(state.input!, hs, BS));
         using normed = new UsingHolder(residual.value.rmsnorm(
           (model as any).tensors.get(`model.layers.0.input_layernorm.weight`), cfg.rmsNormEps, hs, BS));
         for (let i = 0; i < cfg.numHiddenLayers; i++) {

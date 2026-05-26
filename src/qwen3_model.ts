@@ -119,7 +119,7 @@ export class Qwen3Model extends ChatModel {
     const S = state.isDecode ? 1 : totalTokens;
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
-    using residual = new UsingHolder(embedTable.embedding(ws.inputIdsBuf, hs, BS));
+    using residual = new UsingHolder(embedTable.embedding(state.input!, hs, BS));
 
     using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, hd / 2, B, S));
     using cos = rotaryEmbedding.result.cos;

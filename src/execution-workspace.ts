@@ -86,7 +86,7 @@ export class ExecutionState {
     );
   }
 
-  prepareInput(tokenIds: number[][]|Tensor) {
+  setInput(tokenIds: number[][]|Tensor) {
     if (tokenIds instanceof Tensor) {
       this.input = tokenIds;
     }
@@ -100,7 +100,8 @@ export class ExecutionState {
           }
         }
       });
-      this.input = this.ws.inputIdsBufH;
+      this.input = this.ws.inputIdsBuf;
+      this.input.memcpy(this.ws.inputIdsBufH, this.input.bytes, MemcpyKind.HostToDevice);
     }
   }
 }
@@ -121,9 +122,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
   mlaPrefillPlanInfo: Tensor;
   /** Pinned host buffer: written by mlaDecodePlan, read by mlaDecodeRun. */
   mlaDecodePlanInfo: Tensor;
-  /** GPU buffer [B*S] of I32: written by host (h2d), read by embedding lookup. */
+  /** Scratch GPU buffer [B*S] of I32: written by host (h2d), read by embedding lookup. */
   inputIdsBuf: Tensor;
-  /** Pinned host buffer [B] of I32: written by host, read via memcpy to inputIdsBuf. */
+  /** Scratch Pinned host buffer [B*S] of I32: written by host, read via memcpy to inputIdsBuf. */
   inputIdsBufH: Tensor;
   /** GPU buffer [B*S] of I32: written by host (h2d), read by RoPE kernel. */
   positionIds: Tensor;
@@ -194,20 +195,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
       for (let i = 0; i < B; i++) buf.writeInt32LE(i, i * I32);
     });
     this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, B * I32, MemcpyKind.HostToDevice);
-  }
-
-  forwardInput(state: ExecutionState): void {
-    const batchSize = state.batchSize;
-    let input = state.input;
-
-    if (!input) {
-      throw new Error("input tensor is required");
-    }
-
-    if (input.pinned) {
-      const count = state.isDecode ? batchSize : state.totalTokens;
-      this.inputIdsBuf.memcpy(input, count * I32, MemcpyKind.HostToDevice);
-    }
   }
 
   decodeStep(state: ExecutionState, model: ChatModel, steps = 1): void {
@@ -514,8 +501,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const batchSize = inputIdsList.length;
     const seqLens = inputIdsList.map(ids => ids.length);
     const state = this.planPrefill(model, batchSize, seqLens, cache);
-    state.prepareInput(inputIdsList);
-    this.forwardInput(state);
+    state.setInput(inputIdsList);
     using hiddenStates = model.forward(state);
     const logits = state.computeLogits(hiddenStates, model);
     return logits;
@@ -528,16 +514,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   forwardDecode(model: ChatModel, state: ExecutionState): Tensor {
-    this.forwardInput(state);
     const hiddenStates = model.forward(state);
     return state.computeLogits(hiddenStates, model);
   }
 
   forwardEagerDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache): number[] {
     const state = this.planDecode(model, tokenIdsList.length, cache);
-    state.prepareInput([tokenIdsList]);
+    state.setInput([tokenIdsList]);
     this.decodeStep(state, model);
-    this.forwardInput(state);
     const hiddenStates = model.forward(state);
     const logits = state.computeLogits(hiddenStates, model);
     using argmaxResult = logits.argmax();

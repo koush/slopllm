@@ -229,8 +229,7 @@ export function* generateStream(
     const batchSize = inputIdsList.length;
     const seqLens = inputIdsList.map(ids => ids.length);
     const state = ws.planPrefill(model, batchSize, seqLens, cache);
-    state.prepareInput(inputIdsList);
-    ws.forwardInput(state);
+    state.setInput(inputIdsList);
     targetHiddenStates.replace(model.forward(state));
 
     using firstTokens = state.computeLogits(targetHiddenStates.value, model);
@@ -266,12 +265,12 @@ export function* generateStream(
     for (let i = 1; i < maxNewTokens; i++) {
       const tPlan = performance.now();
       const state = ws.planDecode(model, 1, cache, useGraph);
+      state.setInput(gpuSampleResult!);
       planMs += performance.now() - tPlan;
 
       const tExec = performance.now();
 
       if (!captureManager.isCaptured(['decode'])) {
-        state.prepareInput(gpuSampleResult!);
         warmupSteps++;
       }
       else {
@@ -279,7 +278,6 @@ export function* generateStream(
       }
 
       captureManager.run(() => {
-        ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
         ws.decodeStep(state, model);
         targetHiddenStates.replace(model.forward(state));
         doSample(state.computeLogits(targetHiddenStates.value, model));

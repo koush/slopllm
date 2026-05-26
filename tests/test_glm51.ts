@@ -25,8 +25,7 @@ function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCac
     const chunk = inputIds.slice(offset, offset + chunkSizes[i]);
     offset += chunkSizes[i];
     const state = ws.planPrefill(model, 1, [chunk.length], cache);
-    state.prepareInput([chunk]);
-    ws.forwardInput(state);
+    state.setInput([chunk]);
     const hiddenStates = model.forward(state);
     if (i < chunkSizes.length - 1) {
       hiddenStates[Symbol.dispose]();

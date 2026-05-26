@@ -529,7 +529,7 @@ export class Glm51Model extends ChatModel {
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
 
-    using residual = new UsingHolder(embedTable.embedding(ws.inputIdsBuf, hs, BS));
+    using residual = new UsingHolder(embedTable.embedding(state.input!, hs, BS));
     using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
@@ -551,7 +551,7 @@ export class Glm51Model extends ChatModel {
     const BS = totalTokens;
 
     if (this.mtp && cfg.numNextNPredictLayers) {
-      const ids = inputIds ?? ws.inputIdsBuf;
+      const ids = inputIds ?? state.input!;
       const embedTable = this.tensors.get("model.embed_tokens.weight")!;
       using embedding = embedTable.embedding(ids, hs, BS);
       using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps, hs, BS);

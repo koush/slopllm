@@ -64,12 +64,12 @@ export function mtpPrefill(
   const predictions: Tensor[] = [];
 
   // rotatedIds ping-pongs between workspace allocations.
-  // Source for layer 0 is ws.inputIdsBuf (the original prompt tokens).
+  // Source for layer 0 is state.input (the original prompt tokens).
   using rotatedIds = new UsingHolder<Tensor>(undefined!);
 
   for (let i = 0; i < nextn; i++) {
     // Rotate input IDs: shift each sequence left by 1, append previous prediction
-    const source = rotatedIds.value ?? ws.inputIdsBuf;
+    const source = rotatedIds.value ?? state.input!;
     rotatedIds.replace(source.rotateInputIds(ws.qoIndptrD, topkIndices, batchSize));
 
     // Forward through one MTP layer with rotated input
@@ -182,13 +182,12 @@ export function mtpTreeDecode(
     );
   }
 
-  // The target model's decode left ws.inputIdsBuf containing the previous token
-  // (set before the target forward pass). The MTP layer needs the current decoded
-  // token (gpuSampleResult) as input for iteration 0.
-  ws.inputIdsBuf.memcpy(gpuSampleResult, gpuSampleResult.bytes, MemcpyKind.DeviceToDevice);
+
+  let nextInput: Tensor = gpuSampleResult;
+  state.setInput(nextInput);
 
   let total = 1;
-  let doubledTargetHs: Tensor | null = null;
+  using doubledTargetHs = new UsingHolder<Tensor>(undefined!);
 
   for (let i = 0; i < nextn; i++) {
     const batchSize = 1 << i;
@@ -200,12 +199,10 @@ export function mtpTreeDecode(
     }
 
     if (batchSize > 1) {
-      const prev: Tensor = doubledTargetHs ?? targetHiddenStates;
-      const doubled: Tensor = prev.cat([prev], 0);
-      if (doubledTargetHs) doubledTargetHs[Symbol.dispose]();
-      doubledTargetHs = doubled;
+      const prev: Tensor = doubledTargetHs.value ?? targetHiddenStates;
+      doubledTargetHs.replace(prev.cat([prev], 0));
     }
-    const hs = batchSize === 1 ? targetHiddenStates : doubledTargetHs!;
+    const hs = batchSize === 1 ? targetHiddenStates : doubledTargetHs.value!;
 
     let mtpState: ExecutionState;
     if (i === 0) {
@@ -219,6 +216,7 @@ export function mtpTreeDecode(
       pagedKV.positionIdsDirty = true;
       pagedKV.pagesDirtyHost = true;
       mtpState = ws.planDecode(model, batchSize, cache);
+      mtpState.setInput(nextInput.reshape([nextInput.numElements]));
       ws.decodeStep(mtpState, model);
     }
 
@@ -227,7 +225,8 @@ export function mtpTreeDecode(
     hiddenStates[Symbol.dispose]();
 
     const topk = logits.topk(2, model.cfg.vocabSize);
-    topk.values[Symbol.dispose]();
+    using _values = topk.values;
+    using indices = topk.indices;
 
     const batch = total * 2;
     const half = batch / 2;
@@ -237,7 +236,7 @@ export function mtpTreeDecode(
       for (let k = 0; k < fanout; k++) {
         validationSequences.memcpy2d(
           ((j * fanout + k) * rowLen + i + 1) * 4, rowLen * 4,
-          topk.indices, j * 4, 4,
+          indices, j * 4, 4,
           4, 1,
           MemcpyKind.DeviceToDevice,
         );
@@ -248,15 +247,11 @@ export function mtpTreeDecode(
       const reordered = ws.alloc(topk.indices.shape, topk.indices.type);
       reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
       reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
-      ws.inputIdsBuf.memcpy(reordered, batch * I32, MemcpyKind.DeviceToDevice);
-      reordered[Symbol.dispose]();
+      nextInput = reordered;
     }
 
-    topk.indices[Symbol.dispose]();
     total *= 2;
   }
-
-  if (doubledTargetHs) doubledTargetHs[Symbol.dispose]();
 
   for (let i = 0; i < total / 2 - 1; i++) {
     const seq = pagedKV.sequences.pop();
@@ -377,8 +372,7 @@ export function mtpVerify(
   // Run verification prefill: batch=totalPaths, each sequence gets suffixLen tokens
   const seqLens = new Array(totalPaths).fill(suffixLen) as number[];
   const state = ws.planPrefill(model, totalPaths, seqLens, cache);
-  state.prepareInput(inputIdsList);
-  ws.forwardInput(state);
+  state.setInput(inputIdsList);
 
   const hiddenStates = model.forward(state);
   // Pass null (not undefined) for lastIdx — undefined triggers the default
