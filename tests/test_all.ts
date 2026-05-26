@@ -10,3 +10,4 @@ import "./test_graph";
 import "./test_cp_prefill";
 import "./test_cat";
 import "./test_staging";
+import "./test_glm51";
