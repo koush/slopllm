@@ -31,13 +31,18 @@ Tensors implement `Disposable` via `[Symbol.dispose]()`. TypeScript 5.2+ explici
 // to the workspace's "disposed" pool for reuse next step. Same addresses, deterministic.
 using _tracker = ws.startTracking();
 {
-  // Unnamed temporaries auto-dispose at scope exit via "using"
-  using gateBuf = normed.linear(weights.gate_proj, BS);  // disposed when this block exits
-  using upBuf = normed.linear(weights.up_proj, BS);      // disposed when this block exits
+  // Unnamed allocs go into the tracked set. On warmup step, these are real GPU allocations.
+  // On subsequent steps, ws.alloc() finds a matching buffer in the "disposed" pool
+  // and reuses it deterministically — same GPU address each time → graph capturable.
+  using gateBuf = ws.alloc([BS, intermediate], "BF16");  // disposed when this block exits
+  normed.linear(weights.gate_proj, BS, gateBuf);
+  using upBuf = ws.alloc([BS, intermediate], "BF16");    // disposed when this block exits
+  normed.linear(weights.up_proj, BS, upBuf);
   using siluBuf = gateBuf.siluAndMul(upBuf, intermediate, BS);
   // gateBuf, upBuf, siluBuf all disposed here ←
 }
 // All tracked tensors disposed here ← (when _tracker goes out of scope)
+// Next forward pass: same alloc sequence → same addresses from disposed pool → CUDA graph replay safe
 
 // Named tensors (model weights) throw on dispose — they persist for the model's lifetime
 const w = ws.alloc([N, K], "BF16", "model.layers.0.mlp.gate_proj.weight");
