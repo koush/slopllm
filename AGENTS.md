@@ -1,106 +1,169 @@
-# Project Conventions
+# GLM.js Architecture Notes
 
-## Reference Implementation
+## Overview
 
-`vendor/streaming_nvfp4_quantize.py` is the **canonical reference** for the GLM-5.1 model architecture. All CUDA kernels and Python test references must match this file's implementation exactly. Key details:
+TypeScript inference engine for the GLM-5.1 model on NVIDIA GPUs. Ships a native C++/CUDA addon (`glm.node`) wrapped by TypeScript operator classes. Supports multi-GPU via tensor parallelism and context parallelism, CUDA graph capture for decode, and paged KV caching with prefix sharing. Qwen3 and Qwen3.5 are also implemented but serve primarily as broader correctness test targets, not production targets.
 
-- **Indexer uses LayerNorm (with bias)** for `k_norm`, while all other norms use RMSNorm
-- **Indexer scoring uses ReLU** (not softmax) on scores before weighted sum
-- **Main attention softmax** operates in float32 for numerical stability, then casts back to BF16
-- **MoE dispatch**: per-expert Python loop (`for i in range(num_experts)`) — same pattern as our CUDA impl
-- **Interleaved RoPE**: Main attention uses interleaved RoPE (`rope_interleave: true`), NOT non-interleaved (Neox-style). HuggingFace `transformers` is wrong here — see GLM-5.1 section below
-- **Rope/nope ordering differs by module**:
-  - Main attention: `[nope | pe]` — first qk_nope_dim=192 dims are non-positional, last qk_rope_dim=64 are positional
-  - Indexer: `[pe | nope]` — first qk_rope_dim=64 dims are positional, remaining are non-positional
-- **The quantization script creates FP4 from BF16**, but the safetensors checkpoint stores BF16 weights directly
-- **Indexer shares `q_resid` with main attention**
+## Core Abstractions
 
-## Build & Test
+### Tensor (`src/tensor.ts`)
+- Abstract base class. Concrete implementations: `GlmTensor` (single GPU) and `ParallelTensor` (multi-GPU).
+- Each tensor owns a GPU memory pointer (`data`), shape, dtype, and a reference to its `WorkspaceBase`.
+- Operations (`.linear()`, `.rmsnorm()`, `.bmm()`, etc.) allocate output tensors from the workspace and call into the native addon.
+- `SamplingWorkspace` extends `WorkspaceBase` for GPU-side top-k/top-p sampling with repetition penalty.
 
-```bash
-npm run build:all       # build everything
-npm run test:python     # run all Python verification tests (158 tests)
+### Workspace (`src/workspace.ts`)
+- `WorkspaceBase` manages GPU memory lifecycle via **dispose-recycle pooling**:
+  - `alloc()` → checks `disposed` set for best-fit reuse; only calls `newTensor()` (real GPU alloc) if no match found.
+  - `disposed` set: tensors whose `[Symbol.dispose]()` was called but whose memory hasn't been freed. Next alloc reuses the pointer.
+  - Named tensors: re-allocating with the same name disposes the old one, recycling its memory.
+  - **`freeze()`**: after model loading, prevents further allocations — all weight addresses are stable for graph capture.
+  - **`startTracking()`**: returns a scope that disposes all unnamed temporaries when exited, returning their memory to the pool for the next forward pass.
+- This pattern is what makes the inference loop graph-capturable: the same GPU addresses are reused each step deterministically.
+
+### Tensor Lifetime and `using` Pattern
+
+Tensors implement `Disposable` via `[Symbol.dispose]()`. TypeScript 5.2+ explicit resource management (`using`) provides scoped cleanup:
+
+```typescript
+// Forward pass: startTracking creates a scope where all unnamed allocs are tracked.
+// When the scope exits, every tracked tensor is disposed → its GPU memory returns
+// to the workspace's "disposed" pool for reuse next step. Same addresses, deterministic.
+using _tracker = ws.startTracking();
+{
+  // Unnamed allocs go into the tracked set. On warmup step, these are real GPU allocations.
+  // On subsequent steps, ws.alloc() finds a matching buffer in the "disposed" pool
+  // and reuses it deterministically — same GPU address each time → graph capturable.
+  using gateBuf = ws.alloc([BS, intermediate], "BF16");  // disposed when this block exits
+  normed.linear(weights.gate_proj, BS, gateBuf);
+  using upBuf = ws.alloc([BS, intermediate], "BF16");    // disposed when this block exits
+  normed.linear(weights.up_proj, BS, upBuf);
+  using siluBuf = gateBuf.siluAndMul(upBuf, intermediate, BS);
+  // gateBuf, upBuf, siluBuf all disposed here ←
+}
+// All tracked tensors disposed here ← (when _tracker goes out of scope)
+// Next forward pass: same alloc sequence → same addresses from disposed pool → CUDA graph replay safe
+
+// Named tensors (model weights) throw on dispose — they persist for the model's lifetime
+const w = ws.alloc([N, K], "BF16", "model.layers.0.mlp.gate_proj.weight");
+
+// removeTracking() opts out: tensor survives the tracking scope (used for forward outputs)
+const output = hiddenStates.linear(lmHead, BS);
+return output.removeTracking();  // caller is responsible for disposing this
 ```
 
-Run Python tests directly:
+Key rules:
+- Named tensors (`setName()` or allocated with a name) cannot be disposed — they live until replaced or the workspace is freed.
+- `using` on an unnamed tensor auto-disposes at block scope exit.
+- `startTracking()` / its `[Symbol.dispose]()` cleans up all tracked tensors at once — cheaper than individual `using` per tensor in hot loops.
+- `removeTracking()` moves a tensor from `tracked` to `exported`, exempting it from the bulk dispose.
+
+### Allocator (`src/allocator.ts`)
+- `ArenaAllocator`: bump allocator with 256-byte alignment. `free()` is a no-op. Used for the weight arena when `--arena` flag is set — a single large `cudaMalloc` carved up linearly.
+- For non-arena mode, `WorkspaceBase` uses `GlmOps.alloc/free` (real `cudaMalloc`/`cudaFree`) but the dispose-recycle pool means actual allocations rarely happen after warmup.
+
+### GlmOps (`src/glm_ops.ts`)
+- Single-GPU device backend. Wraps the native addon (`glm.node`).
+- Owns CUDA context, stream management (7 alternate streams via `withStream()`), and the allocator.
+- CUDA graph API: `graphBeginCapture/EndCapture/Instantiate/Launch/Destroy`.
+- FlashInfer integration: plan/run split for batch prefill/decode and MLA attention.
+- NCCL and P2P primitives exposed for `ParallelOps`.
+
+### ParallelOps (`src/parallel_ops.ts`)
+- Multi-GPU backend implementing `DeviceOps`. Wraps N `GlmOps` instances.
+- `ParallelTensor`: has N shards (one per GPU), delegates ops to each shard, inserts collective communication (AllReduce, AllGather) as needed based on `TensorParallelism` annotations.
+- `TensorParallelism` enum: `Replicated`, `Column` (output-dim sharded), `Row` (input-dim sharded), `PartialSum` (needs AllReduce), `PartialSoftmax` (for CP merge).
+- Communication: NCCL AllReduce/AllGather for large tensors; custom P2P kernels for small AllReduce/AllGather (≤8192 elements) and fused RMSNorm+AllReduce.
+- Per-device shard workspaces created lazily via `getShardWorkspaces()`.
+
+## Tensor Parallelism
+
+Weight parallelism is assigned per-tensor during loading:
+- **Column**: gate_proj, up_proj, embed_tokens (output dim sharded across GPUs; output is Row-parallel)
+- **Row**: o_proj, down_proj, lm_head (input dim sharded; output is PartialSum, needs AllReduce)
+- **Replicated**: norms, bias, RoPE freqs, position IDs
+
+Linear op parallelism rules:
+- Column × Replicated → Row (no comm)
+- Row × Row → PartialSum (AllReduce needed)
+- Replicated × Replicated → Replicated (no comm)
+- Row × Replicated needs AllGather of input first
+
+## Context Parallelism (Interleaved Token-per-GPU)
+
+When `--cp` flag is set (GLM-5.1 only), all GPUs operate as context-parallel shards instead of tensor-parallel shards:
+
+- **KV cache is Row-sharded**: each GPU stores every Nth token's KV (tokens interleaved across GPUs). `PagedKVCache` uses `TensorParallelism.Row` for ckv/kpe tensors.
+- **MLA weights are Replicated** instead of Column: q_pe_proj, v_proj, absorbed weight loaded as Replicated so each GPU can compute attention independently over its shard of the sequence.
+- **Position IDs**: `decodeStep`/`mlaDecodeStep` receive `cpWorldSize=N` and `cpRank=i`. The CUDA kernel assigns position `i, i+N, i+2N, ...` to GPU `i`.
+- **Prefill**: Each GPU runs MLA prefill over its token subset with `cpWorldSize`/`cpRank` params. The FlashInfer plan computes `effectivePageSize = pageSize / worldSize` and `effectiveNumHeads = numHeads` (not sharded). Output is `PartialSoftmax` — each shard has partial attention output + log-sum-exp.
+- **CP Merge**: After prefill/decode, `contextParallelMerge()` or `p2pCpMerge()` combines partial softmax outputs across GPUs using the online softmax trick: `merged_v = Σ(exp(lse_i - lse_max) * v_i) / Σ(exp(lse_i - lse_max))`. This uses either NCCL AllGather + local merge, or fused P2P kernel.
+- **Page allocation**: `PagedKVCache` distributes pages round-robin across GPUs. Page `p` is stored on GPU `p % worldSize`. The effective page size per GPU is `pageSize / worldSize`.
+
+## Paged KV Cache (`src/paged_kv.ts`)
+
+- Fixed `PAGE_SIZE=16` tokens per page. Pages are ref-counted for prefix sharing (only full pages are shared; partial last pages are copied).
+- `Sequence`: ordered list of pages tracking `allocLen` and `tokenIds`.
+- `PagedKVCache` extends `WorkspaceBase` — KV cache tensors (`kData[]`/`vData[]` or `ckvData[]`/`kpeData[]`) are pre-allocated GPU buffers indexed by layer and page ID.
+- Dirty flags (`pagesDirtyHost`, `pagesDirtyDevice`, `positionIdsDirty`) control conditional updates — plan calls and host→device copies are skipped if nothing changed.
+- MLA path: uses `ckvData[layer]` `[maxPages, pageSize, kvLoraRank]` and `kpeData[layer]` `[maxPages, pageSize, qkRopeDim]` instead of separate K/V.
+- Standard path: uses `kData[layer]` `[maxPages, nKv*pageSize*hd]` and `vData[layer]`.
+
+## Execution Workspace (`src/execution-workspace.ts`)
+
+- `ExecutionWorkspace` extends `WorkspaceBase`, pre-allocating all GPU and pinned buffers needed for prefill/decode at construction time. No GPU allocations happen in the hot path.
+- `ExecutionState`: holds per-step context (batchSize, totalTokens, seqLens, isDecode, cache reference).
+- **Plan/Run split**:
+  - `planPrefill()`: allocates pages, fills indptr/positionIds/slotMapping on host, calls FlashInfer plan kernel, copies indices to device.
+  - `planDecode()`: allocates decode token pages, updates position IDs (only if dirty), calls FlashInfer decode plan (only if pages changed), copies indices.
+  - `forwardPrefill/forwardDecode()`: runs the model forward pass using the planned state.
+- FlashInfer plan writes workspace buffers (floatWs, intWs, planInfo). Run reads them. This split is essential for CUDA graph capture — plan runs outside the graph, run is captured.
+
+## CUDA Graph Capture (`src/capture-manager.ts`)
+
+- `CaptureManager`: key → `{warmupSteps, graphExec}`. First 3 calls run eagerly (warmup). On the 3rd warmup call, `graphBeginCapture()` is called, the lambda runs, then `graphEndCapture()` + `graphInstantiate()`. Subsequent calls with the same key launch the cached graph directly via `graphLaunch()`.
+- Works because all GPU pointers are stable (workspace recycling). The plan step (which writes to plan buffers and may change kernel selection) runs outside the graph.
+- Decode path: `captureManager.run(() => { inputIdsBuf.memcpy, decodeStep, model.forward, computeLogits, doSample }, ['decode'])`.
+
+## Model Loading (`src/chat_model.ts`, `src/glm51_model.ts`)
+
+- `ChatModel` extends `WorkspaceBase` — the model IS its weight workspace.
+- `fromPretrained(modelDir)`: scans for safetensors files, memory-maps each shard, calls `loadTensor()` for each weight. After loading, calls `freeze()` to lock the workspace.
+- `loadTensor()` is model-specific:
+  - GLM-5.1: splits MLA fused weights (q_b_proj → q_nope_proj + q_pe_proj, kv_b_proj → k_nope_proj + v_proj), computes absorbed weight (k_nope_proj @ q_nope_proj), handles NVFP4 scale renaming.
+  - Weights are loaded with mmap+DMA (`mmapLoadAsync`) for zero-copy GPU upload.
+  - F32 weights (norms, A_log) are converted to BF16 on load.
+
+## Inference Flow
+
+1. **Prefill**: `planPrefill()` → `prepareInput()` → `forwardInput()` → `model.forward(state)` → `computeLogits()`
+2. **Decode loop**: `planDecode()` → `captureManager.run({ inputIdsBuf.memcpy, decodeStep, model.forward, computeLogits, doSample })` → copy token to host → `reportTokens()` → yield
+
+## Testing
+
+## Scratchpad
+
+The `scratchpad/` directory is gitignored and intended for ad-hoc scripts, diagnostics, and experimentation. It is not checked in — use it for anything temporary that shouldn't pollute the repo (e.g., comparing hidden states across layers, debugging KV cache issues, testing new kernels in isolation).
+
+## Testing
+
 ```bash
-cd tests/python && pytest -v .
+npm run build:all          # build CUDA addon + TypeScript (required before any tests)
+npm run test:python        # Python tests: pytest tests/python/ - validates CUDA kernels against PyTorch
+npm run test:node          # TypeScript tests: end-to-end model inference via tsx --test
+npm test                   # runs both
+# individual tests:
+cd tests/python && pytest -v test_linear.py   # single Python test
+GLM_GPU=1 pytest -v test_linear.py            # specific GPU
+npx tsx --test tests/test_glm51.ts            # single TS test
+GLM_GPUS=0,1 npx tsx --test tests/test_parallel.ts  # multi-GPU
 ```
 
-## Precision Model
+## Key Design Decisions
 
-- All kernels operate on **BF16 with FP32 accumulation**, matching cuBLAS tensor core behavior
-- Test references should match CUDA precision model: BF16 inputs for linear ops, float32 for fused ops (e.g. silu*mul)
-- When increasing test tolerances, investigate implementation bugs first — don't mask real errors with loose tolerances
-- MoE routing weight differences (~1 BF16 ULP) cause cascading errors proportional to output magnitude — this is expected BF16 behavior
-- **Qwen3.5 BF16 vs FP32**: HuggingFace `AutoModelForCausalLM` uses FP32 computation. Our CUDA model uses BF16 throughout. Greedy decoding matches HuggingFace for ~9 tokens; divergence at position 10 is a ~0.25 logit difference from BF16 accumulation through 24 layers. Per-layer synced max_diff < 0.031 (GDN) / < 0.016 (full attention) with 13-token input; accumulated max_diff through all 24 layers is ~0.094 in hidden state / ~0.29 in logits. Sampling (temperature/top-p/top-k/repetition penalty) mitigates this.
-
-## Model Details
-
-### GLM-5.1
-- Model: `zai-org/GLM-5.1`, cached in Python HF cache
-- 78 layers (3 dense: 0-2, 75 MoE: 3-77), 256 routed experts (top-8)
-- hidden_size=6144, moe_intermediate_size=2048, dense_intermediate=12288
-- GPU: NVIDIA RTX PRO 6000 Blackwell (sm_120), PyTorch nightly required
-- Build with `-gencode arch=compute_120,code=sm_120`
-- **Standard RMSNorm** for all layer norms (input_layernorm, post_attention_layernorm, q_a_layernorm, kv_a_layernorm, model.norm) — do NOT add +1 during loading (unlike Qwen3.5 which uses GemmaRMSNorm)
-- **Interleaved RoPE**: Config has `rope_interleave: true`; our implementation uses interleaved RoPE for main attention. HuggingFace `transformers` library is **wrong** — it uses non-interleaved `rotate_half` despite the config, and `rope_interleave` raises `AttributeError`. Do NOT use HuggingFace output as a reference for GLM-5.1. SGLang and vLLM both confirm interleaved RoPE for this model.
-
-### GLM-5.1 Test Models
-- These models are untrained test models used to validate model loading and architecture. They return garbage output as a result, this is expected.
-- Around 1B in size, same architecture as full model but with less layers.
-- tests/python/test_models/glm51_small/glm51_small_nvfp4
-- tests/python/test_models/glm51_small/glm51_small_bf16
-- **HuggingFace comparison tests are skipped** (`TestHuggingFaceModel`, `TestCudaVsHuggingFace`) because HuggingFace `transformers` uses non-interleaved RoPE for GLM-5.1 despite `rope_interleave=true` in config — outputs diverge and comparison is meaningless
-
-### Qwen3-0.6B
-- Model: `Qwen/Qwen3-0.6B`, cached at `/mnt/storage/.cache/huggingface/`
-- Standard GQA transformer (no MLA, no MoE, no DSA/Indexer)
-- hidden_size=1024, num_attention_heads=16, num_key_value_heads=8, head_dim=128, GQA groups=2
-- intermediate_size=3072, num_hidden_layers=28, vocab_size=151936
-- rms_norm_eps=1e-6, rope_theta=1000000, attention_bias=false, tie_word_embeddings=true
-- QK norm: RMSNorm on Q and K per head (before RoPE)
-- SwiGLU MLP: `down_proj(silu(gate_proj(x)) * up_proj(x))`
-- Reference: `vendor/modeling_qwen3.py`, `vendor/configuration_qwen3.py`
-- Run Qwen3 tests with: `HF_HOME=/mnt/storage/.cache/huggingface pytest test_qwen3.py -v`
-
-### Qwen3.5-0.8B
-- Model: `Qwen/Qwen3.5-0.8B`, cached at `/mnt/storage/.cache/huggingface/`
-- 24 layers: 18 GDN (linear_attention) + 6 full_attention, every 4th layer is full attention
-- hidden_size=1024, intermediate_size=3584, vocab_size=248320, rms_norm_eps=1e-6
-- Full attention: 8 heads, 2 KV heads, head_dim=256, partial_rotary_factor=0.25 (64 RoPE dims), attn_output_gate=true
-- GDN: 16 linear_key_heads, 16 linear_value_heads, linear_key_head_dim=128, linear_value_head_dim=128, conv_kernel_dim=4
-- **Weight dtype note**: `A_log` (F32) and `dt_bias` (BF16 in safetensors, but must be uploaded as F32 — GDN kernels read both as `const float*`)
-- GemmaRMSNorm for layer norms (input_layernorm, post_attention_layernorm, q_norm, k_norm, final norm) — weight += 1 during loading
-- Standard RMSNorm for GDN internal norm (linear_attn.norm.weight) — do NOT add +1; weight is F32 in safetensors, kernel reads as BF16 (acceptable precision loss)
-- GDN recurrent state is float32 (mamba_ssm_dtype: float32)
-- rope_theta=10000000 (in rope_parameters, not top-level config)
-- Run: `npx tsx src/run_qwen3_chat.ts --qwen35`
-- Sampling defaults: `--temperature 0.6 --top-p 0.95 --top-k 20 --repetition-penalty 1.1`; `--greedy` for argmax
-- HuggingFace reference: `scratchpad/hf_qwen35_gen.py`
-
-## FlashInfer Integration
-
-FlashInfer's FA2 CUDA attention kernels are compiled into `libglm_ops.so` (Path B: C++ integration).
-
-### Architecture
-- `csrc/glm_flash.cu` — C wrappers calling FlashInfer's `SinglePrefillWithKVCacheDispatched` and `SingleDecodeWithKVCacheDispatched`
-- Specialized for BF16, **head_dim=128 and head_dim=256** (256 added for Qwen3.5), PosEncodingMode::kNone, DefaultAttention variant
-- Prefill uses MaskMode::kCausal; Decode uses MaskMode::kNone
-- KV cache is HND layout: `[n_kv, max_S, hd]` — FlashInfer reads directly from cache via stride parameters
-- Q tensor layout after transpose is `[B, n_heads, S, hd]` (HND) — strides: q_stride_n=hd, q_stride_h=S*hd
-- Output from FlashInfer is NHD: `[S, n_heads, hd]` = `[S, hidden]` — directly compatible with o_proj
-- 32MB workspace buffer for split-KV path (rarely triggered for small sequences)
-- **Note**: Batch prefill/decode paths are hardcoded to head_dim=128; single prefill/decode support both 128 and 256
-
-### Python bindings
-- `helpers.py`: `flash_prefill()` and `flash_decode()` methods on `GlmOps`
-- `qwen3_model.py`: `_attention_prefill_flash()` and `_attention_decode_flash()` methods
-- Hot path (`prefill()` and `_decode_token()`) uses flash attention; `forward()` retains BMM-based attention for testing
-
-## Python Code
-
-- All Python code lives in `tests/python/` — verification only against torch operations, not production
-- Use `json.load()` for config parsing (no transformers dependency)
-- Use `safetensors.safe_open()` for weight loading
-- **Do NOT use HuggingFace `transformers` as a reference for GLM-5.1** — it uses non-interleaved RoPE despite `rope_interleave=true` in config, producing incorrect output. Use the vendor reference script or SGLang/vLLM instead
+- **Dispose-recycle workspace**: enables CUDA graph capture without explicit memory pool management. Tensors are allocated once, disposed into a pool, and reused at the same addresses.
+- **Pre-allocated buffers**: `ExecutionWorkspace` constructor allocates all plan/work/index buffers. No dynamic GPU allocation during inference.
+- **Plan/Run split**: FlashInfer plan is not graph-capturable (writes host buffers, may compile kernels), but run is. Plan only executes when dirty flags indicate changes.
+- **P2P AllReduce**: custom kernel for small AllReduce/AllGather avoids NCCL overhead for partial sums in tensor-parallel decode.
+- **Multi-stream**: `GlmOps.withStream()` provides alternate CUDA streams with event-based synchronization. Used in GLM-5.1 MoE to overlap shared expert computation with routed expert computation.
+- **Strided mmap loading**: weight tensors loaded via `memcpy2dHostToDeviceAsync` with pitch/width/height for row-parallel or column-parallel sharding, avoiding host-side copies.

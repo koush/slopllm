@@ -1,0 +1,106 @@
+# Project Conventions
+
+## Reference Implementation
+
+`vendor/streaming_nvfp4_quantize.py` is the **canonical reference** for the GLM-5.1 model architecture. All CUDA kernels and Python test references must match this file's implementation exactly. Key details:
+
+- **Indexer uses LayerNorm (with bias)** for `k_norm`, while all other norms use RMSNorm
+- **Indexer scoring uses ReLU** (not softmax) on scores before weighted sum
+- **Main attention softmax** operates in float32 for numerical stability, then casts back to BF16
+- **MoE dispatch**: per-expert Python loop (`for i in range(num_experts)`) — same pattern as our CUDA impl
+- **Interleaved RoPE**: Main attention uses interleaved RoPE (`rope_interleave: true`), NOT non-interleaved (Neox-style). HuggingFace `transformers` is wrong here — see GLM-5.1 section below
+- **Rope/nope ordering differs by module**:
+  - Main attention: `[nope | pe]` — first qk_nope_dim=192 dims are non-positional, last qk_rope_dim=64 are positional
+  - Indexer: `[pe | nope]` — first qk_rope_dim=64 dims are positional, remaining are non-positional
+- **The quantization script creates FP4 from BF16**, but the safetensors checkpoint stores BF16 weights directly
+- **Indexer shares `q_resid` with main attention**
+
+## Build & Test
+
+```bash
+npm run build:all       # build everything
+npm run test:python     # run all Python verification tests (158 tests)
+```
+
+Run Python tests directly:
+```bash
+cd tests/python && pytest -v .
+```
+
+## Precision Model
+
+- All kernels operate on **BF16 with FP32 accumulation**, matching cuBLAS tensor core behavior
+- Test references should match CUDA precision model: BF16 inputs for linear ops, float32 for fused ops (e.g. silu*mul)
+- When increasing test tolerances, investigate implementation bugs first — don't mask real errors with loose tolerances
+- MoE routing weight differences (~1 BF16 ULP) cause cascading errors proportional to output magnitude — this is expected BF16 behavior
+- **Qwen3.5 BF16 vs FP32**: HuggingFace `AutoModelForCausalLM` uses FP32 computation. Our CUDA model uses BF16 throughout. Greedy decoding matches HuggingFace for ~9 tokens; divergence at position 10 is a ~0.25 logit difference from BF16 accumulation through 24 layers. Per-layer synced max_diff < 0.031 (GDN) / < 0.016 (full attention) with 13-token input; accumulated max_diff through all 24 layers is ~0.094 in hidden state / ~0.29 in logits. Sampling (temperature/top-p/top-k/repetition penalty) mitigates this.
+
+## Model Details
+
+### GLM-5.1
+- Model: `zai-org/GLM-5.1`, cached in Python HF cache
+- 78 layers (3 dense: 0-2, 75 MoE: 3-77), 256 routed experts (top-8)
+- hidden_size=6144, moe_intermediate_size=2048, dense_intermediate=12288
+- GPU: NVIDIA RTX PRO 6000 Blackwell (sm_120), PyTorch nightly required
+- Build with `-gencode arch=compute_120,code=sm_120`
+- **Standard RMSNorm** for all layer norms (input_layernorm, post_attention_layernorm, q_a_layernorm, kv_a_layernorm, model.norm) — do NOT add +1 during loading (unlike Qwen3.5 which uses GemmaRMSNorm)
+- **Interleaved RoPE**: Config has `rope_interleave: true`; our implementation uses interleaved RoPE for main attention. HuggingFace `transformers` library is **wrong** — it uses non-interleaved `rotate_half` despite the config, and `rope_interleave` raises `AttributeError`. Do NOT use HuggingFace output as a reference for GLM-5.1. SGLang and vLLM both confirm interleaved RoPE for this model.
+
+### GLM-5.1 Test Models
+- These models are untrained test models used to validate model loading and architecture. They return garbage output as a result, this is expected.
+- Around 1B in size, same architecture as full model but with less layers.
+- tests/python/test_models/glm51_small/glm51_small_nvfp4
+- tests/python/test_models/glm51_small/glm51_small_bf16
+- **HuggingFace comparison tests are skipped** (`TestHuggingFaceModel`, `TestCudaVsHuggingFace`) because HuggingFace `transformers` uses non-interleaved RoPE for GLM-5.1 despite `rope_interleave=true` in config — outputs diverge and comparison is meaningless
+
+### Qwen3-0.6B
+- Model: `Qwen/Qwen3-0.6B`, cached at `/mnt/storage/.cache/huggingface/`
+- Standard GQA transformer (no MLA, no MoE, no DSA/Indexer)
+- hidden_size=1024, num_attention_heads=16, num_key_value_heads=8, head_dim=128, GQA groups=2
+- intermediate_size=3072, num_hidden_layers=28, vocab_size=151936
+- rms_norm_eps=1e-6, rope_theta=1000000, attention_bias=false, tie_word_embeddings=true
+- QK norm: RMSNorm on Q and K per head (before RoPE)
+- SwiGLU MLP: `down_proj(silu(gate_proj(x)) * up_proj(x))`
+- Reference: `vendor/modeling_qwen3.py`, `vendor/configuration_qwen3.py`
+- Run Qwen3 tests with: `HF_HOME=/mnt/storage/.cache/huggingface pytest test_qwen3.py -v`
+
+### Qwen3.5-0.8B
+- Model: `Qwen/Qwen3.5-0.8B`, cached at `/mnt/storage/.cache/huggingface/`
+- 24 layers: 18 GDN (linear_attention) + 6 full_attention, every 4th layer is full attention
+- hidden_size=1024, intermediate_size=3584, vocab_size=248320, rms_norm_eps=1e-6
+- Full attention: 8 heads, 2 KV heads, head_dim=256, partial_rotary_factor=0.25 (64 RoPE dims), attn_output_gate=true
+- GDN: 16 linear_key_heads, 16 linear_value_heads, linear_key_head_dim=128, linear_value_head_dim=128, conv_kernel_dim=4
+- **Weight dtype note**: `A_log` (F32) and `dt_bias` (BF16 in safetensors, but must be uploaded as F32 — GDN kernels read both as `const float*`)
+- GemmaRMSNorm for layer norms (input_layernorm, post_attention_layernorm, q_norm, k_norm, final norm) — weight += 1 during loading
+- Standard RMSNorm for GDN internal norm (linear_attn.norm.weight) — do NOT add +1; weight is F32 in safetensors, kernel reads as BF16 (acceptable precision loss)
+- GDN recurrent state is float32 (mamba_ssm_dtype: float32)
+- rope_theta=10000000 (in rope_parameters, not top-level config)
+- Run: `npx tsx src/run_qwen3_chat.ts --qwen35`
+- Sampling defaults: `--temperature 0.6 --top-p 0.95 --top-k 20 --repetition-penalty 1.1`; `--greedy` for argmax
+- HuggingFace reference: `scratchpad/hf_qwen35_gen.py`
+
+## FlashInfer Integration
+
+FlashInfer's FA2 CUDA attention kernels are compiled into `libglm_ops.so` (Path B: C++ integration).
+
+### Architecture
+- `csrc/glm_flash.cu` — C wrappers calling FlashInfer's `SinglePrefillWithKVCacheDispatched` and `SingleDecodeWithKVCacheDispatched`
+- Specialized for BF16, **head_dim=128 and head_dim=256** (256 added for Qwen3.5), PosEncodingMode::kNone, DefaultAttention variant
+- Prefill uses MaskMode::kCausal; Decode uses MaskMode::kNone
+- KV cache is HND layout: `[n_kv, max_S, hd]` — FlashInfer reads directly from cache via stride parameters
+- Q tensor layout after transpose is `[B, n_heads, S, hd]` (HND) — strides: q_stride_n=hd, q_stride_h=S*hd
+- Output from FlashInfer is NHD: `[S, n_heads, hd]` = `[S, hidden]` — directly compatible with o_proj
+- 32MB workspace buffer for split-KV path (rarely triggered for small sequences)
+- **Note**: Batch prefill/decode paths are hardcoded to head_dim=128; single prefill/decode support both 128 and 256
+
+### Python bindings
+- `helpers.py`: `flash_prefill()` and `flash_decode()` methods on `GlmOps`
+- `qwen3_model.py`: `_attention_prefill_flash()` and `_attention_decode_flash()` methods
+- Hot path (`prefill()` and `_decode_token()`) uses flash attention; `forward()` retains BMM-based attention for testing
+
+## Python Code
+
+- All Python code lives in `tests/python/` — verification only against torch operations, not production
+- Use `json.load()` for config parsing (no transformers dependency)
+- Use `safetensors.safe_open()` for weight loading
+- **Do NOT use HuggingFace `transformers` as a reference for GLM-5.1** — it uses non-interleaved RoPE despite `rope_interleave=true` in config, producing incorrect output. Use the vendor reference script or SGLang/vLLM instead
