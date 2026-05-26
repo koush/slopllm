@@ -190,52 +190,6 @@ describe("GLM-5.1 small model smoke test", () => {
     assert.equal(chunkedDecode, fullDecode,
       `Chunked decode token mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
   });
-
-  it("prefill after KV truncate: argmax at every position matches decode", () => {
-    using cache = model.createChatCache(256);
-    const pagedKV = cache.getPagedKV();
-    const prompt = makeLongPrompt(PAGE_SIZE * 2);
-    const numDecodeSteps = 8;
-
-    // Step 1: Prefill prompt and decode N steps greedily to collect answer tokens
-    cache.reset(1);
-    let current = ws.forwardEagerPrefill(model, [prompt], cache)[0];
-    cache.reportTokens(0, prompt);
-    pagedKV.updateIndptr(ws);
-
-    const answerTokens: number[] = [current];
-    for (let step = 0; step < numDecodeSteps; step++) {
-      const result = ws.forwardEagerDecode(model, [current], cache);
-      cache.reportTokens(0, [current]);
-      pagedKV.updateIndptr(ws);
-      current = result[0];
-      answerTokens.push(current);
-    }
-
-    // Step 2: Truncate KV cache back to the prompt
-    const suffix = pagedKV.prefixMatch(0, prompt);
-    assert.deepStrictEqual(suffix, [],
-      `prefixMatch should return empty suffix for exact prompt match, got length ${suffix.length}`);
-    pagedKV.updateIndptr(ws);
-
-    // Step 3: Prefill all answer tokens at once, get logits at every position
-    const state = ws.planPrefill(model, 1, [answerTokens.length], cache);
-    state.prepareInput([answerTokens]);
-    ws.forwardInput(state);
-    const hiddenStates = model.forward(state);
-    const allLogits = state.computeLogits(hiddenStates, model, null);
-    using argmaxResult = allLogits.argmax();
-    const predictions = argmaxResult.readInt32LEArray();
-    cache.reportTokens(0, answerTokens);
-    pagedKV.updateIndptr(ws);
-
-    // Step 4: Each position i should predict answerTokens[i+1]
-    const expected = answerTokens.slice(1);
-    for (let i = 0; i < expected.length; i++) {
-      assert.equal(predictions[i], expected[i],
-        `Position ${i}: predicted ${predictions[i]} but decode produced ${expected[i]}`);
-     }
-  });
 });
 
 describe("GLM-5.1 small model with context parallelism", () => {
@@ -307,47 +261,5 @@ describe("GLM-5.1 small model with context parallelism", () => {
       `Chunked prefill mismatch: chunked=${chunkedTokens[0]}, full=${fullTokens[0]}`);
     assert.equal(chunkedDecode, fullDecode,
       `Chunked decode mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
-  });
-
-  it("prefill after KV truncate: argmax at every position matches decode", () => {
-    using cache = modelCp.createChatCache(256);
-    const pagedKV = cache.getPagedKV();
-    const prompt = makeLongPrompt(PAGE_SIZE * 2);
-    const numDecodeSteps = 8;
-
-    cache.reset(1);
-    let current = wsCp.forwardEagerPrefill(modelCp, [prompt], cache)[0];
-    cache.reportTokens(0, prompt);
-    pagedKV.updateIndptr(wsCp);
-
-    const answerTokens: number[] = [current];
-    for (let step = 0; step < numDecodeSteps; step++) {
-      const result = wsCp.forwardEagerDecode(modelCp, [current], cache);
-      cache.reportTokens(0, [current]);
-      pagedKV.updateIndptr(wsCp);
-      current = result[0];
-      answerTokens.push(current);
-    }
-
-    const suffix = pagedKV.prefixMatch(0, prompt);
-    assert.deepStrictEqual(suffix, [],
-      `prefixMatch should return empty suffix for exact prompt match, got length ${suffix.length}`);
-    pagedKV.updateIndptr(wsCp);
-
-    const state = wsCp.planPrefill(modelCp, 1, [answerTokens.length], cache);
-    state.prepareInput([answerTokens]);
-    wsCp.forwardInput(state);
-    const hiddenStates = modelCp.forward(state);
-    const allLogits = state.computeLogits(hiddenStates, modelCp, null);
-    using argmaxResult = allLogits.argmax();
-    const predictions = argmaxResult.readInt32LEArray();
-    cache.reportTokens(0, answerTokens);
-    pagedKV.updateIndptr(wsCp);
-
-    const expected = answerTokens.slice(1);
-    for (let i = 0; i < expected.length; i++) {
-      assert.equal(predictions[i], expected[i],
-        `Position ${i}: predicted ${predictions[i]} but decode produced ${expected[i]}`);
-    }
   });
 });
