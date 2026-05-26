@@ -324,11 +324,7 @@ export function* generateStream(
           console.log(`  [${row}] ${ids.map(id => tokenizer?.decode([id]) ?? `?${id}`).join(" ")}`);
         }
 
-        // const originalAllocLen = cache.getPagedKV().sequences[0].allocLen;
-        // cache.getPagedKV().sequences[0].allocLen--;
-        // ws.decodeStep(state, model, -1);
         const verifyResult = mtpVerify(model, ws, cache, treeResult, hostBuf, tokenizer);
-        // cache.getPagedKV().sequences[0].truncate(originalAllocLen);
         console.log(`MTP accepted=${verifyResult.numAccepted}/${nextn} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
         if (verifyResult.acceptedTokens.length > 0) {
           console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer?.decode([t]) ?? `?${t}`).join(" ")}`);
