@@ -31,7 +31,7 @@ describe("Qwen3-0.6B batch tests", () => {
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
-    model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO, 4, 4096);
+    model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
     ws = new ExecutionWorkspace(glm, 4, 4096);
   });
 
@@ -329,7 +329,7 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("batch sampling matches sequential sampling", () => {
-    using pagedKV = model.createChatCache() as PagedKVCache;
+    using pagedKV = model.createChatCache(256, 4) as PagedKVCache;
     const greedy: SamplingParams = makeSamplingParams({
       temperature: 0, topP: 1.0, topK: 0,
       repetitionPenalty: 1.0, presencePenalty: 0, repetitionPenaltyWindow: 64,
@@ -365,7 +365,7 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("batch sampling with different histories", () => {
-    using pagedKV = model.createChatCache(4) as PagedKVCache;
+    using pagedKV = model.createChatCache(4, 4) as PagedKVCache;
     const greedy: SamplingParams = makeSamplingParams({
       temperature: 0, topP: 1.0, topK: 0,
       repetitionPenalty: 1.0, presencePenalty: 0, repetitionPenaltyWindow: 64,
@@ -632,7 +632,7 @@ describe("PagedKVCache prefix matching", () => {
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
-    model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO, 4, 4096);
+    model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
     ws = new ExecutionWorkspace(glm, 4, 4096);
   });
 

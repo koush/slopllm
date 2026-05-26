@@ -47,7 +47,7 @@ describe("GLM-5.1 small model smoke test", () => {
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
-    model = await Glm51Model.fromPretrained(glm, SMALL_MODEL_DIR, 2, 128);
+    model = await Glm51Model.fromPretrained(glm, SMALL_MODEL_DIR);
     ws = new ExecutionWorkspace(glm, 2, 128);
   });
 
@@ -123,7 +123,7 @@ describe("GLM-5.1 small model smoke test", () => {
   });
 
   it("handles batch size > 1", () => {
-    const cache = model.createChatCache(64);
+    const cache = model.createChatCache(64, 2);
     const inputIds1 = [1, 2, 3];
     const inputIds2 = [4, 5, 6];
     cache.reset(2);
@@ -207,7 +207,7 @@ describe("GLM-5.1 small model with context parallelism", () => {
     glm1 = new GlmOps(1);
     glm2 = new GlmOps(2);
     po = new ParallelOps([glm1, glm2]);
-    modelCp = await Glm51Model.fromPretrained(po, SMALL_MODEL_DIR, MAX_BATCH, MAX_SEQ_LEN, true);
+    modelCp = await Glm51Model.fromPretrained(po, SMALL_MODEL_DIR, true);
     wsCp = new ExecutionWorkspace(po, MAX_BATCH, MAX_SEQ_LEN);
   });
 

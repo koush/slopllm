@@ -10,8 +10,8 @@ import { generateTokens } from "./test_helper";
 const FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const BF16_REPO = "Qwen/Qwen3-0.6B";
 
-function makeKV(m: Qwen3Model, maxPages = 256): PagedKVCache {
-  return new PagedKVCache(m.glm, m.cfg.numKeyValueHeads, m.cfg.headDim, m.cfg.numHiddenLayers, maxPages, m.maxBatch);
+function makeKV(m: Qwen3Model, maxPages = 256, maxBatch = 1): PagedKVCache {
+  return new PagedKVCache(m.glm, m.cfg.numKeyValueHeads, m.cfg.headDim, m.cfg.numHiddenLayers, maxPages, maxBatch);
 }
 
 function cosineSimilarity(a: Float32Array, b: Float32Array): number {
@@ -41,7 +41,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
-    model = await Qwen3Model.fromPretrained(glm, FP8_REPO, 1, 64);
+    model = await Qwen3Model.fromPretrained(glm, FP8_REPO);
     ws = new ExecutionWorkspace(glm, 1, 64);
   });
 
@@ -102,7 +102,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
 
   it("FP8 logits correlate with BF16 logits (cosine sim >= 0.99)", async () => {
     const fp8KV = makeKV(model);
-    const bf16Model = await Qwen3Model.fromPretrained(glm, BF16_REPO, 1, 64);
+    const bf16Model = await Qwen3Model.fromPretrained(glm, BF16_REPO);
     const bf16Ws = new ExecutionWorkspace(glm, 1, 64);
     const bf16KV = makeKV(bf16Model);
     try {

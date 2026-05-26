@@ -18,7 +18,7 @@ describe("PagedKVCache staging", () => {
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
-    model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO, 4, 4096);
+    model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
     ws = new ExecutionWorkspace(glm, 4, 4096);
   });
 

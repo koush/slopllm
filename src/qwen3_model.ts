@@ -38,23 +38,19 @@ function loadConfig(modelDir: string): Qwen3Config {
 export class Qwen3Model extends ChatModel {
   readonly eosIds: Set<number>;
   cfg: Qwen3Config;
-  maxBatch: number;
-  maxSeqLen: number;
   invFreq: Tensor;
 
-  private constructor(glm: DeviceOps, config: Qwen3Config, maxBatch: number, maxSeqLen: number) {
+  private constructor(glm: DeviceOps, config: Qwen3Config) {
     super(glm);
     this.cfg = config;
-    this.maxBatch = maxBatch;
-    this.maxSeqLen = maxSeqLen;
     this.eosIds = new Set(config.eosTokenIds);
     this.invFreq = this.initInvFreq(config.headDim, config.ropeTheta);
   }
 
-  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string, maxBatch = 1, maxSeqLen = 4096): Promise<Qwen3Model> {
+  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string): Promise<Qwen3Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
-    const model = new Qwen3Model(glm, config, maxBatch, maxSeqLen);
+    const model = new Qwen3Model(glm, config);
     await model.fromPretrained(modelDir);
     return model;
   }
@@ -99,8 +95,8 @@ export class Qwen3Model extends ChatModel {
     }
   }
 
-  createChatCache(maxPages = 256): ChatCache {
-    return new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, maxPages, this.maxBatch);
+  createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, _pageSize = 16): ChatCache {
+    return new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, maxPages, maxBatch);
   }
 
   private mlp(normed: Tensor, BS: number, pfx: string): Tensor {

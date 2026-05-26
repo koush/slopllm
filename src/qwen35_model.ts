@@ -242,10 +242,10 @@ export class Qwen35Model extends ChatModel {
     }
   }
 
-  createChatCache(maxPages = 256, maxBatch = 1, maxSeqLen = 4096): ChatCache {
+  createChatCache(maxPages = 256, maxBatch = 1, maxSeqLen = 4096, _pageSize = 16): ChatCache {
     const pagedKV = new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, maxBatch);
     const gdnState = new Qwen35GdnState(this.glm, this.cfg, maxBatch);
-    return new Qwen35ChatCache(pagedKV, gdnState);
+    return new Qwen35ChatCache(pagedKV, gdnState, maxBatch, maxSeqLen);
   }
 
   private fullAttnCacheIdx(layerIdx: number): number {

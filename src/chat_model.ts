@@ -52,7 +52,7 @@ export abstract class ChatModel extends WorkspaceBase {
     super(glm);
   }
 
-  abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number): ChatCache;
+  abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number): ChatCache;
   abstract forward(state: ExecutionState): Tensor;
   forwardMtp?(state: ExecutionState, previousHiddenState: Tensor, inputIds?: Tensor): Tensor;
 

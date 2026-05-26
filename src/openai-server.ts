@@ -520,8 +520,8 @@ async function main(): Promise<void> {
 
   console.log(`Loading model from ${modelDir}...`);
   const glm = new GlmOps(args.gpu, undefined, undefined);
-  const model = await Qwen3Model.fromPretrained(glm, modelDir, args.batchSize, args.ctxSize);
-  const cache = model.createChatCache(args.maxPages);
+  const model = await Qwen3Model.fromPretrained(glm, modelDir);
+  const cache = model.createChatCache(args.maxPages, args.batchSize, args.ctxSize);
   const ws = new ExecutionWorkspace(glm, args.batchSize, args.ctxSize);
   const tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
   const chatTemplatePath = path.join(tokenizerDir, "chat_template.jinja");

@@ -106,29 +106,25 @@ export class Glm51Model extends ChatModel {
   static readonly WEIGHT_PREFIX = "model.layers.";
   readonly eosIds: Set<number>;
   cfg: Glm51Config;
-  maxBatch: number;
-  maxSeqLen: number;
   invFreq: Tensor;
   readonly contextParallel: boolean;
   private readonly pendingKNope = new Map<string, MlaDeferred>();
   private readonly pendingQNope = new Map<string, MlaDeferred>();
   private readonly mtp: boolean;
 
-  private constructor(glm: DeviceOps, config: Glm51Config, maxBatch: number, maxSeqLen: number, contextParallel = false, mtp = false) {
+  private constructor(glm: DeviceOps, config: Glm51Config, contextParallel = false, mtp = false) {
     super(glm);
     this.cfg = config;
-    this.maxBatch = maxBatch;
-    this.maxSeqLen = maxSeqLen;
     this.eosIds = new Set(config.eosTokenIds);
     this.invFreq = this.initInvFreq(config.qkRopeHeadDim, config.ropeTheta);
     this.contextParallel = contextParallel;
     this.mtp = mtp;
   }
 
-  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, maxBatch = 1, maxSeqLen = 4096, contextParallel = false, mtp = false): Promise<Glm51Model> {
+  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, contextParallel = false, mtp = false): Promise<Glm51Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
-    const model = new Glm51Model(glm, config, maxBatch, maxSeqLen, contextParallel, mtp);
+    const model = new Glm51Model(glm, config, contextParallel, mtp);
     await model.fromPretrained(modelDir);
     return model;
   }
@@ -314,12 +310,12 @@ export class Glm51Model extends ChatModel {
     }
   }
 
-  createChatCache(maxPages = 256, pageSize = 16): ChatCache {
+  createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, pageSize = 16): ChatCache {
     const cfg = this.cfg;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
     const nLayers = cfg.numHiddenLayers + (this.mtp ? cfg.numNextNPredictLayers ?? 0 : 0);
-    return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, this.maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel);
+    return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel);
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {

@@ -90,8 +90,8 @@ describe("CP vs non-CP model prefill", () => {
     glm1 = new GlmOps(1);
     glm2 = new GlmOps(2);
     po = new ParallelOps([glm1, glm2]);
-    modelRef = await Glm51Model.fromPretrained(glm0, SMALL_MODEL_DIR, MAX_BATCH, MAX_SEQ_LEN, false);
-    modelCp = await Glm51Model.fromPretrained(po, SMALL_MODEL_DIR, MAX_BATCH, MAX_SEQ_LEN, true);
+    modelRef = await Glm51Model.fromPretrained(glm0, SMALL_MODEL_DIR, false);
+    modelCp = await Glm51Model.fromPretrained(po, SMALL_MODEL_DIR, true);
     wsRef = new ExecutionWorkspace(glm0, MAX_BATCH, MAX_SEQ_LEN);
     wsCp = new ExecutionWorkspace(po, MAX_BATCH, MAX_SEQ_LEN);
   });

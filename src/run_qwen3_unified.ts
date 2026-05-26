@@ -563,7 +563,7 @@ async function main(): Promise<void> {
   if (args.meta) {
     const metaOps = new MetaOps();
     const model: ChatModel = args.useGlm51
-      ? await Glm51Model.fromPretrained(metaOps, modelDir, args.maxBatch, args.maxSeqLen, args.cp, args.mtp)
+      ? await Glm51Model.fromPretrained(metaOps, modelDir, args.cp, args.mtp)
       : args.useQwen35
         ? await Qwen35Model.fromPretrained(metaOps, modelDir)
         : await Qwen3Model.fromPretrained(metaOps, modelDir);
@@ -602,7 +602,7 @@ async function main(): Promise<void> {
       : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
 
   const model: ChatModel = args.useGlm51
-    ? await Glm51Model.fromPretrained(glm, modelDir, args.maxBatch, args.maxSeqLen, args.cp, args.mtp)
+    ? await Glm51Model.fromPretrained(glm, modelDir, args.cp, args.mtp)
     : args.useQwen35
       ? await Qwen35Model.fromPretrained(glm, modelDir)
       : await Qwen3Model.fromPretrained(glm, modelDir);
@@ -639,7 +639,7 @@ async function main(): Promise<void> {
       }
     }
   }
-  const cache = model.createChatCache(args.maxPages);
+  const cache = model.createChatCache(args.maxPages, args.maxBatch, args.maxSeqLen);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
 
   const tokenizerDir = args.modelDir && fs.existsSync(path.join(args.modelDir, "tokenizer_config.json"))

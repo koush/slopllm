@@ -37,7 +37,7 @@ function tokenizePrompt(tokenizer: any, prompt: string): number[] {
 }
 
 async function loadQwen3(glm: DeviceOps, repoId: string): Promise<ModelContext> {
-  const model = await Qwen3Model.fromPretrained(glm, repoId, 1, 128);
+  const model = await Qwen3Model.fromPretrained(glm, repoId);
   const ws = new ExecutionWorkspace(glm, 1, 128);
   const cache = new PagedKVCache(glm, model.cfg.numKeyValueHeads, model.cfg.headDim, model.cfg.numHiddenLayers, 256, 1);
   return {
