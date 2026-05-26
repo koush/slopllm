@@ -141,6 +141,12 @@ When `--cp` flag is set (GLM-5.1 only), all GPUs operate as context-parallel sha
 
 ## Testing
 
+## Scratchpad
+
+The `scratchpad/` directory is gitignored and intended for ad-hoc scripts, diagnostics, and experimentation. It is not checked in — use it for anything temporary that shouldn't pollute the repo (e.g., comparing hidden states across layers, debugging KV cache issues, testing new kernels in isolation).
+
+## Testing
+
 ```bash
 npm run build:all          # build CUDA addon + TypeScript (required before any tests)
 npm run test:python        # Python tests: pytest tests/python/ - validates CUDA kernels against PyTorch
