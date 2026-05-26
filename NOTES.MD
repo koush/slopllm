@@ -19,6 +19,7 @@ TypeScript inference engine for the GLM-5.1 model on NVIDIA GPUs. Ships a native
   - Named tensors: re-allocating with the same name disposes the old one, recycling its memory.
   - **`freeze()`**: after model loading, prevents further allocations — all weight addresses are stable for graph capture.
   - **`startTracking()`**: returns a scope that disposes all unnamed temporaries when exited, returning their memory to the pool for the next forward pass.
+- **`using` keyword**: Tensors implement `Disposable` via `[Symbol.dispose]()`. Use `using tensor = ws.alloc(...)` (TypeScript 5.2+ explicit resource management) to auto-dispose at scope exit. Named tensors (model weights) throw on dispose — only unnamed temporaries are disposable. `removeTracking()` opts a tensor out of tracking so it survives the `startTracking()` scope (used for forward pass outputs).
 - This pattern is what makes the inference loop graph-capturable: the same GPU addresses are reused each step deterministically.
 
 ### Allocator (`src/allocator.ts`)
