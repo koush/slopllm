@@ -73,14 +73,13 @@ export function mtpPrefill(
     rotatedIds.replace(source.rotateInputIds(ws.qoIndptrD, topkIndices, batchSize));
 
     // Forward through one MTP layer with rotated input
-    const hiddenStates = model.forwardMtp(state, targetHiddenStates, rotatedIds.value);
+    using hiddenStates = model.forwardMtp(state, targetHiddenStates, rotatedIds.value);
 
     // Sample top-1 from this layer's output for the next rotation
     using logits = state.computeLogits(hiddenStates, model);
-    hiddenStates[Symbol.dispose]();
     const topk = logits.topk(1, model.cfg.vocabSize);
+    using _values = topk.values;
     topkIndices = topk.indices; // [batchSize, 1] I32 — stride-compatible with rotateInputIds
-    topk.values[Symbol.dispose]();
 
     // Detach topk.indices so it survives the loop; caller disposes predictions.
     predictions.push(topk.indices);
@@ -220,9 +219,8 @@ export function mtpTreeDecode(
       ws.decodeStep(mtpState, model);
     }
 
-    const hiddenStates = model.forwardMtp!(mtpState, hs);
+    using hiddenStates = model.forwardMtp!(mtpState, hs);
     using logits = mtpState.computeLogits(hiddenStates, model);
-    hiddenStates[Symbol.dispose]();
 
     const topk = logits.topk(2, model.cfg.vocabSize);
     using _values = topk.values;
@@ -359,7 +357,6 @@ export function mtpVerify(
   // disposes all tracked tensors (including hostBuf), and subsequent allocPinned calls
   // can reuse the memory, corrupting any live views.
   const buf = Buffer.from(hostBuf.readPinnedBuffer());
-  hostBuf[Symbol.dispose]();
   const inputIdsList: number[][] = [];
   for (let path = 0; path < totalPaths; path++) {
     const row: number[] = [];
@@ -374,23 +371,20 @@ export function mtpVerify(
   const state = ws.planPrefill(model, totalPaths, seqLens, cache);
   state.setInput(inputIdsList);
 
-  const hiddenStates = model.forward(state);
+  using hiddenStates = model.forward(state);
   // Pass null (not undefined) for lastIdx — undefined triggers the default
   // parameter (this.ws.lastIdx, a truthy Tensor), which selects only the last
   // token per sequence via indexSelect. We need all-positions logits.
-  const logits = state.computeLogits(hiddenStates, model, null);
-  hiddenStates[Symbol.dispose]();
+  using logits = state.computeLogits(hiddenStates, model, null);
 
   // Argmax all positions: [totalPaths * suffixLen] I32
-  const argmaxResult = logits.argmax();
-  logits[Symbol.dispose]();
+  using argmaxResult = logits.argmax();
 
   // Read argmax to host (copy before any subsequent workspace allocations can reclaim the memory)
-  const argmaxHost = ws.allocPinned(argmaxResult.shape, argmaxResult.type);
+  using argmaxHost = ws.allocPinned(argmaxResult.shape, argmaxResult.type);
   argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
   ws.glm.synchronize();
   const argmaxBuf = Buffer.from(argmaxHost.readPinnedBuffer());
-  argmaxHost[Symbol.dispose]();
 
   // Verify: compare draft tokens vs target model argmax for each path.
   // Suffix = [currentToken, D0, D1, ..., D{nextn-1}] starting at originalAllocLen.
@@ -461,9 +455,6 @@ export function mtpVerify(
   pagedKV.positionIdsDirty = true;
   pagedKV.pagesDirtyHost = true;
   pagedKV.pagesDirtyDevice = true;
-
-  // Dispose tensors
-  argmaxResult[Symbol.dispose]();
 
   return { numAccepted: bestAccepted, acceptedTokens, replacementToken: bestReplacement };
 }
