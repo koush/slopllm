@@ -530,7 +530,7 @@ void glm_mla_prefill_plan(
       info,
       qo_indptr_h, kv_indptr_h, kv_len_h,
       batch_size, num_heads, head_dim_o,
-      causal, cp_world_size, cp_rank, GLM_STREAM(ctx));
+      causal, GLM_STREAM(ctx), cp_world_size, cp_rank);
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_mla_prefill_plan failed: %s\n", cudaGetErrorString(status));
