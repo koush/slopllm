@@ -435,11 +435,11 @@ export function mtpVerify(
   // Truncate seq 0 back to originalAllocLen. After prefill, allocLen =
   // originalAllocLen + suffixLen. Truncating discards the suffix KV entries.
   seq0.truncate(originalAllocLen);
-  const lastPageIdx = seq0.pages.length - 1;
-  if (lastPageIdx >= 0) {
-    const expected = tokenIds.length - lastPageIdx * pageSize;
-    if (seq0.pages[lastPageIdx].tokenIds.length > expected) {
-      seq0.pages[lastPageIdx].tokenIds.length = Math.max(0, expected);
+  const lastContentPageIdx = seq0.contentPages - 1;
+  if (lastContentPageIdx >= 0) {
+    const expected = tokenIds.length - lastContentPageIdx * pageSize;
+    if (seq0.pages[lastContentPageIdx].tokenIds.length > expected) {
+      seq0.pages[lastContentPageIdx].tokenIds.length = Math.max(0, expected);
     }
   }
 

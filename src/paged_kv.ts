@@ -16,21 +16,28 @@ function longestPrefix(a: number[], b: number[]): number {
 }
 
 // Pages are write-only until filled and ref-counted for cross-sequence sharing.
-// Only full pages (pageSize tokens) can be shared — a partial last page must never
+// Only full pages (pageSize tokens) can be shared — a partial page must never
 // be shared because the receiving sequence would need to write suffix tokens into it.
+// Empty pages (pre-allocated but unfilled) are never shared.
 export interface Page {
   id: number;
   tokenIds: number[];
   refs: number;
 }
 
-// Ordered list of pages with ref-counted sharing. Pages are filled sequentially
-// (all but the last are full), and tokenIds must never be mutated after writing.
+// Ordered list of pages with ref-counted sharing. The page structure is:
+// [full pages...] [optional partial page] [empty pages...]
+// Content pages = ceil(allocLen / pageSize). Empty pages are pre-allocated slots
+// beyond the content region. tokenIds must never be mutated after writing.
 export class Sequence {
   pages: Page[] = [];
   allocLen = 0;
 
   constructor(public pagedKvCache: PagedKVCache) {
+  }
+
+  get contentPages(): number {
+    return this.allocLen > 0 ? Math.ceil(this.allocLen / this.pagedKvCache.pageSize) : 0;
   }
 
   pushPage(page: Page, pageLen = this.pagedKvCache.pageSize) {
@@ -268,10 +275,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   }
 
   // Finds the best prefix match across all sequences and returns the unmatched suffix.
-  // Only full pages are kept/shared — the partial last page is never shared because
-  // the receiving sequence would write into it. For self-match, pages beyond the
-  // match are popped; for cross-match, full pages are sliced (ref-counted) into
-  // the target sequence. If the entire cache matches (self, no truncation needed),
+  // Only full pages are kept/shared — the partial page is never shared because
+  // the receiving sequence would write into it. Empty pages beyond the content
+  // region are discarded. If the entire cache matches (self, no truncation needed),
   // returns the suffix immediately without touching pages.
   prefixMatch(seqIdx: number, inputIds: number[], copyPartial?: boolean): number[] {
     this.ensureSequence(seqIdx);
@@ -407,7 +413,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       buf.writeInt32LE(0, 0);
       let cumulative = 0;
       for (let i = 0; i < batchSize; i++) {
-        cumulative += this.sequences[i].pages.length;
+        cumulative += this.sequences[i].contentPages;
         buf.writeInt32LE(cumulative, (i + 1) * I32);
       }
     });
@@ -415,8 +421,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.indicesH.withPinnedBuffer(buf => {
       let indicesOff = 0;
       for (let i = 0; i < batchSize; i++) {
-        for (const page of this.sequences[i].pages) {
-          buf.writeInt32LE(page.id, indicesOff * I32);
+        const contentPages = this.sequences[i].contentPages;
+        for (let j = 0; j < contentPages; j++) {
+          buf.writeInt32LE(this.sequences[i].pages[j].id, indicesOff * I32);
           indicesOff++;
         }
       }

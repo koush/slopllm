@@ -364,7 +364,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
 
     if (pagedKV.pagesDirtyDevice) {
-      const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.pages.length, 0);
+      const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.contentPages, 0);
       pagedKV.indices.memcpy(pagedKV.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
       this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
       pagedKV.pagesDirtyDevice = false;
@@ -490,7 +490,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     }
 
-    const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.pages.length, 0);
+    const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.contentPages, 0);
     pagedKV.indices.memcpy(pagedKV.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
     this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
