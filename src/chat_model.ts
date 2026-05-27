@@ -53,8 +53,13 @@ export abstract class ChatModel extends WorkspaceBase {
   }
 
   abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number): ChatCache;
-  abstract forward(state: ExecutionState): Tensor;
+  abstract forwardInternal(state: ExecutionState): Tensor;
   forwardMtp?(state: ExecutionState, previousHiddenState: Tensor, inputIds?: Tensor): Tensor;
+
+  forward(state: ExecutionState): Tensor {
+    using _tracker = state.ws.startTracking();
+    return this.forwardInternal(state);
+  }
 
   protected initInvFreq(ropeDim: number, ropeTheta: number): Tensor {
     const halfDim = ropeDim / 2;

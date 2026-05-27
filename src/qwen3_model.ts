@@ -103,9 +103,8 @@ export class Qwen3Model extends ChatModel {
     return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
   }
 
-  forward(state: ExecutionState): Tensor {
+  forwardInternal(state: ExecutionState): Tensor {
     const ws = state.ws;
-    using _tracker = ws.startTracking();
     const pagedKV = state.cache.getPagedKV();
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;

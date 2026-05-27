@@ -6,10 +6,10 @@ interface Captured {
 }
 
 export class CaptureManager implements Disposable {
+    disabled = false;
     captured = new Map<string, Captured>();
 
     constructor(public ops: DeviceOps) {
-
     }
 
     [Symbol.dispose]() {
@@ -23,24 +23,24 @@ export class CaptureManager implements Disposable {
 
     run(fn: () => void, keyParams?: any[]) {
         let capturing: string | undefined;
-        if (keyParams?.length) {
+        if (!this.disabled && keyParams?.length) {
             const key = keyParams.join(",");
             const captured = this.captured.get(key);
-        if (captured) {
-            if (captured.graphExec !== null) {
-                this.ops.graphLaunch(captured.graphExec);
-                return;
-            }
+            if (captured) {
+                if (captured.graphExec !== null) {
+                    this.ops.graphLaunch(captured.graphExec);
+                    return;
+                }
 
-            if (captured.warmupSteps === 3) {
-                this.ops.graphBeginCapture();
-                capturing = key;
+                if (captured.warmupSteps === 3) {
+                    this.ops.graphBeginCapture();
+                    capturing = key;
+                }
+                captured.warmupSteps++;
             }
-            captured.warmupSteps++;
-        }
-        else {
-            this.captured.set(key, { warmupSteps: 1, graphExec: null });
-        }
+            else {
+                this.captured.set(key, { warmupSteps: 1, graphExec: null });
+            }
         }
 
         fn();

@@ -88,7 +88,8 @@ export class ExecutionState {
 
   setInput(tokenIds: number[][]|Tensor) {
     if (tokenIds instanceof Tensor) {
-      this.input = tokenIds;
+      this.input = this.ws.inputIdsBuf;
+      this.input.memcpy(tokenIds, tokenIds.bytes, MemcpyKind.DeviceToDevice);
     }
     else {
       this.ws.inputIdsBufH.withPinnedBuffer(buf => {

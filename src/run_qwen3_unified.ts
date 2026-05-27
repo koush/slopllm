@@ -223,7 +223,7 @@ export function* generateStream(
   using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
   const nextn = (mtp && model.forwardMtp) ? (mtpDraftTokens ?? 3) : 0;
 
-  const useGraph = graphState !== undefined;
+  captureManager.disabled = graphState === undefined;
   {
     const inputIdsList = [suffixIds];
     const batchSize = inputIdsList.length;
@@ -236,8 +236,7 @@ export function* generateStream(
     doSample(firstTokens);
 
     if (mtp && model.forwardMtp && nextn > 0) {
-      const mtpPredictions = mtpPrefill(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn);
-      for (const pred of mtpPredictions) pred[Symbol.dispose]();
+      mtpPrefill(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn);
     }
   }
 
@@ -264,7 +263,7 @@ export function* generateStream(
   try {
     for (let i = 1; i < maxNewTokens; i++) {
       const tPlan = performance.now();
-      const state = ws.planDecode(model, 1, cache, useGraph);
+      const state = ws.planDecode(model, 1, cache, !captureManager.disabled);
       state.setInput(gpuSampleResult!);
       planMs += performance.now() - tPlan;
 
@@ -281,7 +280,7 @@ export function* generateStream(
         ws.decodeStep(state, model);
         targetHiddenStates.replace(model.forward(state));
         doSample(state.computeLogits(targetHiddenStates.value, model));
-      }, !useGraph ? undefined : ['decode']);
+      }, ['decode']);
 
       sampleResult ||= sampleWorkspace.allocPinned(gpuSampleResult!.shape, gpuSampleResult!.type);
       sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
@@ -297,7 +296,7 @@ export function* generateStream(
       if (eosIds.has(currentToken))
         return;
 
-      const isPostWarmupToken = !useGraph || captureManager.isCaptured(['decode']);
+      const isPostWarmupToken = captureManager.disabled || captureManager.isCaptured(['decode']);
       if (isPostWarmupToken) {
         const now = performance.now();
         if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
@@ -306,27 +305,13 @@ export function* generateStream(
       }
 
       if (mtp && model.forwardMtp && nextn > 0) {
-        const treeResult = mtpTreeDecode(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
-        using hostBuf = mtpTreeReadDrafts(treeResult, ws);
-        glm.synchronize();
-        const totalPaths = 1 << treeResult.nextn;
-        const rowLen = treeResult.nextn + 1;
-        const buf = Buffer.from(hostBuf.readPinnedBuffer());
-        const rootId = buf.readInt32LE(0);
-        console.log(`MTP target=${tokenizer?.decode([rootId]) ?? rootId}`);
-        for (let row = 0; row < totalPaths; row++) {
-          const ids: number[] = [];
-          for (let col = 1; col < rowLen; col++) ids.push(buf.readInt32LE((row * rowLen + col) * 4));
-          console.log(`  [${row}] ${ids.map(id => tokenizer?.decode([id]) ?? `?${id}`).join(" ")}`);
-        }
-
-        const verifyResult = mtpVerify(model, ws, cache, treeResult, hostBuf, tokenizer);
-        console.log(`MTP accepted=${verifyResult.numAccepted}/${nextn} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
-        if (verifyResult.acceptedTokens.length > 0) {
-          console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer?.decode([t]) ?? `?${t}`).join(" ")}`);
-        }
-
-        treeResult.validationSequences[Symbol.dispose]();
+        const treeResult = mtpTreeDecode(state, captureManager, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
+        using validationSequences = treeResult.validationSequences;
+        // const verifyResult = mtpVerify(model, ws, cache, treeResult, validationSequences, tokenizer);
+        // console.log(`MTP accepted=${verifyResult.numAccepted}/${nextn} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
+        // if (verifyResult.acceptedTokens.length > 0) {
+        //   console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer?.decode([t]) ?? `?${t}`).join(" ")}`);
+        // }
       }
     }
   } finally {
@@ -554,8 +539,8 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   const modelDir = args.modelDir ?? (args.useGlm51
-    ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
-    // ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
+    // ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
+    ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
     : resolveModelPath(args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO)));
 
   if (args.meta) {

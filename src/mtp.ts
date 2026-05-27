@@ -1,3 +1,4 @@
+import { CaptureManager } from "./capture-manager";
 import { type ChatCache, type ChatModel } from "./chat_model";
 import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { I32 } from "./glm_ops";
@@ -52,7 +53,7 @@ export function mtpPrefill(
   ws: ExecutionWorkspace,
   gpuSampleResult: Tensor,
   nextn: number,
-): Tensor[] {
+) {
   if (!model.forwardMtp) {
     throw new Error("mtpPrefill: model does not support MTP (forwardMtp not defined)");
   }
@@ -60,8 +61,7 @@ export function mtpPrefill(
   const batchSize = state.batchSize;
   // topkIndices tracks the rotation token for the next layer.
   // Layer 0 uses the target model's sampled token; layers 1+ use the previous MTP layer's top-1.
-  let topkIndices: Tensor = gpuSampleResult;
-  const predictions: Tensor[] = [];
+  using topkIndices = new UsingHolder<Tensor>(undefined!);
 
   // rotatedIds ping-pongs between workspace allocations.
   // Source for layer 0 is state.input (the original prompt tokens).
@@ -70,7 +70,7 @@ export function mtpPrefill(
   for (let i = 0; i < nextn; i++) {
     // Rotate input IDs: shift each sequence left by 1, append previous prediction
     const source = rotatedIds.value ?? state.input!;
-    rotatedIds.replace(source.rotateInputIds(ws.qoIndptrD, topkIndices, batchSize));
+    rotatedIds.replace(source.rotateInputIds(ws.qoIndptrD, topkIndices.value || gpuSampleResult, batchSize));
 
     // Forward through one MTP layer with rotated input
     using hiddenStates = model.forwardMtp(state, targetHiddenStates, rotatedIds.value);
@@ -79,13 +79,8 @@ export function mtpPrefill(
     using logits = state.computeLogits(hiddenStates, model);
     const topk = logits.topk(1, model.cfg.vocabSize);
     using _values = topk.values;
-    topkIndices = topk.indices; // [batchSize, 1] I32 — stride-compatible with rotateInputIds
-
-    // Detach topk.indices so it survives the loop; caller disposes predictions.
-    predictions.push(topk.indices);
+    topkIndices.replace(topk.indices); // [batchSize, 1] I32 — stride-compatible with rotateInputIds
   }
-
-  return predictions;
 }
 
 /**
@@ -149,6 +144,7 @@ export interface MtpTreeResult {
  */
 export function mtpTreeDecode(
   state: ExecutionState,
+  captureManager: CaptureManager,
   model: ChatModel,
   targetHiddenStates: Tensor,
   ws: ExecutionWorkspace,
@@ -312,7 +308,7 @@ export interface MtpVerifyResult {
  * @param ws - Execution workspace
  * @param cache - Chat cache (paged KV cache)
  * @param treeResult - MtpTreeResult from mtpTreeDecode
- * @param hostBuf - Pinned host buffer from mtpTreeReadDrafts (synchronized).
+ * @param validationSequences - Pinned host buffer from mtpTreeReadDrafts (synchronized).
  *   Consumed (disposed) by this function — the data is copied before the forward pass
  *   to avoid corruption from workspace tensor recycling.
  * @param tokenizer - Optional tokenizer for debug logging
@@ -323,7 +319,7 @@ export function mtpVerify(
   ws: ExecutionWorkspace,
   cache: ChatCache,
   treeResult: MtpTreeResult,
-  hostBuf: Tensor,
+  validationSequences: Tensor,
   tokenizer?: any,
 ): MtpVerifyResult {
   const pagedKV = cache.getPagedKV();
@@ -352,26 +348,18 @@ export function mtpVerify(
   for (let i = 1; i < totalPaths; i++) {
     pagedKV.copySequence(i, 0);
   }
-
-  // Copy host buffer data before the forward pass — forwardTarget's startTracking()
-  // disposes all tracked tensors (including hostBuf), and subsequent allocPinned calls
-  // can reuse the memory, corrupting any live views.
-  const buf = Buffer.from(hostBuf.readPinnedBuffer());
-  const inputIdsList: number[][] = [];
-  for (let path = 0; path < totalPaths; path++) {
-    const row: number[] = [];
-    for (let col = 0; col <= nextn; col++) {
-      row.push(buf.readInt32LE((path * (nextn + 1) + col) * 4));
-    }
-    inputIdsList.push(row);
-  }
+  
+  using hostBuf = ws.allocPinned(validationSequences.shape, validationSequences.type);
+  using stream = ws.glm.withStream(() => {
+    hostBuf.memcpy(validationSequences, validationSequences.bytes, MemcpyKind.DeviceToHost);
+  });
 
   // Run verification prefill: batch=totalPaths, each sequence gets suffixLen tokens
   const seqLens = new Array(totalPaths).fill(suffixLen) as number[];
   const state = ws.planPrefill(model, totalPaths, seqLens, cache);
-  state.setInput(inputIdsList);
+  state.setInput(validationSequences);
 
-  using hiddenStates = model.forward(state);
+  using hiddenStates = model.forwardInternal(state);
   // Pass null (not undefined) for lastIdx — undefined triggers the default
   // parameter (this.ws.lastIdx, a truthy Tensor), which selects only the last
   // token per sequence via indexSelect. We need all-positions logits.
@@ -383,8 +371,6 @@ export function mtpVerify(
   // Read argmax to host (copy before any subsequent workspace allocations can reclaim the memory)
   using argmaxHost = ws.allocPinned(argmaxResult.shape, argmaxResult.type);
   argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
-  ws.glm.synchronize();
-  const argmaxBuf = Buffer.from(argmaxHost.readPinnedBuffer());
 
   // Verify: compare draft tokens vs target model argmax for each path.
   // Suffix = [currentToken, D0, D1, ..., D{nextn-1}] starting at originalAllocLen.
@@ -394,10 +380,15 @@ export function mtpVerify(
   let bestAccepted = -1;
   let bestReplacement = -1;
 
+  stream.synchronize();
+  ws.glm.synchronize();
+  const argmaxBuf = Buffer.from(argmaxHost.readPinnedBuffer());
+  const validationSequencesBuf = Buffer.from(hostBuf.readPinnedBuffer());
+
   for (let path = 0; path < totalPaths; path++) {
     let accepted = 0;
     for (let j = 0; j < nextn; j++) {
-      const draftToken = buf.readInt32LE((path * (nextn + 1) + j + 1) * 4);
+      const draftToken = validationSequencesBuf.readInt32LE((path * (nextn + 1) + j + 1) * 4);
       const targetToken = argmaxBuf.readInt32LE((path * suffixLen + j) * 4);
       if (draftToken === targetToken) {
         accepted++;
@@ -415,24 +406,24 @@ export function mtpVerify(
 
   const acceptedTokens: number[] = [];
   for (let j = 0; j < bestAccepted; j++) {
-    acceptedTokens.push(buf.readInt32LE((bestPath * (nextn + 1) + j + 1) * 4));
+    acceptedTokens.push(validationSequencesBuf.readInt32LE((bestPath * (nextn + 1) + j + 1) * 4));
   }
 
   // Log verification results
-  const currentToken = buf.readInt32LE(0);
-  console.log(`MTP Verify: root=${tokenizer?.decode([currentToken]) ?? currentToken} best=[${bestPath}] accepted=${bestAccepted}/${nextn} replacement=${tokenizer?.decode([bestReplacement]) ?? bestReplacement}`);
-  for (let path = 0; path < totalPaths; path++) {
-    const parts: string[] = [];
-    for (let j = 0; j < nextn; j++) {
-      const draftToken = buf.readInt32LE((path * (nextn + 1) + j + 1) * 4);
-      const targetToken = argmaxBuf.readInt32LE((path * suffixLen + j) * 4);
-      const ok = draftToken === targetToken;
-      parts.push(`${ok ? "✓" : "✗"}${tokenizer?.decode([draftToken]) ?? `?${draftToken}`}`);
-      if (!ok) break;
-    }
-    const marker = path === bestPath ? "*" : " ";
-    console.log(`  ${marker}[${path}] ${parts.join(" ")}`);
-  }
+  // const currentToken = validationSequencesBuf.readInt32LE(0);
+  // console.log(`MTP Verify: root=${tokenizer?.decode([currentToken]) ?? currentToken} best=[${bestPath}] accepted=${bestAccepted}/${nextn} replacement=${tokenizer?.decode([bestReplacement]) ?? bestReplacement}`);
+  // for (let path = 0; path < totalPaths; path++) {
+  //   const parts: string[] = [];
+  //   for (let j = 0; j < nextn; j++) {
+  //     const draftToken = validationSequencesBuf.readInt32LE((path * (nextn + 1) + j + 1) * 4);
+  //     const targetToken = argmaxBuf.readInt32LE((path * suffixLen + j) * 4);
+  //     const ok = draftToken === targetToken;
+  //     parts.push(`${ok ? "✓" : "✗"}${tokenizer?.decode([draftToken]) ?? `?${draftToken}`}`);
+  //     if (!ok) break;
+  //   }
+  //   const marker = path === bestPath ? "*" : " ";
+  //   console.log(`  ${marker}[${path}] ${parts.join(" ")}`);
+  // }
 
   // Cleanup: pop forked sequences and restore seq 0 to original state.
   // We don't integrate accepted KV entries yet — just restore and return results.
