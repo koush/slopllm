@@ -31,9 +31,10 @@
                 "--greedy",
                 // "--nvfp4",
                 // "--arena", "92",
-                "--no-cuda-graph",
+                // "--no-cuda-graph",
                 "--cp",
                 "--mtp",
+                "--max-new-tokens", "2000",
             ],
             "skipFiles": [
                 "<node_internals>/**"

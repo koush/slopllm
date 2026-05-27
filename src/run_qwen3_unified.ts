@@ -307,11 +307,11 @@ export function* generateStream(
       if (mtp && model.forwardMtp && nextn > 0) {
         const treeResult = mtpTreeDecode(state, captureManager, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
         using validationSequences = treeResult.validationSequences;
-        // const verifyResult = mtpVerify(model, ws, cache, treeResult, validationSequences, tokenizer);
-        // console.log(`MTP accepted=${verifyResult.numAccepted}/${nextn} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
-        // if (verifyResult.acceptedTokens.length > 0) {
-        //   console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer?.decode([t]) ?? `?${t}`).join(" ")}`);
-        // }
+        const verifyResult = mtpVerify(model, ws, cache, treeResult, validationSequences, tokenizer);
+        console.log(`MTP accepted=${verifyResult.numAccepted}/${nextn} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
+        if (verifyResult.acceptedTokens.length > 0) {
+          console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer?.decode([t]) ?? `?${t}`).join(" ")}`);
+        }
       }
     }
   } finally {

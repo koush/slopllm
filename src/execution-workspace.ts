@@ -293,6 +293,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
   planDecode(model: ChatModel, batchSize: number, cache: ChatCache, enableCudaGraph = false): ExecutionState {
     const pagedKV = cache.getPagedKV();
+    pagedKV.checkSequenceCount();
     const cfg = model.cfg;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
@@ -375,6 +376,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
   planPrefill(model: ChatModel, batchSize: number, seqLens: number[], cache: ChatCache): ExecutionState {
     const pagedKV = cache.getPagedKV();
+    pagedKV.checkSequenceCount();
     const cfg = model.cfg;
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;

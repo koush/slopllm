@@ -168,23 +168,14 @@ export function mtpTreeDecode(
   const rowLen = nextn + 1;
   const validationSequences = ws.alloc([totalPaths * rowLen], "I32");
 
-  for (let j = 0; j < totalPaths; j++) {
-    validationSequences.memcpy2d(
-      j * rowLen * 4, rowLen * 4,
-      gpuSampleResult, 0, 4,
-      4, 1,
-      MemcpyKind.DeviceToDevice,
-    );
-  }
-
 
   let nextInput: Tensor = gpuSampleResult;
-  state.setInput(nextInput);
 
   let total = 1;
   using doubledTargetHs = new UsingHolder<Tensor>(undefined!);
+  const mtpAdvance = nextn - 1;
 
-  for (let i = 0; i < nextn; i++) {
+  for (let i = 0; i < nextn; i++, total *= 2) {
     const batchSize = 1 << i;
 
     if (total > 1) {
@@ -193,58 +184,68 @@ export function mtpTreeDecode(
       }
     }
 
-    if (batchSize > 1) {
-      const prev: Tensor = doubledTargetHs.value ?? targetHiddenStates;
-      doubledTargetHs.replace(prev.cat([prev], 0));
-    }
-    const hs = batchSize === 1 ? targetHiddenStates : doubledTargetHs.value!;
+    const mtpState = i === 0 ? state : ws.planDecode(model, batchSize, cache);
 
-    let mtpState: ExecutionState;
-    if (i === 0) {
-      // Iteration 0: process at the target model's decode position (S).
-      // The target model already allocated the slot at S and set up the decode
-      // plan. Skipping planDecode/decodeStep avoids advancing past position S,
-      // which would leave a gap in the MTP KV cache (no entry at S) and cause
-      // the MTP to process at S+1 instead of S.
-      mtpState = state;
-    } else {
-      pagedKV.positionIdsDirty = true;
-      pagedKV.pagesDirtyHost = true;
-      mtpState = ws.planDecode(model, batchSize, cache);
+    captureManager.run(() => {
       mtpState.setInput(nextInput.reshape([nextInput.numElements]));
-      ws.decodeStep(mtpState, model);
-    }
-
-    using hiddenStates = model.forwardMtp!(mtpState, hs);
-    using logits = mtpState.computeLogits(hiddenStates, model);
-
-    const topk = logits.topk(2, model.cfg.vocabSize);
-    using _values = topk.values;
-    using indices = topk.indices;
-
-    const batch = total * 2;
-    const half = batch / 2;
-
-    const fanout = totalPaths >>> (i + 1);
-    for (let j = 0; j < batch; j++) {
-      for (let k = 0; k < fanout; k++) {
-        validationSequences.memcpy2d(
-          ((j * fanout + k) * rowLen + i + 1) * 4, rowLen * 4,
-          indices, j * 4, 4,
-          4, 1,
-          MemcpyKind.DeviceToDevice,
-        );
+      if (i !== 0) {
+        // Iteration 0: process at the target model's decode position (S).
+        // The target model already allocated the slot at S and set up the decode
+        // plan. Skipping planDecode/decodeStep avoids advancing past position S,
+        // which would leave a gap in the MTP KV cache (no entry at S) and cause
+        // the MTP to process at S+1 instead of S.
+        ws.decodeStep(mtpState, model);
       }
-    }
+      else {
+        for (let j = 0; j < totalPaths; j++) {
+          validationSequences.memcpy2d(
+            j * rowLen * 4, rowLen * 4,
+            gpuSampleResult, 0, 4,
+            4, 1,
+            MemcpyKind.DeviceToDevice,
+          );
+        }
+      }
 
-    if (i < nextn - 1) {
-      const reordered = ws.alloc(topk.indices.shape, topk.indices.type);
-      reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
-      reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
-      nextInput = reordered;
-    }
+      if (batchSize > 1) {
+        const prev: Tensor = doubledTargetHs.value ?? targetHiddenStates;
+        doubledTargetHs.replace(prev.cat([prev], 0));
+      }
+      const hs = batchSize === 1 ? targetHiddenStates : doubledTargetHs.value!;
 
-    total *= 2;
+      using hiddenStates = model.forwardMtp!(mtpState, hs);
+      using logits = mtpState.computeLogits(hiddenStates, model);
+
+      const topk = logits.topk(2, model.cfg.vocabSize);
+      using _values = topk.values;
+      using indices = topk.indices;
+
+      const batch = total * 2;
+      const half = batch / 2;
+
+      const fanout = totalPaths >>> (i + 1);
+      for (let j = 0; j < batch; j++) {
+        for (let k = 0; k < fanout; k++) {
+          validationSequences.memcpy2d(
+            ((j * fanout + k) * rowLen + i + 1) * 4, rowLen * 4,
+            indices, j * 4, 4,
+            4, 1,
+            MemcpyKind.DeviceToDevice,
+          );
+        }
+      }
+
+      if (i < nextn - 1) {
+        const reordered = ws.alloc(topk.indices.shape, topk.indices.type);
+        reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
+        reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
+        nextInput = reordered;
+      }
+      else {
+        // on final iteration, roll back the decode positionid state
+        ws.decodeStep(state, model, -mtpAdvance);
+      }
+    }, ['mtp-tree', `layer${i}`]);
   }
 
   for (let i = 0; i < total / 2 - 1; i++) {
@@ -254,13 +255,8 @@ export function mtpTreeDecode(
 
   // Iteration 0 does not advance the position (no planDecode/decodeStep),
   // so only nextn-1 positions were allocated beyond the target model's slot.
-  const mtpAdvance = nextn - 1;
   const seq0 = pagedKV.sequences[0];
   seq0.truncate(seq0.allocLen - mtpAdvance);
-  pagedKV.positionIdsDirty = true;
-  pagedKV.pagesDirtyHost = true;
-  pagedKV.pagesDirtyDevice = true;
-  ws.decodeStep(state, model, -mtpAdvance);
 
   return { validationSequences, nextn };
 }

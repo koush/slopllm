@@ -136,8 +136,18 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   pagesDirtyHost: boolean;
   pagesDirtyDevice: boolean;
   positionIdsDirty: boolean;
+  lastNumSequences: number;
 
   getPagedKV(): PagedKVCache { return this; }
+
+  checkSequenceCount(): void {
+    if (this.sequences.length !== this.lastNumSequences) {
+      this.pagesDirtyHost = true;
+      this.pagesDirtyDevice = true;
+      this.positionIdsDirty = true;
+    }
+    this.lastNumSequences = this.sequences.length;
+  }
 
   constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false) {
     super(glm);
@@ -169,6 +179,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.pagesDirtyHost = true;
     this.pagesDirtyDevice = true;
     this.positionIdsDirty = true;
+    this.lastNumSequences = 0;
   }
 
   reset(batchSize: number): void {
@@ -250,6 +261,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   copySequence(dstSeqIdx: number, srcSeqIdx: number) {
     if (dstSeqIdx === srcSeqIdx)
       return;
+    this.positionIdsDirty = true;
     const srcSeq = this.sequences[srcSeqIdx];
     const dstSeq = this.ensureSequence(dstSeqIdx);
 
@@ -281,6 +293,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   // returns the suffix immediately without touching pages.
   prefixMatch(seqIdx: number, inputIds: number[], copyPartial?: boolean): number[] {
     this.ensureSequence(seqIdx);
+    this.positionIdsDirty = true;
 
     let bestSeqIdx = -1;
     let bestMatchTokens = 0;
