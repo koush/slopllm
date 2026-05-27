@@ -406,18 +406,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   }
 
   allocDecodeToken(seqIdx: number): void {
-    const sequence = this.sequences[seqIdx];
-    const allocLen = sequence.allocLen;
-    const pageIdxInSeq = Math.floor(allocLen / this.pageSize);
-    if (pageIdxInSeq >= sequence.pages.length) {
-      if (this.availablePages.length === 0) {
-        throw new Error(`allocDecodeToken: no pages available`);
-      }
-      const pageId = this.availablePages.shift()!;
-      const page: Page = { id: pageId, tokenIds: [], refs: 0 };
-      sequence.pushPage(page, 0);
-    }
-    sequence.allocLen = allocLen + 1;
+    this.allocAppendPages(seqIdx, 1);
   }
 
   updateIndptr(ws: ExecutionWorkspace): void {
