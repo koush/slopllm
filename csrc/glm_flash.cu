@@ -558,16 +558,17 @@ void glm_mla_prefill_run(
     uint32_t o_stride_n, uint32_t o_stride_h,
     uint32_t head_dim_ckv, uint32_t head_dim_kpe,
     float* lse,
-    uint32_t cp_world_size, uint32_t cp_rank) {
+    uint32_t cp_world_size, uint32_t cp_rank,
+    void* custom_mask, int32_t* mask_indptr) {
 
   cudaSetDevice(ctx->device_id);
 
   using MLAParams = flashinfer::MLAParams<DType, DType, DTypeO, IdType>;
 
   flashinfer::MLAPlanInfo info;
-  info.FromVector(std::vector<int64_t>(plan_info, plan_info + 18));
+  info.FromVector(std::vector<int64_t>(plan_info, plan_info + 19));
 
-  MLAParams params;
+  MLAParams params = {};
   params.q_nope = static_cast<DType*>(q_nope);
   params.q_pe = static_cast<DType*>(q_pe);
   params.ckv = static_cast<DType*>(ckv_data);
@@ -613,6 +614,10 @@ void glm_mla_prefill_run(
   params.cp_world_size = cp_world_size;
   params.cp_rank = cp_rank;
 
+  params.maybe_custom_mask = static_cast<uint8_t*>(custom_mask);
+  params.maybe_mask_indptr = mask_indptr;
+  params.batch_indices = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.batch_indices_offset);
+
   flashinfer::MaskMode flash_mask = static_cast<flashinfer::MaskMode>(mask_mode);
 
   cudaError_t status;
@@ -620,6 +625,10 @@ void glm_mla_prefill_run(
     if (flash_mask == flashinfer::MaskMode::kCausal) {
       status = flashinfer::mla::BatchMLAPagedAttention<
           flashinfer::MaskMode::kCausal, HEAD_DIM_CKV, HEAD_DIM_KPE, MLAParams>(
+          params, info.num_blks_x, info.num_blks_y, GLM_STREAM(ctx));
+    } else if (flash_mask == flashinfer::MaskMode::kCustom) {
+      status = flashinfer::mla::BatchMLAPagedAttention<
+          flashinfer::MaskMode::kCustom, HEAD_DIM_CKV, HEAD_DIM_KPE, MLAParams>(
           params, info.num_blks_x, info.num_blks_y, GLM_STREAM(ctx));
     } else {
       status = flashinfer::mla::BatchMLAPagedAttention<

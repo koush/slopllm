@@ -248,7 +248,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, contextParallel?: boolean): { o: Tensor, lse: Tensor } {
+  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, contextParallel?: boolean, maskMode: number = 1, customMask?: Tensor, maskIndptr?: Tensor): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const pageSize = pagedKV.pageSize;
@@ -267,12 +267,13 @@ export class ExecutionWorkspace extends WorkspaceBase {
       pagedKV.indices,
       this.floatWs, this.intWs,
       this.mlaPrefillPlanInfo,
-      nHeads, pageSize, 1, smScale,
+      nHeads, pageSize, maskMode, smScale,
       qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH,
       ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
       oStrideN, oStrideH,
       headDimCkv, headDimKpe,
-      contextParallel
+      contextParallel, undefined, undefined,
+      customMask, maskIndptr
     );
   }
 

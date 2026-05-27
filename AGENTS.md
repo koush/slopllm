@@ -167,3 +167,7 @@ GLM_GPUS=0,1 npx tsx --test tests/test_parallel.ts  # multi-GPU
 - **P2P AllReduce**: custom kernel for small AllReduce/AllGather avoids NCCL overhead for partial sums in tensor-parallel decode.
 - **Multi-stream**: `GlmOps.withStream()` provides alternate CUDA streams with event-based synchronization. Used in GLM-5.1 MoE to overlap shared expert computation with routed expert computation.
 - **Strided mmap loading**: weight tensors loaded via `memcpy2dHostToDeviceAsync` with pitch/width/height for row-parallel or column-parallel sharding, avoiding host-side copies.
+
+## Vendor
+
+The vendor subdirectory contains flashinfer, llama.cpp, vllm, and sglang, and can be serve as a reference for implementations of cuda kernels or other algorithms like MTP. Flashinfer has been forked to add support for context parallelism.

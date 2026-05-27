@@ -1661,7 +1661,7 @@ static Napi::Value MlaPrefillPlan(const Napi::CallbackInfo& info) {
 static Napi::Value MlaPrefillRun(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 29) {
-        Napi::TypeError::New(env, "Expected (ctx, q_nope, q_pe, ckv_data, kpe_data, kv_indices, o, float_ws, int_ws, plan_info, num_heads, page_size, mask_mode, sm_scale, q_nope_stride_n, q_nope_stride_h, q_pe_stride_n, q_pe_stride_h, ckv_stride_page, ckv_stride_n, kpe_stride_page, kpe_stride_n, o_stride_n, o_stride_h, head_dim_ckv, head_dim_kpe, lse, cp_world_size, cp_rank) — note 29+ params").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, q_nope, q_pe, ckv_data, kpe_data, kv_indices, o, float_ws, int_ws, plan_info, num_heads, page_size, mask_mode, sm_scale, q_nope_stride_n, q_nope_stride_h, q_pe_stride_n, q_pe_stride_h, ckv_stride_page, ckv_stride_n, kpe_stride_page, kpe_stride_n, o_stride_n, o_stride_h, head_dim_ckv, head_dim_kpe, lse, cp_world_size, cp_rank[, custom_mask, mask_indptr])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1693,6 +1693,12 @@ static Napi::Value MlaPrefillRun(const Napi::CallbackInfo& info) {
     uintptr_t lse_ptr = info[26].As<Napi::Number>().Int64Value();
     uint32_t cp_world_size = info[27].As<Napi::Number>().Uint32Value();
     uint32_t cp_rank = info[28].As<Napi::Number>().Uint32Value();
+    void* custom_mask_ptr = nullptr;
+    int32_t* mask_indptr_ptr = nullptr;
+    if (info.Length() >= 31) {
+        custom_mask_ptr = reinterpret_cast<void*>(info[29].As<Napi::Number>().Int64Value());
+        mask_indptr_ptr = reinterpret_cast<int32_t*>(info[30].As<Napi::Number>().Int64Value());
+    }
     glm_mla_prefill_run(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(q_nope_ptr), reinterpret_cast<void*>(q_pe_ptr),
@@ -1708,7 +1714,8 @@ static Napi::Value MlaPrefillRun(const Napi::CallbackInfo& info) {
         o_stride_n, o_stride_h,
         head_dim_ckv, head_dim_kpe,
         reinterpret_cast<float*>(lse_ptr),
-        cp_world_size, cp_rank);
+        cp_world_size, cp_rank,
+        custom_mask_ptr, mask_indptr_ptr);
     {
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
