@@ -7,7 +7,7 @@ import { WorkspaceBase } from "./workspace";
 
 export const DECODE_PLAN_INFO_SIZE = 10;
 export const PREFILL_PLAN_INFO_SIZE = 15;
-export const MLA_PREFILL_PLAN_INFO_SIZE = 18;
+export const MLA_PREFILL_PLAN_INFO_SIZE = 19;
 export const MLA_DECODE_PLAN_INFO_SIZE = 10;
 
 

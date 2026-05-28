@@ -108,7 +108,7 @@ function runMlaPrefill(
   const floatWs = allocBf16(ws, [128 * 1024 * 1024 / 2]);
   const intWs = allocI32(ws, [8 * 1024 * 1024 / 4]);
   const pinnedIntWs = allocPinnedI32(ws, [8 * 1024 * 1024 / 4]);
-  const planInfo = allocPinnedI32(ws, [18]);
+  const planInfo = allocPinnedI32(ws, [19]);
 
   const kvLenH = allocPinnedI32(ws, [batchSize]);
   kvLenH.h2d(i32Buf(new Int32Array([globalKvLen])));
