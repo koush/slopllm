@@ -21,7 +21,7 @@ export class CaptureManager implements Disposable {
         this.captured.clear();
     }
 
-    run(fn: () => void, keyParams?: any[]) {
+    run(fn: (capturing: boolean) => void, keyParams?: any[]) {
         let capturing: string | undefined;
         if (!this.disabled && keyParams?.length) {
             const key = keyParams.join(",");
@@ -43,7 +43,7 @@ export class CaptureManager implements Disposable {
             }
         }
 
-        fn();
+        fn(!!capturing);
 
         if (capturing) {
             const graph = this.ops.graphEndCapture();

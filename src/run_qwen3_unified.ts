@@ -10,7 +10,7 @@ import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { MetaOps } from "./meta_ops";
 import { resolveModelPath } from "./model_path";
-import { mtpPrefill, mtpTreeDecode, mtpTreeReadDrafts, mtpVerify } from "./mtp";
+import { mtpPrefill, mtpTreeDecode, mtpVerify } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
 import { Qwen35Model } from "./qwen35_model";
 import { Qwen3Model } from "./qwen3_model";
@@ -202,25 +202,24 @@ export function* generateStream(
   const greedy = !sampling;
   let sampleResult: Tensor | null = null;
   let gpuSampleResult: Tensor | null = null;
-  const sampledLogits = new UsingHolder<Tensor>(undefined!);
   using samplingWorkspace = sampling ? new SamplingWorkspace(glm, 1, model.cfg.vocabSize, sampling!.repetitionPenaltyWindow) : undefined;
   if (samplingWorkspace) samplingWorkspace.updateSampler([sampling!], [inputIds]);
   function doSample(logits: Tensor) {
     if (greedy) {
-      sampledLogits.replace(logits.argmax());
+      using argmax = logits.argmax();
+      gpuSampleResult ||= sampleWorkspace.alloc(argmax.shape, argmax.type);
+      gpuSampleResult.memcpy(argmax, argmax.bytes, MemcpyKind.DeviceToDevice);
     }
     else {
-      sampledLogits.replace(samplingWorkspace!.sample(logits));
+      using sampled = samplingWorkspace!.sample(logits);
+      gpuSampleResult ||= sampleWorkspace.alloc(sampled.shape, sampled.type);
+      gpuSampleResult.memcpy(sampled, sampled.bytes, MemcpyKind.DeviceToDevice);
     }
-    const argmaxValue = sampledLogits.value;
-    gpuSampleResult ||= sampleWorkspace.alloc(argmaxValue.shape, argmaxValue.type);
-    gpuSampleResult.memcpy(argmaxValue, argmaxValue.bytes, MemcpyKind.DeviceToDevice);
   }
 
   const tokenHistory = inputIds.slice();
 
   using captureManager = new CaptureManager(glm);
-  using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
   const nextn = (mtp && model.forwardMtp) ? (mtpDraftTokens ?? 3) : 0;
 
   captureManager.disabled = graphState === undefined;
@@ -230,13 +229,13 @@ export function* generateStream(
     const seqLens = inputIdsList.map(ids => ids.length);
     const state = ws.planPrefill(model, batchSize, seqLens, cache);
     state.setInput(inputIdsList);
-    targetHiddenStates.replace(model.forward(state));
+    using targetHiddenStates = model.forward(state);
 
-    using firstTokens = state.computeLogits(targetHiddenStates.value, model);
+    using firstTokens = state.computeLogits(targetHiddenStates, model);
     doSample(firstTokens);
 
     if (mtp && model.forwardMtp && nextn > 0) {
-      mtpPrefill(state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn);
+      mtpPrefill(state, model, targetHiddenStates, ws, gpuSampleResult!, nextn);
     }
   }
 
@@ -261,6 +260,8 @@ export function* generateStream(
   let tAfterSync = 0;
 
   try {
+    using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
+
     for (let i = 1; i < maxNewTokens; i++) {
       const tPlan = performance.now();
       const state = ws.planDecode(model, 1, cache, !captureManager.disabled);
@@ -306,8 +307,7 @@ export function* generateStream(
 
       if (mtp && model.forwardMtp && nextn > 0) {
         const treeResult = mtpTreeDecode(state, captureManager, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
-        using validationSequences = treeResult.validationSequences;
-        // const verifyResult = mtpVerify(model, ws, cache, treeResult, validationSequences, tokenizer);
+        // const verifyResult = mtpVerify(model, ws, cache, treeResult, tokenizer);
         // console.log(`MTP accepted=${verifyResult.numAccepted}/${nextn} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
         // if (verifyResult.acceptedTokens.length > 0) {
         //   console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer?.decode([t]) ?? `?${t}`).join(" ")}`);

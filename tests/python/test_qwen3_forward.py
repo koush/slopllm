@@ -17,24 +17,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(scope="module")
-def qwen3_model(glm):
-    model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=1, max_seq_len=16)
-    yield model
-    model.free()
-    gc.collect(); torch.cuda.empty_cache()
-
-
-def test_qwen3_forward_vs_reference(qwen3_model, glm):
-    model = qwen3_model
+def test_qwen3_forward_vs_reference(glm):
     device = torch.device("cuda", glm.device)
-    cfg = model.cfg
-    B, S = 1, 8
+    model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=1, max_seq_len=16)
 
     input_ids = torch.tensor([[151643, 151644, 151645, 1, 2, 3, 4, 5]], dtype=torch.int64, device=device)
 
     our_logits = model.forward(input_ids)
 
+    cfg = model.cfg
     weights = load_qwen3_weights(device)
     ref_logits = qwen3_model_torch(input_ids, weights, cfg)
 
@@ -48,6 +39,11 @@ def test_qwen3_forward_vs_reference(qwen3_model, glm):
     our_top5 = our_logits[0, -1].topk(5).indices.tolist()
     ref_top5 = ref_logits[0, -1].topk(5).indices.tolist()
     assert our_top5 == ref_top5, f"Top-5 mismatch: ours={our_top5}, ref={ref_top5}"
+
+    del weights
+    model.free()
+    del model
+    gc.collect(); torch.cuda.empty_cache()
 
 
 def test_qwen3_forward_vs_hf(glm):
@@ -115,9 +111,9 @@ def test_qwen3_forward_multitoken(glm):
     gc.collect(); torch.cuda.empty_cache()
 
 
-def test_qwen3_prefill_vs_forward(qwen3_model, glm):
-    model = qwen3_model
+def test_qwen3_prefill_vs_forward(glm):
     device = torch.device("cuda", glm.device)
+    model = Qwen3Model.from_pretrained(glm, QWEN3_REPO, max_batch=1, max_seq_len=16)
 
     input_ids = torch.tensor([[151643, 151644, 151645, 1, 2, 3, 4, 5]], dtype=torch.int64, device=device)
 
@@ -135,6 +131,10 @@ def test_qwen3_prefill_vs_forward(qwen3_model, glm):
         assert prefill_top5 == forward_top5, f"Top-5 mismatch: prefill={prefill_top5}, forward={forward_top5}"
     finally:
         cache.free()
+
+    model.free()
+    del model
+    gc.collect(); torch.cuda.empty_cache()
 
 
 def test_qwen3_prefill_decode(glm):

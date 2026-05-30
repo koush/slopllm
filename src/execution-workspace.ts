@@ -1,5 +1,5 @@
 import { ChatModel, type ChatCache } from "./chat_model";
-import { DeviceOps } from "./device_ops";
+import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
 import { BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, I32 } from "./glm_ops";
 import { type PagedKVCache } from "./paged_kv";
 import { MemcpyKind, Tensor } from "./tensor";
@@ -20,11 +20,20 @@ export class ExecutionState {
   readonly ws: ExecutionWorkspace;
   readonly cache: ChatCache;
   readonly qoIndptrHost?: Tensor;
+  customMask?: {
+    indptr: Tensor;
+    mask: Tensor;
+    mode?: MaskMode;
+  };
 
   constructor(
     batchSize: number, totalTokens: number, seqLens: number[],
     isDecode: boolean, ws: ExecutionWorkspace, cache: ChatCache,
-    qoIndptrHost?: Tensor,
+    qoIndptrHost?: Tensor, customMask?: {
+      indptr: Tensor;
+      mask: Tensor;
+      mode?: MaskMode;
+    },
   ) {
     this.batchSize = batchSize;
     this.totalTokens = totalTokens;
@@ -33,6 +42,7 @@ export class ExecutionState {
     this.ws = ws;
     this.cache = cache;
     this.qoIndptrHost = qoIndptrHost;
+    this.customMask = customMask;
   }
 
   computeLogits(hiddenStates: Tensor, model: ChatModel, lastIdx: Tensor | null = this.ws.lastIdx): Tensor {
@@ -86,10 +96,16 @@ export class ExecutionState {
     );
   }
 
-  setInput(tokenIds: number[][]|Tensor) {
+  setInput(tokenIds: number[][] | Tensor) {
     if (tokenIds instanceof Tensor) {
-      this.input = this.ws.inputIdsBuf;
-      this.input.memcpy(tokenIds, tokenIds.bytes, MemcpyKind.DeviceToDevice);
+      // if the tensor is not in the same workspace copy it into the workspace buffer.
+      if (tokenIds.workspace !== this.ws) {
+        this.input = this.ws.inputIdsBuf;
+        this.input.memcpy(tokenIds, tokenIds.bytes, MemcpyKind.DeviceToDevice);
+      }
+      else {
+        this.input = tokenIds;
+      }
     }
     else {
       this.ws.inputIdsBufH.withPinnedBuffer(buf => {
@@ -158,6 +174,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   /** Pinned host buffer [B*S] of I32: batch index per token for MLA KV cache append. */
   mlaBatchIndicesH: Tensor;
   lastDecodePagedKV: PagedKVCache | null;
+  private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
 
   constructor(glm: DeviceOps, B: number, S: number) {
     super(glm);
@@ -198,6 +215,33 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, B * I32, MemcpyKind.HostToDevice);
   }
 
+  startTracking(keepExports = new Set<Tensor>()): Disposable & { [Symbol.dispose](): void } {
+    if (this.tracking !== null) {
+      throw new Error("startTracking already active");
+    }
+    if (this.tracked.size) {
+      console.warn("startTracking was called with tensors already allocated, this may result in non-deterministic allocations."); 
+    }
+    for (const tensor of this.exported) {
+      if (!keepExports.has(tensor)) {
+        this.exported.delete(tensor);
+        tensor[Symbol.dispose]();
+      }
+    }
+    const ws = this;
+    const tracker: Disposable & { [Symbol.dispose](): void } = {
+      [Symbol.dispose]() {
+        for (const tensor of ws.tracked) {
+          tensor[Symbol.dispose]();
+        }
+        ws.tracked.clear();
+        ws.tracking = null;
+      },
+    };
+    this.tracking = tracker;
+    return tracker;
+  }
+
   decodeStep(state: ExecutionState, model: ChatModel, steps = 1): void {
     const pagedKV = state.cache.getPagedKV();
     const batchSize = state.batchSize;
@@ -233,7 +277,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  flashPrefillPaged(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): Tensor {
+  flashPrefillPaged(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: MaskMode, smScale: number): Tensor {
     const out = this.alloc([1, nHeads, totalTokens, hd], query.type, undefined, query.parallelism);
     this.glm.batchPrefillPagedRun(
       query, out,
@@ -248,7 +292,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, contextParallel?: boolean, maskMode: number = 1, customMask?: Tensor, maskIndptr?: Tensor): { o: Tensor, lse: Tensor } {
+  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, contextParallel?: boolean, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const pageSize = pagedKV.pageSize;
@@ -375,7 +419,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return new ExecutionState(batchSize, totalTokens, seqLens, true, this, cache);
   }
 
-  planPrefill(model: ChatModel, batchSize: number, seqLens: number[], cache: ChatCache): ExecutionState {
+  planPrefill(model: ChatModel, batchSize: number, seqLens: number[], cache: ChatCache, customMask?: {
+    indptr: Tensor;
+    mask: Tensor;
+  }): ExecutionState {
     const pagedKV = cache.getPagedKV();
     pagedKV.checkSequenceCount();
     const cfg = model.cfg;
@@ -449,7 +496,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         this.mlaPrefillPlanInfo,
         this.qoIndptrH, this.indptrH,
         this.kvLenH, this.lastPageLenH,
-        batchSize, nHeads, cfg.kvLoraRank!, true,
+        batchSize, nHeads, cfg.kvLoraRank!, !customMask,
         pagedKV.pageSize, pagedKV.sequences.map(s => s.allocLen),
         pagedKV.contextParallel
       );
@@ -498,7 +545,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
 
-    return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, this.qoIndptrH);
+    return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, this.qoIndptrH, customMask);
   }
 
   forwardPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): Tensor {

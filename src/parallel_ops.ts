@@ -1,7 +1,8 @@
-import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, MaskMode, StridedMmap, TensorParallelism } from "./device_ops";
 import { GlmOps, getNativeAddon, f32ToBf16Bytes, bf16BytesToF32, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM } from "./glm_ops";
 import { MemcpyKind } from "./tensor";
 import { Tensor } from "./tensor";
+import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
 export class ParallelTensor extends Tensor {
@@ -81,14 +82,11 @@ export class ParallelTensor extends Tensor {
   }
 
   [Symbol.dispose](): void {
-    if (this.name !== undefined) {
-      throw new Error("Cannot dispose named tensor");
-    }
-    this.workspace.tracked.delete(this);
     for (const shard of this.shards) {
       shard[Symbol.dispose]();
     }
     (this.shards as Tensor[]).length = 0;
+    super[Symbol.dispose]();
   }
 
   override setName(name: string | undefined): void {
@@ -161,7 +159,7 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism === TensorParallelism.PartialSum) {
       throw new Error("allGather cannot be used on PartialSum tensors; use allReduce instead");
     }
-    const output = this.parallelOps.newTensor(workspace, this.fullShape, this.type, false, undefined, TensorParallelism.Replicated);
+    const output = this.workspace.alloc(this.fullShape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     const elemBytes = ParallelTensor.elemBytes(this.type);
 
@@ -854,7 +852,7 @@ export class ParallelTensor extends Tensor {
       using _rankIndices = rankIndices;
       using gatheredIndices = allIndices.gather(rankIndices, 1, ws, batch);
 
-      const finalIndices = this.parallelOps.newTensor(this.workspace, [batch], "I32", false, undefined, TensorParallelism.Replicated);
+      const finalIndices = this.workspace.alloc([batch], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
       const pGatheredIndices = gatheredIndices as ParallelTensor;
       const idxBytes = batch * 4;
       for (let i = 0; i < ws; i++) {
@@ -1237,8 +1235,8 @@ export class ParallelTensor extends Tensor {
         localValuesShards.push(result.values);
         localIndicesShards.push(result.indices);
       }
-      const localValues = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch, k * this.worldSize], this.type, TensorParallelism.Row);
-      const localIndices = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch, k * this.worldSize], "I32", TensorParallelism.Row);
+      using localValues = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch, k * this.worldSize], this.type, TensorParallelism.Row);
+      using localIndices = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch, k * this.worldSize], "I32", TensorParallelism.Row);
       using gatheredValues = localValues.allGather(this.workspace);
       using gatheredIndices = localIndices.allGather(this.workspace);
       const kTotal = k * this.worldSize;
@@ -1416,19 +1414,20 @@ export class ParallelTensor extends Tensor {
     const isCp = this.parallelism === TensorParallelism.PartialSoftmax;
     const vExpandedPar = isCp ? TensorParallelism.Column : this.parallelism;
     const vExpandedFullShape = isCp ? [BS * this.parallelOps.worldSize, nHeads * vHeadDim] : [BS, nHeads * vHeadDim];
-    const vExpanded = this.parallelOps.wrapShards(this.workspace, outShards, vExpandedFullShape, this.type, vExpandedPar);
-    if (isCp) {
-      const pLse = lse as ParallelTensor;
-      const cpShardNHeads = isVProjSharded ? shardNHeads : this.parallelOps.shardDim(nHeads, "mlaVExpand cpShardNHeads");
-      const cpInputNHeads = isVProjSharded ? shardNHeads : nHeads;
-      return this.parallelOps.contextParallelMerge(
-        vExpanded, pLse,
-        BS, nHeads, vHeadDim,
-        null, this.workspace,
-        cpShardNHeads, cpInputNHeads,
-      );
+    using vExpanded = new UsingHolder(this.parallelOps.wrapShards(this.workspace, outShards, vExpandedFullShape, this.type, vExpandedPar));
+    if (!isCp) {
+      return vExpanded.detach();;
     }
-    return vExpanded;
+
+    const pLse = lse as ParallelTensor;
+    const cpShardNHeads = isVProjSharded ? shardNHeads : this.parallelOps.shardDim(nHeads, "mlaVExpand cpShardNHeads");
+    const cpInputNHeads = isVProjSharded ? shardNHeads : nHeads;
+    return this.parallelOps.contextParallelMerge(
+      vExpanded.value, pLse,
+      BS, nHeads, vHeadDim,
+      null, this.workspace,
+      cpShardNHeads, cpInputNHeads,
+    );
   }
 
   mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
@@ -2019,7 +2018,7 @@ export class ParallelOps implements DeviceOps {
 
   wrapShards(workspace: WorkspaceBase, shards: Tensor[], fullShape: number[], type: string, parallelism: TensorParallelism): ParallelTensor {
     const pt = new ParallelTensor(workspace, this, parallelism, shards, fullShape, type, undefined, false, undefined);
-    workspace.tracked.add(pt);
+    workspace.addTracked(pt);
     return pt;
   }
 
@@ -2171,7 +2170,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  batchPrefillPagedPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, pagedKvIndptrH: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, maskMode: number): void {
+  batchPrefillPagedPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, pagedKvIndptrH: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, maskMode: MaskMode): void {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPinnedIntWs = this.cast(pinnedIntWs);
@@ -2183,7 +2182,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  batchPrefillPagedRun(q: Tensor, o: Tensor, kData: Tensor, vData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, qIndptrD: Tensor, planInfo: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): void {
+  batchPrefillPagedRun(q: Tensor, o: Tensor, kData: Tensor, vData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, qIndptrD: Tensor, planInfo: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, qStrideN: number, qStrideH: number, maskMode: MaskMode, smScale: number): void {
     const pQ = this.cast(q);
     const pO = this.cast(o);
     const pKData = this.cast(kData);
@@ -2235,7 +2234,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: number, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, customMask?: Tensor, maskIndptr?: Tensor): { o: Tensor, lse: Tensor } {
+  mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: MaskMode, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, customMask?: Tensor, maskIndptr?: Tensor): { o: Tensor, lse: Tensor } {
     let pQNope = this.cast(qNope);
     let pQPe = this.cast(qPe);
     const pCkvData = this.cast(ckvData);
@@ -2280,12 +2279,16 @@ export class ParallelOps implements DeviceOps {
         }
       }
     }
+    const pCustomMask = customMask ? this.cast(customMask) : undefined;
+    const pMaskIndptr = maskIndptr ? this.cast(maskIndptr) : undefined;
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     try {
       for (let i = 0; i < this.worldSize; i++) {
         const effectiveCpRank = contextParallel ? i : undefined;
-        const shardResult = this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], effectiveNumHeads, effectivePageSize, maskMode, smScale, effectiveQNopeStrideN, qNopeStrideH, effectiveQPeStrideN, qPeStrideH, effectiveCkvStridePage, ckvStrideN, effectiveKpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, contextParallel, effectiveCpWorldSize, effectiveCpRank);
+        const shardCustomMask = pCustomMask ? pCustomMask.shards[i] : undefined;
+        const shardMaskIndptr = pMaskIndptr ? pMaskIndptr.shards[i] : undefined;
+        const shardResult = this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], effectiveNumHeads, effectivePageSize, maskMode, smScale, effectiveQNopeStrideN, qNopeStrideH, effectiveQPeStrideN, qPeStrideH, effectiveCkvStridePage, ckvStrideN, effectiveKpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, contextParallel, effectiveCpWorldSize, effectiveCpRank, shardCustomMask, shardMaskIndptr);
         oShards.push(shardResult.o);
         lseShards.push(shardResult.lse);
       }

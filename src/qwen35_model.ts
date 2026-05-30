@@ -421,7 +421,7 @@ export class Qwen35Model extends ChatModel {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  forwardInternal(state: ExecutionState): Tensor {
+  forwardModel(state: ExecutionState): Tensor {
     const ws = state.ws;
     const cache = state.cache as Qwen35ChatCache;
     const { gdnState } = cache;

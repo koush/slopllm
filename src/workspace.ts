@@ -7,7 +7,6 @@ export class WorkspaceBase implements Disposable {
   tracked = new Set<Tensor>();
   disposed = new Set<Tensor>();
   exported = new Set<Tensor>();
-  private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
   frozen = false;
   allocLogger = false;
 
@@ -52,6 +51,17 @@ export class WorkspaceBase implements Disposable {
     return this._alloc(shape, type, false, name, parallelism);
   }
 
+  ensureAlloc(shape: number[], type: string, name: string, parallelism?: TensorParallelism): Tensor {
+    const existing = this.tensors.get(name);
+    if (existing !== undefined) {
+      if (existing.shape.length !== shape.length || existing.shape.some((v, i) => v !== shape[i]) || existing.type !== type) {
+        throw new Error(`Tensor with name ${name} already exists with different shape or type`);
+      }
+      return existing;
+    }
+    return this._alloc(shape, type, false, name, parallelism);
+  }
+
   allocPinned(shape: number[], type: string, name?: string, parallelism?: TensorParallelism): Tensor {
     return this._alloc(shape, type, true, name, parallelism);
   }
@@ -60,7 +70,11 @@ export class WorkspaceBase implements Disposable {
     return this.alloc([bytes], "U8", name);
   }
 
-  private _alloc(shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor {
+  addTracked(tensor: Tensor) {
+    this.tracked.add(tensor);
+  }
+
+  protected _alloc(shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor {
     if (this.frozen) {
       throw new Error("Workspace is frozen");
     }
@@ -107,7 +121,7 @@ export class WorkspaceBase implements Disposable {
       tensor.setName(name);
       this.tensors.set(name, tensor);
     } else {
-      this.tracked.add(tensor);
+      this.addTracked(tensor);
     }
     return tensor;
   }
@@ -133,25 +147,5 @@ export class WorkspaceBase implements Disposable {
 
   [Symbol.dispose](): void {
     this.free();
-  }
-
-  startTracking(): Disposable & { [Symbol.dispose](): void } {
-    if (this.tracking !== null) throw new Error("startTracking already active");
-    for (const tensor of this.exported) {
-      tensor[Symbol.dispose]();
-    }
-    this.exported.clear();
-    const ws = this;
-    const tracker: Disposable & { [Symbol.dispose](): void } = {
-      [Symbol.dispose]() {
-        for (const tensor of ws.tracked) {
-          tensor[Symbol.dispose]();
-        }
-        ws.tracked.clear();
-        ws.tracking = null;
-      },
-    };
-    this.tracking = tracker;
-    return tracker;
   }
 }

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
-import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, MaskMode, StridedMmap, TensorParallelism } from "./device_ops";
 import { ExecutionState } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
@@ -355,23 +355,21 @@ export class Glm51Model extends ChatModel {
     using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!, BS);
     using gateSigmoid = gateLogitsBuf.sigmoid();
 
-    let topkInput: Tensor;
     using topkInputHolder = new UsingHolder<Tensor>(undefined!);
     const eScoreBias = this.tensors.get(`${pfx}.mlp.gate.e_score_correction_bias`);
     if (eScoreBias) {
-      topkInput = gateSigmoid.add(eScoreBias);
-      topkInputHolder.replace(topkInput);
+      topkInputHolder.replace(gateSigmoid.add(eScoreBias));
     } else if (nGroup > 1) {
       using zeros = ws.alloc([BS, numExperts], "BF16");
       zeros.fill(0, BS * numExperts);
-      topkInput = gateSigmoid.add(zeros, BS * numExperts);
-      topkInputHolder.replace(topkInput);
+      topkInputHolder.replace(gateSigmoid.add(zeros, BS * numExperts));
     } else {
-      topkInput = gateSigmoid;
+      topkInputHolder.replace(gateSigmoid);
     }
 
     if (nGroup > 1) {
-      const groupTopk = topkInput.reshape([BS * nGroup, expertsPerGroup]).topk(2, expertsPerGroup);
+      using groupTopkReshaped = topkInputHolder.value.reshape([BS * nGroup, expertsPerGroup]);
+      const groupTopk = groupTopkReshaped.topk(2, expertsPerGroup);
       using _groupTopkValues = groupTopk.values;
       using groupSums = groupTopk.values.reduceSum(2, BS * nGroup);
       using groupSums2d = groupSums.reshape([BS, nGroup]);
@@ -381,10 +379,10 @@ export class Glm51Model extends ChatModel {
       using groupMask = ws.alloc([BS, nGroup], "BF16");
       groupMask.fill(0, BS * nGroup);
       groupMask.scatterScalar(groupIdx, 1.0, topkGroup, nGroup, BS);
-      topkInput.groupMaskMul(groupMask, numExperts, expertsPerGroup, nGroup, BS);
+      topkInputHolder.value.groupMaskMul(groupMask, numExperts, expertsPerGroup, nGroup, BS);
     }
 
-    const topkResult = topkInput.topk(topK, numExperts);
+    const topkResult = topkInputHolder.value.topk(topK, numExperts);
     using _topkValues = topkResult.values;
     using topkIndices = topkResult.indices;
 
@@ -392,7 +390,7 @@ export class Glm51Model extends ChatModel {
     using normalizedWeights = selectedScores.rowNormalize(cfg.routedScalingFactor, topK, BS, cfg.normTopkProb);
 
     const count = BS * topK;
-    const topkIndicesFlat = topkIndices.reshape([count]);
+    using topkIndicesFlat = topkIndices.reshape([count]);
 
     const gateWeights = this.getExpertWeights(pfx, "gate_proj");
     const upWeights = this.getExpertWeights(pfx, "up_proj");
@@ -412,7 +410,7 @@ export class Glm51Model extends ChatModel {
     sharedDownBufStream.streamWaitEvent();
     using sharedDownBuf = sharedDownBufStream.result;
 
-    const result = routedOut.add(sharedDownBuf, BS * hs);
+    using result = routedOut.add(sharedDownBuf, BS * hs);
     return result.reshape([BS, hs]);
   }
 
@@ -481,7 +479,7 @@ export class Glm51Model extends ChatModel {
 
     const mlaResult = state.isDecode
       ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel)
-      : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel);
+      : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel, !state.customMask ? MaskMode.Causal : (state.customMask.mode ?? MaskMode.Custom), state.customMask?.mask, state.customMask?.indptr);
     using attnOut = mlaResult.o;
     using lseBuf = mlaResult.lse;
 
@@ -512,7 +510,7 @@ export class Glm51Model extends ChatModel {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  forwardInternal(state: ExecutionState): Tensor {
+  forwardModel(state: ExecutionState): Tensor {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const batchSize = state.batchSize;

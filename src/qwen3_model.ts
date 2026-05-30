@@ -103,7 +103,7 @@ export class Qwen3Model extends ChatModel {
     return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
   }
 
-  forwardInternal(state: ExecutionState): Tensor {
+  forwardModel(state: ExecutionState): Tensor {
     const ws = state.ws;
     const pagedKV = state.cache.getPagedKV();
     const cfg = this.cfg;

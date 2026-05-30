@@ -33,7 +33,7 @@ def run_mla_prefill(glm, device, q_nope, q_pe_rope, ckv_paged, kpe_paged, kv_ind
     qo_indptr_h = (ctypes.c_int32 * 2)(0, qo_len)
     kv_indptr_h = (ctypes.c_int32 * 2)(0, kv_len)
     kv_len_h = (ctypes.c_int32 * 1)(kv_len)
-    plan_info = (ctypes.c_int64 * 18)()
+    plan_info = (ctypes.c_int64 * 19)()
 
     glm.mla_prefill_plan(
         float_ws, 32 * 1024 * 1024,

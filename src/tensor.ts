@@ -19,6 +19,11 @@ function numElements(shape: number[]): number {
 export abstract class Tensor implements Disposable {
   parallelism: TensorParallelism = TensorParallelism.Replicated;
   private pinnedBuffer?: Buffer;
+  stack: string;
+  views = new Set<Tensor>();
+  viewDisposed = false;
+  id: number;
+  static nextId = 1;
 
   constructor(public readonly workspace: WorkspaceBase,
     public readonly data: number,
@@ -28,6 +33,7 @@ export abstract class Tensor implements Disposable {
     public readonly name: string | undefined,
     public readonly pinned: boolean,
     public readonly view: Tensor | undefined) {
+    this.id = Tensor.nextId++;
     this.data = data;
     this.allocSize = allocSize;
     this.shape = shape;
@@ -35,6 +41,10 @@ export abstract class Tensor implements Disposable {
     this.name = name;
     this.pinned = pinned;
     this.view = view;
+    this.stack = new Error("Tensor allocated at:").stack!;
+    if (view) {
+      view.views.add(this);
+    }
   }
 
   get numElements(): number {
@@ -109,9 +119,20 @@ export abstract class Tensor implements Disposable {
     if (this.name !== undefined) {
       throw new Error("Cannot dispose named tensor");
     }
-    if (this.data === 0) return;
+    // if stream is active, defer disposal until stream switch
+    if (this.views.size) {
+      this.viewDisposed = true;
+      return;
+    }
     this.workspace.tracked.delete(this);
-    if (this.view) return;
+    if (this.view) {
+      this.view.views.delete(this);
+      if (this.view.viewDisposed) {
+        this.view[Symbol.dispose]();
+      }
+      return;
+    }
+    if (this.data === 0) return;
     this.workspace.disposed.add(this);
   }
 

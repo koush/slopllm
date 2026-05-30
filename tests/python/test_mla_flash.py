@@ -150,7 +150,7 @@ def test_mla_prefill_causal(glm, device):
     kv_indptr_h = (ctypes.c_int32 * 2)(0, S)
     kv_len_h = (ctypes.c_int32 * 1)(S)
     kv_indices = torch.arange(S, dtype=torch.int32, device=device)
-    plan_info = (ctypes.c_int64 * 18)()
+    plan_info = (ctypes.c_int64 * 19)()
 
     float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
 
@@ -225,7 +225,7 @@ def test_mla_prefill_noncausal(glm, device):
     kv_indptr_h = (ctypes.c_int32 * 2)(0, S)
     kv_len_h = (ctypes.c_int32 * 1)(S)
     kv_indices = torch.arange(S, dtype=torch.int32, device=device)
-    plan_info = (ctypes.c_int64 * 18)()
+    plan_info = (ctypes.c_int64 * 19)()
 
     float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
 
@@ -657,7 +657,7 @@ def test_mla_prefill_lse(glm, device):
     kv_indptr_h = (ctypes.c_int32 * 2)(0, S)
     kv_len_h = (ctypes.c_int32 * 1)(S)
     kv_indices = torch.arange(S, dtype=torch.int32, device=device)
-    plan_info = (ctypes.c_int64 * 18)()
+    plan_info = (ctypes.c_int64 * 19)()
 
     float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
 

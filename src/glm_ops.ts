@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, MaskMode, StridedMmap, TensorParallelism } from "./device_ops";
 import type { SamplingParams } from "./chat_model";
 import { MemcpyKind, Tensor } from "./tensor";
 import { SafeTensorFile } from "./safetensors";
@@ -154,7 +154,7 @@ export class GlmTensor extends Tensor {
     super(workspace, data, allocSize, shape, type, name, pinned, view);
   }
 
-  dispose() {
+  _dispose() {
     super[Symbol.dispose]();
   }
 
@@ -164,7 +164,7 @@ export class GlmTensor extends Tensor {
       this.glm.streamTensors.get(this.glm.currentStream)!.add(this);
     }
     else {
-      this.dispose();
+      this._dispose();
     }
   }
 
@@ -556,6 +556,7 @@ export class GlmOps implements DeviceOps {
   ctx: number;
   device: number;
   allocator: Allocator;
+  capturing = false;
 
   constructor(deviceId: number = 0, libPath?: string, arenaGb?: number) {
     if (libPath) {
@@ -575,7 +576,12 @@ export class GlmOps implements DeviceOps {
     }
     else {
       this.allocator = {
-        alloc: (size: number) => getNativeAddon().alloc(this.ctx, size),
+        alloc: (size: number) => {
+          if (this.capturing) {
+            console.warn("Warning: allocating during capture will fail.");
+          }
+          return getNativeAddon().alloc(this.ctx, size)
+        },
         free: (ptr: number) => getNativeAddon().freeBuf(this.ctx, ptr),
       }
     }
@@ -628,7 +634,7 @@ export class GlmOps implements DeviceOps {
     const tensors = this.streamTensors.get(stream);
     this.streamTensors.delete(stream);
     for (const tensor of tensors!) {
-      tensor.dispose();
+      tensor._dispose();
     }
   }
 
@@ -695,21 +701,23 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().batchDecodeRun(this.ctx, ptr(q), ptr(o), ptr(kData), ptr(vData), ptr(indices), ptr(indptrD), ptr(lastPageLen), ptr(floatWs), ptr(intWs), ptr(planInfo), batchSize, numQoHeads, numKvHeads, headDim, pageSize, smScale);
   }
 
-  batchPrefillPagedPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, pagedKvIndptrH: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, maskMode: number): void {
+  batchPrefillPagedPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, pagedKvIndptrH: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, maskMode: MaskMode): void {
     getNativeAddon().batchPrefillPagedPlan(this.ctx, ptr(floatWs), floatWsSize, ptr(intWs), ptr(pinnedIntWs), intWsSize, ptr(planInfo), ptr(qoIndptrH), ptr(pagedKvIndptrH), totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, pageSize, maskMode);
   }
 
-  batchPrefillPagedRun(q: Tensor, o: Tensor, kData: Tensor, vData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, qIndptrD: Tensor, planInfo: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): void {
+  batchPrefillPagedRun(q: Tensor, o: Tensor, kData: Tensor, vData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, qIndptrD: Tensor, planInfo: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, qStrideN: number, qStrideH: number, maskMode: MaskMode, smScale: number): void {
     getNativeAddon().batchPrefillPagedRun(this.ctx, ptr(q), ptr(o), ptr(kData), ptr(vData), ptr(indices), ptr(indptrD), ptr(lastPageLen), ptr(floatWs), ptr(intWs), ptr(qIndptrD), ptr(planInfo), totalQoRows, batchSize, numQoHeads, numKvHeads, headDim, pageSize, qStrideN, qStrideH, maskMode, smScale);
   }
 
   graphBeginCapture(): void {
     getNativeAddon().graphBeginCapture(this.ctx);
+    this.capturing = true;
   }
 
   graphEndCapture(): number {
     const graph = getNativeAddon().graphEndCapture(this.ctx);
     if (!graph) throw new Error("CUDA graph capture failed");
+    this.capturing = false;
     return graph;
   }
 
@@ -735,7 +743,7 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().mlaPrefillPlan(this.ctx, ptr(floatWs), floatWsSize, ptr(intWs), ptr(pinnedIntWs), intWsSize, ptr(planInfo), ptr(qoIndptrH), ptr(kvIndptrH), ptr(kvLenH), batchSize, numHeads, headDimO, causal, cpWorldSize, cpRank);
   }
 
-  mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: number, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0, customMask?: Tensor, maskIndptr?: Tensor): { o: Tensor, lse: Tensor } {
+  mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: MaskMode, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0, customMask?: Tensor, maskIndptr?: Tensor): { o: Tensor, lse: Tensor } {
     const totalTokens = oStrideH / headDimCkv;
     const o = qNope.workspace.alloc([1, numHeads, totalTokens, headDimCkv], qNope.type);
     const lse = qNope.workspace.alloc([totalTokens, numHeads], "F32");

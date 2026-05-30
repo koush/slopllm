@@ -630,6 +630,10 @@ void glm_mla_prefill_run(
       status = flashinfer::mla::BatchMLAPagedAttention<
           flashinfer::MaskMode::kCustom, HEAD_DIM_CKV, HEAD_DIM_KPE, MLAParams>(
           params, info.num_blks_x, info.num_blks_y, GLM_STREAM(ctx));
+    } else if (flash_mask == flashinfer::MaskMode::kCausalCustom) {
+      status = flashinfer::mla::BatchMLAPagedAttention<
+          flashinfer::MaskMode::kCausalCustom, HEAD_DIM_CKV, HEAD_DIM_KPE, MLAParams>(
+          params, info.num_blks_x, info.num_blks_y, GLM_STREAM(ctx));
     } else {
       status = flashinfer::mla::BatchMLAPagedAttention<
           flashinfer::MaskMode::kNone, HEAD_DIM_CKV, HEAD_DIM_KPE, MLAParams>(

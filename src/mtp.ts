@@ -4,6 +4,7 @@ import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { I32 } from "./glm_ops";
 import { MemcpyKind, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
+import { WorkspaceBase } from "./workspace";
 
 /**
  * MTP (Multi-Token Prediction) prefill rotation.
@@ -86,22 +87,18 @@ export function mtpPrefill(
 /**
  * Result of tree-structured MTP draft generation.
  *
- * The validation sequences tensor has shape [(1 << nextn) * (nextn + 1)] I32,
- * laid out as (1 << nextn) rows of (nextn + 1) columns in row-major order.
+ * The validation sequences tensor has shape [2 * (1 << nextn) - 1] I32,
+ * laid out in breadth-first order:
  *
- * Column 0 is the root token (the target model's sampled token, broadcast to all rows).
- * Column i+1 contains MTP layer i's predictions (top-1 and top-2 per batch element,
- * in natural topk order: [top1_seq0, top2_seq0, top1_seq1, top2_seq1, ...]).
+ * For nextn=3, the 15 tokens are:
+ *   [root, D0_top1, D0_top2, D1_top1(top1), D1_top2(top1),
+ *    D1_top1(top2), D1_top2(top2), D2_top1(@3), D2_top2(@3),
+ *    D2_top1(@4), D2_top2(@4), D2_top1(@5), D2_top2(@5),
+ *    D2_top1(@6), D2_top2(@6)]
  *
- * For nextn=3, the 8 rows are:
- *   [root, D0_top1, D1_top1_of_top1, D2_top1_of_top1_of_top1]
- *   [root, D0_top1, D1_top1_of_top1, D2_top2_of_top1_of_top1]
- *   [root, D0_top1, D1_top2_of_top1, D2_top1_of_top2_of_top1]
- *   [root, D0_top1, D1_top2_of_top1, D2_top2_of_top2_of_top1]
- *   [root, D0_top2, D1_top1_of_top2, D2_top1_of_top1_of_top2]
- *   [root, D0_top2, D1_top1_of_top2, D2_top2_of_top1_of_top2]
- *   [root, D0_top2, D1_top2_of_top2, D2_top1_of_top2_of_top2]
- *   [root, D0_top2, D1_top2_of_top2, D2_top2_of_top2_of_top2]
+ * Token at index i has parent at index floor((i - 1) / 2).
+ * This flat layout enables single-sequence verification with a custom
+ * tree-shaped attention mask.
  */
 export interface MtpTreeResult {
   validationSequences: Tensor;
@@ -109,18 +106,16 @@ export interface MtpTreeResult {
 }
 
 /**
- * Tree-structured MTP decode: produce draft predictions using topk=2 batch expansion.
+ * Tree-structured MTP decode using single-sequence prefill with custom masks.
  *
- * At each MTP layer, top-2 predictions are sampled, and the batch is doubled by
- * forking KV cache sequences. This creates a binary tree of depth `nextn` with
- * 2^nextn candidate paths. After generation, forked sequences are cleaned up and
- * the KV cache is rewound.
+ * Iteration 0 reuses the target model's decode slot (batch=1) to produce the
+ * root's top-2 predictions. Iterations 1+ append all tree tokens built so far
+ * to seq0, run a single prefill pass with a tree-shaped custom mask, and extract
+ * top-2 at the leaf positions. After each prefill iteration, seq0 is rolled back
+ * to its original length. This avoids forking KV cache sequences entirely.
  *
- * Iteration 0 processes at the target model's decode position (S), reusing its
- * slot and decode plan. This ensures the MTP KV entry is written at position S
- * (filling the gap that would otherwise exist) and that the MTP layer sees the
- * correct RoPE position. Iterations 1+ advance the position normally via
- * planDecode + decodeStep.
+ * The custom mask ensures each draft token only attends to the prefix plus its
+ * ancestors in the binary tree, so different branches don't cross-attend.
  *
  * Prerequisites:
  *   - The target model must have just decoded (planDecode + decodeStep + forward
@@ -128,12 +123,10 @@ export interface MtpTreeResult {
  *   - state must be the target model's decode state (batchSize = 1)
  *   - gpuSampleResult must be [1] I32 GPU tensor: target model's sampled token
  *   - model.forwardMtp must exist (MTP enabled)
- *   - The paged KV cache must have enough pages for nextn-1 additional tokens
- *     (iteration 0 reuses the target model's slot) and enough sequences for
- *     (1 << (nextn-1)) forked sequences
- *   - cache.getPagedKV().maxBatch must be >= (1 << (nextn - 1))
+ *   - cache.getPagedKV().sequences must have exactly 1 sequence (seq 0)
  *
  * @param state - The target model's decode ExecutionState
+ * @param captureManager - Capture manager for CUDA graph replay
  * @param model - The chat model (must support forwardMtp)
  * @param targetHiddenStates - The target model's hidden states [1, hidden] BF16
  * @param ws - Execution workspace
@@ -157,122 +150,125 @@ export function mtpTreeDecode(
   }
 
   const pagedKV = cache.getPagedKV();
-  const maxMtpBatch = 1 << (nextn - 1);
-  if (pagedKV.maxBatch < maxMtpBatch) {
-    throw new Error(
-      `mtpTreeDecode: maxBatch (${pagedKV.maxBatch}) too small for nextn=${nextn}, need >= ${maxMtpBatch}`,
-    );
-  }
-
   const totalPaths = 1 << nextn;
-  const rowLen = nextn + 1;
-  const validationSequences = ws.alloc([totalPaths * rowLen], "I32");
+  const totalTreeNodes = 2 * totalPaths - 1;
+  const validationSequences = ws.ensureAlloc([totalTreeNodes], "I32", `${totalTreeNodes}-validation-sequences`);
+  const seq0 = pagedKV.sequences[0];
+  const originalAllocLen = seq0.allocLen;
+  const hiddenSize = model.cfg.hiddenSize;
+
+  // Iteration 0: decode step — reuse target model's decode slot, produce root + top-2
+  captureManager.run((capturing) => {
+    using _tracker = ws.startTracking(new Set([targetHiddenStates]));
+    state.setInput(gpuSampleResult.reshape([gpuSampleResult.numElements]));
+
+    validationSequences.memcpy2d(
+      0, I32,
+      gpuSampleResult, 0, I32,
+      I32, 1,
+      MemcpyKind.DeviceToDevice,
+    );
+
+    using hiddenStates = model.forwardMtp!(state, targetHiddenStates);
+    using logits = state.computeLogits(hiddenStates, model);
+    const topk = logits.topk(2, model.cfg.vocabSize);
+    using _values = topk.values;
+    using indices = topk.indices;
+
+    validationSequences.memcpy2d(
+      I32, 2 * I32,
+      indices, 0, 2 * I32,
+      2 * I32, 1,
+      MemcpyKind.DeviceToDevice,
+    );
+  }, ['mtp-tree', 'layer0']);
 
 
-  let nextInput: Tensor = gpuSampleResult;
+  // Iterations 1+: single-sequence prefill with tree-shaped custom mask
+  for (let i = 1; i < nextn; i++) {
+    const numPrefillTokens = (1 << (i + 1)) - 2;
 
-  let total = 1;
-  using doubledTargetHs = new UsingHolder<Tensor>(undefined!);
-  const mtpAdvance = nextn - 1;
+    const { mask, indptr } = ensureCustomMask(ws, originalAllocLen, numPrefillTokens, buildMtpTreeMask);
 
-  for (let i = 0; i < nextn; i++, total *= 2) {
-    const batchSize = 1 << i;
-
-    if (total > 1) {
-      for (let j = 0; j < total / 2; j++) {
-        pagedKV.copySequence(j + total / 2, j);
-      }
-    }
-
-    const mtpState = i === 0 ? state : ws.planDecode(model, batchSize, cache);
+    const prefillState = ws.planPrefill(model, 1, [numPrefillTokens], cache, {
+      mask,
+      indptr,
+    });
 
     captureManager.run(() => {
-      mtpState.setInput(nextInput.reshape([nextInput.numElements]));
-      if (i !== 0) {
-        // Iteration 0: process at the target model's decode position (S).
-        // The target model already allocated the slot at S and set up the decode
-        // plan. Skipping planDecode/decodeStep avoids advancing past position S,
-        // which would leave a gap in the MTP KV cache (no entry at S) and cause
-        // the MTP to process at S+1 instead of S.
-        ws.decodeStep(mtpState, model);
-      }
-      else {
-        for (let j = 0; j < totalPaths; j++) {
-          validationSequences.memcpy2d(
-            j * rowLen * 4, rowLen * 4,
-            gpuSampleResult, 0, 4,
-            4, 1,
-            MemcpyKind.DeviceToDevice,
-          );
-        }
+      using _tracker = ws.startTracking(new Set([targetHiddenStates]));
+
+      const leafStart = (1 << i) - 2;
+      const leafCount = 1 << i;
+
+      // Copy tree tokens (excluding root at index 0) from validationSequences to input buffer
+      ws.inputIdsBuf.memcpy2d(
+        0, numPrefillTokens * I32,
+        validationSequences, I32, totalTreeNodes * I32,
+        numPrefillTokens * I32, 1,
+        MemcpyKind.DeviceToDevice,
+      );
+
+      prefillState.setInput(ws.inputIdsBuf);
+
+      const tiledHs = ws.ensureAlloc([numPrefillTokens, hiddenSize], "BF16", `tiled_hs_${numPrefillTokens}-${hiddenSize}`);
+      const rowBytes = hiddenSize * 2;
+      for (let j = 0; j < numPrefillTokens; j++) {
+        tiledHs.memcpy2d(
+          j * rowBytes, rowBytes,
+          targetHiddenStates, 0, rowBytes,
+          rowBytes, 1,
+          MemcpyKind.DeviceToDevice,
+        );
       }
 
-      if (batchSize > 1) {
-        const prev: Tensor = doubledTargetHs.value ?? targetHiddenStates;
-        doubledTargetHs.replace(prev.cat([prev], 0));
-      }
-      const hs = batchSize === 1 ? targetHiddenStates : doubledTargetHs.value!;
-
-      using hiddenStates = model.forwardMtp!(mtpState, hs);
-      using logits = mtpState.computeLogits(hiddenStates, model);
+      using hiddenStates = model.forwardMtp!(prefillState, tiledHs);
+      using logits = prefillState.computeLogits(hiddenStates, model, null);
 
       const topk = logits.topk(2, model.cfg.vocabSize);
       using _values = topk.values;
       using indices = topk.indices;
 
-      const batch = total * 2;
-      const half = batch / 2;
-
-      const fanout = totalPaths >>> (i + 1);
-      for (let j = 0; j < batch; j++) {
-        for (let k = 0; k < fanout; k++) {
-          validationSequences.memcpy2d(
-            ((j * fanout + k) * rowLen + i + 1) * 4, rowLen * 4,
-            indices, j * 4, 4,
-            4, 1,
-            MemcpyKind.DeviceToDevice,
-          );
-        }
-      }
-
-      if (i < nextn - 1) {
-        const reordered = ws.alloc(topk.indices.shape, topk.indices.type);
-        reordered.memcpy2d(0, 4, topk.indices, 0, 8, 4, half, MemcpyKind.DeviceToDevice);
-        reordered.memcpy2d(half * 4, 4, topk.indices, 4, 8, 4, half, MemcpyKind.DeviceToDevice);
-        nextInput = reordered;
-      }
-      else {
-        // on final iteration, roll back the decode positionid state
-        ws.decodeStep(state, model, -mtpAdvance);
-      }
+      const writeOffset = ((1 << (i + 1)) - 1) * I32;
+      const writeCount = leafCount * 2;
+      validationSequences.memcpy2d(
+        writeOffset, writeCount * I32,
+        indices, leafStart * 2 * I32, numPrefillTokens * 2 * I32,
+        writeCount * I32, 1,
+        MemcpyKind.DeviceToDevice,
+      );
     }, ['mtp-tree', `layer${i}`]);
-  }
 
-  for (let i = 0; i < total / 2 - 1; i++) {
-    const seq = pagedKV.sequences.pop();
-    seq!.clear();
+    seq0.truncate(originalAllocLen);
+    pagedKV.positionIdsDirty = true;
+    pagedKV.pagesDirtyHost = true;
+    pagedKV.pagesDirtyDevice = true;
   }
-
-  // Iteration 0 does not advance the position (no planDecode/decodeStep),
-  // so only nextn-1 positions were allocated beyond the target model's slot.
-  const seq0 = pagedKV.sequences[0];
-  seq0.truncate(seq0.allocLen - mtpAdvance);
 
   return { validationSequences, nextn };
 }
 
-/**
- * Initiate async GPU→Host copy of tree validation sequences.
- *
- * The caller MUST synchronize the stream before reading the returned buffer.
- */
-export function mtpTreeReadDrafts(
-  result: MtpTreeResult,
-  ws: ExecutionWorkspace,
-): Tensor {
-  const host = ws.allocPinned(result.validationSequences.shape, result.validationSequences.type);
-  host.memcpy(result.validationSequences, result.validationSequences.bytes, MemcpyKind.DeviceToHost);
-  return host;
+function buildMtpTreeMask(numPrefillTokens: number, prefixLen: number): { data: Uint8Array; indptr: Int32Array } {
+  const kvLen = prefixLen + numPrefillTokens;
+  const totalBits = numPrefillTokens * kvLen;
+  const byteLen = Math.ceil(totalBits / 8);
+  const data = new Uint8Array(byteLen);
+
+  for (let q = 0; q < numPrefillTokens; q++) {
+    for (let k = 0; k < prefixLen; k++) {
+      const bit = q * kvLen + k;
+      data[bit >> 3] |= 1 << (bit & 7);
+    }
+    let cur = q + 1;
+    while (cur > 0) {
+      const kvPos = prefixLen + cur - 1;
+      const bit = q * kvLen + kvPos;
+      data[bit >> 3] |= 1 << (bit & 7);
+      cur = (cur - 1) >> 1;
+    }
+  }
+
+  return { data, indptr: new Int32Array([0, byteLen]) };
 }
 
 export interface MtpVerifyResult {
@@ -285,28 +281,79 @@ export interface MtpVerifyResult {
   replacementToken: number;
 }
 
+function buildTreeMask(totalTreeNodes: number, prefixLen: number): { data: Uint8Array; indptr: Int32Array } {
+  const kvLen = prefixLen + totalTreeNodes;
+  const totalBits = totalTreeNodes * kvLen;
+  const byteLen = Math.ceil(totalBits / 8);
+  const data = new Uint8Array(byteLen);
+
+  for (let q = 0; q < totalTreeNodes; q++) {
+    for (let k = 0; k < prefixLen; k++) {
+      const bit = q * kvLen + k;
+      data[bit >> 3] |= 1 << (bit & 7);
+    }
+    let cur = q;
+    while (true) {
+      const bit = q * kvLen + (prefixLen + cur);
+      data[bit >> 3] |= 1 << (bit & 7);
+      if (cur === 0) break;
+      cur = (cur - 1) >> 1;
+    }
+  }
+
+  return { data, indptr: new Int32Array([0, byteLen]) };
+}
+
+
+function ensureCustomMask(ws: WorkspaceBase, originalAllocLen: number, numPrefillTokens: number, buildMask: (totalTreeNodes: number, prefixLen: number) => { data: Uint8Array; indptr: Int32Array }) {
+  let mask = ws.tensors.get(`mtp_tree_mask_${numPrefillTokens}-${originalAllocLen}-${buildMask.name}`);
+  let indptr = ws.tensors.get(`mtp_tree_mask_indptr_${numPrefillTokens}-${originalAllocLen}-${buildMask.name}`);
+  if (!mask || !indptr) {
+    const { data: maskData, indptr: maskIndptrData } = buildMask(numPrefillTokens, originalAllocLen);
+    mask = ws.alloc([maskData.length], "U8", `mtp_tree_mask_${numPrefillTokens}-${originalAllocLen}-${buildMask.name}`);
+    mask.h2d(Buffer.from(maskData));
+    indptr = ws.alloc([maskIndptrData.length], "I32", `mtp_tree_mask_indptr_${numPrefillTokens}-${originalAllocLen}-${buildMask.name}`);
+    indptr.h2d(i32Buf(maskIndptrData));
+    // why is this necessary? illegal memory access without it.
+    ws.glm.synchronize();
+  }
+
+  return {
+    mask,
+    indptr,
+  };
+};
+
+function i32Buf(data: Int32Array): Buffer {
+  const buf = Buffer.alloc(data.length * 4);
+  for (let i = 0; i < data.length; i++) buf.writeInt32LE(data[i], i * 4);
+  return buf;
+}
+
 /**
- * Verify MTP draft tokens against the target model via naive batch prefill.
+ * Verify MTP draft tokens against the target model using a single-sequence
+ * tree-shaped custom mask.
  *
- * Creates 2^nextn sequences by forking the target model's KV cache, prefills
- * each with [currentToken, D0, D1, ..., D{nextn-1}] from the validation
- * sequences, runs the target model forward, and compares argmax logits against
- * the draft tokens. After verification, restores the KV cache to its
- * pre-verification state.
+ * Appends all tree tokens (root + draft) to seq0, runs a single prefill pass
+ * with a custom attention mask that enforces the tree structure (each node
+ * attends to prefix + itself + ancestors), and compares argmax logits against
+ * the draft tokens. After verification, restores the KV cache.
+ *
+ * The root token (index 0 in the tree) is included in the prefill so the
+ * target model produces a prediction at the root position, which is compared
+ * against the root's children. The root is already in the KV cache at
+ * position originalAllocLen-1; including it again at originalAllocLen
+ * duplicates it but matches the convention used in batch verification.
  *
  * Prerequisites:
- *   - mtpTreeDecode + mtpTreeReadDrafts have been called, hostBuf is synchronized
+ *   - mtpTreeDecode has been called, treeResult.validationSequences is populated
  *   - cache.getPagedKV().sequences has exactly 1 sequence (seq 0)
- *   - cache.getPagedKV().maxBatch >= (1 << nextn)
  *   - model.forwardMtp must exist (MTP enabled)
  *
  * @param model - The chat model
  * @param ws - Execution workspace
  * @param cache - Chat cache (paged KV cache)
  * @param treeResult - MtpTreeResult from mtpTreeDecode
- * @param validationSequences - Pinned host buffer from mtpTreeReadDrafts (synchronized).
- *   Consumed (disposed) by this function — the data is copied before the forward pass
- *   to avoid corruption from workspace tensor recycling.
  * @param tokenizer - Optional tokenizer for debug logging
  * @returns MtpVerifyResult with numAccepted, acceptedTokens, and replacementToken
  */
@@ -315,84 +362,72 @@ export function mtpVerify(
   ws: ExecutionWorkspace,
   cache: ChatCache,
   treeResult: MtpTreeResult,
-  validationSequences: Tensor,
   tokenizer?: any,
 ): MtpVerifyResult {
   const pagedKV = cache.getPagedKV();
   const nextn = treeResult.nextn;
   const totalPaths = 1 << nextn;
-  const suffixLen = nextn + 1; // [currentToken, D0, D1, ..., D{nextn-1}]
+  const totalTreeNodes = 2 * totalPaths - 1;
   const pageSize = pagedKV.pageSize;
 
-  if (pagedKV.maxBatch < totalPaths) {
-    throw new Error(
-      `mtpVerify: maxBatch (${pagedKV.maxBatch}) too small for nextn=${nextn}, need >= ${totalPaths}`,
-    );
+  if (pagedKV.sequences.length !== 1) {
+    throw new Error(`mtpVerify: expected 1 sequence, got ${pagedKV.sequences.length}`);
   }
 
   const seq0 = pagedKV.sequences[0];
   const originalAllocLen = seq0.allocLen;
   const tokenIds = seq0.getTokenIds();
 
-  // allocLen = originalAllocLen → planPrefill starts at originalAllocLen, which is
-  // exactly where the next decode step would process currentToken. The existing KV
-  // at 0..originalAllocLen-1 is the correct prefix context; no prevToken prepend needed.
+  using hostBuf = ws.allocPinned(treeResult.validationSequences.shape, treeResult.validationSequences.type);
+  hostBuf.memcpy(treeResult.validationSequences, treeResult.validationSequences.bytes, MemcpyKind.DeviceToHost);
+  ws.glm.synchronize();
+  const treeTokens = Buffer.from(hostBuf.readPinnedBuffer());
+
+  const allTokenIds: number[] = [];
+  for (let i = 0; i < totalTreeNodes; i++) {
+    allTokenIds.push(treeTokens.readInt32LE(i * 4));
+  }
+
   pagedKV.positionIdsDirty = true;
   pagedKV.pagesDirtyHost = true;
 
-  // Fork copies for all verification paths (totalPaths = 2^nextn)
-  for (let i = 1; i < totalPaths; i++) {
-    pagedKV.copySequence(i, 0);
-  }
-  
-  using hostBuf = ws.allocPinned(validationSequences.shape, validationSequences.type);
-  using stream = ws.glm.withStream(() => {
-    hostBuf.memcpy(validationSequences, validationSequences.bytes, MemcpyKind.DeviceToHost);
+  const { mask, indptr } = ensureCustomMask(ws, originalAllocLen, totalTreeNodes, buildTreeMask);
+
+  const state = ws.planPrefill(model, 1, [totalTreeNodes], cache, {
+    mask,
+    indptr,
   });
+  state.setInput([allTokenIds]);
 
-  // Run verification prefill: batch=totalPaths, each sequence gets suffixLen tokens
-  const seqLens = new Array(totalPaths).fill(suffixLen) as number[];
-  const state = ws.planPrefill(model, totalPaths, seqLens, cache);
-  state.setInput(validationSequences);
-
-  using hiddenStates = model.forwardInternal(state);
-  // Pass null (not undefined) for lastIdx — undefined triggers the default
-  // parameter (this.ws.lastIdx, a truthy Tensor), which selects only the last
-  // token per sequence via indexSelect. We need all-positions logits.
+  using hiddenStates = model.forward(state);
   using logits = state.computeLogits(hiddenStates, model, null);
 
-  // Argmax all positions: [totalPaths * suffixLen] I32
   using argmaxResult = logits.argmax();
-
-  // Read argmax to host (copy before any subsequent workspace allocations can reclaim the memory)
   using argmaxHost = ws.allocPinned(argmaxResult.shape, argmaxResult.type);
   argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
 
-  // Verify: compare draft tokens vs target model argmax for each path.
-  // Suffix = [currentToken, D0, D1, ..., D{nextn-1}] starting at originalAllocLen.
-  // argmax at position j predicts the token at position j+1:
-  //   j=0 (currentToken) → predicts D0; j=1 (D0) → predicts D1; etc.
+  ws.glm.synchronize();
+  const argmaxBuf = Buffer.from(argmaxHost.readPinnedBuffer());
+
   let bestPath = 0;
   let bestAccepted = -1;
   let bestReplacement = -1;
 
-  stream.synchronize();
-  ws.glm.synchronize();
-  const argmaxBuf = Buffer.from(argmaxHost.readPinnedBuffer());
-  const validationSequencesBuf = Buffer.from(hostBuf.readPinnedBuffer());
-
   for (let path = 0; path < totalPaths; path++) {
     let accepted = 0;
-    for (let j = 0; j < nextn; j++) {
-      const draftToken = validationSequencesBuf.readInt32LE((path * (nextn + 1) + j + 1) * 4);
-      const targetToken = argmaxBuf.readInt32LE((path * suffixLen + j) * 4);
+    let nodeIdx = 0;
+    for (let layer = 0; layer < nextn; layer++) {
+      const childIdx = nodeIdx * 2 + 1 + ((path >> (nextn - 1 - layer)) & 1);
+      const draftToken = treeTokens.readInt32LE(childIdx * 4);
+      const targetToken = argmaxBuf.readInt32LE(nodeIdx * 4);
       if (draftToken === targetToken) {
         accepted++;
+        nodeIdx = childIdx;
       } else {
         break;
       }
     }
-    const replacement = argmaxBuf.readInt32LE((path * suffixLen + accepted) * 4);
+    const replacement = argmaxBuf.readInt32LE(nodeIdx * 4);
     if (accepted > bestAccepted) {
       bestAccepted = accepted;
       bestPath = path;
@@ -401,35 +436,13 @@ export function mtpVerify(
   }
 
   const acceptedTokens: number[] = [];
-  for (let j = 0; j < bestAccepted; j++) {
-    acceptedTokens.push(validationSequencesBuf.readInt32LE((bestPath * (nextn + 1) + j + 1) * 4));
+  let nodeIdx = 0;
+  for (let layer = 0; layer < bestAccepted; layer++) {
+    const childIdx = nodeIdx * 2 + 1 + ((bestPath >> (nextn - 1 - layer)) & 1);
+    acceptedTokens.push(treeTokens.readInt32LE(childIdx * 4));
+    nodeIdx = childIdx;
   }
 
-  // Log verification results
-  // const currentToken = validationSequencesBuf.readInt32LE(0);
-  // console.log(`MTP Verify: root=${tokenizer?.decode([currentToken]) ?? currentToken} best=[${bestPath}] accepted=${bestAccepted}/${nextn} replacement=${tokenizer?.decode([bestReplacement]) ?? bestReplacement}`);
-  // for (let path = 0; path < totalPaths; path++) {
-  //   const parts: string[] = [];
-  //   for (let j = 0; j < nextn; j++) {
-  //     const draftToken = validationSequencesBuf.readInt32LE((path * (nextn + 1) + j + 1) * 4);
-  //     const targetToken = argmaxBuf.readInt32LE((path * suffixLen + j) * 4);
-  //     const ok = draftToken === targetToken;
-  //     parts.push(`${ok ? "✓" : "✗"}${tokenizer?.decode([draftToken]) ?? `?${draftToken}`}`);
-  //     if (!ok) break;
-  //   }
-  //   const marker = path === bestPath ? "*" : " ";
-  //   console.log(`  ${marker}[${path}] ${parts.join(" ")}`);
-  // }
-
-  // Cleanup: pop forked sequences and restore seq 0 to original state.
-  // We don't integrate accepted KV entries yet — just restore and return results.
-  for (let i = totalPaths - 1; i > 0; i--) {
-    const seq = pagedKV.sequences.pop();
-    seq!.clear();
-  }
-
-  // Truncate seq 0 back to originalAllocLen. After prefill, allocLen =
-  // originalAllocLen + suffixLen. Truncating discards the suffix KV entries.
   seq0.truncate(originalAllocLen);
   const lastContentPageIdx = seq0.contentPages - 1;
   if (lastContentPageIdx >= 0) {
