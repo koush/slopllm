@@ -307,6 +307,7 @@ export function* generateStream(
 
       if (mtp && model.forwardMtp && nextn > 0) {
         const treeResult = mtpTreeDecode(state, captureManager, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache);
+        glm.synchronize();
         // const verifyResult = mtpVerify(model, ws, cache, treeResult, tokenizer);
         // console.log(`MTP accepted=${verifyResult.numAccepted}/${nextn} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
         // if (verifyResult.acceptedTokens.length > 0) {

@@ -422,6 +422,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   planPrefill(model: ChatModel, batchSize: number, seqLens: number[], cache: ChatCache, customMask?: {
     indptr: Tensor;
     mask: Tensor;
+    mode?: MaskMode;
   }): ExecutionState {
     const pagedKV = cache.getPagedKV();
     pagedKV.checkSequenceCount();

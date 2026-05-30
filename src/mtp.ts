@@ -1,5 +1,6 @@
 import { CaptureManager } from "./capture-manager";
 import { type ChatCache, type ChatModel } from "./chat_model";
+import { MaskMode } from "./device_ops";
 import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { I32 } from "./glm_ops";
 import { MemcpyKind, Tensor } from "./tensor";
@@ -157,11 +158,15 @@ export function mtpTreeDecode(
   const originalAllocLen = seq0.allocLen;
   const hiddenSize = model.cfg.hiddenSize;
 
+  ws.glm.synchronize();
+
   // Iteration 0: decode step — reuse target model's decode slot, produce root + top-2
   captureManager.run((capturing) => {
     using _tracker = ws.startTracking(new Set([targetHiddenStates]));
-    state.setInput(gpuSampleResult.reshape([gpuSampleResult.numElements]));
+    using gpuReshaped = gpuSampleResult.reshape([gpuSampleResult.numElements]);
+    state.setInput(gpuReshaped);
 
+    validationSequences.fill(0, totalTreeNodes);
     validationSequences.memcpy2d(
       0, I32,
       gpuSampleResult, 0, I32,
@@ -183,17 +188,15 @@ export function mtpTreeDecode(
     );
   }, ['mtp-tree', 'layer0']);
 
+  // ws.glm.synchronize();
 
   // Iterations 1+: single-sequence prefill with tree-shaped custom mask
   for (let i = 1; i < nextn; i++) {
     const numPrefillTokens = (1 << (i + 1)) - 2;
 
-    const { mask, indptr } = ensureCustomMask(ws, originalAllocLen, numPrefillTokens, buildMtpTreeMask);
+    const customMask = ensureCustomMask(ws, numPrefillTokens, buildMtpTreeMask);
 
-    const prefillState = ws.planPrefill(model, 1, [numPrefillTokens], cache, {
-      mask,
-      indptr,
-    });
+    const prefillState = ws.planPrefill(model, 1, [numPrefillTokens], cache, customMask);
 
     captureManager.run(() => {
       using _tracker = ws.startTracking(new Set([targetHiddenStates]));
@@ -248,21 +251,16 @@ export function mtpTreeDecode(
   return { validationSequences, nextn };
 }
 
-function buildMtpTreeMask(numPrefillTokens: number, prefixLen: number): { data: Uint8Array; indptr: Int32Array } {
-  const kvLen = prefixLen + numPrefillTokens;
-  const totalBits = numPrefillTokens * kvLen;
+function buildMtpTreeMask(numPrefillTokens: number): { data: Uint8Array; indptr: Int32Array } {
+  const totalBits = numPrefillTokens * numPrefillTokens;
   const byteLen = Math.ceil(totalBits / 8);
   const data = new Uint8Array(byteLen);
 
   for (let q = 0; q < numPrefillTokens; q++) {
-    for (let k = 0; k < prefixLen; k++) {
-      const bit = q * kvLen + k;
-      data[bit >> 3] |= 1 << (bit & 7);
-    }
     let cur = q + 1;
     while (cur > 0) {
-      const kvPos = prefixLen + cur - 1;
-      const bit = q * kvLen + kvPos;
+      const suffixPos = cur - 1;
+      const bit = q * numPrefillTokens + suffixPos;
       data[bit >> 3] |= 1 << (bit & 7);
       cur = (cur - 1) >> 1;
     }
@@ -281,20 +279,15 @@ export interface MtpVerifyResult {
   replacementToken: number;
 }
 
-function buildTreeMask(totalTreeNodes: number, prefixLen: number): { data: Uint8Array; indptr: Int32Array } {
-  const kvLen = prefixLen + totalTreeNodes;
-  const totalBits = totalTreeNodes * kvLen;
+function buildTreeMask(totalTreeNodes: number): { data: Uint8Array; indptr: Int32Array } {
+  const totalBits = totalTreeNodes * totalTreeNodes;
   const byteLen = Math.ceil(totalBits / 8);
   const data = new Uint8Array(byteLen);
 
   for (let q = 0; q < totalTreeNodes; q++) {
-    for (let k = 0; k < prefixLen; k++) {
-      const bit = q * kvLen + k;
-      data[bit >> 3] |= 1 << (bit & 7);
-    }
     let cur = q;
     while (true) {
-      const bit = q * kvLen + (prefixLen + cur);
+      const bit = q * totalTreeNodes + cur;
       data[bit >> 3] |= 1 << (bit & 7);
       if (cur === 0) break;
       cur = (cur - 1) >> 1;
@@ -305,14 +298,14 @@ function buildTreeMask(totalTreeNodes: number, prefixLen: number): { data: Uint8
 }
 
 
-function ensureCustomMask(ws: WorkspaceBase, originalAllocLen: number, numPrefillTokens: number, buildMask: (totalTreeNodes: number, prefixLen: number) => { data: Uint8Array; indptr: Int32Array }) {
-  let mask = ws.tensors.get(`mtp_tree_mask_${numPrefillTokens}-${originalAllocLen}-${buildMask.name}`);
-  let indptr = ws.tensors.get(`mtp_tree_mask_indptr_${numPrefillTokens}-${originalAllocLen}-${buildMask.name}`);
+function ensureCustomMask(ws: WorkspaceBase, numTokens: number, buildMask: (numTokens: number) => { data: Uint8Array; indptr: Int32Array }) {
+  let mask = ws.tensors.get(`mtp_tree_mask_${numTokens}-${buildMask.name}`);
+  let indptr = ws.tensors.get(`mtp_tree_mask_indptr_${numTokens}-${buildMask.name}`);
   if (!mask || !indptr) {
-    const { data: maskData, indptr: maskIndptrData } = buildMask(numPrefillTokens, originalAllocLen);
-    mask = ws.alloc([maskData.length], "U8", `mtp_tree_mask_${numPrefillTokens}-${originalAllocLen}-${buildMask.name}`);
+    const { data: maskData, indptr: maskIndptrData } = buildMask(numTokens);
+    mask = ws.alloc([maskData.length], "U8", `mtp_tree_mask_${numTokens}-${buildMask.name}`);
     mask.h2d(Buffer.from(maskData));
-    indptr = ws.alloc([maskIndptrData.length], "I32", `mtp_tree_mask_indptr_${numPrefillTokens}-${originalAllocLen}-${buildMask.name}`);
+    indptr = ws.alloc([maskIndptrData.length], "I32", `mtp_tree_mask_indptr_${numTokens}-${buildMask.name}`);
     indptr.h2d(i32Buf(maskIndptrData));
     // why is this necessary? illegal memory access without it.
     ws.glm.synchronize();
@@ -321,6 +314,7 @@ function ensureCustomMask(ws: WorkspaceBase, originalAllocLen: number, numPrefil
   return {
     mask,
     indptr,
+    mode: MaskMode.CausalCustom,
   };
 };
 
@@ -391,12 +385,10 @@ export function mtpVerify(
   pagedKV.positionIdsDirty = true;
   pagedKV.pagesDirtyHost = true;
 
-  const { mask, indptr } = ensureCustomMask(ws, originalAllocLen, totalTreeNodes, buildTreeMask);
+  const customMask = ensureCustomMask(ws, totalTreeNodes, buildTreeMask);
 
-  const state = ws.planPrefill(model, 1, [totalTreeNodes], cache, {
-    mask,
-    indptr,
-  });
+  const state = ws.planPrefill(model, 1, [totalTreeNodes], cache, customMask);
+
   state.setInput([allTokenIds]);
 
   using hiddenStates = model.forward(state);

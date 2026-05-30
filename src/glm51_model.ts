@@ -479,7 +479,7 @@ export class Glm51Model extends ChatModel {
 
     const mlaResult = state.isDecode
       ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel)
-      : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel, !state.customMask ? MaskMode.Causal : (state.customMask.mode ?? MaskMode.Custom), state.customMask?.mask, state.customMask?.indptr);
+      : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel, !state.customMask ? MaskMode.Causal : state.customMask.mode, state.customMask?.mask, state.customMask?.indptr);
     using attnOut = mlaResult.o;
     using lseBuf = mlaResult.lse;
 
