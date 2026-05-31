@@ -81,22 +81,6 @@ export abstract class Tensor implements Disposable {
     return this.pinnedBuffer;
   }
 
-  setName(name: string | undefined) {
-    if (name === undefined) {
-      if (this.name !== undefined) {
-        this.workspace.tensors.delete(this.name);
-        (this as { name: string | undefined }).name = undefined;
-      }
-      return;
-    }
-    if (this.name)
-      throw new Error(`Tensor already has name ${this.name}, cannot rename to ${name}`);
-    (this as { name: string }).name = name;
-    this.workspace.tracked.delete(this);
-    this.workspace.exported.delete(this);
-    this.workspace.tensors.set(name, this);
-  }
-
   detachData() {
     (this as { data: number }).data = 0;
     this.pinnedBuffer = undefined;

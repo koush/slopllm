@@ -137,7 +137,6 @@ export interface MtpTreeResult {
  * @returns MtpTreeResult with validation sequences tensor and nextn
  */
 export function mtpTreeDecode(
-  state: ExecutionState,
   captureManager: CaptureManager,
   model: ChatModel,
   targetHiddenStates: Tensor,
@@ -156,88 +155,68 @@ export function mtpTreeDecode(
   const validationSequences = ws.ensureAlloc([totalTreeNodes], "I32", `${totalTreeNodes}-validation-sequences`);
   const seq0 = pagedKV.sequences[0];
   const originalAllocLen = seq0.allocLen;
-  const hiddenSize = model.cfg.hiddenSize;
 
-  ws.glm.synchronize();
+  using previousTiledHs = new UsingHolder<Tensor>(undefined!);
+  using _tracker = ws.startTracking(new Set([targetHiddenStates]));
 
-  // Iteration 0: decode step — reuse target model's decode slot, produce root + top-2
-  captureManager.run((capturing) => {
-    using _tracker = ws.startTracking(new Set([targetHiddenStates]));
-    using gpuReshaped = gpuSampleResult.reshape([gpuSampleResult.numElements]);
-    state.setInput(gpuReshaped);
+  // Iteration: single-sequence prefill with tree-shaped custom mask
+  // 1 -> 3 -> 7 -> 15 for i = 0,1,2,3 (nextn=3)
+  for (let i = 0; i < nextn; i++) {
+    const numPrefillTokens = (1 << (i + 1)) - 1;
 
-    validationSequences.fill(0, totalTreeNodes);
-    validationSequences.memcpy2d(
-      0, I32,
-      gpuSampleResult, 0, I32,
-      I32, 1,
-      MemcpyKind.DeviceToDevice,
-    );
-
-    using hiddenStates = model.forwardMtp!(state, targetHiddenStates);
-    using logits = state.computeLogits(hiddenStates, model);
-    const topk = logits.topk(2, model.cfg.vocabSize);
-    using _values = topk.values;
-    using indices = topk.indices;
-
-    validationSequences.memcpy2d(
-      I32, 2 * I32,
-      indices, 0, 2 * I32,
-      2 * I32, 1,
-      MemcpyKind.DeviceToDevice,
-    );
-  }, ['mtp-tree', 'layer0']);
-
-  // ws.glm.synchronize();
-
-  // Iterations 1+: single-sequence prefill with tree-shaped custom mask
-  for (let i = 1; i < nextn; i++) {
-    const numPrefillTokens = (1 << (i + 1)) - 2;
-
-    const customMask = ensureCustomMask(ws, numPrefillTokens, buildMtpTreeMask);
-
-    const prefillState = ws.planPrefill(model, 1, [numPrefillTokens], cache, customMask);
+    let prefillState: ExecutionState;
+    if (i === 0) {
+      prefillState = ws.planPrefill(model, 1, [1], cache);
+    }
+    else {
+      const customMask = ensureCustomMask(ws, numPrefillTokens, buildMtpTreeMask);
+      prefillState = ws.planPrefill(model, 1, [numPrefillTokens], cache, customMask);
+    }
 
     captureManager.run(() => {
-      using _tracker = ws.startTracking(new Set([targetHiddenStates]));
 
-      const leafStart = (1 << i) - 2;
-      const leafCount = 1 << i;
-
-      // Copy tree tokens (excluding root at index 0) from validationSequences to input buffer
-      ws.inputIdsBuf.memcpy2d(
-        0, numPrefillTokens * I32,
-        validationSequences, I32, totalTreeNodes * I32,
-        numPrefillTokens * I32, 1,
-        MemcpyKind.DeviceToDevice,
-      );
-
-      prefillState.setInput(ws.inputIdsBuf);
-
-      const tiledHs = ws.ensureAlloc([numPrefillTokens, hiddenSize], "BF16", `tiled_hs_${numPrefillTokens}-${hiddenSize}`);
-      const rowBytes = hiddenSize * 2;
-      for (let j = 0; j < numPrefillTokens; j++) {
-        tiledHs.memcpy2d(
-          j * rowBytes, rowBytes,
-          targetHiddenStates, 0, rowBytes,
-          rowBytes, 1,
-          MemcpyKind.DeviceToDevice,
-        );
+      if (i === 0) {
+        using gpuReshaped = gpuSampleResult.reshape([gpuSampleResult.numElements]);
+        prefillState.setInput(gpuReshaped);
+      }
+      else {
+        prefillState.setInput(ws.inputIdsBuf);
       }
 
-      using hiddenStates = model.forwardMtp!(prefillState, tiledHs);
+      // results in i ^ 2 + 1 tiled hidden states
+      if (i === 0) {
+        const copy = ws.alloc(targetHiddenStates.shape, targetHiddenStates.type)
+        previousTiledHs.replace(copy);
+        copy.memcpy(targetHiddenStates);
+      }
+      else {
+        previousTiledHs.replace(previousTiledHs.value.cat([previousTiledHs.value], 0));
+        previousTiledHs.replace(previousTiledHs.value.cat([targetHiddenStates], 0));
+      }
+
+      using hiddenStates = model.forwardMtp!(prefillState, previousTiledHs.value);
       using logits = prefillState.computeLogits(hiddenStates, model, null);
 
       const topk = logits.topk(2, model.cfg.vocabSize);
       using _values = topk.values;
       using indices = topk.indices;
 
-      const writeOffset = ((1 << (i + 1)) - 1) * I32;
+      // number of leaves in the prefill
+      const leafCount = 1 << i;
+      // number of nodes in the prefill
+      const nodeCount = numPrefillTokens - leafCount;
+      // start writing after existing tokens (ie 1, 3, 7) to append the new layer's tree top 2 predictions
+      const writeOffset = numPrefillTokens * I32;
+      // each leaf has 2 predictions
       const writeCount = leafCount * 2;
-      validationSequences.memcpy2d(
-        writeOffset, writeCount * I32,
-        indices, leafStart * 2 * I32, numPrefillTokens * 2 * I32,
-        writeCount * I32, 1,
+      ws.inputIdsBuf.memcpy2d(
+        writeOffset, // dst offset
+        writeCount * I32, // dst pitch (unused)
+        indices, // src
+        (nodeCount * 2) * I32, // src offset (each node which has already processed will have 2 predictions that we can skip)
+        writeCount * I32, // src pitch (unused)
+        writeCount * I32, // width
+        1, // height (no pitch)
         MemcpyKind.DeviceToDevice,
       );
     }, ['mtp-tree', `layer${i}`]);
@@ -246,27 +225,41 @@ export function mtpTreeDecode(
     pagedKV.positionIdsDirty = true;
     pagedKV.pagesDirtyHost = true;
     pagedKV.pagesDirtyDevice = true;
+
+    // why is this necessary? without it there's an illegal memory access.
+    if (i === 1)
+      ws.glm.synchronize();
   }
+
+  validationSequences.memcpy(ws.inputIdsBuf, undefined, MemcpyKind.DeviceToDevice);
 
   return { validationSequences, nextn };
 }
 
-function buildMtpTreeMask(numPrefillTokens: number): { data: Uint8Array; indptr: Int32Array } {
+function buildMtpTreeMask(ws: WorkspaceBase, numPrefillTokens: number): { data: Tensor; indptr: Tensor } {
   const totalBits = numPrefillTokens * numPrefillTokens;
   const byteLen = Math.ceil(totalBits / 8);
-  const data = new Uint8Array(byteLen);
+  const data = ws.tensors.get(`mtp_tree_mask_host_${numPrefillTokens}`) || ws.allocPinned([byteLen], "U8", `mtp_tree_mask_host_${numPrefillTokens}`);
 
-  for (let q = 0; q < numPrefillTokens; q++) {
-    let cur = q + 1;
-    while (cur > 0) {
-      const suffixPos = cur - 1;
-      const bit = q * numPrefillTokens + suffixPos;
-      data[bit >> 3] |= 1 << (bit & 7);
-      cur = (cur - 1) >> 1;
+  data.withPinnedBuffer(data => {
+    for (let q = 0; q < numPrefillTokens; q++) {
+      let cur = q + 1;
+      while (cur > 0) {
+        const suffixPos = cur - 1;
+        const bit = q * numPrefillTokens + suffixPos;
+        data[bit >> 3] |= 1 << (bit & 7);
+        cur = (cur - 1) >> 1;
+      }
     }
-  }
+  });
 
-  return { data, indptr: new Int32Array([0, byteLen]) };
+  const indptr = ws.tensors.get(`mtp_tree_mask_indptr_host_${numPrefillTokens}`) || ws.allocPinned([2], "I32", `mtp_tree_mask_indptr_host_${numPrefillTokens}`);
+  indptr.withPinnedBuffer(indptr => {
+    indptr.writeInt32LE(0, 0);
+    indptr.writeInt32LE(byteLen, 4);
+  });
+
+  return { data, indptr };
 }
 
 export interface MtpVerifyResult {
@@ -279,36 +272,42 @@ export interface MtpVerifyResult {
   replacementToken: number;
 }
 
-function buildTreeMask(totalTreeNodes: number): { data: Uint8Array; indptr: Int32Array } {
+function buildTreeMask(ws: WorkspaceBase, totalTreeNodes: number): { data: Tensor; indptr: Tensor } {
   const totalBits = totalTreeNodes * totalTreeNodes;
   const byteLen = Math.ceil(totalBits / 8);
-  const data = new Uint8Array(byteLen);
+  const data = ws.tensors.get(`mtp_tree_mask_host_${totalTreeNodes}`) || ws.allocPinned([byteLen], "U8", `mtp_tree_mask_host_${totalTreeNodes}`);
 
-  for (let q = 0; q < totalTreeNodes; q++) {
-    let cur = q;
-    while (true) {
-      const bit = q * totalTreeNodes + cur;
-      data[bit >> 3] |= 1 << (bit & 7);
-      if (cur === 0) break;
-      cur = (cur - 1) >> 1;
+  data.withPinnedBuffer(data => {
+    for (let q = 0; q < totalTreeNodes; q++) {
+      let cur = q;
+      while (true) {
+        const bit = q * totalTreeNodes + cur;
+        data[bit >> 3] |= 1 << (bit & 7);
+        if (cur === 0) break;
+        cur = (cur - 1) >> 1;
+      }
     }
-  }
+  });
 
-  return { data, indptr: new Int32Array([0, byteLen]) };
+  const indptr = ws.tensors.get(`mtp_tree_mask_indptr_host_${totalTreeNodes}`) || ws.allocPinned([2], "I32", `mtp_tree_mask_indptr_host_${totalTreeNodes}`);
+  indptr.withPinnedBuffer(indptr => {
+    indptr.writeInt32LE(0, 0);
+    indptr.writeInt32LE(byteLen, 4);
+  });
+
+  return { data, indptr };
 }
 
 
-function ensureCustomMask(ws: WorkspaceBase, numTokens: number, buildMask: (numTokens: number) => { data: Uint8Array; indptr: Int32Array }) {
+function ensureCustomMask(ws: WorkspaceBase, numTokens: number, buildMask: (ws: WorkspaceBase, numTokens: number) => { data: Tensor; indptr: Tensor }) {
   let mask = ws.tensors.get(`mtp_tree_mask_${numTokens}-${buildMask.name}`);
   let indptr = ws.tensors.get(`mtp_tree_mask_indptr_${numTokens}-${buildMask.name}`);
   if (!mask || !indptr) {
-    const { data: maskData, indptr: maskIndptrData } = buildMask(numTokens);
-    mask = ws.alloc([maskData.length], "U8", `mtp_tree_mask_${numTokens}-${buildMask.name}`);
-    mask.h2d(Buffer.from(maskData));
-    indptr = ws.alloc([maskIndptrData.length], "I32", `mtp_tree_mask_indptr_${numTokens}-${buildMask.name}`);
-    indptr.h2d(i32Buf(maskIndptrData));
-    // why is this necessary? illegal memory access without it.
-    ws.glm.synchronize();
+    const { data: maskData, indptr: maskIndptrData } = buildMask(ws, numTokens);
+    mask = ws.alloc(maskData.shape, "U8", `mtp_tree_mask_${numTokens}-${buildMask.name}`);
+    mask.memcpy(maskData, maskData.bytes, MemcpyKind.HostToDevice);
+    indptr = ws.alloc(maskIndptrData.shape, "I32", `mtp_tree_mask_indptr_${numTokens}-${buildMask.name}`);
+    indptr.memcpy(maskIndptrData, maskIndptrData.bytes, MemcpyKind.HostToDevice);
   }
 
   return {
@@ -317,12 +316,6 @@ function ensureCustomMask(ws: WorkspaceBase, numTokens: number, buildMask: (numT
     mode: MaskMode.CausalCustom,
   };
 };
-
-function i32Buf(data: Int32Array): Buffer {
-  const buf = Buffer.alloc(data.length * 4);
-  for (let i = 0; i < data.length; i++) buf.writeInt32LE(data[i], i * 4);
-  return buf;
-}
 
 /**
  * Verify MTP draft tokens against the target model using a single-sequence

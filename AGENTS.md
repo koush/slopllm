@@ -53,7 +53,7 @@ return output.removeTracking();  // caller is responsible for disposing this
 ```
 
 Key rules:
-- Named tensors (`setName()` or allocated with a name) cannot be disposed — they live until replaced or the workspace is freed.
+- Named tensors (allocated with a name) cannot be disposed — they live until replaced or the workspace is freed.
 - `using` on an unnamed tensor auto-disposes at block scope exit.
 - `startTracking()` / its `[Symbol.dispose]()` cleans up all tracked tensors at once — cheaper than individual `using` per tensor in hot loops.
 - `removeTracking()` moves a tensor from `tracked` to `exported`, exempting it from the bulk dispose.

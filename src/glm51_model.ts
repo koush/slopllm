@@ -243,8 +243,9 @@ export class Glm51Model extends ChatModel {
     const par = TensorParallelism.Column;
     const kNopeProj = await this.loadDeferredMlaWeight(kNopeKey, par);
     const qNopeProj = await this.loadDeferredMlaWeight(qNopeKey, par);
-    const wAbsorbed = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
-    wAbsorbed.setName(`${layerPfx}.absorbed.weight`);
+    using wAbsorbedTmp = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
+    const wAbsorbed = this.alloc(wAbsorbedTmp.shape, wAbsorbedTmp.type, `${layerPfx}.absorbed.weight`, wAbsorbedTmp.parallelism);
+    wAbsorbed.memcpy(wAbsorbedTmp);
     kNopeProj[Symbol.dispose]();
     qNopeProj[Symbol.dispose]();
     this.pendingKNope.delete(kNopeKey);

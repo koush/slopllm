@@ -30,7 +30,7 @@
                 "--glm51",
                 "--greedy",
                 // "--nvfp4",
-                // "--arena", "92",
+                "--arena", "92",
                 // "--no-cuda-graph",
                 "--cp",
                 "--mtp",

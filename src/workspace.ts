@@ -96,7 +96,7 @@ export class WorkspaceBase implements Disposable {
       if (!t.data)
         throw new Error("disposed tensor should have data");
       if (t.pinned === pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
-        if (name === undefined || t.allocSize === bytes) {
+        if (name === undefined) {
           best = t;
         }
       }
@@ -114,11 +114,10 @@ export class WorkspaceBase implements Disposable {
       if (this.allocLogger) {
         console.warn(`Allocating new tensor ${name ?? "<unnamed>"} of size ${bytes} bytes (${shape.join("x")} ${type}${pinned ? " pinned" : ""}${parallelism ? ` ${parallelism}` : ""})`);
       }
-      tensor = this.glm.newTensor(this, shape, type, pinned, undefined, parallelism);
+      tensor = this.glm.newTensor(this, shape, type, pinned, name, parallelism);
     }
 
     if (name !== undefined) {
-      tensor.setName(name);
       this.tensors.set(name, tensor);
     } else {
       this.addTracked(tensor);

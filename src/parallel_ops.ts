@@ -30,7 +30,9 @@ export class ParallelTensor extends Tensor {
     this.shards = shards;
     this.fullShape = fullShape;
     for (let i = 0; i < shards.length; i++) {
-      shards[i].setName(name);
+      if (shards[i].name !== name) {
+        throw new Error(`Shard ${i} has name ${shards[i].name}, expected ${name}`);
+      }
     }
   }
 
@@ -87,24 +89,6 @@ export class ParallelTensor extends Tensor {
     }
     (this.shards as Tensor[]).length = 0;
     super[Symbol.dispose]();
-  }
-
-  override setName(name: string | undefined): void {
-    if (name === undefined) {
-      if (this.name !== undefined) {
-        this.workspace.tensors.delete(this.name);
-        (this as { name: string | undefined }).name = undefined;
-      }
-    } else {
-      if (this.name) throw new Error(`Tensor already has name ${this.name}, cannot rename to ${name}`);
-      (this as { name: string }).name = name;
-      this.workspace.tracked.delete(this);
-      this.workspace.exported.delete(this);
-      this.workspace.tensors.set(name, this);
-    }
-    for (let i = 0; i < this.shards.length; i++) {
-      this.shards[i].setName(name);
-    }
   }
 
   shard(rank: number): Tensor {
@@ -1178,11 +1162,22 @@ export class ParallelTensor extends Tensor {
     if (!(src instanceof ParallelTensor)) {
       throw new Error("ParallelTensor.memcpy requires ParallelTensor source");
     }
-    const bytes = size ?? Math.min(this.allocSize, src.allocSize);
-    const copyKind = kind ?? MemcpyKind.DeviceToDevice;
-    for (let i = 0; i < this.shards.length; i++) {
-      this.shards[i].memcpy(src.shards[i], bytes, copyKind);
+
+    // straight copy
+    if (this.parallelism === src.parallelism && (size === undefined || this.parallelism === TensorParallelism.Replicated)) {
+      for (let i = 0; i < this.shards.length; i++) {
+        this.shards[i].memcpy(src.shards[i], size, kind);
+      }
+      return;
     }
+
+    if (this.parallelism === TensorParallelism.Replicated) {
+      using gathered = src.allGather(this.workspace);
+      this.memcpy(gathered, size, kind);
+      return;
+    }
+
+    throw new Error(`ParallelTensor.memcpy: unsupported parallelism combination dst ${this.parallelism} src ${src.parallelism}`);
   }
 
   memcpy2d(dstOffset: number, dpitch: number, src: Tensor, srcOffset: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
@@ -2005,7 +2000,7 @@ export class ParallelOps implements DeviceOps {
     const ss = this.shardShape(shape, par);
     const shardWss = this.getShardWorkspaces(workspace);
     const shards: Tensor[] = shardWss.map(ws =>
-      pinned ? ws.allocPinned(ss, type) : ws.alloc(ss, type),
+      pinned ? ws.allocPinned(ss, type, name) : ws.alloc(ss, type, name),
     );
     return new ParallelTensor(workspace, this, par, shards, shape, type, name, pinned, undefined);
   }
