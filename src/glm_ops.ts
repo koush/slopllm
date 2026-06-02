@@ -281,8 +281,9 @@ export class GlmTensor extends Tensor {
     return { values, indices };
   }
 
-  indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
-    super.indexSelect(indices, dim, batch);
+  indexSelect(indices: Tensor, batch: number): Tensor {
+    super.indexSelect(indices, batch);
+    const dim = this.shape[1];
     const out = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, indices.data, dim, batch);
     return out;
@@ -470,6 +471,24 @@ export class GlmTensor extends Tensor {
       );
       offset += srcRowBytes;
     }
+    return out;
+  }
+
+  slice(dim: number, start: number, length: number): Tensor {
+    super.slice(dim, start, length);
+    if (start < 0) {
+      start = this.shape[dim] + start;
+    }
+    const outShape = [...this.shape];
+    outShape[dim] = length;
+    const out = this.workspace.alloc(outShape, this.type);
+    const elemBytes = SafeTensorFile.dtypeBytes(this.type);
+    const outerStrides = this.shape.slice(0, dim).reduce((a, b) => a * b, 1);
+    const innerStride = this.shape.slice(dim + 1).reduce((a, b) => a * b, 1);
+    const srcPitch = this.shape[dim] * innerStride * elemBytes;
+    const dstPitch = length * innerStride * elemBytes;
+    const srcOffset = start * innerStride * elemBytes;
+    out.memcpy2d(0, dstPitch, this, srcOffset, srcPitch, dstPitch, outerStrides, MemcpyKind.DeviceToDevice);
     return out;
   }
 

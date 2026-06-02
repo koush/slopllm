@@ -877,16 +877,16 @@ export class ParallelTensor extends Tensor {
     return { values, indices };
   }
 
-  indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
-    super.indexSelect(indices, dim, batch);
+  indexSelect(indices: Tensor, batch: number): Tensor {
+    super.indexSelect(indices, batch);
     const pIndices = indices as ParallelTensor;
     this.assertParallel("indexSelect src", this, TensorParallelism.Replicated, TensorParallelism.Row);
     this.assertParallel("indexSelect indices", pIndices, TensorParallelism.Replicated, TensorParallelism.PartialSum);
 
-    const shardDim = this.parallelism === TensorParallelism.Row ? this.shardDim(dim, "indexSelect dim") : dim;
+    const dim = this.shape[1];
     const shards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      shards.push(this.shards[i].indexSelect(pIndices.shards[i], shardDim, batch));
+      shards.push(this.shards[i].indexSelect(pIndices.shards[i], batch));
     }
     return this.parallelOps.wrapShards(this.workspace, shards, [batch, dim], this.type, this.parallelism);
   }
@@ -1320,6 +1320,25 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, outShape, this.type, TensorParallelism.Replicated);
   }
 
+  slice(dim: number, start: number, length: number): Tensor {
+    super.slice(dim, start, length);
+    if (this.parallelism === TensorParallelism.PartialSum) {
+      this.allReduce();
+      return this.slice(dim, start, length);
+    }
+    if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
+      using gathered = this.allGather(this.workspace);
+      return gathered.slice(dim, start, length);
+    }
+    const outShape = [...this.fullShape];
+    outShape[dim] = length;
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].slice(dim, start, length));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, outShape, this.type, TensorParallelism.Replicated);
+  }
+
   scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
     const pIndices = indices as ParallelTensor;
     if (this.parallelism !== pIndices.parallelism) {
@@ -1670,7 +1689,7 @@ export class ParallelOps implements DeviceOps {
     if (dtype !== NCCL_BFLOAT16 && dtype !== NCCL_FLOAT32)
       return false;
     // Single-block kernel limit: 1024 threads * 8 vec = 8192 elements.
-    if (count > 8192)
+    if (count > 65536)
       return false;
     const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
     if (!group)

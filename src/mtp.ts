@@ -52,37 +52,20 @@ export function mtpPrefill(
   state: ExecutionState,
   model: ChatModel,
   targetHiddenStates: Tensor,
-  ws: ExecutionWorkspace,
   gpuSampleResult: Tensor,
-  nextn: number,
 ) {
   if (!model.forwardMtp) {
     throw new Error("mtpPrefill: model does not support MTP (forwardMtp not defined)");
   }
 
-  const batchSize = state.batchSize;
-  // topkIndices tracks the rotation token for the next layer.
-  // Layer 0 uses the target model's sampled token; layers 1+ use the previous MTP layer's top-1.
-  using topkIndices = new UsingHolder<Tensor>(undefined!);
+  // Forward through one MTP layer with rotated input
+  using hiddenStates = model.forwardMtp(state, targetHiddenStates, state.input);
 
-  // rotatedIds ping-pongs between workspace allocations.
-  // Source for layer 0 is state.input (the original prompt tokens).
-  using rotatedIds = new UsingHolder<Tensor>(undefined!);
-
-  for (let i = 0; i < nextn; i++) {
-    // Rotate input IDs: shift each sequence left by 1, append previous prediction
-    const source = rotatedIds.value ?? state.input!;
-    rotatedIds.replace(source.rotateInputIds(ws.qoIndptrD, topkIndices.value || gpuSampleResult, batchSize));
-
-    // Forward through one MTP layer with rotated input
-    using hiddenStates = model.forwardMtp(state, targetHiddenStates, rotatedIds.value);
-
-    // Sample top-1 from this layer's output for the next rotation
-    using logits = state.computeLogits(hiddenStates, model);
-    const topk = logits.topk(1, model.cfg.vocabSize);
-    using _values = topk.values;
-    topkIndices.replace(topk.indices); // [batchSize, 1] I32 — stride-compatible with rotateInputIds
-  }
+  // Sample top-1 from this layer's output for the next rotation
+  using logits = state.computeLogits(hiddenStates, model);
+  const topk = logits.topk(1, model.cfg.vocabSize);
+  using _values = topk.values;
+  using _indices = topk.indices;
 }
 
 /**
@@ -104,6 +87,29 @@ export function mtpPrefill(
 export interface MtpTreeResult {
   validationSequences: Tensor;
   nextn: number;
+}
+
+function getPositionIdsMask(ws: ExecutionWorkspace, originalAllocLen: number, totalTreeNodes: number) {
+    const positionIds = ws.ensureAlloc(ws.positionIds.shape, ws.positionIds.type, `mtp_tree_position_ids-${totalTreeNodes}`);
+    function treeDepth(n: number): number {
+      let depth = 0;
+      while (n > 0) {
+        n = (n - 1) >> 1;
+        depth++;
+      }
+      return depth;
+    }
+
+    const positionIdsH = ws.ensureAllocPinned(ws.positionIds.shape, ws.positionIds.type, `mtp_tree_position_ids_host-${totalTreeNodes}`);
+    positionIdsH.withPinnedBuffer(buf => {
+      let posOff = 0;
+      for (let p = 0; p < totalTreeNodes; p++) {
+        buf.writeInt32LE(originalAllocLen + treeDepth(p), posOff * I32);
+        posOff++;
+      }
+    });
+    positionIds.memcpy(positionIdsH, totalTreeNodes * I32, MemcpyKind.HostToDevice);
+    return positionIds;
 }
 
 /**
@@ -141,7 +147,7 @@ export function mtpTreeDecode(
   model: ChatModel,
   targetHiddenStates: Tensor,
   ws: ExecutionWorkspace,
-  gpuSampleResult: Tensor,
+  currentToken: number,
   nextn: number,
   cache: ChatCache,
 ): MtpTreeResult {
@@ -156,8 +162,16 @@ export function mtpTreeDecode(
   const seq0 = pagedKV.sequences[0];
   const originalAllocLen = seq0.allocLen;
 
-  using previousTiledHs = new UsingHolder<Tensor>(undefined!);
   using _tracker = ws.startTracking(new Set([targetHiddenStates]));
+
+  const hiddenDim = targetHiddenStates.shape[1];
+  const rowBytes = hiddenDim * 2; // BF16 = 2 bytes per element
+  // Buffer to save MTP output from previous iteration for chained hidden states.
+  // Each node p > 0 is conditioned on its parent's MTP output (matching the
+  // single-layer EAGLE worker's decode path where hidden_states are chained).
+  const prevMtpOutput = ws.ensureAlloc([(1 << nextn) - 1, hiddenDim], "BF16", `mtp-tree-prev-mtp-${totalTreeNodes}`);
+
+
 
   // Iteration: single-sequence prefill with tree-shaped custom mask
   // 1 -> 3 -> 7 -> 15 for i = 0,1,2,3 (nextn=3)
@@ -167,35 +181,64 @@ export function mtpTreeDecode(
     let prefillState: ExecutionState;
     if (i === 0) {
       prefillState = ws.planPrefill(model, 1, [1], cache);
+      prefillState.setInput([[currentToken]]);
     }
     else {
-      const customMask = ensureCustomMask(ws, numPrefillTokens, buildMtpTreeMask);
-      prefillState = ws.planPrefill(model, 1, [numPrefillTokens], cache, customMask);
+      const customMask = ensureCustomMask(ws, numPrefillTokens, buildTreeMask);
+      prefillState = ws.planPrefill(model, 1, [numPrefillTokens], cache, {
+        ...customMask,
+        positionIds: getPositionIdsMask(ws, originalAllocLen, totalTreeNodes),
+      });
     }
 
     captureManager.run(() => {
+      prefillState.setInput(ws.inputIdsBuf);
+
+      // Build tiled hidden states: node 0 gets targetHS, node p>0 gets its
+      // parent's MTP output from the previous iteration (chained, matching the
+      // single-layer EAGLE worker's decode path).
+      //   tiledHs[0]         = targetHS            (root)
+      //   tiledHs[2p+1]     = prevMtpOutput[p]    (child 1 of node p)
+      //   tiledHs[2p+2]     = prevMtpOutput[p]    (child 2 of node p)
+      const tiledHs = ws.ensureAlloc([numPrefillTokens, hiddenDim], "BF16", `mtp-tree-hs-${numPrefillTokens}`);
 
       if (i === 0) {
-        using gpuReshaped = gpuSampleResult.reshape([gpuSampleResult.numElements]);
-        prefillState.setInput(gpuReshaped);
-      }
-      else {
-        prefillState.setInput(ws.inputIdsBuf);
+        tiledHs.memcpy(targetHiddenStates);
+      } else {
+        // Row 0: target model hidden state (root node)
+        tiledHs.memcpy2d(
+          0, rowBytes,
+          targetHiddenStates, 0, rowBytes,
+          rowBytes, 1,
+          MemcpyKind.DeviceToDevice,
+        );
+        // Odd rows (1,3,5,…): one copy of each parent's MTP output
+        const numParents = (numPrefillTokens - 1) >> 1;
+        tiledHs.memcpy2d(
+          1 * rowBytes, 2 * rowBytes,
+          prevMtpOutput, 0, rowBytes,
+          rowBytes, numParents,
+          MemcpyKind.DeviceToDevice,
+        );
+        // Even rows (2,4,6,…): duplicate from odd rows (sibling shares same parent)
+        tiledHs.memcpy2d(
+          2 * rowBytes, 2 * rowBytes,
+          tiledHs, 1 * rowBytes, 2 * rowBytes,
+          rowBytes, numParents,
+          MemcpyKind.DeviceToDevice,
+        );
       }
 
-      // results in i ^ 2 + 1 tiled hidden states
-      if (i === 0) {
-        const copy = ws.alloc(targetHiddenStates.shape, targetHiddenStates.type)
-        previousTiledHs.replace(copy);
-        copy.memcpy(targetHiddenStates);
-      }
-      else {
-        previousTiledHs.replace(previousTiledHs.value.cat([previousTiledHs.value], 0));
-        previousTiledHs.replace(previousTiledHs.value.cat([targetHiddenStates], 0));
-      }
-
-      using hiddenStates = model.forwardMtp!(prefillState, previousTiledHs.value);
+      using hiddenStates = model.forwardMtp!(prefillState, tiledHs);
       using logits = prefillState.computeLogits(hiddenStates, model, null);
+
+      // Save this iteration's MTP output for the next iteration's chaining
+      prevMtpOutput.memcpy2d(
+        0, rowBytes,
+        hiddenStates, 0, rowBytes,
+        rowBytes, numPrefillTokens,
+        MemcpyKind.DeviceToDevice,
+      );
 
       const topk = logits.topk(2, model.cfg.vocabSize);
       using _values = topk.values;
@@ -227,49 +270,14 @@ export function mtpTreeDecode(
     pagedKV.pagesDirtyDevice = true;
 
     // why is this necessary? without it there's an illegal memory access.
-    if (i === 1)
-      ws.glm.synchronize();
+    // actually without the sync all the host pointers are written in a tight loop,
+    // and the memcpy may happen before the data has been read and send to gpu.
+    ws.glm.synchronize();
   }
 
   validationSequences.memcpy(ws.inputIdsBuf, undefined, MemcpyKind.DeviceToDevice);
 
   return { validationSequences, nextn };
-}
-
-function buildMtpTreeMask(ws: WorkspaceBase, numPrefillTokens: number): { data: Tensor; indptr: Tensor } {
-  const totalBits = numPrefillTokens * numPrefillTokens;
-  const byteLen = Math.ceil(totalBits / 8);
-  const data = ws.tensors.get(`mtp_tree_mask_host_${numPrefillTokens}`) || ws.allocPinned([byteLen], "U8", `mtp_tree_mask_host_${numPrefillTokens}`);
-
-  data.withPinnedBuffer(data => {
-    for (let q = 0; q < numPrefillTokens; q++) {
-      let cur = q + 1;
-      while (cur > 0) {
-        const suffixPos = cur - 1;
-        const bit = q * numPrefillTokens + suffixPos;
-        data[bit >> 3] |= 1 << (bit & 7);
-        cur = (cur - 1) >> 1;
-      }
-    }
-  });
-
-  const indptr = ws.tensors.get(`mtp_tree_mask_indptr_host_${numPrefillTokens}`) || ws.allocPinned([2], "I32", `mtp_tree_mask_indptr_host_${numPrefillTokens}`);
-  indptr.withPinnedBuffer(indptr => {
-    indptr.writeInt32LE(0, 0);
-    indptr.writeInt32LE(byteLen, 4);
-  });
-
-  return { data, indptr };
-}
-
-export interface MtpVerifyResult {
-  /** Number of draft tokens accepted (0..nextn). */
-  numAccepted: number;
-  /** The accepted draft token IDs from the winning path. */
-  acceptedTokens: number[];
-  /** Target model's argmax at the first mismatch position (or bonus token if all accepted).
-   *  This is the token the target model would generate instead of the rejected draft. */
-  replacementToken: number;
 }
 
 function buildTreeMask(ws: WorkspaceBase, totalTreeNodes: number): { data: Tensor; indptr: Tensor } {
@@ -278,6 +286,7 @@ function buildTreeMask(ws: WorkspaceBase, totalTreeNodes: number): { data: Tenso
   const data = ws.tensors.get(`mtp_tree_mask_host_${totalTreeNodes}`) || ws.allocPinned([byteLen], "U8", `mtp_tree_mask_host_${totalTreeNodes}`);
 
   data.withPinnedBuffer(data => {
+    data.fill(0);
     for (let q = 0; q < totalTreeNodes; q++) {
       let cur = q;
       while (true) {
@@ -345,54 +354,65 @@ function ensureCustomMask(ws: WorkspaceBase, numTokens: number, buildMask: (ws: 
  * @returns MtpVerifyResult with numAccepted, acceptedTokens, and replacementToken
  */
 export function mtpVerify(
+  captureManager: CaptureManager,
   model: ChatModel,
+  targetHiddenStates: UsingHolder<Tensor>,
   ws: ExecutionWorkspace,
   cache: ChatCache,
   treeResult: MtpTreeResult,
+  currentToken: number,
   tokenizer?: any,
-): MtpVerifyResult {
+) {
   const pagedKV = cache.getPagedKV();
   const nextn = treeResult.nextn;
   const totalPaths = 1 << nextn;
   const totalTreeNodes = 2 * totalPaths - 1;
-  const pageSize = pagedKV.pageSize;
-
+  
   if (pagedKV.sequences.length !== 1) {
     throw new Error(`mtpVerify: expected 1 sequence, got ${pagedKV.sequences.length}`);
   }
 
+  using _tracker = ws.startTracking(new Set([treeResult.validationSequences, targetHiddenStates.value]));
+
   const seq0 = pagedKV.sequences[0];
   const originalAllocLen = seq0.allocLen;
-  const tokenIds = seq0.getTokenIds();
 
-  using hostBuf = ws.allocPinned(treeResult.validationSequences.shape, treeResult.validationSequences.type);
-  hostBuf.memcpy(treeResult.validationSequences, treeResult.validationSequences.bytes, MemcpyKind.DeviceToHost);
-  ws.glm.synchronize();
-  const treeTokens = Buffer.from(hostBuf.readPinnedBuffer());
-
-  const allTokenIds: number[] = [];
-  for (let i = 0; i < totalTreeNodes; i++) {
-    allTokenIds.push(treeTokens.readInt32LE(i * 4));
-  }
+  const hostBuf = ws.ensureAllocPinned(treeResult.validationSequences.shape, treeResult.validationSequences.type, `mtp_verify_host_buf_${totalTreeNodes}`);
 
   pagedKV.positionIdsDirty = true;
   pagedKV.pagesDirtyHost = true;
+  pagedKV.pagesDirtyDevice = true;
 
   const customMask = ensureCustomMask(ws, totalTreeNodes, buildTreeMask);
 
-  const state = ws.planPrefill(model, 1, [totalTreeNodes], cache, customMask);
+  const state = ws.planPrefill(model, 1, [totalTreeNodes], cache, {
+    ...customMask,
+    positionIds: getPositionIdsMask(ws, originalAllocLen, totalTreeNodes),
+  });
 
-  state.setInput([allTokenIds]);
+  captureManager.run(() => {
+    using stream = ws.glm.withStream(() => {
+      hostBuf.memcpy(treeResult.validationSequences, treeResult.validationSequences.bytes, MemcpyKind.DeviceToHost);
+    });
 
-  using hiddenStates = model.forward(state);
-  using logits = state.computeLogits(hiddenStates, model, null);
+    state.setInput(treeResult.validationSequences);
 
-  using argmaxResult = logits.argmax();
-  using argmaxHost = ws.allocPinned(argmaxResult.shape, argmaxResult.type);
-  argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
+    const hiddenStates = model.forwardModel(state);
+    using logits = state.computeLogits(hiddenStates, model, null);
+    using argmaxResult = logits.argmax();
+
+    console.log(argmaxResult.readInt32LEArray().map(v => tokenizer.decode([v], { skip_special_tokens: false })));
+
+    const argmaxHost = ws.ensureAllocPinned(argmaxResult.shape, argmaxResult.type, `mtp_verify_argmax_host_${totalTreeNodes}`);
+    argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
+
+    stream.streamWaitEvent();
+  }, ['mtp-verify']);
 
   ws.glm.synchronize();
-  const argmaxBuf = Buffer.from(argmaxHost.readPinnedBuffer());
+  const argmaxHost = ws.tensors.get(`mtp_verify_argmax_host_${totalTreeNodes}`)!;
+  const argmaxBuf = argmaxHost.readPinnedBuffer();
+  const treeTokens = hostBuf.readPinnedBuffer();
 
   let bestPath = 0;
   let bestAccepted = -1;
@@ -429,19 +449,41 @@ export function mtpVerify(
   }
 
   seq0.truncate(originalAllocLen);
-  const lastContentPageIdx = seq0.contentPages - 1;
-  if (lastContentPageIdx >= 0) {
-    const expected = tokenIds.length - lastContentPageIdx * pageSize;
-    if (seq0.pages[lastContentPageIdx].tokenIds.length > expected) {
-      seq0.pages[lastContentPageIdx].tokenIds.length = Math.max(0, expected);
-    }
-  }
-
   pagedKV.positionIdsDirty = true;
   pagedKV.pagesDirtyHost = true;
   pagedKV.pagesDirtyDevice = true;
 
-  return { numAccepted: bestAccepted, acceptedTokens, replacementToken: bestReplacement };
+  const finishTokens = [currentToken, ...acceptedTokens, bestReplacement];
+  const finishState = ws.planPrefill(model, 1, [finishTokens.length], cache);
+  finishState.setInput([finishTokens]);
+  captureManager.run(() => {
+    targetHiddenStates.replace(model.forwardModel(finishState));
+    using logits = finishState.computeLogits(targetHiddenStates.value, model);
+    using logits2 = finishState.computeLogits(targetHiddenStates.value, model, null);
+
+
+    using argmaxResult = logits.argmax();
+    console.log(argmaxResult.readInt32LEArray().map(v => tokenizer.decode([v], { skip_special_tokens: false })));
+
+    using argmaxResult2 = logits2.argmax();
+    console.log(argmaxResult2.readInt32LEArray().map(v => tokenizer.decode([v], { skip_special_tokens: false })));
+
+    const argmaxHost = ws.tensors.get(`mtp_verify_argmax_host_${totalTreeNodes}`)!;
+    argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
+
+  }, ['mtp-verify-finish']);
+
+  ws.glm.synchronize();
+
+  const targetToken = argmaxBuf.readInt32LE(0);
+
+  finishState.setInput([[targetToken]]);
+
+  const verifiedTokens = finishTokens.slice();
+  // remove the input token.
+  verifiedTokens.shift();
+
+  return [...verifiedTokens, targetToken];
 }
 
 

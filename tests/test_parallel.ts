@@ -1913,7 +1913,7 @@ describe("ParallelOps.indexSelect", () => {
     idx.h2d(indicesBuf);
     po.synchronize();
 
-    using out = src.indexSelect(idx, srcDim, batch);
+    using out = src.indexSelect(idx, batch);
     po.synchronize();
 
     const outBuf = Buffer.alloc(k * srcDim * 2);

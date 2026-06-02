@@ -104,8 +104,9 @@ export class MetaTensor extends Tensor {
         return { values, indices };
     }
 
-    indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
-        super.indexSelect(indices, dim, batch);
+    indexSelect(indices: Tensor, batch: number): Tensor {
+        super.indexSelect(indices, batch);
+        const dim = this.shape[1];
         return this.workspace.alloc([batch, dim], this.type);
     }
 
@@ -197,6 +198,13 @@ export class MetaTensor extends Tensor {
         super.cat(tensors, dim);
         const outShape = [...this.shape];
         for (const t of tensors) outShape[dim] += t.shape[dim];
+        return this.workspace.alloc(outShape, this.type);
+    }
+
+    slice(dim: number, start: number, length: number): Tensor {
+        super.slice(dim, start, length);
+        const outShape = [...this.shape];
+        outShape[dim] = length;
         return this.workspace.alloc(outShape, this.type);
     }
 

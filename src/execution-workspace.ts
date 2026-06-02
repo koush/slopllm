@@ -12,48 +12,28 @@ export const MLA_DECODE_PLAN_INFO_SIZE = 10;
 
 
 export class ExecutionState {
-  batchSize: number;
-  totalTokens: number;
-  seqLens: number[];
   input?: Tensor;
-  readonly isDecode: boolean;
-  readonly ws: ExecutionWorkspace;
-  readonly cache: ChatCache;
-  readonly qoIndptrHost?: Tensor;
-  customMask?: {
-    indptr: Tensor;
-    mask: Tensor;
-    mode?: MaskMode;
-  };
 
   constructor(
-    batchSize: number, totalTokens: number, seqLens: number[],
-    isDecode: boolean, ws: ExecutionWorkspace, cache: ChatCache,
-    qoIndptrHost?: Tensor, customMask?: {
+    public readonly batchSize: number, public readonly totalTokens: number, public readonly seqLens: number[],
+    public readonly isDecode: boolean, public readonly ws: ExecutionWorkspace, public readonly cache: ChatCache,
+    public readonly qoIndptrHost?: Tensor, public readonly customMask?: {
       indptr: Tensor;
       mask: Tensor;
       mode?: MaskMode;
+      positionIds?: Tensor;
     },
   ) {
-    this.batchSize = batchSize;
-    this.totalTokens = totalTokens;
-    this.seqLens = seqLens;
-    this.isDecode = isDecode;
-    this.ws = ws;
-    this.cache = cache;
-    this.qoIndptrHost = qoIndptrHost;
-    this.customMask = customMask;
   }
 
   computeLogits(hiddenStates: Tensor, model: ChatModel, lastIdx: Tensor | null = this.ws.lastIdx): Tensor {
     const lmHead = model.tensors.get("lm_head.weight")!;
-    const hs = model.cfg.hiddenSize;
     const batchSize = this.batchSize;
     if (this.isDecode) {
       return hiddenStates.linear(lmHead, batchSize).removeTracking();
     }
     else if (lastIdx) {
-      using hiddenLast = hiddenStates.indexSelect(lastIdx, hs, batchSize);
+      using hiddenLast = hiddenStates.indexSelect(lastIdx, batchSize);
       return hiddenLast.linear(lmHead, batchSize).removeTracking();
     }
     else {
@@ -423,6 +403,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     indptr: Tensor;
     mask: Tensor;
     mode?: MaskMode;
+    positionIds?: Tensor;
   }): ExecutionState {
     const pagedKV = cache.getPagedKV();
     pagedKV.checkSequenceCount();
@@ -497,7 +478,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         this.mlaPrefillPlanInfo,
         this.qoIndptrH, this.indptrH,
         this.kvLenH, this.lastPageLenH,
-        batchSize, nHeads, cfg.kvLoraRank!, !customMask,
+        batchSize, nHeads, cfg.kvLoraRank!, !customMask || customMask.mode === MaskMode.CausalCustom  || customMask.mode === MaskMode.Causal,
         pagedKV.pageSize, pagedKV.sequences.map(s => s.allocLen),
         pagedKV.contextParallel
       );

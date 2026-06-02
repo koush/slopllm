@@ -779,3 +779,336 @@ def test_mla_decode_lse(glm, device):
     glm.free_buf(float_ws)
     glm.free_buf(int_ws)
     glm.free_pinned(pinned_int_ws)
+
+
+def mla_prefill_reference_custom_mask(q_nope, q_pe_rope, ckv, kpe_rope, sm_scale, custom_mask, prefix_len=0):
+    """Reference MLA prefill with custom mask support.
+
+    Args:
+        custom_mask: boolean array of shape [qo_len, kv_len] or [qo_len, suffix_len].
+                     If prefix_len > 0, custom_mask is [qo_len, suffix_len] and
+                     prefix positions are always attended (CausalCustom semantics).
+        prefix_len: number of prefix KV positions (always attended).
+    """
+    BS, H, D_CKV = q_nope.shape
+    S = ckv.shape[1]
+    D_KPE = q_pe_rope.shape[-1]
+
+    ckv_exp = ckv.expand(H, S, D_CKV)
+    kpe_exp = kpe_rope.expand(H, S, D_KPE)
+
+    score_nope = torch.einsum('bhd,hkd->bhk', q_nope, ckv_exp)
+    score_pe = torch.einsum('bhd,hkd->bhk', q_pe_rope, kpe_exp)
+    score = (score_nope + score_pe) * sm_scale
+
+    if prefix_len > 0:
+        suffix_len = S - prefix_len
+        mask = torch.full((BS, S), float('-inf'), device=score.device, dtype=score.dtype)
+        for q in range(BS):
+            for k in range(prefix_len):
+                mask[q, k] = 0.0
+            for k in range(suffix_len):
+                if custom_mask[q * suffix_len + k]:
+                    mask[q, prefix_len + k] = 0.0
+        score = score + mask.unsqueeze(1)
+    else:
+        mask = torch.full((BS, S), float('-inf'), device=score.device, dtype=score.dtype)
+        for q in range(BS):
+            for k in range(S):
+                if custom_mask[q * S + k]:
+                    mask[q, k] = 0.0
+        score = score + mask.unsqueeze(1)
+
+    attn = torch.nn.functional.softmax(score.float(), dim=-1).to(q_nope.dtype)
+    output = torch.einsum('bhk,hkd->bhd', attn, ckv_exp)
+    return output
+
+
+def _pack_mask(mask_bool, qo_len, kv_len):
+    total_bits = qo_len * kv_len
+    byte_len = (total_bits + 7) // 8
+    data = bytearray(byte_len)
+    for q in range(qo_len):
+        for k in range(kv_len):
+            if mask_bool[q * kv_len + k]:
+                offset = q * kv_len + k
+                data[offset >> 3] |= 1 << (offset & 7)
+    indptr = (ctypes.c_int32 * 2)(0, byte_len)
+    return bytes(data), indptr
+
+
+def _run_mla_prefill_with_mask(glm, device, q_nope, q_pe_rope, ckv_paged, kpe_paged,
+                                kv_indices, qo_len, kv_len, num_heads,
+                                causal, custom_mask_data=None, mask_indptr=None,
+                                mask_mode=0, page_size=1):
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
+    B = 1
+    float_ws, int_ws, pinned_int_ws = _alloc_workspace(glm)
+
+    qo_indptr_h = (ctypes.c_int32 * 2)(0, qo_len)
+    kv_indptr_h = (ctypes.c_int32 * 2)(0, kv_len)
+    kv_len_h = (ctypes.c_int32 * 1)(kv_len)
+    plan_info = (ctypes.c_int64 * 19)()
+
+    glm.mla_prefill_plan(
+        float_ws, 32 * 1024 * 1024,
+        int_ws, pinned_int_ws, 8 * 1024 * 1024,
+        ctypes.addressof(plan_info),
+        ctypes.addressof(qo_indptr_h),
+        ctypes.addressof(kv_indptr_h),
+        ctypes.addressof(kv_len_h),
+        B, num_heads, HEAD_DIM_CKV, causal)
+
+    o = torch.empty(B * qo_len, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+
+    custom_mask_ptr = None
+    mask_indptr_ptr = None
+    if custom_mask_data is not None:
+        custom_mask_ptr = (ctypes.c_uint8 * len(custom_mask_data))(*custom_mask_data)
+        mask_indptr_ptr = mask_indptr
+
+    mask_mode_int = mask_mode
+
+    glm.mla_prefill_run(
+        q_nope.data_ptr(), q_pe_rope.data_ptr(),
+        ckv_paged.data_ptr(), kpe_paged.data_ptr(),
+        kv_indices.data_ptr(),
+        o.data_ptr(),
+        float_ws, int_ws, ctypes.addressof(plan_info),
+        num_heads, page_size, mask_mode_int, sm_scale,
+        num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
+        num_heads * HEAD_DIM_KPE, HEAD_DIM_KPE,
+        page_size * HEAD_DIM_CKV, HEAD_DIM_CKV,
+        page_size * HEAD_DIM_KPE, HEAD_DIM_KPE,
+        num_heads * HEAD_DIM_CKV, HEAD_DIM_CKV,
+        HEAD_DIM_CKV, HEAD_DIM_KPE,
+        None, 0, 0,
+        custom_mask_ptr, mask_indptr_ptr)
+
+    glm.synchronize()
+
+    glm.free_buf(float_ws)
+    glm.free_buf(int_ws)
+    glm.free_pinned(pinned_int_ws)
+
+    return o
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mla_prefill_causal_custom_tree_mask(glm, device):
+    """Test CausalCustom mask with tree-structured attention mask and prefix.
+
+    This directly tests the mask pattern used by MTP tree verification:
+    - A prefix of existing KV cache entries (always attended)
+    - A suffix of tree tokens with a tree-shaped custom mask
+    - Each tree node attends to itself and its ancestors
+    """
+    B = 1
+    prefix_len = 16
+    num_prefill = 7
+    qo_len = num_prefill
+    kv_len = prefix_len + num_prefill
+    num_heads = 4
+    page_size = 1
+    num_pages = kv_len
+
+    torch.manual_seed(123)
+
+    q_nope = torch.randn(B * qo_len, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn(B * qo_len, num_heads, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+    ckv = torch.randn(kv_len, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    kpe = torch.randn(kv_len, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+
+    cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, qo_len)
+    q_pe_4d = q_pe.reshape(B, num_heads, qo_len, HEAD_DIM_KPE)
+    q_pe_rope = torch.empty_like(q_pe_4d)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
+    q_pe_rope = q_pe_rope.reshape(B * qo_len, num_heads, HEAD_DIM_KPE)
+
+    kpe_4d = kpe.reshape(kv_len, 1, HEAD_DIM_KPE)
+    kpe_rope_4d = torch.empty_like(kpe_4d)
+    kpe_cos = cos[:, :kv_len, :]
+    kpe_sin = sin[:, :kv_len, :]
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d.expand(B, kv_len, HEAD_DIM_KPE),
+                              kpe_cos, kpe_sin, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
+    kpe_rope = kpe_rope_4d.reshape(kv_len, HEAD_DIM_KPE)
+
+    ckv_paged = ckv.reshape(num_pages, page_size, HEAD_DIM_CKV)
+    kpe_paged = kpe_rope.reshape(num_pages, page_size, HEAD_DIM_KPE)
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+
+    # Build tree mask: binary tree with depth 3 (7 nodes)
+    parents = [[], [0], [0], [1], [1], [2], [2]]
+    suffix_mask = [False] * (qo_len * qo_len)
+    for q in range(qo_len):
+        suffix_mask[q * qo_len + q] = True
+        cur = q
+        while len(parents[cur]) > 0:
+            cur = parents[cur][0]
+            suffix_mask[q * qo_len + cur] = True
+
+    packed_mask, mask_indptr = _pack_mask(suffix_mask, qo_len, qo_len)
+
+    # Run with CausalCustom (mask_mode=4)
+    o_cc = _run_mla_prefill_with_mask(
+        glm, device, q_nope, q_pe_rope, ckv_paged, kpe_paged,
+        kv_indices, qo_len, kv_len, num_heads,
+        causal=True,
+        custom_mask_data=packed_mask, mask_indptr=mask_indptr,
+        mask_mode=4,
+        page_size=page_size)
+
+    # Build full custom mask for reference
+    full_mask = [False] * (qo_len * kv_len)
+    for q in range(qo_len):
+        for k in range(prefix_len):
+            full_mask[q * kv_len + k] = True
+        for k in range(qo_len):
+            full_mask[q * kv_len + prefix_len + k] = suffix_mask[q * qo_len + k]
+
+    ref_output = mla_prefill_reference_custom_mask(
+        q_nope, q_pe_rope,
+        ckv.unsqueeze(0), kpe_rope.unsqueeze(0),
+        1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE),
+        full_mask, prefix_len=prefix_len)
+
+    torch.testing.assert_close(o_cc.cpu(), ref_output.cpu(), atol=0.05, rtol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mla_prefill_causal_custom_matches_full_custom(glm, device):
+    """Test that CausalCustom produces the same output as full Custom mask (15-node tree)."""
+    B = 1
+    prefix_len = 32
+    num_prefill = 15
+    qo_len = num_prefill
+    kv_len = prefix_len + num_prefill
+    num_heads = 4
+    page_size = 1
+    num_pages = kv_len
+
+    torch.manual_seed(456)
+
+    q_nope = torch.randn(B * qo_len, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn(B * qo_len, num_heads, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+    ckv = torch.randn(kv_len, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    kpe = torch.randn(kv_len, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+
+    cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, qo_len)
+    q_pe_4d = q_pe.reshape(B, num_heads, qo_len, HEAD_DIM_KPE)
+    q_pe_rope = torch.empty_like(q_pe_4d)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
+    q_pe_rope = q_pe_rope.reshape(B * qo_len, num_heads, HEAD_DIM_KPE)
+
+    kpe_4d = kpe.reshape(kv_len, 1, HEAD_DIM_KPE)
+    kpe_rope_4d = torch.empty_like(kpe_4d)
+    kpe_cos = cos[:, :kv_len, :]
+    kpe_sin = sin[:, :kv_len, :]
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d.expand(B, kv_len, HEAD_DIM_KPE),
+                              kpe_cos, kpe_sin, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
+    kpe_rope = kpe_rope_4d.reshape(kv_len, HEAD_DIM_KPE)
+
+    ckv_paged = ckv.reshape(num_pages, page_size, HEAD_DIM_CKV)
+    kpe_paged = kpe_rope.reshape(num_pages, page_size, HEAD_DIM_KPE)
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+
+    # Build tree mask (binary tree depth 4, 15 nodes)
+    parents = [[], [0], [0], [1], [1], [2], [2], [3], [3], [4], [4], [5], [5], [6], [6]]
+    suffix_mask = [False] * (qo_len * qo_len)
+    for q in range(qo_len):
+        suffix_mask[q * qo_len + q] = True
+        cur = q
+        while len(parents[cur]) > 0:
+            cur = parents[cur][0]
+            suffix_mask[q * qo_len + cur] = True
+
+    # CausalCustom mask
+    packed_suffix, suffix_indptr = _pack_mask(suffix_mask, qo_len, qo_len)
+    o_cc = _run_mla_prefill_with_mask(
+        glm, device, q_nope, q_pe_rope, ckv_paged, kpe_paged,
+        kv_indices, qo_len, kv_len, num_heads,
+        causal=True,
+        custom_mask_data=packed_suffix, mask_indptr=suffix_indptr,
+        mask_mode=4,
+        page_size=page_size)
+
+    # Full Custom mask (prefix always attended + tree mask for suffix)
+    full_mask = [False] * (qo_len * kv_len)
+    for q in range(qo_len):
+        for k in range(prefix_len):
+            full_mask[q * kv_len + k] = True
+        for k in range(qo_len):
+            full_mask[q * kv_len + prefix_len + k] = suffix_mask[q * qo_len + k]
+
+    packed_full, full_indptr = _pack_mask(full_mask, qo_len, kv_len)
+    o_full = _run_mla_prefill_with_mask(
+        glm, device, q_nope, q_pe_rope, ckv_paged, kpe_paged,
+        kv_indices, qo_len, kv_len, num_heads,
+        causal=False,
+        custom_mask_data=packed_full, mask_indptr=full_indptr,
+        mask_mode=2,
+        page_size=page_size)
+
+    torch.testing.assert_close(o_cc.cpu(), o_full.cpu(), atol=0.01, rtol=0.005)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mla_prefill_causal_custom_causal_suffix_matches_causal(glm, device):
+    """Test that CausalCustom with a causal suffix mask matches built-in causal attention."""
+    B = 1
+    prefix_len = 32
+    num_prefill = 7
+    qo_len = num_prefill
+    kv_len = prefix_len + num_prefill
+    num_heads = 4
+    page_size = 1
+    num_pages = kv_len
+
+    torch.manual_seed(789)
+
+    q_nope = torch.randn(B * qo_len, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn(B * qo_len, num_heads, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+    ckv = torch.randn(kv_len, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    kpe = torch.randn(kv_len, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
+
+    cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, qo_len)
+    q_pe_4d = q_pe.reshape(B, num_heads, qo_len, HEAD_DIM_KPE)
+    q_pe_rope = torch.empty_like(q_pe_4d)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
+    q_pe_rope = q_pe_rope.reshape(B * qo_len, num_heads, HEAD_DIM_KPE)
+
+    kpe_4d = kpe.reshape(kv_len, 1, HEAD_DIM_KPE)
+    kpe_rope_4d = torch.empty_like(kpe_4d)
+    kpe_cos = cos[:, :kv_len, :]
+    kpe_sin = sin[:, :kv_len, :]
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d.expand(B, kv_len, HEAD_DIM_KPE),
+                              kpe_cos, kpe_sin, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
+    kpe_rope = kpe_rope_4d.reshape(kv_len, HEAD_DIM_KPE)
+
+    ckv_paged = ckv.reshape(num_pages, page_size, HEAD_DIM_CKV)
+    kpe_paged = kpe_rope.reshape(num_pages, page_size, HEAD_DIM_KPE)
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+
+    # Causal suffix mask: q[i] attends to suffix[0..i]
+    suffix_mask = [False] * (qo_len * qo_len)
+    for q in range(qo_len):
+        for k in range(q + 1):
+            suffix_mask[q * qo_len + k] = True
+
+    packed_suffix, suffix_indptr = _pack_mask(suffix_mask, qo_len, qo_len)
+    o_cc = _run_mla_prefill_with_mask(
+        glm, device, q_nope, q_pe_rope, ckv_paged, kpe_paged,
+        kv_indices, qo_len, kv_len, num_heads,
+        causal=True,
+        custom_mask_data=packed_suffix, mask_indptr=suffix_indptr,
+        mask_mode=4,
+        page_size=page_size)
+
+    # Built-in causal
+    o_causal = _run_mla_prefill_with_mask(
+        glm, device, q_nope, q_pe_rope, ckv_paged, kpe_paged,
+        kv_indices, qo_len, kv_len, num_heads,
+        causal=True,
+        page_size=page_size)
+
+    torch.testing.assert_close(o_cc.cpu(), o_causal.cpu(), atol=0.05, rtol=0.02)

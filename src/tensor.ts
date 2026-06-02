@@ -101,7 +101,7 @@ export abstract class Tensor implements Disposable {
 
   [Symbol.dispose](): void {
     if (this.name !== undefined) {
-      throw new Error("Cannot dispose named tensor");
+      throw new Error(`Cannot dispose named tensor ${this.name}`);
     }
     // if stream is active, defer disposal until stream switch
     if (this.views.size) {
@@ -122,7 +122,7 @@ export abstract class Tensor implements Disposable {
 
   removeTracking(): this {
     if (this.name !== undefined) {
-      throw new Error("Cannot removeTracking on named tensor");
+      throw new Error(`Cannot removeTracking on named tensor ${this.name}`);
     }
     this.workspace.tracked.delete(this);
     this.workspace.exported.add(this);
@@ -224,10 +224,11 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  indexSelect(indices: Tensor, dim: number, batch: number): Tensor {
+  indexSelect(indices: Tensor, batch: number): Tensor {
+    if (this.shape.length !== 2) throw new Error(`indexSelect: input must be 2D, got shape [${this.shape}]`);
     if (indices.type !== "I32") throw new Error(`indexSelect: indices must be I32, got ${indices.type}`);
     if (indices.numElements < batch) {
-      throw new Error(`indexSelect: indices has ${indices.numElements} elements (shape [${indices.shape}]${indices.view ? ', view of [' + indices.view.shape + ']' : ''}), insufficient for batch=${batch}`);
+      throw new Error(`indexSelect: indices has ${indices.numElements} elements (shape [${indices.shape}]${this.view ? ', view of [' + this.view.shape + ']' : ''}), insufficient for batch=${batch}`);
     }
     return undefined as never;
   }
@@ -380,6 +381,25 @@ export abstract class Tensor implements Disposable {
   }
 
   scatterAddRows(scales: Tensor, topK: number, dim: number, numRows: number): Tensor {
+    return undefined as never;
+  }
+
+  slice(dim: number, start: number, length: number): Tensor {
+    if (dim < 0 || dim >= this.shape.length) {
+      throw new Error(`slice: dim ${dim} out of range for ${this.shape.length}D tensor`);
+    }
+    if (start < 0) {
+      start = this.shape[dim] + start;
+    }
+    if (start < 0 || start > this.shape[dim]) {
+      throw new Error(`slice: start ${start} out of range for dim ${dim} (size ${this.shape[dim]})`);
+    }
+    if (length <= 0) {
+      throw new Error(`slice: length must be positive, got ${length}`);
+    }
+    if (start + length > this.shape[dim]) {
+      throw new Error(`slice: start ${start} + length ${length} exceeds dim ${dim} size ${this.shape[dim]}`);
+    }
     return undefined as never;
   }
 

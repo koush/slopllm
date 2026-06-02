@@ -62,6 +62,17 @@ export class WorkspaceBase implements Disposable {
     return this._alloc(shape, type, false, name, parallelism);
   }
 
+  ensureAllocPinned(shape: number[], type: string, name: string, parallelism?: TensorParallelism): Tensor {
+    const existing = this.tensors.get(name);
+    if (existing !== undefined) {
+      if (existing.shape.length !== shape.length || existing.shape.some((v, i) => v !== shape[i]) || existing.type !== type) {
+        throw new Error(`Tensor with name ${name} already exists with different shape or type`);
+      }
+      return existing;
+    }
+    return this._alloc(shape, type, true, name, parallelism);
+  }
+
   allocPinned(shape: number[], type: string, name?: string, parallelism?: TensorParallelism): Tensor {
     return this._alloc(shape, type, true, name, parallelism);
   }

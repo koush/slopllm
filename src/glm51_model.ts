@@ -241,13 +241,11 @@ export class Glm51Model extends ChatModel {
     const qNopeKey = `${layerPfx}.q_nope_proj.weight`;
     if (!this.pendingKNope.has(kNopeKey) || !this.pendingQNope.has(qNopeKey)) return;
     const par = TensorParallelism.Column;
-    const kNopeProj = await this.loadDeferredMlaWeight(kNopeKey, par);
-    const qNopeProj = await this.loadDeferredMlaWeight(qNopeKey, par);
+    using kNopeProj = await this.loadDeferredMlaWeight(kNopeKey, par);
+    using qNopeProj = await this.loadDeferredMlaWeight(qNopeKey, par);
     using wAbsorbedTmp = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
     const wAbsorbed = this.alloc(wAbsorbedTmp.shape, wAbsorbedTmp.type, `${layerPfx}.absorbed.weight`, wAbsorbedTmp.parallelism);
     wAbsorbed.memcpy(wAbsorbedTmp);
-    kNopeProj[Symbol.dispose]();
-    qNopeProj[Symbol.dispose]();
     this.pendingKNope.delete(kNopeKey);
     this.pendingQNope.delete(qNopeKey);
   }
@@ -430,7 +428,7 @@ export class Glm51Model extends ChatModel {
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : totalTokens;
 
-    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, qkRopeDim / 2, B, S));
+    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(state.customMask?.positionIds || ws.positionIds, qkRopeDim / 2, B, S));
     using cos = rotaryEmbedding.result.cos;
     using sin = rotaryEmbedding.result.sin;
 

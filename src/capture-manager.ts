@@ -3,6 +3,7 @@ import { DeviceOps } from "./device_ops";
 interface Captured {
     warmupSteps: number;
     graphExec: number | null;
+    result: any;
 }
 
 export class CaptureManager implements Disposable {
@@ -21,7 +22,7 @@ export class CaptureManager implements Disposable {
         this.captured.clear();
     }
 
-    run(fn: (capturing: boolean) => void, keyParams?: any[]) {
+    run<T>(fn: (capturing: boolean) => T, keyParams?: any[]): T {
         let capturing: string | undefined;
         if (!this.disabled && keyParams?.length) {
             const key = keyParams.join(",");
@@ -29,7 +30,7 @@ export class CaptureManager implements Disposable {
             if (captured) {
                 if (captured.graphExec !== null) {
                     this.ops.graphLaunch(captured.graphExec);
-                    return;
+                    return captured.result;
                 }
 
                 if (captured.warmupSteps === 3) {
@@ -39,11 +40,13 @@ export class CaptureManager implements Disposable {
                 captured.warmupSteps++;
             }
             else {
-                this.captured.set(key, { warmupSteps: 1, graphExec: null });
+                this.captured.set(key, { warmupSteps: 1, graphExec: null, result: undefined });
             }
         }
 
-        fn(!!capturing);
+        const result = fn(!!capturing);
+        if (capturing)
+            this.captured.get(capturing!)!.result = result;
 
         if (capturing) {
             const graph = this.ops.graphEndCapture();
@@ -52,6 +55,7 @@ export class CaptureManager implements Disposable {
             this.ops.graphDestroy(graph);
             this.ops.graphLaunch(captured.graphExec);
         }
+        return result;
     }
 
     isCaptured(keyParams: any[]): boolean {
