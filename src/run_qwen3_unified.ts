@@ -10,7 +10,7 @@ import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { MetaOps } from "./meta_ops";
 import { resolveModelPath } from "./model_path";
-import { mtpPrefill, mtpTreeDecode, mtpVerify } from "./mtp";
+import { mtpTreeDecode, mtpVerify } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
 import { Qwen35Model } from "./qwen35_model";
 import { Qwen3Model } from "./qwen3_model";
@@ -236,7 +236,7 @@ export function* generateStream(
     doSample(firstTokens);
 
     if (mtp && model.forwardMtp && nextn > 0) {
-      mtpPrefill(state, model, hiddenStates, gpuSampleResult!);
+      using _mtpHiddenStates = model.forwardMtp(state, hiddenStates);
     }
 
     targetHiddenStates.replace(hiddenStates.slice(0, -1, 1).removeTracking())

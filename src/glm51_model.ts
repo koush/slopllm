@@ -532,7 +532,7 @@ export class Glm51Model extends ChatModel {
     return normed.detach().removeTracking();
   }
 
-  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, inputIds?: Tensor) {
+  forwardMtp(state: ExecutionState, previousHiddenState: Tensor) {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const ws = state.ws;
@@ -541,9 +541,8 @@ export class Glm51Model extends ChatModel {
     const BS = totalTokens;
 
     if (this.mtp && cfg.numNextNPredictLayers) {
-      const ids = inputIds ?? state.input!;
       const embedTable = this.tensors.get("model.embed_tokens.weight")!;
-      using embedding = embedTable.embedding(ids, hs, BS);
+      using embedding = embedTable.embedding(state.input!, hs, BS);
       using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps, hs, BS);
       using hnorm = previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps, hs, BS);
       using cat = enorm.cat([hnorm], 1);

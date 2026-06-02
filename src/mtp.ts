@@ -4,69 +4,7 @@ import { MaskMode } from "./device_ops";
 import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { I32 } from "./glm_ops";
 import { MemcpyKind, Tensor } from "./tensor";
-import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
-
-/**
- * MTP (Multi-Token Prediction) prefill rotation.
- *
- * During prefill, each MTP layer needs to see a rotated version of the input:
- *   Target:     [t0, t1, ..., t{S-1}]           → sample T
- *   MTP layer 0: [t1, t2, ..., t{S-1}, T]        → sample P0
- *   MTP layer 1: [t2, t3, ..., t{S-1}, T, P0]    → sample P1
- *   MTP layer 2: [t3, t4, ..., t{S-1}, T, P0, P1] → sample P2
- *
- * Each layer shifts the input left by 1 and appends the previous layer's prediction.
- * The rotation token comes from:
- *   - Layer 0: the target model's sampled token (gpuSampleResult)
- *   - Layer 1+: the previous MTP layer's top-1 prediction (topk.indices)
- *
- * Returns the top-1 prediction indices for each MTP layer (shape [batchSize, 1] I32 each).
- * The caller is responsible for disposing the returned tensors when done.
- *
- * Prerequisites:
- *   - ws.qoIndptrD must be populated on GPU (done by planPrefill)
- *   - state must be in prefill mode (isDecode = false)
- *   - gpuSampleResult must be [batchSize] I32 on GPU (target model's sampled token)
- *   - model.forwardMtp must exist (MTP enabled)
- *
- * Example usage in prefill path:
- *
- *   // After target model forward + sampling:
- *   targetHiddenStates.replace(model.forward(state));
- *   using firstTokens = state.computeLogits(targetHiddenStates.value, model);
- *   doSample(firstTokens);
- *
- *   // MTP prefill with rotation
- *   const mtpPredictions = mtpPrefill(
- *     state, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn
- *   );
- *
- *   readSample();
- *
- *   // Use mtpPredictions[i] for layer i's top-1 prediction...
- *   // Dispose when done:
- *   for (const pred of mtpPredictions) pred[Symbol.dispose]();
- */
-export function mtpPrefill(
-  state: ExecutionState,
-  model: ChatModel,
-  targetHiddenStates: Tensor,
-  gpuSampleResult: Tensor,
-) {
-  if (!model.forwardMtp) {
-    throw new Error("mtpPrefill: model does not support MTP (forwardMtp not defined)");
-  }
-
-  // Forward through one MTP layer with rotated input
-  using hiddenStates = model.forwardMtp(state, targetHiddenStates, state.input);
-
-  // Sample top-1 from this layer's output for the next rotation
-  using logits = state.computeLogits(hiddenStates, model);
-  const topk = logits.topk(1, model.cfg.vocabSize);
-  using _values = topk.values;
-  using _indices = topk.indices;
-}
 
 /**
  * Result of tree-structured MTP draft generation.
@@ -453,7 +391,10 @@ export function mtpVerify(
   pagedKV.pagesDirtyHost = true;
   pagedKV.pagesDirtyDevice = true;
 
-  const finishTokens = [currentToken, ...acceptedTokens];
+  // this is not ideal, since attention was already computed, but the kv cache has the token tree in
+  // non sequential order.
+  // another forward pass with just the tokens that were accepted will fix the kv cache ordering.
+  const finishTokens = [currentToken, ...acceptedTokens, bestReplacement];
   const finishState = ws.planPrefill(model, 1, [finishTokens.length], cache);
   finishState.setInput([finishTokens]);
   captureManager.run(() => {
@@ -467,6 +408,8 @@ export function mtpVerify(
     const argmaxHost = ws.tensors.get(`mtp_verify_argmax_host_${totalTreeNodes}`)!;
     argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
     targetHiddenStates.memcpy(hiddenLast, undefined, MemcpyKind.DeviceToDevice);
+
+    using _mtpHiddenStates = model.forwardMtp!(finishState, verifiedHiddenStates);
   }, ['mtp-verify-finish']);
 
   ws.glm.synchronize();
@@ -478,6 +421,10 @@ export function mtpVerify(
   const verifiedTokens = finishTokens.slice();
   // remove the input token.
   verifiedTokens.shift();
+
+  // if (acceptedTokens.length) {
+  //   console.warn(`MTP verify: accepted ${acceptedTokens.length} tokens: ${acceptedTokens.map(t => tokenizer.decode([t], { skip_special_tokens: false }))}, replacement: ${tokenizer.decode([bestReplacement], { skip_special_tokens: false })}, target: ${tokenizer.decode([targetToken], { skip_special_tokens: false })}`);
+  // }
 
   return [...verifiedTokens, targetToken];
 }
