@@ -356,7 +356,7 @@ function ensureCustomMask(ws: WorkspaceBase, numTokens: number, buildMask: (ws: 
 export function mtpVerify(
   captureManager: CaptureManager,
   model: ChatModel,
-  targetHiddenStates: UsingHolder<Tensor>,
+  targetHiddenStates: Tensor,
   ws: ExecutionWorkspace,
   cache: ChatCache,
   treeResult: MtpTreeResult,
@@ -372,7 +372,7 @@ export function mtpVerify(
     throw new Error(`mtpVerify: expected 1 sequence, got ${pagedKV.sequences.length}`);
   }
 
-  using _tracker = ws.startTracking(new Set([treeResult.validationSequences, targetHiddenStates.value]));
+  using _tracker = ws.startTracking(new Set([treeResult.validationSequences, targetHiddenStates]));
 
   const seq0 = pagedKV.sequences[0];
   const originalAllocLen = seq0.allocLen;
@@ -401,7 +401,7 @@ export function mtpVerify(
     using logits = state.computeLogits(hiddenStates, model, null);
     using argmaxResult = logits.argmax();
 
-    console.log(argmaxResult.readInt32LEArray().map(v => tokenizer.decode([v], { skip_special_tokens: false })));
+    // console.log(argmaxResult.readInt32LEArray().map(v => tokenizer.decode([v], { skip_special_tokens: false })));
 
     const argmaxHost = ws.ensureAllocPinned(argmaxResult.shape, argmaxResult.type, `mtp_verify_argmax_host_${totalTreeNodes}`);
     argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
@@ -453,24 +453,20 @@ export function mtpVerify(
   pagedKV.pagesDirtyHost = true;
   pagedKV.pagesDirtyDevice = true;
 
-  const finishTokens = [currentToken, ...acceptedTokens, bestReplacement];
+  const finishTokens = [currentToken, ...acceptedTokens];
   const finishState = ws.planPrefill(model, 1, [finishTokens.length], cache);
   finishState.setInput([finishTokens]);
   captureManager.run(() => {
-    targetHiddenStates.replace(model.forwardModel(finishState));
-    using logits = finishState.computeLogits(targetHiddenStates.value, model);
-    using logits2 = finishState.computeLogits(targetHiddenStates.value, model, null);
-
+    using verifiedHiddenStates = model.forwardModel(finishState);
+    const lmHead = model.tensors.get("lm_head.weight")!;
+    const batchSize = finishState.batchSize;
+    using hiddenLast = verifiedHiddenStates.indexSelect(ws.lastIdx, batchSize);
+    using logits = hiddenLast.linear(lmHead, batchSize).removeTracking();
 
     using argmaxResult = logits.argmax();
-    console.log(argmaxResult.readInt32LEArray().map(v => tokenizer.decode([v], { skip_special_tokens: false })));
-
-    using argmaxResult2 = logits2.argmax();
-    console.log(argmaxResult2.readInt32LEArray().map(v => tokenizer.decode([v], { skip_special_tokens: false })));
-
     const argmaxHost = ws.tensors.get(`mtp_verify_argmax_host_${totalTreeNodes}`)!;
     argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
-
+    targetHiddenStates.memcpy(hiddenLast, undefined, MemcpyKind.DeviceToDevice);
   }, ['mtp-verify-finish']);
 
   ws.glm.synchronize();
@@ -485,5 +481,3 @@ export function mtpVerify(
 
   return [...verifiedTokens, targetToken];
 }
-
-

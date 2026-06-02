@@ -30,6 +30,9 @@ GlmCtx* glm_init(int device_id) {
     cublasCreate(&CUBLAS(ctx));
     cublasSetStream(CUBLAS(ctx), ctx->streams[0]);
     cublasSetMathMode(CUBLAS(ctx), CUBLAS_TENSOR_OP_MATH);
+    // this suppresses most non deterministic output
+    // can be used for sanity checking in case of deviation
+    // cublasSetMathMode(CUBLAS(ctx), CUBLAS_PEDANTIC_MATH);
 
     return ctx;
 }

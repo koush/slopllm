@@ -270,7 +270,7 @@ export function* generateStream(
         // const validationSequences = treeResult.validationSequences.readInt32LEArray();
         // const tokens = tokenizer.decode(validationSequences, { skip_special_tokens: false });
         // console.log(tokens);
-        const verifyResult = mtpVerify(captureManager, model, targetHiddenStates, ws, cache, treeResult, currentToken, tokenizer);
+        const verifyResult = mtpVerify(captureManager, model, targetHiddenStates.value, ws, cache, treeResult, currentToken, tokenizer);
         // best replacement goes to gpuSampleResult for next step
         for (const t of verifyResult) {
           currentToken = t;
@@ -567,8 +567,8 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   const modelDir = args.modelDir ?? (args.useGlm51
-    // ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
-    ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
+    ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
+    // ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
     : resolveModelPath(args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO)));
 
   if (args.meta) {
