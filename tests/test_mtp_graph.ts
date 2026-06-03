@@ -84,11 +84,14 @@ describe("MTP with CUDA graph capture: TP validation", () => {
         if (i === 1) {
           ws.inputIdsBuf.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToDevice);
         }
+        sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
+        ws.glm.synchronize();
+        const currentToken = sampleResult.readPinnedBuffer().readInt32LE();
         const treeResult = mtpTreeDecode(
-          captureManager, model, targetHiddenStates.value, ws, gpuSampleResult!, nextn, cache,
+          captureManager, model, targetHiddenStates.value, ws, currentToken, nextn, cache,
         );
         const verifyResult = mtpVerify(
-          captureManager, model, targetHiddenStates, ws, cache, treeResult,
+          captureManager, model, targetHiddenStates.value, ws, cache, treeResult, currentToken,
         );
         for (const t of verifyResult) {
           cache.reportTokens(0, [t]);

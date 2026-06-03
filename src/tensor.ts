@@ -224,7 +224,7 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  indexSelect(indices: Tensor, batch: number): Tensor {
+  indexSelect(indices: Tensor, batch: number, offset: number = 0): Tensor {
     if (this.shape.length !== 2) throw new Error(`indexSelect: input must be 2D, got shape [${this.shape}]`);
     if (indices.type !== "I32") throw new Error(`indexSelect: indices must be I32, got ${indices.type}`);
     if (indices.numElements < batch) {
@@ -398,7 +398,26 @@ export abstract class Tensor implements Disposable {
       throw new Error(`slice: length must be positive, got ${length}`);
     }
     if (start + length > this.shape[dim]) {
-      throw new Error(`slice: start ${start} + length ${length} exceeds dim ${dim} size ${this.shape[dim]}`);
+      throw new Error(`slice: start ${start} + length ${length} exceeds dim ${dim} size ${this.shape[dim]})`);
+    }
+    return undefined as never;
+  }
+
+  narrow(start: number, length: number): Tensor {
+    if (this.shape.length === 0) {
+      throw new Error(`narrow: cannot narrow a scalar tensor`);
+    }
+    if (start < 0) {
+      start = this.shape[0] + start;
+    }
+    if (start < 0 || start > this.shape[0]) {
+      throw new Error(`narrow: start ${start} out of range for dim 0 (size ${this.shape[0]})`);
+    }
+    if (length <= 0) {
+      throw new Error(`narrow: length must be positive, got ${length}`);
+    }
+    if (start + length > this.shape[0]) {
+      throw new Error(`narrow: start ${start} + length ${length} exceeds dim 0 size ${this.shape[0]})`);
     }
     return undefined as never;
   }

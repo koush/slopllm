@@ -134,7 +134,7 @@ describe("Tree prefill divergence diagnosis", () => {
     state.setInput([tokens]);
 
     using hidden = model.forward(state);
-    using logits = state.computeLogits(hidden, model, null);
+    using logits = state.computeLogits(hidden, model, true);
     const logitsF32 = readBf16Logits(logits, numTokens, vocabSize);
     return { logits: logitsF32, cache, state };
   }
@@ -167,7 +167,7 @@ describe("Tree prefill divergence diagnosis", () => {
     state.setInput([tokens]);
 
     using hidden = model.forward(state);
-    using logits = state.computeLogits(hidden, model, null);
+    using logits = state.computeLogits(hidden, model, true);
     const logitsF32 = readBf16Logits(logits, numTokens, vocabSize);
     return { logits: logitsF32, cache, state };
   }
@@ -402,7 +402,7 @@ describe("Tree prefill divergence diagnosis", () => {
     state.setInput([tokens]);
 
     using hidden = model.forward(state);
-    using logitsTensor = state.computeLogits(hidden, model, null);
+    using logitsTensor = state.computeLogits(hidden, model, true);
     const treeLogits = readBf16Logits(logitsTensor, numNodes, vocabSize);
 
     // Reference: causal prefill of [10, 20] with pageSize=32
@@ -412,7 +412,7 @@ describe("Tree prefill divergence diagnosis", () => {
     refState.setInput([[tokens[0], tokens[1]]]);
 
     using refHidden = model.forward(refState);
-    using refLogitsTensor = refState.computeLogits(refHidden, model, null);
+    using refLogitsTensor = refState.computeLogits(refHidden, model, true);
     const refLogits = readBf16Logits(refLogitsTensor, 2, vocabSize);
 
     let maxDiff = 0;

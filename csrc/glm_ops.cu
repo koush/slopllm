@@ -442,15 +442,6 @@ void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
 
 
 // ---------------------------------------------------------------------------
-// Embedding lookup kernel
-// ---------------------------------------------------------------------------
-
-void glm_embedding(GlmCtx* ctx, void* out, const void* table,
-                   const int* ids, int hidden, int seq_len) {
-    glm_index_select(ctx, out, table, ids, hidden, seq_len);
-}
-
-// ---------------------------------------------------------------------------
 // LayerNorm kernel (with bias)
 // ---------------------------------------------------------------------------
 
@@ -1907,25 +1898,26 @@ __global__ void __launch_bounds__(256, 4) index_select_kernel(
     const __nv_bfloat16* src,
     const int* indices,
     int dim,
-    int k
+    int k,
+    int offset
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= k * dim) return;
     int i = idx / dim;
     int d = idx % dim;
-    int src_row = indices[i];
+    int src_row = indices[i] + offset;
     out[idx] = src[src_row * dim + d];
 }
 
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
-                       const void* indices, int dim, int k) {
+                       const void* indices, int dim, int k, int offset) {
     cudaSetDevice(ctx->device_id);
     int total = k * dim;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
     index_select_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)src,
-        (const int*)indices, dim, k);
+        (const int*)indices, dim, k, offset);
 }
 
 // ---------------------------------------------------------------------------

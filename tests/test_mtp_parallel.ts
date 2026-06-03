@@ -49,8 +49,13 @@ function runMtpTreeDecode(model: ChatModel, ws: ExecutionWorkspace, cache: ChatC
   using logits = state.computeLogits(hiddenHolder.value, model);
   using gpuSampleResult = greedySample(logits, sampleWorkspace);
 
+  const currentTokenHost = sampleWorkspace.allocPinned(gpuSampleResult.shape, gpuSampleResult.type);
+  currentTokenHost.memcpy(gpuSampleResult, gpuSampleResult.bytes, MemcpyKind.DeviceToHost);
+  ws.glm.synchronize();
+  const currentToken = currentTokenHost.readPinnedBuffer().readInt32LE();
+
   const treeResult = mtpTreeDecode(
-    captureManager, model, hiddenHolder.value, ws, gpuSampleResult, nextn, cache,
+    captureManager, model, hiddenHolder.value, ws, currentToken, nextn, cache,
   );
 
   using hostBuf = sampleWorkspace.allocPinned(treeResult.validationSequences.shape, treeResult.validationSequences.type);
@@ -75,7 +80,7 @@ function runMtpTreeDecode(model: ChatModel, ws: ExecutionWorkspace, cache: ChatC
   cache.getPagedKV().pagesDirtyDevice = true;
 
   const verifyResult = mtpVerify(
-    captureManager, model, hiddenHolder, ws, cache, treeResult,
+    captureManager, model, hiddenHolder.value, ws, cache, treeResult, currentToken,
   );
 
   for (const t of verifyResult) {

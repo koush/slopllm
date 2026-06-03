@@ -877,8 +877,8 @@ export class ParallelTensor extends Tensor {
     return { values, indices };
   }
 
-  indexSelect(indices: Tensor, batch: number): Tensor {
-    super.indexSelect(indices, batch);
+  indexSelect(indices: Tensor, batch: number, offset: number = 0): Tensor {
+    super.indexSelect(indices, batch, offset);
     const pIndices = indices as ParallelTensor;
     this.assertParallel("indexSelect src", this, TensorParallelism.Replicated, TensorParallelism.Row);
     this.assertParallel("indexSelect indices", pIndices, TensorParallelism.Replicated, TensorParallelism.PartialSum);
@@ -886,7 +886,7 @@ export class ParallelTensor extends Tensor {
     const dim = this.shape[1];
     const shards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      shards.push(this.shards[i].indexSelect(pIndices.shards[i], batch));
+      shards.push(this.shards[i].indexSelect(pIndices.shards[i], batch, offset));
     }
     return this.parallelOps.wrapShards(this.workspace, shards, [batch, dim], this.type, this.parallelism);
   }
@@ -1337,6 +1337,19 @@ export class ParallelTensor extends Tensor {
       outShards.push(this.shards[i].slice(dim, start, length));
     }
     return this.parallelOps.wrapShards(this.workspace, outShards, outShape, this.type, TensorParallelism.Replicated);
+  }
+
+  narrow(start: number, length: number): Tensor {
+    super.narrow(start, length);
+    if (this.parallelism !== TensorParallelism.Replicated) {
+      throw new Error(`narrow: only supported on Replicated tensors, got ${this.parallelism}`);
+    }
+    const newShape = [length, ...this.fullShape.slice(1)];
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push(this.shards[i].narrow(start, length));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, newShape, this.type, TensorParallelism.Replicated);
   }
 
   scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {

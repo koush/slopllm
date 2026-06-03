@@ -143,7 +143,7 @@ describe("Model-level tree prefill vs sequential prefill", () => {
     ccState.setInput([TREE_TOKENS]);
 
     using ccHidden = model.forward(ccState);
-    using ccLogits = ccState.computeLogits(ccHidden, model, null);
+    using ccLogits = ccState.computeLogits(ccHidden, model, true);
     const ccLogitsF32 = readBf16Logits(ccLogits, seqLen, vocabSize);
 
     using causalCache = model.createChatCache(128);
@@ -153,7 +153,7 @@ describe("Model-level tree prefill vs sequential prefill", () => {
     causalState.setInput([TREE_TOKENS]);
 
     using causalHidden = model.forward(causalState);
-    using causalLogits = causalState.computeLogits(causalHidden, model, null);
+    using causalLogits = causalState.computeLogits(causalHidden, model, true);
     const causalLogitsF32 = readBf16Logits(causalLogits, seqLen, vocabSize);
 
     let top1Mismatches = 0;
@@ -202,7 +202,7 @@ describe("Model-level tree prefill vs sequential prefill", () => {
     treeState.setInput([TREE_TOKENS]);
 
     using treeHidden = model.forward(treeState);
-    using treeLogits = treeState.computeLogits(treeHidden, model, null);
+    using treeLogits = treeState.computeLogits(treeHidden, model, true);
     const treeLogitsF32 = readBf16Logits(treeLogits, numTreeNodes, vocabSize);
 
     const paths = [
@@ -227,7 +227,7 @@ describe("Model-level tree prefill vs sequential prefill", () => {
       pathState.setInput([pathTokens]);
 
       using pathHidden = model.forward(pathState);
-      using pathLogits = pathState.computeLogits(pathHidden, model, null);
+      using pathLogits = pathState.computeLogits(pathHidden, model, true);
       const pathLogitsF32 = readBf16Logits(pathLogits, pathLen, vocabSize);
 
       let top1Mismatches = 0;

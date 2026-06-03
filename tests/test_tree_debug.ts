@@ -293,7 +293,7 @@ describe("Tree prefill debug diagnostics", () => {
       state.setInput([tokens]);
 
       using hidden = model.forward(state);
-      using logits = state.computeLogits(hidden, model, null);
+      using logits = state.computeLogits(hidden, model, true);
       const treeLogits = Buffer.alloc(numNodes * vocabSize * 2);
       logits.d2h(treeLogits);
       const treeF32 = bf16BytesToF32(treeLogits);
@@ -314,7 +314,7 @@ describe("Tree prefill debug diagnostics", () => {
       state2.setInput([tokens]);
 
       using hidden2 = model.forward(state2);
-      using logits2 = state2.computeLogits(hidden2, model, null);
+      using logits2 = state2.computeLogits(hidden2, model, true);
       const causalLogits = Buffer.alloc(numNodes * vocabSize * 2);
       logits2.d2h(causalLogits);
       const causalF32 = bf16BytesToF32(causalLogits);
@@ -341,7 +341,7 @@ describe("Tree prefill debug diagnostics", () => {
       state3.setInput([tokens]);
 
       using hidden3 = model.forward(state3);
-      using logits3 = state3.computeLogits(hidden3, model, null);
+      using logits3 = state3.computeLogits(hidden3, model, true);
       const builtinLogits = Buffer.alloc(numNodes * vocabSize * 2);
       logits3.d2h(builtinLogits);
       const builtinF32 = bf16BytesToF32(builtinLogits);
@@ -383,7 +383,7 @@ describe("Tree prefill debug diagnostics", () => {
     state.setInput([tokens]);
 
     using hidden = model.forward(state);
-    using logits = state.computeLogits(hidden, model, null);
+    using logits = state.computeLogits(hidden, model, true);
     const treeLogits = Buffer.alloc(numNodes * vocabSize * 2);
     logits.d2h(treeLogits);
     const treeF32 = bf16BytesToF32(treeLogits);
@@ -395,7 +395,7 @@ describe("Tree prefill debug diagnostics", () => {
     state2.setInput([tokens]);
 
     using hidden2 = model.forward(state2);
-    using logits2 = state2.computeLogits(hidden2, model, null);
+    using logits2 = state2.computeLogits(hidden2, model, true);
     const causalLogits = Buffer.alloc(numNodes * vocabSize * 2);
     logits2.d2h(causalLogits);
     const causalF32 = bf16BytesToF32(causalLogits);
@@ -438,7 +438,7 @@ describe("Tree prefill debug diagnostics", () => {
     state.setInput([tokens]);
 
     using hidden = model.forward(state);
-    using logits = state.computeLogits(hidden, model, null);
+    using logits = state.computeLogits(hidden, model, true);
     const treeLogits = Buffer.alloc(numNodes * vocabSize * 2);
     logits.d2h(treeLogits);
     const treeF32 = bf16BytesToF32(treeLogits);
@@ -461,7 +461,7 @@ describe("Tree prefill debug diagnostics", () => {
     state2.setInput([[10, 20]]);
 
     using hidden2 = model.forward(state2);
-    using logits2 = state2.computeLogits(hidden2, model, null);
+    using logits2 = state2.computeLogits(hidden2, model, true);
     const pathLogits = Buffer.alloc(2 * vocabSize * 2);
     logits2.d2h(pathLogits);
     const pathF32 = bf16BytesToF32(pathLogits);

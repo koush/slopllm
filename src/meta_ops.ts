@@ -1,6 +1,7 @@
 import { DeviceOps, MaskMode, StridedMmap, TensorParallelism } from "./device_ops";
 import { GlmTensor } from "./glm_ops";
 import { MemcpyKind, Tensor } from "./tensor";
+import { SafeTensorFile } from "./safetensors";
 import { WorkspaceBase } from "./workspace";
 
 export class MetaTensor extends Tensor {
@@ -104,8 +105,8 @@ export class MetaTensor extends Tensor {
         return { values, indices };
     }
 
-    indexSelect(indices: Tensor, batch: number): Tensor {
-        super.indexSelect(indices, batch);
+    indexSelect(indices: Tensor, batch: number, offset: number = 0): Tensor {
+        super.indexSelect(indices, batch, offset);
         const dim = this.shape[1];
         return this.workspace.alloc([batch, dim], this.type);
     }
@@ -206,6 +207,19 @@ export class MetaTensor extends Tensor {
         const outShape = [...this.shape];
         outShape[dim] = length;
         return this.workspace.alloc(outShape, this.type);
+    }
+
+    narrow(start: number, length: number): Tensor {
+        super.narrow(start, length);
+        if (start < 0) {
+            start = this.shape[0] + start;
+        }
+        const innerElements = this.shape.slice(1).reduce((a, b) => a * b, 1);
+        const elemBytes = SafeTensorFile.dtypeBytes(this.type);
+        const byteOffset = start * innerElements * elemBytes;
+        const newShape = [length, ...this.shape.slice(1)];
+        const newAllocSize = this.allocSize - byteOffset;
+        return this.workspace.glm.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this);
     }
 
     scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {

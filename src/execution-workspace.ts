@@ -26,18 +26,19 @@ export class ExecutionState {
   ) {
   }
 
-  computeLogits(hiddenStates: Tensor, model: ChatModel, lastIdx: Tensor | null = this.ws.lastIdx): Tensor {
+  computeLogits(hiddenStates: Tensor, model: ChatModel, allTokens: boolean = false): Tensor {
     const lmHead = model.tensors.get("lm_head.weight")!;
     const batchSize = this.batchSize;
     if (this.isDecode) {
       return hiddenStates.linear(lmHead, batchSize).removeTracking();
     }
-    else if (lastIdx) {
-      using hiddenLast = hiddenStates.indexSelect(lastIdx, batchSize);
-      return hiddenLast.linear(lmHead, batchSize).removeTracking();
+    else if (allTokens) {
+      return hiddenStates.linear(lmHead, this.totalTokens).removeTracking();
     }
     else {
-      return hiddenStates.linear(lmHead, this.totalTokens).removeTracking();
+      using lastIdxFromIndptr = this.ws.qoIndptrD.narrow(1, batchSize);
+      using hiddenLast = hiddenStates.indexSelect(lastIdxFromIndptr, batchSize, -1);
+      return hiddenLast.linear(lmHead, batchSize).removeTracking();
     }
   }
 

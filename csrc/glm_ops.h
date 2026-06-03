@@ -61,9 +61,6 @@ void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
 void glm_linear(GlmCtx* ctx, void* out, const void* input,
                 const void* weight, int batch, int n, int k);
 
-void glm_embedding(GlmCtx* ctx, void* out, const void* table,
-                   const int* ids, int hidden, int seq_len);
-
 void glm_layernorm(GlmCtx* ctx, void* out, const void* input,
                    const void* weight, const void* bias, float eps, int dim, int batch);
 
@@ -194,7 +191,7 @@ void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
                            int batch_size);
 
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
-                       const void* indices, int dim, int k);
+                       const void* indices, int dim, int k, int offset);
 
 void glm_arange(GlmCtx* ctx, int* out, int start, int step, int count);
 

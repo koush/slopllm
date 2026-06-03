@@ -171,3 +171,7 @@ GLM_GPUS=0,1 npx tsx --test tests/test_parallel.ts  # multi-GPU
 ## Vendor
 
 The vendor subdirectory contains flashinfer, llama.cpp, vllm, and sglang, and can be serve as a reference for implementations of cuda kernels or other algorithms like MTP. Flashinfer has been forked to add support for context parallelism.
+
+# Workflow
+
+You must NEVER use "git stash pop" to reapply stashed changes. You MUST use "git stash apply" instead. "git stash pop" is potentially destructive and may cause data loss. The user will clean up any entries left behind from usage of "git stash apply".

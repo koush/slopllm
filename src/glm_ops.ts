@@ -52,11 +52,10 @@ interface NativeAddon {
   fusedNormRope(ctx: number, out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
   linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number): void;
-  embedding(ctx: number, out: number, table: number, ids: number, hidden: number, seqLen: number): void;
   fill(ctx: number, out: number, value: number, n: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
   applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
-  indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number): void;
+  indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number, offset: number): void;
   gather(ctx: number, out: number, input: number, indices: number, k: number, inDim: number, batch: number, elemSize: number): void;
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
@@ -248,7 +247,7 @@ export class GlmTensor extends Tensor {
   embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
     super.embedding(ids, hidden, seqLen);
     const out = ids.workspace.alloc([seqLen, hidden], this.type);
-    getNativeAddon().embedding(this.glm.ctx, out.data, this.data, ids.data, hidden, seqLen);
+    getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, ids.data, hidden, seqLen, 0);
     return out;
   }
 
@@ -281,11 +280,11 @@ export class GlmTensor extends Tensor {
     return { values, indices };
   }
 
-  indexSelect(indices: Tensor, batch: number): Tensor {
-    super.indexSelect(indices, batch);
+  indexSelect(indices: Tensor, batch: number, offset: number = 0): Tensor {
+    super.indexSelect(indices, batch, offset);
     const dim = this.shape[1];
     const out = this.workspace.alloc([batch, dim], this.type);
-    getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, indices.data, dim, batch);
+    getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, indices.data, dim, batch, offset);
     return out;
   }
 
@@ -490,6 +489,19 @@ export class GlmTensor extends Tensor {
     const srcOffset = start * innerStride * elemBytes;
     out.memcpy2d(0, dstPitch, this, srcOffset, srcPitch, dstPitch, outerStrides, MemcpyKind.DeviceToDevice);
     return out;
+  }
+
+  narrow(start: number, length: number): Tensor {
+    super.narrow(start, length);
+    if (start < 0) {
+      start = this.shape[0] + start;
+    }
+    const innerElements = this.shape.slice(1).reduce((a, b) => a * b, 1);
+    const elemBytes = SafeTensorFile.dtypeBytes(this.type);
+    const byteOffset = start * innerElements * elemBytes;
+    const newShape = [length, ...this.shape.slice(1)];
+    const newAllocSize = this.allocSize - byteOffset;
+    return this.workspace.glm.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this);
   }
 
   scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {

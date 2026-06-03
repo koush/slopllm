@@ -506,7 +506,7 @@ describe("Qwen3-0.6B batch tests", () => {
     const state = ws.planPrefill(model, 1, [answerTokens.length], pagedKV);
     state.setInput([answerTokens]);
     const hiddenStates = model.forward(state);
-    const allLogits = state.computeLogits(hiddenStates, model, null);
+    const allLogits = state.computeLogits(hiddenStates, model, true);
     using argmaxResult = allLogits.argmax();
     const predictions = argmaxResult.readInt32LEArray();
     pagedKV.reportTokens(0, answerTokens);

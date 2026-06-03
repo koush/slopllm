@@ -61,7 +61,7 @@ describe("Token count comparison: same attention, different total tokens", () =>
     const state8 = ws.planPrefill(model, 1, [8], cache8);
     state8.setInput([[10, 20, 30, 40, 50, 60, 70, 80]]);
     using hidden8 = model.forward(state8);
-    using logits8 = state8.computeLogits(hidden8, model, null);
+    using logits8 = state8.computeLogits(hidden8, model, true);
     const f8 = readLogits(logits8, 8, vocabSize);
 
     // 2-token built-in causal
@@ -70,7 +70,7 @@ describe("Token count comparison: same attention, different total tokens", () =>
     const state2 = ws.planPrefill(model, 1, [2], cache2);
     state2.setInput([[10, 20]]);
     using hidden2 = model.forward(state2);
-    using logits2 = state2.computeLogits(hidden2, model, null);
+    using logits2 = state2.computeLogits(hidden2, model, true);
     const f2 = readLogits(logits2, 2, vocabSize);
 
     // Position 1: token 20 attends to {0, 1} in both cases
@@ -105,7 +105,7 @@ describe("Token count comparison: same attention, different total tokens", () =>
     const state7 = ws.planPrefill(model, 1, [7], cache7);
     state7.setInput([[10, 20, 30, 40, 50, 60, 70]]);
     using hidden7 = model.forward(state7);
-    using logits7 = state7.computeLogits(hidden7, model, null);
+    using logits7 = state7.computeLogits(hidden7, model, true);
     const f7 = readLogits(logits7, 7, vocabSize);
 
     using cache2 = model.createChatCache(128);
@@ -113,7 +113,7 @@ describe("Token count comparison: same attention, different total tokens", () =>
     const state2 = ws.planPrefill(model, 1, [2], cache2);
     state2.setInput([[10, 20]]);
     using hidden2 = model.forward(state2);
-    using logits2 = state2.computeLogits(hidden2, model, null);
+    using logits2 = state2.computeLogits(hidden2, model, true);
     const f2 = readLogits(logits2, 2, vocabSize);
 
     let maxDiff1 = 0;
@@ -137,7 +137,7 @@ describe("Token count comparison: same attention, different total tokens", () =>
       const stateN = ws.planPrefill(model, 1, [n], cacheN);
       stateN.setInput([tokens]);
       using hiddenN = model.forward(stateN);
-      using logitsN = stateN.computeLogits(hiddenN, model, null);
+      using logitsN = stateN.computeLogits(hiddenN, model, true);
       const fN = readLogits(logitsN, n, vocabSize);
 
       using cache2 = model.createChatCache(128);
@@ -145,8 +145,11 @@ describe("Token count comparison: same attention, different total tokens", () =>
       const state2 = ws.planPrefill(model, 1, [2], cache2);
       state2.setInput([[10, 20]]);
       using hidden2 = model.forward(state2);
-      using logits2 = state2.computeLogits(hidden2, model, null);
+      using logits2 = state2.computeLogits(hidden2, model, true);
       const f2 = readLogits(logits2, 2, vocabSize);
+
+
+
 
       let maxDiff = 0;
       for (let v = 0; v < vocabSize; v++) {

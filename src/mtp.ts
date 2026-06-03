@@ -168,7 +168,7 @@ export function mtpTreeDecode(
       }
 
       using hiddenStates = model.forwardMtp!(prefillState, tiledHs);
-      using logits = prefillState.computeLogits(hiddenStates, model, null);
+      using logits = prefillState.computeLogits(hiddenStates, model, true);
 
       // Save this iteration's MTP output for the next iteration's chaining
       prevMtpOutput.memcpy2d(
@@ -328,7 +328,7 @@ export function mtpVerify(
     state.setInput(treeResult.validationSequences);
 
     const hiddenStates = model.forwardModel(state);
-    using logits = state.computeLogits(hiddenStates, model, null);
+    using logits = state.computeLogits(hiddenStates, model, true);
     using argmaxResult = logits.argmax();
 
     // console.log(argmaxResult.readInt32LEArray().map(v => tokenizer.decode([v], { skip_special_tokens: false })));

@@ -193,26 +193,6 @@ static Napi::Value Linear(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value Embedding(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 6) {
-        Napi::TypeError::New(env, "Expected (ctx, out, table, ids, hidden, seq_len)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t table_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t ids_ptr = info[3].As<Napi::Number>().Int64Value();
-    int hidden = info[4].As<Napi::Number>().Int32Value();
-    int seq_len = info[5].As<Napi::Number>().Int32Value();
-    glm_embedding(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                  reinterpret_cast<void*>(out_ptr),
-                  reinterpret_cast<const void*>(table_ptr),
-                  reinterpret_cast<const int*>(ids_ptr),
-                  hidden, seq_len);
-    return env.Undefined();
-}
-
 static Napi::Value Layernorm(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 8) {
@@ -911,7 +891,7 @@ static Napi::Value ScatterAddRows(const Napi::CallbackInfo& info) {
 static Napi::Value IndexSelect(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
-        Napi::TypeError::New(env, "Expected (ctx, out, src, indices, dim, k)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, out, src, indices, dim, k[, offset])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -920,11 +900,12 @@ static Napi::Value IndexSelect(const Napi::CallbackInfo& info) {
     uintptr_t idx_ptr = info[3].As<Napi::Number>().Int64Value();
     int dim = info[4].As<Napi::Number>().Int32Value();
     int k = info[5].As<Napi::Number>().Int32Value();
+    int offset = (info.Length() >= 7) ? info[6].As<Napi::Number>().Int32Value() : 0;
     glm_index_select(reinterpret_cast<GlmCtx*>(ctx_ptr),
                      reinterpret_cast<void*>(out_ptr),
                      reinterpret_cast<const void*>(src_ptr),
                      reinterpret_cast<const void*>(idx_ptr),
-                     dim, k);
+                     dim, k, offset);
     return env.Undefined();
 }
 
@@ -2733,7 +2714,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "fusedNormRope"), Napi::Function::New(env, FusedNormRope));
     exports.Set(Napi::String::New(env, "siluAndMul"), Napi::Function::New(env, SiluAndMul));
     exports.Set(Napi::String::New(env, "linear"), Napi::Function::New(env, Linear));
-    exports.Set(Napi::String::New(env, "embedding"), Napi::Function::New(env, Embedding));
     exports.Set(Napi::String::New(env, "layernorm"), Napi::Function::New(env, Layernorm));
     exports.Set(Napi::String::New(env, "relu"), Napi::Function::New(env, Relu));
     exports.Set(Napi::String::New(env, "sigmoid"), Napi::Function::New(env, Sigmoid));

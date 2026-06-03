@@ -213,4 +213,68 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     const idx = ws.alloc([1], "I32");
     assert.throws(() => src.indexSelect(idx, 2), /insufficient for batch/);
   });
+
+  it("selects rows with negative offset (qoIndptr pattern)", () => {
+    const batchSize = 3;
+    const totalTokens = 10;
+    const dim = 4;
+
+    const indptr = ws.alloc([batchSize + 1], "I32");
+    const indptrData = new Int32Array([0, 3, 7, 10]);
+    indptr.h2d(Buffer.from(indptrData.buffer));
+    glm.synchronize();
+
+    const src = ws.alloc([totalTokens, dim], "BF16");
+    const srcF32 = new Float32Array(totalTokens * dim);
+    for (let i = 0; i < srcF32.length; i++) srcF32[i] = i * 0.1;
+    src.h2d(f32ToBf16Bytes(srcF32));
+    glm.synchronize();
+
+    const indptrTail = indptr.narrow(1, batchSize);
+    using selected = src.indexSelect(indptrTail, batchSize, -1);
+    glm.synchronize();
+
+    const buf = Buffer.alloc(batchSize * dim * 2);
+    selected.d2h(buf);
+    const actual = bf16BytesToF32(buf);
+
+    for (let i = 0; i < batchSize; i++) {
+      const expectedRow = indptrData[i + 1] - 1;
+      for (let j = 0; j < dim; j++) {
+        const expected = srcF32[expectedRow * dim + j];
+        const actualVal = actual[i * dim + j];
+        const relErr = Math.abs(actualVal - expected) / Math.max(Math.abs(expected), 1e-6);
+        assert.ok(relErr < 0.05, `row ${i} (src row ${expectedRow}), col ${j}: expected ${expected}, got ${actualVal}`);
+      }
+    }
+  });
+
+  it("selects rows with positive offset", () => {
+    const rows = 4;
+    const dim = 4;
+
+    const indices = ws.alloc([2], "I32");
+    const idxData = new Int32Array([0, 1]);
+    indices.h2d(Buffer.from(idxData.buffer));
+
+    const src = ws.alloc([rows, dim], "BF16");
+    const srcF32 = new Float32Array(rows * dim);
+    for (let i = 0; i < srcF32.length; i++) srcF32[i] = i;
+    src.h2d(f32ToBf16Bytes(srcF32));
+    glm.synchronize();
+
+    using out = src.indexSelect(indices, 2, 2);
+    glm.synchronize();
+
+    const buf = Buffer.alloc(2 * dim * 2);
+    out.d2h(buf);
+    const actual = bf16BytesToF32(buf);
+
+    for (let j = 0; j < dim; j++) {
+      const expected0 = srcF32[2 * dim + j];
+      const expected1 = srcF32[3 * dim + j];
+      assert.ok(Math.abs(actual[j] - expected0) < 0.05, `row 0 col ${j}: expected ${expected0}, got ${actual[j]}`);
+      assert.ok(Math.abs(actual[dim + j] - expected1) < 0.05, `row 1 col ${j}: expected ${expected1}, got ${actual[dim + j]}`);
+    }
+  });
 });
