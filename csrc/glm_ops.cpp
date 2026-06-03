@@ -999,7 +999,7 @@ static Napi::Value KvCacheWrite(const Napi::CallbackInfo& info) {
 static Napi::Value DecodeStep(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 7) {
-        Napi::TypeError::New(env, "Expected (ctx, position_ids, last_page_len, slot_mapping, indptr, indices, page_size, batch_size[, cp_world_size, cp_rank, steps])").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, position_ids, last_page_len, slot_mapping, indptr, indices, page_size, batch_size[, steps])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1010,16 +1010,14 @@ static Napi::Value DecodeStep(const Napi::CallbackInfo& info) {
     uintptr_t indices_ptr = info[5].As<Napi::Number>().Int64Value();
     uint32_t page_size = info[6].As<Napi::Number>().Uint32Value();
     uint32_t batch_size = info[7].As<Napi::Number>().Uint32Value();
-    uint32_t cp_world_size = (info.Length() > 8) ? info[8].As<Napi::Number>().Uint32Value() : 1;
-    uint32_t cp_rank = (info.Length() > 9) ? info[9].As<Napi::Number>().Uint32Value() : 0;
-    int32_t steps = (info.Length() > 10) ? info[10].As<Napi::Number>().Int32Value() : 1;
+    int32_t steps = (info.Length() > 8) ? info[8].As<Napi::Number>().Int32Value() : 1;
     glm_decode_step(reinterpret_cast<GlmCtx*>(ctx_ptr),
                      reinterpret_cast<int32_t*>(position_ids_ptr),
                      reinterpret_cast<int32_t*>(last_page_len_ptr),
                      reinterpret_cast<int32_t*>(slot_mapping_ptr),
                      reinterpret_cast<const int32_t*>(indptr_ptr),
                      reinterpret_cast<const int32_t*>(indices_ptr),
-                     page_size, batch_size, cp_world_size, cp_rank, steps);
+                     page_size, batch_size, steps);
     return env.Undefined();
 }
 

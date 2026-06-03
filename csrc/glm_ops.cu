@@ -2080,8 +2080,6 @@ __global__ void __launch_bounds__(128) decode_step_kernel(
     const int32_t* indices,
     uint32_t page_size,
     uint32_t batch_size,
-    uint32_t cp_world_size,
-    uint32_t cp_rank,
     int32_t steps
 ) {
     uint32_t seq = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2090,58 +2088,32 @@ __global__ void __launch_bounds__(128) decode_step_kernel(
     int32_t pos = position_ids[seq] + steps;
     position_ids[seq] = pos;
 
-    if (cp_world_size > 1) {
-        uint32_t eps = page_size / cp_world_size;
-        int32_t local_kv_len = (pos >= (int32_t)cp_rank)
-            ? (pos - (int32_t)cp_rank) / (int32_t)cp_world_size + 1
-            : 0;
-        int32_t remainder = local_kv_len % (int32_t)eps;
-        last_page_len[seq] = (local_kv_len > 0)
-            ? ((remainder != 0) ? remainder : (int32_t)eps)
-            : 0;
+    int32_t kv_len = pos + 1;
+    int32_t remainder = kv_len % (int32_t)page_size;
+    last_page_len[seq] = (remainder != 0) ? remainder : (int32_t)page_size;
 
-        if (pos % (int32_t)cp_world_size == (int32_t)cp_rank) {
-            int32_t local_pos = local_kv_len - 1;
-            int32_t page_idx = local_pos / (int32_t)eps;
-            int32_t page_offset = local_pos % (int32_t)eps;
-            int32_t seq_page_start = indptr[seq];
-            int32_t abs_page = indices[seq_page_start + page_idx];
-            slot_mapping[seq] = abs_page * (int32_t)page_size
-                + (int32_t)cp_rank * (int32_t)eps + page_offset;
-        } else {
-            slot_mapping[seq] = 0;
-        }
-    } else {
-        int32_t kv_len = pos + 1;
-        int32_t remainder = kv_len % (int32_t)page_size;
-        last_page_len[seq] = (remainder != 0) ? remainder : (int32_t)page_size;
-
-        int32_t page_idx = pos / (int32_t)page_size;
-        int32_t page_offset = pos % (int32_t)page_size;
-        int32_t seq_page_start = indptr[seq];
-        int32_t abs_page = indices[seq_page_start + page_idx];
-        slot_mapping[seq] = abs_page * (int32_t)page_size + page_offset;
-    }
+    int32_t page_idx = pos / (int32_t)page_size;
+    int32_t page_offset = pos % (int32_t)page_size;
+    int32_t seq_page_start = indptr[seq];
+    int32_t abs_page = indices[seq_page_start + page_idx];
+    slot_mapping[seq] = abs_page * (int32_t)page_size + page_offset;
 }
 
 void glm_decode_step(GlmCtx* ctx,
-                      int32_t* position_ids,
-                      int32_t* last_page_len,
-                      int32_t* slot_mapping,
-                      const int32_t* indptr,
-                      const int32_t* indices,
-                      uint32_t page_size,
-                      uint32_t batch_size,
-                      uint32_t cp_world_size,
-                      uint32_t cp_rank,
-                      int32_t steps) {
+                       int32_t* position_ids,
+                       int32_t* last_page_len,
+                       int32_t* slot_mapping,
+                       const int32_t* indptr,
+                       const int32_t* indices,
+                       uint32_t page_size,
+                       uint32_t batch_size,
+                       int32_t steps) {
     cudaSetDevice(ctx->device_id);
     dim3 grid((batch_size + 127) / 128);
     dim3 block(128);
     decode_step_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
         position_ids, last_page_len, slot_mapping,
-        indptr, indices, page_size, batch_size,
-        cp_world_size, cp_rank, steps);
+        indptr, indices, page_size, batch_size, steps);
 }
 
 // ---------------------------------------------------------------------------
