@@ -128,11 +128,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   positionIds: Tensor;
   /** Pinned host buffer [B*S] of I32: written by host, read via memcpy to positionIds. */
   positionIdsH: Tensor;
-  /** GPU buffer [B] of I32: written by host (h2d), read to extract last-token logits per sequence (prefill). */
-  lastIdx: Tensor;
-  /** Pinned host buffer [B] of I32: written by host, read via memcpy to lastIdx. */
-  lastIdxH: Tensor;
-  /** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer prefill run. */
+/** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer prefill run. */
   qoIndptrD: Tensor;
   /** Pinned host buffer [B+1] of I32: written by host, read by MLA prefill plan and memcpy to qoIndptrD. */
   qoIndptrH: Tensor;
@@ -170,8 +166,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
     this.positionIds = this.alloc([B * S], "I32", "positionIds");
     this.positionIdsH = this.allocPinned([B * S], "I32", "positionIdsH");
-    this.lastIdx = this.alloc([B], "I32", "lastIdx");
-    this.lastIdxH = this.allocPinned([B], "I32", "lastIdxH");
     this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
     this.inputIdsBufH = this.allocPinned([B * S], "I32", "inputIdsBufH");
     this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
@@ -461,15 +455,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
         buf.writeInt32LE(pagedKV.sequences[i].allocLen, i * I32);
       }
     });
-
-    this.lastIdxH.withPinnedBuffer(buf => {
-      let lastOff = 0;
-      for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-        buf.writeInt32LE(lastOff + seqLens[seqIdx] - 1, seqIdx * I32);
-        lastOff += seqLens[seqIdx];
-      }
-    });
-    this.lastIdx.memcpy(this.lastIdxH, batchSize * I32, MemcpyKind.HostToDevice);
 
     if (cfg.kvLoraRank) {
       this.glm.mlaPrefillPlan(
