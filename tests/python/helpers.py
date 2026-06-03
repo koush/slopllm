@@ -167,12 +167,6 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
-        self.lib.glm_embedding.restype = None
-        self.lib.glm_embedding.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int
-        ]
-
         self.lib.glm_layernorm.restype = None
         self.lib.glm_layernorm.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -348,7 +342,7 @@ class GlmOps:
         self.lib.glm_index_select.restype = None
         self.lib.glm_index_select.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_int, ctypes.c_int
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
         self.lib.glm_rotate_input_ids.restype = None
@@ -887,13 +881,7 @@ class GlmOps:
         )
 
     def embedding(self, output, table, ids, hidden, seq_len):
-        self.lib.glm_embedding(
-            self.ctx,
-            self._ptr(output),
-            self._ptr(table),
-            self._ptr(ids),
-            hidden, seq_len
-        )
+        self.index_select(output, table, ids, hidden, seq_len)
 
     def layernorm(self, output, input, weight, bias, eps, dim, batch):
         bias_ptr = self._ptr(bias) if bias is not None else ctypes.c_void_p(0)
@@ -1154,13 +1142,13 @@ class GlmOps:
             rows, cols
         )
 
-    def index_select(self, output, src, indices, dim, k):
+    def index_select(self, output, src, indices, dim, k, offset=0):
         self.lib.glm_index_select(
             self.ctx,
             self._ptr(output),
             self._ptr(src),
             self._ptr(indices),
-            dim, k
+            dim, k, offset
         )
 
     def rotate_input_ids(self, output_ids, input_ids, qo_indptr, new_tokens, batch_size):
