@@ -825,16 +825,17 @@ def mla_prefill_reference_custom_mask(q_nope, q_pe_rope, ckv, kpe_rope, sm_scale
 
 
 def _pack_mask(mask_bool, qo_len, kv_len):
+    import numpy as np
     total_bits = qo_len * kv_len
     byte_len = (total_bits + 7) // 8
-    data = bytearray(byte_len)
+    data = np.zeros(byte_len, dtype=np.uint8)
     for q in range(qo_len):
         for k in range(kv_len):
             if mask_bool[q * kv_len + k]:
                 offset = q * kv_len + k
-                data[offset >> 3] |= 1 << (offset & 7)
-    indptr = (ctypes.c_int32 * 2)(0, byte_len)
-    return bytes(data), indptr
+                data[offset >> 3] |= np.uint8(1 << (offset & 7))
+    indptr = np.array([0, byte_len], dtype=np.int32)
+    return data, indptr
 
 
 def _run_mla_prefill_with_mask(glm, device, q_nope, q_pe_rope, ckv_paged, kpe_paged,
@@ -861,13 +862,19 @@ def _run_mla_prefill_with_mask(glm, device, q_nope, q_pe_rope, ckv_paged, kpe_pa
 
     o = torch.empty(B * qo_len, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
 
-    custom_mask_ptr = None
-    mask_indptr_ptr = None
+    custom_mask_ptr = 0
+    mask_indptr_ptr = 0
     if custom_mask_data is not None:
-        custom_mask_ptr = (ctypes.c_uint8 * len(custom_mask_data))(*custom_mask_data)
-        mask_indptr_ptr = mask_indptr
+        mask_tensor = torch.from_numpy(custom_mask_data).to(device)
+        custom_mask_ptr = mask_tensor.data_ptr()
+    if mask_indptr is not None:
+        indptr_tensor = torch.from_numpy(mask_indptr).to(device)
+        mask_indptr_ptr = indptr_tensor.data_ptr()
 
-    mask_mode_int = mask_mode
+    if mask_mode == 0 and custom_mask_data is None and causal:
+        mask_mode_int = 1
+    else:
+        mask_mode_int = mask_mode
 
     glm.mla_prefill_run(
         q_nope.data_ptr(), q_pe_rope.data_ptr(),
@@ -919,18 +926,16 @@ def test_mla_prefill_causal_custom_tree_mask(glm, device):
     ckv = torch.randn(kv_len, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
     kpe = torch.randn(kv_len, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
 
-    cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, qo_len)
+    cos_q, sin_q = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, qo_len)
+    cos_k, sin_k = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, kv_len)
     q_pe_4d = q_pe.reshape(B, num_heads, qo_len, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos_q, sin_q, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * qo_len, num_heads, HEAD_DIM_KPE)
 
-    kpe_4d = kpe.reshape(kv_len, 1, HEAD_DIM_KPE)
+    kpe_4d = kpe.reshape(B, 1, kv_len, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    kpe_cos = cos[:, :kv_len, :]
-    kpe_sin = sin[:, :kv_len, :]
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d.expand(B, kv_len, HEAD_DIM_KPE),
-                              kpe_cos, kpe_sin, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_k, sin_k, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(kv_len, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(num_pages, page_size, HEAD_DIM_CKV)
@@ -958,19 +963,11 @@ def test_mla_prefill_causal_custom_tree_mask(glm, device):
         mask_mode=4,
         page_size=page_size)
 
-    # Build full custom mask for reference
-    full_mask = [False] * (qo_len * kv_len)
-    for q in range(qo_len):
-        for k in range(prefix_len):
-            full_mask[q * kv_len + k] = True
-        for k in range(qo_len):
-            full_mask[q * kv_len + prefix_len + k] = suffix_mask[q * qo_len + k]
-
     ref_output = mla_prefill_reference_custom_mask(
         q_nope, q_pe_rope,
         ckv.unsqueeze(0), kpe_rope.unsqueeze(0),
         1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE),
-        full_mask, prefix_len=prefix_len)
+        suffix_mask, prefix_len=prefix_len)
 
     torch.testing.assert_close(o_cc.cpu(), ref_output.cpu(), atol=0.05, rtol=0.02)
 
@@ -994,18 +991,16 @@ def test_mla_prefill_causal_custom_matches_full_custom(glm, device):
     ckv = torch.randn(kv_len, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
     kpe = torch.randn(kv_len, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
 
-    cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, qo_len)
+    cos_q, sin_q = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, qo_len)
+    cos_k, sin_k = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, kv_len)
     q_pe_4d = q_pe.reshape(B, num_heads, qo_len, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos_q, sin_q, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * qo_len, num_heads, HEAD_DIM_KPE)
 
-    kpe_4d = kpe.reshape(kv_len, 1, HEAD_DIM_KPE)
+    kpe_4d = kpe.reshape(B, 1, kv_len, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    kpe_cos = cos[:, :kv_len, :]
-    kpe_sin = sin[:, :kv_len, :]
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d.expand(B, kv_len, HEAD_DIM_KPE),
-                              kpe_cos, kpe_sin, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_k, sin_k, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(kv_len, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(num_pages, page_size, HEAD_DIM_CKV)
@@ -1071,18 +1066,16 @@ def test_mla_prefill_causal_custom_causal_suffix_matches_causal(glm, device):
     ckv = torch.randn(kv_len, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
     kpe = torch.randn(kv_len, HEAD_DIM_KPE, dtype=torch.bfloat16, device=device)
 
-    cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, qo_len)
+    cos_q, sin_q = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, qo_len)
+    cos_k, sin_k = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, kv_len)
     q_pe_4d = q_pe.reshape(B, num_heads, qo_len, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos_q, sin_q, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * qo_len, num_heads, HEAD_DIM_KPE)
 
-    kpe_4d = kpe.reshape(kv_len, 1, HEAD_DIM_KPE)
+    kpe_4d = kpe.reshape(B, 1, kv_len, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    kpe_cos = cos[:, :kv_len, :]
-    kpe_sin = sin[:, :kv_len, :]
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d.expand(B, kv_len, HEAD_DIM_KPE),
-                              kpe_cos, kpe_sin, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_k, sin_k, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(kv_len, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(num_pages, page_size, HEAD_DIM_CKV)
