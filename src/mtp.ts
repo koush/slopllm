@@ -203,9 +203,6 @@ export function mtpTreeDecode(
     }, ['mtp-tree', `layer${i}`]);
 
     seq0.truncate(originalAllocLen);
-    pagedKV.positionIdsDirty = true;
-    pagedKV.pagesDirtyHost = true;
-    pagedKV.pagesDirtyDevice = true;
 
     // why is this necessary? without it there's an illegal memory access.
     // actually without the sync all the host pointers are written in a tight loop,
@@ -316,11 +313,6 @@ export function mtpVerify(
   const originalAllocLen = seq0.allocLen;
 
   const hostBuf = ws.ensureAllocPinned(treeResult.validationSequences.shape, treeResult.validationSequences.type, `mtp_verify_host_buf_${totalTreeNodes}`);
-
-  pagedKV.positionIdsDirty = true;
-  pagedKV.pagesDirtyHost = true;
-  pagedKV.pagesDirtyDevice = true;
-
   const customMask = ensureCustomMask(ws, totalTreeNodes, buildTreeMask);
 
   const state = ws.planPrefill(model, 1, [totalTreeNodes], cache, {
@@ -387,9 +379,6 @@ export function mtpVerify(
   }
 
   seq0.truncate(originalAllocLen);
-  pagedKV.positionIdsDirty = true;
-  pagedKV.pagesDirtyHost = true;
-  pagedKV.pagesDirtyDevice = true;
 
   // this is not ideal, since attention was already computed, but the kv cache has the token tree in
   // non sequential order.
