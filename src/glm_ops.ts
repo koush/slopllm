@@ -841,13 +841,6 @@ export function bf16BytesToF32(buf: Buffer): Float32Array {
 export const BF16 = 2;
 export const I32 = 4;
 export const F32 = 4;
-export const SAMPLING_MAX_TOPK = 256;
-export const SAMPLING_BLOCK_SIZE = 256;
-export const FLASH_TMP_SIZE = 32 * 1024 * 1024;
-export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
-export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
-export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
-export const PAGE_SIZE = 16;
 
 const MEMCPY_H2H = 0;
 const MEMCPY_H2D = 1;

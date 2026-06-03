@@ -1,6 +1,6 @@
 import { ChatModel, type ChatCache } from "./chat_model";
-import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
-import { BATCH_FLOAT_WS_SIZE, BATCH_INT_WS_SIZE, BATCH_PINNED_INT_WS_SIZE, I32 } from "./glm_ops";
+import { DeviceOps, MaskMode } from "./device_ops";
+import { I32 } from "./glm_ops";
 import { type PagedKVCache } from "./paged_kv";
 import { MemcpyKind, Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
@@ -9,7 +9,9 @@ export const DECODE_PLAN_INFO_SIZE = 10;
 export const PREFILL_PLAN_INFO_SIZE = 15;
 export const MLA_PREFILL_PLAN_INFO_SIZE = 19;
 export const MLA_DECODE_PLAN_INFO_SIZE = 10;
-
+export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
+export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
+export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 
 export class ExecutionState {
   input?: Tensor;
@@ -375,8 +377,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
         );
       } else {
         this.glm.mlaDecodePlan(
-          this.floatWs, 128 * 1024 * 1024,
-          this.intWs, this.pinnedIntWs, 8 * 1024 * 1024,
+          this.floatWs, BATCH_FLOAT_WS_SIZE,
+          this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
           this.mlaDecodePlanInfo,
           this.indptrH, this.lastPageLenH,
           batchSize, model.cfg.numAttentionHeads, pagedKV.pageSize, enableCudaGraph,
@@ -465,8 +467,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
     if (cfg.kvLoraRank) {
       this.glm.mlaPrefillPlan(
-        this.floatWs, 128 * 1024 * 1024,
-        this.intWs, this.pinnedIntWs, 8 * 1024 * 1024,
+        this.floatWs, BATCH_FLOAT_WS_SIZE,
+        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
         this.mlaPrefillPlanInfo,
         this.qoIndptrH, this.indptrH,
         this.kvLenH, this.lastPageLenH,
