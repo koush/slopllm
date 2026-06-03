@@ -51,7 +51,7 @@ export class WorkspaceBase implements Disposable {
     return this._alloc(shape, type, false, name, parallelism);
   }
 
-  ensureAlloc(shape: number[], type: string, name: string, parallelism?: TensorParallelism): Tensor {
+  ensureAlloc(shape: number[], type: string, name: string, parallelism?: TensorParallelism, fill?: number): Tensor {
     const existing = this.tensors.get(name);
     if (existing !== undefined) {
       if (existing.shape.length !== shape.length || existing.shape.some((v, i) => v !== shape[i]) || existing.type !== type) {
@@ -59,7 +59,11 @@ export class WorkspaceBase implements Disposable {
       }
       return existing;
     }
-    return this._alloc(shape, type, false, name, parallelism);
+    const ret = this._alloc(shape, type, false, name, parallelism);
+    if (fill !== undefined) {
+      ret.fill(fill, ret.numElements);
+    }
+    return ret;
   }
 
   ensureAllocPinned(shape: number[], type: string, name: string, parallelism?: TensorParallelism): Tensor {

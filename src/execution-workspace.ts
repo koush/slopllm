@@ -130,6 +130,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
   inputIdsBuf: Tensor;
   /** Scratch Pinned host buffer [B*S] of I32: written by host, read via memcpy to inputIdsBuf. */
   inputIdsBufH: Tensor;
+  /** Whether the input buffer has been cleared. */
+  inputCleared = false;
   /** GPU buffer [B*S] of I32: written by host (h2d), read by RoPE kernel. */
   positionIds: Tensor;
   /** Pinned host buffer [B*S] of I32: written by host, read via memcpy to positionIds. */
@@ -194,6 +196,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
       for (let i = 0; i < B; i++) buf.writeInt32LE(i, i * I32);
     });
     this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, B * I32, MemcpyKind.HostToDevice);
+  }
+
+  ensureInputCleared() {
+    if (this.inputCleared) {
+      return;
+    }
+    this.inputIdsBuf.fill(0, this.inputIdsBuf.numElements);
+    this.inputCleared = true;
   }
 
   startTracking(keepExports = new Set<Tensor>()): Disposable & { [Symbol.dispose](): void } {

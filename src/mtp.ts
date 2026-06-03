@@ -85,7 +85,7 @@ export function mtpTreeDecode(
   model: ChatModel,
   targetHiddenStates: Tensor,
   ws: ExecutionWorkspace,
-  currentToken: number,
+  targetToken: number,
   nextn: number,
   cache: ChatCache,
 ): MtpTreeResult {
@@ -107,38 +107,32 @@ export function mtpTreeDecode(
   // Buffer to save MTP output from previous iteration for chained hidden states.
   // Each node p > 0 is conditioned on its parent's MTP output (matching the
   // single-layer EAGLE worker's decode path where hidden_states are chained).
-  const prevMtpOutput = ws.ensureAlloc([(1 << nextn) - 1, hiddenDim], "BF16", `mtp-tree-prev-mtp-${totalTreeNodes}`);
+  const prevMtpOutput = ws.ensureAlloc([(1 << nextn) - 1, hiddenDim], "BF16", `mtp-tree-prev-mtp-${totalTreeNodes}`, undefined, 0);
 
+  // Build tiled hidden states: node 0 gets targetHS, node p>0 gets its
+  // parent's MTP output from the previous iteration (chained, matching the
+  // single-layer EAGLE worker's decode path).
+  //   tiledHs[0]         = targetHS            (root)
+  //   tiledHs[2p+1]     = prevMtpOutput[p]    (child 1 of node p)
+  //   tiledHs[2p+2]     = prevMtpOutput[p]    (child 2 of node p)
+  const tiledHs = ws.ensureAlloc([totalTreeNodes, hiddenDim], "BF16", `mtp-tree-hs-${totalTreeNodes}`, undefined, 0);
+  
+  const customMask = ensureCustomMask(ws, totalTreeNodes, buildTreeMask);
+  const prefillState = ws.planPrefill(model, 1, [totalTreeNodes], cache, {
+    ...customMask,
+    positionIds: getPositionIdsMask(ws, originalAllocLen, totalTreeNodes),
+  });
+  ws.ensureInputCleared();
+  prefillState.setInput([[targetToken]]);
 
+  // using the designated input buffer is a no op in terms of gpu execution, no staging memcpy needed.
+  prefillState.setInput(ws.inputIdsBuf);
 
-  // Iteration: single-sequence prefill with tree-shaped custom mask
-  // 1 -> 3 -> 7 -> 15 for i = 0,1,2,3 (nextn=3)
-  for (let i = 0; i < nextn; i++) {
-    const numPrefillTokens = (1 << (i + 1)) - 1;
-
-    let prefillState: ExecutionState;
-    if (i === 0) {
-      prefillState = ws.planPrefill(model, 1, [1], cache);
-      prefillState.setInput([[currentToken]]);
-    }
-    else {
-      const customMask = ensureCustomMask(ws, numPrefillTokens, buildTreeMask);
-      prefillState = ws.planPrefill(model, 1, [numPrefillTokens], cache, {
-        ...customMask,
-        positionIds: getPositionIdsMask(ws, originalAllocLen, totalTreeNodes),
-      });
-    }
-
-    captureManager.run(() => {
-      prefillState.setInput(ws.inputIdsBuf);
-
-      // Build tiled hidden states: node 0 gets targetHS, node p>0 gets its
-      // parent's MTP output from the previous iteration (chained, matching the
-      // single-layer EAGLE worker's decode path).
-      //   tiledHs[0]         = targetHS            (root)
-      //   tiledHs[2p+1]     = prevMtpOutput[p]    (child 1 of node p)
-      //   tiledHs[2p+2]     = prevMtpOutput[p]    (child 2 of node p)
-      const tiledHs = ws.ensureAlloc([numPrefillTokens, hiddenDim], "BF16", `mtp-tree-hs-${numPrefillTokens}`);
+  captureManager.run(() => {
+    // Iteration: single-sequence prefill with tree-shaped custom mask
+    // 1 -> 3 -> 7 -> 15 for i = 0,1,2,3 (nextn=3)
+    for (let i = 0; i < nextn; i++) {
+      const numPrefillTokens = (1 << (i + 1)) - 1;
 
       if (i === 0) {
         tiledHs.memcpy(targetHiddenStates);
@@ -171,12 +165,14 @@ export function mtpTreeDecode(
       using logits = prefillState.computeLogits(hiddenStates, model, true);
 
       // Save this iteration's MTP output for the next iteration's chaining
-      prevMtpOutput.memcpy2d(
-        0, rowBytes,
-        hiddenStates, 0, rowBytes,
-        rowBytes, numPrefillTokens,
-        MemcpyKind.DeviceToDevice,
-      );
+      if (i < nextn - 1) {
+        prevMtpOutput.memcpy2d(
+          0, rowBytes,
+          hiddenStates, 0, rowBytes,
+          rowBytes, numPrefillTokens,
+          MemcpyKind.DeviceToDevice,
+        );
+      }
 
       const topk = logits.topk(2, model.cfg.vocabSize);
       using _values = topk.values;
@@ -200,15 +196,13 @@ export function mtpTreeDecode(
         1, // height (no pitch)
         MemcpyKind.DeviceToDevice,
       );
-    }, ['mtp-tree', `layer${i}`]);
+    }
+  }, ['mtp-tree']);
 
-    seq0.truncate(originalAllocLen);
+  seq0.truncate(originalAllocLen);
 
-    // why is this necessary? without it there's an illegal memory access.
-    // actually without the sync all the host pointers are written in a tight loop,
-    // and the memcpy may happen before the data has been read and send to gpu.
-    ws.glm.synchronize();
-  }
+  // should maybe be downstream?
+  ws.glm.synchronize();
 
   validationSequences.memcpy(ws.inputIdsBuf, undefined, MemcpyKind.DeviceToDevice);
 
@@ -405,8 +399,6 @@ export function mtpVerify(
   ws.glm.synchronize();
 
   const targetToken = argmaxBuf.readInt32LE(0);
-
-  finishState.setInput([[targetToken]]);
 
   const verifiedTokens = finishTokens.slice();
   // remove the input token.
