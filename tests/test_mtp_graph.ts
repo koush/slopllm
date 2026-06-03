@@ -104,7 +104,7 @@ describe("MTP with CUDA graph capture: TP validation", () => {
       state.setInput(gpuSampleResult!);
 
       captureManager.run(() => {
-        ws.decodeStep(state, model);
+        ws.positionStep(state, model);
         targetHiddenStates.replace(model.forward(state));
         using logits = state.computeLogits(targetHiddenStates.value, model);
         using argmax = logits.argmax();

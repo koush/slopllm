@@ -40,7 +40,7 @@ function runMtpTreeDecode(model: ChatModel, ws: ExecutionWorkspace, cache: ChatC
 
   const state = ws.planDecode(model, 1, cache);
   state.setInput([[firstToken]]);
-  ws.decodeStep(state, model);
+  ws.positionStep(state, model);
 
   using hiddenHolder = new UsingHolder<Tensor>(undefined!);
   const hidden = model.forward(state);

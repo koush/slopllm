@@ -483,7 +483,7 @@ class Glm51SmallModel:
             logits = F.linear(hidden_states, self.lm_head_w)
         return logits, kv_cache
 
-    def forward_decode_step(self, token_id, kv_cache, position):
+    def forward_position_step(self, token_id, kv_cache, position):
         B = 1
         qk_rope_dim = self.cfg["qk_rope_head_dim"]
         cos, sin = make_rotary_embed(qk_rope_dim // 2, position + 1, device=self.device, batch_size=B)
@@ -516,8 +516,8 @@ class Glm51SmallModel:
             logits = F.linear(hidden_state, self.lm_head_w)
         return logits, new_kv_cache
 
-    def forward_decode_step_with_hidden(self, token_id, kv_cache, position):
-        """Like forward_decode_step but also returns per-layer hidden states."""
+    def forward_position_step_with_hidden(self, token_id, kv_cache, position):
+        """Like forward_position_step but also returns per-layer hidden states."""
         B = 1
         qk_rope_dim = self.cfg["qk_rope_head_dim"]
         cos, sin = make_rotary_embed(qk_rope_dim // 2, position + 1, device=self.device, batch_size=B)
@@ -557,6 +557,6 @@ class Glm51SmallModel:
         tokens = [logits[0, -1].argmax().item()]
         for i in range(max_new_tokens - 1):
             token_tensor = torch.tensor([[tokens[-1]]], device=self.device)
-            logits, kv_cache = self.forward_decode_step(token_tensor, kv_cache, len(tokens) - 1 + input_ids.shape[1])
+            logits, kv_cache = self.forward_position_step(token_tensor, kv_cache, len(tokens) - 1 + input_ids.shape[1])
             tokens.append(logits[0, -1].argmax().item())
         return tokens

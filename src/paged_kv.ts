@@ -45,7 +45,6 @@ export class Sequence {
     this.allocLen += pageLen;
     page.refs++;
     this.pagedKvCache.pagesDirtyHost = true;
-    this.pagedKvCache.pagesDirtyDevice = true;
   }
 
   popPage() {
@@ -56,7 +55,6 @@ export class Sequence {
       this.pagedKvCache.availablePages.push(page.id);
     }
     this.pagedKvCache.pagesDirtyHost = true;
-    this.pagedKvCache.pagesDirtyDevice = true;
   }
 
   clear() {
@@ -143,7 +141,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   checkSequenceCount(): void {
     if (this.sequences.length !== this.lastNumSequences) {
       this.pagesDirtyHost = true;
-      this.pagesDirtyDevice = true;
       this.positionIdsDirty = true;
     }
     this.lastNumSequences = this.sequences.length;
@@ -200,7 +197,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
     this.sequences = Array.from({ length: batchSize }, () => new Sequence(this));
     this.pagesDirtyHost = true;
-    this.pagesDirtyDevice = true;
     this.positionIdsDirty = true;
   }
 
@@ -215,7 +211,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.staging.set(stagingKey, seq);
     this.sequences.splice(seqIdx, 1);
     this.pagesDirtyHost = true;
-    this.pagesDirtyDevice = true;
     this.positionIdsDirty = true;
   }
 
@@ -227,7 +222,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.staging.delete(stagingKey);
     this.sequences.push(seq);
     this.pagesDirtyHost = true;
-    this.pagesDirtyDevice = true;
     this.positionIdsDirty = true;
     return seq;
   }
@@ -254,7 +248,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     seq.clear();
     this.sequences.splice(seqIdx, 1);
     this.pagesDirtyHost = true;
-    this.pagesDirtyDevice = true;
     this.positionIdsDirty = true;
   }
 

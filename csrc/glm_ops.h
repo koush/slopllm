@@ -351,25 +351,25 @@ void glm_kv_cache_write(GlmCtx* ctx,
                          uint32_t src_k_token_stride, uint32_t src_k_head_stride,
                          uint32_t src_v_token_stride, uint32_t src_v_head_stride);
 
-void glm_decode_step(GlmCtx* ctx,
-                      int32_t* position_ids,
-                      int32_t* last_page_len,
-                      int32_t* slot_mapping,
-                      const int32_t* indptr,
-                      const int32_t* indices,
-                      uint32_t page_size,
-                      uint32_t batch_size,
-                      int32_t steps);
+void glm_position_step(GlmCtx* ctx,
+                        int32_t* position_ids,
+                        int32_t* last_page_len,
+                        int32_t* slot_mapping,
+                        const int32_t* indptr,
+                        const int32_t* indices,
+                        uint32_t page_size,
+                        uint32_t batch_size,
+                        int32_t steps);
 
-void glm_mla_decode_step(GlmCtx* ctx,
-                           int32_t* position_ids,
-                           int32_t* last_page_len,
-                           const int32_t* indptr,
-                           uint32_t page_size,
-                           uint32_t batch_size,
-                           uint32_t cp_world_size,
-                           uint32_t cp_rank,
-                           int32_t steps);
+void glm_mla_position_step(GlmCtx* ctx,
+                             int32_t* position_ids,
+                             int32_t* last_page_len,
+                             const int32_t* indptr,
+                             uint32_t page_size,
+                             uint32_t batch_size,
+                             uint32_t cp_world_size,
+                             uint32_t cp_rank,
+                             int32_t steps);
 
 void glm_synchronize(GlmCtx* ctx);
 

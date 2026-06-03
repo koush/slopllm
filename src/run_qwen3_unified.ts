@@ -303,7 +303,7 @@ export function* generateStream(
         }
 
         captureManager.run(() => {
-          ws.decodeStep(state, model);
+          ws.positionStep(state, model);
           targetHiddenStates.replace(model.forward(state));
           doSample(state.computeLogits(targetHiddenStates.value, model));
         }, ['decode']);

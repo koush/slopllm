@@ -63,7 +63,7 @@ function getPositionIdsMask(ws: ExecutionWorkspace, originalAllocLen: number, to
  * ancestors in the binary tree, so different branches don't cross-attend.
  *
  * Prerequisites:
- *   - The target model must have just decoded (planDecode + decodeStep + forward
+ *   - The target model must have just decoded (planDecode + positionStep + forward
  *     already called for the current position)
  *   - state must be the target model's decode state (batchSize = 1)
  *   - gpuSampleResult must be [1] I32 GPU tensor: target model's sampled token

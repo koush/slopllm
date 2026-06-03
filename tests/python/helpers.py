@@ -545,8 +545,8 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,  # cp_rank, cp_world_size
         ]
 
-        self.lib.glm_decode_step.restype = None
-        self.lib.glm_decode_step.argtypes = [
+        self.lib.glm_position_step.restype = None
+        self.lib.glm_position_step.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
@@ -1402,10 +1402,10 @@ class GlmOps:
             ctypes.c_uint32(cp_rank), ctypes.c_uint32(cp_world_size)
         )
 
-    def decode_step(self, position_ids, last_page_len, slot_mapping,
+    def position_step(self, position_ids, last_page_len, slot_mapping,
                      indptr, indices, page_size, batch_size,
                      cp_world_size=1, cp_rank=0, steps=1):
-        self.lib.glm_decode_step(
+        self.lib.glm_position_step(
             self.ctx,
             ctypes.c_void_p(position_ids), ctypes.c_void_p(last_page_len),
             ctypes.c_void_p(slot_mapping),

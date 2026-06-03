@@ -554,12 +554,12 @@ class TestMLA:
             assert result_ckv[1, offset].abs().max().item() == 0, f"page1 offset={offset} ckv should be zero"
             assert result_kpe[1, offset].abs().max().item() == 0, f"page1 offset={offset} kpe should be zero"
 
-    def test_decode_step(self, glm, device):
-        """Verify decode_step_kernel updates position_ids, last_page_len, slot_mapping correctly."""
+    def test_position_step(self, glm, device):
+        """Verify position_step_kernel updates position_ids, last_page_len, slot_mapping correctly."""
         if device is None:
             pytest.skip("CUDA required")
 
-        # decode_step_kernel logic:
+        # position_step_kernel logic:
         #   pos = position_ids[seq] + 1
         #   position_ids[seq] = pos
         #   kv_len = pos + 1
@@ -583,7 +583,7 @@ class TestMLA:
         indptr = torch.tensor([0, 2], dtype=torch.int32, device=device)
 
         # Step 1: pos becomes 6, kv_len=7, page=6//16=0, offset=6%16=6, slot=0*16+6=6
-        glm.decode_step(position_ids.data_ptr(), last_page_len.data_ptr(),
+        glm.position_step(position_ids.data_ptr(), last_page_len.data_ptr(),
                          slot_mapping.data_ptr(),
                          indptr.data_ptr(), indices.data_ptr(), PAGE, B)
         glm.synchronize()
@@ -592,7 +592,7 @@ class TestMLA:
         assert slot_mapping[0].item() == 6, f"slot_mapping after step1: {slot_mapping[0].item()}"
 
         # Step 2: pos becomes 7, kv_len=8, page=7//16=0, offset=7%16=7, slot=0*16+7=7
-        glm.decode_step(position_ids.data_ptr(), last_page_len.data_ptr(),
+        glm.position_step(position_ids.data_ptr(), last_page_len.data_ptr(),
                          slot_mapping.data_ptr(),
                          indptr.data_ptr(), indices.data_ptr(), PAGE, B)
         glm.synchronize()
@@ -601,7 +601,7 @@ class TestMLA:
         assert slot_mapping[0].item() == 7
 
         # Step 3: pos becomes 8, kv_len=9, page=8//16=0, offset=8%16=8, slot=0*16+8=8
-        glm.decode_step(position_ids.data_ptr(), last_page_len.data_ptr(),
+        glm.position_step(position_ids.data_ptr(), last_page_len.data_ptr(),
                          slot_mapping.data_ptr(),
                          indptr.data_ptr(), indices.data_ptr(), PAGE, B)
         glm.synchronize()
@@ -611,7 +611,7 @@ class TestMLA:
 
         # Test page boundary: position_ids=15, next step crosses to page 1
         position_ids[0] = 15
-        glm.decode_step(position_ids.data_ptr(), last_page_len.data_ptr(),
+        glm.position_step(position_ids.data_ptr(), last_page_len.data_ptr(),
                          slot_mapping.data_ptr(),
                          indptr.data_ptr(), indices.data_ptr(), PAGE, B)
         glm.synchronize()
@@ -621,7 +621,7 @@ class TestMLA:
 
         # Next step fills page 1
         position_ids[0] = 16
-        glm.decode_step(position_ids.data_ptr(), last_page_len.data_ptr(),
+        glm.position_step(position_ids.data_ptr(), last_page_len.data_ptr(),
                          slot_mapping.data_ptr(),
                          indptr.data_ptr(), indices.data_ptr(), PAGE, B)
         glm.synchronize()
@@ -636,7 +636,7 @@ class TestMLA:
         # Need more pages for indices
         indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
         indptr = torch.tensor([0, 2], dtype=torch.int32, device=device)
-        glm.decode_step(position_ids.data_ptr(), last_page_len.data_ptr(),
+        glm.position_step(position_ids.data_ptr(), last_page_len.data_ptr(),
                          slot_mapping.data_ptr(),
                          indptr.data_ptr(), indices.data_ptr(), PAGE, B)
         glm.synchronize()

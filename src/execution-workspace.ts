@@ -221,17 +221,17 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return tracker;
   }
 
-  decodeStep(state: ExecutionState, model: ChatModel, steps = 1): void {
+  positionStep(state: ExecutionState, model: ChatModel, steps = 1): void {
     const pagedKV = state.cache.getPagedKV();
     const batchSize = state.batchSize;
     if (!model.cfg.kvLoraRank) {
-      this.glm.decodeStep(
+      this.glm.positionStep(
         this.positionIds, this.lastPageLen, this.slotMapping,
         this.indptrD, pagedKV.indices,
         pagedKV.pageSize, batchSize, steps
       );
     } else {
-      this.glm.mlaDecodeStep(
+      this.glm.mlaPositionStep(
         this.positionIds, this.lastPageLen,
         this.indptrD,
         pagedKV.pageSize, batchSize,
@@ -385,8 +385,11 @@ export class ExecutionWorkspace extends WorkspaceBase {
         );
       }
       pagedKV.pagesDirtyHost = false;
+      pagedKV.pagesDirtyDevice = true;
     }
 
+    // could be rolled into above? keeping an explicit flag here since
+    // there may be a case where only device needs update or device update is done later in graph?
     if (pagedKV.pagesDirtyDevice) {
       const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.contentPages, 0);
       pagedKV.indices.memcpy(pagedKV.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
@@ -543,7 +546,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   forwardEagerDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache): number[] {
     const state = this.planDecode(model, tokenIdsList.length, cache);
     state.setInput([tokenIdsList]);
-    this.decodeStep(state, model);
+    this.positionStep(state, model);
     const hiddenStates = model.forward(state);
     const logits = state.computeLogits(hiddenStates, model);
     using argmaxResult = logits.argmax();

@@ -2064,7 +2064,7 @@ void glm_kv_cache_write(GlmCtx* ctx,
 // indices: [max_pages] int32 — page table indices (read-only)
 // ---------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(128) decode_step_kernel(
+__global__ void __launch_bounds__(128) position_step_kernel(
     int32_t* position_ids,
     int32_t* last_page_len,
     int32_t* slot_mapping,
@@ -2091,31 +2091,31 @@ __global__ void __launch_bounds__(128) decode_step_kernel(
     slot_mapping[seq] = abs_page * (int32_t)page_size + page_offset;
 }
 
-void glm_decode_step(GlmCtx* ctx,
-                       int32_t* position_ids,
-                       int32_t* last_page_len,
-                       int32_t* slot_mapping,
-                       const int32_t* indptr,
-                       const int32_t* indices,
-                       uint32_t page_size,
-                       uint32_t batch_size,
-                       int32_t steps) {
+void glm_position_step(GlmCtx* ctx,
+                        int32_t* position_ids,
+                        int32_t* last_page_len,
+                        int32_t* slot_mapping,
+                        const int32_t* indptr,
+                        const int32_t* indices,
+                        uint32_t page_size,
+                        uint32_t batch_size,
+                        int32_t steps) {
     cudaSetDevice(ctx->device_id);
     dim3 grid((batch_size + 127) / 128);
     dim3 block(128);
-    decode_step_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
+    position_step_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
         position_ids, last_page_len, slot_mapping,
         indptr, indices, page_size, batch_size, steps);
 }
 
 // ---------------------------------------------------------------------------
-// MLA decode step kernel
-// Same as decode_step_kernel but without slot_mapping computation.
+// MLA position step kernel
+// Same as position_step_kernel but without slot_mapping computation.
 // MLA uses mlaKvCacheAppend (batchIndices + positionIds) instead of
 // kvCacheWrite (slotMapping), so slot_mapping is not needed.
 // ---------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(128) mla_decode_step_kernel(
+__global__ void __launch_bounds__(128) mla_position_step_kernel(
     int32_t* position_ids,
     int32_t* last_page_len,
     const int32_t* indptr,
@@ -2147,19 +2147,19 @@ __global__ void __launch_bounds__(128) mla_decode_step_kernel(
     }
 }
 
-void glm_mla_decode_step(GlmCtx* ctx,
-                           int32_t* position_ids,
-                           int32_t* last_page_len,
-                           const int32_t* indptr,
-                           uint32_t page_size,
-                           uint32_t batch_size,
-                           uint32_t cp_world_size,
-                           uint32_t cp_rank,
-                           int32_t steps) {
+void glm_mla_position_step(GlmCtx* ctx,
+                             int32_t* position_ids,
+                             int32_t* last_page_len,
+                             const int32_t* indptr,
+                             uint32_t page_size,
+                             uint32_t batch_size,
+                             uint32_t cp_world_size,
+                             uint32_t cp_rank,
+                             int32_t steps) {
     cudaSetDevice(ctx->device_id);
     dim3 grid((batch_size + 127) / 128);
     dim3 block(128);
-    mla_decode_step_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
+    mla_position_step_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
         position_ids, last_page_len, indptr,
         page_size, batch_size,
         cp_world_size, cp_rank, steps);
