@@ -437,8 +437,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
       pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);
     }
 
-    pagedKV.positionIdsDirty = true;
-
     this.qoIndptrH.withPinnedBuffer(buf => {
       buf.writeInt32LE(0, 0);
       for (let i = 0; i < batchSize; i++) {
@@ -458,6 +456,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       }
     });
     this.positionIds.memcpy(this.positionIdsH, totalTokens * I32, MemcpyKind.HostToDevice);
+    pagedKV.positionIdsDirty = true;
 
     this.kvLenH.withPinnedBuffer(buf => {
       for (let i = 0; i < batchSize; i++) {
