@@ -390,7 +390,7 @@ export function mtpVerify(
     using verifiedHiddenStates = model.forwardModel(finishState);
     const lmHead = model.tensors.get("lm_head.weight")!;
     const batchSize = finishState.batchSize;
-    using lastIdxFromIndptr = finishState.ws.qoIndptrD.narrow(1, batchSize);
+    using lastIdxFromIndptr = finishState.lastIdx;
     using hiddenLast = verifiedHiddenStates.indexSelect(lastIdxFromIndptr, batchSize, -1);
     using logits = hiddenLast.linear(lmHead, batchSize).removeTracking();
 
