@@ -10,7 +10,7 @@ import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { MetaOps } from "./meta_ops";
 import { resolveModelPath } from "./model_path";
-import { mtpTreeDecode, mtpVerify } from "./mtp";
+import { mtpTreeDecode } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
 import { Qwen35Model } from "./qwen35_model";
 import { Qwen3Model } from "./qwen3_model";
@@ -265,14 +265,9 @@ export function* generateStream(
   try {
     for (let i = 1; i < maxNewTokens; i++) {
       if (mtp && model.forwardMtp && nextn > 0) {
-        const treeResult = mtpTreeDecode(captureManager, model, targetHiddenStates.value, ws, currentToken, nextn, cache);
+        const treeResult = mtpTreeDecode(captureManager, model, targetHiddenStates.value, ws, currentToken, nextn, cache, tokenizer);
         // glm.synchronize();
-        // const validationSequences = treeResult.validationSequences.readInt32LEArray();
-        // const tokens = tokenizer.decode(validationSequences, { skip_special_tokens: false });
-        // console.log(tokens);
-        const verifyResult = mtpVerify(captureManager, model, targetHiddenStates.value, ws, cache, treeResult, currentToken, tokenizer);
-        // best replacement goes to gpuSampleResult for next step
-        for (const t of verifyResult) {
+        for (const t of treeResult) {
           currentToken = t;
           cache.reportTokens(0, [t]);
           tokenHistory.push(t);
