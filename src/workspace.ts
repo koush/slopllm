@@ -99,9 +99,8 @@ export class WorkspaceBase implements Disposable {
     if (name !== undefined) {
       const existing = this.tensors.get(name);
       if (existing !== undefined) {
-        existing[Symbol.dispose]();
+        throw new Error(`Tensor with name ${name} already exists`);
       }
-
     }
 
     let best: Tensor | undefined;

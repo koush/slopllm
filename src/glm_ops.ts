@@ -158,6 +158,9 @@ export class GlmTensor extends Tensor {
   }
 
   [Symbol.dispose](): void {
+    if (this.name !== undefined) {
+      throw new Error(`Cannot dispose named tensor ${this.name}`);
+    }
     // if stream is active, defer disposal until stream switch
     if (this.glm.currentStream) {
       this.glm.streamTensors.get(this.glm.currentStream)!.add(this);

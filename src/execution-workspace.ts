@@ -19,7 +19,7 @@ export class ExecutionState {
   constructor(
     public readonly batchSize: number, public readonly totalTokens: number, public readonly seqLens: number[],
     public readonly isDecode: boolean, public readonly ws: ExecutionWorkspace, public readonly cache: ChatCache,
-    public readonly qoIndptrHost?: Tensor, public readonly customMask?: {
+    public readonly customMask?: {
       indptr: Tensor;
       mask: Tensor;
       mode?: MaskMode;
@@ -103,9 +103,12 @@ export class ExecutionState {
             idsOff += I32;
           }
         }
+        const totalBytes = this.totalTokens * I32;
+        if (idsOff < totalBytes)
+          buf.fill(0, idsOff, totalBytes);
       });
       this.input = this.ws.inputIdsBuf;
-      this.input.memcpy(this.ws.inputIdsBufH, this.input.bytes, MemcpyKind.HostToDevice);
+      this.input.memcpy(this.ws.inputIdsBufH, this.totalTokens * I32, MemcpyKind.HostToDevice);
     }
   }
 }
@@ -530,7 +533,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
 
-    return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, this.qoIndptrH, customMask);
+    return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, customMask);
   }
 
   forwardPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): Tensor {

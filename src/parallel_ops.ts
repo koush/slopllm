@@ -84,6 +84,9 @@ export class ParallelTensor extends Tensor {
   }
 
   [Symbol.dispose](): void {
+    if (this.name !== undefined) {
+      throw new Error(`Cannot dispose named tensor ${this.name}`);
+    }
     for (const shard of this.shards) {
       shard[Symbol.dispose]();
     }
@@ -840,7 +843,7 @@ export class ParallelTensor extends Tensor {
       const pGatheredIndices = gatheredIndices as ParallelTensor;
       const idxBytes = batch * 4;
       for (let i = 0; i < ws; i++) {
-        finalIndices.shards[i].memcpy(pGatheredIndices.shards[i], idxBytes);
+        finalIndices.shards[i].memcpy(pGatheredIndices.shards[i], idxBytes, MemcpyKind.DeviceToDevice);
       }
 
       return { values: rankValues, indices: finalIndices };

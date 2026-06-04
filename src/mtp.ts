@@ -7,26 +7,26 @@ import { MemcpyKind, Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
 function getPositionIdsMask(ws: ExecutionWorkspace, originalAllocLen: number, totalTreeNodes: number) {
-    const positionIds = ws.ensureAlloc(ws.positionIds.shape, ws.positionIds.type, `mtp_tree_position_ids-${totalTreeNodes}`);
-    function treeDepth(n: number): number {
-      let depth = 0;
-      while (n > 0) {
-        n = (n - 1) >> 1;
-        depth++;
-      }
-      return depth;
+  const positionIds = ws.ensureAlloc(ws.positionIds.shape, ws.positionIds.type, `mtp_tree_position_ids-${totalTreeNodes}`);
+  function treeDepth(n: number): number {
+    let depth = 0;
+    while (n > 0) {
+      n = (n - 1) >> 1;
+      depth++;
     }
+    return depth;
+  }
 
-    const positionIdsH = ws.ensureAllocPinned(ws.positionIds.shape, ws.positionIds.type, `mtp_tree_position_ids_host-${totalTreeNodes}`);
-    positionIdsH.withPinnedBuffer(buf => {
-      let posOff = 0;
-      for (let p = 0; p < totalTreeNodes; p++) {
-        buf.writeInt32LE(originalAllocLen + treeDepth(p), posOff * I32);
-        posOff++;
-      }
-    });
-    positionIds.memcpy(positionIdsH, totalTreeNodes * I32, MemcpyKind.HostToDevice);
-    return positionIds;
+  const positionIdsH = ws.ensureAllocPinned(ws.positionIds.shape, ws.positionIds.type, `mtp_tree_position_ids_host-${totalTreeNodes}`);
+  positionIdsH.withPinnedBuffer(buf => {
+    let posOff = 0;
+    for (let p = 0; p < totalTreeNodes; p++) {
+      buf.writeInt32LE(originalAllocLen + treeDepth(p), posOff * I32);
+      posOff++;
+    }
+  });
+  positionIds.memcpy(positionIdsH, totalTreeNodes * I32, MemcpyKind.HostToDevice);
+  return positionIds;
 }
 
 /**
@@ -83,17 +83,13 @@ export function mtpTreeDecode(
 
   const hiddenDim = targetHiddenStates.shape[1];
   const rowBytes = hiddenDim * 2; // BF16 = 2 bytes per element
-  // Buffer to save MTP output from previous iteration for chained hidden states.
-  // Each node p > 0 is conditioned on its parent's MTP output (matching the
-  // single-layer EAGLE worker's decode path where hidden_states are chained).
-  const prevMtpOutput = ws.ensureAlloc([(1 << nextn) - 1, hiddenDim], "BF16", `mtp-tree-prev-mtp-${totalTreeNodes}`, undefined, 0);
 
-  // Build tiled hidden states: node 0 gets targetHS, node p>0 gets its
-  // parent's MTP output from the previous iteration (chained, matching the
-  // single-layer EAGLE worker's decode path).
-  //   tiledHs[0]         = targetHS            (root)
-  //   tiledHs[2p+1]     = prevMtpOutput[p]    (child 1 of node p)
-  //   tiledHs[2p+2]     = prevMtpOutput[p]    (child 2 of node p)
+  // Tiled hidden states for the binary tree. Populated incrementally:
+  //   tiledHs[0]     = targetHS              (root, written once at i=0)
+  //   tiledHs[2p+1] = hiddenStates[p]       (child 1, written at end of iter i)
+  //   tiledHs[2p+2] = hiddenStates[p]       (child 2, written at end of iter i)
+  // Each iteration's hiddenStates output is copied directly to tiledHs for the
+  // next iteration, eliminating the need for a separate prevMtpOutput buffer.
   const tiledHs = ws.ensureAlloc([totalTreeNodes, hiddenDim], "BF16", `mtp-tree-hs-${totalTreeNodes}`, undefined, 0);
 
   const hostBuf = ws.ensureAllocPinned([totalTreeNodes], "I32", `mtp_verify_host_buf_${totalTreeNodes}`);
@@ -106,8 +102,8 @@ export function mtpTreeDecode(
   ws.ensureInputCleared();
   prefillState.setInput([[targetToken]]);
 
-  // using the designated input buffer is a no op in terms of gpu execution, no staging memcpy needed.
-  prefillState.setInput(ws.inputIdsBuf);
+  ws.glm.synchronize();
+  const start = performance.now();
 
   captureManager.run(() => {
     // Iteration: single-sequence prefill with tree-shaped custom mask
@@ -117,44 +113,36 @@ export function mtpTreeDecode(
 
       if (i === 0) {
         tiledHs.memcpy(targetHiddenStates);
-      } else {
-        // Row 0: target model hidden state (root node)
-        tiledHs.memcpy2d(
-          0, rowBytes,
-          targetHiddenStates, 0, rowBytes,
-          rowBytes, 1,
-          MemcpyKind.DeviceToDevice,
-        );
-        // Odd rows (1,3,5,…): one copy of each parent's MTP output
-        const numParents = (numPrefillTokens - 1) >> 1;
-        tiledHs.memcpy2d(
-          1 * rowBytes, 2 * rowBytes,
-          prevMtpOutput, 0, rowBytes,
-          rowBytes, numParents,
-          MemcpyKind.DeviceToDevice,
-        );
-        // Even rows (2,4,6,…): duplicate from odd rows (sibling shares same parent)
-        tiledHs.memcpy2d(
-          2 * rowBytes, 2 * rowBytes,
-          tiledHs, 1 * rowBytes, 2 * rowBytes,
-          rowBytes, numParents,
-          MemcpyKind.DeviceToDevice,
-        );
       }
 
       using hiddenStates = model.forwardMtp!(prefillState, tiledHs);
+
+      // Copy this iteration's hiddenStates directly to tiledHs for next iteration.
+      // Each parent p's output becomes both children 2p+1 and 2p+2.
+      using tiledHsStream = i < nextn - 1
+        ? ws.glm.withStream(() => {
+          using oddStream = ws.glm.withStream(() => {
+            // Odd rows (1,3,5,…): child 1 of each parent
+            tiledHs.memcpy2d(
+              1 * rowBytes, 2 * rowBytes,
+              hiddenStates, 0, rowBytes,
+              rowBytes, numPrefillTokens,
+              MemcpyKind.DeviceToDevice,
+            );
+          });
+          // Even rows (2,4,6,…): child 2 of each parent (sibling shares same parent)
+          tiledHs.memcpy2d(
+            2 * rowBytes, 2 * rowBytes,
+            hiddenStates, 0, rowBytes,
+            rowBytes, numPrefillTokens,
+            MemcpyKind.DeviceToDevice,
+          );
+
+          oddStream.streamWaitEvent();
+        })
+        : undefined;
+
       using logits = prefillState.computeLogits(hiddenStates, model, true);
-
-      // Save this iteration's MTP output for the next iteration's chaining
-      if (i < nextn - 1) {
-        prevMtpOutput.memcpy2d(
-          0, rowBytes,
-          hiddenStates, 0, rowBytes,
-          rowBytes, numPrefillTokens,
-          MemcpyKind.DeviceToDevice,
-        );
-      }
-
       const topk = logits.topk(2, model.cfg.vocabSize);
       using _values = topk.values;
       using indices = topk.indices;
@@ -177,6 +165,8 @@ export function mtpTreeDecode(
         1, // height (no pitch)
         MemcpyKind.DeviceToDevice,
       );
+
+      tiledHsStream?.streamWaitEvent();
     }
 
     using stream = ws.glm.withStream(() => {
@@ -194,11 +184,13 @@ export function mtpTreeDecode(
 
   ws.glm.synchronize();
 
-  seq0.truncate(originalAllocLen);
+  const draft = performance.now();
 
   const argmaxHost = ws.tensors.get(`mtp_verify_argmax_host_${totalTreeNodes}`)!;
   const argmaxBuf = argmaxHost.readPinnedBuffer();
   const treeTokens = hostBuf.readPinnedBuffer();
+
+  seq0.truncate(originalAllocLen);
 
   let bestPath = 0;
   let bestAccepted = -1;
@@ -218,13 +210,13 @@ export function mtpTreeDecode(
         break;
       }
     }
-    const replacement = argmaxBuf.readInt32LE(nodeIdx * 4);
     if (accepted > bestAccepted) {
       bestAccepted = accepted;
       bestPath = path;
-      bestReplacement = replacement;
+      bestReplacement = argmaxBuf.readInt32LE(nodeIdx * 4);
     }
   }
+
 
   const acceptedTokens: number[] = [];
   let nodeIdx = 0;
@@ -240,6 +232,7 @@ export function mtpTreeDecode(
   const finishTokens = [targetToken, ...acceptedTokens, bestReplacement];
   const finishState = ws.planPrefill(model, 1, [finishTokens.length], cache);
   finishState.setInput([finishTokens]);
+
   captureManager.run(() => {
     using verifiedHiddenStates = model.forwardModel(finishState);
     const lmHead = model.tensors.get("lm_head.weight")!;
@@ -253,16 +246,24 @@ export function mtpTreeDecode(
     argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
     targetHiddenStates.memcpy(hiddenLast, undefined, MemcpyKind.DeviceToDevice);
 
+    using rotatedInputIds = finishState.input!.rotateInputIds(ws.qoIndptrD, argmaxResult, finishState.batchSize);
+    finishState.setInput(rotatedInputIds);
+    // ws.inputIdsBuf.memcpy(rotatedInputIds, rotatedInputIds.bytes, MemcpyKind.DeviceToDevice);
+    // finishState.setInput(ws.inputIdsBuf);
     using _mtpHiddenStates = model.forwardMtp!(finishState, verifiedHiddenStates);
-  }, ['mtp-verify-finish']);
+  }, ['mtp-verify-finish', finishTokens.length]);
 
   ws.glm.synchronize();
+
+  const verify = performance.now();
 
   const newTargetToken = argmaxBuf.readInt32LE(0);
 
   // if (acceptedTokens.length) {
   //   console.warn(`MTP verify: accepted ${acceptedTokens.length} tokens: ${acceptedTokens.map(t => tokenizer.decode([t], { skip_special_tokens: false }))}, replacement: ${tokenizer.decode([bestReplacement], { skip_special_tokens: false })}, target: ${tokenizer.decode([targetToken], { skip_special_tokens: false })}`);
   // }
+
+  // console.log(`MTP tree decode: draft ${draft - start}ms, verify ${verify - draft}ms, total ${verify - start}ms, accepted ${acceptedTokens.length} tokens`);
 
   // return the predicted tokens (need to remove the original target token)
   // with the new target token

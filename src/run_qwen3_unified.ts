@@ -220,7 +220,7 @@ export function* generateStream(
   const tokenHistory = inputIds.slice();
 
   using captureManager = new CaptureManager(glm);
-  const nextn = (mtp && model.forwardMtp) ? (mtpDraftTokens ?? 8) : 0;
+  const nextn = (mtp && model.forwardMtp) ? (mtpDraftTokens ?? 3) : 0;
   using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
   let currentToken: number;
 
@@ -236,6 +236,8 @@ export function* generateStream(
     doSample(firstTokens);
 
     if (mtp && model.forwardMtp && nextn > 0) {
+      using rotatedInputIds = state.input!.rotateInputIds(ws.qoIndptrD, gpuSampleResult!, state.batchSize);
+      state.setInput(rotatedInputIds);
       using _mtpHiddenStates = model.forwardMtp(state, hiddenStates);
     }
 
@@ -284,7 +286,7 @@ export function* generateStream(
       }
 
       const tPlan = performance.now();
-      if (true) {
+      if (false) {
         const state = ws.planDecode(model, 1, cache, !captureManager.disabled);
         state.setInput([[currentToken]]);
         planMs += performance.now() - tPlan;
@@ -307,10 +309,20 @@ export function* generateStream(
       else {
         const state = ws.planPrefill(model, 1, [1], cache);
         state.setInput([[currentToken]]);
-        using hiddenStates = model.forward(state);
-        using tokens = state.computeLogits(hiddenStates, model);
-        doSample(tokens);
-        targetHiddenStates.replace(hiddenStates.slice(0, -1, 1).removeTracking())
+
+        if (!captureManager.isCaptured(['decode'])) {
+          warmupSteps++;
+        }
+        else {
+          graphSteps++;
+        }
+
+        captureManager.run(() => {
+          using hiddenStates = model.forward(state);
+          using tokens = state.computeLogits(hiddenStates, model);
+          doSample(tokens);
+          targetHiddenStates.replace(hiddenStates.slice(0, -1, 1).removeTracking())
+        }, ['decode']);
       }
       const tExec = performance.now();
 

@@ -149,8 +149,11 @@ export class Glm51Model extends ChatModel {
       name.endsWith(".up_proj.weight_weight_scale") ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight_weight_scale")) ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".up_proj.weight_weight_scale")) ||
-      name.endsWith(".mlp.shared_experts.gate_proj.weight_weight_scale") ||
-      name.endsWith(".mlp.shared_experts.up_proj.weight_weight_scale")) return TensorParallelism.Column;
+      name.endsWith(".mlp.shared_experts.gate_proj.weight_weight_scale"))
+      // || name.endsWith(".mlp.shared_experts.up_proj.weight_weight_scale") ||
+      // name.endsWith(".eh_proj.weight") ||
+      // name.endsWith(".eh_proj.weight_weight_scale"))
+      return TensorParallelism.Column;
     if (name.endsWith(".self_attn.o_proj.weight") ||
       name.endsWith(".mlp.down_proj.weight") ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".down_proj.weight")) ||
@@ -453,28 +456,32 @@ export class Glm51Model extends ChatModel {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
       using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps, cfg.qLoraRank, BS);
 
-      using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!, BS);
       using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!, BS);
+
+      using qAbsorbedRStream = this.glm.withStream(() => {
+        using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!, BS);
+        return state.isDecode
+          ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
+          : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
+      });
 
       rotaryEmbedding.streamWaitEvent();
       using qPeR = this.glm.withStream(() => qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave));
 
-      const qAbsorbedR = state.isDecode
-        ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
-        : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-
+      qAbsorbedRStream.streamWaitEvent();
       qPeR.streamWaitEvent();
+
       return {
-        qAbsorbedR,
+        qAbsorbedR: qAbsorbedRStream.result,
         qPeR: qPeR.result,
       }
     });
 
-    using qAbsorbedR = q.result.qAbsorbedR;
-    using qPeR = q.result.qPeR;
-
     kvcache.streamWaitEvent();
     q.streamWaitEvent();
+
+    using qAbsorbedR = q.result.qAbsorbedR;
+    using qPeR = q.result.qPeR;
 
     const mlaResult = state.isDecode
       ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel)
@@ -540,24 +547,27 @@ export class Glm51Model extends ChatModel {
     const totalTokens = state.totalTokens;
     const BS = totalTokens;
 
-    if (this.mtp && cfg.numNextNPredictLayers) {
-      const embedTable = this.tensors.get("model.embed_tokens.weight")!;
-      using embedding = embedTable.embedding(state.input!, hs, BS);
-      using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps, hs, BS);
-      using hnorm = previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps, hs, BS);
-      using cat = enorm.cat([hnorm], 1);
-
-      using residual = new UsingHolder(cat.linear(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.eh_proj.weight`)!, BS));
-      using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
-
-      const layerIdx = cfg.numHiddenLayers;
-      const result = this.mlaLayer(normed.value, residual.value, layerIdx, state);
-      normed.replace(result.normed);
-      residual.replace(result.residual);
-
-      return normed.detach().removeTracking();
+    if (!this.mtp || !cfg.numNextNPredictLayers) {
+      throw new Error("forwardMtp called but model is not configured for MTP or has no next-n predict layers");
     }
-    
-    throw new Error("forwardMtp called but model is not configured for MTP or has no next-n predict layers");
+
+    const embedTable = this.tensors.get("model.embed_tokens.weight")!;
+    using hnormStream = ws.glm.withStream(() => {
+      return previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps, hs, BS);
+    });
+    using embedding = embedTable.embedding(state.input!, hs, BS);
+    using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps, hs, BS);
+    hnormStream.streamWaitEvent();
+    using hnorm = hnormStream.result;
+    using cat = enorm.cat([hnorm], 1);
+
+    using residual = cat.linear(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.eh_proj.weight`)!, BS);
+    using normed = residual.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+
+    const layerIdx = cfg.numHiddenLayers;
+    const result = this.mlaLayer(normed, residual, layerIdx, state);
+    using _residual = result.residual;
+
+    return result.normed.removeTracking();
   }
 }
