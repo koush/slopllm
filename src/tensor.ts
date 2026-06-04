@@ -99,9 +99,19 @@ export abstract class Tensor implements Disposable {
 
   abstract free(): void;
 
-  [Symbol.dispose](): void {
+  canDispose() {
     if (this.name !== undefined) {
       throw new Error(`Cannot dispose named tensor ${this.name}`);
+    }
+    if (this.workspace.exported.has(this)) {
+      return;
+    }
+    return true;
+  }
+
+  [Symbol.dispose](): void {
+    if (!this.canDispose()) {
+      return;
     }
     // if stream is active, defer disposal until stream switch
     if (this.views.size) {
@@ -126,6 +136,15 @@ export abstract class Tensor implements Disposable {
     }
     this.workspace.tracked.delete(this);
     this.workspace.exported.add(this);
+    return this;
+  }
+
+  resumeTracking(): this {
+    if (this.name !== undefined) {
+      throw new Error(`Cannot resumeTracking on named tensor ${this.name}`);
+    }
+    this.workspace.tracked.add(this);
+    this.workspace.exported.delete(this);
     return this;
   }
 

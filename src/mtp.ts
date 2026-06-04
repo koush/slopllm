@@ -263,7 +263,7 @@ export function mtpTreeDecode(
   //   console.warn(`MTP verify: accepted ${acceptedTokens.length} tokens: ${acceptedTokens.map(t => tokenizer.decode([t], { skip_special_tokens: false }))}, replacement: ${tokenizer.decode([bestReplacement], { skip_special_tokens: false })}, target: ${tokenizer.decode([targetToken], { skip_special_tokens: false })}`);
   // }
 
-  // console.log(`MTP tree decode: draft ${draft - start}ms, verify ${verify - draft}ms, total ${verify - start}ms, accepted ${acceptedTokens.length} tokens`);
+  console.log(`MTP tree decode: draft ${draft - start}ms, verify ${verify - draft}ms, total ${verify - start}ms, accepted ${acceptedTokens.length} tokens`);
 
   // return the predicted tokens (need to remove the original target token)
   // with the new target token

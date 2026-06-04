@@ -84,8 +84,8 @@ export class ParallelTensor extends Tensor {
   }
 
   [Symbol.dispose](): void {
-    if (this.name !== undefined) {
-      throw new Error(`Cannot dispose named tensor ${this.name}`);
+    if (!this.canDispose()) {
+      return;
     }
     for (const shard of this.shards) {
       shard[Symbol.dispose]();

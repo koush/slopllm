@@ -158,8 +158,8 @@ export class GlmTensor extends Tensor {
   }
 
   [Symbol.dispose](): void {
-    if (this.name !== undefined) {
-      throw new Error(`Cannot dispose named tensor ${this.name}`);
+    if (!this.canDispose()) {
+      return;
     }
     // if stream is active, defer disposal until stream switch
     if (this.glm.currentStream) {
@@ -668,7 +668,7 @@ export class GlmOps implements DeviceOps {
     const tensors = this.streamTensors.get(stream);
     this.streamTensors.delete(stream);
     for (const tensor of tensors!) {
-      tensor._dispose();
+      tensor[Symbol.dispose]();
     }
   }
 
