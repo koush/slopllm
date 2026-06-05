@@ -52,6 +52,26 @@ const output = hiddenStates.linear(lmHead, BS);
 return output.removeTracking();  // caller is responsible for disposing this
 ```
 
+Here's another example that demonstrates stream mechanics, tensors created in a stream are delay disposed when the stream goes out of scope:
+
+```typescript
+using _tracker = ws.startTracking();
+{
+  using stream = ws.glm.withStream(() => {
+    using gateBuf = ws.alloc([BS, intermediate], "BF16");  // disposed when this block exits
+    normed.linear(weights.gate_proj, BS, gateBuf);
+    using upBuf = ws.alloc([BS, intermediate], "BF16");    // disposed when this block exits
+    normed.linear(weights.up_proj, BS, upBuf);
+    using siluBuf = gateBuf.siluAndMul(upBuf, intermediate, BS);
+    // gateBuf, upBuf, siluBuf are NOT disposed here ←
+  });
+
+  // make the default/current stream wait for the other stream
+  stream.streamWaitEvent();
+  // stream is disposed here when it goes out of scope, and NOW gateBuf, upBuf, and siluBuf are placed back into the workspace.
+}
+```
+
 Key rules:
 - Named tensors (allocated with a name) cannot be disposed — they live until replaced or the workspace is freed.
 - `using` on an unnamed tensor auto-disposes at block scope exit.

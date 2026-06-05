@@ -39,6 +39,7 @@ interface CliArgs {
   prompt: string | undefined;
   useQwen35: boolean;
   useGlm51: boolean;
+  glm51Small: boolean;
   useFp8: boolean;
   useNvfp4: boolean;
   useBatch: boolean;
@@ -73,6 +74,7 @@ function parseArgs(argv: string[]): CliArgs {
     prompt: undefined,
     useQwen35: false,
     useGlm51: false,
+    glm51Small: false,
     useFp8: false,
     useNvfp4: false,
     useBatch: false,
@@ -105,6 +107,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--no-kv-persist") args.noReset = false;
     else if (a === "--qwen35") args.useQwen35 = true;
     else if (a === "--glm51") args.useGlm51 = true;
+    else if (a === "--glm51-small") { args.useGlm51 = true; args.glm51Small = true; }
     else if (a === "--model-dir" && i + 1 < argv.length) args.modelDir = argv[++i];
     else if (a === "--fp8") args.useFp8 = true;
     else if (a === "--nvfp4") args.useNvfp4 = true;
@@ -154,7 +157,7 @@ function parseArgs(argv: string[]): CliArgs {
 
 function modelLabel(args: CliArgs): string {
   if (args.useQwen35) return "Qwen3.5-0.8B";
-  if (args.useGlm51) return args.useNvfp4 ? "GLM-5.1-NVFP4" : "GLM-5.1";
+  if (args.useGlm51) return args.glm51Small ? "GLM-5.1-small" : (args.useNvfp4 ? "GLM-5.1-NVFP4" : "GLM-5.1");
   return args.useFp8 ? "Qwen3-0.6B-FP8" : "Qwen3-0.6B";
 }
 
@@ -222,6 +225,7 @@ export function* generateStream(
   using captureManager = new CaptureManager(glm);
   const nextn = (mtp && model.forwardMtp) ? (mtpDraftTokens ?? 3) : 0;
   using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
+  using mtpHiddenStates = new UsingHolder<Tensor>(undefined!);
   let currentToken: number;
 
   captureManager.disabled = graphState === undefined;
@@ -239,6 +243,7 @@ export function* generateStream(
       using rotatedInputIds = state.input!.rotateInputIds(ws.qoIndptrD, gpuSampleResult!, state.batchSize);
       state.setInput(rotatedInputIds);
       using _mtpHiddenStates = model.forwardMtp(state, hiddenStates);
+      mtpHiddenStates.replace(_mtpHiddenStates.slice(0, -1, 1).removeTracking());
     }
 
     targetHiddenStates.replace(hiddenStates.slice(0, -1, 1).removeTracking())
@@ -573,9 +578,13 @@ async function interactiveBatch(
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
+  const GLM51_SMALL_BF16 = "tests/python/test_models/glm51_small/glm51_small_bf16";
+  const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp4";
+
   const modelDir = args.modelDir ?? (args.useGlm51
-    ? '/mnt/storage/GLM-5.1-NVFP4-Fixed'
-    // ? (args.useNvfp4 ? "tests/python/test_models/glm51_small/glm51_small_nvfp4" : "tests/python/test_models/glm51_small/glm51_small_bf16")
+    ? (args.glm51Small
+      ? (args.useNvfp4 ? GLM51_SMALL_NVFP4 : GLM51_SMALL_BF16)
+      : '/mnt/storage/GLM-5.1-NVFP4-Fixed')
     : resolveModelPath(args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO)));
 
   if (args.meta) {

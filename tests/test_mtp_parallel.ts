@@ -11,7 +11,7 @@ import { ParallelOps } from "../src/parallel_ops";
 import { Tensor } from "../src/tensor";
 import { UsingHolder } from "../src/using-holder";
 import { WorkspaceBase } from "../src/workspace";
-import { mtpTreeDecode, mtpVerify } from "../src/mtp";
+import { mtpTreeDecode } from "../src/mtp";
 
 const SMALL_MODEL_DIR = path.resolve(
   __dirname,
@@ -54,41 +54,16 @@ function runMtpTreeDecode(model: ChatModel, ws: ExecutionWorkspace, cache: ChatC
   ws.glm.synchronize();
   const currentToken = currentTokenHost.readPinnedBuffer().readInt32LE();
 
-  const treeResult = mtpTreeDecode(
+  const result = mtpTreeDecode(
     captureManager, model, hiddenHolder.value, ws, currentToken, nextn, cache,
   );
 
-  using hostBuf = sampleWorkspace.allocPinned(treeResult.validationSequences.shape, treeResult.validationSequences.type);
-  hostBuf.memcpy(treeResult.validationSequences, treeResult.validationSequences.bytes, MemcpyKind.DeviceToHost);
-  ws.glm.synchronize();
-
-  const totalTreeNodes = (1 << (nextn + 1)) - 1;
-  const tokens: number[] = [];
-  const buf = hostBuf.readPinnedBuffer();
-  for (let i = 0; i < totalTreeNodes; i++) {
-    tokens.push(buf.readInt32LE(i * 4));
-  }
-
-  for (let i = 0; i < tokens.length; i++) {
-    assert.ok(tokens[i] >= 0 && tokens[i] < model.cfg.vocabSize,
-      `${label}: tree token ${i} = ${tokens[i]} out of range [0, ${model.cfg.vocabSize})`);
-  }
-
-  cache.getPagedKV().sequences[0].truncate(cache.getPagedKV().sequences[0].allocLen - (totalTreeNodes - 1));
-  cache.getPagedKV().positionIdsDirty = true;
-  cache.getPagedKV().pagesDirtyHost = true;
-  cache.getPagedKV().pagesDirtyDevice = true;
-
-  const verifyResult = mtpVerify(
-    captureManager, model, hiddenHolder.value, ws, cache, treeResult, currentToken,
-  );
-
-  for (const t of verifyResult) {
+  for (const t of result) {
     assert.ok(t >= 0 && t < model.cfg.vocabSize,
-      `${label}: verify token ${t} out of range [0, ${model.cfg.vocabSize})`);
+      `${label}: token ${t} out of range [0, ${model.cfg.vocabSize})`);
   }
 
-  return tokens;
+  return result;
 }
 
 describe("MTP tree decode: TP validation", () => {

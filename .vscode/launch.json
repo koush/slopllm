@@ -40,6 +40,33 @@
             "skipFiles": [
                 "<node_internals>/**"
             ]
+        },
+        {
+            "type": "node",
+            "request": "launch",
+            "name": "Greedy 8-GPU Small",
+            "runtimeExecutable": "tsx",
+            "console": "integratedTerminal",
+            "env": {
+                // "NCCL_DEBUG": "INFO",
+            },
+            "runtimeArgs": [
+                "${workspaceFolder}/src/run_qwen3_unified.ts",
+                "--gpus", "0,1,2,3,4,5,6,7",
+                "--prompt", "tell me a 1000 word story",
+                // "--prompt", "hi",
+                "--glm51",
+                "--greedy",
+                // "--nvfp4",
+                // "--arena", "92",
+                // "--no-cuda-graph",
+                "--cp",
+                "--mtp",
+                "--max-new-tokens", "2000",
+            ],
+            "skipFiles": [
+                "<node_internals>/**"
+            ]
         }
     ]
 }

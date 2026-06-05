@@ -102,10 +102,12 @@ export function mtpTreeDecode(
   ws.ensureInputCleared();
   prefillState.setInput([[targetToken]]);
 
-  ws.glm.synchronize();
   const start = performance.now();
+  const mlaKVCacheAppendOrig = prefillState.mlaKvCacheAppend.bind(prefillState);
 
-  captureManager.run(() => {
+  const kvCacheLayers = captureManager.run(() => {
+    const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
+
     // Iteration: single-sequence prefill with tree-shaped custom mask
     // 1 -> 3 -> 7 -> 15 for i = 0,1,2,3 (nextn=3)
     for (let i = 0; i < nextn; i++) {
@@ -113,6 +115,15 @@ export function mtpTreeDecode(
 
       if (i === 0) {
         tiledHs.memcpy(targetHiddenStates);
+      }
+
+      if (i === nextn - 1) {
+        prefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
+          appendCkv.removeTracking();
+          appendKpe.removeTracking();
+          kvCacheLayers.push({ appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim });
+          mlaKVCacheAppendOrig(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
+        };
       }
 
       using hiddenStates = model.forwardMtp!(prefillState, tiledHs);
@@ -180,6 +191,7 @@ export function mtpTreeDecode(
     argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
     stream.streamWaitEvent();
 
+    return kvCacheLayers;
   }, ['mtp-tree']);
 
   ws.glm.synchronize();
@@ -189,8 +201,6 @@ export function mtpTreeDecode(
   const argmaxHost = ws.tensors.get(`mtp_verify_argmax_host_${totalTreeNodes}`)!;
   const argmaxBuf = argmaxHost.readPinnedBuffer();
   const treeTokens = hostBuf.readPinnedBuffer();
-
-  seq0.truncate(originalAllocLen);
 
   let bestPath = 0;
   let bestAccepted = -1;
@@ -226,48 +236,72 @@ export function mtpTreeDecode(
     nodeIdx = childIdx;
   }
 
-  // this is not ideal, since attention was already computed, but the kv cache has the token tree in
-  // non sequential order.
-  // another forward pass with just the tokens that were accepted will fix the kv cache ordering.
-  const finishTokens = [targetToken, ...acceptedTokens, bestReplacement];
-  const finishState = ws.planPrefill(model, 1, [finishTokens.length], cache);
-  finishState.setInput([finishTokens]);
+  // Accepted tokens along bestPath: root (node 0) + accepted children.
+  // The replacement token is handled separately via a decode step, not from the tree.
+  const finishCount = bestAccepted + 1; // target + accepted (replacement added via decode)
+  const acceptedNodeIndices: number[] = [0];
+  {
+    let ni = 0;
+    for (let layer = 0; layer < bestAccepted; layer++) {
+      ni = ni * 2 + 1 + ((bestPath >> (nextn - 1 - layer)) & 1);
+      acceptedNodeIndices.push(ni);
+    }
+  }
+  const acceptedSet = new Set(acceptedNodeIndices);
+
+  // Build positionIds: accepted tokens → sequential positions, rejected → scratch
+  prefillState.ws.positionIdsH.withPinnedBuffer(buf => {
+    let nextAccepted = 0;
+    let nextScratch = originalAllocLen + finishCount;
+    for (let i = 0; i < totalTreeNodes; i++) {
+      if (acceptedSet.has(i)) {
+        buf.writeInt32LE(originalAllocLen + nextAccepted, i * I32);
+        nextAccepted++;
+      } else {
+        buf.writeInt32LE(nextScratch, i * I32);
+        nextScratch++;
+      }
+    }
+  });
 
   captureManager.run(() => {
-    using verifiedHiddenStates = model.forwardModel(finishState);
-    const lmHead = model.tensors.get("lm_head.weight")!;
-    const batchSize = finishState.batchSize;
-    using lastIdxFromIndptr = finishState.lastIdx;
-    using hiddenLast = verifiedHiddenStates.indexSelect(lastIdxFromIndptr, batchSize, -1);
-    using logits = hiddenLast.linear(lmHead, batchSize).removeTracking();
+    prefillState.ws.positionIds.memcpy(prefillState.ws.positionIdsH, totalTreeNodes * I32, MemcpyKind.HostToDevice);
 
+    for (const layer of kvCacheLayers) {
+      mlaKVCacheAppendOrig(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
+    }
+  }, ['mtp-tree-append']);
+
+  seq0.truncate(originalAllocLen + finishCount);
+
+  // Decode the replacement token: this correctly populates its KV cache entry
+  // (with the right input token and causal attention) and produces the next token.
+  const replaceState = ws.planDecode(model, 1, cache);
+  replaceState.setInput([[bestReplacement]]);
+
+  captureManager.run(() => {
+    ws.positionStep(replaceState, model);
+    using replaceHidden = model.forwardModel(replaceState);
+    using logits = replaceState.computeLogits(replaceHidden, model, true);
     using argmaxResult = logits.argmax();
-    const argmaxHost = ws.tensors.get(`mtp_verify_argmax_host_${totalTreeNodes}`)!;
-    argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
-    targetHiddenStates.memcpy(hiddenLast, undefined, MemcpyKind.DeviceToDevice);
-
-    using rotatedInputIds = finishState.input!.rotateInputIds(ws.qoIndptrD, argmaxResult, finishState.batchSize);
-    finishState.setInput(rotatedInputIds);
-    // ws.inputIdsBuf.memcpy(rotatedInputIds, rotatedInputIds.bytes, MemcpyKind.DeviceToDevice);
-    // finishState.setInput(ws.inputIdsBuf);
-    using _mtpHiddenStates = model.forwardMtp!(finishState, verifiedHiddenStates);
-  }, ['mtp-verify-finish', finishTokens.length]);
+    using rotatedInputIds = replaceState.input!.rotateInputIds(ws.qoIndptrD, argmaxResult, replaceState.batchSize);
+    replaceState.setInput(rotatedInputIds);
+    using _mtpHs = model.forwardMtp!(replaceState, replaceHidden);
+    targetHiddenStates.memcpy(replaceHidden, undefined, MemcpyKind.DeviceToDevice);
+    hostBuf.memcpy(argmaxResult, I32, MemcpyKind.DeviceToHost);
+  }, ['mtp-replace']);
 
   ws.glm.synchronize();
 
+  const newTargetToken = hostBuf.readPinnedBuffer().readInt32LE();
+
   const verify = performance.now();
 
-  const newTargetToken = argmaxBuf.readInt32LE(0);
+  if (acceptedTokens.length) {
+    console.warn(`MTP verify: accepted ${acceptedTokens.length} tokens: ${acceptedTokens.map(t => tokenizer.decode([t], { skip_special_tokens: false }))}, replacement: ${tokenizer.decode([bestReplacement], { skip_special_tokens: false })}, target: ${tokenizer.decode([targetToken], { skip_special_tokens: false })}`);
+  }
 
-  // if (acceptedTokens.length) {
-  //   console.warn(`MTP verify: accepted ${acceptedTokens.length} tokens: ${acceptedTokens.map(t => tokenizer.decode([t], { skip_special_tokens: false }))}, replacement: ${tokenizer.decode([bestReplacement], { skip_special_tokens: false })}, target: ${tokenizer.decode([targetToken], { skip_special_tokens: false })}`);
-  // }
-
-  console.log(`MTP tree decode: draft ${draft - start}ms, verify ${verify - draft}ms, total ${verify - start}ms, accepted ${acceptedTokens.length} tokens`);
-
-  // return the predicted tokens (need to remove the original target token)
-  // with the new target token
-  return [...finishTokens.slice(1), newTargetToken];
+  return [...acceptedTokens, bestReplacement, newTargetToken];
 }
 
 function buildTreeMask(ws: WorkspaceBase, totalTreeNodes: number): { data: Tensor; indptr: Tensor } {

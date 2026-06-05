@@ -11,7 +11,7 @@ import { ParallelOps } from "../src/parallel_ops";
 import { Tensor } from "../src/tensor";
 import { UsingHolder } from "../src/using-holder";
 import { WorkspaceBase } from "../src/workspace";
-import { mtpTreeDecode, mtpVerify } from "../src/mtp";
+import { mtpTreeDecode } from "../src/mtp";
 
 const SMALL_MODEL_DIR = path.resolve(
   __dirname,
@@ -87,13 +87,10 @@ describe("MTP with CUDA graph capture: TP validation", () => {
         sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
         ws.glm.synchronize();
         const currentToken = sampleResult.readPinnedBuffer().readInt32LE();
-        const treeResult = mtpTreeDecode(
+        const result = mtpTreeDecode(
           captureManager, model, targetHiddenStates.value, ws, currentToken, nextn, cache,
         );
-        const verifyResult = mtpVerify(
-          captureManager, model, targetHiddenStates.value, ws, cache, treeResult, currentToken,
-        );
-        for (const t of verifyResult) {
+        for (const t of result) {
           cache.reportTokens(0, [t]);
           output.push(t);
         }
