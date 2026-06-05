@@ -344,8 +344,6 @@ export function mtpTreeDecode(
         );
       }
     }
-    // get the hidden state for next call to mtpTreeDecode
-    using newTargetHiddenState = hiddenStateStaging.slice(finishCount - 1, finishCount, 1);
   }
 
   // target can now be truncate to the accepted + replacement length
