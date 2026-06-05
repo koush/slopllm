@@ -55,7 +55,7 @@
                 "--gpus", "0,1,2,3,4,5,6,7",
                 "--prompt", "tell me a 1000 word story",
                 // "--prompt", "hi",
-                "--glm51",
+                "--glm51-small",
                 "--greedy",
                 // "--nvfp4",
                 // "--arena", "92",

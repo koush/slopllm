@@ -224,7 +224,6 @@ export function* generateStream(
 
   using captureManager = new CaptureManager(glm);
   const nextn = (mtp && model.forwardMtp) ? (mtpDraftTokens ?? 3) : 0;
-  using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
   using mtpHiddenStates = new UsingHolder<Tensor>(undefined!);
   let currentToken: number;
 
@@ -245,8 +244,6 @@ export function* generateStream(
       using _mtpHiddenStates = model.forwardMtp(state, hiddenStates);
       mtpHiddenStates.replace(_mtpHiddenStates.slice(0, -1, 1).removeTracking());
     }
-
-    targetHiddenStates.replace(hiddenStates.slice(0, -1, 1).removeTracking())
   }
 
   sampleResult ||= sampleWorkspace.allocPinned(gpuSampleResult!.shape, gpuSampleResult!.type);
@@ -272,7 +269,7 @@ export function* generateStream(
   try {
     for (let i = 1; i < maxNewTokens; i++) {
       if (mtp && model.forwardMtp && nextn > 0) {
-        const treeResult = mtpTreeDecode(captureManager, model, targetHiddenStates.value, ws, currentToken, nextn, cache, tokenizer);
+        const treeResult = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, ws, currentToken, nextn, cache, tokenizer);
         // glm.synchronize();
         for (const t of treeResult) {
           currentToken = t;
@@ -306,8 +303,8 @@ export function* generateStream(
 
         captureManager.run(() => {
           ws.positionStep(state, model);
-          targetHiddenStates.replace(model.forward(state));
-          doSample(state.computeLogits(targetHiddenStates.value, model));
+          using hiddenStates = model.forward(state);
+          doSample(state.computeLogits(hiddenStates, model));
         }, ['decode']);
 
       }
@@ -326,7 +323,6 @@ export function* generateStream(
           using hiddenStates = model.forward(state);
           using tokens = state.computeLogits(hiddenStates, model);
           doSample(tokens);
-          targetHiddenStates.replace(hiddenStates.slice(0, -1, 1).removeTracking())
         }, ['decode']);
       }
       const tExec = performance.now();

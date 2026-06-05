@@ -139,6 +139,18 @@ export class WorkspaceBase implements Disposable {
     return tensor;
   }
 
+  transfer(tensor: Tensor) {
+    if (tensor.view) {
+      throw new Error("Cannot transfer a tensor view");
+    }
+
+    tensor.workspace.tracked.delete(tensor);
+    tensor.workspace.disposed.delete(tensor);
+    tensor.workspace.exported.delete(tensor);
+    tensor.workspace = this;
+    this.addTracked(tensor);
+  }
+
   free(): void {
     for (const tensor of this.tensors.values()) {
       tensor.free();

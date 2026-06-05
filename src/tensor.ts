@@ -25,7 +25,7 @@ export abstract class Tensor implements Disposable {
   id: number;
   static nextId = 1;
 
-  constructor(public readonly workspace: WorkspaceBase,
+  constructor(public workspace: WorkspaceBase,
     public readonly data: number,
     public readonly allocSize: number,
     public readonly shape: number[],
