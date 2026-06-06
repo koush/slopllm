@@ -293,7 +293,7 @@ export function* generateStream(
       }
 
       const tPlan = performance.now();
-      if (false) {
+      if (true) {
         const state = ws.planDecode(model, 1, cache, !captureManager.disabled);
         state.setInput([[currentToken]]);
         planMs += performance.now() - tPlan;

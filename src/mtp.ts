@@ -235,7 +235,7 @@ export function mtpTreeDecode(
   const kvCacheLayers = captureManager.run(() => {
     const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
 
-    const mlaKVCacheAppendOrig = treePrefillState.mlaKvCacheAppend.bind(treePrefillState);
+    const mlaKVCacheAppendOrig = targetPrefillState.mlaKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
       appendCkv.removeTracking();
       appendKpe.removeTracking();
@@ -355,8 +355,10 @@ export function mtpTreeDecode(
     for (const layer of kvCacheLayers) {
       mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
     }
+  }, ['mtp-replace', totalVerificationTokens]);
 
-    using verfiedHiddenStates = hiddenStateStaging.slice(0, finishCount, 1);
+  captureManager.run(() => {
+    using verfiedHiddenStates = hiddenStateStaging.slice(0, 0, finishCount);
     using mtpHs = model.forwardMtp!(mtpExtendPrefill, verfiedHiddenStates);
     // MTP convention (same as rotateInputIds in prefill): at position P, the input
     // token is P+1 paired with hidden state at P. Here input[0] = acceptedTokens[0]
@@ -364,7 +366,7 @@ export function mtpTreeDecode(
     // targetToken). The MTP KV at position P thus encodes token P+1, while the target
     // model KV at the same position encodes token P — each layer has its own KV slot
     // so this is safe. The last row is the seed for the next draft iteration.
-    using newMtpHiddenStates = mtpHs.slice(finishCount - 1, finishCount, 1);
+    using newMtpHiddenStates = mtpHs.slice(0, -1, 1);
     mtpHiddenStates.memcpy(newMtpHiddenStates);
   }, ['mtp-replace', finishCount]);
 
