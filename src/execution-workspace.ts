@@ -420,7 +420,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     mask: Tensor;
     mode?: MaskMode;
     positionIds?: Tensor;
-  }, startPos = cache.getPagedKV().sequences.map(s => s.allocLen)): ExecutionState {
+  }): ExecutionState {
     const pagedKV = cache.getPagedKV();
     pagedKV.checkSequenceCount();
     const cfg = model.cfg;
@@ -434,6 +434,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       throw new Error(`planPrefill: pagedKV has ${pagedKV.sequences.length} sequences, expected ${batchSize}`);
     }
 
+    const startPos = cache.getPagedKV().sequences.map(s => s.allocLen);
     cache.prefillBatchPlanHook?.(batchSize, seqLens, totalTokens, startPos, cache);
 
     let prefillPagesNeeded = 0;

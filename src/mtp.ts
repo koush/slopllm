@@ -130,7 +130,6 @@ export function mtpTreeDecode(
   ws.ensureInputCleared();
 
   const start = performance.now();
-  const mlaKVCacheAppendOrig = treePrefillState.mlaKvCacheAppend.bind(treePrefillState);
 
   captureManager.run(() => {
     using initialLogits = mtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, batchSize);
@@ -236,6 +235,7 @@ export function mtpTreeDecode(
   const kvCacheLayers = captureManager.run(() => {
     const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
 
+    const mlaKVCacheAppendOrig = treePrefillState.mlaKvCacheAppend.bind(treePrefillState);
     targetPrefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
       appendCkv.removeTracking();
       appendKpe.removeTracking();
@@ -284,6 +284,7 @@ export function mtpTreeDecode(
     }
   }
 
+  const finishCount = bestAccepted + 1; // target + accepted (replacement added via decode)
 
   const acceptedTokens: number[] = [];
   let nodeIdx = 0;
@@ -293,43 +294,16 @@ export function mtpTreeDecode(
     nodeIdx = childIdx;
   }
 
-  // Accepted tokens along bestPath: root (node 0) + accepted children.
-  // The replacement token is handled separately via a decode step, not from the tree.
-  const finishCount = bestAccepted + 1; // target + accepted (replacement added via decode)
-  const acceptedNodeIndices: number[] = [0];
   {
+    // Accepted tokens along bestPath: root (node 0) + accepted children.
+    // The replacement token is handled separately via a decode step, not from the tree.
+    const acceptedNodeIndices: number[] = [0];
     let ni = 0;
     for (let layer = 0; layer < bestAccepted; layer++) {
       ni = ni * 2 + 1 + ((bestPath >> (nextn - 1 - layer)) & 1);
       acceptedNodeIndices.push(ni);
     }
-  }
-  const acceptedSet = new Set(acceptedNodeIndices);
 
-  // Build positionIds: accepted tokens → sequential positions, rejected → scratch
-  targetPrefillState.ws.positionIdsH.withPinnedBuffer(buf => {
-    let nextAccepted = 0;
-    let nextScratch = originalAllocLen + finishCount;
-    for (let i = 0; i < totalVerificationTokens; i++) {
-      if (acceptedSet.has(i)) {
-        buf.writeInt32LE(originalAllocLen + nextAccepted, i * I32);
-        nextAccepted++;
-      } else {
-        buf.writeInt32LE(nextScratch, i * I32);
-        nextScratch++;
-      }
-    }
-  });
-
-  captureManager.run(() => {
-    targetPrefillState.ws.positionIds.memcpy(targetPrefillState.ws.positionIdsH, totalVerificationTokens * I32, MemcpyKind.HostToDevice);
-
-    for (const layer of kvCacheLayers) {
-      mlaKVCacheAppendOrig(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
-    }
-  }, ['mtp-tree-append', totalVerificationTokens]);
-
-  {
     // After capture block, in-place reorder accepted rows to front:
     // targetHiddenStates now has shape [totalVerificationTokens, hiddenDim]
     // Move accepted rows to positions 0..finishCount-1
@@ -344,18 +318,44 @@ export function mtpTreeDecode(
         );
       }
     }
+
+    for (const layer of kvCacheLayers) {
+      const kvLoraRank = layer.kvLoraRank;
+      const qkRopeDim = layer.qkRopeDim;
+      for (let i = 0; i < finishCount; i++) {
+        const srcIdx = acceptedNodeIndices[i];
+        if (srcIdx !== i) {
+          layer.appendCkv.memcpy2d(
+            i * kvLoraRank * 2, kvLoraRank * 2,
+            layer.appendCkv, srcIdx * kvLoraRank * 2, kvLoraRank * 2,
+            kvLoraRank * 2, 1,
+            MemcpyKind.DeviceToDevice,
+          );
+          layer.appendKpe.memcpy2d(
+            i * qkRopeDim * 2, qkRopeDim * 2,
+            layer.appendKpe, srcIdx * qkRopeDim * 2, qkRopeDim * 2,
+            qkRopeDim * 2, 1,
+            MemcpyKind.DeviceToDevice,
+          );
+        }
+      }
+    }
   }
 
-  // target can now be truncate to the accepted + replacement length
-  seq0.truncate(originalAllocLen + finishCount);
+  // target can now be truncate to the original length, plan another prefill with
+  // the accepted token length.
+  // target layers: write the captured kvCacheLayers
+  // mtp layers: perform extended prefill as usual
+  seq0.truncate(originalAllocLen);
 
-  // mtp still needs to extend prefill
-  const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache, undefined,
-    // this will start the extend prefill operation to the original alloc len
-    cache.getPagedKV().sequences.map(s => originalAllocLen));
+  const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache, undefined);
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
 
   captureManager.run(() => {
+    for (const layer of kvCacheLayers) {
+      mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
+    }
+
     using verfiedHiddenStates = hiddenStateStaging.slice(0, finishCount, 1);
     using mtpHs = model.forwardMtp!(mtpExtendPrefill, verfiedHiddenStates);
     // IS THIS WRONG? FIX?
