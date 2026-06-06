@@ -358,7 +358,12 @@ export function mtpTreeDecode(
 
     using verfiedHiddenStates = hiddenStateStaging.slice(0, finishCount, 1);
     using mtpHs = model.forwardMtp!(mtpExtendPrefill, verfiedHiddenStates);
-    // IS THIS WRONG? FIX?
+    // MTP convention (same as rotateInputIds in prefill): at position P, the input
+    // token is P+1 paired with hidden state at P. Here input[0] = acceptedTokens[0]
+    // (the token after targetToken) with verifiedHiddenStates[0] (target model HS at
+    // targetToken). The MTP KV at position P thus encodes token P+1, while the target
+    // model KV at the same position encodes token P — each layer has its own KV slot
+    // so this is safe. The last row is the seed for the next draft iteration.
     using newMtpHiddenStates = mtpHs.slice(finishCount - 1, finishCount, 1);
     mtpHiddenStates.memcpy(newMtpHiddenStates);
   }, ['mtp-replace', finishCount]);

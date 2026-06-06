@@ -239,6 +239,11 @@ export function* generateStream(
     doSample(firstTokens);
 
     if (mtp && model.forwardMtp && nextn > 0) {
+      // MTP convention: at position P, the input token is the token at P+1 (not P),
+      // paired with the target model's hidden state at P. This means the MTP KV entry
+      // at position P encodes info about token P+1, whereas the target model KV at the
+      // same position encodes token P. This is safe because each MLA layer has its own
+      // KV slot — the two never interfere.
       using rotatedInputIds = state.input!.rotateInputIds(ws.qoIndptrD, gpuSampleResult!, state.batchSize);
       state.setInput(rotatedInputIds);
       using _mtpHiddenStates = model.forwardMtp(state, hiddenStates);
