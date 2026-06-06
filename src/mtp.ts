@@ -102,7 +102,8 @@ export function mtpTreeDecode(
   const totalTreeNodes = 2 * totalPaths - 2;
   const seq0 = pagedKV.sequences[0];
   const originalAllocLen = seq0.allocLen;
-  const batchSize = 1;
+  const pagedKv = cache.getPagedKV();
+  const batchSize = pagedKv.sequences.length;
 
   using _tracker = ws.startTracking(new Set([mtpHiddenStates]));
 
@@ -121,91 +122,154 @@ export function mtpTreeDecode(
   const hostBuf = ws.ensureAllocPinned([totalTreeNodes], "I32", `mtp_verify_host_buf_${totalTreeNodes}`);
 
   const mtpCustomMask = ensureMTPCustomMask(ws, totalTreeNodes);
-  // this creates an oversized tree for all iterations, but the masking prevents the padding tokens from affecting the results that
-  // we care about per iteration.
-  const treePrefillState = ws.planPrefill(model, batchSize, [totalTreeNodes], cache, {
-    ...mtpCustomMask,
-    positionIds: getMTPPositionIdsMask(ws, originalAllocLen, totalTreeNodes),
-  });
-  ws.ensureInputCleared();
 
   const start = performance.now();
 
-  captureManager.run(() => {
-    using initialLogits = mtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, batchSize);
-    const initialTopk = initialLogits.topk(2, model.cfg.vocabSize);
-    using initialIndices = initialTopk.indices;
-    using _initialValues = initialTopk.values;
-    ws.inputIdsBuf.memcpy(initialIndices, initialIndices.bytes, MemcpyKind.DeviceToDevice);
-    treePrefillState.setInput(ws.inputIdsBuf);
-
-    // Iteration: single-sequence prefill with tree-shaped custom mask
-    // 2 -> 6 -> 14 for i = 0,1,2 (nextn=3)
+  if (true) {
+    let hostBufOffset = 0;
+    let chainedMtpHiddenState = mtpHiddenStates;
     for (let i = 1; i < nextn; i++) {
-      const numPrefillTokens = (1 << (i + 1)) - 2;
-
-      if (i === 1) {
-        using cat = mtpHiddenStates.cat([mtpHiddenStates], 0);
-        tiledHs.memcpy(cat);
+      // every iteration, duplicate all the sequences to add the top 2
+      const currentBatchSize = pagedKv.sequences.length;
+      for (let seqIdx = 0; seqIdx < currentBatchSize; seqIdx++) {
+        pagedKv.copySequence(seqIdx + currentBatchSize, seqIdx);
       }
 
-      using hiddenStates = model.forwardMtp!(treePrefillState, tiledHs);
+      const newBatchSize = pagedKv.sequences.length;
+      const state = ws.planDecode(model, newBatchSize, cache);
 
-      // Copy this iteration's hiddenStates directly to tiledHs for next iteration.
-      using tiledHsStream = i < nextn - 1
-        ? ws.glm.withStream(() => {
-          using oddStream = ws.glm.withStream(() => {
-            // Rows 3,5,7,…: child 2 of each parent (2p+3)
+
+      chainedMtpHiddenState = captureManager.run(() => {
+        // prepare initial input
+        if (i === 1) {
+          using initialLogits = mtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, currentBatchSize);
+          const initialTopk = initialLogits.topk(2, model.cfg.vocabSize);
+          using initialIndices = initialTopk.indices;
+          using _initialValues = initialTopk.values;
+          ws.inputIdsBuf.memcpy(initialIndices, initialIndices.bytes, MemcpyKind.DeviceToDevice);
+          // copy the initial indices to host buffer
+          hostBuf.memcpy2d(0, currentBatchSize * I32 * 2, initialIndices, 0, currentBatchSize * I32 * 2, currentBatchSize * I32 * 2, 1, MemcpyKind.DeviceToHost);
+        }
+
+        state.setInput(ws.inputIdsBuf);
+
+        ws.positionStep(state, model);
+
+        using doubledHiddenState = chainedMtpHiddenState.cat([chainedMtpHiddenState], 0);
+        using newMtpHiddenStates = model.forwardMtp!(state, doubledHiddenState);
+        using logits = newMtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, newBatchSize);
+        const topk = logits.topk(2, model.cfg.vocabSize);
+        using _values = topk.values;
+        using indices = topk.indices;
+
+        // append the new indices to host buffer
+        hostBufOffset += currentBatchSize * I32 * 2;
+        hostBuf.memcpy2d(hostBufOffset, newBatchSize * I32 * 2, indices, 0, newBatchSize * I32 * 2, newBatchSize * I32 * 2, 1, MemcpyKind.DeviceToHost);
+
+        // prepare next input
+        if (i !== nextn - 1) {
+          ws.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
+        }
+
+        return newMtpHiddenStates.capture();
+      }, ['mtp-tree-decode', i, nextn]);
+      
+      ws.glm.synchronize();
+    }
+
+    //
+
+    // clean up the tree of sequences
+    while (pagedKv.sequences.length > batchSize) {
+      pagedKv.removeSequence(batchSize);
+    }
+  }
+  else {
+    // this creates an oversized tree for all iterations, but the masking prevents the padding tokens from affecting the results that
+    // we care about per iteration.
+    const treePrefillState = ws.planPrefill(model, batchSize, [totalTreeNodes], cache, {
+      ...mtpCustomMask,
+      positionIds: getMTPPositionIdsMask(ws, originalAllocLen, totalTreeNodes),
+    });
+    ws.ensureInputCleared();
+
+    captureManager.run(() => {
+      using initialLogits = mtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, batchSize);
+      const initialTopk = initialLogits.topk(2, model.cfg.vocabSize);
+      using initialIndices = initialTopk.indices;
+      using _initialValues = initialTopk.values;
+      ws.inputIdsBuf.memcpy(initialIndices, initialIndices.bytes, MemcpyKind.DeviceToDevice);
+      treePrefillState.setInput(ws.inputIdsBuf);
+
+      // Iteration: single-sequence prefill with tree-shaped custom mask
+      // 2 -> 6 -> 14 for i = 0,1,2 (nextn=3)
+      for (let i = 1; i < nextn; i++) {
+        const numPrefillTokens = (1 << (i + 1)) - 2;
+
+        if (i === 1) {
+          using cat = mtpHiddenStates.cat([mtpHiddenStates], 0);
+          tiledHs.memcpy(cat);
+        }
+
+        using hiddenStates = model.forwardMtp!(treePrefillState, tiledHs);
+
+        // Copy this iteration's hiddenStates directly to tiledHs for next iteration.
+        using tiledHsStream = i < nextn - 1
+          ? ws.glm.withStream(() => {
+            using oddStream = ws.glm.withStream(() => {
+              // Rows 3,5,7,…: child 2 of each parent (2p+3)
+              tiledHs.memcpy2d(
+                3 * rowBytes, 2 * rowBytes,
+                hiddenStates, 0, rowBytes,
+                rowBytes, numPrefillTokens,
+                MemcpyKind.DeviceToDevice,
+              );
+            });
+            // Rows 2,4,6,…: child 1 of each parent (2p+2)
             tiledHs.memcpy2d(
-              3 * rowBytes, 2 * rowBytes,
+              2 * rowBytes, 2 * rowBytes,
               hiddenStates, 0, rowBytes,
               rowBytes, numPrefillTokens,
               MemcpyKind.DeviceToDevice,
             );
-          });
-          // Rows 2,4,6,…: child 1 of each parent (2p+2)
-          tiledHs.memcpy2d(
-            2 * rowBytes, 2 * rowBytes,
-            hiddenStates, 0, rowBytes,
-            rowBytes, numPrefillTokens,
-            MemcpyKind.DeviceToDevice,
-          );
 
-          oddStream.streamWaitEvent();
-        })
-        : undefined;
+            oddStream.streamWaitEvent();
+          })
+          : undefined;
 
-      using logits = treePrefillState.computeLogits(hiddenStates, model, true);
-      const topk = logits.topk(2, model.cfg.vocabSize);
-      using _values = topk.values;
-      using indices = topk.indices;
+        using logits = treePrefillState.computeLogits(hiddenStates, model, true);
+        const topk = logits.topk(2, model.cfg.vocabSize);
+        using _values = topk.values;
+        using indices = topk.indices;
 
-      // number of leaves in the prefill
-      const leafCount = 1 << i;
-      // number of nodes in the prefill
-      const nodeCount = numPrefillTokens - leafCount;
-      // start writing after existing tokens (ie 1, 3, 7) to append the new layer's tree top 2 predictions
-      const writeOffset = numPrefillTokens * I32;
-      // each leaf has 2 predictions
-      const writeCount = leafCount * 2;
-      ws.inputIdsBuf.memcpy2d(
-        writeOffset, // dst offset
-        writeCount * I32, // dst pitch (unused)
-        indices, // src
-        (nodeCount * 2) * I32, // src offset (each node which has already processed will have 2 predictions that we can skip)
-        writeCount * I32, // src pitch (unused)
-        writeCount * I32, // width
-        1, // height (no pitch)
-        MemcpyKind.DeviceToDevice,
-      );
+        // number of leaves in the prefill
+        const leafCount = 1 << i;
+        // number of nodes in the prefill
+        const nodeCount = numPrefillTokens - leafCount;
+        // start writing after existing tokens (ie 1, 3, 7) to append the new layer's tree top 2 predictions
+        const writeOffset = numPrefillTokens * I32;
+        // each leaf has 2 predictions
+        const writeCount = leafCount * 2;
+        ws.inputIdsBuf.memcpy2d(
+          writeOffset, // dst offset
+          writeCount * I32, // dst pitch (unused)
+          indices, // src
+          (nodeCount * 2) * I32, // src offset (each node which has already processed will have 2 predictions that we can skip)
+          writeCount * I32, // src pitch (unused)
+          writeCount * I32, // width
+          1, // height (no pitch)
+          MemcpyKind.DeviceToDevice,
+        );
 
-      tiledHsStream?.streamWaitEvent();
-    }
+        tiledHsStream?.streamWaitEvent();
+      }
 
-    hostBuf.memcpy(ws.inputIdsBuf, hostBuf.bytes, MemcpyKind.DeviceToHost);
-  }, ['mtp-tree', totalTreeNodes]);
+      hostBuf.memcpy(ws.inputIdsBuf, hostBuf.bytes, MemcpyKind.DeviceToHost);
+    }, ['mtp-tree', totalTreeNodes]);
+    ws.glm.synchronize();
+  }
 
-  ws.glm.synchronize();
+  const draft = performance.now();
 
   // after iterative tree decode/prefill, rewind for tree verification prefill
   seq0.truncate(originalAllocLen);
@@ -237,8 +301,8 @@ export function mtpTreeDecode(
 
     const mlaKVCacheAppendOrig = targetPrefillState.mlaKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
-      appendCkv.removeTracking();
-      appendKpe.removeTracking();
+      // appendCkv.removeTracking();
+      // appendKpe.removeTracking();
       kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendKpe: appendKpe.capture(), cacheIdx, kvLoraRank, qkRopeDim });
       mlaKVCacheAppendOrig(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
     };
@@ -256,7 +320,7 @@ export function mtpTreeDecode(
 
   ws.glm.synchronize();
 
-  const draft = performance.now();
+  const verify = performance.now();
 
   const argmaxHost = ws.tensors.get(`mtp_verify_argmax_host_${totalVerificationTokens}`)!;
   const argmaxBuf = argmaxHost.readPinnedBuffer();
@@ -372,11 +436,13 @@ export function mtpTreeDecode(
 
   ws.glm.synchronize();
 
-  const verify = performance.now();
 
   // if (acceptedTokens.length) {
   //   console.warn(`MTP verify: accepted ${acceptedTokens.length} tokens: ${acceptedTokens.map(t => tokenizer.decode([t], { skip_special_tokens: false }))}, replacement: ${tokenizer.decode([bestReplacement], { skip_special_tokens: false })}, target: ${tokenizer.decode([targetToken], { skip_special_tokens: false })}`);
   // }
+
+  // timings
+  console.log(`MTP tree decode: ${draft - start}ms, verification prefill ${verify - draft}ms, extend prefill ${performance.now() - verify}ms`);
 
   return [...acceptedTokens, bestReplacement];
 }
