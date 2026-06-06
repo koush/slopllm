@@ -83,6 +83,14 @@ export class ParallelTensor extends Tensor {
     }
   }
 
+  capture() {
+    const capturedShards = this.shards.map(s => s.capture());
+    const captured = new ParallelTensor(this.workspace, this.parallelOps, this.parallelism, capturedShards, this.fullShape, this.type, this.name, this.pinned, this);
+    (captured as { name: string | undefined }).name = this.name;
+    captured.captured = true;
+    return captured;
+  }
+
   [Symbol.dispose](): void {
     if (!this.canDispose()) {
       return;

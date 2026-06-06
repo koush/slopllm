@@ -239,7 +239,7 @@ export function mtpTreeDecode(
     targetPrefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
       appendCkv.removeTracking();
       appendKpe.removeTracking();
-      kvCacheLayers.push({ appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim });
+      kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendKpe: appendKpe.capture(), cacheIdx, kvLoraRank, qkRopeDim });
       mlaKVCacheAppendOrig(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
     };
 
@@ -355,9 +355,7 @@ export function mtpTreeDecode(
     for (const layer of kvCacheLayers) {
       mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
     }
-  }, ['mtp-replace', totalVerificationTokens]);
 
-  captureManager.run(() => {
     using verfiedHiddenStates = hiddenStateStaging.slice(0, 0, finishCount);
     using mtpHs = model.forwardMtp!(mtpExtendPrefill, verfiedHiddenStates);
     // MTP convention (same as rotateInputIds in prefill): at position P, the input

@@ -24,6 +24,7 @@ export abstract class Tensor implements Disposable {
   viewDisposed = false;
   id: number;
   static nextId = 1;
+  captured = false;
 
   constructor(public workspace: WorkspaceBase,
     public readonly data: number,
@@ -99,8 +100,19 @@ export abstract class Tensor implements Disposable {
 
   abstract free(): void;
 
+  capture() {
+    const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, undefined);
+    (captured as { name: string | undefined }).name = this.name;
+    captured.captured = true;
+    return captured;
+  }
+
   canDispose() {
+    if (this.captured) {
+      return false;
+    }
     if (this.name !== undefined) {
+      // return false?
       throw new Error(`Cannot dispose named tensor ${this.name}`);
     }
     if (this.workspace.exported.has(this)) {
