@@ -101,6 +101,7 @@ export abstract class Tensor implements Disposable {
   abstract free(): void;
 
   capture() {
+    this.removeTracking();
     const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, undefined);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
@@ -116,7 +117,7 @@ export abstract class Tensor implements Disposable {
       throw new Error(`Cannot dispose named tensor ${this.name}`);
     }
     if (this.workspace.exported.has(this)) {
-      return;
+      return false;
     }
     return true;
   }
