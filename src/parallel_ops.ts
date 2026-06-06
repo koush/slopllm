@@ -1,5 +1,5 @@
 import { DeviceOps, MaskMode, StridedMmap, TensorParallelism } from "./device_ops";
-import { GlmOps, getNativeAddon, f32ToBf16Bytes, bf16BytesToF32, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM } from "./glm_ops";
+import { GlmOps, GlmTensor, getNativeAddon, f32ToBf16Bytes, bf16BytesToF32, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM } from "./glm_ops";
 import { MemcpyKind } from "./tensor";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
@@ -485,6 +485,19 @@ export class ParallelTensor extends Tensor {
     using gatheredA = this.allGather(this.workspace);
     using gatheredB = pB.allGather(pB.workspace);
     return gatheredA.bmm(gatheredB, batch, M, N, K, transA, transB);
+  }
+
+  // Transpose 4D tensor [d0,d1,d2,d3] by permutation [p0,p1,p2,p3].
+  // For Column parallelism d1 is the sharded dimension, so each shard uses d1/worldSize.
+  transpose4d(d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): Tensor {
+    const shardD1 = this.parallelism === TensorParallelism.Column ? d1 / this.worldSize : d1;
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outShards.push((this.shards[i] as GlmTensor).transpose4d(d0, shardD1, d2, d3, p0, p1, p2, p3));
+    }
+    const dims = [d0, d1, d2, d3];
+    const outDims = [p0, p1, p2, p3].map(p => dims[p]);
+    return this.parallelOps.wrapShards(this.workspace, outShards, [outDims[0] * outDims[1], outDims[2] * outDims[3]], this.type, this.parallelism);
   }
 
   writePointers(tensors: Tensor[]): void {
@@ -1862,8 +1875,12 @@ export class ParallelOps implements DeviceOps {
     const snh = shardNHeads ?? numHeads;
     const inh = inputNHeads ?? snh;
     const isHeads = snh !== numHeads;
-    using gatheredVOutShards = partialVOuts.allGather(partialVOuts.workspace);
+    using gatheredVOutStream = this.withStream(() => {
+      return partialVOuts.allGather(partialVOuts.workspace);
+    });
     using gatheredLseShards = partialLses.allGather(partialLses.workspace);
+    gatheredVOutStream.streamWaitEvent();
+    using gatheredVOutShards = gatheredVOutStream.result;
     const shardWss = this.getShardWorkspaces(workspace);
     const shardVOutShape = isHeads ? [batchSize, snh * vHeadDim] : [batchSize, numHeads * vHeadDim];
     const mergedVOutShards = shardWss.map(ws => ws.alloc(shardVOutShape, "BF16"));

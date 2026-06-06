@@ -121,7 +121,6 @@ export function mtpTreeDecode(
 
   const hostBuf = ws.ensureAllocPinned([totalTreeNodes], "I32", `mtp_verify_host_buf_${totalTreeNodes}`);
 
-  const mtpCustomMask = ensureMTPCustomMask(ws, totalTreeNodes);
 
   const start = performance.now();
 
@@ -187,6 +186,7 @@ export function mtpTreeDecode(
   else {
     // this creates an oversized tree for all iterations, but the masking prevents the padding tokens from affecting the results that
     // we care about per iteration.
+    const mtpCustomMask = ensureMTPCustomMask(ws, totalTreeNodes);
     const treePrefillState = ws.planPrefill(model, batchSize, [totalTreeNodes], cache, {
       ...mtpCustomMask,
       positionIds: getMTPPositionIdsMask(ws, originalAllocLen, totalTreeNodes),
@@ -442,7 +442,7 @@ export function mtpTreeDecode(
   // }
 
   // timings
-  console.log(`MTP tree decode: ${draft - start}ms, verification prefill ${verify - draft}ms, extend prefill ${performance.now() - verify}ms`);
+  // console.log(`MTP tree decode: ${draft - start}ms, verification prefill ${verify - draft}ms, extend prefill ${performance.now() - verify}ms`);
 
   return [...acceptedTokens, bestReplacement];
 }

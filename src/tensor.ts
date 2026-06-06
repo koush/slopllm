@@ -178,6 +178,10 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
+  transpose4d(d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): Tensor {
+    return undefined as never;
+  }
+
   writePointers(tensors: Tensor[]): void {
     if (this.type !== "I64") throw new Error(`writePointers: expected I64 tensor, got ${this.type}`);
     const n = tensors.length;

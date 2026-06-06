@@ -358,10 +358,14 @@ void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
 
 // ---------------------------------------------------------------------------
 // MLA V-Expand kernel
-// attn_out: [batch, n_heads, seq_len, kv_lora_rank] (HND layout from FlashInfer)
-// v_proj: [n_heads * v_head_dim, kv_lora_rank] (row-major, per-head weights)
-// result: [batch, n_heads, seq_len, v_head_dim] (HND layout)
-// Computes result[b,h,s,j] = sum_k(attn_out[b,h,s,k] * v_proj[h*v_head_dim+j, k])
+// attn_out: [batch, attn_n_heads, seq_len, kv_lora_rank] (HND layout from FlashInfer)
+// v_proj: [n_heads, kv_lora_rank, v_head_dim] (transposed layout for coalesced access)
+// result: [batch, seq_len, n_heads * v_head_dim]
+// Computes result[b,s,h,j] = sum_k(attn_out[b,h,s,k] * v_proj[h,k,j])
+//
+// Two key optimizations vs the naive layout [n_heads, v_head_dim, kv_lora_rank]:
+//  1. attn_row is shared by all threads in a block -> loaded once into shared memory
+//  2. v_proj[h,k,j]: for fixed k, consecutive threads (j) hit consecutive addresses
 // ---------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(256, 4) mla_v_expand_kernel(
@@ -372,20 +376,28 @@ __global__ void __launch_bounds__(256, 4) mla_v_expand_kernel(
     int seq_len, int batch,
     int attn_n_heads, int head_offset
 ) {
+    extern __shared__ float s_attn[];  // [kv_lora_rank]
+
     int bhs = blockIdx.x;
     int s = bhs % seq_len;
     int h = (bhs / seq_len) % n_heads;
     int b = bhs / (seq_len * n_heads);
 
     const __nv_bfloat16* attn_row = attn_out + ((b * attn_n_heads + h + head_offset) * seq_len + s) * kv_lora_rank;
-    const __nv_bfloat16* w_base = v_proj + h * v_head_dim * kv_lora_rank;
+
+    // Load attn_row cooperatively into shared memory (all threads share the same row)
+    for (int k = threadIdx.x; k < kv_lora_rank; k += blockDim.x)
+        s_attn[k] = __bfloat162float(attn_row[k]);
+    __syncthreads();
+
+    // v_proj transposed layout: [n_heads, kv_lora_rank, v_head_dim]
+    // w_base[k * v_head_dim + j]: for fixed k, consecutive j -> coalesced reads
+    const __nv_bfloat16* w_base = v_proj + h * kv_lora_rank * v_head_dim;
 
     for (int j = threadIdx.x; j < v_head_dim; j += blockDim.x) {
         float sum = 0.0f;
-        const __nv_bfloat16* w_row = w_base + j * kv_lora_rank;
-        for (int k = 0; k < kv_lora_rank; k++) {
-            sum += __bfloat162float(attn_row[k]) * __bfloat162float(w_row[k]);
-        }
+        for (int k = 0; k < kv_lora_rank; k++)
+            sum += s_attn[k] * __bfloat162float(w_base[k * v_head_dim + j]);
         result[(b * seq_len + s) * (n_heads * v_head_dim) + h * v_head_dim + j] = __float2bfloat16(sum);
     }
 }
@@ -398,7 +410,8 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
     cudaSetDevice(ctx->device_id);
     int total_rows = batch * n_heads * seq_len;
     int block_size = compute_block_size(v_head_dim, true);
-    mla_v_expand_kernel<<<total_rows, block_size, 0, GLM_STREAM(ctx)>>>(
+    size_t shmem_size = kv_lora_rank * sizeof(float);
+    mla_v_expand_kernel<<<total_rows, block_size, shmem_size, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
         (const __nv_bfloat16*)v_proj,
         kv_lora_rank, v_head_dim, n_heads, seq_len, batch,

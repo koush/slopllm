@@ -104,6 +104,7 @@ interface NativeAddon {
   bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number): void;
   ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, attnNHeads: number, headOffset: number): void;
+  transpose4d(ctx: number, out: number, input: number, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): void;
   ncclUniqueId(outId: Buffer): void;
   ncclGroupStart(): void;
   ncclGroupEnd(): void;
@@ -143,6 +144,8 @@ interface NativeAddon {
   groupMaskMul(ctx: number, scores: number, groupMask: number, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void;
   expertScale(ctx: number, out: number, weights: number, indices: number, expertId: number, topK: number, batch: number): void;
   mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
+  mulMatIdGrouped(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
+  groupedMoeWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
   scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number): void;
   rotateInputIds(ctx: number, outputIds: number, inputIds: number, qoIndptr: number, newTokens: number, batchSize: number): void;
@@ -212,6 +215,12 @@ export class GlmTensor extends Tensor {
   bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
     const out = this.workspace.alloc([batch * M, N], this.type);
     getNativeAddon().bmm(this.glm.ctx, out.data, this.data, B.data, 1.0, 0.0, batch, M, N, K, transA ? 1 : 0, transB ? 1 : 0);
+    return out;
+  }
+
+  transpose4d(d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): Tensor {
+    const out = this.workspace.alloc([d0 * d1 * d2 * d3], this.type);
+    getNativeAddon().transpose4d(this.glm.ctx, out.data, this.data, d0, d1, d2, d3, p0, p1, p2, p3);
     return out;
   }
 
@@ -342,7 +351,7 @@ export class GlmTensor extends Tensor {
     getNativeAddon().fill(this.glm.ctx, this.data, value, n);
   }
 
-  mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
+  async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
     if (strided) {
       return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
     } else {
@@ -350,7 +359,7 @@ export class GlmTensor extends Tensor {
     }
   }
 
-  mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
+  async mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
     return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
   }
 
@@ -569,6 +578,16 @@ export class GlmTensor extends Tensor {
         scale2Ptrs.writePointers(scale2Tensors);
       }
       getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K);
+    } else if (count > topK) {
+      const numExperts = weights.length;
+      const wsName = `__moe_grouped_ws.${name}`;
+      let wsTensor = this.workspace.tensors.get(wsName);
+      const wsSize = getNativeAddon().groupedMoeWorkspaceSize(count, N, K, numExperts);
+      if (!wsTensor || wsTensor.allocSize < wsSize) {
+        if (wsTensor) wsTensor[Symbol.dispose]();
+        wsTensor = this.workspace.allocRaw(wsSize, wsName);
+      }
+      getNativeAddon().mulMatIdGrouped(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
     } else {
       getNativeAddon().mulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K);
     }

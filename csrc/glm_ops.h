@@ -114,8 +114,9 @@ void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
                          int seq_len, int batch, int in_stride, bool interleaved);
 
 // MLA V-Expand: per-head matmul attn_out @ v_proj^T
-// attn_out: [B, attn_n_heads, S, kv_lora_rank] (HND), v_proj: [n_heads*v_head_dim, kv_lora_rank]
-// result: [B, n_heads, S, v_head_dim] (HND)
+// attn_out: [B, attn_n_heads, S, kv_lora_rank] (HND)
+// v_proj: [n_heads, kv_lora_rank, v_head_dim] (transposed layout for coalesced access)
+// result: [B, S, n_heads * v_head_dim]
 // head_offset: offset into attn_n_heads dimension of attn_out for this shard
 void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        const void* v_proj,
@@ -180,6 +181,14 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
                              const void* scales, int top_k,
                              int dim, int num_rows, void* workspace);
+
+size_t glm_grouped_moe_workspace_size(int count, int N, int K, int num_experts);
+
+void glm_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
+                              const void* const* weight_ptrs,
+                              const int* expert_ids, int top_k,
+                              int count, int N, int K,
+                              int num_experts, void* workspace);
 
 // Rotate input IDs for MTP prefill: shifts each sequence left by 1,
 // appends new_token at the last position.

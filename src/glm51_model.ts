@@ -269,11 +269,16 @@ export class Glm51Model extends ChatModel {
       const tKNope = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", undefined, colPar);
       const vName = name.replace(".kv_b_proj.weight", ".v_proj.weight");
       const vPar = this.contextParallel ? TensorParallelism.Replicated : colPar;
-      const tV = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", vName, vPar);
+      using tVRaw = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", undefined, vPar);
       await Promise.all([
         tKNope.mmapLoad(mmapPtr, offset, tKNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
-        tV.mmapLoad(mmapPtr, offset, tV.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: vHeadDim * inDim * eb, width: vHeadDim * inDim * eb, height: nHeads }),
+        tVRaw.mmapLoad(mmapPtr, offset, tVRaw.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: vHeadDim * inDim * eb, width: vHeadDim * inDim * eb, height: nHeads }),
       ]);
+      // Transpose v_proj: [nHeads, vHeadDim, kvLoraRank] -> [nHeads, kvLoraRank, vHeadDim]
+      // The transposed layout enables coalesced reads in mla_v_expand_kernel.
+      using tVT = tVRaw.transpose4d(1, nHeads, vHeadDim, kvLoraRank, 0, 1, 3, 2);
+      const tV = this.alloc([nHeads * kvLoraRank, vHeadDim], "BF16", vName, vPar);
+      tV.memcpy(tVT);
       this.pendingKNope.set(name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), tKNope);
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
       await this.splitMlaWeightMmap(mmapPtr, offset,

@@ -786,6 +786,21 @@ class GlmOps:
             ctypes.c_void_p,
         ]
 
+        self.lib.glm_grouped_moe_workspace_size.restype = ctypes.c_size_t
+        self.lib.glm_grouped_moe_workspace_size.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_mul_mat_id_grouped.restype = None
+        self.lib.glm_mul_mat_id_grouped.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
             self.lib.glm_free(self.ctx)
@@ -1597,6 +1612,20 @@ class GlmOps:
             self._ptr(expert_ids),
             top_k, count, N, K
         )
+
+    def mul_mat_id_grouped(self, output, input, weight_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace):
+        self.lib.glm_mul_mat_id_grouped(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input),
+            ctypes.c_void_p(weight_ptrs),
+            self._ptr(expert_ids),
+            top_k, count, N, K, num_experts,
+            ctypes.c_void_p(workspace)
+        )
+
+    def grouped_moe_workspace_size(self, count, N, K, num_experts):
+        return self.lib.glm_grouped_moe_workspace_size(count, N, K, num_experts)
 
     def nvfp4_mul_mat_id(self, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, top_k, count, N, K):
         self.lib.glm_nvfp4_mul_mat_id(
