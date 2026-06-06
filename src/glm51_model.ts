@@ -91,25 +91,14 @@ function loadConfig(modelDir: string): Glm51Config {
   };
 }
 
-interface MlaDeferred {
-  mmapPtr: number;
-  offset: number;
-  nHeads: number;
-  headDim: number;
-  inDim: number;
-  rowsPerHead: number;
-  outDim: number;
-  par: TensorParallelism;
-}
-
 export class Glm51Model extends ChatModel {
   static readonly WEIGHT_PREFIX = "model.layers.";
   readonly eosIds: Set<number>;
   cfg: Glm51Config;
   invFreq: Tensor;
   readonly contextParallel: boolean;
-  private readonly pendingKNope = new Map<string, MlaDeferred>();
-  private readonly pendingQNope = new Map<string, MlaDeferred>();
+  private readonly pendingKNope = new Map<string, Tensor>();
+  private readonly pendingQNope = new Map<string, Tensor>();
   private readonly mtp: boolean;
 
   private constructor(glm: DeviceOps, config: Glm51Config, contextParallel = false, mtp = false) {
@@ -224,33 +213,24 @@ export class Glm51Model extends ChatModel {
     const t0 = this.alloc([nHeads * rowsPerHead0, outDim0], "BF16", name0, par);
     const t1 = this.alloc([nHeads * rowsPerHead1, outDim1], "BF16", name1, par);
     const strided: StridedMmap = { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: rowsPerHead0 * inDim * eb, width: rowsPerHead0 * inDim * eb, height: nHeads };
-    await t0.mmapLoad(mmapPtr, offset, t0.bytes, strided);
-    await t1.mmapLoad(mmapPtr, offset, t1.bytes, { srcOffset: rowsPerHead0 * inDim * eb, dstOffset: 0, srcPitch, dstPitch: rowsPerHead1 * inDim * eb, width: rowsPerHead1 * inDim * eb, height: nHeads });
+    await Promise.all([
+      t0.mmapLoad(mmapPtr, offset, t0.bytes, strided),
+      t1.mmapLoad(mmapPtr, offset, t1.bytes, { srcOffset: rowsPerHead0 * inDim * eb, dstOffset: 0, srcPitch, dstPitch: rowsPerHead1 * inDim * eb, width: rowsPerHead1 * inDim * eb, height: nHeads })
+    ]);
     return [t0, t1];
   }
 
-  private async loadDeferredMlaWeight(name: string, par: TensorParallelism): Promise<Tensor> {
-    const deferred = this.pendingKNope.get(name) ?? this.pendingQNope.get(name);
-    if (!deferred) throw new Error(`No deferred MLA info for ${name}`);
-    const eb = 2;
-    const srcPitch = deferred.headDim * deferred.inDim * eb;
-    const t = this.alloc([deferred.nHeads * deferred.rowsPerHead, deferred.outDim], "BF16", undefined, par);
-    await t.mmapLoad(deferred.mmapPtr, deferred.offset, t.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: deferred.rowsPerHead * deferred.inDim * eb, width: deferred.rowsPerHead * deferred.inDim * eb, height: deferred.nHeads });
-    return t;
-  }
-
-  private async tryComputeAbsorbed(layerPfx: string, nHeads: number, kvLoraRank: number, qLoraRank: number, qkNopeDim: number): Promise<void> {
+  private tryComputeAbsorbed(layerPfx: string, nHeads: number, kvLoraRank: number, qLoraRank: number, qkNopeDim: number): void {
     const kNopeKey = `${layerPfx}.k_nope_proj.weight`;
     const qNopeKey = `${layerPfx}.q_nope_proj.weight`;
     if (!this.pendingKNope.has(kNopeKey) || !this.pendingQNope.has(qNopeKey)) return;
-    const par = TensorParallelism.Column;
-    using kNopeProj = await this.loadDeferredMlaWeight(kNopeKey, par);
-    using qNopeProj = await this.loadDeferredMlaWeight(qNopeKey, par);
+    using kNopeProj = this.pendingKNope.get(kNopeKey)!;
+    using qNopeProj = this.pendingQNope.get(qNopeKey)!;
+    this.pendingKNope.delete(kNopeKey);
+    this.pendingQNope.delete(qNopeKey);
     using wAbsorbedTmp = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
     const wAbsorbed = this.alloc(wAbsorbedTmp.shape, wAbsorbedTmp.type, `${layerPfx}.absorbed.weight`, wAbsorbedTmp.parallelism);
     wAbsorbed.memcpy(wAbsorbedTmp);
-    this.pendingKNope.delete(kNopeKey);
-    this.pendingQNope.delete(qNopeKey);
   }
 
   private async loadMlaWeight(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
@@ -274,23 +254,27 @@ export class Glm51Model extends ChatModel {
     if (name.endsWith(".q_b_proj.weight")) {
       const eb = 2;
       const srcPitch = qkHeadDim * inDim * eb;
-      this.pendingQNope.set(name.replace(".q_b_proj.weight", ".q_nope_proj.weight"), {
-        mmapPtr, offset, nHeads, headDim: qkHeadDim, inDim, rowsPerHead: qkNopeDim, outDim: qLoraRank, par: colPar,
-      });
+      const tQNope = this.alloc([nHeads * qkNopeDim, qLoraRank], "BF16", undefined, colPar);
       const peName = name.replace(".q_b_proj.weight", ".q_pe_proj.weight");
       const par = this.contextParallel ? TensorParallelism.Replicated : colPar;
       const tPe = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", peName, par);
-      await tPe.mmapLoad(mmapPtr, offset, tPe.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: qkRopeDim * inDim * eb, width: qkRopeDim * inDim * eb, height: nHeads });
+      await Promise.all([
+        tQNope.mmapLoad(mmapPtr, offset, tQNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
+        tPe.mmapLoad(mmapPtr, offset, tPe.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: qkRopeDim * inDim * eb, width: qkRopeDim * inDim * eb, height: nHeads }),
+      ]);
+      this.pendingQNope.set(name.replace(".q_b_proj.weight", ".q_nope_proj.weight"), tQNope);
     } else if (name.endsWith(".kv_b_proj.weight")) {
       const eb = 2;
       const srcPitch = (qkNopeDim + vHeadDim) * inDim * eb;
-      this.pendingKNope.set(name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), {
-        mmapPtr, offset, nHeads, headDim: qkNopeDim + vHeadDim, inDim, rowsPerHead: qkNopeDim, outDim: kvLoraRank, par: colPar,
-      });
+      const tKNope = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", undefined, colPar);
       const vName = name.replace(".kv_b_proj.weight", ".v_proj.weight");
       const vPar = this.contextParallel ? TensorParallelism.Replicated : colPar;
       const tV = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", vName, vPar);
-      await tV.mmapLoad(mmapPtr, offset, tV.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: vHeadDim * inDim * eb, width: vHeadDim * inDim * eb, height: nHeads });
+      await Promise.all([
+        tKNope.mmapLoad(mmapPtr, offset, tKNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
+        tV.mmapLoad(mmapPtr, offset, tV.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: vHeadDim * inDim * eb, width: vHeadDim * inDim * eb, height: nHeads }),
+      ]);
+      this.pendingKNope.set(name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), tKNope);
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
       await this.splitMlaWeightMmap(mmapPtr, offset,
         1, kvLoraRank + qkRopeDim, inDim,
@@ -300,7 +284,7 @@ export class Glm51Model extends ChatModel {
     }
 
     if (name.endsWith(".q_b_proj.weight") || name.endsWith(".kv_b_proj.weight")) {
-      await this.tryComputeAbsorbed(layerPfx, nHeads, kvLoraRank, qLoraRank, qkNopeDim);
+      this.tryComputeAbsorbed(layerPfx, nHeads, kvLoraRank, qLoraRank, qkNopeDim);
     }
   }
 
