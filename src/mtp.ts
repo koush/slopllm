@@ -254,6 +254,8 @@ export function mtpTreeDecode(
     return kvCacheLayers;
   }, ['mtp-verify', totalVerificationTokens]);
 
+  ws.glm.synchronize();
+
   const draft = performance.now();
 
   const argmaxHost = ws.tensors.get(`mtp_verify_argmax_host_${totalVerificationTokens}`)!;
@@ -348,7 +350,7 @@ export function mtpTreeDecode(
   // mtp layers: perform extended prefill as usual
   seq0.truncate(originalAllocLen);
 
-  const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache, undefined);
+  const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache);
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
 
   captureManager.run(() => {
@@ -372,9 +374,9 @@ export function mtpTreeDecode(
 
   const verify = performance.now();
 
-  if (acceptedTokens.length) {
-    console.warn(`MTP verify: accepted ${acceptedTokens.length} tokens: ${acceptedTokens.map(t => tokenizer.decode([t], { skip_special_tokens: false }))}, replacement: ${tokenizer.decode([bestReplacement], { skip_special_tokens: false })}, target: ${tokenizer.decode([targetToken], { skip_special_tokens: false })}`);
-  }
+  // if (acceptedTokens.length) {
+  //   console.warn(`MTP verify: accepted ${acceptedTokens.length} tokens: ${acceptedTokens.map(t => tokenizer.decode([t], { skip_special_tokens: false }))}, replacement: ${tokenizer.decode([bestReplacement], { skip_special_tokens: false })}, target: ${tokenizer.decode([targetToken], { skip_special_tokens: false })}`);
+  // }
 
   return [...acceptedTokens, bestReplacement];
 }
