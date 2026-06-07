@@ -515,10 +515,43 @@ constexpr int NVFP4_GEMM_BLOCK_DIM = NVFP4_GEMM_M_TILE * NVFP4_GEMM_N_TILE;
 // why this trades less reuse for more occupancy than the M_TILE=16 variant.
 constexpr int NVFP4_GEMM_SMALL_M_TILE = 4;
 constexpr int NVFP4_GEMM_SMALL_M_THRESHOLD = 32;
+// When M > 1 and N is small, the smem GEMM kernel launches too few CTAs to
+// fill the GPU (e.g. N=256 → grid.x=8 → only 32 CTAs at M=15).  cuBLAS with
+// split-K gives much higher occupancy.  Below this N threshold (per shard),
+// dequantize FP4→BF16 and call cublasGemmEx instead.
+constexpr int NVFP4_CUBLAS_N_THRESHOLD = 512;
 // Pad each smem_weight row so its stride in 4-byte words (65) is coprime with
 // the 32 shared-memory banks — every lane of a warp (which spans all 32 `n`
 // values for a fixed `k`) then lands in a distinct bank, avoiding conflicts.
 constexpr int NVFP4_GEMM_SMEM_PAD = 2;
+
+// ---------------------------------------------------------------------------
+// NVFP4 dequantize-only kernel: converts FP4 weights to BF16 in a workspace
+// buffer so that a subsequent cublasGemmEx call can use Tensor Cores + split-K.
+// Each thread decodes one output element.  The grid is (N * K) elements total.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(256, 8)
+nvfp4_dequantize_to_bf16_kernel(
+    __nv_bfloat16* __restrict__ dst,
+    const uint8_t* __restrict__ weight,
+    const __nv_fp8_e4m3* __restrict__ weight_scale,
+    const float* __restrict__ weight_scale_2,
+    int N, int K) {
+
+    int num_k_groups = K / NVFP4_QUANT_GROUP;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total) return;
+
+    int n = idx / K;
+    int k = idx % K;
+    int kg = k / NVFP4_QUANT_GROUP;
+    float scale = static_cast<float>(weight_scale[n * num_k_groups + kg]) * (*weight_scale_2);
+    uint8_t packed = weight[n * (K / 2) + k / 2];
+    float val = (k & 1) ? fp4_e2m1_decode(packed >> 4u) * scale
+                         : fp4_e2m1_decode(packed & 0x0Fu) * scale;
+    dst[idx] = __float2bfloat16(val);
+}
 
 // ---------------------------------------------------------------------------
 // NVFP4 dequantize+GEMM (M > 1): the FP4 weight nibble and its scale depend
@@ -823,7 +856,8 @@ void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
 
 void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
                               const void* fp4_weight, const void* weight_scale,
-                              const float* weight_scale_2, int m, int n, int k) {
+                              const float* weight_scale_2, int m, int n, int k,
+                              void* bf16_workspace) {
     cudaSetDevice(ctx->device_id);
     const __nv_fp8_e4m3* scale_ptr = reinterpret_cast<const __nv_fp8_e4m3*>(weight_scale);
     if (m == 1) {
@@ -848,6 +882,34 @@ void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input
                 reinterpret_cast<const uint8_t*>(fp4_weight),
                 scale_ptr, weight_scale_2, m, n, k);
         }
+    } else if (m > 1 && n <= NVFP4_CUBLAS_N_THRESHOLD && bf16_workspace != nullptr) {
+        // Small-N path: dequantize FP4→BF16, then use cuBLAS for high-occupancy
+        // split-K GEMM.  The custom smem kernel would launch only
+        // ceil(N/32)*ceil(M/4) CTAs — e.g. 8*4=32 for N=256, M=15 — which
+        // severely under-utilises the GPU.  cuBLAS split-K creates hundreds of
+        // CTAs and uses Tensor Cores, yielding 20-40× speedup for these shapes.
+        auto dst = reinterpret_cast<__nv_bfloat16*>(bf16_workspace);
+        int total = n * k;
+        int deq_grid = (total + 255) / 256;
+        nvfp4_dequantize_to_bf16_kernel<<<deq_grid, 256, 0, GLM_STREAM(ctx)>>>(
+            dst,
+            reinterpret_cast<const uint8_t*>(fp4_weight),
+            scale_ptr, weight_scale_2,
+            n, k);
+
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasGemmEx(CUBLAS(ctx),
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            n, m, k,
+            &alpha,
+            dst,          CUDA_R_16BF, k,
+            bf16_input,   CUDA_R_16BF, k,
+            &beta,
+            bf16_out,     CUDA_R_16BF, n,
+            CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     } else if (m <= NVFP4_GEMM_SMALL_M_THRESHOLD) {
         // Narrow-tile variant: more CTAs along M (better occupancy at small M)
         // and less per-block input-staging work, while still reusing decoded

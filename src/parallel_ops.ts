@@ -1725,8 +1725,8 @@ export class ParallelOps implements DeviceOps {
       return false;
     if (dtype !== NCCL_BFLOAT16 && dtype !== NCCL_FLOAT32)
       return false;
-    // Single-block kernel limit: 1024 threads * 8 vec = 8192 elements.
-    if (count > 65536)
+    // keep an eye on this, p2p limit needs to be above MTP prefill size (15 for top 2 and nextn 3)
+    if (count > 65536 * 2)
       return false;
     const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
     if (!group)

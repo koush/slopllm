@@ -587,7 +587,8 @@ void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
 // weight_scale_2: scalar F32 (global scale = amax / (6*448))
 void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
                               const void* fp4_weight, const void* weight_scale,
-                              const float* weight_scale_2, int m, int n, int k);
+                              const float* weight_scale_2, int m, int n, int k,
+                              void* bf16_workspace = nullptr);
 
 // Gated DeltaNet recurrent step (decode, T=1, batched)
 // Fused: L2 norm q,k + gate computation + delta rule update

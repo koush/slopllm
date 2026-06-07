@@ -2046,7 +2046,7 @@ static Napi::Value Fp8LinearDecode(const Napi::CallbackInfo& info) {
 static Napi::Value Nvfp4LinearDecode(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 8) {
-        Napi::TypeError::New(env, "Expected (ctx, bf16_out, bf16_input, fp4_weight, weight_scale, weight_scale_2, m, n, k)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, bf16_out, bf16_input, fp4_weight, weight_scale, weight_scale_2, m, n, k[, bf16_workspace])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -2058,13 +2058,18 @@ static Napi::Value Nvfp4LinearDecode(const Napi::CallbackInfo& info) {
     int m = info[6].As<Napi::Number>().Int32Value();
     int n = info[7].As<Napi::Number>().Int32Value();
     int k = info[8].As<Napi::Number>().Int32Value();
+    uintptr_t ws_ptr = 0;
+    if (info.Length() >= 10) {
+        ws_ptr = info[9].As<Napi::Number>().Int64Value();
+    }
     glm_nvfp4_linear_decode(reinterpret_cast<GlmCtx*>(ctx_ptr),
                              reinterpret_cast<void*>(out_ptr),
                              reinterpret_cast<const void*>(input_ptr),
                              reinterpret_cast<const void*>(weight_ptr),
                              reinterpret_cast<const void*>(scale_ptr),
                              reinterpret_cast<const float*>(scale2_ptr),
-                             m, n, k);
+                             m, n, k,
+                             reinterpret_cast<void*>(ws_ptr));
     return env.Undefined();
 }
 
