@@ -21,6 +21,7 @@ export abstract class Tensor implements Disposable {
   private pinnedBuffer?: Buffer;
   stack: string;
   views = new Set<Tensor>();
+  disposed = false;
   viewDisposed = false;
   id: number;
   static nextId = 1;
@@ -109,6 +110,9 @@ export abstract class Tensor implements Disposable {
   }
 
   canDispose() {
+    if (this.disposed) {
+      return false;
+    }
     if (this.captured) {
       return false;
     }
@@ -131,6 +135,7 @@ export abstract class Tensor implements Disposable {
       this.viewDisposed = true;
       return;
     }
+    this.disposed = true;
     this.workspace.tracked.delete(this);
     if (this.view) {
       this.view.views.delete(this);

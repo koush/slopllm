@@ -57,7 +57,7 @@ interface CliArgs {
   arena: number;
   cp: boolean;
   mtp: boolean;
-  mtpDraftTokens: number;
+  mtpDraftTopk: number[];
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -91,7 +91,7 @@ function parseArgs(argv: string[]): CliArgs {
     arena: 0,
     cp: false,
     mtp: false,
-    mtpDraftTokens: 3,
+    mtpDraftTopk: [],
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -127,7 +127,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--arena" && i + 1 < argv.length) args.arena = parseInt(argv[++i], 10);
     else if (a === "--cp") args.cp = true;
     else if (a === "--mtp") args.mtp = true;
-    else if (a === "--mtp-draft-tokens" && i + 1 < argv.length) args.mtpDraftTokens = parseInt(argv[++i], 10);
+    else if (a === "--mtp-draft-topk" && i + 1 < argv.length) args.mtpDraftTopk = argv[++i].split(",").map(s => parseInt(s.trim(), 10));
   }
 
   if (args.useQwen35 && args.useFp8) {
@@ -141,6 +141,10 @@ function parseArgs(argv: string[]): CliArgs {
   if (args.useNvfp4 && !args.useGlm51) {
     console.error("Error: --nvfp4 is only supported with --glm51");
     process.exit(1);
+  }
+
+  if (args.mtp && args.mtpDraftTopk.length === 0) {
+    args.mtpDraftTopk = [2, 2, 2];
   }
 
   if (args.mtp && args.maxBatch < 8) {
@@ -197,7 +201,7 @@ export function* generateStream(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
-  timing?: DecodeTiming, mtp?: boolean, mtpDraftTokens?: number, tokenizer?: any,
+  timing?: DecodeTiming, mtp?: boolean, mtpDraftTopk?: number[], tokenizer?: any,
 ): Generator<number> {
   const suffixIds = cache.prefixMatch(0, inputIds);
 
@@ -223,7 +227,7 @@ export function* generateStream(
   const tokenHistory = inputIds.slice();
 
   using captureManager = new CaptureManager(glm);
-  const nextn = (mtp && model.forwardMtp) ? (mtpDraftTokens ?? 3) : 0;
+  const topks = (mtp && model.forwardMtp && mtpDraftTopk && mtpDraftTopk.length > 0) ? mtpDraftTopk : [];
   using mtpHiddenStates = new UsingHolder<Tensor>(undefined!);
   let currentToken: number;
 
@@ -238,7 +242,7 @@ export function* generateStream(
     using firstTokens = state.computeLogits(hiddenStates, model);
     doSample(firstTokens);
 
-    if (mtp && model.forwardMtp && nextn > 0) {
+    if (mtp && model.forwardMtp && topks.length > 0) {
       // MTP convention: at position P, the input token is the token at P+1 (not P),
       // paired with the target model's hidden state at P. This means the MTP KV entry
       // at position P encodes info about token P+1, whereas the target model KV at the
@@ -273,8 +277,8 @@ export function* generateStream(
 
   try {
     for (let i = 1; i < maxNewTokens; i++) {
-      if (mtp && model.forwardMtp && nextn > 0) {
-        const treeResult = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, ws, currentToken, nextn, cache, tokenizer);
+      if (mtp && model.forwardMtp && topks.length > 0) {
+        const treeResult = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, ws, currentToken, topks, cache, tokenizer);
         // glm.synchronize();
         for (const t of treeResult) {
           currentToken = t;
@@ -286,7 +290,7 @@ export function* generateStream(
         }
 
         continue;
-        // console.log(`MTP accepted=${verifyResult.numAccepted}/${nextn} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
+        // console.log(`MTP accepted=${verifyResult.numAccepted}/${topks.length} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
         // if (verifyResult.acceptedTokens.length > 0) {
         //   console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer?.decode([t]) ?? `?${t}`).join(" ")}`);
         // }
@@ -453,7 +457,7 @@ async function interactiveChat(
       const generatedIds: number[] = [];
       const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-      for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTokens, tokenizer)) {
+      for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk, tokenizer)) {
         generatedIds.push(tokenId);
         tokCount++;
         const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -492,7 +496,7 @@ async function singlePrompt(
   const generatedIds: number[] = [];
   const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTokens, tokenizer)) {
+  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk, tokenizer)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -686,7 +690,7 @@ async function main(): Promise<void> {
   const samplingStr = !args.greedy ? samplingParts.join(" ") : "greedy";
 
   const arenaStr = args.arena ? `  |  arena=${args.arena}GB` : "";
-  const mtpStr = args.mtp ? `  |  mtp=${args.mtpDraftTokens}` : "";
+  const mtpStr = args.mtp ? `  |  mtp=${args.mtpDraftTopk.join(',')}` : "";
   console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${args.maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}${arenaStr}${mtpStr}`);
 
   const cleanup = () => {

@@ -509,6 +509,12 @@ constexpr int NVFP4_GEMM_M_TILE = 16;
 constexpr int NVFP4_GEMM_N_TILE = 32;
 constexpr int NVFP4_GEMM_K_TILE = 128;
 constexpr int NVFP4_GEMM_BLOCK_DIM = NVFP4_GEMM_M_TILE * NVFP4_GEMM_N_TILE;
+// Narrow M-tile used when M <= NVFP4_GEMM_SMALL_M_THRESHOLD (e.g. MTP
+// verification batches): quadruples grid.y vs. NVFP4_GEMM_M_TILE=16 while still
+// reusing each decoded weight tile across 4 rows. See the kernel comment for
+// why this trades less reuse for more occupancy than the M_TILE=16 variant.
+constexpr int NVFP4_GEMM_SMALL_M_TILE = 4;
+constexpr int NVFP4_GEMM_SMALL_M_THRESHOLD = 32;
 // Pad each smem_weight row so its stride in 4-byte words (65) is coprime with
 // the 32 shared-memory banks — every lane of a warp (which spans all 32 `n`
 // values for a fixed `k`) then lands in a distinct bank, avoiding conflicts.
@@ -527,7 +533,22 @@ constexpr int NVFP4_GEMM_SMEM_PAD = 2;
 // removing the redundant decode work — beneficial for both small-M (e.g.
 // speculative-decode verification) and large-M (prefill) shapes.
 // ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(NVFP4_GEMM_BLOCK_DIM, 4)
+// Templated on M_TILE so small-M callers (e.g. speculative-decode verification,
+// where M ~ 10s of tokens) can use a narrower tile. A narrower M_TILE means:
+//   - more CTAs along the M dimension (grid.y = ceil(M / M_TILE)) -> better SM
+//     occupancy when M doesn't fill a single M_TILE=16 tile (the M=15 case
+//     launches only ceil(N/N_TILE) CTAs total at M_TILE=16, badly under-filling
+//     a 188-SM GPU), and
+//   - less per-block input-staging work (the smem_input load loop is the part
+//     of this kernel whose cost actually scales with valid_m = min(M_TILE, M),
+//     not the weight decode/compute, which runs the same number of iterations
+//     regardless of how many M-rows are valid).
+// Weight tiles are still decoded once per N_TILE and reused across the (now
+// smaller) M_TILE rows, so this keeps the bandwidth-efficient reuse that makes
+// the GEMV fallback a bad idea at M > 1 (it re-reads the whole weight matrix
+// once per row), while trading less of it for occupancy than M_TILE=16 does.
+template <int M_TILE>
+__global__ void __launch_bounds__(M_TILE * NVFP4_GEMM_N_TILE, 4)
 nvfp4_dequantize_gemm_smem_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
@@ -536,21 +557,23 @@ nvfp4_dequantize_gemm_smem_kernel(
     const float* __restrict__ weight_scale_2,
     int M, int N, int K) {
 
-    int m_start = blockIdx.y * NVFP4_GEMM_M_TILE;
+    constexpr int BLOCK_DIM = M_TILE * NVFP4_GEMM_N_TILE;
+
+    int m_start = blockIdx.y * M_TILE;
     int n_start = blockIdx.x * NVFP4_GEMM_N_TILE;
     int local_m = threadIdx.x / NVFP4_GEMM_N_TILE;
     int local_n = threadIdx.x % NVFP4_GEMM_N_TILE;
     int m = m_start + local_m;
     int n = n_start + local_n;
 
-    __shared__ __nv_bfloat16 smem_input[NVFP4_GEMM_M_TILE][NVFP4_GEMM_K_TILE];
+    __shared__ __nv_bfloat16 smem_input[M_TILE][NVFP4_GEMM_K_TILE];
     // Pre-decoded, pre-scaled BF16 weight tile (shared across all M_TILE rows).
     __shared__ __nv_bfloat16 smem_weight[NVFP4_GEMM_N_TILE][NVFP4_GEMM_K_TILE + NVFP4_GEMM_SMEM_PAD];
 
     float sum = 0.0f;
     int num_k_tiles = (K + NVFP4_GEMM_K_TILE - 1) / NVFP4_GEMM_K_TILE;
     int num_k_groups = K / NVFP4_QUANT_GROUP;
-    int valid_m = min(NVFP4_GEMM_M_TILE, M - m_start);
+    int valid_m = min(M_TILE, M - m_start);
     int valid_n = min(NVFP4_GEMM_N_TILE, N - n_start);
     float scale_2_val = *weight_scale_2;
 
@@ -558,7 +581,7 @@ nvfp4_dequantize_gemm_smem_kernel(
         int k_start = kb * NVFP4_GEMM_K_TILE;
         int k_tile = min(NVFP4_GEMM_K_TILE, K - k_start);
 
-        for (int i = threadIdx.x; i < valid_m * k_tile; i += NVFP4_GEMM_BLOCK_DIM) {
+        for (int i = threadIdx.x; i < valid_m * k_tile; i += BLOCK_DIM) {
             int lm = i / k_tile;
             int lk = i % k_tile;
             smem_input[lm][lk] = input[(m_start + lm) * K + k_start + lk];
@@ -567,7 +590,7 @@ nvfp4_dequantize_gemm_smem_kernel(
         // K_TILE is a multiple of NVFP4_QUANT_GROUP (16) and weights are packed
         // 2-per-byte, so k_tile is always even — k_tile/2 byte-pairs to decode.
         int k_tile_pairs = k_tile / 2;
-        for (int i = threadIdx.x; i < valid_n * k_tile_pairs; i += NVFP4_GEMM_BLOCK_DIM) {
+        for (int i = threadIdx.x; i < valid_n * k_tile_pairs; i += BLOCK_DIM) {
             int ln = i / k_tile_pairs;
             int lk_pair = i % k_tile_pairs;
             int k = lk_pair * 2;
@@ -825,10 +848,22 @@ void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input
                 reinterpret_cast<const uint8_t*>(fp4_weight),
                 scale_ptr, weight_scale_2, m, n, k);
         }
+    } else if (m <= NVFP4_GEMM_SMALL_M_THRESHOLD) {
+        // Narrow-tile variant: more CTAs along M (better occupancy at small M)
+        // and less per-block input-staging work, while still reusing decoded
+        // weight tiles across NVFP4_GEMM_SMALL_M_TILE rows (unlike the GEVM
+        // fallback, which would re-read the whole weight matrix per row).
+        dim3 grid((n + NVFP4_GEMM_N_TILE - 1) / NVFP4_GEMM_N_TILE,
+                  (m + NVFP4_GEMM_SMALL_M_TILE - 1) / NVFP4_GEMM_SMALL_M_TILE);
+        nvfp4_dequantize_gemm_smem_kernel<NVFP4_GEMM_SMALL_M_TILE><<<grid, NVFP4_GEMM_SMALL_M_TILE * NVFP4_GEMM_N_TILE, 0, GLM_STREAM(ctx)>>>(
+            reinterpret_cast<__nv_bfloat16*>(bf16_out),
+            reinterpret_cast<const __nv_bfloat16*>(bf16_input),
+            reinterpret_cast<const uint8_t*>(fp4_weight),
+            scale_ptr, weight_scale_2, m, n, k);
     } else {
         dim3 grid((n + NVFP4_GEMM_N_TILE - 1) / NVFP4_GEMM_N_TILE,
                   (m + NVFP4_GEMM_M_TILE - 1) / NVFP4_GEMM_M_TILE);
-        nvfp4_dequantize_gemm_smem_kernel<<<grid, NVFP4_GEMM_BLOCK_DIM, 0, GLM_STREAM(ctx)>>>(
+        nvfp4_dequantize_gemm_smem_kernel<NVFP4_GEMM_M_TILE><<<grid, NVFP4_GEMM_BLOCK_DIM, 0, GLM_STREAM(ctx)>>>(
             reinterpret_cast<__nv_bfloat16*>(bf16_out),
             reinterpret_cast<const __nv_bfloat16*>(bf16_input),
             reinterpret_cast<const uint8_t*>(fp4_weight),

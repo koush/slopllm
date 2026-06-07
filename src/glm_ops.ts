@@ -7,6 +7,19 @@ import { SafeTensorFile } from "./safetensors";
 import type { WorkspaceBase } from "./workspace";
 import { Allocator, ArenaAllocator } from "./allocator";
 
+// Above `count == topK` (single-token decode), mulMatId can either:
+//  - run the direct per-(token,expert) GEMV kernel (mulMatId/nvfp4MulMatId), which
+//    re-reads each expert's weight once per routed token (redundant when several
+//    tokens share an expert, but a single dependency-free kernel launch), or
+//  - run the grouped/sorted pipeline (mulMatIdGrouped/nvfp4MulMatIdGrouped), which
+//    reads each expert's weight once regardless of how many tokens route to it, at
+//    the cost of a 6-stage histogram/scatter/gemv/unscatter dependency chain.
+// The grouped pipeline's per-stage overhead dominates at small counts (e.g. MTP
+// verification batches), so the direct path wins there despite redundant reads;
+// the grouped path only pays off once `count` is large enough to amortize its
+// dispatch overhead against avoided redundant weight reads (true prefill territory).
+const MUL_MAT_ID_GROUPED_THRESHOLD = 256;
+
 function findProjectRoot(dir: string): string {
   let d = dir;
   while (d !== path.dirname(d)) {
@@ -157,10 +170,6 @@ export class GlmTensor extends Tensor {
     super(workspace, data, allocSize, shape, type, name, pinned, view);
   }
 
-  _dispose() {
-    super[Symbol.dispose]();
-  }
-
   [Symbol.dispose](): void {
     if (!this.canDispose()) {
       return;
@@ -170,7 +179,7 @@ export class GlmTensor extends Tensor {
       this.glm.streamTensors.get(this.glm.currentStream)!.add(this);
     }
     else {
-      this._dispose();
+      super[Symbol.dispose]();
     }
   }
 
@@ -353,15 +362,15 @@ export class GlmTensor extends Tensor {
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
-    if (strided) {
-      return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
-    } else {
-      return this.mmapLoadAsync(mmapPtr, offset, nbytes);
-    }
+    // if (strided) {
+    //   return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
+    // } else {
+    //   return this.mmapLoadAsync(mmapPtr, offset, nbytes);
+    // }
   }
 
   async mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
-    return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
+    // return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
   }
 
   memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void> {
@@ -578,7 +587,7 @@ export class GlmTensor extends Tensor {
         scale2Ptrs = this.workspace.alloc([weights.length], "I64", scale2PtrName);
         scale2Ptrs.writePointers(scale2Tensors);
       }
-      if (count > topK) {
+      if (count > MUL_MAT_ID_GROUPED_THRESHOLD) {
         const numExperts = weights.length;
         const wsSize = getNativeAddon().groupedMoeWorkspaceSize(count, N, K, numExperts);
         using wsTensor = this.workspace.allocRaw(wsSize);
@@ -586,7 +595,7 @@ export class GlmTensor extends Tensor {
       } else {
         getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K);
       }
-    } else if (count > topK) {
+    } else if (count > MUL_MAT_ID_GROUPED_THRESHOLD) {
       const numExperts = weights.length;
       const wsSize = getNativeAddon().groupedMoeWorkspaceSize(count, N, K, numExperts);
       using wsTensor = this.workspace.allocRaw(wsSize);
