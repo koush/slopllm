@@ -658,8 +658,14 @@ nvfp4_dequantize_gemm_smem_kernel(
 // nvfp4_mul_mat_id kernels (must be outside extern "C" due to templates)
 // No shared memory — each warp reads input directly from global memory (L1-cached).
 // This eliminates __syncthreads() barriers present in the tiled version.
+//
+// Template parameter RowsPerWarp: 1 for normal K (> 512), 2 for small K (<= 512).
+// When RowsPerWarp=2, lanes 0-15 compute row0 and lanes 16-31 compute row1,
+// doubling throughput when num_k_groups <= 32 (half the warp would otherwise
+// sit idle).  Each block covers GEMV_ROWS_PER_BLOCK * RowsPerWarp rows.
 // ---------------------------------------------------------------------------
 
+template <int RowsPerWarp>
 __global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
 nvfp4_mul_mat_id_kernel(
     __nv_bfloat16* __restrict__ output,
@@ -670,14 +676,20 @@ nvfp4_mul_mat_id_kernel(
     const int* __restrict__ expert_ids,
     int top_k, int count, int N, int K) {
 
-    int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+    constexpr int LANES_PER_ROW = GEMV_WARP_SIZE / RowsPerWarp;
+    constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * RowsPerWarp;
+
+    int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     int entry = blockIdx.x / num_row_groups;
     int row_group = blockIdx.x % num_row_groups;
     int warp_id = threadIdx.x / GEMV_WARP_SIZE;
-    int row = row_group * GEMV_ROWS_PER_BLOCK + warp_id;
     int lane = threadIdx.x % GEMV_WARP_SIZE;
 
     if (entry >= count) return;
+
+    int row_in_warp = lane / LANES_PER_ROW;
+    int inner_lane = lane % LANES_PER_ROW;
+    int row = row_group * ROWS_PER_BLOCK + warp_id * RowsPerWarp + row_in_warp;
 
     int bid = entry / top_k;
     int eid = expert_ids[entry];
@@ -692,7 +704,7 @@ nvfp4_mul_mat_id_kernel(
     float sum = 0.0f;
 
     if (row_valid) {
-        for (int g = lane; g < num_k_groups; g += GEMV_WARP_SIZE) {
+        for (int g = inner_lane; g < num_k_groups; g += LANES_PER_ROW) {
             float scale = static_cast<float>(scale_row[g]) * scale_2_val;
             int k_start = g * NVFP4_QUANT_GROUP;
 
@@ -721,12 +733,24 @@ nvfp4_mul_mat_id_kernel(
         }
     }
 
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-    }
-    if (row_valid && lane == 0) {
-        output[(size_t)entry * N + row] = __float2bfloat16(sum);
+    if constexpr (RowsPerWarp == 1) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        }
+        if (row_valid && lane == 0) {
+            output[(size_t)entry * N + row] = __float2bfloat16(sum);
+        }
+    } else {
+        // Half-warp reduction: XOR strides 1,2,4,8 within each 16-lane half.
+        // Skip stride 16 which would cross the row boundary.
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 1);
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 2);
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 4);
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 8);
+        if (row_valid && inner_lane == 0) {
+            output[(size_t)entry * N + row] = __float2bfloat16(sum);
+        }
     }
 }
 
@@ -811,7 +835,166 @@ nvfp4_mul_mat_id_splitk_kernel(
     }
 }
 
-} // namespace
+}
+
+// ---------------------------------------------------------------------------
+// mul_mat_id: Indexed matrix-vector multiplication for MoE expert dispatch.
+//
+// For each entry i in [0, count), computes:
+//   output[i, :] = input[i / top_k, :] @ weights[expert_ids[i], :, :].T
+//
+// input:       [batch, K]          BF16
+// weight_ptrs: [num_experts]       array of device pointers, each [N, K] BF16
+// expert_ids:  [count]             int32
+// ---------------------------------------------------------------------------
+
+template <int RowsPerWarp>
+__global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
+bf16_mul_mat_id_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* const* __restrict__ weight_ptrs,
+    const int* __restrict__ expert_ids,
+    int top_k, int count, int N, int K) {
+
+    if (N == 0 || count == 0 || K == 0) return;
+
+    constexpr int LANES_PER_ROW = GEMV_WARP_SIZE / RowsPerWarp;
+    constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * RowsPerWarp;
+
+    int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    int entry = blockIdx.x / num_row_groups;
+    int row_group = blockIdx.x % num_row_groups;
+    int warp_id = threadIdx.x / GEMV_WARP_SIZE;
+    int lane = threadIdx.x % GEMV_WARP_SIZE;
+
+    if (entry >= count) return;
+
+    int row_in_warp = lane / LANES_PER_ROW;
+    int inner_lane = lane % LANES_PER_ROW;
+    int row = row_group * ROWS_PER_BLOCK + warp_id * RowsPerWarp + row_in_warp;
+
+    int bid = entry / top_k;
+    int eid = expert_ids[entry];
+    const __nv_bfloat16* input_row  = input  + (size_t)bid * K;
+    const __nv_bfloat16* weight_mat = weight_ptrs[eid];
+    const __nv_bfloat16* weight_row = weight_mat + (size_t)row * K;
+
+    int K_vec = K / GEMV_K_VEC;
+    int K_tail_start = K_vec * GEMV_K_VEC;
+
+    float sum = 0.0f;
+    bool row_valid = row < N;
+
+    if (row_valid) {
+        const uint4* input_v4  = reinterpret_cast<const uint4*>(input_row);
+        const uint4* weight_v4 = reinterpret_cast<const uint4*>(weight_row);
+
+        for (int ki = inner_lane; ki < K_vec; ki += LANES_PER_ROW) {
+            uint4 wv = weight_v4[ki];
+            uint4 xv = input_v4[ki];
+            __nv_bfloat16 wb[8], xb[8];
+            uint4_to_bf16x8(wv, wb);
+            uint4_to_bf16x8(xv, xb);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                sum += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+            }
+        }
+
+        for (int k = K_tail_start + inner_lane; k < K; k += LANES_PER_ROW) {
+            sum += __bfloat162float(weight_row[k]) * __bfloat162float(input_row[k]);
+        }
+    }
+
+    if constexpr (RowsPerWarp == 1) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        }
+        if (row_valid && lane == 0) {
+            output[(size_t)entry * N + row] = __float2bfloat16(sum);
+        }
+    } else {
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 1);
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 2);
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 4);
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 8);
+        if (row_valid && inner_lane == 0) {
+            output[(size_t)entry * N + row] = __float2bfloat16(sum);
+        }
+    }
+}
+
+// Split-K variant for small N
+__global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS, 2)
+bf16_mul_mat_id_splitk_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* const* __restrict__ weight_ptrs,
+    const int* __restrict__ expert_ids,
+    int top_k, int count, int N, int K) {
+
+    if (N == 0 || count == 0 || K == 0) return;
+
+    int entry = blockIdx.x / N;
+    int row = blockIdx.x % N;
+
+    constexpr int TOTAL_WARPS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS;
+    int tid = threadIdx.x;
+    int warp_id = tid / GEMV_WARP_SIZE;
+    int lane = tid % GEMV_WARP_SIZE;
+
+    int bid = entry / top_k;
+    int eid = expert_ids[entry];
+    const __nv_bfloat16* input_row  = input  + (size_t)bid * K;
+    const __nv_bfloat16* weight_mat = weight_ptrs[eid];
+    const __nv_bfloat16* weight_row = weight_mat + (size_t)row * K;
+
+    int K_vec = K / GEMV_K_VEC;
+    int K_tail_start = K_vec * GEMV_K_VEC;
+
+    const uint4* input_v4  = reinterpret_cast<const uint4*>(input_row);
+    const uint4* weight_v4 = reinterpret_cast<const uint4*>(weight_row);
+
+    float sum = 0.0f;
+    int g_thread = warp_id * GEMV_WARP_SIZE + lane;
+    int g_threads = TOTAL_WARPS * GEMV_WARP_SIZE;
+    for (int ki = g_thread; ki < K_vec; ki += g_threads) {
+        uint4 wv = weight_v4[ki];
+        uint4 xv = input_v4[ki];
+        __nv_bfloat16 wb[8], xb[8];
+        uint4_to_bf16x8(wv, wb);
+        uint4_to_bf16x8(xv, xb);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            sum += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+        }
+    }
+    for (int k = K_tail_start + g_thread; k < K; k += g_threads) {
+        sum += __bfloat162float(weight_row[k]) * __bfloat162float(input_row[k]);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+
+    __shared__ float warp_sums[TOTAL_WARPS];
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float s = (lane < TOTAL_WARPS) ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = TOTAL_WARPS / 2; offset > 0; offset >>= 1) {
+            s += __shfl_down_sync(0xFFFFFFFF, s, offset);
+        }
+        if (lane == 0) {
+            output[(size_t)entry * N + row] = __float2bfloat16(s);
+        }
+    }
+}
 
 extern "C" {
 
@@ -943,6 +1126,7 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
     if (count == 0 || N == 0 || K == 0) return;
 
     constexpr int SPLITK_THRESHOLD = 1024;
+    constexpr int SMALLK_THRESHOLD = GEMV_WARP_SIZE * NVFP4_QUANT_GROUP; // K <= 512: num_k_groups <= 32
     if (N < SPLITK_THRESHOLD) {
         int grid_size = count * N;
         constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS;
@@ -954,10 +1138,24 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
             (const float* const*)scale2_ptrs,
             expert_ids, top_k,
             count, N, K);
+    } else if (K <= SMALLK_THRESHOLD) {
+        // Each warp computes 2 rows (lanes 0-15 for row0, 16-31 for row1),
+        // doubling throughput when num_k_groups <= 32 (K <= 512).
+        constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * 2;
+        int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+        int grid_size = count * num_row_groups;
+        nvfp4_mul_mat_id_kernel<2><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)output,
+            (const __nv_bfloat16*)input,
+            (const uint8_t* const*)weight_ptrs,
+            (const __nv_fp8_e4m3* const*)scale_ptrs,
+            (const float* const*)scale2_ptrs,
+            expert_ids, top_k,
+            count, N, K);
     } else {
         int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
         int grid_size = count * num_row_groups;
-        nvfp4_mul_mat_id_kernel<<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        nvfp4_mul_mat_id_kernel<1><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)output,
             (const __nv_bfloat16*)input,
             (const uint8_t* const*)weight_ptrs,
@@ -1023,161 +1221,15 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-// ---------------------------------------------------------------------------
-// mul_mat_id: Indexed matrix-vector multiplication for MoE expert dispatch.
-//
-// For each entry i in [0, count), computes:
-//   output[i, :] = input[i / top_k, :] @ weights[expert_ids[i], :, :].T
-//
-// input:       [batch, K]          BF16
-// weight_ptrs: [num_experts]       array of device pointers, each [N, K] BF16
-// expert_ids:  [count]             int32
-// top_k:       number of experts per token (batch_id = entry / top_k)
-// output:      [count, N]          BF16
-// count:       total (token, expert) pairs
-// N:           output dimension (weight rows)
-// K:           input dimension (weight cols)
-// ---------------------------------------------------------------------------
-
-__global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
-bf16_mul_mat_id_kernel(
-    __nv_bfloat16* __restrict__ output,
-    const __nv_bfloat16* __restrict__ input,
-    const __nv_bfloat16* const* __restrict__ weight_ptrs,
-    const int* __restrict__ expert_ids,
-    int top_k, int count, int N, int K) {
-
-    if (N == 0 || count == 0 || K == 0) return;
-
-    int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
-    int entry = blockIdx.x / num_row_groups;
-    int row_group = blockIdx.x % num_row_groups;
-    int warp_id = threadIdx.x / GEMV_WARP_SIZE;
-    int row = row_group * GEMV_ROWS_PER_BLOCK + warp_id;
-    int lane = threadIdx.x % GEMV_WARP_SIZE;
-
-    if (entry >= count) return;
-
-    int bid = entry / top_k;
-    int eid = expert_ids[entry];
-    const __nv_bfloat16* input_row  = input  + (size_t)bid * K;
-    const __nv_bfloat16* weight_mat = weight_ptrs[eid];
-    const __nv_bfloat16* weight_row = weight_mat + (size_t)row * K;
-
-    int K_vec = K / GEMV_K_VEC;
-    int K_tail_start = K_vec * GEMV_K_VEC;
-
-    float sum = 0.0f;
-    bool row_valid = row < N;
-
-    if (row_valid) {
-        const uint4* input_v4  = reinterpret_cast<const uint4*>(input_row);
-        const uint4* weight_v4 = reinterpret_cast<const uint4*>(weight_row);
-
-        for (int ki = lane; ki < K_vec; ki += GEMV_WARP_SIZE) {
-            uint4 wv = weight_v4[ki];
-            uint4 xv = input_v4[ki];
-            __nv_bfloat16 wb[8], xb[8];
-            uint4_to_bf16x8(wv, wb);
-            uint4_to_bf16x8(xv, xb);
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                sum += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
-            }
-        }
-
-        for (int k = K_tail_start + lane; k < K; k += GEMV_WARP_SIZE) {
-            sum += __bfloat162float(weight_row[k]) * __bfloat162float(input_row[k]);
-        }
-    }
-
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-    }
-    if (row_valid && lane == 0) {
-        output[(size_t)entry * N + row] = __float2bfloat16(sum);
-    }
-}
-
-// Split-K variant for small N
-__global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS, 2)
-bf16_mul_mat_id_splitk_kernel(
-    __nv_bfloat16* __restrict__ output,
-    const __nv_bfloat16* __restrict__ input,
-    const __nv_bfloat16* const* __restrict__ weight_ptrs,
-    const int* __restrict__ expert_ids,
-    int top_k, int count, int N, int K) {
-
-    if (N == 0 || count == 0 || K == 0) return;
-
-    int entry = blockIdx.x / N;
-    int row = blockIdx.x % N;
-
-    constexpr int TOTAL_WARPS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS;
-    int tid = threadIdx.x;
-    int warp_id = tid / GEMV_WARP_SIZE;
-    int lane = tid % GEMV_WARP_SIZE;
-
-    int bid = entry / top_k;
-    int eid = expert_ids[entry];
-    const __nv_bfloat16* input_row  = input  + (size_t)bid * K;
-    const __nv_bfloat16* weight_mat = weight_ptrs[eid];
-    const __nv_bfloat16* weight_row = weight_mat + (size_t)row * K;
-
-    int K_vec = K / GEMV_K_VEC;
-    int K_tail_start = K_vec * GEMV_K_VEC;
-
-    const uint4* input_v4  = reinterpret_cast<const uint4*>(input_row);
-    const uint4* weight_v4 = reinterpret_cast<const uint4*>(weight_row);
-
-    float sum = 0.0f;
-    int g_thread = warp_id * GEMV_WARP_SIZE + lane;
-    int g_threads = TOTAL_WARPS * GEMV_WARP_SIZE;
-    for (int ki = g_thread; ki < K_vec; ki += g_threads) {
-        uint4 wv = weight_v4[ki];
-        uint4 xv = input_v4[ki];
-        __nv_bfloat16 wb[8], xb[8];
-        uint4_to_bf16x8(wv, wb);
-        uint4_to_bf16x8(xv, xb);
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            sum += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
-        }
-    }
-    for (int k = K_tail_start + g_thread; k < K; k += g_threads) {
-        sum += __bfloat162float(weight_row[k]) * __bfloat162float(input_row[k]);
-    }
-
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-    }
-
-    __shared__ float warp_sums[TOTAL_WARPS];
-    if (lane == 0) warp_sums[warp_id] = sum;
-    __syncthreads();
-
-    if (warp_id == 0) {
-        float s = (lane < TOTAL_WARPS) ? warp_sums[lane] : 0.0f;
-        #pragma unroll
-        for (int offset = TOTAL_WARPS / 2; offset > 0; offset >>= 1) {
-            s += __shfl_down_sync(0xFFFFFFFF, s, offset);
-        }
-        if (lane == 0) {
-            output[(size_t)entry * N + row] = __float2bfloat16(s);
-        }
-    }
-}
-
 void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
-                     const void* const* weight_ptrs,
-                     const int* expert_ids, int top_k,
-                     int count, int N, int K) {
+                      const void* const* weight_ptrs,
+                      const int* expert_ids, int top_k,
+                      int count, int N, int K) {
     cudaSetDevice(ctx->device_id);
     if (count == 0 || N == 0 || K == 0) return;
 
     constexpr int SPLITK_THRESHOLD = 1024;
+    constexpr int SMALLK_THRESHOLD = GEMV_WARP_SIZE * GEMV_K_VEC; // K <= 256: K_vec <= 32
     if (N < SPLITK_THRESHOLD) {
         int grid_size = count * N;
         constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS;
@@ -1187,10 +1239,20 @@ void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
             (const __nv_bfloat16* const*)weight_ptrs,
             expert_ids, top_k,
             count, N, K);
+    } else if (K <= SMALLK_THRESHOLD) {
+        constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * 2;
+        int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+        int grid_size = count * num_row_groups;
+        bf16_mul_mat_id_kernel<2><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)output,
+            (const __nv_bfloat16*)input,
+            (const __nv_bfloat16* const*)weight_ptrs,
+            expert_ids, top_k,
+            count, N, K);
     } else {
         int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
         int grid_size = count * num_row_groups;
-        bf16_mul_mat_id_kernel<<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        bf16_mul_mat_id_kernel<1><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)output,
             (const __nv_bfloat16*)input,
             (const __nv_bfloat16* const*)weight_ptrs,

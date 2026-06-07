@@ -210,6 +210,7 @@ class TestNVFP4MulMatId:
         (4, 2, 3, 1024, 256),
         (8, 4, 4, 2048, 1024),
         (8, 1, 1, 256, 512),
+        (4, 2, 2, 6144, 256),
     ])
     def test_nvfp4_mul_mat_id_vs_per_expert(self, glm, device, num_experts, bs, topk, N, K):
         torch.manual_seed(42)
