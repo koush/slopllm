@@ -190,6 +190,14 @@ void glm_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
                               int count, int N, int K,
                               int num_experts, void* workspace);
 
+void glm_nvfp4_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
+                                     const void* const* weight_ptrs,
+                                     const void* const* scale_ptrs,
+                                     const void* const* scale2_ptrs,
+                                     const int* expert_ids, int top_k,
+                                     int count, int N, int K,
+                                     int num_experts, void* workspace);
+
 // Rotate input IDs for MTP prefill: shifts each sequence left by 1,
 // appends new_token at the last position.
 // output_ids/input_ids: [totalTokens] I32

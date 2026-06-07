@@ -1,6 +1,7 @@
 #include "glm_ops.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 
@@ -218,6 +219,114 @@ __global__ void unscatter_output_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Grouped NVFP4 GEMV kernel
+//
+// Same structure as grouped_bf16_gemv_kernel but dequantizes FP4 E2M1 weights
+// with double quantization (FP8 block scale + F32 global scale) on the fly.
+// Weight layout matches nvfp4_mul_mat_id_kernel:
+//   weight_ptrs[e]: [N, K/2] uint8 (two FP4 values per byte)
+//   scale_ptrs[e]:  [N, K/16] FP8 E4M3 (one per block of 16 elements)
+//   scale2_ptrs[e]: scalar F32 (global scale for the expert)
+// ---------------------------------------------------------------------------
+
+constexpr int NVFP4_QUANT_GROUP = 16;
+
+__device__ __forceinline__ float fp4_e2m1_decode_grouped(uint8_t nibble) {
+    uint32_t n = (uint32_t)nibble & 0x7u;
+    uint32_t fp = (n < 2u) ? (n * 0x3F000000u)
+                            : (((126u + (n >> 1u)) << 23u) | ((n & 1u) << 22u));
+    fp |= (uint32_t)(nibble >> 3u) << 31u;
+    return __uint_as_float(fp);
+}
+
+__global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
+grouped_nvfp4_gemv_kernel(
+    __nv_bfloat16* __restrict__ sorted_output,
+    const __nv_bfloat16* __restrict__ sorted_input,
+    int K,
+    const uint8_t* const* __restrict__ weight_ptrs,
+    const __nv_fp8_e4m3* const* __restrict__ scale_ptrs,
+    const float* const* __restrict__ scale2_ptrs,
+    const int* __restrict__ expert_offsets,
+    int num_experts,
+    int N,
+    int max_M)
+{
+    int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+    int expert_id = blockIdx.x / num_row_groups;
+    int row_group = blockIdx.x % num_row_groups;
+
+    if (expert_id >= num_experts) return;
+
+    int M_e = expert_offsets[expert_id + 1] - expert_offsets[expert_id];
+    if (M_e == 0) return;
+
+    int warp_id = threadIdx.x / GEMV_WARP_SIZE;
+    int lane = threadIdx.x % GEMV_WARP_SIZE;
+    int row = row_group * GEMV_ROWS_PER_BLOCK + warp_id;
+    bool row_valid = row < N;
+
+    const uint8_t* weight_row = weight_ptrs[expert_id] + (size_t)row * (K / 2);
+    const __nv_fp8_e4m3* scale_row = scale_ptrs[expert_id] + (size_t)row * (K / NVFP4_QUANT_GROUP);
+    float scale_2_val = *scale2_ptrs[expert_id];
+
+    const __nv_bfloat16* expert_input = sorted_input + (size_t)expert_offsets[expert_id] * K;
+    __nv_bfloat16* expert_output = sorted_output + (size_t)expert_offsets[expert_id] * N;
+
+    int num_k_groups = K / NVFP4_QUANT_GROUP;
+
+    float sums[8];
+    #pragma unroll
+    for (int m = 0; m < 8; m++) sums[m] = 0.0f;
+
+    if (row_valid) {
+        for (int g = lane; g < num_k_groups; g += GEMV_WARP_SIZE) {
+            float scale = static_cast<float>(scale_row[g]) * scale_2_val;
+            int k_start = g * NVFP4_QUANT_GROUP;
+
+            uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
+            uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
+
+            for (int m = 0; m < M_e && m < 8; m++) {
+                const uint4* input_v4 = reinterpret_cast<const uint4*>(expert_input + (size_t)m * K + k_start);
+                uint4 xv0 = input_v4[0];
+                uint4 xv1 = input_v4[1];
+                __nv_bfloat16 xb0[8], xb1[8];
+                uint4_to_bf16x8(xv0, xb0);
+                uint4_to_bf16x8(xv1, xb1);
+
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
+                    sums[m] += fp4_e2m1_decode_grouped(packed & 0x0Fu) * scale * __bfloat162float(xb0[j * 2])
+                             + fp4_e2m1_decode_grouped(packed >> 4u) * scale * __bfloat162float(xb0[j * 2 + 1]);
+                }
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
+                    sums[m] += fp4_e2m1_decode_grouped(packed & 0x0Fu) * scale * __bfloat162float(xb1[j * 2])
+                             + fp4_e2m1_decode_grouped(packed >> 4u) * scale * __bfloat162float(xb1[j * 2 + 1]);
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            #pragma unroll
+            for (int m = 0; m < 8; m++) {
+                sums[m] += __shfl_down_sync(0xFFFFFFFF, sums[m], offset);
+            }
+        }
+
+        if (lane == 0) {
+            for (int m = 0; m < M_e && m < 8; m++) {
+                expert_output[(size_t)m * N + row] = __float2bfloat16(sums[m]);
+            }
+        }
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -304,6 +413,70 @@ void glm_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
         expert_offsets, num_experts, N, 8);
 
     // Step 7: Unscatter output
+    grid_size = (count + block_size - 1) / block_size;
+    unscatter_output_kernel<<<grid_size, block_size, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(output),
+        sorted_output, N, sorted_to_original, count);
+}
+
+void glm_nvfp4_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
+                                     const void* const* weight_ptrs,
+                                     const void* const* scale_ptrs,
+                                     const void* const* scale2_ptrs,
+                                     const int* expert_ids, int top_k,
+                                     int count, int N, int K,
+                                     int num_experts, void* workspace) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    if (count == 0 || N == 0 || K == 0) return;
+
+    uint8_t* ws = static_cast<uint8_t*>(workspace);
+    size_t offset = 0;
+
+    __nv_bfloat16* sorted_input = reinterpret_cast<__nv_bfloat16*>(ws + offset);
+    offset += (size_t)count * K * 2;
+
+    __nv_bfloat16* sorted_output = reinterpret_cast<__nv_bfloat16*>(ws + offset);
+    offset += (size_t)count * N * 2;
+
+    int* expert_counts = reinterpret_cast<int*>(ws + offset);
+    offset += (size_t)num_experts * 4;
+
+    int* expert_offsets = reinterpret_cast<int*>(ws + offset);
+    offset += (size_t)(num_experts + 1) * 4;
+
+    int* sorted_to_original = reinterpret_cast<int*>(ws + offset);
+
+    cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
+
+    int block_size = 256;
+    int grid_size = (count + block_size - 1) / block_size;
+    histogram_kernel<<<grid_size, block_size, 0, stream>>>(
+        expert_ids, count, expert_counts, num_experts);
+
+    prefix_sum_kernel<<<1, 1, 0, stream>>>(
+        expert_counts, expert_offsets, num_experts);
+
+    grid_size = (count + block_size - 1) / block_size;
+    scatter_input_simple_kernel<<<grid_size, block_size, 0, stream>>>(
+        expert_ids, count, top_k,
+        reinterpret_cast<const __nv_bfloat16*>(input), K,
+        sorted_input, sorted_to_original, expert_offsets);
+
+    grid_size = (num_experts + block_size - 1) / block_size;
+    restore_offsets_kernel<<<grid_size, block_size, 0, stream>>>(
+        expert_offsets, expert_counts, num_experts);
+
+    int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+    int total_ctas = num_experts * num_row_groups;
+
+    grouped_nvfp4_gemv_kernel<<<total_ctas, GEMV_BLOCK_SIZE, 0, stream>>>(
+        sorted_output, sorted_input, K,
+        reinterpret_cast<const uint8_t* const*>(weight_ptrs),
+        reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs),
+        reinterpret_cast<const float* const*>(scale2_ptrs),
+        expert_offsets, num_experts, N, 8);
+
     grid_size = (count + block_size - 1) / block_size;
     unscatter_output_kernel<<<grid_size, block_size, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(output),

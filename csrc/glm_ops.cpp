@@ -929,6 +929,37 @@ static Napi::Value MulMatIdGrouped(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value Nvfp4MulMatIdGrouped(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t wptrs_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t sptrs_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t s2ptrs_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t eids_ptr = info[6].As<Napi::Number>().Int64Value();
+    int top_k = info[7].As<Napi::Number>().Int32Value();
+    int count = info[8].As<Napi::Number>().Int32Value();
+    int N = info[9].As<Napi::Number>().Int32Value();
+    int K = info[10].As<Napi::Number>().Int32Value();
+    int num_experts = info[11].As<Napi::Number>().Int32Value();
+    uintptr_t ws_ptr = info[12].As<Napi::Number>().Int64Value();
+    glm_nvfp4_mul_mat_id_grouped(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                     reinterpret_cast<void*>(out_ptr),
+                                     reinterpret_cast<const void*>(in_ptr),
+                                     reinterpret_cast<const void* const*>(wptrs_ptr),
+                                     reinterpret_cast<const void* const*>(sptrs_ptr),
+                                     reinterpret_cast<const void* const*>(s2ptrs_ptr),
+                                     reinterpret_cast<const int*>(eids_ptr),
+                                     top_k, count, N, K, num_experts,
+                                     reinterpret_cast<void*>(ws_ptr));
+    return env.Undefined();
+}
+
 static Napi::Value IndexSelect(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -2790,6 +2821,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "scatterAddRows"), Napi::Function::New(env, ScatterAddRows));
     exports.Set(Napi::String::New(env, "groupedMoeWorkspaceSize"), Napi::Function::New(env, GroupedMoeWorkspaceSize));
     exports.Set(Napi::String::New(env, "mulMatIdGrouped"), Napi::Function::New(env, MulMatIdGrouped));
+    exports.Set(Napi::String::New(env, "nvfp4MulMatIdGrouped"), Napi::Function::New(env, Nvfp4MulMatIdGrouped));
     exports.Set(Napi::String::New(env, "indexSelect"), Napi::Function::New(env, IndexSelect));
     exports.Set(Napi::String::New(env, "arange"), Napi::Function::New(env, Arange));
     exports.Set(Napi::String::New(env, "max"), Napi::Function::New(env, Max));

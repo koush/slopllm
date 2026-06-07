@@ -801,6 +801,17 @@ class GlmOps:
             ctypes.c_void_p,
         ]
 
+        self.lib.glm_nvfp4_mul_mat_id_grouped.restype = None
+        self.lib.glm_nvfp4_mul_mat_id_grouped.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
             self.lib.glm_free(self.ctx)
@@ -1637,6 +1648,19 @@ class GlmOps:
             ctypes.c_void_p(scale2_ptrs),
             self._ptr(expert_ids),
             top_k, count, N, K
+        )
+
+    def nvfp4_mul_mat_id_grouped(self, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace):
+        self.lib.glm_nvfp4_mul_mat_id_grouped(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input),
+            ctypes.c_void_p(weight_ptrs),
+            ctypes.c_void_p(scale_ptrs),
+            ctypes.c_void_p(scale2_ptrs),
+            self._ptr(expert_ids),
+            top_k, count, N, K, num_experts,
+            ctypes.c_void_p(workspace)
         )
 
     def scatter_add_rows(self, out, input, scales, top_k, dim, num_rows, workspace):

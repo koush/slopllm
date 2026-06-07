@@ -509,7 +509,24 @@ constexpr int NVFP4_GEMM_M_TILE = 16;
 constexpr int NVFP4_GEMM_N_TILE = 32;
 constexpr int NVFP4_GEMM_K_TILE = 128;
 constexpr int NVFP4_GEMM_BLOCK_DIM = NVFP4_GEMM_M_TILE * NVFP4_GEMM_N_TILE;
+// Pad each smem_weight row so its stride in 4-byte words (65) is coprime with
+// the 32 shared-memory banks — every lane of a warp (which spans all 32 `n`
+// values for a fixed `k`) then lands in a distinct bank, avoiding conflicts.
+constexpr int NVFP4_GEMM_SMEM_PAD = 2;
 
+// ---------------------------------------------------------------------------
+// NVFP4 dequantize+GEMM (M > 1): the FP4 weight nibble and its scale depend
+// only on (n, k), not on the output row m. The naive approach — every thread
+// decoding its own (m, n) element — redoes the same decode + scale multiply
+// once per row in the M tile (16x redundant ALU work, plus 16x redundant
+// `weight_scale` loads). Instead we cooperatively decode+scale each weight
+// tile into shared memory exactly once per K-tile (using all 512 threads of
+// the block), then every row in the M tile just does a plain BF16x2 FMA
+// against the pre-decoded values. This keeps the same general tiling (works
+// for any M, amortizing the FP4 weight read across the whole M tile) while
+// removing the redundant decode work — beneficial for both small-M (e.g.
+// speculative-decode verification) and large-M (prefill) shapes.
+// ---------------------------------------------------------------------------
 __global__ void __launch_bounds__(NVFP4_GEMM_BLOCK_DIM, 4)
 nvfp4_dequantize_gemm_smem_kernel(
     __nv_bfloat16* __restrict__ output,
@@ -527,7 +544,8 @@ nvfp4_dequantize_gemm_smem_kernel(
     int n = n_start + local_n;
 
     __shared__ __nv_bfloat16 smem_input[NVFP4_GEMM_M_TILE][NVFP4_GEMM_K_TILE];
-    __shared__ uint8_t smem_weight[NVFP4_GEMM_N_TILE][NVFP4_GEMM_K_TILE / 2];
+    // Pre-decoded, pre-scaled BF16 weight tile (shared across all M_TILE rows).
+    __shared__ __nv_bfloat16 smem_weight[NVFP4_GEMM_N_TILE][NVFP4_GEMM_K_TILE + NVFP4_GEMM_SMEM_PAD];
 
     float sum = 0.0f;
     int num_k_tiles = (K + NVFP4_GEMM_K_TILE - 1) / NVFP4_GEMM_K_TILE;
@@ -546,32 +564,29 @@ nvfp4_dequantize_gemm_smem_kernel(
             smem_input[lm][lk] = input[(m_start + lm) * K + k_start + lk];
         }
 
-        for (int i = threadIdx.x; i < valid_n * (k_tile / 2); i += NVFP4_GEMM_BLOCK_DIM) {
-            int ln = i / (k_tile / 2);
-            int lk = i % (k_tile / 2);
-            smem_weight[ln][lk] = weight[(n_start + ln) * (K / 2) + k_start / 2 + lk];
+        // K_TILE is a multiple of NVFP4_QUANT_GROUP (16) and weights are packed
+        // 2-per-byte, so k_tile is always even — k_tile/2 byte-pairs to decode.
+        int k_tile_pairs = k_tile / 2;
+        for (int i = threadIdx.x; i < valid_n * k_tile_pairs; i += NVFP4_GEMM_BLOCK_DIM) {
+            int ln = i / k_tile_pairs;
+            int lk_pair = i % k_tile_pairs;
+            int k = lk_pair * 2;
+            int kg = kb * (NVFP4_GEMM_K_TILE / NVFP4_QUANT_GROUP) + k / NVFP4_QUANT_GROUP;
+            float scale = static_cast<float>(weight_scale[(n_start + ln) * num_k_groups + kg]) * scale_2_val;
+            uint8_t packed = weight[(n_start + ln) * (K / 2) + k_start / 2 + lk_pair];
+            smem_weight[ln][k]     = __float2bfloat16(fp4_e2m1_decode(packed & 0x0Fu) * scale);
+            smem_weight[ln][k + 1] = __float2bfloat16(fp4_e2m1_decode(packed >> 4u) * scale);
         }
 
         __syncthreads();
 
         if (m < M && n < N) {
-            constexpr int GROUPS_PER_K_TILE = NVFP4_GEMM_K_TILE / NVFP4_QUANT_GROUP;
-            #pragma unroll
-            for (int g = 0; g < GROUPS_PER_K_TILE; g++) {
-                int kg = kb * GROUPS_PER_K_TILE + g;
-                float scale = static_cast<float>(weight_scale[n * num_k_groups + kg]) * scale_2_val;
-                int g_start = g * NVFP4_QUANT_GROUP;
-                #pragma unroll
-                for (int k = g_start; k < g_start + NVFP4_QUANT_GROUP; k += 2) {
-                    if (k < k_tile) {
-                        float x_val = __bfloat162float(smem_input[local_m][k]);
-                        uint8_t packed = smem_weight[local_n][k / 2];
-                        float w0 = fp4_e2m1_decode(packed & 0x0Fu) * scale;
-                        float w1 = fp4_e2m1_decode(packed >> 4u) * scale;
-                        float x_val_next = __bfloat162float(smem_input[local_m][k + 1]);
-                        sum += w0 * x_val + w1 * x_val_next;
-                    }
-                }
+            #pragma unroll 4
+            for (int k = 0; k < k_tile; k += 2) {
+                __nv_bfloat162 x2 = *reinterpret_cast<__nv_bfloat162*>(&smem_input[local_m][k]);
+                __nv_bfloat162 w2 = *reinterpret_cast<__nv_bfloat162*>(&smem_weight[local_n][k]);
+                sum += __bfloat162float(x2.x) * __bfloat162float(w2.x)
+                     + __bfloat162float(x2.y) * __bfloat162float(w2.y);
             }
         }
 

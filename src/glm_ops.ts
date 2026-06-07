@@ -147,6 +147,7 @@ interface NativeAddon {
   mulMatIdGrouped(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   groupedMoeWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
+  nvfp4MulMatIdGrouped(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number): void;
   rotateInputIds(ctx: number, outputIds: number, inputIds: number, qoIndptr: number, newTokens: number, batchSize: number): void;
 }
@@ -352,15 +353,15 @@ export class GlmTensor extends Tensor {
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
-    if (strided) {
-      return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
-    } else {
-      return this.mmapLoadAsync(mmapPtr, offset, nbytes);
-    }
+    // if (strided) {
+    //   return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
+    // } else {
+    //   return this.mmapLoadAsync(mmapPtr, offset, nbytes);
+    // }
   }
 
   async mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
-    return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
+    // return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
   }
 
   memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void> {
@@ -577,16 +578,18 @@ export class GlmTensor extends Tensor {
         scale2Ptrs = this.workspace.alloc([weights.length], "I64", scale2PtrName);
         scale2Ptrs.writePointers(scale2Tensors);
       }
-      getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K);
+      if (count > topK) {
+        const numExperts = weights.length;
+        const wsSize = getNativeAddon().groupedMoeWorkspaceSize(count, N, K, numExperts);
+        using wsTensor = this.workspace.allocRaw(wsSize);
+        getNativeAddon().nvfp4MulMatIdGrouped(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
+      } else {
+        getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K);
+      }
     } else if (count > topK) {
       const numExperts = weights.length;
-      const wsName = `__moe_grouped_ws.${name}`;
-      let wsTensor = this.workspace.tensors.get(wsName);
       const wsSize = getNativeAddon().groupedMoeWorkspaceSize(count, N, K, numExperts);
-      if (!wsTensor || wsTensor.allocSize < wsSize) {
-        if (wsTensor) wsTensor[Symbol.dispose]();
-        wsTensor = this.workspace.allocRaw(wsSize, wsName);
-      }
+      using wsTensor = this.workspace.allocRaw(wsSize);
       getNativeAddon().mulMatIdGrouped(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
     } else {
       getNativeAddon().mulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K);
