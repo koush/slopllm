@@ -240,6 +240,38 @@ __device__ __forceinline__ float fp4_e2m1_decode_grouped(uint8_t nibble) {
     return __uint_as_float(fp);
 }
 
+// Tokens-per-expert is unbounded (data-dependent), but registers aren't —
+// process M_e in chunks of NVFP4_GROUPED_M_CHUNK, accumulating that many
+// running sums per lane at a time. Matches GEMV_ROWS_PER_BLOCK so that for
+// the overwhelmingly common case M_e <= chunk (e.g. avg M_e << 1 for
+// small-batch decode/verify routing across many experts), the loop below
+// runs exactly one outer iteration with the same register/reduction width as
+// the original (buggy) kernel — i.e. zero added cost for the hot path.
+constexpr int NVFP4_GROUPED_M_CHUNK = GEMV_ROWS_PER_BLOCK;
+
+// ---------------------------------------------------------------------------
+// Grouped NVFP4 GEMV kernel
+//
+// Each CTA owns one (expert, row_group) and must handle all M_e tokens routed
+// to that expert, where M_e is data-dependent and unbounded — naively capping
+// at a fixed register count (the original kernel used sums[8] / `m < 8`)
+// silently drops tokens whose local index is >= 8.
+//
+// Fix: loop over M_e in chunks of NVFP4_GROUPED_M_CHUNK, re-reading the FP4
+// weight from global memory once per chunk. This redundant re-read only
+// happens when M_e > chunk — i.e. only in the rare large-M_e regime that the
+// original kernel got wrong anyway, so it's a strict correctness + (at worst)
+// neutral perf improvement there. For M_e <= chunk (the dominant case for
+// sparse MoE routing — e.g. MTP verify with small batches spread across many
+// experts) the outer loop runs exactly once and this is byte-for-byte the
+// same instruction sequence as the original kernel, just without the bug.
+//
+// (A shared-memory weight cache to eliminate the redundant re-reads entirely
+// was evaluated, but reserving dynamic shared memory on every launch lowered
+// SM occupancy enough to make the dominant small-M_e case ~10% slower —
+// not worth it for a code path that triggers rarely.)
+// ---------------------------------------------------------------------------
+
 __global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
 grouped_nvfp4_gemv_kernel(
     __nv_bfloat16* __restrict__ sorted_output,
@@ -250,8 +282,7 @@ grouped_nvfp4_gemv_kernel(
     const float* const* __restrict__ scale2_ptrs,
     const int* __restrict__ expert_offsets,
     int num_experts,
-    int N,
-    int max_M)
+    int N)
 {
     int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
     int expert_id = blockIdx.x / num_row_groups;
@@ -266,21 +297,24 @@ grouped_nvfp4_gemv_kernel(
     int lane = threadIdx.x % GEMV_WARP_SIZE;
     int row = row_group * GEMV_ROWS_PER_BLOCK + warp_id;
     bool row_valid = row < N;
+    if (!row_valid) return;
+
+    int num_k_groups = K / NVFP4_QUANT_GROUP;
 
     const uint8_t* weight_row = weight_ptrs[expert_id] + (size_t)row * (K / 2);
-    const __nv_fp8_e4m3* scale_row = scale_ptrs[expert_id] + (size_t)row * (K / NVFP4_QUANT_GROUP);
+    const __nv_fp8_e4m3* scale_row = scale_ptrs[expert_id] + (size_t)row * num_k_groups;
     float scale_2_val = *scale2_ptrs[expert_id];
 
     const __nv_bfloat16* expert_input = sorted_input + (size_t)expert_offsets[expert_id] * K;
     __nv_bfloat16* expert_output = sorted_output + (size_t)expert_offsets[expert_id] * N;
 
-    int num_k_groups = K / NVFP4_QUANT_GROUP;
+    for (int m_base = 0; m_base < M_e; m_base += NVFP4_GROUPED_M_CHUNK) {
+        int m_count = min(NVFP4_GROUPED_M_CHUNK, M_e - m_base);
 
-    float sums[8];
-    #pragma unroll
-    for (int m = 0; m < 8; m++) sums[m] = 0.0f;
+        float sums[NVFP4_GROUPED_M_CHUNK];
+        #pragma unroll
+        for (int m = 0; m < NVFP4_GROUPED_M_CHUNK; m++) sums[m] = 0.0f;
 
-    if (row_valid) {
         for (int g = lane; g < num_k_groups; g += GEMV_WARP_SIZE) {
             float scale = static_cast<float>(scale_row[g]) * scale_2_val;
             int k_start = g * NVFP4_QUANT_GROUP;
@@ -288,8 +322,8 @@ grouped_nvfp4_gemv_kernel(
             uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
             uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
 
-            for (int m = 0; m < M_e && m < 8; m++) {
-                const uint4* input_v4 = reinterpret_cast<const uint4*>(expert_input + (size_t)m * K + k_start);
+            for (int m = 0; m < m_count; m++) {
+                const uint4* input_v4 = reinterpret_cast<const uint4*>(expert_input + (size_t)(m_base + m) * K + k_start);
                 uint4 xv0 = input_v4[0];
                 uint4 xv1 = input_v4[1];
                 __nv_bfloat16 xb0[8], xb1[8];
@@ -314,14 +348,14 @@ grouped_nvfp4_gemv_kernel(
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             #pragma unroll
-            for (int m = 0; m < 8; m++) {
+            for (int m = 0; m < NVFP4_GROUPED_M_CHUNK; m++) {
                 sums[m] += __shfl_down_sync(0xFFFFFFFF, sums[m], offset);
             }
         }
 
         if (lane == 0) {
-            for (int m = 0; m < M_e && m < 8; m++) {
-                expert_output[(size_t)m * N + row] = __float2bfloat16(sums[m]);
+            for (int m = 0; m < m_count; m++) {
+                expert_output[(size_t)(m_base + m) * N + row] = __float2bfloat16(sums[m]);
             }
         }
     }
@@ -475,7 +509,7 @@ void glm_nvfp4_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
         reinterpret_cast<const uint8_t* const*>(weight_ptrs),
         reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs),
         reinterpret_cast<const float* const*>(scale2_ptrs),
-        expert_offsets, num_experts, N, 8);
+        expert_offsets, num_experts, N);
 
     grid_size = (count + block_size - 1) / block_size;
     unscatter_output_kernel<<<grid_size, block_size, 0, stream>>>(

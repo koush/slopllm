@@ -138,9 +138,9 @@ export class Glm51Model extends ChatModel {
       name.endsWith(".up_proj.weight_weight_scale") ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight_weight_scale")) ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".up_proj.weight_weight_scale")) ||
-      name.endsWith(".mlp.shared_experts.gate_proj.weight_weight_scale"))
-      // || name.endsWith(".mlp.shared_experts.up_proj.weight_weight_scale") ||
-      // name.endsWith(".eh_proj.weight") ||
+      name.endsWith(".mlp.shared_experts.gate_proj.weight_weight_scale") ||
+      name.endsWith(".mlp.shared_experts.up_proj.weight_weight_scale"))
+      // || name.endsWith(".eh_proj.weight") ||
       // name.endsWith(".eh_proj.weight_weight_scale"))
       return TensorParallelism.Column;
     if (name.endsWith(".self_attn.o_proj.weight") ||
@@ -334,11 +334,11 @@ export class Glm51Model extends ChatModel {
     const ws = normed.workspace;
 
     // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
-    using sharedGateBufStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS));
-    using sharedGateBuf = sharedGateBufStream.result;
     using sharedDownBufStream = this.glm.withStream(() => {
+      using sharedGateBufStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS));
       using sharedUpBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.up_proj.weight`)!, BS);
       sharedGateBufStream.streamWaitEvent();
+      using sharedGateBuf = sharedGateBufStream.result;
       using sharedSiluBuf = sharedGateBuf.siluAndMul(sharedUpBuf, moeIntermediate, BS);
       return sharedSiluBuf.linear(this.tensors.get(`${pfx}.mlp.shared_experts.down_proj.weight`)!, BS);
     });
@@ -377,8 +377,10 @@ export class Glm51Model extends ChatModel {
     using _topkValues = topkResult.values;
     using topkIndices = topkResult.indices;
 
-    using selectedScores = gateSigmoid.gather(topkIndices, topK, numExperts, BS);
-    using normalizedWeights = selectedScores.rowNormalize(cfg.routedScalingFactor, topK, BS, cfg.normTopkProb);
+    using normalizedWeightsStream = this.glm.withStream(() => {
+      using selectedScores = gateSigmoid.gather(topkIndices, topK, numExperts, BS);
+      return selectedScores.rowNormalize(cfg.routedScalingFactor, topK, BS, cfg.normTopkProb);
+    });
 
     const count = BS * topK;
     using topkIndicesFlat = topkIndices.reshape([count]);
@@ -388,13 +390,15 @@ export class Glm51Model extends ChatModel {
     const downWeights = this.getExpertWeights(pfx, "down_proj");
 
     using gateOutStream = this.glm.withStream(() => normed.mulMatId(gateWeights, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
-    using gateOut = gateOutStream.result;
     using upOut = normed.mulMatId(upWeights, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
     gateOutStream.streamWaitEvent();
+    using gateOut = gateOutStream.result;
     using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
 
     using downOut = siluOut.mulMatId(downWeights, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
 
+    normalizedWeightsStream.streamWaitEvent();
+    using normalizedWeights = normalizedWeightsStream.result;
     using normalizedWeightsFlat = normalizedWeights.reshape([count]);
     using routedOut = downOut.scatterAddRows(normalizedWeightsFlat, topK, hs, BS);
 

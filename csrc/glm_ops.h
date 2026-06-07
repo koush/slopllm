@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define GLM_MAX_STREAMS 8
+#define GLM_MAX_STREAMS 16
 
 struct GlmCtx {
     int device_id;

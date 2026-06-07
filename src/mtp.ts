@@ -442,7 +442,7 @@ export function mtpTreeDecode(
   // }
 
   // timings
-  console.log(`MTP tree decode: ${draft - start}ms, verification prefill ${verify - draft}ms, extend prefill ${performance.now() - verify}ms`);
+  // console.log(`MTP tree decode: ${draft - start}ms, verification prefill ${verify - draft}ms, extend prefill ${performance.now() - verify}ms`);
 
   return [...acceptedTokens, bestReplacement];
 }
