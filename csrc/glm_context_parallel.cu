@@ -263,14 +263,17 @@ void glm_context_parallel_merge_heads(
 } // extern "C"
 
 // ---------------------------------------------------------------------------
-// P2P Context Parallel Merge: fused P2P sync + online softmax merge.
+// P2P Context Parallel Merge: two-phase P2P sync + multi-block merge.
 //
-// Single-block kernel that:
+// Phase 1 (p2p_cp_sync_kernel): single-block kernel that:
 //   1. Scatters local partial_v_out + partial_lse to P2P data buffer
 //   2. Publishes data-ready flag and waits for all peers
-//   3. Reads all peers' data from peer-mapped P2P buffers
-//   4. Merges using state_t::merge across all shards
-//   5. Writes merged output
+//   3. Writes slot_offset for Phase 2
+//
+// Phase 2 (p2p_cp_merge_multi_kernel): multi-block kernel that:
+//   1. Reads all peers' data from peer-mapped P2P buffers
+//   2. Merges using state_t::merge across all shards (one block per head)
+//   3. Writes merged output
 //
 // P2P buffer layout per slot:
 //   [v_out: B*H*vHeadDim*2 bytes] [lse: B*H*4 bytes]
@@ -285,31 +288,24 @@ __device__ __forceinline__ void p2p_spin_until(volatile int* flag, int target) {
     while (*flag < target) { /* spin */ }
 }
 
-template <int VEC_SIZE, int BDX, int NUM_SHARDS>
 __global__ void __launch_bounds__(P2P_CP_BLOCK_SIZE, 1)
-p2p_cp_merge_kernel(
-    void* const* peer_data,            // [world_size] device ptrs (peer-mapped)
-    int* const* peer_flags,            // [world_size] device ptrs (peer-mapped)
+p2p_cp_sync_kernel(
+    void* const* peer_data,
+    int* const* peer_flags,
     unsigned long long* my_seq_counter,
+    int* slot_offset_out,
     int my_rank,
     int world_size,
     int max_slot_bytes,
     const __nv_bfloat16* __restrict__ my_v_out,
     const float* __restrict__ my_lse,
-    __nv_bfloat16* __restrict__ merged_v_out,
-    float* __restrict__ merged_lse,
     int batch_size,
     int num_heads,
-    int shard_n_heads,
-    int head_offset,
-    int input_n_heads,
-    int v_out_bytes)              // B * input_n_heads * vHeadDim * sizeof(bf16)
+    int v_out_bytes)
 {
-    constexpr int head_dim = VEC_SIZE * BDX;
     int tid = threadIdx.x;
     int bs = blockDim.x;
 
-    // ---- P2P sync phase ----
     __shared__ unsigned int s_seq;
     __shared__ int          s_slot_offset;
     __shared__ void*        s_peer_data[P2P_AR_MAX_WORLD];
@@ -372,42 +368,63 @@ p2p_cp_merge_kernel(
     __syncthreads();
     __threadfence_system();
 
-    // ---- Merge phase ----
-    __shared__ float s_lse[P2P_AR_MAX_WORLD];
-
-    int num_pairs = batch_size * shard_n_heads;
-
-    for (int bh = 0; bh < num_pairs; ++bh) {
-        int b = bh / shard_n_heads;
-        int local_h = bh % shard_n_heads;
-        int h = local_h + head_offset;
-
-        auto load_lse = [&](float* slse, int b_, int h_, int nh) {
-            if (tid < NUM_SHARDS) {
-                const float* peer_lse = reinterpret_cast<const float*>(
-                    static_cast<char*>(s_peer_data[tid]) + slot_offset + v_out_bytes);
-                slse[tid] = peer_lse[b_ * nh + h_];
-            }
-        };
-
-        auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int h_, int hd, int tid_) {
-            const __nv_bfloat16* peer_v = reinterpret_cast<const __nv_bfloat16*>(
-                static_cast<char*>(s_peer_data[s]) + slot_offset);
-            v.cast_load(peer_v + (b_ * input_n_heads + h_) * hd + tid_ * VEC_SIZE);
-        };
-
-        cp_merge_one_pair<VEC_SIZE, BDX, NUM_SHARDS>(
-            tid, b, h, num_heads, local_h, shard_n_heads, s_lse,
-            load_lse, load_v,
-            merged_v_out, merged_lse);
-
-        __syncthreads();
+    // Write slot_offset for Phase 2
+    if (tid == 0) {
+        *slot_offset_out = slot_offset;
     }
+}
+
+template <int VEC_SIZE, int BDX, int NUM_SHARDS>
+__global__ void __launch_bounds__(BDX, 1)
+p2p_cp_merge_multi_kernel(
+    void* const* peer_data,
+    const int* __restrict__ slot_offset_ptr,
+    __nv_bfloat16* __restrict__ merged_v_out,
+    float* __restrict__ merged_lse,
+    int batch_size,
+    int num_heads,
+    int shard_n_heads,
+    int head_offset,
+    int input_n_heads,
+    int v_out_bytes)
+{
+    constexpr int head_dim = VEC_SIZE * BDX;
+    int tid = threadIdx.x;
+    int bh = blockIdx.x;
+    int b = bh / shard_n_heads;
+    int local_h = bh % shard_n_heads;
+    int h = local_h + head_offset;
+
+    if (b >= batch_size) return;
+
+    int slot_offset = *slot_offset_ptr;
+
+    __shared__ float s_lse[CP_MAX_SHARDS];
+
+    auto load_lse = [&](float* slse, int b_, int h_, int nh) {
+        if (tid < NUM_SHARDS) {
+            const float* peer_lse = reinterpret_cast<const float*>(
+                static_cast<char*>(peer_data[tid]) + slot_offset + v_out_bytes);
+            slse[tid] = peer_lse[b_ * nh + h_];
+        }
+    };
+
+    auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int h_, int hd, int tid_) {
+        const __nv_bfloat16* peer_v = reinterpret_cast<const __nv_bfloat16*>(
+            static_cast<char*>(peer_data[s]) + slot_offset);
+        v.cast_load(peer_v + (b_ * input_n_heads + h_) * hd + tid_ * VEC_SIZE);
+    };
+
+    cp_merge_one_pair<VEC_SIZE, BDX, NUM_SHARDS>(
+        tid, b, h, num_heads, local_h, shard_n_heads, s_lse,
+        load_lse, load_v,
+        merged_v_out, merged_lse);
 }
 
 template <int VEC_SIZE, int BDX>
 void launch_p2p_cp_merge(
     void** peer_data, int** peer_flags, unsigned long long* seq_counter,
+    int* slot_offset_out,
     int my_rank, int world_size, int max_slot_bytes,
     const __nv_bfloat16* my_v_out, const float* my_lse,
     __nv_bfloat16* merged_v_out, float* merged_lse,
@@ -415,33 +432,37 @@ void launch_p2p_cp_merge(
     int input_n_heads, int v_out_bytes,
     cudaStream_t stream)
 {
+    // Phase 1: P2P sync (single block)
+    p2p_cp_sync_kernel<<<1, P2P_CP_BLOCK_SIZE, 0, stream>>>(
+        peer_data, peer_flags, seq_counter, slot_offset_out,
+        my_rank, world_size, max_slot_bytes,
+        my_v_out, my_lse, batch_size, num_heads, v_out_bytes);
+
+    // Phase 2: Multi-block merge
+    int grid = batch_size * shard_n_heads;
     switch (num_shards) {
         case 2:
-            p2p_cp_merge_kernel<VEC_SIZE, BDX, 2><<<1, P2P_CP_BLOCK_SIZE, 0, stream>>>(
-                peer_data, peer_flags, seq_counter,
-                my_rank, world_size, max_slot_bytes,
-                my_v_out, my_lse, merged_v_out, merged_lse,
+            p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 2><<<grid, BDX, 0, stream>>>(
+                peer_data, slot_offset_out,
+                merged_v_out, merged_lse,
                 batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
             break;
         case 4:
-            p2p_cp_merge_kernel<VEC_SIZE, BDX, 4><<<1, P2P_CP_BLOCK_SIZE, 0, stream>>>(
-                peer_data, peer_flags, seq_counter,
-                my_rank, world_size, max_slot_bytes,
-                my_v_out, my_lse, merged_v_out, merged_lse,
+            p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 4><<<grid, BDX, 0, stream>>>(
+                peer_data, slot_offset_out,
+                merged_v_out, merged_lse,
                 batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
             break;
         case 8:
-            p2p_cp_merge_kernel<VEC_SIZE, BDX, 8><<<1, P2P_CP_BLOCK_SIZE, 0, stream>>>(
-                peer_data, peer_flags, seq_counter,
-                my_rank, world_size, max_slot_bytes,
-                my_v_out, my_lse, merged_v_out, merged_lse,
+            p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 8><<<grid, BDX, 0, stream>>>(
+                peer_data, slot_offset_out,
+                merged_v_out, merged_lse,
                 batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
             break;
         case 16:
-            p2p_cp_merge_kernel<VEC_SIZE, BDX, 16><<<1, P2P_CP_BLOCK_SIZE, 0, stream>>>(
-                peer_data, peer_flags, seq_counter,
-                my_rank, world_size, max_slot_bytes,
-                my_v_out, my_lse, merged_v_out, merged_lse,
+            p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 16><<<grid, BDX, 0, stream>>>(
+                peer_data, slot_offset_out,
+                merged_v_out, merged_lse,
                 batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
             break;
         default:
@@ -519,6 +540,7 @@ void glm_p2p_cp_merge_heads(
         case 32:
             launch_p2p_cp_merge<4, 8>(
                 inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
+                inst->slot_offset_d,
                 inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(my_v_out), my_lse,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
@@ -528,6 +550,7 @@ void glm_p2p_cp_merge_heads(
         case 64:
             launch_p2p_cp_merge<4, 16>(
                 inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
+                inst->slot_offset_d,
                 inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(my_v_out), my_lse,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
@@ -537,6 +560,7 @@ void glm_p2p_cp_merge_heads(
         case 128:
             launch_p2p_cp_merge<4, 32>(
                 inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
+                inst->slot_offset_d,
                 inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(my_v_out), my_lse,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
@@ -546,6 +570,7 @@ void glm_p2p_cp_merge_heads(
         case 256:
             launch_p2p_cp_merge<4, 64>(
                 inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
+                inst->slot_offset_d,
                 inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(my_v_out), my_lse,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,
@@ -555,6 +580,7 @@ void glm_p2p_cp_merge_heads(
         case 512:
             launch_p2p_cp_merge<4, 128>(
                 inst->peer_data_arr_d, inst->peer_flags_arr_d, inst->seq_counter_d,
+                inst->slot_offset_d,
                 inst->my_rank, inst->world_size, (int)inst->max_bytes,
                 static_cast<const __nv_bfloat16*>(my_v_out), my_lse,
                 static_cast<__nv_bfloat16*>(merged_v_out), merged_lse,

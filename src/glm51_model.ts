@@ -409,7 +409,7 @@ export class Glm51Model extends ChatModel {
     return result.reshape([BS, hs]);
   }
 
-  private mlaLayer(normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState): { normed: Tensor, residual: Tensor } {
+  private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const ws = state.ws;
     const hs = cfg.hiddenSize;
@@ -424,14 +424,9 @@ export class Glm51Model extends ChatModel {
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : totalTokens;
 
-    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(state.customMask?.positionIds || ws.positionIds, qkRopeDim / 2, B, S));
-    using cos = rotaryEmbedding.result.cos;
-    using sin = rotaryEmbedding.result.sin;
-
     using kvcache = this.glm.withStream(() => {
       using kPeRopeStream = this.glm.withStream(() => {
         using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!, BS);
-        rotaryEmbedding.streamWaitEvent();
         return kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave)
       });
       using kPeRope = kPeRopeStream.result;
@@ -458,7 +453,6 @@ export class Glm51Model extends ChatModel {
           : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
       });
 
-      rotaryEmbedding.streamWaitEvent();
       using qPeR = this.glm.withStream(() => qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave));
 
       qAbsorbedRStream.streamWaitEvent();
@@ -517,14 +511,22 @@ export class Glm51Model extends ChatModel {
     const BS = totalTokens;
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : totalTokens;
+    const ws = state.ws;
+    const qkRopeDim = cfg.qkRopeHeadDim;
+
+    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(state.customMask?.positionIds || ws.positionIds, qkRopeDim / 2, B, S));
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
 
     using residual = new UsingHolder(embedTable.embedding(state.input!, hs, BS));
     using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
 
+    rotaryEmbedding.streamWaitEvent();
+    using cos = rotaryEmbedding.result.cos;
+    using sin = rotaryEmbedding.result.sin;
+
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const result = this.mlaLayer(normed.value, residual.value, i, state);
+      const result = this.mlaLayer(cos, sin, normed.value, residual.value, i, state);
       normed.replace(result.normed);
       residual.replace(result.residual);
     }
@@ -539,10 +541,15 @@ export class Glm51Model extends ChatModel {
     const batchSize = state.batchSize;
     const totalTokens = state.totalTokens;
     const BS = totalTokens;
+    const qkRopeDim = cfg.qkRopeHeadDim;
+    const B = state.isDecode ? batchSize : 1;
+    const S = state.isDecode ? 1 : totalTokens;
 
     if (!this.mtp || !cfg.numNextNPredictLayers) {
       throw new Error("forwardMtp called but model is not configured for MTP or has no next-n predict layers");
     }
+
+    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(state.customMask?.positionIds || ws.positionIds, qkRopeDim / 2, B, S));
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
     using hnormStream = ws.glm.withStream(() => {
@@ -557,8 +564,12 @@ export class Glm51Model extends ChatModel {
     using residual = cat.linear(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.eh_proj.weight`)!, BS);
     using normed = residual.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
 
+    rotaryEmbedding.streamWaitEvent();
+    using cos = rotaryEmbedding.result.cos;
+    using sin = rotaryEmbedding.result.sin;
+
     const layerIdx = cfg.numHiddenLayers;
-    const result = this.mlaLayer(normed, residual, layerIdx, state);
+    const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state);
     using _residual = result.residual;
 
     return result.normed.removeTracking();

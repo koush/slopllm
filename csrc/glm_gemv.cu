@@ -126,22 +126,20 @@ constexpr int GEMV_SPLITK_WARPS = 4;
 constexpr int GEMV_SPLITK_BLOCK_SIZE = GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
 constexpr int GEMV_SPLITK_PARTITIONS = 4;  // K is split into this many segments
 
-__global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS, 2)
+template <int NumPartitions>
+__global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * NumPartitions, 2)
 bf16_gemv_splitk_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ weight,
     int M, int N, int K) {
 
-    // gridDim.x = M * N. Each block computes one (m, row).
-    // Within the block, we have GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS
-    // warps cooperatively reducing over K.
     if (N == 0 || M == 0 || K == 0) return;
 
     int m = blockIdx.x / N;
     int row = blockIdx.x % N;
 
-    constexpr int TOTAL_WARPS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS;
+    constexpr int TOTAL_WARPS = NumPartitions * GEMV_SPLITK_WARPS;
     int tid = threadIdx.x;
     int warp_id = tid / GEMV_WARP_SIZE;
     int lane = tid % GEMV_WARP_SIZE;
@@ -156,9 +154,6 @@ bf16_gemv_splitk_kernel(
     const uint4* weight_v4 = reinterpret_cast<const uint4*>(weight_row);
 
     float sum = 0.0f;
-    // Each warp strides through the full K_vec range, but TOTAL_WARPS of them
-    // in the block share the work via an interleaved pattern: thread global
-    // index = warp_id * 32 + lane, total threads = TOTAL_WARPS * 32.
     int g_thread = warp_id * GEMV_WARP_SIZE + lane;
     int g_threads = TOTAL_WARPS * GEMV_WARP_SIZE;
     for (int ki = g_thread; ki < K_vec; ki += g_threads) {
@@ -754,8 +749,8 @@ nvfp4_mul_mat_id_kernel(
     }
 }
 
-// Split-K variant for small N — no input shared memory, warp_sums for reduction
-__global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS, 2)
+template <int NumPartitions>
+__global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * NumPartitions, 2)
 nvfp4_mul_mat_id_splitk_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
@@ -768,7 +763,7 @@ nvfp4_mul_mat_id_splitk_kernel(
     int entry = blockIdx.x / N;
     int row = blockIdx.x % N;
 
-    constexpr int TOTAL_WARPS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS;
+    constexpr int TOTAL_WARPS = NumPartitions * GEMV_SPLITK_WARPS;
     int tid = threadIdx.x;
     int warp_id = tid / GEMV_WARP_SIZE;
     int lane = tid % GEMV_WARP_SIZE;
@@ -926,8 +921,8 @@ bf16_mul_mat_id_kernel(
     }
 }
 
-// Split-K variant for small N
-__global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS, 2)
+template <int NumPartitions>
+__global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * NumPartitions, 2)
 bf16_mul_mat_id_splitk_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
@@ -940,7 +935,7 @@ bf16_mul_mat_id_splitk_kernel(
     int entry = blockIdx.x / N;
     int row = blockIdx.x % N;
 
-    constexpr int TOTAL_WARPS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS;
+    constexpr int TOTAL_WARPS = NumPartitions * GEMV_SPLITK_WARPS;
     int tid = threadIdx.x;
     int warp_id = tid / GEMV_WARP_SIZE;
     int lane = tid % GEMV_WARP_SIZE;
@@ -1126,18 +1121,32 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
     if (count == 0 || N == 0 || K == 0) return;
 
     constexpr int SPLITK_THRESHOLD = 1024;
+    constexpr int SPLITK_FULL_THREADS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
     constexpr int SMALLK_THRESHOLD = GEMV_WARP_SIZE * NVFP4_QUANT_GROUP; // K <= 512: num_k_groups <= 32
     if (N < SPLITK_THRESHOLD) {
         int grid_size = count * N;
-        constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS;
-        nvfp4_mul_mat_id_splitk_kernel<<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)output,
-            (const __nv_bfloat16*)input,
-            (const uint8_t* const*)weight_ptrs,
-            (const __nv_fp8_e4m3* const*)scale_ptrs,
-            (const float* const*)scale2_ptrs,
-            expert_ids, top_k,
-            count, N, K);
+        int num_k_groups = K / NVFP4_QUANT_GROUP;
+        if (num_k_groups < SPLITK_FULL_THREADS) {
+            constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * 2;
+            nvfp4_mul_mat_id_splitk_kernel<2><<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)output,
+                (const __nv_bfloat16*)input,
+                (const uint8_t* const*)weight_ptrs,
+                (const __nv_fp8_e4m3* const*)scale_ptrs,
+                (const float* const*)scale2_ptrs,
+                expert_ids, top_k,
+                count, N, K);
+        } else {
+            constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS;
+            nvfp4_mul_mat_id_splitk_kernel<4><<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)output,
+                (const __nv_bfloat16*)input,
+                (const uint8_t* const*)weight_ptrs,
+                (const __nv_fp8_e4m3* const*)scale_ptrs,
+                (const float* const*)scale2_ptrs,
+                expert_ids, top_k,
+                count, N, K);
+        }
     } else if (K <= SMALLK_THRESHOLD) {
         // Each warp computes 2 rows (lanes 0-15 for row0, 16-31 for row1),
         // doubling throughput when num_k_groups <= 32 (K <= 512).
@@ -1186,14 +1195,25 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
         // blocks we need N >= ~1100. Below that, use split-K (one block per
         // row, multiple warps splitting K).
         constexpr int SPLITK_THRESHOLD = 1024;
+        constexpr int SPLITK_FULL_THREADS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
         if (n < SPLITK_THRESHOLD) {
-            constexpr int SPLITK_BLOCK = GEMV_SPLITK_WARPS * GEMV_SPLITK_PARTITIONS * GEMV_WARP_SIZE;
             int grid_size = batch * n;
-            bf16_gemv_splitk_kernel<<<grid_size, SPLITK_BLOCK, 0, GLM_STREAM(ctx)>>>(
-                reinterpret_cast<__nv_bfloat16*>(out),
-                reinterpret_cast<const __nv_bfloat16*>(input),
-                reinterpret_cast<const __nv_bfloat16*>(weight),
-                batch, n, k);
+            int K_vec = k / GEMV_K_VEC;
+            if (K_vec < SPLITK_FULL_THREADS) {
+                constexpr int SPLITK_BLOCK = GEMV_SPLITK_WARPS * 2 * GEMV_WARP_SIZE;
+                bf16_gemv_splitk_kernel<2><<<grid_size, SPLITK_BLOCK, 0, GLM_STREAM(ctx)>>>(
+                    reinterpret_cast<__nv_bfloat16*>(out),
+                    reinterpret_cast<const __nv_bfloat16*>(input),
+                    reinterpret_cast<const __nv_bfloat16*>(weight),
+                    batch, n, k);
+            } else {
+                constexpr int SPLITK_BLOCK = GEMV_SPLITK_WARPS * GEMV_SPLITK_PARTITIONS * GEMV_WARP_SIZE;
+                bf16_gemv_splitk_kernel<4><<<grid_size, SPLITK_BLOCK, 0, GLM_STREAM(ctx)>>>(
+                    reinterpret_cast<__nv_bfloat16*>(out),
+                    reinterpret_cast<const __nv_bfloat16*>(input),
+                    reinterpret_cast<const __nv_bfloat16*>(weight),
+                    batch, n, k);
+            }
         } else {
             int num_row_groups = (n + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
             int grid_size = batch * num_row_groups;
@@ -1229,16 +1249,28 @@ void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
     if (count == 0 || N == 0 || K == 0) return;
 
     constexpr int SPLITK_THRESHOLD = 1024;
+    constexpr int SPLITK_FULL_THREADS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
     constexpr int SMALLK_THRESHOLD = GEMV_WARP_SIZE * GEMV_K_VEC; // K <= 256: K_vec <= 32
     if (N < SPLITK_THRESHOLD) {
         int grid_size = count * N;
-        constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS;
-        bf16_mul_mat_id_splitk_kernel<<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)output,
-            (const __nv_bfloat16*)input,
-            (const __nv_bfloat16* const*)weight_ptrs,
-            expert_ids, top_k,
-            count, N, K);
+        int K_vec = K / GEMV_K_VEC;
+        if (K_vec < SPLITK_FULL_THREADS) {
+            constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * 2;
+            bf16_mul_mat_id_splitk_kernel<2><<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)output,
+                (const __nv_bfloat16*)input,
+                (const __nv_bfloat16* const*)weight_ptrs,
+                expert_ids, top_k,
+                count, N, K);
+        } else {
+            constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS;
+            bf16_mul_mat_id_splitk_kernel<4><<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)output,
+                (const __nv_bfloat16*)input,
+                (const __nv_bfloat16* const*)weight_ptrs,
+                expert_ids, top_k,
+                count, N, K);
+        }
     } else if (K <= SMALLK_THRESHOLD) {
         constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * 2;
         int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;

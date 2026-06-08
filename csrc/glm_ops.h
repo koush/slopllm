@@ -289,6 +289,7 @@ struct GlmP2PInstance {
     int**               peer_flags_arr_d;
     unsigned long long* seq_counter_d;
     int*                my_flag_d;
+    int*                slot_offset_d;
     void*               metadata_alloc_d;
     size_t              max_bytes;
     int                 world_size;
