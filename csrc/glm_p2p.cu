@@ -211,7 +211,7 @@ p2p_allreduce_oneshot_kernel(
     if constexpr (VEC == 8) {
         int count_v = count / 8;
         for (int i = tid; i < count_v; i += bs) {
-            float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;
+            float2 a01 = {0,0}, a23 = {0,0}, a45 = {0,0}, a67 = {0,0};
             #pragma unroll
             for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
                 if (rr >= world_size) break;
@@ -219,21 +219,19 @@ p2p_allreduce_oneshot_kernel(
                 const uint4* pv = reinterpret_cast<const uint4*>(
                     static_cast<const char*>(s_peer_data[r]) + slot_offset);
                 uint4 raw = pv[i];
-                auto* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
-                a0 += __bfloat162float(h[0]);
-                a1 += __bfloat162float(h[1]);
-                a2 += __bfloat162float(h[2]);
-                a3 += __bfloat162float(h[3]);
-                a4 += __bfloat162float(h[4]);
-                a5 += __bfloat162float(h[5]);
-                a6 += __bfloat162float(h[6]);
-                a7 += __bfloat162float(h[7]);
+                auto* h2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+                float2 c0 = __bfloat1622float2(h2[0]);
+                float2 c1 = __bfloat1622float2(h2[1]);
+                float2 c2 = __bfloat1622float2(h2[2]);
+                float2 c3 = __bfloat1622float2(h2[3]);
+                a01.x += c0.x; a01.y += c0.y;
+                a23.x += c1.x; a23.y += c1.y;
+                a45.x += c2.x; a45.y += c2.y;
+                a67.x += c3.x; a67.y += c3.y;
             }
-            __nv_bfloat16 packed[8] = {
-                __float2bfloat16(a0), __float2bfloat16(a1),
-                __float2bfloat16(a2), __float2bfloat16(a3),
-                __float2bfloat16(a4), __float2bfloat16(a5),
-                __float2bfloat16(a6), __float2bfloat16(a7),
+            __nv_bfloat162 packed[4] = {
+                __float22bfloat162_rn(a01), __float22bfloat162_rn(a23),
+                __float22bfloat162_rn(a45), __float22bfloat162_rn(a67),
             };
             uint4 out_raw;
             __builtin_memcpy(&out_raw, packed, 16);
