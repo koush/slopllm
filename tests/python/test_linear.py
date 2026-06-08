@@ -46,3 +46,26 @@ def test_linear_zero_weight(glm, device):
 
     glm.linear(out, x, w, 2, 16, 32)
     assert (out.cpu().abs() < 1e-6).all(), "Zero weight should produce zero output"
+
+
+@pytest.mark.parametrize("batch,n,k", [
+    (15, 2048, 6144),
+    (15, 768, 256),
+    (15, 512, 6144),
+    (15, 64, 6144),
+    (15, 256, 2048),
+    (15, 256, 768),
+    (15, 192, 768),
+    (8, 1024, 4096),
+    (32, 512, 2048),
+    (64, 256, 1024),
+])
+def test_linear_batch_gt1(glm, device, batch, n, k):
+    x = torch.randn(batch, k, dtype=torch.bfloat16, device=device)
+    w = torch.randn(n, k, dtype=torch.bfloat16, device=device)
+    out = torch.empty(batch, n, dtype=torch.bfloat16, device=device)
+
+    glm.linear(out, x, w, batch, n, k)
+    ref = torch_linear(x, w)
+    tol = 0.5 if n * k > 1_000_000 else 5e-2
+    torch.testing.assert_close(out.cpu(), ref.cpu(), atol=tol, rtol=1e-2)
