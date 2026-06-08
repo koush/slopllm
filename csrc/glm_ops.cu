@@ -2356,44 +2356,82 @@ void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
         input_ids, output_ids, qo_indptr, new_tokens, batch_size);
 }
 
+} // extern "C"
+
 // ---------------------------------------------------------------------------
 // Sum of N tensors (element-wise, max 16 inputs)
+// Pointers passed as kernel arguments for CUDA graph compatibility.
+// Must be outside extern "C" because it's a template.
 // ---------------------------------------------------------------------------
 
+template <typename scalar_t>
 __global__ void __launch_bounds__(256, 4) sum_pointers_kernel(
-    const __nv_bfloat16** __restrict__ pointers,
-    __nv_bfloat16* __restrict__ output,
+    const scalar_t* p0,  const scalar_t* p1,  const scalar_t* p2,  const scalar_t* p3,
+    const scalar_t* p4,  const scalar_t* p5,  const scalar_t* p6,  const scalar_t* p7,
+    const scalar_t* p8,  const scalar_t* p9,  const scalar_t* p10, const scalar_t* p11,
+    const scalar_t* p12, const scalar_t* p13, const scalar_t* p14, const scalar_t* p15,
+    scalar_t* __restrict__ output,
     int N,
     int64_t numel)
 {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     int64_t stride = blockDim.x * gridDim.x;
 
-    const __nv_bfloat16* ptrs[16];
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        if (j >= N) break;
-        ptrs[j] = pointers[j];
-    }
+    const scalar_t* ptrs[16] = {
+        p0, p1, p2, p3, p4, p5, p6, p7,
+        p8, p9, p10, p11, p12, p13, p14, p15
+    };
 
-    for (int64_t i = idx; i < numel; i += stride) {
-        float acc = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            if (j >= N) break;
-            acc += __bfloat162float(ptrs[j][i]);
+    if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+        for (int64_t i = idx; i < numel; i += stride) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                if (j >= N) break;
+                acc += __bfloat162float(ptrs[j][i]);
+            }
+            output[i] = __float2bfloat16(acc);
         }
-        output[i] = __float2bfloat16(acc);
+    } else {
+        for (int64_t i = idx; i < numel; i += stride) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                if (j >= N) break;
+                acc += ptrs[j][i];
+            }
+            output[i] = acc;
+        }
     }
 }
 
-void glm_sum_pointers(GlmCtx* ctx, void** pointers, void* output, int N, int64_t numel) {
+extern "C" {
+
+void glm_sum_pointers(GlmCtx* ctx,
+    void* p0,  void* p1,  void* p2,  void* p3,
+    void* p4,  void* p5,  void* p6,  void* p7,
+    void* p8,  void* p9,  void* p10, void* p11,
+    void* p12, void* p13, void* p14, void* p15,
+    void* output, int N, int64_t numel, int dtype) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = (int)((numel + block_size - 1) / block_size);
     if (grid > 65535) grid = 65535;
-    sum_pointers_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (const __nv_bfloat16**)pointers, (__nv_bfloat16*)output, N, numel);
+    if (dtype == 9) {
+        sum_pointers_kernel<__nv_bfloat16><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (const __nv_bfloat16*)p0,  (const __nv_bfloat16*)p1,  (const __nv_bfloat16*)p2,  (const __nv_bfloat16*)p3,
+            (const __nv_bfloat16*)p4,  (const __nv_bfloat16*)p5,  (const __nv_bfloat16*)p6,  (const __nv_bfloat16*)p7,
+            (const __nv_bfloat16*)p8,  (const __nv_bfloat16*)p9,  (const __nv_bfloat16*)p10, (const __nv_bfloat16*)p11,
+            (const __nv_bfloat16*)p12, (const __nv_bfloat16*)p13, (const __nv_bfloat16*)p14, (const __nv_bfloat16*)p15,
+            (__nv_bfloat16*)output, N, numel);
+    } else {
+        sum_pointers_kernel<float><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (const float*)p0,  (const float*)p1,  (const float*)p2,  (const float*)p3,
+            (const float*)p4,  (const float*)p5,  (const float*)p6,  (const float*)p7,
+            (const float*)p8,  (const float*)p9,  (const float*)p10, (const float*)p11,
+            (const float*)p12, (const float*)p13, (const float*)p14, (const float*)p15,
+            (float*)output, N, numel);
+    }
 }
 
 } // extern "C"

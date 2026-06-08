@@ -207,9 +207,14 @@ void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
                            const int* qo_indptr, const int* new_tokens,
                            int batch_size);
 
-// Element-wise sum of N tensors (max 16). pointers[0..N-1] are device pointers
-// to __nv_bfloat16 arrays, each of length numel. Output is BF16.
-void glm_sum_pointers(GlmCtx* ctx, void** pointers, void* output, int N, int64_t numel);
+// Element-wise sum of N tensors (max 16). Pointers passed as kernel args
+// for CUDA graph compatibility. dtype: 9=BF16, 7=F32.
+void glm_sum_pointers(GlmCtx* ctx,
+    void* p0,  void* p1,  void* p2,  void* p3,
+    void* p4,  void* p5,  void* p6,  void* p7,
+    void* p8,  void* p9,  void* p10, void* p11,
+    void* p12, void* p13, void* p14, void* p15,
+    void* output, int N, int64_t numel, int dtype);
 
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
                        const void* indices, int dim, int k, int offset);

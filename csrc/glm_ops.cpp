@@ -596,18 +596,29 @@ static Napi::Value Scale(const Napi::CallbackInfo& info) {
 
 static Napi::Value SumPointers(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 5) {
-        Napi::TypeError::New(env, "Expected (ctx, pointers, out, N, numel)").ThrowAsJavaScriptException();
+    if (info.Length() < 21) {
+        Napi::TypeError::New(env, "Expected (ctx, p0..p15, out, N, numel, dtype)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t ptrs_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t out_ptr = info[2].As<Napi::Number>().Int64Value();
-    int N = info[3].As<Napi::Number>().Int32Value();
-    int64_t numel = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t p[16];
+    for (int i = 0; i < 16; i++) {
+        p[i] = info[1 + i].As<Napi::Number>().Int64Value();
+    }
+    uintptr_t out_ptr = info[17].As<Napi::Number>().Int64Value();
+    int N = info[18].As<Napi::Number>().Int32Value();
+    int64_t numel = info[19].As<Napi::Number>().Int64Value();
+    int dtype = info[20].As<Napi::Number>().Int32Value();
     glm_sum_pointers(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                     reinterpret_cast<void**>(ptrs_ptr),
-                     reinterpret_cast<void*>(out_ptr), N, numel);
+                     reinterpret_cast<void*>(p[0]),  reinterpret_cast<void*>(p[1]),
+                     reinterpret_cast<void*>(p[2]),  reinterpret_cast<void*>(p[3]),
+                     reinterpret_cast<void*>(p[4]),  reinterpret_cast<void*>(p[5]),
+                     reinterpret_cast<void*>(p[6]),  reinterpret_cast<void*>(p[7]),
+                     reinterpret_cast<void*>(p[8]),  reinterpret_cast<void*>(p[9]),
+                     reinterpret_cast<void*>(p[10]), reinterpret_cast<void*>(p[11]),
+                     reinterpret_cast<void*>(p[12]), reinterpret_cast<void*>(p[13]),
+                     reinterpret_cast<void*>(p[14]), reinterpret_cast<void*>(p[15]),
+                     reinterpret_cast<void*>(out_ptr), N, numel, dtype);
     return env.Undefined();
 }
 

@@ -1755,7 +1755,7 @@ export class ParallelOps implements DeviceOps {
     if (!group)
       return false;
 
-    if (false) {
+    if (true) {
       // prep data
       const shardViews = shards.map(shard => {
         const shardView = shard.workspace.alloc(shard.shape, shard.type);
@@ -1773,11 +1773,9 @@ export class ParallelOps implements DeviceOps {
       for (let selfIndex = 0; selfIndex < this.worldSize; selfIndex++) {
         const shard = shards[selfIndex];
         const peerShards: Tensor[] = [];
-        for (let i = 0; i < this.worldSize; i++) {
+        for (let i = 1; i < this.worldSize; i++) {
           const peerShard = shardViews[(selfIndex + i) % this.worldSize];
-          if (peerShard.workspace.glm !== shard.workspace.glm) {
-            peerShards.push(peerShard);
-          }
+          peerShards.push(peerShard);
         }
         shard.sum(peerShards);
       }
