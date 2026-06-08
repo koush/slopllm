@@ -139,6 +139,57 @@ p2p_data_sync_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// P2P barrier: increment seq, publish flag, wait for peers. No data scatter.
+// Writes slot_offset so callers know which double-buffer slot was selected.
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(P2P_AR_BLOCK_SIZE, 1)
+p2p_barrier_kernel(
+    int* const* peer_flags,
+    unsigned long long* my_seq_counter,
+    int* slot_offset_out,
+    int my_rank,
+    int world_size,
+    int max_slot_bytes)
+{
+    int tid = threadIdx.x;
+
+    __shared__ unsigned int s_seq;
+    __shared__ int          s_slot_offset;
+    __shared__ int*         s_peer_flags[P2P_AR_MAX_WORLD];
+
+    if (tid == 0) {
+        unsigned long long s = atomicAdd(my_seq_counter, 2ULL) + 2ULL;
+        s_seq = (unsigned int)(s & 0x7FFFFFFEu);
+        if (s_seq == 0) s_seq = 2;
+        s_slot_offset = ((s_seq >> 1) & 1) * max_slot_bytes;
+    }
+    if (tid < world_size) {
+        s_peer_flags[tid] = peer_flags[tid];
+    }
+    __syncthreads();
+
+    int seq = (int)s_seq;
+
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        volatile int* mf = s_peer_flags[my_rank];
+        *mf = seq + 1;
+    }
+    if (tid < world_size) {
+        volatile int* pf = s_peer_flags[tid];
+        spin_until(pf, seq + 1);
+    }
+    __syncthreads();
+    __threadfence_system();
+
+    if (tid == 0) {
+        *slot_offset_out = s_slot_offset;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // P2P AllReduce – fused single-block (scatter + sync + reduce in one kernel).
 //
 // Used for allreduce where the payload is small enough for a single block
@@ -831,6 +882,14 @@ void glm_p2p_rmsnorm(GlmCtx* ctx, GlmP2PInstance* inst,
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<__nv_bfloat16*>(output),
         eps, shard_dim, full_dim, batch);
+}
+
+void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst) {
+    cudaSetDevice(ctx->device_id);
+    p2p_barrier_kernel<<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        inst->peer_flags_arr_d, inst->seq_counter_d,
+        inst->slot_offset_d,
+        inst->my_rank, inst->world_size, (int)inst->max_bytes);
 }
 
 } // extern "C"

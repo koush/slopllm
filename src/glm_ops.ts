@@ -136,6 +136,7 @@ interface NativeAddon {
   p2pAllGather(ctx: number, instance: number, sendbuf: number, recvbuf: number, numBytes: number): void;
   p2pAllGatherRow(ctx: number, instance: number, sendbuf: number, recvbuf: number, shardBytes: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number): void;
   p2pRmsnorm(ctx: number, instance: number, input: number, weight: number, output: number, eps: number, shardDim: number, fullDim: number, batch: number): void;
+  p2pBarrier(ctx: number, instance: number): void;
   contextParallelMerge(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void;
   p2pCpMerge(ctx: number, instance: number, myVOut: number, myLse: number, mergedVOut: number, mergedLse: number, numShards: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void;
   contextParallelMergeHeads(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, shardNHeads: number, headOffset: number, inputNHeads: number, vHeadDim: number): void;
@@ -851,6 +852,10 @@ export class GlmOps implements DeviceOps {
     } else {
       getNativeAddon().p2pCpMergeHeads(this.ctx, instance, ptr(myVOut), ptr(myLse), ptr(mergedVOut), mergedLse ? ptr(mergedLse) : 0, numShards, batchSize, numHeads, snh, ho, inh, vHeadDim);
     }
+  }
+
+  p2pBarrier(instance: number): void {
+    getNativeAddon().p2pBarrier(this.ctx, instance);
   }
 }
 

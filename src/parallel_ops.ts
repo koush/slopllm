@@ -1646,6 +1646,14 @@ class P2PAllReduceGroup {
       getNativeAddon().p2pDestroyInstance(inst);
     }
   }
+
+  /** P2P barrier: sync all GPUs without data transfer. */
+  barrier(devices: readonly GlmOps[]): void {
+    const addon = getNativeAddon();
+    for (let i = 0; i < this.worldSize; ++i) {
+      addon.p2pBarrier(devices[i].ctx, this.instances[i]);
+    }
+  }
 }
 
 export class ParallelOps implements DeviceOps {
@@ -2002,6 +2010,13 @@ export class ParallelOps implements DeviceOps {
         getNativeAddon().ncclCommDestroy(comm);
       }
     }
+  }
+
+  /** P2P barrier: sync all GPUs without data transfer. */
+  p2pBarrier(): void {
+    const group = this.getP2PGroup(this.devices[0].currentStream);
+    if (!group) throw new Error('P2P not available for barrier');
+    group.barrier(this.devices);
   }
 
   shardDim(dim: number, name: string): number {

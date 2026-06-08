@@ -2758,6 +2758,19 @@ static Napi::Value P2PRmsnorm(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value P2PBarrier(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, instance)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
+    glm_p2p_barrier(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                    reinterpret_cast<GlmP2PInstance*>(inst_ptr));
+    return env.Undefined();
+}
+
 static Napi::Value RotateInputIds(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -2899,6 +2912,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "p2pAllGather"), Napi::Function::New(env, P2PAllGather));
     exports.Set(Napi::String::New(env, "p2pAllGatherRow"), Napi::Function::New(env, P2PAllGatherRow));
     exports.Set(Napi::String::New(env, "p2pRmsnorm"), Napi::Function::New(env, P2PRmsnorm));
+    exports.Set(Napi::String::New(env, "p2pBarrier"), Napi::Function::New(env, P2PBarrier));
     return exports;
 }
 
