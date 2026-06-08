@@ -991,6 +991,96 @@ bf16_mul_mat_id_splitk_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// NVFP4 linear split-K kernel (M>1, N<=512).
+//
+// Fused dequantize + GEMM for small-N prefill/verification batches.
+// Replaces the cuBLAS fallback path (dequantize_to_bf16 + cublasGemmEx)
+// with a single kernel launch, avoiding multiple split-K kernel overhead.
+//
+// Each CTA computes one output element: output[input_row, row].
+// NumPartitions warps split the K dimension, then reduce via shared memory.
+// No expert ID indirection (unlike nvfp4_mul_mat_id_splitk_kernel).
+// ---------------------------------------------------------------------------
+
+template <int NumPartitions>
+__global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * NumPartitions, 2)
+nvfp4_linear_splitk_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const uint8_t* __restrict__ fp4_weight,
+    const __nv_fp8_e4m3* __restrict__ weight_scale,
+    const float* __restrict__ weight_scale_2,
+    int m, int n, int k) {
+
+    int input_row = blockIdx.x / n;
+    int row = blockIdx.x % n;
+
+    constexpr int TOTAL_WARPS = NumPartitions * GEMV_SPLITK_WARPS;
+    int tid = threadIdx.x;
+    int warp_id = tid / GEMV_WARP_SIZE;
+    int lane = tid % GEMV_WARP_SIZE;
+
+    const __nv_bfloat16* input_row_ptr = input + (size_t)input_row * k;
+    const uint8_t* weight_row = fp4_weight + (size_t)row * (k / 2);
+    const __nv_fp8_e4m3* scale_row = weight_scale + (size_t)row * (k / NVFP4_QUANT_GROUP);
+    float scale_2_val = *weight_scale_2;
+
+    int num_k_groups = k / NVFP4_QUANT_GROUP;
+    int g_thread = warp_id * GEMV_WARP_SIZE + lane;
+    int g_threads = TOTAL_WARPS * GEMV_WARP_SIZE;
+
+    float sum = 0.0f;
+
+    for (int g = g_thread; g < num_k_groups; g += g_threads) {
+        float scale = static_cast<float>(scale_row[g]) * scale_2_val;
+        int k_start = g * NVFP4_QUANT_GROUP;
+
+        const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row_ptr + k_start);
+        uint4 xv0 = input_v4[0];
+        uint4 xv1 = input_v4[1];
+        __nv_bfloat16 xb0[8], xb1[8];
+        uint4_to_bf16x8(xv0, xb0);
+        uint4_to_bf16x8(xv1, xb1);
+
+        uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
+        uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
+            sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb0[j * 2])
+                 + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb0[j * 2 + 1]);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
+            sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb1[j * 2])
+                 + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb1[j * 2 + 1]);
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+
+    __shared__ float warp_sums[TOTAL_WARPS];
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float s = (lane < TOTAL_WARPS) ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = TOTAL_WARPS / 2; offset > 0; offset >>= 1) {
+            s += __shfl_down_sync(0xFFFFFFFF, s, offset);
+        }
+        if (lane == 0) {
+            output[(size_t)input_row * n + row] = __float2bfloat16(s);
+        }
+    }
+}
+
 extern "C" {
 
 void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
@@ -1033,9 +1123,9 @@ void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
 }
 
 void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
-                              const void* fp4_weight, const void* weight_scale,
-                              const float* weight_scale_2, int m, int n, int k,
-                              void* bf16_workspace) {
+                               const void* fp4_weight, const void* weight_scale,
+                               const float* weight_scale_2, int m, int n, int k,
+                               void* bf16_workspace) {
     cudaSetDevice(ctx->device_id);
     const __nv_fp8_e4m3* scale_ptr = reinterpret_cast<const __nv_fp8_e4m3*>(weight_scale);
     if (m == 1) {
@@ -1060,34 +1150,29 @@ void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input
                 reinterpret_cast<const uint8_t*>(fp4_weight),
                 scale_ptr, weight_scale_2, m, n, k);
         }
-    } else if (m > 1 && n <= NVFP4_CUBLAS_N_THRESHOLD && bf16_workspace != nullptr) {
-        // Small-N path: dequantize FP4→BF16, then use cuBLAS for high-occupancy
-        // split-K GEMM.  The custom smem kernel would launch only
-        // ceil(N/32)*ceil(M/4) CTAs — e.g. 8*4=32 for N=256, M=15 — which
-        // severely under-utilises the GPU.  cuBLAS split-K creates hundreds of
-        // CTAs and uses Tensor Cores, yielding 20-40× speedup for these shapes.
-        auto dst = reinterpret_cast<__nv_bfloat16*>(bf16_workspace);
-        int total = n * k;
-        int deq_grid = (total + 255) / 256;
-        nvfp4_dequantize_to_bf16_kernel<<<deq_grid, 256, 0, GLM_STREAM(ctx)>>>(
-            dst,
-            reinterpret_cast<const uint8_t*>(fp4_weight),
-            scale_ptr, weight_scale_2,
-            n, k);
-
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        cublasGemmEx(CUBLAS(ctx),
-            CUBLAS_OP_T,
-            CUBLAS_OP_N,
-            n, m, k,
-            &alpha,
-            dst,          CUDA_R_16BF, k,
-            bf16_input,   CUDA_R_16BF, k,
-            &beta,
-            bf16_out,     CUDA_R_16BF, n,
-            CUDA_R_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    } else if (m > 1 && n <= NVFP4_CUBLAS_N_THRESHOLD) {
+        // Small-N, M>1 path: fused NVFP4 dequantize + split-K GEMM.
+        // One CTA per (row, input_row) pair, NumPartitions warps split K.
+        int grid_size = m * n;
+        int num_k_groups = k / NVFP4_QUANT_GROUP;
+        constexpr int SPLITK_FULL_THREADS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
+        if (num_k_groups < SPLITK_FULL_THREADS) {
+            constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * 2;
+            nvfp4_linear_splitk_kernel<2><<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
+                reinterpret_cast<__nv_bfloat16*>(bf16_out),
+                reinterpret_cast<const __nv_bfloat16*>(bf16_input),
+                reinterpret_cast<const uint8_t*>(fp4_weight),
+                scale_ptr, weight_scale_2,
+                m, n, k);
+        } else {
+            constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * GEMV_SPLITK_PARTITIONS;
+            nvfp4_linear_splitk_kernel<4><<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
+                reinterpret_cast<__nv_bfloat16*>(bf16_out),
+                reinterpret_cast<const __nv_bfloat16*>(bf16_input),
+                reinterpret_cast<const uint8_t*>(fp4_weight),
+                scale_ptr, weight_scale_2,
+                m, n, k);
+        }
     } else if (m <= NVFP4_GEMM_SMALL_M_THRESHOLD) {
         // Narrow-tile variant: more CTAs along M (better occupancy at small M)
         // and less per-block input-staging work, while still reusing decoded

@@ -215,8 +215,7 @@ export class GlmTensor extends Tensor {
       k = k * 2; // NVFP4: weight is [N, K/2] packed, kernel expects K
       const scale = weight.workspace.tensors.get(weight.name! + "_weight_scale")!;
       const scale2 = weight.workspace.tensors.get(weight.name! + "_weight_scale_2")!;
-      using ws = (batch > 1 && n <= 512) ? this.workspace.alloc([n, k], "BF16") : undefined;
-      getNativeAddon().nvfp4LinearDecode(this.glm.ctx, out.data, this.data, weight.data, scale.data, scale2.data, batch, n, k, ws?.data || 0);
+      getNativeAddon().nvfp4LinearDecode(this.glm.ctx, out.data, this.data, weight.data, scale.data, scale2.data, batch, n, k, 0);
     } else {
       getNativeAddon().linear(this.glm.ctx, out.data, this.data, weight.data, batch, n, k);
     }
@@ -363,15 +362,15 @@ export class GlmTensor extends Tensor {
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
-    if (strided) {
-      return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
-    } else {
-      return this.mmapLoadAsync(mmapPtr, offset, nbytes);
-    }
+    // if (strided) {
+    //   return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
+    // } else {
+    //   return this.mmapLoadAsync(mmapPtr, offset, nbytes);
+    // }
   }
 
   async mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
-    return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
+    // return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
   }
 
   memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void> {
