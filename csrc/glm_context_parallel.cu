@@ -332,6 +332,7 @@ p2p_cp_sync_kernel(
     int slot_offset = s_slot_offset;
 
     // Scatter my_v_out to P2P buffer
+    // s_peer_data[my_rank] via smem: dynamic index, would spill registers
     char* my_data = static_cast<char*>(s_peer_data[my_rank]) + slot_offset;
     {
         const uint4* src_v4 = reinterpret_cast<const uint4*>(my_v_out);
@@ -361,11 +362,13 @@ p2p_cp_sync_kernel(
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
+        // s_peer_flags via smem: my_rank is dynamic across kernels, smem avoids spill
         volatile int* mf = s_peer_flags[my_rank];
         *mf = seq + 1;
     }
 
     // Wait for all peers
+    // s_peer_flags[tid] via smem: dynamic index would spill register array
     if (tid < world_size) {
         volatile int* pf = s_peer_flags[tid];
         p2p_spin_until(pf, seq + 1);
@@ -405,19 +408,32 @@ p2p_cp_merge_multi_kernel(
 
     int slot_offset = *slot_offset_ptr;
 
+    // Rank-rotated peer data pointers in registers. rr is a compile-time
+    // constant in the unrolled merge loop, so peer_pv[s] avoids register spill.
+    // peer_pv[tid] in load_lse is dynamic but called once (negligible spill cost).
+    const char* peer_pv[CP_MAX_SHARDS];
+    #pragma unroll
+    for (int rr = 0; rr < CP_MAX_SHARDS; ++rr) {
+        if (rr >= NUM_SHARDS) break;
+        int r = rr + my_rank; if (r >= NUM_SHARDS) r -= NUM_SHARDS;
+        peer_pv[rr] = static_cast<const char*>(peer_data[r]) + slot_offset;
+    }
+
     __shared__ float s_lse[CP_MAX_SHARDS];
 
     auto load_lse = [&](float* slse, int b_, int h_, int nh) {
+        // tid is dynamic but only NUM_SHARDS threads execute this once,
+        // so register spill cost is negligible.
         if (tid < NUM_SHARDS) {
             const float* peer_lse = reinterpret_cast<const float*>(
-                static_cast<char*>(peer_data[tid]) + slot_offset + v_out_bytes);
+                peer_pv[tid] + v_out_bytes);
             slse[tid] = peer_lse[b_ * nh + h_];
         }
     };
 
     auto load_v = [&](flashinfer::vec_t<float, VEC_SIZE>& v, int s, int b_, int h_, int hd, int tid_) {
         const __nv_bfloat16* peer_v = reinterpret_cast<const __nv_bfloat16*>(
-            static_cast<char*>(peer_data[s]) + slot_offset);
+            peer_pv[s]);
         v.cast_load(peer_v + (b_ * input_n_heads + h_) * hd + tid_ * VEC_SIZE);
     };
 

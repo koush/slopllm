@@ -90,6 +90,7 @@ p2p_data_sync_kernel(
     int slot_offset = s_slot_offset;
 
     // Scatter local input to P2P buffer
+    // s_peer_data[my_rank] via smem: dynamic index, would spill registers
     char* my_data = static_cast<char*>(s_peer_data[my_rank]) + slot_offset;
     {
         const char* in_b = static_cast<const char*>(my_input);
@@ -117,11 +118,13 @@ p2p_data_sync_kernel(
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
+        // s_peer_flags via smem: my_rank is dynamic across kernels, smem avoids spill
         volatile int* mf = s_peer_flags[my_rank];
         *mf = seq + 1;
     }
 
     // Wait for all peers
+    // s_peer_flags[tid] via smem: dynamic index would spill register array
     if (tid < world_size) {
         volatile int* pf = s_peer_flags[tid];
         spin_until(pf, seq + 1);
@@ -176,8 +179,19 @@ p2p_allreduce_oneshot_kernel(
 
     int seq = (int)s_seq;
     int slot_offset = s_slot_offset;
+
+    // Rank-rotated peer data pointers in registers. rr is a compile-time
+    // constant in the unrolled loop below, so peer_pv[rr] avoids register spill.
+    // Contrast with s_peer_flags[tid] where tid is dynamic — that must stay in smem.
+    const char* peer_pv[P2P_AR_MAX_WORLD];
+    #pragma unroll
+    for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
+        int r = rr + my_rank; if (r >= world_size) r -= world_size;
+        peer_pv[rr] = static_cast<const char*>(s_peer_data[r]) + slot_offset;
+    }
+
     T* my_data = reinterpret_cast<T*>(
-        static_cast<char*>(s_peer_data[my_rank]) + slot_offset);
+        const_cast<char*>(peer_pv[0]));
 
     // Step 1: scatter local input into our peer-visible data buffer.
     if (in != my_data) {
@@ -197,9 +211,11 @@ p2p_allreduce_oneshot_kernel(
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
+        // s_peer_flags via smem: my_rank is dynamic across kernels, smem avoids spill
         volatile int* mf = s_peer_flags[my_rank];
         *mf = seq + 1;
     }
+    // s_peer_flags[tid] via smem: dynamic index would spill register array
     if (tid < world_size) {
         volatile int* pf = s_peer_flags[tid];
         spin_until(pf, seq + 1);
@@ -215,9 +231,7 @@ p2p_allreduce_oneshot_kernel(
             #pragma unroll
             for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
                 if (rr >= world_size) break;
-                int r = rr + my_rank; if (r >= world_size) r -= world_size;
-                const uint4* pv = reinterpret_cast<const uint4*>(
-                    static_cast<const char*>(s_peer_data[r]) + slot_offset);
+                const uint4* pv = reinterpret_cast<const uint4*>(peer_pv[rr]);
                 uint4 raw = pv[i];
                 auto* h2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
                 float2 c0 = __bfloat1622float2(h2[0]);
@@ -243,9 +257,7 @@ p2p_allreduce_oneshot_kernel(
             #pragma unroll
             for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
                 if (rr >= world_size) break;
-                int r = rr + my_rank; if (r >= world_size) r -= world_size;
-                const __nv_bfloat16* p = reinterpret_cast<const __nv_bfloat16*>(
-                    static_cast<const char*>(s_peer_data[r]) + slot_offset);
+                const __nv_bfloat16* p = reinterpret_cast<const __nv_bfloat16*>(peer_pv[rr]);
                 s += __bfloat162float(p[i]);
             }
             out[i] = __float2bfloat16(s);
@@ -257,9 +269,7 @@ p2p_allreduce_oneshot_kernel(
             #pragma unroll
             for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
                 if (rr >= world_size) break;
-                int r = rr + my_rank; if (r >= world_size) r -= world_size;
-                const uint4* pv = reinterpret_cast<const uint4*>(
-                    static_cast<const char*>(s_peer_data[r]) + slot_offset);
+                const uint4* pv = reinterpret_cast<const uint4*>(peer_pv[rr]);
                 uint4 raw = pv[i];
                 auto* f = reinterpret_cast<const float*>(&raw);
                 a0 += f[0]; a1 += f[1]; a2 += f[2]; a3 += f[3];
@@ -275,9 +285,7 @@ p2p_allreduce_oneshot_kernel(
             #pragma unroll
             for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
                 if (rr >= world_size) break;
-                int r = rr + my_rank; if (r >= world_size) r -= world_size;
-                const float* p = reinterpret_cast<const float*>(
-                    static_cast<const char*>(s_peer_data[r]) + slot_offset);
+                const float* p = reinterpret_cast<const float*>(peer_pv[rr]);
                 s += p[i];
             }
             out[i] = s;
@@ -297,11 +305,21 @@ __global__ void p2p_allreduce_multi_kernel(
     const int* __restrict__ slot_offset_ptr,
     T* __restrict__ out,
     int count,
-    int world_size)
+    int world_size,
+    int my_rank)
 {
     int slot_offset = *slot_offset_ptr;
     int tid = threadIdx.x;
     int bs  = blockDim.x;
+
+    // Rank-rotated peer data pointers in registers. rr is a compile-time
+    // constant in the unrolled loop below, so peer_pv[rr] avoids register spill.
+    const char* peer_pv[P2P_AR_MAX_WORLD];
+    #pragma unroll
+    for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
+        int r = rr + my_rank; if (r >= world_size) r -= world_size;
+        peer_pv[rr] = static_cast<const char*>(peer_data[r]) + slot_offset;
+    }
 
     if constexpr (VEC == 8) {
         int count_v = count / 8;
@@ -310,8 +328,7 @@ __global__ void p2p_allreduce_multi_kernel(
             #pragma unroll
             for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
                 if (r >= world_size) break;
-                const uint4* pv = reinterpret_cast<const uint4*>(
-                    static_cast<const char*>(peer_data[r]) + slot_offset);
+                const uint4* pv = reinterpret_cast<const uint4*>(peer_pv[r]);
                 uint4 raw = pv[i];
                 auto* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
                 a0 += __bfloat162float(h[0]);
@@ -339,8 +356,7 @@ __global__ void p2p_allreduce_multi_kernel(
             #pragma unroll
             for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
                 if (r >= world_size) break;
-                const __nv_bfloat16* p = reinterpret_cast<const __nv_bfloat16*>(
-                    static_cast<const char*>(peer_data[r]) + slot_offset);
+                const __nv_bfloat16* p = reinterpret_cast<const __nv_bfloat16*>(peer_pv[r]);
                 s += __bfloat162float(p[i]);
             }
             out[i] = __float2bfloat16(s);
@@ -352,8 +368,7 @@ __global__ void p2p_allreduce_multi_kernel(
             #pragma unroll
             for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
                 if (r >= world_size) break;
-                const uint4* pv = reinterpret_cast<const uint4*>(
-                    static_cast<const char*>(peer_data[r]) + slot_offset);
+                const uint4* pv = reinterpret_cast<const uint4*>(peer_pv[r]);
                 uint4 raw = pv[i];
                 auto* f = reinterpret_cast<const float*>(&raw);
                 a0 += f[0]; a1 += f[1]; a2 += f[2]; a3 += f[3];
@@ -369,8 +384,7 @@ __global__ void p2p_allreduce_multi_kernel(
             #pragma unroll
             for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
                 if (r >= world_size) break;
-                const float* p = reinterpret_cast<const float*>(
-                    static_cast<const char*>(peer_data[r]) + slot_offset);
+                const float* p = reinterpret_cast<const float*>(peer_pv[r]);
                 s += p[i];
             }
             out[i] = s;
@@ -551,8 +565,19 @@ p2p_rmsnorm_kernel(
 
     int seq = (int)s_seq;
     int slot_offset = s_slot_offset;
+
+    // Rank-rotated peer data pointers in registers. rr is a compile-time
+    // constant in the unrolled loop below, so peer_pv[rr] avoids register spill.
+    // Contrast with s_peer_flags[tid] where tid is dynamic — that must stay in smem.
+    const char* peer_pv[P2P_AR_MAX_WORLD];
+    #pragma unroll
+    for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
+        int r = rr + my_rank; if (r >= world_size) r -= world_size;
+        peer_pv[rr] = static_cast<const char*>(s_peer_data[r]) + slot_offset;
+    }
+
     float* my_data = reinterpret_cast<float*>(
-        static_cast<char*>(s_peer_data[my_rank]) + slot_offset);
+        const_cast<char*>(peer_pv[0]));
 
     // ---- Step 1: Compute local sum of squares per row, write to P2P buffer.
     for (int row = tid; row < batch; row += bs) {
@@ -569,9 +594,11 @@ p2p_rmsnorm_kernel(
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
+        // s_peer_flags via smem: my_rank is dynamic across kernels, smem avoids spill
         volatile int* mf = s_peer_flags[my_rank];
         *mf = seq + 1;
     }
+    // s_peer_flags[tid] via smem: dynamic index would spill register array
     if (tid < world_size) {
         volatile int* pf = s_peer_flags[tid];
         spin_until(pf, seq + 1);
@@ -585,9 +612,7 @@ p2p_rmsnorm_kernel(
         #pragma unroll
         for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
             if (rr >= world_size) break;
-            int r = rr + my_rank; if (r >= world_size) r -= world_size;
-            const float* peer_buf = reinterpret_cast<const float*>(
-                static_cast<const char*>(s_peer_data[r]) + slot_offset);
+            const float* peer_buf = reinterpret_cast<const float*>(peer_pv[rr]);
             total_sum += peer_buf[row];
         }
         s_inv_rms[row] = rsqrtf(total_sum / (float)full_dim + eps);
