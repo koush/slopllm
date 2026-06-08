@@ -391,14 +391,22 @@ __global__ void __launch_bounds__(256, 4) mla_v_expand_kernel(
     __syncthreads();
 
     // v_proj transposed layout: [n_heads, kv_lora_rank, v_head_dim]
-    // w_base[k * v_head_dim + j]: for fixed k, consecutive j -> coalesced reads
+    // w_base[k * v_head_dim + j]: for fixed k, consecutive j -> coalesced reads.
+    // Each thread owns a pair of consecutive j's, loading/converting/storing
+    // via __nv_bfloat162 so the bf16<->f32 conversions run as packed ops.
     const __nv_bfloat16* w_base = v_proj + h * kv_lora_rank * v_head_dim;
+    __nv_bfloat16* result_base = result + (b * seq_len + s) * (n_heads * v_head_dim) + h * v_head_dim;
 
-    for (int j = threadIdx.x; j < v_head_dim; j += blockDim.x) {
-        float sum = 0.0f;
-        for (int k = 0; k < kv_lora_rank; k++)
-            sum += s_attn[k] * __bfloat162float(w_base[k * v_head_dim + j]);
-        result[(b * seq_len + s) * (n_heads * v_head_dim) + h * v_head_dim + j] = __float2bfloat16(sum);
+    for (int j = threadIdx.x * 2; j < v_head_dim; j += blockDim.x * 2) {
+        float sum0 = 0.0f, sum1 = 0.0f;
+        for (int k = 0; k < kv_lora_rank; k++) {
+            float w0, w1;
+            load_bf16x2(w_base + k * v_head_dim + j, w0, w1);
+            float a = s_attn[k];
+            sum0 += a * w0;
+            sum1 += a * w1;
+        }
+        store_bf16x2(result_base + j, sum0, sum1);
     }
 }
 
@@ -409,7 +417,9 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        int attn_n_heads, int head_offset) {
     cudaSetDevice(ctx->device_id);
     int total_rows = batch * n_heads * seq_len;
-    int block_size = compute_block_size(v_head_dim, true);
+    // Each thread now handles a pair of consecutive j's (see kernel), so size
+    // the block to v_head_dim/2 threads -- one per output pair.
+    int block_size = compute_block_size(v_head_dim / 2, true);
     size_t shmem_size = kv_lora_rank * sizeof(float);
     mla_v_expand_kernel<<<total_rows, block_size, shmem_size, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,

@@ -49,7 +49,8 @@ __device__ __forceinline__ void cp_merge_one_pair(
     LseLoader load_lse,
     VLoader load_v,
     __nv_bfloat16* merged_v_out,
-    float* merged_lse)
+    float* merged_lse,
+    int rank_offset = 0)
 {
     constexpr int head_dim = VEC_SIZE * BDX;
 
@@ -60,8 +61,12 @@ __device__ __forceinline__ void cp_merge_one_pair(
         flashinfer::state_t<VEC_SIZE> st;
         st.init();
 
+        // Stagger shard read order by rank so all GPUs don't hammer the same
+        // peer's P2P buffer simultaneously (see p2p_allreduce_oneshot_kernel).
         #pragma unroll
-        for (int s = 0; s < NUM_SHARDS; ++s) {
+        for (int ss = 0; ss < NUM_SHARDS; ++ss) {
+            int s = ss + rank_offset;
+            if (s >= NUM_SHARDS) s -= NUM_SHARDS;
             flashinfer::vec_t<float, VEC_SIZE> v;
             load_v(v, s, b, h, head_dim, tid);
             st.merge(v, s_lse[s], 1.0f);
@@ -386,7 +391,8 @@ p2p_cp_merge_multi_kernel(
     int shard_n_heads,
     int head_offset,
     int input_n_heads,
-    int v_out_bytes)
+    int v_out_bytes,
+    int my_rank)
 {
     constexpr int head_dim = VEC_SIZE * BDX;
     int tid = threadIdx.x;
@@ -418,7 +424,7 @@ p2p_cp_merge_multi_kernel(
     cp_merge_one_pair<VEC_SIZE, BDX, NUM_SHARDS>(
         tid, b, h, num_heads, local_h, shard_n_heads, s_lse,
         load_lse, load_v,
-        merged_v_out, merged_lse);
+        merged_v_out, merged_lse, my_rank);
 }
 
 template <int VEC_SIZE, int BDX>
@@ -445,25 +451,25 @@ void launch_p2p_cp_merge(
             p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 2><<<grid, BDX, 0, stream>>>(
                 peer_data, slot_offset_out,
                 merged_v_out, merged_lse,
-                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
+                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes, my_rank);
             break;
         case 4:
             p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 4><<<grid, BDX, 0, stream>>>(
                 peer_data, slot_offset_out,
                 merged_v_out, merged_lse,
-                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
+                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes, my_rank);
             break;
         case 8:
             p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 8><<<grid, BDX, 0, stream>>>(
                 peer_data, slot_offset_out,
                 merged_v_out, merged_lse,
-                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
+                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes, my_rank);
             break;
         case 16:
             p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 16><<<grid, BDX, 0, stream>>>(
                 peer_data, slot_offset_out,
                 merged_v_out, merged_lse,
-                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes);
+                batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes, my_rank);
             break;
         default:
             fprintf(stderr, "launch_p2p_cp_merge: unsupported num_shards=%d (must be 2, 4, 8, or 16)\n", num_shards);
