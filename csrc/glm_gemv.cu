@@ -1265,14 +1265,15 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
     } else if (K <= SMALLK_THRESHOLD) {
         // Small K (<=512 => num_k_groups <= 32) means RowsPerWarp=2's 16
         // lanes/row each only run the reduction loop ~1-2 times -- mostly
-        // fixed per-block overhead. RowsPerWarp=4 (8 lanes/row) halves the
-        // grid (more rows per block) and doubles loop iterations per lane,
-        // amortizing that overhead better. (E.g. down_proj under 8-way TP:
-        // K = moe_intermediate/world_size = 256, N = hidden_size = 6144.)
-        constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * 4;
+        // fixed per-block overhead. RowsPerWarp=8 (4 lanes/row) shrinks the
+        // grid by 4x (more rows per block) and quadruples loop iterations
+        // per lane, amortizing that overhead better. (E.g. down_proj under
+        // 8-way TP: K = moe_intermediate/world_size = 256, N = hidden_size
+        // = 6144 -> num_k_groups = 16, 4 iterations/lane at RowsPerWarp=8.)
+        constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * 8;
         int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
         int grid_size = count * num_row_groups;
-        nvfp4_mul_mat_id_kernel<4><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        nvfp4_mul_mat_id_kernel<8><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)output,
             (const __nv_bfloat16*)input,
             (const uint8_t* const*)weight_ptrs,
