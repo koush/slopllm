@@ -2356,5 +2356,45 @@ void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
         input_ids, output_ids, qo_indptr, new_tokens, batch_size);
 }
 
+// ---------------------------------------------------------------------------
+// Sum of N tensors (element-wise, max 16 inputs)
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) sum_pointers_kernel(
+    const __nv_bfloat16** __restrict__ pointers,
+    __nv_bfloat16* __restrict__ output,
+    int N,
+    int64_t numel)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = blockDim.x * gridDim.x;
+
+    const __nv_bfloat16* ptrs[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        if (j >= N) break;
+        ptrs[j] = pointers[j];
+    }
+
+    for (int64_t i = idx; i < numel; i += stride) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            if (j >= N) break;
+            acc += __bfloat162float(ptrs[j][i]);
+        }
+        output[i] = __float2bfloat16(acc);
+    }
+}
+
+void glm_sum_pointers(GlmCtx* ctx, void** pointers, void* output, int N, int64_t numel) {
+    cudaSetDevice(ctx->device_id);
+    int block_size = 256;
+    int grid = (int)((numel + block_size - 1) / block_size);
+    if (grid > 65535) grid = 65535;
+    sum_pointers_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (const __nv_bfloat16**)pointers, (__nv_bfloat16*)output, N, numel);
+}
+
 } // extern "C"
 

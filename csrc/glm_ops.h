@@ -207,6 +207,10 @@ void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
                            const int* qo_indptr, const int* new_tokens,
                            int batch_size);
 
+// Element-wise sum of N tensors (max 16). pointers[0..N-1] are device pointers
+// to __nv_bfloat16 arrays, each of length numel. Output is BF16.
+void glm_sum_pointers(GlmCtx* ctx, void** pointers, void* output, int N, int64_t numel);
+
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
                        const void* indices, int dim, int k, int offset);
 

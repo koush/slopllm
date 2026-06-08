@@ -364,6 +364,17 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
+  sum(tensors: Tensor[]): void {
+    if (tensors.length === 0 || tensors.length > 15) {
+      throw new Error(`sum: requires 1-15 additional tensors, got ${tensors.length}`);
+    }
+    for (let i = 0; i < tensors.length; i++) {
+      if (tensors[i].type !== this.type) {
+        throw new Error(`sum: tensor ${i} type ${tensors[i].type} != ${this.type}`);
+      }
+    }
+  }
+
   scaleInPlace(scale: number, n: number): void {
   }
 

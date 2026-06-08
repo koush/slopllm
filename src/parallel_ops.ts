@@ -1598,6 +1598,13 @@ class P2PAllReduceGroup {
 
     // 2. Cache flag pointers (never changes).
     this.flagPtrs = this.instances.map(inst => addon.p2pGetFlagPtr(inst));
+
+    // 3. Initialize peer flags so barrier works before any ensureCapacity call.
+    //    Data pointers are set to zero — barrier doesn't use them.
+    const zeroDataPtrs = new Array(this.worldSize).fill(0);
+    for (let i = 0; i < this.worldSize; ++i) {
+      addon.p2pSetPeers(this.devices[i].ctx, this.instances[i], zeroDataPtrs, this.flagPtrs);
+    }
   }
 
   /**
@@ -1723,6 +1730,14 @@ export class ParallelOps implements DeviceOps {
     return this.p2pGroups.get(stream) || null;
   }
 
+  p2pSources: Tensor[] = [];
+  sourceCleanup() {
+    // arrived at new barrier, release the old sources
+    while (this.p2pSources.length) {
+      using _src = this.p2pSources.pop()!;
+    }
+  }
+
   /**
    * Try to AllReduce via the custom P2P kernel. Returns true on success
    * (caller must skip the NCCL fallback). Returns false if the message is
@@ -1739,15 +1754,46 @@ export class ParallelOps implements DeviceOps {
     const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
     if (!group)
       return false;
-    const elemBytes = dtype === NCCL_BFLOAT16 ? 2 : 4;
-    const slotBytes = count * elemBytes;
-    const shardWorkspaces = this.getShardWorkspaces(shards[0].workspace);
-    group.ensureCapacity(slotBytes, shardWorkspaces);
-    const addon = getNativeAddon();
-    for (let i = 0; i < this.worldSize; ++i) {
-      addon.p2pAllReduce(this.devices[i].ctx, group.instances[i],
-        shards[i].data, shards[i].data, count, dtype);
+
+    if (false) {
+      // prep data
+      const shardViews = shards.map(shard => {
+        const shardView = shard.workspace.alloc(shard.shape, shard.type);
+        shardView.memcpy(shard);
+        return shardView;
+      });
+
+      // indicate readiness
+      this.p2pBarrier();
+
+      // release the old sources and track new ones
+      this.sourceCleanup();
+      this.p2pSources.push(...shardViews);
+
+      for (let selfIndex = 0; selfIndex < this.worldSize; selfIndex++) {
+        const shard = shards[selfIndex];
+        const peerShards: Tensor[] = [];
+        for (let i = 0; i < this.worldSize; i++) {
+          const peerShard = shardViews[(selfIndex + i) % this.worldSize];
+          if (peerShard.workspace.glm !== shard.workspace.glm) {
+            peerShards.push(peerShard);
+          }
+        }
+        shard.sum(peerShards);
+      }
     }
+    else {
+      const elemBytes = dtype === NCCL_BFLOAT16 ? 2 : 4;
+      const slotBytes = count * elemBytes;
+      const shardWorkspaces = this.getShardWorkspaces(shards[0].workspace);
+      const addon = getNativeAddon();
+      group!.ensureCapacity(slotBytes, shardWorkspaces);
+      for (let i = 0; i < this.worldSize; ++i) {
+        addon.p2pAllReduce(this.devices[i].ctx, group!.instances[i],
+          shards[i].data, shards[i].data, count, dtype);
+      }
+    }
+
     return true;
   }
 
@@ -1771,8 +1817,7 @@ export class ParallelOps implements DeviceOps {
     const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
     if (!group)
       return false;
-    const shardWorkspaces = this.getShardWorkspaces(shards[0].workspace);
-    group.ensureCapacity(shardBytes, shardWorkspaces);
+    group.ensureCapacity(shardBytes, shards.map(s => s.workspace));
     const addon = getNativeAddon();
 
     if (parallelism === TensorParallelism.Column) {
@@ -1821,8 +1866,7 @@ export class ParallelOps implements DeviceOps {
     if (!group)
       return false;
     const slotBytes = batch * 4;
-    const shardWorkspaces = this.getShardWorkspaces(inputShards[0].workspace);
-    group.ensureCapacity(slotBytes, shardWorkspaces);
+    group.ensureCapacity(slotBytes, inputShards.map(s => s.workspace));
     const addon = getNativeAddon();
     for (let i = 0; i < this.worldSize; ++i) {
       const weightPtr = weightIsSharded
@@ -1969,7 +2013,7 @@ export class ParallelOps implements DeviceOps {
     if (!group) {
       throw new Error("p2pCpMerge: P2P not available");
     }
-    const shardWorkspaces = this.getShardWorkspaces(partialVOuts[0].workspace);
+    const shardWorkspaces = partialVOuts.map(s => s.workspace);
     group.ensureCapacity(slotBytes, shardWorkspaces);
     const shardVOutShape = isHeads ? [batchSize, snh * vHeadDim] : [batchSize, numHeads * vHeadDim];
 

@@ -594,6 +594,23 @@ static Napi::Value Scale(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value SumPointers(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5) {
+        Napi::TypeError::New(env, "Expected (ctx, pointers, out, N, numel)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t ptrs_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[2].As<Napi::Number>().Int64Value();
+    int N = info[3].As<Napi::Number>().Int32Value();
+    int64_t numel = info[4].As<Napi::Number>().Int64Value();
+    glm_sum_pointers(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                     reinterpret_cast<void**>(ptrs_ptr),
+                     reinterpret_cast<void*>(out_ptr), N, numel);
+    return env.Undefined();
+}
+
 static Napi::Value Add(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 5) {
@@ -2823,6 +2840,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "topk"), Napi::Function::New(env, Topk));
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));
     exports.Set(Napi::String::New(env, "scale"), Napi::Function::New(env, Scale));
+    exports.Set(Napi::String::New(env, "sumPointers"), Napi::Function::New(env, SumPointers));
     exports.Set(Napi::String::New(env, "add"), Napi::Function::New(env, Add));
     exports.Set(Napi::String::New(env, "addBroadcast"), Napi::Function::New(env, AddBroadcast));
     exports.Set(Napi::String::New(env, "rowScaleAdd"), Napi::Function::New(env, RowScaleAdd));

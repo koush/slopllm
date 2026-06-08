@@ -147,6 +147,7 @@ interface NativeAddon {
   add(ctx: number, out: number, a: number, b: number, n: number): void;
   addBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scale(ctx: number, out: number, input: number, scale: number, n: number): void;
+  sumPointers(ctx: number, pointers: number, out: number, n: number, numel: number): void;
   mul(ctx: number, out: number, a: number, b: number, n: number): void;
   mulBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
@@ -450,6 +451,21 @@ export class GlmTensor extends Tensor {
     const out = this.workspace.alloc(this.shape, this.type);
     getNativeAddon().add(this.glm.ctx, out.data, this.data, other.data, count);
     return out;
+  }
+
+  sum(tensors: Tensor[]): void {
+    super.sum(tensors);
+    const all = [this as Tensor, ...tensors];
+    const N = all.length;
+    const numel = this.shape.reduce((a, b) => a * b, 1);
+    const ptrName = `__sum_ptrs`;
+    let ptrs = this.workspace.tensors.get(ptrName);
+    if (!ptrs || ptrs.numElements < N) {
+      if (ptrs) ptrs[Symbol.dispose]();
+      ptrs = this.workspace.alloc([16], "I64", ptrName);
+    }
+    ptrs.writePointers(all);
+    getNativeAddon().sumPointers(this.glm.ctx, ptrs.data, this.data, N, numel);
   }
 
   scaleInPlace(scale: number, n: number): void {

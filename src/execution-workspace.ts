@@ -226,6 +226,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const tracker: Disposable & { [Symbol.dispose](): void } = {
       [Symbol.dispose]() {
         for (const tensor of ws.tracked) {
+          tensor.views.clear();
           tensor[Symbol.dispose]();
         }
         ws.tracked.clear();
