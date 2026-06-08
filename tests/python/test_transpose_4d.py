@@ -37,6 +37,17 @@ def test_transpose_4d_reverse_dims(glm, device):
     assert torch.equal(out.cpu(), expected.cpu())
 
 
+def test_transpose_4d_swap_2_3(glm, device):
+    # Non-tile-aligned dims to exercise the tiled shared-memory fast path's
+    # boundary handling (TRANSPOSE_TILE_DIM == 32).
+    B, S, H, D = 2, 3, 37, 50
+    x = torch.randn(B, S, H, D, dtype=torch.bfloat16, device=device)
+    out = torch.empty(B, S, D, H, dtype=torch.bfloat16, device=device)
+    glm.transpose_4d(out, x, B, S, H, D, 0, 1, 3, 2)
+    expected = x.transpose(2, 3).contiguous()
+    assert torch.equal(out.cpu(), expected.cpu())
+
+
 def test_transpose_4d_attention_shape(glm, device):
     B, S, H, D = 1, 16, 128, 2624
     x = torch.randn(B, S, H, D, dtype=torch.bfloat16, device=device)

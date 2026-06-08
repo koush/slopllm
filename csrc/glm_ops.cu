@@ -1651,6 +1651,57 @@ __global__ void __launch_bounds__(256, 4) transpose_0213_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Specialized transpose for {0,1,3,2}: swaps the last two dims (true 2D
+// transpose per (i0,i1) slice). Unlike the naive scatter kernels above, a
+// permutation that moves the fastest-varying input dim (dim3) to the
+// second-to-last output position makes BOTH the naive read and write strides
+// non-unit for one side -- e.g. coalesced reads but scattered writes with
+// stride dim2, or vice versa. A tiled shared-memory transpose lets every
+// thread do coalesced global reads AND coalesced global writes, paying for
+// the transpose with a fast on-chip shared-memory shuffle instead.
+// input:  [dim0, dim1, dim2, dim3]  output: [dim0, dim1, dim3, dim2]
+// out[b, h, j, i] = in[b, h, i, j]
+// ---------------------------------------------------------------------------
+
+constexpr int TRANSPOSE_TILE_DIM = 32;
+constexpr int TRANSPOSE_BLOCK_ROWS = 8;
+
+__global__ void __launch_bounds__(TRANSPOSE_TILE_DIM * TRANSPOSE_BLOCK_ROWS)
+transpose_swap_last2_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ input,
+    int dim01, int dim2, int dim3
+) {
+    __shared__ __nv_bfloat16 tile[TRANSPOSE_TILE_DIM][TRANSPOSE_TILE_DIM + 1];
+
+    int batch = blockIdx.z;
+    const __nv_bfloat16* in_base = input + (size_t)batch * dim2 * dim3;
+    __nv_bfloat16* out_base = out + (size_t)batch * dim3 * dim2;
+
+    int col = blockIdx.x * TRANSPOSE_TILE_DIM + threadIdx.x;  // index along dim3 (input row-contiguous)
+    int row0 = blockIdx.y * TRANSPOSE_TILE_DIM + threadIdx.y;
+
+    #pragma unroll
+    for (int j = 0; j < TRANSPOSE_TILE_DIM; j += TRANSPOSE_BLOCK_ROWS) {
+        int row = row0 + j;
+        if (row < dim2 && col < dim3)
+            tile[threadIdx.y + j][threadIdx.x] = in_base[(size_t)row * dim3 + col];
+    }
+    __syncthreads();
+
+    // Transposed coordinates: output row runs along dim3, output col along dim2
+    int out_col = blockIdx.y * TRANSPOSE_TILE_DIM + threadIdx.x;
+    int out_row0 = blockIdx.x * TRANSPOSE_TILE_DIM + threadIdx.y;
+
+    #pragma unroll
+    for (int j = 0; j < TRANSPOSE_TILE_DIM; j += TRANSPOSE_BLOCK_ROWS) {
+        int out_row = out_row0 + j;
+        if (out_row < dim3 && out_col < dim2)
+            out_base[(size_t)out_row * dim2 + out_col] = tile[threadIdx.x][threadIdx.y + j];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // General 4D transpose kernel
 // input:  [dim0, dim1, dim2, dim3] with row-major layout
 // output: [dim_perm0, dim_perm1, dim_perm2, dim_perm3]
@@ -1705,6 +1756,14 @@ void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
         transpose_0213_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
             dim0, dim1, dim2, dim3);
+    } else if (perm0 == 0 && perm1 == 1 && perm2 == 3 && perm3 == 2) {
+        ::dim3 block(TRANSPOSE_TILE_DIM, TRANSPOSE_BLOCK_ROWS);
+        ::dim3 grid3((dim3 + TRANSPOSE_TILE_DIM - 1) / TRANSPOSE_TILE_DIM,
+                     (dim2 + TRANSPOSE_TILE_DIM - 1) / TRANSPOSE_TILE_DIM,
+                     dim0 * dim1);
+        transpose_swap_last2_kernel<<<grid3, block, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+            dim0 * dim1, dim2, dim3);
     } else {
         transpose_4d_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
