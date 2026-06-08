@@ -1208,10 +1208,39 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
     constexpr int SPLITK_THRESHOLD = 1024;
     constexpr int SPLITK_FULL_THREADS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
     constexpr int SMALLK_THRESHOLD = GEMV_WARP_SIZE * NVFP4_QUANT_GROUP; // K <= 512: num_k_groups <= 32
+    constexpr int MIN_ROWSPERWARP_BLOCKS = 256;
+    int num_k_groups = K / NVFP4_QUANT_GROUP;
     if (N < SPLITK_THRESHOLD) {
+        bool splitk_underutilized = num_k_groups < SPLITK_FULL_THREADS;
+        if (splitk_underutilized) {
+            constexpr int ROWS_PER_BLOCK_SMALLK = GEMV_ROWS_PER_BLOCK * 2;
+            int grid_rpw_smallk = count * ((N + ROWS_PER_BLOCK_SMALLK - 1) / ROWS_PER_BLOCK_SMALLK);
+            if (grid_rpw_smallk >= MIN_ROWSPERWARP_BLOCKS) {
+                nvfp4_mul_mat_id_kernel<2><<<grid_rpw_smallk, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                    (__nv_bfloat16*)output,
+                    (const __nv_bfloat16*)input,
+                    (const uint8_t* const*)weight_ptrs,
+                    (const __nv_fp8_e4m3* const*)scale_ptrs,
+                    (const float* const*)scale2_ptrs,
+                    expert_ids, top_k,
+                    count, N, K);
+                return;
+            }
+            int grid_rpw_normalk = count * ((N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);
+            if (grid_rpw_normalk >= MIN_ROWSPERWARP_BLOCKS) {
+                nvfp4_mul_mat_id_kernel<1><<<grid_rpw_normalk, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                    (__nv_bfloat16*)output,
+                    (const __nv_bfloat16*)input,
+                    (const uint8_t* const*)weight_ptrs,
+                    (const __nv_fp8_e4m3* const*)scale_ptrs,
+                    (const float* const*)scale2_ptrs,
+                    expert_ids, top_k,
+                    count, N, K);
+                return;
+            }
+        }
         int grid_size = count * N;
-        int num_k_groups = K / NVFP4_QUANT_GROUP;
-        if (num_k_groups < SPLITK_FULL_THREADS) {
+        if (splitk_underutilized) {
             constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * 2;
             nvfp4_mul_mat_id_splitk_kernel<2><<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
                 (__nv_bfloat16*)output,
@@ -1233,8 +1262,6 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
                 count, N, K);
         }
     } else if (K <= SMALLK_THRESHOLD) {
-        // Each warp computes 2 rows (lanes 0-15 for row0, 16-31 for row1),
-        // doubling throughput when num_k_groups <= 32 (K <= 512).
         constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * 2;
         int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
         int grid_size = count * num_row_groups;
@@ -1336,10 +1363,35 @@ void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
     constexpr int SPLITK_THRESHOLD = 1024;
     constexpr int SPLITK_FULL_THREADS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
     constexpr int SMALLK_THRESHOLD = GEMV_WARP_SIZE * GEMV_K_VEC; // K <= 256: K_vec <= 32
+    constexpr int MIN_ROWSPERWARP_BLOCKS = 256;
+    int K_vec = K / GEMV_K_VEC;
     if (N < SPLITK_THRESHOLD) {
+        bool splitk_underutilized = K_vec < SPLITK_FULL_THREADS;
+        if (splitk_underutilized) {
+            constexpr int ROWS_PER_BLOCK_SMALLK = GEMV_ROWS_PER_BLOCK * 2;
+            int grid_rpw_smallk = count * ((N + ROWS_PER_BLOCK_SMALLK - 1) / ROWS_PER_BLOCK_SMALLK);
+            if (grid_rpw_smallk >= MIN_ROWSPERWARP_BLOCKS) {
+                bf16_mul_mat_id_kernel<2><<<grid_rpw_smallk, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                    (__nv_bfloat16*)output,
+                    (const __nv_bfloat16*)input,
+                    (const __nv_bfloat16* const*)weight_ptrs,
+                    expert_ids, top_k,
+                    count, N, K);
+                return;
+            }
+            int grid_rpw_normalk = count * ((N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);
+            if (grid_rpw_normalk >= MIN_ROWSPERWARP_BLOCKS) {
+                bf16_mul_mat_id_kernel<1><<<grid_rpw_normalk, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                    (__nv_bfloat16*)output,
+                    (const __nv_bfloat16*)input,
+                    (const __nv_bfloat16* const*)weight_ptrs,
+                    expert_ids, top_k,
+                    count, N, K);
+                return;
+            }
+        }
         int grid_size = count * N;
-        int K_vec = K / GEMV_K_VEC;
-        if (K_vec < SPLITK_FULL_THREADS) {
+        if (splitk_underutilized) {
             constexpr int block_size = GEMV_SPLITK_BLOCK_SIZE * 2;
             bf16_mul_mat_id_splitk_kernel<2><<<grid_size, block_size, 0, GLM_STREAM(ctx)>>>(
                 (__nv_bfloat16*)output,

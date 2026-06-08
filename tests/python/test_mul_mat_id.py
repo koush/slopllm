@@ -250,6 +250,74 @@ class TestMulMatId:
 
         torch.testing.assert_close(output_bf16.cpu().float(), ref.cpu(), atol=2e-2, rtol=2e-2)
 
+    def test_mul_mat_id_large_batch_small_N(self, glm, device):
+        batch = 15
+        K = 768
+        N = 256
+        num_experts = 8
+        topK = 8
+        count = batch * topK
+
+        input_bf16 = torch.randn(batch, K, dtype=torch.bfloat16, device=device)
+        weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
+
+        expert_ids = torch.randint(0, num_experts, (batch, topK), dtype=torch.int32, device=device)
+        expert_ids_flat = expert_ids.reshape(-1)
+
+        output_bf16 = torch.empty(count, N, dtype=torch.bfloat16, device=device)
+
+        weight_ptrs = GpuPtrs([w.data_ptr() for w in weights], device)
+
+        glm.mul_mat_id(
+            output_bf16.data_ptr(),
+            input_bf16.data_ptr(),
+            weight_ptrs.data_ptr,
+            expert_ids_flat.data_ptr(),
+            topK, count, N, K
+        )
+
+        ref = torch.zeros(count, N, dtype=torch.float32, device=device)
+        for i in range(count):
+            bid = i // topK
+            eid = expert_ids_flat[i].item()
+            ref[i] = input_bf16[bid].float() @ weights[eid].float().T
+
+        torch.testing.assert_close(output_bf16.cpu().float(), ref.cpu(), atol=2e-2, rtol=2e-2)
+
+    def test_mul_mat_id_large_batch_down_proj(self, glm, device):
+        batch = 15
+        K = 256
+        N = 768
+        num_experts = 8
+        topK = 8
+        count = batch * topK
+
+        input_bf16 = torch.randn(batch, K, dtype=torch.bfloat16, device=device)
+        weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
+
+        expert_ids = torch.randint(0, num_experts, (batch, topK), dtype=torch.int32, device=device)
+        expert_ids_flat = expert_ids.reshape(-1)
+
+        output_bf16 = torch.empty(count, N, dtype=torch.bfloat16, device=device)
+
+        weight_ptrs = GpuPtrs([w.data_ptr() for w in weights], device)
+
+        glm.mul_mat_id(
+            output_bf16.data_ptr(),
+            input_bf16.data_ptr(),
+            weight_ptrs.data_ptr,
+            expert_ids_flat.data_ptr(),
+            topK, count, N, K
+        )
+
+        ref = torch.zeros(count, N, dtype=torch.float32, device=device)
+        for i in range(count):
+            bid = i // topK
+            eid = expert_ids_flat[i].item()
+            ref[i] = input_bf16[bid].float() @ weights[eid].float().T
+
+        torch.testing.assert_close(output_bf16.cpu().float(), ref.cpu(), atol=2e-2, rtol=2e-2)
+
 class TestScatterAddRows:
     def test_scatter_add_rows_basic(self, glm, device):
         rows_out = 2
