@@ -213,8 +213,9 @@ p2p_allreduce_oneshot_kernel(
         for (int i = tid; i < count_v; i += bs) {
             float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;
             #pragma unroll
-            for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
-                if (r >= world_size) break;
+            for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
+                if (rr >= world_size) break;
+                int r = rr + my_rank; if (r >= world_size) r -= world_size;
                 const uint4* pv = reinterpret_cast<const uint4*>(
                     static_cast<const char*>(s_peer_data[r]) + slot_offset);
                 uint4 raw = pv[i];
@@ -242,8 +243,9 @@ p2p_allreduce_oneshot_kernel(
         for (int i = tail + tid; i < count; i += bs) {
             float s = 0.0f;
             #pragma unroll
-            for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
-                if (r >= world_size) break;
+            for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
+                if (rr >= world_size) break;
+                int r = rr + my_rank; if (r >= world_size) r -= world_size;
                 const __nv_bfloat16* p = reinterpret_cast<const __nv_bfloat16*>(
                     static_cast<const char*>(s_peer_data[r]) + slot_offset);
                 s += __bfloat162float(p[i]);
@@ -255,8 +257,9 @@ p2p_allreduce_oneshot_kernel(
         for (int i = tid; i < count_v; i += bs) {
             float a0=0,a1=0,a2=0,a3=0;
             #pragma unroll
-            for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
-                if (r >= world_size) break;
+            for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
+                if (rr >= world_size) break;
+                int r = rr + my_rank; if (r >= world_size) r -= world_size;
                 const uint4* pv = reinterpret_cast<const uint4*>(
                     static_cast<const char*>(s_peer_data[r]) + slot_offset);
                 uint4 raw = pv[i];
@@ -272,8 +275,9 @@ p2p_allreduce_oneshot_kernel(
         for (int i = tail + tid; i < count; i += bs) {
             float s = 0.0f;
             #pragma unroll
-            for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
-                if (r >= world_size) break;
+            for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
+                if (rr >= world_size) break;
+                int r = rr + my_rank; if (r >= world_size) r -= world_size;
                 const float* p = reinterpret_cast<const float*>(
                     static_cast<const char*>(s_peer_data[r]) + slot_offset);
                 s += p[i];
@@ -382,14 +386,18 @@ p2p_allgather_column_multi_kernel(
     const int* __restrict__ slot_offset_ptr,
     void* __restrict__ out,
     int shard_bytes,
-    int world_size)
+    int world_size,
+    int my_rank)
 {
     int slot_offset = *slot_offset_ptr;
     int tid = threadIdx.x;
     int bs  = blockDim.x;
 
     char* out_b = static_cast<char*>(out);
-    for (int r = 0; r < world_size; ++r) {
+    // Stagger the read order per-rank so all GPUs don't converge on the same
+    // peer's memory at the same time (see p2p_allreduce_oneshot_kernel).
+    for (int rr = 0; rr < world_size; ++rr) {
+        int r = rr + my_rank; if (r >= world_size) r -= world_size;
         const char* src = static_cast<const char*>(peer_data[r]) + slot_offset;
         char* dst = out_b + (size_t)r * shard_bytes;
 
@@ -421,7 +429,8 @@ p2p_allgather_row_multi_kernel(
     int shard_dim1_bytes,
     int full_dim1_bytes,
     int outer,
-    int world_size)
+    int world_size,
+    int my_rank)
 {
     int slot_offset = *slot_offset_ptr;
     int tid = threadIdx.x;
@@ -430,7 +439,9 @@ p2p_allgather_row_multi_kernel(
     char* out_b = static_cast<char*>(out);
 
     for (int row = blockIdx.x; row < outer; row += gridDim.x) {
-        for (int r = 0; r < world_size; ++r) {
+        // Stagger the read order per-rank (see p2p_allreduce_oneshot_kernel).
+        for (int rr = 0; rr < world_size; ++rr) {
+            int r = rr + my_rank; if (r >= world_size) r -= world_size;
             const char* src = static_cast<const char*>(peer_data[r]) + slot_offset
                               + (size_t)row * shard_dim1_bytes;
             char* dst = out_b + (size_t)row * full_dim1_bytes + (size_t)r * shard_dim1_bytes;
@@ -574,8 +585,9 @@ p2p_rmsnorm_kernel(
     for (int row = tid; row < batch; row += bs) {
         float total_sum = 0.0f;
         #pragma unroll
-        for (int r = 0; r < P2P_AR_MAX_WORLD; ++r) {
-            if (r >= world_size) break;
+        for (int rr = 0; rr < P2P_AR_MAX_WORLD; ++rr) {
+            if (rr >= world_size) break;
+            int r = rr + my_rank; if (r >= world_size) r -= world_size;
             const float* peer_buf = reinterpret_cast<const float*>(
                 static_cast<const char*>(s_peer_data[r]) + slot_offset);
             total_sum += peer_buf[row];
@@ -748,7 +760,7 @@ void glm_p2p_allgather(GlmCtx* ctx, GlmP2PInstance* inst,
     if (grid < 1) grid = 1;
     p2p_allgather_column_multi_kernel<<<grid, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
         inst->peer_data_arr_d, inst->slot_offset_d,
-        recvbuf, num_bytes, inst->world_size);
+        recvbuf, num_bytes, inst->world_size, inst->my_rank);
 }
 
 void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
@@ -774,7 +786,7 @@ void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
     if (grid < 1) grid = 1;
     p2p_allgather_row_multi_kernel<<<grid, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
         inst->peer_data_arr_d, inst->slot_offset_d,
-        recvbuf, shard_dim1_bytes, full_dim1_bytes, outer, inst->world_size);
+        recvbuf, shard_dim1_bytes, full_dim1_bytes, outer, inst->world_size, inst->my_rank);
 }
 
 void glm_p2p_rmsnorm(GlmCtx* ctx, GlmP2PInstance* inst,
