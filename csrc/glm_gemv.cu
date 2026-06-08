@@ -737,12 +737,13 @@ nvfp4_mul_mat_id_kernel(
             output[(size_t)entry * N + row] = __float2bfloat16(sum);
         }
     } else {
-        // Half-warp reduction: XOR strides 1,2,4,8 within each 16-lane half.
-        // Skip stride 16 which would cross the row boundary.
-        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 1);
-        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 2);
-        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 4);
-        sum += __shfl_xor_sync(0xFFFFFFFF, sum, 8);
+        // Sub-warp reduction: XOR strides LANES_PER_ROW/2 .. 1, confined to
+        // each LANES_PER_ROW-lane row group (stride never reaches LANES_PER_ROW,
+        // so it can't cross into a neighboring row).
+        #pragma unroll
+        for (int offset = LANES_PER_ROW / 2; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+        }
         if (row_valid && inner_lane == 0) {
             output[(size_t)entry * N + row] = __float2bfloat16(sum);
         }
@@ -1262,10 +1263,16 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
                 count, N, K);
         }
     } else if (K <= SMALLK_THRESHOLD) {
-        constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * 2;
+        // Small K (<=512 => num_k_groups <= 32) means RowsPerWarp=2's 16
+        // lanes/row each only run the reduction loop ~1-2 times -- mostly
+        // fixed per-block overhead. RowsPerWarp=4 (8 lanes/row) halves the
+        // grid (more rows per block) and doubles loop iterations per lane,
+        // amortizing that overhead better. (E.g. down_proj under 8-way TP:
+        // K = moe_intermediate/world_size = 256, N = hidden_size = 6144.)
+        constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * 4;
         int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
         int grid_size = count * num_row_groups;
-        nvfp4_mul_mat_id_kernel<2><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        nvfp4_mul_mat_id_kernel<4><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)output,
             (const __nv_bfloat16*)input,
             (const uint8_t* const*)weight_ptrs,
