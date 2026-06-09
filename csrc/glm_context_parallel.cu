@@ -35,6 +35,10 @@
 #include "flashinfer/attention/state.cuh"
 #include "flashinfer/vec_dtypes.cuh"
 #include "flashinfer/math.cuh"
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
+
+namespace cg = cooperative_groups;
 
 namespace {
 
@@ -443,6 +447,100 @@ p2p_cp_merge_multi_kernel(
         merged_v_out, merged_lse, my_rank);
 }
 
+// ---------------------------------------------------------------------------
+// Smem-staged P2P CP merge kernel.
+//
+// Issues all NUM_SHARDS V copies simultaneously via cg::memcpy_async before
+// waiting, so all NVLink reads are in-flight at once.  The merge loop then
+// runs against local smem instead of live P2P reads — same technique as
+// sum_pointers_smem_kernel.
+//
+// smem layout: [NUM_SHARDS * head_dim] bf16  (V data)
+//              [CP_MAX_SHARDS] float          (LSE, loaded directly — tiny)
+// ---------------------------------------------------------------------------
+
+template <int VEC_SIZE, int BDX, int NUM_SHARDS>
+__global__ void __launch_bounds__(BDX, 1)
+p2p_cp_merge_smem_kernel(
+    void* const* peer_data,
+    const int* __restrict__ slot_offset_ptr,
+    __nv_bfloat16* __restrict__ merged_v_out,
+    float* __restrict__ merged_lse,
+    int batch_size,
+    int num_heads,
+    int shard_n_heads,
+    int head_offset,
+    int input_n_heads,
+    int v_out_bytes,
+    int my_rank)
+{
+    constexpr int head_dim      = VEC_SIZE * BDX;
+    constexpr int v_shard_bytes = head_dim * sizeof(__nv_bfloat16);
+
+    // smem: V slabs first, LSE array after
+    extern __shared__ char smem[];
+    __nv_bfloat16* smem_v   = reinterpret_cast<__nv_bfloat16*>(smem);
+    float*         smem_lse = reinterpret_cast<float*>(smem + NUM_SHARDS * v_shard_bytes);
+
+    auto block = cg::this_thread_block();
+    int tid = threadIdx.x;
+
+    int bh      = blockIdx.x;
+    int b       = bh / shard_n_heads;
+    int local_h = bh % shard_n_heads;
+    int h       = local_h + head_offset;
+
+    if (b >= batch_size) return;
+
+    int slot_offset = *slot_offset_ptr;
+
+    // Build rank-rotated peer pointers
+    const char* peer_pv[CP_MAX_SHARDS];
+    #pragma unroll
+    for (int rr = 0; rr < CP_MAX_SHARDS; ++rr) {
+        if (rr >= NUM_SHARDS) break;
+        int r = rr + my_rank; if (r >= NUM_SHARDS) r -= NUM_SHARDS;
+        peer_pv[rr] = static_cast<const char*>(peer_data[r]) + slot_offset;
+    }
+
+    // Issue all NUM_SHARDS V copies simultaneously — all in-flight before any wait
+    #pragma unroll
+    for (int rr = 0; rr < NUM_SHARDS; ++rr) {
+        const __nv_bfloat16* src = reinterpret_cast<const __nv_bfloat16*>(peer_pv[rr])
+                                   + (b * input_n_heads + h) * head_dim;
+        cg::memcpy_async(block, smem_v + rr * head_dim, src, v_shard_bytes);
+    }
+
+    // LSE is tiny (NUM_SHARDS floats); load directly while V copies are in-flight
+    if (tid < NUM_SHARDS) {
+        const float* peer_lse = reinterpret_cast<const float*>(peer_pv[tid] + v_out_bytes);
+        smem_lse[tid] = peer_lse[b * num_heads + h];
+    }
+
+    // Wait for all V copies + barrier ensures smem_lse is visible
+    cg::wait(block);
+
+    // Merge from smem — no P2P reads in the hot loop
+    if (tid < BDX) {
+        flashinfer::state_t<VEC_SIZE> st;
+        st.init();
+
+        #pragma unroll
+        for (int ss = 0; ss < NUM_SHARDS; ++ss) {
+            int s = ss + my_rank; if (s >= NUM_SHARDS) s -= NUM_SHARDS;
+            flashinfer::vec_t<float, VEC_SIZE> v;
+            v.cast_load(smem_v + s * head_dim + tid * VEC_SIZE);
+            st.merge(v, smem_lse[s], 1.0f);
+        }
+
+        st.normalize();
+        st.o.cast_store(merged_v_out + (b * shard_n_heads + local_h) * head_dim + tid * VEC_SIZE);
+
+        if (merged_lse != nullptr && tid == 0)
+            merged_lse[b * shard_n_heads + local_h] = st.get_lse();
+    }
+}
+
 template <int VEC_SIZE, int BDX>
 void launch_p2p_cp_merge(
     void** peer_data, int** peer_flags, unsigned long long* seq_counter,
@@ -460,29 +558,34 @@ void launch_p2p_cp_merge(
         my_rank, world_size, max_slot_bytes,
         my_v_out, my_lse, batch_size, num_heads, v_out_bytes);
 
-    // Phase 2: Multi-block merge
+    // Phase 2: Multi-block merge (smem-staged: all shard V copies in-flight simultaneously)
     int grid = batch_size * shard_n_heads;
+    constexpr int head_dim = VEC_SIZE * BDX;
+    // smem: NUM_SHARDS * head_dim bf16  +  CP_MAX_SHARDS floats (LSE)
+    auto smem_bytes = [&](int ns) {
+        return ns * head_dim * (int)sizeof(__nv_bfloat16) + CP_MAX_SHARDS * (int)sizeof(float);
+    };
     switch (num_shards) {
         case 2:
-            p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 2><<<grid, BDX, 0, stream>>>(
+            p2p_cp_merge_smem_kernel<VEC_SIZE, BDX, 2><<<grid, BDX, smem_bytes(2), stream>>>(
                 peer_data, slot_offset_out,
                 merged_v_out, merged_lse,
                 batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes, my_rank);
             break;
         case 4:
-            p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 4><<<grid, BDX, 0, stream>>>(
+            p2p_cp_merge_smem_kernel<VEC_SIZE, BDX, 4><<<grid, BDX, smem_bytes(4), stream>>>(
                 peer_data, slot_offset_out,
                 merged_v_out, merged_lse,
                 batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes, my_rank);
             break;
         case 8:
-            p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 8><<<grid, BDX, 0, stream>>>(
+            p2p_cp_merge_smem_kernel<VEC_SIZE, BDX, 8><<<grid, BDX, smem_bytes(8), stream>>>(
                 peer_data, slot_offset_out,
                 merged_v_out, merged_lse,
                 batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes, my_rank);
             break;
         case 16:
-            p2p_cp_merge_multi_kernel<VEC_SIZE, BDX, 16><<<grid, BDX, 0, stream>>>(
+            p2p_cp_merge_smem_kernel<VEC_SIZE, BDX, 16><<<grid, BDX, smem_bytes(16), stream>>>(
                 peer_data, slot_offset_out,
                 merged_v_out, merged_lse,
                 batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_out_bytes, my_rank);
