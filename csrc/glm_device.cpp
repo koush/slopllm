@@ -169,6 +169,40 @@ void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,
                        static_cast<cudaMemcpyKind>(kind), GLM_STREAM(ctx));
 }
 
+void glm_memcpy_peer(GlmCtx* ctx, void* dst, int dstDevice,
+                      const void* src, int srcDevice, size_t bytes) {
+    cudaMemcpyPeerAsync(dst, dstDevice, src, srcDevice, bytes, GLM_STREAM(ctx));
+}
+
+void glm_memcpy3d_peer(GlmCtx* ctx,
+    void* dstPtr, size_t dstPitch, size_t dstXSize, size_t dstYSize, int dstDevice,
+    size_t dstPosX, size_t dstPosY, size_t dstPosZ,
+    const void* srcPtr, size_t srcPitch, size_t srcXSize, size_t srcYSize, int srcDevice,
+    size_t srcPosX, size_t srcPosY, size_t srcPosZ,
+    size_t width, size_t height, size_t depth) {
+    cudaMemcpy3DPeerParms p{};
+    p.dstPtr.ptr = dstPtr;
+    p.dstPtr.pitch = dstPitch;
+    p.dstPtr.xsize = dstXSize;
+    p.dstPtr.ysize = dstYSize;
+    p.dstDevice = dstDevice;
+    p.dstPos.x = dstPosX;
+    p.dstPos.y = dstPosY;
+    p.dstPos.z = dstPosZ;
+    p.srcPtr.ptr = const_cast<void*>(srcPtr);
+    p.srcPtr.pitch = srcPitch;
+    p.srcPtr.xsize = srcXSize;
+    p.srcPtr.ysize = srcYSize;
+    p.srcDevice = srcDevice;
+    p.srcPos.x = srcPosX;
+    p.srcPos.y = srcPosY;
+    p.srcPos.z = srcPosZ;
+    p.extent.width = width;
+    p.extent.height = height;
+    p.extent.depth = depth;
+    cudaMemcpy3DPeerAsync(&p, GLM_STREAM(ctx));
+}
+
 // ---------------------------------------------------------------------------
 // Stream synchronization
 // ---------------------------------------------------------------------------

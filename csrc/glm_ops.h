@@ -231,6 +231,18 @@ void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,
                   const void* src, size_t spitch,
                   size_t width, size_t height, int kind);
 
+// Peer-to-peer memory copy (async on stream, explicit src/dst devices)
+void glm_memcpy_peer(GlmCtx* ctx, void* dst, int dstDevice,
+                     const void* src, int srcDevice, size_t bytes);
+
+// 3D peer-to-peer memory copy (async on stream)
+void glm_memcpy3d_peer(GlmCtx* ctx,
+    void* dstPtr, size_t dstPitch, size_t dstXSize, size_t dstYSize, int dstDevice,
+    size_t dstPosX, size_t dstPosY, size_t dstPosZ,
+    const void* srcPtr, size_t srcPitch, size_t srcXSize, size_t srcYSize, int srcDevice,
+    size_t srcPosX, size_t srcPosY, size_t srcPosZ,
+    size_t width, size_t height, size_t depth);
+
 // ---------------------------------------------------------------------------
 // NCCL operations
 // ---------------------------------------------------------------------------

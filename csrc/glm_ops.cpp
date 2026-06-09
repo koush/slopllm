@@ -2493,6 +2493,59 @@ static Napi::Value Memcpy2d(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value MemcpyPeer(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, dst, dstDevice, src, srcDevice, bytes)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t dst_ptr = info[1].As<Napi::Number>().Int64Value();
+    int dstDevice = info[2].As<Napi::Number>().Int32Value();
+    uintptr_t src_ptr = info[3].As<Napi::Number>().Int64Value();
+    int srcDevice = info[4].As<Napi::Number>().Int32Value();
+    size_t bytes = info[5].As<Napi::Number>().Int64Value();
+    glm_memcpy_peer(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                    reinterpret_cast<void*>(dst_ptr), dstDevice,
+                    reinterpret_cast<const void*>(src_ptr), srcDevice, bytes);
+    return env.Undefined();
+}
+
+static Napi::Value Memcpy3dPeer(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 20) {
+        Napi::TypeError::New(env, "Expected (ctx, dstPtr, dstPitch, dstXSize, dstYSize, dstDevice, dstPosX, dstPosY, dstPosZ, srcPtr, srcPitch, srcXSize, srcYSize, srcDevice, srcPosX, srcPosY, srcPosZ, width, height, depth)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t dstPtr = info[1].As<Napi::Number>().Int64Value();
+    size_t dstPitch = info[2].As<Napi::Number>().Int64Value();
+    size_t dstXSize = info[3].As<Napi::Number>().Int64Value();
+    size_t dstYSize = info[4].As<Napi::Number>().Int64Value();
+    int dstDevice = info[5].As<Napi::Number>().Int32Value();
+    size_t dstPosX = info[6].As<Napi::Number>().Int64Value();
+    size_t dstPosY = info[7].As<Napi::Number>().Int64Value();
+    size_t dstPosZ = info[8].As<Napi::Number>().Int64Value();
+    uintptr_t srcPtr = info[9].As<Napi::Number>().Int64Value();
+    size_t srcPitch = info[10].As<Napi::Number>().Int64Value();
+    size_t srcXSize = info[11].As<Napi::Number>().Int64Value();
+    size_t srcYSize = info[12].As<Napi::Number>().Int64Value();
+    int srcDevice = info[13].As<Napi::Number>().Int32Value();
+    size_t srcPosX = info[14].As<Napi::Number>().Int64Value();
+    size_t srcPosY = info[15].As<Napi::Number>().Int64Value();
+    size_t srcPosZ = info[16].As<Napi::Number>().Int64Value();
+    size_t width = info[17].As<Napi::Number>().Int64Value();
+    size_t height = info[18].As<Napi::Number>().Int64Value();
+    size_t depth = info[19].As<Napi::Number>().Int64Value();
+    glm_memcpy3d_peer(reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<void*>(dstPtr), dstPitch, dstXSize, dstYSize, dstDevice,
+        dstPosX, dstPosY, dstPosZ,
+        reinterpret_cast<const void*>(srcPtr), srcPitch, srcXSize, srcYSize, srcDevice,
+        srcPosX, srcPosY, srcPosZ,
+        width, height, depth);
+    return env.Undefined();
+}
+
 static Napi::Value NcclUniqueId(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsBuffer()) {
@@ -2923,6 +2976,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
     exports.Set(Napi::String::New(env, "rotateInputIds"), Napi::Function::New(env, RotateInputIds));
     exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));
+    exports.Set(Napi::String::New(env, "memcpyPeer"), Napi::Function::New(env, MemcpyPeer));
+    exports.Set(Napi::String::New(env, "memcpy3dPeer"), Napi::Function::New(env, Memcpy3dPeer));
     exports.Set(Napi::String::New(env, "ncclUniqueId"), Napi::Function::New(env, NcclUniqueId));
     exports.Set(Napi::String::New(env, "ncclGroupStart"), Napi::Function::New(env, NcclGroupStart));
     exports.Set(Napi::String::New(env, "ncclGroupEnd"), Napi::Function::New(env, NcclGroupEnd));

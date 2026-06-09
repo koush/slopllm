@@ -1779,17 +1779,16 @@ export class ParallelOps implements DeviceOps {
         }
         shard.sum(peerShards);
       }
+      return true;
     }
-    else {
-      const elemBytes = dtype === NCCL_BFLOAT16 ? 2 : 4;
-      const slotBytes = count * elemBytes;
-      const shardWorkspaces = this.getShardWorkspaces(shards[0].workspace);
-      const addon = getNativeAddon();
-      group!.ensureCapacity(slotBytes, shardWorkspaces);
-      for (let i = 0; i < this.worldSize; ++i) {
-        addon.p2pAllReduce(this.devices[i].ctx, group!.instances[i],
-          shards[i].data, shards[i].data, count, dtype);
-      }
+    const elemBytes = dtype === NCCL_BFLOAT16 ? 2 : 4;
+    const slotBytes = count * elemBytes;
+    const shardWorkspaces = this.getShardWorkspaces(shards[0].workspace);
+    const addon = getNativeAddon();
+    group!.ensureCapacity(slotBytes, shardWorkspaces);
+    for (let i = 0; i < this.worldSize; ++i) {
+      addon.p2pAllReduce(this.devices[i].ctx, group!.instances[i],
+        shards[i].data, shards[i].data, count, dtype);
     }
 
     return true;
@@ -1815,13 +1814,79 @@ export class ParallelOps implements DeviceOps {
     const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
     if (!group)
       return false;
-    group.ensureCapacity(shardBytes, shards.map(s => s.workspace));
+
+    if (false) {
+      // release old sources, track new ones
+      this.sourceCleanup();
+    
+
+      // stage source data
+      const shardViews = outputShards.map(shard => {
+        const shardView = shard.workspace.alloc(shard.shape, shard.type);
+        shardView.memcpy(shard, undefined, MemcpyKind.DeviceToDevice);
+        return shardView;
+      });
+
+      // release old sources, track new ones
+      this.sourceCleanup();
+      // this.p2pSources.push(...shardViews);
+
+      // copy directly from peer shards into output — no staging needed
+      // each shard is already on its owner GPU and readable via P2P
+      if (parallelism === TensorParallelism.Column) {
+        for (let i = 0; i < this.worldSize; i++) {
+          for (let r = 0; r < this.worldSize; r++) {
+            outputShards[i].memcpy2d(
+              r * shardBytes,
+              shardBytes,
+              shards[r],
+              0,
+              shardBytes,
+              shardBytes,
+              1,
+              MemcpyKind.DeviceToDevice,
+            );
+          }
+        }
+        this.p2pBarrier();
+        return true;
+      }
+
+      if (parallelism === TensorParallelism.Row) {
+        const outer = fullShape[0];
+        const inner = fullShape.slice(2).reduce((a, b) => a * b, 1);
+        const shardDim1 = fullShape[1] / this.worldSize;
+        const shardDim1Bytes = shardDim1 * inner * elemBytes;
+        const fullDim1Bytes = fullShape[1] * inner * elemBytes;
+        for (let i = 0; i < this.worldSize; i++) {
+          for (let r = 0; r < this.worldSize; r++) {
+            outputShards[i].memcpy2d(
+              r * shardDim1Bytes,
+              fullDim1Bytes,
+              shards[r],
+              0,
+              shardDim1Bytes,
+              shardDim1Bytes,
+              outer,
+              MemcpyKind.DeviceToDevice,
+            );
+          }
+        }
+        this.p2pBarrier();
+        return true;
+      }
+
+      return false;
+    }
+
+    // old path: P2P data sync + gather kernels
+    group!.ensureCapacity(shardBytes, shards.map(s => s.workspace));
     const addon = getNativeAddon();
 
     if (parallelism === TensorParallelism.Column) {
       for (let i = 0; i < this.worldSize; ++i) {
         addon.p2pAllGather(
-          this.devices[i].ctx, group.instances[i],
+          this.devices[i].ctx, group!.instances[i],
           shards[i].data, outputShards[i].data,
           shardBytes,
         );
@@ -1837,7 +1902,7 @@ export class ParallelOps implements DeviceOps {
       const fullDim1Bytes = fullShape[1] * inner * elemBytes;
       for (let i = 0; i < this.worldSize; ++i) {
         addon.p2pAllGatherRow(
-          this.devices[i].ctx, group.instances[i],
+          this.devices[i].ctx, group!.instances[i],
           shards[i].data, outputShards[i].data,
           shardBytes, shardDim1Bytes, fullDim1Bytes, outer,
         );

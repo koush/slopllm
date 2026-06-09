@@ -114,6 +114,8 @@ interface NativeAddon {
   gateSigmoidMul(ctx: number, attnOut: number, gateInterleaved: number, batchSeq: number, numHeads: number, headDim: number): void;
   sampleBatch(ctx: number, outTokens: number, topkVals: number, topkIdxs: number, workspace: number, logits: number, penaltyTokens: number, penaltyCount: number, maxWindow: number, vocabSize: number, batchSize: number, temperatures: number, repPenalties: number, presPenalties: number, topKs: number, topPs: number, stepCounter: number, maxEffectiveK: number): void;
   memcpy2d(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void;
+  memcpyPeer(ctx: number, dst: number, dstDevice: number, src: number, srcDevice: number, bytes: number): void;
+  memcpy3dPeer(ctx: number, dstPtr: number, dstPitch: number, dstXSize: number, dstYSize: number, dstDevice: number, dstPosX: number, dstPosY: number, dstPosZ: number, srcPtr: number, srcPitch: number, srcXSize: number, srcYSize: number, srcDevice: number, srcPosX: number, srcPosY: number, srcPosZ: number, width: number, height: number, depth: number): void;
   bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number): void;
   ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, attnNHeads: number, headOffset: number): void;
@@ -289,7 +291,7 @@ export class GlmTensor extends Tensor {
 
   argmax(): Tensor {
     super.argmax();
-    const { indices, values} = this.max();
+    const { indices, values } = this.max();
     values[Symbol.dispose]();
     return indices;
   }
@@ -385,11 +387,30 @@ export class GlmTensor extends Tensor {
     }
     const bytes = size ?? Math.min(this.allocSize, src.allocSize);
     const copyKind = kind ?? (src.pinned ? MemcpyKind.HostToDevice : MemcpyKind.DeviceToDevice);
-    getNativeAddon().memcpy(this.glm.ctx, this.data, src.data, bytes, memcpyKindToNative(copyKind));
+    // if (copyKind === MemcpyKind.DeviceToDevice && this.glm !== src.glm) {
+    //   getNativeAddon().memcpyPeer(src.glm.ctx, this.data, this.glm.device, src.data, src.glm.device, bytes);
+    // } else {
+      getNativeAddon().memcpy(src.glm.ctx, this.data, src.data, bytes, memcpyKindToNative(copyKind));
+    // }
   }
 
   memcpy2d(dstOffset: number, dpitch: number, src: Tensor, srcOffset: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
-    getNativeAddon().memcpy2d(this.glm.ctx, this.data + dstOffset, dpitch, (src as GlmTensor).data + srcOffset, spitch, width, height, memcpyKindToNative(kind));
+    if (!(src instanceof GlmTensor)) {
+      throw new Error("GlmTensor.memcpy requires GlmTensor source");
+    }
+    // if (kind === MemcpyKind.DeviceToDevice && this.glm !== (src as GlmTensor).glm) {
+    //   const s = src as GlmTensor;
+    //   getNativeAddon().memcpy3dPeer(
+    //     src.glm.ctx,
+    //     this.data + dstOffset, dpitch, width, height, this.glm.device,
+    //     0, 0, 0,
+    //     s.data + srcOffset, spitch, width, height, s.glm.device,
+    //     0, 0, 0,
+    //     width, height, 1,
+    //   );
+    // } else {
+      getNativeAddon().memcpy2d(src.glm.ctx, this.data + dstOffset, dpitch, (src as GlmTensor).data + srcOffset, spitch, width, height, memcpyKindToNative(kind));
+    // }
   }
 
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
