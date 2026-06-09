@@ -28,6 +28,7 @@
 // ---------------------------------------------------------------------------
 
 #include "glm_ops.h"
+#include "glm_p2p_common.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdio>
@@ -293,10 +294,6 @@ void glm_context_parallel_merge_heads(
 
 constexpr int P2P_CP_BLOCK_SIZE = 1024;
 
-__device__ __forceinline__ void p2p_spin_until(volatile int* flag, int target) {
-    while (*flag < target) { /* spin */ }
-}
-
 __global__ void __launch_bounds__(P2P_CP_BLOCK_SIZE, 1)
 p2p_cp_sync_kernel(
     void* const* peer_data,
@@ -362,23 +359,8 @@ p2p_cp_sync_kernel(
         }
     }
 
-    // Publish data-ready flag
-    __threadfence_system();
-    __syncthreads();
-    if (tid == 0) {
-        // s_peer_flags via smem: my_rank is dynamic across kernels, smem avoids spill
-        volatile int* mf = s_peer_flags[my_rank];
-        *mf = seq + 1;
-    }
-
-    // Wait for all peers
-    // s_peer_flags[tid] via smem: dynamic index would spill register array
-    if (tid < world_size) {
-        volatile int* pf = s_peer_flags[tid];
-        p2p_spin_until(pf, seq + 1);
-    }
-    __syncthreads();
-    __threadfence_system();
+    // Publish data-ready flag and wait for all peers
+    p2p_publish_and_wait(tid, s_peer_flags, my_rank, world_size, seq);
 
     // Write slot_offset for Phase 2
     if (tid == 0) {

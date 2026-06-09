@@ -33,6 +33,7 @@
 //   should serialize via stream events.
 // ---------------------------------------------------------------------------
 #include "glm_ops.h"
+#include "glm_p2p_common.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdio>
@@ -42,11 +43,6 @@ namespace {
 constexpr int P2P_AR_BLOCK_SIZE = 1024;
 constexpr int P2P_AR_VEC_BF16 = 8;   // uint4 = 8 bf16
 constexpr int P2P_AR_VEC_F32 = 4;    // uint4 = 4 fp32
-
-// Spin-wait for `*flag >= target`. Volatile load forces fresh read from L2.
-__device__ __forceinline__ void spin_until(volatile int* flag, int target) {
-    while (*flag < target) { /* spin */ }
-}
 
 // ---------------------------------------------------------------------------
 // P2P data sync: scatter local data to P2P buffer, publish flag, wait for peers.
@@ -114,23 +110,8 @@ p2p_data_sync_kernel(
         }
     }
 
-    // Publish data-ready flag
-    __threadfence_system();
-    __syncthreads();
-    if (tid == 0) {
-        // s_peer_flags via smem: my_rank is dynamic across kernels, smem avoids spill
-        volatile int* mf = s_peer_flags[my_rank];
-        *mf = seq + 1;
-    }
-
-    // Wait for all peers
-    // s_peer_flags[tid] via smem: dynamic index would spill register array
-    if (tid < world_size) {
-        volatile int* pf = s_peer_flags[tid];
-        spin_until(pf, seq + 1);
-    }
-    __syncthreads();
-    __threadfence_system();
+    // Publish data-ready flag and wait for all peers
+    p2p_publish_and_wait(tid, s_peer_flags, my_rank, world_size, seq);
 
     // Write slot_offset for Phase 2
     if (tid == 0) {
@@ -171,18 +152,7 @@ p2p_barrier_kernel(
 
     int seq = (int)s_seq;
 
-    __threadfence_system();
-    __syncthreads();
-    if (tid == 0) {
-        volatile int* mf = s_peer_flags[my_rank];
-        *mf = seq + 1;
-    }
-    if (tid < world_size) {
-        volatile int* pf = s_peer_flags[tid];
-        spin_until(pf, seq + 1);
-    }
-    __syncthreads();
-    __threadfence_system();
+    p2p_publish_and_wait(tid, s_peer_flags, my_rank, world_size, seq);
 
     if (tid == 0) {
         *slot_offset_out = s_slot_offset;
@@ -259,20 +229,7 @@ p2p_allreduce_oneshot_kernel(
     }
 
     // Step 2: publish data-ready, wait for peers.
-    __threadfence_system();
-    __syncthreads();
-    if (tid == 0) {
-        // s_peer_flags via smem: my_rank is dynamic across kernels, smem avoids spill
-        volatile int* mf = s_peer_flags[my_rank];
-        *mf = seq + 1;
-    }
-    // s_peer_flags[tid] via smem: dynamic index would spill register array
-    if (tid < world_size) {
-        volatile int* pf = s_peer_flags[tid];
-        spin_until(pf, seq + 1);
-    }
-    __syncthreads();
-    __threadfence_system();
+    p2p_publish_and_wait(tid, s_peer_flags, my_rank, world_size, seq);
 
     // Step 3: read all peers at current slot, sum, write to output.
     if constexpr (VEC == 8) {
@@ -642,20 +599,7 @@ p2p_rmsnorm_kernel(
     }
 
     // ---- Step 2: Publish data-ready, wait for peers.
-    __threadfence_system();
-    __syncthreads();
-    if (tid == 0) {
-        // s_peer_flags via smem: my_rank is dynamic across kernels, smem avoids spill
-        volatile int* mf = s_peer_flags[my_rank];
-        *mf = seq + 1;
-    }
-    // s_peer_flags[tid] via smem: dynamic index would spill register array
-    if (tid < world_size) {
-        volatile int* pf = s_peer_flags[tid];
-        spin_until(pf, seq + 1);
-    }
-    __syncthreads();
-    __threadfence_system();
+    p2p_publish_and_wait(tid, s_peer_flags, my_rank, world_size, seq);
 
     // ---- Step 3: Read all peers' partial sums, compute inv_rms per row.
     for (int row = tid; row < batch; row += bs) {
