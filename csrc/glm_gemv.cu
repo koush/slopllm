@@ -713,18 +713,20 @@ nvfp4_mul_mat_id_kernel(
             uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
             uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
 
+            float gsum = 0.0f;
             #pragma unroll
             for (int j = 0; j < 4; j++) {
                 uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
-                sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb0[j * 2])
-                     + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb0[j * 2 + 1]);
+                gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb0[j * 2])
+                      + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb0[j * 2 + 1]);
             }
             #pragma unroll
             for (int j = 0; j < 4; j++) {
                 uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
-                sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb1[j * 2])
-                     + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb1[j * 2 + 1]);
+                gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb1[j * 2])
+                      + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb1[j * 2 + 1]);
             }
+            sum += gsum * scale;
         }
     }
 
@@ -796,18 +798,20 @@ nvfp4_mul_mat_id_splitk_kernel(
         uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
         uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
 
+        float gsum = 0.0f;
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
-            sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb0[j * 2])
-                 + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb0[j * 2 + 1]);
+            gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb0[j * 2])
+                  + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb0[j * 2 + 1]);
         }
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
-            sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb1[j * 2])
-                 + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb1[j * 2 + 1]);
+            gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb1[j * 2])
+                  + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb1[j * 2 + 1]);
         }
+        sum += gsum * scale;
     }
 
     #pragma unroll
@@ -1047,18 +1051,20 @@ nvfp4_linear_splitk_kernel(
         uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
         uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
 
+        float gsum = 0.0f;
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
-            sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb0[j * 2])
-                 + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb0[j * 2 + 1]);
+            gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb0[j * 2])
+                  + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb0[j * 2 + 1]);
         }
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
-            sum += fp4_e2m1_decode(packed & 0x0Fu) * scale * __bfloat162float(xb1[j * 2])
-                 + fp4_e2m1_decode(packed >> 4u) * scale * __bfloat162float(xb1[j * 2 + 1]);
+            gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb1[j * 2])
+                  + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb1[j * 2 + 1]);
         }
+        sum += gsum * scale;
     }
 
     #pragma unroll

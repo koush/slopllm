@@ -368,41 +368,49 @@ void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
 //  2. v_proj[h,k,j]: for fixed k, consecutive threads (j) hit consecutive addresses
 // ---------------------------------------------------------------------------
 
+template <int ROWS_PER_BLOCK>
 __global__ void __launch_bounds__(256, 4) mla_v_expand_kernel(
     __nv_bfloat16* __restrict__ result,
     const __nv_bfloat16* __restrict__ attn_out,
     const __nv_bfloat16* __restrict__ v_proj,
     int kv_lora_rank, int v_head_dim, int n_heads,
     int seq_len, int batch,
-    int attn_n_heads, int head_offset
+    int attn_n_heads, int head_offset,
+    int total_rows
 ) {
-    extern __shared__ float s_attn[];  // [kv_lora_rank]
+    extern __shared__ float s_attn[];  // [ROWS_PER_BLOCK * kv_lora_rank]
 
-    int bhs = blockIdx.x;
+    int threads_per_row = blockDim.x / ROWS_PER_BLOCK;
+    int row_in_block = threadIdx.x / threads_per_row;
+    int lane = threadIdx.x % threads_per_row;
+
+    int bhs = blockIdx.x * ROWS_PER_BLOCK + row_in_block;
+    bool valid = (bhs < total_rows);
+
     int s = bhs % seq_len;
     int h = (bhs / seq_len) % n_heads;
     int b = bhs / (seq_len * n_heads);
 
-    const __nv_bfloat16* attn_row = attn_out + ((b * attn_n_heads + h + head_offset) * seq_len + s) * kv_lora_rank;
+    float* my_s_attn = s_attn + row_in_block * kv_lora_rank;
 
-    // Load attn_row cooperatively into shared memory (all threads share the same row)
-    for (int k = threadIdx.x; k < kv_lora_rank; k += blockDim.x)
-        s_attn[k] = __bfloat162float(attn_row[k]);
+    if (valid) {
+        const __nv_bfloat16* attn_row = attn_out + ((b * attn_n_heads + h + head_offset) * seq_len + s) * kv_lora_rank;
+        for (int k = lane; k < kv_lora_rank; k += threads_per_row)
+            my_s_attn[k] = __bfloat162float(attn_row[k]);
+    }
     __syncthreads();
 
-    // v_proj transposed layout: [n_heads, kv_lora_rank, v_head_dim]
-    // w_base[k * v_head_dim + j]: for fixed k, consecutive j -> coalesced reads.
-    // Each thread owns a pair of consecutive j's, loading/converting/storing
-    // via __nv_bfloat162 so the bf16<->f32 conversions run as packed ops.
+    if (!valid) return;
+
     const __nv_bfloat16* w_base = v_proj + h * kv_lora_rank * v_head_dim;
     __nv_bfloat16* result_base = result + (b * seq_len + s) * (n_heads * v_head_dim) + h * v_head_dim;
 
-    for (int j = threadIdx.x * 2; j < v_head_dim; j += blockDim.x * 2) {
+    for (int j = lane * 2; j < v_head_dim; j += threads_per_row * 2) {
         float sum0 = 0.0f, sum1 = 0.0f;
         for (int k = 0; k < kv_lora_rank; k++) {
             float w0, w1;
             load_bf16x2(w_base + k * v_head_dim + j, w0, w1);
-            float a = s_attn[k];
+            float a = my_s_attn[k];
             sum0 += a * w0;
             sum1 += a * w1;
         }
@@ -417,15 +425,22 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        int attn_n_heads, int head_offset) {
     cudaSetDevice(ctx->device_id);
     int total_rows = batch * n_heads * seq_len;
-    // Each thread now handles a pair of consecutive j's (see kernel), so size
-    // the block to v_head_dim/2 threads -- one per output pair.
-    int block_size = compute_block_size(v_head_dim / 2, true);
-    size_t shmem_size = kv_lora_rank * sizeof(float);
-    mla_v_expand_kernel<<<total_rows, block_size, shmem_size, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
-        (const __nv_bfloat16*)v_proj,
-        kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
-        attn_n_heads, head_offset);
+    // Keep block_size <= 256 (matching __launch_bounds__): rows_per_block = 256 / threads_per_row.
+    int threads_per_row = compute_block_size(v_head_dim / 2, true);
+    int rows_per_block = max(1, 256 / threads_per_row);
+    int block_size = rows_per_block * threads_per_row;
+    int grid = (total_rows + rows_per_block - 1) / rows_per_block;
+    size_t shmem_size = rows_per_block * kv_lora_rank * sizeof(float);
+    auto launch = [&]<int RPB>() {
+        mla_v_expand_kernel<RPB><<<grid, block_size, shmem_size, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
+            (const __nv_bfloat16*)v_proj,
+            kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
+            attn_n_heads, head_offset, total_rows);
+    };
+    if (rows_per_block >= 4) launch.operator()<4>();
+    else if (rows_per_block == 2) launch.operator()<2>();
+    else launch.operator()<1>();
 }
 
 // ---------------------------------------------------------------------------
