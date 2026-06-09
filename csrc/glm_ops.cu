@@ -2405,6 +2405,90 @@ __global__ void __launch_bounds__(256, 4) sum_pointers_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Smem-staged sum of N tensors (element-wise, max 16 inputs)
+// Each warp cooperatively loads a contiguous chunk from each peer into smem
+// using cg::memcpy_async, then reduces from smem. This dramatically improves
+// PCIe P2P utilization by issuing large contiguous reads per peer instead of
+// interleaved per-element reads.
+// ---------------------------------------------------------------------------
+
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
+
+namespace cg = cooperative_groups;
+
+template <typename scalar_t, int ElemsPerWarp>
+__global__ void __launch_bounds__(1024, 1)
+sum_pointers_smem_kernel(
+    const scalar_t* p0,  const scalar_t* p1,  const scalar_t* p2,  const scalar_t* p3,
+    const scalar_t* p4,  const scalar_t* p5,  const scalar_t* p6,  const scalar_t* p7,
+    const scalar_t* p8,  const scalar_t* p9,  const scalar_t* p10, const scalar_t* p11,
+    const scalar_t* p12, const scalar_t* p13, const scalar_t* p14, const scalar_t* p15,
+    scalar_t* __restrict__ output,
+    int N,
+    int64_t numel)
+{
+    constexpr int WarpSize = 32;
+    constexpr int MaxN = 16;
+    constexpr int SmemPerWarp = MaxN * ElemsPerWarp * sizeof(scalar_t);
+
+    extern __shared__ char smem_raw[];
+    int warp_id = threadIdx.x / WarpSize;
+    int lane = threadIdx.x % WarpSize;
+    char* warp_smem = smem_raw + warp_id * SmemPerWarp;
+
+    auto warp = cg::tiled_partition<WarpSize>(cg::this_thread_block());
+
+    const scalar_t* ptrs[MaxN] = {
+        p0, p1, p2, p3, p4, p5, p6, p7,
+        p8, p9, p10, p11, p12, p13, p14, p15
+    };
+
+    int64_t total_warps = (int64_t)gridDim.x * (blockDim.x / WarpSize);
+    int64_t my_warp_id = (int64_t)blockIdx.x * (blockDim.x / WarpSize) + warp_id;
+
+    for (int64_t warp_start = my_warp_id * ElemsPerWarp;
+         warp_start < numel;
+         warp_start += total_warps * ElemsPerWarp)
+    {
+        int64_t elems = min((int64_t)ElemsPerWarp, numel - warp_start);
+        size_t copy_bytes = elems * sizeof(scalar_t);
+
+        // Stage each peer's chunk into smem using warp-cooperative async memcpy
+        for (int j = 0; j < N; j++) {
+            scalar_t* dst = reinterpret_cast<scalar_t*>(
+                warp_smem + j * ElemsPerWarp * sizeof(scalar_t));
+            cg::memcpy_async(warp, dst, ptrs[j] + warp_start, copy_bytes);
+        }
+        cg::wait(warp);
+
+        // Reduce from smem and write output
+        if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+            for (int i = lane; i < elems; i += WarpSize) {
+                float acc = 0.0f;
+                for (int j = 0; j < MaxN; j++) {
+                    if (j >= N) break;
+                    acc += __bfloat162float(
+                        reinterpret_cast<const __nv_bfloat16*>(
+                            warp_smem + j * ElemsPerWarp * sizeof(__nv_bfloat16))[i]);
+                }
+                output[warp_start + i] = __float2bfloat16(acc);
+            }
+        } else {
+            for (int i = lane; i < elems; i += WarpSize) {
+                float acc = 0.0f;
+                for (int j = 0; j < MaxN; j++) {
+                    if (j >= N) break;
+                    acc += reinterpret_cast<const float*>(
+                        warp_smem + j * ElemsPerWarp * sizeof(float))[i];
+                }
+                output[warp_start + i] = acc;
+            }
+        }
+    }
+}
+
 extern "C" {
 
 void glm_sum_pointers(GlmCtx* ctx,
@@ -2414,18 +2498,52 @@ void glm_sum_pointers(GlmCtx* ctx,
     void* p12, void* p13, void* p14, void* p15,
     void* output, int N, int64_t numel, int dtype) {
     cudaSetDevice(ctx->device_id);
-    int block_size = 256;
-    int grid = (int)((numel + block_size - 1) / block_size);
-    if (grid > 65535) grid = 65535;
+
+    constexpr int ElemsPerWarp = 512;
+    constexpr int WarpSize = 32;
+    constexpr int MaxN = 16;
+
+    int elem_size = (dtype == 9) ? 2 : 4;
+    int smem_per_warp = MaxN * ElemsPerWarp * elem_size;
+
+    // Determine warps per block based on smem availability and work size
+    int total_warps = (int)((numel + ElemsPerWarp - 1) / ElemsPerWarp);
+    if (total_warps == 0) total_warps = 1;
+
+    int max_smem = 0;
+    cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock, ctx->device_id);
+    int max_warps_by_smem = max_smem / smem_per_warp;
+    if (max_warps_by_smem > 32) max_warps_by_smem = 32;
+    if (max_warps_by_smem < 1) max_warps_by_smem = 1;
+
+    int warps_per_block = total_warps;
+    if (warps_per_block > max_warps_by_smem) warps_per_block = max_warps_by_smem;
+    if (warps_per_block > 16) warps_per_block = 16;
+    if (warps_per_block < 1) warps_per_block = 1;
+
+    int block_size = warps_per_block * WarpSize;
+    int grid = (total_warps + warps_per_block - 1) / warps_per_block;
+    if (grid > 65535) {
+        grid = 65535;
+        // recalculate warps_per_block for large numel
+        warps_per_block = (total_warps + grid - 1) / grid;
+        if (warps_per_block > max_warps_by_smem) warps_per_block = max_warps_by_smem;
+        if (warps_per_block > 32) warps_per_block = 32;
+        if (warps_per_block < 1) warps_per_block = 1;
+        block_size = warps_per_block * WarpSize;
+        grid = (total_warps + warps_per_block - 1) / warps_per_block;
+    }
+    int smem_bytes = warps_per_block * smem_per_warp;
+
     if (dtype == 9) {
-        sum_pointers_kernel<__nv_bfloat16><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        sum_pointers_smem_kernel<__nv_bfloat16, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
             (const __nv_bfloat16*)p0,  (const __nv_bfloat16*)p1,  (const __nv_bfloat16*)p2,  (const __nv_bfloat16*)p3,
             (const __nv_bfloat16*)p4,  (const __nv_bfloat16*)p5,  (const __nv_bfloat16*)p6,  (const __nv_bfloat16*)p7,
             (const __nv_bfloat16*)p8,  (const __nv_bfloat16*)p9,  (const __nv_bfloat16*)p10, (const __nv_bfloat16*)p11,
             (const __nv_bfloat16*)p12, (const __nv_bfloat16*)p13, (const __nv_bfloat16*)p14, (const __nv_bfloat16*)p15,
             (__nv_bfloat16*)output, N, numel);
     } else {
-        sum_pointers_kernel<float><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        sum_pointers_smem_kernel<float, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
             (const float*)p0,  (const float*)p1,  (const float*)p2,  (const float*)p3,
             (const float*)p4,  (const float*)p5,  (const float*)p6,  (const float*)p7,
             (const float*)p8,  (const float*)p9,  (const float*)p10, (const float*)p11,
