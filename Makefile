@@ -9,6 +9,7 @@ BUILD_DIR := build/Release
 SRCS_CU := csrc/glm_ops.cu csrc/glm_flash.cu csrc/glm_gemv.cu csrc/glm_gdn.cu csrc/glm_sampling.cu csrc/glm_p2p.cu csrc/glm_context_parallel.cu csrc/glm_grouped_moe.cu
 SRCS_CPP := csrc/glm_nccl.cpp csrc/glm_device.cpp
 OBJS := $(SRCS_CU:csrc/%.cu=$(BUILD_DIR)/%.o) $(SRCS_CPP:csrc/%.cpp=$(BUILD_DIR)/%.o)
+DEPS := $(OBJS:.o=.d)
 
 .PHONY: all clean test
 
@@ -21,16 +22,18 @@ $(BUILD_DIR)/$(LIB_NAME): $(OBJS) | $(BUILD_DIR)
 		-L$(CUDA_PATH)/lib64 -lcublas -lcudart -lnccl
 
 $(BUILD_DIR)/%.o: csrc/%.cu | $(BUILD_DIR)
-	$(NVCC) $(NVCC_FLAGS) -c -o $@ $< \
+	$(NVCC) $(NVCC_FLAGS) -MD -MF $(@:.o=.d) -c -o $@ $< \
 		$(FLASHINFER_INC) \
 		-I$(CUDA_PATH)/include
 
 $(BUILD_DIR)/%.o: csrc/%.cpp | $(BUILD_DIR)
-	$(NVCC) $(NVCC_FLAGS) -c -o $@ $< \
+	$(NVCC) $(NVCC_FLAGS) -MD -MF $(@:.o=.d) -c -o $@ $< \
 		-I$(CUDA_PATH)/include
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 clean:
-	rm -f $(BUILD_DIR)/$(LIB_NAME) $(OBJS)
+	rm -f $(BUILD_DIR)/$(LIB_NAME) $(OBJS) $(DEPS)
+
+-include $(DEPS)
