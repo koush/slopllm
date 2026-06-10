@@ -309,7 +309,7 @@ struct GlmP2PInstance {
     void**              peer_data_arr_d;
     int**               peer_flags_arr_d;
     unsigned long long* seq_counter_d;
-    int*                my_flag_d;
+    int*                my_flags_d;  // int[world_size]: rank's flag array, peers write into my_flags_d[their_rank]
     int*                slot_offset_d;
     int*                ready_mask_d;
     void*               metadata_alloc_d;
@@ -333,7 +333,7 @@ GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank,
 // Free instance state.
 void glm_p2p_destroy_instance(GlmP2PInstance* inst);
 
-// Get this rank's peer-visible flag pointer (single int).
+// Get this rank's peer-visible flag array pointer (int[world_size]).
 int* glm_p2p_get_flag_ptr(GlmP2PInstance* inst);
 
 // Set the max slot capacity (bytes per double-buffer slot).
@@ -342,7 +342,7 @@ void glm_p2p_set_max_bytes(GlmP2PInstance* inst, size_t max_bytes);
 
 // Configure this rank's view of all peers' data + flag pointers.
 // peer_data_ptrs[r] = device pointer (on rank r) to rank r's data buffer.
-// peer_flag_ptrs[r] = device pointer (on rank r) to rank r's flag.
+// peer_flag_ptrs[r] = device pointer (on rank r) to rank r's flag array (int[world_size]).
 void glm_p2p_set_peers(GlmCtx* ctx, GlmP2PInstance* inst,
                        const void* const* peer_data_ptrs,
                        int* const* peer_flag_ptrs);

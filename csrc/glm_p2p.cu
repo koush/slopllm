@@ -115,7 +115,8 @@ p2p_data_sync_kernel(
     }
 
     // Publish data-ready flag and wait for all peers
-    p2p_publish_and_wait(tid, s_peer_flags, my_rank, world_size, seq);
+    p2p_publish_and_wait(tid, my_rank, world_size, seq,
+                         s_peer_flags, s_peer_flags[my_rank]);
 
     // Write slot_offset for Phase 2
     if (tid == 0) {
@@ -156,7 +157,8 @@ p2p_barrier_kernel(
 
     int seq = (int)s_seq;
 
-    p2p_publish_and_wait(tid, s_peer_flags, my_rank, world_size, seq);
+    p2p_publish_and_wait(tid, my_rank, world_size, seq,
+                         s_peer_flags, s_peer_flags[my_rank]);
 
     if (tid == 0) {
         *slot_offset_out = s_slot_offset;
@@ -233,7 +235,8 @@ p2p_allreduce_oneshot_kernel(
     }
 
     // Step 2: publish data-ready, wait for peers.
-    p2p_publish_and_wait(tid, s_peer_flags, my_rank, world_size, seq);
+    p2p_publish_and_wait(tid, my_rank, world_size, seq,
+                         s_peer_flags, s_peer_flags[my_rank]);
 
     // Step 3: read all peers at current slot, sum, write to output.
     if constexpr (VEC == 8) {
@@ -306,11 +309,12 @@ p2p_allreduce_oneshot_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// P2P AllReduce – multi-block smem-staged with progressive pull.
+// P2P AllReduce – multi-block smem-staged with progressive push.
 //
-// Uses p2p_publish_and_wait_any to overlap NVLink data transfer with P2P
-// spin-wait latency. Block 0 does the P2P flag sync loop and writes the
-// cumulative ready mask to ready_mask_d; ALL blocks (including block 0)
+// Uses p2p_publish_and_wait_any (push-based) to overlap NVLink data
+// transfer with P2P spin-wait latency. Block 0 pushes its flag into all
+// peers' local flag arrays and polls its own array for readiness, writing
+// the cumulative ready mask to ready_mask_d; ALL blocks (including block 0)
 // spin-read ready_mask_d and issue cg::memcpy_async for newly-ready peers.
 //
 // Peer data pointers passed as kernel args (p0..p7) for CUDA graph safety —
@@ -337,6 +341,12 @@ p2p_allreduce_smem_kernel(
     int lane    = tid % WarpSize;
     int warps_per_block = blockDim.x / WarpSize;
     int64_t my_warp_id = (int64_t)blockIdx.x * warps_per_block + warp_id;
+
+    __shared__ int* s_peer_flags[MaxN];
+    __shared__ int* s_my_flags;
+    if (tid < world_size) s_peer_flags[tid] = peer_flags[tid];
+    if (tid == 0) s_my_flags = peer_flags[my_rank];
+    __syncthreads();
     int64_t total_warps = (int64_t)gridDim.x * warps_per_block;
 
     const scalar_t* ptrs[MaxN];
@@ -369,8 +379,9 @@ p2p_allreduce_smem_kernel(
             int prev_ready_mask = 0;
             while (true) {
                 int ready_mask = p2p_publish_and_wait_any(
-                    tid, peer_flags, my_rank, world_size,
-                    my_seq_counter, prev_ready_mask, ready_mask_d);
+                    tid, my_rank, world_size,
+                    my_seq_counter, prev_ready_mask, ready_mask_d,
+                    s_peer_flags, s_my_flags);
                 if (ready_mask == -1) break;
 
                 int new_gpu_mask = ready_mask ^ prev_ready_mask;
@@ -723,7 +734,8 @@ p2p_rmsnorm_kernel(
     }
 
     // ---- Step 2: Publish data-ready, wait for peers.
-    p2p_publish_and_wait(tid, s_peer_flags, my_rank, world_size, seq);
+    p2p_publish_and_wait(tid, my_rank, world_size, seq,
+                         s_peer_flags, s_peer_flags[my_rank]);
 
     // ---- Step 3: Read all peers' partial sums, compute inv_rms per row.
     for (int row = tid; row < batch; row += bs) {
@@ -795,12 +807,12 @@ GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size
     inst->max_bytes = 0;
     inst->device_id = ctx->device_id;
 
-    // Metadata-only allocation: peer_data[N] | peer_flags[N] | seq_counter | flag | slot_offset | ready_mask
+    // Metadata-only allocation: peer_data[N] | peer_flags[N] | seq_counter | flags[N] | slot_offset | ready_mask
     // Data buffer is provided externally via p2pSetPeers.
     size_t header = sizeof(void*) * world_size
                    + sizeof(int*)  * world_size
                    + sizeof(unsigned long long)
-                   + sizeof(int)
+                   + sizeof(int)  * world_size
                    + sizeof(int)
                    + sizeof(int);
     size_t header_aligned = (header + 255) & ~size_t(255);  // 256B align
@@ -819,7 +831,7 @@ GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size
     inst->peer_data_arr_d  = reinterpret_cast<void**>(p); p += sizeof(void*) * world_size;
     inst->peer_flags_arr_d = reinterpret_cast<int**>(p);  p += sizeof(int*)  * world_size;
     inst->seq_counter_d    = reinterpret_cast<unsigned long long*>(p); p += sizeof(unsigned long long);
-    inst->my_flag_d        = reinterpret_cast<int*>(p); p += sizeof(int);
+    inst->my_flags_d       = reinterpret_cast<int*>(p); p += sizeof(int) * world_size;
     inst->slot_offset_d    = reinterpret_cast<int*>(p); p += sizeof(int);
     inst->ready_mask_d     = reinterpret_cast<int*>(p);
     return inst;
@@ -833,7 +845,7 @@ void glm_p2p_destroy_instance(GlmP2PInstance* inst) {
 }
 
 int* glm_p2p_get_flag_ptr(GlmP2PInstance* inst) {
-    return inst ? inst->my_flag_d : nullptr;
+    return inst ? inst->my_flags_d : nullptr;
 }
 
 void glm_p2p_set_max_bytes(GlmP2PInstance* inst, size_t max_bytes) {

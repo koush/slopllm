@@ -3,36 +3,44 @@
 
 #include "glm_ops.h"
 
-__device__ __forceinline__ void p2p_spin_until(volatile int* flag, int target) {
-    while (*flag < target) { /* spin */ }
-}
-
 __device__ __forceinline__ void p2p_publish_and_wait(
     int tid,
-    int* const* s_peer_flags,
     int my_rank,
     int world_size,
-    int seq)
+    int seq,
+    int* const* peer_flag_arrays,
+    int* my_flags)
 {
-    __threadfence_system();
     __syncthreads();
-    if (tid == 0) {
-        volatile int* mf = s_peer_flags[my_rank];
-        *mf = seq + 1;
-    }
+
     if (tid < world_size) {
-        volatile int* pf = s_peer_flags[tid];
-        p2p_spin_until(pf, seq + 1);
+        int val = seq + 1;
+        if (tid == my_rank) {
+            my_flags[my_rank] = val;
+        } else {
+            asm volatile("st.global.release.sys.s32 [%0], %1;"
+                         :: "l"(peer_flag_arrays[tid] + my_rank), "r"(val));
+        }
+    }
+
+    if (tid < world_size) {
+        int target = seq + 1;
+        int v;
+        do {
+            asm volatile("ld.volatile.global.s32 %0, [%1];"
+                         : "=r"(v) : "l"(my_flags + tid));
+            if (v < target) __nanosleep(32);
+        } while (v < target);
+        asm volatile("fence.acquire.sys;");
     }
     __syncthreads();
-    __threadfence_system();
 }
 
 // Progressive P2P sync callable from any block.
 //
-// Block 0: publishes own flag (once, on first call), spins on P2P flags
-// until at least one new peer is ready, computes cumulative mask, writes
-// it to *ready_mask_d.
+// Block 0: pushes own flag into all peers' flag arrays (push), then polls
+// own local my_flags array until at least one new peer is ready, computes
+// cumulative mask, writes it to *ready_mask_d.
 //
 // Other blocks: spin-read *ready_mask_d until it advances past
 // prev_ready_mask.
@@ -46,12 +54,13 @@ __device__ __forceinline__ void p2p_publish_and_wait(
 // ready_mask_d – device int, zeroed before kernel launch
 __device__ __forceinline__ int p2p_publish_and_wait_any(
     int tid,
-    int* const* peer_flags,
     int my_rank,
     int world_size,
     unsigned long long* my_seq_counter,
     int prev_ready_mask,
-    int* ready_mask_d)
+    int* ready_mask_d,
+    int* const* peer_flag_arrays,
+    int* my_flags)
 {
     constexpr int MaxN = P2P_AR_MAX_WORLD;
     int full_mask = ((1 << world_size) - 1) ^ (1 << my_rank);
@@ -72,35 +81,49 @@ __device__ __forceinline__ int p2p_publish_and_wait_any(
                 if (s_seq == 0) s_seq = 2;
             }
             if (tid < world_size)
-                s_peer_flags[tid] = peer_flags[tid];
+                s_peer_flags[tid] = peer_flag_arrays[tid];
             __syncthreads();
-            if (tid == 0) {
-                __threadfence_system();
-                *(volatile int*)s_peer_flags[my_rank] = s_seq + 1;
+
+            // Push: write our flag into every peer's local flag array
+            if (tid < world_size) {
+                int val = (int)s_seq + 1;
+                if (tid == my_rank) {
+                    my_flags[my_rank] = val;
+                } else {
+                    asm volatile("st.global.release.sys.s32 [%0], %1;"
+                                 :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
+                }
             }
         }
 
         if (tid == 0) smem_flag_ready = 0;
         __syncthreads();
 
+        // Poll own local my_flags for peer readiness
         while (true) {
             if (tid < world_size && tid != my_rank
                 && !(prev_ready_mask & (1 << tid))) {
-                volatile int* pf = s_peer_flags[tid];
-                if (*pf >= s_seq + 1) {
+                int v;
+                asm volatile("ld.volatile.global.s32 %0, [%1];"
+                             : "=r"(v) : "l"(my_flags + tid));
+                if (v >= (int)s_seq + 1) {
                     smem_flag_ready = 1;
                     break;
                 }
+                __nanosleep(32);
             }
             if (smem_flag_ready) break;
         }
 
         if (tid < 32) {
             __syncwarp();
+            asm volatile("fence.acquire.sys;");
             uint32_t my_bit = 0;
             if (tid < world_size && tid != my_rank) {
-                volatile int* pf = s_peer_flags[tid];
-                if (*pf >= s_seq + 1) my_bit = (1u << tid);
+                int v;
+                asm volatile("ld.volatile.global.s32 %0, [%1];"
+                             : "=r"(v) : "l"(my_flags + tid));
+                if (v >= (int)s_seq + 1) my_bit = (1u << tid);
             }
             uint32_t ballot = __ballot_sync(0xFFFFFFFFu, my_bit != 0);
             if (tid == 0) s_ready_mask = (int)ballot;
@@ -114,7 +137,6 @@ __device__ __forceinline__ int p2p_publish_and_wait_any(
             __threadfence();
         }
         __syncthreads();
-        __threadfence_system();
 
         return cumulative;
     } else {

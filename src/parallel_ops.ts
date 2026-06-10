@@ -1788,11 +1788,11 @@ export class ParallelOps implements DeviceOps {
       return shardView;
     });
 
-    const elemBytes = dtype === NCCL_BFLOAT16 ? 2 : 4;
-    const slotBytes = count * elemBytes;
-    const shardWorkspaces = this.getShardWorkspaces(shards[0].workspace);
     const addon = getNativeAddon();
-    group!.ensureCapacity(slotBytes, shardWorkspaces);
+    // const elemBytes = dtype === NCCL_BFLOAT16 ? 2 : 4;
+    // const slotBytes = count * elemBytes;
+    // const shardWorkspaces = this.getShardWorkspaces(shards[0].workspace);
+    // group!.ensureCapacity(slotBytes, shardWorkspaces);
     for (let i = 0; i < this.worldSize; ++i) {
       addon.p2pAllReduceSmem(this.devices[i].ctx, group!.instances[i],
         shardViews[0]?.data || 0, shardViews[1]?.data || 0, shardViews[2]?.data || 0, shardViews[3]?.data || 0,

@@ -360,7 +360,8 @@ p2p_cp_sync_kernel(
     }
 
     // Publish data-ready flag and wait for all peers
-    p2p_publish_and_wait(tid, s_peer_flags, my_rank, world_size, seq);
+    p2p_publish_and_wait(tid, my_rank, world_size, seq,
+                         s_peer_flags, s_peer_flags[my_rank]);
 
     // Write slot_offset for Phase 2
     if (tid == 0) {

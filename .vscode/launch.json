@@ -61,8 +61,8 @@
                 // "--arena", "92",
                 // "--no-cuda-graph",
                 "--cp",
-                // "--mtp",
-                "--max-new-tokens", "2000",
+                "--mtp",
+                "--max-new-tokens", "1000",
             ],
             "skipFiles": [
                 "<node_internals>/**"

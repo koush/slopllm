@@ -151,6 +151,8 @@ export function mtpTreeDecode(
 
   const start = performance.now();
 
+  let warmup = false;
+
   if (true) {
     // current path that decodes in batch
     let hostBufOffset = 0;
@@ -169,6 +171,7 @@ export function mtpTreeDecode(
       const state = ws.planDecode(model, newBatchSize, cache);
 
 
+      warmup ||= !captureManager.isCaptured(['mtp-tree-decode', i, topks.length]);
       chainedMtpHiddenState = captureManager.run(() => {
         // prepare initial input
         if (i === 1) {
@@ -204,7 +207,7 @@ export function mtpTreeDecode(
 
         return newMtpHiddenStates.capture();
       }, ['mtp-tree-decode', i, topks.length]);
-      
+
       ws.glm.synchronize();
     }
 
@@ -226,6 +229,7 @@ export function mtpTreeDecode(
     });
     ws.ensureInputCleared();
 
+    warmup ||= !captureManager.isCaptured(['mtp-tree', numTreeNodes]);
     captureManager.run(() => {
       using initialLogits = mtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, batchSize);
       const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
@@ -322,9 +326,9 @@ export function mtpTreeDecode(
   const verificationTokens: number[][] = [];
   for (let batch = 0; batch < batchSize; batch++) {
     let batchOffset = batch * numTreeNodes * I32;
-      // this is a code smell, fix later when real batch support is added, right now code is batch 1
-      const batchTokens: number[] = [targetToken];
-      for (let i = 0; i < numTreeNodes; i++) {
+    // this is a code smell, fix later when real batch support is added, right now code is batch 1
+    const batchTokens: number[] = [targetToken];
+    for (let i = 0; i < numTreeNodes; i++) {
       batchTokens.push(hostBuf.readPinnedBuffer().readInt32LE(batchOffset + i * I32));
     }
     verificationTokens.push(batchTokens);
@@ -341,8 +345,9 @@ export function mtpTreeDecode(
 
   const hiddenStateStaging = ws.ensureAlloc([numVerificationTokens, hiddenDim], "BF16", `mtp-tree-hs-staging-${numVerificationTokens}`, undefined, 0);
 
+  warmup ||= !captureManager.isCaptured(['mtp-verify', numVerificationTokens]);
   const kvCacheLayers = captureManager.run(() => {
-    const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor,  appendCkvOrig: Tensor, appendKpeOrig: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
+    const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, appendCkvOrig: Tensor, appendKpeOrig: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
 
     const mlaKVCacheAppendOrig = targetPrefillState.mlaKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
@@ -468,6 +473,7 @@ export function mtpTreeDecode(
   const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache);
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
 
+  warmup ||= !captureManager.isCaptured(['mtp-replace', finishCount]);
   captureManager.run(() => {
     for (const layer of kvCacheLayers) {
       mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
@@ -495,9 +501,12 @@ export function mtpTreeDecode(
   // }
 
   // timings
-  console.log(`MTP tree decode: ${draft - start}ms, verification prefill ${verify - draft}ms, extend prefill ${performance.now() - verify}ms`);
+  // console.log(`MTP tree decode: ${draft - start}ms, verification prefill ${verify - draft}ms, extend prefill ${performance.now() - verify}ms`);
 
-  return [...acceptedTokens, bestReplacement];
+  return {
+    warmup,
+    tokens: [...acceptedTokens, bestReplacement],
+  }
 }
 
 function buildTargetMask(ws: WorkspaceBase, topk: number[]): { data: Tensor; indptr: Tensor } {

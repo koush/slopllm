@@ -278,12 +278,28 @@ export function* generateStream(
   try {
     for (let i = 1; i < maxNewTokens; i++) {
       if (mtp && model.forwardMtp && topks.length > 0) {
-        const treeResult = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, ws, currentToken, topks, cache, tokenizer);
+        const { warmup, tokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, ws, currentToken, topks, cache, tokenizer);
         // glm.synchronize();
-        for (const t of treeResult) {
+        for (const t of tokens) {
           currentToken = t;
           cache.reportTokens(0, [t]);
           tokenHistory.push(t);
+
+          const now = performance.now();
+          if (firstPostWarmupTime === 0)
+            firstPostWarmupTime = now;
+          lastTokenTime = now;
+
+          if (warmup) {
+            warmupSteps++;
+            firstPostWarmupTime = 0;
+            postWarmupTokenCount = 0;
+          }
+          else {
+            graphSteps++;
+            postWarmupTokenCount++;
+          }
+
           yield t;
           if (eosIds.has(t))
             return;
@@ -301,7 +317,6 @@ export function* generateStream(
         const state = ws.planDecode(model, 1, cache, !captureManager.disabled);
         state.setInput([[currentToken]]);
         planMs += performance.now() - tPlan;
-
 
         if (!captureManager.isCaptured(['decode'])) {
           warmupSteps++;
