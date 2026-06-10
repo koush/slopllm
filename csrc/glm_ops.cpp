@@ -2774,6 +2774,37 @@ static Napi::Value P2PAllReduce(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value P2PAllReduceSmem(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, instance, p0..p7, output, N, numel, dtype)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t ptrs[8];
+    for (int i = 0; i < 8; i++) {
+        ptrs[i] = info[2 + i].As<Napi::Number>().Int64Value();
+    }
+    uintptr_t output_ptr = info[10].As<Napi::Number>().Int64Value();
+    int N = info[11].As<Napi::Number>().Int32Value();
+    int64_t numel = info[12].As<Napi::Number>().Int64Value();
+    int dtype = info[13].As<Napi::Number>().Int32Value();
+    glm_p2p_allreduce_smem(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                            reinterpret_cast<GlmP2PInstance*>(inst_ptr),
+                            reinterpret_cast<const void*>(ptrs[0]),
+                            reinterpret_cast<const void*>(ptrs[1]),
+                            reinterpret_cast<const void*>(ptrs[2]),
+                            reinterpret_cast<const void*>(ptrs[3]),
+                            reinterpret_cast<const void*>(ptrs[4]),
+                            reinterpret_cast<const void*>(ptrs[5]),
+                            reinterpret_cast<const void*>(ptrs[6]),
+                            reinterpret_cast<const void*>(ptrs[7]),
+                            reinterpret_cast<void*>(output_ptr),
+                            N, numel, dtype);
+    return env.Undefined();
+}
+
 static Napi::Value P2PAllGather(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 5) {
@@ -2993,6 +3024,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "p2pGetFlagPtr"), Napi::Function::New(env, P2PGetFlagPtr));
     exports.Set(Napi::String::New(env, "p2pSetPeers"), Napi::Function::New(env, P2PSetPeers));
     exports.Set(Napi::String::New(env, "p2pAllReduce"), Napi::Function::New(env, P2PAllReduce));
+    exports.Set(Napi::String::New(env, "p2pAllReduceSmem"), Napi::Function::New(env, P2PAllReduceSmem));
     exports.Set(Napi::String::New(env, "p2pAllGather"), Napi::Function::New(env, P2PAllGather));
     exports.Set(Napi::String::New(env, "p2pAllGatherRow"), Napi::Function::New(env, P2PAllGatherRow));
     exports.Set(Napi::String::New(env, "p2pRmsnorm"), Napi::Function::New(env, P2PRmsnorm));

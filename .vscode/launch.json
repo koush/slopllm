@@ -61,7 +61,7 @@
                 // "--arena", "92",
                 // "--no-cuda-graph",
                 "--cp",
-                "--mtp",
+                // "--mtp",
                 "--max-new-tokens", "2000",
             ],
             "skipFiles": [

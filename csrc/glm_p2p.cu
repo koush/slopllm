@@ -36,7 +36,11 @@
 #include "glm_p2p_common.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
 #include <cstdio>
+
+namespace cg = cooperative_groups;
 
 namespace {
 
@@ -297,6 +301,126 @@ p2p_allreduce_oneshot_kernel(
                 s += p[i];
             }
             out[i] = s;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2P AllReduce – multi-block smem-staged with progressive pull.
+//
+// Uses p2p_publish_and_wait_any to overlap NVLink data transfer with P2P
+// spin-wait latency. Block 0 does the P2P flag sync loop and writes the
+// cumulative ready mask to ready_mask_d; ALL blocks (including block 0)
+// spin-read ready_mask_d and issue cg::memcpy_async for newly-ready peers.
+//
+// Peer data pointers passed as kernel args (p0..p7) for CUDA graph safety —
+// no mutation of persistent instance state.
+// ---------------------------------------------------------------------------
+
+template <typename scalar_t, int ElemsPerWarp>
+__global__ void __launch_bounds__(1024, 1)
+p2p_allreduce_smem_kernel(
+    const scalar_t* p0,  const scalar_t* p1,  const scalar_t* p2,  const scalar_t* p3,
+    const scalar_t* p4,  const scalar_t* p5,  const scalar_t* p6,  const scalar_t* p7,
+    int* const* peer_flags,
+    unsigned long long* my_seq_counter,
+    int* ready_mask_d,
+    int my_rank, int world_size,
+    scalar_t* __restrict__ out,
+    int64_t numel,
+    int smem_stride)
+{
+    constexpr int WarpSize = 32;
+    constexpr int MaxN = P2P_AR_MAX_WORLD;
+    int tid = threadIdx.x;
+    int warp_id = tid / WarpSize;
+    int lane    = tid % WarpSize;
+    int warps_per_block = blockDim.x / WarpSize;
+    int64_t my_warp_id = (int64_t)blockIdx.x * warps_per_block + warp_id;
+    int64_t total_warps = (int64_t)gridDim.x * warps_per_block;
+
+    const scalar_t* ptrs[MaxN];
+    ptrs[0] = p0; ptrs[1] = p1; ptrs[2] = p2; ptrs[3] = p3;
+    ptrs[4] = p4; ptrs[5] = p5; ptrs[6] = p6; ptrs[7] = p7;
+
+    auto warp = cg::tiled_partition<WarpSize>(cg::this_thread_block());
+    extern __shared__ char smem_raw[];
+    char* warp_smem = smem_raw + warp_id * smem_stride;
+
+    int64_t warp_start = my_warp_id * ElemsPerWarp;
+    bool warp_active = (warp_start < numel);
+    int64_t warp_elems = warp_active ? min((int64_t)ElemsPerWarp, numel - warp_start) : 0;
+    size_t warp_copy_bytes = warp_elems * sizeof(scalar_t);
+
+    // Copy self to smem immediately — local data, overlaps with P2P spin
+    if (warp_active) {
+        scalar_t* self_dst = reinterpret_cast<scalar_t*>(
+            warp_smem + my_rank * ElemsPerWarp * sizeof(scalar_t));
+        cg::memcpy_async(warp, self_dst, ptrs[my_rank] + warp_start, warp_copy_bytes);
+    }
+
+    int64_t total_warp_stride = total_warps * ElemsPerWarp;
+
+    for (int64_t seg_start = warp_start; seg_start < numel; seg_start += total_warp_stride) {
+        int64_t seg_elems = min((int64_t)ElemsPerWarp, numel - seg_start);
+        size_t seg_copy_bytes = seg_elems * sizeof(scalar_t);
+
+        if (seg_start == warp_start) {
+            int prev_ready_mask = 0;
+            while (true) {
+                int ready_mask = p2p_publish_and_wait_any(
+                    tid, peer_flags, my_rank, world_size,
+                    my_seq_counter, prev_ready_mask, ready_mask_d);
+                if (ready_mask == -1) break;
+
+                int new_gpu_mask = ready_mask ^ prev_ready_mask;
+
+                for (int gpu = 0; gpu < world_size; gpu++) {
+                    if (!(new_gpu_mask & (1 << gpu))) continue;
+
+                    if (warp_active) {
+                        scalar_t* dst = reinterpret_cast<scalar_t*>(
+                            warp_smem + gpu * ElemsPerWarp * sizeof(scalar_t));
+                        cg::memcpy_async(warp, dst, ptrs[gpu] + seg_start, seg_copy_bytes);
+                    }
+                }
+
+                prev_ready_mask = ready_mask;
+            }
+        } else {
+            // All peers ready — memcpy_async for all peers at once
+            for (int gpu = 0; gpu < world_size; gpu++) {
+                if (warp_active) {
+                    scalar_t* dst = reinterpret_cast<scalar_t*>(
+                        warp_smem + gpu * ElemsPerWarp * sizeof(scalar_t));
+                    cg::memcpy_async(warp, dst, ptrs[gpu] + seg_start, seg_copy_bytes);
+                }
+            }
+        }
+
+        if (warp_active) {
+            cg::wait(warp);
+
+            if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                for (int i = lane; i < seg_elems; i += WarpSize) {
+                    float acc = 0.0f;
+                    for (int gpu = 0; gpu < world_size; gpu++) {
+                        acc += __bfloat162float(
+                            reinterpret_cast<const __nv_bfloat16*>(
+                                warp_smem + gpu * ElemsPerWarp * sizeof(__nv_bfloat16))[i]);
+                    }
+                    out[seg_start + i] = __float2bfloat16(acc);
+                }
+            } else {
+                for (int i = lane; i < seg_elems; i += WarpSize) {
+                    float acc = 0.0f;
+                    for (int gpu = 0; gpu < world_size; gpu++) {
+                        acc += reinterpret_cast<const float*>(
+                            warp_smem + gpu * ElemsPerWarp * sizeof(float))[i];
+                    }
+                    out[seg_start + i] = acc;
+                }
+            }
         }
     }
 }
@@ -671,11 +795,12 @@ GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size
     inst->max_bytes = 0;
     inst->device_id = ctx->device_id;
 
-    // Metadata-only allocation: peer_data[N] | peer_flags[N] | seq_counter | flag | slot_offset
+    // Metadata-only allocation: peer_data[N] | peer_flags[N] | seq_counter | flag | slot_offset | ready_mask
     // Data buffer is provided externally via p2pSetPeers.
     size_t header = sizeof(void*) * world_size
                    + sizeof(int*)  * world_size
                    + sizeof(unsigned long long)
+                   + sizeof(int)
                    + sizeof(int)
                    + sizeof(int);
     size_t header_aligned = (header + 255) & ~size_t(255);  // 256B align
@@ -695,7 +820,8 @@ GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size
     inst->peer_flags_arr_d = reinterpret_cast<int**>(p);  p += sizeof(int*)  * world_size;
     inst->seq_counter_d    = reinterpret_cast<unsigned long long*>(p); p += sizeof(unsigned long long);
     inst->my_flag_d        = reinterpret_cast<int*>(p); p += sizeof(int);
-    inst->slot_offset_d    = reinterpret_cast<int*>(p);
+    inst->slot_offset_d    = reinterpret_cast<int*>(p); p += sizeof(int);
+    inst->ready_mask_d     = reinterpret_cast<int*>(p);
     return inst;
 }
 
@@ -753,6 +879,71 @@ void glm_p2p_allreduce(GlmCtx* ctx, GlmP2PInstance* inst,
                 count);
     } else {
         fprintf(stderr, "glm_p2p_allreduce: unsupported dtype %d\n", dtype);
+    }
+}
+
+void glm_p2p_allreduce_smem(GlmCtx* ctx, GlmP2PInstance* inst,
+                             const void* p0,  const void* p1,
+                             const void* p2,  const void* p3,
+                             const void* p4,  const void* p5,
+                             const void* p6,  const void* p7,
+                             void* output, int N, int64_t numel, int dtype) {
+    cudaSetDevice(ctx->device_id);
+
+    // Zero ready_mask_d before launch
+    cudaMemsetAsync(inst->ready_mask_d, 0, sizeof(int), GLM_STREAM(ctx));
+
+    constexpr int WarpSize = 32;
+    constexpr int ElemsPerWarp = 512;
+    constexpr int SmemBudget = 32 * 1024;
+
+    int elem_size = (dtype == 9) ? 2 : 4;
+    int smem_per_warp = N * ElemsPerWarp * elem_size;
+    if (smem_per_warp < 1) smem_per_warp = 1;
+
+    int warps_per_block = SmemBudget / smem_per_warp;
+    if (warps_per_block > 32) warps_per_block = 32;
+    if (warps_per_block < 1) warps_per_block = 1;
+
+    int block_size = warps_per_block * WarpSize;
+    int64_t total_warps = (numel + ElemsPerWarp - 1) / ElemsPerWarp;
+    if (total_warps < 1) total_warps = 1;
+    int grid = (int)((total_warps + warps_per_block - 1) / warps_per_block);
+    if (grid > 65535) grid = 65535;
+    int smem_bytes = warps_per_block * smem_per_warp;
+
+    if (dtype == 9) {
+        p2p_allreduce_smem_kernel<__nv_bfloat16, ElemsPerWarp>
+            <<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
+                static_cast<const __nv_bfloat16*>(p0),
+                static_cast<const __nv_bfloat16*>(p1),
+                static_cast<const __nv_bfloat16*>(p2),
+                static_cast<const __nv_bfloat16*>(p3),
+                static_cast<const __nv_bfloat16*>(p4),
+                static_cast<const __nv_bfloat16*>(p5),
+                static_cast<const __nv_bfloat16*>(p6),
+                static_cast<const __nv_bfloat16*>(p7),
+                inst->peer_flags_arr_d, inst->seq_counter_d, inst->ready_mask_d,
+                inst->my_rank, N,
+                static_cast<__nv_bfloat16*>(output),
+                numel, smem_per_warp);
+    } else if (dtype == 7) {
+        p2p_allreduce_smem_kernel<float, ElemsPerWarp>
+            <<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
+                static_cast<const float*>(p0),
+                static_cast<const float*>(p1),
+                static_cast<const float*>(p2),
+                static_cast<const float*>(p3),
+                static_cast<const float*>(p4),
+                static_cast<const float*>(p5),
+                static_cast<const float*>(p6),
+                static_cast<const float*>(p7),
+                inst->peer_flags_arr_d, inst->seq_counter_d, inst->ready_mask_d,
+                inst->my_rank, N,
+                static_cast<float*>(output),
+                numel, smem_per_warp);
+    } else {
+        fprintf(stderr, "glm_p2p_allreduce_smem: unsupported dtype %d\n", dtype);
     }
 }
 

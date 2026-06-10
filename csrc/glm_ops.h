@@ -311,6 +311,7 @@ struct GlmP2PInstance {
     unsigned long long* seq_counter_d;
     int*                my_flag_d;
     int*                slot_offset_d;
+    int*                ready_mask_d;
     void*               metadata_alloc_d;
     size_t              max_bytes;
     int                 world_size;
@@ -348,7 +349,17 @@ void glm_p2p_set_peers(GlmCtx* ctx, GlmP2PInstance* inst,
 
 // Run AllReduce on this rank's active stream.
 void glm_p2p_allreduce(GlmCtx* ctx, GlmP2PInstance* inst,
-                       const void* in, void* out, int count, int dtype);
+                        const void* in, void* out, int count, int dtype);
+
+// Multi-block smem-staged P2P AllReduce with progressive pull.
+// Peer data pointers passed as kernel args for CUDA graph safety.
+// dtype: 9=BF16, 7=F32.  Zeroes ready_mask_d before launch.
+void glm_p2p_allreduce_smem(GlmCtx* ctx, GlmP2PInstance* inst,
+                             const void* p0,  const void* p1,
+                             const void* p2,  const void* p3,
+                             const void* p4,  const void* p5,
+                             const void* p6,  const void* p7,
+                             void* output, int N, int64_t numel, int dtype);
 
 // Run AllGather (Column layout – contiguous per rank) on this rank's active stream.
 // Each rank contributes `num_bytes` bytes from sendbuf; recvbuf receives the

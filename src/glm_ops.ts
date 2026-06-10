@@ -135,6 +135,7 @@ interface NativeAddon {
   p2pSetMaxBytes(instance: number, maxBytes: number): void;
   p2pSetPeers(ctx: number, instance: number, dataPtrs: number[], flagPtrs: number[]): void;
   p2pAllReduce(ctx: number, instance: number, in_: number, out: number, count: number, dtype: number): void;
+  p2pAllReduceSmem(ctx: number, instance: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, numel: number, dtype: number): void;
   p2pAllGather(ctx: number, instance: number, sendbuf: number, recvbuf: number, numBytes: number): void;
   p2pAllGatherRow(ctx: number, instance: number, sendbuf: number, recvbuf: number, shardBytes: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number): void;
   p2pRmsnorm(ctx: number, instance: number, input: number, weight: number, output: number, eps: number, shardDim: number, fullDim: number, batch: number): void;
@@ -366,15 +367,15 @@ export class GlmTensor extends Tensor {
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
-    if (strided) {
-      return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
-    } else {
-      return this.mmapLoadAsync(mmapPtr, offset, nbytes);
-    }
+    // if (strided) {
+    //   return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
+    // } else {
+    //   return this.mmapLoadAsync(mmapPtr, offset, nbytes);
+    // }
   }
 
   async mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
-    return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
+    // return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
   }
 
   memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void> {

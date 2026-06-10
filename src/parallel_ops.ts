@@ -1781,14 +1781,23 @@ export class ParallelOps implements DeviceOps {
       }
       return true;
     }
+
+    const shardViews = shards.map(shard => {
+      const shardView = shard.workspace.alloc(shard.shape, shard.type);
+      shardView.memcpy(shard);
+      return shardView;
+    });
+
     const elemBytes = dtype === NCCL_BFLOAT16 ? 2 : 4;
     const slotBytes = count * elemBytes;
     const shardWorkspaces = this.getShardWorkspaces(shards[0].workspace);
     const addon = getNativeAddon();
     group!.ensureCapacity(slotBytes, shardWorkspaces);
     for (let i = 0; i < this.worldSize; ++i) {
-      addon.p2pAllReduce(this.devices[i].ctx, group!.instances[i],
-        shards[i].data, shards[i].data, count, dtype);
+      addon.p2pAllReduceSmem(this.devices[i].ctx, group!.instances[i],
+        shardViews[0]?.data || 0, shardViews[1]?.data || 0, shardViews[2]?.data || 0, shardViews[3]?.data || 0,
+        shardViews[4]?.data || 0, shardViews[5]?.data || 0, shardViews[6]?.data || 0, shardViews[7]?.data || 0,
+        shards[i].data, shards.length, count, dtype);
     }
 
     return true;
@@ -1818,7 +1827,7 @@ export class ParallelOps implements DeviceOps {
     if (false) {
       // release old sources, track new ones
       this.sourceCleanup();
-    
+
 
       // stage source data
       const shardViews = outputShards.map(shard => {
