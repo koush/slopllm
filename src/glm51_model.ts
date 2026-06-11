@@ -251,10 +251,13 @@ export class Glm51Model extends ChatModel {
       throw new Error(`loadMlaWeight: expected BF16, got ${meta.dtype}`);
     }
 
+    // using column parallelism means there's a gather on the absorbed
+    const nopeParallelism = false && this.contextParallel ? TensorParallelism.Replicated : colPar;
+
     if (name.endsWith(".q_b_proj.weight")) {
       const eb = 2;
       const srcPitch = qkHeadDim * inDim * eb;
-      const tQNope = this.alloc([nHeads * qkNopeDim, qLoraRank], "BF16", undefined, colPar);
+      const tQNope = this.alloc([nHeads * qkNopeDim, qLoraRank], "BF16", undefined, nopeParallelism);
       const peName = name.replace(".q_b_proj.weight", ".q_pe_proj.weight");
       const par = this.contextParallel ? TensorParallelism.Replicated : colPar;
       const tPe = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", peName, par);
@@ -266,7 +269,7 @@ export class Glm51Model extends ChatModel {
     } else if (name.endsWith(".kv_b_proj.weight")) {
       const eb = 2;
       const srcPitch = (qkNopeDim + vHeadDim) * inDim * eb;
-      const tKNope = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", undefined, colPar);
+      const tKNope = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", undefined, nopeParallelism);
       const vName = name.replace(".kv_b_proj.weight", ".v_proj.weight");
       const vPar = this.contextParallel ? TensorParallelism.Replicated : colPar;
       using tVRaw = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", undefined, vPar);
@@ -444,7 +447,10 @@ export class Glm51Model extends ChatModel {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
       using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps, cfg.qLoraRank, BS);
 
-      using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!, BS);
+      using qPeR = this.glm.withStream(() => {
+        using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!, BS);
+        return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
+      });
 
       using qAbsorbedRStream = this.glm.withStream(() => {
         using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!, BS);
@@ -452,8 +458,6 @@ export class Glm51Model extends ChatModel {
           ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
           : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
       });
-
-      using qPeR = this.glm.withStream(() => qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave));
 
       qAbsorbedRStream.streamWaitEvent();
       qPeR.streamWaitEvent();
