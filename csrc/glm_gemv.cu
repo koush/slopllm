@@ -1,4 +1,5 @@
 #include "glm_ops.h"
+#include "glm_nvfp4.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_fp8.h>
@@ -385,20 +386,6 @@ fp8_dequantize_gemm_smem_kernel(
 
 constexpr int NVFP4_QUANT_GROUP = 16;
 
-// Decode 4-bit E2M1 float to float32 using register arithmetic only.
-// Constant memory LUT with divergent warp access serializes to 32 sequential
-// fetches; this replaces it with pure register ops (no memory traffic).
-// Bit layout: [sign][exp1][exp0][mantissa], exponent bias = 1.
-// Values: 0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6
-__device__ __forceinline__ float fp4_e2m1_decode(uint8_t nibble) {
-    uint32_t n = (uint32_t)nibble & 0x7u;
-    // n=0 → 0.0, n=1 → 0.5 (subnormal), n≥2 → normal: 1.m * 2^(e-1)
-    uint32_t fp = (n < 2u) ? (n * 0x3F000000u)
-                            : (((126u + (n >> 1u)) << 23u) | ((n & 1u) << 22u));
-    fp |= (uint32_t)(nibble >> 3u) << 31u;
-    return __uint_as_float(fp);
-}
-
 template<int K_TILE>
 __global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
 nvfp4_dequantize_gemv_kernel(
@@ -451,9 +438,8 @@ nvfp4_dequantize_gemv_kernel(
                     float x0 = __bfloat162float(x2.x);
                     float x1 = __bfloat162float(x2.y);
                     uint8_t packed = weight_row[(k_start + g_start) / 2 + ki];
-                    float w0 = fp4_e2m1_decode(packed & 0x0Fu) * scale;
-                    float w1 = fp4_e2m1_decode(packed >> 4u) * scale;
-                    sum += w0 * x0 + w1 * x1;
+                    float2 w = fp4x2_to_float2(packed);
+                    sum += w.x * scale * x0 + w.y * scale * x1;
                 }
             }
         }
@@ -479,10 +465,9 @@ nvfp4_dequantize_gemv_kernel(
                 int g_start = g * NVFP4_QUANT_GROUP;
                 for (int k = g_start + lane; k < g_start + NVFP4_QUANT_GROUP; k += GEMV_WARP_SIZE) {
                     uint8_t packed = weight_row[(remaining_start + k) / 2];
-                    float w0 = fp4_e2m1_decode(packed & 0x0Fu) * scale;
-                    float w1 = fp4_e2m1_decode(packed >> 4u) * scale;
+                    float2 w = fp4x2_to_float2(packed);
                     float x_val = __bfloat162float(smem[k]);
-                    sum += (k % 2 == 0 ? w0 : w1) * x_val;
+                    sum += ((k % 2 == 0) ? w.x : w.y) * scale * x_val;
                 }
             }
         }
@@ -543,8 +528,8 @@ nvfp4_dequantize_to_bf16_kernel(
     int kg = k / NVFP4_QUANT_GROUP;
     float scale = static_cast<float>(weight_scale[n * num_k_groups + kg]) * (*weight_scale_2);
     uint8_t packed = weight[n * (K / 2) + k / 2];
-    float val = (k & 1) ? fp4_e2m1_decode(packed >> 4u) * scale
-                         : fp4_e2m1_decode(packed & 0x0Fu) * scale;
+    float2 w = fp4x2_to_float2(packed);
+    float val = ((k & 1) ? w.y : w.x) * scale;
     dst[idx] = __float2bfloat16(val);
 }
 
@@ -625,8 +610,9 @@ nvfp4_dequantize_gemm_smem_kernel(
             int kg = kb * (NVFP4_GEMM_K_TILE / NVFP4_QUANT_GROUP) + k / NVFP4_QUANT_GROUP;
             float scale = static_cast<float>(weight_scale[(n_start + ln) * num_k_groups + kg]) * scale_2_val;
             uint8_t packed = weight[(n_start + ln) * (K / 2) + k_start / 2 + lk_pair];
-            smem_weight[ln][k]     = __float2bfloat16(fp4_e2m1_decode(packed & 0x0Fu) * scale);
-            smem_weight[ln][k + 1] = __float2bfloat16(fp4_e2m1_decode(packed >> 4u) * scale);
+            float2 w = fp4x2_to_float2(packed);
+            smem_weight[ln][k]     = __float2bfloat16(w.x * scale);
+            smem_weight[ln][k + 1] = __float2bfloat16(w.y * scale);
         }
 
         __syncthreads();
@@ -717,14 +703,16 @@ nvfp4_mul_mat_id_kernel(
             #pragma unroll
             for (int j = 0; j < 4; j++) {
                 uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
-                gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb0[j * 2])
-                      + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb0[j * 2 + 1]);
+                float2 w = fp4x2_to_float2(packed);
+                gsum += w.x * __bfloat162float(xb0[j * 2])
+                      + w.y * __bfloat162float(xb0[j * 2 + 1]);
             }
             #pragma unroll
             for (int j = 0; j < 4; j++) {
                 uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
-                gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb1[j * 2])
-                      + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb1[j * 2 + 1]);
+                float2 w = fp4x2_to_float2(packed);
+                gsum += w.x * __bfloat162float(xb1[j * 2])
+                      + w.y * __bfloat162float(xb1[j * 2 + 1]);
             }
             sum += gsum * scale;
         }
@@ -802,14 +790,16 @@ nvfp4_mul_mat_id_splitk_kernel(
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
-            gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb0[j * 2])
-                  + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb0[j * 2 + 1]);
+            float2 w = fp4x2_to_float2(packed);
+            gsum += w.x * __bfloat162float(xb0[j * 2])
+                  + w.y * __bfloat162float(xb0[j * 2 + 1]);
         }
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
-            gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb1[j * 2])
-                  + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb1[j * 2 + 1]);
+            float2 w = fp4x2_to_float2(packed);
+            gsum += w.x * __bfloat162float(xb1[j * 2])
+                  + w.y * __bfloat162float(xb1[j * 2 + 1]);
         }
         sum += gsum * scale;
     }
@@ -1055,14 +1045,16 @@ nvfp4_linear_splitk_kernel(
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
-            gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb0[j * 2])
-                  + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb0[j * 2 + 1]);
+            float2 w = fp4x2_to_float2(packed);
+            gsum += w.x * __bfloat162float(xb0[j * 2])
+                  + w.y * __bfloat162float(xb0[j * 2 + 1]);
         }
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
-            gsum += fp4_e2m1_decode(packed & 0x0Fu) * __bfloat162float(xb1[j * 2])
-                  + fp4_e2m1_decode(packed >> 4u)   * __bfloat162float(xb1[j * 2 + 1]);
+            float2 w = fp4x2_to_float2(packed);
+            gsum += w.x * __bfloat162float(xb1[j * 2])
+                  + w.y * __bfloat162float(xb1[j * 2 + 1]);
         }
         sum += gsum * scale;
     }

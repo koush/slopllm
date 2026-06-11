@@ -6,7 +6,7 @@ CompileFlags:
     - "-I/mnt/storage2/glm.js/vendor/flashinfer/3rdparty/cutlass/include"
     - "-I/mnt/storage2/glm.js/vendor/flashinfer/3rdparty/cutlass/tools/util/include"
     - "-I/usr/include/node"
-    - "-I/usr/local/cuda-12.9/targets/x86_64-linux/include"
+    - "-I/usr/local/cuda-13.3/targets/x86_64-linux/include"
     - "-std=c++17"
     - "-fPIC"
     - "--cuda-gpu-arch=sm_120a"

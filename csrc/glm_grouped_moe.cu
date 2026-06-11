@@ -1,4 +1,5 @@
 #include "glm_ops.h"
+#include "glm_nvfp4.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -232,14 +233,6 @@ __global__ void unscatter_output_kernel(
 
 constexpr int NVFP4_QUANT_GROUP = 16;
 
-__device__ __forceinline__ float fp4_e2m1_decode_grouped(uint8_t nibble) {
-    uint32_t n = (uint32_t)nibble & 0x7u;
-    uint32_t fp = (n < 2u) ? (n * 0x3F000000u)
-                            : (((126u + (n >> 1u)) << 23u) | ((n & 1u) << 22u));
-    fp |= (uint32_t)(nibble >> 3u) << 31u;
-    return __uint_as_float(fp);
-}
-
 // Tokens-per-expert is unbounded (data-dependent), but registers aren't —
 // process M_e in chunks of NVFP4_GROUPED_M_CHUNK, accumulating that many
 // running sums per lane at a time. Matches GEMV_ROWS_PER_BLOCK so that for
@@ -315,12 +308,14 @@ grouped_nvfp4_gemv_kernel(
         #pragma unroll
         for (int m = 0; m < NVFP4_GROUPED_M_CHUNK; m++) sums[m] = 0.0f;
 
-        for (int g = lane; g < num_k_groups; g += GEMV_WARP_SIZE) {
-            float scale = static_cast<float>(scale_row[g]) * scale_2_val;
+        for (int g = lane * 2; g < num_k_groups; g += GEMV_WARP_SIZE * 2) {
             int k_start = g * NVFP4_QUANT_GROUP;
+            uint4 w = *reinterpret_cast<const uint4*>(weight_row + (size_t)g * (NVFP4_QUANT_GROUP / 2));
 
-            uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
-            uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
+            float scale0 = static_cast<float>(scale_row[g]) * scale_2_val;
+            float scale1 = (g + 1 < num_k_groups)
+                               ? static_cast<float>(scale_row[g + 1]) * scale_2_val
+                               : 0.0f;
 
             for (int m = 0; m < m_count; m++) {
                 const uint4* input_v4 = reinterpret_cast<const uint4*>(expert_input + (size_t)(m_base + m) * K + k_start);
@@ -332,15 +327,40 @@ grouped_nvfp4_gemv_kernel(
 
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
-                    sums[m] += fp4_e2m1_decode_grouped(packed & 0x0Fu) * scale * __bfloat162float(xb0[j * 2])
-                             + fp4_e2m1_decode_grouped(packed >> 4u) * scale * __bfloat162float(xb0[j * 2 + 1]);
+                    uint8_t packed = (w.x >> (j * 8)) & 0xFFu;
+                    float2 wv = fp4x2_to_float2(packed);
+                    sums[m] += wv.x * scale0 * __bfloat162float(xb0[j * 2])
+                             + wv.y * scale0 * __bfloat162float(xb0[j * 2 + 1]);
                 }
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
-                    sums[m] += fp4_e2m1_decode_grouped(packed & 0x0Fu) * scale * __bfloat162float(xb1[j * 2])
-                             + fp4_e2m1_decode_grouped(packed >> 4u) * scale * __bfloat162float(xb1[j * 2 + 1]);
+                    uint8_t packed = (w.y >> (j * 8)) & 0xFFu;
+                    float2 wv = fp4x2_to_float2(packed);
+                    sums[m] += wv.x * scale0 * __bfloat162float(xb1[j * 2])
+                             + wv.y * scale0 * __bfloat162float(xb1[j * 2 + 1]);
+                }
+
+                if (g + 1 < num_k_groups) {
+                    const uint4* input_v4_1 = reinterpret_cast<const uint4*>(expert_input + (size_t)(m_base + m) * K + k_start + NVFP4_QUANT_GROUP);
+                    uint4 xv2 = input_v4_1[0];
+                    uint4 xv3 = input_v4_1[1];
+                    uint4_to_bf16x8(xv2, xb0);
+                    uint4_to_bf16x8(xv3, xb1);
+
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        uint8_t packed = (w.z >> (j * 8)) & 0xFFu;
+                        float2 wv = fp4x2_to_float2(packed);
+                        sums[m] += wv.x * scale1 * __bfloat162float(xb0[j * 2])
+                                 + wv.y * scale1 * __bfloat162float(xb0[j * 2 + 1]);
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        uint8_t packed = (w.w >> (j * 8)) & 0xFFu;
+                        float2 wv = fp4x2_to_float2(packed);
+                        sums[m] += wv.x * scale1 * __bfloat162float(xb1[j * 2])
+                                 + wv.y * scale1 * __bfloat162float(xb1[j * 2 + 1]);
+                    }
                 }
             }
         }

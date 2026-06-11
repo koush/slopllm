@@ -7,6 +7,6 @@
     "${workspaceFolder}/vendor/flashinfer/3rdparty/cutlass/tools/util/include",
     "/usr/include/node",
     "${workspaceFolder}/node_modules/node-addon-api",
-    "/usr/local/cuda-12.9/targets/x86_64-linux/include"
+    "/usr/local/cuda-13.3/targets/x86_64-linux/include"
   ]
 }

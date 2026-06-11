@@ -2422,16 +2422,14 @@ __global__ void __launch_bounds__(256, 4) sum_pointers_kernel(
 
 // ---------------------------------------------------------------------------
 // Smem-staged sum of N tensors (element-wise, max 16 inputs)
-// Each warp cooperatively loads a contiguous chunk from each peer into smem
-// using cg::memcpy_async, then reduces from smem. This dramatically improves
-// PCIe P2P utilization by issuing large contiguous reads per peer instead of
-// interleaved per-element reads.
+// Thread 0 issues N cp.async.bulk transfers (one per peer, covering the
+// entire block's tile) into peer-major smem, then the block waits on a
+// single mbarrier.  This uses the TMA/DMA engine for large contiguous P2P
+// reads instead of per-warp cg::memcpy_async fragments.
 // ---------------------------------------------------------------------------
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/memcpy_async.h>
-
-namespace cg = cooperative_groups;
+#include <cuda/barrier>
+#include <cuda/ptx>
 
 template <typename scalar_t, int ElemsPerWarp>
 __global__ void __launch_bounds__(1024, 1)
@@ -2443,62 +2441,83 @@ sum_pointers_smem_kernel(
     scalar_t* __restrict__ output,
     int N,
     int64_t numel,
-    int smem_stride)
+    int peer_stride)
 {
     constexpr int WarpSize = 32;
     constexpr int MaxN = 16;
 
     extern __shared__ char smem_raw[];
-    int warp_id = threadIdx.x / WarpSize;
-    int lane = threadIdx.x % WarpSize;
-    char* warp_smem = smem_raw + warp_id * smem_stride;
+    __shared__ cuda::barrier<cuda::thread_scope_block> bar;
 
-    auto warp = cg::tiled_partition<WarpSize>(cg::this_thread_block());
+    int warp_id = threadIdx.x / WarpSize;
+    int lane    = threadIdx.x % WarpSize;
+    int warps_per_block = blockDim.x / WarpSize;
 
     const scalar_t* ptrs[MaxN] = {
         p0, p1, p2, p3, p4, p5, p6, p7,
         p8, p9, p10, p11, p12, p13, p14, p15
     };
 
-    int64_t total_warps = (int64_t)gridDim.x * (blockDim.x / WarpSize);
-    int64_t my_warp_id = (int64_t)blockIdx.x * (blockDim.x / WarpSize) + warp_id;
+    int64_t block_stride = (int64_t)warps_per_block * ElemsPerWarp;
+    int64_t total_blocks = gridDim.x;
+    int64_t my_block_start = (int64_t)blockIdx.x * block_stride;
 
-    for (int64_t warp_start = my_warp_id * ElemsPerWarp;
-         warp_start < numel;
-         warp_start += total_warps * ElemsPerWarp)
+    if (threadIdx.x == 0) {
+        init(&bar, blockDim.x);
+    }
+    __syncthreads();
+
+    for (int64_t blk = my_block_start;
+         blk < numel;
+         blk += total_blocks * block_stride)
     {
-        int64_t elems = min((int64_t)ElemsPerWarp, numel - warp_start);
-        size_t copy_bytes = elems * sizeof(scalar_t);
+        int64_t elems = min(block_stride, numel - blk);
+        uint32_t copy_bytes = (uint32_t)(elems * sizeof(scalar_t));
 
-        // Stage each peer's chunk into smem using warp-cooperative async memcpy
-        for (int j = 0; j < N; j++) {
-            scalar_t* dst = reinterpret_cast<scalar_t*>(
-                warp_smem + j * ElemsPerWarp * sizeof(scalar_t));
-            cg::memcpy_async(warp, dst, ptrs[j] + warp_start, copy_bytes);
-        }
-        cg::wait(warp);
-
-        // Reduce from smem and write output
-        if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
-            for (int i = lane; i < elems; i += WarpSize) {
-                float acc = 0.0f;
-                for (int j = 0; j < MaxN; j++) {
-                    if (j >= N) break;
-                    acc += __bfloat162float(
-                        reinterpret_cast<const __nv_bfloat16*>(
-                            warp_smem + j * ElemsPerWarp * sizeof(__nv_bfloat16))[i]);
-                }
-                output[warp_start + i] = __float2bfloat16(acc);
+        if (threadIdx.x == 0) {
+            cuda::ptx::mbarrier_expect_tx(
+                cuda::ptx::sem_relaxed_t{},
+                cuda::ptx::scope_cta_t{},
+                cuda::ptx::space_shared_t{},
+                reinterpret_cast<uint64_t*>(&bar),
+                N * copy_bytes);
+            for (int j = 0; j < N; j++) {
+                cuda::ptx::cp_async_bulk(
+                    cuda::ptx::space_shared_t{},
+                    cuda::ptx::space_global_t{},
+                    smem_raw + j * peer_stride,
+                    ptrs[j] + blk,
+                    copy_bytes,
+                    reinterpret_cast<uint64_t*>(&bar));
             }
-        } else {
-            for (int i = lane; i < elems; i += WarpSize) {
-                float acc = 0.0f;
-                for (int j = 0; j < MaxN; j++) {
-                    if (j >= N) break;
-                    acc += reinterpret_cast<const float*>(
-                        warp_smem + j * ElemsPerWarp * sizeof(float))[i];
+        }
+        bar.arrive_and_wait();
+
+        int64_t warp_start = warp_id * ElemsPerWarp;
+        int64_t warp_elems = min((int64_t)ElemsPerWarp, elems - warp_start);
+
+        if (warp_start < elems) {
+            if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                for (int i = lane; i < warp_elems; i += WarpSize) {
+                    float acc = 0.0f;
+                    for (int j = 0; j < MaxN; j++) {
+                        if (j >= N) break;
+                        acc += __bfloat162float(
+                            reinterpret_cast<const __nv_bfloat16*>(
+                                smem_raw + j * peer_stride)[warp_start + i]);
+                    }
+                    output[blk + warp_start + i] = __float2bfloat16(acc);
                 }
-                output[warp_start + i] = acc;
+            } else {
+                for (int i = lane; i < warp_elems; i += WarpSize) {
+                    float acc = 0.0f;
+                    for (int j = 0; j < MaxN; j++) {
+                        if (j >= N) break;
+                        acc += reinterpret_cast<const float*>(
+                            smem_raw + j * peer_stride)[warp_start + i];
+                    }
+                    output[blk + warp_start + i] = acc;
+                }
             }
         }
     }
@@ -2531,7 +2550,11 @@ void glm_sum_pointers(GlmCtx* ctx,
     if (total_warps == 0) total_warps = 1;
     int grid = (total_warps + warps_per_block - 1) / warps_per_block;
     if (grid > 65535) grid = 65535;
-    int smem_bytes = warps_per_block * smem_per_warp;
+
+    // Peer-major smem layout: each peer's data for all warps is contiguous
+    // so thread 0 can issue one cp.async.bulk per peer covering the full block tile.
+    int peer_stride = warps_per_block * ElemsPerWarp * elem_size;
+    int smem_bytes = N * peer_stride;
 
     if (dtype == 9) {
         sum_pointers_smem_kernel<__nv_bfloat16, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
@@ -2539,14 +2562,14 @@ void glm_sum_pointers(GlmCtx* ctx,
             (const __nv_bfloat16*)p4,  (const __nv_bfloat16*)p5,  (const __nv_bfloat16*)p6,  (const __nv_bfloat16*)p7,
             (const __nv_bfloat16*)p8,  (const __nv_bfloat16*)p9,  (const __nv_bfloat16*)p10, (const __nv_bfloat16*)p11,
             (const __nv_bfloat16*)p12, (const __nv_bfloat16*)p13, (const __nv_bfloat16*)p14, (const __nv_bfloat16*)p15,
-            (__nv_bfloat16*)output, N, numel, smem_per_warp);
+            (__nv_bfloat16*)output, N, numel, peer_stride);
     } else {
         sum_pointers_smem_kernel<float, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
             (const float*)p0,  (const float*)p1,  (const float*)p2,  (const float*)p3,
             (const float*)p4,  (const float*)p5,  (const float*)p6,  (const float*)p7,
             (const float*)p8,  (const float*)p9,  (const float*)p10, (const float*)p11,
             (const float*)p12, (const float*)p13, (const float*)p14, (const float*)p15,
-            (float*)output, N, numel, smem_per_warp);
+            (float*)output, N, numel, peer_stride);
     }
 }
 
