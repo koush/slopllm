@@ -1756,6 +1756,27 @@ export class ParallelOps implements DeviceOps {
       return false;
 
     if (true) {
+      for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
+        const shardCopies: Tensor[] = [];
+        for (let i = 0; i < this.worldSize; i++) {
+          const shard = shards[i];
+          const copy = shard.workspace.alloc(shard.shape, shard.type);
+          copy.memcpy(shard);
+          shardCopies.push(copy);
+        }
+
+        this.p2pBarrier();
+        this.sourceCleanup();
+        this.p2pSources.push(...shardCopies);
+
+        for (let i = 0; i < this.worldSize; i++) {
+          const shard = shards[i];
+          const peer = shardCopies[(i + reduceHalf) % this.worldSize];
+          shard.sum([peer]);
+        }
+      }
+
+      return true;
       // prep data
       const shardViews = shards.map(shard => {
         const shardView = shard.workspace.alloc(shard.shape, shard.type);
