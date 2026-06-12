@@ -59,6 +59,10 @@ static Napi::Value H2D(const Napi::CallbackInfo& info) {
     Napi::Buffer<char> buf = info[2].As<Napi::Buffer<char>>();
     glm_h2d(reinterpret_cast<GlmCtx*>(ctx_ptr),
             reinterpret_cast<void*>(gpu_ptr), buf.Data(), buf.Length());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("h2D failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -73,6 +77,10 @@ static Napi::Value D2H(const Napi::CallbackInfo& info) {
     uintptr_t gpu_ptr = info[2].As<Napi::Number>().Int64Value();
     glm_d2h(reinterpret_cast<GlmCtx*>(ctx_ptr),
             buf.Data(), reinterpret_cast<void*>(gpu_ptr), buf.Length());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("d2H failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -94,6 +102,10 @@ static Napi::Value Rmsnorm(const Napi::CallbackInfo& info) {
                 reinterpret_cast<const void*>(in_ptr),
                 reinterpret_cast<const void*>(wt_ptr),
                 eps, dim, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("rmsnorm failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -119,6 +131,10 @@ static Napi::Value FusedAddRmsnorm(const Napi::CallbackInfo& info) {
                            reinterpret_cast<const void*>(b_ptr),
                            reinterpret_cast<const void*>(wt_ptr),
                            eps, dim, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("fusedAddRmsnorm failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -149,6 +165,10 @@ static Napi::Value FusedNormRope(const Napi::CallbackInfo& info) {
                          reinterpret_cast<const void*>(cos_ptr),
                          reinterpret_cast<const void*>(sin_ptr),
                          eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("fusedNormRope failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -169,6 +189,10 @@ static Napi::Value SiluAndMul(const Napi::CallbackInfo& info) {
                      reinterpret_cast<const void*>(gate_ptr),
                      reinterpret_cast<const void*>(up_ptr),
                      intermediate, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("siluAndMul failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -190,6 +214,10 @@ static Napi::Value Linear(const Napi::CallbackInfo& info) {
                reinterpret_cast<const void*>(in_ptr),
                reinterpret_cast<const void*>(wt_ptr),
                batch, n, k);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("linear failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -213,6 +241,10 @@ static Napi::Value Layernorm(const Napi::CallbackInfo& info) {
                   reinterpret_cast<const void*>(wt_ptr),
                   reinterpret_cast<const void*>(bias_ptr),
                   eps, dim, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("layernorm failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -229,6 +261,10 @@ static Napi::Value Relu(const Napi::CallbackInfo& info) {
     glm_relu(reinterpret_cast<GlmCtx*>(ctx_ptr),
              reinterpret_cast<void*>(out_ptr),
              reinterpret_cast<const void*>(in_ptr), n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("relu failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -245,6 +281,10 @@ static Napi::Value Sigmoid(const Napi::CallbackInfo& info) {
     glm_sigmoid(reinterpret_cast<GlmCtx*>(ctx_ptr),
                 reinterpret_cast<void*>(out_ptr),
                 reinterpret_cast<const void*>(in_ptr), n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("sigmoid failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -265,6 +305,10 @@ static Napi::Value Softmax(const Napi::CallbackInfo& info) {
                 reinterpret_cast<const void*>(in_ptr),
                 mask_ptr ? reinterpret_cast<const void*>(mask_ptr) : nullptr,
                 dim, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("softmax failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -279,6 +323,10 @@ static Napi::Value CausalMask(const Napi::CallbackInfo& info) {
     int seq_len = info[2].As<Napi::Number>().Int32Value();
     glm_causal_mask(reinterpret_cast<GlmCtx*>(ctx_ptr),
                     reinterpret_cast<void*>(out_ptr), seq_len);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("causalMask failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -294,6 +342,10 @@ static Napi::Value Fill(const Napi::CallbackInfo& info) {
     int n = info[3].As<Napi::Number>().Int32Value();
     glm_fill(reinterpret_cast<GlmCtx*>(ctx_ptr),
              reinterpret_cast<void*>(out_ptr), value, n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("fill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -316,6 +368,10 @@ static Napi::Value Gather(const Napi::CallbackInfo& info) {
                reinterpret_cast<const void*>(in_ptr),
                reinterpret_cast<const int*>(idx_ptr),
                k, in_dim, batch, elem_size);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("gather failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -336,6 +392,10 @@ static Napi::Value ScatterScalar(const Napi::CallbackInfo& info) {
                        reinterpret_cast<void*>(out_ptr),
                        reinterpret_cast<const int*>(idx_ptr),
                        value, k, out_dim, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("scatterScalar failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -357,6 +417,10 @@ static Napi::Value CatLastDim(const Napi::CallbackInfo& info) {
                      reinterpret_cast<const void*>(a_ptr),
                      reinterpret_cast<const void*>(b_ptr),
                      a_last_dim, b_last_dim, outer);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("catLastDim failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -377,6 +441,10 @@ static Napi::Value MaskedFill(const Napi::CallbackInfo& info) {
                     reinterpret_cast<const void*>(in_ptr),
                     reinterpret_cast<const void*>(mask_ptr),
                     value, n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("maskedFill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -397,6 +465,10 @@ static Napi::Value IndexAdd(const Napi::CallbackInfo& info) {
                   reinterpret_cast<const int*>(idx_ptr),
                   reinterpret_cast<const void*>(val_ptr),
                   n_indices, dim);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("indexAdd failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -420,6 +492,10 @@ static Napi::Value RotaryEmbedding(const Napi::CallbackInfo& info) {
                          reinterpret_cast<const void*>(inv_ptr),
                          reinterpret_cast<const int*>(pos_ptr),
                          dim_half, batch, seq_len);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("rotaryEmbedding failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -446,6 +522,10 @@ static Napi::Value ApplyRotaryPosEmb(const Napi::CallbackInfo& info) {
                              reinterpret_cast<const void*>(cos_ptr),
                              reinterpret_cast<const void*>(sin_ptr),
                              rope_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("applyRotaryPosEmb failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -473,6 +553,10 @@ static Napi::Value ApplyRotaryPosEmbPartial(const Napi::CallbackInfo& info) {
                                       reinterpret_cast<const void*>(cos_ptr),
                                       reinterpret_cast<const void*>(sin_ptr),
                                       rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("applyRotaryPosEmbPartial failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -500,6 +584,10 @@ static Napi::Value RopeTranspose(const Napi::CallbackInfo& info) {
                         reinterpret_cast<const void*>(cos_ptr),
                         reinterpret_cast<const void*>(sin_ptr),
                         rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("ropeTranspose failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -526,6 +614,10 @@ static Napi::Value MlaVExpand(const Napi::CallbackInfo& info) {
                       reinterpret_cast<const void*>(v_proj_ptr),
                       kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
                       attn_n_heads, head_offset);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("mlaVExpand failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -548,6 +640,10 @@ static Napi::Value Topk(const Napi::CallbackInfo& info) {
              reinterpret_cast<int*>(out_idxs_ptr),
              reinterpret_cast<const void*>(in_ptr),
              k, dim, batch, offset);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("topk failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -574,6 +670,10 @@ static Napi::Value Bmm(const Napi::CallbackInfo& info) {
             reinterpret_cast<const void*>(a_ptr),
             reinterpret_cast<const void*>(b_ptr),
             alpha, beta, batch, M, N, K, transA, transB);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("bmm failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -591,6 +691,10 @@ static Napi::Value Scale(const Napi::CallbackInfo& info) {
     glm_scale(reinterpret_cast<GlmCtx*>(ctx_ptr),
               reinterpret_cast<void*>(out_ptr),
               reinterpret_cast<const void*>(in_ptr), scale, n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("scale failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -619,6 +723,10 @@ static Napi::Value SumPointers(const Napi::CallbackInfo& info) {
                      reinterpret_cast<void*>(p[12]), reinterpret_cast<void*>(p[13]),
                      reinterpret_cast<void*>(p[14]), reinterpret_cast<void*>(p[15]),
                      reinterpret_cast<void*>(out_ptr), N, numel, dtype);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("sumPointers failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -637,6 +745,10 @@ static Napi::Value Add(const Napi::CallbackInfo& info) {
             reinterpret_cast<void*>(out_ptr),
             reinterpret_cast<const void*>(a_ptr),
             reinterpret_cast<const void*>(b_ptr), n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("add failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -656,6 +768,10 @@ static Napi::Value AddBroadcast(const Napi::CallbackInfo& info) {
                        reinterpret_cast<void*>(out_ptr),
                        reinterpret_cast<const void*>(a_ptr),
                        reinterpret_cast<const void*>(b_ptr), dim, rows);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("addBroadcast failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -676,6 +792,10 @@ static Napi::Value RowScaleAdd(const Napi::CallbackInfo& info) {
                       reinterpret_cast<const void*>(in_ptr),
                       reinterpret_cast<const void*>(scales_ptr),
                       rows, dim);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("rowScaleAdd failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -697,6 +817,10 @@ static Napi::Value ExpandDim1(const Napi::CallbackInfo& info) {
                     reinterpret_cast<void*>(out_ptr),
                     reinterpret_cast<const void*>(in_ptr),
                     dim1_out, dim1_in, seq_len, head_dim, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("expandDim1 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -721,6 +845,10 @@ static Napi::Value Transpose4d(const Napi::CallbackInfo& info) {
                      reinterpret_cast<void*>(out_ptr),
                      reinterpret_cast<const void*>(in_ptr),
                      d0, d1, d2, d3, p0, p1, p2, p3);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("transpose4d failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -740,6 +868,10 @@ static Napi::Value Mul(const Napi::CallbackInfo& info) {
             reinterpret_cast<const void*>(a_ptr),
             reinterpret_cast<const void*>(b_ptr),
             n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("mul failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -759,6 +891,10 @@ static Napi::Value MulBroadcast(const Napi::CallbackInfo& info) {
                        reinterpret_cast<void*>(out_ptr),
                        reinterpret_cast<const void*>(a_ptr),
                        reinterpret_cast<const void*>(b_ptr), dim, rows);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("mulBroadcast failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -777,6 +913,10 @@ static Napi::Value ReduceSum(const Napi::CallbackInfo& info) {
                    reinterpret_cast<void*>(out_ptr),
                    reinterpret_cast<const void*>(in_ptr),
                    rows, cols);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("reduceSum failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -797,6 +937,10 @@ static Napi::Value RowNormalize(const Napi::CallbackInfo& info) {
                        reinterpret_cast<void*>(out_ptr),
                        reinterpret_cast<const void*>(in_ptr),
                        scale, rows, cols, normalize);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("rowNormalize failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -817,6 +961,10 @@ static Napi::Value GroupMaskMul(const Napi::CallbackInfo& info) {
                         reinterpret_cast<void*>(scores_ptr),
                         reinterpret_cast<const void*>(mask_ptr),
                         num_experts, experts_per_group, n_group, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("groupMaskMul failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -838,6 +986,10 @@ static Napi::Value ExpertScale(const Napi::CallbackInfo& info) {
                       reinterpret_cast<const void*>(weights_ptr),
                       reinterpret_cast<const int*>(indices_ptr),
                       expert_id, topK, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("expertScale failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -862,6 +1014,10 @@ static Napi::Value MulMatId(const Napi::CallbackInfo& info) {
                     reinterpret_cast<const void* const*>(wptrs_ptr),
                     reinterpret_cast<const int*>(eids_ptr),
                     top_k, count, N, K);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("mulMatId failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -890,6 +1046,10 @@ static Napi::Value Nvfp4MulMatId(const Napi::CallbackInfo& info) {
                           reinterpret_cast<const void* const*>(s2ptrs_ptr),
                           reinterpret_cast<const int*>(eids_ptr),
                           top_k, count, N, K);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("nvfp4MulMatId failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -913,6 +1073,10 @@ static Napi::Value ScatterAddRows(const Napi::CallbackInfo& info) {
                           reinterpret_cast<const void*>(scales_ptr),
                           top_k, dim, num_rows,
                           reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("scatterAddRows failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -954,6 +1118,10 @@ static Napi::Value MulMatIdGrouped(const Napi::CallbackInfo& info) {
                             reinterpret_cast<const int*>(eids_ptr),
                             top_k, count, N, K, num_experts,
                             reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("mulMatIdGrouped failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -985,6 +1153,10 @@ static Napi::Value Nvfp4MulMatIdGrouped(const Napi::CallbackInfo& info) {
                                      reinterpret_cast<const int*>(eids_ptr),
                                      top_k, count, N, K, num_experts,
                                      reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("nvfp4MulMatIdGrouped failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1006,6 +1178,10 @@ static Napi::Value IndexSelect(const Napi::CallbackInfo& info) {
                      reinterpret_cast<const void*>(src_ptr),
                      reinterpret_cast<const void*>(idx_ptr),
                      dim, k, offset);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("indexSelect failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1022,6 +1198,10 @@ static Napi::Value Arange(const Napi::CallbackInfo& info) {
     int count = info[4].As<Napi::Number>().Int32Value();
     glm_arange(reinterpret_cast<GlmCtx*>(ctx_ptr),
                reinterpret_cast<int*>(out_ptr), start, step, count);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("arange failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1042,6 +1222,10 @@ static Napi::Value Max(const Napi::CallbackInfo& info) {
             reinterpret_cast<void*>(out_vals_ptr),
             reinterpret_cast<int*>(out_idxs_ptr),
             reinterpret_cast<const void*>(in_ptr), dim, batch, offset);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("max failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1074,6 +1258,10 @@ static Napi::Value KvCacheWrite(const Napi::CallbackInfo& info) {
                         batch_size, n_kv, hd, page_size,
                         src_k_token_stride, src_k_head_stride,
                         src_v_token_stride, src_v_head_stride);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("kvCacheWrite failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1099,6 +1287,10 @@ static Napi::Value PositionStep(const Napi::CallbackInfo& info) {
                        reinterpret_cast<const int32_t*>(indptr_ptr),
                        reinterpret_cast<const int32_t*>(indices_ptr),
                        page_size, batch_size, steps);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("positionStep failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1122,6 +1314,10 @@ static Napi::Value MlaPositionStep(const Napi::CallbackInfo& info) {
                            reinterpret_cast<int32_t*>(last_page_len_ptr),
                            reinterpret_cast<const int32_t*>(indptr_ptr),
                            page_size, batch_size, cp_world_size, cp_rank, steps);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("mlaPositionStep failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1139,6 +1335,10 @@ static Napi::Value Memcpy(const Napi::CallbackInfo& info) {
     glm_memcpy(reinterpret_cast<GlmCtx*>(ctx_ptr),
                reinterpret_cast<void*>(dst_ptr),
                reinterpret_cast<const void*>(src_ptr), bytes, kind);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("memcpy failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1182,6 +1382,10 @@ static Napi::Value SetStream(const Napi::CallbackInfo& info) {
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     int stream_idx = info[1].As<Napi::Number>().Int32Value();
     glm_set_stream(reinterpret_cast<GlmCtx*>(ctx_ptr), stream_idx);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("setStream failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1195,6 +1399,10 @@ static Napi::Value EventRecord(const Napi::CallbackInfo& info) {
     int event_idx = info[1].As<Napi::Number>().Int32Value();
     int stream_idx = info[2].As<Napi::Number>().Int32Value();
     glm_event_record(reinterpret_cast<GlmCtx*>(ctx_ptr), event_idx, stream_idx);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("eventRecord failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1208,6 +1416,10 @@ static Napi::Value StreamWaitEvent(const Napi::CallbackInfo& info) {
     int stream_idx = info[1].As<Napi::Number>().Int32Value();
     int event_idx = info[2].As<Napi::Number>().Int32Value();
     glm_stream_wait_event(reinterpret_cast<GlmCtx*>(ctx_ptr), stream_idx, event_idx);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("streamWaitEvent failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1230,6 +1442,10 @@ static Napi::Value ExpandDim1Strided(const Napi::CallbackInfo& info) {
                             reinterpret_cast<void*>(out_ptr),
                             reinterpret_cast<const void*>(in_ptr),
                             dim1_out, dim1_in, seq_len, head_dim, batch, head_stride);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("expandDim1Strided failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1271,6 +1487,10 @@ static Napi::Value FlashPrefill(const Napi::CallbackInfo& info) {
                       kv_stride_n, kv_stride_h,
                       v_stride_n, v_stride_h,
                       mask_mode, kv_layout, sm_scale);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("flashPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -1306,6 +1526,10 @@ static Napi::Value FlashDecode(const Napi::CallbackInfo& info) {
                      q_stride_n, q_stride_h,
                      kv_stride_n, kv_stride_h,
                      sm_scale);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("flashDecode failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2068,6 +2292,10 @@ static Napi::Value Fp8LinearDecode(const Napi::CallbackInfo& info) {
                            reinterpret_cast<const void*>(weight_ptr),
                            reinterpret_cast<const float*>(scale_ptr),
                            m, n, k);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("fp8LinearDecode failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2098,6 +2326,10 @@ static Napi::Value Nvfp4LinearDecode(const Napi::CallbackInfo& info) {
                              reinterpret_cast<const float*>(scale2_ptr),
                              m, n, k,
                              reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("nvfp4LinearDecode failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2132,6 +2364,10 @@ static Napi::Value GdnRecurrentStep(const Napi::CallbackInfo& info) {
                             reinterpret_cast<const float*>(dtb_ptr),
                             num_heads, d_k, d_v,
                             batch_size, state_stride, qkv_ch_stride, qkv_seq_stride);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("gdnRecurrentStep failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2169,6 +2405,10 @@ static Napi::Value GdnPrefill(const Napi::CallbackInfo& info) {
                      reinterpret_cast<const int*>(cu_seqlens_ptr),
                      total_seq_len, num_heads, d_k, d_v,
                      batch_size, state_stride, qkv_ch_stride, qkv_seq_stride);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("gdnPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2199,6 +2439,10 @@ static Napi::Value CausalConv1d(const Napi::CallbackInfo& info) {
                        reinterpret_cast<const int*>(cu_seqlens_ptr),
                        conv_dim, total_seq_len, kernel_size,
                        batch_size, conv_state_stride, ch_stride, seq_stride);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("causalConv1d failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2224,6 +2468,10 @@ static Napi::Value CausalConv1dUpdate(const Napi::CallbackInfo& info) {
                                reinterpret_cast<const void*>(w_ptr),
                                conv_dim, kernel_size,
                                batch_size, conv_state_stride);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("causalConv1dUpdate failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2247,6 +2495,10 @@ static Napi::Value RmsnormGated(const Napi::CallbackInfo& info) {
                        reinterpret_cast<const void*>(gate_ptr),
                        reinterpret_cast<const void*>(w_ptr),
                        eps, dim, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("rmsnormGated failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2290,6 +2542,10 @@ static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
                reinterpret_cast<const float*>(top_ps_ptr),
                reinterpret_cast<unsigned int*>(step_counter_ptr),
                max_effective_k);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("sampleBatch failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2469,6 +2725,10 @@ static Napi::Value GateSigmoidMul(const Napi::CallbackInfo& info) {
                           reinterpret_cast<void*>(out_ptr),
                           reinterpret_cast<const void*>(gate_ptr),
                           batch_seq, num_heads, head_dim);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("gateSigmoidMul failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2490,6 +2750,10 @@ static Napi::Value Memcpy2d(const Napi::CallbackInfo& info) {
                  reinterpret_cast<void*>(dst_ptr), dpitch,
                  reinterpret_cast<const void*>(src_ptr), spitch,
                  width, height, kind);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("memcpy2d failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2508,6 +2772,10 @@ static Napi::Value MemcpyPeer(const Napi::CallbackInfo& info) {
     glm_memcpy_peer(reinterpret_cast<GlmCtx*>(ctx_ptr),
                     reinterpret_cast<void*>(dst_ptr), dstDevice,
                     reinterpret_cast<const void*>(src_ptr), srcDevice, bytes);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("memcpyPeer failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2543,6 +2811,10 @@ static Napi::Value Memcpy3dPeer(const Napi::CallbackInfo& info) {
         reinterpret_cast<const void*>(srcPtr), srcPitch, srcXSize, srcYSize, srcDevice,
         srcPosX, srcPosY, srcPosZ,
         width, height, depth);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("memcpy3dPeer failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2751,6 +3023,10 @@ static Napi::Value P2PSetPeers(const Napi::CallbackInfo& info) {
     glm_p2p_set_peers(reinterpret_cast<GlmCtx*>(ctx_ptr),
                       reinterpret_cast<GlmP2PInstance*>(inst_ptr),
                       data_ptrs.data(), flag_ptrs.data());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PSetPeers failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2771,6 +3047,10 @@ static Napi::Value P2PAllReduce(const Napi::CallbackInfo& info) {
                       reinterpret_cast<const void*>(in_ptr),
                       reinterpret_cast<void*>(out_ptr),
                       count, dtype);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PAllReduce failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2802,6 +3082,10 @@ static Napi::Value P2PAllReduceSmem(const Napi::CallbackInfo& info) {
                             reinterpret_cast<const void*>(ptrs[7]),
                             reinterpret_cast<void*>(output_ptr),
                             N, numel, dtype);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PAllReduceSmem failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2821,6 +3105,10 @@ static Napi::Value P2PAllGather(const Napi::CallbackInfo& info) {
                        reinterpret_cast<const void*>(sendbuf_ptr),
                        reinterpret_cast<void*>(recvbuf_ptr),
                        num_bytes);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PAllGather failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2843,6 +3131,10 @@ static Napi::Value P2PAllGatherRow(const Napi::CallbackInfo& info) {
                            reinterpret_cast<const void*>(sendbuf_ptr),
                            reinterpret_cast<void*>(recvbuf_ptr),
                            shard_bytes, shard_dim1_bytes, full_dim1_bytes, outer);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PAllGatherRow failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2867,6 +3159,10 @@ static Napi::Value P2PRmsnorm(const Napi::CallbackInfo& info) {
                      reinterpret_cast<const void*>(weight_ptr),
                      reinterpret_cast<void*>(output_ptr),
                      eps, shard_dim, full_dim, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PRmsnorm failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2882,6 +3178,10 @@ static Napi::Value P2PBarrier(const Napi::CallbackInfo& info) {
     glm_p2p_barrier(reinterpret_cast<GlmCtx*>(ctx_ptr),
                     reinterpret_cast<GlmP2PInstance*>(inst_ptr),
                     peer_rank);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PBarrier failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
@@ -2903,6 +3203,10 @@ static Napi::Value RotateInputIds(const Napi::CallbackInfo& info) {
                           reinterpret_cast<const int*>(indptr_ptr),
                           reinterpret_cast<const int*>(new_tokens_ptr),
                           batch_size);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("rotateInputIds failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
     return env.Undefined();
 }
 
