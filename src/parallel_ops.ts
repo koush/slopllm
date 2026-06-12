@@ -2016,7 +2016,8 @@ export class ParallelOps implements DeviceOps {
     shardNHeads?: number,
     inputNHeads?: number,
   ): ParallelTensor {
-    if (this.p2pEnabled) {
+    const P2P_CP_MERGE_MAX_BATCH = 128;
+    if (this.p2pEnabled && batchSize <= P2P_CP_MERGE_MAX_BATCH) {
       return this.p2pCpMerge(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, mergedLse, workspace, shardNHeads, inputNHeads);
     }
     const snh = shardNHeads ?? numHeads;

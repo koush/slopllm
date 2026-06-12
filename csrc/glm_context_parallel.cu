@@ -634,13 +634,13 @@ void glm_p2p_cp_merge_heads(
     // P2P buffer holds per-shard data: v_out is [B, input_n_heads, D],
     // lse is [B, num_heads] (full heads). Only the merge phase processes
     // shard_n_heads starting at head_offset.
-    int v_out_bytes = batch_size * input_n_heads * v_head_dim * 2;
-    int lse_bytes = batch_size * num_heads * 4;
-    int slot_bytes = v_out_bytes + lse_bytes;
+    int64_t v_out_bytes = (int64_t)batch_size * input_n_heads * v_head_dim * 2;
+    int64_t lse_bytes = (int64_t)batch_size * num_heads * 4;
+    int64_t slot_bytes = v_out_bytes + lse_bytes;
 
-    if ((size_t)slot_bytes > inst->max_bytes) {
-        fprintf(stderr, "glm_p2p_cp_merge_heads: slot_bytes=%d exceeds max_bytes=%zu\n",
-                slot_bytes, inst->max_bytes);
+    if (slot_bytes > (int64_t)inst->max_bytes) {
+        fprintf(stderr, "glm_p2p_cp_merge_heads: slot_bytes=%lld exceeds max_bytes=%zu\n",
+                (long long)slot_bytes, inst->max_bytes);
         return;
     }
 
