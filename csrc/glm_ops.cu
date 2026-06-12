@@ -2473,6 +2473,7 @@ sum_pointers_smem_kernel(
     {
         int64_t elems = min(block_stride, numel - blk);
         uint32_t copy_bytes = (uint32_t)(elems * sizeof(scalar_t));
+        copy_bytes = (copy_bytes + 15u) & ~15u;
 
         if (threadIdx.x == 0) {
             cuda::ptx::mbarrier_expect_tx(
