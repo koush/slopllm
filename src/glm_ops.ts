@@ -139,7 +139,7 @@ interface NativeAddon {
   p2pAllGather(ctx: number, instance: number, sendbuf: number, recvbuf: number, numBytes: number): void;
   p2pAllGatherRow(ctx: number, instance: number, sendbuf: number, recvbuf: number, shardBytes: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number): void;
   p2pRmsnorm(ctx: number, instance: number, input: number, weight: number, output: number, eps: number, shardDim: number, fullDim: number, batch: number): void;
-  p2pBarrier(ctx: number, instance: number): void;
+  p2pBarrier(ctx: number, instance: number, peerRank?: number): void;
   contextParallelMerge(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void;
   p2pCpMerge(ctx: number, instance: number, myVOut: number, myLse: number, mergedVOut: number, mergedLse: number, numShards: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void;
   contextParallelMergeHeads(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, shardNHeads: number, headOffset: number, inputNHeads: number, vHeadDim: number): void;
@@ -367,15 +367,15 @@ export class GlmTensor extends Tensor {
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
-    if (strided) {
-      return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
-    } else {
-      return this.mmapLoadAsync(mmapPtr, offset, nbytes);
-    }
+    // if (strided) {
+    //   return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
+    // } else {
+    //   return this.mmapLoadAsync(mmapPtr, offset, nbytes);
+    // }
   }
 
   async mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
-    return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
+    // return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
   }
 
   memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void> {
@@ -895,8 +895,8 @@ export class GlmOps implements DeviceOps {
     }
   }
 
-  p2pBarrier(instance: number): void {
-    getNativeAddon().p2pBarrier(this.ctx, instance);
+  p2pBarrier(instance: number, peerRank: number = -1): void {
+    getNativeAddon().p2pBarrier(this.ctx, instance, peerRank);
   }
 }
 

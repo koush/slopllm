@@ -9,11 +9,15 @@ __device__ __forceinline__ void p2p_publish_and_wait(
     int world_size,
     int seq,
     int* const* peer_flag_arrays,
-    int* my_flags)
+    int* my_flags,
+    int peer_rank = -1)
 {
     __syncthreads();
 
-    if (tid < world_size) {
+    bool active = (peer_rank < 0 && tid < world_size) ||
+                  (peer_rank >= 0 && tid == peer_rank);
+
+    if (active) {
         int val = seq + 1;
         if (tid == my_rank) {
             my_flags[my_rank] = val;
@@ -23,7 +27,7 @@ __device__ __forceinline__ void p2p_publish_and_wait(
         }
     }
 
-    if (tid < world_size) {
+    if (active) {
         int target = seq + 1;
         int v;
         do {

@@ -136,7 +136,8 @@ p2p_barrier_kernel(
     int* slot_offset_out,
     int my_rank,
     int world_size,
-    int max_slot_bytes)
+    int max_slot_bytes,
+    int peer_rank = -1)
 {
     int tid = threadIdx.x;
 
@@ -158,7 +159,8 @@ p2p_barrier_kernel(
     int seq = (int)s_seq;
 
     p2p_publish_and_wait(tid, my_rank, world_size, seq,
-                         s_peer_flags, s_peer_flags[my_rank]);
+                         s_peer_flags, s_peer_flags[my_rank],
+                         peer_rank);
 
     if (tid == 0) {
         *slot_offset_out = s_slot_offset;
@@ -1031,12 +1033,13 @@ void glm_p2p_rmsnorm(GlmCtx* ctx, GlmP2PInstance* inst,
         eps, shard_dim, full_dim, batch);
 }
 
-void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst) {
+void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank) {
     cudaSetDevice(ctx->device_id);
     p2p_barrier_kernel<<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
         inst->peer_flags_arr_d, inst->seq_counter_d,
         inst->slot_offset_d,
-        inst->my_rank, inst->world_size, (int)inst->max_bytes);
+        inst->my_rank, inst->world_size, (int)inst->max_bytes,
+        peer_rank);
 }
 
 } // extern "C"

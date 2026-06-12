@@ -395,7 +395,7 @@ void glm_p2p_rmsnorm(GlmCtx* ctx, GlmP2PInstance* inst,
 // P2P barrier: increment seq counter, publish flag, wait for all peers.
 // No data scatter — caller stages data into P2P buffer before/after as needed.
 // Writes slot_offset to inst->slot_offset_d so caller knows which slot was selected.
-void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst);
+void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank = -1);
 
 void glm_kv_cache_write(GlmCtx* ctx,
                          void* src_k, void* src_v,

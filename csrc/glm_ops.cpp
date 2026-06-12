@@ -2873,13 +2873,15 @@ static Napi::Value P2PRmsnorm(const Napi::CallbackInfo& info) {
 static Napi::Value P2PBarrier(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2) {
-        Napi::TypeError::New(env, "Expected (ctx, instance)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, instance[, peerRank])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
+    int peer_rank = (info.Length() >= 3) ? info[2].As<Napi::Number>().Int32Value() : -1;
     glm_p2p_barrier(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                    reinterpret_cast<GlmP2PInstance*>(inst_ptr));
+                    reinterpret_cast<GlmP2PInstance*>(inst_ptr),
+                    peer_rank);
     return env.Undefined();
 }
 

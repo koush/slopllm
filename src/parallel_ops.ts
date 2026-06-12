@@ -1655,10 +1655,11 @@ class P2PAllReduceGroup {
   }
 
   /** P2P barrier: sync all GPUs without data transfer. */
-  barrier(devices: readonly GlmOps[]): void {
+  barrier(devices: readonly GlmOps[], peerRanks?: number[]): void {
     const addon = getNativeAddon();
     for (let i = 0; i < this.worldSize; ++i) {
-      addon.p2pBarrier(devices[i].ctx, this.instances[i]);
+      const peerRank = peerRanks ? peerRanks[i] : -1;
+      addon.p2pBarrier(devices[i].ctx, this.instances[i], peerRank);
     }
   }
 }
@@ -1765,13 +1766,14 @@ export class ParallelOps implements DeviceOps {
           shardCopies.push(copy);
         }
 
-        this.p2pBarrier();
+        const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
+        this.p2pBarrier(peerRanks);
         this.sourceCleanup();
         this.p2pSources.push(...shardCopies);
 
         for (let i = 0; i < this.worldSize; i++) {
           const shard = shards[i];
-          const peer = shardCopies[(i + reduceHalf) % this.worldSize];
+          const peer = shardCopies[i ^ reduceHalf];
           shard.sum([peer]);
         }
       }
@@ -2150,10 +2152,10 @@ export class ParallelOps implements DeviceOps {
   }
 
   /** P2P barrier: sync all GPUs without data transfer. */
-  p2pBarrier(): void {
+  p2pBarrier(peerRanks?: number[]): void {
     const group = this.getP2PGroup(this.devices[0].currentStream);
     if (!group) throw new Error('P2P not available for barrier');
-    group.barrier(this.devices);
+    group.barrier(this.devices, peerRanks);
   }
 
   shardDim(dim: number, name: string): number {
