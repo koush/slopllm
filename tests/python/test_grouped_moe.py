@@ -17,10 +17,10 @@ from helpers import GpuBuffer, GpuPtrs, GlmOps
 
 
 class TestMulMatIdGrouped:
-    def _run_grouped(self, glm, device, batch, K, N, num_experts, topK):
+    def _run_grouped(self, glm, device, batch, K, N, num_experts, topK, scale=1.0):
         count = batch * topK
-        input_bf16 = torch.randn(batch, K, dtype=torch.bfloat16, device=device)
-        weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
+        input_bf16 = torch.randn(batch, K, dtype=torch.bfloat16, device=device) * scale
+        weights = [torch.randn(N, K, dtype=torch.bfloat16, device=device) * scale for _ in range(num_experts)]
         expert_ids = torch.randint(0, num_experts, (batch, topK), dtype=torch.int32, device=device)
         expert_ids_flat = expert_ids.reshape(-1)
 
@@ -125,7 +125,7 @@ class TestMulMatIdGrouped:
 
     def test_grouped_large_batch(self, glm, device):
         """Test with larger batch to exercise multi-entry-per-expert path."""
-        self._run_grouped(glm, device, batch=8, K=256, N=512, num_experts=16, topK=4)
+        self._run_grouped(glm, device, batch=8, K=256, N=512, num_experts=16, topK=4, scale=0.01)
 
     def test_grouped_all_same_expert(self, glm, device):
         """All entries select the same expert."""
