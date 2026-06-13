@@ -64,6 +64,7 @@ export class CaptureManager implements Disposable {
         }
         const key = keyParams.join(",");
         const captured = this.captured.get(key);
-        return captured?.graphExec !== null;
+        // graphExec may be 0
+        return captured?.graphExec != null;
     }
 }

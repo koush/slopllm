@@ -67,6 +67,22 @@
             "skipFiles": [
                 "<node_internals>/**"
             ]
+        },
+                {
+            "type": "node",
+            "request": "launch",
+            "name": "Prefill test",
+            "runtimeExecutable": "tsx",
+            "console": "integratedTerminal",
+            "env": {
+                // "NCCL_DEBUG": "INFO",
+            },
+            "runtimeArgs": [
+                "${workspaceFolder}/src/run_prefill_benchmark.ts",
+            ],
+            "skipFiles": [
+                "<node_internals>/**"
+            ]
         }
     ]
 }

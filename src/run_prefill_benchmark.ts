@@ -1,3 +1,4 @@
+import { CaptureManager } from "./capture-manager";
 import { ChatModel } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
@@ -23,7 +24,7 @@ function parseArgs(argv: string[]): BenchArgs {
   const gpusEnv = process.env.GLM_GPUS ?? process.env.GLM_GPU ?? "0";
   const args: BenchArgs = {
     gpus: gpusEnv === "0" ? [0, 1, 2, 3, 4, 5, 6, 7] : gpusEnv.split(",").map(s => parseInt(s.trim(), 10)),
-    seqLen: 65536,
+    seqLen: 8192,
     chunkSize: 4096,
     arena: 92,
     maxBatch: 1,
@@ -84,9 +85,41 @@ async function main(): Promise<void> {
 
   const numChunks = Math.ceil(args.seqLen / args.chunkSize);
 
-  for (let run = -args.warmupRuns; run < args.benchRuns; run++) {
-    const isWarmup = run < 0;
-    const runLabel = isWarmup ? "warmup" : `run ${run + 1}`;
+  const captureManager = new CaptureManager(glm);
+
+  let warmupRuns = 0;
+
+  while (!captureManager.isCaptured(['prefill'])) {
+    cache.reset(1);
+
+
+    warmupRuns++;
+    const chunkStart = 0;
+
+    const chunkLen = Math.min(args.chunkSize, args.seqLen - chunkStart);
+
+    const t0 = performance.now();
+    const tc0 = performance.now();
+    const state = ws.planPrefill(model, 1, [chunkLen], cache);
+    state.setInput([inputIds.slice(chunkStart, chunkStart + chunkLen)]);
+
+    captureManager.run(() => {
+      using hiddenStates = model.forward(state);
+    }, ['prefill']);
+
+    glm.synchronize();
+    const tc1 = performance.now();
+    const chunkTokPerSec = chunkLen / ((tc1 - tc0) / 1000);
+
+    const runLabel = "warmup";
+
+    console.log(`  ${runLabel} chunk: ${chunkLen} tokens, ${(tc1 - tc0).toFixed(0)}ms (${chunkTokPerSec.toFixed(0)} tok/s)`);
+  }
+  console.log('warmup finished');
+
+  let captureRuns = 0;
+  while (captureRuns < args.benchRuns) {
+    const runLabel = `run ${captureRuns + 1}`;
 
     cache.reset(1);
 
@@ -100,11 +133,9 @@ async function main(): Promise<void> {
       const state = ws.planPrefill(model, 1, [chunkLen], cache);
       state.setInput([inputIds.slice(chunkStart, chunkStart + chunkLen)]);
 
-      using hiddenStates = model.forward(state);
-
-      if (isLast) {
-        using logits = state.computeLogits(hiddenStates, model);
-      }
+      captureManager.run(() => {
+        using hiddenStates = model.forward(state);
+      }, ['prefill']);
 
       glm.synchronize();
       const tc1 = performance.now();
@@ -116,11 +147,8 @@ async function main(): Promise<void> {
     const tokPerSec = args.seqLen / (elapsed / 1000);
     const msPerTok = elapsed / args.seqLen;
 
-    if (isWarmup) {
-      console.log(`  ${runLabel}: ${elapsed.toFixed(0)}ms (${tokPerSec.toFixed(0)} tok/s, ${msPerTok.toFixed(3)} ms/tok) [discarded]`);
-    } else {
-      console.log(`  ${runLabel}: ${elapsed.toFixed(0)}ms (${tokPerSec.toFixed(0)} tok/s, ${msPerTok.toFixed(3)} ms/tok)`);
-    }
+    console.log(`  ${runLabel}: ${elapsed.toFixed(0)}ms (${tokPerSec.toFixed(0)} tok/s, ${msPerTok.toFixed(3)} ms/tok)`);
+    captureRuns++;
   }
 
   glm.synchronize();
