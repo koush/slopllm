@@ -8,16 +8,24 @@ import { Tensor } from "../src/tensor";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { PagedKVCache } from "../src/paged_kv";
 import { generateBatchTokens, generateTokens } from "./test_helper";
+import { AutoTokenizer } from "@huggingface/transformers";
+import { resolveModelPath } from "../src/model_path";
 
 import { PAGE_SIZE } from "../src/paged_kv";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
-const PROMPT1 = [151643, 151644, 151645, 1, 2, 3];
-const PROMPT2 = [151643, 151644, 1, 2, 3, 4, 5];
-const PROMPT_LONG1 = [151643, 151644, 151645, 1, 2, 3, 4, 5, 6, 7];
-const PROMPT_LONG2 = [151643, 151644, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-const PROMPT_GRAPH = [151643, 151644, 151645, 1, 2988, 279, 1716, 364];
-const EOS_TOKEN_IDS = new Set([151645, 151643]);
+
+function tokenizePrompt(tokenizer: any, prompt: string): number[] {
+  const messages = [{ role: "user" as const, content: prompt }];
+  const result = tokenizer.apply_chat_template(messages as any, {
+    tokenize: true,
+    add_generation_prompt: true,
+    return_tensor: false,
+    return_dict: true,
+    tokenizer_kwargs: { enable_thinking: false },
+  }) as { input_ids: number[] | number[][] };
+  return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
+}
 
 function makeLongPrompt(length: number, prefix: number[] = [151643, 151644, 151645]): number[] {
   return [...prefix, ...Array.from({ length: length - prefix.length }, (_, i) => 100 + i)];
@@ -27,12 +35,25 @@ describe("Qwen3-0.6B batch tests", () => {
   let glm: GlmOps;
   let model: Qwen3Model;
   let ws: ExecutionWorkspace;
+  let tokenizer: any;
+  let PROMPT1: number[];
+  let PROMPT2: number[];
+  let PROMPT_LONG1: number[];
+  let PROMPT_LONG2: number[];
+  let PROMPT_GRAPH: number[];
+  const EOS_TOKEN_IDS = new Set([151645, 151643]);
 
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
     model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
     ws = new ExecutionWorkspace(glm, 4, 4096);
+    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN3_REPO), { local_files_only: true });
+    PROMPT1 = tokenizePrompt(tokenizer, "Hi");
+    PROMPT2 = tokenizePrompt(tokenizer, "Hello");
+    PROMPT_LONG1 = tokenizePrompt(tokenizer, "What is the capital of France?");
+    PROMPT_LONG2 = tokenizePrompt(tokenizer, "What is the capital of Japan?");
+    PROMPT_GRAPH = tokenizePrompt(tokenizer, "The capital of France is");
   });
 
   after(() => {
@@ -619,12 +640,15 @@ describe("PagedKVCache prefix matching", () => {
   let glm: GlmOps;
   let model: Qwen3Model;
   let ws: ExecutionWorkspace;
+  let PROMPT1: number[];
 
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
     model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
     ws = new ExecutionWorkspace(glm, 4, 4096);
+    const tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN3_REPO), { local_files_only: true });
+    PROMPT1 = tokenizePrompt(tokenizer, "Hi");
   });
 
   after(() => {
