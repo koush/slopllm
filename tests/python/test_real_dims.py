@@ -36,7 +36,8 @@ def test_dense_layer_real_dims(glm, device):
     idx_eps = 1e-6
 
     torch.manual_seed(42)
-    hidden_states = torch.randn(B, S, HIDDEN, dtype=torch.bfloat16, device=device)
+    s = 0.01
+    hidden_states = torch.randn(B, S, HIDDEN, dtype=torch.bfloat16, device=device) * s
     cos, sin = _make_rotary_embed(glm, device, QK_ROPE_DIM // 2, B, S, theta=ROPE_THETA)
 
     causal_2d = torch.empty(S, S, dtype=torch.bfloat16, device=device)
@@ -46,19 +47,19 @@ def test_dense_layer_real_dims(glm, device):
     input_layernorm_w = torch.randn(HIDDEN, dtype=torch.bfloat16, device=device)
     post_attn_layernorm_w = torch.randn(HIDDEN, dtype=torch.bfloat16, device=device)
 
-    q_a_proj_w = torch.randn(Q_LORA_RANK, HIDDEN, dtype=torch.bfloat16, device=device)
+    q_a_proj_w = torch.randn(Q_LORA_RANK, HIDDEN, dtype=torch.bfloat16, device=device) * s
     q_a_layernorm_w = torch.randn(Q_LORA_RANK, dtype=torch.bfloat16, device=device)
-    q_b_proj_w = torch.randn(NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
-    kv_a_proj_with_mqa_w = torch.randn(KV_LORA_RANK + QK_ROPE_DIM, HIDDEN, dtype=torch.bfloat16, device=device)
+    q_b_proj_w = torch.randn(NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device) * s
+    kv_a_proj_with_mqa_w = torch.randn(KV_LORA_RANK + QK_ROPE_DIM, HIDDEN, dtype=torch.bfloat16, device=device) * s
     kv_a_layernorm_w = torch.randn(KV_LORA_RANK, dtype=torch.bfloat16, device=device)
-    kv_b_proj_w = torch.randn(NUM_HEADS * (QK_NOPE_DIM + V_HEAD_DIM), KV_LORA_RANK, dtype=torch.bfloat16, device=device)
-    o_proj_w = torch.randn(HIDDEN, NUM_HEADS * V_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    kv_b_proj_w = torch.randn(NUM_HEADS * (QK_NOPE_DIM + V_HEAD_DIM), KV_LORA_RANK, dtype=torch.bfloat16, device=device) * s
+    o_proj_w = torch.randn(HIDDEN, NUM_HEADS * V_HEAD_DIM, dtype=torch.bfloat16, device=device) * s
 
-    idx_wq_b_w = torch.randn(IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
-    idx_wk_w = torch.randn(IDX_HEAD_DIM, HIDDEN, dtype=torch.bfloat16, device=device)
+    idx_wq_b_w = torch.randn(IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device) * s
+    idx_wk_w = torch.randn(IDX_HEAD_DIM, HIDDEN, dtype=torch.bfloat16, device=device) * s
     idx_k_norm_w = torch.randn(IDX_HEAD_DIM, dtype=torch.bfloat16, device=device)
     idx_k_norm_b = torch.randn(IDX_HEAD_DIM, dtype=torch.bfloat16, device=device)
-    idx_weights_proj_w = torch.randn(IDX_N_HEADS, HIDDEN, dtype=torch.bfloat16, device=device)
+    idx_weights_proj_w = torch.randn(IDX_N_HEADS, HIDDEN, dtype=torch.bfloat16, device=device) * s
 
     attn_weights = dict(
         q_a_proj_w=q_a_proj_w, q_a_layernorm_w=q_a_layernorm_w,
@@ -76,9 +77,9 @@ def test_dense_layer_real_dims(glm, device):
         v_head_dim=V_HEAD_DIM, q_lora_rank=Q_LORA_RANK, kv_lora_rank=KV_LORA_RANK,
         hidden_size=HIDDEN)
 
-    gate_w = torch.randn(INTERMEDIATE, HIDDEN, dtype=torch.bfloat16, device=device)
-    up_w = torch.randn(INTERMEDIATE, HIDDEN, dtype=torch.bfloat16, device=device)
-    down_w = torch.randn(HIDDEN, INTERMEDIATE, dtype=torch.bfloat16, device=device)
+    gate_w = torch.randn(INTERMEDIATE, HIDDEN, dtype=torch.bfloat16, device=device) * s
+    up_w = torch.randn(INTERMEDIATE, HIDDEN, dtype=torch.bfloat16, device=device) * s
+    down_w = torch.randn(HIDDEN, INTERMEDIATE, dtype=torch.bfloat16, device=device) * s
 
     mlp_weights = dict(gate_w=gate_w, up_w=up_w, down_w=down_w)
 
@@ -92,11 +93,9 @@ def test_dense_layer_real_dims(glm, device):
         input_layernorm_w, post_attn_layernorm_w,
         attn_weights, mlp_weights, "dense", EPS)
 
-    # cuBLAS GEMM pads batch<8 to 8 for cross-batch determinism (chunked prefill).
-    # With std=1 random weights, BF16 rounding differences between algorithms
-    # compound through SiLU/softmax to ~1e4 maxDiff; with trained-magnitude
-    # weights (1/sqrt(dim)), maxDiff is ~0.03.
-    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=2e4, rtol=1.0)
+    # Weights scaled by 0.01 to keep outputs small and avoid bf16 accumulation
+    # overflow with real GLM-5.1 dimensions. LayerNorm weights left unscaled.
+    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.1, rtol=5e-3)
 
 
 # @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -110,7 +109,8 @@ def test_moe_layer_real_dims(glm, device):
     idx_eps = 1e-6
 
     torch.manual_seed(123)
-    hidden_states = torch.randn(B, S, HIDDEN, dtype=torch.bfloat16, device=device)
+    s = 0.01
+    hidden_states = torch.randn(B, S, HIDDEN, dtype=torch.bfloat16, device=device) * s
     cos, sin = _make_rotary_embed(glm, device, QK_ROPE_DIM // 2, B, S, theta=ROPE_THETA)
 
     causal_2d = torch.empty(S, S, dtype=torch.bfloat16, device=device)
@@ -120,19 +120,19 @@ def test_moe_layer_real_dims(glm, device):
     input_layernorm_w = torch.randn(HIDDEN, dtype=torch.bfloat16, device=device)
     post_attn_layernorm_w = torch.randn(HIDDEN, dtype=torch.bfloat16, device=device)
 
-    q_a_proj_w = torch.randn(Q_LORA_RANK, HIDDEN, dtype=torch.bfloat16, device=device)
+    q_a_proj_w = torch.randn(Q_LORA_RANK, HIDDEN, dtype=torch.bfloat16, device=device) * s
     q_a_layernorm_w = torch.randn(Q_LORA_RANK, dtype=torch.bfloat16, device=device)
-    q_b_proj_w = torch.randn(NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
-    kv_a_proj_with_mqa_w = torch.randn(KV_LORA_RANK + QK_ROPE_DIM, HIDDEN, dtype=torch.bfloat16, device=device)
+    q_b_proj_w = torch.randn(NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device) * s
+    kv_a_proj_with_mqa_w = torch.randn(KV_LORA_RANK + QK_ROPE_DIM, HIDDEN, dtype=torch.bfloat16, device=device) * s
     kv_a_layernorm_w = torch.randn(KV_LORA_RANK, dtype=torch.bfloat16, device=device)
-    kv_b_proj_w = torch.randn(NUM_HEADS * (QK_NOPE_DIM + V_HEAD_DIM), KV_LORA_RANK, dtype=torch.bfloat16, device=device)
-    o_proj_w = torch.randn(HIDDEN, NUM_HEADS * V_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    kv_b_proj_w = torch.randn(NUM_HEADS * (QK_NOPE_DIM + V_HEAD_DIM), KV_LORA_RANK, dtype=torch.bfloat16, device=device) * s
+    o_proj_w = torch.randn(HIDDEN, NUM_HEADS * V_HEAD_DIM, dtype=torch.bfloat16, device=device) * s
 
-    idx_wq_b_w = torch.randn(IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
-    idx_wk_w = torch.randn(IDX_HEAD_DIM, HIDDEN, dtype=torch.bfloat16, device=device)
+    idx_wq_b_w = torch.randn(IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device) * s
+    idx_wk_w = torch.randn(IDX_HEAD_DIM, HIDDEN, dtype=torch.bfloat16, device=device) * s
     idx_k_norm_w = torch.randn(IDX_HEAD_DIM, dtype=torch.bfloat16, device=device)
     idx_k_norm_b = torch.randn(IDX_HEAD_DIM, dtype=torch.bfloat16, device=device)
-    idx_weights_proj_w = torch.randn(IDX_N_HEADS, HIDDEN, dtype=torch.bfloat16, device=device)
+    idx_weights_proj_w = torch.randn(IDX_N_HEADS, HIDDEN, dtype=torch.bfloat16, device=device) * s
 
     attn_weights = dict(
         q_a_proj_w=q_a_proj_w, q_a_layernorm_w=q_a_layernorm_w,
@@ -150,19 +150,19 @@ def test_moe_layer_real_dims(glm, device):
         v_head_dim=V_HEAD_DIM, q_lora_rank=Q_LORA_RANK, kv_lora_rank=KV_LORA_RANK,
         hidden_size=HIDDEN)
 
-    gate_weight = torch.randn(N_ROUTED_EXPERTS, HIDDEN, dtype=torch.bfloat16, device=device)
-    e_score_correction_bias = torch.randn(N_ROUTED_EXPERTS, dtype=torch.bfloat16, device=device)
+    gate_weight = torch.randn(N_ROUTED_EXPERTS, HIDDEN, dtype=torch.bfloat16, device=device) * s
+    e_score_correction_bias = torch.randn(N_ROUTED_EXPERTS, dtype=torch.bfloat16, device=device) * s
 
-    pool_gates = [torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device) for _ in range(num_distinct_experts)]
-    pool_ups = [torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device) for _ in range(num_distinct_experts)]
-    pool_downs = [torch.randn(HIDDEN, MOE_INTER, dtype=torch.bfloat16, device=device) for _ in range(num_distinct_experts)]
+    pool_gates = [torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device) * s for _ in range(num_distinct_experts)]
+    pool_ups = [torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device) * s for _ in range(num_distinct_experts)]
+    pool_downs = [torch.randn(HIDDEN, MOE_INTER, dtype=torch.bfloat16, device=device) * s for _ in range(num_distinct_experts)]
     expert_gates = [pool_gates[i % num_distinct_experts] for i in range(N_ROUTED_EXPERTS)]
     expert_ups = [pool_ups[i % num_distinct_experts] for i in range(N_ROUTED_EXPERTS)]
     expert_downs = [pool_downs[i % num_distinct_experts] for i in range(N_ROUTED_EXPERTS)]
 
-    shared_gate_w = torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device)
-    shared_up_w = torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device)
-    shared_down_w = torch.randn(HIDDEN, MOE_INTER, dtype=torch.bfloat16, device=device)
+    shared_gate_w = torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device) * s
+    shared_up_w = torch.randn(MOE_INTER, HIDDEN, dtype=torch.bfloat16, device=device) * s
+    shared_down_w = torch.randn(HIDDEN, MOE_INTER, dtype=torch.bfloat16, device=device) * s
 
     mlp_weights = dict(
         gate_weight=gate_weight, e_score_correction_bias=e_score_correction_bias,
@@ -182,4 +182,6 @@ def test_moe_layer_real_dims(glm, device):
         input_layernorm_w, post_attn_layernorm_w,
         attn_weights, mlp_weights, "sparse", EPS)
 
-    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=2e4, rtol=1.0)
+    # Weights scaled by 0.01 to keep outputs small and avoid bf16 accumulation
+    # overflow with real GLM-5.1 dimensions. LayerNorm weights left unscaled.
+    torch.testing.assert_close(cuda.cpu(), ref.cpu(), atol=0.25, rtol=5e-2)
