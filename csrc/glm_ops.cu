@@ -438,7 +438,8 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
             kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
             attn_n_heads, head_offset, total_rows);
     };
-    if (rows_per_block >= 4) launch.operator()<4>();
+    if (rows_per_block >= 8) launch.operator()<8>();
+    else if (rows_per_block >= 4) launch.operator()<4>();
     else if (rows_per_block == 2) launch.operator()<2>();
     else launch.operator()<1>();
 }

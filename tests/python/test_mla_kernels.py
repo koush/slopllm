@@ -78,7 +78,7 @@ def test_mla_v_expand(glm, device):
     v_head_dim = 6
 
     attn_out = torch.randn(batch * n_heads, seq_len, kv_lora_rank, dtype=torch.bfloat16, device=device)
-    v_proj = torch.randn(n_heads * v_head_dim, kv_lora_rank, dtype=torch.bfloat16, device=device)
+    v_proj = torch.randn(n_heads * kv_lora_rank, v_head_dim, dtype=torch.bfloat16, device=device)
 
     result_cuda = torch.empty(batch * seq_len, n_heads * v_head_dim, dtype=torch.bfloat16, device=device)
     glm.mlaVExpand(result_cuda, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch)
@@ -91,7 +91,7 @@ def test_mla_v_expand(glm, device):
                     sum_val = 0.0
                     for k in range(kv_lora_rank):
                         a = attn_out[(b * n_heads + h), s, k].float()
-                        w = v_proj[h * v_head_dim + j, k].float()
+                        w = v_proj[h * kv_lora_rank + k, j].float()
                         sum_val += a * w
                     result_ref[b, s, h, j] = sum_val
 
