@@ -113,8 +113,8 @@ class TestP2PBarrier:
         for rank in range(NUM_GPUS):
             self.ops[rank].p2p_barrier(instances[rank])
 
-        y = torch.randn(count, dtype=torch.bfloat16, device=f'cuda:{rank}')
         for rank in range(NUM_GPUS):
+            y = torch.randn(count, dtype=torch.bfloat16, device=f'cuda:{rank}')
             self.ops[rank].p2p_allreduce(instances[rank], y, y, count)
 
         self._synchronize_all()

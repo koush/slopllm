@@ -731,6 +731,7 @@ class GlmOps:
         self.lib.glm_p2p_barrier.restype = None
         self.lib.glm_p2p_barrier.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int,
         ]
 
         self.lib.glm_p2p_cp_merge.restype = None
@@ -1748,8 +1749,8 @@ class GlmOps:
         flag_arr = (ctypes.c_void_p * world_size)(*[ctypes.c_void_p(int(p)) for p in peer_flag_ptrs])
         self.lib.glm_p2p_set_peers(self.ctx, inst, data_arr, flag_arr)
 
-    def p2p_barrier(self, inst):
-        self.lib.glm_p2p_barrier(self.ctx, inst)
+    def p2p_barrier(self, inst, peer_rank=-1):
+        self.lib.glm_p2p_barrier(self.ctx, inst, peer_rank)
 
     def p2p_allreduce(self, inst, inp, out, count, dtype=9):
         self.lib.glm_p2p_allreduce(self.ctx, inst, self._ptr(inp), self._ptr(out), count, dtype)
