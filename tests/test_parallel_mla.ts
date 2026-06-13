@@ -582,7 +582,7 @@ describe("ParallelOps.mlaVExpand", () => {
             let sum = 0;
             for (let k = 0; k < kvLoraRank; k++) {
               const a = attnOut[(b * nHeads + h) * seqLen * kvLoraRank + s * kvLoraRank + k];
-              const w = vProj[(h * vHeadDim + j) * kvLoraRank + k];
+              const w = vProj[(h * kvLoraRank + k) * vHeadDim + j];
               sum += a * w;
             }
             result[(b * seqLen + s) * nHeads * vHeadDim + h * vHeadDim + j] = sum;
@@ -609,7 +609,7 @@ describe("ParallelOps.mlaVExpand", () => {
     const expected = refMlaVExpand(attnOutF32, vProjF32, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
 
     const refAttnOut = refWs.alloc([batch * nHeads, seqLen, kvLoraRank], "BF16");
-    const refVProj = refWs.alloc([nHeads * vHeadDim, kvLoraRank], "BF16");
+    const refVProj = refWs.alloc([nHeads * kvLoraRank, vHeadDim], "BF16");
     refAttnOut.h2d(f32ToBf16Bytes(attnOutF32));
     refVProj.h2d(f32ToBf16Bytes(vProjF32));
     ref.synchronize();
@@ -643,13 +643,13 @@ describe("ParallelOps.mlaVExpand", () => {
       }
     }
 
-    const vProjShard0 = new Float32Array(shardHeads * vHeadDim * kvLoraRank);
-    const vProjShard1 = new Float32Array(shardHeads * vHeadDim * kvLoraRank);
+    const vProjShard0 = new Float32Array(shardHeads * kvLoraRank * vHeadDim);
+    const vProjShard1 = new Float32Array(shardHeads * kvLoraRank * vHeadDim);
     for (let h = 0; h < shardHeads; h++) {
-      for (let j = 0; j < vHeadDim; j++) {
-        for (let k = 0; k < kvLoraRank; k++) {
-          vProjShard0[(h * vHeadDim + j) * kvLoraRank + k] = vProjF32[(h * vHeadDim + j) * kvLoraRank + k];
-          vProjShard1[(h * vHeadDim + j) * kvLoraRank + k] = vProjF32[((shardHeads + h) * vHeadDim + j) * kvLoraRank + k];
+      for (let k = 0; k < kvLoraRank; k++) {
+        for (let j = 0; j < vHeadDim; j++) {
+          vProjShard0[(h * kvLoraRank + k) * vHeadDim + j] = vProjF32[(h * kvLoraRank + k) * vHeadDim + j];
+          vProjShard1[(h * kvLoraRank + k) * vHeadDim + j] = vProjF32[((shardHeads + h) * kvLoraRank + k) * vHeadDim + j];
         }
       }
     }
@@ -657,7 +657,7 @@ describe("ParallelOps.mlaVExpand", () => {
     pAttnOut.shard(0).h2d(f32ToBf16Bytes(attnShard0));
     pAttnOut.shard(1).h2d(f32ToBf16Bytes(attnShard1));
 
-    const pVProj = ws.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    const pVProj = ws.alloc([nHeads * kvLoraRank, vHeadDim], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
     pVProj.shard(0).h2d(f32ToBf16Bytes(vProjShard0));
     pVProj.shard(1).h2d(f32ToBf16Bytes(vProjShard1));
     po.synchronize();
