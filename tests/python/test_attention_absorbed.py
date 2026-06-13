@@ -394,26 +394,27 @@ def test_attention_absorbed_real_dims(glm, device):
     idx_eps = 1e-6
 
     torch.manual_seed(42)
-    hidden_states = torch.randn(B, S, hidden_size, dtype=torch.bfloat16, device=device)
+    s = 0.01
+    hidden_states = torch.randn(B, S, hidden_size, dtype=torch.bfloat16, device=device) * s
     cos, sin = _make_rotary_embed(glm, device, qk_rope_dim // 2, B, S, theta=1_000_000)
 
     causal_2d = torch.empty(S, S, dtype=torch.bfloat16, device=device)
     glm.causal_mask(causal_2d, S)
     attention_mask = causal_2d.unsqueeze(0).unsqueeze(0)
 
-    q_a_proj_w = torch.randn(q_lora_rank, hidden_size, dtype=torch.bfloat16, device=device)
+    q_a_proj_w = torch.randn(q_lora_rank, hidden_size, dtype=torch.bfloat16, device=device) * s
     q_a_layernorm_w = torch.randn(q_lora_rank, dtype=torch.bfloat16, device=device)
-    q_b_proj_w = torch.randn(num_heads * qk_head_dim, q_lora_rank, dtype=torch.bfloat16, device=device)
-    kv_a_proj_with_mqa_w = torch.randn(kv_lora_rank + qk_rope_dim, hidden_size, dtype=torch.bfloat16, device=device)
+    q_b_proj_w = torch.randn(num_heads * qk_head_dim, q_lora_rank, dtype=torch.bfloat16, device=device) * s
+    kv_a_proj_with_mqa_w = torch.randn(kv_lora_rank + qk_rope_dim, hidden_size, dtype=torch.bfloat16, device=device) * s
     kv_a_layernorm_w = torch.randn(kv_lora_rank, dtype=torch.bfloat16, device=device)
-    kv_b_proj_w = torch.randn(num_heads * (qk_nope_dim + v_head_dim), kv_lora_rank, dtype=torch.bfloat16, device=device)
-    o_proj_w = torch.randn(hidden_size, num_heads * v_head_dim, dtype=torch.bfloat16, device=device)
+    kv_b_proj_w = torch.randn(num_heads * (qk_nope_dim + v_head_dim), kv_lora_rank, dtype=torch.bfloat16, device=device) * s
+    o_proj_w = torch.randn(hidden_size, num_heads * v_head_dim, dtype=torch.bfloat16, device=device) * s
 
-    idx_wq_b_w = torch.randn(idx_n_heads * idx_head_dim, q_lora_rank, dtype=torch.bfloat16, device=device)
-    idx_wk_w = torch.randn(idx_head_dim, hidden_size, dtype=torch.bfloat16, device=device)
+    idx_wq_b_w = torch.randn(idx_n_heads * idx_head_dim, q_lora_rank, dtype=torch.bfloat16, device=device) * s
+    idx_wk_w = torch.randn(idx_head_dim, hidden_size, dtype=torch.bfloat16, device=device) * s
     idx_k_norm_w = torch.randn(idx_head_dim, dtype=torch.bfloat16, device=device)
     idx_k_norm_b = torch.randn(idx_head_dim, dtype=torch.bfloat16, device=device)
-    idx_weights_proj_w = torch.randn(idx_n_heads, hidden_size, dtype=torch.bfloat16, device=device)
+    idx_weights_proj_w = torch.randn(idx_n_heads, hidden_size, dtype=torch.bfloat16, device=device) * s
 
     indexer_weights = dict(
         wq_b_w=idx_wq_b_w, wk_w=idx_wk_w,
