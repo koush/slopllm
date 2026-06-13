@@ -232,6 +232,7 @@ __global__ void unscatter_output_kernel(
 // ---------------------------------------------------------------------------
 
 constexpr int NVFP4_QUANT_GROUP = 16;
+constexpr int NVFP4_SMALLK_THRESHOLD = GEMV_WARP_SIZE * NVFP4_QUANT_GROUP;
 
 // Tokens-per-expert is unbounded (data-dependent), but registers aren't —
 // process M_e in chunks of NVFP4_GROUPED_M_CHUNK, accumulating that many
@@ -263,8 +264,16 @@ constexpr int NVFP4_GROUPED_M_CHUNK = GEMV_ROWS_PER_BLOCK;
 // was evaluated, but reserving dynamic shared memory on every launch lowered
 // SM occupancy enough to make the dominant small-M_e case ~10% slower —
 // not worth it for a code path that triggers rarely.)
+//
+// Template parameter RowsPerWarp: when K is small (<= 512, i.e.
+// num_k_groups <= 32), each warp only needs 4 lanes per row to cover the
+// K-dimension. RowsPerWarp=8 packs 8 output rows into each 32-lane warp
+// (4 lanes each), reducing the grid by 8× and dramatically improving
+// occupancy for the large-N, small-K case (e.g. MoE down_proj under TP).
+// RowsPerWarp=1 is the default: one full warp per row, 32 lanes collaborating.
 // ---------------------------------------------------------------------------
 
+template <int RowsPerWarp>
 __global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
 grouped_nvfp4_gemv_kernel(
     __nv_bfloat16* __restrict__ sorted_output,
@@ -277,7 +286,11 @@ grouped_nvfp4_gemv_kernel(
     int num_experts,
     int N)
 {
-    int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+    constexpr int LANES_PER_ROW = GEMV_WARP_SIZE / RowsPerWarp;
+    constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * RowsPerWarp;
+    constexpr int M_CHUNK = (RowsPerWarp == 1) ? NVFP4_GROUPED_M_CHUNK : 1;
+
+    int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     int expert_id = blockIdx.x / num_row_groups;
     int row_group = blockIdx.x % num_row_groups;
 
@@ -288,27 +301,32 @@ grouped_nvfp4_gemv_kernel(
 
     int warp_id = threadIdx.x / GEMV_WARP_SIZE;
     int lane = threadIdx.x % GEMV_WARP_SIZE;
-    int row = row_group * GEMV_ROWS_PER_BLOCK + warp_id;
+    int row_in_warp = lane / LANES_PER_ROW;
+    int inner_lane = lane % LANES_PER_ROW;
+    int row = row_group * ROWS_PER_BLOCK + warp_id * RowsPerWarp + row_in_warp;
     bool row_valid = row < N;
-    if (!row_valid) return;
+
+    if constexpr (RowsPerWarp == 1) {
+        if (!row_valid) return;
+    }
 
     int num_k_groups = K / NVFP4_QUANT_GROUP;
 
-    const uint8_t* weight_row = weight_ptrs[expert_id] + (size_t)row * (K / 2);
-    const __nv_fp8_e4m3* scale_row = scale_ptrs[expert_id] + (size_t)row * num_k_groups;
+    const uint8_t* weight_row = row_valid ? (weight_ptrs[expert_id] + (size_t)row * (K / 2)) : nullptr;
+    const __nv_fp8_e4m3* scale_row = row_valid ? (scale_ptrs[expert_id] + (size_t)row * num_k_groups) : nullptr;
     float scale_2_val = *scale2_ptrs[expert_id];
 
     const __nv_bfloat16* expert_input = sorted_input + (size_t)expert_offsets[expert_id] * K;
     __nv_bfloat16* expert_output = sorted_output + (size_t)expert_offsets[expert_id] * N;
 
-    for (int m_base = 0; m_base < M_e; m_base += NVFP4_GROUPED_M_CHUNK) {
-        int m_count = min(NVFP4_GROUPED_M_CHUNK, M_e - m_base);
+    for (int m_base = 0; m_base < M_e; m_base += M_CHUNK) {
+        int m_count = min(M_CHUNK, M_e - m_base);
 
-        float sums[NVFP4_GROUPED_M_CHUNK];
+        float sums[M_CHUNK];
         #pragma unroll
-        for (int m = 0; m < NVFP4_GROUPED_M_CHUNK; m++) sums[m] = 0.0f;
+        for (int m = 0; m < M_CHUNK; m++) sums[m] = 0.0f;
 
-        for (int g = lane * 2; g < num_k_groups; g += GEMV_WARP_SIZE * 2) {
+        for (int g = inner_lane * 2; row_valid && g < num_k_groups; g += LANES_PER_ROW * 2) {
             int k_start = g * NVFP4_QUANT_GROUP;
             uint4 w = *reinterpret_cast<const uint4*>(weight_row + (size_t)g * (NVFP4_QUANT_GROUP / 2));
 
@@ -365,17 +383,31 @@ grouped_nvfp4_gemv_kernel(
             }
         }
 
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
+        if constexpr (RowsPerWarp == 1) {
             #pragma unroll
-            for (int m = 0; m < NVFP4_GROUPED_M_CHUNK; m++) {
-                sums[m] += __shfl_down_sync(0xFFFFFFFF, sums[m], offset);
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                #pragma unroll
+                for (int m = 0; m < M_CHUNK; m++) {
+                    sums[m] += __shfl_down_sync(0xFFFFFFFF, sums[m], offset);
+                }
             }
-        }
-
-        if (lane == 0) {
-            for (int m = 0; m < m_count; m++) {
-                expert_output[(size_t)(m_base + m) * N + row] = __float2bfloat16(sums[m]);
+            if (lane == 0) {
+                for (int m = 0; m < m_count; m++) {
+                    expert_output[(size_t)(m_base + m) * N + row] = __float2bfloat16(sums[m]);
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int offset = LANES_PER_ROW / 2; offset > 0; offset >>= 1) {
+                #pragma unroll
+                for (int m = 0; m < M_CHUNK; m++) {
+                    sums[m] += __shfl_xor_sync(0xFFFFFFFF, sums[m], offset);
+                }
+            }
+            if (row_valid && inner_lane == 0) {
+                for (int m = 0; m < m_count; m++) {
+                    expert_output[(size_t)(m_base + m) * N + row] = __float2bfloat16(sums[m]);
+                }
             }
         }
     }
@@ -521,15 +553,26 @@ void glm_nvfp4_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
     restore_offsets_kernel<<<grid_size, block_size, 0, stream>>>(
         expert_offsets, expert_counts, num_experts);
 
-    int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
-    int total_ctas = num_experts * num_row_groups;
-
-    grouped_nvfp4_gemv_kernel<<<total_ctas, GEMV_BLOCK_SIZE, 0, stream>>>(
-        sorted_output, sorted_input, K,
-        reinterpret_cast<const uint8_t* const*>(weight_ptrs),
-        reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs),
-        reinterpret_cast<const float* const*>(scale2_ptrs),
-        expert_offsets, num_experts, N);
+    if (K <= NVFP4_SMALLK_THRESHOLD) {
+        constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * 8;
+        int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+        int total_ctas = num_experts * num_row_groups;
+        grouped_nvfp4_gemv_kernel<8><<<total_ctas, GEMV_BLOCK_SIZE, 0, stream>>>(
+            sorted_output, sorted_input, K,
+            reinterpret_cast<const uint8_t* const*>(weight_ptrs),
+            reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs),
+            reinterpret_cast<const float* const*>(scale2_ptrs),
+            expert_offsets, num_experts, N);
+    } else {
+        int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+        int total_ctas = num_experts * num_row_groups;
+        grouped_nvfp4_gemv_kernel<1><<<total_ctas, GEMV_BLOCK_SIZE, 0, stream>>>(
+            sorted_output, sorted_input, K,
+            reinterpret_cast<const uint8_t* const*>(weight_ptrs),
+            reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs),
+            reinterpret_cast<const float* const*>(scale2_ptrs),
+            expert_offsets, num_experts, N);
+    }
 
     grid_size = (count + block_size - 1) / block_size;
     unscatter_output_kernel<<<grid_size, block_size, 0, stream>>>(

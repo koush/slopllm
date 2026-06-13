@@ -79,6 +79,7 @@
             },
             "runtimeArgs": [
                 "${workspaceFolder}/src/run_prefill_benchmark.ts",
+                "--glm51-small",
             ],
             "skipFiles": [
                 "<node_internals>/**"

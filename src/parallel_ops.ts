@@ -1847,6 +1847,8 @@ export class ParallelOps implements DeviceOps {
     if (!group)
       return false;
 
+    return false;
+
     if (false) {
       // release old sources, track new ones
       this.sourceCleanup();

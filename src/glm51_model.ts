@@ -252,7 +252,7 @@ export class Glm51Model extends ChatModel {
     }
 
     // using column parallelism means there's a gather on the absorbed
-    const nopeParallelism = false && this.contextParallel ? TensorParallelism.Replicated : colPar;
+    const nopeParallelism = this.contextParallel ? TensorParallelism.Replicated : colPar;
 
     if (name.endsWith(".q_b_proj.weight")) {
       const eb = 2;

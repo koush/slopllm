@@ -7,6 +7,7 @@ import { GlmOps } from "./glm_ops";
 import { ParallelOps } from "./parallel_ops";
 
 const GLM51_MODEL_DIR = "/mnt/storage/GLM-5.1-NVFP4-Fixed";
+const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp4";
 
 interface BenchArgs {
   gpus: number[];
@@ -18,6 +19,7 @@ interface BenchArgs {
   benchRuns: number;
   cp: boolean;
   pageSize: number;
+  glm51Small: boolean;
 }
 
 function parseArgs(argv: string[]): BenchArgs {
@@ -29,9 +31,10 @@ function parseArgs(argv: string[]): BenchArgs {
     arena: 92,
     maxBatch: 1,
     warmupRuns: 1,
-    benchRuns: 3,
+    benchRuns: 1,
     cp: true,
     pageSize: 16,
+    glm51Small: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -42,6 +45,7 @@ function parseArgs(argv: string[]): BenchArgs {
     else if (a === "--warmup" && i + 1 < argv.length) args.warmupRuns = parseInt(argv[++i], 10);
     else if (a === "--runs" && i + 1 < argv.length) args.benchRuns = parseInt(argv[++i], 10);
     else if (a === "--cp") args.cp = true;
+    else if (a === "--glm51-small") args.glm51Small = true;
     else if (a === "--help") {
       console.log(`Usage: npx tsx src/run_prefill_benchmark.ts [options]
 Options:
@@ -52,6 +56,7 @@ Options:
   --warmup <n>       Warmup runs (default: 1)
   --runs <n>         Benchmark runs (default: 3)
   --cp               Enable context parallelism
+  --glm51-small      Use GLM-5.1 small model
   --help             Show this help`);
       process.exit(0);
     }
@@ -61,13 +66,14 @@ Options:
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const gpuDevices = args.gpus.map(id => new GlmOps(id, undefined, args.arena || undefined));
+  const gpuDevices = args.gpus.map(id => new GlmOps(id, undefined,  undefined));
   const glm: DeviceOps = gpuDevices.length > 1 ? new ParallelOps(gpuDevices) : gpuDevices[0];
   const gpuLabel = args.gpus.length > 1 ? `${args.gpus[0]}-${args.gpus[args.gpus.length - 1]}` : `${args.gpus[0]}`;
 
-  console.log(`GLM-5.1 Prefill Benchmark | GPUs ${gpuLabel} (${args.gpus.length}) | seq_len=${args.seqLen} | chunk_size=${args.chunkSize} | cp=${args.cp}`);
+  const modelDir = args.glm51Small ? GLM51_SMALL_NVFP4 : GLM51_MODEL_DIR;
+  console.log(`GLM-5.1 Prefill Benchmark | GPUs ${gpuLabel} (${args.gpus.length}) | seq_len=${args.seqLen} | chunk_size=${args.chunkSize} | cp=${args.cp} | model=${args.glm51Small ? "small" : "full"}`);
 
-  const model: ChatModel = await Glm51Model.fromPretrained(glm, GLM51_MODEL_DIR, args.cp, false);
+  const model: ChatModel = await Glm51Model.fromPretrained(glm, modelDir, args.cp, false);
   const pageSize = args.pageSize;
   const maxPages = Math.ceil(args.seqLen / pageSize) + 64;
   const cache = model.createChatCache(maxPages, args.maxBatch, args.seqLen + 1);
@@ -86,10 +92,11 @@ async function main(): Promise<void> {
   const numChunks = Math.ceil(args.seqLen / args.chunkSize);
 
   const captureManager = new CaptureManager(glm);
+  captureManager.disabled = true;
 
   let warmupRuns = 0;
 
-  while (!captureManager.isCaptured(['prefill'])) {
+  while (!captureManager.isCaptured(['prefill']) && !captureManager.disabled) {
     cache.reset(1);
 
 
