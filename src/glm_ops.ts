@@ -144,6 +144,7 @@ interface NativeAddon {
   p2pCpMerge(ctx: number, instance: number, myVOut: number, myLse: number, mergedVOut: number, mergedLse: number, numShards: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void;
   contextParallelMergeHeads(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, shardNHeads: number, headOffset: number, inputNHeads: number, vHeadDim: number): void;
   p2pCpMergeHeads(ctx: number, instance: number, myVOut: number, myLse: number, mergedVOut: number, mergedLse: number, numShards: number, batchSize: number, numHeads: number, shardNHeads: number, headOffset: number, inputNHeads: number, vHeadDim: number): void;
+  cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, v8: number, v9: number, v10: number, v11: number, v12: number, v13: number, v14: number, v15: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, lse8: number, lse9: number, lse10: number, lse11: number, lse12: number, lse13: number, lse14: number, lse15: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number, offset: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
@@ -893,6 +894,21 @@ export class GlmOps implements DeviceOps {
     } else {
       getNativeAddon().p2pCpMergeHeads(this.ctx, instance, ptr(myVOut), ptr(myLse), ptr(mergedVOut), mergedLse ? ptr(mergedLse) : 0, numShards, batchSize, numHeads, snh, ho, inh, vHeadDim);
     }
+  }
+
+  cpMergeTree(vPtrs: number[], lsePtrs: number[], numShards: number, outputV: Tensor, outputLse: Tensor | null, numel: number, batchSize: number, numHeads: number, vHeadDim: number): void {
+    const v = new Array<number>(16).fill(0);
+    for (let i = 0; i < numShards; i++) v[i] = vPtrs[i];
+    const lse = new Array<number>(16).fill(0);
+    for (let i = 0; i < numShards; i++) lse[i] = lsePtrs[i];
+    getNativeAddon().cpMergeTree(
+      this.ctx,
+      v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+      v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15],
+      lse[0], lse[1], lse[2], lse[3], lse[4], lse[5], lse[6], lse[7],
+      lse[8], lse[9], lse[10], lse[11], lse[12], lse[13], lse[14], lse[15],
+      numShards, ptr(outputV), outputLse ? ptr(outputLse) : 0, numel, batchSize, numHeads, vHeadDim,
+    );
   }
 
   p2pBarrier(instance: number, peerRank: number = -1): void {

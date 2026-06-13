@@ -2709,6 +2709,56 @@ static Napi::Value P2PCpMergeHeads(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value CpMergeTree(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 40) {
+        Napi::TypeError::New(env, "Expected (ctx, v0..v15, lse0..lse15, num_shards, output_v, output_lse, numel, batch_size, num_heads, v_head_dim)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t vp[16], lp[16];
+    for (int i = 0; i < 16; i++) {
+        vp[i] = info[1 + i].As<Napi::Number>().Int64Value();
+        lp[i] = info[17 + i].As<Napi::Number>().Int64Value();
+    }
+    int num_shards = info[33].As<Napi::Number>().Int32Value();
+    uintptr_t output_v_ptr = info[34].As<Napi::Number>().Int64Value();
+    uintptr_t output_lse_ptr = info[35].As<Napi::Number>().Int64Value();
+    int64_t numel = info[36].As<Napi::Number>().Int64Value();
+    int batch_size = info[37].As<Napi::Number>().Int32Value();
+    int num_heads = info[38].As<Napi::Number>().Int32Value();
+    int v_head_dim = info[39].As<Napi::Number>().Int32Value();
+
+    glm_cp_merge_tree(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<const void*>(vp[0]),  reinterpret_cast<const void*>(vp[1]),
+        reinterpret_cast<const void*>(vp[2]),  reinterpret_cast<const void*>(vp[3]),
+        reinterpret_cast<const void*>(vp[4]),  reinterpret_cast<const void*>(vp[5]),
+        reinterpret_cast<const void*>(vp[6]),  reinterpret_cast<const void*>(vp[7]),
+        reinterpret_cast<const void*>(vp[8]),  reinterpret_cast<const void*>(vp[9]),
+        reinterpret_cast<const void*>(vp[10]), reinterpret_cast<const void*>(vp[11]),
+        reinterpret_cast<const void*>(vp[12]), reinterpret_cast<const void*>(vp[13]),
+        reinterpret_cast<const void*>(vp[14]), reinterpret_cast<const void*>(vp[15]),
+        reinterpret_cast<const float*>(lp[0]),  reinterpret_cast<const float*>(lp[1]),
+        reinterpret_cast<const float*>(lp[2]),  reinterpret_cast<const float*>(lp[3]),
+        reinterpret_cast<const float*>(lp[4]),  reinterpret_cast<const float*>(lp[5]),
+        reinterpret_cast<const float*>(lp[6]),  reinterpret_cast<const float*>(lp[7]),
+        reinterpret_cast<const float*>(lp[8]),  reinterpret_cast<const float*>(lp[9]),
+        reinterpret_cast<const float*>(lp[10]), reinterpret_cast<const float*>(lp[11]),
+        reinterpret_cast<const float*>(lp[12]), reinterpret_cast<const float*>(lp[13]),
+        reinterpret_cast<const float*>(lp[14]), reinterpret_cast<const float*>(lp[15]),
+        num_shards,
+        reinterpret_cast<void*>(output_v_ptr),
+        reinterpret_cast<float*>(output_lse_ptr),
+        numel, batch_size, num_heads, v_head_dim);
+
+    cudaError_t cp_err = cudaGetLastError();
+    if (cp_err != cudaSuccess) {
+        Napi::Error::New(env, std::string("cpMergeTree failed: ") + cudaGetErrorString(cp_err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value GateSigmoidMul(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -3310,6 +3360,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "contextParallelMergeHeads"), Napi::Function::New(env, ContextParallelMergeHeads));
     exports.Set(Napi::String::New(env, "p2pCpMerge"), Napi::Function::New(env, P2PCpMerge));
     exports.Set(Napi::String::New(env, "p2pCpMergeHeads"), Napi::Function::New(env, P2PCpMergeHeads));
+    exports.Set(Napi::String::New(env, "cpMergeTree"), Napi::Function::New(env, CpMergeTree));
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
     exports.Set(Napi::String::New(env, "rotateInputIds"), Napi::Function::New(env, RotateInputIds));
     exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));

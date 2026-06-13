@@ -1709,6 +1709,28 @@ class GlmOps:
     def p2p_enable_peer_access(self, peer_device):
         return self.lib.glm_p2p_enable_peer_access(self.ctx, peer_device)
 
+    def cp_merge_tree(self, v_ptrs_int, lse_ptrs_int, num_shards,
+                      merged_v_out, merged_lse,
+                      numel, batch_size, num_heads, v_head_dim):
+        v_args = [ctypes.c_void_p(int(p)) for p in v_ptrs_int] + [ctypes.c_void_p(0)] * (16 - len(v_ptrs_int))
+        lse_args = [ctypes.c_void_p(int(p)) for p in lse_ptrs_int] + [ctypes.c_void_p(0)] * (16 - len(lse_ptrs_int))
+        self.lib.glm_cp_merge_tree.restype = None
+        self.lib.glm_cp_merge_tree.argtypes = (
+            [ctypes.c_void_p] +
+            [ctypes.c_void_p] * 16 +
+            [ctypes.c_void_p] * 16 +
+            [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+             ctypes.c_int64, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        )
+        self.lib.glm_cp_merge_tree(
+            self.ctx,
+            *v_args, *lse_args,
+            num_shards,
+            ctypes.c_void_p(int(merged_v_out)),
+            ctypes.c_void_p(int(merged_lse)) if merged_lse is not None else ctypes.c_void_p(0),
+            numel, batch_size, num_heads, v_head_dim,
+        )
+
     def p2p_create_instance(self, my_rank, world_size):
         return self.lib.glm_p2p_create_instance(self.ctx, my_rank, world_size)
 

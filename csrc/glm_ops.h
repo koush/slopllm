@@ -779,6 +779,33 @@ void glm_p2p_cp_merge_heads(
     int input_n_heads,
     int v_head_dim);
 
+// CP Merge Tree: smem-staged online softmax merge using cp.async.bulk.
+// Merges up to 16 partial (v_out, lse) pairs using the online softmax trick.
+// Supports in-place operation (output_v may alias one of the v inputs, output_lse may alias one of the lse inputs).
+// Individual pointer arguments (not arrays) for CUDA graph capture compatibility.
+// v_out inputs: [batch_size * num_heads * v_head_dim] BF16 each
+// lse inputs: [batch_size * num_heads] F32 each
+// output_v: [batch_size * num_heads * v_head_dim] BF16
+// output_lse: [batch_size * num_heads] F32 (optional - pass nullptr to skip)
+// numel: batch_size * num_heads * v_head_dim (total BF16 elements in v_out)
+void glm_cp_merge_tree(
+    GlmCtx* ctx,
+    const void* v0,  const void* v1,  const void* v2,  const void* v3,
+    const void* v4,  const void* v5,  const void* v6,  const void* v7,
+    const void* v8,  const void* v9,  const void* v10, const void* v11,
+    const void* v12, const void* v13, const void* v14, const void* v15,
+    const float* lse0,  const float* lse1,  const float* lse2,  const float* lse3,
+    const float* lse4,  const float* lse5,  const float* lse6,  const float* lse7,
+    const float* lse8,  const float* lse9,  const float* lse10, const float* lse11,
+    const float* lse12, const float* lse13, const float* lse14, const float* lse15,
+    int num_shards,
+    void* output_v,
+    float* output_lse,
+    int64_t numel,
+    int batch_size,
+    int num_heads,
+    int v_head_dim);
+
 // RMSNorm gated: output = RMSNorm(input) * weight * SiLU(gate)
 // output: [batch, dim] BF16
 // input: [batch, dim] BF16
