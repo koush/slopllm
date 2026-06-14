@@ -172,9 +172,9 @@ npm run test:node          # TypeScript tests: end-to-end model inference via ts
 npm test                   # runs both
 # individual tests:
 cd tests/python && pytest -v test_linear.py   # single Python test
-GLM_GPU=1 pytest -v test_linear.py            # specific GPU
+pytest -v test_linear.py            # specific GPU
 npx tsx --test tests/test_glm51.ts            # single TS test
-GLM_GPUS=0,1 npx tsx --test tests/test_parallel.ts  # multi-GPU
+npx tsx --test tests/test_parallel.ts  # multi-GPU
 ```
 
 ## Key Design Decisions
