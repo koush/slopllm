@@ -28,7 +28,7 @@ function parseArgs(argv: string[]): BenchArgs {
     gpus: gpusEnv === "0" ? [0, 1, 2, 3, 4, 5, 6, 7] : gpusEnv.split(",").map(s => parseInt(s.trim(), 10)),
     seqLen: 8192,
     chunkSize: 4096,
-    arena: 92,
+    arena: undefined!,
     maxBatch: 1,
     warmupRuns: 1,
     benchRuns: 1,
