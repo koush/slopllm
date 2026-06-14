@@ -722,10 +722,9 @@ void glm_p2p_cp_merge_heads(
 #include <cuda/ptx>
 
 constexpr int CP_TREE_MAX_SHARDS = 16;
-constexpr int CP_TREE_SMEM_BUDGET = 48 * 1024;
 
-template <int NUM_SHARDS>
-__global__ void __launch_bounds__(1024, 1)
+template <int VEC_SIZE, int BDX>
+__global__ void __launch_bounds__(BDX, 2)
 cp_merge_tree_kernel(
     const __nv_bfloat16* v0,  const __nv_bfloat16* v1,  const __nv_bfloat16* v2,  const __nv_bfloat16* v3,
     const __nv_bfloat16* v4,  const __nv_bfloat16* v5,  const __nv_bfloat16* v6,  const __nv_bfloat16* v7,
@@ -746,14 +745,19 @@ cp_merge_tree_kernel(
     int v_peer_stride,
     int lse_peer_stride)
 {
-    constexpr int WarpSize = 32;
+    (void)numel; (void)heads_per_block; (void)v_peer_stride; (void)lse_peer_stride; (void)v_head_dim;
+    constexpr int head_dim = VEC_SIZE * BDX;
+    constexpr int v_shard_bytes = head_dim * sizeof(__nv_bfloat16);
 
-    extern __shared__ char smem_raw[];
-    __shared__ cuda::barrier<cuda::thread_scope_block> bar;
+    constexpr int NUM_SHARDS = CP_TREE_MAX_SHARDS;
+    auto block = cg::this_thread_block();
+    int tid = threadIdx.x;
 
-    int warp_id = threadIdx.x / WarpSize;
-    int lane = threadIdx.x % WarpSize;
-    int warps_per_block = blockDim.x / WarpSize;
+    int64_t bh = blockIdx.x;
+    int b = (int)(bh / num_heads);
+    int h = (int)(bh % num_heads);
+
+    if (b >= batch_size) return;
 
     const __nv_bfloat16* v_ptrs[CP_TREE_MAX_SHARDS] = {
         v0, v1, v2, v3, v4, v5, v6, v7,
@@ -764,103 +768,45 @@ cp_merge_tree_kernel(
         lse8, lse9, lse10, lse11, lse12, lse13, lse14, lse15
     };
 
-    int64_t total_heads = (int64_t)batch_size * num_heads;
-    int64_t heads_per_grid = (int64_t)gridDim.x * heads_per_block;
-    int64_t my_head_start = (int64_t)blockIdx.x * heads_per_block;
+    extern __shared__ char smem[];
+    __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem);
+    float* smem_lse = reinterpret_cast<float*>(smem + N * v_shard_bytes);
 
-    if (threadIdx.x == 0) {
-        init(&bar, blockDim.x);
+    int64_t v_offset = (int64_t)(b * num_heads + h) * head_dim;
+    int64_t lse_offset = (int64_t)b * num_heads + h;
+
+    #pragma unroll
+    for (int s = 0; s < NUM_SHARDS; s++) {
+        if (s >= N) break;
+        cg::memcpy_async(block,
+            smem_v + s * head_dim,
+            v_ptrs[s] + v_offset,
+            v_shard_bytes);
     }
-    __syncthreads();
 
-    for (int64_t h_start = my_head_start;
-         h_start < total_heads;
-         h_start += heads_per_grid)
-    {
-        int64_t h_end = min(h_start + heads_per_block, total_heads);
-        int h_count = (int)(h_end - h_start);
+    if (tid < N) {
+        smem_lse[tid] = lse_ptrs[tid][lse_offset];
+    }
 
-        int64_t v_elem_start = h_start * v_head_dim;
-        int64_t v_elem_count = (int64_t)h_count * v_head_dim;
-        uint32_t v_copy_bytes = (uint32_t)(v_elem_count * sizeof(__nv_bfloat16));
-        v_copy_bytes = (v_copy_bytes + 15u) & ~15u;
+    cg::wait(block);
 
-        if (threadIdx.x == 0) {
-            cuda::ptx::mbarrier_expect_tx(
-                cuda::ptx::sem_relaxed_t{},
-                cuda::ptx::scope_cta_t{},
-                cuda::ptx::space_shared_t{},
-                reinterpret_cast<uint64_t*>(&bar),
-                N * v_copy_bytes);
-            for (int s = 0; s < N; s++) {
-                cuda::ptx::cp_async_bulk(
-                    cuda::ptx::space_shared_t{},
-                    cuda::ptx::space_global_t{},
-                    smem_raw + s * v_peer_stride,
-                    v_ptrs[s] + v_elem_start,
-                    v_copy_bytes,
-                    reinterpret_cast<uint64_t*>(&bar));
-            }
-        }
-        bar.arrive_and_wait();
+    if (tid < BDX) {
+        flashinfer::state_t<VEC_SIZE> st;
+        st.init();
 
-        // Load lse from global memory (small data, not worth cp.async.bulk alignment hassle)
-        char* lse_smem = smem_raw + N * v_peer_stride;
-        for (int idx = threadIdx.x; idx < N * h_count; idx += blockDim.x) {
-            int s = idx / h_count;
-            int h = idx % h_count;
-            reinterpret_cast<float*>(lse_smem + s * lse_peer_stride)[h] =
-                lse_ptrs[s][h_start + h];
-        }
-        __syncthreads();
-
-        for (int h = warp_id; h < h_count; h += warps_per_block) {
-            int64_t global_head = h_start + h;
-
-            float lse_vals[CP_TREE_MAX_SHARDS];
-            float max_lse = -HUGE_VALF;
-            #pragma unroll
-            for (int s = 0; s < NUM_SHARDS; s++) {
-                if (s >= N) break;
-                lse_vals[s] = reinterpret_cast<const float*>(
-                    smem_raw + N * v_peer_stride + s * lse_peer_stride)[h];
-                max_lse = fmaxf(max_lse, lse_vals[s]);
-            }
-
-            float d = 0.0f;
-            float scale[CP_TREE_MAX_SHARDS];
-            #pragma unroll
-            for (int s = 0; s < NUM_SHARDS; s++) {
-                if (s >= N) break;
-                scale[s] = exp2f(lse_vals[s] - max_lse);
-                d += scale[s];
-            }
-            float inv_d = 1.0f / d;
-
-            int64_t out_offset = global_head * v_head_dim;
-            int smem_v_offset = h * v_head_dim;
-
-            for (int i = lane; i < v_head_dim; i += WarpSize) {
-                float acc = 0.0f;
-                #pragma unroll
-                for (int s = 0; s < NUM_SHARDS; s++) {
-                    if (s >= N) break;
-                    float v = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(
-                        smem_raw + s * v_peer_stride)[smem_v_offset + i]);
-                    acc += v * scale[s];
-                }
-                output_v[out_offset + i] = __float2bfloat16(acc * inv_d);
-            }
-
-            if (output_lse != nullptr && lane == 0) {
-                output_lse[global_head] = max_lse + log2f(d);
-            }
+        #pragma unroll
+        for (int s = 0; s < NUM_SHARDS; s++) {
+            if (s >= N) break;
+            flashinfer::vec_t<float, VEC_SIZE> v;
+            v.cast_load(smem_v + s * head_dim + tid * VEC_SIZE);
+            st.merge(v, smem_lse[s], 1.0f);
         }
 
-        if (threadIdx.x == 0) {
-            init(&bar, blockDim.x);
-        }
-        __syncthreads();
+        st.normalize();
+        st.o.cast_store(output_v + v_offset + tid * VEC_SIZE);
+
+        if (output_lse != nullptr && tid == 0)
+            output_lse[lse_offset] = st.get_lse();
     }
 }
 
@@ -876,34 +822,12 @@ static void launch_cp_merge_tree(
     int v_head_dim,
     cudaStream_t stream)
 {
-    int heads_per_block = CP_TREE_SMEM_BUDGET / (num_shards * (v_head_dim * (int)sizeof(__nv_bfloat16) + (int)sizeof(float)));
-    if (heads_per_block < 1) heads_per_block = 1;
-
-    int v_peer_stride = heads_per_block * v_head_dim * (int)sizeof(__nv_bfloat16);
-    v_peer_stride = (v_peer_stride + 15) & ~15;
-
-    int lse_peer_stride = heads_per_block * (int)sizeof(float);
-
-    int smem_bytes = num_shards * v_peer_stride + num_shards * lse_peer_stride;
-    if (smem_bytes > CP_TREE_SMEM_BUDGET) {
-        heads_per_block = 1;
-        v_peer_stride = heads_per_block * v_head_dim * (int)sizeof(__nv_bfloat16);
-        v_peer_stride = (v_peer_stride + 15) & ~15;
-        lse_peer_stride = heads_per_block * (int)sizeof(float);
-        smem_bytes = num_shards * v_peer_stride + num_shards * lse_peer_stride;
-    }
-
-    int warps_per_block = heads_per_block;
-    if (warps_per_block > 32) warps_per_block = 32;
-    if (warps_per_block < 1) warps_per_block = 1;
-    int block_size = warps_per_block * 32;
-
     int64_t total_heads = (int64_t)batch_size * num_heads;
-    int grid = (int)((total_heads + heads_per_block - 1) / heads_per_block);
+    int grid = (int)total_heads;
     if (grid > 65535) grid = 65535;
 
-    #define LAUNCH_CP_TREE(NS) \
-        cp_merge_tree_kernel<NS><<<grid, block_size, smem_bytes, stream>>>( \
+    #define LAUNCH_CP_TREE(VEC_SIZE, BDX) \
+        cp_merge_tree_kernel<VEC_SIZE, BDX><<<grid, BDX, num_shards * (BDX * VEC_SIZE) * sizeof(__nv_bfloat16) + num_shards * sizeof(float), stream>>>( \
             v_ptrs[0], v_ptrs[1], v_ptrs[2], v_ptrs[3], \
             v_ptrs[4], v_ptrs[5], v_ptrs[6], v_ptrs[7], \
             v_ptrs[8], v_ptrs[9], v_ptrs[10], v_ptrs[11], \
@@ -913,27 +837,16 @@ static void launch_cp_merge_tree(
             lse_ptrs[8], lse_ptrs[9], lse_ptrs[10], lse_ptrs[11], \
             lse_ptrs[12], lse_ptrs[13], lse_ptrs[14], lse_ptrs[15], \
             output_v, output_lse, num_shards, numel, batch_size, num_heads, v_head_dim, \
-            heads_per_block, v_peer_stride, lse_peer_stride)
+            0, 0, 0)
 
-    switch (num_shards) {
-        case 1:  LAUNCH_CP_TREE(1); break;
-        case 2:  LAUNCH_CP_TREE(2); break;
-        case 3:  LAUNCH_CP_TREE(3); break;
-        case 4:  LAUNCH_CP_TREE(4); break;
-        case 5:  LAUNCH_CP_TREE(5); break;
-        case 6:  LAUNCH_CP_TREE(6); break;
-        case 7:  LAUNCH_CP_TREE(7); break;
-        case 8:  LAUNCH_CP_TREE(8); break;
-        case 9:  LAUNCH_CP_TREE(9); break;
-        case 10: LAUNCH_CP_TREE(10); break;
-        case 11: LAUNCH_CP_TREE(11); break;
-        case 12: LAUNCH_CP_TREE(12); break;
-        case 13: LAUNCH_CP_TREE(13); break;
-        case 14: LAUNCH_CP_TREE(14); break;
-        case 15: LAUNCH_CP_TREE(15); break;
-        case 16: LAUNCH_CP_TREE(16); break;
+    switch (v_head_dim) {
+        case 32:  LAUNCH_CP_TREE(4, 8); break;
+        case 64:  LAUNCH_CP_TREE(4, 16); break;
+        case 128: LAUNCH_CP_TREE(4, 32); break;
+        case 256: LAUNCH_CP_TREE(4, 64); break;
+        case 512: LAUNCH_CP_TREE(4, 128); break;
         default:
-            fprintf(stderr, "launch_cp_merge_tree: unsupported num_shards=%d (must be 1-16)\n", num_shards);
+            fprintf(stderr, "launch_cp_merge_tree: unsupported v_head_dim=%d (must be 32, 64, 128, 256, or 512)\n", v_head_dim);
             break;
     }
 

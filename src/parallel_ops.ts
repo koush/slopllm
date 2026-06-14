@@ -223,6 +223,33 @@ export class ParallelTensor extends Tensor {
     throw new Error(`allGather: unsupported parallelism ${this.parallelism}`);
   }
 
+  sliceToRowParallel(workspace: WorkspaceBase, shardDim1: number): ParallelTensor {
+    if (this.parallelism !== TensorParallelism.Replicated) {
+      throw new Error(`sliceToRowParallel: expected Replicated, got ${this.parallelism}`);
+    }
+    if (this.fullShape.length !== 2) {
+      throw new Error(`sliceToRowParallel: expected 2D tensor, got ${this.fullShape.length}D`);
+    }
+    const outer = this.fullShape[0];
+    const dim1 = this.fullShape[1];
+    const elemBytes = ParallelTensor.elemBytes(this.type);
+    const shardWss = this.parallelOps.getShardWorkspaces(workspace);
+    const shardShape = [outer, shardDim1];
+    const outputShards: Tensor[] = [];
+    for (let i = 0; i < this.devices.length; i++) {
+      const shard = shardWss[i].alloc(shardShape, this.type);
+      shard.memcpy2d(
+        0, shardDim1 * elemBytes,
+        this.shards[i], i * shardDim1 * elemBytes,
+        dim1 * elemBytes,
+        shardDim1 * elemBytes, outer,
+        MemcpyKind.DeviceToDevice,
+      );
+      outputShards.push(shard);
+    }
+    return this.parallelOps.wrapShards(workspace, outputShards, this.fullShape, this.type, TensorParallelism.Row);
+  }
+
   h2d(data: Buffer, size?: number): void {
     const eb = ParallelTensor.elemBytes(this.type);
 
@@ -431,7 +458,7 @@ export class ParallelTensor extends Tensor {
 
     // Row weight: K dimension mismatch, allGather weight to Replicated
     if (WP === TensorParallelism.Row) {
-      using gathered = pWeight.allGather(pWeight.workspace);
+      using gathered = pWeight.allGather(this.workspace);
       return this.linear(gathered, batch);
     }
 
@@ -1473,12 +1500,18 @@ export class ParallelTensor extends Tensor {
     const pLse = lse as ParallelTensor;
     const cpShardNHeads = isVProjSharded ? shardNHeads : this.parallelOps.shardDim(nHeads, "mlaVExpand cpShardNHeads");
     const cpInputNHeads = isVProjSharded ? shardNHeads : nHeads;
-    return this.parallelOps.contextParallelMerge(
+    const merged = this.parallelOps.contextParallelMerge(
       vExpanded.value, pLse,
       BS, nHeads, vHeadDim,
       null, this.workspace,
       cpShardNHeads, cpInputNHeads,
     );
+    if (merged.parallelism === TensorParallelism.Replicated && cpShardNHeads < nHeads) {
+      const sliced = merged.sliceToRowParallel(this.workspace, cpShardNHeads * vHeadDim);
+      merged[Symbol.dispose]();
+      return sliced;
+    }
+    return merged;
   }
 
   mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
@@ -1883,13 +1916,16 @@ export class ParallelOps implements DeviceOps {
   }
 
   /**
-   * Merge partial attention outputs from context-parallel shards using
-   * NCCL AllGather + local merge.
+   * Merge partial attention outputs from context-parallel shards.
    *
    * Each GPU has partial_v_out [batch, nHeads * vHeadDim] (BF16)
    * and partial_lse [batch, nHeads] (F32).
    *
-   * When shardNHeads is provided, only processes and outputs heads
+   * When P2P is enabled, uses a butterfly tree reduction via cpMergeTree
+   * (always produces Replicated output, shardNHeads/inputNHeads ignored).
+   *
+   * Otherwise falls back to NCCL AllGather + local merge. When shardNHeads
+   * is provided, only processes and outputs heads
    * [i * shardNHeads, (i+1) * shardNHeads) per device i, producing
    * contiguous Row-parallel output [batch, shardNHeads * vHeadDim].
    *
@@ -1906,9 +1942,8 @@ export class ParallelOps implements DeviceOps {
     shardNHeads?: number,
     inputNHeads?: number,
   ): ParallelTensor {
-    const P2P_CP_MERGE_MAX_BATCH = 128;
-    if (this.p2pEnabled && batchSize <= P2P_CP_MERGE_MAX_BATCH) {
-      return this.p2pCpMerge(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, mergedLse, workspace, shardNHeads, inputNHeads);
+    if (this.p2pEnabled) {
+      return this.cpMergeTreeReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace);
     }
     const snh = shardNHeads ?? numHeads;
     const inh = inputNHeads ?? snh;
@@ -1955,79 +1990,72 @@ export class ParallelOps implements DeviceOps {
   }
 
   /**
-   * Merge partial attention outputs using fused P2P + online softmax merge.
-   * This avoids NCCL overhead for small payloads.
+   * Merge partial attention outputs via butterfly tree reduction using
+   * cpMergeTree. Each round pairs GPUs via XOR distance and merges their
+   * partial (v_out, lse) with the online softmax kernel. After log2(N)
+   * rounds every GPU holds the fully merged result (Replicated).
    *
-   * Each GPU has partial_v_out [batch, nHeads * vHeadDim] (BF16)
-   * and partial_lse [batch, nHeads] (F32).
-   *
-   * When shardNHeads is provided, only processes and outputs heads
-   * [i * shardNHeads, (i+1) * shardNHeads) per device i, producing
-   * contiguous Row-parallel output [batch, shardNHeads * vHeadDim].
-   *
-   * When shardNHeads is omitted, outputs all heads (Replicated).
+   * Each GPU has partial_v_out [batch, numHeads * vHeadDim] (BF16)
+   * and partial_lse [batch, numHeads] (F32).
    */
-  p2pCpMerge(
+  private cpMergeTreeReduce(
     partialVOuts: readonly Tensor[],
     partialLses: readonly Tensor[],
     batchSize: number,
     numHeads: number,
     vHeadDim: number,
-    mergedLse: Tensor | null,
     workspace: WorkspaceBase,
-    shardNHeads?: number,
-    inputNHeads?: number,
   ): ParallelTensor {
-    const snh = shardNHeads ?? numHeads;
-    const inh = inputNHeads ?? snh;
-    const isHeads = snh !== numHeads;
-    const numShards = partialVOuts.length;
-    if (numShards !== this.worldSize) {
-      throw new Error(`p2pCpMerge: numShards=${numShards} != worldSize=${this.worldSize}`);
-    }
-    if (numShards < 2) {
-      throw new Error(`p2pCpMerge: requires at least 2 shards, got ${numShards}`);
-    }
-
-    // P2P buffer holds per-shard data: v_out is [B, inh, D] (input_n_heads stride),
-    // lse is [B, numHeads] (full heads).
-    const vOutBytes = batchSize * inh * vHeadDim * 2; // BF16
-    const lseBytes = batchSize * numHeads * 4;             // F32
-    const slotBytes = vOutBytes + lseBytes;
-
-    const group = this.getP2PGroup(partialVOuts[0].workspace.glm.currentStream);
-    if (!group) {
-      throw new Error("p2pCpMerge: P2P not available");
-    }
-    const shardWorkspaces = partialVOuts.map(s => s.workspace);
-    group.ensureCapacity(slotBytes, shardWorkspaces);
-    const shardVOutShape = isHeads ? [batchSize, snh * vHeadDim] : [batchSize, numHeads * vHeadDim];
-
-    const mergedVOutShards = shardWorkspaces.map(ws => ws.alloc(shardVOutShape, "BF16"));
-    let mergedLseShards: Tensor[] | null = null;
-    if (mergedLse) {
-      const shardLseShape = isHeads ? [batchSize, snh] : [batchSize, numHeads];
-      mergedLseShards = shardWorkspaces.map(ws => ws.alloc(shardLseShape, "F32"));
-    }
-
-    for (let i = 0; i < this.worldSize; i++) {
-      const headOffset = isHeads ? i * snh : 0;
-      this.devices[i].p2pCpMerge(
-        group.instances[i],
-        partialVOuts[i], partialLses[i],
-        mergedVOutShards[i], mergedLseShards ? mergedLseShards[i] : null,
-        numShards, batchSize, numHeads, vHeadDim, snh, headOffset, inh,
-      );
-    }
-
-    const outParallelism = isHeads ? TensorParallelism.Row : TensorParallelism.Replicated;
+    const numel = batchSize * numHeads * vHeadDim;
+    const shardWss = this.getShardWorkspaces(workspace);
     const fullVOutShape = [batchSize, numHeads * vHeadDim];
-    return new ParallelTensor(
-      workspace, this,
-      outParallelism,
-      mergedVOutShards, fullVOutShape,
-      "BF16", undefined, false, undefined,
-    );
+
+    const currentV: Tensor[] = [];
+    const currentLse: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      const v = shardWss[i].alloc(partialVOuts[i].shape, partialVOuts[i].type);
+      v.memcpy(partialVOuts[i]);
+      currentV.push(v);
+      const lse = shardWss[i].alloc(partialLses[i].shape, partialLses[i].type);
+      lse.memcpy(partialLses[i]);
+      currentLse.push(lse);
+    }
+
+    for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
+      const vCopies: Tensor[] = [];
+      const lseCopies: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        const vc = currentV[i].workspace.alloc(currentV[i].shape, currentV[i].type);
+        vc.memcpy(currentV[i]);
+        vCopies.push(vc);
+        const lc = currentLse[i].workspace.alloc(currentLse[i].shape, currentLse[i].type);
+        lc.memcpy(currentLse[i]);
+        lseCopies.push(lc);
+      }
+
+      const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
+      this.p2pBarrier(peerRanks);
+      this.sourceCleanup();
+      this.p2pSources.push(...vCopies, ...lseCopies);
+
+      for (let i = 0; i < this.worldSize; i++) {
+        const peer = i ^ reduceHalf;
+        // log all tensor sizes/shapes
+        this.devices[i].cpMergeTree(
+          [currentV[i].data, vCopies[peer].data],
+          [currentLse[i].data, lseCopies[peer].data],
+          2,
+          currentV[i], currentLse[i],
+          numel, batchSize, numHeads, vHeadDim,
+        );
+      }
+    }
+
+    for (const lse of currentLse) {
+      lse[Symbol.dispose]();
+    }
+
+    return this.wrapShards(workspace, currentV, fullVOutShape, "BF16", TensorParallelism.Replicated);
   }
 
   free(): void {
