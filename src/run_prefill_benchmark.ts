@@ -66,7 +66,7 @@ Options:
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const gpuDevices = args.gpus.map(id => new GlmOps(id, undefined,  undefined));
+  const gpuDevices = args.gpus.map(id => new GlmOps(id, undefined, args.arena));
   const glm: DeviceOps = gpuDevices.length > 1 ? new ParallelOps(gpuDevices) : gpuDevices[0];
   const gpuLabel = args.gpus.length > 1 ? `${args.gpus[0]}-${args.gpus[args.gpus.length - 1]}` : `${args.gpus[0]}`;
 
