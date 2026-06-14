@@ -368,6 +368,10 @@ export class GlmTensor extends Tensor {
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
+    if (process.env.GLM_SKIP_MMAP_LOAD) {
+      // for testing: skip actual load
+      return;
+    }
     if (strided) {
       return this.memcpy2dHostToDeviceAsync(strided.dstOffset, strided.dstPitch, mmapPtr + offset + strided.srcOffset, strided.srcPitch, strided.width, strided.height);
     } else {
@@ -376,6 +380,10 @@ export class GlmTensor extends Tensor {
   }
 
   async mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
+    if (process.env.GLM_SKIP_MMAP_LOAD) {
+      // for testing: skip actual load
+      return;
+    }
     return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
   }
 
