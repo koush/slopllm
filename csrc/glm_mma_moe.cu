@@ -148,7 +148,7 @@ __device__ __forceinline__ void bf16_load_weights(
 }
 
 template <bool IsNvFP4>
-__global__ void __launch_bounds__(CTA_SIZE, 2)
+__global__ void __launch_bounds__(CTA_SIZE, 8)
 grouped_mma_kernel(
     __nv_bfloat16* __restrict__ sorted_output,
     const __nv_bfloat16* __restrict__ sorted_input,
@@ -601,7 +601,7 @@ void glm_nvfp4_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inp
 
     int num_SMs;
     cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, ctx->device_id);
-    int grid_size = num_SMs * 2;
+    int grid_size = num_SMs * 8;
 
     cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
 
@@ -655,7 +655,7 @@ void glm_bf16_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inpu
 
     int num_SMs;
     cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, ctx->device_id);
-    int grid_size = num_SMs * 2;
+    int grid_size = num_SMs * 8;
 
     cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
 

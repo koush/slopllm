@@ -52,7 +52,7 @@ Options:
   --gpus <ids>       GPU IDs (default: 0-7)
   --seq-len <n>      Total prefill sequence length (default: 65536)
   --chunk-size <n>   Prefill chunk size (default: 4096)
-  --arena <n>        Arena size in GB (default: 92)
+  --arena <n>        Arena size in GB (default: none)
   --warmup <n>       Warmup runs (default: 1)
   --runs <n>         Benchmark runs (default: 3)
   --cp               Enable context parallelism

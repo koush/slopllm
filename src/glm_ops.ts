@@ -167,6 +167,9 @@ interface NativeAddon {
   groupedMoeWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
   nvfp4MulMatIdGrouped(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
+  mmaMoeWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
+  nvfp4MulMatIdGroupedMma(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
+  bf16MulMatIdGroupedMma(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number): void;
   rotateInputIds(ctx: number, outputIds: number, inputIds: number, qoIndptr: number, newTokens: number, batchSize: number): void;
 }
@@ -640,17 +643,17 @@ export class GlmTensor extends Tensor {
       }
       if (count > MUL_MAT_ID_GROUPED_THRESHOLD) {
         const numExperts = weights.length;
-        const wsSize = getNativeAddon().groupedMoeWorkspaceSize(count, N, K, numExperts);
+        const wsSize = getNativeAddon().mmaMoeWorkspaceSize(count, N, K, numExperts);
         using wsTensor = this.workspace.allocRaw(wsSize);
-        getNativeAddon().nvfp4MulMatIdGrouped(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
+        getNativeAddon().nvfp4MulMatIdGroupedMma(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
       } else {
         getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K);
       }
     } else if (count > MUL_MAT_ID_GROUPED_THRESHOLD) {
       const numExperts = weights.length;
-      const wsSize = getNativeAddon().groupedMoeWorkspaceSize(count, N, K, numExperts);
+      const wsSize = getNativeAddon().mmaMoeWorkspaceSize(count, N, K, numExperts);
       using wsTensor = this.workspace.allocRaw(wsSize);
-      getNativeAddon().mulMatIdGrouped(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
+      getNativeAddon().bf16MulMatIdGroupedMma(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
     } else {
       getNativeAddon().mulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K);
     }
