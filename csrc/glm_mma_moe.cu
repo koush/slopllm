@@ -148,7 +148,7 @@ __device__ __forceinline__ void bf16_load_weights(
 }
 
 template <bool IsNvFP4>
-__global__ void __launch_bounds__(CTA_SIZE, 4)
+__global__ void __launch_bounds__(CTA_SIZE, 2)
 grouped_mma_kernel(
     __nv_bfloat16* __restrict__ sorted_output,
     const __nv_bfloat16* __restrict__ sorted_input,
@@ -158,46 +158,13 @@ grouped_mma_kernel(
     const void* const* __restrict__ scale2_ptrs,
     const int* __restrict__ expert_offsets,
     int num_experts,
-    int N)
+    int N,
+    int total_tiles,
+    int* __restrict__ tile_counter)
 {
     int num_n_tiles = (N + TN - 1) / TN;
-    int expert_id = blockIdx.x / num_n_tiles;
-    int n_tile = blockIdx.x % num_n_tiles;
-
-    if (expert_id >= num_experts) return;
-
-    int M_e = expert_offsets[expert_id + 1] - expert_offsets[expert_id];
-    if (M_e == 0) return;
-
-    int n_start = n_tile * TN;
-    int n_valid = min(TN, N - n_start);
-    if (n_valid <= 0) return;
-
     int warp_id = threadIdx.x / 32;
     int warp_col_offset = warp_id * (MMA_N * MMA_PER_WARP_N);
-    int n_warp_start = n_start + warp_col_offset;
-    int n_warp_valid = 0;
-    if (n_warp_start < N) {
-        n_warp_valid = min(MMA_N * MMA_PER_WARP_N, N - n_warp_start);
-    }
-
-    const __nv_bfloat16* expert_input = sorted_input + (size_t)expert_offsets[expert_id] * K;
-    __nv_bfloat16* expert_output = sorted_output + (size_t)expert_offsets[expert_id] * N;
-
-    float scale_2_val = 0.0f;
-    const uint8_t* weight_base_fp4 = nullptr;
-    const __nv_fp8_e4m3* scale_base = nullptr;
-    int num_k_groups = K / QUANT_GROUP;
-    const __nv_bfloat16* weight_base_bf16 = nullptr;
-
-    if constexpr (IsNvFP4) {
-        scale_2_val = *reinterpret_cast<const float* const*>(scale2_ptrs)[expert_id];
-        weight_base_fp4 = reinterpret_cast<const uint8_t* const*>(weight_ptrs)[expert_id];
-        scale_base = reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs)[expert_id];
-    } else {
-        weight_base_bf16 = reinterpret_cast<const __nv_bfloat16* const*>(weight_ptrs)[expert_id];
-        (void)scale_ptrs; (void)scale2_ptrs;
-    }
 
     extern __shared__ uint8_t smem_buf[];
     __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_buf);
@@ -206,81 +173,127 @@ grouped_mma_kernel(
     constexpr size_t smem_extra = IsNvFP4 ? (TN * (TK / 2) + TN) : 0;
     float* smem_c = reinterpret_cast<float*>(smem_fp4_base + smem_extra);
 
-    int num_k_steps = K / TK;
+    __shared__ int s_work_idx;
 
-    for (int m_start = 0; m_start < M_e; m_start += TM) {
-        int m_valid = min(TM, M_e - m_start);
+    for (;;) {
+        if (threadIdx.x == 0) {
+            s_work_idx = atomicAdd(tile_counter, 1);
+        }
+        __syncthreads();
 
-        FragC c0, c1;
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            c0.reg[i] = 0.0f;
-            c1.reg[i] = 0.0f;
+        int work_idx = s_work_idx;
+        if (work_idx >= total_tiles) break;
+
+        int expert_id = work_idx / num_n_tiles;
+        int n_tile = work_idx % num_n_tiles;
+
+        int M_e = expert_offsets[expert_id + 1] - expert_offsets[expert_id];
+        if (M_e == 0) continue;
+
+        int n_start = n_tile * TN;
+        int n_valid = min(TN, N - n_start);
+        if (n_valid <= 0) continue;
+
+        int n_warp_start = n_start + warp_col_offset;
+        int n_warp_valid = 0;
+        if (n_warp_start < N) {
+            n_warp_valid = min(MMA_N * MMA_PER_WARP_N, N - n_warp_start);
         }
 
-        for (int k_step = 0; k_step < num_k_steps; k_step++) {
-            int k_start = k_step * TK;
+        const __nv_bfloat16* expert_input = sorted_input + (size_t)expert_offsets[expert_id] * K;
+        __nv_bfloat16* expert_output = sorted_output + (size_t)expert_offsets[expert_id] * N;
 
-            for (int i = threadIdx.x; i < TM * TK; i += CTA_SIZE) {
-                int m = i / TK;
-                int k = i % TK;
-                int row = m_start + m;
-                __nv_bfloat16 val = __float2bfloat16(0.0f);
-                if (row < M_e) {
-                    val = expert_input[(size_t)row * K + k_start + k];
-                }
-                smem_a[m * TK + k] = val;
+        float scale_2_val = 0.0f;
+        const uint8_t* weight_base_fp4 = nullptr;
+        const __nv_fp8_e4m3* scale_base = nullptr;
+        int num_k_groups = K / QUANT_GROUP;
+        const __nv_bfloat16* weight_base_bf16 = nullptr;
+
+        if constexpr (IsNvFP4) {
+            scale_2_val = *reinterpret_cast<const float* const*>(scale2_ptrs)[expert_id];
+            weight_base_fp4 = reinterpret_cast<const uint8_t* const*>(weight_ptrs)[expert_id];
+            scale_base = reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs)[expert_id];
+        } else {
+            weight_base_bf16 = reinterpret_cast<const __nv_bfloat16* const*>(weight_ptrs)[expert_id];
+            (void)scale_ptrs; (void)scale2_ptrs;
+        }
+
+        int num_k_steps = K / TK;
+
+        for (int m_start = 0; m_start < M_e; m_start += TM) {
+            int m_valid = min(TM, M_e - m_start);
+
+            FragC c0, c1;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                c0.reg[i] = 0.0f;
+                c1.reg[i] = 0.0f;
             }
 
-            __syncthreads();
+            for (int k_step = 0; k_step < num_k_steps; k_step++) {
+                int k_start = k_step * TK;
 
-            if constexpr (IsNvFP4) {
-                nvfp4_load_weights(smem_fp4_base, smem_b, n_start, n_valid, N, K, k_start,
-                                   weight_base_fp4, scale_base, scale_2_val, num_k_groups);
-            } else {
-                bf16_load_weights(nullptr, smem_b, n_start, n_valid, N, K, k_start,
-                                  weight_base_bf16);
+                for (int i = threadIdx.x; i < TM * TK; i += CTA_SIZE) {
+                    int m = i / TK;
+                    int k = i % TK;
+                    int row = m_start + m;
+                    __nv_bfloat16 val = __float2bfloat16(0.0f);
+                    if (row < M_e) {
+                        val = expert_input[(size_t)row * K + k_start + k];
+                    }
+                    smem_a[m * TK + k] = val;
+                }
+
+                __syncthreads();
+
+                if constexpr (IsNvFP4) {
+                    nvfp4_load_weights(smem_fp4_base, smem_b, n_start, n_valid, N, K, k_start,
+                                       weight_base_fp4, scale_base, scale_2_val, num_k_groups);
+                } else {
+                    bf16_load_weights(nullptr, smem_b, n_start, n_valid, N, K, k_start,
+                                      weight_base_bf16);
+                }
+
+                if (n_warp_valid > 0) {
+                    FragA a_frag;
+                    load_frag_a(a_frag, smem_a, TK);
+
+                    FragB b_frag0;
+                    load_frag_b(b_frag0, smem_b, TN, warp_col_offset);
+                    mma_sync_bf16_f32(c0, a_frag, b_frag0, c0);
+
+                    if (n_warp_valid > MMA_N) {
+                        FragB b_frag1;
+                        load_frag_b(b_frag1, smem_b, TN, warp_col_offset + MMA_N);
+                        mma_sync_bf16_f32(c1, a_frag, b_frag1, c1);
+                    }
+                }
+
+                __syncthreads();
             }
 
             if (n_warp_valid > 0) {
-                FragA a_frag;
-                load_frag_a(a_frag, smem_a, TK);
-
-                FragB b_frag0;
-                load_frag_b(b_frag0, smem_b, TN, warp_col_offset);
-                mma_sync_bf16_f32(c0, a_frag, b_frag0, c0);
-
+                store_frag_c(smem_c, c0, warp_id, 0);
                 if (n_warp_valid > MMA_N) {
-                    FragB b_frag1;
-                    load_frag_b(b_frag1, smem_b, TN, warp_col_offset + MMA_N);
-                    mma_sync_bf16_f32(c1, a_frag, b_frag1, c1);
+                    store_frag_c(smem_c, c1, warp_id, 1);
+                }
+            }
+
+            __syncthreads();
+
+            for (int i = threadIdx.x; i < m_valid * n_valid; i += CTA_SIZE) {
+                int m = i / n_valid;
+                int n = i % n_valid;
+                float val = smem_c[m * TN + n];
+                int row = m_start + m;
+                int col = n_start + n;
+                if (row < M_e && col < N) {
+                    expert_output[(size_t)row * N + col] = __float2bfloat16(val);
                 }
             }
 
             __syncthreads();
         }
-
-        if (n_warp_valid > 0) {
-            store_frag_c(smem_c, c0, warp_id, 0);
-            if (n_warp_valid > MMA_N) {
-                store_frag_c(smem_c, c1, warp_id, 1);
-            }
-        }
-
-        __syncthreads();
-
-        for (int i = threadIdx.x; i < m_valid * n_valid; i += CTA_SIZE) {
-            int m = i / n_valid;
-            int n = i % n_valid;
-            float val = smem_c[m * TN + n];
-            int row = m_start + m;
-            int col = n_start + n;
-            if (row < M_e && col < N) {
-                expert_output[(size_t)row * N + col] = __float2bfloat16(val);
-            }
-        }
-
-        __syncthreads();
     }
 }
 
@@ -501,7 +514,8 @@ size_t glm_mma_moe_workspace_size(int count, int N, int K, int num_experts) {
     size_t expert_counts = (size_t)num_experts * 4;
     size_t expert_offsets = (size_t)(num_experts + 1) * 4;
     size_t sorted_to_original = (size_t)count * 4;
-    return sorted_input + sorted_output + expert_counts + expert_offsets + sorted_to_original;
+    size_t tile_counter = 4;
+    return sorted_input + sorted_output + expert_counts + expert_offsets + sorted_to_original + tile_counter;
 }
 
 static void dispatch_sort_scatter(GlmCtx* ctx, const void* input, int K,
@@ -559,23 +573,33 @@ void glm_nvfp4_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inp
     offset += (size_t)(num_experts + 1) * 4;
 
     int* sorted_to_original = reinterpret_cast<int*>(ws + offset);
+    offset += (size_t)count * 4;
+
+    int* tile_counter = reinterpret_cast<int*>(ws + offset);
 
     dispatch_sort_scatter(ctx, input, K, expert_ids, top_k, count, num_experts,
                           sorted_input, sorted_to_original, expert_counts, expert_offsets, stream);
 
     int num_n_tiles = (N + TN - 1) / TN;
-    int total_ctas = num_experts * num_n_tiles;
+    int total_tiles = num_experts * num_n_tiles;
+
+    int num_SMs;
+    cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, ctx->device_id);
+    int grid_size = num_SMs * 2;
+
+    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
 
     size_t smem_size = TM * TK * 2 + TK * TN * 2 + nvfp4_smem_extra() + TM * TN * 4;
 
-    grouped_mma_kernel<true><<<total_ctas, CTA_SIZE, smem_size, stream>>>(
+    grouped_mma_kernel<true><<<grid_size, CTA_SIZE, smem_size, stream>>>(
         sorted_output, sorted_input, K,
         weight_ptrs, scale_ptrs, scale2_ptrs,
-        expert_offsets, num_experts, N);
+        expert_offsets, num_experts, N,
+        total_tiles, tile_counter);
 
     int block_size = 256;
-    int grid_size = (count + block_size - 1) / block_size;
-    unscatter_output_kernel<<<grid_size, block_size, 0, stream>>>(
+    int unscatter_grid = (count + block_size - 1) / block_size;
+    unscatter_output_kernel<<<unscatter_grid, block_size, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(output),
         sorted_output, N, sorted_to_original, count);
 }
@@ -605,23 +629,33 @@ void glm_bf16_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inpu
     offset += (size_t)(num_experts + 1) * 4;
 
     int* sorted_to_original = reinterpret_cast<int*>(ws + offset);
+    offset += (size_t)count * 4;
+
+    int* tile_counter = reinterpret_cast<int*>(ws + offset);
 
     dispatch_sort_scatter(ctx, input, K, expert_ids, top_k, count, num_experts,
                           sorted_input, sorted_to_original, expert_counts, expert_offsets, stream);
 
     int num_n_tiles = (N + TN - 1) / TN;
-    int total_ctas = num_experts * num_n_tiles;
+    int total_tiles = num_experts * num_n_tiles;
+
+    int num_SMs;
+    cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, ctx->device_id);
+    int grid_size = num_SMs * 2;
+
+    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
 
     size_t smem_size = TM * TK * 2 + TK * TN * 2 + bf16_smem_extra() + TM * TN * 4;
 
-    grouped_mma_kernel<false><<<total_ctas, CTA_SIZE, smem_size, stream>>>(
+    grouped_mma_kernel<false><<<grid_size, CTA_SIZE, smem_size, stream>>>(
         sorted_output, sorted_input, K,
         weight_ptrs, nullptr, nullptr,
-        expert_offsets, num_experts, N);
+        expert_offsets, num_experts, N,
+        total_tiles, tile_counter);
 
     int block_size = 256;
-    int grid_size = (count + block_size - 1) / block_size;
-    unscatter_output_kernel<<<grid_size, block_size, 0, stream>>>(
+    int unscatter_grid = (count + block_size - 1) / block_size;
+    unscatter_output_kernel<<<unscatter_grid, block_size, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(output),
         sorted_output, N, sorted_to_original, count);
 }
