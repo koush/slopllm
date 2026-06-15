@@ -4,29 +4,72 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
-#include <mma.h>
 #include <cstdint>
 #include <cstdio>
 
 namespace {
 
-using namespace nvcuda::wmma;
-
-constexpr int WMMA_M = 16;
-constexpr int WMMA_N = 16;
-constexpr int WMMA_K = 16;
+constexpr int MMA_M = 16;
+constexpr int MMA_N = 8;
+constexpr int MMA_K = 16;
 constexpr int WARPS_PER_CTA = 4;
-constexpr int TM = WMMA_M;
-constexpr int TN = WMMA_N * WARPS_PER_CTA;
-constexpr int TK = WMMA_K;
+constexpr int MMA_PER_WARP_N = 2;
+constexpr int TM = MMA_M;
+constexpr int TN = MMA_N * WARPS_PER_CTA * MMA_PER_WARP_N;
+constexpr int TK = MMA_K;
 constexpr int CTA_SIZE = WARPS_PER_CTA * 32;
 constexpr int QUANT_GROUP = 16;
 
-__device__ __forceinline__ void uint4_to_bf16x8(
-    const uint4& v, __nv_bfloat16 out[8]) {
-    auto* h = reinterpret_cast<const __nv_bfloat16*>(&v);
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) out[i] = h[i];
+struct FragA { uint32_t reg[4]; };
+struct FragB { uint32_t reg[2]; };
+struct FragC { float reg[4]; };
+
+__device__ __forceinline__ void mma_sync_bf16_f32(
+    FragC& d, const FragA& a, const FragB& b, const FragC& c) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+f"(d.reg[0]), "+f"(d.reg[1]), "+f"(d.reg[2]), "+f"(d.reg[3])
+        : "r"(a.reg[0]), "r"(a.reg[1]), "r"(a.reg[2]), "r"(a.reg[3]),
+          "r"(b.reg[0]), "r"(b.reg[1])
+    );
+}
+
+__device__ __forceinline__ void load_frag_a(FragA& a, const __nv_bfloat16* smem_a, int stride) {
+    int lane = threadIdx.x % 32;
+    int row = lane & 7;
+    int mat = (lane >> 3) & 1;
+    int col_offset = (lane >> 4) << 3;
+    uint32_t addr = __cvta_generic_to_shared(smem_a + (mat * 8 + row) * stride + col_offset);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(a.reg[0]), "=r"(a.reg[1]), "=r"(a.reg[2]), "=r"(a.reg[3])
+        : "r"(addr));
+}
+
+__device__ __forceinline__ void load_frag_b(FragB& b, const __nv_bfloat16* smem_b, int b_stride, int col_offset) {
+    int lane = threadIdx.x % 32;
+    int row = lane % 16;
+    uint32_t addr = __cvta_generic_to_shared(smem_b + row * b_stride + col_offset);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
+        : "=r"(b.reg[0]), "=r"(b.reg[1])
+        : "r"(addr));
+}
+
+__device__ __forceinline__ void store_frag_c(float* smem_c, const FragC& c, int warp_id, int mma_idx) {
+    int lane = threadIdx.x % 32;
+    int group_id = lane >> 2;
+    int tid_in_group = lane & 3;
+    int col_base = tid_in_group * 2;
+    int col = warp_id * (MMA_N * MMA_PER_WARP_N) + mma_idx * MMA_N + col_base;
+    smem_c[group_id * TN + col + 0] = c.reg[0];
+    smem_c[group_id * TN + col + 1] = c.reg[1];
+    smem_c[(group_id + 8) * TN + col + 0] = c.reg[2];
+    smem_c[(group_id + 8) * TN + col + 1] = c.reg[3];
 }
 
 __global__ void histogram_kernel(
@@ -127,7 +170,7 @@ __global__ void unscatter_output_kernel(
 }
 
 __global__ void __launch_bounds__(CTA_SIZE, 4)
-grouped_nvfp4_wmma_kernel(
+grouped_nvfp4_mma_kernel(
     __nv_bfloat16* __restrict__ sorted_output,
     const __nv_bfloat16* __restrict__ sorted_input,
     int K,
@@ -152,9 +195,12 @@ grouped_nvfp4_wmma_kernel(
     if (n_valid <= 0) return;
 
     int warp_id = threadIdx.x / 32;
-    int n_warp_start = n_start + warp_id * WMMA_N;
-    int n_warp_valid = min(WMMA_N, N - n_warp_start);
-    (void)n_warp_valid;
+    int warp_col_offset = warp_id * (MMA_N * MMA_PER_WARP_N);
+    int n_warp_start = n_start + warp_col_offset;
+    int n_warp_valid = 0;
+    if (n_warp_start < N) {
+        n_warp_valid = min(MMA_N * MMA_PER_WARP_N, N - n_warp_start);
+    }
 
     const __nv_bfloat16* expert_input = sorted_input + (size_t)expert_offsets[expert_id] * K;
     __nv_bfloat16* expert_output = sorted_output + (size_t)expert_offsets[expert_id] * N;
@@ -176,8 +222,12 @@ grouped_nvfp4_wmma_kernel(
     for (int m_start = 0; m_start < M_e; m_start += TM) {
         int m_valid = min(TM, M_e - m_start);
 
-        fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-        fill_fragment(c_frag, 0.0f);
+        FragC c0, c1;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            c0.reg[i] = 0.0f;
+            c1.reg[i] = 0.0f;
+        }
 
         for (int k_step = 0; k_step < num_k_steps; k_step++) {
             int k_start = k_step * TK;
@@ -216,37 +266,48 @@ grouped_nvfp4_wmma_kernel(
 
             __syncthreads();
 
-            int total_bf16 = n_valid * TK;
-            for (int i = threadIdx.x; i < total_bf16; i += CTA_SIZE) {
-                int n = i / TK;
-                int k = i % TK;
-                int k_packed = k / 2;
-                uint8_t packed_byte = smem_fp4[n * (TK / 2) + k_packed];
-
-                float2 f2 = fp4x2_to_float2(packed_byte);
-                float fval = (k % 2 == 0) ? f2.x : f2.y;
-
-                float block_scale = static_cast<float>(smem_scale[n]);
-                float scaled_val = fval * block_scale * scale_2_val;
-
-                smem_b[k + n * TK] = __float2bfloat16(scaled_val);
+            for (int i = threadIdx.x; i < n_valid * TK; i += CTA_SIZE) {
+                int k = i / n_valid;
+                int n = i % n_valid;
+                int global_n = n_start + n;
+                __nv_bfloat16 val = __float2bfloat16(0.0f);
+                if (global_n < N) {
+                    int k_packed = k / 2;
+                    uint8_t packed_byte = smem_fp4[n * (TK / 2) + k_packed];
+                    float2 f2 = fp4x2_to_float2(packed_byte);
+                    float fval = (k % 2 == 0) ? f2.x : f2.y;
+                    float block_scale = static_cast<float>(smem_scale[n]);
+                    float scaled_val = fval * block_scale * scale_2_val;
+                    val = __float2bfloat16(scaled_val);
+                }
+                smem_b[k * TN + n] = val;
             }
 
             __syncthreads();
 
             if (n_warp_valid > 0) {
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, col_major> b_frag;
+                FragA a_frag;
+                load_frag_a(a_frag, smem_a, TK);
 
-                load_matrix_sync(a_frag, smem_a, TK);
-                load_matrix_sync(b_frag, smem_b + warp_id * WMMA_N * TK, TK);
+                FragB b_frag0;
+                load_frag_b(b_frag0, smem_b, TN, warp_col_offset);
+                mma_sync_bf16_f32(c0, a_frag, b_frag0, c0);
 
-                mma_sync(c_frag, a_frag, b_frag, c_frag);
+                if (n_warp_valid > MMA_N) {
+                    FragB b_frag1;
+                    load_frag_b(b_frag1, smem_b, TN, warp_col_offset + MMA_N);
+                    mma_sync_bf16_f32(c1, a_frag, b_frag1, c1);
+                }
             }
+
+            __syncthreads();
         }
 
         if (n_warp_valid > 0) {
-            store_matrix_sync(smem_c + warp_id * WMMA_N, c_frag, TN, mem_row_major);
+            store_frag_c(smem_c, c0, warp_id, 0);
+            if (n_warp_valid > MMA_N) {
+                store_frag_c(smem_c, c1, warp_id, 1);
+            }
         }
 
         __syncthreads();
@@ -263,6 +324,113 @@ grouped_nvfp4_wmma_kernel(
         }
 
         __syncthreads();
+    }
+}
+
+__global__ void __launch_bounds__(CTA_SIZE, 4)
+debug_mma_bf16_kernel(
+    float* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weights,
+    int M, int K, int N)
+{
+    int num_n_tiles = (N + TN - 1) / TN;
+    int n_tile = blockIdx.x % num_n_tiles;
+    int m_tile = blockIdx.x / num_n_tiles;
+
+    int n_start = n_tile * TN;
+    int n_valid = min(TN, N - n_start);
+    if (n_valid <= 0) return;
+
+    int m_start = m_tile * TM;
+    int m_valid = min(TM, M - m_start);
+    if (m_valid <= 0) return;
+
+    int warp_id = threadIdx.x / 32;
+    int warp_col_offset = warp_id * (MMA_N * MMA_PER_WARP_N);
+    int n_warp_start = n_start + warp_col_offset;
+    int n_warp_valid = 0;
+    if (n_warp_start < N) {
+        n_warp_valid = min(MMA_N * MMA_PER_WARP_N, N - n_warp_start);
+    }
+
+    extern __shared__ uint8_t smem_buf[];
+    __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_buf);
+    __nv_bfloat16* smem_b = smem_a + TM * TK;
+    float* smem_c = reinterpret_cast<float*>(smem_b + TK * TN);
+
+    int num_k_steps = K / TK;
+
+    FragC c0, c1;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        c0.reg[i] = 0.0f;
+        c1.reg[i] = 0.0f;
+    }
+
+    for (int k_step = 0; k_step < num_k_steps; k_step++) {
+        int k_start = k_step * TK;
+
+        for (int i = threadIdx.x; i < TM * TK; i += CTA_SIZE) {
+            int m = i / TK;
+            int k = i % TK;
+            int row = m_start + m;
+            __nv_bfloat16 val = __float2bfloat16(0.0f);
+            if (row < M) {
+                val = input[(size_t)row * K + k_start + k];
+            }
+            smem_a[m * TK + k] = val;
+        }
+
+        for (int i = threadIdx.x; i < n_valid * TK; i += CTA_SIZE) {
+            int k = i / n_valid;
+            int n = i % n_valid;
+            int global_n = n_start + n;
+            __nv_bfloat16 val = __float2bfloat16(0.0f);
+            if (global_n < N) {
+                val = weights[(size_t)global_n * K + k_start + k];
+            }
+            smem_b[k * TN + n] = val;
+        }
+
+        __syncthreads();
+
+        if (n_warp_valid > 0) {
+            FragA a_frag;
+            load_frag_a(a_frag, smem_a, TK);
+
+            FragB b_frag0;
+            load_frag_b(b_frag0, smem_b, TN, warp_col_offset);
+            mma_sync_bf16_f32(c0, a_frag, b_frag0, c0);
+
+            if (n_warp_valid > MMA_N) {
+                FragB b_frag1;
+                load_frag_b(b_frag1, smem_b, TN, warp_col_offset + MMA_N);
+                mma_sync_bf16_f32(c1, a_frag, b_frag1, c1);
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (n_warp_valid > 0) {
+        store_frag_c(smem_c, c0, warp_id, 0);
+        if (n_warp_valid > MMA_N) {
+            store_frag_c(smem_c, c1, warp_id, 1);
+        }
+    }
+
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < m_valid * n_valid; i += CTA_SIZE) {
+        int m = i / n_valid;
+        int n = i % n_valid;
+        float val = smem_c[m * TN + n];
+        int row = m_start + m;
+        int col = n_start + n;
+        if (row < M && col < N) {
+            output[(size_t)row * N + col] = val;
+        }
     }
 }
 
@@ -337,7 +505,7 @@ void glm_nvfp4_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inp
                        TN +
                        TM * TN * 4;
 
-    grouped_nvfp4_wmma_kernel<<<total_ctas, CTA_SIZE, smem_size, stream>>>(
+    grouped_nvfp4_mma_kernel<<<total_ctas, CTA_SIZE, smem_size, stream>>>(
         sorted_output, sorted_input, K,
         reinterpret_cast<const uint8_t* const*>(weight_ptrs),
         reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs),
@@ -348,6 +516,28 @@ void glm_nvfp4_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inp
     unscatter_output_kernel<<<grid_size, block_size, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(output),
         sorted_output, N, sorted_to_original, count);
+}
+
+} // extern "C"
+
+extern "C" {
+
+void glm_mma_moe_debug2(GlmCtx* ctx, float* output, const void* input,
+                         const void* weights_bf16, int M, int K, int N) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+
+    int num_n_tiles = (N + TN - 1) / TN;
+    int num_m_tiles = (M + TM - 1) / TM;
+    int total_ctas = num_m_tiles * num_n_tiles;
+
+    size_t smem_size = TM * TK * 2 + TK * TN * 2 + TM * TN * 4;
+
+    debug_mma_bf16_kernel<<<total_ctas, CTA_SIZE, smem_size, stream>>>(
+        output,
+        reinterpret_cast<const __nv_bfloat16*>(input),
+        reinterpret_cast<const __nv_bfloat16*>(weights_bf16),
+        M, K, N);
 }
 
 } // extern "C"

@@ -855,6 +855,12 @@ void glm_nvfp4_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inp
                                         int count, int N, int K,
                                         int num_experts, void* workspace);
 
+void glm_mma_moe_debug(GlmCtx* ctx, float* output, const void* input,
+                        const void* weights, int M, int K, int N);
+
+void glm_mma_moe_debug2(GlmCtx* ctx, float* output, const void* input,
+                         const void* weights_bf16, int M, int K, int N);
+
 #ifdef __cplusplus
 }
 #endif

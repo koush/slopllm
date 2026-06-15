@@ -834,6 +834,7 @@ class GlmOps:
             ctypes.c_void_p,
         ]
 
+
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
             self.lib.glm_free(self.ctx)
@@ -1693,6 +1694,24 @@ class GlmOps:
             self._ptr(scales),
             top_k, dim, num_rows,
             self._ptr(workspace)
+        )
+
+    def mma_moe_debug(self, output, input_buf, weights, M, K, N):
+        self.lib.glm_mma_moe_debug(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input_buf),
+            self._ptr(weights),
+            M, K, N
+        )
+
+    def mma_moe_debug2(self, output, input_buf, weights_bf16, M, K, N):
+        self.lib.glm_mma_moe_debug2(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input_buf),
+            self._ptr(weights_bf16),
+            M, K, N
         )
 
     def context_parallel_merge(self, partial_v_outs, partial_lses, num_shards,
