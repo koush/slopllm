@@ -343,21 +343,23 @@ grouped_nvfp4_gemv_kernel(
                 uint4_to_bf16x8(xv0, xb0);
                 uint4_to_bf16x8(xv1, xb1);
 
+                float gsum0 = 0.0f;
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
                     uint8_t packed = (w.x >> (j * 8)) & 0xFFu;
                     float2 wv = fp4x2_to_float2(packed);
-                    sums[m] += wv.x * scale0 * __bfloat162float(xb0[j * 2])
-                             + wv.y * scale0 * __bfloat162float(xb0[j * 2 + 1]);
+                    gsum0 += wv.x * __bfloat162float(xb0[j * 2])
+                           + wv.y * __bfloat162float(xb0[j * 2 + 1]);
                 }
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
                     uint8_t packed = (w.y >> (j * 8)) & 0xFFu;
                     float2 wv = fp4x2_to_float2(packed);
-                    sums[m] += wv.x * scale0 * __bfloat162float(xb1[j * 2])
-                             + wv.y * scale0 * __bfloat162float(xb1[j * 2 + 1]);
+                    gsum0 += wv.x * __bfloat162float(xb1[j * 2])
+                           + wv.y * __bfloat162float(xb1[j * 2 + 1]);
                 }
 
+                float gsum1 = 0.0f;
                 if (g + 1 < num_k_groups) {
                     const uint4* input_v4_1 = reinterpret_cast<const uint4*>(expert_input + (size_t)(m_base + m) * K + k_start + NVFP4_QUANT_GROUP);
                     uint4 xv2 = input_v4_1[0];
@@ -369,17 +371,19 @@ grouped_nvfp4_gemv_kernel(
                     for (int j = 0; j < 4; j++) {
                         uint8_t packed = (w.z >> (j * 8)) & 0xFFu;
                         float2 wv = fp4x2_to_float2(packed);
-                        sums[m] += wv.x * scale1 * __bfloat162float(xb0[j * 2])
-                                 + wv.y * scale1 * __bfloat162float(xb0[j * 2 + 1]);
+                        gsum1 += wv.x * __bfloat162float(xb0[j * 2])
+                               + wv.y * __bfloat162float(xb0[j * 2 + 1]);
                     }
                     #pragma unroll
                     for (int j = 0; j < 4; j++) {
                         uint8_t packed = (w.w >> (j * 8)) & 0xFFu;
                         float2 wv = fp4x2_to_float2(packed);
-                        sums[m] += wv.x * scale1 * __bfloat162float(xb1[j * 2])
-                                 + wv.y * scale1 * __bfloat162float(xb1[j * 2 + 1]);
+                        gsum1 += wv.x * __bfloat162float(xb1[j * 2])
+                               + wv.y * __bfloat162float(xb1[j * 2 + 1]);
                     }
                 }
+
+                sums[m] += gsum0 * scale0 + gsum1 * scale1;
             }
         }
 
@@ -409,6 +413,153 @@ grouped_nvfp4_gemv_kernel(
                     expert_output[(size_t)(m_base + m) * N + row] = __float2bfloat16(sums[m]);
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grouped NVFP4 GEMV kernel with shared-memory weight cache (RowsPerWarp=8)
+//
+// Same as grouped_nvfp4_gemv_kernel<8> but caches the full weight tile (FP4 +
+// FP8 scales) in shared memory. This eliminates the M_e redundant global-memory
+// weight reads that occur in the m_base loop when M_CHUNK=1, which is the
+// dominant bottleneck for MoE down_proj (K=256, N=6144) where avg M_e ~ 16.
+//
+// Weight tile size: ROWS_PER_BLOCK * (K/2) bytes FP4 + ROWS_PER_BLOCK * (K/16)
+// bytes FP8 scales. For K=256: 64*128 + 64*16 = 9 KB — fits comfortably in smem.
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
+grouped_nvfp4_gemv_smem_kernel(
+    __nv_bfloat16* __restrict__ sorted_output,
+    const __nv_bfloat16* __restrict__ sorted_input,
+    int K,
+    const uint8_t* const* __restrict__ weight_ptrs,
+    const __nv_fp8_e4m3* const* __restrict__ scale_ptrs,
+    const float* const* __restrict__ scale2_ptrs,
+    const int* __restrict__ expert_offsets,
+    int num_experts,
+    int N)
+{
+    extern __shared__ uint8_t smem_buf[];
+    constexpr int RowsPerWarp = 8;
+    constexpr int LANES_PER_ROW = GEMV_WARP_SIZE / RowsPerWarp;
+    constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * RowsPerWarp;
+
+    int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    int expert_id = blockIdx.x / num_row_groups;
+    int row_group = blockIdx.x % num_row_groups;
+
+    if (expert_id >= num_experts) return;
+
+    int M_e = expert_offsets[expert_id + 1] - expert_offsets[expert_id];
+    if (M_e == 0) return;
+
+    int warp_id = threadIdx.x / GEMV_WARP_SIZE;
+    int lane = threadIdx.x % GEMV_WARP_SIZE;
+    int row_in_warp = lane / LANES_PER_ROW;
+    int inner_lane = lane % LANES_PER_ROW;
+    int row = row_group * ROWS_PER_BLOCK + warp_id * RowsPerWarp + row_in_warp;
+    bool row_valid = row < N;
+
+    int num_k_groups = K / NVFP4_QUANT_GROUP;
+    float scale_2_val = *scale2_ptrs[expert_id];
+
+    const __nv_bfloat16* expert_input = sorted_input + (size_t)expert_offsets[expert_id] * K;
+    __nv_bfloat16* expert_output = sorted_output + (size_t)expert_offsets[expert_id] * N;
+
+    int row_start = row_group * ROWS_PER_BLOCK;
+    int valid_rows = min(ROWS_PER_BLOCK, N - row_start);
+    int weight_bytes = valid_rows * (K / 2);
+    int scale_bytes = valid_rows * num_k_groups;
+
+    uint8_t* smem_weight = smem_buf;
+    __nv_fp8_e4m3* smem_scale = reinterpret_cast<__nv_fp8_e4m3*>(smem_buf + weight_bytes);
+
+    const uint8_t* weight_base = weight_ptrs[expert_id] + (size_t)row_start * (K / 2);
+    const __nv_fp8_e4m3* scale_base = scale_ptrs[expert_id] + (size_t)row_start * num_k_groups;
+
+    for (int i = threadIdx.x; i < weight_bytes; i += GEMV_BLOCK_SIZE) {
+        smem_weight[i] = weight_base[i];
+    }
+    for (int i = threadIdx.x; i < scale_bytes; i += GEMV_BLOCK_SIZE) {
+        smem_scale[i] = scale_base[i];
+    }
+    __syncthreads();
+
+    int local_row = row - row_start;
+    const uint8_t* weight_row = row_valid ? (smem_weight + local_row * (K / 2)) : smem_weight;
+    const __nv_fp8_e4m3* scale_row = row_valid ? (smem_scale + local_row * num_k_groups) : smem_scale;
+
+    for (int m_base = 0; m_base < M_e; m_base++) {
+        int m_count = min(1, M_e - m_base);
+        float sum = 0.0f;
+
+        for (int g = inner_lane * 2; row_valid && g < num_k_groups; g += LANES_PER_ROW * 2) {
+            int k_start = g * NVFP4_QUANT_GROUP;
+            uint4 w = *reinterpret_cast<const uint4*>(weight_row + (size_t)g * (NVFP4_QUANT_GROUP / 2));
+
+            float scale0 = static_cast<float>(scale_row[g]) * scale_2_val;
+            float scale1 = (g + 1 < num_k_groups)
+                               ? static_cast<float>(scale_row[g + 1]) * scale_2_val
+                               : 0.0f;
+
+            const uint4* input_v4 = reinterpret_cast<const uint4*>(expert_input + (size_t)m_base * K + k_start);
+            uint4 xv0 = input_v4[0];
+            uint4 xv1 = input_v4[1];
+            __nv_bfloat16 xb0[8], xb1[8];
+            uint4_to_bf16x8(xv0, xb0);
+            uint4_to_bf16x8(xv1, xb1);
+
+            float gsum0 = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                uint8_t packed = (w.x >> (j * 8)) & 0xFFu;
+                float2 wv = fp4x2_to_float2(packed);
+                gsum0 += wv.x * __bfloat162float(xb0[j * 2])
+                       + wv.y * __bfloat162float(xb0[j * 2 + 1]);
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                uint8_t packed = (w.y >> (j * 8)) & 0xFFu;
+                float2 wv = fp4x2_to_float2(packed);
+                gsum0 += wv.x * __bfloat162float(xb1[j * 2])
+                       + wv.y * __bfloat162float(xb1[j * 2 + 1]);
+            }
+
+            float gsum1 = 0.0f;
+            if (g + 1 < num_k_groups) {
+                const uint4* input_v4_1 = reinterpret_cast<const uint4*>(expert_input + (size_t)m_base * K + k_start + NVFP4_QUANT_GROUP);
+                uint4 xv2 = input_v4_1[0];
+                uint4 xv3 = input_v4_1[1];
+                uint4_to_bf16x8(xv2, xb0);
+                uint4_to_bf16x8(xv3, xb1);
+
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    uint8_t packed = (w.z >> (j * 8)) & 0xFFu;
+                    float2 wv = fp4x2_to_float2(packed);
+                    gsum1 += wv.x * __bfloat162float(xb0[j * 2])
+                           + wv.y * __bfloat162float(xb0[j * 2 + 1]);
+                }
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    uint8_t packed = (w.w >> (j * 8)) & 0xFFu;
+                    float2 wv = fp4x2_to_float2(packed);
+                    gsum1 += wv.x * __bfloat162float(xb1[j * 2])
+                           + wv.y * __bfloat162float(xb1[j * 2 + 1]);
+                }
+            }
+
+            sum += gsum0 * scale0 + gsum1 * scale1;
+        }
+
+        #pragma unroll
+        for (int offset = LANES_PER_ROW / 2; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+        }
+        if (row_valid && inner_lane == 0) {
+            expert_output[(size_t)m_base * N + row] = __float2bfloat16(sum);
         }
     }
 }
@@ -557,7 +708,8 @@ void glm_nvfp4_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
         constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * 8;
         int num_row_groups = (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
         int total_ctas = num_experts * num_row_groups;
-        grouped_nvfp4_gemv_kernel<8><<<total_ctas, GEMV_BLOCK_SIZE, 0, stream>>>(
+        size_t smem_size = (size_t)ROWS_PER_BLOCK * (K / 2) + (size_t)ROWS_PER_BLOCK * (K / NVFP4_QUANT_GROUP);
+        grouped_nvfp4_gemv_smem_kernel<<<total_ctas, GEMV_BLOCK_SIZE, smem_size, stream>>>(
             sorted_output, sorted_input, K,
             reinterpret_cast<const uint8_t* const*>(weight_ptrs),
             reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs),
