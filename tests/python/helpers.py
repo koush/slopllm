@@ -834,6 +834,16 @@ class GlmOps:
             ctypes.c_void_p,
         ]
 
+        self.lib.glm_bf16_mul_mat_id_grouped_mma.restype = None
+        self.lib.glm_bf16_mul_mat_id_grouped_mma.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
 
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
