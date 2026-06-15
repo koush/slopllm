@@ -842,6 +842,19 @@ void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_
                       const float* top_ps, unsigned int* step_counter,
                       int max_effective_k);
 
+// Grouped NVFP4 MoE using wmma BF16 MMA with FP4 hardware dequant (SM120+)
+// Same interface as glm_nvfp4_mul_mat_id_grouped but uses Tensor Core MMA
+// for prefill (M > threshold) instead of scalar GEMV.
+size_t glm_mma_moe_workspace_size(int count, int N, int K, int num_experts);
+
+void glm_nvfp4_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* input,
+                                        const void* const* weight_ptrs,
+                                        const void* const* scale_ptrs,
+                                        const void* const* scale2_ptrs,
+                                        const int* expert_ids, int top_k,
+                                        int count, int N, int K,
+                                        int num_experts, void* workspace);
+
 #ifdef __cplusplus
 }
 #endif

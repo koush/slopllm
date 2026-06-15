@@ -818,6 +818,22 @@ class GlmOps:
             ctypes.c_void_p,
         ]
 
+        self.lib.glm_mma_moe_workspace_size.restype = ctypes.c_size_t
+        self.lib.glm_mma_moe_workspace_size.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_nvfp4_mul_mat_id_grouped_mma.restype = None
+        self.lib.glm_nvfp4_mul_mat_id_grouped_mma.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
             self.lib.glm_free(self.ctx)
