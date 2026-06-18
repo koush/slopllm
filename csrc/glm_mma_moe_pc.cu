@@ -89,7 +89,7 @@ __global__ void restore_offsets_kernel(
     }
 }
 
-constexpr int CONSUMER_WARPS = 1;
+constexpr int CONSUMER_WARPS = 2;
 constexpr int WARPS_PER_CTA = CONSUMER_WARPS + 1;
 constexpr int CTA_SIZE = WARPS_PER_CTA * 32;
 
@@ -154,7 +154,6 @@ struct PcSmem {
     uint64_t empty[NumBuffers];
     alignas(16) __nv_bfloat16 a_buf[NumBuffers][TM * TK];
     alignas(8) uint8_t fp4_buf[NumBuffers][TN * (TK / 2)];
-    alignas(16) __nv_bfloat16 b_buf[NumBuffers][TK * TN];
     alignas(16) __nv_fp8_e4m3 scale_batch[TN * SCALE_BATCH];
     int n_valid_buf[NumBuffers];
     int ks_buf[NumBuffers];
@@ -289,18 +288,19 @@ __device__ void producer(
                     int row = m_start + m;
                     if (row < M_e) {
                         const __nv_bfloat16* gmem_ptr = expert_input + (size_t)row * K + k_start;
-                        cp_async_ca_16(reinterpret_cast<uint4*>(sa + m * TK),
-                                       reinterpret_cast<const uint4*>(gmem_ptr),
-                                       1);
-                        cp_async_ca_16(reinterpret_cast<uint4*>(sa + m * TK + 8),
-                                       reinterpret_cast<const uint4*>(gmem_ptr + 8),
-                                       1);
-                        cp_async_ca_16(reinterpret_cast<uint4*>(sa + m * TK + 16),
-                                       reinterpret_cast<const uint4*>(gmem_ptr + 16),
-                                       1);
-                        cp_async_ca_16(reinterpret_cast<uint4*>(sa + m * TK + 24),
-                                       reinterpret_cast<const uint4*>(gmem_ptr + 24),
-                                       1);
+                        int block_row = m / 16;
+                        int tile_row = (m % 16) / 8;
+                        int local_row = m % 8;
+                        int row_base = local_row * 8;
+                        for (int c = 0; c < TK / 8; c++) {
+                            int block_col = c / 2;
+                            int tile_col = c % 2;
+                            int offset = (block_row * (TK / 16) + block_col) * 256
+                                       + (tile_col * 2 + tile_row) * 64 + row_base;
+                            cp_async_ca_16(reinterpret_cast<uint4*>(sa + offset),
+                                            reinterpret_cast<const uint4*>(gmem_ptr + c * 8),
+                                            1);
+                        }
                     }
                 }
 #endif
@@ -509,17 +509,14 @@ __device__ void consumer(
             uint32_t a_reg[4];
             for (int v2 = 0; v2 < 2; v2++)
                 for (int v1 = 0; v1 < 2; v1++) {
-                    uint32_t lo = 0, hi = 0;
-                    for (int v0 = 0; v0 < 2; v0++) {
-                            int m = m_tile + t1 + 8 * v1;
-                            int k = 2 * t0 + v0 + 8 * v2;
-                            uint16_t val_raw = 0;
-                            if (m < TM && k < QUANT_GROUP)
-                                memcpy(&val_raw, &sa[m * TK + a_offset + k], sizeof(uint16_t));
-                            if (v0 == 0) lo = (uint32_t)val_raw;
-                            else         hi = (uint32_t)val_raw;
-                    }
-                    a_reg[v1 + 2 * v2] = (hi << 16) | lo;
+                    int block_row = m_tile / 16;
+                    int block_col = sub_ks;
+                    int tile_row = v1;
+                    int tile_col = v2;
+                    int tile_offset = (block_row * (TK / 16) + block_col) * 256
+                                    + (tile_col * 2 + tile_row) * 64;
+                    a_reg[v1 + 2 * v2] = 0;
+                    memcpy(&a_reg[v1 + 2 * v2], &sa[tile_offset + t1 * 8 + 2 * t0], sizeof(uint32_t));
                 }
 
             int acc_base = (m_tile / 16) * ACC_STRIDE + n_group * 4;
