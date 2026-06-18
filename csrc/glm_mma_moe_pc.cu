@@ -330,10 +330,8 @@ __device__ void producer(
                     smem->tile_m_valid[buf] = m_valid;
                     smem->tile_n_valid[buf] = n_valid;
                 }
-#endif
 
                 __syncwarp();
-#ifndef PRODUCER_ONLY
                 if (lane_id == 0) {
                     ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
                                          ptx::space_shared, &smem->full[buf], 1);
@@ -380,11 +378,16 @@ __device__ void consumer(
     const int* __restrict__ expert_offsets,
     int N)
 {
-    constexpr int N_GROUPS_PER_WARP = TN / (8 * ConsumerWarps);
+    constexpr int TOTAL_N_GROUPS = TN / 8;
+    constexpr int BASE_N_GROUPS = TOTAL_N_GROUPS / ConsumerWarps;
+    constexpr int REM_N_GROUPS = TOTAL_N_GROUPS % ConsumerWarps;
+    constexpr int N_GROUPS_PER_WARP = BASE_N_GROUPS + 1;
     constexpr int ACC_STRIDE = 4 * N_GROUPS_PER_WARP;
 
     int lane_id = threadIdx.x % 32;
     int consumer_warp_id = (threadIdx.x / 32) - 1;
+    int my_n_groups = BASE_N_GROUPS + (consumer_warp_id < REM_N_GROUPS ? 1 : 0);
+    int my_n_start = consumer_warp_id * BASE_N_GROUPS * 8 + (consumer_warp_id < REM_N_GROUPS ? consumer_warp_id * 8 : REM_N_GROUPS * 8);
     uint32_t full_phase[NumBuffers] = {};
     int stage = 0;
     int t0 = lane_id % 4, t1 = lane_id / 4;
@@ -423,8 +426,8 @@ __device__ void consumer(
         int m_valid = smem->tile_m_valid[buf];
         bool is_tile_done = (k_group_idx + K_GROUPS_PER_STEP >= smem->num_k_groups);
 
-        for (int n_group = 0; n_group < N_GROUPS_PER_WARP; n_group++) {
-            int n_start_local = consumer_warp_id * N_GROUPS_PER_WARP * 8 + n_group * 8;
+        for (int n_group = 0; n_group < my_n_groups; n_group++) {
+            int n_start_local = my_n_start + n_group * 8;
             if (n_start_local >= n_valid) break;
 
         for (int sub_ks = 0; sub_ks < K_GROUPS_PER_STEP; sub_ks++) {
@@ -560,8 +563,8 @@ __device__ void consumer(
         if (is_tile_done) {
             __nv_bfloat16* expert_output = sorted_output + (size_t)expert_offsets[expert_id] * N;
 
-            for (int n_group = 0; n_group < N_GROUPS_PER_WARP; n_group++) {
-                int n_start_local = consumer_warp_id * N_GROUPS_PER_WARP * 8 + n_group * 8;
+            for (int n_group = 0; n_group < my_n_groups; n_group++) {
+                int n_start_local = my_n_start + n_group * 8;
 
                 for (int m_tile = 0; m_tile < TM; m_tile += 16) {
                     int acc_base = (m_tile / 16) * ACC_STRIDE + n_group * 4;
