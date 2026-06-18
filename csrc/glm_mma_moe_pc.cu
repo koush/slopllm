@@ -15,7 +15,7 @@ namespace {
 constexpr int TK = 32;
 constexpr int QUANT_GROUP = 16;
 constexpr int K_GROUPS_PER_STEP = TK / QUANT_GROUP;
-constexpr int SCALE_BATCH = 128;
+constexpr int SCALE_BATCH = 32;
 
 __global__ void histogram_kernel(
     const int* __restrict__ expert_ids,
@@ -154,7 +154,7 @@ struct PcSmem {
     uint64_t empty[NumBuffers];
     alignas(16) __nv_bfloat16 a_buf[NumBuffers][TM * TK];
     alignas(8) uint8_t fp4_buf[NumBuffers][TN * (TK / 2)];
-    alignas(16) __nv_fp8_e4m3 scale_batch[TN * SCALE_BATCH];
+    alignas(16) __nv_fp8_e4m3 scale_batch[NumBuffers][TN * SCALE_BATCH];
     int n_valid_buf[NumBuffers];
     int ks_buf[NumBuffers];
     float scale_2_buf[NumBuffers];
@@ -253,7 +253,7 @@ __device__ void producer(
                 uint8_t* sfp4 = smem->fp4_buf[buf];
 
 #ifndef SKIP_SCALE_LOAD
-                if (ks == 0) {
+                if (ks < NumBuffers) {
                     int batch_16b = batch_size / 16;
                     int total_16b = n_valid * batch_16b;
                     for (int i = lane_id; i < total_16b; i += 32) {
@@ -262,9 +262,9 @@ __device__ void producer(
                         int global_n = n_start + n;
                         if (global_n < N) {
                             const __nv_fp8_e4m3* gmem_scale = scale_base + (size_t)global_n * num_k_groups + k_group_batch;
-                            cp_async_ca_16(reinterpret_cast<uint4*>(smem->scale_batch + n * SCALE_BATCH + b),
-                                           reinterpret_cast<const uint4*>(gmem_scale + b),
-                                           1);
+                            cp_async_ca_16(reinterpret_cast<uint4*>(smem->scale_batch[buf] + n * SCALE_BATCH + b),
+                                            reinterpret_cast<const uint4*>(gmem_scale + b),
+                                            1);
                         }
                     }
                     int remainder = batch_size % 16;
@@ -274,9 +274,9 @@ __device__ void producer(
                             int global_n = n_start + n;
                             if (global_n < N && remainder >= 8) {
                                 const __nv_fp8_e4m3* gmem_scale = scale_base + (size_t)global_n * num_k_groups + k_group_batch;
-                                cp_async_ca_8(reinterpret_cast<uint2*>(smem->scale_batch + n * SCALE_BATCH + b),
-                                              reinterpret_cast<const uint2*>(gmem_scale + b),
-                                              1);
+                                cp_async_ca_8(reinterpret_cast<uint2*>(smem->scale_batch[buf] + n * SCALE_BATCH + b),
+                                                reinterpret_cast<const uint2*>(gmem_scale + b),
+                                                1);
                             }
                         }
                     }
@@ -480,9 +480,9 @@ __device__ void consumer(
         );
 
         float bs0 = (n_start_local + 2 * t0 < n_valid) ?
-            static_cast<float>(smem->scale_batch[(n_start_local + 2 * t0) * SCALE_BATCH + scale_idx]) : 0.0f;
+            static_cast<float>(smem->scale_batch[buf][(n_start_local + 2 * t0) * SCALE_BATCH + (scale_idx % SCALE_BATCH)]) : 0.0f;
         float bs1 = (n_start_local + 2 * t0 + 1 < n_valid) ?
-            static_cast<float>(smem->scale_batch[(n_start_local + 2 * t0 + 1) * SCALE_BATCH + scale_idx]) : 0.0f;
+            static_cast<float>(smem->scale_batch[buf][(n_start_local + 2 * t0 + 1) * SCALE_BATCH + (scale_idx % SCALE_BATCH)]) : 0.0f;
         frag_d[0] *= bs0 * scale_2_val;
         frag_d[1] *= bs1 * scale_2_val;
         frag_d[2] *= bs0 * scale_2_val;
