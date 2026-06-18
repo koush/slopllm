@@ -12,9 +12,7 @@ namespace ptx = cuda::ptx;
 
 namespace {
 
-constexpr int TK = 32;
 constexpr int QUANT_GROUP = 16;
-constexpr int K_GROUPS_PER_STEP = TK / QUANT_GROUP;
 constexpr int SCALE_BATCH = 32;
 
 __global__ void histogram_kernel(
@@ -148,12 +146,13 @@ void mbar_wait(uint64_t* bar, uint32_t phase) {
         ;
 }
 
-template <int TM, int TN, int MaxExperts, int NumBuffers = 2>
+template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int TK = 32>
 struct PcSmem {
+    static constexpr int K_GROUPS_PER_STEP = TK / QUANT_GROUP;
     uint64_t full[NumBuffers];
     uint64_t empty[CONSUMER_WARPS][NumBuffers];
     alignas(16) __nv_bfloat16 a_buf[NumBuffers][TM * TK];
-    alignas(8) uint8_t fp4_buf[NumBuffers][TN * (TK / 2)];
+    alignas(16) uint8_t fp4_buf[NumBuffers][TN * (TK / 2)];
     alignas(16) __nv_fp8_e4m3 scale_batch[NumBuffers][TN * SCALE_BATCH];
     int n_valid_buf[NumBuffers];
     int ks_buf[NumBuffers];
@@ -168,7 +167,7 @@ struct PcSmem {
     int num_k_groups;
 };
 
-template <int TM, int TN, int MaxExperts, int NumBuffers = 2>
+template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int TK = 32>
 __device__ void producer(
     const __nv_bfloat16* __restrict__ sorted_input,
     int K,
@@ -234,7 +233,7 @@ __device__ void producer(
 
         for (int k_group_batch = 0; k_group_batch < num_k_groups; k_group_batch += SCALE_BATCH) {
             int batch_size = min(SCALE_BATCH, num_k_groups - k_group_batch);
-            int k_steps_in_batch = batch_size / K_GROUPS_PER_STEP;
+            int k_steps_in_batch = batch_size / PcSmem<TM, TN, MaxExperts, NumBuffers, TK>::K_GROUPS_PER_STEP;
 
             for (int ks = 0; ks < k_steps_in_batch; ks++) {
                 int buf = stage % NumBuffers;
@@ -248,7 +247,7 @@ __device__ void producer(
                 }
 #endif
 
-                int k_group_idx = k_group_batch + ks * K_GROUPS_PER_STEP;
+                int k_group_idx = k_group_batch + ks * PcSmem<TM, TN, MaxExperts, NumBuffers, TK>::K_GROUPS_PER_STEP;
                 int k_start = k_group_idx * QUANT_GROUP;
                 __nv_bfloat16* sa = smem->a_buf[buf];
                 uint8_t* sfp4 = smem->fp4_buf[buf];
@@ -291,6 +290,11 @@ __device__ void producer(
                             cp_async_ca_16(reinterpret_cast<uint4*>(sfp4 + n * (TK / 2)),
                                            reinterpret_cast<const uint4*>(gmem_ptr),
                                            1);
+                            if constexpr (TK == 64) {
+                                cp_async_ca_16(reinterpret_cast<uint4*>(sfp4 + n * (TK / 2) + 16),
+                                               reinterpret_cast<const uint4*>(gmem_ptr + 16),
+                                               1);
+                            }
                         }
                     }
 #endif
@@ -384,7 +388,7 @@ __device__ void producer(
 #endif
 }
 
-template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int ConsumerWarps = CONSUMER_WARPS>
+template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int TK = 32, int ConsumerWarps = CONSUMER_WARPS>
 __device__ void consumer(
     PcSmem<TM, TN, MaxExperts, NumBuffers>* smem,
     __nv_bfloat16* __restrict__ sorted_output,
@@ -433,69 +437,91 @@ __device__ void consumer(
         int m_start = smem->tile_m_start[buf];
         int n_start_tile = smem->tile_n_start[buf];
         int m_valid = smem->tile_m_valid[buf];
-        bool is_tile_done = (k_group_idx + K_GROUPS_PER_STEP >= smem->num_k_groups);
+        constexpr int KGPS = PcSmem<TM, TN, MaxExperts, NumBuffers, TK>::K_GROUPS_PER_STEP;
+        bool is_tile_done = (k_group_idx + KGPS >= smem->num_k_groups);
+
+        constexpr uint8_t UE4M3_ONE = 0x38;
+        uint32_t sfa_packed = (uint32_t)UE4M3_ONE | ((uint32_t)UE4M3_ONE << 8)
+                            | ((uint32_t)UE4M3_ONE << 16) | ((uint32_t)UE4M3_ONE << 24);
 
         for (int n_group = 0; n_group < my_n_groups; n_group++) {
             int n_start_local = my_n_start + n_group * 8;
             if (n_start_local >= n_valid) break;
 
-        for (int sub_ks = 0; sub_ks < K_GROUPS_PER_STEP; sub_ks++) {
-            int fp4_offset = sub_ks * (QUANT_GROUP / 2);
-            int a_offset = sub_ks * QUANT_GROUP;
-            int scale_idx = k_group_idx + sub_ks;
-
-        uint32_t frag_a_id[4] = {0};
-        {
-            for (int v2 = 0; v2 < 2; v2++)
-                for (int v1 = 0; v1 < 2; v1++)
-                    for (int v0 = 0; v0 < 4; v0++) {
-                        int m = t1 + 8 * v1;
-                        int k = 4 * t0 + v0 + 16 * v2;
-                        uint8_t val = (k == m) ? 0x02 : 0x00;
-                        frag_a_id[v1 + 2 * v2] |= ((uint32_t)val << (v0 * 8));
-                    }
-            for (int i = 0; i < 4; i++) frag_a_id[i] <<= 2;
-        }
-
-        uint32_t frag_b_fp4[2] = {0};
-        {
-            for (int v1 = 0; v1 < 2; v1++)
-                for (int v0 = 0; v0 < 4; v0++) {
-                    int n = n_start_local + t1;
-                    int k = 4 * t0 + v0 + 16 * v1;
-                    uint8_t val = 0;
-                    if (n < n_valid && k < QUANT_GROUP) {
-                        int k_packed = k / 2;
-                        uint8_t byte_val = sfp4[n * (TK / 2) + fp4_offset + k_packed];
-                        val = (k % 2 == 0) ? (byte_val & 0xF) : (byte_val >> 4);
-                    }
-                    frag_b_fp4[v1] |= ((uint32_t)val << (v0 * 8));
+            int n_col = n_start_local + t1;
+            uint32_t sfb_packed = 0;
+            if (n_col < n_valid) {
+                if constexpr (KGPS % 4 == 0) {
+                    // k_group_idx is always a multiple of KGPS here, so this offset
+                    // is guaranteed 4-byte aligned -- safe to do one aligned word load
+                    // instead of 4 separate byte loads.
+                    const uint32_t* sb32 = reinterpret_cast<const uint32_t*>(
+                        reinterpret_cast<const uint8_t*>(&smem->scale_batch[buf][0])
+                        + n_col * SCALE_BATCH + (k_group_idx % SCALE_BATCH));
+                    sfb_packed = *sb32;
+                } else {
+                    // KGPS doesn't divide 4 evenly (e.g. TK=32 -> KGPS=2), so the
+                    // offset isn't guaranteed 4-byte aligned -- fall back to safe
+                    // byte-wise loads.
+                    uint8_t s0 = reinterpret_cast<const uint8_t&>(smem->scale_batch[buf][n_col * SCALE_BATCH + ((k_group_idx + 0) % SCALE_BATCH)]);
+                    uint8_t s1 = reinterpret_cast<const uint8_t&>(smem->scale_batch[buf][n_col * SCALE_BATCH + ((k_group_idx + 1) % SCALE_BATCH)]);
+                    uint8_t s2 = reinterpret_cast<const uint8_t&>(smem->scale_batch[buf][n_col * SCALE_BATCH + ((k_group_idx + 2) % SCALE_BATCH)]);
+                    uint8_t s3 = reinterpret_cast<const uint8_t&>(smem->scale_batch[buf][n_col * SCALE_BATCH + ((k_group_idx + 3) % SCALE_BATCH)]);
+                    sfb_packed = (uint32_t)s0 | ((uint32_t)s1 << 8) | ((uint32_t)s2 << 16) | ((uint32_t)s3 << 24);
                 }
-            frag_b_fp4[0] <<= 2;
-            frag_b_fp4[1] <<= 2;
-        }
+            }
 
-        float frag_d[4];
-        asm volatile(
-            "mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e2m1.e2m1.f32 "
-            "{%0,  %1,  %2,  %3},"
-            "{%4,  %5,  %6,  %7},"
-            "{%8,  %9},"
-            "{%10, %11, %12, %13};\n"
-            : "=f"(frag_d[0]), "=f"(frag_d[1]), "=f"(frag_d[2]), "=f"(frag_d[3])
-            : "r"(frag_a_id[0]), "r"(frag_a_id[1]), "r"(frag_a_id[2]), "r"(frag_a_id[3]),
-              "r"(frag_b_fp4[0]), "r"(frag_b_fp4[1]),
-              "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f)
-        );
+            uint32_t regB[2] = {0, 0};
+            for (int v1 = 0; v1 < 2; v1++)
+                for (int v0 = 0; v0 < 8; v0++) {
+                    int n = n_start_local + t1;
+                    int k = 8 * t0 + v0 + 32 * v1;
+                    uint8_t nibble = 0;
+                    if (n < n_valid && k < TK) {
+                        int k_packed = k / 2;
+                        uint8_t byte_val = sfp4[n * (TK / 2) + k_packed];
+                        nibble = (k % 2 == 0) ? (byte_val & 0xF) : (byte_val >> 4);
+                    }
+                    regB[v1] |= (uint32_t)nibble << (4 * v0);
+                }
 
-        float bs0 = (n_start_local + 2 * t0 < n_valid) ?
-            static_cast<float>(smem->scale_batch[buf][(n_start_local + 2 * t0) * SCALE_BATCH + (scale_idx % SCALE_BATCH)]) : 0.0f;
-        float bs1 = (n_start_local + 2 * t0 + 1 < n_valid) ?
-            static_cast<float>(smem->scale_batch[buf][(n_start_local + 2 * t0 + 1) * SCALE_BATCH + (scale_idx % SCALE_BATCH)]) : 0.0f;
-        frag_d[0] *= bs0 * scale_2_val;
-        frag_d[1] *= bs1 * scale_2_val;
-        frag_d[2] *= bs0 * scale_2_val;
-        frag_d[3] *= bs1 * scale_2_val;
+        for (int sub_ks = 0; sub_ks < KGPS; sub_ks++) {
+            int shift = sub_ks * QUANT_GROUP;
+
+            uint32_t regA[4] = {0, 0, 0, 0};
+            for (int reg = 0; reg < 4; reg++) {
+                int v1 = reg % 2, v2 = reg / 2;
+                int m = t1 + 8 * v1;
+                for (int v0 = 0; v0 < 8; v0++) {
+                    int k = 8 * t0 + v0 + 32 * v2;
+                    if (k == m + shift) regA[reg] |= (uint32_t)0x2 << (4 * v0);
+                }
+            }
+
+            float frag_d[4];
+            asm volatile(
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X"
+                ".m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                "{%0,  %1,  %2,  %3},"
+                "{%4,  %5,  %6,  %7},"
+                "{%8,  %9},"
+                "{%10, %11, %12, %13},"
+                "{%14},"
+                "{%15, %16},"
+                "{%17},"
+                "{%18, %19};\n"
+                : "=f"(frag_d[0]), "=f"(frag_d[1]), "=f"(frag_d[2]), "=f"(frag_d[3])
+                : "r"(regA[0]), "r"(regA[1]), "r"(regA[2]), "r"(regA[3]),
+                  "r"(regB[0]), "r"(regB[1]),
+                  "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f),
+                  "r"(sfa_packed), "h"((uint16_t)0), "h"((uint16_t)0),
+                  "r"(sfb_packed), "h"((uint16_t)0), "h"((uint16_t)0)
+            );
+
+            frag_d[0] *= scale_2_val;
+            frag_d[1] *= scale_2_val;
+            frag_d[2] *= scale_2_val;
+            frag_d[3] *= scale_2_val;
 
             uint32_t pack_01, pack_23;
             asm volatile("{ .reg .b16 lo, hi; "
@@ -601,13 +627,13 @@ __device__ void consumer(
     }
 }
 
-template <int TM, int TN, int MaxExperts, int NumBuffers = 2>
+template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int TK = 32>
 constexpr size_t pc_smem_size() {
     constexpr size_t alignment = alignof(PcSmem<TM, TN, MaxExperts, NumBuffers>);
     return sizeof(PcSmem<TM, TN, MaxExperts, NumBuffers>) + alignment - 1;
 }
 
-template <int TM, int TN, int MaxExperts, int NumBuffers = 2>
+template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int TK = 32>
 __global__ void __launch_bounds__(CTA_SIZE, 8)
 grouped_mma_pc_kernel(
     const __nv_bfloat16* __restrict__ sorted_input,
@@ -650,7 +676,7 @@ grouped_mma_pc_kernel(
     }
 }
 
-template <int TM, int TN, int MaxExperts, int NumBuffers = 2>
+template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int TK = 32>
 static void launch_pc_kernel(GlmCtx* ctx, int num_experts, int N,
                               const __nv_bfloat16* sorted_input,
                               __nv_bfloat16* sorted_output, int K,
@@ -663,13 +689,13 @@ static void launch_pc_kernel(GlmCtx* ctx, int num_experts, int N,
     cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, ctx->device_id);
     int grid_size = num_SMs * 8;
 
-    size_t smem_size = pc_smem_size<TM, TN, MaxExperts, NumBuffers>();
+    size_t smem_size = pc_smem_size<TM, TN, MaxExperts, NumBuffers, TK>();
 
     cudaFuncSetAttribute(
-        (void*)grouped_mma_pc_kernel<TM, TN, MaxExperts, NumBuffers>,
+        (void*)grouped_mma_pc_kernel<TM, TN, MaxExperts, NumBuffers, TK>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
-    grouped_mma_pc_kernel<TM, TN, MaxExperts, NumBuffers><<<grid_size, CTA_SIZE, smem_size, stream>>>(
+    grouped_mma_pc_kernel<TM, TN, MaxExperts, NumBuffers, TK><<<grid_size, CTA_SIZE, smem_size, stream>>>(
         sorted_input, sorted_output, K, weight_ptrs, scale_ptrs, scale2_ptrs,
         expert_offsets, num_experts, N, tile_counter);
 }
@@ -738,9 +764,17 @@ void glm_nvfp4_mul_mat_id_grouped_mma_pc(GlmCtx* ctx, void* output,
     cudaMemsetAsync(sorted_output, 0, (size_t)count * N * 2, stream);
 
     constexpr int MaxExperts = 256;
-    launch_pc_kernel<32, 64, MaxExperts>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                              weight_ptrs, scale_ptrs, scale2_ptrs,
-                              expert_offsets, tile_counter, stream);
+    const char* tk_env = getenv("GLM_MOE_TK");
+    int tk = tk_env ? atoi(tk_env) : 32;
+    if (tk == 64) {
+        launch_pc_kernel<32, 64, MaxExperts, 2, 64>(ctx, num_experts, N, sorted_input, sorted_output, K,
+                                  weight_ptrs, scale_ptrs, scale2_ptrs,
+                                  expert_offsets, tile_counter, stream);
+    } else {
+        launch_pc_kernel<32, 64, MaxExperts>(ctx, num_experts, N, sorted_input, sorted_output, K,
+                                  weight_ptrs, scale_ptrs, scale2_ptrs,
+                                  expert_offsets, tile_counter, stream);
+    }
 
     grid_size = (count + block_size - 1) / block_size;
     unscatter_output_kernel<<<grid_size, block_size, 0, stream>>>(
