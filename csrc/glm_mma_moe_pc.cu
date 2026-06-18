@@ -507,17 +507,23 @@ __device__ void consumer(
 
         for (int m_tile = 0; m_tile < TM; m_tile += 16) {
             uint32_t a_reg[4];
-            for (int v2 = 0; v2 < 2; v2++)
-                for (int v1 = 0; v1 < 2; v1++) {
-                    int block_row = m_tile / 16;
-                    int block_col = sub_ks;
-                    int tile_row = v1;
-                    int tile_col = v2;
-                    int tile_offset = (block_row * (TK / 16) + block_col) * 256
-                                    + (tile_col * 2 + tile_row) * 64;
-                    a_reg[v1 + 2 * v2] = 0;
-                    memcpy(&a_reg[v1 + 2 * v2], &sa[tile_offset + t1 * 8 + 2 * t0], sizeof(uint32_t));
-                }
+            {
+                int block_row = m_tile / 16;
+                int block_col = sub_ks;
+                int row = lane_id & 7;
+                int mat = (lane_id >> 3) & 1;
+                int col_offset = (lane_id >> 4) << 3;
+                int tile_row = mat;
+                int tile_col = col_offset >> 3;
+                int addr_offset = (block_row * (TK / 16) + block_col) * 256
+                                + (tile_col * 2 + tile_row) * 64 + row * 8;
+                uint32_t smem_ptr = __cvta_generic_to_shared(sa + addr_offset);
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                    "{%0, %1, %2, %3}, [%4];\n"
+                    : "=r"(a_reg[0]), "=r"(a_reg[1]), "=r"(a_reg[2]), "=r"(a_reg[3])
+                    : "r"(smem_ptr));
+            }
 
             int acc_base = (m_tile / 16) * ACC_STRIDE + n_group * 4;
             asm volatile(
