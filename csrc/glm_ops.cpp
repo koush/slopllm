@@ -1240,6 +1240,204 @@ static Napi::Value Bf16MulMatIdGroupedMma(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value Nvfp4MulMatIdGroupedMmaTm64(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t wptrs_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t sptrs_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t s2ptrs_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t eids_ptr = info[6].As<Napi::Number>().Int64Value();
+    int top_k = info[7].As<Napi::Number>().Int32Value();
+    int count = info[8].As<Napi::Number>().Int32Value();
+    int N = info[9].As<Napi::Number>().Int32Value();
+    int K = info[10].As<Napi::Number>().Int32Value();
+    int num_experts = info[11].As<Napi::Number>().Int32Value();
+    uintptr_t ws_ptr = info[12].As<Napi::Number>().Int64Value();
+    glm_nvfp4_mul_mat_id_grouped_mma_tm64(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                               reinterpret_cast<void*>(out_ptr),
+                                               reinterpret_cast<const void*>(in_ptr),
+                                               reinterpret_cast<const void* const*>(wptrs_ptr),
+                                               reinterpret_cast<const void* const*>(sptrs_ptr),
+                                               reinterpret_cast<const void* const*>(s2ptrs_ptr),
+                                               reinterpret_cast<const int*>(eids_ptr),
+                                               top_k, count, N, K, num_experts,
+                                               reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("nvfp4MulMatIdGroupedMmaTm64 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value Bf16MulMatIdGroupedMmaTm64(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weight_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t wptrs_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t eids_ptr = info[4].As<Napi::Number>().Int64Value();
+    int top_k = info[5].As<Napi::Number>().Int32Value();
+    int count = info[6].As<Napi::Number>().Int32Value();
+    int N = info[7].As<Napi::Number>().Int32Value();
+    int K = info[8].As<Napi::Number>().Int32Value();
+    int num_experts = info[9].As<Napi::Number>().Int32Value();
+    uintptr_t ws_ptr = info[10].As<Napi::Number>().Int64Value();
+    glm_bf16_mul_mat_id_grouped_mma_tm64(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                              reinterpret_cast<void*>(out_ptr),
+                                              reinterpret_cast<const void*>(in_ptr),
+                                              reinterpret_cast<const void* const*>(wptrs_ptr),
+                                              reinterpret_cast<const int*>(eids_ptr),
+                                              top_k, count, N, K, num_experts,
+                                              reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("bf16MulMatIdGroupedMmaTm64 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value Nvfp4MulMatIdGroupedMmaTm32Tn128(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t wptrs_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t sptrs_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t s2ptrs_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t eids_ptr = info[6].As<Napi::Number>().Int64Value();
+    int top_k = info[7].As<Napi::Number>().Int32Value();
+    int count = info[8].As<Napi::Number>().Int32Value();
+    int N = info[9].As<Napi::Number>().Int32Value();
+    int K = info[10].As<Napi::Number>().Int32Value();
+    int num_experts = info[11].As<Napi::Number>().Int32Value();
+    uintptr_t ws_ptr = info[12].As<Napi::Number>().Int64Value();
+    glm_nvfp4_mul_mat_id_grouped_mma_tm32_tn128(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                                      reinterpret_cast<void*>(out_ptr),
+                                                      reinterpret_cast<const void*>(in_ptr),
+                                                      reinterpret_cast<const void* const*>(wptrs_ptr),
+                                                      reinterpret_cast<const void* const*>(sptrs_ptr),
+                                                      reinterpret_cast<const void* const*>(s2ptrs_ptr),
+                                                      reinterpret_cast<const int*>(eids_ptr),
+                                                      top_k, count, N, K, num_experts,
+                                                      reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("nvfp4MulMatIdGroupedMmaTm32Tn128 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value Nvfp4MulMatIdGroupedMmaTm16Tn128(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t wptrs_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t sptrs_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t s2ptrs_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t eids_ptr = info[6].As<Napi::Number>().Int64Value();
+    int top_k = info[7].As<Napi::Number>().Int32Value();
+    int count = info[8].As<Napi::Number>().Int32Value();
+    int N = info[9].As<Napi::Number>().Int32Value();
+    int K = info[10].As<Napi::Number>().Int32Value();
+    int num_experts = info[11].As<Napi::Number>().Int32Value();
+    uintptr_t ws_ptr = info[12].As<Napi::Number>().Int64Value();
+    glm_nvfp4_mul_mat_id_grouped_mma_tm16_tn128(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                                      reinterpret_cast<void*>(out_ptr),
+                                                      reinterpret_cast<const void*>(in_ptr),
+                                                      reinterpret_cast<const void* const*>(wptrs_ptr),
+                                                      reinterpret_cast<const void* const*>(sptrs_ptr),
+                                                      reinterpret_cast<const void* const*>(s2ptrs_ptr),
+                                                      reinterpret_cast<const int*>(eids_ptr),
+                                                      top_k, count, N, K, num_experts,
+                                                      reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("nvfp4MulMatIdGroupedMmaTm16Tn128 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value Bf16MulMatIdGroupedMmaTm32Tn128(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weight_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t wptrs_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t eids_ptr = info[4].As<Napi::Number>().Int64Value();
+    int top_k = info[5].As<Napi::Number>().Int32Value();
+    int count = info[6].As<Napi::Number>().Int32Value();
+    int N = info[7].As<Napi::Number>().Int32Value();
+    int K = info[8].As<Napi::Number>().Int32Value();
+    int num_experts = info[9].As<Napi::Number>().Int32Value();
+    uintptr_t ws_ptr = info[10].As<Napi::Number>().Int64Value();
+    glm_bf16_mul_mat_id_grouped_mma_tm32_tn128(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                                     reinterpret_cast<void*>(out_ptr),
+                                                     reinterpret_cast<const void*>(in_ptr),
+                                                     reinterpret_cast<const void* const*>(wptrs_ptr),
+                                                     reinterpret_cast<const int*>(eids_ptr),
+                                                     top_k, count, N, K, num_experts,
+                                                     reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("bf16MulMatIdGroupedMmaTm32Tn128 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value Bf16MulMatIdGroupedMmaTm16Tn128(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weight_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t wptrs_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t eids_ptr = info[4].As<Napi::Number>().Int64Value();
+    int top_k = info[5].As<Napi::Number>().Int32Value();
+    int count = info[6].As<Napi::Number>().Int32Value();
+    int N = info[7].As<Napi::Number>().Int32Value();
+    int K = info[8].As<Napi::Number>().Int32Value();
+    int num_experts = info[9].As<Napi::Number>().Int32Value();
+    uintptr_t ws_ptr = info[10].As<Napi::Number>().Int64Value();
+    glm_bf16_mul_mat_id_grouped_mma_tm16_tn128(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                                     reinterpret_cast<void*>(out_ptr),
+                                                     reinterpret_cast<const void*>(in_ptr),
+                                                     reinterpret_cast<const void* const*>(wptrs_ptr),
+                                                     reinterpret_cast<const int*>(eids_ptr),
+                                                     top_k, count, N, K, num_experts,
+                                                     reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("bf16MulMatIdGroupedMmaTm16Tn128 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value IndexSelect(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -3392,6 +3590,12 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "mmaMoeWorkspaceSize"), Napi::Function::New(env, MmaMoeWorkspaceSize));
     exports.Set(Napi::String::New(env, "nvfp4MulMatIdGroupedMma"), Napi::Function::New(env, Nvfp4MulMatIdGroupedMma));
     exports.Set(Napi::String::New(env, "bf16MulMatIdGroupedMma"), Napi::Function::New(env, Bf16MulMatIdGroupedMma));
+    exports.Set(Napi::String::New(env, "nvfp4MulMatIdGroupedMmaTm64"), Napi::Function::New(env, Nvfp4MulMatIdGroupedMmaTm64));
+    exports.Set(Napi::String::New(env, "bf16MulMatIdGroupedMmaTm64"), Napi::Function::New(env, Bf16MulMatIdGroupedMmaTm64));
+    exports.Set(Napi::String::New(env, "nvfp4MulMatIdGroupedMmaTm32Tn128"), Napi::Function::New(env, Nvfp4MulMatIdGroupedMmaTm32Tn128));
+    exports.Set(Napi::String::New(env, "nvfp4MulMatIdGroupedMmaTm16Tn128"), Napi::Function::New(env, Nvfp4MulMatIdGroupedMmaTm16Tn128));
+    exports.Set(Napi::String::New(env, "bf16MulMatIdGroupedMmaTm32Tn128"), Napi::Function::New(env, Bf16MulMatIdGroupedMmaTm32Tn128));
+    exports.Set(Napi::String::New(env, "bf16MulMatIdGroupedMmaTm16Tn128"), Napi::Function::New(env, Bf16MulMatIdGroupedMmaTm16Tn128));
     exports.Set(Napi::String::New(env, "indexSelect"), Napi::Function::New(env, IndexSelect));
     exports.Set(Napi::String::New(env, "arange"), Napi::Function::New(env, Arange));
     exports.Set(Napi::String::New(env, "max"), Napi::Function::New(env, Max));

@@ -844,6 +844,69 @@ class GlmOps:
             ctypes.c_void_p,
         ]
 
+        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm64.restype = None
+        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm64.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
+        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm64.restype = None
+        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm64.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
+        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm32_tn128.restype = None
+        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm32_tn128.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
+        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm16_tn128.restype = None
+        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm16_tn128.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
+        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm32_tn128.restype = None
+        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm32_tn128.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
+        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm16_tn128.restype = None
+        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm16_tn128.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
 
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
@@ -1706,26 +1769,8 @@ class GlmOps:
             self._ptr(workspace)
         )
 
-    def mma_moe_debug(self, output, input_buf, weights, M, K, N):
-        self.lib.glm_mma_moe_debug(
-            self.ctx,
-            self._ptr(output),
-            self._ptr(input_buf),
-            self._ptr(weights),
-            M, K, N
-        )
-
-    def mma_moe_debug2(self, output, input_buf, weights_bf16, M, K, N):
-        self.lib.glm_mma_moe_debug2(
-            self.ctx,
-            self._ptr(output),
-            self._ptr(input_buf),
-            self._ptr(weights_bf16),
-            M, K, N
-        )
-
     def context_parallel_merge(self, partial_v_outs, partial_lses, num_shards,
-                               merged_v_out, merged_lse,
+                                merged_v_out, merged_lse,
                                batch_size, num_heads, v_head_dim):
         v_ptrs = (ctypes.c_void_p * num_shards)(*[ctypes.c_void_p(int(p)) for p in partial_v_outs])
         lse_ptrs = (ctypes.c_void_p * num_shards)(*[ctypes.c_void_p(int(p)) for p in partial_lses])

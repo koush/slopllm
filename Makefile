@@ -6,7 +6,7 @@ LIB_NAME = libglm_ops.so
 
 BUILD_DIR := build/Release
 
-SRCS_CU := csrc/glm_ops.cu csrc/glm_flash.cu csrc/glm_gemv.cu csrc/glm_gdn.cu csrc/glm_sampling.cu csrc/glm_p2p.cu csrc/glm_context_parallel.cu csrc/glm_grouped_moe.cu csrc/glm_mma_moe.cu
+SRCS_CU := csrc/glm_ops.cu csrc/glm_flash.cu csrc/glm_gemv.cu csrc/glm_gdn.cu csrc/glm_sampling.cu csrc/glm_p2p.cu csrc/glm_context_parallel.cu csrc/glm_grouped_moe.cu csrc/glm_mma_moe.cu csrc/glm_mma_moe_pc.cu
 SRCS_CPP := csrc/glm_nccl.cpp csrc/glm_device.cpp
 OBJS := $(SRCS_CU:csrc/%.cu=$(BUILD_DIR)/%.o) $(SRCS_CPP:csrc/%.cpp=$(BUILD_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)

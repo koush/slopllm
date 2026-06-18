@@ -855,12 +855,6 @@ void glm_nvfp4_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inp
                                         int count, int N, int K,
                                         int num_experts, void* workspace);
 
-void glm_mma_moe_debug(GlmCtx* ctx, float* output, const void* input,
-                        const void* weights, int M, int K, int N);
-
-void glm_mma_moe_debug2(GlmCtx* ctx, float* output, const void* input,
-                         const void* weights_bf16, int M, int K, int N);
-
 // Grouped BF16 MoE using Tensor Core MMA (SM120+)
 // Same interface as glm_mul_mat_id_grouped but uses Tensor Core MMA
 // for prefill (M > threshold) instead of scalar GEMV.
@@ -869,6 +863,64 @@ void glm_bf16_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inpu
                                        const int* expert_ids, int top_k,
                                        int count, int N, int K,
                                        int num_experts, void* workspace);
+
+// TM=64 variants of the above
+void glm_nvfp4_mul_mat_id_grouped_mma_tm64(GlmCtx* ctx, void* output, const void* input,
+                                               const void* const* weight_ptrs,
+                                               const void* const* scale_ptrs,
+                                               const void* const* scale2_ptrs,
+                                               const int* expert_ids, int top_k,
+                                               int count, int N, int K,
+                                               int num_experts, void* workspace);
+
+void glm_bf16_mul_mat_id_grouped_mma_tm64(GlmCtx* ctx, void* output, const void* input,
+                                              const void* const* weight_ptrs,
+                                              const int* expert_ids, int top_k,
+                                              int count, int N, int K,
+                                              int num_experts, void* workspace);
+
+// TN=128 variants
+void glm_nvfp4_mul_mat_id_grouped_mma_tm32_tn128(GlmCtx* ctx, void* output, const void* input,
+                                                      const void* const* weight_ptrs,
+                                                      const void* const* scale_ptrs,
+                                                      const void* const* scale2_ptrs,
+                                                      const int* expert_ids, int top_k,
+                                                      int count, int N, int K,
+                                                      int num_experts, void* workspace);
+
+void glm_nvfp4_mul_mat_id_grouped_mma_tm16_tn128(GlmCtx* ctx, void* output, const void* input,
+                                                      const void* const* weight_ptrs,
+                                                      const void* const* scale_ptrs,
+                                                      const void* const* scale2_ptrs,
+                                                      const int* expert_ids, int top_k,
+                                                      int count, int N, int K,
+                                                      int num_experts, void* workspace);
+
+void glm_bf16_mul_mat_id_grouped_mma_tm32_tn128(GlmCtx* ctx, void* output, const void* input,
+                                                     const void* const* weight_ptrs,
+                                                     const int* expert_ids, int top_k,
+                                                     int count, int N, int K,
+                                                     int num_experts, void* workspace);
+
+void glm_bf16_mul_mat_id_grouped_mma_tm16_tn128(GlmCtx* ctx, void* output, const void* input,
+                                                      const void* const* weight_ptrs,
+                                                      const int* expert_ids, int top_k,
+                                                      int count, int N, int K,
+                                                      int num_experts, void* workspace);
+
+// Producer/Consumer MMA MoE kernel (NVFP4 only, SM120+)
+// Same interface as glm_nvfp4_mul_mat_id_grouped_mma but uses
+// producer/consumer warp specialization for overlapping load+dequant with MMA.
+size_t glm_mma_moe_pc_workspace_size(int count, int N, int K, int num_experts);
+
+void glm_nvfp4_mul_mat_id_grouped_mma_pc(GlmCtx* ctx, void* output,
+                                          const void* input,
+                                          const void* const* weight_ptrs,
+                                          const void* const* scale_ptrs,
+                                          const void* const* scale2_ptrs,
+                                          const int* expert_ids, int top_k,
+                                          int count, int N, int K,
+                                          int num_experts, void* workspace);
 
 #ifdef __cplusplus
 }
