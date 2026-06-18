@@ -146,24 +146,30 @@ void mbar_wait(uint64_t* bar, uint32_t phase) {
         ;
 }
 
+__device__ __forceinline__
+bool mbar_test(uint64_t* bar, uint32_t phase) {
+    return !ptx::mbarrier_try_wait_parity(bar, phase);
+}
+
 template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int TK = 32>
 struct PcSmem {
     static constexpr int K_GROUPS_PER_STEP = TK / QUANT_GROUP;
-    uint64_t full[NumBuffers];
+    uint64_t full[CONSUMER_WARPS][NumBuffers];
     uint64_t empty[CONSUMER_WARPS][NumBuffers];
-    alignas(16) __nv_bfloat16 a_buf[NumBuffers][TM * TK];
+    static constexpr int NumABuffers = NumBuffers + 1;
+    alignas(16) __nv_bfloat16 a_buf[NumABuffers][TM * TK];
     alignas(16) uint8_t fp4_buf[NumBuffers][TN * (TK / 2)];
     alignas(16) __nv_fp8_e4m3 scale_batch[NumBuffers][TN * SCALE_BATCH];
-    int n_valid_buf[NumBuffers];
-    int ks_buf[NumBuffers];
-    float scale_2_buf[NumBuffers];
+    int n_valid_buf[NumABuffers];
+    int ks_buf[NumABuffers];
+    float scale_2_buf[NumABuffers];
     int finished;
     int tile_prefix[MaxExperts + 1];
-    int tile_expert_id[NumBuffers];
-    int tile_m_start[NumBuffers];
-    int tile_n_start[NumBuffers];
-    int tile_m_valid[NumBuffers];
-    int tile_n_valid[NumBuffers];
+    int tile_expert_id[NumABuffers];
+    int tile_m_start[NumABuffers];
+    int tile_n_start[NumABuffers];
+    int tile_m_valid[NumABuffers];
+    int tile_n_valid[NumABuffers];
     int num_k_groups;
 };
 
@@ -178,7 +184,7 @@ __device__ void producer(
     int num_experts,
     int N,
     int* __restrict__ tile_counter,
-    PcSmem<TM, TN, MaxExperts, NumBuffers>* smem)
+    PcSmem<TM, TN, MaxExperts, NumBuffers, TK>* smem)
 {
     int lane_id = threadIdx.x % 32;
 
@@ -237,20 +243,25 @@ __device__ void producer(
 
             for (int ks = 0; ks < k_steps_in_batch; ks++) {
                 int buf = stage % NumBuffers;
-
-#ifndef PRODUCER_ONLY
-                if (stage >= NumBuffers) {
-                    for (int cw = 0; cw < CONSUMER_WARPS; cw++) {
-                        mbar_wait(&smem->empty[cw][buf], empty_phase[cw][buf]);
-                        empty_phase[cw][buf] ^= 1;
-                    }
-                }
-#endif
+                int abuf = stage % smem->NumABuffers;
 
                 int k_group_idx = k_group_batch + ks * PcSmem<TM, TN, MaxExperts, NumBuffers, TK>::K_GROUPS_PER_STEP;
                 int k_start = k_group_idx * QUANT_GROUP;
-                __nv_bfloat16* sa = smem->a_buf[buf];
+                __nv_bfloat16* sa = smem->a_buf[abuf];
                 uint8_t* sfp4 = smem->fp4_buf[buf];
+
+#ifndef PRODUCER_ONLY
+                if (lane_id == 0) {
+                    smem->n_valid_buf[abuf] = n_valid;
+                    smem->ks_buf[abuf] = k_group_idx;
+                    smem->scale_2_buf[abuf] = scale_2_val;
+                    smem->tile_expert_id[abuf] = expert_id;
+                    smem->tile_m_start[abuf] = m_start;
+                    smem->tile_n_start[abuf] = n_start;
+                    smem->tile_m_valid[abuf] = m_valid;
+                    smem->tile_n_valid[abuf] = n_valid;
+                }
+#endif
 
 #ifndef SKIP_ACT_LOAD
                 for (int m = lane_id; m < TM; m += 32) {
@@ -274,10 +285,18 @@ __device__ void producer(
                 }
 #endif
 
+                int last_cw_arrived = 0;
+
                 constexpr int TOTAL_N_GROUPS = TN / 8;
                 constexpr int BASE_N_GROUPS = TOTAL_N_GROUPS / CONSUMER_WARPS;
                 constexpr int REM_N_GROUPS = TOTAL_N_GROUPS % CONSUMER_WARPS;
                 for (int cw = 0; cw < CONSUMER_WARPS; cw++) {
+#ifndef PRODUCER_ONLY
+                    if (stage >= NumBuffers) {
+                        mbar_wait(&smem->empty[cw][buf], empty_phase[cw][buf]);
+                        empty_phase[cw][buf] ^= 1;
+                    } 
+#endif
                     int cw_n_start = cw * BASE_N_GROUPS * 8 + (cw < REM_N_GROUPS ? cw * 8 : REM_N_GROUPS * 8);
                     int cw_n_count = (BASE_N_GROUPS + (cw < REM_N_GROUPS ? 1 : 0)) * 8;
                     int cw_n_valid = (cw_n_start < n_valid) ? min(cw_n_start + cw_n_count, n_valid) - cw_n_start : 0;
@@ -329,29 +348,28 @@ __device__ void producer(
                         }
                     }
 #endif
-                }
-
-                cp_async_commit();
-                cp_async_wait_all();
 
 #ifndef PRODUCER_ONLY
-                if (lane_id == 0) {
-                    smem->n_valid_buf[buf] = n_valid;
-                    smem->ks_buf[buf] = k_group_idx;
-                    smem->scale_2_buf[buf] = scale_2_val;
-                    smem->tile_expert_id[buf] = expert_id;
-                    smem->tile_m_start[buf] = m_start;
-                    smem->tile_n_start[buf] = n_start;
-                    smem->tile_m_valid[buf] = m_valid;
-                    smem->tile_n_valid[buf] = n_valid;
-                }
-
-                __syncwarp();
-                if (lane_id == 0) {
-                    ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
-                                         ptx::space_shared, &smem->full[buf], 1);
-                }
+                    // if (stage >= NumBuffers) {
+                        // on last consumer or if the next consumer is not ready, wait for all pending cp.async and signal all pending consumers
+                        if (cw == CONSUMER_WARPS - 1 || !mbar_test(&smem->empty[cw + 1][buf], empty_phase[cw + 1][buf])) {
+                            cp_async_commit();
+                            cp_async_wait_all();
+                            __syncwarp();
+                            if (lane_id == 0) {
+                                for (int cw_start = last_cw_arrived; cw_start <= cw; cw_start++) {
+                                    ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
+                                                        ptx::space_shared, &smem->full[cw_start][buf], 1);
+                                }
+                                last_cw_arrived = cw + 1;
+                            }
+                        }
+                    // }
+#else
+                    cp_async_commit();
+                    cp_async_wait_all();
 #endif
+                }
 
                 stage++;
             }
@@ -362,11 +380,14 @@ __device__ void producer(
     __syncwarp();
 #ifndef PRODUCER_ONLY
     if (stage == 0) {
+        for (int b = 0; b < smem->NumABuffers; b++)
+            smem->n_valid_buf[b] = 0;
         for (int b = 0; b < NumBuffers; b++) {
             if (lane_id == 0) {
-                smem->n_valid_buf[b] = 0;
-                ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
-                                     ptx::space_shared, &smem->full[b], 1);
+                for (int cw = 0; cw < CONSUMER_WARPS; cw++) {
+                    ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
+                                         ptx::space_shared, &smem->full[cw][b], 1);
+                }
             }
         }
     } else {
@@ -377,11 +398,14 @@ __device__ void producer(
             }
         }
         __syncwarp();
+        for (int b = 0; b < smem->NumABuffers; b++)
+            smem->n_valid_buf[b] = 0;
         for (int b = 0; b < NumBuffers; b++) {
             if (lane_id == 0) {
-                smem->n_valid_buf[b] = 0;
-                ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
-                                     ptx::space_shared, &smem->full[b], 1);
+                for (int cw = 0; cw < CONSUMER_WARPS; cw++) {
+                    ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
+                                         ptx::space_shared, &smem->full[cw][b], 1);
+                }
             }
         }
     }
@@ -390,7 +414,7 @@ __device__ void producer(
 
 template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int TK = 32, int ConsumerWarps = CONSUMER_WARPS>
 __device__ void consumer(
-    PcSmem<TM, TN, MaxExperts, NumBuffers>* smem,
+    PcSmem<TM, TN, MaxExperts, NumBuffers, TK>* smem,
     __nv_bfloat16* __restrict__ sorted_output,
     const int* __restrict__ expert_offsets,
     int N)
@@ -413,10 +437,11 @@ __device__ void consumer(
 
     for (;;) {
         int buf = stage % NumBuffers;
-        mbar_wait(&smem->full[buf], full_phase[buf]);
+        int abuf = stage % smem->NumABuffers;
+        mbar_wait(&smem->full[consumer_warp_id][buf], full_phase[buf]);
         full_phase[buf] ^= 1;
 
-        bool is_finished = smem->finished != 0 && smem->n_valid_buf[buf] == 0;
+        bool is_finished = smem->finished != 0 && smem->n_valid_buf[abuf] == 0;
         if (is_finished) {
             __syncwarp();
             if (lane_id == 0) {
@@ -427,16 +452,19 @@ __device__ void consumer(
         }
 
 #ifndef CONSUMER_NOOP
-        int n_valid = smem->n_valid_buf[buf];
-        int k_group_idx = smem->ks_buf[buf];
-        float scale_2_val = smem->scale_2_buf[buf];
+        int n_valid = smem->n_valid_buf[abuf];
+        int k_group_idx = smem->ks_buf[abuf];
+        float scale_2_val = smem->scale_2_buf[abuf];
+        uint16_t s2_u16;
+        asm volatile("cvt.rn.bf16.f32 %0, %1;" : "=h"(s2_u16) : "f"(scale_2_val));
+        uint32_t s2_pair = (uint32_t)s2_u16 | ((uint32_t)s2_u16 << 16);
         uint8_t* sfp4 = smem->fp4_buf[buf];
-        __nv_bfloat16* sa = smem->a_buf[buf];
+        __nv_bfloat16* sa = smem->a_buf[abuf];
 
-        int expert_id = smem->tile_expert_id[buf];
-        int m_start = smem->tile_m_start[buf];
-        int n_start_tile = smem->tile_n_start[buf];
-        int m_valid = smem->tile_m_valid[buf];
+        int expert_id = smem->tile_expert_id[abuf];
+        int m_start = smem->tile_m_start[abuf];
+        int n_start_tile = smem->tile_n_start[abuf];
+        int m_valid = smem->tile_m_valid[abuf];
         constexpr int KGPS = PcSmem<TM, TN, MaxExperts, NumBuffers, TK>::K_GROUPS_PER_STEP;
         bool is_tile_done = (k_group_idx + KGPS >= smem->num_k_groups);
 
@@ -444,142 +472,120 @@ __device__ void consumer(
         uint32_t sfa_packed = (uint32_t)UE4M3_ONE | ((uint32_t)UE4M3_ONE << 8)
                             | ((uint32_t)UE4M3_ONE << 16) | ((uint32_t)UE4M3_ONE << 24);
 
+        int sfb_shift = (k_group_idx & 3) * 8;
+        int sfb_base_off = (k_group_idx % SCALE_BATCH) & ~3;
+
+        int src_lo_lane = 4 * (2 * t0)     + t1 / 2;
+        int src_hi_lane = 4 * (2 * t0 + 1) + t1 / 2;
+        int sel = (t1 & 1) * 16;
+
+        int ldm_row = lane_id & 7;
+        int ldm_tile_row = (lane_id >> 3) & 1;
+        int ldm_tile_col = ((lane_id >> 4) << 3) >> 3;
+        int ldm_base = (ldm_tile_col * 2 + ldm_tile_row) * 64 + ldm_row * 8;
+
         for (int n_group = 0; n_group < my_n_groups; n_group++) {
             int n_start_local = my_n_start + n_group * 8;
             if (n_start_local >= n_valid) break;
 
             int n_col = n_start_local + t1;
+
             uint32_t sfb_packed = 0;
+            uint32_t regB_0 = 0, regB_1 = 0;
             if (n_col < n_valid) {
-                if constexpr (KGPS % 4 == 0) {
-                    // k_group_idx is always a multiple of KGPS here, so this offset
-                    // is guaranteed 4-byte aligned -- safe to do one aligned word load
-                    // instead of 4 separate byte loads.
-                    const uint32_t* sb32 = reinterpret_cast<const uint32_t*>(
-                        reinterpret_cast<const uint8_t*>(&smem->scale_batch[buf][0])
-                        + n_col * SCALE_BATCH + (k_group_idx % SCALE_BATCH));
-                    sfb_packed = *sb32;
-                } else {
-                    // KGPS doesn't divide 4 evenly (e.g. TK=32 -> KGPS=2), so the
-                    // offset isn't guaranteed 4-byte aligned -- fall back to safe
-                    // byte-wise loads.
-                    uint8_t s0 = reinterpret_cast<const uint8_t&>(smem->scale_batch[buf][n_col * SCALE_BATCH + ((k_group_idx + 0) % SCALE_BATCH)]);
-                    uint8_t s1 = reinterpret_cast<const uint8_t&>(smem->scale_batch[buf][n_col * SCALE_BATCH + ((k_group_idx + 1) % SCALE_BATCH)]);
-                    uint8_t s2 = reinterpret_cast<const uint8_t&>(smem->scale_batch[buf][n_col * SCALE_BATCH + ((k_group_idx + 2) % SCALE_BATCH)]);
-                    uint8_t s3 = reinterpret_cast<const uint8_t&>(smem->scale_batch[buf][n_col * SCALE_BATCH + ((k_group_idx + 3) % SCALE_BATCH)]);
-                    sfb_packed = (uint32_t)s0 | ((uint32_t)s1 << 8) | ((uint32_t)s2 << 16) | ((uint32_t)s3 << 24);
+                int base = n_col * SCALE_BATCH + sfb_base_off;
+                uint32_t raw = *reinterpret_cast<const uint32_t*>(
+                    reinterpret_cast<const uint8_t*>(&smem->scale_batch[buf][0]) + base);
+                sfb_packed = raw >> sfb_shift;
+
+                const uint8_t* fp4_row = sfp4 + n_col * (TK / 2);
+                regB_0 = *reinterpret_cast<const uint32_t*>(fp4_row + 4 * t0);
+                if constexpr (TK > 32) {
+                    regB_1 = *reinterpret_cast<const uint32_t*>(fp4_row + 4 * t0 + 16);
                 }
             }
 
-            uint32_t regB[2] = {0, 0};
-            for (int v1 = 0; v1 < 2; v1++)
-                for (int v0 = 0; v0 < 8; v0++) {
-                    int n = n_start_local + t1;
-                    int k = 8 * t0 + v0 + 32 * v1;
-                    uint8_t nibble = 0;
-                    if (n < n_valid && k < TK) {
-                        int k_packed = k / 2;
-                        uint8_t byte_val = sfp4[n * (TK / 2) + k_packed];
-                        nibble = (k % 2 == 0) ? (byte_val & 0xF) : (byte_val >> 4);
+            for (int sub_ks = 0; sub_ks < KGPS; sub_ks++) {
+                int shift = sub_ks * QUANT_GROUP;
+
+                uint32_t regA[4] = {0, 0, 0, 0};
+                for (int reg = 0; reg < 4; reg++) {
+                    int v1 = reg % 2, v2 = reg / 2;
+                    int m = t1 + 8 * v1;
+                    for (int v0 = 0; v0 < 8; v0++) {
+                        int k = 8 * t0 + v0 + 32 * v2;
+                        if (k == m + shift) regA[reg] |= (uint32_t)0x2 << (4 * v0);
                     }
-                    regB[v1] |= (uint32_t)nibble << (4 * v0);
                 }
 
-        for (int sub_ks = 0; sub_ks < KGPS; sub_ks++) {
-            int shift = sub_ks * QUANT_GROUP;
-
-            uint32_t regA[4] = {0, 0, 0, 0};
-            for (int reg = 0; reg < 4; reg++) {
-                int v1 = reg % 2, v2 = reg / 2;
-                int m = t1 + 8 * v1;
-                for (int v0 = 0; v0 < 8; v0++) {
-                    int k = 8 * t0 + v0 + 32 * v2;
-                    if (k == m + shift) regA[reg] |= (uint32_t)0x2 << (4 * v0);
-                }
-            }
-
-            float frag_d[4];
-            asm volatile(
-                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X"
-                ".m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-                "{%0,  %1,  %2,  %3},"
-                "{%4,  %5,  %6,  %7},"
-                "{%8,  %9},"
-                "{%10, %11, %12, %13},"
-                "{%14},"
-                "{%15, %16},"
-                "{%17},"
-                "{%18, %19};\n"
-                : "=f"(frag_d[0]), "=f"(frag_d[1]), "=f"(frag_d[2]), "=f"(frag_d[3])
-                : "r"(regA[0]), "r"(regA[1]), "r"(regA[2]), "r"(regA[3]),
-                  "r"(regB[0]), "r"(regB[1]),
-                  "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f),
-                  "r"(sfa_packed), "h"((uint16_t)0), "h"((uint16_t)0),
-                  "r"(sfb_packed), "h"((uint16_t)0), "h"((uint16_t)0)
-            );
-
-            frag_d[0] *= scale_2_val;
-            frag_d[1] *= scale_2_val;
-            frag_d[2] *= scale_2_val;
-            frag_d[3] *= scale_2_val;
-
-            uint32_t pack_01, pack_23;
-            asm volatile("{ .reg .b16 lo, hi; "
-                "cvt.rn.bf16.f32 lo, %2; cvt.rn.bf16.f32 hi, %3; mov.b32 %0, {lo, hi}; }"
-                : "=r"(pack_01) : "r"(0), "f"(frag_d[0]), "f"(frag_d[1]));
-            asm volatile("{ .reg .b16 lo, hi; "
-                "cvt.rn.bf16.f32 lo, %2; cvt.rn.bf16.f32 hi, %3; mov.b32 %0, {lo, hi}; }"
-                : "=r"(pack_23) : "r"(0), "f"(frag_d[2]), "f"(frag_d[3]));
-
-        int src_lo_lane = 4 * (2 * t0)     + t1 / 2;
-        int src_hi_lane = 4 * (2 * t0 + 1) + t1 / 2;
-
-        uint32_t p01_lo = __shfl_sync(0xFFFFFFFF, pack_01, src_lo_lane);
-        uint32_t p23_lo = __shfl_sync(0xFFFFFFFF, pack_23, src_lo_lane);
-        uint32_t p01_hi = __shfl_sync(0xFFFFFFFF, pack_01, src_hi_lane);
-        uint32_t p23_hi = __shfl_sync(0xFFFFFFFF, pack_23, src_hi_lane);
-
-        int sel = (t1 & 1) * 16;
-        uint32_t b_reg_0 = (((p01_hi >> sel) & 0xFFFF) << 16) | ((p01_lo >> sel) & 0xFFFF);
-        uint32_t b_reg_1 = (((p23_hi >> sel) & 0xFFFF) << 16) | ((p23_lo >> sel) & 0xFFFF);
-
-        for (int m_tile = 0; m_tile < TM; m_tile += 16) {
-            uint32_t a_reg[4];
-            {
-                int block_row = m_tile / 16;
-                int block_col = sub_ks;
-                int row = lane_id & 7;
-                int mat = (lane_id >> 3) & 1;
-                int col_offset = (lane_id >> 4) << 3;
-                int tile_row = mat;
-                int tile_col = col_offset >> 3;
-                int addr_offset = (block_row * (TK / 16) + block_col) * 256
-                                + (tile_col * 2 + tile_row) * 64 + row * 8;
-                uint32_t smem_ptr = __cvta_generic_to_shared(sa + addr_offset);
+                float frag_d[4];
                 asm volatile(
-                    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
-                    "{%0, %1, %2, %3}, [%4];\n"
-                    : "=r"(a_reg[0]), "=r"(a_reg[1]), "=r"(a_reg[2]), "=r"(a_reg[3])
-                    : "r"(smem_ptr));
-            }
+                    "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X"
+                    ".m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                    "{%0,  %1,  %2,  %3},"
+                    "{%4,  %5,  %6,  %7},"
+                    "{%8,  %9},"
+                    "{%10, %11, %12, %13},"
+                    "{%14},"
+                    "{%15, %16},"
+                    "{%17},"
+                    "{%18, %19};\n"
+                    : "=f"(frag_d[0]), "=f"(frag_d[1]), "=f"(frag_d[2]), "=f"(frag_d[3])
+                    : "r"(regA[0]), "r"(regA[1]), "r"(regA[2]), "r"(regA[3]),
+                    "r"(regB_0), "r"(regB_1),
+                    "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f),
+                    "r"(sfa_packed), "h"((uint16_t)0), "h"((uint16_t)0),
+                    "r"(sfb_packed), "h"((uint16_t)0), "h"((uint16_t)0)
+                );
 
-            int acc_base = (m_tile / 16) * ACC_STRIDE + n_group * 4;
-            asm volatile(
-                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                "{%0,  %1,  %2,  %3},"
-                "{%4,  %5,  %6,  %7},"
-                "{%8,  %9},"
-                "{%10, %11, %12, %13};\n"
-                : "=f"(frag_c_accum[acc_base+0]), "=f"(frag_c_accum[acc_base+1]),
-                  "=f"(frag_c_accum[acc_base+2]), "=f"(frag_c_accum[acc_base+3])
-                : "r"(a_reg[0]), "r"(a_reg[1]), "r"(a_reg[2]), "r"(a_reg[3]),
-                  "r"(b_reg_0), "r"(b_reg_1),
-                  "f"(frag_c_accum[acc_base+0]), "f"(frag_c_accum[acc_base+1]),
-                  "f"(frag_c_accum[acc_base+2]), "f"(frag_c_accum[acc_base+3])
-            );
-        }
+                uint32_t pack_01, pack_23;
+                asm volatile("{ .reg .b16 lo, hi; "
+                    "cvt.rn.bf16.f32 lo, %2; cvt.rn.bf16.f32 hi, %3; mov.b32 %0, {lo, hi}; }"
+                    : "=r"(pack_01) : "r"(0), "f"(frag_d[0]), "f"(frag_d[1]));
+                asm volatile("{ .reg .b16 lo, hi; "
+                    "cvt.rn.bf16.f32 lo, %2; cvt.rn.bf16.f32 hi, %3; mov.b32 %0, {lo, hi}; }"
+                    : "=r"(pack_23) : "r"(0), "f"(frag_d[2]), "f"(frag_d[3]));
 
-        } // end sub_ks loop
+                uint32_t p01_lo = __shfl_sync(0xFFFFFFFF, pack_01, src_lo_lane);
+                uint32_t p23_lo = __shfl_sync(0xFFFFFFFF, pack_23, src_lo_lane);
+                uint32_t p01_hi = __shfl_sync(0xFFFFFFFF, pack_01, src_hi_lane);
+                uint32_t p23_hi = __shfl_sync(0xFFFFFFFF, pack_23, src_hi_lane);
+
+                uint32_t b_reg_0 = (((p01_hi >> sel) & 0xFFFF) << 16) | ((p01_lo >> sel) & 0xFFFF);
+                uint32_t b_reg_1 = (((p23_hi >> sel) & 0xFFFF) << 16) | ((p23_lo >> sel) & 0xFFFF);
+
+                asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_0) : "r"(b_reg_0), "r"(s2_pair));
+                asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
+
+                for (int m_tile = 0; m_tile < TM; m_tile += 16) {
+                    uint32_t a_reg[4];
+                    {
+                        int addr_offset = (m_tile / 16 * (TK / 16) + sub_ks) * 256 + ldm_base;
+                        uint32_t smem_ptr = __cvta_generic_to_shared(sa + addr_offset);
+                        asm volatile(
+                            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                            "{%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(a_reg[0]), "=r"(a_reg[1]), "=r"(a_reg[2]), "=r"(a_reg[3])
+                            : "r"(smem_ptr));
+                    }
+
+                    int acc_base = (m_tile / 16) * ACC_STRIDE + n_group * 4;
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0,  %1,  %2,  %3},"
+                        "{%4,  %5,  %6,  %7},"
+                        "{%8,  %9},"
+                        "{%10, %11, %12, %13};\n"
+                        : "=f"(frag_c_accum[acc_base+0]), "=f"(frag_c_accum[acc_base+1]),
+                        "=f"(frag_c_accum[acc_base+2]), "=f"(frag_c_accum[acc_base+3])
+                        : "r"(a_reg[0]), "r"(a_reg[1]), "r"(a_reg[2]), "r"(a_reg[3]),
+                        "r"(b_reg_0), "r"(b_reg_1),
+                        "f"(frag_c_accum[acc_base+0]), "f"(frag_c_accum[acc_base+1]),
+                        "f"(frag_c_accum[acc_base+2]), "f"(frag_c_accum[acc_base+3])
+                    );
+                }
+
+            } // end sub_ks loop
 
         } // end n_group loop
 #endif // CONSUMER_NOOP
@@ -629,8 +635,8 @@ __device__ void consumer(
 
 template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int TK = 32>
 constexpr size_t pc_smem_size() {
-    constexpr size_t alignment = alignof(PcSmem<TM, TN, MaxExperts, NumBuffers>);
-    return sizeof(PcSmem<TM, TN, MaxExperts, NumBuffers>) + alignment - 1;
+    constexpr size_t alignment = alignof(PcSmem<TM, TN, MaxExperts, NumBuffers, TK>);
+    return sizeof(PcSmem<TM, TN, MaxExperts, NumBuffers, TK>) + alignment - 1;
 }
 
 template <int TM, int TN, int MaxExperts, int NumBuffers = 2, int TK = 32>
@@ -647,13 +653,13 @@ grouped_mma_pc_kernel(
     int N,
     int* __restrict__ tile_counter)
 {
-    extern __shared__ __align__(alignof(PcSmem<TM, TN, MaxExperts, NumBuffers>)) uint8_t smem_buf[];
-    auto* smem = reinterpret_cast<PcSmem<TM, TN, MaxExperts, NumBuffers>*>(smem_buf);
+    extern __shared__ __align__(alignof(PcSmem<TM, TN, MaxExperts, NumBuffers, TK>)) uint8_t smem_buf[];
+    auto* smem = reinterpret_cast<PcSmem<TM, TN, MaxExperts, NumBuffers, TK>*>(smem_buf);
 
     if (threadIdx.x == 0) {
         for (int s = 0; s < NumBuffers; s++) {
-            ptx::mbarrier_init(&smem->full[s], 1);
             for (int cw = 0; cw < CONSUMER_WARPS; cw++) {
+                ptx::mbarrier_init(&smem->full[cw][s], 1);
                 ptx::mbarrier_init(&smem->empty[cw][s], 1);
             }
         }
@@ -665,13 +671,13 @@ grouped_mma_pc_kernel(
     int warp_id = threadIdx.x / 32;
 
     if (warp_id == 0) {
-        producer<TM, TN, MaxExperts, NumBuffers>(
+        producer<TM, TN, MaxExperts, NumBuffers, TK>(
             sorted_input, K, weight_ptrs, scale_ptrs, scale2_ptrs,
             expert_offsets, num_experts, N, tile_counter,
             smem);
     } else if (warp_id >= 1 && warp_id <= CONSUMER_WARPS) {
 #ifndef PRODUCER_ONLY
-        consumer<TM, TN, MaxExperts, NumBuffers>(smem, sorted_output, expert_offsets, N);
+        consumer<TM, TN, MaxExperts, NumBuffers, TK>(smem, sorted_output, expert_offsets, N);
 #endif
     }
 }
