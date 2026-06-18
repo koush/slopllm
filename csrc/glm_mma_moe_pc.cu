@@ -151,14 +151,13 @@ void mbar_wait(uint64_t* bar, uint32_t phase) {
 template <int TM, int TN, int MaxExperts, int NumBuffers = 2>
 struct PcSmem {
     uint64_t full[NumBuffers];
-    uint64_t empty[NumBuffers];
+    uint64_t empty[CONSUMER_WARPS][NumBuffers];
     alignas(16) __nv_bfloat16 a_buf[NumBuffers][TM * TK];
     alignas(8) uint8_t fp4_buf[NumBuffers][TN * (TK / 2)];
     alignas(16) __nv_fp8_e4m3 scale_batch[NumBuffers][TN * SCALE_BATCH];
     int n_valid_buf[NumBuffers];
     int ks_buf[NumBuffers];
     float scale_2_buf[NumBuffers];
-    int consumer_count[NumBuffers];
     int finished;
     int tile_prefix[MaxExperts + 1];
     int tile_expert_id[NumBuffers];
@@ -199,7 +198,7 @@ __device__ void producer(
     __syncwarp();
 
     int total_tiles = smem->tile_prefix[num_experts];
-    uint32_t empty_phase[NumBuffers] = {};
+    uint32_t empty_phase[CONSUMER_WARPS][NumBuffers] = {};
     int stage = 0;
 
     for (;;) {
@@ -242,8 +241,10 @@ __device__ void producer(
 
 #ifndef PRODUCER_ONLY
                 if (stage >= NumBuffers) {
-                    mbar_wait(&smem->empty[buf], empty_phase[buf]);
-                    empty_phase[buf] ^= 1;
+                    for (int cw = 0; cw < CONSUMER_WARPS; cw++) {
+                        mbar_wait(&smem->empty[cw][buf], empty_phase[cw][buf]);
+                        empty_phase[cw][buf] ^= 1;
+                    }
                 }
 #endif
 
@@ -251,37 +252,6 @@ __device__ void producer(
                 int k_start = k_group_idx * QUANT_GROUP;
                 __nv_bfloat16* sa = smem->a_buf[buf];
                 uint8_t* sfp4 = smem->fp4_buf[buf];
-
-#ifndef SKIP_SCALE_LOAD
-                if (ks < NumBuffers) {
-                    int batch_16b = batch_size / 16;
-                    int total_16b = n_valid * batch_16b;
-                    for (int i = lane_id; i < total_16b; i += 32) {
-                        int n = i / batch_16b;
-                        int b = (i % batch_16b) * 16;
-                        int global_n = n_start + n;
-                        if (global_n < N) {
-                            const __nv_fp8_e4m3* gmem_scale = scale_base + (size_t)global_n * num_k_groups + k_group_batch;
-                            cp_async_ca_16(reinterpret_cast<uint4*>(smem->scale_batch[buf] + n * SCALE_BATCH + b),
-                                            reinterpret_cast<const uint4*>(gmem_scale + b),
-                                            1);
-                        }
-                    }
-                    int remainder = batch_size % 16;
-                    if (remainder > 0) {
-                        int b = batch_16b * 16;
-                        for (int n = lane_id; n < n_valid; n += 32) {
-                            int global_n = n_start + n;
-                            if (global_n < N && remainder >= 8) {
-                                const __nv_fp8_e4m3* gmem_scale = scale_base + (size_t)global_n * num_k_groups + k_group_batch;
-                                cp_async_ca_8(reinterpret_cast<uint2*>(smem->scale_batch[buf] + n * SCALE_BATCH + b),
-                                                reinterpret_cast<const uint2*>(gmem_scale + b),
-                                                1);
-                            }
-                        }
-                    }
-                }
-#endif
 
 #ifndef SKIP_ACT_LOAD
                 for (int m = lane_id; m < TM; m += 32) {
@@ -304,17 +274,58 @@ __device__ void producer(
                     }
                 }
 #endif
+
+                constexpr int TOTAL_N_GROUPS = TN / 8;
+                constexpr int BASE_N_GROUPS = TOTAL_N_GROUPS / CONSUMER_WARPS;
+                constexpr int REM_N_GROUPS = TOTAL_N_GROUPS % CONSUMER_WARPS;
+                for (int cw = 0; cw < CONSUMER_WARPS; cw++) {
+                    int cw_n_start = cw * BASE_N_GROUPS * 8 + (cw < REM_N_GROUPS ? cw * 8 : REM_N_GROUPS * 8);
+                    int cw_n_count = (BASE_N_GROUPS + (cw < REM_N_GROUPS ? 1 : 0)) * 8;
+                    int cw_n_valid = (cw_n_start < n_valid) ? min(cw_n_start + cw_n_count, n_valid) - cw_n_start : 0;
+
 #ifndef SKIP_FP4_LOAD
-                for (int n = lane_id; n < n_valid; n += 32) {
-                    int global_n = n_start + n;
-                    if (global_n < N) {
-                        const void* gmem_ptr = weight_base_fp4 + (size_t)global_n * (K / 2) + k_start / 2;
-                        cp_async_ca_16(reinterpret_cast<uint4*>(sfp4 + n * (TK / 2)),
-                                       reinterpret_cast<const uint4*>(gmem_ptr),
-                                       1);
+                    for (int n = cw_n_start + lane_id; n < cw_n_start + cw_n_valid; n += 32) {
+                        int global_n = n_start + n;
+                        if (global_n < N) {
+                            const void* gmem_ptr = weight_base_fp4 + (size_t)global_n * (K / 2) + k_start / 2;
+                            cp_async_ca_16(reinterpret_cast<uint4*>(sfp4 + n * (TK / 2)),
+                                           reinterpret_cast<const uint4*>(gmem_ptr),
+                                           1);
+                        }
                     }
-                }
 #endif
+
+#ifndef SKIP_SCALE_LOAD
+                    if (ks < NumBuffers) {
+                        int batch_16b = batch_size / 16;
+                        int total_16b = cw_n_valid * batch_16b;
+                        for (int i = lane_id; i < total_16b; i += 32) {
+                            int n = cw_n_start + i / batch_16b;
+                            int b = (i % batch_16b) * 16;
+                            int global_n = n_start + n;
+                            if (global_n < N) {
+                                const __nv_fp8_e4m3* gmem_scale = scale_base + (size_t)global_n * num_k_groups + k_group_batch;
+                                cp_async_ca_16(reinterpret_cast<uint4*>(smem->scale_batch[buf] + n * SCALE_BATCH + b),
+                                                reinterpret_cast<const uint4*>(gmem_scale + b),
+                                                1);
+                            }
+                        }
+                        int remainder = batch_size % 16;
+                        if (remainder > 0) {
+                            int b = batch_16b * 16;
+                            for (int n = cw_n_start + lane_id; n < cw_n_start + cw_n_valid; n += 32) {
+                                int global_n = n_start + n;
+                                if (global_n < N && remainder >= 8) {
+                                    const __nv_fp8_e4m3* gmem_scale = scale_base + (size_t)global_n * num_k_groups + k_group_batch;
+                                    cp_async_ca_8(reinterpret_cast<uint2*>(smem->scale_batch[buf] + n * SCALE_BATCH + b),
+                                                    reinterpret_cast<const uint2*>(gmem_scale + b),
+                                                    1);
+                                }
+                            }
+                        }
+                    }
+#endif
+                }
 
                 cp_async_commit();
                 cp_async_wait_all();
@@ -356,8 +367,10 @@ __device__ void producer(
         }
     } else {
         for (int b = 0; b < NumBuffers; b++) {
-            mbar_wait(&smem->empty[b], empty_phase[b]);
-            empty_phase[b] ^= 1;
+            for (int cw = 0; cw < CONSUMER_WARPS; cw++) {
+                mbar_wait(&smem->empty[cw][b], empty_phase[cw][b]);
+                empty_phase[cw][b] ^= 1;
+            }
         }
         __syncwarp();
         for (int b = 0; b < NumBuffers; b++) {
@@ -403,12 +416,8 @@ __device__ void consumer(
         if (is_finished) {
             __syncwarp();
             if (lane_id == 0) {
-                int prev = atomicAdd(&smem->consumer_count[buf], 1);
-                if (prev == ConsumerWarps - 1) {
-                    smem->consumer_count[buf] = 0;
-                    ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
-                                         ptx::space_shared, &smem->empty[buf], 1);
-                }
+                ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
+                                     ptx::space_shared, &smem->empty[consumer_warp_id][buf], 1);
             }
             break;
         }
@@ -551,12 +560,8 @@ __device__ void consumer(
 
         __syncwarp();
         if (lane_id == 0) {
-            int prev = atomicAdd(&smem->consumer_count[buf], 1);
-            if (prev == ConsumerWarps - 1) {
-                smem->consumer_count[buf] = 0;
-                ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
-                                     ptx::space_shared, &smem->empty[buf], 1);
-            }
+            ptx::mbarrier_arrive(ptx::sem_release, ptx::scope_cta,
+                                 ptx::space_shared, &smem->empty[consumer_warp_id][buf], 1);
         }
 
 #ifndef CONSUMER_NOOP
@@ -622,8 +627,9 @@ grouped_mma_pc_kernel(
     if (threadIdx.x == 0) {
         for (int s = 0; s < NumBuffers; s++) {
             ptx::mbarrier_init(&smem->full[s], 1);
-            ptx::mbarrier_init(&smem->empty[s], 1);
-            smem->consumer_count[s] = 0;
+            for (int cw = 0; cw < CONSUMER_WARPS; cw++) {
+                ptx::mbarrier_init(&smem->empty[cw][s], 1);
+            }
         }
         smem->finished = 0;
         smem->num_k_groups = K / QUANT_GROUP;
