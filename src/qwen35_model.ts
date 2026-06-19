@@ -257,7 +257,7 @@ export class Qwen35Model extends ChatModel {
   }
 
   private mlp(normed: Tensor, pfx: string, BS: number): Tensor {
-    return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
+    return this.swiGluMlp(normed, `${pfx}.mlp`, this.cfg.intermediateSize, BS);
   }
 
   private gdnLayerPrefill(ws: ExecutionWorkspace, normed: Tensor, residual: Tensor, layerIdx: number, S: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {

@@ -100,7 +100,7 @@ export class Qwen3Model extends ChatModel {
   }
 
   private mlp(normed: Tensor, BS: number, pfx: string): Tensor {
-    return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
+    return this.swiGluMlp(normed, `${pfx}.mlp`, this.cfg.intermediateSize, BS);
   }
 
   forwardModel(state: ExecutionState): Tensor {

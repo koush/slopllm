@@ -313,7 +313,7 @@ export class Glm51Model extends ChatModel {
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
-    return this.swiGluMlp(normed, pfx, this.cfg.intermediateSize, BS);
+    return this.swiGluMlp(normed, `${pfx}.mlp`, this.cfg.intermediateSize, BS);
   }
 
   private getExpertWeights(pfx: string, proj: string): Tensor[] {
@@ -338,12 +338,7 @@ export class Glm51Model extends ChatModel {
 
     // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
     using sharedDownBufStream = this.glm.withStream(() => {
-      using sharedGateBufStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.gate_proj.weight`)!, BS));
-      using sharedUpBuf = normed.linear(this.tensors.get(`${pfx}.mlp.shared_experts.up_proj.weight`)!, BS);
-      sharedGateBufStream.streamWaitEvent();
-      using sharedGateBuf = sharedGateBufStream.result;
-      using sharedSiluBuf = sharedGateBuf.siluAndMul(sharedUpBuf, moeIntermediate, BS);
-      return sharedSiluBuf.linear(this.tensors.get(`${pfx}.mlp.shared_experts.down_proj.weight`)!, BS);
+      return this.swiGluMlp(normed, `${pfx}.mlp.shared_experts`, moeIntermediate, BS);
     });
 
     using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!, BS);
