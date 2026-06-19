@@ -306,12 +306,19 @@ __device__ void producer(
                         int global_n = n_start + n;
                         if (global_n < N) {
                             const void* gmem_ptr = weight_base_fp4 + (size_t)global_n * (K / 2) + k_start / 2;
-                            cp_async_ca_16(reinterpret_cast<uint4*>(sfp4 + n * (TK / 2)),
-                                           reinterpret_cast<const uint4*>(gmem_ptr),
-                                           1);
                             if constexpr (TK == 64) {
-                                cp_async_ca_16(reinterpret_cast<uint4*>(sfp4 + n * (TK / 2) + 16),
+                                // Same swizzle as the consumer's regB_0/regB_1 read: swap
+                                // which 16-byte half of the row each chunk lands in.
+                                int swiz16 = ((n >> 2) & 1) * 16;
+                                cp_async_ca_16(reinterpret_cast<uint4*>(sfp4 + n * (TK / 2) + (0 ^ swiz16)),
+                                               reinterpret_cast<const uint4*>(gmem_ptr),
+                                               1);
+                                cp_async_ca_16(reinterpret_cast<uint4*>(sfp4 + n * (TK / 2) + (16 ^ swiz16)),
                                                reinterpret_cast<const uint4*>(gmem_ptr + 16),
+                                               1);
+                            } else {
+                                cp_async_ca_16(reinterpret_cast<uint4*>(sfp4 + n * (TK / 2)),
+                                               reinterpret_cast<const uint4*>(gmem_ptr),
                                                1);
                             }
                         }
@@ -328,7 +335,9 @@ __device__ void producer(
                             int global_n = n_start + n;
                             if (global_n < N) {
                                 const __nv_fp8_e4m3* gmem_scale = scale_base + (size_t)global_n * num_k_groups + k_group_batch;
-                                cp_async_ca_16(reinterpret_cast<uint4*>(smem->scale_batch[buf] + n * SCALE_BATCH + b),
+                                // Same swizzle as the consumer's sfb_packed read.
+                                int swiz16 = ((n >> 2) & 1) * 16;
+                                cp_async_ca_16(reinterpret_cast<uint4*>(smem->scale_batch[buf] + n * SCALE_BATCH + (b ^ swiz16)),
                                                 reinterpret_cast<const uint4*>(gmem_scale + b),
                                                 1);
                             }
@@ -340,7 +349,8 @@ __device__ void producer(
                                 int global_n = n_start + n;
                                 if (global_n < N && remainder >= 8) {
                                     const __nv_fp8_e4m3* gmem_scale = scale_base + (size_t)global_n * num_k_groups + k_group_batch;
-                                    cp_async_ca_8(reinterpret_cast<uint2*>(smem->scale_batch[buf] + n * SCALE_BATCH + b),
+                                    int swiz16 = ((n >> 2) & 1) * 16;
+                                    cp_async_ca_8(reinterpret_cast<uint2*>(smem->scale_batch[buf] + n * SCALE_BATCH + (b ^ swiz16)),
                                                     reinterpret_cast<const uint2*>(gmem_scale + b),
                                                     1);
                                 }
@@ -456,7 +466,7 @@ __device__ void consumer(
         int k_group_idx = smem->ks_buf[abuf];
         float scale_2_val = smem->scale_2_buf[abuf];
         uint16_t s2_u16;
-        asm volatile("cvt.rn.bf16.f32 %0, %1;" : "=h"(s2_u16) : "f"(scale_2_val));
+        asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(s2_u16) : "f"(scale_2_val));
         uint32_t s2_pair = (uint32_t)s2_u16 | ((uint32_t)s2_u16 << 16);
         uint8_t* sfp4 = smem->fp4_buf[buf];
         __nv_bfloat16* sa = smem->a_buf[abuf];
@@ -475,10 +485,6 @@ __device__ void consumer(
         int sfb_shift = (k_group_idx & 3) * 8;
         int sfb_base_off = (k_group_idx % SCALE_BATCH) & ~3;
 
-        int src_lo_lane = 4 * (2 * t0)     + t1 / 2;
-        int src_hi_lane = 4 * (2 * t0 + 1) + t1 / 2;
-        int sel = (t1 & 1) * 16;
-
         int ldm_row = lane_id & 7;
         int ldm_tile_row = (lane_id >> 3) & 1;
         int ldm_tile_col = ((lane_id >> 4) << 3) >> 3;
@@ -489,19 +495,31 @@ __device__ void consumer(
             if (n_start_local >= n_valid) break;
 
             int n_col = n_start_local + t1;
+            // Bank-conflict swizzle: each row of fp4_buf (when TK==64) and of
+            // scale_batch is 32 bytes (8 words), which divides 32 banks with
+            // period 4 -- n_col and n_col+4 alias the same banks at different
+            // addresses. XORing the within-row offset's bit 4 (value 16) by
+            // bit 2 of n_col relocates alternate n_col's data into the other
+            // half of the row, which spreads all 8 n_col's across all 32
+            // banks with no aliasing. Producer writes (below) apply the exact
+            // same XOR to the destination offset, so the data lands wherever
+            // this read expects it.
+            int swiz16 = ((n_col >> 2) & 1) * 16;
 
             uint32_t sfb_packed = 0;
             uint32_t regB_0 = 0, regB_1 = 0;
             if (n_col < n_valid) {
-                int base = n_col * SCALE_BATCH + sfb_base_off;
+                int base = n_col * SCALE_BATCH + (sfb_base_off ^ swiz16);
                 uint32_t raw = *reinterpret_cast<const uint32_t*>(
                     reinterpret_cast<const uint8_t*>(&smem->scale_batch[buf][0]) + base);
                 sfb_packed = raw >> sfb_shift;
 
                 const uint8_t* fp4_row = sfp4 + n_col * (TK / 2);
-                regB_0 = *reinterpret_cast<const uint32_t*>(fp4_row + 4 * t0);
                 if constexpr (TK > 32) {
-                    regB_1 = *reinterpret_cast<const uint32_t*>(fp4_row + 4 * t0 + 16);
+                    regB_0 = *reinterpret_cast<const uint32_t*>(fp4_row + (4 * t0 ^ swiz16));
+                    regB_1 = *reinterpret_cast<const uint32_t*>(fp4_row + ((4 * t0 + 16) ^ swiz16));
+                } else {
+                    regB_0 = *reinterpret_cast<const uint32_t*>(fp4_row + 4 * t0);
                 }
             }
 
@@ -519,7 +537,7 @@ __device__ void consumer(
                 }
 
                 float frag_d[4];
-                asm volatile(
+                asm(
                     "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X"
                     ".m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
                     "{%0,  %1,  %2,  %3},"
@@ -539,30 +557,38 @@ __device__ void consumer(
                 );
 
                 uint32_t pack_01, pack_23;
-                asm volatile("{ .reg .b16 lo, hi; "
+                asm("{ .reg .b16 lo, hi; "
                     "cvt.rn.bf16.f32 lo, %2; cvt.rn.bf16.f32 hi, %3; mov.b32 %0, {lo, hi}; }"
                     : "=r"(pack_01) : "r"(0), "f"(frag_d[0]), "f"(frag_d[1]));
-                asm volatile("{ .reg .b16 lo, hi; "
+                asm("{ .reg .b16 lo, hi; "
                     "cvt.rn.bf16.f32 lo, %2; cvt.rn.bf16.f32 hi, %3; mov.b32 %0, {lo, hi}; }"
                     : "=r"(pack_23) : "r"(0), "f"(frag_d[2]), "f"(frag_d[3]));
 
-                uint32_t p01_lo = __shfl_sync(0xFFFFFFFF, pack_01, src_lo_lane);
-                uint32_t p23_lo = __shfl_sync(0xFFFFFFFF, pack_23, src_lo_lane);
-                uint32_t p01_hi = __shfl_sync(0xFFFFFFFF, pack_01, src_hi_lane);
-                uint32_t p23_hi = __shfl_sync(0xFFFFFFFF, pack_23, src_hi_lane);
+                // pack_01/pack_23 are in mma1's CLayout (SM80_16x8_Row: thread
+                // (t0,t1) holds row=t1, cols={2t0,2t0+1}). mma2's B operand
+                // wants the *transpose* of that (row<->col swapped: thread
+                // (t0,t1) needs n=t1, k={2t0,2t0+1}) -- exactly what
+                // movmatrix.trans does in one warp-synchronous instruction,
+                // replacing the previous 4 __shfl_sync calls + shift/mask/OR
+                // recombination (verified algebraically equivalent: source
+                // lanes (t1/2, 2t0) and (t1/2, 2t0+1) with parity-based half
+                // selection, same as the old src_lo_lane/src_hi_lane/sel).
+                uint32_t b_reg_0, b_reg_1;
+                asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
+                    : "=r"(b_reg_0) : "r"(pack_01));
+                asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
+                    : "=r"(b_reg_1) : "r"(pack_23));
 
-                uint32_t b_reg_0 = (((p01_hi >> sel) & 0xFFFF) << 16) | ((p01_lo >> sel) & 0xFFFF);
-                uint32_t b_reg_1 = (((p23_hi >> sel) & 0xFFFF) << 16) | ((p23_lo >> sel) & 0xFFFF);
+                asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_0) : "r"(b_reg_0), "r"(s2_pair));
+                asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
 
-                asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_0) : "r"(b_reg_0), "r"(s2_pair));
-                asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
-
+                #pragma unroll
                 for (int m_tile = 0; m_tile < TM; m_tile += 16) {
                     uint32_t a_reg[4];
                     {
                         int addr_offset = (m_tile / 16 * (TK / 16) + sub_ks) * 256 + ldm_base;
                         uint32_t smem_ptr = __cvta_generic_to_shared(sa + addr_offset);
-                        asm volatile(
+                        asm (
                             "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
                             "{%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_reg[0]), "=r"(a_reg[1]), "=r"(a_reg[2]), "=r"(a_reg[3])
@@ -570,7 +596,7 @@ __device__ void consumer(
                     }
 
                     int acc_base = (m_tile / 16) * ACC_STRIDE + n_group * 4;
-                    asm volatile(
+                    asm (
                         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                         "{%0,  %1,  %2,  %3},"
                         "{%4,  %5,  %6,  %7},"
