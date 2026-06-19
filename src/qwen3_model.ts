@@ -100,7 +100,7 @@ export class Qwen3Model extends ChatModel {
   }
 
   private mlp(normed: Tensor, BS: number, pfx: string): Tensor {
-    return this.swiGluMlp(normed, `${pfx}.mlp`, this.cfg.intermediateSize, BS);
+    return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`), this.cfg.intermediateSize, BS);
   }
 
   forwardModel(state: ExecutionState): Tensor {
@@ -162,7 +162,7 @@ export class Qwen3Model extends ChatModel {
       }
 
       using reshapedFlashOut = flashOut.value.reshape([BS, nHeads * hd]);
-      using oProjBuf = reshapedFlashOut.linear(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
+      using oProjBuf = reshapedFlashOut.outputProj(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
       const attnResult = residual.value.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
       using attnNormed = attnResult.normed;
       residual.replace(attnResult.residual);

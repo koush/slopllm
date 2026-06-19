@@ -179,6 +179,10 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
+  outputProj(weight: Tensor, batch: number): Tensor {
+    return this.linear(weight, batch);
+  }
+
   bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
     return undefined as never;
   }
@@ -242,6 +246,30 @@ export abstract class Tensor implements Disposable {
     }
     if (this.type !== up.type) throw new Error(`siluAndMul: gate type ${this.type} != up type ${up.type}`);
     return undefined as never;
+  }
+
+  swiGluMlp(weights: { gate: Tensor, up: Tensor, down: Tensor }, intermediateSize: number, BS: number): Tensor {
+    using upStream = this.workspace.glm.withStream(() => this.linear(weights.up, BS));
+    using upBuf = upStream.result;
+    using gateBuf = this.linear(weights.gate, BS);
+    upStream.streamWaitEvent();
+    using siluBuf = gateBuf.siluAndMul(upBuf, intermediateSize, BS);
+    return siluBuf.linear(weights.down, BS);
+  }
+
+  swiGluMlpMoe(
+    weights: { gate: Tensor[], up: Tensor[], down: Tensor[] },
+    topkIndicesFlat: Tensor,
+    topK: number, count: number,
+    moeIntermediate: number, hs: number,
+    pfx: string,
+  ): Tensor {
+    using gateOutStream = this.workspace.glm.withStream(() => this.mulMatId(weights.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
+    using upOut = this.mulMatId(weights.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
+    gateOutStream.streamWaitEvent();
+    using gateOut = gateOutStream.result;
+    using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
+    return siluOut.mulMatId(weights.down, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
   }
 
   arange(start: number, step: number, count: number): void {

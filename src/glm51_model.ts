@@ -313,7 +313,7 @@ export class Glm51Model extends ChatModel {
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
-    return this.swiGluMlp(normed, `${pfx}.mlp`, this.cfg.intermediateSize, BS);
+    return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`), this.cfg.intermediateSize, BS);
   }
 
   private getExpertWeights(pfx: string, proj: string): Tensor[] {
@@ -337,8 +337,9 @@ export class Glm51Model extends ChatModel {
     const ws = normed.workspace;
 
     // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
+    const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
     using sharedDownBufStream = this.glm.withStream(() => {
-      return this.swiGluMlp(normed, `${pfx}.mlp.shared_experts`, moeIntermediate, BS);
+      return normed.swiGluMlp(sharedWeights, moeIntermediate, BS);
     });
 
     using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!, BS);
@@ -387,13 +388,7 @@ export class Glm51Model extends ChatModel {
     const upWeights = this.getExpertWeights(pfx, "up_proj");
     const downWeights = this.getExpertWeights(pfx, "down_proj");
 
-    using gateOutStream = this.glm.withStream(() => normed.mulMatId(gateWeights, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
-    using upOut = normed.mulMatId(upWeights, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
-    gateOutStream.streamWaitEvent();
-    using gateOut = gateOutStream.result;
-    using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
-
-    using downOut = siluOut.mulMatId(downWeights, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
+    using downOut = normed.swiGluMlpMoe({ gate: gateWeights, up: upWeights, down: downWeights }, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
 
     normalizedWeightsStream.streamWaitEvent();
     using normalizedWeights = normalizedWeightsStream.result;
@@ -477,7 +472,7 @@ export class Glm51Model extends ChatModel {
 
     const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
     using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, S, B, lseBuf);
-    using oProjBuf = vExpanded.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
+    using oProjBuf = vExpanded.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
 
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
     using attnNormed = attnResult.normed;

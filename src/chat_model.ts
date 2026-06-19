@@ -72,13 +72,12 @@ export abstract class ChatModel extends WorkspaceBase {
     return invFreq;
   }
 
-  protected swiGluMlp(normed: Tensor, pfx: string, intermediateSize: number, BS: number): Tensor {
-    using upStream = this.glm.withStream(() => normed.linear(this.tensors.get(`${pfx}.up_proj.weight`)!, BS));
-    using upBuf = upStream.result;
-    using gateBuf = normed.linear(this.tensors.get(`${pfx}.gate_proj.weight`)!, BS);
-    upStream.streamWaitEvent();
-    using siluBuf = gateBuf.siluAndMul(upBuf, intermediateSize, BS);
-    return siluBuf.linear(this.tensors.get(`${pfx}.down_proj.weight`)!, BS);
+  protected swiGluMlpWeights(pfx: string): { gate: Tensor, up: Tensor, down: Tensor } {
+    return {
+      gate: this.tensors.get(`${pfx}.gate_proj.weight`)!,
+      up: this.tensors.get(`${pfx}.up_proj.weight`)!,
+      down: this.tensors.get(`${pfx}.down_proj.weight`)!,
+    };
   }
 
   protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void>;

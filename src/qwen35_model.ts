@@ -257,7 +257,7 @@ export class Qwen35Model extends ChatModel {
   }
 
   private mlp(normed: Tensor, pfx: string, BS: number): Tensor {
-    return this.swiGluMlp(normed, `${pfx}.mlp`, this.cfg.intermediateSize, BS);
+    return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`), this.cfg.intermediateSize, BS);
   }
 
   private gdnLayerPrefill(ws: ExecutionWorkspace, normed: Tensor, residual: Tensor, layerIdx: number, S: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
@@ -408,7 +408,7 @@ export class Qwen35Model extends ChatModel {
     }
 
     using reshapedFlashOut = flashOut.value.reshape([BS, nHeads * hd]);
-    using oProjBuf = reshapedFlashOut.linear(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
+    using oProjBuf = reshapedFlashOut.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!, BS);
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
