@@ -120,11 +120,14 @@ def bench_pc(glm, device_id, batch, K, N, num_experts, topK, weight_ptrs, scale_
         glm.synchronize()
         times.append(time.perf_counter() - t0)
 
-    gmem = count * (K + N) * 2 + count * N * 2
+    gmem_act = count * (K + N) * 2 + count * N * 2
+    bytes_per_expert = N * (K // 2) + N * (K // GROUP_SIZE) + 4
+    gmem_weights_max = count * bytes_per_expert
+    gmem_max = gmem_act + gmem_weights_max
     avg = np.mean(times) * 1000
     p50 = np.percentile(times, 50) * 1000
     mn = np.min(times) * 1000
-    bw = gmem / np.mean(times) / 1e9
+    bw = gmem_max / np.mean(times) / 1e9
     return {"avg_ms": avg, "p50_ms": p50, "min_ms": mn, "bw_gbs": bw}
 
 
@@ -163,11 +166,14 @@ def bench_mma(glm, device_id, batch, K, N, num_experts, topK, weight_ptrs, scale
         glm.synchronize()
         times.append(time.perf_counter() - t0)
 
-    gmem = count * (K + N) * 2 + count * N * 2
+    gmem_act = count * (K + N) * 2 + count * N * 2
+    bytes_per_expert = N * (K // 2) + N * (K // GROUP_SIZE) + 4
+    gmem_weights_max = count * bytes_per_expert
+    gmem_max = gmem_act + gmem_weights_max
     avg = np.mean(times) * 1000
     p50 = np.percentile(times, 50) * 1000
     mn = np.min(times) * 1000
-    bw = gmem / np.mean(times) / 1e9
+    bw = gmem_max / np.mean(times) / 1e9
     return {"avg_ms": avg, "p50_ms": p50, "min_ms": mn, "bw_gbs": bw}
 
 
@@ -198,9 +204,12 @@ def main():
         batch, K, N, num_experts, topK = 4096, 7168, 2048, 256, 4
 
     count = batch * topK
-    gmem = count * (K + N) * 2 + count * N * 2
+    gmem_act = count * (K + N) * 2 + count * N * 2
+    bytes_per_expert = N * (K // 2) + N * (K // GROUP_SIZE) + 4
+    gmem_weights_max = count * bytes_per_expert
+    gmem_max = gmem_act + gmem_weights_max
     print(f"Config: batch={batch} K={K} N={N} experts={num_experts} topK={topK} count={count}")
-    print(f"GMEM traffic: {gmem/1e9:.1f} GB  (peak HBM: 1792 GB/s)")
+    print(f"GMEM traffic: act={gmem_act/1e9:.1f} GB  +weights(max)={gmem_weights_max/1e9:.1f} GB  total(max)={gmem_max/1e9:.1f} GB  (peak HBM: 1792 GB/s)")
 
     print(f"Quantizing {num_experts} experts...", flush=True)
     wp, sp, s2p = setup_weights(glm, device_id, N, K, num_experts)
