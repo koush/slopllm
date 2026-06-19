@@ -54,7 +54,7 @@ function runMtpTreeDecode(model: ChatModel, ws: ExecutionWorkspace, cache: ChatC
   ws.glm.synchronize();
   const currentToken = currentTokenHost.readPinnedBuffer().readInt32LE();
 
-  const result = mtpTreeDecode(
+  const { tokens: result } = mtpTreeDecode(
     captureManager, model, hiddenHolder.value, ws, currentToken, Array(nextn).fill(2), cache,
   );
 
