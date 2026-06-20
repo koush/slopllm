@@ -143,7 +143,8 @@ export class Glm51Model extends ChatModel {
       // || name.endsWith(".eh_proj.weight") ||
       // name.endsWith(".eh_proj.weight_weight_scale"))
       return TensorParallelism.Column;
-    if (name.endsWith(".self_attn.o_proj.weight") ||
+    if (
+      name.endsWith(".self_attn.o_proj.weight") ||
       name.endsWith(".mlp.down_proj.weight") ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".down_proj.weight")) ||
       name.endsWith(".mlp.shared_experts.down_proj.weight") ||

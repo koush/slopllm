@@ -195,3 +195,36 @@ The vendor subdirectory contains flashinfer, llama.cpp, vllm, and sglang, and ca
 You must NEVER "git commit" unless the user explicitly asks you to commit. If you think the user intends to commit, you must ask for permission per commit. There may be multiple changes that may need to be in multiple commits. You must not proactively commit a change just because you made a prior commit. You must wait for explicit permission to commit every change to ensure the user has fully reviewed it. Instructions to make a change is not implicit permission to commit. Permission to commit is only for a single commit.
 
 You must NEVER use "git stash pop" to reapply stashed changes. You MUST use "git stash apply" instead. "git stash pop" is potentially destructive and may cause data loss when used in conjunction with an coding agent harness rollback. The user will clean up any entries left behind from usage of "git stash apply".
+
+# Production GLM-5.1 Model Config (zai-org/GLM-5.1)
+
+| Key | Value |
+|---|---|
+| architectures | GlmMoeDsaForCausalLM |
+| model_type | glm_moe_dsa |
+| dtype | bfloat16 |
+| hidden_size | 6144 |
+| intermediate_size | 12288 |
+| moe_intermediate_size | 2048 |
+| num_hidden_layers | 78 |
+| num_attention_heads | 64 |
+| num_key_value_heads | 64 |
+| kv_lora_rank | 512 |
+| q_lora_rank | 2048 |
+| qk_head_dim | 256 (nope: 192, rope: 64) |
+| v_head_dim | 256 |
+| n_routed_experts | 256 |
+| n_shared_experts | 1 |
+| num_experts_per_tok | 8 |
+| routed_scaling_factor | 2.5 |
+| scoring_func | sigmoid |
+| topk_method | noaux_tc |
+| index_topk | 2048 |
+| index_head_dim | 128 |
+| index_n_heads | 32 |
+| first_k_dense_replace | 3 |
+| num_nextn_predict_layers | 1 |
+| max_position_embeddings | 202752 |
+| vocab_size | 154880 |
+| rms_norm_eps | 1e-05 |
+| rope_interleave | true |

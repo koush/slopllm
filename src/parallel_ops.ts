@@ -250,6 +250,41 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(workspace, outputShards, this.fullShape, this.type, TensorParallelism.Row);
   }
 
+  // outputProj(weight: Tensor, batch: number): Tensor {
+  //   const N = weight.shape[0];
+  //   const minTileN = 256;
+  //   const minBatchPerTile = 1024;
+  //   const maxTiles = Math.floor(N / minTileN);
+  //   const tilesFromBatch = 1 << Math.floor(Math.log2(batch / minBatchPerTile));
+  //   let numTiles = Math.min(maxTiles, tilesFromBatch);
+  //   while (numTiles > 1 && N % numTiles !== 0) numTiles >>= 1;
+  //   if (numTiles === 1) {
+  //     return super.outputProj(weight, batch);
+  //   }
+  //   const tileN = N / numTiles;
+
+  //   const streams: ReturnType<typeof this.workspace.glm.withStream>[] = [];
+  //   for (let i = 0; i < numTiles; i++) {
+  //     const stream = this.workspace.glm.withStream(() => {
+  //       const start = i * tileN;
+  //       const len = i === numTiles - 1 ? N - start : tileN;
+
+  //       using tile = weight.narrow(start, len);
+  //       using oProj = this.outputProj(tile, batch);
+
+  //       // now reduce here (psuedocode)
+  //       oProj.allReduce();
+  //     });
+
+  //     streams.push(stream);
+  //   }
+
+  //   for (const stream of streams) {
+  //     stream.streamWaitEvent();
+  //     stream[Symbol.dispose]();
+  //   }
+  // }
+
   h2d(data: Buffer, size?: number): void {
     const eb = ParallelTensor.elemBytes(this.type);
 
@@ -1392,15 +1427,15 @@ export class ParallelTensor extends Tensor {
 
   narrow(start: number, length: number): Tensor {
     super.narrow(start, length);
-    if (this.parallelism !== TensorParallelism.Replicated) {
-      throw new Error(`narrow: only supported on Replicated tensors, got ${this.parallelism}`);
+    if (this.parallelism !== TensorParallelism.Replicated && this.parallelism !== TensorParallelism.Row) {
+      throw new Error(`narrow: only supported on Replicated or Row tensors, got ${this.parallelism}`);
     }
     const newShape = [length, ...this.fullShape.slice(1)];
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       outShards.push(this.shards[i].narrow(start, length));
     }
-    return this.parallelOps.wrapShards(this.workspace, outShards, newShape, this.type, TensorParallelism.Replicated);
+    return this.parallelOps.wrapShards(this.workspace, outShards, newShape, this.type, this.parallelism);
   }
 
   scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
