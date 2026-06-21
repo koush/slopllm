@@ -735,50 +735,6 @@ void glm_context_parallel_merge_heads(
     int input_n_heads,
     int v_head_dim);
 
-// P2P context parallel merge: fused P2P sync + online softmax merge.
-// Uses GlmP2PInstance for peer-to-peer data exchange (no NCCL needed).
-// inst: P2P instance with peers already configured
-// my_v_out: [batch_size * num_heads * v_head_dim] BF16 (local partial attention output)
-// my_lse: [batch_size * num_heads] F32 (local partial log-sum-exp)
-// merged_v_out: [batch_size * num_heads * v_head_dim] BF16 (output)
-// merged_lse: [batch_size * num_heads] F32 (output, optional - pass nullptr to skip)
-// num_shards: number of context-parallel shards (2, 4, 8, or 16)
-// v_head_dim: per-head output dimension (32, 64, 128, 256, or 512)
-void glm_p2p_cp_merge(
-    GlmCtx* ctx,
-    GlmP2PInstance* inst,
-    const void* my_v_out,
-    const float* my_lse,
-    void* merged_v_out,
-    float* merged_lse,
-    int num_shards,
-    int batch_size,
-    int num_heads,
-    int v_head_dim);
-
-// P2P head-grouped context parallel merge: fused P2P sync + online softmax merge,
-// only processing heads [head_offset, head_offset + shard_n_heads).
-// input_n_heads: number of heads per input shard (stride for v_out indexing).
-// P2P buffer holds full head data (scatter/sync unchanged), only merge phase
-// processes shard_n_heads starting at head_offset.
-// Output: [batch_size * shard_n_heads * v_head_dim] BF16 (contiguous Row layout)
-// When shard_n_heads == num_heads, head_offset == 0, and input_n_heads == num_heads,
-// equivalent to glm_p2p_cp_merge.
-void glm_p2p_cp_merge_heads(
-    GlmCtx* ctx,
-    GlmP2PInstance* inst,
-    const void* my_v_out,
-    const float* my_lse,
-    void* merged_v_out,
-    float* merged_lse,
-    int num_shards,
-    int batch_size,
-    int num_heads,
-    int shard_n_heads,
-    int head_offset,
-    int input_n_heads,
-    int v_head_dim);
-
 // CP Merge Tree: smem-staged online softmax merge using cp.async.bulk.
 // Merges up to 16 partial (v_out, lse) pairs using the online softmax trick.
 // Supports in-place operation (output_v may alias one of the v inputs, output_lse may alias one of the lse inputs).
