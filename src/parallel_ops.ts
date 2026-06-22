@@ -1525,8 +1525,9 @@ export class ParallelTensor extends Tensor {
       outShards.push(this.shards[i].mlaVExpand(pVProj.shards[i], kvLoraRank, vHeadDim, shardNHeads, seqLen, batch, undefined, shardHeadOffset, attnNHeads));
     }
     const isCp = this.parallelism === TensorParallelism.PartialSoftmax;
+    const cpInputNHeads = isVProjSharded ? shardNHeads : nHeads;
     const vExpandedPar = isCp ? TensorParallelism.Column : this.parallelism;
-    const vExpandedFullShape = isCp ? [BS * this.parallelOps.worldSize, nHeads * vHeadDim] : [BS, nHeads * vHeadDim];
+    const vExpandedFullShape = isCp ? [BS * this.parallelOps.worldSize, cpInputNHeads * vHeadDim] : [BS, nHeads * vHeadDim];
     using vExpanded = new UsingHolder(this.parallelOps.wrapShards(this.workspace, outShards, vExpandedFullShape, this.type, vExpandedPar));
     if (!isCp) {
       return vExpanded.detach();;
@@ -1534,7 +1535,6 @@ export class ParallelTensor extends Tensor {
 
     const pLse = lse as ParallelTensor;
     const cpShardNHeads = isVProjSharded ? shardNHeads : this.parallelOps.shardDim(nHeads, "mlaVExpand cpShardNHeads");
-    const cpInputNHeads = isVProjSharded ? shardNHeads : nHeads;
     const merged = this.parallelOps.contextParallelMerge(
       vExpanded.value, pLse,
       BS, nHeads, vHeadDim,
@@ -1961,6 +1961,16 @@ export class ParallelOps implements DeviceOps {
     addon.ncclGroupEnd();
   }
 
+  /** NCCL point-to-point send. Must be paired with ncclRecv on peer. */
+  ncclSend(shard: Tensor, rank: number, peer: number, count: number, dtype: number): void {
+    getNativeAddon().ncclSend(this.comms[rank], this.devices[rank].ctx, shard.data, count, dtype, peer);
+  }
+
+  /** NCCL point-to-point recv. Must be paired with ncclSend on peer. */
+  ncclRecv(shard: Tensor, rank: number, peer: number, count: number, dtype: number): void {
+    getNativeAddon().ncclRecv(this.comms[rank], this.devices[rank].ctx, shard.data, count, dtype, peer);
+  }
+
   /**
    * Merge partial attention outputs from context-parallel shards.
    *
@@ -2008,19 +2018,17 @@ export class ParallelOps implements DeviceOps {
 
     // AllGather each shard's partial_v_out and partial_lse to all GPUs.
     // After AllGather, each GPU has all shards' data and can run cp_merge locally.
-    const vOutElemBytes = 2; // BF16
-    const lseElemBytes = 4;  // F32
-    const vOutElemsPerShard = batchSize * inh * vHeadDim;
-    const lseElemsPerShard = batchSize * numHeads;
     const numShards = this.worldSize;
 
-    // Build pointer arrays and run cp_merge on each device.
+    // Slice each gathered buffer by rank using narrow, then run cp_merge on each device.
     for (let i = 0; i < this.worldSize; i++) {
       const vPtrs: number[] = [];
       const lsePtrs: number[] = [];
       for (let s = 0; s < numShards; s++) {
-        vPtrs.push(gatheredVOutShards.shards[i].data + s * vOutElemsPerShard * vOutElemBytes);
-        lsePtrs.push(gatheredLseShards.shards[i].data + s * lseElemsPerShard * lseElemBytes);
+        using vView = gatheredVOutShards.shards[i].narrow(s * batchSize, batchSize);
+        using lseView = gatheredLseShards.shards[i].narrow(s * batchSize, batchSize);
+        vPtrs.push(vView.data);
+        lsePtrs.push(lseView.data);
       }
       const headOffset = isHeads ? i * snh : 0;
       this.devices[i].contextParallelMerge(

@@ -128,6 +128,8 @@ interface NativeAddon {
   ncclCommDestroy(comm: number): void;
   ncclAllReduce(comm: number, ctx: number, sendbuff: number, recvbuff: number, count: number, datatype: number, op: number): void;
   ncclAllGather(comm: number, ctx: number, sendbuff: number, recvbuff: number, count: number, datatype: number): void;
+  ncclSend(comm: number, ctx: number, sendbuff: number, count: number, datatype: number, peer: number): void;
+  ncclRecv(comm: number, ctx: number, recvbuff: number, count: number, datatype: number, peer: number): void;
   p2pEnablePeerAccess(ctx: number, peerDevice: number): number;
   p2pCreateInstance(ctx: number, myRank: number, worldSize: number): number;
   p2pDestroyInstance(instance: number): void;

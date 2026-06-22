@@ -3251,6 +3251,44 @@ static Napi::Value NcclAllGather(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value NcclSend(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (comm, ctx, sendbuff, count, datatype, peer)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t comm_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t ctx_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t send_ptr = info[2].As<Napi::Number>().Int64Value();
+    size_t count = info[3].As<Napi::Number>().Int64Value();
+    int datatype = info[4].As<Napi::Number>().Int32Value();
+    int peer = info[5].As<Napi::Number>().Int32Value();
+    glm_nccl_send(reinterpret_cast<void*>(comm_ptr),
+                   reinterpret_cast<GlmCtx*>(ctx_ptr),
+                   reinterpret_cast<const void*>(send_ptr),
+                   count, datatype, peer);
+    return env.Undefined();
+}
+
+static Napi::Value NcclRecv(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (comm, ctx, recvbuff, count, datatype, peer)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t comm_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t ctx_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t recv_ptr = info[2].As<Napi::Number>().Int64Value();
+    size_t count = info[3].As<Napi::Number>().Int64Value();
+    int datatype = info[4].As<Napi::Number>().Int32Value();
+    int peer = info[5].As<Napi::Number>().Int32Value();
+    glm_nccl_recv(reinterpret_cast<void*>(comm_ptr),
+                   reinterpret_cast<GlmCtx*>(ctx_ptr),
+                   reinterpret_cast<void*>(recv_ptr),
+                   count, datatype, peer);
+    return env.Undefined();
+}
+
 // ---------------------------------------------------------------------------
 // Custom P2P AllReduce bindings
 // ---------------------------------------------------------------------------
@@ -3641,6 +3679,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "ncclCommDestroy"), Napi::Function::New(env, NcclCommDestroy));
     exports.Set(Napi::String::New(env, "ncclAllReduce"), Napi::Function::New(env, NcclAllReduce));
     exports.Set(Napi::String::New(env, "ncclAllGather"), Napi::Function::New(env, NcclAllGather));
+    exports.Set(Napi::String::New(env, "ncclSend"), Napi::Function::New(env, NcclSend));
+    exports.Set(Napi::String::New(env, "ncclRecv"), Napi::Function::New(env, NcclRecv));
     exports.Set(Napi::String::New(env, "p2pEnablePeerAccess"), Napi::Function::New(env, P2PEnablePeerAccess));
     exports.Set(Napi::String::New(env, "p2pCreateInstance"), Napi::Function::New(env, P2PCreateInstance));
     exports.Set(Napi::String::New(env, "p2pDestroyInstance"), Napi::Function::New(env, P2PDestroyInstance));

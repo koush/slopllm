@@ -282,6 +282,13 @@ void glm_nccl_all_gather(void* comm, GlmCtx* ctx,
                           const void* sendbuff, void* recvbuff,
                           size_t count, int datatype);
 
+// Send/Recv: point-to-point communication between ranks
+// sendbuff/recvbuff are device pointers, count is number of elements
+void glm_nccl_send(void* comm, GlmCtx* ctx,
+                    const void* sendbuff, size_t count, int datatype, int peer);
+void glm_nccl_recv(void* comm, GlmCtx* ctx,
+                    void* recvbuff, size_t count, int datatype, int peer);
+
 // ---------------------------------------------------------------------------
 // Custom P2P AllReduce (small messages, single-process multi-GPU).
 //

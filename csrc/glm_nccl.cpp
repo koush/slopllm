@@ -76,3 +76,25 @@ void glm_nccl_all_gather(void* comm, GlmCtx* ctx,
         fprintf(stderr, "glm_nccl_all_gather failed: %s\n", ncclGetErrorString(result));
     }
 }
+
+void glm_nccl_send(void* comm, GlmCtx* ctx,
+                    const void* sendbuff, size_t count, int datatype, int peer) {
+    ncclResult_t result = ncclSend(sendbuff, count,
+                          static_cast<ncclDataType_t>(datatype),
+                          peer,
+                          static_cast<ncclComm_t>(comm), GLM_STREAM(ctx));
+    if (result != ncclSuccess) {
+        fprintf(stderr, "glm_nccl_send failed: %s\n", ncclGetErrorString(result));
+    }
+}
+
+void glm_nccl_recv(void* comm, GlmCtx* ctx,
+                    void* recvbuff, size_t count, int datatype, int peer) {
+    ncclResult_t result = ncclRecv(recvbuff, count,
+                          static_cast<ncclDataType_t>(datatype),
+                          peer,
+                          static_cast<ncclComm_t>(comm), GLM_STREAM(ctx));
+    if (result != ncclSuccess) {
+        fprintf(stderr, "glm_nccl_recv failed: %s\n", ncclGetErrorString(result));
+    }
+}
