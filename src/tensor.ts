@@ -392,7 +392,18 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  sum(tensors: Tensor[]): void {
+  sumInPlace(tensors: Tensor[]): void {
+    if (tensors.length === 0 || tensors.length > 15) {
+      throw new Error(`sumInPlace: requires 1-15 additional tensors, got ${tensors.length}`);
+    }
+    for (let i = 0; i < tensors.length; i++) {
+      if (tensors[i].type !== this.type) {
+        throw new Error(`sumInPlace: tensor ${i} type ${tensors[i].type} != ${this.type}`);
+      }
+    }
+  }
+
+  sum(tensors: Tensor[]): Tensor {
     if (tensors.length === 0 || tensors.length > 15) {
       throw new Error(`sum: requires 1-15 additional tensors, got ${tensors.length}`);
     }
@@ -401,6 +412,7 @@ export abstract class Tensor implements Disposable {
         throw new Error(`sum: tensor ${i} type ${tensors[i].type} != ${this.type}`);
       }
     }
+    return undefined as never;
   }
 
   scaleInPlace(scale: number, n: number): void {

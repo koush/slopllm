@@ -1824,24 +1824,35 @@ export class ParallelOps implements DeviceOps {
     if (!group)
       return false;
 
+    let current: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      const copy = shards[i].workspace.alloc(shards[i].shape, shards[i].type);
+      copy.memcpy(shards[i]);
+      current.push(copy);
+    }
+
     for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
-      const shardCopies: Tensor[] = [];
-      for (let i = 0; i < this.worldSize; i++) {
-        const shard = shards[i];
-        const copy = shard.workspace.alloc(shard.shape, shard.type);
-        copy.memcpy(shard);
-        shardCopies.push(copy);
-      }
-
       const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
-      this.p2pBarrier(peerRanks);
-      this.sourceCleanup();
-      this.p2pSources.push(...shardCopies);
+      const isLast = reduceHalf === 1;
 
-      for (let i = 0; i < this.worldSize; i++) {
-        const shard = shards[i];
-        const peer = shardCopies[i ^ reduceHalf];
-        shard.sum([peer]);
+      this.p2pBarrier(peerRanks);
+      if (reduceHalf === this.worldSize / 2) {
+        this.sourceCleanup();
+      }
+      this.p2pSources.push(...current);
+
+      if (isLast) {
+        for (let i = 0; i < this.worldSize; i++) {
+          const peer = i ^ reduceHalf;
+          shards[i].sumInPlace([current[i], current[peer]]);
+        }
+      } else {
+        const output: Tensor[] = new Array(this.worldSize);
+        for (let i = 0; i < this.worldSize; i++) {
+          const peer = i ^ reduceHalf;
+          output[i] = current[i].sum([current[peer]]);
+        }
+        current = output;
       }
     }
 

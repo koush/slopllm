@@ -487,22 +487,32 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  sum(tensors: Tensor[]): void {
-    super.sum(tensors);
-    const all = [this as Tensor, ...tensors];
-    const N = all.length;
-    const numel = this.shape.reduce((a, b) => a * b, 1);
-    const dtype = this.type === "F32" ? 7 : 9;
+  private runSumPointers(output: Tensor, inputs: Tensor[]): void {
+    const N = inputs.length;
+    const numel = output.shape.reduce((a, b) => a * b, 1);
+    const dtype = output.type === "F32" ? 7 : 9;
     const ptrs = new Array<number>(16).fill(0);
-    for (let i = 0; i < N; i++) ptrs[i] = all[i].data;
+    for (let i = 0; i < N; i++) ptrs[i] = inputs[i].data;
     getNativeAddon().sumPointers(
       this.glm.ctx,
       ptrs[0], ptrs[1], ptrs[2], ptrs[3],
       ptrs[4], ptrs[5], ptrs[6], ptrs[7],
       ptrs[8], ptrs[9], ptrs[10], ptrs[11],
       ptrs[12], ptrs[13], ptrs[14], ptrs[15],
-      this.data, N, numel, dtype,
+      output.data, N, numel, dtype,
     );
+  }
+
+  sumInPlace(tensors: Tensor[]): void {
+    super.sumInPlace(tensors);
+    this.runSumPointers(this, tensors);
+  }
+
+  sum(tensors: Tensor[]): Tensor {
+    super.sum(tensors);
+    const out = this.workspace.alloc(this.shape, this.type);
+    this.runSumPointers(out, [this as Tensor, ...tensors]);
+    return out;
   }
 
   scaleInPlace(scale: number, n: number): void {
