@@ -2041,6 +2041,61 @@ export class ParallelOps implements DeviceOps {
     vHeadDim: number,
     workspace: WorkspaceBase,
   ): ParallelTensor {
+    // fast path for decode that does p2p
+    if (batchSize < 256) {
+      const numel = batchSize * numHeads * vHeadDim;
+      const shardWss = this.getShardWorkspaces(workspace);
+      const fullVOutShape = [batchSize, numHeads * vHeadDim];
+
+      let currentV: Tensor[] = [];
+      let currentLse: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        const v = shardWss[i].alloc(partialVOuts[i].shape, partialVOuts[i].type);
+        v.memcpy(partialVOuts[i]);
+        currentV.push(v);
+        const lse = shardWss[i].alloc(partialLses[i].shape, partialLses[i].type);
+        lse.memcpy(partialLses[i]);
+        currentLse.push(lse);
+      }
+
+      for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
+        const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
+
+        const outputV: Tensor[] = [];
+        const outputLse: Tensor[] = [];
+        for (let i = 0; i < this.worldSize; i++) {
+          outputV.push(shardWss[i].alloc(currentV[i].shape, currentV[i].type));
+          outputLse.push(shardWss[i].alloc(currentLse[i].shape, currentLse[i].type));
+        }
+
+        this.p2pBarrier(peerRanks);
+        if (reduceHalf === this.worldSize / 2) {
+          this.sourceCleanup();
+        }
+        this.p2pSources.push(...currentV, ...currentLse);
+
+        for (let i = 0; i < this.worldSize; i++) {
+          const peer = i ^ reduceHalf;
+          this.devices[i].cpMergeTree(
+            [currentV[i].data, currentV[peer].data],
+            [currentLse[i].data, currentLse[peer].data],
+            2,
+            outputV[i], outputLse[i],
+            numel, batchSize, numHeads, vHeadDim,
+          );
+        }
+
+        currentV = outputV;
+        currentLse = outputLse;
+      }
+
+      for (const lse of currentLse) {
+        lse[Symbol.dispose]();
+      }
+
+      return this.wrapShards(workspace, currentV, fullVOutShape, "BF16", TensorParallelism.Replicated);
+    }
+
     const numel = batchSize * numHeads * vHeadDim;
     const shardWss = this.getShardWorkspaces(workspace);
     const fullVOutShape = [batchSize, numHeads * vHeadDim];
@@ -2057,28 +2112,43 @@ export class ParallelOps implements DeviceOps {
     }
 
     for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
-      const vCopies: Tensor[] = [];
-      const lseCopies: Tensor[] = [];
+      const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
+
+      const peerShards: Tensor[] = [];
+      const peerLses: Tensor[] = [];
+
+      // loop to prepare shards for peers
       for (let i = 0; i < this.worldSize; i++) {
-        const vc = currentV[i].workspace.alloc(currentV[i].shape, currentV[i].type);
-        vc.memcpy(currentV[i]);
-        vCopies.push(vc);
-        const lc = currentLse[i].workspace.alloc(currentLse[i].shape, currentLse[i].type);
-        lc.memcpy(currentLse[i]);
-        lseCopies.push(lc);
+        const peer = i ^ reduceHalf;
+        const peerShard = shardWss[peer].alloc(partialVOuts[peer].shape, partialVOuts[peer].type);
+        const peerLse = shardWss[peer].alloc(partialLses[peer].shape, partialLses[peer].type);
+        const shard = currentV[i];
+        const lse = currentLse[i];
+
+        peerShard.memcpy(shard, shard.bytes, MemcpyKind.DeviceToDevice);
+        peerLse.memcpy(lse, lse.bytes, MemcpyKind.DeviceToDevice);
+
+        peerShards.push(peerShard);
+        peerLses.push(peerLse);
       }
 
-      const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
       this.p2pBarrier(peerRanks);
-      this.sourceCleanup();
-      this.p2pSources.push(...vCopies, ...lseCopies);
+      // only clean up sources prior to the call to this reduce, as peers can race on each other.
+      if (reduceHalf === this.worldSize / 2) {
+        this.sourceCleanup();
+      }
+      this.p2pSources.push(...peerShards, ...peerLses);
 
       for (let i = 0; i < this.worldSize; i++) {
         const peer = i ^ reduceHalf;
+
+        const vInputs = [currentV[i].data, peerShards[peer].data];
+        const lseInputs = [currentLse[i].data, peerLses[peer].data];
+
         // log all tensor sizes/shapes
         this.devices[i].cpMergeTree(
-          [currentV[i].data, vCopies[peer].data],
-          [currentLse[i].data, lseCopies[peer].data],
+          vInputs,
+          lseInputs,
           2,
           currentV[i], currentLse[i],
           numel, batchSize, numHeads, vHeadDim,
