@@ -1541,12 +1541,6 @@ export class ParallelTensor extends Tensor {
       BS, nHeads, vHeadDim,
       null, this.workspace,
     );
-    if (merged.parallelism === TensorParallelism.Replicated) {
-      const cpShardNHeads = this.parallelOps.shardDim(nHeads, "mlaVExpand cpShardNHeads");
-      const sliced = merged.sliceToRowParallel(this.workspace, cpShardNHeads * vHeadDim);
-      merged[Symbol.dispose]();
-      return sliced;
-    }
     return merged;
   }
 
@@ -2020,11 +2014,13 @@ export class ParallelOps implements DeviceOps {
     vHeadDim: number,
     workspace: WorkspaceBase,
   ): ParallelTensor {
+    const shardNHeads = this.shardDim(numHeads, "cpMergeTreeReduce shardNHeads");
+    const shardNumel = batchSize * shardNHeads * vHeadDim;
+
     // fast path for decode that does p2p
     if (batchSize < 256) {
       const numel = batchSize * numHeads * vHeadDim;
       const shardWss = this.getShardWorkspaces(workspace);
-      const fullVOutShape = [batchSize, numHeads * vHeadDim];
 
       let currentV: Tensor[] = [];
       let currentLse: Tensor[] = [];
@@ -2039,12 +2035,17 @@ export class ParallelOps implements DeviceOps {
 
       for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
         const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
+        const isLastRound = reduceHalf === 1;
+        const outNumel = isLastRound ? shardNumel : numel;
+        const outHeads = isLastRound ? shardNHeads : numHeads;
+        const outVShape = isLastRound ? [batchSize, shardNHeads * vHeadDim] : currentV[0].shape;
+        const outLseShape = isLastRound ? [batchSize, shardNHeads] : currentLse[0].shape;
 
         const outputV: Tensor[] = [];
         const outputLse: Tensor[] = [];
         for (let i = 0; i < this.worldSize; i++) {
-          outputV.push(shardWss[i].alloc(currentV[i].shape, currentV[i].type));
-          outputLse.push(shardWss[i].alloc(currentLse[i].shape, currentLse[i].type));
+          outputV.push(shardWss[i].alloc(outVShape, currentV[i].type));
+          outputLse.push(shardWss[i].alloc(outLseShape, currentLse[i].type));
         }
 
         this.p2pBarrier(peerRanks);
@@ -2060,8 +2061,14 @@ export class ParallelOps implements DeviceOps {
             [currentLse[i].data, currentLse[peer].data],
             2,
             outputV[i], outputLse[i],
-            numel, batchSize, numHeads, vHeadDim,
+            outNumel, batchSize, numHeads, vHeadDim,
+            outHeads, isLastRound ? i * shardNHeads : 0, numHeads,
           );
+        }
+
+        for (let i = 0; i < this.worldSize; i++) {
+          currentV[i][Symbol.dispose]();
+          currentLse[i][Symbol.dispose]();
         }
 
         currentV = outputV;
@@ -2072,15 +2079,14 @@ export class ParallelOps implements DeviceOps {
         lse[Symbol.dispose]();
       }
 
-      return this.wrapShards(workspace, currentV, fullVOutShape, "BF16", TensorParallelism.Replicated);
+      return this.wrapShards(workspace, currentV, [batchSize, numHeads * vHeadDim], "BF16", TensorParallelism.Row);
     }
 
     const numel = batchSize * numHeads * vHeadDim;
     const shardWss = this.getShardWorkspaces(workspace);
-    const fullVOutShape = [batchSize, numHeads * vHeadDim];
 
-    const currentV: Tensor[] = [];
-    const currentLse: Tensor[] = [];
+    let currentV: Tensor[] = [];
+    let currentLse: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       const v = shardWss[i].alloc(partialVOuts[i].shape, partialVOuts[i].type);
       v.memcpy(partialVOuts[i]);
@@ -2092,27 +2098,29 @@ export class ParallelOps implements DeviceOps {
 
     for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
       const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
+      const isLastRound = reduceHalf === 1;
+      const outNumel = isLastRound ? shardNumel : numel;
+      const outHeads = isLastRound ? shardNHeads : numHeads;
+      const outVShape = isLastRound ? [batchSize, shardNHeads * vHeadDim] : currentV[0].shape;
+      const outLseShape = isLastRound ? [batchSize, shardNHeads] : currentLse[0].shape;
 
       const peerShards: Tensor[] = [];
       const peerLses: Tensor[] = [];
-
-      // loop to prepare shards for peers
+      const outputV: Tensor[] = [];
+      const outputLse: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
         const peer = i ^ reduceHalf;
-        const peerShard = shardWss[peer].alloc(partialVOuts[peer].shape, partialVOuts[peer].type);
-        const peerLse = shardWss[peer].alloc(partialLses[peer].shape, partialLses[peer].type);
-        const shard = currentV[i];
-        const lse = currentLse[i];
-
-        peerShard.memcpy(shard, shard.bytes, MemcpyKind.DeviceToDevice);
-        peerLse.memcpy(lse, lse.bytes, MemcpyKind.DeviceToDevice);
-
+        const peerShard = shardWss[peer].alloc(currentV[i].shape, currentV[i].type);
+        const peerLse = shardWss[peer].alloc(currentLse[i].shape, currentLse[i].type);
+        peerShard.memcpy(currentV[i], currentV[i].bytes, MemcpyKind.DeviceToDevice);
+        peerLse.memcpy(currentLse[i], currentLse[i].bytes, MemcpyKind.DeviceToDevice);
         peerShards.push(peerShard);
         peerLses.push(peerLse);
+        outputV.push(shardWss[i].alloc(outVShape, currentV[i].type));
+        outputLse.push(shardWss[i].alloc(outLseShape, currentLse[i].type));
       }
 
       this.p2pBarrier(peerRanks);
-      // only clean up sources prior to the call to this reduce, as peers can race on each other.
       if (reduceHalf === this.worldSize / 2) {
         this.sourceCleanup();
       }
@@ -2120,26 +2128,30 @@ export class ParallelOps implements DeviceOps {
 
       for (let i = 0; i < this.worldSize; i++) {
         const peer = i ^ reduceHalf;
-
-        const vInputs = [currentV[i].data, peerShards[peer].data];
-        const lseInputs = [currentLse[i].data, peerLses[peer].data];
-
-        // log all tensor sizes/shapes
         this.devices[i].cpMergeTree(
-          vInputs,
-          lseInputs,
+          [currentV[i].data, peerShards[peer].data],
+          [currentLse[i].data, peerLses[peer].data],
           2,
-          currentV[i], currentLse[i],
-          numel, batchSize, numHeads, vHeadDim,
+          outputV[i], outputLse[i],
+          outNumel, batchSize, numHeads, vHeadDim,
+          outHeads, isLastRound ? i * shardNHeads : 0, numHeads,
         );
       }
+
+      for (let i = 0; i < this.worldSize; i++) {
+        currentV[i][Symbol.dispose]();
+        currentLse[i][Symbol.dispose]();
+      }
+
+      currentV = outputV;
+      currentLse = outputLse;
     }
 
     for (const lse of currentLse) {
       lse[Symbol.dispose]();
     }
 
-    return this.wrapShards(workspace, currentV, fullVOutShape, "BF16", TensorParallelism.Replicated);
+    return this.wrapShards(workspace, currentV, [batchSize, numHeads * vHeadDim], "BF16", TensorParallelism.Row);
   }
 
   /**
@@ -2158,10 +2170,12 @@ export class ParallelOps implements DeviceOps {
     vHeadDim: number,
     workspace: WorkspaceBase,
   ): ParallelTensor {
+    const shardNHeads = this.shardDim(numHeads, "ncclMergeTreeReduce shardNHeads");
+    const shardNumel = batchSize * shardNHeads * vHeadDim;
     const numel = batchSize * numHeads * vHeadDim;
     const lseCount = batchSize * numHeads;
+    const shardLseCount = batchSize * shardNHeads;
     const shardWss = this.getShardWorkspaces(workspace);
-    const fullVOutShape = [batchSize, numHeads * vHeadDim];
 
     let currentV: Tensor[] = [];
     let currentLse: Tensor[] = [];
@@ -2175,6 +2189,13 @@ export class ParallelOps implements DeviceOps {
     }
 
     for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
+      const isLastRound = reduceHalf === 1;
+      const outNumel = isLastRound ? shardNumel : numel;
+      const outLseCt = isLastRound ? shardLseCount : lseCount;
+      const outHeads = isLastRound ? shardNHeads : numHeads;
+      const outVShape = isLastRound ? [batchSize, shardNHeads * vHeadDim] : currentV[0].shape;
+      const outLseShape = isLastRound ? [batchSize, shardNHeads] : currentLse[0].shape;
+
       const peerV: Tensor[] = [];
       const peerLse: Tensor[] = [];
       const outputV: Tensor[] = [];
@@ -2182,8 +2203,8 @@ export class ParallelOps implements DeviceOps {
       for (let i = 0; i < this.worldSize; i++) {
         peerV.push(shardWss[i].alloc(currentV[i].shape, currentV[i].type));
         peerLse.push(shardWss[i].alloc(currentLse[i].shape, currentLse[i].type));
-        outputV.push(shardWss[i].alloc(currentV[i].shape, currentV[i].type));
-        outputLse.push(shardWss[i].alloc(currentLse[i].shape, currentLse[i].type));
+        outputV.push(shardWss[i].alloc(outVShape, currentV[i].type));
+        outputLse.push(shardWss[i].alloc(outLseShape, currentLse[i].type));
       }
 
       getNativeAddon().ncclGroupStart();
@@ -2202,7 +2223,8 @@ export class ParallelOps implements DeviceOps {
           [currentLse[i].data, peerLse[i].data],
           2,
           outputV[i], outputLse[i],
-          numel, batchSize, numHeads, vHeadDim,
+          outNumel, batchSize, numHeads, vHeadDim,
+          outHeads, isLastRound ? i * shardNHeads : 0, numHeads,
         );
       }
 
@@ -2221,7 +2243,7 @@ export class ParallelOps implements DeviceOps {
       lse[Symbol.dispose]();
     }
 
-    return this.wrapShards(workspace, currentV, fullVOutShape, "BF16", TensorParallelism.Replicated);
+    return this.wrapShards(workspace, currentV, [batchSize, numHeads * vHeadDim], "BF16", TensorParallelism.Row);
   }
 
   free(): void {
@@ -2311,6 +2333,27 @@ export class ParallelOps implements DeviceOps {
   }
 
   wrapShards(workspace: WorkspaceBase, shards: Tensor[], fullShape: number[], type: string, parallelism: TensorParallelism): ParallelTensor {
+    if (shards.length === 0) {
+      throw new Error("wrapShards: no shards provided");
+    }
+    const ws = shards.length;
+    const fullElems = fullShape.reduce((a, b) => a * b, 1);
+    const shardElems = shards[0].shape.reduce((a, b) => a * b, 1);
+    switch (parallelism) {
+      case TensorParallelism.Replicated:
+      case TensorParallelism.PartialSum:
+      case TensorParallelism.PartialSoftmax:
+        if (shardElems !== fullElems) {
+          throw new Error(`wrapShards(${parallelism}): shard elems ${shardElems} (shape [${shards[0].shape}]) != full elems ${fullElems} (shape [${fullShape}])`);
+        }
+        break;
+      case TensorParallelism.Row:
+      case TensorParallelism.Column:
+        if (shardElems * ws !== fullElems) {
+          throw new Error(`wrapShards(${parallelism}): shard elems ${shardElems} * worldSize ${ws} = ${shardElems * ws} != full elems ${fullElems} (shape [${fullShape}])`);
+        }
+        break;
+    }
     const pt = new ParallelTensor(workspace, this, parallelism, shards, fullShape, type, undefined, false, undefined);
     workspace.addTracked(pt);
     return pt;
