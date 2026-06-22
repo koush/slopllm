@@ -393,7 +393,6 @@ static void launch_cp_merge_tree(
 {
     int64_t total_heads = (int64_t)batch_size * num_heads;
     int grid = (int)total_heads;
-    if (grid > 65535) grid = 65535;
 
     #define LAUNCH_CP_TREE(VEC_SIZE, BDX) \
         cp_merge_tree_kernel<VEC_SIZE, BDX><<<grid, BDX, num_shards * (BDX * VEC_SIZE) * sizeof(__nv_bfloat16) + num_shards * sizeof(float), stream>>>( \
