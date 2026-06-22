@@ -142,7 +142,7 @@ interface NativeAddon {
   p2pAllGatherRow(ctx: number, instance: number, sendbuf: number, recvbuf: number, shardBytes: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number): void;
   p2pRmsnorm(ctx: number, instance: number, input: number, weight: number, output: number, eps: number, shardDim: number, fullDim: number, batch: number): void;
   p2pBarrier(ctx: number, instance: number, peerRank?: number): void;
-  cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, v8: number, v9: number, v10: number, v11: number, v12: number, v13: number, v14: number, v15: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, lse8: number, lse9: number, lse10: number, lse11: number, lse12: number, lse13: number, lse14: number, lse15: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number): void;
+  cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, v8: number, v9: number, v10: number, v11: number, v12: number, v13: number, v14: number, v15: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, lse8: number, lse9: number, lse10: number, lse11: number, lse12: number, lse13: number, lse14: number, lse15: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads: number, headOffset: number, inputNHeads: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number, offset: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
@@ -895,7 +895,10 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), ptr(kpeData), ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), ptr(appendKpe), ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
   }
 
-  cpMergeTree(vPtrs: number[], lsePtrs: number[], numShards: number, outputV: Tensor, outputLse: Tensor | null, numel: number, batchSize: number, numHeads: number, vHeadDim: number): void {
+  cpMergeTree(vPtrs: number[], lsePtrs: number[], numShards: number, outputV: Tensor, outputLse: Tensor | null, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void {
+    const snh = shardNHeads ?? numHeads;
+    const ho = headOffset ?? 0;
+    const inh = inputNHeads ?? numHeads;
     const v = new Array<number>(16).fill(0);
     for (let i = 0; i < numShards; i++) v[i] = vPtrs[i];
     const lse = new Array<number>(16).fill(0);
@@ -907,6 +910,7 @@ export class GlmOps implements DeviceOps {
       lse[0], lse[1], lse[2], lse[3], lse[4], lse[5], lse[6], lse[7],
       lse[8], lse[9], lse[10], lse[11], lse[12], lse[13], lse[14], lse[15],
       numShards, ptr(outputV), outputLse ? ptr(outputLse) : 0, numel, batchSize, numHeads, vHeadDim,
+      snh, ho, inh,
     );
   }
 

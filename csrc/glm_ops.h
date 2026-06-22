@@ -706,11 +706,14 @@ void glm_causal_conv1d_update(GlmCtx* ctx, void* output, void* conv_state,
 // Merges up to 16 partial (v_out, lse) pairs using the online softmax trick.
 // Supports in-place operation (output_v may alias one of the v inputs, output_lse may alias one of the lse inputs).
 // Individual pointer arguments (not arrays) for CUDA graph capture compatibility.
-// v_out inputs: [batch_size * num_heads * v_head_dim] BF16 each
+// v_out inputs: [batch_size * input_n_heads * v_head_dim] BF16 each
 // lse inputs: [batch_size * num_heads] F32 each
-// output_v: [batch_size * num_heads * v_head_dim] BF16
-// output_lse: [batch_size * num_heads] F32 (optional - pass nullptr to skip)
+// output_v: [batch_size * shard_n_heads * v_head_dim] BF16
+// output_lse: [batch_size * shard_n_heads] F32 (optional - pass nullptr to skip)
 // numel: batch_size * num_heads * v_head_dim (total BF16 elements in v_out)
+// shard_n_heads: number of heads to process/output (default num_heads = all)
+// head_offset: first head to process (default 0)
+// input_n_heads: heads per input shard stride (default num_heads = all heads per shard)
 void glm_cp_merge_tree(
     GlmCtx* ctx,
     const void* v0,  const void* v1,  const void* v2,  const void* v3,
@@ -727,7 +730,10 @@ void glm_cp_merge_tree(
     int64_t numel,
     int batch_size,
     int num_heads,
-    int v_head_dim);
+    int v_head_dim,
+    int shard_n_heads,
+    int head_offset,
+    int input_n_heads);
 
 // RMSNorm gated: output = RMSNorm(input) * weight * SiLU(gate)
 // output: [batch, dim] BF16

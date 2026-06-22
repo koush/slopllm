@@ -2878,8 +2878,8 @@ static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
 
 static Napi::Value CpMergeTree(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 40) {
-        Napi::TypeError::New(env, "Expected (ctx, v0..v15, lse0..lse15, num_shards, output_v, output_lse, numel, batch_size, num_heads, v_head_dim)").ThrowAsJavaScriptException();
+    if (info.Length() < 43) {
+        Napi::TypeError::New(env, "Expected (ctx, v0..v15, lse0..lse15, num_shards, output_v, output_lse, numel, batch_size, num_heads, v_head_dim, shard_n_heads, head_offset, input_n_heads)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -2895,6 +2895,9 @@ static Napi::Value CpMergeTree(const Napi::CallbackInfo& info) {
     int batch_size = info[37].As<Napi::Number>().Int32Value();
     int num_heads = info[38].As<Napi::Number>().Int32Value();
     int v_head_dim = info[39].As<Napi::Number>().Int32Value();
+    int shard_n_heads = info[40].As<Napi::Number>().Int32Value();
+    int head_offset = info[41].As<Napi::Number>().Int32Value();
+    int input_n_heads = info[42].As<Napi::Number>().Int32Value();
 
     glm_cp_merge_tree(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
@@ -2917,7 +2920,8 @@ static Napi::Value CpMergeTree(const Napi::CallbackInfo& info) {
         num_shards,
         reinterpret_cast<void*>(output_v_ptr),
         reinterpret_cast<float*>(output_lse_ptr),
-        numel, batch_size, num_heads, v_head_dim);
+        numel, batch_size, num_heads, v_head_dim,
+        shard_n_heads, head_offset, input_n_heads);
 
     cudaError_t cp_err = cudaGetLastError();
     if (cp_err != cudaSuccess) {

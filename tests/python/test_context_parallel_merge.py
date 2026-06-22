@@ -56,13 +56,13 @@ class TestContextParallelMerge:
         merged_v_out = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_lse_out = torch.empty(B, H, dtype=torch.float32, device=device)
         
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_out.data_ptr(),
             merged_lse_out.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         glm.synchronize()
         
@@ -82,13 +82,13 @@ class TestContextParallelMerge:
         merged_v_out = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_lse_out = torch.empty(B, H, dtype=torch.float32, device=device)
         
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_out.data_ptr(),
             merged_lse_out.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         glm.synchronize()
         
@@ -108,13 +108,13 @@ class TestContextParallelMerge:
         merged_v_out = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_lse_out = torch.empty(B, H, dtype=torch.float32, device=device)
         
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_out.data_ptr(),
             merged_lse_out.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         glm.synchronize()
         
@@ -134,13 +134,13 @@ class TestContextParallelMerge:
         merged_v_out = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_lse_out = torch.empty(B, H, dtype=torch.float32, device=device)
         
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_out.data_ptr(),
             merged_lse_out.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         glm.synchronize()
         
@@ -158,13 +158,13 @@ class TestContextParallelMerge:
         merged_v_out = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_lse_out = torch.empty(B, H, dtype=torch.float32, device=device)
         
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [v.data_ptr()],
             [lse.data_ptr()],
             1,
             merged_v_out.data_ptr(),
             merged_lse_out.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         glm.synchronize()
         
@@ -186,17 +186,17 @@ class TestContextParallelMerge:
         lse_ab = torch.empty(B, H, dtype=torch.float32, device=device)
         lse_ba = torch.empty(B, H, dtype=torch.float32, device=device)
         
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [v0.data_ptr(), v1.data_ptr()],
             [lse0.data_ptr(), lse1.data_ptr()],
             2, merged_ab.data_ptr(), lse_ab.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [v1.data_ptr(), v0.data_ptr()],
             [lse1.data_ptr(), lse0.data_ptr()],
             2, merged_ba.data_ptr(), lse_ba.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         glm.synchronize()
         
@@ -218,39 +218,39 @@ class TestContextParallelMerge:
         # merge(a, b) first, then merge with c
         merged_ab_v = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_ab_lse = torch.empty(B, H, dtype=torch.float32, device=device)
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [v0.data_ptr(), v1.data_ptr()],
             [lse0.data_ptr(), lse1.data_ptr()],
             2, merged_ab_v.data_ptr(), merged_ab_lse.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         
         merged_ab_c_v = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_ab_c_lse = torch.empty(B, H, dtype=torch.float32, device=device)
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [merged_ab_v.data_ptr(), v2.data_ptr()],
             [merged_ab_lse.data_ptr(), lse2.data_ptr()],
             2, merged_ab_c_v.data_ptr(), merged_ab_c_lse.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         
         # merge(b, c) first, then merge with a
         merged_bc_v = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_bc_lse = torch.empty(B, H, dtype=torch.float32, device=device)
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [v1.data_ptr(), v2.data_ptr()],
             [lse1.data_ptr(), lse2.data_ptr()],
             2, merged_bc_v.data_ptr(), merged_bc_lse.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         
         merged_a_bc_v = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_a_bc_lse = torch.empty(B, H, dtype=torch.float32, device=device)
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [v0.data_ptr(), merged_bc_v.data_ptr()],
             [lse0.data_ptr(), merged_bc_lse.data_ptr()],
             2, merged_a_bc_v.data_ptr(), merged_a_bc_lse.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         
         glm.synchronize()
@@ -258,11 +258,11 @@ class TestContextParallelMerge:
         # Also verify against 3-shard direct merge
         merged_3_v = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_3_lse = torch.empty(B, H, dtype=torch.float32, device=device)
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [v0.data_ptr(), v1.data_ptr(), v2.data_ptr()],
             [lse0.data_ptr(), lse1.data_ptr(), lse2.data_ptr()],
             3, merged_3_v.data_ptr(), merged_3_lse.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         glm.synchronize()
         
@@ -296,13 +296,13 @@ class TestContextParallelMerge:
         # Path 3: CUDA kernel merge in vHeadDim space
         merged_v_cuda = torch.empty(B, H, v_head_dim, dtype=torch.bfloat16, device=device)
         merged_lse_cuda = torch.empty(B, H, dtype=torch.float32, device=device)
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_cuda.data_ptr(),
             merged_lse_cuda.data_ptr(),
-            B, H, v_head_dim
+            B * H * v_head_dim, B, H, v_head_dim
         )
         glm.synchronize()
         
@@ -324,13 +324,13 @@ class TestContextParallelMerge:
         merged_v_out = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         merged_lse_out = torch.empty(B, H, dtype=torch.float32, device=device)
         
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_out.data_ptr(),
             merged_lse_out.data_ptr(),
-            B, H, D
+            B * H * D, B, H, D
         )
         glm.synchronize()
         
@@ -350,13 +350,13 @@ class TestContextParallelMerge:
         
         merged_v_out = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
         
-        glm.context_parallel_merge(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in partial_v_outs],
             [t.data_ptr() for t in partial_lses],
             num_shards,
             merged_v_out.data_ptr(),
             None,
-            B, H, D
+            B * H * D, B, H, D
         )
         glm.synchronize()
         

@@ -56,7 +56,10 @@ cp_merge_tree_kernel(
     int v_head_dim,
     int heads_per_block,
     int v_peer_stride,
-    int lse_peer_stride)
+    int lse_peer_stride,
+    int shard_n_heads,
+    int head_offset,
+    int input_n_heads)
 {
     (void)numel; (void)heads_per_block; (void)v_peer_stride; (void)lse_peer_stride; (void)v_head_dim;
     constexpr int head_dim = VEC_SIZE * BDX;
@@ -68,8 +71,9 @@ cp_merge_tree_kernel(
     int tid = threadIdx.x;
 
     int64_t bh = blockIdx.x;
-    int b = (int)(bh / num_heads);
-    int h = (int)(bh % num_heads);
+    int b = (int)(bh / shard_n_heads);
+    int local_h = (int)(bh % shard_n_heads);
+    int h = local_h + head_offset;
 
     if (b >= batch_size) return;
 
@@ -86,20 +90,22 @@ cp_merge_tree_kernel(
     __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem);
     float* smem_lse = reinterpret_cast<float*>(smem + N * v_shard_bytes);
 
-    int64_t v_offset = (int64_t)(b * num_heads + h) * head_dim;
-    int64_t lse_offset = (int64_t)b * num_heads + h;
+    int64_t v_in_offset = (int64_t)(b * input_n_heads + h) * head_dim;
+    int64_t lse_in_offset = (int64_t)b * num_heads + h;
+    int64_t v_out_offset = (int64_t)(b * shard_n_heads + local_h) * head_dim;
+    int64_t lse_out_offset = (int64_t)b * shard_n_heads + local_h;
 
     #pragma unroll
     for (int s = 0; s < NUM_SHARDS; s++) {
         if (s >= N) break;
         cg::memcpy_async(block,
             smem_v + s * head_dim,
-            v_ptrs[s] + v_offset,
+            v_ptrs[s] + v_in_offset,
             v_shard_bytes);
     }
 
     if (tid < N) {
-        cg::memcpy_async(thread, &smem_lse[tid], lse_ptrs[tid] + lse_offset, sizeof(float));
+        cg::memcpy_async(thread, &smem_lse[tid], lse_ptrs[tid] + lse_in_offset, sizeof(float));
     }
 
     cg::wait(block);
@@ -117,10 +123,10 @@ cp_merge_tree_kernel(
         }
 
         st.normalize();
-        st.o.cast_store(output_v + v_offset + tid * VEC_SIZE);
+        st.o.cast_store(output_v + v_out_offset + tid * VEC_SIZE);
 
         if (output_lse != nullptr && tid == 0)
-            output_lse[lse_offset] = st.get_lse();
+            output_lse[lse_out_offset] = st.get_lse();
     }
 }
 
@@ -134,9 +140,12 @@ static void launch_cp_merge_tree(
     int batch_size,
     int num_heads,
     int v_head_dim,
+    int shard_n_heads,
+    int head_offset,
+    int input_n_heads,
     cudaStream_t stream)
 {
-    int64_t total_heads = (int64_t)batch_size * num_heads;
+    int64_t total_heads = (int64_t)batch_size * shard_n_heads;
     int grid = (int)total_heads;
 
     #define LAUNCH_CP_TREE(VEC_SIZE, BDX) \
@@ -150,7 +159,7 @@ static void launch_cp_merge_tree(
             lse_ptrs[8], lse_ptrs[9], lse_ptrs[10], lse_ptrs[11], \
             lse_ptrs[12], lse_ptrs[13], lse_ptrs[14], lse_ptrs[15], \
             output_v, output_lse, num_shards, numel, batch_size, num_heads, v_head_dim, \
-            0, 0, 0)
+            0, 0, 0, shard_n_heads, head_offset, input_n_heads)
 
     switch (v_head_dim) {
         case 32:  LAUNCH_CP_TREE(4, 8); break;
@@ -184,7 +193,10 @@ void glm_cp_merge_tree(
     int64_t numel,
     int batch_size,
     int num_heads,
-    int v_head_dim)
+    int v_head_dim,
+    int shard_n_heads,
+    int head_offset,
+    int input_n_heads)
 {
     cudaSetDevice(ctx->device_id);
 
@@ -221,6 +233,7 @@ void glm_cp_merge_tree(
         v_ptrs, lse_ptr_arr, num_shards,
         reinterpret_cast<__nv_bfloat16*>(output_v), output_lse,
         numel, batch_size, num_heads, v_head_dim,
+        shard_n_heads, head_offset, input_n_heads,
         GLM_STREAM(ctx));
 }
 

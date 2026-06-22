@@ -1,4 +1,4 @@
-"""Test context_parallel_merge_heads with shard-layout v_out input.
+"""Test cp_merge_tree with shard-layout v_out input and per-head merge.
 
 When input_n_heads=shard_n_heads (column-parallel v_proj output), each shard's
 v_out is [B, shard_n_heads, D]. This is only valid when head_offset=0 because
@@ -116,13 +116,14 @@ class TestCpMergeShardLayout:
         merged_v = torch.empty(B, snh, D, dtype=torch.bfloat16, device=device)
         merged_lse = torch.empty(B, snh, dtype=torch.float32, device=device)
 
-        glm.context_parallel_merge_heads(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in shard_v_outs],
             [t.data_ptr() for t in full_lses],
             num_shards,
             merged_v.data_ptr(),
             merged_lse.data_ptr(),
-            B, H, snh, head_offset, snh, D
+            B * snh * D, B, H, D,
+            snh, head_offset, snh
         )
         glm.synchronize()
 
@@ -149,13 +150,14 @@ class TestCpMergeShardLayout:
         merged_v = torch.empty(B, snh, D, dtype=torch.bfloat16, device=device)
         merged_lse = torch.empty(B, snh, dtype=torch.float32, device=device)
 
-        glm.context_parallel_merge_heads(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in full_v_outs],
             [t.data_ptr() for t in full_lses],
             num_shards,
             merged_v.data_ptr(),
             merged_lse.data_ptr(),
-            B, H, snh, head_offset, H, D
+            B * snh * D, B, H, D,
+            snh, head_offset, H
         )
         glm.synchronize()
 
@@ -182,13 +184,14 @@ class TestCpMergeShardLayout:
         merged_v = torch.empty(B, snh, D, dtype=torch.bfloat16, device=device)
         merged_lse = torch.empty(B, snh, dtype=torch.float32, device=device)
 
-        glm.context_parallel_merge_heads(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in full_v_outs],
             [t.data_ptr() for t in full_lses],
             num_shards,
             merged_v.data_ptr(),
             merged_lse.data_ptr(),
-            B, H, snh, head_offset, H, D
+            B * snh * D, B, H, D,
+            snh, head_offset, H
         )
         glm.synchronize()
 
@@ -219,13 +222,14 @@ class TestCpMergeShardLayout:
 
             merged_v = torch.empty(B, snh, D, dtype=torch.bfloat16, device=device)
             merged_lse = torch.empty(B, snh, dtype=torch.float32, device=device)
-            glm.context_parallel_merge_heads(
+            glm.cp_merge_tree(
                 [t.data_ptr() for t in full_v_outs],
                 [t.data_ptr() for t in full_lses],
                 num_shards,
                 merged_v.data_ptr(),
                 merged_lse.data_ptr(),
-                B, H, snh, offset, H, D
+                B * snh * D, B, H, D,
+                snh, offset, H
             )
             merged_v_shards.append(merged_v)
             merged_lse_shards.append(merged_lse)
@@ -260,13 +264,14 @@ class TestCpMergeShardLayout:
 
             merged_v = torch.empty(B, snh, D, dtype=torch.bfloat16, device=device)
             merged_lse = torch.empty(B, snh, dtype=torch.float32, device=device)
-            glm.context_parallel_merge_heads(
+            glm.cp_merge_tree(
                 [t.data_ptr() for t in full_v_outs],
                 [t.data_ptr() for t in full_lses],
                 num_shards,
                 merged_v.data_ptr(),
                 merged_lse.data_ptr(),
-                B, H, snh, offset, H, D
+                B * snh * D, B, H, D,
+                snh, offset, H
             )
             glm.synchronize()
             torch.testing.assert_close(
@@ -296,13 +301,14 @@ class TestCpMergeShardLayout:
         merged_v = torch.empty(B, snh, D, dtype=torch.bfloat16, device=device)
         merged_lse = torch.empty(B, snh, dtype=torch.float32, device=device)
 
-        glm.context_parallel_merge_heads(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in full_v_outs],
             [t.data_ptr() for t in full_lses],
             num_shards,
             merged_v.data_ptr(),
             merged_lse.data_ptr(),
-            B, H, snh, head_offset, H, D
+            B * snh * D, B, H, D,
+            snh, head_offset, H
         )
         glm.synchronize()
 
@@ -329,13 +335,14 @@ class TestCpMergeShardLayout:
         merged_v = torch.empty(B, snh, D, dtype=torch.bfloat16, device=device)
         merged_lse = torch.empty(B, snh, dtype=torch.float32, device=device)
 
-        glm.context_parallel_merge_heads(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in full_v_outs],
             [t.data_ptr() for t in full_lses],
             num_shards,
             merged_v.data_ptr(),
             merged_lse.data_ptr(),
-            B, H, snh, head_offset, H, D
+            B * snh * D, B, H, D,
+            snh, head_offset, H
         )
         glm.synchronize()
 
@@ -358,13 +365,14 @@ class TestCpMergeShardLayout:
         merged_v = torch.empty(B, snh, D, dtype=torch.bfloat16, device=device)
         merged_lse = torch.empty(B, snh, dtype=torch.float32, device=device)
 
-        glm.context_parallel_merge_heads(
+        glm.cp_merge_tree(
             [full_v.data_ptr()],
             [full_lse.data_ptr()],
             1,
             merged_v.data_ptr(),
             merged_lse.data_ptr(),
-            B, H, snh, head_offset, H, D
+            B * snh * D, B, H, D,
+            snh, head_offset, H
         )
         glm.synchronize()
 
@@ -394,13 +402,14 @@ class TestCpMergeShardLayout:
         merged_v = torch.empty(B, snh, D, dtype=torch.bfloat16, device=device)
         merged_lse = torch.empty(B, snh, dtype=torch.float32, device=device)
 
-        glm.context_parallel_merge_heads(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in full_v_outs],
             [t.data_ptr() for t in full_lses],
             num_shards,
             merged_v.data_ptr(),
             merged_lse.data_ptr(),
-            B, H, snh, head_offset, H, D
+            B * snh * D, B, H, D,
+            snh, head_offset, H
         )
         glm.synchronize()
 
@@ -430,13 +439,14 @@ class TestCpMergeShardLayout:
         merged_v = torch.empty(B, snh, D, dtype=torch.bfloat16, device=device)
         merged_lse = torch.empty(B, snh, dtype=torch.float32, device=device)
 
-        glm.context_parallel_merge_heads(
+        glm.cp_merge_tree(
             [t.data_ptr() for t in shard_v_outs],
             [t.data_ptr() for t in full_lses],
             num_shards,
             merged_v.data_ptr(),
             merged_lse.data_ptr(),
-            B, H, snh, head_offset, snh, D
+            B * snh * D, B, H, D,
+            snh, head_offset, snh
         )
         glm.synchronize()
 
