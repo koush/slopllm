@@ -697,50 +697,10 @@ void glm_causal_conv1d(GlmCtx* ctx, void* output, void* conv_state,
 // weight layout: [conv_dim, kernel_size] (BF16)
 // conv_state_stride: stride (in bf16 elements) between batch elements in conv_state
 void glm_causal_conv1d_update(GlmCtx* ctx, void* output, void* conv_state,
-                               const void* input, const void* weight,
-                               int conv_dim, int kernel_size,
-                               int batch_size, int conv_state_stride);
+                                const void* input, const void* weight,
+                                int conv_dim, int kernel_size,
+                                int batch_size, int conv_state_stride);
 
-// Context Parallelism: Online softmax merge of partial attention outputs.
-// Merges N partial (v_out, lse) pairs using FlashInfer's state_t::merge.
-// partial_v_outs[i]: [batch_size * num_heads * v_head_dim] BF16
-// partial_lses[i]:   [batch_size * num_heads] F32 (base-2 log-sum-exp)
-// merged_v_out:      [batch_size * num_heads * v_head_dim] BF16
-// merged_lse:        [batch_size * num_heads] F32 (optional, pass nullptr to skip)
-// num_shards: number of partial attention outputs (1, 2, 4, 8, or 16)
-// v_head_dim: per-head output dimension (32, 64, 128, 256, or 512)
-void glm_context_parallel_merge(
-    GlmCtx* ctx,
-    const void* const* partial_v_outs,
-    const float* const* partial_lses,
-    int num_shards,
-    void* merged_v_out,
-    float* merged_lse,
-    int batch_size,
-    int num_heads,
-    int v_head_dim);
-
-// Head-grouped context parallel merge: only processes and outputs heads
-// [head_offset, head_offset + shard_n_heads). Output is contiguous
-// [batch_size * shard_n_heads * v_head_dim] (Row-parallel layout).
-// input_n_heads: number of heads per input shard (stride for v_out indexing).
-//   Equals num_heads when v_proj is replicated (each shard has all heads),
-//   or shard_n_heads when v_proj is column-parallel (each shard has its head group).
-// When shard_n_heads == num_heads, head_offset == 0, and input_n_heads == num_heads,
-// equivalent to glm_context_parallel_merge.
-void glm_context_parallel_merge_heads(
-    GlmCtx* ctx,
-    const void* const* partial_v_outs,
-    const float* const* partial_lses,
-    int num_shards,
-    void* merged_v_out,
-    float* merged_lse,
-    int batch_size,
-    int num_heads,
-    int shard_n_heads,
-    int head_offset,
-    int input_n_heads,
-    int v_head_dim);
 
 // CP Merge Tree: smem-staged online softmax merge using cp.async.bulk.
 // Merges up to 16 partial (v_out, lse) pairs using the online softmax trick.

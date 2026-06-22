@@ -142,8 +142,6 @@ interface NativeAddon {
   p2pAllGatherRow(ctx: number, instance: number, sendbuf: number, recvbuf: number, shardBytes: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number): void;
   p2pRmsnorm(ctx: number, instance: number, input: number, weight: number, output: number, eps: number, shardDim: number, fullDim: number, batch: number): void;
   p2pBarrier(ctx: number, instance: number, peerRank?: number): void;
-  contextParallelMerge(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void;
-  contextParallelMergeHeads(ctx: number, vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: number, mergedLse: number, batchSize: number, numHeads: number, shardNHeads: number, headOffset: number, inputNHeads: number, vHeadDim: number): void;
   cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, v8: number, v9: number, v10: number, v11: number, v12: number, v13: number, v14: number, v15: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, lse8: number, lse9: number, lse10: number, lse11: number, lse12: number, lse13: number, lse14: number, lse15: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number, offset: number): void;
@@ -895,17 +893,6 @@ export class GlmOps implements DeviceOps {
 
   mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): void {
     getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), ptr(kpeData), ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), ptr(appendKpe), ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
-  }
-
-  contextParallelMerge(vPtrs: number[], lsePtrs: number[], numShards: number, mergedVOut: Tensor, mergedLse: Tensor | null, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void {
-    const snh = shardNHeads ?? numHeads;
-    const ho = headOffset ?? 0;
-    const inh = inputNHeads ?? snh;
-    if (snh === numHeads && ho === 0 && inh === numHeads) {
-      getNativeAddon().contextParallelMerge(this.ctx, vPtrs, lsePtrs, numShards, ptr(mergedVOut), mergedLse ? ptr(mergedLse) : 0, batchSize, numHeads, vHeadDim);
-    } else {
-      getNativeAddon().contextParallelMergeHeads(this.ctx, vPtrs, lsePtrs, numShards, ptr(mergedVOut), mergedLse ? ptr(mergedLse) : 0, batchSize, numHeads, snh, ho, inh, vHeadDim);
-    }
   }
 
   cpMergeTree(vPtrs: number[], lsePtrs: number[], numShards: number, outputV: Tensor, outputLse: Tensor | null, numel: number, batchSize: number, numHeads: number, vHeadDim: number): void {

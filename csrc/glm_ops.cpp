@@ -2876,97 +2876,6 @@ static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value ContextParallelMerge(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 9) {
-        Napi::TypeError::New(env, "Expected (ctx, v_ptrs, lse_ptrs, num_shards, merged_v_out, merged_lse, batch_size, num_heads, v_head_dim)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    Napi::Array v_ptrs_arr = info[1].As<Napi::Array>();
-    Napi::Array lse_ptrs_arr = info[2].As<Napi::Array>();
-    int num_shards = info[3].As<Napi::Number>().Int32Value();
-    uintptr_t merged_v_out_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t merged_lse_ptr = info[5].As<Napi::Number>().Int64Value();
-    int batch_size = info[6].As<Napi::Number>().Int32Value();
-    int num_heads = info[7].As<Napi::Number>().Int32Value();
-    int v_head_dim = info[8].As<Napi::Number>().Int32Value();
-
-    if (v_ptrs_arr.Length() != (uint32_t)num_shards || lse_ptrs_arr.Length() != (uint32_t)num_shards) {
-        Napi::TypeError::New(env, "v_ptrs and lse_ptrs arrays must have num_shards elements").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-
-    const void* v_ptrs[16];
-    const float* lse_ptrs[16];
-    memset(v_ptrs, 0, sizeof(v_ptrs));
-    memset(lse_ptrs, 0, sizeof(lse_ptrs));
-    for (int i = 0; i < num_shards; ++i) {
-        v_ptrs[i] = reinterpret_cast<const void*>(v_ptrs_arr.Get(i).As<Napi::Number>().Int64Value());
-        lse_ptrs[i] = reinterpret_cast<const float*>(lse_ptrs_arr.Get(i).As<Napi::Number>().Int64Value());
-    }
-
-    glm_context_parallel_merge(
-        reinterpret_cast<GlmCtx*>(ctx_ptr),
-        v_ptrs, lse_ptrs, num_shards,
-        reinterpret_cast<void*>(merged_v_out_ptr),
-        reinterpret_cast<float*>(merged_lse_ptr),
-        batch_size, num_heads, v_head_dim);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        Napi::Error::New(env, std::string("contextParallelMerge failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
-    }
-    return env.Undefined();
-}
-
-static Napi::Value ContextParallelMergeHeads(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 12) {
-        Napi::TypeError::New(env, "Expected (ctx, v_ptrs, lse_ptrs, num_shards, merged_v_out, merged_lse, batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_head_dim)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    Napi::Array v_ptrs_arr = info[1].As<Napi::Array>();
-    Napi::Array lse_ptrs_arr = info[2].As<Napi::Array>();
-    int num_shards = info[3].As<Napi::Number>().Int32Value();
-    uintptr_t merged_v_out_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t merged_lse_ptr = info[5].As<Napi::Number>().Int64Value();
-    int batch_size = info[6].As<Napi::Number>().Int32Value();
-    int num_heads = info[7].As<Napi::Number>().Int32Value();
-    int shard_n_heads = info[8].As<Napi::Number>().Int32Value();
-    int head_offset = info[9].As<Napi::Number>().Int32Value();
-    int input_n_heads = info[10].As<Napi::Number>().Int32Value();
-    int v_head_dim = info[11].As<Napi::Number>().Int32Value();
-
-    if (v_ptrs_arr.Length() != (uint32_t)num_shards || lse_ptrs_arr.Length() != (uint32_t)num_shards) {
-        Napi::TypeError::New(env, "v_ptrs and lse_ptrs arrays must have num_shards elements").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-
-    const void* v_ptrs[16];
-    const float* lse_ptrs[16];
-    memset(v_ptrs, 0, sizeof(v_ptrs));
-    memset(lse_ptrs, 0, sizeof(lse_ptrs));
-    for (int i = 0; i < num_shards; ++i) {
-        v_ptrs[i] = reinterpret_cast<const void*>(v_ptrs_arr.Get(i).As<Napi::Number>().Int64Value());
-        lse_ptrs[i] = reinterpret_cast<const float*>(lse_ptrs_arr.Get(i).As<Napi::Number>().Int64Value());
-    }
-
-    glm_context_parallel_merge_heads(
-        reinterpret_cast<GlmCtx*>(ctx_ptr),
-        v_ptrs, lse_ptrs, num_shards,
-        reinterpret_cast<void*>(merged_v_out_ptr),
-        reinterpret_cast<float*>(merged_lse_ptr),
-        batch_size, num_heads, shard_n_heads, head_offset, input_n_heads, v_head_dim);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        Napi::Error::New(env, std::string("contextParallelMergeHeads failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
-    }
-    return env.Undefined();
-}
-
 static Napi::Value CpMergeTree(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 40) {
@@ -3663,8 +3572,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "causalConv1dUpdate"), Napi::Function::New(env, CausalConv1dUpdate));
     exports.Set(Napi::String::New(env, "rmsnormGated"), Napi::Function::New(env, RmsnormGated));
     exports.Set(Napi::String::New(env, "gateSigmoidMul"), Napi::Function::New(env, GateSigmoidMul));
-    exports.Set(Napi::String::New(env, "contextParallelMerge"), Napi::Function::New(env, ContextParallelMerge));
-    exports.Set(Napi::String::New(env, "contextParallelMergeHeads"), Napi::Function::New(env, ContextParallelMergeHeads));
     exports.Set(Napi::String::New(env, "cpMergeTree"), Napi::Function::New(env, CpMergeTree));
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
     exports.Set(Napi::String::New(env, "rotateInputIds"), Napi::Function::New(env, RotateInputIds));

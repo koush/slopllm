@@ -370,10 +370,6 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  contextParallelMerge(lse: Tensor, vHeadDim: number, nHeads: number, seqLen: number, batch: number, shardNHeads?: number): Tensor {
-    return undefined as never;
-  }
-
   sigmoid(): Tensor {
     return undefined as never;
   }
