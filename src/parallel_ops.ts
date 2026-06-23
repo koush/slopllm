@@ -2014,74 +2014,40 @@ export class ParallelOps implements DeviceOps {
     vHeadDim: number,
     workspace: WorkspaceBase,
   ): ParallelTensor {
-    const shardNHeads = this.shardDim(numHeads, "cpMergeTreeReduce shardNHeads");
-    const shardNumel = batchSize * shardNHeads * vHeadDim;
+    // slow path (prefill): allocate peer buffers, memcpy, barrier
+    if (batchSize >= 256) {
+      return this.butterflyMergeReduce(
+        partialVOuts, partialLses, batchSize, numHeads, vHeadDim, workspace,
+        (reduceHalf, shardWss, currentV, currentLse) => {
+          const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
+          const peerV: Tensor[] = new Array(this.worldSize);
+          const peerLse: Tensor[] = new Array(this.worldSize);
+          const sourceBuffers: Tensor[] = [];
+          for (let s = 0; s < this.worldSize; s++) {
+            const r = s ^ reduceHalf;
+            const pv = shardWss[r].alloc(currentV[s].shape, currentV[s].type);
+            const pl = shardWss[r].alloc(currentLse[s].shape, currentLse[s].type);
+            pv.memcpy(currentV[s], currentV[s].bytes, MemcpyKind.DeviceToDevice);
+            pl.memcpy(currentLse[s], currentLse[s].bytes, MemcpyKind.DeviceToDevice);
+            peerV[r] = pv;
+            peerLse[r] = pl;
+            sourceBuffers.push(pv, pl);
+          }
 
-    // fast path for decode that does p2p
-    if (batchSize < 256) {
-      const numel = batchSize * numHeads * vHeadDim;
-      const shardWss = this.getShardWorkspaces(workspace);
+          this.p2pBarrier(peerRanks);
+          if (reduceHalf === this.worldSize / 2) {
+            this.sourceCleanup();
+          }
+          this.p2pSources.push(...sourceBuffers);
 
-      let currentV: Tensor[] = [];
-      let currentLse: Tensor[] = [];
-      for (let i = 0; i < this.worldSize; i++) {
-        const v = shardWss[i].alloc(partialVOuts[i].shape, partialVOuts[i].type);
-        v.memcpy(partialVOuts[i]);
-        currentV.push(v);
-        const lse = shardWss[i].alloc(partialLses[i].shape, partialLses[i].type);
-        lse.memcpy(partialLses[i]);
-        currentLse.push(lse);
-      }
-
-      for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
-        const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
-        const isLastRound = reduceHalf === 1;
-        const outNumel = isLastRound ? shardNumel : numel;
-        const outHeads = isLastRound ? shardNHeads : numHeads;
-        const outVShape = isLastRound ? [batchSize, shardNHeads * vHeadDim] : currentV[0].shape;
-        const outLseShape = isLastRound ? [batchSize, shardNHeads] : currentLse[0].shape;
-
-        const outputV: Tensor[] = [];
-        const outputLse: Tensor[] = [];
-        for (let i = 0; i < this.worldSize; i++) {
-          outputV.push(shardWss[i].alloc(outVShape, currentV[i].type));
-          outputLse.push(shardWss[i].alloc(outLseShape, currentLse[i].type));
-        }
-
-        this.p2pBarrier(peerRanks);
-        if (reduceHalf === this.worldSize / 2) {
-          this.sourceCleanup();
-        }
-        this.p2pSources.push(...currentV, ...currentLse);
-
-        for (let i = 0; i < this.worldSize; i++) {
-          const peer = i ^ reduceHalf;
-          this.devices[i].cpMergeTree(
-            [currentV[i].data, currentV[peer].data],
-            [currentLse[i].data, currentLse[peer].data],
-            2,
-            outputV[i], outputLse[i],
-            outNumel, batchSize, numHeads, vHeadDim,
-            outHeads, isLastRound ? i * shardNHeads : 0, numHeads,
-          );
-        }
-
-        for (let i = 0; i < this.worldSize; i++) {
-          currentV[i][Symbol.dispose]();
-          currentLse[i][Symbol.dispose]();
-        }
-
-        currentV = outputV;
-        currentLse = outputLse;
-      }
-
-      for (const lse of currentLse) {
-        lse[Symbol.dispose]();
-      }
-
-      return this.wrapShards(workspace, currentV, [batchSize, numHeads * vHeadDim], "BF16", TensorParallelism.Row);
+          return { peerV, peerLse, toDisposeAfterMerge: [] };
+        },
+      );
     }
 
+    // fast path for decode that does direct p2p reads
+    const shardNHeads = this.shardDim(numHeads, "cpMergeTreeReduce shardNHeads");
+    const shardNumel = batchSize * shardNHeads * vHeadDim;
     const numel = batchSize * numHeads * vHeadDim;
     const shardWss = this.getShardWorkspaces(workspace);
 
@@ -2104,18 +2070,9 @@ export class ParallelOps implements DeviceOps {
       const outVShape = isLastRound ? [batchSize, shardNHeads * vHeadDim] : currentV[0].shape;
       const outLseShape = isLastRound ? [batchSize, shardNHeads] : currentLse[0].shape;
 
-      const peerShards: Tensor[] = [];
-      const peerLses: Tensor[] = [];
       const outputV: Tensor[] = [];
       const outputLse: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        const peer = i ^ reduceHalf;
-        const peerShard = shardWss[peer].alloc(currentV[i].shape, currentV[i].type);
-        const peerLse = shardWss[peer].alloc(currentLse[i].shape, currentLse[i].type);
-        peerShard.memcpy(currentV[i], currentV[i].bytes, MemcpyKind.DeviceToDevice);
-        peerLse.memcpy(currentLse[i], currentLse[i].bytes, MemcpyKind.DeviceToDevice);
-        peerShards.push(peerShard);
-        peerLses.push(peerLse);
         outputV.push(shardWss[i].alloc(outVShape, currentV[i].type));
         outputLse.push(shardWss[i].alloc(outLseShape, currentLse[i].type));
       }
@@ -2124,13 +2081,13 @@ export class ParallelOps implements DeviceOps {
       if (reduceHalf === this.worldSize / 2) {
         this.sourceCleanup();
       }
-      this.p2pSources.push(...peerShards, ...peerLses);
+      this.p2pSources.push(...currentV, ...currentLse);
 
       for (let i = 0; i < this.worldSize; i++) {
         const peer = i ^ reduceHalf;
         this.devices[i].cpMergeTree(
-          [currentV[i].data, peerShards[peer].data],
-          [currentLse[i].data, peerLses[peer].data],
+          [currentV[i].data, currentV[peer].data],
+          [currentLse[i].data, currentLse[peer].data],
           2,
           outputV[i], outputLse[i],
           outNumel, batchSize, numHeads, vHeadDim,
@@ -2170,11 +2127,59 @@ export class ParallelOps implements DeviceOps {
     vHeadDim: number,
     workspace: WorkspaceBase,
   ): ParallelTensor {
-    const shardNHeads = this.shardDim(numHeads, "ncclMergeTreeReduce shardNHeads");
-    const shardNumel = batchSize * shardNHeads * vHeadDim;
     const numel = batchSize * numHeads * vHeadDim;
     const lseCount = batchSize * numHeads;
-    const shardLseCount = batchSize * shardNHeads;
+
+    return this.butterflyMergeReduce(
+      partialVOuts, partialLses, batchSize, numHeads, vHeadDim, workspace,
+      (reduceHalf, shardWss, currentV, currentLse) => {
+        const peerV: Tensor[] = [];
+        const peerLse: Tensor[] = [];
+        for (let i = 0; i < this.worldSize; i++) {
+          peerV.push(shardWss[i].alloc(currentV[i].shape, currentV[i].type));
+          peerLse.push(shardWss[i].alloc(currentLse[i].shape, currentLse[i].type));
+        }
+
+        getNativeAddon().ncclGroupStart();
+        for (let i = 0; i < this.worldSize; i++) {
+          const peer = i ^ reduceHalf;
+          getNativeAddon().ncclSend(this.comms[i], this.devices[i].ctx, currentV[i].data, numel, NCCL_BFLOAT16, peer);
+          getNativeAddon().ncclSend(this.comms[i], this.devices[i].ctx, currentLse[i].data, lseCount, NCCL_FLOAT32, peer);
+          getNativeAddon().ncclRecv(this.comms[i], this.devices[i].ctx, peerV[i].data, numel, NCCL_BFLOAT16, peer);
+          getNativeAddon().ncclRecv(this.comms[i], this.devices[i].ctx, peerLse[i].data, lseCount, NCCL_FLOAT32, peer);
+        }
+        getNativeAddon().ncclGroupEnd();
+
+        return { peerV, peerLse, toDisposeAfterMerge: [...peerV, ...peerLse] };
+      },
+    );
+  }
+
+  /**
+   * Shared butterfly tree reduction for CP merge. Handles the common loop
+   * structure: copy inputs, iterate log2(N) rounds of pairwise merge, dispose.
+   *
+   * The transferFn callback handles per-round peer data exchange (P2P memcpy
+   * or NCCL Send/Recv) and returns receiver-indexed peerV/peerLse arrays
+   * plus any tensors to dispose after the merge call.
+   */
+  private butterflyMergeReduce(
+    partialVOuts: readonly Tensor[],
+    partialLses: readonly Tensor[],
+    batchSize: number,
+    numHeads: number,
+    vHeadDim: number,
+    workspace: WorkspaceBase,
+    transferFn: (
+      reduceHalf: number,
+      shardWss: WorkspaceBase[],
+      currentV: readonly Tensor[],
+      currentLse: readonly Tensor[],
+    ) => { peerV: Tensor[]; peerLse: Tensor[]; toDisposeAfterMerge: Tensor[] },
+  ): ParallelTensor {
+    const shardNHeads = this.shardDim(numHeads, "butterflyMergeReduce shardNHeads");
+    const shardNumel = batchSize * shardNHeads * vHeadDim;
+    const numel = batchSize * numHeads * vHeadDim;
     const shardWss = this.getShardWorkspaces(workspace);
 
     let currentV: Tensor[] = [];
@@ -2191,31 +2196,18 @@ export class ParallelOps implements DeviceOps {
     for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
       const isLastRound = reduceHalf === 1;
       const outNumel = isLastRound ? shardNumel : numel;
-      const outLseCt = isLastRound ? shardLseCount : lseCount;
       const outHeads = isLastRound ? shardNHeads : numHeads;
       const outVShape = isLastRound ? [batchSize, shardNHeads * vHeadDim] : currentV[0].shape;
       const outLseShape = isLastRound ? [batchSize, shardNHeads] : currentLse[0].shape;
 
-      const peerV: Tensor[] = [];
-      const peerLse: Tensor[] = [];
+      const { peerV, peerLse, toDisposeAfterMerge } = transferFn(reduceHalf, shardWss, currentV, currentLse);
+
       const outputV: Tensor[] = [];
       const outputLse: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        peerV.push(shardWss[i].alloc(currentV[i].shape, currentV[i].type));
-        peerLse.push(shardWss[i].alloc(currentLse[i].shape, currentLse[i].type));
         outputV.push(shardWss[i].alloc(outVShape, currentV[i].type));
         outputLse.push(shardWss[i].alloc(outLseShape, currentLse[i].type));
       }
-
-      getNativeAddon().ncclGroupStart();
-      for (let i = 0; i < this.worldSize; i++) {
-        const peer = i ^ reduceHalf;
-        getNativeAddon().ncclSend(this.comms[i], this.devices[i].ctx, currentV[i].data, numel, NCCL_BFLOAT16, peer);
-        getNativeAddon().ncclSend(this.comms[i], this.devices[i].ctx, currentLse[i].data, lseCount, NCCL_FLOAT32, peer);
-        getNativeAddon().ncclRecv(this.comms[i], this.devices[i].ctx, peerV[i].data, numel, NCCL_BFLOAT16, peer);
-        getNativeAddon().ncclRecv(this.comms[i], this.devices[i].ctx, peerLse[i].data, lseCount, NCCL_FLOAT32, peer);
-      }
-      getNativeAddon().ncclGroupEnd();
 
       for (let i = 0; i < this.worldSize; i++) {
         this.devices[i].cpMergeTree(
@@ -2231,8 +2223,9 @@ export class ParallelOps implements DeviceOps {
       for (let i = 0; i < this.worldSize; i++) {
         currentV[i][Symbol.dispose]();
         currentLse[i][Symbol.dispose]();
-        peerV[i][Symbol.dispose]();
-        peerLse[i][Symbol.dispose]();
+      }
+      for (const t of toDisposeAfterMerge) {
+        t[Symbol.dispose]();
       }
 
       currentV = outputV;
