@@ -85,7 +85,7 @@ export class ParallelTensor extends Tensor {
 
   capture() {
     const capturedShards = this.shards.map(s => s.capture());
-    const captured = new ParallelTensor(this.workspace, this.parallelOps, this.parallelism, capturedShards, this.fullShape, this.type, this.name, this.pinned, this);
+    const captured = this.parallelOps.wrapShards(this.workspace, capturedShards, this.fullShape, this.type, this.parallelism, this);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
     return captured;
@@ -130,17 +130,15 @@ export class ParallelTensor extends Tensor {
     const newPar = ParallelTensor.computeReshapeParallelism(this.shape, newShape, this.parallelism, this.worldSize);
     const newShardShape = this.parallelOps.shardShape(newShape, newPar);
     const reshapedShards: Tensor[] = this.shards.map(s => s.reshape(newShardShape));
-    return new ParallelTensor(
-      this.workspace, this.parallelOps, newPar,
-      reshapedShards, newShape, this.type, undefined, this.pinned, this,
+    return this.parallelOps.wrapShards(
+      this.workspace, reshapedShards, newShape, this.type, newPar, this,
     );
   }
 
   override viewClone(): Tensor {
     const clonedShards: Tensor[] = this.shards.map(s => s.viewClone());
-    return new ParallelTensor(
-      this.workspace, this.parallelOps, this.parallelism,
-      clonedShards, this.shape, this.type, undefined, this.pinned, this,
+    return this.parallelOps.wrapShards(
+      this.workspace, clonedShards, this.shape, this.type, this.parallelism, this,
     );
   }
 
@@ -2349,7 +2347,7 @@ export class ParallelOps implements DeviceOps {
     return new ParallelTensor(workspace, this, view.parallelism, view.shards, shape, type, undefined, pinned, view);
   }
 
-  wrapShards(workspace: WorkspaceBase, shards: Tensor[], fullShape: number[], type: string, parallelism: TensorParallelism): ParallelTensor {
+  wrapShards(workspace: WorkspaceBase, shards: Tensor[], fullShape: number[], type: string, parallelism: TensorParallelism, view?: ParallelTensor): ParallelTensor {
     if (shards.length === 0) {
       throw new Error("wrapShards: no shards provided");
     }
@@ -2371,7 +2369,7 @@ export class ParallelOps implements DeviceOps {
         }
         break;
     }
-    const pt = new ParallelTensor(workspace, this, parallelism, shards, fullShape, type, undefined, false, undefined);
+    const pt = new ParallelTensor(workspace, this, parallelism, shards, fullShape, type, undefined, !!view?.pinned, view);
     workspace.addTracked(pt);
     return pt;
   }
@@ -2648,8 +2646,8 @@ export class ParallelOps implements DeviceOps {
       if (gatheredQNope) gatheredQNope[Symbol.dispose]();
       if (gatheredQPe) gatheredQPe[Symbol.dispose]();
     }
-    const o = new ParallelTensor(pFloatWs.workspace, this, oPar, oShards, oFullShape, qNope.type, undefined, false, undefined);
-    const lse = new ParallelTensor(pFloatWs.workspace, this, lsePar, lseShards, lseFullShape, "F32", undefined, false, undefined);
+    const o = this.wrapShards(pFloatWs.workspace, oShards, oFullShape, qNope.type, oPar);
+    const lse = this.wrapShards(pFloatWs.workspace, lseShards, lseFullShape, "F32", lsePar);
     return { o, lse };
   }
 
@@ -2711,8 +2709,8 @@ export class ParallelOps implements DeviceOps {
       if (gatheredQNope) gatheredQNope[Symbol.dispose]();
       if (gatheredQPe) gatheredQPe[Symbol.dispose]();
     }
-    const o = new ParallelTensor(pFloatWs.workspace, this, oPar, oShards, oFullShape, qNope.type, undefined, false, undefined);
-    const lse = new ParallelTensor(pFloatWs.workspace, this, lsePar, lseShards, lseFullShape, "F32", undefined, false, undefined);
+    const o = this.wrapShards(pFloatWs.workspace, oShards, oFullShape, qNope.type, oPar);
+    const lse = this.wrapShards(pFloatWs.workspace, lseShards, lseFullShape, "F32", lsePar);
     return { o, lse };
   }
 

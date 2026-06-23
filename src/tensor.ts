@@ -107,7 +107,7 @@ export abstract class Tensor implements Disposable {
 
   capture() {
     this.removeTracking();
-    const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, undefined);
+    const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, this);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
     return captured;
