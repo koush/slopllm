@@ -2114,17 +2114,9 @@ export class ParallelOps implements DeviceOps {
     }
 
     for (let i = 0; i < this.worldSize; i++) {
-      // rotate the source order per GPU so they don't all hit peer 0 first
-      const rotV: number[] = [];
-      const rotLse: number[] = [];
-      for (let j = 0; j < this.worldSize; j++) {
-        const src = (i + j) % this.worldSize;
-        rotV.push(vPtrs[src]);
-        rotLse.push(lsePtrs[src]);
-      }
       this.devices[i].cpMergeTree(
-        rotV,
-        rotLse,
+        vPtrs,
+        lsePtrs,
         this.worldSize,
         outputV[i], outputLse[i],
         shardNumel, batchSize, numHeads, vHeadDim,

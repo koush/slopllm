@@ -36,7 +36,7 @@ namespace cg = cooperative_groups;
 
 constexpr int CP_TREE_MAX_SHARDS = 16;
 
-template <int VEC_SIZE, int BDX>
+template <int NUM_SHARDS, int VEC_SIZE, int BDX>
 __global__ void __launch_bounds__(BDX, 2)
 cp_merge_tree_kernel(
     const __nv_bfloat16* v0,  const __nv_bfloat16* v1,  const __nv_bfloat16* v2,  const __nv_bfloat16* v3,
@@ -49,7 +49,6 @@ cp_merge_tree_kernel(
     const float* lse12, const float* lse13, const float* lse14, const float* lse15,
     __nv_bfloat16* output_v,
     float* output_lse,
-    int N,
     int64_t numel,
     int batch_size,
     int num_heads,
@@ -65,9 +64,7 @@ cp_merge_tree_kernel(
     constexpr int head_dim = VEC_SIZE * BDX;
     constexpr int v_shard_bytes = head_dim * sizeof(__nv_bfloat16);
 
-    constexpr int NUM_SHARDS = CP_TREE_MAX_SHARDS;
     auto block = cg::this_thread_block();
-    auto thread = cg::this_thread();
     int tid = threadIdx.x;
 
     int64_t bh = blockIdx.x;
@@ -77,57 +74,75 @@ cp_merge_tree_kernel(
 
     if (b >= batch_size) return;
 
-    const __nv_bfloat16* v_ptrs[CP_TREE_MAX_SHARDS] = {
+    const __nv_bfloat16* v_ptrs_orig[CP_TREE_MAX_SHARDS] = {
         v0, v1, v2, v3, v4, v5, v6, v7,
         v8, v9, v10, v11, v12, v13, v14, v15
     };
-    const float* lse_ptrs[CP_TREE_MAX_SHARDS] = {
+    const float* lse_ptrs_orig[CP_TREE_MAX_SHARDS] = {
         lse0, lse1, lse2, lse3, lse4, lse5, lse6, lse7,
         lse8, lse9, lse10, lse11, lse12, lse13, lse14, lse15
     };
 
+    // Rotate pointer order by blockIdx.x so different blocks hit different peers first,
+    // distributing P2P load across the fabric.
+    const __nv_bfloat16* v_ptrs[CP_TREE_MAX_SHARDS];
+    const float* lse_ptrs[CP_TREE_MAX_SHARDS];
+    int rot = (int)(blockIdx.x % NUM_SHARDS);
+    #pragma unroll
+    for (int s = 0; s < NUM_SHARDS; s++) {
+        v_ptrs[s] = v_ptrs_orig[(s + rot) % NUM_SHARDS];
+        lse_ptrs[s] = lse_ptrs_orig[(s + rot) % NUM_SHARDS];
+    }
+
     extern __shared__ char smem[];
     __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem);
-    float* smem_lse = reinterpret_cast<float*>(smem + N * v_shard_bytes);
+    float* smem_lse = reinterpret_cast<float*>(smem + NUM_SHARDS * v_shard_bytes);
 
     int64_t v_in_offset = (int64_t)(b * input_n_heads + h) * head_dim;
     int64_t lse_in_offset = (int64_t)b * num_heads + h;
     int64_t v_out_offset = (int64_t)(b * shard_n_heads + local_h) * head_dim;
     int64_t lse_out_offset = (int64_t)b * shard_n_heads + local_h;
 
+    // Scalar load all lse values directly (no async copy needed for 4 bytes)
+    for (int s = tid; s < NUM_SHARDS; s += BDX) {
+        smem_lse[s] = lse_ptrs[s][lse_in_offset];
+    }
+    __syncthreads();
+
+    // Issue all v memcpy_async up front
     #pragma unroll
     for (int s = 0; s < NUM_SHARDS; s++) {
-        if (s >= N) break;
         cg::memcpy_async(block,
             smem_v + s * head_dim,
             v_ptrs[s] + v_in_offset,
             v_shard_bytes);
     }
 
-    if (tid < N) {
-        cg::memcpy_async(thread, &smem_lse[tid], lse_ptrs[tid] + lse_in_offset, sizeof(float));
-    }
+    // Interleave wait_prior + compute: wait on copies 0..s, then merge shard s.
+    // wait_prior<NUM_SHARDS - 1 - s> waits for the first s+1 copies to complete.
+    flashinfer::state_t<VEC_SIZE> st;
+    st.init();
 
-    cg::wait(block);
-
-    if (tid < BDX) {
-        flashinfer::state_t<VEC_SIZE> st;
-        st.init();
-
-        #pragma unroll
-        for (int s = 0; s < NUM_SHARDS; s++) {
-            if (s >= N) break;
-            flashinfer::vec_t<float, VEC_SIZE> v;
-            v.cast_load(smem_v + s * head_dim + tid * VEC_SIZE);
-            st.merge(v, smem_lse[s], 1.0f);
+    auto wait_and_merge = [&] <int s>() {
+        if constexpr (s < NUM_SHARDS - 1) {
+            cg::wait_prior<NUM_SHARDS - 1 - s>(block);
+        } else {
+            cg::wait(block);
         }
+        flashinfer::vec_t<float, VEC_SIZE> v;
+        v.cast_load(smem_v + s * head_dim + tid * VEC_SIZE);
+        st.merge(v, smem_lse[s], 1.0f);
+    };
 
-        st.normalize();
-        st.o.cast_store(output_v + v_out_offset + tid * VEC_SIZE);
+    [&] <int... Is>(std::integer_sequence<int, Is...>) {
+        (wait_and_merge.template operator()<Is>(), ...);
+    }(std::make_integer_sequence<int, NUM_SHARDS>{});
 
-        if (output_lse != nullptr && tid == 0)
-            output_lse[lse_out_offset] = st.get_lse();
-    }
+    st.normalize();
+    st.o.cast_store(output_v + v_out_offset + tid * VEC_SIZE);
+
+    if (output_lse != nullptr && tid == 0)
+        output_lse[lse_out_offset] = st.get_lse();
 }
 
 static void launch_cp_merge_tree(
@@ -148,8 +163,8 @@ static void launch_cp_merge_tree(
     int64_t total_heads = (int64_t)batch_size * shard_n_heads;
     int grid = (int)total_heads;
 
-    #define LAUNCH_CP_TREE(VEC_SIZE, BDX) \
-        cp_merge_tree_kernel<VEC_SIZE, BDX><<<grid, BDX, num_shards * (BDX * VEC_SIZE) * sizeof(__nv_bfloat16) + num_shards * sizeof(float), stream>>>( \
+    #define LAUNCH_CP_TREE(NS, VEC_SIZE, BDX) \
+        cp_merge_tree_kernel<NS, VEC_SIZE, BDX><<<grid, BDX, NS * (BDX * VEC_SIZE) * sizeof(__nv_bfloat16) + NS * sizeof(float), stream>>>( \
             v_ptrs[0], v_ptrs[1], v_ptrs[2], v_ptrs[3], \
             v_ptrs[4], v_ptrs[5], v_ptrs[6], v_ptrs[7], \
             v_ptrs[8], v_ptrs[9], v_ptrs[10], v_ptrs[11], \
@@ -158,21 +173,33 @@ static void launch_cp_merge_tree(
             lse_ptrs[4], lse_ptrs[5], lse_ptrs[6], lse_ptrs[7], \
             lse_ptrs[8], lse_ptrs[9], lse_ptrs[10], lse_ptrs[11], \
             lse_ptrs[12], lse_ptrs[13], lse_ptrs[14], lse_ptrs[15], \
-            output_v, output_lse, num_shards, numel, batch_size, num_heads, v_head_dim, \
+            output_v, output_lse, numel, batch_size, num_heads, v_head_dim, \
             0, 0, 0, shard_n_heads, head_offset, input_n_heads)
 
-    switch (v_head_dim) {
-        case 32:  LAUNCH_CP_TREE(4, 8); break;
-        case 64:  LAUNCH_CP_TREE(4, 16); break;
-        case 128: LAUNCH_CP_TREE(4, 32); break;
-        case 256: LAUNCH_CP_TREE(4, 64); break;
-        case 512: LAUNCH_CP_TREE(4, 128); break;
+    #define DISPATCH_VHEAD_DIM(NS) \
+        switch (v_head_dim) { \
+            case 32:  LAUNCH_CP_TREE(NS, 4, 8); break; \
+            case 64:  LAUNCH_CP_TREE(NS, 4, 16); break; \
+            case 128: LAUNCH_CP_TREE(NS, 4, 32); break; \
+            case 256: LAUNCH_CP_TREE(NS, 4, 64); break; \
+            case 512: LAUNCH_CP_TREE(NS, 4, 128); break; \
+            default: \
+                fprintf(stderr, "launch_cp_merge_tree: unsupported v_head_dim=%d\n", v_head_dim); \
+                break; \
+        }
+
+    switch (num_shards) {
+        case 2:  DISPATCH_VHEAD_DIM(2); break;
+        case 4:  DISPATCH_VHEAD_DIM(4); break;
+        case 8:  DISPATCH_VHEAD_DIM(8); break;
+        case 16: DISPATCH_VHEAD_DIM(16); break;
         default:
-            fprintf(stderr, "launch_cp_merge_tree: unsupported v_head_dim=%d (must be 32, 64, 128, 256, or 512)\n", v_head_dim);
+            fprintf(stderr, "launch_cp_merge_tree: unsupported num_shards=%d (must be 2, 4, 8, or 16)\n", num_shards);
             break;
     }
 
     #undef LAUNCH_CP_TREE
+    #undef DISPATCH_VHEAD_DIM
 }
 
 extern "C" {
