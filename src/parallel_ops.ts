@@ -1523,6 +1523,30 @@ export class ParallelTensor extends Tensor {
       throw new Error(`mlaVExpand: context parallelism requires replicated v_proj, got ${pVProj.parallelism}`);
     }
     const BS = batch * seqLen;
+
+    // this is faster with 4+ gpu
+    // CP decode: merge K-dim attn_out first, then v_expand h heads locally.
+    // Avoids redundant v_expand of all H heads on every GPU. Only for decode
+    // (seqLen=1) where BHSD layout == BSH layout so the merge can read attn_out directly.
+    if (isCp && seqLen === 1) {
+      const pLse = lse as ParallelTensor;
+      using merged = new UsingHolder(this.parallelOps.contextParallelMerge(
+        this, pLse,
+        BS, nHeads, kvLoraRank,
+        null, this.workspace,
+      ));
+      const h = this.parallelOps.shardDim(nHeads, "mlaVExpand cpShardNHeads");
+      const expandShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        expandShards.push(merged.value.shards[i].mlaVExpand(
+          pVProj.shards[i], kvLoraRank, vHeadDim, h, 1, BS,
+          undefined, 0, h, i * h
+        ));
+      }
+      return this.parallelOps.wrapShards(this.workspace, expandShards, [BS, nHeads * vHeadDim], this.type, TensorParallelism.Row);
+    }
+
+    // Non-CP or CP prefill: expand-then-merge
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       const shardHeadOffset = (isPartialSoftmax && isVProjSharded) ? i * shardNHeads : 0;

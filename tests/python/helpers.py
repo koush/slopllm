@@ -274,7 +274,7 @@ class GlmOps:
         self.lib.glm_mla_v_expand.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int
+            ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
         self.lib.glm_scale.restype = None
@@ -1132,14 +1132,14 @@ class GlmOps:
             rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved
         )
 
-    def mlaVExpand(self, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch, attn_n_heads=None, head_offset=0):
+    def mlaVExpand(self, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch, attn_n_heads=None, head_offset=0, v_proj_head_offset=0):
         if attn_n_heads is None:
             attn_n_heads = n_heads
         self.lib.glm_mla_v_expand(
             self.ctx,
             self._ptr(result), self._ptr(attn_out), self._ptr(v_proj),
             kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
-            attn_n_heads, head_offset
+            attn_n_heads, head_offset, v_proj_head_offset
         )
 
     def scale(self, output, input, scale, n):

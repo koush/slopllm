@@ -593,8 +593,8 @@ static Napi::Value RopeTranspose(const Napi::CallbackInfo& info) {
 
 static Napi::Value MlaVExpand(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 9) {
-        Napi::TypeError::New(env, "Expected (ctx, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch)").ThrowAsJavaScriptException();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch, attn_n_heads, head_offset, v_proj_head_offset)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -608,12 +608,13 @@ static Napi::Value MlaVExpand(const Napi::CallbackInfo& info) {
     int batch = info[8].As<Napi::Number>().Int32Value();
     int attn_n_heads = info[9].As<Napi::Number>().Int32Value();
     int head_offset = info[10].As<Napi::Number>().Int32Value();
+    int v_proj_head_offset = info[11].As<Napi::Number>().Int32Value();
     glm_mla_v_expand(reinterpret_cast<GlmCtx*>(ctx_ptr),
                       reinterpret_cast<void*>(result_ptr),
                       reinterpret_cast<const void*>(attn_out_ptr),
                       reinterpret_cast<const void*>(v_proj_ptr),
                       kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
-                      attn_n_heads, head_offset);
+                      attn_n_heads, head_offset, v_proj_head_offset);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("mlaVExpand failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
