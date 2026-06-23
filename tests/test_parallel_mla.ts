@@ -165,7 +165,7 @@ describe("ParallelOps.ropeTranspose", () => {
     po.synchronize();
 
     assert.equal(pOut.parallelism, TensorParallelism.Column);
-    assert.deepEqual(pOut.fullShape, [batch * seqLen, nHeads, headDim]);
+    assert.deepEqual(pOut.shape, [batch * seqLen, nHeads, headDim]);
     assert.deepEqual(pOut.shard(0).shape, [batch * seqLen, nHeads / 2, headDim]);
 
     const out0Buf = Buffer.alloc(batch * seqLen * nHeads / 2 * headDim * 2);
@@ -214,7 +214,7 @@ describe("ParallelOps.ropeTranspose", () => {
     po.synchronize();
 
     assert.equal(pOut.parallelism, TensorParallelism.Replicated);
-    assert.deepEqual(pOut.fullShape, [batch * seqLen, nHeads, headDim]);
+    assert.deepEqual(pOut.shape, [batch * seqLen, nHeads, headDim]);
 
     const outBuf = Buffer.alloc(batch * nHeads * seqLen * headDim * 2);
     pOut.d2h(outBuf);

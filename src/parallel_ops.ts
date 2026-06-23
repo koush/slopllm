@@ -8,7 +8,6 @@ import { WorkspaceBase } from "./workspace";
 export class ParallelTensor extends Tensor {
   parallelism: TensorParallelism;
   readonly shards: readonly Tensor[];
-  readonly fullShape: number[];
   private readonly devices: readonly GlmOps[];
   private readonly parallelOps: ParallelOps;
 
@@ -17,18 +16,17 @@ export class ParallelTensor extends Tensor {
     parallelOps: ParallelOps,
     parallelism: TensorParallelism,
     shards: readonly Tensor[],
-    fullShape: number[],
+    shape: number[],
     type: string,
     name: string | undefined,
     pinned: boolean,
     view: ParallelTensor | undefined,
   ) {
-    super(workspace, 0, 0, fullShape, type, name, pinned, view);
+    super(workspace, 0, 0, shape, type, name, pinned, view);
     this.parallelOps = parallelOps;
     this.devices = parallelOps.devices;
     this.parallelism = parallelism;
     this.shards = shards;
-    this.fullShape = fullShape;
     for (let i = 0; i < shards.length; i++) {
       if (shards[i].name !== name) {
         throw new Error(`Shard ${i} has name ${shards[i].name}, expected ${name}`);
@@ -85,7 +83,7 @@ export class ParallelTensor extends Tensor {
 
   capture() {
     const capturedShards = this.shards.map(s => s.capture());
-    const captured = this.parallelOps.wrapShards(this.workspace, capturedShards, this.fullShape, this.type, this.parallelism, undefined);
+    const captured = this.parallelOps.wrapShards(this.workspace, capturedShards, this.shape, this.type, this.parallelism, undefined);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
     return captured;
@@ -160,11 +158,11 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism === TensorParallelism.PartialSum) {
       throw new Error("allGather cannot be used on PartialSum tensors; use allReduce instead");
     }
-    const output = this.workspace.alloc(this.fullShape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const output = this.workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     const elemBytes = ParallelTensor.elemBytes(this.type);
 
-    if (this.parallelOps.tryP2PAllGather(this.shards, output.shards, count, elemBytes, this.parallelism, this.fullShape)) {
+    if (this.parallelOps.tryP2PAllGather(this.shards, output.shards, count, elemBytes, this.parallelism, this.shape)) {
       return output;
     }
 
@@ -188,11 +186,11 @@ export class ParallelTensor extends Tensor {
 
     if (this.parallelism === TensorParallelism.Row) {
       const eb = this.type === "BF16" ? 2 : this.type === "F32" ? 4 : this.type === "I32" ? 4 : 1;
-      const outer = this.fullShape[0];
-      const inner = this.fullShape.slice(2).reduce((a, b) => a * b, 1);
-      const shardDim1 = this.fullShape[1] / this.devices.length;
+      const outer = this.shape[0];
+      const inner = this.shape.slice(2).reduce((a, b) => a * b, 1);
+      const shardDim1 = this.shape[1] / this.devices.length;
       const shardBytes = count * eb;
-      const totalElems = this.fullShape.reduce((a, b) => a * b, 1);
+      const totalElems = this.shape.reduce((a, b) => a * b, 1);
       const totalBytes = totalElems * eb;
 
       const shardWss = this.parallelOps.getShardWorkspaces(workspace);
@@ -212,7 +210,7 @@ export class ParallelTensor extends Tensor {
         for (let r = 0; r < this.devices.length; r++) {
           output.shards[i].memcpy2d(
             r * shardDim1 * inner * eb,
-            this.fullShape[1] * inner * eb,
+            this.shape[1] * inner * eb,
             tempTensors[i], r * shardBytes,
             shardDim1 * inner * eb,
             shardDim1 * inner * eb,
@@ -233,11 +231,11 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism !== TensorParallelism.Replicated) {
       throw new Error(`sliceToRowParallel: expected Replicated, got ${this.parallelism}`);
     }
-    if (this.fullShape.length !== 2) {
-      throw new Error(`sliceToRowParallel: expected 2D tensor, got ${this.fullShape.length}D`);
+    if (this.shape.length !== 2) {
+      throw new Error(`sliceToRowParallel: expected 2D tensor, got ${this.shape.length}D`);
     }
-    const outer = this.fullShape[0];
-    const dim1 = this.fullShape[1];
+    const outer = this.shape[0];
+    const dim1 = this.shape[1];
     const elemBytes = ParallelTensor.elemBytes(this.type);
     const shardWss = this.parallelOps.getShardWorkspaces(workspace);
     const shardShape = [outer, shardDim1];
@@ -253,7 +251,7 @@ export class ParallelTensor extends Tensor {
       );
       outputShards.push(shard);
     }
-    return this.parallelOps.wrapShards(workspace, outputShards, this.fullShape, this.type, TensorParallelism.Row);
+    return this.parallelOps.wrapShards(workspace, outputShards, this.shape, this.type, TensorParallelism.Row);
   }
 
   // outputProj(weight: Tensor, batch: number): Tensor {
@@ -303,7 +301,7 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.Column) {
-      const totalElems = ParallelTensor.shapeElems(this.fullShape);
+      const totalElems = ParallelTensor.shapeElems(this.shape);
       const shardBytes = (totalElems / this.worldSize) * eb;
       for (let i = 0; i < this.worldSize; i++) {
         this.shards[i].h2d(data.subarray(i * shardBytes, (i + 1) * shardBytes));
@@ -312,10 +310,10 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.Row) {
-      const outer = this.fullShape[0];
-      const inner = ParallelTensor.shapeElems(this.fullShape.slice(2));
-      const shardDim1 = this.fullShape[1] / this.worldSize;
-      const fullStride = this.fullShape[1] * inner * eb;
+      const outer = this.shape[0];
+      const inner = ParallelTensor.shapeElems(this.shape.slice(2));
+      const shardDim1 = this.shape[1] / this.worldSize;
+      const fullStride = this.shape[1] * inner * eb;
       const shardStride = shardDim1 * inner * eb;
       for (let i = 0; i < this.worldSize; i++) {
         const shardBuf = Buffer.alloc(outer * shardStride);
@@ -345,7 +343,7 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.Column) {
-      const totalElems = ParallelTensor.shapeElems(this.fullShape);
+      const totalElems = ParallelTensor.shapeElems(this.shape);
       const shardBytes = (totalElems / this.worldSize) * eb;
       for (let i = 0; i < this.worldSize; i++) {
         this.shards[i].d2h(buf.subarray(i * shardBytes, (i + 1) * shardBytes));
@@ -354,10 +352,10 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.Row) {
-      const outer = this.fullShape[0];
-      const inner = ParallelTensor.shapeElems(this.fullShape.slice(2));
-      const shardDim1 = this.fullShape[1] / this.worldSize;
-      const fullStride = this.fullShape[1] * inner * eb;
+      const outer = this.shape[0];
+      const inner = ParallelTensor.shapeElems(this.shape.slice(2));
+      const shardDim1 = this.shape[1] / this.worldSize;
+      const fullStride = this.shape[1] * inner * eb;
       const shardStride = shardDim1 * inner * eb;
       for (let i = 0; i < this.worldSize; i++) {
         const shardBuf = Buffer.alloc(outer * shardStride);
@@ -375,7 +373,7 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.PartialSum) {
-      const totalElems = ParallelTensor.shapeElems(this.fullShape);
+      const totalElems = ParallelTensor.shapeElems(this.shape);
       const shardBytes = totalElems * eb;
 
       if (this.type === "F32") {
@@ -719,8 +717,8 @@ export class ParallelTensor extends Tensor {
 
     if (this.parallelism === 'row' && input.parallelism === 'partial_sum') {
       const eb = 2;
-      const rows = this.fullShape[0];
-      const fullDim = this.fullShape[1];
+      const rows = this.shape[0];
+      const fullDim = this.shape[1];
       const shardDim = fullDim / this.worldSize;
       const shardWss = this.parallelOps.getShardWorkspaces(this.workspace);
 
@@ -804,7 +802,7 @@ export class ParallelTensor extends Tensor {
 
     if (this.parallelism === TensorParallelism.Row) {
       const shardNHeads = this.shardDim(nHeads, "fusedNormRope nHeads");
-      const shardInStride = this.fullShape[2] === this.fullShape[1]
+      const shardInStride = this.shape[2] === this.shape[1]
         ? stride / this.worldSize
         : stride;
       this.assertParallel("fusedNormRope weight", pWeight, TensorParallelism.Replicated);
@@ -904,8 +902,8 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.Row) {
-      const batch = this.fullShape[0];
-      const dim = this.fullShape[1];
+      const batch = this.shape[0];
+      const dim = this.shape[1];
       const ws = this.worldSize;
       const shardDim = dim / ws;
 
@@ -939,7 +937,7 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.Column) {
-      const batch = this.fullShape[0];
+      const batch = this.shape[0];
 
       const localValuesShards: Tensor[] = [];
       const localIndicesShards: Tensor[] = [];
@@ -1211,9 +1209,9 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.Row) {
-      const outer = this.fullShape[0];
-      const inner = this.fullShape.slice(2).reduce((a, b) => a * b, 1);
-      const fullDim1 = this.fullShape[1];
+      const outer = this.shape[0];
+      const inner = this.shape.slice(2).reduce((a, b) => a * b, 1);
+      const fullDim1 = this.shape[1];
       const shardDim1 = fullDim1 / this.worldSize;
       const eb = ParallelTensor.elemBytes(this.type);
       const srcPitch = fullDim1 * inner * eb;
@@ -1303,7 +1301,7 @@ export class ParallelTensor extends Tensor {
     for (let i = 0; i < this.worldSize; i++) {
       outShards.push(this.shards[i].sigmoid());
     }
-    return this.parallelOps.wrapShards(this.workspace, outShards, this.fullShape, this.type, this.parallelism);
+    return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
   }
 
   topk(k: number, dim: number, offset = 0): { values: Tensor, indices: Tensor } {
@@ -1312,7 +1310,7 @@ export class ParallelTensor extends Tensor {
       return this.topk(k, dim, offset);
     }
     if (this.parallelism === TensorParallelism.Row) {
-      const batch = this.fullShape[0];
+      const batch = this.shape[0];
       const shardDim = this.shardDim(dim, "topk dim");
       const localValuesShards: Tensor[] = [];
       const localIndicesShards: Tensor[] = [];
@@ -1340,8 +1338,8 @@ export class ParallelTensor extends Tensor {
         valuesShards.push(result.values);
         indicesShards.push(result.indices);
       }
-      const values = this.parallelOps.wrapShards(this.workspace, valuesShards, [...this.fullShape.slice(0, -1), k], this.type, TensorParallelism.Column);
-      const indices = this.parallelOps.wrapShards(this.workspace, indicesShards, [...this.fullShape.slice(0, -1), k], "I32", TensorParallelism.Column);
+      const values = this.parallelOps.wrapShards(this.workspace, valuesShards, [...this.shape.slice(0, -1), k], this.type, TensorParallelism.Column);
+      const indices = this.parallelOps.wrapShards(this.workspace, indicesShards, [...this.shape.slice(0, -1), k], "I32", TensorParallelism.Column);
       return { values, indices };
     }
     const valuesShards: Tensor[] = [];
@@ -1351,8 +1349,8 @@ export class ParallelTensor extends Tensor {
       valuesShards.push(result.values);
       indicesShards.push(result.indices);
     }
-    const values = this.parallelOps.wrapShards(this.workspace, valuesShards, [...this.fullShape.slice(0, -1), k], this.type, this.parallelism);
-    const indices = this.parallelOps.wrapShards(this.workspace, indicesShards, [...this.fullShape.slice(0, -1), k], "I32", this.parallelism);
+    const values = this.parallelOps.wrapShards(this.workspace, valuesShards, [...this.shape.slice(0, -1), k], this.type, this.parallelism);
+    const indices = this.parallelOps.wrapShards(this.workspace, indicesShards, [...this.shape.slice(0, -1), k], "I32", this.parallelism);
     return { values, indices };
   }
 
@@ -1379,7 +1377,7 @@ export class ParallelTensor extends Tensor {
     for (let i = 0; i < this.worldSize; i++) {
       outShards.push(this.shards[i].rowNormalize(scale, dim, batch, normalize));
     }
-    return this.parallelOps.wrapShards(this.workspace, outShards, this.fullShape, this.type, this.parallelism);
+    return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
   }
 
   cat(tensors: Tensor[], dim: number): Tensor {
@@ -1403,8 +1401,8 @@ export class ParallelTensor extends Tensor {
       return gatheredSelf.cat(gatheredTensors, dim);
     }
 
-    const outShape = [...this.fullShape];
-    for (const t of pTensors) outShape[dim] += t.fullShape[dim];
+    const outShape = [...this.shape];
+    for (const t of pTensors) outShape[dim] += t.shape[dim];
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       outShards.push(this.shards[i].cat(pTensors.map(t => t.shards[i]), dim));
@@ -1422,7 +1420,7 @@ export class ParallelTensor extends Tensor {
       using gathered = this.allGather(this.workspace);
       return gathered.slice(dim, start, length);
     }
-    const outShape = [...this.fullShape];
+    const outShape = [...this.shape];
     outShape[dim] = length;
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
@@ -1436,7 +1434,7 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism !== TensorParallelism.Replicated && this.parallelism !== TensorParallelism.Row) {
       throw new Error(`narrow: only supported on Replicated or Row tensors, got ${this.parallelism}`);
     }
-    const newShape = [length, ...this.fullShape.slice(1)];
+    const newShape = [length, ...this.shape.slice(1)];
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       outShards.push(this.shards[i].narrow(start, length));
@@ -1509,7 +1507,7 @@ export class ParallelTensor extends Tensor {
     for (let i = 0; i < this.worldSize; i++) {
       outShards.push(this.shards[i].applyRotaryPosEmb(pCos.shards[i], pSin.shards[i], ropeDim, shardNHeads, seqLen, batch, unsqueezeDim, interleaved));
     }
-    return this.parallelOps.wrapShards(this.workspace, outShards, this.fullShape, this.type, this.parallelism);
+    return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
   }
 
   mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, lse?: Tensor): Tensor {

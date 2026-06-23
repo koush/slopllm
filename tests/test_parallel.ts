@@ -117,7 +117,7 @@ describe("ParallelTensor allocation and properties", () => {
   it("column parallel tensor has correct properties", () => {
     const pt = ws.alloc([8, 4], "F32", undefined, TensorParallelism.Column) as ParallelTensor;
     assert.equal(pt.parallelism, TensorParallelism.Column);
-    assert.deepEqual(pt.fullShape, [8, 4]);
+    assert.deepEqual(pt.shape, [8, 4]);
     assert.deepEqual(pt.shape, [8, 4]);
     assert.equal(pt.type, "F32");
     assert.equal(pt.data, 0);
@@ -131,7 +131,7 @@ describe("ParallelTensor allocation and properties", () => {
   it("row parallel tensor has correct properties", () => {
     const pt = ws.alloc([4, 8], "F32", undefined, TensorParallelism.Row) as ParallelTensor;
     assert.equal(pt.parallelism, TensorParallelism.Row);
-    assert.deepEqual(pt.fullShape, [4, 8]);
+    assert.deepEqual(pt.shape, [4, 8]);
     assert.equal(pt.shards.length, 2);
     assert.deepEqual(pt.shard(0).shape, [4, 4]);
     assert.deepEqual(pt.shard(1).shape, [4, 4]);
@@ -140,7 +140,7 @@ describe("ParallelTensor allocation and properties", () => {
   it("replicated tensor has correct properties", () => {
     const pt = ws.alloc([4, 4], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     assert.equal(pt.parallelism, TensorParallelism.Replicated);
-    assert.deepEqual(pt.fullShape, [4, 4]);
+    assert.deepEqual(pt.shape, [4, 4]);
     assert.equal(pt.shards.length, 2);
     assert.deepEqual(pt.shard(0).shape, [4, 4]);
     assert.deepEqual(pt.shard(1).shape, [4, 4]);
@@ -682,8 +682,8 @@ describe("ParallelTensor.allGather", () => {
 
     const gathered = pt.allGather(ws);
     assert.equal(gathered.parallelism, TensorParallelism.Replicated);
-    assert.equal(gathered.fullShape[0], rows);
-    assert.equal(gathered.fullShape[1], cols);
+    assert.equal(gathered.shape[0], rows);
+    assert.equal(gathered.shape[1], cols);
     assert.notStrictEqual(gathered, pt, "allGather should return new tensor for Row");
     po.synchronize();
 
