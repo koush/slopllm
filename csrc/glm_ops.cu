@@ -2502,18 +2502,35 @@ sum_pointers_smem_kernel(
 
         if (warp_start < elems) {
             if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
-                for (int i = lane; i < warp_elems; i += WarpSize) {
+                constexpr int VEC = 2;
+                int64_t vec_elems = warp_elems / VEC * VEC;
+                for (int64_t i = lane * VEC; i < vec_elems; i += WarpSize * VEC) {
+                    float2 acc = {0.0f, 0.0f};
+                    for (int j = 0; j < MaxN; j++) {
+                        if (j >= N) break;
+                        __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(
+                            smem_raw + j * peer_stride + (warp_start + i) * sizeof(__nv_bfloat16));
+                        float2 f = __bfloat1622float2(v);
+                        acc.x += f.x;
+                        acc.y += f.y;
+                    }
+                    *reinterpret_cast<__nv_bfloat162*>(
+                        reinterpret_cast<char*>(output) + (blk + warp_start + i) * sizeof(__nv_bfloat16)) =
+                        __float22bfloat162_rn(acc);
+                }
+                int64_t tail_start = warp_start + vec_elems;
+                for (int64_t i = lane; i < warp_elems - vec_elems; i += WarpSize) {
                     float acc = 0.0f;
                     for (int j = 0; j < MaxN; j++) {
                         if (j >= N) break;
                         acc += __bfloat162float(
                             reinterpret_cast<const __nv_bfloat16*>(
-                                smem_raw + j * peer_stride)[warp_start + i]);
+                                smem_raw + j * peer_stride)[tail_start + i]);
                     }
-                    output[blk + warp_start + i] = __float2bfloat16(acc);
+                    output[blk + tail_start + i] = __float2bfloat16(acc);
                 }
             } else {
-                for (int i = lane; i < warp_elems; i += WarpSize) {
+                for (int64_t i = lane; i < warp_elems; i += WarpSize) {
                     float acc = 0.0f;
                     for (int j = 0; j < MaxN; j++) {
                         if (j >= N) break;
