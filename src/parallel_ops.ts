@@ -2092,66 +2092,51 @@ export class ParallelOps implements DeviceOps {
       );
     }
 
-    // fast path for decode that does direct p2p reads
+    // fast path for decode: single barrier, flat all-to-all merge.
+    // Each GPU reads h heads from all N peers directly via P2P, merges in one kernel launch.
+    // Output is Row-parallel (each GPU holds h heads), so no need for butterfly rounds.
     const shardNHeads = this.shardDim(numHeads, "cpMergeTreeReduce shardNHeads");
     const shardNumel = batchSize * shardNHeads * vHeadDim;
-    const numel = batchSize * numHeads * vHeadDim;
     const shardWss = this.getShardWorkspaces(workspace);
 
-    let currentV: Tensor[] = [];
-    let currentLse: Tensor[] = [];
+    this.p2pBarrier();
+    this.sourceCleanup();
+    this.p2pSources.push(...partialVOuts.map(t => t.viewClone()), ...partialLses.map(t => t.viewClone()));
+
+    const vPtrs: number[] = partialVOuts.map(t => t.data);
+    const lsePtrs: number[] = partialLses.map(t => t.data);
+
+    const outputV: Tensor[] = [];
+    const outputLse: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      currentV.push(partialVOuts[i].viewClone());
-      currentLse.push(partialLses[i].viewClone());
+      outputV.push(shardWss[i].alloc([batchSize, shardNHeads * vHeadDim], "BF16"));
+      outputLse.push(shardWss[i].alloc([batchSize, shardNHeads], "F32"));
     }
 
-    for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
-      const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
-      const isLastRound = reduceHalf === 1;
-      const outNumel = isLastRound ? shardNumel : numel;
-      const outHeads = isLastRound ? shardNHeads : numHeads;
-      const outVShape = isLastRound ? [batchSize, shardNHeads * vHeadDim] : currentV[0].shape;
-      const outLseShape = isLastRound ? [batchSize, shardNHeads] : currentLse[0].shape;
-
-      const outputV: Tensor[] = [];
-      const outputLse: Tensor[] = [];
-      for (let i = 0; i < this.worldSize; i++) {
-        outputV.push(shardWss[i].alloc(outVShape, currentV[i].type));
-        outputLse.push(shardWss[i].alloc(outLseShape, currentLse[i].type));
+    for (let i = 0; i < this.worldSize; i++) {
+      // rotate the source order per GPU so they don't all hit peer 0 first
+      const rotV: number[] = [];
+      const rotLse: number[] = [];
+      for (let j = 0; j < this.worldSize; j++) {
+        const src = (i + j) % this.worldSize;
+        rotV.push(vPtrs[src]);
+        rotLse.push(lsePtrs[src]);
       }
-
-      this.p2pBarrier(peerRanks);
-      if (reduceHalf === this.worldSize / 2) {
-        this.sourceCleanup();
-      }
-      this.p2pSources.push(...currentV, ...currentLse);
-
-      for (let i = 0; i < this.worldSize; i++) {
-        const peer = i ^ reduceHalf;
-        this.devices[i].cpMergeTree(
-          [currentV[i].data, currentV[peer].data],
-          [currentLse[i].data, currentLse[peer].data],
-          2,
-          outputV[i], outputLse[i],
-          outNumel, batchSize, numHeads, vHeadDim,
-          outHeads, isLastRound ? i * shardNHeads : 0, numHeads,
-        );
-      }
-
-      for (let i = 0; i < this.worldSize; i++) {
-        currentV[i][Symbol.dispose]();
-        currentLse[i][Symbol.dispose]();
-      }
-
-      currentV = outputV;
-      currentLse = outputLse;
+      this.devices[i].cpMergeTree(
+        rotV,
+        rotLse,
+        this.worldSize,
+        outputV[i], outputLse[i],
+        shardNumel, batchSize, numHeads, vHeadDim,
+        shardNHeads, i * shardNHeads, numHeads,
+      );
     }
 
-    for (const lse of currentLse) {
+    for (const lse of outputLse) {
       lse[Symbol.dispose]();
     }
 
-    return this.wrapShards(workspace, currentV, [batchSize, numHeads * vHeadDim], "BF16", TensorParallelism.Row);
+    return this.wrapShards(workspace, outputV, [batchSize, numHeads * vHeadDim], "BF16", TensorParallelism.Row);
   }
 
   /**
