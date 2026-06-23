@@ -82,8 +82,27 @@ export class ParallelTensor extends Tensor {
   }
 
   capture() {
-    const capturedShards = this.shards.map(s => s.capture());
-    const captured = this.parallelOps.wrapShards(this.workspace, capturedShards, this.shape, this.type, this.parallelism, undefined);
+    this.removeTracking();
+    // Create captured shard orphans directly via wrapTensor rather than calling
+    // s.capture() on each shard. Using s.capture() would call removeTracking() on
+    // the original shard, moving it into the shard workspace's exported set. Shard
+    // workspaces never have startTracking() called on them, so shards stuck in
+    // exported can never be disposed or recycled — leaking GPU memory every call.
+    // Instead, wrap the same GPU pointer in a new captured (immutable, orphan)
+    // tensor without touching the original shard's tracking state. The original
+    // shards stay in sw.tracked, so when this ParallelTensor is later disposed by
+    // startTracking() cleaning up main ws.exported, each shard's canDispose()
+    // returns true and its GPU memory enters the shard workspace's disposed pool
+    // for recycling. The captured shards are pure orphans (not in any workspace
+    // set) held solely by the returned captured ParallelTensor / CaptureManager.
+    const capturedShards = this.shards.map(s => {
+      const captured = s.workspace.glm.wrapTensor(
+        s.workspace, s.data, s.allocSize, s.shape, s.type, s.pinned, undefined);
+      (captured as { name: string | undefined }).name = s.name;
+      captured.captured = true;
+      return captured;
+    });
+    const captured = new ParallelTensor(this.workspace, this.parallelOps, this.parallelism, capturedShards, this.shape, this.type, undefined, this.pinned, undefined);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
     return captured;

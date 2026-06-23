@@ -430,6 +430,7 @@ export class Glm51Model extends ChatModel {
 
       kPeRopeStream.streamWaitEvent();
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
+      ckvNormed[Symbol.dispose]();
     });
 
     const pagedKV = state.cache.getPagedKV();
