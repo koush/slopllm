@@ -85,7 +85,7 @@ export class ParallelTensor extends Tensor {
 
   capture() {
     const capturedShards = this.shards.map(s => s.capture());
-    const captured = this.parallelOps.wrapShards(this.workspace, capturedShards, this.fullShape, this.type, this.parallelism, this);
+    const captured = this.parallelOps.wrapShards(this.workspace, capturedShards, this.fullShape, this.type, this.parallelism, undefined);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
     return captured;
