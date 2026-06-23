@@ -2601,7 +2601,7 @@ export class ParallelOps implements DeviceOps {
     const effectiveCkvStridePage = contextParallel ? ckvStridePage / this.worldSize : ckvStridePage;
     const effectiveKpeStridePage = contextParallel ? kpeStridePage / this.worldSize : kpeStridePage;
     const totalTokens = oStrideH / headDimCkv;
-    const lsePar = contextParallel ? TensorParallelism.Column : TensorParallelism.Replicated;
+    const lsePar = contextParallel ? TensorParallelism.Column : TensorParallelism.Row;
     const lseFullShape = contextParallel ? [totalTokens * this.worldSize, numHeads] : [totalTokens, numHeads];
     const oPar = contextParallel ? TensorParallelism.PartialSoftmax : qNope.parallelism;
     const oFullShape = [1, numHeads, totalTokens, headDimCkv];
@@ -2681,7 +2681,7 @@ export class ParallelOps implements DeviceOps {
     const pPlanInfo = this.cast(planInfo);
     const effectiveNumQoHeads = contextParallel ? numQoHeads : this.shardDim(numQoHeads, "mlaDecodeRun numQoHeads");
     const effectivePageSize = contextParallel ? pageSize / this.worldSize : pageSize;
-    const lsePar = contextParallel ? TensorParallelism.Column : TensorParallelism.Replicated;
+    const lsePar = contextParallel ? TensorParallelism.Column : TensorParallelism.Row;
     const lseFullShape = contextParallel ? [batchSize * this.worldSize, numQoHeads] : [batchSize, numQoHeads];
     const oPar = contextParallel ? TensorParallelism.PartialSoftmax : qNope.parallelism;
     const oFullShape = [batchSize, numQoHeads, 1, headDimCkv];
