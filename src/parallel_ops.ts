@@ -1853,7 +1853,9 @@ export class ParallelOps implements DeviceOps {
 
     let current: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      current.push(shards[i].viewClone());
+      const copy = shards[i].workspace.alloc(shards[i].shape, shards[i].type);
+      copy.memcpy(shards[i]);
+      current.push(copy);
     }
 
     for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
