@@ -99,6 +99,10 @@ export abstract class Tensor implements Disposable {
     return reshaped;
   }
 
+  viewClone(): Tensor {
+    return this.reshape(this.shape);
+  }
+
   abstract free(): void;
 
   capture() {

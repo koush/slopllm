@@ -136,6 +136,14 @@ export class ParallelTensor extends Tensor {
     );
   }
 
+  override viewClone(): Tensor {
+    const clonedShards: Tensor[] = this.shards.map(s => s.viewClone());
+    return new ParallelTensor(
+      this.workspace, this.parallelOps, this.parallelism,
+      clonedShards, this.shape, this.type, undefined, this.pinned, this,
+    );
+  }
+
   allReduce(): void {
     if (this.parallelism !== TensorParallelism.PartialSum) {
       throw new Error(`allReduce requires PartialSum tensor, got ${this.parallelism}`);
@@ -1845,9 +1853,7 @@ export class ParallelOps implements DeviceOps {
 
     let current: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const copy = shards[i].workspace.alloc(shards[i].shape, shards[i].type);
-      copy.memcpy(shards[i]);
-      current.push(copy);
+      current.push(shards[i].viewClone());
     }
 
     for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
@@ -2078,12 +2084,8 @@ export class ParallelOps implements DeviceOps {
     let currentV: Tensor[] = [];
     let currentLse: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const v = shardWss[i].alloc(partialVOuts[i].shape, partialVOuts[i].type);
-      v.memcpy(partialVOuts[i]);
-      currentV.push(v);
-      const lse = shardWss[i].alloc(partialLses[i].shape, partialLses[i].type);
-      lse.memcpy(partialLses[i]);
-      currentLse.push(lse);
+      currentV.push(partialVOuts[i].viewClone());
+      currentLse.push(partialLses[i].viewClone());
     }
 
     for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
@@ -2209,12 +2211,8 @@ export class ParallelOps implements DeviceOps {
     let currentV: Tensor[] = [];
     let currentLse: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const v = shardWss[i].alloc(partialVOuts[i].shape, partialVOuts[i].type);
-      v.memcpy(partialVOuts[i]);
-      currentV.push(v);
-      const lse = shardWss[i].alloc(partialLses[i].shape, partialLses[i].type);
-      lse.memcpy(partialLses[i]);
-      currentLse.push(lse);
+      currentV.push(partialVOuts[i].viewClone());
+      currentLse.push(partialLses[i].viewClone());
     }
 
     for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
