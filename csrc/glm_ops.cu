@@ -2570,7 +2570,6 @@ void glm_sum_pointers(GlmCtx* ctx,
     int total_warps = (int)((numel + ElemsPerWarp - 1) / ElemsPerWarp);
     if (total_warps == 0) total_warps = 1;
     int grid = (total_warps + warps_per_block - 1) / warps_per_block;
-    if (grid > 65535) grid = 65535;
 
     // Peer-major smem layout: each peer's data for all warps is contiguous
     // so thread 0 can issue one cp.async.bulk per peer covering the full block tile.
