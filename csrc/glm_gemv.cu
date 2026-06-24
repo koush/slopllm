@@ -1305,7 +1305,8 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
                 const void* weight, int batch, int n, int k) {
     cudaSetDevice(ctx->device_id);
 
-    if (batch == 1) {
+    // TODO auto tune
+    if (batch < 4) {
         // Split-K variant when N is small enough that the row-major kernel
         // would launch too few blocks to fill the GPU. Threshold tuned for
         // RTX PRO 6000 / sm_120 (~140 SMs). Each row-major block has
