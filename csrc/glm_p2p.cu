@@ -923,7 +923,6 @@ void glm_p2p_allreduce_smem(GlmCtx* ctx, GlmP2PInstance* inst,
     int64_t total_warps = (numel + ElemsPerWarp - 1) / ElemsPerWarp;
     if (total_warps < 1) total_warps = 1;
     int grid = (int)((total_warps + warps_per_block - 1) / warps_per_block);
-    if (grid > 65535) grid = 65535;
     int smem_bytes = warps_per_block * smem_per_warp;
 
     if (dtype == 9) {
