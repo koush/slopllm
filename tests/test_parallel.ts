@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_SUM } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { TensorParallelism } from "../src/device_ops";
-import { MemcpyKind } from "../src/tensor";
+import { MemcpyKind, Tensor } from "../src/tensor";
 import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
 
 describe("ParallelOps construction", () => {
@@ -563,7 +563,7 @@ describe("ParallelTensor.allReduce", () => {
 
   it("allReduce BF16 PartialSum → Replicated", () => {
     const rows = 4;
-    const cols = 8;
+    const cols = 768;
     const totalElems = rows * cols;
 
     const pt = ws.alloc([rows, cols], "BF16", undefined, TensorParallelism.PartialSum) as ParallelTensor;
@@ -600,8 +600,8 @@ describe("ParallelTensor.allReduce", () => {
   });
 
   it("allReduce F32 PartialSum → Replicated", () => {
-    const rows = 3;
-    const cols = 6;
+    const rows = 4;
+    const cols = 768;
     const totalElems = rows * cols;
 
     const pt = ws.alloc([rows, cols], "F32", undefined, TensorParallelism.PartialSum) as ParallelTensor;

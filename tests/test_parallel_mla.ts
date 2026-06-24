@@ -1019,8 +1019,8 @@ describe("ParallelOps.reduceSum", () => {
   });
 
   it("Row-parallel reduceSum produces PartialSum and AllReduce matches single-GPU", () => {
-    const batch = 2;
-    const dim = 8;
+    const batch = 4;
+    const dim = 768;
 
     const inputF32 = new Float32Array(batch * dim);
     for (let i = 0; i < batch * dim; i++) inputF32[i] = (i % 13 - 6) * 0.1;
