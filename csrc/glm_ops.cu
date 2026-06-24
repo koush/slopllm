@@ -2485,7 +2485,8 @@ sum_pointers_smem_kernel(
                 cuda::ptx::space_shared_t{},
                 reinterpret_cast<uint64_t*>(&bar),
                 N * copy_bytes);
-            for (int j = 0; j < N; j++) {
+            for (int j = 0; j < MaxN; j++) {
+                if (j >= N) break;
                 cuda::ptx::cp_async_bulk(
                     cuda::ptx::space_shared_t{},
                     cuda::ptx::space_global_t{},
