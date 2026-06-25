@@ -396,11 +396,11 @@ export class Qwen35Model extends ChatModel {
 
     using flashOut = new UsingHolder<Tensor>(undefined!);
     if (state.isDecode) {
-      flashOut.replace(ws.flashDecode(qRope, pagedKV, cacheIdx, batchSize, nHeads, nKv, hd, cfg.scaling));
+      flashOut.replace(ws.flashDecode(state, qRope, cacheIdx, nHeads, nKv, hd, cfg.scaling));
     } else {
       const qStrideN = hd;
       const qStrideH = BS * hd;
-      flashOut.replace(ws.flashPrefillPaged(qRope, pagedKV, cacheIdx, BS, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
+      flashOut.replace(ws.flashPrefillPaged(state, qRope, cacheIdx, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
     }
 
     if (cfg.attnOutputGate) {
