@@ -2358,9 +2358,13 @@ static Napi::Value MlaPrefillRun(const Napi::CallbackInfo& info) {
     uint32_t cp_rank = info[28].As<Napi::Number>().Uint32Value();
     void* custom_mask_ptr = nullptr;
     int32_t* mask_indptr_ptr = nullptr;
+    int32_t* mask_kv_len_ptr = nullptr;
     if (info.Length() >= 31) {
         custom_mask_ptr = reinterpret_cast<void*>(info[29].As<Napi::Number>().Int64Value());
         mask_indptr_ptr = reinterpret_cast<int32_t*>(info[30].As<Napi::Number>().Int64Value());
+    }
+    if (info.Length() >= 32) {
+        mask_kv_len_ptr = reinterpret_cast<int32_t*>(info[31].As<Napi::Number>().Int64Value());
     }
     glm_mla_prefill_run(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
@@ -2378,7 +2382,7 @@ static Napi::Value MlaPrefillRun(const Napi::CallbackInfo& info) {
         head_dim_ckv, head_dim_kpe,
         reinterpret_cast<float*>(lse_ptr),
         cp_world_size, cp_rank,
-        custom_mask_ptr, mask_indptr_ptr);
+        custom_mask_ptr, mask_indptr_ptr, mask_kv_len_ptr);
     {
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {

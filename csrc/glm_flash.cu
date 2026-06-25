@@ -559,7 +559,7 @@ void glm_mla_prefill_run(
     uint32_t head_dim_ckv, uint32_t head_dim_kpe,
     float* lse,
     uint32_t cp_world_size, uint32_t cp_rank,
-    void* custom_mask, int32_t* mask_indptr) {
+    void* custom_mask, int32_t* mask_indptr, int32_t* mask_kv_len) {
 
   cudaSetDevice(ctx->device_id);
 
@@ -616,6 +616,7 @@ void glm_mla_prefill_run(
 
   params.maybe_custom_mask = static_cast<uint8_t*>(custom_mask);
   params.maybe_mask_indptr = mask_indptr;
+  params.maybe_mask_kv_len = mask_kv_len;
   params.batch_indices = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.batch_indices_offset);
 
   flashinfer::MaskMode flash_mask = static_cast<flashinfer::MaskMode>(mask_mode);

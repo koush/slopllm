@@ -24,6 +24,7 @@ export class ExecutionState {
       mask: Tensor;
       mode?: MaskMode;
       positionIds?: Tensor;
+      maskKvLen?: Tensor;
     },
   ) {
   }
@@ -286,7 +287,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, contextParallel?: boolean, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor): { o: Tensor, lse: Tensor } {
+  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, contextParallel?: boolean, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const pageSize = pagedKV.pageSize;
@@ -311,7 +312,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       oStrideN, oStrideH,
       headDimCkv, headDimKpe,
       contextParallel, undefined, undefined,
-      customMask, maskIndptr
+      customMask, maskIndptr, maskKvLen
     );
   }
 
@@ -421,6 +422,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     mask: Tensor;
     mode?: MaskMode;
     positionIds?: Tensor;
+    maskKvLen?: Tensor;
   }): ExecutionState {
     const pagedKV = cache.getPagedKV();
     pagedKV.checkSequenceCount();

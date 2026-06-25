@@ -2611,7 +2611,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: MaskMode, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, customMask?: Tensor, maskIndptr?: Tensor): { o: Tensor, lse: Tensor } {
+  mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: MaskMode, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
     let pQNope = this.cast(qNope);
     let pQPe = this.cast(qPe);
     const pCkvData = this.cast(ckvData);
@@ -2658,6 +2658,7 @@ export class ParallelOps implements DeviceOps {
     }
     const pCustomMask = customMask ? this.cast(customMask) : undefined;
     const pMaskIndptr = maskIndptr ? this.cast(maskIndptr) : undefined;
+    const pMaskKvLen = maskKvLen ? this.cast(maskKvLen) : undefined;
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     try {
@@ -2665,7 +2666,8 @@ export class ParallelOps implements DeviceOps {
         const effectiveCpRank = contextParallel ? i : undefined;
         const shardCustomMask = pCustomMask ? pCustomMask.shards[i] : undefined;
         const shardMaskIndptr = pMaskIndptr ? pMaskIndptr.shards[i] : undefined;
-        const shardResult = this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], effectiveNumHeads, effectivePageSize, maskMode, smScale, effectiveQNopeStrideN, qNopeStrideH, effectiveQPeStrideN, qPeStrideH, effectiveCkvStridePage, ckvStrideN, effectiveKpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, contextParallel, effectiveCpWorldSize, effectiveCpRank, shardCustomMask, shardMaskIndptr);
+        const shardMaskKvLen = pMaskKvLen ? pMaskKvLen.shards[i] : undefined;
+        const shardResult = this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], effectiveNumHeads, effectivePageSize, maskMode, smScale, effectiveQNopeStrideN, qNopeStrideH, effectiveQPeStrideN, qPeStrideH, effectiveCkvStridePage, ckvStrideN, effectiveKpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, contextParallel, effectiveCpWorldSize, effectiveCpRank, shardCustomMask, shardMaskIndptr, shardMaskKvLen);
         oShards.push(shardResult.o);
         lseShards.push(shardResult.lse);
       }
