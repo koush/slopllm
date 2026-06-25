@@ -244,8 +244,7 @@ describe("Qwen3-0.6B batch tests", () => {
     gws.positionStep(stateRef, model);
     const hiddenStatesRef = model.forward(stateRef);
     const logitsRef = stateRef.computeLogits(hiddenStatesRef, model);
-    using argmaxRef = logitsRef.argmax();
-    const tokensRef = argmaxRef.readInt32LEArray();
+    const tokensRef = (() => { using a = logitsRef.argmax(); return a.readInt32LEArray(); })();
 
     pagedKV.reset(1);
     const tokens2 = gws.forwardEagerPrefill(model, [prompt], pagedKV);
@@ -314,6 +313,7 @@ describe("Qwen3-0.6B batch tests", () => {
         }
 
     gws.positionStep(state, model);
+        captureArgmax?.[Symbol.dispose]();
         const hiddenStates = model.forward(state);
         captureArgmax = state.computeLogits(hiddenStates, model).argmax();
 
@@ -368,9 +368,8 @@ describe("Qwen3-0.6B batch tests", () => {
     const firstToken = tokens[0];
     const history = [...PROMPT_GRAPH, firstToken];
 
-    const greedySingle = logits.sampleTokenGPU(greedy, history).readInt32LEArray()[0];
-
-    const batchResults = logits.sampleBatchGPU([greedy, sampling], [history, history]).readInt32LEArray();
+    const greedySingle = (() => { using r = logits.sampleTokenGPU(greedy, history); return r.readInt32LEArray()[0]; })();
+    const batchResults = (() => { using r = logits.sampleBatchGPU([greedy, sampling], [history, history]); return r.readInt32LEArray(); })();
 
     assert.equal(batchResults[0], greedySingle,
       `Batch greedy[0] != sequential greedy: ${batchResults[0]} != ${greedySingle}`);
@@ -398,7 +397,7 @@ describe("Qwen3-0.6B batch tests", () => {
     const history1 = [...PROMPT1, tokens[0]];
     const history2 = [...PROMPT2, tokens[1]];
 
-    const batchResults = logits.sampleBatchGPU([greedy, greedy], [history1, history2]).readInt32LEArray();
+    const batchResults = (() => { using r = logits.sampleBatchGPU([greedy, greedy], [history1, history2]); return r.readInt32LEArray(); })();
 
     assert.equal(batchResults[0], tokens[0],
       `Batch greedy[0] != argmax: ${batchResults[0]} != ${tokens[0]}`);

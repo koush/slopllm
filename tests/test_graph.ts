@@ -95,6 +95,7 @@ function generateWithGraph(
         graph.graphBeginCapture();
       }
 
+      argmaxResult?.[Symbol.dispose]();
       ws.positionStep(state, model);
       const hiddenStates = model.forward(state);
       argmaxResult = state.computeLogits(hiddenStates, model).argmax();
