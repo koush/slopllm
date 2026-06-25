@@ -1,6 +1,5 @@
 import { type ChatCache } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
-import type { ExecutionWorkspace } from "./execution-workspace";
 import { I32 } from "./glm_ops";
 import { MemcpyKind, Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
@@ -400,36 +399,5 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
   allocDecodeToken(seqIdx: number): void {
     this.allocAppendPages(seqIdx, 1);
-  }
-
-  updateIndptr(ws: ExecutionWorkspace): void {
-    const batchSize = this.sequences.length;
-    ws.indptrH.withPinnedBuffer(buf => {
-      buf.writeInt32LE(0, 0);
-      let cumulative = 0;
-      for (let i = 0; i < batchSize; i++) {
-        cumulative += this.sequences[i].contentPages;
-        buf.writeInt32LE(cumulative, (i + 1) * I32);
-      }
-    });
-
-    this.indicesH.withPinnedBuffer(buf => {
-      let indicesOff = 0;
-      for (let i = 0; i < batchSize; i++) {
-        const contentPages = this.sequences[i].contentPages;
-        for (let j = 0; j < contentPages; j++) {
-          buf.writeInt32LE(this.sequences[i].pages[j].id, indicesOff * I32);
-          indicesOff++;
-        }
-      }
-    });
-
-    ws.lastPageLenH.withPinnedBuffer(buf => {
-      for (let i = 0; i < batchSize; i++) {
-        const allocLen = this.sequences[i].allocLen;
-        const remainder = allocLen % this.pageSize;
-        buf.writeInt32LE(remainder !== 0 ? remainder : (allocLen > 0 ? this.pageSize : 0), i * I32);
-      }
-    });
   }
 }

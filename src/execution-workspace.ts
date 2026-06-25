@@ -331,6 +331,37 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
 
+  updateIndptr(pagedKV: PagedKVCache): void {
+    const batchSize = pagedKV.sequences.length;
+    this.indptrH.withPinnedBuffer(buf => {
+      buf.writeInt32LE(0, 0);
+      let cumulative = 0;
+      for (let i = 0; i < batchSize; i++) {
+        cumulative += pagedKV.sequences[i].contentPages;
+        buf.writeInt32LE(cumulative, (i + 1) * I32);
+      }
+    });
+
+    pagedKV.indicesH.withPinnedBuffer(buf => {
+      let indicesOff = 0;
+      for (let i = 0; i < batchSize; i++) {
+        const contentPages = pagedKV.sequences[i].contentPages;
+        for (let j = 0; j < contentPages; j++) {
+          buf.writeInt32LE(pagedKV.sequences[i].pages[j].id, indicesOff * I32);
+          indicesOff++;
+        }
+      }
+    });
+
+    this.lastPageLenH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        const allocLen = pagedKV.sequences[i].allocLen;
+        const remainder = allocLen % pagedKV.pageSize;
+        buf.writeInt32LE(remainder !== 0 ? remainder : (allocLen > 0 ? pagedKV.pageSize : 0), i * I32);
+      }
+    });
+  }
+
   planDecode(model: ChatModel, batchSize: number, cache: ChatCache, enableCudaGraph = false): ExecutionState {
     const pagedKV = cache.getPagedKV();
     pagedKV.checkSequenceCount();
@@ -378,7 +409,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
 
     if (pagedKV.pagesDirtyHost) {
-      pagedKV.updateIndptr(this);
+      this.updateIndptr(pagedKV);
 
       if (!cfg.kvLoraRank) {
         this.glm.batchDecodePlan(
@@ -459,7 +490,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       }
     });
 
-    pagedKV.updateIndptr(this);
+    this.updateIndptr(pagedKV);
 
     this.positionIdsH.withPinnedBuffer(buf => {
       let posOff = 0;

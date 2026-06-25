@@ -266,12 +266,12 @@ async function generateContinuousBatch(
         }
       }
 
-      pagedKV.updateIndptr(ws);
+      ws.updateIndptr(pagedKV);
 
-      // Unstage active sequences (if any were staged)
+      // Unstage active sequences (if any)
       if (active.length > 0) {
         pagedKV.unstageAll();
-        pagedKV.updateIndptr(ws);
+        ws.updateIndptr(pagedKV);
       }
 
       // Build new active list matching pagedKV sequence order: [new..., old...]

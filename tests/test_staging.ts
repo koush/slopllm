@@ -216,28 +216,28 @@ describe("PagedKVCache staging", () => {
     ws.forwardEagerPrefill(model, [PROMPT1, PROMPT2], refKV);
     pagedKV.reportTokens(0, PROMPT1);
     pagedKV.reportTokens(1, PROMPT2);
-    pagedKV.updateIndptr(ws);
+    ws.updateIndptr(pagedKV);
     refKV.reportTokens(0, PROMPT1);
     refKV.reportTokens(1, PROMPT2);
-    refKV.updateIndptr(ws);
+    ws.updateIndptr(refKV);
 
     const decode1 = ws.forwardEagerDecode(model, batchTokens, pagedKV);
     const refDecode1 = ws.forwardEagerDecode(model, batchTokens, refKV);
     pagedKV.reportTokens(0, [decode1[0]]);
     pagedKV.reportTokens(1, [decode1[1]]);
-    pagedKV.updateIndptr(ws);
+    ws.updateIndptr(pagedKV);
     refKV.reportTokens(0, [refDecode1[0]]);
     refKV.reportTokens(1, [refDecode1[1]]);
-    refKV.updateIndptr(ws);
+    ws.updateIndptr(refKV);
 
     const decode2 = ws.forwardEagerDecode(model, decode1, pagedKV);
     const refDecode2 = ws.forwardEagerDecode(model, refDecode1, refKV);
     pagedKV.reportTokens(0, [decode2[0]]);
     pagedKV.reportTokens(1, [decode2[1]]);
-    pagedKV.updateIndptr(ws);
+    ws.updateIndptr(pagedKV);
     refKV.reportTokens(0, [refDecode2[0]]);
     refKV.reportTokens(1, [refDecode2[1]]);
-    refKV.updateIndptr(ws);
+    ws.updateIndptr(refKV);
 
     assert.equal(decode1[0], refDecode1[0], "decode1 seq0 matches reference");
     assert.equal(decode1[1], refDecode1[1], "decode1 seq1 matches reference");
@@ -255,14 +255,14 @@ describe("PagedKVCache staging", () => {
     const prompt3 = [151643, 151644, 10, 20, 30];
     const tokens3 = ws.forwardEagerPrefill(model, [prompt3], pagedKV);
     pagedKV.reportTokens(0, prompt3);
-    pagedKV.updateIndptr(ws);
+    ws.updateIndptr(pagedKV);
 
     pagedKV.unstageAll();
 
     assert.equal(pagedKV.sequences.length, 3, "3 sequences after unstageAll");
     assert.equal(pagedKV.staging.size, 0, "staging is empty");
 
-    pagedKV.updateIndptr(ws);
+    ws.updateIndptr(pagedKV);
 
     // unstageAll restores in Map insertion order: key 1 first, then key 0
     // sequences = [newSeq, seq1, seq0]
@@ -286,12 +286,12 @@ describe("PagedKVCache staging", () => {
     pagedKV.reset(1);
     const tokens1 = ws.forwardEagerPrefill(model, [PROMPT1], pagedKV);
     pagedKV.reportTokens(0, PROMPT1);
-    pagedKV.updateIndptr(ws);
+    ws.updateIndptr(pagedKV);
 
     for (let step = 0; step < 3; step++) {
       const decodeTokens = ws.forwardEagerDecode(model, [tokens1[0]], pagedKV);
       pagedKV.reportTokens(0, [decodeTokens[0]]);
-      pagedKV.updateIndptr(ws);
+      ws.updateIndptr(pagedKV);
       tokens1[0] = decodeTokens[0];
     }
 
@@ -304,7 +304,7 @@ describe("PagedKVCache staging", () => {
     const prompt2 = [151643, 151644, 10, 20, 30, 40, 50];
     const tokens2 = ws.forwardEagerPrefill(model, [prompt2], pagedKV);
     pagedKV.reportTokens(0, prompt2);
-    pagedKV.updateIndptr(ws);
+    ws.updateIndptr(pagedKV);
 
     assert.equal(pagedKV.sequences.length, 1, "1 active sequence after prefill");
     assert.equal(pagedKV.staging.size, 1, "staging still has 1 entry");
@@ -314,14 +314,14 @@ describe("PagedKVCache staging", () => {
     refKV.reset(1);
     const refTokens = ws.forwardEagerPrefill(model, [PROMPT1], refKV);
     refKV.reportTokens(0, PROMPT1);
-    refKV.updateIndptr(ws);
+    ws.updateIndptr(refKV);
     let refDecoded: number[] = [];
     let lastRef = refTokens[0];
     for (let step = 0; step < 3; step++) {
       const stepTokens = ws.forwardEagerDecode(model, [lastRef], refKV);
       refDecoded.push(stepTokens[0]);
       refKV.reportTokens(0, [stepTokens[0]]);
-      refKV.updateIndptr(ws);
+      ws.updateIndptr(refKV);
       lastRef = stepTokens[0];
     }
     const refNext = ws.forwardEagerDecode(model, [lastRef], refKV);
@@ -330,7 +330,7 @@ describe("PagedKVCache staging", () => {
     assert.equal(pagedKV.sequences.length, 2, "2 sequences after unstage");
     // sequences = [newSeq, seq0] — unstageSequence appends to end
 
-    pagedKV.updateIndptr(ws);
+    ws.updateIndptr(pagedKV);
 
     // Input tokens must match sequence order: [newSeq, seq0]
     const resumedDecode = ws.forwardEagerDecode(model, [tokens2[0], lastRef], pagedKV);

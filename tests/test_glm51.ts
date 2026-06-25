@@ -175,12 +175,12 @@ describe("GLM-5.1 small model smoke test", () => {
 
     cache1.reset(1);
     const fullTokens = ws.forwardEagerPrefill(model, [fullPrompt], cache1);
-    cache1.getPagedKV().updateIndptr(ws);
+    ws.updateIndptr(cache1.getPagedKV());
     const fullDecode = ws.forwardEagerDecode(model, [fullTokens[0]], cache1)[0];
 
     cache2.reset(1);
     const chunkedTokens = chunkedPrefill(model, ws, cache2, fullPrompt, [mid, fullPrompt.length - mid]);
-    cache2.getPagedKV().updateIndptr(ws);
+    ws.updateIndptr(cache2.getPagedKV());
     const chunkedDecode = ws.forwardEagerDecode(model, [chunkedTokens[0]], cache2)[0];
 
     assert.equal(chunkedTokens[0], fullTokens[0],
@@ -234,7 +234,7 @@ describe("GLM-5.1 small model with context parallelism", () => {
     const firstToken = wsCp.forwardEagerPrefill(modelCp, [inputIds], cache)[0];
     assert.ok(firstToken >= 0 && firstToken < modelCp.cfg.vocabSize, "prefill token out of range");
 
-    cache.getPagedKV().updateIndptr(wsCp);
+    wsCp.updateIndptr(cache.getPagedKV());
     const secondToken = wsCp.forwardEagerDecode(modelCp, [firstToken], cache)[0];
     assert.ok(secondToken >= 0 && secondToken < modelCp.cfg.vocabSize, "decode token out of range");
   });
@@ -247,12 +247,12 @@ describe("GLM-5.1 small model with context parallelism", () => {
 
     cache1.reset(1);
     const fullTokens = wsCp.forwardEagerPrefill(modelCp, [fullPrompt], cache1);
-    cache1.getPagedKV().updateIndptr(wsCp);
+    wsCp.updateIndptr(cache1.getPagedKV());
     const fullDecode = wsCp.forwardEagerDecode(modelCp, [fullTokens[0]], cache1)[0];
 
     cache2.reset(1);
     const chunkedTokens = chunkedPrefill(modelCp, wsCp, cache2, fullPrompt, [mid, fullPrompt.length - mid]);
-    cache2.getPagedKV().updateIndptr(wsCp);
+    wsCp.updateIndptr(cache2.getPagedKV());
     const chunkedDecode = wsCp.forwardEagerDecode(modelCp, [chunkedTokens[0]], cache2)[0];
 
     assert.equal(chunkedTokens[0], fullTokens[0],
