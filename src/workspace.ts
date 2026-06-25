@@ -89,9 +89,17 @@ export class WorkspaceBase implements Disposable {
     this.tracked.add(tensor);
   }
 
+  static isSameParallelism(p1: TensorParallelism | undefined, p2: TensorParallelism | undefined): boolean {
+    if (p1 === p2)
+      return true;
+    if (p1 && p2)
+      return false;
+    return p1 === 'replicated' || p2 === 'replicated';
+  }
+
   protected _alloc(shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor {
-    if (this.frozen) {
-      throw new Error("Workspace is frozen");
+    if (this.frozen && !pinned) {
+      throw new Error("Workspace is frozen. Device allocations, new or recycled, are not allowed.");
     }
 
     const bytes = Tensor.byteCount(shape, type);
@@ -107,9 +115,9 @@ export class WorkspaceBase implements Disposable {
     for (const t of this.disposed) {
       if (t.view)
         throw new Error("disposed tensor should not have a view");
-      if (!t.data)
-        throw new Error("disposed tensor should have data");
-      if (t.pinned === pinned && t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
+      if (t.pinned === pinned && t.allocSize >= bytes && t.type === type
+        && WorkspaceBase.isSameParallelism(t.parallelism, parallelism)
+        && (best === undefined || t.allocSize < best.allocSize)) {
         if (name === undefined) {
           best = t;
         }
@@ -123,8 +131,11 @@ export class WorkspaceBase implements Disposable {
       this.disposed.delete(best);
       const data = best.data;
       best.detachData();
-      tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned, undefined);
+      tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned, parallelism, undefined, best);
     } else {
+      if (this.frozen) {
+        throw new Error("Workspace is frozen. New host pinned allocations are not allowed. Did you forget to call WorkspaceBase.synchronize()?");
+      }
       if (this.allocLogger) {
         console.warn(`Allocating new tensor ${name ?? "<unnamed>"} of size ${bytes} bytes (${shape.join("x")} ${type}${pinned ? " pinned" : ""}${parallelism ? ` ${parallelism}` : ""})`);
       }
@@ -137,6 +148,15 @@ export class WorkspaceBase implements Disposable {
       this.addTracked(tensor);
     }
     return tensor;
+  }
+  
+  synchronize() {
+    this.glm.synchronize();
+    for (const tensor of this.tracked) {
+      if (tensor.pinned) {
+        tensor[Symbol.dispose]();
+      }
+    }
   }
 
   transfer(tensor: Tensor) {

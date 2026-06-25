@@ -27,7 +27,7 @@ export interface StridedMmap {
 
 export interface DeviceOps {
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
-  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined): Tensor;
+  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, parallelism: TensorParallelism | undefined, view: Tensor | undefined, disposed?: Tensor): Tensor;
   synchronize(): void;
   synchronizeStream(streamIdx: number): void;
   setStream(streamIdx: number): void;

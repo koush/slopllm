@@ -312,7 +312,7 @@ describe("Qwen3-0.6B batch tests", () => {
           glm.graphBeginCapture();
         }
 
-    gws.positionStep(state, model);
+        gws.positionStep(state, model);
         captureArgmax?.[Symbol.dispose]();
         const hiddenStates = model.forward(state);
         captureArgmax = state.computeLogits(hiddenStates, model).argmax();
@@ -331,7 +331,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
       if (graphExec !== null) {
         glm.graphLaunch(graphExec);
-        glm.synchronize();
+        gws.synchronize();
       }
 
       current = captureArgmax.readInt32LEArray()[0];

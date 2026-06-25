@@ -34,7 +34,8 @@ export abstract class Tensor implements Disposable {
     public readonly type: string,
     public readonly name: string | undefined,
     public readonly pinned: boolean,
-    public readonly view: Tensor | undefined) {
+    public readonly view: Tensor | undefined,
+    parallelism?: TensorParallelism) {
     this.id = Tensor.nextId++;
     this.data = data;
     this.allocSize = allocSize;
@@ -43,6 +44,7 @@ export abstract class Tensor implements Disposable {
     this.name = name;
     this.pinned = pinned;
     this.view = view;
+    if (parallelism) this.parallelism = parallelism;
     this.stack = new Error("Tensor allocated at:").stack!;
     if (view) {
       view.views.add(this);
@@ -95,7 +97,7 @@ export abstract class Tensor implements Disposable {
       throw new Error(`reshape: cannot reshape [${this.shape}] (${current} elements) to [${newShape}] (${target} elements)`);
     }
 
-    const reshaped = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, newShape, this.type, this.pinned, this);
+    const reshaped = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, newShape, this.type, this.pinned, this.parallelism, this);
     return reshaped;
   }
 
@@ -107,7 +109,7 @@ export abstract class Tensor implements Disposable {
 
   capture() {
     this.removeTracking();
-    const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, undefined);
+    const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, this.parallelism, undefined);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
     return captured;
@@ -148,7 +150,6 @@ export abstract class Tensor implements Disposable {
       }
       return;
     }
-    if (this.data === 0) return;
     this.workspace.disposed.add(this);
   }
 

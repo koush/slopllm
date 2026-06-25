@@ -290,7 +290,7 @@ describe("ParallelTensor disposal and recycling", () => {
     pt[Symbol.dispose]();
 
     assert.ok(!ws.tracked.has(pt), "ParallelTensor should be removed from main workspace tracked");
-    assert.ok(!ws.disposed.has(pt), "ParallelTensor should NOT be in main workspace disposed");
+    assert.ok(ws.disposed.has(pt), "ParallelTensor should be in main workspace disposed");
     assert.equal(sws[0].disposed.size, 1, "shard 0 should be in device 0 workspace disposed");
     assert.equal(sws[1].disposed.size, 1, "shard 1 should be in device 1 workspace disposed");
 

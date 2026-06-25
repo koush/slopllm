@@ -96,7 +96,8 @@ export class ExecutionState {
       }
     }
     else {
-      this.ws.inputIdsBufH.withPinnedBuffer(buf => {
+      const inputIdsBufH = this.ws.allocPinned([this.ws.inputIdsBuf.numElements], "I32");
+      inputIdsBufH.withPinnedBuffer(buf => {
         let idsOff = 0;
         for (const ids of tokenIds) {
           for (const id of ids) {
@@ -109,7 +110,7 @@ export class ExecutionState {
           buf.fill(0, idsOff, totalBytes);
       });
       this.input = this.ws.inputIdsBuf;
-      this.input.memcpy(this.ws.inputIdsBufH, this.totalTokens * I32, MemcpyKind.HostToDevice);
+      this.input.memcpy(inputIdsBufH, this.totalTokens * I32, MemcpyKind.HostToDevice);
     }
   }
 }
@@ -121,47 +122,45 @@ export class ExecutionWorkspace extends WorkspaceBase {
   /** GPU int workspace: written by FlashInfer plan, read by FlashInfer run. */
   intWs: Tensor;
   /** Pinned host int workspace: scratch space used internally by FlashInfer plan (read+write within plan call). */
-  pinnedIntWs: Tensor;
+  private pinnedIntWs: Tensor;
   /** Pinned host buffer: written by batchDecodePlan, read by batchDecodeRun. */
-  decodePlanInfo: Tensor;
+  private decodePlanInfo: Tensor;
   /** Pinned host buffer: written by batchPrefillPagedPlan, read by batchPrefillPagedRun. */
-  prefillPlanInfo: Tensor;
+  private prefillPlanInfo: Tensor;
   /** Pinned host buffer: written by mlaPrefillPlan, read by mlaPrefillRun. */
-  mlaPrefillPlanInfo: Tensor;
+  private mlaPrefillPlanInfo: Tensor;
   /** Pinned host buffer: written by mlaDecodePlan, read by mlaDecodeRun. */
-  mlaDecodePlanInfo: Tensor;
+  private mlaDecodePlanInfo: Tensor;
   /** Scratch GPU buffer [B*S] of I32: written by host (h2d), read by embedding lookup. */
   inputIdsBuf: Tensor;
-  /** Scratch Pinned host buffer [B*S] of I32: written by host, read via memcpy to inputIdsBuf. */
-  inputIdsBufH: Tensor;
   /** Whether the input buffer has been cleared. */
   inputCleared = false;
   /** GPU buffer [B*S] of I32: written by host (h2d), read by RoPE kernel. */
   positionIds: Tensor;
   /** Pinned host buffer [B*S] of I32: written by host, read via memcpy to positionIds. */
-  positionIdsH: Tensor;
+  private positionIdsH: Tensor;
 /** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer prefill run. */
   qoIndptrD: Tensor;
   /** Pinned host buffer [B+1] of I32: written by host, read by MLA prefill plan and memcpy to qoIndptrD. */
-  qoIndptrH: Tensor;
+  private qoIndptrH: Tensor;
   /** GPU buffer [B*S] of I32: written by host (h2d) or memcpy, read by kvCacheWrite to scatter K/V into cache. */
   slotMapping: Tensor;
   /** Pinned host buffer [B*S] of I32: written by host, read via memcpy to slotMapping. */
-  slotMappingH: Tensor;
+  private slotMappingH: Tensor;
   /** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer run (page indptr). */
   indptrD: Tensor;
   /** Pinned host buffer [B+1] of I32: written by updateIndptr, read by memcpy to indptrD and by FlashInfer plan. */
-  indptrH: Tensor;
+  private indptrH: Tensor;
   /** GPU buffer [B] of I32: written by host via memcpy, read by FlashInfer run. */
   lastPageLen: Tensor;
   /** Pinned host buffer [B] of I32: written by updateIndptr, read via memcpy to lastPageLen. */
-  lastPageLenH: Tensor;
+  private lastPageLenH: Tensor;
   /** Pinned host buffer [B] of I32: KV lengths per batch entry, used by MLA prefill plan. */
-  kvLenH: Tensor;
+  private kvLenH: Tensor;
   /** GPU buffer [B*S] of I32: batch index per token for MLA KV cache append. */
   mlaBatchIndices: Tensor;
   /** Pinned host buffer [B*S] of I32: batch index per token for MLA KV cache append. */
-  mlaBatchIndicesH: Tensor;
+  private mlaBatchIndicesH: Tensor;
   lastDecodePagedKV: PagedKVCache | null;
   private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
 
@@ -179,7 +178,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.positionIds = this.alloc([B * S], "I32", "positionIds");
     this.positionIdsH = this.allocPinned([B * S], "I32", "positionIdsH");
     this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
-    this.inputIdsBufH = this.allocPinned([B * S], "I32", "inputIdsBufH");
     this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
     this.qoIndptrH = this.allocPinned([B + 1], "I32", "qoIndptrH");
     this.slotMapping = this.alloc([B * S], "I32", "slotMapping");
@@ -214,7 +212,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
     if (this.tracking !== null) {
       throw new Error("startTracking already active");
     }
-    if (this.tracked.size) {
+    // device tensors should not be in the 
+    // writing to a host tensor from the host is not serialized like 
+    const hasDeviceTrackedTensors = [...this.tracked].some(t => !t.pinned);
+    if (hasDeviceTrackedTensors) {
       console.warn("startTracking was called with tensors already allocated, this may result in non-deterministic allocations."); 
     }
     for (const tensor of this.exported) {

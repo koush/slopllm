@@ -176,8 +176,8 @@ interface NativeAddon {
 }
 
 export class GlmTensor extends Tensor {
-  constructor(workspace: WorkspaceBase, public readonly glm: GlmOps, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean, view: GlmTensor | undefined) {
-    super(workspace, data, allocSize, shape, type, name, pinned, view);
+  constructor(workspace: WorkspaceBase, public readonly glm: GlmOps, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean, view: GlmTensor | undefined, parallelism?: TensorParallelism) {
+    super(workspace, data, allocSize, shape, type, name, pinned, view, parallelism);
   }
 
   [Symbol.dispose](): void {
@@ -588,7 +588,7 @@ export class GlmTensor extends Tensor {
     const byteOffset = start * innerElements * elemBytes;
     const newShape = [length, ...this.shape.slice(1)];
     const newAllocSize = this.allocSize - byteOffset;
-    return this.workspace.glm.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this);
+    return this.workspace.glm.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this.parallelism, this);
   }
 
   scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
@@ -727,14 +727,14 @@ export class GlmOps implements DeviceOps {
     return p;
   }
 
-  newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, _parallelism?: TensorParallelism): GlmTensor {
+  newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): GlmTensor {
     const size = Tensor.byteCount(shape, type);
     const data = pinned ? this.allocPinned(size) : this.allocator.alloc(size);
-    return new GlmTensor(workspace, this, data, size, shape, type, name, pinned, undefined);
+    return new GlmTensor(workspace, this, data, size, shape, type, name, pinned, undefined, parallelism);
   }
 
-  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: GlmTensor | undefined): Tensor {
-    return new GlmTensor(workspace, this, data, allocSize, shape, type, undefined, pinned, view);
+  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, parallelism: TensorParallelism | undefined, view: GlmTensor | undefined, _disposed?: GlmTensor): Tensor {
+    return new GlmTensor(workspace, this, data, allocSize, shape, type, undefined, pinned, view, parallelism);
   }
 
   synchronize(): void {

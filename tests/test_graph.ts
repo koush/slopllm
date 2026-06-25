@@ -114,8 +114,8 @@ function generateWithGraph(
 
     if (graphExec !== null) {
       graph.graphLaunch(graphExec);
-      graph.synchronize();
     }
+    ws.synchronize();
 
     currentToken = argmaxResult.readInt32LEArray()[0];
     generated.push(currentToken);

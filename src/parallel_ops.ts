@@ -6,7 +6,6 @@ import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
 export class ParallelTensor extends Tensor {
-  parallelism: TensorParallelism;
   readonly shards: readonly Tensor[];
   private readonly devices: readonly GlmOps[];
   private readonly parallelOps: ParallelOps;
@@ -22,10 +21,9 @@ export class ParallelTensor extends Tensor {
     pinned: boolean,
     view: ParallelTensor | undefined,
   ) {
-    super(workspace, 0, 0, shape, type, name, pinned, view);
+    super(workspace, 0, Tensor.byteCount(shape, type), shape, type, name, pinned, view, parallelism);
     this.parallelOps = parallelOps;
     this.devices = parallelOps.devices;
-    this.parallelism = parallelism;
     this.shards = shards;
     for (let i = 0; i < shards.length; i++) {
       if (shards[i].name !== name) {
@@ -97,7 +95,7 @@ export class ParallelTensor extends Tensor {
     // set) held solely by the returned captured ParallelTensor / CaptureManager.
     const capturedShards = this.shards.map(s => {
       const captured = s.workspace.glm.wrapTensor(
-        s.workspace, s.data, s.allocSize, s.shape, s.type, s.pinned, undefined);
+        s.workspace, s.data, s.allocSize, s.shape, s.type, s.pinned, s.parallelism, undefined);
       (captured as { name: string | undefined }).name = s.name;
       captured.captured = true;
       return captured;
@@ -115,7 +113,6 @@ export class ParallelTensor extends Tensor {
     for (const shard of this.shards) {
       shard[Symbol.dispose]();
     }
-    (this.shards as Tensor[]).length = 0;
     super[Symbol.dispose]();
   }
 
@@ -2368,10 +2365,27 @@ export class ParallelOps implements DeviceOps {
     return new ParallelTensor(workspace, this, par, shards, shape, type, name, pinned, undefined);
   }
 
-  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: ParallelTensor | undefined): Tensor {
+  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, parallelism: TensorParallelism, view: ParallelTensor | undefined, disposed?: ParallelTensor): Tensor {
+    if (disposed) {
+      if (view)
+        throw new Error("ParallelOps.wrapTensor: cannot provide both view and disposed");
+      const newTensors: Tensor[] = [];
+      const ss = this.shardShape(shape, parallelism);
+      for (const shard of disposed.shards) {
+        if (!shard.disposed)
+          throw new Error("ParallelOps.wrapTensor: shard not disposed");
+        const tensor = pinned
+          ? shard.workspace.allocPinned(ss, type)
+          : shard.workspace.alloc(ss, type);
+        newTensors.push(tensor);
+      }
+
+      return new ParallelTensor(workspace, this, parallelism ?? disposed.parallelism, newTensors, shape, type, undefined, pinned, view);
+    }
+
     if (!view)
       throw new Error("ParallelOps.wrapTensor not supported; tensor recycling happens at shard level");
-    return new ParallelTensor(workspace, this, view.parallelism, view.shards, shape, type, undefined, pinned, view);
+    return new ParallelTensor(workspace, this, parallelism ?? view.parallelism, view.shards, shape, type, undefined, pinned, view);
   }
 
   wrapShards(workspace: WorkspaceBase, shards: Tensor[], fullShape: number[], type: string, parallelism: TensorParallelism, view?: ParallelTensor): ParallelTensor {

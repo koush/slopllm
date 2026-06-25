@@ -219,7 +219,7 @@ export class MetaTensor extends Tensor {
         const byteOffset = start * innerElements * elemBytes;
         const newShape = [length, ...this.shape.slice(1)];
         const newAllocSize = this.allocSize - byteOffset;
-        return this.workspace.glm.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this);
+        return this.workspace.glm.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this.parallelism, this);
     }
 
     scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
@@ -269,11 +269,11 @@ export class MetaOps implements DeviceOps {
         const size = Tensor.byteCount(shape, type);
         this.totalAllocs++;
         this.totalBytes += size;
-        return new MetaTensor(workspace, 0, size, shape, type, name, pinned, undefined);
+        return new MetaTensor(workspace, 0, size, shape, type, name, pinned, undefined, parallelism);
     }
 
-    wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined): Tensor {
-        return new MetaTensor(workspace, data, allocSize, shape, type, undefined, pinned, view);
+    wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, parallelism: TensorParallelism | undefined, view: Tensor | undefined, _disposed?: Tensor): Tensor {
+        return new MetaTensor(workspace, data, allocSize, shape, type, undefined, pinned, view, parallelism);
     }
 
     synchronize(): void {
