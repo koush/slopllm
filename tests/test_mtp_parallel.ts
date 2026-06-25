@@ -32,7 +32,6 @@ function greedySample(logits: Tensor, ws: WorkspaceBase): Tensor {
 function runMtpTreeDecode(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache, nextn: number, label: string): number[] {
   const firstTokens = ws.forwardEagerPrefill(model, [INPUT_IDS], cache);
   cache.reportTokens(0, INPUT_IDS);
-  ws.updateIndptr(cache.getPagedKV());
   const firstToken = firstTokens[0];
 
   using captureManager = new CaptureManager(ws.glm);

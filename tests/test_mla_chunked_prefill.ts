@@ -79,12 +79,10 @@ describe("GLM-5.1 MLA: 1-token chunked prefill vs full prefill + decode", () => 
 
     cache1.reset(1);
     const fullToken = ws.forwardEagerPrefill(model, [prompt], cache1)[0];
-    ws.updateIndptr(cache1.getPagedKV());
     const fullDecode = ws.forwardEagerDecode(model, [fullToken], cache1)[0];
 
     cache2.reset(1);
     const chunkedToken = chunkedPrefill(model, ws, cache2, prompt, chunkSizes)[0];
-    ws.updateIndptr(cache2.getPagedKV());
     const chunkedDecode = ws.forwardEagerDecode(model, [chunkedToken], cache2)[0];
 
     assert.equal(chunkedToken, fullToken,
@@ -101,13 +99,11 @@ describe("GLM-5.1 MLA: 1-token chunked prefill vs full prefill + decode", () => 
 
     cache1.reset(1);
     const firstToken = ws.forwardEagerPrefill(model, [prompt], cache1)[0];
-    ws.updateIndptr(cache1.getPagedKV());
 
     const decodeTokens: number[] = [firstToken];
     let current = firstToken;
     for (let step = 0; step < numDecodeSteps; step++) {
       current = ws.forwardEagerDecode(model, [current], cache1)[0];
-      ws.updateIndptr(cache1.getPagedKV());
       decodeTokens.push(current);
     }
 
@@ -115,7 +111,6 @@ describe("GLM-5.1 MLA: 1-token chunked prefill vs full prefill + decode", () => 
     const chunkedFirstToken = ws.forwardEagerPrefill(model, [prompt], cache2)[0];
     assert.equal(chunkedFirstToken, firstToken,
       `prefill token mismatch: ${chunkedFirstToken} != ${firstToken}`);
-    ws.updateIndptr(cache2.getPagedKV());
 
     const chunkedDecodeTokens: number[] = [chunkedFirstToken];
     let chunkedCurrent = chunkedFirstToken;
@@ -126,7 +121,6 @@ describe("GLM-5.1 MLA: 1-token chunked prefill vs full prefill + decode", () => 
       using logits = state.computeLogits(hiddenStates, model);
       using argmaxOut = logits.argmax();
       chunkedCurrent = argmaxOut.readInt32LEArray()[0];
-      ws.updateIndptr(cache2.getPagedKV());
       chunkedDecodeTokens.push(chunkedCurrent);
 
       assert.equal(chunkedCurrent, decodeTokens[step + 1],
@@ -145,12 +139,10 @@ describe("GLM-5.1 MLA: 1-token chunked prefill vs full prefill + decode", () => 
 
     cache1.reset(1);
     const fullToken = ws.forwardEagerPrefill(model, [prompt], cache1)[0];
-    ws.updateIndptr(cache1.getPagedKV());
     const fullDecode = ws.forwardEagerDecode(model, [fullToken], cache1)[0];
 
     cache2.reset(1);
     const chunkedToken = chunkedPrefill(model, ws, cache2, prompt, chunkSizes)[0];
-    ws.updateIndptr(cache2.getPagedKV());
     const chunkedDecode = ws.forwardEagerDecode(model, [chunkedToken], cache2)[0];
 
     assert.equal(chunkedToken, fullToken,
