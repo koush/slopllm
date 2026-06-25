@@ -133,7 +133,7 @@ function assertParis(generated: number[], text: string, parisTokenId: number) {
   assert.ok(generated.length > 0, "No tokens generated");
   const hasParis = text.includes("Paris") || generated.includes(parisTokenId);
   assert.ok(hasParis, `Expected 'Paris' in generated text, got: ${JSON.stringify(text.slice(0, 200))}`);
-  console.log(`  Generated ${generated.length} tokens: ${JSON.stringify(text.slice(0, 200))}`);
+  // console.log(`  Generated ${generated.length} tokens: ${JSON.stringify(text.slice(0, 200))}`);
 }
 
 // --- Single GPU ---
