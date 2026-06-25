@@ -368,8 +368,10 @@ void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
 //  2. v_proj[h,k,j]: for fixed k, consecutive threads (j) hit consecutive addresses
 // ---------------------------------------------------------------------------
 
-template <int ROWS_PER_BLOCK>
-__global__ void __launch_bounds__(256, 4) mla_v_expand_kernel(
+// KV_LR > 0: kv_lora_rank is a compile-time constant (enables smem-load unroll).
+// KV_LR == 0: fall back to the runtime kv_lora_rank parameter.
+template <int KV_LR, int BDX, int RPB>
+__global__ void __launch_bounds__(BDX, 4) mla_v_expand_kernel(
     __nv_bfloat16* __restrict__ result,
     const __nv_bfloat16* __restrict__ attn_out,
     const __nv_bfloat16* __restrict__ v_proj,
@@ -379,41 +381,61 @@ __global__ void __launch_bounds__(256, 4) mla_v_expand_kernel(
     int v_proj_head_offset,
     int total_rows
 ) {
-    extern __shared__ float s_attn[];  // [ROWS_PER_BLOCK * kv_lora_rank]
+    extern __shared__ float s_attn[];  // [RPB * kv_lora_rank]
 
-    int threads_per_row = blockDim.x / ROWS_PER_BLOCK;
-    int row_in_block = threadIdx.x / threads_per_row;
-    int lane = threadIdx.x % threads_per_row;
+    constexpr int TPR = BDX / RPB;
+    constexpr bool CT = (KV_LR > 0);
+    const int kv_lr = CT ? KV_LR : kv_lora_rank;
 
-    int bhs = blockIdx.x * ROWS_PER_BLOCK + row_in_block;
+    int row_in_block = threadIdx.x / TPR;
+    int lane = threadIdx.x % TPR;
+
+    int bhs = blockIdx.x * RPB + row_in_block;
     bool valid = (bhs < total_rows);
 
     int s = bhs % seq_len;
     int h = (bhs / seq_len) % n_heads;
     int b = bhs / (seq_len * n_heads);
 
-    float* my_s_attn = s_attn + row_in_block * kv_lora_rank;
+    float* my_s_attn = s_attn + row_in_block * kv_lr;
 
     if (valid) {
-        const __nv_bfloat16* attn_row = attn_out + ((b * attn_n_heads + h + head_offset) * seq_len + s) * kv_lora_rank;
-        for (int k = lane; k < kv_lora_rank; k += threads_per_row)
-            my_s_attn[k] = __bfloat162float(attn_row[k]);
+        const __nv_bfloat16* attn_row = attn_out + ((b * attn_n_heads + h + head_offset) * seq_len + s) * kv_lr;
+        if constexpr (CT) {
+            #pragma unroll
+            for (int k = lane; k < KV_LR; k += TPR)
+                my_s_attn[k] = __bfloat162float(attn_row[k]);
+        } else {
+            for (int k = lane; k < kv_lr; k += TPR)
+                my_s_attn[k] = __bfloat162float(attn_row[k]);
+        }
     }
     __syncthreads();
 
     if (!valid) return;
 
-    const __nv_bfloat16* w_base = v_proj + (h + v_proj_head_offset) * kv_lora_rank * v_head_dim;
+    const __nv_bfloat16* w_base = v_proj + (h + v_proj_head_offset) * kv_lr * v_head_dim;
     __nv_bfloat16* result_base = result + (b * seq_len + s) * (n_heads * v_head_dim) + h * v_head_dim;
 
-    for (int j = lane * 2; j < v_head_dim; j += threads_per_row * 2) {
+    for (int j = lane * 2; j < v_head_dim; j += TPR * 2) {
         float sum0 = 0.0f, sum1 = 0.0f;
-        for (int k = 0; k < kv_lora_rank; k++) {
-            float w0, w1;
-            load_bf16x2(w_base + k * v_head_dim + j, w0, w1);
-            float a = my_s_attn[k];
-            sum0 += a * w0;
-            sum1 += a * w1;
+        if constexpr (CT) {
+            #pragma unroll 8
+            for (int k = 0; k < KV_LR; k++) {
+                float w0, w1;
+                load_bf16x2(w_base + k * v_head_dim + j, w0, w1);
+                float a = my_s_attn[k];
+                sum0 += a * w0;
+                sum1 += a * w1;
+            }
+        } else {
+            for (int k = 0; k < kv_lr; k++) {
+                float w0, w1;
+                load_bf16x2(w_base + k * v_head_dim + j, w0, w1);
+                float a = my_s_attn[k];
+                sum0 += a * w0;
+                sum1 += a * w1;
+            }
         }
         store_bf16x2(result_base + j, sum0, sum1);
     }
@@ -433,17 +455,30 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
     int block_size = rows_per_block * threads_per_row;
     int grid = (total_rows + rows_per_block - 1) / rows_per_block;
     size_t shmem_size = rows_per_block * kv_lora_rank * sizeof(float);
-    auto launch = [&]<int RPB>() {
-        mla_v_expand_kernel<RPB><<<grid, block_size, shmem_size, GLM_STREAM(ctx)>>>(
+    constexpr int BDX = 256;
+    auto launch = [&]<int KV_LR, int RPB>() {
+        mla_v_expand_kernel<KV_LR, BDX, RPB><<<grid, block_size, shmem_size, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
             (const __nv_bfloat16*)v_proj,
             kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
             attn_n_heads, head_offset, v_proj_head_offset, total_rows);
     };
-    if (rows_per_block >= 8) launch.operator()<8>();
-    else if (rows_per_block >= 4) launch.operator()<4>();
-    else if (rows_per_block == 2) launch.operator()<2>();
-    else launch.operator()<1>();
+    if (kv_lora_rank == 512) {
+        if (rows_per_block == 8) launch.template operator()<512, 8>();
+        else if (rows_per_block == 4) launch.template operator()<512, 4>();
+        else if (rows_per_block == 2) launch.template operator()<512, 2>();
+        else launch.template operator()<512, 1>();
+    } else if (kv_lora_rank == 128) {
+        if (rows_per_block == 8) launch.template operator()<128, 8>();
+        else if (rows_per_block == 4) launch.template operator()<128, 4>();
+        else if (rows_per_block == 2) launch.template operator()<128, 2>();
+        else launch.template operator()<128, 1>();
+    } else {
+        if (rows_per_block >= 8) launch.template operator()<0, 8>();
+        else if (rows_per_block >= 4) launch.template operator()<0, 4>();
+        else if (rows_per_block == 2) launch.template operator()<0, 2>();
+        else launch.template operator()<0, 1>();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2545,6 +2580,273 @@ sum_pointers_smem_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Flat all-to-all AllReduce (pipelined register reduction):
+// Each GPU loads all N peers' data through 2 double-buffered smem buffers
+// using cp.async.bulk (TMA), accumulating in FP32 registers.  After all N
+// sources are reduced, the result is written to smem and scattered back to
+// all N peer pointers via cp.async.bulk (shared→global).
+//
+// Smem holds 2 buffers (1 source each) — same footprint as sum_pointers with
+// N=2.  Grid is invariant of N.  Replaces the butterfly tree (3 rounds,
+// 3 barriers) with a single kernel + 2 barriers.
+//
+// Layout: in-place.  Each pointer is both input and output.  All GPUs
+// independently reduce the full tensor and write the result to all peers.
+// ---------------------------------------------------------------------------
+
+template <typename scalar_t, int ElemsPerWarp>
+__global__ void __launch_bounds__(1024, 1)
+flat_allreduce_kernel(
+    scalar_t* p0,  scalar_t* p1,  scalar_t* p2,  scalar_t* p3,
+    scalar_t* p4,  scalar_t* p5,  scalar_t* p6,  scalar_t* p7,
+    scalar_t* p8,  scalar_t* p9,  scalar_t* p10, scalar_t* p11,
+    scalar_t* p12, scalar_t* p13, scalar_t* p14, scalar_t* p15,
+    int N,
+    int64_t numel,
+    int my_rank,
+    int buf_stride)
+{
+    constexpr int WarpSize = 32;
+    constexpr int MaxN = 16;
+    constexpr int NumBufs = 2;
+
+    extern __shared__ char smem_raw[];
+    __shared__ cuda::barrier<cuda::thread_scope_block> bar[NumBufs];
+
+    int warp_id = threadIdx.x / WarpSize;
+    int lane    = threadIdx.x % WarpSize;
+    int warps_per_block = blockDim.x / WarpSize;
+
+    scalar_t* ptrs_orig[MaxN] = {
+        p0, p1, p2, p3, p4, p5, p6, p7,
+        p8, p9, p10, p11, p12, p13, p14, p15
+    };
+
+    // Rotate pointer order by blockIdx.x so different blocks hit different
+    // peers first, distributing P2P load across the fabric.
+    scalar_t* ptrs[MaxN];
+    int rot = (int)(blockIdx.x % N);
+    #pragma unroll
+    for (int s = 0; s < MaxN; s++) {
+        if (s >= N) break;
+        ptrs[s] = ptrs_orig[(s + rot) % N];
+    }
+
+    int64_t block_stride = (int64_t)warps_per_block * ElemsPerWarp;
+    int64_t total_blocks = gridDim.x;
+    int64_t my_block_start = (int64_t)blockIdx.x * block_stride;
+
+    // Round-robin block ownership: GPU my_rank owns blocks where
+    // blockIdx.x % N == my_rank. Blocks not owned by this GPU are no-ops.
+    // This ensures each element is written by exactly one GPU, avoiding
+    // read-write races on peer pointers during in-place allreduce.
+    if (blockIdx.x % N != my_rank) return;
+
+    if (threadIdx.x == 0) {
+        for (int b = 0; b < NumBufs; b++)
+            init(&bar[b], blockDim.x);
+    }
+    __syncthreads();
+
+    for (int64_t blk = my_block_start;
+         blk < numel;
+         blk += total_blocks * block_stride)
+    {
+        int64_t elems = min(block_stride, numel - blk);
+        uint32_t copy_bytes = (uint32_t)(elems * sizeof(scalar_t));
+        copy_bytes = (copy_bytes + 15u) & ~15u;
+
+        int64_t warp_start = warp_id * ElemsPerWarp;
+        int64_t warp_elems = min((int64_t)ElemsPerWarp, elems - warp_start);
+        bool active = (warp_start < elems);
+
+        // Prologue: issue first NumBufs loads
+        if (threadIdx.x == 0) {
+            #pragma unroll
+            for (int b = 0; b < NumBufs; b++) {
+                if (b >= N) break;
+                cuda::ptx::mbarrier_expect_tx(
+                    cuda::ptx::sem_relaxed_t{},
+                    cuda::ptx::scope_cta_t{},
+                    cuda::ptx::space_shared_t{},
+                    reinterpret_cast<uint64_t*>(&bar[b]),
+                    copy_bytes);
+                cuda::ptx::cp_async_bulk(
+                    cuda::ptx::space_shared_t{},
+                    cuda::ptx::space_global_t{},
+                    smem_raw + b * buf_stride,
+                    ptrs[b] + blk,
+                    copy_bytes,
+                    reinterpret_cast<uint64_t*>(&bar[b]));
+            }
+        }
+
+        if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+            constexpr int VEC = 2;
+            constexpr int Iters = ElemsPerWarp / (WarpSize * VEC);
+            float2 acc[Iters];
+            float tail_acc = 0.0f;
+            int64_t vec_elems = 0;
+            int64_t tail_start = 0;
+            int64_t tail_count = 0;
+
+            if (active) {
+                vec_elems = warp_elems / VEC * VEC;
+                tail_start = warp_start + vec_elems;
+                tail_count = warp_elems - vec_elems;
+            }
+
+            for (int j = 0; j < MaxN; j++) {
+                if (j >= N) break;
+                int buf_idx = j % NumBufs;
+                bar[buf_idx].arrive_and_wait();
+
+                if (active) {
+                    const char* buf = smem_raw + buf_idx * buf_stride;
+                    for (int64_t i = lane * VEC, k = 0; i < vec_elems;
+                         i += WarpSize * VEC, k++) {
+                        __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(
+                            buf + (warp_start + i) * sizeof(__nv_bfloat16));
+                        float2 f = __bfloat1622float2(v);
+                        if (j == 0) acc[k] = f;
+                        else { acc[k].x += f.x; acc[k].y += f.y; }
+                    }
+                    if (lane < tail_count) {
+                        float val = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(
+                            buf)[tail_start + lane]);
+                        if (j == 0) tail_acc = val;
+                        else tail_acc += val;
+                    }
+                }
+
+                __syncthreads();
+
+                if (j + NumBufs < N && threadIdx.x == 0) {
+                    cuda::ptx::mbarrier_expect_tx(
+                        cuda::ptx::sem_relaxed_t{},
+                        cuda::ptx::scope_cta_t{},
+                        cuda::ptx::space_shared_t{},
+                        reinterpret_cast<uint64_t*>(&bar[buf_idx]),
+                        copy_bytes);
+                    cuda::ptx::cp_async_bulk(
+                        cuda::ptx::space_shared_t{},
+                        cuda::ptx::space_global_t{},
+                        smem_raw + buf_idx * buf_stride,
+                        ptrs[j + NumBufs] + blk,
+                        copy_bytes,
+                        reinterpret_cast<uint64_t*>(&bar[buf_idx]));
+                }
+            }
+
+            // Write accumulators to smem[0]
+            if (active) {
+                for (int64_t i = lane * VEC, k = 0; i < vec_elems;
+                     i += WarpSize * VEC, k++) {
+                    *reinterpret_cast<__nv_bfloat162*>(
+                        smem_raw + (warp_start + i) * sizeof(__nv_bfloat16)) =
+                        __float22bfloat162_rn(acc[k]);
+                }
+                if (lane < tail_count) {
+                    reinterpret_cast<__nv_bfloat16*>(smem_raw)[tail_start + lane] =
+                        __float2bfloat16(tail_acc);
+                }
+            }
+        } else {
+            constexpr int VEC = 4;
+            constexpr int Iters = ElemsPerWarp / (WarpSize * VEC);
+            float4 acc[Iters];
+            float tail_acc[VEC - 1] = {};
+            int64_t vec_elems = 0;
+            int64_t tail_start = 0;
+            int64_t tail_count = 0;
+
+            if (active) {
+                vec_elems = warp_elems / VEC * VEC;
+                tail_start = warp_start + vec_elems;
+                tail_count = warp_elems - vec_elems;
+            }
+
+            for (int j = 0; j < MaxN; j++) {
+                if (j >= N) break;
+                int buf_idx = j % NumBufs;
+                bar[buf_idx].arrive_and_wait();
+
+                if (active) {
+                    const char* buf = smem_raw + buf_idx * buf_stride;
+                    for (int64_t i = lane * VEC, k = 0; i < vec_elems;
+                         i += WarpSize * VEC, k++) {
+                        float4 v = *reinterpret_cast<const float4*>(
+                            buf + (warp_start + i) * sizeof(float));
+                        if (j == 0) acc[k] = v;
+                        else { acc[k].x += v.x; acc[k].y += v.y;
+                               acc[k].z += v.z; acc[k].w += v.w; }
+                    }
+                    int tc = 0;
+                    for (int64_t i = lane; i < tail_count; i += WarpSize) {
+                        float val = reinterpret_cast<const float*>(
+                            buf)[tail_start + i];
+                        if (j == 0) tail_acc[tc] = val;
+                        else tail_acc[tc] += val;
+                        tc++;
+                    }
+                }
+
+                __syncthreads();
+
+                if (j + NumBufs < N && threadIdx.x == 0) {
+                    cuda::ptx::mbarrier_expect_tx(
+                        cuda::ptx::sem_relaxed_t{},
+                        cuda::ptx::scope_cta_t{},
+                        cuda::ptx::space_shared_t{},
+                        reinterpret_cast<uint64_t*>(&bar[buf_idx]),
+                        copy_bytes);
+                    cuda::ptx::cp_async_bulk(
+                        cuda::ptx::space_shared_t{},
+                        cuda::ptx::space_global_t{},
+                        smem_raw + buf_idx * buf_stride,
+                        ptrs[j + NumBufs] + blk,
+                        copy_bytes,
+                        reinterpret_cast<uint64_t*>(&bar[buf_idx]));
+                }
+            }
+
+            // Write accumulators to smem[0]
+            if (active) {
+                for (int64_t i = lane * VEC, k = 0; i < vec_elems;
+                     i += WarpSize * VEC, k++) {
+                    *reinterpret_cast<float4*>(
+                        smem_raw + (warp_start + i) * sizeof(float)) = acc[k];
+                }
+                int tc = 0;
+                for (int64_t i = lane; i < tail_count; i += WarpSize) {
+                    reinterpret_cast<float*>(smem_raw)[tail_start + i] = tail_acc[tc++];
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // Scatter result to all N peers via cp.async.bulk (shared→global)
+        if (threadIdx.x == 0) {
+            #pragma unroll
+            for (int j = 0; j < MaxN; j++) {
+                if (j >= N) break;
+                cuda::ptx::cp_async_bulk(
+                    cuda::ptx::space_global_t{},
+                    cuda::ptx::space_shared_t{},
+                    ptrs[j] + blk,
+                    smem_raw,
+                    copy_bytes);
+            }
+            cuda::ptx::cp_async_bulk_commit_group();
+        }
+        cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+        __threadfence_system();
+        __syncthreads();
+    }
+}
+
 extern "C" {
 
 void glm_sum_pointers(GlmCtx* ctx,
@@ -2594,5 +2896,54 @@ void glm_sum_pointers(GlmCtx* ctx,
     }
 }
 
+void glm_flat_allreduce(
+    GlmCtx* ctx,
+    void* p0,  void* p1,  void* p2,  void* p3,
+    void* p4,  void* p5,  void* p6,  void* p7,
+    void* p8,  void* p9,  void* p10, void* p11,
+    void* p12, void* p13, void* p14, void* p15,
+    int N, int64_t numel, int dtype, int my_rank)
+{
+    cudaSetDevice(ctx->device_id);
+
+    constexpr int ElemsPerWarp = 512;
+    constexpr int WarpSize = 32;
+    constexpr int SmemBudget = 32 * 1024;
+    constexpr int NumBufs = 2;
+
+    int elem_size = (dtype == 9) ? 2 : 4;
+    int smem_per_warp = NumBufs * ElemsPerWarp * elem_size;
+    if (smem_per_warp < 1) smem_per_warp = 1;
+
+    int warps_per_block = SmemBudget / smem_per_warp;
+    if (warps_per_block > 32) warps_per_block = 32;
+    if (warps_per_block < 1) warps_per_block = 1;
+
+    int block_size = warps_per_block * WarpSize;
+    int total_warps = (int)((numel + ElemsPerWarp - 1) / ElemsPerWarp);
+    if (total_warps == 0) total_warps = 1;
+    int grid = (total_warps + warps_per_block - 1) / warps_per_block;
+
+    int buf_stride = warps_per_block * ElemsPerWarp * elem_size;
+    int smem_bytes = NumBufs * buf_stride;
+
+    if (dtype == 9) {
+        flat_allreduce_kernel<__nv_bfloat16, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)p0,  (__nv_bfloat16*)p1,  (__nv_bfloat16*)p2,  (__nv_bfloat16*)p3,
+            (__nv_bfloat16*)p4,  (__nv_bfloat16*)p5,  (__nv_bfloat16*)p6,  (__nv_bfloat16*)p7,
+            (__nv_bfloat16*)p8,  (__nv_bfloat16*)p9,  (__nv_bfloat16*)p10, (__nv_bfloat16*)p11,
+            (__nv_bfloat16*)p12, (__nv_bfloat16*)p13, (__nv_bfloat16*)p14, (__nv_bfloat16*)p15,
+            N, numel, my_rank, buf_stride);
+    } else {
+        flat_allreduce_kernel<float, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
+            (float*)p0,  (float*)p1,  (float*)p2,  (float*)p3,
+            (float*)p4,  (float*)p5,  (float*)p6,  (float*)p7,
+            (float*)p8,  (float*)p9,  (float*)p10, (float*)p11,
+            (float*)p12, (float*)p13, (float*)p14, (float*)p15,
+            N, numel, my_rank, buf_stride);
+    }
+}
+
 } // extern "C"
+
 

@@ -150,6 +150,7 @@ interface NativeAddon {
   addBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scale(ctx: number, out: number, input: number, scale: number, n: number): void;
   sumPointers(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, p8: number, p9: number, p10: number, p11: number, p12: number, p13: number, p14: number, p15: number, out: number, n: number, numel: number, dtype: number): void;
+  flatAllReduce(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, p8: number, p9: number, p10: number, p11: number, p12: number, p13: number, p14: number, p15: number, n: number, numel: number, dtype: number, myRank: number): void;
   mul(ctx: number, out: number, a: number, b: number, n: number): void;
   mulBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
@@ -911,6 +912,17 @@ export class GlmOps implements DeviceOps {
       lse[8], lse[9], lse[10], lse[11], lse[12], lse[13], lse[14], lse[15],
       numShards, ptr(outputV), outputLse ? ptr(outputLse) : 0, numel, batchSize, numHeads, vHeadDim,
       snh, ho, inh,
+    );
+  }
+
+  flatAllReduce(ptrs: number[], N: number, numel: number, dtype: number, myRank: number): void {
+    const p = new Array<number>(16).fill(0);
+    for (let i = 0; i < N; i++) p[i] = ptrs[i];
+    getNativeAddon().flatAllReduce(
+      this.ctx,
+      p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+      p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15],
+      N, numel, dtype, myRank,
     );
   }
 

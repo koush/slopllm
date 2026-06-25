@@ -1859,44 +1859,77 @@ export class ParallelOps implements DeviceOps {
       return false;
     if (dtype !== NCCL_BFLOAT16 && dtype !== NCCL_FLOAT32)
       return false;
+
+    // butterfly reduce
+    if (true) {
+      if (count > 65536 * 2)
+        return false;
+      const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
+      if (!group)
+        return false;
+
+      let current: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        const copy = shards[i].workspace.alloc(shards[i].shape, shards[i].type);
+        copy.memcpy(shards[i]);
+        current.push(copy);
+      }
+
+      for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
+        const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
+        const isLast = reduceHalf === 1;
+
+        this.p2pBarrier(peerRanks);
+        if (reduceHalf === this.worldSize / 2) {
+          this.sourceCleanup();
+        }
+        this.p2pSources.push(...current);
+
+        if (isLast) {
+          for (let i = 0; i < this.worldSize; i++) {
+            const peer = i ^ reduceHalf;
+            shards[i].sumInPlace([current[i], current[peer]]);
+          }
+        } else {
+          const output: Tensor[] = new Array(this.worldSize);
+          for (let i = 0; i < this.worldSize; i++) {
+            const peer = i ^ reduceHalf;
+            output[i] = current[i].sum([current[peer]]);
+          }
+          current = output;
+        }
+      }
+
+      return true;
+    }
+
+    // each gpu reduces a shard and scatters
+
     // keep an eye on this, p2p limit needs to be above MTP prefill size (15 for top 2 and nextn 3)
     if (count > 65536 * 2)
+      return false;
+    if (count % this.worldSize !== 0)
       return false;
     const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
     if (!group)
       return false;
 
-    let current: Tensor[] = [];
-    for (let i = 0; i < this.worldSize; i++) {
-      const copy = shards[i].workspace.alloc(shards[i].shape, shards[i].type);
-      copy.memcpy(shards[i]);
-      current.push(copy);
+    // Flat all-to-all: 2 barriers + 1 kernel.
+    // Each GPU loads all N peers through double-buffered smem, accumulates
+    // in registers, and writes the result back to all peers (in-place).
+    // Block-level pointer rotation is handled inside the kernel.
+    this.p2pBarrier();
+    this.sourceCleanup();
+
+    const ptrs = shards.map(s => s.data);
+    const dt = (dtype === NCCL_BFLOAT16) ? 9 : 7;
+    const N = this.worldSize;
+    for (let i = 0; i < N; i++) {
+      this.devices[i].flatAllReduce(ptrs, N, count, dt, i);
     }
 
-    for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
-      const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
-      const isLast = reduceHalf === 1;
-
-      this.p2pBarrier(peerRanks);
-      if (reduceHalf === this.worldSize / 2) {
-        this.sourceCleanup();
-      }
-      this.p2pSources.push(...current);
-
-      if (isLast) {
-        for (let i = 0; i < this.worldSize; i++) {
-          const peer = i ^ reduceHalf;
-          shards[i].sumInPlace([current[i], current[peer]]);
-        }
-      } else {
-        const output: Tensor[] = new Array(this.worldSize);
-        for (let i = 0; i < this.worldSize; i++) {
-          const peer = i ^ reduceHalf;
-          output[i] = current[i].sum([current[peer]]);
-        }
-        current = output;
-      }
-    }
+    this.p2pBarrier();
+    this.sourceCleanup();
 
     return true;
   }
