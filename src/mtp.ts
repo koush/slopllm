@@ -142,10 +142,6 @@ export function mtpTreeDecode(
   const hiddenDim = mtpHiddenStates.shape[1];
   const rowBytes = hiddenDim * BF16; // BF16 = 2 bytes per element
 
-  // Tiled hidden states for the draft tree. Populated incrementally:
-  // Used by the prefill-based path (else branch below).
-  const tiledHs = ws.ensureAlloc([numTreeNodes, hiddenDim], "BF16", `mtp-tree-hs-${numTreeNodes}`, undefined, 0);
-
   const hostBuf = ws.ensureAllocPinned([numTreeNodes], "I32", `mtp_verify_host_buf_${numTreeNodes}`);
 
 
@@ -219,103 +215,82 @@ export function mtpTreeDecode(
     }
   }
   else {
-    // Single-sequence prefill with custom mask: all tree tokens processed at once,
-    // with a tree-shaped causal mask preventing cross-branch attention.
+    // Chunked prefill with extended causal custom mask.
+    // Each depth is a separate planPrefill + forwardMtp. The extended mask
+    // allows each token to attend to its parent from the previous depth
+    // (now in KV cache). KV cache is retained between depths; only truncated
+    // after all depths for verification.
     const draftBoundaries = depthBoundaries(draftTopk);
-    const mtpCustomMask = ensureMTPCustomMask(ws, draftTopk);
-    const treePrefillState = ws.planPrefill(model, batchSize, [numTreeNodes], cache, {
-      ...mtpCustomMask,
-      positionIds: getPositionIdsMask(ws, originalAllocLen, draftTopk),
-    });
-    ws.ensureInputCleared();
 
-    warmup ||= !captureManager.isCaptured(['mtp-tree', numTreeNodes]);
-    captureManager.run(() => {
-      using initialLogits = mtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, batchSize);
-      const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
-      using initialIndices = initialTopk.indices;
-      using _initialValues = initialTopk.values;
-      ws.inputIdsBuf.memcpy(initialIndices, initialIndices.bytes, MemcpyKind.DeviceToDevice);
-      treePrefillState.setInput(ws.inputIdsBuf);
+    let chainedHs = mtpHiddenStates;
 
-      for (let i = 1; i < topks.length; i++) {
-        const numPrefillTokens = totalTreeNodes(topks.slice(0, i));
+    for (let depth = 1; depth < topks.length; depth++) {
+      const qoLen = totalPaths(topks.slice(0, depth));
+      const hsPrevQoLen = depth > 1 ? totalPaths(topks.slice(0, depth - 1)) : 1;
+      const expandK = topks[depth - 1];
 
-        if (i === 1) {
-          if (topks[0] > 1) {
-            using cat = mtpHiddenStates.cat(Array(topks[0] - 1).fill(mtpHiddenStates), 0);
-            tiledHs.memcpy(cat);
-          } else {
-            tiledHs.memcpy(mtpHiddenStates);
+      // Host side: build mask, position IDs, plan prefill
+      const chunkedMask = ensureChunkedMTPMask(ws, topks, depth);
+      const posIds = getPositionIdsChunked(ws, originalAllocLen, depth, qoLen);
+      const state = ws.planPrefill(model, batchSize, [qoLen], cache, {
+        mask: chunkedMask.mask,
+        indptr: chunkedMask.indptr,
+        mode: MaskMode.CausalCustom,
+        positionIds: posIds,
+        maskKvLen: chunkedMask.maskKvLen,
+      });
+
+      const prevHs = chainedHs;
+      warmup ||= !captureManager.isCaptured(['mtp-chunk', depth, topks.length]);
+      chainedHs = captureManager.run(() => {
+        // Depth 1: compute initial logits and topk from mtpHiddenStates
+        if (depth === 1) {
+          using initialLogits = mtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, batchSize);
+          const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
+          using _initialValues = initialTopk.values;
+          using initialIndices = initialTopk.indices;
+          ws.inputIdsBuf.memcpy(initialIndices, initialIndices.bytes, MemcpyKind.DeviceToDevice);
+          hostBuf.memcpy2d(0, topks[0] * I32, initialIndices, 0, topks[0] * I32, topks[0] * I32, 1, MemcpyKind.DeviceToHost);
+        }
+
+        state.setInput(ws.inputIdsBuf);
+
+        // Expand prevHs: replicate each parent's hidden state for expandK children
+        // Layout: [p0, p0, ..., p0, p1, p1, ..., p1, ...] (grouped by parent)
+        using _expandedHs = expandK > 1 ? ws.alloc([qoLen, hiddenDim], "BF16") : undefined;
+        const expandedHs = _expandedHs ?? prevHs;
+        if (expandK > 1) {
+          for (let c = 0; c < expandK; c++) {
+            _expandedHs!.memcpy2d(
+              c * rowBytes, expandK * rowBytes,
+              prevHs, 0, rowBytes,
+              rowBytes, hsPrevQoLen,
+              MemcpyKind.DeviceToDevice,
+            );
           }
         }
 
-        using hiddenStates = model.forwardMtp!(treePrefillState, tiledHs);
+        using hiddenStates = model.forwardMtp!(state, expandedHs);
 
-        // Copy each node's hidden state to its children's positions in tiledHs.
-        // For each depth d and child offset c, memcpy2d copies all nodes at depth d
-        // to their c-th child's position (pitch = topks[d+1] rows between siblings).
-        using tiledHsStream = i < topks.length - 1
-          ? ws.glm.withStream(() => {
-            const streams: { streamWaitEvent: () => void }[] = [];
-            for (let d = 0; d < i; d++) {
-              const nodesAtDepth = d > 0 ? draftBoundaries[d] - draftBoundaries[d - 1] : draftBoundaries[0];
-              const srcStartRow = d > 0 ? draftBoundaries[d - 1] : 0;
-              const childBranchFactor = topks[d + 1];
-              for (let c = 1; c < childBranchFactor; c++) {
-                const stream = ws.glm.withStream(() => {
-                  tiledHs.memcpy2d(
-                    (draftBoundaries[d] + c) * rowBytes, childBranchFactor * rowBytes,
-                    hiddenStates, srcStartRow * rowBytes, rowBytes,
-                    rowBytes, nodesAtDepth,
-                    MemcpyKind.DeviceToDevice,
-                  );
-                });
-                streams.push(stream);
-              }
-            }
-            // c=0 copies (child offset 0) run on the default stream
-            for (let d = 0; d < i; d++) {
-              const nodesAtDepth = d > 0 ? draftBoundaries[d] - draftBoundaries[d - 1] : draftBoundaries[0];
-              const srcStartRow = d > 0 ? draftBoundaries[d - 1] : 0;
-              const childBranchFactor = topks[d + 1];
-              tiledHs.memcpy2d(
-                draftBoundaries[d] * rowBytes, childBranchFactor * rowBytes,
-                hiddenStates, srcStartRow * rowBytes, rowBytes,
-                rowBytes, nodesAtDepth,
-                MemcpyKind.DeviceToDevice,
-              );
-            }
-            for (const s of streams) s.streamWaitEvent();
-          })
-          : undefined;
-
-        using logits = treePrefillState.computeLogits(hiddenStates, model, true);
-        const logitsTopk = logits.topk(topks[i], model.cfg.vocabSize);
+        using logits = state.computeLogits(hiddenStates, model, true);
+        const logitsTopk = logits.topk(topks[depth], model.cfg.vocabSize);
         using _values = logitsTopk.values;
         using indices = logitsTopk.indices;
 
-        const leafCount = totalPaths(topks.slice(0, i));
-        const nodeCount = numPrefillTokens - leafCount;
-        const writeOffset = numPrefillTokens * I32;
-        const writeCount = leafCount * topks[i];
-        ws.inputIdsBuf.memcpy2d(
-          writeOffset,
-          writeCount * I32,
-          indices,
-          (nodeCount * topks[i]) * I32,
-          writeCount * I32,
-          writeCount * I32,
-          1,
-          MemcpyKind.DeviceToDevice,
-        );
+        // Write next depth's tokens to hostBuf
+        const hostOffset = draftBoundaries[depth - 1] * I32;
+        const hostCount = qoLen * topks[depth];
+        hostBuf.memcpy2d(hostOffset, hostCount * I32, indices, 0, hostCount * I32, hostCount * I32, 1, MemcpyKind.DeviceToHost);
 
-        tiledHsStream?.streamWaitEvent();
-      }
+        // Prepare input for next depth
+        if (depth < topks.length - 1) {
+          ws.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
+        }
 
-      hostBuf.memcpy(ws.inputIdsBuf, hostBuf.bytes, MemcpyKind.DeviceToHost);
-    }, ['mtp-tree', numTreeNodes]);
-    ws.glm.synchronize();
+        return hiddenStates.capture();
+      }, ['mtp-chunk', depth, topks.length]);
+      ws.glm.synchronize();
+    }
   }
 
   const draft = performance.now();
@@ -374,6 +349,11 @@ export function mtpTreeDecode(
 
   const argmaxHost = ws.tensors.get(`mtp_verify_argmax_host_${numVerificationTokens}`)!;
   const argmaxBuf = argmaxHost.readPinnedBuffer();
+
+  // const tokenTree = argmaxHost.readInt32LEArray().map(t => tokenizer.decode([t], { skip_special_tokens: false }));
+  // const draftTree = verificationTokens[0].map(t => tokenizer.decode([t], { skip_special_tokens: false }));
+  // console.warn(`MTP target predictions: ${tokenTree.join(", ")}`);
+  // console.warn(`MTP draft tokens:       ${draftTree.join(", ")}`);
 
   let bestPath = 0;
   let bestAccepted = -1;
@@ -497,7 +477,7 @@ export function mtpTreeDecode(
 
 
   // if (acceptedTokens.length) {
-  //   console.warn(`MTP verify: accepted ${acceptedTokens.length} tokens: ${acceptedTokens.map(t => tokenizer.decode([t], { skip_special_tokens: false }))}, replacement: ${tokenizer.decode([bestReplacement], { skip_special_tokens: false })}, target: ${tokenizer.decode([targetToken], { skip_special_tokens: false })}`);
+  //  console.warn(`MTP verify: accepted ${acceptedTokens.length} tokens: ${acceptedTokens.map(t => tokenizer.decode([t], { skip_special_tokens: false }))}, replacement: ${tokenizer.decode([bestReplacement], { skip_special_tokens: false })}, target: ${tokenizer.decode([targetToken], { skip_special_tokens: false })}`);
   // }
 
   // timings
@@ -608,4 +588,75 @@ function ensureMTPCustomMask(ws: WorkspaceBase, topk: number[]) {
     mode: MaskMode.CausalCustom,
   };
 };
+
+function buildChunkedMTPMask(ws: WorkspaceBase, topks: number[], depth: number): { data: Tensor; indptr: Tensor; maskKvLenValue: number } {
+  const qoLen = totalPaths(topks.slice(0, depth));
+  const prevQoLen = depth > 1 ? totalPaths(topks.slice(0, depth - 1)) : 0;
+  const maskKvLen = qoLen + prevQoLen;
+  const totalBits = qoLen * maskKvLen;
+  const byteLen = Math.ceil(totalBits / 8);
+  const key = `${topks.join('_')}_d${depth}`;
+
+  const data = ws.tensors.get(`mtp_chunk_mask_host_${key}`) || ws.allocPinned([byteLen], "U8", `mtp_chunk_mask_host_${key}`);
+
+  data.withPinnedBuffer(buf => {
+    buf.fill(0);
+    for (let q = 0; q < qoLen; q++) {
+      if (prevQoLen > 0) {
+        const parent = Math.floor(q / topks[depth - 1]);
+        const bit = q * maskKvLen + parent;
+        buf[bit >> 3] |= 1 << (bit & 7);
+      }
+      const selfBit = q * maskKvLen + prevQoLen + q;
+      buf[selfBit >> 3] |= 1 << (selfBit & 7);
+    }
+  });
+
+  const indptr = ws.tensors.get(`mtp_chunk_mask_indptr_host_${key}`) || ws.allocPinned([2], "I32", `mtp_chunk_mask_indptr_host_${key}`);
+  indptr.withPinnedBuffer(buf => {
+    buf.writeInt32LE(0, 0);
+    buf.writeInt32LE(byteLen, 4);
+  });
+
+  return { data, indptr, maskKvLenValue: maskKvLen };
+}
+
+function ensureChunkedMTPMask(ws: WorkspaceBase, topks: number[], depth: number): { mask: Tensor; indptr: Tensor; maskKvLen: Tensor } {
+  const key = `${topks.join('_')}_d${depth}`;
+  let mask = ws.tensors.get(`mtp_chunk_mask_${key}`);
+  let indptr = ws.tensors.get(`mtp_chunk_mask_indptr_${key}`);
+  let maskKvLen = ws.tensors.get(`mtp_chunk_mask_kvlen_${key}`);
+
+  if (!mask || !indptr || !maskKvLen) {
+    const { data: maskData, indptr: maskIndptrData, maskKvLenValue } = buildChunkedMTPMask(ws, topks, depth);
+
+    mask = ws.alloc(maskData.shape, "U8", `mtp_chunk_mask_${key}`);
+    mask.memcpy(maskData, maskData.bytes, MemcpyKind.HostToDevice);
+
+    indptr = ws.alloc(maskIndptrData.shape, "I32", `mtp_chunk_mask_indptr_${key}`);
+    indptr.memcpy(maskIndptrData, maskIndptrData.bytes, MemcpyKind.HostToDevice);
+
+    const maskKvLenH = ws.allocPinned([1], "I32", `mtp_chunk_mask_kvlen_host_${key}`);
+    maskKvLenH.withPinnedBuffer(buf => {
+      buf.writeInt32LE(maskKvLenValue, 0);
+    });
+    maskKvLen = ws.alloc([1], "I32", `mtp_chunk_mask_kvlen_${key}`);
+    maskKvLen.memcpy(maskKvLenH, 4, MemcpyKind.HostToDevice);
+  }
+
+  return { mask, indptr, maskKvLen };
+}
+
+function getPositionIdsChunked(ws: ExecutionWorkspace, originalAllocLen: number, depth: number, numTokens: number): Tensor {
+  const key = `mtp_chunk_pos_d${depth}_n${numTokens}`;
+  const positionIds = ws.ensureAlloc([numTokens], "I32", key);
+  const positionIdsH = ws.ensureAllocPinned([numTokens], "I32", `${key}_host`);
+  positionIdsH.withPinnedBuffer(buf => {
+    for (let p = 0; p < numTokens; p++) {
+      buf.writeInt32LE(originalAllocLen + depth, p * I32);
+    }
+  });
+  positionIds.memcpy(positionIdsH, numTokens * I32, MemcpyKind.HostToDevice);
+  return positionIds;
+}
 
