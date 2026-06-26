@@ -5,7 +5,8 @@ export class WorkspaceBase implements Disposable {
   readonly glm: DeviceOps;
   tensors = new Map<string, Tensor>();
   tracked = new Set<Tensor>();
-  disposed = new Set<Tensor>();
+  disposedDevice = new Set<Tensor>();
+  disposedHost = new Set<Tensor>();
   exported = new Set<Tensor>();
   frozen = false;
   allocLogger = false;
@@ -16,35 +17,6 @@ export class WorkspaceBase implements Disposable {
 
   freeze() {
     this.frozen = true;
-  }
-
-  stats(): { namedCount: number; namedBytes: number; namedDetails: { name: string; shape: number[]; type: string; allocSize: number; parallelism: string }[]; disposedCount: number; disposedBytes: number; disposedDetails: { shape: number[]; type: string; allocSize: number }[]; trackedCount: number; trackedBytes: number; exportedCount: number; exportedBytes: number } {
-    const namedDetails: { name: string; shape: number[]; type: string; allocSize: number; parallelism: string }[] = [];
-    let namedBytes = 0;
-    for (const [name, t] of this.tensors) {
-      namedBytes += t.allocSize;
-      namedDetails.push({ name, shape: t.shape, type: t.type, allocSize: t.allocSize, parallelism: t.parallelism ?? "none" });
-    }
-    const disposedDetails: { shape: number[]; type: string; allocSize: number }[] = [];
-    let disposedBytes = 0;
-    for (const t of this.disposed) {
-      disposedBytes += t.allocSize;
-      disposedDetails.push({ shape: t.shape, type: t.type, allocSize: t.allocSize });
-    }
-    let trackedBytes = 0;
-    for (const t of this.tracked) {
-      trackedBytes += t.allocSize;
-    }
-    let exportedBytes = 0;
-    for (const t of this.exported) {
-      exportedBytes += t.allocSize;
-    }
-    return {
-      namedCount: this.tensors.size, namedBytes, namedDetails,
-      disposedCount: this.disposed.size, disposedBytes, disposedDetails,
-      trackedCount: this.tracked.size, trackedBytes,
-      exportedCount: this.exported.size, exportedBytes,
-    };
   }
 
   alloc(shape: number[], type: string, name?: string, parallelism?: TensorParallelism): Tensor {
@@ -104,7 +76,8 @@ export class WorkspaceBase implements Disposable {
     }
 
     let best: Tensor | undefined;
-    for (const t of this.disposed) {
+    const disposed = pinned ? this.disposedHost : this.disposedDevice;
+    for (const t of disposed) {
       if (t.view)
         throw new Error("disposed tensor should not have a view");
       if (!t.data)
@@ -120,7 +93,7 @@ export class WorkspaceBase implements Disposable {
       if (best.allocSize !== bytes && this.allocLogger) {
         console.warn(`Reusing disposed tensor of size ${best.allocSize} bytes for allocation of ${bytes} bytes (${shape.join("x")} ${type}${pinned ? " pinned" : ""}${parallelism ? ` ${parallelism}` : ""})`);
       }
-      this.disposed.delete(best);
+      disposed.delete(best);
       const data = best.data;
       best.detachData();
       tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned, undefined);
@@ -145,7 +118,8 @@ export class WorkspaceBase implements Disposable {
     }
 
     tensor.workspace.tracked.delete(tensor);
-    tensor.workspace.disposed.delete(tensor);
+    tensor.workspace.disposedHost.delete(tensor);
+    tensor.workspace.disposedDevice.delete(tensor);
     tensor.workspace.exported.delete(tensor);
     tensor.workspace = this;
     this.addTracked(tensor);
@@ -158,7 +132,10 @@ export class WorkspaceBase implements Disposable {
     for (const tensor of this.tracked) {
       tensor.free();
     }
-    for (const tensor of this.disposed) {
+    for (const tensor of this.disposedHost) {
+      tensor.free();
+    }
+    for (const tensor of this.disposedDevice) {
       tensor.free();
     }
     for (const tensor of this.exported) {
@@ -166,7 +143,8 @@ export class WorkspaceBase implements Disposable {
     }
     this.tensors.clear();
     this.tracked.clear();
-    this.disposed.clear();
+    this.disposedHost.clear();
+    this.disposedDevice.clear();
     this.exported.clear();
   }
 

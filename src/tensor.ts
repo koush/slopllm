@@ -149,7 +149,10 @@ export abstract class Tensor implements Disposable {
       return;
     }
     if (this.data === 0) return;
-    this.workspace.disposed.add(this);
+    if (this.pinned)
+      this.workspace.disposedHost.add(this);
+    else
+      this.workspace.disposedDevice.add(this);
   }
 
   removeTracking(): this {

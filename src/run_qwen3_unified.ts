@@ -616,7 +616,6 @@ async function main(): Promise<void> {
         : await Qwen3Model.fromPretrained(metaOps, modelDir);
     const loadAllocs = metaOps.totalAllocs;
     const loadBytes = metaOps.totalBytes;
-    const loadStats = model.stats();
 
     const cache = model.createChatCache(args.maxPages, args.maxBatch, args.maxSeqLen);
     const ws = new ExecutionWorkspace(metaOps, args.maxBatch, args.maxSeqLen);
@@ -631,9 +630,6 @@ async function main(): Promise<void> {
     console.log(`  model weight allocs: ${loadAllocs} (${mb(loadBytes)} MB)`);
     console.log(`  + workspace/cache allocs: ${forwardAllocs - loadAllocs} (${mb(forwardBytes - loadBytes)} MB)`);
     console.log(`  total allocs: ${forwardAllocs} (${mb(forwardBytes)} MB)`);
-    console.log(`  named tensors: ${loadStats.namedCount} (${mb(loadStats.namedBytes)} MB)`);
-    console.log(`  disposed tensors: ${loadStats.disposedCount} (${mb(loadStats.disposedBytes)} MB)`);
-    console.log(`  tracked tensors: ${loadStats.trackedCount} (${mb(loadStats.trackedBytes)} MB)`);
     return;
   }
 
@@ -654,38 +650,6 @@ async function main(): Promise<void> {
       ? await Qwen35Model.fromPretrained(glm, modelDir)
       : await Qwen3Model.fromPretrained(glm, modelDir);
 
-  if (args.stats) {
-    const printWsStats = (label: string, s: ReturnType<WorkspaceBase["stats"]>) => {
-      const mb = (b: number) => (b / (1024 * 1024)).toFixed(1);
-      console.log(`[${label}] named: ${s.namedCount} (${mb(s.namedBytes)} MB), disposed: ${s.disposedCount} (${mb(s.disposedBytes)} MB), tracked: ${s.trackedCount} (${mb(s.trackedBytes)} MB), exported: ${s.exportedCount} (${mb(s.exportedBytes)} MB)`);
-      if (s.disposedCount > 0) {
-        console.log(`  disposed tensors:`);
-        for (const d of s.disposedDetails) {
-          console.log(`    [${d.shape}] ${d.type} allocSize=${d.allocSize}`);
-        }
-      }
-      const byPrefix: Record<string, { count: number; bytes: number }> = {};
-      for (const d of s.namedDetails) {
-        const pfx = d.name.replace(/model\.layers\.\d+/, "model.layers.N");
-        const key = `${pfx} [${d.shape}] ${d.type} ${d.parallelism}`;
-        if (!byPrefix[key]) byPrefix[key] = { count: 0, bytes: 0 };
-        byPrefix[key].count++;
-        byPrefix[key].bytes += d.allocSize;
-      }
-      const sorted = Object.entries(byPrefix).sort((a, b) => b[1].bytes - a[1].bytes);
-      console.log(`  named by pattern (top 30):`);
-      for (let i = 0; i < Math.min(30, sorted.length); i++) {
-        const [key, v] = sorted[i];
-        console.log(`    ${v.count}x ${key} = ${mb(v.bytes)} MB`);
-      }
-    };
-    printWsStats("model workspace", model.stats());
-    if (glm instanceof ParallelOps) {
-      for (const [i, ws] of glm.shardWorkspacesFor(model as WorkspaceBase).entries()) {
-        printWsStats(`GPU ${i} workspace`, ws.stats());
-      }
-    }
-  }
   const cache = model.createChatCache(args.maxPages, args.maxBatch, args.maxSeqLen);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
 
