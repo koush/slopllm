@@ -497,6 +497,7 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,  # cp_world_size, cp_rank
             ctypes.c_void_p,  # custom_mask (optional, nullptr to skip)
             ctypes.c_void_p,  # mask_indptr (optional, nullptr to skip)
+            ctypes.c_void_p,  # mask_kv_len (optional, nullptr to skip)
         ]
 
         self.lib.glm_mla_decode_plan.restype = None
@@ -1398,7 +1399,7 @@ class GlmOps:
                         head_dim_ckv, head_dim_kpe,
                         lse=None,
                         cp_world_size=0, cp_rank=0,
-                        custom_mask=None, mask_indptr=None):
+                        custom_mask=None, mask_indptr=None, mask_kv_len=None):
         self.lib.glm_mla_prefill_run(
             self.ctx,
             ctypes.c_void_p(q_nope), ctypes.c_void_p(q_pe),
@@ -1419,6 +1420,7 @@ class GlmOps:
             ctypes.c_uint32(cp_world_size), ctypes.c_uint32(cp_rank),
             ctypes.c_void_p(custom_mask),
             ctypes.c_void_p(mask_indptr),
+            ctypes.c_void_p(mask_kv_len),
         )
 
     def mla_decode_plan(self, float_ws, float_ws_size,
