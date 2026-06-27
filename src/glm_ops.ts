@@ -248,7 +248,14 @@ export class GlmTensor extends Tensor {
   writePointers(tensors: Tensor[]): void {
     super.writePointers(tensors);
     const n = tensors.length;
-    if (n > 8) throw new Error(`writePointers: supports up to 8 pointers, got ${n}`);
+    if (n > 8) {
+      const ptrs = new BigInt64Array(n);
+      for (let i = 0; i < n; i++) {
+         ptrs[i] = BigInt(tensors[i].data);
+      }
+      this.h2d(Buffer.from(ptrs.buffer));
+      return;
+    }
     const ptrs = new Array(8).fill(0);
     for (let i = 0; i < n; i++) {
       ptrs[i] = tensors[i].data;
