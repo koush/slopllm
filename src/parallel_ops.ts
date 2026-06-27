@@ -1955,16 +1955,21 @@ export class ParallelOps implements DeviceOps {
     if (!group)
       return false;
 
-    // old path: P2P data sync + gather kernels
-    group!.ensureCapacity(shardBytes, shards.map(s => s.workspace));
     const addon = getNativeAddon();
+    const ptrs = new Array<number>(8).fill(0);
+    for (let i = 0; i < this.worldSize; i++) ptrs[i] = shards[i].data;
 
     if (parallelism === TensorParallelism.Column) {
+      // Smem-staged AllGather: barrier, then single kernel reads from all peers via TMA.
+      this.p2pBarrier();
+      this.sourceCleanup();
+      this.p2pSources.push(...shards.map(s => s.viewClone()));
       for (let i = 0; i < this.worldSize; ++i) {
-        addon.p2pAllGather(
-          this.devices[i].ctx, group!.instances[i],
-          shards[i].data, outputShards[i].data,
-          shardBytes,
+        addon.p2pAllGatherSmem(
+          this.devices[i].ctx,
+          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+          outputShards[i].data, this.worldSize, shardBytes,
         );
       }
       return true;
@@ -1976,11 +1981,16 @@ export class ParallelOps implements DeviceOps {
       const shardDim1 = fullShape[1] / this.worldSize;
       const shardDim1Bytes = shardDim1 * inner * elemBytes;
       const fullDim1Bytes = fullShape[1] * inner * elemBytes;
+      // Smem-staged Row AllGather: barrier, then single kernel reads from all peers via TMA.
+      this.p2pBarrier();
+      this.sourceCleanup();
+      this.p2pSources.push(...shards.map(s => s.viewClone()));
       for (let i = 0; i < this.worldSize; ++i) {
-        addon.p2pAllGatherRow(
-          this.devices[i].ctx, group!.instances[i],
-          shards[i].data, outputShards[i].data,
-          shardBytes, shardDim1Bytes, fullDim1Bytes, outer,
+        addon.p2pAllGatherRowSmem(
+          this.devices[i].ctx,
+          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+          outputShards[i].data, this.worldSize, shardDim1Bytes, fullDim1Bytes, outer,
         );
       }
       return true;

@@ -396,6 +396,23 @@ void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
                               int shard_bytes, int shard_dim1_bytes,
                               int full_dim1_bytes, int outer);
 
+// Smem-staged AllGather (Column layout). Requires p2p_barrier before call.
+// Each peer contributes shard_bytes from its pointer; output receives
+// the concatenated result (N * shard_bytes bytes total).
+// Peer pointers p0..p7 are the per-GPU source data pointers (up to 8).
+void glm_p2p_allgather_smem(GlmCtx* ctx,
+    const void* p0,  const void* p1,  const void* p2,  const void* p3,
+    const void* p4,  const void* p5,  const void* p6,  const void* p7,
+    void* output, int N, int shard_bytes);
+
+// Smem-staged AllGather (Row layout). Requires p2p_barrier before call.
+// Each peer contributes shard_dim1_bytes per row; output is interleaved:
+//   dst = output + row * full_dim1_bytes + peer_j * shard_dim1_bytes
+void glm_p2p_allgather_row_smem(GlmCtx* ctx,
+    const void* p0,  const void* p1,  const void* p2,  const void* p3,
+    const void* p4,  const void* p5,  const void* p6,  const void* p7,
+    void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer);
+
 // P2P Row-parallel RMSNorm: computes RMSNorm on row-parallel tensors without
 // allGathering the full hidden dimension. Each rank computes local sum of squares,
 // exchanges via P2P, then normalizes locally. Output remains row-parallel.

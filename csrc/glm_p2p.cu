@@ -38,6 +38,7 @@
 #include <cuda_bf16.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
+#include <cuda/ptx>
 #include <cstdio>
 
 namespace cg = cooperative_groups;
@@ -766,6 +767,208 @@ p2p_rmsnorm_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Smem-staged AllGather kernels (barrier + async copy + TMA bulk store).
+//
+// Replaces the two-phase (p2p_data_sync + multi-block gather) approach with a
+// single kernel that reads directly from peer GPU memory into smem via
+// cg::memcpy_async, then writes back to global via cp.async.bulk (TMA store).
+// Requires a p2p_barrier before launch to ensure peer data is visible.
+//
+// Peer pointers are passed as 8 separate args (like sum_pointers_smem_kernel).
+// Block rotation by blockIdx.x % N distributes P2P read load across peers.
+// ---------------------------------------------------------------------------
+
+constexpr int AG_SMEM_BLOCK_SIZE = 1024;
+constexpr int AG_SMEM_MAX_N = 8;
+
+template <int N>
+__global__ void __launch_bounds__(AG_SMEM_BLOCK_SIZE, 1)
+p2p_allgather_smem_kernel(
+    const void* __restrict__ p0,  const void* __restrict__ p1,
+    const void* __restrict__ p2,  const void* __restrict__ p3,
+    const void* __restrict__ p4,  const void* __restrict__ p5,
+    const void* __restrict__ p6,  const void* __restrict__ p7,
+    void* __restrict__ output,
+    int shard_bytes,
+    int total_bytes)
+{
+    auto block = cg::this_thread_block();
+    const char* ptrs[AG_SMEM_MAX_N] = {
+        static_cast<const char*>(p0), static_cast<const char*>(p1),
+        static_cast<const char*>(p2), static_cast<const char*>(p3),
+        static_cast<const char*>(p4), static_cast<const char*>(p5),
+        static_cast<const char*>(p6), static_cast<const char*>(p7),
+    };
+
+    extern __shared__ char smem_raw[];
+    int tid = threadIdx.x;
+    int bs  = blockDim.x;
+
+    int rot = blockIdx.x % N;
+    const char* rotated_ptrs[AG_SMEM_MAX_N];
+    #pragma unroll
+    for (int s = 0; s < AG_SMEM_MAX_N; s++) {
+        if (s < N) {
+            rotated_ptrs[s] = ptrs[(s + rot) % N];
+        }
+    }
+
+    // Per-iteration smem: one bs-sized slot per peer (1024 bytes, 16-aligned).
+    int peer_stride = bs;
+
+    for (int64_t blk = (int64_t)blockIdx.x * bs;
+         blk < (int64_t)shard_bytes;
+         blk += (int64_t)gridDim.x * bs)
+    {
+        int64_t elems = min((int64_t)bs, (int64_t)shard_bytes - blk);
+
+        // Issue all async reads (P2P global → smem)
+        #pragma unroll
+        for (int s = 0; s < N; s++) {
+            cg::memcpy_async(block,
+                smem_raw + s * peer_stride,
+                rotated_ptrs[s] + blk,
+                elems);
+        }
+        cg::wait(block);
+
+        // Queue all N TMA bulk stores (smem → global), then wait once.
+        if (elems % 16 == 0) {
+            if (tid == 0) {
+                #pragma unroll
+                for (int s = 0; s < N; s++) {
+                    int actual_peer = (s + rot) % N;
+                    char* dst = static_cast<char*>(output)
+                                + (int64_t)actual_peer * shard_bytes + blk;
+                    cuda::ptx::cp_async_bulk(
+                        cuda::ptx::space_global_t{},
+                        cuda::ptx::space_shared_t{},
+                        dst,
+                        smem_raw + s * peer_stride,
+                        (uint32_t)elems);
+                }
+                cuda::ptx::cp_async_bulk_commit_group();
+                cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+            }
+        } else {
+            // Scalar fallback for sub-16-byte tail
+            #pragma unroll
+            for (int s = 0; s < N; s++) {
+                int actual_peer = (s + rot) % N;
+                const char* src = smem_raw + s * peer_stride;
+                char* dst = static_cast<char*>(output)
+                            + (int64_t)actual_peer * shard_bytes + blk;
+                for (int i = tid; i < elems; i += bs) {
+                    dst[i] = src[i];
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <int N>
+__global__ void __launch_bounds__(AG_SMEM_BLOCK_SIZE, 1)
+p2p_allgather_row_smem_kernel(
+    const void* __restrict__ p0,  const void* __restrict__ p1,
+    const void* __restrict__ p2,  const void* __restrict__ p3,
+    const void* __restrict__ p4,  const void* __restrict__ p5,
+    const void* __restrict__ p6,  const void* __restrict__ p7,
+    void* __restrict__ output,
+    int shard_dim1_bytes,
+    int full_dim1_bytes,
+    int outer)
+{
+    auto block = cg::this_thread_block();
+    const char* ptrs[AG_SMEM_MAX_N] = {
+        static_cast<const char*>(p0), static_cast<const char*>(p1),
+        static_cast<const char*>(p2), static_cast<const char*>(p3),
+        static_cast<const char*>(p4), static_cast<const char*>(p5),
+        static_cast<const char*>(p6), static_cast<const char*>(p7),
+    };
+
+    extern __shared__ char smem_raw[];
+    int tid = threadIdx.x;
+    int bs  = blockDim.x;
+
+    int rot = blockIdx.x % N;
+    const char* rotated_ptrs[AG_SMEM_MAX_N];
+    #pragma unroll
+    for (int s = 0; s < AG_SMEM_MAX_N; s++) {
+        if (s < N) {
+            rotated_ptrs[s] = ptrs[(s + rot) % N];
+        }
+    }
+
+    // Pad stride to 16 bytes for TMA alignment in smem.
+    int peer_stride = (shard_dim1_bytes + 15) & ~15;
+    char* out_b = static_cast<char*>(output);
+    bool use_tma = (shard_dim1_bytes % 16 == 0);
+
+    if (use_tma) {
+        for (int row = blockIdx.x; row < outer; row += gridDim.x)
+        {
+            // Issue all async reads (P2P global → smem)
+            #pragma unroll
+            for (int s = 0; s < N; s++) {
+                cg::memcpy_async(block,
+                    smem_raw + s * peer_stride,
+                    rotated_ptrs[s] + (int64_t)row * shard_dim1_bytes,
+                    shard_dim1_bytes);
+            }
+            cg::wait(block);
+
+            // Queue all N TMA bulk stores (smem → global), then wait once.
+            if (tid == 0) {
+                #pragma unroll
+                for (int s = 0; s < N; s++) {
+                    int actual_peer = (s + rot) % N;
+                    char* dst = out_b + (int64_t)row * full_dim1_bytes
+                                + (int64_t)actual_peer * shard_dim1_bytes;
+                    cuda::ptx::cp_async_bulk(
+                        cuda::ptx::space_global_t{},
+                        cuda::ptx::space_shared_t{},
+                        dst,
+                        smem_raw + s * peer_stride,
+                        (uint32_t)shard_dim1_bytes);
+                }
+                cuda::ptx::cp_async_bulk_commit_group();
+                cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+            }
+
+            __syncthreads();
+        }
+    }
+    else 
+    {
+        for (int row = blockIdx.x; row < outer; row += gridDim.x)
+        {
+            // Issue all async reads (P2P global → smem)
+            #pragma unroll
+            for (int s = 0; s < N; s++) {
+                cg::memcpy_async(block,
+                    smem_raw + s * peer_stride,
+                    rotated_ptrs[s] + (int64_t)row * shard_dim1_bytes,
+                    shard_dim1_bytes);
+            }
+            cg::wait(block);
+            // Scalar fallback for sub-16-byte sizes
+            #pragma unroll
+            for (int s = 0; s < N; s++) {
+                int actual_peer = (s + rot) % N;
+                const char* src = smem_raw + s * peer_stride;
+                char* dst = out_b + (int64_t)row * full_dim1_bytes
+                            + (int64_t)actual_peer * shard_dim1_bytes;
+                for (int i = tid; i < shard_dim1_bytes; i += bs) {
+                    dst[i] = src[i];
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1039,6 +1242,77 @@ void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank) {
         inst->slot_offset_d,
         inst->my_rank, inst->world_size, (int)inst->max_bytes,
         peer_rank);
+}
+
+// ---------------------------------------------------------------------------
+// Launchers for smem-staged AllGather kernels.
+// Caller must invoke p2p_barrier before calling these.
+// Peer pointers are passed directly (no P2P buffer/slot mechanism needed).
+// ---------------------------------------------------------------------------
+
+#define LAUNCH_AG_SMEM(N) \
+    do { \
+        int grid = (shard_bytes / 16 + AG_SMEM_BLOCK_SIZE - 1) / AG_SMEM_BLOCK_SIZE; \
+        if (grid < N) grid = N; \
+        if (grid > 1024) grid = 1024; \
+        size_t smem = (size_t)N * AG_SMEM_BLOCK_SIZE; \
+        cudaFuncSetAttribute( \
+            (void*)p2p_allgather_smem_kernel<N>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+        p2p_allgather_smem_kernel<N><<<grid, AG_SMEM_BLOCK_SIZE, smem, stream>>>( \
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], \
+            output, shard_bytes, N * shard_bytes); \
+    } while(0)
+
+void glm_p2p_allgather_smem(GlmCtx* ctx,
+    const void* p0,  const void* p1,  const void* p2,  const void* p3,
+    const void* p4,  const void* p5,  const void* p6,  const void* p7,
+    void* output, int N, int shard_bytes) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    const void* p[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
+    switch (N) {
+        case 2: LAUNCH_AG_SMEM(2); break;
+        case 4: LAUNCH_AG_SMEM(4); break;
+        case 8: LAUNCH_AG_SMEM(8); break;
+        default:
+            fprintf(stderr, "glm_p2p_allgather_smem: unsupported N=%d\n", N);
+            break;
+    }
+    #undef LAUNCH_AG_SMEM
+}
+
+#define LAUNCH_AG_ROW_SMEM(N) \
+    do { \
+        int grid = outer; \
+        if (grid < N) grid = N; \
+        if (grid > 1024) grid = 1024; \
+        size_t peer_stride = ((size_t)shard_dim1_bytes + 15) & ~(size_t)15; \
+        size_t smem = (size_t)N * peer_stride; \
+        cudaFuncSetAttribute( \
+            (void*)p2p_allgather_row_smem_kernel<N>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+        p2p_allgather_row_smem_kernel<N><<<grid, AG_SMEM_BLOCK_SIZE, smem, stream>>>( \
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], \
+            output, shard_dim1_bytes, full_dim1_bytes, outer); \
+    } while(0)
+
+void glm_p2p_allgather_row_smem(GlmCtx* ctx,
+    const void* p0,  const void* p1,  const void* p2,  const void* p3,
+    const void* p4,  const void* p5,  const void* p6,  const void* p7,
+    void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    const void* p[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
+    switch (N) {
+        case 2: LAUNCH_AG_ROW_SMEM(2); break;
+        case 4: LAUNCH_AG_ROW_SMEM(4); break;
+        case 8: LAUNCH_AG_ROW_SMEM(8); break;
+        default:
+            fprintf(stderr, "glm_p2p_allgather_row_smem: unsupported N=%d\n", N);
+            break;
+    }
+    #undef LAUNCH_AG_ROW_SMEM
 }
 
 } // extern "C"

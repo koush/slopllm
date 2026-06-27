@@ -3449,6 +3449,58 @@ static Napi::Value P2PAllGatherRow(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value P2PAllGatherSmem(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, p0..p7, output, N, shardBytes)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t p[8];
+    for (int i = 0; i < 8; i++) p[i] = info[1 + i].As<Napi::Number>().Int64Value();
+    uintptr_t output_ptr = info[9].As<Napi::Number>().Int64Value();
+    int N = info[10].As<Napi::Number>().Int32Value();
+    int shard_bytes = info[11].As<Napi::Number>().Int32Value();
+    glm_p2p_allgather_smem(reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<const void*>(p[0]), reinterpret_cast<const void*>(p[1]),
+        reinterpret_cast<const void*>(p[2]), reinterpret_cast<const void*>(p[3]),
+        reinterpret_cast<const void*>(p[4]), reinterpret_cast<const void*>(p[5]),
+        reinterpret_cast<const void*>(p[6]), reinterpret_cast<const void*>(p[7]),
+        reinterpret_cast<void*>(output_ptr), N, shard_bytes);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PAllGatherSmem failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value P2PAllGatherRowSmem(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 14) {
+        Napi::TypeError::New(env, "Expected (ctx, p0..p7, output, N, shardDim1Bytes, fullDim1Bytes, outer)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t p[8];
+    for (int i = 0; i < 8; i++) p[i] = info[1 + i].As<Napi::Number>().Int64Value();
+    uintptr_t output_ptr = info[9].As<Napi::Number>().Int64Value();
+    int N = info[10].As<Napi::Number>().Int32Value();
+    int shard_dim1_bytes = info[11].As<Napi::Number>().Int32Value();
+    int full_dim1_bytes = info[12].As<Napi::Number>().Int32Value();
+    int outer = info[13].As<Napi::Number>().Int32Value();
+    glm_p2p_allgather_row_smem(reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<const void*>(p[0]), reinterpret_cast<const void*>(p[1]),
+        reinterpret_cast<const void*>(p[2]), reinterpret_cast<const void*>(p[3]),
+        reinterpret_cast<const void*>(p[4]), reinterpret_cast<const void*>(p[5]),
+        reinterpret_cast<const void*>(p[6]), reinterpret_cast<const void*>(p[7]),
+        reinterpret_cast<void*>(output_ptr), N, shard_dim1_bytes, full_dim1_bytes, outer);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PAllGatherRowSmem failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value P2PRmsnorm(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 9) {
@@ -3656,6 +3708,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "p2pAllReduceSmem"), Napi::Function::New(env, P2PAllReduceSmem));
     exports.Set(Napi::String::New(env, "p2pAllGather"), Napi::Function::New(env, P2PAllGather));
     exports.Set(Napi::String::New(env, "p2pAllGatherRow"), Napi::Function::New(env, P2PAllGatherRow));
+    exports.Set(Napi::String::New(env, "p2pAllGatherSmem"), Napi::Function::New(env, P2PAllGatherSmem));
+    exports.Set(Napi::String::New(env, "p2pAllGatherRowSmem"), Napi::Function::New(env, P2PAllGatherRowSmem));
     exports.Set(Napi::String::New(env, "p2pRmsnorm"), Napi::Function::New(env, P2PRmsnorm));
     exports.Set(Napi::String::New(env, "p2pBarrier"), Napi::Function::New(env, P2PBarrier));
     return exports;
