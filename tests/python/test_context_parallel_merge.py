@@ -121,9 +121,9 @@ class TestContextParallelMerge:
         torch.testing.assert_close(merged_v_out.cpu(), merged_v_ref.cpu(), atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(merged_lse_out.cpu(), merged_lse_ref.cpu(), atol=1e-3, rtol=1e-3)
 
-    def test_merge_16_shards(self, glm, device):
+    def test_merge_8_shards(self, glm, device):
         B, H, D = 1, 4, 128
-        num_shards = 16
+        num_shards = 8
         torch.manual_seed(77)
         
         partial_v_outs = [torch.randn(B, H, D, dtype=torch.bfloat16, device=device) for _ in range(num_shards)]

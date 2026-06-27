@@ -250,11 +250,11 @@ function runCpPrefillTest(
   }
 
   const mergedVOut = allocBf16(ws, [totalTokens, N_HEADS * V_HEAD_DIM]);
-  const vPtrs16 = new Array<number>(16).fill(0);
-  const lsePtrs16 = new Array<number>(16).fill(0);
-  for (let i = 0; i < worldSize; i++) { vPtrs16[i] = shardVPtrs[i]; lsePtrs16[i] = shardLsePtrs[i]; }
+  const vPtrs8 = new Array<number>(8).fill(0);
+  const lsePtrs8 = new Array<number>(8).fill(0);
+  for (let i = 0; i < worldSize; i++) { vPtrs8[i] = shardVPtrs[i]; lsePtrs8[i] = shardLsePtrs[i]; }
   glm.cpMergeTree(
-    vPtrs16, lsePtrs16, worldSize,
+    vPtrs8, lsePtrs8, worldSize,
     mergedVOut, null,
     totalTokens * N_HEADS * V_HEAD_DIM, totalTokens, N_HEADS, V_HEAD_DIM,
   );
@@ -395,11 +395,11 @@ function runCpAppendPrefillTest(
   }
 
   const mergedVOut = allocBf16(ws, [totalQTokens, N_HEADS * V_HEAD_DIM]);
-  const vPtrs16 = new Array<number>(16).fill(0);
-  const lsePtrs16 = new Array<number>(16).fill(0);
-  for (let i = 0; i < worldSize; i++) { vPtrs16[i] = shardVPtrs[i]; lsePtrs16[i] = shardLsePtrs[i]; }
+  const vPtrs8 = new Array<number>(8).fill(0);
+  const lsePtrs8 = new Array<number>(8).fill(0);
+  for (let i = 0; i < worldSize; i++) { vPtrs8[i] = shardVPtrs[i]; lsePtrs8[i] = shardLsePtrs[i]; }
   glm.cpMergeTree(
-    vPtrs16, lsePtrs16, worldSize,
+    vPtrs8, lsePtrs8, worldSize,
     mergedVOut, null,
     totalQTokens * N_HEADS * V_HEAD_DIM, totalQTokens, N_HEADS, V_HEAD_DIM,
   );

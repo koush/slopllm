@@ -54,14 +54,14 @@ class TestCpMergeTree:
         out_v_ptr = self.ops.alloc(out_numel * 2)
         out_lse_ptr = self.ops.alloc(batch * shard_n_heads * 4)
 
-        v_args = [ctypes.c_void_p(int(p)) for p in gpu_v_ptrs] + [ctypes.c_void_p(0)] * (16 - N)
-        lse_args = [ctypes.c_void_p(int(p)) for p in gpu_lse_ptrs] + [ctypes.c_void_p(0)] * (16 - N)
+        v_args = [ctypes.c_void_p(int(p)) for p in gpu_v_ptrs] + [ctypes.c_void_p(0)] * (8 - N)
+        lse_args = [ctypes.c_void_p(int(p)) for p in gpu_lse_ptrs] + [ctypes.c_void_p(0)] * (8 - N)
 
         self.ops.lib.glm_cp_merge_tree.restype = None
         self.ops.lib.glm_cp_merge_tree.argtypes = (
             [ctypes.c_void_p] +
-            [ctypes.c_void_p] * 16 +
-            [ctypes.c_void_p] * 16 +
+            [ctypes.c_void_p] * 8 +
+            [ctypes.c_void_p] * 8 +
             [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
              ctypes.c_int64, ctypes.c_int, ctypes.c_int, ctypes.c_int,
              ctypes.c_int, ctypes.c_int, ctypes.c_int]

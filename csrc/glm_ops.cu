@@ -2459,7 +2459,7 @@ __global__ void __launch_bounds__(256, 4) sum_pointers_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Smem-staged sum of N tensors (element-wise, max 16 inputs)
+// Smem-staged sum of N tensors (element-wise, max 8 inputs)
 // Thread 0 issues N cp.async.bulk transfers (one per peer, covering the
 // entire block's tile) into peer-major smem, then the block waits on a
 // single mbarrier.  This uses the TMA/DMA engine for large contiguous P2P
@@ -2474,15 +2474,13 @@ __global__ void __launch_bounds__(1024, 1)
 sum_pointers_smem_kernel(
     const scalar_t* p0,  const scalar_t* p1,  const scalar_t* p2,  const scalar_t* p3,
     const scalar_t* p4,  const scalar_t* p5,  const scalar_t* p6,  const scalar_t* p7,
-    const scalar_t* p8,  const scalar_t* p9,  const scalar_t* p10, const scalar_t* p11,
-    const scalar_t* p12, const scalar_t* p13, const scalar_t* p14, const scalar_t* p15,
     scalar_t* __restrict__ output,
     int N,
     int64_t numel,
     int peer_stride)
 {
     constexpr int WarpSize = 32;
-    constexpr int MaxN = 16;
+    constexpr int MaxN = 8;
 
     extern __shared__ char smem_raw[];
     __shared__ cuda::barrier<cuda::thread_scope_block> bar;
@@ -2492,8 +2490,7 @@ sum_pointers_smem_kernel(
     int warps_per_block = blockDim.x / WarpSize;
 
     const scalar_t* ptrs[MaxN] = {
-        p0, p1, p2, p3, p4, p5, p6, p7,
-        p8, p9, p10, p11, p12, p13, p14, p15
+        p0, p1, p2, p3, p4, p5, p6, p7
     };
 
     int64_t block_stride = (int64_t)warps_per_block * ElemsPerWarp;
@@ -2600,15 +2597,13 @@ __global__ void __launch_bounds__(1024, 1)
 flat_allreduce_kernel(
     scalar_t* p0,  scalar_t* p1,  scalar_t* p2,  scalar_t* p3,
     scalar_t* p4,  scalar_t* p5,  scalar_t* p6,  scalar_t* p7,
-    scalar_t* p8,  scalar_t* p9,  scalar_t* p10, scalar_t* p11,
-    scalar_t* p12, scalar_t* p13, scalar_t* p14, scalar_t* p15,
     int N,
     int64_t numel,
     int my_rank,
     int buf_stride)
 {
     constexpr int WarpSize = 32;
-    constexpr int MaxN = 16;
+    constexpr int MaxN = 8;
     constexpr int NumBufs = 2;
 
     extern __shared__ char smem_raw[];
@@ -2619,8 +2614,7 @@ flat_allreduce_kernel(
     int warps_per_block = blockDim.x / WarpSize;
 
     scalar_t* ptrs_orig[MaxN] = {
-        p0, p1, p2, p3, p4, p5, p6, p7,
-        p8, p9, p10, p11, p12, p13, p14, p15
+        p0, p1, p2, p3, p4, p5, p6, p7
     };
 
     // Rotate pointer order by blockIdx.x so different blocks hit different
@@ -2852,8 +2846,6 @@ extern "C" {
 void glm_sum_pointers(GlmCtx* ctx,
     void* p0,  void* p1,  void* p2,  void* p3,
     void* p4,  void* p5,  void* p6,  void* p7,
-    void* p8,  void* p9,  void* p10, void* p11,
-    void* p12, void* p13, void* p14, void* p15,
     void* output, int N, int64_t numel, int dtype) {
     cudaSetDevice(ctx->device_id);
 
@@ -2883,15 +2875,11 @@ void glm_sum_pointers(GlmCtx* ctx,
         sum_pointers_smem_kernel<__nv_bfloat16, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
             (const __nv_bfloat16*)p0,  (const __nv_bfloat16*)p1,  (const __nv_bfloat16*)p2,  (const __nv_bfloat16*)p3,
             (const __nv_bfloat16*)p4,  (const __nv_bfloat16*)p5,  (const __nv_bfloat16*)p6,  (const __nv_bfloat16*)p7,
-            (const __nv_bfloat16*)p8,  (const __nv_bfloat16*)p9,  (const __nv_bfloat16*)p10, (const __nv_bfloat16*)p11,
-            (const __nv_bfloat16*)p12, (const __nv_bfloat16*)p13, (const __nv_bfloat16*)p14, (const __nv_bfloat16*)p15,
             (__nv_bfloat16*)output, N, numel, peer_stride);
     } else {
         sum_pointers_smem_kernel<float, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
             (const float*)p0,  (const float*)p1,  (const float*)p2,  (const float*)p3,
             (const float*)p4,  (const float*)p5,  (const float*)p6,  (const float*)p7,
-            (const float*)p8,  (const float*)p9,  (const float*)p10, (const float*)p11,
-            (const float*)p12, (const float*)p13, (const float*)p14, (const float*)p15,
             (float*)output, N, numel, peer_stride);
     }
 }
@@ -2900,8 +2888,6 @@ void glm_flat_allreduce(
     GlmCtx* ctx,
     void* p0,  void* p1,  void* p2,  void* p3,
     void* p4,  void* p5,  void* p6,  void* p7,
-    void* p8,  void* p9,  void* p10, void* p11,
-    void* p12, void* p13, void* p14, void* p15,
     int N, int64_t numel, int dtype, int my_rank)
 {
     cudaSetDevice(ctx->device_id);
@@ -2931,15 +2917,11 @@ void glm_flat_allreduce(
         flat_allreduce_kernel<__nv_bfloat16, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)p0,  (__nv_bfloat16*)p1,  (__nv_bfloat16*)p2,  (__nv_bfloat16*)p3,
             (__nv_bfloat16*)p4,  (__nv_bfloat16*)p5,  (__nv_bfloat16*)p6,  (__nv_bfloat16*)p7,
-            (__nv_bfloat16*)p8,  (__nv_bfloat16*)p9,  (__nv_bfloat16*)p10, (__nv_bfloat16*)p11,
-            (__nv_bfloat16*)p12, (__nv_bfloat16*)p13, (__nv_bfloat16*)p14, (__nv_bfloat16*)p15,
             N, numel, my_rank, buf_stride);
     } else {
         flat_allreduce_kernel<float, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
             (float*)p0,  (float*)p1,  (float*)p2,  (float*)p3,
             (float*)p4,  (float*)p5,  (float*)p6,  (float*)p7,
-            (float*)p8,  (float*)p9,  (float*)p10, (float*)p11,
-            (float*)p12, (float*)p13, (float*)p14, (float*)p15,
             N, numel, my_rank, buf_stride);
     }
 }

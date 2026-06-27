@@ -396,8 +396,8 @@ export abstract class Tensor implements Disposable {
   }
 
   sumInPlace(tensors: Tensor[]): void {
-    if (tensors.length === 0 || tensors.length > 15) {
-      throw new Error(`sumInPlace: requires 1-15 additional tensors, got ${tensors.length}`);
+    if (tensors.length === 0 || tensors.length > 8) {
+      throw new Error(`sumInPlace: requires 1-8 additional tensors, got ${tensors.length}`);
     }
     for (let i = 0; i < tensors.length; i++) {
       if (tensors[i].type !== this.type) {
@@ -407,8 +407,8 @@ export abstract class Tensor implements Disposable {
   }
 
   sum(tensors: Tensor[]): Tensor {
-    if (tensors.length === 0 || tensors.length > 15) {
-      throw new Error(`sum: requires 1-15 additional tensors, got ${tensors.length}`);
+    if (tensors.length === 0 || tensors.length > 7) {
+      throw new Error(`sum: requires 1-7 additional tensors, got ${tensors.length}`);
     }
     for (let i = 0; i < tensors.length; i++) {
       if (tensors[i].type !== this.type) {

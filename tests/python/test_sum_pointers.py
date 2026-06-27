@@ -39,12 +39,12 @@ class TestSumPointers:
 
         out_ptr = gpu_ptrs[0]
 
-        ptr_args = [ctypes.c_void_p(int(p)) for p in gpu_ptrs] + [ctypes.c_void_p(0)] * (16 - N)
+        ptr_args = [ctypes.c_void_p(int(p)) for p in gpu_ptrs] + [ctypes.c_void_p(0)] * (8 - N)
 
         self.ops.lib.glm_sum_pointers.restype = None
         self.ops.lib.glm_sum_pointers.argtypes = (
             [ctypes.c_void_p] +  # ctx
-            [ctypes.c_void_p] * 16 +  # p0..p15
+            [ctypes.c_void_p] * 8 +  # p0..p7
             [ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_int]  # out, N, numel, dtype
         )
         self.ops.lib.glm_sum_pointers(
@@ -93,7 +93,7 @@ class TestSumPointers:
         assert torch.equal(result, expected_sum)
 
     def test_max_tensors(self):
-        tensors = [(torch.arange(64, dtype=torch.float32).bfloat16() * (i + 1)) for i in range(16)]
+        tensors = [(torch.arange(64, dtype=torch.float32).bfloat16() * (i + 1)) for i in range(8)]
         expected_sum = sum(t.float() for t in tensors).bfloat16()
         result = self._sum_pointers(tensors)
         assert torch.equal(result, expected_sum)

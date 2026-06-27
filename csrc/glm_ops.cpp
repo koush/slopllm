@@ -732,28 +732,24 @@ static Napi::Value Scale(const Napi::CallbackInfo& info) {
 
 static Napi::Value SumPointers(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 21) {
-        Napi::TypeError::New(env, "Expected (ctx, p0..p15, out, N, numel, dtype)").ThrowAsJavaScriptException();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, p0..p7, out, N, numel, dtype)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t p[16];
-    for (int i = 0; i < 16; i++) {
+    uintptr_t p[8];
+    for (int i = 0; i < 8; i++) {
         p[i] = info[1 + i].As<Napi::Number>().Int64Value();
     }
-    uintptr_t out_ptr = info[17].As<Napi::Number>().Int64Value();
-    int N = info[18].As<Napi::Number>().Int32Value();
-    int64_t numel = info[19].As<Napi::Number>().Int64Value();
-    int dtype = info[20].As<Napi::Number>().Int32Value();
+    uintptr_t out_ptr = info[9].As<Napi::Number>().Int64Value();
+    int N = info[10].As<Napi::Number>().Int32Value();
+    int64_t numel = info[11].As<Napi::Number>().Int64Value();
+    int dtype = info[12].As<Napi::Number>().Int32Value();
     glm_sum_pointers(reinterpret_cast<GlmCtx*>(ctx_ptr),
                      reinterpret_cast<void*>(p[0]),  reinterpret_cast<void*>(p[1]),
                      reinterpret_cast<void*>(p[2]),  reinterpret_cast<void*>(p[3]),
                      reinterpret_cast<void*>(p[4]),  reinterpret_cast<void*>(p[5]),
                      reinterpret_cast<void*>(p[6]),  reinterpret_cast<void*>(p[7]),
-                     reinterpret_cast<void*>(p[8]),  reinterpret_cast<void*>(p[9]),
-                     reinterpret_cast<void*>(p[10]), reinterpret_cast<void*>(p[11]),
-                     reinterpret_cast<void*>(p[12]), reinterpret_cast<void*>(p[13]),
-                     reinterpret_cast<void*>(p[14]), reinterpret_cast<void*>(p[15]),
                      reinterpret_cast<void*>(out_ptr), N, numel, dtype);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -764,28 +760,24 @@ static Napi::Value SumPointers(const Napi::CallbackInfo& info) {
 
 static Napi::Value FlatAllReduce(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 21) {
-        Napi::TypeError::New(env, "Expected (ctx, p0..p15, N, numel, dtype, my_rank)").ThrowAsJavaScriptException();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, p0..p7, N, numel, dtype, my_rank)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t p[16];
-    for (int i = 0; i < 16; i++) {
+    uintptr_t p[8];
+    for (int i = 0; i < 8; i++) {
         p[i] = info[1 + i].As<Napi::Number>().Int64Value();
     }
-    int N = info[17].As<Napi::Number>().Int32Value();
-    int64_t numel = info[18].As<Napi::Number>().Int64Value();
-    int dtype = info[19].As<Napi::Number>().Int32Value();
-    int my_rank = info[20].As<Napi::Number>().Int32Value();
+    int N = info[9].As<Napi::Number>().Int32Value();
+    int64_t numel = info[10].As<Napi::Number>().Int64Value();
+    int dtype = info[11].As<Napi::Number>().Int32Value();
+    int my_rank = info[12].As<Napi::Number>().Int32Value();
     glm_flat_allreduce(reinterpret_cast<GlmCtx*>(ctx_ptr),
                        reinterpret_cast<void*>(p[0]),  reinterpret_cast<void*>(p[1]),
                        reinterpret_cast<void*>(p[2]),  reinterpret_cast<void*>(p[3]),
                        reinterpret_cast<void*>(p[4]),  reinterpret_cast<void*>(p[5]),
                        reinterpret_cast<void*>(p[6]),  reinterpret_cast<void*>(p[7]),
-                       reinterpret_cast<void*>(p[8]),  reinterpret_cast<void*>(p[9]),
-                       reinterpret_cast<void*>(p[10]), reinterpret_cast<void*>(p[11]),
-                       reinterpret_cast<void*>(p[12]), reinterpret_cast<void*>(p[13]),
-                       reinterpret_cast<void*>(p[14]), reinterpret_cast<void*>(p[15]),
                        N, numel, dtype, my_rank);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -2946,26 +2938,26 @@ static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
 
 static Napi::Value CpMergeTree(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 43) {
-        Napi::TypeError::New(env, "Expected (ctx, v0..v15, lse0..lse15, num_shards, output_v, output_lse, numel, batch_size, num_heads, v_head_dim, shard_n_heads, head_offset, input_n_heads)").ThrowAsJavaScriptException();
+    if (info.Length() < 27) {
+        Napi::TypeError::New(env, "Expected (ctx, v0..v7, lse0..lse7, num_shards, output_v, output_lse, numel, batch_size, num_heads, v_head_dim, shard_n_heads, head_offset, input_n_heads)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t vp[16], lp[16];
-    for (int i = 0; i < 16; i++) {
+    uintptr_t vp[8], lp[8];
+    for (int i = 0; i < 8; i++) {
         vp[i] = info[1 + i].As<Napi::Number>().Int64Value();
-        lp[i] = info[17 + i].As<Napi::Number>().Int64Value();
+        lp[i] = info[9 + i].As<Napi::Number>().Int64Value();
     }
-    int num_shards = info[33].As<Napi::Number>().Int32Value();
-    uintptr_t output_v_ptr = info[34].As<Napi::Number>().Int64Value();
-    uintptr_t output_lse_ptr = info[35].As<Napi::Number>().Int64Value();
-    int64_t numel = info[36].As<Napi::Number>().Int64Value();
-    int batch_size = info[37].As<Napi::Number>().Int32Value();
-    int num_heads = info[38].As<Napi::Number>().Int32Value();
-    int v_head_dim = info[39].As<Napi::Number>().Int32Value();
-    int shard_n_heads = info[40].As<Napi::Number>().Int32Value();
-    int head_offset = info[41].As<Napi::Number>().Int32Value();
-    int input_n_heads = info[42].As<Napi::Number>().Int32Value();
+    int num_shards = info[17].As<Napi::Number>().Int32Value();
+    uintptr_t output_v_ptr = info[18].As<Napi::Number>().Int64Value();
+    uintptr_t output_lse_ptr = info[19].As<Napi::Number>().Int64Value();
+    int64_t numel = info[20].As<Napi::Number>().Int64Value();
+    int batch_size = info[21].As<Napi::Number>().Int32Value();
+    int num_heads = info[22].As<Napi::Number>().Int32Value();
+    int v_head_dim = info[23].As<Napi::Number>().Int32Value();
+    int shard_n_heads = info[24].As<Napi::Number>().Int32Value();
+    int head_offset = info[25].As<Napi::Number>().Int32Value();
+    int input_n_heads = info[26].As<Napi::Number>().Int32Value();
 
     glm_cp_merge_tree(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
@@ -2973,18 +2965,10 @@ static Napi::Value CpMergeTree(const Napi::CallbackInfo& info) {
         reinterpret_cast<const void*>(vp[2]),  reinterpret_cast<const void*>(vp[3]),
         reinterpret_cast<const void*>(vp[4]),  reinterpret_cast<const void*>(vp[5]),
         reinterpret_cast<const void*>(vp[6]),  reinterpret_cast<const void*>(vp[7]),
-        reinterpret_cast<const void*>(vp[8]),  reinterpret_cast<const void*>(vp[9]),
-        reinterpret_cast<const void*>(vp[10]), reinterpret_cast<const void*>(vp[11]),
-        reinterpret_cast<const void*>(vp[12]), reinterpret_cast<const void*>(vp[13]),
-        reinterpret_cast<const void*>(vp[14]), reinterpret_cast<const void*>(vp[15]),
         reinterpret_cast<const float*>(lp[0]),  reinterpret_cast<const float*>(lp[1]),
         reinterpret_cast<const float*>(lp[2]),  reinterpret_cast<const float*>(lp[3]),
         reinterpret_cast<const float*>(lp[4]),  reinterpret_cast<const float*>(lp[5]),
         reinterpret_cast<const float*>(lp[6]),  reinterpret_cast<const float*>(lp[7]),
-        reinterpret_cast<const float*>(lp[8]),  reinterpret_cast<const float*>(lp[9]),
-        reinterpret_cast<const float*>(lp[10]), reinterpret_cast<const float*>(lp[11]),
-        reinterpret_cast<const float*>(lp[12]), reinterpret_cast<const float*>(lp[13]),
-        reinterpret_cast<const float*>(lp[14]), reinterpret_cast<const float*>(lp[15]),
         num_shards,
         reinterpret_cast<void*>(output_v_ptr),
         reinterpret_cast<float*>(output_lse_ptr),

@@ -212,21 +212,17 @@ void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
                            const int* qo_indptr, const int* new_tokens,
                            int batch_size);
 
-// Element-wise sum of N tensors (max 16). Pointers passed as kernel args
+// Element-wise sum of N tensors (max 8). Pointers passed as kernel args
 // for CUDA graph compatibility. dtype: 9=BF16, 7=F32.
 void glm_sum_pointers(GlmCtx* ctx,
     void* p0,  void* p1,  void* p2,  void* p3,
     void* p4,  void* p5,  void* p6,  void* p7,
-    void* p8,  void* p9,  void* p10, void* p11,
-    void* p12, void* p13, void* p14, void* p15,
     void* output, int N, int64_t numel, int dtype);
 
 void glm_flat_allreduce(
     GlmCtx* ctx,
     void* p0,  void* p1,  void* p2,  void* p3,
     void* p4,  void* p5,  void* p6,  void* p7,
-    void* p8,  void* p9,  void* p10, void* p11,
-    void* p12, void* p13, void* p14, void* p15,
     int N, int64_t numel, int dtype, int my_rank);
 
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
@@ -717,7 +713,7 @@ void glm_causal_conv1d_update(GlmCtx* ctx, void* output, void* conv_state,
 
 
 // CP Merge Tree: smem-staged online softmax merge using cp.async.bulk.
-// Merges up to 16 partial (v_out, lse) pairs using the online softmax trick.
+// Merges up to 8 partial (v_out, lse) pairs using the online softmax trick.
 // Supports in-place operation (output_v may alias one of the v inputs, output_lse may alias one of the lse inputs).
 // Individual pointer arguments (not arrays) for CUDA graph capture compatibility.
 // v_out inputs: [batch_size * input_n_heads * v_head_dim] BF16 each
@@ -732,12 +728,8 @@ void glm_cp_merge_tree(
     GlmCtx* ctx,
     const void* v0,  const void* v1,  const void* v2,  const void* v3,
     const void* v4,  const void* v5,  const void* v6,  const void* v7,
-    const void* v8,  const void* v9,  const void* v10, const void* v11,
-    const void* v12, const void* v13, const void* v14, const void* v15,
     const float* lse0,  const float* lse1,  const float* lse2,  const float* lse3,
     const float* lse4,  const float* lse5,  const float* lse6,  const float* lse7,
-    const float* lse8,  const float* lse9,  const float* lse10, const float* lse11,
-    const float* lse12, const float* lse13, const float* lse14, const float* lse15,
     int num_shards,
     void* output_v,
     float* output_lse,

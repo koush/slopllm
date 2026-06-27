@@ -34,19 +34,15 @@ namespace cg = cooperative_groups;
 #include <cuda/barrier>
 #include <cuda/ptx>
 
-constexpr int CP_TREE_MAX_SHARDS = 16;
+constexpr int CP_TREE_MAX_SHARDS = 8;
 
 template <int NUM_SHARDS, int VEC_SIZE, int BDX>
 __global__ void __launch_bounds__(BDX, 2)
 cp_merge_tree_kernel(
     const __nv_bfloat16* v0,  const __nv_bfloat16* v1,  const __nv_bfloat16* v2,  const __nv_bfloat16* v3,
     const __nv_bfloat16* v4,  const __nv_bfloat16* v5,  const __nv_bfloat16* v6,  const __nv_bfloat16* v7,
-    const __nv_bfloat16* v8,  const __nv_bfloat16* v9,  const __nv_bfloat16* v10, const __nv_bfloat16* v11,
-    const __nv_bfloat16* v12, const __nv_bfloat16* v13, const __nv_bfloat16* v14, const __nv_bfloat16* v15,
     const float* lse0,  const float* lse1,  const float* lse2,  const float* lse3,
     const float* lse4,  const float* lse5,  const float* lse6,  const float* lse7,
-    const float* lse8,  const float* lse9,  const float* lse10, const float* lse11,
-    const float* lse12, const float* lse13, const float* lse14, const float* lse15,
     __nv_bfloat16* output_v,
     float* output_lse,
     int64_t numel,
@@ -75,12 +71,10 @@ cp_merge_tree_kernel(
     if (b >= batch_size) return;
 
     const __nv_bfloat16* v_ptrs_orig[CP_TREE_MAX_SHARDS] = {
-        v0, v1, v2, v3, v4, v5, v6, v7,
-        v8, v9, v10, v11, v12, v13, v14, v15
+        v0, v1, v2, v3, v4, v5, v6, v7
     };
     const float* lse_ptrs_orig[CP_TREE_MAX_SHARDS] = {
-        lse0, lse1, lse2, lse3, lse4, lse5, lse6, lse7,
-        lse8, lse9, lse10, lse11, lse12, lse13, lse14, lse15
+        lse0, lse1, lse2, lse3, lse4, lse5, lse6, lse7
     };
 
     // Rotate pointer order by blockIdx.x so different blocks hit different peers first,
@@ -146,8 +140,8 @@ cp_merge_tree_kernel(
 }
 
 static void launch_cp_merge_tree(
-    const __nv_bfloat16* v_ptrs[16],
-    const float* lse_ptrs[16],
+    const __nv_bfloat16* v_ptrs[8],
+    const float* lse_ptrs[8],
     int num_shards,
     __nv_bfloat16* output_v,
     float* output_lse,
@@ -167,12 +161,8 @@ static void launch_cp_merge_tree(
         cp_merge_tree_kernel<NS, VEC_SIZE, BDX><<<grid, BDX, NS * (BDX * VEC_SIZE) * sizeof(__nv_bfloat16) + NS * sizeof(float), stream>>>( \
             v_ptrs[0], v_ptrs[1], v_ptrs[2], v_ptrs[3], \
             v_ptrs[4], v_ptrs[5], v_ptrs[6], v_ptrs[7], \
-            v_ptrs[8], v_ptrs[9], v_ptrs[10], v_ptrs[11], \
-            v_ptrs[12], v_ptrs[13], v_ptrs[14], v_ptrs[15], \
             lse_ptrs[0], lse_ptrs[1], lse_ptrs[2], lse_ptrs[3], \
             lse_ptrs[4], lse_ptrs[5], lse_ptrs[6], lse_ptrs[7], \
-            lse_ptrs[8], lse_ptrs[9], lse_ptrs[10], lse_ptrs[11], \
-            lse_ptrs[12], lse_ptrs[13], lse_ptrs[14], lse_ptrs[15], \
             output_v, output_lse, numel, batch_size, num_heads, v_head_dim, \
             0, 0, 0, shard_n_heads, head_offset, input_n_heads)
 
@@ -194,9 +184,8 @@ static void launch_cp_merge_tree(
         case 3:  DISPATCH_VHEAD_DIM(3); break;
         case 4:  DISPATCH_VHEAD_DIM(4); break;
         case 8:  DISPATCH_VHEAD_DIM(8); break;
-        case 16: DISPATCH_VHEAD_DIM(16); break;
         default:
-            fprintf(stderr, "launch_cp_merge_tree: unsupported num_shards=%d (must be 1, 2, 3, 4, 8, or 16)\n", num_shards);
+            fprintf(stderr, "launch_cp_merge_tree: unsupported num_shards=%d (must be 1, 2, 3, 4, or 8)\n", num_shards);
             break;
     }
 
@@ -210,12 +199,8 @@ void glm_cp_merge_tree(
     GlmCtx* ctx,
     const void* v0,  const void* v1,  const void* v2,  const void* v3,
     const void* v4,  const void* v5,  const void* v6,  const void* v7,
-    const void* v8,  const void* v9,  const void* v10, const void* v11,
-    const void* v12, const void* v13, const void* v14, const void* v15,
     const float* lse0,  const float* lse1,  const float* lse2,  const float* lse3,
     const float* lse4,  const float* lse5,  const float* lse6,  const float* lse7,
-    const float* lse8,  const float* lse9,  const float* lse10, const float* lse11,
-    const float* lse12, const float* lse13, const float* lse14, const float* lse15,
     int num_shards,
     void* output_v,
     float* output_lse,
@@ -235,7 +220,7 @@ void glm_cp_merge_tree(
         return;
     }
 
-    const __nv_bfloat16* v_ptrs[16] = {
+    const __nv_bfloat16* v_ptrs[8] = {
         reinterpret_cast<const __nv_bfloat16*>(v0),
         reinterpret_cast<const __nv_bfloat16*>(v1),
         reinterpret_cast<const __nv_bfloat16*>(v2),
@@ -244,18 +229,9 @@ void glm_cp_merge_tree(
         reinterpret_cast<const __nv_bfloat16*>(v5),
         reinterpret_cast<const __nv_bfloat16*>(v6),
         reinterpret_cast<const __nv_bfloat16*>(v7),
-        reinterpret_cast<const __nv_bfloat16*>(v8),
-        reinterpret_cast<const __nv_bfloat16*>(v9),
-        reinterpret_cast<const __nv_bfloat16*>(v10),
-        reinterpret_cast<const __nv_bfloat16*>(v11),
-        reinterpret_cast<const __nv_bfloat16*>(v12),
-        reinterpret_cast<const __nv_bfloat16*>(v13),
-        reinterpret_cast<const __nv_bfloat16*>(v14),
-        reinterpret_cast<const __nv_bfloat16*>(v15),
     };
-    const float* lse_ptr_arr[16] = {
-        lse0, lse1, lse2, lse3, lse4, lse5, lse6, lse7,
-        lse8, lse9, lse10, lse11, lse12, lse13, lse14, lse15
+    const float* lse_ptr_arr[8] = {
+        lse0, lse1, lse2, lse3, lse4, lse5, lse6, lse7
     };
 
     launch_cp_merge_tree(

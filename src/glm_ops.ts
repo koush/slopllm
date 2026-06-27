@@ -143,15 +143,15 @@ interface NativeAddon {
   p2pAllGatherRow(ctx: number, instance: number, sendbuf: number, recvbuf: number, shardBytes: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number): void;
   p2pRmsnorm(ctx: number, instance: number, input: number, weight: number, output: number, eps: number, shardDim: number, fullDim: number, batch: number): void;
   p2pBarrier(ctx: number, instance: number, peerRank?: number): void;
-  cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, v8: number, v9: number, v10: number, v11: number, v12: number, v13: number, v14: number, v15: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, lse8: number, lse9: number, lse10: number, lse11: number, lse12: number, lse13: number, lse14: number, lse15: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads: number, headOffset: number, inputNHeads: number): void;
+  cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads: number, headOffset: number, inputNHeads: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number, offset: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
   add(ctx: number, out: number, a: number, b: number, n: number): void;
   addBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scale(ctx: number, out: number, input: number, scale: number, n: number): void;
-  sumPointers(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, p8: number, p9: number, p10: number, p11: number, p12: number, p13: number, p14: number, p15: number, out: number, n: number, numel: number, dtype: number): void;
-  flatAllReduce(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, p8: number, p9: number, p10: number, p11: number, p12: number, p13: number, p14: number, p15: number, n: number, numel: number, dtype: number, myRank: number): void;
+  sumPointers(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, out: number, n: number, numel: number, dtype: number): void;
+  flatAllReduce(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, n: number, numel: number, dtype: number, myRank: number): void;
   mul(ctx: number, out: number, a: number, b: number, n: number): void;
   mulBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
@@ -496,14 +496,12 @@ export class GlmTensor extends Tensor {
     const N = inputs.length;
     const numel = output.shape.reduce((a, b) => a * b, 1);
     const dtype = output.type === "F32" ? 7 : 9;
-    const ptrs = new Array<number>(16).fill(0);
+    const ptrs = new Array<number>(8).fill(0);
     for (let i = 0; i < N; i++) ptrs[i] = inputs[i].data;
     getNativeAddon().sumPointers(
       this.glm.ctx,
       ptrs[0], ptrs[1], ptrs[2], ptrs[3],
       ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-      ptrs[8], ptrs[9], ptrs[10], ptrs[11],
-      ptrs[12], ptrs[13], ptrs[14], ptrs[15],
       output.data, N, numel, dtype,
     );
   }
@@ -904,28 +902,25 @@ export class GlmOps implements DeviceOps {
     const snh = shardNHeads ?? numHeads;
     const ho = headOffset ?? 0;
     const inh = inputNHeads ?? numHeads;
-    const v = new Array<number>(16).fill(0);
+    const v = new Array<number>(8).fill(0);
     for (let i = 0; i < numShards; i++) v[i] = vPtrs[i];
-    const lse = new Array<number>(16).fill(0);
+    const lse = new Array<number>(8).fill(0);
     for (let i = 0; i < numShards; i++) lse[i] = lsePtrs[i];
     getNativeAddon().cpMergeTree(
       this.ctx,
       v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-      v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15],
       lse[0], lse[1], lse[2], lse[3], lse[4], lse[5], lse[6], lse[7],
-      lse[8], lse[9], lse[10], lse[11], lse[12], lse[13], lse[14], lse[15],
       numShards, ptr(outputV), outputLse ? ptr(outputLse) : 0, numel, batchSize, numHeads, vHeadDim,
       snh, ho, inh,
     );
   }
 
   flatAllReduce(ptrs: number[], N: number, numel: number, dtype: number, myRank: number): void {
-    const p = new Array<number>(16).fill(0);
+    const p = new Array<number>(8).fill(0);
     for (let i = 0; i < N; i++) p[i] = ptrs[i];
     getNativeAddon().flatAllReduce(
       this.ctx,
       p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
-      p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15],
       N, numel, dtype, myRank,
     );
   }

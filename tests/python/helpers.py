@@ -1747,13 +1747,13 @@ class GlmOps:
         snh = num_heads if shard_n_heads is None else shard_n_heads
         ho = 0 if head_offset is None else head_offset
         inh = num_heads if input_n_heads is None else input_n_heads
-        v_args = [ctypes.c_void_p(int(p)) for p in v_ptrs_int] + [ctypes.c_void_p(0)] * (16 - len(v_ptrs_int))
-        lse_args = [ctypes.c_void_p(int(p)) for p in lse_ptrs_int] + [ctypes.c_void_p(0)] * (16 - len(lse_ptrs_int))
+        v_args = [ctypes.c_void_p(int(p)) for p in v_ptrs_int] + [ctypes.c_void_p(0)] * (8 - len(v_ptrs_int))
+        lse_args = [ctypes.c_void_p(int(p)) for p in lse_ptrs_int] + [ctypes.c_void_p(0)] * (8 - len(lse_ptrs_int))
         self.lib.glm_cp_merge_tree.restype = None
         self.lib.glm_cp_merge_tree.argtypes = (
             [ctypes.c_void_p] +
-            [ctypes.c_void_p] * 16 +
-            [ctypes.c_void_p] * 16 +
+            [ctypes.c_void_p] * 8 +
+            [ctypes.c_void_p] * 8 +
             [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
              ctypes.c_int64, ctypes.c_int, ctypes.c_int, ctypes.c_int,
              ctypes.c_int, ctypes.c_int, ctypes.c_int]
