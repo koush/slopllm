@@ -66,6 +66,37 @@ static Napi::Value H2D(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value WritePointers(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, dst, p0, p1, p2, p3, p4, p5, p6, p7, n)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t dst_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t ptrs[8];
+    for (int i = 0; i < 8; i++) {
+        ptrs[i] = info[2 + i].As<Napi::Number>().Int64Value();
+    }
+    int n = info[10].As<Napi::Number>().Int32Value();
+    glm_write_pointers(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                       reinterpret_cast<void*>(dst_ptr),
+                       reinterpret_cast<void*>(ptrs[0]),
+                       reinterpret_cast<void*>(ptrs[1]),
+                       reinterpret_cast<void*>(ptrs[2]),
+                       reinterpret_cast<void*>(ptrs[3]),
+                       reinterpret_cast<void*>(ptrs[4]),
+                       reinterpret_cast<void*>(ptrs[5]),
+                       reinterpret_cast<void*>(ptrs[6]),
+                       reinterpret_cast<void*>(ptrs[7]),
+                       n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("writePointers failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value D2H(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 3) {
@@ -3512,6 +3543,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "alloc"), Napi::Function::New(env, Alloc));
     exports.Set(Napi::String::New(env, "freeBuf"), Napi::Function::New(env, FreeBuf));
     exports.Set(Napi::String::New(env, "h2d"), Napi::Function::New(env, H2D));
+    exports.Set(Napi::String::New(env, "writePointers"), Napi::Function::New(env, WritePointers));
     exports.Set(Napi::String::New(env, "d2h"), Napi::Function::New(env, D2H));
     exports.Set(Napi::String::New(env, "rmsnorm"), Napi::Function::New(env, Rmsnorm));
     exports.Set(Napi::String::New(env, "fusedAddRmsnorm"), Napi::Function::New(env, FusedAddRmsnorm));

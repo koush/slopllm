@@ -2944,6 +2944,39 @@ void glm_flat_allreduce(
     }
 }
 
+// ---------------------------------------------------------------------------
+// write_pointers: graph-capturable pointer array writer
+// ---------------------------------------------------------------------------
+
+__global__ void write_pointers_kernel(
+    void** dst,
+    void* p0, void* p1, void* p2, void* p3,
+    void* p4, void* p5, void* p6, void* p7,
+    int n)
+{
+    if (threadIdx.x < n) {
+        switch (threadIdx.x) {
+            case 0: dst[0] = p0; break;
+            case 1: dst[1] = p1; break;
+            case 2: dst[2] = p2; break;
+            case 3: dst[3] = p3; break;
+            case 4: dst[4] = p4; break;
+            case 5: dst[5] = p5; break;
+            case 6: dst[6] = p6; break;
+            case 7: dst[7] = p7; break;
+        }
+    }
+}
+
+void glm_write_pointers(GlmCtx* ctx, void* dst,
+                        void* p0, void* p1, void* p2, void* p3,
+                        void* p4, void* p5, void* p6, void* p7,
+                        int n) {
+    cudaSetDevice(ctx->device_id);
+    write_pointers_kernel<<<1, 8, 0, GLM_STREAM(ctx)>>>(
+        (void**)dst, p0, p1, p2, p3, p4, p5, p6, p7, n);
+}
+
 } // extern "C"
 
 

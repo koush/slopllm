@@ -32,6 +32,10 @@ void glm_free_buf(GlmCtx* ctx, void* ptr);
 
 void glm_h2d(GlmCtx* ctx, void* dst, const void* src, size_t bytes);
 void glm_d2h(GlmCtx* ctx, void* dst, const void* src, size_t bytes);
+void glm_write_pointers(GlmCtx* ctx, void* dst,
+                        void* p0, void* p1, void* p2, void* p3,
+                        void* p4, void* p5, void* p6, void* p7,
+                        int n);
 
 void* glm_mmap_open(const char* path);
 void glm_mmap_close(void* ptr, uint64_t size);

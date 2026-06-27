@@ -59,6 +59,7 @@ interface NativeAddon {
   alloc(ctx: number, size: number): number;
   freeBuf(ctx: number, ptr: number): void;
   h2d(ctx: number, dst: number, src: Buffer, size: number): void;
+  writePointers(ctx: number, dst: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, n: number): void;
   d2h(ctx: number, dst: Buffer, src: number, size: number): void;
   rmsnorm(ctx: number, out: number, input: number, weight: number, eps: number, dim: number, batch: number): void;
   fusedAddRmsnorm(ctx: number, out: number, residual: number, inputA: number, inputB: number, weight: number, eps: number, dim: number, batch: number): void;
@@ -247,11 +248,14 @@ export class GlmTensor extends Tensor {
   writePointers(tensors: Tensor[]): void {
     super.writePointers(tensors);
     const n = tensors.length;
-    const ptrs = new BigInt64Array(n);
+    if (n > 8) throw new Error(`writePointers: supports up to 8 pointers, got ${n}`);
+    const ptrs = new Array(8).fill(0);
     for (let i = 0; i < n; i++) {
-      ptrs[i] = BigInt(tensors[i].data);
+      ptrs[i] = tensors[i].data;
     }
-    this.h2d(Buffer.from(ptrs.buffer));
+    getNativeAddon().writePointers(this.glm.ctx, this.data,
+      ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+      ptrs[4], ptrs[5], ptrs[6], ptrs[7], n);
   }
 
   rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
