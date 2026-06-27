@@ -189,12 +189,14 @@ static void launch_cp_merge_tree(
         }
 
     switch (num_shards) {
+        case 1:  DISPATCH_VHEAD_DIM(1); break;
         case 2:  DISPATCH_VHEAD_DIM(2); break;
+        case 3:  DISPATCH_VHEAD_DIM(3); break;
         case 4:  DISPATCH_VHEAD_DIM(4); break;
         case 8:  DISPATCH_VHEAD_DIM(8); break;
         case 16: DISPATCH_VHEAD_DIM(16); break;
         default:
-            fprintf(stderr, "launch_cp_merge_tree: unsupported num_shards=%d (must be 2, 4, 8, or 16)\n", num_shards);
+            fprintf(stderr, "launch_cp_merge_tree: unsupported num_shards=%d (must be 1, 2, 3, 4, 8, or 16)\n", num_shards);
             break;
     }
 
