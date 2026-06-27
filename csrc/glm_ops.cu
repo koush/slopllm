@@ -1,7 +1,11 @@
 #include "glm_ops.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
 #include <cstdio>
+
+namespace cg = cooperative_groups;
 
 #define CUBLAS(ctx) (*reinterpret_cast<cublasHandle_t*>(&(ctx)->cublas_handle))
 
@@ -228,6 +232,7 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
 // Applies per-head RMSNorm then RoPE, with layout transpose.
 // ---------------------------------------------------------------------------
 
+template <bool kInterleaved>
 __global__ void __launch_bounds__(256, 4) fused_norm_rope_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ in,
@@ -235,7 +240,7 @@ __global__ void __launch_bounds__(256, 4) fused_norm_rope_kernel(
     const __nv_bfloat16* __restrict__ cos_emb,
     const __nv_bfloat16* __restrict__ sin_emb,
     float eps, int rope_dim, int head_dim,
-    int n_heads, int seq_len, int batch, int in_stride, bool interleaved
+    int n_heads, int seq_len, int batch, int in_stride
 ) {
     int bhs = blockIdx.x;
     int s = bhs % seq_len;
@@ -257,7 +262,7 @@ __global__ void __launch_bounds__(256, 4) fused_norm_rope_kernel(
         float ni = wi * xi * inv_rms;
 
         if (i < rope_dim) {
-            if (interleaved) {
+            if constexpr (kInterleaved) {
                 int cos_idx = cos_base + (i >> 1);
                 float ci = __bfloat162float(cos_emb[cos_idx]);
                 float si = __bfloat162float(sin_emb[cos_idx]);
@@ -285,11 +290,19 @@ void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
     int total_rows = batch * n_heads * seq_len;
     int block_size = compute_block_size(head_dim, true);
     size_t shared_mem = block_size * sizeof(float);
-    fused_norm_rope_kernel<<<total_rows, block_size, shared_mem, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
-        (const __nv_bfloat16*)weight,
-        (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
-        eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved);
+    if (interleaved) {
+        fused_norm_rope_kernel<true><<<total_rows, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
+            (const __nv_bfloat16*)weight,
+            (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
+            eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
+    } else {
+        fused_norm_rope_kernel<false><<<total_rows, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
+            (const __nv_bfloat16*)weight,
+            (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
+            eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -300,13 +313,14 @@ void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
 // Cos/sin embeddings: [batch, seq_len, rope_dim] (only used if rope_dim > 0)
 // ---------------------------------------------------------------------------
 
+template <bool kInterleaved>
 __global__ void __launch_bounds__(256, 4) rope_transpose_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ in,
     const __nv_bfloat16* __restrict__ cos_emb,
     const __nv_bfloat16* __restrict__ sin_emb,
     int rope_dim, int head_dim, int n_heads,
-    int seq_len, int batch, int in_stride, bool interleaved
+    int seq_len, int batch, int in_stride
 ) {
     int bhs = blockIdx.x;
     int s = bhs % seq_len;
@@ -322,7 +336,7 @@ __global__ void __launch_bounds__(256, 4) rope_transpose_kernel(
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         float xi = __bfloat162float(x[i]);
         if (i < rope_dim && rope_dim > 0) {
-            if (interleaved) {
+            if constexpr (kInterleaved) {
                 int cos_idx = cos_base + (i >> 1);
                 float ci = __bfloat162float(cos_emb[cos_idx]);
                 float si = __bfloat162float(sin_emb[cos_idx]);
@@ -350,10 +364,17 @@ void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
     cudaSetDevice(ctx->device_id);
     int total_rows = batch * n_heads * seq_len;
     int block_size = compute_block_size(head_dim, true);
-    rope_transpose_kernel<<<total_rows, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
-        (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
-        rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved);
+    if (interleaved) {
+        rope_transpose_kernel<true><<<total_rows, block_size, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
+            (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
+            rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
+    } else {
+        rope_transpose_kernel<false><<<total_rows, block_size, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
+            (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
+            rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,6 +1129,7 @@ void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
 // When head_dim == rope_dim, this reduces to the original behavior.
 // ---------------------------------------------------------------------------
 
+template <bool kInterleaved>
 __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* x,
@@ -1118,8 +1140,7 @@ __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
     int seq_len,
     int n_heads,
     int batch,
-    int unsqueeze_dim,
-    bool interleaved
+    int unsqueeze_dim
 ) {
     int total = batch * n_heads * seq_len * head_dim;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1150,7 +1171,7 @@ __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
         int cos_base = (b * seq_len + s) * rope_dim;
         float x_val = __bfloat162float(x[x_idx]);
 
-        if (interleaved) {
+        if constexpr (kInterleaved) {
             int cos_idx = cos_base + (d >> 1);
             float cos_val = __bfloat162float(cos_emb[cos_idx]);
             float sin_val = __bfloat162float(sin_emb[cos_idx]);
@@ -1188,10 +1209,17 @@ void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
     int total = batch * n_heads * seq_len * head_dim;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    apply_rotary_pos_emb_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
-        (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
-        rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim, interleaved);
+    if (interleaved) {
+        apply_rotary_pos_emb_kernel<true><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
+            (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
+            rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim);
+    } else {
+        apply_rotary_pos_emb_kernel<false><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
+            (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
+            rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2460,76 +2488,88 @@ __global__ void __launch_bounds__(256, 4) sum_pointers_kernel(
 
 // ---------------------------------------------------------------------------
 // Smem-staged sum of N tensors (element-wise, max 8 inputs)
-// Thread 0 issues N cp.async.bulk transfers (one per peer, covering the
-// entire block's tile) into peer-major smem, then the block waits on a
-// single mbarrier.  This uses the TMA/DMA engine for large contiguous P2P
-// reads instead of per-warp cg::memcpy_async fragments.
+// Double-buffered: while computing+writing from buf[0], buf[1] reads are
+// in flight. cg::wait_prior<N> lets us wait for buf[0] while buf[1] is
+// still pending. Uses cg::memcpy_async (no TMA, no alignment constraints).
 // ---------------------------------------------------------------------------
 
 #include <cuda/barrier>
 #include <cuda/ptx>
 
-template <typename scalar_t, int ElemsPerWarp>
+template <typename scalar_t, int ElemsPerWarp, int N>
 __global__ void __launch_bounds__(1024, 1)
 sum_pointers_smem_kernel(
     const scalar_t* p0,  const scalar_t* p1,  const scalar_t* p2,  const scalar_t* p3,
     const scalar_t* p4,  const scalar_t* p5,  const scalar_t* p6,  const scalar_t* p7,
     scalar_t* __restrict__ output,
-    int N,
     int64_t numel,
     int peer_stride)
 {
     constexpr int WarpSize = 32;
-    constexpr int MaxN = 8;
+
+    auto block = cg::this_thread_block();
 
     extern __shared__ char smem_raw[];
-    __shared__ cuda::barrier<cuda::thread_scope_block> bar;
 
     int warp_id = threadIdx.x / WarpSize;
     int lane    = threadIdx.x % WarpSize;
     int warps_per_block = blockDim.x / WarpSize;
 
-    const scalar_t* ptrs[MaxN] = {
-        p0, p1, p2, p3, p4, p5, p6, p7
+    const char* byte_ptrs[8] = {
+        reinterpret_cast<const char*>(p0), reinterpret_cast<const char*>(p1),
+        reinterpret_cast<const char*>(p2), reinterpret_cast<const char*>(p3),
+        reinterpret_cast<const char*>(p4), reinterpret_cast<const char*>(p5),
+        reinterpret_cast<const char*>(p6), reinterpret_cast<const char*>(p7),
     };
 
     int64_t block_stride = (int64_t)warps_per_block * ElemsPerWarp;
     int64_t total_blocks = gridDim.x;
     int64_t my_block_start = (int64_t)blockIdx.x * block_stride;
+    size_t buf_size = (size_t)N * peer_stride;
 
-    if (threadIdx.x == 0) {
-        init(&bar, blockDim.x);
-    }
-    __syncthreads();
+    // Prologue: issue chunk 0 into buf[0]
+    int64_t blk = my_block_start;
+    int64_t blk_next = blk + total_blocks * block_stride;
 
-    for (int64_t blk = my_block_start;
-         blk < numel;
-         blk += total_blocks * block_stride)
-    {
+    if (blk < numel) {
         int64_t elems = min(block_stride, numel - blk);
-        uint32_t copy_bytes = (uint32_t)(elems * sizeof(scalar_t));
-        copy_bytes = (copy_bytes + 15u) & ~15u;
-
-        if (threadIdx.x == 0) {
-            cuda::ptx::mbarrier_expect_tx(
-                cuda::ptx::sem_relaxed_t{},
-                cuda::ptx::scope_cta_t{},
-                cuda::ptx::space_shared_t{},
-                reinterpret_cast<uint64_t*>(&bar),
-                N * copy_bytes);
-            for (int j = 0; j < MaxN; j++) {
-                if (j >= N) break;
-                cuda::ptx::cp_async_bulk(
-                    cuda::ptx::space_shared_t{},
-                    cuda::ptx::space_global_t{},
-                    smem_raw + j * peer_stride,
-                    ptrs[j] + blk,
-                    copy_bytes,
-                    reinterpret_cast<uint64_t*>(&bar));
-            }
+        size_t copy_bytes = (size_t)elems * sizeof(scalar_t);
+        #pragma unroll
+        for (int j = 0; j < N; j++) {
+            cg::memcpy_async(block,
+                smem_raw + j * peer_stride,
+                byte_ptrs[j] + blk * sizeof(scalar_t),
+                copy_bytes);
         }
-        bar.arrive_and_wait();
+    }
 
+    // Issue chunk 1 into buf[1] (if exists)
+    if (blk_next < numel) {
+        int64_t elems = min(block_stride, numel - blk_next);
+        size_t copy_bytes = (size_t)elems * sizeof(scalar_t);
+        #pragma unroll
+        for (int j = 0; j < N; j++) {
+            cg::memcpy_async(block,
+                smem_raw + buf_size + j * peer_stride,
+                byte_ptrs[j] + blk_next * sizeof(scalar_t),
+                copy_bytes);
+        }
+    }
+
+    int buf = 0;
+    while (blk < numel) {
+        int next_buf = 1 - buf;
+        int64_t elems = min(block_stride, numel - blk);
+
+        // Wait for current buf (next buf still in flight, if any)
+        if (blk_next < numel) {
+            cg::wait_prior<N>(block);
+        } else {
+            cg::wait(block);
+        }
+
+        // Compute + scalar write from current buf (overlaps with next buf reads)
+        char* smem_buf = smem_raw + (size_t)buf * buf_size;
         int64_t warp_start = warp_id * ElemsPerWarp;
         int64_t warp_elems = min((int64_t)ElemsPerWarp, elems - warp_start);
 
@@ -2539,10 +2579,10 @@ sum_pointers_smem_kernel(
                 int64_t vec_elems = warp_elems / VEC * VEC;
                 for (int64_t i = lane * VEC; i < vec_elems; i += WarpSize * VEC) {
                     float2 acc = {0.0f, 0.0f};
-                    for (int j = 0; j < MaxN; j++) {
-                        if (j >= N) break;
+                    #pragma unroll
+                    for (int j = 0; j < N; j++) {
                         __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(
-                            smem_raw + j * peer_stride + (warp_start + i) * sizeof(__nv_bfloat16));
+                            smem_buf + j * peer_stride + (warp_start + i) * sizeof(__nv_bfloat16));
                         float2 f = __bfloat1622float2(v);
                         acc.x += f.x;
                         acc.y += f.y;
@@ -2552,28 +2592,52 @@ sum_pointers_smem_kernel(
                         __float22bfloat162_rn(acc);
                 }
                 int64_t tail_start = warp_start + vec_elems;
-                for (int64_t i = lane; i < warp_elems - vec_elems; i += WarpSize) {
-                    float acc = 0.0f;
-                    for (int j = 0; j < MaxN; j++) {
-                        if (j >= N) break;
-                        acc += __bfloat162float(
-                            reinterpret_cast<const __nv_bfloat16*>(
-                                smem_raw + j * peer_stride)[tail_start + i]);
+                for (int64_t i = lane * VEC; i < warp_elems - vec_elems; i += WarpSize * VEC) {
+                    float2 acc = {0.0f, 0.0f};
+                    #pragma unroll
+                    for (int j = 0; j < N; j++) {
+                        __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(
+                            smem_buf + j * peer_stride + (tail_start + i) * sizeof(__nv_bfloat16));
+                        float2 f = __bfloat1622float2(v);
+                        acc.x += f.x;
+                        acc.y += f.y;
                     }
-                    output[blk + tail_start + i] = __float2bfloat16(acc);
+                    *reinterpret_cast<__nv_bfloat162*>(
+                        reinterpret_cast<char*>(output) + (blk + tail_start + i) * sizeof(__nv_bfloat16)) =
+                        __float22bfloat162_rn(acc);
                 }
             } else {
                 for (int64_t i = lane; i < warp_elems; i += WarpSize) {
                     float acc = 0.0f;
-                    for (int j = 0; j < MaxN; j++) {
-                        if (j >= N) break;
+                    #pragma unroll
+                    for (int j = 0; j < N; j++) {
                         acc += reinterpret_cast<const float*>(
-                            smem_raw + j * peer_stride)[warp_start + i];
+                            smem_buf + j * peer_stride)[warp_start + i];
                     }
                     output[blk + warp_start + i] = acc;
                 }
             }
         }
+        __syncthreads();
+
+        // Prefetch chunk+2 into current buf (if exists)
+        int64_t blk_pf = blk_next + total_blocks * block_stride;
+        if (blk_pf < numel) {
+            int64_t pf_elems = min(block_stride, numel - blk_pf);
+            size_t pf_bytes = (size_t)pf_elems * sizeof(scalar_t);
+            char* pf_smem = smem_raw + (size_t)buf * buf_size;
+            #pragma unroll
+            for (int j = 0; j < N; j++) {
+                cg::memcpy_async(block,
+                    pf_smem + j * peer_stride,
+                    byte_ptrs[j] + blk_pf * sizeof(scalar_t),
+                    pf_bytes);
+            }
+        }
+
+        buf = next_buf;
+        blk = blk_next;
+        blk_next = blk_pf;
     }
 }
 
@@ -2851,13 +2915,13 @@ void glm_sum_pointers(GlmCtx* ctx,
 
     constexpr int ElemsPerWarp = 512;
     constexpr int WarpSize = 32;
-    constexpr int SmemBudget = 32 * 1024;
+    constexpr int SmemBudget = 64 * 1024;  // doubled for double-buffering
 
     int elem_size = (dtype == 9) ? 2 : 4;
     int smem_per_warp = N * ElemsPerWarp * elem_size;
     if (smem_per_warp < 1) smem_per_warp = 1;
 
-    int warps_per_block = SmemBudget / smem_per_warp;
+    int warps_per_block = SmemBudget / (2 * smem_per_warp);
     if (warps_per_block > 32) warps_per_block = 32;
     if (warps_per_block < 1) warps_per_block = 1;
 
@@ -2866,22 +2930,36 @@ void glm_sum_pointers(GlmCtx* ctx,
     if (total_warps == 0) total_warps = 1;
     int grid = (total_warps + warps_per_block - 1) / warps_per_block;
 
-    // Peer-major smem layout: each peer's data for all warps is contiguous
-    // so thread 0 can issue one cp.async.bulk per peer covering the full block tile.
     int peer_stride = warps_per_block * ElemsPerWarp * elem_size;
-    int smem_bytes = N * peer_stride;
+    int smem_bytes = 2 * N * peer_stride;
+
+#define DISPATCH_SUM(DTYPE, N_VAL) \
+    do { \
+        cudaFuncSetAttribute( \
+            (void*)sum_pointers_smem_kernel<DTYPE, ElemsPerWarp, N_VAL>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes); \
+        sum_pointers_smem_kernel<DTYPE, ElemsPerWarp, N_VAL><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>( \
+            (const DTYPE*)p0, (const DTYPE*)p1, (const DTYPE*)p2, (const DTYPE*)p3, \
+            (const DTYPE*)p4, (const DTYPE*)p5, (const DTYPE*)p6, (const DTYPE*)p7, \
+            (DTYPE*)output, numel, peer_stride); \
+    } while(0)
 
     if (dtype == 9) {
-        sum_pointers_smem_kernel<__nv_bfloat16, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
-            (const __nv_bfloat16*)p0,  (const __nv_bfloat16*)p1,  (const __nv_bfloat16*)p2,  (const __nv_bfloat16*)p3,
-            (const __nv_bfloat16*)p4,  (const __nv_bfloat16*)p5,  (const __nv_bfloat16*)p6,  (const __nv_bfloat16*)p7,
-            (__nv_bfloat16*)output, N, numel, peer_stride);
+        switch (N) {
+            case 2: DISPATCH_SUM(__nv_bfloat16, 2); break;
+            case 4: DISPATCH_SUM(__nv_bfloat16, 4); break;
+            case 8: DISPATCH_SUM(__nv_bfloat16, 8); break;
+            default: fprintf(stderr, "glm_sum_pointers: unsupported N=%d\n", N); break;
+        }
     } else {
-        sum_pointers_smem_kernel<float, ElemsPerWarp><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>(
-            (const float*)p0,  (const float*)p1,  (const float*)p2,  (const float*)p3,
-            (const float*)p4,  (const float*)p5,  (const float*)p6,  (const float*)p7,
-            (float*)output, N, numel, peer_stride);
+        switch (N) {
+            case 2: DISPATCH_SUM(float, 2); break;
+            case 4: DISPATCH_SUM(float, 4); break;
+            case 8: DISPATCH_SUM(float, 8); break;
+            default: fprintf(stderr, "glm_sum_pointers: unsupported N=%d\n", N); break;
+        }
     }
+#undef DISPATCH_SUM
 }
 
 void glm_flat_allreduce(
