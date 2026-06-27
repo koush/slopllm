@@ -872,9 +872,13 @@ export class ParallelTensor extends Tensor {
     super.siluAndMul(up, intermediate, batch);
     const pUp = up as ParallelTensor;
 
+    if (this.parallelism === TensorParallelism.Column || pUp.parallelism === TensorParallelism.Column) {
+      throw new Error(`siluAndMul: unsupported parallelism this=${this.parallelism}, up=${pUp.parallelism}`);
+    }
+
     if (this.parallelism === pUp.parallelism) {
       const outPar = this.parallelism;
-      const shardIntermediate = this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column
+      const shardIntermediate = this.parallelism === TensorParallelism.Row
         ? intermediate / this.worldSize
         : intermediate;
       const shards: Tensor[] = [];
@@ -1036,7 +1040,10 @@ export class ParallelTensor extends Tensor {
     const pBRaw = this.cast(bRaw);
     const pALog = this.cast(aLog);
     const pDtBias = this.cast(dtBias);
-    const isRowPar = pQkv.parallelism === TensorParallelism.Row || pQkv.parallelism === TensorParallelism.Column;
+    if (pQkv.parallelism === TensorParallelism.Column) {
+      throw new Error(`gdnRecurrentStep: unsupported qkv parallelism ${pQkv.parallelism}`);
+    }
+    const isRowPar = pQkv.parallelism === TensorParallelism.Row;
     const shardHeads = isRowPar ? this.shardDim(numHeads, "gdnRecurrentStep numHeads") : numHeads;
     const shardStateStride = isRowPar ? stateStride / this.worldSize : stateStride;
     const shardSeqStride = isRowPar ? qkvSeqStride / this.worldSize : qkvSeqStride;
@@ -1054,7 +1061,10 @@ export class ParallelTensor extends Tensor {
     const pALog = this.cast(aLog);
     const pDtBias = this.cast(dtBias);
     const pCuSeqlens = this.cast(cuSeqlens);
-    const isRowPar = pQkv.parallelism === TensorParallelism.Row || pQkv.parallelism === TensorParallelism.Column;
+    if (pQkv.parallelism === TensorParallelism.Column) {
+      throw new Error(`gdnPrefill: unsupported qkv parallelism ${pQkv.parallelism}`);
+    }
+    const isRowPar = pQkv.parallelism === TensorParallelism.Row;
     const shardHeads = isRowPar ? this.shardDim(numHeads, "gdnPrefill numHeads") : numHeads;
     const shardStateStride = isRowPar ? stateStride / this.worldSize : stateStride;
     const shardSeqStride = isRowPar ? qkvSeqStride / this.worldSize : qkvSeqStride;
@@ -1069,7 +1079,10 @@ export class ParallelTensor extends Tensor {
     const pInput = this.cast(input);
     const pWeight = this.cast(weight);
     const pCuSeqlens = this.cast(cuSeqlens);
-    const isRowPar = pInput.parallelism === TensorParallelism.Row || pInput.parallelism === TensorParallelism.Column;
+    if (pInput.parallelism === TensorParallelism.Column) {
+      throw new Error(`causalConv1d: unsupported input parallelism ${pInput.parallelism}`);
+    }
+    const isRowPar = pInput.parallelism === TensorParallelism.Row;
     const shardConvDim = isRowPar ? convDim / this.worldSize : convDim;
     const shardConvStateStride = isRowPar ? convStateStride / this.worldSize : convStateStride;
     const shardSeqStride = isRowPar ? seqStride / this.worldSize : seqStride;
@@ -1083,7 +1096,10 @@ export class ParallelTensor extends Tensor {
     const pConvState = this.cast(convState);
     const pInput = input as ParallelTensor;
     const pWeight = this.cast(weight);
-    const isRowPar = pInput.parallelism === TensorParallelism.Row || pInput.parallelism === TensorParallelism.Column;
+    if (pInput.parallelism === TensorParallelism.Column) {
+      throw new Error(`causalConv1dUpdate: unsupported input parallelism ${pInput.parallelism}`);
+    }
+    const isRowPar = pInput.parallelism === TensorParallelism.Row;
     const parallelism = isRowPar ? TensorParallelism.Row : TensorParallelism.Replicated;
     const shardConvDim = isRowPar ? convDim / this.worldSize : convDim;
     const shardConvStateStride = isRowPar ? convStateStride / this.worldSize : convStateStride;
@@ -1145,8 +1161,12 @@ export class ParallelTensor extends Tensor {
     super.gateSigmoidMul(gate, batchSeq, numHeads, headDim);
     const pGate = gate as ParallelTensor;
 
+    if (this.parallelism === TensorParallelism.Column || pGate.parallelism === TensorParallelism.Column) {
+      throw new Error(`gateSigmoidMul: unsupported parallelism this=${this.parallelism}, gate=${pGate.parallelism}`);
+    }
+
     if (this.parallelism === pGate.parallelism) {
-      const shardNumHeads = this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column
+      const shardNumHeads = this.parallelism === TensorParallelism.Row
         ? this.shardDim(numHeads, "gateSigmoidMul numHeads")
         : numHeads;
       for (let i = 0; i < this.worldSize; i++) {
@@ -1155,7 +1175,7 @@ export class ParallelTensor extends Tensor {
       return;
     }
 
-    if ((this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) && pGate.parallelism === TensorParallelism.Replicated) {
+    if (this.parallelism === TensorParallelism.Row && pGate.parallelism === TensorParallelism.Replicated) {
       using gathered = this.allGather(this.workspace);
       gathered.gateSigmoidMul(gate, batchSeq, numHeads, headDim);
       for (let i = 0; i < this.worldSize; i++) {
@@ -1377,10 +1397,13 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism === TensorParallelism.PartialSum) {
       throw new Error("reduceSum: unsupported input parallelism PartialSum (allReduce first)");
     }
+    if (this.parallelism === TensorParallelism.Column) {
+      throw new Error(`reduceSum: unsupported input parallelism ${this.parallelism}`);
+    }
     const outShards: Tensor[] = [];
-    const isSharded = this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column;
+    const isSharded = this.parallelism === TensorParallelism.Row;
     const shardDim = isSharded ? this.parallelOps.shardDim(dim, "reduceSum dim") : dim;
-    const shardBatch = isSharded ? batch : batch;
+    const shardBatch = batch;
     for (let i = 0; i < this.worldSize; i++) {
       outShards.push(this.shards[i].reduceSum(shardDim, shardBatch));
     }
@@ -1491,12 +1514,12 @@ export class ParallelTensor extends Tensor {
     if (pSin && pSin.parallelism !== TensorParallelism.Replicated) {
       throw new Error(`ropeTranspose: sin must be Replicated, got ${pSin.parallelism}`);
     }
-    const shardNHeads = (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column)
-      ? this.parallelOps.shardDim(nHeads, "ropeTranspose nHeads")
-      : nHeads;
-    if (this.parallelism === TensorParallelism.PartialSum) {
+    if (this.parallelism === TensorParallelism.PartialSum || this.parallelism === TensorParallelism.Column) {
       throw new Error(`ropeTranspose: unsupported input parallelism ${this.parallelism}`);
     }
+    const shardNHeads = this.parallelism === TensorParallelism.Row
+      ? this.parallelOps.shardDim(nHeads, "ropeTranspose nHeads")
+      : nHeads;
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       const shardCos = pCos ? pCos.shards[i] : undefined!;
@@ -1516,10 +1539,10 @@ export class ParallelTensor extends Tensor {
     if (pSin.parallelism !== TensorParallelism.Replicated) {
       throw new Error(`applyRotaryPosEmb: sin must be Replicated, got ${pSin.parallelism}`);
     }
-    if (this.parallelism === TensorParallelism.PartialSum) {
+    if (this.parallelism === TensorParallelism.PartialSum || this.parallelism === TensorParallelism.Column) {
       throw new Error(`applyRotaryPosEmb: unsupported input parallelism ${this.parallelism}`);
     }
-    const shardNHeads = (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column)
+    const shardNHeads = this.parallelism === TensorParallelism.Row
       ? this.parallelOps.shardDim(nHeads, "applyRotaryPosEmb nHeads")
       : nHeads;
     const outShards: Tensor[] = [];
@@ -1532,15 +1555,16 @@ export class ParallelTensor extends Tensor {
   mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, lse?: Tensor): Tensor {
     super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
     const pVProj = vProj as ParallelTensor;
-    if (this.parallelism === TensorParallelism.PartialSum || pVProj.parallelism === TensorParallelism.PartialSum) {
+    if (this.parallelism === TensorParallelism.PartialSum || this.parallelism === TensorParallelism.Column ||
+        pVProj.parallelism === TensorParallelism.PartialSum || pVProj.parallelism === TensorParallelism.Column) {
       throw new Error(`mlaVExpand: unsupported parallelism this=${this.parallelism}, vProj=${pVProj.parallelism}`);
     }
-    const shardNHeads = (pVProj.parallelism === TensorParallelism.Row || pVProj.parallelism === TensorParallelism.Column)
+    const shardNHeads = pVProj.parallelism === TensorParallelism.Row
       ? this.parallelOps.shardDim(nHeads, "mlaVExpand nHeads")
       : nHeads;
     const isPartialSoftmax = this.parallelism === TensorParallelism.PartialSoftmax;
     const attnNHeads = isPartialSoftmax ? nHeads : shardNHeads;
-    const isVProjSharded = pVProj.parallelism === TensorParallelism.Row || pVProj.parallelism === TensorParallelism.Column;
+    const isVProjSharded = pVProj.parallelism === TensorParallelism.Row;
     const isCp = this.parallelism === TensorParallelism.PartialSoftmax;
     if (isCp && isVProjSharded) {
       throw new Error(`mlaVExpand: context parallelism requires replicated v_proj, got ${pVProj.parallelism}`);

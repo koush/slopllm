@@ -133,7 +133,7 @@ describe("ParallelOps.ropeTranspose", () => {
     glm1.free();
   });
 
-  it("Column-parallel ropeTranspose no-RoPE matches single-GPU", () => {
+  it("Row-parallel ropeTranspose no-RoPE matches single-GPU", () => {
     const batch = 2;
     const nHeads = 4;
     const seqLen = 3;
@@ -154,7 +154,7 @@ describe("ParallelOps.ropeTranspose", () => {
     refOut.d2h(refBuf);
     const refF32 = bf16BytesToF32(refBuf);
 
-    const pInput = ws.alloc([totalRows, nHeads * headDim], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    const pInput = ws.alloc([totalRows, nHeads * headDim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
     const shard0F32 = shardColumnHeads(inputF32, totalRows, nHeads, headDim, 0, 2);
     const shard1F32 = shardColumnHeads(inputF32, totalRows, nHeads, headDim, 1, 2);
     pInput.shard(0).h2d(f32ToBf16Bytes(shard0F32));
@@ -164,7 +164,7 @@ describe("ParallelOps.ropeTranspose", () => {
     const pOut = pInput.ropeTranspose(undefined!, undefined!, ropeDim, headDim, nHeads, seqLen, batch) as ParallelTensor;
     po.synchronize();
 
-    assert.equal(pOut.parallelism, TensorParallelism.Column);
+    assert.equal(pOut.parallelism, TensorParallelism.Row);
     assert.deepEqual(pOut.shape, [batch * seqLen, nHeads, headDim]);
     assert.deepEqual(pOut.shard(0).shape, [batch * seqLen, nHeads / 2, headDim]);
 
@@ -231,7 +231,7 @@ describe("ParallelOps.ropeTranspose", () => {
     pInput[Symbol.dispose]();
   });
 
-  it("Column-parallel ropeTranspose with RoPE matches single-GPU", () => {
+  it("Row-parallel ropeTranspose with RoPE matches single-GPU", () => {
     const batch = 1;
     const nHeads = 4;
     const seqLen = 4;
@@ -283,7 +283,7 @@ describe("ParallelOps.ropeTranspose", () => {
     const { cos: pCos, sin: pSin } = pInvFreq.rotaryEmbedding(pPosIds, dimHalf, batch, seqLen);
     po.synchronize();
 
-    const pInput = ws.alloc([totalRows, nHeads * headDim], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    const pInput = ws.alloc([totalRows, nHeads * headDim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
     const shard0F32 = shardColumnHeads(inputF32, totalRows, nHeads, headDim, 0, 2);
     const shard1F32 = shardColumnHeads(inputF32, totalRows, nHeads, headDim, 1, 2);
     pInput.shard(0).h2d(f32ToBf16Bytes(shard0F32));
@@ -345,7 +345,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     glm1.free();
   });
 
-  it("Column-parallel applyRotaryPosEmb matches single-GPU", () => {
+  it("Row-parallel applyRotaryPosEmb matches single-GPU", () => {
     const batch = 2;
     const nHeads = 4;
     const seqLen = 4;
@@ -393,7 +393,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     const { cos: pCos, sin: pSin } = pInvFreq.rotaryEmbedding(pPosIds, dimHalf, batch, seqLen);
     po.synchronize();
 
-    const pInput = ws.alloc([batch * nHeads, seqLen, ropeDim], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    const pInput = ws.alloc([batch * nHeads, seqLen, ropeDim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
     const shardHeads = nHeads / 2;
     const rowLen = seqLen * ropeDim;
     const shard0F32 = new Float32Array(batch * shardHeads * rowLen);
@@ -416,7 +416,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     const pOut = pInput.applyRotaryPosEmb(pCos, pSin, ropeDim, nHeads, seqLen, batch, 1) as ParallelTensor;
     po.synchronize();
 
-    assert.equal(pOut.parallelism, TensorParallelism.Column);
+    assert.equal(pOut.parallelism, TensorParallelism.Row);
 
     const shardSize = batch * shardHeads * seqLen * ropeDim;
     const out0Buf = Buffer.alloc(shardSize * 2);
@@ -593,7 +593,7 @@ describe("ParallelOps.mlaVExpand", () => {
     return result;
   }
 
-  it("Column-parallel mlaVExpand matches single-GPU", () => {
+  it("Row-parallel mlaVExpand matches single-GPU", () => {
     const batch = 1;
     const seqLen = 2;
     const nHeads = 4;
@@ -625,7 +625,7 @@ describe("ParallelOps.mlaVExpand", () => {
       assert.ok(relErr < 0.1, `ref i=${i}: expected ${expected[i]}, got ${refF32[i]} (relErr=${relErr})`);
     }
 
-    const pAttnOut = ws.alloc([batch * nHeads, seqLen, kvLoraRank], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    const pAttnOut = ws.alloc([batch * nHeads, seqLen, kvLoraRank], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
     const shardHeads = nHeads / 2;
 
     const attnShard0 = new Float32Array(batch * shardHeads * seqLen * kvLoraRank);
@@ -657,7 +657,7 @@ describe("ParallelOps.mlaVExpand", () => {
     pAttnOut.shard(0).h2d(f32ToBf16Bytes(attnShard0));
     pAttnOut.shard(1).h2d(f32ToBf16Bytes(attnShard1));
 
-    const pVProj = ws.alloc([nHeads * kvLoraRank, vHeadDim], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+    const pVProj = ws.alloc([nHeads * kvLoraRank, vHeadDim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
     pVProj.shard(0).h2d(f32ToBf16Bytes(vProjShard0));
     pVProj.shard(1).h2d(f32ToBf16Bytes(vProjShard1));
     po.synchronize();
@@ -665,7 +665,7 @@ describe("ParallelOps.mlaVExpand", () => {
     const pOut = pAttnOut.mlaVExpand(pVProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch) as ParallelTensor;
     po.synchronize();
 
-    assert.equal(pOut.parallelism, TensorParallelism.Column);
+    assert.equal(pOut.parallelism, TensorParallelism.Row);
 
     const BS = batch * seqLen;
     const shardOutSize = BS * shardHeads * vHeadDim;

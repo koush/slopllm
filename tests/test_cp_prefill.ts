@@ -288,7 +288,7 @@ function runCpPrefillTest(
     }
   }
 
-  console.log(`CP prefill (seqLen=${seqLen}, batch=${batchSize}, pageSize=${pageSize}, worldSize=${worldSize}): maxAbsErr=${maxAbsErr.toFixed(6)} maxRelErrForSignificant=${maxRelErrForSignificant.toFixed(6)} errors=${errorCount}/${totalElems}`);
+  // console.log(`CP prefill (seqLen=${seqLen}, batch=${batchSize}, pageSize=${pageSize}, worldSize=${worldSize}): maxAbsErr=${maxAbsErr.toFixed(6)} maxRelErrForSignificant=${maxRelErrForSignificant.toFixed(6)} errors=${errorCount}/${totalElems}`);
   assert.ok(errorCount === 0, `${errorCount}/${totalElems} elements exceed tolerance (atol=${ABS_TOL}, rtol=${REL_TOL})`);
 }
 
