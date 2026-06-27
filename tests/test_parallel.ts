@@ -290,9 +290,9 @@ describe("ParallelTensor disposal and recycling", () => {
     pt[Symbol.dispose]();
 
     assert.ok(!ws.tracked.has(pt), "ParallelTensor should be removed from main workspace tracked");
-    assert.ok(!ws.disposed.has(pt), "ParallelTensor should NOT be in main workspace disposed");
-    assert.equal(sws[0].disposed.size, 1, "shard 0 should be in device 0 workspace disposed");
-    assert.equal(sws[1].disposed.size, 1, "shard 1 should be in device 1 workspace disposed");
+    assert.ok(!ws.disposedDevice.has(pt), "ParallelTensor should NOT be in main workspace disposed");
+    assert.equal(sws[0].disposedDevice.size, 1, "shard 0 should be in device 0 workspace disposed");
+    assert.equal(sws[1].disposedDevice.size, 1, "shard 1 should be in device 1 workspace disposed");
 
     ws.free();
     po.free();
@@ -319,8 +319,8 @@ describe("ParallelTensor disposal and recycling", () => {
     }
 
     const sws = po.shardWorkspacesFor(ws);
-    assert.equal(sws[0].disposed.size, 1, "device 0 disposed should have 1 shard after scope exit");
-    assert.equal(sws[1].disposed.size, 1, "device 1 disposed should have 1 shard after scope exit");
+    assert.equal(sws[0].disposedDevice.size, 1, "device 0 disposed should have 1 shard after scope exit");
+    assert.equal(sws[1].disposedDevice.size, 1, "device 1 disposed should have 1 shard after scope exit");
 
     const pt2 = ws.alloc([8, 4], "F32", undefined, TensorParallelism.Column) as ParallelTensor;
     assert.equal(pt2.shard(0).data, s0_data, "shard 0 buffer should be recycled");
@@ -347,8 +347,8 @@ describe("ParallelTensor disposal and recycling", () => {
     }
 
     const sws = po.shardWorkspacesFor(ws);
-    assert.equal(sws[0].disposed.size, 1, "shard 0 should be recycled after using scope");
-    assert.equal(sws[1].disposed.size, 1, "shard 1 should be recycled after using scope");
+    assert.equal(sws[0].disposedDevice.size, 1, "shard 0 should be recycled after using scope");
+    assert.equal(sws[1].disposedDevice.size, 1, "shard 1 should be recycled after using scope");
 
     ws.free();
     po.free();
@@ -378,11 +378,11 @@ describe("ParallelTensor disposal and recycling", () => {
     assert.equal(sws2[0].tracked.size, 1, "ws2 device 0 should have 1 tracked shard");
 
     pt1[Symbol.dispose]();
-    assert.equal(sws1[0].disposed.size, 1, "ws1 device 0 should have 1 disposed after pt1 disposed");
-    assert.equal(sws2[0].disposed.size, 0, "ws2 device 0 should have 0 disposed (unaffected)");
+    assert.equal(sws1[0].disposedDevice.size, 1, "ws1 device 0 should have 1 disposed after pt1 disposed");
+    assert.equal(sws2[0].disposedDevice.size, 0, "ws2 device 0 should have 0 disposed (unaffected)");
 
     pt2[Symbol.dispose]();
-    assert.equal(sws2[0].disposed.size, 1, "ws2 device 0 should have 1 disposed after pt2 disposed");
+    assert.equal(sws2[0].disposedDevice.size, 1, "ws2 device 0 should have 1 disposed after pt2 disposed");
 
     ws1.free();
     ws2.free();
