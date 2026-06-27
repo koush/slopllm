@@ -816,25 +816,26 @@ p2p_allgather_smem_kernel(
 
     // Per-iteration smem: one bs-sized slot per peer (1024 bytes, 16-aligned).
     int peer_stride = bs;
+    bool use_tma = (shard_bytes % 16 == 0);
 
-    for (int64_t blk = (int64_t)blockIdx.x * bs;
-         blk < (int64_t)shard_bytes;
-         blk += (int64_t)gridDim.x * bs)
-    {
-        int64_t elems = min((int64_t)bs, (int64_t)shard_bytes - blk);
+    if (use_tma) {
+        for (int64_t blk = (int64_t)blockIdx.x * bs;
+             blk < (int64_t)shard_bytes;
+             blk += (int64_t)gridDim.x * bs)
+        {
+            int64_t elems = min((int64_t)bs, (int64_t)shard_bytes - blk);
 
-        // Issue all async reads (P2P global → smem)
-        #pragma unroll
-        for (int s = 0; s < N; s++) {
-            cg::memcpy_async(block,
-                smem_raw + s * peer_stride,
-                rotated_ptrs[s] + blk,
-                elems);
-        }
-        cg::wait(block);
+            // Issue all async reads (P2P global → smem)
+            #pragma unroll
+            for (int s = 0; s < N; s++) {
+                cg::memcpy_async(block,
+                    smem_raw + s * peer_stride,
+                    rotated_ptrs[s] + blk,
+                    elems);
+            }
+            cg::wait(block);
 
-        // Queue all N TMA bulk stores (smem → global), then wait once.
-        if (elems % 16 == 0) {
+            // Queue all N TMA bulk stores (smem → global), then wait once.
             if (tid == 0) {
                 #pragma unroll
                 for (int s = 0; s < N; s++) {
@@ -851,8 +852,29 @@ p2p_allgather_smem_kernel(
                 cuda::ptx::cp_async_bulk_commit_group();
                 cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
             }
-        } else {
-            // Scalar fallback for sub-16-byte tail
+
+            __syncthreads();
+        }
+    }
+    else
+    {
+        for (int64_t blk = (int64_t)blockIdx.x * bs;
+             blk < (int64_t)shard_bytes;
+             blk += (int64_t)gridDim.x * bs)
+        {
+            int64_t elems = min((int64_t)bs, (int64_t)shard_bytes - blk);
+
+            // Issue all async reads (P2P global → smem)
+            #pragma unroll
+            for (int s = 0; s < N; s++) {
+                cg::memcpy_async(block,
+                    smem_raw + s * peer_stride,
+                    rotated_ptrs[s] + blk,
+                    elems);
+            }
+            cg::wait(block);
+
+            // Scalar fallback for sub-16-byte sizes
             #pragma unroll
             for (int s = 0; s < N; s++) {
                 int actual_peer = (s + rot) % N;
@@ -863,8 +885,8 @@ p2p_allgather_smem_kernel(
                     dst[i] = src[i];
                 }
             }
+            __syncthreads();
         }
-        __syncthreads();
     }
 }
 
