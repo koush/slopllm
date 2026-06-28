@@ -490,10 +490,12 @@ constexpr int NVFP4_GEMM_N_TILE = 32;
 constexpr int NVFP4_GEMM_K_TILE = 128;
 constexpr int NVFP4_GEMM_BLOCK_DIM = NVFP4_GEMM_M_TILE * NVFP4_GEMM_N_TILE;
 // Narrow M-tile used when M <= NVFP4_GEMM_SMALL_M_THRESHOLD (e.g. MTP
-// verification batches): quadruples grid.y vs. NVFP4_GEMM_M_TILE=16 while still
-// reusing each decoded weight tile across 4 rows. See the kernel comment for
+// verification batches): doubles grid.y vs. NVFP4_GEMM_M_TILE=16 while still
+// reusing each decoded weight tile across 8 rows. See the kernel comment for
 // why this trades less reuse for more occupancy than the M_TILE=16 variant.
-constexpr int NVFP4_GEMM_SMALL_M_TILE = 4;
+// M_TILE=8 (vs the previous 4) eliminates redundant weight decode for M=5-8:
+// grid.y=1 instead of 2, so each weight tile is decoded once not twice.
+constexpr int NVFP4_GEMM_SMALL_M_TILE = 8;
 constexpr int NVFP4_GEMM_SMALL_M_THRESHOLD = 32;
 // When M > 1 and N is small, the smem GEMM kernel launches too few CTAs to
 // fill the GPU (e.g. N=256 → grid.x=8 → only 32 CTAs at M=15).  cuBLAS with
