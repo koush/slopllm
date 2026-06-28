@@ -473,6 +473,14 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
     // Keep block_size <= 256 (matching __launch_bounds__): rows_per_block = 256 / threads_per_row.
     int threads_per_row = compute_block_size(v_head_dim / 2, true);
     int rows_per_block = max(1, 256 / threads_per_row);
+    // For short sequences (2-8 tokens), pack more rows per block so that all
+    // seq positions for one head land in a single block. This loads the v_proj
+    // weight for that head once and reuses it across all seq positions via
+    // L1/L2 cache, instead of loading it from separate blocks.
+    if (seq_len >= 2 && seq_len <= 8 && rows_per_block < 8) {
+        rows_per_block = 8;
+        threads_per_row = 256 / rows_per_block;
+    }
     int block_size = rows_per_block * threads_per_row;
     int grid = (total_rows + rows_per_block - 1) / rows_per_block;
     size_t shmem_size = rows_per_block * kv_lora_rank * sizeof(float);
