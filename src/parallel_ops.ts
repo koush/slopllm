@@ -1555,11 +1555,11 @@ export class ParallelTensor extends Tensor {
   mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, lse?: Tensor): Tensor {
     super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
     const pVProj = vProj as ParallelTensor;
-    if (this.parallelism === TensorParallelism.PartialSum || this.parallelism === TensorParallelism.Column ||
-        pVProj.parallelism === TensorParallelism.PartialSum || pVProj.parallelism === TensorParallelism.Column) {
-      throw new Error(`mlaVExpand: unsupported parallelism this=${this.parallelism}, vProj=${pVProj.parallelism}`);
-    }
-    const shardNHeads = pVProj.parallelism === TensorParallelism.Row
+    // if (this.parallelism === TensorParallelism.PartialSum || this.parallelism === TensorParallelism.Column ||
+    //     pVProj.parallelism === TensorParallelism.PartialSum || pVProj.parallelism === TensorParallelism.Column) {
+    //   throw new Error(`mlaVExpand: unsupported parallelism this=${this.parallelism}, vProj=${pVProj.parallelism}`);
+    // }
+    const shardNHeads = (pVProj.parallelism === TensorParallelism.Row || pVProj.parallelism === TensorParallelism.Column)
       ? this.parallelOps.shardDim(nHeads, "mlaVExpand nHeads")
       : nHeads;
     const isPartialSoftmax = this.parallelism === TensorParallelism.PartialSoftmax;
