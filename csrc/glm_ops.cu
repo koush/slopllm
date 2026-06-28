@@ -142,7 +142,11 @@ __global__ void __launch_bounds__(256, 4) rmsnorm_kernel(
 void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
                  const void* weight, float eps, int dim, int batch) {
     cudaSetDevice(ctx->device_id);
-    int block_size = compute_block_size(dim);
+    // For large dim and small batch, use 1024 threads per block to increase
+    // the number of outstanding memory requests per SM (32 warps vs 8),
+    // improving memory latency hiding when only a few blocks are active.
+    int max_block = (dim >= 4096 && batch < 64) ? 1024 : 256;
+    int block_size = compute_block_size(dim, false, max_block);
     size_t shared_mem = block_size * sizeof(float);
     rmsnorm_kernel<<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
@@ -217,7 +221,8 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
                             const void* input_a, const void* input_b,
                             const void* weight, float eps, int dim, int batch) {
     cudaSetDevice(ctx->device_id);
-    int block_size = compute_block_size(dim);
+    int max_block = (dim >= 4096 && batch < 64) ? 1024 : 256;
+    int block_size = compute_block_size(dim, false, max_block);
     size_t shared_mem = block_size * sizeof(float);
     fused_add_rmsnorm_kernel<<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
