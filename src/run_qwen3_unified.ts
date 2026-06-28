@@ -10,7 +10,7 @@ import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { MetaOps } from "./meta_ops";
 import { resolveModelPath } from "./model_path";
-import { mtpTreeDecode } from "./mtp";
+import { mtpTreeDecode, MtpStats } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
 import { Qwen35Model } from "./qwen35_model";
 import { Qwen3Model } from "./qwen3_model";
@@ -195,6 +195,7 @@ export interface DecodeTiming {
   warmupSteps: number;
   graphSteps: number;
   warmupTokPerSec: number;
+  mtpStats?: MtpStats;
 }
 
 export function* generateStream(
@@ -228,6 +229,8 @@ export function* generateStream(
 
   using captureManager = new CaptureManager(glm);
   const topks = (mtp && model.forwardMtp && mtpDraftTopk && mtpDraftTopk.length > 0) ? mtpDraftTopk : [];
+  const mtpStats = topks.length > 0 ? new MtpStats(topks.length) : undefined;
+  if (timing && mtpStats) timing.mtpStats = mtpStats;
   using mtpHiddenStates = new UsingHolder<Tensor>(undefined!);
   let currentToken: number;
 
@@ -278,7 +281,8 @@ export function* generateStream(
   try {
     for (let i = 1; i < maxNewTokens; i++) {
       if (mtp && model.forwardMtp && topks.length > 0) {
-        const { warmup, tokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, ws, currentToken, topks, cache, tokenizer);
+        const { warmup, tokens, numAccepted, numDraftTokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, ws, currentToken, topks, cache, tokenizer);
+        if (mtpStats && !warmup) mtpStats.observe(numDraftTokens, numAccepted);
         // glm.synchronize();
         for (const t of tokens) {
           currentToken = t;
@@ -483,6 +487,7 @@ async function interactiveChat(
       const elapsed = performance.now() - t0;
       console.log(`\n  [${tokCount} tokens in ${(elapsed / 1000).toFixed(1)}s, ${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s]`);
       console.log(`  timing: plan=${timing.planMs.toFixed(1)}ms exec=${timing.execMs.toFixed(1)}ms idle=${timing.idleMs.toFixed(1)}ms (warmup=${timing.warmupSteps} graph=${timing.graphSteps}) decode=${timing.warmupTokPerSec.toFixed(1)} tok/s`);
+      if (timing.mtpStats) console.log(`  ${timing.mtpStats.log()}`);
 
       const responseText = tokenizer.decode(generatedIds.filter(t => !eosIds.has(t)), { skip_special_tokens: true });
       messages.push({ role: "assistant", content: responseText });
@@ -522,6 +527,7 @@ async function singlePrompt(
   const elapsed = performance.now() - t0;
   console.log(`\n\n${tokCount} tokens in ${elapsed.toFixed(1)}ms (${(tokCount / (elapsed / 1000)).toFixed(1)} tok/s)`);
   console.log(`timing: plan=${timing.planMs.toFixed(1)}ms exec=${timing.execMs.toFixed(1)}ms idle=${timing.idleMs.toFixed(1)}ms (warmup=${timing.warmupSteps} graph=${timing.graphSteps}) decode=${timing.warmupTokPerSec.toFixed(1)} tok/s`);
+  if (timing.mtpStats) console.log(timing.mtpStats.log());
 
   if (graphState?.graphExec !== null && graphState?.graphExec !== undefined) glm.graphExecDestroy(graphState.graphExec);
 }
