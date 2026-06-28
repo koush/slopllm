@@ -610,7 +610,7 @@ async function main(): Promise<void> {
   const modelDir = args.modelDir ?? (args.useGlm51
     ? (args.glm51Small
       ? (args.useNvfp4 ? GLM51_SMALL_NVFP4 : GLM51_SMALL_BF16)
-      : '/mnt/storage/glm-5.2/GLM-5.2-NVFP4/')
+      : '/mnt/storage/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/2eff962076815828e4031aec2834ac6e22fb4434/')
     : resolveModelPath(args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO)));
 
   if (args.meta) {
