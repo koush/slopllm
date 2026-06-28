@@ -338,8 +338,8 @@ export class Glm51Model extends ChatModel {
     const ws = normed.workspace;
 
     // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
-    const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
     using sharedDownBufStream = this.glm.withStream(() => {
+      const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
       return normed.swiGluMlp(sharedWeights, moeIntermediate, BS);
     });
 
