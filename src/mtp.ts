@@ -196,9 +196,18 @@ export function mtpTreeDecode(
         hostBufOffset += currentBatchSize * I32 * topks[i - 1];
         hostBuf.memcpy2d(hostBufOffset, newBatchSize * I32 * topks[i], indices, 0, newBatchSize * I32 * topks[i], newBatchSize * I32 * topks[i], 1, MemcpyKind.DeviceToHost);
 
-        // prepare next input
+        // prepare next input — transpose indices from [newBatchSize, topks[i]]
+        // (grouped by parent) to [topks[i], newBatchSize] (grouped by child) to
+        // match the interleaved sequence order [orig0, orig1, ..., copy0, copy1, ...].
         if (i !== topks.length - 1) {
-          ws.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
+          for (let c = 0; c < topks[i]; c++) {
+            ws.inputIdsBuf.memcpy2d(
+              c * newBatchSize * I32, I32,
+              indices, c * I32, topks[i] * I32,
+              I32, newBatchSize,
+              MemcpyKind.DeviceToDevice,
+            );
+          }
         }
 
         return newMtpHiddenStates.capture();
