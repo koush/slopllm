@@ -18,6 +18,8 @@ struct GlmCtx {
     int active_stream;
     cudaEvent_t events[GLM_MAX_STREAMS];
     void* cublas_handle;
+    void* cublaslt_handle;
+    void* cublaslt_workspace;
 };
 
 typedef struct GlmCtx GlmCtx;
