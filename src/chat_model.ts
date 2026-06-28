@@ -83,21 +83,22 @@ export abstract class ChatModel extends WorkspaceBase {
   protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void>;
 
   protected async loadWeights(modelDir: string): Promise<void> {
-    const stFiles = fs.readdirSync(modelDir).filter(f => f.endsWith('.safetensors') || f.endsWith('.safetensors.json'));
+    const allFiles = fs.readdirSync(modelDir);
     const shards: string[] = [];
-    if (stFiles.some(f => f === 'model.safetensors')) {
+    if (allFiles.includes('model.safetensors')) {
       shards.push(path.join(modelDir, 'model.safetensors'));
     } else {
-      const indexFile = stFiles.find(f => f.endsWith('.json'));
+      const indexFile = allFiles.find(f => f.endsWith('.index.json') || f.endsWith('.safetensors.json'));
       if (indexFile) {
         const idx = JSON.parse(fs.readFileSync(path.join(modelDir, indexFile), 'utf-8'));
-        for (const f of Object.keys(idx.weight_map ?? idx)) {
-          if (f.endsWith('.safetensors') && !shards.includes(path.join(modelDir, f))) {
+        const weightMap = idx.weight_map ?? idx;
+        for (const f of Object.values(weightMap)) {
+          if (typeof f === 'string' && f.endsWith('.safetensors') && !shards.includes(path.join(modelDir, f))) {
             shards.push(path.join(modelDir, f));
           }
         }
       } else {
-        shards.push(...stFiles.filter(f => f.endsWith('.safetensors')).map(f => path.join(modelDir, f)));
+        shards.push(...allFiles.filter(f => f.endsWith('.safetensors')).map(f => path.join(modelDir, f)));
       }
     }
 
