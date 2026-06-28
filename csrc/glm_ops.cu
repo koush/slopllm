@@ -111,7 +111,7 @@ __device__ float compute_inv_rms(const __nv_bfloat16* x, int dim, float eps, flo
 // RMSNorm kernel
 // ---------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(256, 4) rmsnorm_kernel(
+__global__ void __launch_bounds__(1024, 1) rmsnorm_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
@@ -142,9 +142,6 @@ __global__ void __launch_bounds__(256, 4) rmsnorm_kernel(
 void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
                  const void* weight, float eps, int dim, int batch) {
     cudaSetDevice(ctx->device_id);
-    // For large dim and small batch, use 1024 threads per block to increase
-    // the number of outstanding memory requests per SM (32 warps vs 8),
-    // improving memory latency hiding when only a few blocks are active.
     int max_block = (dim >= 4096 && batch < 64) ? 1024 : 256;
     int block_size = compute_block_size(dim, false, max_block);
     size_t shared_mem = block_size * sizeof(float);
@@ -159,7 +156,7 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
 // residual[i] = input_a[i] + input_b[i]
 // ---------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(256, 4) fused_add_rmsnorm_kernel(
+__global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel(
     __nv_bfloat16* __restrict__ out,
     __nv_bfloat16* __restrict__ residual,
     const __nv_bfloat16* __restrict__ input_a,
@@ -478,14 +475,6 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
     // Keep block_size <= 256 (matching __launch_bounds__): rows_per_block = 256 / threads_per_row.
     int threads_per_row = compute_block_size(v_head_dim / 2, true);
     int rows_per_block = max(1, 256 / threads_per_row);
-    // For short sequences (2-8 tokens), pack more rows per block so that all
-    // seq positions for one head land in a single block. This loads the v_proj
-    // weight for that head once and reuses it across all seq positions via
-    // L1/L2 cache, instead of loading it from separate blocks.
-    if (seq_len >= 2 && seq_len <= 8 && rows_per_block < 8) {
-        rows_per_block = 8;
-        threads_per_row = 256 / rows_per_block;
-    }
     int block_size = rows_per_block * threads_per_row;
     int grid = (total_rows + rows_per_block - 1) / rows_per_block;
     size_t shmem_size = rows_per_block * kv_lora_rank * sizeof(float);
