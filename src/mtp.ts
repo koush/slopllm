@@ -6,6 +6,57 @@ import { BF16, I32 } from "./glm_ops";
 import { MemcpyKind, Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
+/**
+ * Accumulator for MTP/speculative-decoding acceptance metrics, mirroring
+ * vllm's SpecDecodingStats + SpecDecodingLogging.
+ *
+ *   draft_acceptance_rate = num_accepted_tokens / num_draft_tokens
+ *   mean_acceptance_length = 1 + num_accepted_tokens / num_drafts  (includes bonus token)
+ *   per_position_rate[i] = num_accepted_per_pos[i] / num_drafts
+ */
+export class MtpStats {
+  numDrafts = 0;
+  numDraftTokens = 0;
+  numAcceptedTokens = 0;
+  numAcceptedPerPos: number[];
+  readonly numSpecTokens: number;
+
+  constructor(numSpecTokens: number) {
+    this.numSpecTokens = numSpecTokens;
+    this.numAcceptedPerPos = new Array(numSpecTokens).fill(0);
+  }
+
+  observe(numDraftTokens: number, numAccepted: number): void {
+    this.numDrafts++;
+    this.numDraftTokens += numDraftTokens;
+    this.numAcceptedTokens += numAccepted;
+    for (let i = 0; i < numAccepted && i < this.numAcceptedPerPos.length; i++) {
+      this.numAcceptedPerPos[i]++;
+    }
+  }
+
+  get acceptanceRate(): number {
+    return this.numDraftTokens > 0 ? this.numAcceptedTokens / this.numDraftTokens : NaN;
+  }
+
+  get meanAcceptanceLength(): number {
+    return this.numDrafts > 0 ? 1 + this.numAcceptedTokens / this.numDrafts : NaN;
+  }
+
+  perPositionRates(): number[] {
+    return this.numAcceptedPerPos.map(a => this.numDrafts > 0 ? a / this.numDrafts : NaN);
+  }
+
+  log(): string {
+    if (this.numDrafts === 0) return "";
+    const rates = this.perPositionRates().map(r => r.toFixed(3)).join(", ");
+    return `MTP metrics: mean acceptance length=${this.meanAcceptanceLength.toFixed(2)}, ` +
+      `acceptance rate=${(this.acceptanceRate * 100).toFixed(1)}%, ` +
+      `accepted=${this.numAcceptedTokens}/${this.numDraftTokens} tokens, ` +
+      `drafts=${this.numDrafts}, per-pos=[${rates}]`;
+  }
+}
+
 function totalPaths(topk: number[]): number {
   return topk.reduce((acc, k) => acc * k, 1);
 }
@@ -127,6 +178,8 @@ export function mtpTreeDecode(
     throw new Error("mtpTreeDecode: model does not support MTP (forwardMtp not defined)");
   }
 
+  const lmHead = model.tensors.get("lm_head.weight")!;
+
   const pagedKV = cache.getPagedKV();
   const draftTopk = topks;
   const targetTopk = [1, ...topks];
@@ -171,7 +224,8 @@ export function mtpTreeDecode(
       chainedMtpHiddenState = captureManager.run(() => {
         // prepare initial input
         if (i === 1) {
-          using initialLogits = mtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, currentBatchSize);
+          // mtpHiddenStates is already shared_head.norm'd by forwardMtp; use directly
+          using initialLogits = mtpHiddenStates.linear(lmHead, currentBatchSize);
           const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
           using initialIndices = initialTopk.indices;
           using _initialValues = initialTopk.values;
@@ -187,7 +241,8 @@ export function mtpTreeDecode(
         using _expanded = k > 1 ? chainedMtpHiddenState.cat(Array(k - 1).fill(chainedMtpHiddenState), 0) : undefined;
         const expandedHiddenState = _expanded ?? chainedMtpHiddenState;
         using newMtpHiddenStates = model.forwardMtp!(state, expandedHiddenState);
-        using logits = newMtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, newBatchSize);
+        // newMtpHiddenStates is already shared_head.norm'd; apply lmHead directly
+        using logits = newMtpHiddenStates.linear(lmHead, newBatchSize);
         const logitsTopk = logits.topk(topks[i], model.cfg.vocabSize);
         using _values = logitsTopk.values;
         using indices = logitsTopk.indices;
@@ -254,7 +309,8 @@ export function mtpTreeDecode(
       chainedHs = captureManager.run(() => {
         // Depth 1: compute initial logits and topk from mtpHiddenStates
         if (depth === 1) {
-          using initialLogits = mtpHiddenStates.linear(model.tensors.get("lm_head.weight")!, batchSize);
+          // mtpHiddenStates is already shared_head.norm'd; use directly
+          using initialLogits = mtpHiddenStates.linear(lmHead, batchSize);
           const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
           using _initialValues = initialTopk.values;
           using initialIndices = initialTopk.indices;
@@ -281,7 +337,8 @@ export function mtpTreeDecode(
 
         using hiddenStates = model.forwardMtp!(state, expandedHs);
 
-        using logits = state.computeLogits(hiddenStates, model, true);
+        // hiddenStates is already shared_head.norm'd; apply lmHead directly
+        using logits = hiddenStates.linear(lmHead, state.totalTokens).removeTracking();
         const logitsTopk = logits.topk(topks[depth], model.cfg.vocabSize);
         using _values = logitsTopk.values;
         using indices = logitsTopk.indices;
@@ -495,6 +552,8 @@ export function mtpTreeDecode(
   return {
     warmup,
     tokens: [...acceptedTokens, bestReplacement],
+    numAccepted: bestAccepted,
+    numDraftTokens: topks.length,
   }
 }
 

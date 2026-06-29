@@ -1,6 +1,7 @@
 #include "glm_ops.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cstdio>
 #include <cstring>
 #include <sys/mman.h>
@@ -30,6 +31,8 @@ GlmCtx* glm_init(int device_id) {
     cublasCreate(&CUBLAS(ctx));
     cublasSetStream(CUBLAS(ctx), ctx->streams[0]);
     cublasSetMathMode(CUBLAS(ctx), CUBLAS_TENSOR_OP_MATH);
+    cublasLtCreate(reinterpret_cast<cublasLtHandle_t*>(&ctx->cublaslt_handle));
+    cudaMalloc(&ctx->cublaslt_workspace, 32 * 1024 * 1024);
     // this suppresses most non deterministic output
     // can be used for sanity checking in case of deviation
     // cublasSetMathMode(CUBLAS(ctx), CUBLAS_PEDANTIC_MATH);
@@ -41,6 +44,8 @@ void glm_free(GlmCtx* ctx) {
     if (!ctx) return;
     cudaSetDevice(ctx->device_id);
     cublasDestroy(CUBLAS(ctx));
+    cublasLtDestroy(*reinterpret_cast<cublasLtHandle_t*>(&ctx->cublaslt_handle));
+    cudaFree(ctx->cublaslt_workspace);
     for (int i = 0; i < GLM_MAX_STREAMS; i++) {
         cudaStreamDestroy(ctx->streams[i]);
         cudaEventDestroy(ctx->events[i]);

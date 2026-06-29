@@ -338,8 +338,8 @@ export class Glm51Model extends ChatModel {
     const ws = normed.workspace;
 
     // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
-    const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
     using sharedDownBufStream = this.glm.withStream(() => {
+      const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
       return normed.swiGluMlp(sharedWeights, moeIntermediate, BS);
     });
 
@@ -529,7 +529,7 @@ export class Glm51Model extends ChatModel {
     return normed.detach().removeTracking();
   }
 
-  forwardMtp(state: ExecutionState, previousHiddenState: Tensor) {
+  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, maskPos0?: boolean) {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const ws = state.ws;
@@ -551,6 +551,10 @@ export class Glm51Model extends ChatModel {
       return previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps, hs, BS);
     });
     using embedding = embedTable.embedding(state.input!, hs, BS);
+    if (maskPos0) {
+      using firstRow = embedding.narrow(0, 1);
+      firstRow.fill(0, hs);
+    }
     using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps, hs, BS);
     hnormStream.streamWaitEvent();
     using hnorm = hnormStream.result;
@@ -567,6 +571,9 @@ export class Glm51Model extends ChatModel {
     const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state);
     using _residual = result.residual;
 
+    // Return shared_head.norm(residual) so the recycled seed for the next MTP
+    // step is already normed — matches sglang Glm4MoeModelNextN and vLLM v1
+    // deepseek_mtp which both recycle the post-shared_head-norm state.
     return result.normed.removeTracking();
   }
 }

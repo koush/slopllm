@@ -2,12 +2,37 @@
 #include "glm_nvfp4.cuh"
 
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <unordered_map>
 
 #define CUBLAS(ctx) (*reinterpret_cast<cublasHandle_t*>(&(ctx)->cublas_handle))
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// cublasLt algorithm cache: maps (device_id, M, N, K) → heuristic result.
+// The heuristic is a host-side query that runs during warmup (before graph
+// capture). After capture, the graph replays the selected kernel — the cache
+// is never hit again.
+// ---------------------------------------------------------------------------
+struct LtCacheKey {
+    int m, n, k;
+    bool operator==(const LtCacheKey& o) const { return m == o.m && n == o.n && k == o.k; }
+};
+struct LtCacheKeyHash {
+    size_t operator()(const LtCacheKey& k) const {
+        return ((size_t)k.m * 1000003) ^ ((size_t)k.n * 1009) ^ (size_t)k.k;
+    }
+};
+struct LtCacheEntry {
+    cublasLtMatmulHeuristicResult_t heuristic;
+    bool valid = false;
+};
+static std::unordered_map<int, std::unordered_map<LtCacheKey, LtCacheEntry, LtCacheKeyHash>> g_lt_caches;
+
+constexpr size_t LT_WORKSPACE_SIZE = 32 * 1024 * 1024;
 
 constexpr int GEMV_WARP_SIZE = 32;
 constexpr int GEMV_ROWS_PER_BLOCK = 8;
@@ -490,10 +515,12 @@ constexpr int NVFP4_GEMM_N_TILE = 32;
 constexpr int NVFP4_GEMM_K_TILE = 128;
 constexpr int NVFP4_GEMM_BLOCK_DIM = NVFP4_GEMM_M_TILE * NVFP4_GEMM_N_TILE;
 // Narrow M-tile used when M <= NVFP4_GEMM_SMALL_M_THRESHOLD (e.g. MTP
-// verification batches): quadruples grid.y vs. NVFP4_GEMM_M_TILE=16 while still
-// reusing each decoded weight tile across 4 rows. See the kernel comment for
+// verification batches): doubles grid.y vs. NVFP4_GEMM_M_TILE=16 while still
+// reusing each decoded weight tile across 8 rows. See the kernel comment for
 // why this trades less reuse for more occupancy than the M_TILE=16 variant.
-constexpr int NVFP4_GEMM_SMALL_M_TILE = 4;
+// M_TILE=8 (vs the previous 4) eliminates redundant weight decode for M=5-8:
+// grid.y=1 instead of 2, so each weight tile is decoded once not twice.
+constexpr int NVFP4_GEMM_SMALL_M_TILE = 8;
 constexpr int NVFP4_GEMM_SMALL_M_THRESHOLD = 32;
 // When M > 1 and N is small, the smem GEMM kernel launches too few CTAs to
 // fill the GPU (e.g. N=256 → grid.x=8 → only 32 CTAs at M=15).  cuBLAS with
@@ -1305,7 +1332,6 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
                 const void* weight, int batch, int n, int k) {
     cudaSetDevice(ctx->device_id);
 
-    // TODO auto tune
     if (batch < 4) {
         // Split-K variant when N is small enough that the row-major kernel
         // would launch too few blocks to fill the GPU. Threshold tuned for
@@ -1347,17 +1373,61 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    cublasGemmEx(CUBLAS(ctx),
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        n, batch, k,
-        &alpha,
-        weight, CUDA_R_16BF, k,
-        input,  CUDA_R_16BF, k,
-        &beta,
-        out,    CUDA_R_16BF, n,
-        CUDA_R_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    cublasLtHandle_t ltHandle = *reinterpret_cast<cublasLtHandle_t*>(&ctx->cublaslt_handle);
+
+    cublasLtMatmulDesc_t opDesc;
+    cublasLtMatmulDescCreate(&opDesc, CUBLAS_COMPUTE_32F, CUDA_R_16BF);
+    cublasOperation_t transA = CUBLAS_OP_T;
+    cublasOperation_t transB = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA));
+    cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB));
+
+    // weight [n,k] row-major = [k,n] col-major; input [batch,k] row-major = [k,batch] col-major
+    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
+    cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_16BF, k, n, k);
+    cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_16BF, k, batch, k);
+    cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, n, batch, n);
+
+    auto& cache = g_lt_caches[ctx->device_id];
+    LtCacheKey key{batch, n, k};
+    auto& entry = cache[key];
+
+    if (!entry.valid) {
+        cublasLtMatmulPreference_t pref;
+        cublasLtMatmulPreferenceCreate(&pref);
+        size_t wsSize = LT_WORKSPACE_SIZE;
+        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsSize, sizeof(wsSize));
+        int returnedResults = 0;
+        cublasLtMatmulAlgoGetHeuristic(ltHandle, opDesc, Adesc, Bdesc, Cdesc, Cdesc,
+                                       pref, 1, &entry.heuristic, &returnedResults);
+        cublasLtMatmulPreferenceDestroy(pref);
+        entry.valid = (returnedResults > 0);
+    }
+
+    if (entry.valid) {
+        cublasLtMatmul(ltHandle, opDesc, &alpha,
+            weight, Adesc, input, Bdesc, &beta,
+            out, Cdesc, out, Cdesc,
+            &entry.heuristic.algo, ctx->cublaslt_workspace, LT_WORKSPACE_SIZE,
+            GLM_STREAM(ctx));
+    } else {
+        cublasGemmEx(CUBLAS(ctx),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            n, batch, k,
+            &alpha,
+            weight, CUDA_R_16BF, k,
+            input,  CUDA_R_16BF, k,
+            &beta,
+            out,    CUDA_R_16BF, n,
+            CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+
+    cublasLtMatrixLayoutDestroy(Cdesc);
+    cublasLtMatrixLayoutDestroy(Bdesc);
+    cublasLtMatrixLayoutDestroy(Adesc);
+    cublasLtMatmulDescDestroy(opDesc);
 }
 
 void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
