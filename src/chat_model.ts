@@ -54,7 +54,7 @@ export abstract class ChatModel extends WorkspaceBase {
 
   abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number): ChatCache;
   abstract forwardModel(state: ExecutionState): Tensor;
-  forwardMtp?(state: ExecutionState, previousHiddenState: Tensor): Tensor;
+  forwardMtp?(state: ExecutionState, previousHiddenState: Tensor, maskPos0?: boolean): Tensor;
 
   forward(state: ExecutionState): Tensor {
     using _tracker = state.ws.startTracking();

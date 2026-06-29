@@ -253,7 +253,7 @@ export function* generateStream(
       // KV slot — the two never interfere.
       using rotatedInputIds = state.input!.rotateInputIds(ws.qoIndptrD, gpuSampleResult!, state.batchSize);
       state.setInput(rotatedInputIds);
-      using _mtpHiddenStates = model.forwardMtp(state, hiddenStates);
+      using _mtpHiddenStates = model.forwardMtp(state, hiddenStates, true);
       mtpHiddenStates.replace(_mtpHiddenStates.slice(0, -1, 1).removeTracking());
     }
   }
