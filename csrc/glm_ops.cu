@@ -3,6 +3,8 @@
 #include <cublas_v2.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
+#include <cuda/barrier>
+#include <cuda/ptx>
 #include <cstdio>
 
 namespace cg = cooperative_groups;
@@ -464,6 +466,161 @@ __global__ void __launch_bounds__(BDX, 4) mla_v_expand_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// MLA V-Expand kernel v2: v_proj tiled in shared memory via cg::memcpy_async
+//
+// Reverses the smem strategy of v1: v_proj tiles are loaded into shared memory
+// via cg::memcpy_async (cooperative async copy), and attn values are kept in
+// registers. This avoids L2 reads in the inner loop (smem ~30 cycles vs
+// L2 ~200 cycles).
+//
+// Double-buffered with cg::wait_prior: while computing on tile t, tile t+1 is
+// in flight. Tile t+2 is prefetched into the current buffer after compute
+// finishes (the P2P kernel pattern).
+//
+// RPB is always 1: cg::memcpy_async is a block-cooperative copy requiring all
+// threads to share the same source address, so all threads in a block must
+// work on the same head. BDX=128 gives full thread utilization for VHD=256
+// (128 threads × 2 elements = 256).
+//
+// Template parameters:
+//   KV_LR  - compile-time kv_lora_rank (e.g. 512)
+//   VHD    - compile-time v_head_dim (e.g. 256)
+//   BDX    - block size (128)
+//   TILE_K - k-dimension tile size (16)
+// ---------------------------------------------------------------------------
+
+template <int KV_LR, int VHD, int BDX, int TILE_K>
+__global__ void __launch_bounds__(BDX, 8) mla_v_expand_kernel_v2(
+    __nv_bfloat16* __restrict__ result,
+    const __nv_bfloat16* __restrict__ attn_out,
+    const __nv_bfloat16* __restrict__ v_proj,
+    int n_heads, int seq_len, int batch,
+    int attn_n_heads, int head_offset,
+    int v_proj_head_offset,
+    int total_rows
+) {
+    static_assert(VHD % 2 == 0, "v_head_dim must be even for bf16x2 loads");
+    static_assert(KV_LR % TILE_K == 0, "kv_lora_rank must be divisible by TILE_K");
+
+    constexpr int TPR = BDX;  // RPB=1
+    constexpr int NUM_TILES = KV_LR / TILE_K;
+    constexpr int VEC = 2;
+    constexpr int J_ITERS = (VHD + TPR * VEC - 1) / (TPR * VEC);
+
+    // Smem layout:
+    //   s_attn:  [KV_LR] float, 16-byte aligned
+    //   s_vproj: [2][TILE_K][VHD] bf16 (double-buffered)
+    extern __shared__ char smem_raw[];
+    constexpr size_t attn_bytes = KV_LR * sizeof(float);
+    constexpr size_t attn_bytes_aligned = (attn_bytes + 15) & ~size_t(15);
+    float* s_attn = reinterpret_cast<float*>(smem_raw);
+    __nv_bfloat16* s_vproj = reinterpret_cast<__nv_bfloat16*>(
+        smem_raw + attn_bytes_aligned);
+
+    auto block = cg::this_thread_block();
+
+    int lane = threadIdx.x;
+
+    int bhs = blockIdx.x;  // RPB=1
+    bool valid = (bhs < total_rows);
+
+    int s_pos = bhs % seq_len;
+    int h = (bhs / seq_len) % n_heads;
+    int b = bhs / (seq_len * n_heads);
+
+    // Use a valid pointer for invalid threads (cg::memcpy_async requires all
+    // threads to participate; the data is meaningless but the address must be
+    // in-bounds).
+    const __nv_bfloat16* w_base = valid
+        ? v_proj + (h + v_proj_head_offset) * KV_LR * VHD
+        : v_proj;
+
+    constexpr size_t tile_bytes = (size_t)(TILE_K * VHD * sizeof(__nv_bfloat16));
+
+    // Prologue: issue tile 0 into buf[0], tile 1 into buf[1] (if exists).
+    // Issued before attn load so async copies are in flight during the
+    // bf16→float conversion + smem writes below.
+    cg::memcpy_async(block, s_vproj, w_base, tile_bytes);
+    if (NUM_TILES > 1) {
+        cg::memcpy_async(block, s_vproj + TILE_K * VHD,
+                         w_base + TILE_K * VHD, tile_bytes);
+    }
+
+    // Phase 1: Load attn into smem — overlaps with async v_proj copies
+    if (valid) {
+        const __nv_bfloat16* attn_row = attn_out +
+            ((b * attn_n_heads + h + head_offset) * seq_len + s_pos) * KV_LR;
+        #pragma unroll
+        for (int k = lane; k < KV_LR; k += BDX)
+            s_attn[k] = __bfloat162float(attn_row[k]);
+    }
+
+    __syncthreads();
+
+    // Phase 2: Pipelined tile computation
+    float sum[J_ITERS][2] = {};
+    float attn_reg[TILE_K];
+
+    for (int t = 0; t < NUM_TILES; t++) {
+        int buf = t % 2;
+
+        // Wait for current tile (keep next in flight if any)
+        if (t < NUM_TILES - 1) {
+            cg::wait_prior<1>(block);
+        } else {
+            cg::wait(block);
+        }
+
+        if (valid) {
+            // Load attn tile into registers
+            #pragma unroll
+            for (int kk = 0; kk < TILE_K; kk++)
+                attn_reg[kk] = s_attn[t * TILE_K + kk];
+
+            // Compute against v_proj tile in smem
+            const __nv_bfloat16* vproj_tile = s_vproj + buf * TILE_K * VHD;
+
+            #pragma unroll
+            for (int ji = 0; ji < J_ITERS; ji++) {
+                int j = lane * VEC + ji * TPR * VEC;
+                if (j < VHD) {
+                    #pragma unroll
+                    for (int kk = 0; kk < TILE_K; kk++) {
+                        float w0, w1;
+                        load_bf16x2(vproj_tile + kk * VHD + j, w0, w1);
+                        float a = attn_reg[kk];
+                        sum[ji][0] += a * w0;
+                        sum[ji][1] += a * w1;
+                    }
+                }
+            }
+        }
+
+        __syncthreads();  // ensure all threads done reading smem before prefetch
+
+        // Prefetch tile t+2 into current buffer (reuse, not next buffer)
+        if (t + 2 < NUM_TILES) {
+            cg::memcpy_async(block,
+                s_vproj + buf * TILE_K * VHD,
+                w_base + (t + 2) * TILE_K * VHD,
+                tile_bytes);
+        }
+    }
+
+    // Store results
+    if (valid) {
+        __nv_bfloat16* result_base =
+            result + (b * seq_len + s_pos) * (n_heads * VHD) + h * VHD;
+        #pragma unroll
+        for (int ji = 0; ji < J_ITERS; ji++) {
+            int j = lane * VEC + ji * TPR * VEC;
+            if (j < VHD)
+                store_bf16x2(result_base + j, sum[ji][0], sum[ji][1]);
+        }
+    }
+}
+
 void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        const void* v_proj,
                        int kv_lora_rank, int v_head_dim, int n_heads,
@@ -477,8 +634,31 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
     int rows_per_block = max(1, 256 / threads_per_row);
     int block_size = rows_per_block * threads_per_row;
     int grid = (total_rows + rows_per_block - 1) / rows_per_block;
-    size_t shmem_size = rows_per_block * kv_lora_rank * sizeof(float);
     constexpr int BDX = 256;
+
+    // v2 kernel: v_proj tiled in smem via cg::memcpy_async, attn in registers.
+    // RPB=1 (one row per block), BDX=128 (full thread utilization for VHD=256).
+    // Dispatch when kv_lora_rank and v_head_dim are known at compile time.
+    if (kv_lora_rank == 512 && v_head_dim == 256) {
+        constexpr int KV_LR = 512;
+        constexpr int VHD = 256;
+        constexpr int TILE_K = 16;
+        constexpr int BDX_V2 = 128;
+        constexpr size_t attn_bytes = KV_LR * sizeof(float);
+        constexpr size_t attn_bytes_aligned = (attn_bytes + 15) & ~size_t(15);
+        constexpr size_t vproj_bytes = 2 * TILE_K * VHD * sizeof(__nv_bfloat16);
+        size_t shmem_size = attn_bytes_aligned + vproj_bytes;
+        mla_v_expand_kernel_v2<KV_LR, VHD, BDX_V2, TILE_K>
+            <<<total_rows, BDX_V2, shmem_size, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
+                (const __nv_bfloat16*)v_proj,
+                n_heads, seq_len, batch,
+                attn_n_heads, head_offset, v_proj_head_offset, total_rows);
+        return;
+    }
+
+    // v1 kernel: attn in smem, v_proj streamed from L2 (fallback)
+    size_t shmem_size = rows_per_block * kv_lora_rank * sizeof(float);
     auto launch = [&]<int KV_LR, int RPB>() {
         mla_v_expand_kernel<KV_LR, BDX, RPB><<<grid, block_size, shmem_size, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
@@ -2494,9 +2674,6 @@ __global__ void __launch_bounds__(256, 4) sum_pointers_kernel(
 // in flight. cg::wait_prior<N> lets us wait for buf[0] while buf[1] is
 // still pending. Uses cg::memcpy_async (no TMA, no alignment constraints).
 // ---------------------------------------------------------------------------
-
-#include <cuda/barrier>
-#include <cuda/ptx>
 
 template <typename scalar_t, int ElemsPerWarp, int N>
 __global__ void __launch_bounds__(1024, 1)
