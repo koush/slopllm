@@ -565,6 +565,13 @@ __global__ void __launch_bounds__(BDX, 8) mla_v_expand_kernel_v2(
     for (int t = 0; t < NUM_TILES; t++) {
         int buf = t % 2;
 
+        // Load attn tile into registers — smem read overlaps with wait below
+        if (valid) {
+            #pragma unroll
+            for (int kk = 0; kk < TILE_K; kk++)
+                attn_reg[kk] = s_attn[t * TILE_K + kk];
+        }
+
         // Wait for current tile (keep next in flight if any)
         if (t < NUM_TILES - 1) {
             cg::wait_prior<1>(block);
@@ -573,11 +580,6 @@ __global__ void __launch_bounds__(BDX, 8) mla_v_expand_kernel_v2(
         }
 
         if (valid) {
-            // Load attn tile into registers
-            #pragma unroll
-            for (int kk = 0; kk < TILE_K; kk++)
-                attn_reg[kk] = s_attn[t * TILE_K + kk];
-
             // Compute against v_proj tile in smem
             const __nv_bfloat16* vproj_tile = s_vproj + buf * TILE_K * VHD;
 
