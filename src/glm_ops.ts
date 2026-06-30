@@ -18,7 +18,7 @@ import { Allocator, ArenaAllocator } from "./allocator";
 // verification batches), so the direct path wins there despite redundant reads;
 // the grouped path only pays off once `count` is large enough to amortize its
 // dispatch overhead against avoided redundant weight reads (true prefill territory).
-const MUL_MAT_ID_GROUPED_THRESHOLD = 256;
+const MUL_MAT_ID_GROUPED_THRESHOLD = 512;
 
 function findProjectRoot(dir: string): string {
   let d = dir;
@@ -173,6 +173,8 @@ interface NativeAddon {
   nvfp4MulMatIdGroupedMma(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   mmaMoePcWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   nvfp4MulMatIdGroupedMmaPc(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
+  mmaMoeCoopWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
+  nvfp4MulMatIdGroupedMmaCoop(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   bf16MulMatIdGroupedMma(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number): void;
   rotateInputIds(ctx: number, outputIds: number, inputIds: number, qoIndptr: number, newTokens: number, batchSize: number): void;
@@ -665,9 +667,9 @@ export class GlmTensor extends Tensor {
       }
       if (count > MUL_MAT_ID_GROUPED_THRESHOLD) {
         const numExperts = weights.length;
-        const wsSize = getNativeAddon().mmaMoePcWorkspaceSize(count, N, K, numExperts);
+        const wsSize = getNativeAddon().mmaMoeCoopWorkspaceSize(count, N, K, numExperts);
         using wsTensor = this.workspace.allocRaw(wsSize);
-        getNativeAddon().nvfp4MulMatIdGroupedMmaPc(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
+        getNativeAddon().nvfp4MulMatIdGroupedMmaCoop(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
       } else {
         getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K);
       }

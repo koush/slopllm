@@ -563,7 +563,7 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void
 
     constexpr int MaxExperts = 256;
     const char* cfg_env = getenv("GLM_COOP_CONFIG");
-    std::string cfg(cfg_env ? cfg_env : "tm32_nw4");
+    std::string cfg(cfg_env ? cfg_env : "tm64_tn128_d2_nw2");
 
     // Backward compat: GLM_COOP_NWARPS overrides config
     const char* nw_env = getenv("GLM_COOP_NWARPS");
