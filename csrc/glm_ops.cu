@@ -630,59 +630,115 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        int attn_n_heads, int head_offset,
                        int v_proj_head_offset) {
     cudaSetDevice(ctx->device_id);
-    int total_rows = batch * n_heads * seq_len;
-    // Keep block_size <= 256 (matching __launch_bounds__): rows_per_block = 256 / threads_per_row.
-    int threads_per_row = compute_block_size(v_head_dim / 2, true);
-    int rows_per_block = max(1, 256 / threads_per_row);
-    int block_size = rows_per_block * threads_per_row;
-    int grid = (total_rows + rows_per_block - 1) / rows_per_block;
-    constexpr int BDX = 256;
 
-    // v2 kernel: v_proj tiled in smem via cg::memcpy_async, attn in registers.
-    // RPB=1 (one row per block), BDX=128 (full thread utilization for VHD=256).
-    // Dispatch when kv_lora_rank and v_head_dim are known at compile time.
-    if (kv_lora_rank == 512 && v_head_dim == 256) {
-        constexpr int KV_LR = 512;
-        constexpr int VHD = 256;
-        constexpr int TILE_K = 16;
-        constexpr int BDX_V2 = 128;
-        constexpr size_t attn_bytes = KV_LR * sizeof(float);
-        constexpr size_t attn_bytes_aligned = (attn_bytes + 15) & ~size_t(15);
-        constexpr size_t vproj_bytes = 2 * TILE_K * VHD * sizeof(__nv_bfloat16);
-        size_t shmem_size = attn_bytes_aligned + vproj_bytes;
-        mla_v_expand_kernel_v2<KV_LR, VHD, BDX_V2, TILE_K>
-            <<<total_rows, BDX_V2, shmem_size, GLM_STREAM(ctx)>>>(
-                (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
-                (const __nv_bfloat16*)v_proj,
-                n_heads, seq_len, batch,
-                attn_n_heads, head_offset, v_proj_head_offset, total_rows);
+    // cuBLAS strided batched GEMM: for each head h,
+    //   result[b*s, h*V : (h+1)*V] = attn_out[h, b, s, :] @ v_proj[h, :, :]
+    //
+    // Requires batch==1 or seq_len==1 (strided batched can't express both > 1).
+
+    if (batch == 1 || seq_len == 1) {
+        // Column-major (cuBLAS convention): C_cm = A_cm @ B_cm
+        //   A_cm = v_proj[h]  : [V, Lkv]     lda=V,       strideA = Lkv*V
+        //   B_cm = attn_out[h]: [Lkv, B*S]   ldb varies,  strideB varies
+        //   C_cm = result[h]  : [V, B*S]     ldc = N*V,   strideC = V
+        //
+        // B_cm strides depend on prefill vs decode:
+        //   Prefill (B=1, S>1): per-head data is contiguous [S, Lkv]
+        //     ldb = Lkv, strideB = S*Lkv
+        //   Decode (S=1, B>=1): per-head data is strided across attn_n_heads
+        //     ldb = attn_n_heads*Lkv, strideB = Lkv
+
+        int BS = batch * seq_len;
+        long long Lkv = kv_lora_rank;
+        long long V = v_head_dim;
+
+        long long lda = V;
+        long long strideA = Lkv * V;
+
+        long long ldb, strideB;
+        if (seq_len > 1) {
+            ldb = Lkv;
+            strideB = (long long)seq_len * Lkv;
+        } else {
+            ldb = (long long)attn_n_heads * Lkv;
+            strideB = Lkv;
+        }
+        const void* B_base = (const char*)attn_out + (long long)head_offset * strideB * sizeof(__nv_bfloat16);
+
+        long long ldc = (long long)n_heads * V;
+        long long strideC = V;
+
+        const void* A_base = (const char*)v_proj + (long long)v_proj_head_offset * strideA * sizeof(__nv_bfloat16);
+
+        float alpha = 1.0f, beta = 0.0f;
+
+        cublasGemmStridedBatchedEx(CUBLAS(ctx),
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            V,          // m
+            BS,         // n
+            Lkv,        // k
+            &alpha,
+            A_base, CUDA_R_16BF, lda, strideA,
+            B_base, CUDA_R_16BF, ldb, strideB,
+            &beta,
+            result, CUDA_R_16BF, ldc, strideC,
+            n_heads,    // batchCount
+            CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         return;
     }
 
-    // v1 kernel: attn in smem, v_proj streamed from L2 (fallback)
-    size_t shmem_size = rows_per_block * kv_lora_rank * sizeof(float);
-    auto launch = [&]<int KV_LR, int RPB>() {
-        mla_v_expand_kernel<KV_LR, BDX, RPB><<<grid, block_size, shmem_size, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
-            (const __nv_bfloat16*)v_proj,
-            kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
-            attn_n_heads, head_offset, v_proj_head_offset, total_rows);
-    };
-    if (kv_lora_rank == 512) {
-        if (rows_per_block == 8) launch.template operator()<512, 8>();
-        else if (rows_per_block == 4) launch.template operator()<512, 4>();
-        else if (rows_per_block == 2) launch.template operator()<512, 2>();
-        else launch.template operator()<512, 1>();
-    } else if (kv_lora_rank == 128) {
-        if (rows_per_block == 8) launch.template operator()<128, 8>();
-        else if (rows_per_block == 4) launch.template operator()<128, 4>();
-        else if (rows_per_block == 2) launch.template operator()<128, 2>();
-        else launch.template operator()<128, 1>();
-    } else {
-        if (rows_per_block >= 8) launch.template operator()<0, 8>();
-        else if (rows_per_block >= 4) launch.template operator()<0, 4>();
-        else if (rows_per_block == 2) launch.template operator()<0, 2>();
-        else launch.template operator()<0, 1>();
+    // Fallback: batch > 1 && seq_len > 1 (unit tests only).
+    // v2 kernel for production dims, v1 for everything else.
+    {
+        int total_rows = batch * n_heads * seq_len;
+
+        if (kv_lora_rank == 512 && v_head_dim == 256) {
+            constexpr int KV_LR = 512;
+            constexpr int VHD = 256;
+            constexpr int TILE_K = 16;
+            constexpr int BDX_V2 = 128;
+            constexpr size_t attn_bytes = KV_LR * sizeof(float);
+            constexpr size_t attn_bytes_aligned = (attn_bytes + 15) & ~size_t(15);
+            constexpr size_t vproj_bytes = 2 * TILE_K * VHD * sizeof(__nv_bfloat16);
+            size_t shmem_size = attn_bytes_aligned + vproj_bytes;
+            mla_v_expand_kernel_v2<KV_LR, VHD, BDX_V2, TILE_K>
+                <<<total_rows, BDX_V2, shmem_size, GLM_STREAM(ctx)>>>(
+                    (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
+                    (const __nv_bfloat16*)v_proj,
+                    n_heads, seq_len, batch,
+                    attn_n_heads, head_offset, v_proj_head_offset, total_rows);
+            return;
+        }
+
+        int threads_per_row = compute_block_size(v_head_dim / 2, true);
+        int rows_per_block = max(1, 256 / threads_per_row);
+        int block_size = rows_per_block * threads_per_row;
+        int grid = (total_rows + rows_per_block - 1) / rows_per_block;
+        size_t shmem_size = (size_t)rows_per_block * kv_lora_rank * sizeof(float);
+        auto launch_v1 = [&]<int KV_LR, int RPB>() {
+            mla_v_expand_kernel<KV_LR, 256, RPB><<<grid, block_size, shmem_size, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)result, (const __nv_bfloat16*)attn_out,
+                (const __nv_bfloat16*)v_proj,
+                kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
+                attn_n_heads, head_offset, v_proj_head_offset, total_rows);
+        };
+        if (kv_lora_rank == 512) {
+            if (rows_per_block == 8) launch_v1.template operator()<512, 8>();
+            else if (rows_per_block == 4) launch_v1.template operator()<512, 4>();
+            else if (rows_per_block == 2) launch_v1.template operator()<512, 2>();
+            else launch_v1.template operator()<512, 1>();
+        } else if (kv_lora_rank == 128) {
+            if (rows_per_block == 8) launch_v1.template operator()<128, 8>();
+            else if (rows_per_block == 4) launch_v1.template operator()<128, 4>();
+            else if (rows_per_block == 2) launch_v1.template operator()<128, 2>();
+            else launch_v1.template operator()<128, 1>();
+        } else {
+            if (rows_per_block >= 8) launch_v1.template operator()<0, 8>();
+            else if (rows_per_block >= 4) launch_v1.template operator()<0, 4>();
+            else if (rows_per_block == 2) launch_v1.template operator()<0, 2>();
+            else launch_v1.template operator()<0, 1>();
+        }
     }
 }
 
