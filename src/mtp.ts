@@ -202,21 +202,50 @@ export function mtpTreeDecode(
 
   let warmup = false;
 
+  // Depth-1 tree (topks.length === 1, e.g. nextn=1): both draft strategies below
+  // run zero loop iterations, so the root's top-k candidates must be generated
+  // explicitly here. No MTP forward or sequence duplication is needed — the
+  // candidates come straight from the seed hidden state. Applies to both the
+  // batched-decode and chunked-prefill branches.
+  if (topks.length === 1) {
+    warmup ||= !captureManager.isCaptured(['mtp-tree-decode-root', topks[0]]);
+    captureManager.run(() => {
+      // mtpHiddenStates is already shared_head.norm'd by forwardMtp; use directly
+      using initialLogits = mtpHiddenStates.linear(lmHead, batchSize);
+      const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
+      using _initialValues = initialTopk.values;
+      using initialIndices = initialTopk.indices;
+      hostBuf.memcpy2d(0, batchSize * I32 * topks[0], initialIndices, 0, batchSize * I32 * topks[0], batchSize * I32 * topks[0], 1, MemcpyKind.DeviceToHost);
+    }, ['mtp-tree-decode-root', topks[0]]);
+    ws.glm.synchronize();
+  }
+
   if (true) {
     // current path that decodes in batch
     let hostBufOffset = 0;
     let chainedMtpHiddenState = mtpHiddenStates;
+
     for (let i = 1; i < topks.length; i++) {
       // every iteration, duplicate all the sequences to add the top-k for this depth
       const currentBatchSize = pagedKv.sequences.length;
       const k = topks[i - 1];
-      for (let j = 1; j < k; j++) {
-        for (let seqIdx = 0; seqIdx < currentBatchSize; seqIdx++) {
-          pagedKv.copySequence(seqIdx + j * currentBatchSize, seqIdx);
+      const newBatchSize = currentBatchSize * k;
+
+      // Interleaved duplication: produce [orig0, copy0_of_orig0, ..., orig1, copy0_of_orig1, ...]
+      // so that parent-grouped (BFS) topk indices can be used directly as inputs without
+      // transposition. This keeps the hostBuf layout in BFS order at all depths, matching
+      // the BFS tree indexing used during verification (childIndex/parentIndex over targetTopk).
+      // Phase 1: save originals to the end of the array
+      for (let seqIdx = 0; seqIdx < currentBatchSize; seqIdx++) {
+        pagedKv.copySequence(newBatchSize - currentBatchSize + seqIdx, seqIdx);
+      }
+      // Phase 2: create interleaved copies from the saved originals
+      for (let seqIdx = 0; seqIdx < currentBatchSize; seqIdx++) {
+        for (let j = 0; j < k; j++) {
+          pagedKv.copySequence(seqIdx * k + j, newBatchSize - currentBatchSize + seqIdx);
         }
       }
 
-      const newBatchSize = pagedKv.sequences.length;
       const state = ws.planDecode(model, newBatchSize, cache);
 
 
@@ -238,8 +267,23 @@ export function mtpTreeDecode(
 
         ws.positionStep(state, model);
 
-        using _expanded = k > 1 ? chainedMtpHiddenState.cat(Array(k - 1).fill(chainedMtpHiddenState), 0) : undefined;
+        // Expand hidden states: repeat each row k times consecutively [hs0, hs0, ..., hs1, hs1, ...]
+        // to match interleaved sequence order [orig0, copy0, ..., orig1, copy1, ...]. Each child
+        // shares its parent's hidden state (the EAGLE/MTP recurrence uses h_{d-1} as input).
+        using _expanded = k > 1 ? ws.alloc([newBatchSize, hiddenDim], "BF16") : undefined;
         const expandedHiddenState = _expanded ?? chainedMtpHiddenState;
+        if (_expanded) {
+          for (let seqIdx = 0; seqIdx < currentBatchSize; seqIdx++) {
+            for (let j = 0; j < k; j++) {
+              _expanded.memcpy2d(
+                (seqIdx * k + j) * rowBytes, rowBytes,
+                chainedMtpHiddenState, seqIdx * rowBytes, rowBytes,
+                rowBytes, 1,
+                MemcpyKind.DeviceToDevice,
+              );
+            }
+          }
+        }
         using newMtpHiddenStates = model.forwardMtp!(state, expandedHiddenState);
         // newMtpHiddenStates is already shared_head.norm'd; apply lmHead directly
         using logits = newMtpHiddenStates.linear(lmHead, newBatchSize);
@@ -251,18 +295,10 @@ export function mtpTreeDecode(
         hostBufOffset += currentBatchSize * I32 * topks[i - 1];
         hostBuf.memcpy2d(hostBufOffset, newBatchSize * I32 * topks[i], indices, 0, newBatchSize * I32 * topks[i], newBatchSize * I32 * topks[i], 1, MemcpyKind.DeviceToHost);
 
-        // prepare next input — transpose indices from [newBatchSize, topks[i]]
-        // (grouped by parent) to [topks[i], newBatchSize] (grouped by child) to
-        // match the interleaved sequence order [orig0, orig1, ..., copy0, copy1, ...].
+        // prepare next input — indices are already in parent-grouped (BFS) order,
+        // matching the interleaved sequence layout [orig0_child0, orig0_child1, orig1_child0, ...]
         if (i !== topks.length - 1) {
-          for (let c = 0; c < topks[i]; c++) {
-            ws.inputIdsBuf.memcpy2d(
-              c * newBatchSize * I32, I32,
-              indices, c * I32, topks[i] * I32,
-              I32, newBatchSize,
-              MemcpyKind.DeviceToDevice,
-            );
-          }
+          ws.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
         }
 
         return newMtpHiddenStates.capture();
