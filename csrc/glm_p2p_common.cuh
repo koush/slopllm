@@ -35,7 +35,7 @@ __device__ __forceinline__ void p2p_publish_and_wait(
             if ((int)((unsigned)v - (unsigned)target) < 0) __nanosleep(nanosleep_ns);
         } while ((int)((unsigned)v - (unsigned)target) < 0);
     }
-    __syncthreads();
+    __syncwarp();
 }
 
 #endif

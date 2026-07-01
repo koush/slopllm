@@ -75,7 +75,7 @@ p2p_barrier_kernel(
     if (tid < world_size) {
         s_peer_flags[tid] = peer_flags[tid];
     }
-    __syncthreads();
+    __syncwarp();
 
     int seq = (int)s_seq;
 
