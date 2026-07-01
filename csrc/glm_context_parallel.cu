@@ -18,7 +18,6 @@
 // ---------------------------------------------------------------------------
 
 #include "glm_ops.h"
-#include "glm_p2p_common.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdio>

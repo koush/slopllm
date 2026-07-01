@@ -1,26 +1,14 @@
 // ---------------------------------------------------------------------------
-// Custom P2P "one-shot" AllReduce for small messages (single-block design).
+// Custom P2P barrier and smem-staged AllGather for multi-GPU decode.
 //
-// Targets PCIe-only multi-GPU systems where NCCL ring AllReduce is ~30-50 us
-// per call due to multi-hop launch latency. This implementation completes a
-// 10 KB AllReduce in ~5-10 us by:
-//   - Mapping every peer's data buffer directly via cudaDeviceEnablePeerAccess
-//     (single-process, all-GPUs-in-same-cuCtx topology).
-//   - Each rank scatters its local input into a double-buffered slot
-//     (selected by the call counter) before waiting for peers.
-//   - Each rank publishes a data-ready flag (odd seq value) and waits for
-//     all peers' data-ready flags before reading their data.
-//   - Double buffering + the data-ready wait prevents any rank from getting
-//     2+ calls ahead: a rank cannot complete call N+1 until all peers
-//     publish data-ready for N+1, which requires them to have finished
-//     call N, so the next call's slot is safe to reuse.
-//   - Each rank reads from every peer's data buffer (at the current slot)
-//     in parallel and sums.
+// P2P barrier: single-warp kernel that publishes a seq-counted flag to all
+// peers via st.global.release.sys and spin-waits for their flags via
+// ld.acquire.sys. Used before AllGather and reduce-scatter to ensure peer
+// data is visible.
 //
-// We use a *single block* per AllReduce — fine for hidden sizes up to
-// block_size * VEC = 1024 * 8 = 8192 BF16 elements (16 KB). For Qwen3-32B
-// (hidden=5120 BF16 = 10 KB) this covers the AllReduces emitted after o_proj
-// and down_proj.
+// Smem-staged AllGather: reads peer GPU memory into shared memory via
+// cg::memcpy_async, then vector-copies to global output. D-adaptive pipeline
+// depth, rank-rotated peer read order.
 //
 // CUDA Graph compatibility:
 //   The seq counter lives in device memory. Each kernel call atomicAdds it to
@@ -28,12 +16,10 @@
 //   replays produce the correct fresh seq each time.
 //
 // Thread-safety:
-//   This is a single-stream API. Concurrent AllReduces from different streams
-//   on the same instance would race on the seq counter and flag. Callers
-//   should serialize via stream events.
+//   Single-stream API. Concurrent calls from different streams on the same
+//   instance would race on the seq counter and flag.
 // ---------------------------------------------------------------------------
 #include "glm_ops.h"
-#include "glm_p2p_common.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cooperative_groups.h>
@@ -49,8 +35,7 @@ constexpr int P2P_AR_VEC_BF16 = 8;   // uint4 = 8 bf16
 constexpr int P2P_AR_VEC_F32 = 4;    // uint4 = 4 fp32
 
 // ---------------------------------------------------------------------------
-// P2P barrier: increment seq, publish flag, wait for peers. No data scatter.
-// Writes slot_offset so callers know which double-buffer slot was selected.
+// P2P barrier: increment seq, publish flag, wait for peers. No data transfer.
 // ---------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(P2P_BARRIER_BLOCK_SIZE, 1)
@@ -79,9 +64,30 @@ p2p_barrier_kernel(
 
     int seq = (int)s_seq;
 
-    p2p_publish_and_wait(tid, my_rank, world_size, seq,
-                         s_peer_flags, s_peer_flags[my_rank],
-                         nanosleep_ns, peer_rank);
+    bool active = (peer_rank < 0 && tid < world_size) ||
+                  (peer_rank >= 0 && tid == peer_rank);
+
+    if (active) {
+        int val = seq + 1;
+        if (tid == my_rank) {
+            s_peer_flags[my_rank][my_rank] = val;
+        } else {
+            asm volatile("st.global.release.sys.s32 [%0], %1;"
+                         :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
+        }
+    }
+
+    if (active) {
+        int target = seq + 1;
+        int* my_flags = s_peer_flags[my_rank];
+        int v;
+        do {
+            asm volatile("ld.acquire.sys.b32 %0, [%1];"
+                         : "=r"(v) : "l"(my_flags + tid));
+            if ((int)((unsigned)v - (unsigned)target) < 0) __nanosleep(nanosleep_ns);
+        } while ((int)((unsigned)v - (unsigned)target) < 0);
+    }
+    __syncwarp();
 }
 
 
