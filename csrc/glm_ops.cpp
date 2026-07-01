@@ -758,34 +758,6 @@ static Napi::Value SumPointers(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value FlatAllReduce(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 13) {
-        Napi::TypeError::New(env, "Expected (ctx, p0..p7, N, numel, dtype, my_rank)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t p[8];
-    for (int i = 0; i < 8; i++) {
-        p[i] = info[1 + i].As<Napi::Number>().Int64Value();
-    }
-    int N = info[9].As<Napi::Number>().Int32Value();
-    int64_t numel = info[10].As<Napi::Number>().Int64Value();
-    int dtype = info[11].As<Napi::Number>().Int32Value();
-    int my_rank = info[12].As<Napi::Number>().Int32Value();
-    glm_flat_allreduce(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                       reinterpret_cast<void*>(p[0]),  reinterpret_cast<void*>(p[1]),
-                       reinterpret_cast<void*>(p[2]),  reinterpret_cast<void*>(p[3]),
-                       reinterpret_cast<void*>(p[4]),  reinterpret_cast<void*>(p[5]),
-                       reinterpret_cast<void*>(p[6]),  reinterpret_cast<void*>(p[7]),
-                       N, numel, dtype, my_rank);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        Napi::Error::New(env, std::string("flatAllReduce failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
-    }
-    return env.Undefined();
-}
-
 static Napi::Value Add(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 5) {
@@ -3506,7 +3478,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));
     exports.Set(Napi::String::New(env, "scale"), Napi::Function::New(env, Scale));
     exports.Set(Napi::String::New(env, "sumPointers"), Napi::Function::New(env, SumPointers));
-    exports.Set(Napi::String::New(env, "flatAllReduce"), Napi::Function::New(env, FlatAllReduce));
     exports.Set(Napi::String::New(env, "add"), Napi::Function::New(env, Add));
     exports.Set(Napi::String::New(env, "addBroadcast"), Napi::Function::New(env, AddBroadcast));
     exports.Set(Napi::String::New(env, "rowScaleAdd"), Napi::Function::New(env, RowScaleAdd));

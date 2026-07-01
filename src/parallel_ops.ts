@@ -163,11 +163,127 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism !== TensorParallelism.PartialSum) {
       throw new Error(`allReduce requires PartialSum tensor, got ${this.parallelism}`);
     }
-    // console.warn(`Performing allReduce on PartialSum tensor with shape [${this.fullShape}] and type ${this.type}, this may be slow`);
-    const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
-    const dtype = this.parallelOps.ncclDatatype(this.type);
-    this.parallelOps.doAllReduce(this.shards, count, dtype);
+    if (!this.tryP2PAllReduce()) {
+      const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
+      const dtype = this.parallelOps.ncclDatatype(this.type);
+      const addon = getNativeAddon();
+      addon.ncclGroupStart();
+      for (let i = 0; i < this.worldSize; ++i) {
+        addon.ncclAllReduce(
+          this.parallelOps.comms[i], this.devices[i].ctx,
+          this.shards[i].data, this.shards[i].data,
+          count, dtype, NCCL_SUM,
+        );
+      }
+      addon.ncclGroupEnd();
+    }
     this.parallelism = TensorParallelism.Replicated;
+  }
+
+  /**
+   * Try to AllReduce via the custom P2P kernel. Returns true on success
+   * (caller must skip the NCCL fallback). Returns false if the message is
+   * too large for the P2P group, in which case the caller should NCCL.
+   */
+  private tryP2PAllReduce(): boolean {
+    if (!this.parallelOps.p2pEnabled)
+      return false;
+    if (this.type !== "BF16" && this.type !== "F32")
+      return false;
+
+    const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
+
+    if (true) {
+      if (count > 65536 * 2)
+        return false;
+      const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
+      if (!group)
+        return false;
+
+      this.parallelOps.p2pBarrier();
+      this.parallelOps.sourceCleanup();
+
+      if (count % this.worldSize !== 0)
+        return false;
+      const chunkLen = count / this.worldSize;
+      const chunkBytes = chunkLen * (this.shards[0].bytes / count);
+      const flatShards = this.shards.map(s => s.reshape([count]));
+      this.parallelOps.p2pSources.push(...flatShards);
+      const outputShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        const rowShards: Tensor[] = new Array(this.worldSize);
+        // rank i starts with its own shard (j = i) and walks outward,
+        // instead of every rank hitting flatShards[0] first
+        for (let k = 0; k < this.worldSize; k++) {
+          const j = (i + k) % this.worldSize;
+          const v = flatShards[j].narrow(i * chunkLen, chunkLen);
+          rowShards[k] = v;
+          this.parallelOps.p2pSources.push(v);
+        }
+        rowShards[0].sumInPlace(rowShards);
+        outputShards.push(rowShards[0]);
+      }
+      this.parallelOps.p2pBarrier();
+
+      const addon = getNativeAddon();
+      const ptrs = new Array<number>(8).fill(0);
+      for (let i = 0; i < this.worldSize; i++) ptrs[i] = outputShards[i].data;
+      for (let i = 0; i < this.worldSize; ++i) {
+        addon.p2pAllGatherRowSmem(
+          this.devices[i].ctx,
+          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+          this.shards[i].data, this.worldSize, chunkBytes, this.shards[i].bytes, 1, i,
+        );
+      }
+
+      return true;
+    }
+
+    // butterfly reduce
+    if (true) {
+      if (count > 65536 * 2)
+        return false;
+      const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
+      if (!group)
+        return false;
+
+      let current: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        const copy = this.shards[i].workspace.alloc(this.shards[i].shape, this.shards[i].type);
+        copy.memcpy(this.shards[i]);
+        current.push(copy);
+      }
+
+      for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
+        const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
+        const isLast = reduceHalf === 1;
+
+        this.parallelOps.p2pBarrier(peerRanks);
+        if (reduceHalf === this.worldSize / 2) {
+          this.parallelOps.sourceCleanup();
+        }
+        this.parallelOps.p2pSources.push(...current);
+
+        if (isLast) {
+          for (let i = 0; i < this.worldSize; i++) {
+            const peer = i ^ reduceHalf;
+            this.shards[i].sumInPlace([current[i], current[peer]]);
+          }
+        } else {
+          const output: Tensor[] = new Array(this.worldSize);
+          for (let i = 0; i < this.worldSize; i++) {
+            const peer = i ^ reduceHalf;
+            output[i] = current[i].sum([current[peer]]);
+          }
+          current = output;
+        }
+      }
+
+      return true;
+    }
+
+    return false;
   }
 
   allGather(workspace: WorkspaceBase): ParallelTensor {
@@ -178,15 +294,12 @@ export class ParallelTensor extends Tensor {
       throw new Error("allGather cannot be used on PartialSum tensors; use allReduce instead");
     }
     const output = this.workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
-    const elemBytes = ParallelTensor.elemBytes(this.type);
 
-    if (this.parallelOps.tryP2PAllGather(this.shards, output.shards, count, elemBytes, this.parallelism, this.shape)) {
+    if (this.tryP2PAllGather(output)) {
       return output;
     }
 
-    // console.warn(`Falling back to NCCL allGather for parallelism ${this.parallelism}, this may be slow`);
-
+    const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     const dtype = this.parallelOps.ncclDatatype(this.type);
     const comms = this.parallelOps.comms;
 
@@ -244,6 +357,66 @@ export class ParallelTensor extends Tensor {
     }
 
     throw new Error(`allGather: unsupported parallelism ${this.parallelism}`);
+  }
+
+  /**
+   * Try to AllGather via the custom P2P kernel. Returns true on success
+   * (caller must skip the NCCL fallback). Returns false if the shard is
+   * too large for the P2P group, in which case the caller should use NCCL.
+   * Dtype-agnostic: copies raw bytes, supports all element types.
+   */
+  private tryP2PAllGather(output: ParallelTensor): boolean {
+    if (!this.parallelOps.p2pEnabled)
+      return false;
+    const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
+    const elemBytes = ParallelTensor.elemBytes(this.type);
+    const shardBytes = count * elemBytes;
+    const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
+    if (!group)
+      return false;
+
+    const addon = getNativeAddon();
+    const ptrs = new Array<number>(8).fill(0);
+    for (let i = 0; i < this.worldSize; i++) ptrs[i] = this.shards[i].data;
+
+    if (this.parallelism === TensorParallelism.Column) {
+      // Smem-staged AllGather: barrier, then single kernel reads from all peers via TMA.
+      this.parallelOps.p2pBarrier();
+      this.parallelOps.sourceCleanup();
+      this.parallelOps.p2pSources.push(...this.shards.map(s => s.viewClone()));
+      for (let i = 0; i < this.worldSize; ++i) {
+        addon.p2pAllGatherSmem(
+          this.devices[i].ctx,
+          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+          output.shards[i].data, this.worldSize, shardBytes, i,
+        );
+      }
+      return true;
+    }
+
+    if (this.parallelism === TensorParallelism.Row) {
+      const outer = this.shape[0];
+      const inner = this.shape.slice(2).reduce((a, b) => a * b, 1);
+      const shardDim1 = this.shape[1] / this.worldSize;
+      const shardDim1Bytes = shardDim1 * inner * elemBytes;
+      const fullDim1Bytes = this.shape[1] * inner * elemBytes;
+      // Smem-staged Row AllGather: barrier, then single kernel reads from all peers via TMA.
+      this.parallelOps.p2pBarrier();
+      this.parallelOps.sourceCleanup();
+      this.parallelOps.p2pSources.push(...this.shards.map(s => s.viewClone()));
+      for (let i = 0; i < this.worldSize; ++i) {
+        addon.p2pAllGatherRowSmem(
+          this.devices[i].ctx,
+          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+          output.shards[i].data, this.worldSize, shardDim1Bytes, fullDim1Bytes, outer, i,
+        );
+      }
+      return true;
+    }
+
+    return false;
   }
 
   sliceToRowParallel(workspace: WorkspaceBase, shardDim1: number): ParallelTensor {
@@ -1759,7 +1932,7 @@ export class ParallelOps implements DeviceOps {
   private readonly shardWorkspaces = new WeakMap<WorkspaceBase, WorkspaceBase[]>();
   /** Lazy-initialized P2P groups per stream. */
   private p2pGroups = new Map<number, P2PAllReduceGroup>();
-  private p2pEnabled: boolean;
+  p2pEnabled: boolean;
   /** When true, all GPUs are context-parallel shards. MLA ops auto-inject cpWorldSize/cpRank. */
 
   constructor(devices: GlmOps[]) {
@@ -1805,7 +1978,7 @@ export class ParallelOps implements DeviceOps {
   }
 
   /** Get (and lazily create) the P2P group for the given stream. */
-  private getP2PGroup(stream: number): P2PAllReduceGroup | null {
+  getP2PGroup(stream: number): P2PAllReduceGroup | null {
     if (!this.p2pEnabled) return null;
     if (!this.p2pGroups.has(stream)) {
       try {
@@ -1825,219 +1998,6 @@ export class ParallelOps implements DeviceOps {
     while (this.p2pSources.length) {
       using _src = this.p2pSources.pop()!;
     }
-  }
-
-  /**
-   * Try to AllReduce via the custom P2P kernel. Returns true on success
-   * (caller must skip the NCCL fallback). Returns false if the message is
-   * too large for the P2P group, in which case the caller should NCCL.
-   */
-  private tryP2PAllReduce(shards: readonly Tensor[], count: number, dtype: number): boolean {
-    if (!this.p2pEnabled)
-      return false;
-    if (dtype !== NCCL_BFLOAT16 && dtype !== NCCL_FLOAT32)
-      return false;
-
-    if (true) {
-      if (count > 65536 * 2)
-        return false;
-      const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
-      if (!group)
-        return false;
-
-      this.p2pBarrier();
-      this.sourceCleanup();
-
-      if (count % this.worldSize !== 0)
-        return false;
-      const chunkLen = count / this.worldSize;
-      const chunkBytes = chunkLen * (shards[0].bytes / count);
-      const flatShards = shards.map(s => s.reshape([count]));
-      this.p2pSources.push(...flatShards);
-      const outputShards: Tensor[] = [];
-      for (let i = 0; i < this.worldSize; i++) {
-        const rowShards: Tensor[] = new Array(this.worldSize);
-        // rank i starts with its own shard (j = i) and walks outward,
-        // instead of every rank hitting flatShards[0] first
-        for (let k = 0; k < this.worldSize; k++) {
-          const j = (i + k) % this.worldSize;
-          const v = flatShards[j].narrow(i * chunkLen, chunkLen);
-          rowShards[j] = v;
-          this.p2pSources.push(v);
-        }
-        rowShards[i].sumInPlace(rowShards);
-        outputShards.push(rowShards[i]);
-      }
-      this.p2pBarrier();
-
-      const addon = getNativeAddon();
-      const ptrs = new Array<number>(8).fill(0);
-      for (let i = 0; i < this.worldSize; i++) ptrs[i] = outputShards[i].data;
-      for (let i = 0; i < this.worldSize; ++i) {
-        addon.p2pAllGatherRowSmem(
-          this.devices[i].ctx,
-          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-          shards[i].data, this.worldSize, chunkBytes, shards[i].bytes, 1, i,
-        );
-      }
-
-      return true;
-    }
-
-    // butterfly reduce
-    if (true) {
-      if (count > 65536 * 2)
-        return false;
-      const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
-      if (!group)
-        return false;
-
-      let current: Tensor[] = [];
-      for (let i = 0; i < this.worldSize; i++) {
-        const copy = shards[i].workspace.alloc(shards[i].shape, shards[i].type);
-        copy.memcpy(shards[i]);
-        current.push(copy);
-      }
-
-      for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
-        const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
-        const isLast = reduceHalf === 1;
-
-        this.p2pBarrier(peerRanks);
-        if (reduceHalf === this.worldSize / 2) {
-          this.sourceCleanup();
-        }
-        this.p2pSources.push(...current);
-
-        if (isLast) {
-          for (let i = 0; i < this.worldSize; i++) {
-            const peer = i ^ reduceHalf;
-            shards[i].sumInPlace([current[i], current[peer]]);
-          }
-        } else {
-          const output: Tensor[] = new Array(this.worldSize);
-          for (let i = 0; i < this.worldSize; i++) {
-            const peer = i ^ reduceHalf;
-            output[i] = current[i].sum([current[peer]]);
-          }
-          current = output;
-        }
-      }
-
-      return true;
-    }
-
-    // each gpu reduces a shard and scatters
-
-    // keep an eye on this, p2p limit needs to be above MTP prefill size (15 for top 2 and nextn 3)
-    if (count > 65536 * 2)
-      return false;
-    if (count % this.worldSize !== 0)
-      return false;
-    const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
-    if (!group)
-      return false;
-
-    // Flat all-to-all: 2 barriers + 1 kernel.
-    // Each GPU loads all N peers through double-buffered smem, accumulates
-    // in registers, and writes the result back to all peers (in-place).
-    // Block-level pointer rotation is handled inside the kernel.
-    this.p2pBarrier();
-    this.sourceCleanup();
-
-    const ptrs = shards.map(s => s.data);
-    const dt = (dtype === NCCL_BFLOAT16) ? 9 : 7;
-    const N = this.worldSize;
-    for (let i = 0; i < N; i++) {
-      this.devices[i].flatAllReduce(ptrs, N, count, dt, i);
-    }
-
-    this.p2pBarrier();
-    this.sourceCleanup();
-
-    return true;
-  }
-
-  /**
-   * Try to AllGather via the custom P2P kernel. Returns true on success
-   * (caller must skip the NCCL fallback). Returns false if the shard is
-   * too large for the P2P group, in which case the caller should use NCCL.
-   * Dtype-agnostic: copies raw bytes, supports all element types.
-   */
-  tryP2PAllGather(
-    shards: readonly Tensor[],
-    outputShards: readonly Tensor[],
-    count: number,
-    elemBytes: number,
-    parallelism: TensorParallelism,
-    fullShape: number[],
-  ): boolean {
-    if (!this.p2pEnabled)
-      return false;
-    const shardBytes = count * elemBytes;
-    const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
-    if (!group)
-      return false;
-
-    const addon = getNativeAddon();
-    const ptrs = new Array<number>(8).fill(0);
-    for (let i = 0; i < this.worldSize; i++) ptrs[i] = shards[i].data;
-
-    if (parallelism === TensorParallelism.Column) {
-      // Smem-staged AllGather: barrier, then single kernel reads from all peers via TMA.
-      this.p2pBarrier();
-      this.sourceCleanup();
-      this.p2pSources.push(...shards.map(s => s.viewClone()));
-      for (let i = 0; i < this.worldSize; ++i) {
-        addon.p2pAllGatherSmem(
-          this.devices[i].ctx,
-          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-          outputShards[i].data, this.worldSize, shardBytes, i,
-        );
-      }
-      return true;
-    }
-
-    if (parallelism === TensorParallelism.Row) {
-      const outer = fullShape[0];
-      const inner = fullShape.slice(2).reduce((a, b) => a * b, 1);
-      const shardDim1 = fullShape[1] / this.worldSize;
-      const shardDim1Bytes = shardDim1 * inner * elemBytes;
-      const fullDim1Bytes = fullShape[1] * inner * elemBytes;
-      // Smem-staged Row AllGather: barrier, then single kernel reads from all peers via TMA.
-      this.p2pBarrier();
-      this.sourceCleanup();
-      this.p2pSources.push(...shards.map(s => s.viewClone()));
-      for (let i = 0; i < this.worldSize; ++i) {
-        addon.p2pAllGatherRowSmem(
-          this.devices[i].ctx,
-          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-          outputShards[i].data, this.worldSize, shardDim1Bytes, fullDim1Bytes, outer, i,
-        );
-      }
-      return true;
-    }
-
-    return false;
-  }
-
-  /** Public wrapper used by ParallelTensor.allReduce. */
-  doAllReduce(shards: readonly Tensor[], count: number, dtype: number): void {
-    if (this.tryP2PAllReduce(shards, count, dtype))
-      return;
-    const addon = getNativeAddon();
-    addon.ncclGroupStart();
-    for (let i = 0; i < this.worldSize; ++i) {
-      addon.ncclAllReduce(
-        this.comms[i], this.devices[i].ctx,
-        shards[i].data, shards[i].data,
-        count, dtype, NCCL_SUM,
-      );
-    }
-    addon.ncclGroupEnd();
   }
 
   /** NCCL point-to-point send. Must be paired with ncclRecv on peer. */
