@@ -68,7 +68,7 @@ p2p_barrier_kernel(
 
     if (tid == 0) {
         unsigned long long s = atomicAdd(my_seq_counter, 2ULL) + 2ULL;
-        s_seq = (unsigned int)(s & 0x7FFFFFFFu);
+        s_seq = (unsigned int)s;
         if (s_seq == 0) s_seq = 2;
     }
     if (tid < world_size) {

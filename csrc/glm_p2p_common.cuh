@@ -33,8 +33,8 @@ __device__ __forceinline__ void p2p_publish_and_wait(
         do {
             asm volatile("ld.volatile.global.s32 %0, [%1];"
                          : "=r"(v) : "l"(my_flags + tid));
-            if (v < target) __nanosleep(32);
-        } while (v < target);
+            if ((int)((unsigned)v - (unsigned)target) < 0) __nanosleep(32);
+        } while ((int)((unsigned)v - (unsigned)target) < 0);
         asm volatile("fence.acquire.sys;");
     }
     __syncthreads();
