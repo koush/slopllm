@@ -1884,6 +1884,53 @@ export class ParallelOps implements DeviceOps {
     if (dtype !== NCCL_BFLOAT16 && dtype !== NCCL_FLOAT32)
       return false;
 
+    if (true) {
+      if (count > 65536 * 2)
+        return false;
+      const group = this.getP2PGroup(shards[0].workspace.glm.currentStream);
+      if (!group)
+        return false;
+
+      this.p2pBarrier();
+      this.sourceCleanup();
+
+      if (count % this.worldSize !== 0)
+        return false;
+      const chunkLen = count / this.worldSize;
+      const chunkBytes = chunkLen * (shards[0].bytes / count);
+      const flatShards = shards.map(s => s.reshape([count]));
+      this.p2pSources.push(...flatShards);
+      const outputShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        const rowShards: Tensor[] = new Array(this.worldSize);
+        // rank i starts with its own shard (j = i) and walks outward,
+        // instead of every rank hitting flatShards[0] first
+        for (let k = 0; k < this.worldSize; k++) {
+          const j = (i + k) % this.worldSize;
+          const v = flatShards[j].narrow(i * chunkLen, chunkLen);
+          rowShards[j] = v;
+          this.p2pSources.push(v);
+        }
+        rowShards[i].sumInPlace(rowShards);
+        outputShards.push(rowShards[i]);
+      }
+      this.p2pBarrier();
+
+      const addon = getNativeAddon();
+      const ptrs = new Array<number>(8).fill(0);
+      for (let i = 0; i < this.worldSize; i++) ptrs[i] = outputShards[i].data;
+      for (let i = 0; i < this.worldSize; ++i) {
+        addon.p2pAllGatherRowSmem(
+          this.devices[i].ctx,
+          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+          shards[i].data, this.worldSize, chunkBytes, shards[i].bytes, 1, i,
+        );
+      }
+
+      return true;
+    }
+
     // butterfly reduce
     if (true) {
       if (count > 65536 * 2)
@@ -2014,7 +2061,7 @@ export class ParallelOps implements DeviceOps {
           this.devices[i].ctx,
           ptrs[0], ptrs[1], ptrs[2], ptrs[3],
           ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-          outputShards[i].data, this.worldSize, shardDim1Bytes, fullDim1Bytes, outer,
+          outputShards[i].data, this.worldSize, shardDim1Bytes, fullDim1Bytes, outer, i,
         );
       }
       return true;

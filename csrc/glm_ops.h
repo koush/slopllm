@@ -413,7 +413,7 @@ void glm_p2p_allgather_smem(GlmCtx* ctx,
 void glm_p2p_allgather_row_smem(GlmCtx* ctx,
     const void* p0,  const void* p1,  const void* p2,  const void* p3,
     const void* p4,  const void* p5,  const void* p6,  const void* p7,
-    void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer);
+    void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer, int rank);
 
 // P2P Row-parallel RMSNorm: computes RMSNorm on row-parallel tensors without
 // allGathering the full hidden dimension. Each rank computes local sum of squares,

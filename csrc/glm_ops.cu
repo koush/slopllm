@@ -2727,154 +2727,123 @@ __global__ void __launch_bounds__(256, 4) sum_pointers_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Smem-staged sum of N tensors (element-wise, max 8 inputs)
-// Double-buffered: while computing+writing from buf[0], buf[1] reads are
-// in flight. cg::wait_prior<N> lets us wait for buf[0] while buf[1] is
-// still pending. Uses cg::memcpy_async (no TMA, no alignment constraints).
+// Smem-staged sum of N tensors (element-wise, max 8 inputs).
+// Peers are streamed through D double-buffered smem slots while threads
+// accumulate in FP32 registers, so the per-peer read size is decoupled from N
+// (always the full block_stride, 16 KB for BF16). D = min(N, smem_budget /
+// per_peer_bytes) is chosen on the host: small tensors issue all N peers in
+// flight (one drain); large tensors pipeline 2 peers. wait_prior<D-1> requires
+// a compile-time D, hence the template parameter and the host switch.
 // ---------------------------------------------------------------------------
 
-template <typename scalar_t, int ElemsPerWarp, int N>
-__global__ void __launch_bounds__(1024, 1)
+template <typename scalar_t, int ElemsPerWarp, int D_VAL>
+__global__ void __launch_bounds__(512, 2)
 sum_pointers_smem_kernel(
     const scalar_t* p0,  const scalar_t* p1,  const scalar_t* p2,  const scalar_t* p3,
     const scalar_t* p4,  const scalar_t* p5,  const scalar_t* p6,  const scalar_t* p7,
     scalar_t* __restrict__ output,
-    int64_t numel,
-    int peer_stride)
+    int N, int64_t numel, int64_t peer_stride_elems)
 {
     constexpr int WarpSize = 32;
-
     auto block = cg::this_thread_block();
-
     extern __shared__ char smem_raw[];
 
     int warp_id = threadIdx.x / WarpSize;
     int lane    = threadIdx.x % WarpSize;
     int warps_per_block = blockDim.x / WarpSize;
+    int64_t block_stride = (int64_t)warps_per_block * ElemsPerWarp;
+    int64_t total_blocks = gridDim.x;
+    int64_t my_start = (int64_t)blockIdx.x * block_stride;
 
-    const char* byte_ptrs[8] = {
+    const char* peers[8] = {
         reinterpret_cast<const char*>(p0), reinterpret_cast<const char*>(p1),
         reinterpret_cast<const char*>(p2), reinterpret_cast<const char*>(p3),
         reinterpret_cast<const char*>(p4), reinterpret_cast<const char*>(p5),
         reinterpret_cast<const char*>(p6), reinterpret_cast<const char*>(p7),
     };
 
-    int64_t block_stride = (int64_t)warps_per_block * ElemsPerWarp;
-    int64_t total_blocks = gridDim.x;
-    int64_t my_block_start = (int64_t)blockIdx.x * block_stride;
-    size_t buf_size = (size_t)N * peer_stride;
+    constexpr int VEC = (sizeof(scalar_t) == 2) ? 2 : 1;
+    constexpr int PAIRS = ElemsPerWarp / (WarpSize * VEC);
+    int64_t warp_start = (int64_t)warp_id * ElemsPerWarp;
+    const size_t elem_sz = sizeof(scalar_t);
 
-    // Prologue: issue chunk 0 into buf[0]
-    int64_t blk = my_block_start;
-    int64_t blk_next = blk + total_blocks * block_stride;
-
-    if (blk < numel) {
+    for (int64_t blk = my_start; blk < numel; blk += total_blocks * block_stride) {
         int64_t elems = min(block_stride, numel - blk);
-        size_t copy_bytes = (size_t)elems * sizeof(scalar_t);
+        size_t copy_bytes = (size_t)elems * elem_sz;
+
+        float2 acc[PAIRS];
         #pragma unroll
-        for (int j = 0; j < N; j++) {
-            cg::memcpy_async(block,
-                smem_raw + j * peer_stride,
-                byte_ptrs[j] + blk * sizeof(scalar_t),
-                copy_bytes);
-        }
-    }
+        for (int k = 0; k < PAIRS; k++) acc[k] = {0.0f, 0.0f};
 
-    // Issue chunk 1 into buf[1] (if exists)
-    if (blk_next < numel) {
-        int64_t elems = min(block_stride, numel - blk_next);
-        size_t copy_bytes = (size_t)elems * sizeof(scalar_t);
+        int P = min(D_VAL, N);
         #pragma unroll
-        for (int j = 0; j < N; j++) {
-            cg::memcpy_async(block,
-                smem_raw + buf_size + j * peer_stride,
-                byte_ptrs[j] + blk_next * sizeof(scalar_t),
-                copy_bytes);
-        }
-    }
-
-    int buf = 0;
-    while (blk < numel) {
-        int next_buf = 1 - buf;
-        int64_t elems = min(block_stride, numel - blk);
-
-        // Wait for current buf (next buf still in flight, if any)
-        if (blk_next < numel) {
-            cg::wait_prior<N>(block);
-        } else {
-            cg::wait(block);
-        }
-
-        // Compute + scalar write from current buf (overlaps with next buf reads)
-        char* smem_buf = smem_raw + (size_t)buf * buf_size;
-        int64_t warp_start = warp_id * ElemsPerWarp;
-        int64_t warp_elems = min((int64_t)ElemsPerWarp, elems - warp_start);
-
-        if (warp_start < elems) {
-            if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
-                constexpr int VEC = 2;
-                int64_t vec_elems = warp_elems / VEC * VEC;
-                for (int64_t i = lane * VEC; i < vec_elems; i += WarpSize * VEC) {
-                    float2 acc = {0.0f, 0.0f};
-                    #pragma unroll
-                    for (int j = 0; j < N; j++) {
-                        __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(
-                            smem_buf + j * peer_stride + (warp_start + i) * sizeof(__nv_bfloat16));
-                        float2 f = __bfloat1622float2(v);
-                        acc.x += f.x;
-                        acc.y += f.y;
-                    }
-                    *reinterpret_cast<__nv_bfloat162*>(
-                        reinterpret_cast<char*>(output) + (blk + warp_start + i) * sizeof(__nv_bfloat16)) =
-                        __float22bfloat162_rn(acc);
-                }
-                int64_t tail_start = warp_start + vec_elems;
-                for (int64_t i = lane * VEC; i < warp_elems - vec_elems; i += WarpSize * VEC) {
-                    float2 acc = {0.0f, 0.0f};
-                    #pragma unroll
-                    for (int j = 0; j < N; j++) {
-                        __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(
-                            smem_buf + j * peer_stride + (tail_start + i) * sizeof(__nv_bfloat16));
-                        float2 f = __bfloat1622float2(v);
-                        acc.x += f.x;
-                        acc.y += f.y;
-                    }
-                    *reinterpret_cast<__nv_bfloat162*>(
-                        reinterpret_cast<char*>(output) + (blk + tail_start + i) * sizeof(__nv_bfloat16)) =
-                        __float22bfloat162_rn(acc);
-                }
-            } else {
-                for (int64_t i = lane; i < warp_elems; i += WarpSize) {
-                    float acc = 0.0f;
-                    #pragma unroll
-                    for (int j = 0; j < N; j++) {
-                        acc += reinterpret_cast<const float*>(
-                            smem_buf + j * peer_stride)[warp_start + i];
-                    }
-                    output[blk + warp_start + i] = acc;
-                }
-            }
-        }
-        __syncthreads();
-
-        // Prefetch chunk+2 into current buf (if exists)
-        int64_t blk_pf = blk_next + total_blocks * block_stride;
-        if (blk_pf < numel) {
-            int64_t pf_elems = min(block_stride, numel - blk_pf);
-            size_t pf_bytes = (size_t)pf_elems * sizeof(scalar_t);
-            char* pf_smem = smem_raw + (size_t)buf * buf_size;
-            #pragma unroll
-            for (int j = 0; j < N; j++) {
+        for (int k = 0; k < D_VAL; k++) {
+            if (k < P)
                 cg::memcpy_async(block,
-                    pf_smem + j * peer_stride,
-                    byte_ptrs[j] + blk_pf * sizeof(scalar_t),
-                    pf_bytes);
+                    smem_raw + (size_t)k * peer_stride_elems * elem_sz,
+                    peers[k] + (size_t)blk * elem_sz,
+                    copy_bytes);
+        }
+
+        int steady = max(0, N - D_VAL);
+        for (int j = 0; j < steady; j++) {
+            cg::wait_prior<D_VAL - 1>(block);
+            char* buf = smem_raw + (size_t)(j % D_VAL) * peer_stride_elems * elem_sz;
+            #pragma unroll
+            for (int k = 0; k < PAIRS; k++) {
+                int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
+                if (off + VEC <= elems) {
+                    if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                        __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(buf + off * elem_sz);
+                        float2 f = __bfloat1622float2(v);
+                        acc[k].x += f.x; acc[k].y += f.y;
+                    } else {
+                        float v = *reinterpret_cast<const float*>(buf + off * elem_sz);
+                        acc[k].x += v;
+                    }
+                }
+            }
+            cg::memcpy_async(block,
+                smem_raw + (size_t)(j % D_VAL) * peer_stride_elems * elem_sz,
+                peers[j + D_VAL] + (size_t)blk * elem_sz,
+                copy_bytes);
+        }
+
+        cg::wait(block);
+        for (int j = steady; j < N; j++) {
+            char* buf = smem_raw + (size_t)(j % D_VAL) * peer_stride_elems * elem_sz;
+            #pragma unroll
+            for (int k = 0; k < PAIRS; k++) {
+                int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
+                if (off + VEC <= elems) {
+                    if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                        __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(buf + off * elem_sz);
+                        float2 f = __bfloat1622float2(v);
+                        acc[k].x += f.x; acc[k].y += f.y;
+                    } else {
+                        float v = *reinterpret_cast<const float*>(buf + off * elem_sz);
+                        acc[k].x += v;
+                    }
+                }
             }
         }
 
-        buf = next_buf;
-        blk = blk_next;
-        blk_next = blk_pf;
+        #pragma unroll
+        for (int k = 0; k < PAIRS; k++) {
+            int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
+            if (off + VEC <= elems) {
+                if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                    *reinterpret_cast<__nv_bfloat162*>(
+                        reinterpret_cast<char*>(output) + (size_t)(blk + off) * elem_sz) =
+                        __float22bfloat162_rn(acc[k]);
+                } else {
+                    *reinterpret_cast<float*>(
+                        reinterpret_cast<char*>(output) + (size_t)(blk + off) * elem_sz) = acc[k].x;
+                }
+            }
+        }
+
+        __syncthreads();   // ensure drain's ld.shared done before next blk's cp.async
     }
 }
 
@@ -3151,49 +3120,56 @@ void glm_sum_pointers(GlmCtx* ctx,
     cudaSetDevice(ctx->device_id);
 
     constexpr int ElemsPerWarp = 512;
-    constexpr int WarpSize = 32;
-    constexpr int SmemBudget = 64 * 1024;  // doubled for double-buffering
+    constexpr int WarpsPerBlock = 16;
+    constexpr int64_t BlockStride = (int64_t)WarpsPerBlock * ElemsPerWarp;
+    constexpr int64_t SmemBudget = 32 * 1024;
 
     int elem_size = (dtype == 9) ? 2 : 4;
-    int smem_per_warp = N * ElemsPerWarp * elem_size;
-    if (smem_per_warp < 1) smem_per_warp = 1;
+    int64_t peer_stride_elems = (numel < BlockStride) ? numel : BlockStride;
+    int64_t peer_stride_bytes = peer_stride_elems * elem_size;
+    if (peer_stride_bytes < 1) peer_stride_bytes = 1;
+    int64_t budget = SmemBudget / peer_stride_bytes;
+    int D = (int)((budget < N) ? budget : N);
+    if (D < 1) D = 1;
+    if (D > 8) D = 8;
 
-    int warps_per_block = SmemBudget / (2 * smem_per_warp);
-    if (warps_per_block > 32) warps_per_block = 32;
-    if (warps_per_block < 1) warps_per_block = 1;
-
-    int block_size = warps_per_block * WarpSize;
-    int total_warps = (int)((numel + ElemsPerWarp - 1) / ElemsPerWarp);
+    int64_t total_warps = (numel + ElemsPerWarp - 1) / ElemsPerWarp;
     if (total_warps == 0) total_warps = 1;
-    int grid = (total_warps + warps_per_block - 1) / warps_per_block;
+    int grid = (int)((total_warps + WarpsPerBlock - 1) / WarpsPerBlock);
+    int block_size = WarpsPerBlock * 32;
+    int64_t smem_bytes = (int64_t)D * peer_stride_bytes;
 
-    int peer_stride = warps_per_block * ElemsPerWarp * elem_size;
-    int smem_bytes = 2 * N * peer_stride;
-
-#define DISPATCH_SUM(DTYPE, N_VAL) \
-    do { \
-        cudaFuncSetAttribute( \
-            (void*)sum_pointers_smem_kernel<DTYPE, ElemsPerWarp, N_VAL>, \
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes); \
-        sum_pointers_smem_kernel<DTYPE, ElemsPerWarp, N_VAL><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>( \
-            (const DTYPE*)p0, (const DTYPE*)p1, (const DTYPE*)p2, (const DTYPE*)p3, \
-            (const DTYPE*)p4, (const DTYPE*)p5, (const DTYPE*)p6, (const DTYPE*)p7, \
-            (DTYPE*)output, numel, peer_stride); \
-    } while(0)
+#define DISPATCH_SUM(SCT, DVAL) do { \
+    cudaFuncSetAttribute( \
+        (void*)sum_pointers_smem_kernel<SCT, ElemsPerWarp, DVAL>, \
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 32768); \
+    sum_pointers_smem_kernel<SCT, ElemsPerWarp, DVAL><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>( \
+        (const SCT*)p0, (const SCT*)p1, (const SCT*)p2, (const SCT*)p3, \
+        (const SCT*)p4, (const SCT*)p5, (const SCT*)p6, (const SCT*)p7, \
+        (SCT*)output, N, numel, peer_stride_elems); \
+} while (0)
 
     if (dtype == 9) {
-        switch (N) {
-            case 2: DISPATCH_SUM(__nv_bfloat16, 2); break;
-            case 4: DISPATCH_SUM(__nv_bfloat16, 4); break;
+        switch (D) {
             case 8: DISPATCH_SUM(__nv_bfloat16, 8); break;
-            default: fprintf(stderr, "glm_sum_pointers: unsupported N=%d\n", N); break;
+            case 7: DISPATCH_SUM(__nv_bfloat16, 7); break;
+            case 6: DISPATCH_SUM(__nv_bfloat16, 6); break;
+            case 5: DISPATCH_SUM(__nv_bfloat16, 5); break;
+            case 4: DISPATCH_SUM(__nv_bfloat16, 4); break;
+            case 3: DISPATCH_SUM(__nv_bfloat16, 3); break;
+            case 2: DISPATCH_SUM(__nv_bfloat16, 2); break;
+            default: DISPATCH_SUM(__nv_bfloat16, 1); break;
         }
     } else {
-        switch (N) {
-            case 2: DISPATCH_SUM(float, 2); break;
-            case 4: DISPATCH_SUM(float, 4); break;
+        switch (D) {
             case 8: DISPATCH_SUM(float, 8); break;
-            default: fprintf(stderr, "glm_sum_pointers: unsupported N=%d\n", N); break;
+            case 7: DISPATCH_SUM(float, 7); break;
+            case 6: DISPATCH_SUM(float, 6); break;
+            case 5: DISPATCH_SUM(float, 5); break;
+            case 4: DISPATCH_SUM(float, 4); break;
+            case 3: DISPATCH_SUM(float, 3); break;
+            case 2: DISPATCH_SUM(float, 2); break;
+            default: DISPATCH_SUM(float, 1); break;
         }
     }
 #undef DISPATCH_SUM

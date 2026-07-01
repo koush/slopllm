@@ -854,8 +854,14 @@ p2p_allgather_smem_kernel(
     }
 }
 
-template <int N>
-__global__ void __launch_bounds__(AG_SMEM_BLOCK_SIZE, 1)
+// Redesigned allgather: 1 block per row (no no-op blocks), 512 threads,
+// D_VAL-deep smem pipeline streaming N peers, vectorized int4 smem→global
+// copy.  Rotation by `rank` spreads peer-read order across GPUs so they
+// don't all hammer peer 0 first.  D_VAL adapts to data size (host picks
+// D = min(N, 32KB / peer_stride)): small data → D=N (all in flight, single
+// drain); large data → D=2..4 (double/triple-buffer pipeline).
+template <int N, int D_VAL>
+__global__ void __launch_bounds__(512, 2)
 p2p_allgather_row_smem_kernel(
     const void* __restrict__ p0,  const void* __restrict__ p1,
     const void* __restrict__ p2,  const void* __restrict__ p3,
@@ -864,9 +870,16 @@ p2p_allgather_row_smem_kernel(
     void* __restrict__ output,
     int shard_dim1_bytes,
     int full_dim1_bytes,
-    int outer)
+    int outer,
+    int rank)
 {
+    constexpr int THREADS = 512;
+    constexpr int VEC = 16;                       // int4
+    constexpr int BLOCK_BYTES = THREADS * VEC;     // 8192
+
     auto block = cg::this_thread_block();
+    extern __shared__ char smem_raw[];
+
     const char* ptrs[AG_SMEM_MAX_N] = {
         static_cast<const char*>(p0), static_cast<const char*>(p1),
         static_cast<const char*>(p2), static_cast<const char*>(p3),
@@ -874,94 +887,74 @@ p2p_allgather_row_smem_kernel(
         static_cast<const char*>(p6), static_cast<const char*>(p7),
     };
 
-    extern __shared__ char smem_raw[];
-    int tid = threadIdx.x;
-    int bs  = blockDim.x;
-
-    int rot = blockIdx.x % N;
-    const char* rotated_ptrs[AG_SMEM_MAX_N];
-    #pragma unroll
-    for (int s = 0; s < AG_SMEM_MAX_N; s++) {
-        if (s < N) {
-            rotated_ptrs[s] = ptrs[(s + rot) % N];
-        }
-    }
-
-    int tile_bytes = min(AG_TILE_BYTES, shard_dim1_bytes);
-    int peer_stride = tile_bytes;
-    size_t buf_size = (size_t)N * peer_stride;
+    int tile_bytes = (BLOCK_BYTES < shard_dim1_bytes) ? BLOCK_BYTES : shard_dim1_bytes;
+    int peer_stride = (tile_bytes + VEC - 1) & ~(VEC - 1);
     int num_tiles = (shard_dim1_bytes + tile_bytes - 1) / tile_bytes;
-    char* out_b = static_cast<char*>(output);
+
+    int tid = threadIdx.x;
+    int P = (D_VAL < N) ? D_VAL : N;
 
     for (int row = blockIdx.x; row < outer; row += gridDim.x)
     {
-        // Prologue: issue tile 0 into buf[0]
+        char* row_out = static_cast<char*>(output) + (int64_t)row * full_dim1_bytes;
+
+        for (int tile = 0; tile < num_tiles; tile++)
         {
-            int64_t elems = min((int64_t)tile_bytes, (int64_t)shard_dim1_bytes);
+            int64_t blk = (int64_t)tile * tile_bytes;
+            int elems = (tile_bytes < shard_dim1_bytes - blk) ? tile_bytes : shard_dim1_bytes - blk;
+            int n_vec = elems / VEC;
+            int tail  = elems - n_vec * VEC;
+
+            // Issue first D_VAL peer reads (rotated by rank)
             #pragma unroll
-            for (int s = 0; s < N; s++) {
-                cg::memcpy_async(block,
-                    smem_raw + s * peer_stride,
-                    rotated_ptrs[s] + (int64_t)row * shard_dim1_bytes,
-                    elems);
-            }
-        }
-
-        // Issue tile 1 into buf[1] (if exists)
-        if (num_tiles > 1) {
-            int64_t off = tile_bytes;
-            int64_t elems = min((int64_t)tile_bytes, (int64_t)shard_dim1_bytes - off);
-            #pragma unroll
-            for (int s = 0; s < N; s++) {
-                cg::memcpy_async(block,
-                    smem_raw + buf_size + s * peer_stride,
-                    rotated_ptrs[s] + (int64_t)row * shard_dim1_bytes + off,
-                    elems);
-            }
-        }
-
-        int buf = 0;
-        for (int tile = 0; tile < num_tiles; tile++) {
-            int next_buf = 1 - buf;
-            int64_t tile_off = (int64_t)tile * tile_bytes;
-            int64_t write_bytes = min((int64_t)tile_bytes, (int64_t)shard_dim1_bytes - tile_off);
-
-            // Wait for current buf's reads (next buf still in flight)
-            if (tile < num_tiles - 1) {
-                cg::wait_prior<N>(block);
-            } else {
-                cg::wait(block);
-            }
-
-            // Scalar write from current buf (overlaps with next buf reads)
-            char* smem_buf = smem_raw + (size_t)buf * buf_size;
-            #pragma unroll
-            for (int s = 0; s < N; s++) {
-                int actual_peer = (s + rot) % N;
-                const char* src = smem_buf + s * peer_stride;
-                char* dst = out_b + (int64_t)row * full_dim1_bytes
-                            + (int64_t)actual_peer * shard_dim1_bytes + tile_off;
-                for (int i = tid; i < write_bytes; i += bs) {
-                    dst[i] = src[i];
-                }
-            }
-            __syncthreads();
-
-            // Prefetch tile+2 into current buf (if exists)
-            if (tile + 2 < num_tiles) {
-                int64_t pf_off = (int64_t)(tile + 2) * tile_bytes;
-                int64_t pf_bytes = min((int64_t)tile_bytes, (int64_t)shard_dim1_bytes - pf_off);
-                char* pf_smem = smem_raw + (size_t)buf * buf_size;
-                #pragma unroll
-                for (int s = 0; s < N; s++) {
+            for (int k = 0; k < D_VAL; k++) {
+                if (k < P) {
+                    int peer = (k + rank) % N;
                     cg::memcpy_async(block,
-                        pf_smem + s * peer_stride,
-                        rotated_ptrs[s] + (int64_t)row * shard_dim1_bytes + pf_off,
-                        pf_bytes);
+                        smem_raw + (size_t)k * peer_stride,
+                        ptrs[peer] + (int64_t)row * shard_dim1_bytes + blk,
+                        elems);
                 }
             }
 
-            buf = next_buf;
+            // Steady: stream remaining N-D_VAL peers through D_VAL smem slots
+            int steady = (N > D_VAL) ? N - D_VAL : 0;
+            for (int j = 0; j < steady; j++) {
+                cg::wait_prior<D_VAL - 1>(block);
+                int slot = j % D_VAL;
+                int actual_peer = (j + rank) % N;
+                const char* src = smem_raw + (size_t)slot * peer_stride;
+                char* dst = row_out + (int64_t)actual_peer * shard_dim1_bytes + blk;
+                for (int i = tid; i < n_vec; i += THREADS)
+                    *reinterpret_cast<int4*>(dst + i * VEC) =
+                        *reinterpret_cast<const int4*>(src + i * VEC);
+                if (tail > 0) {
+                    int ti = n_vec * VEC + tid;
+                    if (ti < elems) dst[ti] = src[ti];
+                }
+                int next_peer = (j + D_VAL + rank) % N;
+                cg::memcpy_async(block,
+                    smem_raw + (size_t)slot * peer_stride,
+                    ptrs[next_peer] + (int64_t)row * shard_dim1_bytes + blk,
+                    elems);
+            }
+
+            // Drain remaining D_VAL peers
+            cg::wait(block);
+            for (int j = steady; j < N; j++) {
+                int slot = j % D_VAL;
+                int actual_peer = (j + rank) % N;
+                const char* src = smem_raw + (size_t)slot * peer_stride;
+                char* dst = row_out + (int64_t)actual_peer * shard_dim1_bytes + blk;
+                for (int i = tid; i < n_vec; i += THREADS)
+                    *reinterpret_cast<int4*>(dst + i * VEC) =
+                        *reinterpret_cast<const int4*>(src + i * VEC);
+                if (tail > 0) {
+                    int ti = n_vec * VEC + tid;
+                    if (ti < elems) dst[ti] = src[ti];
+                }
+            }
+            __syncthreads();   // ensure drain's ld.shared done before next tile's cp.async
         }
     }
 }
@@ -1279,32 +1272,64 @@ void glm_p2p_allgather_smem(GlmCtx* ctx,
     #undef LAUNCH_AG_SMEM
 }
 
-#define LAUNCH_AG_ROW_SMEM(N) \
+#define LAUNCH_AG_ROW_SMEM(N, D) \
     do { \
-        int grid = outer; \
-        if (grid < N) grid = N; \
-        if (grid > 1024) grid = 1024; \
-        int tile_bytes = (shard_dim1_bytes < AG_TILE_BYTES) ? shard_dim1_bytes : AG_TILE_BYTES; \
-        size_t smem = (size_t)2 * N * tile_bytes; \
-        cudaFuncSetAttribute( \
-            (void*)p2p_allgather_row_smem_kernel<N>, \
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
-        p2p_allgather_row_smem_kernel<N><<<grid, AG_SMEM_BLOCK_SIZE, smem, stream>>>( \
+        p2p_allgather_row_smem_kernel<N, D><<<grid, 512, smem, stream>>>( \
             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], \
-            output, shard_dim1_bytes, full_dim1_bytes, outer); \
+            output, shard_dim1_bytes, full_dim1_bytes, outer, rank); \
     } while(0)
 
 void glm_p2p_allgather_row_smem(GlmCtx* ctx,
     const void* p0,  const void* p1,  const void* p2,  const void* p3,
     const void* p4,  const void* p5,  const void* p6,  const void* p7,
-    void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer) {
+    void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer,
+    int rank) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     const void* p[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
+
+    constexpr int BLOCK_BYTES = 8192;
+    constexpr int SMEM_BUDGET  = 32768;
+    int tile_bytes = (BLOCK_BYTES < shard_dim1_bytes) ? BLOCK_BYTES : shard_dim1_bytes;
+    int peer_stride = (tile_bytes + 15) & ~15;
+    int D = N;
+    if (peer_stride > 0) {
+        int cap = SMEM_BUDGET / peer_stride;
+        D = (N < cap) ? N : cap;
+    }
+    if (D < 1) D = 1;
+    size_t smem = (size_t)D * peer_stride;
+    int grid = outer;
+    if (grid > 512) grid = 512;
+    if (grid < 1) grid = 1;
+
     switch (N) {
-        case 2: LAUNCH_AG_ROW_SMEM(2); break;
-        case 4: LAUNCH_AG_ROW_SMEM(4); break;
-        case 8: LAUNCH_AG_ROW_SMEM(8); break;
+        case 2:
+            switch (D) {
+                case 1: LAUNCH_AG_ROW_SMEM(2, 1); break;
+                default: LAUNCH_AG_ROW_SMEM(2, 2); break;
+            }
+            break;
+        case 4:
+            switch (D) {
+                case 1: LAUNCH_AG_ROW_SMEM(4, 1); break;
+                case 2: LAUNCH_AG_ROW_SMEM(4, 2); break;
+                case 3: LAUNCH_AG_ROW_SMEM(4, 3); break;
+                default: LAUNCH_AG_ROW_SMEM(4, 4); break;
+            }
+            break;
+        case 8:
+            switch (D) {
+                case 1: LAUNCH_AG_ROW_SMEM(8, 1); break;
+                case 2: LAUNCH_AG_ROW_SMEM(8, 2); break;
+                case 3: LAUNCH_AG_ROW_SMEM(8, 3); break;
+                case 4: LAUNCH_AG_ROW_SMEM(8, 4); break;
+                case 5: LAUNCH_AG_ROW_SMEM(8, 5); break;
+                case 6: LAUNCH_AG_ROW_SMEM(8, 6); break;
+                case 7: LAUNCH_AG_ROW_SMEM(8, 7); break;
+                default: LAUNCH_AG_ROW_SMEM(8, 8); break;
+            }
+            break;
         default:
             fprintf(stderr, "glm_p2p_allgather_row_smem: unsupported N=%d\n", N);
             break;
