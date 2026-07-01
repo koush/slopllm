@@ -1715,74 +1715,28 @@ class P2PAllReduceGroup {
   /** Per-rank GlmP2PInstance native pointers. */
   readonly instances: number[];
   private readonly flagPtrs: number[];
-  private dataBufs: (Tensor | null)[];
-  private maxSlotBytes: number = 0;
   readonly worldSize: number;
   private readonly devices: readonly GlmOps[];
 
   constructor(devices: readonly GlmOps[]) {
     this.worldSize = devices.length;
     this.devices = devices;
-    this.dataBufs = new Array(devices.length).fill(null);
     const addon = getNativeAddon();
 
-    // 1. Create one instance per rank (metadata only, no data buffer).
+    // 1. Create one instance per rank (metadata only).
     this.instances = devices.map((dev, rank) =>
       addon.p2pCreateInstance(dev.ctx, rank, devices.length));
 
     // 2. Cache flag pointers (never changes).
     this.flagPtrs = this.instances.map(inst => addon.p2pGetFlagPtr(inst));
 
-    // 3. Initialize peer flags so barrier works before any ensureCapacity call.
-    //    Data pointers are set to zero — barrier doesn't use them.
-    const zeroDataPtrs = new Array(this.worldSize).fill(0);
+    // 3. Initialize peer flags so barrier works.
     for (let i = 0; i < this.worldSize; ++i) {
-      addon.p2pSetPeers(this.devices[i].ctx, this.instances[i], zeroDataPtrs, this.flagPtrs);
-    }
-  }
-
-  /**
-   * Ensure the P2P data buffer is at least `slotBytes` per slot.
-   * Allocates or grows the buffer as needed. Each buffer is `2 * slotBytes`
-   * for double buffering.
-   */
-  ensureCapacity(slotBytes: number, shardWorkspaces: WorkspaceBase[]): void {
-    // Round up to multiple of 16 so that double-buffer slot offsets are
-    // always 16-byte aligned (required by P2P kernels using uint4 copies).
-    slotBytes = (slotBytes + 15) & ~15;
-    if (slotBytes <= this.maxSlotBytes) return;
-    const bufBytes = slotBytes * 2;
-    const addon = getNativeAddon();
-
-    // Allocate new data buffer tensors on each device.
-    const newBufs = this.devices.map((_, i) =>
-      shardWorkspaces[i].allocRaw(bufBytes));
-
-    // Dispose old buffers (returns memory to workspace for reuse).
-    for (const buf of this.dataBufs) {
-      if (buf) buf[Symbol.dispose]();
-    }
-    this.dataBufs = newBufs;
-    this.maxSlotBytes = slotBytes;
-
-    // Update max_bytes on all instances.
-    for (let i = 0; i < this.worldSize; ++i) {
-      addon.p2pSetMaxBytes(this.instances[i], slotBytes);
-    }
-
-    // Update peer pointers on all ranks.
-    const dataPtrs = newBufs.map(buf => buf.data);
-    for (let i = 0; i < this.worldSize; ++i) {
-      addon.p2pSetPeers(this.devices[i].ctx, this.instances[i], dataPtrs, this.flagPtrs);
+      addon.p2pSetPeers(this.devices[i].ctx, this.instances[i], this.flagPtrs);
     }
   }
 
   free(): void {
-    for (const buf of this.dataBufs) {
-      if (buf) buf[Symbol.dispose]();
-    }
-    this.dataBufs = new Array(this.worldSize).fill(null);
-    this.maxSlotBytes = 0;
     for (const inst of this.instances) {
       getNativeAddon().p2pDestroyInstance(inst);
     }
@@ -2040,7 +1994,7 @@ export class ParallelOps implements DeviceOps {
           this.devices[i].ctx,
           ptrs[0], ptrs[1], ptrs[2], ptrs[3],
           ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-          outputShards[i].data, this.worldSize, shardBytes,
+          outputShards[i].data, this.worldSize, shardBytes, i,
         );
       }
       return true;
@@ -2068,37 +2022,6 @@ export class ParallelOps implements DeviceOps {
     }
 
     return false;
-  }
-
-  tryP2PRmsnorm(
-    inputShards: readonly Tensor[],
-    weightShards: readonly Tensor[],
-    outputShards: readonly Tensor[],
-    eps: number,
-    shardDim: number,
-    fullDim: number,
-    batch: number,
-    weightIsSharded: boolean,
-  ): boolean {
-    if (!this.p2pEnabled)
-      return false;
-    const group = this.getP2PGroup(inputShards[0].workspace.glm.currentStream);
-    if (!group)
-      return false;
-    const slotBytes = batch * 4;
-    group.ensureCapacity(slotBytes, inputShards.map(s => s.workspace));
-    const addon = getNativeAddon();
-    for (let i = 0; i < this.worldSize; ++i) {
-      const weightPtr = weightIsSharded
-        ? weightShards[i].data
-        : weightShards[i].data + i * shardDim * 2;
-      addon.p2pRmsnorm(
-        this.devices[i].ctx, group.instances[i],
-        inputShards[i].data, weightPtr, outputShards[i].data,
-        eps, shardDim, fullDim, batch,
-      );
-    }
-    return true;
   }
 
   /** Public wrapper used by ParallelTensor.allReduce. */

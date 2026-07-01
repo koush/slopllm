@@ -688,27 +688,10 @@ class GlmOps:
         self.lib.glm_p2p_get_flag_ptr.restype = ctypes.c_void_p
         self.lib.glm_p2p_get_flag_ptr.argtypes = [ctypes.c_void_p]
 
-        self.lib.glm_p2p_set_max_bytes.restype = None
-        self.lib.glm_p2p_set_max_bytes.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-
         self.lib.glm_p2p_set_peers.restype = None
         self.lib.glm_p2p_set_peers.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
-        ]
-
-        self.lib.glm_p2p_allreduce.restype = None
-        self.lib.glm_p2p_allreduce.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int,
-        ]
-
-        self.lib.glm_p2p_rmsnorm.restype = None
-        self.lib.glm_p2p_rmsnorm.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
         ]
 
         self.lib.glm_p2p_barrier.restype = None
@@ -1777,25 +1760,9 @@ class GlmOps:
     def p2p_get_flag_ptr(self, inst):
         return self.lib.glm_p2p_get_flag_ptr(inst)
 
-    def p2p_set_max_bytes(self, inst, max_bytes):
-        self.lib.glm_p2p_set_max_bytes(inst, max_bytes)
-
-    def p2p_set_peers(self, inst, peer_data_ptrs, peer_flag_ptrs, world_size):
-        data_arr = (ctypes.c_void_p * world_size)(*[ctypes.c_void_p(int(p)) for p in peer_data_ptrs])
+    def p2p_set_peers(self, inst, peer_flag_ptrs, world_size):
         flag_arr = (ctypes.c_void_p * world_size)(*[ctypes.c_void_p(int(p)) for p in peer_flag_ptrs])
-        self.lib.glm_p2p_set_peers(self.ctx, inst, data_arr, flag_arr)
+        self.lib.glm_p2p_set_peers(self.ctx, inst, flag_arr)
 
     def p2p_barrier(self, inst, peer_rank=-1):
         self.lib.glm_p2p_barrier(self.ctx, inst, peer_rank)
-
-    def p2p_allreduce(self, inst, inp, out, count, dtype=9):
-        self.lib.glm_p2p_allreduce(self.ctx, inst, self._ptr(inp), self._ptr(out), count, dtype)
-
-    def p2p_rmsnorm(self, inst, input_ptr, weight_ptr, output_ptr, eps, shard_dim, full_dim, batch):
-        self.lib.glm_p2p_rmsnorm(
-            self.ctx, inst,
-            ctypes.c_void_p(int(input_ptr)),
-            ctypes.c_void_p(int(weight_ptr)),
-            ctypes.c_void_p(int(output_ptr)),
-            ctypes.c_float(eps), shard_dim, full_dim, batch
-        )

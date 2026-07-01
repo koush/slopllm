@@ -135,15 +135,9 @@ interface NativeAddon {
   p2pCreateInstance(ctx: number, myRank: number, worldSize: number): number;
   p2pDestroyInstance(instance: number): void;
   p2pGetFlagPtr(instance: number): number;
-  p2pSetMaxBytes(instance: number, maxBytes: number): void;
-  p2pSetPeers(ctx: number, instance: number, dataPtrs: number[], flagPtrs: number[]): void;
-  p2pAllReduce(ctx: number, instance: number, in_: number, out: number, count: number, dtype: number): void;
-  p2pAllReduceSmem(ctx: number, instance: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, numel: number, dtype: number): void;
-  p2pAllGather(ctx: number, instance: number, sendbuf: number, recvbuf: number, numBytes: number): void;
-  p2pAllGatherRow(ctx: number, instance: number, sendbuf: number, recvbuf: number, shardBytes: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number): void;
-  p2pAllGatherSmem(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardBytes: number): void;
+  p2pSetPeers(ctx: number, instance: number, flagPtrs: number[]): void;
+  p2pAllGatherSmem(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardBytes: number, rank: number): void;
   p2pAllGatherRowSmem(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number, rank: number): void;
-  p2pRmsnorm(ctx: number, instance: number, input: number, weight: number, output: number, eps: number, shardDim: number, fullDim: number, batch: number): void;
   p2pBarrier(ctx: number, instance: number, peerRank?: number): void;
   cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads: number, headOffset: number, inputNHeads: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;

@@ -324,14 +324,10 @@ void glm_nccl_recv(void* comm, GlmCtx* ctx,
 // ---------------------------------------------------------------------------
 
 struct GlmP2PInstance {
-    void**              peer_data_arr_d;
     int**               peer_flags_arr_d;
     unsigned long long* seq_counter_d;
     int*                my_flags_d;  // int[world_size]: rank's flag array, peers write into my_flags_d[their_rank]
-    int*                slot_offset_d;
-    int*                ready_mask_d;
     void*               metadata_alloc_d;
-    size_t              max_bytes;
     int                 world_size;
     int                 my_rank;
     int                 device_id;
@@ -354,49 +350,10 @@ void glm_p2p_destroy_instance(GlmP2PInstance* inst);
 // Get this rank's peer-visible flag array pointer (int[world_size]).
 int* glm_p2p_get_flag_ptr(GlmP2PInstance* inst);
 
-// Set the max slot capacity (bytes per double-buffer slot).
-// Must be called after data buffers are allocated and before any P2P operation.
-void glm_p2p_set_max_bytes(GlmP2PInstance* inst, size_t max_bytes);
-
-// Configure this rank's view of all peers' data + flag pointers.
-// peer_data_ptrs[r] = device pointer (on rank r) to rank r's data buffer.
+// Configure this rank's view of all peers' flag pointers.
 // peer_flag_ptrs[r] = device pointer (on rank r) to rank r's flag array (int[world_size]).
 void glm_p2p_set_peers(GlmCtx* ctx, GlmP2PInstance* inst,
-                       const void* const* peer_data_ptrs,
                        int* const* peer_flag_ptrs);
-
-// Run AllReduce on this rank's active stream.
-void glm_p2p_allreduce(GlmCtx* ctx, GlmP2PInstance* inst,
-                        const void* in, void* out, int count, int dtype);
-
-// Multi-block smem-staged P2P AllReduce with progressive pull.
-// Peer data pointers passed as kernel args for CUDA graph safety.
-// dtype: 9=BF16, 7=F32.  Zeroes ready_mask_d before launch.
-void glm_p2p_allreduce_smem(GlmCtx* ctx, GlmP2PInstance* inst,
-                             const void* p0,  const void* p1,
-                             const void* p2,  const void* p3,
-                             const void* p4,  const void* p5,
-                             const void* p6,  const void* p7,
-                             void* output, int N, int64_t numel, int dtype);
-
-// Run AllGather (Column layout – contiguous per rank) on this rank's active stream.
-// Each rank contributes `num_bytes` bytes from sendbuf; recvbuf receives the
-// concatenated result from all ranks (world_size * num_bytes bytes total).
-// Dtype-agnostic: copies raw bytes with uint4 vectorisation.
-void glm_p2p_allgather(GlmCtx* ctx, GlmP2PInstance* inst,
-                        const void* sendbuf, void* recvbuf,
-                        int num_bytes);
-
-// Run AllGather (Row layout – interleaved) on this rank's active stream.
-// Each rank contributes shard_bytes from sendbuf.
-// Output is written in interleaved byte layout:
-//   dst = recvbuf + row * full_dim1_bytes + rank * shard_dim1_bytes
-//   src = peer_shard[rank] + row * shard_dim1_bytes
-// Dtype-agnostic: copies raw bytes with uint4 vectorisation.
-void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
-                              const void* sendbuf, void* recvbuf,
-                              int shard_bytes, int shard_dim1_bytes,
-                              int full_dim1_bytes, int outer);
 
 // Smem-staged AllGather (Column layout). Requires p2p_barrier before call.
 // Each peer contributes shard_bytes from its pointer; output receives
@@ -405,7 +362,7 @@ void glm_p2p_allgather_row(GlmCtx* ctx, GlmP2PInstance* inst,
 void glm_p2p_allgather_smem(GlmCtx* ctx,
     const void* p0,  const void* p1,  const void* p2,  const void* p3,
     const void* p4,  const void* p5,  const void* p6,  const void* p7,
-    void* output, int N, int shard_bytes);
+    void* output, int N, int shard_bytes, int rank);
 
 // Smem-staged AllGather (Row layout). Requires p2p_barrier before call.
 // Each peer contributes shard_dim1_bytes per row; output is interleaved:
@@ -415,21 +372,7 @@ void glm_p2p_allgather_row_smem(GlmCtx* ctx,
     const void* p4,  const void* p5,  const void* p6,  const void* p7,
     void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer, int rank);
 
-// P2P Row-parallel RMSNorm: computes RMSNorm on row-parallel tensors without
-// allGathering the full hidden dimension. Each rank computes local sum of squares,
-// exchanges via P2P, then normalizes locally. Output remains row-parallel.
-// input:  [batch, shard_dim] BF16 (this rank's shard of the hidden dim)
-// weight: [shard_dim] BF16   (this rank's shard of the weight vector)
-// output: [batch, shard_dim] BF16 (row-parallel output)
-// full_dim: total hidden dimension across all ranks (shard_dim * world_size)
-// Requires: P2P instance data buffer >= batch * sizeof(float) per slot
-void glm_p2p_rmsnorm(GlmCtx* ctx, GlmP2PInstance* inst,
-                      const void* input, const void* weight, void* output,
-                      float eps, int shard_dim, int full_dim, int batch);
-
 // P2P barrier: increment seq counter, publish flag, wait for all peers.
-// No data scatter — caller stages data into P2P buffer before/after as needed.
-// Writes slot_offset to inst->slot_offset_d so caller knows which slot was selected.
 void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank = -1);
 
 void glm_kv_cache_write(GlmCtx* ctx,
