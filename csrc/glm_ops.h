@@ -331,6 +331,7 @@ struct GlmP2PInstance {
     int                 world_size;
     int                 my_rank;
     int                 device_id;
+    int                 nanosleep_ns;
 };
 
 static constexpr int P2P_AR_MAX_WORLD = 8;

@@ -10,10 +10,9 @@ __device__ __forceinline__ void p2p_publish_and_wait(
     int seq,
     int* const* peer_flag_arrays,
     int* my_flags,
+    int nanosleep_ns,
     int peer_rank = -1)
 {
-    __syncthreads();
-
     bool active = (peer_rank < 0 && tid < world_size) ||
                   (peer_rank >= 0 && tid == peer_rank);
 
@@ -33,7 +32,7 @@ __device__ __forceinline__ void p2p_publish_and_wait(
         do {
             asm volatile("ld.volatile.global.s32 %0, [%1];"
                          : "=r"(v) : "l"(my_flags + tid));
-            if ((int)((unsigned)v - (unsigned)target) < 0) __nanosleep(32);
+            if ((int)((unsigned)v - (unsigned)target) < 0) __nanosleep(nanosleep_ns);
         } while ((int)((unsigned)v - (unsigned)target) < 0);
         asm volatile("fence.acquire.sys;");
     }

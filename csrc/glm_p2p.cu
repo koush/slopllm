@@ -44,7 +44,7 @@ namespace cg = cooperative_groups;
 
 namespace {
 
-constexpr int P2P_AR_BLOCK_SIZE = 1024;
+constexpr int P2P_BARRIER_BLOCK_SIZE = 32;
 constexpr int P2P_AR_VEC_BF16 = 8;   // uint4 = 8 bf16
 constexpr int P2P_AR_VEC_F32 = 4;    // uint4 = 4 fp32
 
@@ -53,12 +53,13 @@ constexpr int P2P_AR_VEC_F32 = 4;    // uint4 = 4 fp32
 // Writes slot_offset so callers know which double-buffer slot was selected.
 // ---------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(P2P_AR_BLOCK_SIZE, 1)
+__global__ void __launch_bounds__(P2P_BARRIER_BLOCK_SIZE, 1)
 p2p_barrier_kernel(
     int* const* peer_flags,
     unsigned long long* my_seq_counter,
     int my_rank,
     int world_size,
+    int nanosleep_ns,
     int peer_rank = -1)
 {
     int tid = threadIdx.x;
@@ -80,7 +81,7 @@ p2p_barrier_kernel(
 
     p2p_publish_and_wait(tid, my_rank, world_size, seq,
                          s_peer_flags, s_peer_flags[my_rank],
-                         peer_rank);
+                         nanosleep_ns, peer_rank);
 }
 
 
@@ -336,6 +337,18 @@ GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size
     inst->my_rank = my_rank;
     inst->device_id = ctx->device_id;
 
+    // Detect NVLink vs PCIe: use higher performance rank = NVLink (fast poll),
+    // lower = PCIe (back off more to reduce interconnect contention).
+    int min_perf_rank = 0x7fffffff;
+    for (int p = 0; p < world_size; p++) {
+        if (p == my_rank) continue;
+        int rank = 0;
+        cudaDeviceGetP2PAttribute(&rank, cudaDevP2PAttrPerformanceRank,
+                                  ctx->device_id, p);
+        if (rank < min_perf_rank) min_perf_rank = rank;
+    }
+    inst->nanosleep_ns = (min_perf_rank > 0) ? 32 : 200;
+
     // Metadata-only allocation: peer_flags[N] | seq_counter | flags[N]
     size_t header = sizeof(int*)  * world_size
                    + sizeof(unsigned long long)
@@ -379,10 +392,10 @@ void glm_p2p_set_peers(GlmCtx* ctx, GlmP2PInstance* inst,
 
 void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank) {
     cudaSetDevice(ctx->device_id);
-    p2p_barrier_kernel<<<1, P2P_AR_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+    p2p_barrier_kernel<<<1, P2P_BARRIER_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
         inst->peer_flags_arr_d, inst->seq_counter_d,
         inst->my_rank, inst->world_size,
-        peer_rank);
+        inst->nanosleep_ns, peer_rank);
 }
 
 // ---------------------------------------------------------------------------
