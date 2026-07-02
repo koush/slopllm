@@ -197,7 +197,7 @@ export class ParallelTensor extends Tensor {
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
 
     // all to all reduce
-    if (true) {
+    if (false) {
       if (count > 65536 * 2)
         return false;
 
