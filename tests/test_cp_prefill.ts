@@ -433,7 +433,7 @@ function runCpAppendPrefillTest(
     }
   }
 
-  console.log(`CP append prefill (prefix=${prefixLen}, new=${newLen}, batch=${batchSize}, pageSize=${pageSize}, worldSize=${worldSize}): maxAbsErr=${maxAbsErr.toFixed(6)} maxRelErrForSignificant=${maxRelErrForSignificant.toFixed(6)} errors=${errorCount}/${totalElems}`);
+  // console.log(`CP append prefill (prefix=${prefixLen}, new=${newLen}, batch=${batchSize}, pageSize=${pageSize}, worldSize=${worldSize}): maxAbsErr=${maxAbsErr.toFixed(6)} maxRelErrForSignificant=${maxRelErrForSignificant.toFixed(6)} errors=${errorCount}/${totalElems}`);
   assert.ok(errorCount === 0, `${errorCount}/${totalElems} elements exceed tolerance (atol=${ABS_TOL}, rtol=${REL_TOL})`);
 }
 
@@ -671,7 +671,7 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
       }
     }
 
-    console.log(`ParallelOps CP prefill (seqLen=${seqLen}, batch=${batchSize}, pageSize=${pageSize}): maxAbsErr=${maxAbsErr.toFixed(6)} maxRelErrForSignificant=${maxRelErrForSignificant.toFixed(6)} errors=${errorCount}/${totalElems}`);
+    // console.log(`ParallelOps CP prefill (seqLen=${seqLen}, batch=${batchSize}, pageSize=${pageSize}): maxAbsErr=${maxAbsErr.toFixed(6)} maxRelErrForSignificant=${maxRelErrForSignificant.toFixed(6)} errors=${errorCount}/${totalElems}`);
     assert.ok(errorCount === 0, `${errorCount}/${totalElems} elements exceed tolerance (atol=${ABS_TOL}, rtol=${REL_TOL})`);
 
     // Cleanup

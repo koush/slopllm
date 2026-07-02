@@ -855,17 +855,14 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output,
 #if defined(__CUDACC__)
 #include <cuda_bf16.h>
 
-__device__ __forceinline__ void load_bf16x2(const __nv_bfloat16* ptr, float& v0, float& v1) {
+__device__ __forceinline__ float2 load_bf16x2(const __nv_bfloat16* ptr) {
     __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(ptr);
-    v0 = __bfloat162float(v.x);
-    v1 = __bfloat162float(v.y);
+    return __bfloat1622float2(v);
 }
 
 __device__ __forceinline__ void store_bf16x2(__nv_bfloat16* ptr, float v0, float v1) {
-    __nv_bfloat162 v;
-    v.x = __float2bfloat16(v0);
-    v.y = __float2bfloat16(v1);
-    *reinterpret_cast<__nv_bfloat162*>(ptr) = v;
+    float2 f = {v0, v1};
+    *reinterpret_cast<__nv_bfloat162*>(ptr) = __float22bfloat162_rn(f);
 }
 #endif
 

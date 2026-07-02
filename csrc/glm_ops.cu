@@ -82,9 +82,8 @@ __device__ float sigmoid_f(float x) {
 __device__ float compute_inv_rms(const __nv_bfloat16* x, int dim, float eps, float* sdata) {
     float sum = 0.0f;
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
-        float v0, v1;
-        load_bf16x2(x + i, v0, v1);
-        sum += v0 * v0 + v1 * v1;
+        float2 v = load_bf16x2(x + i);
+        sum += v.x * v.x + v.y * v.y;
     }
     if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
         float val = __bfloat162float(x[dim - 1]);
@@ -116,10 +115,9 @@ __global__ void __launch_bounds__(1024, 1) rmsnorm_kernel(
     float inv_rms = compute_inv_rms(x, dim, eps, sdata);
 
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
-        float x0, x1, w0, w1;
-        load_bf16x2(x + i, x0, x1);
-        load_bf16x2(weight + i, w0, w1);
-        store_bf16x2(o + i, w0 * x0 * inv_rms, w1 * x1 * inv_rms);
+        float2 xv = load_bf16x2(x + i);
+        float2 wv = load_bf16x2(weight + i);
+        store_bf16x2(o + i, wv.x * xv.x * inv_rms, wv.y * xv.y * inv_rms);
     }
     if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
         float xi = __bfloat162float(x[dim - 1]);
@@ -163,11 +161,10 @@ __global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel(
 
     float sum = 0.0f;
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
-        float a0, a1, b0, b1;
-        load_bf16x2(a + i, a0, a1);
-        load_bf16x2(b + i, b0, b1);
-        float s0 = a0 + b0;
-        float s1 = a1 + b1;
+        float2 av = load_bf16x2(a + i);
+        float2 bv = load_bf16x2(b + i);
+        float s0 = av.x + bv.x;
+        float s1 = av.y + bv.y;
         sum += s0 * s0 + s1 * s1;
     }
     if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
@@ -184,14 +181,13 @@ __global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel(
     float inv_rms = rsqrtf(sdata[0] / dim + eps);
 
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
-        float a0, a1, b0, b1, w0, w1;
-        load_bf16x2(a + i, a0, a1);
-        load_bf16x2(b + i, b0, b1);
-        load_bf16x2(weight + i, w0, w1);
-        float s0 = a0 + b0;
-        float s1 = a1 + b1;
+        float2 av = load_bf16x2(a + i);
+        float2 bv = load_bf16x2(b + i);
+        float2 wv = load_bf16x2(weight + i);
+        float s0 = av.x + bv.x;
+        float s1 = av.y + bv.y;
         store_bf16x2(r + i, s0, s1);
-        store_bf16x2(o + i, w0 * s0 * inv_rms, w1 * s1 * inv_rms);
+        store_bf16x2(o + i, wv.x * s0 * inv_rms, wv.y * s1 * inv_rms);
     }
     if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
         float ai = __bfloat162float(a[dim - 1]);
@@ -434,19 +430,17 @@ __global__ void __launch_bounds__(BDX, 4) mla_v_expand_kernel(
         if constexpr (CT) {
             #pragma unroll 8
             for (int k = 0; k < KV_LR; k++) {
-                float w0, w1;
-                load_bf16x2(w_base + k * v_head_dim + j, w0, w1);
+                float2 wv = load_bf16x2(w_base + k * v_head_dim + j);
                 float a = my_s_attn[k];
-                sum0 += a * w0;
-                sum1 += a * w1;
+                sum0 += a * wv.x;
+                sum1 += a * wv.y;
             }
         } else {
             for (int k = 0; k < kv_lr; k++) {
-                float w0, w1;
-                load_bf16x2(w_base + k * v_head_dim + j, w0, w1);
+                float2 wv = load_bf16x2(w_base + k * v_head_dim + j);
                 float a = my_s_attn[k];
-                sum0 += a * w0;
-                sum1 += a * w1;
+                sum0 += a * wv.x;
+                sum1 += a * wv.y;
             }
         }
         store_bf16x2(result_base + j, sum0, sum1);
@@ -576,11 +570,10 @@ __global__ void __launch_bounds__(BDX, 8) mla_v_expand_kernel_v2(
                 if (j < VHD) {
                     #pragma unroll
                     for (int kk = 0; kk < TILE_K; kk++) {
-                        float w0, w1;
-                        load_bf16x2(vproj_tile + kk * VHD + j, w0, w1);
+                        float2 wv = load_bf16x2(vproj_tile + kk * VHD + j);
                         float a = attn_reg[kk];
-                        sum[ji][0] += a * w0;
-                        sum[ji][1] += a * w1;
+                        sum[ji][0] += a * wv.x;
+                        sum[ji][1] += a * wv.y;
                     }
                 }
             }
@@ -741,10 +734,9 @@ __global__ void __launch_bounds__(256, 4) silu_and_mul_kernel(
 ) {
     int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
     if (idx + 1 < total) {
-        float g0, g1, u0, u1;
-        load_bf16x2(gate + idx, g0, g1);
-        load_bf16x2(up + idx, u0, u1);
-        store_bf16x2(out + idx, g0 * sigmoid_f(g0) * u0, g1 * sigmoid_f(g1) * u1);
+        float2 gv = load_bf16x2(gate + idx);
+        float2 uv = load_bf16x2(up + idx);
+        store_bf16x2(out + idx, gv.x * sigmoid_f(gv.x) * uv.x, gv.y * sigmoid_f(gv.y) * uv.y);
     } else if (idx < total) {
         float g = __bfloat162float(gate[idx]);
         float u = __bfloat162float(up[idx]);
@@ -785,9 +777,8 @@ __global__ void __launch_bounds__(256, 4) layernorm_kernel(
 
     float mean = 0.0f;
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
-        float v0, v1;
-        load_bf16x2(x + i, v0, v1);
-        mean += v0 + v1;
+        float2 v = load_bf16x2(x + i);
+        mean += v.x + v.y;
     }
     if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
         mean += __bfloat162float(x[dim - 1]);
@@ -799,9 +790,8 @@ __global__ void __launch_bounds__(256, 4) layernorm_kernel(
 
     float var = 0.0f;
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
-        float v0, v1;
-        load_bf16x2(x + i, v0, v1);
-        float d0 = v0 - mean, d1 = v1 - mean;
+        float2 v = load_bf16x2(x + i);
+        float d0 = v.x - mean, d1 = v.y - mean;
         var += d0 * d0 + d1 * d1;
     }
     if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
@@ -814,13 +804,12 @@ __global__ void __launch_bounds__(256, 4) layernorm_kernel(
     float inv_std = rsqrtf(sdata[0] / dim + eps);
 
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
-        float x0, x1, w0, w1;
-        load_bf16x2(x + i, x0, x1);
-        load_bf16x2(weight + i, w0, w1);
+        float2 xv = load_bf16x2(x + i);
+        float2 wv = load_bf16x2(weight + i);
         float b0 = bias ? __bfloat162float(bias[i]) : 0.0f;
         float b1 = bias ? __bfloat162float(bias[i + 1]) : 0.0f;
-        store_bf16x2(o + i, w0 * (x0 - mean) * inv_std + b0,
-                              w1 * (x1 - mean) * inv_std + b1);
+        store_bf16x2(o + i, wv.x * (xv.x - mean) * inv_std + b0,
+                              wv.y * (xv.y - mean) * inv_std + b1);
     }
     if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
         float xi = __bfloat162float(x[dim - 1]);
@@ -850,9 +839,8 @@ template<auto F>
 __global__ void __launch_bounds__(256, 4) ew_unary_kernel(__nv_bfloat16* out, const __nv_bfloat16* input, int n) {
     int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
     if (idx + 1 < n) {
-        float v0, v1;
-        load_bf16x2(input + idx, v0, v1);
-        store_bf16x2(out + idx, F(v0), F(v1));
+        float2 v = load_bf16x2(input + idx);
+        store_bf16x2(out + idx, F(v.x), F(v.y));
     } else if (idx < n) {
         out[idx] = __float2bfloat16(F(__bfloat162float(input[idx])));
     }
@@ -879,10 +867,9 @@ __global__ void __launch_bounds__(256, 4) ew_binary_2d_kernel(
     if (idx + 1 < total) {
         int r = idx / dim;
         int c = idx % dim;
-        float a0, a1, b0, b1;
-        load_bf16x2(a + r * a_stride + c, a0, a1);
-        load_bf16x2(b + r * b_stride + c, b0, b1);
-        store_bf16x2(out + idx, F(a0, b0), F(a1, b1));
+        float2 av = load_bf16x2(a + r * a_stride + c);
+        float2 bv = load_bf16x2(b + r * b_stride + c);
+        store_bf16x2(out + idx, F(av.x, bv.x), F(av.y, bv.y));
     } else if (idx < total) {
         int r = idx / dim;
         int c = idx % dim;
@@ -1532,10 +1519,9 @@ __global__ void __launch_bounds__(256, 4) topk_kernel_v2(
     }
 
     for (int i = tid * 2; i + 1 < dim; i += blockDim.x * 2) {
-        float v0, v1;
-        load_bf16x2(row_in + i, v0, v1);
-        insert_topk<K>(top_vals, top_idxs, v0, i + offset);
-        insert_topk<K>(top_vals, top_idxs, v1, i + 1 + offset);
+        float2 v = load_bf16x2(row_in + i);
+        insert_topk<K>(top_vals, top_idxs, v.x, i + offset);
+        insert_topk<K>(top_vals, top_idxs, v.y, i + 1 + offset);
     }
     if ((dim & 1) && tid == (dim / 2) % blockDim.x) {
         float val = __bfloat162float(row_in[dim - 1]);
@@ -1795,9 +1781,8 @@ __global__ void __launch_bounds__(256, 4) scale_kernel(
 ) {
     int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
     if (idx + 1 < n) {
-        float v0, v1;
-        load_bf16x2(input + idx, v0, v1);
-        store_bf16x2(out + idx, v0 * scale, v1 * scale);
+        float2 v = load_bf16x2(input + idx);
+        store_bf16x2(out + idx, v.x * scale, v.y * scale);
     } else if (idx < n) {
         out[idx] = __float2bfloat16(__bfloat162float(input[idx]) * scale);
     }
@@ -2120,9 +2105,8 @@ __global__ void __launch_bounds__(256, 4) reduce_sum_kernel(
     const __nv_bfloat16* row_ptr = input + row * cols;
     float sum = 0.0f;
     for (int i = threadIdx.x * 2; i + 1 < cols; i += blockDim.x * 2) {
-        float v0, v1;
-        load_bf16x2(row_ptr + i, v0, v1);
-        sum += v0 + v1;
+        float2 v = load_bf16x2(row_ptr + i);
+        sum += v.x + v.y;
     }
     if ((cols & 1) && threadIdx.x == (cols / 2) % blockDim.x) {
         sum += __bfloat162float(row_ptr[cols - 1]);
@@ -2330,10 +2314,9 @@ __global__ void __launch_bounds__(256, 4) max_kernel(__nv_bfloat16* out_values, 
     float my_max = -INFINITY;
     int my_idx = -1;
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
-        float v0, v1;
-        load_bf16x2(row_in + i, v0, v1);
-        if (v0 > my_max || (v0 == my_max && i < my_idx)) { my_max = v0; my_idx = i; }
-        if (v1 > my_max || (v1 == my_max && (i + 1) < my_idx)) { my_max = v1; my_idx = i + 1; }
+        float2 v = load_bf16x2(row_in + i);
+        if (v.x > my_max || (v.x == my_max && i < my_idx)) { my_max = v.x; my_idx = i; }
+        if (v.y > my_max || (v.y == my_max && (i + 1) < my_idx)) { my_max = v.y; my_idx = i + 1; }
     }
     if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
         float val = __bfloat162float(row_in[dim - 1]);

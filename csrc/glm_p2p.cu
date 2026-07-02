@@ -434,9 +434,8 @@ rmsnorm_pointers_smem_kernel(
             int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
             if (off + VEC <= elems) {
                 if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
-                    float a0, a1;
-                    load_bf16x2(inputA + (blk + off), a0, a1);
-                    acc[k].x += a0; acc[k].y += a1;
+                    float2 av = load_bf16x2(inputA + (blk + off));
+                    acc[k].x += av.x; acc[k].y += av.y;
                     sum_sq += acc[k].x * acc[k].x + acc[k].y * acc[k].y;
                 } else {
                     float a = inputA[blk + off];
@@ -468,10 +467,9 @@ rmsnorm_pointers_smem_kernel(
                 int wcol = weight_base + lane * VEC + (int64_t)k * WarpSize * VEC;
                 if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
                     store_bf16x2(residual + gidx, acc[k].x, acc[k].y);
-                    float w0, w1;
-                    load_bf16x2(weight + wcol, w0, w1);
-                    store_bf16x2(out + gidx, w0 * acc[k].x * inv_rms,
-                                            w1 * acc[k].y * inv_rms);
+                    float2 wv = load_bf16x2(weight + wcol);
+                    store_bf16x2(out + gidx, wv.x * acc[k].x * inv_rms,
+                                            wv.y * acc[k].y * inv_rms);
                 } else {
                     residual[gidx] = acc[k].x;
                     float w = weight[wcol];
