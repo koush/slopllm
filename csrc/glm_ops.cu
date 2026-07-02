@@ -99,11 +99,65 @@ __device__ float compute_inv_rms(const __nv_bfloat16* x, int dim, float eps, flo
 }
 
 // ---------------------------------------------------------------------------
-// RMSNorm kernel
+// RMSNorm kernel (register-cached: reads input once)
 // ---------------------------------------------------------------------------
 
+template <int MaxPairs, bool EvenDim = true>
+__global__ void __launch_bounds__(1024, 2) rmsnorm_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* weight,
+    float eps,
+    int dim
+) {
+    int row = blockIdx.x;
+    const __nv_bfloat16* x = input + row * dim;
+    __nv_bfloat16* o = out + row * dim;
+
+    extern __shared__ float sdata[];
+
+    float2 xv[MaxPairs];
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < MaxPairs; k++) {
+        int i = threadIdx.x * 2 + k * blockDim.x * 2;
+        if (i + 1 < dim) {
+            xv[k] = load_bf16x2(x + i);
+            sum += xv[k].x * xv[k].x + xv[k].y * xv[k].y;
+        }
+    }
+    if constexpr (!EvenDim) {
+        if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+            float val = __bfloat162float(x[dim - 1]);
+            sum += val * val;
+        }
+    }
+
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    block_reduce_sum(sdata, threadIdx.x);
+    float inv_rms = rsqrtf(sdata[0] / dim + eps);
+
+    #pragma unroll
+    for (int k = 0; k < MaxPairs; k++) {
+        int i = threadIdx.x * 2 + k * blockDim.x * 2;
+        if (i + 1 < dim) {
+            float2 wv = load_bf16x2(weight + i);
+            store_bf16x2(o + i, wv.x * xv[k].x * inv_rms, wv.y * xv[k].y * inv_rms);
+        }
+    }
+    if constexpr (!EvenDim) {
+        if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+            float xi = __bfloat162float(x[dim - 1]);
+            float wi = __bfloat162float(weight[dim - 1]);
+            o[dim - 1] = __float2bfloat16(wi * xi * inv_rms);
+        }
+    }
+}
+
+// Grid-stride fallback for large pairs (double-read, no caching).
 template <bool EvenDim = true>
-__global__ void __launch_bounds__(1024, 1) rmsnorm_kernel(
+__global__ void __launch_bounds__(1024, 1) rmsnorm_kernel_stride(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
@@ -138,25 +192,118 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
     int max_block = (dim >= 4096 && batch < 64) ? 1024 : 256;
     int block_size = compute_block_size(dim, false, max_block);
     size_t shared_mem = block_size * sizeof(float);
-    if (dim & 1) {
-        rmsnorm_kernel<false><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-            (const __nv_bfloat16*)weight, eps, dim);
+    int pairs = (dim + 2 * block_size - 1) / (2 * block_size);
+    bool even = (dim & 1) == 0;
+
+#define DISPATCH_RMS(P, EV) \
+    rmsnorm_kernel<P, EV><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>( \
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)input, \
+        (const __nv_bfloat16*)weight, eps, dim)
+#define DISPATCH_RMS_PAIRS(P) do { \
+    if (even) { DISPATCH_RMS(P, true); } else { DISPATCH_RMS(P, false); } \
+} while(0)
+
+    if (pairs <= 24) {
+        switch (pairs) {
+            case 1: DISPATCH_RMS_PAIRS(1); break;
+            case 2: DISPATCH_RMS_PAIRS(2); break;
+            case 3: DISPATCH_RMS_PAIRS(3); break;
+            case 4: DISPATCH_RMS_PAIRS(4); break;
+            case 5: case 6: DISPATCH_RMS_PAIRS(6); break;
+            case 7: case 8: DISPATCH_RMS_PAIRS(8); break;
+            case 9: case 10: case 11: case 12: DISPATCH_RMS_PAIRS(12); break;
+            case 13: case 14: case 15: case 16: DISPATCH_RMS_PAIRS(16); break;
+            default: DISPATCH_RMS_PAIRS(24); break;
+        }
     } else {
-        rmsnorm_kernel<true><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-            (const __nv_bfloat16*)weight, eps, dim);
+        if (even) {
+            rmsnorm_kernel_stride<true><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+                (const __nv_bfloat16*)weight, eps, dim);
+        } else {
+            rmsnorm_kernel_stride<false><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+                (const __nv_bfloat16*)weight, eps, dim);
+        }
     }
+#undef DISPATCH_RMS
+#undef DISPATCH_RMS_PAIRS
 }
 
 // ---------------------------------------------------------------------------
-// Fused Add + RMSNorm kernel
+// Fused Add + RMSNorm kernel (register-cached: reads a,b once)
 // out[i] = weight[i] * (input_a[i] + input_b[i]) * inv_rms
 // residual[i] = input_a[i] + input_b[i]
 // ---------------------------------------------------------------------------
 
+template <int MaxPairs, bool EvenDim = true>
+__global__ void __launch_bounds__(1024, 2) fused_add_rmsnorm_kernel(
+    __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ input_a,
+    const __nv_bfloat16* __restrict__ input_b,
+    const __nv_bfloat16* __restrict__ weight,
+    float eps, int dim
+) {
+    int row = blockIdx.x;
+    const __nv_bfloat16* a = input_a + row * dim;
+    const __nv_bfloat16* b = input_b + row * dim;
+    __nv_bfloat16* o = out + row * dim;
+    __nv_bfloat16* r = residual + row * dim;
+
+    extern __shared__ float sdata[];
+
+    float2 sv[MaxPairs];
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < MaxPairs; k++) {
+        int i = threadIdx.x * 2 + k * blockDim.x * 2;
+        if (i + 1 < dim) {
+            float2 av = load_bf16x2(a + i);
+            float2 bv = load_bf16x2(b + i);
+            sv[k] = make_float2(av.x + bv.x, av.y + bv.y);
+            sum += sv[k].x * sv[k].x + sv[k].y * sv[k].y;
+        }
+    }
+    if constexpr (!EvenDim) {
+        if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+            float ai = __bfloat162float(a[dim - 1]);
+            float bi = __bfloat162float(b[dim - 1]);
+            float si = ai + bi;
+            sum += si * si;
+        }
+    }
+
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    block_reduce_sum(sdata, threadIdx.x);
+
+    float inv_rms = rsqrtf(sdata[0] / dim + eps);
+
+    #pragma unroll
+    for (int k = 0; k < MaxPairs; k++) {
+        int i = threadIdx.x * 2 + k * blockDim.x * 2;
+        if (i + 1 < dim) {
+            float2 wv = load_bf16x2(weight + i);
+            store_bf16x2(r + i, sv[k].x, sv[k].y);
+            store_bf16x2(o + i, wv.x * sv[k].x * inv_rms, wv.y * sv[k].y * inv_rms);
+        }
+    }
+    if constexpr (!EvenDim) {
+        if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+            float ai = __bfloat162float(a[dim - 1]);
+            float bi = __bfloat162float(b[dim - 1]);
+            float wi = __bfloat162float(weight[dim - 1]);
+            float si = ai + bi;
+            r[dim - 1] = __float2bfloat16(si);
+            o[dim - 1] = __float2bfloat16(wi * si * inv_rms);
+        }
+    }
+}
+
+// Grid-stride fallback for large pairs (double-read, no caching).
 template <bool EvenDim = true>
-__global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel(
+__global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel_stride(
     __nv_bfloat16* __restrict__ out,
     __nv_bfloat16* __restrict__ residual,
     const __nv_bfloat16* __restrict__ input_a,
@@ -223,17 +370,45 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
     int max_block = (dim >= 4096 && batch < 64) ? 1024 : 256;
     int block_size = compute_block_size(dim, false, max_block);
     size_t shared_mem = block_size * sizeof(float);
-    if (dim & 1) {
-        fused_add_rmsnorm_kernel<false><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
-            (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
-            (const __nv_bfloat16*)weight, eps, dim);
+    int pairs = (dim + 2 * block_size - 1) / (2 * block_size);
+    bool even = (dim & 1) == 0;
+
+#define DISPATCH_FUSED(P, EV) \
+    fused_add_rmsnorm_kernel<P, EV><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>( \
+        (__nv_bfloat16*)out, (__nv_bfloat16*)residual, \
+        (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b, \
+        (const __nv_bfloat16*)weight, eps, dim)
+#define DISPATCH_FUSED_PAIRS(P) do { \
+    if (even) { DISPATCH_FUSED(P, true); } else { DISPATCH_FUSED(P, false); } \
+} while(0)
+
+    if (pairs <= 24) {
+        switch (pairs) {
+            case 1: DISPATCH_FUSED_PAIRS(1); break;
+            case 2: DISPATCH_FUSED_PAIRS(2); break;
+            case 3: DISPATCH_FUSED_PAIRS(3); break;
+            case 4: DISPATCH_FUSED_PAIRS(4); break;
+            case 5: case 6: DISPATCH_FUSED_PAIRS(6); break;
+            case 7: case 8: DISPATCH_FUSED_PAIRS(8); break;
+            case 9: case 10: case 11: case 12: DISPATCH_FUSED_PAIRS(12); break;
+            case 13: case 14: case 15: case 16: DISPATCH_FUSED_PAIRS(16); break;
+            default: DISPATCH_FUSED_PAIRS(24); break;
+        }
     } else {
-        fused_add_rmsnorm_kernel<true><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
-            (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
-            (const __nv_bfloat16*)weight, eps, dim);
+        if (even) {
+            fused_add_rmsnorm_kernel_stride<true><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
+                (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
+                (const __nv_bfloat16*)weight, eps, dim);
+        } else {
+            fused_add_rmsnorm_kernel_stride<false><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
+                (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
+                (const __nv_bfloat16*)weight, eps, dim);
+        }
     }
+#undef DISPATCH_FUSED
+#undef DISPATCH_FUSED_PAIRS
 }
 
 // ---------------------------------------------------------------------------
