@@ -42,11 +42,27 @@ __device__ __forceinline__ float rope_rotate_interleaved(float val, float paired
     return val * cos_val + rotated * sin_val;
 }
 
-__device__ void block_reduce_sum(float* sdata, int tid) {
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
+__device__ __forceinline__ float block_reduce_sum(float val, float* s_partial, int tid) {
+    constexpr int WarpSize = 32;
+    int lane = tid % WarpSize;
+    int warp = tid / WarpSize;
+    int warps_per_block = blockDim.x / WarpSize;
+
+    #pragma unroll
+    for (int offset = WarpSize / 2; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    if (lane == 0) s_partial[warp] = val;
+    __syncthreads();
+
+    if (warp == 0) {
+        val = (tid < warps_per_block) ? s_partial[tid] : 0.0f;
+        #pragma unroll
+        for (int offset = WarpSize / 2; offset > 0; offset >>= 1)
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        if (lane == 0) s_partial[0] = val;
     }
+    __syncthreads();
+    return s_partial[0];
 }
 
 __device__ void block_reduce_max_idx(float* s_vals, int* s_idxs, int tid) {
@@ -92,10 +108,8 @@ __device__ float compute_inv_rms(const __nv_bfloat16* x, int dim, float eps, flo
             sum += val * val;
         }
     }
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    block_reduce_sum(sdata, threadIdx.x);
-    return rsqrtf(sdata[0] / dim + eps);
+    float total = block_reduce_sum(sum, sdata, threadIdx.x);
+    return rsqrtf(total / dim + eps);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,10 +147,8 @@ __global__ void __launch_bounds__(1024, 2) rmsnorm_kernel(
         }
     }
 
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    block_reduce_sum(sdata, threadIdx.x);
-    float inv_rms = rsqrtf(sdata[0] / dim + eps);
+    float total = block_reduce_sum(sum, sdata, threadIdx.x);
+    float inv_rms = rsqrtf(total / dim + eps);
 
     #pragma unroll
     for (int k = 0; k < MaxPairs; k++) {
@@ -191,7 +203,7 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
     cudaSetDevice(ctx->device_id);
     int max_block = (dim >= 4096 && batch < 64) ? 1024 : 256;
     int block_size = compute_block_size(dim, false, max_block);
-    size_t shared_mem = block_size * sizeof(float);
+    size_t shared_mem = (block_size / 32) * sizeof(float);
     int pairs = (dim + 2 * block_size - 1) / (2 * block_size);
     bool even = (dim & 1) == 0;
 
@@ -274,11 +286,9 @@ __global__ void __launch_bounds__(1024, 2) fused_add_rmsnorm_kernel(
         }
     }
 
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    block_reduce_sum(sdata, threadIdx.x);
+    float total = block_reduce_sum(sum, sdata, threadIdx.x);
 
-    float inv_rms = rsqrtf(sdata[0] / dim + eps);
+    float inv_rms = rsqrtf(total / dim + eps);
 
     #pragma unroll
     for (int k = 0; k < MaxPairs; k++) {
@@ -336,11 +346,9 @@ __global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel_stride(
         }
     }
 
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    block_reduce_sum(sdata, threadIdx.x);
+    float total = block_reduce_sum(sum, sdata, threadIdx.x);
 
-    float inv_rms = rsqrtf(sdata[0] / dim + eps);
+    float inv_rms = rsqrtf(total / dim + eps);
 
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
         float2 av = load_bf16x2(a + i);
@@ -369,7 +377,7 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
     cudaSetDevice(ctx->device_id);
     int max_block = (dim >= 4096 && batch < 64) ? 1024 : 256;
     int block_size = compute_block_size(dim, false, max_block);
-    size_t shared_mem = block_size * sizeof(float);
+    size_t shared_mem = (block_size / 32) * sizeof(float);
     int pairs = (dim + 2 * block_size - 1) / (2 * block_size);
     bool even = (dim & 1) == 0;
 
@@ -475,7 +483,7 @@ void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
     cudaSetDevice(ctx->device_id);
     int total_rows = batch * n_heads * seq_len;
     int block_size = compute_block_size(head_dim, true);
-    size_t shared_mem = block_size * sizeof(float);
+    size_t shared_mem = (block_size / 32) * sizeof(float);
     if (interleaved) {
         fused_norm_rope_kernel<true><<<total_rows, block_size, shared_mem, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
@@ -982,10 +990,7 @@ __global__ void __launch_bounds__(256, 4) layernorm_kernel(
     if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
         mean += __bfloat162float(x[dim - 1]);
     }
-    sdata[threadIdx.x] = mean;
-    __syncthreads();
-    block_reduce_sum(sdata, threadIdx.x);
-    mean = sdata[0] / dim;
+    mean = block_reduce_sum(mean, sdata, threadIdx.x) / dim;
 
     float var = 0.0f;
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
@@ -997,10 +1002,7 @@ __global__ void __launch_bounds__(256, 4) layernorm_kernel(
         float d = __bfloat162float(x[dim - 1]) - mean;
         var += d * d;
     }
-    sdata[threadIdx.x] = var;
-    __syncthreads();
-    block_reduce_sum(sdata, threadIdx.x);
-    float inv_std = rsqrtf(sdata[0] / dim + eps);
+    float inv_std = rsqrtf(block_reduce_sum(var, sdata, threadIdx.x) / dim + eps);
 
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
         float2 xv = load_bf16x2(x + i);
@@ -1022,7 +1024,7 @@ void glm_layernorm(GlmCtx* ctx, void* out, const void* input,
                    const void* weight, const void* bias, float eps, int dim, int batch) {
     cudaSetDevice(ctx->device_id);
     int block_size = compute_block_size(dim);
-    size_t shared_mem = block_size * sizeof(float);
+    size_t shared_mem = (block_size / 32) * sizeof(float);
     layernorm_kernel<<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
         (const __nv_bfloat16*)weight, (const __nv_bfloat16*)bias,
@@ -1201,10 +1203,7 @@ __global__ void __launch_bounds__(256, 4) softmax_kernel(
         }
         sum += __expf(val);
     }
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    block_reduce_sum(sdata, threadIdx.x);
-    float inv_sum = 1.0f / sdata[0];
+    float inv_sum = 1.0f / block_reduce_sum(sum, sdata, threadIdx.x);
 
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float val;
@@ -2311,18 +2310,16 @@ __global__ void __launch_bounds__(256, 4) reduce_sum_kernel(
         sum += __bfloat162float(row_ptr[cols - 1]);
     }
     extern __shared__ float sdata[];
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    block_reduce_sum(sdata, threadIdx.x);
+    float total = block_reduce_sum(sum, sdata, threadIdx.x);
     if (threadIdx.x == 0) {
-        out[row] = __float2bfloat16(sdata[0]);
+        out[row] = __float2bfloat16(total);
     }
 }
 
 void glm_reduce_sum(GlmCtx* ctx, void* out, const void* input, int rows, int cols) {
     cudaSetDevice(ctx->device_id);
     int block_size = compute_block_size(cols);
-    size_t shared_mem = block_size * sizeof(float);
+    size_t shared_mem = (block_size / 32) * sizeof(float);
     reduce_sum_kernel<<<rows, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input, cols);
 }
