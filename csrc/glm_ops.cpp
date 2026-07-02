@@ -733,7 +733,7 @@ static Napi::Value Scale(const Napi::CallbackInfo& info) {
 static Napi::Value SumPointers(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 13) {
-        Napi::TypeError::New(env, "Expected (ctx, p0..p7, out, N, numel, dtype)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, p0..p7, out, N, numel, dtype[, writeback])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -745,15 +745,56 @@ static Napi::Value SumPointers(const Napi::CallbackInfo& info) {
     int N = info[10].As<Napi::Number>().Int32Value();
     int64_t numel = info[11].As<Napi::Number>().Int64Value();
     int dtype = info[12].As<Napi::Number>().Int32Value();
+    bool writeback = false;
+    if (info.Length() >= 14 && info[13].IsBoolean()) {
+        writeback = info[13].As<Napi::Boolean>().Value();
+    }
     glm_sum_pointers(reinterpret_cast<GlmCtx*>(ctx_ptr),
                      reinterpret_cast<void*>(p[0]),  reinterpret_cast<void*>(p[1]),
                      reinterpret_cast<void*>(p[2]),  reinterpret_cast<void*>(p[3]),
                      reinterpret_cast<void*>(p[4]),  reinterpret_cast<void*>(p[5]),
                      reinterpret_cast<void*>(p[6]),  reinterpret_cast<void*>(p[7]),
-                     reinterpret_cast<void*>(out_ptr), N, numel, dtype);
+                     reinterpret_cast<void*>(out_ptr), N, numel, dtype, writeback);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("sumPointers failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value RmsnormPointersSmem(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 18) {
+        Napi::TypeError::New(env, "Expected (ctx, p0..p7, inputA, weight, out, residual, N, numel, dim, eps, dtype)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t p[8];
+    for (int i = 0; i < 8; i++) {
+        p[i] = info[1 + i].As<Napi::Number>().Int64Value();
+    }
+    uintptr_t inputA_ptr = info[9].As<Napi::Number>().Int64Value();
+    uintptr_t weight_ptr = info[10].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[11].As<Napi::Number>().Int64Value();
+    uintptr_t res_ptr = info[12].As<Napi::Number>().Int64Value();
+    int N = info[13].As<Napi::Number>().Int32Value();
+    int64_t numel = info[14].As<Napi::Number>().Int64Value();
+    int dim = info[15].As<Napi::Number>().Int32Value();
+    float eps = info[16].As<Napi::Number>().FloatValue();
+    int dtype = info[17].As<Napi::Number>().Int32Value();
+    glm_rmsnorm_pointers_smem(reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<const void*>(p[0]),  reinterpret_cast<const void*>(p[1]),
+        reinterpret_cast<const void*>(p[2]),  reinterpret_cast<const void*>(p[3]),
+        reinterpret_cast<const void*>(p[4]),  reinterpret_cast<const void*>(p[5]),
+        reinterpret_cast<const void*>(p[6]),  reinterpret_cast<const void*>(p[7]),
+        reinterpret_cast<const void*>(inputA_ptr),
+        reinterpret_cast<const void*>(weight_ptr),
+        reinterpret_cast<void*>(out_ptr),
+        reinterpret_cast<void*>(res_ptr),
+        N, numel, dim, eps, dtype);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("rmsnormPointersSmem failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }
     return env.Undefined();
 }
@@ -3478,6 +3519,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));
     exports.Set(Napi::String::New(env, "scale"), Napi::Function::New(env, Scale));
     exports.Set(Napi::String::New(env, "sumPointers"), Napi::Function::New(env, SumPointers));
+    exports.Set(Napi::String::New(env, "rmsNormPointers"), Napi::Function::New(env, RmsnormPointersSmem));
     exports.Set(Napi::String::New(env, "add"), Napi::Function::New(env, Add));
     exports.Set(Napi::String::New(env, "addBroadcast"), Napi::Function::New(env, AddBroadcast));
     exports.Set(Napi::String::New(env, "rowScaleAdd"), Napi::Function::New(env, RowScaleAdd));

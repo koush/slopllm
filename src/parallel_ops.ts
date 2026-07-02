@@ -206,10 +206,8 @@ export class ParallelTensor extends Tensor {
       if (count % this.worldSize !== 0)
         return false;
       const chunkLen = count / this.worldSize;
-      const chunkBytes = chunkLen * (this.shards[0].bytes / count);
       const flatShards = this.shards.map(s => s.reshape([count]));
       this.parallelOps.p2pSources.push(...flatShards);
-      const outputShards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
         const rowShards: Tensor[] = new Array(this.worldSize);
         // rank i starts with its own shard (j = i) and walks outward,
@@ -220,22 +218,9 @@ export class ParallelTensor extends Tensor {
           rowShards[k] = v;
           this.parallelOps.p2pSources.push(v);
         }
-        rowShards[0].sumInPlace(rowShards);
-        outputShards.push(rowShards[0]);
+        rowShards[0].sumInPlace(rowShards, true);
       }
       this.parallelOps.p2pBarrier();
-
-      const addon = getNativeAddon();
-      const ptrs = new Array<number>(8).fill(0);
-      for (let i = 0; i < this.worldSize; i++) ptrs[i] = outputShards[i].data;
-      for (let i = 0; i < this.worldSize; ++i) {
-        addon.p2pAllGatherRowSmem(
-          this.devices[i].ctx,
-          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-          this.shards[i].data, this.worldSize, chunkBytes, this.shards[i].bytes, 1, i,
-        );
-      }
 
       return true;
     }
@@ -946,6 +931,10 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
       using gathered = this.allGather(this.workspace);
       return gathered.fusedAddRmsnorm(input, weight, eps, dim, batch);
+    }
+    
+    if (this.parallelism === TensorParallelism.Replicated && input.parallelism === TensorParallelism.PartialSum) {
+      // can be used here?
     }
 
     if (pInput.parallelism === TensorParallelism.PartialSum) {

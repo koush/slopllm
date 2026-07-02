@@ -74,21 +74,8 @@ __device__ float sigmoid_f(float x) {
 }
 
 // ---------------------------------------------------------------------------
-// BF16 vector I/O helpers
+// BF16 vector I/O helpers now live in glm_ops.h (shared across .cu TUs).
 // ---------------------------------------------------------------------------
-
-__device__ inline void load_bf16x2(const __nv_bfloat16* ptr, float& v0, float& v1) {
-    __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(ptr);
-    v0 = __bfloat162float(v.x);
-    v1 = __bfloat162float(v.y);
-}
-
-__device__ inline void store_bf16x2(__nv_bfloat16* ptr, float v0, float v1) {
-    __nv_bfloat162 v;
-    v.x = __float2bfloat16(v0);
-    v.y = __float2bfloat16(v1);
-    *reinterpret_cast<__nv_bfloat162*>(ptr) = v;
-}
 
 // Compute sum of squares of bf16 vector, reduce across block, return inv_rms.
 // Caller must provide extern __shared__ float sdata[].
@@ -2742,7 +2729,7 @@ sum_pointers_smem_kernel(
     const scalar_t* p0,  const scalar_t* p1,  const scalar_t* p2,  const scalar_t* p3,
     const scalar_t* p4,  const scalar_t* p5,  const scalar_t* p6,  const scalar_t* p7,
     scalar_t* __restrict__ output,
-    int N, int64_t numel, int64_t peer_stride_elems)
+    int N, int64_t numel, int64_t peer_stride_elems, bool writeback)
 {
     constexpr int WarpSize = 32;
     auto block = cg::this_thread_block();
@@ -2828,17 +2815,36 @@ sum_pointers_smem_kernel(
             }
         }
 
-        #pragma unroll
-        for (int k = 0; k < PAIRS; k++) {
-            int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
-            if (off + VEC <= elems) {
-                if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
-                    *reinterpret_cast<__nv_bfloat162*>(
-                        reinterpret_cast<char*>(output) + (size_t)(blk + off) * elem_sz) =
-                        __float22bfloat162_rn(acc[k]);
-                } else {
-                    *reinterpret_cast<float*>(
-                        reinterpret_cast<char*>(output) + (size_t)(blk + off) * elem_sz) = acc[k].x;
+        if (writeback) {
+            for (int j = 0; j < N; j++) {
+                #pragma unroll
+                for (int k = 0; k < PAIRS; k++) {
+                    int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
+                    if (off + VEC <= elems) {
+                        if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                            *reinterpret_cast<__nv_bfloat162*>(
+                                const_cast<char*>(peers[j]) + (size_t)(blk + off) * elem_sz) =
+                                __float22bfloat162_rn(acc[k]);
+                        } else {
+                            *reinterpret_cast<float*>(
+                                const_cast<char*>(peers[j]) + (size_t)(blk + off) * elem_sz) = acc[k].x;
+                        }
+                    }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int k = 0; k < PAIRS; k++) {
+                int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
+                if (off + VEC <= elems) {
+                    if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                        *reinterpret_cast<__nv_bfloat162*>(
+                            reinterpret_cast<char*>(output) + (size_t)(blk + off) * elem_sz) =
+                            __float22bfloat162_rn(acc[k]);
+                    } else {
+                        *reinterpret_cast<float*>(
+                            reinterpret_cast<char*>(output) + (size_t)(blk + off) * elem_sz) = acc[k].x;
+                    }
                 }
             }
         }
@@ -2852,7 +2858,7 @@ extern "C" {
 void glm_sum_pointers(GlmCtx* ctx,
     void* p0,  void* p1,  void* p2,  void* p3,
     void* p4,  void* p5,  void* p6,  void* p7,
-    void* output, int N, int64_t numel, int dtype) {
+    void* output, int N, int64_t numel, int dtype, bool writeback) {
     cudaSetDevice(ctx->device_id);
 
     constexpr int ElemsPerWarp = 512;
@@ -2882,7 +2888,7 @@ void glm_sum_pointers(GlmCtx* ctx,
     sum_pointers_smem_kernel<SCT, ElemsPerWarp, DVAL><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>( \
         (const SCT*)p0, (const SCT*)p1, (const SCT*)p2, (const SCT*)p3, \
         (const SCT*)p4, (const SCT*)p5, (const SCT*)p6, (const SCT*)p7, \
-        (SCT*)output, N, numel, peer_stride_elems); \
+        (SCT*)output, N, numel, peer_stride_elems, writeback); \
 } while (0)
 
     if (dtype == 9) {

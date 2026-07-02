@@ -45,12 +45,12 @@ class TestSumPointers:
         self.ops.lib.glm_sum_pointers.argtypes = (
             [ctypes.c_void_p] +  # ctx
             [ctypes.c_void_p] * 8 +  # p0..p7
-            [ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_int]  # out, N, numel, dtype
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_int, ctypes.c_bool]  # out, N, numel, dtype, writeback
         )
         self.ops.lib.glm_sum_pointers(
             self.ops.ctx,
             *ptr_args,
-            ctypes.c_void_p(int(out_ptr)), N, count, dtype,
+            ctypes.c_void_p(int(out_ptr)), N, count, dtype, False,
         )
 
         self.ops.synchronize()
@@ -64,6 +64,46 @@ class TestSumPointers:
 
         for p in gpu_ptrs[1:] + [gpu_ptrs[0]]:
             self.ops.free_buf(p)
+
+    def _sum_pointers_writeback(self, tensors_bf16, dtype=9):
+        count = tensors_bf16[0].shape[0]
+        N = len(tensors_bf16)
+
+        gpu_ptrs = []
+        for t in tensors_bf16:
+            ptr = self.ops.alloc(count * (4 if dtype == 7 else 2))
+            if dtype == 7:
+                cpu = t.cpu().float().numpy().astype(np.float32).tobytes()
+            else:
+                cpu = t.cpu().view(torch.int16).numpy().tobytes()
+            self.ops.h2d(ptr, cpu)
+            gpu_ptrs.append(ptr)
+
+        ptr_args = [ctypes.c_void_p(int(p)) for p in gpu_ptrs] + [ctypes.c_void_p(0)] * (8 - N)
+
+        self.ops.lib.glm_sum_pointers.restype = None
+        self.ops.lib.glm_sum_pointers.argtypes = (
+            [ctypes.c_void_p] +  # ctx
+            [ctypes.c_void_p] * 8 +  # p0..p7
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_int, ctypes.c_bool]
+        )
+        self.ops.lib.glm_sum_pointers(
+            self.ops.ctx,
+            *ptr_args,
+            ctypes.c_void_p(0), N, count, dtype, True,
+        )
+
+        self.ops.synchronize()
+
+        results = []
+        for p in gpu_ptrs:
+            out_bytes = ctypes.create_string_buffer(count * (4 if dtype == 7 else 2))
+            self.ops.d2h(out_bytes, p, count * (4 if dtype == 7 else 2))
+            if dtype == 7:
+                results.append(torch.from_numpy(np.frombuffer(out_bytes.raw, dtype=np.float32)[:count]).float())
+            else:
+                results.append(bf16_bytes_to_tensor(out_bytes.raw, count))
+        return results
 
     def test_single_tensor(self):
         a = torch.arange(256, dtype=torch.float32).bfloat16()
@@ -120,3 +160,30 @@ class TestSumPointers:
         result = self._sum_pointers([a, b, c], dtype=7)
         expected = a + b + c
         assert torch.allclose(result, expected, atol=1e-6), f"max err = {(result - expected).abs().max():.8f}"
+
+    def test_writeback_two_tensors(self):
+        a = torch.arange(512, dtype=torch.float32).bfloat16()
+        b = torch.arange(512, dtype=torch.float32).bfloat16() * 2
+        expected = (a.float() + b.float()).bfloat16()
+        results = self._sum_pointers_writeback([a, b])
+        assert len(results) == 2
+        for i, r in enumerate(results):
+            assert torch.equal(r, expected), f"writeback ptr {i} mismatch"
+
+    def test_writeback_many_tensors(self):
+        tensors = [(torch.arange(128, dtype=torch.float32).bfloat16() * (i + 1)) for i in range(8)]
+        expected_sum = sum(t.float() for t in tensors).bfloat16()
+        results = self._sum_pointers_writeback(tensors)
+        assert len(results) == 8
+        for i, r in enumerate(results):
+            assert torch.equal(r, expected_sum), f"writeback ptr {i} mismatch"
+
+    def test_writeback_f32_native(self):
+        a = torch.arange(256, dtype=torch.float32)
+        b = torch.arange(256, dtype=torch.float32) * 2
+        c = torch.arange(256, dtype=torch.float32) * 3
+        expected = a + b + c
+        results = self._sum_pointers_writeback([a, b, c], dtype=7)
+        assert len(results) == 3
+        for i, r in enumerate(results):
+            assert torch.allclose(r, expected, atol=1e-6), f"writeback ptr {i} max err = {(r - expected).abs().max():.8f}"

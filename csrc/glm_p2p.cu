@@ -24,6 +24,7 @@
 #include <cuda_bf16.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
+#include <type_traits>
 #include <cstdio>
 
 namespace cg = cooperative_groups;
@@ -301,6 +302,188 @@ p2p_allgather_row_smem_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fused P2P AllReduce + Add + RMSNorm (smem-staged).
+//
+// Same peer read pattern as sum_pointers_smem_kernel (glm_ops.cu): N peer
+// partial-sum pointers stream through a D-deep smem pipeline while threads
+// accumulate in FP32 registers. After accumulation, inputA (residual) is added,
+// then each row of `dim` elements is RMSNormed:
+//   s        = inputA + sum_{peer<N} p_peer
+//   residual = s
+//   out      = weight * s * rsqrt(mean(s^2) + eps)
+//
+// Row geometry: ElemsPerWarp (512) divides dim, so each warp's 512 elements
+// lie within a single row; one row spans warps_per_row = dim / ElemsPerWarp
+// warps. After accumulation every warp shuffle-reduces its sum-of-squares,
+// writes one float to a small reduction region at the end of smem, one
+// __syncthreads, then sums its row's warps_per_row slots to get inv_rms.
+// Host enforces dim % 512 == 0 and 8192 % dim == 0 (row-aligned tiles).
+// ---------------------------------------------------------------------------
+
+template <typename scalar_t, int ElemsPerWarp, int D_VAL>
+__global__ void __launch_bounds__(512, 2)
+rmsnorm_pointers_smem_kernel(
+    const scalar_t* p0,  const scalar_t* p1,
+    const scalar_t* p2,  const scalar_t* p3,
+    const scalar_t* p4,  const scalar_t* p5,
+    const scalar_t* p6,  const scalar_t* p7,
+    const scalar_t* __restrict__ inputA,
+    const scalar_t* __restrict__ weight,
+    scalar_t* __restrict__ out,
+    scalar_t* __restrict__ residual,
+    int N, int64_t numel, int64_t peer_stride_elems, int dim, float eps)
+{
+    constexpr int WarpSize = 32;
+    auto block = cg::this_thread_block();
+    extern __shared__ char smem_raw[];
+
+    int warp_id = threadIdx.x / WarpSize;
+    int lane    = threadIdx.x % WarpSize;
+    int warps_per_block = blockDim.x / WarpSize;
+    int64_t block_stride = (int64_t)warps_per_block * ElemsPerWarp;
+    int64_t total_blocks = gridDim.x;
+    int64_t my_start = (int64_t)blockIdx.x * block_stride;
+
+    const char* peers[8] = {
+        reinterpret_cast<const char*>(p0), reinterpret_cast<const char*>(p1),
+        reinterpret_cast<const char*>(p2), reinterpret_cast<const char*>(p3),
+        reinterpret_cast<const char*>(p4), reinterpret_cast<const char*>(p5),
+        reinterpret_cast<const char*>(p6), reinterpret_cast<const char*>(p7),
+    };
+
+    constexpr int VEC = (sizeof(scalar_t) == 2) ? 2 : 1;
+    constexpr int PAIRS = ElemsPerWarp / (WarpSize * VEC);
+    int64_t warp_start = (int64_t)warp_id * ElemsPerWarp;
+    const size_t elem_sz = sizeof(scalar_t);
+
+    int warps_per_row = dim / ElemsPerWarp;                       // >= 1
+    int row_warp_base = (warp_id / warps_per_row) * warps_per_row;
+    int weight_base   = (warp_id % warps_per_row) * ElemsPerWarp; // weight col for this warp
+
+    // Reduction slots at the end of smem, past the peer pipeline region.
+    float* reduce_smem = reinterpret_cast<float*>(
+        smem_raw + (size_t)D_VAL * peer_stride_elems * elem_sz);
+
+    for (int64_t blk = my_start; blk < numel; blk += total_blocks * block_stride) {
+        int64_t elems = min(block_stride, numel - blk);
+        size_t copy_bytes = (size_t)elems * elem_sz;
+
+        float2 acc[PAIRS];
+        #pragma unroll
+        for (int k = 0; k < PAIRS; k++) acc[k] = {0.0f, 0.0f};
+
+        // --- Peer pipeline (identical read pattern to sum_pointers_smem) ---
+        int P = min(D_VAL, N);
+        #pragma unroll
+        for (int k = 0; k < D_VAL; k++) {
+            if (k < P)
+                cg::memcpy_async(block,
+                    smem_raw + (size_t)k * peer_stride_elems * elem_sz,
+                    peers[k] + (size_t)blk * elem_sz,
+                    copy_bytes);
+        }
+
+        int steady = max(0, N - D_VAL);
+        for (int j = 0; j < steady; j++) {
+            cg::wait_prior<D_VAL - 1>(block);
+            char* buf = smem_raw + (size_t)(j % D_VAL) * peer_stride_elems * elem_sz;
+            #pragma unroll
+            for (int k = 0; k < PAIRS; k++) {
+                int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
+                if (off + VEC <= elems) {
+                    if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                        __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(buf + off * elem_sz);
+                        float2 f = __bfloat1622float2(v);
+                        acc[k].x += f.x; acc[k].y += f.y;
+                    } else {
+                        float v = *reinterpret_cast<const float*>(buf + off * elem_sz);
+                        acc[k].x += v;
+                    }
+                }
+            }
+            cg::memcpy_async(block,
+                smem_raw + (size_t)(j % D_VAL) * peer_stride_elems * elem_sz,
+                peers[j + D_VAL] + (size_t)blk * elem_sz,
+                copy_bytes);
+        }
+
+        cg::wait(block);
+        for (int j = steady; j < N; j++) {
+            char* buf = smem_raw + (size_t)(j % D_VAL) * peer_stride_elems * elem_sz;
+            #pragma unroll
+            for (int k = 0; k < PAIRS; k++) {
+                int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
+                if (off + VEC <= elems) {
+                    if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                        __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(buf + off * elem_sz);
+                        float2 f = __bfloat1622float2(v);
+                        acc[k].x += f.x; acc[k].y += f.y;
+                    } else {
+                        float v = *reinterpret_cast<const float*>(buf + off * elem_sz);
+                        acc[k].x += v;
+                    }
+                }
+            }
+        }
+
+        // --- Add inputA (residual), accumulate sum-of-squares ---
+        float sum_sq = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < PAIRS; k++) {
+            int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
+            if (off + VEC <= elems) {
+                if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                    float a0, a1;
+                    load_bf16x2(inputA + (blk + off), a0, a1);
+                    acc[k].x += a0; acc[k].y += a1;
+                    sum_sq += acc[k].x * acc[k].x + acc[k].y * acc[k].y;
+                } else {
+                    float a = inputA[blk + off];
+                    acc[k].x += a;
+                    sum_sq += acc[k].x * acc[k].x;
+                }
+            }
+        }
+
+        // --- Intra-warp shuffle reduce ---
+        #pragma unroll
+        for (int offset = WarpSize / 2; offset > 0; offset >>= 1)
+            sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+
+        // --- Cross-warp exchange: 1 slot/warp, 1 sync, sum row partners ---
+        if (lane == 0) reduce_smem[warp_id] = sum_sq;
+        __syncthreads();
+        float row_sq = 0.0f;
+        for (int w = 0; w < warps_per_row; w++)
+            row_sq += reduce_smem[row_warp_base + w];
+        float inv_rms = rsqrtf(row_sq / (float)dim + eps);
+
+        // --- Write residual and normed output ---
+        #pragma unroll
+        for (int k = 0; k < PAIRS; k++) {
+            int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
+            if (off + VEC <= elems) {
+                int64_t gidx = blk + off;
+                int wcol = weight_base + lane * VEC + (int64_t)k * WarpSize * VEC;
+                if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                    store_bf16x2(residual + gidx, acc[k].x, acc[k].y);
+                    float w0, w1;
+                    load_bf16x2(weight + wcol, w0, w1);
+                    store_bf16x2(out + gidx, w0 * acc[k].x * inv_rms,
+                                            w1 * acc[k].y * inv_rms);
+                } else {
+                    residual[gidx] = acc[k].x;
+                    float w = weight[wcol];
+                    out[gidx] = w * acc[k].x * inv_rms;
+                }
+            }
+        }
+
+        __syncthreads();   // smem reads done before next tile's cp.async
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -538,6 +721,86 @@ void glm_p2p_allgather_row_smem(GlmCtx* ctx,
             break;
     }
     #undef LAUNCH_AG_ROW_SMEM
+}
+
+// ---------------------------------------------------------------------------
+// Fused P2P AllReduce + Add + RMSNorm launcher.
+// ---------------------------------------------------------------------------
+
+#define LAUNCH_RMSNORM_PTRS(SCT, DVAL) do { \
+    cudaFuncSetAttribute( \
+        (void*)rmsnorm_pointers_smem_kernel<SCT, ElemsPerWarp, DVAL>, \
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 65536); \
+    rmsnorm_pointers_smem_kernel<SCT, ElemsPerWarp, DVAL><<<grid, block_size, smem_bytes, stream>>>( \
+        (const SCT*)p0, (const SCT*)p1, (const SCT*)p2, (const SCT*)p3, \
+        (const SCT*)p4, (const SCT*)p5, (const SCT*)p6, (const SCT*)p7, \
+        (const SCT*)inputA, (const SCT*)weight, \
+        (SCT*)out, (SCT*)residual, \
+        N, numel, peer_stride_elems, dim, eps); \
+} while (0)
+
+void glm_rmsnorm_pointers_smem(GlmCtx* ctx,
+    const void* p0,  const void* p1,  const void* p2,  const void* p3,
+    const void* p4,  const void* p5,  const void* p6,  const void* p7,
+    const void* inputA, const void* weight,
+    void* out, void* residual,
+    int N, int64_t numel, int dim, float eps, int dtype) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+
+    constexpr int ElemsPerWarp = 512;
+    constexpr int WarpsPerBlock = 16;
+    constexpr int64_t BlockStride = (int64_t)WarpsPerBlock * ElemsPerWarp;  // 8192
+    constexpr int64_t SmemBudget = 32 * 1024;
+
+    // Row-alignment requirements (see kernel comment).
+    if (dim <= 0 || ElemsPerWarp <= 0 || dim % ElemsPerWarp != 0 ||
+        BlockStride % dim != 0 || N <= 0 || N > 8) {
+        fprintf(stderr, "glm_rmsnorm_pointers_smem: invalid args dim=%d N=%d "
+                        "(need dim%%512==0 and 8192%%dim==0, 1<=N<=8)\n", dim, N);
+        return;
+    }
+
+    int elem_size = (dtype == 9) ? 2 : 4;
+    int64_t peer_stride_elems = (numel < BlockStride) ? numel : BlockStride;
+    int64_t peer_stride_bytes = peer_stride_elems * elem_size;
+    if (peer_stride_bytes < 1) peer_stride_bytes = 1;
+    int64_t budget = SmemBudget / peer_stride_bytes;
+    int D = (int)((budget < N) ? budget : N);
+    if (D < 1) D = 1;
+    if (D > 8) D = 8;
+
+    int64_t total_warps = (numel + ElemsPerWarp - 1) / ElemsPerWarp;
+    if (total_warps == 0) total_warps = 1;
+    int grid = (int)((total_warps + WarpsPerBlock - 1) / WarpsPerBlock);
+    int block_size = WarpsPerBlock * 32;
+    int64_t smem_bytes = (int64_t)D * peer_stride_bytes
+                       + (int64_t)WarpsPerBlock * sizeof(float);
+
+    if (dtype == 9) {
+        switch (D) {
+            case 8: LAUNCH_RMSNORM_PTRS(__nv_bfloat16, 8); break;
+            case 7: LAUNCH_RMSNORM_PTRS(__nv_bfloat16, 7); break;
+            case 6: LAUNCH_RMSNORM_PTRS(__nv_bfloat16, 6); break;
+            case 5: LAUNCH_RMSNORM_PTRS(__nv_bfloat16, 5); break;
+            case 4: LAUNCH_RMSNORM_PTRS(__nv_bfloat16, 4); break;
+            case 3: LAUNCH_RMSNORM_PTRS(__nv_bfloat16, 3); break;
+            case 2: LAUNCH_RMSNORM_PTRS(__nv_bfloat16, 2); break;
+            default: LAUNCH_RMSNORM_PTRS(__nv_bfloat16, 1); break;
+        }
+    } else {
+        switch (D) {
+            case 8: LAUNCH_RMSNORM_PTRS(float, 8); break;
+            case 7: LAUNCH_RMSNORM_PTRS(float, 7); break;
+            case 6: LAUNCH_RMSNORM_PTRS(float, 6); break;
+            case 5: LAUNCH_RMSNORM_PTRS(float, 5); break;
+            case 4: LAUNCH_RMSNORM_PTRS(float, 4); break;
+            case 3: LAUNCH_RMSNORM_PTRS(float, 3); break;
+            case 2: LAUNCH_RMSNORM_PTRS(float, 2); break;
+            default: LAUNCH_RMSNORM_PTRS(float, 1); break;
+        }
+    }
+    #undef LAUNCH_RMSNORM_PTRS
 }
 
 } // extern "C"

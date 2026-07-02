@@ -219,7 +219,22 @@ void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
 void glm_sum_pointers(GlmCtx* ctx,
     void* p0,  void* p1,  void* p2,  void* p3,
     void* p4,  void* p5,  void* p6,  void* p7,
-    void* output, int N, int64_t numel, int dtype);
+    void* output, int N, int64_t numel, int dtype, bool writeback = false);
+
+// Fused P2P AllReduce + Add + RMSNorm. Reads N peer partial-sum pointers
+// (smem-staged, same read pattern as glm_sum_pointers), accumulates them in
+// registers, adds inputA (residual), then RMSNorms each row of `dim` elements:
+//   s        = inputA + sum_{peer<N} p_peer
+//   residual = s
+//   out      = weight * s * rsqrt(mean(s^2) + eps)
+// Constraints: dim % 512 == 0 and 8192 % dim == 0 (tiles stay row-aligned).
+// dtype: 9=BF16, 7=F32.
+void glm_rmsnorm_pointers_smem(GlmCtx* ctx,
+    const void* p0,  const void* p1,  const void* p2,  const void* p3,
+    const void* p4,  const void* p5,  const void* p6,  const void* p7,
+    const void* inputA, const void* weight,
+    void* out, void* residual,
+    int N, int64_t numel, int dim, float eps, int dtype);
 
 void glm_index_select(GlmCtx* ctx, void* out, const void* src,
                        const void* indices, int dim, int k, int offset);
@@ -829,6 +844,28 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output,
                                             int num_experts, void* workspace);
 
 #ifdef __cplusplus
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Device-only BF16 vector I/O helpers (available to all .cu TUs that include
+// this header). Kept here so kernels defined in translation units other than
+// glm_ops.cu (e.g. glm_p2p.cu) can share the same helpers.
+// ---------------------------------------------------------------------------
+#if defined(__CUDACC__)
+#include <cuda_bf16.h>
+
+__device__ __forceinline__ void load_bf16x2(const __nv_bfloat16* ptr, float& v0, float& v1) {
+    __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(ptr);
+    v0 = __bfloat162float(v.x);
+    v1 = __bfloat162float(v.y);
+}
+
+__device__ __forceinline__ void store_bf16x2(__nv_bfloat16* ptr, float v0, float v1) {
+    __nv_bfloat162 v;
+    v.x = __float2bfloat16(v0);
+    v.y = __float2bfloat16(v1);
+    *reinterpret_cast<__nv_bfloat162*>(ptr) = v;
 }
 #endif
 

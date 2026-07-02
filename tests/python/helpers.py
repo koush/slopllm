@@ -655,6 +655,15 @@ class GlmOps:
             ctypes.c_float, ctypes.c_int, ctypes.c_int,
         ]
 
+        self.lib.glm_rmsnorm_pointers_smem.restype = None
+        self.lib.glm_rmsnorm_pointers_smem.argtypes = (
+            [ctypes.c_void_p] +                       # ctx
+            [ctypes.c_void_p] * 8 +                   # p0..p7
+            [ctypes.c_void_p, ctypes.c_void_p] +      # inputA, weight
+            [ctypes.c_void_p, ctypes.c_void_p] +      # out, residual
+            [ctypes.c_int, ctypes.c_int64, ctypes.c_int, ctypes.c_float, ctypes.c_int]  # N, numel, dim, eps, dtype
+        )
+
         self.lib.glm_fused_norm_rope.restype = None
         self.lib.glm_fused_norm_rope.argtypes = [
             ctypes.c_void_p,
@@ -1613,6 +1622,18 @@ class GlmOps:
             self._ptr(input_b),
             self._ptr(weight),
             ctypes.c_float(eps), dim, batch
+        )
+
+    def rmsnorm_pointers_smem(self, peer_ptrs, inputA, weight, out, residual,
+                              N, numel, dim, eps, dtype=9):
+        ptr_args = [ctypes.c_void_p(int(p)) for p in peer_ptrs]
+        ptr_args += [ctypes.c_void_p(0)] * (8 - len(peer_ptrs))
+        self.lib.glm_rmsnorm_pointers_smem(
+            self.ctx,
+            *ptr_args,
+            self._ptr(inputA), self._ptr(weight),
+            self._ptr(out), self._ptr(residual),
+            N, ctypes.c_int64(numel), dim, ctypes.c_float(eps), dtype,
         )
 
     def fused_norm_rope(self, output, input_tensor, weight, cos, sin, eps, rope_dim, head_dim, n_heads, seq_len, batch, in_stride=None, interleaved=False):

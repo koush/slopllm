@@ -395,7 +395,7 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  sumInPlace(tensors: Tensor[]): void {
+  sumInPlace(tensors: Tensor[], writeback?: boolean): void {
     if (tensors.length === 0 || tensors.length > 8) {
       throw new Error(`sumInPlace: requires 1-8 additional tensors, got ${tensors.length}`);
     }

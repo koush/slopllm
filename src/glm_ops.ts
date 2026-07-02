@@ -146,7 +146,8 @@ interface NativeAddon {
   add(ctx: number, out: number, a: number, b: number, n: number): void;
   addBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scale(ctx: number, out: number, input: number, scale: number, n: number): void;
-  sumPointers(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, out: number, n: number, numel: number, dtype: number): void;
+  sumPointers(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, out: number, n: number, numel: number, dtype: number, writeback?: boolean): void;
+  rmsNormPointers(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, inputA: number, weight: number, out: number, residual: number, n: number, numel: number, dim: number, eps: number, dtype: number): void;
   mul(ctx: number, out: number, a: number, b: number, n: number): void;
   mulBroadcast(ctx: number, out: number, a: number, b: number, dim: number, rows: number): void;
   scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
@@ -496,7 +497,7 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  private runSumPointers(output: Tensor, inputs: Tensor[]): void {
+  private runSumPointers(output: Tensor, inputs: Tensor[], writeback?: boolean): void {
     const N = inputs.length;
     const numel = output.shape.reduce((a, b) => a * b, 1);
     const dtype = output.type === "F32" ? 7 : 9;
@@ -506,13 +507,35 @@ export class GlmTensor extends Tensor {
       this.glm.ctx,
       ptrs[0], ptrs[1], ptrs[2], ptrs[3],
       ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-      output.data, N, numel, dtype,
+      output.data, N, numel, dtype, writeback,
     );
   }
 
-  sumInPlace(tensors: Tensor[]): void {
+  /**
+   * Fused P2P AllReduce + Add + RMSNorm over N peer partial-sum tensors.
+   * Computes, per row of `dim` elements:
+   *   s = inputA + sum(peers);  residual = s;  out = weight * s * rsqrt(mean(s^2)+eps)
+   * `out` and `residual` receive the results; `peers` are read only.
+   * Requires dim % 512 == 0 and 8192 % dim == 0 (row-aligned tiles).
+   */
+  rmsNormPointers(inputA: Tensor, peers: Tensor[], weight: Tensor, out: Tensor, residual: Tensor, dim: number, eps: number): void {
+    const N = peers.length;
+    const numel = out.shape.reduce((a, b) => a * b, 1);
+    const dtype = out.type === "F32" ? 7 : 9;
+    const ptrs = new Array<number>(8).fill(0);
+    for (let i = 0; i < N; i++) ptrs[i] = peers[i].data;
+    getNativeAddon().rmsNormPointers(
+      this.glm.ctx,
+      ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+      ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+      inputA.data, weight.data, out.data, residual.data,
+      N, numel, dim, eps, dtype,
+    );
+  }
+
+  sumInPlace(tensors: Tensor[], writeback?: boolean): void {
     super.sumInPlace(tensors);
-    this.runSumPointers(this, tensors);
+    this.runSumPointers(this, tensors, writeback);
   }
 
   sum(tensors: Tensor[]): Tensor {
