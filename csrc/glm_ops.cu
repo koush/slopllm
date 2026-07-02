@@ -79,15 +79,18 @@ __device__ float sigmoid_f(float x) {
 
 // Compute sum of squares of bf16 vector, reduce across block, return inv_rms.
 // Caller must provide extern __shared__ float sdata[].
+template <bool EvenDim = true>
 __device__ float compute_inv_rms(const __nv_bfloat16* x, int dim, float eps, float* sdata) {
     float sum = 0.0f;
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
         float2 v = load_bf16x2(x + i);
         sum += v.x * v.x + v.y * v.y;
     }
-    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
-        float val = __bfloat162float(x[dim - 1]);
-        sum += val * val;
+    if constexpr (!EvenDim) {
+        if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+            float val = __bfloat162float(x[dim - 1]);
+            sum += val * val;
+        }
     }
     sdata[threadIdx.x] = sum;
     __syncthreads();
@@ -99,6 +102,7 @@ __device__ float compute_inv_rms(const __nv_bfloat16* x, int dim, float eps, flo
 // RMSNorm kernel
 // ---------------------------------------------------------------------------
 
+template <bool EvenDim = true>
 __global__ void __launch_bounds__(1024, 1) rmsnorm_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
@@ -112,17 +116,19 @@ __global__ void __launch_bounds__(1024, 1) rmsnorm_kernel(
 
     extern __shared__ float sdata[];
 
-    float inv_rms = compute_inv_rms(x, dim, eps, sdata);
+    float inv_rms = compute_inv_rms<EvenDim>(x, dim, eps, sdata);
 
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
         float2 xv = load_bf16x2(x + i);
         float2 wv = load_bf16x2(weight + i);
         store_bf16x2(o + i, wv.x * xv.x * inv_rms, wv.y * xv.y * inv_rms);
     }
-    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
-        float xi = __bfloat162float(x[dim - 1]);
-        float wi = __bfloat162float(weight[dim - 1]);
-        o[dim - 1] = __float2bfloat16(wi * xi * inv_rms);
+    if constexpr (!EvenDim) {
+        if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+            float xi = __bfloat162float(x[dim - 1]);
+            float wi = __bfloat162float(weight[dim - 1]);
+            o[dim - 1] = __float2bfloat16(wi * xi * inv_rms);
+        }
     }
 }
 
@@ -132,9 +138,15 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
     int max_block = (dim >= 4096 && batch < 64) ? 1024 : 256;
     int block_size = compute_block_size(dim, false, max_block);
     size_t shared_mem = block_size * sizeof(float);
-    rmsnorm_kernel<<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-        (const __nv_bfloat16*)weight, eps, dim);
+    if (dim & 1) {
+        rmsnorm_kernel<false><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+            (const __nv_bfloat16*)weight, eps, dim);
+    } else {
+        rmsnorm_kernel<true><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+            (const __nv_bfloat16*)weight, eps, dim);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +155,7 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
 // residual[i] = input_a[i] + input_b[i]
 // ---------------------------------------------------------------------------
 
+template <bool EvenDim = true>
 __global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel(
     __nv_bfloat16* __restrict__ out,
     __nv_bfloat16* __restrict__ residual,
@@ -167,11 +180,13 @@ __global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel(
         float s1 = av.y + bv.y;
         sum += s0 * s0 + s1 * s1;
     }
-    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
-        float ai = __bfloat162float(a[dim - 1]);
-        float bi = __bfloat162float(b[dim - 1]);
-        float si = ai + bi;
-        sum += si * si;
+    if constexpr (!EvenDim) {
+        if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+            float ai = __bfloat162float(a[dim - 1]);
+            float bi = __bfloat162float(b[dim - 1]);
+            float si = ai + bi;
+            sum += si * si;
+        }
     }
 
     sdata[threadIdx.x] = sum;
@@ -189,13 +204,15 @@ __global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel(
         store_bf16x2(r + i, s0, s1);
         store_bf16x2(o + i, wv.x * s0 * inv_rms, wv.y * s1 * inv_rms);
     }
-    if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
-        float ai = __bfloat162float(a[dim - 1]);
-        float bi = __bfloat162float(b[dim - 1]);
-        float wi = __bfloat162float(weight[dim - 1]);
-        float si = ai + bi;
-        r[dim - 1] = __float2bfloat16(si);
-        o[dim - 1] = __float2bfloat16(wi * si * inv_rms);
+    if constexpr (!EvenDim) {
+        if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
+            float ai = __bfloat162float(a[dim - 1]);
+            float bi = __bfloat162float(b[dim - 1]);
+            float wi = __bfloat162float(weight[dim - 1]);
+            float si = ai + bi;
+            r[dim - 1] = __float2bfloat16(si);
+            o[dim - 1] = __float2bfloat16(wi * si * inv_rms);
+        }
     }
 }
 
@@ -206,10 +223,17 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
     int max_block = (dim >= 4096 && batch < 64) ? 1024 : 256;
     int block_size = compute_block_size(dim, false, max_block);
     size_t shared_mem = block_size * sizeof(float);
-    fused_add_rmsnorm_kernel<<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
-        (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
-        (const __nv_bfloat16*)weight, eps, dim);
+    if (dim & 1) {
+        fused_add_rmsnorm_kernel<false><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
+            (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
+            (const __nv_bfloat16*)weight, eps, dim);
+    } else {
+        fused_add_rmsnorm_kernel<true><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
+            (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
+            (const __nv_bfloat16*)weight, eps, dim);
+    }
 }
 
 // ---------------------------------------------------------------------------
