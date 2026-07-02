@@ -3030,7 +3030,96 @@ sum_pointers_smem_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// memcpy_multi: fan-out copy from one source to N destination pointers.
+// No smem staging — read once into registers, scatter-write to all destinations.
+// Same warp-based indexing as sum_pointers_smem for consistent grid sizing.
+// ---------------------------------------------------------------------------
+
+template <typename scalar_t, int ElemsPerWarp>
+__global__ void __launch_bounds__(512, 2)
+memcpy_multi_kernel(
+    const scalar_t* src,
+    scalar_t* dst0, scalar_t* dst1, scalar_t* dst2, scalar_t* dst3,
+    scalar_t* dst4, scalar_t* dst5, scalar_t* dst6, scalar_t* dst7,
+    int N, int64_t numel)
+{
+    constexpr int WarpSize = 32;
+    int warp_id = threadIdx.x / WarpSize;
+    int lane    = threadIdx.x % WarpSize;
+    int warps_per_block = blockDim.x / WarpSize;
+    int64_t block_stride = (int64_t)warps_per_block * ElemsPerWarp;
+    int64_t total_blocks = gridDim.x;
+    int64_t my_start = (int64_t)blockIdx.x * block_stride;
+
+    scalar_t* dsts[8] = {dst0, dst1, dst2, dst3, dst4, dst5, dst6, dst7};
+
+    constexpr int VEC = (sizeof(scalar_t) == 2) ? 2 : 1;
+    constexpr int PAIRS = ElemsPerWarp / (WarpSize * VEC);
+    int64_t warp_start = (int64_t)warp_id * ElemsPerWarp;
+    const size_t elem_sz = sizeof(scalar_t);
+
+    for (int64_t blk = my_start; blk < numel; blk += total_blocks * block_stride) {
+        int64_t elems = min(block_stride, numel - blk);
+
+        #pragma unroll
+        for (int k = 0; k < PAIRS; k++) {
+            int64_t off = warp_start + lane * VEC + (int64_t)k * WarpSize * VEC;
+            if (off + VEC <= elems) {
+                if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+                    __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(
+                        reinterpret_cast<const char*>(src) + (size_t)(blk + off) * elem_sz);
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        if (j >= N) break;
+                        *reinterpret_cast<__nv_bfloat162*>(
+                            reinterpret_cast<char*>(dsts[j]) + (size_t)(blk + off) * elem_sz) = v;
+                    }
+                } else {
+                    float v = *reinterpret_cast<const float*>(
+                        reinterpret_cast<const char*>(src) + (size_t)(blk + off) * elem_sz);
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        if (j >= N) break;
+                        *reinterpret_cast<float*>(
+                            reinterpret_cast<char*>(dsts[j]) + (size_t)(blk + off) * elem_sz) = v;
+                    }
+                }
+            }
+        }
+    }
+}
+
 extern "C" {
+
+void glm_memcpy_multi(GlmCtx* ctx,
+    const void* src,
+    void* dst0, void* dst1, void* dst2, void* dst3,
+    void* dst4, void* dst5, void* dst6, void* dst7,
+    int N, int64_t numel, int dtype) {
+    cudaSetDevice(ctx->device_id);
+
+    constexpr int ElemsPerWarp = 512;
+    constexpr int WarpsPerBlock = 16;
+    int64_t total_warps = (numel + ElemsPerWarp - 1) / ElemsPerWarp;
+    if (total_warps == 0) total_warps = 1;
+    int grid = (int)((total_warps + WarpsPerBlock - 1) / WarpsPerBlock);
+    int block_size = WarpsPerBlock * 32;
+
+    if (dtype == 9) {
+        memcpy_multi_kernel<__nv_bfloat16, ElemsPerWarp><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (const __nv_bfloat16*)src,
+            (__nv_bfloat16*)dst0, (__nv_bfloat16*)dst1, (__nv_bfloat16*)dst2, (__nv_bfloat16*)dst3,
+            (__nv_bfloat16*)dst4, (__nv_bfloat16*)dst5, (__nv_bfloat16*)dst6, (__nv_bfloat16*)dst7,
+            N, numel);
+    } else {
+        memcpy_multi_kernel<float, ElemsPerWarp><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (const float*)src,
+            (float*)dst0, (float*)dst1, (float*)dst2, (float*)dst3,
+            (float*)dst4, (float*)dst5, (float*)dst6, (float*)dst7,
+            N, numel);
+    }
+}
 
 void glm_sum_pointers(GlmCtx* ctx,
     void* p0,  void* p1,  void* p2,  void* p3,
@@ -3123,6 +3212,29 @@ void glm_write_pointers(GlmCtx* ctx, void* dst,
     cudaSetDevice(ctx->device_id);
     write_pointers_kernel<<<1, 8, 0, GLM_STREAM(ctx)>>>(
         (void**)dst, p0, p1, p2, p3, p4, p5, p6, p7, n);
+}
+
+void glm_sum_pointers_direct(GlmCtx* ctx,
+    void* p0, void* p1, void* p2, void* p3,
+    void* p4, void* p5, void* p6, void* p7,
+    void* output, int N, int64_t numel, int dtype) {
+    cudaSetDevice(ctx->device_id);
+    constexpr int block_size = 256;
+    int grid = (int)((numel + block_size - 1) / block_size);
+    if (grid > 65535) grid = 65535;
+    if (dtype == 9) {
+        sum_pointers_kernel<__nv_bfloat16><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)p0, (__nv_bfloat16*)p1, (__nv_bfloat16*)p2, (__nv_bfloat16*)p3,
+            (__nv_bfloat16*)p4, (__nv_bfloat16*)p5, (__nv_bfloat16*)p6, (__nv_bfloat16*)p7,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            (__nv_bfloat16*)output, N, numel);
+    } else {
+        sum_pointers_kernel<float><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (float*)p0, (float*)p1, (float*)p2, (float*)p3,
+            (float*)p4, (float*)p5, (float*)p6, (float*)p7,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            (float*)output, N, numel);
+    }
 }
 
 } // extern "C"

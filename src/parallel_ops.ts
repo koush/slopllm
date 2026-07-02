@@ -190,14 +190,76 @@ export class ParallelTensor extends Tensor {
       return false;
     if (this.type !== "BF16" && this.type !== "F32")
       return false;
+    const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
+    if (!group)
+      return false;
 
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
 
+    // all to all reduce
     if (true) {
       if (count > 65536 * 2)
         return false;
-      const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
-      if (!group)
+
+      const gatheredShards: Tensor[] = [];
+      for (const shard of this.shards) {
+        const outerShape = shard.shape[0];
+        const gatheredShape = [outerShape * this.worldSize, ...shard.shape.slice(1)];
+        const gathered = shard.workspace.alloc(gatheredShape, shard.type);
+        gatheredShards.push(gathered);
+      }
+
+      const addon = getNativeAddon();
+      for (let i = 0; i < this.worldSize; i++) {
+        const shard = this.shards[i];
+        const outer = shard.shape[0];
+        const gatheredNarrows = gatheredShards.map(g => g.narrow(i * outer, outer));
+        const ptrs = new Array<number>(8).fill(0);
+        for (let k = 0; k < this.worldSize; k++) {
+          ptrs[k] = gatheredNarrows[(i + k) % this.worldSize].data;
+        }
+        addon.memcpyMulti(this.devices[i].ctx, shard.data,
+          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+          this.worldSize, shard.numElements, shard.type === "F32" ? 7 : 9);
+        for (const n of gatheredNarrows) {
+          n[Symbol.dispose]();
+        }
+      }
+
+      this.parallelOps.p2pBarrier();
+      this.parallelOps.sourceCleanup();
+
+      for (let i = 0; i < this.worldSize; i++) {
+        const gathered = gatheredShards[i];
+        const outer = this.shards[i].shape[0];
+        const shard = this.shards[i] as GlmTensor;
+        const numel = shard.numElements;
+        const dtype = shard.type === "F32" ? 7 : 9;
+        const gatheredNarrows = new Array<Tensor>(this.worldSize);
+        const ptrs = new Array<number>(8).fill(0);
+        for (let k = 0; k < this.worldSize; k++) {
+          gatheredNarrows[k] = gathered.narrow(k * outer, outer);
+          ptrs[k] = (gatheredNarrows[k] as GlmTensor).data;
+        }
+        addon.sumPointersDirect(
+          this.devices[i].ctx,
+          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+          shard.data, this.worldSize, numel, dtype,
+        );
+        for (const gatheredNarrow of gatheredNarrows) {
+          gatheredNarrow[Symbol.dispose]();
+        }
+        gathered[Symbol.dispose]();
+      }
+
+      return true;
+    }
+
+    // row reduce + scatter
+    if (true) {
+      if (count > 65536 * 2)
         return false;
 
       this.parallelOps.p2pBarrier();
@@ -228,9 +290,6 @@ export class ParallelTensor extends Tensor {
     // butterfly reduce
     if (true) {
       if (count > 65536 * 2)
-        return false;
-      const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
-      if (!group)
         return false;
 
       let current: Tensor[] = [];
@@ -431,40 +490,6 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(workspace, outputShards, this.shape, this.type, TensorParallelism.Row);
   }
 
-  // outputProj(weight: Tensor, batch: number): Tensor {
-  //   const N = weight.shape[0];
-  //   const minTileN = 256;
-  //   const minBatchPerTile = 1024;
-  //   const maxTiles = Math.floor(N / minTileN);
-  //   const tilesFromBatch = 1 << Math.floor(Math.log2(batch / minBatchPerTile));
-  //   let numTiles = Math.min(maxTiles, tilesFromBatch);
-  //   while (numTiles > 1 && N % numTiles !== 0) numTiles >>= 1;
-  //   if (numTiles === 1) {
-  //     return super.outputProj(weight, batch);
-  //   }
-  //   const tileN = N / numTiles;
-
-  //   const streams: ReturnType<typeof this.workspace.glm.withStream>[] = [];
-  //   for (let i = 0; i < numTiles; i++) {
-  //     const stream = this.workspace.glm.withStream(() => {
-  //       const start = i * tileN;
-  //       const len = i === numTiles - 1 ? N - start : tileN;
-
-  //       using tile = weight.narrow(start, len);
-  //       using oProj = this.outputProj(tile, batch);
-
-  //       // now reduce here (psuedocode)
-  //       oProj.allReduce();
-  //     });
-
-  //     streams.push(stream);
-  //   }
-
-  //   for (const stream of streams) {
-  //     stream.streamWaitEvent();
-  //     stream[Symbol.dispose]();
-  //   }
-  // }
 
   h2d(data: Buffer, size?: number): void {
     const eb = ParallelTensor.elemBytes(this.type);
@@ -932,7 +957,7 @@ export class ParallelTensor extends Tensor {
       using gathered = this.allGather(this.workspace);
       return gathered.fusedAddRmsnorm(input, weight, eps, dim, batch);
     }
-    
+
     if (this.parallelism === TensorParallelism.Replicated && input.parallelism === TensorParallelism.PartialSum) {
       // can be used here?
     }

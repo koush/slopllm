@@ -730,6 +730,63 @@ static Napi::Value Scale(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value MemcpyMulti(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, src, dst0..dst7, N, numel, dtype)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t src_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t dst[8];
+    for (int i = 0; i < 8; i++) {
+        dst[i] = info[2 + i].As<Napi::Number>().Int64Value();
+    }
+    int N = info[10].As<Napi::Number>().Int32Value();
+    int64_t numel = info[11].As<Napi::Number>().Int64Value();
+    int dtype = info[12].As<Napi::Number>().Int32Value();
+    glm_memcpy_multi(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                     reinterpret_cast<const void*>(src_ptr),
+                     reinterpret_cast<void*>(dst[0]), reinterpret_cast<void*>(dst[1]),
+                     reinterpret_cast<void*>(dst[2]), reinterpret_cast<void*>(dst[3]),
+                     reinterpret_cast<void*>(dst[4]), reinterpret_cast<void*>(dst[5]),
+                     reinterpret_cast<void*>(dst[6]), reinterpret_cast<void*>(dst[7]),
+                     N, numel, dtype);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("memcpyMulti failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value SumPointersDirect(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, p0..p7, output, N, numel, dtype)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t p[8];
+    for (int i = 0; i < 8; i++) {
+        p[i] = info[1 + i].As<Napi::Number>().Int64Value();
+    }
+    uintptr_t out_ptr = info[9].As<Napi::Number>().Int64Value();
+    int N = info[10].As<Napi::Number>().Int32Value();
+    int64_t numel = info[11].As<Napi::Number>().Int64Value();
+    int dtype = info[12].As<Napi::Number>().Int32Value();
+    glm_sum_pointers_direct(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                     reinterpret_cast<void*>(p[0]),  reinterpret_cast<void*>(p[1]),
+                     reinterpret_cast<void*>(p[2]),  reinterpret_cast<void*>(p[3]),
+                     reinterpret_cast<void*>(p[4]),  reinterpret_cast<void*>(p[5]),
+                     reinterpret_cast<void*>(p[6]),  reinterpret_cast<void*>(p[7]),
+                     reinterpret_cast<void*>(out_ptr), N, numel, dtype);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("sumPointersDirect failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value SumPointers(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 13) {
@@ -3518,6 +3575,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "topk"), Napi::Function::New(env, Topk));
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));
     exports.Set(Napi::String::New(env, "scale"), Napi::Function::New(env, Scale));
+    exports.Set(Napi::String::New(env, "memcpyMulti"), Napi::Function::New(env, MemcpyMulti));
+    exports.Set(Napi::String::New(env, "sumPointersDirect"), Napi::Function::New(env, SumPointersDirect));
     exports.Set(Napi::String::New(env, "sumPointers"), Napi::Function::New(env, SumPointers));
     exports.Set(Napi::String::New(env, "rmsNormPointers"), Napi::Function::New(env, RmsnormPointersSmem));
     exports.Set(Napi::String::New(env, "add"), Napi::Function::New(env, Add));

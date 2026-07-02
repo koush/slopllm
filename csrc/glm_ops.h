@@ -214,6 +214,23 @@ void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
                            const int* qo_indptr, const int* new_tokens,
                            int batch_size);
 
+// Fan-out copy from one source to N destination pointers (max 8).
+// Pointers passed as kernel args for CUDA graph compatibility.
+// dtype: 9=BF16, 7=F32.
+void glm_memcpy_multi(GlmCtx* ctx,
+    const void* src,
+    void* dst0, void* dst1, void* dst2, void* dst3,
+    void* dst4, void* dst5, void* dst6, void* dst7,
+    int N, int64_t numel, int dtype);
+
+// Direct (no smem) element-wise sum of N tensors (max 8) into a separate output.
+// For local memory only — no smem staging or pipelining.
+// dtype: 9=BF16, 7=F32.
+void glm_sum_pointers_direct(GlmCtx* ctx,
+    void* p0,  void* p1,  void* p2,  void* p3,
+    void* p4,  void* p5,  void* p6,  void* p7,
+    void* output, int N, int64_t numel, int dtype);
+
 // Element-wise sum of N tensors (max 8). Pointers passed as kernel args
 // for CUDA graph compatibility. dtype: 9=BF16, 7=F32.
 void glm_sum_pointers(GlmCtx* ctx,
