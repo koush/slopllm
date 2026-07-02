@@ -2723,13 +2723,13 @@ __global__ void __launch_bounds__(256, 4) sum_pointers_kernel(
 // a compile-time D, hence the template parameter and the host switch.
 // ---------------------------------------------------------------------------
 
-template <typename scalar_t, int ElemsPerWarp, int D_VAL>
+template <typename scalar_t, int ElemsPerWarp, int D_VAL, bool WRITEBACK>
 __global__ void __launch_bounds__(512, 2)
 sum_pointers_smem_kernel(
     const scalar_t* p0,  const scalar_t* p1,  const scalar_t* p2,  const scalar_t* p3,
     const scalar_t* p4,  const scalar_t* p5,  const scalar_t* p6,  const scalar_t* p7,
     scalar_t* __restrict__ output,
-    int N, int64_t numel, int64_t peer_stride_elems, bool writeback)
+    int N, int64_t numel, int64_t peer_stride_elems)
 {
     constexpr int WarpSize = 32;
     auto block = cg::this_thread_block();
@@ -2762,14 +2762,12 @@ sum_pointers_smem_kernel(
         #pragma unroll
         for (int k = 0; k < PAIRS; k++) acc[k] = {0.0f, 0.0f};
 
-        int P = min(D_VAL, N);
         #pragma unroll
         for (int k = 0; k < D_VAL; k++) {
-            if (k < P)
-                cg::memcpy_async(block,
-                    smem_raw + (size_t)k * peer_stride_elems * elem_sz,
-                    peers[k] + (size_t)blk * elem_sz,
-                    copy_bytes);
+            cg::memcpy_async(block,
+                smem_raw + (size_t)k * peer_stride_elems * elem_sz,
+                peers[k] + (size_t)blk * elem_sz,
+                copy_bytes);
         }
 
         int steady = max(0, N - D_VAL);
@@ -2815,7 +2813,7 @@ sum_pointers_smem_kernel(
             }
         }
 
-        if (writeback) {
+        if constexpr (WRITEBACK) {
             for (int j = 0; j < N; j++) {
                 #pragma unroll
                 for (int k = 0; k < PAIRS; k++) {
@@ -2881,40 +2879,38 @@ void glm_sum_pointers(GlmCtx* ctx,
     int block_size = WarpsPerBlock * 32;
     int64_t smem_bytes = (int64_t)D * peer_stride_bytes;
 
-#define DISPATCH_SUM(SCT, DVAL) do { \
+#define DISPATCH_SUM(SCT, DVAL, WB) do { \
     cudaFuncSetAttribute( \
-        (void*)sum_pointers_smem_kernel<SCT, ElemsPerWarp, DVAL>, \
+        (void*)sum_pointers_smem_kernel<SCT, ElemsPerWarp, DVAL, WB>, \
         cudaFuncAttributeMaxDynamicSharedMemorySize, 32768); \
-    sum_pointers_smem_kernel<SCT, ElemsPerWarp, DVAL><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>( \
+    sum_pointers_smem_kernel<SCT, ElemsPerWarp, DVAL, WB><<<grid, block_size, smem_bytes, GLM_STREAM(ctx)>>>( \
         (const SCT*)p0, (const SCT*)p1, (const SCT*)p2, (const SCT*)p3, \
         (const SCT*)p4, (const SCT*)p5, (const SCT*)p6, (const SCT*)p7, \
-        (SCT*)output, N, numel, peer_stride_elems, writeback); \
+        (SCT*)output, N, numel, peer_stride_elems); \
+} while (0)
+
+#define DISPATCH_DTYPE(SCT, WB) do { \
+    switch (D) { \
+        case 8: DISPATCH_SUM(SCT, 8, WB); break; \
+        case 7: DISPATCH_SUM(SCT, 7, WB); break; \
+        case 6: DISPATCH_SUM(SCT, 6, WB); break; \
+        case 5: DISPATCH_SUM(SCT, 5, WB); break; \
+        case 4: DISPATCH_SUM(SCT, 4, WB); break; \
+        case 3: DISPATCH_SUM(SCT, 3, WB); break; \
+        case 2: DISPATCH_SUM(SCT, 2, WB); break; \
+        default: DISPATCH_SUM(SCT, 1, WB); break; \
+    } \
 } while (0)
 
     if (dtype == 9) {
-        switch (D) {
-            case 8: DISPATCH_SUM(__nv_bfloat16, 8); break;
-            case 7: DISPATCH_SUM(__nv_bfloat16, 7); break;
-            case 6: DISPATCH_SUM(__nv_bfloat16, 6); break;
-            case 5: DISPATCH_SUM(__nv_bfloat16, 5); break;
-            case 4: DISPATCH_SUM(__nv_bfloat16, 4); break;
-            case 3: DISPATCH_SUM(__nv_bfloat16, 3); break;
-            case 2: DISPATCH_SUM(__nv_bfloat16, 2); break;
-            default: DISPATCH_SUM(__nv_bfloat16, 1); break;
-        }
+        if (writeback) DISPATCH_DTYPE(__nv_bfloat16, true);
+        else           DISPATCH_DTYPE(__nv_bfloat16, false);
     } else {
-        switch (D) {
-            case 8: DISPATCH_SUM(float, 8); break;
-            case 7: DISPATCH_SUM(float, 7); break;
-            case 6: DISPATCH_SUM(float, 6); break;
-            case 5: DISPATCH_SUM(float, 5); break;
-            case 4: DISPATCH_SUM(float, 4); break;
-            case 3: DISPATCH_SUM(float, 3); break;
-            case 2: DISPATCH_SUM(float, 2); break;
-            default: DISPATCH_SUM(float, 1); break;
-        }
+        if (writeback) DISPATCH_DTYPE(float, true);
+        else           DISPATCH_DTYPE(float, false);
     }
 #undef DISPATCH_SUM
+#undef DISPATCH_DTYPE
 }
 
 // ---------------------------------------------------------------------------
