@@ -243,7 +243,6 @@ export class Glm51Model extends ChatModel {
     const kvLoraRank = cfg.kvLoraRank;
     const qLoraRank = cfg.qLoraRank;
     const qkHeadDim = cfg.qkHeadDim;
-    const colPar = TensorParallelism.Column;
     const inDim = meta.shape[1];
     const offset = st.dataStart + meta.dataOffsets[0];
     const layerPfx = name.replace(/\.(q_b_proj|kv_b_proj|kv_a_proj_with_mqa)\.weight$/, "");
@@ -253,14 +252,14 @@ export class Glm51Model extends ChatModel {
     }
 
     // using column parallelism means there's a gather on the absorbed
-    const nopeParallelism = false && this.contextParallel ? TensorParallelism.Replicated : colPar;
+    const nopeParallelism = TensorParallelism.Column;
 
     if (name.endsWith(".q_b_proj.weight")) {
       const eb = 2;
       const srcPitch = qkHeadDim * inDim * eb;
       const tQNope = this.alloc([nHeads * qkNopeDim, qLoraRank], "BF16", undefined, nopeParallelism);
       const peName = name.replace(".q_b_proj.weight", ".q_pe_proj.weight");
-      const par = this.contextParallel ? TensorParallelism.Replicated : colPar;
+      const par = this.contextParallel ? TensorParallelism.Replicated : TensorParallelism.Column;
       const tPe = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", peName, par);
       await Promise.all([
         tQNope.mmapLoad(mmapPtr, offset, tQNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
@@ -272,7 +271,7 @@ export class Glm51Model extends ChatModel {
       const srcPitch = (qkNopeDim + vHeadDim) * inDim * eb;
       const tKNope = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", undefined, nopeParallelism);
       const vName = name.replace(".kv_b_proj.weight", ".v_proj.weight");
-      const vPar = this.contextParallel ? TensorParallelism.Replicated : colPar;
+      const vPar = this.contextParallel ? TensorParallelism.Replicated : TensorParallelism.Column;
       using tVRaw = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", undefined, vPar);
       await Promise.all([
         tKNope.mmapLoad(mmapPtr, offset, tKNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
