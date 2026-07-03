@@ -145,6 +145,89 @@ bf16_gemv_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-warp BF16 GEMV: 1 block per row, BLOCK_SIZE threads collaborate on K.
+// Inspired by llama.cpp's mul_mat_vec_f. For medium N (1024–8192) where the
+// regular kernel (1 warp/row, 8 rows/block) has too few blocks to fill SMs.
+// With 256 threads/block and N=2048: 2048 blocks → 8 blocks/SM → 64 warps/SM
+// (vs 10.9 warps/SM for the regular kernel). Block-level reduction via shared
+// memory + warp shuffle.
+// ---------------------------------------------------------------------------
+
+template <int BLOCK_SIZE>
+__global__ void
+bf16_gemv_multiwarp_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    int M, int N, int K) {
+
+    if (N == 0 || M == 0 || K == 0) return;
+
+    int row = blockIdx.x;
+    int m = blockIdx.y;
+    int tid = threadIdx.x;
+    int lane = tid % GEMV_WARP_SIZE;
+    int warp_id = tid / GEMV_WARP_SIZE;
+    constexpr int NUM_WARPS = BLOCK_SIZE / GEMV_WARP_SIZE;
+
+    if (row >= N) return;
+
+    const __nv_bfloat16* input_row  = input  + (size_t)m   * K;
+    const __nv_bfloat16* weight_row = weight + (size_t)row * K;
+
+    int K_vec = K / GEMV_K_VEC;
+    int K_tail_start = K_vec * GEMV_K_VEC;
+
+    const uint4* input_v4  = reinterpret_cast<const uint4*>(input_row);
+    const uint4* weight_v4 = reinterpret_cast<const uint4*>(weight_row);
+
+    float sum = 0.0f;
+
+    for (int ki = tid; ki < K_vec; ki += BLOCK_SIZE) {
+        uint4 wv = weight_v4[ki];
+        uint4 xv = input_v4[ki];
+        __nv_bfloat16 wb[8], xb[8];
+        uint4_to_bf16x8(wv, wb);
+        uint4_to_bf16x8(xv, xb);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            sum += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+        }
+    }
+
+    for (int k = K_tail_start + tid; k < K; k += BLOCK_SIZE) {
+        sum += __bfloat162float(weight_row[k]) * __bfloat162float(input_row[k]);
+    }
+
+    // Warp reduce
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+    }
+
+    // Block reduce
+    if constexpr (BLOCK_SIZE > GEMV_WARP_SIZE) {
+        __shared__ float warp_sums[NUM_WARPS];
+        if (lane == 0) warp_sums[warp_id] = sum;
+        __syncthreads();
+        if (warp_id == 0) {
+            sum = (lane < NUM_WARPS) ? warp_sums[lane] : 0.0f;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+            }
+            if (lane == 0) {
+                output[(size_t)m * N + row] = __float2bfloat16(sum);
+            }
+        }
+    } else {
+        if (lane == 0) {
+            output[(size_t)m * N + row] = __float2bfloat16(sum);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Split-K BF16 GEMV: for small-N decode where the regular kernel can't fill
 // the GPU. Each block handles one output row split across K_SPLIT segments.
 // We use 4 warps each owning a contiguous K segment of size ~K/4, sum
@@ -1365,13 +1448,34 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
                     batch, n, k);
             }
         } else {
-            int num_row_groups = (n + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
-            int grid_size = batch * num_row_groups;
-            bf16_gemv_kernel<<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-                reinterpret_cast<__nv_bfloat16*>(out),
-                reinterpret_cast<const __nv_bfloat16*>(input),
-                reinterpret_cast<const __nv_bfloat16*>(weight),
-                batch, n, k);
+            dim3 grid(n, batch);
+            int K_vec = k / GEMV_K_VEC;
+            int mw_block = GEMV_WARP_SIZE;
+            int niter_best = (K_vec + GEMV_WARP_SIZE - 1) / GEMV_WARP_SIZE;
+            for (int bs = 2 * GEMV_WARP_SIZE; bs <= 256; bs += GEMV_WARP_SIZE) {
+                int niter = (K_vec + bs - 1) / bs;
+                if (niter < niter_best) {
+                    niter_best = niter;
+                    mw_block = bs;
+                }
+            }
+            auto* out_bf = reinterpret_cast<__nv_bfloat16*>(out);
+            auto* in_bf = reinterpret_cast<const __nv_bfloat16*>(input);
+            auto* wt_bf = reinterpret_cast<const __nv_bfloat16*>(weight);
+            #define LAUNCH_MW(BS) \
+                bf16_gemv_multiwarp_kernel<BS><<<grid, BS, 0, GLM_STREAM(ctx)>>>(out_bf, in_bf, wt_bf, batch, n, k)
+            switch (mw_block) {
+                case 32:  LAUNCH_MW(32);  break;
+                case 64:  LAUNCH_MW(64);  break;
+                case 96:  LAUNCH_MW(96);  break;
+                case 128: LAUNCH_MW(128); break;
+                case 160: LAUNCH_MW(160); break;
+                case 192: LAUNCH_MW(192); break;
+                case 224: LAUNCH_MW(224); break;
+                case 256: LAUNCH_MW(256); break;
+                default:  LAUNCH_MW(256); break;
+            }
+            #undef LAUNCH_MW
         }
         return;
     }
