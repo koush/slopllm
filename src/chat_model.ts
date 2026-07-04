@@ -109,10 +109,15 @@ export abstract class ChatModel extends WorkspaceBase {
       return { st, mmapPtr, fileSize };
     });
 
+    const loadBatchSize = parseInt(process.env.GLM_LOAD_BATCH_SIZE ?? "8", 10);
     for (const { st, mmapPtr } of openShards) {
-      for (const name of st.tensorNames()) {
-        // console.log('Loading tensor', name);
-        await this.loadTensor(name, st.meta(name), st, mmapPtr);
+      const names = st.tensorNames();
+      for (let i = 0; i < names.length; i += loadBatchSize) {
+        await Promise.all(
+          names.slice(i, i + loadBatchSize).map(name =>
+            this.loadTensor(name, st.meta(name), st, mmapPtr)
+          )
+        );
       }
     }
 

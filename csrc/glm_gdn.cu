@@ -27,12 +27,18 @@ __device__ __forceinline__ float softplus_f(float x) {
     return logf(1.0f + __expf(x));
 }
 
+__device__ __forceinline__ float fast_tanh(float x) {
+    float result;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(result) : "f"(x));
+    return result;
+}
+
 __device__ __forceinline__ float sigmoid_f(float x) {
-    return 1.0f / (1.0f + __expf(-x));
+    return 0.5f * (fast_tanh(0.5f * x) + 1.0f);
 }
 
 __device__ __forceinline__ float silu_f(float x) {
-    return x * sigmoid_f(x);
+    return x * 0.5f * (fast_tanh(0.5f * x) + 1.0f);
 }
 
 __device__ float block_reduce_sum(float val, float* s_partial, int tid, int blockDimX) {

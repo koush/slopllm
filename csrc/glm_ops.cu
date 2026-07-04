@@ -85,8 +85,18 @@ __device__ void block_reduce_max(float* sdata, int tid) {
     }
 }
 
-__device__ float sigmoid_f(float x) {
-    return 1.0f / (1.0f + __expf(-x));
+__device__ __forceinline__ float fast_tanh(float x) {
+    float result;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(result) : "f"(x));
+    return result;
+}
+
+__device__ __forceinline__ float sigmoid_f(float x) {
+    return 0.5f * (fast_tanh(0.5f * x) + 1.0f);
+}
+
+__device__ __forceinline__ float silu_f(float x) {
+    return x * 0.5f * (fast_tanh(0.5f * x) + 1.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -943,11 +953,11 @@ __global__ void __launch_bounds__(256, 4) silu_and_mul_kernel(
     if (idx + 1 < total) {
         float2 gv = load_bf16x2(gate + idx);
         float2 uv = load_bf16x2(up + idx);
-        store_bf16x2(out + idx, gv.x * sigmoid_f(gv.x) * uv.x, gv.y * sigmoid_f(gv.y) * uv.y);
+        store_bf16x2(out + idx, silu_f(gv.x) * uv.x, silu_f(gv.y) * uv.y);
     } else if (idx < total) {
         float g = __bfloat162float(gate[idx]);
         float u = __bfloat162float(up[idx]);
-        out[idx] = __float2bfloat16(g * sigmoid_f(g) * u);
+        out[idx] = __float2bfloat16(silu_f(g) * u);
     }
 }
 
@@ -956,7 +966,7 @@ void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
     cudaSetDevice(ctx->device_id);
     int total = batch * intermediate;
     int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
+    int grid = (total + 2 * block_size - 1) / (2 * block_size);
     silu_and_mul_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)gate,
         (const __nv_bfloat16*)up, total);
@@ -1056,7 +1066,7 @@ __global__ void __launch_bounds__(256, 4) ew_unary_kernel(__nv_bfloat16* out, co
 // b:   row stride = b_stride (b_stride == dim for contiguous, 0 for broadcast)
 // ---------------------------------------------------------------------------
 
-template<auto F>
+template<typename F>
 __global__ void __launch_bounds__(256, 4) ew_binary_2d_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ a,
@@ -1068,13 +1078,13 @@ __global__ void __launch_bounds__(256, 4) ew_binary_2d_kernel(
     if (idx + 1 < total) {
         int r = idx / dim;
         int c = idx % dim;
-        float2 av = load_bf16x2(a + r * a_stride + c);
-        float2 bv = load_bf16x2(b + r * b_stride + c);
-        store_bf16x2(out + idx, F(av.x, bv.x), F(av.y, bv.y));
+        __nv_bfloat162 av = *reinterpret_cast<const __nv_bfloat162*>(a + r * a_stride + c);
+        __nv_bfloat162 bv = *reinterpret_cast<const __nv_bfloat162*>(b + r * b_stride + c);
+        *reinterpret_cast<__nv_bfloat162*>(out + idx) = F{}(av, bv);
     } else if (idx < total) {
         int r = idx / dim;
         int c = idx % dim;
-        out[idx] = __float2bfloat16(F(__bfloat162float(a[r * a_stride + c]), __bfloat162float(b[r * b_stride + c])));
+        out[idx] = F{}(a[r * a_stride + c], b[r * b_stride + c]);
     }
 }
 
@@ -1086,8 +1096,7 @@ __global__ void __launch_bounds__(256, 4) ew_binary_2d_kernel(
 // ---------------------------------------------------------------------------
 
 static __device__ __forceinline__ float sigmoid_mul_f(float val, float gate) {
-    float sig = 1.0f / (1.0f + __expf(-gate));
-    return val * sig;
+    return val * 0.5f * (fast_tanh(0.5f * gate) + 1.0f);
 }
 
 template<auto F>
@@ -2108,12 +2117,15 @@ void glm_scale(GlmCtx* ctx, void* out, const void* input, float scale, int n) {
 // Add: out = a + b
 // ---------------------------------------------------------------------------
 
-static __device__ __forceinline__ float add_f(float a, float b) { return a + b; }
+struct add_f {
+    __device__ __forceinline__ __nv_bfloat162 operator()(__nv_bfloat162 a, __nv_bfloat162 b) const { return __hadd2(a, b); }
+    __device__ __forceinline__ __nv_bfloat16 operator()(__nv_bfloat16 a, __nv_bfloat16 b) const { return __hadd(a, b); }
+};
 
 void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
-    int grid = (n + block_size - 1) / block_size;
+    int grid = (n + 2 * block_size - 1) / (2 * block_size);
     ew_binary_2d_kernel<add_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b,
         n, 1, n, n);
@@ -2123,7 +2135,7 @@ void glm_add_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int
     cudaSetDevice(ctx->device_id);
     int total = rows * dim;
     int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
+    int grid = (total + 2 * block_size - 1) / (2 * block_size);
     ew_binary_2d_kernel<add_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b,
         dim, rows, dim, 0);
@@ -2376,12 +2388,15 @@ void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
 // Mul: out = a * b
 // ---------------------------------------------------------------------------
 
-static __device__ __forceinline__ float mul_f(float a, float b) { return a * b; }
+struct mul_f {
+    __device__ __forceinline__ __nv_bfloat162 operator()(__nv_bfloat162 a, __nv_bfloat162 b) const { return __hmul2(a, b); }
+    __device__ __forceinline__ __nv_bfloat16 operator()(__nv_bfloat16 a, __nv_bfloat16 b) const { return __hmul(a, b); }
+};
 
 void glm_mul(GlmCtx* ctx, void* out, const void* a, const void* b, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
-    int grid = (n + block_size - 1) / block_size;
+    int grid = (n + 2 * block_size - 1) / (2 * block_size);
     ew_binary_2d_kernel<mul_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b,
         n, 1, n, n);
@@ -2391,7 +2406,7 @@ void glm_mul_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int
     cudaSetDevice(ctx->device_id);
     int total = rows * dim;
     int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
+    int grid = (total + 2 * block_size - 1) / (2 * block_size);
     ew_binary_2d_kernel<mul_f><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b,
         dim, rows, dim, 0);

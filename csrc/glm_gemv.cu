@@ -1421,13 +1421,13 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
     cudaSetDevice(ctx->device_id);
 
     if (batch < 4) {
-        // Split-K variant when N is small enough that the row-major kernel
-        // would launch too few blocks to fill the GPU. Threshold tuned for
-        // RTX PRO 6000 / sm_120 (~140 SMs). Each row-major block has
-        // ROWS_PER_BLOCK=8 rows, so block count = ceil(N/8). To hit ~140
-        // blocks we need N >= ~1100. Below that, use split-K (one block per
-        // row, multiple warps splitting K).
-        constexpr int SPLITK_THRESHOLD = 1024;
+        // Split-K variant when N is small enough that fewer blocks would
+        // underutilize the GPU. With 512 threads/block, split-K provides
+        // more memory-level parallelism per SM when block count is low.
+        // Threshold tuned for RTX PRO 6000 / sm_120 (~140 SMs): below 512
+        // blocks, the extra warps help hide memory latency; at 512+ blocks
+        // the multiwarp kernel's lighter reduction wins.
+        constexpr int SPLITK_THRESHOLD = 512;
         constexpr int SPLITK_FULL_THREADS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
         if (n < SPLITK_THRESHOLD) {
             int grid_size = batch * n;
