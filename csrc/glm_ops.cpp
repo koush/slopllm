@@ -430,6 +430,31 @@ static Napi::Value ScatterScalar(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value Deinterleave(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (ctx, out, in, shard_offsets, world_size, total_len, D)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t offsets_ptr = info[3].As<Napi::Number>().Int64Value();
+    int world_size = info[4].As<Napi::Number>().Int32Value();
+    int total_len = info[5].As<Napi::Number>().Int32Value();
+    int D = info[6].As<Napi::Number>().Int32Value();
+    glm_deinterleave(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                     reinterpret_cast<void*>(out_ptr),
+                     reinterpret_cast<const void*>(in_ptr),
+                     reinterpret_cast<const int32_t*>(offsets_ptr),
+                     world_size, total_len, D);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("deinterleave failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value CatLastDim(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 7) {
@@ -3564,6 +3589,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "fill"), Napi::Function::New(env, Fill));
     exports.Set(Napi::String::New(env, "gather"), Napi::Function::New(env, Gather));
     exports.Set(Napi::String::New(env, "scatterScalar"), Napi::Function::New(env, ScatterScalar));
+    exports.Set(Napi::String::New(env, "deinterleave"), Napi::Function::New(env, Deinterleave));
     exports.Set(Napi::String::New(env, "catLastDim"), Napi::Function::New(env, CatLastDim));
     exports.Set(Napi::String::New(env, "maskedFill"), Napi::Function::New(env, MaskedFill));
     exports.Set(Napi::String::New(env, "indexAdd"), Napi::Function::New(env, IndexAdd));

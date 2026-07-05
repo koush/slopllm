@@ -211,6 +211,12 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
+        self.lib.glm_deinterleave.restype = None
+        self.lib.glm_deinterleave.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int
+        ]
+
         self.lib.glm_cat_last_dim.restype = None
         self.lib.glm_cat_last_dim.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -1032,6 +1038,15 @@ class GlmOps:
             self._ptr(indices),
             ctypes.c_float(value),
             k, out_dim, batch
+        )
+
+    def deinterleave(self, output, input, shard_offsets, world_size, total_len, D):
+        self.lib.glm_deinterleave(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input),
+            self._ptr(shard_offsets),
+            world_size, total_len, D
         )
 
     def cat_last_dim(self, output, a, b, a_last_dim, b_last_dim, outer):

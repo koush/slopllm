@@ -15,10 +15,12 @@ export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 
 export class ExecutionState {
   input?: Tensor;
+  readonly absorbed: boolean;
 
   constructor(
     public readonly batchSize: number, public readonly totalTokens: number, public readonly seqLens: number[],
     public readonly isDecode: boolean, public readonly ws: ExecutionWorkspace, public readonly cache: ChatCache,
+    absorbed: boolean = true,
     public readonly customMask?: {
       indptr: Tensor;
       mask: Tensor;
@@ -27,6 +29,7 @@ export class ExecutionState {
       maskKvLen?: Tensor;
     },
   ) {
+    this.absorbed = absorbed;
   }
 
   get lastIdx(): Tensor {
@@ -566,7 +569,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
 
-    return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, customMask);
+    return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, totalTokens <= 1024, customMask);
   }
 
   forwardPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): Tensor {

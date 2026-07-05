@@ -413,6 +413,8 @@ export class ParallelTensor extends Tensor {
     if (!this.parallelOps.p2pEnabled)
       return false;
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
+    if (count > 65536 * 2)
+      return false;
     const elemBytes = ParallelTensor.elemBytes(this.type);
     const shardBytes = count * elemBytes;
     const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
@@ -2049,7 +2051,8 @@ export class ParallelOps implements DeviceOps {
     mergedLse: Tensor | null,
     workspace: WorkspaceBase,
   ): ParallelTensor {
-    if (this.p2pEnabled) {
+    const count = partialVOuts.shards[0].shape.reduce((a, b) => a * b, 1);
+    if (this.p2pEnabled && count <= 65536 * 2) {
       return this.cpMergeTreeReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace);
     }
     return this.ncclMergeTreeReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace);

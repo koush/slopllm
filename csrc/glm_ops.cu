@@ -1386,6 +1386,78 @@ void glm_scatter_scalar(GlmCtx* ctx, void* out, const int* indices, float value,
 }
 
 // ---------------------------------------------------------------------------
+// Deinterleave kernel: rearranges all-gathered interleaved KV shards into
+// sequential token order.
+//
+// After NCCL all-gather of interleaved compact KV, the buffer layout is:
+//   [shard0: tok 0, ws, 2*ws, ...] [shard1: tok 1, 1+ws, ...] ... [shard_{ws-1}: ...]
+//
+// For output token i:
+//   rank = i % ws
+//   local_idx = i / ws
+//   src_row = shard_offsets[rank] + local_idx
+//
+// Each block processes BLOCK_ROWS output rows. Threads cooperatively copy D
+// elements per row using vectorized loads. When D is a multiple of 8, int4
+// (16-byte) loads are used; otherwise falls back to scalar bf16 copies to
+// avoid misalignment (row stride = D * 2 bytes must be 16-byte aligned for
+// int4).
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256) deinterleave_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ in,
+    const int32_t* __restrict__ shard_offsets,
+    int world_size,
+    int total_len,
+    int D
+) {
+    constexpr int BLOCK_ROWS = 4;
+    const int row_start = blockIdx.x * BLOCK_ROWS;
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    #pragma unroll
+    for (int r = 0; r < BLOCK_ROWS; r++) {
+        const int out_row = row_start + r;
+        if (out_row >= total_len) break;
+
+        const int rank = out_row % world_size;
+        const int local_idx = out_row / world_size;
+        const int32_t shard_off = shard_offsets[rank];
+        const int src_row = shard_off + local_idx;
+
+        const __nv_bfloat16* src = in + (size_t)src_row * D;
+        __nv_bfloat16* dst = out + (size_t)out_row * D;
+
+        if (D % 8 == 0) {
+            constexpr int VEC = 8;
+            const int vec_count = D / VEC;
+            for (int j = tid; j < vec_count; j += block_size) {
+                *reinterpret_cast<int4*>(dst + j * VEC) =
+                    *reinterpret_cast<const int4*>(src + j * VEC);
+            }
+        } else {
+            for (int j = tid; j < D; j += block_size) {
+                dst[j] = src[j];
+            }
+        }
+    }
+}
+
+void glm_deinterleave(GlmCtx* ctx, void* out, const void* in,
+                      const int32_t* shard_offsets, int world_size,
+                      int total_len, int D) {
+    cudaSetDevice(ctx->device_id);
+    constexpr int BLOCK_ROWS = 4;
+    constexpr int BLOCK_SIZE = 256;
+    int grid = (total_len + BLOCK_ROWS - 1) / BLOCK_ROWS;
+    deinterleave_kernel<<<grid, BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
+        shard_offsets, world_size, total_len, D);
+}
+
+// ---------------------------------------------------------------------------
 // Cat last dim kernel
 // out[i, :a_dim] = a[i, :], out[i, a_dim:] = b[i, :]
 // ---------------------------------------------------------------------------

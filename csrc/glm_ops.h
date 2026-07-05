@@ -87,6 +87,10 @@ void glm_gather(GlmCtx* ctx, void* out, const void* input, const int* indices,
 void glm_scatter_scalar(GlmCtx* ctx, void* out, const int* indices, float value,
                         int k, int out_dim, int batch);
 
+void glm_deinterleave(GlmCtx* ctx, void* out, const void* in,
+                      const int32_t* shard_offsets, int world_size,
+                      int total_len, int D);
+
 void glm_cat_last_dim(GlmCtx* ctx, void* out, const void* a, const void* b,
                       int a_last_dim, int b_last_dim, int outer);
 
