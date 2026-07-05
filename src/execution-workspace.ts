@@ -161,6 +161,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
   lastPageLenH: Tensor;
   /** Pinned host buffer [B] of I32: KV lengths per batch entry, used by MLA prefill plan. */
   kvLenH: Tensor;
+  /** GPU buffer [B] of I32: device copy of kvLenH, global KV lengths per sequence (post-gather). */
+  kvLenD: Tensor;
+  /** Pinned host buffer [B+1] of I32: token-level KV indptr (cumulative allocLen per sequence). Fixed up by ParallelOps for CP. */
+  kvTokenIndptrH: Tensor;
+  /** GPU buffer [B+1] of I32: device copy of kvTokenIndptrH. */
+  kvTokenIndptrD: Tensor;
   /** GPU buffer [B*S] of I32: batch index per token for MLA KV cache append. */
   mlaBatchIndices: Tensor;
   /** Pinned host buffer [B*S] of I32: batch index per token for MLA KV cache append. */
@@ -192,6 +198,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.lastPageLen = this.alloc([B * I32], "I32", "lastPageLen");
     this.lastPageLenH = this.allocPinned([B], "I32", "lastPageLenH");
     this.kvLenH = this.allocPinned([B], "I32", "kvLenH");
+    this.kvLenD = this.alloc([B], "I32", "kvLenD");
+    this.kvTokenIndptrH = this.allocPinned([(B + 1) * I32], "I32", "kvTokenIndptrH");
+    this.kvTokenIndptrD = this.alloc([(B + 1) * I32], "I32", "kvTokenIndptrD");
     this.mlaBatchIndices = this.alloc([B * S], "I32", "mlaBatchIndices");
     this.mlaBatchIndicesH = this.allocPinned([B * S], "I32", "mlaBatchIndicesH");
     this.lastDecodePagedKV = null;
@@ -271,6 +280,20 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.floatWs, this.intWs,
       this.decodePlanInfo,
       batchSize, nHeads, nKv, hd, pagedKV.pageSize, smScale
+    );
+    return out;
+  }
+
+  batchPrefillRagged(q: Tensor, k: Tensor, v: Tensor, totalQoRows: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: MaskMode, smScale: number): Tensor {
+    const out = this.alloc([1, nHeads, totalQoRows, hd], q.type, undefined, q.parallelism);
+    this.glm.batchPrefillRaggedRun(
+      q, k, v, out,
+      this.floatWs, this.intWs,
+      this.qoIndptrD, this.kvTokenIndptrD,
+      this.prefillPlanInfo,
+      totalQoRows, batchSize, nHeads, nKv, hd,
+      qStrideN, qStrideH, kvStrideN, kvStrideH, vStrideN, vStrideH,
+      maskMode, smScale
     );
     return out;
   }
@@ -513,6 +536,15 @@ export class ExecutionWorkspace extends WorkspaceBase {
       }
     });
 
+    this.kvTokenIndptrH.withPinnedBuffer(buf => {
+      buf.writeInt32LE(0, 0);
+      let cumulative = 0;
+      for (let i = 0; i < batchSize; i++) {
+        cumulative += pagedKV.sequences[i].allocLen;
+        buf.writeInt32LE(cumulative, (i + 1) * I32);
+      }
+    });
+
     if (cfg.kvLoraRank) {
       this.glm.mlaPrefillPlan(
         this.floatWs, BATCH_FLOAT_WS_SIZE,
@@ -568,6 +600,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     pagedKV.indices.memcpy(pagedKV.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
     this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
+
+    this.kvLenD.memcpy(this.kvLenH, batchSize * I32, MemcpyKind.HostToDevice);
+    this.kvTokenIndptrD.memcpy(this.kvTokenIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
 
     return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, totalTokens <= 1024, customMask);
   }

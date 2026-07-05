@@ -64,6 +64,17 @@ cudaError_t dispatch_batch_prefill_paged_run_inner(
       params, tmp_v, tmp_s, enable_pdl, stream);
 }
 
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, flashinfer::MaskMode MASK_MODE>
+cudaError_t dispatch_batch_prefill_ragged_run_inner(
+    flashinfer::BatchPrefillRaggedParams<DType, DType, DTypeO, IdType>& params,
+    DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream) {
+  return flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
+      CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENC, false, MASK_MODE,
+      AttentionVariant,
+      flashinfer::BatchPrefillRaggedParams<DType, DType, DTypeO, IdType>>(
+      params, tmp_v, tmp_s, enable_pdl, stream);
+}
+
 template <uint32_t HEAD_DIM>
 void glm_batch_decode_plan_impl(
     GlmCtx* ctx,
@@ -123,75 +134,6 @@ void glm_batch_decode_plan_impl(
 } // anonymous namespace
 
 extern "C" {
-
-void glm_flash_prefill(
-    GlmCtx* ctx,
-    void* q, void* k, void* v, void* o, void* tmp,
-    int qo_len, int kv_len,
-    int num_qo_heads, int num_kv_heads, int head_dim,
-    int q_stride_n, int q_stride_h,
-    int kv_stride_n, int kv_stride_h,
-    int v_stride_n, int v_stride_h,
-    int mask_mode, int kv_layout, float sm_scale) {
-
-  cudaSetDevice(ctx->device_id);
-
-  using Params = flashinfer::SinglePrefillParams<DType, DType, DTypeO>;
-
-  Params params;
-  params.q = static_cast<DType*>(q);
-  params.k = static_cast<DType*>(k);
-  params.v = static_cast<DType*>(v);
-  params.o = static_cast<DTypeO*>(o);
-  params.lse = nullptr;
-  params.maybe_custom_mask = nullptr;
-  params.maybe_alibi_slopes = nullptr;
-  params.num_qo_heads = num_qo_heads;
-  params.num_kv_heads = num_kv_heads;
-  params.qo_len = qo_len;
-  params.kv_len = kv_len;
-  params.q_stride_n = q_stride_n;
-  params.q_stride_h = q_stride_h;
-  params.k_stride_n = kv_stride_n;
-  params.k_stride_h = kv_stride_h;
-  params.v_stride_n = v_stride_n;
-  params.v_stride_h = v_stride_h;
-  params.head_dim = head_dim;
-  params.window_left = -1;
-  params.logits_soft_cap = 0.0f;
-  params.sm_scale = sm_scale;
-  params.rope_rcp_scale = 1.0f;
-  params.rope_rcp_theta = 1.0f;
-  params.partition_kv = false;
-  params.group_size = flashinfer::uint_fastdiv(num_qo_heads / num_kv_heads);
-
-  flashinfer::MaskMode flash_mask = static_cast<flashinfer::MaskMode>(mask_mode);
-
-  cudaError_t status;
-  DISPATCH_HEAD_DIM(head_dim, {
-    if (flash_mask == flashinfer::MaskMode::kCausal) {
-      status = flashinfer::SinglePrefillWithKVCacheDispatched<
-          HEAD_DIM, HEAD_DIM,
-          flashinfer::PosEncodingMode::kNone,
-          false,
-          flashinfer::MaskMode::kCausal,
-          AttentionVariant, Params>(
-          params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
-    } else {
-      status = flashinfer::SinglePrefillWithKVCacheDispatched<
-          HEAD_DIM, HEAD_DIM,
-          flashinfer::PosEncodingMode::kNone,
-          false,
-          flashinfer::MaskMode::kNone,
-          AttentionVariant, Params>(
-          params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
-    }
-  });
-
-  if (status != cudaSuccess) {
-    fprintf(stderr, "glm_flash_prefill failed: %s\n", cudaGetErrorString(status));
-  }
-}
 
 void glm_flash_decode(
     GlmCtx* ctx,
@@ -485,6 +427,154 @@ void glm_batch_prefill_paged_run(
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_batch_prefill_paged_run failed: %s\n", cudaGetErrorString(status));
+  }
+}
+
+void glm_batch_prefill_ragged_plan(
+    GlmCtx* ctx,
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
+    int64_t* plan_info,
+    int32_t* qo_indptr_h, int32_t* kv_indptr_h,
+    uint32_t total_qo_rows, uint32_t batch_size,
+    uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t head_dim, int mask_mode) {
+
+  cudaSetDevice(ctx->device_id);
+
+  flashinfer::PrefillPlanInfo info;
+
+  cudaError_t status = flashinfer::PrefillPlan<IdType>(
+      float_ws, float_ws_size,
+      int_ws, pinned_int_ws, int_ws_size,
+      info,
+      qo_indptr_h,
+      kv_indptr_h,
+      total_qo_rows,
+      batch_size,
+      num_qo_heads,
+      num_kv_heads,
+      head_dim, // head_dim_qk
+      head_dim, // head_dim_vo
+      1, // page_size=1 for ragged (kv_indptr is token-level)
+      false, // enable_cuda_graph
+      2, // sizeof_dtype_o (bf16 = 2 bytes)
+      -1, // window_left
+      -1, // fixed_split_size
+      false, // disable_split_kv
+      0, // num_colocated_ctas
+      GLM_STREAM(ctx));
+
+  if (status != cudaSuccess) {
+    fprintf(stderr, "glm_batch_prefill_ragged_plan failed: %s\n", cudaGetErrorString(status));
+    return;
+  }
+
+  auto vec = info.ToVector();
+  memcpy(plan_info, vec.data(), sizeof(int64_t) * vec.size());
+}
+
+void glm_batch_prefill_ragged_run(
+    GlmCtx* ctx,
+    void* q, void* k, void* v, void* o,
+    void* float_ws, void* int_ws,
+    int32_t* q_indptr_d, int32_t* kv_indptr_d,
+    int64_t* plan_info,
+    uint32_t total_qo_rows, uint32_t batch_size,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+    int32_t q_stride_n, int32_t q_stride_h,
+    int32_t kv_stride_n, int32_t kv_stride_h,
+    int32_t v_stride_n, int32_t v_stride_h,
+    int mask_mode, float sm_scale) {
+
+  cudaSetDevice(ctx->device_id);
+
+  using RaggedParams = flashinfer::BatchPrefillRaggedParams<DType, DType, DTypeO, IdType>;
+
+  flashinfer::PrefillPlanInfo info;
+  info.FromVector(std::vector<int64_t>(plan_info, plan_info + 15));
+  flashinfer::MaskMode flash_mask = static_cast<flashinfer::MaskMode>(mask_mode);
+
+  RaggedParams params(
+      static_cast<DType*>(q),
+      static_cast<DType*>(k),
+      static_cast<DType*>(v),
+      nullptr, // maybe_custom_mask
+      q_indptr_d,
+      kv_indptr_d,
+      nullptr, // maybe_mask_indptr
+      nullptr, // maybe_q_rope_offset
+      nullptr, // maybe_k_rope_offset
+      static_cast<DTypeO*>(o),
+      nullptr, // lse
+      nullptr, // maybe_alibi_slopes
+      num_qo_heads, num_kv_heads,
+      q_stride_n, q_stride_h,
+      kv_stride_n, kv_stride_h,
+      -1, // window_left
+      0.0f, // logits_soft_cap
+      sm_scale,
+      1.0f, // rope_scale
+      1.0f // rope_theta
+  );
+
+  params.request_indices = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.request_indices_offset);
+  params.qo_tile_indices = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.qo_tile_indices_offset);
+  params.kv_tile_indices = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.kv_tile_indices_offset);
+  params.merge_indptr = info.split_kv
+      ? reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.merge_indptr_offset)
+      : nullptr;
+  params.o_indptr = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.o_indptr_offset);
+  params.kv_chunk_size_ptr = reinterpret_cast<IdType*>(static_cast<char*>(int_ws) + info.kv_chunk_size_ptr_offset);
+  params.block_valid_mask = info.split_kv
+      ? reinterpret_cast<bool*>(static_cast<char*>(int_ws) + info.block_valid_mask_offset)
+      : nullptr;
+  params.max_total_num_rows = total_qo_rows;
+  if (info.enable_cuda_graph) {
+    params.total_num_rows = reinterpret_cast<uint32_t*>(static_cast<char*>(int_ws) + info.total_num_rows_offset);
+  } else {
+    params.total_num_rows = nullptr;
+  }
+  params.padded_batch_size = info.padded_batch_size;
+  params.partition_kv = info.split_kv;
+  params.maybe_prefix_len_ptr = nullptr;
+  params.maybe_token_pos_in_items_ptr = nullptr;
+  params.token_pos_in_items_len = 0;
+  params.maybe_max_item_len_ptr = nullptr;
+
+  DTypeO* tmp_v = info.split_kv
+      ? reinterpret_cast<DTypeO*>(static_cast<char*>(float_ws) + info.v_offset)
+      : nullptr;
+  float* tmp_s = info.split_kv
+      ? reinterpret_cast<float*>(static_cast<char*>(float_ws) + info.s_offset)
+      : nullptr;
+
+  uint32_t cta_tile_q = static_cast<uint32_t>(info.cta_tile_q);
+
+  cudaError_t status = cudaSuccess;
+
+  DISPATCH_HEAD_DIM(head_dim, {
+    if (flash_mask == flashinfer::MaskMode::kCausal) {
+      switch (cta_tile_q) {
+        case 128: status = dispatch_batch_prefill_ragged_run_inner<128, HEAD_DIM, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 64: status = dispatch_batch_prefill_ragged_run_inner<64, HEAD_DIM, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 16: status = dispatch_batch_prefill_ragged_run_inner<16, HEAD_DIM, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 1: status = dispatch_batch_prefill_ragged_run_inner<1, HEAD_DIM, flashinfer::MaskMode::kCausal>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
+      }
+    } else {
+      switch (cta_tile_q) {
+        case 128: status = dispatch_batch_prefill_ragged_run_inner<128, HEAD_DIM, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 64: status = dispatch_batch_prefill_ragged_run_inner<64, HEAD_DIM, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 16: status = dispatch_batch_prefill_ragged_run_inner<16, HEAD_DIM, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        case 1: status = dispatch_batch_prefill_ragged_run_inner<1, HEAD_DIM, flashinfer::MaskMode::kNone>(params, tmp_v, tmp_s, false, GLM_STREAM(ctx)); break;
+        default: fprintf(stderr, "Unsupported cta_tile_q: %u\n", cta_tile_q); status = cudaErrorInvalidValue;
+      }
+    }
+  });
+
+  if (status != cudaSuccess) {
+    fprintf(stderr, "glm_batch_prefill_ragged_run failed: %s\n", cudaGetErrorString(status));
   }
 }
 

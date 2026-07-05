@@ -213,8 +213,16 @@ class GlmOps:
 
         self.lib.glm_deinterleave.restype = None
         self.lib.glm_deinterleave.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int
+        ]
+
+        self.lib.glm_gather_pages.restype = None
+        self.lib.glm_gather_pages.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
         self.lib.glm_cat_last_dim.restype = None
@@ -385,18 +393,6 @@ class GlmOps:
         self.lib.glm_mmap_load.restype = None
         self.lib.glm_mmap_load.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
 
-        self.lib.glm_flash_prefill.restype = None
-        self.lib.glm_flash_prefill.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_float,
-        ]
-
         self.lib.glm_flash_decode.restype = None
         self.lib.glm_flash_decode.argtypes = [
             ctypes.c_void_p,
@@ -466,6 +462,33 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32,
+            ctypes.c_int32, ctypes.c_int32,
+            ctypes.c_int32, ctypes.c_float,
+        ]
+
+        self.lib.glm_batch_prefill_ragged_plan.restype = None
+        self.lib.glm_batch_prefill_ragged_plan.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_int32,
+        ]
+
+        self.lib.glm_batch_prefill_ragged_run.restype = None
+        self.lib.glm_batch_prefill_ragged_run.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_int32, ctypes.c_int32,
+            ctypes.c_int32, ctypes.c_int32,
             ctypes.c_int32, ctypes.c_int32,
             ctypes.c_int32, ctypes.c_float,
         ]
@@ -1040,13 +1063,24 @@ class GlmOps:
             k, out_dim, batch
         )
 
-    def deinterleave(self, output, input, shard_offsets, world_size, total_len, D):
+    def deinterleave(self, output, input, world_size, total_len, global_len, kv_token_indptr, batch_size, D):
         self.lib.glm_deinterleave(
             self.ctx,
             self._ptr(output),
             self._ptr(input),
-            self._ptr(shard_offsets),
-            world_size, total_len, D
+            world_size, total_len, global_len,
+            self._ptr(kv_token_indptr), batch_size, D
+        )
+
+    def gather_pages(self, output, input, page_indices, page_indptr, last_page_len, num_pages, batch_size, page_size, D):
+        self.lib.glm_gather_pages(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input),
+            self._ptr(page_indices),
+            self._ptr(page_indptr),
+            self._ptr(last_page_len),
+            num_pages, batch_size, page_size, D
         )
 
     def cat_last_dim(self, output, a, b, a_last_dim, b_last_dim, outer):
@@ -1255,24 +1289,6 @@ class GlmOps:
             self._ptr(qo_indptr),
             self._ptr(new_tokens),
             batch_size
-        )
-
-    def flash_prefill(self, q, k, v, o, tmp,
-                      qo_len, kv_len,
-                      num_qo_heads, num_kv_heads, head_dim,
-                      q_stride_n, q_stride_h,
-                      kv_stride_n, kv_stride_h,
-                      v_stride_n, v_stride_h,
-                      mask_mode, kv_layout, sm_scale):
-        self.lib.glm_flash_prefill(
-            self.ctx,
-            self._ptr(q), self._ptr(k), self._ptr(v), self._ptr(o), self._ptr(tmp),
-            qo_len, kv_len,
-            num_qo_heads, num_kv_heads, head_dim,
-            q_stride_n, q_stride_h,
-            kv_stride_n, kv_stride_h,
-            v_stride_n, v_stride_h,
-            mask_mode, kv_layout, ctypes.c_float(sm_scale)
         )
 
     def flash_decode(self, q, k, v, o, tmp,

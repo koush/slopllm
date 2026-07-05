@@ -432,25 +432,58 @@ static Napi::Value ScatterScalar(const Napi::CallbackInfo& info) {
 
 static Napi::Value Deinterleave(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 7) {
-        Napi::TypeError::New(env, "Expected (ctx, out, in, shard_offsets, world_size, total_len, D)").ThrowAsJavaScriptException();
+    if (info.Length() < 9) {
+        Napi::TypeError::New(env, "Expected (ctx, out, in, world_size, total_len, global_len, kv_token_indptr, batch_size, D)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
     uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t offsets_ptr = info[3].As<Napi::Number>().Int64Value();
-    int world_size = info[4].As<Napi::Number>().Int32Value();
-    int total_len = info[5].As<Napi::Number>().Int32Value();
-    int D = info[6].As<Napi::Number>().Int32Value();
+    int world_size = info[3].As<Napi::Number>().Int32Value();
+    int total_len = info[4].As<Napi::Number>().Int32Value();
+    int global_len = info[5].As<Napi::Number>().Int32Value();
+    uintptr_t kv_token_indptr_ptr = info[6].As<Napi::Number>().Int64Value();
+    int batch_size = info[7].As<Napi::Number>().Int32Value();
+    int D = info[8].As<Napi::Number>().Int32Value();
     glm_deinterleave(reinterpret_cast<GlmCtx*>(ctx_ptr),
                      reinterpret_cast<void*>(out_ptr),
                      reinterpret_cast<const void*>(in_ptr),
-                     reinterpret_cast<const int32_t*>(offsets_ptr),
-                     world_size, total_len, D);
+                     world_size, total_len, global_len,
+                     reinterpret_cast<const int32_t*>(kv_token_indptr_ptr),
+                     batch_size, D);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("deinterleave failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value GatherPages(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 10) {
+        Napi::TypeError::New(env, "Expected (ctx, out, in, page_indices, page_indptr, last_page_len, num_pages, batch_size, page_size, D)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t indices_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t page_indptr_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t last_page_len_ptr = info[5].As<Napi::Number>().Int64Value();
+    int num_pages = info[6].As<Napi::Number>().Int32Value();
+    int batch_size = info[7].As<Napi::Number>().Int32Value();
+    int page_size = info[8].As<Napi::Number>().Int32Value();
+    int D = info[9].As<Napi::Number>().Int32Value();
+    glm_gather_pages(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                     reinterpret_cast<void*>(out_ptr),
+                     reinterpret_cast<const void*>(in_ptr),
+                     reinterpret_cast<const int32_t*>(indices_ptr),
+                     reinterpret_cast<const int32_t*>(page_indptr_ptr),
+                     reinterpret_cast<const int32_t*>(last_page_len_ptr),
+                     num_pages, batch_size, page_size, D);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("gatherPages failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }
     return env.Undefined();
 }
@@ -1976,51 +2009,6 @@ static Napi::Value ExpandDim1Strided(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value FlashPrefill(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 20) {
-        Napi::TypeError::New(env, "Expected (ctx, q, k, v, o, tmp, qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, v_stride_n, v_stride_h, mask_mode, kv_layout, sm_scale)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t k_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t v_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t o_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t tmp_ptr = info[5].As<Napi::Number>().Int64Value();
-    int qo_len = info[6].As<Napi::Number>().Int32Value();
-    int kv_len = info[7].As<Napi::Number>().Int32Value();
-    int num_qo_heads = info[8].As<Napi::Number>().Int32Value();
-    int num_kv_heads = info[9].As<Napi::Number>().Int32Value();
-    int head_dim = info[10].As<Napi::Number>().Int32Value();
-    int q_stride_n = info[11].As<Napi::Number>().Int32Value();
-    int q_stride_h = info[12].As<Napi::Number>().Int32Value();
-    int kv_stride_n = info[13].As<Napi::Number>().Int32Value();
-    int kv_stride_h = info[14].As<Napi::Number>().Int32Value();
-    int v_stride_n = info[15].As<Napi::Number>().Int32Value();
-    int v_stride_h = info[16].As<Napi::Number>().Int32Value();
-    int mask_mode = info[17].As<Napi::Number>().Int32Value();
-    int kv_layout = info[18].As<Napi::Number>().Int32Value();
-    float sm_scale = info[19].As<Napi::Number>().FloatValue();
-    glm_flash_prefill(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                      reinterpret_cast<void*>(q_ptr),
-                      reinterpret_cast<void*>(k_ptr),
-                      reinterpret_cast<void*>(v_ptr),
-                      reinterpret_cast<void*>(o_ptr),
-                      reinterpret_cast<void*>(tmp_ptr),
-                      qo_len, kv_len,
-                      num_qo_heads, num_kv_heads, head_dim,
-                      q_stride_n, q_stride_h,
-                      kv_stride_n, kv_stride_h,
-                      v_stride_n, v_stride_h,
-                      mask_mode, kv_layout, sm_scale);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        Napi::Error::New(env, std::string("flashPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
-    }
-    return env.Undefined();
-}
-
 static Napi::Value FlashDecode(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 15) {
@@ -2445,6 +2433,97 @@ static Napi::Value BatchPrefillPagedRun(const Napi::CallbackInfo& info) {
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
             Napi::Error::New(env, std::string("batchPrefillPagedRun failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+        }
+    }
+    return env.Undefined();
+}
+
+static Napi::Value BatchPrefillRaggedPlan(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 15) {
+        Napi::TypeError::New(env, "Expected (ctx, float_ws, float_ws_size, int_ws, pinned_int_ws, int_ws_size, plan_info, qo_indptr_h, kv_indptr_h, total_qo_rows, batch_size, num_qo_heads, num_kv_heads, head_dim, mask_mode)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t float_ws = info[1].As<Napi::Number>().Int64Value();
+    size_t float_ws_size = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t int_ws = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t pinned_int_ws = info[4].As<Napi::Number>().Int64Value();
+    size_t int_ws_size = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t plan_info_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t qo_indptr_h_ptr = info[7].As<Napi::Number>().Int64Value();
+    uintptr_t kv_indptr_h_ptr = info[8].As<Napi::Number>().Int64Value();
+    uint32_t total_qo_rows = info[9].As<Napi::Number>().Uint32Value();
+    uint32_t batch_size = info[10].As<Napi::Number>().Uint32Value();
+    uint32_t num_qo_heads = info[11].As<Napi::Number>().Uint32Value();
+    uint32_t num_kv_heads = info[12].As<Napi::Number>().Uint32Value();
+    uint32_t head_dim = info[13].As<Napi::Number>().Uint32Value();
+    int mask_mode = info[14].As<Napi::Number>().Int32Value();
+    glm_batch_prefill_ragged_plan(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<void*>(float_ws), float_ws_size,
+        reinterpret_cast<void*>(int_ws), reinterpret_cast<void*>(pinned_int_ws), int_ws_size,
+        reinterpret_cast<int64_t*>(plan_info_ptr),
+        reinterpret_cast<int32_t*>(qo_indptr_h_ptr),
+        reinterpret_cast<int32_t*>(kv_indptr_h_ptr),
+        total_qo_rows, batch_size,
+        num_qo_heads, num_kv_heads, head_dim, mask_mode);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            Napi::Error::New(env, std::string("batchPrefillRaggedPlan failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+        }
+    }
+    return env.Undefined();
+}
+
+static Napi::Value BatchPrefillRaggedRun(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 23) {
+        Napi::TypeError::New(env, "Expected (ctx, q, k, v, o, float_ws, int_ws, q_indptr_d, kv_indptr_d, plan_info, total_qo_rows, batch_size, num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, v_stride_n, v_stride_h, mask_mode, sm_scale)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t k_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t v_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t o_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t float_ws_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t int_ws_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t q_indptr_d_ptr = info[7].As<Napi::Number>().Int64Value();
+    uintptr_t kv_indptr_d_ptr = info[8].As<Napi::Number>().Int64Value();
+    uintptr_t plan_info_ptr = info[9].As<Napi::Number>().Int64Value();
+    uint32_t total_qo_rows = info[10].As<Napi::Number>().Uint32Value();
+    uint32_t batch_size = info[11].As<Napi::Number>().Uint32Value();
+    uint32_t num_qo_heads = info[12].As<Napi::Number>().Uint32Value();
+    uint32_t num_kv_heads = info[13].As<Napi::Number>().Uint32Value();
+    uint32_t head_dim = info[14].As<Napi::Number>().Uint32Value();
+    int32_t q_stride_n = info[15].As<Napi::Number>().Int32Value();
+    int32_t q_stride_h = info[16].As<Napi::Number>().Int32Value();
+    int32_t kv_stride_n = info[17].As<Napi::Number>().Int32Value();
+    int32_t kv_stride_h = info[18].As<Napi::Number>().Int32Value();
+    int32_t v_stride_n = info[19].As<Napi::Number>().Int32Value();
+    int32_t v_stride_h = info[20].As<Napi::Number>().Int32Value();
+    int mask_mode = info[21].As<Napi::Number>().Int32Value();
+    float sm_scale = info[22].As<Napi::Number>().FloatValue();
+    glm_batch_prefill_ragged_run(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<void*>(q_ptr), reinterpret_cast<void*>(k_ptr),
+        reinterpret_cast<void*>(v_ptr), reinterpret_cast<void*>(o_ptr),
+        reinterpret_cast<void*>(float_ws_ptr), reinterpret_cast<void*>(int_ws_ptr),
+        reinterpret_cast<int32_t*>(q_indptr_d_ptr),
+        reinterpret_cast<int32_t*>(kv_indptr_d_ptr),
+        reinterpret_cast<int64_t*>(plan_info_ptr),
+        total_qo_rows, batch_size,
+        num_qo_heads, num_kv_heads, head_dim,
+        q_stride_n, q_stride_h,
+        kv_stride_n, kv_stride_h,
+        v_stride_n, v_stride_h,
+        mask_mode, sm_scale);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            Napi::Error::New(env, std::string("batchPrefillRaggedRun failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
         }
     }
     return env.Undefined();
@@ -3590,6 +3669,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "gather"), Napi::Function::New(env, Gather));
     exports.Set(Napi::String::New(env, "scatterScalar"), Napi::Function::New(env, ScatterScalar));
     exports.Set(Napi::String::New(env, "deinterleave"), Napi::Function::New(env, Deinterleave));
+    exports.Set(Napi::String::New(env, "gatherPages"), Napi::Function::New(env, GatherPages));
     exports.Set(Napi::String::New(env, "catLastDim"), Napi::Function::New(env, CatLastDim));
     exports.Set(Napi::String::New(env, "maskedFill"), Napi::Function::New(env, MaskedFill));
     exports.Set(Napi::String::New(env, "indexAdd"), Napi::Function::New(env, IndexAdd));
@@ -3648,7 +3728,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "eventRecord"), Napi::Function::New(env, EventRecord));
     exports.Set(Napi::String::New(env, "streamWaitEvent"), Napi::Function::New(env, StreamWaitEvent));
     exports.Set(Napi::String::New(env, "expandDim1Strided"), Napi::Function::New(env, ExpandDim1Strided));
-    exports.Set(Napi::String::New(env, "flashPrefill"), Napi::Function::New(env, FlashPrefill));
     exports.Set(Napi::String::New(env, "flashDecode"), Napi::Function::New(env, FlashDecode));
     exports.Set(Napi::String::New(env, "mmapOpen"), Napi::Function::New(env, MmapOpen));
     exports.Set(Napi::String::New(env, "mmapLoadAsync"), Napi::Function::New(env, MmapLoadAsync));
@@ -3662,6 +3741,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "batchDecodeRun"), Napi::Function::New(env, BatchDecodeRun));
     exports.Set(Napi::String::New(env, "batchPrefillPagedPlan"), Napi::Function::New(env, BatchPrefillPagedPlan));
     exports.Set(Napi::String::New(env, "batchPrefillPagedRun"), Napi::Function::New(env, BatchPrefillPagedRun));
+    exports.Set(Napi::String::New(env, "batchPrefillRaggedPlan"), Napi::Function::New(env, BatchPrefillRaggedPlan));
+    exports.Set(Napi::String::New(env, "batchPrefillRaggedRun"), Napi::Function::New(env, BatchPrefillRaggedRun));
     exports.Set(Napi::String::New(env, "mlaPrefillPlan"), Napi::Function::New(env, MlaPrefillPlan));
     exports.Set(Napi::String::New(env, "mlaPrefillRun"), Napi::Function::New(env, MlaPrefillRun));
     exports.Set(Napi::String::New(env, "mlaDecodePlan"), Napi::Function::New(env, MlaDecodePlan));

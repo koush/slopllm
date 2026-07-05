@@ -4,6 +4,7 @@ import { MemcpyKind } from "./tensor";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
+import type { PagedKVCache } from "./paged_kv";
 
 export class ParallelTensor extends Tensor {
   parallelism: TensorParallelism;
@@ -2557,6 +2558,33 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  batchPrefillRaggedPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, kvIndptrH: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, maskMode: MaskMode): void {
+    const pFloatWs = this.cast(floatWs);
+    const pIntWs = this.cast(intWs);
+    const pPinnedIntWs = this.cast(pinnedIntWs);
+    const pPlanInfo = this.cast(planInfo);
+    const pQoIndptrH = this.cast(qoIndptrH);
+    const pKvIndptrH = this.cast(kvIndptrH);
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].batchPrefillRaggedPlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pQoIndptrH.shards[i], pKvIndptrH.shards[i], totalQoRows, batchSize, this.shardDim(numQoHeads, "batchPrefillRaggedPlan numQoHeads"), this.shardDim(numKvHeads, "batchPrefillRaggedPlan numKvHeads"), headDim, maskMode);
+    }
+  }
+
+  batchPrefillRaggedRun(q: Tensor, k: Tensor, v: Tensor, o: Tensor, floatWs: Tensor, intWs: Tensor, qIndptrD: Tensor, kvIndptrD: Tensor, planInfo: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: MaskMode, smScale: number): void {
+    const pQ = this.cast(q);
+    const pK = this.cast(k);
+    const pV = this.cast(v);
+    const pO = this.cast(o);
+    const pFloatWs = this.cast(floatWs);
+    const pIntWs = this.cast(intWs);
+    const pQIndptrD = this.cast(qIndptrD);
+    const pKvIndptrD = this.cast(kvIndptrD);
+    const pPlanInfo = this.cast(planInfo);
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].batchPrefillRaggedRun(pQ.shards[i], pK.shards[i], pV.shards[i], pO.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pQIndptrD.shards[i], pKvIndptrD.shards[i], pPlanInfo.shards[i], totalQoRows, batchSize, this.shardDim(numQoHeads, "batchPrefillRaggedRun numQoHeads"), this.shardDim(numKvHeads, "batchPrefillRaggedRun numKvHeads"), headDim, qStrideN, qStrideH, kvStrideN, kvStrideH, vStrideN, vStrideH, maskMode, smScale);
+    }
+  }
+
   private adjustCpLastPageLen(lastPageLenH: ParallelTensor, batchSize: number, seqKvLens: number[], pageSize: number): void {
     const cpWorldSize = this.worldSize;
     const effectivePageSize = pageSize / cpWorldSize;
@@ -2739,6 +2767,53 @@ export class ParallelOps implements DeviceOps {
       const effectiveCpRank = contextParallel ? i : undefined;
       this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, contextParallel, effectiveCpWorldSize, effectiveCpRank);
     }
+  }
+
+  gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, numPages: number, batchSize: number, pageSize: number, D: number, totalKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor {
+    const pSrc = this.cast(srcData);
+    const pIndices = this.cast(pageIndices);
+    const pIndptr = this.cast(pageIndptrD);
+    const pLastPageLen = this.cast(lastPageLen);
+    const pKvIndptr = this.cast(kvTokenIndptrD);
+
+    if (!contextParallel) {
+      const out = srcData.workspace.alloc([totalKvLen, D], "BF16") as ParallelTensor;
+      const pOut = this.cast(out);
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], numPages, batchSize, pageSize, D, totalKvLen, pKvIndptr.shards[i], false);
+      }
+      return out;
+    }
+
+    // CP: each GPU has every Nth token within each page (Row-parallel, sharded on pageSize dim)
+    const cpWorldSize = this.worldSize;
+    const effPageSize = pageSize / cpWorldSize;
+    const localLen = numPages * effPageSize;
+
+    // Step 1: Local gather — each GPU gathers from its shard of the KV data
+    const localBufs: Tensor[] = [];
+    for (let i = 0; i < cpWorldSize; i++) {
+      localBufs.push(this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], numPages, batchSize, effPageSize, D, localLen, pKvIndptr.shards[i], false));
+    }
+
+    // Step 2: NCCL all-gather (Column → Replicated)
+    using localPar = this.wrapShards(pSrc.workspace, localBufs, [localLen * cpWorldSize, D], "BF16", TensorParallelism.Column);
+    using gathered = localPar.allGather(pSrc.workspace);
+
+    // Step 3: Deinterleave — reorder interleaved tokens to sequential
+    const out = srcData.workspace.alloc([totalKvLen, D], "BF16") as ParallelTensor;
+    const pOut = this.cast(out);
+    const globalLen = gathered.shape[0];
+
+    for (let i = 0; i < cpWorldSize; i++) {
+      getNativeAddon().deinterleave(
+        this.devices[i].ctx,
+        pOut.shards[i].data, gathered.shards[i].data,
+        cpWorldSize, totalKvLen, globalLen,
+        pKvIndptr.shards[i].data, batchSize, D,
+      );
+    }
+    return out;
   }
 
   private graphHandles: (number | undefined)[][] = [];

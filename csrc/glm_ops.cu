@@ -1407,25 +1407,44 @@ void glm_scatter_scalar(GlmCtx* ctx, void* out, const int* indices, float value,
 __global__ void __launch_bounds__(256) deinterleave_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ in,
-    const int32_t* __restrict__ shard_offsets,
     int world_size,
     int total_len,
+    int global_len,
+    const int32_t* __restrict__ kv_token_indptr,
+    int batch_size,
     int D
 ) {
     constexpr int BLOCK_ROWS = 4;
     const int row_start = blockIdx.x * BLOCK_ROWS;
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
+    const int chunk_len = global_len / world_size;
 
     #pragma unroll
     for (int r = 0; r < BLOCK_ROWS; r++) {
         const int out_row = row_start + r;
         if (out_row >= total_len) break;
 
-        const int rank = out_row % world_size;
-        const int local_idx = out_row / world_size;
-        const int32_t shard_off = shard_offsets[rank];
-        const int src_row = shard_off + local_idx;
+        // Find which sequence this row belongs to
+        int seq = 0;
+        while (seq < batch_size - 1 && out_row >= kv_token_indptr[seq + 1]) seq++;
+
+        const int seq_start = kv_token_indptr[seq];
+        const int local_in_seq = out_row - seq_start;
+        const int rank = local_in_seq % world_size;
+        const int local_idx = local_in_seq / world_size;
+
+        // Compute per-rank source offset: sum of count(rank, s') for s' < seq
+        // count(rank, s') = ceil((seq_len[s'] - rank) / ws) if seq_len[s'] > rank else 0
+        int src_offset = 0;
+        for (int s = 0; s < seq; s++) {
+            const int slen = kv_token_indptr[s + 1] - kv_token_indptr[s];
+            if (slen > rank) {
+                src_offset += (slen - rank + world_size - 1) / world_size;
+            }
+        }
+
+        const int src_row = rank * chunk_len + src_offset + local_idx;
 
         const __nv_bfloat16* src = in + (size_t)src_row * D;
         __nv_bfloat16* dst = out + (size_t)out_row * D;
@@ -1446,15 +1465,101 @@ __global__ void __launch_bounds__(256) deinterleave_kernel(
 }
 
 void glm_deinterleave(GlmCtx* ctx, void* out, const void* in,
-                      const int32_t* shard_offsets, int world_size,
-                      int total_len, int D) {
+                      int world_size, int total_len, int global_len,
+                      const int32_t* kv_token_indptr, int batch_size, int D) {
     cudaSetDevice(ctx->device_id);
     constexpr int BLOCK_ROWS = 4;
     constexpr int BLOCK_SIZE = 256;
     int grid = (total_len + BLOCK_ROWS - 1) / BLOCK_ROWS;
     deinterleave_kernel<<<grid, BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
-        shard_offsets, world_size, total_len, D);
+        world_size, total_len, global_len,
+        kv_token_indptr, batch_size, D);
+}
+
+// ---------------------------------------------------------------------------
+// Gather pages kernel: copies KV data from scattered pages into a contiguous
+// buffer. Handles ALL sequences in one launch using device-resident index
+// tensors — no host work, graph-capturable.
+//
+// in: [maxPages, pageSize, D] — paged KV data (ckvData or kpeData)
+// out: [totalKvLen, D] — contiguous tokens across all sequences (packed)
+//
+// page_indices[0..numPages-1]: flat page IDs for all sequences
+// page_indptr[0..B]: page-level cumulative offsets (page_indptr[B] = numPages)
+// last_page_len[0..B-1]: valid tokens in last page per sequence
+//
+// Output offsets computed on-device via prefix sum of per-sequence lengths:
+//   seqLen[seq] = (pages_in_seq - 1) * page_size + last_page_len[seq]
+//
+// Each block copies one page. Finds its sequence via linear scan of page_indptr.
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256) gather_pages_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ in,
+    const int32_t* __restrict__ page_indices,
+    const int32_t* __restrict__ page_indptr,
+    const int32_t* __restrict__ last_page_len,
+    int num_pages,
+    int batch_size,
+    int page_size,
+    int D
+) {
+    const int gp = blockIdx.x;
+    if (gp >= num_pages) return;
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    // Find which sequence this page belongs to (linear scan, B is small)
+    int seq = 0;
+    while (seq < batch_size - 1 && gp >= page_indptr[seq + 1]) seq++;
+
+    const int local_page = gp - page_indptr[seq];
+    const int pages_in_seq = page_indptr[seq + 1] - page_indptr[seq];
+    const bool is_last = (local_page == pages_in_seq - 1);
+    const int copy_len = is_last ? last_page_len[seq] : page_size;
+
+    // Compute output offset: prefix sum of preceding sequences' lengths + local offset
+    int out_offset = local_page * page_size;
+    for (int s = 0; s < seq; s++) {
+        const int ps = page_indptr[s + 1] - page_indptr[s];
+        out_offset += (ps - 1) * page_size + last_page_len[s];
+    }
+
+    const int32_t src_page = page_indices[gp];
+
+    const int total_elems = copy_len * D;
+    const __nv_bfloat16* src = in + (size_t)src_page * page_size * D;
+    __nv_bfloat16* dst = out + (size_t)out_offset * D;
+
+    if (D % 8 == 0) {
+        constexpr int VEC = 8;
+        const int vec_count = total_elems / VEC;
+        for (int j = tid; j < vec_count; j += block_size) {
+            *reinterpret_cast<int4*>(dst + j * VEC) =
+                *reinterpret_cast<const int4*>(src + j * VEC);
+        }
+    } else {
+        for (int j = tid; j < total_elems; j += block_size) {
+            dst[j] = src[j];
+        }
+    }
+}
+
+void glm_gather_pages(GlmCtx* ctx, void* out, const void* in,
+                      const int32_t* page_indices,
+                      const int32_t* page_indptr,
+                      const int32_t* last_page_len,
+                      int num_pages, int batch_size,
+                      int page_size, int D) {
+    cudaSetDevice(ctx->device_id);
+    constexpr int BLOCK_SIZE = 256;
+    int grid = num_pages;
+    gather_pages_kernel<<<grid, BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
+        page_indices, page_indptr, last_page_len,
+        num_pages, batch_size, page_size, D);
 }
 
 // ---------------------------------------------------------------------------

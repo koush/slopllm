@@ -88,8 +88,15 @@ void glm_scatter_scalar(GlmCtx* ctx, void* out, const int* indices, float value,
                         int k, int out_dim, int batch);
 
 void glm_deinterleave(GlmCtx* ctx, void* out, const void* in,
-                      const int32_t* shard_offsets, int world_size,
-                      int total_len, int D);
+                      int world_size, int total_len, int global_len,
+                      const int32_t* kv_token_indptr, int batch_size, int D);
+
+void glm_gather_pages(GlmCtx* ctx, void* out, const void* in,
+                      const int32_t* page_indices,
+                      const int32_t* page_indptr,
+                      const int32_t* last_page_len,
+                      int num_pages, int batch_size,
+                      int page_size, int D);
 
 void glm_cat_last_dim(GlmCtx* ctx, void* out, const void* a, const void* b,
                       int a_last_dim, int b_last_dim, int outer);
@@ -445,16 +452,6 @@ void glm_event_record(GlmCtx* ctx, int event_idx, int stream_idx);
 
 void glm_stream_wait_event(GlmCtx* ctx, int stream_idx, int event_idx);
 
-void glm_flash_prefill(
-    GlmCtx* ctx,
-    void* q, void* k, void* v, void* o, void* tmp,
-    int qo_len, int kv_len,
-    int num_qo_heads, int num_kv_heads, int head_dim,
-    int q_stride_n, int q_stride_h,
-    int kv_stride_n, int kv_stride_h,
-    int v_stride_n, int v_stride_h,
-    int mask_mode, int kv_layout, float sm_scale);
-
 void glm_flash_decode(
     GlmCtx* ctx,
     void* q, void* k, void* v, void* o, void* tmp,
@@ -512,6 +509,29 @@ void glm_batch_prefill_paged_run(
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
     uint32_t page_size,
     int32_t q_stride_n, int32_t q_stride_h,
+    int mask_mode, float sm_scale);
+
+void glm_batch_prefill_ragged_plan(
+    GlmCtx* ctx,
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
+    int64_t* plan_info,
+    int32_t* qo_indptr_h, int32_t* kv_indptr_h,
+    uint32_t total_qo_rows, uint32_t batch_size,
+    uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t head_dim, int mask_mode);
+
+void glm_batch_prefill_ragged_run(
+    GlmCtx* ctx,
+    void* q, void* k, void* v, void* o,
+    void* float_ws, void* int_ws,
+    int32_t* q_indptr_d, int32_t* kv_indptr_d,
+    int64_t* plan_info,
+    uint32_t total_qo_rows, uint32_t batch_size,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+    int32_t q_stride_n, int32_t q_stride_h,
+    int32_t kv_stride_n, int32_t kv_stride_h,
+    int32_t v_stride_n, int32_t v_stride_h,
     int mask_mode, float sm_scale);
 
 // ---------------------------------------------------------------------------
