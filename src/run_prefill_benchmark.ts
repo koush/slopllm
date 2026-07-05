@@ -34,7 +34,7 @@ function parseArgs(argv: string[]): BenchArgs {
     maxBatch: 1,
     warmupRuns: 1,
     benchRuns: 1,
-    cp: true,
+    cp: false,
     pageSize: 256,
     glm51Small: false,
   };

@@ -222,8 +222,10 @@ export class Glm51Model extends ChatModel {
   private tryComputeAbsorbed(layerPfx: string, nHeads: number, kvLoraRank: number, qLoraRank: number, qkNopeDim: number): void {
     const kNopeName = `${layerPfx}.k_nope_proj.weight`;
     const qNopeName = `${layerPfx}.q_nope_proj.weight`;
+    const absorbedName = `${layerPfx}.absorbed.weight`;
     const kNopeProj = this.tensors.get(kNopeName);
     const qNopeProj = this.tensors.get(qNopeName);
+    if (this.tensors.has(absorbedName)) return;
     if (!kNopeProj || !qNopeProj) return;
     using wAbsorbedTmp = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
     const wAbsorbed = this.alloc(wAbsorbedTmp.shape, wAbsorbedTmp.type, `${layerPfx}.absorbed.weight`, wAbsorbedTmp.parallelism);
