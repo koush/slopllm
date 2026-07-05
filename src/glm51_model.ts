@@ -434,7 +434,7 @@ export class Glm51Model extends ChatModel {
 
     const pagedKV = state.cache.getPagedKV();
 
-    const { absorbed } = state;
+    const absorbed = true; //state.absorbed;
 
     using q = this.glm.withStream(() => {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
@@ -446,7 +446,7 @@ export class Glm51Model extends ChatModel {
       });
 
       using qAbsorbedRStream = this.glm.withStream(() => {
-        if (state.absorbed) {
+        if (absorbed) {
           using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!, BS);
           return state.isDecode
             ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
@@ -473,7 +473,7 @@ export class Glm51Model extends ChatModel {
     using qPeR = q.result.qPeR;
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
-    if (state.absorbed) {
+    if (absorbed) {
       const mlaResult = state.isDecode
         ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel)
         : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel, !state.customMask ? MaskMode.Causal : state.customMask.mode, state.customMask?.mask, state.customMask?.indptr, state.customMask?.maskKvLen);
