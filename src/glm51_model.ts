@@ -37,6 +37,7 @@ export interface Glm51Config extends CommonModelConfig {
   indexHeadDim: number;
   indexNHeads: number;
   ropeInterleave: boolean;
+  indexerRopeInterleave: boolean;
   mlpLayerTypes: string[];
   numDenseMlpLayers: number;
   firstSparseMlpLayer: number;
@@ -84,6 +85,7 @@ function loadConfig(modelDir: string): Glm51Config {
     indexHeadDim: raw.index_head_dim ?? 64,
     indexNHeads: raw.index_n_heads ?? 4,
     ropeInterleave: raw.rope_interleave ?? false,
+    indexerRopeInterleave: raw.indexer_rope_interleave ?? raw.rope_interleave ?? false,
     mlpLayerTypes,
     numDenseMlpLayers,
     firstSparseMlpLayer: firstSparseMlpLayer >= 0 ? firstSparseMlpLayer : numDenseMlpLayers,
@@ -150,12 +152,13 @@ export class Glm51Model extends ChatModel {
       name.endsWith(".down_proj.weight_weight_scale") ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".down_proj.weight_weight_scale")) ||
       name.endsWith(".mlp.shared_experts.down_proj.weight_weight_scale")) return TensorParallelism.Row;
+    // Indexer weights are always Replicated — the indexer is a small module
+    // that must run identically on every GPU to produce the same topk indices.
+    if (name.includes(".indexer.")) return TensorParallelism.Replicated;
     return TensorParallelism.Replicated;
   }
 
   protected async loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
-    if (name.includes(".indexer.")) return;
-
     // NVFP4 scale tensors: rename to match linear() lookup convention
     // e.g. "X.gate_proj.weight_scale" → "X.gate_proj.weight_weight_scale"
     if (name.endsWith(".input_scale")) return; // not used by kernel
