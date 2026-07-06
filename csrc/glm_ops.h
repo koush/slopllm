@@ -84,7 +84,13 @@ void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
                        const int32_t* pageIndptr, const int32_t* lastPageLen,
                        const int32_t* qoIndptr, float scale,
                        int totalQ, int idxNHeads, int idxHeadDim,
-                       int pageSize, int maxKvLen, int causal);
+                        int pageSize, int maxKvLen, int causal);
+
+void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, const int32_t* topk_idx,
+                       const int32_t* page_indices, const int32_t* page_indptr,
+                       const int32_t* last_page_len, const int32_t* batch_indices,
+                       int num_tokens, int topk, int page_size,
+                       uint32_t cp_world_size, uint32_t cp_rank);
 
 void glm_fill(GlmCtx* ctx, void* out, float value, int n);
 
@@ -459,6 +465,16 @@ void glm_event_record(GlmCtx* ctx, int event_idx, int stream_idx);
 
 void glm_stream_wait_event(GlmCtx* ctx, int stream_idx, int event_idx);
 
+void glm_flash_prefill(
+    GlmCtx* ctx,
+    void* q, void* k, void* v, void* o, void* tmp,
+    int qo_len, int kv_len,
+    int num_qo_heads, int num_kv_heads, int head_dim,
+    int q_stride_n, int q_stride_h,
+    int kv_stride_n, int kv_stride_h,
+    int v_stride_n, int v_stride_h,
+    int mask_mode, int kv_layout, float sm_scale);
+
 void glm_flash_decode(
     GlmCtx* ctx,
     void* q, void* k, void* v, void* o, void* tmp,
@@ -631,6 +647,55 @@ void glm_mla_kv_cache_append(
     uint32_t head_dim_ckv, uint32_t head_dim_kpe,
     size_t append_ckv_stride_n, size_t append_kpe_stride_n,
     uint32_t cp_world_size = 1, uint32_t cp_rank = 0);
+
+// Sparse MLA: Quantize BF16 ckv+kpe → packed FP8 paged cache
+// kv_cache: [num_blocks, page_size, BPT] uint8 (BPT = kv_lora_rank + num_tiles*4 + pe_dim*2)
+// append_ckv: [nnz, kv_lora_rank] BF16
+// append_kpe: [nnz, pe_dim] BF16
+void glm_concat_and_cache_ds_mla(
+    GlmCtx* ctx,
+    void* kv_cache,
+    void* append_ckv, void* append_kpe,
+    int32_t* indices, int32_t* indptr,
+    int32_t* batch_indices, int32_t* positions,
+    uint32_t nnz, uint32_t page_size,
+    uint32_t kv_lora_rank, uint32_t pe_dim,
+    size_t append_ckv_stride_n, size_t append_kpe_stride_n);
+
+// Sparse MLA SM120: prefill attention over topk-selected KV slots
+// q: [num_tokens, num_heads, d_qk] BF16 (d_qk = 576 = 512 nope + 64 rope)
+// kv_cache: [num_pages, page_size, BPT] U8 (packed FP8)
+// indices: [num_tokens, topk] int32 — flat slot IDs (page_id * page_size + offset), -1 = skip
+// output: [num_tokens, num_heads, d_v] BF16 (d_v = 512)
+// out_lse: [num_tokens, num_heads] FP32
+// stride_kv_block: page_block_size * bytes_per_token
+// topk_length: [num_tokens] int32 or null (effective top-k per token)
+void glm_sparse_mla_prefill(
+    GlmCtx* ctx,
+    void* q, void* kv_cache,
+    int32_t* indices,
+    void* output, float* out_lse,
+    uint32_t num_tokens, uint32_t num_heads, uint32_t topk,
+    uint32_t page_block_size,
+    float sm_scale, size_t stride_kv_block,
+    int32_t* topk_length);
+
+// Sparse MLA SM120: decode attention (split-K + merge)
+// mid_out: [num_tokens, num_heads, num_splits, d_v] BF16 (scratch)
+// mid_lse: [num_tokens, num_heads, num_splits] FP32 (scratch)
+// num_splits = ceil(topk / 64)
+// chunks_per_block_override: 0 = auto-tune
+void glm_sparse_mla_decode(
+    GlmCtx* ctx,
+    void* q, void* kv_cache,
+    int32_t* indices,
+    void* mid_out, float* mid_lse,
+    void* output, float* out_lse,
+    uint32_t num_tokens, uint32_t num_heads, uint32_t topk,
+    uint32_t num_splits,
+    float sm_scale, size_t stride_kv_block,
+    int32_t* topk_length,
+    int chunks_per_block_override);
 
 // CUDA Graph operations
 void glm_graph_begin_capture(GlmCtx* ctx);

@@ -4,7 +4,7 @@ import { I32 } from "./glm_ops";
 import { MemcpyKind, Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
-export const PAGE_SIZE = 16;
+export const PAGE_SIZE = 64;
 
 function longestPrefix(a: number[], b: number[]): number {
   const len = Math.min(a.length, b.length);
@@ -121,6 +121,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   readonly maxBatch: number;
   readonly pageSize: number;
   readonly contextParallel: boolean;
+  readonly sparseMode: boolean;
+  readonly bytesPerToken: number;
   kData: Tensor[];
   vData: Tensor[];
   ckvData: Tensor[];
@@ -154,14 +156,22 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.maxBatch = maxBatch;
     this.pageSize = pageSize;
     this.contextParallel = contextParallel;
+    this.sparseMode = indexHeadDim > 0 && kvLoraRank > 0;
+    this.bytesPerToken = kvLoraRank > 0
+      ? kvLoraRank + (kvLoraRank / 128) * 4 + qkRopeDim * 2
+      : 0;
     this.kData = [];
     this.vData = [];
     this.ckvData = [];
     this.kpeData = [];
     for (let i = 0; i < nLayers; i++) {
       if (kvLoraRank > 0) {
-        this.ckvData.push(this.alloc([maxPages, pageSize, kvLoraRank], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
-        this.kpeData.push(this.alloc([maxPages, pageSize, qkRopeDim], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
+        if (this.sparseMode) {
+          this.ckvData.push(this.alloc([maxPages, pageSize, this.bytesPerToken], "U8", undefined, contextParallel ? TensorParallelism.Row : undefined));
+        } else {
+          this.ckvData.push(this.alloc([maxPages, pageSize, kvLoraRank], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
+          this.kpeData.push(this.alloc([maxPages, pageSize, qkRopeDim], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
+        }
         if (indexHeadDim > 0) {
           this.kData.push(this.alloc([maxPages, pageSize, indexHeadDim], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
         }

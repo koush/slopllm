@@ -233,6 +233,15 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
+        self.lib.glm_topk_to_slots.restype = None
+        self.lib.glm_topk_to_slots.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_uint32, ctypes.c_uint32,
+        ]
+
         self.lib.glm_cat_last_dim.restype = None
         self.lib.glm_cat_last_dim.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -400,6 +409,18 @@ class GlmOps:
 
         self.lib.glm_mmap_load.restype = None
         self.lib.glm_mmap_load.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
+
+        self.lib.glm_flash_prefill.restype = None
+        self.lib.glm_flash_prefill.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_float,
+        ]
 
         self.lib.glm_flash_decode.restype = None
         self.lib.glm_flash_decode.argtypes = [
@@ -575,6 +596,39 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_size_t, ctypes.c_size_t,
             ctypes.c_uint32, ctypes.c_uint32,  # cp_rank, cp_world_size
+        ]
+
+        self.lib.glm_concat_and_cache_ds_mla.restype = None
+        self.lib.glm_concat_and_cache_ds_mla.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_size_t, ctypes.c_size_t,
+        ]
+
+        self.lib.glm_sparse_mla_prefill.restype = None
+        self.lib.glm_sparse_mla_prefill.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_float, ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+
+        self.lib.glm_sparse_mla_decode.restype = None
+        self.lib.glm_sparse_mla_decode.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_float, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_int,
         ]
 
         self.lib.glm_position_step.restype = None
@@ -1108,6 +1162,18 @@ class GlmOps:
             total_q, n_heads, head_dim, page_size, max_kv_len, 1 if causal else 0
         )
 
+    def topk_to_slots(self, slots, topk_idx, page_indices, page_indptr,
+                      last_page_len, batch_indices, num_tokens, topk, page_size,
+                      cp_world_size=1, cp_rank=0):
+        self.lib.glm_topk_to_slots(
+            self.ctx,
+            self._ptr(slots), self._ptr(topk_idx),
+            self._ptr(page_indices), self._ptr(page_indptr),
+            self._ptr(last_page_len), self._ptr(batch_indices),
+            num_tokens, topk, page_size,
+            cp_world_size, cp_rank
+        )
+
     def cat_last_dim(self, output, a, b, a_last_dim, b_last_dim, outer):
         self.lib.glm_cat_last_dim(
             self.ctx,
@@ -1314,6 +1380,24 @@ class GlmOps:
             self._ptr(qo_indptr),
             self._ptr(new_tokens),
             batch_size
+        )
+
+    def flash_prefill(self, q, k, v, o, tmp,
+                      qo_len, kv_len,
+                      num_qo_heads, num_kv_heads, head_dim,
+                      q_stride_n, q_stride_h,
+                      kv_stride_n, kv_stride_h,
+                      v_stride_n, v_stride_h,
+                      mask_mode, kv_layout, sm_scale):
+        self.lib.glm_flash_prefill(
+            self.ctx,
+            self._ptr(q), self._ptr(k), self._ptr(v), self._ptr(o), self._ptr(tmp),
+            qo_len, kv_len,
+            num_qo_heads, num_kv_heads, head_dim,
+            q_stride_n, q_stride_h,
+            kv_stride_n, kv_stride_h,
+            v_stride_n, v_stride_h,
+            mask_mode, kv_layout, ctypes.c_float(sm_scale)
         )
 
     def flash_decode(self, q, k, v, o, tmp,
@@ -1526,6 +1610,48 @@ class GlmOps:
             ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe),
             ctypes.c_size_t(append_ckv_stride_n), ctypes.c_size_t(append_kpe_stride_n),
             ctypes.c_uint32(cp_rank), ctypes.c_uint32(cp_world_size)
+        )
+
+    def concat_and_cache_ds_mla(self, kv_cache, append_ckv, append_kpe,
+                                indices, indptr, batch_indices, positions,
+                                nnz, page_size, kv_lora_rank, pe_dim,
+                                append_ckv_stride_n, append_kpe_stride_n):
+        self.lib.glm_concat_and_cache_ds_mla(
+            self.ctx,
+            ctypes.c_void_p(kv_cache),
+            ctypes.c_void_p(append_ckv), ctypes.c_void_p(append_kpe),
+            ctypes.c_void_p(indices), ctypes.c_void_p(indptr),
+            ctypes.c_void_p(batch_indices), ctypes.c_void_p(positions),
+            ctypes.c_uint32(nnz), ctypes.c_uint32(page_size),
+            ctypes.c_uint32(kv_lora_rank), ctypes.c_uint32(pe_dim),
+            ctypes.c_size_t(append_ckv_stride_n), ctypes.c_size_t(append_kpe_stride_n)
+        )
+
+    def sparse_mla_prefill(self, q, kv_cache, indices, output, out_lse,
+                           num_tokens, num_heads, topk, page_block_size,
+                           sm_scale, stride_kv_block, topk_length=None):
+        self.lib.glm_sparse_mla_prefill(
+            self.ctx,
+            ctypes.c_void_p(q), ctypes.c_void_p(kv_cache), ctypes.c_void_p(indices),
+            ctypes.c_void_p(output), ctypes.c_void_p(out_lse),
+            ctypes.c_uint32(num_tokens), ctypes.c_uint32(num_heads), ctypes.c_uint32(topk),
+            ctypes.c_uint32(page_block_size), ctypes.c_float(sm_scale), ctypes.c_size_t(stride_kv_block),
+            ctypes.c_void_p(topk_length) if topk_length is not None else None,
+        )
+
+    def sparse_mla_decode(self, q, kv_cache, indices, mid_out, mid_lse,
+                          output, out_lse, num_tokens, num_heads, topk,
+                          num_splits, sm_scale, stride_kv_block,
+                          chunks_per_block=0, topk_length=None):
+        self.lib.glm_sparse_mla_decode(
+            self.ctx,
+            ctypes.c_void_p(q), ctypes.c_void_p(kv_cache), ctypes.c_void_p(indices),
+            ctypes.c_void_p(mid_out), ctypes.c_void_p(mid_lse),
+            ctypes.c_void_p(output), ctypes.c_void_p(out_lse),
+            ctypes.c_uint32(num_tokens), ctypes.c_uint32(num_heads), ctypes.c_uint32(topk),
+            ctypes.c_uint32(num_splits), ctypes.c_float(sm_scale), ctypes.c_size_t(stride_kv_block),
+            ctypes.c_void_p(topk_length) if topk_length is not None else None,
+            ctypes.c_int(chunks_per_block),
         )
 
     def position_step(self, position_ids, last_page_len, slot_mapping,

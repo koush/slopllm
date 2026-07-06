@@ -2780,6 +2780,45 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): void {
+    const pKvCache = this.cast(kvCache);
+    const pAppendCkv = this.cast(appendCkv);
+    const pAppendKpe = this.cast(appendKpe);
+    const pIndices = this.cast(indices);
+    const pIndptr = this.cast(indptr);
+    const pBatchIndices = this.cast(batchIndices);
+    const pPositions = this.cast(positions);
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].concatAndCacheDsMla(pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN);
+    }
+  }
+
+  sparseMlaPrefill(q: Tensor, kvCache: Tensor, indices: Tensor, output: Tensor, outLse: Tensor, numTokens: number, numHeads: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, topkLength?: Tensor): void {
+    const pQ = this.cast(q);
+    const pKvCache = this.cast(kvCache);
+    const pIndices = this.cast(indices);
+    const pOutput = this.cast(output);
+    const pOutLse = this.cast(outLse);
+    const pTopkLength = topkLength ? this.cast(topkLength) : undefined;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].sparseMlaPrefill(pQ.shards[i], pKvCache.shards[i], pIndices.shards[i], pOutput.shards[i], pOutLse.shards[i], numTokens, numHeads, topk, pageBlockSize, smScale, strideKvBlock, pTopkLength?.shards[i]);
+    }
+  }
+
+  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, midOut: Tensor, midLse: Tensor, output: Tensor, outLse: Tensor, numTokens: number, numHeads: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: Tensor): void {
+    const pQ = this.cast(q);
+    const pKvCache = this.cast(kvCache);
+    const pIndices = this.cast(indices);
+    const pMidOut = this.cast(midOut);
+    const pMidLse = this.cast(midLse);
+    const pOutput = this.cast(output);
+    const pOutLse = this.cast(outLse);
+    const pTopkLength = topkLength ? this.cast(topkLength) : undefined;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].sparseMlaDecode(pQ.shards[i], pKvCache.shards[i], pIndices.shards[i], pMidOut.shards[i], pMidLse.shards[i], pOutput.shards[i], pOutLse.shards[i], numTokens, numHeads, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, pTopkLength?.shards[i]);
+    }
+  }
+
   gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, numPages: number, batchSize: number, pageSize: number, D: number, totalKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor {
     const pSrc = this.cast(srcData);
     const pIndices = this.cast(pageIndices);
@@ -2837,6 +2876,20 @@ export class ParallelOps implements DeviceOps {
     const pQoIndptr = this.cast(qoIndptr);
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].indexerScore(pOut.shards[i], pQ.shards[i], pKData.shards[i], pWeights.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal);
+    }
+  }
+
+  topkToSlots(slots: Tensor, topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, numTokens: number, topk: number, pageSize: number, cpWorldSize: number = 1, cpRank: number = 0, contextParallel?: boolean): void {
+    const pSlots = this.cast(slots);
+    const pTopkIdx = this.cast(topkIdx);
+    const pPageIndices = this.cast(pageIndices);
+    const pPageIndptr = this.cast(pageIndptr);
+    const pLastPageLen = this.cast(lastPageLen);
+    const pBatchIndices = this.cast(batchIndices);
+    for (let i = 0; i < this.worldSize; i++) {
+      const cpW = contextParallel ? cpWorldSize : 1;
+      const cpR = contextParallel ? i : 0;
+      this.devices[i].topkToSlots(pSlots.shards[i], pTopkIdx.shards[i], pPageIndices.shards[i], pPageIndptr.shards[i], pLastPageLen.shards[i], pBatchIndices.shards[i], numTokens, topk, pageSize, cpW, cpR);
     }
   }
 

@@ -400,6 +400,40 @@ static Napi::Value IndexerScore(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value TopkToSlots(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, slots, topkIdx, pageIndices, pageIndptr, lastPageLen, batchIndices, numTokens, topk, pageSize, cpWorldSize, cpRank)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t slots_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t topk_idx_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t page_indices_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t page_indptr_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t last_page_len_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t batch_indices_ptr = info[6].As<Napi::Number>().Int64Value();
+    int num_tokens = info[7].As<Napi::Number>().Int32Value();
+    int topk = info[8].As<Napi::Number>().Int32Value();
+    int page_size = info[9].As<Napi::Number>().Int32Value();
+    uint32_t cp_world_size = info[10].As<Napi::Number>().Uint32Value();
+    uint32_t cp_rank = info[11].As<Napi::Number>().Uint32Value();
+    glm_topk_to_slots(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<int32_t*>(slots_ptr),
+        reinterpret_cast<const int32_t*>(topk_idx_ptr),
+        reinterpret_cast<const int32_t*>(page_indices_ptr),
+        reinterpret_cast<const int32_t*>(page_indptr_ptr),
+        reinterpret_cast<const int32_t*>(last_page_len_ptr),
+        reinterpret_cast<const int32_t*>(batch_indices_ptr),
+        num_tokens, topk, page_size, cp_world_size, cp_rank);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("topkToSlots failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value Fill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 4) {
@@ -2802,6 +2836,124 @@ static Napi::Value MlaKvCacheAppend(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value ConcatAndCacheDsMla(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 14) {
+        Napi::TypeError::New(env, "Expected 14 args (ctx, kv_cache, append_ckv, append_kpe, indices, indptr, batch_indices, positions, nnz, page_size, kv_lora_rank, pe_dim, append_ckv_stride_n, append_kpe_stride_n)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t kv_cache_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t append_ckv_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t append_kpe_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t indices_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t indptr_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t batch_indices_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t positions_ptr = info[7].As<Napi::Number>().Int64Value();
+    uint32_t nnz = info[8].As<Napi::Number>().Uint32Value();
+    uint32_t page_size = info[9].As<Napi::Number>().Uint32Value();
+    uint32_t kv_lora_rank = info[10].As<Napi::Number>().Uint32Value();
+    uint32_t pe_dim = info[11].As<Napi::Number>().Uint32Value();
+    size_t append_ckv_stride_n = info[12].As<Napi::Number>().Int64Value();
+    size_t append_kpe_stride_n = info[13].As<Napi::Number>().Int64Value();
+    glm_concat_and_cache_ds_mla(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<void*>(kv_cache_ptr),
+        reinterpret_cast<void*>(append_ckv_ptr), reinterpret_cast<void*>(append_kpe_ptr),
+        reinterpret_cast<int32_t*>(indices_ptr),
+        reinterpret_cast<int32_t*>(indptr_ptr),
+        reinterpret_cast<int32_t*>(batch_indices_ptr),
+        reinterpret_cast<int32_t*>(positions_ptr),
+        nnz, page_size, kv_lora_rank, pe_dim,
+        append_ckv_stride_n, append_kpe_stride_n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("concatAndCacheDsMla failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value SparseMlaPrefill(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected 12 args (ctx, q, kv_cache, indices, output, out_lse, num_tokens, num_heads, topk, page_block_size, sm_scale, stride_kv_block)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t kv_cache_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t indices_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t output_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t out_lse_ptr = info[5].As<Napi::Number>().Int64Value();
+    uint32_t num_tokens = info[6].As<Napi::Number>().Uint32Value();
+    uint32_t num_heads = info[7].As<Napi::Number>().Uint32Value();
+    uint32_t topk = info[8].As<Napi::Number>().Uint32Value();
+    uint32_t page_block_size = info[9].As<Napi::Number>().Uint32Value();
+    float sm_scale = info[10].As<Napi::Number>().FloatValue();
+    size_t stride_kv_block = info[11].As<Napi::Number>().Int64Value();
+    int32_t* topk_length = nullptr;
+    if (info.Length() >= 13 && info[12].IsNumber()) {
+        topk_length = reinterpret_cast<int32_t*>(info[12].As<Napi::Number>().Int64Value());
+    }
+    glm_sparse_mla_prefill(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<void*>(q_ptr),
+        reinterpret_cast<void*>(kv_cache_ptr),
+        reinterpret_cast<int32_t*>(indices_ptr),
+        reinterpret_cast<void*>(output_ptr),
+        reinterpret_cast<float*>(out_lse_ptr),
+        num_tokens, num_heads, topk, page_block_size,
+        sm_scale, stride_kv_block, topk_length);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("sparseMlaPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value SparseMlaDecode(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 15) {
+        Napi::TypeError::New(env, "Expected 15 args (ctx, q, kv_cache, indices, mid_out, mid_lse, output, out_lse, num_tokens, num_heads, topk, num_splits, sm_scale, stride_kv_block, chunks_per_block)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t kv_cache_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t indices_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t mid_out_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t mid_lse_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t output_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t out_lse_ptr = info[7].As<Napi::Number>().Int64Value();
+    uint32_t num_tokens = info[8].As<Napi::Number>().Uint32Value();
+    uint32_t num_heads = info[9].As<Napi::Number>().Uint32Value();
+    uint32_t topk = info[10].As<Napi::Number>().Uint32Value();
+    uint32_t num_splits = info[11].As<Napi::Number>().Uint32Value();
+    float sm_scale = info[12].As<Napi::Number>().FloatValue();
+    size_t stride_kv_block = info[13].As<Napi::Number>().Int64Value();
+    int chunks_per_block = info[14].As<Napi::Number>().Int32Value();
+    int32_t* topk_length = nullptr;
+    if (info.Length() >= 16 && info[15].IsNumber()) {
+        topk_length = reinterpret_cast<int32_t*>(info[16].As<Napi::Number>().Int64Value());
+    }
+    glm_sparse_mla_decode(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<void*>(q_ptr),
+        reinterpret_cast<void*>(kv_cache_ptr),
+        reinterpret_cast<int32_t*>(indices_ptr),
+        reinterpret_cast<void*>(mid_out_ptr),
+        reinterpret_cast<float*>(mid_lse_ptr),
+        reinterpret_cast<void*>(output_ptr),
+        reinterpret_cast<float*>(out_lse_ptr),
+        num_tokens, num_heads, topk, num_splits,
+        sm_scale, stride_kv_block, topk_length, chunks_per_block);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("sparseMlaDecode failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value GraphBeginCapture(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1) {
@@ -3705,6 +3857,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "softmax"), Napi::Function::New(env, Softmax));
     exports.Set(Napi::String::New(env, "causalMask"), Napi::Function::New(env, CausalMask));
     exports.Set(Napi::String::New(env, "indexerScore"), Napi::Function::New(env, IndexerScore));
+    exports.Set(Napi::String::New(env, "topkToSlots"), Napi::Function::New(env, TopkToSlots));
     exports.Set(Napi::String::New(env, "fill"), Napi::Function::New(env, Fill));
     exports.Set(Napi::String::New(env, "gather"), Napi::Function::New(env, Gather));
     exports.Set(Napi::String::New(env, "scatterScalar"), Napi::Function::New(env, ScatterScalar));
@@ -3788,6 +3941,9 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "mlaDecodePlan"), Napi::Function::New(env, MlaDecodePlan));
     exports.Set(Napi::String::New(env, "mlaDecodeRun"), Napi::Function::New(env, MlaDecodeRun));
     exports.Set(Napi::String::New(env, "mlaKvCacheAppend"), Napi::Function::New(env, MlaKvCacheAppend));
+    exports.Set(Napi::String::New(env, "concatAndCacheDsMla"), Napi::Function::New(env, ConcatAndCacheDsMla));
+    exports.Set(Napi::String::New(env, "sparseMlaPrefill"), Napi::Function::New(env, SparseMlaPrefill));
+    exports.Set(Napi::String::New(env, "sparseMlaDecode"), Napi::Function::New(env, SparseMlaDecode));
     exports.Set(Napi::String::New(env, "graphBeginCapture"), Napi::Function::New(env, GraphBeginCapture));
     exports.Set(Napi::String::New(env, "graphEndCapture"), Napi::Function::New(env, GraphEndCapture));
     exports.Set(Napi::String::New(env, "graphInstantiate"), Napi::Function::New(env, GraphInstantiate));

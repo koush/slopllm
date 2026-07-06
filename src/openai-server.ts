@@ -13,7 +13,7 @@ import { resolveModelPath } from "./model_path";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const MODEL_NAME = "qwen3-0.6b";
-const PAGE_SIZE = 16;
+const PAGE_SIZE = 64;
 
 interface ServerArgs {
   port: number;

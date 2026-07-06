@@ -71,6 +71,7 @@ interface NativeAddon {
   fill(ctx: number, out: number, value: number, n: number): void;
   causalMask(ctx: number, out: number, seqLen: number): void;
   indexerScore(ctx: number, out: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: number): void;
+  topkToSlots(ctx: number, slots: number, topkIdx: number, pageIndices: number, pageIndptr: number, lastPageLen: number, batchIndices: number, numTokens: number, topk: number, pageSize: number, cpWorldSize: number, cpRank: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
   applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number, offset: number): void;
@@ -119,6 +120,9 @@ interface NativeAddon {
   mlaDecodePlan(ctx: number, floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, indptrH: number, batchSize: number, numQoHeads: number, pageSize: number, enableCudaGraph: boolean, headDimCkv: number, headDimKpe: number): void;
   mlaDecodeRun(ctx: number, qNope: number, qPe: number, ckvData: number, kpeData: number, indices: number, indptrD: number, lastPageLen: number, o: number, floatWs: number, intWs: number, planInfo: number, batchSize: number, numQoHeads: number, pageSize: number, smScale: number, headDimCkv: number, headDimKpe: number, lse: number): void;
   mlaKvCacheAppend(ctx: number, ckvData: number, kpeData: number, indices: number, indptr: number, lastPageLen: number, appendCkv: number, appendKpe: number, batchIndices: number, positions: number, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, cpWorldSize: number, cpRank: number): void;
+  concatAndCacheDsMla(ctx: number, kvCache: number, appendCkv: number, appendKpe: number, indices: number, indptr: number, batchIndices: number, positions: number, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): void;
+  sparseMlaPrefill(ctx: number, q: number, kvCache: number, indices: number, output: number, outLse: number, numTokens: number, numHeads: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, topkLength?: number): void;
+  sparseMlaDecode(ctx: number, q: number, kvCache: number, indices: number, midOut: number, midLse: number, output: number, outLse: number, numTokens: number, numHeads: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: number): void;
   causalConv1d(ctx: number, output: number, convState: number, input: number, weight: number, cuSeqlens: number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void;
   causalConv1dUpdate(ctx: number, output: number, convState: number, input: number, weight: number, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): void;
   rmsnormGated(ctx: number, output: number, input: number, gate: number, weight: number, eps: number, dim: number, batch: number): void;
@@ -868,6 +872,10 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().indexerScore(this.ctx, out.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal ? 1 : 0);
   }
 
+  topkToSlots(slots: Tensor, topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, numTokens: number, topk: number, pageSize: number, cpWorldSize: number = 1, cpRank: number = 0): void {
+    getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkIdx), ptr(pageIndices), ptr(pageIndptr), ptr(lastPageLen), ptr(batchIndices), numTokens, topk, pageSize, cpWorldSize, cpRank);
+  }
+
   positionStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number, steps = 1): void {
     getNativeAddon().positionStep(this.ctx, ptr(positionIds), ptr(lastPageLen), ptr(slotMapping), ptr(indptr), ptr(indices), pageSize, batchSize, steps);
   }
@@ -959,6 +967,18 @@ export class GlmOps implements DeviceOps {
 
   mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): void {
     getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), kpeData ? ptr(kpeData) : 0, ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), appendKpe ? ptr(appendKpe) : 0, ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
+  }
+
+  concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): void {
+    getNativeAddon().concatAndCacheDsMla(this.ctx, ptr(kvCache), ptr(appendCkv), ptr(appendKpe), ptr(indices), ptr(indptr), ptr(batchIndices), ptr(positions), nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN);
+  }
+
+  sparseMlaPrefill(q: Tensor, kvCache: Tensor, indices: Tensor, output: Tensor, outLse: Tensor, numTokens: number, numHeads: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, topkLength?: Tensor): void {
+    getNativeAddon().sparseMlaPrefill(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(output), ptr(outLse), numTokens, numHeads, topk, pageBlockSize, smScale, strideKvBlock, topkLength ? ptr(topkLength) : 0);
+  }
+
+  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, midOut: Tensor, midLse: Tensor, output: Tensor, outLse: Tensor, numTokens: number, numHeads: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: Tensor): void {
+    getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(output), ptr(outLse), numTokens, numHeads, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, topkLength ? ptr(topkLength) : 0);
   }
 
   cpMergeTree(vPtrs: number[], lsePtrs: number[], numShards: number, outputV: Tensor, outputLse: Tensor | null, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void {

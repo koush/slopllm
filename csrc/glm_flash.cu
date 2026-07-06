@@ -1,6 +1,7 @@
 #include "glm_ops.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <flashinfer/attention/default_prefill_params.cuh>
@@ -134,6 +135,75 @@ void glm_batch_decode_plan_impl(
 } // anonymous namespace
 
 extern "C" {
+
+void glm_flash_prefill(
+    GlmCtx* ctx,
+    void* q, void* k, void* v, void* o, void* tmp,
+    int qo_len, int kv_len,
+    int num_qo_heads, int num_kv_heads, int head_dim,
+    int q_stride_n, int q_stride_h,
+    int kv_stride_n, int kv_stride_h,
+    int v_stride_n, int v_stride_h,
+    int mask_mode, int kv_layout, float sm_scale) {
+
+  cudaSetDevice(ctx->device_id);
+
+  using Params = flashinfer::SinglePrefillParams<DType, DType, DTypeO>;
+
+  Params params;
+  params.q = static_cast<DType*>(q);
+  params.k = static_cast<DType*>(k);
+  params.v = static_cast<DType*>(v);
+  params.o = static_cast<DTypeO*>(o);
+  params.lse = nullptr;
+  params.maybe_custom_mask = nullptr;
+  params.maybe_alibi_slopes = nullptr;
+  params.num_qo_heads = num_qo_heads;
+  params.num_kv_heads = num_kv_heads;
+  params.qo_len = qo_len;
+  params.kv_len = kv_len;
+  params.q_stride_n = q_stride_n;
+  params.q_stride_h = q_stride_h;
+  params.k_stride_n = kv_stride_n;
+  params.k_stride_h = kv_stride_h;
+  params.v_stride_n = v_stride_n;
+  params.v_stride_h = v_stride_h;
+  params.head_dim = head_dim;
+  params.window_left = -1;
+  params.logits_soft_cap = 0.0f;
+  params.sm_scale = sm_scale;
+  params.rope_rcp_scale = 1.0f;
+  params.rope_rcp_theta = 1.0f;
+  params.partition_kv = false;
+  params.group_size = flashinfer::uint_fastdiv(num_qo_heads / num_kv_heads);
+
+  flashinfer::MaskMode flash_mask = static_cast<flashinfer::MaskMode>(mask_mode);
+
+  cudaError_t status;
+  DISPATCH_HEAD_DIM(head_dim, {
+    if (flash_mask == flashinfer::MaskMode::kCausal) {
+      status = flashinfer::SinglePrefillWithKVCacheDispatched<
+          HEAD_DIM, HEAD_DIM,
+          flashinfer::PosEncodingMode::kNone,
+          false,
+          flashinfer::MaskMode::kCausal,
+          AttentionVariant, Params>(
+          params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
+    } else {
+      status = flashinfer::SinglePrefillWithKVCacheDispatched<
+          HEAD_DIM, HEAD_DIM,
+          flashinfer::PosEncodingMode::kNone,
+          false,
+          flashinfer::MaskMode::kNone,
+          AttentionVariant, Params>(
+          params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
+    }
+  });
+
+  if (status != cudaSuccess) {
+    fprintf(stderr, "glm_flash_prefill failed: %s\n", cudaGetErrorString(status));
+  }
+}
 
 void glm_flash_decode(
     GlmCtx* ctx,
@@ -973,6 +1043,137 @@ void glm_mla_kv_cache_append(
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_mla_kv_cache_append failed: %s\n", cudaGetErrorString(status));
   }
+}
+
+} // extern "C"
+
+// ---------------------------------------------------------------------------
+// Concat and Cache DS-MLA: BF16 ckv + kpe → packed FP8 paged cache
+//
+// Per-token layout (656 bytes for kv_lora_rank=512, pe_dim=64):
+//   [0, kv_lora_rank)              FP8 e4m3 quantized ckv
+//   [kv_lora_rank, +num_tiles*4)   num_tiles × FP32 per-128-block scales
+//   [kv_lora_rank+num_tiles*4, BPT)  BF16 kpe (raw copy, not quantized)
+// ---------------------------------------------------------------------------
+
+template <int KV_LORA_RANK, int PE_DIM>
+__global__ void concat_and_cache_ds_mla_kernel(
+    uint8_t* __restrict__ kv_cache,
+    const __nv_bfloat16* __restrict__ append_ckv,
+    const __nv_bfloat16* __restrict__ append_kpe,
+    const int32_t* __restrict__ indices,
+    const int32_t* __restrict__ indptr,
+    const int32_t* __restrict__ batch_indices,
+    const int32_t* __restrict__ positions,
+    int page_size,
+    size_t ckv_stride_n, size_t kpe_stride_n
+) {
+    constexpr int SCALE_BLOCK = 128;
+    constexpr int NUM_TILES = KV_LORA_RANK / SCALE_BLOCK;
+    constexpr int THREADS_PER_TILE = SCALE_BLOCK / 8;
+    constexpr int NOPE_THREADS = NUM_TILES * THREADS_PER_TILE;
+    constexpr unsigned NOPE_MASK = (NOPE_THREADS >= 32) ? 0xFFFFFFFFu : ((1u << NOPE_THREADS) - 1u);
+    constexpr int SCALE_BYTES = NUM_TILES * 4;
+    constexpr int BPT = KV_LORA_RANK + SCALE_BYTES + PE_DIM * 2;
+    constexpr float kFp8ScaleDivisor = 448.f;
+
+    const int token_idx = blockIdx.x;
+
+    const int batch = batch_indices[token_idx];
+    const int pos = positions[token_idx];
+    const int page_in_seq = pos / page_size;
+    const int offset_in_page = pos % page_size;
+    const int page_id = indices[indptr[batch] + page_in_seq];
+    const size_t slot = (size_t)page_id * page_size + offset_in_page;
+
+    uint8_t* dst = kv_cache + slot * BPT;
+    const __nv_bfloat16* src_ckv = append_ckv + (size_t)token_idx * ckv_stride_n;
+    const __nv_bfloat16* src_kpe = append_kpe + (size_t)token_idx * kpe_stride_n;
+
+    if (threadIdx.x >= NOPE_THREADS) {
+        const int pe_idx = (threadIdx.x - NOPE_THREADS) * 2;
+        if (pe_idx < PE_DIM) {
+            int32_t vals = *reinterpret_cast<const int32_t*>(&src_kpe[pe_idx]);
+            *reinterpret_cast<int32_t*>(&dst[KV_LORA_RANK + SCALE_BYTES + pe_idx * 2]) = vals;
+        }
+        return;
+    }
+
+    const int tile_idx = threadIdx.x / THREADS_PER_TILE;
+    const int lane_in_tile = threadIdx.x % THREADS_PER_TILE;
+
+    const int src_offset = threadIdx.x * 8;
+    int4 vals_i4 = *reinterpret_cast<const int4*>(&src_ckv[src_offset]);
+    const __nv_bfloat16* vals = reinterpret_cast<const __nv_bfloat16*>(&vals_i4);
+
+    float max_abs = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        max_abs = fmaxf(max_abs, fabsf(__bfloat162float(vals[i])));
+    }
+
+    #pragma unroll
+    for (int mask = 8; mask > 0; mask /= 2) {
+        max_abs = fmaxf(max_abs, __shfl_xor_sync(NOPE_MASK, max_abs, mask, 16));
+    }
+
+    float tile_scale = fmaxf(max_abs / kFp8ScaleDivisor, FLT_MIN);
+
+    if (lane_in_tile == 0) {
+        float* scale_dst = reinterpret_cast<float*>(&dst[KV_LORA_RANK]);
+        scale_dst[tile_idx] = tile_scale;
+    }
+
+    uint8_t result[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        float val = __bfloat162float(vals[i]) / tile_scale;
+        result[i] = __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E4M3);
+    }
+    uint32_t* result32 = reinterpret_cast<uint32_t*>(result);
+    *reinterpret_cast<uint32_t*>(&dst[src_offset]) = result32[0];
+    *reinterpret_cast<uint32_t*>(&dst[src_offset + 4]) = result32[1];
+}
+
+extern "C" {
+
+void glm_concat_and_cache_ds_mla(
+    GlmCtx* ctx,
+    void* kv_cache,
+    void* append_ckv, void* append_kpe,
+    int32_t* indices, int32_t* indptr,
+    int32_t* batch_indices, int32_t* positions,
+    uint32_t nnz, uint32_t page_size,
+    uint32_t kv_lora_rank, uint32_t pe_dim,
+    size_t append_ckv_stride_n, size_t append_kpe_stride_n
+) {
+    cudaSetDevice(ctx->device_id);
+
+    if (kv_lora_rank == 512 && pe_dim == 64) {
+        constexpr int BLOCK_SIZE = 96;
+        concat_and_cache_ds_mla_kernel<512, 64><<<nnz, BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+            (uint8_t*)kv_cache,
+            (const __nv_bfloat16*)append_ckv,
+            (const __nv_bfloat16*)append_kpe,
+            indices, indptr, batch_indices, positions,
+            page_size, append_ckv_stride_n, append_kpe_stride_n);
+    } else if (kv_lora_rank == 128 && pe_dim == 64) {
+        constexpr int BLOCK_SIZE = 64;
+        concat_and_cache_ds_mla_kernel<128, 64><<<nnz, BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+            (uint8_t*)kv_cache,
+            (const __nv_bfloat16*)append_ckv,
+            (const __nv_bfloat16*)append_kpe,
+            indices, indptr, batch_indices, positions,
+            page_size, append_ckv_stride_n, append_kpe_stride_n);
+    } else {
+        fprintf(stderr, "glm_concat_and_cache_ds_mla: unsupported kv_lora_rank=%u pe_dim=%u\n",
+                kv_lora_rank, pe_dim);
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm_concat_and_cache_ds_mla failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 } // extern "C"

@@ -82,7 +82,7 @@ function loadConfig(modelDir: string): Glm51Config {
     normTopkProb: raw.norm_topk_prob ?? false,
     routedScalingFactor: raw.routed_scaling_factor ?? 1.0,
     indexTopk: raw.index_topk ?? 256,
-    indexHeadDim: raw.index_head_dim ?? 64,
+    indexHeadDim: true ? 0 : raw.index_head_dim ?? 64,
     indexNHeads: raw.index_n_heads ?? 4,
     ropeInterleave: raw.rope_interleave ?? false,
     indexerRopeInterleave: raw.indexer_rope_interleave ?? raw.rope_interleave ?? false,
