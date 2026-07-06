@@ -346,7 +346,7 @@ export class MetaOps implements DeviceOps {
         return undefined as never;
     }
 
-    mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): void {
+    mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): void {
     }
 
     gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, numPages: number, batchSize: number, pageSize: number, D: number, totalKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor {

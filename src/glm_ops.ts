@@ -942,8 +942,8 @@ export class GlmOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): void {
-    getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), ptr(kpeData), ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), ptr(appendKpe), ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
+  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): void {
+    getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), kpeData ? ptr(kpeData) : 0, ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), appendKpe ? ptr(appendKpe) : 0, ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
   }
 
   cpMergeTree(vPtrs: number[], lsePtrs: number[], numShards: number, outputV: Tensor, outputLse: Tensor | null, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void {

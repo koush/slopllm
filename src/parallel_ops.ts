@@ -2752,20 +2752,20 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
+  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
     const pCkvData = this.cast(ckvData);
-    const pKpeData = this.cast(kpeData);
+    const pKpeData = kpeData ? this.cast(kpeData) : null;
     const pIndices = this.cast(indices);
     const pIndptr = this.cast(indptr);
     const pLastPageLen = this.cast(lastPageLen);
     const pAppendCkv = this.cast(appendCkv);
-    const pAppendKpe = this.cast(appendKpe);
+    const pAppendKpe = appendKpe ? this.cast(appendKpe) : null;
     const pBatchIndices = this.cast(batchIndices);
     const pPositions = this.cast(positions);
     const effectiveCpWorldSize = contextParallel ? this.worldSize : undefined;
     for (let i = 0; i < this.worldSize; i++) {
       const effectiveCpRank = contextParallel ? i : undefined;
-      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, contextParallel, effectiveCpWorldSize, effectiveCpRank);
+      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData?.shards[i] ?? null, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe?.shards[i] ?? null, pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, contextParallel, effectiveCpWorldSize, effectiveCpRank);
     }
   }
 
