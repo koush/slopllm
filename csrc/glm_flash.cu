@@ -913,6 +913,47 @@ void glm_mla_kv_cache_append(
   constexpr uint32_t vec_size = 2;
   cudaError_t status = cudaSuccess;
 
+  // Indexer K-only append: head_dim_kpe == 0 skips kpe writes (kernel guard: tx*vec_size < 0)
+  if (head_dim_kpe == 0) {
+    if (head_dim_ckv == 128) {
+      constexpr uint32_t HC = 128;
+      uint32_t bdx = HC / vec_size;
+      auto kernel = flashinfer::AppendPagedKVMlaCacheKernel<HC, 0, vec_size, DType, IdType>;
+      int num_blocks_per_sm = 0;
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, bdx, 0);
+      num_blocks_per_sm = std::min(num_blocks_per_sm, (int)((nnz + num_sms - 1) / num_sms));
+      dim3 nblks(num_blocks_per_sm * num_sms);
+      dim3 nthrs(bdx);
+      void* args[] = {(void*)&paged_kv, (void*)&append_ckv, (void*)&append_kpe,
+                      (void*)&batch_indices, (void*)&positions, (void*)&nnz,
+                      (void*)&append_ckv_stride_n, (void*)&append_kpe_stride_n,
+                      (void*)&cp_rank, (void*)&cp_world_size};
+      cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, GLM_STREAM(ctx));
+      status = cudaGetLastError();
+    } else if (head_dim_ckv == 64) {
+      constexpr uint32_t HC = 64;
+      uint32_t bdx = HC / vec_size;
+      auto kernel = flashinfer::AppendPagedKVMlaCacheKernel<HC, 0, vec_size, DType, IdType>;
+      int num_blocks_per_sm = 0;
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, bdx, 0);
+      num_blocks_per_sm = std::min(num_blocks_per_sm, (int)((nnz + num_sms - 1) / num_sms));
+      dim3 nblks(num_blocks_per_sm * num_sms);
+      dim3 nthrs(bdx);
+      void* args[] = {(void*)&paged_kv, (void*)&append_ckv, (void*)&append_kpe,
+                      (void*)&batch_indices, (void*)&positions, (void*)&nnz,
+                      (void*)&append_ckv_stride_n, (void*)&append_kpe_stride_n,
+                      (void*)&cp_rank, (void*)&cp_world_size};
+      cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, GLM_STREAM(ctx));
+      status = cudaGetLastError();
+    } else {
+      fprintf(stderr, "glm_mla_kv_cache_append: unsupported indexer head_dim_ckv=%u\n", head_dim_ckv);
+    }
+    if (status != cudaSuccess) {
+      fprintf(stderr, "glm_mla_kv_cache_append failed: %s\n", cudaGetErrorString(status));
+    }
+    return;
+  }
+
   DISPATCH_MLA_HEAD_DIMS(head_dim_ckv, head_dim_kpe, {
     uint32_t bdx = HEAD_DIM_CKV / vec_size;
     auto kernel = flashinfer::AppendPagedKVMlaCacheKernel<HEAD_DIM_CKV, HEAD_DIM_KPE, vec_size, DType, IdType>;

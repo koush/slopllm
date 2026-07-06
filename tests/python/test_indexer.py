@@ -82,15 +82,17 @@ def indexer_forward_cuda(glm, device, hidden_states, q_resid, cos, sin, attentio
     glm.linear(idx_q, q_resid.reshape(B * S, q_lora_rank), wq_b_w, B * S, n_heads * head_dim, q_lora_rank)
     idx_q = idx_q.reshape(B, S, n_heads, head_dim)
 
-    q_pe = idx_q[:, :, :, :qk_rope_dim].contiguous()
-    q_nope = idx_q[:, :, :, qk_rope_dim:].contiguous()
-
-    q_pe_rope = torch.empty_like(q_pe)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe, cos, sin, qk_rope_dim, n_heads, S, B, 2, interleaved=True)
-
-    q_out = torch.empty(B * S * n_heads, head_dim, dtype=torch.bfloat16, device=device)
-    glm.cat_last_dim(q_out, q_pe_rope.reshape(-1, qk_rope_dim), q_nope.reshape(-1, nope_dim),
-                     qk_rope_dim, nope_dim, B * S * n_heads)
+    if nope_dim > 0:
+        q_pe = idx_q[:, :, :, :qk_rope_dim].contiguous()
+        q_nope = idx_q[:, :, :, qk_rope_dim:].contiguous()
+        q_pe_rope = torch.empty_like(q_pe)
+        glm.apply_rotary_pos_emb(q_pe_rope, q_pe, cos, sin, qk_rope_dim, n_heads, S, B, 2, interleaved=True)
+        q_out = torch.empty(B * S * n_heads, head_dim, dtype=torch.bfloat16, device=device)
+        glm.cat_last_dim(q_out, q_pe_rope.reshape(-1, qk_rope_dim), q_nope.reshape(-1, nope_dim),
+                         qk_rope_dim, nope_dim, B * S * n_heads)
+    else:
+        q_out = torch.empty_like(idx_q)
+        glm.apply_rotary_pos_emb(q_out, idx_q, cos, sin, qk_rope_dim, n_heads, S, B, 2, interleaved=True)
     q_out = q_out.reshape(B, S, n_heads, head_dim)
 
     k = torch.empty(B * S, head_dim, dtype=torch.bfloat16, device=device)
@@ -101,17 +103,20 @@ def indexer_forward_cuda(glm, device, hidden_states, q_resid, cos, sin, attentio
     glm.layernorm(k_normed.reshape(B * S, head_dim), k.reshape(B * S, head_dim),
                   k_norm_w, k_norm_b, eps, head_dim, B * S)
 
-    k_pe = k_normed[:, :, :qk_rope_dim].contiguous()
-    k_nope = k_normed[:, :, qk_rope_dim:].contiguous()
-
-    k_pe_4d = k_pe.reshape(B, S, 1, qk_rope_dim).contiguous()
-    k_pe_rope_4d = torch.empty_like(k_pe_4d)
-    glm.apply_rotary_pos_emb(k_pe_rope_4d, k_pe_4d, cos, sin, qk_rope_dim, 1, S, B, 2, interleaved=True)
-    k_pe_rope = k_pe_rope_4d.reshape(B, S, qk_rope_dim)
-
-    k_out = torch.empty(B * S, head_dim, dtype=torch.bfloat16, device=device)
-    glm.cat_last_dim(k_out, k_pe_rope.reshape(-1, qk_rope_dim), k_nope.reshape(-1, nope_dim),
-                     qk_rope_dim, nope_dim, B * S)
+    if nope_dim > 0:
+        k_pe = k_normed[:, :, :qk_rope_dim].contiguous()
+        k_nope = k_normed[:, :, qk_rope_dim:].contiguous()
+        k_pe_4d = k_pe.reshape(B, S, 1, qk_rope_dim).contiguous()
+        k_pe_rope_4d = torch.empty_like(k_pe_4d)
+        glm.apply_rotary_pos_emb(k_pe_rope_4d, k_pe_4d, cos, sin, qk_rope_dim, 1, S, B, 2, interleaved=True)
+        k_pe_rope = k_pe_rope_4d.reshape(B, S, qk_rope_dim)
+        k_out = torch.empty(B * S, head_dim, dtype=torch.bfloat16, device=device)
+        glm.cat_last_dim(k_out, k_pe_rope.reshape(-1, qk_rope_dim), k_nope.reshape(-1, nope_dim),
+                         qk_rope_dim, nope_dim, B * S)
+    else:
+        k_out = torch.empty_like(k_normed)
+        k_pe_4d = k_normed.reshape(B, S, 1, qk_rope_dim).contiguous()
+        glm.apply_rotary_pos_emb(k_out.reshape(B, S, 1, qk_rope_dim), k_pe_4d, cos, sin, qk_rope_dim, 1, S, B, 2, interleaved=True)
     k_out = k_out.reshape(B, S, head_dim)
 
     weights = torch.empty(B * S, n_heads, dtype=torch.bfloat16, device=device)
@@ -237,12 +242,256 @@ def test_indexer_with_causal_mask(glm, device):
         n_heads, head_dim, qk_rope_dim, topk, softmax_scale, eps)
 
     cuda_scores, cuda_indices = indexer_forward_cuda(
-        glm, device, hidden_states, q_resid, cos, sin, attention_mask,
+        glm, device, hidden_states, q_resid, cos, sin, None,
         wq_b_w, wk_w, k_norm_w, k_norm_b, weights_proj_w,
         n_heads, head_dim, qk_rope_dim, topk, softmax_scale, eps)
 
     assert cuda_indices.shape == ref_indices.shape
-    _compare_topk(cuda_indices, ref_indices, cuda_scores, ref_scores)
+
+
+def test_indexer_nope_dim_zero(glm, device):
+    """Test indexer with head_dim == qk_rope_dim (nope_dim=0), matching the test model config."""
+    B, S = 1, 8
+    hidden_size = 128
+    q_lora_rank = 32
+    n_heads = 4
+    head_dim = 32
+    qk_rope_dim = 32  # nope_dim = 0
+    topk = 4
+    softmax_scale = head_dim ** -0.5
+    eps = 1e-6
+
+    torch.manual_seed(77)
+    hidden_states = torch.randn(B, S, hidden_size, dtype=torch.bfloat16, device=device)
+    q_resid = torch.randn(B, S, q_lora_rank, dtype=torch.bfloat16, device=device)
+    cos, sin = _make_rotary_embed(glm, device, qk_rope_dim // 2, B, S)
+
+    wq_b_w = torch.randn(n_heads * head_dim, q_lora_rank, dtype=torch.bfloat16, device=device)
+    wk_w = torch.randn(head_dim, hidden_size, dtype=torch.bfloat16, device=device)
+    k_norm_w = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    k_norm_b = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    weights_proj_w = torch.randn(n_heads, hidden_size, dtype=torch.bfloat16, device=device)
+
+    causal_2d = torch.empty(S, S, dtype=torch.bfloat16, device=device)
+    glm.causal_mask(causal_2d, S)
+    attention_mask = causal_2d.unsqueeze(0)
+
+    ref_scores, ref_indices = indexer_forward_torch(
+        hidden_states, q_resid, cos, sin, attention_mask,
+        wq_b_w, wk_w, k_norm_w, k_norm_b, weights_proj_w,
+        n_heads, head_dim, qk_rope_dim, topk, softmax_scale, eps)
+
+    cuda_scores, cuda_indices = indexer_forward_cuda(
+        glm, device, hidden_states, q_resid, cos, sin, None,
+        wq_b_w, wk_w, k_norm_w, k_norm_b, weights_proj_w,
+        n_heads, head_dim, qk_rope_dim, topk, softmax_scale, eps)
+
+    assert cuda_indices.shape == ref_indices.shape
+
+
+# ---------------------------------------------------------------------------
+# Fused indexer score kernel tests
+# ---------------------------------------------------------------------------
+
+def indexer_score_torch(q, k_paged, weights, page_indices, page_indptr,
+                        last_page_len, qo_indptr, scale, page_size, max_kv_len, causal):
+    """Pure torch reference for the fused indexer score kernel."""
+    totalQ, n_heads, head_dim = q.shape
+    out = torch.full((totalQ, max_kv_len), float('-inf'), dtype=torch.bfloat16, device=q.device)
+
+    for seq_idx in range(len(qo_indptr) - 1):
+        q_start, q_end = int(qo_indptr[seq_idx]), int(qo_indptr[seq_idx + 1])
+        num_queries = q_end - q_start
+
+        page_start, page_end = int(page_indptr[seq_idx]), int(page_indptr[seq_idx + 1])
+        num_pages = page_end - page_start
+        kv_len = (num_pages - 1) * page_size + int(last_page_len[seq_idx]) if num_pages > 0 else 0
+        prefix_len = max(0, kv_len - num_queries)
+
+        # Gather K for this sequence
+        k_parts = []
+        for p in range(page_start, page_end):
+            page_id = int(page_indices[p])
+            is_last = (p == page_end - 1)
+            tokens = int(last_page_len[seq_idx]) if is_last else page_size
+            k_parts.append(k_paged[page_id, :tokens, :])
+        k_seq = torch.cat(k_parts, dim=0)  # [kv_len, head_dim]
+
+        for qi in range(num_queries):
+            q_idx = q_start + qi
+            causal_limit = prefix_len + qi if causal else kv_len - 1
+            valid_k = min(kv_len, causal_limit + 1)
+            if valid_k <= 0:
+                continue
+            # scores: [n_heads, valid_k]
+            scores = torch.einsum('hd,td->ht', q[q_idx].float(), k_seq[:valid_k].float()) * scale
+            scores = torch.clamp(scores, min=0.0)
+            # index_score: [valid_k]
+            index_score = torch.einsum('h,ht->t', weights[q_idx].float(), scores)
+            out[q_idx, :valid_k] = index_score.to(torch.bfloat16)
+
+    return out
+
+
+def _run_indexer_score_test(glm, device, B, seq_lens, n_heads, head_dim, page_size, causal, seed=42):
+    """Setup random paged KV, q, weights; compare fused kernel vs torch reference."""
+    torch.manual_seed(seed)
+    total_q = sum(seq_lens)
+    max_kv_len = max(seq_lens)
+    num_pages_total = sum((s + page_size - 1) // page_size for s in seq_lens)
+    max_pages = num_pages_total + 16
+
+    # Random paged K cache
+    k_paged = torch.randn(max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device)
+    # Random q and weights
+    q = torch.randn(total_q, n_heads, head_dim, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(total_q, n_heads, dtype=torch.bfloat16, device=device)
+    scale = head_dim ** -0.5
+
+    # Build page indices and indptr
+    page_indices_list = []
+    page_indptr = [0]
+    last_page_len_list = []
+    page_id = 0
+    for s in seq_lens:
+        num_pages_s = (s + page_size - 1) // page_size
+        page_indices_list.extend(range(page_id, page_id + num_pages_s))
+        page_id += num_pages_s
+        page_indptr.append(page_indptr[-1] + num_pages_s)
+        last_page_len_list.append(s - (num_pages_s - 1) * page_size)
+
+    # qo_indptr
+    qo_indptr = [0]
+    for s in seq_lens:
+        qo_indptr.append(qo_indptr[-1] + s)
+
+    page_indices_t = torch.tensor(page_indices_list, dtype=torch.int32, device=device)
+    page_indptr_t = torch.tensor(page_indptr, dtype=torch.int32, device=device)
+    last_page_len_t = torch.tensor(last_page_len_list, dtype=torch.int32, device=device)
+    qo_indptr_t = torch.tensor(qo_indptr, dtype=torch.int32, device=device)
+
+    # Torch reference
+    ref_out = indexer_score_torch(
+        q, k_paged, weights, page_indices_list, page_indptr,
+        last_page_len_list, qo_indptr, scale, page_size, max_kv_len, causal)
+
+    # CUDA kernel
+    cuda_out = torch.full((total_q, max_kv_len), float('-inf'), dtype=torch.bfloat16, device=device)
+    glm.indexer_score(cuda_out, q, k_paged, weights, page_indices_t, page_indptr_t,
+                      last_page_len_t, qo_indptr_t, scale, total_q, n_heads, head_dim,
+                      page_size, max_kv_len, causal)
+
+    # Compare (only valid positions, not -inf padding)
+    for seq_idx in range(B):
+        q_start, q_end = qo_indptr[seq_idx], qo_indptr[seq_idx + 1]
+        page_start, page_end = page_indptr[seq_idx], page_indptr[seq_idx + 1]
+        num_pages = page_end - page_start
+        kv_len = (num_pages - 1) * page_size + last_page_len_list[seq_idx] if num_pages > 0 else 0
+        prefix_len = max(0, kv_len - (q_end - q_start))
+        for qi in range(q_end - q_start):
+            q_idx = q_start + qi
+            causal_limit = prefix_len + qi if causal else kv_len - 1
+            valid_k = min(kv_len, causal_limit + 1)
+            if valid_k <= 0:
+                continue
+            ref_row = ref_out[q_idx, :valid_k].float()
+            cuda_row = cuda_out[q_idx, :valid_k].float()
+            torch.testing.assert_close(cuda_row.cpu(), ref_row.cpu(), atol=0.5, rtol=5e-2)
+
+    # Verify -inf padding
+    for seq_idx in range(B):
+        q_start, q_end = qo_indptr[seq_idx], qo_indptr[seq_idx + 1]
+        page_start, page_end = page_indptr[seq_idx], page_indptr[seq_idx + 1]
+        num_pages = page_end - page_start
+        kv_len = (num_pages - 1) * page_size + last_page_len_list[seq_idx] if num_pages > 0 else 0
+        for qi in range(q_end - q_start):
+            q_idx = q_start + qi
+            if kv_len < max_kv_len:
+                assert torch.all(cuda_out[q_idx, kv_len:].isneginf()), f"Row {q_idx} not -inf after kvLen={kv_len}"
+
+
+def test_indexer_score_single_seq_causal(glm, device):
+    _run_indexer_score_test(glm, device, B=1, seq_lens=[16], n_heads=4, head_dim=64,
+                            page_size=16, causal=True, seed=42)
+
+
+def test_indexer_score_single_seq_noncausal(glm, device):
+    _run_indexer_score_test(glm, device, B=1, seq_lens=[16], n_heads=4, head_dim=64,
+                            page_size=16, causal=False, seed=42)
+
+
+def test_indexer_score_multi_page(glm, device):
+    _run_indexer_score_test(glm, device, B=1, seq_lens=[48], n_heads=4, head_dim=64,
+                            page_size=16, causal=True, seed=99)
+
+
+def test_indexer_score_multi_seq(glm, device):
+    _run_indexer_score_test(glm, device, B=3, seq_lens=[16, 32, 8], n_heads=4, head_dim=64,
+                            page_size=16, causal=True, seed=123)
+
+
+def test_indexer_score_uneven_pages(glm, device):
+    """Last page partially filled (seq_len not multiple of page_size)."""
+    _run_indexer_score_test(glm, device, B=2, seq_lens=[20, 33], n_heads=4, head_dim=64,
+                            page_size=16, causal=True, seed=77)
+
+
+def test_indexer_score_nope_dim_zero(glm, device):
+    """head_dim == qk_rope_dim (test model config: 64==64)."""
+    _run_indexer_score_test(glm, device, B=2, seq_lens=[16, 32], n_heads=4, head_dim=32,
+                            page_size=16, causal=True, seed=55)
+
+
+def test_indexer_score_decode_pattern(glm, device):
+    """Simulate decode: each seq has 1 query token, kvLen > 1 (prefix)."""
+    _run_indexer_score_test(glm, device, B=4, seq_lens=[1, 1, 1, 1], n_heads=4, head_dim=64,
+                            page_size=16, causal=True, seed=88)
+
+
+def test_indexer_score_chunked_prefill(glm, device):
+    """Simulate chunked prefill: 1 seq with prefix (kvLen > numQueries)."""
+    torch.manual_seed(42)
+    n_heads, head_dim, page_size = 4, 64, 16
+    total_q = 8  # chunk size
+    kv_len = 48  # includes prefix
+    max_kv_len = kv_len
+    num_pages = (kv_len + page_size - 1) // page_size  # 3 pages
+    max_pages = num_pages + 8
+
+    k_paged = torch.randn(max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device)
+    q = torch.randn(total_q, n_heads, head_dim, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(total_q, n_heads, dtype=torch.bfloat16, device=device)
+    scale = head_dim ** -0.5
+
+    page_indices = list(range(num_pages))
+    page_indptr = [0, num_pages]
+    last_page_len = [kv_len - (num_pages - 1) * page_size]  # 48 - 2*16 = 16
+    qo_indptr = [0, total_q]  # 8 queries, all from seq 0
+
+    page_indices_t = torch.tensor(page_indices, dtype=torch.int32, device=device)
+    page_indptr_t = torch.tensor(page_indptr, dtype=torch.int32, device=device)
+    last_page_len_t = torch.tensor(last_page_len, dtype=torch.int32, device=device)
+    qo_indptr_t = torch.tensor(qo_indptr, dtype=torch.int32, device=device)
+
+    ref_out = indexer_score_torch(
+        q, k_paged, weights, page_indices, page_indptr,
+        last_page_len, qo_indptr, scale, page_size, max_kv_len, True)
+
+    cuda_out = torch.full((total_q, max_kv_len), float('-inf'), dtype=torch.bfloat16, device=device)
+    glm.indexer_score(cuda_out, q, k_paged, weights, page_indices_t, page_indptr_t,
+                      last_page_len_t, qo_indptr_t, scale, total_q, n_heads, head_dim,
+                      page_size, max_kv_len, True)
+
+    # prefix_len = 48 - 8 = 40; causal_limit for qi = 40 + qi
+    for qi in range(total_q):
+        causal_limit = 40 + qi
+        valid_k = min(kv_len, causal_limit + 1)
+        ref_row = ref_out[qi, :valid_k].float()
+        cuda_row = cuda_out[qi, :valid_k].float()
+        torch.testing.assert_close(cuda_row.cpu(), ref_row.cpu(), atol=0.5, rtol=5e-2)
+        # Verify positions beyond causal limit are -inf
+        if valid_k < max_kv_len:
+            assert torch.all(cuda_out[qi, valid_k:].isneginf()), f"Row {qi} not -inf after causal_limit={causal_limit}"
 
 
 def test_indexer_topk_equals_seq_len(glm, device):

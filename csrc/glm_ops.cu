@@ -99,6 +99,10 @@ __device__ __forceinline__ float silu_f(float x) {
     return x * 0.5f * (fast_tanh(0.5f * x) + 1.0f);
 }
 
+__device__ __forceinline__ float relu_f(float x) {
+    return x > 0.0f ? x : 0.0f;
+}
+
 // ---------------------------------------------------------------------------
 // BF16 vector I/O helpers now live in glm_ops.h (shared across .cu TUs).
 // ---------------------------------------------------------------------------
@@ -1144,8 +1148,6 @@ void glm_gate_sigmoid_mul(
 // ReLU
 // ---------------------------------------------------------------------------
 
-static __device__ __forceinline__ float relu_f(float v) { return fmaxf(v, 0.0f); }
-
 void glm_relu(GlmCtx* ctx, void* out, const void* input, int n) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
@@ -1245,20 +1247,22 @@ void glm_softmax(GlmCtx* ctx, void* out, const void* input,
 
 // ---------------------------------------------------------------------------
 // Causal mask kernel
-// Fills upper triangle with -inf: out[i][j] = (j > i) ? -inf : 0
-// out: [seq_len, seq_len] BF16
+// Fills upper triangle with -inf: out[i][j] = (j > offset + i) ? -inf : 0
+// out: [rows, cols] BF16
 // ---------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(256, 4) causal_mask_kernel(
     __nv_bfloat16* out,
-    int seq_len
+    int rows,
+    int cols,
+    int offset
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = seq_len * seq_len;
+    int total = rows * cols;
     if (idx < total) {
-        int row = idx / seq_len;
-        int col = idx % seq_len;
-        float val = (col > row) ? -INFINITY : 0.0f;
+        int row = idx / cols;
+        int col = idx % cols;
+        float val = (col > offset + row) ? -INFINITY : 0.0f;
         out[idx] = __float2bfloat16(val);
     }
 }
@@ -1269,7 +1273,134 @@ void glm_causal_mask(GlmCtx* ctx, void* out, int seq_len) {
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
     causal_mask_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, seq_len);
+        (__nv_bfloat16*)out, seq_len, seq_len, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Fused indexer score kernel
+// Computes: out[qi, ki] = sum_h weights[qi,h] * ReLU(sum_d q[qi,h,d] * k[ki,d]) * scale)
+// Reads K from paged cache. One block per query token. One warp per head.
+// Invalid positions (beyond kvLen or causal limit) remain -inf.
+// ---------------------------------------------------------------------------
+
+__global__ void indexer_score_kernel(
+    __nv_bfloat16* __restrict__ out,          // [totalQ, maxKvLen]
+    const __nv_bfloat16* __restrict__ q,      // [totalQ, idxNHeads, idxHeadDim]
+    const __nv_bfloat16* __restrict__ kData,  // [maxPages, pageSize, idxHeadDim]
+    const __nv_bfloat16* __restrict__ weights,// [totalQ, idxNHeads]
+    const int32_t* __restrict__ pageIndices,  // [numPages]
+    const int32_t* __restrict__ pageIndptr,   // [B+1]
+    const int32_t* __restrict__ lastPageLen,  // [B]
+    const int32_t* __restrict__ qoIndptr,     // [B+1]
+    float scale,
+    int idxNHeads, int idxHeadDim, int pageSize, int maxKvLen,
+    int causal
+) {
+    const int qIdx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warpIdx = tid / 32;
+    const int lane = tid % 32;
+
+    // Find sequence for this query (linear scan, B is small)
+    int seq = 0;
+    while (qoIndptr[seq + 1] <= qIdx) seq++;
+
+    const int qLocalPos = qIdx - qoIndptr[seq];
+    const int numQueries = qoIndptr[seq + 1] - qoIndptr[seq];
+
+    const int pageStart = pageIndptr[seq];
+    const int pageEnd = pageIndptr[seq + 1];
+    const int numPages = pageEnd - pageStart;
+    const int kvLen = numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0;
+    const int prefixLen = max(0, kvLen - numQueries);
+    const int causalLimit = causal ? (prefixLen + qLocalPos) : (kvLen - 1);
+
+    // Shared memory: q [idxNHeads*idxHeadDim] + weights [idxNHeads] + scores [idxNHeads]
+    extern __shared__ char smem[];
+    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem);
+    __nv_bfloat16* w_s = q_s + idxNHeads * idxHeadDim;
+    float* score_s = reinterpret_cast<float*>(w_s + idxNHeads);
+
+    // Load q into shared memory
+    for (int i = tid; i < idxNHeads * idxHeadDim; i += blockDim.x) {
+        q_s[i] = q[(size_t)qIdx * idxNHeads * idxHeadDim + i];
+    }
+    // Load weights
+    if (tid < idxNHeads) {
+        w_s[tid] = weights[qIdx * idxNHeads + tid];
+    }
+    // Initialize output row to -inf
+    for (int i = tid; i < maxKvLen; i += blockDim.x) {
+        out[(size_t)qIdx * maxKvLen + i] = __float2bfloat16(-INFINITY);
+    }
+    __syncthreads();
+
+    // Iterate over pages
+    for (int pageIdx = pageStart; pageIdx < pageEnd; pageIdx++) {
+        const int localPageIdx = pageIdx - pageStart;
+        const int firstLocalK = localPageIdx * pageSize;
+        if (firstLocalK > causalLimit) break;
+
+        const int32_t pageId = pageIndices[pageIdx];
+        const bool isLastPage = (pageIdx == pageEnd - 1);
+        const int tokensInPage = isLastPage ? lastPageLen[seq] : pageSize;
+
+        for (int t = 0; t < tokensInPage; t++) {
+            const int localK = firstLocalK + t;
+            if (localK > causalLimit) break;
+
+            // Each warp computes one head's dot product
+            if (warpIdx < idxNHeads) {
+                const __nv_bfloat16* k_ptr = kData + (size_t)pageId * pageSize * idxHeadDim + t * idxHeadDim;
+                const __nv_bfloat16* q_ptr = q_s + warpIdx * idxHeadDim;
+
+                float partial = 0.0f;
+                for (int d = lane; d < idxHeadDim; d += 32) {
+                    partial += __bfloat162float(q_ptr[d]) * __bfloat162float(k_ptr[d]);
+                }
+                // Warp reduce
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    partial += __shfl_xor_sync(0xffffffff, partial, offset);
+                }
+                if (lane == 0) {
+                    partial *= scale;
+                    partial = fmaxf(partial, 0.0f);
+                    score_s[warpIdx] = partial;
+                }
+            }
+
+            __syncthreads();
+
+            // Thread 0 computes weighted sum and writes output
+            if (tid == 0) {
+                float indexScore = 0.0f;
+                for (int h = 0; h < idxNHeads; h++) {
+                    indexScore += __bfloat162float(w_s[h]) * score_s[h];
+                }
+                out[(size_t)qIdx * maxKvLen + localK] = __float2bfloat16(indexScore);
+            }
+
+            __syncthreads();
+        }
+    }
+}
+
+void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
+                       const void* weights, const int32_t* pageIndices,
+                       const int32_t* pageIndptr, const int32_t* lastPageLen,
+                       const int32_t* qoIndptr, float scale,
+                       int totalQ, int idxNHeads, int idxHeadDim,
+                       int pageSize, int maxKvLen, int causal) {
+    cudaSetDevice(ctx->device_id);
+    int block_size = idxNHeads * 32;
+    if (block_size > 1024) block_size = 1024;
+    int smem_size = idxNHeads * idxHeadDim * sizeof(__nv_bfloat16)  // q_s
+                  + idxNHeads * sizeof(__nv_bfloat16)                // w_s
+                  + idxNHeads * sizeof(float);                       // score_s
+    indexer_score_kernel<<<totalQ, block_size, smem_size, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
+        (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
+        scale, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal);
 }
 
 // ---------------------------------------------------------------------------

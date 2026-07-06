@@ -916,6 +916,17 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, shards, [batch, dim], this.type, TensorParallelism.Replicated);
   }
 
+  layernorm(weight: Tensor, bias: Tensor, eps: number, dim: number, batch: number): Tensor {
+    super.layernorm(weight, bias, eps, dim, batch);
+    const pWeight = weight as ParallelTensor;
+    const pBias = bias as ParallelTensor;
+    const shards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      shards.push(this.shards[i].layernorm(pWeight.shards[i], pBias.shards[i], eps, dim, batch));
+    }
+    return this.parallelOps.wrapShards(this.workspace, shards, [batch, dim], this.type, TensorParallelism.Replicated);
+  }
+
   fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
     super.fusedAddRmsnorm(input, weight, eps, dim, batch);
     const pInput = input as ParallelTensor;
@@ -2777,12 +2788,11 @@ export class ParallelOps implements DeviceOps {
     const pKvIndptr = this.cast(kvTokenIndptrD);
 
     if (!contextParallel) {
-      const out = srcData.workspace.alloc([totalKvLen, D], "BF16") as ParallelTensor;
-      const pOut = this.cast(out);
+      const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], numPages, batchSize, pageSize, D, totalKvLen, pKvIndptr.shards[i], false);
+        shards.push(this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], numPages, batchSize, pageSize, D, totalKvLen, pKvIndptr.shards[i], false));
       }
-      return out;
+      return this.wrapShards(srcData.workspace, shards, [totalKvLen, D], "BF16", pSrc.parallelism);
     }
 
     // CP: each GPU has every Nth token within each page (Row-parallel, sharded on pageSize dim)
@@ -2814,6 +2824,20 @@ export class ParallelOps implements DeviceOps {
       );
     }
     return out;
+  }
+
+  indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void {
+    const pOut = this.cast(out);
+    const pQ = this.cast(q);
+    const pKData = this.cast(kData);
+    const pWeights = this.cast(weights);
+    const pIndices = this.cast(pageIndices);
+    const pIndptr = this.cast(pageIndptr);
+    const pLastPageLen = this.cast(lastPageLen);
+    const pQoIndptr = this.cast(qoIndptr);
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].indexerScore(pOut.shards[i], pQ.shards[i], pKData.shards[i], pWeights.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal);
+    }
   }
 
   private graphHandles: (number | undefined)[][] = [];

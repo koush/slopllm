@@ -66,6 +66,11 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([batch, dim], this.type);
     }
 
+    layernorm(weight: Tensor, bias: Tensor, eps: number, dim: number, batch: number): Tensor {
+        super.layernorm(weight, bias, eps, dim, batch);
+        return this.workspace.alloc([batch, dim], this.type);
+    }
+
     fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
         super.fusedAddRmsnorm(input, weight, eps, dim, batch);
         const normed = this.workspace.alloc([batch, dim], this.type);
@@ -351,6 +356,9 @@ export class MetaOps implements DeviceOps {
 
     gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, numPages: number, batchSize: number, pageSize: number, D: number, totalKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor {
         return undefined as never;
+    }
+
+    indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void {
     }
 
     graphBeginCapture(): void {

@@ -63,11 +63,14 @@ interface NativeAddon {
   writePointers(ctx: number, dst: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, n: number): void;
   d2h(ctx: number, dst: Buffer, src: number, size: number): void;
   rmsnorm(ctx: number, out: number, input: number, weight: number, eps: number, dim: number, batch: number): void;
+  layernorm(ctx: number, out: number, input: number, weight: number, bias: number, eps: number, dim: number, batch: number): void;
   fusedAddRmsnorm(ctx: number, out: number, residual: number, inputA: number, inputB: number, weight: number, eps: number, dim: number, batch: number): void;
   fusedNormRope(ctx: number, out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
   linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number): void;
   fill(ctx: number, out: number, value: number, n: number): void;
+  causalMask(ctx: number, out: number, seqLen: number): void;
+  indexerScore(ctx: number, out: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
   applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number, offset: number): void;
@@ -148,6 +151,7 @@ interface NativeAddon {
   p2pBarrier(ctx: number, instance: number, peerRank?: number): void;
   cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads: number, headOffset: number, inputNHeads: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
+  relu(ctx: number, out: number, input: number, n: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number, offset: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;
   add(ctx: number, out: number, a: number, b: number, n: number): void;
@@ -274,6 +278,13 @@ export class GlmTensor extends Tensor {
     super.rmsnorm(weight, eps, dim, batch);
     const out = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().rmsnorm(this.glm.ctx, out.data, this.data, weight.data, eps, dim, batch);
+    return out;
+  }
+
+  layernorm(weight: Tensor, bias: Tensor, eps: number, dim: number, batch: number): Tensor {
+    super.layernorm(weight, bias, eps, dim, batch);
+    const out = this.workspace.alloc([batch, dim], this.type);
+    getNativeAddon().layernorm(this.glm.ctx, out.data, this.data, weight.data, bias.data, eps, dim, batch);
     return out;
   }
 
@@ -851,6 +862,10 @@ export class GlmOps implements DeviceOps {
     const out = srcData.workspace.alloc([totalKvLen, D], "BF16");
     getNativeAddon().gatherPages(this.ctx, out.data, srcData.data, pageIndices.data, pageIndptrD.data, lastPageLen.data, numPages, batchSize, pageSize, D);
     return out;
+  }
+
+  indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void {
+    getNativeAddon().indexerScore(this.ctx, out.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal ? 1 : 0);
   }
 
   positionStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number, steps = 1): void {

@@ -79,6 +79,13 @@ void glm_softmax(GlmCtx* ctx, void* out, const void* input,
 
 void glm_causal_mask(GlmCtx* ctx, void* out, int seq_len);
 
+void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
+                       const void* weights, const int32_t* pageIndices,
+                       const int32_t* pageIndptr, const int32_t* lastPageLen,
+                       const int32_t* qoIndptr, float scale,
+                       int totalQ, int idxNHeads, int idxHeadDim,
+                       int pageSize, int maxKvLen, int causal);
+
 void glm_fill(GlmCtx* ctx, void* out, float value, int n);
 
 void glm_gather(GlmCtx* ctx, void* out, const void* input, const int* indices,

@@ -225,6 +225,14 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
+        self.lib.glm_indexer_score.restype = None
+        self.lib.glm_indexer_score.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+        ]
+
         self.lib.glm_cat_last_dim.restype = None
         self.lib.glm_cat_last_dim.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -1081,6 +1089,23 @@ class GlmOps:
             self._ptr(page_indptr),
             self._ptr(last_page_len),
             num_pages, batch_size, page_size, D
+        )
+
+    def indexer_score(self, output, q, k_data, weights, page_indices, page_indptr,
+                      last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
+                      page_size, max_kv_len, causal):
+        self.lib.glm_indexer_score(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(q),
+            self._ptr(k_data),
+            self._ptr(weights),
+            self._ptr(page_indices),
+            self._ptr(page_indptr),
+            self._ptr(last_page_len),
+            self._ptr(qo_indptr),
+            ctypes.c_float(scale),
+            total_q, n_heads, head_dim, page_size, max_kv_len, 1 if causal else 0
         )
 
     def cat_last_dim(self, output, a, b, a_last_dim, b_last_dim, outer):

@@ -361,6 +361,45 @@ static Napi::Value CausalMask(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value IndexerScore(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 16) {
+        Napi::TypeError::New(env, "Expected (ctx, out, q, kData, weights, pageIndices, pageIndptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t q_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t kData_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t weights_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t pageIndices_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t pageIndptr_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t lastPageLen_ptr = info[7].As<Napi::Number>().Int64Value();
+    uintptr_t qoIndptr_ptr = info[8].As<Napi::Number>().Int64Value();
+    float scale = info[9].As<Napi::Number>().FloatValue();
+    int totalQ = info[10].As<Napi::Number>().Int32Value();
+    int idxNHeads = info[11].As<Napi::Number>().Int32Value();
+    int idxHeadDim = info[12].As<Napi::Number>().Int32Value();
+    int pageSize = info[13].As<Napi::Number>().Int32Value();
+    int maxKvLen = info[14].As<Napi::Number>().Int32Value();
+    int causal = info[15].As<Napi::Number>().Int32Value();
+    glm_indexer_score(reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<void*>(out_ptr),
+        reinterpret_cast<const void*>(q_ptr),
+        reinterpret_cast<const void*>(kData_ptr),
+        reinterpret_cast<const void*>(weights_ptr),
+        reinterpret_cast<const int32_t*>(pageIndices_ptr),
+        reinterpret_cast<const int32_t*>(pageIndptr_ptr),
+        reinterpret_cast<const int32_t*>(lastPageLen_ptr),
+        reinterpret_cast<const int32_t*>(qoIndptr_ptr),
+        scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("indexerScore failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value Fill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 4) {
@@ -3665,6 +3704,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "sigmoid"), Napi::Function::New(env, Sigmoid));
     exports.Set(Napi::String::New(env, "softmax"), Napi::Function::New(env, Softmax));
     exports.Set(Napi::String::New(env, "causalMask"), Napi::Function::New(env, CausalMask));
+    exports.Set(Napi::String::New(env, "indexerScore"), Napi::Function::New(env, IndexerScore));
     exports.Set(Napi::String::New(env, "fill"), Napi::Function::New(env, Fill));
     exports.Set(Napi::String::New(env, "gather"), Napi::Function::New(env, Gather));
     exports.Set(Napi::String::New(env, "scatterScalar"), Napi::Function::New(env, ScatterScalar));

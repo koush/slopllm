@@ -145,7 +145,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.lastNumSequences = this.sequences.length;
   }
 
-  constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false) {
+  constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, pageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0) {
     super(glm);
     this.nKv = nKv;
     this.hd = hd;
@@ -162,6 +162,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       if (kvLoraRank > 0) {
         this.ckvData.push(this.alloc([maxPages, pageSize, kvLoraRank], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
         this.kpeData.push(this.alloc([maxPages, pageSize, qkRopeDim], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
+        if (indexHeadDim > 0) {
+          this.kData.push(this.alloc([maxPages, pageSize, indexHeadDim], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
+        }
       } else {
         this.kData.push(this.alloc([maxPages, nKv * pageSize * hd], "BF16", undefined, TensorParallelism.Row));
         this.vData.push(this.alloc([maxPages, nKv * pageSize * hd], "BF16", undefined, TensorParallelism.Row));

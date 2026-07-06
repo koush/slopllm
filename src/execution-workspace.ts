@@ -424,6 +424,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
           for (let i = 0; i < batchSize; i++) buf.writeInt32LE(i, i * I32);
         });
         this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, batchSize * I32, MemcpyKind.HostToDevice);
+        this.qoIndptrH.withPinnedBuffer(buf => {
+          for (let i = 0; i <= batchSize; i++) buf.writeInt32LE(i, i * I32);
+        });
+        this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
       }
 
       pagedKV.positionIdsDirty = false;

@@ -213,6 +213,15 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
+  layernorm(weight: Tensor, bias: Tensor, eps: number, dim: number, batch: number): Tensor {
+    if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== dim) {
+      throw new Error(`layernorm: input shape [${this.shape}] incompatible with batch=${batch}, dim=${dim}`);
+    }
+    if (weight.numElements !== dim) throw new Error(`layernorm: weight has ${weight.numElements} elements, expected ${dim}`);
+    if (bias.numElements !== dim) throw new Error(`layernorm: bias has ${bias.numElements} elements, expected ${dim}`);
+    return undefined as never;
+  }
+
   fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
     if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== dim) {
       throw new Error(`fusedAddRmsnorm: residual shape [${this.shape}] incompatible with batch=${batch}, dim=${dim}`);

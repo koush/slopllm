@@ -58,6 +58,8 @@ export interface DeviceOps {
 
   gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, numPages: number, batchSize: number, pageSize: number, D: number, totalKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor;
 
+  indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void;
+
   graphBeginCapture(): void;
   graphEndCapture(): number;
   graphInstantiate(graph: number): number;

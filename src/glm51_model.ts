@@ -311,7 +311,7 @@ export class Glm51Model extends ChatModel {
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
     const nLayers = cfg.numHiddenLayers + (this.mtp ? cfg.numNextNPredictLayers ?? 0 : 0);
-    return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel);
+    return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim);
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
@@ -421,6 +421,8 @@ export class Glm51Model extends ChatModel {
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : totalTokens;
 
+    const pagedKV = state.cache.getPagedKV();
+
     using kvcache = this.glm.withStream(() => {
       using kPeRopeStream = this.glm.withStream(() => {
         using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!, BS);
@@ -433,9 +435,40 @@ export class Glm51Model extends ChatModel {
 
       kPeRopeStream.streamWaitEvent();
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
-    });
 
-    const pagedKV = state.cache.getPagedKV();
+      // Indexer K: wk(normed) → layernorm → split → RoPE → concat → append to kData
+      if (cfg.indexHeadDim > 0 && pagedKV.kData.length > layerIdx) {
+        const idxRopeDim = qkRopeDim;
+        const idxNopeDim = cfg.indexHeadDim - idxRopeDim;
+        using idxKRaw = normed.linear(this.tensors.get(`${pfx}.indexer.wk.weight`)!, BS);
+        using idxKNormed = idxKRaw.layernorm(
+          this.tensors.get(`${pfx}.indexer.k_norm.weight`)!,
+          this.tensors.get(`${pfx}.indexer.k_norm.bias`)!,
+          1e-6, cfg.indexHeadDim, BS,
+        );
+        let idxKOut: Tensor;
+        if (idxNopeDim > 0) {
+          using idxKPe = idxKNormed.slice(1, 0, idxRopeDim);
+          using idxKNope = idxKNormed.slice(1, idxRopeDim, idxNopeDim);
+          using idxKPeRope = idxKPe.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
+          idxKOut = idxKPeRope.cat([idxKNope], 1);
+        } else {
+          idxKOut = idxKNormed.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
+        }
+
+        const nnz = state.isDecode ? batchSize : totalTokens;
+        ws.glm.mlaKvCacheAppend(
+          pagedKV.kData[layerIdx], null,
+          pagedKV.indices, ws.indptrD, ws.lastPageLen,
+          idxKOut, null,
+          ws.mlaBatchIndices, ws.positionIds,
+          nnz, pagedKV.pageSize, cfg.indexHeadDim, 0,
+          cfg.indexHeadDim, 0,
+          pagedKV.contextParallel,
+        );
+        return idxKOut;
+      }
+    });
 
     const absorbed = true; //state.absorbed;
 
@@ -460,12 +493,21 @@ export class Glm51Model extends ChatModel {
         }
       });
 
+      // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
+      using idxQStream = this.glm.withStream(() => {
+        if (cfg.indexHeadDim === 0) return undefined as Tensor | undefined;
+        using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!, BS);
+        return idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
+      });
+
       qAbsorbedRStream.streamWaitEvent();
       qPeR.streamWaitEvent();
+      idxQStream.streamWaitEvent();
 
       return {
         qAbsorbedR: qAbsorbedRStream.result,
         qPeR: qPeR.result,
+        idxQ: idxQStream.result,
       }
     });
 
@@ -474,6 +516,33 @@ export class Glm51Model extends ChatModel {
 
     using qAbsorbedR = q.result.qAbsorbedR;
     using qPeR = q.result.qPeR;
+
+    // Indexer forward: fused score kernel + topk
+    using idxQ = q.result.idxQ;
+    if (idxQ) {
+      const idxNHeads = cfg.indexNHeads;
+      const idxHeadDim = cfg.indexHeadDim;
+      const idxTopk = cfg.indexTopk;
+      const maxKvLen = state.isDecode
+        ? pagedKV.sequences.reduce((max, s) => Math.max(max, s.allocLen), 0)
+        : pagedKV.sequences.reduce((sum, s) => sum + s.allocLen, 0);
+
+      if (maxKvLen > idxTopk) {
+        using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!, BS);
+        idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
+
+        using indexScores = ws.alloc([BS, maxKvLen], "BF16");
+        this.glm.indexerScore(
+          indexScores, idxQ, pagedKV.kData[layerIdx], idxWeights,
+          pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD,
+          Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim,
+          pagedKV.pageSize, maxKvLen, !state.isDecode,
+        );
+
+        const { indices: topkIndices } = indexScores.topk(idxTopk, maxKvLen);
+        using _topkIndices = topkIndices;
+      }
+    }
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     if (absorbed) {
