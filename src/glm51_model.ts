@@ -99,6 +99,8 @@ export class Glm51Model extends ChatModel {
   cfg: Glm51Config;
   invFreq: Tensor;
   readonly contextParallel: boolean;
+  private readonly pendingKNope = new Map<string, Tensor>();
+  private readonly pendingQNope = new Map<string, Tensor>();
   private readonly mtp: boolean;
 
   private constructor(glm: DeviceOps, config: Glm51Config, contextParallel = false, mtp = false) {
@@ -223,13 +225,13 @@ export class Glm51Model extends ChatModel {
   }
 
   private tryComputeAbsorbed(layerPfx: string, nHeads: number, kvLoraRank: number, qLoraRank: number, qkNopeDim: number): void {
-    const kNopeName = `${layerPfx}.k_nope_proj.weight`;
-    const qNopeName = `${layerPfx}.q_nope_proj.weight`;
-    const absorbedName = `${layerPfx}.absorbed.weight`;
-    if (this.tensors.has(absorbedName)) return;
-    const kNopeProj = this.tensors.get(kNopeName);
-    const qNopeProj = this.tensors.get(qNopeName);
-    if (!kNopeProj || !qNopeProj) return;
+    const kNopeKey = `${layerPfx}.k_nope_proj.weight`;
+    const qNopeKey = `${layerPfx}.q_nope_proj.weight`;
+    if (!this.pendingKNope.has(kNopeKey) || !this.pendingQNope.has(qNopeKey)) return;
+    using kNopeProj = this.pendingKNope.get(kNopeKey)!;
+    using qNopeProj = this.pendingQNope.get(qNopeKey)!;
+    this.pendingKNope.delete(kNopeKey);
+    this.pendingQNope.delete(qNopeKey);
     using wAbsorbedTmp = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
     const wAbsorbed = this.alloc(wAbsorbedTmp.shape, wAbsorbedTmp.type, `${layerPfx}.absorbed.weight`, wAbsorbedTmp.parallelism);
     wAbsorbed.memcpy(wAbsorbedTmp);
@@ -258,8 +260,7 @@ export class Glm51Model extends ChatModel {
     if (name.endsWith(".q_b_proj.weight")) {
       const eb = 2;
       const srcPitch = qkHeadDim * inDim * eb;
-      const qNopeName = name.replace(".q_b_proj.weight", ".q_nope_proj.weight");
-      const tQNope = this.alloc([nHeads * qkNopeDim, qLoraRank], "BF16", qNopeName, nopeParallelism);
+      const tQNope = this.alloc([nHeads * qkNopeDim, qLoraRank], "BF16", undefined, nopeParallelism);
       const peName = name.replace(".q_b_proj.weight", ".q_pe_proj.weight");
       const par = this.contextParallel ? TensorParallelism.Replicated : TensorParallelism.Column;
       const tPe = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", peName, par);
@@ -267,15 +268,14 @@ export class Glm51Model extends ChatModel {
         tQNope.mmapLoad(mmapPtr, offset, tQNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
         tPe.mmapLoad(mmapPtr, offset, tPe.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: qkRopeDim * inDim * eb, width: qkRopeDim * inDim * eb, height: nHeads }),
       ]);
+      this.pendingQNope.set(name.replace(".q_b_proj.weight", ".q_nope_proj.weight"), tQNope);
     } else if (name.endsWith(".kv_b_proj.weight")) {
       const eb = 2;
       const srcPitch = (qkNopeDim + vHeadDim) * inDim * eb;
-      const kNopeName = name.replace(".kv_b_proj.weight", ".k_nope_proj.weight");
-      const tKNope = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", kNopeName, nopeParallelism);
+      const tKNope = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", undefined, nopeParallelism);
       const vName = name.replace(".kv_b_proj.weight", ".v_proj.weight");
-      const vLinName = name.replace(".kv_b_proj.weight", ".v_proj.linear.weight");
       const vPar = this.contextParallel ? TensorParallelism.Replicated : TensorParallelism.Column;
-      const tVRaw = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", vLinName, vPar);
+      using tVRaw = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", undefined, vPar);
       await Promise.all([
         tKNope.mmapLoad(mmapPtr, offset, tKNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
         tVRaw.mmapLoad(mmapPtr, offset, tVRaw.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: vHeadDim * inDim * eb, width: vHeadDim * inDim * eb, height: nHeads }),
@@ -285,6 +285,7 @@ export class Glm51Model extends ChatModel {
       using tVT = tVRaw.transpose4d(1, nHeads, vHeadDim, kvLoraRank, 0, 1, 3, 2);
       const tV = this.alloc([nHeads * kvLoraRank, vHeadDim], "BF16", vName, vPar);
       tV.memcpy(tVT);
+      this.pendingKNope.set(name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), tKNope);
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
       await this.splitMlaWeightMmap(mmapPtr, offset,
         1, kvLoraRank + qkRopeDim, inDim,
@@ -411,8 +412,6 @@ export class Glm51Model extends ChatModel {
     const nHeads = cfg.numAttentionHeads;
     const kvLoraRank = cfg.kvLoraRank;
     const qkRopeDim = cfg.qkRopeHeadDim;
-    const qkNopeDim = cfg.qkNopeHeadDim;
-    const qkHeadDim = cfg.qkHeadDim;
     const vHeadDim = cfg.vHeadDim;
     const pfx = `${Glm51Model.WEIGHT_PREFIX}${layerIdx}.self_attn`;
     const batchSize = state.batchSize;
@@ -470,8 +469,6 @@ export class Glm51Model extends ChatModel {
       }
     });
 
-    const absorbed = true; //state.absorbed;
-
     using q = this.glm.withStream(() => {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
       using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps, cfg.qLoraRank, BS);
@@ -482,15 +479,10 @@ export class Glm51Model extends ChatModel {
       });
 
       using qAbsorbedRStream = this.glm.withStream(() => {
-        if (absorbed) {
-          using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!, BS);
-          return state.isDecode
-            ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
-            : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-        } else {
-          using qNopeLin = qNormed.linear(this.tensors.get(`${pfx}.q_nope_proj.weight`)!, BS);
-          return qNopeLin.ropeTranspose(cos, sin, qkNopeDim, qkNopeDim, nHeads, S, B, qkNopeDim, cfg.ropeInterleave);
-        }
+        using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!, BS);
+        return state.isDecode
+          ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
+          : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
       });
 
       // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
@@ -545,7 +537,7 @@ export class Glm51Model extends ChatModel {
     }
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
-    if (absorbed) {
+    {
       const mlaResult = state.isDecode
         ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel)
         : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel, !state.customMask ? MaskMode.Causal : state.customMask.mode, state.customMask?.mask, state.customMask?.indptr, state.customMask?.maskKvLen);
@@ -555,37 +547,6 @@ export class Glm51Model extends ChatModel {
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
       using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, S, B, lseBuf);
       oProjBuf.replace(vExpanded.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!, BS));
-    }
-    else {
-      // Non-absorbed path: gather compact KV from pages, project to full K/V
-      const numPages = pagedKV.sequences.reduce((sum, s) => sum + s.contentPages, 0);
-      const totalKvLen = pagedKV.sequences.reduce((sum, s) => sum + s.allocLen, 0);
-
-      // Gather ckv [totalKvLen, kvLoraRank] and kpe [totalKvLen, qkRopeDim] from paged cache
-      // In CP mode, ParallelOps.gatherPages handles: local gather → NCCL all-gather → deinterleave
-      using ckvContig = this.glm.gatherPages(
-        pagedKV.ckvData[layerIdx],
-        pagedKV.indices, ws.indptrD, ws.lastPageLen,
-        numPages, batchSize, pagedKV.pageSize, kvLoraRank, totalKvLen, ws.kvTokenIndptrD, this.contextParallel,
-      );
-      using kpeContig = this.glm.gatherPages(
-        pagedKV.kpeData[layerIdx],
-        pagedKV.indices, ws.indptrD, ws.lastPageLen,
-        numPages, batchSize, pagedKV.pageSize, qkRopeDim, totalKvLen, ws.kvTokenIndptrD, this.contextParallel,
-      );
-
-      // Project ckv → K_nope [totalKvLen, nHeads * qkNopeDim] and V [totalKvLen, nHeads * vHeadDim]
-      using kNope = ckvContig.linear(this.tensors.get(`${pfx}.k_nope_proj.weight`)!, totalKvLen);
-      using vFull = ckvContig.linear(this.tensors.get(`${pfx}.v_proj.linear.weight`)!, totalKvLen);
-      // TODO: Apply RoPE to kpeContig → k_pe [totalKvLen, qkRopeDim] (shared across heads)
-      // TODO: Reshape K_nope → [nHeads, totalKvLen, qkNopeDim], broadcast k_pe → [nHeads, totalKvLen, qkRopeDim]
-      // TODO: Concat K_nope + k_pe → K [nHeads, totalKvLen, qkHeadDim]
-      // TODO: Reshape V → [nHeads, totalKvLen, vHeadDim]
-      // TODO: Q: concat(qNopeR, qPeR) → [nHeads, qoLen, qkHeadDim]
-      // TODO: Run ws.batchPrefillRagged(Q, K, V, ...) → attnOut [nHeads, qoLen, vHeadDim]
-      // TODO: Reshape attnOut → [qoLen, nHeads * vHeadDim] for o_proj
-      // TODO: oProjBuf.replace(attnOut.outputProj(o_proj, BS))
-      // NOTE: Must be graph-capturable — avoid h2d and dynamic allocations
     }
 
     const attnResult = residual.fusedAddRmsnorm(oProjBuf.value, this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
