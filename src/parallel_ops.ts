@@ -1629,6 +1629,21 @@ export class ParallelTensor extends Tensor {
     const allPar = [this.parallelism, ...pTensors.map(t => t.parallelism)];
     const hasNonReplicated = allPar.some(p => p !== TensorParallelism.Replicated);
 
+    // Row-parallel tensors are sharded on dim 1. Concatenating on any other dim
+    // is a purely local per-shard op that preserves Row parallelism — no need to
+    // allGather to Replicated (which would hand a full [BS, nHeads, ...] buffer to
+    // kernels expecting a per-rank [BS, nHeads/world, ...] contiguous layout, e.g.
+    // sparse MLA which takes no q-stride argument).
+    if (dim !== 1 && allPar.every(p => p === TensorParallelism.Row)) {
+      const outShape = [...this.shape];
+      for (const t of pTensors) outShape[dim] += t.shape[dim];
+      const outShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        outShards.push(this.shards[i].cat(pTensors.map(t => t.shards[i]), dim));
+      }
+      return this.parallelOps.wrapShards(this.workspace, outShards, outShape, this.type, TensorParallelism.Row);
+    }
+
     if (hasNonReplicated) {
       if (this.parallelism === TensorParallelism.PartialSum) {
         this.allReduce();
