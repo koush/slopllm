@@ -440,6 +440,42 @@ static Napi::Value IndexerScoreTopk(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 22) {
+        Napi::TypeError::New(env, "Expected 22 args (…, scores, rowLen, hist, meta, maxKv, numSplits)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_indexer_score_topk_v2(
+        reinterpret_cast<GlmCtx*>((uintptr_t)info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<int32_t*>((uintptr_t)info[1].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>((uintptr_t)info[2].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>((uintptr_t)info[3].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>((uintptr_t)info[4].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[5].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[6].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[7].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[8].As<Napi::Number>().Int64Value()),
+        info[9].As<Napi::Number>().FloatValue(),
+        info[10].As<Napi::Number>().Int32Value(),
+        info[11].As<Napi::Number>().Int32Value(),
+        info[12].As<Napi::Number>().Int32Value(),
+        info[13].As<Napi::Number>().Int32Value(),
+        info[14].As<Napi::Number>().Int32Value(),
+        info[15].As<Napi::Number>().Int32Value(),
+        reinterpret_cast<void*>((uintptr_t)info[16].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<int32_t*>((uintptr_t)info[17].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<int32_t*>((uintptr_t)info[18].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<int32_t*>((uintptr_t)info[19].As<Napi::Number>().Int64Value()),
+        info[20].As<Napi::Number>().Int32Value(),
+        info[21].As<Napi::Number>().Int32Value());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("indexerScoreTopkV2 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value TopkToSlots(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 11) {
@@ -3898,6 +3934,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "causalMask"), Napi::Function::New(env, CausalMask));
     exports.Set(Napi::String::New(env, "indexerScore"), Napi::Function::New(env, IndexerScore));
     exports.Set(Napi::String::New(env, "indexerScoreTopk"), Napi::Function::New(env, IndexerScoreTopk));
+    exports.Set(Napi::String::New(env, "indexerScoreTopkV2"), Napi::Function::New(env, IndexerScoreTopkV2));
     exports.Set(Napi::String::New(env, "topkToSlots"), Napi::Function::New(env, TopkToSlots));
     exports.Set(Napi::String::New(env, "fill"), Napi::Function::New(env, Fill));
     exports.Set(Napi::String::New(env, "gather"), Napi::Function::New(env, Gather));

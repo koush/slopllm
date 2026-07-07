@@ -1650,6 +1650,241 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, const int32_t* topk_idx,
 }
 
 // ---------------------------------------------------------------------------
+// Exact large-K top-K over non-negative bf16 scores, by histogram.
+//
+// Indexer scores are ReLU'd and bf16-rounded, so each score is one of only
+// 32768 non-negative bf16 values. Selecting the top-K (K up to a few thousand)
+// out of N (up to ~200k) is therefore an exact histogram problem, done in three
+// fully-parallel multi-block passes — no per-thread K-arrays, no serial heap.
+// All passes have a fixed launch shape (grid sized for max context), so this is
+// CUDA-graph capturable; per-row length is read on-device from row_len.
+//
+//   hist:  [batch, 32768] i32 scratch   meta: [batch, 4] i32 scratch
+//   meta layout per row: [tau_key, tie_take, out_count, tie_count]
+// Output out_idx[row, 0..K) = selected position indices (unordered), -1 padded.
+// ---------------------------------------------------------------------------
+
+#define IDX_NBUCKET 65536   // full signed bf16 range, mapped to a monotonic key
+
+static __device__ __forceinline__ int bf16_key(const __nv_bfloat16* p) {
+    // Order-preserving float->uint key: negatives -> [0,0x7FFF] (reversed),
+    // non-negatives -> [0x8000,0xFFFF]. Monotonic in value across the full range,
+    // so histogram bucket order == score order. Scores are signed (final weighted
+    // sum is not ReLU'd), so this must handle the sign bit.
+    unsigned short u = *reinterpret_cast<const unsigned short*>(p);
+    unsigned short k = (u & 0x8000) ? (unsigned short)(~u) : (unsigned short)(u | 0x8000);
+    return (int)k;
+}
+
+__global__ void idx_hist_kernel(
+    const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ row_len,
+    int32_t* __restrict__ hist, int stride
+) {
+    const int row = blockIdx.y;
+    const int len = row_len ? row_len[row] : stride;
+    const __nv_bfloat16* s = scores + (size_t)row * stride;
+    int32_t* h = hist + (size_t)row * IDX_NBUCKET;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < len; i += gridDim.x * blockDim.x) {
+        atomicAdd(&h[bf16_key(&s[i])], 1);
+    }
+}
+
+// One block (256 threads) per row: init out_idx to -1, then find the threshold
+// bucket tau (largest set of top buckets whose counts sum to >= topk) with a
+// two-level parallel scan over the 32768 buckets — 128 buckets/thread, a 256-way
+// block scan, then the winning thread refines within its range.
+__global__ void idx_threshold_kernel(
+    const int32_t* __restrict__ hist, int32_t* __restrict__ meta,
+    int32_t* __restrict__ out_idx, const int32_t* __restrict__ row_len,
+    int stride, int topk
+) {
+    const int row = blockIdx.x;
+    const int len = row_len ? row_len[row] : stride;
+    for (int i = threadIdx.x; i < topk; i += blockDim.x)
+        out_idx[(size_t)row * topk + i] = (i < len && len <= topk) ? i : -1;
+    // Identity case: every valid position is selected — write it directly and
+    // disable the gather pass (tau = INT_MAX so no position matches).
+    if (len <= topk) {
+        if (threadIdx.x == 0) {
+            int32_t* m = meta + (size_t)row * 4;
+            m[0] = 0x7FFFFFFF; m[1] = 0; m[2] = topk; m[3] = 0;
+        }
+        return;
+    }
+
+    const int t = threadIdx.x;                 // 0..255
+    const int PER = IDX_NBUCKET / 256;         // 128 buckets per thread
+    const int32_t* h = hist + (size_t)row * IDX_NBUCKET;
+    // Thread t owns the t-th band from the top: buckets [hi-PER, hi).
+    const int hi = IDX_NBUCKET - t * PER;
+    long localSum = 0;
+    for (int k = hi - PER; k < hi; k++) localSum += h[k];
+
+    __shared__ long partial[256];
+    __shared__ int s_winner;
+    __shared__ long s_above;   // count in bands strictly above the winning band
+    partial[t] = localSum;
+    __syncthreads();
+
+    if (t == 0) {
+        long cum = 0; int winner = 255;
+        for (int j = 0; j < 256; j++) {
+            if (cum + partial[j] >= topk) { winner = j; break; }
+            cum += partial[j];
+        }
+        s_winner = winner;
+        s_above = cum;         // total in bands 0..winner-1
+    }
+    __syncthreads();
+
+    if (t == s_winner) {
+        const int whi = IDX_NBUCKET - t * PER;
+        long cum = s_above; long numAbove = s_above; int tau = whi - PER;
+        for (int k = whi - 1; k >= whi - PER; k--) {
+            long c = h[k];
+            if (cum + c >= topk) { tau = k; numAbove = cum; break; }
+            cum += c;
+        }
+        int32_t* m = meta + (size_t)row * 4;
+        m[0] = tau;                   // threshold bucket
+        m[1] = topk - (int)numAbove;  // ties to take from the tau bucket
+        m[2] = 0;                     // out_count
+        m[3] = 0;                     // tie_count
+    }
+}
+
+__global__ void idx_gather_kernel(
+    const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ row_len,
+    int32_t* __restrict__ meta, int32_t* __restrict__ out_idx, int stride, int topk
+) {
+    const int row = blockIdx.y;
+    const int len = row_len ? row_len[row] : stride;
+    const __nv_bfloat16* s = scores + (size_t)row * stride;
+    int32_t* m = meta + (size_t)row * 4;
+    const int tau = m[0];
+    const int tieTake = m[1];
+    int32_t* out = out_idx + (size_t)row * topk;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < len; i += gridDim.x * blockDim.x) {
+        const int key = bf16_key(&s[i]);
+        if (key > tau) {
+            int p = atomicAdd(&m[2], 1);
+            if (p < topk) out[p] = i;
+        } else if (key == tau) {
+            int t = atomicAdd(&m[3], 1);
+            if (t < tieTake) {
+                int p = atomicAdd(&m[2], 1);
+                if (p < topk) out[p] = i;
+            }
+        }
+    }
+}
+
+void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
+    const void* scores, const int32_t* row_len,
+    int32_t* hist, int32_t* meta,
+    int batch, int stride, int topk, int num_splits) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    cudaMemsetAsync(hist, 0, (size_t)batch * IDX_NBUCKET * sizeof(int32_t), stream);
+    cudaMemsetAsync(meta, 0, (size_t)batch * 4 * sizeof(int32_t), stream);
+    dim3 grid(num_splits, batch);
+    idx_hist_kernel<<<grid, 256, 0, stream>>>(
+        (const __nv_bfloat16*)scores, row_len, hist, stride);
+    idx_threshold_kernel<<<batch, 256, 0, stream>>>(hist, meta, out_idx, row_len, stride, topk);
+    idx_gather_kernel<<<grid, 256, 0, stream>>>(
+        (const __nv_bfloat16*)scores, row_len, meta, out_idx, stride, topk);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-block indexer scoring: writes per-position scores into a buffer instead
+// of feeding a serial heap. grid = (num_splits, totalQ); one warp per KV
+// position so decode (small totalQ) spreads across many SMs. The per-head math
+// matches indexer_score_topk_kernel exactly (per-head ReLU, weighted sum, final
+// bf16 round) so the downstream selection is identical.
+// ---------------------------------------------------------------------------
+__global__ void idx_score_kernel(
+    __nv_bfloat16* __restrict__ scores,       // [totalQ, maxKv]
+    int32_t* __restrict__ row_len,            // [totalQ]  (numValid per query)
+    const __nv_bfloat16* __restrict__ q,      // [totalQ, idxNHeads, idxHeadDim]
+    const __nv_bfloat16* __restrict__ kData,  // [maxPages, pageSize, idxHeadDim]
+    const __nv_bfloat16* __restrict__ weights,// [totalQ, idxNHeads]
+    const int32_t* __restrict__ pageIndices, const int32_t* __restrict__ pageIndptr,
+    const int32_t* __restrict__ lastPageLen, const int32_t* __restrict__ qoIndptr,
+    float scale, int idxNHeads, int idxHeadDim, int pageSize, int maxKv, int causal
+) {
+    const int qIdx = blockIdx.y;
+    int seq = 0;
+    while (qoIndptr[seq + 1] <= qIdx) seq++;
+    const int qLocalPos = qIdx - qoIndptr[seq];
+    const int numQueries = qoIndptr[seq + 1] - qoIndptr[seq];
+    const int pageStart = pageIndptr[seq];
+    const int numPages = pageIndptr[seq + 1] - pageStart;
+    const int kvLen = numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0;
+    const int prefixLen = max(0, kvLen - numQueries);
+    const int causalLimit = causal ? (prefixLen + qLocalPos) : (kvLen - 1);
+    const int numValid = causalLimit + 1;
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) row_len[qIdx] = numValid;
+
+    extern __shared__ char smem[];
+    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem);
+    __nv_bfloat16* w_s = q_s + idxNHeads * idxHeadDim;
+    for (int i = threadIdx.x; i < idxNHeads * idxHeadDim; i += blockDim.x)
+        q_s[i] = q[(size_t)qIdx * idxNHeads * idxHeadDim + i];
+    for (int i = threadIdx.x; i < idxNHeads; i += blockDim.x)
+        w_s[i] = weights[qIdx * idxNHeads + i];
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warpsPerBlock = blockDim.x >> 5;
+    for (int pos = blockIdx.x * warpsPerBlock + warp; pos < numValid;
+         pos += gridDim.x * warpsPerBlock) {
+        const int pageId = pageIndices[pageStart + pos / pageSize];
+        const __nv_bfloat16* kbase = kData + (size_t)pageId * pageSize * idxHeadDim
+                                     + (pos % pageSize) * idxHeadDim;
+        float acc = 0.f;
+        for (int h = 0; h < idxNHeads; h++) {
+            const __nv_bfloat16* qh = q_s + h * idxHeadDim;
+            float partial = 0.f;
+            for (int d = lane; d < idxHeadDim; d += 32)
+                partial += __bfloat162float(qh[d]) * __bfloat162float(kbase[d]);
+            for (int off = 16; off > 0; off >>= 1)
+                partial += __shfl_xor_sync(0xffffffff, partial, off);
+            if (lane == 0) acc += __bfloat162float(w_s[h]) * fmaxf(partial * scale, 0.f);
+        }
+        if (lane == 0)
+            scores[(size_t)qIdx * maxKv + pos] = __float2bfloat16(acc);
+    }
+}
+
+// Full v2 indexer top-k: multi-block score -> histogram select. Drop-in
+// replacement for glm_indexer_score_topk with the same out_idx semantics.
+// scratch: scores [totalQ, maxKv] bf16, rowLen [totalQ] i32, hist [totalQ,32768]
+// i32, meta [totalQ, 4] i32.
+void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
+    const void* q, const void* kData, const void* weights,
+    const int32_t* pageIndices, const int32_t* pageIndptr,
+    const int32_t* lastPageLen, const int32_t* qoIndptr,
+    float scale, int totalQ, int idxNHeads, int idxHeadDim,
+    int pageSize, int topk, int causal,
+    void* scores, int32_t* rowLen, int32_t* hist, int32_t* meta,
+    int maxKv, int num_splits) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    dim3 grid(num_splits, totalQ);
+    int block = 256;
+    size_t smem = (size_t)idxNHeads * idxHeadDim * sizeof(__nv_bfloat16)
+                + idxNHeads * sizeof(__nv_bfloat16);
+    idx_score_kernel<<<grid, block, smem, stream>>>(
+        (__nv_bfloat16*)scores, rowLen, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
+        (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
+        scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal);
+    glm_topk_from_scores(ctx, out_idx, scores, rowLen, hist, meta,
+                         totalQ, maxKv, topk, num_splits);
+}
+
+// ---------------------------------------------------------------------------
 // Fill kernel
 // ---------------------------------------------------------------------------
 

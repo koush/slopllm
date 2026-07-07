@@ -528,20 +528,11 @@ export class Glm51Model extends ChatModel {
       using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!, BS);
       idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
 
-      const { indices: topkIndices } = this.glm.indexerScoreTopk(
+      const slots = this.glm.indexerTopkSlots(
         idxQ, pagedKV.kData[layerIdx], idxWeights,
-        pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD,
-        Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim,
-        pagedKV.pageSize, idxTopk, !state.isDecode,
-      );
-      using _topkIndices = topkIndices;
-
-      const slots = ws.alloc([BS, idxTopk], "I32");
-      this.glm.topkToSlots(
-        slots, topkIndices,
-        pagedKV.indices, ws.indptrD, ws.lastPageLen,
-        ws.mlaBatchIndices, BS, idxTopk, pagedKV.pageSize,
-        1, 0, this.contextParallel,
+        pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD, ws.mlaBatchIndices,
+        Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim, pagedKV.pageSize, idxTopk,
+        state.isDecode, pagedKV.maxPages * pagedKV.pageSize, this.contextParallel,
       );
       sharedSlots.replace(slots);
     }

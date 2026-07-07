@@ -250,6 +250,23 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
         ]
 
+        self.lib.glm_topk_from_scores.restype = None
+        self.lib.glm_topk_from_scores.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+
+        self.lib.glm_indexer_score_topk_v2.restype = None
+        self.lib.glm_indexer_score_topk_v2.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+        ]
+
         self.lib.glm_cat_last_dim.restype = None
         self.lib.glm_cat_last_dim.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -1187,6 +1204,18 @@ class GlmOps:
             total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0
         )
 
+    def indexer_score_topk_v2(self, out_idx, q, k_data, weights, page_indices, page_indptr,
+                              last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
+                              page_size, topk, causal,
+                              scores, row_len, hist, meta, max_kv, num_splits):
+        self.lib.glm_indexer_score_topk_v2(
+            self.ctx, self._ptr(out_idx), self._ptr(q), self._ptr(k_data), self._ptr(weights),
+            self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
+            ctypes.c_float(scale), total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0,
+            self._ptr(scores), self._ptr(row_len), self._ptr(hist), self._ptr(meta),
+            max_kv, num_splits,
+        )
+
     def topk_to_slots(self, slots, topk_idx, page_indices, page_indptr,
                       last_page_len, batch_indices, num_tokens, topk, page_size,
                       cp_world_size=1, cp_rank=0):
@@ -1197,6 +1226,15 @@ class GlmOps:
             self._ptr(last_page_len), self._ptr(batch_indices),
             num_tokens, topk, page_size,
             cp_world_size, cp_rank
+        )
+
+    def topk_from_scores(self, out_idx, scores, row_len, hist, meta,
+                         batch, stride, topk, num_splits):
+        self.lib.glm_topk_from_scores(
+            self.ctx, self._ptr(out_idx), self._ptr(scores),
+            self._ptr(row_len) if row_len else None,
+            self._ptr(hist), self._ptr(meta),
+            batch, stride, topk, num_splits,
         )
 
     def cat_last_dim(self, output, a, b, a_last_dim, b_last_dim, outer):

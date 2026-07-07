@@ -63,9 +63,10 @@ export interface DeviceOps {
   gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, numPages: number, batchSize: number, pageSize: number, D: number, totalKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor;
 
   indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void;
-  indexerScoreTopk(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: boolean): { indices: Tensor };
-
-  topkToSlots(slots: Tensor, topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, numTokens: number, topk: number, pageSize: number, cpWorldSize?: number, cpRank?: number, contextParallel?: boolean): void;
+  // Indexer top-k -> physical KV slots (score+topk then slot mapping). Returns
+  // the [totalQ, topk] slots tensor. `decode` selects the multi-block v2 kernel;
+  // `maxKv` bounds the score scratch (max sequence length in the cache).
+  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, decode: boolean, maxKv: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): Tensor;
 
   graphBeginCapture(): void;
   graphEndCapture(): number;

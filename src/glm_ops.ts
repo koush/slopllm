@@ -72,6 +72,7 @@ interface NativeAddon {
   causalMask(ctx: number, out: number, seqLen: number): void;
   indexerScore(ctx: number, out: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: number): void;
   indexerScoreTopk(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number): void;
+  indexerScoreTopkV2(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, scores: number, rowLen: number, hist: number, meta: number, maxKv: number, numSplits: number): void;
   topkToSlots(ctx: number, slots: number, topkIdx: number, pageIndices: number, pageIndptr: number, lastPageLen: number, batchIndices: number, numTokens: number, topk: number, pageSize: number, cpWorldSize: number, cpRank: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
   applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
@@ -873,14 +874,36 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().indexerScore(this.ctx, out.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal ? 1 : 0);
   }
 
-  indexerScoreTopk(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: boolean): { indices: Tensor } {
-    const indices = q.workspace.alloc([totalQ, topk], "I32");
-    getNativeAddon().indexerScoreTopk(this.ctx, indices.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal ? 1 : 0);
-    return { indices };
+  // Indexer top-k selection -> physical KV slots. Runs the full pipeline
+  // (score+topk, then map token positions to slots) on this device. Decode uses
+  // the multi-block score+histogram kernel (v2): totalQ is small (batch), so the
+  // one-block-per-query v1 kernel would pin a single SM and its cost grows with
+  // kvLen. Prefill uses v1 — totalQ blocks already fill the GPU, and v2's
+  // per-query scratch (scores/hist) would be O(totalQ*kvLen), infeasible.
+  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, decode: boolean, maxKv: number, _contextParallel?: boolean, cpWorldSize: number = 1, cpRank: number = 0): Tensor {
+    using topkIdx = decode
+      ? this.indexerScoreTopkV2(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv)
+      : this.indexerScoreTopk(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk);
+    const slots = idxQ.workspace.alloc([totalQ, topk], "I32");
+    getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkIdx), ptr(pageIndices), ptr(indptr), ptr(lastPageLen), ptr(batchIndices), totalQ, topk, pageSize, cpWorldSize, cpRank);
+    return slots;
   }
 
-  topkToSlots(slots: Tensor, topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, numTokens: number, topk: number, pageSize: number, cpWorldSize: number = 1, cpRank: number = 0): void {
-    getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkIdx), ptr(pageIndices), ptr(pageIndptr), ptr(lastPageLen), ptr(batchIndices), numTokens, topk, pageSize, cpWorldSize, cpRank);
+  private indexerScoreTopk(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number): Tensor {
+    const indices = q.workspace.alloc([totalQ, topk], "I32");
+    getNativeAddon().indexerScoreTopk(this.ctx, indices.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/);
+    return indices;
+  }
+
+  private indexerScoreTopkV2(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number): Tensor {
+    const numSplits = Math.min(256, Math.max(1, Math.ceil(maxKv / 256)));
+    const indices = q.workspace.alloc([totalQ, topk], "I32");
+    using scores = q.workspace.alloc([totalQ, maxKv], "BF16");
+    using rowLen = q.workspace.alloc([totalQ], "I32");
+    using hist = q.workspace.alloc([totalQ, 65536], "I32");
+    using meta = q.workspace.alloc([totalQ, 4], "I32");
+    getNativeAddon().indexerScoreTopkV2(this.ctx, indices.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 0 /*causal: decode*/, scores.data, rowLen.data, hist.data, meta.data, maxKv, numSplits);
+    return indices;
   }
 
   positionStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number, steps = 1): void {
