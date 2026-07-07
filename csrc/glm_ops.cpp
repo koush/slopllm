@@ -2006,7 +2006,7 @@ static Napi::Value PositionStep(const Napi::CallbackInfo& info) {
 static Napi::Value MlaPositionStep(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 5) {
-        Napi::TypeError::New(env, "Expected (ctx, position_ids, last_page_len, indptr, page_size, batch_size[, cp_world_size, cp_rank, steps])").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, position_ids, last_page_len, indptr, page_size, batch_size[, cp_world_size, cp_rank, steps, global_last_page_len])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -2018,9 +2018,11 @@ static Napi::Value MlaPositionStep(const Napi::CallbackInfo& info) {
     uint32_t cp_world_size = (info.Length() > 6) ? info[6].As<Napi::Number>().Uint32Value() : 1;
     uint32_t cp_rank = (info.Length() > 7) ? info[7].As<Napi::Number>().Uint32Value() : 0;
     int32_t steps = (info.Length() > 8) ? info[8].As<Napi::Number>().Int32Value() : 1;
+    uintptr_t global_last_page_len_ptr = (info.Length() > 9) ? info[9].As<Napi::Number>().Int64Value() : 0;
     glm_mla_position_step(reinterpret_cast<GlmCtx*>(ctx_ptr),
                            reinterpret_cast<int32_t*>(position_ids_ptr),
                            reinterpret_cast<int32_t*>(last_page_len_ptr),
+                           reinterpret_cast<int32_t*>(global_last_page_len_ptr),
                            reinterpret_cast<const int32_t*>(indptr_ptr),
                            page_size, batch_size, cp_world_size, cp_rank, steps);
     cudaError_t err = cudaGetLastError();
@@ -2915,7 +2917,7 @@ static Napi::Value MlaKvCacheAppend(const Napi::CallbackInfo& info) {
 static Napi::Value ConcatAndCacheDsMla(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 14) {
-        Napi::TypeError::New(env, "Expected 14 args (ctx, kv_cache, append_ckv, append_kpe, indices, indptr, batch_indices, positions, nnz, page_size, kv_lora_rank, pe_dim, append_ckv_stride_n, append_kpe_stride_n)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected at least 14 args (ctx, kv_cache, append_ckv, append_kpe, indices, indptr, batch_indices, positions, nnz, page_size, kv_lora_rank, pe_dim, append_ckv_stride_n, append_kpe_stride_n[, cp_world_size, cp_rank])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -2932,6 +2934,8 @@ static Napi::Value ConcatAndCacheDsMla(const Napi::CallbackInfo& info) {
     uint32_t pe_dim = info[11].As<Napi::Number>().Uint32Value();
     size_t append_ckv_stride_n = info[12].As<Napi::Number>().Int64Value();
     size_t append_kpe_stride_n = info[13].As<Napi::Number>().Int64Value();
+    uint32_t cp_world_size = (info.Length() >= 15) ? info[14].As<Napi::Number>().Uint32Value() : 0;
+    uint32_t cp_rank = (info.Length() >= 16) ? info[15].As<Napi::Number>().Uint32Value() : 0;
     glm_concat_and_cache_ds_mla(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(kv_cache_ptr),
@@ -2941,7 +2945,8 @@ static Napi::Value ConcatAndCacheDsMla(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(batch_indices_ptr),
         reinterpret_cast<int32_t*>(positions_ptr),
         nnz, page_size, kv_lora_rank, pe_dim,
-        append_ckv_stride_n, append_kpe_stride_n);
+        append_ckv_stride_n, append_kpe_stride_n,
+        cp_world_size, cp_rank);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("concatAndCacheDsMla failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

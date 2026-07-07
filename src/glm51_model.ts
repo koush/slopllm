@@ -533,6 +533,7 @@ export class Glm51Model extends ChatModel {
         pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD, ws.mlaBatchIndices,
         Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim, pagedKV.pageSize, idxTopk,
         state.isDecode, pagedKV.maxPages * pagedKV.pageSize, this.contextParallel,
+        undefined, undefined, ws.globalLastPageLen,
       );
       sharedSlots.replace(slots);
     }

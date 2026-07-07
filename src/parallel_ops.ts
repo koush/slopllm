@@ -2514,14 +2514,15 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mlaPositionStep(positionIds: Tensor, lastPageLen: Tensor, indptr: Tensor, pageSize: number, batchSize: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, steps?: number): void {
+  mlaPositionStep(positionIds: Tensor, lastPageLen: Tensor, indptr: Tensor, pageSize: number, batchSize: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, steps?: number, globalLastPageLen?: Tensor): void {
     const pPositionIds = this.cast(positionIds);
     const pLastPageLen = this.cast(lastPageLen);
     const pIndptr = this.cast(indptr);
+    const pGlobalLastPageLen = globalLastPageLen ? this.cast(globalLastPageLen) : undefined;
     const cpWs = contextParallel ? this.worldSize : 1;
     for (let i = 0; i < this.worldSize; i++) {
       const cpR = contextParallel ? i : 0;
-      this.devices[i].mlaPositionStep(pPositionIds.shards[i], pLastPageLen.shards[i], pIndptr.shards[i], pageSize, batchSize, contextParallel, cpWs, cpR, steps);
+      this.devices[i].mlaPositionStep(pPositionIds.shards[i], pLastPageLen.shards[i], pIndptr.shards[i], pageSize, batchSize, contextParallel, cpWs, cpR, steps, pGlobalLastPageLen?.shards[i]);
     }
   }
 
@@ -2795,7 +2796,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): void {
+  concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean): void {
     const pKvCache = this.cast(kvCache);
     const pAppendCkv = this.cast(appendCkv);
     const pAppendKpe = this.cast(appendKpe);
@@ -2803,8 +2804,10 @@ export class ParallelOps implements DeviceOps {
     const pIndptr = this.cast(indptr);
     const pBatchIndices = this.cast(batchIndices);
     const pPositions = this.cast(positions);
+    const cpWorldSize = contextParallel ? this.worldSize : 0;
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].concatAndCacheDsMla(pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN);
+      const cpRank = contextParallel ? i : 0;
+      this.devices[i].concatAndCacheDsMla(pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, contextParallel, cpWorldSize, cpRank);
     }
   }
 
@@ -2912,7 +2915,7 @@ export class ParallelOps implements DeviceOps {
   // and each rank must sum over all idxNHeads), so the whole pipeline runs
   // per-device and the [totalQ, topk] slots are Replicated. Under context
   // parallel each rank filters to its own KV slice via cpWorld/cpRank.
-  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, decode: boolean, maxKv: number, contextParallel?: boolean): Tensor {
+  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, decode: boolean, maxKv: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, globalLastPageLen?: Tensor): Tensor {
     const pQ = this.cast(idxQ);
     const pKData = this.cast(kData);
     const pWeights = this.cast(weights);
@@ -2921,11 +2924,12 @@ export class ParallelOps implements DeviceOps {
     const pLastPageLen = this.cast(lastPageLen);
     const pQoIndptr = this.cast(qoIndptr);
     const pBatchIndices = this.cast(batchIndices);
+    const pGlobalLastPageLen = globalLastPageLen ? this.cast(globalLastPageLen) : undefined;
     const slotShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       const cpW = contextParallel ? this.worldSize : 1;
       const cpR = contextParallel ? i : 0;
-      slotShards.push(this.devices[i].indexerTopkSlots(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], pBatchIndices.shards[i], scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, decode, maxKv, contextParallel, cpW, cpR));
+      slotShards.push(this.devices[i].indexerTopkSlots(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], pBatchIndices.shards[i], scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, decode, maxKv, contextParallel, cpW, cpR, pGlobalLastPageLen?.shards[i]));
     }
     return this.wrapShards(idxQ.workspace, slotShards, [totalQ, topk], "I32", TensorParallelism.Replicated);
   }

@@ -77,6 +77,7 @@ export class ExecutionState {
         this.ws.mlaBatchIndices, this.ws.positionIds,
         nnz, pageSize, kvLoraRank, qkRopeDim,
         kvLoraRank, qkRopeDim,
+        pagedKV.contextParallel,
       );
     } else {
       this.ws.glm.mlaKvCacheAppend(
@@ -163,6 +164,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
   lastPageLen: Tensor;
   /** Pinned host buffer [B] of I32: written by updateIndptr, read via memcpy to lastPageLen. */
   lastPageLenH: Tensor;
+  /** GPU buffer [B] of I32: global (non-CP-adjusted) last page len, read by indexer score kernel. */
+  globalLastPageLen: Tensor;
+  /** Pinned host buffer [B] of I32: global last page len, copied to globalLastPageLen. */
+  globalLastPageLenH: Tensor;
   /** Pinned host buffer [B] of I32: KV lengths per batch entry, used by MLA prefill plan. */
   kvLenH: Tensor;
   /** GPU buffer [B] of I32: device copy of kvLenH, global KV lengths per sequence (post-gather). */
@@ -201,6 +206,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.indptrH = this.allocPinned([(B + 1) * I32], "I32", "indptrH");
     this.lastPageLen = this.alloc([B * I32], "I32", "lastPageLen");
     this.lastPageLenH = this.allocPinned([B], "I32", "lastPageLenH");
+    this.globalLastPageLen = this.alloc([B * I32], "I32", "globalLastPageLen");
+    this.globalLastPageLenH = this.allocPinned([B], "I32", "globalLastPageLenH");
     this.kvLenH = this.allocPinned([B], "I32", "kvLenH");
     this.kvLenD = this.alloc([B], "I32", "kvLenD");
     this.kvTokenIndptrH = this.allocPinned([(B + 1) * I32], "I32", "kvTokenIndptrH");
@@ -269,7 +276,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
         this.indptrD,
         pagedKV.pageSize, batchSize,
         pagedKV.contextParallel,
-        undefined, undefined, steps
+        undefined, undefined, steps,
+        this.globalLastPageLen,
       );
     }
   }
@@ -384,6 +392,13 @@ export class ExecutionWorkspace extends WorkspaceBase {
     });
 
     this.lastPageLenH.withPinnedBuffer(buf => {
+      for (let i = 0; i < batchSize; i++) {
+        const allocLen = pagedKV.sequences[i].allocLen;
+        const remainder = allocLen % pagedKV.pageSize;
+        buf.writeInt32LE(remainder !== 0 ? remainder : (allocLen > 0 ? pagedKV.pageSize : 0), i * I32);
+      }
+    });
+    this.globalLastPageLenH.withPinnedBuffer(buf => {
       for (let i = 0; i < batchSize; i++) {
         const allocLen = pagedKV.sequences[i].allocLen;
         const remainder = allocLen % pagedKV.pageSize;
@@ -608,6 +623,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     pagedKV.indices.memcpy(pagedKV.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
     this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
+    this.globalLastPageLen.memcpy(this.globalLastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
 
     this.kvLenD.memcpy(this.kvLenH, batchSize * I32, MemcpyKind.HostToDevice);
     this.kvTokenIndptrD.memcpy(this.kvTokenIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);

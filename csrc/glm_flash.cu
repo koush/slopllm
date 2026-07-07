@@ -1066,7 +1066,8 @@ __global__ void concat_and_cache_ds_mla_kernel(
     const int32_t* __restrict__ batch_indices,
     const int32_t* __restrict__ positions,
     int page_size,
-    size_t ckv_stride_n, size_t kpe_stride_n
+    size_t ckv_stride_n, size_t kpe_stride_n,
+    uint32_t cp_world_size, uint32_t cp_rank
 ) {
     constexpr int SCALE_BLOCK = 128;
     constexpr int NUM_TILES = KV_LORA_RANK / SCALE_BLOCK;
@@ -1080,9 +1081,19 @@ __global__ void concat_and_cache_ds_mla_kernel(
     const int token_idx = blockIdx.x;
 
     const int batch = batch_indices[token_idx];
-    const int pos = positions[token_idx];
-    const int page_in_seq = pos / page_size;
-    const int offset_in_page = pos % page_size;
+    int pos = positions[token_idx];
+
+    // Context parallelism: each GPU stores every Nth token (interleaved).
+    // Filter out tokens not belonging to this rank, and remap to local position.
+    int eff_page_size = page_size;
+    if (cp_world_size > 0) {
+        if ((uint32_t)pos % cp_world_size != cp_rank) return;
+        pos = ((uint32_t)pos - cp_rank) / cp_world_size;
+        eff_page_size = page_size / (int)cp_world_size;
+    }
+
+    const int page_in_seq = pos / eff_page_size;
+    const int offset_in_page = pos % eff_page_size;
     const int page_id = indices[indptr[batch] + page_in_seq];
     const size_t slot = (size_t)page_id * page_size + offset_in_page;
 
@@ -1145,7 +1156,8 @@ void glm_concat_and_cache_ds_mla(
     int32_t* batch_indices, int32_t* positions,
     uint32_t nnz, uint32_t page_size,
     uint32_t kv_lora_rank, uint32_t pe_dim,
-    size_t append_ckv_stride_n, size_t append_kpe_stride_n
+    size_t append_ckv_stride_n, size_t append_kpe_stride_n,
+    uint32_t cp_world_size, uint32_t cp_rank
 ) {
     cudaSetDevice(ctx->device_id);
 
@@ -1156,7 +1168,8 @@ void glm_concat_and_cache_ds_mla(
             (const __nv_bfloat16*)append_ckv,
             (const __nv_bfloat16*)append_kpe,
             indices, indptr, batch_indices, positions,
-            page_size, append_ckv_stride_n, append_kpe_stride_n);
+            page_size, append_ckv_stride_n, append_kpe_stride_n,
+            cp_world_size, cp_rank);
     } else if (kv_lora_rank == 128 && pe_dim == 64) {
         constexpr int BLOCK_SIZE = 64;
         concat_and_cache_ds_mla_kernel<128, 64><<<nnz, BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
@@ -1164,7 +1177,8 @@ void glm_concat_and_cache_ds_mla(
             (const __nv_bfloat16*)append_ckv,
             (const __nv_bfloat16*)append_kpe,
             indices, indptr, batch_indices, positions,
-            page_size, append_ckv_stride_n, append_kpe_stride_n);
+            page_size, append_ckv_stride_n, append_kpe_stride_n,
+            cp_world_size, cp_rank);
     } else {
         fprintf(stderr, "glm_concat_and_cache_ds_mla: unsupported kv_lora_rank=%u pe_dim=%u\n",
                 kv_lora_rank, pe_dim);

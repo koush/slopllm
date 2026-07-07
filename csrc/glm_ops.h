@@ -469,6 +469,7 @@ void glm_position_step(GlmCtx* ctx,
 void glm_mla_position_step(GlmCtx* ctx,
                              int32_t* position_ids,
                              int32_t* last_page_len,
+                             int32_t* global_last_page_len,
                              const int32_t* indptr,
                              uint32_t page_size,
                              uint32_t batch_size,
@@ -681,7 +682,8 @@ void glm_concat_and_cache_ds_mla(
     int32_t* batch_indices, int32_t* positions,
     uint32_t nnz, uint32_t page_size,
     uint32_t kv_lora_rank, uint32_t pe_dim,
-    size_t append_ckv_stride_n, size_t append_kpe_stride_n);
+    size_t append_ckv_stride_n, size_t append_kpe_stride_n,
+    uint32_t cp_world_size = 0, uint32_t cp_rank = 0);
 
 // Sparse MLA SM120: prefill attention over topk-selected KV slots
 // q: [num_tokens, num_heads, d_qk] BF16 (d_qk = 576 = 512 nope + 64 rope)

@@ -3601,6 +3601,7 @@ void glm_position_step(GlmCtx* ctx,
 __global__ void __launch_bounds__(128) mla_position_step_kernel(
     int32_t* position_ids,
     int32_t* last_page_len,
+    int32_t* global_last_page_len,
     const int32_t* indptr,
     uint32_t page_size,
     uint32_t batch_size,
@@ -3614,6 +3615,13 @@ __global__ void __launch_bounds__(128) mla_position_step_kernel(
     int32_t pos = position_ids[seq] + steps;
     position_ids[seq] = pos;
 
+    // Global last_page_len (always computed, used by indexer which scores
+    // against the replicated kData containing all tokens).
+    int32_t gkv = pos + 1;
+    int32_t grem = gkv % (int32_t)page_size;
+    int32_t global_lpl = (grem != 0) ? grem : (int32_t)page_size;
+    if (global_last_page_len) global_last_page_len[seq] = global_lpl;
+
     if (cp_world_size > 1) {
         uint32_t eps = page_size / cp_world_size;
         int32_t local_kv_len = (pos >= (int32_t)cp_rank)
@@ -3624,15 +3632,14 @@ __global__ void __launch_bounds__(128) mla_position_step_kernel(
             ? ((remainder != 0) ? remainder : (int32_t)eps)
             : 0;
     } else {
-        int32_t kv_len = pos + 1;
-        int32_t remainder = kv_len % (int32_t)page_size;
-        last_page_len[seq] = (remainder != 0) ? remainder : (int32_t)page_size;
+        last_page_len[seq] = global_lpl;
     }
 }
 
 void glm_mla_position_step(GlmCtx* ctx,
                              int32_t* position_ids,
                              int32_t* last_page_len,
+                             int32_t* global_last_page_len,
                              const int32_t* indptr,
                              uint32_t page_size,
                              uint32_t batch_size,
@@ -3643,7 +3650,7 @@ void glm_mla_position_step(GlmCtx* ctx,
     dim3 grid((batch_size + 127) / 128);
     dim3 block(128);
     mla_position_step_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
-        position_ids, last_page_len, indptr,
+        position_ids, last_page_len, global_last_page_len, indptr,
         page_size, batch_size,
         cp_world_size, cp_rank, steps);
 }
