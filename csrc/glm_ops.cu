@@ -1446,6 +1446,19 @@ __global__ void indexer_score_topk_kernel(
     const int prefixLen = max(0, kvLen - numQueries);
     const int causalLimit = causal ? (prefixLen + qLocalPos) : (kvLen - 1);
 
+    // Fast path: when the number of candidate positions fits within topk, the
+    // selection is deterministic (every valid position is kept), so the score +
+    // top-k heap is pure waste. Emit the identity selection directly. This is a
+    // device-side branch on kvLen (from indptr/lastPageLen), so it stays
+    // CUDA-graph capturable — the launch shape is unchanged across replays.
+    const int numValid = causalLimit + 1;  // positions 0..causalLimit
+    if (numValid <= topk) {
+        for (int i = tid; i < topk; i += blockDim.x) {
+            out_idx[(size_t)qIdx * topk + i] = (i < numValid) ? i : -1;
+        }
+        return;
+    }
+
     extern __shared__ char smem[];
     __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem);
     __nv_bfloat16* w_s = q_s + idxNHeads * idxHeadDim;
