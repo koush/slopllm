@@ -3,6 +3,7 @@ import { DeviceOps, MaskMode } from "./device_ops";
 import { I32 } from "./glm_ops";
 import { type PagedKVCache } from "./paged_kv";
 import { MemcpyKind, Tensor } from "./tensor";
+import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
 export const DECODE_PLAN_INFO_SIZE = 10;
@@ -15,6 +16,7 @@ export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 
 export class ExecutionState {
   input?: Tensor;
+  sharedSlots?: UsingHolder<Tensor>;
 
   constructor(
     public readonly batchSize: number, public readonly totalTokens: number, public readonly seqLens: number[],
@@ -148,7 +150,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   positionIds: Tensor;
   /** Pinned host buffer [B*S] of I32: written by host, read via memcpy to positionIds. */
   positionIdsH: Tensor;
-/** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer prefill run. */
+  /** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer prefill run. */
   qoIndptrD: Tensor;
   /** Pinned host buffer [B+1] of I32: written by host, read by MLA prefill plan and memcpy to qoIndptrD. */
   qoIndptrH: Tensor;
@@ -238,7 +240,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       throw new Error("startTracking already active");
     }
     if (this.tracked.size) {
-      console.warn("startTracking was called with tensors already allocated, this may result in non-deterministic allocations."); 
+      console.warn("startTracking was called with tensors already allocated, this may result in non-deterministic allocations.");
     }
     for (const tensor of this.exported) {
       if (!keepExports.has(tensor)) {
@@ -575,7 +577,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         this.mlaPrefillPlanInfo,
         this.qoIndptrH, this.indptrH,
         this.kvLenH, this.lastPageLenH,
-        batchSize, nHeads, cfg.kvLoraRank!, !customMask || customMask.mode === MaskMode.CausalCustom  || customMask.mode === MaskMode.Causal,
+        batchSize, nHeads, cfg.kvLoraRank!, !customMask || customMask.mode === MaskMode.CausalCustom || customMask.mode === MaskMode.Causal,
         pagedKV.pageSize, pagedKV.sequences.map(s => s.allocLen),
         pagedKV.contextParallel
       );

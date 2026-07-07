@@ -1426,7 +1426,10 @@ __global__ void indexer_score_topk_kernel(
     const int32_t* __restrict__ qoIndptr,     // [B+1]
     float scale,
     int idxNHeads, int idxHeadDim, int pageSize, int topk,
-    int causal
+    int causal,
+    const uint8_t* __restrict__ custom_mask,  // bit-packed [qo_len, mask_kv_len], null = no mask
+    const int32_t* __restrict__ mask_indptr,  // [B+1] offset into custom_mask per seq
+    const int32_t* __restrict__ mask_kv_len   // [B] mask width per seq, null = numQueries
 ) {
     const int qIdx = blockIdx.x;
     const int tid = threadIdx.x;
@@ -1446,6 +1449,18 @@ __global__ void indexer_score_topk_kernel(
     const int prefixLen = max(0, kvLen - numQueries);
     const int causalLimit = causal ? (prefixLen + qLocalPos) : (kvLen - 1);
 
+    // CausalCustom mask setup: positions < mask_prefix_len are always attended
+    // (causal is trivially satisfied). Positions >= mask_prefix_len are filtered
+    // by the bit-packed custom mask at [qLocalPos * mask_kv_len + (pos - mask_prefix_len)].
+    const uint8_t* mask_ptr = nullptr;
+    int mask_kv_len_val = 0;
+    int mask_prefix_len = 0;
+    if (custom_mask && mask_indptr) {
+        mask_ptr = custom_mask + mask_indptr[seq];
+        mask_kv_len_val = mask_kv_len ? mask_kv_len[seq] : numQueries;
+        mask_prefix_len = max(0, kvLen - mask_kv_len_val);
+    }
+
     // Fast path: when the number of candidate positions fits within topk, the
     // selection is deterministic (every valid position is kept), so the score +
     // top-k heap is pure waste. Emit the identity selection directly. This is a
@@ -1454,7 +1469,16 @@ __global__ void indexer_score_topk_kernel(
     const int numValid = causalLimit + 1;  // positions 0..causalLimit
     if (numValid <= topk) {
         for (int i = tid; i < topk; i += blockDim.x) {
-            out_idx[(size_t)qIdx * topk + i] = (i < numValid) ? i : -1;
+            if (i < numValid) {
+                bool valid = true;
+                if (mask_ptr && i >= mask_prefix_len) {
+                    int mask_offset = qLocalPos * mask_kv_len_val + (i - mask_prefix_len);
+                    valid = ((mask_ptr[mask_offset >> 3] >> (mask_offset & 7)) & 1);
+                }
+                out_idx[(size_t)qIdx * topk + i] = valid ? i : -1;
+            } else {
+                out_idx[(size_t)qIdx * topk + i] = -1;
+            }
         }
         return;
     }
@@ -1492,6 +1516,12 @@ __global__ void indexer_score_topk_kernel(
         for (int t = 0; t < tokensInPage; t++) {
             const int localK = firstLocalK + t;
             if (localK > causalLimit) break;
+
+            // CausalCustom mask: skip masked-out positions (they never enter the heap)
+            if (mask_ptr && localK >= mask_prefix_len) {
+                int mask_offset = qLocalPos * mask_kv_len_val + (localK - mask_prefix_len);
+                if (!((mask_ptr[mask_offset >> 3] >> (mask_offset & 7)) & 1)) continue;
+            }
 
             if (warpIdx < idxNHeads) {
                 const __nv_bfloat16* k_ptr = kData + (size_t)pageId * pageSize * idxHeadDim + t * idxHeadDim;
@@ -1552,7 +1582,8 @@ void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
     float scale, int totalQ, int idxNHeads, int idxHeadDim,
-    int pageSize, int topk, int causal) {
+    int pageSize, int topk, int causal,
+    const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len) {
     cudaSetDevice(ctx->device_id);
     int block_size = idxNHeads * 32;
     if (block_size > 1024) block_size = 1024;
@@ -1564,7 +1595,8 @@ void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
     indexer_score_topk_kernel<<<totalQ, block_size, smem_size, GLM_STREAM(ctx)>>>(
         out_idx, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
         (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
-        scale, idxNHeads, idxHeadDim, pageSize, topk, causal);
+        scale, idxNHeads, idxHeadDim, pageSize, topk, causal,
+        custom_mask, mask_indptr, mask_kv_len);
 }
 
 // ---------------------------------------------------------------------------

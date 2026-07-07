@@ -10,7 +10,7 @@ import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { MetaOps } from "./meta_ops";
 import { resolveModelPath } from "./model_path";
-import { mtpTreeDecode, MtpStats } from "./mtp";
+import { MtpStats, mtpTreeDecode } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
 import { Qwen35Model } from "./qwen35_model";
 import { Qwen3Model } from "./qwen3_model";
@@ -235,11 +235,15 @@ export function* generateStream(
   let currentToken: number;
 
   captureManager.disabled = graphState === undefined;
+
+  // needed by mtp
+  using sharedSlots = new UsingHolder<Tensor>(undefined!);
   {
     const inputIdsList = [suffixIds];
     const batchSize = inputIdsList.length;
     const seqLens = inputIdsList.map(ids => ids.length);
     const state = ws.planPrefill(model, batchSize, seqLens, cache);
+    state.sharedSlots = sharedSlots;
     state.setInput(inputIdsList);
     using hiddenStates = model.forward(state);
     using firstTokens = state.computeLogits(hiddenStates, model);
@@ -281,7 +285,7 @@ export function* generateStream(
   try {
     for (let i = 1; i < maxNewTokens; i++) {
       if (mtp && model.forwardMtp && topks.length > 0) {
-        const { warmup, tokens, numAccepted, numDraftTokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, ws, currentToken, topks, cache, tokenizer);
+        const { warmup, tokens, numAccepted, numDraftTokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots, ws, currentToken, topks, cache, tokenizer);
         if (mtpStats && !warmup) mtpStats.observe(numDraftTokens, numAccepted);
         // glm.synchronize();
         for (const t of tokens) {

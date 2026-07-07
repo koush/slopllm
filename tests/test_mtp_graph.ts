@@ -58,10 +58,12 @@ describe("MTP with CUDA graph capture: TP validation", () => {
     const sampleWorkspace = new WorkspaceBase(ws.glm);
     let gpuSampleResult: Tensor | null = null;
     using targetHiddenStates = new UsingHolder<Tensor>(undefined!);
+    using sharedSlots = new UsingHolder<Tensor>(undefined!);
 
     const suffixIds = cache.prefixMatch(0, INPUT_IDS);
     {
       const state = ws.planPrefill(model, 1, [suffixIds.length], cache);
+      state.sharedSlots = sharedSlots;
       state.setInput([suffixIds]);
       using hiddenStates = model.forward(state);
       using firstTokens = state.computeLogits(hiddenStates, model);
@@ -88,7 +90,7 @@ describe("MTP with CUDA graph capture: TP validation", () => {
         ws.glm.synchronize();
         const currentToken = sampleResult.readPinnedBuffer().readInt32LE();
         const { tokens: result } = mtpTreeDecode(
-          captureManager, model, targetHiddenStates.value, ws, currentToken, Array(nextn).fill(2), cache,
+          captureManager, model, targetHiddenStates.value, sharedSlots, ws, currentToken, Array(nextn).fill(2), cache,
         );
         for (const t of result) {
           cache.reportTokens(0, [t]);

@@ -91,7 +91,9 @@ void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
     float scale, int totalQ, int idxNHeads, int idxHeadDim,
-    int pageSize, int topk, int causal);
+    int pageSize, int topk, int causal,
+    const uint8_t* custom_mask = nullptr, const int32_t* mask_indptr = nullptr,
+    const int32_t* mask_kv_len = nullptr);
 
 void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const void* q, const void* kData, const void* weights,

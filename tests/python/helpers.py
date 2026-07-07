@@ -1189,7 +1189,7 @@ class GlmOps:
 
     def indexer_score_topk(self, out_idx, q, k_data, weights, page_indices, page_indptr,
                            last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
-                           page_size, topk, causal):
+                           page_size, topk, causal, custom_mask=None, mask_indptr=None, mask_kv_len=None):
         self.lib.glm_indexer_score_topk(
             self.ctx,
             self._ptr(out_idx),
@@ -1201,7 +1201,10 @@ class GlmOps:
             self._ptr(last_page_len),
             self._ptr(qo_indptr),
             ctypes.c_float(scale),
-            total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0
+            total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0,
+            self._ptr(custom_mask) if custom_mask is not None else ctypes.c_void_p(0),
+            self._ptr(mask_indptr) if mask_indptr is not None else ctypes.c_void_p(0),
+            self._ptr(mask_kv_len) if mask_kv_len is not None else ctypes.c_void_p(0)
         )
 
     def indexer_score_topk_v2(self, out_idx, q, k_data, weights, page_indices, page_indptr,

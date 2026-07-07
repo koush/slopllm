@@ -4,6 +4,7 @@ import { MaskMode } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { BF16, I32 } from "./glm_ops";
 import { MemcpyKind, Tensor } from "./tensor";
+import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
 /**
@@ -168,6 +169,7 @@ export function mtpTreeDecode(
   captureManager: CaptureManager,
   model: ChatModel,
   mtpHiddenStates: Tensor,
+  sharedSlots: UsingHolder<Tensor>,
   ws: ExecutionWorkspace,
   targetToken: number,
   topks: number[],
@@ -190,7 +192,7 @@ export function mtpTreeDecode(
   const pagedKv = cache.getPagedKV();
   const batchSize = pagedKv.sequences.length;
 
-  using _tracker = ws.startTracking(new Set([mtpHiddenStates]));
+  using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedSlots.value]));
 
   const hiddenDim = mtpHiddenStates.shape[1];
   const rowBytes = hiddenDim * BF16; // BF16 = 2 bytes per element
@@ -248,6 +250,7 @@ export function mtpTreeDecode(
       }
 
       const state = ws.planDecode(model, newBatchSize, cache);
+      state.sharedSlots = sharedSlots;
 
 
       warmup ||= !captureManager.isCaptured(['mtp-tree-decode', i, topks.length]);
@@ -340,6 +343,7 @@ export function mtpTreeDecode(
         positionIds: posIds,
         maskKvLen: chunkedMask.maskKvLen,
       });
+      state.sharedSlots = sharedSlots;
 
       const prevHs = chainedHs;
       warmup ||= !captureManager.isCaptured(['mtp-chunk', depth, topks.length]);
@@ -418,6 +422,7 @@ export function mtpTreeDecode(
     ...targetCustomMask,
     positionIds: getPositionIdsMask(ws, originalAllocLen, targetTopk),
   });
+  targetPrefillState.sharedSlots = sharedSlots;
 
   targetPrefillState.setInput(verificationTokens);
 
@@ -555,6 +560,7 @@ export function mtpTreeDecode(
 
   const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache);
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
+  mtpExtendPrefill.sharedSlots = sharedSlots;
 
   warmup ||= !captureManager.isCaptured(['mtp-replace', finishCount]);
   captureManager.run(() => {

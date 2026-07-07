@@ -444,7 +444,7 @@ export class Glm51Model extends ChatModel {
 
       // Indexer K: wk(normed) → layernorm → split → RoPE → concat → append to kData
       // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
-      if (cfg.indexHeadDim > 0 && pagedKV.kData.length > layerIdx && cfg.indexerTypes[layerIdx] !== "shared") {
+      if (cfg.indexHeadDim > 0 && pagedKV.kData.length > layerIdx && (cfg.indexerTypes[layerIdx] !== "shared" || !sharedSlots.value)) {
         const idxRopeDim = qkRopeDim;
         const idxNopeDim = cfg.indexHeadDim - idxRopeDim;
         using idxKRaw = normed.linear(this.tensors.get(`${pfx}.indexer.wk.weight`)!, BS);
@@ -494,7 +494,7 @@ export class Glm51Model extends ChatModel {
       // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
       // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
       using idxQStream = this.glm.withStream(() => {
-        if (cfg.indexHeadDim === 0 || cfg.indexerTypes[layerIdx] === "shared") return undefined as Tensor | undefined;
+        if (cfg.indexHeadDim === 0 || (cfg.indexerTypes[layerIdx] === "shared" && sharedSlots.value)) return undefined as Tensor | undefined;
         using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!, BS);
         return idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
       });
@@ -528,12 +528,14 @@ export class Glm51Model extends ChatModel {
       using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!, BS);
       idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
 
+      const cm = (!state.isDecode && state.customMask?.mode === MaskMode.CausalCustom) ? state.customMask : undefined;
       const slots = this.glm.indexerTopkSlots(
         idxQ, pagedKV.kData[layerIdx], idxWeights,
         pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD, ws.mlaBatchIndices,
         Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim, pagedKV.pageSize, idxTopk,
         state.isDecode, pagedKV.maxPages * pagedKV.pageSize, this.contextParallel,
         undefined, undefined, ws.globalLastPageLen,
+        cm?.mask, cm?.indptr, cm?.maskKvLen,
       );
       sharedSlots.replace(slots);
     }
@@ -644,7 +646,8 @@ export class Glm51Model extends ChatModel {
     using cos = rotaryEmbedding.result.cos;
     using sin = rotaryEmbedding.result.sin;
 
-    using sharedSlots = new UsingHolder<Tensor>(undefined!);
+    using _sharedSlots = state.sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
+    const sharedSlots = _sharedSlots || state.sharedSlots!;
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const result = this.mlaLayer(cos, sin, normed.value, residual.value, i, state, sharedSlots);
@@ -653,6 +656,7 @@ export class Glm51Model extends ChatModel {
       if (process.env.GLM_DEBUG) { console.log(`layer ${i} done`); (this.glm as any).synchronize?.(); console.log(`layer ${i} sync ok`); }
     }
 
+    state.sharedSlots?.value?.removeTracking();
     return normed.detach().removeTracking();
   }
 
@@ -695,7 +699,8 @@ export class Glm51Model extends ChatModel {
     using sin = rotaryEmbedding.result.sin;
 
     const layerIdx = cfg.numHiddenLayers;
-    using sharedSlots = new UsingHolder<Tensor>(undefined!);
+    using _sharedSlots = state.sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
+    const sharedSlots = _sharedSlots || state.sharedSlots!;
     const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state, sharedSlots);
     using _residual = result.residual;
 
