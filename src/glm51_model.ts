@@ -83,8 +83,8 @@ function loadConfig(modelDir: string): Glm51Config {
     normTopkProb: raw.norm_topk_prob ?? false,
     routedScalingFactor: raw.routed_scaling_factor ?? 1.0,
     indexTopk: raw.index_topk ?? 256,
-    // set to true to completely disable sparse indexing and fall back to dense attention.
-    indexHeadDim: raw.index_head_dim ?? 64,
+    // set to 0 to completely disable sparse indexing and fall back to dense attention.
+    // indexHeadDim: 0,
     indexNHeads: raw.index_n_heads ?? 4,
     indexerTypes: raw.indexer_types
       ? [...raw.indexer_types, ...(raw.num_nextn_predict_layers ? [raw.index_share_for_mtp_iteration ? "shared" : "full"] : [])]
