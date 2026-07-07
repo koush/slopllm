@@ -220,7 +220,8 @@ export function mtpTreeDecode(
     ws.glm.synchronize();
   }
 
-  if (true) {
+  const useDecodeDraftGenerator = true;
+  if (useDecodeDraftGenerator) {
     // current path that decodes in batch
     let hostBufOffset = 0;
     let chainedMtpHiddenState = mtpHiddenStates;
