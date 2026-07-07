@@ -233,6 +233,14 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
+        self.lib.glm_indexer_score_topk.restype = None
+        self.lib.glm_indexer_score_topk.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+        ]
+
         self.lib.glm_topk_to_slots.restype = None
         self.lib.glm_topk_to_slots.argtypes = [
             ctypes.c_void_p,
@@ -1160,6 +1168,23 @@ class GlmOps:
             self._ptr(qo_indptr),
             ctypes.c_float(scale),
             total_q, n_heads, head_dim, page_size, max_kv_len, 1 if causal else 0
+        )
+
+    def indexer_score_topk(self, out_idx, q, k_data, weights, page_indices, page_indptr,
+                           last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
+                           page_size, topk, causal):
+        self.lib.glm_indexer_score_topk(
+            self.ctx,
+            self._ptr(out_idx),
+            self._ptr(q),
+            self._ptr(k_data),
+            self._ptr(weights),
+            self._ptr(page_indices),
+            self._ptr(page_indptr),
+            self._ptr(last_page_len),
+            self._ptr(qo_indptr),
+            ctypes.c_float(scale),
+            total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0
         )
 
     def topk_to_slots(self, slots, topk_idx, page_indices, page_indptr,

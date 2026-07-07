@@ -10,7 +10,6 @@ import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
-import { reverseDictionary } from "../vendor/transformers.js/packages/transformers/types/utils/core";
 
 export { ExecutionState as BatchState };
 export type { SamplingParams };
@@ -36,6 +35,8 @@ export interface Glm51Config extends CommonModelConfig {
   indexTopk: number;
   indexHeadDim: number;
   indexNHeads: number;
+  indexerTypes: string[];
+  indexShareForMtp: boolean;
   ropeInterleave: boolean;
   indexerRopeInterleave: boolean;
   mlpLayerTypes: string[];
@@ -84,6 +85,10 @@ function loadConfig(modelDir: string): Glm51Config {
     indexTopk: raw.index_topk ?? 256,
     indexHeadDim: true ? 0 : raw.index_head_dim ?? 64,
     indexNHeads: raw.index_n_heads ?? 4,
+    indexerTypes: raw.indexer_types
+      ? [...raw.indexer_types, ...(raw.num_nextn_predict_layers ? [raw.index_share_for_mtp_iteration ? "shared" : "full"] : [])]
+      : Array(raw.num_hidden_layers + (raw.num_nextn_predict_layers ?? 0)).fill("full"),
+    indexShareForMtp: raw.index_share_for_mtp_iteration ?? false,
     ropeInterleave: raw.rope_interleave ?? false,
     indexerRopeInterleave: raw.indexer_rope_interleave ?? raw.rope_interleave ?? false,
     mlpLayerTypes,
@@ -307,7 +312,7 @@ export class Glm51Model extends ChatModel {
     }
   }
 
-  createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, pageSize = 16): ChatCache {
+  createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, pageSize = 64): ChatCache {
     const cfg = this.cfg;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
@@ -405,7 +410,7 @@ export class Glm51Model extends ChatModel {
     return result.reshape([BS, hs]);
   }
 
-  private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState): { normed: Tensor, residual: Tensor } {
+  private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState, sharedSlots: UsingHolder<Tensor>): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const ws = state.ws;
     const hs = cfg.hiddenSize;
@@ -436,7 +441,8 @@ export class Glm51Model extends ChatModel {
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
 
       // Indexer K: wk(normed) → layernorm → split → RoPE → concat → append to kData
-      if (cfg.indexHeadDim > 0 && pagedKV.kData.length > layerIdx) {
+      // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
+      if (cfg.indexHeadDim > 0 && pagedKV.kData.length > layerIdx && cfg.indexerTypes[layerIdx] !== "shared") {
         const idxRopeDim = qkRopeDim;
         const idxNopeDim = cfg.indexHeadDim - idxRopeDim;
         using idxKRaw = normed.linear(this.tensors.get(`${pfx}.indexer.wk.weight`)!, BS);
@@ -445,15 +451,14 @@ export class Glm51Model extends ChatModel {
           this.tensors.get(`${pfx}.indexer.k_norm.bias`)!,
           1e-6, cfg.indexHeadDim, BS,
         );
-        let idxKOut: Tensor;
-        if (idxNopeDim > 0) {
-          using idxKPe = idxKNormed.slice(1, 0, idxRopeDim);
-          using idxKNope = idxKNormed.slice(1, idxRopeDim, idxNopeDim);
-          using idxKPeRope = idxKPe.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
-          idxKOut = idxKPeRope.cat([idxKNope], 1);
-        } else {
-          idxKOut = idxKNormed.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
-        }
+        using idxKOut = idxNopeDim > 0
+          ? (() => {
+              using idxKPe = idxKNormed.slice(1, 0, idxRopeDim);
+              using idxKNope = idxKNormed.slice(1, idxRopeDim, idxNopeDim);
+              using idxKPeRope = idxKPe.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
+              return idxKPeRope.cat([idxKNope], 1);
+            })()
+          : idxKNormed.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
 
         const nnz = state.isDecode ? batchSize : totalTokens;
         ws.glm.mlaKvCacheAppend(
@@ -463,9 +468,8 @@ export class Glm51Model extends ChatModel {
           ws.mlaBatchIndices, ws.positionIds,
           nnz, pagedKV.pageSize, cfg.indexHeadDim, 0,
           cfg.indexHeadDim, 0,
-          pagedKV.contextParallel,
+          false,
         );
-        return idxKOut;
       }
     });
 
@@ -486,8 +490,9 @@ export class Glm51Model extends ChatModel {
       });
 
       // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
+      // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
       using idxQStream = this.glm.withStream(() => {
-        if (cfg.indexHeadDim === 0) return undefined as Tensor | undefined;
+        if (cfg.indexHeadDim === 0 || cfg.indexerTypes[layerIdx] === "shared") return undefined as Tensor | undefined;
         using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!, BS);
         return idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
       });
@@ -505,58 +510,109 @@ export class Glm51Model extends ChatModel {
 
     kvcache.streamWaitEvent();
     q.streamWaitEvent();
+    if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} streams joined`); (this.glm as any).synchronize?.(); }
 
     using qAbsorbedR = q.result.qAbsorbedR;
     using qPeR = q.result.qPeR;
 
-    // Indexer forward: fused score kernel + topk
+    // Indexer forward: fused score+topk kernel → slots
     using idxQ = q.result.idxQ;
     if (idxQ) {
+      // 'full' layer: compute score+topk → slots
       const idxNHeads = cfg.indexNHeads;
       const idxHeadDim = cfg.indexHeadDim;
       const idxTopk = cfg.indexTopk;
-      const maxKvLen = state.isDecode
-        ? pagedKV.sequences.reduce((max, s) => Math.max(max, s.allocLen), 0)
-        : pagedKV.sequences.reduce((sum, s) => sum + s.allocLen, 0);
 
-      if (maxKvLen > idxTopk) {
-        using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!, BS);
-        idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
+      using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!, BS);
+      idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
 
-        using indexScores = ws.alloc([BS, maxKvLen], "BF16");
-        this.glm.indexerScore(
-          indexScores, idxQ, pagedKV.kData[layerIdx], idxWeights,
-          pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD,
-          Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim,
-          pagedKV.pageSize, maxKvLen, !state.isDecode,
-        );
+      const { indices: topkIndices } = this.glm.indexerScoreTopk(
+        idxQ, pagedKV.kData[layerIdx], idxWeights,
+        pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD,
+        Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim,
+        pagedKV.pageSize, idxTopk, !state.isDecode,
+      );
+      using _topkIndices = topkIndices;
 
-        const { indices: topkIndices } = indexScores.topk(idxTopk, maxKvLen);
-        using _topkIndices = topkIndices;
-      }
+      const slots = ws.alloc([BS, idxTopk], "I32");
+      this.glm.topkToSlots(
+        slots, topkIndices,
+        pagedKV.indices, ws.indptrD, ws.lastPageLen,
+        ws.mlaBatchIndices, BS, idxTopk, pagedKV.pageSize,
+        1, 0, this.contextParallel,
+      );
+      sharedSlots.replace(slots);
     }
+    if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} indexer+slots done`); (this.glm as any).synchronize?.(); }
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     {
-      const mlaResult = state.isDecode
-        ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel)
-        : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel, !state.customMask ? MaskMode.Causal : state.customMask.mode, state.customMask?.mask, state.customMask?.indptr, state.customMask?.maskKvLen);
-      using attnOut = mlaResult.o;
-      using lseBuf = mlaResult.lse;
+      let attnOut: Tensor;
+      let lseBuf: Tensor;
+      let vS = S;
+      let vB = B;
+
+      if (sharedSlots.value) {
+        // Sparse MLA path: SM120 kernel on packed FP8 KV cache
+        using qConcat = qAbsorbedR.cat([qPeR], 2); // [BS, nHeads, kvLoraRank + qkRopeDim]
+        const strideKvBlock = pagedKV.pageSize * pagedKV.bytesPerToken;
+        let sparseResult: { o: Tensor, lse: Tensor };
+
+        if (state.isDecode) {
+          const numSplits = Math.ceil(cfg.indexTopk / 64);
+          const midPar = this.contextParallel ? undefined : TensorParallelism.Row;
+          using midOut = ws.alloc([BS, nHeads, numSplits, kvLoraRank], "BF16", undefined, midPar);
+          using midLse = ws.alloc([BS, nHeads, numSplits], "F32", undefined, midPar);
+          sparseResult = this.glm.sparseMlaDecode(
+            qConcat, pagedKV.ckvData[layerIdx], sharedSlots.value,
+            midOut, midLse, BS, nHeads, kvLoraRank, cfg.indexTopk, numSplits,
+            cfg.scaling, strideKvBlock, 0, this.contextParallel,
+          );
+        } else {
+          sparseResult = this.glm.sparseMlaPrefill(
+            qConcat, pagedKV.ckvData[layerIdx], sharedSlots.value,
+            BS, nHeads, kvLoraRank, cfg.indexTopk, pagedKV.pageSize,
+            cfg.scaling, strideKvBlock, this.contextParallel,
+          );
+          // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
+          // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
+          // seqLen=1, batch=BS — which matches token-major layout.
+          vS = 1;
+          vB = BS;
+        }
+
+        attnOut = sparseResult.o;
+        lseBuf = sparseResult.lse;
+        if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} sparse MLA done`); (this.glm as any).synchronize?.(); }
+      } else {
+        // Dense MLA path (FlashInfer plan/run)
+        const mlaResult = state.isDecode
+          ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel)
+          : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel, !state.customMask ? MaskMode.Causal : state.customMask.mode, state.customMask?.mask, state.customMask?.indptr, state.customMask?.maskKvLen);
+        attnOut = mlaResult.o;
+        lseBuf = mlaResult.lse;
+      }
+
+      using _attnOut = attnOut;
+      using _lseBuf = lseBuf;
 
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
-      using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, S, B, lseBuf);
+      using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, vS, vB, lseBuf);
+      if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} vExpand done`); (this.glm as any).synchronize?.(); }
       oProjBuf.replace(vExpanded.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!, BS));
+      if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} oProj done`); (this.glm as any).synchronize?.(); }
     }
 
     const attnResult = residual.fusedAddRmsnorm(oProjBuf.value, this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
+    if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} post-attn norm done`); (this.glm as any).synchronize?.(); }
 
     const mlpPfx = `${Glm51Model.WEIGHT_PREFIX}${layerIdx}`;
     using downBuf = layerIdx >= cfg.firstSparseMlpLayer
       ? this.mlpSparse(attnNormed, mlpPfx, BS)
       : this.mlpDense(attnNormed, mlpPfx, BS);
+    if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} MLP done`); (this.glm as any).synchronize?.(); }
 
     let nextWeight: Tensor;
     if (layerIdx < cfg.numHiddenLayers - 1) {
@@ -594,10 +650,13 @@ export class Glm51Model extends ChatModel {
     using cos = rotaryEmbedding.result.cos;
     using sin = rotaryEmbedding.result.sin;
 
+    using sharedSlots = new UsingHolder<Tensor>(undefined!);
+
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const result = this.mlaLayer(cos, sin, normed.value, residual.value, i, state);
+      const result = this.mlaLayer(cos, sin, normed.value, residual.value, i, state, sharedSlots);
       normed.replace(result.normed);
       residual.replace(result.residual);
+      if (process.env.GLM_DEBUG) { console.log(`layer ${i} done`); (this.glm as any).synchronize?.(); console.log(`layer ${i} sync ok`); }
     }
 
     return normed.detach().removeTracking();
@@ -642,7 +701,8 @@ export class Glm51Model extends ChatModel {
     using sin = rotaryEmbedding.result.sin;
 
     const layerIdx = cfg.numHiddenLayers;
-    const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state);
+    using sharedSlots = new UsingHolder<Tensor>(undefined!);
+    const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state, sharedSlots);
     using _residual = result.residual;
 
     // Return shared_head.norm(residual) so the recycled seed for the next MTP

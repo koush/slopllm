@@ -873,19 +873,24 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
 
         float alpha = 1.0f, beta = 0.0f;
 
-        cublasGemmStridedBatchedEx(CUBLAS(ctx),
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            V,          // m
-            BS,         // n
-            Lkv,        // k
-            &alpha,
-            A_base, CUDA_R_16BF, lda, strideA,
-            B_base, CUDA_R_16BF, ldb, strideB,
-            &beta,
-            result, CUDA_R_16BF, ldc, strideC,
-            n_heads,    // batchCount
-            CUDA_R_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        // Use cublasGemmEx per-head loop instead of cublasGemmStridedBatchedEx.
+        // The strided batched API causes illegal memory access on SM120 with
+        // the decode layout (seq_len=1, ldb=attn_n_heads*Lkv).
+        for (int h = 0; h < n_heads; h++) {
+            const void* A_h = (const char*)A_base + (long long)h * strideA * sizeof(__nv_bfloat16);
+            const void* B_h = (const char*)B_base + (long long)h * strideB * sizeof(__nv_bfloat16);
+            void* C_h = (char*)result + (long long)h * strideC * sizeof(__nv_bfloat16);
+            cublasGemmEx(CUBLAS(ctx),
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                V, BS, Lkv,
+                &alpha,
+                A_h, CUDA_R_16BF, lda,
+                B_h, CUDA_R_16BF, ldb,
+                &beta,
+                C_h, CUDA_R_16BF, ldc,
+                CUDA_R_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
         return;
     }
 
@@ -1401,6 +1406,152 @@ void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
         (__nv_bfloat16*)out, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
         (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
         scale, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal);
+}
+
+// ---------------------------------------------------------------------------
+// Fused indexer score + topk kernel
+// Computes index scores for all KV positions and maintains a running top-k
+// min-heap in shared memory. Outputs [totalQ, topk] int32 indices directly.
+// When kvLen < topk, remaining entries are -1.
+// ---------------------------------------------------------------------------
+
+__global__ void indexer_score_topk_kernel(
+    int32_t* __restrict__ out_idx,       // [totalQ, topk]
+    const __nv_bfloat16* __restrict__ q,      // [totalQ, idxNHeads, idxHeadDim]
+    const __nv_bfloat16* __restrict__ kData,  // [maxPages, pageSize, idxHeadDim]
+    const __nv_bfloat16* __restrict__ weights,// [totalQ, idxNHeads]
+    const int32_t* __restrict__ pageIndices,  // [numPages]
+    const int32_t* __restrict__ pageIndptr,   // [B+1]
+    const int32_t* __restrict__ lastPageLen,  // [B]
+    const int32_t* __restrict__ qoIndptr,     // [B+1]
+    float scale,
+    int idxNHeads, int idxHeadDim, int pageSize, int topk,
+    int causal
+) {
+    const int qIdx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warpIdx = tid / 32;
+    const int lane = tid % 32;
+
+    int seq = 0;
+    while (qoIndptr[seq + 1] <= qIdx) seq++;
+
+    const int qLocalPos = qIdx - qoIndptr[seq];
+    const int numQueries = qoIndptr[seq + 1] - qoIndptr[seq];
+
+    const int pageStart = pageIndptr[seq];
+    const int pageEnd = pageIndptr[seq + 1];
+    const int numPages = pageEnd - pageStart;
+    const int kvLen = numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0;
+    const int prefixLen = max(0, kvLen - numQueries);
+    const int causalLimit = causal ? (prefixLen + qLocalPos) : (kvLen - 1);
+
+    extern __shared__ char smem[];
+    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem);
+    __nv_bfloat16* w_s = q_s + idxNHeads * idxHeadDim;
+    float* score_s = reinterpret_cast<float*>(w_s + idxNHeads);
+    float* heap_vals = score_s + idxNHeads;
+    int32_t* heap_idx = reinterpret_cast<int32_t*>(heap_vals + topk);
+
+    for (int i = tid; i < idxNHeads * idxHeadDim; i += blockDim.x) {
+        q_s[i] = q[(size_t)qIdx * idxNHeads * idxHeadDim + i];
+    }
+    if (tid < idxNHeads) {
+        w_s[tid] = weights[qIdx * idxNHeads + tid];
+    }
+    if (tid == 0) {
+        for (int i = 0; i < topk; i++) {
+            heap_vals[i] = -INFINITY;
+            heap_idx[i] = -1;
+        }
+    }
+    __syncthreads();
+
+    for (int pageIdx = pageStart; pageIdx < pageEnd; pageIdx++) {
+        const int localPageIdx = pageIdx - pageStart;
+        const int firstLocalK = localPageIdx * pageSize;
+        if (firstLocalK > causalLimit) break;
+
+        const int32_t pageId = pageIndices[pageIdx];
+        const bool isLastPage = (pageIdx == pageEnd - 1);
+        const int tokensInPage = isLastPage ? lastPageLen[seq] : pageSize;
+
+        for (int t = 0; t < tokensInPage; t++) {
+            const int localK = firstLocalK + t;
+            if (localK > causalLimit) break;
+
+            if (warpIdx < idxNHeads) {
+                const __nv_bfloat16* k_ptr = kData + (size_t)pageId * pageSize * idxHeadDim + t * idxHeadDim;
+                const __nv_bfloat16* q_ptr = q_s + warpIdx * idxHeadDim;
+
+                float partial = 0.0f;
+                for (int d = lane; d < idxHeadDim; d += 32) {
+                    partial += __bfloat162float(q_ptr[d]) * __bfloat162float(k_ptr[d]);
+                }
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    partial += __shfl_xor_sync(0xffffffff, partial, offset);
+                }
+                if (lane == 0) {
+                    partial *= scale;
+                    partial = fmaxf(partial, 0.0f);
+                    score_s[warpIdx] = partial;
+                }
+            }
+
+            __syncthreads();
+
+            if (tid == 0) {
+                float indexScore = 0.0f;
+                for (int h = 0; h < idxNHeads; h++) {
+                    indexScore += __bfloat162float(w_s[h]) * score_s[h];
+                }
+                indexScore = __bfloat162float(__float2bfloat16(indexScore));
+
+                if (indexScore > heap_vals[0]) {
+                    heap_vals[0] = indexScore;
+                    heap_idx[0] = localK;
+                    int pos = 0;
+                    while (true) {
+                        int left = 2 * pos + 1;
+                        int right = 2 * pos + 2;
+                        int smallest = pos;
+                        if (left < topk && heap_vals[left] < heap_vals[smallest]) smallest = left;
+                        if (right < topk && heap_vals[right] < heap_vals[smallest]) smallest = right;
+                        if (smallest == pos) break;
+                        float tv = heap_vals[pos]; heap_vals[pos] = heap_vals[smallest]; heap_vals[smallest] = tv;
+                        int32_t ti = heap_idx[pos]; heap_idx[pos] = heap_idx[smallest]; heap_idx[smallest] = ti;
+                        pos = smallest;
+                    }
+                }
+            }
+
+            __syncthreads();
+        }
+    }
+
+    for (int i = tid; i < topk; i += blockDim.x) {
+        out_idx[(size_t)qIdx * topk + i] = heap_idx[i];
+    }
+}
+
+void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
+    const void* q, const void* kData, const void* weights,
+    const int32_t* pageIndices, const int32_t* pageIndptr,
+    const int32_t* lastPageLen, const int32_t* qoIndptr,
+    float scale, int totalQ, int idxNHeads, int idxHeadDim,
+    int pageSize, int topk, int causal) {
+    cudaSetDevice(ctx->device_id);
+    int block_size = idxNHeads * 32;
+    if (block_size > 1024) block_size = 1024;
+    int smem_size = idxNHeads * idxHeadDim * sizeof(__nv_bfloat16)
+                  + idxNHeads * sizeof(__nv_bfloat16)
+                  + idxNHeads * sizeof(float)
+                  + topk * sizeof(float)
+                  + topk * sizeof(int32_t);
+    indexer_score_topk_kernel<<<totalQ, block_size, smem_size, GLM_STREAM(ctx)>>>(
+        out_idx, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
+        (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
+        scale, idxNHeads, idxHeadDim, pageSize, topk, causal);
 }
 
 // ---------------------------------------------------------------------------

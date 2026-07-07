@@ -57,12 +57,13 @@ export interface DeviceOps {
   mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): void;
   concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): void;
 
-  sparseMlaPrefill(q: Tensor, kvCache: Tensor, indices: Tensor, output: Tensor, outLse: Tensor, numTokens: number, numHeads: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, topkLength?: Tensor): void;
-  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, midOut: Tensor, midLse: Tensor, output: Tensor, outLse: Tensor, numTokens: number, numHeads: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: Tensor): void;
+  sparseMlaPrefill(q: Tensor, kvCache: Tensor, indices: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, contextParallel?: boolean, topkLength?: Tensor): { o: Tensor, lse: Tensor };
+  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, midOut: Tensor, midLse: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, contextParallel?: boolean, topkLength?: Tensor): { o: Tensor, lse: Tensor };
 
   gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, numPages: number, batchSize: number, pageSize: number, D: number, totalKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor;
 
   indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void;
+  indexerScoreTopk(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: boolean): { indices: Tensor };
 
   topkToSlots(slots: Tensor, topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, numTokens: number, topk: number, pageSize: number, cpWorldSize?: number, cpRank?: number, contextParallel?: boolean): void;
 

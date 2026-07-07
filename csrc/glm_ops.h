@@ -84,7 +84,14 @@ void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
                        const int32_t* pageIndptr, const int32_t* lastPageLen,
                        const int32_t* qoIndptr, float scale,
                        int totalQ, int idxNHeads, int idxHeadDim,
-                        int pageSize, int maxKvLen, int causal);
+                       int pageSize, int maxKvLen, int causal);
+
+void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
+    const void* q, const void* kData, const void* weights,
+    const int32_t* pageIndices, const int32_t* pageIndptr,
+    const int32_t* lastPageLen, const int32_t* qoIndptr,
+    float scale, int totalQ, int idxNHeads, int idxHeadDim,
+    int pageSize, int topk, int causal);
 
 void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, const int32_t* topk_idx,
                        const int32_t* page_indices, const int32_t* page_indptr,

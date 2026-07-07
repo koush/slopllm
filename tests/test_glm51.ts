@@ -64,7 +64,7 @@ describe("GLM-5.1 small model smoke test", () => {
     assert.equal(cfg.nRoutedExperts, 8, "nRoutedExperts");
     assert.equal(cfg.numExpertsPerTok, 4, "numExpertsPerTok");
     assert.equal(cfg.vocabSize, 154880, "vocabSize");
-    assert.equal(cfg.kvLoraRank, 128, "kvLoraRank");
+    assert.equal(cfg.kvLoraRank, 512, "kvLoraRank");
     assert.equal(cfg.qkRopeHeadDim, 64, "qkRopeHeadDim");
     assert.ok(cfg.tieWordEmbeddings, "tieWordEmbeddings");
   });

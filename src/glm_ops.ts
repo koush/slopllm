@@ -71,6 +71,7 @@ interface NativeAddon {
   fill(ctx: number, out: number, value: number, n: number): void;
   causalMask(ctx: number, out: number, seqLen: number): void;
   indexerScore(ctx: number, out: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: number): void;
+  indexerScoreTopk(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number): void;
   topkToSlots(ctx: number, slots: number, topkIdx: number, pageIndices: number, pageIndptr: number, lastPageLen: number, batchIndices: number, numTokens: number, topk: number, pageSize: number, cpWorldSize: number, cpRank: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
   applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
@@ -872,6 +873,12 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().indexerScore(this.ctx, out.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal ? 1 : 0);
   }
 
+  indexerScoreTopk(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: boolean): { indices: Tensor } {
+    const indices = q.workspace.alloc([totalQ, topk], "I32");
+    getNativeAddon().indexerScoreTopk(this.ctx, indices.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal ? 1 : 0);
+    return { indices };
+  }
+
   topkToSlots(slots: Tensor, topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, numTokens: number, topk: number, pageSize: number, cpWorldSize: number = 1, cpRank: number = 0): void {
     getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkIdx), ptr(pageIndices), ptr(pageIndptr), ptr(lastPageLen), ptr(batchIndices), numTokens, topk, pageSize, cpWorldSize, cpRank);
   }
@@ -973,12 +980,20 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().concatAndCacheDsMla(this.ctx, ptr(kvCache), ptr(appendCkv), ptr(appendKpe), ptr(indices), ptr(indptr), ptr(batchIndices), ptr(positions), nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN);
   }
 
-  sparseMlaPrefill(q: Tensor, kvCache: Tensor, indices: Tensor, output: Tensor, outLse: Tensor, numTokens: number, numHeads: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, topkLength?: Tensor): void {
-    getNativeAddon().sparseMlaPrefill(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(output), ptr(outLse), numTokens, numHeads, topk, pageBlockSize, smScale, strideKvBlock, topkLength ? ptr(topkLength) : 0);
+  sparseMlaPrefill(q: Tensor, kvCache: Tensor, indices: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, _contextParallel?: boolean, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+    if (pageBlockSize !== 64) throw new Error(`sparseMlaPrefill: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize}`);
+    const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
+    const lse = q.workspace.alloc([numTokens, numHeads], "F32");
+    getNativeAddon().sparseMlaPrefill(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(o), ptr(lse), numTokens, numHeads, topk, pageBlockSize, smScale, strideKvBlock, topkLength ? ptr(topkLength) : 0);
+    return { o, lse };
   }
 
-  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, midOut: Tensor, midLse: Tensor, output: Tensor, outLse: Tensor, numTokens: number, numHeads: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: Tensor): void {
-    getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(output), ptr(outLse), numTokens, numHeads, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, topkLength ? ptr(topkLength) : 0);
+  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, midOut: Tensor, midLse: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, _contextParallel?: boolean, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+    if (strideKvBlock % 64 !== 0) throw new Error(`sparseMlaDecode: SM120 kernel requires pageBlockSize=64, got strideKvBlock=${strideKvBlock} (not divisible by 64 bytes/token)`);
+    const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
+    const lse = q.workspace.alloc([numTokens, numHeads], "F32");
+    getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, topkLength ? ptr(topkLength) : 0);
+    return { o, lse };
   }
 
   cpMergeTree(vPtrs: number[], lsePtrs: number[], numShards: number, outputV: Tensor, outputLse: Tensor | null, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads?: number, headOffset?: number, inputNHeads?: number): void {
