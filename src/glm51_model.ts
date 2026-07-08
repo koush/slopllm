@@ -695,6 +695,11 @@ export class Glm51Model extends ChatModel {
     const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state, sharedSlots);
     using _residual = result.residual;
 
+    // Export the shared slots (like forwardModel) so they survive the caller's
+    // MTP tracking region — otherwise startTracking's dispose frees the tensor
+    // sharedSlots still points to, causing a use-after-free on the next pass.
+    state.sharedSlots?.value?.removeTracking();
+
     // Return shared_head.norm(residual) so the recycled seed for the next MTP
     // step is already normed — matches sglang Glm4MoeModelNextN and vLLM v1
     // deepseek_mtp which both recycle the post-shared_head-norm state.

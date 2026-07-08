@@ -366,8 +366,38 @@ export abstract class Tensor implements Disposable {
   abstract mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void>;
   abstract mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void>;
   abstract memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void>;
-  abstract memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void;
-  abstract memcpy2d(dstOffset: number, dpitch: number, src: Tensor, srcOffset: number, spitch: number, width: number, height: number, kind: MemcpyKind): void;
+  memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {
+    if (size !== undefined) {
+      if (size < 0) {
+        throw new Error(`memcpy: negative size ${size}`);
+      }
+      if (size > this.bytes) {
+        throw new Error(`memcpy: size ${size} exceeds destination ${this.bytes} bytes`);
+      }
+      if (size > src.bytes) {
+        throw new Error(`memcpy: size ${size} exceeds source ${src.bytes} bytes`);
+      }
+    }
+  }
+  memcpy2d(dstOffset: number, dpitch: number, src: Tensor, srcOffset: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+    if (dstOffset < 0 || srcOffset < 0 || width < 0 || height < 0 || dpitch < 0 || spitch < 0) {
+      throw new Error(`memcpy2d: negative parameter (dstOffset=${dstOffset}, srcOffset=${srcOffset}, width=${width}, height=${height}, dpitch=${dpitch}, spitch=${spitch})`);
+    }
+    if (width > dpitch) {
+      throw new Error(`memcpy2d: width ${width} exceeds dpitch ${dpitch}`);
+    }
+    if (width > spitch) {
+      throw new Error(`memcpy2d: width ${width} exceeds spitch ${spitch}`);
+    }
+    const dstEnd = dstOffset + (height > 0 ? (height - 1) * dpitch + width : 0);
+    const srcEnd = srcOffset + (height > 0 ? (height - 1) * spitch + width : 0);
+    if (dstEnd > this.bytes) {
+      throw new Error(`memcpy2d: dst region end ${dstEnd} exceeds destination ${this.bytes} bytes`);
+    }
+    if (srcEnd > src.bytes) {
+      throw new Error(`memcpy2d: src region end ${srcEnd} exceeds source ${src.bytes} bytes`);
+    }
+  }
   rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     if (positionIds.type !== "I32") throw new Error(`rotaryEmbedding: positionIds must be I32, got ${positionIds.type}`);
     return undefined as never;

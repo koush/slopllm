@@ -25,7 +25,7 @@ const MUL_MAT_ID_GROUPED_THRESHOLD = 512;
 // decode kernel for better GPU occupancy (e.g. MTP tree verify). Above it, the
 // prefill kernel's per-token CTAs already fill the GPU and amortize KV loads.
 // Tunable — the crossover is roughly the SM count divided by heads/HPB.
-const SPARSE_MLA_DECODE_DISPATCH_MAX = 64;
+const SPARSE_MLA_DECODE_DISPATCH_MAX = Number(process.env.GLM_SPARSE_DECODE_DISPATCH_MAX ?? 64);
 
 function findProjectRoot(dir: string): string {
   let d = dir;
@@ -435,6 +435,7 @@ export class GlmTensor extends Tensor {
   }
 
   memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {
+    super.memcpy(src, size, kind);
     if (!(src instanceof GlmTensor)) {
       throw new Error("GlmTensor.memcpy requires GlmTensor source");
     }
@@ -448,6 +449,7 @@ export class GlmTensor extends Tensor {
   }
 
   memcpy2d(dstOffset: number, dpitch: number, src: Tensor, srcOffset: number, spitch: number, width: number, height: number, kind: MemcpyKind): void {
+    super.memcpy2d(dstOffset, dpitch, src, srcOffset, spitch, width, height, kind);
     if (!(src instanceof GlmTensor)) {
       throw new Error("GlmTensor.memcpy requires GlmTensor source");
     }

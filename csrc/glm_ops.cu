@@ -1607,7 +1607,7 @@ void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
 // page_indptr: [B+1] — per-sequence page range start/end
 // last_page_len: [B] — tokens in last partial page per sequence
 // batch_indices: [num_tokens] — which sequence each query belongs to
-// Output: slots [num_tokens, topk] — physical slot = page_id * page_size + offset, or -1
+// Output: slots [num_tokens, topk] — physical slot = page_id * eff_page_size + offset, or -1
 //
 // CP mode (cp_world_size > 1): tokens interleaved across GPUs. GPU cp_rank
 // stores tokens at global positions cp_rank, cp_rank+N, cp_rank+2N, ...
@@ -1659,7 +1659,7 @@ __global__ void topk_to_slots_kernel(
         }
         if (local_pos >= local_kv_len) continue;
         const int abs_page = page_indices[page_base + local_pos / eff_page_size];
-        const int slot = abs_page * page_size + (local_pos % eff_page_size);
+        const int slot = abs_page * eff_page_size + (local_pos % eff_page_size);
         out[atomicAdd(&s_count, 1)] = slot;   // compact to front
     }
     __syncthreads();

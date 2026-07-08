@@ -32,6 +32,10 @@ Thumbs.db
 # Scratchpad (experimental/debug scripts)
 scratchpad/
 
+# Profiling artifacts
+*.nsys-rep
+*.sqlite
+
 # Logs
 *.log
 tests/python/test_models/glm51_small/glm51_small_bf16/

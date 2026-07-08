@@ -285,6 +285,7 @@ export function* generateStream(
   try {
     for (let i = 1; i < maxNewTokens; i++) {
       if (mtp && model.forwardMtp && topks.length > 0) {
+        if (process.env.GLM_STEP_LOG === '1') process.stderr.write(`[step ${i}] seqLen=${cache.getPagedKV().sequences[0].allocLen} histLen=${tokenHistory.length}\n`);
         const { warmup, tokens, numAccepted, numDraftTokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots, ws, currentToken, topks, cache, tokenizer);
         if (mtpStats && !warmup) mtpStats.observe(numDraftTokens, numAccepted);
         // glm.synchronize();

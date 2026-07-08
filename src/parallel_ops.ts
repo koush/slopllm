@@ -1518,7 +1518,7 @@ export class ParallelTensor extends Tensor {
       }
       return;
     }
-    const shardRowBytes = this.shards[0].shape.slice(1).reduce((a, b) => a * b, 1) * 2;
+    const shardRowBytes = Tensor.byteCount(this.shards[0].shape.slice(1), this.shards[0].type);
     const dstPageId = Math.floor(dstOffset / dpitch);
     const srcPageId = Math.floor(srcOffset / spitch);
     const pSrc = src as ParallelTensor;

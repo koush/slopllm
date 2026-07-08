@@ -356,16 +356,20 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   copyPage(srcPageId: number, dstPageId: number): void {
     for (let i = 0; i < this.kData.length; i++) {
       this.copyPageRow(this.kData[i], srcPageId, dstPageId);
+    }
+    for (let i = 0; i < this.vData.length; i++) {
       this.copyPageRow(this.vData[i], srcPageId, dstPageId);
     }
     for (let i = 0; i < this.ckvData.length; i++) {
       this.copyPageRow(this.ckvData[i], srcPageId, dstPageId);
+    }
+    for (let i = 0; i < this.kpeData.length; i++) {
       this.copyPageRow(this.kpeData[i], srcPageId, dstPageId);
     }
   }
 
   copyPageRow(tensor: Tensor, srcPageId: number, dstPageId: number): void {
-    const rowBytes = tensor.shape.slice(1).reduce((a, b) => a * b, 1) * 2;
+    const rowBytes = Tensor.byteCount(tensor.shape.slice(1), tensor.type);
     tensor.memcpy2d(
       dstPageId * rowBytes, rowBytes,
       tensor, srcPageId * rowBytes,
