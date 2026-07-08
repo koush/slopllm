@@ -447,6 +447,61 @@ static Napi::Value IndexerScoreTopk(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 21) {
+        Napi::TypeError::New(env, "Expected 21 args").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_idx_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t q_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t kData_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t weights_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t pageIndices_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t pageIndptr_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t lastPageLen_ptr = info[7].As<Napi::Number>().Int64Value();
+    uintptr_t qoIndptr_ptr = info[8].As<Napi::Number>().Int64Value();
+    float scale = info[9].As<Napi::Number>().FloatValue();
+    int totalQ = info[10].As<Napi::Number>().Int32Value();
+    int idxNHeads = info[11].As<Napi::Number>().Int32Value();
+    int idxHeadDim = info[12].As<Napi::Number>().Int32Value();
+    int pageSize = info[13].As<Napi::Number>().Int32Value();
+    int topk = info[14].As<Napi::Number>().Int32Value();
+    int causal = info[15].As<Napi::Number>().Int32Value();
+    const uint8_t* custom_mask = nullptr;
+    const int32_t* mask_indptr = nullptr;
+    const int32_t* mask_kv_len = nullptr;
+    if (info.Length() >= 17 && info[16].IsNumber()) custom_mask = reinterpret_cast<const uint8_t*>(info[16].As<Napi::Number>().Int64Value());
+    if (info.Length() >= 18 && info[17].IsNumber()) mask_indptr = reinterpret_cast<const int32_t*>(info[17].As<Napi::Number>().Int64Value());
+    if (info.Length() >= 19 && info[18].IsNumber()) mask_kv_len = reinterpret_cast<const int32_t*>(info[18].As<Napi::Number>().Int64Value());
+    uintptr_t coarseHist_ptr = info[19].As<Napi::Number>().Int64Value();
+    uintptr_t fineHist_ptr = info[20].As<Napi::Number>().Int64Value();
+    uintptr_t meta_ptr = info[21].As<Napi::Number>().Int64Value();
+    int numSplits = info[22].As<Napi::Number>().Int32Value();
+    glm_indexer_score_topk_prefill(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<int32_t*>(out_idx_ptr),
+        reinterpret_cast<const void*>(q_ptr),
+        reinterpret_cast<const void*>(kData_ptr),
+        reinterpret_cast<const void*>(weights_ptr),
+        reinterpret_cast<const int32_t*>(pageIndices_ptr),
+        reinterpret_cast<const int32_t*>(pageIndptr_ptr),
+        reinterpret_cast<const int32_t*>(lastPageLen_ptr),
+        reinterpret_cast<const int32_t*>(qoIndptr_ptr),
+        scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal,
+        custom_mask, mask_indptr, mask_kv_len,
+        reinterpret_cast<int32_t*>(coarseHist_ptr),
+        reinterpret_cast<int32_t*>(fineHist_ptr),
+        reinterpret_cast<int32_t*>(meta_ptr),
+        numSplits);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("indexerScoreTopkPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 22) {
@@ -3948,6 +4003,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "causalMask"), Napi::Function::New(env, CausalMask));
     exports.Set(Napi::String::New(env, "indexerScore"), Napi::Function::New(env, IndexerScore));
     exports.Set(Napi::String::New(env, "indexerScoreTopk"), Napi::Function::New(env, IndexerScoreTopk));
+    exports.Set(Napi::String::New(env, "indexerScoreTopkPrefill"), Napi::Function::New(env, IndexerScoreTopkPrefill));
     exports.Set(Napi::String::New(env, "indexerScoreTopkV2"), Napi::Function::New(env, IndexerScoreTopkV2));
     exports.Set(Napi::String::New(env, "topkToSlots"), Napi::Function::New(env, TopkToSlots));
     exports.Set(Napi::String::New(env, "fill"), Napi::Function::New(env, Fill));
