@@ -434,8 +434,6 @@ export function mtpTreeDecode(
 
     const mlaKVCacheAppendOrig = targetPrefillState.mlaKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
-      // appendCkv.removeTracking();
-      // appendKpe.removeTracking();
       kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendKpe: appendKpe.capture(), appendCkvOrig: appendCkv, appendKpeOrig: appendKpe, cacheIdx, kvLoraRank, qkRopeDim });
       mlaKVCacheAppendOrig(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
     };

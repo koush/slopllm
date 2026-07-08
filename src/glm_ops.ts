@@ -21,6 +21,12 @@ import { Allocator, ArenaAllocator } from "./allocator";
 // dispatch overhead against avoided redundant weight reads (true prefill territory).
 const MUL_MAT_ID_GROUPED_THRESHOLD = 512;
 
+// Below this query-token count, sparse MLA prefill is routed to the split-K
+// decode kernel for better GPU occupancy (e.g. MTP tree verify). Above it, the
+// prefill kernel's per-token CTAs already fill the GPU and amortize KV loads.
+// Tunable — the crossover is roughly the SM count divided by heads/HPB.
+const SPARSE_MLA_DECODE_DISPATCH_MAX = 64;
+
 function findProjectRoot(dir: string): string {
   let d = dir;
   while (d !== path.dirname(d)) {
@@ -73,7 +79,7 @@ interface NativeAddon {
   indexerScore(ctx: number, out: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: number): void;
   indexerScoreTopk(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, customMask?: number, maskIndptr?: number, maskKvLen?: number): void;
   indexerScoreTopkV2(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, scores: number, rowLen: number, hist: number, meta: number, maxKv: number, numSplits: number): void;
-  topkToSlots(ctx: number, slots: number, topkIdx: number, pageIndices: number, pageIndptr: number, lastPageLen: number, batchIndices: number, numTokens: number, topk: number, pageSize: number, cpWorldSize: number, cpRank: number): void;
+  topkToSlots(ctx: number, slots: number, topkLength: number, topkIdx: number, pageIndices: number, pageIndptr: number, lastPageLen: number, batchIndices: number, numTokens: number, topk: number, pageSize: number, cpWorldSize: number, cpRank: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
   applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number, offset: number): void;
@@ -880,13 +886,16 @@ export class GlmOps implements DeviceOps {
   // one-block-per-query v1 kernel would pin a single SM and its cost grows with
   // kvLen. Prefill uses v1 — totalQ blocks already fill the GPU, and v2's
   // per-query scratch (scores/hist) would be O(totalQ*kvLen), infeasible.
-  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, decode: boolean, maxKv: number, _contextParallel?: boolean, cpWorldSize: number = 1, cpRank: number = 0, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor {
+  // Writes the compacted valid-slot count per query into `topkLength` (a stable
+  // caller buffer), which feeds the sparse kernel's topk_length so it only walks
+  // ceil(count/BI) candidate tiles instead of the full topk.
+  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, topkLength: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, decode: boolean, maxKv: number, _contextParallel?: boolean, cpWorldSize: number = 1, cpRank: number = 0, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor {
     const scoreLastPageLen = globalLastPageLen ?? lastPageLen;
     using topkIdx = decode
       ? this.indexerScoreTopkV2(idxQ, kData, weights, pageIndices, indptr, scoreLastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv)
       : this.indexerScoreTopk(idxQ, kData, weights, pageIndices, indptr, scoreLastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, customMask, maskIndptr, maskKvLen);
     const slots = idxQ.workspace.alloc([totalQ, topk], "I32");
-    getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkIdx), ptr(pageIndices), ptr(indptr), ptr(lastPageLen), ptr(batchIndices), totalQ, topk, pageSize, cpWorldSize, cpRank);
+    getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkLength), ptr(topkIdx), ptr(pageIndices), ptr(indptr), ptr(lastPageLen), ptr(batchIndices), totalQ, topk, pageSize, cpWorldSize, cpRank);
     return slots;
   }
 
@@ -1008,6 +1017,18 @@ export class GlmOps implements DeviceOps {
     if (pageBlockSize !== 64) throw new Error(`sparseMlaPrefill: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize}`);
     const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
     const lse = q.workspace.alloc([numTokens, numHeads], "F32");
+    // Small query counts (e.g. MTP tree verify) starve the prefill kernel: its
+    // grid is only numTokens × ceil(NUM_HEADS/HPB) CTAs, leaving the GPU idle.
+    // Route to the split-K decode kernel — same mask-free slot attention, but
+    // numTokens × ceil(topk/64) CTAs — which fills the SMs. Correctness is
+    // identical (causality lives in the slots, not the kernel).
+    if (numTokens <= SPARSE_MLA_DECODE_DISPATCH_MAX) {
+      const numSplits = Math.ceil(topk / 64);
+      using midOut = q.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
+      using midLse = q.workspace.alloc([numTokens, numHeads, numSplits], "F32");
+      getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, strideKvBlock, 0, topkLength ? ptr(topkLength) : 0);
+      return { o, lse };
+    }
     getNativeAddon().sparseMlaPrefill(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(o), ptr(lse), numTokens, numHeads, topk, pageBlockSize, smScale, strideKvBlock, topkLength ? ptr(topkLength) : 0);
     return { o, lse };
   }

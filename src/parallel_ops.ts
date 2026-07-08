@@ -1648,7 +1648,8 @@ export class ParallelTensor extends Tensor {
       if (this.parallelism === TensorParallelism.PartialSum) {
         this.allReduce();
       }
-      const gatheredSelf = this.parallelism === TensorParallelism.Replicated ? this : this.allGather(this.workspace);
+      using _gatheredSelf = this.parallelism === TensorParallelism.Replicated ? undefined : this.allGather(this.workspace);
+      const gatheredSelf = _gatheredSelf || this;
       const gatheredTensors: Tensor[] = [];
       for (const t of pTensors) {
         if (t.parallelism === TensorParallelism.PartialSum) {
@@ -2915,7 +2916,7 @@ export class ParallelOps implements DeviceOps {
   // and each rank must sum over all idxNHeads), so the whole pipeline runs
   // per-device and the [totalQ, topk] slots are Replicated. Under context
   // parallel each rank filters to its own KV slice via cpWorld/cpRank.
-  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, decode: boolean, maxKv: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor {
+  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, topkLength: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, decode: boolean, maxKv: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor {
     const pQ = this.cast(idxQ);
     const pKData = this.cast(kData);
     const pWeights = this.cast(weights);
@@ -2924,6 +2925,7 @@ export class ParallelOps implements DeviceOps {
     const pLastPageLen = this.cast(lastPageLen);
     const pQoIndptr = this.cast(qoIndptr);
     const pBatchIndices = this.cast(batchIndices);
+    const pTopkLength = this.cast(topkLength);
     const pGlobalLastPageLen = globalLastPageLen ? this.cast(globalLastPageLen) : undefined;
     const pCustomMask = customMask ? this.cast(customMask) : undefined;
     const pMaskIndptr = maskIndptr ? this.cast(maskIndptr) : undefined;
@@ -2932,7 +2934,7 @@ export class ParallelOps implements DeviceOps {
     for (let i = 0; i < this.worldSize; i++) {
       const cpW = contextParallel ? this.worldSize : 1;
       const cpR = contextParallel ? i : 0;
-      slotShards.push(this.devices[i].indexerTopkSlots(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], pBatchIndices.shards[i], scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, decode, maxKv, contextParallel, cpW, cpR, pGlobalLastPageLen?.shards[i], pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i]));
+      slotShards.push(this.devices[i].indexerTopkSlots(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], pBatchIndices.shards[i], pTopkLength.shards[i], scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, decode, maxKv, contextParallel, cpW, cpR, pGlobalLastPageLen?.shards[i], pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i]));
     }
     return this.wrapShards(idxQ.workspace, slotShards, [totalQ, topk], "I32", TensorParallelism.Replicated);
   }

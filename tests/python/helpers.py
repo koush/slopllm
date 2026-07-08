@@ -244,7 +244,7 @@ class GlmOps:
         self.lib.glm_topk_to_slots.restype = None
         self.lib.glm_topk_to_slots.argtypes = [
             ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_uint32, ctypes.c_uint32,
@@ -1221,10 +1221,11 @@ class GlmOps:
 
     def topk_to_slots(self, slots, topk_idx, page_indices, page_indptr,
                       last_page_len, batch_indices, num_tokens, topk, page_size,
-                      cp_world_size=1, cp_rank=0):
+                      cp_world_size=1, cp_rank=0, topk_length=None):
         self.lib.glm_topk_to_slots(
             self.ctx,
-            self._ptr(slots), self._ptr(topk_idx),
+            self._ptr(slots), self._ptr(topk_length) if topk_length is not None else None,
+            self._ptr(topk_idx),
             self._ptr(page_indices), self._ptr(page_indptr),
             self._ptr(last_page_len), self._ptr(batch_indices),
             num_tokens, topk, page_size,

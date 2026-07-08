@@ -1616,8 +1616,14 @@ void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
 // Effective page size = page_size / cp_world_size
 // ---------------------------------------------------------------------------
 
+// One block per query token. Valid slots are compacted to a contiguous prefix
+// [0, count) and the count is written to topk_length[token]; the sparse
+// attention kernel then only walks ceil(count/BI) candidate tiles instead of the
+// full TOPK. This matters most under CP, where topk_to_slots keeps only the
+// ~topk/world positions that live on this rank (the rest were scattered -1).
 __global__ void topk_to_slots_kernel(
-    int32_t* __restrict__ slots,         // [num_tokens, topk]
+    int32_t* __restrict__ slots,          // [num_tokens, topk]
+    int32_t* __restrict__ topk_length,    // [num_tokens] (nullable)
     const int32_t* __restrict__ topk_idx, // [num_tokens, topk]
     const int32_t* __restrict__ page_indices,
     const int32_t* __restrict__ page_indptr,
@@ -1626,58 +1632,51 @@ __global__ void topk_to_slots_kernel(
     int topk, int page_size, int num_tokens,
     uint32_t cp_world_size, uint32_t cp_rank
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = num_tokens * topk;
-    if (idx >= total) return;
+    const int token = blockIdx.x;
+    if (token >= num_tokens) return;
+    const int seq = batch_indices[token];
+    const int num_pages = page_indptr[seq + 1] - page_indptr[seq];
+    const int page_base = page_indptr[seq];
+    const int eff_page_size = (cp_world_size > 1) ? (page_size / (int)cp_world_size) : page_size;
+    const int local_kv_len = (num_pages - 1) * eff_page_size + last_page_len[seq];
 
-    int token = idx / topk;
-    int seq = batch_indices[token];
+    int32_t* out = slots + (size_t)token * topk;
+    const int32_t* in = topk_idx + (size_t)token * topk;
 
-    int token_pos = topk_idx[idx];
-    if (token_pos < 0) {
-        slots[idx] = -1;
-        return;
-    }
+    __shared__ int s_count;
+    if (threadIdx.x == 0) s_count = 0;
+    __syncthreads();
 
-    int num_pages = page_indptr[seq + 1] - page_indptr[seq];
-    int local_pos;
-    int eff_page_size;
-
-    if (cp_world_size > 1) {
-        if ((uint32_t)token_pos % cp_world_size != cp_rank) {
-            slots[idx] = -1;
-            return;
+    for (int i = threadIdx.x; i < topk; i += blockDim.x) {
+        const int token_pos = in[i];
+        if (token_pos < 0) continue;
+        int local_pos;
+        if (cp_world_size > 1) {
+            if ((uint32_t)token_pos % cp_world_size != cp_rank) continue;
+            local_pos = (token_pos - (int)cp_rank) / (int)cp_world_size;
+        } else {
+            local_pos = token_pos;
         }
-        local_pos = (token_pos - (int32_t)cp_rank) / (int32_t)cp_world_size;
-        eff_page_size = page_size / (int32_t)cp_world_size;
-    } else {
-        local_pos = token_pos;
-        eff_page_size = page_size;
+        if (local_pos >= local_kv_len) continue;
+        const int abs_page = page_indices[page_base + local_pos / eff_page_size];
+        const int slot = abs_page * page_size + (local_pos % eff_page_size);
+        out[atomicAdd(&s_count, 1)] = slot;   // compact to front
     }
+    __syncthreads();
 
-    int local_kv_len = (num_pages - 1) * eff_page_size + last_page_len[seq];
-    if (local_pos >= local_kv_len) {
-        slots[idx] = -1;
-        return;
-    }
-
-    int page_idx_in_seq = local_pos / eff_page_size;
-    int offset_in_page = local_pos % eff_page_size;
-    int abs_page = page_indices[page_indptr[seq] + page_idx_in_seq];
-    slots[idx] = abs_page * page_size + offset_in_page;
+    const int count = s_count;
+    for (int i = count + threadIdx.x; i < topk; i += blockDim.x) out[i] = -1;
+    if (threadIdx.x == 0 && topk_length) topk_length[token] = count;
 }
 
-void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, const int32_t* topk_idx,
+void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const int32_t* topk_idx,
                        const int32_t* page_indices, const int32_t* page_indptr,
                        const int32_t* last_page_len, const int32_t* batch_indices,
                        int num_tokens, int topk, int page_size,
                        uint32_t cp_world_size, uint32_t cp_rank) {
     cudaSetDevice(ctx->device_id);
-    int total = num_tokens * topk;
-    int block = 256;
-    int grid = (total + block - 1) / block;
-    topk_to_slots_kernel<<<grid, block, 0, GLM_STREAM(ctx)>>>(
-        slots, topk_idx, page_indices, page_indptr, last_page_len, batch_indices,
+    topk_to_slots_kernel<<<num_tokens, 256, 0, GLM_STREAM(ctx)>>>(
+        slots, topk_length, topk_idx, page_indices, page_indptr, last_page_len, batch_indices,
         topk, page_size, num_tokens, cp_world_size, cp_rank);
 }
 

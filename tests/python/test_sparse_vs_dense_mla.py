@@ -300,3 +300,70 @@ def test_sparse_matches_dense_and_reference(glm, device, num_heads, seq_len):
         f"SPARSE disagrees with dense/reference (cos={sparse_cos}, rel={sparse_rel}) "
         f"— reproduces the model garbage-output bug")
     assert sparse_rel < 0.10, f"sparse rel error too high: {sparse_rel}"
+
+
+def _run_sparse_prefill_and_decode(glm, device, q, ckv, kpe, num_heads, seq_len):
+    """Pack once, then run BOTH the prefill kernel and the split-K decode kernel
+    on identical q/cache/causal-slots. Returns (prefill[S,H,512], decode[S,H,512])."""
+    num_pages = (seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+    max_pages = num_pages + 2
+    kv_cache = torch.zeros(max_pages, PAGE_SIZE, BPT, dtype=torch.uint8, device=device)
+    page_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    page_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    batch_indices = torch.zeros(seq_len, dtype=torch.int32, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int32, device=device)
+    glm.concat_and_cache_ds_mla(
+        kv_cache.data_ptr(), ckv.contiguous().data_ptr(), kpe.contiguous().data_ptr(),
+        page_indices.data_ptr(), page_indptr.data_ptr(),
+        batch_indices.data_ptr(), positions.data_ptr(),
+        seq_len, PAGE_SIZE, KV_LORA_RANK, PE_DIM, KV_LORA_RANK, PE_DIM,
+    )
+    slots = torch.full((seq_len, TOPK), -1, dtype=torch.int32, device=device)
+    for t in range(seq_len):
+        for pos in range(t + 1):
+            slots[t, pos] = int(page_indices[pos // PAGE_SIZE].item()) * PAGE_SIZE + (pos % PAGE_SIZE)
+    q_in = q.reshape(seq_len, num_heads, D_QK).contiguous()
+    stride_kv_block = PAGE_SIZE * BPT
+
+    pre = torch.zeros(seq_len, num_heads, KV_LORA_RANK, dtype=torch.bfloat16, device=device)
+    pre_lse = torch.zeros(seq_len, num_heads, dtype=torch.float32, device=device)
+    glm.sparse_mla_prefill(
+        q_in.data_ptr(), kv_cache.data_ptr(), slots.data_ptr(),
+        pre.data_ptr(), pre_lse.data_ptr(),
+        seq_len, num_heads, TOPK, PAGE_SIZE, SM_SCALE, stride_kv_block,
+    )
+
+    num_splits = (TOPK + 63) // 64
+    mid_out = torch.zeros(seq_len, num_heads, num_splits, KV_LORA_RANK, dtype=torch.bfloat16, device=device)
+    mid_lse = torch.zeros(seq_len, num_heads, num_splits, dtype=torch.float32, device=device)
+    dec = torch.zeros(seq_len, num_heads, KV_LORA_RANK, dtype=torch.bfloat16, device=device)
+    dec_lse = torch.zeros(seq_len, num_heads, dtype=torch.float32, device=device)
+    glm.sparse_mla_decode(
+        q_in.data_ptr(), kv_cache.data_ptr(), slots.data_ptr(),
+        mid_out.data_ptr(), mid_lse.data_ptr(), dec.data_ptr(), dec_lse.data_ptr(),
+        seq_len, num_heads, TOPK, num_splits, SM_SCALE, stride_kv_block,
+    )
+    glm.synchronize()
+    return pre.reshape(seq_len, num_heads, KV_LORA_RANK), dec.reshape(seq_len, num_heads, KV_LORA_RANK)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("num_heads", [8, 64])
+@pytest.mark.parametrize("seq_len", [13, 37, 200])
+def test_prefill_decode_equivalence(glm, device, num_heads, seq_len):
+    """The split-K decode kernel must produce the same result as the prefill
+    kernel on identical multi-token causal inputs (this is what the GlmOps
+    sparseMlaPrefill->decode carveout relies on)."""
+    torch.manual_seed(9000 + seq_len + num_heads)
+    ckv = torch.randn(seq_len, KV_LORA_RANK, dtype=torch.bfloat16, device=device)
+    kpe = torch.randn(seq_len, PE_DIM, dtype=torch.bfloat16, device=device)
+    q = torch.randn(seq_len, num_heads, D_QK, dtype=torch.bfloat16, device=device)
+
+    pre, dec = _run_sparse_prefill_and_decode(glm, device, q, ckv, kpe, num_heads, seq_len)
+    pre = pre.float(); dec = dec.float()
+    rel = (pre - dec).abs().max().item() / (pre.abs().max().item() + 1e-6)
+    cos = _cos(pre, dec)
+    last_cos = _cos(pre[-1], dec[-1])
+    print(f"\n[prefill vs decode H={num_heads} S={seq_len}] cos={cos:.5f} last={last_cos:.5f} rel={rel:.4f}")
+    assert cos > 0.999, f"prefill vs decode mismatch: cos={cos}, rel={rel}"
+    assert rel < 0.02, f"prefill vs decode rel too high: {rel}"

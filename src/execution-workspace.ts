@@ -94,6 +94,19 @@ export class ExecutionState {
     }
   }
 
+  indexerKvCacheAppend(idxKOut: Tensor, cacheIdx: number, indexHeadDim: number) {
+    const pagedKV = this.cache.getPagedKV();
+    const nnz = this.isDecode ? this.batchSize : this.totalTokens;
+    this.ws.glm.mlaKvCacheAppend(
+      pagedKV.kData[cacheIdx], null,
+      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen,
+      idxKOut, null,
+      this.ws.mlaBatchIndices, this.ws.positionIds,
+      nnz, pagedKV.pageSize, indexHeadDim, 0,
+      indexHeadDim, 0
+    );
+  }
+
   setInput(tokenIds: number[][] | Tensor) {
     if (tokenIds instanceof Tensor) {
       // if the tensor is not in the same workspace copy it into the workspace buffer.
@@ -182,6 +195,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
   mlaBatchIndices: Tensor;
   /** Pinned host buffer [B*S] of I32: batch index per token for MLA KV cache append. */
   mlaBatchIndicesH: Tensor;
+  /** GPU buffer [B*S] of I32: per-query compacted valid-slot count, written by
+   *  topkToSlots on full layers, read as sparse attention's topk_length. Stable
+   *  buffer so it persists to shared layers that reuse the same slots. */
+  sparseTopkLength: Tensor;
   lastDecodePagedKV: PagedKVCache | null;
   private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
 
@@ -216,6 +233,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.kvTokenIndptrD = this.alloc([(B + 1) * I32], "I32", "kvTokenIndptrD");
     this.mlaBatchIndices = this.alloc([B * S], "I32", "mlaBatchIndices");
     this.mlaBatchIndicesH = this.allocPinned([B * S], "I32", "mlaBatchIndicesH");
+    this.sparseTopkLength = this.alloc([B * S], "I32", "sparseTopkLength");
     this.lastDecodePagedKV = null;
 
     // Initialize mlaBatchIndices for decode: [0, 1, 2, ..., B-1]
@@ -240,7 +258,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
       throw new Error("startTracking already active");
     }
     if (this.tracked.size) {
-      console.warn("startTracking was called with tensors already allocated, this may result in non-deterministic allocations.");
+      console.warn(new Error("startTracking was called with tensors already allocated, this may result in non-deterministic allocations."));
+      for (const tracked of this.tracked) {
+        console.warn(tracked.stack);
+      }
     }
     for (const tensor of this.exported) {
       if (!keepExports.has(tensor)) {
@@ -472,7 +493,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
           nHeads, nKv, hd, pageSize,
           enableCudaGraph
         );
-      } else {
+      }
+      else if (!pagedKV.sparseMode) {
         this.glm.mlaDecodePlan(
           this.floatWs, BATCH_FLOAT_WS_SIZE,
           this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
@@ -482,6 +504,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
           model.cfg.kvLoraRank!, model.cfg.qkRopeHeadDim!, pagedKV.contextParallel,
           undefined, undefined, pagedKV.sequences.map(s => s.allocLen)
         );
+      }
+      else {
+        // sparse mode requires no planning
       }
       pagedKV.pagesDirtyHost = false;
       pagedKV.pagesDirtyDevice = true;
@@ -571,16 +596,21 @@ export class ExecutionWorkspace extends WorkspaceBase {
     });
 
     if (cfg.kvLoraRank) {
-      this.glm.mlaPrefillPlan(
-        this.floatWs, BATCH_FLOAT_WS_SIZE,
-        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
-        this.mlaPrefillPlanInfo,
-        this.qoIndptrH, this.indptrH,
-        this.kvLenH, this.lastPageLenH,
-        batchSize, nHeads, cfg.kvLoraRank!, !customMask || customMask.mode === MaskMode.CausalCustom || customMask.mode === MaskMode.Causal,
-        pagedKV.pageSize, pagedKV.sequences.map(s => s.allocLen),
-        pagedKV.contextParallel
-      );
+      if (!pagedKV.sparseMode) {
+        this.glm.mlaPrefillPlan(
+          this.floatWs, BATCH_FLOAT_WS_SIZE,
+          this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+          this.mlaPrefillPlanInfo,
+          this.qoIndptrH, this.indptrH,
+          this.kvLenH, this.lastPageLenH,
+          batchSize, nHeads, cfg.kvLoraRank!, !customMask || customMask.mode === MaskMode.CausalCustom || customMask.mode === MaskMode.Causal,
+          pagedKV.pageSize, pagedKV.sequences.map(s => s.allocLen),
+          pagedKV.contextParallel
+        );
+      }
+      else {
+        // sparse mode requires no planning
+      }
       this.mlaBatchIndicesH.withPinnedBuffer(buf => {
         let off = 0;
         for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {

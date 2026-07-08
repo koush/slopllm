@@ -1115,18 +1115,22 @@ __global__ void concat_and_cache_ds_mla_kernel(
 
     const int src_offset = threadIdx.x * 8;
     int4 vals_i4 = *reinterpret_cast<const int4*>(&src_ckv[src_offset]);
-    const __nv_bfloat16* vals = reinterpret_cast<const __nv_bfloat16*>(&vals_i4);
+    const __nv_bfloat162* vals2 = reinterpret_cast<const __nv_bfloat162*>(&vals_i4);
 
-    float max_abs = 0.f;
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        max_abs = fmaxf(max_abs, fabsf(__bfloat162float(vals[i])));
-    }
+    // Max |val| over the 8 elements. bf16 magnitude order is preserved by the
+    // conversion to float, so reduce in bf16x2 (abs+max, 2 lanes/op, tree-shaped)
+    // instead of 8 scalar float converts on a serial fmaxf chain.
+    __nv_bfloat162 m2 = __hmax2(__hmax2(__habs2(vals2[0]), __habs2(vals2[1])),
+                                __hmax2(__habs2(vals2[2]), __habs2(vals2[3])));
 
+    // Reduce across the 16-thread tile. A shuffle always moves a 32-bit lane, so
+    // carry the packed bf16x2 (one __hmax2 per step) and collapse to a float only
+    // once, after the reduction.
     #pragma unroll
     for (int mask = 8; mask > 0; mask /= 2) {
-        max_abs = fmaxf(max_abs, __shfl_xor_sync(NOPE_MASK, max_abs, mask, 16));
+        m2 = __hmax2(m2, __shfl_xor_sync(NOPE_MASK, m2, mask, 16));
     }
+    float max_abs = __bfloat162float(__hmax(m2.x, m2.y));
 
     float tile_scale = fmaxf(max_abs / kFp8ScaleDivisor, FLT_MIN);
 
@@ -1135,15 +1139,18 @@ __global__ void concat_and_cache_ds_mla_kernel(
         scale_dst[tile_idx] = tile_scale;
     }
 
-    uint8_t result[8];
+    // Quantize 2-at-a-time: bf16x2 -> float2 -> fp8x2, packed into two u32 stores.
+    uint32_t packed[2] = {0u, 0u};
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        float val = __bfloat162float(vals[i]) / tile_scale;
-        result[i] = __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E4M3);
+    for (int j = 0; j < 4; j++) {
+        float2 f = __bfloat1622float2(vals2[j]);
+        f.x /= tile_scale;
+        f.y /= tile_scale;
+        uint16_t p = __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
+        packed[j >> 1] |= (uint32_t)p << ((j & 1) * 16);
     }
-    uint32_t* result32 = reinterpret_cast<uint32_t*>(result);
-    *reinterpret_cast<uint32_t*>(&dst[src_offset]) = result32[0];
-    *reinterpret_cast<uint32_t*>(&dst[src_offset + 4]) = result32[1];
+    *reinterpret_cast<uint32_t*>(&dst[src_offset]) = packed[0];
+    *reinterpret_cast<uint32_t*>(&dst[src_offset + 4]) = packed[1];
 }
 
 extern "C" {

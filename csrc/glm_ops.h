@@ -109,7 +109,7 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     int32_t* hist, int32_t* meta,
     int batch, int stride, int topk, int num_splits);
 
-void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, const int32_t* topk_idx,
+void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const int32_t* topk_idx,
                        const int32_t* page_indices, const int32_t* page_indptr,
                        const int32_t* last_page_len, const int32_t* batch_indices,
                        int num_tokens, int topk, int page_size,

@@ -485,25 +485,27 @@ static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
 
 static Napi::Value TopkToSlots(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, slots, topkIdx, pageIndices, pageIndptr, lastPageLen, batchIndices, numTokens, topk, pageSize, cpWorldSize, cpRank)").ThrowAsJavaScriptException();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected (ctx, slots, topkLength, topkIdx, pageIndices, pageIndptr, lastPageLen, batchIndices, numTokens, topk, pageSize, cpWorldSize, cpRank)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t slots_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t topk_idx_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t page_indices_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t page_indptr_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t last_page_len_ptr = info[5].As<Napi::Number>().Int64Value();
-    uintptr_t batch_indices_ptr = info[6].As<Napi::Number>().Int64Value();
-    int num_tokens = info[7].As<Napi::Number>().Int32Value();
-    int topk = info[8].As<Napi::Number>().Int32Value();
-    int page_size = info[9].As<Napi::Number>().Int32Value();
-    uint32_t cp_world_size = info[10].As<Napi::Number>().Uint32Value();
-    uint32_t cp_rank = info[11].As<Napi::Number>().Uint32Value();
+    uintptr_t topk_length_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t topk_idx_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t page_indices_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t page_indptr_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t last_page_len_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t batch_indices_ptr = info[7].As<Napi::Number>().Int64Value();
+    int num_tokens = info[8].As<Napi::Number>().Int32Value();
+    int topk = info[9].As<Napi::Number>().Int32Value();
+    int page_size = info[10].As<Napi::Number>().Int32Value();
+    uint32_t cp_world_size = info[11].As<Napi::Number>().Uint32Value();
+    uint32_t cp_rank = info[12].As<Napi::Number>().Uint32Value();
     glm_topk_to_slots(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<int32_t*>(slots_ptr),
+        reinterpret_cast<int32_t*>(topk_length_ptr),
         reinterpret_cast<const int32_t*>(topk_idx_ptr),
         reinterpret_cast<const int32_t*>(page_indices_ptr),
         reinterpret_cast<const int32_t*>(page_indptr_ptr),

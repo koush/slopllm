@@ -41,6 +41,12 @@ def ref_topk_to_slots(topk_idx, page_indices, page_indptr, last_page_len,
     return slots
 
 
+def valid_set(arr):
+    """Per-row set of valid (>=0) slots. topk_to_slots now compacts valid slots to
+    the front in arbitrary order, so only the set is well-defined, not position."""
+    return [set(int(x) for x in row if x >= 0) for row in np.asarray(arr)]
+
+
 @pytest.mark.parametrize("cp_world_size,cp_rank", [
     (1, 0),
     (2, 0),
@@ -82,7 +88,7 @@ def test_topk_to_slots_basic(glm, device, cp_world_size, cp_rank):
     )
 
     actual = slots.cpu().numpy()
-    np.testing.assert_array_equal(actual, ref), f"mismatch:\n actual={actual}\n ref={ref}"
+    assert valid_set(actual) == valid_set(ref), f"mismatch:\n actual={actual}\n ref={ref}"
 
 
 def test_topk_to_slots_multi_seq(glm, device):
@@ -130,7 +136,7 @@ def test_topk_to_slots_multi_seq(glm, device):
     )
 
     actual = slots.cpu().numpy()
-    np.testing.assert_array_equal(actual, ref), f"mismatch:\n actual={actual}\n ref={ref}"
+    assert valid_set(actual) == valid_set(ref), f"mismatch:\n actual={actual}\n ref={ref}"
 
 
 def test_topk_to_slots_invalid(glm, device):
@@ -157,10 +163,8 @@ def test_topk_to_slots_invalid(glm, device):
     torch.cuda.synchronize(device)
 
     actual = slots.cpu().numpy()
-    assert actual[0, 0] == -1, f"negative should be -1, got {actual[0, 0]}"
-    assert actual[0, 1] == -1, f"kv_len should be -1, got {actual[0, 1]}"
-    assert actual[0, 2] == -1, f"beyond kv_len should be -1, got {actual[0, 2]}"
-    assert actual[0, 3] == 5 * page_size, f"pos 0 should be slot {5 * page_size}, got {actual[0, 3]}"
+    # Only pos 0 is valid; the rest (-1, >=kv_len) are dropped.
+    assert valid_set(actual) == [{5 * page_size}], f"got {actual}"
 
 
 def test_topk_to_slots_partial_page(glm, device):
@@ -185,7 +189,4 @@ def test_topk_to_slots_partial_page(glm, device):
     torch.cuda.synchronize(device)
 
     actual = slots.cpu().numpy()
-    assert actual[0, 0] == 7 * 64 + 0, f"pos 0 → page 7, offset 0 = {7*64}"
-    assert actual[0, 1] == 7 * 64 + 63, f"pos 63 → page 7, offset 63 = {7*64+63}"
-    assert actual[0, 2] == 3 * 64 + 0, f"pos 64 → page 3, offset 0 = {3*64}"
-    assert actual[0, 3] == 3 * 64 + 35, f"pos 99 → page 3, offset 35 = {3*64+35}"
+    assert valid_set(actual) == [{7*64+0, 7*64+63, 3*64+0, 3*64+35}], f"got {actual}"

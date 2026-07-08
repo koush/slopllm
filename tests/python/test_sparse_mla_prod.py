@@ -227,15 +227,14 @@ def test_topk_to_slots_prod(prod_setup, device):
     )
     torch.cuda.synchronize()
 
-    # Reference: slot = page_id * page_size + offset
-    for pos in range(s['seq_len']):
-        expected = _slot_for_token(0, pos, s['page_indices_np'], s['page_indptr_np'], PAGE_SIZE)
-        actual = slots[0, pos].item()
-        assert actual == expected, f"pos {pos}: expected slot {expected}, got {actual}"
-
-    # Check -1 padding
-    for i in range(s['seq_len'], TOPK):
-        assert slots[0, i].item() == -1, f"pos {i}: expected -1, got {slots[0, i].item()}"
+    # topk_to_slots compacts valid slots to the front in arbitrary order, so
+    # compare the set of valid slots and check the rest is -1 padded.
+    expected = {_slot_for_token(0, pos, s['page_indices_np'], s['page_indptr_np'], PAGE_SIZE)
+                for pos in range(s['seq_len'])}
+    slots_np = slots[0].cpu().numpy()
+    got = set(int(x) for x in slots_np if x >= 0)
+    assert got == expected, f"slot set mismatch: missing {expected - got}, extra {got - expected}"
+    assert set(int(x) for x in slots_np[s['seq_len']:]) == {-1}, "expected -1 padding after valid slots"
 
     print(f"topkToSlots: all {s['seq_len']} slots correct")
 

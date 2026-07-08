@@ -462,16 +462,7 @@ export class Glm51Model extends ChatModel {
             })()
           : idxKNormed.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
 
-        const nnz = state.isDecode ? batchSize : totalTokens;
-        ws.glm.mlaKvCacheAppend(
-          pagedKV.kData[layerIdx], null,
-          pagedKV.indices, ws.indptrD, ws.lastPageLen,
-          idxKOut, null,
-          ws.mlaBatchIndices, ws.positionIds,
-          nnz, pagedKV.pageSize, cfg.indexHeadDim, 0,
-          cfg.indexHeadDim, 0,
-          false,
-        );
+        state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
       }
     });
 
@@ -531,7 +522,7 @@ export class Glm51Model extends ChatModel {
       const cm = (!state.isDecode && state.customMask?.mode === MaskMode.CausalCustom) ? state.customMask : undefined;
       const slots = this.glm.indexerTopkSlots(
         idxQ, pagedKV.kData[layerIdx], idxWeights,
-        pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD, ws.mlaBatchIndices,
+        pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD, ws.mlaBatchIndices, ws.sparseTopkLength,
         Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim, pagedKV.pageSize, idxTopk,
         state.isDecode, pagedKV.maxPages * pagedKV.pageSize, this.contextParallel,
         undefined, undefined, ws.globalLastPageLen,
@@ -562,13 +553,13 @@ export class Glm51Model extends ChatModel {
           sparseResult = this.glm.sparseMlaDecode(
             qConcat, pagedKV.ckvData[layerIdx], sharedSlots.value,
             midOut, midLse, BS, nHeads, kvLoraRank, cfg.indexTopk, numSplits,
-            cfg.scaling, strideKvBlock, 0, this.contextParallel,
+            cfg.scaling, strideKvBlock, 0, this.contextParallel, ws.sparseTopkLength,
           );
         } else {
           sparseResult = this.glm.sparseMlaPrefill(
             qConcat, pagedKV.ckvData[layerIdx], sharedSlots.value,
             BS, nHeads, kvLoraRank, cfg.indexTopk, pagedKV.pageSize,
-            cfg.scaling, strideKvBlock, this.contextParallel,
+            cfg.scaling, strideKvBlock, this.contextParallel, ws.sparseTopkLength,
           );
           // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
           // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when

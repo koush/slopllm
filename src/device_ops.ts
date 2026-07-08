@@ -64,9 +64,11 @@ export interface DeviceOps {
 
   indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void;
   // Indexer top-k -> physical KV slots (score+topk then slot mapping). Returns
-  // the [totalQ, topk] slots tensor. `decode` selects the multi-block v2 kernel;
-  // `maxKv` bounds the score scratch (max sequence length in the cache).
-  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, decode: boolean, maxKv: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor;
+  // the [totalQ, topk] slots tensor and writes the compacted valid count per
+  // query into `topkLength` (a stable caller buffer, for the sparse kernel's
+  // early-out). `decode` selects the multi-block v2 kernel; `maxKv` bounds the
+  // score scratch (max seq len).
+  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, topkLength: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, decode: boolean, maxKv: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor;
 
   graphBeginCapture(): void;
   graphEndCapture(): number;
