@@ -503,7 +503,6 @@ export class Glm51Model extends ChatModel {
 
     kvcache.streamWaitEvent();
     q.streamWaitEvent();
-    if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} streams joined`); (this.glm as any).synchronize?.(); }
 
     using qAbsorbedR = q.result.qAbsorbedR;
     using qPeR = q.result.qPeR;
@@ -530,7 +529,6 @@ export class Glm51Model extends ChatModel {
       );
       sharedSlots.replace(slots);
     }
-    if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} indexer+slots done`); (this.glm as any).synchronize?.(); }
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     {
@@ -570,7 +568,6 @@ export class Glm51Model extends ChatModel {
 
         attnOut = sparseResult.o;
         lseBuf = sparseResult.lse;
-        if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} sparse MLA done`); (this.glm as any).synchronize?.(); }
       } else {
         // Dense MLA path (FlashInfer plan/run)
         const mlaResult = state.isDecode
@@ -585,21 +582,17 @@ export class Glm51Model extends ChatModel {
 
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
       using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, vS, vB, lseBuf);
-      if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} vExpand done`); (this.glm as any).synchronize?.(); }
       oProjBuf.replace(vExpanded.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!, BS));
-      if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} oProj done`); (this.glm as any).synchronize?.(); }
     }
 
     const attnResult = residual.fusedAddRmsnorm(oProjBuf.value, this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
-    if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} post-attn norm done`); (this.glm as any).synchronize?.(); }
 
     const mlpPfx = `${Glm51Model.WEIGHT_PREFIX}${layerIdx}`;
     using downBuf = layerIdx >= cfg.firstSparseMlpLayer
       ? this.mlpSparse(attnNormed, mlpPfx, BS)
       : this.mlpDense(attnNormed, mlpPfx, BS);
-    if (process.env.GLM_DEBUG) { console.log(`  L${layerIdx} MLP done`); (this.glm as any).synchronize?.(); }
 
     let nextWeight: Tensor;
     if (layerIdx < cfg.numHiddenLayers - 1) {
@@ -644,7 +637,6 @@ export class Glm51Model extends ChatModel {
       const result = this.mlaLayer(cos, sin, normed.value, residual.value, i, state, sharedSlots);
       normed.replace(result.normed);
       residual.replace(result.residual);
-      if (process.env.GLM_DEBUG) { console.log(`layer ${i} done`); (this.glm as any).synchronize?.(); console.log(`layer ${i} sync ok`); }
     }
 
     state.sharedSlots?.value?.removeTracking();
