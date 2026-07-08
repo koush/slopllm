@@ -429,13 +429,20 @@ export function mtpTreeDecode(
   const hiddenStateStaging = ws.ensureAlloc([numVerificationTokens, hiddenDim], "BF16", `mtp-tree-hs-staging-${numVerificationTokens}`, undefined, 0);
 
   warmup ||= !captureManager.isCaptured(['mtp-verify', numVerificationTokens]);
-  const kvCacheLayers = captureManager.run(() => {
+  const { kvCacheLayers, indexerKvCacheLayers } = captureManager.run(() => {
     const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, appendCkvOrig: Tensor, appendKpeOrig: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
+    const indexerKvCacheLayers: { appendIdxK: Tensor, appendIdxKOrig: Tensor, cacheIdx: number, indexHeadDim: number }[] = [];
 
     const mlaKVCacheAppendOrig = targetPrefillState.mlaKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
       kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendKpe: appendKpe.capture(), appendCkvOrig: appendCkv, appendKpeOrig: appendKpe, cacheIdx, kvLoraRank, qkRopeDim });
       mlaKVCacheAppendOrig(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
+    };
+
+    const indexerKvCacheAppendOrig = targetPrefillState.indexerKvCacheAppend.bind(targetPrefillState);
+    targetPrefillState.indexerKvCacheAppend = (idxKOut, cacheIdx, indexHeadDim) => {
+      indexerKvCacheLayers.push({ appendIdxK: idxKOut.capture(), appendIdxKOrig: idxKOut, cacheIdx, indexHeadDim });
+      indexerKvCacheAppendOrig(idxKOut, cacheIdx, indexHeadDim);
     };
 
     using hiddenStates = model.forwardModel(targetPrefillState);
@@ -446,7 +453,7 @@ export function mtpTreeDecode(
 
     hiddenStateStaging.memcpy(hiddenStates, undefined, MemcpyKind.DeviceToDevice);
 
-    return kvCacheLayers;
+    return { kvCacheLayers, indexerKvCacheLayers };
   }, ['mtp-verify', numVerificationTokens]);
 
   ws.glm.synchronize();
@@ -548,6 +555,20 @@ export function mtpTreeDecode(
         }
       }
     }
+    for (const layer of indexerKvCacheLayers) {
+      const indexHeadDim = layer.indexHeadDim;
+      for (let i = 0; i < finishCount; i++) {
+        const srcIdx = acceptedNodeIndices[i];
+        if (srcIdx !== i) {
+          layer.appendIdxK.memcpy2d(
+            i * indexHeadDim * 2, indexHeadDim * 2,
+            layer.appendIdxK, srcIdx * indexHeadDim * 2, indexHeadDim * 2,
+            indexHeadDim * 2, 1,
+            MemcpyKind.DeviceToDevice,
+          );
+        }
+      }
+    }
   }
 
   // target can now be truncate to the original length, plan another prefill with
@@ -566,6 +587,10 @@ export function mtpTreeDecode(
       mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
       layer.appendCkvOrig[Symbol.dispose]();
       layer.appendKpeOrig[Symbol.dispose]();
+    }
+    for (const layer of indexerKvCacheLayers) {
+      mtpExtendPrefill.indexerKvCacheAppend(layer.appendIdxK, layer.cacheIdx, layer.indexHeadDim);
+      layer.appendIdxKOrig[Symbol.dispose]();
     }
 
     using verfiedHiddenStates = hiddenStateStaging.slice(0, 0, finishCount);
