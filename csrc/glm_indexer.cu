@@ -342,10 +342,16 @@ void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
 // full TOPK. This matters most under CP, where topk_to_slots keeps only the
 // ~topk/world positions that live on this rank (the rest were scattered -1).
 //
-// The slot format is abs_page * page_size + offset, matching the sparse MLA
-// kernel's decomposition (slot / page_block_size = page_id, slot % page_block_size
-// = offset). In CP mode the offset is in [0, eff_page_size) — only this rank's
-// subset of tokens within each page — but the page stride is still page_size.
+// The slot is the linear physical index into this rank's KV cache:
+//   slot = abs_page * eff_page_size + offset,   offset in [0, eff_page_size)
+// This must match exactly how concat_and_cache_ds_mla (glm_flash.cu) writes each
+// token: slot = page_id * eff_page_size + (local_pos % eff_page_size). The sparse
+// MLA kernel decodes slot / page_block_size and slot % page_block_size, but with
+// strideKvBlock = page_block_size * bytes_per_token that collapses back to linear
+// addressing (kv_cache + slot * BPT), so the linear slot is what it needs.
+// In non-CP mode eff_page_size == page_size, so this reduces to the dense layout.
+// (Do NOT use page_size as the stride under CP: the physical pages hold only
+//  eff_page_size = page_size / cp_world_size tokens each.)
 //
 // Compaction preserves input order: valid entries appear in the same relative
 // order as in topk_idx, so slots[t, 0..count) correspond to the valid subset of
@@ -392,7 +398,7 @@ __global__ void topk_to_slots_kernel(
             }
             if (local_pos >= 0 && local_pos < local_kv_len) {
                 const int abs_page = page_indices[page_base + local_pos / eff_page_size];
-                slot = abs_page * page_size + (local_pos % eff_page_size);
+                slot = abs_page * eff_page_size + (local_pos % eff_page_size);
             }
         }
         s_slots[i] = slot;
@@ -1229,8 +1235,6 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     int numSplits, int qGlobalStart) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
-
-    int block = 256;
 
     // Zero histograms and meta.
     cudaMemsetAsync(coarseHist, 0, (size_t)totalQ * IDX_COARSE_BUCKETS * sizeof(int32_t), stream);
