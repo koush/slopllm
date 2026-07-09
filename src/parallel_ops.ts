@@ -2940,6 +2940,9 @@ export class ParallelOps implements DeviceOps {
     const pMaskKvLen = maskKvLen ? this.cast(maskKvLen) : undefined;
 
     const W = this.worldSize;
+    // Query-sharding requires a single sequence (qoIndptr = [0, totalQ]). The
+    // score kernel indexes the custom mask by global query row (qg + qGlobalStart)
+    // and the mask/indptr are passed full, so a CausalCustom mask shards correctly.
     const canShard = !decode && !contextParallel && W > 1
       && pQoIndptr.shards[0].shape[0] === 2
       && totalQ % W === 0;
