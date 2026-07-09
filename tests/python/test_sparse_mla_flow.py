@@ -263,7 +263,7 @@ def test_sparse_mla_flow_cp_filter(glm, device, cp_world_size, cp_rank):
             page_idx_in_seq = local_pos // eps
             offset_in_page = local_pos % eps
             abs_page = page_indices_np[page_indptr_np[0] + page_idx_in_seq]
-            expected.append(abs_page * page_size + offset_in_page)
+            expected.append(abs_page * eps + offset_in_page)
 
         # Compare actual vs expected
         for k in range(len(expected)):

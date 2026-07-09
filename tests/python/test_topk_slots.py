@@ -36,7 +36,7 @@ def ref_topk_to_slots(topk_idx, page_indices, page_indptr, last_page_len,
             page_idx_in_seq = local_pos // eps
             offset_in_page = local_pos % eps
             abs_page = page_indices[page_indptr[seq] + page_idx_in_seq]
-            slots[t, k] = abs_page * page_size + offset_in_page
+            slots[t, k] = abs_page * eps + offset_in_page
 
     return slots
 
