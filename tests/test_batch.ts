@@ -98,8 +98,8 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("batch prefill append", () => {
-    using pagedKV = makePagedKV(1, 256);
-    using singleKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
+    using singleKV = makePagedKV(1, 64);
     const suffix = [4, 5, 6, 7];
     const fullPrompt = [...PROMPT1, ...suffix];
 
@@ -127,8 +127,8 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("batch prefill truncate append", () => {
-    using pagedKV = makePagedKV(1, 256);
-    using singleKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
+    using singleKV = makePagedKV(1, 64);
     const base = makeLongPrompt(PAGE_SIZE);
     const suffix = [200, 201, 202, 203];
     const fullPrompt = [...base, ...suffix];
@@ -151,7 +151,7 @@ describe("Qwen3-0.6B batch tests", () => {
     const tokensTruncAppend = ws.forwardEagerPrefill(model, [suffixB], pagedKV);
     pagedKV.reportTokens(0, suffixB);
 
-    using pagedKV2 = makePagedKV(1, 256);
+    using pagedKV2 = makePagedKV(1, 64);
     pagedKV2.reset(1);
     const tokensFull = ws.forwardEagerPrefill(model, [fullPrompt], pagedKV2);
 
@@ -209,7 +209,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
   it("batch generate vs single generate", () => {
     using pagedKV = makePagedKV();
-    using singleKV = makePagedKV(1, 256);
+    using singleKV = makePagedKV(1, 64);
     const maxNewTokens = 20;
     const batchGenerated = generateBatchTokens(model, ws, pagedKV, [PROMPT_LONG1, PROMPT_LONG2], maxNewTokens, EOS_TOKEN_IDS);
 
@@ -346,7 +346,7 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("batch sampling matches sequential sampling", () => {
-    using pagedKV = model.createChatCache(256, 4) as PagedKVCache;
+    using pagedKV = model.createChatCache(64, 4) as PagedKVCache;
     const greedy: SamplingParams = makeSamplingParams({
       temperature: 0, topP: 1.0, topK: 0,
       repetitionPenalty: 1.0, presencePenalty: 0, repetitionPenaltyWindow: 64,
@@ -426,8 +426,8 @@ describe("Qwen3-0.6B batch tests", () => {
   }
 
   it("chunked prefill: two even halves", () => {
-    using pagedKV = makePagedKV(1, 256);
-    using pagedKV2 = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
+    using pagedKV2 = makePagedKV(1, 64);
     const fullPrompt = PROMPT_LONG1;
     const mid = Math.floor(fullPrompt.length / 2);
     const firstHalf = fullPrompt.slice(0, mid);
@@ -444,8 +444,8 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("chunked prefill: uneven split", () => {
-    using pagedKV = makePagedKV(1, 256);
-    using pagedKV2 = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
+    using pagedKV2 = makePagedKV(1, 64);
     const fullPrompt = PROMPT_LONG1;
 
     pagedKV.reset(1);
@@ -459,8 +459,8 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("chunked prefill: three chunks", () => {
-    using pagedKV = makePagedKV(1, 256);
-    using pagedKV2 = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
+    using pagedKV2 = makePagedKV(1, 64);
     const fullPrompt = PROMPT_LONG1;
 
     pagedKV.reset(1);
@@ -474,8 +474,8 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("chunked prefill + decode matches full prefill + decode", () => {
-    using pagedKV = makePagedKV(1, 256);
-    using pagedKV2 = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
+    using pagedKV2 = makePagedKV(1, 64);
     const fullPrompt = PROMPT_LONG1;
     const mid = Math.floor(fullPrompt.length / 2);
 
@@ -496,7 +496,7 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("prefill after KV truncate: argmax at every position matches decode", () => {
-    using pagedKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
     const prompt = makeLongPrompt(PAGE_SIZE * 2);
     const numDecodeSteps = 8;
 
@@ -662,7 +662,7 @@ describe("PagedKVCache prefix matching", () => {
   }
 
   it("self-match: prefix shorter than pageSize returns suffix", () => {
-    using pagedKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
     const prompt = PROMPT1;
     const suffix = [100, 101, 102, 103];
     const fullPrompt = [...prompt, ...suffix];
@@ -678,7 +678,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("self-match: truncate longer cache returns suffix", () => {
-    using pagedKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
     const base = makeLongPrompt(PAGE_SIZE);
     const suffix = [200, 201, 202, 203];
     const fullPrompt = [...base, ...suffix];
@@ -697,7 +697,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence: share full pages between sequences", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const baseLen = PAGE_SIZE * 2;
     const base = makeLongPrompt(baseLen);
@@ -720,7 +720,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence: only full pages shared, partial page not shared", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const baseLen = PAGE_SIZE + 4;
     const base = makeLongPrompt(baseLen);
@@ -739,7 +739,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence: page extending past match is not shared", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const baseLen = PAGE_SIZE + 4;
     const base = makeLongPrompt(baseLen);
@@ -760,7 +760,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("self-match wins tie when cross-match has same token count", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const shortPrefix = PROMPT1;
     const longerBase = makeLongPrompt(PAGE_SIZE + 2);
@@ -779,7 +779,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("no pages shared when all matching tokens in partial page", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const base = makeLongPrompt(PAGE_SIZE + 2);
 
@@ -796,8 +796,8 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence sharing produces correct prefill output", () => {
-    using pagedKV = makePagedKV(1, 256);
-    using singleKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
+    using singleKV = makePagedKV(1, 64);
     const baseLen = PAGE_SIZE * 2;
     const base = makeLongPrompt(baseLen);
     const suffix = makeLongPrompt(8, [200]);
@@ -820,8 +820,8 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("self-match: full cache match continues from partial page", () => {
-    using pagedKV = makePagedKV(1, 256);
-    using singleKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
+    using singleKV = makePagedKV(1, 64);
     const prompt = PROMPT1;
     const suffix = [100, 101, 102, 103];
     const fullPrompt = [...prompt, ...suffix];
@@ -846,7 +846,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("self-match: full cache match at page boundary", () => {
-    using pagedKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
     const base = makeLongPrompt(PAGE_SIZE * 2);
     const suffix = [200, 201, 202, 203];
     const fullPrompt = [...base, ...suffix];
@@ -863,14 +863,14 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("empty cache returns full input", () => {
-    using pagedKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
     pagedKV.reset(1);
     const result = pagedKV.prefixMatch(0, PROMPT1);
     assert.deepStrictEqual(result, PROMPT1, "empty cache should return full input");
   });
 
   it("truncate and re-extend produces correct decode", () => {
-    using pagedKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(1, 64);
     const base = makeLongPrompt(PAGE_SIZE);
     const suffix = [200, 201, 202, 203];
     const fullPrompt = [...base, ...suffix];
@@ -894,7 +894,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence copyPartial: copies partial page tokens and sets allocLen", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const baseLen = PAGE_SIZE + 4;
     const base = makeLongPrompt(baseLen);
@@ -957,7 +957,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence copyPartial: ref count unchanged on source pages", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const baseLen = PAGE_SIZE + 4;
     const base = makeLongPrompt(baseLen);
@@ -976,7 +976,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence copyPartial=false: partial page not copied (original behavior)", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const baseLen = PAGE_SIZE + 4;
     const base = makeLongPrompt(baseLen);
@@ -996,7 +996,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence copyPartial: no partial page when match is page-aligned", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const baseLen = PAGE_SIZE * 2;
     const base = makeLongPrompt(baseLen);
@@ -1015,7 +1015,7 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence copyPartial: subsequent reportTokens places tokens correctly", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
     const baseLen = PAGE_SIZE + 4;
     const base = makeLongPrompt(baseLen);
@@ -1038,9 +1038,9 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence sharing: prefill + decode matches full prefill + decode", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
-    using refKV = makePagedKV(1, 256);
+    using refKV = makePagedKV(1, 64);
     const baseLen = PAGE_SIZE * 2;
     const base = makeLongPrompt(baseLen);
     const suffix = makeLongPrompt(8, [200]);
@@ -1093,9 +1093,9 @@ describe("PagedKVCache prefix matching", () => {
   });
 
   it("cross-sequence copyPartial: prefill + decode matches full prefill + decode", () => {
-    using pagedKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);
-    using refKV = makePagedKV(1, 256);
+    using refKV = makePagedKV(1, 64);
     const baseLen = PAGE_SIZE + 4;
     const base = makeLongPrompt(baseLen);
     const suffix = makeLongPrompt(8, [200]);
