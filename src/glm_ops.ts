@@ -1062,10 +1062,12 @@ export class GlmOps implements DeviceOps {
     return { o, lse };
   }
 
-  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, midOut: Tensor, midLse: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, _contextParallel?: boolean, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, _contextParallel?: boolean, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
     if (strideKvBlock % 64 !== 0) throw new Error(`sparseMlaDecode: SM120 kernel requires pageBlockSize=64, got strideKvBlock=${strideKvBlock} (not divisible by 64 bytes/token)`);
     const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
     const lse = q.workspace.alloc([numTokens, numHeads], "F32");
+    using midOut = q.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
+    using midLse = q.workspace.alloc([numTokens, numHeads, numSplits], "F32");
     getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, topkLength ? ptr(topkLength) : 0);
     return { o, lse };
   }

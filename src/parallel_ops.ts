@@ -2831,19 +2831,17 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, midOut: Tensor, midLse: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, contextParallel?: boolean, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, contextParallel?: boolean, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
     const pQ = this.cast(q);
     const pKvCache = this.cast(kvCache);
     const pIndices = this.cast(indices);
-    const pMidOut = this.cast(midOut);
-    const pMidLse = this.cast(midLse);
     const pTopkLength = topkLength ? this.cast(topkLength) : undefined;
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "sparseMlaDecode numHeads");
     const oPar = contextParallel ? TensorParallelism.PartialSoftmax : TensorParallelism.Row;
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaDecode(pQ.shards[i], pKvCache.shards[i], pIndices.shards[i], pMidOut.shards[i], pMidLse.shards[i], numTokens, effectiveNumHeads, headDim, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, contextParallel, pTopkLength?.shards[i]);
+      const result = this.devices[i].sparseMlaDecode(pQ.shards[i], pKvCache.shards[i], pIndices.shards[i], numTokens, effectiveNumHeads, headDim, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, contextParallel, pTopkLength?.shards[i]);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }

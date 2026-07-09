@@ -441,10 +441,13 @@ export class Glm51Model extends ChatModel {
 
       kPeRopeStream.streamWaitEvent();
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
+    });
 
-      // Indexer K: wk(normed) → layernorm → split → RoPE → concat → append to kData
-      // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
-      if (cfg.indexHeadDim > 0 && pagedKV.kData.length > layerIdx && (cfg.indexerTypes[layerIdx] !== "shared" || !sharedSlots.value)) {
+    // Indexer K: wk(normed) → layernorm → split → RoPE → concat → append to kData
+    // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
+    using kvcacheIndex = (cfg.indexHeadDim === 0 || (cfg.indexerTypes[layerIdx] === "shared" && sharedSlots.value))
+      ? undefined
+      : this.glm.withStream(() => {
         const idxRopeDim = qkRopeDim;
         const idxNopeDim = cfg.indexHeadDim - idxRopeDim;
         using idxKRaw = normed.linear(this.tensors.get(`${pfx}.indexer.wk.weight`)!, BS);
@@ -455,20 +458,50 @@ export class Glm51Model extends ChatModel {
         );
         using idxKOut = idxNopeDim > 0
           ? (() => {
-              using idxKPe = idxKNormed.slice(1, 0, idxRopeDim);
-              using idxKNope = idxKNormed.slice(1, idxRopeDim, idxNopeDim);
-              using idxKPeRope = idxKPe.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
-              return idxKPeRope.cat([idxKNope], 1);
-            })()
+            using idxKPe = idxKNormed.slice(1, 0, idxRopeDim);
+            using idxKNope = idxKNormed.slice(1, idxRopeDim, idxNopeDim);
+            using idxKPeRope = idxKPe.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
+            return idxKPeRope.cat([idxKNope], 1);
+          })()
           : idxKNormed.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
 
         state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
-      }
-    });
+      });
 
     using q = this.glm.withStream(() => {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
       using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps, cfg.qLoraRank, BS);
+
+      // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
+      // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
+      using idxQStream = (cfg.indexHeadDim === 0 || (cfg.indexerTypes[layerIdx] === "shared" && sharedSlots.value))
+        ? undefined
+        : this.glm.withStream(() => {
+          const idxNHeads = cfg.indexNHeads;
+          const idxHeadDim = cfg.indexHeadDim;
+          const idxTopk = cfg.indexTopk;
+
+          using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!, BS);
+          idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
+
+          using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!, BS);
+          using idxQ = idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
+
+          kvcacheIndex?.streamWaitEvent();
+
+          // Indexer forward: fused score+topk kernel → slots
+          // 'full' layer: compute score+topk → slots
+          const cm = (!state.isDecode && state.customMask?.mode === MaskMode.CausalCustom) ? state.customMask : undefined;
+          const slots = this.glm.indexerTopkSlots(
+            idxQ, pagedKV.kData[layerIdx], idxWeights,
+            pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD, ws.mlaBatchIndices, ws.sparseTopkLength,
+            Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim, pagedKV.pageSize, idxTopk,
+            state.isDecode, pagedKV.maxPages * pagedKV.pageSize, this.contextParallel,
+            undefined, undefined, ws.globalLastPageLen,
+            cm?.mask, cm?.indptr, cm?.maskKvLen,
+          );
+          sharedSlots.replace(slots);
+        });
 
       using qPeR = this.glm.withStream(() => {
         using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!, BS);
@@ -482,22 +515,13 @@ export class Glm51Model extends ChatModel {
           : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
       });
 
-      // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
-      // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
-      using idxQStream = this.glm.withStream(() => {
-        if (cfg.indexHeadDim === 0 || (cfg.indexerTypes[layerIdx] === "shared" && sharedSlots.value)) return undefined as Tensor | undefined;
-        using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!, BS);
-        return idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
-      });
-
       qAbsorbedRStream.streamWaitEvent();
       qPeR.streamWaitEvent();
-      idxQStream.streamWaitEvent();
+      idxQStream?.streamWaitEvent();
 
       return {
         qAbsorbedR: qAbsorbedRStream.result,
         qPeR: qPeR.result,
-        idxQ: idxQStream.result,
       }
     });
 
@@ -506,29 +530,6 @@ export class Glm51Model extends ChatModel {
 
     using qAbsorbedR = q.result.qAbsorbedR;
     using qPeR = q.result.qPeR;
-
-    // Indexer forward: fused score+topk kernel → slots
-    using idxQ = q.result.idxQ;
-    if (idxQ) {
-      // 'full' layer: compute score+topk → slots
-      const idxNHeads = cfg.indexNHeads;
-      const idxHeadDim = cfg.indexHeadDim;
-      const idxTopk = cfg.indexTopk;
-
-      using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!, BS);
-      idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
-
-      const cm = (!state.isDecode && state.customMask?.mode === MaskMode.CausalCustom) ? state.customMask : undefined;
-      const slots = this.glm.indexerTopkSlots(
-        idxQ, pagedKV.kData[layerIdx], idxWeights,
-        pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD, ws.mlaBatchIndices, ws.sparseTopkLength,
-        Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim, pagedKV.pageSize, idxTopk,
-        state.isDecode, pagedKV.maxPages * pagedKV.pageSize, this.contextParallel,
-        undefined, undefined, ws.globalLastPageLen,
-        cm?.mask, cm?.indptr, cm?.maskKvLen,
-      );
-      sharedSlots.replace(slots);
-    }
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     {
@@ -545,12 +546,9 @@ export class Glm51Model extends ChatModel {
 
         if (state.isDecode) {
           const numSplits = Math.ceil(cfg.indexTopk / 64);
-          const midPar = this.contextParallel ? undefined : TensorParallelism.Row;
-          using midOut = ws.alloc([BS, nHeads, numSplits, kvLoraRank], "BF16", undefined, midPar);
-          using midLse = ws.alloc([BS, nHeads, numSplits], "F32", undefined, midPar);
           sparseResult = this.glm.sparseMlaDecode(
             qConcat, pagedKV.ckvData[layerIdx], sharedSlots.value,
-            midOut, midLse, BS, nHeads, kvLoraRank, cfg.indexTopk, numSplits,
+            BS, nHeads, kvLoraRank, cfg.indexTopk, numSplits,
             cfg.scaling, strideKvBlock, 0, this.contextParallel, ws.sparseTopkLength,
           );
         } else {
