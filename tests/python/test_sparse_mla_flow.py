@@ -236,36 +236,44 @@ def test_sparse_mla_flow_cp_filter(glm, device, cp_world_size, cp_rank):
         cp_world_size, cp_rank,
     )
 
-    # Verify: every valid slot must correspond to a token_pos where pos % cp_world_size == cp_rank
+    # Verify: compacted slots match expected (valid entries at front, in input order).
+    # topk_to_slots compacts valid slots to a contiguous prefix [0, count) preserving
+    # the relative order from topk_indices, so slots[t, k] does NOT correspond to
+    # topk_indices[t, k] when invalid entries were filtered out (e.g. wrong CP rank).
     slots_cpu = slots.cpu().numpy()
     topk_cpu = topk_indices.cpu().numpy()
+    last_page_len_np = last_page_len_t.cpu().numpy()
+    eps = page_size // cp_world_size
 
     valid_count = 0
     for t in range(nnz):
+        # Build expected compacted slots from topk_indices
+        expected = []
         for k in range(topk):
             token_pos = int(topk_cpu[t, k])
-            slot = int(slots_cpu[t, k])
-
-            if slot < 0:
-                # Invalid — must be either pos out of range or wrong CP rank
-                if token_pos >= 0 and token_pos < max_kv_len:
-                    assert token_pos % cp_world_size != cp_rank, \
-                        f"token {t} k {k}: pos {token_pos} belongs to this rank but got -1"
+            if token_pos < 0:
                 continue
-
-            valid_count += 1
-            assert token_pos % cp_world_size == cp_rank, \
-                f"token {t} k {k}: pos {token_pos} % {cp_world_size} != {cp_rank} but got slot {slot}"
-
-            # Verify slot correctness
-            eps = page_size // cp_world_size
+            if token_pos % cp_world_size != cp_rank:
+                continue
             local_pos = (token_pos - cp_rank) // cp_world_size
+            num_pages = page_indptr_np[1] - page_indptr_np[0]
+            local_kv_len = (num_pages - 1) * eps + int(last_page_len_np[0])
+            if local_pos >= local_kv_len:
+                continue
             page_idx_in_seq = local_pos // eps
             offset_in_page = local_pos % eps
             abs_page = page_indices_np[page_indptr_np[0] + page_idx_in_seq]
-            expected_slot = abs_page * page_size + offset_in_page
-            assert slot == expected_slot, \
-                f"token {t} k {k}: slot {slot} != expected {expected_slot}"
+            expected.append(abs_page * page_size + offset_in_page)
+
+        # Compare actual vs expected
+        for k in range(len(expected)):
+            assert int(slots_cpu[t, k]) == expected[k], \
+                f"token {t} k {k}: slot {int(slots_cpu[t, k])} != expected {expected[k]}"
+        for k in range(len(expected), topk):
+            assert int(slots_cpu[t, k]) == -1, \
+                f"token {t} k {k}: expected -1 but got {int(slots_cpu[t, k])}"
+
+        valid_count += len(expected)
 
     # Roughly 1/cp_world_size of entries should be valid
     total_entries = nnz * topk

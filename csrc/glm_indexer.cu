@@ -341,6 +341,15 @@ void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
 // attention kernel then only walks ceil(count/BI) candidate tiles instead of the
 // full TOPK. This matters most under CP, where topk_to_slots keeps only the
 // ~topk/world positions that live on this rank (the rest were scattered -1).
+//
+// The slot format is abs_page * page_size + offset, matching the sparse MLA
+// kernel's decomposition (slot / page_block_size = page_id, slot % page_block_size
+// = offset). In CP mode the offset is in [0, eff_page_size) — only this rank's
+// subset of tokens within each page — but the page stride is still page_size.
+//
+// Compaction preserves input order: valid entries appear in the same relative
+// order as in topk_idx, so slots[t, 0..count) correspond to the valid subset of
+// topk_idx[t, *] in order.
 __global__ void topk_to_slots_kernel(
     int32_t* __restrict__ slots,          // [num_tokens, topk]
     int32_t* __restrict__ topk_length,    // [num_tokens] (nullable)
@@ -363,30 +372,43 @@ __global__ void topk_to_slots_kernel(
     int32_t* out = slots + (size_t)token * topk;
     const int32_t* in = topk_idx + (size_t)token * topk;
 
-    __shared__ int s_count;
-    if (threadIdx.x == 0) s_count = 0;
-    __syncthreads();
+    extern __shared__ int32_t s_slots[];  // [topk]
 
+    // Pass 1: compute slot for each topk entry in parallel, store in smem
+    // (or -1 if the entry is invalid: negative, wrong CP rank, or beyond kvLen).
     for (int i = threadIdx.x; i < topk; i += blockDim.x) {
         const int token_pos = in[i];
-        if (token_pos < 0) continue;
-        int local_pos;
-        if (cp_world_size > 1) {
-            if ((uint32_t)token_pos % cp_world_size != cp_rank) continue;
-            local_pos = (token_pos - (int)cp_rank) / (int)cp_world_size;
-        } else {
-            local_pos = token_pos;
+        int slot = -1;
+        if (token_pos >= 0) {
+            int local_pos;
+            if (cp_world_size > 1) {
+                if ((uint32_t)token_pos % cp_world_size == cp_rank) {
+                    local_pos = (token_pos - (int)cp_rank) / (int)cp_world_size;
+                } else {
+                    local_pos = -1;
+                }
+            } else {
+                local_pos = token_pos;
+            }
+            if (local_pos >= 0 && local_pos < local_kv_len) {
+                const int abs_page = page_indices[page_base + local_pos / eff_page_size];
+                slot = abs_page * page_size + (local_pos % eff_page_size);
+            }
         }
-        if (local_pos >= local_kv_len) continue;
-        const int abs_page = page_indices[page_base + local_pos / eff_page_size];
-        const int slot = abs_page * eff_page_size + (local_pos % eff_page_size);
-        out[atomicAdd(&s_count, 1)] = slot;   // compact to front
+        s_slots[i] = slot;
     }
     __syncthreads();
 
-    const int count = s_count;
-    for (int i = count + threadIdx.x; i < topk; i += blockDim.x) out[i] = -1;
-    if (threadIdx.x == 0 && topk_length) topk_length[token] = count;
+    // Pass 2: serial compaction in thread 0 (preserves input order).
+    if (threadIdx.x == 0) {
+        int count = 0;
+        for (int i = 0; i < topk; i++) {
+            if (s_slots[i] >= 0)
+                out[count++] = s_slots[i];
+        }
+        for (int i = count; i < topk; i++) out[i] = -1;
+        if (topk_length) topk_length[token] = count;
+    }
 }
 
 void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const int32_t* topk_idx,
@@ -395,7 +417,8 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const 
                        int num_tokens, int topk, int page_size,
                        uint32_t cp_world_size, uint32_t cp_rank) {
     cudaSetDevice(ctx->device_id);
-    topk_to_slots_kernel<<<num_tokens, 256, 0, GLM_STREAM(ctx)>>>(
+    int smem = topk * sizeof(int32_t);
+    topk_to_slots_kernel<<<num_tokens, 256, smem, GLM_STREAM(ctx)>>>(
         slots, topk_length, topk_idx, page_indices, page_indptr, last_page_len, batch_indices,
         topk, page_size, num_tokens, cp_world_size, cp_rank);
 }
