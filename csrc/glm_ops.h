@@ -993,6 +993,21 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output,
                                             int count, int N, int K,
                                             int num_experts, void* workspace);
 
+// Split MoE coop: scatter once, GEMM multiple times, unscatter separately.
+size_t glm_mma_moe_coop_scatter_workspace_size(int count, int K, int num_experts);
+size_t glm_mma_moe_coop_gemm_workspace_size(int count, int N);
+void glm_mma_moe_coop_scatter(GlmCtx* ctx, const void* input, const int* expert_ids,
+                              int top_k, int count, int K, int num_experts,
+                              void* scatter_workspace);
+void glm_mma_moe_coop_gemm(GlmCtx* ctx,
+                           const void* const* weight_ptrs, const void* const* scale_ptrs,
+                           const void* const* scale2_ptrs,
+                           int num_experts, int N, int K, int count,
+                           const void* scatter_workspace, void* gemm_workspace);
+void glm_mma_moe_coop_unscatter(GlmCtx* ctx, void* output,
+                                int count, int N, int K, int num_experts,
+                                const void* scatter_workspace, const void* gemm_workspace);
+
 #ifdef __cplusplus
 }
 #endif

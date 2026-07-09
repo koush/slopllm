@@ -1715,6 +1715,113 @@ static Napi::Value Nvfp4MulMatIdGroupedMmaCoop(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value MmaMoeCoopScatterWorkspaceSize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3) {
+        Napi::TypeError::New(env, "Expected (count, K, num_experts)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    int count = info[0].As<Napi::Number>().Int32Value();
+    int K = info[1].As<Napi::Number>().Int32Value();
+    int num_experts = info[2].As<Napi::Number>().Int32Value();
+    size_t ws_size = glm_mma_moe_coop_scatter_workspace_size(count, K, num_experts);
+    return Napi::Number::New(env, static_cast<double>(ws_size));
+}
+
+static Napi::Value MmaMoeCoopGemmWorkspaceSize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (count, N)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    int count = info[0].As<Napi::Number>().Int32Value();
+    int N = info[1].As<Napi::Number>().Int32Value();
+    size_t ws_size = glm_mma_moe_coop_gemm_workspace_size(count, N);
+    return Napi::Number::New(env, static_cast<double>(ws_size));
+}
+
+static Napi::Value MmaMoeCoopScatter(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 8) {
+        Napi::TypeError::New(env, "Expected (ctx, input, expert_ids, top_k, count, K, num_experts, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t in_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t eids_ptr = info[2].As<Napi::Number>().Int64Value();
+    int top_k = info[3].As<Napi::Number>().Int32Value();
+    int count = info[4].As<Napi::Number>().Int32Value();
+    int K = info[5].As<Napi::Number>().Int32Value();
+    int num_experts = info[6].As<Napi::Number>().Int32Value();
+    uintptr_t ws_ptr = info[7].As<Napi::Number>().Int64Value();
+    glm_mma_moe_coop_scatter(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                             reinterpret_cast<const void*>(in_ptr),
+                             reinterpret_cast<const int*>(eids_ptr),
+                             top_k, count, K, num_experts,
+                             reinterpret_cast<void*>(ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("mmaMoeCoopScatter failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value MmaMoeCoopGemm(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 10) {
+        Napi::TypeError::New(env, "Expected (ctx, weight_ptrs, scale_ptrs, scale2_ptrs, num_experts, N, K, count, scatter_workspace, gemm_workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t wptrs_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t sptrs_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t s2ptrs_ptr = info[3].As<Napi::Number>().Int64Value();
+    int num_experts = info[4].As<Napi::Number>().Int32Value();
+    int N = info[5].As<Napi::Number>().Int32Value();
+    int K = info[6].As<Napi::Number>().Int32Value();
+    int count = info[7].As<Napi::Number>().Int32Value();
+    uintptr_t scatter_ws_ptr = info[8].As<Napi::Number>().Int64Value();
+    uintptr_t gemm_ws_ptr = info[9].As<Napi::Number>().Int64Value();
+    glm_mma_moe_coop_gemm(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                          reinterpret_cast<const void* const*>(wptrs_ptr),
+                          reinterpret_cast<const void* const*>(sptrs_ptr),
+                          reinterpret_cast<const void* const*>(s2ptrs_ptr),
+                          num_experts, N, K, count,
+                          reinterpret_cast<const void*>(scatter_ws_ptr),
+                          reinterpret_cast<void*>(gemm_ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("mmaMoeCoopGemm failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value MmaMoeCoopUnscatter(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 8) {
+        Napi::TypeError::New(env, "Expected (ctx, output, count, N, K, num_experts, scatter_workspace, gemm_workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
+    int count = info[2].As<Napi::Number>().Int32Value();
+    int N = info[3].As<Napi::Number>().Int32Value();
+    int K = info[4].As<Napi::Number>().Int32Value();
+    int num_experts = info[5].As<Napi::Number>().Int32Value();
+    uintptr_t scatter_ws_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t gemm_ws_ptr = info[7].As<Napi::Number>().Int64Value();
+    glm_mma_moe_coop_unscatter(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                               reinterpret_cast<void*>(out_ptr),
+                               count, N, K, num_experts,
+                               reinterpret_cast<const void*>(scatter_ws_ptr),
+                               reinterpret_cast<const void*>(gemm_ws_ptr));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("mmaMoeCoopUnscatter failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value Bf16MulMatIdGroupedMma(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 11) {
@@ -4060,6 +4167,11 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "mmaMoePcWorkspaceSize"), Napi::Function::New(env, MmaMoePcWorkspaceSize));
     exports.Set(Napi::String::New(env, "nvfp4MulMatIdGroupedMmaCoop"), Napi::Function::New(env, Nvfp4MulMatIdGroupedMmaCoop));
     exports.Set(Napi::String::New(env, "mmaMoeCoopWorkspaceSize"), Napi::Function::New(env, MmaMoeCoopWorkspaceSize));
+    exports.Set(Napi::String::New(env, "mmaMoeCoopScatterWorkspaceSize"), Napi::Function::New(env, MmaMoeCoopScatterWorkspaceSize));
+    exports.Set(Napi::String::New(env, "mmaMoeCoopGemmWorkspaceSize"), Napi::Function::New(env, MmaMoeCoopGemmWorkspaceSize));
+    exports.Set(Napi::String::New(env, "mmaMoeCoopScatter"), Napi::Function::New(env, MmaMoeCoopScatter));
+    exports.Set(Napi::String::New(env, "mmaMoeCoopGemm"), Napi::Function::New(env, MmaMoeCoopGemm));
+    exports.Set(Napi::String::New(env, "mmaMoeCoopUnscatter"), Napi::Function::New(env, MmaMoeCoopUnscatter));
     exports.Set(Napi::String::New(env, "bf16MulMatIdGroupedMma"), Napi::Function::New(env, Bf16MulMatIdGroupedMma));
     exports.Set(Napi::String::New(env, "nvfp4MulMatIdGroupedMmaTm64"), Napi::Function::New(env, Nvfp4MulMatIdGroupedMmaTm64));
     exports.Set(Napi::String::New(env, "bf16MulMatIdGroupedMmaTm64"), Napi::Function::New(env, Bf16MulMatIdGroupedMmaTm64));

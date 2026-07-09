@@ -1854,6 +1854,44 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, [count, N], this.type, outPar);
   }
 
+  swiGluMlpMoe(
+    weights: { gate: Tensor[], up: Tensor[], down: Tensor[] },
+    topkIndicesFlat: Tensor,
+    topK: number, count: number,
+    moeIntermediate: number, hs: number,
+    pfx: string,
+  ): Tensor {
+    super.swiGluMlpMoe(weights, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
+
+    const inputPar = this.parallelism;
+    if (inputPar !== TensorParallelism.Replicated) {
+      throw new Error(`swiGluMlpMoe: unsupported input parallelism ${inputPar} (expected Replicated)`);
+    }
+
+    const pGate = weights.gate.map(w => w as ParallelTensor);
+    const pUp = weights.up.map(w => w as ParallelTensor);
+    const pDown = weights.down.map(w => w as ParallelTensor);
+    const pExpertIds = topkIndicesFlat as ParallelTensor;
+
+    // Replicated input: gate/up shard N (moeIntermediate) → Row,
+    // silu preserves Row, down shards K (moeIntermediate) → PartialSum.
+    const shardMoeIntermediate = this.parallelOps.shardDim(moeIntermediate, "swiGluMlpMoe moeIntermediate");
+
+    const outShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      const shardWeights = {
+        gate: pGate.map(w => w.shards[i]),
+        up: pUp.map(w => w.shards[i]),
+        down: pDown.map(w => w.shards[i]),
+      };
+      outShards.push(this.shards[i].swiGluMlpMoe(
+        shardWeights, pExpertIds.shards[i], topK, count,
+        shardMoeIntermediate, hs, pfx,
+      ));
+    }
+    return this.parallelOps.wrapShards(this.workspace, outShards, [count, hs], this.type, TensorParallelism.PartialSum);
+  }
+
   scatterAddRows(scales: Tensor, topK: number, dim: number, numRows: number): Tensor {
     const pScales = scales as ParallelTensor;
     const outShards: Tensor[] = [];

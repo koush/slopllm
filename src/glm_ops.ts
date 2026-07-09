@@ -203,6 +203,11 @@ interface NativeAddon {
   nvfp4MulMatIdGroupedMmaPc(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   mmaMoeCoopWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   nvfp4MulMatIdGroupedMmaCoop(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
+  mmaMoeCoopScatterWorkspaceSize(count: number, K: number, numExperts: number): number;
+  mmaMoeCoopGemmWorkspaceSize(count: number, N: number): number;
+  mmaMoeCoopScatter(ctx: number, input: number, expertIds: number, topK: number, count: number, K: number, numExperts: number, workspace: number): void;
+  mmaMoeCoopGemm(ctx: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, numExperts: number, N: number, K: number, count: number, scatterWorkspace: number, gemmWorkspace: number): void;
+  mmaMoeCoopUnscatter(ctx: number, output: number, count: number, N: number, K: number, numExperts: number, scatterWorkspace: number, gemmWorkspace: number): void;
   bf16MulMatIdGroupedMma(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number): void;
   rotateInputIds(ctx: number, outputIds: number, inputIds: number, qoIndptr: number, newTokens: number, batchSize: number): void;
@@ -741,6 +746,82 @@ export class GlmTensor extends Tensor {
       getNativeAddon().mulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K);
     }
     return out;
+  }
+
+  private getMoeNvfp4Ptrs(weights: Tensor[], name: string): { weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor } {
+    const ptrName = `__moe_ptrs.${name}`;
+    let weightPtrs = this.workspace.tensors.get(ptrName);
+    if (!weightPtrs) {
+      weightPtrs = this.workspace.alloc([weights.length], "I64", ptrName);
+      weightPtrs.writePointers(weights);
+    }
+    const scalePtrName = ptrName + "_weight_scale";
+    let scalePtrs = this.workspace.tensors.get(scalePtrName);
+    if (!scalePtrs) {
+      const scaleTensors = weights.map(w => w.workspace.tensors.get(w.name! + "_weight_scale")!);
+      scalePtrs = this.workspace.alloc([weights.length], "I64", scalePtrName);
+      scalePtrs.writePointers(scaleTensors);
+    }
+    const scale2PtrName = ptrName + "_weight_scale_2";
+    let scale2Ptrs = this.workspace.tensors.get(scale2PtrName);
+    if (!scale2Ptrs) {
+      const scale2Tensors = weights.map(w => w.workspace.tensors.get(w.name! + "_weight_scale_2")!);
+      scale2Ptrs = this.workspace.alloc([weights.length], "I64", scale2PtrName);
+      scale2Ptrs.writePointers(scale2Tensors);
+    }
+    return { weightPtrs, scalePtrs, scale2Ptrs };
+  }
+
+  swiGluMlpMoe(
+    weights: { gate: Tensor[], up: Tensor[], down: Tensor[] },
+    topkIndicesFlat: Tensor,
+    topK: number, count: number,
+    moeIntermediate: number, hs: number,
+    pfx: string,
+  ): Tensor {
+    super.swiGluMlpMoe(weights, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
+
+    if (count <= MUL_MAT_ID_GROUPED_THRESHOLD || weights.gate[0].type !== "U8") {
+      using gateOutStream = this.workspace.glm.withStream(() => this.mulMatId(weights.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
+      using upOut = this.mulMatId(weights.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
+      gateOutStream.streamWaitEvent();
+      using gateOut = gateOutStream.result;
+      using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
+      return siluOut.mulMatId(weights.down, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
+    }
+
+    const numExperts = weights.gate.length;
+    const ctx = this.glm.ctx;
+    const gatePtrs = this.getMoeNvfp4Ptrs(weights.gate, `${pfx}.gate_proj`);
+    const upPtrs = this.getMoeNvfp4Ptrs(weights.up, `${pfx}.up_proj`);
+
+    const scatterWsSize = getNativeAddon().mmaMoeCoopScatterWorkspaceSize(count, hs, numExperts);
+    using scatterWs = this.workspace.allocRaw(scatterWsSize);
+    getNativeAddon().mmaMoeCoopScatter(ctx, this.data, topkIndicesFlat.data, topK, count, hs, numExperts, scatterWs.data);
+
+    const gemmWsSize = getNativeAddon().mmaMoeCoopGemmWorkspaceSize(count, moeIntermediate);
+
+    using gateStream = this.workspace.glm.withStream(() => {
+      using gemmWs = this.workspace.allocRaw(gemmWsSize);
+      getNativeAddon().mmaMoeCoopGemm(ctx, gatePtrs.weightPtrs.data, gatePtrs.scalePtrs.data, gatePtrs.scale2Ptrs.data,
+                                       numExperts, moeIntermediate, hs, count, scatterWs.data, gemmWs.data);
+      const gateOut = this.workspace.alloc([count, moeIntermediate], this.type);
+      getNativeAddon().mmaMoeCoopUnscatter(ctx, gateOut.data, count, moeIntermediate, hs, numExperts,
+                                           scatterWs.data, gemmWs.data);
+      return gateOut;
+    });
+
+    using upGemmWs = this.workspace.allocRaw(gemmWsSize);
+    getNativeAddon().mmaMoeCoopGemm(ctx, upPtrs.weightPtrs.data, upPtrs.scalePtrs.data, upPtrs.scale2Ptrs.data,
+                                     numExperts, moeIntermediate, hs, count, scatterWs.data, upGemmWs.data);
+    using upOut = this.workspace.alloc([count, moeIntermediate], this.type);
+    getNativeAddon().mmaMoeCoopUnscatter(ctx, upOut.data, count, moeIntermediate, hs, numExperts,
+                                         scatterWs.data, upGemmWs.data);
+
+    gateStream.streamWaitEvent();
+    using gateOut = gateStream.result;
+    using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
+    return siluOut.mulMatId(weights.down, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
   }
 
   scatterAddRows(scales: Tensor, topK: number, dim: number, numRows: number): Tensor {

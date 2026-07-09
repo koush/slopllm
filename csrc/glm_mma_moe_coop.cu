@@ -518,54 +518,15 @@ static void launch_coop(GlmCtx* ctx, int num_experts, int N,
         expert_offsets, num_experts, N, tile_counter);
 }
 
-} // namespace
-
-extern "C" {
-
-size_t glm_mma_moe_coop_workspace_size(int count, int N, int K, int num_experts) {
-    size_t sorted_input = (size_t)count * K * 2;
-    size_t sorted_output = (size_t)count * N * 2;
-    size_t expert_counts = (size_t)num_experts * 4;
-    size_t expert_offsets = (size_t)(num_experts + 1) * 4;
-    size_t sorted_to_original = (size_t)count * 4;
-    size_t tile_counter = 4;
-    return sorted_input + sorted_output + expert_counts + expert_offsets + sorted_to_original + tile_counter;
-}
-
-void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void* input,
-                                           const void* const* weight_ptrs, const void* const* scale_ptrs,
-                                           const void* const* scale2_ptrs, const int* expert_ids,
-                                           int top_k, int count, int N, int K, int num_experts,
-                                           void* workspace) {
-    cudaSetDevice(ctx->device_id);
-    cudaStream_t stream = GLM_STREAM(ctx);
-    if (count == 0 || N == 0 || K == 0) return;
-
-    uint8_t* ws = static_cast<uint8_t*>(workspace);
-    size_t offset = 0;
-    __nv_bfloat16* sorted_input = reinterpret_cast<__nv_bfloat16*>(ws + offset); offset += (size_t)count * K * 2;
-    __nv_bfloat16* sorted_output = reinterpret_cast<__nv_bfloat16*>(ws + offset); offset += (size_t)count * N * 2;
-    int* expert_counts = reinterpret_cast<int*>(ws + offset); offset += (size_t)num_experts * 4;
-    int* expert_offsets = reinterpret_cast<int*>(ws + offset); offset += (size_t)(num_experts + 1) * 4;
-    int* sorted_to_original = reinterpret_cast<int*>(ws + offset); offset += (size_t)count * 4;
-    int* tile_counter = reinterpret_cast<int*>(ws + offset);
-
-    int block = 256, grid = (count + block - 1) / block;
-    cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
-    histogram_kernel<<<grid, block, 0, stream>>>(expert_ids, count, expert_counts, num_experts);
-    prefix_sum_kernel<<<1, 1, 0, stream>>>(expert_counts, expert_offsets, num_experts);
-    scatter_input_kernel<<<grid, block, 0, stream>>>(expert_ids, count, top_k,
-        reinterpret_cast<const __nv_bfloat16*>(input), K, sorted_input, sorted_to_original, expert_offsets);
-    grid = (num_experts + block - 1) / block;
-    restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts);
-    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
-    cudaMemsetAsync(sorted_output, 0, (size_t)count * N * 2, stream);
-
+static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
+                                   const __nv_bfloat16* sorted_input, __nv_bfloat16* sorted_output, int K,
+                                   const void* const* weight_ptrs, const void* const* scale_ptrs,
+                                   const void* const* scale2_ptrs, const int* expert_offsets,
+                                   int* tile_counter, cudaStream_t stream) {
     constexpr int MaxExperts = 256;
     const char* cfg_env = getenv("GLM_COOP_CONFIG");
     std::string cfg(cfg_env ? cfg_env : "tm64_tn128_d2_nw2");
 
-    // Backward compat: GLM_COOP_NWARPS overrides config
     const char* nw_env = getenv("GLM_COOP_NWARPS");
     if (nw_env && !cfg_env) {
         int nw = atoi(nw_env);
@@ -675,15 +636,155 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void
                                                         weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
     else if (cfg == "tm64_tn128_d2_nw4")
         launch_coop<64, 128, 2, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
     else if (cfg == "tm64_tn128_d3_nw4")
         launch_coop<64, 128, 3, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
     else
         launch_coop<32, 64, 4, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+}
+
+} // namespace
+
+extern "C" {
+
+size_t glm_mma_moe_coop_workspace_size(int count, int N, int K, int num_experts) {
+    size_t sorted_input = (size_t)count * K * 2;
+    size_t sorted_output = (size_t)count * N * 2;
+    size_t expert_counts = (size_t)num_experts * 4;
+    size_t expert_offsets = (size_t)(num_experts + 1) * 4;
+    size_t sorted_to_original = (size_t)count * 4;
+    size_t tile_counter = 4;
+    return sorted_input + sorted_output + expert_counts + expert_offsets + sorted_to_original + tile_counter;
+}
+
+void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void* input,
+                                           const void* const* weight_ptrs, const void* const* scale_ptrs,
+                                           const void* const* scale2_ptrs, const int* expert_ids,
+                                           int top_k, int count, int N, int K, int num_experts,
+                                           void* workspace) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    if (count == 0 || N == 0 || K == 0) return;
+
+    uint8_t* ws = static_cast<uint8_t*>(workspace);
+    size_t offset = 0;
+    __nv_bfloat16* sorted_input = reinterpret_cast<__nv_bfloat16*>(ws + offset); offset += (size_t)count * K * 2;
+    __nv_bfloat16* sorted_output = reinterpret_cast<__nv_bfloat16*>(ws + offset); offset += (size_t)count * N * 2;
+    int* expert_counts = reinterpret_cast<int*>(ws + offset); offset += (size_t)num_experts * 4;
+    int* expert_offsets = reinterpret_cast<int*>(ws + offset); offset += (size_t)(num_experts + 1) * 4;
+    int* sorted_to_original = reinterpret_cast<int*>(ws + offset); offset += (size_t)count * 4;
+    int* tile_counter = reinterpret_cast<int*>(ws + offset);
+
+    int block = 256, grid = (count + block - 1) / block;
+    cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
+    histogram_kernel<<<grid, block, 0, stream>>>(expert_ids, count, expert_counts, num_experts);
+    prefix_sum_kernel<<<1, 1, 0, stream>>>(expert_counts, expert_offsets, num_experts);
+    scatter_input_kernel<<<grid, block, 0, stream>>>(expert_ids, count, top_k,
+        reinterpret_cast<const __nv_bfloat16*>(input), K, sorted_input, sorted_to_original, expert_offsets);
+    grid = (num_experts + block - 1) / block;
+    restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts);
+    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
+    cudaMemsetAsync(sorted_output, 0, (size_t)count * N * 2, stream);
+
+    launch_coop_configured(ctx, num_experts, N, sorted_input, sorted_output, K,
+                           weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
 
     grid = (count + block - 1) / block;
+    unscatter_output_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(output),
+                                                        sorted_output, N, sorted_to_original, count);
+}
+
+// ---------------------------------------------------------------------------
+// Split MoE coop: scatter once, run GEMM multiple times with different weights
+// (e.g. gate + up share the same scatter), unscatter each output separately.
+//
+// Scatter workspace layout:
+//   [0, count*K*2):                        sorted_input
+//   [count*K*2, +num_experts*4):           expert_counts
+//   [count*K*2 + num_experts*4, +(num_experts+1)*4): expert_offsets
+//   [count*K*2 + num_experts*4 + (num_experts+1)*4, +count*4): sorted_to_original
+//
+// GEMM workspace layout:
+//   [0, count*N*2):   sorted_output
+//   [count*N*2, +4):  tile_counter
+// ---------------------------------------------------------------------------
+
+size_t glm_mma_moe_coop_scatter_workspace_size(int count, int K, int num_experts) {
+    return (size_t)count * K * 2
+         + (size_t)num_experts * 4
+         + (size_t)(num_experts + 1) * 4
+         + (size_t)count * 4;
+}
+
+size_t glm_mma_moe_coop_gemm_workspace_size(int count, int N) {
+    return (size_t)count * N * 2 + 4;
+}
+
+void glm_mma_moe_coop_scatter(GlmCtx* ctx, const void* input, const int* expert_ids,
+                              int top_k, int count, int K, int num_experts,
+                              void* scatter_workspace) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    if (count == 0 || K == 0) return;
+
+    uint8_t* ws = static_cast<uint8_t*>(scatter_workspace);
+    size_t offset = 0;
+    __nv_bfloat16* sorted_input = reinterpret_cast<__nv_bfloat16*>(ws + offset); offset += (size_t)count * K * 2;
+    int* expert_counts = reinterpret_cast<int*>(ws + offset); offset += (size_t)num_experts * 4;
+    int* expert_offsets = reinterpret_cast<int*>(ws + offset); offset += (size_t)(num_experts + 1) * 4;
+    int* sorted_to_original = reinterpret_cast<int*>(ws + offset);
+
+    int block = 256, grid = (count + block - 1) / block;
+    cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
+    histogram_kernel<<<grid, block, 0, stream>>>(expert_ids, count, expert_counts, num_experts);
+    prefix_sum_kernel<<<1, 1, 0, stream>>>(expert_counts, expert_offsets, num_experts);
+    scatter_input_kernel<<<grid, block, 0, stream>>>(expert_ids, count, top_k,
+        reinterpret_cast<const __nv_bfloat16*>(input), K, sorted_input, sorted_to_original, expert_offsets);
+    grid = (num_experts + block - 1) / block;
+    restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts);
+}
+
+void glm_mma_moe_coop_gemm(GlmCtx* ctx,
+                           const void* const* weight_ptrs, const void* const* scale_ptrs,
+                           const void* const* scale2_ptrs,
+                           int num_experts, int N, int K, int count,
+                           const void* scatter_workspace, void* gemm_workspace) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    if (count == 0 || N == 0 || K == 0) return;
+
+    const uint8_t* sws = static_cast<const uint8_t*>(scatter_workspace);
+    const __nv_bfloat16* sorted_input = reinterpret_cast<const __nv_bfloat16*>(sws);
+    const int* expert_offsets = reinterpret_cast<const int*>(sws + (size_t)count * K * 2 + (size_t)num_experts * 4);
+
+    uint8_t* gws = static_cast<uint8_t*>(gemm_workspace);
+    __nv_bfloat16* sorted_output = reinterpret_cast<__nv_bfloat16*>(gws);
+    int* tile_counter = reinterpret_cast<int*>(gws + (size_t)count * N * 2);
+
+    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
+    cudaMemsetAsync(sorted_output, 0, (size_t)count * N * 2, stream);
+
+    launch_coop_configured(ctx, num_experts, N, sorted_input, sorted_output, K,
+                           weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+}
+
+void glm_mma_moe_coop_unscatter(GlmCtx* ctx, void* output,
+                                int count, int N, int K, int num_experts,
+                                const void* scatter_workspace, const void* gemm_workspace) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    if (count == 0 || N == 0) return;
+
+    const uint8_t* sws = static_cast<const uint8_t*>(scatter_workspace);
+    const int* sorted_to_original = reinterpret_cast<const int*>(
+        sws + (size_t)count * K * 2 + (size_t)num_experts * 4 + (size_t)(num_experts + 1) * 4);
+
+    const uint8_t* gws = static_cast<const uint8_t*>(gemm_workspace);
+    const __nv_bfloat16* sorted_output = reinterpret_cast<const __nv_bfloat16*>(gws);
+
+    int block = 256, grid = (count + block - 1) / block;
     unscatter_output_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(output),
                                                         sorted_output, N, sorted_to_original, count);
 }

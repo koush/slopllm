@@ -273,6 +273,10 @@ export abstract class Tensor implements Disposable {
     return siluBuf.linear(weights.down, BS);
   }
 
+  /** SiLU-gated MoE MLP: gate_proj + up_proj → silu_and_mul → down_proj.
+   *  Weights are per-expert arrays. topkIndicesFlat is [count] expert ids (count = batch * topK).
+   *  Gate/up use topK routing; down uses topK=1 (each token-expert pair is independent).
+   *  Implementations should overlap gate and up on separate streams. */
   swiGluMlpMoe(
     weights: { gate: Tensor[], up: Tensor[], down: Tensor[] },
     topkIndicesFlat: Tensor,
@@ -280,12 +284,13 @@ export abstract class Tensor implements Disposable {
     moeIntermediate: number, hs: number,
     pfx: string,
   ): Tensor {
-    using gateOutStream = this.workspace.glm.withStream(() => this.mulMatId(weights.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
-    using upOut = this.mulMatId(weights.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
-    gateOutStream.streamWaitEvent();
-    using gateOut = gateOutStream.result;
-    using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
-    return siluOut.mulMatId(weights.down, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
+    if (weights.gate.length !== weights.up.length || weights.gate.length !== weights.down.length) {
+      throw new Error(`swiGluMlpMoe: expert count mismatch gate=${weights.gate.length} up=${weights.up.length} down=${weights.down.length}`);
+    }
+    if (topkIndicesFlat.shape.length !== 1 || topkIndicesFlat.shape[0] < count) {
+      throw new Error(`swiGluMlpMoe: topkIndicesFlat shape [${topkIndicesFlat.shape}] insufficient for count=${count}`);
+    }
+    return undefined as never;
   }
 
   arange(start: number, step: number, count: number): void {
