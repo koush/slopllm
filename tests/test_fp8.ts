@@ -75,7 +75,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
   });
 
   it("prefills and produces a valid token", () => {
-    const pagedKV = makeKV(model);
+    const pagedKV = makeKV(model, 4);
     try {
       pagedKV.reset(1);
       const token = ws.forwardEagerPrefill(model, [[1, 2, 3, 4, 5]], pagedKV)[0];
@@ -87,7 +87,7 @@ describe("Qwen3-0.6B-FP8 model", () => {
   });
 
   it("decodes tokens after prefill", () => {
-    const pagedKV = makeKV(model);
+    const pagedKV = makeKV(model, 4);
     try {
       const tokens = [...generateTokens(model, ws, pagedKV, [1, 2, 3, 4, 5], 10, model.eosIds)];
       assert.ok(tokens.length > 0, "should produce at least one token");
@@ -101,21 +101,21 @@ describe("Qwen3-0.6B-FP8 model", () => {
   });
 
   it("FP8 logits correlate with BF16 logits (cosine sim >= 0.99)", async () => {
-    const fp8KV = makeKV(model);
+    const fp8KV = makeKV(model, 4);
     const bf16Model = await Qwen3Model.fromPretrained(glm, BF16_REPO);
     const bf16Ws = new ExecutionWorkspace(glm, 1, 64);
-    const bf16KV = makeKV(bf16Model);
+    const bf16KV = makeKV(bf16Model, 4);
     try {
       fp8KV.reset(1);
       const fp8State = ws.planPrefill(model, 1, [5], fp8KV);
       fp8State.setInput([[1, 2, 3, 4, 5]]);
-      const fp8LogitsBuf = model.forward(fp8State);
+      using fp8LogitsBuf = model.forward(fp8State);
       const fp8Logits = readLogits(fp8LogitsBuf);
 
       bf16KV.reset(1);
       const bf16State = bf16Ws.planPrefill(bf16Model, 1, [5], bf16KV);
       bf16State.setInput([[1, 2, 3, 4, 5]]);
-      const bf16LogitsBuf = bf16Model.forward(bf16State);
+      using bf16LogitsBuf = bf16Model.forward(bf16State);
       const bf16Logits = readLogits(bf16LogitsBuf);
 
       assert.equal(fp8Logits.length, bf16Logits.length, "logits length mismatch");

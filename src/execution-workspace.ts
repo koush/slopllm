@@ -674,13 +674,13 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   forwardEagerPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): number[] {
-    const logits = this.forwardPrefill(model, inputIdsList, cache);
+    using logits = this.forwardPrefill(model, inputIdsList, cache);
     using argmaxResult = logits.argmax();
     return argmaxResult.readInt32LEArray();
   }
 
   forwardDecode(model: ChatModel, state: ExecutionState): Tensor {
-    const hiddenStates = model.forward(state);
+    using hiddenStates = model.forward(state);
     return state.computeLogits(hiddenStates, model);
   }
 
@@ -688,8 +688,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const state = this.planDecode(model, tokenIdsList.length, cache);
     state.setInput([tokenIdsList]);
     this.positionStep(state, model);
-    const hiddenStates = model.forward(state);
-    const logits = state.computeLogits(hiddenStates, model);
+    using hiddenStates = model.forward(state);
+    using logits = state.computeLogits(hiddenStates, model);
     using argmaxResult = logits.argmax();
     return argmaxResult.readInt32LEArray();
   }
