@@ -449,8 +449,8 @@ static Napi::Value IndexerScoreTopk(const Napi::CallbackInfo& info) {
 
 static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 21) {
-        Napi::TypeError::New(env, "Expected 21 args").ThrowAsJavaScriptException();
+    if (info.Length() < 26) {
+        Napi::TypeError::New(env, "Expected 26 args").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -475,10 +475,13 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     if (info.Length() >= 17 && info[16].IsNumber()) custom_mask = reinterpret_cast<const uint8_t*>(info[16].As<Napi::Number>().Int64Value());
     if (info.Length() >= 18 && info[17].IsNumber()) mask_indptr = reinterpret_cast<const int32_t*>(info[17].As<Napi::Number>().Int64Value());
     if (info.Length() >= 19 && info[18].IsNumber()) mask_kv_len = reinterpret_cast<const int32_t*>(info[18].As<Napi::Number>().Int64Value());
-    uintptr_t coarseHist_ptr = info[19].As<Napi::Number>().Int64Value();
-    uintptr_t fineHist_ptr = info[20].As<Napi::Number>().Int64Value();
-    uintptr_t meta_ptr = info[21].As<Napi::Number>().Int64Value();
-    int numSplits = info[22].As<Napi::Number>().Int32Value();
+    uintptr_t scores_ptr = info[19].As<Napi::Number>().Int64Value();
+    uintptr_t rowLen_ptr = info[20].As<Napi::Number>().Int64Value();
+    int maxKv = info[21].As<Napi::Number>().Int32Value();
+    uintptr_t coarseHist_ptr = info[22].As<Napi::Number>().Int64Value();
+    uintptr_t fineHist_ptr = info[23].As<Napi::Number>().Int64Value();
+    uintptr_t meta_ptr = info[24].As<Napi::Number>().Int64Value();
+    int numSplits = info[25].As<Napi::Number>().Int32Value();
     glm_indexer_score_topk_prefill(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<int32_t*>(out_idx_ptr),
@@ -491,6 +494,9 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
         reinterpret_cast<const int32_t*>(qoIndptr_ptr),
         scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal,
         custom_mask, mask_indptr, mask_kv_len,
+        reinterpret_cast<void*>(scores_ptr),
+        reinterpret_cast<int32_t*>(rowLen_ptr),
+        maxKv,
         reinterpret_cast<int32_t*>(coarseHist_ptr),
         reinterpret_cast<int32_t*>(fineHist_ptr),
         reinterpret_cast<int32_t*>(meta_ptr),
