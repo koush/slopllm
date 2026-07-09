@@ -104,7 +104,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int maxKv,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
-    int numSplits);
+    int numSplits, int qGlobalStart);
 
 void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const void* q, const void* kData, const void* weights,

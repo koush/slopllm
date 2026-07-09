@@ -276,7 +276,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_cat_last_dim.restype = None
@@ -1236,7 +1236,8 @@ class GlmOps:
                                    page_size, topk, causal,
                                    scores, row_len, max_kv,
                                    coarse_hist, fine_hist, meta, num_splits,
-                                   custom_mask=None, mask_indptr=None, mask_kv_len=None):
+                                   custom_mask=None, mask_indptr=None, mask_kv_len=None,
+                                   q_global_start=0):
         self.lib.glm_indexer_score_topk_prefill(
             self.ctx, self._ptr(out_idx), self._ptr(q), self._ptr(k_data), self._ptr(weights),
             self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
@@ -1246,7 +1247,7 @@ class GlmOps:
             self._ptr(mask_kv_len) if mask_kv_len is not None else ctypes.c_void_p(0),
             self._ptr(scores), self._ptr(row_len), max_kv,
             self._ptr(coarse_hist), self._ptr(fine_hist), self._ptr(meta),
-            num_splits,
+            num_splits, q_global_start,
         )
 
     def topk_to_slots(self, slots, topk_idx, page_indices, page_indptr,

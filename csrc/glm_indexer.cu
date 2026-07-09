@@ -767,7 +767,8 @@ idx_prefill_score_mma_kernel(
     int totalQ, float scale, int idxNHeads, int idxHeadDim, int pageSize,
     int maxKv, int causal,
     const uint8_t* __restrict__ custom_mask,
-    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len)
+    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len,
+    int qGlobalStart)
 {
     using namespace idxmma;
 
@@ -787,14 +788,21 @@ idx_prefill_score_mma_kernel(
         }
     }
     if (seq < 0) return;
+    // Under query-sharding q/weights/scores/out are the shard's local [totalQ,...]
+    // buffers while qoIndptr still describes the full sequence, so stop once a tile
+    // lands past this shard's local row count (also covers the launch slop blocks).
+    if (qStart >= totalQ) return;
 
     const int qoStart   = qoIndptr[seq];
     const int numQueries = qoIndptr[seq + 1] - qoStart;
-    const int m_valid   = min(TM, qoIndptr[seq + 1] - qStart);
+    // Clamp to both the sequence end (multi-seq) and the local row count (shard).
+    const int m_valid   = min(TM, min(qoIndptr[seq + 1], totalQ) - qStart);
     const int pageStart = pageIndptr[seq];
     const int numPages  = pageIndptr[seq + 1] - pageStart;
     const int kvLen     = numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0;
-    const int prefixLen = max(0, kvLen - numQueries);
+    // qGlobalStart shifts a shard's local query row to its true sequence position
+    // for causal limits (0 in the non-sharded path → identical to before).
+    const int prefixLen = max(0, kvLen - numQueries) + qGlobalStart;
     const int tileStart = blockIdx.x * TN;
     if (tileStart >= kvLen) return;
     // Causal prune: skip the whole tile if it sits past the last query's limit.
@@ -935,7 +943,7 @@ idx_prefill_score_mma_kernel(
         int cl = causal ? (prefixLen + (qg - qoStart)) : (kvLen - 1);
         if (gpos > cl) return;
         __nv_bfloat16 out =
-            (mask_ptr && idx_is_masked(gpos, qg - qoStart, mask_ptr, mask_kv_len_val, mask_prefix_len))
+            (mask_ptr && idx_is_masked(gpos, qg - qoStart + qGlobalStart, mask_ptr, mask_kv_len_val, mask_prefix_len))
                 ? __float2bfloat16(-INFINITY)
                 : __float2bfloat16(val);
         scores[(size_t)qg * maxKv + gpos] = out;
@@ -1195,7 +1203,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int maxKv,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
-    int numSplits) {
+    int numSplits, int qGlobalStart) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
 
@@ -1226,7 +1234,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
             (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
             (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
             totalQ, scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal,
-            custom_mask, mask_indptr, mask_kv_len);
+            custom_mask, mask_indptr, mask_kv_len, qGlobalStart);
     }
 
     // Passes 2-6: histogram + gather from buffer.
