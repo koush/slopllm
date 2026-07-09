@@ -582,6 +582,25 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
 // matches indexer_score_topk_kernel exactly (per-head ReLU, weighted sum, final
 // bf16 round) so the downstream selection is identical.
 // ---------------------------------------------------------------------------
+
+// Shared device helper: check if a KV position is masked out. Defined here so
+// both the v2 score kernel below and the two-level prefill kernels can use it.
+static __device__ __forceinline__ bool idx_is_masked(
+    int pos, int qLocalPos,
+    const uint8_t* mask_ptr, int mask_kv_len_val, int mask_prefix_len)
+{
+    if (!mask_ptr) return false;
+    if (pos < mask_prefix_len) return false;
+    int mask_offset = qLocalPos * mask_kv_len_val + (pos - mask_prefix_len);
+    return !((mask_ptr[mask_offset >> 3] >> (mask_offset & 7)) & 1);
+}
+
+// HAS_MASK is a compile-time switch: the whole custom-mask path (extra args,
+// per-position bit test) is elided when false, so the common no-mask case pays
+// nothing. The masked variant writes -inf for masked positions so they land in
+// the lowest histogram bucket and are never selected — identical semantics to
+// the two-level prefill score kernel.
+template <bool HAS_MASK>
 __global__ void idx_score_kernel(
     __nv_bfloat16* __restrict__ scores,       // [totalQ, maxKv]
     int32_t* __restrict__ row_len,            // [totalQ]  (numValid per query)
@@ -590,7 +609,10 @@ __global__ void idx_score_kernel(
     const __nv_bfloat16* __restrict__ weights,// [totalQ, idxNHeads]
     const int32_t* __restrict__ pageIndices, const int32_t* __restrict__ pageIndptr,
     const int32_t* __restrict__ lastPageLen, const int32_t* __restrict__ qoIndptr,
-    float scale, int idxNHeads, int idxHeadDim, int pageSize, int maxKv, int causal
+    float scale, int idxNHeads, int idxHeadDim, int pageSize, int maxKv, int causal,
+    const uint8_t* __restrict__ custom_mask,
+    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len,
+    int qGlobalStart
 ) {
     const int qIdx = blockIdx.y;
     int seq = 0;
@@ -600,11 +622,23 @@ __global__ void idx_score_kernel(
     const int pageStart = pageIndptr[seq];
     const int numPages = pageIndptr[seq + 1] - pageStart;
     const int kvLen = numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0;
-    const int prefixLen = max(0, kvLen - numQueries);
+    // qGlobalStart shifts a shard's local query row to its true sequence position
+    // (0 outside query-sharding) so the causal limit and mask row stay correct.
+    const int prefixLen = max(0, kvLen - numQueries) + qGlobalStart;
     const int causalLimit = causal ? (prefixLen + qLocalPos) : (kvLen - 1);
     const int numValid = causalLimit + 1;
 
     if (blockIdx.x == 0 && threadIdx.x == 0) row_len[qIdx] = numValid;
+
+    // Custom-mask setup — compiled out entirely when !HAS_MASK.
+    const uint8_t* mask_ptr = nullptr;
+    int mask_kv_len_val = 0, mask_prefix_len = 0;
+    if constexpr (HAS_MASK) {
+        mask_ptr = custom_mask + mask_indptr[seq];
+        mask_kv_len_val = mask_kv_len ? mask_kv_len[seq] : numQueries;
+        mask_prefix_len = max(0, kvLen - mask_kv_len_val);
+    }
+    const int maskRow = qLocalPos + qGlobalStart;
 
     extern __shared__ char smem[];
     __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -620,6 +654,13 @@ __global__ void idx_score_kernel(
     const int warpsPerBlock = blockDim.x >> 5;
     for (int pos = blockIdx.x * warpsPerBlock + warp; pos < numValid;
          pos += gridDim.x * warpsPerBlock) {
+        if constexpr (HAS_MASK) {
+            if (idx_is_masked(pos, maskRow, mask_ptr, mask_kv_len_val, mask_prefix_len)) {
+                if (lane == 0)
+                    scores[(size_t)qIdx * maxKv + pos] = __float2bfloat16(-INFINITY);
+                continue;
+            }
+        }
         const int pageId = pageIndices[pageStart + pos / pageSize];
         const __nv_bfloat16* kbase = kData + (size_t)pageId * pageSize * idxHeadDim
                                      + (pos % pageSize) * idxHeadDim;
@@ -648,18 +689,23 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
     float scale, int totalQ, int idxNHeads, int idxHeadDim,
     int pageSize, int topk, int causal,
+    const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int32_t* hist, int32_t* meta,
-    int maxKv, int num_splits) {
+    int maxKv, int num_splits, int qGlobalStart) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     dim3 grid(num_splits, totalQ);
     int block = 256;
     size_t smem = (size_t)idxNHeads * idxHeadDim * sizeof(__nv_bfloat16)
                 + idxNHeads * sizeof(__nv_bfloat16);
-    idx_score_kernel<<<grid, block, smem, stream>>>(
+    // Dispatch the mask-free variant when there is no custom mask so its bit-test
+    // path is compiled out (zero cost for the common case).
+    auto kern = (custom_mask && mask_indptr) ? idx_score_kernel<true> : idx_score_kernel<false>;
+    kern<<<grid, block, smem, stream>>>(
         (__nv_bfloat16*)scores, rowLen, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
         (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
-        scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal);
+        scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal,
+        custom_mask, mask_indptr, mask_kv_len, qGlobalStart);
     glm_topk_from_scores(ctx, out_idx, scores, rowLen, hist, meta,
                          totalQ, maxKv, topk, num_splits);
 }
@@ -755,17 +801,6 @@ __device__ __forceinline__ void ldm_b(FragB& b, const __nv_bfloat16* s, int stri
         : "=r"(b.reg[0]), "=r"(b.reg[1]) : "r"(addr));
 }
 } // namespace idxmma
-
-// Shared device helper: check if a KV position is masked out.
-static __device__ __forceinline__ bool idx_is_masked(
-    int pos, int qLocalPos,
-    const uint8_t* mask_ptr, int mask_kv_len_val, int mask_prefix_len)
-{
-    if (!mask_ptr) return false;
-    if (pos < mask_prefix_len) return false;
-    int mask_offset = qLocalPos * mask_kv_len_val + (pos - mask_prefix_len);
-    return !((mask_ptr[mask_offset >> 3] >> (mask_offset & 7)) & 1);
-}
 
 
 // ---------------------------------------------------------------------------

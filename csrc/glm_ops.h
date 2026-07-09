@@ -112,8 +112,9 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
     float scale, int totalQ, int idxNHeads, int idxHeadDim,
     int pageSize, int topk, int causal,
+    const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int32_t* hist, int32_t* meta,
-    int maxKv, int num_splits);
+    int maxKv, int num_splits, int qGlobalStart);
 
 void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     const void* scores, const int32_t* row_len,
