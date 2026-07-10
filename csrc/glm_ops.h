@@ -1003,7 +1003,8 @@ void glm_mma_moe_coop_gemm(GlmCtx* ctx,
                            const void* const* weight_ptrs, const void* const* scale_ptrs,
                            const void* const* scale2_ptrs,
                            int num_experts, int N, int K, int count,
-                           const void* scatter_workspace, void* gemm_workspace);
+                           const void* scatter_workspace, void* gemm_workspace,
+                           void* output);
 void glm_mma_moe_coop_unscatter(GlmCtx* ctx, void* output,
                                 int count, int N, int K, int num_experts,
                                 const void* scatter_workspace, const void* gemm_workspace);

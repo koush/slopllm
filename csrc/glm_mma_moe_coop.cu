@@ -123,12 +123,13 @@ struct CoopSmem {
 template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M, int TK = 32>
 __global__ void __launch_bounds__(NWARPS * 32, 4)
 coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
-                __nv_bfloat16* __restrict__ sorted_output, int K,
+                __nv_bfloat16* __restrict__ output, int K,
                 const void* const* __restrict__ weight_ptrs,
                 const void* const* __restrict__ scale_ptrs,
                 const void* const* __restrict__ scale2_ptrs,
                 const int* __restrict__ expert_offsets, int num_experts, int N,
-                int* __restrict__ tile_counter) {
+                int* __restrict__ tile_counter,
+                const int* __restrict__ sorted_to_original) {
     constexpr int CTA_THREADS = NWARPS * 32;
     constexpr int KGPS = TK / QUANT_GROUP;
     constexpr int TOTAL_N_GROUPS = TN / 8;
@@ -471,23 +472,26 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
             __syncthreads();
         }
 
-        // ---- writeback ----
-        __nv_bfloat16* expert_output = sorted_output + (size_t)expert_offsets[expert_id] * N;
-        for (int n_group = 0; n_group < N_GROUPS_FOR_WARP; n_group++) {
-            int n_start_local = my_n_start_local + n_group * 8;
-            for (int mt = 0; mt < M_TILES_FOR_WARP; mt++) {
-                int m_tile2 = (my_m_start_tile + mt) * 16;
+        // ---- writeback (scattered: write directly to output via sorted_to_original) ----
+        const int* expert_s2o = sorted_to_original + expert_offsets[expert_id];
+        for (int mt = 0; mt < M_TILES_FOR_WARP; mt++) {
+            int m_tile2 = (my_m_start_tile + mt) * 16;
+            int row0 = m_tile2 + t1, row1 = m_tile2 + t1 + 8;
+            int orig0 = -1, orig1 = -1;
+            if (row0 < m_valid) orig0 = expert_s2o[m_start + row0];
+            if (row1 < m_valid) orig1 = expert_s2o[m_start + row1];
+            for (int n_group = 0; n_group < N_GROUPS_FOR_WARP; n_group++) {
+                int n_start_local = my_n_start_local + n_group * 8;
                 int acc_base = mt * ACC_STRIDE + n_group * 4;
-                int row0 = m_tile2 + t1, row1 = m_tile2 + t1 + 8;
                 int col0 = n_start + n_start_local + 2 * t0, col1 = n_start + n_start_local + 2 * t0 + 1;
-                if (row0 < m_valid && col0 < N)
-                    expert_output[(size_t)(m_start + row0) * N + col0] = __float2bfloat16(frag_c_accum[acc_base + 0]);
-                if (row0 < m_valid && col1 < N)
-                    expert_output[(size_t)(m_start + row0) * N + col1] = __float2bfloat16(frag_c_accum[acc_base + 1]);
-                if (row1 < m_valid && col0 < N)
-                    expert_output[(size_t)(m_start + row1) * N + col0] = __float2bfloat16(frag_c_accum[acc_base + 2]);
-                if (row1 < m_valid && col1 < N)
-                    expert_output[(size_t)(m_start + row1) * N + col1] = __float2bfloat16(frag_c_accum[acc_base + 3]);
+                if (orig0 >= 0 && col0 < N)
+                    output[(size_t)orig0 * N + col0] = __float2bfloat16(frag_c_accum[acc_base + 0]);
+                if (orig0 >= 0 && col1 < N)
+                    output[(size_t)orig0 * N + col1] = __float2bfloat16(frag_c_accum[acc_base + 1]);
+                if (orig1 >= 0 && col0 < N)
+                    output[(size_t)orig1 * N + col0] = __float2bfloat16(frag_c_accum[acc_base + 2]);
+                if (orig1 >= 0 && col1 < N)
+                    output[(size_t)orig1 * N + col1] = __float2bfloat16(frag_c_accum[acc_base + 3]);
             }
         }
         for (int i = 0; i < ACC_SIZE; i++) frag_c_accum[i] = 0.0f;
@@ -497,10 +501,11 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
 
 template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M, int TK = 32>
 static void launch_coop(GlmCtx* ctx, int num_experts, int N,
-                        const __nv_bfloat16* sorted_input, __nv_bfloat16* sorted_output, int K,
+                        const __nv_bfloat16* sorted_input, __nv_bfloat16* output, int K,
                         const void* const* weight_ptrs, const void* const* scale_ptrs,
                         const void* const* scale2_ptrs, const int* expert_offsets,
-                        int* tile_counter, cudaStream_t stream) {
+                        int* tile_counter, cudaStream_t stream,
+                        const int* sorted_to_original) {
     int num_SMs;
     cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, ctx->device_id);
     int max_smem;
@@ -514,15 +519,16 @@ static void launch_coop(GlmCtx* ctx, int num_experts, int N,
     cudaFuncSetAttribute((void*)coop_moe_kernel<TM, TN, DEPTH, NWARPS, MaxExperts, SPLIT_M, TK>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     coop_moe_kernel<TM, TN, DEPTH, NWARPS, MaxExperts, SPLIT_M, TK><<<grid, NWARPS * 32, smem, stream>>>(
-        sorted_input, sorted_output, K, weight_ptrs, scale_ptrs, scale2_ptrs,
-        expert_offsets, num_experts, N, tile_counter);
+        sorted_input, output, K, weight_ptrs, scale_ptrs, scale2_ptrs,
+        expert_offsets, num_experts, N, tile_counter, sorted_to_original);
 }
 
 static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
-                                   const __nv_bfloat16* sorted_input, __nv_bfloat16* sorted_output, int K,
+                                   const __nv_bfloat16* sorted_input, __nv_bfloat16* output, int K,
                                    const void* const* weight_ptrs, const void* const* scale_ptrs,
                                    const void* const* scale2_ptrs, const int* expert_offsets,
-                                   int* tile_counter, cudaStream_t stream) {
+                                   int* tile_counter, cudaStream_t stream,
+                                   const int* sorted_to_original) {
     constexpr int MaxExperts = 256;
     const char* cfg_env = getenv("GLM_COOP_CONFIG");
     std::string cfg(cfg_env ? cfg_env : "tm64_tn128_d2_nw2");
@@ -536,113 +542,113 @@ static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
     }
 
     if (cfg == "tm32_nw2")
-        launch_coop<32, 64, 4, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<32, 64, 4, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm32_nw8")
-        launch_coop<32, 64, 4, 8, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<32, 64, 4, 8, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_nw2")
-        launch_coop<64, 64, 4, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 4, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_nw4")
-        launch_coop<64, 64, 4, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 4, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm128_nw2")
-        launch_coop<128, 64, 4, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<128, 64, 4, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm128_nw4")
-        launch_coop<128, 64, 4, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<128, 64, 4, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_nw2")
-        launch_coop<64, 128, 4, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 4, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_nw4")
-        launch_coop<64, 128, 4, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 4, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_mw2")
-        launch_coop<64, 64, 4, 2, MaxExperts, true>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                     weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 4, 2, MaxExperts, true>(ctx, num_experts, N, sorted_input, output, K,
+                                                     weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_mw4")
-        launch_coop<64, 64, 4, 4, MaxExperts, true>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                     weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 4, 4, MaxExperts, true>(ctx, num_experts, N, sorted_input, output, K,
+                                                     weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm128_mw4")
-        launch_coop<128, 64, 4, 4, MaxExperts, true>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<128, 64, 4, 4, MaxExperts, true>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_d3_nw2")
-        launch_coop<64, 64, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_d6_nw2")
-        launch_coop<64, 64, 6, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 6, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_d2_nw2")
-        launch_coop<64, 64, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm128_d3_nw2")
-        launch_coop<128, 64, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<128, 64, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_d3_nw2")
-        launch_coop<64, 128, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_d3_nw4")
-        launch_coop<64, 64, 3, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 3, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_d2_nw4")
-        launch_coop<64, 64, 2, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 2, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm128_d3_nw4")
-        launch_coop<128, 64, 3, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<128, 64, 3, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_d2_nw1")
-        launch_coop<64, 64, 2, 1, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 2, 1, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_d2_nw2")
-        launch_coop<64, 128, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_d2_nw1")
-        launch_coop<64, 128, 2, 1, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 2, 1, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_d3_nw1")
-        launch_coop<64, 128, 3, 1, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 3, 1, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm128_tn128_d3_nw2")
-        launch_coop<128, 128, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<128, 128, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm128_tn128_d2_nw2")
-        launch_coop<128, 128, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<128, 128, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn256_d3_nw2")
-        launch_coop<64, 256, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 256, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn256_d2_nw2")
-        launch_coop<64, 256, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 256, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_d2k64_nw2")
-        launch_coop<64, 128, 2, 2, MaxExperts, false, 64>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 2, 2, MaxExperts, false, 64>(ctx, num_experts, N, sorted_input, output, K,
+                                                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_d3k64_nw2")
-        launch_coop<64, 128, 3, 2, MaxExperts, false, 64>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 3, 2, MaxExperts, false, 64>(ctx, num_experts, N, sorted_input, output, K,
+                                                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_d2k64_nw4")
-        launch_coop<64, 128, 2, 4, MaxExperts, false, 64>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 2, 4, MaxExperts, false, 64>(ctx, num_experts, N, sorted_input, output, K,
+                                                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_d2k64_nw2")
-        launch_coop<64, 64, 2, 2, MaxExperts, false, 64>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                          weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 64, 2, 2, MaxExperts, false, 64>(ctx, num_experts, N, sorted_input, output, K,
+                                                          weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm32_tn128_d2_nw2")
-        launch_coop<32, 128, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<32, 128, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm32_tn128_d3_nw2")
-        launch_coop<32, 128, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<32, 128, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_d2_nw4")
-        launch_coop<64, 128, 2, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 2, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn128_d3_nw4")
-        launch_coop<64, 128, 3, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<64, 128, 3, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else
-        launch_coop<32, 64, 4, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, sorted_output, K,
-                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+        launch_coop<32, 64, 4, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
 }
 
 } // namespace
@@ -671,7 +677,7 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void
     uint8_t* ws = static_cast<uint8_t*>(workspace);
     size_t offset = 0;
     __nv_bfloat16* sorted_input = reinterpret_cast<__nv_bfloat16*>(ws + offset); offset += (size_t)count * K * 2;
-    __nv_bfloat16* sorted_output = reinterpret_cast<__nv_bfloat16*>(ws + offset); offset += (size_t)count * N * 2;
+    offset += (size_t)count * N * 2; // sorted_output (unused — kernel writes directly to output)
     int* expert_counts = reinterpret_cast<int*>(ws + offset); offset += (size_t)num_experts * 4;
     int* expert_offsets = reinterpret_cast<int*>(ws + offset); offset += (size_t)(num_experts + 1) * 4;
     int* sorted_to_original = reinterpret_cast<int*>(ws + offset); offset += (size_t)count * 4;
@@ -686,19 +692,15 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void
     grid = (num_experts + block - 1) / block;
     restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts);
     cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
-    cudaMemsetAsync(sorted_output, 0, (size_t)count * N * 2, stream);
 
-    launch_coop_configured(ctx, num_experts, N, sorted_input, sorted_output, K,
-                           weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
-
-    grid = (count + block - 1) / block;
-    unscatter_output_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(output),
-                                                        sorted_output, N, sorted_to_original, count);
+    launch_coop_configured(ctx, num_experts, N, sorted_input, reinterpret_cast<__nv_bfloat16*>(output), K,
+                           weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
 }
 
 // ---------------------------------------------------------------------------
 // Split MoE coop: scatter once, run GEMM multiple times with different weights
-// (e.g. gate + up share the same scatter), unscatter each output separately.
+// (e.g. gate + up share the same scatter). The GEMM kernel writes directly to
+// the final output buffer via sorted_to_original lookup (no unscatter step).
 //
 // Scatter workspace layout:
 //   [0, count*K*2):                        sorted_input
@@ -707,8 +709,7 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void
 //   [count*K*2 + num_experts*4 + (num_experts+1)*4, +count*4): sorted_to_original
 //
 // GEMM workspace layout:
-//   [0, count*N*2):   sorted_output
-//   [count*N*2, +4):  tile_counter
+//   [0, 4):  tile_counter
 // ---------------------------------------------------------------------------
 
 size_t glm_mma_moe_coop_scatter_workspace_size(int count, int K, int num_experts) {
@@ -719,7 +720,8 @@ size_t glm_mma_moe_coop_scatter_workspace_size(int count, int K, int num_experts
 }
 
 size_t glm_mma_moe_coop_gemm_workspace_size(int count, int N) {
-    return (size_t)count * N * 2 + 4;
+    (void)count; (void)N;
+    return 4; // tile_counter only
 }
 
 void glm_mma_moe_coop_scatter(GlmCtx* ctx, const void* input, const int* expert_ids,
@@ -750,7 +752,8 @@ void glm_mma_moe_coop_gemm(GlmCtx* ctx,
                            const void* const* weight_ptrs, const void* const* scale_ptrs,
                            const void* const* scale2_ptrs,
                            int num_experts, int N, int K, int count,
-                           const void* scatter_workspace, void* gemm_workspace) {
+                           const void* scatter_workspace, void* gemm_workspace,
+                           void* output) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     if (count == 0 || N == 0 || K == 0) return;
@@ -758,16 +761,16 @@ void glm_mma_moe_coop_gemm(GlmCtx* ctx,
     const uint8_t* sws = static_cast<const uint8_t*>(scatter_workspace);
     const __nv_bfloat16* sorted_input = reinterpret_cast<const __nv_bfloat16*>(sws);
     const int* expert_offsets = reinterpret_cast<const int*>(sws + (size_t)count * K * 2 + (size_t)num_experts * 4);
+    const int* sorted_to_original = reinterpret_cast<const int*>(
+        sws + (size_t)count * K * 2 + (size_t)num_experts * 4 + (size_t)(num_experts + 1) * 4);
 
     uint8_t* gws = static_cast<uint8_t*>(gemm_workspace);
-    __nv_bfloat16* sorted_output = reinterpret_cast<__nv_bfloat16*>(gws);
-    int* tile_counter = reinterpret_cast<int*>(gws + (size_t)count * N * 2);
+    int* tile_counter = reinterpret_cast<int*>(gws);
 
     cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
-    cudaMemsetAsync(sorted_output, 0, (size_t)count * N * 2, stream);
 
-    launch_coop_configured(ctx, num_experts, N, sorted_input, sorted_output, K,
-                           weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream);
+    launch_coop_configured(ctx, num_experts, N, sorted_input, reinterpret_cast<__nv_bfloat16*>(output), K,
+                           weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
 }
 
 void glm_mma_moe_coop_unscatter(GlmCtx* ctx, void* output,

@@ -206,7 +206,7 @@ interface NativeAddon {
   mmaMoeCoopScatterWorkspaceSize(count: number, K: number, numExperts: number): number;
   mmaMoeCoopGemmWorkspaceSize(count: number, N: number): number;
   mmaMoeCoopScatter(ctx: number, input: number, expertIds: number, topK: number, count: number, K: number, numExperts: number, workspace: number): void;
-  mmaMoeCoopGemm(ctx: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, numExperts: number, N: number, K: number, count: number, scatterWorkspace: number, gemmWorkspace: number): void;
+  mmaMoeCoopGemm(ctx: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, numExperts: number, N: number, K: number, count: number, scatterWorkspace: number, gemmWorkspace: number, output: number): void;
   mmaMoeCoopUnscatter(ctx: number, output: number, count: number, N: number, K: number, numExperts: number, scatterWorkspace: number, gemmWorkspace: number): void;
   bf16MulMatIdGroupedMma(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number): void;
@@ -803,20 +803,16 @@ export class GlmTensor extends Tensor {
 
     using gateStream = this.workspace.glm.withStream(() => {
       using gemmWs = this.workspace.allocRaw(gemmWsSize);
-      getNativeAddon().mmaMoeCoopGemm(ctx, gatePtrs.weightPtrs.data, gatePtrs.scalePtrs.data, gatePtrs.scale2Ptrs.data,
-                                       numExperts, moeIntermediate, hs, count, scatterWs.data, gemmWs.data);
       const gateOut = this.workspace.alloc([count, moeIntermediate], this.type);
-      getNativeAddon().mmaMoeCoopUnscatter(ctx, gateOut.data, count, moeIntermediate, hs, numExperts,
-                                           scatterWs.data, gemmWs.data);
+      getNativeAddon().mmaMoeCoopGemm(ctx, gatePtrs.weightPtrs.data, gatePtrs.scalePtrs.data, gatePtrs.scale2Ptrs.data,
+                                       numExperts, moeIntermediate, hs, count, scatterWs.data, gemmWs.data, gateOut.data);
       return gateOut;
     });
 
     using upGemmWs = this.workspace.allocRaw(gemmWsSize);
-    getNativeAddon().mmaMoeCoopGemm(ctx, upPtrs.weightPtrs.data, upPtrs.scalePtrs.data, upPtrs.scale2Ptrs.data,
-                                     numExperts, moeIntermediate, hs, count, scatterWs.data, upGemmWs.data);
     using upOut = this.workspace.alloc([count, moeIntermediate], this.type);
-    getNativeAddon().mmaMoeCoopUnscatter(ctx, upOut.data, count, moeIntermediate, hs, numExperts,
-                                         scatterWs.data, upGemmWs.data);
+    getNativeAddon().mmaMoeCoopGemm(ctx, upPtrs.weightPtrs.data, upPtrs.scalePtrs.data, upPtrs.scale2Ptrs.data,
+                                     numExperts, moeIntermediate, hs, count, scatterWs.data, upGemmWs.data, upOut.data);
 
     gateStream.streamWaitEvent();
     using gateOut = gateStream.result;

@@ -1768,8 +1768,8 @@ static Napi::Value MmaMoeCoopScatter(const Napi::CallbackInfo& info) {
 
 static Napi::Value MmaMoeCoopGemm(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 10) {
-        Napi::TypeError::New(env, "Expected (ctx, weight_ptrs, scale_ptrs, scale2_ptrs, num_experts, N, K, count, scatter_workspace, gemm_workspace)").ThrowAsJavaScriptException();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, weight_ptrs, scale_ptrs, scale2_ptrs, num_experts, N, K, count, scatter_workspace, gemm_workspace, output)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1782,13 +1782,15 @@ static Napi::Value MmaMoeCoopGemm(const Napi::CallbackInfo& info) {
     int count = info[7].As<Napi::Number>().Int32Value();
     uintptr_t scatter_ws_ptr = info[8].As<Napi::Number>().Int64Value();
     uintptr_t gemm_ws_ptr = info[9].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[10].As<Napi::Number>().Int64Value();
     glm_mma_moe_coop_gemm(reinterpret_cast<GlmCtx*>(ctx_ptr),
                           reinterpret_cast<const void* const*>(wptrs_ptr),
                           reinterpret_cast<const void* const*>(sptrs_ptr),
                           reinterpret_cast<const void* const*>(s2ptrs_ptr),
                           num_experts, N, K, count,
                           reinterpret_cast<const void*>(scatter_ws_ptr),
-                          reinterpret_cast<void*>(gemm_ws_ptr));
+                          reinterpret_cast<void*>(gemm_ws_ptr),
+                          reinterpret_cast<void*>(out_ptr));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("mmaMoeCoopGemm failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
