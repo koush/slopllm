@@ -131,7 +131,7 @@ __device__ float compute_inv_rms(const __nv_bfloat16* x, int dim, float eps, flo
 // ---------------------------------------------------------------------------
 
 template <int MaxPairs, bool EvenDim = true>
-__global__ void __launch_bounds__(1024, 2) rmsnorm_kernel(
+__global__ void __launch_bounds__(1024) rmsnorm_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
@@ -263,7 +263,7 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
 // ---------------------------------------------------------------------------
 
 template <int MaxPairs, bool EvenDim = true>
-__global__ void __launch_bounds__(1024, 2) fused_add_rmsnorm_kernel(
+__global__ void __launch_bounds__(1024) fused_add_rmsnorm_kernel(
     __nv_bfloat16* __restrict__ out,
     __nv_bfloat16* __restrict__ residual,
     const __nv_bfloat16* __restrict__ input_a,

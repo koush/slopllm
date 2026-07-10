@@ -44,21 +44,6 @@ constexpr int GEMV_ROWS_PER_BLOCK = 8;
 constexpr int GEMV_BLOCK_SIZE = GEMV_ROWS_PER_BLOCK * GEMV_WARP_SIZE;
 constexpr int FP8_QUANT_BLOCK = 128;
 
-__device__ __forceinline__ float warp_reduce_max(float x) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        x = fmaxf(x, __shfl_xor_sync(0xFFFFFFFF, x, offset));
-    }
-    return x;
-}
-
-__device__ __forceinline__ float warp_reduce_sum(float x) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(0xFFFFFFFF, x, offset);
-    }
-    return x;
-}
 
 // ---------------------------------------------------------------------------
 // BF16 GEMV kernel: optimized for M=1 (single-token decode)
@@ -80,68 +65,6 @@ __device__ __forceinline__ void uint4_to_bf16x8(
     auto* h = reinterpret_cast<const __nv_bfloat16*>(&v);
     #pragma unroll
     for (int i = 0; i < 8; ++i) out[i] = h[i];
-}
-
-__global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
-bf16_gemv_kernel(
-    __nv_bfloat16* __restrict__ output,
-    const __nv_bfloat16* __restrict__ input,
-    const __nv_bfloat16* __restrict__ weight,
-    int M, int N, int K) {
-
-    if (N == 0 || M == 0 || K == 0) return;
-
-    int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
-    int m = blockIdx.x / num_row_groups;
-    int row_group = blockIdx.x % num_row_groups;
-    int warp_id = threadIdx.x / GEMV_WARP_SIZE;
-    int row = row_group * GEMV_ROWS_PER_BLOCK + warp_id;
-    int lane = threadIdx.x % GEMV_WARP_SIZE;
-
-    if (m >= M) return;
-
-    const __nv_bfloat16* input_row  = input  + (size_t)m   * K;
-    const __nv_bfloat16* weight_row = weight + (size_t)row * K;
-
-    // K_VEC = 8 BF16 / uint4 load.
-    // Each warp strides by (32 lanes * 8 elem) = 256 BF16 elements per iter.
-    int K_vec = K / GEMV_K_VEC;       // # full uint4 chunks
-    int K_tail_start = K_vec * GEMV_K_VEC;
-
-    float sum = 0.0f;
-    bool row_valid = row < N;
-
-    if (row_valid) {
-        const uint4* input_v4  = reinterpret_cast<const uint4*>(input_row);
-        const uint4* weight_v4 = reinterpret_cast<const uint4*>(weight_row);
-
-        // 32-lane warp strides through K_vec chunks.
-        for (int ki = lane; ki < K_vec; ki += GEMV_WARP_SIZE) {
-            uint4 wv = weight_v4[ki];
-            uint4 xv = input_v4[ki];
-            __nv_bfloat16 wb[8], xb[8];
-            uint4_to_bf16x8(wv, wb);
-            uint4_to_bf16x8(xv, xb);
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                sum += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
-            }
-        }
-
-        // Scalar tail (rare: K is typically a multiple of 256/8=32).
-        for (int k = K_tail_start + lane; k < K; k += GEMV_WARP_SIZE) {
-            sum += __bfloat162float(weight_row[k]) * __bfloat162float(input_row[k]);
-        }
-    }
-
-    // Warp reduction.
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-    }
-    if (row_valid && lane == 0) {
-        output[(size_t)m * N + row] = __float2bfloat16(sum);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +348,7 @@ constexpr int FP8_GEMM_K_TILE = 128;
 constexpr int FP8_GEMM_BLOCK_DIM = FP8_GEMM_M_TILE * FP8_GEMM_N_TILE;
 constexpr int FP8_GEMM_WEIGHT_PAD = 4;
 
-__global__ void __launch_bounds__(FP8_GEMM_BLOCK_DIM, 4)
+__global__ void __launch_bounds__(FP8_GEMM_BLOCK_DIM, 3)
 fp8_dequantize_gemm_smem_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
@@ -648,7 +571,7 @@ constexpr int NVFP4_GEMM_SMEM_PAD = 2;
 // the GEMV fallback a bad idea at M > 1 (it re-reads the whole weight matrix
 // once per row), while trading less of it for occupancy than M_TILE=16 does.
 template <int M_TILE>
-__global__ void __launch_bounds__(M_TILE * NVFP4_GEMM_N_TILE, 4)
+__global__ void __launch_bounds__(M_TILE * NVFP4_GEMM_N_TILE, 3)
 nvfp4_dequantize_gemm_smem_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
