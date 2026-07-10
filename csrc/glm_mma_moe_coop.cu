@@ -112,7 +112,6 @@ __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wai
 
 template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M, int TK>
 struct CoopSmem {
-    static constexpr int K_GROUPS_PER_STEP = TK / QUANT_GROUP;
     alignas(16) __nv_bfloat16 a_buf[DEPTH][TM * TK];
     alignas(16) uint8_t fp4_buf[DEPTH][TN * (TK / 2)];
     alignas(16) __nv_fp8_e4m3 scale_batch[DEPTH][TN * SCALE_BATCH];

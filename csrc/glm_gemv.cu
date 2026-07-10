@@ -621,34 +621,6 @@ constexpr int NVFP4_CUBLAS_N_THRESHOLD = 512;
 constexpr int NVFP4_GEMM_SMEM_PAD = 2;
 
 // ---------------------------------------------------------------------------
-// NVFP4 dequantize-only kernel: converts FP4 weights to BF16 in a workspace
-// buffer so that a subsequent cublasGemmEx call can use Tensor Cores + split-K.
-// Each thread decodes one output element.  The grid is (N * K) elements total.
-// ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(256, 8)
-nvfp4_dequantize_to_bf16_kernel(
-    __nv_bfloat16* __restrict__ dst,
-    const uint8_t* __restrict__ weight,
-    const __nv_fp8_e4m3* __restrict__ weight_scale,
-    const float* __restrict__ weight_scale_2,
-    int N, int K) {
-
-    int num_k_groups = K / NVFP4_QUANT_GROUP;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * K;
-    if (idx >= total) return;
-
-    int n = idx / K;
-    int k = idx % K;
-    int kg = k / NVFP4_QUANT_GROUP;
-    float scale = static_cast<float>(weight_scale[n * num_k_groups + kg]) * (*weight_scale_2);
-    uint8_t packed = weight[n * (K / 2) + k / 2];
-    float2 w = fp4x2_to_float2(packed);
-    float val = ((k & 1) ? w.y : w.x) * scale;
-    dst[idx] = __float2bfloat16(val);
-}
-
-// ---------------------------------------------------------------------------
 // NVFP4 dequantize+GEMM (M > 1): the FP4 weight nibble and its scale depend
 // only on (n, k), not on the output row m. The naive approach — every thread
 // decoding its own (m, n) element — redoes the same decode + scale multiply
