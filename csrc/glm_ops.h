@@ -385,6 +385,14 @@ void glm_nccl_send(void* comm, GlmCtx* ctx,
 void glm_nccl_recv(void* comm, GlmCtx* ctx,
                     void* recvbuff, size_t count, int datatype, int peer);
 
+// Reduce-scatter: sendbuff and recvbuff are device pointers
+// recvcount is the number of elements each rank receives (total / world_size)
+// datatype: ncclDataType_t values (7=float32, 9=bfloat16)
+// op: ncclRedOp_t values (0=sum, 1=prod, 2=max, 3=min)
+void glm_nccl_reduce_scatter(void* comm, GlmCtx* ctx,
+                              const void* sendbuff, void* recvbuff,
+                              size_t recvcount, int datatype, int op);
+
 // ---------------------------------------------------------------------------
 // Custom P2P AllReduce (small messages, single-process multi-GPU).
 //
@@ -862,6 +870,23 @@ void glm_cp_merge_tree(
     int shard_n_heads,
     int head_offset,
     int input_n_heads);
+
+// CP correction: rescale local v_out by exp2(lse_local - global_lse) in-place.
+// v_out: [batch_size, num_heads, v_head_dim] BF16 (in-place)
+// lses: [world_size, batch_size, num_heads] F32 — all-gathered LSEs (base-2)
+// global_lse: [batch_size, num_heads] F32 — output merged LSE (optional, nullptr to skip)
+// world_size: number of DCP ranks
+// rank: this rank's index in the DCP group
+void glm_cp_correct_attn_out(
+    GlmCtx* ctx,
+    void* v_out,
+    const float* lses,
+    float* global_lse,
+    int batch_size,
+    int num_heads,
+    int v_head_dim,
+    int world_size,
+    int rank);
 
 // RMSNorm gated: output = RMSNorm(input) * weight * SiLU(gate)
 // output: [batch, dim] BF16

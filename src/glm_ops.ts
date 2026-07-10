@@ -164,6 +164,7 @@ interface NativeAddon {
   ncclAllGather(comm: number, ctx: number, sendbuff: number, recvbuff: number, count: number, datatype: number): void;
   ncclSend(comm: number, ctx: number, sendbuff: number, count: number, datatype: number, peer: number): void;
   ncclRecv(comm: number, ctx: number, recvbuff: number, count: number, datatype: number, peer: number): void;
+  ncclReduceScatter(comm: number, ctx: number, sendbuff: number, recvbuff: number, recvcount: number, datatype: number, op: number): void;
   p2pEnablePeerAccess(ctx: number, peerDevice: number): number;
   p2pCreateInstance(ctx: number, myRank: number, worldSize: number): number;
   p2pDestroyInstance(instance: number): void;
@@ -173,6 +174,7 @@ interface NativeAddon {
   p2pAllGatherRowSmem(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number, rank: number): void;
   p2pBarrier(ctx: number, instance: number, peerRank?: number): void;
   cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads: number, headOffset: number, inputNHeads: number): void;
+  cpCorrectAttnOut(ctx: number, vOut: number, lses: number, globalLse: number, batchSize: number, numHeads: number, vHeadDim: number, worldSize: number, rank: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   relu(ctx: number, out: number, input: number, n: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number, offset: number): void;
@@ -1164,6 +1166,17 @@ export class GlmOps implements DeviceOps {
       numShards, ptr(outputV), outputLse ? ptr(outputLse) : 0, numel, batchSize, numHeads, vHeadDim,
       snh, ho, inh,
     );
+  }
+
+  cpCorrectAttnOut(vOut: Tensor, lses: Tensor, globalLse: Tensor | null, batchSize: number, numHeads: number, vHeadDim: number, worldSize: number, rank: number): void {
+    getNativeAddon().cpCorrectAttnOut(
+      this.ctx, ptr(vOut), ptr(lses), globalLse ? ptr(globalLse) : 0,
+      batchSize, numHeads, vHeadDim, worldSize, rank,
+    );
+  }
+
+  ncclReduceScatter(comm: number, sendbuff: Tensor, recvbuff: Tensor, recvcount: number, datatype: number, op: number): void {
+    getNativeAddon().ncclReduceScatter(comm, this.ctx, ptr(sendbuff), ptr(recvbuff), recvcount, datatype, op);
   }
 
   p2pBarrier(instance: number, peerRank: number = -1): void {

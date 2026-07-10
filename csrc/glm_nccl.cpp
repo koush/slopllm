@@ -98,3 +98,15 @@ void glm_nccl_recv(void* comm, GlmCtx* ctx,
         fprintf(stderr, "glm_nccl_recv failed: %s\n", ncclGetErrorString(result));
     }
 }
+
+void glm_nccl_reduce_scatter(void* comm, GlmCtx* ctx,
+                              const void* sendbuff, void* recvbuff,
+                              size_t recvcount, int datatype, int op) {
+    ncclResult_t result = ncclReduceScatter(sendbuff, recvbuff, recvcount,
+                          static_cast<ncclDataType_t>(datatype),
+                          static_cast<ncclRedOp_t>(op),
+                          static_cast<ncclComm_t>(comm), GLM_STREAM(ctx));
+    if (result != ncclSuccess) {
+        fprintf(stderr, "glm_nccl_reduce_scatter failed: %s\n", ncclGetErrorString(result));
+    }
+}

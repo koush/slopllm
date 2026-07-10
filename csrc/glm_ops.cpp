@@ -3661,6 +3661,36 @@ static Napi::Value CpMergeTree(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value CpCorrectAttnOut(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 9) {
+        Napi::TypeError::New(env, "Expected (ctx, v_out, lses, global_lse, batch_size, num_heads, v_head_dim, world_size, rank)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t v_out_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t lses_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t global_lse_ptr = info[3].As<Napi::Number>().Int64Value();
+    int batch_size = info[4].As<Napi::Number>().Int32Value();
+    int num_heads = info[5].As<Napi::Number>().Int32Value();
+    int v_head_dim = info[6].As<Napi::Number>().Int32Value();
+    int world_size = info[7].As<Napi::Number>().Int32Value();
+    int rank = info[8].As<Napi::Number>().Int32Value();
+
+    glm_cp_correct_attn_out(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<void*>(v_out_ptr),
+        reinterpret_cast<const float*>(lses_ptr),
+        reinterpret_cast<float*>(global_lse_ptr),
+        batch_size, num_heads, v_head_dim, world_size, rank);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("cpCorrectAttnOut failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value GateSigmoidMul(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -3930,6 +3960,27 @@ static Napi::Value NcclRecv(const Napi::CallbackInfo& info) {
                    reinterpret_cast<GlmCtx*>(ctx_ptr),
                    reinterpret_cast<void*>(recv_ptr),
                    count, datatype, peer);
+    return env.Undefined();
+}
+
+static Napi::Value NcclReduceScatter(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 7) {
+        Napi::TypeError::New(env, "Expected (comm, ctx, sendbuff, recvbuff, recvcount, datatype, op)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t comm_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t ctx_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t send_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t recv_ptr = info[3].As<Napi::Number>().Int64Value();
+    size_t recvcount = info[4].As<Napi::Number>().Int64Value();
+    int datatype = info[5].As<Napi::Number>().Int32Value();
+    int op = info[6].As<Napi::Number>().Int32Value();
+    glm_nccl_reduce_scatter(reinterpret_cast<void*>(comm_ptr),
+                             reinterpret_cast<GlmCtx*>(ctx_ptr),
+                             reinterpret_cast<const void*>(send_ptr),
+                             reinterpret_cast<void*>(recv_ptr),
+                             recvcount, datatype, op);
     return env.Undefined();
 }
 
@@ -4233,6 +4284,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "rmsnormGated"), Napi::Function::New(env, RmsnormGated));
     exports.Set(Napi::String::New(env, "gateSigmoidMul"), Napi::Function::New(env, GateSigmoidMul));
     exports.Set(Napi::String::New(env, "cpMergeTree"), Napi::Function::New(env, CpMergeTree));
+    exports.Set(Napi::String::New(env, "cpCorrectAttnOut"), Napi::Function::New(env, CpCorrectAttnOut));
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
     exports.Set(Napi::String::New(env, "rotateInputIds"), Napi::Function::New(env, RotateInputIds));
     exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));
@@ -4248,6 +4300,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "ncclAllGather"), Napi::Function::New(env, NcclAllGather));
     exports.Set(Napi::String::New(env, "ncclSend"), Napi::Function::New(env, NcclSend));
     exports.Set(Napi::String::New(env, "ncclRecv"), Napi::Function::New(env, NcclRecv));
+    exports.Set(Napi::String::New(env, "ncclReduceScatter"), Napi::Function::New(env, NcclReduceScatter));
     exports.Set(Napi::String::New(env, "p2pEnablePeerAccess"), Napi::Function::New(env, P2PEnablePeerAccess));
     exports.Set(Napi::String::New(env, "p2pCreateInstance"), Napi::Function::New(env, P2PCreateInstance));
     exports.Set(Napi::String::New(env, "p2pDestroyInstance"), Napi::Function::New(env, P2PDestroyInstance));
