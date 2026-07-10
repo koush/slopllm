@@ -198,6 +198,9 @@ You must NEVER use "git stash pop" to reapply stashed changes. You MUST use "git
 
 # Production GLM-5.1 Model Config (zai-org/GLM-5.1)
 
+Model Path:
+`/mnt/storage/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/`
+
 | Key | Value |
 |---|---|
 | architectures | GlmMoeDsaForCausalLM |
@@ -209,10 +212,13 @@ You must NEVER use "git stash pop" to reapply stashed changes. You MUST use "git
 | num_hidden_layers | 78 |
 | num_attention_heads | 64 |
 | num_key_value_heads | 64 |
-| kv_lora_rank | 512 |
+| kv_lora_rank | 512 (attn output dim, input to v_expand) |
 | q_lora_rank | 2048 |
-| qk_head_dim | 256 (nope: 192, rope: 64) |
-| v_head_dim | 256 |
+| qk_nope_head_dim | 192 |
+| qk_rope_head_dim | 64 |
+| qk_head_dim | 256 (= qk_nope + qk_rope) |
+| v_head_dim | 256 (output of v_expand; note: ≠ qk_nope_head_dim) |
+| head_dim | 192 (= qk_nope_head_dim) |
 | n_routed_experts | 256 |
 | n_shared_experts | 1 |
 | num_experts_per_tok | 8 |
