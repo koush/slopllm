@@ -1264,9 +1264,13 @@ void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input
                 reinterpret_cast<const uint8_t*>(fp4_weight),
                 scale_ptr, weight_scale_2, m, n, k);
         }
-    } else if (m > 1 && n <= NVFP4_CUBLAS_N_THRESHOLD) {
-        // Small-N, M>1 path: fused NVFP4 dequantize + split-K GEMM.
+    } else if (m > 1 && n <= NVFP4_CUBLAS_N_THRESHOLD && m <= NVFP4_GEMM_SMALL_M_THRESHOLD) {
+        // Small-N, small-M path: fused NVFP4 dequantize + split-K GEMM.
         // One CTA per (row, input_row) pair, NumPartitions warps split K.
+        // Only used when M is small enough that the smem GEMM kernel would
+        // launch too few CTAs to fill the GPU (e.g. M=15, N=256 → 32 CTAs).
+        // At large M (e.g. prefill with M=4096), the smem GEMM reuses each
+        // decoded weight tile across M_TILE=16 rows and is far more efficient.
         int grid_size = m * n;
         int num_k_groups = k / NVFP4_QUANT_GROUP;
         constexpr int SPLITK_FULL_THREADS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
