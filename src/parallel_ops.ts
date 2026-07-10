@@ -1644,6 +1644,38 @@ export class ParallelTensor extends Tensor {
       return this.parallelOps.wrapShards(this.workspace, outShards, outShape, this.type, TensorParallelism.Row);
     }
 
+    // Mix of Row and Replicated, cat on non-sharded dim: slice Replicated tensors
+    // on dim 1 to match each Row shard's head range, then cat locally per shard.
+    // No communication needed — the Replicated data is already present on every GPU.
+    if (dim !== 1 && hasNonReplicated && allPar.every(p => p === TensorParallelism.Row || p === TensorParallelism.Replicated)) {
+      const outShape = [...this.shape];
+      for (const t of pTensors) {
+        outShape[dim] += t.shape[dim];
+      }
+      const rowPar = this.parallelism === TensorParallelism.Row
+        ? this
+        : pTensors.find(t => (t as ParallelTensor).parallelism === TensorParallelism.Row)! as ParallelTensor;
+      const shardDim1 = rowPar.shards[0].shape[1];
+      const outShards: Tensor[] = [];
+      for (let i = 0; i < this.worldSize; i++) {
+        using selfShard = this.parallelism === TensorParallelism.Row
+          ? this.shards[i].viewClone()
+          : this.shards[i].slice(1, i * shardDim1, shardDim1);
+        const tensorShards = pTensors.map(t => {
+          const pt = t as ParallelTensor;
+          if (pt.parallelism === TensorParallelism.Row) {
+            return pt.shards[i].viewClone();
+          }
+          return pt.shards[i].slice(1, i * shardDim1, shardDim1);
+        });
+        outShards.push(selfShard.cat(tensorShards, dim));
+        for (const t of tensorShards) {
+          t[Symbol.dispose]();
+        }
+      }
+      return this.parallelOps.wrapShards(this.workspace, outShards, outShape, this.type, TensorParallelism.Row);
+    }
+
     if (hasNonReplicated) {
       if (this.parallelism === TensorParallelism.PartialSum) {
         this.allReduce();
@@ -2857,10 +2889,13 @@ export class ParallelOps implements DeviceOps {
     const pTopkLength = topkLength ? this.cast(topkLength) : undefined;
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "sparseMlaPrefill numHeads");
     const oPar = contextParallel ? TensorParallelism.PartialSoftmax : TensorParallelism.Row;
+    using gatheredQ: ParallelTensor = (contextParallel && pQ.parallelism === TensorParallelism.Row)
+      ? pQ.allGather(pQ.workspace)
+      : pQ.viewClone() as ParallelTensor;
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaPrefill(pQ.shards[i], pKvCache.shards[i], pIndices.shards[i], numTokens, effectiveNumHeads, headDim, topk, pageBlockSize, smScale, strideKvBlock, contextParallel, pTopkLength?.shards[i]);
+      const result = this.devices[i].sparseMlaPrefill(gatheredQ.shards[i], pKvCache.shards[i], pIndices.shards[i], numTokens, effectiveNumHeads, headDim, topk, pageBlockSize, smScale, strideKvBlock, contextParallel, pTopkLength?.shards[i]);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
@@ -2876,10 +2911,13 @@ export class ParallelOps implements DeviceOps {
     const pTopkLength = topkLength ? this.cast(topkLength) : undefined;
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "sparseMlaDecode numHeads");
     const oPar = contextParallel ? TensorParallelism.PartialSoftmax : TensorParallelism.Row;
+    using gatheredQ: ParallelTensor = (contextParallel && pQ.parallelism === TensorParallelism.Row)
+      ? pQ.allGather(pQ.workspace)
+      : pQ.viewClone() as ParallelTensor;
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaDecode(pQ.shards[i], pKvCache.shards[i], pIndices.shards[i], numTokens, effectiveNumHeads, headDim, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, contextParallel, pTopkLength?.shards[i]);
+      const result = this.devices[i].sparseMlaDecode(gatheredQ.shards[i], pKvCache.shards[i], pIndices.shards[i], numTokens, effectiveNumHeads, headDim, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, contextParallel, pTopkLength?.shards[i]);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
