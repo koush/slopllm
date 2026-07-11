@@ -269,8 +269,7 @@ export class Glm51Model extends ChatModel {
       const srcPitch = qkHeadDim * inDim * eb;
       const tQNope = this.alloc([nHeads * qkNopeDim, qLoraRank], "BF16", undefined, nopeParallelism);
       const peName = name.replace(".q_b_proj.weight", ".q_pe_proj.weight");
-      const par = this.contextParallel ? TensorParallelism.Replicated : TensorParallelism.Column;
-      const tPe = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", peName, par);
+      const tPe = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", peName, nopeParallelism);
       await Promise.all([
         tQNope.mmapLoad(mmapPtr, offset, tQNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
         tPe.mmapLoad(mmapPtr, offset, tPe.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: qkRopeDim * inDim * eb, width: qkRopeDim * inDim * eb, height: nHeads }),

@@ -99,30 +99,36 @@ Key rules:
 ## Tensor Parallelism
 
 Weight parallelism is assigned per-tensor during loading:
-- **Column**: gate_proj, up_proj, embed_tokens (output dim sharded across GPUs; output is Row-parallel)
-- **Row**: o_proj, down_proj, lm_head (input dim sharded; output is PartialSum, needs AllReduce)
-- **Replicated**: norms, bias, RoPE freqs, position IDs
+- **Column**: gate_proj, up_proj, embed_tokens, q_nope_proj, k_nope_proj, absorbed weight (output dim sharded across GPUs; linear output is Row-parallel)
+- **Row**: o_proj, down_proj, lm_head (input dim sharded; linear output is PartialSum, needs AllReduce)
+- **Replicated**: norms, bias, RoPE freqs, position IDs, q_pe_proj, v_proj, ckv_proj, k_pe_proj
 
-Linear op parallelism rules:
+Linear op parallelism rules (weight × input → output):
 - Column × Replicated → Row (no comm)
 - Row × Row → PartialSum (AllReduce needed)
 - Replicated × Replicated → Replicated (no comm)
-- Row × Replicated needs AllGather of input first
+- Row weight → AllGather weight to Replicated, then proceed (K-dim mismatch)
+- Row input → AllGather input to Replicated, then proceed (K-dim mismatch)
 
 ## Context Parallelism (Interleaved Token-per-GPU)
 
-When `--cp` flag is set (GLM-5.1 only), all GPUs operate as context-parallel shards instead of tensor-parallel shards:
+When `--cp` flag is set (GLM-5.1 only), GPUs operate as context-parallel shards for attention while retaining tensor-parallel sharding for linear layers:
 
 - **KV cache is Row-sharded**: each GPU stores every Nth token's KV (tokens interleaved across GPUs). `PagedKVCache` uses `TensorParallelism.Row` for ckv/kpe tensors.
-- **MLA weights are Replicated** instead of Column: q_pe_proj, v_proj, absorbed weight loaded as Replicated so each GPU can compute attention independently over its shard of the sequence.
-- **Position IDs**: `decodeStep`/`mlaDecodeStep` receive `cpWorldSize=N` and `cpRank=i`. The CUDA kernel assigns position `i, i+N, i+2N, ...` to GPU `i`.
+- **MLA weights split by role**:
+  - **Replicated in CP** (were Column in TP-only): q_pe_proj, v_proj — so each GPU can compute attention independently over its KV shard.
+  - **Still Column-parallel in CP**: q_nope_proj, k_nope_proj, absorbed weight — the absorbed weight is computed from k_nope_proj × q_nope_proj BMM (Column × Column → Column). This causes Q to be Row-parallel after the absorbed projection, requiring an AllGather to Replicated before attention.
+  - **Still Row/Column-parallel in CP**: o_proj (Row → AllReduce), down_proj (Row → AllReduce), gate_proj/up_proj (Column) — same as TP-only mode.
+- **Position IDs**: decode/prefill kernels receive `cpWorldSize=N` and `cpRank=i`. The CUDA kernel assigns position `i, i+N, i+2N, ...` to GPU `i`.
 - **Prefill**: Each GPU runs MLA prefill over its token subset with `cpWorldSize`/`cpRank` params. The FlashInfer plan computes `effectivePageSize = pageSize / worldSize` and `effectiveNumHeads = numHeads` (not sharded). Output is `PartialSoftmax` — each shard has partial attention output + log-sum-exp.
-- **CP Merge**: After prefill/decode, `contextParallelMerge()` or `p2pCpMerge()` combines partial softmax outputs across GPUs using the online softmax trick: `merged_v = Σ(exp(lse_i - lse_max) * v_i) / Σ(exp(lse_i - lse_max))`. This uses either NCCL AllGather + local merge, or fused P2P kernel.
+- **CP Merge**: After prefill/decode, partial softmax outputs are combined across GPUs using the online softmax trick: `merged_v = Σ(exp(lse_i - lse_max) * v_i) / Σ(exp(lse_i - lse_max))`. Two paths:
+  - **P2P fast path** (small batches, decode): single barrier + flat all-to-all merge kernel. Each GPU reads all N peers' data via P2P and merges in one kernel launch. Gated by a element-count threshold.
+  - **AG+RS** (prefill, large batches): AllGather LSE (tiny), correct v_out in-place by rescaling with `exp2(lse_local - global_lse)`, transpose v_out to `[N, B, H/N, D]`, then ReduceScatter — each rank receives its head group summed across all GPUs. Communication per rank: `(N-1)/N × B×H×D` vs `log2(N) × B×H×D` for the old butterfly.
 - **Page allocation**: `PagedKVCache` distributes pages round-robin across GPUs. Page `p` is stored on GPU `p % worldSize`. The effective page size per GPU is `pageSize / worldSize`.
 
 ## Paged KV Cache (`src/paged_kv.ts`)
 
-- Fixed `PAGE_SIZE=16` tokens per page. Pages are ref-counted for prefix sharing (only full pages are shared; partial last pages are copied).
+- Fixed `PAGE_SIZE=64` tokens per page. Pages are ref-counted for prefix sharing (only full pages are shared; partial last pages are copied).
 - `Sequence`: ordered list of pages tracking `allocLen` and `tokenIds`.
 - `PagedKVCache` extends `WorkspaceBase` — KV cache tensors (`kData[]`/`vData[]` or `ckvData[]`/`kpeData[]`) are pre-allocated GPU buffers indexed by layer and page ID.
 - Dirty flags (`pagesDirtyHost`, `pagesDirtyDevice`, `positionIdsDirty`) control conditional updates — plan calls and host→device copies are skipped if nothing changed.

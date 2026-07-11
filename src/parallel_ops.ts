@@ -1815,8 +1815,14 @@ export class ParallelTensor extends Tensor {
     const attnNHeads = isPartialSoftmax ? nHeads : shardNHeads;
     const isVProjSharded = pVProj.parallelism === TensorParallelism.Row;
     const isCp = this.parallelism === TensorParallelism.PartialSoftmax;
-    if (isCp && isVProjSharded) {
-      throw new Error(`mlaVExpand: context parallelism requires replicated v_proj, got ${pVProj.parallelism}`);
+    if (isCp && pVProj.parallelism === TensorParallelism.Row) {
+      throw new Error(`mlaVExpand: context parallelism does not support Row-parallel v_proj`);
+    }
+    // Column v_proj in CP prefill could be supported by switching to merge-then-expand
+    // (merge attn_out in kvLoraRank space, then v_expand locally), but that doubles
+    // merge communication (kvLoraRank=512 > vHeadDim=256) for modest memory savings.
+    if (isCp && seqLen !== 1 && pVProj.parallelism === TensorParallelism.Column) {
+      throw new Error(`mlaVExpand: CP prefill (expand-then-merge) requires Replicated v_proj, got Column`);
     }
     const BS = batch * seqLen;
 
@@ -1833,12 +1839,19 @@ export class ParallelTensor extends Tensor {
       ));
       const h = this.parallelOps.shardDim(nHeads, "mlaVExpand cpShardNHeads");
       const expandShards: Tensor[] = [];
+      const narrowViews: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
+        let vProjShard = pVProj.shards[i];
+        if (pVProj.parallelism === TensorParallelism.Replicated) {
+          vProjShard = vProjShard.narrow(i * h * kvLoraRank, h * kvLoraRank);
+          narrowViews.push(vProjShard);
+        }
         expandShards.push(merged.value.shards[i].mlaVExpand(
-          pVProj.shards[i], kvLoraRank, vHeadDim, h, 1, BS,
-          undefined, 0, h, i * h
+          vProjShard, kvLoraRank, vHeadDim, h, 1, BS,
+          undefined, 0, h, 0
         ));
       }
+      for (const v of narrowViews) v[Symbol.dispose]();
       return this.parallelOps.wrapShards(this.workspace, expandShards, [BS, nHeads * vHeadDim], this.type, TensorParallelism.Row);
     }
 
