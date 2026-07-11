@@ -79,7 +79,6 @@ export class ExecutionState {
         this.ws.mlaBatchIndices, this.ws.positionIds,
         nnz, pageSize, kvLoraRank, qkRopeDim,
         kvLoraRank, qkRopeDim,
-        pagedKV.contextParallel,
       );
     } else {
       this.ws.glm.mlaKvCacheAppend(
@@ -89,7 +88,6 @@ export class ExecutionState {
         this.ws.mlaBatchIndices, this.ws.positionIds,
         nnz, pageSize, kvLoraRank, qkRopeDim,
         kvLoraRank, qkRopeDim,
-        pagedKV.contextParallel,
       );
     }
   }
@@ -348,7 +346,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, contextParallel?: boolean, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
+  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const pageSize = pagedKV.pageSize;
@@ -372,12 +370,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
       ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
       oStrideN, oStrideH,
       headDimCkv, headDimKpe,
-      contextParallel, undefined, undefined,
+      undefined, undefined,
       customMask, maskIndptr, maskKvLen
     );
   }
 
-  mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, contextParallel?: boolean): { o: Tensor, lse: Tensor } {
+  mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): { o: Tensor, lse: Tensor } {
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     return this.glm.mlaDecodeRun(
@@ -387,7 +385,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.mlaDecodePlanInfo,
       batchSize, nHeads, pagedKV.pageSize, smScale,
       headDimCkv, headDimKpe,
-      contextParallel
     );
   }
 

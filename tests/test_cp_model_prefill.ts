@@ -310,7 +310,7 @@ describe("CP vs non-CP model prefill", () => {
           kvcache.streamWaitEvent();
           q.streamWaitEvent();
 
-          const mlaResult = ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, bs, nH, kvLR, qkRD, scaling, contextParallel);
+          const mlaResult = ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, bs, nH, kvLR, qkRD, scaling);
 
           // attnOut is PartialSoftmax in CP mode — can't d2h, skip comparison
           // snap("L0_attnOut_before_vexpand", mlaResult.o, BS * nH * kvLR, isCp);

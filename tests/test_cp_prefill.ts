@@ -146,7 +146,7 @@ function runMlaPrefill(
     ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
     oStrideN, oStrideH,
     headDimCkv, headDimKpe,
-    true, cpWorldSize, cpRank,
+    cpWorldSize, cpRank,
   );
   glm.synchronize();
 
@@ -634,7 +634,6 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
       ckvStridePage, HEAD_DIM_CKV, kpeStridePage, HEAD_DIM_KPE,
       HEAD_DIM_CKV, totalTokens * HEAD_DIM_CKV,
       HEAD_DIM_CKV, HEAD_DIM_KPE,
-      true,
     );
     po.synchronize();
 

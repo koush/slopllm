@@ -548,13 +548,13 @@ export class Glm51Model extends ChatModel {
           sparseResult = this.glm.sparseMlaDecode(
             qConcat, pagedKV.ckvData[layerIdx], sharedSlots.value,
             BS, nHeads, kvLoraRank, cfg.indexTopk, numSplits,
-            cfg.scaling, strideKvBlock, 0, this.contextParallel, ws.sparseTopkLength,
+            cfg.scaling, strideKvBlock, 0, ws.sparseTopkLength,
           );
         } else {
           sparseResult = this.glm.sparseMlaPrefill(
             qConcat, pagedKV.ckvData[layerIdx], sharedSlots.value,
             BS, nHeads, kvLoraRank, cfg.indexTopk, pagedKV.pageSize,
-            cfg.scaling, strideKvBlock, this.contextParallel, ws.sparseTopkLength,
+            cfg.scaling, strideKvBlock, ws.sparseTopkLength,
           );
           // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
           // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
@@ -568,8 +568,8 @@ export class Glm51Model extends ChatModel {
       } else {
         // Dense MLA path (FlashInfer plan/run)
         const mlaResult = state.isDecode
-          ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel)
-          : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, this.contextParallel, !state.customMask ? MaskMode.Causal : state.customMask.mode, state.customMask?.mask, state.customMask?.indptr, state.customMask?.maskKvLen);
+          ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling)
+          : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, !state.customMask ? MaskMode.Causal : state.customMask.mode, state.customMask?.mask, state.customMask?.indptr, state.customMask?.maskKvLen);
         attnOut = mlaResult.o;
         lseBuf = mlaResult.lse;
       }

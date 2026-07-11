@@ -225,7 +225,7 @@ function runMlaPrefill(
     ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
     oStrideN, oStrideH,
     headDimCkv, headDimKpe,
-    false, 0, 0,
+    0, 0,
     customMask, maskIndptr,
   );
   glm.synchronize();

@@ -222,7 +222,7 @@ function runMlaPrefillParallel(
     ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
     oStrideN, oStrideH,
     headDimCkv, headDimKpe,
-    false, undefined, undefined,
+    undefined, undefined,
     customMask, maskIndptr,
   );
   po.synchronize();
@@ -331,7 +331,7 @@ function runMlaPrefillRef(
     ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
     oStrideN, oStrideH,
     headDimCkv, headDimKpe,
-    false, 0, 0,
+    0, 0,
     customMask, maskIndptr,
   );
   glm.synchronize();

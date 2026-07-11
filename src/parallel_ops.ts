@@ -2663,7 +2663,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: MaskMode, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
+  mlaPrefillRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: MaskMode, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, _cpWorldSize?: number, _cpRank?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
     let pQNope = this.cast(qNope);
     let pQPe = this.cast(qPe);
     const pCkvData = this.cast(ckvData);
@@ -2672,6 +2672,7 @@ export class ParallelOps implements DeviceOps {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPlanInfo = this.cast(planInfo);
+    const contextParallel = pCkvData.parallelism === TensorParallelism.Row;
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "mlaPrefillRun numHeads");
     const effectivePageSize = contextParallel ? pageSize / this.worldSize : pageSize;
     const effectiveQNopeStrideN = contextParallel ? qNopeStrideN : effectiveNumHeads * headDimCkv;
@@ -2719,7 +2720,7 @@ export class ParallelOps implements DeviceOps {
         const shardCustomMask = pCustomMask ? pCustomMask.shards[i] : undefined;
         const shardMaskIndptr = pMaskIndptr ? pMaskIndptr.shards[i] : undefined;
         const shardMaskKvLen = pMaskKvLen ? pMaskKvLen.shards[i] : undefined;
-        const shardResult = this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], effectiveNumHeads, effectivePageSize, maskMode, smScale, effectiveQNopeStrideN, qNopeStrideH, effectiveQPeStrideN, qPeStrideH, effectiveCkvStridePage, ckvStrideN, effectiveKpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, contextParallel, effectiveCpWorldSize, effectiveCpRank, shardCustomMask, shardMaskIndptr, shardMaskKvLen);
+        const shardResult = this.devices[i].mlaPrefillRun(pQNope.shards[i], pQPe.shards[i], pCkvData.shards[i], pKpeData.shards[i], pKvIndices.shards[i], pFloatWs.shards[i], pIntWs.shards[i], pPlanInfo.shards[i], effectiveNumHeads, effectivePageSize, maskMode, smScale, effectiveQNopeStrideN, qNopeStrideH, effectiveQPeStrideN, qPeStrideH, effectiveCkvStridePage, ckvStrideN, effectiveKpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, effectiveCpWorldSize, effectiveCpRank, shardCustomMask, shardMaskIndptr, shardMaskKvLen);
         oShards.push(shardResult.o);
         lseShards.push(shardResult.lse);
       }
@@ -2749,7 +2750,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  mlaDecodeRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, batchSize: number, numQoHeads: number, pageSize: number, smScale: number, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): { o: Tensor, lse: Tensor } {
+  mlaDecodeRun(qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, batchSize: number, numQoHeads: number, pageSize: number, smScale: number, headDimCkv: number, headDimKpe: number): { o: Tensor, lse: Tensor } {
     let pQNope = this.cast(qNope);
     let pQPe = this.cast(qPe);
     const pCkvData = this.cast(ckvData);
@@ -2760,6 +2761,7 @@ export class ParallelOps implements DeviceOps {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPlanInfo = this.cast(planInfo);
+    const contextParallel = pCkvData.parallelism === TensorParallelism.Row;
     const effectiveNumQoHeads = contextParallel ? numQoHeads : this.shardDim(numQoHeads, "mlaDecodeRun numQoHeads");
     const effectivePageSize = contextParallel ? pageSize / this.worldSize : pageSize;
     const lsePar = contextParallel ? TensorParallelism.Column : TensorParallelism.Row;
@@ -2795,7 +2797,7 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
+  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, _cpWorldSize?: number, _cpRank?: number): void {
     const pCkvData = this.cast(ckvData);
     const pKpeData = kpeData ? this.cast(kpeData) : null;
     const pIndices = this.cast(indices);
@@ -2805,14 +2807,15 @@ export class ParallelOps implements DeviceOps {
     const pAppendKpe = appendKpe ? this.cast(appendKpe) : null;
     const pBatchIndices = this.cast(batchIndices);
     const pPositions = this.cast(positions);
+    const contextParallel = pCkvData.parallelism === TensorParallelism.Row;
     const effectiveCpWorldSize = contextParallel ? this.worldSize : undefined;
     for (let i = 0; i < this.worldSize; i++) {
       const effectiveCpRank = contextParallel ? i : undefined;
-      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData?.shards[i] ?? null, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe?.shards[i] ?? null, pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, contextParallel, effectiveCpWorldSize, effectiveCpRank);
+      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData?.shards[i] ?? null, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe?.shards[i] ?? null, pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, effectiveCpWorldSize, effectiveCpRank);
     }
   }
 
-  concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, contextParallel?: boolean): void {
+  concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, _cpWorldSize?: number, _cpRank?: number): void {
     const pKvCache = this.cast(kvCache);
     const pAppendCkv = this.cast(appendCkv);
     const pAppendKpe = this.cast(appendKpe);
@@ -2820,18 +2823,20 @@ export class ParallelOps implements DeviceOps {
     const pIndptr = this.cast(indptr);
     const pBatchIndices = this.cast(batchIndices);
     const pPositions = this.cast(positions);
+    const contextParallel = pKvCache.parallelism === TensorParallelism.Row;
     const cpWorldSize = contextParallel ? this.worldSize : 0;
     for (let i = 0; i < this.worldSize; i++) {
       const cpRank = contextParallel ? i : 0;
-      this.devices[i].concatAndCacheDsMla(pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, contextParallel, cpWorldSize, cpRank);
+      this.devices[i].concatAndCacheDsMla(pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
     }
   }
 
-  sparseMlaPrefill(q: Tensor, kvCache: Tensor, indices: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, contextParallel?: boolean, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaPrefill(q: Tensor, kvCache: Tensor, indices: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
     const pQ = this.cast(q);
     const pKvCache = this.cast(kvCache);
     const pIndices = this.cast(indices);
     const pTopkLength = topkLength ? this.cast(topkLength) : undefined;
+    const contextParallel = pKvCache.parallelism === TensorParallelism.Row;
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "sparseMlaPrefill numHeads");
     const oPar = contextParallel ? TensorParallelism.PartialSoftmax : TensorParallelism.Row;
     using gatheredQ: ParallelTensor = (contextParallel && pQ.parallelism === TensorParallelism.Row)
@@ -2840,7 +2845,7 @@ export class ParallelOps implements DeviceOps {
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaPrefill(gatheredQ.shards[i], pKvCache.shards[i], pIndices.shards[i], numTokens, effectiveNumHeads, headDim, topk, pageBlockSize, smScale, strideKvBlock, contextParallel, pTopkLength?.shards[i]);
+      const result = this.devices[i].sparseMlaPrefill(gatheredQ.shards[i], pKvCache.shards[i], pIndices.shards[i], numTokens, effectiveNumHeads, headDim, topk, pageBlockSize, smScale, strideKvBlock, pTopkLength?.shards[i]);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
@@ -2849,11 +2854,12 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, contextParallel?: boolean, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(q: Tensor, kvCache: Tensor, indices: Tensor, numTokens: number, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
     const pQ = this.cast(q);
     const pKvCache = this.cast(kvCache);
     const pIndices = this.cast(indices);
     const pTopkLength = topkLength ? this.cast(topkLength) : undefined;
+    const contextParallel = pKvCache.parallelism === TensorParallelism.Row;
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "sparseMlaDecode numHeads");
     const oPar = contextParallel ? TensorParallelism.PartialSoftmax : TensorParallelism.Row;
     using gatheredQ: ParallelTensor = (contextParallel && pQ.parallelism === TensorParallelism.Row)
@@ -2862,7 +2868,7 @@ export class ParallelOps implements DeviceOps {
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaDecode(gatheredQ.shards[i], pKvCache.shards[i], pIndices.shards[i], numTokens, effectiveNumHeads, headDim, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, contextParallel, pTopkLength?.shards[i]);
+      const result = this.devices[i].sparseMlaDecode(gatheredQ.shards[i], pKvCache.shards[i], pIndices.shards[i], numTokens, effectiveNumHeads, headDim, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, pTopkLength?.shards[i]);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
