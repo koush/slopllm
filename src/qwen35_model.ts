@@ -260,8 +260,9 @@ export class Qwen35Model extends ChatModel {
     return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`), this.cfg.intermediateSize, BS);
   }
 
-  private gdnLayerPrefill(ws: ExecutionWorkspace, normed: Tensor, residual: Tensor, layerIdx: number, S: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
+  private gdnLayerPrefill(state: ExecutionState, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
+    const ws = state.ws;
     const hs = cfg.hiddenSize;
     const linKDim = cfg.linearKeyHeadDim;
     const linVDim = cfg.linearValueHeadDim;
@@ -271,6 +272,7 @@ export class Qwen35Model extends ChatModel {
     const fullConvStateStride = fullConvDim * (cfg.linearConvKernelDim - 1);
     const fullRecurrentStateStride = fullLinHeads * linKDim * linVDim;
     const pfx = `${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.linear_attn`;
+    const S = state.totalTokens;
     const BS = S;
     const batchSize = gdnState.batchSize;
 
@@ -288,12 +290,12 @@ export class Qwen35Model extends ChatModel {
 
     using gdnOut = ws.alloc([S, fullZDim], "BF16", undefined, TensorParallelism.Row);
 
-    gdnOut.gdnPrefill(
-      recurrentState, convOut,
+    ws.glm.gdnPrefill(
+      state, gdnOut, recurrentState, convOut,
       aBuf, bBuf,
       this.tensors.get(`${pfx}.A_log`)!, this.tensors.get(`${pfx}.dt_bias`)!,
-      gdnState.cuSeqlens, S, fullLinHeads, linKDim, linVDim,
-      batchSize, fullRecurrentStateStride, 1, fullConvDim,
+      gdnState.cuSeqlens, fullLinHeads, linKDim, linVDim,
+      fullRecurrentStateStride, 1, fullConvDim,
     );
 
     using gatedOut = ws.alloc([S, fullZDim], "BF16", undefined, TensorParallelism.Row);
@@ -315,8 +317,9 @@ export class Qwen35Model extends ChatModel {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  private gdnLayerDecode(ws: ExecutionWorkspace, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState, batchSize: number): { normed: Tensor, residual: Tensor } {
+  private gdnLayerDecode(state: ExecutionState, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
+    const ws = state.ws;
     const hs = cfg.hiddenSize;
     const linKDim = cfg.linearKeyHeadDim;
     const linVDim = cfg.linearValueHeadDim;
@@ -326,7 +329,7 @@ export class Qwen35Model extends ChatModel {
     const fullConvStateStride = fullConvDim * (cfg.linearConvKernelDim - 1);
     const fullRecurrentStateStride = fullLinHeads * linKDim * linVDim;
     const pfx = `${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.linear_attn`;
-    const BS = batchSize;
+    const BS = state.batchSize;
 
     using qkvBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_qkv.weight`)!, BS);
     using aBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_a.weight`)!, BS);
@@ -341,12 +344,12 @@ export class Qwen35Model extends ChatModel {
 
     using gdnOut = ws.alloc([BS, fullZDim], "BF16", undefined, TensorParallelism.Row);
 
-    gdnOut.gdnRecurrentStep(
-      recurrentState, convOut,
+    ws.glm.gdnRecurrentStep(
+      state, gdnOut, recurrentState, convOut,
       aBuf, bBuf,
       this.tensors.get(`${pfx}.A_log`)!, this.tensors.get(`${pfx}.dt_bias`)!,
       fullLinHeads, linKDim, linVDim,
-      BS, fullRecurrentStateStride, 1, fullConvDim,
+      fullRecurrentStateStride, 1, fullConvDim,
     );
 
     using gatedOut = ws.alloc([BS, fullZDim], "BF16", undefined, TensorParallelism.Row);
@@ -447,9 +450,9 @@ export class Qwen35Model extends ChatModel {
       let result: { normed: Tensor, residual: Tensor };
       if (cfg.layerTypes[i] === "linear_attention") {
         if (state.isDecode) {
-          result = this.gdnLayerDecode(ws, normed.value, residual.value, i, gdnState, batchSize);
+          result = this.gdnLayerDecode(state, normed.value, residual.value, i, gdnState);
         } else {
-          result = this.gdnLayerPrefill(ws, normed.value, residual.value, i, totalTokens, gdnState);
+          result = this.gdnLayerPrefill(state, normed.value, residual.value, i, gdnState);
         }
       } else {
         result = this.fullAttnLayer(normed.value, residual.value, i, state, cos, sin);

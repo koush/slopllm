@@ -1234,47 +1234,6 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, shards, [batch, k], this.type, TensorParallelism.Replicated);
   }
 
-  gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    super.gdnRecurrentStep(state, qkv, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
-    const pState = this.cast(state);
-    const pQkv = this.cast(qkv);
-    const pARaw = this.cast(aRaw);
-    const pBRaw = this.cast(bRaw);
-    const pALog = this.cast(aLog);
-    const pDtBias = this.cast(dtBias);
-    if (pQkv.parallelism === TensorParallelism.Column) {
-      throw new Error(`gdnRecurrentStep: unsupported qkv parallelism ${pQkv.parallelism}`);
-    }
-    const isRowPar = pQkv.parallelism === TensorParallelism.Row;
-    const shardHeads = isRowPar ? this.shardDim(numHeads, "gdnRecurrentStep numHeads") : numHeads;
-    const shardStateStride = isRowPar ? stateStride / this.worldSize : stateStride;
-    const shardSeqStride = isRowPar ? qkvSeqStride / this.worldSize : qkvSeqStride;
-    for (let i = 0; i < this.worldSize; i++) {
-      this.shards[i].gdnRecurrentStep(pState.shards[i], pQkv.shards[i], pARaw.shards[i], pBRaw.shards[i], pALog.shards[i], pDtBias.shards[i], shardHeads, dK, dV, batchSize, shardStateStride, qkvChStride, shardSeqStride);
-    }
-  }
-
-  gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    super.gdnPrefill(state, qkv, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
-    const pState = this.cast(state);
-    const pQkv = this.cast(qkv);
-    const pARaw = this.cast(aRaw);
-    const pBRaw = this.cast(bRaw);
-    const pALog = this.cast(aLog);
-    const pDtBias = this.cast(dtBias);
-    const pCuSeqlens = this.cast(cuSeqlens);
-    if (pQkv.parallelism === TensorParallelism.Column) {
-      throw new Error(`gdnPrefill: unsupported qkv parallelism ${pQkv.parallelism}`);
-    }
-    const isRowPar = pQkv.parallelism === TensorParallelism.Row;
-    const shardHeads = isRowPar ? this.shardDim(numHeads, "gdnPrefill numHeads") : numHeads;
-    const shardStateStride = isRowPar ? stateStride / this.worldSize : stateStride;
-    const shardSeqStride = isRowPar ? qkvSeqStride / this.worldSize : qkvSeqStride;
-    for (let i = 0; i < this.worldSize; i++) {
-      this.shards[i].gdnPrefill(pState.shards[i], pQkv.shards[i], pARaw.shards[i], pBRaw.shards[i], pALog.shards[i], pDtBias.shards[i], pCuSeqlens.shards[i], totalSeqLen, shardHeads, dK, dV, batchSize, shardStateStride, qkvChStride, shardSeqStride);
-    }
-  }
-
   causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
     super.causalConv1d(convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
     const pConvState = this.cast(convState);
@@ -2838,6 +2797,47 @@ export class ParallelOps implements DeviceOps {
     for (let i = 0; i < this.worldSize; i++) {
       const cpRank = contextParallel ? i : 0;
       this.devices[i].concatAndCacheDsMla(pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
+    }
+  }
+
+  gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    const pOutput = this.cast(output);
+    const pState = this.cast(recurrentState);
+    const pQkv = this.cast(qkv);
+    const pARaw = this.cast(aRaw);
+    const pBRaw = this.cast(bRaw);
+    const pALog = this.cast(aLog);
+    const pDtBias = this.cast(dtBias);
+    if (pQkv.parallelism === TensorParallelism.Column) {
+      throw new Error(`gdnRecurrentStep: unsupported qkv parallelism ${pQkv.parallelism}`);
+    }
+    const isRowPar = pQkv.parallelism === TensorParallelism.Row;
+    const shardHeads = isRowPar ? this.shardDim(numHeads, "gdnRecurrentStep numHeads") : numHeads;
+    const shardStateStride = isRowPar ? stateStride / this.worldSize : stateStride;
+    const shardSeqStride = isRowPar ? qkvSeqStride / this.worldSize : qkvSeqStride;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].gdnRecurrentStep(state, pOutput.shards[i], pState.shards[i], pQkv.shards[i], pARaw.shards[i], pBRaw.shards[i], pALog.shards[i], pDtBias.shards[i], shardHeads, dK, dV, shardStateStride, qkvChStride, shardSeqStride);
+    }
+  }
+
+  gdnPrefill(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    const pOutput = this.cast(output);
+    const pState = this.cast(recurrentState);
+    const pQkv = this.cast(qkv);
+    const pARaw = this.cast(aRaw);
+    const pBRaw = this.cast(bRaw);
+    const pALog = this.cast(aLog);
+    const pDtBias = this.cast(dtBias);
+    const pCuSeqlens = this.cast(cuSeqlens);
+    if (pQkv.parallelism === TensorParallelism.Column) {
+      throw new Error(`gdnPrefill: unsupported qkv parallelism ${pQkv.parallelism}`);
+    }
+    const isRowPar = pQkv.parallelism === TensorParallelism.Row;
+    const shardHeads = isRowPar ? this.shardDim(numHeads, "gdnPrefill numHeads") : numHeads;
+    const shardStateStride = isRowPar ? stateStride / this.worldSize : stateStride;
+    const shardSeqStride = isRowPar ? qkvSeqStride / this.worldSize : qkvSeqStride;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].gdnPrefill(state, pOutput.shards[i], pState.shards[i], pQkv.shards[i], pARaw.shards[i], pBRaw.shards[i], pALog.shards[i], pDtBias.shards[i], pCuSeqlens.shards[i], shardHeads, dK, dV, shardStateStride, qkvChStride, shardSeqStride);
     }
   }
 

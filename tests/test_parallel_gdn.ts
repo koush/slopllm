@@ -4,6 +4,7 @@ import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { TensorParallelism } from "../src/device_ops";
 import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
+import type { ExecutionState } from "../src/execution-workspace";
 
 function shardQkvData(
   fullData: Float32Array, rows: number, numHeads: number, dK: number, dV: number,
@@ -163,9 +164,9 @@ describe("ParallelOps GDN recurrent step", () => {
     refDtBias.h2d(Buffer.from(dtBiasF32.buffer));
     refGlm.synchronize();
 
-    refOutput.gdnRecurrentStep(
-      refState, refQkv, refARaw, refBRaw, refALog, refDtBias,
-      numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride,
+    refGlm.gdnRecurrentStep(
+      { batchSize } as ExecutionState, refOutput, refState, refQkv, refARaw, refBRaw, refALog, refDtBias,
+      numHeads, dK, dV, stateStride, qkvChStride, qkvSeqStride,
     );
     refGlm.synchronize();
 
@@ -208,9 +209,9 @@ describe("ParallelOps GDN recurrent step", () => {
     }
     po.synchronize();
 
-    tpOutput.gdnRecurrentStep(
-      tpState, tpQkv, tpARaw, tpBRaw, tpALog, tpDtBias,
-      numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride,
+    po.gdnRecurrentStep(
+      { batchSize } as ExecutionState, tpOutput, tpState, tpQkv, tpARaw, tpBRaw, tpALog, tpDtBias,
+      numHeads, dK, dV, stateStride, qkvChStride, qkvSeqStride,
     );
     po.synchronize();
 
@@ -273,9 +274,9 @@ describe("ParallelOps GDN recurrent step", () => {
     refDtBias.h2d(Buffer.from(dtBiasF32.buffer));
     refGlm.synchronize();
 
-    refOutput.gdnRecurrentStep(
-      refState, refQkv, refARaw, refBRaw, refALog, refDtBias,
-      numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride,
+    refGlm.gdnRecurrentStep(
+      { batchSize } as ExecutionState, refOutput, refState, refQkv, refARaw, refBRaw, refALog, refDtBias,
+      numHeads, dK, dV, stateStride, qkvChStride, qkvSeqStride,
     );
     refGlm.synchronize();
 
@@ -314,9 +315,9 @@ describe("ParallelOps GDN recurrent step", () => {
     tpDtBias.h2d(Buffer.from(dtBiasF32.buffer));
     po.synchronize();
 
-    tpOutput.gdnRecurrentStep(
-      tpState, tpQkv, tpARaw, tpBRaw, tpALog, tpDtBias,
-      numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride,
+    po.gdnRecurrentStep(
+      { batchSize } as ExecutionState, tpOutput, tpState, tpQkv, tpARaw, tpBRaw, tpALog, tpDtBias,
+      numHeads, dK, dV, stateStride, qkvChStride, qkvSeqStride,
     );
     po.synchronize();
 
@@ -408,10 +409,10 @@ describe("ParallelOps GDN prefill", () => {
     refCuSeqlens.h2d(Buffer.from(cuSeqlens.buffer));
     refGlm.synchronize();
 
-    refOutput.gdnPrefill(
-      refState, refQkv, refARaw, refBRaw, refALog, refDtBias,
-      refCuSeqlens, totalSeqLen, numHeads, dK, dV,
-      batchSize, stateStride, qkvChStride, qkvSeqStride,
+    refGlm.gdnPrefill(
+      { batchSize, totalTokens: totalSeqLen } as ExecutionState, refOutput, refState, refQkv, refARaw, refBRaw, refALog, refDtBias,
+      refCuSeqlens, numHeads, dK, dV,
+      stateStride, qkvChStride, qkvSeqStride,
     );
     refGlm.synchronize();
 
@@ -451,10 +452,10 @@ describe("ParallelOps GDN prefill", () => {
     tpCuSeqlens.h2d(Buffer.from(cuSeqlens.buffer));
     po.synchronize();
 
-    tpOutput.gdnPrefill(
-      tpState, tpQkv, tpARaw, tpBRaw, tpALog, tpDtBias,
-      tpCuSeqlens, totalSeqLen, numHeads, dK, dV,
-      batchSize, stateStride, qkvChStride, qkvSeqStride,
+    po.gdnPrefill(
+      { batchSize, totalTokens: totalSeqLen } as ExecutionState, tpOutput, tpState, tpQkv, tpARaw, tpBRaw, tpALog, tpDtBias,
+      tpCuSeqlens, numHeads, dK, dV,
+      stateStride, qkvChStride, qkvSeqStride,
     );
     po.synchronize();
 

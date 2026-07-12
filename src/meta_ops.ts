@@ -125,14 +125,6 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([batch, k], this.type);
     }
 
-    gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-        super.gdnRecurrentStep(state, qkv, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
-    }
-
-    gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-        super.gdnPrefill(state, qkv, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
-    }
-
     causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
         super.causalConv1d(convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
     }
@@ -358,6 +350,12 @@ export class MetaOps implements DeviceOps {
     }
 
     concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, cpWorldSize?: number, cpRank?: number): void {
+    }
+
+    gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    }
+
+    gdnPrefill(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
     }
 
     sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, strideKvBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {

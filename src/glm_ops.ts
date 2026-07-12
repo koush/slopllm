@@ -393,16 +393,6 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  gdnRecurrentStep(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    super.gdnRecurrentStep(state, qkv, aRaw, bRaw, aLog, dtBias, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
-    getNativeAddon().gdnRecurrentStep(this.glm.ctx, this.data, state.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
-  }
-
-  gdnPrefill(state: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
-    super.gdnPrefill(state, qkv, aRaw, bRaw, aLog, dtBias, cuSeqlens, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
-    getNativeAddon().gdnPrefill(this.glm.ctx, this.data, state.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, cuSeqlens.data, totalSeqLen, numHeads, dK, dV, batchSize, stateStride, qkvChStride, qkvSeqStride);
-  }
-
   causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
     super.causalConv1d(convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
     getNativeAddon().causalConv1d(this.glm.ctx, this.data, convState.data, input.data, weight.data, cuSeqlens.data, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
@@ -1129,6 +1119,21 @@ export class GlmOps implements DeviceOps {
 
   concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, cpWorldSize: number = 0, cpRank: number = 0): void {
     getNativeAddon().concatAndCacheDsMla(this.ctx, ptr(kvCache), ptr(appendCkv), ptr(appendKpe), ptr(indices), ptr(indptr), ptr(batchIndices), ptr(positions), nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
+  }
+
+  gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    if (recurrentState.type !== "F32") throw new Error(`gdnRecurrentStep: state must be F32, got ${recurrentState.type}`);
+    if (aLog.type !== "F32") throw new Error(`gdnRecurrentStep: aLog must be F32, got ${aLog.type}`);
+    if (dtBias.type !== "F32") throw new Error(`gdnRecurrentStep: dtBias must be F32, got ${dtBias.type}`);
+    getNativeAddon().gdnRecurrentStep(this.ctx, output.data, recurrentState.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, numHeads, dK, dV, state.batchSize, stateStride, qkvChStride, qkvSeqStride);
+  }
+
+  gdnPrefill(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
+    if (recurrentState.type !== "F32") throw new Error(`gdnPrefill: state must be F32, got ${recurrentState.type}`);
+    if (aLog.type !== "F32") throw new Error(`gdnPrefill: aLog must be F32, got ${aLog.type}`);
+    if (dtBias.type !== "F32") throw new Error(`gdnPrefill: dtBias must be F32, got ${dtBias.type}`);
+    if (cuSeqlens.type !== "I32") throw new Error(`gdnPrefill: cuSeqlens must be I32, got ${cuSeqlens.type}`);
+    getNativeAddon().gdnPrefill(this.ctx, output.data, recurrentState.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, cuSeqlens.data, state.totalTokens, numHeads, dK, dV, state.batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
   sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, strideKvBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
