@@ -7,6 +7,15 @@ import { WorkspaceBase } from "./workspace";
 import type { PagedKVCache } from "./paged_kv";
 import { ExecutionState } from "./execution-workspace";
 
+// Master switch for the CP "gather CKV" path in sparse MLA prefill. When true,
+// CP prefill gathers the CKV cache into a flat Replicated buffer and the indexer
+// emits flat slots to match. When false, both are disabled: Q is AllGathered and
+// the indexer/sparse kernel run against the paged cache (the pre-gather path).
+// Toggle here or via GLM_CP_GATHER_KV=0. Both the gather (sparseMlaPrefill) and
+// the indexer flat-slot mode (indexerTopkSlots ignores kvTokenIndptr when off)
+// read this so they never diverge.
+export const CP_GATHER_KV = process.env.GLM_CP_GATHER_KV !== "0";
+
 export class ParallelTensor extends Tensor {
   parallelism: TensorParallelism;
   readonly shards: readonly Tensor[];
@@ -1783,7 +1792,11 @@ export class ParallelTensor extends Tensor {
     // Column v_proj in CP prefill could be supported by switching to merge-then-expand
     // (merge attn_out in kvLoraRank space, then v_expand locally), but that doubles
     // merge communication (kvLoraRank=512 > vHeadDim=256) for modest memory savings.
-    if (isCp && seqLen !== 1 && pVProj.parallelism === TensorParallelism.Column) {
+    // Token-major attn_out (sparse SM120 output: [BS, nHeads, kvLoraRank]) has the
+    // same layout as decode (one row per token), so it takes the merge-then-expand
+    // path regardless of the nominal seqLen.
+    const isCpDecodeLayout = isCp && (seqLen === 1 || !!_tokenMajor);
+    if (isCp && !isCpDecodeLayout && pVProj.parallelism === TensorParallelism.Column) {
       throw new Error(`mlaVExpand: CP prefill (expand-then-merge) requires Replicated v_proj, got Column`);
     }
     const BS = batch * seqLen;
@@ -1792,7 +1805,7 @@ export class ParallelTensor extends Tensor {
     // CP decode: merge K-dim attn_out first, then v_expand h heads locally.
     // Avoids redundant v_expand of all H heads on every GPU. Only for decode
     // (seqLen=1) where BHSD layout == BSH layout so the merge can read attn_out directly.
-    if (isCp && seqLen === 1) {
+    if (isCpDecodeLayout) {
       const pLse = lse as ParallelTensor;
       using merged = new UsingHolder(this.parallelOps.contextParallelMerge(
         this, pLse,
@@ -2864,7 +2877,7 @@ export class ParallelOps implements DeviceOps {
     const pTopkLength = this.cast(topkLength);
     const contextParallel = pKvCache.parallelism === TensorParallelism.Row;
 
-    let shouldGatherKv = contextParallel;
+    let shouldGatherKv = CP_GATHER_KV && contextParallel;
     if (shouldGatherKv) {
       const paddedKvLen = state.getGraphVariantPaddedKvLen();
       const paddedQLen = state.getGraphVariantPaddedQLen();
@@ -3013,7 +3026,7 @@ export class ParallelOps implements DeviceOps {
     const pCustomMask = customMask ? this.cast(customMask) : undefined;
     const pMaskIndptr = maskIndptr ? this.cast(maskIndptr) : undefined;
     const pMaskKvLen = maskKvLen ? this.cast(maskKvLen) : undefined;
-    const pKvTokenIndptr = kvTokenIndptrD ? this.cast(kvTokenIndptrD) : undefined;
+    const pKvTokenIndptr = (CP_GATHER_KV && kvTokenIndptrD) ? this.cast(kvTokenIndptrD) : undefined;
 
     const W = this.worldSize;
     const flatMode = contextParallel && !!pKvTokenIndptr;
