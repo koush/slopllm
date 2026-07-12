@@ -6,6 +6,7 @@ import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
 import { PagedKVCache } from "../src/paged_kv";
 import { WorkspaceBase } from "../src/workspace";
 import { Tensor } from "../src/tensor";
+import type { ExecutionState } from "../src/execution-workspace";
 
 const HEAD_DIM_CKV = 512;
 const HEAD_DIM_KPE = 64;
@@ -138,7 +139,9 @@ function runMlaPrefill(
   const oStrideN = headDimCkv;
   const oStrideH = totalQTokens * headDimCkv;
 
+  const execState = { batchSize, totalTokens: totalQTokens, cache: { getPagedKV: () => ({ pageSize }) } } as ExecutionState;
   const { o: vOut, lse } = glm.mlaPrefillRun(
+    execState,
     qNope, qPe, ckv, kpe, indices,
     floatWs, intWs, planInfo,
     nHeads, pageSize, 1, SM_SCALE,
@@ -626,7 +629,9 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
     // Run MLA prefill — ParallelOps adjusts strides for CP and AllGathers Row-parallel Q
     const ckvStridePage = pageSize * HEAD_DIM_CKV;
     const kpeStridePage = pageSize * HEAD_DIM_KPE;
+    const execState = { batchSize, totalTokens, cache: { getPagedKV: () => ({ pageSize }) } } as ExecutionState;
     const { o: pOut, lse: pLse } = po.mlaPrefillRun(
+      execState,
       pQNope, pQPe, ckvData, kpeData, pagedKV.indices,
       floatWs, intWs, planInfo,
       N_HEADS, pageSize, 1, SM_SCALE,

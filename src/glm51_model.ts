@@ -426,8 +426,6 @@ export class Glm51Model extends ChatModel {
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : totalTokens;
 
-    const pagedKV = state.cache.getPagedKV();
-
     using kvcache = this.glm.withStream(() => {
       using kPeRopeStream = this.glm.withStream(() => {
         using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!, BS);
@@ -490,14 +488,9 @@ export class Glm51Model extends ChatModel {
 
           // Indexer forward: fused score+topk kernel → slots
           // 'full' layer: compute score+topk → slots
-          const cm = (!state.isDecode && state.customMask?.mode === MaskMode.CausalCustom) ? state.customMask : undefined;
-          const slots = this.glm.indexerTopkSlots(
-            idxQ, pagedKV.kData[layerIdx], idxWeights,
-            pagedKV.indices, ws.indptrD, ws.lastPageLen, ws.qoIndptrD, ws.mlaBatchIndices, ws.sparseTopkLength,
-            Math.pow(idxHeadDim, -0.5), BS, idxNHeads, idxHeadDim, pagedKV.pageSize, idxTopk,
-            state.isDecode, pagedKV.maxPages * pagedKV.pageSize, this.contextParallel,
-            undefined, undefined, ws.globalLastPageLen,
-            cm?.mask, cm?.indptr, cm?.maskKvLen,
+          const slots = state.indexerTopkSlots(
+            idxQ, layerIdx, idxWeights,
+            Math.pow(idxHeadDim, -0.5), idxTopk,
           );
           sharedSlots.replace(slots);
         });
@@ -540,21 +533,17 @@ export class Glm51Model extends ChatModel {
       if (sharedSlots.value) {
         // Sparse MLA path: SM120 kernel on packed FP8 KV cache
         using qConcat = qAbsorbedR.cat([qPeR], 2); // [BS, nHeads, kvLoraRank + qkRopeDim]
-        const strideKvBlock = pagedKV.pageSize * pagedKV.bytesPerToken;
         let sparseResult: { o: Tensor, lse: Tensor };
 
         if (state.isDecode) {
-          const numSplits = Math.ceil(cfg.indexTopk / 64);
-          sparseResult = this.glm.sparseMlaDecode(
-            qConcat, pagedKV.ckvData[layerIdx], sharedSlots.value,
-            BS, nHeads, kvLoraRank, cfg.indexTopk, numSplits,
-            cfg.scaling, strideKvBlock, 0, ws.sparseTopkLength,
+          sparseResult = state.sparseMla(
+            qConcat, layerIdx, sharedSlots.value,
+            nHeads, kvLoraRank, cfg.indexTopk, cfg.scaling,
           );
         } else {
-          sparseResult = this.glm.sparseMlaPrefill(
-            qConcat, pagedKV.ckvData[layerIdx], sharedSlots.value,
-            BS, nHeads, kvLoraRank, cfg.indexTopk, pagedKV.pageSize,
-            cfg.scaling, strideKvBlock, ws.sparseTopkLength,
+          sparseResult = state.sparseMla(
+            qConcat, layerIdx, sharedSlots.value,
+            nHeads, kvLoraRank, cfg.indexTopk, cfg.scaling,
           );
           // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
           // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
@@ -568,8 +557,8 @@ export class Glm51Model extends ChatModel {
       } else {
         // Dense MLA path (FlashInfer plan/run)
         const mlaResult = state.isDecode
-          ? ws.mlaDecodePaged(qAbsorbedR, qPeR, pagedKV, layerIdx, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling)
-          : ws.mlaPrefillPaged(qAbsorbedR, qPeR, pagedKV, layerIdx, totalTokens, batchSize, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, !state.customMask ? MaskMode.Causal : state.customMask.mode, state.customMask?.mask, state.customMask?.indptr, state.customMask?.maskKvLen);
+          ? ws.mlaDecodePaged(state, qAbsorbedR, qPeR, layerIdx, nHeads, kvLoraRank, qkRopeDim, cfg.scaling)
+          : ws.mlaPrefillPaged(state, qAbsorbedR, qPeR, layerIdx, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, !state.customMask ? MaskMode.Causal : state.customMask.mode, state.customMask?.mask, state.customMask?.indptr, state.customMask?.maskKvLen);
         attnOut = mlaResult.o;
         lseBuf = mlaResult.lse;
       }

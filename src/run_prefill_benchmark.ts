@@ -118,7 +118,7 @@ async function main(): Promise<void> {
     const state = ws.planPrefill(model, 1, [chunkLen], cache);
     state.setInput([inputIds.slice(chunkStart, chunkStart + chunkLen)]);
 
-    captureManager.run(() => {
+    state.capture(captureManager, () => {
       using hiddenStates = model.forward(state);
     }, ['prefill']);
 
@@ -169,7 +169,7 @@ async function main(): Promise<void> {
       const state = ws.planPrefill(model, 1, [chunkLen], cache);
       state.setInput([inputIds.slice(chunkStart, chunkStart + chunkLen)]);
 
-      captureManager.run(() => {
+      state.capture(captureManager, () => {
         using hiddenStates = model.forward(state);
       }, ['prefill']);
 

@@ -121,6 +121,38 @@ export class ExecutionState {
     );
   }
 
+  indexerTopkSlots(idxQ: Tensor, cacheIdx: number, weights: Tensor, scale: number, topk: number): Tensor {
+    const pagedKV = this.cache.getPagedKV();
+    const cm = (!this.isDecode && this.customMask?.mode === MaskMode.CausalCustom) ? this.customMask : undefined;
+    return this.ws.glm.indexerTopkSlots(
+      idxQ, pagedKV.kData[cacheIdx], weights,
+      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.qoIndptrD, this.ws.mlaBatchIndices, this.ws.sparseTopkLength,
+      scale, topk,
+      this.isDecode, pagedKV.maxPages * pagedKV.pageSize, pagedKV.contextParallel,
+      undefined, undefined, this.ws.globalLastPageLen,
+      cm?.mask, cm?.indptr, cm?.maskKvLen,
+    );
+  }
+
+  sparseMla(q: Tensor, cacheIdx: number, indices: Tensor, nHeads: number, kvLoraRank: number, topk: number, smScale: number): { o: Tensor, lse: Tensor } {
+    const pagedKV = this.cache.getPagedKV();
+    const strideKvBlock = pagedKV.pageSize * pagedKV.bytesPerToken;
+    if (this.isDecode) {
+      const numSplits = Math.ceil(topk / 64);
+      return this.ws.glm.sparseMlaDecode(
+        this, q, pagedKV.ckvData[cacheIdx], indices,
+        nHeads, kvLoraRank, topk, numSplits,
+        smScale, strideKvBlock, 0, this.ws.sparseTopkLength,
+      );
+    } else {
+      return this.ws.glm.sparseMlaPrefill(
+        this, q, pagedKV.ckvData[cacheIdx], indices,
+        nHeads, kvLoraRank, topk,
+        smScale, strideKvBlock, this.ws.sparseTopkLength,
+      );
+    }
+  }
+
   setInput(tokenIds: number[][] | Tensor) {
     if (tokenIds instanceof Tensor) {
       // if the tensor is not in the same workspace copy it into the workspace buffer.
@@ -366,52 +398,56 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
 
-  flashDecode(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
-    const out = this.alloc([batchSize, nHeads, 1, hd], query.type, undefined, query.parallelism);
+  flashDecode(state: ExecutionState, query: Tensor, cacheIdx: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
+    const pagedKV = state.cache.getPagedKV();
+    const out = this.alloc([state.batchSize, nHeads, 1, hd], query.type, undefined, query.parallelism);
     this.glm.batchDecodeRun(
-      query, out,
+      state, query, out,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
       pagedKV.indices, this.indptrD, this.lastPageLen,
       this.floatWs, this.intWs,
       this.decodePlanInfo,
-      batchSize, nHeads, nKv, hd, pagedKV.pageSize, smScale
+      nHeads, nKv, hd, smScale
     );
     return out;
   }
 
-  batchPrefillRagged(q: Tensor, k: Tensor, v: Tensor, totalQoRows: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: MaskMode, smScale: number): Tensor {
-    const out = this.alloc([1, nHeads, totalQoRows, hd], q.type, undefined, q.parallelism);
+  batchPrefillRagged(state: ExecutionState, q: Tensor, k: Tensor, v: Tensor, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: MaskMode, smScale: number): Tensor {
+    const out = this.alloc([1, nHeads, state.totalTokens, hd], q.type, undefined, q.parallelism);
     this.glm.batchPrefillRaggedRun(
-      q, k, v, out,
+      state, q, k, v, out,
       this.floatWs, this.intWs,
       this.qoIndptrD, this.kvTokenIndptrD,
       this.prefillPlanInfo,
-      totalQoRows, batchSize, nHeads, nKv, hd,
+      nHeads, nKv, hd,
       qStrideN, qStrideH, kvStrideN, kvStrideH, vStrideN, vStrideH,
       maskMode, smScale
     );
     return out;
   }
 
-  flashPrefillPaged(query: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: MaskMode, smScale: number): Tensor {
-    const out = this.alloc([1, nHeads, totalTokens, hd], query.type, undefined, query.parallelism);
+  flashPrefillPaged(state: ExecutionState, query: Tensor, cacheIdx: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: MaskMode, smScale: number): Tensor {
+    const pagedKV = state.cache.getPagedKV();
+    const out = this.alloc([1, nHeads, state.totalTokens, hd], query.type, undefined, query.parallelism);
     this.glm.batchPrefillPagedRun(
-      query, out,
+      state, query, out,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
       pagedKV.indices, this.indptrD, this.lastPageLen,
       this.floatWs, this.intWs,
       this.qoIndptrD,
       this.prefillPlanInfo,
-      totalTokens, batchSize, nHeads, nKv, hd, pagedKV.pageSize,
+      nHeads, nKv, hd,
       qStrideN, qStrideH, maskMode, smScale
     );
     return out;
   }
 
-  mlaPrefillPaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, totalTokens: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
+  mlaPrefillPaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, cacheIdx: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
+    const pagedKV = state.cache.getPagedKV();
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     const pageSize = pagedKV.pageSize;
+    const totalTokens = state.totalTokens;
     const qNopeStrideN = nHeads * headDimCkv;
     const qNopeStrideH = headDimCkv;
     const qPeStrideN = nHeads * headDimKpe;
@@ -423,7 +459,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const oStrideN = headDimCkv;
     const oStrideH = totalTokens * headDimCkv;
     return this.glm.mlaPrefillRun(
-      qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
+      state, qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       pagedKV.indices,
       this.floatWs, this.intWs,
       this.mlaPrefillPlanInfo,
@@ -437,15 +473,16 @@ export class ExecutionWorkspace extends WorkspaceBase {
     );
   }
 
-  mlaDecodePaged(qNope: Tensor, qPe: Tensor, pagedKV: PagedKVCache, cacheIdx: number, batchSize: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): { o: Tensor, lse: Tensor } {
+  mlaDecodePaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, cacheIdx: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): { o: Tensor, lse: Tensor } {
+    const pagedKV = state.cache.getPagedKV();
     const headDimCkv = kvLoraRank;
     const headDimKpe = qkRopeDim;
     return this.glm.mlaDecodeRun(
-      qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
+      state, qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       pagedKV.indices, this.indptrD, this.lastPageLen,
       this.floatWs, this.intWs,
       this.mlaDecodePlanInfo,
-      batchSize, nHeads, pagedKV.pageSize, smScale,
+      nHeads, pagedKV.pageSize, smScale,
       headDimCkv, headDimKpe,
     );
   }

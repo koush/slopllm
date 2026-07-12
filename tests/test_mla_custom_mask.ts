@@ -4,6 +4,7 @@ import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "../src/glm_ops";
 import { MaskMode } from "../src/device_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { Tensor } from "../src/tensor";
+import type { ExecutionState } from "../src/execution-workspace";
 
 const HEAD_DIM_CKV = 512;
 const HEAD_DIM_KPE = 64;
@@ -217,7 +218,9 @@ function runMlaPrefill(
     maskMode = causal ? MaskMode.Causal : MaskMode.None;
   }
 
+  const execState = { batchSize, totalTokens: totalQTokens, cache: { getPagedKV: () => ({ pageSize }) } } as ExecutionState;
   const result = glm.mlaPrefillRun(
+    execState,
     qNope, qPe, ckv, kpe, indices,
     floatWs, intWs, planInfo,
     nHeads, pageSize, maskMode, SM_SCALE,

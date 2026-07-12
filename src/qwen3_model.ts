@@ -154,11 +154,11 @@ export class Qwen3Model extends ChatModel {
 
       using flashOut = new UsingHolder<Tensor>(undefined!);
       if (state.isDecode) {
-        flashOut.replace(ws.flashDecode(qRope, pagedKV, i, batchSize, nHeads, nKv, hd, cfg.scaling));
+        flashOut.replace(ws.flashDecode(state, qRope, i, nHeads, nKv, hd, cfg.scaling));
       } else {
         const qStrideN = hd;
         const qStrideH = totalTokens * hd;
-        flashOut.replace(ws.flashPrefillPaged(qRope, pagedKV, i, totalTokens, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
+        flashOut.replace(ws.flashPrefillPaged(state, qRope, i, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
       }
 
       using reshapedFlashOut = flashOut.value.reshape([BS, nHeads * hd]);

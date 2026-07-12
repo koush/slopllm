@@ -375,7 +375,6 @@ export class Qwen35Model extends ChatModel {
     const nHeads = cfg.numAttentionHeads;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
-    const pagedKV = state.cache.getPagedKV();
     const cacheIdx = this.fullAttnCacheIdx(layerIdx);
     const pfx = `${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.self_attn`;
     const batchSize = state.batchSize;
@@ -396,11 +395,11 @@ export class Qwen35Model extends ChatModel {
 
     using flashOut = new UsingHolder<Tensor>(undefined!);
     if (state.isDecode) {
-      flashOut.replace(ws.flashDecode(qRope, pagedKV, cacheIdx, batchSize, nHeads, nKv, hd, cfg.scaling));
+      flashOut.replace(ws.flashDecode(state, qRope, cacheIdx, nHeads, nKv, hd, cfg.scaling));
     } else {
       const qStrideN = hd;
       const qStrideH = BS * hd;
-      flashOut.replace(ws.flashPrefillPaged(qRope, pagedKV, cacheIdx, BS, batchSize, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
+      flashOut.replace(ws.flashPrefillPaged(state, qRope, cacheIdx, nHeads, nKv, hd, qStrideN, qStrideH, 1, cfg.scaling));
     }
 
     if (cfg.attnOutputGate) {
