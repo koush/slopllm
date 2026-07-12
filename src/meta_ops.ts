@@ -166,7 +166,7 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc(this.shape, this.type);
     }
 
-    mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, _lse?: Tensor, _headOffset?: number, _attnNHeads?: number, _vProjHeadOffset?: number): Tensor {
+    mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, _lse?: Tensor, _headOffset?: number, _attnNHeads?: number, _vProjHeadOffset?: number, _tokenMajor?: boolean): Tensor {
         super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
         const BS = batch * seqLen;
         return this.workspace.alloc([BS, nHeads * vHeadDim], this.type);

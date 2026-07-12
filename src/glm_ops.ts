@@ -508,11 +508,13 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, _lse?: Tensor, headOffset: number = 0, attnNHeads: number = nHeads, vProjHeadOffset: number = 0): Tensor {
+  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, _lse?: Tensor, headOffset: number = 0, attnNHeads: number = nHeads, vProjHeadOffset: number = 0, tokenMajor: boolean = false): Tensor {
     super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
     const BS = batch * seqLen;
     const out = this.workspace.alloc([BS, nHeads * vHeadDim], this.type);
-    getNativeAddon().mlaVExpand(this.glm.ctx, out.data, this.data, vProj.data, kvLoraRank, vHeadDim, nHeads, seqLen, batch, attnNHeads, headOffset, vProjHeadOffset);
+    const effSeqLen = tokenMajor ? 1 : seqLen;
+    const effBatch = tokenMajor ? BS : batch;
+    getNativeAddon().mlaVExpand(this.glm.ctx, out.data, this.data, vProj.data, kvLoraRank, vHeadDim, nHeads, effSeqLen, effBatch, attnNHeads, headOffset, vProjHeadOffset);
     return out;
   }
 

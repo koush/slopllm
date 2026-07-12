@@ -1801,20 +1801,22 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
   }
 
-  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, lse?: Tensor): Tensor {
+  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, lse?: Tensor, _headOffset?: number, _attnNHeads?: number, _vProjHeadOffset?: number, _tokenMajor?: boolean): Tensor {
     super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
     const pVProj = vProj as ParallelTensor;
     // if (this.parallelism === TensorParallelism.PartialSum || this.parallelism === TensorParallelism.Column ||
     //     pVProj.parallelism === TensorParallelism.PartialSum || pVProj.parallelism === TensorParallelism.Column) {
     //   throw new Error(`mlaVExpand: unsupported parallelism this=${this.parallelism}, vProj=${pVProj.parallelism}`);
     // }
-    const shardNHeads = (pVProj.parallelism === TensorParallelism.Row || pVProj.parallelism === TensorParallelism.Column)
+    const shardNHeads = (this.parallelism === TensorParallelism.Row || pVProj.parallelism === TensorParallelism.Row || pVProj.parallelism === TensorParallelism.Column)
       ? this.parallelOps.shardDim(nHeads, "mlaVExpand nHeads")
       : nHeads;
     const isPartialSoftmax = this.parallelism === TensorParallelism.PartialSoftmax;
     const attnNHeads = isPartialSoftmax ? nHeads : shardNHeads;
     const isVProjSharded = pVProj.parallelism === TensorParallelism.Row;
     const isCp = this.parallelism === TensorParallelism.PartialSoftmax;
+    const isVProjReplicated = pVProj.parallelism === TensorParallelism.Replicated;
+    const isAttnRowSharded = this.parallelism === TensorParallelism.Row;
     if (isCp && pVProj.parallelism === TensorParallelism.Row) {
       throw new Error(`mlaVExpand: context parallelism does not support Row-parallel v_proj`);
     }
@@ -1848,7 +1850,7 @@ export class ParallelTensor extends Tensor {
         }
         expandShards.push(merged.value.shards[i].mlaVExpand(
           vProjShard, kvLoraRank, vHeadDim, h, 1, BS,
-          undefined, 0, h, 0
+          undefined, 0, h, 0, _tokenMajor
         ));
       }
       for (const v of narrowViews) v[Symbol.dispose]();
@@ -1857,11 +1859,18 @@ export class ParallelTensor extends Tensor {
 
     // Non-CP or CP prefill: expand-then-merge
     const outShards: Tensor[] = [];
+    const narrowViews: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
+      let vProjShard = pVProj.shards[i];
+      if (isVProjReplicated && isAttnRowSharded) {
+        vProjShard = vProjShard.narrow(i * shardNHeads * kvLoraRank, shardNHeads * kvLoraRank);
+        narrowViews.push(vProjShard);
+      }
       const shardHeadOffset = (isPartialSoftmax && isVProjSharded) ? i * shardNHeads : 0;
-      outShards.push(this.shards[i].mlaVExpand(pVProj.shards[i], kvLoraRank, vHeadDim, shardNHeads, seqLen, batch, undefined, shardHeadOffset, attnNHeads));
+      outShards.push(this.shards[i].mlaVExpand(vProjShard, kvLoraRank, vHeadDim, shardNHeads, seqLen, batch, undefined, shardHeadOffset, attnNHeads, 0, _tokenMajor));
     }
-    const vExpandedPar = isCp ? TensorParallelism.Column : this.parallelism;
+    for (const v of narrowViews) v[Symbol.dispose]();
+    const vExpandedPar = isCp ? TensorParallelism.Column : (shardNHeads === nHeads ? TensorParallelism.Replicated : this.parallelism);
     const vExpandedFullShape = isCp ? [BS * this.parallelOps.worldSize, nHeads * vHeadDim] : [BS, nHeads * vHeadDim];
     using vExpanded = new UsingHolder(this.parallelOps.wrapShards(this.workspace, outShards, vExpandedFullShape, this.type, vExpandedPar));
     if (!isCp) {
