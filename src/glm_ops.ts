@@ -96,8 +96,8 @@ interface NativeAddon {
   applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number, offset: number): void;
   gather(ctx: number, out: number, input: number, indices: number, k: number, inDim: number, batch: number, elemSize: number): void;
-  deinterleave(ctx: number, out: number, input: number, worldSize: number, totalLen: number, globalLen: number, kvTokenIndptr: number, batchSize: number, D: number): void;
-  gatherPages(ctx: number, out: number, input: number, pageIndices: number, pageIndptr: number, lastPageLen: number, numPages: number, batchSize: number, pageSize: number, D: number): void;
+  deinterleave(ctx: number, out: number, input: number, worldSize: number, maxTotalLen: number, pageIndptr: number, kvTokenIndptr: number, batchSize: number, pageSize: number, D: number): void;
+  gatherPages(ctx: number, out: number, input: number, pageIndices: number, pageIndptr: number, lastPageLen: number, maxPages: number, batchSize: number, pageSize: number, D: number): void;
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
@@ -955,9 +955,11 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().kvCacheWrite(this.ctx, ptr(srcK), ptr(srcV), ptr(dstK), ptr(dstV), ptr(slotMapping), batchSize, nKv, hd, pageSize, srcKTokenStride, srcKHeadStride, srcVTokenStride, srcVHeadStride);
   }
 
-  gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, numPages: number, batchSize: number, pageSize: number, D: number, totalKvLen: number, _kvTokenIndptrD: Tensor, _contextParallel: boolean): Tensor {
-    const out = srcData.workspace.alloc([totalKvLen, D], "BF16");
-    getNativeAddon().gatherPages(this.ctx, out.data, srcData.data, pageIndices.data, pageIndptrD.data, lastPageLen.data, numPages, batchSize, pageSize, D);
+  gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, pageSize: number, D: number, paddedKvLen: number, _kvTokenIndptrD: Tensor, _contextParallel: boolean): Tensor {
+    const out = srcData.workspace.alloc([paddedKvLen, D], srcData.type);
+    const elemBytes = srcData.type === "U8" ? 1 : 2;
+    const maxPages = srcData.shape[0];
+    getNativeAddon().gatherPages(this.ctx, out.data, srcData.data, pageIndices.data, pageIndptrD.data, lastPageLen.data, maxPages, batchSize, pageSize, D * elemBytes);
     return out;
   }
 

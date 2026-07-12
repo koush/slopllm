@@ -552,7 +552,7 @@ static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
 static Napi::Value TopkToSlots(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 13) {
-        Napi::TypeError::New(env, "Expected (ctx, slots, topkLength, topkIdx, pageIndices, pageIndptr, lastPageLen, batchIndices, numTokens, topk, pageSize, cpWorldSize, cpRank)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, slots, topkLength, topkIdx, pageIndices, pageIndptr, lastPageLen, batchIndices, numTokens, topk, pageSize, cpWorldSize, cpRank, kvTokenIndptr?)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -568,6 +568,7 @@ static Napi::Value TopkToSlots(const Napi::CallbackInfo& info) {
     int page_size = info[10].As<Napi::Number>().Int32Value();
     uint32_t cp_world_size = info[11].As<Napi::Number>().Uint32Value();
     uint32_t cp_rank = info[12].As<Napi::Number>().Uint32Value();
+    uintptr_t kv_token_indptr_ptr = info.Length() > 13 ? info[13].As<Napi::Number>().Int64Value() : 0;
     glm_topk_to_slots(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<int32_t*>(slots_ptr),
@@ -577,7 +578,8 @@ static Napi::Value TopkToSlots(const Napi::CallbackInfo& info) {
         reinterpret_cast<const int32_t*>(page_indptr_ptr),
         reinterpret_cast<const int32_t*>(last_page_len_ptr),
         reinterpret_cast<const int32_t*>(batch_indices_ptr),
-        num_tokens, topk, page_size, cp_world_size, cp_rank);
+        num_tokens, topk, page_size, cp_world_size, cp_rank,
+        reinterpret_cast<const int32_t*>(kv_token_indptr_ptr));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("topkToSlots failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -656,25 +658,27 @@ static Napi::Value ScatterScalar(const Napi::CallbackInfo& info) {
 
 static Napi::Value Deinterleave(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 9) {
-        Napi::TypeError::New(env, "Expected (ctx, out, in, world_size, total_len, global_len, kv_token_indptr, batch_size, D)").ThrowAsJavaScriptException();
+    if (info.Length() < 10) {
+        Napi::TypeError::New(env, "Expected (ctx, out, in, world_size, max_total_len, page_indptr, kv_token_indptr, batch_size, page_size, D)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
     uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
     int world_size = info[3].As<Napi::Number>().Int32Value();
-    int total_len = info[4].As<Napi::Number>().Int32Value();
-    int global_len = info[5].As<Napi::Number>().Int32Value();
+    int max_total_len = info[4].As<Napi::Number>().Int32Value();
+    uintptr_t page_indptr_ptr = info[5].As<Napi::Number>().Int64Value();
     uintptr_t kv_token_indptr_ptr = info[6].As<Napi::Number>().Int64Value();
     int batch_size = info[7].As<Napi::Number>().Int32Value();
-    int D = info[8].As<Napi::Number>().Int32Value();
+    int page_size = info[8].As<Napi::Number>().Int32Value();
+    int D = info[9].As<Napi::Number>().Int32Value();
     glm_deinterleave(reinterpret_cast<GlmCtx*>(ctx_ptr),
                      reinterpret_cast<void*>(out_ptr),
                      reinterpret_cast<const void*>(in_ptr),
-                     world_size, total_len, global_len,
+                     world_size, max_total_len,
+                     reinterpret_cast<const int32_t*>(page_indptr_ptr),
                      reinterpret_cast<const int32_t*>(kv_token_indptr_ptr),
-                     batch_size, D);
+                     batch_size, page_size, D);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("deinterleave failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -685,7 +689,7 @@ static Napi::Value Deinterleave(const Napi::CallbackInfo& info) {
 static Napi::Value GatherPages(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 10) {
-        Napi::TypeError::New(env, "Expected (ctx, out, in, page_indices, page_indptr, last_page_len, num_pages, batch_size, page_size, D)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, out, in, page_indices, page_indptr, last_page_len, max_pages, batch_size, page_size, D)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -694,7 +698,7 @@ static Napi::Value GatherPages(const Napi::CallbackInfo& info) {
     uintptr_t indices_ptr = info[3].As<Napi::Number>().Int64Value();
     uintptr_t page_indptr_ptr = info[4].As<Napi::Number>().Int64Value();
     uintptr_t last_page_len_ptr = info[5].As<Napi::Number>().Int64Value();
-    int num_pages = info[6].As<Napi::Number>().Int32Value();
+    int max_pages = info[6].As<Napi::Number>().Int32Value();
     int batch_size = info[7].As<Napi::Number>().Int32Value();
     int page_size = info[8].As<Napi::Number>().Int32Value();
     int D = info[9].As<Napi::Number>().Int32Value();
@@ -704,7 +708,7 @@ static Napi::Value GatherPages(const Napi::CallbackInfo& info) {
                      reinterpret_cast<const int32_t*>(indices_ptr),
                      reinterpret_cast<const int32_t*>(page_indptr_ptr),
                      reinterpret_cast<const int32_t*>(last_page_len_ptr),
-                     num_pages, batch_size, page_size, D);
+                     max_pages, batch_size, page_size, D);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("gatherPages failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

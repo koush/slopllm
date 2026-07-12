@@ -125,7 +125,8 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const 
                        const int32_t* page_indices, const int32_t* page_indptr,
                        const int32_t* last_page_len, const int32_t* batch_indices,
                        int num_tokens, int topk, int page_size,
-                       uint32_t cp_world_size, uint32_t cp_rank);
+                       uint32_t cp_world_size, uint32_t cp_rank,
+                       const int32_t* kv_token_indptr);
 
 void glm_fill(GlmCtx* ctx, void* out, float value, int n);
 
@@ -136,14 +137,16 @@ void glm_scatter_scalar(GlmCtx* ctx, void* out, const int* indices, float value,
                         int k, int out_dim, int batch);
 
 void glm_deinterleave(GlmCtx* ctx, void* out, const void* in,
-                      int world_size, int total_len, int global_len,
-                      const int32_t* kv_token_indptr, int batch_size, int D);
+                      int world_size, int max_total_len,
+                      const int32_t* page_indptr,
+                      const int32_t* kv_token_indptr,
+                      int batch_size, int page_size, int D);
 
 void glm_gather_pages(GlmCtx* ctx, void* out, const void* in,
                       const int32_t* page_indices,
                       const int32_t* page_indptr,
                       const int32_t* last_page_len,
-                      int num_pages, int batch_size,
+                      int max_pages, int batch_size,
                       int page_size, int D);
 
 void glm_cat_last_dim(GlmCtx* ctx, void* out, const void* a, const void* b,

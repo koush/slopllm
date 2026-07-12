@@ -1414,20 +1414,22 @@ void glm_scatter_scalar(GlmCtx* ctx, void* out, const int* indices, float value,
 // ---------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(256) deinterleave_kernel(
-    __nv_bfloat16* __restrict__ out,
-    const __nv_bfloat16* __restrict__ in,
+    char* __restrict__ out,
+    const char* __restrict__ in,
     int world_size,
-    int total_len,
-    int global_len,
+    int padded_total_len,
+    const int32_t* __restrict__ page_indptr,
     const int32_t* __restrict__ kv_token_indptr,
     int batch_size,
+    int page_size,
     int D
 ) {
     constexpr int BLOCK_ROWS = 4;
+    const int total_len = kv_token_indptr[batch_size];
+    const int chunk_len = padded_total_len / world_size;
     const int row_start = blockIdx.x * BLOCK_ROWS;
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
-    const int chunk_len = global_len / world_size;
 
     #pragma unroll
     for (int r = 0; r < BLOCK_ROWS; r++) {
@@ -1455,11 +1457,11 @@ __global__ void __launch_bounds__(256) deinterleave_kernel(
 
         const int src_row = rank * chunk_len + src_offset + local_idx;
 
-        const __nv_bfloat16* src = in + (size_t)src_row * D;
-        __nv_bfloat16* dst = out + (size_t)out_row * D;
+        const char* src = in + (size_t)src_row * D;
+        char* dst = out + (size_t)out_row * D;
 
-        if (D % 8 == 0) {
-            constexpr int VEC = 8;
+        if (D % 16 == 0) {
+            constexpr int VEC = 16;
             const int vec_count = D / VEC;
             for (int j = tid; j < vec_count; j += block_size) {
                 *reinterpret_cast<int4*>(dst + j * VEC) =
@@ -1474,16 +1476,19 @@ __global__ void __launch_bounds__(256) deinterleave_kernel(
 }
 
 void glm_deinterleave(GlmCtx* ctx, void* out, const void* in,
-                      int world_size, int total_len, int global_len,
-                      const int32_t* kv_token_indptr, int batch_size, int D) {
+                      int world_size, int max_total_len,
+                      const int32_t* page_indptr,
+                      const int32_t* kv_token_indptr,
+                      int batch_size, int page_size, int D) {
     cudaSetDevice(ctx->device_id);
     constexpr int BLOCK_ROWS = 4;
     constexpr int BLOCK_SIZE = 256;
-    int grid = (total_len + BLOCK_ROWS - 1) / BLOCK_ROWS;
+    int grid = (max_total_len + BLOCK_ROWS - 1) / BLOCK_ROWS;
     deinterleave_kernel<<<grid, BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
-        world_size, total_len, global_len,
-        kv_token_indptr, batch_size, D);
+        (char*)out, (const char*)in,
+        world_size, max_total_len,
+        page_indptr, kv_token_indptr,
+        batch_size, page_size, D);
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,16 +1510,16 @@ void glm_deinterleave(GlmCtx* ctx, void* out, const void* in,
 // ---------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(256) gather_pages_kernel(
-    __nv_bfloat16* __restrict__ out,
-    const __nv_bfloat16* __restrict__ in,
+    char* __restrict__ out,
+    const char* __restrict__ in,
     const int32_t* __restrict__ page_indices,
     const int32_t* __restrict__ page_indptr,
     const int32_t* __restrict__ last_page_len,
-    int num_pages,
     int batch_size,
     int page_size,
     int D
 ) {
+    const int num_pages = page_indptr[batch_size];
     const int gp = blockIdx.x;
     if (gp >= num_pages) return;
     const int tid = threadIdx.x;
@@ -1527,30 +1532,30 @@ __global__ void __launch_bounds__(256) gather_pages_kernel(
     const int local_page = gp - page_indptr[seq];
     const int pages_in_seq = page_indptr[seq + 1] - page_indptr[seq];
     const bool is_last = (local_page == pages_in_seq - 1);
-    const int copy_len = is_last ? last_page_len[seq] : page_size;
+    const int copy_len = is_last ? min(last_page_len[seq], page_size) : page_size;
 
     // Compute output offset: prefix sum of preceding sequences' lengths + local offset
     int out_offset = local_page * page_size;
     for (int s = 0; s < seq; s++) {
         const int ps = page_indptr[s + 1] - page_indptr[s];
-        out_offset += (ps - 1) * page_size + last_page_len[s];
+        out_offset += (ps - 1) * page_size + min(last_page_len[s], page_size);
     }
 
     const int32_t src_page = page_indices[gp];
 
-    const int total_elems = copy_len * D;
-    const __nv_bfloat16* src = in + (size_t)src_page * page_size * D;
-    __nv_bfloat16* dst = out + (size_t)out_offset * D;
+    const int total_bytes = copy_len * D;
+    const char* src = in + (size_t)src_page * page_size * D;
+    char* dst = out + (size_t)out_offset * D;
 
-    if (D % 8 == 0) {
-        constexpr int VEC = 8;
-        const int vec_count = total_elems / VEC;
+    if (D % 16 == 0) {
+        constexpr int VEC = 16;
+        const int vec_count = total_bytes / VEC;
         for (int j = tid; j < vec_count; j += block_size) {
             *reinterpret_cast<int4*>(dst + j * VEC) =
                 *reinterpret_cast<const int4*>(src + j * VEC);
         }
     } else {
-        for (int j = tid; j < total_elems; j += block_size) {
+        for (int j = tid; j < total_bytes; j += block_size) {
             dst[j] = src[j];
         }
     }
@@ -1560,15 +1565,15 @@ void glm_gather_pages(GlmCtx* ctx, void* out, const void* in,
                       const int32_t* page_indices,
                       const int32_t* page_indptr,
                       const int32_t* last_page_len,
-                      int num_pages, int batch_size,
+                      int max_pages, int batch_size,
                       int page_size, int D) {
     cudaSetDevice(ctx->device_id);
     constexpr int BLOCK_SIZE = 256;
-    int grid = num_pages;
+    int grid = max_pages;
     gather_pages_kernel<<<grid, BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
+        (char*)out, (const char*)in,
         page_indices, page_indptr, last_page_len,
-        num_pages, batch_size, page_size, D);
+        batch_size, page_size, D);
 }
 
 // ---------------------------------------------------------------------------
