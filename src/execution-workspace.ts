@@ -1,3 +1,4 @@
+import { CaptureManager } from "./capture-manager";
 import { ChatModel, type ChatCache } from "./chat_model";
 import { DeviceOps, MaskMode } from "./device_ops";
 import { I32 } from "./glm_ops";
@@ -17,6 +18,10 @@ export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 export class ExecutionState {
   input?: Tensor;
   sharedSlots?: UsingHolder<Tensor>;
+  paddedKvLenInvariant = true;
+  paddedQLenInvariant = true;
+  private readonly paddedKvLen: number;
+  private readonly paddedQLen: number;
 
   constructor(
     public readonly batchSize: number, public readonly totalTokens: number, public readonly seqLens: number[],
@@ -29,6 +34,17 @@ export class ExecutionState {
       maskKvLen?: Tensor;
     },
   ) {
+    const totalKvLen = cache.getPagedKV().sequences.reduce((sum, s) => sum + s.allocLen, 0);
+    this.paddedKvLen = ExecutionState.getPaddedKvLen(totalKvLen);
+    this.paddedQLen = ExecutionState.getPaddedQLen(this.totalTokens);
+  }
+
+  private static getPaddedKvLen(totalKvLen: number): number {
+    return Math.max(1024, 1 << Math.ceil(Math.log2(totalKvLen)));
+  }
+
+  private static getPaddedQLen(qLen: number): number {
+    return Math.max(1024, 1 << Math.ceil(Math.log2(qLen)));
   }
 
   get lastIdx(): Tensor {
@@ -132,6 +148,52 @@ export class ExecutionState {
       this.input = this.ws.inputIdsBuf;
       this.input.memcpy(this.ws.inputIdsBufH, this.totalTokens * I32, MemcpyKind.HostToDevice);
     }
+  }
+
+  // Stable identity of a captured graph, known before execution. Padded dims
+  // are NOT included here; they are appended to the effective key only once the
+  // graph has been learned to size its buffers by them (see CaptureManager).
+  private baseKeyParams(providedKeyParams: (string|number)[]): (string|number)[] {
+    return [...(providedKeyParams ?? []), `batchSize:${this.batchSize}`];
+  }
+
+  // Effective capture key: base key + any padded dims this base graph is known
+  // to be variant in. Length-invariant graphs collapse all KV-length buckets to
+  // a single key (capture once, replay always); variant graphs (e.g. the CP
+  // CKV-gather prefill) get a distinct key per bucket.
+  private effectiveKeyParams(captureManager: CaptureManager, providedKeyParams: (string|number)[]): (string|number)[] {
+    const keyParams = this.baseKeyParams(providedKeyParams);
+    const variant = captureManager.getLengthVariant(keyParams.join(","));
+    if (variant.kvLen) keyParams.push(`paddedKvLen:${this.paddedKvLen}`);
+    if (variant.qLen) keyParams.push(`paddedQLen:${this.paddedQLen}`);
+    return keyParams;
+  }
+
+  isCaptured(captureManager: CaptureManager, providedKeyParams: (string|number)[]): boolean {
+    return captureManager.isCaptured(this.effectiveKeyParams(captureManager, providedKeyParams));
+  }
+
+  getGraphVariantPaddedKvLen() {
+    this.paddedKvLenInvariant = false;
+    return this.paddedKvLen;
+  }
+
+  getGraphVariantPaddedQLen() {
+    this.paddedQLenInvariant = false;
+    return this.paddedQLen;
+  }
+
+  capture<T>(captureManager: CaptureManager, fn: (capturing: boolean) => T, providedKeyParams: (string|number)[]): T {
+    const baseKey = this.baseKeyParams(providedKeyParams).join(",");
+    const keyParams = this.effectiveKeyParams(captureManager, providedKeyParams);
+    return captureManager.run(capturing => {
+      const result = fn(capturing);
+      // Learn (monotonically) whether this graph varies by a padded dim, so
+      // subsequent invocations key on it. getGraphVariantPadded*() flips the
+      // corresponding flag false during fn when the graph consumed that dim.
+      captureManager.recordLengthVariant(baseKey, !this.paddedKvLenInvariant, !this.paddedQLenInvariant);
+      return result;
+    }, keyParams);
   }
 }
 

@@ -322,19 +322,22 @@ export function* generateStream(
       }
 
       const tPlan = performance.now();
+      let isPostWarmupToken = false;
       if (true) {
         const state = ws.planDecode(model, 1, cache, !captureManager.disabled);
         state.setInput([[currentToken]]);
         planMs += performance.now() - tPlan;
 
-        if (!captureManager.isCaptured(['decode'])) {
+        const isCaptured = state.isCaptured(captureManager, ['decode']);
+        isPostWarmupToken = captureManager.disabled || isCaptured;
+        if (!isCaptured) {
           warmupSteps++;
         }
         else {
           graphSteps++;
         }
 
-        captureManager.run(() => {
+        state.capture(captureManager, () => {
           ws.positionStep(state, model);
           using hiddenStates = model.forward(state);
           doSample(state.computeLogits(hiddenStates, model));
@@ -345,14 +348,16 @@ export function* generateStream(
         const state = ws.planPrefill(model, 1, [1], cache);
         state.setInput([[currentToken]]);
 
-        if (!captureManager.isCaptured(['decode'])) {
+        const isCaptured = state.isCaptured(captureManager, ['decode']);
+        isPostWarmupToken = captureManager.disabled || isCaptured;
+        if (!isCaptured) {
           warmupSteps++;
         }
         else {
           graphSteps++;
         }
 
-        captureManager.run(() => {
+        state.capture(captureManager, () => {
           using hiddenStates = model.forward(state);
           using tokens = state.computeLogits(hiddenStates, model);
           doSample(tokens);
@@ -375,7 +380,6 @@ export function* generateStream(
       if (eosIds.has(currentToken))
         return;
 
-      const isPostWarmupToken = captureManager.disabled || captureManager.isCaptured(['decode']);
       if (isPostWarmupToken) {
         const now = performance.now();
         if (firstPostWarmupTime === 0) firstPostWarmupTime = now;

@@ -210,7 +210,7 @@ export function mtpTreeDecode(
   // candidates come straight from the seed hidden state. Applies to both the
   // batched-decode and chunked-prefill branches.
   if (topks.length === 1) {
-    warmup ||= !captureManager.isCaptured(['mtp-tree-decode-root', topks[0]]);
+    warmup ||= !captureManager.isCaptured(['mtp-tree-decode-root', topks[0], `batchSize:${batchSize}`]);
     captureManager.run(() => {
       // mtpHiddenStates is already shared_head.norm'd by forwardMtp; use directly
       using initialLogits = mtpHiddenStates.linear(lmHead, batchSize);
@@ -218,7 +218,7 @@ export function mtpTreeDecode(
       using _initialValues = initialTopk.values;
       using initialIndices = initialTopk.indices;
       hostBuf.memcpy2d(0, batchSize * I32 * topks[0], initialIndices, 0, batchSize * I32 * topks[0], batchSize * I32 * topks[0], 1, MemcpyKind.DeviceToHost);
-    }, ['mtp-tree-decode-root', topks[0]]);
+    }, ['mtp-tree-decode-root', topks[0], `batchSize:${batchSize}`]);
     ws.glm.synchronize();
   }
 
@@ -253,8 +253,8 @@ export function mtpTreeDecode(
       state.sharedSlots = sharedSlots;
 
 
-      warmup ||= !captureManager.isCaptured(['mtp-tree-decode', i, topks.length]);
-      chainedMtpHiddenState = captureManager.run(() => {
+      warmup ||= !state.isCaptured(captureManager, ['mtp-tree-decode', i, topks.length]);
+      chainedMtpHiddenState = state.capture(captureManager, () => {
         // prepare initial input
         if (i === 1) {
           // mtpHiddenStates is already shared_head.norm'd by forwardMtp; use directly
@@ -346,8 +346,8 @@ export function mtpTreeDecode(
       state.sharedSlots = sharedSlots;
 
       const prevHs = chainedHs;
-      warmup ||= !captureManager.isCaptured(['mtp-chunk', depth, topks.length]);
-      chainedHs = captureManager.run(() => {
+      warmup ||= !state.isCaptured(captureManager, ['mtp-chunk', depth, topks.length]);
+      chainedHs = state.capture(captureManager, () => {
         // Depth 1: compute initial logits and topk from mtpHiddenStates
         if (depth === 1) {
           // mtpHiddenStates is already shared_head.norm'd; use directly
@@ -428,8 +428,8 @@ export function mtpTreeDecode(
 
   const hiddenStateStaging = ws.ensureAlloc([numVerificationTokens, hiddenDim], "BF16", `mtp-tree-hs-staging-${numVerificationTokens}`, undefined, 0);
 
-  warmup ||= !captureManager.isCaptured(['mtp-verify', numVerificationTokens]);
-  const { kvCacheLayers, indexerKvCacheLayers } = captureManager.run(() => {
+  warmup ||= !targetPrefillState.isCaptured(captureManager, ['mtp-verify', numVerificationTokens]);
+  const { kvCacheLayers, indexerKvCacheLayers } = targetPrefillState.capture(captureManager, () => {
     const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, appendCkvOrig: Tensor, appendKpeOrig: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
     const indexerKvCacheLayers: { appendIdxK: Tensor, appendIdxKOrig: Tensor, cacheIdx: number, indexHeadDim: number }[] = [];
 
@@ -581,8 +581,8 @@ export function mtpTreeDecode(
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
   mtpExtendPrefill.sharedSlots = sharedSlots;
 
-  warmup ||= !captureManager.isCaptured(['mtp-replace', finishCount]);
-  captureManager.run(() => {
+  warmup ||= !mtpExtendPrefill.isCaptured(captureManager, ['mtp-replace', finishCount]);
+  mtpExtendPrefill.capture(captureManager, () => {
     for (const layer of kvCacheLayers) {
       mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
       layer.appendCkvOrig[Symbol.dispose]();
