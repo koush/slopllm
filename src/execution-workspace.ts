@@ -131,6 +131,7 @@ export class ExecutionState {
       this.isDecode, pagedKV.maxPages * pagedKV.pageSize, pagedKV.contextParallel,
       undefined, undefined, this.ws.globalLastPageLen,
       cm?.mask, cm?.indptr, cm?.maskKvLen,
+      0, pagedKV.contextParallel && !this.isDecode ? this.ws.kvTokenIndptrD : undefined,
     );
   }
 
@@ -149,6 +150,7 @@ export class ExecutionState {
         this, q, pagedKV.ckvData[cacheIdx], indices,
         nHeads, kvLoraRank, topk,
         smScale, strideKvBlock, this.ws.sparseTopkLength,
+        this.ws.indptrD, this.ws.lastPageLen, this.ws.kvTokenIndptrD,
       );
     }
   }

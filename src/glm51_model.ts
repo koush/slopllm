@@ -486,8 +486,6 @@ export class Glm51Model extends ChatModel {
 
           kvcacheIndex?.streamWaitEvent();
 
-          // Indexer forward: fused score+topk kernel → slots
-          // 'full' layer: compute score+topk → slots
           const slots = state.indexerTopkSlots(
             idxQ, layerIdx, idxWeights,
             Math.pow(idxHeadDim, -0.5), idxTopk,
@@ -527,30 +525,14 @@ export class Glm51Model extends ChatModel {
     {
       let attnOut: Tensor;
       let lseBuf: Tensor;
-      let vS = S;
-      let vB = B;
 
       if (sharedSlots.value) {
         // Sparse MLA path: SM120 kernel on packed FP8 KV cache
         using qConcat = qAbsorbedR.cat([qPeR], 2); // [BS, nHeads, kvLoraRank + qkRopeDim]
-        let sparseResult: { o: Tensor, lse: Tensor };
-
-        if (state.isDecode) {
-          sparseResult = state.sparseMla(
-            qConcat, layerIdx, sharedSlots.value,
-            nHeads, kvLoraRank, cfg.indexTopk, cfg.scaling,
-          );
-        } else {
-          sparseResult = state.sparseMla(
-            qConcat, layerIdx, sharedSlots.value,
-            nHeads, kvLoraRank, cfg.indexTopk, cfg.scaling,
-          );
-          // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
-          // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
-          // seqLen=1, batch=BS — which matches token-major layout.
-          vS = 1;
-          vB = BS;
-        }
+        const sparseResult = state.sparseMla(
+          qConcat, layerIdx, sharedSlots.value,
+          nHeads, kvLoraRank, cfg.indexTopk, cfg.scaling,
+        );
 
         attnOut = sparseResult.o;
         lseBuf = sparseResult.lse;
@@ -567,7 +549,7 @@ export class Glm51Model extends ChatModel {
       using _lseBuf = lseBuf;
 
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
-      using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, vS, vB, lseBuf);
+      using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, S, B, lseBuf, undefined, undefined, undefined, !!sharedSlots.value);
       oProjBuf.replace(vExpanded.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!, BS));
     }
 

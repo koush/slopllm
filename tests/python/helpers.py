@@ -214,8 +214,9 @@ class GlmOps:
         self.lib.glm_deinterleave.restype = None
         self.lib.glm_deinterleave.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_void_p, ctypes.c_int, ctypes.c_int
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
         self.lib.glm_gather_pages.restype = None
@@ -1165,15 +1166,21 @@ class GlmOps:
         )
 
     def deinterleave(self, output, input, world_size, total_len, global_len, kv_token_indptr, batch_size, D):
+        page_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=input.device)
+        page_indptr[batch_size] = 1
+        page_size = 1
+        elem_bytes = input.element_size()
         self.lib.glm_deinterleave(
             self.ctx,
             self._ptr(output),
             self._ptr(input),
-            world_size, total_len, global_len,
-            self._ptr(kv_token_indptr), batch_size, D
+            world_size, global_len,
+            self._ptr(page_indptr), self._ptr(kv_token_indptr),
+            batch_size, page_size, D * elem_bytes
         )
 
-    def gather_pages(self, output, input, page_indices, page_indptr, last_page_len, num_pages, batch_size, page_size, D):
+    def gather_pages(self, output, input, page_indices, page_indptr, last_page_len, max_pages, batch_size, page_size, D):
+        elem_bytes = input.element_size()
         self.lib.glm_gather_pages(
             self.ctx,
             self._ptr(output),
@@ -1181,7 +1188,7 @@ class GlmOps:
             self._ptr(page_indices),
             self._ptr(page_indptr),
             self._ptr(last_page_len),
-            num_pages, batch_size, page_size, D
+            max_pages, batch_size, page_size, D * elem_bytes
         )
 
     def indexer_score(self, output, q, k_data, weights, page_indices, page_indptr,
