@@ -75,13 +75,24 @@ export class CaptureManager implements Disposable {
             }
         }
 
-        const result = fn(!!capturing);
-        if (capturing)
-            this.captured.get(capturing!)!.result = result;
+        let result: T;
+        try {
+            result = fn(!!capturing);
+        }
+        catch (e) {
+            console.warn("Error during capture run:", e);
+
+            if (capturing) {
+                const graph = this.ops.graphEndCapture();
+                this.ops.graphDestroy(graph);
+            }
+            throw e;
+        }
 
         if (capturing) {
-            const graph = this.ops.graphEndCapture();
             const captured = this.captured.get(capturing)!;
+            captured.result = result;
+            const graph = this.ops.graphEndCapture();
             captured.graphExec = this.ops.graphInstantiate(graph);
             this.ops.graphDestroy(graph);
             this.ops.graphLaunch(captured.graphExec);
