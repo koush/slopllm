@@ -956,7 +956,7 @@ export class GlmOps implements DeviceOps {
   }
 
   gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, pageSize: number, D: number, paddedKvLen: number, _kvTokenIndptrD: Tensor, _contextParallel: boolean): Tensor {
-    const out = srcData.workspace.alloc([paddedKvLen, D], srcData.type);
+    const out = pageIndptrD.workspace.alloc([paddedKvLen, D], srcData.type);
     const elemBytes = srcData.type === "U8" ? 1 : 2;
     const maxPages = srcData.shape[0];
     getNativeAddon().gatherPages(this.ctx, out.data, srcData.data, pageIndices.data, pageIndptrD.data, lastPageLen.data, maxPages, batchSize, pageSize, D * elemBytes);
@@ -996,7 +996,8 @@ export class GlmOps implements DeviceOps {
     using topkIdx = useDirect
       ? this.indexerScoreTopkV2(idxQ, kData, weights, pageIndices, indptr, scoreLastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart)
       : this.indexerScoreTopkPrefill(idxQ, kData, weights, pageIndices, indptr, scoreLastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, customMask, maskIndptr, maskKvLen, qGlobalStart);
-    const slots = idxQ.workspace.alloc([totalQ, topk], "I32");
+    using fullSlots = idxQ.workspace.alloc([maxKv, topk], "I32")
+    const slots = fullSlots.narrow(0, totalQ);
     getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkLength), ptr(topkIdx), ptr(pageIndices), ptr(indptr), ptr(lastPageLen), ptr(batchIndices), totalQ, topk, pageSize, cpWorldSize, cpRank, kvTokenIndptrD ? ptr(kvTokenIndptrD) : 0);
     return slots;
   }
