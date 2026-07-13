@@ -2939,6 +2939,7 @@ export class ParallelOps implements DeviceOps {
   }
 
   gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, pageSize: number, D: number, paddedKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor {
+    const workspace = pageIndptrD.workspace;
     const pSrc = this.cast(srcData);
     const pIndices = this.cast(pageIndices);
     const pIndptr = this.cast(pageIndptrD);
@@ -2950,7 +2951,7 @@ export class ParallelOps implements DeviceOps {
       for (let i = 0; i < this.worldSize; i++) {
         shards.push(this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, pageSize, D, paddedKvLen, pKvIndptr.shards[i], false));
       }
-      return this.wrapShards(srcData.workspace, shards, [paddedKvLen, D], pSrc.type, pSrc.parallelism);
+      return this.wrapShards(workspace, shards, [paddedKvLen, D], pSrc.type, pSrc.parallelism);
     }
 
     // CP: each GPU has every Nth token within each page (Row-parallel, sharded on pageSize dim)
@@ -2965,11 +2966,11 @@ export class ParallelOps implements DeviceOps {
     }
 
     // Step 2: NCCL all-gather (Column → Replicated)
-    using localPar = this.wrapShards(pSrc.workspace, localBufs, [paddedKvLen, D], pSrc.type, TensorParallelism.Column);
-    using gathered = localPar.allGather(pSrc.workspace);
+    using localPar = this.wrapShards(workspace, localBufs, [paddedKvLen, D], pSrc.type, TensorParallelism.Column);
+    using gathered = localPar.allGather(workspace);
 
     // Step 3: Deinterleave — reorder interleaved tokens to sequential
-    const out = srcData.workspace.alloc([paddedKvLen, D], pSrc.type) as ParallelTensor;
+    const out = workspace.alloc([paddedKvLen, D], pSrc.type) as ParallelTensor;
     const pOut = this.cast(out);
     const elemBytes = pSrc.type === "U8" ? 1 : 2;
 
