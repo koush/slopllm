@@ -80,13 +80,13 @@ function runMlaPrefill(
   const numPages = Math.ceil(kvSeqLen / pageSize);
   const lastPageLen = kvSeqLen % pageSize || pageSize;
 
-  const qNope = allocBf16(ws, [1, totalQTokens, nHeads * headDimCkv]);
-  const qPe = allocBf16(ws, [1, totalQTokens, nHeads * headDimKpe]);
+  const qNope = allocBf16(ws, [totalQTokens, nHeads, headDimCkv]);
+  const qPe = allocBf16(ws, [totalQTokens, nHeads, headDimKpe]);
   qNope.h2d(f32ToBf16Bytes(qNopeF32));
   qPe.h2d(f32ToBf16Bytes(qPeF32));
 
-  const ckv = allocBf16(ws, [ckvF32.length]);
-  const kpe = allocBf16(ws, [kpeF32.length]);
+  const ckv = allocBf16(ws, [maxPages, pageSize, headDimCkv]);
+  const kpe = allocBf16(ws, [maxPages, pageSize, headDimKpe]);
   ckv.h2d(f32ToBf16Bytes(ckvF32));
   kpe.h2d(f32ToBf16Bytes(kpeF32));
 
@@ -144,11 +144,7 @@ function runMlaPrefill(
     execState,
     qNope, qPe, ckv, kpe, indices,
     floatWs, intWs, planInfo,
-    nHeads, pageSize, 1, SM_SCALE,
-    qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH,
-    ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
-    oStrideN, oStrideH,
-    headDimCkv, headDimKpe,
+    SM_SCALE, 1,
     cpWorldSize, cpRank,
   );
   glm.synchronize();
@@ -589,8 +585,8 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
     }
 
     // Allocate Q as Replicated (all shards need all Q heads for CP)
-    const pQNope = ws.alloc([1, totalTokens, N_HEADS * HEAD_DIM_CKV], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const pQPe = ws.alloc([1, totalTokens, N_HEADS * HEAD_DIM_KPE], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const pQNope = ws.alloc([totalTokens, N_HEADS, HEAD_DIM_CKV], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const pQPe = ws.alloc([totalTokens, N_HEADS, HEAD_DIM_KPE], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     pQNope.h2d(f32ToBf16Bytes(qNopeF32));
     pQPe.h2d(f32ToBf16Bytes(qPeF32));
 
@@ -634,11 +630,7 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
       execState,
       pQNope, pQPe, ckvData, kpeData, pagedKV.indices,
       floatWs, intWs, planInfo,
-      N_HEADS, pageSize, 1, SM_SCALE,
-      N_HEADS * HEAD_DIM_CKV, HEAD_DIM_CKV, N_HEADS * HEAD_DIM_KPE, HEAD_DIM_KPE,
-      ckvStridePage, HEAD_DIM_CKV, kpeStridePage, HEAD_DIM_KPE,
-      HEAD_DIM_CKV, totalTokens * HEAD_DIM_CKV,
-      HEAD_DIM_CKV, HEAD_DIM_KPE,
+      SM_SCALE, 1,
     );
     po.synchronize();
 

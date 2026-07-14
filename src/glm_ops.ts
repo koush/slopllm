@@ -957,8 +957,9 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().kvCacheWrite(this.ctx, ptr(srcK), ptr(srcV), ptr(dstK), ptr(dstV), ptr(slotMapping), batchSize, nKv, hd, pageSize, srcKTokenStride, srcKHeadStride, srcVTokenStride, srcVHeadStride);
   }
 
-  gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, D: number, paddedKvLen: number, _kvTokenIndptrD: Tensor, _contextParallel: boolean): Tensor {
+  gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, paddedKvLen: number, _kvTokenIndptrD: Tensor, _contextParallel: boolean): Tensor {
     const pageSize = srcData.shape[1];
+    const D = srcData.shape[2];
     const out = pageIndptrD.workspace.alloc([paddedKvLen / pageSize, pageSize, D], srcData.type);
     const elemBytes = srcData.type === "U8" ? 1 : 2;
     const maxPages = srcData.shape[0];
@@ -1100,8 +1101,22 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().mlaPrefillPlan(this.ctx, ptr(floatWs), floatWsSize, ptr(intWs), ptr(pinnedIntWs), intWsSize, ptr(planInfo), ptr(qoIndptrH), ptr(kvIndptrH), ptr(kvLenH), batchSize, numHeads, headDimO, causal, cpWorldSize, cpRank);
   }
 
-  mlaPrefillRun(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numHeads: number, pageSize: number, maskMode: MaskMode, smScale: number, qNopeStrideN: number, qNopeStrideH: number, qPeStrideN: number, qPeStrideH: number, ckvStridePage: number, ckvStrideN: number, kpeStridePage: number, kpeStrideN: number, oStrideN: number, oStrideH: number, headDimCkv: number, headDimKpe: number, cpWorldSize: number = 0, cpRank: number = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
-    const totalTokens = oStrideH / headDimCkv;
+  mlaPrefillRun(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, smScale: number, maskMode: MaskMode, cpWorldSize: number = 0, cpRank: number = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
+    const numHeads = qNope.shape[1];
+    const headDimCkv = ckvData.shape[2];
+    const headDimKpe = kpeData.shape[2];
+    const pageSize = ckvData.shape[1];
+    const ckvStridePage = pageSize * headDimCkv;
+    const ckvStrideN = headDimCkv;
+    const kpeStridePage = kpeData.shape[1] * headDimKpe;
+    const kpeStrideN = headDimKpe;
+    const qNopeStrideN = qNope.shape[1] * qNope.shape[2];
+    const qNopeStrideH = qNope.shape[2];
+    const qPeStrideN = qPe.shape[1] * qPe.shape[2];
+    const qPeStrideH = qPe.shape[2];
+    const totalTokens = state.totalTokens;
+    const oStrideN = headDimCkv;
+    const oStrideH = totalTokens * headDimCkv;
     const o = qNope.workspace.alloc([1, numHeads, totalTokens, headDimCkv], qNope.type);
     const lse = qNope.workspace.alloc([totalTokens, numHeads], "F32");
     getNativeAddon().mlaPrefillRun(this.ctx, ptr(qNope), ptr(qPe), ptr(ckvData), ptr(kpeData), ptr(kvIndices), ptr(o), ptr(floatWs), ptr(intWs), ptr(planInfo), numHeads, pageSize, maskMode, smScale, qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH, ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, ptr(lse), cpWorldSize, cpRank, customMask ? ptr(customMask) : 0, maskIndptr ? ptr(maskIndptr) : 0, maskKvLen ? ptr(maskKvLen) : 0);
@@ -1112,7 +1127,11 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().mlaDecodePlan(this.ctx, ptr(floatWs), floatWsSize, ptr(intWs), ptr(pinnedIntWs), intWsSize, ptr(planInfo), ptr(indptrH), batchSize, numQoHeads, pageSize, enableCudaGraph, headDimCkv, headDimKpe);
   }
 
-  mlaDecodeRun(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numQoHeads: number, pageSize: number, smScale: number, headDimCkv: number, headDimKpe: number): { o: Tensor, lse: Tensor } {
+  mlaDecodeRun(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, smScale: number): { o: Tensor, lse: Tensor } {
+    const numQoHeads = qNope.shape[1];
+    const headDimCkv = ckvData.shape[2];
+    const headDimKpe = kpeData.shape[2];
+    const pageSize = ckvData.shape[1];
     const o = qNope.workspace.alloc([state.batchSize, numQoHeads, 1, headDimCkv], qNope.type);
     const lse = qNope.workspace.alloc([state.batchSize, numQoHeads], "F32");
     getNativeAddon().mlaDecodeRun(this.ctx, ptr(qNope), ptr(qPe), ptr(ckvData), ptr(kpeData), ptr(indices), ptr(indptrD), ptr(lastPageLen), ptr(o), ptr(floatWs), ptr(intWs), ptr(planInfo), state.batchSize, numQoHeads, pageSize, smScale, headDimCkv, headDimKpe, ptr(lse));
@@ -1142,12 +1161,15 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().gdnPrefill(this.ctx, output.data, recurrentState.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, cuSeqlens.data, state.totalTokens, numHeads, dK, dV, state.batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
-  sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
     const numTokens = state.totalTokens;
+    const numHeads = qAbsorbed.shape[1];
+    const headDim = qAbsorbed.shape[2];
     const elemBytes = SafeTensorFile.dtypeBytes(kvCache.type);
     const pageBlockSize = kvCache.shape[1];
     const effectiveStrideKvBlock = pageBlockSize * kvCache.shape[2] * elemBytes;
     if (pageBlockSize !== 64) throw new Error(`sparseMlaPrefill: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize} ${kvCache.shape}`);
+    using q = qAbsorbed.cat([qPe], 2);
     const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
     const lse = q.workspace.alloc([numTokens, numHeads], "F32");
     // Small query counts (e.g. MTP tree verify) starve the prefill kernel: its
@@ -1166,12 +1188,15 @@ export class GlmOps implements DeviceOps {
     return { o, lse };
   }
 
-  sparseMlaDecode(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
     const numTokens = state.batchSize;
+    const numHeads = qAbsorbed.shape[1];
+    const headDim = qAbsorbed.shape[2];
     const elemBytes = SafeTensorFile.dtypeBytes(kvCache.type);
     const pageBlockSize = kvCache.shape[1];
     const effectiveStrideKvBlock = pageBlockSize * kvCache.shape[2] * elemBytes;
     if (pageBlockSize !== 64) throw new Error(`sparseMlaDecode: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize}`);
+    using q = qAbsorbed.cat([qPe], 2);
     const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
     const lse = q.workspace.alloc([numTokens, numHeads], "F32");
     using midOut = q.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");

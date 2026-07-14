@@ -134,19 +134,27 @@ export class ExecutionState {
     );
   }
 
-  sparseMla(q: Tensor, cacheIdx: number, indices: Tensor, nHeads: number, kvLoraRank: number, topk: number, smScale: number): { o: Tensor, lse: Tensor } {
+  denseMla(qNope: Tensor, qPe: Tensor, cacheIdx: number, smScale: number): { o: Tensor, lse: Tensor } {
+    if (this.isDecode) {
+      return this.ws.mlaDecodePaged(this, qNope, qPe, cacheIdx, smScale);
+    } else {
+      return this.ws.mlaPrefillPaged(this, qNope, qPe, cacheIdx, smScale, !this.customMask ? MaskMode.Causal : this.customMask.mode, this.customMask?.mask, this.customMask?.indptr, this.customMask?.maskKvLen);
+    }
+  }
+
+  sparseMla(qAbsorbed: Tensor, qPe: Tensor, cacheIdx: number, indices: Tensor, topk: number, smScale: number): { o: Tensor, lse: Tensor } {
     const pagedKV = this.cache.getPagedKV();
     if (this.isDecode) {
       const numSplits = Math.ceil(topk / 64);
       return this.ws.glm.sparseMlaDecode(
-        this, q, pagedKV.ckvData[cacheIdx], indices,
-        nHeads, kvLoraRank, topk, numSplits,
+        this, qAbsorbed, qPe, pagedKV.ckvData[cacheIdx], indices,
+        topk, numSplits,
         smScale, 0, this.ws.sparseTopkLength,
       );
     } else {
       return this.ws.glm.sparseMlaPrefill(
-        this, q, pagedKV.ckvData[cacheIdx], indices,
-        nHeads, kvLoraRank, topk,
+        this, qAbsorbed, qPe, pagedKV.ckvData[cacheIdx], indices,
+        topk,
         smScale, this.ws.sparseTopkLength,
         this.ws.indptrD, this.ws.lastPageLen, this.ws.kvTokenIndptrD,
       );
@@ -442,48 +450,27 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  mlaPrefillPaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, cacheIdx: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
+  mlaPrefillPaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, cacheIdx: number, smScale: number, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
     const pagedKV = state.cache.getPagedKV();
-    const headDimCkv = kvLoraRank;
-    const headDimKpe = qkRopeDim;
-    const pageSize = pagedKV.pageSize;
-    const totalTokens = state.totalTokens;
-    const qNopeStrideN = nHeads * headDimCkv;
-    const qNopeStrideH = headDimCkv;
-    const qPeStrideN = nHeads * headDimKpe;
-    const qPeStrideH = headDimKpe;
-    const ckvStridePage = pageSize * headDimCkv;
-    const ckvStrideN = headDimCkv;
-    const kpeStridePage = pageSize * headDimKpe;
-    const kpeStrideN = headDimKpe;
-    const oStrideN = headDimCkv;
-    const oStrideH = totalTokens * headDimCkv;
     return this.glm.mlaPrefillRun(
       state, qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       pagedKV.indices,
       this.floatWs, this.intWs,
       this.mlaPrefillPlanInfo,
-      nHeads, pageSize, maskMode, smScale,
-      qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH,
-      ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
-      oStrideN, oStrideH,
-      headDimCkv, headDimKpe,
+      smScale, maskMode,
       undefined, undefined,
       customMask, maskIndptr, maskKvLen
     );
   }
 
-  mlaDecodePaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, cacheIdx: number, nHeads: number, kvLoraRank: number, qkRopeDim: number, smScale: number): { o: Tensor, lse: Tensor } {
+  mlaDecodePaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, cacheIdx: number, smScale: number): { o: Tensor, lse: Tensor } {
     const pagedKV = state.cache.getPagedKV();
-    const headDimCkv = kvLoraRank;
-    const headDimKpe = qkRopeDim;
     return this.glm.mlaDecodeRun(
       state, qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       pagedKV.indices, this.indptrD, this.lastPageLen,
       this.floatWs, this.intWs,
       this.mlaDecodePlanInfo,
-      nHeads, pagedKV.pageSize, smScale,
-      headDimCkv, headDimKpe,
+      smScale,
     );
   }
 

@@ -146,13 +146,13 @@ function runMlaPrefillParallel(
   const numPages = Math.ceil(kvSeqLen / pageSize);
   const lastPageLen = kvSeqLen % pageSize || pageSize;
 
-  const qNope = allocBf16(ws, [1, totalQTokens, nHeads * headDimCkv], TensorParallelism.Replicated) as ParallelTensor;
-  const qPe = allocBf16(ws, [1, totalQTokens, nHeads * headDimKpe], TensorParallelism.Replicated) as ParallelTensor;
+  const qNope = allocBf16(ws, [totalQTokens, nHeads, headDimCkv], TensorParallelism.Replicated) as ParallelTensor;
+  const qPe = allocBf16(ws, [totalQTokens, nHeads, headDimKpe], TensorParallelism.Replicated) as ParallelTensor;
   qNope.h2d(f32ToBf16Bytes(qNopeF32));
   qPe.h2d(f32ToBf16Bytes(qPeF32));
 
-  const ckv = allocBf16(ws, [ckvF32.length], TensorParallelism.Replicated);
-  const kpe = allocBf16(ws, [kpeF32.length], TensorParallelism.Replicated);
+  const ckv = allocBf16(ws, [maxPages, pageSize, headDimCkv], TensorParallelism.Replicated);
+  const kpe = allocBf16(ws, [maxPages, pageSize, headDimKpe], TensorParallelism.Replicated);
   ckv.h2d(f32ToBf16Bytes(ckvF32));
   kpe.h2d(f32ToBf16Bytes(kpeF32));
 
@@ -220,11 +220,7 @@ function runMlaPrefillParallel(
     execState,
     qNope, qPe, ckv, kpe, indices,
     floatWs, intWs, planInfo,
-    nHeads, pageSize, maskMode, SM_SCALE,
-    qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH,
-    ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
-    oStrideN, oStrideH,
-    headDimCkv, headDimKpe,
+    SM_SCALE, maskMode,
     undefined, undefined,
     customMask, maskIndptr,
   );
@@ -257,13 +253,13 @@ function runMlaPrefillRef(
   const numPages = Math.ceil(kvSeqLen / pageSize);
   const lastPageLen = kvSeqLen % pageSize || pageSize;
 
-  const qNope = ws.alloc([1, totalQTokens, nHeads * headDimCkv], "BF16");
-  const qPe = ws.alloc([1, totalQTokens, nHeads * headDimKpe], "BF16");
+  const qNope = ws.alloc([totalQTokens, nHeads, headDimCkv], "BF16");
+  const qPe = ws.alloc([totalQTokens, nHeads, headDimKpe], "BF16");
   qNope.h2d(f32ToBf16Bytes(qNopeF32));
   qPe.h2d(f32ToBf16Bytes(qPeF32));
 
-  const ckv = ws.alloc([ckvF32.length], "BF16");
-  const kpe = ws.alloc([kpeF32.length], "BF16");
+  const ckv = ws.alloc([maxPages, pageSize, headDimCkv], "BF16");
+  const kpe = ws.alloc([maxPages, pageSize, headDimKpe], "BF16");
   ckv.h2d(f32ToBf16Bytes(ckvF32));
   kpe.h2d(f32ToBf16Bytes(kpeF32));
 
@@ -331,11 +327,7 @@ function runMlaPrefillRef(
     execState,
     qNope, qPe, ckv, kpe, indices,
     floatWs, intWs, planInfo,
-    nHeads, pageSize, maskMode, SM_SCALE,
-    qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH,
-    ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN,
-    oStrideN, oStrideH,
-    headDimCkv, headDimKpe,
+    SM_SCALE, maskMode,
     0, 0,
     customMask, maskIndptr,
   );

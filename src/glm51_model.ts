@@ -532,32 +532,20 @@ export class Glm51Model extends ChatModel {
 
       if (sharedSlots.value) {
         // Sparse MLA path: SM120 kernel on packed FP8 KV cache
-        using qConcat = qAbsorbedR.cat([qPeR], 2); // [BS, nHeads, kvLoraRank + qkRopeDim]
-        let sparseResult: { o: Tensor, lse: Tensor };
-
-        if (state.isDecode) {
-          sparseResult = state.sparseMla(
-            qConcat, layerIdx, sharedSlots.value,
-            nHeads, kvLoraRank, cfg.indexTopk, cfg.scaling,
-          );
-        } else {
-          sparseResult = state.sparseMla(
-            qConcat, layerIdx, sharedSlots.value,
-            nHeads, kvLoraRank, cfg.indexTopk, cfg.scaling,
-          );
-          // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
-          // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
-          // seqLen=1, batch=BS — which matches token-major layout.
-          tokenMajor = true;
-        }
+        // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
+        // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
+        // seqLen=1, batch=BS — which matches token-major layout.
+        const sparseResult = state.sparseMla(
+          qAbsorbedR, qPeR, layerIdx, sharedSlots.value,
+          cfg.indexTopk, cfg.scaling,
+        );
+        tokenMajor = !state.isDecode;
 
         attnOut = sparseResult.o;
         lseBuf = sparseResult.lse;
       } else {
         // Dense MLA path (FlashInfer plan/run)
-        const mlaResult = state.isDecode
-          ? ws.mlaDecodePaged(state, qAbsorbedR, qPeR, layerIdx, nHeads, kvLoraRank, qkRopeDim, cfg.scaling)
-          : ws.mlaPrefillPaged(state, qAbsorbedR, qPeR, layerIdx, nHeads, kvLoraRank, qkRopeDim, cfg.scaling, !state.customMask ? MaskMode.Causal : state.customMask.mode, state.customMask?.mask, state.customMask?.indptr, state.customMask?.maskKvLen);
+        const mlaResult = state.denseMla(qAbsorbedR, qPeR, layerIdx, cfg.scaling);
         attnOut = mlaResult.o;
         lseBuf = mlaResult.lse;
       }
