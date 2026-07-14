@@ -873,23 +873,43 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
 
         float alpha = 1.0f, beta = 0.0f;
 
-        // Use cublasGemmEx per-head loop instead of cublasGemmStridedBatchedEx.
-        // The strided batched API causes illegal memory access on SM120 with
-        // the decode layout (seq_len=1, ldb=attn_n_heads*Lkv).
-        for (int h = 0; h < n_heads; h++) {
-            const void* A_h = (const char*)A_base + (long long)h * strideA * sizeof(__nv_bfloat16);
-            const void* B_h = (const char*)B_base + (long long)h * strideB * sizeof(__nv_bfloat16);
-            void* C_h = (char*)result + (long long)h * strideC * sizeof(__nv_bfloat16);
-            cublasGemmEx(CUBLAS(ctx),
+        if (true) {
+            // this works for dense MLA but not for sparse MLA path?
+            cublasGemmStridedBatchedEx(CUBLAS(ctx),
                 CUBLAS_OP_N, CUBLAS_OP_N,
-                V, BS, Lkv,
+                V,          // m
+                BS,         // n
+                Lkv,        // k
                 &alpha,
-                A_h, CUDA_R_16BF, lda,
-                B_h, CUDA_R_16BF, ldb,
+                A_base, CUDA_R_16BF, lda, strideA,
+                B_base, CUDA_R_16BF, ldb, strideB,
                 &beta,
-                C_h, CUDA_R_16BF, ldc,
+                result, CUDA_R_16BF, ldc, strideC,
+                n_heads,    // batchCount
                 CUDA_R_32F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+        else {
+            // NOTE: this no longer seems true and the issue may have been another bug in the code being reflected here?
+
+            // Use cublasGemmEx per-head loop instead of cublasGemmStridedBatchedEx.
+            // The strided batched API causes illegal memory access on SM120 with
+            // the decode layout (seq_len=1, ldb=attn_n_heads*Lkv).
+            for (int h = 0; h < n_heads; h++) {
+                const void* A_h = (const char*)A_base + (long long)h * strideA * sizeof(__nv_bfloat16);
+                const void* B_h = (const char*)B_base + (long long)h * strideB * sizeof(__nv_bfloat16);
+                void* C_h = (char*)result + (long long)h * strideC * sizeof(__nv_bfloat16);
+                cublasGemmEx(CUBLAS(ctx),
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    V, BS, Lkv,
+                    &alpha,
+                    A_h, CUDA_R_16BF, lda,
+                    B_h, CUDA_R_16BF, ldb,
+                    &beta,
+                    C_h, CUDA_R_16BF, ldc,
+                    CUDA_R_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            }
         }
         return;
     }
