@@ -263,6 +263,7 @@ export class MetaTensor extends Tensor {
 }
 
 export class MetaOps implements DeviceOps {
+    readonly worldSize = 1;
     totalAllocs = 0;
     totalBytes = 0;
 
@@ -366,7 +367,7 @@ export class MetaOps implements DeviceOps {
         return undefined as never;
     }
 
-    gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, pageSize: number, D: number, paddedKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor {
+    gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, D: number, paddedKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor {
         return undefined as never;
     }
 

@@ -439,7 +439,7 @@ int glm_p2p_enable_peer_access(GlmCtx* ctx, int peer_device);
 // Create a P2P instance on this device (metadata only, no data buffer).
 // Call glm_p2p_set_peers and glm_p2p_set_max_bytes before use.
 GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank,
-                                         int world_size);
+                                         int world_size, const int* device_ids);
 
 // Free instance state.
 void glm_p2p_destroy_instance(GlmP2PInstance* inst);

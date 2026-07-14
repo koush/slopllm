@@ -4007,14 +4007,19 @@ static Napi::Value P2PEnablePeerAccess(const Napi::CallbackInfo& info) {
 static Napi::Value P2PCreateInstance(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 3) {
-        Napi::TypeError::New(env, "Expected (ctx, myRank, worldSize)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, myRank, deviceIds[])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     int my_rank = info[1].As<Napi::Number>().Int32Value();
-    int world_size = info[2].As<Napi::Number>().Int32Value();
+    Napi::Array devArr = info[2].As<Napi::Array>();
+    int world_size = devArr.Length();
+    std::vector<int> device_ids(world_size);
+    for (int i = 0; i < world_size; ++i) {
+        device_ids[i] = devArr.Get(i).As<Napi::Number>().Int32Value();
+    }
     GlmP2PInstance* inst = glm_p2p_create_instance(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                                                    my_rank, world_size);
+                                                    my_rank, world_size, device_ids.data());
     return Napi::Number::New(env, reinterpret_cast<uintptr_t>(inst));
 }
 

@@ -167,7 +167,7 @@ interface NativeAddon {
   ncclRecv(comm: number, ctx: number, recvbuff: number, count: number, datatype: number, peer: number): void;
   ncclReduceScatter(comm: number, ctx: number, sendbuff: number, recvbuff: number, recvcount: number, datatype: number, op: number): void;
   p2pEnablePeerAccess(ctx: number, peerDevice: number): number;
-  p2pCreateInstance(ctx: number, myRank: number, worldSize: number): number;
+  p2pCreateInstance(ctx: number, myRank: number, deviceIds: number[]): number;
   p2pDestroyInstance(instance: number): void;
   p2pGetFlagPtr(instance: number): number;
   p2pSetPeers(ctx: number, instance: number, flagPtrs: number[]): void;
@@ -827,6 +827,7 @@ export class GlmTensor extends Tensor {
 }
 
 export class GlmOps implements DeviceOps {
+  readonly worldSize = 1;
   ctx: number;
   device: number;
   allocator: Allocator;
@@ -955,8 +956,9 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().kvCacheWrite(this.ctx, ptr(srcK), ptr(srcV), ptr(dstK), ptr(dstV), ptr(slotMapping), batchSize, nKv, hd, pageSize, srcKTokenStride, srcKHeadStride, srcVTokenStride, srcVHeadStride);
   }
 
-  gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, pageSize: number, D: number, paddedKvLen: number, _kvTokenIndptrD: Tensor, _contextParallel: boolean): Tensor {
-    const out = pageIndptrD.workspace.alloc([paddedKvLen, D], srcData.type);
+  gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, D: number, paddedKvLen: number, _kvTokenIndptrD: Tensor, _contextParallel: boolean): Tensor {
+    const pageSize = srcData.shape[1];
+    const out = pageIndptrD.workspace.alloc([paddedKvLen / pageSize, pageSize, D], srcData.type);
     const elemBytes = srcData.type === "U8" ? 1 : 2;
     const maxPages = srcData.shape[0];
     getNativeAddon().gatherPages(this.ctx, out.data, srcData.data, pageIndices.data, pageIndptrD.data, lastPageLen.data, maxPages, batchSize, pageSize, D * elemBytes);
@@ -1042,7 +1044,7 @@ export class GlmOps implements DeviceOps {
   }
 
   batchDecodeRun(state: ExecutionState, q: Tensor, o: Tensor, kData: Tensor, vData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, numQoHeads: number, numKvHeads: number, headDim: number, smScale: number): void {
-    const pageSize = state.cache.getPagedKV().pageSize;
+    const pageSize = kData.shape[1] / (numKvHeads * headDim);
     getNativeAddon().batchDecodeRun(this.ctx, ptr(q), ptr(o), ptr(kData), ptr(vData), ptr(indices), ptr(indptrD), ptr(lastPageLen), ptr(floatWs), ptr(intWs), ptr(planInfo), state.batchSize, numQoHeads, numKvHeads, headDim, pageSize, smScale);
   }
 
@@ -1051,7 +1053,7 @@ export class GlmOps implements DeviceOps {
   }
 
   batchPrefillPagedRun(state: ExecutionState, q: Tensor, o: Tensor, kData: Tensor, vData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, qIndptrD: Tensor, planInfo: Tensor, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, maskMode: MaskMode, smScale: number): void {
-    const pageSize = state.cache.getPagedKV().pageSize;
+    const pageSize = kData.shape[1] / (numKvHeads * headDim);
     getNativeAddon().batchPrefillPagedRun(this.ctx, ptr(q), ptr(o), ptr(kData), ptr(vData), ptr(indices), ptr(indptrD), ptr(lastPageLen), ptr(floatWs), ptr(intWs), ptr(qIndptrD), ptr(planInfo), state.totalTokens, state.batchSize, numQoHeads, numKvHeads, headDim, pageSize, qStrideN, qStrideH, maskMode, smScale);
   }
 
@@ -1140,10 +1142,15 @@ export class GlmOps implements DeviceOps {
   }
 
   sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, strideKvBlock: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
-    const pagedKV = state.cache.getPagedKV();
-    const pageBlockSize = pagedKV.pageSize;
     const numTokens = state.totalTokens;
-    if (pageBlockSize !== 64) throw new Error(`sparseMlaPrefill: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize}`);
+    const elemBytes = SafeTensorFile.dtypeBytes(kvCache.type);
+    const pageBlockSize = kvCache.shape.length >= 3
+      ? kvCache.shape[1]
+      : Math.floor(strideKvBlock / (kvCache.shape[kvCache.shape.length - 1] * elemBytes));
+    const effectiveStrideKvBlock = kvCache.shape.length >= 3
+      ? pageBlockSize * kvCache.shape[2] * elemBytes
+      : strideKvBlock;
+    if (pageBlockSize !== 64) throw new Error(`sparseMlaPrefill: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize} ${kvCache.shape}`);
     const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
     const lse = q.workspace.alloc([numTokens, numHeads], "F32");
     // Small query counts (e.g. MTP tree verify) starve the prefill kernel: its
@@ -1155,21 +1162,28 @@ export class GlmOps implements DeviceOps {
       const numSplits = Math.ceil(topk / 64);
       using midOut = q.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
       using midLse = q.workspace.alloc([numTokens, numHeads, numSplits], "F32");
-      getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, strideKvBlock, 0, ptr(topkLength));
+      getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, 0, ptr(topkLength));
       return { o, lse };
     }
-    getNativeAddon().sparseMlaPrefill(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(o), ptr(lse), numTokens, numHeads, topk, pageBlockSize, smScale, strideKvBlock, ptr(topkLength));
+    getNativeAddon().sparseMlaPrefill(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(o), ptr(lse), numTokens, numHeads, topk, pageBlockSize, smScale, effectiveStrideKvBlock, ptr(topkLength));
     return { o, lse };
   }
 
   sparseMlaDecode(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
     const numTokens = state.batchSize;
-    if (strideKvBlock % 64 !== 0) throw new Error(`sparseMlaDecode: SM120 kernel requires pageBlockSize=64, got strideKvBlock=${strideKvBlock} (not divisible by 64 bytes/token)`);
+    const elemBytes = SafeTensorFile.dtypeBytes(kvCache.type);
+    const pageBlockSize = kvCache.shape.length >= 3
+      ? kvCache.shape[1]
+      : Math.floor(strideKvBlock / (kvCache.shape[kvCache.shape.length - 1] * elemBytes));
+    const effectiveStrideKvBlock = kvCache.shape.length >= 3
+      ? pageBlockSize * kvCache.shape[2] * elemBytes
+      : strideKvBlock;
+    if (pageBlockSize !== 64) throw new Error(`sparseMlaDecode: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize}`);
     const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
     const lse = q.workspace.alloc([numTokens, numHeads], "F32");
     using midOut = q.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
     using midLse = q.workspace.alloc([numTokens, numHeads, numSplits], "F32");
-    getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, topkLength ? ptr(topkLength) : 0);
+    getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, chunksPerBlock, topkLength ? ptr(topkLength) : 0);
     return { o, lse };
   }
 

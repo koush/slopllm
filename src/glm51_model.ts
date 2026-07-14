@@ -314,6 +314,8 @@ export class Glm51Model extends ChatModel {
   }
 
   createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, pageSize = 64): ChatCache {
+    if (pageSize !== 64)
+      throw new Error(`createChatCache: pageSize must be 64, got ${pageSize}`);
     const cfg = this.cfg;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;

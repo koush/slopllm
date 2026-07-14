@@ -513,7 +513,8 @@ int glm_p2p_enable_peer_access(GlmCtx* ctx, int peer_device) {
     return 0;
 }
 
-GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size) {
+GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size,
+                                        const int* device_ids) {
     if (world_size > P2P_AR_MAX_WORLD || world_size <= 0) {
         fprintf(stderr, "glm_p2p_create_instance: invalid world_size %d\n", world_size);
         return nullptr;
@@ -531,7 +532,7 @@ GlmP2PInstance* glm_p2p_create_instance(GlmCtx* ctx, int my_rank, int world_size
         if (p == my_rank) continue;
         int rank = 0;
         cudaDeviceGetP2PAttribute(&rank, cudaDevP2PAttrPerformanceRank,
-                                  ctx->device_id, p);
+                                  ctx->device_id, device_ids[p]);
         if (rank < min_perf_rank) min_perf_rank = rank;
     }
     inst->nanosleep_ns = (min_perf_rank > 0) ? 32 : 200;

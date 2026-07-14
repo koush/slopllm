@@ -2004,10 +2004,11 @@ class P2PAllReduceGroup {
     this.worldSize = devices.length;
     this.devices = devices;
     const addon = getNativeAddon();
+    const deviceIds = devices.map(d => d.device);
 
     // 1. Create one instance per rank (metadata only).
     this.instances = devices.map((dev, rank) =>
-      addon.p2pCreateInstance(dev.ctx, rank, devices.length));
+      addon.p2pCreateInstance(dev.ctx, rank, deviceIds));
 
     // 2. Cache flag pointers (never changes).
     this.flagPtrs = this.instances.map(inst => addon.p2pGetFlagPtr(inst));
@@ -2887,7 +2888,7 @@ export class ParallelOps implements DeviceOps {
     using gatheredKv = shouldGatherKv
       ? this.gatherPages(
           kvCache, pagedKV.indices, pageIndptrD, lastPageLen,
-          pagedKV.sequences.length, pagedKV.pageSize, pagedKV.bytesPerToken,
+          pagedKV.sequences.length, pagedKV.bytesPerToken,
           state.getGraphVariantPaddedKvLen(),
           kvTokenIndptrD, true,
         )
@@ -2938,39 +2939,40 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, pageSize: number, D: number, paddedKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor {
+  gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, D: number, paddedKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor {
     const workspace = pageIndptrD.workspace;
     const pSrc = this.cast(srcData);
     const pIndices = this.cast(pageIndices);
     const pIndptr = this.cast(pageIndptrD);
     const pLastPageLen = this.cast(lastPageLen);
     const pKvIndptr = this.cast(kvTokenIndptrD);
+    const pageSize = srcData.shape[1];
 
     if (!contextParallel) {
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, pageSize, D, paddedKvLen, pKvIndptr.shards[i], false));
+        shards.push(this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, D, paddedKvLen, pKvIndptr.shards[i], false));
       }
-      return this.wrapShards(workspace, shards, [paddedKvLen, D], pSrc.type, pSrc.parallelism);
+      return this.wrapShards(workspace, shards, [paddedKvLen / pageSize, pageSize, D], pSrc.type, pSrc.parallelism);
     }
 
     // CP: each GPU has every Nth token within each page (Row-parallel, sharded on pageSize dim)
     const cpWorldSize = this.worldSize;
-    const effPageSize = pageSize / cpWorldSize;
     const paddedLocalLen = paddedKvLen / cpWorldSize;
 
     // Step 1: Local gather — each GPU gathers from its shard of the KV data
     const localBufs: Tensor[] = [];
     for (let i = 0; i < cpWorldSize; i++) {
-      localBufs.push(this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, effPageSize, D, paddedLocalLen, pKvIndptr.shards[i], false));
+      localBufs.push(this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, D, paddedLocalLen, pKvIndptr.shards[i], false));
     }
 
+    const shardPageSize = pSrc.shards[0].shape[1];
     // Step 2: NCCL all-gather (Column → Replicated)
-    using localPar = this.wrapShards(workspace, localBufs, [paddedKvLen, D], pSrc.type, TensorParallelism.Column);
+    using localPar = this.wrapShards(workspace, localBufs, [paddedKvLen / shardPageSize, shardPageSize, D], pSrc.type, TensorParallelism.Column);
     using gathered = localPar.allGather(workspace);
 
     // Step 3: Deinterleave — reorder interleaved tokens to sequential
-    const out = workspace.alloc([paddedKvLen, D], pSrc.type) as ParallelTensor;
+    const out = workspace.alloc([paddedKvLen / shardPageSize, shardPageSize, D], pSrc.type) as ParallelTensor;
     const pOut = this.cast(out);
     const elemBytes = pSrc.type === "U8" ? 1 : 2;
 
