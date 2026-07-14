@@ -207,8 +207,8 @@ describe("PagedKVCache staging", () => {
   });
 
   it("staging preserves KV cache: decode → stage → prefill → unstage → decode", () => {
-    using pagedKV = makePagedKV(4, 256);
-    using refKV = makePagedKV(2, 256);
+    using pagedKV = makePagedKV(4, 16);
+    using refKV = makePagedKV(2, 16);
 
     pagedKV.reset(2);
     refKV.reset(2);
@@ -280,8 +280,8 @@ describe("PagedKVCache staging", () => {
   });
 
   it("staging with reset allows prefill of new sequence while preserving staged KV", () => {
-    using pagedKV = makePagedKV(4, 256);
-    using refKV = makePagedKV(1, 256);
+    using pagedKV = makePagedKV(4, 16);
+    using refKV = makePagedKV(1, 16);
 
     pagedKV.reset(1);
     const tokens1 = ws.forwardEagerPrefill(model, [PROMPT1], pagedKV);
