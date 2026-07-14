@@ -359,11 +359,11 @@ export class MetaOps implements DeviceOps {
     gdnPrefill(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
     }
 
-    sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, strideKvBlock: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
+    sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
         return undefined as never;
     }
 
-    sparseMlaDecode(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+    sparseMlaDecode(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
         return undefined as never;
     }
 

@@ -59,8 +59,8 @@ export interface DeviceOps {
   mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, cpWorldSize?: number, cpRank?: number): void;
   concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, cpWorldSize?: number, cpRank?: number): void;
 
-  sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, strideKvBlock: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor };
-  sparseMlaDecode(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor };
+  sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor };
+  sparseMlaDecode(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor };
 
   gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, D: number, paddedKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor;
 

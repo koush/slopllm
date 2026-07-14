@@ -1,11 +1,9 @@
 import { DeviceOps, MaskMode, StridedMmap, TensorParallelism } from "./device_ops";
-import { GlmOps, GlmTensor, getNativeAddon, f32ToBf16Bytes, bf16BytesToF32, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_UINT8, NCCL_SUM } from "./glm_ops";
-import { MemcpyKind } from "./tensor";
-import { Tensor } from "./tensor";
+import { ExecutionState } from "./execution-workspace";
+import { bf16BytesToF32, f32ToBf16Bytes, getNativeAddon, GlmOps, GlmTensor, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM, NCCL_UINT8 } from "./glm_ops";
+import { MemcpyKind, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
-import type { PagedKVCache } from "./paged_kv";
-import { ExecutionState } from "./execution-workspace";
 
 // Master switch for the CP "gather CKV" path in sparse MLA prefill. When true,
 // CP prefill gathers the CKV cache into a flat Replicated buffer and the indexer
@@ -2869,7 +2867,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, strideKvBlock: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
     const pagedKV = state.cache.getPagedKV();
     const numTokens = state.totalTokens;
     const pQ = this.cast(q);
@@ -2887,11 +2885,11 @@ export class ParallelOps implements DeviceOps {
 
     using gatheredKv = shouldGatherKv
       ? this.gatherPages(
-          kvCache, pagedKV.indices, pageIndptrD, lastPageLen,
-          pagedKV.sequences.length, pagedKV.bytesPerToken,
-          state.getGraphVariantPaddedKvLen(),
-          kvTokenIndptrD, true,
-        )
+        kvCache, pagedKV.indices, pageIndptrD, lastPageLen,
+        pagedKV.sequences.length, pagedKV.bytesPerToken,
+        pagedKV.maxPages * pagedKV.pageSize,
+        kvTokenIndptrD, true,
+      )
       : undefined;
     const effectiveKvCache = gatheredKv ?? kvCache;
     const pEffKvCache = this.cast(effectiveKvCache);
@@ -2906,7 +2904,7 @@ export class ParallelOps implements DeviceOps {
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaPrefill(state, gatheredQ.shards[i], pEffKvCache.shards[i], pIndices.shards[i], effectiveNumHeads, headDim, topk, smScale, strideKvBlock, pTopkLength.shards[i], pageIndptrD, lastPageLen, kvTokenIndptrD);
+      const result = this.devices[i].sparseMlaPrefill(state, gatheredQ.shards[i], pEffKvCache.shards[i], pIndices.shards[i], effectiveNumHeads, headDim, topk, smScale, pTopkLength.shards[i], pageIndptrD, lastPageLen, kvTokenIndptrD);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
@@ -2915,7 +2913,7 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  sparseMlaDecode(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
     const numTokens = state.batchSize;
     const pQ = this.cast(q);
     const pKvCache = this.cast(kvCache);
@@ -2930,7 +2928,7 @@ export class ParallelOps implements DeviceOps {
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaDecode(state, gatheredQ.shards[i], pKvCache.shards[i], pIndices.shards[i], effectiveNumHeads, headDim, topk, numSplits, smScale, strideKvBlock, chunksPerBlock, pTopkLength?.shards[i]);
+      const result = this.devices[i].sparseMlaDecode(state, gatheredQ.shards[i], pKvCache.shards[i], pIndices.shards[i], effectiveNumHeads, headDim, topk, numSplits, smScale, chunksPerBlock, pTopkLength?.shards[i]);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
@@ -3042,7 +3040,7 @@ export class ParallelOps implements DeviceOps {
       && colIdxQ && colWeights
       && totalQ % W === 0;
 
-    if (!canShard) {
+    if (true || !canShard) {
       const slotShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
         const cpR = flatMode ? 0 : (contextParallel ? i : 0);

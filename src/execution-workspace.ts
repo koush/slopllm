@@ -44,7 +44,7 @@ export class ExecutionState {
   }
 
   private static getPaddedQLen(qLen: number): number {
-    return Math.max(1024, 1 << Math.ceil(Math.log2(qLen)));
+    return Math.max(16, 1 << Math.ceil(Math.log2(qLen)));
   }
 
   get lastIdx(): Tensor {
@@ -137,19 +137,18 @@ export class ExecutionState {
 
   sparseMla(q: Tensor, cacheIdx: number, indices: Tensor, nHeads: number, kvLoraRank: number, topk: number, smScale: number): { o: Tensor, lse: Tensor } {
     const pagedKV = this.cache.getPagedKV();
-    const strideKvBlock = pagedKV.pageSize * pagedKV.bytesPerToken;
     if (this.isDecode) {
       const numSplits = Math.ceil(topk / 64);
       return this.ws.glm.sparseMlaDecode(
         this, q, pagedKV.ckvData[cacheIdx], indices,
         nHeads, kvLoraRank, topk, numSplits,
-        smScale, strideKvBlock, 0, this.ws.sparseTopkLength,
+        smScale, 0, this.ws.sparseTopkLength,
       );
     } else {
       return this.ws.glm.sparseMlaPrefill(
         this, q, pagedKV.ckvData[cacheIdx], indices,
         nHeads, kvLoraRank, topk,
-        smScale, strideKvBlock, this.ws.sparseTopkLength,
+        smScale, this.ws.sparseTopkLength,
         this.ws.indptrD, this.ws.lastPageLen, this.ws.kvTokenIndptrD,
       );
     }
@@ -488,7 +487,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
       headDimCkv, headDimKpe,
     );
   }
-
 
   updateIndptr(pagedKV: PagedKVCache): void {
     const batchSize = pagedKV.sequences.length;

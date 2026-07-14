@@ -49,6 +49,7 @@
             "console": "integratedTerminal",
             "env": {
                 // "NCCL_DEBUG": "INFO",
+                "GLM_CP_GATHER_KV": "0"
             },
             "runtimeArgs": [
                 "${workspaceFolder}/src/run_qwen3_unified.ts",

@@ -998,8 +998,8 @@ export class GlmOps implements DeviceOps {
     using topkIdx = useDirect
       ? this.indexerScoreTopkV2(idxQ, kData, weights, pageIndices, indptr, scoreLastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart)
       : this.indexerScoreTopkPrefill(idxQ, kData, weights, pageIndices, indptr, scoreLastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, customMask, maskIndptr, maskKvLen, qGlobalStart);
-    using fullSlots = idxQ.workspace.alloc([maxKv, topk], "I32")
-    const slots = fullSlots.narrow(0, totalQ);
+    // const slots = idxQ.workspace.alloc([totalQ, topk], "I32");
+    const slots = idxQ.workspace.ensureAlloc([maxKv, topk], "I32", "idxslots-shared").narrow(0, totalQ);
     getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkLength), ptr(topkIdx), ptr(pageIndices), ptr(indptr), ptr(lastPageLen), ptr(batchIndices), totalQ, topk, pageSize, cpWorldSize, cpRank, kvTokenIndptrD ? ptr(kvTokenIndptrD) : 0);
     return slots;
   }
@@ -1141,15 +1141,11 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().gdnPrefill(this.ctx, output.data, recurrentState.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, cuSeqlens.data, state.totalTokens, numHeads, dK, dV, state.batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
-  sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, strideKvBlock: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaPrefill(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, smScale: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
     const numTokens = state.totalTokens;
     const elemBytes = SafeTensorFile.dtypeBytes(kvCache.type);
-    const pageBlockSize = kvCache.shape.length >= 3
-      ? kvCache.shape[1]
-      : Math.floor(strideKvBlock / (kvCache.shape[kvCache.shape.length - 1] * elemBytes));
-    const effectiveStrideKvBlock = kvCache.shape.length >= 3
-      ? pageBlockSize * kvCache.shape[2] * elemBytes
-      : strideKvBlock;
+    const pageBlockSize = kvCache.shape[1];
+    const effectiveStrideKvBlock = pageBlockSize * kvCache.shape[2] * elemBytes;
     if (pageBlockSize !== 64) throw new Error(`sparseMlaPrefill: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize} ${kvCache.shape}`);
     const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
     const lse = q.workspace.alloc([numTokens, numHeads], "F32");
@@ -1169,15 +1165,11 @@ export class GlmOps implements DeviceOps {
     return { o, lse };
   }
 
-  sparseMlaDecode(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(state: ExecutionState, q: Tensor, kvCache: Tensor, indices: Tensor, numHeads: number, headDim: number, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
     const numTokens = state.batchSize;
     const elemBytes = SafeTensorFile.dtypeBytes(kvCache.type);
-    const pageBlockSize = kvCache.shape.length >= 3
-      ? kvCache.shape[1]
-      : Math.floor(strideKvBlock / (kvCache.shape[kvCache.shape.length - 1] * elemBytes));
-    const effectiveStrideKvBlock = kvCache.shape.length >= 3
-      ? pageBlockSize * kvCache.shape[2] * elemBytes
-      : strideKvBlock;
+    const pageBlockSize = kvCache.shape[1];
+    const effectiveStrideKvBlock = pageBlockSize * kvCache.shape[2] * elemBytes;
     if (pageBlockSize !== 64) throw new Error(`sparseMlaDecode: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize}`);
     const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
     const lse = q.workspace.alloc([numTokens, numHeads], "F32");

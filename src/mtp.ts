@@ -422,11 +422,13 @@ export function mtpTreeDecode(
     ...targetCustomMask,
     positionIds: getPositionIdsMask(ws, originalAllocLen, targetTopk),
   });
+  sharedSlots.release();
   targetPrefillState.sharedSlots = sharedSlots;
 
   targetPrefillState.setInput(verificationTokens);
 
   const hiddenStateStaging = ws.ensureAlloc([numVerificationTokens, hiddenDim], "BF16", `mtp-tree-hs-staging-${numVerificationTokens}`, undefined, 0);
+  ws.glm.synchronize();
 
   warmup ||= !targetPrefillState.isCaptured(captureManager, ['mtp-verify', numVerificationTokens]);
   const { kvCacheLayers, indexerKvCacheLayers } = targetPrefillState.capture(captureManager, () => {
@@ -576,13 +578,11 @@ export function mtpTreeDecode(
   // target layers: write the captured kvCacheLayers
   // mtp layers: perform extended prefill as usual
   seq0.truncate(originalAllocLen);
+  ws.glm.synchronize();
 
   const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache);
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
   mtpExtendPrefill.sharedSlots = sharedSlots;
-
-  warmup ||= !mtpExtendPrefill.isCaptured(captureManager, ['mtp-replace', finishCount]);
-  mtpExtendPrefill.capture(captureManager, () => {
     for (const layer of kvCacheLayers) {
       mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
       layer.appendCkvOrig[Symbol.dispose]();
@@ -592,6 +592,10 @@ export function mtpTreeDecode(
       mtpExtendPrefill.indexerKvCacheAppend(layer.appendIdxK, layer.cacheIdx, layer.indexHeadDim);
       layer.appendIdxKOrig[Symbol.dispose]();
     }
+  ws.glm.synchronize();
+
+  warmup ||= !mtpExtendPrefill.isCaptured(captureManager, ['mtp-replace', finishCount]);
+  mtpExtendPrefill.capture(captureManager, () => {
 
     using verfiedHiddenStates = hiddenStateStaging.slice(0, 0, finishCount);
     using mtpHs = model.forwardMtp!(mtpExtendPrefill, verfiedHiddenStates);

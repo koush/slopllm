@@ -65,8 +65,12 @@ export class CaptureManager implements Disposable {
                 }
 
                 if (captured.warmupSteps === 3) {
+                    console.warn("\n====capturing====", key)
                     this.ops.graphBeginCapture();
                     capturing = key;
+                }
+                else {
+                    console.warn("\n====warmingup====", key)
                 }
                 captured.warmupSteps++;
             }
