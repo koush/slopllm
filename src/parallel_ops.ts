@@ -2496,7 +2496,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void {
+  kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void {
     const pSrcK = this.cast(srcK);
     const pSrcV = this.cast(srcV);
     const pDstK = this.cast(dstK);
@@ -2510,7 +2510,7 @@ export class ParallelOps implements DeviceOps {
     const shardKTokenStride = isRowPar && srcKTokenStride !== hd ? srcKTokenStride / this.worldSize : srcKTokenStride;
     const shardVTokenStride = isRowPar ? srcVTokenStride / this.worldSize : srcVTokenStride;
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].kvCacheWrite(pSrcK.shards[i], pSrcV.shards[i], pDstK.shards[i], pDstV.shards[i], pSlotMapping.shards[i], batchSize, shardNKv, hd, pageSize, shardKTokenStride, srcKHeadStride, shardVTokenStride, srcVHeadStride);
+      this.devices[i].kvCacheWrite(pSrcK.shards[i], pSrcV.shards[i], pDstK.shards[i], pDstV.shards[i], pSlotMapping.shards[i], batchSize, shardNKv, hd, shardKTokenStride, srcKHeadStride, shardVTokenStride, srcVHeadStride);
     }
   }
 
@@ -2792,7 +2792,7 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, _cpWorldSize?: number, _cpRank?: number): void {
+  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, _pageSize?: number, _cpWorldSize?: number, _cpRank?: number): void {
     const pCkvData = this.cast(ckvData);
     const pKpeData = kpeData ? this.cast(kpeData) : null;
     const pIndices = this.cast(indices);
@@ -2804,13 +2804,14 @@ export class ParallelOps implements DeviceOps {
     const pPositions = this.cast(positions);
     const contextParallel = pCkvData.parallelism === TensorParallelism.Row;
     const effectiveCpWorldSize = contextParallel ? this.worldSize : undefined;
+    const pageSize = pCkvData.shape[1];
     for (let i = 0; i < this.worldSize; i++) {
       const effectiveCpRank = contextParallel ? i : undefined;
-      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData?.shards[i] ?? null, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe?.shards[i] ?? null, pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, effectiveCpWorldSize, effectiveCpRank);
+      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData?.shards[i] ?? null, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe?.shards[i] ?? null, pBatchIndices.shards[i], pPositions.shards[i], nnz, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, pageSize, effectiveCpWorldSize, effectiveCpRank);
     }
   }
 
-  concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, _cpWorldSize?: number, _cpRank?: number): void {
+  concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, _pageSize?: number, _cpWorldSize?: number, _cpRank?: number): void {
     const pKvCache = this.cast(kvCache);
     const pAppendCkv = this.cast(appendCkv);
     const pAppendKpe = this.cast(appendKpe);
@@ -2820,9 +2821,10 @@ export class ParallelOps implements DeviceOps {
     const pPositions = this.cast(positions);
     const contextParallel = pKvCache.parallelism === TensorParallelism.Row;
     const cpWorldSize = contextParallel ? this.worldSize : 0;
+    const pageSize = pKvCache.shape[1];
     for (let i = 0; i < this.worldSize; i++) {
       const cpRank = contextParallel ? i : 0;
-      this.devices[i].concatAndCacheDsMla(pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
+      this.devices[i].concatAndCacheDsMla(pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, pageSize, cpWorldSize, cpRank);
     }
   }
 
@@ -3012,7 +3014,7 @@ export class ParallelOps implements DeviceOps {
   // Fall-back (replicated): decode, context-parallel, multi-sequence prefill,
   // or uneven totalQ — every rank runs the full indexer. Decode is cheap;
   // multi-seq / CP need qoIndptr rebasing which is not yet implemented.
-  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, topkLength: Tensor, scale: number, topk: number, decode: boolean, maxKv: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart?: number, kvTokenIndptrD?: Tensor): Tensor {
+  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, topkLength: Tensor, scale: number, topk: number, decode: boolean, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart?: number, kvTokenIndptrD?: Tensor): Tensor {
     const totalQ = idxQ.shape[0];
     const pQ = this.cast(idxQ);
     const pKData = this.cast(kData);
@@ -3044,7 +3046,7 @@ export class ParallelOps implements DeviceOps {
       const slotShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
         const cpR = flatMode ? 0 : (contextParallel ? i : 0);
-        slotShards.push(this.devices[i].indexerTopkSlots(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], pBatchIndices.shards[i], pTopkLength.shards[i], scale, topk, decode, maxKv, contextParallel, cpW, cpR, pGlobalLastPageLen?.shards[i], pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i], 0, pKvTokenIndptr?.shards[i]));
+        slotShards.push(this.devices[i].indexerTopkSlots(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], pBatchIndices.shards[i], pTopkLength.shards[i], scale, topk, decode, contextParallel, cpW, cpR, pGlobalLastPageLen?.shards[i], pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i], 0, pKvTokenIndptr?.shards[i]));
       }
       return this.wrapShards(idxQ.workspace, slotShards, [totalQ, topk], "I32", TensorParallelism.Replicated);
     }
@@ -3062,7 +3064,7 @@ export class ParallelOps implements DeviceOps {
         pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i],
         pQoIndptr.shards[i], localBatchIndices, localTopkLength,
         scale, topk,
-        decode, maxKv, contextParallel, cpW, cpR,
+        decode, contextParallel, cpW, cpR,
         pGlobalLastPageLen?.shards[i],
         pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i],
         qStart, pKvTokenIndptr?.shards[i]

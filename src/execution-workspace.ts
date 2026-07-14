@@ -78,14 +78,13 @@ export class ExecutionState {
       kRope, vBuf,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
       this.ws.slotMapping,
-      BS, nKv, hd, pagedKV.pageSize,
+      BS, nKv, hd,
       kTokenStride, kHeadStride, vTokenStride, vHeadStride
     );
   }
 
   mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number): void {
     const pagedKV = this.cache.getPagedKV();
-    const pageSize = pagedKV.pageSize;
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     if (pagedKV.sparseMode) {
       this.ws.glm.concatAndCacheDsMla(
@@ -93,7 +92,7 @@ export class ExecutionState {
         appendCkv, appendKpe,
         pagedKV.indices, this.ws.indptrD,
         this.ws.mlaBatchIndices, this.ws.positionIds,
-        nnz, pageSize, kvLoraRank, qkRopeDim,
+        nnz, kvLoraRank, qkRopeDim,
         kvLoraRank, qkRopeDim,
       );
     } else {
@@ -102,7 +101,7 @@ export class ExecutionState {
         pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen,
         appendCkv, appendKpe,
         this.ws.mlaBatchIndices, this.ws.positionIds,
-        nnz, pageSize, kvLoraRank, qkRopeDim,
+        nnz, kvLoraRank, qkRopeDim,
         kvLoraRank, qkRopeDim,
       );
     }
@@ -116,7 +115,7 @@ export class ExecutionState {
       pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen,
       idxKOut, null,
       this.ws.mlaBatchIndices, this.ws.positionIds,
-      nnz, pagedKV.pageSize, indexHeadDim, 0,
+      nnz, indexHeadDim, 0,
       indexHeadDim, 0
     );
   }
@@ -128,7 +127,7 @@ export class ExecutionState {
       idxQ, pagedKV.kData[cacheIdx], weights,
       pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.qoIndptrD, this.ws.mlaBatchIndices, this.ws.sparseTopkLength,
       scale, topk,
-      this.isDecode, pagedKV.maxPages * pagedKV.pageSize, pagedKV.contextParallel,
+      this.isDecode, pagedKV.contextParallel,
       undefined, undefined, this.ws.globalLastPageLen,
       cm?.mask, cm?.indptr, cm?.maskKvLen,
       0, pagedKV.contextParallel && !this.isDecode ? this.ws.kvTokenIndptrD : undefined,
