@@ -270,7 +270,7 @@ def _run_moe_cuda(glm, cfg, layer, post_normed_gpu, B, S):
             scale_f32[b] = expert_weights[b][k_idx] if k_idx >= 0 else 0.0
 
         scale_bf16 = _f32_to_bf16(scale_f32).to("cuda")
-        glm.row_scale_add(routed_out_gpu, expert_down, scale_bf16, BS, hidden_size)
+        routed_out_gpu += scale_bf16.unsqueeze(1) * expert_down
 
     shared_gate_w_gpu = _upload_tensor(glm, layer.mlp.shared_gate_w)
     shared_up_w_gpu = _upload_tensor(glm, layer.mlp.shared_up_w)

@@ -213,7 +213,7 @@ export function mtpTreeDecode(
     warmup ||= !captureManager.isCaptured(['mtp-tree-decode-root', topks[0], `batchSize:${batchSize}`]);
     captureManager.run(() => {
       // mtpHiddenStates is already shared_head.norm'd by forwardMtp; use directly
-      using initialLogits = mtpHiddenStates.linear(lmHead, batchSize);
+      using initialLogits = mtpHiddenStates.linear(lmHead);
       const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
       using _initialValues = initialTopk.values;
       using initialIndices = initialTopk.indices;
@@ -258,7 +258,7 @@ export function mtpTreeDecode(
         // prepare initial input
         if (i === 1) {
           // mtpHiddenStates is already shared_head.norm'd by forwardMtp; use directly
-          using initialLogits = mtpHiddenStates.linear(lmHead, currentBatchSize);
+          using initialLogits = mtpHiddenStates.linear(lmHead);
           const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
           using initialIndices = initialTopk.indices;
           using _initialValues = initialTopk.values;
@@ -290,7 +290,7 @@ export function mtpTreeDecode(
         }
         using newMtpHiddenStates = model.forwardMtp!(state, expandedHiddenState);
         // newMtpHiddenStates is already shared_head.norm'd; apply lmHead directly
-        using logits = newMtpHiddenStates.linear(lmHead, newBatchSize);
+        using logits = newMtpHiddenStates.linear(lmHead);
         const logitsTopk = logits.topk(topks[i], model.cfg.vocabSize);
         using _values = logitsTopk.values;
         using indices = logitsTopk.indices;
@@ -351,7 +351,7 @@ export function mtpTreeDecode(
         // Depth 1: compute initial logits and topk from mtpHiddenStates
         if (depth === 1) {
           // mtpHiddenStates is already shared_head.norm'd; use directly
-          using initialLogits = mtpHiddenStates.linear(lmHead, batchSize);
+          using initialLogits = mtpHiddenStates.linear(lmHead);
           const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
           using _initialValues = initialTopk.values;
           using initialIndices = initialTopk.indices;
@@ -379,7 +379,7 @@ export function mtpTreeDecode(
         using hiddenStates = model.forwardMtp!(state, expandedHs);
 
         // hiddenStates is already shared_head.norm'd; apply lmHead directly
-        using logits = hiddenStates.linear(lmHead, state.totalTokens).removeTracking();
+        using logits = hiddenStates.linear(lmHead).removeTracking();
         const logitsTopk = logits.topk(topks[depth], model.cfg.vocabSize);
         using _values = logitsTopk.values;
         using indices = logitsTopk.indices;

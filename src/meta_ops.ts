@@ -51,10 +51,10 @@ export class MetaTensor extends Tensor {
         super.memcpy2d(_dstOffset, _dpitch, _src, _srcOffset, _spitch, _width, _height, _kind);
     }
 
-    linear(weight: Tensor, batch: number): Tensor {
-        super.linear(weight, batch);
+    linear(weight: Tensor): Tensor {
+        super.linear(weight);
         const n = weight.shape[0];
-        return this.workspace.alloc([batch, n], this.type);
+        return this.workspace.alloc([this.shape[0], n], this.type);
     }
 
     bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
@@ -64,20 +64,20 @@ export class MetaTensor extends Tensor {
     writePointers(tensors: Tensor[]): void {
     }
 
-    rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
-        super.rmsnorm(weight, eps, dim, batch);
-        return this.workspace.alloc([batch, dim], this.type);
+    rmsnorm(weight: Tensor, eps: number): Tensor {
+        super.rmsnorm(weight, eps);
+        return this.workspace.alloc(this.shape, this.type);
     }
 
-    layernorm(weight: Tensor, bias: Tensor, eps: number, dim: number, batch: number): Tensor {
-        super.layernorm(weight, bias, eps, dim, batch);
-        return this.workspace.alloc([batch, dim], this.type);
+    layernorm(weight: Tensor, bias: Tensor, eps: number): Tensor {
+        super.layernorm(weight, bias, eps);
+        return this.workspace.alloc(this.shape, this.type);
     }
 
-    fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
-        super.fusedAddRmsnorm(input, weight, eps, dim, batch);
-        const normed = this.workspace.alloc([batch, dim], this.type);
-        const residual = this.workspace.alloc([batch, dim], this.type);
+    fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number): { normed: Tensor, residual: Tensor } {
+        super.fusedAddRmsnorm(input, weight, eps);
+        const normed = this.workspace.alloc(this.shape, this.type);
+        const residual = this.workspace.alloc(this.shape, this.type);
         return { normed, residual };
     }
 
@@ -86,14 +86,16 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
     }
 
-    embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
-        super.embedding(ids, hidden, seqLen);
+    embedding(ids: Tensor): Tensor {
+        super.embedding(ids);
+        const seqLen = ids.numElements;
+        const hidden = this.shape[1];
         return ids.workspace.alloc([seqLen, hidden], this.type);
     }
 
-    siluAndMul(up: Tensor, intermediate: number, batch: number): Tensor {
-        super.siluAndMul(up, intermediate, batch);
-        return this.workspace.alloc([batch, intermediate], this.type);
+    siluAndMul(up: Tensor): Tensor {
+        super.siluAndMul(up);
+        return this.workspace.alloc(this.shape, this.type);
     }
 
     arange(start: number, step: number, count: number): void {
@@ -114,8 +116,9 @@ export class MetaTensor extends Tensor {
         return { values, indices };
     }
 
-    indexSelect(indices: Tensor, batch: number, offset: number = 0): Tensor {
-        super.indexSelect(indices, batch, offset);
+    indexSelect(indices: Tensor, offset: number = 0): Tensor {
+        super.indexSelect(indices, offset);
+        const batch = indices.numElements;
         const dim = this.shape[1];
         return this.workspace.alloc([batch, dim], this.type);
     }
@@ -134,12 +137,12 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([batchSize * convDim], this.type);
     }
 
-    rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
-        super.rmsnormGated(input, gate, weight, eps, dim, batch);
+    rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number): void {
+        super.rmsnormGated(input, gate, weight, eps);
     }
 
-    gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
-        super.gateSigmoidMul(gate, batchSeq, numHeads, headDim);
+    gateSigmoidMul(gate: Tensor, numHeads: number, headDim: number): void {
+        super.gateSigmoidMul(gate, numHeads, headDim);
     }
 
     rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
@@ -223,7 +226,7 @@ export class MetaTensor extends Tensor {
         return this.workspace.glm.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this);
     }
 
-    scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
+    scatterScalar(indices: Tensor, value: number, k: number): void {
     }
 
     maskedFill(mask: Tensor, value: number, n: number): void {
@@ -233,29 +236,23 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc(this.shape, this.type);
     }
 
-    rowScaleAdd(input: Tensor, scales: Tensor, rows: number, dim: number): void {
+    reduceSum(): Tensor {
+        return this.workspace.alloc([this.shape[0]], this.type);
     }
 
-    reduceSum(dim: number, batch: number): Tensor {
-        return this.workspace.alloc([batch], this.type);
+    rowNormalize(scale: number, normalize: boolean = true): Tensor {
+        return this.workspace.alloc(this.shape, this.type);
     }
 
-    rowNormalize(scale: number, dim: number, batch: number, normalize: boolean = true): Tensor {
-        return this.workspace.alloc([batch, dim], this.type);
-    }
-
-    groupMaskMul(groupMask: Tensor, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void {
-    }
-
-    expertScale(weights: Tensor, indices: Tensor, expertId: number, topK: number, batch: number): void {
+    groupMaskMul(groupMask: Tensor, expertsPerGroup: number, nGroup: number): void {
     }
 
     mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
         return this.workspace.alloc([count, N], this.type);
     }
 
-    scatterAddRows(scales: Tensor, topK: number, dim: number, numRows: number): Tensor {
-        return this.workspace.alloc([numRows, dim], this.type);
+    scatterAddRows(scales: Tensor, topK: number, numRows: number): Tensor {
+        return this.workspace.alloc([numRows, this.shape[1]], this.type);
     }
 
     sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {

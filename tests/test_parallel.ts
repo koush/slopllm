@@ -445,7 +445,7 @@ describe("ParallelOps.linear", () => {
     input.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    using output = input.linear(weight, batch);
+    using output = input.linear(weight);
     assert.equal(output.parallelism, TensorParallelism.Row, "output should be Row-parallel");
     po.synchronize();
 
@@ -478,7 +478,7 @@ describe("ParallelOps.linear", () => {
     input.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    using output = input.linear(weight, batch);
+    using output = input.linear(weight);
     assert.equal(output.parallelism, TensorParallelism.PartialSum, "output should be PartialSum");
     po.synchronize();
 
@@ -511,7 +511,7 @@ describe("ParallelOps.linear", () => {
     input.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    using output = input.linear(weight, batch);
+    using output = input.linear(weight);
     assert.equal(output.parallelism, TensorParallelism.Replicated, "output should be Replicated");
     po.synchronize();
 
@@ -529,7 +529,7 @@ describe("ParallelOps.linear", () => {
     // Column weight + Replicated input → Row output
     const colW = ws.alloc([8, 16], "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
     const repX = ws.alloc([2, 16], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const result = repX.linear(colW, 2);
+    const result = repX.linear(colW);
     assert.equal((result as ParallelTensor).parallelism, TensorParallelism.Row);
   });
 
@@ -537,7 +537,7 @@ describe("ParallelOps.linear", () => {
     const weight = ws.alloc([8, 16], "BF16", undefined, TensorParallelism.PartialSum) as ParallelTensor;
     const input = ws.alloc([2, 16], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
 
-    assert.throws(() => input.linear(weight, 2), /PartialSum weight requires Replicated input/);
+    assert.throws(() => input.linear(weight), /PartialSum weight requires Replicated input/);
   });
 });
 
@@ -904,7 +904,7 @@ describe("ParallelOps.siluAndMul", () => {
     up.h2d(f32ToBf16Bytes(upF32));
     po.synchronize();
 
-    using out = gate.siluAndMul(up, intermediate, batch);
+    using out = gate.siluAndMul(up);
     po.synchronize();
 
     const outBuf = Buffer.alloc(batch * intermediate * 2);
@@ -936,7 +936,7 @@ describe("ParallelOps.siluAndMul", () => {
     up.h2d(f32ToBf16Bytes(upF32));
     po.synchronize();
 
-    using out = gate.siluAndMul(up, intermediate, batch);
+    using out = gate.siluAndMul(up);
     po.synchronize();
 
     const outBuf = Buffer.alloc(batch * intermediate * 2);
@@ -1053,7 +1053,7 @@ describe("ParallelOps.rmsnorm", () => {
     weight.h2d(f32ToBf16Bytes(weightF32));
     po.synchronize();
 
-    using out = input.rmsnorm(weight, eps, dim, batch);
+    using out = input.rmsnorm(weight, eps);
     po.synchronize();
 
     const outBuf = Buffer.alloc(batch * dim * 2);
@@ -1093,7 +1093,7 @@ describe("ParallelOps.rmsnorm", () => {
     po.synchronize();
 
     assert.equal(input.parallelism, TensorParallelism.PartialSum);
-    using out = input.rmsnorm(weight, eps, dim, batch);
+    using out = input.rmsnorm(weight, eps);
     assert.equal(input.parallelism, TensorParallelism.Replicated, "rmsnorm should auto-allReduce PartialSum input");
     po.synchronize();
 
@@ -1153,7 +1153,7 @@ describe("ParallelOps.fusedAddRmsnorm", () => {
     weight.h2d(f32ToBf16Bytes(weightF32));
     po.synchronize();
 
-    const { normed, residual } = inputA.fusedAddRmsnorm(inputB, weight, eps, dim, batch);
+    const { normed, residual } = inputA.fusedAddRmsnorm(inputB, weight, eps);
     po.synchronize();
 
     const normedBuf = Buffer.alloc(batch * dim * 2);
@@ -1202,7 +1202,7 @@ describe("ParallelOps.fusedAddRmsnorm", () => {
     po.synchronize();
 
     assert.equal(inputA.parallelism, TensorParallelism.PartialSum);
-    const { normed, residual } = inputA.fusedAddRmsnorm(inputB, weight, eps, dim, batch);
+    const { normed, residual } = inputA.fusedAddRmsnorm(inputB, weight, eps);
     assert.equal(inputA.parallelism, TensorParallelism.Replicated, "fusedAddRmsnorm should auto-allReduce PartialSum inputA");
     po.synchronize();
 
@@ -1268,7 +1268,7 @@ describe("ParallelOps.embedding", () => {
     inputIds.h2d(idsBuf);
     po.synchronize();
 
-    using out = table.embedding(inputIds, hidden, seqLen);
+    using out = table.embedding(inputIds);
     po.synchronize();
 
     const outBuf = Buffer.alloc(seqLen * hidden * 2);
@@ -1307,7 +1307,7 @@ describe("ParallelOps.embedding", () => {
     inputIds.h2d(idsBuf);
     po.synchronize();
 
-    using out = table.embedding(inputIds, hidden, seqLen);
+    using out = table.embedding(inputIds);
     po.synchronize();
 
     const outBuf = Buffer.alloc(seqLen * hidden * 2);
@@ -1913,7 +1913,7 @@ describe("ParallelOps.indexSelect", () => {
     idx.h2d(indicesBuf);
     po.synchronize();
 
-    using out = src.indexSelect(idx, batch);
+    using out = src.indexSelect(idx);
     po.synchronize();
 
     const outBuf = Buffer.alloc(k * srcDim * 2);

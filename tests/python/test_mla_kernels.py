@@ -97,35 +97,3 @@ def test_mla_v_expand(glm, device):
 
     result_ref_flat = result_ref.reshape(batch * seq_len, n_heads * v_head_dim).bfloat16()
     torch.testing.assert_close(result_cuda.cpu(), result_ref_flat.cpu(), atol=1e-1, rtol=1e-1)
-
-
-def test_row_scale_add(glm, device):
-    rows, dim = 4, 8
-
-    out = torch.randn(rows, dim, dtype=torch.bfloat16, device=device)
-    inp = torch.randn(rows, dim, dtype=torch.bfloat16, device=device)
-    scales = torch.randn(rows, dtype=torch.bfloat16, device=device)
-
-    out_ref = out.float() + scales.float().unsqueeze(1) * inp.float()
-    out_ref = out_ref.bfloat16()
-
-    out_cuda = out.clone()
-    glm.row_scale_add(out_cuda, inp, scales, rows, dim)
-
-    torch.testing.assert_close(out_cuda.cpu(), out_ref.cpu(), atol=1e-2, rtol=1e-2)
-
-
-def test_row_scale_add_zeros(glm, device):
-    rows, dim = 3, 6
-
-    out = torch.zeros(rows, dim, dtype=torch.bfloat16, device=device)
-    inp = torch.randn(rows, dim, dtype=torch.bfloat16, device=device)
-    scales = torch.tensor([1.5, 0.0, 2.0], dtype=torch.bfloat16, device=device)
-
-    out_ref = scales.float().unsqueeze(1) * inp.float()
-    out_ref = out_ref.bfloat16()
-
-    out_cuda = out.clone()
-    glm.row_scale_add(out_cuda, inp, scales, rows, dim)
-
-    torch.testing.assert_close(out_cuda.cpu(), out_ref.cpu(), atol=1e-2, rtol=1e-2)

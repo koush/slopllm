@@ -532,7 +532,7 @@ describe("ParallelOps rmsnormGated", () => {
     refWeight.h2d(f32ToBf16Bytes(weightF32));
     refGlm.synchronize();
 
-    refOutput.rmsnormGated(refInput, refGate, refWeight, eps, dim, batch);
+    refOutput.rmsnormGated(refInput, refGate, refWeight, eps);
     refGlm.synchronize();
 
     const refOutputBuf = Buffer.alloc(seqLen * zDim * 2);
@@ -551,7 +551,7 @@ describe("ParallelOps rmsnormGated", () => {
     tpWeight.h2d(f32ToBf16Bytes(weightF32));
     po.synchronize();
 
-    tpOutput.rmsnormGated(tpInput, tpGate, tpWeight, eps, dim, batch);
+    tpOutput.rmsnormGated(tpInput, tpGate, tpWeight, eps);
     po.synchronize();
 
     const tpOutputBuf = Buffer.alloc(seqLen * zDim * 2);

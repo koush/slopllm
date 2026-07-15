@@ -2358,37 +2358,6 @@ void glm_add_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int
 // input:   [rows, dim] BF16
 // scales:  [rows] BF16 (per-row scaling factor)
 // ---------------------------------------------------------------------------
-
-__global__ void __launch_bounds__(256, 4) row_scale_add_kernel(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* input,
-    const __nv_bfloat16* scales,
-    int rows,
-    int dim
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = rows * dim;
-    if (idx < total) {
-        int row = idx / dim;
-        float s = __bfloat162float(scales[row]);
-        float v = __bfloat162float(input[idx]);
-        float o = __bfloat162float(out[idx]);
-        out[idx] = __float2bfloat16(o + s * v);
-    }
-}
-
-void glm_row_scale_add(GlmCtx* ctx, void* out, const void* input,
-                        const void* scales, int rows, int dim) {
-    cudaSetDevice(ctx->device_id);
-    int total = rows * dim;
-    int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
-    row_scale_add_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-        (const __nv_bfloat16*)scales, rows, dim);
-}
-
-// ---------------------------------------------------------------------------
 // Expand/repeat along dim 1 of a 4D tensor
 // input:  [batch, dim1_in, seq_len, head_dim]
 // output: [batch, dim1_out, seq_len, head_dim]
@@ -2752,43 +2721,6 @@ void glm_group_mask_mul(GlmCtx* ctx, void* scores, const void* group_mask,
     group_mask_mul_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)scores, (const __nv_bfloat16*)group_mask,
         num_experts, experts_per_group, n_group, batch);
-}
-
-// ---------------------------------------------------------------------------
-// Expert-scale kernel
-//   out:      [batch]       BF16
-//   weights:  [batch, topK] BF16
-//   indices:  [batch, topK] int32
-//   For each batch b, find the first k where indices[b, k] == expert_id,
-//   then out[b] = weights[b, k]. If not found, out[b] = 0.
-// ---------------------------------------------------------------------------
-
-__global__ void __launch_bounds__(256, 4) expert_scale_kernel(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* weights,
-    const int* indices,
-    int expert_id, int topK, int batch
-) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= batch) return;
-    float scale = 0.0f;
-    for (int k = 0; k < topK; k++) {
-        if (indices[b * topK + k] == expert_id) {
-            scale = __bfloat162float(weights[b * topK + k]);
-            break;
-        }
-    }
-    out[b] = __float2bfloat16(scale);
-}
-
-void glm_expert_scale(GlmCtx* ctx, void* out, const void* weights,
-                       const int* indices, int expert_id, int topK, int batch) {
-    cudaSetDevice(ctx->device_id);
-    int block_size = 256;
-    int grid = (batch + block_size - 1) / block_size;
-    expert_scale_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)weights,
-        indices, expert_id, topK, batch);
 }
 
 // ---------------------------------------------------------------------------

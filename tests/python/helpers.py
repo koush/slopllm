@@ -367,12 +367,6 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int
         ]
 
-        self.lib.glm_row_scale_add.restype = None
-        self.lib.glm_row_scale_add.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int
-        ]
-
         self.lib.glm_expand_dim1.restype = None
         self.lib.glm_expand_dim1.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -852,12 +846,6 @@ class GlmOps:
         self.lib.glm_group_mask_mul.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ]
-
-        self.lib.glm_expert_scale.restype = None
-        self.lib.glm_expert_scale.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_mul_mat_id.restype = None
@@ -1420,15 +1408,6 @@ class GlmOps:
             rows
         )
 
-    def row_scale_add(self, output, input, scales, rows, dim):
-        self.lib.glm_row_scale_add(
-            self.ctx,
-            self._ptr(output),
-            self._ptr(input),
-            self._ptr(scales),
-            rows, dim
-        )
-
     def expand_dim1(self, output, input, dim1_out, dim1_in, seq_len, head_dim, batch):
         self.lib.glm_expand_dim1(
             self.ctx,
@@ -1970,15 +1949,6 @@ class GlmOps:
             self._ptr(scores),
             self._ptr(group_mask),
             num_experts, experts_per_group, n_group, batch
-        )
-
-    def expert_scale(self, output, weights, indices, expert_id, top_k, batch):
-        self.lib.glm_expert_scale(
-            self.ctx,
-            self._ptr(output),
-            self._ptr(weights),
-            self._ptr(indices),
-            expert_id, top_k, batch
         )
 
     def mul_mat_id(self, output, input, weight_ptrs, expert_ids, top_k, count, N, K):

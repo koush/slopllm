@@ -186,9 +186,10 @@ describe("CP vs non-CP model prefill", () => {
 
       (model as any).forward = function(state: ExecutionState): Tensor {
         const embedTable = (model as any).tensors.get("model.embed_tokens.weight");
-        using residual = new UsingHolder(embedTable.embedding(state.input!, hs, BS));
+        using inputIds = state.input!.narrow(0, state.totalTokens);
+        using residual = new UsingHolder(embedTable.embedding(inputIds));
         using normed = new UsingHolder(residual.value.rmsnorm(
-          (model as any).tensors.get(`model.layers.0.input_layernorm.weight`), cfg.rmsNormEps, hs, BS));
+          (model as any).tensors.get(`model.layers.0.input_layernorm.weight`), cfg.rmsNormEps));
 
         snap2("L0_input_normed", normed.value, BS * hs, isCp);
         snap2("L0_input_residual", residual.value, BS * hs, isCp);
@@ -281,22 +282,22 @@ describe("CP vs non-CP model prefill", () => {
 
           using kvcache = (model as any).glm.withStream(() => {
             using kPeRopeStream = (model as any).glm.withStream(() => {
-              using kPeRaw = normed.linear((model as any).tensors.get(`${pfx}.k_pe_proj.weight`), BS);
+              using kPeRaw = normed.linear((model as any).tensors.get(`${pfx}.k_pe_proj.weight`));
               rotaryEmbedding.streamWaitEvent();
               return kPeRaw.applyRotaryPosEmb(cos, sin, qkRD, 1, S, B, 1, cfg2.ropeInterleave);
             });
             using kPeRope = kPeRopeStream.result;
-            using ckv = normed.linear((model as any).tensors.get(`${pfx}.ckv_proj.weight`), BS);
-            using ckvNormed = ckv.rmsnorm((model as any).tensors.get(`${pfx}.kv_a_layernorm.weight`), cfg2.rmsNormEps, kvLR, BS);
+            using ckv = normed.linear((model as any).tensors.get(`${pfx}.ckv_proj.weight`));
+            using ckvNormed = ckv.rmsnorm((model as any).tensors.get(`${pfx}.kv_a_layernorm.weight`), cfg2.rmsNormEps);
             kPeRopeStream.streamWaitEvent();
             state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLR, qkRD);
           });
 
           using q = (model as any).glm.withStream(() => {
-            using qResidBuf = normed.linear((model as any).tensors.get(`${pfx}.q_a_proj.weight`), BS);
-            using qNormed = qResidBuf.rmsnorm((model as any).tensors.get(`${pfx}.q_a_layernorm.weight`), cfg2.rmsNormEps, cfg2.qLoraRank, BS);
-            using qAbsorbedLin = qNormed.linear((model as any).tensors.get(`${pfx}.absorbed.weight`), BS);
-            using qPeLin = qNormed.linear((model as any).tensors.get(`${pfx}.q_pe_proj.weight`), BS);
+            using qResidBuf = normed.linear((model as any).tensors.get(`${pfx}.q_a_proj.weight`));
+            using qNormed = qResidBuf.rmsnorm((model as any).tensors.get(`${pfx}.q_a_layernorm.weight`), cfg2.rmsNormEps);
+            using qAbsorbedLin = qNormed.linear((model as any).tensors.get(`${pfx}.absorbed.weight`));
+            using qPeLin = qNormed.linear((model as any).tensors.get(`${pfx}.q_pe_proj.weight`));
             rotaryEmbedding.streamWaitEvent();
             using qPeR = (model as any).glm.withStream(() => qPeLin.ropeTranspose(cos, sin, qkRD, qkRD, nH, S, B, qkRD, cfg2.ropeInterleave));
             const qAbsorbedR = qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLR, nH, S, B, kvLR);
@@ -321,14 +322,14 @@ describe("CP vs non-CP model prefill", () => {
 
           snap3("L0_vExpanded_after_merge", vExpanded, BS * nH * vHD, isCp);
 
-          using oProjBuf = vExpanded.linear((model as any).tensors.get(`${pfx}.o_proj.weight`), BS);
+          using oProjBuf = vExpanded.linear((model as any).tensors.get(`${pfx}.o_proj.weight`));
 
           snap3("L0_oProjBuf", oProjBuf, BS * hs, isCp);
 
           const attnResult = residual.fusedAddRmsnorm(
             oProjBuf,
             (model as any).tensors.get(`model.layers.${layerIdx}.post_attention_layernorm.weight`),
-            cfg2.rmsNormEps, hs, BS);
+            cfg2.rmsNormEps);
 
           snap3("L0_attn_residual", attnResult.residual, BS * hs, isCp);
           snap3("L0_attn_normed", attnResult.normed, BS * hs, isCp);
@@ -344,7 +345,7 @@ describe("CP vs non-CP model prefill", () => {
           const nextWeight = layerIdx < cfg2.numHiddenLayers - 1
             ? (model as any).tensors.get(`model.layers.${layerIdx + 1}.input_layernorm.weight`)
             : (model as any).tensors.get("model.norm.weight");
-          const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg2.rmsNormEps, hs, BS);
+          const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg2.rmsNormEps);
 
           snap3("L0_final_residual", mlpResult.residual, BS * hs, isCp);
           snap3("L0_final_normed", mlpResult.normed, BS * hs, isCp);
@@ -356,9 +357,10 @@ describe("CP vs non-CP model prefill", () => {
 
       (model as any).forward = function(state: ExecutionState): Tensor {
         const embedTable = (model as any).tensors.get("model.embed_tokens.weight");
-        using residual = new UsingHolder(embedTable.embedding(state.input!, hs, BS));
+        using inputIds = state.input!.narrow(0, state.totalTokens);
+        using residual = new UsingHolder(embedTable.embedding(inputIds));
         using normed = new UsingHolder(residual.value.rmsnorm(
-          (model as any).tensors.get(`model.layers.0.input_layernorm.weight`), cfg.rmsNormEps, hs, BS));
+          (model as any).tensors.get(`model.layers.0.input_layernorm.weight`), cfg.rmsNormEps));
         for (let i = 0; i < cfg.numHiddenLayers; i++) {
           const r = (model as any).mlaLayer(normed.value, residual.value, i, state);
           normed.replace(r.normed);

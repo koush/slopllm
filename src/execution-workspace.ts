@@ -53,17 +53,16 @@ export class ExecutionState {
 
   computeLogits(hiddenStates: Tensor, model: ChatModel, allTokens: boolean = false): Tensor {
     const lmHead = model.tensors.get("lm_head.weight")!;
-    const batchSize = this.batchSize;
     if (this.isDecode) {
-      return hiddenStates.linear(lmHead, batchSize).removeTracking();
+      return hiddenStates.linear(lmHead).removeTracking();
     }
     else if (allTokens) {
-      return hiddenStates.linear(lmHead, this.totalTokens).removeTracking();
+      return hiddenStates.linear(lmHead).removeTracking();
     }
     else {
       using lastIdxFromIndptr = this.lastIdx;
-      using hiddenLast = hiddenStates.indexSelect(lastIdxFromIndptr, this.batchSize, -1);
-      return hiddenLast.linear(lmHead, batchSize).removeTracking();
+      using hiddenLast = hiddenStates.indexSelect(lastIdxFromIndptr, -1);
+      return hiddenLast.linear(lmHead).removeTracking();
     }
   }
 

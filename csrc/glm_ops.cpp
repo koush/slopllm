@@ -1187,30 +1187,6 @@ static Napi::Value AddBroadcast(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value RowScaleAdd(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 6) {
-        Napi::TypeError::New(env, "Expected (ctx, out, input, scales, rows, dim)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t scales_ptr = info[3].As<Napi::Number>().Int64Value();
-    int rows = info[4].As<Napi::Number>().Int32Value();
-    int dim = info[5].As<Napi::Number>().Int32Value();
-    glm_row_scale_add(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                      reinterpret_cast<void*>(out_ptr),
-                      reinterpret_cast<const void*>(in_ptr),
-                      reinterpret_cast<const void*>(scales_ptr),
-                      rows, dim);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        Napi::Error::New(env, std::string("rowScaleAdd failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
-    }
-    return env.Undefined();
-}
-
 static Napi::Value ExpandDim1(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 8) {
@@ -1376,31 +1352,6 @@ static Napi::Value GroupMaskMul(const Napi::CallbackInfo& info) {
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("groupMaskMul failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
-    }
-    return env.Undefined();
-}
-
-static Napi::Value ExpertScale(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 7) {
-        Napi::TypeError::New(env, "Expected (ctx, out, weights, indices, expert_id, topK, batch)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t weights_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t indices_ptr = info[3].As<Napi::Number>().Int64Value();
-    int expert_id = info[4].As<Napi::Number>().Int32Value();
-    int topK = info[5].As<Napi::Number>().Int32Value();
-    int batch = info[6].As<Napi::Number>().Int32Value();
-    glm_expert_scale(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                      reinterpret_cast<void*>(out_ptr),
-                      reinterpret_cast<const void*>(weights_ptr),
-                      reinterpret_cast<const int*>(indices_ptr),
-                      expert_id, topK, batch);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        Napi::Error::New(env, std::string("expertScale failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }
     return env.Undefined();
 }
@@ -4208,7 +4159,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "rmsNormPointers"), Napi::Function::New(env, RmsnormPointersSmem));
     exports.Set(Napi::String::New(env, "add"), Napi::Function::New(env, Add));
     exports.Set(Napi::String::New(env, "addBroadcast"), Napi::Function::New(env, AddBroadcast));
-    exports.Set(Napi::String::New(env, "rowScaleAdd"), Napi::Function::New(env, RowScaleAdd));
     exports.Set(Napi::String::New(env, "expandDim1"), Napi::Function::New(env, ExpandDim1));
     exports.Set(Napi::String::New(env, "transpose4d"), Napi::Function::New(env, Transpose4d));
     exports.Set(Napi::String::New(env, "mul"), Napi::Function::New(env, Mul));
@@ -4216,7 +4166,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "reduceSum"), Napi::Function::New(env, ReduceSum));
     exports.Set(Napi::String::New(env, "rowNormalize"), Napi::Function::New(env, RowNormalize));
     exports.Set(Napi::String::New(env, "groupMaskMul"), Napi::Function::New(env, GroupMaskMul));
-    exports.Set(Napi::String::New(env, "expertScale"), Napi::Function::New(env, ExpertScale));
     exports.Set(Napi::String::New(env, "mulMatId"), Napi::Function::New(env, MulMatId));
     exports.Set(Napi::String::New(env, "nvfp4MulMatId"), Napi::Function::New(env, Nvfp4MulMatId));
     exports.Set(Napi::String::New(env, "scatterAddRows"), Napi::Function::New(env, ScatterAddRows));

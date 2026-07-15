@@ -176,18 +176,17 @@ export abstract class Tensor implements Disposable {
   abstract h2d(data: Buffer, size?: number): void;
   abstract d2h(buf: Buffer, size?: number): void;
 
-  linear(weight: Tensor, batch: number): Tensor {
+  linear(weight: Tensor): Tensor {
     if (this.shape.length !== 2) throw new Error(`linear: input must be 2D, got shape [${this.shape}]`);
     if (weight.shape.length !== 2) throw new Error(`linear: weight must be 2D, got shape [${weight.shape}]`);
-    if (this.shape[0] < batch) throw new Error(`linear: input batch ${this.shape[0]} < ${batch}`);
     const weightK = weight.type === "U8" ? weight.shape[1] * 2 : weight.shape[1]; // NVFP4: packed K/2
     if (this.shape[1] !== weightK) throw new Error(`linear: input dim ${this.shape[1]} != weight dim ${weightK} (weight type ${weight.type}, shape [${weight.shape}])`);
     if (weight.type !== "BF16" && weight.type !== "F8_E4M3" && weight.type !== "U8") throw new Error(`linear: weight type must be BF16, F8_E4M3, or U8, got ${weight.type}`);
     return undefined as never;
   }
 
-  outputProj(weight: Tensor, batch: number): Tensor {
-    return this.linear(weight, batch);
+  outputProj(weight: Tensor): Tensor {
+    return this.linear(weight);
   }
 
   bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
@@ -205,30 +204,33 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
-    if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== dim) {
-      throw new Error(`rmsnorm: input shape [${this.shape}] incompatible with batch=${batch}, dim=${dim}`);
+  rmsnorm(weight: Tensor, eps: number): Tensor {
+    if (this.shape.length !== 2) {
+      throw new Error(`rmsnorm: expected 2D input, got [${this.shape}]`);
     }
+    const dim = this.shape[1];
     if (weight.numElements !== dim) throw new Error(`rmsnorm: weight has ${weight.numElements} elements, expected ${dim}`);
     return undefined as never;
   }
 
-  layernorm(weight: Tensor, bias: Tensor, eps: number, dim: number, batch: number): Tensor {
-    if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== dim) {
-      throw new Error(`layernorm: input shape [${this.shape}] incompatible with batch=${batch}, dim=${dim}`);
+  layernorm(weight: Tensor, bias: Tensor, eps: number): Tensor {
+    if (this.shape.length !== 2) {
+      throw new Error(`layernorm: expected 2D input, got [${this.shape}]`);
     }
+    const dim = this.shape[1];
     if (weight.numElements !== dim) throw new Error(`layernorm: weight has ${weight.numElements} elements, expected ${dim}`);
     if (bias.numElements !== dim) throw new Error(`layernorm: bias has ${bias.numElements} elements, expected ${dim}`);
     return undefined as never;
   }
 
-  fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
-    if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== dim) {
-      throw new Error(`fusedAddRmsnorm: residual shape [${this.shape}] incompatible with batch=${batch}, dim=${dim}`);
+  fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number): { normed: Tensor, residual: Tensor } {
+    if (this.shape.length !== 2) {
+      throw new Error(`fusedAddRmsnorm: expected 2D residual, got [${this.shape}]`);
     }
-    if (input.shape.length !== 2 || input.shape[0] < batch || input.shape[1] !== dim) {
-      throw new Error(`fusedAddRmsnorm: input shape [${input.shape}] incompatible with batch=${batch}, dim=${dim}`);
+    if (input.shape.length !== 2 || input.shape[0] !== this.shape[0] || input.shape[1] !== this.shape[1]) {
+      throw new Error(`fusedAddRmsnorm: input shape [${input.shape}] does not match residual shape [${this.shape}]`);
     }
+    const dim = this.shape[1];
     if (weight.numElements !== dim) throw new Error(`fusedAddRmsnorm: weight has ${weight.numElements} elements, expected ${dim}`);
     return undefined as never;
   }
@@ -242,35 +244,35 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
-    if (this.shape.length !== 2 || this.shape[1] !== hidden) {
-      throw new Error(`embedding: table shape [${this.shape}] incompatible with hidden=${hidden}`);
+  embedding(ids: Tensor): Tensor {
+    if (this.shape.length !== 2) {
+      throw new Error(`embedding: table must be 2D, got [${this.shape}]`);
     }
     if (ids.type !== "I32") throw new Error(`embedding: ids must be I32, got ${ids.type}`);
-    if (ids.shape.length !== 1 || ids.shape[0] < seqLen) {
-      throw new Error(`embedding: ids shape [${ids.shape}] insufficient for seqLen=${seqLen}`);
+    if (ids.shape.length !== 1) {
+      throw new Error(`embedding: ids must be 1D, got [${ids.shape}]`);
     }
     return undefined as never;
   }
 
-  siluAndMul(up: Tensor, intermediate: number, batch: number): Tensor {
-    if (this.shape.length !== 2 || this.shape[0] < batch || this.shape[1] !== intermediate) {
-      throw new Error(`siluAndMul: gate shape [${this.shape}] incompatible with batch=${batch}, intermediate=${intermediate}`);
+  siluAndMul(up: Tensor): Tensor {
+    if (this.shape.length !== 2) {
+      throw new Error(`siluAndMul: gate must be 2D, got [${this.shape}]`);
     }
-    if (up.shape.length !== 2 || up.shape[0] < batch || up.shape[1] !== intermediate) {
-      throw new Error(`siluAndMul: up shape [${up.shape}] incompatible with batch=${batch}, intermediate=${intermediate}`);
+    if (up.shape.length !== 2 || up.shape[0] !== this.shape[0] || up.shape[1] !== this.shape[1]) {
+      throw new Error(`siluAndMul: up shape [${up.shape}] does not match gate shape [${this.shape}]`);
     }
     if (this.type !== up.type) throw new Error(`siluAndMul: gate type ${this.type} != up type ${up.type}`);
     return undefined as never;
   }
 
-  swiGluMlp(weights: { gate: Tensor, up: Tensor, down: Tensor }, intermediateSize: number, BS: number): Tensor {
-    using upStream = this.workspace.glm.withStream(() => this.linear(weights.up, BS));
+  swiGluMlp(weights: { gate: Tensor, up: Tensor, down: Tensor }): Tensor {
+    using upStream = this.workspace.glm.withStream(() => this.linear(weights.up));
     using upBuf = upStream.result;
-    using gateBuf = this.linear(weights.gate, BS);
+    using gateBuf = this.linear(weights.gate);
     upStream.streamWaitEvent();
-    using siluBuf = gateBuf.siluAndMul(upBuf, intermediateSize, BS);
-    return siluBuf.linear(weights.down, BS);
+    using siluBuf = gateBuf.siluAndMul(upBuf);
+    return siluBuf.linear(weights.down);
   }
 
   /** SiLU-gated MoE MLP: gate_proj + up_proj → silu_and_mul → down_proj.
@@ -314,12 +316,9 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  indexSelect(indices: Tensor, batch: number, offset: number = 0): Tensor {
+  indexSelect(indices: Tensor, offset: number = 0): Tensor {
     if (this.shape.length !== 2) throw new Error(`indexSelect: input must be 2D, got shape [${this.shape}]`);
     if (indices.type !== "I32") throw new Error(`indexSelect: indices must be I32, got ${indices.type}`);
-    if (indices.numElements < batch) {
-      throw new Error(`indexSelect: indices has ${indices.numElements} elements (shape [${indices.shape}]${this.view ? ', view of [' + this.view.shape + ']' : ''}), insufficient for batch=${batch}`);
-    }
     return undefined as never;
   }
 
@@ -340,17 +339,19 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
-    if (input.shape.length !== 2 || input.shape[0] < batch || input.shape[1] !== dim) {
-      throw new Error(`rmsnormGated: input shape [${input.shape}] incompatible with batch=${batch}, dim=${dim}`);
+  rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number): void {
+    if (input.shape.length !== 2) {
+      throw new Error(`rmsnormGated: input must be 2D, got [${input.shape}]`);
     }
-    if (gate.shape.length !== 2 || gate.shape[0] < batch || gate.shape[1] !== dim) {
-      throw new Error(`rmsnormGated: gate shape [${gate.shape}] incompatible with batch=${batch}, dim=${dim}`);
+    const dim = input.shape[1];
+    const batch = input.shape[0];
+    if (gate.shape.length !== 2 || gate.shape[0] !== batch || gate.shape[1] !== dim) {
+      throw new Error(`rmsnormGated: gate shape [${gate.shape}] does not match input shape [${input.shape}]`);
     }
     if (weight.numElements !== dim) throw new Error(`rmsnormGated: weight has ${weight.numElements} elements, expected ${dim}`);
   }
 
-  gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
+  gateSigmoidMul(gate: Tensor, numHeads: number, headDim: number): void {
     if (gate.type !== this.type) throw new Error(`gateSigmoidMul: gate type ${gate.type} != output type ${this.type}`);
   }
 
@@ -475,7 +476,7 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
+  scatterScalar(indices: Tensor, value: number, k: number): void {
   }
 
   maskedFill(mask: Tensor, value: number, n: number): void {
@@ -485,28 +486,22 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  rowScaleAdd(input: Tensor, scales: Tensor, rows: number, dim: number): void {
-  }
-
-  reduceSum(dim: number, batch: number): Tensor {
+  reduceSum(): Tensor {
     return undefined as never;
   }
 
-  rowNormalize(scale: number, dim: number, batch: number, normalize?: boolean): Tensor {
+  rowNormalize(scale: number, normalize?: boolean): Tensor {
     return undefined as never;
   }
 
-  groupMaskMul(groupMask: Tensor, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void {
-  }
-
-  expertScale(weights: Tensor, indices: Tensor, expertId: number, topK: number, batch: number): void {
+  groupMaskMul(groupMask: Tensor, expertsPerGroup: number, nGroup: number): void {
   }
 
   mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
     return undefined as never;
   }
 
-  scatterAddRows(scales: Tensor, topK: number, dim: number, numRows: number): Tensor {
+  scatterAddRows(scales: Tensor, topK: number, numRows: number): Tensor {
     return undefined as never;
   }
 

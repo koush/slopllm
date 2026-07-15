@@ -1,4 +1,4 @@
-"""Tests for GLM-5.1 MoE: CUDA row_scale_add + add vs torch reference.
+"""Tests for GLM-5.1 MoE: CUDA add vs torch reference.
 
 Validates the full MoE sparse MLP (routing + expert dispatch + shared expert)
 using CUDA kernels against the pure PyTorch reference.
@@ -164,8 +164,7 @@ def run_moe_cuda(glm, cfg, layer, post_normed_gpu, B, S):
 
         scale_bf16 = _f32_to_bf16(scale_f32).to("cuda")
 
-        glm.row_scale_add(routed_out_gpu.data_ptr(), expert_down.data_ptr(),
-                         scale_bf16.data_ptr(), BS, hidden_size)
+        routed_out_gpu += scale_bf16.unsqueeze(1) * expert_down
 
     shared_gate_w_gpu = _upload_tensor(glm, layer.mlp.shared_gate_w)
     shared_up_w_gpu = _upload_tensor(glm, layer.mlp.shared_up_w)

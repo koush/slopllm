@@ -43,7 +43,7 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     idx.h2d(idxBuf);
     glm.synchronize();
 
-    using out = src.indexSelect(idx, k);
+    using out = src.indexSelect(idx);
     glm.synchronize();
 
     const outBuf = Buffer.alloc(k * dim * 2);
@@ -74,7 +74,7 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     idx.h2d(idxBuf);
     glm.synchronize();
 
-    using out = src.indexSelect(idx, k);
+    using out = src.indexSelect(idx);
     glm.synchronize();
 
     const outBuf = Buffer.alloc(k * dim * 2);
@@ -113,7 +113,7 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     idx.h2d(idxBuf);
     glm.synchronize();
 
-    using out = src.indexSelect(idx, k);
+    using out = src.indexSelect(idx);
     glm.synchronize();
 
     const outBuf = Buffer.alloc(k * dim * 2);
@@ -151,7 +151,7 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     idx.h2d(idxBuf);
     glm.synchronize();
 
-    using out = src.indexSelect(idx, k);
+    using out = src.indexSelect(idx);
     glm.synchronize();
 
     const outBuf = Buffer.alloc(k * dim * 2);
@@ -189,7 +189,7 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     idx.h2d(idxBuf);
     glm.synchronize();
 
-    using out = src.indexSelect(idx, k);
+    using out = src.indexSelect(idx);
     glm.synchronize();
 
     const outBuf = Buffer.alloc(k * dim * 2);
@@ -205,13 +205,7 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
   it("throws if indices are not I32", () => {
     const src = ws.alloc([4, 8], "BF16");
     const idx = ws.alloc([2], "BF16");
-    assert.throws(() => src.indexSelect(idx, 2), /indices must be I32/);
-  });
-
-  it("throws if indices too small for batch", () => {
-    const src = ws.alloc([4, 8], "BF16");
-    const idx = ws.alloc([1], "I32");
-    assert.throws(() => src.indexSelect(idx, 2), /insufficient for batch/);
+    assert.throws(() => src.indexSelect(idx), /indices must be I32/);
   });
 
   it("selects rows with negative offset (qoIndptr pattern)", () => {
@@ -231,7 +225,7 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     glm.synchronize();
 
     const indptrTail = indptr.narrow(1, batchSize);
-    using selected = src.indexSelect(indptrTail, batchSize, -1);
+    using selected = src.indexSelect(indptrTail, -1);
     glm.synchronize();
 
     const buf = Buffer.alloc(batchSize * dim * 2);
@@ -263,7 +257,7 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     src.h2d(f32ToBf16Bytes(srcF32));
     glm.synchronize();
 
-    using out = src.indexSelect(indices, 2, 2);
+    using out = src.indexSelect(indices, 2);
     glm.synchronize();
 
     const buf = Buffer.alloc(2 * dim * 2);

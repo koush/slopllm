@@ -100,7 +100,7 @@ export class Qwen3Model extends ChatModel {
   }
 
   private mlp(normed: Tensor, BS: number, pfx: string): Tensor {
-    return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`), this.cfg.intermediateSize, BS);
+    return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`));
   }
 
   forwardModel(state: ExecutionState): Tensor {
@@ -118,22 +118,23 @@ export class Qwen3Model extends ChatModel {
     const S = state.isDecode ? 1 : totalTokens;
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
-    using residual = new UsingHolder(embedTable.embedding(state.input!, hs, BS));
+    using inputIds = state.input!.narrow(0, BS);
+    using residual = new UsingHolder(embedTable.embedding(inputIds));
 
     using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, hd / 2, B, S));
     using cos = rotaryEmbedding.result.cos;
     using sin = rotaryEmbedding.result.sin;
 
-    using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
+    using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`model.layers.0.input_layernorm.weight`)!, cfg.rmsNormEps));
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
 
-      using vStream = this.glm.withStream(() => normed.value.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!, BS));
+      using vStream = this.glm.withStream(() => normed.value.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!));
       using vBuf = vStream.result;
 
       using kStream = this.glm.withStream(() => {
-        using kBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!, BS);
+        using kBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!);
 
         if (!i) {
           rotaryEmbedding.streamWaitEvent();
@@ -144,7 +145,7 @@ export class Qwen3Model extends ChatModel {
         state.kvCacheWrite(kRope, vBuf, i, nKv, hd);
       });
 
-      using qBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.q_proj.weight`)!, BS);
+      using qBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.q_proj.weight`)!);
       if (!i) {
         rotaryEmbedding.streamWaitEvent();
       }
@@ -162,8 +163,8 @@ export class Qwen3Model extends ChatModel {
       }
 
       using reshapedFlashOut = flashOut.value.reshape([BS, nHeads * hd]);
-      using oProjBuf = reshapedFlashOut.outputProj(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!, BS);
-      const attnResult = residual.value.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      using oProjBuf = reshapedFlashOut.outputProj(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!);
+      const attnResult = residual.value.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
       using attnNormed = attnResult.normed;
       residual.replace(attnResult.residual);
 
@@ -171,7 +172,7 @@ export class Qwen3Model extends ChatModel {
       const nextWeight = i < cfg.numHiddenLayers - 1
         ? this.tensors.get(`model.layers.${i + 1}.input_layernorm.weight`)!
         : this.tensors.get("model.norm.weight")!;
-      const mlpResult = residual.value.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
+      const mlpResult = residual.value.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
       normed.replace(mlpResult.normed);
       residual.replace(mlpResult.residual);
     }

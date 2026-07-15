@@ -324,7 +324,7 @@ export class Glm51Model extends ChatModel {
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
-    return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`), this.cfg.intermediateSize, BS);
+    return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`));
   }
 
   private getExpertWeights(pfx: string, proj: string): Tensor[] {
@@ -350,10 +350,10 @@ export class Glm51Model extends ChatModel {
     // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
     using sharedDownBufStream = this.glm.withStream(() => {
       const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
-      return normed.swiGluMlp(sharedWeights, moeIntermediate, BS);
+      return normed.swiGluMlp(sharedWeights);
     });
 
-    using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!, BS);
+    using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!);
     using gateSigmoid = gateLogitsBuf.sigmoid();
 
     using topkInputHolder = new UsingHolder<Tensor>(undefined!);
@@ -372,15 +372,15 @@ export class Glm51Model extends ChatModel {
       using groupTopkReshaped = topkInputHolder.value.reshape([BS * nGroup, expertsPerGroup]);
       const groupTopk = groupTopkReshaped.topk(2, expertsPerGroup);
       using _groupTopkValues = groupTopk.values;
-      using groupSums = groupTopk.values.reduceSum(2, BS * nGroup);
+      using groupSums = groupTopk.values.reduceSum();
       using groupSums2d = groupSums.reshape([BS, nGroup]);
       const groupIdxTopk = groupSums2d.topk(topkGroup, nGroup);
       using _groupIdxValues = groupIdxTopk.values;
       using groupIdx = groupIdxTopk.indices;
       using groupMask = ws.alloc([BS, nGroup], "BF16");
       groupMask.fill(0, BS * nGroup);
-      groupMask.scatterScalar(groupIdx, 1.0, topkGroup, nGroup, BS);
-      topkInputHolder.value.groupMaskMul(groupMask, numExperts, expertsPerGroup, nGroup, BS);
+      groupMask.scatterScalar(groupIdx, 1.0, topkGroup);
+      topkInputHolder.value.groupMaskMul(groupMask, expertsPerGroup, nGroup);
     }
 
     const topkResult = topkInputHolder.value.topk(topK, numExperts);
@@ -389,7 +389,7 @@ export class Glm51Model extends ChatModel {
 
     using normalizedWeightsStream = this.glm.withStream(() => {
       using selectedScores = gateSigmoid.gather(topkIndices, topK, numExperts, BS);
-      return selectedScores.rowNormalize(cfg.routedScalingFactor, topK, BS, cfg.normTopkProb);
+      return selectedScores.rowNormalize(cfg.routedScalingFactor, cfg.normTopkProb);
     });
 
     const count = BS * topK;
@@ -404,7 +404,7 @@ export class Glm51Model extends ChatModel {
     normalizedWeightsStream.streamWaitEvent();
     using normalizedWeights = normalizedWeightsStream.result;
     using normalizedWeightsFlat = normalizedWeights.reshape([count]);
-    using routedOut = downOut.scatterAddRows(normalizedWeightsFlat, topK, hs, BS);
+    using routedOut = downOut.scatterAddRows(normalizedWeightsFlat, topK, BS);
 
     sharedDownBufStream.streamWaitEvent();
     using sharedDownBuf = sharedDownBufStream.result;
@@ -430,13 +430,13 @@ export class Glm51Model extends ChatModel {
 
     using kvcache = this.glm.withStream(() => {
       using kPeRopeStream = this.glm.withStream(() => {
-        using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!, BS);
+        using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!);
         return kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave)
       });
       using kPeRope = kPeRopeStream.result;
 
-      using ckv = normed.linear(this.tensors.get(`${pfx}.ckv_proj.weight`)!, BS);
-      using ckvNormed = ckv.rmsnorm(this.tensors.get(`${pfx}.kv_a_layernorm.weight`)!, cfg.rmsNormEps, kvLoraRank, BS);
+      using ckv = normed.linear(this.tensors.get(`${pfx}.ckv_proj.weight`)!);
+      using ckvNormed = ckv.rmsnorm(this.tensors.get(`${pfx}.kv_a_layernorm.weight`)!, cfg.rmsNormEps);
 
       kPeRopeStream.streamWaitEvent();
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
@@ -449,11 +449,11 @@ export class Glm51Model extends ChatModel {
       : this.glm.withStream(() => {
         const idxRopeDim = qkRopeDim;
         const idxNopeDim = cfg.indexHeadDim - idxRopeDim;
-        using idxKRaw = normed.linear(this.tensors.get(`${pfx}.indexer.wk.weight`)!, BS);
+        using idxKRaw = normed.linear(this.tensors.get(`${pfx}.indexer.wk.weight`)!);
         using idxKNormed = idxKRaw.layernorm(
           this.tensors.get(`${pfx}.indexer.k_norm.weight`)!,
           this.tensors.get(`${pfx}.indexer.k_norm.bias`)!,
-          1e-6, cfg.indexHeadDim, BS,
+          1e-6,
         );
         using idxKOut = idxNopeDim > 0
           ? (() => {
@@ -468,8 +468,8 @@ export class Glm51Model extends ChatModel {
       });
 
     using q = this.glm.withStream(() => {
-      using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!, BS);
-      using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps, cfg.qLoraRank, BS);
+      using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
+      using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
 
       // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
       // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
@@ -480,10 +480,10 @@ export class Glm51Model extends ChatModel {
           const idxHeadDim = cfg.indexHeadDim;
           const idxTopk = cfg.indexTopk;
 
-          using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!, BS);
+          using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!);
           idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
 
-          using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!, BS);
+          using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!);
           using idxQ = idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
 
           kvcacheIndex?.streamWaitEvent();
@@ -496,12 +496,12 @@ export class Glm51Model extends ChatModel {
         });
 
       using qPeR = this.glm.withStream(() => {
-        using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!, BS);
+        using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!);
         return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
       });
 
       using qAbsorbedRStream = this.glm.withStream(() => {
-        using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!, BS);
+        using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!);
         return state.isDecode
           ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
           : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
@@ -555,10 +555,10 @@ export class Glm51Model extends ChatModel {
 
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
       using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);
-      oProjBuf.replace(vExpanded.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!, BS));
+      oProjBuf.replace(vExpanded.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!));
     }
 
-    const attnResult = residual.fusedAddRmsnorm(oProjBuf.value, this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+    const attnResult = residual.fusedAddRmsnorm(oProjBuf.value, this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
 
@@ -577,7 +577,7 @@ export class Glm51Model extends ChatModel {
     } else {
       nextWeight = this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.shared_head.norm.weight`)!;
     }
-    const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps, hs, BS);
+    const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
@@ -596,8 +596,9 @@ export class Glm51Model extends ChatModel {
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
 
-    using residual = new UsingHolder(embedTable.embedding(state.input!, hs, BS));
-    using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}0.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS));
+    using inputIds = state.input!.narrow(0, BS);
+    using residual = new UsingHolder(embedTable.embedding(inputIds));
+    using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}0.input_layernorm.weight`)!, cfg.rmsNormEps));
 
     rotaryEmbedding.streamWaitEvent();
     using cos = rotaryEmbedding.result.cos;
@@ -635,20 +636,21 @@ export class Glm51Model extends ChatModel {
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
     using hnormStream = ws.glm.withStream(() => {
-      return previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps, hs, BS);
+      return previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps);
     });
-    using embedding = embedTable.embedding(state.input!, hs, BS);
+    using inputIds = state.input!.narrow(0, BS);
+    using embedding = embedTable.embedding(inputIds);
     if (maskPos0) {
       using firstRow = embedding.narrow(0, 1);
       firstRow.fill(0, hs);
     }
-    using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps, hs, BS);
+    using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps);
     hnormStream.streamWaitEvent();
     using hnorm = hnormStream.result;
     using cat = enorm.cat([hnorm], 1);
 
-    using residual = cat.linear(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.eh_proj.weight`)!, BS);
-    using normed = residual.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.input_layernorm.weight`)!, cfg.rmsNormEps, hs, BS);
+    using residual = cat.linear(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.eh_proj.weight`)!);
+    using normed = residual.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.input_layernorm.weight`)!, cfg.rmsNormEps);
 
     rotaryEmbedding.streamWaitEvent();
     using cos = rotaryEmbedding.result.cos;

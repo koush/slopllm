@@ -206,9 +206,6 @@ void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n);
 
 void glm_add_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int dim, int rows);
 
-void glm_row_scale_add(GlmCtx* ctx, void* out, const void* input,
-                        const void* scales, int rows, int dim);
-
 void glm_expand_dim1(GlmCtx* ctx, void* out, const void* input,
                      int dim1_out, int dim1_in, int seq_len, int head_dim, int batch);
 
@@ -231,9 +228,6 @@ void glm_row_normalize(GlmCtx* ctx, void* out, const void* input,
 
 void glm_group_mask_mul(GlmCtx* ctx, void* scores, const void* group_mask,
                          int num_experts, int experts_per_group, int n_group, int batch);
-
-void glm_expert_scale(GlmCtx* ctx, void* out, const void* weights,
-                       const int* indices, int expert_id, int topK, int batch);
 
 void glm_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
                      const void* const* weight_ptrs,

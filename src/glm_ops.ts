@@ -190,11 +190,9 @@ interface NativeAddon {
   scatterScalar(ctx: number, out: number, indices: number, value: number, k: number, outDim: number, batch: number): void;
   maskedFill(ctx: number, out: number, input: number, mask: number, value: number, n: number): void;
   applyRotaryPosEmbPartial(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
-  rowScaleAdd(ctx: number, out: number, input: number, scales: number, rows: number, dim: number): void;
   reduceSum(ctx: number, out: number, input: number, rows: number, cols: number): void;
   rowNormalize(ctx: number, out: number, input: number, scale: number, rows: number, cols: number, normalize: boolean): void;
   groupMaskMul(ctx: number, scores: number, groupMask: number, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void;
-  expertScale(ctx: number, out: number, weights: number, indices: number, expertId: number, topK: number, batch: number): void;
   mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
   mulMatIdGrouped(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   groupedMoeWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
@@ -253,8 +251,9 @@ export class GlmTensor extends Tensor {
     getNativeAddon().d2h(this.glm.ctx, buf, this.data, size ?? buf.length);
   }
 
-  linear(weight: Tensor, batch: number): Tensor {
-    super.linear(weight, batch);
+  linear(weight: Tensor): Tensor {
+    super.linear(weight);
+    const batch = this.shape[0];
     const n = weight.shape[0];
     let k = weight.shape[1];
     const outShape = [batch, n];
@@ -305,22 +304,28 @@ export class GlmTensor extends Tensor {
       ptrs[4], ptrs[5], ptrs[6], ptrs[7], n);
   }
 
-  rmsnorm(weight: Tensor, eps: number, dim: number, batch: number): Tensor {
-    super.rmsnorm(weight, eps, dim, batch);
+  rmsnorm(weight: Tensor, eps: number): Tensor {
+    super.rmsnorm(weight, eps);
+    const batch = this.shape[0];
+    const dim = this.shape[1];
     const out = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().rmsnorm(this.glm.ctx, out.data, this.data, weight.data, eps, dim, batch);
     return out;
   }
 
-  layernorm(weight: Tensor, bias: Tensor, eps: number, dim: number, batch: number): Tensor {
-    super.layernorm(weight, bias, eps, dim, batch);
+  layernorm(weight: Tensor, bias: Tensor, eps: number): Tensor {
+    super.layernorm(weight, bias, eps);
+    const batch = this.shape[0];
+    const dim = this.shape[1];
     const out = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().layernorm(this.glm.ctx, out.data, this.data, weight.data, bias.data, eps, dim, batch);
     return out;
   }
 
-  fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number, dim: number, batch: number): { normed: Tensor, residual: Tensor } {
-    super.fusedAddRmsnorm(input, weight, eps, dim, batch);
+  fusedAddRmsnorm(input: Tensor, weight: Tensor, eps: number): { normed: Tensor, residual: Tensor } {
+    super.fusedAddRmsnorm(input, weight, eps);
+    const batch = this.shape[0];
+    const dim = this.shape[1];
     const normed = this.workspace.alloc([batch, dim], this.type);
     const residual = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().fusedAddRmsnorm(this.glm.ctx, normed.data, residual.data, this.data, input.data, weight.data, eps, dim, batch);
@@ -334,15 +339,19 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  embedding(ids: Tensor, hidden: number, seqLen: number): Tensor {
-    super.embedding(ids, hidden, seqLen);
+  embedding(ids: Tensor): Tensor {
+    super.embedding(ids);
+    const hidden = this.shape[1];
+    const seqLen = ids.numElements;
     const out = ids.workspace.alloc([seqLen, hidden], this.type);
     getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, ids.data, hidden, seqLen, 0);
     return out;
   }
 
-  siluAndMul(up: Tensor, intermediate: number, batch: number): Tensor {
-    super.siluAndMul(up, intermediate, batch);
+  siluAndMul(up: Tensor): Tensor {
+    super.siluAndMul(up);
+    const batch = this.shape[0];
+    const intermediate = this.shape[1];
     const out = this.workspace.alloc([batch, intermediate], this.type);
     getNativeAddon().siluAndMul(this.glm.ctx, out.data, this.data, up.data, intermediate, batch);
     return out;
@@ -370,8 +379,9 @@ export class GlmTensor extends Tensor {
     return { values, indices };
   }
 
-  indexSelect(indices: Tensor, batch: number, offset: number = 0): Tensor {
-    super.indexSelect(indices, batch, offset);
+  indexSelect(indices: Tensor, offset: number = 0): Tensor {
+    super.indexSelect(indices, offset);
+    const batch = indices.numElements;
     const dim = this.shape[1];
     const out = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, indices.data, dim, batch, offset);
@@ -405,13 +415,16 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number, dim: number, batch: number): void {
-    super.rmsnormGated(input, gate, weight, eps, dim, batch);
+  rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number): void {
+    super.rmsnormGated(input, gate, weight, eps);
+    const dim = input.shape[1];
+    const batch = input.shape[0];
     getNativeAddon().rmsnormGated(this.glm.ctx, this.data, input.data, gate.data, weight.data, eps, dim, batch);
   }
 
-  gateSigmoidMul(gate: Tensor, batchSeq: number, numHeads: number, headDim: number): void {
-    super.gateSigmoidMul(gate, batchSeq, numHeads, headDim);
+  gateSigmoidMul(gate: Tensor, numHeads: number, headDim: number): void {
+    super.gateSigmoidMul(gate, numHeads, headDim);
+    const batchSeq = this.numElements / (numHeads * headDim);
     getNativeAddon().gateSigmoidMul(this.glm.ctx, this.data, gate.data, batchSeq, numHeads, headDim);
   }
 
@@ -663,7 +676,9 @@ export class GlmTensor extends Tensor {
     return this.workspace.glm.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this);
   }
 
-  scatterScalar(indices: Tensor, value: number, k: number, outDim: number, batch: number): void {
+  scatterScalar(indices: Tensor, value: number, k: number): void {
+    const outDim = this.shape[1];
+    const batch = this.shape[0];
     getNativeAddon().scatterScalar(this.glm.ctx, this.data, indices.data, value, k, outDim, batch);
   }
 
@@ -677,28 +692,26 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  rowScaleAdd(input: Tensor, scales: Tensor, rows: number, dim: number): void {
-    getNativeAddon().rowScaleAdd(this.glm.ctx, this.data, input.data, scales.data, rows, dim);
-  }
-
-  reduceSum(dim: number, batch: number): Tensor {
+  reduceSum(): Tensor {
+    const batch = this.shape[0];
+    const dim = this.shape[1];
     const out = this.workspace.alloc([batch], this.type);
     getNativeAddon().reduceSum(this.glm.ctx, out.data, this.data, batch, dim);
     return out;
   }
 
-  rowNormalize(scale: number, dim: number, batch: number, normalize: boolean = true): Tensor {
+  rowNormalize(scale: number, normalize: boolean = true): Tensor {
+    const batch = this.shape[0];
+    const dim = this.shape[1];
     const out = this.workspace.alloc([batch, dim], this.type);
     getNativeAddon().rowNormalize(this.glm.ctx, out.data, this.data, scale, batch, dim, normalize);
     return out;
   }
 
-  groupMaskMul(groupMask: Tensor, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void {
+  groupMaskMul(groupMask: Tensor, expertsPerGroup: number, nGroup: number): void {
+    const batch = this.shape[0];
+    const numExperts = this.shape[1];
     getNativeAddon().groupMaskMul(this.glm.ctx, this.data, groupMask.data, numExperts, expertsPerGroup, nGroup, batch);
-  }
-
-  expertScale(weights: Tensor, indices: Tensor, expertId: number, topK: number, batch: number): void {
-    getNativeAddon().expertScale(this.glm.ctx, this.data, weights.data, indices.data, expertId, topK, batch);
   }
 
   mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
@@ -781,7 +794,7 @@ export class GlmTensor extends Tensor {
       using upOut = this.mulMatId(weights.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
       gateOutStream.streamWaitEvent();
       using gateOut = gateOutStream.result;
-      using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
+      using siluOut = gateOut.siluAndMul(upOut);
       return siluOut.mulMatId(weights.down, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
     }
 
@@ -811,11 +824,12 @@ export class GlmTensor extends Tensor {
 
     gateStream.streamWaitEvent();
     using gateOut = gateStream.result;
-    using siluOut = gateOut.siluAndMul(upOut, moeIntermediate, count);
+    using siluOut = gateOut.siluAndMul(upOut);
     return siluOut.mulMatId(weights.down, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
   }
 
-  scatterAddRows(scales: Tensor, topK: number, dim: number, numRows: number): Tensor {
+  scatterAddRows(scales: Tensor, topK: number, numRows: number): Tensor {
+    const dim = this.shape[1];
     const out = this.workspace.alloc([numRows, dim], this.type);
     getNativeAddon().scatterAddRows(this.glm.ctx, out.data, this.data, scales.data, topK, dim, numRows, 0);
     return out;

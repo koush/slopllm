@@ -988,7 +988,7 @@ describe("ParallelOps.reduceSum", () => {
     refInput.h2d(f32ToBf16Bytes(inputF32));
     ref.synchronize();
 
-    const refOut = refInput.reduceSum(dim, batch);
+    const refOut = refInput.reduceSum();
     ref.synchronize();
     const refBuf = Buffer.alloc(batch * 2);
     refOut.d2h(refBuf);
@@ -998,7 +998,7 @@ describe("ParallelOps.reduceSum", () => {
     pInput.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    const pOut = pInput.reduceSum(dim, batch) as ParallelTensor;
+    const pOut = pInput.reduceSum() as ParallelTensor;
     po.synchronize();
 
     assert.equal(pOut.parallelism, TensorParallelism.Replicated);
@@ -1029,7 +1029,7 @@ describe("ParallelOps.reduceSum", () => {
     refInput.h2d(f32ToBf16Bytes(inputF32));
     ref.synchronize();
 
-    const refOut = refInput.reduceSum(dim, batch);
+    const refOut = refInput.reduceSum();
     ref.synchronize();
     const refBuf = Buffer.alloc(batch * 2);
     refOut.d2h(refBuf);
@@ -1039,7 +1039,7 @@ describe("ParallelOps.reduceSum", () => {
     pInput.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    const pOut = pInput.reduceSum(dim, batch) as ParallelTensor;
+    const pOut = pInput.reduceSum() as ParallelTensor;
     po.synchronize();
 
     assert.equal(pOut.parallelism, TensorParallelism.PartialSum);

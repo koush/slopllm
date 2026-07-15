@@ -46,11 +46,11 @@ describe("withStream", () => {
     input.h2d(f32ToBf16Bytes(inputF32));
     weight.h2d(f32ToBf16Bytes(weightF32));
 
-    const refResult = input.linear(weight, M);
+    const refResult = input.linear(weight);
     glm.synchronize();
     const refData = readBf16(refResult, M * N);
 
-    using syncStream = glm.withStream(() => input.linear(weight, M));
+    using syncStream = glm.withStream(() => input.linear(weight));
     syncStream.streamWaitEvent();
     glm.synchronize();
     const streamData = readBf16(syncStream.result, M * N);
@@ -74,14 +74,14 @@ describe("withStream", () => {
     wA.h2d(f32ToBf16Bytes(wAF32));
     wB.h2d(f32ToBf16Bytes(wBF32));
 
-    const refA = input.linear(wA, M);
-    const refB = input.linear(wB, M);
+    const refA = input.linear(wA);
+    const refB = input.linear(wB);
     glm.synchronize();
     const refAData = readBf16(refA, M * N);
     const refBData = readBf16(refB, M * N);
 
-    using syncA = glm.withStream(() => input.linear(wA, M));
-    const refMain = input.linear(wB, M);
+    using syncA = glm.withStream(() => input.linear(wA));
+    const refMain = input.linear(wB);
     syncA.streamWaitEvent();
 
     glm.synchronize();
@@ -204,7 +204,7 @@ describe("withStream", () => {
     type StreamSync = Disposable & { result: Tensor; streamWaitEvent(): void };
     const syncs: StreamSync[] = [];
     for (let i = 0; i < 7; i++) {
-      syncs.push(glm.withStream(() => input.linear(weight, M)) as StreamSync);
+      syncs.push(glm.withStream(() => input.linear(weight)) as StreamSync);
     }
 
     assert.throws(() => {
@@ -214,7 +214,7 @@ describe("withStream", () => {
     for (const sync of syncs) { sync.streamWaitEvent(); (sync as Disposable)[Symbol.dispose](); }
 
     {
-      using sync = glm.withStream(() => input.linear(weight, M));
+      using sync = glm.withStream(() => input.linear(weight));
       sync.streamWaitEvent();
       glm.synchronize();
       const data = readBf16(sync.result, M * N);
