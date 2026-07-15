@@ -391,8 +391,8 @@ export class Qwen35Model extends ChatModel {
     using vBuf = normed.linear(this.tensors.get(`${pfx}.v_proj.weight`)!);
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    using qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nHeads, S, B, hd * 2);
-    using kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, hd, nKv, S, B);
+    using qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, S, B, hd * 2);
+    using kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, ropeDim, S, B);
 
     state.kvCacheWrite(kRope, vBuf, cacheIdx, nKv, hd);
 
@@ -441,7 +441,7 @@ export class Qwen35Model extends ChatModel {
     using residual = new UsingHolder(embedTable.embedding(inputIds));
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    const rotaryEmbedding = this.invFreq.rotaryEmbedding(ws.positionIds, ropeDim / 2, B, S);
+    const rotaryEmbedding = this.invFreq.rotaryEmbedding(ws.positionIds, B, S);
     using cos = rotaryEmbedding.cos;
     using sin = rotaryEmbedding.sin;
 

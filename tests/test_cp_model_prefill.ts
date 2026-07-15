@@ -276,7 +276,7 @@ describe("CP vs non-CP model prefill", () => {
           snap3("L0_normed_input", normed, BS * hs, isCp);
 
           using rotaryEmbedding = (model as any).glm.withStream(() =>
-            (model as any).invFreq.rotaryEmbedding(ws.positionIds, qkRD / 2, B, S));
+            (model as any).invFreq.rotaryEmbedding(ws.positionIds, B, S));
           using cos = rotaryEmbedding.result.cos;
           using sin = rotaryEmbedding.result.sin;
 

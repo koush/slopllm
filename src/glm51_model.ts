@@ -592,7 +592,7 @@ export class Glm51Model extends ChatModel {
     const ws = state.ws;
     const qkRopeDim = cfg.qkRopeHeadDim;
 
-    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(state.customMask?.positionIds || ws.positionIds, qkRopeDim / 2, B, S));
+    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(state.customMask?.positionIds || ws.positionIds, B, S));
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
 
@@ -632,7 +632,7 @@ export class Glm51Model extends ChatModel {
       throw new Error("forwardMtp called but model is not configured for MTP or has no next-n predict layers");
     }
 
-    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(state.customMask?.positionIds || ws.positionIds, qkRopeDim / 2, B, S));
+    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(state.customMask?.positionIds || ws.positionIds, B, S));
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
     using hnormStream = ws.glm.withStream(() => {

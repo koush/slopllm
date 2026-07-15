@@ -261,7 +261,7 @@ describe("ParallelOps.ropeTranspose", () => {
     refPosIds.h2d(positionIdsBuf);
     ref.synchronize();
 
-    const { cos: refCos, sin: refSin } = refInvFreq.rotaryEmbedding(refPosIds, dimHalf, batch, seqLen);
+    const { cos: refCos, sin: refSin } = refInvFreq.rotaryEmbedding(refPosIds, batch, seqLen);
     ref.synchronize();
 
     const refInput = refWs.alloc([totalRows, nHeads * headDim], "BF16");
@@ -280,7 +280,7 @@ describe("ParallelOps.ropeTranspose", () => {
     pPosIds.h2d(positionIdsBuf);
     po.synchronize();
 
-    const { cos: pCos, sin: pSin } = pInvFreq.rotaryEmbedding(pPosIds, dimHalf, batch, seqLen);
+    const { cos: pCos, sin: pSin } = pInvFreq.rotaryEmbedding(pPosIds, batch, seqLen);
     po.synchronize();
 
     const pInput = ws.alloc([totalRows, nHeads * headDim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
@@ -371,7 +371,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     refPosIds.h2d(positionIdsBuf);
     ref.synchronize();
 
-    const { cos: refCos, sin: refSin } = refInvFreq.rotaryEmbedding(refPosIds, dimHalf, batch, seqLen);
+    const { cos: refCos, sin: refSin } = refInvFreq.rotaryEmbedding(refPosIds, batch, seqLen);
     ref.synchronize();
 
     const refInput = refWs.alloc([batch, nHeads, seqLen, ropeDim], "BF16");
@@ -390,7 +390,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     pPosIds.h2d(positionIdsBuf);
     po.synchronize();
 
-    const { cos: pCos, sin: pSin } = pInvFreq.rotaryEmbedding(pPosIds, dimHalf, batch, seqLen);
+    const { cos: pCos, sin: pSin } = pInvFreq.rotaryEmbedding(pPosIds, batch, seqLen);
     po.synchronize();
 
     const pInput = ws.alloc([batch * nHeads, seqLen, ropeDim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
@@ -487,7 +487,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     refPosIds.h2d(positionIdsBuf);
     ref.synchronize();
 
-    const { cos: refCos, sin: refSin } = refInvFreq.rotaryEmbedding(refPosIds, dimHalf, batch, seqLen);
+    const { cos: refCos, sin: refSin } = refInvFreq.rotaryEmbedding(refPosIds, batch, seqLen);
     ref.synchronize();
 
     const refInput = refWs.alloc([batch, nHeads, seqLen, ropeDim], "BF16");
@@ -506,7 +506,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     pPosIds.h2d(positionIdsBuf);
     po.synchronize();
 
-    const { cos: pCos, sin: pSin } = pInvFreq.rotaryEmbedding(pPosIds, dimHalf, batch, seqLen);
+    const { cos: pCos, sin: pSin } = pInvFreq.rotaryEmbedding(pPosIds, batch, seqLen);
     po.synchronize();
 
     const pInput = ws.alloc([batch, nHeads, seqLen, ropeDim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;

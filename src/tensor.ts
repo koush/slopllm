@@ -235,8 +235,7 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
-    if (weight.numElements !== headDim) throw new Error(`fusedNormRope: weight has ${weight.numElements} elements, expected ${headDim}`);
+  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
     if (cos.shape.length !== sin.shape.length) throw new Error(`fusedNormRope: cos ndim ${cos.shape.length} != sin ndim ${sin.shape.length}`);
     for (let i = 0; i < cos.shape.length; i++) {
       if (cos.shape[i] !== sin.shape[i]) throw new Error(`fusedNormRope: cos shape [${cos.shape}] != sin shape [${sin.shape}]`);
@@ -391,7 +390,7 @@ export abstract class Tensor implements Disposable {
       throw new Error(`memcpy2d: src region end ${srcEnd} exceeds source ${src.bytes} bytes`);
     }
   }
-  rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
+  rotaryEmbedding(positionIds: Tensor, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     if (positionIds.type !== "I32") throw new Error(`rotaryEmbedding: positionIds must be I32, got ${positionIds.type}`);
     return undefined as never;
   }

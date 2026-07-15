@@ -121,7 +121,7 @@ export class Qwen3Model extends ChatModel {
     using inputIds = state.input!.narrow(0, BS);
     using residual = new UsingHolder(embedTable.embedding(inputIds));
 
-    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, hd / 2, B, S));
+    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(ws.positionIds, B, S));
     using cos = rotaryEmbedding.result.cos;
     using sin = rotaryEmbedding.result.sin;
 
@@ -140,7 +140,7 @@ export class Qwen3Model extends ChatModel {
           rotaryEmbedding.streamWaitEvent();
         }
 
-        using kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nKv, S, B);
+        using kRope = kBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.k_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, S, B);
         vStream.streamWaitEvent();
         state.kvCacheWrite(kRope, vBuf, i, nKv, hd);
       });
@@ -149,7 +149,7 @@ export class Qwen3Model extends ChatModel {
       if (!i) {
         rotaryEmbedding.streamWaitEvent();
       }
-      using qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, hd, nHeads, S, B);
+      using qRope = qBuf.fusedNormRope(this.tensors.get(`${pfx}.self_attn.q_norm.weight`)!, cos, sin, cfg.rmsNormEps, hd, S, B);
 
       kStream.streamWaitEvent();
 

@@ -332,8 +332,11 @@ export class GlmTensor extends Tensor {
     return { normed, residual };
   }
 
-  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
-    super.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+  fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
+    super.fusedNormRope(weight, cos, sin, eps, ropeDim, seqLen, batch, inStride, interleaved);
+    const headDim = weight.numElements;
+    const stride = inStride ?? headDim;
+    const nHeads = this.shape[1] / stride;
     const out = this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
     getNativeAddon().fusedNormRope(this.glm.ctx, out.data, this.data, weight.data, cos.data, sin.data, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim, interleaved ?? false);
     return out;
@@ -490,8 +493,9 @@ export class GlmTensor extends Tensor {
     // }
   }
 
-  rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
-    super.rotaryEmbedding(positionIds, dimHalf, batch, seqLen);
+  rotaryEmbedding(positionIds: Tensor, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
+    super.rotaryEmbedding(positionIds, batch, seqLen);
+    const dimHalf = this.shape[0];
     const hd = dimHalf * 2;
     const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
     const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);

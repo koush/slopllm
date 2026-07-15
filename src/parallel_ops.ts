@@ -1014,22 +1014,24 @@ export class ParallelTensor extends Tensor {
     return { normed, residual };
   }
 
-  override fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
-    super.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
+  override fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
+    super.fusedNormRope(weight, cos, sin, eps, ropeDim, seqLen, batch, inStride, interleaved);
+    const headDim = weight.numElements;
+    const stride = inStride ?? headDim;
+    const nHeads = this.shape[1] / stride;
     if (this.parallelism === TensorParallelism.PartialSum) {
       this.allReduce();
-      return this.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
+      return this.fusedNormRope(weight, cos, sin, eps, ropeDim, seqLen, batch, inStride, interleaved);
     }
 
     if (this.parallelism === TensorParallelism.Column) {
       using gathered = this.allGather(this.workspace);
-      return gathered.fusedNormRope(weight, cos, sin, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
+      return gathered.fusedNormRope(weight, cos, sin, eps, ropeDim, seqLen, batch, inStride, interleaved);
     }
 
     const pWeight = weight as ParallelTensor;
     const pCos = cos as ParallelTensor;
     const pSin = sin as ParallelTensor;
-    const stride = inStride ?? headDim;
 
     if (this.parallelism === TensorParallelism.Row) {
       const shardNHeads = this.shardDim(nHeads, "fusedNormRope nHeads");
@@ -1041,7 +1043,7 @@ export class ParallelTensor extends Tensor {
       this.assertParallel("fusedNormRope sin", pSin, TensorParallelism.Replicated);
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.shards[i].fusedNormRope(pWeight.shards[i], pCos.shards[i], pSin.shards[i], eps, ropeDim, headDim, shardNHeads, seqLen, batch, shardInStride, interleaved));
+        shards.push(this.shards[i].fusedNormRope(pWeight.shards[i], pCos.shards[i], pSin.shards[i], eps, ropeDim, seqLen, batch, shardInStride, interleaved));
       }
       return this.parallelOps.wrapShards(this.workspace, shards, [batch, nHeads, seqLen, headDim], this.type, TensorParallelism.Row);
     }
@@ -1053,7 +1055,7 @@ export class ParallelTensor extends Tensor {
 
     const shards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      shards.push(this.shards[i].fusedNormRope(pWeight.shards[i], pCos.shards[i], pSin.shards[i], eps, ropeDim, headDim, nHeads, seqLen, batch, stride, interleaved));
+      shards.push(this.shards[i].fusedNormRope(pWeight.shards[i], pCos.shards[i], pSin.shards[i], eps, ropeDim, seqLen, batch, stride, interleaved));
     }
     return this.parallelOps.wrapShards(this.workspace, shards, [batch, nHeads, seqLen, headDim], this.type, TensorParallelism.Replicated);
   }
@@ -1960,8 +1962,9 @@ export class ParallelTensor extends Tensor {
     }
   }
 
-  rotaryEmbedding(positionIds: Tensor, dimHalf: number, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
-    super.rotaryEmbedding(positionIds, dimHalf, batch, seqLen);
+  rotaryEmbedding(positionIds: Tensor, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
+    super.rotaryEmbedding(positionIds, batch, seqLen);
+    const dimHalf = this.shape[0];
     const pPositionIds = positionIds as ParallelTensor;
     this.assertParallel("rotaryEmbedding invFreq", this, TensorParallelism.Replicated);
     this.assertParallel("rotaryEmbedding positionIds", pPositionIds, TensorParallelism.Replicated);
@@ -1969,7 +1972,7 @@ export class ParallelTensor extends Tensor {
     const cosShards: Tensor[] = [];
     const sinShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.shards[i].rotaryEmbedding(pPositionIds.shards[i], dimHalf, batch, seqLen);
+      const result = this.shards[i].rotaryEmbedding(pPositionIds.shards[i], batch, seqLen);
       cosShards.push(result.cos);
       sinShards.push(result.sin);
     }
