@@ -820,6 +820,7 @@ class GlmOps:
         self.lib.glm_p2p_create_instance.restype = ctypes.c_void_p
         self.lib.glm_p2p_create_instance.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
         ]
 
         self.lib.glm_p2p_destroy_instance.restype = None
@@ -2066,8 +2067,9 @@ class GlmOps:
             snh, ho, inh,
         )
 
-    def p2p_create_instance(self, my_rank, world_size):
-        return self.lib.glm_p2p_create_instance(self.ctx, my_rank, world_size)
+    def p2p_create_instance(self, my_rank, world_size, device_ids):
+        arr = (ctypes.c_int * world_size)(*device_ids)
+        return self.lib.glm_p2p_create_instance(self.ctx, my_rank, world_size, arr)
 
     def p2p_destroy_instance(self, inst):
         self.lib.glm_p2p_destroy_instance(inst)

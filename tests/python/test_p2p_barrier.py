@@ -24,13 +24,14 @@ class TestP2PBarrier:
 
     def _setup_p2p(self):
         world_size = NUM_GPUS
+        device_ids = [self.ops[r].device for r in range(world_size)]
         instances = []
         for rank in range(world_size):
             for peer in range(world_size):
                 if peer != rank:
-                    rc = self.ops[rank].p2p_enable_peer_access(peer)
+                    rc = self.ops[rank].p2p_enable_peer_access(device_ids[peer])
                     assert rc == 0, f"Peer access failed: GPU {rank} -> {peer}"
-            inst = self.ops[rank].p2p_create_instance(rank, world_size)
+            inst = self.ops[rank].p2p_create_instance(rank, world_size, device_ids)
             assert inst is not None and inst != 0, f"p2p_create_instance failed for rank {rank}"
             instances.append(inst)
 
