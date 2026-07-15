@@ -512,8 +512,12 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, _lse?: Tensor, headOffset: number = 0, attnNHeads: number = nHeads, vProjHeadOffset: number = 0, tokenMajor: boolean = false): Tensor {
-    super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
+  mlaVExpand(vProj: Tensor, seqLen: number, batch: number, _lse?: Tensor, headOffset: number = 0, attnNHeads?: number, vProjHeadOffset: number = 0, tokenMajor: boolean = false): Tensor {
+    super.mlaVExpand(vProj, seqLen, batch);
+    const kvLoraRank = this.shape[this.shape.length - 1];
+    const nHeads = this.shape[1];
+    const vHeadDim = vProj.shape[1];
+    attnNHeads = attnNHeads ?? nHeads;
     const BS = batch * seqLen;
     const out = this.workspace.alloc([BS, nHeads * vHeadDim], this.type);
     const effSeqLen = tokenMajor ? 1 : seqLen;

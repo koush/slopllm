@@ -1787,8 +1787,11 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
   }
 
-  mlaVExpand(vProj: Tensor, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, lse?: Tensor, _headOffset?: number, _attnNHeads?: number, _vProjHeadOffset?: number, _tokenMajor?: boolean): Tensor {
-    super.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
+  mlaVExpand(vProj: Tensor, seqLen: number, batch: number, lse?: Tensor, _headOffset?: number, _attnNHeads?: number, _vProjHeadOffset?: number, _tokenMajor?: boolean): Tensor {
+    super.mlaVExpand(vProj, seqLen, batch);
+    const kvLoraRank = this.shape[this.shape.length - 1];
+    const nHeads = this.shape[1];
+    const vHeadDim = vProj.shape[1];
     const pVProj = vProj as ParallelTensor;
     // if (this.parallelism === TensorParallelism.PartialSum || this.parallelism === TensorParallelism.Column ||
     //     pVProj.parallelism === TensorParallelism.PartialSum || pVProj.parallelism === TensorParallelism.Column) {
@@ -1832,18 +1835,22 @@ export class ParallelTensor extends Tensor {
       const h = this.parallelOps.shardDim(nHeads, "mlaVExpand cpShardNHeads");
       const expandShards: Tensor[] = [];
       const narrowViews: Tensor[] = [];
+      const reshapeViews: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
         let vProjShard = pVProj.shards[i];
         if (pVProj.parallelism === TensorParallelism.Replicated) {
           vProjShard = vProjShard.narrow(i * h * kvLoraRank, h * kvLoraRank);
           narrowViews.push(vProjShard);
         }
-        expandShards.push(merged.value.shards[i].mlaVExpand(
-          vProjShard, kvLoraRank, vHeadDim, h, 1, BS,
+        const reshapedMerged = merged.value.shards[i].reshape([BS, h, kvLoraRank]);
+        reshapeViews.push(reshapedMerged);
+        expandShards.push(reshapedMerged.mlaVExpand(
+          vProjShard, 1, BS,
           undefined, 0, h, 0, _tokenMajor
         ));
       }
       for (const v of narrowViews) v[Symbol.dispose]();
+      for (const v of reshapeViews) v[Symbol.dispose]();
       return this.parallelOps.wrapShards(this.workspace, expandShards, [BS, nHeads * vHeadDim], this.type, TensorParallelism.Row);
     }
 
@@ -1857,7 +1864,7 @@ export class ParallelTensor extends Tensor {
         narrowViews.push(vProjShard);
       }
       const shardHeadOffset = (isPartialSoftmax && isVProjSharded) ? i * shardNHeads : 0;
-      outShards.push(this.shards[i].mlaVExpand(vProjShard, kvLoraRank, vHeadDim, shardNHeads, seqLen, batch, undefined, shardHeadOffset, attnNHeads, 0, _tokenMajor));
+      outShards.push(this.shards[i].mlaVExpand(vProjShard, seqLen, batch, undefined, shardHeadOffset, attnNHeads, 0, _tokenMajor));
     }
     for (const v of narrowViews) v[Symbol.dispose]();
     const vExpandedPar = isCp ? TensorParallelism.Column : (shardNHeads === nHeads ? TensorParallelism.Replicated : this.parallelism);

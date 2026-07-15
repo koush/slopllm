@@ -608,13 +608,13 @@ describe("ParallelOps.mlaVExpand", () => {
 
     const expected = refMlaVExpand(attnOutF32, vProjF32, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
 
-    const refAttnOut = refWs.alloc([batch * nHeads, seqLen, kvLoraRank], "BF16");
+    const refAttnOut = refWs.alloc([batch, nHeads, seqLen, kvLoraRank], "BF16");
     const refVProj = refWs.alloc([nHeads * kvLoraRank, vHeadDim], "BF16");
     refAttnOut.h2d(f32ToBf16Bytes(attnOutF32));
     refVProj.h2d(f32ToBf16Bytes(vProjF32));
     ref.synchronize();
 
-    const refOut = refAttnOut.mlaVExpand(refVProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch);
+    const refOut = refAttnOut.mlaVExpand(refVProj, seqLen, batch);
     ref.synchronize();
     const refBuf = Buffer.alloc(batch * seqLen * nHeads * vHeadDim * 2);
     refOut.d2h(refBuf);
@@ -625,7 +625,7 @@ describe("ParallelOps.mlaVExpand", () => {
       assert.ok(relErr < 0.1, `ref i=${i}: expected ${expected[i]}, got ${refF32[i]} (relErr=${relErr})`);
     }
 
-    const pAttnOut = ws.alloc([batch * nHeads, seqLen, kvLoraRank], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
+    const pAttnOut = ws.alloc([batch, nHeads, seqLen, kvLoraRank], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
     const shardHeads = nHeads / 2;
 
     const attnShard0 = new Float32Array(batch * shardHeads * seqLen * kvLoraRank);
@@ -643,26 +643,16 @@ describe("ParallelOps.mlaVExpand", () => {
       }
     }
 
-    const vProjShard0 = new Float32Array(shardHeads * kvLoraRank * vHeadDim);
-    const vProjShard1 = new Float32Array(shardHeads * kvLoraRank * vHeadDim);
-    for (let h = 0; h < shardHeads; h++) {
-      for (let k = 0; k < kvLoraRank; k++) {
-        for (let j = 0; j < vHeadDim; j++) {
-          vProjShard0[(h * kvLoraRank + k) * vHeadDim + j] = vProjF32[(h * kvLoraRank + k) * vHeadDim + j];
-          vProjShard1[(h * kvLoraRank + k) * vHeadDim + j] = vProjF32[((shardHeads + h) * kvLoraRank + k) * vHeadDim + j];
-        }
-      }
-    }
 
     pAttnOut.shard(0).h2d(f32ToBf16Bytes(attnShard0));
     pAttnOut.shard(1).h2d(f32ToBf16Bytes(attnShard1));
 
-    const pVProj = ws.alloc([nHeads * kvLoraRank, vHeadDim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
-    pVProj.shard(0).h2d(f32ToBf16Bytes(vProjShard0));
-    pVProj.shard(1).h2d(f32ToBf16Bytes(vProjShard1));
+    const pVProj = ws.alloc([nHeads * kvLoraRank, vHeadDim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    pVProj.shard(0).h2d(f32ToBf16Bytes(vProjF32));
+    pVProj.shard(1).h2d(f32ToBf16Bytes(vProjF32));
     po.synchronize();
 
-    const pOut = pAttnOut.mlaVExpand(pVProj, kvLoraRank, vHeadDim, nHeads, seqLen, batch) as ParallelTensor;
+    const pOut = pAttnOut.mlaVExpand(pVProj, seqLen, batch) as ParallelTensor;
     po.synchronize();
 
     assert.equal(pOut.parallelism, TensorParallelism.Row);

@@ -554,7 +554,7 @@ export class Glm51Model extends ChatModel {
       using _lseBuf = lseBuf;
 
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
-      using vExpanded = attnOut.mlaVExpand(vProj, kvLoraRank, vHeadDim, nHeads, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);
+      using vExpanded = attnOut.mlaVExpand(vProj, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);
       oProjBuf.replace(vExpanded.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!));
     }
 

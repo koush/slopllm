@@ -207,7 +207,7 @@ function runCpPrefillTest(
   const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
   const vProjF32 = randomData(N_HEADS * V_HEAD_DIM * HEAD_DIM_CKV);
-  const vProj = allocBf16(ws, [N_HEADS * V_HEAD_DIM, HEAD_DIM_CKV]);
+  const vProj = allocBf16(ws, [N_HEADS * HEAD_DIM_CKV, V_HEAD_DIM]);
   vProj.h2d(f32ToBf16Bytes(vProjF32));
 
   const baseline = runMlaPrefill(
@@ -218,7 +218,7 @@ function runCpPrefillTest(
     0, 0,
   );
 
-  const baselineVExpanded = baseline.vOut.mlaVExpand(vProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize);
+  const baselineVExpanded = baseline.vOut.mlaVExpand(vProj, seqLen, batchSize);
   const baselineVExpandedBuf = Buffer.alloc(totalTokens * N_HEADS * V_HEAD_DIM * 2);
   baselineVExpanded.d2h(baselineVExpandedBuf);
   const baselineVExpandedF32 = bf16BytesToF32(baselineVExpandedBuf);
@@ -242,7 +242,7 @@ function runCpPrefillTest(
       worldSize, rank,
     );
 
-    const shardVExpanded = result.vOut.mlaVExpand(vProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize);
+    const shardVExpanded = result.vOut.mlaVExpand(vProj, seqLen, batchSize);
 
     shardVPtrs.push(shardVExpanded.data);
     shardLsePtrs.push(result.lse.data);
@@ -352,7 +352,7 @@ function runCpAppendPrefillTest(
   const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
   const vProjF32 = randomData(N_HEADS * V_HEAD_DIM * HEAD_DIM_CKV);
-  const vProj = allocBf16(ws, [N_HEADS * V_HEAD_DIM, HEAD_DIM_CKV]);
+  const vProj = allocBf16(ws, [N_HEADS * HEAD_DIM_CKV, V_HEAD_DIM]);
   vProj.h2d(f32ToBf16Bytes(vProjF32));
 
   const baseline = runMlaPrefill(
@@ -363,7 +363,7 @@ function runCpAppendPrefillTest(
     0, 0,
   );
 
-  const baselineVExpanded = baseline.vOut.mlaVExpand(vProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, newLen, batchSize);
+  const baselineVExpanded = baseline.vOut.mlaVExpand(vProj, newLen, batchSize);
   const baselineVExpandedBuf = Buffer.alloc(totalQTokens * N_HEADS * V_HEAD_DIM * 2);
   baselineVExpanded.d2h(baselineVExpandedBuf);
   const baselineVExpandedF32 = bf16BytesToF32(baselineVExpandedBuf);
@@ -387,7 +387,7 @@ function runCpAppendPrefillTest(
       worldSize, rank,
     );
 
-    const shardVExpanded = result.vOut.mlaVExpand(vProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, newLen, batchSize);
+    const shardVExpanded = result.vOut.mlaVExpand(vProj, newLen, batchSize);
 
     shardVPtrs.push(shardVExpanded.data);
     shardLsePtrs.push(result.lse.data);
@@ -548,9 +548,9 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
       pageSize * HEAD_DIM_CKV, pageSize * HEAD_DIM_KPE,
       0, 0,
     );
-    const vProjRef = refWs.alloc([N_HEADS * V_HEAD_DIM, HEAD_DIM_CKV], "BF16");
+    const vProjRef = refWs.alloc([N_HEADS * HEAD_DIM_CKV, V_HEAD_DIM], "BF16");
     vProjRef.h2d(f32ToBf16Bytes(vProjF32));
-    const baselineVExpanded = baseline.vOut.mlaVExpand(vProjRef, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize);
+    const baselineVExpanded = baseline.vOut.mlaVExpand(vProjRef, seqLen, batchSize);
     const baselineVExpandedBuf = Buffer.alloc(totalTokens * N_HEADS * V_HEAD_DIM * 2);
     baselineVExpanded.d2h(baselineVExpandedBuf);
     const baselineVExpandedF32 = bf16BytesToF32(baselineVExpandedBuf);
@@ -591,7 +591,7 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
     pQPe.h2d(f32ToBf16Bytes(qPeF32));
 
     // Allocate v_proj as Replicated (for simplicity)
-    const pVProj = ws.alloc([N_HEADS * V_HEAD_DIM, HEAD_DIM_CKV], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const pVProj = ws.alloc([N_HEADS * HEAD_DIM_CKV, V_HEAD_DIM], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     pVProj.h2d(f32ToBf16Bytes(vProjF32));
 
     // Allocate workspace tensors (Replicated — same on each GPU)
@@ -635,7 +635,7 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
     po.synchronize();
 
     // mlaVExpand with LSE — triggers CP merge when contextParallel=true
-    const pVExpanded = pOut.mlaVExpand(pVProj, HEAD_DIM_CKV, V_HEAD_DIM, N_HEADS, seqLen, batchSize, pLse) as ParallelTensor;
+    const pVExpanded = pOut.mlaVExpand(pVProj, seqLen, batchSize, pLse) as ParallelTensor;
     po.synchronize();
 
     // Compare with baseline

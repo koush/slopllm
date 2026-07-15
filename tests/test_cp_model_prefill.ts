@@ -318,7 +318,7 @@ describe("CP vs non-CP model prefill", () => {
 
           using attnOut = mlaResult.o;          using lseBuf = mlaResult.lse;
           const vProj = (model as any).tensors.get(`${pfx}.v_proj.weight`);
-          using vExpanded = attnOut.mlaVExpand(vProj, kvLR, vHD, nH, S, B, lseBuf);
+          using vExpanded = attnOut.mlaVExpand(vProj, S, B, lseBuf);
 
           snap3("L0_vExpanded_after_merge", vExpanded, BS * nH * vHD, isCp);
 
