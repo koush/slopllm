@@ -366,7 +366,7 @@ __global__ void topk_to_slots_kernel(
     const int32_t* __restrict__ batch_indices,
     int topk, int page_size, int num_tokens,
     uint32_t cp_world_size, uint32_t cp_rank,
-    const int32_t* __restrict__ kv_token_indptr  // [batch+1] (nullable: paged-slot mode)
+    const int32_t* __restrict__ kv_token_indptr  // [batch+1] (used when cp_world_size == 1)
 ) {
     const int token = blockIdx.x;
     if (token >= num_tokens) return;
@@ -377,7 +377,7 @@ __global__ void topk_to_slots_kernel(
 
     extern __shared__ int32_t s_slots[];  // [topk]
 
-    if (kv_token_indptr) {
+    if (cp_world_size == 1) {
         // Flat-index mode: slot = kvTokenIndptr[seq] + token_pos.
         // No CP filtering or page mapping — used after CKV gather when each
         // GPU has the full de-interleaved KV in a flat buffer.
@@ -390,7 +390,8 @@ __global__ void topk_to_slots_kernel(
             s_slots[i] = slot;
         }
     } else {
-        // Paged-slot mode (existing): slot = abs_page * eff_page_size + offset
+        // Paged-slot mode: slot = abs_page * eff_page_size + offset
+        // cp_world_size == 0 (non-CP) or > 1 (CP paged)
         const int num_pages = page_indptr[seq + 1] - page_indptr[seq];
         const int page_base = page_indptr[seq];
         const int eff_page_size = (cp_world_size > 1) ? (page_size / (int)cp_world_size) : page_size;
@@ -626,9 +627,9 @@ __global__ void idx_score_kernel(
     const int32_t* __restrict__ pageIndices, const int32_t* __restrict__ pageIndptr,
     const int32_t* __restrict__ lastPageLen, const int32_t* __restrict__ qoIndptr,
     float scale, int idxNHeads, int idxHeadDim, int pageSize, int maxKv, int causal,
+    int qGlobalStart,
     const uint8_t* __restrict__ custom_mask,
-    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len,
-    int qGlobalStart
+    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len
 ) {
     const int qIdx = blockIdx.y;
     int seq = 0;
@@ -704,10 +705,10 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
     float scale, int totalQ, int idxNHeads, int idxHeadDim,
-    int pageSize, int topk, int causal,
+    int pageSize, int topk, int causal, int qGlobalStart,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int32_t* hist, int32_t* meta,
-    int maxKv, int num_splits, int qGlobalStart) {
+    int maxKv, int num_splits) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     dim3 grid(num_splits, totalQ);
@@ -721,7 +722,7 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
         (__nv_bfloat16*)scores, rowLen, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
         (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
         scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal,
-        custom_mask, mask_indptr, mask_kv_len, qGlobalStart);
+        qGlobalStart, custom_mask, mask_indptr, mask_kv_len);
     glm_topk_from_scores(ctx, out_idx, scores, rowLen, hist, meta,
                          totalQ, maxKv, topk, num_splits);
 }
@@ -845,10 +846,9 @@ idx_prefill_score_mma_kernel(
     const int32_t* __restrict__ pageIndices, const int32_t* __restrict__ pageIndptr,
     const int32_t* __restrict__ lastPageLen, const int32_t* __restrict__ qoIndptr,
     int totalQ, float scale, int idxNHeads, int idxHeadDim, int pageSize,
-    int maxKv, int causal,
+    int maxKv, int causal, int qGlobalStart,
     const uint8_t* __restrict__ custom_mask,
-    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len,
-    int qGlobalStart)
+    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len)
 {
     using namespace idxmma;
 
@@ -1279,11 +1279,11 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
     float scale, int totalQ, int idxNHeads, int idxHeadDim,
-    int pageSize, int topk, int causal,
+    int pageSize, int topk, int causal, int qGlobalStart,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int maxKv,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
-    int numSplits, int qGlobalStart) {
+    int numSplits) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
 
@@ -1312,7 +1312,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
             (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
             (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
             totalQ, scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal,
-            custom_mask, mask_indptr, mask_kv_len, qGlobalStart);
+            qGlobalStart, custom_mask, mask_indptr, mask_kv_len);
     }
 
     // Passes 2-6: histogram + gather from buffer.

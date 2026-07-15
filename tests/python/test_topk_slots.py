@@ -7,7 +7,7 @@ PAGE_SIZE = 64
 
 
 def ref_topk_to_slots(topk_idx, page_indices, page_indptr, last_page_len,
-                      batch_indices, topk, page_size, cp_world_size=1, cp_rank=0):
+                      batch_indices, topk, page_size, cp_world_size=0, cp_rank=0):
     """Reference implementation on CPU."""
     num_tokens = topk_idx.shape[0]
     slots = np.full((num_tokens, topk), -1, dtype=np.int32)
@@ -48,7 +48,7 @@ def valid_set(arr):
 
 
 @pytest.mark.parametrize("cp_world_size,cp_rank", [
-    (1, 0),
+    (0, 0),
     (2, 0),
     (2, 1),
     (4, 1),
@@ -67,7 +67,7 @@ def test_topk_to_slots_basic(glm, device, cp_world_size, cp_rank):
     batch_indices = torch.zeros(1, dtype=torch.int32, device=device)
 
     topk = 8
-    global_kv_len = kv_len * cp_world_size
+    global_kv_len = kv_len * cp_world_size if cp_world_size > 0 else kv_len
     topk_idx = torch.tensor([[0, 1, 3, cp_world_size, cp_world_size+1, 2*cp_world_size, global_kv_len-1, global_kv_len]],
                             dtype=torch.int32, device=device)
 
@@ -125,14 +125,14 @@ def test_topk_to_slots_multi_seq(glm, device):
         slots.data_ptr(), topk_idx.data_ptr(),
         page_indices.data_ptr(), page_indptr.data_ptr(),
         last_page_len.data_ptr(), batch_indices.data_ptr(),
-        num_tokens, topk, page_size, 1, 0,
+        num_tokens, topk, page_size, 0, 0,
     )
     torch.cuda.synchronize(device)
 
     ref = ref_topk_to_slots(
         topk_idx.cpu().numpy(), page_indices.cpu().numpy(),
         page_indptr.cpu().numpy(), last_page_len.cpu().numpy(),
-        batch_indices.cpu().numpy(), topk, page_size, 1, 0,
+        batch_indices.cpu().numpy(), topk, page_size, 0, 0,
     )
 
     actual = slots.cpu().numpy()
@@ -158,7 +158,7 @@ def test_topk_to_slots_invalid(glm, device):
         slots.data_ptr(), topk_idx.data_ptr(),
         page_indices.data_ptr(), page_indptr.data_ptr(),
         last_page_len.data_ptr(), batch_indices.data_ptr(),
-        1, topk, page_size, 1, 0,
+        1, topk, page_size, 0, 0,
     )
     torch.cuda.synchronize(device)
 
@@ -184,7 +184,7 @@ def test_topk_to_slots_partial_page(glm, device):
         slots.data_ptr(), topk_idx.data_ptr(),
         page_indices.data_ptr(), page_indptr.data_ptr(),
         last_page_len.data_ptr(), batch_indices.data_ptr(),
-        1, topk, page_size, 1, 0,
+        1, topk, page_size, 0, 0,
     )
     torch.cuda.synchronize(device)
 

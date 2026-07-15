@@ -469,20 +469,20 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     int pageSize = info[13].As<Napi::Number>().Int32Value();
     int topk = info[14].As<Napi::Number>().Int32Value();
     int causal = info[15].As<Napi::Number>().Int32Value();
+    int qGlobalStart = info[16].As<Napi::Number>().Int32Value();
     const uint8_t* custom_mask = nullptr;
     const int32_t* mask_indptr = nullptr;
     const int32_t* mask_kv_len = nullptr;
-    if (info.Length() >= 17 && info[16].IsNumber()) custom_mask = reinterpret_cast<const uint8_t*>(info[16].As<Napi::Number>().Int64Value());
-    if (info.Length() >= 18 && info[17].IsNumber()) mask_indptr = reinterpret_cast<const int32_t*>(info[17].As<Napi::Number>().Int64Value());
-    if (info.Length() >= 19 && info[18].IsNumber()) mask_kv_len = reinterpret_cast<const int32_t*>(info[18].As<Napi::Number>().Int64Value());
-    uintptr_t scores_ptr = info[19].As<Napi::Number>().Int64Value();
-    uintptr_t rowLen_ptr = info[20].As<Napi::Number>().Int64Value();
-    int maxKv = info[21].As<Napi::Number>().Int32Value();
-    uintptr_t coarseHist_ptr = info[22].As<Napi::Number>().Int64Value();
-    uintptr_t fineHist_ptr = info[23].As<Napi::Number>().Int64Value();
-    uintptr_t meta_ptr = info[24].As<Napi::Number>().Int64Value();
-    int numSplits = info[25].As<Napi::Number>().Int32Value();
-    int qGlobalStart = info[26].As<Napi::Number>().Int32Value();
+    if (info.Length() >= 18 && info[17].IsNumber()) custom_mask = reinterpret_cast<const uint8_t*>(info[17].As<Napi::Number>().Int64Value());
+    if (info.Length() >= 19 && info[18].IsNumber()) mask_indptr = reinterpret_cast<const int32_t*>(info[18].As<Napi::Number>().Int64Value());
+    if (info.Length() >= 20 && info[19].IsNumber()) mask_kv_len = reinterpret_cast<const int32_t*>(info[19].As<Napi::Number>().Int64Value());
+    uintptr_t scores_ptr = info[20].As<Napi::Number>().Int64Value();
+    uintptr_t rowLen_ptr = info[21].As<Napi::Number>().Int64Value();
+    int maxKv = info[22].As<Napi::Number>().Int32Value();
+    uintptr_t coarseHist_ptr = info[23].As<Napi::Number>().Int64Value();
+    uintptr_t fineHist_ptr = info[24].As<Napi::Number>().Int64Value();
+    uintptr_t meta_ptr = info[25].As<Napi::Number>().Int64Value();
+    int numSplits = info[26].As<Napi::Number>().Int32Value();
     glm_indexer_score_topk_prefill(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<int32_t*>(out_idx_ptr),
@@ -494,14 +494,14 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
         reinterpret_cast<const int32_t*>(lastPageLen_ptr),
         reinterpret_cast<const int32_t*>(qoIndptr_ptr),
         scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal,
-        custom_mask, mask_indptr, mask_kv_len,
+        qGlobalStart, custom_mask, mask_indptr, mask_kv_len,
         reinterpret_cast<void*>(scores_ptr),
         reinterpret_cast<int32_t*>(rowLen_ptr),
         maxKv,
         reinterpret_cast<int32_t*>(coarseHist_ptr),
         reinterpret_cast<int32_t*>(fineHist_ptr),
         reinterpret_cast<int32_t*>(meta_ptr),
-        numSplits, qGlobalStart);
+        numSplits);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("indexerScoreTopkPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -512,7 +512,7 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
 static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 26) {
-        Napi::TypeError::New(env, "Expected 26 args (…, causal, customMask, maskIndptr, maskKvLen, scores, rowLen, hist, meta, maxKv, numSplits, qGlobalStart)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected 26 args (…, causal, qGlobalStart, customMask, maskIndptr, maskKvLen, scores, rowLen, hist, meta, maxKv, numSplits)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     glm_indexer_score_topk_v2(
@@ -532,14 +532,14 @@ static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
         info[13].As<Napi::Number>().Int32Value(),
         info[14].As<Napi::Number>().Int32Value(),
         info[15].As<Napi::Number>().Int32Value(),
-        reinterpret_cast<const uint8_t*>((uintptr_t)info[16].As<Napi::Number>().Int64Value()),
-        reinterpret_cast<const int32_t*>((uintptr_t)info[17].As<Napi::Number>().Int64Value()),
+        info[16].As<Napi::Number>().Int32Value(),
+        reinterpret_cast<const uint8_t*>((uintptr_t)info[17].As<Napi::Number>().Int64Value()),
         reinterpret_cast<const int32_t*>((uintptr_t)info[18].As<Napi::Number>().Int64Value()),
-        reinterpret_cast<void*>((uintptr_t)info[19].As<Napi::Number>().Int64Value()),
-        reinterpret_cast<int32_t*>((uintptr_t)info[20].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[19].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<void*>((uintptr_t)info[20].As<Napi::Number>().Int64Value()),
         reinterpret_cast<int32_t*>((uintptr_t)info[21].As<Napi::Number>().Int64Value()),
         reinterpret_cast<int32_t*>((uintptr_t)info[22].As<Napi::Number>().Int64Value()),
-        info[23].As<Napi::Number>().Int32Value(),
+        reinterpret_cast<int32_t*>((uintptr_t)info[23].As<Napi::Number>().Int64Value()),
         info[24].As<Napi::Number>().Int32Value(),
         info[25].As<Napi::Number>().Int32Value());
     cudaError_t err = cudaGetLastError();

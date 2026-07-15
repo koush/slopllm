@@ -100,21 +100,21 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
     float scale, int totalQ, int idxNHeads, int idxHeadDim,
-    int pageSize, int topk, int causal,
+    int pageSize, int topk, int causal, int qGlobalStart,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int maxKv,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
-    int numSplits, int qGlobalStart);
+    int numSplits);
 
 void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const void* q, const void* kData, const void* weights,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
     float scale, int totalQ, int idxNHeads, int idxHeadDim,
-    int pageSize, int topk, int causal,
+    int pageSize, int topk, int causal, int qGlobalStart,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int32_t* hist, int32_t* meta,
-    int maxKv, int num_splits, int qGlobalStart);
+    int maxKv, int num_splits);
 
 void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     const void* scores, const int32_t* row_len,

@@ -89,8 +89,8 @@ interface NativeAddon {
   causalMask(ctx: number, out: number, seqLen: number): void;
   indexerScore(ctx: number, out: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: number): void;
   indexerScoreTopk(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, customMask?: number, maskIndptr?: number, maskKvLen?: number): void;
-  indexerScoreTopkPrefill(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, customMask: number, maskIndptr: number, maskKvLen: number, scores: number, rowLen: number, maxKv: number, coarseHist: number, fineHist: number, meta: number, numSplits: number, qGlobalStart: number): void;
-  indexerScoreTopkV2(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, customMask: number, maskIndptr: number, maskKvLen: number, scores: number, rowLen: number, hist: number, meta: number, maxKv: number, numSplits: number, qGlobalStart: number): void;
+  indexerScoreTopkPrefill(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, qGlobalStart: number, customMask: number, maskIndptr: number, maskKvLen: number, scores: number, rowLen: number, maxKv: number, coarseHist: number, fineHist: number, meta: number, numSplits: number): void;
+  indexerScoreTopkV2(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, qGlobalStart: number, customMask: number, maskIndptr: number, maskKvLen: number, scores: number, rowLen: number, hist: number, meta: number, maxKv: number, numSplits: number): void;
   topkToSlots(ctx: number, slots: number, topkLength: number, topkIdx: number, pageIndices: number, pageIndptr: number, lastPageLen: number, batchIndices: number, numTokens: number, topk: number, pageSize: number, cpWorldSize: number, cpRank: number, kvTokenIndptr?: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
   applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
@@ -981,28 +981,24 @@ export class GlmOps implements DeviceOps {
   // Writes the compacted valid-slot count per query into `topkLength` (a stable
   // caller buffer), which feeds the sparse kernel's topk_length so it only walks
   // ceil(count/BI) candidate tiles instead of the full topk.
-  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, topkLength: Tensor, scale: number, topk: number, decode: boolean, _contextParallel?: boolean, cpWorldSize: number = 1, cpRank: number = 0, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, kvTokenIndptrD?: Tensor): Tensor {
+  indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart: number = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor {
     const totalQ = idxQ.shape[0];
     const idxNHeads = idxQ.shape[1];
     const idxHeadDim = idxQ.shape[2];
     const pageSize = kData.shape[1];
     const maxKv = kData.shape[0] * kData.shape[1];
-    const scoreLastPageLen = globalLastPageLen ?? lastPageLen;
-    // Kernel selection is a q-len heuristic, not the caller's decode flag: the
-    // direct v2 path (per-position score + single histogram) wins for small Q but
-    // its 256 KB/query histogram doesn't scale, so large Q uses the two-level
-    // tensor-core prefill path. Both paths support custom masks and query-sharding
-    // (qGlobalStart). `decode` now only supplies causal semantics — a lone decode
-    // query attends to all past KV (causal limit kvLen-1), i.e. causal for a
-    // single-query row, so pass causal=0 there and causal=1 for a multi-query
-    // (prefill / MTP tree-verify) row routed here at small Q.
     const useDirect = totalQ <= INDEXER_DIRECT_DISPATCH_MAX;
-    using topkIdx = useDirect
-      ? this.indexerScoreTopkV2(idxQ, kData, weights, pageIndices, indptr, scoreLastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart)
-      : this.indexerScoreTopkPrefill(idxQ, kData, weights, pageIndices, indptr, scoreLastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, customMask, maskIndptr, maskKvLen, qGlobalStart);
-    // const slots = idxQ.workspace.alloc([totalQ, topk], "I32");
-    const slots = idxQ.workspace.ensureAlloc([maxKv, topk], "I32", "idxslots-shared").narrow(0, totalQ);
-    getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkLength), ptr(topkIdx), ptr(pageIndices), ptr(indptr), ptr(lastPageLen), ptr(batchIndices), totalQ, topk, pageSize, cpWorldSize, cpRank, kvTokenIndptrD ? ptr(kvTokenIndptrD) : 0);
+    const topkIdx = useDirect
+      ? this.indexerScoreTopkV2(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart)
+      : this.indexerScoreTopkPrefill(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, customMask, maskIndptr, maskKvLen, qGlobalStart);
+    return topkIdx;
+  }
+
+  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, _contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): Tensor {
+    const totalQ = topkIdx.shape[0];
+    const topk = topkIdx.shape[1];
+    const slots = topkIdx.workspace.ensureAlloc([maxKv, topk], "I32", "idxslots-shared").narrow(0, totalQ);
+    getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkLength), ptr(topkIdx), ptr(pageIndices), ptr(indptr), ptr(lastPageLen), ptr(batchIndices), totalQ, topk, pageSize, cpWorldSize, cpRank, ptr(kvTokenIndptrD));
     return slots;
   }
 
@@ -1014,7 +1010,7 @@ export class GlmOps implements DeviceOps {
     using coarseHist = q.workspace.alloc([totalQ, 1024], "I32");
     using fineHist = q.workspace.alloc([totalQ, 64], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
-    getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, maxKv, coarseHist.data, fineHist.data, meta.data, numSplits, qGlobalStart);
+    getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, maxKv, coarseHist.data, fineHist.data, meta.data, numSplits);
     return indices;
   }
 
@@ -1025,7 +1021,7 @@ export class GlmOps implements DeviceOps {
     using rowLen = q.workspace.alloc([totalQ], "I32");
     using hist = q.workspace.alloc([totalQ, 65536], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
-    getNativeAddon().indexerScoreTopkV2(this.ctx, indices.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, hist.data, meta.data, maxKv, numSplits, qGlobalStart);
+    getNativeAddon().indexerScoreTopkV2(this.ctx, indices.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, hist.data, meta.data, maxKv, numSplits);
     return indices;
   }
 

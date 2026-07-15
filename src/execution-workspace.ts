@@ -122,15 +122,23 @@ export class ExecutionState {
 
   indexerTopkSlots(idxQ: Tensor, cacheIdx: number, weights: Tensor, scale: number, topk: number): Tensor {
     const pagedKV = this.cache.getPagedKV();
+    const kData = pagedKV.kData[cacheIdx];
+    const maxKv = kData.shape[0] * kData.shape[1];
     const cm = (!this.isDecode && this.customMask?.mode === MaskMode.CausalCustom) ? this.customMask : undefined;
-    return this.ws.glm.indexerTopkSlots(
-      idxQ, pagedKV.kData[cacheIdx], weights,
-      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.qoIndptrD, this.ws.mlaBatchIndices, this.ws.sparseTopkLength,
+    using topkIdx = this.ws.glm.indexerTopk(
+      idxQ, kData, weights,
+      pagedKV.indices, this.ws.indptrD, this.ws.globalLastPageLen, this.ws.qoIndptrD,
       scale, topk,
-      this.isDecode, pagedKV.contextParallel,
-      undefined, undefined, this.ws.globalLastPageLen,
+      this.isDecode,
+      0,
       cm?.mask, cm?.indptr, cm?.maskKvLen,
-      0, pagedKV.contextParallel && !this.isDecode ? this.ws.kvTokenIndptrD : undefined,
+    );
+    return this.ws.glm.topkToSlots(
+      this,
+      topkIdx, this.ws.kvTokenIndptrD,
+      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices, this.ws.sparseTopkLength,
+      pagedKV.pageSize, maxKv,
+      pagedKV.contextParallel,
     );
   }
 

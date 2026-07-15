@@ -250,6 +250,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p,
         ]
 
         self.lib.glm_topk_from_scores.restype = None
@@ -264,10 +265,10 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_indexer_score_topk_prefill.restype = None
@@ -275,11 +276,11 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
         ]
 
         self.lib.glm_cat_last_dim.restype = None
@@ -1239,11 +1240,12 @@ class GlmOps:
             self.ctx, self._ptr(out_idx), self._ptr(q), self._ptr(k_data), self._ptr(weights),
             self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
             ctypes.c_float(scale), total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0,
+            q_global_start,
             self._ptr(custom_mask) if custom_mask is not None else ctypes.c_void_p(0),
             self._ptr(mask_indptr) if mask_indptr is not None else ctypes.c_void_p(0),
             self._ptr(mask_kv_len) if mask_kv_len is not None else ctypes.c_void_p(0),
             self._ptr(scores), self._ptr(row_len), self._ptr(hist), self._ptr(meta),
-            max_kv, num_splits, q_global_start,
+            max_kv, num_splits,
         )
 
     def indexer_score_topk_prefill(self, out_idx, q, k_data, weights, page_indices, page_indptr,
@@ -1257,17 +1259,18 @@ class GlmOps:
             self.ctx, self._ptr(out_idx), self._ptr(q), self._ptr(k_data), self._ptr(weights),
             self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
             ctypes.c_float(scale), total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0,
+            q_global_start,
             self._ptr(custom_mask) if custom_mask is not None else ctypes.c_void_p(0),
             self._ptr(mask_indptr) if mask_indptr is not None else ctypes.c_void_p(0),
             self._ptr(mask_kv_len) if mask_kv_len is not None else ctypes.c_void_p(0),
             self._ptr(scores), self._ptr(row_len), max_kv,
             self._ptr(coarse_hist), self._ptr(fine_hist), self._ptr(meta),
-            num_splits, q_global_start,
+            num_splits,
         )
 
     def topk_to_slots(self, slots, topk_idx, page_indices, page_indptr,
                       last_page_len, batch_indices, num_tokens, topk, page_size,
-                      cp_world_size=1, cp_rank=0, topk_length=None):
+                      cp_world_size=0, cp_rank=0, topk_length=None, kv_token_indptr=None):
         self.lib.glm_topk_to_slots(
             self.ctx,
             self._ptr(slots), self._ptr(topk_length) if topk_length is not None else None,
@@ -1275,7 +1278,8 @@ class GlmOps:
             self._ptr(page_indices), self._ptr(page_indptr),
             self._ptr(last_page_len), self._ptr(batch_indices),
             num_tokens, topk, page_size,
-            cp_world_size, cp_rank
+            cp_world_size, cp_rank,
+            self._ptr(kv_token_indptr) if kv_token_indptr is not None else ctypes.c_void_p(0),
         )
 
     def topk_from_scores(self, out_idx, scores, row_len, hist, meta,

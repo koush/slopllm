@@ -374,10 +374,12 @@ export class MetaOps implements DeviceOps {
     indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void {
     }
 
-    indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, topkLength: Tensor, scale: number, topk: number, decode: boolean, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart?: number, kvTokenIndptrD?: Tensor): Tensor {
-        // Return an allocated slots tensor so the meta forward sizes the slots
-        // buffer and takes the sparse-attention branch (as the real path does).
+    indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor {
         return idxQ.workspace.alloc([idxQ.shape[0], topk], "I32");
+    }
+
+    topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): Tensor {
+        return topkIdx.workspace.alloc([topkIdx.shape[0], topkIdx.shape[1]], "I32");
     }
 
     graphBeginCapture(): void {

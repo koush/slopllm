@@ -10,7 +10,7 @@ import { WorkspaceBase } from "./workspace";
 // emits flat slots to match. When false, both are disabled: Q is AllGathered and
 // the indexer/sparse kernel run against the paged cache (the pre-gather path).
 // Toggle here or via GLM_CP_GATHER_KV=0. Both the gather (sparseMlaPrefill) and
-// the indexer flat-slot mode (indexerTopkSlots ignores kvTokenIndptr when off)
+// the indexer flat-slot mode (topkToSlots ignores kvTokenIndptr when off)
 // read this so they never diverge.
 export const CP_GATHER_KV = process.env.GLM_CP_GATHER_KV !== "0";
 
@@ -2867,6 +2867,18 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  shouldGatherKv(state: ExecutionState) {
+    let shouldGatherKv = CP_GATHER_KV && state.cache.getPagedKV().contextParallel && state.getGraphVariantPaddedQLen() > 32;
+    if (shouldGatherKv) {
+      console.warn('Gathering KV cache for CP mode due to padded Q length > 32. This may be inefficient for large KV caches.');
+      const paddedKvLen = state.getGraphVariantPaddedKvLen();
+      const paddedQLen = state.getGraphVariantPaddedQLen();
+      shouldGatherKv = paddedQLen * 162 >= paddedKvLen;
+    }
+    return shouldGatherKv;
+  }
+
+
   sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
     const pagedKV = state.cache.getPagedKV();
     const numTokens = state.totalTokens;
@@ -2879,12 +2891,7 @@ export class ParallelOps implements DeviceOps {
     const numHeads = pQAbsorbed.shape[1];
     const headDim = pQAbsorbed.shape[2];
 
-    let shouldGatherKv = CP_GATHER_KV && contextParallel;
-    if (shouldGatherKv) {
-      const paddedKvLen = state.getGraphVariantPaddedKvLen();
-      const paddedQLen = state.getGraphVariantPaddedQLen();
-      shouldGatherKv = paddedQLen * 162 >= paddedKvLen;
-    }
+    const shouldGatherKv = this.shouldGatherKv(state);
 
     using gatheredKv = shouldGatherKv
       ? this.gatherPages(
@@ -2897,7 +2904,6 @@ export class ParallelOps implements DeviceOps {
     const effectiveKvCache = gatheredKv ?? kvCache;
     const pEffKvCache = this.cast(effectiveKvCache);
     const nonCp = pEffKvCache.parallelism !== TensorParallelism.Row;
-    const effectiveNumHeads = nonCp ? this.shardDim(numHeads, "sparseMlaPrefill numHeads") : numHeads;
     const oPar = nonCp ? TensorParallelism.Row : TensorParallelism.PartialSoftmax;
     using gatheredQAbsorbed: ParallelTensor = (pQAbsorbed.parallelism === TensorParallelism.Row && nonCp)
       ? pQAbsorbed.viewClone() as ParallelTensor
@@ -3027,7 +3033,7 @@ export class ParallelOps implements DeviceOps {
   // Fall-back (replicated): decode, context-parallel, multi-sequence prefill,
   // or uneven totalQ — every rank runs the full indexer. Decode is cheap;
   // multi-seq / CP need qoIndptr rebasing which is not yet implemented.
-  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, topkLength: Tensor, scale: number, topk: number, decode: boolean, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart?: number, kvTokenIndptrD?: Tensor): Tensor {
+  indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor {
     const totalQ = idxQ.shape[0];
     const pQ = this.cast(idxQ);
     const pKData = this.cast(kData);
@@ -3036,17 +3042,11 @@ export class ParallelOps implements DeviceOps {
     const pIndptr = this.cast(indptr);
     const pLastPageLen = this.cast(lastPageLen);
     const pQoIndptr = this.cast(qoIndptr);
-    const pBatchIndices = this.cast(batchIndices);
-    const pTopkLength = this.cast(topkLength);
-    const pGlobalLastPageLen = globalLastPageLen ? this.cast(globalLastPageLen) : undefined;
     const pCustomMask = customMask ? this.cast(customMask) : undefined;
     const pMaskIndptr = maskIndptr ? this.cast(maskIndptr) : undefined;
     const pMaskKvLen = maskKvLen ? this.cast(maskKvLen) : undefined;
-    const pKvTokenIndptr = (CP_GATHER_KV && kvTokenIndptrD) ? this.cast(kvTokenIndptrD) : undefined;
 
     const W = this.worldSize;
-    const flatMode = contextParallel && !!pKvTokenIndptr;
-    const cpW = flatMode ? 1 : (contextParallel ? W : 1);
     const kDataReplicated = kData.parallelism === TensorParallelism.Replicated;
     using colIdxQ = this.tryNarrowToColumnParallel(pQ);
     using colWeights = this.tryNarrowToColumnParallel(pWeights);
@@ -3056,51 +3056,56 @@ export class ParallelOps implements DeviceOps {
       && totalQ % W === 0;
 
     if (true || !canShard) {
-      const slotShards: Tensor[] = [];
+      const topkIdxShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
-        const cpR = flatMode ? 0 : (contextParallel ? i : 0);
-        slotShards.push(this.devices[i].indexerTopkSlots(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], pBatchIndices.shards[i], pTopkLength.shards[i], scale, topk, decode, contextParallel, cpW, cpR, pGlobalLastPageLen?.shards[i], pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i], 0, pKvTokenIndptr?.shards[i]));
+        topkIdxShards.push(this.devices[i].indexerTopk(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, topk, decode, qGlobalStart ?? 0, pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i]));
       }
-      return this.wrapShards(idxQ.workspace, slotShards, [totalQ, topk], "I32", TensorParallelism.Replicated);
+      return this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Replicated);
     }
 
     // Query-sharded path: each rank processes totalQ/W query rows.
     const localQ = totalQ / W;
-    const slotShards: Tensor[] = [];
+    const topkIdxShards: Tensor[] = [];
     for (let i = 0; i < W; i++) {
       const qStart = i * localQ;
-      const cpR = flatMode ? 0 : (contextParallel ? i : 0);
-      using localBatchIndices = pBatchIndices.shards[i].narrow(qStart, localQ);
-      using localTopkLength = pTopkLength.shards[i].narrow(qStart, localQ);
-      slotShards.push(this.devices[i].indexerTopkSlots(
+      topkIdxShards.push(this.devices[i].indexerTopk(
         colIdxQ!.shards[i], pKData.shards[i], colWeights!.shards[i],
         pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i],
-        pQoIndptr.shards[i], localBatchIndices, localTopkLength,
+        pQoIndptr.shards[i],
         scale, topk,
-        decode, contextParallel, cpW, cpR,
-        pGlobalLastPageLen?.shards[i],
-        pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i],
-        qStart, pKvTokenIndptr?.shards[i]
+        decode, qStart,
+        pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i]
       ));
     }
 
     // Column [totalQ, topk] → AllGather → Replicated [totalQ, topk].
-    using slotsColumn = this.wrapShards(idxQ.workspace, slotShards, [totalQ, topk], "I32", TensorParallelism.Column);
-    const slotsReplicated = slotsColumn.allGather(idxQ.workspace);
+    using topkIdxColumn = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Column);
+    const topkIdxReplicated = topkIdxColumn.allGather(idxQ.workspace);
 
-    // In-place AllGather of topkLength: each rank wrote localQ entries at
-    // offset i*localQ; NCCL AllGather with sendbuff = recvbuff + rank*count
-    // scatters them back to every rank (NCCL in-place pattern).
-    const dtype = this.ncclDatatype("I32");
-    const comms = this.comms;
-    getNativeAddon().ncclGroupStart();
+    return topkIdxReplicated;
+  }
+
+  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): Tensor {
+    const pTopkIdx = this.cast(topkIdx);
+    const pKvTokenIndptr = this.cast(kvTokenIndptrD);
+    const pPageIndices = this.cast(pageIndices);
+    const pIndptr = this.cast(indptr);
+    const pLastPageLen = this.cast(lastPageLen);
+    const pBatchIndices = this.cast(batchIndices);
+    const pTopkLength = this.cast(topkLength);
+
+    const W = this.worldSize;
+    const flatMode = this.shouldGatherKv(state);
+    const cpW = flatMode ? 1 : (contextParallel ? W : 0);
+    const totalQ = topkIdx.shape[0];
+    const topk = topkIdx.shape[1];
+
+    const slotShards: Tensor[] = [];
     for (let i = 0; i < W; i++) {
-      const sendPtr = pTopkLength.shards[i].data + i * localQ * 4;
-      getNativeAddon().ncclAllGather(comms[i], this.devices[i].ctx, sendPtr, pTopkLength.shards[i].data, localQ, dtype);
+      const cpR = (cpW > 1) ? i : 0;
+      slotShards.push(this.devices[i].topkToSlots(state, pTopkIdx.shards[i], pKvTokenIndptr.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pBatchIndices.shards[i], pTopkLength.shards[i], pageSize, maxKv, contextParallel, cpW, cpR));
     }
-    getNativeAddon().ncclGroupEnd();
-
-    return slotsReplicated;
+    return this.wrapShards(topkIdx.workspace, slotShards, [totalQ, topk], "I32", TensorParallelism.Replicated);
   }
 
   private graphHandles: (number | undefined)[][] = [];

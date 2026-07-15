@@ -68,12 +68,12 @@ export interface DeviceOps {
   gdnPrefill(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
 
   indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void;
-  // Indexer top-k -> physical KV slots (score+topk then slot mapping). Returns
-  // the [totalQ, topk] slots tensor and writes the compacted valid count per
-  // query into `topkLength` (a stable caller buffer, for the sparse kernel's
-  // early-out). `decode` selects the multi-block v2 kernel; `maxKv` bounds the
-  // score scratch (max seq len).
-  indexerTopkSlots(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, batchIndices: Tensor, topkLength: Tensor, scale: number, topk: number, decode: boolean, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, globalLastPageLen?: Tensor, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart?: number, kvTokenIndptrD?: Tensor): Tensor;
+  // Indexer top-k scoring: returns [totalQ, topk] indices tensor.
+  indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor;
+  // Convert top-k indices to physical KV slots. Writes compacted valid count
+  // per query into `topkLength`. Returns [totalQ, topk] slots tensor.
+  // cpWorldSize: 0=non-CP, 1=CP flat (gather), >1=CP paged.
+  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): Tensor;
 
   graphBeginCapture(): void;
   graphEndCapture(): number;
