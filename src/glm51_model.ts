@@ -415,12 +415,9 @@ export class Glm51Model extends ChatModel {
 
   private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState, sharedSlots: UsingHolder<Tensor>): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
-    const ws = state.ws;
-    const hs = cfg.hiddenSize;
     const nHeads = cfg.numAttentionHeads;
     const kvLoraRank = cfg.kvLoraRank;
     const qkRopeDim = cfg.qkRopeHeadDim;
-    const vHeadDim = cfg.vHeadDim;
     const pfx = `${Glm51Model.WEIGHT_PREFIX}${layerIdx}.self_attn`;
     const batchSize = state.batchSize;
     const totalTokens = state.totalTokens;
@@ -583,21 +580,13 @@ export class Glm51Model extends ChatModel {
 
   forwardModel(state: ExecutionState): Tensor {
     const cfg = this.cfg;
-    const hs = cfg.hiddenSize;
-    const batchSize = state.batchSize;
     const totalTokens = state.totalTokens;
-    const BS = totalTokens;
-    const B = state.isDecode ? batchSize : 1;
-    const S = state.isDecode ? 1 : totalTokens;
-    const ws = state.ws;
-    const qkRopeDim = cfg.qkRopeHeadDim;
 
-    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(state.customMask?.positionIds || ws.positionIds, B, S));
+    using rotaryEmbedding = this.glm.withStream(() => state.rotaryEmbedding(this.invFreq));
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
 
-    using inputIds = state.input!.narrow(0, BS);
-    using residual = new UsingHolder(embedTable.embedding(inputIds));
+    using residual = new UsingHolder(state.embedding(embedTable));
     using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}0.input_layernorm.weight`)!, cfg.rmsNormEps));
 
     rotaryEmbedding.streamWaitEvent();
@@ -621,25 +610,18 @@ export class Glm51Model extends ChatModel {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const ws = state.ws;
-    const batchSize = state.batchSize;
-    const totalTokens = state.totalTokens;
-    const BS = totalTokens;
-    const qkRopeDim = cfg.qkRopeHeadDim;
-    const B = state.isDecode ? batchSize : 1;
-    const S = state.isDecode ? 1 : totalTokens;
 
     if (!this.mtp || !cfg.numNextNPredictLayers) {
       throw new Error("forwardMtp called but model is not configured for MTP or has no next-n predict layers");
     }
 
-    using rotaryEmbedding = this.glm.withStream(() => this.invFreq.rotaryEmbedding(state.customMask?.positionIds || ws.positionIds, B, S));
+    using rotaryEmbedding = this.glm.withStream(() => state.rotaryEmbedding(this.invFreq));
 
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
     using hnormStream = ws.glm.withStream(() => {
       return previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps);
     });
-    using inputIds = state.input!.narrow(0, BS);
-    using embedding = embedTable.embedding(inputIds);
+    using embedding = state.embedding(embedTable);
     if (maskPos0) {
       using firstRow = embedding.narrow(0, 1);
       firstRow.fill(0, hs);

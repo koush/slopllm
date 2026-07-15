@@ -437,11 +437,10 @@ export class Qwen35Model extends ChatModel {
     const S = state.isDecode ? 1 : totalTokens;
 
     const embedTable = this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}embed_tokens.weight`)!;
-    using inputIds = state.input!.narrow(0, BS);
-    using residual = new UsingHolder(embedTable.embedding(inputIds));
+    using residual = new UsingHolder(state.embedding(embedTable));
 
     const ropeDim = Math.floor(hd * cfg.partialRotaryFactor);
-    const rotaryEmbedding = this.invFreq.rotaryEmbedding(ws.positionIds, B, S);
+    const rotaryEmbedding = state.rotaryEmbedding(this.invFreq);
     using cos = rotaryEmbedding.cos;
     using sin = rotaryEmbedding.sin;
 

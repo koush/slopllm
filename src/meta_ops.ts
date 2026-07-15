@@ -86,6 +86,7 @@ export class MetaTensor extends Tensor {
         const headDim = weight.numElements;
         const stride = inStride ?? headDim;
         const nHeads = this.shape[1] / stride;
+        using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
         return this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
     }
 
@@ -152,6 +153,7 @@ export class MetaTensor extends Tensor {
         super.rotaryEmbedding(positionIds, batch, seqLen);
         const dimHalf = this.shape[0];
         const hd = dimHalf * 2;
+        using reshaped = positionIds.reshape([batch, seqLen]);
         const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
         const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
         return { cos, sin };
@@ -159,10 +161,15 @@ export class MetaTensor extends Tensor {
 
     ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
         super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
+        using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
         return this.workspace.alloc([batch * seqLen, nHeads, headDim], this.type);
     }
 
     applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+        super.applyRotaryPosEmb(cos, sin, ropeDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
+        if (this.shape.length === 2) {
+            using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
+        }
         return this.workspace.alloc(this.shape, this.type);
     }
 
@@ -172,6 +179,9 @@ export class MetaTensor extends Tensor {
         const vHeadDim = vProj.shape[1];
         const kvLoraRank = this.shape[this.shape.length - 1];
         const BS = batch * seqLen;
+        if (this.shape.length !== 4) {
+            using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
+        }
         return this.workspace.alloc([BS, nHeads * vHeadDim], this.type);
     }
 
@@ -240,6 +250,8 @@ export class MetaTensor extends Tensor {
     }
 
     applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+        super.applyRotaryPosEmbPartial(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
+        using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
         return this.workspace.alloc(this.shape, this.type);
     }
 

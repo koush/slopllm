@@ -236,6 +236,7 @@ export abstract class Tensor implements Disposable {
   }
 
   fusedNormRope(weight: Tensor, cos: Tensor, sin: Tensor, eps: number, ropeDim: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
+    if (this.shape[0] !== batch * seqLen) throw new Error(`fusedNormRope: input shape[0]=${this.shape[0]} != batch*seqLen=${batch * seqLen}`);
     if (cos.shape.length !== sin.shape.length) throw new Error(`fusedNormRope: cos ndim ${cos.shape.length} != sin ndim ${sin.shape.length}`);
     for (let i = 0; i < cos.shape.length; i++) {
       if (cos.shape[i] !== sin.shape[i]) throw new Error(`fusedNormRope: cos shape [${cos.shape}] != sin shape [${sin.shape}]`);
@@ -392,19 +393,34 @@ export abstract class Tensor implements Disposable {
   }
   rotaryEmbedding(positionIds: Tensor, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
     if (positionIds.type !== "I32") throw new Error(`rotaryEmbedding: positionIds must be I32, got ${positionIds.type}`);
+    if (positionIds.shape[0] !== batch * seqLen) throw new Error(`rotaryEmbedding: positionIds shape[0]=${positionIds.shape[0]} != batch*seqLen=${batch * seqLen}`);
     return undefined as never;
   }
 
   ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
+    if (this.shape[0] !== batch * seqLen) throw new Error(`ropeTranspose: input shape[0]=${this.shape[0]} != batch*seqLen=${batch * seqLen}`);
     if (ropeDim > 0 && cos.shape.length !== sin.shape.length) throw new Error(`ropeTranspose: cos ndim ${cos.shape.length} != sin ndim ${sin.shape.length}`);
     return undefined as never;
   }
 
   applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+    if (this.shape.length === 2) {
+      if (this.shape[0] !== batch * seqLen) throw new Error(`applyRotaryPosEmb: input shape[0]=${this.shape[0]} != batch*seqLen=${batch * seqLen}`);
+    } else if (this.shape.length === 4) {
+      if (this.shape[0] !== batch) throw new Error(`applyRotaryPosEmb: input shape[0]=${this.shape[0]} != batch=${batch}`);
+      const seqDim = unsqueezeDim === 1 ? 2 : 1;
+      if (this.shape[seqDim] !== seqLen) throw new Error(`applyRotaryPosEmb: input shape[${seqDim}]=${this.shape[seqDim]} != seqLen=${seqLen}`);
+    }
     return undefined as never;
   }
 
   mlaVExpand(vProj: Tensor, seqLen: number, batch: number, lse?: Tensor, headOffset?: number, attnNHeads?: number, vProjHeadOffset?: number, tokenMajor?: boolean): Tensor {
+    const BS = batch * seqLen;
+    if (this.shape.length === 4) {
+      if (this.shape[0] !== batch || this.shape[2] !== seqLen) throw new Error(`mlaVExpand: input shape [${this.shape}] != [batch=${batch}, _, seqLen=${seqLen}, _]`);
+    } else {
+      if (this.shape[0] !== BS) throw new Error(`mlaVExpand: input shape[0]=${this.shape[0]} != batch*seqLen=${BS}`);
+    }
     return undefined as never;
   }
 
@@ -482,6 +498,7 @@ export abstract class Tensor implements Disposable {
   }
 
   applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+    if (this.shape[0] !== batch * seqLen) throw new Error(`applyRotaryPosEmbPartial: input shape[0]=${this.shape[0]} != batch*seqLen=${batch * seqLen}`);
     return undefined as never;
   }
 

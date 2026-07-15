@@ -66,6 +66,19 @@ export class ExecutionState {
     }
   }
 
+  rotaryEmbedding(invFreq: Tensor): { cos: Tensor, sin: Tensor } {
+    const B = this.isDecode ? this.batchSize : 1;
+    const S = this.isDecode ? 1 : this.totalTokens;
+    const posIds = this.customMask?.positionIds || this.ws.positionIds;
+    using narrowed = posIds.narrow(0, B * S);
+    return invFreq.rotaryEmbedding(narrowed, B, S);
+  }
+
+  embedding(embedTable: Tensor): Tensor {
+    using narrowed = this.input!.narrow(0, this.totalTokens);
+    return embedTable.embedding(narrowed);
+  }
+
   kvCacheWrite(kRope: Tensor, vBuf: Tensor, cacheIdx: number, nKv: number, hd: number): void {
     const pagedKV = this.cache.getPagedKV();
     const BS = this.totalTokens;

@@ -337,8 +337,9 @@ export class GlmTensor extends Tensor {
     const headDim = weight.numElements;
     const stride = inStride ?? headDim;
     const nHeads = this.shape[1] / stride;
+    using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
     const out = this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
-    getNativeAddon().fusedNormRope(this.glm.ctx, out.data, this.data, weight.data, cos.data, sin.data, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim, interleaved ?? false);
+    getNativeAddon().fusedNormRope(this.glm.ctx, out.data, reshaped.data, weight.data, cos.data, sin.data, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim, interleaved ?? false);
     return out;
   }
 
@@ -497,22 +498,30 @@ export class GlmTensor extends Tensor {
     super.rotaryEmbedding(positionIds, batch, seqLen);
     const dimHalf = this.shape[0];
     const hd = dimHalf * 2;
+    using reshaped = positionIds.reshape([batch, seqLen]);
     const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
     const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
-    getNativeAddon().rotaryEmbedding(this.glm.ctx, cos.data, sin.data, this.data, positionIds.data, dimHalf, batch, seqLen);
+    getNativeAddon().rotaryEmbedding(this.glm.ctx, cos.data, sin.data, this.data, reshaped.data, dimHalf, batch, seqLen);
     return { cos, sin };
   }
 
   ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
-    super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride);
+    super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
+    using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
     const out = this.workspace.alloc([batch * seqLen, nHeads, headDim], this.type);
-    getNativeAddon().ropeTranspose(this.glm.ctx, out.data, this.data, ropeDim > 0 ? cos.data : 0, ropeDim > 0 ? sin.data : 0, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim, interleaved ?? false);
+    getNativeAddon().ropeTranspose(this.glm.ctx, out.data, reshaped.data, ropeDim > 0 ? cos.data : 0, ropeDim > 0 ? sin.data : 0, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim, interleaved ?? false);
     return out;
   }
 
   applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+    super.applyRotaryPosEmb(cos, sin, ropeDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
+    let inputData = this.data;
+    if (this.shape.length === 2) {
+      using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
+      inputData = reshaped.data;
+    }
     const out = this.workspace.alloc(this.shape, this.type);
-    getNativeAddon().applyRotaryPosEmb(this.glm.ctx, out.data, this.data, cos.data, sin.data, ropeDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false);
+    getNativeAddon().applyRotaryPosEmb(this.glm.ctx, out.data, inputData, cos.data, sin.data, ropeDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false);
     return out;
   }
 
@@ -523,10 +532,15 @@ export class GlmTensor extends Tensor {
     const vHeadDim = vProj.shape[1];
     attnNHeads = attnNHeads ?? nHeads;
     const BS = batch * seqLen;
+    let inputData = this.data;
+    if (this.shape.length !== 4) {
+      using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
+      inputData = reshaped.data;
+    }
     const out = this.workspace.alloc([BS, nHeads * vHeadDim], this.type);
     const effSeqLen = tokenMajor ? 1 : seqLen;
     const effBatch = tokenMajor ? BS : batch;
-    getNativeAddon().mlaVExpand(this.glm.ctx, out.data, this.data, vProj.data, kvLoraRank, vHeadDim, nHeads, effSeqLen, effBatch, attnNHeads, headOffset, vProjHeadOffset);
+    getNativeAddon().mlaVExpand(this.glm.ctx, out.data, inputData, vProj.data, kvLoraRank, vHeadDim, nHeads, effSeqLen, effBatch, attnNHeads, headOffset, vProjHeadOffset);
     return out;
   }
 
@@ -695,8 +709,10 @@ export class GlmTensor extends Tensor {
   }
 
   applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+    super.applyRotaryPosEmbPartial(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
+    using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
     const out = this.workspace.alloc(this.shape, this.type);
-    getNativeAddon().applyRotaryPosEmbPartial(this.glm.ctx, out.data, this.data, cos.data, sin.data, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false);
+    getNativeAddon().applyRotaryPosEmbPartial(this.glm.ctx, out.data, reshaped.data, cos.data, sin.data, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false);
     return out;
   }
 
