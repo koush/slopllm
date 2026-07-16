@@ -420,10 +420,9 @@ export class Glm51Model extends ChatModel {
     const qkRopeDim = cfg.qkRopeHeadDim;
     const pfx = `${Glm51Model.WEIGHT_PREFIX}${layerIdx}.self_attn`;
     const batchSize = state.batchSize;
-    const totalTokens = state.totalTokens;
-    const BS = totalTokens;
+    const BS = state.totalTokens;
     const B = state.isDecode ? batchSize : 1;
-    const S = state.isDecode ? 1 : totalTokens;
+    const S = state.isDecode ? 1 : state.totalTokens;
 
     using kvcache = this.glm.withStream(() => {
       using kPeRopeStream = this.glm.withStream(() => {
@@ -580,7 +579,6 @@ export class Glm51Model extends ChatModel {
 
   forwardModel(state: ExecutionState): Tensor {
     const cfg = this.cfg;
-    const totalTokens = state.totalTokens;
 
     using rotaryEmbedding = this.glm.withStream(() => state.rotaryEmbedding(this.invFreq));
 

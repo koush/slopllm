@@ -15,7 +15,6 @@ interface Captured {
  */
 interface LengthVariant {
     kvLen: boolean;
-    qLen: boolean;
 }
 
 export class CaptureManager implements Disposable {
@@ -38,18 +37,17 @@ export class CaptureManager implements Disposable {
 
     /** Learned variance for a base graph; defaults to length-invariant. */
     getLengthVariant(baseKey: string): LengthVariant {
-        return this.lengthVariant.get(baseKey) ?? { kvLen: false, qLen: false };
+        return this.lengthVariant.get(baseKey) ?? { kvLen: false };
     }
 
     /** Monotonically record that a base graph sizes buffers by a padded dim. */
-    recordLengthVariant(baseKey: string, kvLen: boolean, qLen: boolean): void {
-        if (!kvLen && !qLen) return;
+    recordLengthVariant(baseKey: string, kvLen: boolean): void {
+        if (!kvLen) return;
         const cur = this.lengthVariant.get(baseKey);
         if (!cur) {
-            this.lengthVariant.set(baseKey, { kvLen, qLen });
+            this.lengthVariant.set(baseKey, { kvLen });
         } else {
             cur.kvLen ||= kvLen;
-            cur.qLen ||= qLen;
         }
     }
 

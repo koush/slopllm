@@ -2898,16 +2898,13 @@ export class ParallelOps implements DeviceOps {
   }
 
   shouldGatherKv(state: ExecutionState) {
-    let shouldGatherKv = CP_GATHER_KV && state.cache.getPagedKV().contextParallel && state.getGraphVariantPaddedQLen() > 32;
+    let shouldGatherKv = CP_GATHER_KV && state.cache.getPagedKV().contextParallel && state.totalTokens > 32;
     if (shouldGatherKv) {
-      console.warn('Gathering KV cache for CP mode due to padded Q length > 32. This may be inefficient for large KV caches.');
       const paddedKvLen = state.getGraphVariantPaddedKvLen();
-      const paddedQLen = state.getGraphVariantPaddedQLen();
-      shouldGatherKv = paddedQLen * 162 >= paddedKvLen;
+      shouldGatherKv = state.totalTokens * 162 >= paddedKvLen;
     }
     return shouldGatherKv;
   }
-
 
   sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
     const pagedKV = state.cache.getPagedKV();

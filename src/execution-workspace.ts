@@ -19,9 +19,7 @@ export class ExecutionState {
   input?: Tensor;
   sharedSlots?: UsingHolder<Tensor>;
   paddedKvLenInvariant = true;
-  paddedQLenInvariant = true;
   private readonly paddedKvLen: number;
-  private readonly paddedQLen: number;
 
   constructor(
     public readonly batchSize: number, public readonly totalTokens: number, public readonly seqLens: number[],
@@ -36,15 +34,10 @@ export class ExecutionState {
   ) {
     const totalKvLen = cache.getPagedKV().sequences.reduce((sum, s) => sum + s.allocLen, 0);
     this.paddedKvLen = ExecutionState.getPaddedKvLen(totalKvLen);
-    this.paddedQLen = ExecutionState.getPaddedQLen(this.totalTokens);
   }
 
   private static getPaddedKvLen(totalKvLen: number): number {
     return Math.max(1024, 1 << Math.ceil(Math.log2(totalKvLen)));
-  }
-
-  private static getPaddedQLen(qLen: number): number {
-    return Math.max(16, 1 << Math.ceil(Math.log2(qLen)));
   }
 
   get lastIdx(): Tensor {
@@ -66,17 +59,17 @@ export class ExecutionState {
     }
   }
 
+  embedding(embedTable: Tensor): Tensor {
+    using narrowed = this.input!.narrow(0, this.totalTokens);
+    return embedTable.embedding(narrowed);
+  }
+
   rotaryEmbedding(invFreq: Tensor): { cos: Tensor, sin: Tensor } {
     const B = this.isDecode ? this.batchSize : 1;
     const S = this.isDecode ? 1 : this.totalTokens;
     const posIds = this.customMask?.positionIds || this.ws.positionIds;
     using narrowed = posIds.narrow(0, B * S);
     return invFreq.rotaryEmbedding(narrowed, B, S);
-  }
-
-  embedding(embedTable: Tensor): Tensor {
-    using narrowed = this.input!.narrow(0, this.totalTokens);
-    return embedTable.embedding(narrowed);
   }
 
   kvCacheWrite(kRope: Tensor, vBuf: Tensor, cacheIdx: number, nKv: number, hd: number): void {
@@ -214,7 +207,7 @@ export class ExecutionState {
   // are NOT included here; they are appended to the effective key only once the
   // graph has been learned to size its buffers by them (see CaptureManager).
   private baseKeyParams(providedKeyParams: (string|number)[]): (string|number)[] {
-    return [...(providedKeyParams ?? []), `batchSize:${this.batchSize}`];
+    return [...(providedKeyParams ?? []), `batchSize:${this.batchSize}`, `totalTokens:${this.totalTokens}`];
   }
 
   // Effective capture key: base key + any padded dims this base graph is known
@@ -225,7 +218,6 @@ export class ExecutionState {
     const keyParams = this.baseKeyParams(providedKeyParams);
     const variant = captureManager.getLengthVariant(keyParams.join(","));
     if (variant.kvLen) keyParams.push(`paddedKvLen:${this.paddedKvLen}`);
-    if (variant.qLen) keyParams.push(`paddedQLen:${this.paddedQLen}`);
     return keyParams;
   }
 
@@ -238,20 +230,12 @@ export class ExecutionState {
     return this.paddedKvLen;
   }
 
-  getGraphVariantPaddedQLen() {
-    this.paddedQLenInvariant = false;
-    return this.paddedQLen;
-  }
-
   capture<T>(captureManager: CaptureManager, fn: (capturing: boolean) => T, providedKeyParams: (string|number)[]): T {
     const baseKey = this.baseKeyParams(providedKeyParams).join(",");
     const keyParams = this.effectiveKeyParams(captureManager, providedKeyParams);
     return captureManager.run(capturing => {
       const result = fn(capturing);
-      // Learn (monotonically) whether this graph varies by a padded dim, so
-      // subsequent invocations key on it. getGraphVariantPadded*() flips the
-      // corresponding flag false during fn when the graph consumed that dim.
-      captureManager.recordLengthVariant(baseKey, !this.paddedKvLenInvariant, !this.paddedQLenInvariant);
+      captureManager.recordLengthVariant(baseKey, !this.paddedKvLenInvariant);
       return result;
     }, keyParams);
   }
