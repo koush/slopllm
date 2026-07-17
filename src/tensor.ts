@@ -19,7 +19,7 @@ function numElements(shape: number[]): number {
 export abstract class Tensor implements Disposable {
   parallelism: TensorParallelism = TensorParallelism.Replicated;
   private pinnedBuffer?: Buffer;
-  stack: string;
+  // stack: string;
   views = new Set<Tensor>();
   disposed = false;
   viewDisposed = false;
@@ -43,7 +43,7 @@ export abstract class Tensor implements Disposable {
     this.name = name;
     this.pinned = pinned;
     this.view = view;
-    this.stack = new Error("Tensor allocated at:").stack!;
+    // this.stack = new Error("Tensor allocated at:").stack!;
     if (view) {
       view.views.add(this);
     }

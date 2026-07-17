@@ -2839,20 +2839,92 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, _pageSize?: number, _cpWorldSize?: number, _cpRank?: number): void {
+  sparseMlaPrepareCache(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | null, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
+    if (!indices) {
+      throw new Error("sparseMlaPrepareCache: indices tensor is required");
+    }
+
+    if (state.isDecode || !this.shouldGatherKv(state))
+      return kvCache.viewClone();
+
     const pKvCache = this.cast(kvCache);
     const pAppendCkv = this.cast(appendCkv);
     const pAppendKpe = this.cast(appendKpe);
-    const pIndices = this.cast(indices);
+    const pIndptr = this.cast(indptr);
+    const pBatchIndices = this.cast(batchIndices);
+    const pPositions = this.cast(positions);
+    const contextParallel = pKvCache.parallelism === TensorParallelism.Row;
+    const pageSize = pKvCache.shape[1];
+    const pagedKV = state.cache.getPagedKV();
+
+    const nextCacheIdx = cacheIdx + 1;
+    if (nextCacheIdx < state.model.cfg.numHiddenLayers && pagedKV.ckvData[nextCacheIdx]) {
+      // prefetch gathers pages from the next layer
+      const nextStream = this.withStream(() => {
+        const nextKvCache = pagedKV.ckvData[nextCacheIdx];
+
+        return this.gatherPages(
+          nextKvCache, indices, indptr, state.ws.lastPageLen,
+          state.batchSize,
+          pagedKV.maxPages * pagedKV.pageSize,
+          state.ws.kvTokenIndptrD, contextParallel,
+        ) as ParallelTensor;
+      });
+
+      // leak prevention (ie mtp ignored, etc)
+      using existing = state.ws.extras.get(`sparseMlaPrefetch_${nextCacheIdx}`) as ReturnType<typeof this.withStream<ParallelTensor>>;
+      existing?.streamWaitEvent();
+      using _existing = existing?.result;
+
+      state.ws.extras.set(`sparseMlaPrefetch_${nextCacheIdx}`, nextStream);
+    }
+
+    const prefetchKeyStream = `sparseMlaPrefetch_${cacheIdx}`;
+    using prefetchedStream = state.ws.extras.get(prefetchKeyStream) as ReturnType<typeof this.withStream<ParallelTensor>>;
+    const prefetched = prefetchedStream?.result;
+    if (prefetched) {
+      // after a prefetch, the NEW ckv values need to be written to the flat gathered tensor
+      // because the prefetch started on the layer before they were ready.
+      state.ws.extras.delete(prefetchKeyStream);
+      prefetchedStream.streamWaitEvent();
+
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].concatAndCacheDsMla(state, cacheIdx, prefetched.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i],
+          // prefetch tensor is flat, so no need for indices
+          undefined,
+          pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, pageSize, 0, 0);
+      }
+    }
+
+    if (prefetched) {
+      // console.log('prefetched', cacheIdx);
+      return prefetched;
+    }
+
+    // no prefetch was available, so gather the pages now (layer 0)
+    return this.gatherPages(
+      kvCache, indices, indptr, state.ws.lastPageLen,
+      state.batchSize,
+      pagedKV.maxPages * pagedKV.pageSize,
+      state.ws.kvTokenIndptrD, contextParallel,
+    );
+  }
+
+  concatAndCacheDsMla(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | undefined, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number) {
+    const pKvCache = this.cast(kvCache);
+    const pAppendCkv = this.cast(appendCkv);
+    const pAppendKpe = this.cast(appendKpe);
+    const pIndices = indices ? this.cast(indices) : null;
     const pIndptr = this.cast(indptr);
     const pBatchIndices = this.cast(batchIndices);
     const pPositions = this.cast(positions);
     const contextParallel = pKvCache.parallelism === TensorParallelism.Row;
     const cpWorldSize = contextParallel ? this.worldSize : 0;
     const pageSize = pKvCache.shape[1];
+
     for (let i = 0; i < this.worldSize; i++) {
       const cpRank = contextParallel ? i : 0;
-      this.devices[i].concatAndCacheDsMla(pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, pageSize, cpWorldSize, cpRank);
+      this.devices[i].concatAndCacheDsMla(state, cacheIdx, pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices?.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, pageSize, cpWorldSize, cpRank);
     }
   }
 
@@ -2907,7 +2979,6 @@ export class ParallelOps implements DeviceOps {
   }
 
   sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
-    const pagedKV = state.cache.getPagedKV();
     const numTokens = state.totalTokens;
     const pQAbsorbed = this.cast(qAbsorbed);
     const pQPe = this.cast(qPe);
@@ -2918,18 +2989,7 @@ export class ParallelOps implements DeviceOps {
     const numHeads = pQAbsorbed.shape[1];
     const headDim = pQAbsorbed.shape[2];
 
-    const shouldGatherKv = this.shouldGatherKv(state);
-
-    using gatheredKv = shouldGatherKv
-      ? this.gatherPages(
-        kvCache, pagedKV.indices, pageIndptrD, lastPageLen,
-        state.batchSize,
-        pagedKV.maxPages * pagedKV.pageSize,
-        kvTokenIndptrD, true,
-      )
-      : undefined;
-    const effectiveKvCache = gatheredKv ?? kvCache;
-    const pEffKvCache = this.cast(effectiveKvCache);
+    const pEffKvCache = this.cast(kvCache);
     const nonCp = pEffKvCache.parallelism !== TensorParallelism.Row;
     const oPar = nonCp ? TensorParallelism.Row : TensorParallelism.PartialSoftmax;
     using gatheredQAbsorbed: ParallelTensor = (pQAbsorbed.parallelism === TensorParallelism.Row && nonCp)
@@ -3082,7 +3142,7 @@ export class ParallelOps implements DeviceOps {
       && colIdxQ && colWeights
       && totalQ % W === 0;
 
-    if (true || !canShard) {
+    if (!canShard) {
       const topkIdxShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
         topkIdxShards.push(this.devices[i].indexerTopk(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, topk, decode, qGlobalStart ?? 0, pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i]));

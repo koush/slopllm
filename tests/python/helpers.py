@@ -643,6 +643,7 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_uint32, ctypes.c_uint32,
         ]
 
         self.lib.glm_sparse_mla_prefill.restype = None
@@ -1711,16 +1712,19 @@ class GlmOps:
     def concat_and_cache_ds_mla(self, kv_cache, append_ckv, append_kpe,
                                 indices, indptr, batch_indices, positions,
                                 nnz, page_size, kv_lora_rank, pe_dim,
-                                append_ckv_stride_n, append_kpe_stride_n):
+                                append_ckv_stride_n, append_kpe_stride_n,
+                                cp_world_size=0, cp_rank=0):
         self.lib.glm_concat_and_cache_ds_mla(
             self.ctx,
             ctypes.c_void_p(kv_cache),
             ctypes.c_void_p(append_ckv), ctypes.c_void_p(append_kpe),
-            ctypes.c_void_p(indices), ctypes.c_void_p(indptr),
+            ctypes.c_void_p(indices) if indices is not None else None,
+            ctypes.c_void_p(indptr),
             ctypes.c_void_p(batch_indices), ctypes.c_void_p(positions),
             ctypes.c_uint32(nnz), ctypes.c_uint32(page_size),
             ctypes.c_uint32(kv_lora_rank), ctypes.c_uint32(pe_dim),
-            ctypes.c_size_t(append_ckv_stride_n), ctypes.c_size_t(append_kpe_stride_n)
+            ctypes.c_size_t(append_ckv_stride_n), ctypes.c_size_t(append_kpe_stride_n),
+            ctypes.c_uint32(cp_world_size), ctypes.c_uint32(cp_rank),
         )
 
     def sparse_mla_prefill(self, q, kv_cache, indices, output, out_lse,

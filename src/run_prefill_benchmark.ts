@@ -81,9 +81,9 @@ async function main(): Promise<void> {
 
   const model: ChatModel = await Glm51Model.fromPretrained(glm, modelDir, args.cp, false);
   const worldSize = args.gpus.length;
-  const cachePageSize = args.cp ? args.pageSize * worldSize : args.pageSize;
+  const cachePageSize = args.pageSize;
   const totalLen = args.contextLen + args.seqLen;
-  const maxPages = Math.ceil(totalLen / cachePageSize) + 64;
+  const maxPages = Math.ceil(totalLen / cachePageSize / (args.cp ? worldSize : 1)) + 64;
   const cache = model.createChatCache(maxPages, args.maxBatch, totalLen + 1, cachePageSize);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.chunkSize + 1);
 

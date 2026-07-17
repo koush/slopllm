@@ -47,8 +47,8 @@ function findProjectRoot(dir: string): string {
   return dir;
 }
 
-function ptr(t: Tensor): number {
-  return t.data;
+function ptr(t: Tensor | undefined): number {
+  return t ? t.data : 0;
 }
 
 let nativeAddon: NativeAddon | null = null;
@@ -956,7 +956,7 @@ export class GlmOps implements DeviceOps {
     if (stream === undefined)
       throw new Error("No available streams");
     const currentStream = this.currentStream;
-    // Record event on stream 0 so the alternate stream can wait for
+    // Record event on current stream so the alternate stream can wait for
     // all prior work (e.g. rmsnorm output that K/V will read).
     getNativeAddon().eventRecord(this.ctx, currentStream, currentStream);
     if (this.streamTensors.has(stream)) {
@@ -965,7 +965,7 @@ export class GlmOps implements DeviceOps {
     this.setStream(stream);
     getNativeAddon().streamWaitEvent(this.ctx, stream, currentStream);
     const result = fn();
-    // Record event on the alternate stream so stream 0 can wait at dispose.
+    // Record event on the alternate stream so others can wait
     getNativeAddon().eventRecord(this.ctx, stream, stream);
     this.setStream(currentStream);
     return {
@@ -1176,8 +1176,12 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), kpeData ? ptr(kpeData) : 0, ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), appendKpe ? ptr(appendKpe) : 0, ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
   }
 
-  concatAndCacheDsMla(kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize: number = kvCache.shape[1], cpWorldSize: number = 0, cpRank: number = 0): void {
+  concatAndCacheDsMla(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | undefined, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize: number = kvCache.shape[1], cpWorldSize: number = 0, cpRank: number = 0) {
     getNativeAddon().concatAndCacheDsMla(this.ctx, ptr(kvCache), ptr(appendCkv), ptr(appendKpe), ptr(indices), ptr(indptr), ptr(batchIndices), ptr(positions), nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
+  }
+
+  sparseMlaPrepareCache(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | null, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
+    return kvCache.viewClone();
   }
 
   gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {

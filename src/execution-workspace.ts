@@ -22,6 +22,7 @@ export class ExecutionState {
   private readonly paddedKvLen: number;
 
   constructor(
+    public readonly model: ChatModel,
     public readonly batchSize: number, public readonly totalTokens: number, public readonly seqLens: number[],
     public readonly isDecode: boolean, public readonly ws: ExecutionWorkspace, public readonly cache: ChatCache,
     public readonly customMask?: {
@@ -88,11 +89,25 @@ export class ExecutionState {
     );
   }
 
-  mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number): void {
+  sparseMlaPrepareCache(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number) {
+    const pagedKV = this.cache.getPagedKV();
+    const nnz = this.isDecode ? this.batchSize : this.totalTokens;
+    return this.ws.glm.sparseMlaPrepareCache(
+      this, cacheIdx,
+      pagedKV.ckvData[cacheIdx], appendCkv, appendKpe,
+      pagedKV.indices, this.ws.indptrD,
+      this.ws.mlaBatchIndices, this.ws.positionIds,
+      nnz, kvLoraRank, qkRopeDim,
+      kvLoraRank, qkRopeDim
+    );
+  }
+
+  mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number) {
     const pagedKV = this.cache.getPagedKV();
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     if (pagedKV.sparseMode) {
-      this.ws.glm.concatAndCacheDsMla(
+      return this.ws.glm.concatAndCacheDsMla(
+        this, cacheIdx,
         pagedKV.ckvData[cacheIdx],
         appendCkv, appendKpe,
         pagedKV.indices, this.ws.indptrD,
@@ -155,18 +170,18 @@ export class ExecutionState {
     }
   }
 
-  sparseMla(qAbsorbed: Tensor, qPe: Tensor, cacheIdx: number, indices: Tensor, topk: number, smScale: number): { o: Tensor, lse: Tensor } {
+  sparseMla(qAbsorbed: Tensor, qPe: Tensor, ckv: Tensor, indices: Tensor, topk: number, smScale: number): { o: Tensor, lse: Tensor } {
     const pagedKV = this.cache.getPagedKV();
     if (this.isDecode) {
       const numSplits = Math.ceil(topk / 64);
       return this.ws.glm.sparseMlaDecode(
-        this, qAbsorbed, qPe, pagedKV.ckvData[cacheIdx], indices,
+        this, qAbsorbed, qPe, ckv, indices,
         topk, numSplits,
         smScale, 0, this.ws.sparseTopkLength,
       );
     } else {
       return this.ws.glm.sparseMlaPrefill(
-        this, qAbsorbed, qPe, pagedKV.ckvData[cacheIdx], indices,
+        this, qAbsorbed, qPe, ckv, indices,
         topk,
         smScale, this.ws.sparseTopkLength,
         this.ws.indptrD, this.ws.lastPageLen, this.ws.kvTokenIndptrD,
@@ -305,6 +320,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   sparseTopkLength: Tensor;
   lastDecodePagedKV: PagedKVCache | null;
   private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
+  extras = new Map<string, any>();
 
   constructor(glm: DeviceOps, B: number, S: number) {
     super(glm);
@@ -363,9 +379,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
     if (this.tracked.size) {
       console.warn(new Error("startTracking was called with tensors already allocated, this may result in non-deterministic allocations."));
-      for (const tracked of this.tracked) {
-        console.warn(tracked.stack);
-      }
+      // for (const tracked of this.tracked) {
+      //   console.warn(tracked.stack);
+      // }
     }
     for (const tensor of this.exported) {
       if (!keepExports.has(tensor)) {
@@ -607,7 +623,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       pagedKV.pagesDirtyDevice = false;
     }
 
-    return new ExecutionState(batchSize, totalTokens, seqLens, true, this, cache);
+    return new ExecutionState(model, batchSize, totalTokens, seqLens, true, this, cache);
   }
 
   planPrefill(model: ChatModel, batchSize: number, seqLens: number[], cache: ChatCache, customMask?: {
@@ -746,7 +762,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.kvLenD.memcpy(this.kvLenH, batchSize * I32, MemcpyKind.HostToDevice);
     this.kvTokenIndptrD.memcpy(this.kvTokenIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
 
-    return new ExecutionState(batchSize, totalTokens, seqLens, false, this, cache, customMask);
+    return new ExecutionState(model, batchSize, totalTokens, seqLens, false, this, cache, customMask);
   }
 
   forwardPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): Tensor {

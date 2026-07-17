@@ -1092,10 +1092,15 @@ __global__ void concat_and_cache_ds_mla_kernel(
         eff_page_size = page_size / (int)cp_world_size;
     }
 
-    const int page_in_seq = pos / eff_page_size;
-    const int offset_in_page = pos % eff_page_size;
-    const int page_id = indices[indptr[batch] + page_in_seq];
-    const size_t slot = (size_t)page_id * eff_page_size + offset_in_page;
+    size_t slot;
+    if (indices == nullptr) {
+        slot = (size_t)indptr[batch] * eff_page_size + pos;
+    } else {
+        const int page_in_seq = pos / eff_page_size;
+        const int offset_in_page = pos % eff_page_size;
+        const int page_id = indices[indptr[batch] + page_in_seq];
+        slot = (size_t)page_id * eff_page_size + offset_in_page;
+    }
 
     uint8_t* dst = kv_cache + slot * BPT;
     const __nv_bfloat16* src_ckv = append_ckv + (size_t)token_idx * ckv_stride_n;

@@ -436,6 +436,8 @@ export class Glm51Model extends ChatModel {
 
       kPeRopeStream.streamWaitEvent();
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
+
+      return state.sparseMlaPrepareCache(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
     });
 
     // Indexer K: wk(normed) → layernorm → split → RoPE → concat → append to kData
@@ -518,6 +520,7 @@ export class Glm51Model extends ChatModel {
 
     using qAbsorbedR = q.result.qAbsorbedR;
     using qPeR = q.result.qPeR;
+    using ckv = kvcache.result;
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     {
@@ -532,7 +535,7 @@ export class Glm51Model extends ChatModel {
         // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
         // seqLen=1, batch=BS — which matches token-major layout.
         const sparseResult = state.sparseMla(
-          qAbsorbedR, qPeR, layerIdx, sharedSlots.value,
+          qAbsorbedR, qPeR, ckv!, sharedSlots.value,
           cfg.indexTopk, cfg.scaling,
         );
         tokenMajor = !state.isDecode;
