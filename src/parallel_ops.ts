@@ -3135,6 +3135,9 @@ export class ParallelOps implements DeviceOps {
 
     const W = this.worldSize;
     const kDataReplicated = kData.parallelism === TensorParallelism.Replicated;
+    if (W > 1 && !kDataReplicated) {
+      throw new Error(`indexerTopk: cross-rank topk merge is not supported (kData parallelism: ${kData.parallelism})`);
+    }
     using colIdxQ = this.tryNarrowToColumnParallel(pQ);
     using colWeights = this.tryNarrowToColumnParallel(pWeights);
     const canShard = !decode && W > 1 && kDataReplicated
