@@ -1,13 +1,18 @@
+import { AutoTokenizer } from "@huggingface/transformers";
+import fs from "node:fs";
+import path from "node:path";
 import { CaptureManager } from "./capture-manager";
-import { ChatModel } from "./chat_model";
+import { ChatCache, ChatModel } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { ParallelOps } from "./parallel_ops";
+import { resolveModelPath } from "./model_path";
 
 const GLM51_MODEL_DIR = '/mnt/storage/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/2eff962076815828e4031aec2834ac6e22fb4434/';
 const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp4";
+const GLM51_REPO = "zai-org/GLM-5.1";
 
 interface BenchArgs {
   gpus: number[];
@@ -21,6 +26,8 @@ interface BenchArgs {
   cp: boolean;
   pageSize: number;
   glm51Small: boolean;
+  file: string | undefined;
+  maxNewTokens: number;
 }
 
 function parseArgs(argv: string[]): BenchArgs {
@@ -37,6 +44,8 @@ function parseArgs(argv: string[]): BenchArgs {
     cp: false,
     pageSize: 64,
     glm51Small: false,
+    file: undefined,
+    maxNewTokens: 512,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -50,6 +59,8 @@ function parseArgs(argv: string[]): BenchArgs {
     else if (a === "--cp") args.cp = true;
     else if (a === "--page-size" && i + 1 < argv.length) args.pageSize = parseInt(argv[++i], 10);
     else if (a === "--glm51-small") args.glm51Small = true;
+    else if (a === "--file" && i + 1 < argv.length) args.file = argv[++i];
+    else if (a === "--max-new-tokens" && i + 1 < argv.length) args.maxNewTokens = parseInt(argv[++i], 10);
     else if (a === "--help") {
       console.log(`Usage: npx tsx src/run_prefill_benchmark.ts [options]
 Options:
@@ -63,11 +74,120 @@ Options:
   --cp               Enable context parallelism
   --page-size <n>    KV cache page size (default: 16)
   --glm51-small      Use GLM-5.1 small model
+  --file <path>      Read file contents (up to --seq-len tokens), ask the model to
+                     summarize it, and print the response (skips benchmarking)
+  --max-new-tokens <n>  Max tokens to generate for --file summary (default: 512)
   --help             Show this help`);
       process.exit(0);
     }
   }
   return args;
+}
+
+function tokenizeMessages(
+  tokenizer: any,
+  messages: Array<{ role: string; content: string }>,
+  chatTemplate?: string,
+): number[] {
+  try {
+    const opts: any = {
+      tokenize: true,
+      add_generation_prompt: true,
+      return_tensor: false,
+      return_dict: true,
+    };
+    if (chatTemplate) opts.chat_template = chatTemplate;
+    const result = tokenizer.apply_chat_template(messages, opts) as { input_ids: number[] | number[][] };
+    return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
+  } catch {
+    const text = messages.map(m => `<|${m.role}|>\n${m.content}`).join("\n") + "\n\n\n";
+    return tokenizer.encode(text, { add_special_tokens: false });
+  }
+}
+
+// Build the summarization prompt, trimming the document text until the templated
+// prompt fits within seqLen tokens (keeps the chat-template suffix / generation
+// prompt intact, which raw token truncation would clobber).
+function buildSummaryPromptIds(
+  tokenizer: any, chatTemplate: string | undefined, docText: string, seqLen: number,
+): number[] {
+  const makeIds = (content: string) =>
+    tokenizeMessages(tokenizer, [{ role: "user", content: `Summarize the following text:\n\n${content}` }], chatTemplate);
+
+  let content = docText;
+  let ids = makeIds(content);
+  while (ids.length > seqLen && content.length > 1) {
+    // Cut proportionally to the overshoot (with margin) and re-tokenize.
+    const keep = Math.max(1, Math.floor(content.length * (seqLen / ids.length) * 0.95));
+    if (keep >= content.length) break;
+    content = content.slice(0, keep);
+    ids = makeIds(content);
+  }
+  return ids;
+}
+
+async function runSummarize(
+  model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
+  args: BenchArgs, modelDir: string,
+): Promise<void> {
+  const tokenizerDir = fs.existsSync(path.join(modelDir, "tokenizer_config.json"))
+    ? modelDir : resolveModelPath(GLM51_REPO);
+  const tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
+  const chatTemplatePath = path.join(tokenizerDir, "chat_template.jinja");
+  const chatTemplate = fs.existsSync(chatTemplatePath) ? fs.readFileSync(chatTemplatePath, "utf-8") : undefined;
+
+  const docText = fs.readFileSync(args.file!, "utf-8");
+  const inputIds = buildSummaryPromptIds(tokenizer, chatTemplate, docText, args.seqLen);
+  const promptLen = inputIds.length;
+  console.log(`Summarizing ${args.file} | ${docText.length} chars -> ${promptLen} prompt tokens (cap ${args.seqLen}) | max_new_tokens=${args.maxNewTokens}`);
+
+  cache.reset(1);
+  const numChunks = Math.ceil(promptLen / args.chunkSize);
+
+  // Chunked prefill of the document. planPrefill positions each chunk at the
+  // current allocLen, so consecutive chunks continue the sequence correctly.
+  // Keep the last chunk's logits to sample the first response token.
+  let firstToken = -1;
+  const tPrefill = performance.now();
+  for (let c = 0; c < numChunks; c++) {
+    const chunkStart = c * args.chunkSize;
+    const chunkLen = Math.min(args.chunkSize, promptLen - chunkStart);
+    const isLast = c === numChunks - 1;
+
+    const state = ws.planPrefill(model, 1, [chunkLen], cache);
+    state.setInput([inputIds.slice(chunkStart, chunkStart + chunkLen)]);
+    using hiddenStates = model.forward(state);
+    if (isLast) {
+      using logits = state.computeLogits(hiddenStates, model);
+      using argmax = logits.argmax();
+      firstToken = argmax.readInt32LEArray()[0];
+    }
+    glm.synchronize();
+  }
+  const prefillMs = performance.now() - tPrefill;
+  console.log(`prefill: ${promptLen} tokens in ${prefillMs.toFixed(0)}ms (${(promptLen / (prefillMs / 1000)).toFixed(0)} tok/s)\n`);
+
+  // Greedy decode loop, streaming decoded text to stdout.
+  process.stdout.write("Summary: ");
+  const generatedIds: number[] = [];
+  let cur = firstToken;
+  const tDecode = performance.now();
+  for (let i = 0; i < args.maxNewTokens; i++) {
+    if (model.eosIds.has(cur)) break;
+    generatedIds.push(cur);
+    process.stdout.write(tokenizer.decode([cur], { skip_special_tokens: true }));
+
+    const state = ws.planDecode(model, 1, cache);
+    state.setInput([[cur]]);
+    ws.positionStep(state, model);
+    using hiddenStates = model.forward(state);
+    using logits = state.computeLogits(hiddenStates, model);
+    using argmax = logits.argmax();
+    cur = argmax.readInt32LEArray()[0];
+  }
+  const decodeMs = performance.now() - tDecode;
+  process.stdout.write("\n");
+  console.log(`\n[${generatedIds.length} tokens in ${(decodeMs / 1000).toFixed(1)}s, ${(generatedIds.length / (decodeMs / 1000)).toFixed(1)} tok/s]`);
 }
 
 async function main(): Promise<void> {
@@ -82,7 +202,9 @@ async function main(): Promise<void> {
   const model: ChatModel = await Glm51Model.fromPretrained(glm, modelDir, args.cp, false);
   const worldSize = args.gpus.length;
   const cachePageSize = args.pageSize;
-  const totalLen = args.contextLen + args.seqLen;
+  // In --file mode, reserve room for the generated summary on top of the prompt.
+  const genHeadroom = args.file ? args.maxNewTokens : 0;
+  const totalLen = args.contextLen + args.seqLen + genHeadroom;
   const maxPages = Math.ceil(totalLen / cachePageSize / (args.cp ? worldSize : 1)) + 64;
   const cache = model.createChatCache(maxPages, args.maxBatch, totalLen + 1, cachePageSize);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.chunkSize + 1);
@@ -96,6 +218,17 @@ async function main(): Promise<void> {
   const kvLoraRank = cfg.kvLoraRank ?? "?";
   console.log(`Model: ${numLayers} layers, hidden=${hiddenSize}, heads=${numHeads}, kv_lora_rank=${kvLoraRank}, page_size=${cachePageSize} (effective ${args.pageSize}/gpu${args.cp ? ` ×${worldSize}` : ""})`);
   console.log(`KV cache: ${maxPages} pages (${(maxPages * cachePageSize * 2 * (kvLoraRank ?? 512 + 64) / 1024 / 1024 / 1024).toFixed(1)} GB for MLA cache)`);
+
+  if (args.file) {
+    await runSummarize(model, ws, glm, cache, args, modelDir);
+    glm.synchronize();
+    cache.free();
+    ws.free();
+    model.free();
+    if (glm instanceof ParallelOps) glm.free();
+    for (const d of gpuDevices) d.free();
+    return;
+  }
 
   const numChunks = Math.ceil(args.seqLen / args.chunkSize);
 
