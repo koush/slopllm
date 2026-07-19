@@ -107,7 +107,7 @@ export interface DeviceOps {
   // Convert top-k indices to physical KV slots. Writes compacted valid count
   // per query into `topkLength`. Returns [totalQ, topk] slots tensor.
   // cpWorldSize: 0=non-CP, 1=CP flat (gather), >1=CP paged.
-  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): Tensor;
+  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, cacheIdx: number, kvCache: Tensor, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): Tensor;
 
   graphBeginCapture(): void;
   graphEndCapture(): number;

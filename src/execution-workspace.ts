@@ -159,6 +159,7 @@ export class ExecutionState {
       topkIdx, this.ws.kvTokenIndptrD,
       pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices, this.ws.sparseTopkLength,
       pagedKV.pageSize, maxKv,
+      cacheIdx, pagedKV.ckvData[cacheIdx],
       pagedKV.contextParallel,
     );
   }

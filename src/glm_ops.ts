@@ -1077,7 +1077,7 @@ export class GlmOps implements DeviceOps {
     return topkIdx;
   }
 
-  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, _contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): Tensor {
+  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, _cacheIdx: number, _kvCache: Tensor, _contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): Tensor {
     const totalQ = topkIdx.shape[0];
     const topk = topkIdx.shape[1];
     const slots = topkIdx.workspace.ensureAlloc([maxKv, topk], "I32", "idxslots-shared").narrow(0, totalQ);
