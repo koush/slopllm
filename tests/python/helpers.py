@@ -253,6 +253,17 @@ class GlmOps:
             ctypes.c_void_p,
         ]
 
+        self.lib.glm_gather_topk_ckv.restype = None
+        self.lib.glm_gather_topk_ckv.argtypes = (
+            [ctypes.c_void_p]                                    # ctx
+            + [ctypes.c_void_p] * 8                              # flat_p0..p7
+            + [ctypes.c_void_p]                                  # local_kv_cache
+            + [ctypes.c_void_p] * 5                              # topk_idx, batch_indices, page_indices, page_indptr, kv_token_indptr
+            + [ctypes.c_int, ctypes.c_int, ctypes.c_int]         # N, cp_world_size, cp_rank
+            + [ctypes.c_int, ctypes.c_int]                       # eff_page_size, bpt_bytes
+            + [ctypes.c_int, ctypes.c_int]                       # num_tokens, topk
+        )
+
         self.lib.glm_topk_from_scores.restype = None
         self.lib.glm_topk_from_scores.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -1269,6 +1280,75 @@ class GlmOps:
             num_tokens, topk, page_size,
             cp_world_size, cp_rank,
             self._ptr(kv_token_indptr) if kv_token_indptr is not None else ctypes.c_void_p(0),
+        )
+
+    def gather_topk_ckv(self, flat_ptrs, local_kv_cache,
+                        topk_idx, batch_indices,
+                        page_indices, page_indptr, kv_token_indptr,
+                        N, cp_world_size, cp_rank,
+                        eff_page_size, bpt_bytes,
+                        num_tokens, topk):
+        """Sparse topk-driven gather of BPT-byte CKV tokens from a rank's
+        local paged cache into flat-format output buffer(s). Same kernel body
+        for two call shapes:
+          * N=1, cp_world_size=0 — single-GPU / non-CP. No fan-out, no P2P:
+            each (query, k) entry's BPT bytes are written once to the single
+            output buffer at flat_slot = topk_idx[entry]. Degenerate case;
+            multi-GPU / P2P not required.
+          * N>=1, cp_world_size>0 — context-parallel. Each entry's BPT bytes
+            are read ONCE from this rank's local cache and fan-out written to
+            all N peer buffers (cross-GPU via P2P) at flat_slot = topk_idx[entry].
+            Tokens not on this rank (recovered token_pos = flat_slot -
+            kv_token_indptr[seq] failing pos % cp_world_size != cp_rank) are
+            skipped.
+
+        INPUT CONTRACT (topk_idx): [num_tokens, topk] int32 holding OUTPUT
+        flat slots — exactly the format topk_to_slots produces in its flat
+        mode (cp_world_size == 1: slot = kv_token_indptr[seq] + token_pos).
+        Invalid entries encoded as -1 are silently skipped. Same indexing
+        the downstream sparse MLA kernel uses to read the gathered buffer;
+        the caller's sharedSlots tensor can be passed directly.
+
+        flat_ptrs:        list/tuple of N peer GPU pointers (uint8 buffers of
+                          size total_flat_slots * bpt_bytes each). Inactive
+                          peer slots (index >= N) get nullptr passed through.
+        local_kv_cache:   per-rank local paged KV cache (uint8), accessed
+                          linearly as kv_cache[src_slot * bpt_bytes].
+        topk_idx:         [num_tokens, topk] int32 — OUTPUT flat slots
+                          (i.e. kv_token_indptr[seq] + token_pos); -1 = skip.
+        batch_indices:    [num_tokens] int32 — sequence index per query.
+        page_indices:     per-rank page-id table.
+        page_indptr:      [B+1] int32 — page range per seq.
+        kv_token_indptr:  [B+1] int32 — global de-interleaved token prefix sum
+                          per seq; used to recover token_pos =
+                          flat_slot - kv_token_indptr[seq] for the CP-rank
+                          filter and paged src_slot lookup.
+        N:                number of active peers (1..8). N=1 selects the
+                          degenerate single-buffer path (no fan-out).
+        cp_world_size:    0 (no CP at all — filter skipped) or > 0 (CP filter
+                          applied; cp_world_size=1 is degenerate — filter is a
+                          no-op since pos % 1 == 0).
+        cp_rank:          this rank's CP id.
+        eff_page_size:    page_size / cp_world_size (or == page_size non-CP).
+        bpt_bytes:        bytes per token (prod: 656). Must be mult of 16 for
+                          vectorized path; non-multiples use byte-tail.
+        """
+        if len(flat_ptrs) > 8:
+            raise ValueError(f"flat_ptrs: max 8 peers, got {len(flat_ptrs)}")
+        ptrs = list(flat_ptrs) + [0] * (8 - len(flat_ptrs))
+        self.lib.glm_gather_topk_ckv(
+            self.ctx,
+            self._ptr(ptrs[0]), self._ptr(ptrs[1]),
+            self._ptr(ptrs[2]), self._ptr(ptrs[3]),
+            self._ptr(ptrs[4]), self._ptr(ptrs[5]),
+            self._ptr(ptrs[6]), self._ptr(ptrs[7]),
+            self._ptr(local_kv_cache),
+            self._ptr(topk_idx), self._ptr(batch_indices),
+            self._ptr(page_indices), self._ptr(page_indptr),
+            self._ptr(kv_token_indptr),
+            ctypes.c_int(N), ctypes.c_int(cp_world_size), ctypes.c_int(cp_rank),
+            ctypes.c_int(eff_page_size), ctypes.c_int(bpt_bytes),
+            ctypes.c_int(num_tokens), ctypes.c_int(topk),
         )
 
     def topk_from_scores(self, out_idx, scores, row_len, hist, meta,

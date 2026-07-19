@@ -143,6 +143,7 @@ interface NativeAddon {
   concatAndCacheDsMla(ctx: number, kvCache: number, appendCkv: number, appendKpe: number, indices: number, indptr: number, batchIndices: number, positions: number, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, cpWorldSize: number, cpRank: number): void;
   sparseMlaPrefill(ctx: number, q: number, kvCache: number, indices: number, output: number, outLse: number, numTokens: number, numHeads: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, topkLength?: number): void;
   sparseMlaDecode(ctx: number, q: number, kvCache: number, indices: number, midOut: number, midLse: number, output: number, outLse: number, numTokens: number, numHeads: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: number): void;
+  gatherTopkCkv(ctx: number, flatP0: number, flatP1: number, flatP2: number, flatP3: number, flatP4: number, flatP5: number, flatP6: number, flatP7: number, localKvCache: number, topkIdx: number, batchIndices: number, pageIndices: number, pageIndptr: number, kvTokenIndptr: number, N: number, cpWorldSize: number, cpRank: number, effPageSize: number, bptBytes: number, numTokens: number, topk: number): void;
   causalConv1d(ctx: number, output: number, convState: number, input: number, weight: number, cuSeqlens: number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void;
   causalConv1dUpdate(ctx: number, output: number, convState: number, input: number, weight: number, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): void;
   rmsnormGated(ctx: number, output: number, input: number, gate: number, weight: number, eps: number, dim: number, batch: number): void;
@@ -1005,6 +1006,48 @@ export class GlmOps implements DeviceOps {
     return out;
   }
 
+  gatherTopkCkv(_state: ExecutionState, kvCache: Tensor, outputs: readonly Tensor[], topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, kvTokenIndptr: Tensor, batchIndices: Tensor, topk: number, paddedKvLen: number, cpWorldSize: number = 0, cpRank: number = 0, effPageSize?: number): void {
+    const pageSize = kvCache.shape[1];
+    const bpt = kvCache.shape[2];
+    const numTokens = topkIdx.shape[0];
+    const N = outputs.length;
+    if (N < 1 || N > 8) {
+      throw new Error(`gatherTopkCkv: outputs.length=${N} must be in [1, 8]`);
+    }
+    // Output contract: each peer buffer must be 3D
+    // [paddedKvLen/pageSize, pageSize, BPT] U8 (same shape gatherPages' TS
+    // impl returns). Caller is responsible for pre-allocating; validate here.
+    if (paddedKvLen % pageSize !== 0) {
+      throw new Error(`gatherTopkCkv: paddedKvLen=${paddedKvLen} not divisible by pageSize=${pageSize}`);
+    }
+    const expectedPages = paddedKvLen / pageSize;
+    const expectedShape: number[] = [expectedPages, pageSize, bpt];
+    for (let i = 0; i < N; i++) {
+      const o = outputs[i];
+      if (o.type !== kvCache.type) {
+        throw new Error(`gatherTopkCkv: outputs[${i}].type=${o.type}, expected ${kvCache.type}`);
+      }
+      if (o.shape.length !== 3 || o.shape[0] !== expectedShape[0] || o.shape[1] !== expectedShape[1] || o.shape[2] !== expectedShape[2]) {
+        throw new Error(`gatherTopkCkv: outputs[${i}].shape=[${o.shape.join("x")}], expected [${expectedShape.join("x")}]`);
+      }
+    }
+    const effPs = effPageSize ?? pageSize;
+    // Build the 8-pointer peer table from the caller-provided outputs. Unused
+    // slots stay at 0 (kernel only writes peers [0, N)).
+    const peerPtrs = new Array<number>(8).fill(0);
+    for (let j = 0; j < N; j++) peerPtrs[j] = outputs[j].data;
+    getNativeAddon().gatherTopkCkv(
+      this.ctx,
+      peerPtrs[0], peerPtrs[1], peerPtrs[2], peerPtrs[3],
+      peerPtrs[4], peerPtrs[5], peerPtrs[6], peerPtrs[7],
+      kvCache.data, topkIdx.data, batchIndices.data,
+      pageIndices.data, pageIndptr.data, kvTokenIndptr.data,
+      N, cpWorldSize, cpRank,
+      effPs, bpt,
+      numTokens, topk,
+    );
+  }
+
   indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void {
     getNativeAddon().indexerScore(this.ctx, out.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal ? 1 : 0);
   }
@@ -1180,7 +1223,7 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().concatAndCacheDsMla(this.ctx, ptr(kvCache), ptr(appendCkv), ptr(appendKpe), ptr(indices), ptr(indptr), ptr(batchIndices), ptr(positions), nnz, pageSize, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
   }
 
-  sparseMlaPrepareCache(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | null, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
+  sparseMlaPrepareCache(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor | null, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
     return kvCache.viewClone();
   }
 

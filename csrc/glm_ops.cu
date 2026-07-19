@@ -1314,14 +1314,10 @@ __global__ void __launch_bounds__(256, 4) fill_kernel(__nv_bfloat16* out, float 
 
 void glm_fill(GlmCtx* ctx, void* out, float value, int n) {
     cudaSetDevice(ctx->device_id);
-    if (value == 0.0f) {
-        cudaMemsetAsync(out, 0, n * sizeof(__nv_bfloat16), GLM_STREAM(ctx));
-    } else {
-        int block_size = 256;
-        int grid = (n + block_size - 1) / block_size;
-        fill_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)out, value, n);
-    }
+    int block_size = 256;
+    int grid = (n + block_size - 1) / block_size;
+    fill_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, value, n);
 }
 
 // ---------------------------------------------------------------------------

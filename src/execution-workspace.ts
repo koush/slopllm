@@ -89,12 +89,13 @@ export class ExecutionState {
     );
   }
 
-  sparseMlaPrepareCache(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number) {
+  sparseMlaPrepareCache(appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, cacheIdx: number, kvLoraRank: number, qkRopeDim: number) {
     const pagedKV = this.cache.getPagedKV();
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     return this.ws.glm.sparseMlaPrepareCache(
       this, cacheIdx,
       pagedKV.ckvData[cacheIdx], appendCkv, appendKpe,
+      topk,
       pagedKV.indices, this.ws.indptrD,
       this.ws.mlaBatchIndices, this.ws.positionIds,
       nnz, kvLoraRank, qkRopeDim,

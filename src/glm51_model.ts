@@ -437,7 +437,14 @@ export class Glm51Model extends ChatModel {
       kPeRopeStream.streamWaitEvent();
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
 
-      return state.sparseMlaPrepareCache(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
+      // Shared layers reuse the previous 'full' layer's topk slots (held in
+      // sharedSlots.value); full layers pass undefined so sparseMlaPrepareCache
+      // falls through to the indices/gatherPages path.
+      // const sharedTopk = cfg.indexerTypes[layerIdx] === "shared" && sharedSlots.value
+      //   ? sharedSlots.value
+      //   : undefined;
+      const sharedTopk = undefined;
+      return state.sparseMlaPrepareCache(ckvNormed, kPeRope, sharedTopk, layerIdx, kvLoraRank, qkRopeDim);
     });
 
     // Indexer K: wk(normed) → layernorm → split → RoPE → concat → append to kData

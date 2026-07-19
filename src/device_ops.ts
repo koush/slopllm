@@ -58,12 +58,46 @@ export interface DeviceOps {
   mlaDecodeRun(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, smScale: number): { o: Tensor, lse: Tensor };
   mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize?: number, cpWorldSize?: number, cpRank?: number): void;
   concatAndCacheDsMla(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | undefined, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): void;
-  sparseMlaPrepareCache(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | null, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor;
+  sparseMlaPrepareCache(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor | null, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor;
 
   sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor };
   sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor };
 
   gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, paddedKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor;
+  // Sparse topk-driven P2P gather of packed CKV tokens into the caller-provided
+  // output flat buffers (same [paddedKvLen/pageSize, pageSize, BPT] U8 layout
+  // gatherPages produces). The implementation does NOT allocate outputs —
+  // callers pre-allocate and pass them in. Returns void.
+  //
+  // Each rank reads each (query, k) topk entry from its local paged cache shard
+  // once and fan-out writes those BPT bytes to all N peer output flat buffers at
+  // flat_slot = kvTokenIndptr[seq] + token_pos. CP filter drops positions whose
+  // global pos % cp_world_size != this rank's cp_rank. After the call every peer
+  // buffer has the same union of topk tokens; non-topk flat slots are NOT touched
+  // (preserving stale data — the consumer only reads slots in the
+  // topk_length-bounded prefix).
+  //
+  // outputs: up to 8 caller-pre-allocated flat output tensors. For GlmOps this
+  //          is the literal peer-buffer table (N = outputs.length, 1..8). For
+  //          ParallelOps the callsite passes a single ParallelTensor in
+  //          outputs[0]; ParallelOps internally extracts its N shards and uses
+  //          them as the per-rank peer table.
+  // kvCache: per-rank paged CKV cache (Row under CP, Replicated otherwise).
+  // topkIdx:        [num_tokens, topk] I32 Replicated — global KV positions in seq.
+  // pageIndices:    per-rank page-id table.
+  // pageIndptr:     [B+1] I32 per-rank page range per seq.
+  // kvTokenIndptr:  [B+1] I32 Replicated — global per-seq token prefix sum
+  //                 (= flat-slot base for the output buffers).
+  // batchIndices:   [num_tokens] I32 Replicated — seq index per query.
+  // topk:           number of topk entries per query.
+  // paddedKvLen:    output flat buffer size in tokens (page-aligned).
+  // CP signaling: cpWorldSize=0 (default) indicates no CP at all (filter
+  //               skipped); CP callers pass cpWorldSize=world_size and
+  //               cpRank=i. cpWorldSize=1 is degenerate CP — filter runs but
+  //               is a no-op (pos % 1 == 0). effPageSize defaults to
+  //               kvCache.shape[1] (full page size) when omitted and MUST be
+  //               pageSize/worldSize for CP callers.
+  gatherTopkCkv(state: ExecutionState, kvCache: Tensor, outputs: readonly Tensor[], topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, kvTokenIndptr: Tensor, batchIndices: Tensor, topk: number, paddedKvLen: number, cpWorldSize?: number, cpRank?: number, effPageSize?: number): void;
   gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
   gdnPrefill(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
 

@@ -739,6 +739,62 @@ void glm_sparse_mla_decode(
     int32_t* topk_length,
     int chunks_per_block_override);
 
+// Sparse topk-driven gather of BPT-byte CKV tokens into a flat-format output
+// buffer. Same kernel body for two call shapes:
+//   * N=1, cp_world_size=0 — single-GPU / non-CP. The warp reads BPT bytes
+//     from this rank's local paged KV cache ONCE and writes them once to the
+//     single output flat buffer at flat_slot = topk_idx[entry]. Degenerate
+//     case: no fan-out, no P2P, no peer semantics. multi-GPU / P2P is NOT
+//     required.
+//   * N>=1, cp_world_size>0 — context-parallel. Each warp reads BPT bytes
+//     ONCE from this rank's local paged KV cache and fan-out writes them to
+//     all N peer flat buffers at flat_slot = topk_idx[entry] (cross-GPU via
+//     P2P). Tokens not on this rank (pos % cp_world_size != cp_rank, where
+//     pos = flat_slot - kv_token_indptr[seq] is reverse-derived) are skipped.
+//     Writes are idempotent — duplicate topk entries across queries produce
+//     the same bytes at the same slot. Non-topk flat slots are NOT touched
+//     (consumer reads only topk slots governed by topk_length).
+//
+// INPUT CONTRACT (topk_idx): [num_tokens, topk] int32 holding OUTPUT flat
+// slots — exactly the format topk_to_slots produces in its flat mode
+// (cp_world_size == 1: slot = kv_token_indptr[seq] + token_pos). Invalid
+// entries are encoded as -1 and silently skipped. Same indexing the
+// downstream sparse MLA kernel uses to read the gathered buffer.
+//
+// flat_p0..p7: peer flat output buffers, size total_flat_slots * bpt_bytes
+//              each (only the first N are written; entries >= N ignored).
+// local_kv_cache: this rank's paged KV cache, accessed linearly as
+//                 kv_cache[src_slot * bpt_bytes] where
+//                 src_slot = abs_page * eff_page_size + offset_in_page.
+// topk_idx:        [num_tokens, topk] int32 — OUTPUT flat slots (-1 skip),
+//                  as produced by topk_to_slots in flat (cp_world_size == 1)
+//                  mode.
+// batch_indices:   [num_tokens] int32 — sequence index per query.
+// page_indices:    per-rank page-id table (same layout as concat_and_cache_ds_mla).
+// page_indptr:     [B+1] int32 — page range per seq.
+// kv_token_indptr: [B+1] int32 — global de-interleaved token prefix sum per
+//                  seq; used to recover token_pos = flat_slot - kv_token_indptr[seq]
+//                  for the CP-rank filter and the paged src_slot lookup.
+// N:               number of active peers (1..8). N=1 selects the degenerate
+//                  single-buffer path (no fan-out).
+// cp_world_size:   0 (no CP at all — filter skipped, local_pos == token_pos) or
+//                  > 0 (CP filter applied: pos % ws == cp_rank kept). cp_world_size
+//                  == 1 is degenerate CP — filter is a no-op (pos % 1 == 0).
+// cp_rank:         this rank's CP id.
+// eff_page_size:   page_size / cp_world_size (or == page_size non-CP).
+// bpt_bytes:       bytes per token (prod: 656). Multiples of 16 use vectorized
+//                  int4 copies; non-multiples use scalar byte tail.
+void glm_gather_topk_ckv(
+    GlmCtx* ctx,
+    void* flat_p0, void* flat_p1, void* flat_p2, void* flat_p3,
+    void* flat_p4, void* flat_p5, void* flat_p6, void* flat_p7,
+    void* local_kv_cache,
+    int32_t* topk_idx, int32_t* batch_indices,
+    int32_t* page_indices, int32_t* page_indptr, int32_t* kv_token_indptr,
+    int N, int cp_world_size, int cp_rank,
+    int eff_page_size, int bpt_bytes,
+    int num_tokens, int topk);
+
 // CUDA Graph operations
 void glm_graph_begin_capture(GlmCtx* ctx);
 void* glm_graph_end_capture(GlmCtx* ctx);
