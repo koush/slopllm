@@ -57,6 +57,7 @@ void glm_nccl_comm_destroy(void* comm) {
 void glm_nccl_all_reduce(void* comm, GlmCtx* ctx,
                           const void* sendbuff, void* recvbuff,
                           size_t count, int datatype, int op) {
+    cudaSetDevice(ctx->device_id);
     ncclResult_t result = ncclAllReduce(sendbuff, recvbuff, count,
                           static_cast<ncclDataType_t>(datatype),
                           static_cast<ncclRedOp_t>(op),
@@ -69,6 +70,7 @@ void glm_nccl_all_reduce(void* comm, GlmCtx* ctx,
 void glm_nccl_all_gather(void* comm, GlmCtx* ctx,
                           const void* sendbuff, void* recvbuff,
                           size_t count, int datatype) {
+    cudaSetDevice(ctx->device_id);
     ncclResult_t result = ncclAllGather(sendbuff, recvbuff, count,
                           static_cast<ncclDataType_t>(datatype),
                           static_cast<ncclComm_t>(comm), GLM_STREAM(ctx));
@@ -79,6 +81,7 @@ void glm_nccl_all_gather(void* comm, GlmCtx* ctx,
 
 void glm_nccl_send(void* comm, GlmCtx* ctx,
                     const void* sendbuff, size_t count, int datatype, int peer) {
+    cudaSetDevice(ctx->device_id);
     ncclResult_t result = ncclSend(sendbuff, count,
                           static_cast<ncclDataType_t>(datatype),
                           peer,
@@ -90,6 +93,7 @@ void glm_nccl_send(void* comm, GlmCtx* ctx,
 
 void glm_nccl_recv(void* comm, GlmCtx* ctx,
                     void* recvbuff, size_t count, int datatype, int peer) {
+    cudaSetDevice(ctx->device_id);
     ncclResult_t result = ncclRecv(recvbuff, count,
                           static_cast<ncclDataType_t>(datatype),
                           peer,
@@ -102,6 +106,7 @@ void glm_nccl_recv(void* comm, GlmCtx* ctx,
 void glm_nccl_reduce_scatter(void* comm, GlmCtx* ctx,
                               const void* sendbuff, void* recvbuff,
                               size_t recvcount, int datatype, int op) {
+    cudaSetDevice(ctx->device_id);
     ncclResult_t result = ncclReduceScatter(sendbuff, recvbuff, recvcount,
                           static_cast<ncclDataType_t>(datatype),
                           static_cast<ncclRedOp_t>(op),

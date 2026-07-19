@@ -176,6 +176,7 @@ void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,
 
 void glm_memcpy_peer(GlmCtx* ctx, void* dst, int dstDevice,
                       const void* src, int srcDevice, size_t bytes) {
+    cudaSetDevice(ctx->device_id);
     cudaMemcpyPeerAsync(dst, dstDevice, src, srcDevice, bytes, GLM_STREAM(ctx));
 }
 
@@ -185,6 +186,7 @@ void glm_memcpy3d_peer(GlmCtx* ctx,
     const void* srcPtr, size_t srcPitch, size_t srcXSize, size_t srcYSize, int srcDevice,
     size_t srcPosX, size_t srcPosY, size_t srcPosZ,
     size_t width, size_t height, size_t depth) {
+    cudaSetDevice(ctx->device_id);
     cudaMemcpy3DPeerParms p{};
     p.dstPtr.ptr = dstPtr;
     p.dstPtr.pitch = dstPitch;
@@ -213,6 +215,7 @@ void glm_memcpy3d_peer(GlmCtx* ctx,
 // ---------------------------------------------------------------------------
 
 void glm_synchronize(GlmCtx* ctx) {
+    cudaSetDevice(ctx->device_id);
     cudaError_t err = cudaStreamSynchronize(ctx->streams[ctx->active_stream]);
     if (err != cudaSuccess) {
         fprintf(stderr, "glm_synchronize failed: %s\n", cudaGetErrorString(err));
@@ -224,6 +227,7 @@ void glm_synchronize_stream(GlmCtx* ctx, int stream_idx) {
         fprintf(stderr, "glm_synchronize_stream: invalid stream index %d\n", stream_idx);
         return;
     }
+    cudaSetDevice(ctx->device_id);
     cudaError_t err = cudaStreamSynchronize(ctx->streams[stream_idx]);
     if (err != cudaSuccess) {
         fprintf(stderr, "glm_synchronize_stream failed: %s\n", cudaGetErrorString(err));
@@ -235,6 +239,7 @@ void glm_set_stream(GlmCtx* ctx, int stream_idx) {
         fprintf(stderr, "glm_set_stream: invalid stream index %d (max %d)\n", stream_idx, GLM_MAX_STREAMS - 1);
         return;
     }
+    cudaSetDevice(ctx->device_id);
     ctx->active_stream = stream_idx;
     cublasSetStream(CUBLAS(ctx), ctx->streams[stream_idx]);
 }
@@ -244,6 +249,7 @@ void glm_event_record(GlmCtx* ctx, int event_idx, int stream_idx) {
         fprintf(stderr, "glm_event_record: invalid index event=%d stream=%d\n", event_idx, stream_idx);
         return;
     }
+    cudaSetDevice(ctx->device_id);
     cudaEventRecord(ctx->events[event_idx], ctx->streams[stream_idx]);
 }
 
@@ -252,6 +258,7 @@ void glm_stream_wait_event(GlmCtx* ctx, int stream_idx, int event_idx) {
         fprintf(stderr, "glm_stream_wait_event: invalid index stream=%d event=%d\n", stream_idx, event_idx);
         return;
     }
+    cudaSetDevice(ctx->device_id);
     cudaStreamWaitEvent(ctx->streams[stream_idx], ctx->events[event_idx], 0);
 }
 
@@ -281,7 +288,8 @@ void* glm_graph_end_capture(GlmCtx* ctx) {
     return reinterpret_cast<void*>(graph);
 }
 
-void* glm_graph_instantiate(void* graph) {
+void* glm_graph_instantiate(GlmCtx* ctx, void* graph) {
+    cudaSetDevice(ctx->device_id);
     cudaGraphExec_t graph_exec = nullptr;
     cudaError_t err = cudaGraphInstantiate(&graph_exec, reinterpret_cast<cudaGraph_t>(graph), nullptr, nullptr, 0);
     if (err != cudaSuccess) {
@@ -291,7 +299,7 @@ void* glm_graph_instantiate(void* graph) {
     return reinterpret_cast<void*>(graph_exec);
 }
 
-void glm_graph_launch(void* graph_exec, GlmCtx* ctx) {
+void glm_graph_launch(GlmCtx* ctx, void* graph_exec) {
     cudaSetDevice(ctx->device_id);
     cudaError_t err = cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(graph_exec), GLM_STREAM(ctx));
     if (err != cudaSuccess) {
@@ -299,7 +307,8 @@ void glm_graph_launch(void* graph_exec, GlmCtx* ctx) {
     }
 }
 
-int glm_graph_exec_update(void* graph_exec, void* graph) {
+int glm_graph_exec_update(GlmCtx* ctx, void* graph_exec, void* graph) {
+    cudaSetDevice(ctx->device_id);
     cudaGraphExecUpdateResultInfo result_info = {};
     cudaGraphExecUpdate(reinterpret_cast<cudaGraphExec_t>(graph_exec),
                         reinterpret_cast<cudaGraph_t>(graph),
@@ -307,8 +316,9 @@ int glm_graph_exec_update(void* graph_exec, void* graph) {
     return (result_info.result == cudaGraphExecUpdateSuccess) ? 0 : 1;
 }
 
-void glm_graph_destroy(void* graph) {
+void glm_graph_destroy(GlmCtx* ctx, void* graph) {
     if (graph) {
+        cudaSetDevice(ctx->device_id);
         cudaError_t err = cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(graph));
         if (err != cudaSuccess) {
             fprintf(stderr, "glm_graph_destroy failed: %s\n", cudaGetErrorString(err));
@@ -316,8 +326,9 @@ void glm_graph_destroy(void* graph) {
     }
 }
 
-void glm_graph_exec_destroy(void* graph_exec) {
+void glm_graph_exec_destroy(GlmCtx* ctx, void* graph_exec) {
     if (graph_exec) {
+        cudaSetDevice(ctx->device_id);
         cudaError_t err = cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(graph_exec));
         if (err != cudaSuccess) {
             fprintf(stderr, "glm_graph_exec_destroy failed: %s\n", cudaGetErrorString(err));

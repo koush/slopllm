@@ -122,10 +122,10 @@ interface NativeAddon {
   batchPrefillRaggedRun(ctx: number, q: number, k: number, v: number, o: number, floatWs: number, intWs: number, qIndptrD: number, kvIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: number, smScale: number): void;
   graphBeginCapture(ctx: number): void;
   graphEndCapture(ctx: number): number;
-  graphInstantiate(graph: number): number;
-  graphLaunch(graphExec: number, ctx: number): void;
-  graphDestroy(graph: number): void;
-  graphExecDestroy(graphExec: number): void;
+  graphInstantiate(ctx: number, graph: number): number;
+  graphLaunch(ctx: number, graphExec: number): void;
+  graphDestroy(ctx: number, graph: number): void;
+  graphExecDestroy(ctx: number, graphExec: number): void;
   mmapOpen(path: string): number;
   mmapLoadAsync(ctx: number, gpuDst: number, mmapPtr: number, offset: number, nbytes: number): Promise<void>;
   memcpyHostToDeviceAsync(ctx: number, dst: number, src: number, nbytes: number): Promise<void>;
@@ -175,6 +175,8 @@ interface NativeAddon {
   p2pAllGatherSmem(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardBytes: number, rank: number): void;
   p2pAllGatherRowSmem(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number, rank: number): void;
   p2pBarrier(ctx: number, instance: number, peerRank?: number): void;
+  p2pArrive(ctx: number, instance: number, peerRank?: number): void;
+  p2pWait(ctx: number, instance: number, peerRank?: number): void;
   cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads: number, headOffset: number, inputNHeads: number): void;
   cpCorrectAttnOut(ctx: number, vOut: number, lses: number, globalLse: number, batchSize: number, numHeads: number, vHeadDim: number, worldSize: number, rank: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
@@ -1157,21 +1159,21 @@ export class GlmOps implements DeviceOps {
   }
 
   graphInstantiate(graph: number): number {
-    const exec = getNativeAddon().graphInstantiate(graph);
+    const exec = getNativeAddon().graphInstantiate(this.ctx, graph);
     if (!exec) throw new Error("CUDA graph instantiation failed");
     return exec;
   }
 
   graphLaunch(graphExec: number): void {
-    getNativeAddon().graphLaunch(graphExec, this.ctx);
+    getNativeAddon().graphLaunch(this.ctx, graphExec);
   }
 
   graphDestroy(graph: number): void {
-    getNativeAddon().graphDestroy(graph);
+    getNativeAddon().graphDestroy(this.ctx, graph);
   }
 
   graphExecDestroy(graphExec: number): void {
-    getNativeAddon().graphExecDestroy(graphExec);
+    getNativeAddon().graphExecDestroy(this.ctx, graphExec);
   }
 
   mlaPrefillPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, kvIndptrH: Tensor, kvLenH: Tensor, lastPageLenH: Tensor, batchSize: number, numHeads: number, headDimO: number, causal: boolean, pageSize: number, seqKvLens: number[], contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): void {
@@ -1314,8 +1316,17 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().ncclReduceScatter(comm, this.ctx, ptr(sendbuff), ptr(recvbuff), recvcount, datatype, op);
   }
 
+  p2pArrive(instance: number, peerRank: number = -1): void {
+    getNativeAddon().p2pArrive(this.ctx, instance, peerRank);
+  }
+
+  p2pWait(instance: number, peerRank: number = -1): void {
+    getNativeAddon().p2pWait(this.ctx, instance, peerRank);
+  }
+
   p2pBarrier(instance: number, peerRank: number = -1): void {
-    getNativeAddon().p2pBarrier(this.ctx, instance, peerRank);
+    this.p2pArrive(instance, peerRank);
+    this.p2pWait(instance, peerRank);
   }
 }
 

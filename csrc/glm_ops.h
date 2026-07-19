@@ -466,6 +466,13 @@ void glm_p2p_allgather_row_smem(GlmCtx* ctx,
 // P2P barrier: increment seq counter, publish flag, wait for all peers.
 void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank = -1);
 
+// P2P barrier split into two phases. Between arrive and wait the caller may
+// launch other work on the same stream; arrive's release makes prior writes
+// visible, wait's acquire sees peers' writes before subsequent reads.
+// glm_p2p_barrier(ctx, inst, peer_rank) == arrive then wait on the same stream.
+void glm_p2p_arrive(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank = -1);
+void glm_p2p_wait(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank = -1);
+
 void glm_kv_cache_write(GlmCtx* ctx,
                          void* src_k, void* src_v,
                          void* dst_k, void* dst_v,
@@ -798,11 +805,11 @@ void glm_gather_topk_ckv(
 // CUDA Graph operations
 void glm_graph_begin_capture(GlmCtx* ctx);
 void* glm_graph_end_capture(GlmCtx* ctx);
-void* glm_graph_instantiate(void* graph);
-void glm_graph_launch(void* graph_exec, GlmCtx* ctx);
-int glm_graph_exec_update(void* graph_exec, void* graph);
-void glm_graph_destroy(void* graph);
-void glm_graph_exec_destroy(void* graph_exec);
+void* glm_graph_instantiate(GlmCtx* ctx, void* graph);
+void glm_graph_launch(GlmCtx* ctx, void* graph_exec);
+int glm_graph_exec_update(GlmCtx* ctx, void* graph_exec, void* graph);
+void glm_graph_destroy(GlmCtx* ctx, void* graph);
+void glm_graph_exec_destroy(GlmCtx* ctx, void* graph_exec);
 
 // Fused FP8 dequantize + GEMV for decode (any M)
 // Computes: output[m, j] = sum_k(bf16_input[m, k] * fp8_weight[j, k] * bf16_scale_inv[j/128, k/128])

@@ -848,6 +848,18 @@ class GlmOps:
             ctypes.c_int,
         ]
 
+        self.lib.glm_p2p_arrive.restype = None
+        self.lib.glm_p2p_arrive.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+
+        self.lib.glm_p2p_wait.restype = None
+        self.lib.glm_p2p_wait.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+
         self.lib.glm_row_normalize.restype = None
         self.lib.glm_row_normalize.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -2141,3 +2153,9 @@ class GlmOps:
 
     def p2p_barrier(self, inst, peer_rank=-1):
         self.lib.glm_p2p_barrier(self.ctx, inst, peer_rank)
+
+    def p2p_arrive(self, inst, peer_rank=-1):
+        self.lib.glm_p2p_arrive(self.ctx, inst, peer_rank)
+
+    def p2p_wait(self, inst, peer_rank=-1):
+        self.lib.glm_p2p_wait(self.ctx, inst, peer_rank)

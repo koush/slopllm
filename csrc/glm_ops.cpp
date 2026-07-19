@@ -3259,12 +3259,14 @@ static Napi::Value GraphEndCapture(const Napi::CallbackInfo& info) {
 
 static Napi::Value GraphInstantiate(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 1) {
-        Napi::TypeError::New(env, "Expected (graph)").ThrowAsJavaScriptException();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, graph)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    uintptr_t graph_ptr = info[0].As<Napi::Number>().Int64Value();
-    void* graph_exec = glm_graph_instantiate(reinterpret_cast<void*>(graph_ptr));
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t graph_ptr = info[1].As<Napi::Number>().Int64Value();
+    void* graph_exec = glm_graph_instantiate(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                              reinterpret_cast<void*>(graph_ptr));
     if (!graph_exec) {
         cudaError_t err = cudaGetLastError();
         std::string msg = "graphInstantiate failed: null graph_exec returned";
@@ -3282,13 +3284,13 @@ static Napi::Value GraphInstantiate(const Napi::CallbackInfo& info) {
 static Napi::Value GraphLaunch(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2) {
-        Napi::TypeError::New(env, "Expected (graph_exec, ctx)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, graph_exec)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    uintptr_t graph_exec_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t ctx_ptr = info[1].As<Napi::Number>().Int64Value();
-    glm_graph_launch(reinterpret_cast<void*>(graph_exec_ptr),
-                     reinterpret_cast<GlmCtx*>(ctx_ptr));
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t graph_exec_ptr = info[1].As<Napi::Number>().Int64Value();
+    glm_graph_launch(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                     reinterpret_cast<void*>(graph_exec_ptr));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("graphLaunch failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -3298,25 +3300,29 @@ static Napi::Value GraphLaunch(const Napi::CallbackInfo& info) {
 
 static Napi::Value GraphExecUpdate(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 2) {
-        Napi::TypeError::New(env, "Expected (graph_exec, graph)").ThrowAsJavaScriptException();
+    if (info.Length() < 3) {
+        Napi::TypeError::New(env, "Expected (ctx, graph_exec, graph)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    uintptr_t graph_exec_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t graph_ptr = info[1].As<Napi::Number>().Int64Value();
-    int result = glm_graph_exec_update(reinterpret_cast<void*>(graph_exec_ptr),
-                                       reinterpret_cast<void*>(graph_ptr));
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t graph_exec_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t graph_ptr = info[2].As<Napi::Number>().Int64Value();
+    int result = glm_graph_exec_update(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                        reinterpret_cast<void*>(graph_exec_ptr),
+                                        reinterpret_cast<void*>(graph_ptr));
     return Napi::Number::New(env, result);
 }
 
 static Napi::Value GraphDestroy(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 1) {
-        Napi::TypeError::New(env, "Expected (graph)").ThrowAsJavaScriptException();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, graph)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    uintptr_t graph_ptr = info[0].As<Napi::Number>().Int64Value();
-    glm_graph_destroy(reinterpret_cast<void*>(graph_ptr));
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t graph_ptr = info[1].As<Napi::Number>().Int64Value();
+    glm_graph_destroy(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                      reinterpret_cast<void*>(graph_ptr));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("graphDestroy failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -3326,12 +3332,14 @@ static Napi::Value GraphDestroy(const Napi::CallbackInfo& info) {
 
 static Napi::Value GraphExecDestroy(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 1) {
-        Napi::TypeError::New(env, "Expected (graph_exec)").ThrowAsJavaScriptException();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, graph_exec)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    uintptr_t graph_exec_ptr = info[0].As<Napi::Number>().Int64Value();
-    glm_graph_exec_destroy(reinterpret_cast<void*>(graph_exec_ptr));
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t graph_exec_ptr = info[1].As<Napi::Number>().Int64Value();
+    glm_graph_exec_destroy(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                            reinterpret_cast<void*>(graph_exec_ptr));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("graphExecDestroy failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -4135,6 +4143,44 @@ static Napi::Value P2PBarrier(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value P2PArrive(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, instance[, peerRank])").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
+    int peer_rank = (info.Length() >= 3) ? info[2].As<Napi::Number>().Int32Value() : -1;
+    glm_p2p_arrive(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                   reinterpret_cast<GlmP2PInstance*>(inst_ptr),
+                   peer_rank);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PArrive failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value P2PWait(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        Napi::TypeError::New(env, "Expected (ctx, instance[, peerRank])").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t inst_ptr = info[1].As<Napi::Number>().Int64Value();
+    int peer_rank = (info.Length() >= 3) ? info[2].As<Napi::Number>().Int32Value() : -1;
+    glm_p2p_wait(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                 reinterpret_cast<GlmP2PInstance*>(inst_ptr),
+                 peer_rank);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PWait failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value RotateInputIds(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 6) {
@@ -4314,6 +4360,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "p2pAllGatherSmem"), Napi::Function::New(env, P2PAllGatherSmem));
     exports.Set(Napi::String::New(env, "p2pAllGatherRowSmem"), Napi::Function::New(env, P2PAllGatherRowSmem));
     exports.Set(Napi::String::New(env, "p2pBarrier"), Napi::Function::New(env, P2PBarrier));
+    exports.Set(Napi::String::New(env, "p2pArrive"), Napi::Function::New(env, P2PArrive));
+    exports.Set(Napi::String::New(env, "p2pWait"), Napi::Function::New(env, P2PWait));
     return exports;
 }
 

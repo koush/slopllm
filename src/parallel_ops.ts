@@ -2061,10 +2061,25 @@ class P2PAllReduceGroup {
 
   /** P2P barrier: sync all GPUs without data transfer. */
   barrier(devices: readonly GlmOps[], peerRanks?: number[]): void {
+    this.arrive(devices, peerRanks);
+    this.wait(devices, peerRanks);
+  }
+
+  /** Arrive phase: each rank publishes its flag (release). No spinning. */
+  arrive(devices: readonly GlmOps[], peerRanks?: number[]): void {
     const addon = getNativeAddon();
     for (let i = 0; i < this.worldSize; ++i) {
       const peerRank = peerRanks ? peerRanks[i] : -1;
-      addon.p2pBarrier(devices[i].ctx, this.instances[i], peerRank);
+      addon.p2pArrive(devices[i].ctx, this.instances[i], peerRank);
+    }
+  }
+
+  /** Wait phase: each rank spins on peers' flags (acquire). */
+  wait(devices: readonly GlmOps[], peerRanks?: number[]): void {
+    const addon = getNativeAddon();
+    for (let i = 0; i < this.worldSize; ++i) {
+      const peerRank = peerRanks ? peerRanks[i] : -1;
+      addon.p2pWait(devices[i].ctx, this.instances[i], peerRank);
     }
   }
 }
@@ -2346,6 +2361,20 @@ export class ParallelOps implements DeviceOps {
     const group = this.getP2PGroup(this.devices[0].currentStream);
     if (!group) throw new Error('P2P not available for barrier');
     group.barrier(this.devices, peerRanks);
+  }
+
+  /** Arrive phase of p2pBarrier: publish flags without waiting. */
+  p2pArrive(peerRanks?: number[]): void {
+    const group = this.getP2PGroup(this.devices[0].currentStream);
+    if (!group) throw new Error('P2P not available for arrive');
+    group.arrive(this.devices, peerRanks);
+  }
+
+  /** Wait phase of p2pBarrier: spin on peers' flags. */
+  p2pWait(peerRanks?: number[]): void {
+    const group = this.getP2PGroup(this.devices[0].currentStream);
+    if (!group) throw new Error('P2P not available for wait');
+    group.wait(this.devices, peerRanks);
   }
 
   shardDim(dim: number, name: string): number {

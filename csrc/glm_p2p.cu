@@ -36,11 +36,21 @@ constexpr int P2P_AR_VEC_BF16 = 8;   // uint4 = 8 bf16
 constexpr int P2P_AR_VEC_F32 = 4;    // uint4 = 4 fp32
 
 // ---------------------------------------------------------------------------
-// P2P barrier: increment seq, publish flag, wait for peers. No data transfer.
+// P2P barrier, split into arrive + wait so callers can overlap work between
+// publishing their flag and spinning on peers' flags.
+//
+// arrive: increment my_seq_counter, publish flag to peers (release.sys).
+// wait:   read my_seq_counter back to recover the target, spin on peers' flags
+//         (acquire.sys). Safe because the API is single-stream per instance:
+//         no other arrive touches my_seq_counter between the two launches, so
+//         *my_seq_counter == s (the value arrive computed) when wait reads it.
+//
+// Graph-capturable: my_seq_counter lives in device memory and is atomicAdd'd
+// fresh each replay; wait reads it device-side, so no host-encoded seq.
 // ---------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(P2P_BARRIER_BLOCK_SIZE, 1)
-p2p_barrier_kernel(
+p2p_arrive_kernel(
     int* const* peer_flags,
     unsigned long long* my_seq_counter,
     int my_rank,
@@ -77,6 +87,41 @@ p2p_barrier_kernel(
                          :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
         }
     }
+    __syncwarp();
+    (void)nanosleep_ns;  // unused on the publish side
+}
+
+__global__ void __launch_bounds__(P2P_BARRIER_BLOCK_SIZE, 1)
+p2p_wait_kernel(
+    int* const* peer_flags,
+    unsigned long long* my_seq_counter,
+    int my_rank,
+    int world_size,
+    int nanosleep_ns,
+    int peer_rank = -1)
+{
+    int tid = threadIdx.x;
+
+    __shared__ unsigned int s_seq;
+    __shared__ int*         s_peer_flags[P2P_AR_MAX_WORLD];
+
+    if (tid == 0) {
+        // arrive already ran on this stream, so *my_seq_counter == s. Recover
+        // the same s_seq arrive published (with the same wrap guard) and derive
+        // the target from it.
+        unsigned long long s = *my_seq_counter;
+        s_seq = (unsigned int)s;
+        if (s_seq == 0) s_seq = 2;
+    }
+    if (tid < world_size) {
+        s_peer_flags[tid] = peer_flags[tid];
+    }
+    __syncwarp();
+
+    int seq = (int)s_seq;
+
+    bool active = (peer_rank < 0 && tid < world_size) ||
+                  (peer_rank >= 0 && tid == peer_rank);
 
     if (active) {
         int target = seq + 1;
@@ -578,12 +623,25 @@ void glm_p2p_set_peers(GlmCtx* ctx, GlmP2PInstance* inst,
     cudaMemcpy(inst->peer_flags_arr_d, peer_flag_ptrs, sizeof(int*) * N, cudaMemcpyHostToDevice);
 }
 
-void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank) {
+void glm_p2p_arrive(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank) {
     cudaSetDevice(ctx->device_id);
-    p2p_barrier_kernel<<<1, P2P_BARRIER_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+    p2p_arrive_kernel<<<1, P2P_BARRIER_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
         inst->peer_flags_arr_d, inst->seq_counter_d,
         inst->my_rank, inst->world_size,
         inst->nanosleep_ns, peer_rank);
+}
+
+void glm_p2p_wait(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank) {
+    cudaSetDevice(ctx->device_id);
+    p2p_wait_kernel<<<1, P2P_BARRIER_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        inst->peer_flags_arr_d, inst->seq_counter_d,
+        inst->my_rank, inst->world_size,
+        inst->nanosleep_ns, peer_rank);
+}
+
+void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank) {
+    glm_p2p_arrive(ctx, inst, peer_rank);
+    glm_p2p_wait(ctx, inst, peer_rank);
 }
 
 // ---------------------------------------------------------------------------
