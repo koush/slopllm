@@ -24,6 +24,7 @@ using IdType = int32_t;
 using AttentionVariant = flashinfer::DefaultAttention<false, false, false, false>;
 constexpr auto POS_ENC = flashinfer::PosEncodingMode::kNone;
 
+#undef DISPATCH_HEAD_DIM
 #define DISPATCH_HEAD_DIM(HEAD_DIM_VAL, ...) \
   do { \
     if ((HEAD_DIM_VAL) == 256) { \
@@ -379,6 +380,7 @@ void glm_batch_prefill_paged_plan(
       -1, // fixed_split_size
       false, // disable_split_kv
       0, // num_colocated_ctas
+      0, // uniform_q_len
       GLM_STREAM(ctx));
 
   if (status != cudaSuccess) {
@@ -533,6 +535,7 @@ void glm_batch_prefill_ragged_plan(
       -1, // fixed_split_size
       false, // disable_split_kv
       0, // num_colocated_ctas
+      0, // uniform_q_len
       GLM_STREAM(ctx));
 
   if (status != cudaSuccess) {
