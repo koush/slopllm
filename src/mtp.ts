@@ -431,7 +431,7 @@ export function mtpTreeDecode(
   ws.glm.synchronize();
 
   warmup ||= !targetPrefillState.isCaptured(captureManager, ['mtp-verify', numVerificationTokens]);
-  const { kvCacheLayers, indexerKvCacheLayers } = targetPrefillState.capture(captureManager, () => {
+  const { kvCacheLayers, indexerKvCacheLayers } = targetPrefillState.capture(captureManager, (capturing) => {
     const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, appendCkvOrig: Tensor, appendKpeOrig: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
     const indexerKvCacheLayers: { appendIdxK: Tensor, appendIdxKOrig: Tensor, cacheIdx: number, indexHeadDim: number }[] = [];
 
@@ -454,6 +454,13 @@ export function mtpTreeDecode(
     argmaxHost.memcpy(argmaxResult, argmaxResult.bytes, MemcpyKind.DeviceToHost);
 
     hiddenStateStaging.memcpy(hiddenStates, undefined, MemcpyKind.DeviceToDevice);
+
+    if (capturing) {
+      for (const extra of ws.extras.values()) {
+        using _extra = extra;
+        extra.streamWaitEvent?.();
+      }
+    }
 
     return { kvCacheLayers, indexerKvCacheLayers };
   }, ['mtp-verify', numVerificationTokens]);
@@ -583,15 +590,15 @@ export function mtpTreeDecode(
   const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache);
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
   mtpExtendPrefill.sharedSlots = sharedSlots;
-    for (const layer of kvCacheLayers) {
-      mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
-      layer.appendCkvOrig[Symbol.dispose]();
-      layer.appendKpeOrig[Symbol.dispose]();
-    }
-    for (const layer of indexerKvCacheLayers) {
-      mtpExtendPrefill.indexerKvCacheAppend(layer.appendIdxK, layer.cacheIdx, layer.indexHeadDim);
-      layer.appendIdxKOrig[Symbol.dispose]();
-    }
+  for (const layer of kvCacheLayers) {
+    mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
+    layer.appendCkvOrig[Symbol.dispose]();
+    layer.appendKpeOrig[Symbol.dispose]();
+  }
+  for (const layer of indexerKvCacheLayers) {
+    mtpExtendPrefill.indexerKvCacheAppend(layer.appendIdxK, layer.cacheIdx, layer.indexHeadDim);
+    layer.appendIdxKOrig[Symbol.dispose]();
+  }
   ws.glm.synchronize();
 
   warmup ||= !mtpExtendPrefill.isCaptured(captureManager, ['mtp-replace', finishCount]);

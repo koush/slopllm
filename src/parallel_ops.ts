@@ -2913,13 +2913,14 @@ export class ParallelOps implements DeviceOps {
     const pagedKV = state.cache.getPagedKV();
     const cfg = state.model.cfg as Glm51Config;
 
-    for (let nextCacheIdx = cacheIdx + 1; ; nextCacheIdx++) {
+    for (let i = 1; ; i++) {
+      const nextCacheIdx = cacheIdx + i;
       // prefetch as many of the next layer ckv as possible
       if (!pagedKV.ckvData[nextCacheIdx])
         break;
       if (cfg.indexerTypes[nextCacheIdx] !== "shared")
         break;
-      const nextStream = this.withStream<ParallelTensor>(() => {
+      const nextStream = this.withStream(() => {
         const nextKvCache = pagedKV.ckvData[nextCacheIdx];
 
         // Sparse topk gather: skip the full-cache deinterleave of
@@ -2940,9 +2941,10 @@ export class ParallelOps implements DeviceOps {
         const shardPageSize = pageSize / this.worldSize;
         const BPT = pKvCache.shape[2];
         const workspace = pIndptr.workspace;
-        const out = workspace.alloc(
+        const out = workspace.ensureAlloc(
           [paddedKvLen / shardPageSize, shardPageSize, BPT],
           pKvCache.type,
+          `sparseMlaPrefetch_${i}`,
         ) as ParallelTensor;
 
         this.gatherTopkCkv(
@@ -2958,15 +2960,16 @@ export class ParallelOps implements DeviceOps {
           paddedKvLen,
         );
 
-        return out;
+        // no tensor is returned, it's a deterministically named tensor, the shared layer will know where to find it based on idx and distance from full layer.
+        // this is necessary for graph capture in split graphs.
       });
 
-
-      // leak prevention (ie mtp ignored, etc)
+      // the actual state is stored at the stream index.
+      // always clean up before writing, the layer may not be processed due to either incorrect usage (so being defensive here)
+      // or because it is an mtp layer that was skipped.
       using existing = state.ws.extras.get(`sparseMlaPrefetch_${nextCacheIdx}`) as ReturnType<typeof this.withStream<ParallelTensor>>;
       existing?.streamWaitEvent();
       using _existing = existing?.result;
-
       state.ws.extras.set(`sparseMlaPrefetch_${nextCacheIdx}`, nextStream);
     }
   }
@@ -2979,9 +2982,12 @@ export class ParallelOps implements DeviceOps {
     const pAppendKpe = this.cast(appendKpe);
     const pageSize = pKvCache.shape[1];
     const pIndptr = this.cast(indptr);
+    const cfg = state.model.cfg as Glm51Config;
 
     const pagedKV = state.cache.getPagedKV();
-    // due to mtp usage being potentially dynamic (mtp or incorrect usage), only clean up after the layer is finished and before a prefetch overwrites.
+
+    // the previous layer may not be processed due to either incorrect usage (so being defensive here)
+    // or because it is an mtp layer that was skipped.
     {
       const prevCacheIndex = (cacheIdx - 1 + pagedKV.ckvData.length) % pagedKV.ckvData.length;
       const prevKey = `sparseMlaPrefetch_${prevCacheIndex}`;
@@ -2991,15 +2997,43 @@ export class ParallelOps implements DeviceOps {
       existing?.streamWaitEvent();
     }
 
-    // get the gathered kv if its available
-    // this kv may be from a sparse or full gather.
+    // get the gatherering stream if it is available
     const prefetchKeyStream = `sparseMlaPrefetch_${cacheIdx}`;
     using prefetchedStream = state.ws.extras.get(prefetchKeyStream) as ReturnType<typeof this.withStream<ParallelTensor>>;
-    const prefetched = prefetchedStream?.result;
-    // note that the prefetched stream entry is not deleted here, only disposed. mtp layer is reused many times.
-    // could guard this behavior to last layer only.
+    prefetchedStream?.streamWaitEvent();
+    state.ws.extras.delete(prefetchKeyStream);
 
-    if (prefetchedStream) {
+    // the gathering stream returns a tensor if its a full gather.
+    // a sparse gather will NOT return a tensor, it must be read from the deterministically named tensor in the workspace.
+    let prefetched = prefetchedStream?.result;
+
+    const isSharedLayer = cfg.indexerTypes[cacheIdx] === "shared";
+    const isFullGathering = this.shouldGatherKv(state, false);
+    if (isSharedLayer) {
+      if (prefetched) {
+        throw new Error(`sparseMlaPrepareCache: unexpected prefetched result for shared layer ${cacheIdx}`);
+      }
+
+      if (this.shouldGatherKv(state, true)) {
+        // 1-based distance back to the 'full' layer that gathered this buffer,
+        // matching the loop counter in sparseMlaPrepareSharedSlotsCache.
+        let d = 0;
+        while (cfg.indexerTypes[cacheIdx - d] === "shared") {
+          d++;
+        }
+        prefetched = pIndptr.workspace.tensors.get(`sparseMlaPrefetch_${d}`) as ParallelTensor;
+        if (!prefetched) {
+          throw new Error(`sparseMlaPrepareCache: expected prefetched result for shared layer ${cacheIdx} (distance ${d})`);
+        }
+      }
+    }
+    else {
+      if (!prefetched && isFullGathering) {
+        throw new Error(`sparseMlaPrepareCache: expected prefetched result for full layer ${cacheIdx}`);
+      }
+    }
+
+    if (prefetched) {
       // After a prefetch, this layer's NEW ckv values need to be written to
       // the flat gathered tensor: the prefetch started on the previous
       // layer's call and read from pagedKV.ckvData[cacheIdx] BEFORE this
@@ -3007,8 +3041,6 @@ export class ParallelOps implements DeviceOps {
       // new_seq_len) are stale in the gathered buffer. concatAndCacheDsMla
       // writes them in. This is required in prefill (full gather) and decode (sparse gather)
       // because the topk may reference those new-token positions.
-
-      prefetchedStream.streamWaitEvent();
 
       for (let i = 0; i < this.worldSize; i++) {
         this.devices[i].concatAndCacheDsMla(state, cacheIdx, prefetched!.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i],
@@ -3124,7 +3156,10 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  shouldGatherKv(state: ExecutionState, sparse: boolean) {
+  // determines the gather type to be used depending on the state.
+  // this is called at various states in the pipeline for hooking a all vs sparse gather
+  // "full" layers should never be sparse gathered. (enforced elsewhere)
+  shouldGatherKv(state: ExecutionState, sparseGather: boolean) {
     // only valid in cp mode
     if (!state.cache.getPagedKV().contextParallel)
       return false;
@@ -3135,7 +3170,7 @@ export class ParallelOps implements DeviceOps {
     // if total tokens is under some threshold, use the sparse gather.
     if (state.totalTokens <= 32) {
       // decode should only sparse gather.
-      return sparse;
+      return sparseGather;
     }
 
     // prevent high batch decode from using the gather path
@@ -3144,7 +3179,7 @@ export class ParallelOps implements DeviceOps {
     }
 
     // never sparse gather above the threshold
-    if (sparse)
+    if (sparseGather)
       return false;
 
     // should do the actual math to see whether q or ckv has a smaller gather
