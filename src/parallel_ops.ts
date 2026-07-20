@@ -2913,6 +2913,8 @@ export class ParallelOps implements DeviceOps {
     const pagedKV = state.cache.getPagedKV();
     const cfg = state.model.cfg as Glm51Config;
 
+    let needBarrier = true;
+
     for (let i = 1; ; i++) {
       const nextCacheIdx = cacheIdx + i;
       // prefetch as many of the next layer ckv as possible
@@ -2920,6 +2922,12 @@ export class ParallelOps implements DeviceOps {
         break;
       if (cfg.indexerTypes[nextCacheIdx] !== "shared")
         break;
+
+      if (needBarrier) {
+        needBarrier = false;
+        this.p2pBarrier();
+      }
+
       const nextStream = this.withStream(() => {
         const nextKvCache = pagedKV.ckvData[nextCacheIdx];
 
@@ -3373,7 +3381,7 @@ export class ParallelOps implements DeviceOps {
     // need a barrier with system-scope acquire/release semantics. This is
     // the WRITE-side mirror of the existing pre-launch p2pBarrier() in
     // tryP2PAllGather / p2pAllGatherSmem (which syncs peer READS).
-    // this.p2pBarrier();
+    this.p2pBarrier();
   }
 
   indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void {
