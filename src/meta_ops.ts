@@ -401,7 +401,7 @@ export class MetaOps implements DeviceOps {
         return idxQ.workspace.alloc([idxQ.shape[0], topk], "I32");
     }
 
-    topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, _cacheIdx: number, _kvCache: Tensor, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): Tensor {
+    topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): Tensor {
         return topkIdx.workspace.alloc([topkIdx.shape[0], topkIdx.shape[1]], "I32");
     }
 

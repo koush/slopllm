@@ -1099,10 +1099,22 @@ export class GlmOps implements DeviceOps {
     return topkIdx;
   }
 
-  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, _cacheIdx: number, _kvCache: Tensor, _contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): Tensor {
+  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, _cacheIdx: number, _contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): Tensor {
+    // Device level operates on the resolved cpWorldSize/cpRank. Single-GPU
+    // (non-CP) callers reach here with the defaults (cpWorldSize 0 = paged);
+    // ParallelOps resolves the flat/paged mode from cacheIdx and passes
+    // cpWorldSize/cpRank per shard, so cacheIdx is unused here.
     const totalQ = topkIdx.shape[0];
     const topk = topkIdx.shape[1];
-    const slots = topkIdx.workspace.ensureAlloc([maxKv, topk], "I32", "idxslots-shared").narrow(0, totalQ);
+    // Allocate the max footprint ([maxKv, topk]) and narrow to [totalQ, topk]:
+    // a plain transient alloc, but constant-sized across totalQ / graph variants
+    // so the workspace allocator layout stays stable under graph capture. Hold
+    // the full allocation with `using` so its disposal is deferred to when the
+    // caller disposes the returned narrow view — returning a bare
+    // `alloc(...).narrow(...)` would leak the parent allocation, since disposing
+    // a view alone never frees its parent.
+    using full = topkIdx.workspace.alloc([maxKv, topk], "I32");
+    const slots = full.narrow(0, totalQ);
     getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkLength), ptr(topkIdx), ptr(pageIndices), ptr(indptr), ptr(lastPageLen), ptr(batchIndices), totalQ, topk, pageSize, cpWorldSize, cpRank, ptr(kvTokenIndptrD));
     return slots;
   }

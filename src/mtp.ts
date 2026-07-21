@@ -169,7 +169,7 @@ export function mtpTreeDecode(
   captureManager: CaptureManager,
   model: ChatModel,
   mtpHiddenStates: Tensor,
-  sharedSlots: UsingHolder<Tensor>,
+  sharedTopk: UsingHolder<Tensor>,
   ws: ExecutionWorkspace,
   targetToken: number,
   topks: number[],
@@ -192,7 +192,7 @@ export function mtpTreeDecode(
   const pagedKv = cache.getPagedKV();
   const batchSize = pagedKv.sequences.length;
 
-  using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedSlots.value]));
+  using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedTopk.value]));
 
   const hiddenDim = mtpHiddenStates.shape[1];
   const rowBytes = hiddenDim * BF16; // BF16 = 2 bytes per element
@@ -250,7 +250,7 @@ export function mtpTreeDecode(
       }
 
       const state = ws.planDecode(model, newBatchSize, cache);
-      state.sharedSlots = sharedSlots;
+      state.sharedTopk = sharedTopk;
 
 
       warmup ||= !state.isCaptured(captureManager, ['mtp-tree-decode', i, topks.length]);
@@ -343,7 +343,7 @@ export function mtpTreeDecode(
         positionIds: posIds,
         maskKvLen: chunkedMask.maskKvLen,
       });
-      state.sharedSlots = sharedSlots;
+      state.sharedTopk = sharedTopk;
 
       const prevHs = chainedHs;
       warmup ||= !state.isCaptured(captureManager, ['mtp-chunk', depth, topks.length]);
@@ -422,8 +422,8 @@ export function mtpTreeDecode(
     ...targetCustomMask,
     positionIds: getPositionIdsMask(ws, originalAllocLen, targetTopk),
   });
-  sharedSlots.release();
-  targetPrefillState.sharedSlots = sharedSlots;
+  sharedTopk.release();
+  targetPrefillState.sharedTopk = sharedTopk;
 
   targetPrefillState.setInput(verificationTokens);
 
@@ -587,7 +587,7 @@ export function mtpTreeDecode(
 
   const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache);
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
-  mtpExtendPrefill.sharedSlots = sharedSlots;
+  mtpExtendPrefill.sharedTopk = sharedTopk;
   for (const layer of kvCacheLayers) {
     mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
     layer.appendCkvOrig[Symbol.dispose]();

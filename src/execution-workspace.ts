@@ -17,7 +17,11 @@ export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 
 export class ExecutionState {
   input?: Tensor;
-  sharedSlots?: UsingHolder<Tensor>;
+  // Holds the raw indexer top-k (token positions, Replicated [totalQ, topk])
+  // produced on 'full' layers and reused by the following 'shared' layers. The
+  // per-layer physical slots are derived on demand from this via topkSlots(),
+  // in whichever addressing mode (flat/paged) that layer's CKV buffer needs.
+  sharedTopk?: UsingHolder<Tensor>;
   paddedKvLenInvariant = true;
   private readonly paddedKvLen: number;
 
@@ -141,12 +145,15 @@ export class ExecutionState {
     );
   }
 
-  indexerTopkSlots(idxQ: Tensor, cacheIdx: number, weights: Tensor, scale: number, topk: number): Tensor {
+  // Run the indexer and return the raw top-k token positions (Replicated
+  // [totalQ, topk]). Slot conversion is deferred to topkSlots() so the same
+  // top-k can be reused across shared layers and mapped to whichever addressing
+  // (flat/paged) each layer's CKV buffer requires.
+  indexerTopk(idxQ: Tensor, cacheIdx: number, weights: Tensor, scale: number, topk: number): Tensor {
     const pagedKV = this.cache.getPagedKV();
     const kData = pagedKV.kData[cacheIdx];
-    const maxKv = kData.shape[0] * kData.shape[1];
     const cm = (!this.isDecode && this.customMask?.mode === MaskMode.CausalCustom) ? this.customMask : undefined;
-    using topkIdx = this.ws.glm.indexerTopk(
+    return this.ws.glm.indexerTopk(
       idxQ, kData, weights,
       pagedKV.indices, this.ws.indptrD, this.ws.globalLastPageLen, this.ws.qoIndptrD,
       scale, topk,
@@ -154,13 +161,22 @@ export class ExecutionState {
       0,
       cm?.mask, cm?.indptr, cm?.maskKvLen,
     );
+  }
+
+  // Map raw indexer top-k -> physical slots for layer `cacheIdx`. The addressing
+  // (flat vs paged) is chosen internally by the ops layer from cacheIdx, so the
+  // model stays mode-agnostic. Writes the compacted per-query count into
+  // sparseTopkLength (read by sparse MLA). Called per layer at attention time.
+  topkSlots(cacheIdx: number, topkIdx: Tensor): Tensor {
+    const pagedKV = this.cache.getPagedKV();
+    const kData = pagedKV.kData[cacheIdx];
+    const maxKv = kData.shape[0] * kData.shape[1];
     return this.ws.glm.topkToSlots(
       this,
       topkIdx, this.ws.kvTokenIndptrD,
       pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices, this.ws.sparseTopkLength,
       pagedKV.pageSize, maxKv,
-      cacheIdx, pagedKV.ckvData[cacheIdx],
-      pagedKV.contextParallel,
+      cacheIdx, pagedKV.contextParallel,
     );
   }
 
@@ -330,6 +346,13 @@ export class ExecutionWorkspace extends WorkspaceBase {
    *  topkToSlots on full layers, read as sparse attention's topk_length. Stable
    *  buffer so it persists to shared layers that reuse the same slots. */
   sparseTopkLength: Tensor;
+  /** GPU buffer [B*S] of I32: separate compacted valid-slot count written by
+   *  the shared-slots gather's own flat topkToSlots. Distinct from
+   *  sparseTopkLength because the gather runs on a side stream concurrently
+   *  with the full layer's own (paged) topkToSlots on the main stream, so they
+   *  must not share a length buffer. (gatherTopkCkv ignores it, but the kernel
+   *  still writes it.) */
+  sparseTopkLengthGather: Tensor;
   lastDecodePagedKV: PagedKVCache | null;
   private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
   extras = new Map<string, any>();
@@ -366,6 +389,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.mlaBatchIndices = this.alloc([B * S], "I32", "mlaBatchIndices");
     this.mlaBatchIndicesH = this.allocPinned([B * S], "I32", "mlaBatchIndicesH");
     this.sparseTopkLength = this.alloc([B * S], "I32", "sparseTopkLength");
+    this.sparseTopkLengthGather = this.alloc([B * S], "I32", "sparseTopkLengthGather");
     this.lastDecodePagedKV = null;
 
     // Initialize mlaBatchIndices for decode: [0, 1, 2, ..., B-1]

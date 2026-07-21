@@ -2905,7 +2905,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  sparseMlaPrepareSharedSlotsCache(state: ExecutionState, cacheIdx: number, kvCache: Tensor, topk: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor) {
+  sparseMlaPrepareSharedSlotsCache(state: ExecutionState, cacheIdx: number, kvCache: Tensor, topkIdx: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor) {
     const pKvCache = this.cast(kvCache);
     const pIndptr = this.cast(indptr);
     const pBatchIndices = this.cast(batchIndices);
@@ -2930,7 +2930,33 @@ export class ParallelOps implements DeviceOps {
     if (!isSparseGathering)
       return;
 
+    const paddedKvLen = pagedKV.maxPages * pagedKV.pageSize;
+
     const nextStream = this.withStream(() => {
+      // Derive the FLAT slots the gather consumes from the raw indexer top-k:
+      // flat_slot = kvTokenIndptr[seq] + token_pos, Replicated (cpW=1), the same
+      // for every layer in this shared group. Generated here on the gather's
+      // side stream; the slots are a transient alloc (distinct from the full
+      // layer's paged slots), the length uses sparseTopkLengthGather so it can't
+      // race the full layer's paged topkToSlots length write on the main stream.
+      // The gather_topk_ckv kernel reads these as direct OUTPUT slots and
+      // reverse-derives token_pos for the CP-rank filter and paged src_slot
+      // lookup.
+      // Resolve to flat via the FIRST shared layer's index (cacheIdx +
+      // startIndex): the gather produces exactly the shared layers' replicated
+      // buffers, so their addressing is the flat one. The slots are a plain
+      // transient alloc (distinct from the full layer's paged slots by virtue
+      // of being a separate allocation); only the length still uses its own
+      // buffer (sparseTopkLengthGather) so it can't race the full layer's paged
+      // topkToSlots length write on the main stream.
+      const flatSlots = this.topkToSlots(
+        state, topkIdx, state.ws.kvTokenIndptrD,
+        indices, indptr, state.ws.lastPageLen, batchIndices, state.ws.sparseTopkLengthGather,
+        pageSize, paddedKvLen, cacheIdx + startIndex, pKvCache.parallelism === TensorParallelism.Row,
+      );
+      const pFlatSlots = this.cast(flatSlots);
+      const topkCount = pFlatSlots.shape[1];
+
       for (let i = startIndex; ; i++) {
         const nextCacheIdx = cacheIdx + i;
         // prefetch as many of the next layer ckv as possible
@@ -2941,21 +2967,10 @@ export class ParallelOps implements DeviceOps {
 
         const nextKvCache = pagedKV.ckvData[nextCacheIdx];
 
-        // Sparse topk gather: skip the full-cache deinterleave of
-        // gatherPages and gather only the union of topk-referenced flat
-        // slots directly into a Replicated flat buffer. `topk` is a
-        // Replicated ParallelTensor of flat slots (output of topkToSlots
-        // under gather / cpW=1 mode — flat_slot = kvTokenIndptr[seq] +
-        // token_pos); the gather_topk_ckv kernel reads these as direct
-        // OUTPUT slots and reverse-derives token_pos for the CP-rank
-        // filter and paged src_slot lookup. The fixup below writes this
-        // layer's just-appended CKV/KPE for positions the prefetch
-        // couldn't have seen (next layer's mlaKvCacheAppend hadn't run
-        // yet); in prefill the topk can reference such new-token
-        // positions, so the fixup is required.
-        const pTopk = this.cast(topk);
-        const topkCount = pTopk.shape[1];
-        const paddedKvLen = pagedKV.maxPages * pagedKV.pageSize;
+        // The fixup in sparseMlaPrepareCache later writes this layer's
+        // just-appended CKV/KPE for positions the gather couldn't have seen
+        // (the shared layer's own mlaKvCacheAppend hadn't run yet), so the
+        // topk referencing new-token positions is handled there.
         const shardPageSize = pageSize / this.worldSize;
         const BPT = pKvCache.shape[2];
         const workspace = pIndptr.workspace;
@@ -2969,7 +2984,7 @@ export class ParallelOps implements DeviceOps {
           state,
           nextKvCache,
           [out],
-          pTopk,
+          pFlatSlots,
           this.cast(indices!),
           pIndptr,
           state.ws.kvTokenIndptrD,
@@ -2980,14 +2995,16 @@ export class ParallelOps implements DeviceOps {
       }
 
 
-      // Cross-rank P2P fan-out barrier. Each rank's gatherTopkCkv kernel wrote
-      // BPT-byte tokens to ALL N peer output shards via P2P. Before any
-      // downstream consumer (the fixup / sparseMlaDecode run on each rank's
-      // own stream) reads its local output shard, it must observe ALL peers'
-      // writes — stream-order covers self-writes, but cross-stream peer writes
-      // need a barrier with system-scope acquire/release semantics. This is
-      // the WRITE-side mirror of the existing pre-launch p2pBarrier() in
-      // tryP2PAllGather / p2pAllGatherSmem (which syncs peer READS).
+      // FIXME(cross-rank-visibility): each rank's gatherTopkCkv writes BPT-byte
+      // tokens to ALL N peer output shards via P2P. A downstream consumer on
+      // rank j reads shard j — written partly by REMOTE ranks. The side-stream
+      // join at the end of the full layer (slotsReadyStream.streamWaitEvent) is
+      // DIAGONAL (rank j's main waits rank j's OWN gather only), and the full
+      // layer's o_proj/MLP allReduces run concurrently with the gather (the join
+      // is after them), so they don't order a remote rank's writes before this
+      // rank's read. Pinned pending investigation of whether another barrier
+      // sits between the gather and the first shared-layer read; if not, a
+      // write-side p2pBarrier() here is required.
       // this.p2pBarrier();
 
       // no tensor is returned, it's a deterministically named tensor, the shared layer will know where to find it based on idx and distance from full layer.
@@ -3505,7 +3522,13 @@ export class ParallelOps implements DeviceOps {
     return topkIdxReplicated;
   }
 
-  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, cacheIdx: number, kvCache: Tensor, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): Tensor {
+  // The flat/paged addressing is resolved internally from `cacheIdx` (via
+  // topkSlotMode) so the model / ExecutionState never see it:
+  //   "flat": de-interleaved slot (kvTokenIndptr[seq] + token_pos), identical on
+  //   every rank (cpW=1) — for the gathered/replicated CKV buffer. "paged": the
+  //   per-rank CP shard (cpW=W, cpR=i) with the ownership filter, or non-CP
+  //   (cpW=0).
+  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): Tensor {
     const pTopkIdx = this.cast(topkIdx);
     const pKvTokenIndptr = this.cast(kvTokenIndptrD);
     const pPageIndices = this.cast(pageIndices);
@@ -3513,23 +3536,38 @@ export class ParallelOps implements DeviceOps {
     const pLastPageLen = this.cast(lastPageLen);
     const pBatchIndices = this.cast(batchIndices);
     const pTopkLength = this.cast(topkLength);
-    const pKvCache = this.cast(kvCache);
 
     const W = this.worldSize;
-    const flatMode = this.shouldGatherKv(state, false) || this.shouldGatherKv(state, true);
-    const cpW = flatMode ? 1 : (contextParallel ? W : 0);
+    const mode = this.topkSlotMode(state, cacheIdx);
+    const cpW = mode === "flat" ? 1 : (contextParallel ? W : 0);
     const totalQ = topkIdx.shape[0];
     const topk = topkIdx.shape[1];
 
     const slotShards: Tensor[] = [];
     for (let i = 0; i < W; i++) {
       const cpR = (cpW > 1) ? i : 0;
-      slotShards.push(this.devices[i].topkToSlots(state, pTopkIdx.shards[i], pKvTokenIndptr.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pBatchIndices.shards[i], pTopkLength.shards[i], pageSize, maxKv, cacheIdx, pKvCache.shards[i], contextParallel, cpW, cpR));
+      // cacheIdx is unused at the device level (mode already resolved to cpW/cpR).
+      slotShards.push(this.devices[i].topkToSlots(state, pTopkIdx.shards[i], pKvTokenIndptr.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pBatchIndices.shards[i], pTopkLength.shards[i], pageSize, maxKv, -1, contextParallel, cpW, cpR));
     }
 
-    const topkSlots = this.wrapShards(topkIdx.workspace, slotShards, [totalQ, topk], "I32", TensorParallelism.Replicated);
+    return this.wrapShards(topkIdx.workspace, slotShards, [totalQ, topk], "I32", TensorParallelism.Replicated);
+  }
 
-    return topkSlots;
+  // Which addressing layer `cacheIdx`'s CKV buffer (as returned by
+  // sparseMlaPrepareCache) needs — the single source of truth shared with that
+  // method's return-value logic:
+  //   full-gather (prefill)   -> every layer reads a gathered flat buffer.
+  //   sparse-gather (decode)  -> 'full' layers read their paged CP shard;
+  //                              'shared' layers read the gathered flat buffer.
+  //   no gather               -> every layer reads its paged CP shard.
+  topkSlotMode(state: ExecutionState, cacheIdx: number): "flat" | "paged" {
+    if (this.shouldGatherKv(state, false))
+      return "flat";
+    if (this.shouldGatherKv(state, true)) {
+      const cfg = state.model.cfg as Glm51Config;
+      return cfg.indexerTypes[cacheIdx] === "shared" ? "flat" : "paged";
+    }
+    return "paged";
   }
 
   slotsReady(state: ExecutionState, topkIdx: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, cacheIdx: number, kvCache: Tensor) {
