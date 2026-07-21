@@ -455,10 +455,10 @@ export function mtpTreeDecode(
 
     hiddenStateStaging.memcpy(hiddenStates, undefined, MemcpyKind.DeviceToDevice);
 
-    for (const extra of ws.extras.values()) {
-      using _extra = extra;
-      extra.streamWaitEvent?.();
-    }
+    // for (const extra of ws.extras.values()) {
+    //   using _extra = extra;
+    //   extra.streamWaitEvent?.();
+    // }
 
     return { kvCacheLayers, indexerKvCacheLayers };
   }, ['mtp-verify', numVerificationTokens]);

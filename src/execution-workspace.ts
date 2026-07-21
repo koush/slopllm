@@ -166,7 +166,7 @@ export class ExecutionState {
 
   slotsReady(cacheIdx: number, topkIdx: Tensor) {
     const pagedKV = this.cache.getPagedKV();
-    this.ws.glm.slotsReady!(
+    return this.ws.glm.slotsReady!(
       this,
       topkIdx,
       pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices,

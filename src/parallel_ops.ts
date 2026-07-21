@@ -3008,8 +3008,11 @@ export class ParallelOps implements DeviceOps {
       using existing = state.ws.extras.get(`sparseMlaPrefetch_${nextCacheIdx}`) as ReturnType<typeof this.withStream<ParallelTensor>>;
       existing?.streamWaitEvent();
       using _existing = existing?.result;
-      state.ws.extras.set(`sparseMlaPrefetch_${nextCacheIdx}`, nextStream);
     }
+
+    // state.ws.extras.set(`sparseMlaPrefetch_${cacheIdx}`, nextStream);
+
+    return nextStream;
   }
 
   sparseMlaPrepareCache(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
@@ -3531,8 +3534,9 @@ export class ParallelOps implements DeviceOps {
 
   slotsReady(state: ExecutionState, topkIdx: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, cacheIdx: number, kvCache: Tensor) {
     if (this.shouldGatherKv(state, true)) {
-      this.sparseMlaPrepareSharedSlotsCache(state, cacheIdx, kvCache, topkIdx, pageIndices, indptr, batchIndices);
+      return this.sparseMlaPrepareSharedSlotsCache(state, cacheIdx, kvCache, topkIdx, pageIndices, indptr, batchIndices)!;
     }
+    return undefined!;
   }
 
   private graphHandles: (number | undefined)[][] = [];

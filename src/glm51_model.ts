@@ -511,10 +511,8 @@ export class Glm51Model extends ChatModel {
         : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
     });
 
-    if (idxQStream) {
-      idxQStream?.streamWaitEvent();
-      state.slotsReady(layerIdx, sharedSlots.value);
-    }
+    idxQStream?.streamWaitEvent();
+    using slotsReadyStream = idxQStream ? state.slotsReady(layerIdx, sharedSlots.value) : undefined;
 
     qAbsorbedRStream.streamWaitEvent();
     qPeRStream.streamWaitEvent();
@@ -580,6 +578,8 @@ export class Glm51Model extends ChatModel {
       nextWeight = this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.shared_head.norm.weight`)!;
     }
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
+
+    slotsReadyStream?.streamWaitEvent();
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
