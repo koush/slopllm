@@ -216,6 +216,9 @@ p2p_allgather_smem_kernel(
                 int ti = n_vec * VEC + tid;
                 if (ti < elems) dst[ti] = src[ti];
             }
+            // All threads must finish draining this slot before the next peer
+            // is streamed into it (cg::wait_prior only orders the fill side).
+            __syncthreads();
             int next_peer = (j + D_VAL + rank) % N;
             cg::memcpy_async(block,
                 smem_raw + (size_t)slot * peer_stride,
@@ -320,6 +323,9 @@ p2p_allgather_row_smem_kernel(
                     int ti = n_vec * VEC + tid;
                     if (ti < elems) dst[ti] = src[ti];
                 }
+                // All threads must finish draining this slot before the next
+                // peer is streamed into it (wait_prior only orders the fill).
+                __syncthreads();
                 int next_peer = (j + D_VAL + rank) % N;
                 cg::memcpy_async(block,
                     smem_raw + (size_t)slot * peer_stride,
@@ -447,6 +453,9 @@ rmsnorm_pointers_smem_kernel(
                     }
                 }
             }
+            // All threads must finish reading this slot before the next peer is
+            // streamed into it (cg::wait_prior only orders the fill side).
+            __syncthreads();
             cg::memcpy_async(block,
                 smem_raw + (size_t)(j % D_VAL) * peer_stride_elems * elem_sz,
                 peers[j + D_VAL] + (size_t)blk * elem_sz,

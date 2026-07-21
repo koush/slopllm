@@ -242,8 +242,8 @@ export class ParallelTensor extends Tensor {
         }
       }
 
-      this.parallelOps.p2pBarrier();
-      this.parallelOps.sourceCleanup();
+      group!.barrier(this.devices);
+      group!.cleanupSources();
 
       for (let i = 0; i < this.worldSize; i++) {
         const gathered = gatheredShards[i];
@@ -277,14 +277,14 @@ export class ParallelTensor extends Tensor {
       if (count > 65536 * 2)
         return false;
 
-      this.parallelOps.p2pBarrier();
-      this.parallelOps.sourceCleanup();
+      group.barrier(this.devices);
+      group.cleanupSources();
 
       if (count % this.worldSize !== 0)
         return false;
       const chunkLen = count / this.worldSize;
       const flatShards = this.shards.map(s => s.reshape([count]));
-      this.parallelOps.p2pSources.push(...flatShards);
+      group.sources.push(...flatShards);
       for (let i = 0; i < this.worldSize; i++) {
         const rowShards: Tensor[] = new Array(this.worldSize);
         // rank i starts with its own shard (j = i) and walks outward,
@@ -293,11 +293,11 @@ export class ParallelTensor extends Tensor {
           const j = (i + k) % this.worldSize;
           const v = flatShards[j].narrow(i * chunkLen, chunkLen);
           rowShards[k] = v;
-          this.parallelOps.p2pSources.push(v);
+          group.sources.push(v);
         }
         rowShards[0].sumInPlace(rowShards, true);
       }
-      this.parallelOps.p2pBarrier();
+      group.barrier(this.devices);
 
       return true;
     }
@@ -318,11 +318,11 @@ export class ParallelTensor extends Tensor {
         const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
         const isLast = reduceHalf === 1;
 
-        this.parallelOps.p2pBarrier(peerRanks);
+        group!.barrier(this.devices, peerRanks);
         if (reduceHalf === this.worldSize / 2) {
-          this.parallelOps.sourceCleanup();
+          group!.cleanupSources();
         }
-        this.parallelOps.p2pSources.push(...current);
+        group!.sources.push(...current);
 
         if (isLast) {
           for (let i = 0; i < this.worldSize; i++) {
@@ -442,9 +442,9 @@ export class ParallelTensor extends Tensor {
 
     if (this.parallelism === TensorParallelism.Column) {
       // Smem-staged AllGather: barrier, then single kernel reads from all peers via TMA.
-      this.parallelOps.p2pBarrier();
-      this.parallelOps.sourceCleanup();
-      this.parallelOps.p2pSources.push(...this.shards.map(s => s.viewClone()));
+      group.barrier(this.devices);
+      group.cleanupSources();
+      group.sources.push(...this.shards.map(s => s.viewClone()));
       for (let i = 0; i < this.worldSize; ++i) {
         addon.p2pAllGatherSmem(
           this.devices[i].ctx,
@@ -463,9 +463,9 @@ export class ParallelTensor extends Tensor {
       const shardDim1Bytes = shardDim1 * inner * elemBytes;
       const fullDim1Bytes = this.shape[1] * inner * elemBytes;
       // Smem-staged Row AllGather: barrier, then single kernel reads from all peers via TMA.
-      this.parallelOps.p2pBarrier();
-      this.parallelOps.sourceCleanup();
-      this.parallelOps.p2pSources.push(...this.shards.map(s => s.viewClone()));
+      group.barrier(this.devices);
+      group.cleanupSources();
+      group.sources.push(...this.shards.map(s => s.viewClone()));
       for (let i = 0; i < this.worldSize; ++i) {
         addon.p2pAllGatherRowSmem(
           this.devices[i].ctx,
@@ -2053,7 +2053,27 @@ class P2PAllReduceGroup {
     }
   }
 
+  /**
+   * Buffers peers are reading through this group's barriers. A P2P op pushes
+   * the tensors its peers will read; they are only released once this group's
+   * *next* barrier proves every peer is past those reads.
+   *
+   * Per-group (i.e. per-stream) on purpose: a barrier on one stream says
+   * nothing about a P2P op still in flight on another, so a shared list would
+   * let one stream's cleanup recycle buffers another stream's peers are still
+   * reading.
+   */
+  sources: Tensor[] = [];
+
+  /** Release the sources retained since the previous barrier on this group. */
+  cleanupSources(): void {
+    while (this.sources.length) {
+      using _src = this.sources.pop()!;
+    }
+  }
+
   free(): void {
+    this.cleanupSources();
     for (const inst of this.instances) {
       getNativeAddon().p2pDestroyInstance(inst);
     }
@@ -2151,12 +2171,19 @@ export class ParallelOps implements DeviceOps {
     return this.p2pGroups.get(stream) || null;
   }
 
-  p2pSources: Tensor[] = [];
+  /**
+   * Retain `tensors` until the next barrier on the current stream's P2P group,
+   * because peers are about to read them and must not see the memory recycled.
+   */
+  p2pRetainSources(...tensors: Tensor[]): void {
+    const group = this.getP2PGroup(this.devices[0].currentStream);
+    if (!group) throw new Error('P2P not available for source retention');
+    group.sources.push(...tensors);
+  }
+
+  /** Release the sources retained by the current stream's group. */
   sourceCleanup() {
-    // arrived at new barrier, release the old sources
-    while (this.p2pSources.length) {
-      using _src = this.p2pSources.pop()!;
-    }
+    this.getP2PGroup(this.devices[0].currentStream)?.cleanupSources();
   }
 
   /** NCCL point-to-point send. Must be paired with ncclRecv on peer. */
@@ -2227,7 +2254,7 @@ export class ParallelOps implements DeviceOps {
 
     this.p2pBarrier();
     this.sourceCleanup();
-    this.p2pSources.push(...partialVOuts.map(t => t.viewClone()), ...partialLses.map(t => t.viewClone()));
+    this.p2pRetainSources(...partialVOuts.map(t => t.viewClone()), ...partialLses.map(t => t.viewClone()));
 
     const vPtrs: number[] = partialVOuts.map(t => t.data);
     const lsePtrs: number[] = partialLses.map(t => t.data);

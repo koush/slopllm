@@ -3238,6 +3238,10 @@ sum_pointers_smem_kernel(
                     }
                 }
             }
+            // Every thread must be done reading this slot before the next peer
+            // is streamed into it: cg::wait_prior only orders the fill side, so
+            // without this a fast warp's refill overwrites a slow warp's reads.
+            __syncthreads();
             cg::memcpy_async(block,
                 smem_raw + (size_t)(j % D_VAL) * peer_stride_elems * elem_sz,
                 peers[j + D_VAL] + (size_t)blk * elem_sz,
