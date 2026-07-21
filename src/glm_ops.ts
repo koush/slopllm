@@ -143,7 +143,7 @@ interface NativeAddon {
   concatAndCacheDsMla(ctx: number, kvCache: number, appendCkv: number, appendKpe: number, indices: number, indptr: number, batchIndices: number, positions: number, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, cpWorldSize: number, cpRank: number): void;
   sparseMlaPrefill(ctx: number, q: number, kvCache: number, indices: number, output: number, outLse: number, numTokens: number, numHeads: number, topk: number, pageBlockSize: number, smScale: number, strideKvBlock: number, topkLength?: number): void;
   sparseMlaDecode(ctx: number, q: number, kvCache: number, indices: number, midOut: number, midLse: number, output: number, outLse: number, numTokens: number, numHeads: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: number): void;
-  gatherTopkCkv(ctx: number, flatP0: number, flatP1: number, flatP2: number, flatP3: number, flatP4: number, flatP5: number, flatP6: number, flatP7: number, localKvCache: number, topkIdx: number, batchIndices: number, pageIndices: number, pageIndptr: number, kvTokenIndptr: number, N: number, cpWorldSize: number, cpRank: number, effPageSize: number, bptBytes: number, numTokens: number, topk: number): void;
+  gatherTopkCkv(ctx: number, flatP0: number, flatP1: number, flatP2: number, flatP3: number, flatP4: number, flatP5: number, flatP6: number, flatP7: number, localKvCache: number, topkIdx: number, batchIndices: number, pageIndices: number, pageIndptr: number, kvTokenIndptr: number, N: number, cpWorldSize: number, cpRank: number, effPageSize: number, bptBytes: number, numTokens: number, topk: number, paddedKvLen: number, scratchBitmap: number, scratchUnique: number, scratchCounter: number): void;
   causalConv1d(ctx: number, output: number, convState: number, input: number, weight: number, cuSeqlens: number, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void;
   causalConv1dUpdate(ctx: number, output: number, convState: number, input: number, weight: number, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): void;
   rmsnormGated(ctx: number, output: number, input: number, gate: number, weight: number, eps: number, dim: number, batch: number): void;
@@ -1038,6 +1038,27 @@ export class GlmOps implements DeviceOps {
     // slots stay at 0 (kernel only writes peers [0, N)).
     const peerPtrs = new Array<number>(8).fill(0);
     for (let j = 0; j < N; j++) peerPtrs[j] = outputs[j].data;
+
+    // Dedup scratch, used only when numTokens > 1.
+    //
+    // These are persistent (named) rather than alloc + `using`. Empirically the
+    // alloc + `using` form produced CKV corruption under CP+MTP that this form
+    // does not; the mechanism was never established, so treat the requirement as
+    // observed rather than understood, and re-test rather than assume if it is
+    // ever changed back.
+    //
+    // INVARIANT: at most one gather in flight per device. ParallelOps issues a
+    // supergroup's gathers sequentially on a single stream, and the consumer
+    // waits before the next supergroup produces, so this holds. Reintroducing
+    // concurrent gather streams would require one scratch set per stream.
+    const BITS_PER_WORD = 32;
+    const ws = kvCache.workspace;
+    const bitmapWords = Math.ceil(paddedKvLen / BITS_PER_WORD);  // one bit per flat slot
+    const maxEntries = numTokens * topk;                         // one int2 per (query, k)
+    const bitmap = ws.ensureAlloc([bitmapWords], "I32", `gatherCkvBitmap_${bitmapWords}`);
+    const unique = ws.ensureAlloc([maxEntries * 2], "I32", `gatherCkvUnique_${maxEntries}`);
+    const counter = ws.ensureAlloc([1], "I32", "gatherCkvCounter");
+
     getNativeAddon().gatherTopkCkv(
       this.ctx,
       peerPtrs[0], peerPtrs[1], peerPtrs[2], peerPtrs[3],
@@ -1046,7 +1067,8 @@ export class GlmOps implements DeviceOps {
       pageIndices.data, pageIndptr.data, kvTokenIndptr.data,
       N, cpWorldSize, cpRank,
       effPs, bpt,
-      numTokens, topk,
+      numTokens, topk, paddedKvLen,
+      bitmap.data, unique.data, counter.data,
     );
   }
 

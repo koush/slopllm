@@ -65,7 +65,14 @@ def test_flat_write_single_seq(glm, device, kv_lora_rank, pe_dim):
     (512, 64),
 ])
 def test_flat_write_multi_seq(glm, device, kv_lora_rank, pe_dim):
-    """Multi-sequence flat write respects per-batch page-aligned offsets."""
+    """Multi-sequence flat write places each sequence at its TOKEN prefix sum.
+
+    Flat mode targets a gathered buffer, and both producers of one --
+    gather_pages_kernel and gather_topk_ckv -- lay sequences out by
+    de-interleaved token prefix sum. That is also what topk_to_slots emits in
+    flat mode, and therefore what sparse MLA indexes with. Page-aligned offsets
+    only agree for batch 0 and for sequences that exactly fill their pages.
+    """
     num_tiles = kv_lora_rank // 128
     bpt = kv_lora_rank + num_tiles * 4 + pe_dim * 2
 
@@ -81,6 +88,11 @@ def test_flat_write_multi_seq(glm, device, kv_lora_rank, pe_dim):
     for i, sl in enumerate(seq_lens):
         indptr[i + 1] = indptr[i] + (sl + PAGE_SIZE - 1) // PAGE_SIZE
 
+    # Flat mode (indices=None) indexes by de-interleaved TOKEN prefix sum.
+    token_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
+    for i, sl in enumerate(seq_lens):
+        token_indptr[i + 1] = token_indptr[i] + sl
+
     batch_indices = torch.zeros(nnz, dtype=torch.int32, device=device)
     positions = torch.zeros(nnz, dtype=torch.int32, device=device)
     idx = 0
@@ -91,7 +103,7 @@ def test_flat_write_multi_seq(glm, device, kv_lora_rank, pe_dim):
 
     glm.concat_and_cache_ds_mla(
         flat_cache.data_ptr(), ckv.data_ptr(), kpe.data_ptr(),
-        None, indptr.data_ptr(),
+        None, token_indptr.data_ptr(),
         batch_indices.data_ptr(), positions.data_ptr(),
         nnz, PAGE_SIZE, kv_lora_rank, pe_dim,
         kv_lora_rank, pe_dim,
@@ -103,7 +115,7 @@ def test_flat_write_multi_seq(glm, device, kv_lora_rank, pe_dim):
     idx = 0
     for b, sl in enumerate(seq_lens):
         pages_for_seq = (sl + PAGE_SIZE - 1) // PAGE_SIZE
-        seq_start_slot = int(indptr[b]) * PAGE_SIZE
+        seq_start_slot = sum(seq_lens[:b])
         for p in range(pages_for_seq):
             page_start = p * PAGE_SIZE
             n = min(PAGE_SIZE, sl - page_start)
@@ -119,11 +131,10 @@ def test_flat_write_multi_seq(glm, device, kv_lora_rank, pe_dim):
             assert torch.equal(kpe_a, kpe_r), f"seq {b} page {p}: kpe mismatch"
             idx += n
 
-        pad_start = seq_start_slot + sl
-        pad_end = seq_start_slot + pages_for_seq * PAGE_SIZE
-        if pad_end > pad_start:
-            assert (flat_cache[pad_start:pad_end] == 0).all(), \
-                f"seq {b}: padding slots should be zero"
+    # Token layout packs sequences contiguously, so there is no inter-sequence
+    # page padding -- only the tail past the last token stays untouched.
+    live = sum(seq_lens)
+    assert (flat_cache[live:] == 0).all(), "slots past the last token should be zero"
 
 
 @pytest.mark.parametrize("kv_lora_rank,pe_dim", [
@@ -220,8 +231,15 @@ def test_flat_write_vs_scattered_paged(glm, device, kv_lora_rank, pe_dim):
 @pytest.mark.parametrize("kv_lora_rank,pe_dim", [
     (512, 64),
 ])
-def test_flat_write_multi_seq_matches_paged(glm, device, kv_lora_rank, pe_dim):
-    """Multi-sequence flat write matches identity-indexed paged write."""
+def test_flat_write_multi_seq_matches_gathered(glm, device, kv_lora_rank, pe_dim):
+    """Flat write must land where gather_pages puts the same tokens.
+
+    That is the contract that matters: sparseMlaPrepareCache patches freshly
+    appended tokens into a buffer produced by gatherPages/gatherTopkCkv, so the
+    two must agree on layout. It does NOT match an identity-indexed paged write
+    for multi-sequence input -- paged layout pads each sequence out to a page
+    boundary, gathered layout packs them by token.
+    """
     num_tiles = kv_lora_rank // 128
     bpt = kv_lora_rank + num_tiles * 4 + pe_dim * 2
 
@@ -236,6 +254,11 @@ def test_flat_write_multi_seq_matches_paged(glm, device, kv_lora_rank, pe_dim):
     indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
     for i, sl in enumerate(seq_lens):
         indptr[i + 1] = indptr[i] + (sl + PAGE_SIZE - 1) // PAGE_SIZE
+
+    # Flat mode (indices=None) indexes by de-interleaved TOKEN prefix sum.
+    token_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
+    for i, sl in enumerate(seq_lens):
+        token_indptr[i + 1] = token_indptr[i] + sl
 
     batch_indices = torch.zeros(nnz, dtype=torch.int32, device=device)
     positions = torch.zeros(nnz, dtype=torch.int32, device=device)
@@ -257,13 +280,19 @@ def test_flat_write_multi_seq_matches_paged(glm, device, kv_lora_rank, pe_dim):
     flat_cache = torch.zeros(num_pages * PAGE_SIZE, bpt, dtype=torch.uint8, device=device)
     glm.concat_and_cache_ds_mla(
         flat_cache.data_ptr(), ckv.data_ptr(), kpe.data_ptr(),
-        None, indptr.data_ptr(),
+        None, token_indptr.data_ptr(),
         batch_indices.data_ptr(), positions.data_ptr(),
         nnz, PAGE_SIZE, kv_lora_rank, pe_dim,
         kv_lora_rank, pe_dim,
     )
     torch.cuda.synchronize(device)
 
-    paged_flat = paged_cache.reshape(num_pages * PAGE_SIZE, bpt)
-    assert torch.equal(paged_flat, flat_cache), \
-        "multi-seq flat write should match identity-indexed paged write"
+    last_page_len = torch.tensor(
+        [((sl - 1) % PAGE_SIZE) + 1 for sl in seq_lens], dtype=torch.int32, device=device)
+    gathered = torch.zeros(num_pages * PAGE_SIZE, bpt, dtype=torch.uint8, device=device)
+    glm.gather_pages(gathered, paged_cache, identity_indices, indptr, last_page_len,
+                     num_pages, len(seq_lens), PAGE_SIZE, bpt)
+    torch.cuda.synchronize(device)
+
+    assert torch.equal(gathered, flat_cache), \
+        "flat write must agree with gather_pages layout (token prefix sum)"

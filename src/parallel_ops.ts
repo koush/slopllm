@@ -2913,8 +2913,8 @@ export class ParallelOps implements DeviceOps {
     const pagedKV = state.cache.getPagedKV();
     const cfg = state.model.cfg as Glm51Config;
 
-    let needBarrier = true;
 
+    let hasShared = false;
     for (let i = 1; ; i++) {
       const nextCacheIdx = cacheIdx + i;
       // prefetch as many of the next layer ckv as possible
@@ -2922,13 +2922,21 @@ export class ParallelOps implements DeviceOps {
         break;
       if (cfg.indexerTypes[nextCacheIdx] !== "shared")
         break;
+      hasShared = true;
+    }
 
-      if (needBarrier) {
-        needBarrier = false;
-        this.p2pBarrier();
-      }
+    if (!hasShared)
+      return;
 
-      const nextStream = this.withStream(() => {
+    const nextStream = this.withStream(() => {
+      for (let i = 1; ; i++) {
+        const nextCacheIdx = cacheIdx + i;
+        // prefetch as many of the next layer ckv as possible
+        if (!pagedKV.ckvData[nextCacheIdx])
+          break;
+        if (cfg.indexerTypes[nextCacheIdx] !== "shared")
+          break;
+
         const nextKvCache = pagedKV.ckvData[nextCacheIdx];
 
         // Sparse topk gather: skip the full-cache deinterleave of
@@ -2952,7 +2960,7 @@ export class ParallelOps implements DeviceOps {
         const out = workspace.ensureAlloc(
           [paddedKvLen / shardPageSize, shardPageSize, BPT],
           pKvCache.type,
-          `sparseMlaPrefetch_${i}`,
+          `sparseMlaPrefetch_${nextCacheIdx}`,
         ) as ParallelTensor;
 
         this.gatherTopkCkv(
@@ -2967,10 +2975,30 @@ export class ParallelOps implements DeviceOps {
           topkCount,
           paddedKvLen,
         );
+      }
 
-        // no tensor is returned, it's a deterministically named tensor, the shared layer will know where to find it based on idx and distance from full layer.
-        // this is necessary for graph capture in split graphs.
-      });
+
+      // Cross-rank P2P fan-out barrier. Each rank's gatherTopkCkv kernel wrote
+      // BPT-byte tokens to ALL N peer output shards via P2P. Before any
+      // downstream consumer (the fixup / sparseMlaDecode run on each rank's
+      // own stream) reads its local output shard, it must observe ALL peers'
+      // writes — stream-order covers self-writes, but cross-stream peer writes
+      // need a barrier with system-scope acquire/release semantics. This is
+      // the WRITE-side mirror of the existing pre-launch p2pBarrier() in
+      // tryP2PAllGather / p2pAllGatherSmem (which syncs peer READS).
+      this.p2pBarrier();
+
+      // no tensor is returned, it's a deterministically named tensor, the shared layer will know where to find it based on idx and distance from full layer.
+      // this is necessary for graph capture in split graphs.
+    });
+
+    for (let i = 1; ; i++) {
+      const nextCacheIdx = cacheIdx + i;
+      // prefetch as many of the next layer ckv as possible
+      if (!pagedKV.ckvData[nextCacheIdx])
+        break;
+      if (cfg.indexerTypes[nextCacheIdx] !== "shared")
+        break;
 
       // the actual state is stored at the stream index.
       // always clean up before writing, the layer may not be processed due to either incorrect usage (so being defensive here)
@@ -2990,6 +3018,7 @@ export class ParallelOps implements DeviceOps {
     const pAppendKpe = this.cast(appendKpe);
     const pageSize = pKvCache.shape[1];
     const pIndptr = this.cast(indptr);
+    const pKvTokenIndptr = this.cast(state.ws.kvTokenIndptrD);
     const cfg = state.model.cfg as Glm51Config;
 
     const pagedKV = state.cache.getPagedKV();
@@ -3029,7 +3058,7 @@ export class ParallelOps implements DeviceOps {
         while (cfg.indexerTypes[cacheIdx - d] === "shared") {
           d++;
         }
-        prefetched = pIndptr.workspace.tensors.get(`sparseMlaPrefetch_${d}`) as ParallelTensor;
+        prefetched = pIndptr.workspace.tensors.get(`sparseMlaPrefetch_${cacheIdx}`) as ParallelTensor;
         if (!prefetched) {
           throw new Error(`sparseMlaPrepareCache: expected prefetched result for shared layer ${cacheIdx} (distance ${d})`);
         }
@@ -3052,9 +3081,13 @@ export class ParallelOps implements DeviceOps {
 
       for (let i = 0; i < this.worldSize; i++) {
         this.devices[i].concatAndCacheDsMla(state, cacheIdx, prefetched!.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i],
-          // prefetch tensor is flat, so no need for indices
+          // prefetch tensor is flat, so no need for indices — and in that mode
+          // the kernel indexes by kvTokenIndptr (the de-interleaved token prefix
+          // sum the gather used), NOT the page indptr. They only coincide for
+          // batch 0, so passing the page indptr corrupted the gathered buffer
+          // for every forked sequence in MTP's draft passes.
           undefined,
-          pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, pageSize, 0, 0);
+          pKvTokenIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, pageSize, 0, 0);
       }
     }
 
@@ -3360,11 +3393,22 @@ export class ParallelOps implements DeviceOps {
     // per-shard invocations every output shard holds the full topk union.
     // Per-shard GlmOps call with the FULL N-shard peer table (N=worldSize),
     // cpWorldSize=worldSize, cpRank=i, effPageSize=shardPageSize.
+    //
+    // The peer table is ROTATED by rank: rank i is handed
+    // [shard_i, shard_i+1, ..., shard_N-1, shard_0, ...]. The kernel walks its
+    // peer array in order, so unrotated every rank would target shard 0 first,
+    // shard 1 second, and so on — all N sources contending for one destination
+    // link per phase. Rotated, step t is the permutation i -> (i+t) % N, so each
+    // destination receives from exactly one source at a time. The kernel only
+    // uses the peer index to pick a destination base pointer (no self-case, no
+    // rank-derived math), so the rotation is transparent to it — cpRank is
+    // passed separately and stays the true rank for the CP ownership filter.
     for (let i = 0; i < this.worldSize; i++) {
+      const rotatedPeers = [...pOut.shards.slice(i), ...pOut.shards.slice(0, i)];
       this.devices[i].gatherTopkCkv(
         state,
         pKvCache.shards[i],
-        pOut.shards,
+        rotatedPeers,
         pTopkIdx.shards[i],
         pPageIndices.shards[i], pPageIndptr.shards[i],
         pKvTokenIndptr.shards[i], pBatchIndices.shards[i],
@@ -3373,15 +3417,6 @@ export class ParallelOps implements DeviceOps {
       );
     }
 
-    // Cross-rank P2P fan-out barrier. Each rank's gatherTopkCkv kernel wrote
-    // BPT-byte tokens to ALL N peer output shards via P2P. Before any
-    // downstream consumer (the fixup / sparseMlaDecode run on each rank's
-    // own stream) reads its local output shard, it must observe ALL peers'
-    // writes — stream-order covers self-writes, but cross-stream peer writes
-    // need a barrier with system-scope acquire/release semantics. This is
-    // the WRITE-side mirror of the existing pre-launch p2pBarrier() in
-    // tryP2PAllGather / p2pAllGatherSmem (which syncs peer READS).
-    this.p2pBarrier();
   }
 
   indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void {

@@ -261,7 +261,8 @@ class GlmOps:
             + [ctypes.c_void_p] * 5                              # topk_idx, batch_indices, page_indices, page_indptr, kv_token_indptr
             + [ctypes.c_int, ctypes.c_int, ctypes.c_int]         # N, cp_world_size, cp_rank
             + [ctypes.c_int, ctypes.c_int]                       # eff_page_size, bpt_bytes
-            + [ctypes.c_int, ctypes.c_int]                       # num_tokens, topk
+            + [ctypes.c_int, ctypes.c_int, ctypes.c_int]         # num_tokens, topk, padded_kv_len
+            + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]  # scratch bitmap, unique, counter
         )
 
         self.lib.glm_topk_from_scores.restype = None
@@ -1299,7 +1300,8 @@ class GlmOps:
                         page_indices, page_indptr, kv_token_indptr,
                         N, cp_world_size, cp_rank,
                         eff_page_size, bpt_bytes,
-                        num_tokens, topk):
+                        num_tokens, topk, padded_kv_len,
+                        scratch_bitmap=0, scratch_unique=0, scratch_counter=0):
         """Sparse topk-driven gather of BPT-byte CKV tokens from a rank's
         local paged cache into flat-format output buffer(s). Same kernel body
         for two call shapes:
@@ -1344,6 +1346,9 @@ class GlmOps:
         eff_page_size:    page_size / cp_world_size (or == page_size non-CP).
         bpt_bytes:        bytes per token (prod: 656). Must be mult of 16 for
                           vectorized path; non-multiples use byte-tail.
+        padded_kv_len:    total flat slot capacity of each output buffer. Only
+                          used to size the dedup bitmap (num_tokens > 1);
+                          every flat_slot must be < padded_kv_len.
         """
         if len(flat_ptrs) > 8:
             raise ValueError(f"flat_ptrs: max 8 peers, got {len(flat_ptrs)}")
@@ -1361,6 +1366,8 @@ class GlmOps:
             ctypes.c_int(N), ctypes.c_int(cp_world_size), ctypes.c_int(cp_rank),
             ctypes.c_int(eff_page_size), ctypes.c_int(bpt_bytes),
             ctypes.c_int(num_tokens), ctypes.c_int(topk),
+            ctypes.c_int(padded_kv_len),
+            self._ptr(scratch_bitmap), self._ptr(scratch_unique), self._ptr(scratch_counter),
         )
 
     def topk_from_scores(self, out_idx, scores, row_len, hist, meta,

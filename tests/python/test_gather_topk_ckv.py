@@ -35,6 +35,23 @@ PE_DIM = 64
 BPT = KV_LORA_RANK + NUM_TILES * 4 + PE_DIM * 2   # 656
 
 
+
+def _alloc_scratch(device, padded_kv_len, num_tokens, topk):
+    """Dedup scratch, owned by the caller (mirrors what GlmOps allocates from the
+    TS workspace). Returned as a dict of kwargs plus the tensors themselves, which
+    must stay alive for the duration of the call."""
+    bitmap_words = (padded_kv_len + 31) // 32
+    max_entries = num_tokens * topk
+    bitmap = torch.zeros(bitmap_words, dtype=torch.int32, device=device)
+    unique = torch.zeros(max_entries * 2, dtype=torch.int32, device=device)
+    counter = torch.zeros(1, dtype=torch.int32, device=device)
+    return bitmap, unique, counter, dict(
+        scratch_bitmap=bitmap.data_ptr(),
+        scratch_unique=unique.data_ptr(),
+        scratch_counter=counter.data_ptr(),
+    )
+
+
 def _build_global_page_table(seq_lens, page_size, start_page_id=0):
     page_indices = []
     page_indptr = [0]
@@ -136,6 +153,7 @@ def test_gather_topk_ckv_local_mirror_non_cp(glm, device):
     page_indptr_t = torch.from_numpy(page_indptr).to(device)
     kv_token_indptr_t = torch.from_numpy(kv_token_indptr).to(device)
 
+    _sb, _su, _sc, _scratch = _alloc_scratch(device, total_tokens, num_tokens, topk)
     glm.gather_topk_ckv(
         flat_ptrs=[flat_buf.data_ptr()],
         local_kv_cache=local_kv.data_ptr(),
@@ -146,7 +164,7 @@ def test_gather_topk_ckv_local_mirror_non_cp(glm, device):
         kv_token_indptr=kv_token_indptr_t.data_ptr(),
         N=1, cp_world_size=cp_world_size, cp_rank=cp_rank,
         eff_page_size=eff_page_size, bpt_bytes=BPT,
-        num_tokens=num_tokens, topk=topk,
+        num_tokens=num_tokens, topk=topk, padded_kv_len=total_tokens, **_scratch,
     )
     torch.cuda.synchronize(device)
 
@@ -229,6 +247,7 @@ def test_gather_topk_ckv_multi_rank_fanout(glm, device, cp_world_size, num_seqs)
     kv_token_indptr_t = torch.from_numpy(kv_token_indptr).to(device)
 
     for rank in range(cp_world_size):
+        _sb, _su, _sc, _scratch = _alloc_scratch(device, total_tokens, num_tokens, topk)
         glm.gather_topk_ckv(
             flat_ptrs=[b.data_ptr() for b in flat_bufs],
             local_kv_cache=per_rank_local_kv[rank].data_ptr(),
@@ -239,7 +258,7 @@ def test_gather_topk_ckv_multi_rank_fanout(glm, device, cp_world_size, num_seqs)
             kv_token_indptr=kv_token_indptr_t.data_ptr(),
             N=cp_world_size, cp_world_size=cp_world_size, cp_rank=rank,
             eff_page_size=eff_page_size, bpt_bytes=BPT,
-            num_tokens=num_tokens, topk=topk,
+            num_tokens=num_tokens, topk=topk, padded_kv_len=total_tokens, **_scratch,
         )
     torch.cuda.synchronize(device)
 
@@ -325,6 +344,7 @@ def test_gather_topk_ckv_arbitrary_pointers_eight_peers(glm, device):
     page_indptr_t = torch.from_numpy(page_indptr).to(device)
     kv_token_indptr_t = torch.from_numpy(kv_token_indptr).to(device)
 
+    _sb, _su, _sc, _scratch = _alloc_scratch(device, total_tokens, num_tokens, topk)
     glm.gather_topk_ckv(
         flat_ptrs=[b.data_ptr() for b in flat_bufs],
         local_kv_cache=local_kv.data_ptr(),
@@ -335,7 +355,7 @@ def test_gather_topk_ckv_arbitrary_pointers_eight_peers(glm, device):
         kv_token_indptr=kv_token_indptr_t.data_ptr(),
         N=N, cp_world_size=cp_world_size, cp_rank=cp_rank,
         eff_page_size=eff_page_size, bpt_bytes=BPT,
-        num_tokens=num_tokens, topk=topk,
+        num_tokens=num_tokens, topk=topk, padded_kv_len=total_tokens, **_scratch,
     )
     torch.cuda.synchronize(device)
 
@@ -436,6 +456,7 @@ def test_gather_topk_ckv_matches_gather_pages_on_topk_subset(glm, device):
     batch_indices = torch.from_numpy(batch_indices_np).to(device)
     kv_token_indptr_t = torch.from_numpy(kv_token_indptr).to(device)
 
+    _sb, _su, _sc, _scratch = _alloc_scratch(device, total_tokens, num_tokens, topk)
     glm.gather_topk_ckv(
         flat_ptrs=[sparse.data_ptr()],
         local_kv_cache=kv_cache_3d.data_ptr(),
@@ -446,7 +467,7 @@ def test_gather_topk_ckv_matches_gather_pages_on_topk_subset(glm, device):
         kv_token_indptr=kv_token_indptr_t.data_ptr(),
         N=1, cp_world_size=0, cp_rank=0,
         eff_page_size=PAGE_SIZE, bpt_bytes=BPT,
-        num_tokens=num_tokens, topk=topk,
+        num_tokens=num_tokens, topk=topk, padded_kv_len=total_tokens, **_scratch,
     )
     torch.cuda.synchronize(device)
 
@@ -476,4 +497,180 @@ def test_gather_topk_ckv_matches_gather_pages_on_topk_subset(glm, device):
     for s in list(non_topk)[:50]:
         assert (sparse_np[s] == sentinel).all(), (
             f"non-topk slot {s} was overwritten; expected sentinel 0x{sentinel:02x}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dedup path (num_tokens > 1): the mark/compact kernels collapse duplicate
+# flat_slots so each unique token is fanned out once instead of once per query
+# that selected it. Two properties matter and neither is covered above:
+#
+#   1. Heavy duplication across queries still produces every selected token.
+#   2. The bitmap is restored between calls. It is zeroed once at allocation
+#      and thereafter cleared by the fanout kernel, so a stale bit would make a
+#      later call silently drop that slot. Only repeated invocation catches it.
+# ---------------------------------------------------------------------------
+def test_gather_topk_ckv_dedup_identical_rows_repeated_calls(glm, device):
+    """All queries select the SAME topk set — the maximal-duplication case that
+    MTP verification produces. Runs the gather three times over a re-primed
+    buffer; every call must reproduce the full result."""
+    torch.manual_seed(7)
+    seq_lens = [100]
+    page_indices, page_indptr, _, next_page = _build_global_page_table(seq_lens, PAGE_SIZE)
+    max_pages = next_page + 4
+    eff_page_size = PAGE_SIZE
+    cp_world_size = 0
+    cp_rank = 0
+    total_tokens = seq_lens[0]
+    kv_token_indptr = np.cumsum([0] + seq_lens).astype(np.int32)
+
+    local_kv_np = np.zeros((max_pages * eff_page_size, BPT), dtype=np.uint8)
+    expected = {}
+    for pos in range(seq_lens[0]):
+        slot, abs_page, off = _local_slot(cp_rank, page_indices, page_indptr, 0, pos,
+                                          cp_world_size, eff_page_size)
+        local_kv_np[slot] = _token_bytes(cp_rank, abs_page, off, BPT)
+        expected[pos] = local_kv_np[slot].copy()
+    local_kv = torch.from_numpy(local_kv_np).to(device)
+
+    topk = 32
+    num_tokens = 4
+    # One row of distinct positions, replicated across all queries: every entry
+    # beyond the first row is a duplicate, so 128 entries collapse to 32.
+    row = np.random.choice(seq_lens[0], size=topk, replace=False).astype(np.int32)
+    topk_idx_np = np.tile(row, (num_tokens, 1))
+    batch_indices_np = np.zeros(num_tokens, dtype=np.int32)
+    topk_flat_np = _to_flat_slots(topk_idx_np, batch_indices_np, kv_token_indptr)
+
+    topk_idx = torch.from_numpy(topk_flat_np).to(device)
+    batch_indices = torch.from_numpy(batch_indices_np).to(device)
+    page_indices_t = torch.from_numpy(page_indices).to(device)
+    page_indptr_t = torch.from_numpy(page_indptr).to(device)
+    kv_token_indptr_t = torch.from_numpy(kv_token_indptr).to(device)
+
+    selected = set(int(p) for p in row)
+    # Scratch is deliberately REUSED across the three calls and is pre-dirtied
+    # below, mirroring the workspace recycler handing back an arbitrary block.
+    # The kernel must clear it on entry; a stale bitmap bit would silently drop
+    # that slot on calls 2 and 3.
+    _sb, _su, _sc, _scratch = _alloc_scratch(device, total_tokens, num_tokens, topk)
+    for call in range(3):
+        _sb.fill_(-1); _sc.fill_(12345)   # dirty the scratch before every call
+        sentinel = 0xD0 + call
+        flat_buf = torch.full((total_tokens, BPT), sentinel, dtype=torch.uint8, device=device)
+        glm.gather_topk_ckv(
+            flat_ptrs=[flat_buf.data_ptr()],
+            local_kv_cache=local_kv.data_ptr(),
+            topk_idx=topk_idx.data_ptr(),
+            batch_indices=batch_indices.data_ptr(),
+            page_indices=page_indices_t.data_ptr(),
+            page_indptr=page_indptr_t.data_ptr(),
+            kv_token_indptr=kv_token_indptr_t.data_ptr(),
+            N=1, cp_world_size=cp_world_size, cp_rank=cp_rank,
+            eff_page_size=eff_page_size, bpt_bytes=BPT,
+            num_tokens=num_tokens, topk=topk, padded_kv_len=total_tokens, **_scratch,
+        )
+        torch.cuda.synchronize(device)
+        flat_np = flat_buf.cpu().numpy()
+
+        for pos in sorted(selected):
+            assert np.array_equal(flat_np[pos], expected[pos]), (
+                f"call {call}: selected slot {pos} not written "
+                f"(stale bitmap bit would drop it)\n"
+                f" got     [:16]={flat_np[pos][:16]}\n"
+                f" expected[:16]={expected[pos][:16]}"
+            )
+        for pos in range(total_tokens):
+            if pos not in selected:
+                assert (flat_np[pos] == sentinel).all(), (
+                    f"call {call}: unselected slot {pos} was overwritten"
+                )
+
+
+def test_gather_topk_ckv_dedup_matches_non_dedup_multi_rank(glm, device):
+    """The dedup path (num_tokens > 1) must agree byte-for-byte with the
+    single-query path (num_tokens == 1) run once per query row, under CP fan-out
+    with duplicate slots across rows."""
+    torch.manual_seed(11)
+    cp_world_size = 4
+    seq_lens = [70, 45]
+    eff_page_size = PAGE_SIZE // cp_world_size
+    page_indices, page_indptr, _, next_page = _build_global_page_table(
+        [(_l + cp_world_size - 1) // cp_world_size for _l in seq_lens], eff_page_size)
+    max_pages = next_page + 4
+    total_tokens = sum(seq_lens)
+    kv_token_indptr = np.cumsum([0] + seq_lens).astype(np.int32)
+
+    per_rank_local_kv = []
+    for rank in range(cp_world_size):
+        buf_np = np.zeros((max_pages * eff_page_size, BPT), dtype=np.uint8)
+        for seq, slen in enumerate(seq_lens):
+            for pos in range(slen):
+                if _expected_rank(pos, cp_world_size) != rank:
+                    continue
+                slot, abs_page, off = _local_slot(rank, page_indices, page_indptr, seq,
+                                                  pos, cp_world_size, eff_page_size)
+                buf_np[slot] = _token_bytes(rank, abs_page, off, BPT)
+        per_rank_local_kv.append(torch.from_numpy(np.ascontiguousarray(buf_np)).to(device))
+
+    topk = 16
+    num_tokens = 6
+    topk_idx_np = np.empty((num_tokens, topk), dtype=np.int32)
+    batch_indices_np = np.empty(num_tokens, dtype=np.int32)
+    for t in range(num_tokens):
+        batch_indices_np[t] = t % len(seq_lens)
+    # Rows sharing a sequence get the SAME positions, so they duplicate.
+    per_seq_rows = {}
+    for seq in range(len(seq_lens)):
+        per_seq_rows[seq] = np.random.choice(seq_lens[seq], size=topk, replace=False)
+    for t in range(num_tokens):
+        topk_idx_np[t] = per_seq_rows[int(batch_indices_np[t])]
+
+    topk_flat_np = _to_flat_slots(topk_idx_np, batch_indices_np, kv_token_indptr)
+    page_indices_t = torch.from_numpy(page_indices).to(device)
+    page_indptr_t = torch.from_numpy(page_indptr).to(device)
+    kv_token_indptr_t = torch.from_numpy(kv_token_indptr).to(device)
+    batch_indices = torch.from_numpy(batch_indices_np).to(device)
+    topk_idx = torch.from_numpy(topk_flat_np).to(device)
+
+    sentinel = 0x5A
+
+    def run(nt, rows_topk_idx, rows_batch_indices):
+        bufs = [torch.full((total_tokens, BPT), sentinel, dtype=torch.uint8, device=device)
+                for _ in range(cp_world_size)]
+        ptrs = [b.data_ptr() for b in bufs]
+        for rank in range(cp_world_size):
+            _sb, _su, _sc, _scratch = _alloc_scratch(device, total_tokens, num_tokens, topk)
+            glm.gather_topk_ckv(
+                flat_ptrs=ptrs,
+                local_kv_cache=per_rank_local_kv[rank].data_ptr(),
+                topk_idx=rows_topk_idx.data_ptr(),
+                batch_indices=rows_batch_indices.data_ptr(),
+                page_indices=page_indices_t.data_ptr(),
+                page_indptr=page_indptr_t.data_ptr(),
+                kv_token_indptr=kv_token_indptr_t.data_ptr(),
+                N=cp_world_size, cp_world_size=cp_world_size, cp_rank=rank,
+                eff_page_size=eff_page_size, bpt_bytes=BPT,
+                num_tokens=nt, topk=topk, padded_kv_len=total_tokens, **_scratch,
+            )
+        torch.cuda.synchronize(device)
+        return [b.cpu().numpy() for b in bufs]
+
+    dedup = run(num_tokens, topk_idx, batch_indices)
+
+    # Reference: same work driven one query row at a time, which takes the
+    # num_tokens == 1 path and never deduplicates. Accumulate into one buffer
+    # set by replaying every row against the same destination.
+    ref = [np.full((total_tokens, BPT), sentinel, dtype=np.uint8) for _ in range(cp_world_size)]
+    for t in range(num_tokens):
+        row_idx = torch.from_numpy(np.ascontiguousarray(topk_flat_np[t:t + 1])).to(device)
+        row_bi = torch.from_numpy(np.ascontiguousarray(batch_indices_np[t:t + 1])).to(device)
+        got = run(1, row_idx, row_bi)
+        for j in range(cp_world_size):
+            written = (got[j] != sentinel).any(axis=1)
+            ref[j][written] = got[j][written]
+
+    for j in range(cp_world_size):
+        assert np.array_equal(dedup[j], ref[j]), (
+            f"peer {j}: dedup path disagrees with per-row non-dedup reference"
         )

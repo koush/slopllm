@@ -800,7 +800,8 @@ void glm_gather_topk_ckv(
     int32_t* page_indices, int32_t* page_indptr, int32_t* kv_token_indptr,
     int N, int cp_world_size, int cp_rank,
     int eff_page_size, int bpt_bytes,
-    int num_tokens, int topk);
+    int num_tokens, int topk, int padded_kv_len,
+    void* scratch_bitmap, void* scratch_unique, void* scratch_counter);
 
 // CUDA Graph operations
 void glm_graph_begin_capture(GlmCtx* ctx);

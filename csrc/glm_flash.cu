@@ -1097,7 +1097,13 @@ __global__ void concat_and_cache_ds_mla_kernel(
 
     size_t slot;
     if (indices == nullptr) {
-        slot = (size_t)indptr[batch] * eff_page_size + pos;
+        // Flat (gathered) destination: the buffer is indexed by the SAME flat
+        // slot the gather wrote and sparse MLA reads, i.e. a de-interleaved
+        // TOKEN prefix sum. `indptr` is therefore kv_token_indptr in this mode,
+        // not the page indptr — scaling by eff_page_size here would only agree
+        // for batch 0, and silently corrupt gathered history for every forked
+        // sequence (MTP's draft passes).
+        slot = (size_t)indptr[batch] + pos;
     } else {
         const int page_in_seq = pos / eff_page_size;
         const int offset_in_page = pos % eff_page_size;

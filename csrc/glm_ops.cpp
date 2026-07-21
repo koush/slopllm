@@ -3176,8 +3176,8 @@ static Napi::Value SparseMlaDecode(const Napi::CallbackInfo& info) {
 
 static Napi::Value GatherTopkCkv(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 22) {
-        Napi::TypeError::New(env, "Expected 22 args (ctx, flat_p0..p7, local_kv_cache, topk_idx, batch_indices, page_indices, page_indptr, kv_token_indptr, N, cp_world_size, cp_rank, eff_page_size, bpt_bytes, num_tokens, topk)").ThrowAsJavaScriptException();
+    if (info.Length() < 26) {
+        Napi::TypeError::New(env, "Expected 26 args (ctx, flat_p0..p7, local_kv_cache, topk_idx, batch_indices, page_indices, page_indptr, kv_token_indptr, N, cp_world_size, cp_rank, eff_page_size, bpt_bytes, num_tokens, topk, padded_kv_len, scratch_bitmap, scratch_unique, scratch_counter)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -3198,6 +3198,10 @@ static Napi::Value GatherTopkCkv(const Napi::CallbackInfo& info) {
     int bpt_bytes = info[19].As<Napi::Number>().Int32Value();
     int num_tokens = info[20].As<Napi::Number>().Int32Value();
     int topk = info[21].As<Napi::Number>().Int32Value();
+    int padded_kv_len = info[22].As<Napi::Number>().Int32Value();
+    uintptr_t scratch_bitmap_ptr = info[23].As<Napi::Number>().Int64Value();
+    uintptr_t scratch_unique_ptr = info[24].As<Napi::Number>().Int64Value();
+    uintptr_t scratch_counter_ptr = info[25].As<Napi::Number>().Int64Value();
     glm_gather_topk_ckv(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(flat_p[0]), reinterpret_cast<void*>(flat_p[1]),
@@ -3212,7 +3216,10 @@ static Napi::Value GatherTopkCkv(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(kv_token_indptr_ptr),
         N, cp_world_size, cp_rank,
         eff_page_size, bpt_bytes,
-        num_tokens, topk);
+        num_tokens, topk, padded_kv_len,
+        reinterpret_cast<void*>(scratch_bitmap_ptr),
+        reinterpret_cast<void*>(scratch_unique_ptr),
+        reinterpret_cast<void*>(scratch_counter_ptr));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("gatherTopkCkv failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
