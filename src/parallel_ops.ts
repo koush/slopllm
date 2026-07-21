@@ -2567,8 +2567,8 @@ export class ParallelOps implements DeviceOps {
         }
       },
       streamWaitEvent: () => {
-        if (disposed)
-          return;
+        // if (disposed)
+        //   return;
         for (let i = 0; i < this.devices.length; i++) {
           this.devices[i].streamWaitEvent(this.devices[i].currentStream, streams[i]!);
         }
@@ -2913,28 +2913,30 @@ export class ParallelOps implements DeviceOps {
     const pagedKV = state.cache.getPagedKV();
     const cfg = state.model.cfg as Glm51Config;
 
+    // set to 0 to include the full layer
+    const startIndex = 1;
 
-    let hasShared = false;
-    for (let i = 1; ; i++) {
+    let isSparseGathering = false;
+    for (let i = startIndex; ; i++) {
       const nextCacheIdx = cacheIdx + i;
       // prefetch as many of the next layer ckv as possible
       if (!pagedKV.ckvData[nextCacheIdx])
         break;
-      if (cfg.indexerTypes[nextCacheIdx] !== "shared")
+      if (i !== 0 && cfg.indexerTypes[nextCacheIdx] !== "shared")
         break;
-      hasShared = true;
+      isSparseGathering = true;
     }
 
-    if (!hasShared)
+    if (!isSparseGathering)
       return;
 
     const nextStream = this.withStream(() => {
-      for (let i = 1; ; i++) {
+      for (let i = startIndex; ; i++) {
         const nextCacheIdx = cacheIdx + i;
         // prefetch as many of the next layer ckv as possible
         if (!pagedKV.ckvData[nextCacheIdx])
           break;
-        if (cfg.indexerTypes[nextCacheIdx] !== "shared")
+        if (i !== 0 && cfg.indexerTypes[nextCacheIdx] !== "shared")
           break;
 
         const nextKvCache = pagedKV.ckvData[nextCacheIdx];
@@ -2986,18 +2988,18 @@ export class ParallelOps implements DeviceOps {
       // need a barrier with system-scope acquire/release semantics. This is
       // the WRITE-side mirror of the existing pre-launch p2pBarrier() in
       // tryP2PAllGather / p2pAllGatherSmem (which syncs peer READS).
-      this.p2pBarrier();
+      // this.p2pBarrier();
 
       // no tensor is returned, it's a deterministically named tensor, the shared layer will know where to find it based on idx and distance from full layer.
       // this is necessary for graph capture in split graphs.
     });
 
-    for (let i = 1; ; i++) {
+    for (let i = startIndex; ; i++) {
       const nextCacheIdx = cacheIdx + i;
       // prefetch as many of the next layer ckv as possible
       if (!pagedKV.ckvData[nextCacheIdx])
         break;
-      if (cfg.indexerTypes[nextCacheIdx] !== "shared")
+      if (i !== 0 && cfg.indexerTypes[nextCacheIdx] !== "shared")
         break;
 
       // the actual state is stored at the stream index.
@@ -3524,11 +3526,13 @@ export class ParallelOps implements DeviceOps {
 
     const topkSlots = this.wrapShards(topkIdx.workspace, slotShards, [totalQ, topk], "I32", TensorParallelism.Replicated);
 
-    if (this.shouldGatherKv(state, true)) {
-      this.sparseMlaPrepareSharedSlotsCache(state, cacheIdx, kvCache, topkSlots, pPageIndices, pIndptr, pBatchIndices);
-    }
-
     return topkSlots;
+  }
+
+  slotsReady(state: ExecutionState, topkIdx: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, cacheIdx: number, kvCache: Tensor) {
+    if (this.shouldGatherKv(state, true)) {
+      this.sparseMlaPrepareSharedSlotsCache(state, cacheIdx, kvCache, topkIdx, pageIndices, indptr, batchIndices);
+    }
   }
 
   private graphHandles: (number | undefined)[][] = [];

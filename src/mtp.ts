@@ -455,11 +455,9 @@ export function mtpTreeDecode(
 
     hiddenStateStaging.memcpy(hiddenStates, undefined, MemcpyKind.DeviceToDevice);
 
-    if (capturing) {
-      for (const extra of ws.extras.values()) {
-        using _extra = extra;
-        extra.streamWaitEvent?.();
-      }
+    for (const extra of ws.extras.values()) {
+      using _extra = extra;
+      extra.streamWaitEvent?.();
     }
 
     return { kvCacheLayers, indexerKvCacheLayers };

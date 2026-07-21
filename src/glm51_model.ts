@@ -472,61 +472,57 @@ export class Glm51Model extends ChatModel {
         state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
       });
 
-    using q = this.glm.withStream(() => {
-      using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
-      using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
+    using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
+    using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
 
-      // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
-      // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
-      using idxQStream = (cfg.indexHeadDim === 0 || (cfg.indexerTypes[layerIdx] === "shared" && sharedSlots.value))
-        ? undefined
-        : this.glm.withStream(() => {
-          const idxNHeads = cfg.indexNHeads;
-          const idxHeadDim = cfg.indexHeadDim;
-          const idxTopk = cfg.indexTopk;
+    // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
+    // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
+    using idxQStream = (cfg.indexHeadDim === 0 || (cfg.indexerTypes[layerIdx] === "shared" && sharedSlots.value))
+      ? undefined
+      : this.glm.withStream(() => {
+        const idxNHeads = cfg.indexNHeads;
+        const idxHeadDim = cfg.indexHeadDim;
+        const idxTopk = cfg.indexTopk;
 
-          using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!);
-          idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
+        using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!);
+        idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
 
-          using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!);
-          using idxQ = idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
+        using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!);
+        using idxQ = idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
 
-          kvcacheIndex?.streamWaitEvent();
+        kvcacheIndex?.streamWaitEvent();
 
-          const slots = state.indexerTopkSlots(
-            idxQ, layerIdx, idxWeights,
-            Math.pow(idxHeadDim, -0.5), idxTopk,
-          );
-          sharedSlots.replace(slots);
-        });
-
-      using qPeR = this.glm.withStream(() => {
-        using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!);
-        return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
+        const slots = state.indexerTopkSlots(
+          idxQ, layerIdx, idxWeights,
+          Math.pow(idxHeadDim, -0.5), idxTopk,
+        );
+        sharedSlots.replace(slots);
       });
 
-      using qAbsorbedRStream = this.glm.withStream(() => {
-        using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!);
-        return state.isDecode
-          ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
-          : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-      });
-
-      qAbsorbedRStream.streamWaitEvent();
-      qPeR.streamWaitEvent();
-      idxQStream?.streamWaitEvent();
-
-      return {
-        qAbsorbedR: qAbsorbedRStream.result,
-        qPeR: qPeR.result,
-      }
+    using qPeRStream = this.glm.withStream(() => {
+      using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!);
+      return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
     });
 
-    kvcache.streamWaitEvent();
-    q.streamWaitEvent();
+    using qAbsorbedRStream = this.glm.withStream(() => {
+      using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!);
+      return state.isDecode
+        ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
+        : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
+    });
 
-    using qAbsorbedR = q.result.qAbsorbedR;
-    using qPeR = q.result.qPeR;
+    if (idxQStream) {
+      idxQStream?.streamWaitEvent();
+      state.slotsReady(layerIdx, sharedSlots.value);
+    }
+
+    qAbsorbedRStream.streamWaitEvent();
+    qPeRStream.streamWaitEvent();
+    kvcache.streamWaitEvent();
+
+
+    using qAbsorbedR = qAbsorbedRStream.result;
+    using qPeR = qPeRStream.result;
     using ckv = kvcache.result;
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);

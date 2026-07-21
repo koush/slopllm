@@ -164,6 +164,16 @@ export class ExecutionState {
     );
   }
 
+  slotsReady(cacheIdx: number, topkIdx: Tensor) {
+    const pagedKV = this.cache.getPagedKV();
+    this.ws.glm.slotsReady!(
+      this,
+      topkIdx,
+      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices,
+      cacheIdx, pagedKV.ckvData[cacheIdx],
+    );
+  }
+
   denseMla(qNope: Tensor, qPe: Tensor, cacheIdx: number, smScale: number): { o: Tensor, lse: Tensor } {
     if (this.isDecode) {
       return this.ws.mlaDecodePaged(this, qNope, qPe, cacheIdx, smScale);
@@ -223,7 +233,7 @@ export class ExecutionState {
   // Stable identity of a captured graph, known before execution. Padded dims
   // are NOT included here; they are appended to the effective key only once the
   // graph has been learned to size its buffers by them (see CaptureManager).
-  private baseKeyParams(providedKeyParams: (string|number)[]): (string|number)[] {
+  private baseKeyParams(providedKeyParams: (string | number)[]): (string | number)[] {
     return [...(providedKeyParams ?? []), `batchSize:${this.batchSize}`, `totalTokens:${this.totalTokens}`];
   }
 
@@ -231,14 +241,14 @@ export class ExecutionState {
   // to be variant in. Length-invariant graphs collapse all KV-length buckets to
   // a single key (capture once, replay always); variant graphs (e.g. the CP
   // CKV-gather prefill) get a distinct key per bucket.
-  private effectiveKeyParams(captureManager: CaptureManager, providedKeyParams: (string|number)[]): (string|number)[] {
+  private effectiveKeyParams(captureManager: CaptureManager, providedKeyParams: (string | number)[]): (string | number)[] {
     const keyParams = this.baseKeyParams(providedKeyParams);
     const variant = captureManager.getLengthVariant(keyParams.join(","));
     if (variant.kvLen) keyParams.push(`paddedKvLen:${this.paddedKvLen}`);
     return keyParams;
   }
 
-  isCaptured(captureManager: CaptureManager, providedKeyParams: (string|number)[]): boolean {
+  isCaptured(captureManager: CaptureManager, providedKeyParams: (string | number)[]): boolean {
     return captureManager.isCaptured(this.effectiveKeyParams(captureManager, providedKeyParams));
   }
 
@@ -247,7 +257,7 @@ export class ExecutionState {
     return this.paddedKvLen;
   }
 
-  capture<T>(captureManager: CaptureManager, fn: (capturing: boolean) => T, providedKeyParams: (string|number)[]): T {
+  capture<T>(captureManager: CaptureManager, fn: (capturing: boolean) => T, providedKeyParams: (string | number)[]): T {
     const baseKey = this.baseKeyParams(providedKeyParams).join(",");
     const keyParams = this.effectiveKeyParams(captureManager, providedKeyParams);
     return captureManager.run(capturing => {
