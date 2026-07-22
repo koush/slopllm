@@ -62,7 +62,15 @@ export interface DeviceOps {
 
   sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor };
   sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor };
-  slotsReady?(state: ExecutionState, topkIdx: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, cacheIdx: number, kvCache: Tensor): Disposable  & { result: void, streamWaitEvent(): void, synchronize(): void };
+  // Populates the group slot cache and (decode sparse-gather) fans out CKV, on a
+  // background stream. result is the group's { slots, length } (stored into
+  // state.sharedSlots / sharedSlotsLength by the caller), or undefined when no
+  // shared group follows this full layer.
+  slotsReady?(state: ExecutionState, topkIdx: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, cacheIdx: number, kvCache: Tensor): (Disposable & { result: { slots: Tensor, length: Tensor }, streamWaitEvent(): void, synchronize(): void }) | undefined;
+
+  // Whether layer `cacheIdx` (a full layer) reads the same slot format as its
+  // shared group and can reuse the cache. CP-only; absent on non-CP ops.
+  fullLayerReusesGroup?(state: ExecutionState, cacheIdx: number): boolean;
 
   gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, paddedKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor;
   // Sparse topk-driven P2P gather of packed CKV tokens into the caller-provided

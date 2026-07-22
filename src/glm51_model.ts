@@ -413,7 +413,7 @@ export class Glm51Model extends ChatModel {
     return result.reshape([BS, hs]);
   }
 
-  private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState, sharedTopk: UsingHolder<Tensor>): { normed: Tensor, residual: Tensor } {
+  private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const nHeads = cfg.numAttentionHeads;
     const kvLoraRank = cfg.kvLoraRank;
@@ -444,7 +444,7 @@ export class Glm51Model extends ChatModel {
 
     // Indexer K: wk(normed) → layernorm → split → RoPE → concat → append to kData
     // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
-    using kvcacheIndex = (cfg.indexHeadDim === 0 || (cfg.indexerTypes[layerIdx] === "shared" && sharedTopk.value))
+    using kvcacheIndex = (cfg.indexHeadDim === 0 || cfg.indexerTypes[layerIdx] === "shared")
       ? undefined
       : this.glm.withStream(() => {
         const idxRopeDim = qkRopeDim;
@@ -472,7 +472,7 @@ export class Glm51Model extends ChatModel {
 
     // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
     // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
-    using idxQStream = (cfg.indexHeadDim === 0 || (cfg.indexerTypes[layerIdx] === "shared" && sharedTopk.value))
+    using idxQStream = (cfg.indexHeadDim === 0 || cfg.indexerTypes[layerIdx] === "shared")
       ? undefined
       : this.glm.withStream(() => {
         const idxNHeads = cfg.indexNHeads;
@@ -489,11 +489,10 @@ export class Glm51Model extends ChatModel {
 
         // Store the raw indexer top-k (token positions); slots are derived
         // per-layer/per-mode below and in the gather (slotsReady).
-        const topkIdx = state.indexerTopk(
+        return state.indexerTopk(
           idxQ, layerIdx, idxWeights,
           Math.pow(idxHeadDim, -0.5), idxTopk,
         );
-        sharedTopk.replace(topkIdx);
       });
 
     using qPeRStream = this.glm.withStream(() => {
@@ -509,7 +508,20 @@ export class Glm51Model extends ChatModel {
     });
 
     idxQStream?.streamWaitEvent();
-    using slotsReadyStream = idxQStream ? state.slotsReady(layerIdx, sharedTopk.value) : undefined;
+    using topk = idxQStream?.result;
+    // Full layers populate the group slot cache (state.sharedSlots /
+    // sharedSlotsLength) on a background stream + gather (decode sparse-gather).
+    using slotsReadyStream = topk ? state.slotsReady(layerIdx, topk) : undefined;
+    // This layer's { slots, length }: a full layer reusing the group format joins
+    // the cache stream and returns its viewClone; a full layer with a divergent
+    // format (decode paged) computes its own; a shared layer (no topk) reuses the
+    // cache the previous full layer populated. undefined only in the dense path
+    // (no sparse indexer). Issued before the q/kvcache joins so it overlaps them.
+    const sparse = (topk || state.sharedSlots?.value)
+      ? state.topkSlots(layerIdx, topk, slotsReadyStream)
+      : undefined;
+    using _slots = sparse?.slots;
+    using _length = sparse?.length;
 
     qAbsorbedRStream.streamWaitEvent();
     qPeRStream.streamWaitEvent();
@@ -520,14 +532,6 @@ export class Glm51Model extends ChatModel {
     using qPeR = qPeRStream.result;
     using ckv = kvcache.result;
 
-    // Derive THIS layer's physical slots from the reused raw top-k. The ops
-    // layer picks the addressing its CKV buffer needs (flat/paged) from the
-    // layer index; the model stays mode-agnostic. Regenerated per layer — cheap
-    // (a slot remap), unlike the indexer.
-    using slots = sharedTopk.value
-      ? state.topkSlots(layerIdx, sharedTopk.value)
-      : undefined;
-
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     {
       let attnOut: Tensor;
@@ -535,13 +539,13 @@ export class Glm51Model extends ChatModel {
 
       let tokenMajor = false;
 
-      if (slots) {
+      if (sparse) {
         // Sparse MLA path: SM120 kernel on packed FP8 KV cache
         // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
         // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
         // seqLen=1, batch=BS — which matches token-major layout.
         const sparseResult = state.sparseMla(
-          qAbsorbedR, qPeR, ckv!, slots,
+          qAbsorbedR, qPeR, ckv!, sparse.slots, sparse.length,
           cfg.indexTopk, cfg.scaling,
         );
         tokenMajor = !state.isDecode;
@@ -602,16 +606,23 @@ export class Glm51Model extends ChatModel {
     using cos = rotaryEmbedding.result.cos;
     using sin = rotaryEmbedding.result.sin;
 
-    using _sharedTopk = state.sharedTopk ? undefined : new UsingHolder<Tensor>(undefined!);
-    const sharedTopk = _sharedTopk || state.sharedTopk!;
+    // The group slot cache lives on state.sharedSlots / sharedSlotsLength.
+    // Callers that span multiple forwards (run loop, MTP) provide persistent
+    // holders; otherwise fall back to forward-local ones.
+    using _localSlots = state.sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
+    using _localLength = state.sharedSlotsLength ? undefined : new UsingHolder<Tensor>(undefined!);
+    state.sharedSlots ??= _localSlots!;
+    state.sharedSlotsLength ??= _localLength!;
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const result = this.mlaLayer(cos, sin, normed.value, residual.value, i, state, sharedTopk);
+      const result = this.mlaLayer(cos, sin, normed.value, residual.value, i, state);
       normed.replace(result.normed);
       residual.replace(result.residual);
     }
 
-    state.sharedTopk?.value?.removeTracking();
+    // Export the cache so it survives a caller's MTP tracking region (see mtp.ts).
+    state.sharedSlots?.value?.removeTracking();
+    state.sharedSlotsLength?.value?.removeTracking();
     return normed.detach().removeTracking();
   }
 
@@ -648,15 +659,18 @@ export class Glm51Model extends ChatModel {
     using sin = rotaryEmbedding.result.sin;
 
     const layerIdx = cfg.numHiddenLayers;
-    using _sharedTopk = state.sharedTopk ? undefined : new UsingHolder<Tensor>(undefined!);
-    const sharedTopk = _sharedTopk || state.sharedTopk!;
-    const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state, sharedTopk);
+    using _localSlots = state.sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
+    using _localLength = state.sharedSlotsLength ? undefined : new UsingHolder<Tensor>(undefined!);
+    state.sharedSlots ??= _localSlots!;
+    state.sharedSlotsLength ??= _localLength!;
+    const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state);
     using _residual = result.residual;
 
-    // Export the shared top-k (like forwardModel) so it survives the caller's
-    // MTP tracking region — otherwise startTracking's dispose frees the tensor
-    // sharedTopk still points to, causing a use-after-free on the next pass.
-    state.sharedTopk?.value?.removeTracking();
+    // Export the cache (slots + length) so it survives the caller's MTP tracking
+    // region — otherwise startTracking's dispose frees the tensors the holders
+    // still point to, causing a use-after-free on the next pass.
+    state.sharedSlots?.value?.removeTracking();
+    state.sharedSlotsLength?.value?.removeTracking();
 
     // Return shared_head.norm(residual) so the recycled seed for the next MTP
     // step is already normed — matches sglang Glm4MoeModelNextN and vLLM v1

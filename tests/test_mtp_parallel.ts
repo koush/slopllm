@@ -43,8 +43,10 @@ function runMtpTreeDecode(model: ChatModel, ws: ExecutionWorkspace, cache: ChatC
   ws.positionStep(state, model);
 
   using hiddenHolder = new UsingHolder<Tensor>(undefined!);
-  using sharedTopk = new UsingHolder<Tensor>(undefined!);
-  state.sharedTopk = sharedTopk;
+  using sharedSlots = new UsingHolder<Tensor>(undefined!);
+  using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
+  state.sharedSlots = sharedSlots;
+  state.sharedSlotsLength = sharedSlotsLength;
   const hidden = model.forward(state);
   hiddenHolder.replace(hidden.removeTracking());
 
@@ -57,7 +59,7 @@ function runMtpTreeDecode(model: ChatModel, ws: ExecutionWorkspace, cache: ChatC
   const currentToken = currentTokenHost.readPinnedBuffer().readInt32LE();
 
   const { tokens: result } = mtpTreeDecode(
-    captureManager, model, hiddenHolder.value, sharedTopk, ws, currentToken, Array(nextn).fill(2), cache,
+    captureManager, model, hiddenHolder.value, sharedSlots, sharedSlotsLength, ws, currentToken, Array(nextn).fill(2), cache,
   );
 
   for (const t of result) {

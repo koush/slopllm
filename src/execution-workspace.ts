@@ -17,11 +17,12 @@ export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 
 export class ExecutionState {
   input?: Tensor;
-  // Holds the raw indexer top-k (token positions, Replicated [totalQ, topk])
-  // produced on 'full' layers and reused by the following 'shared' layers. The
-  // per-layer physical slots are derived on demand from this via topkSlots(),
-  // in whichever addressing mode (flat/paged) that layer's CKV buffer needs.
-  sharedTopk?: UsingHolder<Tensor>;
+  // Persisted per-group sparse-slot cache, populated once at the full layer and
+  // reused by the following shared layers. Two separate Tensor holders (not a
+  // {slots,length} object) so each keeps UsingHolder's dispose-on-replace
+  // semantics; sharedSlotsLength is the length paired with sharedSlots' slots.
+  sharedSlots?: UsingHolder<Tensor>;
+  sharedSlotsLength?: UsingHolder<Tensor>;
   paddedKvLenInvariant = true;
   private readonly paddedKvLen: number;
 
@@ -163,31 +164,63 @@ export class ExecutionState {
     );
   }
 
-  // Map raw indexer top-k -> physical slots for layer `cacheIdx`. The addressing
-  // (flat vs paged) is chosen internally by the ops layer from cacheIdx, so the
-  // model stays mode-agnostic. Writes the compacted per-query count into
-  // sparseTopkLength (read by sparse MLA). Called per layer at attention time.
-  topkSlots(cacheIdx: number, topkIdx: Tensor): Tensor {
+  // Physical { slots, length } for layer `cacheIdx`'s sparse MLA. The ops layer
+  // picks flat/paged internally from cacheIdx, so the model stays mode-agnostic.
+  //   - shared layer (topkIdx omitted): reuse the group cache the preceding full
+  //     layer populated (already joined at that layer's end).
+  //   - full layer reusing the group format: join the background cache stream,
+  //     return the cache.
+  //   - full layer with a divergent format (decode paged): compute its own.
+  // Returned tensors are disposable (cache reuses are viewClones; the parent
+  // cache tensors live in the holders), so the caller `using`s them per layer.
+  topkSlots(cacheIdx: number, topkIdx?: Tensor, slotsReadyStream?: { streamWaitEvent(): void }): { slots: Tensor, length: Tensor } {
+    if (!topkIdx || this.ws.glm.fullLayerReusesGroup?.(this, cacheIdx)) {
+      // Full-layer reuse joins the just-launched background cache; shared layers
+      // have no stream (cache already joined by the previous full layer).
+      if (topkIdx) slotsReadyStream?.streamWaitEvent();
+      return {
+        slots: this.sharedSlots!.value.viewClone(),
+        length: this.sharedSlotsLength!.value.viewClone(),
+      };
+    }
+    return this.computeSlots(cacheIdx, topkIdx);
+  }
+
+  // Foreground compute of a full layer's own { slots, length } (used when its
+  // format diverges from the group, i.e. decode sparse-gather paged).
+  private computeSlots(cacheIdx: number, topkIdx: Tensor): { slots: Tensor, length: Tensor } {
     const pagedKV = this.cache.getPagedKV();
     const kData = pagedKV.kData[cacheIdx];
     const maxKv = kData.shape[0] * kData.shape[1];
-    return this.ws.glm.topkToSlots(
+    // Transient [maxQ] length (constant-size for capture); slots is
+    // topkToSlots' max-narrowed transient. Both disposed by the caller.
+    const length = this.ws.alloc([this.ws.positionIds.shape[0]], "I32");
+    const slots = this.ws.glm.topkToSlots(
       this,
       topkIdx, this.ws.kvTokenIndptrD,
-      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices, this.ws.sparseTopkLength,
+      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices, length,
       pagedKV.pageSize, maxKv,
       cacheIdx, pagedKV.contextParallel,
     );
+    return { slots, length };
   }
 
   slotsReady(cacheIdx: number, topkIdx: Tensor) {
     const pagedKV = this.cache.getPagedKV();
-    return this.ws.glm.slotsReady!(
+    const stream = this.ws.glm.slotsReady!(
       this,
       topkIdx,
       pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices,
       cacheIdx, pagedKV.ckvData[cacheIdx],
     );
+    // Store the group cache into the persisted holders (dispose-on-replace).
+    // These holders are created/threaded by the caller (run/mtp) so they persist
+    // across shared layers and MTP passes; fall back to a local holder otherwise.
+    if (stream) {
+      (this.sharedSlots ??= new UsingHolder<Tensor>(undefined!)).replace(stream.result.slots);
+      (this.sharedSlotsLength ??= new UsingHolder<Tensor>(undefined!)).replace(stream.result.length);
+    }
+    return stream;
   }
 
   denseMla(qNope: Tensor, qPe: Tensor, cacheIdx: number, smScale: number): { o: Tensor, lse: Tensor } {
@@ -198,20 +231,19 @@ export class ExecutionState {
     }
   }
 
-  sparseMla(qAbsorbed: Tensor, qPe: Tensor, ckv: Tensor, indices: Tensor, topk: number, smScale: number): { o: Tensor, lse: Tensor } {
-    const pagedKV = this.cache.getPagedKV();
+  sparseMla(qAbsorbed: Tensor, qPe: Tensor, ckv: Tensor, indices: Tensor, length: Tensor, topk: number, smScale: number): { o: Tensor, lse: Tensor } {
     if (this.isDecode) {
       const numSplits = Math.ceil(topk / 64);
       return this.ws.glm.sparseMlaDecode(
         this, qAbsorbed, qPe, ckv, indices,
         topk, numSplits,
-        smScale, 0, this.ws.sparseTopkLength,
+        smScale, 0, length,
       );
     } else {
       return this.ws.glm.sparseMlaPrefill(
         this, qAbsorbed, qPe, ckv, indices,
         topk,
-        smScale, this.ws.sparseTopkLength,
+        smScale, length,
         this.ws.indptrD, this.ws.lastPageLen, this.ws.kvTokenIndptrD,
       );
     }
@@ -342,17 +374,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
   mlaBatchIndices: Tensor;
   /** Pinned host buffer [B*S] of I32: batch index per token for MLA KV cache append. */
   mlaBatchIndicesH: Tensor;
-  /** GPU buffer [B*S] of I32: per-query compacted valid-slot count, written by
-   *  topkToSlots on full layers, read as sparse attention's topk_length. Stable
-   *  buffer so it persists to shared layers that reuse the same slots. */
-  sparseTopkLength: Tensor;
-  /** GPU buffer [B*S] of I32: separate compacted valid-slot count written by
-   *  the shared-slots gather's own flat topkToSlots. Distinct from
-   *  sparseTopkLength because the gather runs on a side stream concurrently
-   *  with the full layer's own (paged) topkToSlots on the main stream, so they
-   *  must not share a length buffer. (gatherTopkCkv ignores it, but the kernel
-   *  still writes it.) */
-  sparseTopkLengthGather: Tensor;
   lastDecodePagedKV: PagedKVCache | null;
   private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
   extras = new Map<string, any>();
@@ -388,8 +409,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.kvTokenIndptrD = this.alloc([(B + 1) * I32], "I32", "kvTokenIndptrD");
     this.mlaBatchIndices = this.alloc([B * S], "I32", "mlaBatchIndices");
     this.mlaBatchIndicesH = this.allocPinned([B * S], "I32", "mlaBatchIndicesH");
-    this.sparseTopkLength = this.alloc([B * S], "I32", "sparseTopkLength");
-    this.sparseTopkLengthGather = this.alloc([B * S], "I32", "sparseTopkLengthGather");
     this.lastDecodePagedKV = null;
 
     // Initialize mlaBatchIndices for decode: [0, 1, 2, ..., B-1]

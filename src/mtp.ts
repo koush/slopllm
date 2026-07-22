@@ -169,7 +169,8 @@ export function mtpTreeDecode(
   captureManager: CaptureManager,
   model: ChatModel,
   mtpHiddenStates: Tensor,
-  sharedTopk: UsingHolder<Tensor>,
+  sharedSlots: UsingHolder<Tensor>,
+  sharedSlotsLength: UsingHolder<Tensor>,
   ws: ExecutionWorkspace,
   targetToken: number,
   topks: number[],
@@ -192,7 +193,7 @@ export function mtpTreeDecode(
   const pagedKv = cache.getPagedKV();
   const batchSize = pagedKv.sequences.length;
 
-  using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedTopk.value]));
+  using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedSlots.value, sharedSlotsLength.value]));
 
   const hiddenDim = mtpHiddenStates.shape[1];
   const rowBytes = hiddenDim * BF16; // BF16 = 2 bytes per element
@@ -250,7 +251,8 @@ export function mtpTreeDecode(
       }
 
       const state = ws.planDecode(model, newBatchSize, cache);
-      state.sharedTopk = sharedTopk;
+      state.sharedSlots = sharedSlots;
+      state.sharedSlotsLength = sharedSlotsLength;
 
 
       warmup ||= !state.isCaptured(captureManager, ['mtp-tree-decode', i, topks.length]);
@@ -343,7 +345,8 @@ export function mtpTreeDecode(
         positionIds: posIds,
         maskKvLen: chunkedMask.maskKvLen,
       });
-      state.sharedTopk = sharedTopk;
+      state.sharedSlots = sharedSlots;
+      state.sharedSlotsLength = sharedSlotsLength;
 
       const prevHs = chainedHs;
       warmup ||= !state.isCaptured(captureManager, ['mtp-chunk', depth, topks.length]);
@@ -422,8 +425,10 @@ export function mtpTreeDecode(
     ...targetCustomMask,
     positionIds: getPositionIdsMask(ws, originalAllocLen, targetTopk),
   });
-  sharedTopk.release();
-  targetPrefillState.sharedTopk = sharedTopk;
+  sharedSlots.release();
+  sharedSlotsLength.release();
+  targetPrefillState.sharedSlots = sharedSlots;
+  targetPrefillState.sharedSlotsLength = sharedSlotsLength;
 
   targetPrefillState.setInput(verificationTokens);
 
@@ -431,7 +436,7 @@ export function mtpTreeDecode(
   ws.glm.synchronize();
 
   warmup ||= !targetPrefillState.isCaptured(captureManager, ['mtp-verify', numVerificationTokens]);
-  const { kvCacheLayers, indexerKvCacheLayers } = targetPrefillState.capture(captureManager, (capturing) => {
+  const { kvCacheLayers, indexerKvCacheLayers, capturedSharedSlots, capturedSharedSlotsLength } = targetPrefillState.capture(captureManager, (capturing) => {
     const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, appendCkvOrig: Tensor, appendKpeOrig: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
     const indexerKvCacheLayers: { appendIdxK: Tensor, appendIdxKOrig: Tensor, cacheIdx: number, indexHeadDim: number }[] = [];
 
@@ -460,8 +465,19 @@ export function mtpTreeDecode(
     //   extra.streamWaitEvent?.();
     // }
 
-    return { kvCacheLayers, indexerKvCacheLayers };
+    // Capture the group slot cache into the graph result. forwardModel sets it
+    // via a holder side-effect, which does NOT re-run on graph replay — so
+    // return the captured tensors and re-apply the holders below (valid on both
+    // warmup and replay), the way kvCacheLayers are threaded out. Without this,
+    // a replayed target prefill leaves the holder stale and the reusing MTP
+    // extend-prefill pass falls to the (invalid) dense path.
+    const capturedSharedSlots = targetPrefillState.sharedSlots?.value?.capture();
+    const capturedSharedSlotsLength = targetPrefillState.sharedSlotsLength?.value?.capture();
+    return { kvCacheLayers, indexerKvCacheLayers, capturedSharedSlots, capturedSharedSlotsLength };
   }, ['mtp-verify', numVerificationTokens]);
+
+  if (capturedSharedSlots) sharedSlots.replace(capturedSharedSlots);
+  if (capturedSharedSlotsLength) sharedSlotsLength.replace(capturedSharedSlotsLength);
 
   ws.glm.synchronize();
 
@@ -587,7 +603,8 @@ export function mtpTreeDecode(
 
   const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache);
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
-  mtpExtendPrefill.sharedTopk = sharedTopk;
+  mtpExtendPrefill.sharedSlots = sharedSlots;
+  mtpExtendPrefill.sharedSlotsLength = sharedSlotsLength;
   for (const layer of kvCacheLayers) {
     mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
     layer.appendCkvOrig[Symbol.dispose]();

@@ -237,13 +237,15 @@ export function* generateStream(
   captureManager.disabled = graphState === undefined;
 
   // needed by mtp
-  using sharedTopk = new UsingHolder<Tensor>(undefined!);
+  using sharedSlots = new UsingHolder<Tensor>(undefined!);
+  using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
   {
     const inputIdsList = [suffixIds];
     const batchSize = inputIdsList.length;
     const seqLens = inputIdsList.map(ids => ids.length);
     const state = ws.planPrefill(model, batchSize, seqLens, cache);
-    state.sharedTopk = sharedTopk;
+    state.sharedSlots = sharedSlots;
+    state.sharedSlotsLength = sharedSlotsLength;
     state.setInput(inputIdsList);
     using hiddenStates = model.forward(state);
     using firstTokens = state.computeLogits(hiddenStates, model);
@@ -286,7 +288,7 @@ export function* generateStream(
     for (let i = 1; i < maxNewTokens; i++) {
       if (mtp && model.forwardMtp && topks.length > 0) {
         if (process.env.GLM_STEP_LOG === '1') process.stderr.write(`[step ${i}] seqLen=${cache.getPagedKV().sequences[0].allocLen} histLen=${tokenHistory.length}\n`);
-        const { warmup, tokens, numAccepted, numDraftTokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedTopk, ws, currentToken, topks, cache, tokenizer);
+        const { warmup, tokens, numAccepted, numDraftTokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots, sharedSlotsLength, ws, currentToken, topks, cache, tokenizer);
         if (mtpStats && !warmup) mtpStats.observe(numDraftTokens, numAccepted);
         // glm.synchronize();
         for (const t of tokens) {
