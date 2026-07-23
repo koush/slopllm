@@ -695,6 +695,54 @@ nvfp4_mul_mat_id_kernel(
     float sum = 0.0f;
 
     if (row_valid) {
+      if constexpr (RowsPerWarp == 8) {
+        // Small-K / large-N path: <8> is dispatched only when K <= SMALLK_THRESHOLD
+        // (=512), so num_k_groups <= 32 and, with RowsPerWarp=8 (LANES_PER_ROW=4),
+        // each lane runs the body at most 8 times. Fully unroll over a compile-time
+        // bound (GEMV_WARP_SIZE=32 groups stepped by LANES_PER_ROW) so nvcc issues the
+        // independent per-group global loads (scale + input + weight) up front and
+        // software-pipelines them, instead of the original dynamic loop which
+        // serialized one load-wait-compute chain per iteration (only 4 in-flight
+        // groups for the K=256 case -> latency-bound at ~63% of DRAM peak). The
+        // 32-group bound is only valid when num_k_groups <= 32, hence this
+        // specialization: <1>/<2> are also dispatched with large K elsewhere and must
+        // keep the dynamic loop below. Out-of-range groups are predicated out (no
+        // OOB reads).
+        #pragma unroll
+        for (int g0 = 0; g0 < GEMV_WARP_SIZE; g0 += LANES_PER_ROW) {
+            int g = inner_lane + g0;
+            if (g >= num_k_groups) continue;
+            float scale = static_cast<float>(scale_row[g]) * scale_2_val;
+            int k_start = g * NVFP4_QUANT_GROUP;
+
+            const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row + k_start);
+            uint4 xv0 = input_v4[0];
+            uint4 xv1 = input_v4[1];
+            __nv_bfloat16 xb0[8], xb1[8];
+            uint4_to_bf16x8(xv0, xb0);
+            uint4_to_bf16x8(xv1, xb1);
+
+            uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
+            uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
+
+            float gsum = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
+                float2 w = fp4x2_to_float2(packed);
+                gsum += w.x * __bfloat162float(xb0[j * 2])
+                      + w.y * __bfloat162float(xb0[j * 2 + 1]);
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
+                float2 w = fp4x2_to_float2(packed);
+                gsum += w.x * __bfloat162float(xb1[j * 2])
+                      + w.y * __bfloat162float(xb1[j * 2 + 1]);
+            }
+            sum += gsum * scale;
+        }
+      } else {
         for (int g = inner_lane; g < num_k_groups; g += LANES_PER_ROW) {
             float scale = static_cast<float>(scale_row[g]) * scale_2_val;
             int k_start = g * NVFP4_QUANT_GROUP;
@@ -726,6 +774,7 @@ nvfp4_mul_mat_id_kernel(
             }
             sum += gsum * scale;
         }
+      }
     }
 
     if constexpr (RowsPerWarp == 1) {
@@ -1404,6 +1453,13 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
         cublasLtMatmulPreferenceCreate(&pref);
         size_t wsSize = LT_WORKSPACE_PER_STREAM;
         cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsSize, sizeof(wsSize));
+        // DIAGNOSTIC: forbid split-K reduction schemes that accumulate via atomics
+        // (nondeterministic run-to-run). Guarded so we can A/B; NONE-only algos are
+        // deterministic. Falls back to cublasGemmEx if the heuristic returns nothing.
+        if (getenv("GLM_CUBLAS_DETERMINISTIC")) {
+            uint32_t redMask = CUBLASLT_REDUCTION_SCHEME_NONE;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &redMask, sizeof(redMask));
+        }
         int returnedResults = 0;
         cublasLtMatmulAlgoGetHeuristic(ltHandle, entry.opDesc, entry.Adesc, entry.Bdesc, entry.Cdesc, entry.Cdesc,
                                        pref, 1, &entry.heuristic, &returnedResults);
