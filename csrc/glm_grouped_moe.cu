@@ -330,9 +330,9 @@ grouped_nvfp4_gemv_kernel(
             int k_start = g * NVFP4_QUANT_GROUP;
             uint4 w = *reinterpret_cast<const uint4*>(weight_row + (size_t)g * (NVFP4_QUANT_GROUP / 2));
 
-            float scale0 = static_cast<float>(scale_row[g]) * scale_2_val;
+            float scale0 = fp8_e4m3_to_float(scale_row[g]) * scale_2_val;
             float scale1 = (g + 1 < num_k_groups)
-                               ? static_cast<float>(scale_row[g + 1]) * scale_2_val
+                               ? fp8_e4m3_to_float(scale_row[g + 1]) * scale_2_val
                                : 0.0f;
 
             for (int m = 0; m < m_count; m++) {
@@ -499,9 +499,9 @@ grouped_nvfp4_gemv_smem_kernel(
             int k_start = g * NVFP4_QUANT_GROUP;
             uint4 w = *reinterpret_cast<const uint4*>(weight_row + (size_t)g * (NVFP4_QUANT_GROUP / 2));
 
-            float scale0 = static_cast<float>(scale_row[g]) * scale_2_val;
+            float scale0 = fp8_e4m3_to_float(scale_row[g]) * scale_2_val;
             float scale1 = (g + 1 < num_k_groups)
-                               ? static_cast<float>(scale_row[g + 1]) * scale_2_val
+                               ? fp8_e4m3_to_float(scale_row[g + 1]) * scale_2_val
                                : 0.0f;
 
             const uint4* input_v4 = reinterpret_cast<const uint4*>(expert_input + (size_t)m_base * K + k_start);

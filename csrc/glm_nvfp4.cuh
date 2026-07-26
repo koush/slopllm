@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <string.h>
 
 // SM120a native FP4→F16x2 conversion instruction.
@@ -45,4 +46,40 @@ __device__ __forceinline__ float2 fp4x2_to_float2(uint8_t packed) {
     f.y = fp4_e2m1_decode(packed >> 4u);
     return f;
 #endif
+  }
+
+// FP8 E4M3 → FP16 conversion via inline PTX, reading the HIGH output lane.
+//
+// Workaround for a hardware defect on certain SM120a parts (e.g. GPU 3 on this
+// cluster): the LOW output lane of `cvt.rn.f16x2.e4m3x2` intermittently faults
+// (returns garbage), while the HIGH lane is always clean. The compiler's
+// `static_cast<float>` / `__half` conversions always read the low lane, so they
+// always hit the defect.
+//
+// This routine duplicates the input byte into both lanes of the f16x2
+// conversion, then extracts the (clean) HIGH f16 result.
+__device__ __forceinline__ __half fp8_e4m3_to_half(uint8_t b) {
+    uint16_t in = (uint16_t)b | ((uint16_t)b << 8);
+    uint32_t h2;
+    asm volatile(
+        "cvt.rn.f16x2.e4m3x2 %0, %1;\n"
+        : "=r"(h2)
+        : "h"(in));
+    uint16_t h16 = (uint16_t)(h2 >> 16);
+    __half h;
+    memcpy(&h, &h16, sizeof(h));
+    return h;
+}
+
+__device__ __forceinline__ __half fp8_e4m3_to_half(__nv_fp8_e4m3 v) {
+    return fp8_e4m3_to_half(reinterpret_cast<const uint8_t&>(v));
+}
+
+// FP8 E4M3 → FP32 convenience wrapper. Equivalent to the former
+// `static_cast<float>(__nv_fp8_e4m3)` but routed through the high-lane PTX path
+// to avoid the GPU 3 low-lane defect. The intermediate FP16 is exact (every
+// E4M3 value is representable in FP16), so the result is bit-identical to a
+// direct FP8→FP32 convert on healthy hardware.
+__device__ __forceinline__ float fp8_e4m3_to_float(__nv_fp8_e4m3 v) {
+    return __half2float(fp8_e4m3_to_half(v));
 }

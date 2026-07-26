@@ -289,8 +289,8 @@ fp8_dequantize_gemv_kernel(
                     __nv_bfloat162 x2 = smem_vec[b * (FP8_QUANT_BLOCK / 2) + ki];
                     float x0 = __bfloat162float(x2.x);
                     float x1 = __bfloat162float(x2.y);
-                    float w0 = static_cast<float>(weight_row[k_start + b * FP8_QUANT_BLOCK + ki * 2]) * scale;
-                    float w1 = static_cast<float>(weight_row[k_start + b * FP8_QUANT_BLOCK + ki * 2 + 1]) * scale;
+                    float w0 = fp8_e4m3_to_float(weight_row[k_start + b * FP8_QUANT_BLOCK + ki * 2]) * scale;
+                    float w1 = fp8_e4m3_to_float(weight_row[k_start + b * FP8_QUANT_BLOCK + ki * 2 + 1]) * scale;
                     sum += w0 * x0 + w1 * x1;
                 }
             }
@@ -316,7 +316,7 @@ fp8_dequantize_gemv_kernel(
                 float scale = __bfloat162float(scale_inv[n_block * num_k_blocks + kb]);
                 int b_start = b * FP8_QUANT_BLOCK;
                 for (int k = b_start + lane; k < b_start + FP8_QUANT_BLOCK; k += GEMV_WARP_SIZE) {
-                    float w_val = static_cast<float>(weight_row[remaining_start + k]) * scale;
+                    float w_val = fp8_e4m3_to_float(weight_row[remaining_start + k]) * scale;
                     float x_val = __bfloat162float(smem[k]);
                     sum += w_val * x_val;
                 }
@@ -397,7 +397,7 @@ fp8_dequantize_gemm_smem_kernel(
             #pragma unroll
             for (int k = 0; k < FP8_GEMM_K_TILE; k++) {
                 if (k < k_tile) {
-                    float w_val = static_cast<float>(smem_weight[local_n][k]) * scale;
+                    float w_val = fp8_e4m3_to_float(smem_weight[local_n][k]) * scale;
                     float x_val = __bfloat162float(smem_input[local_m][k]);
                     sum += w_val * x_val;
                 }
@@ -466,7 +466,7 @@ nvfp4_dequantize_gemv_kernel(
             #pragma unroll
             for (int g = 0; g < GROUPS_PER_TILE; g++) {
                 int kg = tile * GROUPS_PER_TILE + g;
-                float scale = static_cast<float>(weight_scale[row * num_k_groups + kg]) * scale_2_val;
+                float scale = fp8_e4m3_to_float(weight_scale[row * num_k_groups + kg]) * scale_2_val;
                 int g_start = g * NVFP4_QUANT_GROUP;
                 #pragma unroll
                 for (int ki = lane; ki < NVFP4_QUANT_GROUP / 2; ki += GEMV_WARP_SIZE) {
@@ -497,7 +497,7 @@ nvfp4_dequantize_gemv_kernel(
             int remaining_groups = remaining / NVFP4_QUANT_GROUP;
             for (int g = 0; g < remaining_groups; g++) {
                 int kg = remaining_groups_start + g;
-                float scale = static_cast<float>(weight_scale[row * num_k_groups + kg]) * scale_2_val;
+                float scale = fp8_e4m3_to_float(weight_scale[row * num_k_groups + kg]) * scale_2_val;
                 int g_start = g * NVFP4_QUANT_GROUP;
                 for (int k = g_start + lane; k < g_start + NVFP4_QUANT_GROUP; k += GEMV_WARP_SIZE) {
                     uint8_t packed = weight_row[(remaining_start + k) / 2];
@@ -618,7 +618,7 @@ nvfp4_dequantize_gemm_smem_kernel(
             int lk_pair = i % k_tile_pairs;
             int k = lk_pair * 2;
             int kg = kb * (NVFP4_GEMM_K_TILE / NVFP4_QUANT_GROUP) + k / NVFP4_QUANT_GROUP;
-            float scale = static_cast<float>(weight_scale[(n_start + ln) * num_k_groups + kg]) * scale_2_val;
+            float scale = fp8_e4m3_to_float(weight_scale[(n_start + ln) * num_k_groups + kg]) * scale_2_val;
             uint8_t packed = weight[(n_start + ln) * (K / 2) + k_start / 2 + lk_pair];
             float2 w = fp4x2_to_float2(packed);
             smem_weight[ln][k]     = __float2bfloat16(w.x * scale);
@@ -712,7 +712,7 @@ nvfp4_mul_mat_id_kernel(
         for (int g0 = 0; g0 < GEMV_WARP_SIZE; g0 += LANES_PER_ROW) {
             int g = inner_lane + g0;
             if (g >= num_k_groups) continue;
-            float scale = static_cast<float>(scale_row[g]) * scale_2_val;
+            float scale = fp8_e4m3_to_float(scale_row[g]) * scale_2_val;
             int k_start = g * NVFP4_QUANT_GROUP;
 
             const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row + k_start);
@@ -744,7 +744,7 @@ nvfp4_mul_mat_id_kernel(
         }
       } else {
         for (int g = inner_lane; g < num_k_groups; g += LANES_PER_ROW) {
-            float scale = static_cast<float>(scale_row[g]) * scale_2_val;
+            float scale = fp8_e4m3_to_float(scale_row[g]) * scale_2_val;
             int k_start = g * NVFP4_QUANT_GROUP;
 
             const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row + k_start);
@@ -832,7 +832,7 @@ nvfp4_mul_mat_id_splitk_kernel(
     float sum = 0.0f;
 
     for (int g = g_thread; g < num_k_groups; g += g_threads) {
-        float scale = static_cast<float>(scale_row[g]) * scale_2_val;
+        float scale = fp8_e4m3_to_float(scale_row[g]) * scale_2_val;
         int k_start = g * NVFP4_QUANT_GROUP;
 
         const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row + k_start);
@@ -1087,7 +1087,7 @@ nvfp4_linear_splitk_kernel(
     float sum = 0.0f;
 
     for (int g = g_thread; g < num_k_groups; g += g_threads) {
-        float scale = static_cast<float>(scale_row[g]) * scale_2_val;
+        float scale = fp8_e4m3_to_float(scale_row[g]) * scale_2_val;
         int k_start = g * NVFP4_QUANT_GROUP;
 
         const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row_ptr + k_start);
@@ -1410,6 +1410,8 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
             auto* out_bf = reinterpret_cast<__nv_bfloat16*>(out);
             auto* in_bf = reinterpret_cast<const __nv_bfloat16*>(input);
             auto* wt_bf = reinterpret_cast<const __nv_bfloat16*>(weight);
+            // BS >= 128 uses shared memory for input staging (K*2 bytes).
+            // BS < 128 uses no dynamic shared memory to preserve high occupancy.
             #define LAUNCH_MW(BS) \
                 bf16_gemv_multiwarp_kernel<BS><<<grid, BS, 0, GLM_STREAM(ctx)>>>(out_bf, in_bf, wt_bf, batch, n, k)
             switch (mw_block) {

@@ -241,7 +241,7 @@ grouped_mma_kernel(
                     uint8_t packed_byte = sfp4[n * (TK / 2) + k_packed];
                     float2 f2 = fp4x2_to_float2(packed_byte);
                     float fval = (k % 2 == 0) ? f2.x : f2.y;
-                    float block_scale = static_cast<float>(smem_scale[n]);
+                    float block_scale = fp8_e4m3_to_float(smem_scale[n]);
                     float scaled_val = fval * block_scale * scale_2_val;
                     smem_b[k * TN + n] = __float2bfloat16(scaled_val);
                 }
