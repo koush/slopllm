@@ -147,7 +147,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.lastNumSequences = this.sequences.length;
   }
 
-  constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0) {
+  constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0, sharedLayers: boolean[] = []) {
     super(glm);
     this.nKv = nKv;
     this.hd = hd;
@@ -164,6 +164,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.vData = [];
     this.ckvData = [];
     this.kpeData = [];
+    if (sharedLayers.length > 0 && sharedLayers.length < nLayers)
+      throw new Error(`PagedKVCache: sharedLayers length ${sharedLayers.length} != nLayers ${nLayers}`);
     for (let i = 0; i < nLayers; i++) {
       if (kvLoraRank > 0) {
         if (this.sparseMode) {
@@ -173,7 +175,11 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
           this.kpeData.push(this.alloc([maxPages, this.pageSize, qkRopeDim], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
         }
         if (indexHeadDim > 0) {
-          this.kData.push(this.alloc([maxPages, this.pageSize, indexHeadDim], "BF16"));
+          if (sharedLayers[i]) {
+            this.kData.push(undefined!);
+          } else {
+            this.kData.push(this.alloc([maxPages, this.pageSize, indexHeadDim], "BF16"));
+          }
         }
       } else {
         this.kData.push(this.alloc([maxPages, nKv * this.pageSize * hd], "BF16", undefined, TensorParallelism.Row));
@@ -355,7 +361,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
   copyPage(srcPageId: number, dstPageId: number): void {
     for (let i = 0; i < this.kData.length; i++) {
-      this.copyPageRow(this.kData[i], srcPageId, dstPageId);
+      if (this.kData[i]) this.copyPageRow(this.kData[i], srcPageId, dstPageId);
     }
     for (let i = 0; i < this.vData.length; i++) {
       this.copyPageRow(this.vData[i], srcPageId, dstPageId);

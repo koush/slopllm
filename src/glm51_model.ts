@@ -320,7 +320,8 @@ export class Glm51Model extends ChatModel {
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
     const nLayers = cfg.numHiddenLayers + (this.mtp ? cfg.numNextNPredictLayers ?? 0 : 0);
-    return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim);
+    const sharedLayers = cfg.indexerTypes.map(t => t === "shared");
+    return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim, sharedLayers);
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
