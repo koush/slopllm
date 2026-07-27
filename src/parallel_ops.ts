@@ -666,6 +666,17 @@ export class ParallelTensor extends Tensor {
 
     // Replicated weight + Replicated input → Replicated output
     if (WP === TensorParallelism.Replicated && XP === TensorParallelism.Replicated) {
+      const W = this.worldSize;
+      if (n % W === 0 && batch <= W && pWeight.numElements > 1048576) {
+        // these weights are better as column parallel for decode but replicated for prefill
+        if (pWeight.name?.includes(".self_attn.q_a_proj.weight") || pWeight.name?.includes(".indexer.wq_b.weight") || pWeight.name?.includes(".ckv_proj.weight")) {
+          using narrowed = pWeight.parallelOps.tryNarrowToColumnParallel(pWeight);
+          if (narrowed) {
+            return this.linear(narrowed);
+          }
+        }
+        console.log(`[shard-candidate] weight=${pWeight.name ?? "(unnamed)"} shape=[${n}, ${weight.shape[1]}] batch=${batch} n/W=${n / W} allgather=${n * batch * 2}B`);
+      }
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
         shards.push(this.shards[i].linear(pWeight.shards[i]));
@@ -799,14 +810,6 @@ export class ParallelTensor extends Tensor {
   add(other: Tensor, n?: number): Tensor {
     const pOther = other as ParallelTensor;
 
-    if (this.parallelism === pOther.parallelism) {
-      const outShards: Tensor[] = [];
-      for (let i = 0; i < this.worldSize; i++) {
-        outShards.push(this.shards[i].add(pOther.shards[i], n));
-      }
-      return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
-    }
-
     if (this.parallelism === TensorParallelism.PartialSum && pOther.parallelism === TensorParallelism.Replicated) {
       const outShards: Tensor[] = [];
       outShards.push(this.shards[0].add(pOther.shards[0], n));
@@ -818,40 +821,19 @@ export class ParallelTensor extends Tensor {
       }
       return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, TensorParallelism.PartialSum);
     }
-    if (pOther.parallelism === TensorParallelism.PartialSum && this.parallelism === TensorParallelism.Replicated) {
-      return pOther.add(this, n);
-    }
 
-    if (this.parallelism === TensorParallelism.PartialSum) {
-      using gathered = pOther.allGather(pOther.workspace);
-      return this.add(gathered, n);
-    }
-    if (pOther.parallelism === TensorParallelism.PartialSum) {
-      using gathered = this.allGather(this.workspace);
-      return pOther.add(gathered, n);
-    }
-
-    if ((this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) && pOther.parallelism === TensorParallelism.Replicated) {
-      using gathered = this.allGather(this.workspace);
-      return gathered.add(pOther, n);
-    }
-    if (this.parallelism === TensorParallelism.Replicated && (pOther.parallelism === TensorParallelism.Row || pOther.parallelism === TensorParallelism.Column)) {
-      using gathered = pOther.allGather(pOther.workspace);
-      return this.add(gathered, n);
-    }
-
-    using gatheredThis = this.allGather(this.workspace);
-    using gatheredOther = pOther.allGather(pOther.workspace);
-    return gatheredThis.add(gatheredOther, n);
+    return this.elementwiseBinary(pOther, (a, b) => a.add(b, n));
   }
 
   mul(other: Tensor, n?: number): Tensor {
-    const pOther = other as ParallelTensor;
+    return this.elementwiseBinary(other as ParallelTensor, (a, b) => a.mul(b, n));
+  }
 
+  private elementwiseBinary(pOther: ParallelTensor, op: (a: Tensor, b: Tensor) => Tensor): Tensor {
     if (this.parallelism === pOther.parallelism) {
       const outShards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        outShards.push(this.shards[i].mul(pOther.shards[i], n));
+        outShards.push(op(this.shards[i], pOther.shards[i]));
       }
       return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
     }
@@ -859,35 +841,35 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism === TensorParallelism.PartialSum && pOther.parallelism === TensorParallelism.Replicated) {
       const outShards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        outShards.push(this.shards[i].mul(pOther.shards[i], n));
+        outShards.push(op(this.shards[i], pOther.shards[i]));
       }
       return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, TensorParallelism.PartialSum);
     }
     if (pOther.parallelism === TensorParallelism.PartialSum && this.parallelism === TensorParallelism.Replicated) {
-      return pOther.mul(this, n);
+      return pOther.elementwiseBinary(this, op);
     }
 
     if (this.parallelism === TensorParallelism.PartialSum) {
       using gathered = pOther.allGather(pOther.workspace);
-      return this.mul(gathered, n);
+      return this.elementwiseBinary(gathered as ParallelTensor, op);
     }
     if (pOther.parallelism === TensorParallelism.PartialSum) {
       using gathered = this.allGather(this.workspace);
-      return pOther.mul(gathered, n);
+      return pOther.elementwiseBinary(gathered as ParallelTensor, op);
     }
 
     if ((this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) && pOther.parallelism === TensorParallelism.Replicated) {
       using gathered = this.allGather(this.workspace);
-      return gathered.mul(pOther, n);
+      return (gathered as ParallelTensor).elementwiseBinary(pOther, op);
     }
     if (this.parallelism === TensorParallelism.Replicated && (pOther.parallelism === TensorParallelism.Row || pOther.parallelism === TensorParallelism.Column)) {
       using gathered = pOther.allGather(pOther.workspace);
-      return this.mul(gathered, n);
+      return this.elementwiseBinary(gathered as ParallelTensor, op);
     }
 
     using gatheredThis = this.allGather(this.workspace);
     using gatheredOther = pOther.allGather(pOther.workspace);
-    return gatheredThis.mul(gatheredOther, n);
+    return (gatheredThis as ParallelTensor).elementwiseBinary(gatheredOther as ParallelTensor, op);
   }
 
   rmsnorm(weight: Tensor, eps: number): Tensor {
@@ -3421,7 +3403,7 @@ export class ParallelOps implements DeviceOps {
   // multi-seq / CP need qoIndptr rebasing which is not yet implemented.
   indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor {
     const totalQ = idxQ.shape[0];
-    const pQ = this.cast(idxQ);
+    using pQ = idxQ.parallelism === TensorParallelism.Replicated ? idxQ.viewClone() as ParallelTensor : this.cast(idxQ).allGather(idxQ.workspace);
     const pKData = this.cast(kData);
     const pWeights = this.cast(weights);
     const pPageIndices = this.cast(pageIndices);

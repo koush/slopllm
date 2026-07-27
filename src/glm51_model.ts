@@ -132,11 +132,14 @@ export class Glm51Model extends ChatModel {
     if (name === "model.embed_tokens.weight") return TensorParallelism.Row;
     const pfx = Glm51Model.WEIGHT_PREFIX;
     if (
-      // very small and immediately rmsnorm
-      //name.endsWith(".self_attn.q_a_proj.weight") ||
+      // good for decode, but bad for prefill due to gather
+      // name.endsWith(".self_attn.q_a_proj.weight") ||
       // very small, output goes through kv_a_layernorm, split into replicated ckv/k_pe_proj anyway
       //name.endsWith(".self_attn.kv_a_proj_with_mqa.weight") ||
       name.endsWith(".mlp.gate_proj.weight") ||
+      // moderate size weight but not worth it at tp8 possibly due to unsupported parallelism combos
+      // investigate further.
+      // name.endsWith(".mlp.gate.weight") ||
       name.endsWith(".mlp.up_proj.weight") ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight")) ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".up_proj.weight")) ||
@@ -163,6 +166,7 @@ export class Glm51Model extends ChatModel {
       name.endsWith(".mlp.shared_experts.down_proj.weight_weight_scale")) return TensorParallelism.Row;
     // Indexer weights are always Replicated — the indexer is a small module
     // that must run identically on every GPU to produce the same topk indices.
+    if (name.includes('.indexer.wq_b.weight')) return TensorParallelism.Replicated;
     if (name.includes(".indexer.")) return TensorParallelism.Replicated;
     return TensorParallelism.Replicated;
   }
@@ -210,25 +214,6 @@ export class Glm51Model extends ChatModel {
         await lmHead.mmapLoad(mmapPtr, offset, lmHead.bytes);
       }
     }
-  }
-
-  private async splitMlaWeightMmap(
-    mmapPtr: number, offset: number,
-    nHeads: number, headDim: number, inDim: number,
-    name0: string, rowsPerHead0: number, outDim0: number,
-    name1: string, rowsPerHead1: number, outDim1: number,
-    par: TensorParallelism,
-  ): Promise<[Tensor, Tensor]> {
-    const eb = 2;
-    const srcPitch = headDim * inDim * eb;
-    const t0 = this.alloc([nHeads * rowsPerHead0, outDim0], "BF16", name0, par);
-    const t1 = this.alloc([nHeads * rowsPerHead1, outDim1], "BF16", name1, par);
-    const strided: StridedMmap = { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: rowsPerHead0 * inDim * eb, width: rowsPerHead0 * inDim * eb, height: nHeads };
-    await Promise.all([
-      t0.mmapLoad(mmapPtr, offset, t0.bytes, strided),
-      t1.mmapLoad(mmapPtr, offset, t1.bytes, { srcOffset: rowsPerHead0 * inDim * eb, dstOffset: 0, srcPitch, dstPitch: rowsPerHead1 * inDim * eb, width: rowsPerHead1 * inDim * eb, height: nHeads })
-    ]);
-    return [t0, t1];
   }
 
   private tryComputeAbsorbed(layerPfx: string, nHeads: number, kvLoraRank: number, qLoraRank: number, qkNopeDim: number): void {
@@ -293,11 +278,16 @@ export class Glm51Model extends ChatModel {
       tV.memcpy(tVT);
       this.pendingKNope.set(name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), tKNope);
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
-      await this.splitMlaWeightMmap(mmapPtr, offset,
-        1, kvLoraRank + qkRopeDim, inDim,
-        name.replace(".kv_a_proj_with_mqa.weight", ".ckv_proj.weight"), kvLoraRank, inDim,
-        name.replace(".kv_a_proj_with_mqa.weight", ".k_pe_proj.weight"), qkRopeDim, inDim,
-        TensorParallelism.Replicated);
+      const ckvName = name.replace(".kv_a_proj_with_mqa.weight", ".ckv_proj.weight");
+      const kpeName = name.replace(".kv_a_proj_with_mqa.weight", ".k_pe_proj.weight");
+      // good for decode, but bad for prefill due to gather
+      const ckv = this.alloc([kvLoraRank, inDim], "BF16", ckvName, TensorParallelism.Replicated);
+      const kpe = this.alloc([qkRopeDim, inDim], "BF16", kpeName, TensorParallelism.Replicated);
+      const eb = 2;
+      await Promise.all([
+        ckv.mmapLoad(mmapPtr, offset, ckv.bytes),
+        kpe.mmapLoad(mmapPtr, offset + kvLoraRank * inDim * eb, kpe.bytes),
+      ]);
     }
 
     if (name.endsWith(".q_b_proj.weight") || name.endsWith(".kv_b_proj.weight")) {
@@ -342,11 +332,8 @@ export class Glm51Model extends ChatModel {
     const numExperts = cfg.nRoutedExperts;
     const topK = cfg.numExpertsPerTok;
     const nGroup = cfg.nGroup;
-    const topkGroup = cfg.topkGroup;
     const moeIntermediate = cfg.moeIntermediateSize;
     const hs = cfg.hiddenSize;
-    const expertsPerGroup = numExperts / nGroup;
-    const ws = normed.workspace;
 
     // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
     using sharedDownBufStream = this.glm.withStream(() => {
@@ -361,27 +348,13 @@ export class Glm51Model extends ChatModel {
     const eScoreBias = this.tensors.get(`${pfx}.mlp.gate.e_score_correction_bias`);
     if (eScoreBias) {
       topkInputHolder.replace(gateSigmoid.add(eScoreBias));
-    } else if (nGroup > 1) {
-      using zeros = ws.alloc([BS, numExperts], "BF16");
-      zeros.fill(0, BS * numExperts);
-      topkInputHolder.replace(gateSigmoid.add(zeros, BS * numExperts));
     } else {
       topkInputHolder.replace(gateSigmoid);
     }
 
     if (nGroup > 1) {
-      using groupTopkReshaped = topkInputHolder.value.reshape([BS * nGroup, expertsPerGroup]);
-      const groupTopk = groupTopkReshaped.topk(2, expertsPerGroup);
-      using _groupTopkValues = groupTopk.values;
-      using groupSums = groupTopk.values.reduceSum();
-      using groupSums2d = groupSums.reshape([BS, nGroup]);
-      const groupIdxTopk = groupSums2d.topk(topkGroup, nGroup);
-      using _groupIdxValues = groupIdxTopk.values;
-      using groupIdx = groupIdxTopk.indices;
-      using groupMask = ws.alloc([BS, nGroup], "BF16");
-      groupMask.fill(0, BS * nGroup);
-      groupMask.scatterScalar(groupIdx, 1.0, topkGroup);
-      topkInputHolder.value.groupMaskMul(groupMask, expertsPerGroup, nGroup);
+      // removed untested dead code that supported this, just guard
+      throw new Error(`mlpSparse: nGroup > 1 is not supported (got nGroup=${nGroup})`);
     }
 
     const topkResult = topkInputHolder.value.topk(topK, numExperts);
