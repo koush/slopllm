@@ -75,7 +75,6 @@ __device__ __forceinline__ void uint4_to_bf16x8(
 // (vs 10.9 warps/SM for the regular kernel). Block-level reduction via shared
 // memory + warp shuffle.
 // ---------------------------------------------------------------------------
-
 template <int BLOCK_SIZE>
 __global__ void
 bf16_gemv_multiwarp_kernel(
@@ -104,20 +103,60 @@ bf16_gemv_multiwarp_kernel(
     const uint4* input_v4  = reinterpret_cast<const uint4*>(input_row);
     const uint4* weight_v4 = reinterpret_cast<const uint4*>(weight_row);
 
-    float sum = 0.0f;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
 
-    for (int ki = tid; ki < K_vec; ki += BLOCK_SIZE) {
-        uint4 wv = weight_v4[ki];
-        uint4 xv = input_v4[ki];
-        __nv_bfloat16 wb[8], xb[8];
-        uint4_to_bf16x8(wv, wb);
-        uint4_to_bf16x8(xv, xb);
+    for (int ki = tid; ki < K_vec; ki += BLOCK_SIZE * 4) {
+        int idx0 = ki;
+        int idx1 = ki + BLOCK_SIZE;
+        int idx2 = ki + BLOCK_SIZE * 2;
+        int idx3 = ki + BLOCK_SIZE * 3;
+
+        // Issue all 8 loads as early as possible — 4 weight (streaming) + 4 input (cached).
+        // Using __ldcs for weights since they are streamed once; __ldg for input since
+        // it is reused across all row blocks and benefits from caching.
+        uint4 wv0 = (idx0 < K_vec) ? __ldcs(&weight_v4[idx0]) : make_uint4(0,0,0,0);
+        uint4 xv0 = (idx0 < K_vec) ? __ldg(&input_v4[idx0])   : make_uint4(0,0,0,0);
+
+        uint4 wv1 = (idx1 < K_vec) ? __ldcs(&weight_v4[idx1]) : make_uint4(0,0,0,0);
+        uint4 xv1 = (idx1 < K_vec) ? __ldg(&input_v4[idx1])   : make_uint4(0,0,0,0);
+
+        uint4 wv2 = (idx2 < K_vec) ? __ldcs(&weight_v4[idx2]) : make_uint4(0,0,0,0);
+        uint4 xv2 = (idx2 < K_vec) ? __ldg(&input_v4[idx2])   : make_uint4(0,0,0,0);
+
+        uint4 wv3 = (idx3 < K_vec) ? __ldcs(&weight_v4[idx3]) : make_uint4(0,0,0,0);
+        uint4 xv3 = (idx3 < K_vec) ? __ldg(&input_v4[idx3])   : make_uint4(0,0,0,0);
+
+        __nv_bfloat162 wb0[4], xb0[4], wb1[4], xb1[4], wb2[4], xb2[4], wb3[4], xb3[4];
+        memcpy(wb0, &wv0, sizeof(uint4));  memcpy(xb0, &xv0, sizeof(uint4));
+        memcpy(wb1, &wv1, sizeof(uint4));  memcpy(xb1, &xv1, sizeof(uint4));
+        memcpy(wb2, &wv2, sizeof(uint4));  memcpy(xb2, &xv2, sizeof(uint4));
+        memcpy(wb3, &wv3, sizeof(uint4));  memcpy(xb3, &xv3, sizeof(uint4));
+
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            sum += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+        for (int j = 0; j < 4; ++j) {
+            float2 wf0 = __bfloat1622float2(wb0[j]);
+            float2 xf0 = __bfloat1622float2(xb0[j]);
+            float2 wf1 = __bfloat1622float2(wb1[j]);
+            float2 xf1 = __bfloat1622float2(xb1[j]);
+            float2 wf2 = __bfloat1622float2(wb2[j]);
+            float2 xf2 = __bfloat1622float2(xb2[j]);
+            float2 wf3 = __bfloat1622float2(wb3[j]);
+            float2 xf3 = __bfloat1622float2(xb3[j]);
+
+            sum0 = __fmaf_rn(wf0.x, xf0.x, sum0);
+            sum0 = __fmaf_rn(wf0.y, xf0.y, sum0);
+            sum1 = __fmaf_rn(wf1.x, xf1.x, sum1);
+            sum1 = __fmaf_rn(wf1.y, xf1.y, sum1);
+            sum2 = __fmaf_rn(wf2.x, xf2.x, sum2);
+            sum2 = __fmaf_rn(wf2.y, xf2.y, sum2);
+            sum3 = __fmaf_rn(wf3.x, xf3.x, sum3);
+            sum3 = __fmaf_rn(wf3.y, xf3.y, sum3);
         }
     }
 
+    float sum = (sum0 + sum1) + (sum2 + sum3);
+
+    // Tail loop for non-aligned K.
     for (int k = K_tail_start + tid; k < K; k += BLOCK_SIZE) {
         sum += __bfloat162float(weight_row[k]) * __bfloat162float(input_row[k]);
     }
@@ -190,20 +229,59 @@ bf16_gemv_splitk_kernel(
     const uint4* input_v4  = reinterpret_cast<const uint4*>(input_row);
     const uint4* weight_v4 = reinterpret_cast<const uint4*>(weight_row);
 
-    float sum = 0.0f;
     int g_thread = warp_id * GEMV_WARP_SIZE + lane;
     int g_threads = TOTAL_WARPS * GEMV_WARP_SIZE;
-    for (int ki = g_thread; ki < K_vec; ki += g_threads) {
-        uint4 wv = weight_v4[ki];
-        uint4 xv = input_v4[ki];
-        __nv_bfloat16 wb[8], xb[8];
-        uint4_to_bf16x8(wv, wb);
-        uint4_to_bf16x8(xv, xb);
+
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+
+    for (int ki = g_thread; ki < K_vec; ki += g_threads * 4) {
+        int idx0 = ki;
+        int idx1 = ki + g_threads;
+        int idx2 = ki + g_threads * 2;
+        int idx3 = ki + g_threads * 3;
+
+        uint4 wv0 = (idx0 < K_vec) ? __ldcs(&weight_v4[idx0]) : make_uint4(0,0,0,0);
+        uint4 xv0 = (idx0 < K_vec) ? __ldg(&input_v4[idx0])   : make_uint4(0,0,0,0);
+
+        uint4 wv1 = (idx1 < K_vec) ? __ldcs(&weight_v4[idx1]) : make_uint4(0,0,0,0);
+        uint4 xv1 = (idx1 < K_vec) ? __ldg(&input_v4[idx1])   : make_uint4(0,0,0,0);
+
+        uint4 wv2 = (idx2 < K_vec) ? __ldcs(&weight_v4[idx2]) : make_uint4(0,0,0,0);
+        uint4 xv2 = (idx2 < K_vec) ? __ldg(&input_v4[idx2])   : make_uint4(0,0,0,0);
+
+        uint4 wv3 = (idx3 < K_vec) ? __ldcs(&weight_v4[idx3]) : make_uint4(0,0,0,0);
+        uint4 xv3 = (idx3 < K_vec) ? __ldg(&input_v4[idx3])   : make_uint4(0,0,0,0);
+
+        __nv_bfloat162 wb0[4], xb0[4], wb1[4], xb1[4], wb2[4], xb2[4], wb3[4], xb3[4];
+        memcpy(wb0, &wv0, sizeof(uint4));  memcpy(xb0, &xv0, sizeof(uint4));
+        memcpy(wb1, &wv1, sizeof(uint4));  memcpy(xb1, &xv1, sizeof(uint4));
+        memcpy(wb2, &wv2, sizeof(uint4));  memcpy(xb2, &xv2, sizeof(uint4));
+        memcpy(wb3, &wv3, sizeof(uint4));  memcpy(xb3, &xv3, sizeof(uint4));
+
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            sum += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+        for (int j = 0; j < 4; ++j) {
+            float2 wf0 = __bfloat1622float2(wb0[j]);
+            float2 xf0 = __bfloat1622float2(xb0[j]);
+            float2 wf1 = __bfloat1622float2(wb1[j]);
+            float2 xf1 = __bfloat1622float2(xb1[j]);
+            float2 wf2 = __bfloat1622float2(wb2[j]);
+            float2 xf2 = __bfloat1622float2(xb2[j]);
+            float2 wf3 = __bfloat1622float2(wb3[j]);
+            float2 xf3 = __bfloat1622float2(xb3[j]);
+
+            sum0 = __fmaf_rn(wf0.x, xf0.x, sum0);
+            sum0 = __fmaf_rn(wf0.y, xf0.y, sum0);
+            sum1 = __fmaf_rn(wf1.x, xf1.x, sum1);
+            sum1 = __fmaf_rn(wf1.y, xf1.y, sum1);
+            sum2 = __fmaf_rn(wf2.x, xf2.x, sum2);
+            sum2 = __fmaf_rn(wf2.y, xf2.y, sum2);
+            sum3 = __fmaf_rn(wf3.x, xf3.x, sum3);
+            sum3 = __fmaf_rn(wf3.y, xf3.y, sum3);
         }
     }
+
+    float sum = (sum0 + sum1) + (sum2 + sum3);
+
     for (int k = K_tail_start + g_thread; k < K; k += g_threads) {
         sum += __bfloat162float(weight_row[k]) * __bfloat162float(input_row[k]);
     }
