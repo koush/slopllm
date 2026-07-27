@@ -3024,27 +3024,22 @@ export class ParallelOps implements DeviceOps {
     let prefetched = prefetchedStream?.result;
 
     const isSharedLayer = cfg.indexerTypes[cacheIdx] === "shared";
-    const isFullGathering = this.shouldGatherKv(state, false);
     if (isSharedLayer) {
-      if (prefetched) {
-        throw new Error(`sparseMlaPrepareCache: unexpected prefetched result for shared layer ${cacheIdx}`);
-      }
-
-      if (this.shouldGatherKv(state, true)) {
-        // 1-based distance back to the 'full' layer that gathered this buffer,
-        // matching the loop counter in sparseMlaPrepareSharedSlotsCache.
-        let d = 0;
-        while (cfg.indexerTypes[cacheIdx - d] === "shared") {
-          d++;
-        }
+      const isSparseGathering = this.shouldGatherKv(state, true);
+      if (!prefetched && isSparseGathering) {
+        // Sparse-gather decode: the full layer returned early (no extras
+        // stream), so the gathered flat buffer lives as a named workspace
+        // tensor materialized by sparseMlaPrepareSharedSlotsCache's
+        // gatherTopkCkv loop (ensureAlloc), not as a stream result in extras.
         prefetched = pIndptr.workspace.tensors.get(`sparseMlaPrefetch_${cacheIdx}`) as ParallelTensor;
         if (!prefetched) {
-          throw new Error(`sparseMlaPrepareCache: expected prefetched result for shared layer ${cacheIdx} (distance ${d})`);
+          throw new Error(`sparseMlaPrepareCache: expected prefetched result for shared layer ${cacheIdx}`);
         }
       }
     }
     else {
-      if (!prefetched && isFullGathering) {
+      const isFullGathering = this.shouldGatherKv(state, false);
+      if (!prefetched && isFullGathering && cacheIdx) {
         throw new Error(`sparseMlaPrepareCache: expected prefetched result for full layer ${cacheIdx}`);
       }
     }
