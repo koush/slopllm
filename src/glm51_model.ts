@@ -137,8 +137,9 @@ export class Glm51Model extends ChatModel {
       // very small, output goes through kv_a_layernorm, split into replicated ckv/k_pe_proj anyway
       //name.endsWith(".self_attn.kv_a_proj_with_mqa.weight") ||
       name.endsWith(".mlp.gate_proj.weight") ||
-      // moderate size weight but not worth it at tp8 possibly due to unsupported parallelism combos
-      // investigate further.
+      // moderate size weight but it is on critical path with nothing to overlap with at all.
+      // the other bf16 weights (indexer, ckv, q, etc) contend with each other, so overlap works there.
+      // but this linear happens in isolation.
       // name.endsWith(".mlp.gate.weight") ||
       name.endsWith(".mlp.up_proj.weight") ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".gate_proj.weight")) ||
