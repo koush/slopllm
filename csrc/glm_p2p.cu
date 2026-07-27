@@ -83,8 +83,21 @@ p2p_arrive_kernel(
         if (tid == my_rank) {
             s_peer_flags[my_rank][my_rank] = val;
         } else {
-            asm volatile("st.global.release.sys.s32 [%0], %1;"
+            // per Claude
+            // Kernel completion on GPU *i* is a system-scope synchronizing event:
+            // it drains the device's caches and write buffers to the point of coherence.
+            // This is exactly why `cudaMemcpyPeerAsync` after a kernel on the same stream works,
+            // and why the host can read results after `cudaStreamSynchronize`. So yes — all of
+            // kernel 1's P2P stores are pushed out before kernel 2 begins issuing. That edge is
+            // real, and the `.release` *ordering* on the flag store is redundant with respect to it.
+
+            asm volatile("st.global.relaxed.sys.s32 [%0], %1;"
                          :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
+
+            // so this is not needed because the kernel boundary gaurantees it.
+            // however if the arrive/barrier/op is FUSED then it would be needed.
+            // asm volatile("st.global.release.sys.s32 [%0], %1;"
+            //              :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
         }
     }
     __syncwarp();
@@ -536,6 +549,62 @@ rmsnorm_pointers_smem_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Write-based Row AllGather: each GPU reads its local shard from HBM and
+// writes it to all N peers' output buffers via NVLink. Fire-and-forget writes
+// avoid the round-trip latency of P2P reads. The caller issues arrive before
+// this kernel and wait after, so the barrier absorbs write latency.
+// ---------------------------------------------------------------------------
+
+constexpr int AG_WRITE_THREADS = 128;
+
+template <int N>
+__global__ void __launch_bounds__(AG_WRITE_THREADS, 4)
+p2p_allgather_row_write_kernel(
+    const void* __restrict__ local_shard,
+    void* __restrict__ out0,  void* __restrict__ out1,
+    void* __restrict__ out2,  void* __restrict__ out3,
+    void* __restrict__ out4,  void* __restrict__ out5,
+    void* __restrict__ out6,  void* __restrict__ out7,
+    int shard_dim1_bytes,
+    int full_dim1_bytes,
+    int outer,
+    int rank)
+{
+    constexpr int VEC = 16;  // int4
+    const int tid = threadIdx.x;
+    const int n_vec = shard_dim1_bytes / VEC;
+    const int tail = shard_dim1_bytes - n_vec * VEC;
+
+    void* dsts[AG_SMEM_MAX_N] = {
+        static_cast<char*>(out0), static_cast<char*>(out1),
+        static_cast<char*>(out2), static_cast<char*>(out3),
+        static_cast<char*>(out4), static_cast<char*>(out5),
+        static_cast<char*>(out6), static_cast<char*>(out7),
+    };
+
+    for (int row = blockIdx.x; row < outer; row += gridDim.x)
+    {
+        const char* src = static_cast<const char*>(local_shard)
+                          + (int64_t)row * shard_dim1_bytes;
+
+        #pragma unroll
+        for (int j = 0; j < N; j++) {
+            int peer = (j + blockIdx.x) % N;
+            char* dst = static_cast<char*>(dsts[peer])
+                        + (int64_t)row * full_dim1_bytes
+                        + (int64_t)rank * shard_dim1_bytes;
+            for (int i = tid; i < n_vec; i += AG_WRITE_THREADS)
+                *reinterpret_cast<int4*>(dst + i * VEC) =
+                    *reinterpret_cast<const int4*>(src + i * VEC);
+            if (tail > 0) {
+                int ti = n_vec * VEC + tid;
+                if (ti < shard_dim1_bytes) dst[ti] = src[ti];
+            }
+        }
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -787,6 +856,42 @@ void glm_p2p_allgather_row_smem(GlmCtx* ctx,
             break;
     }
     #undef LAUNCH_AG_ROW_SMEM
+}
+
+#define LAUNCH_AG_ROW_WRITE(N) \
+    do { \
+        p2p_allgather_row_write_kernel<N><<<grid, AG_WRITE_THREADS, 0, stream>>>( \
+            local_shard, \
+            const_cast<void*>(p[0]), const_cast<void*>(p[1]), \
+            const_cast<void*>(p[2]), const_cast<void*>(p[3]), \
+            const_cast<void*>(p[4]), const_cast<void*>(p[5]), \
+            const_cast<void*>(p[6]), const_cast<void*>(p[7]), \
+            shard_dim1_bytes, full_dim1_bytes, outer, rank); \
+    } while(0)
+
+void glm_p2p_allgather_row_write(GlmCtx* ctx,
+    const void* local_shard,
+    const void* p0,  const void* p1,  const void* p2,  const void* p3,
+    const void* p4,  const void* p5,  const void* p6,  const void* p7,
+    void* /*output*/, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer,
+    int rank) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    const void* p[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
+
+    int grid = outer;
+    if (grid > 512) grid = 512;
+    if (grid < 1) grid = 1;
+
+    switch (N) {
+        case 2:  LAUNCH_AG_ROW_WRITE(2);  break;
+        case 4:  LAUNCH_AG_ROW_WRITE(4);  break;
+        case 8:  LAUNCH_AG_ROW_WRITE(8);  break;
+        default:
+            fprintf(stderr, "glm_p2p_allgather_row_write: unsupported N=%d\n", N);
+            break;
+    }
+    #undef LAUNCH_AG_ROW_WRITE
 }
 
 // ---------------------------------------------------------------------------

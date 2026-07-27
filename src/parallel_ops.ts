@@ -209,93 +209,87 @@ export class ParallelTensor extends Tensor {
 
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
 
-    // all to all reduce
-    if (false) {
+    // all to all reduce: AllGather via P2P write, then local sum
+    if (true) {
       if (count > 65536 * 2)
         return false;
 
+      const elemBytes = ParallelTensor.elemBytes(this.type);
+      const shardBytes = count * elemBytes;
+      const fullBytes = shardBytes * this.worldSize;
+
+      // Allocate gathered buffer on each GPU: [count * worldSize, ...] flat
       const gatheredShards: Tensor[] = [];
       for (const shard of this.shards) {
-        const outerShape = shard.shape[0];
-        const gatheredShape = [outerShape * this.worldSize, ...shard.shape.slice(1)];
-        const gathered = shard.workspace.alloc(gatheredShape, shard.type);
+        const gathered = shard.workspace.alloc([count * this.worldSize], shard.type);
         gatheredShards.push(gathered);
       }
 
       const addon = getNativeAddon();
+
+      // AllGather via P2P write: each GPU writes its shard to all peers'
+      // gathered buffers at offset rank * shardBytes (flat concatenation).
       for (let i = 0; i < this.worldSize; i++) {
-        const shard = this.shards[i];
-        const outer = shard.shape[0];
-        const gatheredNarrows = gatheredShards.map(g => g.narrow(i * outer, outer));
-        const ptrs = new Array<number>(8).fill(0);
+        const rotatedPtrs = new Array<number>(8).fill(0);
         for (let k = 0; k < this.worldSize; k++) {
-          ptrs[k] = gatheredNarrows[(i + k) % this.worldSize].data;
+          rotatedPtrs[k] = gatheredShards[(i + k) % this.worldSize].data;
         }
-        addon.memcpyMulti(this.devices[i].ctx, shard.data,
-          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-          this.worldSize, shard.numElements, shard.type === "F32" ? 7 : 9);
-        for (const n of gatheredNarrows) {
-          n[Symbol.dispose]();
-        }
+        addon.p2pAllGatherRowWrite(
+          this.devices[i].ctx,
+          this.shards[i].data,
+          rotatedPtrs[0], rotatedPtrs[1], rotatedPtrs[2], rotatedPtrs[3],
+          rotatedPtrs[4], rotatedPtrs[5], rotatedPtrs[6], rotatedPtrs[7],
+          gatheredShards[i].data, this.worldSize, shardBytes, fullBytes, 1, i,
+        );
       }
 
-      group!.barrier(this.devices);
-      group!.cleanupSources();
-
+      group.barrier(this.devices);
+      group.cleanupSources();
+      group.sources.push(...gatheredShards);
+      const dtype = this.type === "F32" ? 7 : 9;
       for (let i = 0; i < this.worldSize; i++) {
         const gathered = gatheredShards[i];
-        const outer = this.shards[i].shape[0];
-        const shard = this.shards[i] as GlmTensor;
-        const numel = shard.numElements;
-        const dtype = shard.type === "F32" ? 7 : 9;
-        const gatheredNarrows = new Array<Tensor>(this.worldSize);
         const ptrs = new Array<number>(8).fill(0);
         for (let k = 0; k < this.worldSize; k++) {
-          gatheredNarrows[k] = gathered.narrow(k * outer, outer);
-          ptrs[k] = (gatheredNarrows[k] as GlmTensor).data;
+          const narrow = gathered.narrow(k * count, count);
+          ptrs[k] = (narrow as GlmTensor).data;
+          narrow[Symbol.dispose]();
         }
         addon.sumPointersDirect(
           this.devices[i].ctx,
           ptrs[0], ptrs[1], ptrs[2], ptrs[3],
           ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-          shard.data, this.worldSize, numel, dtype,
+          this.shards[i].data, this.worldSize, count, dtype,
         );
-        for (const gatheredNarrow of gatheredNarrows) {
-          gatheredNarrow[Symbol.dispose]();
-        }
-        gathered[Symbol.dispose]();
       }
 
       return true;
     }
 
     // row reduce + scatter
-    if (true) {
+    if (false) {
       if (count > 65536 * 2)
         return false;
 
-      group.barrier(this.devices);
-      group.cleanupSources();
+      group!.barrier(this.devices);
+      group!.cleanupSources();
 
       if (count % this.worldSize !== 0)
         return false;
       const chunkLen = count / this.worldSize;
       const flatShards = this.shards.map(s => s.reshape([count]));
-      group.sources.push(...flatShards);
+      group!.sources.push(...flatShards);
       for (let i = 0; i < this.worldSize; i++) {
         const rowShards: Tensor[] = new Array(this.worldSize);
-        // rank i starts with its own shard (j = i) and walks outward,
-        // instead of every rank hitting flatShards[0] first
         for (let k = 0; k < this.worldSize; k++) {
           const j = (i + k) % this.worldSize;
           const v = flatShards[j].narrow(i * chunkLen, chunkLen);
           rowShards[k] = v;
-          group.sources.push(v);
+          group!.sources.push(v);
         }
         rowShards[0].sumInPlace(rowShards, true);
       }
-      group.barrier(this.devices);
+      group!.barrier(this.devices);
 
       return true;
     }
@@ -435,22 +429,28 @@ export class ParallelTensor extends Tensor {
       return false;
 
     const addon = getNativeAddon();
-    const ptrs = new Array<number>(8).fill(0);
-    for (let i = 0; i < this.worldSize; i++) ptrs[i] = this.shards[i].data;
 
     if (this.parallelism === TensorParallelism.Column) {
-      // Smem-staged AllGather: barrier, then single kernel reads from all peers via TMA.
-      group.barrier(this.devices);
-      group.cleanupSources();
-      group.sources.push(...this.shards.map(s => s.viewClone()));
+      const fullBytes = shardBytes * this.worldSize;
+      // Write-based Column AllGather: each GPU writes its shard to all peers'
+      // output buffers (concatenation along dim 0), then barrier ensures all
+      // writes are visible. Uses same kernel as Row with outer=1.
       for (let i = 0; i < this.worldSize; ++i) {
-        addon.p2pAllGatherSmem(
+        const rotatedPtrs = new Array<number>(8).fill(0);
+        for (let k = 0; k < this.worldSize; k++) {
+          rotatedPtrs[k] = output.shards[(i + k) % this.worldSize].data;
+        }
+        addon.p2pAllGatherRowWrite(
           this.devices[i].ctx,
-          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-          output.shards[i].data, this.worldSize, shardBytes, i,
+          this.shards[i].data,
+          rotatedPtrs[0], rotatedPtrs[1], rotatedPtrs[2], rotatedPtrs[3],
+          rotatedPtrs[4], rotatedPtrs[5], rotatedPtrs[6], rotatedPtrs[7],
+          output.shards[i].data, this.worldSize, shardBytes, fullBytes, 1, i,
         );
       }
+      group.barrier(this.devices);
+      group.cleanupSources();
+      group.sources.push(...output.shards.map(s => s.viewClone()));
       return true;
     }
 
@@ -460,18 +460,26 @@ export class ParallelTensor extends Tensor {
       const shardDim1 = this.shape[1] / this.worldSize;
       const shardDim1Bytes = shardDim1 * inner * elemBytes;
       const fullDim1Bytes = this.shape[1] * inner * elemBytes;
-      // Smem-staged Row AllGather: barrier, then single kernel reads from all peers via TMA.
-      group.barrier(this.devices);
-      group.cleanupSources();
-      group.sources.push(...this.shards.map(s => s.viewClone()));
+      // Write-based Row AllGather: each GPU writes its shard to all peers'
+      // output buffers, then barrier ensures all writes are visible.
+      // Peer pointers are rotated by rank so all N GPUs don't target the
+      // same peer's NVLink port simultaneously.
       for (let i = 0; i < this.worldSize; ++i) {
-        addon.p2pAllGatherRowSmem(
+        const rotatedPtrs = new Array<number>(8).fill(0);
+        for (let k = 0; k < this.worldSize; k++) {
+          rotatedPtrs[k] = output.shards[(i + k) % this.worldSize].data;
+        }
+        addon.p2pAllGatherRowWrite(
           this.devices[i].ctx,
-          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+          this.shards[i].data,
+          rotatedPtrs[0], rotatedPtrs[1], rotatedPtrs[2], rotatedPtrs[3],
+          rotatedPtrs[4], rotatedPtrs[5], rotatedPtrs[6], rotatedPtrs[7],
           output.shards[i].data, this.worldSize, shardDim1Bytes, fullDim1Bytes, outer, i,
         );
       }
+      group.barrier(this.devices);
+      group.cleanupSources();
+      group.sources.push(...output.shards.map(s => s.viewClone()));
       return true;
     }
 
@@ -675,7 +683,9 @@ export class ParallelTensor extends Tensor {
             return this.linear(narrowed);
           }
         }
-        console.log(`[shard-candidate] weight=${pWeight.name ?? "(unnamed)"} shape=[${n}, ${weight.shape[1]}] batch=${batch} n/W=${n / W} allgather=${n * batch * 2}B`);
+        if (!pWeight.name?.includes(".mlp.gate.weight")) {
+          console.log(`[shard-candidate] weight=${pWeight.name ?? "(unnamed)"} shape=[${n}, ${weight.shape[1]}] batch=${batch} n/W=${n / W} allgather=${n * batch * 2}B`);
+        }
       }
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
@@ -1502,6 +1512,10 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism === TensorParallelism.PartialSum) {
       this.allReduce();
       return this.sigmoid();
+    }
+    if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
+      using gathered = this.allGather(this.workspace);
+      return gathered.sigmoid();
     }
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
