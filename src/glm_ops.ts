@@ -101,7 +101,6 @@ interface NativeAddon {
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
-  memcpyMulti(ctx: number, src: number, dst0: number, dst1: number, dst2: number, dst3: number, dst4: number, dst5: number, dst6: number, dst7: number, N: number, numel: number, dtype: number): void;
   sumPointersDirect(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, numel: number, dtype: number): void;
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
   positionStep(ctx: number, positionIds: number, lastPageLen: number, slotMapping: number, indptr: number, indices: number, pageSize: number, batchSize: number, steps: number): void;
@@ -174,6 +173,7 @@ interface NativeAddon {
   p2pSetPeers(ctx: number, instance: number, flagPtrs: number[]): void;
   p2pAllGatherSmem(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardBytes: number, rank: number): void;
   p2pAllGatherRowSmem(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number, rank: number): void;
+  p2pAllGatherRowWrite(ctx: number, localShard: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number, rank: number): void;
   p2pBarrier(ctx: number, instance: number, peerRank?: number): void;
   p2pArrive(ctx: number, instance: number, peerRank?: number): void;
   p2pWait(ctx: number, instance: number, peerRank?: number): void;

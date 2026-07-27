@@ -1016,35 +1016,6 @@ static Napi::Value Scale(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value MemcpyMulti(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 12) {
-        Napi::TypeError::New(env, "Expected (ctx, src, dst0..dst7, N, numel, dtype)").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t src_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t dst[8];
-    for (int i = 0; i < 8; i++) {
-        dst[i] = info[2 + i].As<Napi::Number>().Int64Value();
-    }
-    int N = info[10].As<Napi::Number>().Int32Value();
-    int64_t numel = info[11].As<Napi::Number>().Int64Value();
-    int dtype = info[12].As<Napi::Number>().Int32Value();
-    glm_memcpy_multi(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                     reinterpret_cast<const void*>(src_ptr),
-                     reinterpret_cast<void*>(dst[0]), reinterpret_cast<void*>(dst[1]),
-                     reinterpret_cast<void*>(dst[2]), reinterpret_cast<void*>(dst[3]),
-                     reinterpret_cast<void*>(dst[4]), reinterpret_cast<void*>(dst[5]),
-                     reinterpret_cast<void*>(dst[6]), reinterpret_cast<void*>(dst[7]),
-                     N, numel, dtype);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        Napi::Error::New(env, std::string("memcpyMulti failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
-    }
-    return env.Undefined();
-}
-
 static Napi::Value SumPointersDirect(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 12) {
@@ -4131,6 +4102,36 @@ static Napi::Value P2PAllGatherRowSmem(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value P2PAllGatherRowWrite(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 16) {
+        Napi::TypeError::New(env, "Expected (ctx, localShard, p0..p7, output, N, shardDim1Bytes, fullDim1Bytes, outer, rank)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t local_shard = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t p[8];
+    for (int i = 0; i < 8; i++) p[i] = info[2 + i].As<Napi::Number>().Int64Value();
+    uintptr_t output_ptr = info[10].As<Napi::Number>().Int64Value();
+    int N = info[11].As<Napi::Number>().Int32Value();
+    int shard_dim1_bytes = info[12].As<Napi::Number>().Int32Value();
+    int full_dim1_bytes = info[13].As<Napi::Number>().Int32Value();
+    int outer = info[14].As<Napi::Number>().Int32Value();
+    int rank = info[15].As<Napi::Number>().Int32Value();
+    glm_p2p_allgather_row_write(reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<const void*>(local_shard),
+        reinterpret_cast<const void*>(p[0]), reinterpret_cast<const void*>(p[1]),
+        reinterpret_cast<const void*>(p[2]), reinterpret_cast<const void*>(p[3]),
+        reinterpret_cast<const void*>(p[4]), reinterpret_cast<const void*>(p[5]),
+        reinterpret_cast<const void*>(p[6]), reinterpret_cast<const void*>(p[7]),
+        reinterpret_cast<void*>(output_ptr), N, shard_dim1_bytes, full_dim1_bytes, outer, rank);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("p2PAllGatherRowWrite failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value P2PBarrier(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2) {
@@ -4252,7 +4253,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "topk"), Napi::Function::New(env, Topk));
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));
     exports.Set(Napi::String::New(env, "scale"), Napi::Function::New(env, Scale));
-    exports.Set(Napi::String::New(env, "memcpyMulti"), Napi::Function::New(env, MemcpyMulti));
     exports.Set(Napi::String::New(env, "sumPointersDirect"), Napi::Function::New(env, SumPointersDirect));
     exports.Set(Napi::String::New(env, "sumPointers"), Napi::Function::New(env, SumPointers));
     exports.Set(Napi::String::New(env, "rmsNormPointers"), Napi::Function::New(env, RmsnormPointersSmem));
@@ -4366,6 +4366,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "p2pSetPeers"), Napi::Function::New(env, P2PSetPeers));
     exports.Set(Napi::String::New(env, "p2pAllGatherSmem"), Napi::Function::New(env, P2PAllGatherSmem));
     exports.Set(Napi::String::New(env, "p2pAllGatherRowSmem"), Napi::Function::New(env, P2PAllGatherRowSmem));
+    exports.Set(Napi::String::New(env, "p2pAllGatherRowWrite"), Napi::Function::New(env, P2PAllGatherRowWrite));
     exports.Set(Napi::String::New(env, "p2pBarrier"), Napi::Function::New(env, P2PBarrier));
     exports.Set(Napi::String::New(env, "p2pArrive"), Napi::Function::New(env, P2PArrive));
     exports.Set(Napi::String::New(env, "p2pWait"), Napi::Function::New(env, P2PWait));

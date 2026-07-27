@@ -270,15 +270,6 @@ void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
                            const int* qo_indptr, const int* new_tokens,
                            int batch_size);
 
-// Fan-out copy from one source to N destination pointers (max 8).
-// Pointers passed as kernel args for CUDA graph compatibility.
-// dtype: 9=BF16, 7=F32.
-void glm_memcpy_multi(GlmCtx* ctx,
-    const void* src,
-    void* dst0, void* dst1, void* dst2, void* dst3,
-    void* dst4, void* dst5, void* dst6, void* dst7,
-    int N, int64_t numel, int dtype);
-
 // Direct (no smem) element-wise sum of N tensors (max 8) into a separate output.
 // For local memory only — no smem staging or pipelining.
 // dtype: 9=BF16, 7=F32.
@@ -459,6 +450,15 @@ void glm_p2p_allgather_smem(GlmCtx* ctx,
 // Each peer contributes shard_dim1_bytes per row; output is interleaved:
 //   dst = output + row * full_dim1_bytes + peer_j * shard_dim1_bytes
 void glm_p2p_allgather_row_smem(GlmCtx* ctx,
+    const void* p0,  const void* p1,  const void* p2,  const void* p3,
+    const void* p4,  const void* p5,  const void* p6,  const void* p7,
+    void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer, int rank);
+
+// Write-based AllGather (Row layout). Caller issues arrive before and wait
+// after. Each GPU reads its local shard and writes to all N peers' outputs.
+//   peer_j_output + row * full_dim1_bytes + rank * shard_dim1_bytes
+void glm_p2p_allgather_row_write(GlmCtx* ctx,
+    const void* local_shard,
     const void* p0,  const void* p1,  const void* p2,  const void* p3,
     const void* p4,  const void* p5,  const void* p6,  const void* p7,
     void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer, int rank);
