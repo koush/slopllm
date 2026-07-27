@@ -36,7 +36,7 @@
   "tie_word_embeddings": true,
   "index_topk": 2048,
   "index_head_dim": 64,
-  "index_n_heads": 4,
+  "index_n_heads": 8,
   "rope_interleave": true,
   "indexer_rope_interleave": true,
   "ep_size": 1,
