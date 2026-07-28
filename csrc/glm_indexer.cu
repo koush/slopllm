@@ -336,6 +336,41 @@ void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
 // Effective page size = page_size / cp_world_size
 // ---------------------------------------------------------------------------
 
+#define TTS_THREADS 256
+#define TTS_WARPS (TTS_THREADS / 32)
+
+// Order-preserving block-wide stream compaction of one chunk of candidates.
+// Every thread in the block must call this with the same `base`; `slot` is the
+// calling thread's candidate (negative = dropped). Valid slots are appended to
+// out[] in ascending threadIdx.x order via a ballot prefix sum, so the result
+// depends only on the input. Returns the new base, uniform across the block.
+static __device__ __forceinline__ int tts_compact_append(
+    int32_t* __restrict__ out, int slot, int base, int* __restrict__ s_warp
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    const unsigned vote = __ballot_sync(0xffffffffu, slot >= 0);
+    if (lane == 0) s_warp[warp] = __popc(vote);
+    __syncthreads();
+
+    // Every thread scans the 8 warp counts: prefix -> this warp's base, sum ->
+    // the block total. Cheaper than a real scan at this width.
+    int warp_off = 0, total = 0;
+#pragma unroll
+    for (int w = 0; w < TTS_WARPS; w++) {
+        const int c = s_warp[w];
+        if (w < warp) warp_off += c;
+        total += c;
+    }
+
+    if (slot >= 0)
+        out[base + warp_off + __popc(vote & ((1u << lane) - 1))] = slot;
+
+    __syncthreads();  // s_warp is reused by the next chunk
+    return base + total;
+}
+
 // One block per query token. Valid slots are compacted to a contiguous prefix
 // [0, count) and the count is written to topk_length[token]; the sparse
 // attention kernel then only walks ceil(count/BI) candidate tiles instead of the
@@ -355,7 +390,10 @@ void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
 //
 // Compaction preserves input order: valid entries appear in the same relative
 // order as in topk_idx, so slots[t, 0..count) correspond to the valid subset of
-// topk_idx[t, *] in order.
+// topk_idx[t, *] in order. This is what makes the output deterministic — a
+// plain atomicAdd bump would compact the same set in whatever order the warps
+// happened to retire, which changes the order the sparse MLA kernel accumulates
+// its candidate tiles in and therefore perturbs the logits run to run.
 __global__ void topk_to_slots_kernel(
     int32_t* __restrict__ slots,          // [num_tokens, topk]
     int32_t* __restrict__ topk_length,    // [num_tokens] (nullable)
@@ -375,25 +413,26 @@ __global__ void topk_to_slots_kernel(
     int32_t* out = slots + (size_t)token * topk;
     const int32_t* in = topk_idx + (size_t)token * topk;
 
+    __shared__ int s_warp[TTS_WARPS];
+    int count = 0;
+
+    // The chunk loop is block-uniform (threads past topk carry slot = -1) so the
+    // ballot and __syncthreads() inside tts_compact_append see the whole block.
     if (cp_world_size == 1) {
         // Flat-index mode: slot = kvTokenIndptr[seq] + token_pos.
         // No CP filtering or page mapping — used after CKV gather when each
         // GPU has the full de-interleaved KV in a flat buffer.
-        __shared__ int s_count;
-        if (threadIdx.x == 0) s_count = 0;
-        __syncthreads();
+        const int flat_base = kv_token_indptr[seq];
 
-        for (int i = threadIdx.x; i < topk; i += blockDim.x) {
-            const int token_pos = in[i];
-            if (token_pos >= 0) {
-                out[atomicAdd(&s_count, 1)] = kv_token_indptr[seq] + token_pos;
+        for (int i0 = 0; i0 < topk; i0 += blockDim.x) {
+            const int i = i0 + threadIdx.x;
+            int slot = -1;
+            if (i < topk) {
+                const int token_pos = in[i];
+                if (token_pos >= 0) slot = flat_base + token_pos;
             }
+            count = tts_compact_append(out, slot, count, s_warp);
         }
-        __syncthreads();
-
-        const int count = s_count;
-        for (int i = count + threadIdx.x; i < topk; i += blockDim.x) out[i] = -1;
-        if (threadIdx.x == 0 && topk_length) topk_length[token] = count;
     } else {
         // Paged-slot mode: slot = abs_page * eff_page_size + offset
         // cp_world_size == 0 (non-CP) or > 1 (CP paged)
@@ -402,31 +441,31 @@ __global__ void topk_to_slots_kernel(
         const int eff_page_size = (cp_world_size > 1) ? (page_size / (int)cp_world_size) : page_size;
         const int local_kv_len = (num_pages - 1) * eff_page_size + last_page_len[seq];
 
-        __shared__ int s_count;
-        if (threadIdx.x == 0) s_count = 0;
-        __syncthreads();
-
-        for (int i = threadIdx.x; i < topk; i += blockDim.x) {
-            const int token_pos = in[i];
-            if (token_pos < 0) continue;
-            int local_pos;
-            if (cp_world_size > 1) {
-                if ((uint32_t)token_pos % cp_world_size != cp_rank) continue;
-                local_pos = (token_pos - (int)cp_rank) / (int)cp_world_size;
-            } else {
-                local_pos = token_pos;
+        for (int i0 = 0; i0 < topk; i0 += blockDim.x) {
+            const int i = i0 + threadIdx.x;
+            int slot = -1;
+            if (i < topk) {
+                const int token_pos = in[i];
+                int local_pos = -1;
+                if (token_pos >= 0) {
+                    if (cp_world_size > 1) {
+                        if ((uint32_t)token_pos % cp_world_size == cp_rank)
+                            local_pos = (token_pos - (int)cp_rank) / (int)cp_world_size;
+                    } else {
+                        local_pos = token_pos;
+                    }
+                }
+                if (local_pos >= 0 && local_pos < local_kv_len) {
+                    const int abs_page = page_indices[page_base + local_pos / eff_page_size];
+                    slot = abs_page * eff_page_size + (local_pos % eff_page_size);
+                }
             }
-            if (local_pos >= local_kv_len) continue;
-            const int abs_page = page_indices[page_base + local_pos / eff_page_size];
-            const int slot = abs_page * eff_page_size + (local_pos % eff_page_size);
-            out[atomicAdd(&s_count, 1)] = slot;
+            count = tts_compact_append(out, slot, count, s_warp);
         }
-        __syncthreads();
-
-        const int count = s_count;
-        for (int i = count + threadIdx.x; i < topk; i += blockDim.x) out[i] = -1;
-        if (threadIdx.x == 0 && topk_length) topk_length[token] = count;
     }
+
+    for (int i = count + threadIdx.x; i < topk; i += blockDim.x) out[i] = -1;
+    if (threadIdx.x == 0 && topk_length) topk_length[token] = count;
 }
 
 void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const int32_t* topk_idx,
@@ -436,8 +475,7 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const 
                        uint32_t cp_world_size, uint32_t cp_rank,
                        const int32_t* kv_token_indptr) {
     cudaSetDevice(ctx->device_id);
-    int smem = 0;
-    topk_to_slots_kernel<<<num_tokens, 256, smem, GLM_STREAM(ctx)>>>(
+    topk_to_slots_kernel<<<num_tokens, TTS_THREADS, 0, GLM_STREAM(ctx)>>>(
         slots, topk_length, topk_idx, page_indices, page_indptr, last_page_len, batch_indices,
         topk, page_size, num_tokens, cp_world_size, cp_rank, kv_token_indptr);
 }
