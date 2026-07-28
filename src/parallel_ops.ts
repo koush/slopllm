@@ -203,138 +203,84 @@ export class ParallelTensor extends Tensor {
       return false;
     if (this.type !== "BF16" && this.type !== "F32")
       return false;
-    const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
+    const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream)!;
     if (!group)
       return false;
 
-    const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
+    const count = this.numElements;
 
-    // all to all reduce: AllGather via P2P write, then local sum
-    if (true) {
-      if (count > 65536 * 2)
-        return false;
+    // all to all reduce: push-based reduce-scatter + gather (write+write).
+    // Two write-only kernels with one barrier between: (1) scatter each GPU's N
+    // chunks into peers' staging buffers, (2) reduce local staging and write the
+    // result chunk back to all peers. All cross-PCIe traffic is posted writes
+    // (no slow P2P reads), bandwidth-optimal at ~2N/GPU.
+    //
+    // No LEADING barrier is needed even though the scatter writes into peers'
+    // staging: staging is allocated from the group's private workspace
+    // (group.workspaces), which only barrier-bracketed P2P ops ever touch. An
+    // address handed out this iteration was last used (and freed) after a prior
+    // P2P barrier, so no peer can still be writing it. (Staging on the shared
+    // caller workspace WOULD race a lagging peer's unrelated in-flight kernel on
+    // the same recycled address -- that is the bug the private workspace fixes.)
+    // Too big for the P2P group, or an uneven split, falls back to NCCL.
+    if (count > 65536 * 2)
+      return false;
+    if (count % this.worldSize !== 0)
+      return false;
 
-      const elemBytes = ParallelTensor.elemBytes(this.type);
-      const shardBytes = count * elemBytes;
-      const fullBytes = shardBytes * this.worldSize;
+    const elemBytes = ParallelTensor.elemBytes(this.type);
+    const chunkLen = count / this.worldSize;
+    const chunkBytes = chunkLen * elemBytes;
+    const dtype = this.type === "F32" ? 7 : 9;
+    const addon = getNativeAddon();
 
-      // Allocate gathered buffer on each GPU: [count * worldSize, ...] flat
-      const gatheredShards: Tensor[] = [];
-      for (const shard of this.shards) {
-        const gathered = shard.workspace.alloc([count * this.worldSize], shard.type);
-        gatheredShards.push(gathered);
-      }
-
-      const addon = getNativeAddon();
-
-      // AllGather via P2P write: each GPU writes its shard to all peers'
-      // gathered buffers at offset rank * shardBytes (flat concatenation).
-      for (let i = 0; i < this.worldSize; i++) {
-        const rotatedPtrs = new Array<number>(8).fill(0);
-        for (let k = 0; k < this.worldSize; k++) {
-          rotatedPtrs[k] = gatheredShards[(i + k) % this.worldSize].data;
-        }
-        addon.p2pAllGatherRowWrite(
-          this.devices[i].ctx,
-          this.shards[i].data,
-          rotatedPtrs[0], rotatedPtrs[1], rotatedPtrs[2], rotatedPtrs[3],
-          rotatedPtrs[4], rotatedPtrs[5], rotatedPtrs[6], rotatedPtrs[7],
-          gatheredShards[i].data, this.worldSize, shardBytes, fullBytes, 1, i,
-        );
-      }
-
-      group.barrier(this.devices);
-      group.cleanupSources();
-      group.sources.push(...gatheredShards);
-      const dtype = this.type === "F32" ? 7 : 9;
-      for (let i = 0; i < this.worldSize; i++) {
-        const gathered = gatheredShards[i];
-        const ptrs = new Array<number>(8).fill(0);
-        for (let k = 0; k < this.worldSize; k++) {
-          const narrow = gathered.narrow(k * count, count);
-          ptrs[k] = (narrow as GlmTensor).data;
-          narrow[Symbol.dispose]();
-        }
-        addon.sumPointersDirect(
-          this.devices[i].ctx,
-          ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-          ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-          this.shards[i].data, this.worldSize, count, dtype,
-        );
-      }
-
-      return true;
+    // Per-GPU staging buffer laid out [worldSize, chunkLen]: slot j receives
+    // GPU j's contribution to this rank's chunk.
+    const staging: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      staging.push(group.workspaces[i].alloc(this.shape, this.type));
     }
 
-    // row reduce + scatter
-    if (false) {
-      if (count > 65536 * 2)
-        return false;
-
-      group!.barrier(this.devices);
-      group!.cleanupSources();
-
-      if (count % this.worldSize !== 0)
-        return false;
-      const chunkLen = count / this.worldSize;
-      const flatShards = this.shards.map(s => s.reshape([count]));
-      group!.sources.push(...flatShards);
-      for (let i = 0; i < this.worldSize; i++) {
-        const rowShards: Tensor[] = new Array(this.worldSize);
-        for (let k = 0; k < this.worldSize; k++) {
-          const j = (i + k) % this.worldSize;
-          const v = flatShards[j].narrow(i * chunkLen, chunkLen);
-          rowShards[k] = v;
-          group!.sources.push(v);
-        }
-        rowShards[0].sumInPlace(rowShards, true);
-      }
-      group!.barrier(this.devices);
-
-      return true;
+    // Phase 1: scatter. GPU i writes chunk k to peer k's staging slot i. The
+    // kernel rotates the peer order by rank; pointers pass in plain order.
+    for (let i = 0; i < this.worldSize; i++) {
+      const ptrs = new Array<number>(8).fill(0);
+      for (let k = 0; k < this.worldSize; k++)
+        ptrs[k] = staging[k].data;
+      addon.p2pReduceScatterWrite(
+        this.devices[i].ctx,
+        this.shards[i].data,
+        ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+        ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+        this.worldSize, chunkBytes, i,
+      );
     }
 
-    // butterfly reduce
-    if (true) {
-      if (count > 65536 * 2)
-        return false;
+    group.barrier(this.devices);
 
-      let current: Tensor[] = [];
-      for (let i = 0; i < this.worldSize; i++) {
-        const copy = this.shards[i].workspace.alloc(this.shards[i].shape, this.shards[i].type);
-        copy.memcpy(this.shards[i]);
-        current.push(copy);
-      }
-
-      for (let reduceHalf = this.worldSize / 2; reduceHalf >= 1; reduceHalf /= 2) {
-        const peerRanks = Array.from({ length: this.worldSize }, (_, i) => i ^ reduceHalf);
-        const isLast = reduceHalf === 1;
-
-        group!.barrier(this.devices, peerRanks);
-        if (reduceHalf === this.worldSize / 2) {
-          group!.cleanupSources();
-        }
-        group!.sources.push(...current);
-
-        if (isLast) {
-          for (let i = 0; i < this.worldSize; i++) {
-            const peer = i ^ reduceHalf;
-            this.shards[i].sumInPlace([current[i], current[peer]]);
-          }
-        } else {
-          const output: Tensor[] = new Array(this.worldSize);
-          for (let i = 0; i < this.worldSize; i++) {
-            const peer = i ^ reduceHalf;
-            output[i] = current[i].sum([current[peer]]);
-          }
-          current = output;
-        }
-      }
-
-      return true;
+    // Phase 2: reduce local staging, write reduced chunk i back to all peers'
+    // shards at offset i * chunkLen.
+    for (let i = 0; i < this.worldSize; i++) {
+      const ptrs = new Array<number>(8).fill(0);
+      for (let k = 0; k < this.worldSize; k++)
+        ptrs[k] = this.shards[k].data;
+      addon.p2pReduceGatherWrite(
+        this.devices[i].ctx,
+        staging[i].data,
+        ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+        ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+        this.worldSize, chunkLen, i, dtype,
+      );
     }
 
-    return false;
+    group.barrier(this.devices);
+
+    // due to the prior barrier, the staging buffers can immediately be recycled.
+    // all peers are done writing to them.
+    group.sources.push(...staging);
+    group.cleanupSources();
+
+    return true;
   }
 
   allGather(workspace: WorkspaceBase): ParallelTensor {
@@ -344,11 +290,15 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism === TensorParallelism.PartialSum) {
       throw new Error("allGather cannot be used on PartialSum tensors; use allReduce instead");
     }
-    const output = this.workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
 
-    if (this.tryP2PAllGather(output)) {
-      return output;
+    {
+      const output = this.tryP2PAllGather();
+      if (output) {
+        return output;
+      }
     }
+
+    const output = this.workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     const dtype = this.parallelOps.ncclDatatype(this.type);
@@ -416,19 +366,33 @@ export class ParallelTensor extends Tensor {
    * too large for the P2P group, in which case the caller should use NCCL.
    * Dtype-agnostic: copies raw bytes, supports all element types.
    */
-  private tryP2PAllGather(output: ParallelTensor): boolean {
+  private tryP2PAllGather(): ParallelTensor | undefined {
     if (!this.parallelOps.p2pEnabled)
-      return false;
+      return;
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     if (count > 65536 * 2)
-      return false;
+      return;
     const elemBytes = ParallelTensor.elemBytes(this.type);
     const shardBytes = count * elemBytes;
     const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
     if (!group)
-      return false;
+      return;
 
     const addon = getNativeAddon();
+
+    // Guard before allocating so the unsupported path can't leak the shards.
+    if (this.parallelism !== TensorParallelism.Column && this.parallelism !== TensorParallelism.Row) {
+      throw new Error(`tryP2PAllGather: unsupported parallelism ${this.parallelism}`);
+    }
+
+    const shards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      shards.push(group.workspaces[i].alloc(this.shape, this.type));
+    }
+
+    const output = this.parallelOps.wrapShards(
+      this.workspace, shards, this.shape, this.type, TensorParallelism.Replicated,
+    );
 
     if (this.parallelism === TensorParallelism.Column) {
       const fullBytes = shardBytes * this.worldSize;
@@ -450,8 +414,8 @@ export class ParallelTensor extends Tensor {
       }
       group.barrier(this.devices);
       group.cleanupSources();
-      group.sources.push(...output.shards.map(s => s.viewClone()));
-      return true;
+      group.sources.push(...shards.map(s => s.viewClone()));
+      return output;
     }
 
     if (this.parallelism === TensorParallelism.Row) {
@@ -479,11 +443,11 @@ export class ParallelTensor extends Tensor {
       }
       group.barrier(this.devices);
       group.cleanupSources();
-      group.sources.push(...output.shards.map(s => s.viewClone()));
-      return true;
+      group.sources.push(...shards.map(s => s.viewClone()));
+      return output;
     }
 
-    return false;
+    throw new Error(`tryP2PAllGather: unsupported parallelism ${this.parallelism}`);
   }
 
   sliceToRowParallel(workspace: WorkspaceBase, shardDim1: number): ParallelTensor {
@@ -2027,6 +1991,7 @@ class P2PAllReduceGroup {
   private readonly flagPtrs: number[];
   readonly worldSize: number;
   private readonly devices: readonly GlmOps[];
+  workspaces: WorkspaceBase[];
 
   constructor(devices: readonly GlmOps[]) {
     this.worldSize = devices.length;
@@ -2045,6 +2010,8 @@ class P2PAllReduceGroup {
     for (let i = 0; i < this.worldSize; ++i) {
       addon.p2pSetPeers(this.devices[i].ctx, this.instances[i], this.flagPtrs);
     }
+
+    this.workspaces = devices.map(d => new WorkspaceBase(d));
   }
 
   /**
@@ -2068,6 +2035,9 @@ class P2PAllReduceGroup {
 
   free(): void {
     this.cleanupSources();
+    for (const ws of this.workspaces) {
+      ws.free();
+    }
     for (const inst of this.instances) {
       getNativeAddon().p2pDestroyInstance(inst);
     }

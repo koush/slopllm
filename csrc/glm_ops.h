@@ -437,23 +437,6 @@ int* glm_p2p_get_flag_ptr(GlmP2PInstance* inst);
 void glm_p2p_set_peers(GlmCtx* ctx, GlmP2PInstance* inst,
                        int* const* peer_flag_ptrs);
 
-// Smem-staged AllGather (Column layout). Requires p2p_barrier before call.
-// Each peer contributes shard_bytes from its pointer; output receives
-// the concatenated result (N * shard_bytes bytes total).
-// Peer pointers p0..p7 are the per-GPU source data pointers (up to 8).
-void glm_p2p_allgather_smem(GlmCtx* ctx,
-    const void* p0,  const void* p1,  const void* p2,  const void* p3,
-    const void* p4,  const void* p5,  const void* p6,  const void* p7,
-    void* output, int N, int shard_bytes, int rank);
-
-// Smem-staged AllGather (Row layout). Requires p2p_barrier before call.
-// Each peer contributes shard_dim1_bytes per row; output is interleaved:
-//   dst = output + row * full_dim1_bytes + peer_j * shard_dim1_bytes
-void glm_p2p_allgather_row_smem(GlmCtx* ctx,
-    const void* p0,  const void* p1,  const void* p2,  const void* p3,
-    const void* p4,  const void* p5,  const void* p6,  const void* p7,
-    void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer, int rank);
-
 // Write-based AllGather (Row layout). Caller issues arrive before and wait
 // after. Each GPU reads its local shard and writes to all N peers' outputs.
 //   peer_j_output + row * full_dim1_bytes + rank * shard_dim1_bytes
@@ -462,6 +445,23 @@ void glm_p2p_allgather_row_write(GlmCtx* ctx,
     const void* p0,  const void* p1,  const void* p2,  const void* p3,
     const void* p4,  const void* p5,  const void* p6,  const void* p7,
     void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer, int rank);
+
+// Push-based reduce-scatter AllReduce (write+write), phase 1: scatter. Each GPU
+// writes its N chunks to peers' staging buffers [N, chunkLen] at slot `rank`.
+// Peer order rotated by rank (permutation schedule, single-block-safe).
+void glm_p2p_reduce_scatter_write(GlmCtx* ctx,
+    const void* local_shard,
+    void* p0, void* p1, void* p2, void* p3,
+    void* p4, void* p5, void* p6, void* p7,
+    int N, int chunk_bytes, int rank);
+
+// Push-based reduce-scatter AllReduce, phase 2: reduce local staging [N, chunkLen]
+// and write reduced chunk `rank` to every peer's output at offset rank*chunk_len.
+void glm_p2p_reduce_gather_write(GlmCtx* ctx,
+    const void* staging,
+    void* p0, void* p1, void* p2, void* p3,
+    void* p4, void* p5, void* p6, void* p7,
+    int N, int chunk_len, int rank, int dtype);
 
 // P2P barrier: increment seq counter, publish flag, wait for all peers.
 void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank = -1);

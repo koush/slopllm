@@ -171,9 +171,9 @@ interface NativeAddon {
   p2pDestroyInstance(instance: number): void;
   p2pGetFlagPtr(instance: number): number;
   p2pSetPeers(ctx: number, instance: number, flagPtrs: number[]): void;
-  p2pAllGatherSmem(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardBytes: number, rank: number): void;
-  p2pAllGatherRowSmem(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number, rank: number): void;
   p2pAllGatherRowWrite(ctx: number, localShard: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, shardDim1Bytes: number, fullDim1Bytes: number, outer: number, rank: number): void;
+  p2pReduceScatterWrite(ctx: number, localShard: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, N: number, chunkBytes: number, rank: number): void;
+  p2pReduceGatherWrite(ctx: number, staging: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, N: number, chunkLen: number, rank: number, dtype: number): void;
   p2pBarrier(ctx: number, instance: number, peerRank?: number): void;
   p2pArrive(ctx: number, instance: number, peerRank?: number): void;
   p2pWait(ctx: number, instance: number, peerRank?: number): void;
