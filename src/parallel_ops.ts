@@ -274,11 +274,8 @@ export class ParallelTensor extends Tensor {
     }
 
     group.barrier(this.devices);
-
-    // due to the prior barrier, the staging buffers can immediately be recycled.
-    // all peers are done writing to them.
-    group.sources.push(...staging);
     group.cleanupSources();
+    group.sources.push(...staging);
 
     return true;
   }
@@ -291,14 +288,11 @@ export class ParallelTensor extends Tensor {
       throw new Error("allGather cannot be used on PartialSum tensors; use allReduce instead");
     }
 
-    {
-      const output = this.tryP2PAllGather();
-      if (output) {
-        return output;
-      }
-    }
-
     const output = this.workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
+
+    if (this.tryP2PAllGather(output)) {
+      return output;
+    }
 
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     const dtype = this.parallelOps.ncclDatatype(this.type);
@@ -366,17 +360,17 @@ export class ParallelTensor extends Tensor {
    * too large for the P2P group, in which case the caller should use NCCL.
    * Dtype-agnostic: copies raw bytes, supports all element types.
    */
-  private tryP2PAllGather(): ParallelTensor | undefined {
+  private tryP2PAllGather(output: ParallelTensor): boolean {
     if (!this.parallelOps.p2pEnabled)
-      return;
+      return false;
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     if (count > 65536 * 2)
-      return;
+      return false;
     const elemBytes = ParallelTensor.elemBytes(this.type);
     const shardBytes = count * elemBytes;
     const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
     if (!group)
-      return;
+      return false;
 
     const addon = getNativeAddon();
 
@@ -390,10 +384,6 @@ export class ParallelTensor extends Tensor {
       shards.push(group.workspaces[i].alloc(this.shape, this.type));
     }
 
-    const output = this.parallelOps.wrapShards(
-      this.workspace, shards, this.shape, this.type, TensorParallelism.Replicated,
-    );
-
     if (this.parallelism === TensorParallelism.Column) {
       const fullBytes = shardBytes * this.worldSize;
       // Write-based Column AllGather: each GPU writes its shard to all peers'
@@ -402,20 +392,29 @@ export class ParallelTensor extends Tensor {
       for (let i = 0; i < this.worldSize; ++i) {
         const rotatedPtrs = new Array<number>(8).fill(0);
         for (let k = 0; k < this.worldSize; k++) {
-          rotatedPtrs[k] = output.shards[(i + k) % this.worldSize].data;
+          rotatedPtrs[k] = shards[(i + k) % this.worldSize].data;
         }
         addon.p2pAllGatherRowWrite(
           this.devices[i].ctx,
           this.shards[i].data,
           rotatedPtrs[0], rotatedPtrs[1], rotatedPtrs[2], rotatedPtrs[3],
           rotatedPtrs[4], rotatedPtrs[5], rotatedPtrs[6], rotatedPtrs[7],
-          output.shards[i].data, this.worldSize, shardBytes, fullBytes, 1, i,
+          shards[i].data, this.worldSize, shardBytes, fullBytes, 1, i,
         );
       }
       group.barrier(this.devices);
-      group.cleanupSources();
+
+      for (let i = 0; i < this.worldSize; i++) {
+        output.shards[i].memcpy(shards[i], shards[i].bytes, MemcpyKind.DeviceToDevice);
+      }
+
+      // due to the prior barrier, the staging buffers can immediately be recycled.
+      // all peers are done writing to them.
       group.sources.push(...shards.map(s => s.viewClone()));
-      return output;
+      group.cleanupSources();
+
+
+      return true;
     }
 
     if (this.parallelism === TensorParallelism.Row) {
@@ -431,20 +430,26 @@ export class ParallelTensor extends Tensor {
       for (let i = 0; i < this.worldSize; ++i) {
         const rotatedPtrs = new Array<number>(8).fill(0);
         for (let k = 0; k < this.worldSize; k++) {
-          rotatedPtrs[k] = output.shards[(i + k) % this.worldSize].data;
+          rotatedPtrs[k] = shards[(i + k) % this.worldSize].data;
         }
         addon.p2pAllGatherRowWrite(
           this.devices[i].ctx,
           this.shards[i].data,
           rotatedPtrs[0], rotatedPtrs[1], rotatedPtrs[2], rotatedPtrs[3],
           rotatedPtrs[4], rotatedPtrs[5], rotatedPtrs[6], rotatedPtrs[7],
-          output.shards[i].data, this.worldSize, shardDim1Bytes, fullDim1Bytes, outer, i,
+          shards[i].data, this.worldSize, shardDim1Bytes, fullDim1Bytes, outer, i,
         );
       }
       group.barrier(this.devices);
+
+      for (let i = 0; i < this.worldSize; i++) {
+        output.shards[i].memcpy(shards[i], shards[i].bytes, MemcpyKind.DeviceToDevice);
+      }
+
       group.cleanupSources();
       group.sources.push(...shards.map(s => s.viewClone()));
-      return output;
+
+      return true;
     }
 
     throw new Error(`tryP2PAllGather: unsupported parallelism ${this.parallelism}`);
