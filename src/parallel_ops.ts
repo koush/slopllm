@@ -14,6 +14,8 @@ import { WorkspaceBase } from "./workspace";
 // the indexer flat-slot mode (topkToSlots ignores kvTokenIndptr when off)
 // read this so they never diverge.
 export const CP_GATHER_KV = process.env.GLM_CP_GATHER_KV !== "0";
+// Fall back to the read-based (pull) CP merge; the push path is the default.
+export const CP_MERGE_PULL = process.env.GLM_CP_MERGE_PULL === "1";
 
 export class ParallelTensor extends Tensor {
   parallelism: TensorParallelism;
@@ -2192,9 +2194,108 @@ export class ParallelOps implements DeviceOps {
   ): ParallelTensor {
     const count = partialVOuts.shards[0].shape.reduce((a, b) => a * b, 1);
     if (this.p2pEnabled && count <= 65536 * 2) {
-      return this.cpMergeTreeReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace);
+      return CP_MERGE_PULL
+        ? this.cpMergeTreeReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace)
+        : this.cpMergePushReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace);
     }
     return this.agRsMerge(partialVOuts.shards, partialLses, batchSize, numHeads, vHeadDim, workspace);
+  }
+
+  /**
+   * Push-based CP merge: scatter each peer's head slice into that peer's staging
+   * buffer, barrier, then merge locally. Same Row-parallel result as
+   * cpMergeTreeReduce, but every cross-device access is a posted write instead
+   * of a blocking P2P read.
+   *
+   * Ordering, in the terms this file's other write-based collectives use:
+   *
+   * - No LEADING barrier. Peers write into `stage*`, which comes from the P2P
+   *   group's private workspace, and the retention below keeps an address out
+   *   of circulation until a barrier downstream of its last reader. Note this
+   *   is the reason the pull version *does* need a leading barrier: there peers
+   *   read the caller's partials, so the producer's attention kernel has to be
+   *   proven complete first. Here nobody touches the partials remotely.
+   * - TRAILING barrier before phase 2, which is what makes the local merge's
+   *   reads of `stage*` valid.
+   * - Retention is cleanup-then-push (one round). The merge reads `stage*`
+   *   *after* the trailing barrier, so that barrier does not cover it; the
+   *   first sync that does is the next collective's, which is exactly what one
+   *   round of deferral waits for. Pushing before cleanup would free the
+   *   staging immediately and let a peer's next collective overwrite it
+   *   mid-merge.
+   */
+  private cpMergePushReduce(
+    partialVOuts: readonly Tensor[],
+    partialLses: readonly Tensor[],
+    batchSize: number,
+    numHeads: number,
+    vHeadDim: number,
+    workspace: WorkspaceBase,
+  ): ParallelTensor {
+    const group = this.getP2PGroup(this.devices[0].currentStream);
+    if (!group) throw new Error("cpMergePushReduce: P2P group unavailable");
+
+    const shardNHeads = this.shardDim(numHeads, "cpMergePushReduce shardNHeads");
+    const shardWss = this.getShardWorkspaces(workspace);
+
+    // Staging: [world, batch, shardNHeads, vHeadDim] BF16 + [world, batch,
+    // shardNHeads] F32. Slot j receives rank j's contribution to this rank's
+    // head slice. Total staging is batch*numHeads*vHeadDim -- the same size as
+    // one rank's partial, so it fits the same P2P size gate as the caller.
+    const stageV: Tensor[] = [];
+    const stageLse: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      stageV.push(group.workspaces[i].alloc([this.worldSize * batchSize * shardNHeads, vHeadDim], "BF16"));
+      stageLse.push(group.workspaces[i].alloc([this.worldSize * batchSize, shardNHeads], "F32"));
+    }
+
+    // Phase 1: scatter. Destination pointers are rotated by rank here; the
+    // kernel rotates again by blockIdx.x so concurrent blocks target different
+    // peers (see cp_merge_scatter_kernel).
+    for (let i = 0; i < this.worldSize; i++) {
+      const vPtrs = new Array<number>(8).fill(0);
+      const lsePtrs = new Array<number>(8).fill(0);
+      for (let k = 0; k < this.worldSize; k++) {
+        const peer = (i + k) % this.worldSize;
+        vPtrs[k] = stageV[peer].data;
+        lsePtrs[k] = stageLse[peer].data;
+      }
+      this.devices[i].cpMergeScatter(
+        partialVOuts[i], partialLses[i], vPtrs, lsePtrs,
+        this.worldSize, batchSize, shardNHeads, vHeadDim, numHeads, numHeads, i,
+      );
+    }
+
+    group.barrier(this.devices);
+
+    // Phase 2: local online-softmax merge of the world_size staging slots.
+    const outputV: Tensor[] = [];
+    const outputLse: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      outputV.push(shardWss[i].alloc([batchSize, shardNHeads * vHeadDim], "BF16"));
+      outputLse.push(shardWss[i].alloc([batchSize, shardNHeads], "F32"));
+    }
+
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].cpMergeLocal(
+        stageV[i], stageLse[i], outputV[i], outputLse[i],
+        this.worldSize, batchSize, shardNHeads, vHeadDim,
+      );
+    }
+
+    group.cleanupSources();
+    group.sources.push(
+      ...stageV.map(t => t.viewClone()),
+      ...stageLse.map(t => t.viewClone()),
+    );
+
+    // outputLse is local-only and unused downstream; any reuse of its address is
+    // on this device's stream, hence ordered behind the merge kernel above.
+    for (const lse of outputLse) {
+      lse[Symbol.dispose]();
+    }
+
+    return this.wrapShards(workspace, outputV, [batchSize, numHeads * vHeadDim], "BF16", TensorParallelism.Row);
   }
 
   /**

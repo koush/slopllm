@@ -3648,6 +3648,81 @@ static Napi::Value CpMergeTree(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value CpMergeScatter(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 26) {
+        Napi::TypeError::New(env, "Expected (ctx, local_v, local_lse, dv0..dv7, dl0..dl7, world_size, batch_size, shard_n_heads, v_head_dim, input_n_heads, num_heads, rank)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t local_v_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t local_lse_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t dv[8], dl[8];
+    for (int i = 0; i < 8; i++) {
+        dv[i] = info[3 + i].As<Napi::Number>().Int64Value();
+        dl[i] = info[11 + i].As<Napi::Number>().Int64Value();
+    }
+    int world_size = info[19].As<Napi::Number>().Int32Value();
+    int batch_size = info[20].As<Napi::Number>().Int32Value();
+    int shard_n_heads = info[21].As<Napi::Number>().Int32Value();
+    int v_head_dim = info[22].As<Napi::Number>().Int32Value();
+    int input_n_heads = info[23].As<Napi::Number>().Int32Value();
+    int num_heads = info[24].As<Napi::Number>().Int32Value();
+    int rank = info[25].As<Napi::Number>().Int32Value();
+
+    glm_cp_merge_scatter(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<const void*>(local_v_ptr),
+        reinterpret_cast<const float*>(local_lse_ptr),
+        reinterpret_cast<void*>(dv[0]), reinterpret_cast<void*>(dv[1]),
+        reinterpret_cast<void*>(dv[2]), reinterpret_cast<void*>(dv[3]),
+        reinterpret_cast<void*>(dv[4]), reinterpret_cast<void*>(dv[5]),
+        reinterpret_cast<void*>(dv[6]), reinterpret_cast<void*>(dv[7]),
+        reinterpret_cast<float*>(dl[0]), reinterpret_cast<float*>(dl[1]),
+        reinterpret_cast<float*>(dl[2]), reinterpret_cast<float*>(dl[3]),
+        reinterpret_cast<float*>(dl[4]), reinterpret_cast<float*>(dl[5]),
+        reinterpret_cast<float*>(dl[6]), reinterpret_cast<float*>(dl[7]),
+        world_size, batch_size, shard_n_heads, v_head_dim,
+        input_n_heads, num_heads, rank);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("cpMergeScatter failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value CpMergeLocal(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 9) {
+        Napi::TypeError::New(env, "Expected (ctx, stage_v, stage_lse, output_v, output_lse, world_size, batch_size, shard_n_heads, v_head_dim)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t stage_v_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t stage_lse_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t output_v_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t output_lse_ptr = info[4].As<Napi::Number>().Int64Value();
+    int world_size = info[5].As<Napi::Number>().Int32Value();
+    int batch_size = info[6].As<Napi::Number>().Int32Value();
+    int shard_n_heads = info[7].As<Napi::Number>().Int32Value();
+    int v_head_dim = info[8].As<Napi::Number>().Int32Value();
+
+    glm_cp_merge_local(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<const void*>(stage_v_ptr),
+        reinterpret_cast<const float*>(stage_lse_ptr),
+        reinterpret_cast<void*>(output_v_ptr),
+        reinterpret_cast<float*>(output_lse_ptr),
+        world_size, batch_size, shard_n_heads, v_head_dim);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("cpMergeLocal failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value CpCorrectAttnOut(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 9) {
@@ -4343,6 +4418,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "rmsnormGated"), Napi::Function::New(env, RmsnormGated));
     exports.Set(Napi::String::New(env, "gateSigmoidMul"), Napi::Function::New(env, GateSigmoidMul));
     exports.Set(Napi::String::New(env, "cpMergeTree"), Napi::Function::New(env, CpMergeTree));
+    exports.Set(Napi::String::New(env, "cpMergeScatter"), Napi::Function::New(env, CpMergeScatter));
+    exports.Set(Napi::String::New(env, "cpMergeLocal"), Napi::Function::New(env, CpMergeLocal));
     exports.Set(Napi::String::New(env, "cpCorrectAttnOut"), Napi::Function::New(env, CpCorrectAttnOut));
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
     exports.Set(Napi::String::New(env, "rotateInputIds"), Napi::Function::New(env, RotateInputIds));

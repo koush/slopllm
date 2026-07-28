@@ -2144,6 +2144,40 @@ class GlmOps:
             snh, ho, inh,
         )
 
+    def cp_merge_scatter(self, local_v, local_lse, dv_ptrs, dl_ptrs, world_size,
+                         batch_size, shard_n_heads, v_head_dim, input_n_heads,
+                         num_heads, rank):
+        dv_args = [ctypes.c_void_p(int(p)) for p in dv_ptrs] + [ctypes.c_void_p(0)] * (8 - len(dv_ptrs))
+        dl_args = [ctypes.c_void_p(int(p)) for p in dl_ptrs] + [ctypes.c_void_p(0)] * (8 - len(dl_ptrs))
+        self.lib.glm_cp_merge_scatter.restype = None
+        self.lib.glm_cp_merge_scatter.argtypes = (
+            [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p] +
+            [ctypes.c_void_p] * 8 +
+            [ctypes.c_void_p] * 8 +
+            [ctypes.c_int] * 7
+        )
+        self.lib.glm_cp_merge_scatter(
+            self.ctx,
+            ctypes.c_void_p(int(local_v)), ctypes.c_void_p(int(local_lse)),
+            *dv_args, *dl_args,
+            world_size, batch_size, shard_n_heads, v_head_dim,
+            input_n_heads, num_heads, rank,
+        )
+
+    def cp_merge_local(self, stage_v, stage_lse, output_v, output_lse,
+                       world_size, batch_size, shard_n_heads, v_head_dim):
+        self.lib.glm_cp_merge_local.restype = None
+        self.lib.glm_cp_merge_local.argtypes = (
+            [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4
+        )
+        self.lib.glm_cp_merge_local(
+            self.ctx,
+            ctypes.c_void_p(int(stage_v)), ctypes.c_void_p(int(stage_lse)),
+            ctypes.c_void_p(int(output_v)),
+            ctypes.c_void_p(int(output_lse)) if output_lse is not None else ctypes.c_void_p(0),
+            world_size, batch_size, shard_n_heads, v_head_dim,
+        )
+
     def p2p_create_instance(self, my_rank, world_size, device_ids):
         arr = (ctypes.c_int * world_size)(*device_ids)
         return self.lib.glm_p2p_create_instance(self.ctx, my_rank, world_size, arr)

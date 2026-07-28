@@ -178,6 +178,8 @@ interface NativeAddon {
   p2pArrive(ctx: number, instance: number, peerRank?: number): void;
   p2pWait(ctx: number, instance: number, peerRank?: number): void;
   cpMergeTree(ctx: number, v0: number, v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number, lse0: number, lse1: number, lse2: number, lse3: number, lse4: number, lse5: number, lse6: number, lse7: number, numShards: number, outputV: number, outputLse: number, numel: number, batchSize: number, numHeads: number, vHeadDim: number, shardNHeads: number, headOffset: number, inputNHeads: number): void;
+  cpMergeScatter(ctx: number, localV: number, localLse: number, dv0: number, dv1: number, dv2: number, dv3: number, dv4: number, dv5: number, dv6: number, dv7: number, dl0: number, dl1: number, dl2: number, dl3: number, dl4: number, dl5: number, dl6: number, dl7: number, worldSize: number, batchSize: number, shardNHeads: number, vHeadDim: number, inputNHeads: number, numHeads: number, rank: number): void;
+  cpMergeLocal(ctx: number, stageV: number, stageLse: number, outputV: number, outputLse: number, worldSize: number, batchSize: number, shardNHeads: number, vHeadDim: number): void;
   cpCorrectAttnOut(ctx: number, vOut: number, lses: number, globalLse: number, batchSize: number, numHeads: number, vHeadDim: number, worldSize: number, rank: number): void;
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   relu(ctx: number, out: number, input: number, n: number): void;
@@ -1336,6 +1338,34 @@ export class GlmOps implements DeviceOps {
       lse[0], lse[1], lse[2], lse[3], lse[4], lse[5], lse[6], lse[7],
       numShards, ptr(outputV), outputLse ? ptr(outputLse) : 0, numel, batchSize, numHeads, vHeadDim,
       snh, ho, inh,
+    );
+  }
+
+  /**
+   * Push-based CP merge, phase 1. Writes each peer's head slice into that peer's
+   * staging buffer at slot `rank`. `stageVPtrs`/`stageLsePtrs` must already be
+   * rotated by rank host-side: entry k belongs to peer (rank + k) % worldSize.
+   */
+  cpMergeScatter(localV: Tensor, localLse: Tensor, stageVPtrs: number[], stageLsePtrs: number[], worldSize: number, batchSize: number, shardNHeads: number, vHeadDim: number, inputNHeads: number, numHeads: number, rank: number): void {
+    const dv = new Array<number>(8).fill(0);
+    const dl = new Array<number>(8).fill(0);
+    for (let i = 0; i < worldSize; i++) {
+      dv[i] = stageVPtrs[i];
+      dl[i] = stageLsePtrs[i];
+    }
+    getNativeAddon().cpMergeScatter(
+      this.ctx, ptr(localV), ptr(localLse),
+      dv[0], dv[1], dv[2], dv[3], dv[4], dv[5], dv[6], dv[7],
+      dl[0], dl[1], dl[2], dl[3], dl[4], dl[5], dl[6], dl[7],
+      worldSize, batchSize, shardNHeads, vHeadDim, inputNHeads, numHeads, rank,
+    );
+  }
+
+  /** Push-based CP merge, phase 2. Must follow a barrier over phase 1. */
+  cpMergeLocal(stageV: Tensor, stageLse: Tensor, outputV: Tensor, outputLse: Tensor | null, worldSize: number, batchSize: number, shardNHeads: number, vHeadDim: number): void {
+    getNativeAddon().cpMergeLocal(
+      this.ctx, ptr(stageV), ptr(stageLse), ptr(outputV), outputLse ? ptr(outputLse) : 0,
+      worldSize, batchSize, shardNHeads, vHeadDim,
     );
   }
 

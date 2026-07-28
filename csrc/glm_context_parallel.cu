@@ -244,6 +244,271 @@ void glm_cp_merge_tree(
 } // extern "C"
 
 // ---------------------------------------------------------------------------
+// Push-based CP merge, phase 1: scatter heads to the rank that owns them.
+//
+// Every rank holds a full-width partial (all num_heads) for its own KV shard,
+// but rank r only needs to produce the merged output for its head slice
+// [r*shard_n_heads, (r+1)*shard_n_heads). This kernel *writes* each peer's head
+// slice into that peer's staging buffer at slot `rank`, so no GPU issues a P2P
+// read -- all cross-device traffic is posted writes, same as the other
+// write-based collectives in glm_p2p.cu.
+//
+// Staging layout per rank: [world, batch, shard_n_heads, head_dim] for v and
+// [world, batch, shard_n_heads] for lse; slot j receives rank j's contribution.
+//
+// The grid is peer-major, which is what keeps the posted writes large: a peer's
+// destination region (slot `rank`, every batch, every local head, every dim) is
+// fully contiguous because `slot` is the outermost staging dimension, and at
+// batch=1 the matching source range is contiguous too. So one block streams a
+// whole batch*shard_n_heads*head_dim run to one peer with every thread active,
+// instead of shattering it into head_dim-sized dribbles. `blocks_per_peer`
+// splits that run further so there is enough in flight to fill the links.
+//
+// Write-hammering control is two-level, mirroring p2p_allgather_row_write:
+// destination pointers arrive already rotated by rank (dsts[k] is peer
+// (rank + k) % N, done host-side), and the slot is picked from blockIdx.x, so
+// concurrent blocks target different peers and rank r's blocks start on peer r.
+// At every instant each receiver's inbound link has one sender.
+// ---------------------------------------------------------------------------
+
+constexpr int CP_SCATTER_THREADS = 128;
+
+template <int N>
+__global__ void __launch_bounds__(CP_SCATTER_THREADS, 4)
+cp_merge_scatter_kernel(
+    const __nv_bfloat16* __restrict__ local_v,   // [batch, input_n_heads, head_dim]
+    const float* __restrict__ local_lse,         // [batch, num_heads]
+    __nv_bfloat16* dv0, __nv_bfloat16* dv1, __nv_bfloat16* dv2, __nv_bfloat16* dv3,
+    __nv_bfloat16* dv4, __nv_bfloat16* dv5, __nv_bfloat16* dv6, __nv_bfloat16* dv7,
+    float* dl0, float* dl1, float* dl2, float* dl3,
+    float* dl4, float* dl5, float* dl6, float* dl7,
+    int batch_size,
+    int shard_n_heads,
+    int head_dim,
+    int input_n_heads,
+    int num_heads,
+    int rank,
+    int blocks_per_peer)
+{
+    __nv_bfloat16* dv[CP_TREE_MAX_SHARDS] = { dv0, dv1, dv2, dv3, dv4, dv5, dv6, dv7 };
+    float*         dl[CP_TREE_MAX_SHARDS] = { dl0, dl1, dl2, dl3, dl4, dl5, dl6, dl7 };
+
+    const int tid   = threadIdx.x;
+    const int slot  = (int)(blockIdx.x % N);          // index into the rotated dst arrays
+    const int chunk = (int)(blockIdx.x / N);          // which slice of this peer's run
+    const int peer  = (rank + slot) % N;              // logical rank owning this head slice
+
+    const int head_stride = shard_n_heads * head_dim;         // per batch row, per peer
+    const int64_t n_elem  = (int64_t)batch_size * head_stride; // contiguous at the destination
+
+    // Destination base for this rank's slot in the peer's staging buffer.
+    __nv_bfloat16* dst_v = dv[slot] + (int64_t)rank * n_elem;
+
+    // int4 (8 bf16) stores need head_dim % 8 == 0; every offset into src and dst
+    // is a whole number of head_dim-sized rows off a 256B-aligned base, so that
+    // one check covers alignment on both sides, and a vector never straddles a
+    // head boundary. Odd head dims fall back to element stores.
+    constexpr int VEC_ELEMS = 8;
+    const bool vectorized = (head_dim % VEC_ELEMS) == 0;
+
+    if (vectorized) {
+        const int64_t n_vec  = n_elem / VEC_ELEMS;
+        const int     hd_vec = head_dim / VEC_ELEMS;
+        const int     hs_vec = head_stride / VEC_ELEMS;
+        for (int64_t v = (int64_t)chunk * CP_SCATTER_THREADS + tid;
+             v < n_vec;
+             v += (int64_t)blocks_per_peer * CP_SCATTER_THREADS)
+        {
+            const int b   = (int)(v / hs_vec);
+            const int rem = (int)(v % hs_vec);
+            const int lh  = rem / hd_vec;
+            const int e   = rem % hd_vec;
+            const int64_t src_vec =
+                ((int64_t)(b * input_n_heads + peer * shard_n_heads + lh) * head_dim) / VEC_ELEMS + e;
+            reinterpret_cast<int4*>(dst_v)[v] = reinterpret_cast<const int4*>(local_v)[src_vec];
+        }
+    } else {
+        for (int64_t i = (int64_t)chunk * CP_SCATTER_THREADS + tid;
+             i < n_elem;
+             i += (int64_t)blocks_per_peer * CP_SCATTER_THREADS)
+        {
+            const int b   = (int)(i / head_stride);
+            const int rem = (int)(i % head_stride);
+            const int lh  = rem / head_dim;
+            const int e   = rem % head_dim;
+            dst_v[i] = local_v[(int64_t)(b * input_n_heads + peer * shard_n_heads + lh) * head_dim + e];
+        }
+    }
+
+    // LSE is batch*shard_n_heads floats per peer -- tiny, so the peer's first
+    // chunk block carries all of it.
+    if (chunk == 0) {
+        const int64_t n_lse = (int64_t)batch_size * shard_n_heads;
+        float* dst_lse = dl[slot] + (int64_t)rank * n_lse;
+        for (int64_t i = tid; i < n_lse; i += CP_SCATTER_THREADS) {
+            const int b  = (int)(i / shard_n_heads);
+            const int lh = (int)(i % shard_n_heads);
+            dst_lse[i] = local_lse[(int64_t)b * num_heads + peer * shard_n_heads + lh];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Push-based CP merge, phase 2: merge the local staging buffer.
+//
+// Purely local HBM reads (the barrier after phase 1 guarantees every peer's
+// slot has landed), so there is no P2P latency to hide and no smem staging --
+// just a straight online-softmax merge across the N slots.
+//
+// Slot order is fixed 0..N-1 on every rank. state_t::merge is an online
+// softmax, so accumulation order changes the rounding; keeping it in rank order
+// makes the merged result identical on every GPU and across runs.
+// ---------------------------------------------------------------------------
+
+template <int NUM_SHARDS, int VEC_SIZE, int BDX>
+__global__ void __launch_bounds__(BDX, 2)
+cp_merge_local_kernel(
+    const __nv_bfloat16* __restrict__ stage_v,   // [NUM_SHARDS, batch, shard_n_heads, head_dim]
+    const float* __restrict__ stage_lse,         // [NUM_SHARDS, batch, shard_n_heads]
+    __nv_bfloat16* __restrict__ output_v,        // [batch, shard_n_heads, head_dim]
+    float* __restrict__ output_lse,              // [batch, shard_n_heads] (nullable)
+    int batch_size,
+    int shard_n_heads)
+{
+    constexpr int head_dim = VEC_SIZE * BDX;
+    const int tid = threadIdx.x;
+    const int64_t bh = blockIdx.x;
+    if ((int)(bh / shard_n_heads) >= batch_size) return;
+
+    const int64_t v_slot_stride   = (int64_t)batch_size * shard_n_heads * head_dim;
+    const int64_t lse_slot_stride = (int64_t)batch_size * shard_n_heads;
+
+    flashinfer::state_t<VEC_SIZE> st;
+    st.init();
+
+    #pragma unroll
+    for (int s = 0; s < NUM_SHARDS; s++) {
+        flashinfer::vec_t<float, VEC_SIZE> v;
+        v.cast_load(stage_v + s * v_slot_stride + bh * head_dim + tid * VEC_SIZE);
+        st.merge(v, stage_lse[s * lse_slot_stride + bh], 1.0f);
+    }
+
+    st.normalize();
+    st.o.cast_store(output_v + bh * head_dim + tid * VEC_SIZE);
+
+    if (output_lse != nullptr && tid == 0)
+        output_lse[bh] = st.get_lse();
+}
+
+extern "C" {
+
+void glm_cp_merge_scatter(
+    GlmCtx* ctx,
+    const void* local_v,
+    const float* local_lse,
+    void* dv0, void* dv1, void* dv2, void* dv3,
+    void* dv4, void* dv5, void* dv6, void* dv7,
+    float* dl0, float* dl1, float* dl2, float* dl3,
+    float* dl4, float* dl5, float* dl6, float* dl7,
+    int world_size,
+    int batch_size,
+    int shard_n_heads,
+    int v_head_dim,
+    int input_n_heads,
+    int num_heads,
+    int rank)
+{
+    cudaSetDevice(ctx->device_id);
+
+    if (world_size <= 0 || batch_size <= 0 || shard_n_heads <= 0) return;
+
+    // One block per peer, split further so the whole payload can be in flight:
+    // size blocks_per_peer to cover a peer's run in a single pass per thread.
+    const int64_t units_per_peer = (v_head_dim % 8 == 0)
+        ? ((int64_t)batch_size * shard_n_heads * v_head_dim) / 8
+        :  (int64_t)batch_size * shard_n_heads * v_head_dim;
+    int blocks_per_peer = (int)((units_per_peer + CP_SCATTER_THREADS - 1) / CP_SCATTER_THREADS);
+    if (blocks_per_peer < 1)  blocks_per_peer = 1;
+    if (blocks_per_peer > 64) blocks_per_peer = 64;
+    const int grid = world_size * blocks_per_peer;
+
+    #define LAUNCH_CP_SCATTER(N) \
+        cp_merge_scatter_kernel<N><<<grid, CP_SCATTER_THREADS, 0, GLM_STREAM(ctx)>>>( \
+            reinterpret_cast<const __nv_bfloat16*>(local_v), local_lse, \
+            reinterpret_cast<__nv_bfloat16*>(dv0), reinterpret_cast<__nv_bfloat16*>(dv1), \
+            reinterpret_cast<__nv_bfloat16*>(dv2), reinterpret_cast<__nv_bfloat16*>(dv3), \
+            reinterpret_cast<__nv_bfloat16*>(dv4), reinterpret_cast<__nv_bfloat16*>(dv5), \
+            reinterpret_cast<__nv_bfloat16*>(dv6), reinterpret_cast<__nv_bfloat16*>(dv7), \
+            dl0, dl1, dl2, dl3, dl4, dl5, dl6, dl7, \
+            batch_size, shard_n_heads, v_head_dim, input_n_heads, num_heads, rank, \
+            blocks_per_peer)
+
+    switch (world_size) {
+        case 1: LAUNCH_CP_SCATTER(1); break;
+        case 2: LAUNCH_CP_SCATTER(2); break;
+        case 4: LAUNCH_CP_SCATTER(4); break;
+        case 8: LAUNCH_CP_SCATTER(8); break;
+        default:
+            fprintf(stderr, "glm_cp_merge_scatter: unsupported world_size=%d (must be 1, 2, 4 or 8)\n",
+                    world_size);
+            break;
+    }
+
+    #undef LAUNCH_CP_SCATTER
+}
+
+void glm_cp_merge_local(
+    GlmCtx* ctx,
+    const void* stage_v,
+    const float* stage_lse,
+    void* output_v,
+    float* output_lse,
+    int world_size,
+    int batch_size,
+    int shard_n_heads,
+    int v_head_dim)
+{
+    cudaSetDevice(ctx->device_id);
+
+    const int grid = batch_size * shard_n_heads;
+    if (grid <= 0) return;
+
+    #define LAUNCH_CP_LOCAL(NS, VEC_SIZE, BDX) \
+        cp_merge_local_kernel<NS, VEC_SIZE, BDX><<<grid, BDX, 0, GLM_STREAM(ctx)>>>( \
+            reinterpret_cast<const __nv_bfloat16*>(stage_v), stage_lse, \
+            reinterpret_cast<__nv_bfloat16*>(output_v), output_lse, \
+            batch_size, shard_n_heads)
+
+    #define DISPATCH_CP_LOCAL_DIM(NS) \
+        switch (v_head_dim) { \
+            case 32:  LAUNCH_CP_LOCAL(NS, 4, 8);   break; \
+            case 64:  LAUNCH_CP_LOCAL(NS, 4, 16);  break; \
+            case 128: LAUNCH_CP_LOCAL(NS, 4, 32);  break; \
+            case 256: LAUNCH_CP_LOCAL(NS, 4, 64);  break; \
+            case 512: LAUNCH_CP_LOCAL(NS, 4, 128); break; \
+            default: \
+                fprintf(stderr, "glm_cp_merge_local: unsupported v_head_dim=%d\n", v_head_dim); \
+                break; \
+        }
+
+    switch (world_size) {
+        case 1: DISPATCH_CP_LOCAL_DIM(1); break;
+        case 2: DISPATCH_CP_LOCAL_DIM(2); break;
+        case 4: DISPATCH_CP_LOCAL_DIM(4); break;
+        case 8: DISPATCH_CP_LOCAL_DIM(8); break;
+        default:
+            fprintf(stderr, "glm_cp_merge_local: unsupported world_size=%d (must be 1, 2, 4 or 8)\n",
+                    world_size);
+            break;
+    }
+
+    #undef LAUNCH_CP_LOCAL
+    #undef DISPATCH_CP_LOCAL_DIM
+}
+
+} // extern "C"
+
+// ---------------------------------------------------------------------------
 // CP Correction Kernel: rescale local v_out by exp2(lse_local - global_lse)
 //
 // After AllGathering all N ranks' LSEs, each GPU computes the global LSE

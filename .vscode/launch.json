@@ -60,7 +60,7 @@
                 // "--nvfp4",
                 // "--arena", "92",
                 // "--no-cuda-graph",
-                // "--cp",
+                "--cp",
                 // "--mtp",
                 "--mtp-draft-topk", "1,1,1",
                 "--max-new-tokens", "2000",

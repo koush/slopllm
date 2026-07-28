@@ -932,6 +932,45 @@ void glm_cp_merge_tree(
     int head_offset,
     int input_n_heads);
 
+// Push-based CP merge, phase 1: scatter each peer's head slice into that peer's
+// staging buffer at slot `rank`. Destination pointers must be pre-rotated by
+// rank host-side (dv[k]/dl[k] belong to peer (rank + k) % world_size).
+// local_v:   [batch_size, input_n_heads, v_head_dim] BF16
+// local_lse: [batch_size, num_heads] F32
+// staging:   [world_size, batch_size, shard_n_heads, v_head_dim] BF16
+//            [world_size, batch_size, shard_n_heads] F32
+void glm_cp_merge_scatter(
+    GlmCtx* ctx,
+    const void* local_v,
+    const float* local_lse,
+    void* dv0, void* dv1, void* dv2, void* dv3,
+    void* dv4, void* dv5, void* dv6, void* dv7,
+    float* dl0, float* dl1, float* dl2, float* dl3,
+    float* dl4, float* dl5, float* dl6, float* dl7,
+    int world_size,
+    int batch_size,
+    int shard_n_heads,
+    int v_head_dim,
+    int input_n_heads,
+    int num_heads,
+    int rank);
+
+// Push-based CP merge, phase 2: online-softmax merge of the local staging
+// buffer's world_size slots. Must run after a barrier that proves every peer's
+// phase-1 writes have landed.
+// output_v:   [batch_size, shard_n_heads, v_head_dim] BF16
+// output_lse: [batch_size, shard_n_heads] F32 (nullable)
+void glm_cp_merge_local(
+    GlmCtx* ctx,
+    const void* stage_v,
+    const float* stage_lse,
+    void* output_v,
+    float* output_lse,
+    int world_size,
+    int batch_size,
+    int shard_n_heads,
+    int v_head_dim);
+
 // CP correction: rescale local v_out by exp2(lse_local - global_lse) in-place.
 // v_out: [batch_size, num_heads, v_head_dim] BF16 (in-place)
 // lses: [world_size, batch_size, num_heads] F32 — all-gathered LSEs (base-2)
