@@ -1,6 +1,6 @@
 import { type DeviceOps } from "./device_ops";
 import { MemcpyKind } from "./enums";
-import {  type Tensor } from "./tensor";
+import { type Tensor } from "./tensor";
 
 interface Captured {
     warmupSteps: number;
@@ -25,6 +25,7 @@ export class CaptureManager implements Disposable {
     captured = new Map<string, Captured>();
     // baseKey (caller key params + batchSize, WITHOUT padded dims) -> learned variance.
     private lengthVariant = new Map<string, LengthVariant>();
+    static capturing?: CaptureManager;
 
     constructor(public ops: DeviceOps) {
     }
@@ -55,6 +56,10 @@ export class CaptureManager implements Disposable {
     }
 
     run<T, I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, keyParams?: any[]): T {
+        if (CaptureManager.capturing) {
+            throw new Error("Cannot run a capture while another capture is in progress");
+        }
+
         let capturing: string | undefined;
         if (!this.disabled && keyParams?.length) {
             const key = keyParams.join(",");
@@ -99,6 +104,8 @@ export class CaptureManager implements Disposable {
             for (const [name, input] of Object.entries(inputs)) {
                 capturedInputs[name] = input.capture();
             }
+
+            CaptureManager.capturing = this;
             result = fn(!!capturing, capturedInputs);
         }
         catch (e) {
@@ -109,6 +116,9 @@ export class CaptureManager implements Disposable {
                 this.ops.graphDestroy(graph);
             }
             throw e;
+        }
+        finally {
+            CaptureManager.capturing = undefined;
         }
 
         if (capturing) {
