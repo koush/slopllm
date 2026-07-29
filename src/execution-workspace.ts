@@ -1,9 +1,11 @@
 import { CaptureManager } from "./capture-manager";
 import { ChatModel, type ChatCache } from "./chat_model";
 import { DeviceOps, MaskMode } from "./device_ops";
+import { MemcpyKind } from "./enums";
+import type { Glm51Config } from "./glm51_model";
 import { I32 } from "./glm_ops";
 import { type PagedKVCache } from "./paged_kv";
-import { MemcpyKind, Tensor } from "./tensor";
+import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
@@ -164,63 +166,63 @@ export class ExecutionState {
     );
   }
 
-  // Physical { slots, length } for layer `cacheIdx`'s sparse MLA. The ops layer
-  // picks flat/paged internally from cacheIdx, so the model stays mode-agnostic.
-  //   - shared layer (topkIdx omitted): reuse the group cache the preceding full
-  //     layer populated (already joined at that layer's end).
-  //   - full layer reusing the group format: join the background cache stream,
-  //     return the cache.
-  //   - full layer with a divergent format (decode paged): compute its own.
-  // Returned tensors are disposable (cache reuses are viewClones; the parent
-  // cache tensors live in the holders), so the caller `using`s them per layer.
-  topkSlots(cacheIdx: number, topkIdx?: Tensor, slotsReadyStream?: { streamWaitEvent(): void }): { slots: Tensor, length: Tensor } {
-    if (!topkIdx || this.ws.glm.fullLayerReusesGroup?.(this, cacheIdx)) {
-      // Full-layer reuse joins the just-launched background cache; shared layers
-      // have no stream (cache already joined by the previous full layer).
-      if (topkIdx) slotsReadyStream?.streamWaitEvent();
+  sparseMlaSlots(cacheIdx: number, topkIdx: Tensor | undefined) {
+    const cfg = this.model.cfg as Glm51Config;
+    const isSharedLayer = cfg.indexerTypes[cacheIdx] === "shared";
+
+    if (!this.sharedSlots || !this.sharedSlotsLength)
+      throw new Error('Shared slot holders must be installed before calling sparseMlaSlots.');
+
+    if (!topkIdx) {
+      if (!isSharedLayer)
+        throw new Error('Full layers must receive topkIdx; they cannot reuse the group cache.');
+      if (!this.sharedSlots.value || !this.sharedSlotsLength.value)
+        throw new Error('Shared layer has no group cache; the preceding full layer did not populate one.');
+
       return {
         slots: this.sharedSlots!.value.viewClone(),
         length: this.sharedSlotsLength!.value.viewClone(),
+        stream: undefined,
       };
     }
-    return this.computeSlots(cacheIdx, topkIdx);
-  }
 
-  // Foreground compute of a full layer's own { slots, length } (used when its
-  // format diverges from the group, i.e. decode sparse-gather paged).
-  private computeSlots(cacheIdx: number, topkIdx: Tensor): { slots: Tensor, length: Tensor } {
+    if (isSharedLayer)
+      throw new Error('Shared layers should not receive topkIdx; they reuse the group cache.');
+
     const pagedKV = this.cache.getPagedKV();
     const kData = pagedKV.kData[cacheIdx];
     const maxKv = kData.shape[0] * kData.shape[1];
-    // Transient [maxQ] length (constant-size for capture); slots is
-    // topkToSlots' max-narrowed transient. Both disposed by the caller.
-    const length = this.ws.alloc([this.ws.positionIds.shape[0]], "I32");
-    const slots = this.ws.glm.topkToSlots(
+
+    // Release the previous group cache BEFORE allocating the new one. Its
+    // consumers — the preceding shared layers, and that layer's gather stream —
+    // are all enqueued already, so the block is dead. Returning it to the pool
+    // first is what lets the new group land on the same address every step;
+    // allocating while it is still held forces the pool to grow and the
+    // retained block then rotates, which breaks graph replay.
+    this.sharedSlots.release();
+    this.sharedSlotsLength.release();
+
+    // The ops layer resolves both addressings from cacheIdx and hands back this
+    // layer's slots plus the ones the following shared group needs — the same
+    // buffer via a viewClone whenever they agree.
+    const { layer, group, stream } = this.ws.glm.topkToSlots(
       this,
       topkIdx, this.ws.kvTokenIndptrD,
-      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices, length,
+      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices,
       pagedKV.pageSize, maxKv,
       cacheIdx, pagedKV.contextParallel,
     );
-    return { slots, length };
-  }
 
-  slotsReady(cacheIdx: number, topkIdx: Tensor) {
-    const pagedKV = this.cache.getPagedKV();
-    const stream = this.ws.glm.slotsReady!(
-      this,
-      topkIdx,
-      pagedKV.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices,
-      cacheIdx, pagedKV.ckvData[cacheIdx],
-    );
-    // Store the group cache into the persisted holders (dispose-on-replace).
-    // These holders are created/threaded by the caller (run/mtp) so they persist
-    // across shared layers and MTP passes; fall back to a local holder otherwise.
-    if (stream) {
-      (this.sharedSlots ??= new UsingHolder<Tensor>(undefined!)).replace(stream.result.slots);
-      (this.sharedSlotsLength ??= new UsingHolder<Tensor>(undefined!)).replace(stream.result.length);
-    }
-    return stream;
+    // Publish the group cache for the shared layers (and the MTP passes) that
+    // follow. Holds the parent allocation; the caller `using`s `layer`.
+    this.sharedSlots.replace(group.slots);
+    this.sharedSlotsLength.replace(group.length);
+
+    return {
+      slots: layer.slots,
+      length: layer.length,
+      stream,
+    };
   }
 
   denseMla(qNope: Tensor, qPe: Tensor, cacheIdx: number, smScale: number): { o: Tensor, lse: Tensor } {
@@ -305,11 +307,11 @@ export class ExecutionState {
     return this.paddedKvLen;
   }
 
-  capture<T>(captureManager: CaptureManager, fn: (capturing: boolean) => T, providedKeyParams: (string | number)[]): T {
+  capture<T, I extends { [name: string]: Tensor }>(captureManager: CaptureManager, inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, providedKeyParams: (string | number)[]): T {
     const baseKey = this.baseKeyParams(providedKeyParams).join(",");
     const keyParams = this.effectiveKeyParams(captureManager, providedKeyParams);
-    return captureManager.run(capturing => {
-      const result = fn(capturing);
+    return captureManager.run(inputs, (capturing, capturedInputs) => {
+      const result = fn(capturing, capturedInputs);
       captureManager.recordLengthVariant(baseKey, !this.paddedKvLenInvariant);
       return result;
     }, keyParams);

@@ -1,9 +1,10 @@
 import { CaptureManager } from "./capture-manager";
 import { type ChatCache, type ChatModel } from "./chat_model";
 import { MaskMode } from "./device_ops";
+import { MemcpyKind } from "./enums";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { BF16, I32 } from "./glm_ops";
-import { MemcpyKind, Tensor } from "./tensor";
+import { type Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
@@ -204,6 +205,7 @@ export function mtpTreeDecode(
   const start = performance.now();
 
   let warmup = false;
+  const useDecodeDraftGenerator = true;
 
   // Depth-1 tree (topks.length === 1, e.g. nextn=1): both draft strategies below
   // run zero loop iterations, so the root's top-k candidates must be generated
@@ -212,7 +214,7 @@ export function mtpTreeDecode(
   // batched-decode and chunked-prefill branches.
   if (topks.length === 1) {
     warmup ||= !captureManager.isCaptured(['mtp-tree-decode-root', topks[0], `batchSize:${batchSize}`]);
-    captureManager.run(() => {
+    captureManager.run({}, () => {
       // mtpHiddenStates is already shared_head.norm'd by forwardMtp; use directly
       using initialLogits = mtpHiddenStates.linear(lmHead);
       const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
@@ -222,9 +224,7 @@ export function mtpTreeDecode(
     }, ['mtp-tree-decode-root', topks[0], `batchSize:${batchSize}`]);
     ws.glm.synchronize();
   }
-
-  const useDecodeDraftGenerator = true;
-  if (useDecodeDraftGenerator) {
+  else if (useDecodeDraftGenerator) {
     // current path that decodes in batch
     let hostBufOffset = 0;
     let chainedMtpHiddenState = mtpHiddenStates;
@@ -251,12 +251,13 @@ export function mtpTreeDecode(
       }
 
       const state = ws.planDecode(model, newBatchSize, cache);
-      state.sharedSlots = sharedSlots;
-      state.sharedSlotsLength = sharedSlotsLength;
-
 
       warmup ||= !state.isCaptured(captureManager, ['mtp-tree-decode', i, topks.length]);
-      chainedMtpHiddenState = state.capture(captureManager, () => {
+
+      chainedMtpHiddenState = state.capture(captureManager, { sharedSlots: sharedSlots.value, sharedSlotsLength: sharedSlotsLength.value }, (_capturing, inputs) => {
+        state.sharedSlots = new UsingHolder(inputs.sharedSlots);
+        state.sharedSlotsLength = new UsingHolder(inputs.sharedSlotsLength);
+
         // prepare initial input
         if (i === 1) {
           // mtpHiddenStates is already shared_head.norm'd by forwardMtp; use directly
@@ -345,12 +346,13 @@ export function mtpTreeDecode(
         positionIds: posIds,
         maskKvLen: chunkedMask.maskKvLen,
       });
-      state.sharedSlots = sharedSlots;
-      state.sharedSlotsLength = sharedSlotsLength;
 
       const prevHs = chainedHs;
       warmup ||= !state.isCaptured(captureManager, ['mtp-chunk', depth, topks.length]);
-      chainedHs = state.capture(captureManager, () => {
+      chainedHs = state.capture(captureManager, { sharedSlots: sharedSlots.value, sharedSlotsLength: sharedSlotsLength.value }, (_capturing, inputs) => {
+        state.sharedSlots = new UsingHolder(inputs.sharedSlots);
+        state.sharedSlotsLength = new UsingHolder(inputs.sharedSlotsLength);
+
         // Depth 1: compute initial logits and topk from mtpHiddenStates
         if (depth === 1) {
           // mtpHiddenStates is already shared_head.norm'd; use directly
@@ -427,8 +429,6 @@ export function mtpTreeDecode(
   });
   sharedSlots.release();
   sharedSlotsLength.release();
-  targetPrefillState.sharedSlots = sharedSlots;
-  targetPrefillState.sharedSlotsLength = sharedSlotsLength;
 
   targetPrefillState.setInput(verificationTokens);
 
@@ -436,12 +436,19 @@ export function mtpTreeDecode(
   ws.glm.synchronize();
 
   warmup ||= !targetPrefillState.isCaptured(captureManager, ['mtp-verify', numVerificationTokens]);
-  const { kvCacheLayers, indexerKvCacheLayers, capturedSharedSlots, capturedSharedSlotsLength } = targetPrefillState.capture(captureManager, (capturing) => {
+  const { kvCacheLayers, indexerKvCacheLayers, capturedSharedSlots, capturedSharedSlotsLength } = targetPrefillState.capture(captureManager, { }, () => {
+    targetPrefillState.sharedSlots = new UsingHolder(undefined!);
+    targetPrefillState.sharedSlotsLength = new UsingHolder(undefined!);
+
     const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, appendCkvOrig: Tensor, appendKpeOrig: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
     const indexerKvCacheLayers: { appendIdxK: Tensor, appendIdxKOrig: Tensor, cacheIdx: number, indexHeadDim: number }[] = [];
 
     const mlaKVCacheAppendOrig = targetPrefillState.mlaKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
+      // need to prevent this from being recycled into workspace
+      appendCkv.removeTracking();
+      appendKpe.removeTracking();
+      // and capture the tensors for graph playback
       kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendKpe: appendKpe.capture(), appendCkvOrig: appendCkv, appendKpeOrig: appendKpe, cacheIdx, kvLoraRank, qkRopeDim });
       return mlaKVCacheAppendOrig(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
     };
@@ -460,24 +467,14 @@ export function mtpTreeDecode(
 
     hiddenStateStaging.memcpy(hiddenStates, undefined, MemcpyKind.DeviceToDevice);
 
-    // for (const extra of ws.extras.values()) {
-    //   using _extra = extra;
-    //   extra.streamWaitEvent?.();
-    // }
-
-    // Capture the group slot cache into the graph result. forwardModel sets it
-    // via a holder side-effect, which does NOT re-run on graph replay — so
-    // return the captured tensors and re-apply the holders below (valid on both
-    // warmup and replay), the way kvCacheLayers are threaded out. Without this,
-    // a replayed target prefill leaves the holder stale and the reusing MTP
-    // extend-prefill pass falls to the (invalid) dense path.
-    const capturedSharedSlots = targetPrefillState.sharedSlots?.value?.capture();
-    const capturedSharedSlotsLength = targetPrefillState.sharedSlotsLength?.value?.capture();
+    // need the new shared slots for the 
+    const capturedSharedSlots = targetPrefillState.sharedSlots?.value.removeTracking().capture();
+    const capturedSharedSlotsLength = targetPrefillState.sharedSlotsLength?.value.removeTracking().capture();
     return { kvCacheLayers, indexerKvCacheLayers, capturedSharedSlots, capturedSharedSlotsLength };
   }, ['mtp-verify', numVerificationTokens]);
 
-  if (capturedSharedSlots) sharedSlots.replace(capturedSharedSlots);
-  if (capturedSharedSlotsLength) sharedSlotsLength.replace(capturedSharedSlotsLength);
+  sharedSlots.replace(capturedSharedSlots!);
+  sharedSlotsLength.replace(capturedSharedSlotsLength!);
 
   ws.glm.synchronize();
 
@@ -617,7 +614,7 @@ export function mtpTreeDecode(
   ws.glm.synchronize();
 
   warmup ||= !mtpExtendPrefill.isCaptured(captureManager, ['mtp-replace', finishCount]);
-  mtpExtendPrefill.capture(captureManager, () => {
+  mtpExtendPrefill.capture(captureManager, {}, () => {
 
     using verfiedHiddenStates = hiddenStateStaging.slice(0, 0, finishCount);
     using mtpHs = model.forwardMtp!(mtpExtendPrefill, verfiedHiddenStates);

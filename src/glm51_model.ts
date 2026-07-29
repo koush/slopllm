@@ -418,9 +418,13 @@ export class Glm51Model extends ChatModel {
       return state.sparseMlaPrepareCache(ckvNormed, kPeRope, undefined, layerIdx, kvLoraRank, qkRopeDim);
     });
 
+    const dense = cfg.indexHeadDim === 0;
+    const shared = cfg.indexerTypes[layerIdx] === "shared";
+    const skipIndexer = dense || shared;
+
     // Indexer K: wk(normed) → layernorm → split → RoPE → concat → append to kData
     // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
-    using kvcacheIndex = (cfg.indexHeadDim === 0 || cfg.indexerTypes[layerIdx] === "shared")
+    using kvcacheIndex = skipIndexer
       ? undefined
       : this.glm.withStream(() => {
         const idxRopeDim = qkRopeDim;
@@ -448,7 +452,7 @@ export class Glm51Model extends ChatModel {
 
     // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
     // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
-    using idxQStream = (cfg.indexHeadDim === 0 || cfg.indexerTypes[layerIdx] === "shared")
+    using idxQStream = skipIndexer
       ? undefined
       : this.glm.withStream(() => {
         const idxNHeads = cfg.indexNHeads;
@@ -485,24 +489,17 @@ export class Glm51Model extends ChatModel {
 
     idxQStream?.streamWaitEvent();
     using topk = idxQStream?.result;
-    // Full layers populate the group slot cache (state.sharedSlots /
-    // sharedSlotsLength) on a background stream + gather (decode sparse-gather).
-    using slotsReadyStream = topk ? state.slotsReady(layerIdx, topk) : undefined;
-    // This layer's { slots, length }: a full layer reusing the group format joins
-    // the cache stream and returns its viewClone; a full layer with a divergent
-    // format (decode paged) computes its own; a shared layer (no topk) reuses the
-    // cache the previous full layer populated. undefined only in the dense path
-    // (no sparse indexer). Issued before the q/kvcache joins so it overlaps them.
-    const sparse = (topk || state.sharedSlots?.value)
-      ? state.topkSlots(layerIdx, topk, slotsReadyStream)
-      : undefined;
-    using _slots = sparse?.slots;
-    using _length = sparse?.length;
+    const sparseSlots = cfg.indexHeadDim === 0
+      ? undefined
+      : state.sparseMlaSlots(layerIdx, topk);
+
+    using slots = sparseSlots?.slots;
+    using slotsLength = sparseSlots?.length;
+    using slotsStream = sparseSlots?.stream;
 
     qAbsorbedRStream.streamWaitEvent();
     qPeRStream.streamWaitEvent();
     kvcache.streamWaitEvent();
-
 
     using qAbsorbedR = qAbsorbedRStream.result;
     using qPeR = qPeRStream.result;
@@ -515,13 +512,13 @@ export class Glm51Model extends ChatModel {
 
       let tokenMajor = false;
 
-      if (sparse) {
+      if (!dense) {
         // Sparse MLA path: SM120 kernel on packed FP8 KV cache
         // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
         // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
         // seqLen=1, batch=BS — which matches token-major layout.
         const sparseResult = state.sparseMla(
-          qAbsorbedR, qPeR, ckv!, sparse.slots, sparse.length,
+          qAbsorbedR, qPeR, ckv!, slots!, slotsLength!,
           cfg.indexTopk, cfg.scaling,
         );
         tokenMajor = !state.isDecode;
@@ -564,7 +561,7 @@ export class Glm51Model extends ChatModel {
     }
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
 
-    slotsReadyStream?.streamWaitEvent();
+    slotsStream?.streamWaitEvent();
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 

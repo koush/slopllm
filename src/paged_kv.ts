@@ -1,7 +1,8 @@
 import { type ChatCache } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
+import { MemcpyKind } from "./enums";
 import { I32 } from "./glm_ops";
-import { MemcpyKind, Tensor } from "./tensor";
+import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
 export const PAGE_SIZE = 64;

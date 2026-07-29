@@ -1,13 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import { DeviceOps, MaskMode, StridedMmap, TensorParallelism } from "./device_ops";
-import type { SamplingParams } from "./chat_model";
-import { MemcpyKind, Tensor } from "./tensor";
-import { SafeTensorFile } from "./safetensors";
-import type { WorkspaceBase } from "./workspace";
-import type { PagedKVCache } from "./paged_kv";
-import type { ExecutionState } from "./execution-workspace";
 import { Allocator, ArenaAllocator } from "./allocator";
+import { DeviceOps, MaskMode, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
+import type { ExecutionState } from "./execution-workspace";
+import { SafeTensorFile } from "./safetensors";
+import { Tensor } from "./tensor";
+import type { WorkspaceBase } from "./workspace";
+import { MemcpyKind } from "./enums";
 
 // Above `count == topK` (single-token decode), mulMatId can either:
 //  - run the direct per-(token,expert) GEMV kernel (mulMatId/nvfp4MulMatId), which
@@ -1101,13 +1100,18 @@ export class GlmOps implements DeviceOps {
     return topkIdx;
   }
 
-  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, _cacheIdx: number, _contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): Tensor {
+  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, pageSize: number, maxKv: number, _cacheIdx: number, _contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0, providedLength?: Tensor): { layer: SlotSet, group: SlotSet } {
     // Device level operates on the resolved cpWorldSize/cpRank. Single-GPU
     // (non-CP) callers reach here with the defaults (cpWorldSize 0 = paged);
     // ParallelOps resolves the flat/paged mode from cacheIdx and passes
     // cpWorldSize/cpRank per shard, so cacheIdx is unused here.
     const totalQ = topkIdx.shape[0];
     const topk = topkIdx.shape[1];
+    // Constant-size across totalQ / graph variants so the allocator layout
+    // stays stable under capture. ParallelOps pre-allocates one Replicated
+    // tensor and hands down its shards, so the per-device alloc order stays
+    // exactly as it was before the group/layer pair was folded in here.
+    const topkLength = providedLength ?? topkIdx.workspace.alloc([state.ws.positionIds.shape[0]], "I32");
     // Allocate the max footprint ([maxKv, topk]) and narrow to [totalQ, topk]:
     // a plain transient alloc, but constant-sized across totalQ / graph variants
     // so the workspace allocator layout stays stable under graph capture. Hold
@@ -1118,7 +1122,13 @@ export class GlmOps implements DeviceOps {
     using full = topkIdx.workspace.alloc([maxKv, topk], "I32");
     const slots = full.narrow(0, totalQ);
     getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkLength), ptr(topkIdx), ptr(pageIndices), ptr(indptr), ptr(lastPageLen), ptr(batchIndices), totalQ, topk, pageSize, cpWorldSize, cpRank, ptr(kvTokenIndptrD));
-    return slots;
+    // No group concept at the device level: a following shared layer reads the
+    // same slots. Hand back a viewClone so it shares this memory but disposes
+    // independently of the layer's own handle.
+    return {
+      layer: { slots, length: topkLength },
+      group: { slots: slots.viewClone(), length: topkLength.viewClone() },
+    };
   }
 
   private indexerScoreTopkPrefill(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0): Tensor {

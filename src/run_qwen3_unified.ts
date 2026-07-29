@@ -14,9 +14,10 @@ import { MtpStats, mtpTreeDecode } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
 import { Qwen35Model } from "./qwen35_model";
 import { Qwen3Model } from "./qwen3_model";
-import { MemcpyKind, SamplingWorkspace, Tensor } from "./tensor";
+import { SamplingWorkspace, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
+import { MemcpyKind } from "./enums";
 
 const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -339,7 +340,7 @@ export function* generateStream(
           graphSteps++;
         }
 
-        state.capture(captureManager, () => {
+        state.capture(captureManager, {}, () => {
           ws.positionStep(state, model);
           using hiddenStates = model.forward(state);
           doSample(state.computeLogits(hiddenStates, model));
@@ -359,7 +360,7 @@ export function* generateStream(
           graphSteps++;
         }
 
-        state.capture(captureManager, () => {
+        state.capture(captureManager, {}, () => {
           using hiddenStates = model.forward(state);
           using tokens = state.computeLogits(hiddenStates, model);
           doSample(tokens);

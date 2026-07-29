@@ -1,16 +1,10 @@
 import { type SamplingParams } from "./chat_model";
 import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
+import { MemcpyKind } from "./enums";
+export { MemcpyKind };
 import { getNativeAddon } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { WorkspaceBase } from "./workspace";
-
-export const enum MemcpyKind {
-  HostToHost = 0,
-  HostToDevice = 1,
-  DeviceToHost = 2,
-  DeviceToDevice = 3,
-  Default = 4,
-}
 
 function numElements(shape: number[]): number {
   return shape.reduce((a, b) => a * b, 1);
@@ -47,6 +41,25 @@ export abstract class Tensor implements Disposable {
     if (view) {
       view.views.add(this);
     }
+  }
+
+  same(other: Tensor): boolean {
+    if (this === other) return true;
+    if (!other.matches(this)) return false;
+    if (this.data !== other.data) return false;
+    if (this.parallelism !== other.parallelism) return false;
+    return true;
+  }
+
+  matches(other: Tensor): boolean {
+    if (this === other) return true;
+    if (this.shape.length !== other.shape.length) return false;
+    for (let i = 0; i < this.shape.length; i++) {
+      if (this.shape[i] !== other.shape[i]) return false;
+    }
+    if (this.type !== other.type) return false;
+    if (this.pinned !== other.pinned) return false;
+    return true;
   }
 
   get numElements(): number {
@@ -106,7 +119,6 @@ export abstract class Tensor implements Disposable {
   abstract free(): void;
 
   capture() {
-    this.removeTracking();
     const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, undefined);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;

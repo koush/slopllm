@@ -1,4 +1,4 @@
-import { DeviceOps, MaskMode, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, MaskMode, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
 import { GlmTensor } from "./glm_ops";
 import { MemcpyKind, Tensor } from "./tensor";
 import { SafeTensorFile } from "./safetensors";
@@ -401,8 +401,13 @@ export class MetaOps implements DeviceOps {
         return idxQ.workspace.alloc([idxQ.shape[0], topk], "I32");
     }
 
-    topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): Tensor {
-        return topkIdx.workspace.alloc([topkIdx.shape[0], topkIdx.shape[1]], "I32");
+    topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, providedLength?: Tensor): { layer: SlotSet, group: SlotSet } {
+        const slots = topkIdx.workspace.alloc([topkIdx.shape[0], topkIdx.shape[1]], "I32");
+        const length = providedLength ?? topkIdx.workspace.alloc([state.ws.positionIds.shape[0]], "I32");
+        return {
+            layer: { slots, length },
+            group: { slots: slots.viewClone(), length: length.viewClone() },
+        };
     }
 
     graphBeginCapture(): void {

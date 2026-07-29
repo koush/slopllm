@@ -1,7 +1,6 @@
+import type { ExecutionState } from "./execution-workspace";
 import type { Tensor } from "./tensor";
 import type { WorkspaceBase } from "./workspace";
-import type { PagedKVCache } from "./paged_kv";
-import type { ExecutionState } from "./execution-workspace";
 
 export enum MaskMode {
   None = 0,
@@ -27,6 +26,10 @@ export interface StridedMmap {
   height: number;
 }
 
+// A slots tensor and its paired per-query valid count. Always travel together —
+// a slots buffer is only meaningful alongside the length that bounds it.
+export type SlotSet = { slots: Tensor, length: Tensor };
+
 export interface DeviceOps {
   readonly worldSize: number;
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
@@ -38,7 +41,7 @@ export interface DeviceOps {
   streamWaitEvent(streamIdx: number, eventIdx: number): void;
   currentStream: number;
   availableStreams: number[];
-  withStream<T>(fn: () => T): Disposable  & { result: T, streamWaitEvent(): void, synchronize(): void };
+  withStream<T>(fn: () => T): Disposable & { result: T, streamWaitEvent(): void, synchronize(): void };
 
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
 
@@ -62,16 +65,6 @@ export interface DeviceOps {
 
   sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor };
   sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor };
-  // Populates the group slot cache and (decode sparse-gather) fans out CKV, on a
-  // background stream. result is the group's { slots, length } (stored into
-  // state.sharedSlots / sharedSlotsLength by the caller), or undefined when no
-  // shared group follows this full layer.
-  slotsReady?(state: ExecutionState, topkIdx: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, cacheIdx: number, kvCache: Tensor): (Disposable & { result: { slots: Tensor, length: Tensor }, streamWaitEvent(): void, synchronize(): void }) | undefined;
-
-  // Whether layer `cacheIdx` (a full layer) reads the same slot format as its
-  // shared group and can reuse the cache. CP-only; absent on non-CP ops.
-  fullLayerReusesGroup?(state: ExecutionState, cacheIdx: number): boolean;
-
   gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, paddedKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor;
   // Sparse topk-driven P2P gather of packed CKV tokens into the caller-provided
   // output flat buffers (same [paddedKvLen/pageSize, pageSize, BPT] U8 layout
@@ -113,12 +106,22 @@ export interface DeviceOps {
   indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void;
   // Indexer top-k scoring: returns [totalQ, topk] indices tensor.
   indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor;
-  // Convert top-k indices to physical KV slots for layer `cacheIdx`. Writes the
-  // compacted valid count per query into `topkLength`. Returns [totalQ, topk]
-  // slots tensor. The flat/paged addressing is decided internally from
-  // `cacheIdx` (see ParallelOps.topkSlotMode) so callers stay mode-agnostic; the
-  // device level ignores `cacheIdx` and uses cpWorldSize/cpRank directly.
-  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, topkLength: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): Tensor;
+  // Convert top-k indices to physical KV slots for layer `cacheIdx` AND for the
+  // shared group that follows it. The flat/paged addressing of each is decided
+  // internally from `cacheIdx` (see ParallelOps.topkSlotMode) so callers stay
+  // mode-agnostic; the device level ignores `cacheIdx` and uses
+  // cpWorldSize/cpRank directly.
+  //
+  // `group` is always present. When both need the same addressing — every mode
+  // except decode sparse-gather — or when no shared group follows, it is a
+  // viewClone of `layer`: same memory, independent handle, so the caller can
+  // `using` one and park the other in a holder without a double dispose.
+  //
+  // `stream` is the background CKV gather (decode sparse-gather only); join it
+  // before the group's shared layers read their gathered buffers.
+  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, providedLength?: Tensor): {
+    layer: SlotSet, group: SlotSet, stream?: Disposable & { streamWaitEvent(): void, synchronize(): void },
+  };
 
   graphBeginCapture(): void;
   graphEndCapture(): number;

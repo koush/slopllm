@@ -1,9 +1,12 @@
-import { DeviceOps } from "./device_ops";
+import { type DeviceOps } from "./device_ops";
+import { MemcpyKind } from "./enums";
+import {  type Tensor } from "./tensor";
 
 interface Captured {
     warmupSteps: number;
     graphExec: number | null;
     result: any;
+    inputs: { [name: string]: Tensor, };
 }
 
 /**
@@ -51,18 +54,31 @@ export class CaptureManager implements Disposable {
         }
     }
 
-    run<T>(fn: (capturing: boolean) => T, keyParams?: any[]): T {
+    run<T, I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, keyParams?: any[]): T {
         let capturing: string | undefined;
         if (!this.disabled && keyParams?.length) {
             const key = keyParams.join(",");
             const captured = this.captured.get(key);
+
             if (captured) {
                 if (captured.graphExec !== null) {
+                    for (const [name, input] of Object.entries(inputs)) {
+                        const capturedInput = captured.inputs[name];
+                        if (!capturedInput.same(input)) {
+                            capturedInput.memcpy(input, capturedInput.bytes, MemcpyKind.DeviceToDevice);
+                        }
+                    }
                     this.ops.graphLaunch(captured.graphExec);
                     return captured.result;
                 }
 
                 if (captured.warmupSteps === 3) {
+                    const capturedInputs: typeof inputs = {} as any;
+                    for (const [name, tensor] of Object.entries(inputs)) {
+                        (capturedInputs as any)[name] = tensor.capture();
+                    }
+                    captured.inputs = capturedInputs;
+
                     // console.warn("\n====capturing====", key)
                     this.ops.graphBeginCapture();
                     capturing = key;
@@ -73,13 +89,17 @@ export class CaptureManager implements Disposable {
                 captured.warmupSteps++;
             }
             else {
-                this.captured.set(key, { warmupSteps: 1, graphExec: null, result: undefined });
+                this.captured.set(key, { warmupSteps: 1, graphExec: null, result: undefined, inputs: undefined! });
             }
         }
 
         let result: T;
         try {
-            result = fn(!!capturing);
+            const capturedInputs: any = {};
+            for (const [name, input] of Object.entries(inputs)) {
+                capturedInputs[name] = input.capture();
+            }
+            result = fn(!!capturing, capturedInputs);
         }
         catch (e) {
             console.warn("Error during capture run:", e);
