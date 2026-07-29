@@ -1,3 +1,4 @@
+import { CaptureManager } from "./capture-manager";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import { Tensor } from "./tensor";
 
@@ -10,9 +11,41 @@ export class WorkspaceBase implements Disposable {
   exported = new Set<Tensor>();
   frozen = false;
   allocLogger = false;
+  private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
 
   constructor(glm: DeviceOps) {
     this.glm = glm;
+  }
+
+  startTracking(keepExports = new Set<Tensor>()): Disposable & { [Symbol.dispose](): void } {
+    if (this.tracking !== null) {
+      throw new Error("startTracking already active");
+    }
+    if (this.tracked.size) {
+      console.warn(new Error("startTracking was called with tensors already allocated, this may result in non-deterministic allocations."));
+      // for (const tracked of this.tracked) {
+      //   console.warn(tracked.stack);
+      // }
+    }
+    for (const tensor of this.exported) {
+      if (!keepExports.has(tensor)) {
+        this.exported.delete(tensor);
+        tensor[Symbol.dispose]();
+      }
+    }
+    const ws = this;
+    const tracker: Disposable & { [Symbol.dispose](): void } = {
+      [Symbol.dispose]() {
+        for (const tensor of ws.tracked) {
+          tensor.views.clear();
+          tensor[Symbol.dispose]();
+        }
+        ws.tracked.clear();
+        ws.tracking = null;
+      },
+    };
+    this.tracking = tracker;
+    return tracker;
   }
 
   freeze() {
@@ -110,19 +143,6 @@ export class WorkspaceBase implements Disposable {
       this.addTracked(tensor);
     }
     return tensor;
-  }
-
-  transfer(tensor: Tensor) {
-    if (tensor.view) {
-      throw new Error("Cannot transfer a tensor view");
-    }
-
-    tensor.workspace.tracked.delete(tensor);
-    tensor.workspace.disposedHost.delete(tensor);
-    tensor.workspace.disposedDevice.delete(tensor);
-    tensor.workspace.exported.delete(tensor);
-    tensor.workspace = this;
-    this.addTracked(tensor);
   }
 
   free(): void {

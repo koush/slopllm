@@ -3,7 +3,7 @@ import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
 import { Glm51Config } from "./glm51_model";
 import { bf16BytesToF32, f32ToBf16Bytes, getNativeAddon, GlmOps, GlmTensor, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM, NCCL_UINT8 } from "./glm_ops";
-import {  Tensor } from "./tensor";
+import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
@@ -403,7 +403,7 @@ export class ParallelTensor extends Tensor {
 
       // due to the prior barrier, the staging buffers can immediately be recycled.
       // all peers are done writing to them.
-      group.sources.push(...shards.map(s => s.viewClone()));
+      group.sources.push(...shards);
       group.cleanupSources();
 
 
@@ -440,7 +440,7 @@ export class ParallelTensor extends Tensor {
       }
 
       group.cleanupSources();
-      group.sources.push(...shards.map(s => s.viewClone()));
+      group.sources.push(...shards);
 
       return true;
     }
@@ -2577,11 +2577,24 @@ export class ParallelOps implements DeviceOps {
     for (const device of this.devices) {
       device.synchronize();
     }
+    for (const group of this.p2pGroups.values()) {
+      group.cleanupSources();
+      for (const w of group.workspaces) {
+        using _ = w.startTracking();
+      }
+    }
   }
 
   synchronizeStream(streamIdx: number): void {
     for (const device of this.devices) {
       device.synchronizeStream(streamIdx);
+    }
+    const group = this.getP2PGroup(streamIdx);
+    if (group) {
+      group.cleanupSources();
+      for (const w of group.workspaces) {
+        using _ = w.startTracking();
+      }
     }
   }
 

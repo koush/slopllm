@@ -377,7 +377,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
   /** Pinned host buffer [B*S] of I32: batch index per token for MLA KV cache append. */
   mlaBatchIndicesH: Tensor;
   lastDecodePagedKV: PagedKVCache | null;
-  private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
   extras = new Map<string, any>();
 
   constructor(glm: DeviceOps, B: number, S: number) {
@@ -428,37 +427,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
     this.inputIdsBuf.fill(0, this.inputIdsBuf.numElements);
     this.inputCleared = true;
-  }
-
-  startTracking(keepExports = new Set<Tensor>()): Disposable & { [Symbol.dispose](): void } {
-    if (this.tracking !== null) {
-      throw new Error("startTracking already active");
-    }
-    if (this.tracked.size) {
-      console.warn(new Error("startTracking was called with tensors already allocated, this may result in non-deterministic allocations."));
-      // for (const tracked of this.tracked) {
-      //   console.warn(tracked.stack);
-      // }
-    }
-    for (const tensor of this.exported) {
-      if (!keepExports.has(tensor)) {
-        this.exported.delete(tensor);
-        tensor[Symbol.dispose]();
-      }
-    }
-    const ws = this;
-    const tracker: Disposable & { [Symbol.dispose](): void } = {
-      [Symbol.dispose]() {
-        for (const tensor of ws.tracked) {
-          tensor.views.clear();
-          tensor[Symbol.dispose]();
-        }
-        ws.tracked.clear();
-        ws.tracking = null;
-      },
-    };
-    this.tracking = tracker;
-    return tracker;
   }
 
   positionStep(state: ExecutionState, model: ChatModel, steps = 1): void {
