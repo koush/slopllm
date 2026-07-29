@@ -1,12 +1,16 @@
 import { type DeviceOps } from "./device_ops";
 import { MemcpyKind } from "./enums";
+import { PagedKVCache } from "./paged_kv";
 import { type Tensor } from "./tensor";
+import type { WorkspaceBase } from "./workspace";
+
 
 interface Captured {
     warmupSteps: number;
     graphExec: number | null;
     result: any;
     inputs: { [name: string]: Tensor, };
+    capturedWorkspaces: Set<WorkspaceBase>;
 }
 
 /**
@@ -21,13 +25,31 @@ interface LengthVariant {
 }
 
 export class CaptureManager implements Disposable {
+    static capturing?: Captured;
     disabled = false;
     captured = new Map<string, Captured>();
+
     // baseKey (caller key params + batchSize, WITHOUT padded dims) -> learned variance.
     private lengthVariant = new Map<string, LengthVariant>();
-    static capturing?: CaptureManager;
 
     constructor(public ops: DeviceOps) {
+    }
+
+    static trackWorkspaceAlloc(workspace: WorkspaceBase) {
+        const { capturing } = CaptureManager;
+        if (!capturing)
+            return;
+        // if (workspace instanceof PagedKVCache) {
+        //     throw new Error("Cannot capture a PagedKVCache workspace");
+        // }
+        const { capturedWorkspaces } = capturing;
+        if (capturedWorkspaces.has(workspace)) {
+            return;
+        }
+        if (workspace.exported.size || workspace.tracked.size) {
+            throw new Error("Cannot capture a workspace that has exported or tracked tensors");
+        }
+        capturedWorkspaces.add(workspace);
     }
 
     [Symbol.dispose]() {
@@ -60,10 +82,11 @@ export class CaptureManager implements Disposable {
             throw new Error("Cannot run a capture while another capture is in progress");
         }
 
-        let capturing: string | undefined;
+        let captured: Captured | undefined;
+        let capturing = false;
         if (!this.disabled && keyParams?.length) {
             const key = keyParams.join(",");
-            const captured = this.captured.get(key);
+            captured = this.captured.get(key);
 
             if (captured) {
                 if (captured.graphExec !== null) {
@@ -71,6 +94,11 @@ export class CaptureManager implements Disposable {
                         const capturedInput = captured.inputs[name];
                         if (!capturedInput.same(input)) {
                             capturedInput.memcpy(input, capturedInput.bytes, MemcpyKind.DeviceToDevice);
+                        }
+                    }
+                    for (const ws of captured.capturedWorkspaces) {
+                        if (ws.exported.size || ws.tracked.size) {
+                            throw new Error("Cannot replay a capture with exported or tracked tensors in a captured workspace");
                         }
                     }
                     this.ops.graphLaunch(captured.graphExec);
@@ -86,7 +114,7 @@ export class CaptureManager implements Disposable {
 
                     // console.warn("\n====capturing====", key)
                     this.ops.graphBeginCapture();
-                    capturing = key;
+                    capturing = true;
                 }
                 else {
                     // console.warn("\n====warmingup====", key)
@@ -94,7 +122,7 @@ export class CaptureManager implements Disposable {
                 captured.warmupSteps++;
             }
             else {
-                this.captured.set(key, { warmupSteps: 1, graphExec: null, result: undefined, inputs: undefined! });
+                this.captured.set(key, { warmupSteps: 1, graphExec: null, result: undefined, inputs: undefined!, capturedWorkspaces: new Set() });
             }
         }
 
@@ -105,8 +133,10 @@ export class CaptureManager implements Disposable {
                 capturedInputs[name] = input.capture();
             }
 
-            CaptureManager.capturing = this;
-            result = fn(!!capturing, capturedInputs);
+            captured?.capturedWorkspaces.clear();
+            CaptureManager.capturing = captured;
+
+            result = fn(capturing, capturedInputs);
         }
         catch (e) {
             console.warn("Error during capture run:", e);
@@ -122,12 +152,11 @@ export class CaptureManager implements Disposable {
         }
 
         if (capturing) {
-            const captured = this.captured.get(capturing)!;
-            captured.result = result;
+            captured!.result = result;
             const graph = this.ops.graphEndCapture();
-            captured.graphExec = this.ops.graphInstantiate(graph);
+            captured!.graphExec = this.ops.graphInstantiate(graph);
             this.ops.graphDestroy(graph);
-            this.ops.graphLaunch(captured.graphExec);
+            this.ops.graphLaunch(captured!.graphExec);
         }
         return result;
     }

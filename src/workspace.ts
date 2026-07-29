@@ -91,6 +91,15 @@ export class WorkspaceBase implements Disposable {
   }
 
   addTracked(tensor: Tensor) {
+    try {
+      CaptureManager.trackWorkspaceAlloc(this);
+    }
+    finally {
+      this.addTrackedInternal(tensor);
+    }
+  }
+
+  private addTrackedInternal(tensor: Tensor) {
     this.tracked.add(tensor);
   }
 
@@ -98,6 +107,8 @@ export class WorkspaceBase implements Disposable {
     if (this.frozen) {
       throw new Error("Workspace is frozen");
     }
+
+    CaptureManager.trackWorkspaceAlloc(this);
 
     const bytes = Tensor.byteCount(shape, type);
 
@@ -140,7 +151,7 @@ export class WorkspaceBase implements Disposable {
     if (name !== undefined) {
       this.tensors.set(name, tensor);
     } else {
-      this.addTracked(tensor);
+      this.addTrackedInternal(tensor);
     }
     return tensor;
   }

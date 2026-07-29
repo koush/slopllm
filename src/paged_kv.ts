@@ -170,21 +170,21 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     for (let i = 0; i < nLayers; i++) {
       if (kvLoraRank > 0) {
         if (this.sparseMode) {
-          this.ckvData.push(this.alloc([maxPages, this.pageSize, this.bytesPerToken], "U8", undefined, contextParallel ? TensorParallelism.Row : undefined));
+          this.ckvData.push(this.alloc([maxPages, this.pageSize, this.bytesPerToken], "U8", "ckv" + i, contextParallel ? TensorParallelism.Row : undefined));
         } else {
-          this.ckvData.push(this.alloc([maxPages, this.pageSize, kvLoraRank], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
-          this.kpeData.push(this.alloc([maxPages, this.pageSize, qkRopeDim], "BF16", undefined, contextParallel ? TensorParallelism.Row : undefined));
+          this.ckvData.push(this.alloc([maxPages, this.pageSize, kvLoraRank], "BF16", "ckv" + i, contextParallel ? TensorParallelism.Row : undefined));
+          this.kpeData.push(this.alloc([maxPages, this.pageSize, qkRopeDim], "BF16", "kpe" + i, contextParallel ? TensorParallelism.Row : undefined));
         }
         if (indexHeadDim > 0) {
           if (sharedLayers[i]) {
             this.kData.push(undefined!);
           } else {
-            this.kData.push(this.alloc([maxPages, this.pageSize, indexHeadDim], "BF16"));
+            this.kData.push(this.alloc([maxPages, this.pageSize, indexHeadDim], "BF16", "k" + i));
           }
         }
       } else {
-        this.kData.push(this.alloc([maxPages, nKv * this.pageSize * hd], "BF16", undefined, TensorParallelism.Row));
-        this.vData.push(this.alloc([maxPages, nKv * this.pageSize * hd], "BF16", undefined, TensorParallelism.Row));
+        this.kData.push(this.alloc([maxPages, nKv * this.pageSize * hd], "BF16", "k" + i, TensorParallelism.Row));
+        this.vData.push(this.alloc([maxPages, nKv * this.pageSize * hd], "BF16", "v" + i, TensorParallelism.Row));
       }
     }
     this.indices = this.alloc([maxPages * maxBatch * I32], "I32", "indices");
@@ -196,6 +196,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.pagesDirtyDevice = true;
     this.positionIdsDirty = true;
     this.lastNumSequences = 0;
+
+    this.freeze();
   }
 
   reset(batchSize: number): void {

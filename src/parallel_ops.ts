@@ -2276,8 +2276,8 @@ export class ParallelOps implements DeviceOps {
 
     group.cleanupSources();
     group.sources.push(
-      ...stageV.map(t => t.viewClone()),
-      ...stageLse.map(t => t.viewClone()),
+      ...stageV,
+      ...stageLse,
     );
 
     // outputLse is local-only and unused downstream; any reuse of its address is

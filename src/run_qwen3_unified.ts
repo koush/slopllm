@@ -216,12 +216,12 @@ export function* generateStream(
   function doSample(logits: Tensor) {
     if (greedy) {
       using argmax = logits.argmax();
-      gpuSampleResult ||= sampleWorkspace.alloc(argmax.shape, argmax.type);
+      gpuSampleResult = sampleWorkspace.ensureAlloc(argmax.shape, argmax.type, "gpuSampleResult");
       gpuSampleResult.memcpy(argmax, argmax.bytes, MemcpyKind.DeviceToDevice);
     }
     else {
       using sampled = samplingWorkspace!.sample(logits);
-      gpuSampleResult ||= sampleWorkspace.alloc(sampled.shape, sampled.type);
+      gpuSampleResult = sampleWorkspace.ensureAlloc(sampled.shape, sampled.type, "gpuSampleResult");
       gpuSampleResult.memcpy(sampled, sampled.bytes, MemcpyKind.DeviceToDevice);
     }
   }
@@ -265,7 +265,7 @@ export function* generateStream(
     }
   }
 
-  sampleResult ||= sampleWorkspace.allocPinned(gpuSampleResult!.shape, gpuSampleResult!.type);
+  sampleResult = sampleWorkspace.ensureAllocPinned(gpuSampleResult!.shape, gpuSampleResult!.type, "sampleResult");
   sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
   glm.synchronize();
   currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
@@ -287,6 +287,9 @@ export function* generateStream(
 
   try {
     for (let i = 1; i < maxNewTokens; i++) {
+      using _tracking = sampleWorkspace.startTracking();
+      using _tracking2 = ws.startTracking();
+
       if (mtp && model.forwardMtp && topks.length > 0) {
         if (process.env.GLM_STEP_LOG === '1') process.stderr.write(`[step ${i}] seqLen=${cache.getPagedKV().sequences[0].allocLen} histLen=${tokenHistory.length}\n`);
         const { warmup, tokens, numAccepted, numDraftTokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots, sharedSlotsLength, ws, currentToken, topks, cache, tokenizer);
@@ -342,7 +345,7 @@ export function* generateStream(
 
         state.capture(captureManager, {}, () => {
           ws.positionStep(state, model);
-          using hiddenStates = model.forward(state);
+          using hiddenStates = model.forwardModel(state);
           doSample(state.computeLogits(hiddenStates, model));
         }, ['decode']);
 
