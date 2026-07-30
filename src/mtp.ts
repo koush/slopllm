@@ -170,8 +170,8 @@ export function mtpTreeDecode(
   captureManager: CaptureManager,
   model: ChatModel,
   mtpHiddenStates: Tensor,
-  sharedSlots: UsingHolder<Tensor>,
-  sharedSlotsLength: UsingHolder<Tensor>,
+  sharedSlots: Tensor,
+  sharedSlotsLength: Tensor,
   ws: ExecutionWorkspace,
   targetToken: number,
   topks: number[],
@@ -193,8 +193,6 @@ export function mtpTreeDecode(
   const originalAllocLen = seq0.allocLen;
   const pagedKv = cache.getPagedKV();
   const batchSize = pagedKv.sequences.length;
-
-  using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedSlots.value, sharedSlotsLength.value]));
 
   const hiddenDim = mtpHiddenStates.shape[1];
   const rowBytes = hiddenDim * BF16; // BF16 = 2 bytes per element
@@ -227,9 +225,10 @@ export function mtpTreeDecode(
   else if (useDecodeDraftGenerator) {
     // current path that decodes in batch
     let hostBufOffset = 0;
-    let chainedMtpHiddenState = mtpHiddenStates;
 
     for (let i = 1; i < topks.length; i++) {
+      using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedSlots, sharedSlotsLength]));
+
       // every iteration, duplicate all the sequences to add the top-k for this depth
       const currentBatchSize = pagedKv.sequences.length;
       const k = topks[i - 1];
@@ -254,9 +253,10 @@ export function mtpTreeDecode(
 
       warmup ||= !state.isCaptured(captureManager, ['mtp-tree-decode', i, topks.length]);
 
-      chainedMtpHiddenState = state.capture(captureManager, { sharedSlots: sharedSlots.value, sharedSlotsLength: sharedSlotsLength.value }, (_capturing, inputs) => {
-        state.sharedSlots = new UsingHolder(inputs.sharedSlots);
-        state.sharedSlotsLength = new UsingHolder(inputs.sharedSlotsLength);
+      state.capture(captureManager, { sharedSlots, sharedSlotsLength, mtpHiddenStates }, (_capturing, inputs) => {
+        state.sharedSlots = new UsingHolder(inputs.sharedSlots.capture());
+        state.sharedSlotsLength = new UsingHolder(inputs.sharedSlotsLength.capture());
+        const chainedMtpHiddenState = inputs.mtpHiddenStates;
 
         // prepare initial input
         if (i === 1) {
@@ -308,10 +308,14 @@ export function mtpTreeDecode(
           ws.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
         }
 
-        return newMtpHiddenStates.capture();
+        chainedMtpHiddenState.memcpy(newMtpHiddenStates, newMtpHiddenStates.bytes, MemcpyKind.DeviceToDevice);
       }, ['mtp-tree-decode', i, topks.length]);
 
       ws.glm.synchronize();
+
+      mtpHiddenStates.removeTracking();
+      sharedSlots.removeTracking();
+      sharedSlotsLength.removeTracking();
     }
 
     //
@@ -329,8 +333,6 @@ export function mtpTreeDecode(
     // after all depths for verification.
     const draftBoundaries = depthBoundaries(draftTopk);
 
-    let chainedHs = mtpHiddenStates;
-
     for (let depth = 1; depth < topks.length; depth++) {
       const qoLen = totalPaths(topks.slice(0, depth));
       const hsPrevQoLen = depth > 1 ? totalPaths(topks.slice(0, depth - 1)) : 1;
@@ -347,11 +349,11 @@ export function mtpTreeDecode(
         maskKvLen: chunkedMask.maskKvLen,
       });
 
-      const prevHs = chainedHs;
       warmup ||= !state.isCaptured(captureManager, ['mtp-chunk', depth, topks.length]);
-      chainedHs = state.capture(captureManager, { sharedSlots: sharedSlots.value, sharedSlotsLength: sharedSlotsLength.value }, (_capturing, inputs) => {
-        state.sharedSlots = new UsingHolder(inputs.sharedSlots);
-        state.sharedSlotsLength = new UsingHolder(inputs.sharedSlotsLength);
+      state.capture(captureManager, { mtpHiddenStates, sharedSlots, sharedSlotsLength }, (_capturing, inputs) => {
+        state.sharedSlots = new UsingHolder(inputs.sharedSlots.capture());
+        state.sharedSlotsLength = new UsingHolder(inputs.sharedSlotsLength.capture());
+        const prevHs = inputs.mtpHiddenStates;
 
         // Depth 1: compute initial logits and topk from mtpHiddenStates
         if (depth === 1) {
@@ -399,7 +401,7 @@ export function mtpTreeDecode(
           ws.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
         }
 
-        return hiddenStates.capture();
+        prevHs.memcpy(hiddenStates, hiddenStates.bytes, MemcpyKind.DeviceToDevice);
       }, ['mtp-chunk', depth, topks.length]);
       ws.glm.synchronize();
     }
@@ -427,16 +429,16 @@ export function mtpTreeDecode(
     ...targetCustomMask,
     positionIds: getPositionIdsMask(ws, originalAllocLen, targetTopk),
   });
-  sharedSlots.release();
-  sharedSlotsLength.release();
 
   targetPrefillState.setInput(verificationTokens);
 
   const hiddenStateStaging = ws.ensureAlloc([numVerificationTokens, hiddenDim], "BF16", `mtp-tree-hs-staging-${numVerificationTokens}`, undefined, 0);
   ws.glm.synchronize();
 
+  const track1 = ws.startTracking(new Set([mtpHiddenStates, sharedSlots, sharedSlotsLength]));
+
   warmup ||= !targetPrefillState.isCaptured(captureManager, ['mtp-verify', numVerificationTokens]);
-  const { kvCacheLayers, indexerKvCacheLayers, capturedSharedSlots, capturedSharedSlotsLength } = targetPrefillState.capture(captureManager, { }, () => {
+  const { kvCacheLayers, indexerKvCacheLayers } = targetPrefillState.capture(captureManager, { mtpHiddenStates, sharedSlots, sharedSlotsLength }, () => {
     targetPrefillState.sharedSlots = new UsingHolder(undefined!);
     targetPrefillState.sharedSlotsLength = new UsingHolder(undefined!);
 
@@ -455,6 +457,7 @@ export function mtpTreeDecode(
 
     const indexerKvCacheAppendOrig = targetPrefillState.indexerKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.indexerKvCacheAppend = (idxKOut, cacheIdx, indexHeadDim) => {
+      idxKOut.removeTracking();
       indexerKvCacheLayers.push({ appendIdxK: idxKOut.capture(), appendIdxKOrig: idxKOut, cacheIdx, indexHeadDim });
       return indexerKvCacheAppendOrig(idxKOut, cacheIdx, indexHeadDim);
     };
@@ -468,13 +471,19 @@ export function mtpTreeDecode(
     hiddenStateStaging.memcpy(hiddenStates, undefined, MemcpyKind.DeviceToDevice);
 
     // need the new shared slots for the 
-    const capturedSharedSlots = targetPrefillState.sharedSlots?.value.removeTracking().capture();
-    const capturedSharedSlotsLength = targetPrefillState.sharedSlotsLength?.value.removeTracking().capture();
-    return { kvCacheLayers, indexerKvCacheLayers, capturedSharedSlots, capturedSharedSlotsLength };
+    const capturedSharedSlots = targetPrefillState.sharedSlots.value;
+    const capturedSharedSlotsLength = targetPrefillState.sharedSlotsLength.value;
+    sharedSlots.memcpy(capturedSharedSlots, capturedSharedSlots!.bytes, MemcpyKind.DeviceToDevice);
+    sharedSlotsLength.memcpy(capturedSharedSlotsLength, capturedSharedSlotsLength.bytes, MemcpyKind.DeviceToDevice);
+
+    return { kvCacheLayers, indexerKvCacheLayers };
   }, ['mtp-verify', numVerificationTokens]);
 
-  sharedSlots.replace(capturedSharedSlots!);
-  sharedSlotsLength.replace(capturedSharedSlotsLength!);
+  ws.freeze();
+
+  sharedSlots.removeTracking();
+  sharedSlotsLength.removeTracking();
+  mtpHiddenStates.removeTracking();
 
   ws.glm.synchronize();
 
@@ -600,8 +609,6 @@ export function mtpTreeDecode(
 
   const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache);
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
-  mtpExtendPrefill.sharedSlots = sharedSlots;
-  mtpExtendPrefill.sharedSlotsLength = sharedSlotsLength;
   for (const layer of kvCacheLayers) {
     mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
     layer.appendCkvOrig[Symbol.dispose]();
@@ -613,8 +620,15 @@ export function mtpTreeDecode(
   }
   ws.glm.synchronize();
 
+  ws.unfreeze()
+
+  track1[Symbol.dispose]();
+  using track2 = ws.startTracking(new Set([mtpHiddenStates, sharedSlots, sharedSlotsLength]));
+
   warmup ||= !mtpExtendPrefill.isCaptured(captureManager, ['mtp-replace', finishCount]);
-  mtpExtendPrefill.capture(captureManager, {}, () => {
+  mtpExtendPrefill.capture(captureManager, { mtpHiddenStates, sharedSlots, sharedSlotsLength }, () => {
+    mtpExtendPrefill.sharedSlots = new UsingHolder(sharedSlots.capture());
+    mtpExtendPrefill.sharedSlotsLength = new UsingHolder(sharedSlotsLength.capture());
 
     using verfiedHiddenStates = hiddenStateStaging.slice(0, 0, finishCount);
     using mtpHs = model.forwardMtp!(mtpExtendPrefill, verfiedHiddenStates);
@@ -627,7 +641,9 @@ export function mtpTreeDecode(
     using newMtpHiddenStates = mtpHs.slice(0, -1, 1);
     mtpHiddenStates.memcpy(newMtpHiddenStates);
   }, ['mtp-replace', finishCount]);
-
+  mtpHiddenStates.removeTracking();
+  sharedSlots.removeTracking();
+  sharedSlotsLength.removeTracking();
   ws.glm.synchronize();
 
 

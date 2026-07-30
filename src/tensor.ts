@@ -13,7 +13,7 @@ function numElements(shape: number[]): number {
 export abstract class Tensor implements Disposable {
   parallelism: TensorParallelism = TensorParallelism.Replicated;
   private pinnedBuffer?: Buffer;
-  stack: string;
+  // stack: string;
   views = new Set<Tensor>();
   disposed = false;
   viewDisposed = false;
@@ -37,10 +37,39 @@ export abstract class Tensor implements Disposable {
     this.name = name;
     this.pinned = pinned;
     this.view = view;
-    this.stack = new Error("Tensor allocated at:").stack!;
+    // this.stack = new Error("Tensor allocated at:").stack!;
     if (view) {
       view.views.add(this);
     }
+  }
+
+  stage() {
+    if (this.name)
+      throw new Error(`Cannot stage named tensor ${this.name}`);
+    if (this.disposed)
+      throw new Error(`Tensor has been disposed and can not be staged`);
+    if (this.captured)
+      return;
+    if (this.view) {
+      this.view.stage();
+      return;
+    }
+    this.workspace.tracked.delete(this);
+    this.workspace.exported.delete(this);
+    this.workspace.staged.add(this);
+  }
+  
+  unstage() {
+    if (this.disposed)
+      return;
+    if (!this.workspace.staged.has(this))
+      return;
+    if (this.view) {
+      this.view.unstage();
+      return;
+    }
+    this.workspace.staged.delete(this);
+    this.workspace.tracked.add(this);
   }
 
   same(other: Tensor): boolean {
@@ -153,6 +182,7 @@ export abstract class Tensor implements Disposable {
     }
     this.disposed = true;
     this.workspace.tracked.delete(this);
+    this.workspace.staged.delete(this);
     if (this.view) {
       this.view.views.delete(this);
       if (this.view.viewDisposed) {
@@ -171,6 +201,8 @@ export abstract class Tensor implements Disposable {
     if (this.name !== undefined) {
       throw new Error(`Cannot removeTracking on named tensor ${this.name}`);
     }
+    if (this.captured)
+      return this;
     this.workspace.tracked.delete(this);
     this.workspace.exported.add(this);
     return this;

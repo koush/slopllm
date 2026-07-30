@@ -6,6 +6,7 @@ export class WorkspaceBase implements Disposable {
   readonly glm: DeviceOps;
   tensors = new Map<string, Tensor>();
   tracked = new Set<Tensor>();
+  staged = new Set<Tensor>();
   disposedDevice = new Set<Tensor>();
   disposedHost = new Set<Tensor>();
   exported = new Set<Tensor>();
@@ -20,6 +21,9 @@ export class WorkspaceBase implements Disposable {
   startTracking(keepExports = new Set<Tensor>()): Disposable & { [Symbol.dispose](): void } {
     if (this.tracking !== null) {
       throw new Error("startTracking already active");
+    }
+    if (this.staged.size) {
+      throw new Error("startTracking was called with staged tensors already allocated, this may result in non-deterministic allocations.");
     }
     if (this.tracked.size) {
       console.warn(new Error("startTracking was called with tensors already allocated, this may result in non-deterministic allocations."));
@@ -50,6 +54,10 @@ export class WorkspaceBase implements Disposable {
 
   freeze() {
     this.frozen = true;
+  }
+
+  unfreeze() {
+    this.frozen = false;
   }
 
   alloc(shape: number[], type: string, name?: string, parallelism?: TensorParallelism): Tensor {
@@ -172,11 +180,15 @@ export class WorkspaceBase implements Disposable {
     for (const tensor of this.exported) {
       tensor.free();
     }
+    for (const tensor of this.staged) {
+      tensor.free();
+    }
     this.tensors.clear();
     this.tracked.clear();
     this.disposedHost.clear();
     this.disposedDevice.clear();
     this.exported.clear();
+    this.staged.clear();
   }
 
   [Symbol.dispose](): void {

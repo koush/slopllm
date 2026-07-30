@@ -288,11 +288,10 @@ export function* generateStream(
   try {
     for (let i = 1; i < maxNewTokens; i++) {
       using _tracking = sampleWorkspace.startTracking();
-      using _tracking2 = ws.startTracking();
 
       if (mtp && model.forwardMtp && topks.length > 0) {
         if (process.env.GLM_STEP_LOG === '1') process.stderr.write(`[step ${i}] seqLen=${cache.getPagedKV().sequences[0].allocLen} histLen=${tokenHistory.length}\n`);
-        const { warmup, tokens, numAccepted, numDraftTokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots, sharedSlotsLength, ws, currentToken, topks, cache, tokenizer);
+        const { warmup, tokens, numAccepted, numDraftTokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots.value, sharedSlotsLength.value, ws, currentToken, topks, cache, tokenizer);
         if (mtpStats && !warmup) mtpStats.observe(numDraftTokens, numAccepted);
         // glm.synchronize();
         for (const t of tokens) {
@@ -326,6 +325,8 @@ export function* generateStream(
         //   console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer?.decode([t]) ?? `?${t}`).join(" ")}`);
         // }
       }
+
+      using _tracking2 = ws.startTracking();
 
       const tPlan = performance.now();
       let isPostWarmupToken = false;
@@ -617,6 +618,8 @@ async function interactiveBatch(
 // --- Main ---
 
 async function main(): Promise<void> {
+  Error.stackTraceLimit = 20; 
+
   const args = parseArgs(process.argv.slice(2));
 
   const GLM51_SMALL_BF16 = "tests/python/test_models/glm51_small/glm51_small_bf16";

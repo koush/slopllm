@@ -84,6 +84,7 @@ export class CaptureManager implements Disposable {
 
         let captured: Captured | undefined;
         let capturing = false;
+
         if (!this.disabled && keyParams?.length) {
             const key = keyParams.join(",");
             captured = this.captured.get(key);
@@ -91,8 +92,10 @@ export class CaptureManager implements Disposable {
             if (captured) {
                 if (captured.graphExec !== null) {
                     for (const [name, input] of Object.entries(inputs)) {
+                        input.stage();
                         const capturedInput = captured.inputs[name];
                         if (!capturedInput.same(input)) {
+                            console.warn('need memcpy')
                             capturedInput.memcpy(input, capturedInput.bytes, MemcpyKind.DeviceToDevice);
                         }
                     }
@@ -100,6 +103,9 @@ export class CaptureManager implements Disposable {
                         if (ws.exported.size || ws.tracked.size) {
                             throw new Error("Cannot replay a capture with exported or tracked tensors in a captured workspace");
                         }
+                    }
+                    for (const [name, input] of Object.entries(inputs)) {
+                        input.unstage();
                     }
                     this.ops.graphLaunch(captured.graphExec);
                     return captured.result;
@@ -122,7 +128,8 @@ export class CaptureManager implements Disposable {
                 captured.warmupSteps++;
             }
             else {
-                this.captured.set(key, { warmupSteps: 1, graphExec: null, result: undefined, inputs: undefined!, capturedWorkspaces: new Set() });
+                captured = { warmupSteps: 1, graphExec: null, result: undefined, inputs: undefined!, capturedWorkspaces: new Set() };
+                this.captured.set(key, captured);
             }
         }
 
@@ -130,6 +137,7 @@ export class CaptureManager implements Disposable {
         try {
             const capturedInputs: any = {};
             for (const [name, input] of Object.entries(inputs)) {
+                input.stage();
                 capturedInputs[name] = input.capture();
             }
 
@@ -149,6 +157,10 @@ export class CaptureManager implements Disposable {
         }
         finally {
             CaptureManager.capturing = undefined;
+
+            for (const [name, input] of Object.entries(inputs)) {
+                input.unstage();
+            }
         }
 
         if (capturing) {

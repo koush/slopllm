@@ -111,10 +111,21 @@ export class ParallelTensor extends Tensor {
     return captured;
   }
 
-  allowDispose = true;
+  stage() {
+    super.stage();
+    for (const shard of this.shards) {
+      shard.stage();
+    }
+  }
+  
+  unstage() {
+    super.unstage();
+    for (const shard of this.shards) {
+      shard.unstage();
+    }
+  }
+
   [Symbol.dispose](): void {
-    if (!this.allowDispose)
-      console.warn('wtf');
     if (!this.canDispose()) {
       return;
     }
