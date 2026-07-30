@@ -92,7 +92,7 @@ describe("MTP with CUDA graph capture: TP validation", () => {
         ws.glm.synchronize();
         const currentToken = sampleResult.readPinnedBuffer().readInt32LE();
         const { tokens: result } = mtpTreeDecode(
-          captureManager, model, targetHiddenStates.value, sharedSlots, sharedSlotsLength, ws, currentToken, Array(nextn).fill(2), cache,
+          captureManager, model, targetHiddenStates.value, sharedSlots.value, sharedSlotsLength.value, ws, currentToken, Array(nextn).fill(2), cache,
         );
         for (const t of result) {
           cache.reportTokens(0, [t]);
