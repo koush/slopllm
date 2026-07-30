@@ -91,13 +91,13 @@ p2p_arrive_kernel(
             // kernel 1's P2P stores are pushed out before kernel 2 begins issuing. That edge is
             // real, and the `.release` *ordering* on the flag store is redundant with respect to it.
 
-            asm volatile("st.global.relaxed.sys.s32 [%0], %1;"
-                         :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
+            // asm volatile("st.global.relaxed.sys.s32 [%0], %1;"
+            //              :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
 
             // so this is not needed because the kernel boundary gaurantees it.
             // however if the arrive/barrier/op is FUSED then it would be needed.
-            // asm volatile("st.global.release.sys.s32 [%0], %1;"
-            //              :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
+            asm volatile("st.global.release.sys.s32 [%0], %1;"
+                         :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
         }
     }
     __syncwarp();
