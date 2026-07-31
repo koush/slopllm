@@ -693,37 +693,6 @@ function buildTargetMask(ws: WorkspaceBase, topk: number[]): { data: Tensor; ind
   return { data, indptr };
 }
 
-function buildMTPMask(ws: WorkspaceBase, topk: number[]): { data: Tensor; indptr: Tensor } {
-  const numTokens = totalTreeNodes(topk);
-  const totalBits = numTokens * numTokens;
-  const byteLen = Math.ceil(totalBits / 8);
-  const key = topk.join('_');
-  const data = ws.tensors.get(`mtp_draft_mask_host_${key}`) || ws.allocPinned([byteLen], "U8", `mtp_draft_mask_host_${key}`);
-
-  const boundaries = depthBoundaries(topk);
-  data.withPinnedBuffer(data => {
-    data.fill(0);
-    for (let q = 0; q < numTokens; q++) {
-      let cur = q;
-      while (true) {
-        const bit = q * numTokens + cur;
-        data[bit >> 3] |= 1 << (bit & 7);
-        const p = parentIndex(topk, cur, boundaries);
-        if (p === -1) break;
-        cur = p;
-      }
-    }
-  });
-
-  const indptr = ws.tensors.get(`mtp_draft_mask_indptr_host_${key}`) || ws.allocPinned([2], "I32", `mtp_draft_mask_indptr_host_${key}`);
-  indptr.withPinnedBuffer(indptr => {
-    indptr.writeInt32LE(0, 0);
-    indptr.writeInt32LE(byteLen, 4);
-  });
-
-  return { data, indptr };
-}
-
 function ensureTargetCustomMask(ws: WorkspaceBase, topk: number[]) {
   const key = topk.join('_');
   let mask = ws.tensors.get(`mtp_target_mask_${key}`);
@@ -733,25 +702,6 @@ function ensureTargetCustomMask(ws: WorkspaceBase, topk: number[]) {
     mask = ws.alloc(maskData.shape, "U8", `mtp_target_mask_${key}`);
     mask.memcpy(maskData, maskData.bytes, MemcpyKind.HostToDevice);
     indptr = ws.alloc(maskIndptrData.shape, "I32", `mtp_target_mask_indptr_${key}`);
-    indptr.memcpy(maskIndptrData, maskIndptrData.bytes, MemcpyKind.HostToDevice);
-  }
-
-  return {
-    mask,
-    indptr,
-    mode: MaskMode.CausalCustom,
-  };
-};
-
-function ensureMTPCustomMask(ws: WorkspaceBase, topk: number[]) {
-  const key = topk.join('_');
-  let mask = ws.tensors.get(`mtp_draft_mask_${key}`);
-  let indptr = ws.tensors.get(`mtp_draft_mask_indptr_${key}`);
-  if (!mask || !indptr) {
-    const { data: maskData, indptr: maskIndptrData } = buildMTPMask(ws, topk);
-    mask = ws.alloc(maskData.shape, "U8", `mtp_draft_mask_${key}`);
-    mask.memcpy(maskData, maskData.bytes, MemcpyKind.HostToDevice);
-    indptr = ws.alloc(maskIndptrData.shape, "I32", `mtp_draft_mask_indptr_${key}`);
     indptr.memcpy(maskIndptrData, maskIndptrData.bytes, MemcpyKind.HostToDevice);
   }
 
