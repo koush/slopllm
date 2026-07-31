@@ -211,8 +211,9 @@ export function mtpTreeDecode(
   // candidates come straight from the seed hidden state. Applies to both the
   // batched-decode and chunked-prefill branches.
   if (topks.length === 1) {
+    using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedSlots, sharedSlotsLength]));
     warmup ||= !captureManager.isCaptured(['mtp-tree-decode-root', topks[0], `batchSize:${batchSize}`]);
-    captureManager.run({}, () => {
+    captureManager.run({ sharedSlots, sharedSlotsLength, mtpHiddenStates }, () => {
       // mtpHiddenStates is already shared_head.norm'd by forwardMtp; use directly
       using initialLogits = mtpHiddenStates.linear(lmHead);
       const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
@@ -220,6 +221,9 @@ export function mtpTreeDecode(
       using initialIndices = initialTopk.indices;
       hostBuf.memcpy2d(0, batchSize * I32 * topks[0], initialIndices, 0, batchSize * I32 * topks[0], batchSize * I32 * topks[0], 1, MemcpyKind.DeviceToHost);
     }, ['mtp-tree-decode-root', topks[0], `batchSize:${batchSize}`]);
+    mtpHiddenStates.removeTracking();
+    sharedSlots.removeTracking();
+    sharedSlotsLength.removeTracking();
     ws.glm.synchronize();
   }
   else if (useDecodeDraftGenerator) {
