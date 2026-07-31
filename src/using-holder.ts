@@ -45,3 +45,19 @@ export class UsingHolder<T extends Disposable> extends UsingHolderBase<T> {
     }
 }
 
+export class DisposableSet implements Disposable {
+    private _items: Disposable[] = [];
+
+    add(value: Disposable) {
+        this._items.push(value);
+    }
+
+    [Symbol.dispose]() {
+        const items = this._items;
+        this._items = [];
+        for (const item of items) {
+            item[Symbol.dispose]();
+        }
+    }
+}
+
