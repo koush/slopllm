@@ -394,15 +394,12 @@ describe("PagedKVCache staging", () => {
     assert.throws(() => pagedKV.removeSequence(-1), /out of range/);
   });
 
-  it("removeSequence sets dirty flags", () => {
+  it("removeSequence reduces sequence count", () => {
     using pagedKV = makePagedKV(2, 32);
     pagedKV.reset(2);
-    pagedKV.pagesDirtyHost = false;
-    pagedKV.positionIdsDirty = false;
 
     pagedKV.removeSequence(0);
 
-    assert.equal(pagedKV.pagesDirtyHost, true, "pagesDirtyHost should be set");
-    assert.equal(pagedKV.positionIdsDirty, true, "positionIdsDirty should be set");
+    assert.equal(pagedKV.sequences.length, 1, "should have 1 sequence after removal");
   });
 });

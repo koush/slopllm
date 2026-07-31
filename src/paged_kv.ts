@@ -1,7 +1,6 @@
 import { type ChatCache } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import { MemcpyKind } from "./enums";
-import { I32 } from "./glm_ops";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 
@@ -44,7 +43,6 @@ export class Sequence {
     this.pages.push(page);
     this.allocLen += pageLen;
     page.refs++;
-    this.pagedKvCache.pagesDirtyHost = true;
   }
 
   popPage() {
@@ -54,7 +52,6 @@ export class Sequence {
     if (!page.refs) {
       this.pagedKvCache.availablePages.push(page.id);
     }
-    this.pagedKvCache.pagesDirtyHost = true;
   }
 
   clear() {
@@ -128,25 +125,11 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   vData: Tensor[];
   ckvData: Tensor[];
   kpeData: Tensor[];
-  indices: Tensor;
-  indicesH: Tensor;
   availablePages: number[];
   sequences: Sequence[];
   staging: Map<number, Sequence>;
-  pagesDirtyHost: boolean;
-  pagesDirtyDevice: boolean;
-  positionIdsDirty: boolean;
-  lastNumSequences: number;
 
   getPagedKV(): PagedKVCache { return this; }
-
-  checkSequenceCount(): void {
-    if (this.sequences.length !== this.lastNumSequences) {
-      this.pagesDirtyHost = true;
-      this.positionIdsDirty = true;
-    }
-    this.lastNumSequences = this.sequences.length;
-  }
 
   constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0, sharedLayers: boolean[] = []) {
     super(glm);
@@ -187,15 +170,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
         this.vData.push(this.alloc([maxPages, nKv * this.pageSize * hd], "BF16", "v" + i, TensorParallelism.Row));
       }
     }
-    this.indices = this.alloc([maxPages * maxBatch * I32], "I32", "indices");
-    this.indicesH = this.allocPinned([maxPages * maxBatch], "I32", "indicesH");
     this.availablePages = Array.from({ length: maxPages }, (_, i) => i);
     this.sequences = [];
     this.staging = new Map();
-    this.pagesDirtyHost = true;
-    this.pagesDirtyDevice = true;
-    this.positionIdsDirty = true;
-    this.lastNumSequences = 0;
 
     this.freeze();
   }
@@ -217,8 +194,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       }
     }
     this.sequences = Array.from({ length: batchSize }, () => new Sequence(this));
-    this.pagesDirtyHost = true;
-    this.positionIdsDirty = true;
   }
 
   stageSequence(seqIdx: number, stagingKey: number): void {
@@ -231,8 +206,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const seq = this.sequences[seqIdx];
     this.staging.set(stagingKey, seq);
     this.sequences.splice(seqIdx, 1);
-    this.pagesDirtyHost = true;
-    this.positionIdsDirty = true;
   }
 
   unstageSequence(stagingKey: number): Sequence {
@@ -242,8 +215,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
     this.staging.delete(stagingKey);
     this.sequences.push(seq);
-    this.pagesDirtyHost = true;
-    this.positionIdsDirty = true;
     return seq;
   }
 
@@ -268,14 +239,11 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const seq = this.sequences[seqIdx];
     seq.clear();
     this.sequences.splice(seqIdx, 1);
-    this.pagesDirtyHost = true;
-    this.positionIdsDirty = true;
   }
 
   copySequence(dstSeqIdx: number, srcSeqIdx: number) {
     if (dstSeqIdx === srcSeqIdx)
       return;
-    this.positionIdsDirty = true;
     const srcSeq = this.sequences[srcSeqIdx];
     const dstSeq = this.ensureSequence(dstSeqIdx);
 
@@ -307,7 +275,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   // returns the suffix immediately without touching pages.
   prefixMatch(seqIdx: number, inputIds: number[], copyPartial?: boolean): number[] {
     this.ensureSequence(seqIdx);
-    this.positionIdsDirty = true;
 
     let bestSeqIdx = -1;
     let bestMatchTokens = 0;

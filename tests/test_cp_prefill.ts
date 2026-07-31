@@ -568,10 +568,10 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
     // Manually write indices, indptr, lastPageLen via host buffers
     const indicesData = new Int32Array(maxPages);
     for (let i = 0; i < numPages; i++) indicesData[i] = i;
-    pagedKV.indicesH.h2d(i32Buf(indicesData));
-    pagedKV.pagesDirtyHost = false;
-    pagedKV.pagesDirtyDevice = true;
-    pagedKV.indices.memcpy(pagedKV.indicesH, maxPages * 4, 1 /* HostToDevice */);
+    const indicesH = ws.ensureAllocPinned([maxPages], "I32", `test_cp_indicesH_${maxPages}`);
+    indicesH.h2d(i32Buf(indicesData));
+    const indices = ws.ensureAlloc([maxPages], "I32", `test_cp_indices_${maxPages}`);
+    indices.memcpy(indicesH, maxPages * 4, 1 /* HostToDevice */);
 
     // Fill each shard's ckv/kpe with interleaved data
     const ckvData = pagedKV.ckvData[0] as ParallelTensor;
@@ -628,7 +628,7 @@ describe("CP MLA Prefill via ParallelOps + PagedKVCache", () => {
     const execState = { batchSize, totalTokens, cache: { getPagedKV: () => ({ pageSize }) } } as ExecutionState;
     const { o: pOut, lse: pLse } = po.mlaPrefillRun(
       execState,
-      pQNope, pQPe, ckvData, kpeData, pagedKV.indices,
+      pQNope, pQPe, ckvData, kpeData, indices,
       floatWs, intWs, planInfo,
       SM_SCALE, 1,
     );
