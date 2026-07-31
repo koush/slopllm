@@ -1271,37 +1271,6 @@ void glm_softmax(GlmCtx* ctx, void* out, const void* input,
 }
 
 // ---------------------------------------------------------------------------
-// Causal mask kernel
-// Fills upper triangle with -inf: out[i][j] = (j > offset + i) ? -inf : 0
-// out: [rows, cols] BF16
-// ---------------------------------------------------------------------------
-
-__global__ void __launch_bounds__(256, 4) causal_mask_kernel(
-    __nv_bfloat16* out,
-    int rows,
-    int cols,
-    int offset
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = rows * cols;
-    if (idx < total) {
-        int row = idx / cols;
-        int col = idx % cols;
-        float val = (col > offset + row) ? -INFINITY : 0.0f;
-        out[idx] = __float2bfloat16(val);
-    }
-}
-
-void glm_causal_mask(GlmCtx* ctx, void* out, int seq_len) {
-    cudaSetDevice(ctx->device_id);
-    int total = seq_len * seq_len;
-    int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
-    causal_mask_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, seq_len, seq_len, 0);
-}
-
-// ---------------------------------------------------------------------------
 // Fill kernel
 // ---------------------------------------------------------------------------
 
@@ -1590,44 +1559,6 @@ void glm_gather_pages(GlmCtx* ctx, void* out, const void* in,
         (char*)out, (const char*)in,
         page_indices, page_indptr, last_page_len,
         batch_size, page_size, D);
-}
-
-// ---------------------------------------------------------------------------
-// Cat last dim kernel
-// out[i, :a_dim] = a[i, :], out[i, a_dim:] = b[i, :]
-// ---------------------------------------------------------------------------
-
-__global__ void __launch_bounds__(256, 4) cat_last_dim_kernel(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* a,
-    const __nv_bfloat16* b,
-    int a_last_dim,
-    int b_last_dim,
-    int outer
-) {
-    int out_dim = a_last_dim + b_last_dim;
-    int total = outer * out_dim;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total) {
-        int row = idx / out_dim;
-        int col = idx % out_dim;
-        if (col < a_last_dim) {
-            out[idx] = a[row * a_last_dim + col];
-        } else {
-            out[idx] = b[row * b_last_dim + (col - a_last_dim)];
-        }
-    }
-}
-
-void glm_cat_last_dim(GlmCtx* ctx, void* out, const void* a, const void* b,
-                      int a_last_dim, int b_last_dim, int outer) {
-    cudaSetDevice(ctx->device_id);
-    int total = outer * (a_last_dim + b_last_dim);
-    int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
-    cat_last_dim_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)a,
-        (const __nv_bfloat16*)b, a_last_dim, b_last_dim, outer);
 }
 
 // ---------------------------------------------------------------------------
@@ -2354,66 +2285,6 @@ void glm_add_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int
 // input:   [rows, dim] BF16
 // scales:  [rows] BF16 (per-row scaling factor)
 // ---------------------------------------------------------------------------
-// Expand/repeat along dim 1 of a 4D tensor
-// input:  [batch, dim1_in, seq_len, head_dim]
-// output: [batch, dim1_out, seq_len, head_dim]
-// out[b, h_out, s, d] = input[b, h_out * dim1_in / dim1_out, s, d]
-// Requires dim1_out % dim1_in == 0
-// ---------------------------------------------------------------------------
-
-__global__ void __launch_bounds__(256, 4) expand_dim1_kernel(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* input,
-    int dim1_out,
-    int dim1_in,
-    int seq_len,
-    int head_dim,
-    int batch,
-    int head_stride,
-    int expand_ratio
-) {
-    int total = batch * dim1_out * seq_len * head_dim;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total) {
-        int d = idx % head_dim;
-        int rest = idx / head_dim;
-        int s = rest % seq_len;
-        rest /= seq_len;
-        int h_out = rest % dim1_out;
-        int b = rest / dim1_out;
-
-        int h_in = h_out / expand_ratio;
-        int in_idx = (b * dim1_in + h_in) * head_stride + s * head_dim + d;
-        out[idx] = input[in_idx];
-    }
-}
-
-void glm_expand_dim1(GlmCtx* ctx, void* out, const void* input,
-                     int dim1_out, int dim1_in, int seq_len, int head_dim, int batch) {
-    cudaSetDevice(ctx->device_id);
-    int total = batch * dim1_out * seq_len * head_dim;
-    int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
-    expand_dim1_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-        dim1_out, dim1_in, seq_len, head_dim, batch, seq_len * head_dim,
-        dim1_out / dim1_in);
-}
-
-void glm_expand_dim1_strided(GlmCtx* ctx, void* out, const void* input,
-                             int dim1_out, int dim1_in, int seq_len, int head_dim,
-                             int batch, int head_stride) {
-    cudaSetDevice(ctx->device_id);
-    int total = batch * dim1_out * seq_len * head_dim;
-    int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
-    expand_dim1_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
-        dim1_out, dim1_in, seq_len, head_dim, batch, head_stride,
-        dim1_out / dim1_in);
-}
-
-// ---------------------------------------------------------------------------
 // Specialized transpose for {0,2,1,3}: swaps dims 1 and 2
 // input:  [dim0, dim1, dim2, dim3]  output: [dim0, dim2, dim1, dim3]
 // out[b, s, h, d] = in[b, h, s, d]
@@ -3117,50 +2988,6 @@ void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
 } // extern "C"
 
 // ---------------------------------------------------------------------------
-// Sum of N tensors (element-wise, max 8 inputs)
-// Pointers passed as kernel arguments for CUDA graph compatibility.
-// Must be outside extern "C" because it's a template.
-// ---------------------------------------------------------------------------
-
-template <typename scalar_t>
-__global__ void __launch_bounds__(256, 4) sum_pointers_kernel(
-    const scalar_t* p0,  const scalar_t* p1,  const scalar_t* p2,  const scalar_t* p3,
-    const scalar_t* p4,  const scalar_t* p5,  const scalar_t* p6,  const scalar_t* p7,
-    scalar_t* __restrict__ output,
-    int N,
-    int64_t numel)
-{
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = blockDim.x * gridDim.x;
-
-    const scalar_t* ptrs[8] = {
-        p0, p1, p2, p3, p4, p5, p6, p7
-    };
-
-    if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
-        for (int64_t i = idx; i < numel; i += stride) {
-            float acc = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                if (j >= N) break;
-                acc += __bfloat162float(ptrs[j][i]);
-            }
-            output[i] = __float2bfloat16(acc);
-        }
-    } else {
-        for (int64_t i = idx; i < numel; i += stride) {
-            float acc = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                if (j >= N) break;
-                acc += ptrs[j][i];
-            }
-            output[i] = acc;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Smem-staged sum of N tensors (element-wise, max 8 inputs).
 // Peers are streamed through D double-buffered smem slots while threads
 // accumulate in FP32 registers, so the per-peer read size is decoupled from N
@@ -3395,27 +3222,6 @@ void glm_write_pointers(GlmCtx* ctx, void* dst,
     cudaSetDevice(ctx->device_id);
     write_pointers_kernel<<<1, 8, 0, GLM_STREAM(ctx)>>>(
         (void**)dst, p0, p1, p2, p3, p4, p5, p6, p7, n);
-}
-
-void glm_sum_pointers_direct(GlmCtx* ctx,
-    void* p0, void* p1, void* p2, void* p3,
-    void* p4, void* p5, void* p6, void* p7,
-    void* output, int N, int64_t numel, int dtype) {
-    cudaSetDevice(ctx->device_id);
-    constexpr int block_size = 256;
-    int grid = (int)((numel + block_size - 1) / block_size);
-    if (grid > 65535) grid = 65535;
-    if (dtype == 9) {
-        sum_pointers_kernel<__nv_bfloat16><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)p0, (__nv_bfloat16*)p1, (__nv_bfloat16*)p2, (__nv_bfloat16*)p3,
-            (__nv_bfloat16*)p4, (__nv_bfloat16*)p5, (__nv_bfloat16*)p6, (__nv_bfloat16*)p7,
-            (__nv_bfloat16*)output, N, numel);
-    } else {
-        sum_pointers_kernel<float><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-            (float*)p0, (float*)p1, (float*)p2, (float*)p3,
-            (float*)p4, (float*)p5, (float*)p6, (float*)p7,
-            (float*)output, N, numel);
-    }
 }
 
 } // extern "C"

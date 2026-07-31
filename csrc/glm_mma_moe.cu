@@ -472,41 +472,6 @@ __global__ void unscatter_output_kernel(
 }
 
 template <int TM, int TN>
-constexpr size_t nvfp4_smem_extra() { return TN * (TK / 2) + TN; }
-
-template <int TM, int TN>
-constexpr size_t mma_smem_size(int num_experts) {
-    constexpr size_t smem_extra = nvfp4_smem_extra<TM, TN>();
-    size_t peak_kloop = (size_t)TM * TK * 2 + (size_t)TK * TN * 2 + smem_extra + (size_t)TM * TK * 2 + smem_extra;
-    size_t peak_output = (size_t)TM * TK * 2 + (size_t)TK * TN * 2 + smem_extra + (size_t)TM * TN * 4;
-    size_t peak = peak_kloop > peak_output ? peak_kloop : peak_output;
-    return peak + (num_experts + 1) * sizeof(int);
-}
-
-template <int TM, int TN>
-static void launch_mma_kernel_nvfp4(GlmCtx* ctx, int num_experts, int N,
-                                      __nv_bfloat16* sorted_output,
-                                      const __nv_bfloat16* sorted_input, int K,
-                                      const void* const* weight_ptrs,
-                                      const void* const* scale_ptrs,
-                                      const void* const* scale2_ptrs,
-                                      const int* expert_offsets,
-                                      int* tile_counter, cudaStream_t stream) {
-    int num_SMs;
-    cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, ctx->device_id);
-    int min_blocks = (TN >= 128) ? 4 : (TM >= 64 ? 4 : 8);
-    int grid_size = num_SMs * min_blocks;
-
-    size_t smem_size = mma_smem_size<TM, TN>(num_experts);
-
-    grouped_mma_kernel<TM, TN, true><<<grid_size, CTA_SIZE, smem_size, stream>>>(
-        sorted_output, sorted_input, K,
-        weight_ptrs, scale_ptrs, scale2_ptrs,
-        expert_offsets, num_experts, N,
-        tile_counter);
-}
-
-template <int TM, int TN>
 static void launch_mma_kernel_bf16(GlmCtx* ctx, int num_experts, int N,
                                       __nv_bfloat16* sorted_output,
                                       const __nv_bfloat16* sorted_input, int K,
@@ -604,43 +569,6 @@ void NAME(GlmCtx* ctx, void* output, const void* input, \
         sorted_output, N, sorted_to_original, count); \
 }
 
-#define DEFINE_NVFP4_MMA_FUNC(NAME, TM_VAL, TN_VAL) \
-void NAME(GlmCtx* ctx, void* output, const void* input, \
-          const void* const* weight_ptrs, \
-          const void* const* scale_ptrs, \
-          const void* const* scale2_ptrs, \
-          const int* expert_ids, int top_k, \
-          int count, int N, int K, \
-          int num_experts, void* workspace) { \
-    cudaSetDevice(ctx->device_id); \
-    cudaStream_t stream = GLM_STREAM(ctx); \
-    if (count == 0 || N == 0 || K == 0) return; \
-    uint8_t* ws = static_cast<uint8_t*>(workspace); \
-    size_t offset = 0; \
-    __nv_bfloat16* sorted_input = reinterpret_cast<__nv_bfloat16*>(ws + offset); \
-    offset += (size_t)count * K * 2; \
-    __nv_bfloat16* sorted_output = reinterpret_cast<__nv_bfloat16*>(ws + offset); \
-    offset += (size_t)count * N * 2; \
-    int* expert_counts = reinterpret_cast<int*>(ws + offset); \
-    offset += (size_t)num_experts * 4; \
-    int* expert_offsets = reinterpret_cast<int*>(ws + offset); \
-    offset += (size_t)(num_experts + 1) * 4; \
-    int* sorted_to_original = reinterpret_cast<int*>(ws + offset); \
-    offset += (size_t)count * 4; \
-    int* tile_counter = reinterpret_cast<int*>(ws + offset); \
-    dispatch_sort_scatter(ctx, input, K, expert_ids, top_k, count, num_experts, \
-                          sorted_input, sorted_to_original, expert_counts, expert_offsets, stream); \
-    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream); \
-    launch_mma_kernel_nvfp4<TM_VAL, TN_VAL>(ctx, num_experts, N, sorted_output, sorted_input, K, \
-                                              weight_ptrs, scale_ptrs, scale2_ptrs, \
-                                              expert_offsets, tile_counter, stream); \
-    int block_size = 256; \
-    int unscatter_grid = (count + block_size - 1) / block_size; \
-    unscatter_output_kernel<<<unscatter_grid, block_size, 0, stream>>>( \
-        reinterpret_cast<__nv_bfloat16*>(output), \
-        sorted_output, N, sorted_to_original, count); \
-}
-
 #define DEFINE_BF16_MMA_FUNC(NAME, TM_VAL, TN_VAL) \
 void NAME(GlmCtx* ctx, void* output, const void* input, \
           const void* const* weight_ptrs, \
@@ -675,14 +603,6 @@ void NAME(GlmCtx* ctx, void* output, const void* input, \
         sorted_output, N, sorted_to_original, count); \
 }
 
-DEFINE_NVFP4_MMA_FUNC(glm_nvfp4_mul_mat_id_grouped_mma, 32, 64)
-DEFINE_NVFP4_MMA_FUNC(glm_nvfp4_mul_mat_id_grouped_mma_tm64, 64, 64)
-DEFINE_NVFP4_MMA_FUNC(glm_nvfp4_mul_mat_id_grouped_mma_tm32_tn128, 32, 128)
-DEFINE_NVFP4_MMA_FUNC(glm_nvfp4_mul_mat_id_grouped_mma_tm16_tn128, 16, 128)
-
 DEFINE_BF16_MMA_FUNC(glm_bf16_mul_mat_id_grouped_mma, 32, 64)
-DEFINE_BF16_MMA_FUNC(glm_bf16_mul_mat_id_grouped_mma_tm64, 64, 64)
-DEFINE_BF16_MMA_FUNC(glm_bf16_mul_mat_id_grouped_mma_tm32_tn128, 32, 128)
-DEFINE_BF16_MMA_FUNC(glm_bf16_mul_mat_id_grouped_mma_tm16_tn128, 16, 128)
 
 } // extern "C"

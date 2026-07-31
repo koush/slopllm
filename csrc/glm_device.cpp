@@ -95,10 +95,6 @@ void glm_free_pinned(void* ptr) {
     if (ptr) cudaFreeHost(ptr);
 }
 
-void glm_write_pinned(void* dst, const void* src, size_t size) {
-    memcpy(dst, src, size);
-}
-
 // ---------------------------------------------------------------------------
 // Mmap
 // ---------------------------------------------------------------------------
@@ -308,15 +304,6 @@ void glm_graph_launch(GlmCtx* ctx, void* graph_exec) {
     if (err != cudaSuccess) {
         fprintf(stderr, "glm_graph_launch failed: %s\n", cudaGetErrorString(err));
     }
-}
-
-int glm_graph_exec_update(GlmCtx* ctx, void* graph_exec, void* graph) {
-    cudaSetDevice(ctx->device_id);
-    cudaGraphExecUpdateResultInfo result_info = {};
-    cudaGraphExecUpdate(reinterpret_cast<cudaGraphExec_t>(graph_exec),
-                        reinterpret_cast<cudaGraph_t>(graph),
-                        &result_info);
-    return (result_info.result == cudaGraphExecUpdateSuccess) ? 0 : 1;
 }
 
 void glm_graph_destroy(GlmCtx* ctx, void* graph) {

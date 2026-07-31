@@ -77,8 +77,6 @@ void glm_sigmoid(GlmCtx* ctx, void* out, const void* input, int n);
 void glm_softmax(GlmCtx* ctx, void* out, const void* input,
                  const void* mask, int dim, int batch);
 
-void glm_causal_mask(GlmCtx* ctx, void* out, int seq_len);
-
 void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
                        const void* weights, const int32_t* pageIndices,
                        const int32_t* pageIndptr, const int32_t* lastPageLen,
@@ -86,14 +84,7 @@ void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
                        int totalQ, int idxNHeads, int idxHeadDim,
                        int pageSize, int maxKvLen, int causal);
 
-void glm_indexer_score_topk(GlmCtx* ctx, int32_t* out_idx,
-    const void* q, const void* kData, const void* weights,
-    const int32_t* pageIndices, const int32_t* pageIndptr,
-    const int32_t* lastPageLen, const int32_t* qoIndptr,
-    float scale, int totalQ, int idxNHeads, int idxHeadDim,
-    int pageSize, int topk, int causal,
-    const uint8_t* custom_mask = nullptr, const int32_t* mask_indptr = nullptr,
-    const int32_t* mask_kv_len = nullptr);
+
 
 void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     const void* q, const void* kData, const void* weights,
@@ -149,9 +140,6 @@ void glm_gather_pages(GlmCtx* ctx, void* out, const void* in,
                       int max_pages, int batch_size,
                       int page_size, int D);
 
-void glm_cat_last_dim(GlmCtx* ctx, void* out, const void* a, const void* b,
-                      int a_last_dim, int b_last_dim, int outer);
-
 void glm_masked_fill(GlmCtx* ctx, void* out, const void* input, const void* mask,
                      float value, int n);
 
@@ -206,13 +194,6 @@ void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n);
 
 void glm_add_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int dim, int rows);
 
-void glm_expand_dim1(GlmCtx* ctx, void* out, const void* input,
-                     int dim1_out, int dim1_in, int seq_len, int head_dim, int batch);
-
-void glm_expand_dim1_strided(GlmCtx* ctx, void* out, const void* input,
-                             int dim1_out, int dim1_in, int seq_len, int head_dim,
-                             int batch, int head_stride);
-
 void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
                       int dim0, int dim1, int dim2, int dim3,
                       int perm0, int perm1, int perm2, int perm3);
@@ -245,22 +226,6 @@ void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
                              const void* scales, int top_k,
                              int dim, int num_rows, void* workspace);
 
-size_t glm_grouped_moe_workspace_size(int count, int N, int K, int num_experts);
-
-void glm_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
-                              const void* const* weight_ptrs,
-                              const int* expert_ids, int top_k,
-                              int count, int N, int K,
-                              int num_experts, void* workspace);
-
-void glm_nvfp4_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
-                                     const void* const* weight_ptrs,
-                                     const void* const* scale_ptrs,
-                                     const void* const* scale2_ptrs,
-                                     const int* expert_ids, int top_k,
-                                     int count, int N, int K,
-                                     int num_experts, void* workspace);
-
 // Rotate input IDs for MTP prefill: shifts each sequence left by 1,
 // appends new_token at the last position.
 // output_ids/input_ids: [totalTokens] I32
@@ -269,14 +234,6 @@ void glm_nvfp4_mul_mat_id_grouped(GlmCtx* ctx, void* output, const void* input,
 void glm_rotate_input_ids(GlmCtx* ctx, int* output_ids, const int* input_ids,
                            const int* qo_indptr, const int* new_tokens,
                            int batch_size);
-
-// Direct (no smem) element-wise sum of N tensors (max 8) into a separate output.
-// For local memory only — no smem staging or pipelining.
-// dtype: 9=BF16, 7=F32.
-void glm_sum_pointers_direct(GlmCtx* ctx,
-    void* p0,  void* p1,  void* p2,  void* p3,
-    void* p4,  void* p5,  void* p6,  void* p7,
-    void* output, int N, int64_t numel, int dtype);
 
 // Element-wise sum of N tensors (max 8). Pointers passed as kernel args
 // for CUDA graph compatibility. dtype: 9=BF16, 7=F32.
@@ -513,28 +470,8 @@ void glm_event_record(GlmCtx* ctx, int event_idx, int stream_idx);
 
 void glm_stream_wait_event(GlmCtx* ctx, int stream_idx, int event_idx);
 
-void glm_flash_prefill(
-    GlmCtx* ctx,
-    void* q, void* k, void* v, void* o, void* tmp,
-    int qo_len, int kv_len,
-    int num_qo_heads, int num_kv_heads, int head_dim,
-    int q_stride_n, int q_stride_h,
-    int kv_stride_n, int kv_stride_h,
-    int v_stride_n, int v_stride_h,
-    int mask_mode, int kv_layout, float sm_scale);
-
-void glm_flash_decode(
-    GlmCtx* ctx,
-    void* q, void* k, void* v, void* o, void* tmp,
-    int kv_len,
-    int num_qo_heads, int num_kv_heads, int head_dim,
-    int q_stride_n, int q_stride_h,
-    int kv_stride_n, int kv_stride_h,
-    float sm_scale);
-
 void* glm_alloc_pinned(size_t bytes);
 void glm_free_pinned(void* ptr);
-void glm_write_pinned(void* dst, const void* src, size_t size);
 
 void glm_batch_decode_plan(
     GlmCtx* ctx,
@@ -808,7 +745,6 @@ void glm_graph_begin_capture(GlmCtx* ctx);
 void* glm_graph_end_capture(GlmCtx* ctx);
 void* glm_graph_instantiate(GlmCtx* ctx, void* graph);
 void glm_graph_launch(GlmCtx* ctx, void* graph_exec);
-int glm_graph_exec_update(GlmCtx* ctx, void* graph_exec, void* graph);
 void glm_graph_destroy(GlmCtx* ctx, void* graph);
 void glm_graph_exec_destroy(GlmCtx* ctx, void* graph_exec);
 
@@ -1024,85 +960,18 @@ void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_
                       const float* top_ps, unsigned int* step_counter,
                       int max_effective_k);
 
-// Grouped NVFP4 MoE using wmma BF16 MMA with FP4 hardware dequant (SM120+)
-// Same interface as glm_nvfp4_mul_mat_id_grouped but uses Tensor Core MMA
-// for prefill (M > threshold) instead of scalar GEMV.
+// Grouped MoE using Tensor Core MMA (SM120+)
+// Uses Tensor Core MMA for prefill (M > threshold) instead of scalar GEMV.
 size_t glm_mma_moe_workspace_size(int count, int N, int K, int num_experts);
 
-void glm_nvfp4_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* input,
-                                        const void* const* weight_ptrs,
-                                        const void* const* scale_ptrs,
-                                        const void* const* scale2_ptrs,
-                                        const int* expert_ids, int top_k,
-                                        int count, int N, int K,
-                                        int num_experts, void* workspace);
-
 // Grouped BF16 MoE using Tensor Core MMA (SM120+)
-// Same interface as glm_mul_mat_id_grouped but uses Tensor Core MMA
+// Same interface as glm_mul_mat_id but uses Tensor Core MMA
 // for prefill (M > threshold) instead of scalar GEMV.
 void glm_bf16_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* input,
                                        const void* const* weight_ptrs,
                                        const int* expert_ids, int top_k,
                                        int count, int N, int K,
                                        int num_experts, void* workspace);
-
-// TM=64 variants of the above
-void glm_nvfp4_mul_mat_id_grouped_mma_tm64(GlmCtx* ctx, void* output, const void* input,
-                                               const void* const* weight_ptrs,
-                                               const void* const* scale_ptrs,
-                                               const void* const* scale2_ptrs,
-                                               const int* expert_ids, int top_k,
-                                               int count, int N, int K,
-                                               int num_experts, void* workspace);
-
-void glm_bf16_mul_mat_id_grouped_mma_tm64(GlmCtx* ctx, void* output, const void* input,
-                                              const void* const* weight_ptrs,
-                                              const int* expert_ids, int top_k,
-                                              int count, int N, int K,
-                                              int num_experts, void* workspace);
-
-// TN=128 variants
-void glm_nvfp4_mul_mat_id_grouped_mma_tm32_tn128(GlmCtx* ctx, void* output, const void* input,
-                                                      const void* const* weight_ptrs,
-                                                      const void* const* scale_ptrs,
-                                                      const void* const* scale2_ptrs,
-                                                      const int* expert_ids, int top_k,
-                                                      int count, int N, int K,
-                                                      int num_experts, void* workspace);
-
-void glm_nvfp4_mul_mat_id_grouped_mma_tm16_tn128(GlmCtx* ctx, void* output, const void* input,
-                                                      const void* const* weight_ptrs,
-                                                      const void* const* scale_ptrs,
-                                                      const void* const* scale2_ptrs,
-                                                      const int* expert_ids, int top_k,
-                                                      int count, int N, int K,
-                                                      int num_experts, void* workspace);
-
-void glm_bf16_mul_mat_id_grouped_mma_tm32_tn128(GlmCtx* ctx, void* output, const void* input,
-                                                     const void* const* weight_ptrs,
-                                                     const int* expert_ids, int top_k,
-                                                     int count, int N, int K,
-                                                     int num_experts, void* workspace);
-
-void glm_bf16_mul_mat_id_grouped_mma_tm16_tn128(GlmCtx* ctx, void* output, const void* input,
-                                                      const void* const* weight_ptrs,
-                                                      const int* expert_ids, int top_k,
-                                                      int count, int N, int K,
-                                                      int num_experts, void* workspace);
-
-// Producer/Consumer MMA MoE kernel (NVFP4 only, SM120+)
-// Same interface as glm_nvfp4_mul_mat_id_grouped_mma but uses
-// producer/consumer warp specialization for overlapping load+dequant with MMA.
-size_t glm_mma_moe_pc_workspace_size(int count, int N, int K, int num_experts);
-
-void glm_nvfp4_mul_mat_id_grouped_mma_pc(GlmCtx* ctx, void* output,
-                                          const void* input,
-                                          const void* const* weight_ptrs,
-                                          const void* const* scale_ptrs,
-                                          const void* const* scale2_ptrs,
-                                          const int* expert_ids, int top_k,
-                                          int count, int N, int K,
-                                          int num_experts, void* workspace);
 
 // Cooperative all-warps kernel (B12X-style): all warps stage cp.async loads
 // then all warps run MMA. No producer/consumer split, no mbarriers.
@@ -1128,11 +997,8 @@ void glm_mma_moe_coop_gemm(GlmCtx* ctx,
                            const void* const* weight_ptrs, const void* const* scale_ptrs,
                            const void* const* scale2_ptrs,
                            int num_experts, int N, int K, int count,
-                           const void* scatter_workspace, void* gemm_workspace,
-                           void* output);
-void glm_mma_moe_coop_unscatter(GlmCtx* ctx, void* output,
-                                int count, int N, int K, int num_experts,
-                                const void* scatter_workspace, const void* gemm_workspace);
+                            const void* scatter_workspace, void* gemm_workspace,
+                            void* output);
 
 #ifdef __cplusplus
 }

@@ -80,21 +80,6 @@ __global__ void restore_offsets_kernel(int* __restrict__ expert_offsets,
     if (e < num_experts) expert_offsets[e] -= expert_counts[e];
 }
 
-__global__ void unscatter_output_kernel(__nv_bfloat16* __restrict__ output,
-                                         const __nv_bfloat16* __restrict__ sorted_output, int N,
-                                         const int* __restrict__ sorted_to_original, int count) {
-    int pos = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pos >= count) return;
-    int orig = sorted_to_original[pos];
-    const __nv_bfloat16* src = sorted_output + (size_t)pos * N;
-    __nv_bfloat16* dst = output + (size_t)orig * N;
-    int num_uint4 = N / 8;
-    const uint4* src_v4 = reinterpret_cast<const uint4*>(src);
-    uint4* dst_v4 = reinterpret_cast<uint4*>(dst);
-    for (int k = 0; k < num_uint4; k++) dst_v4[k] = src_v4[k];
-    for (int k = num_uint4 * 8; k < N; k++) dst[k] = src[k];
-}
-
 __device__ __forceinline__ void cp_async_ca_16(void* smem_ptr, const void* gmem_ptr) {
     uint32_t s = __cvta_generic_to_shared(smem_ptr);
     asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 16;\n" :: "r"(s), "l"(gmem_ptr));
@@ -770,25 +755,6 @@ void glm_mma_moe_coop_gemm(GlmCtx* ctx,
 
     launch_coop_configured(ctx, num_experts, N, sorted_input, reinterpret_cast<__nv_bfloat16*>(output), K,
                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
-}
-
-void glm_mma_moe_coop_unscatter(GlmCtx* ctx, void* output,
-                                int count, int N, int K, int num_experts,
-                                const void* scatter_workspace, const void* gemm_workspace) {
-    cudaSetDevice(ctx->device_id);
-    cudaStream_t stream = GLM_STREAM(ctx);
-    if (count == 0 || N == 0) return;
-
-    const uint8_t* sws = static_cast<const uint8_t*>(scatter_workspace);
-    const int* sorted_to_original = reinterpret_cast<const int*>(
-        sws + (size_t)count * K * 2 + (size_t)num_experts * 4 + (size_t)(num_experts + 1) * 4);
-
-    const uint8_t* gws = static_cast<const uint8_t*>(gemm_workspace);
-    const __nv_bfloat16* sorted_output = reinterpret_cast<const __nv_bfloat16*>(gws);
-
-    int block = 256, grid = (count + block - 1) / block;
-    unscatter_output_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(output),
-                                                        sorted_output, N, sorted_to_original, count);
 }
 
 } // extern "C"

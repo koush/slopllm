@@ -12,7 +12,7 @@ import { MemcpyKind } from "./enums";
 //  - run the direct per-(token,expert) GEMV kernel (mulMatId/nvfp4MulMatId), which
 //    re-reads each expert's weight once per routed token (redundant when several
 //    tokens share an expert, but a single dependency-free kernel launch), or
-//  - run the grouped/sorted pipeline (mulMatIdGrouped/nvfp4MulMatIdGrouped), which
+//  - run the grouped/sorted pipeline (bf16MulMatIdGroupedMma/nvfp4MulMatIdGroupedMmaCoop), which
 //    reads each expert's weight once regardless of how many tokens route to it, at
 //    the cost of a 6-stage histogram/scatter/gemv/unscatter dependency chain.
 // The grouped pipeline's per-stage overhead dominates at small counts (e.g. MTP
@@ -85,9 +85,7 @@ interface NativeAddon {
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
   linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number): void;
   fill(ctx: number, out: number, value: number, n: number): void;
-  causalMask(ctx: number, out: number, seqLen: number): void;
   indexerScore(ctx: number, out: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: number): void;
-  indexerScoreTopk(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, customMask?: number, maskIndptr?: number, maskKvLen?: number): void;
   indexerScoreTopkPrefill(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, qGlobalStart: number, customMask: number, maskIndptr: number, maskKvLen: number, scores: number, rowLen: number, maxKv: number, coarseHist: number, fineHist: number, meta: number, numSplits: number): void;
   indexerScoreTopkV2(ctx: number, outIdx: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, qGlobalStart: number, customMask: number, maskIndptr: number, maskKvLen: number, scores: number, rowLen: number, hist: number, meta: number, maxKv: number, numSplits: number): void;
   topkToSlots(ctx: number, slots: number, topkLength: number, topkIdx: number, pageIndices: number, pageIndptr: number, lastPageLen: number, batchIndices: number, numTokens: number, topk: number, pageSize: number, cpWorldSize: number, cpRank: number, kvTokenIndptr?: number): void;
@@ -100,7 +98,6 @@ interface NativeAddon {
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
-  sumPointersDirect(ctx: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, output: number, N: number, numel: number, dtype: number): void;
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
   positionStep(ctx: number, positionIds: number, lastPageLen: number, slotMapping: number, indptr: number, indices: number, pageSize: number, batchSize: number, steps: number): void;
   mlaPositionStep(ctx: number, positionIds: number, lastPageLen: number, indptr: number, pageSize: number, batchSize: number, cpWorldSize: number, cpRank: number, steps: number, globalLastPageLen: number): void;
@@ -126,7 +123,6 @@ interface NativeAddon {
   graphExecDestroy(ctx: number, graphExec: number): void;
   mmapOpen(path: string): number;
   mmapLoadAsync(ctx: number, gpuDst: number, mmapPtr: number, offset: number, nbytes: number): Promise<void>;
-  memcpyHostToDeviceAsync(ctx: number, dst: number, src: number, nbytes: number): Promise<void>;
   memcpy2dHostToDeviceAsync(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void>;
   mmapClose(mmapPtr: number, size: number): void;
   fp8LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, m: number, n: number, k: number): void;
@@ -198,21 +194,14 @@ interface NativeAddon {
   rowNormalize(ctx: number, out: number, input: number, scale: number, rows: number, cols: number, normalize: boolean): void;
   groupMaskMul(ctx: number, scores: number, groupMask: number, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void;
   mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
-  mulMatIdGrouped(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
-  groupedMoeWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
-  nvfp4MulMatIdGrouped(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   mmaMoeWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
-  nvfp4MulMatIdGroupedMma(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
-  mmaMoePcWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
-  nvfp4MulMatIdGroupedMmaPc(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   mmaMoeCoopWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   nvfp4MulMatIdGroupedMmaCoop(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   mmaMoeCoopScatterWorkspaceSize(count: number, K: number, numExperts: number): number;
   mmaMoeCoopGemmWorkspaceSize(count: number, N: number): number;
   mmaMoeCoopScatter(ctx: number, input: number, expertIds: number, topK: number, count: number, K: number, numExperts: number, workspace: number): void;
   mmaMoeCoopGemm(ctx: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, numExperts: number, N: number, K: number, count: number, scatterWorkspace: number, gemmWorkspace: number, output: number): void;
-  mmaMoeCoopUnscatter(ctx: number, output: number, count: number, N: number, K: number, numExperts: number, scatterWorkspace: number, gemmWorkspace: number): void;
   bf16MulMatIdGroupedMma(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
   scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number): void;
   rotateInputIds(ctx: number, outputIds: number, inputIds: number, qoIndptr: number, newTokens: number, batchSize: number): void;
