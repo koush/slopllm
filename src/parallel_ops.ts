@@ -2455,6 +2455,10 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  [Symbol.dispose](): void {
+    this.free();
+  }
+
   /** P2P barrier: sync all GPUs without data transfer. */
   p2pBarrier(peerRanks?: number[]): void {
     const group = this.getP2PGroup(this.devices[0].currentStream);

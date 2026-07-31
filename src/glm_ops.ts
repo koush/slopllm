@@ -908,6 +908,10 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().free(this.ctx);
   }
 
+  [Symbol.dispose](): void {
+    this.free();
+  }
+
   allocPinned(bytes: number): number {
     const p = getNativeAddon().allocPinned(bytes);
     if (!p) throw new Error(`allocPinned failed for size ${bytes}`);

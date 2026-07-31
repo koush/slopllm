@@ -30,7 +30,7 @@ export interface StridedMmap {
 // a slots buffer is only meaningful alongside the length that bounds it.
 export type SlotSet = { slots: Tensor, length: Tensor };
 
-export interface DeviceOps {
+export interface DeviceOps extends Disposable {
   readonly worldSize: number;
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined): Tensor;

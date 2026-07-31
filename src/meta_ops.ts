@@ -283,6 +283,9 @@ export class MetaOps implements DeviceOps {
     totalAllocs = 0;
     totalBytes = 0;
 
+    [Symbol.dispose](): void {
+    }
+
     newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor {
         const size = Tensor.byteCount(shape, type);
         this.totalAllocs++;
