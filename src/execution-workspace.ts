@@ -320,8 +320,6 @@ export class ExecutionState {
 
 
 export class ExecutionWorkspace extends WorkspaceBase {
-  /** GPU float workspace: written by FlashInfer plan, read by FlashInfer run. */
-  floatWs: Tensor;
   /** GPU int workspace: written by FlashInfer plan, read by FlashInfer run. */
   intWs: Tensor;
   /** Pinned host int workspace: scratch space used internally by FlashInfer plan (read+write within plan call). */
@@ -385,7 +383,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
   constructor(glm: DeviceOps, B: number, S: number) {
     super(glm);
 
-    this.floatWs = this.alloc([BATCH_FLOAT_WS_SIZE], "U8", "floatWs");
     this.intWs = this.alloc([BATCH_INT_WS_SIZE], "U8", "intWs");
     this.pinnedIntWs = this.allocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
     this.decodePlanInfo = this.allocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", "decodePlanInfo");
@@ -462,7 +459,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       state, query, out,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
       this.indices, this.indptrD, this.lastPageLen,
-      this.floatWs, this.intWs,
+      pagedKV.floatWs, this.intWs,
       this.decodePlanInfo,
       nHeads, nKv, hd, smScale
     );
@@ -470,10 +467,11 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   batchPrefillRagged(state: ExecutionState, q: Tensor, k: Tensor, v: Tensor, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: MaskMode, smScale: number): Tensor {
+    const pagedKV = state.cache.getPagedKV();
     const out = this.alloc([1, nHeads, state.totalTokens, hd], q.type, undefined, q.parallelism);
     this.glm.batchPrefillRaggedRun(
       state, q, k, v, out,
-      this.floatWs, this.intWs,
+      pagedKV.floatWs, this.intWs,
       this.qoIndptrD, this.kvTokenIndptrD,
       this.prefillPlanInfo,
       nHeads, nKv, hd,
@@ -490,7 +488,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       state, query, out,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
       this.indices, this.indptrD, this.lastPageLen,
-      this.floatWs, this.intWs,
+      pagedKV.floatWs, this.intWs,
       this.qoIndptrD,
       this.prefillPlanInfo,
       nHeads, nKv, hd,
@@ -504,7 +502,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return this.glm.mlaPrefillRun(
       state, qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       this.indices,
-      this.floatWs, this.intWs,
+      pagedKV.floatWs, this.intWs,
       this.mlaPrefillPlanInfo,
       smScale, maskMode,
       undefined, undefined,
@@ -517,7 +515,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return this.glm.mlaDecodeRun(
       state, qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
       this.indices, this.indptrD, this.lastPageLen,
-      this.floatWs, this.intWs,
+      pagedKV.floatWs, this.intWs,
       this.mlaDecodePlanInfo,
       smScale,
     );
@@ -609,7 +607,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
     if (!cfg.kvLoraRank) {
       this.glm.batchDecodePlan(
-        this.floatWs, BATCH_FLOAT_WS_SIZE,
+        pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
         this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
         this.decodePlanInfo,
         this.indptrH,
@@ -620,7 +618,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
     else if (!pagedKV.sparseMode) {
       this.glm.mlaDecodePlan(
-        this.floatWs, BATCH_FLOAT_WS_SIZE,
+        pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
         this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
         this.mlaDecodePlanInfo,
         this.indptrH, this.lastPageLenH,
@@ -709,7 +707,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     if (cfg.kvLoraRank) {
       if (!pagedKV.sparseMode) {
         this.glm.mlaPrefillPlan(
-          this.floatWs, BATCH_FLOAT_WS_SIZE,
+          pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
           this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
           this.mlaPrefillPlanInfo,
           this.qoIndptrH, this.indptrH,
@@ -735,7 +733,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     } else {
       this.glm.batchPrefillPagedPlan(
-        this.floatWs, BATCH_FLOAT_WS_SIZE,
+        pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
         this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
         this.prefillPlanInfo,
         this.qoIndptrH, this.indptrH,

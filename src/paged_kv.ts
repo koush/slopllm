@@ -3,6 +3,7 @@ import { DeviceOps, TensorParallelism } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
+import { BATCH_FLOAT_WS_SIZE } from "./execution-workspace";
 
 export const PAGE_SIZE = 64;
 
@@ -125,6 +126,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   vData: Tensor[];
   ckvData: Tensor[];
   kpeData: Tensor[];
+  /** FlashInfer float workspace — shared across workspaces. Only allocated for non-sparse modes (MHA + dense MLA). */
+  floatWs!: Tensor;
   availablePages: number[];
   sequences: Sequence[];
   staging: Map<number, Sequence>;
@@ -173,6 +176,10 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.availablePages = Array.from({ length: maxPages }, (_, i) => i);
     this.sequences = [];
     this.staging = new Map();
+
+    if (!this.sparseMode) {
+      this.floatWs = this.alloc([BATCH_FLOAT_WS_SIZE], "U8", "floatWs");
+    }
 
     this.freeze();
   }
