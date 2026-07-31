@@ -336,21 +336,28 @@ __global__ void idx_hist_kernel(
 __global__ void idx_threshold_kernel(
     const int32_t* __restrict__ hist, int32_t* __restrict__ meta,
     int32_t* __restrict__ out_idx, const int32_t* __restrict__ row_len,
-    int stride, int topk
+    const __nv_bfloat16* __restrict__ scores, int stride, int topk
 ) {
     const int row = blockIdx.x;
     const int len = row_len ? row_len[row] : stride;
-    for (int i = threadIdx.x; i < topk; i += blockDim.x)
-        out_idx[(size_t)row * topk + i] = (i < len && len <= topk) ? i : -1;
-    // Identity case: every valid position is selected — write it directly and
-    // disable the gather pass (tau = INT_MAX so no position matches).
+    // Identity case: all positions fit in topk. Write position-preserving
+    // values directly (deterministic), skipping any position whose score is
+    // -inf (masked out by a custom tree mask). tau=INT_MAX disables the gather
+    // pass entirely (no bf16 key can exceed it).
     if (len <= topk) {
+        const __nv_bfloat16* s = scores + (size_t)row * stride;
+        for (int i = threadIdx.x; i < topk; i += blockDim.x)
+            out_idx[(size_t)row * topk + i] =
+                (i < len && bf16_key(&s[i]) > 127) ? i : -1;
         if (threadIdx.x == 0) {
             int32_t* m = meta + (size_t)row * 4;
             m[0] = 0x7FFFFFFF; m[1] = 0; m[2] = topk; m[3] = 0;
         }
         return;
     }
+
+    for (int i = threadIdx.x; i < topk; i += blockDim.x)
+        out_idx[(size_t)row * topk + i] = -1;
 
     const int t = threadIdx.x;                 // 0..255
     const int PER = IDX_NBUCKET / 256;         // 128 buckets per thread
@@ -430,7 +437,7 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     dim3 grid(num_splits, batch);
     idx_hist_kernel<<<grid, 256, 0, stream>>>(
         (const __nv_bfloat16*)scores, row_len, hist, stride);
-    idx_threshold_kernel<<<batch, 256, 0, stream>>>(hist, meta, out_idx, row_len, stride, topk);
+    idx_threshold_kernel<<<batch, 256, 0, stream>>>(hist, meta, out_idx, row_len, (const __nv_bfloat16*)scores, stride, topk);
     idx_gather_kernel<<<grid, 256, 0, stream>>>(
         (const __nv_bfloat16*)scores, row_len, meta, out_idx, stride, topk);
 }
@@ -921,7 +928,8 @@ __global__ void idx_prefill_coarse_hist_buf_kernel(
 // ---------------------------------------------------------------------------
 __global__ void idx_prefill_coarse_threshold_kernel(
     const int32_t* __restrict__ coarseHist, int32_t* __restrict__ meta,
-    int32_t* __restrict__ out_idx, int topk)
+    int32_t* __restrict__ out_idx, int topk,
+    const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ rowLen, int maxKv)
 {
     const int row = blockIdx.x;
     const int32_t* h = coarseHist + (size_t)row * IDX_COARSE_BUCKETS;
@@ -950,11 +958,19 @@ __global__ void idx_prefill_coarse_threshold_kernel(
 
     long total = s_total;
 
-    // Identity case: all positions fit in topk
+    // Identity case: all positions fit in topk. Write position-preserving
+    // values directly (deterministic), skipping any position whose score is
+    // -inf (masked out by a custom tree mask). tau=-1 signals the gather to
+    // skip (identity already handled).
     if (total <= topk) {
+        const __nv_bfloat16* s = scores + (size_t)row * maxKv;
+        const int len = rowLen ? rowLen[row] : maxKv;
+        for (int i = threadIdx.x; i < topk; i += blockDim.x)
+            out_idx[(size_t)row * topk + i] =
+                (i < len && *reinterpret_cast<const unsigned short*>(&s[i]) != 0xFF80) ? i : -1;
         if (t == 0) {
             int32_t* m = meta + (size_t)row * 4;
-            m[0] = -1;  // identity sentinel
+            m[0] = -1;  // identity sentinel — gather is a no-op
             m[1] = 0;
             m[2] = 0;
             m[3] = 0;
@@ -1089,23 +1105,20 @@ __global__ void idx_prefill_gather_buf_kernel(
     __syncthreads();
 
     for (int i = threadIdx.x; i < len; i += blockDim.x) {
-        if (tau < 0) {
+        if (tau < 0) continue;  // identity case already handled by threshold kernel
+        int key = bf16_key(&s[i]);
+        if (key > tau) {
             int p = atomicAdd(&s_count, 1);
             if (p < topk) out[p] = i;
-        } else {
-            int key = bf16_key(&s[i]);
-            if (key > tau) {
+        } else if (key == tau) {
+            int t = atomicAdd(&s_tie, 1);
+            if (t < tieTake) {
                 int p = atomicAdd(&s_count, 1);
                 if (p < topk) out[p] = i;
-            } else if (key == tau) {
-                int t = atomicAdd(&s_tie, 1);
-                if (t < tieTake) {
-                    int p = atomicAdd(&s_count, 1);
-                    if (p < topk) out[p] = i;
-                }
             }
         }
     }
+    if (tau < 0) return;  // threshold kernel already wrote everything
     // Fill unused slots with -1. Rows shorter than topk (causal prefix) and any
     // threshold undershoot from bf16 ties leave a tail; the sparse-MLA kernel
     // clamps negative indices to page 0 at load and masks them out in QK, so -1
@@ -1166,7 +1179,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 
         // Pass 3: coarse threshold (1 block per query)
         idx_prefill_coarse_threshold_kernel<<<totalQ, 256, 0, stream>>>(
-            coarseHist, meta, out_idx, topk);
+            coarseHist, meta, out_idx, topk, (const __nv_bfloat16*)scores, rowLen, maxKv);
 
         // Pass 4: fine histogram — one block per row
         idx_prefill_fine_hist_buf_kernel<<<totalQ, 256, 0, stream>>>(
