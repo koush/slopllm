@@ -334,6 +334,8 @@ export function mtpTreeDecode(
     const draftBoundaries = depthBoundaries(draftTopk);
 
     for (let depth = 1; depth < topks.length; depth++) {
+      using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedSlots, sharedSlotsLength]));
+
       const qoLen = totalPaths(topks.slice(0, depth));
       const hsPrevQoLen = depth > 1 ? totalPaths(topks.slice(0, depth - 1)) : 1;
       const expandK = topks[depth - 1];
@@ -386,7 +388,7 @@ export function mtpTreeDecode(
         using hiddenStates = model.forwardMtp!(state, expandedHs);
 
         // hiddenStates is already shared_head.norm'd; apply lmHead directly
-        using logits = hiddenStates.linear(lmHead).removeTracking();
+        using logits = hiddenStates.linear(lmHead);
         const logitsTopk = logits.topk(topks[depth], model.cfg.vocabSize);
         using _values = logitsTopk.values;
         using indices = logitsTopk.indices;
@@ -404,6 +406,10 @@ export function mtpTreeDecode(
         prevHs.memcpy(hiddenStates, hiddenStates.bytes, MemcpyKind.DeviceToDevice);
       }, ['mtp-chunk', depth, topks.length]);
       ws.glm.synchronize();
+
+      mtpHiddenStates.removeTracking();
+      sharedSlots.removeTracking();
+      sharedSlotsLength.removeTracking();
     }
   }
 
