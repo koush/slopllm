@@ -256,7 +256,7 @@ export function mtpTreeDecode(
       state.capture(captureManager, { sharedSlots, sharedSlotsLength, mtpHiddenStates }, (_capturing, inputs) => {
         state.sharedSlots = new UsingHolder(inputs.sharedSlots.capture());
         state.sharedSlotsLength = new UsingHolder(inputs.sharedSlotsLength.capture());
-        const chainedMtpHiddenState = inputs.mtpHiddenStates;
+        using chainedMtpHiddenState = inputs.mtpHiddenStates.narrow(0, currentBatchSize);
 
         // prepare initial input
         if (i === 1) {

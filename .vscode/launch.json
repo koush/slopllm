@@ -62,7 +62,7 @@
                 // "--no-cuda-graph",
                 "--cp",
                 "--mtp",
-                "--mtp-draft-topk", "1,1,1",
+                "--mtp-draft-topk", "1,2",
                 "--max-new-tokens", "2000",
             ],
             "skipFiles": [
