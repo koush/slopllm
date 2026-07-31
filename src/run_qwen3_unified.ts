@@ -261,7 +261,14 @@ export function* generateStream(
       using rotatedInputIds = state.input!.rotateInputIds(ws.qoIndptrD, gpuSampleResult!, state.batchSize);
       state.setInput(rotatedInputIds);
       using _mtpHiddenStates = model.forwardMtp(state, hiddenStates, true);
-      mtpHiddenStates.replace(_mtpHiddenStates.slice(0, -1, 1).removeTracking());
+
+      const maxTopK = Math.max(...topks);
+      const maxTopKShape = [maxTopK, ..._mtpHiddenStates.shape.slice(1)];
+      const mtpHiddenStatesMaxTopK = ws.alloc(maxTopKShape, _mtpHiddenStates.type);
+      using sliced = _mtpHiddenStates.slice(0, -1, 1);
+      mtpHiddenStatesMaxTopK.memcpy(sliced, sliced.bytes, MemcpyKind.DeviceToDevice);
+
+      mtpHiddenStates.replace(mtpHiddenStatesMaxTopK.removeTracking());
     }
   }
 
