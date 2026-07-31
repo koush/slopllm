@@ -1446,7 +1446,7 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
                 const void* weight, int batch, int n, int k) {
     cudaSetDevice(ctx->device_id);
 
-    if (batch < 4) {
+    if (batch < 3) {
         // Split-K variant when N is small enough that fewer blocks would
         // underutilize the GPU. With 512 threads/block, split-K provides
         // more memory-level parallelism per SM when block count is low.
