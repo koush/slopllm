@@ -318,11 +318,9 @@ export function mtpTreeDecode(
       sharedSlotsLength.removeTracking();
     }
 
-    //
-
-    // clean up the tree of sequences
+    // clean up the tree of sequences, reverse order so pages are returned in order.
     while (pagedKv.sequences.length > batchSize) {
-      pagedKv.removeSequence(batchSize);
+      pagedKv.removeSequence(pagedKv.sequences.length - 1);
     }
   }
   else {

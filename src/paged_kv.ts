@@ -51,7 +51,8 @@ export class Sequence {
     this.allocLen = Math.min(this.allocLen, this.pages.length * this.pagedKvCache.pageSize);
     page.refs--;
     if (!page.refs) {
-      this.pagedKvCache.availablePages.push(page.id);
+      // unshift to return pages in order of allocation (FIFO) for better cache locality.
+      this.pagedKvCache.availablePages.unshift(page.id);
     }
   }
 
