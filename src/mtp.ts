@@ -720,8 +720,11 @@ function ensureTargetCustomMask(ws: WorkspaceBase, topk: number[]) {
 
 function buildChunkedMTPMask(ws: WorkspaceBase, topks: number[], depth: number): { data: Tensor; indptr: Tensor; maskKvLenValue: number } {
   const qoLen = totalPaths(topks.slice(0, depth));
-  const prevQoLen = depth > 1 ? totalPaths(topks.slice(0, depth - 1)) : 0;
-  const maskKvLen = qoLen + prevQoLen;
+  const boundaries = depthBoundaries(topks);
+  // Total prior draft tokens in KV cache: all tree nodes at depths 0..depth-2.
+  // These map directly to mask columns 0..priorTokens-1.
+  const priorTokens = depth > 1 ? boundaries[depth - 2] : 0;
+  const maskKvLen = priorTokens + qoLen;
   const totalBits = qoLen * maskKvLen;
   const byteLen = Math.ceil(totalBits / 8);
   const key = `${topks.join('_')}_d${depth}`;
@@ -731,13 +734,15 @@ function buildChunkedMTPMask(ws: WorkspaceBase, topks: number[], depth: number):
   data.withPinnedBuffer(buf => {
     buf.fill(0);
     for (let q = 0; q < qoLen; q++) {
-      if (prevQoLen > 0) {
-        const parent = Math.floor(q / topks[depth - 1]);
-        const bit = q * maskKvLen + parent;
+      // Walk the full ancestor chain from this query's tree node to root.
+      // Tree node index = priorTokens + q; each ancestor's tree node index
+      // is also its mask column (ancestors are all in [0, priorTokens)).
+      let cur = priorTokens + q;
+      while (cur !== -1) {
+        const bit = q * maskKvLen + cur;
         buf[bit >> 3] |= 1 << (bit & 7);
+        cur = parentIndex(topks, cur, boundaries);
       }
-      const selfBit = q * maskKvLen + prevQoLen + q;
-      buf[selfBit >> 3] |= 1 << (selfBit & 7);
     }
   });
 
