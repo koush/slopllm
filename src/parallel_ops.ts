@@ -292,7 +292,7 @@ export class ParallelTensor extends Tensor {
       throw new Error("allGather cannot be used on PartialSum tensors; use allReduce instead");
     }
 
-    const output = this.workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const output = workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     if (this.tryP2PAllGather(output)) {
       return output;
@@ -3429,7 +3429,7 @@ export class ParallelOps implements DeviceOps {
   indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor {
     const totalQ = idxQ.shape[0];
     using pQ = idxQ.parallelism === TensorParallelism.Replicated ? idxQ.viewClone() as ParallelTensor : this.cast(idxQ).allGather(idxQ.workspace);
-    const pKData = this.cast(kData);
+    using pKData = kData.parallelism === TensorParallelism.Replicated ? kData.viewClone() as ParallelTensor : this.cast(kData).allGather(idxQ.workspace);
     const pWeights = this.cast(weights);
     const pPageIndices = this.cast(pageIndices);
     const pIndptr = this.cast(indptr);
@@ -3440,13 +3440,9 @@ export class ParallelOps implements DeviceOps {
     const pMaskKvLen = maskKvLen ? this.cast(maskKvLen) : undefined;
 
     const W = this.worldSize;
-    const kDataReplicated = kData.parallelism === TensorParallelism.Replicated;
-    if (W > 1 && !kDataReplicated) {
-      throw new Error(`indexerTopk: cross-rank topk merge is not supported (kData parallelism: ${kData.parallelism})`);
-    }
     using colIdxQ = this.tryNarrowToColumnParallel(pQ);
     using colWeights = this.tryNarrowToColumnParallel(pWeights);
-    const canShard = !decode && W > 1 && kDataReplicated
+    const canShard = !decode && W > 1
       && pQoIndptr.shards[0].shape[0] === 2
       && colIdxQ && colWeights
       && totalQ % W === 0;
