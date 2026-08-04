@@ -3009,22 +3009,27 @@ export class ParallelOps implements DeviceOps {
 
     const pagedKV = state.cache.getPagedKV();
 
+    // get the gathering stream if it is available — retrieve BEFORE cleaning
+    // up the previous layer's entry so that distance-based keys don't
+    // collide (consecutive full layers all share distance 0; cleaning up
+    // first would delete the current layer's own prefetch).
+    const prefetchDist = this.prefetchDistance(cacheIdx, cfg);
+    const prefetchKey = `sparseMlaPrefetch_${prefetchDist}`;
+    using prefetchedStream = state.ws.extras.get(prefetchKey) as ReturnType<typeof this.withStream<ParallelTensor>>;
+    prefetchedStream?.streamWaitEvent();
+    state.ws.extras.delete(prefetchKey);
+
     // the previous layer may not be processed due to either incorrect usage (so being defensive here)
     // or because it is an mtp layer that was skipped.
     {
       const prevCacheIndex = (cacheIdx - 1 + pagedKV.ckvData.length) % pagedKV.ckvData.length;
-      const prevKey = `sparseMlaPrefetch_${prevCacheIndex}`;
+      const prevDist = this.prefetchDistance(prevCacheIndex, cfg);
+      const prevKey = `sparseMlaPrefetch_${prevDist}`;
       using existing = state.ws.extras.get(prevKey) as ReturnType<typeof this.withStream<ParallelTensor>>;
       using _existing = existing?.result;
       state.ws.extras.delete(prevKey);
       existing?.streamWaitEvent();
     }
-
-    // get the gatherering stream if it is available
-    const prefetchKeyStream = `sparseMlaPrefetch_${cacheIdx}`;
-    using prefetchedStream = state.ws.extras.get(prefetchKeyStream) as ReturnType<typeof this.withStream<ParallelTensor>>;
-    prefetchedStream?.streamWaitEvent();
-    state.ws.extras.delete(prefetchKeyStream);
 
     // the gathering stream returns a tensor if its a full gather.
     // a sparse gather will NOT return a tensor, it must be read from the deterministically named tensor in the workspace.
@@ -3038,7 +3043,7 @@ export class ParallelOps implements DeviceOps {
         // stream), so the gathered flat buffer lives as a named workspace
         // tensor materialized by topkToSlots' gatherGroupCkv loop
         // (ensureAlloc), not as a stream result in extras.
-        prefetched = pIndptr.workspace.tensors.get(`sparseMlaPrefetch_${cacheIdx}`) as ParallelTensor;
+        prefetched = pIndptr.workspace.tensors.get(prefetchKey) as ParallelTensor;
         if (!prefetched) {
           throw new Error(`sparseMlaPrepareCache: expected prefetched result for shared layer ${cacheIdx}`);
         }
@@ -3095,14 +3100,15 @@ export class ParallelOps implements DeviceOps {
 
       // due to mtp usage being potentially dynamic (mtp or incorrect usage), only clean up after the layer is finished and before a prefetch overwrites.
       {
-        const nextKey = `sparseMlaPrefetch_${nextCacheIdx}`;
+        const nextDist = this.prefetchDistance(nextCacheIdx, cfg);
+        const nextKey = `sparseMlaPrefetch_${nextDist}`;
         using existing = state.ws.extras.get(nextKey) as ReturnType<typeof this.withStream<ParallelTensor>>;
         using _existing = existing?.result;
         state.ws.extras.delete(nextKey);
         existing?.streamWaitEvent();
       }
 
-      state.ws.extras.set(`sparseMlaPrefetch_${nextCacheIdx}`, nextStream);
+      state.ws.extras.set(`sparseMlaPrefetch_${this.prefetchDistance(nextCacheIdx, cfg)}`, nextStream);
     }
 
     if (prefetched) {
@@ -3176,6 +3182,16 @@ export class ParallelOps implements DeviceOps {
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].gdnPrefill(state, pOutput.shards[i], pState.shards[i], pQkv.shards[i], pARaw.shards[i], pBRaw.shards[i], pALog.shards[i], pDtBias.shards[i], pCuSeqlens.shards[i], shardHeads, dK, dV, shardStateStride, qkvChStride, shardSeqStride);
     }
+  }
+
+  // Distance from the last full layer: full layers return 0, shared layers
+  // return the number of consecutive shared layers since the last full one.
+  // Used as the workspace/extras key so that layers at the same position
+  // within their group reuse the same buffer (4 unique keys instead of 78).
+  private prefetchDistance(cacheIdx: number, cfg: Glm51Config): number {
+    let d = 0;
+    for (let i = cacheIdx; i >= 0 && cfg.indexerTypes[i] === "shared"; i--) d++;
+    return d;
   }
 
   // determines the gather type to be used depending on the state.
@@ -3585,7 +3601,7 @@ export class ParallelOps implements DeviceOps {
       const out = pIndptr.workspace.ensureAlloc(
         [paddedKvLen / shardPageSize, shardPageSize, BPT],
         pKvCache.type,
-        `sparseMlaPrefetch_${nextCacheIdx}`,
+        `sparseMlaPrefetch_${this.prefetchDistance(nextCacheIdx, cfg)}`,
       ) as ParallelTensor;
 
       this.gatherTopkCkv(
