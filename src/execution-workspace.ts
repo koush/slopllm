@@ -313,23 +313,59 @@ export class ExecutionState {
   // Stable identity of a captured graph, known before execution. Padded dims
   // are NOT included here; they are appended to the effective key only once the
   // graph has been learned to size its buffers by them (see CaptureManager).
-  private baseKeyParams(providedKeyParams: (string | number)[]): (string | number)[] {
-    return [...(providedKeyParams ?? []), `batchSize:${this.batchSize}`, `totalTokens:${this.totalTokens}`];
+  private static baseKeyParams(states: readonly ExecutionState[], providedKeyParams: (string | number)[]): (string | number)[] {
+    const keyParams = [...(providedKeyParams ?? [])];
+    for (const state of states) {
+      keyParams.push(`batchSize:${state.batchSize}`, `totalTokens:${state.totalTokens}`);
+    }
+    return keyParams;
   }
 
   // Effective capture key: base key + any padded dims this base graph is known
   // to be variant in. Length-invariant graphs collapse all KV-length buckets to
   // a single key (capture once, replay always); variant graphs (e.g. the CP
   // CKV-gather prefill) get a distinct key per bucket.
-  private effectiveKeyParams(captureManager: CaptureManager, providedKeyParams: (string | number)[]): (string | number)[] {
-    const keyParams = this.baseKeyParams(providedKeyParams);
+  //
+  // Every state contributes its own bucket: the states in a multi-state graph
+  // sit at kv lengths separated by a fixed offset, but power-of-2 bucketing is
+  // lossy, so one state's bucket does not determine the others' near a boundary.
+  private static effectiveKeyParams(captureManager: CaptureManager, states: readonly ExecutionState[], providedKeyParams: (string | number)[]): (string | number)[] {
+    const keyParams = this.baseKeyParams(states, providedKeyParams);
     const variant = captureManager.getLengthVariant(keyParams.join(","));
-    if (variant.kvLen) keyParams.push(`paddedKvLen:${this.paddedKvLen}`);
+    if (variant.kvLen) {
+      for (const state of states) keyParams.push(`paddedKvLen:${state.paddedKvLen}`);
+    }
     return keyParams;
   }
 
+  /**
+   * isCaptured for a graph spanning several states. See captureAll.
+   */
+  static isCaptured(captureManager: CaptureManager, states: readonly ExecutionState[], providedKeyParams: (string | number)[]): boolean {
+    return captureManager.isCaptured(this.effectiveKeyParams(captureManager, states, providedKeyParams));
+  }
+
+  /**
+   * Capture one graph that replays several planned states back-to-back (plan+plan
+   * +run+run). The states must be planned within a single ws.startTracking scope,
+   * in the same order on every step: that is what gives each its own plan slot and
+   * therefore stable device pointers for the buffers baked into the graph.
+   *
+   * The graph is length-variant if ANY of its states sizes buffers by padded kv
+   * len, and the key then carries every state's bucket.
+   */
+  static captureAll<T, I extends { [name: string]: Tensor }>(captureManager: CaptureManager, states: readonly ExecutionState[], inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, providedKeyParams: (string | number)[]): T {
+    const baseKey = this.baseKeyParams(states, providedKeyParams).join(",");
+    const keyParams = this.effectiveKeyParams(captureManager, states, providedKeyParams);
+    return captureManager.run(inputs, (capturing, capturedInputs) => {
+      const result = fn(capturing, capturedInputs);
+      captureManager.recordLengthVariant(baseKey, states.some(s => !s.paddedKvLenInvariant));
+      return result;
+    }, keyParams);
+  }
+
   isCaptured(captureManager: CaptureManager, providedKeyParams: (string | number)[]): boolean {
-    return captureManager.isCaptured(this.effectiveKeyParams(captureManager, providedKeyParams));
+    return ExecutionState.isCaptured(captureManager, [this], providedKeyParams);
   }
 
   getGraphVariantPaddedKvLen() {
@@ -338,13 +374,7 @@ export class ExecutionState {
   }
 
   capture<T, I extends { [name: string]: Tensor }>(captureManager: CaptureManager, inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, providedKeyParams: (string | number)[]): T {
-    const baseKey = this.baseKeyParams(providedKeyParams).join(",");
-    const keyParams = this.effectiveKeyParams(captureManager, providedKeyParams);
-    return captureManager.run(inputs, (capturing, capturedInputs) => {
-      const result = fn(capturing, capturedInputs);
-      captureManager.recordLengthVariant(baseKey, !this.paddedKvLenInvariant);
-      return result;
-    }, keyParams);
+    return ExecutionState.captureAll(captureManager, [this], inputs, fn, providedKeyParams);
   }
 }
 

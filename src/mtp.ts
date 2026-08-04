@@ -2,7 +2,7 @@ import { CaptureManager } from "./capture-manager";
 import { type ChatCache, type ChatModel } from "./chat_model";
 import { MaskMode } from "./device_ops";
 import { MemcpyKind } from "./enums";
-import { ExecutionWorkspace } from "./execution-workspace";
+import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { BF16, I32 } from "./glm_ops";
 import { type Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
@@ -204,7 +204,7 @@ export function mtpTreeDecode(
   const start = performance.now();
 
   let warmup = false;
-  const useDecodeDraftGenerator = true;
+  const useDecodeDraftGenerator = false;
 
   // Depth-1 tree (topks.length === 1, e.g. nextn=1): both draft strategies below
   // run zero loop iterations, so the root's top-k candidates must be generated
@@ -336,14 +336,17 @@ export function mtpTreeDecode(
     // after all depths for verification.
     const draftBoundaries = depthBoundaries(draftTopk);
 
-    for (let depth = 1; depth < topks.length; depth++) {
-      using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedSlots, sharedSlotsLength]));
+    using _tracker = ws.startTracking(new Set([mtpHiddenStates, sharedSlots, sharedSlotsLength]));
 
+    // Plan loop — all plans execute back-to-back. Each gets a unique slot,
+    // so plan N+1's host writes don't race with plan N's in-flight H2D copies.
+    const planStates: ExecutionState[] = [];
+    const planMeta: { qoLen: number, hsPrevQoLen: number, expandK: number, depth: number }[] = [];
+    for (let depth = 1; depth < topks.length; depth++) {
       const qoLen = totalPaths(topks.slice(0, depth));
       const hsPrevQoLen = depth > 1 ? totalPaths(topks.slice(0, depth - 1)) : 1;
       const expandK = topks[depth - 1];
 
-      // Host side: build mask, position IDs, plan prefill
       const chunkedMask = ensureChunkedMTPMask(ws, topks, depth);
       const posIds = getPositionIdsChunked(ws, originalAllocLen, depth, qoLen);
       const state = ws.planPrefill(model, batchSize, [qoLen], cache, {
@@ -354,15 +357,27 @@ export function mtpTreeDecode(
         maskKvLen: chunkedMask.maskKvLen,
       });
 
-      warmup ||= !state.isCaptured(captureManager, ['mtp-chunk', depth, topks.length]);
-      state.capture(captureManager, { mtpHiddenStates, sharedSlots, sharedSlotsLength }, (_capturing, inputs) => {
+      planStates.push(state);
+      planMeta.push({ qoLen, hsPrevQoLen, expandK, depth });
+    }
+
+    // Run loop — all depths captured as a single CUDA graph. Each depth's
+    // forward pass runs sequentially (each needs prev's output), but the
+    // entire multi-depth MTP draft is a single graph launch on replay.
+    const captureKey = ['mtp-chunk-all', topks.join(',')];
+    warmup ||= !ExecutionState.isCaptured(captureManager, planStates, captureKey);
+    ExecutionState.captureAll(captureManager, planStates, { mtpHiddenStates, sharedSlots, sharedSlotsLength }, (_capturing, inputs) => {
+      for (let pi = 0; pi < planStates.length; pi++) {
+        const { qoLen, hsPrevQoLen, expandK, depth } = planMeta[pi];
+        const state = planStates[pi];
+        const next = pi + 1 < planStates.length ? planStates[pi + 1] : null;
+
         state.sharedSlots = new UsingHolder(inputs.sharedSlots.capture());
         state.sharedSlotsLength = new UsingHolder(inputs.sharedSlotsLength.capture());
         const prevHs = inputs.mtpHiddenStates;
 
         // Depth 1: compute initial logits and topk from mtpHiddenStates
         if (depth === 1) {
-          // mtpHiddenStates is already shared_head.norm'd; use directly
           using initialLogits = mtpHiddenStates.linear(lmHead);
           const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
           using _initialValues = initialTopk.values;
@@ -374,7 +389,6 @@ export function mtpTreeDecode(
         state.setInput(state.inputIdsBuf);
 
         // Expand prevHs: replicate each parent's hidden state for expandK children
-        // Layout: [p0, p0, ..., p0, p1, p1, ..., p1, ...] (grouped by parent)
         using _expandedHs = expandK > 1 ? ws.alloc([qoLen, hiddenDim], "BF16") : undefined;
         const expandedHs = _expandedHs ?? prevHs;
         if (expandK > 1) {
@@ -401,19 +415,20 @@ export function mtpTreeDecode(
         const hostCount = qoLen * topks[depth];
         hostBuf.memcpy2d(hostOffset, hostCount * I32, indices, 0, hostCount * I32, hostCount * I32, 1, MemcpyKind.DeviceToHost);
 
-        // Prepare input for next depth
-        if (depth < topks.length - 1) {
-          state.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
+        // Prepare input for next depth — copy to next state's inputIdsBuf
+        if (next) {
+          next.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
         }
 
         prevHs.memcpy(hiddenStates, hiddenStates.bytes, MemcpyKind.DeviceToDevice);
-      }, ['mtp-chunk', depth, topks.length]);
-      ws.glm.synchronize();
+      }
+    }, captureKey);
 
-      mtpHiddenStates.removeTracking();
-      sharedSlots.removeTracking();
-      sharedSlotsLength.removeTracking();
-    }
+    ws.glm.synchronize();
+
+    mtpHiddenStates.removeTracking();
+    sharedSlots.removeTracking();
+    sharedSlotsLength.removeTracking();
   }
 
   const draft = performance.now();
