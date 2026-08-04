@@ -3004,7 +3004,7 @@ export class ParallelOps implements DeviceOps {
     const pAppendKpe = this.cast(appendKpe);
     const pageSize = pKvCache.shape[1];
     const pIndptr = this.cast(indptr);
-    const pKvTokenIndptr = this.cast(state.ws.kvTokenIndptrD);
+    const pKvTokenIndptr = this.cast(state.kvTokenIndptrD);
     const cfg = state.model.cfg as Glm51Config;
 
     const pagedKV = state.cache.getPagedKV();
@@ -3091,10 +3091,10 @@ export class ParallelOps implements DeviceOps {
         const nextKvCache = pagedKV.ckvData[nextCacheIdx];
 
         return this.gatherPages(
-          nextKvCache, indices!, indptr, state.ws.lastPageLen,
+          nextKvCache, indices!, indptr, state.lastPageLen,
           state.batchSize,
           pagedKV.maxPages * pagedKV.pageSize,
-          state.ws.kvTokenIndptrD, contextParallel,
+          state.kvTokenIndptrD, contextParallel,
         ) as ParallelTensor;
       });
 
@@ -3118,10 +3118,10 @@ export class ParallelOps implements DeviceOps {
 
     // no prefetch was available, so gather the pages now (layer 0).
     return this.gatherPages(
-      kvCache, indices, indptr, state.ws.lastPageLen,
+      kvCache, indices, indptr, state.lastPageLen,
       state.batchSize,
       pagedKV.maxPages * pagedKV.pageSize,
-      state.ws.kvTokenIndptrD, contextParallel,
+      state.kvTokenIndptrD, contextParallel,
     );
   }
 
@@ -3510,7 +3510,7 @@ export class ParallelOps implements DeviceOps {
     const W = this.worldSize;
     const totalQ = topkIdx.shape[0];
     const topk = topkIdx.shape[1];
-    const maxQ = state.ws.positionIds.shape[0];
+    const maxQ = state.positionIds.shape[0];
 
     // One SlotSet in the addressing `modeCacheIdx` requires. The per-shard call
     // has no group of its own — its viewClone is discarded here, and must be,
@@ -3606,7 +3606,7 @@ export class ParallelOps implements DeviceOps {
 
       this.gatherTopkCkv(
         state, nextKvCache, [out], pSlots, this.cast(indices),
-        pIndptr, state.ws.kvTokenIndptrD, pBatchIndices, topkCount, paddedKvLen,
+        pIndptr, state.kvTokenIndptrD, pBatchIndices, topkCount, paddedKvLen,
       );
     }
   }

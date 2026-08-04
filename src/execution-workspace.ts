@@ -28,6 +28,40 @@ export class ExecutionState {
   paddedKvLenInvariant = true;
   private readonly paddedKvLen: number;
 
+  // Per-state buffers (allocated via ensureAlloc with slot-suffixed names).
+  // Each plan call gets a unique slot so that plan1+plan2+run1+run2 is safe:
+  // host pinned writes are not stream-ordered, so sharing a single host buffer
+  // across plans would race. Device buffers also need to be per-state because
+  // plan N+1's async H2D would overwrite the device buffer before run N reads it.
+  intWs!: Tensor;
+  intWsH!: Tensor;
+  decodePlanInfo!: Tensor;
+  prefillPlanInfo!: Tensor;
+  mlaPrefillPlanInfo!: Tensor;
+  mlaDecodePlanInfo!: Tensor;
+  inputIdsBuf!: Tensor;
+  inputIdsBufH!: Tensor;
+  positionIds!: Tensor;
+  positionIdsH!: Tensor;
+  qoIndptrD!: Tensor;
+  qoIndptrH!: Tensor;
+  slotMapping!: Tensor;
+  slotMappingH!: Tensor;
+  indptrD!: Tensor;
+  indptrH!: Tensor;
+  lastPageLen!: Tensor;
+  lastPageLenH!: Tensor;
+  globalLastPageLen!: Tensor;
+  globalLastPageLenH!: Tensor;
+  kvLenH!: Tensor;
+  kvLenD!: Tensor;
+  kvTokenIndptrH!: Tensor;
+  kvTokenIndptrD!: Tensor;
+  mlaBatchIndices!: Tensor;
+  mlaBatchIndicesH!: Tensor;
+  indices!: Tensor;
+  indicesH!: Tensor;
+
   constructor(
     public readonly model: ChatModel,
     public readonly batchSize: number, public readonly totalTokens: number, public readonly seqLens: number[],
@@ -49,7 +83,7 @@ export class ExecutionState {
   }
 
   get lastIdx(): Tensor {
-    return this.ws.qoIndptrD.narrow(1, this.batchSize);
+    return this.qoIndptrD.narrow(1, this.batchSize);
   }
 
   computeLogits(hiddenStates: Tensor, model: ChatModel, allTokens: boolean = false): Tensor {
@@ -75,7 +109,7 @@ export class ExecutionState {
   rotaryEmbedding(invFreq: Tensor): { cos: Tensor, sin: Tensor } {
     const B = this.isDecode ? this.batchSize : 1;
     const S = this.isDecode ? 1 : this.totalTokens;
-    const posIds = this.customMask?.positionIds || this.ws.positionIds;
+    const posIds = this.customMask?.positionIds || this.positionIds;
     using narrowed = posIds.narrow(0, B * S);
     return invFreq.rotaryEmbedding(narrowed, B, S);
   }
@@ -90,7 +124,7 @@ export class ExecutionState {
     this.ws.glm.kvCacheWrite(
       kRope, vBuf,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
-      this.ws.slotMapping,
+      this.slotMapping,
       BS, nKv, hd,
       kTokenStride, kHeadStride, vTokenStride, vHeadStride
     );
@@ -103,8 +137,8 @@ export class ExecutionState {
       this, cacheIdx,
       pagedKV.ckvData[cacheIdx], appendCkv, appendKpe,
       topk,
-      this.ws.indices, this.ws.indptrD,
-      this.ws.mlaBatchIndices, this.ws.positionIds,
+      this.indices, this.indptrD,
+      this.mlaBatchIndices, this.positionIds,
       nnz, kvLoraRank, qkRopeDim,
       kvLoraRank, qkRopeDim
     );
@@ -118,17 +152,17 @@ export class ExecutionState {
         this, cacheIdx,
         pagedKV.ckvData[cacheIdx],
         appendCkv, appendKpe,
-        this.ws.indices, this.ws.indptrD,
-        this.ws.mlaBatchIndices, this.ws.positionIds,
+        this.indices, this.indptrD,
+        this.mlaBatchIndices, this.positionIds,
         nnz, kvLoraRank, qkRopeDim,
         kvLoraRank, qkRopeDim,
       );
     } else {
       this.ws.glm.mlaKvCacheAppend(
         pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
-        this.ws.indices, this.ws.indptrD, this.ws.lastPageLen,
+        this.indices, this.indptrD, this.lastPageLen,
         appendCkv, appendKpe,
-        this.ws.mlaBatchIndices, this.ws.positionIds,
+        this.mlaBatchIndices, this.positionIds,
         nnz, kvLoraRank, qkRopeDim,
         kvLoraRank, qkRopeDim,
       );
@@ -140,9 +174,9 @@ export class ExecutionState {
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     this.ws.glm.mlaKvCacheAppend(
       pagedKV.kData[cacheIdx], null,
-      this.ws.indices, this.ws.indptrD, this.ws.lastPageLen,
+      this.indices, this.indptrD, this.lastPageLen,
       idxKOut, null,
-      this.ws.mlaBatchIndices, this.ws.positionIds,
+      this.mlaBatchIndices, this.positionIds,
       nnz, indexHeadDim, 0,
       indexHeadDim, 0
     );
@@ -158,7 +192,7 @@ export class ExecutionState {
     const cm = (!this.isDecode && this.customMask?.mode === MaskMode.CausalCustom) ? this.customMask : undefined;
     return this.ws.glm.indexerTopk(
       idxQ, kData, weights,
-      this.ws.indices, this.ws.indptrD, this.ws.globalLastPageLen, this.ws.qoIndptrD,
+      this.indices, this.indptrD, this.globalLastPageLen, this.qoIndptrD,
       scale, topk,
       this.isDecode,
       0,
@@ -207,8 +241,8 @@ export class ExecutionState {
     // buffer via a viewClone whenever they agree.
     const { layer, group, stream } = this.ws.glm.topkToSlots(
       this,
-      topkIdx, this.ws.kvTokenIndptrD,
-      this.ws.indices, this.ws.indptrD, this.ws.lastPageLen, this.ws.mlaBatchIndices,
+      topkIdx, this.kvTokenIndptrD,
+      this.indices, this.indptrD, this.lastPageLen, this.mlaBatchIndices,
       pagedKV.pageSize, maxKv,
       cacheIdx, pagedKV.contextParallel,
     );
@@ -246,24 +280,20 @@ export class ExecutionState {
         this, qAbsorbed, qPe, ckv, indices,
         topk,
         smScale, length,
-        this.ws.indptrD, this.ws.lastPageLen, this.ws.kvTokenIndptrD,
+        this.indptrD, this.lastPageLen, this.kvTokenIndptrD,
       );
     }
   }
 
   setInput(tokenIds: number[][] | Tensor) {
     if (tokenIds instanceof Tensor) {
-      // if the tensor is not in the same workspace copy it into the workspace buffer.
-      if (tokenIds.workspace !== this.ws) {
-        this.input = this.ws.inputIdsBuf;
+      this.input = this.inputIdsBuf;
+      if (tokenIds !== this.inputIdsBuf) {
         this.input.memcpy(tokenIds, tokenIds.bytes, MemcpyKind.DeviceToDevice);
-      }
-      else {
-        this.input = tokenIds;
       }
     }
     else {
-      this.ws.inputIdsBufH.withPinnedBuffer(buf => {
+      this.inputIdsBufH.withPinnedBuffer(buf => {
         let idsOff = 0;
         for (const ids of tokenIds) {
           for (const id of ids) {
@@ -275,8 +305,8 @@ export class ExecutionState {
         if (idsOff < totalBytes)
           buf.fill(0, idsOff, totalBytes);
       });
-      this.input = this.ws.inputIdsBuf;
-      this.input.memcpy(this.ws.inputIdsBufH, this.totalTokens * I32, MemcpyKind.HostToDevice);
+      this.input = this.inputIdsBuf;
+      this.input.memcpy(this.inputIdsBufH, this.totalTokens * I32, MemcpyKind.HostToDevice);
     }
   }
 
@@ -320,114 +350,68 @@ export class ExecutionState {
 
 
 export class ExecutionWorkspace extends WorkspaceBase {
-  /** GPU int workspace: written by FlashInfer plan, read by FlashInfer run. */
-  intWs: Tensor;
-  /** Pinned host int workspace: scratch space used internally by FlashInfer plan (read+write within plan call). */
-  intWsH: Tensor;
-  /** Pinned host buffer: written by batchDecodePlan, read by batchDecodeRun. */
-  decodePlanInfo: Tensor;
-  /** Pinned host buffer: written by batchPrefillPagedPlan, read by batchPrefillPagedRun. */
-  prefillPlanInfo: Tensor;
-  /** Pinned host buffer: written by mlaPrefillPlan, read by mlaPrefillRun. */
-  mlaPrefillPlanInfo: Tensor;
-  /** Pinned host buffer: written by mlaDecodePlan, read by mlaDecodeRun. */
-  mlaDecodePlanInfo: Tensor;
-  /** Scratch GPU buffer [B*S] of I32: written by host (h2d), read by embedding lookup. */
-  inputIdsBuf: Tensor;
-  /** Scratch Pinned host buffer [B*S] of I32: written by host, read via memcpy to inputIdsBuf. */
-  inputIdsBufH: Tensor;
-  /** Whether the input buffer has been cleared. */
-  inputCleared = false;
-  /** GPU buffer [B*S] of I32: written by host (h2d), read by RoPE kernel. */
-  positionIds: Tensor;
-  /** Pinned host buffer [B*S] of I32: written by host, read via memcpy to positionIds. */
-  positionIdsH: Tensor;
-  /** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer prefill run. */
-  qoIndptrD: Tensor;
-  /** Pinned host buffer [B+1] of I32: written by host, read by MLA prefill plan and memcpy to qoIndptrD. */
-  qoIndptrH: Tensor;
-  /** GPU buffer [B*S] of I32: written by host (h2d) or memcpy, read by kvCacheWrite to scatter K/V into cache. */
-  slotMapping: Tensor;
-  /** Pinned host buffer [B*S] of I32: written by host, read via memcpy to slotMapping. */
-  slotMappingH: Tensor;
-  /** GPU buffer [B+1] of I32: written by host via memcpy, read by FlashInfer run (page indptr). */
-  indptrD: Tensor;
-  /** Pinned host buffer [B+1] of I32: written by updateIndptr, read by memcpy to indptrD and by FlashInfer plan. */
-  indptrH: Tensor;
-  /** GPU buffer [B] of I32: written by host via memcpy, read by FlashInfer run. */
-  lastPageLen: Tensor;
-  /** Pinned host buffer [B] of I32: written by updateIndptr, read via memcpy to lastPageLen. */
-  lastPageLenH: Tensor;
-  /** GPU buffer [B] of I32: global (non-CP-adjusted) last page len, read by indexer score kernel. */
-  globalLastPageLen: Tensor;
-  /** Pinned host buffer [B] of I32: global last page len, copied to globalLastPageLen. */
-  globalLastPageLenH: Tensor;
-  /** Pinned host buffer [B] of I32: KV lengths per batch entry, used by MLA prefill plan. */
-  kvLenH: Tensor;
-  /** GPU buffer [B] of I32: device copy of kvLenH, global KV lengths per sequence (post-gather). */
-  kvLenD: Tensor;
-  /** Pinned host buffer [B+1] of I32: token-level KV indptr (cumulative allocLen per sequence). Fixed up by ParallelOps for CP. */
-  kvTokenIndptrH: Tensor;
-  /** GPU buffer [B+1] of I32: device copy of kvTokenIndptrH. */
-  kvTokenIndptrD: Tensor;
-  /** GPU buffer [B*S] of I32: batch index per token for MLA KV cache append. */
-  mlaBatchIndices: Tensor;
-  /** Pinned host buffer [B*S] of I32: batch index per token for MLA KV cache append. */
-  mlaBatchIndicesH: Tensor;
-  /** GPU buffer [maxPages*maxBatch] of I32: page table — physical page IDs per sequence. Lazily allocated in updateIndptr. */
-  indices: Tensor;
-  /** Pinned host buffer [maxPages*maxBatch] of I32: host-side page table, written by updateIndptr, H2D copied to indices. */
-  indicesH: Tensor;
+  readonly maxBatch: number;
+  readonly maxSeqLen: number;
   extras = new Map<string, any>();
+  private planSlot = 0;
 
   constructor(glm: DeviceOps, B: number, S: number) {
     super(glm);
-
-    this.intWs = this.alloc([BATCH_INT_WS_SIZE], "U8", "intWs");
-    this.intWsH = this.allocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
-    this.decodePlanInfo = this.allocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", "decodePlanInfo");
-    this.prefillPlanInfo = this.allocPinned([PREFILL_PLAN_INFO_SIZE * 8], "U8", "prefillPlanInfo");
-    this.mlaPrefillPlanInfo = this.allocPinned([MLA_PREFILL_PLAN_INFO_SIZE * 8], "U8", "mlaPrefillPlanInfo");
-    this.mlaDecodePlanInfo = this.allocPinned([MLA_DECODE_PLAN_INFO_SIZE * 8], "U8", "mlaDecodePlanInfo");
-
-    this.positionIds = this.alloc([B * S], "I32", "positionIds");
-    this.positionIdsH = this.allocPinned([B * S], "I32", "positionIdsH");
-    this.inputIdsBuf = this.alloc([B * S], "I32", "inputIdsBuf");
-    this.inputIdsBufH = this.allocPinned([B * S], "I32", "inputIdsBufH");
-    this.qoIndptrD = this.alloc([B + 1], "I32", "qoIndptrD");
-    this.qoIndptrH = this.allocPinned([B + 1], "I32", "qoIndptrH");
-    this.slotMapping = this.alloc([B * S], "I32", "slotMapping");
-    this.slotMappingH = this.allocPinned([B * S], "I32", "slotMappingH");
-    this.indptrD = this.alloc([(B + 1) * I32], "I32", "indptrD");
-    this.indptrH = this.allocPinned([(B + 1) * I32], "I32", "indptrH");
-    this.lastPageLen = this.alloc([B * I32], "I32", "lastPageLen");
-    this.lastPageLenH = this.allocPinned([B], "I32", "lastPageLenH");
-    this.globalLastPageLen = this.alloc([B * I32], "I32", "globalLastPageLen");
-    this.globalLastPageLenH = this.allocPinned([B], "I32", "globalLastPageLenH");
-    this.kvLenH = this.allocPinned([B], "I32", "kvLenH");
-    this.kvLenD = this.alloc([B], "I32", "kvLenD");
-    this.kvTokenIndptrH = this.allocPinned([(B + 1) * I32], "I32", "kvTokenIndptrH");
-    this.kvTokenIndptrD = this.alloc([(B + 1) * I32], "I32", "kvTokenIndptrD");
-    this.mlaBatchIndices = this.alloc([B * S], "I32", "mlaBatchIndices");
-    this.mlaBatchIndicesH = this.allocPinned([B * S], "I32", "mlaBatchIndicesH");
-    this.indices = this.alloc([B * S], "I32", "indices");
-    this.indicesH = this.allocPinned([B * S], "I32", "indicesH");
-
-    // Initialize mlaBatchIndices for decode: [0, 1, 2, ..., B-1]
-    // This identity mapping never changes for decode; prefill overwrites it with
-    // per-token batch indices in planPrefill.
-    this.mlaBatchIndicesH.withPinnedBuffer(buf => {
-      for (let i = 0; i < B; i++) buf.writeInt32LE(i, i * I32);
-    });
-    this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, B * I32, MemcpyKind.HostToDevice);
+    this.maxBatch = B;
+    this.maxSeqLen = S;
   }
 
-  ensureInputCleared() {
-    if (this.inputCleared) {
-      return;
+  startTracking(keepExports = new Set<Tensor>()): Disposable & { [Symbol.dispose](): void } {
+    this.planSlot = 0;
+    const inner = super.startTracking(keepExports);
+    const ws = this;
+    return {
+      [Symbol.dispose]() {
+        ws.planSlot = 0;
+        inner[Symbol.dispose]();
+      },
+    };
+  }
+
+  private nextPlanSlot(): number {
+    if (this.tracking !== null) {
+      return this.planSlot++;
     }
-    this.inputIdsBuf.fill(0, this.inputIdsBuf.numElements);
-    this.inputCleared = true;
+    return 0;
+  }
+
+  private allocStateBuffers(state: ExecutionState, slot: number, B: number, S: number): void {
+    const s = (name: string) => `${name}:${slot}`;
+
+    state.intWs = this.ensureAlloc([BATCH_INT_WS_SIZE], "U8", s("intWs"));
+    state.intWsH = this.ensureAllocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", s("intWsH"));
+    state.decodePlanInfo = this.ensureAllocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", s("decodePlanInfo"));
+    state.prefillPlanInfo = this.ensureAllocPinned([PREFILL_PLAN_INFO_SIZE * 8], "U8", s("prefillPlanInfo"));
+    state.mlaPrefillPlanInfo = this.ensureAllocPinned([MLA_PREFILL_PLAN_INFO_SIZE * 8], "U8", s("mlaPrefillPlanInfo"));
+    state.mlaDecodePlanInfo = this.ensureAllocPinned([MLA_DECODE_PLAN_INFO_SIZE * 8], "U8", s("mlaDecodePlanInfo"));
+
+    state.positionIds = this.ensureAlloc([B * S], "I32", s("positionIds"));
+    state.positionIdsH = this.ensureAllocPinned([B * S], "I32", s("positionIdsH"));
+    state.inputIdsBuf = this.ensureAlloc([B * S], "I32", s("inputIdsBuf"));
+    state.inputIdsBufH = this.ensureAllocPinned([B * S], "I32", s("inputIdsBufH"));
+    state.qoIndptrD = this.ensureAlloc([B + 1], "I32", s("qoIndptrD"));
+    state.qoIndptrH = this.ensureAllocPinned([B + 1], "I32", s("qoIndptrH"));
+    state.slotMapping = this.ensureAlloc([B * S], "I32", s("slotMapping"));
+    state.slotMappingH = this.ensureAllocPinned([B * S], "I32", s("slotMappingH"));
+    state.indptrD = this.ensureAlloc([(B + 1) * I32], "I32", s("indptrD"));
+    state.indptrH = this.ensureAllocPinned([(B + 1) * I32], "I32", s("indptrH"));
+    state.lastPageLen = this.ensureAlloc([B * I32], "I32", s("lastPageLen"));
+    state.lastPageLenH = this.ensureAllocPinned([B], "I32", s("lastPageLenH"));
+    state.globalLastPageLen = this.ensureAlloc([B * I32], "I32", s("globalLastPageLen"));
+    state.globalLastPageLenH = this.ensureAllocPinned([B], "I32", s("globalLastPageLenH"));
+    state.kvLenH = this.ensureAllocPinned([B], "I32", s("kvLenH"));
+    state.kvLenD = this.ensureAlloc([B], "I32", s("kvLenD"));
+    state.kvTokenIndptrH = this.ensureAllocPinned([(B + 1) * I32], "I32", s("kvTokenIndptrH"));
+    state.kvTokenIndptrD = this.ensureAlloc([(B + 1) * I32], "I32", s("kvTokenIndptrD"));
+    state.mlaBatchIndices = this.ensureAlloc([B * S], "I32", s("mlaBatchIndices"));
+    state.mlaBatchIndicesH = this.ensureAllocPinned([B * S], "I32", s("mlaBatchIndicesH"));
+    state.indices = this.ensureAlloc([B * S], "I32", s("indices"));
+    state.indicesH = this.ensureAllocPinned([B * S], "I32", s("indicesH"));
   }
 
   positionStep(state: ExecutionState, model: ChatModel, steps = 1): void {
@@ -435,18 +419,18 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const batchSize = state.batchSize;
     if (!model.cfg.kvLoraRank) {
       this.glm.positionStep(
-        this.positionIds, this.lastPageLen, this.slotMapping,
-        this.indptrD, this.indices,
+        state.positionIds, state.lastPageLen, state.slotMapping,
+        state.indptrD, state.indices,
         pagedKV.pageSize, batchSize, steps
       );
     } else {
       this.glm.mlaPositionStep(
-        this.positionIds, this.lastPageLen,
-        this.indptrD,
+        state.positionIds, state.lastPageLen,
+        state.indptrD,
         pagedKV.pageSize, batchSize,
         pagedKV.contextParallel,
         undefined, undefined, steps,
-        this.globalLastPageLen,
+        state.globalLastPageLen,
       );
     }
   }
@@ -458,9 +442,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.glm.batchDecodeRun(
       state, query, out,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
-      this.indices, this.indptrD, this.lastPageLen,
-      pagedKV.floatWs, this.intWs,
-      this.decodePlanInfo,
+      state.indices, state.indptrD, state.lastPageLen,
+      pagedKV.floatWs, state.intWs,
+      state.decodePlanInfo,
       nHeads, nKv, hd, smScale
     );
     return out;
@@ -471,9 +455,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const out = this.alloc([1, nHeads, state.totalTokens, hd], q.type, undefined, q.parallelism);
     this.glm.batchPrefillRaggedRun(
       state, q, k, v, out,
-      pagedKV.floatWs, this.intWs,
-      this.qoIndptrD, this.kvTokenIndptrD,
-      this.prefillPlanInfo,
+      pagedKV.floatWs, state.intWs,
+      state.qoIndptrD, state.kvTokenIndptrD,
+      state.prefillPlanInfo,
       nHeads, nKv, hd,
       qStrideN, qStrideH, kvStrideN, kvStrideH, vStrideN, vStrideH,
       maskMode, smScale
@@ -487,10 +471,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.glm.batchPrefillPagedRun(
       state, query, out,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
-      this.indices, this.indptrD, this.lastPageLen,
-      pagedKV.floatWs, this.intWs,
-      this.qoIndptrD,
-      this.prefillPlanInfo,
+      state.indices, state.indptrD, state.lastPageLen,
+      pagedKV.floatWs, state.intWs,
+      state.qoIndptrD,
+      state.prefillPlanInfo,
       nHeads, nKv, hd,
       qStrideN, qStrideH, maskMode, smScale
     );
@@ -501,9 +485,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const pagedKV = state.cache.getPagedKV();
     return this.glm.mlaPrefillRun(
       state, qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
-      this.indices,
-      pagedKV.floatWs, this.intWs,
-      this.mlaPrefillPlanInfo,
+      state.indices,
+      pagedKV.floatWs, state.intWs,
+      state.mlaPrefillPlanInfo,
       smScale, maskMode,
       undefined, undefined,
       customMask, maskIndptr, maskKvLen
@@ -514,16 +498,16 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const pagedKV = state.cache.getPagedKV();
     return this.glm.mlaDecodeRun(
       state, qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
-      this.indices, this.indptrD, this.lastPageLen,
-      pagedKV.floatWs, this.intWs,
-      this.mlaDecodePlanInfo,
+      state.indices, state.indptrD, state.lastPageLen,
+      pagedKV.floatWs, state.intWs,
+      state.mlaDecodePlanInfo,
       smScale,
     );
   }
 
-  updateIndptr(pagedKV: PagedKVCache): void {
+  updateIndptr(state: ExecutionState, pagedKV: PagedKVCache): void {
     const batchSize = pagedKV.sequences.length;
-    this.indptrH.withPinnedBuffer(buf => {
+    state.indptrH.withPinnedBuffer(buf => {
       buf.writeInt32LE(0, 0);
       let cumulative = 0;
       for (let i = 0; i < batchSize; i++) {
@@ -532,7 +516,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       }
     });
 
-    this.indicesH.withPinnedBuffer(buf => {
+    state.indicesH.withPinnedBuffer(buf => {
       let indicesOff = 0;
       for (let i = 0; i < batchSize; i++) {
         const contentPages = pagedKV.sequences[i].contentPages;
@@ -543,14 +527,14 @@ export class ExecutionWorkspace extends WorkspaceBase {
       }
     });
 
-    this.lastPageLenH.withPinnedBuffer(buf => {
+    state.lastPageLenH.withPinnedBuffer(buf => {
       for (let i = 0; i < batchSize; i++) {
         const allocLen = pagedKV.sequences[i].allocLen;
         const remainder = allocLen % pagedKV.pageSize;
         buf.writeInt32LE(remainder !== 0 ? remainder : (allocLen > 0 ? pagedKV.pageSize : 0), i * I32);
       }
     });
-    this.globalLastPageLenH.withPinnedBuffer(buf => {
+    state.globalLastPageLenH.withPinnedBuffer(buf => {
       for (let i = 0; i < batchSize; i++) {
         const allocLen = pagedKV.sequences[i].allocLen;
         const remainder = allocLen % pagedKV.pageSize;
@@ -581,36 +565,40 @@ export class ExecutionWorkspace extends WorkspaceBase {
       throw new Error(`planDecode: need ${decodePagesNeeded} pages, ${pagedKV.availablePages.length} available`);
     }
 
-    this.positionIdsH.withPinnedBuffer(buf => {
+    const slot = this.nextPlanSlot();
+    const state = new ExecutionState(model, batchSize, totalTokens, seqLens, true, this, cache);
+    this.allocStateBuffers(state, slot, this.maxBatch, this.maxSeqLen);
+
+    state.positionIdsH.withPinnedBuffer(buf => {
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
         buf.writeInt32LE(pagedKV.sequences[seqIdx].allocLen - 1, seqIdx * I32);
       }
     });
-    this.positionIds.memcpy(this.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
+    state.positionIds.memcpy(state.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
 
     if (cfg.kvLoraRank) {
-      this.mlaBatchIndicesH.withPinnedBuffer(buf => {
+      state.mlaBatchIndicesH.withPinnedBuffer(buf => {
         for (let i = 0; i < batchSize; i++) buf.writeInt32LE(i, i * I32);
       });
-      this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, batchSize * I32, MemcpyKind.HostToDevice);
-      this.qoIndptrH.withPinnedBuffer(buf => {
+      state.mlaBatchIndices.memcpy(state.mlaBatchIndicesH, batchSize * I32, MemcpyKind.HostToDevice);
+      state.qoIndptrH.withPinnedBuffer(buf => {
         for (let i = 0; i <= batchSize; i++) buf.writeInt32LE(i, i * I32);
       });
-      this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+      state.qoIndptrD.memcpy(state.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     }
 
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       pagedKV.allocDecodeToken(seqIdx);
     }
 
-    this.updateIndptr(pagedKV);
+    this.updateIndptr(state, pagedKV);
 
     if (!cfg.kvLoraRank) {
       this.glm.batchDecodePlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-        this.intWs, this.intWsH, BATCH_INT_WS_SIZE,
-        this.decodePlanInfo,
-        this.indptrH,
+        state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
+        state.decodePlanInfo,
+        state.indptrH,
         batchSize,
         nHeads, nKv, hd, pageSize,
         enableCudaGraph
@@ -619,9 +607,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     else if (!pagedKV.sparseMode) {
       this.glm.mlaDecodePlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-        this.intWs, this.intWsH, BATCH_INT_WS_SIZE,
-        this.mlaDecodePlanInfo,
-        this.indptrH, this.lastPageLenH,
+        state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
+        state.mlaDecodePlanInfo,
+        state.indptrH, state.lastPageLenH,
         batchSize, model.cfg.numAttentionHeads, pagedKV.pageSize, enableCudaGraph,
         model.cfg.kvLoraRank!, model.cfg.qkRopeHeadDim!, pagedKV.contextParallel,
         undefined, undefined, pagedKV.sequences.map(s => s.allocLen)
@@ -629,10 +617,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
 
     const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.contentPages, 0);
-    this.indices.memcpy(this.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
-    this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    state.indices.memcpy(state.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
+    state.indptrD.memcpy(state.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
 
-    return new ExecutionState(model, batchSize, totalTokens, seqLens, true, this, cache);
+    return state;
   }
 
   planPrefill(model: ChatModel, batchSize: number, seqLens: number[], cache: ChatCache, customMask?: {
@@ -669,16 +657,20 @@ export class ExecutionWorkspace extends WorkspaceBase {
       pagedKV.allocAppendPages(seqIdx, seqLens[seqIdx]);
     }
 
-    this.qoIndptrH.withPinnedBuffer(buf => {
+    const slot = this.nextPlanSlot();
+    const state = new ExecutionState(model, batchSize, totalTokens, seqLens, false, this, cache, customMask);
+    this.allocStateBuffers(state, slot, this.maxBatch, this.maxSeqLen);
+
+    state.qoIndptrH.withPinnedBuffer(buf => {
       buf.writeInt32LE(0, 0);
       for (let i = 0; i < batchSize; i++) {
         buf.writeInt32LE(buf.readInt32LE(i * I32) + seqLens[i], (i + 1) * I32);
       }
     });
 
-    this.updateIndptr(pagedKV);
+    this.updateIndptr(state, pagedKV);
 
-    this.positionIdsH.withPinnedBuffer(buf => {
+    state.positionIdsH.withPinnedBuffer(buf => {
       let posOff = 0;
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
         for (let p = 0; p < seqLens[seqIdx]; p++) {
@@ -687,15 +679,15 @@ export class ExecutionWorkspace extends WorkspaceBase {
         }
       }
     });
-    this.positionIds.memcpy(this.positionIdsH, totalTokens * I32, MemcpyKind.HostToDevice);
+    state.positionIds.memcpy(state.positionIdsH, totalTokens * I32, MemcpyKind.HostToDevice);
 
-    this.kvLenH.withPinnedBuffer(buf => {
+    state.kvLenH.withPinnedBuffer(buf => {
       for (let i = 0; i < batchSize; i++) {
         buf.writeInt32LE(pagedKV.sequences[i].allocLen, i * I32);
       }
     });
 
-    this.kvTokenIndptrH.withPinnedBuffer(buf => {
+    state.kvTokenIndptrH.withPinnedBuffer(buf => {
       buf.writeInt32LE(0, 0);
       let cumulative = 0;
       for (let i = 0; i < batchSize; i++) {
@@ -708,10 +700,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
       if (!pagedKV.sparseMode) {
         this.glm.mlaPrefillPlan(
           pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-          this.intWs, this.intWsH, BATCH_INT_WS_SIZE,
-          this.mlaPrefillPlanInfo,
-          this.qoIndptrH, this.indptrH,
-          this.kvLenH, this.lastPageLenH,
+          state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
+          state.mlaPrefillPlanInfo,
+          state.qoIndptrH, state.indptrH,
+          state.kvLenH, state.lastPageLenH,
           batchSize, nHeads, cfg.kvLoraRank!, !customMask || customMask.mode === MaskMode.CausalCustom || customMask.mode === MaskMode.Causal,
           pagedKV.pageSize, pagedKV.sequences.map(s => s.allocLen),
           pagedKV.contextParallel
@@ -720,7 +712,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       else {
         // sparse mode requires no planning
       }
-      this.mlaBatchIndicesH.withPinnedBuffer(buf => {
+      state.mlaBatchIndicesH.withPinnedBuffer(buf => {
         let off = 0;
         for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
           for (let pos = 0; pos < seqLens[seqIdx]; pos++) {
@@ -729,20 +721,20 @@ export class ExecutionWorkspace extends WorkspaceBase {
           }
         }
       });
-      this.mlaBatchIndices.memcpy(this.mlaBatchIndicesH, totalTokens * I32, MemcpyKind.HostToDevice);
-      this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+      state.mlaBatchIndices.memcpy(state.mlaBatchIndicesH, totalTokens * I32, MemcpyKind.HostToDevice);
+      state.qoIndptrD.memcpy(state.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     } else {
       this.glm.batchPrefillPagedPlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-        this.intWs, this.intWsH, BATCH_INT_WS_SIZE,
-        this.prefillPlanInfo,
-        this.qoIndptrH, this.indptrH,
+        state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
+        state.prefillPlanInfo,
+        state.qoIndptrH, state.indptrH,
         totalTokens, batchSize,
         nHeads, nKv, hd,
         pageSize,
         1
       );
-      this.slotMappingH.withPinnedBuffer(buf => {
+      state.slotMappingH.withPinnedBuffer(buf => {
         let slotOff = 0;
         for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
           const pages = pagedKV.sequences[seqIdx].pages;
@@ -756,20 +748,20 @@ export class ExecutionWorkspace extends WorkspaceBase {
           }
         }
       });
-      this.slotMapping.memcpy(this.slotMappingH, totalTokens * I32, MemcpyKind.HostToDevice);
-      this.qoIndptrD.memcpy(this.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+      state.slotMapping.memcpy(state.slotMappingH, totalTokens * I32, MemcpyKind.HostToDevice);
+      state.qoIndptrD.memcpy(state.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     }
 
     const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.contentPages, 0);
-    this.indices.memcpy(this.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
-    this.indptrD.memcpy(this.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-    this.lastPageLen.memcpy(this.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
-    this.globalLastPageLen.memcpy(this.globalLastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
+    state.indices.memcpy(state.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
+    state.indptrD.memcpy(state.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    state.lastPageLen.memcpy(state.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
+    state.globalLastPageLen.memcpy(state.globalLastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
 
-    this.kvLenD.memcpy(this.kvLenH, batchSize * I32, MemcpyKind.HostToDevice);
-    this.kvTokenIndptrD.memcpy(this.kvTokenIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    state.kvLenD.memcpy(state.kvLenH, batchSize * I32, MemcpyKind.HostToDevice);
+    state.kvTokenIndptrD.memcpy(state.kvTokenIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
 
-    return new ExecutionState(model, batchSize, totalTokens, seqLens, false, this, cache, customMask);
+    return state;
   }
 
   forwardPrefill(model: ChatModel, inputIdsList: number[][], cache: ChatCache): Tensor {

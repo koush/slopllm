@@ -119,8 +119,9 @@ function parentIndex(topk: number[], nodeIndex: number, boundaries?: number[]): 
 
 function getPositionIdsMask(ws: ExecutionWorkspace, originalAllocLen: number, topk: number[]) {
   const numNodes = totalTreeNodes(topk);
-  const positionIds = ws.ensureAlloc(ws.positionIds.shape, ws.positionIds.type, `mtp_pos-${numNodes}`);
-  const positionIdsH = ws.ensureAllocPinned(ws.positionIds.shape, ws.positionIds.type, `mtp_pos_host-${numNodes}`);
+  const maxShape = [ws.maxBatch * ws.maxSeqLen];
+  const positionIds = ws.ensureAlloc(maxShape, "I32", `mtp_pos-${numNodes}`);
+  const positionIdsH = ws.ensureAllocPinned(maxShape, "I32", `mtp_pos_host-${numNodes}`);
   const boundaries = depthBoundaries(topk);
   positionIdsH.withPinnedBuffer(buf => {
     let posOff = 0;
@@ -269,12 +270,12 @@ export function mtpTreeDecode(
           const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
           using initialIndices = initialTopk.indices;
           using _initialValues = initialTopk.values;
-          ws.inputIdsBuf.memcpy(initialIndices, initialIndices.bytes, MemcpyKind.DeviceToDevice);
+          state.inputIdsBuf.memcpy(initialIndices, initialIndices.bytes, MemcpyKind.DeviceToDevice);
           // copy the initial indices to host buffer
           hostBuf.memcpy2d(0, currentBatchSize * I32 * topks[0], initialIndices, 0, currentBatchSize * I32 * topks[0], currentBatchSize * I32 * topks[0], 1, MemcpyKind.DeviceToHost);
         }
 
-        state.setInput(ws.inputIdsBuf);
+        state.setInput(state.inputIdsBuf);
 
         ws.positionStep(state, model);
 
@@ -309,7 +310,7 @@ export function mtpTreeDecode(
         // prepare next input — indices are already in parent-grouped (BFS) order,
         // matching the interleaved sequence layout [orig0_child0, orig0_child1, orig1_child0, ...]
         if (i !== topks.length - 1) {
-          ws.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
+          state.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
         }
 
         chainedMtpHiddenState.memcpy(newMtpHiddenStates, newMtpHiddenStates.bytes, MemcpyKind.DeviceToDevice);
@@ -366,11 +367,11 @@ export function mtpTreeDecode(
           const initialTopk = initialLogits.topk(topks[0], model.cfg.vocabSize);
           using _initialValues = initialTopk.values;
           using initialIndices = initialTopk.indices;
-          ws.inputIdsBuf.memcpy(initialIndices, initialIndices.bytes, MemcpyKind.DeviceToDevice);
+          state.inputIdsBuf.memcpy(initialIndices, initialIndices.bytes, MemcpyKind.DeviceToDevice);
           hostBuf.memcpy2d(0, topks[0] * I32, initialIndices, 0, topks[0] * I32, topks[0] * I32, 1, MemcpyKind.DeviceToHost);
         }
 
-        state.setInput(ws.inputIdsBuf);
+        state.setInput(state.inputIdsBuf);
 
         // Expand prevHs: replicate each parent's hidden state for expandK children
         // Layout: [p0, p0, ..., p0, p1, p1, ..., p1, ...] (grouped by parent)
@@ -402,7 +403,7 @@ export function mtpTreeDecode(
 
         // Prepare input for next depth
         if (depth < topks.length - 1) {
-          ws.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
+          state.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
         }
 
         prevHs.memcpy(hiddenStates, hiddenStates.bytes, MemcpyKind.DeviceToDevice);

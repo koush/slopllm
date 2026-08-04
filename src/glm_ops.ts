@@ -1104,7 +1104,7 @@ export class GlmOps implements DeviceOps {
     // stays stable under capture. ParallelOps pre-allocates one Replicated
     // tensor and hands down its shards, so the per-device alloc order stays
     // exactly as it was before the group/layer pair was folded in here.
-    const topkLength = providedLength ?? topkIdx.workspace.alloc([state.ws.positionIds.shape[0]], "I32");
+    const topkLength = providedLength ?? topkIdx.workspace.alloc([state.positionIds.shape[0]], "I32");
     // Allocate the max footprint ([maxKv, topk]) and narrow to [totalQ, topk]:
     // a plain transient alloc, but constant-sized across totalQ / graph variants
     // so the workspace allocator layout stays stable under graph capture. Hold

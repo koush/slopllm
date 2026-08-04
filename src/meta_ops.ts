@@ -406,7 +406,7 @@ export class MetaOps implements DeviceOps {
 
     topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, providedLength?: Tensor): { layer: SlotSet, group: SlotSet } {
         const slots = topkIdx.workspace.alloc([topkIdx.shape[0], topkIdx.shape[1]], "I32");
-        const length = providedLength ?? topkIdx.workspace.alloc([state.ws.positionIds.shape[0]], "I32");
+        const length = providedLength ?? topkIdx.workspace.alloc([state.positionIds.shape[0]], "I32");
         return {
             layer: { slots, length },
             group: { slots: slots.viewClone(), length: length.viewClone() },

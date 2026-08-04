@@ -12,7 +12,7 @@ export class WorkspaceBase implements Disposable {
   exported = new Set<Tensor>();
   frozen = false;
   allocLogger = false;
-  private tracking: Disposable & { [Symbol.dispose](): void } | null = null;
+  protected tracking: Disposable & { [Symbol.dispose](): void } | null = null;
 
   constructor(glm: DeviceOps) {
     this.glm = glm;

@@ -102,7 +102,6 @@ function generateWithGraph(
 
       if (capturing) {
         const graphIdx = graph.graphEndCapture();
-        ws.freeze();
         graphExec = graph.graphInstantiate(graphIdx);
         graph.graphDestroy(graphIdx);
         capturing = false;

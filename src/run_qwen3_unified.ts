@@ -258,7 +258,7 @@ export function* generateStream(
       // at position P encodes info about token P+1, whereas the target model KV at the
       // same position encodes token P. This is safe because each MLA layer has its own
       // KV slot — the two never interfere.
-      using rotatedInputIds = state.input!.rotateInputIds(ws.qoIndptrD, gpuSampleResult!, state.batchSize);
+      using rotatedInputIds = state.input!.rotateInputIds(state.qoIndptrD, gpuSampleResult!, state.batchSize);
       state.setInput(rotatedInputIds);
       using _mtpHiddenStates = model.forwardMtp(state, hiddenStates, true);
 
