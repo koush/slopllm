@@ -229,7 +229,7 @@ export class GlmTensor extends Tensor {
     if (this.data !== 0) {
       if (this.pinned) {
         getNativeAddon().freePinned(this.data);
-      } else {
+      } else if (!this.view) {
         this.glm.allocator.free(this.data);
       }
       this.detachData();
