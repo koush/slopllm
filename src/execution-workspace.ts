@@ -323,7 +323,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   /** GPU int workspace: written by FlashInfer plan, read by FlashInfer run. */
   intWs: Tensor;
   /** Pinned host int workspace: scratch space used internally by FlashInfer plan (read+write within plan call). */
-  pinnedIntWs: Tensor;
+  intWsH: Tensor;
   /** Pinned host buffer: written by batchDecodePlan, read by batchDecodeRun. */
   decodePlanInfo: Tensor;
   /** Pinned host buffer: written by batchPrefillPagedPlan, read by batchPrefillPagedRun. */
@@ -384,7 +384,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     super(glm);
 
     this.intWs = this.alloc([BATCH_INT_WS_SIZE], "U8", "intWs");
-    this.pinnedIntWs = this.allocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
+    this.intWsH = this.allocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", "pinnedIntWs");
     this.decodePlanInfo = this.allocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", "decodePlanInfo");
     this.prefillPlanInfo = this.allocPinned([PREFILL_PLAN_INFO_SIZE * 8], "U8", "prefillPlanInfo");
     this.mlaPrefillPlanInfo = this.allocPinned([MLA_PREFILL_PLAN_INFO_SIZE * 8], "U8", "mlaPrefillPlanInfo");
@@ -608,7 +608,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     if (!cfg.kvLoraRank) {
       this.glm.batchDecodePlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+        this.intWs, this.intWsH, BATCH_INT_WS_SIZE,
         this.decodePlanInfo,
         this.indptrH,
         batchSize,
@@ -619,7 +619,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     else if (!pagedKV.sparseMode) {
       this.glm.mlaDecodePlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+        this.intWs, this.intWsH, BATCH_INT_WS_SIZE,
         this.mlaDecodePlanInfo,
         this.indptrH, this.lastPageLenH,
         batchSize, model.cfg.numAttentionHeads, pagedKV.pageSize, enableCudaGraph,
@@ -708,7 +708,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       if (!pagedKV.sparseMode) {
         this.glm.mlaPrefillPlan(
           pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-          this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+          this.intWs, this.intWsH, BATCH_INT_WS_SIZE,
           this.mlaPrefillPlanInfo,
           this.qoIndptrH, this.indptrH,
           this.kvLenH, this.lastPageLenH,
@@ -734,7 +734,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     } else {
       this.glm.batchPrefillPagedPlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-        this.intWs, this.pinnedIntWs, BATCH_INT_WS_SIZE,
+        this.intWs, this.intWsH, BATCH_INT_WS_SIZE,
         this.prefillPlanInfo,
         this.qoIndptrH, this.indptrH,
         totalTokens, batchSize,
