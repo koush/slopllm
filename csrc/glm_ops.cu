@@ -1271,6 +1271,37 @@ void glm_softmax(GlmCtx* ctx, void* out, const void* input,
 }
 
 // ---------------------------------------------------------------------------
+// Causal mask kernel
+// Fills upper triangle with -inf: out[i][j] = (j > offset + i) ? -inf : 0
+// out: [rows, cols] BF16
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) causal_mask_kernel(
+    __nv_bfloat16* out,
+    int rows,
+    int cols,
+    int offset
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * cols;
+    if (idx < total) {
+        int row = idx / cols;
+        int col = idx % cols;
+        float val = (col > offset + row) ? -INFINITY : 0.0f;
+        out[idx] = __float2bfloat16(val);
+    }
+}
+
+void glm_causal_mask(GlmCtx* ctx, void* out, int seq_len) {
+    cudaSetDevice(ctx->device_id);
+    int total = seq_len * seq_len;
+    int block_size = 256;
+    int grid = (total + block_size - 1) / block_size;
+    causal_mask_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, seq_len, seq_len, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Fill kernel
 // ---------------------------------------------------------------------------
 
@@ -1559,6 +1590,44 @@ void glm_gather_pages(GlmCtx* ctx, void* out, const void* in,
         (char*)out, (const char*)in,
         page_indices, page_indptr, last_page_len,
         batch_size, page_size, D);
+}
+
+// ---------------------------------------------------------------------------
+// Cat last dim kernel
+// out[i, :a_dim] = a[i, :], out[i, a_dim:] = b[i, :]
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) cat_last_dim_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    int a_last_dim,
+    int b_last_dim,
+    int outer
+) {
+    int out_dim = a_last_dim + b_last_dim;
+    int total = outer * out_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int row = idx / out_dim;
+        int col = idx % out_dim;
+        if (col < a_last_dim) {
+            out[idx] = a[row * a_last_dim + col];
+        } else {
+            out[idx] = b[row * b_last_dim + (col - a_last_dim)];
+        }
+    }
+}
+
+void glm_cat_last_dim(GlmCtx* ctx, void* out, const void* a, const void* b,
+                      int a_last_dim, int b_last_dim, int outer) {
+    cudaSetDevice(ctx->device_id);
+    int total = outer * (a_last_dim + b_last_dim);
+    int block_size = 256;
+    int grid = (total + block_size - 1) / block_size;
+    cat_last_dim_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)a,
+        (const __nv_bfloat16*)b, a_last_dim, b_last_dim, outer);
 }
 
 // ---------------------------------------------------------------------------
@@ -2284,6 +2353,66 @@ void glm_add_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int
 // out:     [rows, dim] BF16 (in-place accumulation)
 // input:   [rows, dim] BF16
 // scales:  [rows] BF16 (per-row scaling factor)
+// ---------------------------------------------------------------------------
+// Expand/repeat along dim 1 of a 4D tensor
+// input:  [batch, dim1_in, seq_len, head_dim]
+// output: [batch, dim1_out, seq_len, head_dim]
+// out[b, h_out, s, d] = input[b, h_out * dim1_in / dim1_out, s, d]
+// Requires dim1_out % dim1_in == 0
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(256, 4) expand_dim1_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* input,
+    int dim1_out,
+    int dim1_in,
+    int seq_len,
+    int head_dim,
+    int batch,
+    int head_stride,
+    int expand_ratio
+) {
+    int total = batch * dim1_out * seq_len * head_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int d = idx % head_dim;
+        int rest = idx / head_dim;
+        int s = rest % seq_len;
+        rest /= seq_len;
+        int h_out = rest % dim1_out;
+        int b = rest / dim1_out;
+
+        int h_in = h_out / expand_ratio;
+        int in_idx = (b * dim1_in + h_in) * head_stride + s * head_dim + d;
+        out[idx] = input[in_idx];
+    }
+}
+
+void glm_expand_dim1(GlmCtx* ctx, void* out, const void* input,
+                     int dim1_out, int dim1_in, int seq_len, int head_dim, int batch) {
+    cudaSetDevice(ctx->device_id);
+    int total = batch * dim1_out * seq_len * head_dim;
+    int block_size = 256;
+    int grid = (total + block_size - 1) / block_size;
+    expand_dim1_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+        dim1_out, dim1_in, seq_len, head_dim, batch, seq_len * head_dim,
+        dim1_out / dim1_in);
+}
+
+void glm_expand_dim1_strided(GlmCtx* ctx, void* out, const void* input,
+                             int dim1_out, int dim1_in, int seq_len, int head_dim,
+                             int batch, int head_stride) {
+    cudaSetDevice(ctx->device_id);
+    int total = batch * dim1_out * seq_len * head_dim;
+    int block_size = 256;
+    int grid = (total + block_size - 1) / block_size;
+    expand_dim1_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+        dim1_out, dim1_in, seq_len, head_dim, batch, head_stride,
+        dim1_out / dim1_in);
+}
+
 // ---------------------------------------------------------------------------
 // Specialized transpose for {0,2,1,3}: swaps dims 1 and 2
 // input:  [dim0, dim1, dim2, dim3]  output: [dim0, dim2, dim1, dim3]

@@ -234,15 +234,6 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
-        self.lib.glm_indexer_score_topk.restype = None
-        self.lib.glm_indexer_score_topk.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_float,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-        ]
-
         self.lib.glm_topk_to_slots.restype = None
         self.lib.glm_topk_to_slots.argtypes = [
             ctypes.c_void_p,
@@ -701,9 +692,6 @@ class GlmOps:
         self.lib.glm_graph_launch.restype = None
         self.lib.glm_graph_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
-        self.lib.glm_graph_exec_update.restype = ctypes.c_int
-        self.lib.glm_graph_exec_update.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-
         self.lib.glm_graph_destroy.restype = None
         self.lib.glm_graph_destroy.argtypes = [ctypes.c_void_p]
 
@@ -897,113 +885,13 @@ class GlmOps:
             ctypes.c_void_p,
         ]
 
-        self.lib.glm_grouped_moe_workspace_size.restype = ctypes.c_size_t
-        self.lib.glm_grouped_moe_workspace_size.argtypes = [
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ]
-
-        self.lib.glm_mul_mat_id_grouped.restype = None
-        self.lib.glm_mul_mat_id_grouped.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-
-        self.lib.glm_nvfp4_mul_mat_id_grouped.restype = None
-        self.lib.glm_nvfp4_mul_mat_id_grouped.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-
         self.lib.glm_mma_moe_workspace_size.restype = ctypes.c_size_t
         self.lib.glm_mma_moe_workspace_size.argtypes = [
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
-        self.lib.glm_nvfp4_mul_mat_id_grouped_mma.restype = None
-        self.lib.glm_nvfp4_mul_mat_id_grouped_mma.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-
         self.lib.glm_bf16_mul_mat_id_grouped_mma.restype = None
         self.lib.glm_bf16_mul_mat_id_grouped_mma.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-
-        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm64.restype = None
-        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm64.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-
-        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm64.restype = None
-        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm64.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-
-        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm32_tn128.restype = None
-        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm32_tn128.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-
-        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm16_tn128.restype = None
-        self.lib.glm_nvfp4_mul_mat_id_grouped_mma_tm16_tn128.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-
-        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm32_tn128.restype = None
-        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm32_tn128.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-
-        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm16_tn128.restype = None
-        self.lib.glm_bf16_mul_mat_id_grouped_mma_tm16_tn128.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_int,
@@ -1221,26 +1109,6 @@ class GlmOps:
             self._ptr(qo_indptr),
             ctypes.c_float(scale),
             total_q, n_heads, head_dim, page_size, max_kv_len, 1 if causal else 0
-        )
-
-    def indexer_score_topk(self, out_idx, q, k_data, weights, page_indices, page_indptr,
-                           last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
-                           page_size, topk, causal, custom_mask=None, mask_indptr=None, mask_kv_len=None):
-        self.lib.glm_indexer_score_topk(
-            self.ctx,
-            self._ptr(out_idx),
-            self._ptr(q),
-            self._ptr(k_data),
-            self._ptr(weights),
-            self._ptr(page_indices),
-            self._ptr(page_indptr),
-            self._ptr(last_page_len),
-            self._ptr(qo_indptr),
-            ctypes.c_float(scale),
-            total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0,
-            self._ptr(custom_mask) if custom_mask is not None else ctypes.c_void_p(0),
-            self._ptr(mask_indptr) if mask_indptr is not None else ctypes.c_void_p(0),
-            self._ptr(mask_kv_len) if mask_kv_len is not None else ctypes.c_void_p(0)
         )
 
     def indexer_score_topk_v2(self, out_idx, q, k_data, weights, page_indices, page_indptr,
@@ -1880,9 +1748,6 @@ class GlmOps:
     def graph_launch(self, graph_exec):
         self.lib.glm_graph_launch(ctypes.c_void_p(graph_exec), self.ctx)
 
-    def graph_exec_update(self, graph_exec, graph):
-        return self.lib.glm_graph_exec_update(ctypes.c_void_p(graph_exec), ctypes.c_void_p(graph))
-
     def graph_destroy(self, graph):
         self.lib.glm_graph_destroy(ctypes.c_void_p(graph))
 
@@ -2064,20 +1929,6 @@ class GlmOps:
             top_k, count, N, K
         )
 
-    def mul_mat_id_grouped(self, output, input, weight_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace):
-        self.lib.glm_mul_mat_id_grouped(
-            self.ctx,
-            self._ptr(output),
-            self._ptr(input),
-            ctypes.c_void_p(weight_ptrs),
-            self._ptr(expert_ids),
-            top_k, count, N, K, num_experts,
-            ctypes.c_void_p(workspace)
-        )
-
-    def grouped_moe_workspace_size(self, count, N, K, num_experts):
-        return self.lib.glm_grouped_moe_workspace_size(count, N, K, num_experts)
-
     def nvfp4_mul_mat_id(self, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, top_k, count, N, K):
         self.lib.glm_nvfp4_mul_mat_id(
             self.ctx,
@@ -2088,19 +1939,6 @@ class GlmOps:
             ctypes.c_void_p(scale2_ptrs),
             self._ptr(expert_ids),
             top_k, count, N, K
-        )
-
-    def nvfp4_mul_mat_id_grouped(self, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, top_k, count, N, K, num_experts, workspace):
-        self.lib.glm_nvfp4_mul_mat_id_grouped(
-            self.ctx,
-            self._ptr(output),
-            self._ptr(input),
-            ctypes.c_void_p(weight_ptrs),
-            ctypes.c_void_p(scale_ptrs),
-            ctypes.c_void_p(scale2_ptrs),
-            self._ptr(expert_ids),
-            top_k, count, N, K, num_experts,
-            ctypes.c_void_p(workspace)
         )
 
     def scatter_add_rows(self, out, input, scales, top_k, dim, num_rows, workspace):

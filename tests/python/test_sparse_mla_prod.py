@@ -178,12 +178,20 @@ def test_indexer_score_topk_prod_dims(prod_setup, device):
 
     out_idx = torch.full((total_q, TOPK), -1, dtype=torch.int32, device=device)
 
-    glm.indexer_score_topk(
-        out_idx.data_ptr(), s['q_idx'].data_ptr(), s['k_data'].data_ptr(),
-        s['weights'].data_ptr(), s['page_indices'].data_ptr(), s['page_indptr'].data_ptr(),
-        s['last_page_len'].data_ptr(), s['qo_indptr'].data_ptr(),
+    max_kv = s['seq_len']
+    NBUCKET = 1024
+    scores = torch.empty(total_q, max_kv, dtype=torch.bfloat16, device=device)
+    row_len = torch.zeros(total_q, dtype=torch.int32, device=device)
+    hist = torch.empty(total_q, NBUCKET, dtype=torch.int32, device=device)
+    meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
+    num_splits = min(256, max(1, (max_kv + 255) // 256))
+
+    glm.indexer_score_topk_v2(
+        out_idx, s['q_idx'], s['k_data'], s['weights'],
+        s['page_indices'], s['page_indptr'], s['last_page_len'], s['qo_indptr'],
         INDEX_HEAD_DIM ** -0.5, total_q, INDEX_N_HEADS, INDEX_HEAD_DIM,
-        PAGE_SIZE, TOPK, False,  # causal=False for decode
+        PAGE_SIZE, TOPK, False,
+        scores, row_len, hist, meta, max_kv, num_splits,
     )
     torch.cuda.synchronize()
 
@@ -247,12 +255,19 @@ def test_full_pipeline_decode_prod(prod_setup, device):
 
     # Step 1: Indexer score+topk
     out_idx = torch.full((total_q, TOPK), -1, dtype=torch.int32, device=device)
-    glm.indexer_score_topk(
-        out_idx.data_ptr(), s['q_idx'].data_ptr(), s['k_data'].data_ptr(),
-        s['weights'].data_ptr(), s['page_indices'].data_ptr(), s['page_indptr'].data_ptr(),
-        s['last_page_len'].data_ptr(), s['qo_indptr'].data_ptr(),
+    max_kv = s['seq_len']
+    NBUCKET = 1024
+    scores = torch.empty(total_q, max_kv, dtype=torch.bfloat16, device=device)
+    row_len = torch.zeros(total_q, dtype=torch.int32, device=device)
+    hist = torch.empty(total_q, NBUCKET, dtype=torch.int32, device=device)
+    meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
+    num_splits = min(256, max(1, (max_kv + 255) // 256))
+    glm.indexer_score_topk_v2(
+        out_idx, s['q_idx'], s['k_data'], s['weights'],
+        s['page_indices'], s['page_indptr'], s['last_page_len'], s['qo_indptr'],
         INDEX_HEAD_DIM ** -0.5, total_q, INDEX_N_HEADS, INDEX_HEAD_DIM,
         PAGE_SIZE, TOPK, False,
+        scores, row_len, hist, meta, max_kv, num_splits,
     )
     torch.cuda.synchronize()
 

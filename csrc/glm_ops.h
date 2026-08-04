@@ -140,6 +140,11 @@ void glm_gather_pages(GlmCtx* ctx, void* out, const void* in,
                       int max_pages, int batch_size,
                       int page_size, int D);
 
+void glm_causal_mask(GlmCtx* ctx, void* out, int seq_len);
+
+void glm_cat_last_dim(GlmCtx* ctx, void* out, const void* a, const void* b,
+                      int a_last_dim, int b_last_dim, int outer);
+
 void glm_masked_fill(GlmCtx* ctx, void* out, const void* input, const void* mask,
                      float value, int n);
 
@@ -193,6 +198,13 @@ void glm_scale(GlmCtx* ctx, void* out, const void* input, float scale, int n);
 void glm_add(GlmCtx* ctx, void* out, const void* a, const void* b, int n);
 
 void glm_add_broadcast(GlmCtx* ctx, void* out, const void* a, const void* b, int dim, int rows);
+
+void glm_expand_dim1(GlmCtx* ctx, void* out, const void* input,
+                     int dim1_out, int dim1_in, int seq_len, int head_dim, int batch);
+
+void glm_expand_dim1_strided(GlmCtx* ctx, void* out, const void* input,
+                             int dim1_out, int dim1_in, int seq_len, int head_dim,
+                             int batch, int head_stride);
 
 void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
                       int dim0, int dim1, int dim2, int dim3,
@@ -469,6 +481,25 @@ void glm_set_stream(GlmCtx* ctx, int stream_idx);
 void glm_event_record(GlmCtx* ctx, int event_idx, int stream_idx);
 
 void glm_stream_wait_event(GlmCtx* ctx, int stream_idx, int event_idx);
+
+void glm_flash_prefill(
+    GlmCtx* ctx,
+    void* q, void* k, void* v, void* o, void* tmp,
+    int qo_len, int kv_len,
+    int num_qo_heads, int num_kv_heads, int head_dim,
+    int q_stride_n, int q_stride_h,
+    int kv_stride_n, int kv_stride_h,
+    int v_stride_n, int v_stride_h,
+    int mask_mode, int kv_layout, float sm_scale);
+
+void glm_flash_decode(
+    GlmCtx* ctx,
+    void* q, void* k, void* v, void* o, void* tmp,
+    int kv_len,
+    int num_qo_heads, int num_kv_heads, int head_dim,
+    int q_stride_n, int q_stride_h,
+    int kv_stride_n, int kv_stride_h,
+    float sm_scale);
 
 void* glm_alloc_pinned(size_t bytes);
 void glm_free_pinned(void* ptr);
