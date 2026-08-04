@@ -123,3 +123,13 @@ Some patterns have multiple shapes/dtypes across layers (e.g., NVFP4 vs BF16 for
 | MTP LayerNorms | 24.00 KB | 0.0% |
 | MTP Shared Head Norm | 12.00 KB | 0.0% |
 | Final Norm | 12.00 KB | 0.0% |
+
+## Per-Token KV Cache Memory (8 GPUs)
+
+Per-token sizes: ckv (sparse, U8) = `kvLoraRank + (kvLoraRank/128)*4 + qkRopeDim*2` = 512 + 16 + 128 = **656 bytes**; k (indexer, BF16) = `indexHeadDim * 2` = **256 bytes**. 78 layers.
+
+| Config | ckv | k | Per layer | 1M context, 78 layers |
+|---|---|---|---|---|
+| Pure TP (replicated ckv + k) | 656 B | 256 B | 912 B | 71.14 GB |
+| CP ckv, replicated k | 82 B | 256 B | 338 B | 26.36 GB |
+| CP ckv + CP k | 82 B | 32 B | 114 B | 8.89 GB |
