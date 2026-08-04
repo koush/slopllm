@@ -1292,7 +1292,11 @@ export class GlmOps implements DeviceOps {
     const effectiveStrideKvBlock = pageBlockSize * kvCache.shape[2] * elemBytes;
     if (pageBlockSize !== 64) throw new Error(`sparseMlaPrefill: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize} ${kvCache.shape}`);
     using q = qAbsorbed.cat([qPe], 2);
-    const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
+    // Pad to 16 tokens so cuBLAS TMA kernels (16-wide n-tile) don't over-read
+    // the allocation when numTokens < 16.
+    const oTokens = Math.max(numTokens, 16);
+    using oFull = q.workspace.alloc([oTokens, numHeads, headDim], "BF16");
+    const o = numTokens < 16 ? oFull.narrow(0, numTokens) : oFull.viewClone();
     const lse = q.workspace.alloc([numTokens, numHeads], "F32");
     // Small query counts (e.g. MTP tree verify) starve the prefill kernel: its
     // grid is only numTokens × ceil(NUM_HEADS/HPB) CTAs, leaving the GPU idle.
@@ -1319,7 +1323,11 @@ export class GlmOps implements DeviceOps {
     const effectiveStrideKvBlock = pageBlockSize * kvCache.shape[2] * elemBytes;
     if (pageBlockSize !== 64) throw new Error(`sparseMlaDecode: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize}`);
     using q = qAbsorbed.cat([qPe], 2);
-    const o = q.workspace.alloc([numTokens, numHeads, headDim], "BF16");
+    // Pad to 16 tokens so cuBLAS TMA kernels (16-wide n-tile) don't over-read
+    // the allocation when numTokens < 16.
+    const oTokens = Math.max(numTokens, 16);
+    using oFull = q.workspace.alloc([oTokens, numHeads, headDim], "BF16");
+    const o = numTokens < 16 ? oFull.narrow(0, numTokens) : oFull.viewClone();
     const lse = q.workspace.alloc([numTokens, numHeads], "F32");
     using midOut = q.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
     using midLse = q.workspace.alloc([numTokens, numHeads, numSplits], "F32");
