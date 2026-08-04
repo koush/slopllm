@@ -26,6 +26,7 @@ def _run_prefill(glm, s, topk, causal, device):
 
     num_splits = min(256, max(1, (max_kv + 255) // 256))
     out = torch.full((total_q, topk), -2, dtype=torch.int32, device=device)
+    out_scores = torch.full((total_q, topk), float('-inf'), dtype=torch.bfloat16, device=device)
     scores = torch.empty(total_q, max_kv, dtype=torch.bfloat16, device=device)
     row_len = torch.empty(total_q, dtype=torch.int32, device=device)
     coarse_hist = torch.empty(total_q, 1024, dtype=torch.int32, device=device)
@@ -33,7 +34,7 @@ def _run_prefill(glm, s, topk, causal, device):
     meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
 
     glm.indexer_score_topk_prefill(
-        out, q, k_paged, weights, pit, pipt, lplt, qoit, scale,
+        out, out_scores, q, k_paged, weights, pit, pipt, lplt, qoit, scale,
         total_q, n_heads, head_dim, page_size, topk, causal,
         scores, row_len, max_kv,
         coarse_hist, fine_hist, meta, num_splits,

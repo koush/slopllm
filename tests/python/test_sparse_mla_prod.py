@@ -177,6 +177,7 @@ def test_indexer_score_topk_prod_dims(prod_setup, device):
     total_q = s['num_q']
 
     out_idx = torch.full((total_q, TOPK), -1, dtype=torch.int32, device=device)
+    out_scores = torch.full((total_q, TOPK), float('-inf'), dtype=torch.bfloat16, device=device)
 
     max_kv = s['seq_len']
     NBUCKET = 1024
@@ -187,7 +188,7 @@ def test_indexer_score_topk_prod_dims(prod_setup, device):
     num_splits = min(256, max(1, (max_kv + 255) // 256))
 
     glm.indexer_score_topk_v2(
-        out_idx, s['q_idx'], s['k_data'], s['weights'],
+        out_idx, out_scores, s['q_idx'], s['k_data'], s['weights'],
         s['page_indices'], s['page_indptr'], s['last_page_len'], s['qo_indptr'],
         INDEX_HEAD_DIM ** -0.5, total_q, INDEX_N_HEADS, INDEX_HEAD_DIM,
         PAGE_SIZE, TOPK, False,
@@ -255,6 +256,7 @@ def test_full_pipeline_decode_prod(prod_setup, device):
 
     # Step 1: Indexer score+topk
     out_idx = torch.full((total_q, TOPK), -1, dtype=torch.int32, device=device)
+    out_scores = torch.full((total_q, TOPK), float('-inf'), dtype=torch.bfloat16, device=device)
     max_kv = s['seq_len']
     NBUCKET = 1024
     scores = torch.empty(total_q, max_kv, dtype=torch.bfloat16, device=device)
@@ -263,7 +265,7 @@ def test_full_pipeline_decode_prod(prod_setup, device):
     meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
     num_splits = min(256, max(1, (max_kv + 255) // 256))
     glm.indexer_score_topk_v2(
-        out_idx, s['q_idx'], s['k_data'], s['weights'],
+        out_idx, out_scores, s['q_idx'], s['k_data'], s['weights'],
         s['page_indices'], s['page_indptr'], s['last_page_len'], s['qo_indptr'],
         INDEX_HEAD_DIM ** -0.5, total_q, INDEX_N_HEADS, INDEX_HEAD_DIM,
         PAGE_SIZE, TOPK, False,

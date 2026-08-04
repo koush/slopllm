@@ -488,10 +488,12 @@ export class Glm51Model extends ChatModel {
     });
 
     idxQStream?.streamWaitEvent();
-    using topk = idxQStream?.result;
+    const topkResult = idxQStream?.result;
+    using topkValues = topkResult?.values;
+    using topkIndices = topkResult?.indices;
     const sparseSlots = cfg.indexHeadDim === 0
       ? undefined
-      : state.sparseMlaSlots(layerIdx, topk);
+      : state.sparseMlaSlots(layerIdx, topkIndices);
 
     using slots = sparseSlots?.slots;
     using slotsLength = sparseSlots?.length;

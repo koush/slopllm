@@ -3442,7 +3442,7 @@ export class ParallelOps implements DeviceOps {
   // Fall-back (replicated): decode, context-parallel, multi-sequence prefill,
   // or uneven totalQ — every rank runs the full indexer. Decode is cheap;
   // multi-seq / CP need qoIndptr rebasing which is not yet implemented.
-  indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): Tensor {
+  indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { values: Tensor, indices: Tensor } {
     const totalQ = idxQ.shape[0];
     using pQ = idxQ.parallelism === TensorParallelism.Replicated ? idxQ.viewClone() as ParallelTensor : this.cast(idxQ).allGather(idxQ.workspace);
     using pKData = kData.parallelism === TensorParallelism.Replicated ? kData.viewClone() as ParallelTensor : this.cast(kData).allGather(idxQ.workspace);
@@ -3465,32 +3465,43 @@ export class ParallelOps implements DeviceOps {
 
     if (!canShard) {
       const topkIdxShards: Tensor[] = [];
+      const topkValShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
-        topkIdxShards.push(this.devices[i].indexerTopk(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, topk, decode, qGlobalStart ?? 0, pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i]));
+        const r = this.devices[i].indexerTopk(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, topk, decode, qGlobalStart ?? 0, pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i]);
+        topkIdxShards.push(r.indices);
+        topkValShards.push(r.values);
       }
-      return this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Replicated);
+      return {
+        indices: this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Replicated),
+        values: this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk], "BF16", TensorParallelism.Replicated),
+      };
     }
 
     // Query-sharded path: each rank processes totalQ/W query rows.
     const localQ = totalQ / W;
     const topkIdxShards: Tensor[] = [];
+    const topkValShards: Tensor[] = [];
     for (let i = 0; i < W; i++) {
       const qStart = i * localQ;
-      topkIdxShards.push(this.devices[i].indexerTopk(
+      const r = this.devices[i].indexerTopk(
         colIdxQ!.shards[i], pKData.shards[i], colWeights!.shards[i],
         pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i],
         pQoIndptr.shards[i],
         scale, topk,
         decode, qStart,
         pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i]
-      ));
+      );
+      topkIdxShards.push(r.indices);
+      topkValShards.push(r.values);
     }
 
     // Column [totalQ, topk] → AllGather → Replicated [totalQ, topk].
     using topkIdxColumn = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Column);
+    using topkValColumn = this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk], "BF16", TensorParallelism.Column);
     const topkIdxReplicated = topkIdxColumn.allGather(idxQ.workspace);
+    const topkValReplicated = topkValColumn.allGather(idxQ.workspace);
 
-    return topkIdxReplicated;
+    return { values: topkValReplicated, indices: topkIdxReplicated };
   }
 
   // The flat/paged addressing is resolved internally from `cacheIdx` (via

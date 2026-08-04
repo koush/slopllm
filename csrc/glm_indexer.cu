@@ -335,20 +335,24 @@ __global__ void idx_hist_kernel(
 // block scan, then the winning thread refines within its range.
 __global__ void idx_threshold_kernel(
     const int32_t* __restrict__ hist, int32_t* __restrict__ meta,
-    int32_t* __restrict__ out_idx, const int32_t* __restrict__ row_len,
+    int32_t* __restrict__ out_idx, __nv_bfloat16* __restrict__ out_scores,
+    const int32_t* __restrict__ row_len,
     const __nv_bfloat16* __restrict__ scores, int stride, int topk
 ) {
     const int row = blockIdx.x;
     const int len = row_len ? row_len[row] : stride;
+    const __nv_bfloat16 neg_inf = __float2bfloat16(-INFINITY);
     // Identity case: all positions fit in topk. Write position-preserving
     // values directly (deterministic), skipping any position whose score is
     // -inf (masked out by a custom tree mask). tau=INT_MAX disables the gather
     // pass entirely (no bf16 key can exceed it).
     if (len <= topk) {
         const __nv_bfloat16* s = scores + (size_t)row * stride;
-        for (int i = threadIdx.x; i < topk; i += blockDim.x)
-            out_idx[(size_t)row * topk + i] =
-                (i < len && bf16_key(&s[i]) > 127) ? i : -1;
+        for (int i = threadIdx.x; i < topk; i += blockDim.x) {
+            bool valid = (i < len && bf16_key(&s[i]) > 127);
+            out_idx[(size_t)row * topk + i] = valid ? i : -1;
+            out_scores[(size_t)row * topk + i] = valid ? s[i] : neg_inf;
+        }
         if (threadIdx.x == 0) {
             int32_t* m = meta + (size_t)row * 4;
             m[0] = 0x7FFFFFFF; m[1] = 0; m[2] = topk; m[3] = 0;
@@ -356,8 +360,10 @@ __global__ void idx_threshold_kernel(
         return;
     }
 
-    for (int i = threadIdx.x; i < topk; i += blockDim.x)
+    for (int i = threadIdx.x; i < topk; i += blockDim.x) {
         out_idx[(size_t)row * topk + i] = -1;
+        out_scores[(size_t)row * topk + i] = neg_inf;
+    }
 
     const int t = threadIdx.x;                 // 0..255
     const int PER = IDX_NBUCKET / 256;         // 128 buckets per thread
@@ -402,7 +408,8 @@ __global__ void idx_threshold_kernel(
 
 __global__ void idx_gather_kernel(
     const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ row_len,
-    int32_t* __restrict__ meta, int32_t* __restrict__ out_idx, int stride, int topk
+    int32_t* __restrict__ meta, int32_t* __restrict__ out_idx,
+    __nv_bfloat16* __restrict__ out_scores, int stride, int topk
 ) {
     const int row = blockIdx.y;
     const int len = row_len ? row_len[row] : stride;
@@ -411,22 +418,24 @@ __global__ void idx_gather_kernel(
     const int tau = m[0];
     const int tieTake = m[1];
     int32_t* out = out_idx + (size_t)row * topk;
+    __nv_bfloat16* out_s = out_scores + (size_t)row * topk;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < len; i += gridDim.x * blockDim.x) {
         const int key = bf16_key(&s[i]);
         if (key > tau) {
             int p = atomicAdd(&m[2], 1);
-            if (p < topk) out[p] = i;
+            if (p < topk) { out[p] = i; out_s[p] = s[i]; }
         } else if (key == tau) {
             int t = atomicAdd(&m[3], 1);
             if (t < tieTake) {
                 int p = atomicAdd(&m[2], 1);
-                if (p < topk) out[p] = i;
+                if (p < topk) { out[p] = i; out_s[p] = s[i]; }
             }
         }
     }
 }
 
 void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
+    __nv_bfloat16* out_scores,
     const void* scores, const int32_t* row_len,
     int32_t* hist, int32_t* meta,
     int batch, int stride, int topk, int num_splits) {
@@ -437,9 +446,9 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     dim3 grid(num_splits, batch);
     idx_hist_kernel<<<grid, 256, 0, stream>>>(
         (const __nv_bfloat16*)scores, row_len, hist, stride);
-    idx_threshold_kernel<<<batch, 256, 0, stream>>>(hist, meta, out_idx, row_len, (const __nv_bfloat16*)scores, stride, topk);
+    idx_threshold_kernel<<<batch, 256, 0, stream>>>(hist, meta, out_idx, out_scores, row_len, (const __nv_bfloat16*)scores, stride, topk);
     idx_gather_kernel<<<grid, 256, 0, stream>>>(
-        (const __nv_bfloat16*)scores, row_len, meta, out_idx, stride, topk);
+        (const __nv_bfloat16*)scores, row_len, meta, out_idx, out_scores, stride, topk);
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +560,7 @@ __global__ void idx_score_kernel(
 // scratch: scores [totalQ, maxKv] bf16, rowLen [totalQ] i32, hist [totalQ,32768]
 // i32, meta [totalQ, 4] i32.
 void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
+    __nv_bfloat16* out_scores,
     const void* q, const void* kData, const void* weights,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
@@ -573,7 +583,7 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
         (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
         scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal,
         qGlobalStart, custom_mask, mask_indptr, mask_kv_len);
-    glm_topk_from_scores(ctx, out_idx, scores, rowLen, hist, meta,
+    glm_topk_from_scores(ctx, out_idx, out_scores, scores, rowLen, hist, meta,
                          totalQ, maxKv, topk, num_splits);
 }
 
@@ -928,15 +938,18 @@ __global__ void idx_prefill_coarse_hist_buf_kernel(
 // ---------------------------------------------------------------------------
 __global__ void idx_prefill_coarse_threshold_kernel(
     const int32_t* __restrict__ coarseHist, int32_t* __restrict__ meta,
-    int32_t* __restrict__ out_idx, int topk,
+    int32_t* __restrict__ out_idx, __nv_bfloat16* __restrict__ out_scores, int topk,
     const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ rowLen, int maxKv)
 {
     const int row = blockIdx.x;
     const int32_t* h = coarseHist + (size_t)row * IDX_COARSE_BUCKETS;
+    const __nv_bfloat16 neg_inf = __float2bfloat16(-INFINITY);
 
-    // Initialize output to -1
-    for (int i = threadIdx.x; i < topk; i += blockDim.x)
+    // Initialize output to -1 / -inf
+    for (int i = threadIdx.x; i < topk; i += blockDim.x) {
         out_idx[(size_t)row * topk + i] = -1;
+        out_scores[(size_t)row * topk + i] = neg_inf;
+    }
 
     // Sum all buckets to get total count
     const int t = threadIdx.x;
@@ -965,9 +978,11 @@ __global__ void idx_prefill_coarse_threshold_kernel(
     if (total <= topk) {
         const __nv_bfloat16* s = scores + (size_t)row * maxKv;
         const int len = rowLen ? rowLen[row] : maxKv;
-        for (int i = threadIdx.x; i < topk; i += blockDim.x)
-            out_idx[(size_t)row * topk + i] =
-                (i < len && *reinterpret_cast<const unsigned short*>(&s[i]) != 0xFF80) ? i : -1;
+        for (int i = threadIdx.x; i < topk; i += blockDim.x) {
+            bool valid = (i < len && *reinterpret_cast<const unsigned short*>(&s[i]) != 0xFF80);
+            out_idx[(size_t)row * topk + i] = valid ? i : -1;
+            out_scores[(size_t)row * topk + i] = valid ? s[i] : neg_inf;
+        }
         if (t == 0) {
             int32_t* m = meta + (size_t)row * 4;
             m[0] = -1;  // identity sentinel — gather is a no-op
@@ -1087,6 +1102,7 @@ __global__ void idx_prefill_fine_threshold_kernel(
 // ---------------------------------------------------------------------------
 __global__ void idx_prefill_gather_buf_kernel(
     int32_t* __restrict__ out_idx,           // [totalQ, topk]
+    __nv_bfloat16* __restrict__ out_scores,  // [totalQ, topk]
     const int32_t* __restrict__ meta,        // [totalQ, 4]
     const __nv_bfloat16* __restrict__ scores,// [totalQ, maxKv]
     const int32_t* __restrict__ rowLen,      // [totalQ]
@@ -1099,6 +1115,7 @@ __global__ void idx_prefill_gather_buf_kernel(
     const int len = rowLen ? rowLen[row] : maxKv;
     const __nv_bfloat16* s = scores + (size_t)row * maxKv;
     int32_t* out = out_idx + (size_t)row * topk;
+    __nv_bfloat16* out_s = out_scores + (size_t)row * topk;
 
     __shared__ int s_count, s_tie;
     if (threadIdx.x == 0) { s_count = 0; s_tie = 0; }
@@ -1109,28 +1126,32 @@ __global__ void idx_prefill_gather_buf_kernel(
         int key = bf16_key(&s[i]);
         if (key > tau) {
             int p = atomicAdd(&s_count, 1);
-            if (p < topk) out[p] = i;
+            if (p < topk) { out[p] = i; out_s[p] = s[i]; }
         } else if (key == tau) {
             int t = atomicAdd(&s_tie, 1);
             if (t < tieTake) {
                 int p = atomicAdd(&s_count, 1);
-                if (p < topk) out[p] = i;
+                if (p < topk) { out[p] = i; out_s[p] = s[i]; }
             }
         }
     }
     if (tau < 0) return;  // threshold kernel already wrote everything
-    // Fill unused slots with -1. Rows shorter than topk (causal prefix) and any
+    // Fill unused slots with -1 / -inf. Rows shorter than topk (causal prefix) and any
     // threshold undershoot from bf16 ties leave a tail; the sparse-MLA kernel
     // clamps negative indices to page 0 at load and masks them out in QK, so -1
     // is the required sentinel. Without this the tail holds stale indices from a
     // prior chunk and the sparse-MLA KV gather reads out of bounds.
     __syncthreads();
-    for (int i = min(s_count, topk) + threadIdx.x; i < topk; i += blockDim.x)
+    const __nv_bfloat16 neg_inf = __float2bfloat16(-INFINITY);
+    for (int i = min(s_count, topk) + threadIdx.x; i < topk; i += blockDim.x) {
         out[i] = -1;
+        out_s[i] = neg_inf;
+    }
 }
 
 // Host function: score once into buffer, then 2-level histogram top-K.
 void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
+    __nv_bfloat16* out_scores,
     const void* q, const void* kData, const void* weights,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
@@ -1179,7 +1200,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 
         // Pass 3: coarse threshold (1 block per query)
         idx_prefill_coarse_threshold_kernel<<<totalQ, 256, 0, stream>>>(
-            coarseHist, meta, out_idx, topk, (const __nv_bfloat16*)scores, rowLen, maxKv);
+            coarseHist, meta, out_idx, out_scores, topk, (const __nv_bfloat16*)scores, rowLen, maxKv);
 
         // Pass 4: fine histogram — one block per row
         idx_prefill_fine_hist_buf_kernel<<<totalQ, 256, 0, stream>>>(
@@ -1191,6 +1212,6 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 
         // Pass 6: gather from buffer — one block per row
         idx_prefill_gather_buf_kernel<<<totalQ, 256, 0, stream>>>(
-            out_idx, meta, (const __nv_bfloat16*)scores, rowLen, maxKv, topk);
+            out_idx, out_scores, meta, (const __nv_bfloat16*)scores, rowLen, maxKv, topk);
     }
 }

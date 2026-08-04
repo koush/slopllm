@@ -183,10 +183,11 @@ export class ExecutionState {
   }
 
   // Run the indexer and return the raw top-k token positions (Replicated
-  // [totalQ, topk]). Slot conversion is deferred to topkSlots() so the same
-  // top-k can be reused across shared layers and mapped to whichever addressing
-  // (flat/paged) each layer's CKV buffer requires.
-  indexerTopk(idxQ: Tensor, cacheIdx: number, weights: Tensor, scale: number, topk: number): Tensor {
+  // [totalQ, topk]) and scores (Replicated [totalQ, topk] BF16). Slot
+  // conversion is deferred to topkSlots() so the same top-k can be reused
+  // across shared layers and mapped to whichever addressing (flat/paged) each
+  // layer's CKV buffer requires.
+  indexerTopk(idxQ: Tensor, cacheIdx: number, weights: Tensor, scale: number, topk: number): { values: Tensor, indices: Tensor } {
     const pagedKV = this.cache.getPagedKV();
     const kData = pagedKV.kData[cacheIdx];
     const cm = (!this.isDecode && this.customMask?.mode === MaskMode.CausalCustom) ? this.customMask : undefined;

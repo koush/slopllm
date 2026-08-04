@@ -45,6 +45,7 @@ def _run_v2(glm, s, topk, causal, device):
         np_ = pip[i + 1] - pip[i]
         max_kv = max(max_kv, (np_ - 1) * k_paged.shape[1] + lpl[i])
     out = torch.full((total_q, topk), -2, dtype=torch.int32, device=device)
+    out_scores = torch.full((total_q, topk), float('-inf'), dtype=torch.bfloat16, device=device)
     scores = torch.zeros(total_q, max_kv, dtype=torch.bfloat16, device=device)
     row_len = torch.zeros(total_q, dtype=torch.int32, device=device)
     hist = torch.empty(total_q, NBUCKET, dtype=torch.int32, device=device)
@@ -52,7 +53,7 @@ def _run_v2(glm, s, topk, causal, device):
     n_heads, head_dim = q.shape[1], q.shape[2]
     num_splits = min(256, max(1, (max_kv + 255) // 256))
     glm.indexer_score_topk_v2(
-        out, q, k_paged, weights, pit, pipt, lplt, qoit, scale,
+        out, out_scores, q, k_paged, weights, pit, pipt, lplt, qoit, scale,
         total_q, n_heads, head_dim, k_paged.shape[1], topk, causal,
         scores, row_len, hist, meta, max_kv, num_splits)
     glm.synchronize()

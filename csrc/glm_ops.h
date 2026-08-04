@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,6 +88,7 @@ void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
 
 
 void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
+    __nv_bfloat16* out_scores,
     const void* q, const void* kData, const void* weights,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
@@ -98,6 +100,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     int numSplits);
 
 void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
+    __nv_bfloat16* out_scores,
     const void* q, const void* kData, const void* weights,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
@@ -108,6 +111,7 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     int maxKv, int num_splits);
 
 void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
+    __nv_bfloat16* out_scores,
     const void* scores, const int32_t* row_len,
     int32_t* hist, int32_t* meta,
     int batch, int stride, int topk, int num_splits);

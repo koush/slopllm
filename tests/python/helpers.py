@@ -258,14 +258,14 @@ class GlmOps:
 
         self.lib.glm_topk_from_scores.restype = None
         self.lib.glm_topk_from_scores.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
         self.lib.glm_indexer_score_topk_v2.restype = None
         self.lib.glm_indexer_score_topk_v2.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -276,7 +276,7 @@ class GlmOps:
 
         self.lib.glm_indexer_score_topk_prefill.restype = None
         self.lib.glm_indexer_score_topk_prefill.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -1111,14 +1111,14 @@ class GlmOps:
             total_q, n_heads, head_dim, page_size, max_kv_len, 1 if causal else 0
         )
 
-    def indexer_score_topk_v2(self, out_idx, q, k_data, weights, page_indices, page_indptr,
+    def indexer_score_topk_v2(self, out_idx, out_scores, q, k_data, weights, page_indices, page_indptr,
                               last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
                               page_size, topk, causal,
                               scores, row_len, hist, meta, max_kv, num_splits,
                               custom_mask=None, mask_indptr=None, mask_kv_len=None,
                               q_global_start=0):
         self.lib.glm_indexer_score_topk_v2(
-            self.ctx, self._ptr(out_idx), self._ptr(q), self._ptr(k_data), self._ptr(weights),
+            self.ctx, self._ptr(out_idx), self._ptr(out_scores), self._ptr(q), self._ptr(k_data), self._ptr(weights),
             self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
             ctypes.c_float(scale), total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0,
             q_global_start,
@@ -1129,7 +1129,7 @@ class GlmOps:
             max_kv, num_splits,
         )
 
-    def indexer_score_topk_prefill(self, out_idx, q, k_data, weights, page_indices, page_indptr,
+    def indexer_score_topk_prefill(self, out_idx, out_scores, q, k_data, weights, page_indices, page_indptr,
                                    last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
                                    page_size, topk, causal,
                                    scores, row_len, max_kv,
@@ -1137,7 +1137,7 @@ class GlmOps:
                                    custom_mask=None, mask_indptr=None, mask_kv_len=None,
                                    q_global_start=0):
         self.lib.glm_indexer_score_topk_prefill(
-            self.ctx, self._ptr(out_idx), self._ptr(q), self._ptr(k_data), self._ptr(weights),
+            self.ctx, self._ptr(out_idx), self._ptr(out_scores), self._ptr(q), self._ptr(k_data), self._ptr(weights),
             self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
             ctypes.c_float(scale), total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0,
             q_global_start,
