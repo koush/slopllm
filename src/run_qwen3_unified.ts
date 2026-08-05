@@ -282,6 +282,10 @@ export function* generateStream(
   yield currentToken;
   if (eosIds.has(currentToken)) return;
 
+  // Budget is in TOKENS, not loop iterations. One plain decode step emits one
+  // token, but one MTP step emits 1 + (accepted drafts), so bounding the loop
+  // counter overshoots by the mean acceptance length (~2.2x at topk 1,1,1).
+  let generated = 1;
   let planMs = 0;
   let execMs = 0;
   let idleMs = 0;
@@ -293,7 +297,7 @@ export function* generateStream(
   let tAfterSync = 0;
 
   try {
-    for (let i = 1; i < maxNewTokens; i++) {
+    for (let i = 1; generated < maxNewTokens; i++) {
       using _tracking = sampleWorkspace.startTracking();
 
       if (mtp && model.forwardMtp && topks.length > 0) {
@@ -322,7 +326,14 @@ export function* generateStream(
           }
 
           yield t;
+          generated++;
           if (eosIds.has(t))
+            return;
+          // Stop mid-batch: the rest of this step's accepted tokens are over
+          // budget. Their KV is already in the cache, exactly as on the EOS
+          // path above -- reportTokens has run for them but they are not
+          // yielded, so the caller never sees them.
+          if (generated >= maxNewTokens)
             return;
         }
 
@@ -391,6 +402,7 @@ export function* generateStream(
       tokenHistory.push(currentToken);
 
       yield currentToken;
+      generated++;
       if (eosIds.has(currentToken))
         return;
 

@@ -3,6 +3,7 @@ import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
 import { Glm51Config } from "./glm51_model";
 import { bf16BytesToF32, f32ToBf16Bytes, getNativeAddon, GlmOps, GlmTensor, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM, NCCL_UINT8 } from "./glm_ops";
+import { SafeTensorFile } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
@@ -15,8 +16,29 @@ import { WorkspaceBase } from "./workspace";
 // the indexer flat-slot mode (topkToSlots ignores kvTokenIndptr when off)
 // read this so they never diverge.
 export const CP_GATHER_KV = process.env.GLM_CP_GATHER_KV !== "0";
+// When enabled, kData is AllGathered to Replicated before indexerTopk (old path).
+// When disabled, kData stays Row-parallel and a per-shard topk merge is done.
+export const CP_GATHER_KDATA = process.env.GLM_CP_GATHER_KDATA === "1";
 // Fall back to the read-based (pull) CP merge; the push path is the default.
 export const CP_MERGE_PULL = process.env.GLM_CP_MERGE_PULL === "1";
+// Sort the CP top-k merge result ascending by global index. ON by default;
+// GLM_CP_TOPK_SORT=0 disables it (diagnostic only -- see below).
+//
+// The gathered buffer is rank-major, so the merge emits positions ordered by
+// (P % W, P / W) rather than by global position P. Sorting also makes this path
+// bit-identical to the replicated-kData build, which is what makes `diff`
+// against that build a usable regression test here.
+//
+// It is NOT only about parity: with the sort off, long generations degenerate
+// into repeated literal "truncated" / "end of output" tokens once the context
+// gets large. Sorting fixes that. Since the sort runs after selection it cannot
+// change WHICH positions are selected, only their order -- so something
+// downstream (topk_to_slots -> gatherTopkCkv -> sparse MLA) depends on the index
+// list being ascending, beyond the float accumulation order it is allowed to
+// depend on. That dependency has not been found, and this sort is currently
+// masking it: any other producer of unsorted top-k indices would corrupt too.
+// Costs ~9% of decode throughput (measured 100.4 -> 92.1 tok/s at 8-way CP).
+export const CP_TOPK_SORT = process.env.GLM_CP_TOPK_SORT !== "0";
 
 export class ParallelTensor extends Tensor {
   parallelism: TensorParallelism;
@@ -155,17 +177,21 @@ export class ParallelTensor extends Tensor {
     return oldPar;
   }
 
-  override reshape(newShape: number[]): Tensor {
-    const current = this.shape.reduce((a, b) => a * b, 1);
-    const target = newShape.reduce((a, b) => a * b, 1);
-    if (current !== target) {
-      throw new Error(`reshape: cannot reshape [${this.shape}] (${current} elements) to [${newShape}] (${target} elements)`);
+  override reshape(newShape: number[], newType?: string): Tensor {
+    const outType = newType ?? this.type;
+    const currentBytes = Math.ceil(this.shape.reduce((a, b) => a * b, 1) * SafeTensorFile.dtypeBytes(this.type));
+    const targetBytes = Math.ceil(newShape.reduce((a, b) => a * b, 1) * SafeTensorFile.dtypeBytes(outType));
+    if (currentBytes !== targetBytes) {
+      throw new Error(`reshape: cannot reshape [${this.shape}] (${this.type}, ${currentBytes} bytes) to [${newShape}] (${outType}, ${targetBytes} bytes)`);
+    }
+    if (newType && newType !== this.type && this.parallelism !== TensorParallelism.Replicated) {
+      throw new Error(`reshape: type change (${this.type} → ${outType}) is only supported on Replicated tensors, got ${this.parallelism}`);
     }
     const newPar = ParallelTensor.computeReshapeParallelism(this.shape, newShape, this.parallelism, this.worldSize);
     const newShardShape = this.parallelOps.shardShape(newShape, newPar);
-    const reshapedShards: Tensor[] = this.shards.map(s => s.reshape(newShardShape));
+    const reshapedShards: Tensor[] = this.shards.map(s => s.reshape(newShardShape, newType));
     return this.parallelOps.wrapShards(
-      this.workspace, reshapedShards, newShape, this.type, newPar, this,
+      this.workspace, reshapedShards, newShape, outType, newPar, this,
     );
   }
 
@@ -2836,9 +2862,7 @@ export class ParallelOps implements DeviceOps {
     const pLastPageLenH = this.cast(lastPageLenH);
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "mlaPrefillPlan numHeads");
     const effectiveCpWorldSize = contextParallel ? this.worldSize : undefined;
-    if (contextParallel) {
-      this.adjustCpLastPageLen(pLastPageLenH, batchSize, seqKvLens, pageSize);
-    }
+    this.adjustCpLastPageLen(pLastPageLenH, batchSize, seqKvLens, pageSize);
     for (let i = 0; i < this.worldSize; i++) {
       const effectiveCpRank = contextParallel ? i : undefined;
       this.devices[i].mlaPrefillPlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pQoIndptrH.shards[i], pKvIndptrH.shards[i], pKvLenH.shards[i], pLastPageLenH.shards[i], batchSize, effectiveNumHeads, headDimO, causal, pageSize, seqKvLens, contextParallel, effectiveCpWorldSize, effectiveCpRank);
@@ -3442,23 +3466,29 @@ export class ParallelOps implements DeviceOps {
   // Fall-back (replicated): decode, context-parallel, multi-sequence prefill,
   // or uneven totalQ — every rank runs the full indexer. Decode is cheap;
   // multi-seq / CP need qoIndptr rebasing which is not yet implemented.
-  indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { values: Tensor, indices: Tensor } {
+  indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { values: Tensor, indices: Tensor } {
     const totalQ = idxQ.shape[0];
     using pQ = idxQ.parallelism === TensorParallelism.Replicated ? idxQ.viewClone() as ParallelTensor : this.cast(idxQ).allGather(idxQ.workspace);
-    using pKData = kData.parallelism === TensorParallelism.Replicated ? kData.viewClone() as ParallelTensor : this.cast(kData).allGather(idxQ.workspace);
+    using pKData = CP_GATHER_KDATA && kData.parallelism === TensorParallelism.Row
+      ? this.cast(kData).allGather(idxQ.workspace)
+      : this.cast(kData).viewClone() as ParallelTensor;
     const pWeights = this.cast(weights);
     const pPageIndices = this.cast(pageIndices);
     const pIndptr = this.cast(indptr);
-    const pLastPageLen = this.cast(lastPageLen);
+    const kIsRow = pKData.parallelism === TensorParallelism.Row;
+    const effectiveLastPageLen = kIsRow ? state.lastPageLen : lastPageLen;
+    const pLastPageLen = this.cast(effectiveLastPageLen);
+    const pGlobalLastPageLen = this.cast(state.globalLastPageLen);
     const pQoIndptr = this.cast(qoIndptr);
     const pCustomMask = customMask ? this.cast(customMask) : undefined;
     const pMaskIndptr = maskIndptr ? this.cast(maskIndptr) : undefined;
     const pMaskKvLen = maskKvLen ? this.cast(maskKvLen) : undefined;
 
     const W = this.worldSize;
+    const kDataReplicated = kData.parallelism === TensorParallelism.Replicated;
     using colIdxQ = this.tryNarrowToColumnParallel(pQ);
     using colWeights = this.tryNarrowToColumnParallel(pWeights);
-    const canShard = !decode && W > 1
+    const canShard = !decode && W > 1 && kDataReplicated
       && pQoIndptr.shards[0].shape[0] === 2
       && colIdxQ && colWeights
       && totalQ % W === 0;
@@ -3467,14 +3497,39 @@ export class ParallelOps implements DeviceOps {
       const topkIdxShards: Tensor[] = [];
       const topkValShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
-        const r = this.devices[i].indexerTopk(pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, topk, decode, qGlobalStart ?? 0, pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i]);
+        const r = this.devices[i].indexerTopk(state, pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, topk, decode, qGlobalStart ?? 0, pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i], kIsRow ? W : 0, kIsRow ? i : 0, pGlobalLastPageLen.shards[i]);
         topkIdxShards.push(r.indices);
         topkValShards.push(r.values);
       }
-      return {
-        indices: this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Replicated),
-        values: this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk], "BF16", TensorParallelism.Replicated),
-      };
+      if (!kIsRow) {
+        return {
+          indices: this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Replicated),
+          values: this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk], "BF16", TensorParallelism.Replicated),
+        };
+      }
+
+      if (true) {
+        // gather indices/values individually here, and then do topk merge
+        using localValues = this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk * W], "BF16", TensorParallelism.Row);
+        using localIndices = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk * W], "I32", TensorParallelism.Row);
+        using gatheredValues = localValues.allGather(idxQ.workspace);
+        using gatheredIndices = localIndices.allGather(idxQ.workspace);
+        const kTotal = topk * W;
+        const { values: mergedValues, indices: mergedIndices } = gatheredValues.topk(topk, kTotal);
+        using _mergedIndices = mergedIndices as ParallelTensor;
+        const finalIndices = gatheredIndices.gather(mergedIndices, topk, kTotal, totalQ);
+
+        // Opt-in: restore ascending-index order so this path is bit-identical to
+        // the replicated-kData build. Off by default -- see CP_TOPK_SORT.
+        if (CP_TOPK_SORT) {
+          const pFinalIndices = this.cast(finalIndices);
+          const pMergedValues = this.cast(mergedValues);
+          for (let i = 0; i < W; i++) {
+            this.devices[i].sortTopkByIndex(pFinalIndices.shards[i], pMergedValues.shards[i], totalQ, topk);
+          }
+        }
+        return { values: mergedValues, indices: finalIndices };
+      }
     }
 
     // Query-sharded path: each rank processes totalQ/W query rows.
@@ -3484,12 +3539,14 @@ export class ParallelOps implements DeviceOps {
     for (let i = 0; i < W; i++) {
       const qStart = i * localQ;
       const r = this.devices[i].indexerTopk(
+        state,
         colIdxQ!.shards[i], pKData.shards[i], colWeights!.shards[i],
         pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i],
         pQoIndptr.shards[i],
         scale, topk,
         decode, qStart,
-        pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i]
+        pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i],
+        kIsRow ? W : 0, kIsRow ? i : 0, pGlobalLastPageLen.shards[i],
       );
       topkIdxShards.push(r.indices);
       topkValShards.push(r.values);
@@ -3502,6 +3559,16 @@ export class ParallelOps implements DeviceOps {
     const topkValReplicated = topkValColumn.allGather(idxQ.workspace);
 
     return { values: topkValReplicated, indices: topkIdxReplicated };
+  }
+
+  // Sort each top-k row ascending by index, in place, on every shard. The
+  // shards hold identical Replicated copies, so sorting each one keeps them so.
+  sortTopkByIndex(indices: Tensor, values: Tensor, batch: number, topk: number): void {
+    const pIndices = this.cast(indices);
+    const pValues = this.cast(values);
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].sortTopkByIndex(pIndices.shards[i], pValues.shards[i], batch, topk);
+    }
   }
 
   // The flat/paged addressing is resolved internally from `cacheIdx` (via

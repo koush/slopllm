@@ -192,6 +192,7 @@ export class ExecutionState {
     const kData = pagedKV.kData[cacheIdx];
     const cm = (!this.isDecode && this.customMask?.mode === MaskMode.CausalCustom) ? this.customMask : undefined;
     return this.ws.glm.indexerTopk(
+      this,
       idxQ, kData, weights,
       this.indices, this.indptrD, this.globalLastPageLen, this.qoIndptrD,
       scale, topk,

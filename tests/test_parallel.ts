@@ -1864,6 +1864,62 @@ describe("ParallelTensor.topk", () => {
     refWs.free();
     refGlm.free();
   });
+
+  it("topk with k>8 uses histogram path on single GPU", () => {
+    const batch = 2;
+    const dim = 512;
+    const k = 16;
+
+    const inputF32 = new Float32Array(batch * dim);
+    for (let i = 0; i < batch * dim; i++) inputF32[i] = (i * 7919) % 1000;
+
+    const refGlm = new GlmOps(2);
+    const refWs = new WorkspaceBase(refGlm);
+    const refInput = refWs.alloc([batch, dim], "BF16");
+    refInput.h2d(f32ToBf16Bytes(inputF32));
+    refGlm.synchronize();
+
+    const { values: refValues, indices: refIndices } = refInput.topk(k, dim);
+    refGlm.synchronize();
+
+    const refValuesBuf = Buffer.alloc(batch * k * 2);
+    const refIndicesBuf = Buffer.alloc(batch * k * 4);
+    refValues.d2h(refValuesBuf);
+    refIndices.d2h(refIndicesBuf);
+    const refValuesArr = bf16BytesToF32(refValuesBuf);
+
+    const input = ws.alloc([batch, dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    input.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    const { values, indices } = input.topk(k, dim);
+    po.synchronize();
+
+    const valuesBuf = Buffer.alloc(batch * k * 2);
+    const indicesBuf = Buffer.alloc(batch * k * 4);
+    values.d2h(valuesBuf);
+    indices.d2h(indicesBuf);
+    const valuesArr = bf16BytesToF32(valuesBuf);
+
+    for (let b = 0; b < batch; b++) {
+      const refPairs: [number, number][] = [];
+      const gotPairs: [number, number][] = [];
+      for (let j = 0; j < k; j++) {
+        refPairs.push([refIndicesBuf.readInt32LE((b * k + j) * 4), refValuesArr[b * k + j]]);
+        gotPairs.push([indicesBuf.readInt32LE((b * k + j) * 4), valuesArr[b * k + j]]);
+      }
+      refPairs.sort((a, b) => b[0] - a[0]);
+      gotPairs.sort((a, b) => b[0] - a[0]);
+      for (let j = 0; j < k; j++) {
+        assert.equal(gotPairs[j][0], refPairs[j][0], `batch ${b} pos ${j} index`);
+        const relErr = Math.abs(gotPairs[j][1] - refPairs[j][1]) / Math.max(Math.abs(refPairs[j][1]), 1e-6);
+        assert.ok(relErr < 0.05, `batch ${b} pos ${j} value: ref=${refPairs[j][1]}, got=${gotPairs[j][1]}`);
+      }
+    }
+
+    refWs.free();
+    refGlm.free();
+  });
 });
 
 describe("ParallelOps.indexSelect", () => {

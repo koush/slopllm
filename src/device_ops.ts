@@ -105,7 +105,9 @@ export interface DeviceOps extends Disposable {
 
   indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void;
   // Indexer top-k scoring: returns { values: [totalQ, topk] BF16 scores, indices: [totalQ, topk] I32 positions }.
-  indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { values: Tensor, indices: Tensor };
+  indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, cpWorldSize?: number, cpRank?: number, globalLastPageLen?: Tensor): { values: Tensor, indices: Tensor };
+  // Sort each top-k row ascending by index (-1 padding last), in place.
+  sortTopkByIndex(indices: Tensor, values: Tensor, batch: number, topk: number): void;
   // Convert top-k indices to physical KV slots for layer `cacheIdx` AND for the
   // shared group that follows it. The flat/paged addressing of each is decided
   // internally from `cacheIdx` (see ParallelOps.topkSlotMode) so callers stay

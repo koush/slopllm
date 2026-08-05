@@ -385,8 +385,8 @@ static Napi::Value IndexerScore(const Napi::CallbackInfo& info) {
 
 static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 28) {
-        Napi::TypeError::New(env, "Expected 28 args").ThrowAsJavaScriptException();
+    if (info.Length() < 31) {
+        Napi::TypeError::New(env, "Expected 31 args").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -420,6 +420,9 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     uintptr_t fineHist_ptr = info[25].As<Napi::Number>().Int64Value();
     uintptr_t meta_ptr = info[26].As<Napi::Number>().Int64Value();
     int numSplits = info[27].As<Napi::Number>().Int32Value();
+    int cpWorldSize = info[28].As<Napi::Number>().Int32Value();
+    int cpRank = info[29].As<Napi::Number>().Int32Value();
+    const int32_t* global_last_page_len = reinterpret_cast<const int32_t*>((uintptr_t)info[30].As<Napi::Number>().Int64Value());
     glm_indexer_score_topk_prefill(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<int32_t*>(out_idx_ptr),
@@ -439,7 +442,7 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(coarseHist_ptr),
         reinterpret_cast<int32_t*>(fineHist_ptr),
         reinterpret_cast<int32_t*>(meta_ptr),
-        numSplits);
+        numSplits, cpWorldSize, cpRank, global_last_page_len);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("indexerScoreTopkPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -449,8 +452,8 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
 
 static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 27) {
-        Napi::TypeError::New(env, "Expected 27 args (…, outScores, causal, qGlobalStart, customMask, maskIndptr, maskKvLen, scores, rowLen, hist, meta, maxKv, numSplits)").ThrowAsJavaScriptException();
+    if (info.Length() < 30) {
+        Napi::TypeError::New(env, "Expected 30 args (…, outScores, causal, qGlobalStart, customMask, maskIndptr, maskKvLen, scores, rowLen, hist, meta, maxKv, numSplits, cpWorldSize, cpRank, globalLastPageLen)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     glm_indexer_score_topk_v2(
@@ -480,7 +483,10 @@ static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>((uintptr_t)info[23].As<Napi::Number>().Int64Value()),
         reinterpret_cast<int32_t*>((uintptr_t)info[24].As<Napi::Number>().Int64Value()),
         info[25].As<Napi::Number>().Int32Value(),
-        info[26].As<Napi::Number>().Int32Value());
+        info[26].As<Napi::Number>().Int32Value(),
+        info[27].As<Napi::Number>().Int32Value(),
+        info[28].As<Napi::Number>().Int32Value(),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[29].As<Napi::Number>().Int64Value()));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("indexerScoreTopkV2 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -875,6 +881,60 @@ static Napi::Value Topk(const Napi::CallbackInfo& info) {
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("topk failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value TopkFromScores(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, out_values, out_indices, scores, row_len, hist, meta, batch, stride, topk, num_splits[, cpWorldSize, cpRank])").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t out_vals_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t out_idxs_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t scores_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t row_len_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t hist_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t meta_ptr = info[6].As<Napi::Number>().Int64Value();
+    int batch = info[7].As<Napi::Number>().Int32Value();
+    int stride = info[8].As<Napi::Number>().Int32Value();
+    int topk = info[9].As<Napi::Number>().Int32Value();
+    int num_splits = info[10].As<Napi::Number>().Int32Value();
+    int cpWorldSize = info.Length() > 11 ? info[11].As<Napi::Number>().Int32Value() : 0;
+    int cpRank = info.Length() > 12 ? info[12].As<Napi::Number>().Int32Value() : 0;
+    glm_topk_from_scores(reinterpret_cast<GlmCtx*>(ctx_ptr),
+              reinterpret_cast<int32_t*>(out_idxs_ptr),
+              reinterpret_cast<__nv_bfloat16*>(out_vals_ptr),
+              reinterpret_cast<const void*>(scores_ptr),
+              reinterpret_cast<const int32_t*>(row_len_ptr),
+              reinterpret_cast<int32_t*>(hist_ptr),
+              reinterpret_cast<int32_t*>(meta_ptr),
+              batch, stride, topk, num_splits,
+              cpWorldSize, cpRank);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("topkFromScores failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value SortTopkByIndex(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5) {
+        Napi::TypeError::New(env, "Expected (ctx, out_idx, out_scores, batch, topk)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_sort_topk_by_index(
+        reinterpret_cast<GlmCtx*>((uintptr_t)info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<int32_t*>((uintptr_t)info[1].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<__nv_bfloat16*>((uintptr_t)info[2].As<Napi::Number>().Int64Value()),
+        info[3].As<Napi::Number>().Int32Value(),
+        info[4].As<Napi::Number>().Int32Value());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("sortTopkByIndex failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }
     return env.Undefined();
 }
@@ -3669,6 +3729,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "ropeTranspose"), Napi::Function::New(env, RopeTranspose));
     exports.Set(Napi::String::New(env, "mlaVExpand"), Napi::Function::New(env, MlaVExpand));
     exports.Set(Napi::String::New(env, "topk"), Napi::Function::New(env, Topk));
+    exports.Set(Napi::String::New(env, "topkFromScores"), Napi::Function::New(env, TopkFromScores));
+    exports.Set(Napi::String::New(env, "sortTopkByIndex"), Napi::Function::New(env, SortTopkByIndex));
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));
     exports.Set(Napi::String::New(env, "scale"), Napi::Function::New(env, Scale));
     exports.Set(Napi::String::New(env, "sumPointers"), Napi::Function::New(env, SumPointers));

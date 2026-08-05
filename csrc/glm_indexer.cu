@@ -1,6 +1,12 @@
 #include "glm_ops.h"
 #include <cuda_runtime.h>
 
+// Remap a local KV position to its global position for context-parallel
+// interleaved sharding. cpWorldSize=0 (non-CP) is a no-op identity.
+static __device__ __forceinline__ int cp_remap(int pos, int cpWorldSize, int cpRank) {
+    return cpWorldSize > 0 ? pos * cpWorldSize + cpRank : pos;
+}
+
 // ---------------------------------------------------------------------------
 // Fused indexer score kernel
 // Computes: out[qi, ki] = sum_h weights[qi,h] * ReLU(sum_d q[qi,h,d] * k[ki,d]) * scale)
@@ -301,10 +307,54 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const 
 //
 //   hist:  [batch, 32768] i32 scratch   meta: [batch, 4] i32 scratch
 //   meta layout per row: [tau_key, tie_take, out_count, tie_count]
-// Output out_idx[row, 0..K) = selected position indices (unordered), -1 padded.
+// Output out_idx[row, 0..K) = selected position indices, -1 padded.
+//
+// The selection is a pure function of the input: entries with key > tau land in
+// out[0, numAbove) in ascending position order, then the FIRST tie_take entries
+// with key == tau land in out[numAbove, K). See idx_gather_count_kernel.
 // ---------------------------------------------------------------------------
 
 #define IDX_NBUCKET 65536   // full signed bf16 range, mapped to a monotonic key
+
+// meta[0] sentinel meaning "the threshold pass already wrote the whole row"
+// (len <= topk). No bf16 key can reach it, so the gather is a no-op either way.
+#define IDX_TAU_IDENTITY 0x7FFFFFFF
+
+#define IDX_GATHER_THREADS 256
+#define IDX_GATHER_WARPS   (IDX_GATHER_THREADS / 32)
+
+// Block-wide ordered slot assignment for one tile of candidates. Every thread
+// in the block must call this with the same `base`; `take` marks the calling
+// thread's candidate. Selected threads receive consecutive slots in ascending
+// threadIdx.x order via a ballot prefix sum, so the assignment depends only on
+// the input -- never on the order warps happen to retire. `*total` receives the
+// block-wide count (uniform), which the caller adds to `base` for the next tile.
+// Requires blockDim.x == IDX_GATHER_THREADS.
+static __device__ __forceinline__ int idx_ordered_slot(
+    bool take, int base, int* __restrict__ s_warp, int* __restrict__ total)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    const unsigned vote = __ballot_sync(0xffffffffu, take);
+    if (lane == 0) s_warp[warp] = __popc(vote);
+    __syncthreads();
+
+    // Every thread scans the warp counts: prefix -> this warp's base, sum ->
+    // the block total. Cheaper than a real scan at this width.
+    int warpOff = 0, sum = 0;
+#pragma unroll
+    for (int w = 0; w < IDX_GATHER_WARPS; w++) {
+        const int c = s_warp[w];
+        if (w < warp) warpOff += c;
+        sum += c;
+    }
+
+    const int slot = take ? (base + warpOff + __popc(vote & ((1u << lane) - 1))) : -1;
+    __syncthreads();   // s_warp is reused by the next tile
+    *total = sum;
+    return slot;
+}
 
 static __device__ __forceinline__ int bf16_key(const __nv_bfloat16* p) {
     // Order-preserving float->uint key: negatives -> [0,0x7FFF] (reversed),
@@ -337,7 +387,8 @@ __global__ void idx_threshold_kernel(
     const int32_t* __restrict__ hist, int32_t* __restrict__ meta,
     int32_t* __restrict__ out_idx, __nv_bfloat16* __restrict__ out_scores,
     const int32_t* __restrict__ row_len,
-    const __nv_bfloat16* __restrict__ scores, int stride, int topk
+    const __nv_bfloat16* __restrict__ scores, int stride, int topk,
+    int cpWorldSize, int cpRank
 ) {
     const int row = blockIdx.x;
     const int len = row_len ? row_len[row] : stride;
@@ -350,12 +401,12 @@ __global__ void idx_threshold_kernel(
         const __nv_bfloat16* s = scores + (size_t)row * stride;
         for (int i = threadIdx.x; i < topk; i += blockDim.x) {
             bool valid = (i < len && bf16_key(&s[i]) > 127);
-            out_idx[(size_t)row * topk + i] = valid ? i : -1;
+            out_idx[(size_t)row * topk + i] = valid ? cp_remap(i, cpWorldSize, cpRank) : -1;
             out_scores[(size_t)row * topk + i] = valid ? s[i] : neg_inf;
         }
         if (threadIdx.x == 0) {
             int32_t* m = meta + (size_t)row * 4;
-            m[0] = 0x7FFFFFFF; m[1] = 0; m[2] = topk; m[3] = 0;
+            m[0] = IDX_TAU_IDENTITY; m[1] = 0; m[2] = topk; m[3] = 0;
         }
         return;
     }
@@ -406,39 +457,204 @@ __global__ void idx_threshold_kernel(
     }
 }
 
-__global__ void idx_gather_kernel(
+// Gather pass A: per-block candidate counts.
+//
+// Block bx owns the CONTIGUOUS chunk [lo, hi) of the row rather than a strided
+// slice, so an exclusive prefix sum over the blocks' counts gives each block the
+// output offset it needs to emit its candidates in ascending position order.
+// That is what makes the selection reproducible: a plain atomicAdd cursor
+// compacts the same set in whatever order the warps happen to retire, which
+// permutes topk_idx, which permutes the slots topk_to_slots emits, which changes
+// the order sparse MLA accumulates its candidate tiles in -- so the logits move
+// run to run. Under context parallelism it is worse than cosmetic: every rank
+// runs this selection independently over identical data, and once tau lands on a
+// real score bucket the ranks disagree about WHICH tied entries to keep. The
+// per-rank KV fan-out in gatherTopkCkv assumes they agree, so a disagreement
+// leaves a flat slot that no rank ever wrote.
+//
+// Integer counts are order-independent, so the shared-memory atomics here are
+// safe. `counts` is [batch, IDX_NBUCKET] i32 (the histogram buffer, dead by this
+// point) using 2 ints per block; num_splits is <= 256 at every call site.
+__global__ void idx_gather_count_kernel(
     const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ row_len,
-    int32_t* __restrict__ meta, int32_t* __restrict__ out_idx,
-    __nv_bfloat16* __restrict__ out_scores, int stride, int topk
+    const int32_t* __restrict__ meta, int32_t* __restrict__ counts, int stride
 ) {
     const int row = blockIdx.y;
+    const int tau = meta[(size_t)row * 4];
+    int32_t* c = counts + (size_t)row * IDX_NBUCKET + (size_t)blockIdx.x * 2;
+    if (tau == IDX_TAU_IDENTITY) {           // block-uniform
+        if (threadIdx.x == 0) { c[0] = 0; c[1] = 0; }
+        return;
+    }
+
     const int len = row_len ? row_len[row] : stride;
     const __nv_bfloat16* s = scores + (size_t)row * stride;
-    int32_t* m = meta + (size_t)row * 4;
+    const int chunk = (len + (int)gridDim.x - 1) / (int)gridDim.x;
+    const int lo = min((int)blockIdx.x * chunk, len);
+    const int hi = min(lo + chunk, len);
+
+    int nAbove = 0, nTie = 0;
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const int key = bf16_key(&s[i]);
+        nAbove += (key > tau);
+        nTie   += (key == tau);
+    }
+
+    __shared__ int sAbove, sTie;
+    if (threadIdx.x == 0) { sAbove = 0; sTie = 0; }
+    __syncthreads();
+    if (nAbove) atomicAdd(&sAbove, nAbove);
+    if (nTie)   atomicAdd(&sTie, nTie);
+    __syncthreads();
+    if (threadIdx.x == 0) { c[0] = sAbove; c[1] = sTie; }
+}
+
+// Gather pass B: emit candidates at deterministic offsets.
+//
+// Layout is exact, never sparse: the threshold pass derived numAbove from a
+// histogram of this same buffer with this same row length, so out[0, numAbove)
+// receives exactly the key > tau entries and out[numAbove, topk) exactly the
+// first tie_take entries at key == tau. (The -1/-inf prefill the threshold pass
+// wrote covers the row regardless.)
+__global__ void idx_gather_write_kernel(
+    const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ row_len,
+    const int32_t* __restrict__ meta, const int32_t* __restrict__ counts,
+    int32_t* __restrict__ out_idx, __nv_bfloat16* __restrict__ out_scores,
+    int stride, int topk, int cpWorldSize, int cpRank
+) {
+    const int row = blockIdx.y;
+    const int32_t* m = meta + (size_t)row * 4;
     const int tau = m[0];
+    if (tau == IDX_TAU_IDENTITY) return;     // block-uniform; row already written
     const int tieTake = m[1];
+    const int aboveTotal = topk - tieTake;
+
+    const int len = row_len ? row_len[row] : stride;
+    const __nv_bfloat16* s = scores + (size_t)row * stride;
     int32_t* out = out_idx + (size_t)row * topk;
     __nv_bfloat16* out_s = out_scores + (size_t)row * topk;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < len; i += gridDim.x * blockDim.x) {
-        const int key = bf16_key(&s[i]);
-        if (key > tau) {
-            int p = atomicAdd(&m[2], 1);
-            if (p < topk) { out[p] = i; out_s[p] = s[i]; }
-        } else if (key == tau) {
-            int t = atomicAdd(&m[3], 1);
-            if (t < tieTake) {
-                int p = atomicAdd(&m[2], 1);
-                if (p < topk) { out[p] = i; out_s[p] = s[i]; }
+
+    const int chunk = (len + (int)gridDim.x - 1) / (int)gridDim.x;
+    const int lo = min((int)blockIdx.x * chunk, len);
+    const int hi = min(lo + chunk, len);
+
+    // Exclusive prefix over the preceding blocks' counts -> this block's bases.
+    const int32_t* c = counts + (size_t)row * IDX_NBUCKET;
+    __shared__ int sAboveBase, sTieBase;
+    if (threadIdx.x == 0) {
+        int a = 0, t = 0;
+        for (int b = 0; b < (int)blockIdx.x; b++) { a += c[2 * b]; t += c[2 * b + 1]; }
+        sAboveBase = a; sTieBase = t;
+    }
+    __syncthreads();
+    int aboveOff = sAboveBase, tieOff = sTieBase;
+
+    __shared__ int s_warp[IDX_GATHER_WARPS];
+    // The tile loop is block-uniform (threads past hi carry take = false) so the
+    // ballot and __syncthreads() inside idx_ordered_slot see the whole block.
+    for (int base = lo; base < hi; base += blockDim.x) {
+        const int i = base + threadIdx.x;
+        const bool inRange = i < hi;
+        const int key = inRange ? bf16_key(&s[i]) : -1;   // -1 matches no tau
+        int total;
+
+        const bool isAbove = inRange && key > tau;
+        const int aSlot = idx_ordered_slot(isAbove, aboveOff, s_warp, &total);
+        if (isAbove && aSlot < aboveTotal) {
+            out[aSlot] = cp_remap(i, cpWorldSize, cpRank);
+            out_s[aSlot] = s[i];
+        }
+        aboveOff += total;
+
+        const bool isTie = inRange && key == tau;
+        const int tRank = idx_ordered_slot(isTie, tieOff, s_warp, &total);
+        if (isTie && tRank < tieTake) {
+            out[aboveTotal + tRank] = cp_remap(i, cpWorldSize, cpRank);
+            out_s[aboveTotal + tRank] = s[i];
+        }
+        tieOff += total;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sort one top-k row ascending by index, -1 padding last.
+//
+// The CP merge concatenates the per-shard top-k lists rank-major, so its output
+// is ordered by (P mod W, P div W) rather than by global position P. Whenever
+// the merge and the replicated path select the same set -- which is every
+// context up to topk, where the selection keeps everything -- the ONLY
+// difference is that order. It is not cosmetic: topk_to_slots compacts
+// preserving input order, and sparse MLA accumulates its candidate tiles in slot
+// order, so the same tokens summed in a different order move the logits in the
+// low bits and greedy decoding diverges within a few tokens.
+//
+// One block per row, bitonic sort in shared memory. The row is padded up to a
+// power of two with INT_MAX (which also parks the -1 padding at the end), so a
+// non-power-of-two topk works too.
+// ---------------------------------------------------------------------------
+#define IDX_SORT_SENTINEL 0x7FFFFFFF
+
+__global__ void idx_sort_by_index_kernel(
+    int32_t* __restrict__ out_idx, __nv_bfloat16* __restrict__ out_scores,
+    int topk, int n2)
+{
+    extern __shared__ char smem_sort[];
+    int32_t* sk = reinterpret_cast<int32_t*>(smem_sort);
+    __nv_bfloat16* sv = reinterpret_cast<__nv_bfloat16*>(sk + n2);
+
+    const int row = blockIdx.x;
+    int32_t* gi = out_idx + (size_t)row * topk;
+    __nv_bfloat16* gv = out_scores + (size_t)row * topk;
+    const __nv_bfloat16 neg_inf = __float2bfloat16(-INFINITY);
+
+    for (int i = threadIdx.x; i < n2; i += blockDim.x) {
+        const bool inRow = i < topk;
+        const int32_t v = inRow ? gi[i] : -1;
+        sk[i] = (v < 0) ? IDX_SORT_SENTINEL : v;
+        sv[i] = inRow ? gv[i] : neg_inf;
+    }
+    __syncthreads();
+
+    // Each pair is touched by exactly one thread (the one holding the lower
+    // index), so the strided loop needs no extra guarding inside a pass.
+    for (int k = 2; k <= n2; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = threadIdx.x; i < n2; i += blockDim.x) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    const bool asc = ((i & k) == 0);
+                    if ((sk[i] > sk[ixj]) == asc) {
+                        int32_t tk = sk[i]; sk[i] = sk[ixj]; sk[ixj] = tk;
+                        __nv_bfloat16 tv = sv[i]; sv[i] = sv[ixj]; sv[ixj] = tv;
+                    }
+                }
             }
+            __syncthreads();
         }
     }
+
+    for (int i = threadIdx.x; i < topk; i += blockDim.x) {
+        gi[i] = (sk[i] == IDX_SORT_SENTINEL) ? -1 : sk[i];
+        gv[i] = sv[i];
+    }
+}
+
+void glm_sort_topk_by_index(GlmCtx* ctx, int32_t* out_idx, __nv_bfloat16* out_scores,
+                            int batch, int topk) {
+    cudaSetDevice(ctx->device_id);
+    int n2 = 1;
+    while (n2 < topk) n2 <<= 1;
+    size_t smem = (size_t)n2 * (sizeof(int32_t) + sizeof(__nv_bfloat16));
+    idx_sort_by_index_kernel<<<batch, 256, smem, GLM_STREAM(ctx)>>>(
+        out_idx, out_scores, topk, n2);
 }
 
 void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     __nv_bfloat16* out_scores,
     const void* scores, const int32_t* row_len,
     int32_t* hist, int32_t* meta,
-    int batch, int stride, int topk, int num_splits) {
+    int batch, int stride, int topk, int num_splits,
+    int cpWorldSize, int cpRank) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     cudaMemsetAsync(hist, 0, (size_t)batch * IDX_NBUCKET * sizeof(int32_t), stream);
@@ -446,9 +662,15 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     dim3 grid(num_splits, batch);
     idx_hist_kernel<<<grid, 256, 0, stream>>>(
         (const __nv_bfloat16*)scores, row_len, hist, stride);
-    idx_threshold_kernel<<<batch, 256, 0, stream>>>(hist, meta, out_idx, out_scores, row_len, (const __nv_bfloat16*)scores, stride, topk);
-    idx_gather_kernel<<<grid, 256, 0, stream>>>(
-        (const __nv_bfloat16*)scores, row_len, meta, out_idx, out_scores, stride, topk);
+    idx_threshold_kernel<<<batch, 256, 0, stream>>>(hist, meta, out_idx, out_scores, row_len, (const __nv_bfloat16*)scores, stride, topk, cpWorldSize, cpRank);
+    // hist is dead once the threshold pass has read it, so the two-pass gather
+    // borrows it for its per-block counts (2 ints per block) instead of taking
+    // another caller-owned scratch buffer through the API.
+    idx_gather_count_kernel<<<grid, IDX_GATHER_THREADS, 0, stream>>>(
+        (const __nv_bfloat16*)scores, row_len, meta, hist, stride);
+    idx_gather_write_kernel<<<grid, IDX_GATHER_THREADS, 0, stream>>>(
+        (const __nv_bfloat16*)scores, row_len, meta, hist, out_idx, out_scores,
+        stride, topk, cpWorldSize, cpRank);
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +683,14 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
 
 // Shared device helper: check if a KV position is masked out. Defined here so
 // both the v2 score kernel below and the two-level prefill kernels can use it.
+//
+// `pos` must be a GLOBAL sequence position and `mask_prefix_len` must be derived
+// from the GLOBAL kv length. The mask bitmap is built over global KV columns --
+// row q, column (P - prefix) for global position P (see buildChunkedMTPMask in
+// mtp.ts, which lays out bit q*maskKvLen + c). Under context parallelism a shard
+// holds every cpWorldSize-th token, so passing a shard-local position here reads
+// an unrelated column: the tree mask then gates the wrong tokens entirely,
+// leaving the draft positions it exists to separate completely unmasked.
 static __device__ __forceinline__ bool idx_is_masked(
     int pos, int qLocalPos,
     const uint8_t* mask_ptr, int mask_kv_len_val, int mask_prefix_len)
@@ -469,6 +699,44 @@ static __device__ __forceinline__ bool idx_is_masked(
     if (pos < mask_prefix_len) return false;
     int mask_offset = qLocalPos * mask_kv_len_val + (pos - mask_prefix_len);
     return !((mask_ptr[mask_offset >> 3] >> (mask_offset & 7)) & 1);
+}
+
+// Inclusive causal limit for one query row, in THIS SHARD's local KV positions.
+//
+// The causal bound is a statement about global sequence positions -- query at
+// global position P may see global KV [0, P] -- so under context parallelism it
+// has to be evaluated in global coordinates and only then mapped back. Local
+// position p holds global position p*cpWorldSize + cpRank, so the last local
+// position at or below a global limit G is floor((G - cpRank) / cpWorldSize).
+//
+// Every consumer of the causal bound must come through here. Deriving any one of
+// them from the LOCAL kvLen instead (prefixLen = kvLen - numQueries) silently
+// disagrees with the others: rowLen advertises positions as valid that the score
+// pass never writes, and the top-k then selects whatever stale bf16 the recycled
+// `scores` buffer happened to hold at those slots.
+//
+// qSeqPos is the query's position within its sequence, already shifted by
+// qGlobalStart for the query-sharded path. cpWorldSize <= 1 means non-CP, where
+// kvLen == globalKvLen and this reduces to the original arithmetic exactly.
+static __device__ __forceinline__ int idx_local_causal_limit(
+    int qSeqPos, int numQueries, int causal,
+    int kvLen, int globalKvLen, int cpWorldSize, int cpRank)
+{
+    if (cpWorldSize <= 1) {
+        const int prefixLen = max(0, kvLen - numQueries);
+        return causal ? (prefixLen + qSeqPos) : (kvLen - 1);
+    }
+    const int globalPrefix = max(0, globalKvLen - numQueries);
+    const int globalLimit  = causal ? (globalPrefix + qSeqPos) : (globalKvLen - 1);
+    // FLOOR division, not C's truncation-toward-zero. globalLimit < cpRank means
+    // this rank owns nothing at or below the limit (its first token is global
+    // position cpRank), so the answer is -1 -> numValid 0. Truncation returns 0
+    // instead, which hands every rank its local position 0 and makes query q see
+    // global positions 0..W-1 rather than just 0. That hits the first W-1 query
+    // rows of every sequence, so a short prompt diverges from the replicated
+    // path on its very first prefill.
+    if (globalLimit < cpRank) return -1;
+    return min((globalLimit - cpRank) / cpWorldSize, kvLen - 1);
 }
 
 // HAS_MASK is a compile-time switch: the whole custom-mask path (extra args,
@@ -488,7 +756,9 @@ __global__ void idx_score_kernel(
     float scale, int idxNHeads, int idxHeadDim, int pageSize, int maxKv, int causal,
     int qGlobalStart,
     const uint8_t* __restrict__ custom_mask,
-    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len
+    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len,
+    int cpWorldSize, int cpRank,
+    const int32_t* __restrict__ globalLastPageLen
 ) {
     const int qIdx = blockIdx.y;
     int seq = 0;
@@ -498,11 +768,17 @@ __global__ void idx_score_kernel(
     const int pageStart = pageIndptr[seq];
     const int numPages = pageIndptr[seq + 1] - pageStart;
     const int kvLen = numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0;
+    // Under CP this shard holds every cpWorldSize-th token, so the causal bound
+    // must be taken in global coordinates and mapped back (see the helper).
+    const int cpW = (cpWorldSize > 1 && globalLastPageLen) ? cpWorldSize : 1;
+    const int globalKvLen = (cpW > 1)
+        ? (numPages > 0 ? (numPages - 1) * (pageSize * cpW) + globalLastPageLen[seq] : 0)
+        : kvLen;
     // qGlobalStart shifts a shard's local query row to its true sequence position
     // (0 outside query-sharding) so the causal limit and mask row stay correct.
-    const int prefixLen = max(0, kvLen - numQueries) + qGlobalStart;
-    const int causalLimit = causal ? (prefixLen + qLocalPos) : (kvLen - 1);
-    const int numValid = causalLimit + 1;
+    const int qSeqPos = qLocalPos + qGlobalStart;
+    const int numValid = idx_local_causal_limit(
+        qSeqPos, numQueries, causal, kvLen, globalKvLen, cpW, cpRank) + 1;
 
     if (blockIdx.x == 0 && threadIdx.x == 0) row_len[qIdx] = numValid;
 
@@ -512,9 +788,13 @@ __global__ void idx_score_kernel(
     if constexpr (HAS_MASK) {
         mask_ptr = custom_mask + mask_indptr[seq];
         mask_kv_len_val = mask_kv_len ? mask_kv_len[seq] : numQueries;
-        mask_prefix_len = max(0, kvLen - mask_kv_len_val);
+        // Global coordinates: the mask window is the last mask_kv_len_val tokens
+        // of the FULL sequence, not of this shard. Identical to kvLen off CP.
+        mask_prefix_len = max(0, globalKvLen - mask_kv_len_val);
     }
-    const int maskRow = qLocalPos + qGlobalStart;
+    // Local pos -> global pos for the mask lookup (identity when cpMaskW == 0).
+    const int cpMaskW = (cpW > 1) ? cpW : 0;
+    const int maskRow = qSeqPos;
 
     extern __shared__ char smem[];
     __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -531,7 +811,8 @@ __global__ void idx_score_kernel(
     for (int pos = blockIdx.x * warpsPerBlock + warp; pos < numValid;
          pos += gridDim.x * warpsPerBlock) {
         if constexpr (HAS_MASK) {
-            if (idx_is_masked(pos, maskRow, mask_ptr, mask_kv_len_val, mask_prefix_len)) {
+            if (idx_is_masked(cp_remap(pos, cpMaskW, cpRank), maskRow,
+                              mask_ptr, mask_kv_len_val, mask_prefix_len)) {
                 if (lane == 0)
                     scores[(size_t)qIdx * maxKv + pos] = __float2bfloat16(-INFINITY);
                 continue;
@@ -568,7 +849,8 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     int pageSize, int topk, int causal, int qGlobalStart,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int32_t* hist, int32_t* meta,
-    int maxKv, int num_splits) {
+    int maxKv, int num_splits, int cpWorldSize, int cpRank,
+    const int32_t* globalLastPageLen) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     dim3 grid(num_splits, totalQ);
@@ -582,9 +864,10 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
         (__nv_bfloat16*)scores, rowLen, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
         (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
         scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal,
-        qGlobalStart, custom_mask, mask_indptr, mask_kv_len);
+        qGlobalStart, custom_mask, mask_indptr, mask_kv_len,
+        cpWorldSize, cpRank, globalLastPageLen);
     glm_topk_from_scores(ctx, out_idx, out_scores, scores, rowLen, hist, meta,
-                         totalQ, maxKv, topk, num_splits);
+                         totalQ, maxKv, topk, num_splits, cpWorldSize, cpRank);
 }
 
 // ---------------------------------------------------------------------------
@@ -708,7 +991,9 @@ idx_prefill_score_mma_kernel(
     int totalQ, float scale, int idxNHeads, int idxHeadDim, int pageSize,
     int maxKv, int causal, int qGlobalStart,
     const uint8_t* __restrict__ custom_mask,
-    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len)
+    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len,
+    int cpWorldSize, int cpRank,
+    const int32_t* __restrict__ globalLastPageLen)
 {
     using namespace idxmma;
 
@@ -740,30 +1025,50 @@ idx_prefill_score_mma_kernel(
     const int pageStart = pageIndptr[seq];
     const int numPages  = pageIndptr[seq + 1] - pageStart;
     const int kvLen     = numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0;
-    // qGlobalStart shifts a shard's local query row to its true sequence position
-    // for causal limits (0 in the non-sharded path → identical to before).
-    const int prefixLen = max(0, kvLen - numQueries) + qGlobalStart;
+    // Under CP this shard holds every cpWorldSize-th token, so the causal bound
+    // must be taken in global coordinates and mapped back (see the helper).
+    const int cpW = (cpWorldSize > 1 && globalLastPageLen) ? cpWorldSize : 1;
+    const int globalKvLen = (cpW > 1)
+        ? (numPages > 0 ? (numPages - 1) * (pageSize * cpW) + globalLastPageLen[seq] : 0)
+        : kvLen;
     const int tileStart = blockIdx.x * TN;
     if (tileStart >= kvLen) return;
+
+    // Per-query causal limits, computed once and shared by all three consumers:
+    // the tile prune below, rowLen, and the per-element epilogue check. Keeping
+    // them on one value is the point -- when the epilogue used its own
+    // local-kvLen formula it stopped short of what rowLen advertised, so the
+    // top-k scanned score slots the MMA pass never wrote.
+    // qGlobalStart shifts a shard's local query row to its true sequence position
+    // for causal limits (0 in the non-sharded path → identical to before).
+    __shared__ int s_causalLimit[TM];
+    for (int ql = threadIdx.x; ql < m_valid; ql += CTA) {
+        s_causalLimit[ql] = idx_local_causal_limit(
+            (qStart + ql) - qoStart + qGlobalStart, numQueries, causal,
+            kvLen, globalKvLen, cpW, cpRank);
+    }
+    __syncthreads();
+
     // Causal prune: skip the whole tile if it sits past the last query's limit.
-    const int maxQGlobal = qStart + m_valid - 1;
-    const int maxCausal  = causal ? (prefixLen + (maxQGlobal - qoStart)) : (kvLen - 1);
-    if (tileStart > maxCausal) return;
+    // The limit is nondecreasing in query position, so the last row bounds them all.
+    if (tileStart > s_causalLimit[m_valid - 1]) return;   // block-uniform
 
     const uint8_t* mask_ptr = nullptr;
     int mask_kv_len_val = 0, mask_prefix_len = 0;
     if (custom_mask && mask_indptr) {
         mask_ptr = custom_mask + mask_indptr[seq];
         mask_kv_len_val = mask_kv_len ? mask_kv_len[seq] : numQueries;
-        mask_prefix_len = max(0, kvLen - mask_kv_len_val);
+        // Global coordinates: the mask window is the last mask_kv_len_val tokens
+        // of the FULL sequence, not of this shard. Identical to kvLen off CP.
+        mask_prefix_len = max(0, globalKvLen - mask_kv_len_val);
     }
+    // Local pos -> global pos for the mask lookup (identity when cpMaskW == 0).
+    const int cpMaskW = (cpW > 1) ? cpW : 0;
 
     // rowLen (= numValid per query) written once, by the first KV tile.
     if (blockIdx.x == 0) {
-        for (int ql = threadIdx.x; ql < m_valid; ql += CTA) {
-            int qg = qStart + ql;
-            rowLen[qg] = (causal ? (prefixLen + (qg - qoStart)) : (kvLen - 1)) + 1;
-        }
+        for (int ql = threadIdx.x; ql < m_valid; ql += CTA)
+            rowLen[qStart + ql] = s_causalLimit[ql] + 1;
     }
 
     const int strideA = idxHeadDim + PAD_A;   // padded Q row stride
@@ -880,10 +1185,12 @@ idx_prefill_score_mma_kernel(
         int gpos = tileStart + pos_in_tile;
         if (gpos >= kvLen) return;
         int qg = qStart + ql;
-        int cl = causal ? (prefixLen + (qg - qoStart)) : (kvLen - 1);
-        if (gpos > cl) return;
+        // Same limit rowLen was written from -- see s_causalLimit above.
+        if (gpos > s_causalLimit[ql]) return;
         __nv_bfloat16 out =
-            (mask_ptr && idx_is_masked(gpos, qg - qoStart + qGlobalStart, mask_ptr, mask_kv_len_val, mask_prefix_len))
+            (mask_ptr && idx_is_masked(cp_remap(gpos, cpMaskW, cpRank),
+                                       qg - qoStart + qGlobalStart,
+                                       mask_ptr, mask_kv_len_val, mask_prefix_len))
                 ? __float2bfloat16(-INFINITY)
                 : __float2bfloat16(val);
         scores[(size_t)qg * maxKv + gpos] = out;
@@ -939,7 +1246,8 @@ __global__ void idx_prefill_coarse_hist_buf_kernel(
 __global__ void idx_prefill_coarse_threshold_kernel(
     const int32_t* __restrict__ coarseHist, int32_t* __restrict__ meta,
     int32_t* __restrict__ out_idx, __nv_bfloat16* __restrict__ out_scores, int topk,
-    const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ rowLen, int maxKv)
+    const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ rowLen, int maxKv,
+    int cpWorldSize, int cpRank)
 {
     const int row = blockIdx.x;
     const int32_t* h = coarseHist + (size_t)row * IDX_COARSE_BUCKETS;
@@ -980,7 +1288,7 @@ __global__ void idx_prefill_coarse_threshold_kernel(
         const int len = rowLen ? rowLen[row] : maxKv;
         for (int i = threadIdx.x; i < topk; i += blockDim.x) {
             bool valid = (i < len && *reinterpret_cast<const unsigned short*>(&s[i]) != 0xFF80);
-            out_idx[(size_t)row * topk + i] = valid ? i : -1;
+            out_idx[(size_t)row * topk + i] = valid ? cp_remap(i, cpWorldSize, cpRank) : -1;
             out_scores[(size_t)row * topk + i] = valid ? s[i] : neg_inf;
         }
         if (t == 0) {
@@ -1096,9 +1404,18 @@ __global__ void idx_prefill_fine_threshold_kernel(
 
 // ---------------------------------------------------------------------------
 // Pass 6: Gather from score buffer
-// Grid: totalQ  Block: 256.  One block per row: compaction counters live in
-// shared memory (no cross-block global-atomic contention). Writes positions with
-// key > tau; for key == tau, takes up to tie_take. Identity (tau<0) takes all.
+// Grid: totalQ  Block: 256.  One block per row, so the ordered compaction needs
+// no cross-block prefix: running offsets live in registers across tiles. Writes
+// positions with key > tau into out[0, numAbove) and the FIRST tie_take entries
+// at key == tau into out[numAbove, topk), both in ascending position order, so
+// the result is a pure function of the scores (see idx_gather_count_kernel for
+// why that matters). Identity (tau<0) was already written by the threshold pass.
+//
+// Slots the selection does not reach keep the -1 / -inf prefill that
+// idx_prefill_coarse_threshold_kernel writes over the whole row before the fine
+// passes run. The sparse-MLA kernel clamps negative indices to page 0 at load
+// and masks them out in QK, so -1 is the required sentinel; without the prefill
+// the tail would hold stale indices and the KV gather would read out of bounds.
 // ---------------------------------------------------------------------------
 __global__ void idx_prefill_gather_buf_kernel(
     int32_t* __restrict__ out_idx,           // [totalQ, topk]
@@ -1106,46 +1423,45 @@ __global__ void idx_prefill_gather_buf_kernel(
     const int32_t* __restrict__ meta,        // [totalQ, 4]
     const __nv_bfloat16* __restrict__ scores,// [totalQ, maxKv]
     const int32_t* __restrict__ rowLen,      // [totalQ]
-    int maxKv, int topk)
+    int maxKv, int topk, int cpWorldSize, int cpRank)
 {
     const int row = blockIdx.x;
     const int32_t* m = meta + (size_t)row * 4;
     const int tau = m[0];
+    if (tau < 0) return;   // block-uniform; threshold kernel already wrote the row
     const int tieTake = m[1];
+    const int aboveTotal = topk - tieTake;
+
     const int len = rowLen ? rowLen[row] : maxKv;
     const __nv_bfloat16* s = scores + (size_t)row * maxKv;
     int32_t* out = out_idx + (size_t)row * topk;
     __nv_bfloat16* out_s = out_scores + (size_t)row * topk;
 
-    __shared__ int s_count, s_tie;
-    if (threadIdx.x == 0) { s_count = 0; s_tie = 0; }
-    __syncthreads();
+    __shared__ int s_warp[IDX_GATHER_WARPS];
+    int aboveOff = 0, tieOff = 0;
+    // The tile loop is block-uniform (threads past len carry take = false) so the
+    // ballot and __syncthreads() inside idx_ordered_slot see the whole block.
+    for (int base = 0; base < len; base += blockDim.x) {
+        const int i = base + threadIdx.x;
+        const bool inRange = i < len;
+        const int key = inRange ? bf16_key(&s[i]) : -1;   // -1 matches no tau
+        int total;
 
-    for (int i = threadIdx.x; i < len; i += blockDim.x) {
-        if (tau < 0) continue;  // identity case already handled by threshold kernel
-        int key = bf16_key(&s[i]);
-        if (key > tau) {
-            int p = atomicAdd(&s_count, 1);
-            if (p < topk) { out[p] = i; out_s[p] = s[i]; }
-        } else if (key == tau) {
-            int t = atomicAdd(&s_tie, 1);
-            if (t < tieTake) {
-                int p = atomicAdd(&s_count, 1);
-                if (p < topk) { out[p] = i; out_s[p] = s[i]; }
-            }
+        const bool isAbove = inRange && key > tau;
+        const int aSlot = idx_ordered_slot(isAbove, aboveOff, s_warp, &total);
+        if (isAbove && aSlot < aboveTotal) {
+            out[aSlot] = cp_remap(i, cpWorldSize, cpRank);
+            out_s[aSlot] = s[i];
         }
-    }
-    if (tau < 0) return;  // threshold kernel already wrote everything
-    // Fill unused slots with -1 / -inf. Rows shorter than topk (causal prefix) and any
-    // threshold undershoot from bf16 ties leave a tail; the sparse-MLA kernel
-    // clamps negative indices to page 0 at load and masks them out in QK, so -1
-    // is the required sentinel. Without this the tail holds stale indices from a
-    // prior chunk and the sparse-MLA KV gather reads out of bounds.
-    __syncthreads();
-    const __nv_bfloat16 neg_inf = __float2bfloat16(-INFINITY);
-    for (int i = min(s_count, topk) + threadIdx.x; i < topk; i += blockDim.x) {
-        out[i] = -1;
-        out_s[i] = neg_inf;
+        aboveOff += total;
+
+        const bool isTie = inRange && key == tau;
+        const int tRank = idx_ordered_slot(isTie, tieOff, s_warp, &total);
+        if (isTie && tRank < tieTake) {
+            out[aboveTotal + tRank] = cp_remap(i, cpWorldSize, cpRank);
+            out_s[aboveTotal + tRank] = s[i];
+        }
+        tieOff += total;
     }
 }
 
@@ -1160,7 +1476,8 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int maxKv,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
-    int numSplits) {
+    int numSplits, int cpWorldSize, int cpRank,
+    const int32_t* globalLastPageLen) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
 
@@ -1189,7 +1506,8 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
             (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
             (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
             totalQ, scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal,
-            qGlobalStart, custom_mask, mask_indptr, mask_kv_len);
+            qGlobalStart, custom_mask, mask_indptr, mask_kv_len,
+            cpWorldSize, cpRank, globalLastPageLen);
     }
 
     // Passes 2-6: histogram + gather from buffer.
@@ -1200,7 +1518,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 
         // Pass 3: coarse threshold (1 block per query)
         idx_prefill_coarse_threshold_kernel<<<totalQ, 256, 0, stream>>>(
-            coarseHist, meta, out_idx, out_scores, topk, (const __nv_bfloat16*)scores, rowLen, maxKv);
+            coarseHist, meta, out_idx, out_scores, topk, (const __nv_bfloat16*)scores, rowLen, maxKv, cpWorldSize, cpRank);
 
         // Pass 4: fine histogram — one block per row
         idx_prefill_fine_hist_buf_kernel<<<totalQ, 256, 0, stream>>>(
@@ -1212,6 +1530,6 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 
         // Pass 6: gather from buffer — one block per row
         idx_prefill_gather_buf_kernel<<<totalQ, 256, 0, stream>>>(
-            out_idx, out_scores, meta, (const __nv_bfloat16*)scores, rowLen, maxKv, topk);
+            out_idx, out_scores, meta, (const __nv_bfloat16*)scores, rowLen, maxKv, topk, cpWorldSize, cpRank);
     }
 }

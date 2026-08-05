@@ -130,14 +130,15 @@ export abstract class Tensor implements Disposable {
     this.pinnedBuffer = undefined;
   }
 
-  reshape(newShape: number[]): Tensor {
-    const current = this.numElements;
-    const target = numElements(newShape);
-    if (current !== target) {
-      throw new Error(`reshape: cannot reshape [${this.shape}] (${current} elements) to [${newShape}] (${target} elements)`);
+  reshape(newShape: number[], newType?: string): Tensor {
+    const outType = newType ?? this.type;
+    const currentBytes = Math.ceil(this.numElements * SafeTensorFile.dtypeBytes(this.type));
+    const targetBytes = Math.ceil(numElements(newShape) * SafeTensorFile.dtypeBytes(outType));
+    if (currentBytes !== targetBytes) {
+      throw new Error(`reshape: cannot reshape [${this.shape}] (${this.type}, ${currentBytes} bytes) to [${newShape}] (${outType}, ${targetBytes} bytes)`);
     }
 
-    const reshaped = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, newShape, this.type, this.pinned, this);
+    const reshaped = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, newShape, outType, this.pinned, this);
     return reshaped;
   }
 

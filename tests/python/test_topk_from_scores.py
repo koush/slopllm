@@ -15,18 +15,24 @@ NBUCKET = 65536
 
 
 def _select(glm, scores_bf16, N_per_row, topk, num_splits):
+    out, _ = _select_with_scores(glm, scores_bf16, N_per_row, topk, num_splits)
+    return out
+
+
+def _select_with_scores(glm, scores_bf16, N_per_row, topk, num_splits):
     batch, stride = scores_bf16.shape
     dev = scores_bf16.device
     out = torch.full((batch, topk), -2, dtype=torch.int32, device=dev)
+    out_scores = torch.full((batch, topk), float('nan'), dtype=torch.bfloat16, device=dev)
     hist = torch.empty(batch, NBUCKET, dtype=torch.int32, device=dev)
     meta = torch.empty(batch, 4, dtype=torch.int32, device=dev)
     row_len = None
     if N_per_row is not None:
         row_len = torch.tensor(N_per_row, dtype=torch.int32, device=dev)
-    glm.topk_from_scores(out, scores_bf16, row_len, hist, meta,
+    glm.topk_from_scores(out, out_scores, scores_bf16, row_len, hist, meta,
                          batch, stride, topk, num_splits)
     glm.synchronize()
-    return out
+    return out, out_scores
 
 
 def _check_exact_topk(sel, scores_row, N, topk):
@@ -60,6 +66,49 @@ def test_topk_from_scores_exact(glm, device, N, batch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("N,num_splits", [
+    (16384, 1),      # the CP merge shape: topk*worldSize candidates, single split
+    (65536, 16),     # multi-block, so the per-block prefix has to line up
+    (200000, 256),
+])
+def test_topk_from_scores_deterministic(glm, device, N, num_splits):
+    """Repeated selection over identical scores must be bit-identical.
+
+    The selection feeds topk_to_slots, which compacts in input order, which sets
+    the order sparse MLA accumulates candidate tiles in -- so any permutation
+    here moves the logits. Under CP every rank runs this over identical data and
+    the ranks must agree on the tie subset, or gatherTopkCkv leaves flat slots
+    that no rank wrote. Ties at the threshold are the interesting part, so use a
+    small value range (heavy bf16 tie bucket) plus a -inf pad block like the CP
+    merge produces.
+    """
+    topk, batch = 2048, 3
+    torch.manual_seed(N)
+    scores = (torch.randint(0, 24, (batch, N), device=device).float() / 8).to(torch.bfloat16)
+    scores[:, : N // 2] = float('-inf')   # pad block, as the per-rank merge emits
+
+    ref_idx, ref_val = _select_with_scores(glm, scores, None, topk, num_splits)
+    ref_idx, ref_val = ref_idx.clone(), ref_val.clone()
+    for it in range(8):
+        idx, val = _select_with_scores(glm, scores, None, topk, num_splits)
+        assert torch.equal(idx, ref_idx), f"iteration {it}: indices differ from first run"
+        assert torch.equal(val.view(torch.int16), ref_val.view(torch.int16)), \
+            f"iteration {it}: scores differ from first run"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_topk_from_scores_pairs_scores_with_indices(glm, device):
+    """out_scores[j] must be the score at out_idx[j] (the merge relies on it)."""
+    N, topk, batch, num_splits = 65536, 2048, 2, 16
+    torch.manual_seed(7)
+    scores = torch.rand(batch, N, device=device).relu().to(torch.bfloat16)
+    idx, val = _select_with_scores(glm, scores, None, topk, num_splits)
+    for b in range(batch):
+        expect = scores[b][idx[b].long()]
+        assert torch.equal(val[b].view(torch.int16), expect.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_topk_from_scores_perf(glm, device):
     """Throughput at 200k context, batch 1 (the decode-critical case)."""
     N, topk, batch = 200000, 2048, 1
@@ -67,10 +116,12 @@ def test_topk_from_scores_perf(glm, device):
     scores = torch.rand(batch, N, device=device).relu().to(torch.bfloat16)
     num_splits = 256
     out = torch.full((batch, topk), -2, dtype=torch.int32, device=device)
+    out_scores = torch.empty(batch, topk, dtype=torch.bfloat16, device=device)
     hist = torch.empty(batch, NBUCKET, dtype=torch.int32, device=device)
     meta = torch.empty(batch, 4, dtype=torch.int32, device=device)
     def call():
-        glm.topk_from_scores(out, scores, None, hist, meta, batch, N, topk, num_splits)
+        glm.topk_from_scores(out, out_scores, scores, None, hist, meta,
+                             batch, N, topk, num_splits)
     for _ in range(3):
         call()
     glm.synchronize()
