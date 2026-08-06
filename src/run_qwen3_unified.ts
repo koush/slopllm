@@ -220,7 +220,9 @@ export function* generateStream(
       gpuSampleResult.memcpy(argmax, argmax.bytes, MemcpyKind.DeviceToDevice);
     }
     else {
-      using sampled = samplingWorkspace!.sample(logits);
+      // Borrowed, not owned: sample() returns the SamplingWorkspace's
+      // persistent outToken, which must survive for the next decode step.
+      const sampled = samplingWorkspace!.sample(logits);
       gpuSampleResult = sampleWorkspace.ensureAlloc(sampled.shape, sampled.type, "gpuSampleResult");
       gpuSampleResult.memcpy(sampled, sampled.bytes, MemcpyKind.DeviceToDevice);
     }
@@ -696,8 +698,15 @@ async function main(): Promise<void> {
   const cache = model.createChatCache(args.maxPages, args.maxBatch, args.maxSeqLen);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
 
-  const tokenizerDir = args.modelDir && fs.existsSync(path.join(args.modelDir, "tokenizer_config.json"))
-    ? args.modelDir : resolveModelPath(repoId);
+  // Prefer the *resolved* model directory, not just an explicit --model-dir.
+  // The served checkpoint ships its own chat_template.jinja, and for GLM-5.x
+  // that template emits a "<|system|>Reasoning Effort: ..." prompt that governs
+  // how long the model thinks before closing </think>. Falling back to the
+  // tokenizer repo's older template drops that system prompt entirely, which
+  // leaves the model off-distribution: it either stubs out after a few hundred
+  // tokens or never closes the thinking block at all.
+  const tokenizerDir = fs.existsSync(path.join(modelDir, "tokenizer_config.json"))
+    ? modelDir : resolveModelPath(repoId);
   const tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
   const chatTemplatePath = path.join(tokenizerDir, "chat_template.jinja");
   const chatTemplate = fs.existsSync(chatTemplatePath) ? fs.readFileSync(chatTemplatePath, "utf-8") : undefined;
@@ -739,7 +748,12 @@ async function main(): Promise<void> {
   cleanup();
 }
 
-main().catch((err) => {
-  console.error("Failed:", err);
-  process.exit(1);
-});
+// Only run as a CLI. This module also exports generateStream, and without the
+// guard any `import { generateStream } from "./run_qwen3_unified"` would load a
+// whole second model as a side effect of the import.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Failed:", err);
+    process.exit(1);
+  });
+}

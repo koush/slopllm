@@ -83,18 +83,10 @@ export class ParallelTensor extends Tensor {
   }
 
   private static elemBytes(type: string): number {
-    switch (type) {
-      case "BF16": return 2;
-      case "I32": return 4;
-      case "I64": return 8;
-      case "F32": return 4;
-      case "U8": return 1;
-      case "F8_E5M2": return 1;
-      case "F8_E4M3": return 1;
-      default:
-        console.warn(`Unknown type ${type}, assuming 1 byte per element`);
-        return 1;
-    }
+    // Single source of truth, shared with Tensor.bytes/byteCount. A local
+    // switch here silently under-counted types it hadn't heard of (e.g. U32),
+    // which would corrupt the sharded h2d/d2h byte math.
+    return SafeTensorFile.dtypeBytes(type);
   }
 
   private static shapeElems(shape: number[]): number {
@@ -229,6 +221,7 @@ export class ParallelTensor extends Tensor {
    * too large for the P2P group, in which case the caller should NCCL.
    */
   private tryP2PAllReduce(): boolean {
+    if (process.env.GLM_P2P_ALLREDUCE === "0") return false;
     if (!this.parallelOps.p2pEnabled)
       return false;
     if (this.type !== "BF16" && this.type !== "F32")
@@ -2006,6 +1999,11 @@ export class ParallelTensor extends Tensor {
     const pTopPs = this.cast(topPs);
     const pStepCounter = this.cast(stepCounter);
     this.assertParallel("sampleBatch logits", pLogits, TensorParallelism.Replicated);
+    // A disposed ParallelTensor has an empty shards array, which would fault
+    // deep inside the per-shard call with an unattributable "reading 'data'".
+    if (pOut.shards.length !== this.worldSize) {
+      throw new Error(`sampleBatch: outTokens has ${pOut.shards.length} shards, expected ${this.worldSize} (disposed by a borrower?)`);
+    }
     for (let i = 0; i < this.worldSize; i++) {
       pLogits.shards[i].sampleBatch(pOut.shards[i], pTopkVals.shards[i], pTopkIdxs.shards[i], pWorkspace.shards[i], pLogits.shards[i], pPenaltyTokens.shards[i], pPenaltyCount.shards[i], maxWindow, vocabSize, batchSize, pTemps.shards[i], pRepPen.shards[i], pPresPen.shards[i], pTopKs.shards[i], pTopPs.shards[i], pStepCounter.shards[i], maxEffectiveK);
     }
