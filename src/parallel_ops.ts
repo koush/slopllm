@@ -2219,7 +2219,7 @@ export class ParallelOps implements DeviceOps {
     workspace: WorkspaceBase,
   ): ParallelTensor {
     const count = partialVOuts.shards[0].shape.reduce((a, b) => a * b, 1);
-    if (this.p2pEnabled && count <= 65536 * 2) {
+    if (this.p2pEnabled && count <= 65536 * 4) {
       return CP_MERGE_PULL
         ? this.cpMergeTreeReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace)
         : this.cpMergePushReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace);
