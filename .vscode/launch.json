@@ -25,18 +25,23 @@
             },
             "runtimeArgs": [
                 "${workspaceFolder}/src/run_qwen3_unified.ts",
-                "--gpus", "0,1,2,3,4,5,6,7",
-                "--prompt", "tell me a 1000 word story",
+                "--gpus",
+                "0,1,2,3,4,5,6,7",
+                "--prompt",
+                "tell me a 1000 word story",
                 // "--prompt", "hi",
                 "--glm51",
                 "--greedy",
                 // "--nvfp4",
-                "--arena", "92",
+                "--arena",
+                "92",
                 // "--no-cuda-graph",
                 "--cp",
                 "--mtp",
-                "--mtp-draft-topk", "1,1,1",
-                "--max-new-tokens", "2000",
+                "--mtp-draft-topk",
+                "1,1,1",
+                "--max-new-tokens",
+                "2000",
             ],
             "skipFiles": [
                 "<node_internals>/**"
@@ -48,12 +53,13 @@
             "name": "Greedy 8-GPU Small",
             "runtimeExecutable": "tsx",
             "console": "integratedTerminal",
-            "env": {
-            },
+            "env": {},
             "runtimeArgs": [
                 "${workspaceFolder}/src/run_qwen3_unified.ts",
-                "--gpus", "0,1,2,3,4,5,6,7",
-                "--prompt", "tell me a 1000 word story",
+                "--gpus",
+                "0,1,2,3,4,5,6,7",
+                "--prompt",
+                "tell me a 1000 word story",
                 // "--prompt", "hi",
                 "--glm51-small",
                 "--greedy",
@@ -62,25 +68,32 @@
                 // "--no-cuda-graph",
                 "--cp",
                 "--mtp",
-                "--mtp-draft-topk", "1,1,1",
-                "--max-new-tokens", "2000",
+                "--mtp-draft-topk",
+                "1,1,1",
+                "--max-new-tokens",
+                "2000",
             ],
             "skipFiles": [
                 "<node_internals>/**"
             ]
         },
-                {
+        {
             "type": "node",
             "request": "launch",
             "name": "Prefill test",
             "runtimeExecutable": "tsx",
             "console": "integratedTerminal",
             "env": {
+                "GLM_SKIP_MMAP_LOAD": "1"
                 // "NCCL_DEBUG": "INFO",
             },
             "runtimeArgs": [
                 "${workspaceFolder}/src/run_prefill_benchmark.ts",
-                "--glm51-small",
+                "--arena", "92",
+                "--cp",
+                "--seq-len", "32768",
+                "--chunk-size", "4096",
+                "--context-len", "128000",
             ],
             "skipFiles": [
                 "<node_internals>/**"
