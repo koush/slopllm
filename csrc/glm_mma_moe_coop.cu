@@ -54,11 +54,11 @@ __global__ void prefix_sum_kernel(const int* __restrict__ expert_counts,
     }
 }
 
-__global__ void scatter_input_kernel(const int* __restrict__ expert_ids, int count, int top_k,
-                                     const __nv_bfloat16* __restrict__ input, int K,
-                                     __nv_bfloat16* __restrict__ sorted_input,
-                                     int* __restrict__ sorted_to_original,
-                                     int* __restrict__ expert_offsets) {
+__global__ void scatter_input_scalar_kernel(const int* __restrict__ expert_ids, int count, int top_k,
+                                            const __nv_bfloat16* __restrict__ input, int K,
+                                            __nv_bfloat16* __restrict__ sorted_input,
+                                            int* __restrict__ sorted_to_original,
+                                            int* __restrict__ expert_offsets) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     int eid = expert_ids[i];
@@ -72,6 +72,95 @@ __global__ void scatter_input_kernel(const int* __restrict__ expert_ids, int cou
     for (int k = 0; k < num_uint4; k++) dst_v4[k] = src_v4[k];
     for (int k = num_uint4 * 8; k < K; k++) dst[k] = src[k];
     sorted_to_original[pos] = i;
+}
+
+// Prefill uses top_k=8 for gate/up. A block owns one input token so the source
+// row is read once, while all threads issue coalesced stores to its eight
+// expert destinations. The scalar kernel above reads the same row eight times
+// and gives each thread an entire row to copy serially.
+__global__ void __launch_bounds__(256) scatter_input_top8_kernel(
+    const int* __restrict__ expert_ids, int num_rows,
+    const __nv_bfloat16* __restrict__ input, int K,
+    __nv_bfloat16* __restrict__ sorted_input,
+    int* __restrict__ sorted_to_original,
+    int* __restrict__ expert_offsets) {
+    int row = blockIdx.x;
+    if (row >= num_rows) return;
+
+    __shared__ int positions[8];
+    if (threadIdx.x < 8) {
+        int route = row * 8 + threadIdx.x;
+        int pos = atomicAdd(&expert_offsets[expert_ids[route]], 1);
+        positions[threadIdx.x] = pos;
+        sorted_to_original[pos] = route;
+    }
+    __syncthreads();
+
+    int num_uint4 = K / 8;
+    const uint4* src = reinterpret_cast<const uint4*>(input + (size_t)row * K);
+    for (int k = threadIdx.x; k < num_uint4; k += blockDim.x) {
+        uint4 value = src[k];
+#pragma unroll
+        for (int route = 0; route < 8; route++) {
+            uint4* dst = reinterpret_cast<uint4*>(sorted_input + (size_t)positions[route] * K);
+            dst[k] = value;
+        }
+    }
+    for (int k = num_uint4 * 8 + threadIdx.x; k < K; k += blockDim.x) {
+        __nv_bfloat16 value = input[(size_t)row * K + k];
+#pragma unroll
+        for (int route = 0; route < 8; route++)
+            sorted_input[(size_t)positions[route] * K + k] = value;
+    }
+}
+
+// Down projection uses top_k=1. Eight warps per block cooperatively copy eight
+// rows, avoiding both the serial per-thread copy and an excessively large
+// one-block-per-row launch.
+__global__ void __launch_bounds__(256) scatter_input_top1_kernel(
+    const int* __restrict__ expert_ids, int count,
+    const __nv_bfloat16* __restrict__ input, int K,
+    __nv_bfloat16* __restrict__ sorted_input,
+    int* __restrict__ sorted_to_original,
+    int* __restrict__ expert_offsets) {
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * 8 + warp;
+    if (row >= count) return;
+
+    int pos = 0;
+    if (lane == 0) {
+        pos = atomicAdd(&expert_offsets[expert_ids[row]], 1);
+        sorted_to_original[pos] = row;
+    }
+    pos = __shfl_sync(0xffffffff, pos, 0);
+
+    int num_uint4 = K / 8;
+    const uint4* src = reinterpret_cast<const uint4*>(input + (size_t)row * K);
+    uint4* dst = reinterpret_cast<uint4*>(sorted_input + (size_t)pos * K);
+    for (int k = lane; k < num_uint4; k += 32) dst[k] = src[k];
+    for (int k = num_uint4 * 8 + lane; k < K; k += 32)
+        sorted_input[(size_t)pos * K + k] = input[(size_t)row * K + k];
+}
+
+void launch_scatter_input(const int* expert_ids, int count, int top_k,
+                          const __nv_bfloat16* input, int K,
+                          __nv_bfloat16* sorted_input, int* sorted_to_original,
+                          int* expert_offsets, cudaStream_t stream) {
+    constexpr int block = 256;
+    if (top_k == 8 && count % 8 == 0) {
+        int num_rows = count / 8;
+        scatter_input_top8_kernel<<<num_rows, block, 0, stream>>>(
+            expert_ids, num_rows, input, K, sorted_input, sorted_to_original, expert_offsets);
+    } else if (top_k == 1) {
+        int grid = (count + 7) / 8;
+        scatter_input_top1_kernel<<<grid, block, 0, stream>>>(
+            expert_ids, count, input, K, sorted_input, sorted_to_original, expert_offsets);
+    } else {
+        int grid = (count + block - 1) / block;
+        scatter_input_scalar_kernel<<<grid, block, 0, stream>>>(
+            expert_ids, count, top_k, input, K, sorted_input, sorted_to_original, expert_offsets);
+    }
 }
 
 __global__ void restore_offsets_kernel(int* __restrict__ expert_offsets,
@@ -671,8 +760,9 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void
     cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
     histogram_kernel<<<grid, block, 0, stream>>>(expert_ids, count, expert_counts, num_experts);
     prefix_sum_kernel<<<1, 1, 0, stream>>>(expert_counts, expert_offsets, num_experts);
-    scatter_input_kernel<<<grid, block, 0, stream>>>(expert_ids, count, top_k,
-        reinterpret_cast<const __nv_bfloat16*>(input), K, sorted_input, sorted_to_original, expert_offsets);
+    launch_scatter_input(expert_ids, count, top_k,
+        reinterpret_cast<const __nv_bfloat16*>(input), K, sorted_input, sorted_to_original,
+        expert_offsets, stream);
     grid = (num_experts + block - 1) / block;
     restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts);
     cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
@@ -726,8 +816,9 @@ void glm_mma_moe_coop_scatter(GlmCtx* ctx, const void* input, const int* expert_
     cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
     histogram_kernel<<<grid, block, 0, stream>>>(expert_ids, count, expert_counts, num_experts);
     prefix_sum_kernel<<<1, 1, 0, stream>>>(expert_counts, expert_offsets, num_experts);
-    scatter_input_kernel<<<grid, block, 0, stream>>>(expert_ids, count, top_k,
-        reinterpret_cast<const __nv_bfloat16*>(input), K, sorted_input, sorted_to_original, expert_offsets);
+    launch_scatter_input(expert_ids, count, top_k,
+        reinterpret_cast<const __nv_bfloat16*>(input), K, sorted_input, sorted_to_original,
+        expert_offsets, stream);
     grid = (num_experts + block - 1) / block;
     restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts);
 }
