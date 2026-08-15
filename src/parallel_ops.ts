@@ -3554,9 +3554,9 @@ export class ParallelOps implements DeviceOps {
     using topkIdxColumn = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Column);
     using topkValColumn = this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk], "BF16", TensorParallelism.Column);
     const topkIdxReplicated = topkIdxColumn.allGather(idxQ.workspace);
-    const topkValReplicated = topkValColumn.allGather(idxQ.workspace);
+    // const topkValReplicated = topkValColumn.allGather(idxQ.workspace);
 
-    return { values: topkValReplicated, indices: topkIdxReplicated };
+    return { values: topkValColumn, indices: topkIdxReplicated };
   }
 
   // Sort each top-k row ascending by index, in place, on every shard. The
