@@ -1,5 +1,8 @@
 #include "glm_ops.h"
 #include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 // Remap a local KV position to its global position for context-parallel
 // interleaved sharding. cpWorldSize=0 (non-CP) is a no-op identity.
@@ -907,11 +910,6 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
 // ---------------------------------------------------------------------------
 namespace idxmma {
 constexpr int MMA_M = 16, MMA_N = 8, MMA_K = 16;
-constexpr int WARPS = 8, CTA = WARPS * 32;   // 256 threads
-constexpr int TM = 64;            // queries per tile      (NUM_M = TM/16 = 4)
-constexpr int TN = 192;           // KV positions per tile  (NPW = 3)
-constexpr int NUM_M = TM / MMA_M;                       // 4
-constexpr int NPW = TN / (MMA_N * WARPS);               // 3
 // Pad smem row strides so the 16 ldmatrix rows don't all land in the same bank
 // set (row byte-stride was a multiple of 128 -> up to 16-way conflict).
 constexpr int PAD_A = 8;   // Q row stride = idxHeadDim + PAD_A
@@ -969,17 +967,18 @@ __device__ __forceinline__ void ldm_b(FragB& b, const __nv_bfloat16* s, int stri
 //   score[q,pos] = Σ_h w[q,h] · ReLU(scale · Σ_d Q[q,h,d]·K[pos,d])
 //
 // K is shared across the idxNHeads heads (a single idxHeadDim vector per KV
-// position), so each output tile loads its 64-wide K slab once and streams the
+// position), so each output tile loads its K slab once and streams the
 // per-head Q tiles through it, folding scale·ReLU·weight into a persistent
 // fp32 score accumulator (one MMA pass, no per-head materialization).
 //
-// Grid: (ceil(maxKv/TN), numQueryTiles).  Block: 128 threads (4 warps).
+// Grid: (ceil(maxKv/TN), numQueryTiles). The block geometry is templated.
 // blockIdx.y maps to (seq, query tile) so tiles never cross a sequence
 // boundary; blockIdx.x is a 64-wide KV tile of global positions. Masked
 // positions are written -inf (lowest histogram bucket); positions beyond the
 // causal limit / kvLen are left untouched (never read by the histogram passes).
 // ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(idxmma::CTA)
+template <int TM, int TN, int WARPS, int Q_BUFFERS>
+__global__ void __launch_bounds__(WARPS * 32)
 idx_prefill_score_mma_kernel(
     __nv_bfloat16* __restrict__ scores,       // [totalQ, maxKv]
     int32_t* __restrict__ rowLen,             // [totalQ]
@@ -996,6 +995,12 @@ idx_prefill_score_mma_kernel(
     const int32_t* __restrict__ globalLastPageLen)
 {
     using namespace idxmma;
+    constexpr int CTA = WARPS * 32;
+    constexpr int NUM_M = TM / MMA_M;
+    constexpr int NPW = TN / (MMA_N * WARPS);
+    static_assert(TM % MMA_M == 0);
+    static_assert(TN % (MMA_N * WARPS) == 0);
+    static_assert(Q_BUFFERS == 1 || Q_BUFFERS == 2);
 
     // Map blockIdx.y -> (seq, qStart). Tiles are laid out per-sequence so a tile
     // never straddles two sequences. The scan reads qoIndptr[0..B]; it stops once
@@ -1075,15 +1080,14 @@ idx_prefill_score_mma_kernel(
     const int strideB = TN + PAD_B;            // padded K row stride
 
     extern __shared__ char smem[];
-    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem);   // [idxHeadDim, strideB] (d-major)
-    __nv_bfloat16* qbuf0  = smem_b + (size_t)idxHeadDim * strideB;    // [TM, strideA] (buffer 0)
-    __nv_bfloat16* qbuf1  = qbuf0 + (size_t)TM * strideA;             // [TM, strideA] (buffer 1)
-    __nv_bfloat16* w_s     = qbuf1 + (size_t)TM * strideA;            // [TM, idxNHeads]
-    __nv_bfloat16* qbuf[2] = { qbuf0, qbuf1 };
+    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem);  // [idxHeadDim, strideB] (d-major)
+    __nv_bfloat16* qbuf0 = smem_b + (size_t)idxHeadDim * strideB;
+    __nv_bfloat16* w_s = qbuf0 + (size_t)Q_BUFFERS * TM * strideA;
+    __nv_bfloat16* qbuf[2] = {qbuf0, Q_BUFFERS == 2 ? qbuf0 + (size_t)TM * strideA : qbuf0};
 
     // Zero both Q buffers once: padded rows (ql >= m_valid) are never cp.async'd,
     // so they stay 0 and fold to nothing (avoids NaN from 0*inf on stale smem).
-    for (int i = threadIdx.x; i < 2 * TM * strideA; i += CTA)
+    for (int i = threadIdx.x; i < Q_BUFFERS * TM * strideA; i += CTA)
         qbuf0[i] = __float2bfloat16(0.f);
 
     // Load the K slab once, transposed into d-major smem: smem_b[d*strideB + pos].
@@ -1127,15 +1131,7 @@ idx_prefill_score_mma_kernel(
         }
     };
 
-    // 2-stage software pipeline: prefetch head h+1's Q while head h computes.
-    issue_q(0, qbuf[0]); cp_commit();
-
-    for (int h = 0; h < idxNHeads; h++) {
-        if (h + 1 < idxNHeads) { issue_q(h + 1, qbuf[(h + 1) & 1]); cp_commit(); cp_wait<1>(); }
-        else                   { cp_wait<0>(); }
-        __syncthreads();
-        const __nv_bfloat16* qa = qbuf[h & 1];
-
+    auto compute_head = [&](int h, const __nv_bfloat16* qa) {
         FragC c[NUM_M][NPW];
         #pragma unroll
         for (int mi = 0; mi < NUM_M; mi++)
@@ -1174,7 +1170,34 @@ idx_prefill_score_mma_kernel(
                 acc[mi][ni].reg[3] += w1 * fmaxf(scale * c[mi][ni].reg[3], 0.f);
             }
         }
-        __syncthreads();   // all reads of qbuf[h&1] done before it is refilled at h+2
+    };
+
+    if constexpr (Q_BUFFERS == 2) {
+        // Prefetch head h+1 while head h computes.
+        issue_q(0, qbuf[0]); cp_commit();
+        for (int h = 0; h < idxNHeads; h++) {
+            if (h + 1 < idxNHeads) {
+                issue_q(h + 1, qbuf[(h + 1) & 1]);
+                cp_commit();
+                cp_wait<1>();
+            } else {
+                cp_wait<0>();
+            }
+            __syncthreads();
+            compute_head(h, qbuf[h & 1]);
+            __syncthreads();
+        }
+    } else {
+        // A single Q buffer lowers shared-memory use at the cost of serializing
+        // each head's Q load with its MMA work.
+        for (int h = 0; h < idxNHeads; h++) {
+            issue_q(h, qbuf[0]);
+            cp_commit();
+            cp_wait<0>();
+            __syncthreads();
+            compute_head(h, qbuf[0]);
+            __syncthreads();
+        }
     }
 
     // Epilogue: write scores with per-element causal / mask / bounds checks.
@@ -1490,24 +1513,37 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     // the +slop covers per-sequence tile rounding without needing a batch count
     // (out-of-range tiles map to seq<0 and return immediately).
     {
-        using idxmma::TM; using idxmma::TN;
-        const int strideA = idxHeadDim + idxmma::PAD_A;
-        const int strideB = TN + idxmma::PAD_B;
-        // K slab + double-buffered Q (2 heads) + weights (all padded to match kernel).
-        size_t mma_smem = ((size_t)idxHeadDim * strideB + 2 * (size_t)TM * strideA
-                           + (size_t)TM * idxNHeads) * sizeof(__nv_bfloat16);
-        // Per-device opt-in for >48KB dynamic smem. cudaFuncSetAttribute is
-        // per-device, so this must run on every device (cheap, idempotent).
-        cudaFuncSetAttribute(idx_prefill_score_mma_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mma_smem);
-        dim3 grid((maxKv + TN - 1) / TN, (totalQ + TM - 1) / TM + 256);
-        idx_prefill_score_mma_kernel<<<grid, idxmma::CTA, mma_smem, stream>>>(
-            (__nv_bfloat16*)scores, rowLen,
-            (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
-            (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
-            totalQ, scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal,
-            qGlobalStart, custom_mask, mask_indptr, mask_kv_len,
-            cpWorldSize, cpRank, globalLastPageLen);
+#define LAUNCH_INDEXER_PREFILL(TM, TN, WARPS, Q_BUFFERS) do { \
+        constexpr int cta = (WARPS) * 32; \
+        const int strideA = idxHeadDim + idxmma::PAD_A; \
+        const int strideB = (TN) + idxmma::PAD_B; \
+        size_t mma_smem = ((size_t)idxHeadDim * strideB \
+                           + (size_t)(Q_BUFFERS) * (TM) * strideA \
+                           + (size_t)(TM) * idxNHeads) * sizeof(__nv_bfloat16); \
+        cudaFuncSetAttribute( \
+            (void*)idx_prefill_score_mma_kernel<(TM), (TN), (WARPS), (Q_BUFFERS)>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mma_smem); \
+        dim3 grid((maxKv + (TN) - 1) / (TN), (totalQ + (TM) - 1) / (TM) + 256); \
+        idx_prefill_score_mma_kernel<(TM), (TN), (WARPS), (Q_BUFFERS)> \
+            <<<grid, cta, mma_smem, stream>>>( \
+                (__nv_bfloat16*)scores, rowLen, \
+                (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData, \
+                (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr, \
+                totalQ, scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal, \
+                qGlobalStart, custom_mask, mask_indptr, mask_kv_len, \
+                cpWorldSize, cpRank, globalLastPageLen); \
+    } while (0)
+
+        const char* config = std::getenv("GLM_INDEXER_PREFILL_CONFIG");
+        if (!config || std::strcmp(config, "q64_k256_w16_q1") == 0)
+            LAUNCH_INDEXER_PREFILL(64, 256, 16, 1);
+        else if (std::strcmp(config, "q64_k192_w8_q2") == 0)
+            LAUNCH_INDEXER_PREFILL(64, 192, 8, 2);
+        else {
+            fprintf(stderr, "Unknown GLM_INDEXER_PREFILL_CONFIG=%s\n", config);
+            LAUNCH_INDEXER_PREFILL(64, 256, 16, 1);
+        }
+#undef LAUNCH_INDEXER_PREFILL
     }
 
     // Passes 2-6: histogram + gather from buffer.
