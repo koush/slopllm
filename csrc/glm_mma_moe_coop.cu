@@ -604,7 +604,10 @@ static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
                                    const int* sorted_to_original) {
     constexpr int MaxExperts = 256;
     const char* cfg_env = getenv("GLM_COOP_CONFIG");
-    std::string cfg(cfg_env ? cfg_env : "tm64_tn128_d2_nw2");
+    const char* default_cfg = "tm64_tn128_d2_nw2";
+    if (N == 6144 && K == 256)
+        default_cfg = "tm64_tn128_d2_nw4";
+    std::string cfg(cfg_env ? cfg_env : default_cfg);
 
     const char* nw_env = getenv("GLM_COOP_NWARPS");
     if (nw_env && !cfg_env) {
