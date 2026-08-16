@@ -3685,6 +3685,8 @@ export class ParallelOps implements DeviceOps {
         pIndptr, state.kvTokenIndptrD, pBatchIndices, topkCount, paddedKvLen,
       );
     }
+
+    this.p2pBarrier();
   }
 
   // Which addressing layer `cacheIdx`'s CKV buffer (as returned by
