@@ -1057,9 +1057,9 @@ export class GlmOps implements DeviceOps {
     const ws = kvCache.workspace;
     const bitmapWords = Math.ceil(paddedKvLen / BITS_PER_WORD);  // one bit per flat slot
     const maxEntries = numTokens * topk;                         // one int2 per (query, k)
-    const bitmap = ws.ensureAlloc([bitmapWords], "I32", `gatherCkvBitmap_${bitmapWords}`);
-    const unique = ws.ensureAlloc([maxEntries * 2], "I32", `gatherCkvUnique_${maxEntries}`);
-    const counter = ws.ensureAlloc([1], "I32", "gatherCkvCounter");
+    using bitmap = ws.alloc([bitmapWords], "I32");
+    using unique = ws.alloc([maxEntries * 2], "I32");
+    using counter = ws.alloc([1], "I32");
 
     getNativeAddon().gatherTopkCkv(
       this.ctx,
