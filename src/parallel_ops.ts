@@ -3067,7 +3067,23 @@ export class ParallelOps implements DeviceOps {
         // (ensureAlloc), not as a stream result in extras.
         prefetched = pIndptr.workspace.tensors.get(prefetchKey) as ParallelTensor;
         if (!prefetched) {
-          throw new Error(`sparseMlaPrepareCache: expected prefetched result for shared layer ${cacheIdx}`);
+          const groupSlots = state.sharedSlots?.value;
+          if (!groupSlots) {
+            throw new Error(`sparseMlaPrepareCache: shared layer ${cacheIdx} has no group slots`);
+          }
+          const shardPageSize = pageSize / this.worldSize;
+          const paddedKvLen = pagedKV.maxPages * pagedKV.pageSize;
+          prefetched = pIndptr.workspace.ensureAlloc(
+            [paddedKvLen / shardPageSize, shardPageSize, pKvCache.shape[2]],
+            pKvCache.type,
+            prefetchKey,
+          ) as ParallelTensor;
+          this.gatherTopkCkv(
+            state, kvCache, [prefetched], groupSlots, indices,
+            pIndptr, state.kvTokenIndptrD, pBatchIndices,
+            groupSlots.shape[1], paddedKvLen,
+          );
+          this.p2pBarrier();
         }
       }
     }
@@ -3107,8 +3123,9 @@ export class ParallelOps implements DeviceOps {
     const contextParallel = pKvCache.parallelism === TensorParallelism.Row;
 
     const nextCacheIdx = cacheIdx + 1;
-    // pipeline the pages from the next layer
-    if (pagedKV.ckvData[nextCacheIdx]) {
+    // Do not carry a prefetched tensor across forwardModel's tracking scope.
+    // The MTP layer runs in a separate forward and gathers its cache there.
+    if (nextCacheIdx < cfg.numHiddenLayers && pagedKV.ckvData[nextCacheIdx]) {
       const nextStream = this.withStream<ParallelTensor>(() => {
         const nextKvCache = pagedKV.ckvData[nextCacheIdx];
 
