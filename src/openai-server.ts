@@ -186,17 +186,28 @@ interface ActiveSequence {
   lastToken: number;
 }
 
+interface ServerMetrics {
+  runningRequests: number;
+  generationTokensTotal: number;
+  promptTokensTotal: number;
+  requestSuccessTotal: number;
+  prefillTimeSecondsCount: number;
+  prefillTimeSecondsSum: number;
+}
+
 async function generateContinuousBatch(
   model: ChatModel,
   ws: ExecutionWorkspace,
   glm: DeviceOps,
   cache: ChatCache,
   tokenizer: any,
+  chatTemplate: string | undefined,
   eosIds: Set<number>,
   pendingQueue: CompletionRequest[],
   maxSeqLen: number,
   maxBatchSize: number,
   decodeLatencyMs: number,
+  metrics: ServerMetrics,
 ): Promise<void> {
   const pagedKV = cache.getPagedKV();
   const eosToken = [...eosIds][0];
@@ -209,6 +220,8 @@ async function generateContinuousBatch(
     for (let i = active.length - 1; i >= 0; i--) {
       if (active[i].request.finished) {
         pagedKV.removeSequence(i);
+        metrics.runningRequests--;
+        metrics.requestSuccessTotal++;
         try { active[i].request.onFinish(); } catch {}
         active.splice(i, 1);
       }
@@ -219,16 +232,18 @@ async function generateContinuousBatch(
     if (pendingQueue.length > 0 && availableSlots > 0) {
       const newCount = Math.min(pendingQueue.length, availableSlots);
       const newRequests = pendingQueue.splice(0, newCount);
+      metrics.runningRequests += newCount;
 
       const inputIdsList: number[][] = [];
       for (const req of newRequests) {
-        const ids = tokenizeMessages(tokenizer, req.messages);
+        const ids = tokenizeMessages(tokenizer, req.messages, chatTemplate);
         req.maxTokens = Math.max(1, req.maxTokens);
         if (ids.length > maxSeqLen - req.maxTokens) {
           ids.splice(0, ids.length - (maxSeqLen - req.maxTokens));
         }
         inputIdsList.push(ids);
         req.promptTokenCount = ids.length;
+        metrics.promptTokensTotal += ids.length;
       }
 
       if (active.length === 0) {
@@ -243,7 +258,12 @@ async function generateContinuousBatch(
       }
 
       // Prefill new requests
+      const prefillStart = performance.now();
       const firstTokens = ws.forwardEagerPrefill(model, inputIdsList, cache);
+      const prefillSeconds = (performance.now() - prefillStart) / 1000;
+      metrics.prefillTimeSecondsCount += newCount;
+      metrics.prefillTimeSecondsSum += prefillSeconds * newCount;
+      metrics.generationTokensTotal += firstTokens.length;
 
       // Report tokens and check for first-token EOS
       for (let i = 0; i < newCount; i++) {
@@ -288,6 +308,8 @@ async function generateContinuousBatch(
     for (let i = active.length - 1; i >= 0; i--) {
       if (active[i].request.finished) {
         pagedKV.removeSequence(i);
+        metrics.runningRequests--;
+        metrics.requestSuccessTotal++;
         try { active[i].request.onFinish(); } catch {}
         active.splice(i, 1);
       }
@@ -309,6 +331,7 @@ async function generateContinuousBatch(
     using decodeLogits = state.computeLogits(hiddenStates, model);
     const newSampled = samplingWorkspace.sample(decodeLogits);
     const newTokens = newSampled.readInt32LEArray();
+    metrics.generationTokensTotal += newTokens.length;
 
     // 6. Process decoded tokens
     for (let i = 0; i < active.length; i++) {
@@ -506,6 +529,49 @@ function sendJSON(res: http.ServerResponse, statusCode: number, data: object): v
   res.end(JSON.stringify(data));
 }
 
+function sendMetrics(
+  res: http.ServerResponse,
+  metrics: ServerMetrics,
+  waitingRequests: number,
+  cache: ChatCache,
+): void {
+  const pagedKV = cache.getPagedKV();
+  const kvUsage = pagedKV.maxPages === 0
+    ? 0
+    : (pagedKV.maxPages - pagedKV.availablePages.length) / pagedKV.maxPages;
+  const lines = [
+    "# HELP vllm:num_requests_running GLM.js requests admitted for model execution.",
+    "# TYPE vllm:num_requests_running gauge",
+    `vllm:num_requests_running ${metrics.runningRequests}`,
+    "# HELP vllm:num_requests_waiting GLM.js requests waiting for admission.",
+    "# TYPE vllm:num_requests_waiting gauge",
+    `vllm:num_requests_waiting ${waitingRequests}`,
+    "# HELP vllm:generation_tokens_total GLM.js sampled completion tokens.",
+    "# TYPE vllm:generation_tokens_total counter",
+    `vllm:generation_tokens_total ${metrics.generationTokensTotal}`,
+    "# HELP vllm:prompt_tokens_total GLM.js prompt tokens admitted for prefill.",
+    "# TYPE vllm:prompt_tokens_total counter",
+    `vllm:prompt_tokens_total ${metrics.promptTokensTotal}`,
+    "# HELP vllm:request_success_total GLM.js successfully completed requests.",
+    "# TYPE vllm:request_success_total counter",
+    `vllm:request_success_total ${metrics.requestSuccessTotal}`,
+    "# HELP vllm:kv_cache_usage_perc GLM.js fraction of KV cache pages in use.",
+    "# TYPE vllm:kv_cache_usage_perc gauge",
+    `vllm:kv_cache_usage_perc ${kvUsage}`,
+    "# HELP vllm:cache_config_info GLM.js paged KV cache configuration.",
+    "# TYPE vllm:cache_config_info gauge",
+    `vllm:cache_config_info{block_size="${pagedKV.pageSize}",num_gpu_blocks="${pagedKV.maxPages}"} 1`,
+    "# HELP vllm:request_prefill_time_seconds GLM.js request prefill duration.",
+    "# TYPE vllm:request_prefill_time_seconds histogram",
+    `vllm:request_prefill_time_seconds_bucket{le="+Inf"} ${metrics.prefillTimeSecondsCount}`,
+    `vllm:request_prefill_time_seconds_sum ${metrics.prefillTimeSecondsSum}`,
+    `vllm:request_prefill_time_seconds_count ${metrics.prefillTimeSecondsCount}`,
+    "",
+  ];
+  res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
+  res.end(lines.join("\n"));
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
@@ -562,6 +628,14 @@ async function main(): Promise<void> {
   }
 
   const pendingQueue: CompletionRequest[] = [];
+  const metrics: ServerMetrics = {
+    runningRequests: 0,
+    generationTokensTotal: 0,
+    promptTokensTotal: 0,
+    requestSuccessTotal: 0,
+    prefillTimeSecondsCount: 0,
+    prefillTimeSecondsSum: 0,
+  };
   let busy = false;
 
   async function processQueue(): Promise<void> {
@@ -573,7 +647,7 @@ async function main(): Promise<void> {
       let totalPrompt = 0;
       const requestCount = pendingQueue.length;
       try {
-        await generateContinuousBatch(model, ws, glm, cache, tokenizer, eosIds, pendingQueue, args.ctxSize, args.batchSize, args.decodeLatency);
+        await generateContinuousBatch(model, ws, glm, cache, tokenizer, chatTemplate, eosIds, pendingQueue, args.ctxSize, args.batchSize, args.decodeLatency, metrics);
       } catch (err) {
         console.error("Continuous batch error:", err);
       }
@@ -773,6 +847,42 @@ async function main(): Promise<void> {
     });
   }
 
+  function handleTokenize(req: http.IncomingMessage, res: http.ServerResponse): void {
+    readBody(req).then(body => {
+      let params: any;
+      try {
+        params = JSON.parse(body);
+      } catch {
+        sendJSON(res, 400, { error: { message: "Invalid JSON", type: "invalid_request_error" } });
+        return;
+      }
+
+      const messages = params?.messages as Array<{ role: string; content: string }> | undefined;
+      if (!messages || !Array.isArray(messages) || messages.length === 0) {
+        sendJSON(res, 400, { error: { message: "messages is required and must be a non-empty array", type: "invalid_request_error" } });
+        return;
+      }
+
+      try {
+        const tokens = tokenizeMessages(tokenizer, messages, chatTemplate);
+        sendJSON(res, 200, {
+          count: tokens.length,
+          max_model_len: args.ctxSize,
+          tokens,
+          token_strs: null,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Tokenization failed";
+        sendJSON(res, 400, { error: { message, type: "invalid_request_error" } });
+      }
+    }).catch(err => {
+      console.error("Tokenize request error:", err);
+      if (!res.headersSent) {
+        sendJSON(res, 500, { error: { message: "Internal server error", type: "internal_error" } });
+      }
+    });
+  }
+
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 
@@ -790,6 +900,10 @@ async function main(): Promise<void> {
 
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
       handleChatCompletions(req, res);
+    } else if (req.method === "POST" && url.pathname === "/tokenize") {
+      handleTokenize(req, res);
+    } else if (req.method === "GET" && url.pathname === "/metrics") {
+      sendMetrics(res, metrics, pendingQueue.length, cache);
     } else if (req.method === "GET" && url.pathname === "/v1/models") {
       sendJSON(res, 200, {
         object: "list",
@@ -798,6 +912,7 @@ async function main(): Promise<void> {
           object: "model",
           created: Math.floor(Date.now() / 1000),
           owned_by: "local",
+          max_model_len: args.ctxSize,
         }],
       });
     } else if (req.method === "GET" && url.pathname === "/health") {
@@ -810,6 +925,8 @@ async function main(): Promise<void> {
   server.listen(args.port, args.host, () => {
     console.log(`OpenAI-compatible server running at http://${args.host}:${args.port}`);
     console.log(`  POST /v1/chat/completions  - Chat completions (streaming & non-streaming)`);
+    console.log(`  POST /tokenize             - Tokenize chat messages`);
+    console.log(`  GET  /metrics              - Prometheus metrics`);
     console.log(`  GET  /v1/models            - List models`);
     console.log(`  GET  /health               - Health check`);
     console.log(`  Model: ${MODEL_NAME}  |  GPU: ${args.gpu}  |  ctx-size: ${args.ctxSize}  |  batch-size: ${args.batchSize}  |  max-pages: ${args.maxPages}`);
