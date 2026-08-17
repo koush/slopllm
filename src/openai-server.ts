@@ -1,29 +1,27 @@
 import http from "node:http";
 import crypto from "node:crypto";
-import { AutoTokenizer } from "@huggingface/transformers";
+import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
+import { parentPort } from "node:worker_threads";
 import { ChatModel, ChatCache, SamplingParams } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
-import { GlmOps } from "./glm_ops";
-import { Qwen3Model } from "./qwen3_model";
 import { SamplingWorkspace } from "./tensor";
 import { resolveModelPath } from "./model_path";
+import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
+import { ParallelOps } from "./parallel_ops";
 
-const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 const MODEL_NAME = "qwen3-0.6b";
 const PAGE_SIZE = 64;
 
-interface ServerArgs {
+interface ServerArgs extends ModelCliArgs {
   port: number;
   host: string;
-  gpu: number;
   ctxSize: number;
   batchSize: number;
   maxPages: number;
   maxTokens: number;
-  modelDir: string | undefined;
   temperature: number;
   topP: number;
   topK: number;
@@ -35,14 +33,13 @@ interface ServerArgs {
 
 function parseArgs(argv: string[]): ServerArgs {
   const args: ServerArgs = {
+    ...parseModelArgs(argv),
     port: 8010,
     host: "0.0.0.0",
-    gpu: parseInt(process.env.GLM_GPUS ?? process.env.GLM_GPU ?? "0", 10),
     ctxSize: 4096,
     batchSize: 1,
     maxPages: 0,
     maxTokens: 512,
-    modelDir: undefined,
     temperature: 0.6,
     topP: 0.95,
     topK: 20,
@@ -55,12 +52,10 @@ function parseArgs(argv: string[]): ServerArgs {
     const a = argv[i];
     if (a === "--port" && i + 1 < argv.length) args.port = parseInt(argv[++i], 10);
     else if (a === "--host" && i + 1 < argv.length) args.host = argv[++i];
-    else if (a === "--gpu" && i + 1 < argv.length) args.gpu = parseInt(argv[++i], 10);
     else if (a === "--ctx-size" && i + 1 < argv.length) args.ctxSize = parseInt(argv[++i], 10);
     else if (a === "--batch-size" && i + 1 < argv.length) args.batchSize = parseInt(argv[++i], 10);
     else if (a === "--max-pages" && i + 1 < argv.length) args.maxPages = parseInt(argv[++i], 10);
     else if (a === "--max-tokens" && i + 1 < argv.length) args.maxTokens = parseInt(argv[++i], 10);
-    else if (a === "--model-dir" && i + 1 < argv.length) args.modelDir = argv[++i];
     else if (a === "--temperature" && i + 1 < argv.length) args.temperature = parseFloat(argv[++i]);
     else if (a === "--top-p" && i + 1 < argv.length) args.topP = parseFloat(argv[++i]);
     else if (a === "--top-k" && i + 1 < argv.length) args.topK = parseInt(argv[++i], 10);
@@ -85,6 +80,8 @@ Options:
   --port <int>                  Server port (default: 8000)
   --host <string>               Server host (default: 0.0.0.0)
   --gpu <int>                   GPU device ID (default: 0)
+  --gpus <list>                 GPU device IDs
+  --arena <int>                 Arena size in GiB per GPU
   --ctx-size <int>              Context size / max sequence length (default: 4096)
   --batch-size <int>            Maximum concurrent requests (default: 1)
   --max-pages <int>             KV cache pages (default: batch-size * ceil(ctx-size / 16))
@@ -572,16 +569,16 @@ function sendMetrics(
   res.end(lines.join("\n"));
 }
 
-async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+export async function main(argv = process.argv.slice(2)): Promise<void> {
+  const args = parseArgs(argv);
 
-  const modelDir = args.modelDir ?? resolveModelPath(QWEN3_REPO);
+  const { modelDir, repoId } = resolveModelSelection(args);
   const tokenizerDir = args.modelDir && fs.existsSync(path.join(args.modelDir, "tokenizer_config.json"))
-    ? args.modelDir : resolveModelPath(QWEN3_REPO);
+    ? args.modelDir : resolveModelPath(repoId);
 
   console.log(`Loading model from ${modelDir}...`);
-  const glm = new GlmOps(args.gpu, undefined, undefined);
-  const model = await Qwen3Model.fromPretrained(glm, modelDir);
+  const { glm, gpuDevices } = createDeviceOps(args);
+  const model = await loadModel(glm, args, modelDir);
   const cache = model.createChatCache(args.maxPages, args.batchSize, args.ctxSize);
   const ws = new ExecutionWorkspace(glm, args.batchSize, args.ctxSize);
   const tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
@@ -929,11 +926,41 @@ async function main(): Promise<void> {
     console.log(`  GET  /metrics              - Prometheus metrics`);
     console.log(`  GET  /v1/models            - List models`);
     console.log(`  GET  /health               - Health check`);
-    console.log(`  Model: ${MODEL_NAME}  |  GPU: ${args.gpu}  |  ctx-size: ${args.ctxSize}  |  batch-size: ${args.batchSize}  |  max-pages: ${args.maxPages}`);
+    console.log(`  Model: ${MODEL_NAME}  |  GPU: ${args.gpus.join(",")}  |  ctx-size=${args.ctxSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);
   });
+
+  let cleaningUp = false;
+  const cleanup = async () => {
+    if (cleaningUp) return;
+    cleaningUp = true;
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    while (busy) await new Promise(resolve => setTimeout(resolve, 10));
+    glm.synchronize();
+    cache.free();
+    ws.free();
+    model.free();
+    if (glm instanceof ParallelOps) glm.free();
+    for (const device of gpuDevices) device.free();
+  };
+
+  if (parentPort) {
+    const port = parentPort;
+    port.on("message", message => {
+      if ((message as { type?: string })?.type !== "shutdown") return;
+      void cleanup().then(() => {
+        port.postMessage({ type: "stopped" });
+        port.close();
+      });
+    });
+  } else {
+    process.once("SIGINT", () => void cleanup().then(() => process.exit(0)));
+    process.once("SIGTERM", () => void cleanup().then(() => process.exit(0)));
+  }
 }
 
-main().catch(err => {
-  console.error("Failed to start server:", err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(err => {
+    console.error("Failed to start server:", err);
+    process.exit(1);
+  });
+}

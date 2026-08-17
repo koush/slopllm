@@ -1,4 +1,4 @@
-import { AutoTokenizer } from "@huggingface/transformers";
+import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -6,31 +6,22 @@ import { CaptureManager } from "./capture-manager";
 import { ChatCache, ChatModel, SamplingParams, makeSamplingParams } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
-import { Glm51Model } from "./glm51_model";
-import { GlmOps } from "./glm_ops";
 import { MetaOps } from "./meta_ops";
+import { createDeviceOps, loadModel, modelLabel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { resolveModelPath } from "./model_path";
 import { MtpStats, mtpTreeDecode } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
-import { Qwen35Model } from "./qwen35_model";
-import { Qwen3Model } from "./qwen3_model";
 import { SamplingWorkspace, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 import { MemcpyKind } from "./enums";
-
-const QWEN3_REPO = "Qwen/Qwen3-0.6B";
-const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
-const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
-const GLM51_REPO = "zai-org/GLM-5.1";
 
 export interface GraphState {
   graphExec: number | null;
   warmupRemaining: number;
 }
 
-interface CliArgs {
-  gpus: number[];
+interface CliArgs extends ModelCliArgs {
   maxNewTokens: number;
   maxSeqLen: number;
   warmupSteps: number;
@@ -38,13 +29,7 @@ interface CliArgs {
   maxBatch: number;
   noReset: boolean;
   prompt: string | undefined;
-  useQwen35: boolean;
-  useGlm51: boolean;
-  glm51Small: boolean;
-  useFp8: boolean;
-  useNvfp4: boolean;
   useBatch: boolean;
-  modelDir: string | undefined;
   noCudaGraph: boolean;
   temperature: number;
   topP: number;
@@ -55,29 +40,19 @@ interface CliArgs {
   greedy: boolean;
   stats: boolean;
   meta: boolean;
-  arena: number;
-  cp: boolean;
-  mtp: boolean;
   mtpDraftTopk: number[];
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  const gpusEnv = process.env.GLM_GPUS ?? process.env.GLM_GPU ?? "0";
   const args: CliArgs = {
-    gpus: gpusEnv.split(",").map(s => parseInt(s.trim(), 10)),
+    ...parseModelArgs(argv),
     maxNewTokens: 256,
     maxSeqLen: 4096,
     warmupSteps: 3,
     maxPages: 256,
     maxBatch: 4,
     noReset: true,
-    modelDir: undefined,
     prompt: undefined,
-    useQwen35: false,
-    useGlm51: false,
-    glm51Small: false,
-    useFp8: false,
-    useNvfp4: false,
     useBatch: false,
     noCudaGraph: false,
     temperature: 0.6,
@@ -89,9 +64,6 @@ function parseArgs(argv: string[]): CliArgs {
     greedy: false,
     stats: false,
     meta: false,
-    arena: 0,
-    cp: false,
-    mtp: false,
     mtpDraftTopk: [],
   };
 
@@ -100,18 +72,10 @@ function parseArgs(argv: string[]): CliArgs {
     if (a === "--prompt" && i + 1 < argv.length) args.prompt = argv[++i];
     else if (a === "--max-new-tokens" && i + 1 < argv.length) args.maxNewTokens = parseInt(argv[++i], 10);
     else if (a === "--warmup-steps" && i + 1 < argv.length) args.warmupSteps = parseInt(argv[++i], 10);
-    else if (a === "--gpus" && i + 1 < argv.length) args.gpus = argv[++i].split(",").map(s => parseInt(s.trim(), 10));
-    else if (a === "--gpu" && i + 1 < argv.length) args.gpus = [parseInt(argv[++i], 10)];
     else if (a === "--max-seq-len" && i + 1 < argv.length) args.maxSeqLen = parseInt(argv[++i], 10);
     else if (a === "--max-pages" && i + 1 < argv.length) args.maxPages = parseInt(argv[++i], 10);
     else if (a === "--max-batch" && i + 1 < argv.length) args.maxBatch = parseInt(argv[++i], 10);
     else if (a === "--no-kv-persist") args.noReset = false;
-    else if (a === "--qwen35") args.useQwen35 = true;
-    else if (a === "--glm51") args.useGlm51 = true;
-    else if (a === "--glm51-small") { args.useGlm51 = true; args.glm51Small = true; }
-    else if (a === "--model-dir" && i + 1 < argv.length) args.modelDir = argv[++i];
-    else if (a === "--fp8") args.useFp8 = true;
-    else if (a === "--nvfp4") args.useNvfp4 = true;
     else if (a === "--batch") args.useBatch = true;
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
     else if (a === "--temperature" && i + 1 < argv.length) args.temperature = parseFloat(argv[++i]);
@@ -125,23 +89,7 @@ function parseArgs(argv: string[]): CliArgs {
     }
     else if (a === "--stats") args.stats = true;
     else if (a === "--meta") args.meta = true;
-    else if (a === "--arena" && i + 1 < argv.length) args.arena = parseInt(argv[++i], 10);
-    else if (a === "--cp") args.cp = true;
-    else if (a === "--mtp") args.mtp = true;
     else if (a === "--mtp-draft-topk" && i + 1 < argv.length) args.mtpDraftTopk = argv[++i].split(",").map(s => parseInt(s.trim(), 10));
-  }
-
-  if (args.useQwen35 && args.useFp8) {
-    console.error("Error: --fp8 is not supported with --qwen35");
-    process.exit(1);
-  }
-  if (args.useGlm51 && args.useFp8) {
-    console.error("Error: --fp8 is not supported with --glm51");
-    process.exit(1);
-  }
-  if (args.useNvfp4 && !args.useGlm51) {
-    console.error("Error: --nvfp4 is only supported with --glm51");
-    process.exit(1);
   }
 
   if (args.mtp && args.mtpDraftTopk.length === 0) {
@@ -158,12 +106,6 @@ function parseArgs(argv: string[]): CliArgs {
   }
 
   return args;
-}
-
-function modelLabel(args: CliArgs): string {
-  if (args.useQwen35) return "Qwen3.5-0.8B";
-  if (args.useGlm51) return args.glm51Small ? "GLM-5.1-small" : (args.useNvfp4 ? "GLM-5.1-NVFP4" : "GLM-5.1");
-  return args.useFp8 ? "Qwen3-0.6B-FP8" : "Qwen3-0.6B";
 }
 
 function tokenizeMessages(
@@ -638,27 +580,16 @@ async function interactiveBatch(
 
 // --- Main ---
 
-async function main(): Promise<void> {
+export async function main(argv = process.argv.slice(2)): Promise<void> {
   Error.stackTraceLimit = 20; 
 
-  const args = parseArgs(process.argv.slice(2));
+  const args = parseArgs(argv);
 
-  const GLM51_SMALL_BF16 = "tests/python/test_models/glm51_small/glm51_small_bf16";
-  const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp4";
-
-  const modelDir = args.modelDir ?? (args.useGlm51
-    ? (args.glm51Small
-      ? (args.useNvfp4 ? GLM51_SMALL_NVFP4 : GLM51_SMALL_BF16)
-      : '/mnt/storage/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/2eff962076815828e4031aec2834ac6e22fb4434/')
-    : resolveModelPath(args.useQwen35 ? QWEN35_REPO : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO)));
+  const { modelDir, repoId } = resolveModelSelection(args);
 
   if (args.meta) {
     const metaOps = new MetaOps();
-    const model: ChatModel = args.useGlm51
-      ? await Glm51Model.fromPretrained(metaOps, modelDir, args.cp, args.mtp)
-      : args.useQwen35
-        ? await Qwen35Model.fromPretrained(metaOps, modelDir)
-        : await Qwen3Model.fromPretrained(metaOps, modelDir);
+    const model = await loadModel(metaOps, args, modelDir);
     const loadAllocs = metaOps.totalAllocs;
     const loadBytes = metaOps.totalBytes;
 
@@ -678,22 +609,11 @@ async function main(): Promise<void> {
     return;
   }
 
-  const gpuDevices = args.gpus.map(id => new GlmOps(id, undefined, args.arena || undefined));
-  const glm: DeviceOps = gpuDevices.length > 1
-    ? new ParallelOps(gpuDevices)
-    : gpuDevices[0];
+  const { glm, gpuDevices } = createDeviceOps(args);
 
   const gpuLabel = args.gpus.join(",");
 
-  const repoId = args.useGlm51 ? GLM51_REPO
-    : args.useQwen35 ? QWEN35_REPO
-      : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
-
-  const model: ChatModel = args.useGlm51
-    ? await Glm51Model.fromPretrained(glm, modelDir, args.cp, args.mtp)
-    : args.useQwen35
-      ? await Qwen35Model.fromPretrained(glm, modelDir)
-      : await Qwen3Model.fromPretrained(glm, modelDir);
+  const model = await loadModel(glm, args, modelDir);
 
   const cache = model.createChatCache(args.maxPages, args.maxBatch, args.maxSeqLen);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);

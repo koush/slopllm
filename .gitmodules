@@ -7,4 +7,4 @@
 	url = https://github.com/koush/huggingface.js
 [submodule "vendor/transformers.js"]
 	path = vendor/transformers.js
-	url = https://github.com/huggingface/transformers.js
+	url = https://github.com/koush/transformers.js

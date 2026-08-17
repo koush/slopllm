@@ -5,7 +5,7 @@
 // engines are uninformative when the underlying divergence is chaotic.
 //
 //   npx tsx src/run_sweep.ts --gpus 0,1,2,3,4,5,6,7 --arena 92 --start 0 --count 10
-import { AutoTokenizer } from "@huggingface/transformers";
+import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
 import { DeviceOps } from "./device_ops";

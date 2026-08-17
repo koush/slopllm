@@ -6,7 +6,7 @@
 // collective changes.
 //
 //   npx tsx src/run_nll.ts --gpus 0,1,2,3,4,5,6,7 --arena 92 --tokens 512
-import { AutoTokenizer } from "@huggingface/transformers";
+import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";

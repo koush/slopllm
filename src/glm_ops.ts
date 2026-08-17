@@ -870,6 +870,8 @@ export class GlmOps implements DeviceOps {
   ctx: number;
   device: number;
   allocator: Allocator;
+  readonly arenaBase?: number;
+  readonly arenaSize?: number;
   capturing = false;
 
   constructor(deviceId: number = 0, libPath?: string, arenaGb?: number) {
@@ -885,7 +887,14 @@ export class GlmOps implements DeviceOps {
 
     if (arenaGb) {
       const size = arenaGb * 1024 * 1024 * 1024;
-      const base = getNativeAddon().alloc(this.ctx, size);
+      const baseEnv = process.env[`GLM_ARENA_BASE_${deviceId}`];
+      const base = baseEnv === undefined ? getNativeAddon().alloc(this.ctx, size) : Number(baseEnv);
+      if (!Number.isSafeInteger(base) || base <= 0) {
+        getNativeAddon().free(this.ctx);
+        throw new Error(`Invalid GLM_ARENA_BASE_${deviceId}: ${baseEnv ?? base}`);
+      }
+      this.arenaBase = base;
+      this.arenaSize = size;
       this.allocator = new ArenaAllocator(base, size);
     }
     else {

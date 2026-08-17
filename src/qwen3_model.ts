@@ -86,12 +86,13 @@ export class Qwen3Model extends ChatModel {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name, par);
       const offset = st.dataStart + meta.dataOffsets[0];
-      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
-
-      if (this.cfg.tieWordEmbeddings && name === "model.embed_tokens.weight" && !this.tensors.has("lm_head.weight")) {
-        const lmHead = this.alloc(meta.shape, dtype, "lm_head.weight", TensorParallelism.Column);
-        await lmHead.mmapLoad(mmapPtr, offset, lmHead.bytes);
-      }
+      const lmHead = this.cfg.tieWordEmbeddings && name === "model.embed_tokens.weight" && !this.tensors.has("lm_head.weight")
+        ? this.alloc(meta.shape, dtype, "lm_head.weight", TensorParallelism.Column)
+        : undefined;
+      await Promise.all([
+        tensor.mmapLoad(mmapPtr, offset, tensor.bytes),
+        lmHead?.mmapLoad(mmapPtr, offset, lmHead.bytes),
+      ]);
     }
   }
 

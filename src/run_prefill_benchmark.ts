@@ -1,4 +1,4 @@
-import { AutoTokenizer } from "@huggingface/transformers";
+import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
 import { CaptureManager } from "./capture-manager";
