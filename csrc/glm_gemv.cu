@@ -12,18 +12,21 @@
 namespace {
 
 // ---------------------------------------------------------------------------
-// cublasLt algorithm cache: maps (device_id, M, N, K) → heuristic result.
+// cublasLt algorithm cache: maps (device_id, M, N, K, workspace size) → heuristic result.
 // The heuristic is a host-side query that runs during warmup (before graph
 // capture). After capture, the graph replays the selected kernel — the cache
 // is never hit again.
 // ---------------------------------------------------------------------------
 struct LtCacheKey {
     int m, n, k;
-    bool operator==(const LtCacheKey& o) const { return m == o.m && n == o.n && k == o.k; }
+    size_t workspace_size;
+    bool operator==(const LtCacheKey& o) const {
+        return m == o.m && n == o.n && k == o.k && workspace_size == o.workspace_size;
+    }
 };
 struct LtCacheKeyHash {
     size_t operator()(const LtCacheKey& k) const {
-        return ((size_t)k.m * 1000003) ^ ((size_t)k.n * 1009) ^ (size_t)k.k;
+        return ((size_t)k.m * 1000003) ^ ((size_t)k.n * 1009) ^ (size_t)k.k ^ (k.workspace_size * 31);
     }
 };
 struct LtCacheEntry {
@@ -35,9 +38,6 @@ struct LtCacheEntry {
     bool valid = false;
 };
 static std::unordered_map<int, std::unordered_map<LtCacheKey, LtCacheEntry, LtCacheKeyHash>> g_lt_caches;
-
-constexpr size_t LT_WORKSPACE_SIZE = 32 * 1024 * 1024;
-constexpr size_t LT_WORKSPACE_PER_STREAM = LT_WORKSPACE_SIZE / GLM_MAX_STREAMS;
 
 constexpr int GEMV_WARP_SIZE = 32;
 constexpr int GEMV_ROWS_PER_BLOCK = 8;
@@ -1443,7 +1443,8 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
 // ---------------------------------------------------------------------------
 
 void glm_linear(GlmCtx* ctx, void* out, const void* input,
-                const void* weight, int batch, int n, int k) {
+                 const void* weight, int batch, int n, int k,
+                 void* workspace, size_t workspace_size) {
     cudaSetDevice(ctx->device_id);
 
     if (batch < 3) {
@@ -1514,7 +1515,7 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
     cublasLtHandle_t ltHandle = *reinterpret_cast<cublasLtHandle_t*>(&ctx->cublaslt_handle);
 
     auto& cache = g_lt_caches[ctx->device_id];
-    LtCacheKey key{batch, n, k};
+    LtCacheKey key{batch, n, k, workspace_size};
     auto& entry = cache[key];
 
     if (!entry.valid) {
@@ -1531,8 +1532,7 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
 
         cublasLtMatmulPreference_t pref;
         cublasLtMatmulPreferenceCreate(&pref);
-        size_t wsSize = LT_WORKSPACE_PER_STREAM;
-        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsSize, sizeof(wsSize));
+        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size));
         // DIAGNOSTIC: forbid split-K reduction schemes that accumulate via atomics
         // (nondeterministic run-to-run). Guarded so we can A/B; NONE-only algos are
         // deterministic. Falls back to cublasGemmEx if the heuristic returns nothing.
@@ -1548,11 +1548,10 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
     }
 
     if (entry.valid) {
-        void* ws = static_cast<char*>(ctx->cublaslt_workspace) + ctx->active_stream * LT_WORKSPACE_PER_STREAM;
         cublasLtMatmul(ltHandle, entry.opDesc, &alpha,
             weight, entry.Adesc, input, entry.Bdesc, &beta,
             out, entry.Cdesc, out, entry.Cdesc,
-            &entry.heuristic.algo, ws, LT_WORKSPACE_PER_STREAM,
+            &entry.heuristic.algo, workspace, workspace_size,
             GLM_STREAM(ctx));
     } else {
         cublasGemmEx(CUBLAS(ctx),

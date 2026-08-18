@@ -32,7 +32,6 @@ GlmCtx* glm_init(int device_id) {
     cublasSetStream(CUBLAS(ctx), ctx->streams[0]);
     cublasSetMathMode(CUBLAS(ctx), CUBLAS_TENSOR_OP_MATH);
     cublasLtCreate(reinterpret_cast<cublasLtHandle_t*>(&ctx->cublaslt_handle));
-    cudaMalloc(&ctx->cublaslt_workspace, 32 * 1024 * 1024);
     // this suppresses most non deterministic output
     // can be used for sanity checking in case of deviation
     // cublasSetMathMode(CUBLAS(ctx), CUBLAS_PEDANTIC_MATH);
@@ -45,7 +44,6 @@ void glm_free(GlmCtx* ctx) {
     cudaSetDevice(ctx->device_id);
     cublasDestroy(CUBLAS(ctx));
     cublasLtDestroy(*reinterpret_cast<cublasLtHandle_t*>(&ctx->cublaslt_handle));
-    cudaFree(ctx->cublaslt_workspace);
     for (int i = 0; i < GLM_MAX_STREAMS; i++) {
         cudaStreamDestroy(ctx->streams[i]);
         cudaEventDestroy(ctx->events[i]);

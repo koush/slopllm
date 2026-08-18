@@ -20,7 +20,6 @@ struct GlmCtx {
     cudaEvent_t events[GLM_MAX_STREAMS];
     void* cublas_handle;
     void* cublaslt_handle;
-    void* cublaslt_workspace;
 };
 
 typedef struct GlmCtx GlmCtx;
@@ -66,7 +65,8 @@ void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
                       const void* up, int intermediate, int batch);
 
 void glm_linear(GlmCtx* ctx, void* out, const void* input,
-                const void* weight, int batch, int n, int k);
+                const void* weight, int batch, int n, int k,
+                void* workspace, size_t workspace_size);
 
 void glm_layernorm(GlmCtx* ctx, void* out, const void* input,
                    const void* weight, const void* bias, float eps, int dim, int batch);

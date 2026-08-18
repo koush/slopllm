@@ -230,8 +230,8 @@ static Napi::Value SiluAndMul(const Napi::CallbackInfo& info) {
 
 static Napi::Value Linear(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 7) {
-        Napi::TypeError::New(env, "Expected (ctx, out, input, weight, batch, n, k)").ThrowAsJavaScriptException();
+    if (info.Length() < 9) {
+        Napi::TypeError::New(env, "Expected (ctx, out, input, weight, batch, n, k, workspace, workspace_size)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -241,11 +241,14 @@ static Napi::Value Linear(const Napi::CallbackInfo& info) {
     int batch = info[4].As<Napi::Number>().Int32Value();
     int n = info[5].As<Napi::Number>().Int32Value();
     int k = info[6].As<Napi::Number>().Int32Value();
+    uintptr_t workspace_ptr = info[7].As<Napi::Number>().Int64Value();
+    size_t workspace_size = info[8].As<Napi::Number>().Int64Value();
     glm_linear(reinterpret_cast<GlmCtx*>(ctx_ptr),
                reinterpret_cast<void*>(out_ptr),
                reinterpret_cast<const void*>(in_ptr),
                reinterpret_cast<const void*>(wt_ptr),
-               batch, n, k);
+               batch, n, k,
+               reinterpret_cast<void*>(workspace_ptr), workspace_size);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("linear failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

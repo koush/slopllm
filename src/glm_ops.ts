@@ -36,6 +36,7 @@ const SPARSE_MLA_DECODE_DISPATCH_MAX = Number(process.env.GLM_SPARSE_DECODE_DISP
 // paths support custom masks and query-sharding, so this is a pure occupancy/
 // memory tradeoff. Tunable to align with SPARSE_MLA_DECODE_DISPATCH_MAX.
 const INDEXER_DIRECT_DISPATCH_MAX = Number(process.env.GLM_INDEXER_DIRECT_DISPATCH_MAX ?? 64);
+const CUBLASLT_WORKSPACE_BYTES = 2 * 1024 * 1024;
 
 function findProjectRoot(dir: string): string {
   let d = dir;
@@ -83,7 +84,7 @@ interface NativeAddon {
   fusedAddRmsnorm(ctx: number, out: number, residual: number, inputA: number, inputB: number, weight: number, eps: number, dim: number, batch: number): void;
   fusedNormRope(ctx: number, out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
-  linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number): void;
+  linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number, workspace: number, workspaceSize: number): void;
   fill(ctx: number, out: number, value: number, n: number): void;
   indexerScore(ctx: number, out: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: number): void;
   indexerScoreTopkPrefill(ctx: number, outIdx: number, outScores: number, q: number, kData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, qGlobalStart: number, customMask: number, maskIndptr: number, maskKvLen: number, scores: number, rowLen: number, maxKv: number, coarseHist: number, fineHist: number, meta: number, numSplits: number, cpWorldSize: number, cpRank: number, globalLastPageLen: number): void;
@@ -264,7 +265,8 @@ export class GlmTensor extends Tensor {
       const scale2 = weight.workspace.tensors.get(weight.name! + "_weight_scale_2")!;
       getNativeAddon().nvfp4LinearDecode(this.glm.ctx, out.data, this.data, weight.data, scale.data, scale2.data, batch, n, k, 0);
     } else {
-      getNativeAddon().linear(this.glm.ctx, out.data, this.data, weight.data, batch, n, k);
+      using workspace = batch >= 3 ? this.workspace.allocRaw(CUBLASLT_WORKSPACE_BYTES) : undefined;
+      getNativeAddon().linear(this.glm.ctx, out.data, this.data, weight.data, batch, n, k, workspace?.data ?? 0, workspace?.bytes ?? 0);
     }
     return out;
   }

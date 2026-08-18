@@ -129,6 +129,7 @@ class GlmOps:
         if self.ctx is None or self.ctx == 0:
             raise RuntimeError(f"glm_init failed on device {device_id}")
         self.device = device_id
+        self._linear_workspace = None
 
     def _setup_signatures(self):
         self.lib.glm_init.restype = ctypes.c_void_p
@@ -164,7 +165,8 @@ class GlmOps:
         self.lib.glm_linear.restype = None
         self.lib.glm_linear.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_size_t
         ]
 
         self.lib.glm_layernorm.restype = None
@@ -914,6 +916,9 @@ class GlmOps:
 
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
+            if getattr(self, '_linear_workspace', None):
+                self.lib.glm_free_buf(self.ctx, ctypes.c_void_p(self._linear_workspace))
+                self._linear_workspace = None
             self.lib.glm_free(self.ctx)
             self.ctx = None
 
@@ -998,12 +1003,17 @@ class GlmOps:
         )
 
     def linear(self, output, input, weight, batch, n, k):
+        workspace_size = 2 * 1024 * 1024 if batch >= 3 else 0
+        if workspace_size and self._linear_workspace is None:
+            self._linear_workspace = self.alloc(workspace_size)
         self.lib.glm_linear(
             self.ctx,
             self._ptr(output),
             self._ptr(input),
             self._ptr(weight),
-            batch, n, k
+            batch, n, k,
+            ctypes.c_void_p(self._linear_workspace) if self._linear_workspace else ctypes.c_void_p(0),
+            workspace_size
         )
 
     def embedding(self, output, table, ids, hidden, seq_len):
