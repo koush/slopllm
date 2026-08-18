@@ -3,26 +3,29 @@ import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { freeModelRuntime, loadModelRuntime, modelLabel, parseModelArgs } from "./model_cli";
 
-interface LoaderArgs {
+export interface LoaderArgs {
   controlHost: string;
   controlPort: number;
-  entry: string;
-  workerArgs: string[];
+  sharedArgs: string[];
+  initialCommand: WorkerCommand | null;
 }
 
-function parseLoaderArgs(argv: string[]): LoaderArgs {
+export interface WorkerCommand {
+  entry: string;
+  args: string[];
+}
+
+export function parseLoaderArgs(argv: string[]): LoaderArgs {
   const entryIndex = argv.findIndex(arg => /\.[cm]?[jt]s$/.test(arg));
-  if (entryIndex < 0) {
-    throw new Error("Expected an executor entry point, for example src/run_qwen3_unified.ts");
-  }
 
   let controlHost = "127.0.0.1";
   let controlPort = 8099;
   const sharedArgs: string[] = [];
-  for (let i = 0; i < entryIndex; i++) {
+  const loaderArgsEnd = entryIndex < 0 ? argv.length : entryIndex;
+  for (let i = 0; i < loaderArgsEnd; i++) {
     const arg = argv[i];
-    if (arg === "--control-host" && i + 1 < entryIndex) controlHost = argv[++i];
-    else if (arg === "--control-port" && i + 1 < entryIndex) controlPort = parseInt(argv[++i], 10);
+    if (arg === "--control-host" && i + 1 < loaderArgsEnd) controlHost = argv[++i];
+    else if (arg === "--control-port" && i + 1 < loaderArgsEnd) controlPort = parseInt(argv[++i], 10);
     else sharedArgs.push(arg);
   }
   if (!Number.isInteger(controlPort) || controlPort <= 0 || controlPort > 65535) {
@@ -32,8 +35,11 @@ function parseLoaderArgs(argv: string[]): LoaderArgs {
   return {
     controlHost,
     controlPort,
-    entry: path.resolve(argv[entryIndex]),
-    workerArgs: [...sharedArgs, ...argv.slice(entryIndex + 1)],
+    sharedArgs,
+    initialCommand: entryIndex < 0 ? null : {
+      entry: path.resolve(argv[entryIndex]),
+      args: [...sharedArgs, ...argv.slice(entryIndex + 1)],
+    },
   };
 }
 
@@ -42,9 +48,40 @@ function sendJson(res: http.ServerResponse, status: number, body: object): void 
   res.end(JSON.stringify(body));
 }
 
+export function parseWorkerCommand(value: unknown, sharedArgs: string[]): WorkerCommand {
+  if (!Array.isArray(value) || value.length === 0 || value.some(arg => typeof arg !== "string")) {
+    throw new Error('Expected a JSON string array such as ["src/run_qwen3_unified.ts", "--batch"]');
+  }
+  const [entry, ...args] = value as string[];
+  if (!/\.[cm]?[jt]s$/.test(entry)) {
+    throw new Error(`Invalid executor entry point: ${entry}`);
+  }
+  return { entry: path.resolve(entry), args: [...sharedArgs, ...args] };
+}
+
+async function readWorkerCommand(req: http.IncomingMessage, sharedArgs: string[]): Promise<WorkerCommand | null> {
+  const chunks: Buffer[] = [];
+  let length = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    length += buffer.length;
+    if (length > 64 * 1024) throw new Error("Request body is too large");
+    chunks.push(buffer);
+  }
+  if (length === 0) return null;
+
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new Error("Request body must be valid JSON");
+  }
+  return parseWorkerCommand(value, sharedArgs);
+}
+
 async function main(): Promise<void> {
   const loaderArgs = parseLoaderArgs(process.argv.slice(2));
-  const modelArgs = parseModelArgs(loaderArgs.workerArgs);
+  const modelArgs = parseModelArgs(loaderArgs.initialCommand?.args ?? loaderArgs.sharedArgs);
   if (!modelArgs.arena) throw new Error("run_model_loader requires --arena <GiB>");
   if (modelArgs.useQwen35 || modelArgs.useFp8) {
     throw new Error("The model loader currently supports Qwen3 and GLM-5.1");
@@ -64,13 +101,15 @@ async function main(): Promise<void> {
   let lastExitCode: number | null = null;
   let lastError: string | null = null;
   let stopping: Promise<void> | null = null;
+  let workerCommand = loaderArgs.initialCommand;
 
   const startWorker = (follow?: http.ServerResponse): void => {
     if (worker) throw new Error("Executor worker is already running");
+    if (!workerCommand) throw new Error("No executor command has been configured");
     lastExitCode = null;
     lastError = null;
-    const next = new Worker(loaderArgs.entry, {
-      argv: loaderArgs.workerArgs,
+    const next = new Worker(workerCommand.entry, {
+      argv: workerCommand.args,
       execArgv: ["--require", require.resolve("tsx/cjs")],
       stdout: true,
       stderr: true,
@@ -106,7 +145,7 @@ async function main(): Promise<void> {
       if (worker === next) worker = null;
       console.log(`Executor worker exited with code ${code}`);
     });
-    console.log(`Started executor worker ${next.threadId}: ${loaderArgs.entry} ${loaderArgs.workerArgs.join(" ")}`);
+    console.log(`Started executor worker ${next.threadId}: ${workerCommand.entry} ${workerCommand.args.join(" ")}`);
   };
 
   const stopWorker = (): Promise<void> => {
@@ -133,7 +172,8 @@ async function main(): Promise<void> {
     return stopping;
   };
 
-  startWorker();
+  if (workerCommand) startWorker();
+  else console.log("No executor command configured; waiting for POST /run");
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? loaderArgs.controlHost}`);
@@ -141,20 +181,29 @@ async function main(): Promise<void> {
       sendJson(res, 200, {
         state: worker ? "running" : "idle",
         threadId: worker?.threadId ?? null,
-        entry: loaderArgs.entry,
-        args: loaderArgs.workerArgs,
+        entry: workerCommand?.entry ?? null,
+        args: workerCommand?.args ?? [],
         lastExitCode,
         lastError,
       });
       return;
     }
     if (req.method === "POST" && url.pathname === "/run") {
-      if (worker) {
-        sendJson(res, 409, { error: "Executor worker is already running" });
-      } else {
+      void readWorkerCommand(req, loaderArgs.sharedArgs).then(command => {
+        if (worker) {
+          sendJson(res, 409, { error: "Executor worker is already running" });
+          return;
+        }
+        if (command) workerCommand = command;
+        if (!workerCommand) {
+          sendJson(res, 400, { error: "No executor command was provided" });
+          return;
+        }
         startWorker();
         sendJson(res, 202, { state: "running", threadId: worker!.threadId });
-      }
+      }).catch(error => {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      });
       return;
     }
     if (req.method === "POST" && url.pathname === "/stop") {
@@ -162,6 +211,10 @@ async function main(): Promise<void> {
       return;
     }
     if (req.method === "POST" && url.pathname === "/restart") {
+      if (!workerCommand) {
+        sendJson(res, 400, { error: "No executor command has been configured" });
+        return;
+      }
       void stopWorker().then(() => {
         if (url.searchParams.has("follow")) {
           res.writeHead(200, {

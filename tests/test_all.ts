@@ -17,3 +17,4 @@ import "./test_narrow";
 import "./test_slice";
 import "./test_index_select";
 import "./test_mla_custom_mask";
+import "./test_model_loader";
