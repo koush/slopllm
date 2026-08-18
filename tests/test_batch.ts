@@ -754,6 +754,80 @@ describe("PagedKVCache prefix matching", () => {
     }
   });
 
+  it("truncate detaches a shared page before it can be overwritten", () => {
+    using pagedKV = makePagedKV(2, 64);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const base = makeLongPrompt(PAGE_SIZE);
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.reportTokens(0, base);
+    pagedKV.prefixMatch(1, base);
+
+    const sharedPage = pagedKV.sequences[0].pages[0];
+    const copiedPageId = pagedKV.availablePages[0];
+    assert.equal(sharedPage.refs, 2);
+
+    pagedKV.sequences[1].truncate(PAGE_SIZE - 1);
+
+    const copiedPage = pagedKV.sequences[1].pages[0];
+    assert.equal(pagedKV.sequences[0].pages[0], sharedPage);
+    assert.equal(sharedPage.refs, 1);
+    assert.equal(copiedPage.id, copiedPageId);
+    assert.equal(copiedPage.refs, 1);
+    assert.deepStrictEqual(copiedPage.tokenIds, sharedPage.tokenIds);
+    assert.equal(pagedKV.sequences[1].allocLen, PAGE_SIZE - 1);
+
+    const pageBytes = pagedKV.nKv * PAGE_SIZE * pagedKV.hd * 2;
+    for (const data of [pagedKV.kData[0], pagedKV.vData[0]]) {
+      const buf = Buffer.alloc(data.bytes);
+      data.d2h(buf);
+      const src = buf.subarray(sharedPage.id * pageBytes, (sharedPage.id + 1) * pageBytes);
+      const dst = buf.subarray(copiedPage.id * pageBytes, (copiedPage.id + 1) * pageBytes);
+      assert.deepStrictEqual(dst, src);
+    }
+  });
+
+  it("truncate keeps an exclusively owned page in place", () => {
+    using pagedKV = makePagedKV(1, 64);
+    const base = makeLongPrompt(PAGE_SIZE);
+
+    pagedKV.reset(1);
+    ws.forwardEagerPrefill(model, [base], pagedKV);
+    pagedKV.reportTokens(0, base);
+
+    const page = pagedKV.sequences[0].pages[0];
+    const availablePages = pagedKV.availablePages.length;
+    pagedKV.sequences[0].truncate(PAGE_SIZE - 1);
+
+    assert.equal(pagedKV.sequences[0].pages[0], page);
+    assert.equal(page.refs, 1);
+    assert.equal(pagedKV.availablePages.length, availablePages);
+  });
+
+  it("truncate recycles a released trailing page for copy-on-write", () => {
+    using pagedKV = makePagedKV(2, 2);
+    using ws2 = new ExecutionWorkspace(glm, 2, 4096);
+    const base = makeLongPrompt(PAGE_SIZE);
+
+    pagedKV.reset(2);
+    ws2.forwardEagerPrefill(model, [base, []], pagedKV);
+    pagedKV.reportTokens(0, base);
+    pagedKV.prefixMatch(1, base);
+    pagedKV.allocAppendPages(1, PAGE_SIZE);
+
+    const sharedPage = pagedKV.sequences[0].pages[0];
+    const trailingPage = pagedKV.sequences[1].pages[1];
+    assert.equal(pagedKV.availablePages.length, 0);
+
+    pagedKV.sequences[1].truncate(PAGE_SIZE - 1);
+
+    assert.equal(pagedKV.sequences[1].pages[0].id, trailingPage.id);
+    assert.equal(pagedKV.sequences[1].pages[0].refs, 1);
+    assert.equal(sharedPage.refs, 1);
+    assert.equal(pagedKV.availablePages.length, 0);
+  });
+
   it("cross-sequence: only full pages shared, partial page not shared", () => {
     using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);

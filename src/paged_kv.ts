@@ -66,11 +66,31 @@ export class Sequence {
     if (newLen < 0 || newLen > this.allocLen) {
       throw new Error(`truncate: newLen ${newLen} out of range [0, ${this.allocLen}]`);
     }
-    this.allocLen = newLen;
+    if (newLen === this.allocLen) return;
+
     const pageSize = this.pagedKvCache.pageSize;
+    this.allocLen = newLen;
     while (this.pages.length > 0 && newLen <= (this.pages.length - 1) * pageSize) {
       this.popPage();
     }
+
+    if (newLen % pageSize === 0) return;
+
+    // Appending after a non-page-aligned truncation overwrites the retained
+    // page. Detach it first so another sequence sharing the full page keeps its
+    // original KV contents.
+    const pageIdx = Math.floor(newLen / pageSize);
+    const page = this.pages[pageIdx];
+    if (page.refs === 1) return;
+
+    const newPageId = this.pagedKvCache.availablePages.shift();
+    if (newPageId === undefined) {
+      throw new Error("truncate: no available page for copy-on-write");
+    }
+    const newPage: Page = { id: newPageId, tokenIds: [...page.tokenIds], refs: 1 };
+    this.pagedKvCache.copyPage(page.id, newPage.id);
+    page.refs--;
+    this.pages[pageIdx] = newPage;
   }
 
   // Returns the number of matching tokens at the start of this sequence and inputIds.
