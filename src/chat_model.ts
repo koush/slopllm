@@ -59,7 +59,12 @@ export abstract class ChatModel extends WorkspaceBase {
 
   abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number): ChatCache;
   abstract forwardModel(state: ExecutionState): Tensor;
-  forwardMtp?(state: ExecutionState, previousHiddenState: Tensor, maskPos0?: boolean): Tensor;
+  forwardMtp?(state: ExecutionState, previousHiddenState: Tensor): Tensor;
+  forwardMtpDraftExtend?(state: ExecutionState): Tensor;
+
+  prepareMtpInput(_cache: ChatCache, inputIdsList: number[][]): number[][] {
+    return inputIdsList.map(inputIds => [...inputIds]);
+  }
 
   forward(state: ExecutionState): Tensor {
     using _tracker = state.ws.startTracking();

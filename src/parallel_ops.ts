@@ -3039,7 +3039,7 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  sparseMlaPrepareCache(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
+  sparseMlaPrepareCache(state: ExecutionState, groupSlots: Tensor, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
     const pKvCache = this.cast(kvCache);
     const pBatchIndices = this.cast(batchIndices);
     const pPositions = this.cast(positions);
@@ -3088,7 +3088,6 @@ export class ParallelOps implements DeviceOps {
         // (ensureAlloc), not as a stream result in extras.
         prefetched = pIndptr.workspace.tensors.get(prefetchKey) as ParallelTensor;
         if (!prefetched) {
-          const groupSlots = state.sharedSlots?.value;
           if (!groupSlots) {
             throw new Error(`sparseMlaPrepareCache: shared layer ${cacheIdx} has no group slots`);
           }

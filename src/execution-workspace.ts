@@ -2,7 +2,6 @@ import { CaptureManager } from "./capture-manager";
 import { ChatModel, type ChatCache } from "./chat_model";
 import { DeviceOps, MaskMode } from "./device_ops";
 import { MemcpyKind } from "./enums";
-import type { Glm51Config } from "./glm51_model";
 import { I32 } from "./glm_ops";
 import { type PagedKVCache } from "./paged_kv";
 import { Tensor } from "./tensor";
@@ -33,62 +32,32 @@ export class ExecutionState {
   // host pinned writes are not stream-ordered, so sharing a single host buffer
   // across plans would race. Device buffers also need to be per-state because
   // plan N+1's async H2D would overwrite the device buffer before run N reads it.
-  // Opaque integer scratch space used by FlashInfer's planner and run kernels.
   intWs!: Tensor;
-  // Pinned staging/scratch counterpart used by the host-side planner.
   intWsH!: Tensor;
-
-  // Opaque host-resident launch metadata produced by the corresponding
-  // FlashInfer plan call and consumed by each attention run call.
   decodePlanInfo!: Tensor;
   prefillPlanInfo!: Tensor;
   mlaPrefillPlanInfo!: Tensor;
   mlaDecodePlanInfo!: Tensor;
-
-  // Flattened input token IDs, with pinned staging for number[][] inputs.
   inputIdsBuf!: Tensor;
   inputIdsBufH!: Tensor;
-  // Absolute position of each flattened query/token (RoPE and cache writes).
   positionIds!: Tensor;
   positionIdsH!: Tensor;
-
-  // Query/output row boundaries for the flattened batch. This has batchSize + 1
-  // cumulative token counts; sequence i's query rows are
-  // [qoIndptr[i], qoIndptr[i + 1]). For prefill seqLens [3, 2] it is [0, 3, 5];
-  // for decode, where every sequence has one query token, it is [0, 1, 2, ...].
   qoIndptrD!: Tensor;
   qoIndptrH!: Tensor;
-  // Physical flat KV-cache destination for each appended standard-attention
-  // token: pageId * pageSize + offsetWithinPage.
   slotMapping!: Tensor;
   slotMappingH!: Tensor;
-
-  // Compressed sparse row offsets: page IDs are stored in the flat indices
-  // array, and sequence i owns indices[indptr[i]..indptr[i + 1]).
   indptrD!: Tensor;
   indptrH!: Tensor;
-  // Number of valid local tokens in each sequence's final cache page.
   lastPageLen!: Tensor;
   lastPageLenH!: Tensor;
-  // Number of valid global tokens represented by the final page. This differs
-  // from lastPageLen under context parallelism, where a local page is sharded.
   globalLastPageLen!: Tensor;
   globalLastPageLenH!: Tensor;
-
-  // Total logical KV length for each sequence, used when planning MLA prefill.
   kvLenH!: Tensor;
   kvLenD!: Tensor;
-  // Compressed sparse row offsets into a conceptual flattened, de-paged
-  // KV-token array. Used to convert per-sequence token positions to flat slots
-  // and gather sparse MLA KV.
   kvTokenIndptrH!: Tensor;
   kvTokenIndptrD!: Tensor;
-  // Sequence index for each flattened MLA query/appended token.
   mlaBatchIndices!: Tensor;
   mlaBatchIndicesH!: Tensor;
-
-  // Concatenated physical page IDs for all sequences; indptr partitions this
-  // array into each sequence's page table.
   indices!: Tensor;
   indicesH!: Tensor;
 
@@ -160,11 +129,11 @@ export class ExecutionState {
     );
   }
 
-  sparseMlaPrepareCache(appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, cacheIdx: number, kvLoraRank: number, qkRopeDim: number) {
+  sparseMlaPrepareCache(slots: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, cacheIdx: number, kvLoraRank: number, qkRopeDim: number) {
     const pagedKV = this.cache.getPagedKV();
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     return this.ws.glm.sparseMlaPrepareCache(
-      this, cacheIdx,
+      this, slots, cacheIdx,
       pagedKV.ckvData[cacheIdx], appendCkv, appendKpe,
       topk,
       this.indices, this.indptrD,
@@ -214,9 +183,9 @@ export class ExecutionState {
 
   // Run the indexer and return the raw top-k token positions (Replicated
   // [totalQ, topk]) and scores (Replicated [totalQ, topk] BF16). Slot
-  // conversion is deferred to topkSlots() so the same top-k can be reused
-  // across shared layers and mapped to whichever addressing (flat/paged) each
-  // layer's CKV buffer requires.
+  // conversion is deferred to the GLM attention layer so the same top-k can be
+  // reused across shared layers and mapped to whichever addressing
+  // (flat/paged) each layer's CKV buffer requires.
   indexerTopk(idxQ: Tensor, cacheIdx: number, weights: Tensor, scale: number, topk: number): { values: Tensor, indices: Tensor } {
     const pagedKV = this.cache.getPagedKV();
     const kData = pagedKV.kData[cacheIdx];
@@ -230,65 +199,6 @@ export class ExecutionState {
       0,
       cm?.mask, cm?.indptr, cm?.maskKvLen,
     );
-  }
-
-  sparseMlaSlots(cacheIdx: number, topkIdx: Tensor | undefined) {
-    const cfg = this.model.cfg as Glm51Config;
-    const isSharedLayer = cfg.indexerTypes[cacheIdx] === "shared";
-
-    if (!this.sharedSlots || !this.sharedSlotsLength)
-      throw new Error('Shared slot holders must be installed before calling sparseMlaSlots.');
-
-    if (!topkIdx) {
-      if (!isSharedLayer)
-        throw new Error('Full layers must receive topkIdx; they cannot reuse the group cache.');
-      if (!this.sharedSlots.value || !this.sharedSlotsLength.value)
-        throw new Error('Shared layer has no group cache; the preceding full layer did not populate one.');
-
-      return {
-        slots: this.sharedSlots!.value.viewClone(),
-        length: this.sharedSlotsLength!.value.viewClone(),
-        stream: undefined,
-      };
-    }
-
-    if (isSharedLayer)
-      throw new Error('Shared layers should not receive topkIdx; they reuse the group cache.');
-
-    const pagedKV = this.cache.getPagedKV();
-    const kData = pagedKV.kData[cacheIdx];
-    const maxKv = kData.shape[0] * kData.shape[1];
-
-    // Release the previous group cache BEFORE allocating the new one. Its
-    // consumers — the preceding shared layers, and that layer's gather stream —
-    // are all enqueued already, so the block is dead. Returning it to the pool
-    // first is what lets the new group land on the same address every step;
-    // allocating while it is still held forces the pool to grow and the
-    // retained block then rotates, which breaks graph replay.
-    this.sharedSlots.release();
-    this.sharedSlotsLength.release();
-
-    // The ops layer resolves both addressings from cacheIdx and hands back this
-    // layer's slots plus the ones the following shared group needs — the same
-    // buffer via a viewClone whenever they agree.
-    const { layer, group, stream } = this.ws.glm.topkToSlots(
-      this,
-      topkIdx, this.kvTokenIndptrD,
-      this.indices, this.indptrD, this.lastPageLen, this.mlaBatchIndices,
-      pagedKV.pageSize, maxKv,
-      cacheIdx, pagedKV.contextParallel,
-    );
-
-    // Publish the group cache for the shared layers (and the MTP passes) that
-    // follow. Holds the parent allocation; the caller `using`s `layer`.
-    this.sharedSlots.replace(group.slots);
-    this.sharedSlotsLength.replace(group.length);
-
-    return {
-      slots: layer.slots,
-      length: layer.length,
-      stream,
-    };
   }
 
   denseMla(qNope: Tensor, qPe: Tensor, cacheIdx: number, smScale: number): { o: Tensor, lse: Tensor } {

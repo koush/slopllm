@@ -316,6 +316,37 @@ export class Glm51Model extends ChatModel {
     return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim, sharedLayers);
   }
 
+  prepareMtpInput(cache: ChatCache, inputIdsList: number[][]): number[][] {
+    const input = super.prepareMtpInput(cache, inputIdsList);
+    if (!this.mtp) return input;
+
+    const sequences = cache.getPagedKV().sequences;
+    if (sequences.length !== input.length) {
+      throw new Error(`prepareMtpInput: cache has ${sequences.length} sequences, received ${input.length} inputs`);
+    }
+
+    for (let i = 0; i < input.length; i++) {
+      const sequence = sequences[i];
+      const tokenIds = sequence.getTokenIds();
+      const reportedLen = tokenIds.length;
+      if (reportedLen === 0) continue;
+
+      let previousToken: number;
+      if (reportedLen === sequence.allocLen + 1) {
+        // The sampled token is reported but has not passed through the target
+        // model yet. It is already the overlap token for this prefill.
+        previousToken = tokenIds[sequence.allocLen];
+      } else if (reportedLen === sequence.allocLen && sequence.allocLen > 0) {
+        previousToken = tokenIds[sequence.allocLen - 1];
+        sequence.truncate(sequence.allocLen - 1);
+      } else {
+        throw new Error(`prepareMtpInput: sequence ${i} has allocLen ${sequence.allocLen} but ${reportedLen} reported tokens`);
+      }
+      input[i].unshift(previousToken);
+    }
+    return input;
+  }
+
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
     return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`));
   }
@@ -414,8 +445,8 @@ export class Glm51Model extends ChatModel {
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
 
       // The physical slots are derived per-layer from sharedTopk at attention
-      // time (see topkSlots below); the topk arg here is vestigial.
-      return state.sparseMlaPrepareCache(ckvNormed, kPeRope, undefined, layerIdx, kvLoraRank, qkRopeDim);
+      // time below; the topk arg here is vestigial.
+      return state.sparseMlaPrepareCache(state.sharedSlots!.value, ckvNormed, kPeRope, undefined, layerIdx, kvLoraRank, qkRopeDim);
     });
 
     const dense = cfg.indexHeadDim === 0;
@@ -491,9 +522,56 @@ export class Glm51Model extends ChatModel {
     const topkResult = idxQStream?.result;
     using topkValues = topkResult?.values;
     using topkIndices = topkResult?.indices;
-    const sparseSlots = cfg.indexHeadDim === 0
-      ? undefined
-      : state.sparseMlaSlots(layerIdx, topkIndices);
+
+    let sparseSlots: {
+      slots: Tensor,
+      length: Tensor,
+      stream?: Disposable & { streamWaitEvent(): void, synchronize(): void },
+    } | undefined;
+    if (cfg.indexHeadDim !== 0) {
+      const sharedSlots = state.sharedSlots;
+      const sharedSlotsLength = state.sharedSlotsLength;
+      if (!sharedSlots || !sharedSlotsLength) {
+        throw new Error('Shared slot holders must be installed before sparse MLA attention.');
+      }
+
+      if (!topkIndices) {
+        if (!shared) {
+          throw new Error('Full layers must receive topk indices; they cannot reuse the group cache.');
+        }
+        if (!sharedSlots.value || !sharedSlotsLength.value) {
+          throw new Error(`Shared layer ${layerIdx} has no group cache; the preceding full layer did not populate one.`);
+        }
+        sparseSlots = {
+          slots: sharedSlots.value.viewClone(),
+          length: sharedSlotsLength.value.viewClone(),
+        };
+      }
+      else {
+        if (shared) {
+          throw new Error('Shared layers should not receive topk indices; they reuse the group cache.');
+        }
+
+        // Release the previous group before allocating the next one so the
+        // workspace reuses the same addresses on every graph replay.
+        sharedSlots.release();
+        sharedSlotsLength.release();
+
+        const pagedKV = state.cache.getPagedKV();
+        const kData = pagedKV.kData[layerIdx];
+        const maxKv = kData.shape[0] * kData.shape[1];
+        const { layer, group, stream } = this.glm.topkToSlots(
+          state,
+          topkIndices, state.kvTokenIndptrD,
+          state.indices, state.indptrD, state.lastPageLen, state.mlaBatchIndices,
+          pagedKV.pageSize, maxKv,
+          layerIdx, pagedKV.contextParallel,
+        );
+        sharedSlots.replace(group.slots);
+        sharedSlotsLength.replace(group.length);
+        sparseSlots = { slots: layer.slots, length: layer.length, stream };
+      }
+    }
 
     using slots = sparseSlots?.slots;
     using slotsLength = sparseSlots?.length;
@@ -601,7 +679,7 @@ export class Glm51Model extends ChatModel {
     return normed.detach().removeTracking();
   }
 
-  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, maskPos0?: boolean) {
+  forwardMtp(state: ExecutionState, previousHiddenState: Tensor) {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const ws = state.ws;
@@ -617,10 +695,17 @@ export class Glm51Model extends ChatModel {
       return previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps);
     });
     using embedding = state.embedding(embedTable);
-    if (maskPos0) {
-      using firstRow = embedding.narrow(0, 1);
-      firstRow.fill(0, hs);
-    }
+    let row = 0;
+    const sequences = state.cache.getPagedKV().sequences;
+    // for (let i = 0; i < state.batchSize; i++) {
+    //   const seqLen = state.seqLens[i];
+    //   const startPos = sequences[i].allocLen - seqLen;
+    //   if (seqLen > 0 && startPos === 0) {
+    //     using firstRow = embedding.narrow(row, 1);
+    //     firstRow.fill(0, hs);
+    //   }
+    //   row += seqLen;
+    // }
     using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps);
     hnormStream.streamWaitEvent();
     using hnorm = hnormStream.result;
@@ -652,4 +737,8 @@ export class Glm51Model extends ChatModel {
     // deepseek_mtp which both recycle the post-shared_head-norm state.
     return result.normed.removeTracking();
   }
+
+  // forwardMtpDraftExtend(state: ExecutionState) {
+
+  // }
 }

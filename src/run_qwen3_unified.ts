@@ -48,7 +48,7 @@ class ExecutionResources implements Disposable {
   constructor(
     private readonly glm: DeviceOps,
     private readonly gpuDevices: readonly DeviceOps[],
-  ) {}
+  ) { }
 
   [Symbol.dispose](): void {
     if (this.disposed) return;
@@ -177,7 +177,6 @@ export async function* generateStream(
   timing?: DecodeTiming, mtp?: boolean, mtpDraftTopk?: number[],
 ): AsyncGenerator<number> {
   const tokenizer = model.tokenizer;
-  const suffixIds = cache.prefixMatch(0, inputIds);
 
   using sampleWorkspace = new WorkspaceBase(glm);
   const greedy = !sampling;
@@ -204,7 +203,8 @@ export async function* generateStream(
 
   using captureManager = new CaptureManager(glm);
   const topks = (mtp && model.forwardMtp && mtpDraftTopk && mtpDraftTopk.length > 0) ? mtpDraftTopk : [];
-  const mtpStats = topks.length > 0 ? new MtpStats(topks.length) : undefined;
+  const usingMtp = topks.length > 0;
+  const mtpStats = usingMtp ? new MtpStats(topks.length) : undefined;
   if (timing && mtpStats) timing.mtpStats = mtpStats;
   using mtpHiddenStates = new UsingHolder<Tensor>(undefined!);
   let currentToken: number;
@@ -215,7 +215,10 @@ export async function* generateStream(
   using sharedSlots = new UsingHolder<Tensor>(undefined!);
   using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
   {
-    const inputIdsList = [suffixIds];
+    const suffixIds = cache.prefixMatch(0, inputIds);
+    const inputIdsList = usingMtp
+      ? model.prepareMtpInput(cache, [suffixIds])
+      : [suffixIds];
     const batchSize = inputIdsList.length;
     const seqLens = inputIdsList.map(ids => ids.length);
     const state = ws.planPrefill(model, batchSize, seqLens, cache);
@@ -226,7 +229,7 @@ export async function* generateStream(
     using firstTokens = state.computeLogits(hiddenStates, model);
     doSample(firstTokens);
 
-    if (mtp && model.forwardMtp && topks.length > 0) {
+    if (usingMtp) {
       // MTP convention: at position P, the input token is the token at P+1 (not P),
       // paired with the target model's hidden state at P. This means the MTP KV entry
       // at position P encodes info about token P+1, whereas the target model KV at the
@@ -234,7 +237,7 @@ export async function* generateStream(
       // KV slot — the two never interfere.
       using rotatedInputIds = state.input!.rotateInputIds(state.qoIndptrD, gpuSampleResult!, state.batchSize);
       state.setInput(rotatedInputIds);
-      using _mtpHiddenStates = model.forwardMtp(state, hiddenStates, true);
+      using _mtpHiddenStates = model.forwardMtp!(state, hiddenStates);
 
       const maxTopK = Math.max(...topks);
       const maxTopKShape = [maxTopK, ..._mtpHiddenStates.shape.slice(1)];
@@ -244,14 +247,15 @@ export async function* generateStream(
 
       mtpHiddenStates.replace(mtpHiddenStatesMaxTopK.removeTracking());
     }
+
+    sampleResult = sampleWorkspace.ensureAllocPinned(gpuSampleResult!.shape, gpuSampleResult!.type, "sampleResult");
+    sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
+    await glm.synchronizeAsync();
+    currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
+    cache.reportTokens(0, suffixIds);
+    cache.reportTokens(0, [currentToken]);
   }
 
-  sampleResult = sampleWorkspace.ensureAllocPinned(gpuSampleResult!.shape, gpuSampleResult!.type, "sampleResult");
-  sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
-  await glm.synchronizeAsync();
-  currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
-  cache.reportTokens(0, suffixIds);
-  cache.reportTokens(0, [currentToken]);
   tokenHistory.push(currentToken);
   yield currentToken;
   await new Promise<void>(resolve => setImmediate(resolve));
@@ -617,7 +621,7 @@ async function interactiveBatch(
 // --- Main ---
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
-  Error.stackTraceLimit = 20; 
+  Error.stackTraceLimit = 20;
 
   const args = parseArgs(argv);
 
