@@ -166,8 +166,12 @@ export class CaptureManager implements Disposable {
         if (capturing) {
             captured!.result = result;
             const graph = this.ops.graphEndCapture();
-            captured!.graphExec = this.ops.graphInstantiate(graph);
-            this.ops.graphDestroy(graph);
+            try {
+                captured!.graphExec = this.ops.graphInstantiate(graph);
+            }
+            finally {
+                this.ops.graphDestroy(graph);
+            }
             this.ops.graphLaunch(captured!.graphExec);
         }
         return result;

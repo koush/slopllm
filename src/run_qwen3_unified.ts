@@ -43,6 +43,41 @@ interface CliArgs extends ModelCliArgs {
   mtpDraftTopk: number[];
 }
 
+class ExecutionResources implements Disposable {
+  model?: ChatModel;
+  cache?: ChatCache;
+  ws?: ExecutionWorkspace;
+  private disposed = false;
+
+  constructor(
+    private readonly glm: DeviceOps,
+    private readonly gpuDevices: readonly DeviceOps[],
+  ) {}
+
+  [Symbol.dispose](): void {
+    if (this.disposed) return;
+    this.disposed = true;
+
+    let cleanupError: unknown;
+    const dispose = (fn: () => void) => {
+      try {
+        fn();
+      } catch (error) {
+        cleanupError ??= error;
+      }
+    };
+
+    dispose(() => this.glm.synchronize());
+    if (this.cache) dispose(() => this.cache![Symbol.dispose]());
+    if (this.ws) dispose(() => this.ws![Symbol.dispose]());
+    if (this.model) dispose(() => this.model![Symbol.dispose]());
+    if (this.glm instanceof ParallelOps) dispose(() => this.glm[Symbol.dispose]());
+    for (const device of this.gpuDevices) dispose(() => device[Symbol.dispose]());
+
+    if (cleanupError) throw cleanupError;
+  }
+}
+
 function parseArgs(argv: string[]): CliArgs {
   const args: CliArgs = {
     ...parseModelArgs(argv),
@@ -613,13 +648,17 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   const { glm, gpuDevices } = createDeviceOps(args);
+  using resources = new ExecutionResources(glm, gpuDevices);
 
   const gpuLabel = args.gpus.join(",");
 
   const model = await loadModel(glm, args, modelDir);
+  resources.model = model;
 
   const cache = model.createChatCache(args.maxPages, args.maxBatch, args.maxSeqLen);
+  resources.cache = cache;
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
+  resources.ws = ws;
 
   // Prefer the *resolved* model directory, not just an explicit --model-dir.
   // The served checkpoint ships its own chat_template.jinja, and for GLM-5.x
@@ -647,15 +686,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const mtpStr = args.mtp ? `  |  mtp=${args.mtpDraftTopk.join(',')}` : "";
   console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${args.maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}${arenaStr}${mtpStr}`);
 
-  const cleanup = () => {
-    glm.synchronize();
-    cache.free();
-    ws.free();
-    model.free();
-    if (glm instanceof ParallelOps) glm.free();
-    for (const d of gpuDevices) d.free();
-  };
-
   if (args.useBatch) {
     await interactiveBatch(model, ws, cache, tokenizer, args, chatTemplate);
   } else {
@@ -668,7 +698,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }
   }
 
-  cleanup();
 }
 
 // Only run as a CLI. This module also exports generateStream, and without the
