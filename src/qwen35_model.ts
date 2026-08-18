@@ -139,7 +139,7 @@ export class Qwen35Model extends ChatModel {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Qwen35Model(glm, config);
-    await model.fromPretrained(modelDir);
+    await model.fromPretrained(modelDir, QWEN35_REPO);
     return model;
   }
 

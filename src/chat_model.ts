@@ -1,8 +1,10 @@
+import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
 import { DeviceOps } from "./device_ops";
 import { ExecutionState } from "./execution-workspace";
 import { f32ToBf16Bytes, mmapClose, mmapOpen } from "./glm_ops";
+import { resolveModelPath } from "./model_path";
 import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
@@ -44,9 +46,12 @@ export interface CommonModelConfig {
   qkRopeHeadDim?: number;
 }
 
+export type Tokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
+
 export abstract class ChatModel extends WorkspaceBase {
   abstract readonly eosIds: Set<number>;
   abstract readonly cfg: CommonModelConfig;
+  tokenizer!: Tokenizer;
 
   constructor(glm: DeviceOps) {
     super(glm);
@@ -129,8 +134,20 @@ export abstract class ChatModel extends WorkspaceBase {
     }
   }
 
-  protected async fromPretrained(modelDir: string): Promise<void> {
+  protected async fromPretrained(modelDir: string, tokenizerRepo: string): Promise<void> {
     await this.loadWeights(modelDir);
+    const tokenizerDir = fs.existsSync(path.join(modelDir, "tokenizer_config.json"))
+      ? modelDir
+      : resolveModelPath(tokenizerRepo);
+    this.tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
+
+    // Served checkpoints may override the tokenizer repository's template.
+    const chatTemplatePath = [modelDir, tokenizerDir]
+      .map(dir => path.join(dir, "chat_template.jinja"))
+      .find(candidate => fs.existsSync(candidate));
+    if (chatTemplatePath) {
+      this.tokenizer.chat_template = fs.readFileSync(chatTemplatePath, "utf-8");
+    }
     this.freeze();
   }
 }

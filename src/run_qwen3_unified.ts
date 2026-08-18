@@ -1,14 +1,10 @@
-import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
-import fs from "node:fs";
-import path from "node:path";
 import { createInterface } from "node:readline";
 import { CaptureManager } from "./capture-manager";
-import { ChatCache, ChatModel, SamplingParams, makeSamplingParams } from "./chat_model";
+import { ChatCache, ChatModel, SamplingParams, Tokenizer, makeSamplingParams } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { MetaOps } from "./meta_ops";
 import { createDeviceOps, loadModel, modelLabel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
-import { resolveModelPath } from "./model_path";
 import { MtpStats, mtpTreeDecode } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
 import { SamplingWorkspace, Tensor } from "./tensor";
@@ -144,9 +140,8 @@ function parseArgs(argv: string[]): CliArgs {
 }
 
 function tokenizeMessages(
-  tokenizer: any,
+  tokenizer: Tokenizer,
   messages: Array<{ role: string; content: string }>,
-  chatTemplate?: string,
 ): number[] {
   try {
     const opts: any = {
@@ -155,8 +150,7 @@ function tokenizeMessages(
       return_tensor: false,
       return_dict: true,
     };
-    if (chatTemplate) opts.chat_template = chatTemplate;
-    const result = tokenizer.apply_chat_template(messages, opts) as { input_ids: number[] | number[][] };
+    const result = tokenizer.apply_chat_template(messages, opts) as unknown as { input_ids: number[] | number[][] };
     return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
   } catch {
     const text = messages.map(m => `<|${m.role}|>\n${m.content}`).join("\n") + "\n\n\n";
@@ -180,8 +174,9 @@ export async function* generateStream(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
-  timing?: DecodeTiming, mtp?: boolean, mtpDraftTopk?: number[], tokenizer?: any,
+  timing?: DecodeTiming, mtp?: boolean, mtpDraftTopk?: number[],
 ): AsyncGenerator<number> {
+  const tokenizer = model.tokenizer;
   const suffixIds = cache.prefixMatch(0, inputIds);
 
   using sampleWorkspace = new WorkspaceBase(glm);
@@ -282,7 +277,7 @@ export async function* generateStream(
 
       if (mtp && model.forwardMtp && topks.length > 0) {
         if (process.env.GLM_STEP_LOG === '1') process.stderr.write(`[step ${i}] seqLen=${cache.getPagedKV().sequences[0].allocLen} histLen=${tokenHistory.length}\n`);
-        const { warmup, tokens, numAccepted, numDraftTokens } = await mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots.value, sharedSlotsLength.value, ws, currentToken, topks, cache, tokenizer);
+        const { warmup, tokens, numAccepted, numDraftTokens } = await mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots.value, sharedSlotsLength.value, ws, currentToken, topks, cache);
         if (mtpStats && !warmup) mtpStats.observe(numDraftTokens, numAccepted);
         // glm.synchronize();
         for (const t of tokens) {
@@ -319,9 +314,9 @@ export async function* generateStream(
         }
 
         continue;
-        // console.log(`MTP accepted=${verifyResult.numAccepted}/${topks.length} replacement=${tokenizer?.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
+        // console.log(`MTP accepted=${verifyResult.numAccepted}/${topks.length} replacement=${tokenizer.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
         // if (verifyResult.acceptedTokens.length > 0) {
-        //   console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer?.decode([t]) ?? `?${t}`).join(" ")}`);
+        //   console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer.decode([t]) ?? `?${t}`).join(" ")}`);
         // }
       }
 
@@ -445,8 +440,9 @@ export function generateBatchTokens(
 
 async function interactiveChat(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
-  tokenizer: any, args: CliArgs, graphState: GraphState | undefined, chatTemplate?: string,
+  args: CliArgs, graphState: GraphState | undefined,
 ): Promise<void> {
+  const tokenizer = model.tokenizer;
   const sp = makeSamplingParams(args);
   const eosIds = model.eosIds;
   const messages: Array<{ role: string; content: string }> = [];
@@ -471,16 +467,16 @@ async function interactiveChat(
       }
 
       messages.push({ role: "user", content: userInput });
-      const inputIds = tokenizeMessages(tokenizer, messages, chatTemplate);
+      const inputIds = tokenizeMessages(tokenizer, messages);
 
       if (inputIds.length > args.maxSeqLen - args.maxNewTokens) {
         console.log(`Warning: prompt (${inputIds.length} tokens) too long, truncating conversation`);
         while (inputIds.length > args.maxSeqLen - args.maxNewTokens && messages.length > 1) {
           messages.splice(1, 2);
-          const retryIds = tokenizeMessages(tokenizer, messages, chatTemplate);
+          const retryIds = tokenizeMessages(tokenizer, messages);
           if (retryIds.length <= args.maxSeqLen - args.maxNewTokens) break;
         }
-        if (messages.length === 1 && tokenizeMessages(tokenizer, messages, chatTemplate).length > args.maxSeqLen - args.maxNewTokens) {
+        if (messages.length === 1 && tokenizeMessages(tokenizer, messages).length > args.maxSeqLen - args.maxNewTokens) {
           console.log("Conversation too long even after truncation. Use /clear to reset.");
           messages.pop();
           continue;
@@ -493,7 +489,7 @@ async function interactiveChat(
       const generatedIds: number[] = [];
       const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-      for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk, tokenizer)) {
+      for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk)) {
         generatedIds.push(tokenId);
         tokCount++;
         const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -517,12 +513,13 @@ async function interactiveChat(
 
 async function singlePrompt(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
-  tokenizer: any, args: CliArgs, graphState: GraphState | undefined, chatTemplate?: string,
+  args: CliArgs, graphState: GraphState | undefined,
 ): Promise<void> {
+  const tokenizer = model.tokenizer;
   const sp = !args.greedy ? makeSamplingParams(args) : undefined;
   const eosIds = model.eosIds;
   const messages = [{ role: "user", content: args.prompt! }];
-  const inputIds = tokenizeMessages(tokenizer, messages, chatTemplate);
+  const inputIds = tokenizeMessages(tokenizer, messages);
 
   console.log(`Prompt: ${args.prompt}`);
   console.log(`Tokens: ${inputIds.length}`);
@@ -533,7 +530,7 @@ async function singlePrompt(
   const generatedIds: number[] = [];
   const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-  for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk, tokenizer)) {
+  for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -553,8 +550,9 @@ async function singlePrompt(
 
 async function interactiveBatch(
   model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache,
-  tokenizer: any, args: CliArgs, chatTemplate?: string,
+  args: CliArgs,
 ): Promise<void> {
+  const tokenizer = model.tokenizer;
   console.log("Enter prompts one per line. Empty line to submit batch. /clear to reset, /q to quit.");
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -588,7 +586,7 @@ async function interactiveBatch(
       const inputIdsList: number[][] = [];
       for (const prompt of prompts) {
         const messages = [{ role: "user" as const, content: prompt }];
-        const ids = tokenizeMessages(tokenizer, messages, chatTemplate);
+        const ids = tokenizeMessages(tokenizer, messages);
         inputIdsList.push(ids);
       }
 
@@ -623,7 +621,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   const args = parseArgs(argv);
 
-  const { modelDir, repoId } = resolveModelSelection(args);
+  const { modelDir } = resolveModelSelection(args);
 
   if (args.meta) {
     const metaOps = new MetaOps();
@@ -660,19 +658,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
   resources.ws = ws;
 
-  // Prefer the *resolved* model directory, not just an explicit --model-dir.
-  // The served checkpoint ships its own chat_template.jinja, and for GLM-5.x
-  // that template emits a "<|system|>Reasoning Effort: ..." prompt that governs
-  // how long the model thinks before closing </think>. Falling back to the
-  // tokenizer repo's older template drops that system prompt entirely, which
-  // leaves the model off-distribution: it either stubs out after a few hundred
-  // tokens or never closes the thinking block at all.
-  const tokenizerDir = fs.existsSync(path.join(modelDir, "tokenizer_config.json"))
-    ? modelDir : resolveModelPath(repoId);
-  const tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
-  const chatTemplatePath = path.join(tokenizerDir, "chat_template.jinja");
-  const chatTemplate = fs.existsSync(chatTemplatePath) ? fs.readFileSync(chatTemplatePath, "utf-8") : undefined;
-
   const sp = makeSamplingParams(args);
   const samplingParts: string[] = [];
   if (sp.temperature > 0) samplingParts.push(`temp=${sp.temperature}`);
@@ -687,14 +672,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${args.maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}${arenaStr}${mtpStr}`);
 
   if (args.useBatch) {
-    await interactiveBatch(model, ws, cache, tokenizer, args, chatTemplate);
+    await interactiveBatch(model, ws, cache, args);
   } else {
     const graphState = args.noCudaGraph ? undefined : { graphExec: null as number | null, warmupRemaining: args.warmupSteps };
 
     if (args.prompt) {
-      await singlePrompt(model, ws, glm, cache, tokenizer, args, graphState, chatTemplate);
+      await singlePrompt(model, ws, glm, cache, args, graphState);
     } else {
-      await interactiveChat(model, ws, glm, cache, tokenizer, args, graphState, chatTemplate);
+      await interactiveChat(model, ws, glm, cache, args, graphState);
     }
   }
 

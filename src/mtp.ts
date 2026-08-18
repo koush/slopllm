@@ -177,12 +177,12 @@ export async function mtpTreeDecode(
   targetToken: number,
   topks: number[],
   cache: ChatCache,
-  tokenizer?: any,
 ) {
   if (!model.forwardMtp) {
     throw new Error("mtpTreeDecode: model does not support MTP (forwardMtp not defined)");
   }
 
+  const tokenizer = model.tokenizer;
   const lmHead = model.tensors.get("lm_head.weight")!;
 
   const pagedKV = cache.getPagedKV();

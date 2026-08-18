@@ -5,18 +5,13 @@
 // engines are uninformative when the underlying divergence is chaotic.
 //
 //   npx tsx src/run_sweep.ts --gpus 0,1,2,3,4,5,6,7 --arena 92 --start 0 --count 10
-import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
-import fs from "node:fs";
-import path from "node:path";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
-import { resolveModelPath } from "./model_path";
 import { ParallelOps } from "./parallel_ops";
 import { generateStream } from "./run_qwen3_unified";
 
-const GLM51_REPO = "zai-org/GLM-5.1";
 const DEFAULT_MODEL_DIR = "/mnt/storage/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/2eff962076815828e4031aec2834ac6e22fb4434/";
 
 const PROMPTS = [
@@ -63,21 +58,14 @@ async function main() {
   const cache = model.createChatCache(parseInt(opt("--max-pages", "8192"), 10), 1, maxSeqLen);
   const ws = new ExecutionWorkspace(glm, 1, maxSeqLen);
 
-  const tokDir = resolveModelPath(GLM51_REPO);
-  const tokenizer = await AutoTokenizer.from_pretrained(tokDir, { local_files_only: true });
-  // Prefer the served model's own chat template. The tokenizer repo
-  // (zai-org/GLM-5.1) ships an older one with no "Reasoning Effort" system
-  // prompt, which is what vLLM emits and what governs thinking length.
-  const modelCt = path.join(modelDir, "chat_template.jinja");
-  const ctPath = fs.existsSync(modelCt) ? modelCt : path.join(tokDir, "chat_template.jinja");
-  const ct = fs.readFileSync(ctPath, "utf-8");
+  const tokenizer = model.tokenizer;
   const effort = process.env.GLM_REASONING_EFFORT;
-  console.log(`[template] ${ctPath}${effort ? `  reasoning_effort=${effort}` : ""}`);
+  console.log(`[template]${effort ? ` reasoning_effort=${effort}` : ""}`);
 
   let bad = 0, n = 0;
   for (const prompt of PROMPTS.slice(start, start + count)) {
     const r: any = tokenizer.apply_chat_template([{ role: "user", content: prompt }],
-      { tokenize: true, add_generation_prompt: true, return_tensor: false, return_dict: true, chat_template: ct,
+      { tokenize: true, add_generation_prompt: true, return_tensor: false, return_dict: true,
         ...(effort ? { reasoning_effort: effort } : {}) });
     const inputIds = (Array.isArray(r.input_ids[0]) ? r.input_ids[0] : r.input_ids) as number[];
 

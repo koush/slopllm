@@ -1,14 +1,10 @@
 import http from "node:http";
 import crypto from "node:crypto";
-import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
-import fs from "node:fs";
-import path from "node:path";
 import { parentPort } from "node:worker_threads";
-import { ChatModel, ChatCache, SamplingParams } from "./chat_model";
+import { ChatModel, ChatCache, SamplingParams, Tokenizer } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { SamplingWorkspace } from "./tensor";
-import { resolveModelPath } from "./model_path";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
 
@@ -99,9 +95,8 @@ Options:
 }
 
 function tokenizeMessages(
-  tokenizer: any,
+  tokenizer: Tokenizer,
   messages: Array<{ role: string; content: string }>,
-  chatTemplate?: string,
 ): number[] {
   try {
     const opts: any = {
@@ -110,8 +105,7 @@ function tokenizeMessages(
       return_tensor: false,
       return_dict: true,
     };
-    if (chatTemplate) opts.chat_template = chatTemplate;
-    const result = tokenizer.apply_chat_template(messages, opts) as { input_ids: number[] | number[][] };
+    const result = tokenizer.apply_chat_template(messages, opts) as unknown as { input_ids: number[] | number[][] };
     return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
   } catch {
     const text = messages.map(m => `<|${m.role}|>\n${m.content}`).join("\n") + "\n\n\n";
@@ -123,7 +117,7 @@ class TokenStreamDecoder {
   private tokenCache: number[] = [];
   private emittedText = "";
 
-  push(tokenId: number, tokenizer: any, skipSpecialTokens: boolean): string {
+  push(tokenId: number, tokenizer: Tokenizer, skipSpecialTokens: boolean): string {
     this.tokenCache.push(tokenId);
     const text = tokenizer.decode(this.tokenCache, { skip_special_tokens: skipSpecialTokens });
 
@@ -140,7 +134,7 @@ class TokenStreamDecoder {
     return delta;
   }
 
-  flush(tokenizer: any, skipSpecialTokens: boolean): string {
+  flush(tokenizer: Tokenizer, skipSpecialTokens: boolean): string {
     if (this.tokenCache.length === 0) return "";
     const text = tokenizer.decode(this.tokenCache, { skip_special_tokens: skipSpecialTokens });
     const delta = text.startsWith(this.emittedText)
@@ -197,8 +191,6 @@ async function generateContinuousBatch(
   ws: ExecutionWorkspace,
   glm: DeviceOps,
   cache: ChatCache,
-  tokenizer: any,
-  chatTemplate: string | undefined,
   eosIds: Set<number>,
   pendingQueue: CompletionRequest[],
   maxSeqLen: number,
@@ -206,6 +198,7 @@ async function generateContinuousBatch(
   decodeLatencyMs: number,
   metrics: ServerMetrics,
 ): Promise<void> {
+  const tokenizer = model.tokenizer;
   const pagedKV = cache.getPagedKV();
   const eosToken = [...eosIds][0];
   const active: ActiveSequence[] = [];
@@ -233,7 +226,7 @@ async function generateContinuousBatch(
 
       const inputIdsList: number[][] = [];
       for (const req of newRequests) {
-        const ids = tokenizeMessages(tokenizer, req.messages, chatTemplate);
+        const ids = tokenizeMessages(tokenizer, req.messages);
         req.maxTokens = Math.max(1, req.maxTokens);
         if (ids.length > maxSeqLen - req.maxTokens) {
           ids.splice(0, ids.length - (maxSeqLen - req.maxTokens));
@@ -364,11 +357,11 @@ async function generateBatch(
   ws: ExecutionWorkspace,
   glm: DeviceOps,
   cache: ChatCache,
-  tokenizer: any,
   eosIds: Set<number>,
   requests: CompletionRequest[],
   maxSeqLen: number,
 ): Promise<void> {
+  const tokenizer = model.tokenizer;
   if (requests.length === 0) return;
   const batchSize = requests.length;
   for (const req of requests) {
@@ -572,25 +565,21 @@ function sendMetrics(
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const args = parseArgs(argv);
 
-  const { modelDir, repoId } = resolveModelSelection(args);
-  const tokenizerDir = args.modelDir && fs.existsSync(path.join(args.modelDir, "tokenizer_config.json"))
-    ? args.modelDir : resolveModelPath(repoId);
+  const { modelDir } = resolveModelSelection(args);
 
   console.log(`Loading model from ${modelDir}...`);
   const { glm, gpuDevices } = createDeviceOps(args);
   const model = await loadModel(glm, args, modelDir);
   const cache = model.createChatCache(args.maxPages, args.batchSize, args.ctxSize);
   const ws = new ExecutionWorkspace(glm, args.batchSize, args.ctxSize);
-  const tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
-  const chatTemplatePath = path.join(tokenizerDir, "chat_template.jinja");
-  const chatTemplate = fs.existsSync(chatTemplatePath) ? fs.readFileSync(chatTemplatePath, "utf-8") : undefined;
+  const tokenizer = model.tokenizer;
   const eosIds = model.eosIds;
 
   console.log(`Model loaded. ctx-size=${args.ctxSize} batch-size=${args.batchSize} max-pages=${args.maxPages} max-tokens=${args.maxTokens}`);
 
   {
     console.log("Warming up...");
-    const warmupIds = tokenizeMessages(tokenizer, [{ role: "user", content: "Hello" }], chatTemplate);
+    const warmupIds = tokenizeMessages(tokenizer, [{ role: "user", content: "Hello" }]);
     cache.reset(1);
     using warmupSw = new SamplingWorkspace(glm, 1, model.cfg.vocabSize, args.repetitionPenaltyWindow);
     warmupSw.updateSampler([makeSamplingParamsHelper(args)], [warmupIds]);
@@ -644,7 +633,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       let totalPrompt = 0;
       const requestCount = pendingQueue.length;
       try {
-        await generateContinuousBatch(model, ws, glm, cache, tokenizer, chatTemplate, eosIds, pendingQueue, args.ctxSize, args.batchSize, args.decodeLatency, metrics);
+        await generateContinuousBatch(model, ws, glm, cache, eosIds, pendingQueue, args.ctxSize, args.batchSize, args.decodeLatency, metrics);
       } catch (err) {
         console.error("Continuous batch error:", err);
       }
@@ -861,7 +850,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       }
 
       try {
-        const tokens = tokenizeMessages(tokenizer, messages, chatTemplate);
+        const tokens = tokenizeMessages(tokenizer, messages);
         sendJSON(res, 200, {
           count: tokens.length,
           max_model_len: args.ctxSize,

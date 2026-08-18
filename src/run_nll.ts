@@ -6,16 +6,13 @@
 // collective changes.
 //
 //   npx tsx src/run_nll.ts --gpus 0,1,2,3,4,5,6,7 --arena 92 --tokens 512
-import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
 import { bf16BytesToF32, GlmOps } from "./glm_ops";
-import { resolveModelPath } from "./model_path";
 import { ParallelOps } from "./parallel_ops";
 
-const GLM51_REPO = "zai-org/GLM-5.1";
 const DEFAULT_MODEL_DIR = "/mnt/storage/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/2eff962076815828e4031aec2834ac6e22fb4434/";
 
 const argv = process.argv.slice(2);
@@ -40,7 +37,7 @@ async function main() {
   const cache = model.createChatCache(4096, 1, maxSeqLen);
   const ws = new ExecutionWorkspace(glm, 1, maxSeqLen);
 
-  const tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(GLM51_REPO), { local_files_only: true });
+  const tokenizer = model.tokenizer;
   const text = fs.readFileSync(textPath, "utf-8").slice(skip, skip + nTokens * 24);
   const encoded = tokenizer.encode(text) as number[];
   const ids = encoded.slice(0, nTokens);

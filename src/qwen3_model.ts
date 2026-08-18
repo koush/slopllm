@@ -10,6 +10,8 @@ import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { ExecutionState } from "./execution-workspace";
 
+const QWEN3_REPO = "Qwen/Qwen3-0.6B";
+
 export interface Qwen3Config extends CommonModelConfig {
   attentionBias: boolean;
   eosTokenIds: number[];
@@ -51,7 +53,7 @@ export class Qwen3Model extends ChatModel {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Qwen3Model(glm, config);
-    await model.fromPretrained(modelDir);
+    await model.fromPretrained(modelDir, QWEN3_REPO);
     return model;
   }
 

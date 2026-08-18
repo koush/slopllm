@@ -1,9 +1,7 @@
-import { AutoTokenizer } from "@huggingface/transformers";
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { GlmOps } from "../src/glm_ops";
-import { resolveModelPath } from "../src/model_path";
 import { PagedKVCache } from "../src/paged_kv";
 import { Qwen3Model } from "../src/qwen3_model";
 import { generateBatchTokens } from "./test_helper";
@@ -37,8 +35,7 @@ describe("Qwen3-0.6B batch smoke test", () => {
     ws = new ExecutionWorkspace(glm, 4, 2048);
     const cfg = model.cfg;
     cache = new PagedKVCache(glm, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, 128, 4);
-    const modelDir = resolveModelPath(QWEN3_REPO);
-    tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
+    tokenizer = model.tokenizer;
   });
 
   after(() => {

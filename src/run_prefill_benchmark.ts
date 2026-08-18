@@ -1,18 +1,14 @@
-import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
-import path from "node:path";
 import { CaptureManager } from "./capture-manager";
-import { ChatCache, ChatModel } from "./chat_model";
+import { ChatCache, ChatModel, Tokenizer } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { ParallelOps } from "./parallel_ops";
-import { resolveModelPath } from "./model_path";
 
 const GLM51_MODEL_DIR = '/mnt/storage/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/2eff962076815828e4031aec2834ac6e22fb4434/';
 const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp4";
-const GLM51_REPO = "zai-org/GLM-5.1";
 
 interface BenchArgs {
   gpus: number[];
@@ -85,9 +81,8 @@ Options:
 }
 
 function tokenizeMessages(
-  tokenizer: any,
+  tokenizer: Tokenizer,
   messages: Array<{ role: string; content: string }>,
-  chatTemplate?: string,
 ): number[] {
   try {
     const opts: any = {
@@ -96,8 +91,7 @@ function tokenizeMessages(
       return_tensor: false,
       return_dict: true,
     };
-    if (chatTemplate) opts.chat_template = chatTemplate;
-    const result = tokenizer.apply_chat_template(messages, opts) as { input_ids: number[] | number[][] };
+    const result = tokenizer.apply_chat_template(messages, opts) as unknown as { input_ids: number[] | number[][] };
     return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
   } catch {
     const text = messages.map(m => `<|${m.role}|>\n${m.content}`).join("\n") + "\n\n\n";
@@ -109,10 +103,10 @@ function tokenizeMessages(
 // prompt fits within seqLen tokens (keeps the chat-template suffix / generation
 // prompt intact, which raw token truncation would clobber).
 function buildSummaryPromptIds(
-  tokenizer: any, chatTemplate: string | undefined, docText: string, seqLen: number,
+  tokenizer: Tokenizer, docText: string, seqLen: number,
 ): number[] {
   const makeIds = (content: string) =>
-    tokenizeMessages(tokenizer, [{ role: "user", content: `Summarize the following text:\n\n${content}` }], chatTemplate);
+    tokenizeMessages(tokenizer, [{ role: "user", content: `Summarize the following text:\n\n${content}` }]);
 
   let content = docText;
   let ids = makeIds(content);
@@ -128,16 +122,11 @@ function buildSummaryPromptIds(
 
 async function runSummarize(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
-  args: BenchArgs, modelDir: string,
+  args: BenchArgs,
 ): Promise<void> {
-  const tokenizerDir = fs.existsSync(path.join(modelDir, "tokenizer_config.json"))
-    ? modelDir : resolveModelPath(GLM51_REPO);
-  const tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
-  const chatTemplatePath = path.join(tokenizerDir, "chat_template.jinja");
-  const chatTemplate = fs.existsSync(chatTemplatePath) ? fs.readFileSync(chatTemplatePath, "utf-8") : undefined;
-
+  const tokenizer = model.tokenizer;
   const docText = fs.readFileSync(args.file!, "utf-8");
-  const inputIds = buildSummaryPromptIds(tokenizer, chatTemplate, docText, args.seqLen);
+  const inputIds = buildSummaryPromptIds(tokenizer, docText, args.seqLen);
   const promptLen = inputIds.length;
   console.log(`Summarizing ${args.file} | ${docText.length} chars -> ${promptLen} prompt tokens (cap ${args.seqLen}) | max_new_tokens=${args.maxNewTokens}`);
 
@@ -220,7 +209,7 @@ async function main(): Promise<void> {
   console.log(`KV cache: ${maxPages} pages (${(maxPages * cachePageSize * 2 * (kvLoraRank ?? 512 + 64) / 1024 / 1024 / 1024).toFixed(1)} GB for MLA cache)`);
 
   if (args.file) {
-    await runSummarize(model, ws, glm, cache, args, modelDir);
+    await runSummarize(model, ws, glm, cache, args);
     glm.synchronize();
     cache.free();
     ws.free();

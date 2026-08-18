@@ -123,7 +123,7 @@ export class Glm51Model extends ChatModel {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Glm51Model(glm, config, contextParallel, mtp);
-    await model.fromPretrained(modelDir);
+    await model.fromPretrained(modelDir, GLM51_REPO);
     return model;
   }
 

@@ -6,8 +6,6 @@ import { Qwen3Model } from "../src/qwen3_model";
 import { Qwen35Model } from "../src/qwen35_model";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { PagedKVCache } from "../src/paged_kv";
-import { AutoTokenizer } from "@huggingface/transformers";
-import { resolveModelPath } from "../src/model_path";
 import type { ChatCache } from "../src/chat_model";
 import type { DeviceOps } from "../src/device_ops";
 
@@ -77,7 +75,7 @@ describe("Qwen3-0.6B Paris (1 GPU, no graph)", () => {
   before(async () => {
     glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
     ctx = await loadQwen3(glm, QWEN3_REPO);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN3_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx.free(); glm.free(); });
 
@@ -103,7 +101,7 @@ describe("Qwen3-0.6B-FP8 Paris (1 GPU, no graph)", () => {
   before(async () => {
     glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
     ctx = await loadQwen3(glm, FP8_REPO);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(FP8_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx.free(); glm.free(); });
 
@@ -129,7 +127,7 @@ describe("Qwen3.5-0.8B Paris (1 GPU, no graph)", () => {
   before(async () => {
     glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
     ctx = await loadQwen35(glm);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN35_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx.free(); glm.free(); });
 
@@ -161,7 +159,7 @@ describe("Qwen3-0.6B Paris (2 GPU, no graph)", () => {
     glm1 = new GlmOps(1);
     po = new ParallelOps([glm0, glm1]);
     ctx = await loadQwen3(po as any, QWEN3_REPO);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN3_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx.free(); po.free(); glm0.free(); glm1.free(); });
 
@@ -191,7 +189,7 @@ describe("Qwen3-0.6B-FP8 Paris (2 GPU, no graph)", () => {
     glm1 = new GlmOps(1);
     po = new ParallelOps([glm0, glm1]);
     ctx = await loadQwen3(po as any, FP8_REPO);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(FP8_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx.free(); po.free(); glm0.free(); glm1.free(); });
 
@@ -221,7 +219,7 @@ describe("Qwen3.5-0.8B Paris (2 GPU, no graph)", () => {
     glm1 = new GlmOps(1);
     po = new ParallelOps([glm0, glm1]);
     ctx = await loadQwen35(po as any);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN35_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx.free(); po.free(); glm0.free(); glm1.free(); });
 

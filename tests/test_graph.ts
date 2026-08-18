@@ -1,11 +1,9 @@
-import { AutoTokenizer } from "@huggingface/transformers";
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import type { ChatCache } from "../src/chat_model";
 import type { DeviceOps } from "../src/device_ops";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { GlmOps } from "../src/glm_ops";
-import { resolveModelPath } from "../src/model_path";
 import { PagedKVCache } from "../src/paged_kv";
 import { ParallelOps } from "../src/parallel_ops";
 import { Qwen35Model } from "../src/qwen35_model";
@@ -145,7 +143,7 @@ describe("Qwen3-0.6B Paris (1 GPU, graph)", () => {
   before(async () => {
     glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
     ctx = await loadQwen3(glm, QWEN3_REPO);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN3_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx[Symbol.dispose](); glm.free(); });
 
@@ -164,7 +162,7 @@ describe("Qwen3-0.6B-FP8 Paris (1 GPU, graph)", () => {
   before(async () => {
     glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
     ctx = await loadQwen3(glm, FP8_REPO);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(FP8_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx[Symbol.dispose](); glm.free(); });
 
@@ -183,7 +181,7 @@ describe("Qwen3.5-0.8B Paris (1 GPU, graph)", () => {
   before(async () => {
     glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
     ctx = await loadQwen35(glm);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN35_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx[Symbol.dispose](); glm.free(); });
 
@@ -208,7 +206,7 @@ describe("Qwen3-0.6B Paris (2 GPU, graph)", () => {
     glm1 = new GlmOps(1);
     po = new ParallelOps([glm0, glm1]);
     ctx = await loadQwen3(po as any, QWEN3_REPO);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN3_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx[Symbol.dispose](); po.free(); glm0.free(); glm1.free(); });
 
@@ -231,7 +229,7 @@ describe("Qwen3-0.6B-FP8 Paris (2 GPU, graph)", () => {
     glm1 = new GlmOps(1);
     po = new ParallelOps([glm0, glm1]);
     ctx = await loadQwen3(po as any, FP8_REPO);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(FP8_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx[Symbol.dispose](); po.free(); glm0.free(); glm1.free(); });
 
@@ -254,7 +252,7 @@ describe("Qwen3.5-0.8B Paris (2 GPU, graph)", () => {
     glm1 = new GlmOps(1);
     po = new ParallelOps([glm0, glm1]);
     ctx = await loadQwen35(po as any);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN35_REPO), { local_files_only: true });
+    tokenizer = ctx.model.tokenizer;
   });
   after(() => { ctx[Symbol.dispose](); po.free(); glm0.free(); glm1.free(); });
 

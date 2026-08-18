@@ -8,8 +8,6 @@ import { Tensor } from "../src/tensor";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { PagedKVCache } from "../src/paged_kv";
 import { generateBatchTokens, generateTokens } from "./test_helper";
-import { AutoTokenizer } from "@huggingface/transformers";
-import { resolveModelPath } from "../src/model_path";
 
 import { PAGE_SIZE } from "../src/paged_kv";
 
@@ -48,7 +46,7 @@ describe("Qwen3-0.6B batch tests", () => {
     glm = new GlmOps(deviceId);
     model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
     ws = new ExecutionWorkspace(glm, 4, 4096);
-    tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN3_REPO), { local_files_only: true });
+    tokenizer = model.tokenizer;
     PROMPT1 = tokenizePrompt(tokenizer, "Hi");
     PROMPT2 = tokenizePrompt(tokenizer, "Hello");
     PROMPT_LONG1 = tokenizePrompt(tokenizer, "What is the capital of France?");
@@ -684,8 +682,7 @@ describe("PagedKVCache prefix matching", () => {
     glm = new GlmOps(deviceId);
     model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
     ws = new ExecutionWorkspace(glm, 4, 4096);
-    const tokenizer = await AutoTokenizer.from_pretrained(resolveModelPath(QWEN3_REPO), { local_files_only: true });
-    PROMPT1 = tokenizePrompt(tokenizer, "Hi");
+    PROMPT1 = tokenizePrompt(model.tokenizer, "Hi");
   });
 
   after(() => {
