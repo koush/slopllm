@@ -15,6 +15,7 @@ import { SamplingWorkspace, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 import { MemcpyKind } from "./enums";
+import { installWorkerStdioForwarding } from "./worker_stdio";
 
 export interface GraphState {
   graphExec: number | null;
@@ -581,6 +582,7 @@ async function interactiveBatch(
 // --- Main ---
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
+  installWorkerStdioForwarding();
   Error.stackTraceLimit = 20; 
 
   const args = parseArgs(argv);

@@ -46,8 +46,8 @@ async function main(): Promise<void> {
   const loaderArgs = parseLoaderArgs(process.argv.slice(2));
   const modelArgs = parseModelArgs(loaderArgs.workerArgs);
   if (!modelArgs.arena) throw new Error("run_model_loader requires --arena <GiB>");
-  if (modelArgs.useGlm51 || modelArgs.useQwen35 || modelArgs.useFp8) {
-    throw new Error("The initial model-loader implementation supports default Qwen3 only");
+  if (modelArgs.useQwen35 || modelArgs.useFp8) {
+    throw new Error("The model loader currently supports Qwen3 and GLM-5.1");
   }
 
   console.log(`Loading ${modelLabel(modelArgs)} for persistent worker execution...`);
@@ -57,6 +57,7 @@ async function main(): Promise<void> {
     process.env[`GLM_ARENA_BASE_${device.device}`] = String(device.arenaBase);
   }
   process.env.GLM_SKIP_MMAP_LOAD = "1";
+  process.env.GLM_MODEL_LOAD_REPLAY = "1";
   console.log(`Model loaded from ${runtime.modelDir}`);
 
   let worker: Worker | null = null;
@@ -64,15 +65,48 @@ async function main(): Promise<void> {
   let lastError: string | null = null;
   let stopping: Promise<void> | null = null;
 
-  const startWorker = (): void => {
+  const startWorker = (follow?: http.ServerResponse): void => {
     if (worker) throw new Error("Executor worker is already running");
     lastExitCode = null;
     lastError = null;
     const next = new Worker(loaderArgs.entry, {
       argv: loaderArgs.workerArgs,
       execArgv: ["--require", require.resolve("tsx/cjs")],
+      stdout: true,
+      stderr: true,
     });
     worker = next;
+    next.stdout.pipe(process.stdout, { end: false });
+    next.stderr.pipe(process.stderr, { end: false });
+    const writeOutput = (stream: "stdout" | "stderr", text: string) => {
+      (stream === "stdout" ? process.stdout : process.stderr).write(text);
+      if (follow && !follow.writableEnded && !follow.destroyed) follow.write(text);
+    };
+    next.on("message", message => {
+      const output = message as { type?: string, stream?: "stdout" | "stderr", text?: string };
+      if (output.type === "stdio" && output.stream && output.text !== undefined) {
+        writeOutput(output.stream, output.text);
+      }
+    });
+    if (follow) {
+      let exited = false;
+      let stdoutEnded = false;
+      let stderrEnded = false;
+      const finish = () => {
+        if (exited && stdoutEnded && stderrEnded && !follow.writableEnded) follow.end();
+      };
+      const write = (chunk: Buffer | string) => {
+        if (!follow.writableEnded && !follow.destroyed) follow.write(chunk);
+      };
+      next.stdout.on("data", write);
+      next.stderr.on("data", write);
+      next.stdout.once("end", () => { stdoutEnded = true; finish(); });
+      next.stderr.once("end", () => { stderrEnded = true; finish(); });
+      next.once("exit", () => {
+        exited = true;
+        setImmediate(finish);
+      });
+    }
     next.once("error", error => {
       lastError = error instanceof Error ? (error.stack ?? error.message) : String(error);
       console.error("Executor worker failed:", error);
@@ -139,8 +173,19 @@ async function main(): Promise<void> {
     }
     if (req.method === "POST" && url.pathname === "/restart") {
       void stopWorker().then(() => {
-        startWorker();
-        sendJson(res, 202, { state: "running", threadId: worker!.threadId });
+        if (url.searchParams.has("follow")) {
+          res.writeHead(200, {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-cache",
+            "x-accel-buffering": "no",
+          });
+          res.socket?.setNoDelay(true);
+          res.flushHeaders();
+          startWorker(res);
+        } else {
+          startWorker();
+          sendJson(res, 202, { state: "running", threadId: worker!.threadId });
+        }
       });
       return;
     }

@@ -228,7 +228,7 @@ export class Glm51Model extends ChatModel {
     this.pendingQNope.delete(qNopeKey);
     using wAbsorbedTmp = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
     const wAbsorbed = this.alloc(wAbsorbedTmp.shape, wAbsorbedTmp.type, `${layerPfx}.absorbed.weight`, wAbsorbedTmp.parallelism);
-    wAbsorbed.memcpy(wAbsorbedTmp);
+    if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") wAbsorbed.memcpy(wAbsorbedTmp);
   }
 
   private async loadMlaWeight(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
@@ -277,7 +277,7 @@ export class Glm51Model extends ChatModel {
       // The transposed layout enables coalesced reads in mla_v_expand_kernel.
       using tVT = tVRaw.transpose4d(1, nHeads, vHeadDim, kvLoraRank, 0, 1, 3, 2);
       const tV = this.alloc([nHeads * kvLoraRank, vHeadDim], "BF16", vName, vPar);
-      tV.memcpy(tVT);
+      if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") tV.memcpy(tVT);
       this.pendingKNope.set(name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), tKNope);
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
       const ckvName = name.replace(".kv_a_proj_with_mqa.weight", ".ckv_proj.weight");
