@@ -33,32 +33,62 @@ export class ExecutionState {
   // host pinned writes are not stream-ordered, so sharing a single host buffer
   // across plans would race. Device buffers also need to be per-state because
   // plan N+1's async H2D would overwrite the device buffer before run N reads it.
+  // Opaque integer scratch space used by FlashInfer's planner and run kernels.
   intWs!: Tensor;
+  // Pinned staging/scratch counterpart used by the host-side planner.
   intWsH!: Tensor;
+
+  // Opaque host-resident launch metadata produced by the corresponding
+  // FlashInfer plan call and consumed by each attention run call.
   decodePlanInfo!: Tensor;
   prefillPlanInfo!: Tensor;
   mlaPrefillPlanInfo!: Tensor;
   mlaDecodePlanInfo!: Tensor;
+
+  // Flattened input token IDs, with pinned staging for number[][] inputs.
   inputIdsBuf!: Tensor;
   inputIdsBufH!: Tensor;
+  // Absolute position of each flattened query/token (RoPE and cache writes).
   positionIds!: Tensor;
   positionIdsH!: Tensor;
+
+  // Query/output row boundaries for the flattened batch. This has batchSize + 1
+  // cumulative token counts; sequence i's query rows are
+  // [qoIndptr[i], qoIndptr[i + 1]). For prefill seqLens [3, 2] it is [0, 3, 5];
+  // for decode, where every sequence has one query token, it is [0, 1, 2, ...].
   qoIndptrD!: Tensor;
   qoIndptrH!: Tensor;
+  // Physical flat KV-cache destination for each appended standard-attention
+  // token: pageId * pageSize + offsetWithinPage.
   slotMapping!: Tensor;
   slotMappingH!: Tensor;
+
+  // Compressed sparse row offsets: page IDs are stored in the flat indices
+  // array, and sequence i owns indices[indptr[i]..indptr[i + 1]).
   indptrD!: Tensor;
   indptrH!: Tensor;
+  // Number of valid local tokens in each sequence's final cache page.
   lastPageLen!: Tensor;
   lastPageLenH!: Tensor;
+  // Number of valid global tokens represented by the final page. This differs
+  // from lastPageLen under context parallelism, where a local page is sharded.
   globalLastPageLen!: Tensor;
   globalLastPageLenH!: Tensor;
+
+  // Total logical KV length for each sequence, used when planning MLA prefill.
   kvLenH!: Tensor;
   kvLenD!: Tensor;
+  // Compressed sparse row offsets into a conceptual flattened, de-paged
+  // KV-token array. Used to convert per-sequence token positions to flat slots
+  // and gather sparse MLA KV.
   kvTokenIndptrH!: Tensor;
   kvTokenIndptrD!: Tensor;
+  // Sequence index for each flattened MLA query/appended token.
   mlaBatchIndices!: Tensor;
   mlaBatchIndicesH!: Tensor;
+
+  // Concatenated physical page IDs for all sequences; indptr partitions this
+  // array into each sequence's page table.
   indices!: Tensor;
   indicesH!: Tensor;
 
