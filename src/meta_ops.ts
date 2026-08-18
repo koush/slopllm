@@ -300,7 +300,15 @@ export class MetaOps implements DeviceOps {
     synchronize(): void {
     }
 
+    synchronizeAsync(): Promise<void> {
+        return Promise.resolve();
+    }
+
     synchronizeStream(streamIdx: number): void {
+    }
+
+    synchronizeStreamAsync(streamIdx: number): Promise<void> {
+        return Promise.resolve();
     }
 
     setStream(streamIdx: number): void {

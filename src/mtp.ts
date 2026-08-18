@@ -167,7 +167,7 @@ function getPositionIdsMask(ws: ExecutionWorkspace, originalAllocLen: number, to
  * @param cache - Chat cache (paged KV cache)
  * @returns Array of accepted draft tokens plus the replacement token
  */
-export function mtpTreeDecode(
+export async function mtpTreeDecode(
   captureManager: CaptureManager,
   model: ChatModel,
   mtpHiddenStates: Tensor,
@@ -225,7 +225,7 @@ export function mtpTreeDecode(
     mtpHiddenStates.removeTracking();
     sharedSlots.removeTracking();
     sharedSlotsLength.removeTracking();
-    ws.glm.synchronize();
+    await ws.glm.synchronizeAsync();
   }
   else if (useDecodeDraftGenerator) {
     // current path that decodes in batch
@@ -316,7 +316,7 @@ export function mtpTreeDecode(
         chainedMtpHiddenState.memcpy(newMtpHiddenStates, newMtpHiddenStates.bytes, MemcpyKind.DeviceToDevice);
       }, ['mtp-tree-decode', i, topks.length]);
 
-      ws.glm.synchronize();
+      await ws.glm.synchronizeAsync();
 
       mtpHiddenStates.removeTracking();
       sharedSlots.removeTracking();
@@ -424,7 +424,7 @@ export function mtpTreeDecode(
       }
     }, captureKey);
 
-    ws.glm.synchronize();
+    await ws.glm.synchronizeAsync();
 
     mtpHiddenStates.removeTracking();
     sharedSlots.removeTracking();
@@ -457,7 +457,7 @@ export function mtpTreeDecode(
   targetPrefillState.setInput(verificationTokens);
 
   const hiddenStateStaging = ws.ensureAlloc([numVerificationTokens, hiddenDim], "BF16", `mtp-tree-hs-staging-${numVerificationTokens}`, undefined, 0);
-  ws.glm.synchronize();
+  await ws.glm.synchronizeAsync();
 
   const track1 = ws.startTracking(new Set([mtpHiddenStates, sharedSlots, sharedSlotsLength]));
 
@@ -509,7 +509,7 @@ export function mtpTreeDecode(
   sharedSlotsLength.removeTracking();
   mtpHiddenStates.removeTracking();
 
-  ws.glm.synchronize();
+  await ws.glm.synchronizeAsync();
 
   const verify = performance.now();
 
@@ -629,7 +629,7 @@ export function mtpTreeDecode(
   // target layers: write the captured kvCacheLayers
   // mtp layers: perform extended prefill as usual
   seq0.truncate(originalAllocLen);
-  ws.glm.synchronize();
+  await ws.glm.synchronizeAsync();
 
   const mtpExtendPrefill = ws.planPrefill(model, batchSize, [finishCount], cache);
   mtpExtendPrefill.setInput([[...acceptedTokens, bestReplacement]]);
@@ -642,7 +642,7 @@ export function mtpTreeDecode(
     mtpExtendPrefill.indexerKvCacheAppend(layer.appendIdxK, layer.cacheIdx, layer.indexHeadDim);
     layer.appendIdxKOrig[Symbol.dispose]();
   }
-  ws.glm.synchronize();
+  await ws.glm.synchronizeAsync();
 
   ws.unfreeze()
 
@@ -668,7 +668,7 @@ export function mtpTreeDecode(
   mtpHiddenStates.removeTracking();
   sharedSlots.removeTracking();
   sharedSlotsLength.removeTracking();
-  ws.glm.synchronize();
+  await ws.glm.synchronizeAsync();
 
 
   // if (acceptedTokens.length) {
@@ -811,4 +811,3 @@ function getPositionIdsChunked(ws: ExecutionWorkspace, originalAllocLen: number,
   positionIds.memcpy(positionIdsH, numTokens * I32, MemcpyKind.HostToDevice);
   return positionIds;
 }
-

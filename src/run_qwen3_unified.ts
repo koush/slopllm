@@ -15,7 +15,6 @@ import { SamplingWorkspace, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 import { MemcpyKind } from "./enums";
-import { installWorkerStdioForwarding } from "./worker_stdio";
 
 export interface GraphState {
   graphExec: number | null;
@@ -142,12 +141,12 @@ export interface DecodeTiming {
   mtpStats?: MtpStats;
 }
 
-export function* generateStream(
+export async function* generateStream(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
   timing?: DecodeTiming, mtp?: boolean, mtpDraftTopk?: number[], tokenizer?: any,
-): Generator<number> {
+): AsyncGenerator<number> {
   const suffixIds = cache.prefixMatch(0, inputIds);
 
   using sampleWorkspace = new WorkspaceBase(glm);
@@ -219,12 +218,13 @@ export function* generateStream(
 
   sampleResult = sampleWorkspace.ensureAllocPinned(gpuSampleResult!.shape, gpuSampleResult!.type, "sampleResult");
   sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
-  glm.synchronize();
+  await glm.synchronizeAsync();
   currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
   cache.reportTokens(0, suffixIds);
   cache.reportTokens(0, [currentToken]);
   tokenHistory.push(currentToken);
   yield currentToken;
+  await new Promise<void>(resolve => setImmediate(resolve));
   if (eosIds.has(currentToken)) return;
 
   // Budget is in TOKENS, not loop iterations. One plain decode step emits one
@@ -247,7 +247,7 @@ export function* generateStream(
 
       if (mtp && model.forwardMtp && topks.length > 0) {
         if (process.env.GLM_STEP_LOG === '1') process.stderr.write(`[step ${i}] seqLen=${cache.getPagedKV().sequences[0].allocLen} histLen=${tokenHistory.length}\n`);
-        const { warmup, tokens, numAccepted, numDraftTokens } = mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots.value, sharedSlotsLength.value, ws, currentToken, topks, cache, tokenizer);
+        const { warmup, tokens, numAccepted, numDraftTokens } = await mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots.value, sharedSlotsLength.value, ws, currentToken, topks, cache, tokenizer);
         if (mtpStats && !warmup) mtpStats.observe(numDraftTokens, numAccepted);
         // glm.synchronize();
         for (const t of tokens) {
@@ -271,6 +271,7 @@ export function* generateStream(
           }
 
           yield t;
+          await new Promise<void>(resolve => setImmediate(resolve));
           generated++;
           if (eosIds.has(t))
             return;
@@ -337,7 +338,7 @@ export function* generateStream(
 
       sampleResult ||= sampleWorkspace.allocPinned(gpuSampleResult!.shape, gpuSampleResult!.type);
       sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
-      glm.synchronize();
+      await glm.synchronizeAsync();
 
       currentToken = sampleResult!.readPinnedBuffer().readInt32LE();
 
@@ -347,6 +348,7 @@ export function* generateStream(
       tokenHistory.push(currentToken);
 
       yield currentToken;
+      await new Promise<void>(resolve => setImmediate(resolve));
       generated++;
       if (eosIds.has(currentToken))
         return;
@@ -456,7 +458,7 @@ async function interactiveChat(
       const generatedIds: number[] = [];
       const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-      for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk, tokenizer)) {
+      for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk, tokenizer)) {
         generatedIds.push(tokenId);
         tokCount++;
         const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -496,7 +498,7 @@ async function singlePrompt(
   const generatedIds: number[] = [];
   const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-  for (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk, tokenizer)) {
+  for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk, tokenizer)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -582,7 +584,6 @@ async function interactiveBatch(
 // --- Main ---
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
-  installWorkerStdioForwarding();
   Error.stackTraceLimit = 20; 
 
   const args = parseArgs(argv);

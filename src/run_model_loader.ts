@@ -78,16 +78,6 @@ async function main(): Promise<void> {
     worker = next;
     next.stdout.pipe(process.stdout, { end: false });
     next.stderr.pipe(process.stderr, { end: false });
-    const writeOutput = (stream: "stdout" | "stderr", text: string) => {
-      (stream === "stdout" ? process.stdout : process.stderr).write(text);
-      if (follow && !follow.writableEnded && !follow.destroyed) follow.write(text);
-    };
-    next.on("message", message => {
-      const output = message as { type?: string, stream?: "stdout" | "stderr", text?: string };
-      if (output.type === "stdio" && output.stream && output.text !== undefined) {
-        writeOutput(output.stream, output.text);
-      }
-    });
     if (follow) {
       let exited = false;
       let stdoutEnded = false;

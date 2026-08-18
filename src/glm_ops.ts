@@ -102,7 +102,9 @@ interface NativeAddon {
   positionStep(ctx: number, positionIds: number, lastPageLen: number, slotMapping: number, indptr: number, indices: number, pageSize: number, batchSize: number, steps: number): void;
   mlaPositionStep(ctx: number, positionIds: number, lastPageLen: number, indptr: number, pageSize: number, batchSize: number, cpWorldSize: number, cpRank: number, steps: number, globalLastPageLen: number): void;
   synchronize(ctx: number): void;
+  synchronizeAsync(ctx: number): Promise<void>;
   synchronizeStream(ctx: number, streamIdx: number): void;
+  synchronizeStreamAsync(ctx: number, streamIdx: number): Promise<void>;
   setStream(ctx: number, streamIdx: number): void;
   eventRecord(ctx: number, eventIdx: number, streamIdx: number): void;
   streamWaitEvent(ctx: number, streamIdx: number, eventIdx: number): void;
@@ -938,8 +940,16 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().synchronize(this.ctx);
   }
 
+  synchronizeAsync(): Promise<void> {
+    return getNativeAddon().synchronizeAsync(this.ctx);
+  }
+
   synchronizeStream(streamIdx: number): void {
     getNativeAddon().synchronizeStream(this.ctx, streamIdx);
+  }
+
+  synchronizeStreamAsync(streamIdx: number): Promise<void> {
+    return getNativeAddon().synchronizeStreamAsync(this.ctx, streamIdx);
   }
 
   streamTensors = new Map<number, Set<GlmTensor>>();

@@ -85,7 +85,7 @@ async function main() {
     const graphState = { graphExec: null as number | null, warmupRemaining: 3 };
     const ids: number[] = [];
     let sawEos = false;
-    for (const t of generateStream(model, ws, glm, cache, inputIds, maxNew, model.eosIds, undefined, graphState)) {
+    for await (const t of generateStream(model, ws, glm, cache, inputIds, maxNew, model.eosIds, undefined, graphState)) {
       ids.push(t);
       if (model.eosIds.has(t)) { sawEos = true; break; }
     }

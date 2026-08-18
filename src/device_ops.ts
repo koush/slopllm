@@ -35,7 +35,9 @@ export interface DeviceOps extends Disposable {
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined): Tensor;
   synchronize(): void;
+  synchronizeAsync(): Promise<void>;
   synchronizeStream(streamIdx: number): void;
+  synchronizeStreamAsync(streamIdx: number): Promise<void>;
   setStream(streamIdx: number): void;
   eventRecord(eventIdx: number, streamIdx: number): void;
   streamWaitEvent(streamIdx: number, eventIdx: number): void;

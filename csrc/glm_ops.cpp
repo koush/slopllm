@@ -1727,6 +1727,59 @@ static Napi::Value SynchronizeStream(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+class SynchronizeWorker : public Napi::AsyncWorker {
+public:
+    SynchronizeWorker(Napi::Promise::Deferred deferred, GlmCtx* ctx, int stream_idx)
+        : Napi::AsyncWorker(deferred.Env()), deferred_(deferred), ctx_(ctx), stream_idx_(stream_idx) {}
+
+    void Execute() override {
+        glm_synchronize_stream(ctx_, stream_idx_);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            SetError(std::string("synchronizeStreamAsync failed: ") + cudaGetErrorString(err));
+        }
+    }
+
+    void OnOK() override {
+        deferred_.Resolve(Env().Undefined());
+    }
+
+    void OnError(const Napi::Error& error) override {
+        deferred_.Reject(error.Value());
+    }
+
+private:
+    Napi::Promise::Deferred deferred_;
+    GlmCtx* ctx_;
+    int stream_idx_;
+};
+
+static Napi::Value SynchronizeAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "Expected (ctx)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    GlmCtx* ctx = reinterpret_cast<GlmCtx*>(ctx_ptr);
+    Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+    (new SynchronizeWorker(deferred, ctx, ctx->active_stream))->Queue();
+    return deferred.Promise();
+}
+
+static Napi::Value SynchronizeStreamAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected (ctx, stream_idx)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    int stream_idx = info[1].As<Napi::Number>().Int32Value();
+    Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+    (new SynchronizeWorker(deferred, reinterpret_cast<GlmCtx*>(ctx_ptr), stream_idx))->Queue();
+    return deferred.Promise();
+}
+
 static Napi::Value SetStream(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2 || !info[1].IsNumber()) {
@@ -3763,6 +3816,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "mlaPositionStep"), Napi::Function::New(env, MlaPositionStep));
     exports.Set(Napi::String::New(env, "synchronize"), Napi::Function::New(env, Synchronize));
     exports.Set(Napi::String::New(env, "synchronizeStream"), Napi::Function::New(env, SynchronizeStream));
+    exports.Set(Napi::String::New(env, "synchronizeAsync"), Napi::Function::New(env, SynchronizeAsync));
+    exports.Set(Napi::String::New(env, "synchronizeStreamAsync"), Napi::Function::New(env, SynchronizeStreamAsync));
     exports.Set(Napi::String::New(env, "setStream"), Napi::Function::New(env, SetStream));
     exports.Set(Napi::String::New(env, "eventRecord"), Napi::Function::New(env, EventRecord));
     exports.Set(Napi::String::New(env, "streamWaitEvent"), Napi::Function::New(env, StreamWaitEvent));

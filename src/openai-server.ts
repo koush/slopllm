@@ -11,7 +11,6 @@ import { SamplingWorkspace } from "./tensor";
 import { resolveModelPath } from "./model_path";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
-import { installWorkerStdioForwarding } from "./worker_stdio";
 
 const MODEL_NAME = "qwen3-0.6b";
 const PAGE_SIZE = 64;
@@ -571,7 +570,6 @@ function sendMetrics(
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
-  installWorkerStdioForwarding();
   const args = parseArgs(argv);
 
   const { modelDir, repoId } = resolveModelSelection(args);

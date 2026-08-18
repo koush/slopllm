@@ -2624,10 +2624,31 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  async synchronizeAsync(): Promise<void> {
+    await Promise.all(this.devices.map(device => device.synchronizeAsync()));
+    for (const group of this.p2pGroups.values()) {
+      group.cleanupSources();
+      for (const w of group.workspaces) {
+        using _ = w.startTracking();
+      }
+    }
+  }
+
   synchronizeStream(streamIdx: number): void {
     for (const device of this.devices) {
       device.synchronizeStream(streamIdx);
     }
+    const group = this.getP2PGroup(streamIdx);
+    if (group) {
+      group.cleanupSources();
+      for (const w of group.workspaces) {
+        using _ = w.startTracking();
+      }
+    }
+  }
+
+  async synchronizeStreamAsync(streamIdx: number): Promise<void> {
+    await Promise.all(this.devices.map(device => device.synchronizeStreamAsync(streamIdx)));
     const group = this.getP2PGroup(streamIdx);
     if (group) {
       group.cleanupSources();
