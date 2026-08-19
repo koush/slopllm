@@ -133,4 +133,6 @@ export interface DeviceOps extends Disposable {
   graphLaunch(graphExec: number): void;
   graphDestroy(graph: number): void;
   graphExecDestroy(graphExec: number): void;
+
+  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void;
 }

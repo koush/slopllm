@@ -7,10 +7,11 @@ import { MetaOps } from "./meta_ops";
 import { createDeviceOps, loadModel, modelLabel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { MtpStats, mtpTreeDecode } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
-import { SamplingWorkspace, Tensor } from "./tensor";
+import {  Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 import { MemcpyKind } from "./enums";
+import { SamplingWorkspace } from "./sampling";
 
 export interface GraphState {
   graphExec: number | null;

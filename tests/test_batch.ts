@@ -4,6 +4,7 @@ import { SamplingParams, makeSamplingParams, type ChatCache, type ChatModel } fr
 import { GlmOps } from "../src/glm_ops";
 import { Qwen35Model } from "../src/qwen35_model";
 import { Qwen3Model } from "../src/qwen3_model";
+import { SamplingWorkspace } from "../src/sampling";
 import { Tensor } from "../src/tensor";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { PagedKVCache } from "../src/paged_kv";
@@ -356,8 +357,16 @@ describe("Qwen3-0.6B batch tests", () => {
     const firstToken = tokens[0];
     const history = [...PROMPT_GRAPH, firstToken];
 
-    const greedySingle = (() => { using r = logits.sampleTokenGPU(greedy, history); return r.readInt32LEArray()[0]; })();
-    const batchResults = (() => { using r = logits.sampleBatchGPU([greedy, sampling], [history, history]); return r.readInt32LEArray(); })();
+    const greedySingle = (() => {
+      using sampler = new SamplingWorkspace(logits.workspace.glm, 1, model.cfg.vocabSize, greedy.repetitionPenaltyWindow);
+      sampler.updateSampler([greedy], [history]);
+      return sampler.sample(logits).readInt32LEArray()[0];
+    })();
+    const batchResults = (() => {
+      using sampler = new SamplingWorkspace(logits.workspace.glm, 2, model.cfg.vocabSize, sampling.repetitionPenaltyWindow);
+      sampler.updateSampler([greedy, sampling], [history, history]);
+      return sampler.sample(logits).readInt32LEArray();
+    })();
 
     assert.equal(batchResults[0], greedySingle,
       `Batch greedy[0] != sequential greedy: ${batchResults[0]} != ${greedySingle}`);
@@ -385,7 +394,11 @@ describe("Qwen3-0.6B batch tests", () => {
     const history1 = [...PROMPT1, tokens[0]];
     const history2 = [...PROMPT2, tokens[1]];
 
-    const batchResults = (() => { using r = logits.sampleBatchGPU([greedy, greedy], [history1, history2]); return r.readInt32LEArray(); })();
+    const batchResults = (() => {
+      using sampler = new SamplingWorkspace(logits.workspace.glm, 2, model.cfg.vocabSize, greedy.repetitionPenaltyWindow);
+      sampler.updateSampler([greedy, greedy], [history1, history2]);
+      return sampler.sample(logits).readInt32LEArray();
+    })();
 
     assert.equal(batchResults[0], tokens[0],
       `Batch greedy[0] != argmax: ${batchResults[0]} != ${tokens[0]}`);

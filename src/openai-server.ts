@@ -4,7 +4,7 @@ import { parentPort } from "node:worker_threads";
 import { ChatModel, ChatCache, SamplingParams, Tokenizer } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
-import { SamplingWorkspace } from "./tensor";
+import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
 

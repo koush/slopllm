@@ -2,9 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
-import { DeviceOps, TensorParallelism } from "./device_ops";
-import { ExecutionState } from "./execution-workspace";
-import { f32ToBf16Bytes } from "./glm_ops";
+import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
+import { executionPhase, type ExecutionPlan, ExecutionState, ExecutionWorkspace } from "./execution-workspace";
+import { MemcpyKind } from "./enums";
+import { BF16, f32ToBf16Bytes, I32 } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
@@ -43,6 +44,221 @@ export interface Glm51Config extends CommonModelConfig {
   numDenseMlpLayers: number;
   firstSparseMlpLayer: number;
   eosTokenIds: number[];
+}
+
+export interface MtpDraftBatch {
+  targetTokens: number[];
+  treeTokens: number[][];
+  topks: readonly number[];
+}
+
+interface MtpVerificationArtifacts {
+  kvCacheLayers: Array<{
+    appendCkv: Tensor;
+    appendKpe: Tensor;
+    cacheIdx: number;
+    kvLoraRank: number;
+    qkRopeDim: number;
+  }>;
+  indexerKvCacheLayers: Array<{
+    appendIdxK: Tensor;
+    cacheIdx: number;
+    indexHeadDim: number;
+  }>;
+  sharedSlots: Tensor;
+  sharedSlotsLength: Tensor;
+  sharedSlotsOrig: Tensor;
+  sharedSlotsLengthOrig: Tensor;
+}
+
+export interface MtpStepResult {
+  draft: MtpDraftBatch;
+  tokens: number[][];
+  numAccepted: number[];
+  numDraftTokens: number;
+}
+
+function mtpTotalPaths(topks: readonly number[]): number {
+  return topks.reduce((acc, topk) => acc * topk, 1);
+}
+
+function mtpTotalTreeNodes(topks: readonly number[]): number {
+  let total = 0;
+  let width = 1;
+  for (const topk of topks) {
+    width *= topk;
+    total += width;
+  }
+  return total;
+}
+
+function mtpDepthBoundaries(topks: readonly number[]): number[] {
+  const boundaries: number[] = [];
+  let total = 0;
+  let width = 1;
+  for (const topk of topks) {
+    width *= topk;
+    total += width;
+    boundaries.push(total);
+  }
+  return boundaries;
+}
+
+function mtpTreeDepth(topks: readonly number[], nodeIndex: number): number {
+  const boundaries = mtpDepthBoundaries(topks);
+  let depth = 0;
+  while (depth < boundaries.length && nodeIndex >= boundaries[depth]) {
+    depth++;
+  }
+  return depth;
+}
+
+function mtpParentIndex(topks: readonly number[], nodeIndex: number, boundaries = mtpDepthBoundaries(topks)): number {
+  const depth = mtpTreeDepth(topks, nodeIndex);
+  if (depth === 0) {
+    return -1;
+  }
+  const offset = nodeIndex - boundaries[depth - 1];
+  const parentOffset = Math.floor(offset / topks[depth]);
+  return (depth > 1 ? boundaries[depth - 2] : 0) + parentOffset;
+}
+
+function mtpChildIndex(topks: readonly number[], nodeIndex: number, digit: number, boundaries = mtpDepthBoundaries(topks)): number {
+  const depth = mtpTreeDepth(topks, nodeIndex);
+  const offset = nodeIndex - (depth > 0 ? boundaries[depth - 1] : 0);
+  return boundaries[depth] + offset * topks[depth + 1] + digit;
+}
+
+function mtpPathDigit(topks: readonly number[], path: number, layer: number, strides: readonly number[]): number {
+  return Math.floor(path / strides[layer]) % topks[layer];
+}
+
+function ensureMtpTargetMask(ws: ExecutionWorkspace, topks: readonly number[]) {
+  const numTokens = mtpTotalTreeNodes(topks);
+  const byteLen = Math.ceil(numTokens * numTokens / 8);
+  const key = topks.join("_");
+  let mask = ws.tensors.get(`glm51_mtp_target_mask_${key}`);
+  let indptr = ws.tensors.get(`glm51_mtp_target_mask_indptr_${key}`);
+  if (!mask || !indptr) {
+    const maskH = ws.allocPinned([ws.maxBatch * byteLen], "U8", `glm51_mtp_target_mask_host_${key}`);
+    const boundaries = mtpDepthBoundaries(topks);
+    maskH.withPinnedBuffer(buf => {
+      buf.fill(0);
+      for (let batch = 0; batch < ws.maxBatch; batch++) {
+        const byteOffset = batch * byteLen;
+        for (let query = 0; query < numTokens; query++) {
+          let current = query;
+          while (true) {
+            const bit = query * numTokens + current;
+            buf[byteOffset + (bit >> 3)] |= 1 << (bit & 7);
+            current = mtpParentIndex(topks, current, boundaries);
+            if (current === -1) {
+              break;
+            }
+          }
+        }
+      }
+    });
+    const indptrH = ws.allocPinned([ws.maxBatch + 1], "I32", `glm51_mtp_target_mask_indptr_host_${key}`);
+    indptrH.withPinnedBuffer(buf => {
+      for (let batch = 0; batch <= ws.maxBatch; batch++) {
+        buf.writeInt32LE(batch * byteLen, batch * I32);
+      }
+    });
+    mask = ws.alloc(maskH.shape, "U8", `glm51_mtp_target_mask_${key}`);
+    mask.memcpy(maskH, maskH.bytes, MemcpyKind.HostToDevice);
+    indptr = ws.alloc(indptrH.shape, "I32", `glm51_mtp_target_mask_indptr_${key}`);
+    indptr.memcpy(indptrH, indptrH.bytes, MemcpyKind.HostToDevice);
+  }
+  return { mask, indptr, mode: MaskMode.CausalCustom };
+}
+
+function ensureMtpChunkMask(ws: ExecutionWorkspace, topks: readonly number[], depth: number) {
+  const qoLen = mtpTotalPaths(topks.slice(0, depth));
+  const boundaries = mtpDepthBoundaries(topks);
+  const priorTokens = depth > 1 ? boundaries[depth - 2] : 0;
+  const maskKvLenValue = priorTokens + qoLen;
+  const byteLen = Math.ceil(qoLen * maskKvLenValue / 8);
+  const key = `${topks.join("_")}_d${depth}`;
+  let mask = ws.tensors.get(`glm51_mtp_chunk_mask_${key}`);
+  let indptr = ws.tensors.get(`glm51_mtp_chunk_mask_indptr_${key}`);
+  let maskKvLen = ws.tensors.get(`glm51_mtp_chunk_mask_kvlen_${key}`);
+  if (!mask || !indptr || !maskKvLen) {
+    const maskH = ws.allocPinned([ws.maxBatch * byteLen], "U8", `glm51_mtp_chunk_mask_host_${key}`);
+    maskH.withPinnedBuffer(buf => {
+      buf.fill(0);
+      for (let batch = 0; batch < ws.maxBatch; batch++) {
+        const byteOffset = batch * byteLen;
+        for (let query = 0; query < qoLen; query++) {
+          let current = priorTokens + query;
+          while (current !== -1) {
+            const bit = query * maskKvLenValue + current;
+            buf[byteOffset + (bit >> 3)] |= 1 << (bit & 7);
+            current = mtpParentIndex(topks, current, boundaries);
+          }
+        }
+      }
+    });
+    const indptrH = ws.allocPinned([ws.maxBatch + 1], "I32", `glm51_mtp_chunk_mask_indptr_host_${key}`);
+    indptrH.withPinnedBuffer(buf => {
+      for (let batch = 0; batch <= ws.maxBatch; batch++) {
+        buf.writeInt32LE(batch * byteLen, batch * I32);
+      }
+    });
+    const maskKvLenH = ws.allocPinned([ws.maxBatch], "I32", `glm51_mtp_chunk_mask_kvlen_host_${key}`);
+    maskKvLenH.withPinnedBuffer(buf => {
+      for (let batch = 0; batch < ws.maxBatch; batch++) {
+        buf.writeInt32LE(maskKvLenValue, batch * I32);
+      }
+    });
+    mask = ws.alloc(maskH.shape, "U8", `glm51_mtp_chunk_mask_${key}`);
+    mask.memcpy(maskH, maskH.bytes, MemcpyKind.HostToDevice);
+    indptr = ws.alloc(indptrH.shape, "I32", `glm51_mtp_chunk_mask_indptr_${key}`);
+    indptr.memcpy(indptrH, indptrH.bytes, MemcpyKind.HostToDevice);
+    maskKvLen = ws.alloc(maskKvLenH.shape, "I32", `glm51_mtp_chunk_mask_kvlen_${key}`);
+    maskKvLen.memcpy(maskKvLenH, maskKvLenH.bytes, MemcpyKind.HostToDevice);
+  }
+  return { mask, indptr, maskKvLen };
+}
+
+function ensureMtpChunkPositionIds(ws: ExecutionWorkspace, originalAllocLens: readonly number[], depth: number, numTokens: number): Tensor {
+  const batchSize = originalAllocLens.length;
+  const totalTokens = batchSize * numTokens;
+  const key = `glm51_mtp_chunk_pos_d${depth}_n${numTokens}`;
+  const positionIds = ws.ensureAlloc([ws.maxBatch * numTokens], "I32", key);
+  const positionIdsH = ws.ensureAllocPinned([ws.maxBatch * numTokens], "I32", `${key}_host`);
+  positionIdsH.withPinnedBuffer(buf => {
+    for (let batch = 0; batch < batchSize; batch++) {
+      for (let token = 0; token < numTokens; token++) {
+        buf.writeInt32LE(originalAllocLens[batch] + depth, (batch * numTokens + token) * I32);
+      }
+    }
+  });
+  positionIds.memcpy(positionIdsH, totalTokens * I32, MemcpyKind.HostToDevice);
+  return positionIds;
+}
+
+function ensureMtpVerificationPositionIds(ws: ExecutionWorkspace, originalAllocLens: readonly number[], topks: readonly number[]): Tensor {
+  const batchSize = originalAllocLens.length;
+  const numNodes = mtpTotalTreeNodes(topks);
+  const key = `glm51_mtp_verify_pos_${numNodes}`;
+  const positionIds = ws.ensureAlloc([ws.maxBatch * ws.maxSeqLen], "I32", key);
+  const positionIdsH = ws.ensureAllocPinned([ws.maxBatch * ws.maxSeqLen], "I32", `${key}_host`);
+  const boundaries = mtpDepthBoundaries(topks);
+  positionIdsH.withPinnedBuffer(buf => {
+    let offset = 0;
+    for (const originalAllocLen of originalAllocLens) {
+      for (let node = 0; node < numNodes; node++) {
+        let depth = 0;
+        while (depth < boundaries.length && node >= boundaries[depth]) {
+          depth++;
+        }
+        buf.writeInt32LE(originalAllocLen + depth, offset++ * I32);
+      }
+    }
+  });
+  positionIds.memcpy(positionIdsH, batchSize * numNodes * I32, MemcpyKind.HostToDevice);
+  return positionIds;
 }
 
 function loadConfig(modelDir: string): Glm51Config {
@@ -128,8 +344,12 @@ export class Glm51Model extends ChatModel {
   }
 
   private weightParallelism(name: string): TensorParallelism {
-    if (name === "lm_head.weight") return TensorParallelism.Column;
-    if (name === "model.embed_tokens.weight") return TensorParallelism.Row;
+    if (name === "lm_head.weight") {
+      return TensorParallelism.Column;
+    }
+    if (name === "model.embed_tokens.weight") {
+      return TensorParallelism.Row;
+    }
     const pfx = Glm51Model.WEIGHT_PREFIX;
     if (
       // good for decode, but bad for prefill due to gather
@@ -155,8 +375,9 @@ export class Glm51Model extends ChatModel {
       name.endsWith(".mlp.shared_experts.up_proj.weight_weight_scale")
       || name.endsWith(".eh_proj.weight")
       || name.endsWith(".eh_proj.weight_weight_scale")
-    )
+    ) {
       return TensorParallelism.Column;
+    }
     if (
       name.endsWith(".self_attn.o_proj.weight") ||
       name.endsWith(".mlp.down_proj.weight") ||
@@ -165,18 +386,26 @@ export class Glm51Model extends ChatModel {
       // NVFP4 block scale tensors follow same parallelism as their weight (weight_scale, not weight_scale_2 which is scalar)
       name.endsWith(".down_proj.weight_weight_scale") ||
       (name.startsWith(pfx) && name.includes(".mlp.experts.") && name.endsWith(".down_proj.weight_weight_scale")) ||
-      name.endsWith(".mlp.shared_experts.down_proj.weight_weight_scale")) return TensorParallelism.Row;
+      name.endsWith(".mlp.shared_experts.down_proj.weight_weight_scale")) {
+      return TensorParallelism.Row;
+    }
     // Indexer weights are always Replicated — the indexer is a small module
     // that must run identically on every GPU to produce the same topk indices.
-    if (name.includes('.indexer.wq_b.weight')) return TensorParallelism.Replicated;
-    if (name.includes(".indexer.")) return TensorParallelism.Replicated;
+    if (name.includes('.indexer.wq_b.weight')) {
+      return TensorParallelism.Replicated;
+    }
+    if (name.includes(".indexer.")) {
+      return TensorParallelism.Replicated;
+    }
     return TensorParallelism.Replicated;
   }
 
   protected async loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
     // NVFP4 scale tensors: rename to match linear() lookup convention
     // e.g. "X.gate_proj.weight_scale" → "X.gate_proj.weight_weight_scale"
-    if (name.endsWith(".input_scale")) return; // not used by kernel
+    if (name.endsWith(".input_scale")) {
+      return; // not used by kernel
+    }
     let storeName = name;
     if (name.endsWith(".weight_scale_2")) {
       storeName = name.replace(/\.weight_scale_2$/, ".weight_weight_scale_2");
@@ -221,14 +450,18 @@ export class Glm51Model extends ChatModel {
   private tryComputeAbsorbed(layerPfx: string, nHeads: number, kvLoraRank: number, qLoraRank: number, qkNopeDim: number): void {
     const kNopeKey = `${layerPfx}.k_nope_proj.weight`;
     const qNopeKey = `${layerPfx}.q_nope_proj.weight`;
-    if (!this.pendingKNope.has(kNopeKey) || !this.pendingQNope.has(qNopeKey)) return;
+    if (!this.pendingKNope.has(kNopeKey) || !this.pendingQNope.has(qNopeKey)) {
+      return;
+    }
     using kNopeProj = this.pendingKNope.get(kNopeKey)!;
     using qNopeProj = this.pendingQNope.get(qNopeKey)!;
     this.pendingKNope.delete(kNopeKey);
     this.pendingQNope.delete(qNopeKey);
     using wAbsorbedTmp = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
     const wAbsorbed = this.alloc(wAbsorbedTmp.shape, wAbsorbedTmp.type, `${layerPfx}.absorbed.weight`, wAbsorbedTmp.parallelism);
-    if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") wAbsorbed.memcpy(wAbsorbedTmp);
+    if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") {
+      wAbsorbed.memcpy(wAbsorbedTmp);
+    }
   }
 
   private async loadMlaWeight(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
@@ -277,7 +510,9 @@ export class Glm51Model extends ChatModel {
       // The transposed layout enables coalesced reads in mla_v_expand_kernel.
       using tVT = tVRaw.transpose4d(1, nHeads, vHeadDim, kvLoraRank, 0, 1, 3, 2);
       const tV = this.alloc([nHeads * kvLoraRank, vHeadDim], "BF16", vName, vPar);
-      if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") tV.memcpy(tVT);
+      if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") {
+        tV.memcpy(tVT);
+      }
       this.pendingKNope.set(name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), tKNope);
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
       const ckvName = name.replace(".kv_a_proj_with_mqa.weight", ".ckv_proj.weight");
@@ -301,13 +536,16 @@ export class Glm51Model extends ChatModel {
     await super.loadWeights(modelDir);
     if (this.cfg.tieWordEmbeddings && !this.tensors.has("lm_head.weight")) {
       const embedTensor = this.tensors.get("model.embed_tokens.weight");
-      if (embedTensor) this.tensors.set("lm_head.weight", embedTensor);
+      if (embedTensor) {
+        this.tensors.set("lm_head.weight", embedTensor);
+      }
     }
   }
 
   createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, pageSize = 64): ChatCache {
-    if (pageSize !== 64)
+    if (pageSize !== 64) {
       throw new Error(`createChatCache: pageSize must be 64, got ${pageSize}`);
+    }
     const cfg = this.cfg;
     const nKv = cfg.numKeyValueHeads;
     const hd = cfg.headDim;
@@ -318,7 +556,9 @@ export class Glm51Model extends ChatModel {
 
   prepareMtpInput(cache: ChatCache, inputIdsList: number[][]): number[][] {
     const input = super.prepareMtpInput(cache, inputIdsList);
-    if (!this.mtp) return input;
+    if (!this.mtp) {
+      return input;
+    }
 
     const sequences = cache.getPagedKV().sequences;
     if (sequences.length !== input.length) {
@@ -329,7 +569,9 @@ export class Glm51Model extends ChatModel {
       const sequence = sequences[i];
       const tokenIds = sequence.getTokenIds();
       const reportedLen = tokenIds.length;
-      if (reportedLen === 0) continue;
+      if (reportedLen === 0) {
+        continue;
+      }
 
       let previousToken: number;
       if (reportedLen === sequence.allocLen + 1) {
@@ -420,7 +662,7 @@ export class Glm51Model extends ChatModel {
     return result.reshape([BS, hs]);
   }
 
-  private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState): { normed: Tensor, residual: Tensor } {
+  private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState, sharedSlots = state.sharedSlots, sharedSlotsLength = state.sharedSlotsLength): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const nHeads = cfg.numAttentionHeads;
     const kvLoraRank = cfg.kvLoraRank;
@@ -445,12 +687,13 @@ export class Glm51Model extends ChatModel {
       kPeRopeStream.streamWaitEvent();
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
 
-      if (dense)
+      if (dense) {
         return;
+      }
 
       // The physical slots are derived per-layer from sharedTopk at attention
       // time below; the topk arg here is vestigial.
-      return state.sparseMlaPrepareCache(state.sharedSlots!.value, ckvNormed, kPeRope, undefined, layerIdx, kvLoraRank, qkRopeDim);
+      return state.sparseMlaPrepareCache(sharedSlots!.value, ckvNormed, kPeRope, undefined, layerIdx, kvLoraRank, qkRopeDim);
     });
 
     const shared = cfg.indexerTypes[layerIdx] === "shared";
@@ -532,8 +775,6 @@ export class Glm51Model extends ChatModel {
       stream?: Disposable & { streamWaitEvent(): void, synchronize(): void },
     } | undefined;
     if (cfg.indexHeadDim !== 0) {
-      const sharedSlots = state.sharedSlots;
-      const sharedSlotsLength = state.sharedSlotsLength;
       if (!sharedSlots || !sharedSlotsLength) {
         throw new Error('Shared slot holders must be installed before sparse MLA attention.');
       }
@@ -648,7 +889,7 @@ export class Glm51Model extends ChatModel {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  forwardModel(state: ExecutionState): Tensor {
+  forwardModel(state: ExecutionState, sharedSlots = state.sharedSlots, sharedSlotsLength = state.sharedSlotsLength): Tensor {
     const cfg = this.cfg;
 
     using rotaryEmbedding = this.glm.withStream(() => state.rotaryEmbedding(this.invFreq));
@@ -665,24 +906,24 @@ export class Glm51Model extends ChatModel {
     // The group slot cache lives on state.sharedSlots / sharedSlotsLength.
     // Callers that span multiple forwards (run loop, MTP) provide persistent
     // holders; otherwise fall back to forward-local ones.
-    using _localSlots = state.sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
-    using _localLength = state.sharedSlotsLength ? undefined : new UsingHolder<Tensor>(undefined!);
-    state.sharedSlots ??= _localSlots!;
-    state.sharedSlotsLength ??= _localLength!;
+    using _localSlots = sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
+    using _localLength = sharedSlotsLength ? undefined : new UsingHolder<Tensor>(undefined!);
+    sharedSlots ??= _localSlots!;
+    sharedSlotsLength ??= _localLength!;
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const result = this.mlaLayer(cos, sin, normed.value, residual.value, i, state);
+      const result = this.mlaLayer(cos, sin, normed.value, residual.value, i, state, sharedSlots, sharedSlotsLength);
       normed.replace(result.normed);
       residual.replace(result.residual);
     }
 
     // Export the cache so it survives a caller's MTP tracking region (see mtp.ts).
-    state.sharedSlots?.value?.removeTracking();
-    state.sharedSlotsLength?.value?.removeTracking();
+    sharedSlots?.value?.removeTracking();
+    sharedSlotsLength?.value?.removeTracking();
     return normed.detach().removeTracking();
   }
 
-  forwardMtp(state: ExecutionState, previousHiddenState: Tensor) {
+  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, sharedSlots = state.sharedSlots, sharedSlotsLength = state.sharedSlotsLength) {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const ws = state.ws;
@@ -726,23 +967,401 @@ export class Glm51Model extends ChatModel {
     using sin = rotaryEmbedding.result.sin;
 
     const layerIdx = cfg.numHiddenLayers;
-    using _localSlots = state.sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
-    using _localLength = state.sharedSlotsLength ? undefined : new UsingHolder<Tensor>(undefined!);
-    state.sharedSlots ??= _localSlots!;
-    state.sharedSlotsLength ??= _localLength!;
-    const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state);
+    using _localSlots = sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
+    using _localLength = sharedSlotsLength ? undefined : new UsingHolder<Tensor>(undefined!);
+    sharedSlots ??= _localSlots!;
+    sharedSlotsLength ??= _localLength!;
+    const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state, sharedSlots, sharedSlotsLength);
     using _residual = result.residual;
 
     // Export the cache (slots + length) so it survives the caller's MTP tracking
     // region — otherwise startTracking's dispose frees the tensors the holders
     // still point to, causing a use-after-free on the next pass.
-    state.sharedSlots?.value?.removeTracking();
-    state.sharedSlotsLength?.value?.removeTracking();
+    sharedSlots?.value?.removeTracking();
+    sharedSlotsLength?.value?.removeTracking();
 
     // Return shared_head.norm(residual) so the recycled seed for the next MTP
     // step is already normed — matches sglang Glm4MoeModelNextN and vLLM v1
     // deepseek_mtp which both recycle the post-shared_head-norm state.
     return result.normed.removeTracking();
+  }
+
+  private planMtpDraftDepths(ws: ExecutionWorkspace, cache: ChatCache, originalAllocLens: readonly number[], topks: readonly number[]) {
+    const batchSize = originalAllocLens.length;
+    const states: ExecutionState[] = [];
+    const metadata: Array<{ qoLen: number; previousWidth: number; expandK: number; depth: number }> = [];
+    for (let depth = 1; depth < topks.length; depth++) {
+      const qoLen = mtpTotalPaths(topks.slice(0, depth));
+      const previousWidth = depth > 1 ? mtpTotalPaths(topks.slice(0, depth - 1)) : 1;
+      const mask = ensureMtpChunkMask(ws, topks, depth);
+      const positionIds = ensureMtpChunkPositionIds(ws, originalAllocLens, depth, qoLen);
+      const state = ws.planPrefill(this, batchSize, new Array(batchSize).fill(qoLen), cache, {
+        ...mask,
+        mode: MaskMode.CausalCustom,
+        positionIds,
+      });
+      states.push(state);
+      metadata.push({ qoLen, previousWidth, expandK: topks[depth - 1], depth });
+    }
+    return { states, metadata };
+  }
+
+  private runMtpDraft(
+    ws: ExecutionWorkspace,
+    topks: readonly number[],
+    batchSize: number,
+    seed: Tensor,
+    sharedSlots: Tensor,
+    sharedSlotsLength: Tensor,
+    states: readonly ExecutionState[],
+    metadata: readonly { qoLen: number; previousWidth: number; expandK: number; depth: number }[],
+    treeHost: Tensor,
+  ): void {
+    const hiddenSize = this.cfg.hiddenSize;
+    const rowBytes = hiddenSize * BF16;
+    const numTreeNodes = mtpTotalTreeNodes(topks);
+    const boundaries = mtpDepthBoundaries(topks);
+    const lmHead = this.tensors.get("lm_head.weight")!;
+
+    using seedRows = seed.narrow(0, batchSize);
+    using rootLogits = seedRows.linear(lmHead);
+    const rootTopk = rootLogits.topk(topks[0], this.cfg.vocabSize);
+    using _rootValues = rootTopk.values;
+    using rootIndices = rootTopk.indices;
+    for (let batch = 0; batch < batchSize; batch++) {
+      treeHost.memcpy2d(
+        batch * numTreeNodes * I32, topks[0] * I32,
+        rootIndices, batch * topks[0] * I32, topks[0] * I32,
+        topks[0] * I32, 1,
+        MemcpyKind.DeviceToHost,
+      );
+    }
+    if (states.length > 0) {
+      states[0].inputIdsBuf.memcpy(rootIndices, rootIndices.bytes, MemcpyKind.DeviceToDevice);
+    }
+
+    for (let index = 0; index < states.length; index++) {
+      const state = states[index];
+      const { qoLen, previousWidth, expandK, depth } = metadata[index];
+      const next = states[index + 1];
+      using stateSharedSlots = new UsingHolder(sharedSlots.viewClone());
+      using stateSharedSlotsLength = new UsingHolder(sharedSlotsLength.viewClone());
+      state.setInput(state.inputIdsBuf);
+
+      const previousRows = batchSize * previousWidth;
+      using previousHidden = seed.narrow(0, previousRows);
+      using expanded = expandK > 1 ? ws.alloc([batchSize * qoLen, hiddenSize], "BF16") : undefined;
+      const inputHidden = expanded ?? previousHidden;
+      if (expanded) {
+        for (let child = 0; child < expandK; child++) {
+          expanded.memcpy2d(
+            child * rowBytes, expandK * rowBytes,
+            previousHidden, 0, rowBytes,
+            rowBytes, previousRows,
+            MemcpyKind.DeviceToDevice,
+          );
+        }
+      }
+
+      using hiddenStates = this.forwardMtp(state, inputHidden, stateSharedSlots, stateSharedSlotsLength);
+      using logits = hiddenStates.linear(lmHead);
+      const topk = logits.topk(topks[depth], this.cfg.vocabSize);
+      using _values = topk.values;
+      using indices = topk.indices;
+      const depthOffset = boundaries[depth - 1];
+      const tokensAtDepth = qoLen * topks[depth];
+      for (let batch = 0; batch < batchSize; batch++) {
+        treeHost.memcpy2d(
+          (batch * numTreeNodes + depthOffset) * I32, tokensAtDepth * I32,
+          indices, batch * tokensAtDepth * I32, tokensAtDepth * I32,
+          tokensAtDepth * I32, 1,
+          MemcpyKind.DeviceToHost,
+        );
+      }
+      if (next) {
+        next.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
+        seed.memcpy(hiddenStates, hiddenStates.bytes, MemcpyKind.DeviceToDevice);
+      }
+    }
+  }
+
+  *planPrefillMtpDraftExtend(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[]): ExecutionPlan<MtpDraftBatch> {
+    if (!this.forwardMtp || topks.length === 0) {
+      throw new Error("MTP draft extend requires an MTP-enabled model and non-empty topks");
+    }
+    const batchSize = inputIds.length;
+    let completed = false;
+    const prefillState = ws.planPrefill(this, batchSize, inputIds.map(ids => ids.length), cache);
+    prefillState.setInput(inputIds);
+    const committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
+    using _rollback = {
+      [Symbol.dispose]: () => {
+        if (!completed) {
+          for (let batch = 0; batch < batchSize; batch++) {
+            cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
+          }
+        }
+      },
+    };
+
+    const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
+    const seed = ws.ensureAlloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16", `glm51_mtp_seed_${topks.join("_")}`);
+    const targetDevice = ws.ensureAlloc([ws.maxBatch], "I32", "glm51_mtp_target_tokens");
+    const targetHost = ws.ensureAllocPinned([ws.maxBatch], "I32", "glm51_mtp_target_tokens_host");
+    const numTreeNodes = mtpTotalTreeNodes(topks);
+    const treeHost = ws.ensureAllocPinned([ws.maxBatch * numTreeNodes], "I32", `glm51_mtp_draft_host_${numTreeNodes}`);
+    using sharedSlots = new UsingHolder<Tensor>(undefined!);
+    using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
+
+    yield* executionPhase({
+      states: [prefillState],
+      inputs: {},
+      captureKey: [],
+      run: () => {
+        using hiddenStates = this.forwardModel(prefillState, sharedSlots, sharedSlotsLength);
+        using logits = prefillState.computeLogits(hiddenStates, this);
+        using target = logits.argmax();
+        targetDevice.memcpy(target, target.bytes, MemcpyKind.DeviceToDevice);
+        using rotatedInput = prefillState.input!.rotateInputIds(prefillState.qoIndptrD, targetDevice, batchSize);
+        prefillState.setInput(rotatedInput);
+        using mtpHidden = this.forwardMtp(prefillState, hiddenStates, sharedSlots, sharedSlotsLength);
+        using lastIdx = prefillState.lastIdx;
+        using lastHidden = mtpHidden.indexSelect(lastIdx, -1);
+        seed.memcpy(lastHidden, lastHidden.bytes, MemcpyKind.DeviceToDevice);
+        targetHost.memcpy(targetDevice, batchSize * I32, MemcpyKind.DeviceToHost);
+      },
+    });
+
+    const draftPlan = this.planMtpDraftDepths(ws, cache, committedAllocLens, topks);
+    yield* executionPhase({
+      states: draftPlan.states,
+      inputs: {
+        sharedSlots: sharedSlots.value,
+        sharedSlotsLength: sharedSlotsLength.value,
+      },
+      captureKey: [],
+      run: (inputs) => {
+        this.runMtpDraft(ws, topks, batchSize, seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
+      },
+    });
+
+    for (let batch = 0; batch < batchSize; batch++) {
+      cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
+    }
+    const targetBuf = targetHost.readPinnedBuffer();
+    const treeBuf = treeHost.readPinnedBuffer();
+    completed = true;
+    return {
+      targetTokens: Array.from({ length: batchSize }, (_, batch) => targetBuf.readInt32LE(batch * I32)),
+      treeTokens: Array.from({ length: batchSize }, (_, batch) =>
+        Array.from({ length: numTreeNodes }, (_, node) => treeBuf.readInt32LE((batch * numTreeNodes + node) * I32))),
+      topks,
+    };
+  }
+
+  *planTargetVerification(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch): ExecutionPlan<MtpStepResult> {
+    const topks = draft.topks;
+    const batchSize = draft.targetTokens.length;
+    if (draft.treeTokens.length !== batchSize) {
+      throw new Error("MTP draft batch does not match target token batch");
+    }
+    const originalAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
+    const targetTopks = [1, ...topks];
+    const numTreeNodes = mtpTotalTreeNodes(topks);
+    const numVerificationTokens = numTreeNodes + 1;
+    const verificationTokens = draft.treeTokens.map((tokens, batch) => [draft.targetTokens[batch], ...tokens]);
+    let completed = false;
+    using _rollback = {
+      [Symbol.dispose]: () => {
+        if (!completed) {
+          for (let batch = 0; batch < batchSize; batch++) {
+            cache.getPagedKV().sequences[batch].truncate(originalAllocLens[batch]);
+          }
+        }
+      },
+    };
+
+    const targetMask = ensureMtpTargetMask(ws, targetTopks);
+    const state = ws.planPrefill(this, batchSize, new Array(batchSize).fill(numVerificationTokens), cache, {
+      ...targetMask,
+      positionIds: ensureMtpVerificationPositionIds(ws, originalAllocLens, targetTopks),
+    });
+    state.setInput(verificationTokens);
+    const mtpHiddenStaging = ws.ensureAlloc([ws.maxBatch * numVerificationTokens, this.cfg.hiddenSize], "BF16", `glm51_mtp_hidden_staging_${numVerificationTokens}`);
+    const argmaxHost = ws.ensureAllocPinned([ws.maxBatch * numVerificationTokens], "I32", `glm51_mtp_verify_argmax_host_${numVerificationTokens}`);
+
+    const artifacts = yield* executionPhase({
+      states: [state],
+      inputs: {},
+      captureKey: ["glm51-mtp-verify", topks.join(",")],
+      run: () => {
+        using slots = new UsingHolder<Tensor>(undefined!);
+        using slotsLength = new UsingHolder<Tensor>(undefined!);
+        const kvCacheLayers: MtpVerificationArtifacts["kvCacheLayers"] = [];
+        const indexerKvCacheLayers: MtpVerificationArtifacts["indexerKvCacheLayers"] = [];
+        const appendMla = state.mlaKvCacheAppend.bind(state);
+        state.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
+          appendCkv.removeTracking();
+          appendKpe.removeTracking();
+          kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendKpe: appendKpe.capture(), cacheIdx, kvLoraRank, qkRopeDim });
+          return appendMla(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
+        };
+        const appendIndexer = state.indexerKvCacheAppend.bind(state);
+        state.indexerKvCacheAppend = (appendIdxK, cacheIdx, indexHeadDim) => {
+          appendIdxK.removeTracking();
+          indexerKvCacheLayers.push({ appendIdxK: appendIdxK.capture(), cacheIdx, indexHeadDim });
+          return appendIndexer(appendIdxK, cacheIdx, indexHeadDim);
+        };
+        using hiddenStates = this.forwardModel(state, slots, slotsLength);
+        using logits = state.computeLogits(hiddenStates, this, true);
+        using argmax = logits.argmax();
+        argmaxHost.memcpy(argmax, argmax.bytes, MemcpyKind.DeviceToHost);
+        state.setInput(argmax);
+        using mtpHidden = this.forwardMtp(state, hiddenStates, slots, slotsLength);
+        mtpHiddenStaging.memcpy(mtpHidden, mtpHidden.bytes, MemcpyKind.DeviceToDevice);
+        const sharedSlotsOrig = slots.detach();
+        const sharedSlotsLengthOrig = slotsLength.detach();
+        return {
+          kvCacheLayers,
+          indexerKvCacheLayers,
+          sharedSlots: sharedSlotsOrig.capture(),
+          sharedSlotsLength: sharedSlotsLengthOrig.capture(),
+          sharedSlotsOrig,
+          sharedSlotsLengthOrig,
+        };
+      },
+    });
+
+    const argmaxBuf = argmaxHost.readPinnedBuffer();
+    const targetBoundaries = mtpDepthBoundaries(targetTopks);
+    const strides = topks.map((_, index) => mtpTotalPaths(topks.slice(index + 1)));
+    const numPaths = mtpTotalPaths(topks);
+    const numAccepted: number[] = [];
+    const acceptedTokens: number[][] = [];
+    const replacements: number[] = [];
+    const acceptedNodes: number[][] = [];
+    for (let batch = 0; batch < batchSize; batch++) {
+      let bestPath = 0;
+      let bestAccepted = -1;
+      let replacement = -1;
+      const argmaxOffset = batch * numVerificationTokens;
+      for (let path = 0; path < numPaths; path++) {
+        let accepted = 0;
+        let node = 0;
+        for (let layer = 0; layer < topks.length; layer++) {
+          const digit = mtpPathDigit(topks, path, layer, strides);
+          const child = mtpChildIndex(targetTopks, node, digit, targetBoundaries);
+          if (verificationTokens[batch][child] !== argmaxBuf.readInt32LE((argmaxOffset + node) * I32)) {
+            break;
+          }
+          accepted++;
+          node = child;
+        }
+        if (accepted > bestAccepted) {
+          bestAccepted = accepted;
+          bestPath = path;
+          replacement = argmaxBuf.readInt32LE((argmaxOffset + node) * I32);
+        }
+      }
+      const tokens: number[] = [];
+      const nodes = [0];
+      let node = 0;
+      for (let layer = 0; layer < bestAccepted; layer++) {
+        node = mtpChildIndex(targetTopks, node, mtpPathDigit(topks, bestPath, layer, strides), targetBoundaries);
+        tokens.push(verificationTokens[batch][node]);
+        nodes.push(node);
+      }
+      numAccepted.push(bestAccepted);
+      acceptedTokens.push(tokens);
+      replacements.push(replacement);
+      acceptedNodes.push(nodes);
+    }
+
+    const finishCounts = numAccepted.map(value => value + 1);
+    for (let batch = 0; batch < batchSize; batch++) {
+      cache.getPagedKV().sequences[batch].truncate(originalAllocLens[batch]);
+    }
+    const commitState = ws.planPrefill(this, batchSize, finishCounts, cache);
+    commitState.setInput(acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]));
+    const committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
+    const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
+    const seed = ws.ensureAlloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16", `glm51_mtp_seed_${topks.join("_")}`);
+    for (let layerIndex = 0; layerIndex < artifacts.kvCacheLayers.length; layerIndex++) {
+      const layer = artifacts.kvCacheLayers[layerIndex];
+      const appendCkv = layer.appendCkv;
+      const appendKpe = layer.appendKpe;
+      let destinationBase = 0;
+      for (let batch = 0; batch < batchSize; batch++) {
+        const sourceBase = batch * numVerificationTokens;
+        for (let index = 0; index < finishCounts[batch]; index++) {
+          const source = sourceBase + acceptedNodes[batch][index];
+          const destination = destinationBase + index;
+          if (source !== destination) {
+            appendCkv.memcpy2d(destination * layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, appendCkv, source * layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, 1, MemcpyKind.DeviceToDevice);
+            appendKpe.memcpy2d(destination * layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, appendKpe, source * layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, 1, MemcpyKind.DeviceToDevice);
+          }
+        }
+        destinationBase += finishCounts[batch];
+      }
+      commitState.mlaKvCacheAppend(appendCkv, appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
+    }
+    for (let layerIndex = 0; layerIndex < artifacts.indexerKvCacheLayers.length; layerIndex++) {
+      const layer = artifacts.indexerKvCacheLayers[layerIndex];
+      const appendIdxK = layer.appendIdxK;
+      let destinationBase = 0;
+      for (let batch = 0; batch < batchSize; batch++) {
+        const sourceBase = batch * numVerificationTokens;
+        for (let index = 0; index < finishCounts[batch]; index++) {
+          const source = sourceBase + acceptedNodes[batch][index];
+          const destination = destinationBase + index;
+          if (source !== destination) {
+            appendIdxK.memcpy2d(destination * layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, appendIdxK, source * layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, 1, MemcpyKind.DeviceToDevice);
+          }
+        }
+        destinationBase += finishCounts[batch];
+      }
+      commitState.indexerKvCacheAppend(appendIdxK, layer.cacheIdx, layer.indexHeadDim);
+    }
+
+    const rowBytes = this.cfg.hiddenSize * BF16;
+    for (let batch = 0; batch < batchSize; batch++) {
+      const finalNode = acceptedNodes[batch][acceptedNodes[batch].length - 1];
+      const source = batch * numVerificationTokens + finalNode;
+      seed.memcpy2d(batch * rowBytes, rowBytes, mtpHiddenStaging, source * rowBytes, rowBytes, rowBytes, 1, MemcpyKind.DeviceToDevice);
+    }
+
+    const draftPlan = this.planMtpDraftDepths(ws, cache, committedAllocLens, topks);
+    const treeHost = ws.ensureAllocPinned([ws.maxBatch * numTreeNodes], "I32", `glm51_mtp_draft_host_${numTreeNodes}`);
+    const draftInputs: { [name: string]: Tensor } = {
+      sharedSlots: artifacts.sharedSlotsOrig.disposed ? artifacts.sharedSlots : artifacts.sharedSlotsOrig,
+      sharedSlotsLength: artifacts.sharedSlotsLengthOrig.disposed ? artifacts.sharedSlotsLength : artifacts.sharedSlotsLengthOrig,
+    };
+
+    yield* executionPhase({
+      states: draftPlan.states,
+      inputs: draftInputs,
+      captureKey: ["glm51-mtp-draft", topks.join(","), `batchSize:${batchSize}`],
+      run: (inputs) => {
+        this.runMtpDraft(ws, topks, batchSize, seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
+      },
+    });
+
+    for (let batch = 0; batch < batchSize; batch++) {
+      cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
+    }
+    const treeBuf = treeHost.readPinnedBuffer();
+    completed = true;
+    return {
+      draft: {
+        targetTokens: replacements,
+        treeTokens: Array.from({ length: batchSize }, (_, batch) =>
+          Array.from({ length: numTreeNodes }, (_, node) => treeBuf.readInt32LE((batch * numTreeNodes + node) * I32))),
+        topks,
+      },
+      tokens: acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]),
+      numAccepted,
+      numDraftTokens: topks.length,
+    };
   }
 
 

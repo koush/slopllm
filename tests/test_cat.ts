@@ -2,7 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
-import { MemcpyKind } from "../src/tensor";
+import { MemcpyKind } from "../src/enums";
 
 describe("GlmTensor.cat (single GPU)", () => {
   let glm: GlmOps;

@@ -1,5 +1,6 @@
 import { ChatCache, ChatModel, SamplingParams } from "../src/chat_model";
 import { ExecutionWorkspace } from "../src/execution-workspace";
+import { SamplingWorkspace } from "../src/sampling";
 
 export function generateBatchTokens(
   model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache,
@@ -52,7 +53,10 @@ export function* generateTokens(
       const state = ws.planDecode(model, 1, cache);
       state.setInput([[nextToken]]);
       const hiddenStates = model.forward(state);
-      nextToken = state.computeLogits(hiddenStates, model).sampleTokenGPU(sampling, tokenHistory).readInt32LEArray()[0];
+      const logits = state.computeLogits(hiddenStates, model);
+      using sampler = new SamplingWorkspace(logits.workspace.glm, 1, model.cfg.vocabSize, sampling.repetitionPenaltyWindow);
+      sampler.updateSampler([sampling], [tokenHistory]);
+      nextToken = sampler.sample(logits).readInt32LEArray()[0];
     } else {
       const decodeTokens = ws.forwardEagerDecode(model, [nextToken], cache);
       nextToken = decodeTokens[0];

@@ -1,15 +1,12 @@
 import { CaptureManager } from "./capture-manager";
 import { type ChatCache, type ChatModel, type Tokenizer } from "./chat_model";
 import { type DeviceOps } from "./device_ops";
-import { MemcpyKind } from "./enums";
-import { ExecutionWorkspace } from "./execution-workspace";
-import { type GlmOps, I32 } from "./glm_ops";
+import { executePlan, ExecutionWorkspace } from "./execution-workspace";
+import { Glm51Model } from "./glm51_model";
+import { type GlmOps } from "./glm_ops";
 import { createDeviceOps, loadModel, type ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
-import { MtpStats, mtpTreeDecode } from "./mtp";
+import { MtpStats } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
-import { type Tensor } from "./tensor";
-import { UsingHolder } from "./using-holder";
-import { WorkspaceBase } from "./workspace";
 
 const PROMPTS = [
   "tell me a 1000 word story",
@@ -100,7 +97,7 @@ function freeResources(model: ChatModel | undefined, cache: ChatCache | undefine
   if (cleanupError) throw cleanupError;
 }
 
-async function runBatch(model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args): Promise<void> {
+async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args): Promise<void> {
   const prompts = PROMPTS.slice(0, args.batchSize);
   const inputIds = prompts.map(prompt => tokenizePrompt(model.tokenizer, prompt));
   const longestPrompt = Math.max(...inputIds.map(ids => ids.length));
@@ -111,49 +108,12 @@ async function runBatch(model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps
   cache.reset(args.batchSize);
   const suffixIds = inputIds.map((ids, batch) => cache.prefixMatch(batch, ids));
   const mtpInputIds = model.prepareMtpInput(cache, suffixIds);
-  const seqLens = mtpInputIds.map(ids => ids.length);
 
   using captureManager = new CaptureManager(glm);
   captureManager.disabled = args.noCudaGraph;
-  using sampleWorkspace = new WorkspaceBase(glm);
-  using mtpHiddenStates = new UsingHolder<Tensor>(undefined!);
-  using sharedSlots = new UsingHolder<Tensor>(undefined!);
-  using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
 
-  const state = ws.planPrefill(model, args.batchSize, seqLens, cache);
-  state.sharedSlots = sharedSlots;
-  state.sharedSlotsLength = sharedSlotsLength;
-  state.setInput(mtpInputIds);
-
-  let gpuFirstTokens: Tensor | undefined;
-  {
-    using _tracker = state.ws.startTracking();
-    const draftExtend = model.forwardMtpDraftExtend!(state, args.mtpDraftTopk, hiddenStates => {
-      using logits = state.computeLogits(hiddenStates, model);
-      using argmax = logits.argmax();
-      gpuFirstTokens = sampleWorkspace.ensureAlloc([ws.maxBatch], "I32", "mtp_batch_first_tokens");
-      gpuFirstTokens.memcpy(argmax, argmax.bytes, MemcpyKind.DeviceToDevice);
-      return gpuFirstTokens.narrow(0, args.batchSize);
-    });
-    using _seed = draftExtend.mtpHiddenStates;
-    using _token = draftExtend.token;
-
-    let maxIntermediateWidth = 1;
-    let width = 1;
-    for (const topk of args.mtpDraftTopk.slice(0, -1)) {
-      width *= topk;
-      maxIntermediateWidth = Math.max(maxIntermediateWidth, width);
-    }
-    const scratch = ws.alloc([ws.maxBatch * maxIntermediateWidth, model.cfg.hiddenSize], _seed.type);
-    scratch.memcpy(_seed, _seed.bytes, MemcpyKind.DeviceToDevice);
-    mtpHiddenStates.replace(scratch.removeTracking());
-  }
-
-  const firstTokensHost = sampleWorkspace.ensureAllocPinned([ws.maxBatch], "I32", "mtp_batch_first_tokens_host");
-  firstTokensHost.memcpy(gpuFirstTokens!, args.batchSize * I32, MemcpyKind.DeviceToHost);
-  await glm.synchronizeAsync();
-  const firstTokenBuffer = firstTokensHost.readPinnedBuffer();
-  const currentTokens = Array.from({ length: args.batchSize }, (_, batch) => firstTokenBuffer.readInt32LE(batch * I32));
+  let currentDraft = (await executePlan(captureManager, ws, model.planPrefillMtpDraftExtend(ws, cache, mtpInputIds, args.mtpDraftTopk))).result;
+  const currentTokens = [...currentDraft.targetTokens];
   const generated = currentTokens.map(token => [token]);
   const finished = currentTokens.map(token => model.eosIds.has(token) || args.maxNewTokens === 1);
   const mtpStats = new MtpStats(args.mtpDraftTopk.length);
@@ -168,33 +128,30 @@ async function runBatch(model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps
 
   const started = performance.now();
   while (!finished.some(Boolean)) {
-    const result = await mtpTreeDecode(
-      captureManager,
-      model,
-      mtpHiddenStates.value,
-      sharedSlots.value,
-      sharedSlotsLength.value,
-      ws,
-      currentTokens,
-      args.mtpDraftTopk,
-      cache,
-    );
-    if (!result.warmup) {
-      for (const accepted of result.numAccepted) {
-        mtpStats.observe(result.numDraftTokens, accepted);
+    const step = await executePlan(captureManager, ws, model.planTargetVerification(ws, cache, currentDraft));
+    const warmup = step.warmup;
+    currentDraft = step.result.draft;
+    const stepTokens = step.result.tokens;
+    const stepAccepted = step.result.numAccepted;
+    const numDraftTokens = step.result.numDraftTokens;
+
+    if (!warmup) {
+      for (const count of stepAccepted) {
+        mtpStats.observe(numDraftTokens, count);
       }
     }
 
     for (let batch = 0; batch < args.batchSize; batch++) {
-      for (const token of result.tokens[batch]) {
+      const reportedTokens: number[] = [];
+      for (const token of stepTokens[batch]) {
         currentTokens[batch] = token;
-        cache.reportTokens(batch, [token]);
+        reportedTokens.push(token);
         generated[batch].push(token);
 
         const now = performance.now();
         if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
         lastTokenTime = now;
-        if (result.warmup) {
+        if (warmup) {
           firstPostWarmupTime = 0;
           postWarmupTokenCount = 0;
         } else {
@@ -206,6 +163,7 @@ async function runBatch(model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps
           break;
         }
       }
+      cache.reportTokens(batch, reportedTokens);
     }
   }
 
@@ -229,12 +187,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const args = parseArgs(argv);
   const { modelDir } = resolveModelSelection(args);
   const { glm, gpuDevices } = createDeviceOps(args);
-  let model: ChatModel | undefined;
+  let model: Glm51Model | undefined;
   let cache: ChatCache | undefined;
   let ws: ExecutionWorkspace | undefined;
 
   try {
-    model = await loadModel(glm, args, modelDir);
+    const loadedModel = await loadModel(glm, args, modelDir);
+    if (!(loadedModel instanceof Glm51Model)) throw new Error("run_glm51_multiple_mtp requires a GLM-5.1 model");
+    model = loadedModel;
     cache = model.createChatCache(args.maxPages, args.batchSize, args.maxSeqLen);
     ws = new ExecutionWorkspace(glm, args.batchSize, args.maxSeqLen);
     console.log(`GLM-5.1 batched MTP: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, topk=${args.mtpDraftTopk.join(",")}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);

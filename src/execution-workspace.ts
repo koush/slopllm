@@ -1,4 +1,4 @@
-import { CaptureManager } from "./capture-manager";
+import {  type CaptureManager } from "./capture-manager";
 import { ChatModel, type ChatCache } from "./chat_model";
 import { DeviceOps, MaskMode } from "./device_ops";
 import { MemcpyKind } from "./enums";
@@ -15,6 +15,73 @@ export const MLA_DECODE_PLAN_INFO_SIZE = 10;
 export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
 export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
+
+export interface ExecutionPhase<T = unknown> {
+  readonly states: readonly ExecutionState[];
+  readonly inputs: { [name: string]: Tensor };
+  readonly captureKey: readonly (string | number)[];
+  run(inputs: { [name: string]: Tensor }): T;
+}
+
+export type ExecutionPlan<T> = Generator<ExecutionPhase, T, unknown>;
+
+export interface ExecutionPlanResult<T> {
+  result: T;
+  warmup: boolean;
+}
+
+export function* executionPhase<T>(phase: ExecutionPhase<T>): Generator<ExecutionPhase, T, unknown> {
+  return (yield phase) as T;
+}
+
+function preserveExecutionInputs(inputs: { [name: string]: Tensor }): Set<Tensor> {
+  const keep = new Set<Tensor>();
+  for (const tensor of Object.values(inputs)) {
+    if (tensor.captured || tensor.name !== undefined || tensor.disposed) continue;
+    tensor.removeTracking();
+    keep.add(tensor);
+  }
+  return keep;
+}
+
+export async function executePlan<T>(captureManager: CaptureManager, ws: ExecutionWorkspace, plan: ExecutionPlan<T>): Promise<ExecutionPlanResult<T>> {
+  let tracking: (Disposable & { [Symbol.dispose](): void }) | undefined = ws.startTracking();
+  let completed = false;
+  let warmup = false;
+  try {
+    let step = plan.next();
+    while (!step.done) {
+      const phase = step.value;
+      if (!captureManager.disabled && phase.captureKey.length > 0) {
+        warmup ||= !ExecutionState.isCaptured(captureManager, phase.states, [...phase.captureKey]);
+      }
+      const phaseResult = ExecutionState.captureAll(
+        captureManager,
+        phase.states,
+        phase.inputs,
+        (_capturing, inputs) => phase.run(inputs),
+        [...phase.captureKey],
+      );
+      await captureManager.ops.synchronizeAsync();
+      const next = plan.next(phaseResult);
+      if (!next.done) {
+        const keepExports = preserveExecutionInputs(next.value.inputs);
+        tracking[Symbol.dispose]();
+        tracking = undefined;
+        tracking = ws.startTracking(keepExports);
+      }
+      step = next;
+    }
+    completed = true;
+    return { result: step.value, warmup };
+  } finally {
+    try {
+      if (!completed) plan.return(undefined as never);
+    } finally {
+      tracking?.[Symbol.dispose]();
+    }
+  }
+}
 
 export class ExecutionState {
   input?: Tensor;
@@ -284,6 +351,7 @@ export class ExecutionState {
    * isCaptured for a graph spanning several states. See captureAll.
    */
   static isCaptured(captureManager: CaptureManager, states: readonly ExecutionState[], providedKeyParams: (string | number)[]): boolean {
+    if (providedKeyParams.length === 0) return false;
     return captureManager.isCaptured(this.effectiveKeyParams(captureManager, states, providedKeyParams));
   }
 
@@ -297,6 +365,7 @@ export class ExecutionState {
    * len, and the key then carries every state's bucket.
    */
   static captureAll<T, I extends { [name: string]: Tensor }>(captureManager: CaptureManager, states: readonly ExecutionState[], inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, providedKeyParams: (string | number)[]): T {
+    if (providedKeyParams.length === 0) return fn(false, inputs);
     const baseKey = this.baseKeyParams(states, providedKeyParams).join(",");
     const keyParams = this.effectiveKeyParams(captureManager, states, providedKeyParams);
     return captureManager.run(inputs, (capturing, capturedInputs) => {
@@ -343,6 +412,11 @@ export class ExecutionWorkspace extends WorkspaceBase {
         inner[Symbol.dispose]();
       },
     };
+  }
+
+  async withTrackingAsync<T>(fn: () => Promise<T>, keepExports = new Set<Tensor>()): Promise<T> {
+    using _tracking = this.startTracking(keepExports);
+    return await fn();
   }
 
   private nextPlanSlot(): number {

@@ -2,12 +2,12 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import {
   GlmOps,
-  getNativeAddon,
   f32ToBf16Bytes,
   bf16BytesToF32,
   NCCL_BFLOAT16,
   NCCL_FLOAT32,
 } from "../src/glm_ops";
+import { getNativeAddon } from "../src/native-addon";
 import { WorkspaceBase } from "../src/workspace";
 import { Tensor } from "../src/tensor";
 

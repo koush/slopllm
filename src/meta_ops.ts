@@ -1,10 +1,9 @@
 import { DeviceOps, MaskMode, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
-import { GlmTensor } from "./glm_ops";
-import { MemcpyKind, Tensor } from "./tensor";
-import { SafeTensorFile } from "./safetensors";
-import { WorkspaceBase } from "./workspace";
-import type { PagedKVCache } from "./paged_kv";
 import type { ExecutionState } from "./execution-workspace";
+import { SafeTensorFile } from "./safetensors";
+import { MemcpyKind } from "./sampling";
+import { Tensor } from "./tensor";
+import { WorkspaceBase } from "./workspace";
 
 export class MetaTensor extends Tensor {
     private fakePinned?: Buffer;
@@ -274,8 +273,6 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([numRows, this.shape[1]], this.type);
     }
 
-    sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
-    }
 }
 
 export class MetaOps implements DeviceOps {
@@ -295,6 +292,9 @@ export class MetaOps implements DeviceOps {
 
     wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined): Tensor {
         return new MetaTensor(workspace, data, allocSize, shape, type, undefined, pinned, view);
+    }
+
+    sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
     }
 
     synchronize(): void {

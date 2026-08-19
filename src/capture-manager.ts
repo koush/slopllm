@@ -1,7 +1,6 @@
+import { Tensor } from "./tensor";
 import { type DeviceOps } from "./device_ops";
 import { MemcpyKind } from "./enums";
-import { PagedKVCache } from "./paged_kv";
-import { type Tensor } from "./tensor";
 import type { WorkspaceBase } from "./workspace";
 
 
@@ -77,7 +76,7 @@ export class CaptureManager implements Disposable {
         }
     }
 
-    run<T, I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, keyParams?: any[]): T {
+    run<T , I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, keyParams?: any[]): T {
         if (CaptureManager.capturing) {
             throw new Error("Cannot run a capture while another capture is in progress");
         }

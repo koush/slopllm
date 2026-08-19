@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { GlmOps, f32ToBf16Bytes, bf16BytesToF32, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_SUM } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { TensorParallelism } from "../src/device_ops";
-import { MemcpyKind, Tensor } from "../src/tensor";
+import { MemcpyKind } from "../src/enums";
+import { Tensor } from "../src/tensor";
 import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
 
 describe("ParallelOps construction", () => {

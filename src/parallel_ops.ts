@@ -2,7 +2,8 @@ import { DeviceOps, MaskMode, SlotSet, StridedMmap, TensorParallelism } from "./
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
 import { Glm51Config } from "./glm51_model";
-import { bf16BytesToF32, f32ToBf16Bytes, getNativeAddon, GlmOps, GlmTensor, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM, NCCL_UINT8 } from "./glm_ops";
+import { bf16BytesToF32, f32ToBf16Bytes, GlmOps, GlmTensor, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM, NCCL_UINT8 } from "./glm_ops";
+import { getNativeAddon } from "./native-addon";
 import { SafeTensorFile } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
@@ -1974,40 +1975,6 @@ export class ParallelTensor extends Tensor {
     return { cos, sin };
   }
 
-  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
-    const pLogits = logits as ParallelTensor;
-    if (pLogits.parallelism === TensorParallelism.Row || pLogits.parallelism === TensorParallelism.Column) {
-      using gathered = pLogits.allGather(pLogits.workspace);
-      this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, gathered, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
-      return;
-    }
-    if (pLogits.parallelism === TensorParallelism.PartialSum) {
-      pLogits.allReduce();
-      this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
-      return;
-    }
-    const pOut = this.cast(outTokens);
-    const pTopkVals = this.cast(topkVals);
-    const pTopkIdxs = this.cast(topkIdxs);
-    const pWorkspace = this.cast(workspace);
-    const pPenaltyTokens = this.cast(penaltyTokens);
-    const pPenaltyCount = this.cast(penaltyCount);
-    const pTemps = this.cast(temperatures);
-    const pRepPen = this.cast(repPenalties);
-    const pPresPen = this.cast(presPenalties);
-    const pTopKs = this.cast(topKs);
-    const pTopPs = this.cast(topPs);
-    const pStepCounter = this.cast(stepCounter);
-    this.assertParallel("sampleBatch logits", pLogits, TensorParallelism.Replicated);
-    // A disposed ParallelTensor has an empty shards array, which would fault
-    // deep inside the per-shard call with an unattributable "reading 'data'".
-    if (pOut.shards.length !== this.worldSize) {
-      throw new Error(`sampleBatch: outTokens has ${pOut.shards.length} shards, expected ${this.worldSize} (disposed by a borrower?)`);
-    }
-    for (let i = 0; i < this.worldSize; i++) {
-      pLogits.shards[i].sampleBatch(pOut.shards[i], pTopkVals.shards[i], pTopkIdxs.shards[i], pWorkspace.shards[i], pLogits.shards[i], pPenaltyTokens.shards[i], pPenaltyCount.shards[i], maxWindow, vocabSize, batchSize, pTemps.shards[i], pRepPen.shards[i], pPresPen.shards[i], pTopKs.shards[i], pTopPs.shards[i], pStepCounter.shards[i], maxEffectiveK);
-    }
-  }
 }
 
 /**
@@ -2570,6 +2537,42 @@ export class ParallelOps implements DeviceOps {
     if (!view)
       throw new Error("ParallelOps.wrapTensor not supported; tensor recycling happens at shard level");
     return new ParallelTensor(workspace, this, view.parallelism, view.shards, shape, type, undefined, pinned, view);
+  }
+
+  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
+    const pLogits = logits as ParallelTensor;
+    if (pLogits.parallelism === TensorParallelism.Row || pLogits.parallelism === TensorParallelism.Column) {
+      using gathered = pLogits.allGather(pLogits.workspace);
+      this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, gathered, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
+      return;
+    }
+    if (pLogits.parallelism === TensorParallelism.PartialSum) {
+      pLogits.allReduce();
+      this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
+      return;
+    }
+
+    const pOut = outTokens as ParallelTensor;
+    const pTopkVals = topkVals as ParallelTensor;
+    const pTopkIdxs = topkIdxs as ParallelTensor;
+    const pWorkspace = workspace as ParallelTensor;
+    const pPenaltyTokens = penaltyTokens as ParallelTensor;
+    const pPenaltyCount = penaltyCount as ParallelTensor;
+    const pTemps = temperatures as ParallelTensor;
+    const pRepPen = repPenalties as ParallelTensor;
+    const pPresPen = presPenalties as ParallelTensor;
+    const pTopKs = topKs as ParallelTensor;
+    const pTopPs = topPs as ParallelTensor;
+    const pStepCounter = stepCounter as ParallelTensor;
+    if (pLogits.parallelism !== TensorParallelism.Replicated) {
+      throw new Error(`sampleBatch logits: unsupported parallelism ${pLogits.parallelism}, expected ${TensorParallelism.Replicated}`);
+    }
+    if (pOut.shards.length !== this.worldSize) {
+      throw new Error(`sampleBatch: outTokens has ${pOut.shards.length} shards, expected ${this.worldSize} (disposed by a borrower?)`);
+    }
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].sampleBatch(pOut.shards[i], pTopkVals.shards[i], pTopkIdxs.shards[i], pWorkspace.shards[i], pLogits.shards[i], pPenaltyTokens.shards[i], pPenaltyCount.shards[i], maxWindow, vocabSize, batchSize, pTemps.shards[i], pRepPen.shards[i], pPresPen.shards[i], pTopKs.shards[i], pTopPs.shards[i], pStepCounter.shards[i], maxEffectiveK);
+    }
   }
 
   wrapShards(workspace: WorkspaceBase, shards: Tensor[], fullShape: number[], type: string, parallelism: TensorParallelism, view?: ParallelTensor): ParallelTensor {

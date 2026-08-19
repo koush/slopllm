@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import {
   GlmOps,
   GlmTensor,
-  getNativeAddon,
   f32ToBf16Bytes,
   bf16BytesToF32,
   NCCL_UNIQUE_ID_BYTES,
@@ -11,7 +10,8 @@ import {
   NCCL_FLOAT32,
   NCCL_SUM,
 } from "../src/glm_ops";
-import { MemcpyKind } from "../src/tensor";
+import { MemcpyKind } from "../src/enums";
+import { getNativeAddon } from "../src/native-addon";
 import { WorkspaceBase } from "../src/workspace";
 import { Tensor } from "../src/tensor";
 
