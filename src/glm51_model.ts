@@ -754,7 +754,8 @@ export class Glm51Model extends ChatModel {
     state.setInput(rotatedInputIds);
     using mtpDraftExtendHiddenStates = this.forwardMtp!(state, hiddenStates);
 
-    const mtpHiddenStates = mtpDraftExtendHiddenStates.slice(0, -1, 1);
+    using lastIdx = state.lastIdx;
+    const mtpHiddenStates = mtpDraftExtendHiddenStates.indexSelect(lastIdx, -1);
 
     return {
       token,

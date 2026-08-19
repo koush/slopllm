@@ -242,12 +242,17 @@ export async function* generateStream(
       using _mtpHiddenStates = mtpDraftExtendResult.mtpHiddenStates;
       using _token = mtpDraftExtendResult.token;
 
-      const maxTopK = Math.max(...topks);
-      const maxTopKShape = [maxTopK, ..._mtpHiddenStates.shape.slice(1)];
-      const mtpHiddenStatesMaxTopK = ws.alloc(maxTopKShape, _mtpHiddenStates.type);
-      mtpHiddenStatesMaxTopK.memcpy(_mtpHiddenStates, _mtpHiddenStates.bytes, MemcpyKind.DeviceToDevice);
+      let maxIntermediateWidth = 1;
+      let width = 1;
+      for (const topk of topks.slice(0, -1)) {
+        width *= topk;
+        maxIntermediateWidth = Math.max(maxIntermediateWidth, width);
+      }
+      const scratchShape = [ws.maxBatch * maxIntermediateWidth, ..._mtpHiddenStates.shape.slice(1)];
+      const mtpHiddenStatesScratch = ws.alloc(scratchShape, _mtpHiddenStates.type);
+      mtpHiddenStatesScratch.memcpy(_mtpHiddenStates, _mtpHiddenStates.bytes, MemcpyKind.DeviceToDevice);
 
-      mtpHiddenStates.replace(mtpHiddenStatesMaxTopK.removeTracking());
+      mtpHiddenStates.replace(mtpHiddenStatesScratch.removeTracking());
     }
 
     sampleResult = sampleWorkspace.ensureAllocPinned(gpuSampleResult!.shape, gpuSampleResult!.type, "sampleResult");
@@ -283,10 +288,10 @@ export async function* generateStream(
 
       if (mtp && model.forwardMtp && topks.length > 0) {
         if (process.env.GLM_STEP_LOG === '1') process.stderr.write(`[step ${i}] seqLen=${cache.getPagedKV().sequences[0].allocLen} histLen=${tokenHistory.length}\n`);
-        const { warmup, tokens, numAccepted, numDraftTokens } = await mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots.value, sharedSlotsLength.value, ws, currentToken, topks, cache);
-        if (mtpStats && !warmup) mtpStats.observe(numDraftTokens, numAccepted);
+        const { warmup, tokens, numAccepted, numDraftTokens } = await mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots.value, sharedSlotsLength.value, ws, [currentToken], topks, cache);
+        if (mtpStats && !warmup) mtpStats.observe(numDraftTokens, numAccepted[0]);
         // glm.synchronize();
-        for (const t of tokens) {
+        for (const t of tokens[0]) {
           currentToken = t;
           cache.reportTokens(0, [t]);
           tokenHistory.push(t);

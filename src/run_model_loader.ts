@@ -199,10 +199,22 @@ async function main(): Promise<void> {
           sendJson(res, 400, { error: "No executor command was provided" });
           return;
         }
-        startWorker();
-        sendJson(res, 202, { state: "running", threadId: worker!.threadId });
+        if (url.searchParams.has("follow")) {
+          res.writeHead(200, {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-cache",
+            "x-accel-buffering": "no",
+          });
+          res.socket?.setNoDelay(true);
+          res.flushHeaders();
+          startWorker(res);
+        } else {
+          startWorker();
+          sendJson(res, 202, { state: "running", threadId: worker!.threadId });
+        }
       }).catch(error => {
-        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        if (!res.headersSent) sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        else if (!res.writableEnded) res.end(`Executor failed: ${error instanceof Error ? error.message : String(error)}\n`);
       });
       return;
     }
