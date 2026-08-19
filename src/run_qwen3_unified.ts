@@ -225,25 +225,27 @@ export async function* generateStream(
     state.sharedSlots = sharedSlots;
     state.sharedSlotsLength = sharedSlotsLength;
     state.setInput(inputIdsList);
-    using hiddenStates = model.forward(state);
-    using firstTokens = state.computeLogits(hiddenStates, model);
-    doSample(firstTokens);
 
-    if (usingMtp) {
-      // MTP convention: at position P, the input token is the token at P+1 (not P),
-      // paired with the target model's hidden state at P. This means the MTP KV entry
-      // at position P encodes info about token P+1, whereas the target model KV at the
-      // same position encodes token P. This is safe because each MLA layer has its own
-      // KV slot — the two never interfere.
-      using rotatedInputIds = state.input!.rotateInputIds(state.qoIndptrD, gpuSampleResult!, state.batchSize);
-      state.setInput(rotatedInputIds);
-      using _mtpHiddenStates = model.forwardMtp!(state, hiddenStates);
+    if (!usingMtp) {
+      using hiddenStates = model.forward(state);
+      using firstTokens = state.computeLogits(hiddenStates, model);
+      doSample(firstTokens);
+    }
+    else {
+      using _tracker = state.ws.startTracking();
+
+      const mtpDraftExtendResult = model.forwardMtpDraftExtend!(state, topks, (hiddenStates) => {
+        using firstTokens = state.computeLogits(hiddenStates, model);
+        doSample(firstTokens);
+        return gpuSampleResult!.viewClone();
+      });
+      using _mtpHiddenStates = mtpDraftExtendResult.mtpHiddenStates;
+      using _token = mtpDraftExtendResult.token;
 
       const maxTopK = Math.max(...topks);
       const maxTopKShape = [maxTopK, ..._mtpHiddenStates.shape.slice(1)];
       const mtpHiddenStatesMaxTopK = ws.alloc(maxTopKShape, _mtpHiddenStates.type);
-      using sliced = _mtpHiddenStates.slice(0, -1, 1);
-      mtpHiddenStatesMaxTopK.memcpy(sliced, sliced.bytes, MemcpyKind.DeviceToDevice);
+      mtpHiddenStatesMaxTopK.memcpy(_mtpHiddenStates, _mtpHiddenStates.bytes, MemcpyKind.DeviceToDevice);
 
       mtpHiddenStates.replace(mtpHiddenStatesMaxTopK.removeTracking());
     }

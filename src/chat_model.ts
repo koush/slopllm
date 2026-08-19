@@ -60,7 +60,10 @@ export abstract class ChatModel extends WorkspaceBase {
   abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number): ChatCache;
   abstract forwardModel(state: ExecutionState): Tensor;
   forwardMtp?(state: ExecutionState, previousHiddenState: Tensor): Tensor;
-  forwardMtpDraftExtend?(state: ExecutionState): Tensor;
+  forwardMtpDraftExtend?(state: ExecutionState, topks: number[], sample: (hiddenStates: Tensor) => Tensor): {
+    token: Tensor,
+    mtpHiddenStates: Tensor,
+  };
 
   prepareMtpInput(_cache: ChatCache, inputIdsList: number[][]): number[][] {
     return inputIdsList.map(inputIds => [...inputIds]);

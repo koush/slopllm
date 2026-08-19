@@ -92,6 +92,8 @@ export class CaptureManager implements Disposable {
             if (captured) {
                 if (captured.graphExec !== null) {
                     for (const [name, input] of Object.entries(inputs)) {
+                        if (!input)
+                            continue;
                         input.stage();
                         const capturedInput = captured.inputs[name];
                         if (!capturedInput.same(input)) {
@@ -105,6 +107,8 @@ export class CaptureManager implements Disposable {
                         }
                     }
                     for (const [name, input] of Object.entries(inputs)) {
+                        if (!input)
+                            continue;
                         input.unstage();
                     }
                     this.ops.graphLaunch(captured.graphExec);
@@ -114,6 +118,8 @@ export class CaptureManager implements Disposable {
                 if (captured.warmupSteps === 3) {
                     const capturedInputs: typeof inputs = {} as any;
                     for (const [name, tensor] of Object.entries(inputs)) {
+                        if (!tensor)
+                            continue;
                         (capturedInputs as any)[name] = tensor.capture();
                     }
                     captured.inputs = capturedInputs;
@@ -137,6 +143,8 @@ export class CaptureManager implements Disposable {
         try {
             const capturedInputs: any = {};
             for (const [name, input] of Object.entries(inputs)) {
+                if (!input)
+                    continue;
                 input.stage();
                 capturedInputs[name] = input.capture();
             }
@@ -159,6 +167,8 @@ export class CaptureManager implements Disposable {
             CaptureManager.capturing = undefined;
 
             for (const [name, input] of Object.entries(inputs)) {
+                if (!input)
+                    continue;
                 input.unstage();
             }
         }

@@ -8,7 +8,7 @@ import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
-import { Tensor } from "./tensor";
+import { MemcpyKind, Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 
 export { ExecutionState as BatchState };
@@ -430,6 +430,7 @@ export class Glm51Model extends ChatModel {
     const BS = state.totalTokens;
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : state.totalTokens;
+    const dense = cfg.indexHeadDim === 0;
 
     using kvcache = this.glm.withStream(() => {
       using kPeRopeStream = this.glm.withStream(() => {
@@ -444,12 +445,14 @@ export class Glm51Model extends ChatModel {
       kPeRopeStream.streamWaitEvent();
       state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
 
+      if (dense)
+        return;
+
       // The physical slots are derived per-layer from sharedTopk at attention
       // time below; the topk arg here is vestigial.
       return state.sparseMlaPrepareCache(state.sharedSlots!.value, ckvNormed, kPeRope, undefined, layerIdx, kvLoraRank, qkRopeDim);
     });
 
-    const dense = cfg.indexHeadDim === 0;
     const shared = cfg.indexerTypes[layerIdx] === "shared";
     const skipIndexer = dense || shared;
 
@@ -695,8 +698,11 @@ export class Glm51Model extends ChatModel {
       return previousHiddenState.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps);
     });
     using embedding = state.embedding(embedTable);
-    let row = 0;
-    const sequences = state.cache.getPagedKV().sequences;
+
+    // TODO: THIS IS NOT GRAPH CAPTURABLE
+    // there seems to be no adverse affect in NOT doing it, as it only affects short/initial sequence.
+    // let row = 0;
+    // const sequences = state.cache.getPagedKV().sequences;
     // for (let i = 0; i < state.batchSize; i++) {
     //   const seqLen = state.seqLens[i];
     //   const startPos = sequences[i].allocLen - seqLen;
@@ -706,6 +712,7 @@ export class Glm51Model extends ChatModel {
     //   }
     //   row += seqLen;
     // }
+
     using enorm = embedding.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.enorm.weight`)!, cfg.rmsNormEps);
     hnormStream.streamWaitEvent();
     using hnorm = hnormStream.result;
@@ -738,7 +745,20 @@ export class Glm51Model extends ChatModel {
     return result.normed.removeTracking();
   }
 
-  // forwardMtpDraftExtend(state: ExecutionState) {
 
-  // }
+  forwardMtpDraftExtend(state: ExecutionState, topks: number[], sample: (hiddenStates: Tensor) => Tensor) {
+    using hiddenStates = this.forwardModel(state);
+    const token = sample(hiddenStates);
+
+    using rotatedInputIds = state.input!.rotateInputIds(state.qoIndptrD, token!, state.batchSize);
+    state.setInput(rotatedInputIds);
+    using mtpDraftExtendHiddenStates = this.forwardMtp!(state, hiddenStates);
+
+    const mtpHiddenStates = mtpDraftExtendHiddenStates.slice(0, -1, 1);
+
+    return {
+      token,
+      mtpHiddenStates,
+    };
+  }
 }
