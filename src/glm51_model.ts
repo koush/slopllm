@@ -2,13 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
-import { DeviceOps, MaskMode, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, TensorParallelism } from "./device_ops";
 import { ExecutionState } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
-import { MemcpyKind, Tensor } from "./tensor";
+import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 
 export { ExecutionState as BatchState };

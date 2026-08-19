@@ -204,7 +204,7 @@ export async function mtpTreeDecode(
   const start = performance.now();
 
   let warmup = false;
-  const useDecodeDraftGenerator = true;
+  const useDecodeDraftGenerator = false;
 
   // Depth-1 tree (topks.length === 1, e.g. nextn=1): both draft strategies below
   // run zero loop iterations, so the root's top-k candidates must be generated
@@ -372,8 +372,8 @@ export async function mtpTreeDecode(
         const state = planStates[pi];
         const next = pi + 1 < planStates.length ? planStates[pi + 1] : null;
 
-        state.sharedSlots = new UsingHolder(inputs.sharedSlots.capture());
-        state.sharedSlotsLength = new UsingHolder(inputs.sharedSlotsLength.capture());
+        state.sharedSlots = new UsingHolder(inputs.sharedSlots?.capture());
+        state.sharedSlotsLength = new UsingHolder(inputs.sharedSlotsLength?.capture());
         const prevHs = inputs.mtpHiddenStates;
 
         // Depth 1: compute initial logits and topk from mtpHiddenStates
@@ -427,8 +427,8 @@ export async function mtpTreeDecode(
     await ws.glm.synchronizeAsync();
 
     mtpHiddenStates.removeTracking();
-    sharedSlots.removeTracking();
-    sharedSlotsLength.removeTracking();
+    sharedSlots?.removeTracking();
+    sharedSlotsLength?.removeTracking();
   }
 
   const draft = performance.now();
