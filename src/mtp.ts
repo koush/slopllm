@@ -227,6 +227,7 @@ export async function mtpTreeDecode(
       using _initialValues = initialTopk.values;
       using initialIndices = initialTopk.indices;
       hostBuf.memcpy2d(0, batchSize * I32 * topks[0], initialIndices, 0, batchSize * I32 * topks[0], batchSize * I32 * topks[0], 1, MemcpyKind.DeviceToHost);
+      return undefined;
     }, ['mtp-tree-decode-root', topks[0], `batchSize:${batchSize}`]);
     mtpHiddenStates.removeTracking();
     sharedSlots.removeTracking();
@@ -494,19 +495,18 @@ export async function mtpTreeDecode(
     targetPrefillState.sharedSlots = new UsingHolder(undefined!);
     targetPrefillState.sharedSlotsLength = new UsingHolder(undefined!);
 
-    const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, appendCkvOrig: Tensor, appendKpeOrig: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
-    const indexerKvCacheLayers: { appendIdxK: Tensor, appendIdxKOrig: Tensor, cacheIdx: number, indexHeadDim: number }[] = [];
+    const kvCacheLayers: { appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number }[] = [];
+    const indexerKvCacheLayers: { appendIdxK: Tensor, cacheIdx: number, indexHeadDim: number }[] = [];
 
     const mlaKVCacheAppendOrig = targetPrefillState.mlaKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
-      // viewclone and and capture the tensors for graph playback
-      kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendKpe: appendKpe.capture(), appendCkvOrig: appendCkv.viewClone(), appendKpeOrig: appendKpe.viewClone(), cacheIdx, kvLoraRank, qkRopeDim });
+      kvCacheLayers.push({ appendCkv: appendCkv.viewClone(), appendKpe: appendKpe.viewClone(), cacheIdx, kvLoraRank, qkRopeDim });
       return mlaKVCacheAppendOrig(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
     };
 
     const indexerKvCacheAppendOrig = targetPrefillState.indexerKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.indexerKvCacheAppend = (idxKOut, cacheIdx, indexHeadDim) => {
-      indexerKvCacheLayers.push({ appendIdxK: idxKOut.capture(), appendIdxKOrig: idxKOut.viewClone(), cacheIdx, indexHeadDim });
+      indexerKvCacheLayers.push({ appendIdxK: idxKOut.viewClone(), cacheIdx, indexHeadDim });
       return indexerKvCacheAppendOrig(idxKOut, cacheIdx, indexHeadDim);
     };
 
@@ -681,13 +681,16 @@ export async function mtpTreeDecode(
   const mtpExtendPrefill = ws.planPrefill(model, batchSize, finishCounts, cache);
   mtpExtendPrefill.setInput(acceptedTokens.map((tokens, batch) => [...tokens, replacementTokens[batch]]));
   for (const layer of kvCacheLayers) {
-    mtpExtendPrefill.mlaKvCacheAppend(layer.appendCkv, layer.appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
-    layer.appendCkvOrig[Symbol.dispose]();
-    layer.appendKpeOrig[Symbol.dispose]();
+    using appendCkv = layer.appendCkv;
+    using appendKpe = layer.appendKpe;
+    appendCkv.resumeTracking();
+    appendKpe.resumeTracking();
+    mtpExtendPrefill.mlaKvCacheAppend(appendCkv, appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
   }
   for (const layer of indexerKvCacheLayers) {
-    mtpExtendPrefill.indexerKvCacheAppend(layer.appendIdxK, layer.cacheIdx, layer.indexHeadDim);
-    layer.appendIdxKOrig[Symbol.dispose]();
+    using appendIdxK = layer.appendIdxK;
+    appendIdxK.resumeTracking();
+    mtpExtendPrefill.indexerKvCacheAppend(appendIdxK, layer.cacheIdx, layer.indexHeadDim);
   }
   await ws.glm.synchronizeAsync();
 

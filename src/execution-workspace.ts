@@ -1,4 +1,4 @@
-import {  type CaptureManager } from "./capture-manager";
+import { type CaptureManager, type CaptureReturn } from "./capture-manager";
 import { ChatModel, type ChatCache } from "./chat_model";
 import { DeviceOps, MaskMode } from "./device_ops";
 import { MemcpyKind } from "./enums";
@@ -371,8 +371,8 @@ export class ExecutionState {
     return captureManager.run(inputs, (capturing, capturedInputs) => {
       const result = fn(capturing, capturedInputs);
       captureManager.recordLengthVariant(baseKey, states.some(s => !s.paddedKvLenInvariant));
-      return result;
-    }, keyParams);
+      return result as CaptureReturn;
+    }, keyParams) as T;
   }
 
   isCaptured(captureManager: CaptureManager, providedKeyParams: (string | number)[]): boolean {

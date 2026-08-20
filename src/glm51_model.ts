@@ -55,23 +55,18 @@ export interface MtpDraftBatch {
 interface MtpVerificationArtifacts {
   kvCacheLayers: Array<{
     appendCkv: Tensor;
-    appendCkvOrig: Tensor;
     appendKpe: Tensor;
-    appendKpeOrig: Tensor;
     cacheIdx: number;
     kvLoraRank: number;
     qkRopeDim: number;
   }>;
   indexerKvCacheLayers: Array<{
     appendIdxK: Tensor;
-    appendIdxKOrig: Tensor;
     cacheIdx: number;
     indexHeadDim: number;
   }>;
   sharedSlots: Tensor;
   sharedSlotsLength: Tensor;
-  sharedSlotsOrig: Tensor;
-  sharedSlotsLengthOrig: Tensor;
 }
 
 export interface MtpStepResult {
@@ -1076,8 +1071,6 @@ export class Glm51Model extends ChatModel {
         next.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
         seed.memcpy(hiddenStates, hiddenStates.bytes, MemcpyKind.DeviceToDevice);
       }
-      stateSharedSlots.value.resumeTracking();
-      stateSharedSlotsLength.value.resumeTracking();
     }
   }
 
@@ -1197,15 +1190,12 @@ export class Glm51Model extends ChatModel {
         const indexerKvCacheLayers: MtpVerificationArtifacts["indexerKvCacheLayers"] = [];
         const appendMla = state.mlaKvCacheAppend.bind(state);
         state.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
-          appendCkv.removeTracking();
-          appendKpe.removeTracking();
-          kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendCkvOrig: appendCkv, appendKpe: appendKpe.capture(), appendKpeOrig: appendKpe, cacheIdx, kvLoraRank, qkRopeDim });
+          kvCacheLayers.push({ appendCkv: appendCkv.viewClone(), appendKpe: appendKpe.viewClone(), cacheIdx, kvLoraRank, qkRopeDim });
           return appendMla(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
         };
         const appendIndexer = state.indexerKvCacheAppend.bind(state);
         state.indexerKvCacheAppend = (appendIdxK, cacheIdx, indexHeadDim) => {
-          appendIdxK.removeTracking();
-          indexerKvCacheLayers.push({ appendIdxK: appendIdxK.capture(), appendIdxKOrig: appendIdxK, cacheIdx, indexHeadDim });
+          indexerKvCacheLayers.push({ appendIdxK: appendIdxK.viewClone(), cacheIdx, indexHeadDim });
           return appendIndexer(appendIdxK, cacheIdx, indexHeadDim);
         };
         using hiddenStates = this.forwardModel(state, slots, slotsLength);
@@ -1215,15 +1205,11 @@ export class Glm51Model extends ChatModel {
         state.setInput(argmax);
         using mtpHidden = this.forwardMtp(state, hiddenStates, slots, slotsLength);
         mtpHiddenStaging.memcpy(mtpHidden, mtpHidden.bytes, MemcpyKind.DeviceToDevice);
-        const sharedSlotsOrig = slots.detach();
-        const sharedSlotsLengthOrig = slotsLength.detach();
         return {
           kvCacheLayers,
           indexerKvCacheLayers,
-          sharedSlots: sharedSlotsOrig.capture(),
-          sharedSlotsLength: sharedSlotsLengthOrig.capture(),
-          sharedSlotsOrig,
-          sharedSlotsLengthOrig,
+          sharedSlots: slots.detach(),
+          sharedSlotsLength: slotsLength.detach(),
         };
       },
     });
@@ -1283,11 +1269,10 @@ export class Glm51Model extends ChatModel {
     const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
     const seed = ws.ensureAlloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16", `glm51_mtp_seed_${topks.join("_")}`);
     for (const layer of artifacts.kvCacheLayers) {
-      const { appendCkv, appendKpe } = layer;
-      using appendCkvOrig = layer.appendCkvOrig;
-      using appendKpeOrig = layer.appendKpeOrig;
-      appendCkvOrig.resumeTracking();
-      appendKpeOrig.resumeTracking();
+      using appendCkv = layer.appendCkv;
+      using appendKpe = layer.appendKpe;
+      appendCkv.resumeTracking();
+      appendKpe.resumeTracking();
       let destinationBase = 0;
       for (let batch = 0; batch < batchSize; batch++) {
         const sourceBase = batch * numVerificationTokens;
@@ -1304,9 +1289,8 @@ export class Glm51Model extends ChatModel {
       commitState.mlaKvCacheAppend(appendCkv, appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
     }
     for (const layer of artifacts.indexerKvCacheLayers) {
-      const { appendIdxK } = layer;
-      using appendIdxKOrig = layer.appendIdxKOrig;
-      appendIdxKOrig.resumeTracking();
+      using appendIdxK = layer.appendIdxK;
+      appendIdxK.resumeTracking();
       let destinationBase = 0;
       for (let batch = 0; batch < batchSize; batch++) {
         const sourceBase = batch * numVerificationTokens;
@@ -1332,8 +1316,8 @@ export class Glm51Model extends ChatModel {
     const draftPlan = this.planMtpDraftDepths(ws, cache, committedAllocLens, topks);
     const treeHost = ws.ensureAllocPinned([ws.maxBatch * numTreeNodes], "I32", `glm51_mtp_draft_host_${numTreeNodes}`);
     const draftInputs: { [name: string]: Tensor } = {
-      sharedSlots: artifacts.sharedSlotsOrig.disposed ? artifacts.sharedSlots : artifacts.sharedSlotsOrig,
-      sharedSlotsLength: artifacts.sharedSlotsLengthOrig.disposed ? artifacts.sharedSlotsLength : artifacts.sharedSlotsLengthOrig,
+      sharedSlots: artifacts.sharedSlots,
+      sharedSlotsLength: artifacts.sharedSlotsLength,
     };
 
     yield* executionPhase({

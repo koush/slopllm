@@ -7,7 +7,7 @@ import type { WorkspaceBase } from "./workspace";
 interface Captured {
     warmupSteps: number;
     graphExec: number | null;
-    result: any;
+    result: CaptureReturn;
     inputs: { [name: string]: Tensor, };
     capturedWorkspaces: Set<WorkspaceBase>;
 }
@@ -23,7 +23,7 @@ interface LengthVariant {
     kvLen: boolean;
 }
 
-type CaptureReturn = Tensor | CaptureReturn[] | string | number | boolean | null | undefined | { [name: string]: CaptureReturn };
+export type CaptureReturn = Tensor | CaptureReturn[] | string | number | boolean | null | undefined | { [name: string]: CaptureReturn };
 
 function mapCaptureTensors(object: CaptureReturn, mapTensor: (tensor: Tensor) => Tensor): CaptureReturn {
     if (object instanceof Tensor) {
@@ -98,7 +98,7 @@ export class CaptureManager implements Disposable {
         }
     }
 
-    run<T, I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, keyParams?: any[]): T {
+    run<I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => CaptureReturn, keyParams?: any[]): CaptureReturn {
         if (CaptureManager.capturing) {
             throw new Error("Cannot run a capture while another capture is in progress");
         }
@@ -133,7 +133,7 @@ export class CaptureManager implements Disposable {
                         input.unstage();
                     }
                     this.ops.graphLaunch(captured.graphExec);
-                    return captured.result;
+                    return mapCaptureTensors(captured.result, tensor => tensor.uncapture().removeTracking());
                 }
 
                 if (captured.warmupSteps === 3) {
@@ -160,7 +160,7 @@ export class CaptureManager implements Disposable {
             }
         }
 
-        let result: T;
+        let result: CaptureReturn;
         try {
             const capturedInputs: any = {};
             for (const [name, input] of Object.entries(inputs)) {
@@ -195,7 +195,7 @@ export class CaptureManager implements Disposable {
         }
 
         if (capturing) {
-            captured!.result = result;
+            captured!.result = mapCaptureTensors(result, tensor => tensor.capture());
             const graph = this.ops.graphEndCapture();
             try {
                 captured!.graphExec = this.ops.graphInstantiate(graph);
@@ -205,7 +205,7 @@ export class CaptureManager implements Disposable {
             }
             this.ops.graphLaunch(captured!.graphExec);
         }
-        return result;
+        return mapCaptureTensors(result, tensor => tensor.removeTracking());
     }
 
     isCaptured(keyParams: any[]): boolean {
