@@ -2,12 +2,13 @@ import { Tensor } from "./tensor";
 import { type DeviceOps } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import type { WorkspaceBase } from "./workspace";
+import { mapTensors, type TensorTree } from "./tensor-tree";
 
 
 interface Captured {
     warmupSteps: number;
     graphExec: number | null;
-    result: CaptureReturn;
+    result: TensorTree;
     inputs: { [name: string]: Tensor, };
     capturedWorkspaces: Set<WorkspaceBase>;
 }
@@ -22,28 +23,6 @@ interface Captured {
 interface LengthVariant {
     kvLen: boolean;
 }
-
-export type CaptureReturn = Tensor | CaptureReturn[] | string | number | boolean | null | undefined | { [name: string]: CaptureReturn };
-
-function mapCaptureTensors(object: CaptureReturn, mapTensor: (tensor: Tensor) => Tensor): CaptureReturn {
-    if (object instanceof Tensor) {
-        return mapTensor(object);
-    }
-    else if (Array.isArray(object)) {
-        return object.map(item => mapCaptureTensors(item, mapTensor));
-    }
-    else if (object && typeof object === "object") {
-        const result: Record<string, CaptureReturn> = {};
-        for (const [key, item] of Object.entries(object)) {
-            result[key] = mapCaptureTensors(item, mapTensor);
-        }
-        return result;
-    }
-    else {
-        return object;
-    }
-}
-
 
 export class CaptureManager implements Disposable {
     static capturing?: Captured;
@@ -98,7 +77,7 @@ export class CaptureManager implements Disposable {
         }
     }
 
-    run<I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => CaptureReturn, keyParams?: any[]): CaptureReturn {
+    run<I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => TensorTree, keyParams?: any[]): TensorTree {
         if (CaptureManager.capturing) {
             throw new Error("Cannot run a capture while another capture is in progress");
         }
@@ -133,7 +112,7 @@ export class CaptureManager implements Disposable {
                         input.unstage();
                     }
                     this.ops.graphLaunch(captured.graphExec);
-                    return mapCaptureTensors(captured.result, tensor => tensor.uncapture());
+                    return mapTensors(captured.result, tensor => tensor.uncapture());
                 }
 
                 if (captured.warmupSteps === 3) {
@@ -160,7 +139,7 @@ export class CaptureManager implements Disposable {
             }
         }
 
-        let result: CaptureReturn;
+        let result: TensorTree;
         try {
             const capturedInputs: any = {};
             for (const [name, input] of Object.entries(inputs)) {
@@ -195,7 +174,7 @@ export class CaptureManager implements Disposable {
         }
 
         if (capturing) {
-            captured!.result = mapCaptureTensors(result, tensor => tensor.capture());
+            captured!.result = mapTensors(result, tensor => tensor.capture());
             const graph = this.ops.graphEndCapture();
             try {
                 captured!.graphExec = this.ops.graphInstantiate(graph);

@@ -1,6 +1,7 @@
 import { CaptureManager } from "./capture-manager";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import { Tensor } from "./tensor";
+import { collectTensors, type TensorTree } from "./tensor-tree";
 
 export class WorkspaceBase implements Disposable {
   readonly glm: DeviceOps;
@@ -68,8 +69,8 @@ export class WorkspaceBase implements Disposable {
     });
   }
 
-  clearTracking(keepExports = new Set<Tensor>()) {
-    this._clearTracking(keepExports);
+  clearTracking(keep: TensorTree = undefined) {
+    this._clearTracking(collectTensors(keep));
   }
 
   startTracking(keepExports = new Set<Tensor>()): Disposable & { [Symbol.dispose](): void } {

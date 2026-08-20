@@ -1,6 +1,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { parentPort } from "node:worker_threads";
+import { CaptureManager } from "./capture-manager";
 import { ChatModel, ChatCache, SamplingParams, Tokenizer } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
@@ -8,7 +9,6 @@ import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
 
-const MODEL_NAME = "qwen3-0.6b";
 const PAGE_SIZE = 64;
 
 interface ServerArgs extends ModelCliArgs {
@@ -197,13 +197,14 @@ async function generateContinuousBatch(
   maxBatchSize: number,
   decodeLatencyMs: number,
   metrics: ServerMetrics,
+  captureManager: CaptureManager,
+  samplingWorkspace: SamplingWorkspace,
 ): Promise<void> {
   const tokenizer = model.tokenizer;
   const pagedKV = cache.getPagedKV();
   const eosToken = [...eosIds][0];
   const active: ActiveSequence[] = [];
   let nextStagingKey = 0;
-  using samplingWorkspace = new SamplingWorkspace(glm, maxBatchSize, model.cfg.vocabSize, 64);
 
   while (active.length > 0 || pendingQueue.length > 0) {
     // 1. Remove finished sequences (reverse order to avoid index shift)
@@ -250,6 +251,8 @@ async function generateContinuousBatch(
       // Prefill new requests
       const prefillStart = performance.now();
       const firstTokens = ws.forwardEagerPrefill(model, inputIdsList, cache);
+      await glm.synchronizeAsync();
+      ws.clearTracking();
       const prefillSeconds = (performance.now() - prefillStart) / 1000;
       metrics.prefillTimeSecondsCount += newCount;
       metrics.prefillTimeSecondsSum += prefillSeconds * newCount;
@@ -314,13 +317,18 @@ async function generateContinuousBatch(
 
     // 5. Decode one step
     const inputTokens = active.map(a => a.lastToken);
-    const state = ws.planDecode(model, active.length, cache);
+    const state = ws.planDecode(model, active.length, cache, true);
     state.setInput([inputTokens]);
-    ws.positionStep(state, model);
-    using hiddenStates = model.forward(state);
-    using decodeLogits = state.computeLogits(hiddenStates, model);
-    const newSampled = samplingWorkspace.sample(decodeLogits);
-    const newTokens = newSampled.readInt32LEArray();
+    state.capture(captureManager, {}, () => {
+      ws.positionStep(state, model);
+      using hiddenStates = model.forwardModel(state);
+      using decodeLogits = state.computeLogits(hiddenStates, model);
+      samplingWorkspace.sample(decodeLogits);
+      return undefined;
+    }, ["openai-decode"]);
+    await glm.synchronizeAsync();
+    const newTokens = samplingWorkspace.outToken.readInt32LEArray();
+    ws.clearTracking();
     metrics.generationTokensTotal += newTokens.length;
 
     // 6. Process decoded tokens
@@ -565,13 +573,15 @@ function sendMetrics(
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const args = parseArgs(argv);
 
-  const { modelDir } = resolveModelSelection(args);
+  const { modelDir, repoId: modelName } = resolveModelSelection(args);
 
   console.log(`Loading model from ${modelDir}...`);
   const { glm, gpuDevices } = createDeviceOps(args);
   const model = await loadModel(glm, args, modelDir);
   const cache = model.createChatCache(args.maxPages, args.batchSize, args.ctxSize);
   const ws = new ExecutionWorkspace(glm, args.batchSize, args.ctxSize);
+  const captureManager = new CaptureManager(glm);
+  const samplingWorkspace = new SamplingWorkspace(glm, args.batchSize, model.cfg.vocabSize, args.repetitionPenaltyWindow);
   const tokenizer = model.tokenizer;
   const eosIds = model.eosIds;
 
@@ -583,9 +593,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     cache.reset(1);
     using warmupSw = new SamplingWorkspace(glm, 1, model.cfg.vocabSize, args.repetitionPenaltyWindow);
     warmupSw.updateSampler([makeSamplingParamsHelper(args)], [warmupIds]);
-    using warmupLogits = ws.forwardPrefill(model, [warmupIds], cache);
-    const warmupSampled = warmupSw.sample(warmupLogits);
-    let lastToken = warmupSampled.readInt32LEArray()[0];
+    let lastToken: number;
+    {
+      using warmupLogits = ws.forwardPrefill(model, [warmupIds], cache);
+      const warmupSampled = warmupSw.sample(warmupLogits);
+      lastToken = warmupSampled.readInt32LEArray()[0];
+    }
     cache.reportTokens(0, warmupIds);
     cache.reportTokens(0, [lastToken]);
     for (let i = 0; i < 3; i++) {
@@ -598,6 +611,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       lastToken = ns.readInt32LEArray()[0];
       cache.reportTokens(0, [lastToken]);
     }
+    await glm.synchronizeAsync();
+    ws.clearTracking();
     cache.reset(1);
     console.log("Warmup complete.");
   }
@@ -633,7 +648,20 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       let totalPrompt = 0;
       const requestCount = pendingQueue.length;
       try {
-        await generateContinuousBatch(model, ws, glm, cache, eosIds, pendingQueue, args.ctxSize, args.batchSize, args.decodeLatency, metrics);
+        await generateContinuousBatch(
+          model,
+          ws,
+          glm,
+          cache,
+          eosIds,
+          pendingQueue,
+          args.ctxSize,
+          args.batchSize,
+          args.decodeLatency,
+          metrics,
+          captureManager,
+          samplingWorkspace,
+        );
       } catch (err) {
         console.error("Continuous batch error:", err);
       }
@@ -661,6 +689,18 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         params = JSON.parse(body);
       } catch {
         sendJSON(res, 400, { error: { message: "Invalid JSON", type: "invalid_request_error" } });
+        return;
+      }
+
+      if (params.model !== undefined && params.model !== modelName) {
+        sendJSON(res, 404, {
+          error: {
+            message: `The model '${params.model}' does not exist`,
+            type: "invalid_request_error",
+            param: "model",
+            code: "model_not_found",
+          },
+        });
         return;
       }
 
@@ -729,7 +769,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           id,
           object: "chat.completion.chunk",
           created,
-          model: MODEL_NAME,
+          model: modelName,
           choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
         });
 
@@ -744,7 +784,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               id,
               object: "chat.completion.chunk",
               created,
-              model: MODEL_NAME,
+              model: modelName,
               choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
             });
           }
@@ -761,7 +801,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               id,
               object: "chat.completion.chunk",
               created,
-              model: MODEL_NAME,
+              model: modelName,
               choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
             });
           }
@@ -770,7 +810,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             id,
             object: "chat.completion.chunk",
             created,
-            model: MODEL_NAME,
+            model: modelName,
             choices: [{ index: 0, delta: {}, finish_reason: completionReq.finishReason }],
           });
 
@@ -779,7 +819,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               id,
               object: "chat.completion.chunk",
               created,
-              model: MODEL_NAME,
+              model: modelName,
               choices: [],
               usage: {
                 prompt_tokens: completionReq.promptTokenCount,
@@ -805,7 +845,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             id,
             object: "chat.completion",
             created,
-            model: MODEL_NAME,
+            model: modelName,
             choices: [{
               index: 0,
               message: { role: "assistant", content },
@@ -894,7 +934,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       sendJSON(res, 200, {
         object: "list",
         data: [{
-          id: MODEL_NAME,
+          id: modelName,
           object: "model",
           created: Math.floor(Date.now() / 1000),
           owned_by: "local",
@@ -902,7 +942,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         }],
       });
     } else if (req.method === "GET" && url.pathname === "/health") {
-      sendJSON(res, 200, { status: "ok", model: MODEL_NAME });
+      sendJSON(res, 200, { status: "ok", model: modelName });
     } else {
       sendJSON(res, 404, { error: { message: "Not found", type: "not_found_error" } });
     }
@@ -915,7 +955,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  GET  /metrics              - Prometheus metrics`);
     console.log(`  GET  /v1/models            - List models`);
     console.log(`  GET  /health               - Health check`);
-    console.log(`  Model: ${MODEL_NAME}  |  GPU: ${args.gpus.join(",")}  |  ctx-size=${args.ctxSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);
+    console.log(`  CUDA graphs: enabled`);
+    console.log(`  Model: ${modelName}  |  GPU: ${args.gpus.join(",")}  |  ctx-size=${args.ctxSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);
   });
 
   let cleaningUp = false;
@@ -925,6 +966,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     await new Promise<void>(resolve => server.close(() => resolve()));
     while (busy) await new Promise(resolve => setTimeout(resolve, 10));
     glm.synchronize();
+    captureManager[Symbol.dispose]();
+    samplingWorkspace.free();
     cache.free();
     ws.free();
     model.free();

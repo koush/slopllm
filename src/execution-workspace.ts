@@ -1,10 +1,11 @@
-import { type CaptureManager, type CaptureReturn } from "./capture-manager";
+import { type CaptureManager } from "./capture-manager";
 import { ChatModel, type ChatCache } from "./chat_model";
 import { DeviceOps, MaskMode } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { I32 } from "./glm_ops";
 import { type PagedKVCache } from "./paged_kv";
 import { Tensor } from "./tensor";
+import { type TensorTree } from "./tensor-tree";
 import { WorkspaceBase } from "./workspace";
 
 export const DECODE_PLAN_INFO_SIZE = 10;
@@ -15,7 +16,7 @@ export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
 export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 
-export interface ExecutionPhase<T = unknown> {
+export interface ExecutionPhase<T = TensorTree> {
   readonly states: readonly ExecutionState[];
   readonly inputs: { [name: string]: Tensor };
   readonly captureKey: readonly (string | number)[];
@@ -29,55 +30,46 @@ export interface ExecutionPlanResult<T> {
   warmup: boolean;
 }
 
-export function* executionPhase<T>(phase: ExecutionPhase<T>): Generator<ExecutionPhase, T, unknown> {
+export function* executionPhase<T extends TensorTree>(phase: ExecutionPhase<T>): Generator<ExecutionPhase, T, unknown> {
   return (yield phase) as T;
 }
 
-function preserveExecutionInputs(inputs: { [name: string]: Tensor }): Set<Tensor> {
-  const keep = new Set<Tensor>();
-  for (const tensor of Object.values(inputs)) {
-    if (tensor.captured || tensor.name !== undefined || tensor.disposed) continue;
-    tensor.removeTracking();
-    keep.add(tensor);
-  }
-  return keep;
-}
-
 export async function executePlan<T>(captureManager: CaptureManager, ws: ExecutionWorkspace, plan: ExecutionPlan<T>): Promise<ExecutionPlanResult<T>> {
-  // let tracking: (Disposable & { [Symbol.dispose](): void }) | undefined = ws.startTracking();
-  let completed = false;
   let warmup = false;
+  let step = plan.next();
+
   try {
-    let step = plan.next();
     while (!step.done) {
       const phase = step.value;
-      if (!captureManager.disabled && phase.captureKey.length > 0) {
-        warmup ||= !ExecutionState.isCaptured(captureManager, phase.states, [...phase.captureKey]);
+      const captureKey = [...phase.captureKey];
+
+      if (!captureManager.disabled && captureKey.length > 0) {
+        warmup ||= !ExecutionState.isCaptured(captureManager, phase.states, captureKey);
       }
+
       const phaseResult = ExecutionState.captureAll(
         captureManager,
         phase.states,
         phase.inputs,
         (_capturing, inputs) => phase.run(inputs),
-        [...phase.captureKey],
+        captureKey,
       );
+
       await captureManager.ops.synchronizeAsync();
-      const next = plan.next(phaseResult);
-      if (!next.done) {
-        const keepExports = preserveExecutionInputs(next.value.inputs);
-        ws.clearTracking(keepExports);
-      }
-      else {
-        ws.clearTracking();
-      }
-      step = next;
+
+      ws.clearTracking([phase.inputs, phaseResult as TensorTree]);
+      step = plan.next(phaseResult);
     }
-    completed = true;
+
+    ws.clearTracking(step.value as TensorTree);
     return { result: step.value, warmup };
   } finally {
-    try {
-      if (!completed) plan.return(undefined as never);
-    } finally {
+    if (!step.done) {
+      try {
+        plan.return(undefined as never);
+      } finally {
+        ws.clearTracking();
+      }
     }
   }
 }
@@ -364,7 +356,7 @@ export class ExecutionState {
     return captureManager.run(inputs, (capturing, capturedInputs) => {
       const result = fn(capturing, capturedInputs);
       captureManager.recordLengthVariant(baseKey, states.some(s => !s.paddedKvLenInvariant));
-      return result as CaptureReturn;
+      return result as TensorTree;
     }, keyParams) as T;
   }
 
@@ -407,8 +399,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     };
   }
 
-  clearTracking(keepExports = new Set<Tensor>()): void {
-    this._clearTracking(keepExports);
+  clearTracking(keep: TensorTree = undefined): void {
+    super.clearTracking(keep);
     this.planSlot = 0;
   }
 

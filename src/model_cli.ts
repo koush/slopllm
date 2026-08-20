@@ -10,7 +10,7 @@ import { Qwen3Model } from "./qwen3_model";
 export const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 export const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 export const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
-export const GLM51_REPO = "zai-org/GLM-5.1";
+export const GLM51_REPO = "lukealonso/GLM-5.2-NVFP4";
 
 const GLM51_SMALL_BF16 = "tests/python/test_models/glm51_small/glm51_small_bf16";
 const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp4";
