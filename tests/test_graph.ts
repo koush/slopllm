@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
+import { CaptureManager } from "../src/capture-manager";
 import type { ChatCache } from "../src/chat_model";
 import type { DeviceOps } from "../src/device_ops";
 import { ExecutionWorkspace } from "../src/execution-workspace";
@@ -19,16 +20,6 @@ interface ModelContext extends Disposable {
   cache: ChatCache;
   eosIds: Set<number>;
   parisTokenId: number;
-}
-
-interface GraphOps {
-  graphBeginCapture(): void;
-  graphEndCapture(): number;
-  graphInstantiate(graph: number): number;
-  graphLaunch(graphExec: number): void;
-  graphDestroy(graph: number): void;
-  graphExecDestroy(graphExec: number): void;
-  synchronize(): void;
 }
 
 function tokenizePrompt(tokenizer: any, prompt: string): number[] {
@@ -68,59 +59,36 @@ async function loadQwen35(glm: DeviceOps): Promise<ModelContext> {
 }
 
 function generateWithGraph(
-  ctx: ModelContext, graph: GraphOps, inputIds: number[], maxNewTokens: number,
+  ctx: ModelContext, graph: DeviceOps, inputIds: number[], maxNewTokens: number,
 ): number[] {
   const { eosIds, cache, ws, model } = ctx;
+  using captureManager = new CaptureManager(graph);
   cache.reset(1);
 
   const firstTokens = ws.forwardEagerPrefill(model, [inputIds], cache);
+  graph.synchronize();
+  ws.clearTracking();
   cache.reportTokens(0, inputIds);
   let currentToken = firstTokens[0];
   const generated: number[] = [currentToken];
 
-  let graphExec: number | null = null;
-  let warmupRemaining = 3;
-  let capturing = false;
-  let argmaxResult: any = null;
-
   for (let i = 1; i < maxNewTokens && !eosIds.has(currentToken); i++) {
     const state = ws.planDecode(model, 1, cache, true);
     state.setInput([[currentToken]]);
-
-    if (graphExec === null) {
-      if (warmupRemaining === 0 && !capturing) {
-        capturing = true;
-        graph.graphBeginCapture();
-      }
-
-      argmaxResult?.[Symbol.dispose]();
-      ws.positionStep(state, model);
-      const hiddenStates = model.forward(state);
-      argmaxResult = state.computeLogits(hiddenStates, model).argmax();
-
-      if (capturing) {
-        const graphIdx = graph.graphEndCapture();
-        graphExec = graph.graphInstantiate(graphIdx);
-        graph.graphDestroy(graphIdx);
-        capturing = false;
-        warmupRemaining = 0;
-      }
-
-      if (warmupRemaining > 0) warmupRemaining--;
-    }
-
-    if (graphExec !== null) {
-      graph.graphLaunch(graphExec);
+    {
+      using argmaxResult = state.capture(captureManager, {}, () => {
+        ws.positionStep(state, model);
+        using hiddenStates = model.forwardModel(state);
+        using logits = state.computeLogits(hiddenStates, model);
+        return logits.argmax();
+      }, ["test-decode"]);
       graph.synchronize();
+      currentToken = argmaxResult.readInt32LEArray()[0];
     }
 
-    currentToken = argmaxResult.readInt32LEArray()[0];
+    ws.clearTracking();
     generated.push(currentToken);
     cache.reportTokens(0, [currentToken]);
-  }
-
-  if (graphExec !== null) {
-    graph.graphExecDestroy(graphExec);
   }
 
   return generated;

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
+import { CaptureManager } from "../src/capture-manager";
 import { SamplingParams, makeSamplingParams, type ChatCache, type ChatModel } from "../src/chat_model";
 import { GlmOps } from "../src/glm_ops";
 import { Qwen35Model } from "../src/qwen35_model";
@@ -244,50 +245,60 @@ describe("Qwen3-0.6B batch tests", () => {
   it("cuda graph decode", () => {
     using gws = new ExecutionWorkspace(glm, 4, 4096);
     using pagedKV = makePagedKV();
+    using captureManager = new CaptureManager(glm);
     const prompt = PROMPT_GRAPH;
 
     pagedKV.reset(1);
     const tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
+    glm.synchronize();
+    gws.clearTracking();
 
     const stateRef = gws.planDecode(model, 1, pagedKV, true);
     stateRef.setInput([[tokens[0]]]);
     gws.positionStep(stateRef, model);
-    const hiddenStatesRef = model.forward(stateRef);
-    const logitsRef = stateRef.computeLogits(hiddenStatesRef, model);
-    const tokensRef = (() => { using a = logitsRef.argmax(); return a.readInt32LEArray(); })();
+    let tokensRef: number[];
+    {
+      using hiddenStatesRef = model.forward(stateRef);
+      using logitsRef = stateRef.computeLogits(hiddenStatesRef, model);
+      using argmaxRef = logitsRef.argmax();
+      tokensRef = argmaxRef.readInt32LEArray();
+    }
+    gws.clearTracking();
 
-    pagedKV.reset(1);
-    const tokens2 = gws.forwardEagerPrefill(model, [prompt], pagedKV);
-    const state = gws.planDecode(model, 1, pagedKV, true);
-    state.setInput([[tokens2[0]]]);
-
-    glm.graphBeginCapture();
-    gws.positionStep(state, model);
-    const captureHiddenStates = model.forward(state);
-    const captureLogits = state.computeLogits(captureHiddenStates, model);
-    const captureArgmax = captureLogits.argmax();
-    const graph = glm.graphEndCapture();
-    const graphExec = glm.graphInstantiate(graph);
-    glm.graphDestroy(graph);
-
-    glm.graphLaunch(graphExec);
-    glm.synchronize();
-
-    const tokensReplay = captureArgmax.readInt32LEArray();
-    assert.deepEqual(tokensReplay, tokensRef,
-      `Graph replay mismatch: replay=${tokensReplay}, ref=${tokensRef}`);
-
-    glm.graphExecDestroy(graphExec);
+    for (let run = 0; run < 5; run++) {
+      pagedKV.reset(1);
+      const tokens2 = gws.forwardEagerPrefill(model, [prompt], pagedKV);
+      glm.synchronize();
+      gws.clearTracking();
+      const state = gws.planDecode(model, 1, pagedKV, true);
+      state.setInput([[tokens2[0]]]);
+      {
+        using captureArgmax = state.capture(captureManager, {}, () => {
+          gws.positionStep(state, model);
+          using hiddenStates = model.forwardModel(state);
+          using logits = state.computeLogits(hiddenStates, model);
+          return logits.argmax();
+        }, ["batch-single-decode"]);
+        glm.synchronize();
+        const tokensReplay = captureArgmax.readInt32LEArray();
+        assert.deepEqual(tokensReplay, tokensRef,
+          `Graph run ${run} mismatch: replay=${tokensReplay}, ref=${tokensRef}`);
+      }
+      gws.clearTracking();
+    }
   });
 
   it("cuda graph multi-step decode", () => {
     using gws = new ExecutionWorkspace(glm, 4, 4096);
     using pagedKV = makePagedKV();
+    using captureManager = new CaptureManager(glm);
     const numSteps = 10;
     const prompt = PROMPT_GRAPH;
 
     pagedKV.reset(1);
     let tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
+    glm.synchronize();
+    gws.clearTracking();
 
     const refTokens: number[] = [];
     let current = tokens[0];
@@ -295,61 +306,40 @@ describe("Qwen3-0.6B batch tests", () => {
       const state = gws.planDecode(model, 1, pagedKV, true);
       state.setInput([[current]]);
       gws.positionStep(state, model);
-      const hiddenStates = model.forward(state);
-      const lastLogits = state.computeLogits(hiddenStates, model);
-      using argmaxResult = lastLogits.argmax();
-      current = argmaxResult.readInt32LEArray()[0];
+      {
+        using hiddenStates = model.forward(state);
+        using lastLogits = state.computeLogits(hiddenStates, model);
+        using argmaxResult = lastLogits.argmax();
+        current = argmaxResult.readInt32LEArray()[0];
+      }
+      gws.clearTracking();
       refTokens.push(current);
     }
 
     pagedKV.reset(1);
     tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
+    glm.synchronize();
+    gws.clearTracking();
     current = tokens[0];
-
-    let graphExec: number | null = null;
-    let warmupRemaining = 3;
-    let capturing = false;
-    let captureArgmax: any = null;
 
     for (let step = 0; step < numSteps; step++) {
       const state = gws.planDecode(model, 1, pagedKV, true);
       state.setInput([[current]]);
-
-      if (graphExec === null) {
-        if (warmupRemaining === 0 && !capturing) {
-          capturing = true;
-          glm.graphBeginCapture();
-        }
-
-    gws.positionStep(state, model);
-        captureArgmax?.[Symbol.dispose]();
-        const hiddenStates = model.forward(state);
-        captureArgmax = state.computeLogits(hiddenStates, model).argmax();
-
-        if (capturing) {
-          const graph = glm.graphEndCapture();
-          graphExec = glm.graphInstantiate(graph);
-          glm.graphDestroy(graph);
-          capturing = false;
-          warmupRemaining = 0;
-        }
-
-        if (warmupRemaining > 0) warmupRemaining--;
-      }
-
-      if (graphExec !== null) {
-        glm.graphLaunch(graphExec);
+      {
+        using captureArgmax = state.capture(captureManager, {}, () => {
+          gws.positionStep(state, model);
+          using hiddenStates = model.forwardModel(state);
+          using logits = state.computeLogits(hiddenStates, model);
+          return logits.argmax();
+        }, ["batch-multi-step-decode"]);
         glm.synchronize();
+        current = captureArgmax.readInt32LEArray()[0];
       }
 
-      current = captureArgmax.readInt32LEArray()[0];
+      gws.clearTracking();
       const expected = refTokens[step];
       assert.equal(current, expected,
         `Step ${step} mismatch: ${current} != ${expected}`);
-    }
-
-    if (graphExec !== null) {
-      glm.graphExecDestroy(graphExec);
     }
   });
 
