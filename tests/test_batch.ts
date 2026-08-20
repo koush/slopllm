@@ -358,8 +358,8 @@ describe("Qwen3-0.6B batch tests", () => {
     pagedKV.reset(1);
     const state = ws.planPrefill(model, 1, [PROMPT_GRAPH.length], pagedKV);
     state.setInput([PROMPT_GRAPH]);
-    const hiddenStates = model.forward(state);
-    const logits = state.computeLogits(hiddenStates, model);
+    using hiddenStates = model.forward(state);
+    using logits = state.computeLogits(hiddenStates, model);
     using argmaxOut = logits.argmax();
     const tokens = argmaxOut.readInt32LEArray();
 
@@ -397,8 +397,8 @@ describe("Qwen3-0.6B batch tests", () => {
     pagedKV.reset(2);
     const state = ws.planPrefill(model, 2, [PROMPT1.length, PROMPT2.length], pagedKV);
     state.setInput([PROMPT1, PROMPT2]);
-    const hiddenStates = model.forward(state);
-    const logits = state.computeLogits(hiddenStates, model);
+    using hiddenStates = model.forward(state);
+    using logits = state.computeLogits(hiddenStates, model);
     using argmaxOut2 = logits.argmax();
     const tokens = argmaxOut2.readInt32LEArray();
 
@@ -433,7 +433,8 @@ describe("Qwen3-0.6B batch tests", () => {
         hiddenStates[Symbol.dispose]();
       }
     }
-    using argmaxOut = logits!.argmax();
+    using finalLogits = logits!;
+    using argmaxOut = finalLogits.argmax();
     return argmaxOut.readInt32LEArray();
   }
 
@@ -532,8 +533,8 @@ describe("Qwen3-0.6B batch tests", () => {
     // Step 3: Prefill all answer tokens at once, get logits at every position
     const state = ws.planPrefill(model, 1, [answerTokens.length], pagedKV);
     state.setInput([answerTokens]);
-    const hiddenStates = model.forward(state);
-    const allLogits = state.computeLogits(hiddenStates, model, true);
+    using hiddenStates = model.forward(state);
+    using allLogits = state.computeLogits(hiddenStates, model, true);
     using argmaxResult = allLogits.argmax();
     const predictions = argmaxResult.readInt32LEArray();
     pagedKV.reportTokens(0, answerTokens);
@@ -639,7 +640,8 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
         hiddenStates[Symbol.dispose]();
       }
     }
-    using argmaxOut = logits!.argmax();
+    using finalLogits = logits!;
+    using argmaxOut = finalLogits.argmax();
     return argmaxOut.readInt32LEArray();
   }
 

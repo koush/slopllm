@@ -34,7 +34,8 @@ function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCac
       hiddenStates[Symbol.dispose]();
     }
   }
-  using argmaxOut = logits!.argmax();
+  using finalLogits = logits!;
+  using argmaxOut = finalLogits.argmax();
   return argmaxOut.readInt32LEArray();
 }
 

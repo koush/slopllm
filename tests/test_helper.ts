@@ -52,8 +52,8 @@ export function* generateTokens(
     if (sampling) {
       const state = ws.planDecode(model, 1, cache);
       state.setInput([[nextToken]]);
-      const hiddenStates = model.forward(state);
-      const logits = state.computeLogits(hiddenStates, model);
+      using hiddenStates = model.forward(state);
+      using logits = state.computeLogits(hiddenStates, model);
       using sampler = new SamplingWorkspace(logits.workspace.glm, 1, model.cfg.vocabSize, sampling.repetitionPenaltyWindow);
       sampler.updateSampler([sampling], [tokenHistory]);
       nextToken = sampler.sample(logits).readInt32LEArray()[0];
