@@ -47,8 +47,8 @@ export class WorkspaceBase implements Disposable {
     }
   }
 
-  assertClear(keepExports = new Set<Tensor>()) {
-    this._runClear(keepExports, (t) => {
+  assertClear(keep: TensorTree = undefined) {
+    this._runClear(collectTensors(keep), (t) => {
       // console.warn(t.stack);
       throw new Error("assertClear was called with tensors already allocated that were not in keepExports, this may result in non-deterministic allocations.");
     });

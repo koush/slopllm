@@ -14,69 +14,39 @@ TypeScript inference engine for the GLM-5.1 model on NVIDIA GPUs. Ships a native
 
 ### Workspace (`src/workspace.ts`)
 - `WorkspaceBase` manages GPU memory lifecycle via **dispose-recycle pooling**:
-  - `alloc()` → checks `disposed` set for best-fit reuse; only calls `newTensor()` (real GPU alloc) if no match found.
-  - `disposed` set: tensors whose `[Symbol.dispose]()` was called but whose memory hasn't been freed. Next alloc reuses the pointer.
-  - Named tensors: re-allocating with the same name disposes the old one, recycling its memory.
-  - **`freeze()`**: after model loading, prevents further allocations — all weight addresses are stable for graph capture.
-  - **`startTracking()`**: returns a scope that disposes all unnamed temporaries when exited, returning their memory to the pool for the next forward pass.
+  - `alloc()` checks the device or pinned-host disposed pool for best-fit reuse and only calls `newTensor()` when no reusable allocation exists.
+  - Unnamed tensors are tracked temporaries. Named tensors are persistent; duplicate named allocations throw, while `ensureAlloc()` returns a compatible existing tensor.
+  - Disposed pinned tensors remain in `synchronizingHost` until device synchronization completes, preventing reuse while an asynchronous copy may still reference them.
+  - **`freeze()`** prevents further allocations after model loading so weight addresses remain stable.
+  - **`startTracking()`** returns a scope that disposes unnamed temporaries on exit. `clearTracking()` provides explicit phase-boundary cleanup and can preserve tensors from a `TensorTree`.
 - This pattern is what makes the inference loop graph-capturable: the same GPU addresses are reused each step deterministically.
 
 ### Tensor Lifetime and `using` Pattern
 
-Tensors implement `Disposable` via `[Symbol.dispose]()`. TypeScript 5.2+ explicit resource management (`using`) provides scoped cleanup:
+Tensors implement `Disposable` via `[Symbol.dispose]()`. Model code can use `using` to release intermediates at the end of a lexical scope:
 
 ```typescript
-// Forward pass: startTracking creates a scope where all unnamed allocs are tracked.
-// When the scope exits, every tracked tensor is disposed → its GPU memory returns
-// to the workspace's "disposed" pool for reuse next step. Same addresses, deterministic.
-using _tracker = ws.startTracking();
-{
-  // Unnamed allocs go into the tracked set. On warmup step, these are real GPU allocations.
-  // On subsequent steps, ws.alloc() finds a matching buffer in the "disposed" pool
-  // and reuses it deterministically — same GPU address each time → graph capturable.
-  using gateBuf = ws.alloc([BS, intermediate], "BF16");  // disposed when this block exits
-  normed.linear(weights.gate_proj, BS, gateBuf);
-  using upBuf = ws.alloc([BS, intermediate], "BF16");    // disposed when this block exits
-  normed.linear(weights.up_proj, BS, upBuf);
-  using siluBuf = gateBuf.siluAndMul(upBuf, intermediate, BS);
-  // gateBuf, upBuf, siluBuf all disposed here ←
-}
-// All tracked tensors disposed here ← (when _tracker goes out of scope)
-// Next forward pass: same alloc sequence → same addresses from disposed pool → CUDA graph replay safe
-
-// Named tensors (model weights) throw on dispose — they persist for the model's lifetime
-const w = ws.alloc([N, K], "BF16", "model.layers.0.mlp.gate_proj.weight");
-
-// removeTracking() opts out: tensor survives the tracking scope (used for forward outputs)
-const output = hiddenStates.linear(lmHead, BS);
-return output.removeTracking();  // caller is responsible for disposing this
+using gate = hiddenStates.linear(weights.gate);
+using up = hiddenStates.linear(weights.up);
+using activated = gate.siluAndMul(up);
+return activated.linear(weights.down);
 ```
 
-Here's another example that demonstrates stream mechanics, tensors created in a stream are delay disposed when the stream goes out of scope:
+Tracking is normally owned by the caller around a complete model operation. A returned tensor must be removed from that tracking scope:
 
 ```typescript
-using _tracker = ws.startTracking();
-{
-  using stream = ws.glm.withStream(() => {
-    using gateBuf = ws.alloc([BS, intermediate], "BF16");  // disposed when this block exits
-    normed.linear(weights.gate_proj, BS, gateBuf);
-    using upBuf = ws.alloc([BS, intermediate], "BF16");    // disposed when this block exits
-    normed.linear(weights.up_proj, BS, upBuf);
-    using siluBuf = gateBuf.siluAndMul(upBuf, intermediate, BS);
-    // gateBuf, upBuf, siluBuf are NOT disposed here ←
-  });
-
-  // make the default/current stream wait for the other stream
-  stream.streamWaitEvent();
-  // stream is disposed here when it goes out of scope, and NOW gateBuf, upBuf, and siluBuf are placed back into the workspace.
+function forward(state: ExecutionState): Tensor {
+  using _tracker = state.ws.startTracking();
+  return model.forwardModel(state).removeTracking();
 }
 ```
 
 Key rules:
-- Named tensors (allocated with a name) cannot be disposed — they live until replaced or the workspace is freed.
+- Named tensors cannot be disposed and live until the workspace is freed.
 - `using` on an unnamed tensor auto-disposes at block scope exit.
-- `startTracking()` / its `[Symbol.dispose]()` cleans up all tracked tensors at once — cheaper than individual `using` per tensor in hot loops.
-- `removeTracking()` moves a tensor from `tracked` to `exported`, exempting it from the bulk dispose.
+- `startTracking()` cleans all tracked tensors at once; use individual `using` declarations when an intermediate should be released earlier.
+- `removeTracking()` stages the tensor and its backing view chain. When the tracking scope exits, the tensor returns to `tracked` under caller ownership.
+- Allocations made on an alternate stream are not recycled until its `withStream()` wrapper is disposed. Call `streamWaitEvent()` before consuming the result on the current stream.
 
 ### Allocator (`src/allocator.ts`)
 - `ArenaAllocator`: bump allocator with 256-byte alignment. `free()` is a no-op. Used for the weight arena when `--arena` flag is set — a single large `cudaMalloc` carved up linearly.
@@ -121,9 +91,7 @@ When `--cp` flag is set (GLM-5.1 only), GPUs operate as context-parallel shards 
   - **Still Row/Column-parallel in CP**: o_proj (Row → AllReduce), down_proj (Row → AllReduce), gate_proj/up_proj (Column) — same as TP-only mode.
 - **Position IDs**: decode/prefill kernels receive `cpWorldSize=N` and `cpRank=i`. The CUDA kernel assigns position `i, i+N, i+2N, ...` to GPU `i`.
 - **Prefill**: Each GPU runs MLA prefill over its token subset with `cpWorldSize`/`cpRank` params. The FlashInfer plan computes `effectivePageSize = pageSize / worldSize` and `effectiveNumHeads = numHeads` (not sharded). Output is `PartialSoftmax` — each shard has partial attention output + log-sum-exp.
-- **CP Merge**: After prefill/decode, partial softmax outputs are combined across GPUs using the online softmax trick: `merged_v = Σ(exp(lse_i - lse_max) * v_i) / Σ(exp(lse_i - lse_max))`. Two paths:
-  - **P2P fast path** (small batches, decode): single barrier + flat all-to-all merge kernel. Each GPU reads all N peers' data via P2P and merges in one kernel launch. Gated by a element-count threshold.
-  - **AG+RS** (prefill, large batches): AllGather LSE (tiny), correct v_out in-place by rescaling with `exp2(lse_local - global_lse)`, transpose v_out to `[N, B, H/N, D]`, then ReduceScatter — each rank receives its head group summed across all GPUs. Communication per rank: `(N-1)/N × B×H×D` vs `log2(N) × B×H×D` for the old butterfly.
+- **CP Merge**: Partial attention outputs are combined with an online-softmax merge. Small decode workloads use a custom P2P path; larger or prefill workloads use AllGather plus ReduceScatter.
 - **Page allocation**: `PagedKVCache` distributes pages round-robin across GPUs. Page `p` is stored on GPU `p % worldSize`. The effective page size per GPU is `pageSize / worldSize`.
 
 ## Paged KV Cache (`src/paged_kv.ts`)
@@ -183,18 +151,67 @@ npx tsx --test tests/test_glm51.ts            # single TS test
 npx tsx --test tests/test_parallel.ts  # multi-GPU
 ```
 
-## Key Design Decisions
+# Persistent Model Loader
 
-- **Dispose-recycle workspace**: enables CUDA graph capture without explicit memory pool management. Tensors are allocated once, disposed into a pool, and reused at the same addresses.
-- **Pre-allocated buffers**: `ExecutionWorkspace` constructor allocates all plan/work/index buffers. No dynamic GPU allocation during inference.
-- **Plan/Run split**: FlashInfer plan is not graph-capturable (writes host buffers, may compile kernels), but run is. Plan only executes when dirty flags indicate changes.
-- **P2P AllReduce**: custom kernel for small AllReduce/AllGather avoids NCCL overhead for partial sums in tensor-parallel decode.
-- **Multi-stream**: `GlmOps.withStream()` provides alternate CUDA streams with event-based synchronization. Used in GLM-5.1 MoE to overlap shared expert computation with routed expert computation.
-- **Strided mmap loading**: weight tensors loaded via `memcpy2dHostToDeviceAsync` with pitch/width/height for row-parallel or column-parallel sharding, avoiding host-side copies.
+`src/run_model_loader.ts` loads the model and GPU arena once, then starts executor workers against that resident model. Stopping or restarting a worker does not reload the weights. Stopping the loader process releases the model runtime.
+
+The loader currently supports Qwen3 and GLM-5.1. It requires `--arena <GiB>` and does not support Qwen3.5 or FP8.
+
+## Start the Loader
+
+Start the loader and its initial executor in one command:
+
+```bash
+npx tsx src/run_model_loader.ts \
+  --arena 92 --gpus 0,1,2,3,4,5,6,7 --cp --glm51 --mtp \
+  src/openai-server.ts --host 0.0.0.0 --port 8010
+```
+
+Arguments before the executor path are shared model arguments and are passed to every worker. Arguments after the path apply only to that executor. Loader options default to `--control-host 127.0.0.1 --control-port 8099` and must appear before the executor path.
+
+The model is ready when the control endpoint responds and the worker reports its own service as ready:
+
+```bash
+curl http://127.0.0.1:8099/status
+curl http://127.0.0.1:8010/health
+```
+
+## Control the Worker
+
+```bash
+# Inspect the current command and worker state.
+curl http://127.0.0.1:8099/status
+
+# Restart the configured worker without reloading the model.
+curl -X POST http://127.0.0.1:8099/restart
+
+# Stop only the worker. The model remains resident on the GPUs.
+curl -X POST http://127.0.0.1:8099/stop
+
+# Start the last configured worker again.
+curl -X POST http://127.0.0.1:8099/run
+```
+
+To replace the executor or its worker-specific arguments, stop the current worker and provide a JSON command array:
+
+```bash
+curl -X POST http://127.0.0.1:8099/stop
+curl -X POST http://127.0.0.1:8099/run \
+  -H 'content-type: application/json' \
+  -d '["src/openai-server.ts", "--host", "0.0.0.0", "--port", "8010"]'
+```
+
+Add `?follow` to `/run` or `/restart` to stream worker output until that worker exits:
+
+```bash
+curl -N -X POST 'http://127.0.0.1:8099/restart?follow'
+```
+
+Changing model/shared arguments requires restarting the loader itself. The control server has no authentication, so keep it bound to `127.0.0.1` unless it is protected by other means.
 
 ## Vendor
 
-The vendor subdirectory contains flashinfer, llama.cpp, vllm, and sglang, and can be serve as a reference for implementations of cuda kernels or other algorithms like MTP. Flashinfer has been forked to add support for context parallelism.
+`vendor/` contains external and forked reference implementations, including FlashInfer, llama.cpp, SGLang, vLLM variants, Transformers variants, and b12x. Use them for comparison when implementing CUDA kernels or inference algorithms, but treat `src/` and `csrc/` as authoritative for this project. The FlashInfer fork contains the project's context-parallel changes.
 
 # Workflow
 
