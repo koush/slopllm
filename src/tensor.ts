@@ -55,7 +55,7 @@ export abstract class Tensor implements Disposable {
     this.workspace.tracked.delete(this);
     this.workspace.staged.add(this);
   }
-  
+
   unstage() {
     if (this.disposed)
       return;
@@ -146,13 +146,13 @@ export abstract class Tensor implements Disposable {
   abstract free(): void;
 
   capture() {
-    const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, undefined);
+    const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, this.view?.capture());
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
     return captured;
   }
 
-  uncapture() {
+  uncapture(): Tensor {
     if (!this.captured) {
       return this.viewClone();
     }
@@ -166,6 +166,39 @@ export abstract class Tensor implements Disposable {
         return exported.viewClone();
     }
 
+    for (const tensor of this.workspace.tracked) {
+      if (this.same(tensor)) {
+        throw new Error("Tensor found in tracked set after uncapture check");
+      }
+    }
+
+    for (const tensor of this.workspace.staged) {
+      if (this.same(tensor)) {
+        throw new Error("Tensor found in staged set after uncapture check");
+      }
+    }
+
+    if (this.view) {
+      using uncapturedView = this.view.uncapture();
+      return this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, uncapturedView);
+    }
+
+    const disposed = this.pinned ? this.workspace.disposedHost : this.workspace.disposedDevice;
+    for (const check of disposed) {
+      if (this.same(check)) {
+        // console.warn('Tensor found in disposed set after uncapture check');
+        disposed.delete(check);
+        check.detachData();
+        const ret = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, undefined);
+        this.workspace.addTracked(ret);
+        return ret;
+      }
+    }
+
+    return this._uncapture();
+  }
+
+  _uncapture() {
     const copy = this.workspace.alloc(this.shape, this.type, undefined, this.parallelism);
     // possible to get the exact same allocation, maybe optimize for this in the future
     if (this.same(copy)) {

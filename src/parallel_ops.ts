@@ -140,6 +140,13 @@ export class ParallelTensor extends Tensor {
     }
   }
 
+  _uncapture(): Tensor {
+    const shards = this.shards.map(s => s.uncapture());
+    return this.parallelOps.wrapShards(
+      this.workspace, shards, this.shape, this.type, this.parallelism,
+    );
+  }
+
   [Symbol.dispose](): void {
     if (!this.canDispose()) {
       return;

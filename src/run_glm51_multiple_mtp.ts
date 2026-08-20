@@ -5,7 +5,7 @@ import { executePlan, ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
 import { type GlmOps } from "./glm_ops";
 import { createDeviceOps, loadModel, type ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
-import { MtpStats } from "./mtp";
+import { MtpStats } from "./mtp_stats";
 import { ParallelOps } from "./parallel_ops";
 
 const PROMPTS = [

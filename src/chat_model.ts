@@ -2,7 +2,7 @@ import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
 import { DeviceOps } from "./device_ops";
-import { ExecutionState } from "./execution-workspace";
+import { type ExecutionPlan, ExecutionState, type ExecutionWorkspace } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { mmapClose, mmapOpen } from "./native-addon";
@@ -27,6 +27,19 @@ export interface ChatCache extends Disposable {
   prefixMatch(seqIdx: number, inputIds: number[]): number[];
   reportTokens(seqIdx: number, tokens: number[]): void;
   prefillBatchPlanHook?(_batchSize: number, _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void;
+}
+
+export interface MtpDraftBatch {
+  targetTokens: number[];
+  treeTokens: number[][];
+  topks: readonly number[];
+}
+
+export interface MtpStepResult {
+  draft: MtpDraftBatch;
+  tokens: number[][];
+  numAccepted: number[];
+  numDraftTokens: number;
 }
 
 export interface CommonModelConfig {
@@ -60,11 +73,8 @@ export abstract class ChatModel extends WorkspaceBase {
 
   abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number): ChatCache;
   abstract forwardModel(state: ExecutionState): Tensor;
-  forwardMtp?(state: ExecutionState, previousHiddenState: Tensor): Tensor;
-  forwardMtpDraftExtend?(state: ExecutionState, topks: number[], sample: (hiddenStates: Tensor) => Tensor): {
-    token: Tensor,
-    mtpHiddenStates: Tensor,
-  };
+  planPrefillMtpDraftExtend?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[]): ExecutionPlan<MtpDraftBatch>;
+  planTargetVerification?(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch): ExecutionPlan<MtpStepResult>;
 
   prepareMtpInput(_cache: ChatCache, inputIdsList: number[][]): number[][] {
     return inputIdsList.map(inputIds => [...inputIds]);

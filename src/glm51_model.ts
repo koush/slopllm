@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ChatCache } from "./chat_model";
+import type { ChatCache, MtpDraftBatch, MtpStepResult } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
 import { executionPhase, type ExecutionPlan, ExecutionState, ExecutionWorkspace } from "./execution-workspace";
@@ -46,12 +46,6 @@ export interface Glm51Config extends CommonModelConfig {
   eosTokenIds: number[];
 }
 
-export interface MtpDraftBatch {
-  targetTokens: number[];
-  treeTokens: number[][];
-  topks: readonly number[];
-}
-
 interface MtpVerificationArtifacts {
   kvCacheLayers: Array<{
     appendCkv: Tensor;
@@ -67,13 +61,6 @@ interface MtpVerificationArtifacts {
   }>;
   sharedSlots: Tensor;
   sharedSlotsLength: Tensor;
-}
-
-export interface MtpStepResult {
-  draft: MtpDraftBatch;
-  tokens: number[][];
-  numAccepted: number[];
-  numDraftTokens: number;
 }
 
 function mtpTotalPaths(topks: readonly number[]): number {
@@ -660,7 +647,7 @@ export class Glm51Model extends ChatModel {
     return result.reshape([BS, hs]);
   }
 
-  private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState, sharedSlots = state.sharedSlots, sharedSlotsLength = state.sharedSlotsLength): { normed: Tensor, residual: Tensor } {
+  private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
     const nHeads = cfg.numAttentionHeads;
     const kvLoraRank = cfg.kvLoraRank;
@@ -887,7 +874,7 @@ export class Glm51Model extends ChatModel {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  forwardModel(state: ExecutionState, sharedSlots = state.sharedSlots, sharedSlotsLength = state.sharedSlotsLength): Tensor {
+  forwardModel(state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Tensor {
     const cfg = this.cfg;
 
     using rotaryEmbedding = this.glm.withStream(() => state.rotaryEmbedding(this.invFreq));
@@ -901,9 +888,8 @@ export class Glm51Model extends ChatModel {
     using cos = rotaryEmbedding.result.cos;
     using sin = rotaryEmbedding.result.sin;
 
-    // The group slot cache lives on state.sharedSlots / sharedSlotsLength.
-    // Callers that span multiple forwards (run loop, MTP) provide persistent
-    // holders; otherwise fall back to forward-local ones.
+    // Callers spanning multiple forwards provide persistent slot holders;
+    // ordinary forwards use holders local to this invocation.
     using _localSlots = sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
     using _localLength = sharedSlotsLength ? undefined : new UsingHolder<Tensor>(undefined!);
     sharedSlots ??= _localSlots!;
@@ -918,7 +904,7 @@ export class Glm51Model extends ChatModel {
     return normed.detach();
   }
 
-  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, sharedSlots = state.sharedSlots, sharedSlotsLength = state.sharedSlotsLength) {
+  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>) {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const ws = state.ws;
@@ -1344,24 +1330,6 @@ export class Glm51Model extends ChatModel {
       tokens: acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]),
       numAccepted,
       numDraftTokens: topks.length,
-    };
-  }
-
-
-  forwardMtpDraftExtend(state: ExecutionState, topks: number[], sample: (hiddenStates: Tensor) => Tensor) {
-    using hiddenStates = this.forwardModel(state);
-    const token = sample(hiddenStates);
-
-    using rotatedInputIds = state.input!.rotateInputIds(state.qoIndptrD, token!, state.batchSize);
-    state.setInput(rotatedInputIds);
-    using mtpDraftExtendHiddenStates = this.forwardMtp!(state, hiddenStates);
-
-    using lastIdx = state.lastIdx;
-    const mtpHiddenStates = mtpDraftExtendHiddenStates.indexSelect(lastIdx, -1);
-
-    return {
-      token,
-      mtpHiddenStates,
     };
   }
 }

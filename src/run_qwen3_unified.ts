@@ -2,13 +2,12 @@ import { createInterface } from "node:readline";
 import { CaptureManager } from "./capture-manager";
 import { ChatCache, ChatModel, SamplingParams, Tokenizer, makeSamplingParams } from "./chat_model";
 import { DeviceOps } from "./device_ops";
-import { ExecutionWorkspace } from "./execution-workspace";
+import { executePlan, ExecutionWorkspace } from "./execution-workspace";
 import { MetaOps } from "./meta_ops";
 import { createDeviceOps, loadModel, modelLabel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
-import { MtpStats, mtpTreeDecode } from "./mtp";
+import { MtpStats } from "./mtp_stats";
 import { ParallelOps } from "./parallel_ops";
-import {  Tensor } from "./tensor";
-import { UsingHolder } from "./using-holder";
+import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 import { MemcpyKind } from "./enums";
 import { SamplingWorkspace } from "./sampling";
@@ -127,9 +126,8 @@ function parseArgs(argv: string[]): CliArgs {
   if (args.mtp && args.mtpDraftTopk.length === 0) {
     args.mtpDraftTopk = [2, 2, 2];
   }
-
-  if (args.mtp && args.maxBatch < 8) {
-    args.maxBatch = 8;
+  if (args.mtpDraftTopk.some(topk => !Number.isInteger(topk) || topk < 1)) {
+    throw new Error(`Invalid --mtp-draft-topk: ${args.mtpDraftTopk.join(",")}`);
   }
 
   if (args.useQwen35 && args.temperature > 0 && args.topP === 0.95 && args.topK === 0 && args.repetitionPenalty === 1.0 && args.presencePenalty === 0) {
@@ -171,13 +169,118 @@ export interface DecodeTiming {
   mtpStats?: MtpStats;
 }
 
+async function* generateMtpStream(
+  model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
+  inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
+  topks: readonly number[], graphState?: GraphState, timing?: DecodeTiming,
+): AsyncGenerator<number> {
+  if (!model.planPrefillMtpDraftExtend || !model.planTargetVerification) {
+    throw new Error("The selected model does not support plan-based MTP decoding");
+  }
+
+  using captureManager = new CaptureManager(glm);
+  captureManager.disabled = graphState === undefined;
+  const mtpStats = new MtpStats(topks.length);
+  if (timing) {
+    timing.mtpStats = mtpStats;
+  }
+
+  let execMs = 0;
+  let warmupSteps = 0;
+  let graphSteps = 0;
+  let firstPostWarmupTime = 0;
+  let lastTokenTime = 0;
+  let postWarmupTokenCount = 0;
+
+  try {
+    const suffixIds = cache.prefixMatch(0, inputIds);
+    const mtpInputIds = model.prepareMtpInput(cache, [suffixIds]);
+    let currentDraft = (await executePlan(
+      captureManager,
+      ws,
+      model.planPrefillMtpDraftExtend(ws, cache, mtpInputIds, topks),
+    )).result;
+
+    const firstToken = currentDraft.targetTokens[0];
+    cache.reportTokens(0, suffixIds);
+    cache.reportTokens(0, [firstToken]);
+    let generated = 1;
+
+    yield firstToken;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (eosIds.has(firstToken) || generated >= maxNewTokens) {
+      return;
+    }
+
+    while (generated < maxNewTokens) {
+      const started = performance.now();
+      const step = await executePlan(
+        captureManager,
+        ws,
+        model.planTargetVerification(ws, cache, currentDraft),
+      );
+      execMs += performance.now() - started;
+      currentDraft = step.result.draft;
+
+      if (!step.warmup) {
+        mtpStats.observe(step.result.numDraftTokens, step.result.numAccepted[0]);
+      }
+
+      for (const token of step.result.tokens[0]) {
+        cache.reportTokens(0, [token]);
+        const now = performance.now();
+        if (step.warmup) {
+          warmupSteps++;
+          firstPostWarmupTime = 0;
+          postWarmupTokenCount = 0;
+        } else {
+          graphSteps++;
+          if (firstPostWarmupTime === 0) {
+            firstPostWarmupTime = now;
+          }
+          lastTokenTime = now;
+          postWarmupTokenCount++;
+        }
+
+        generated++;
+        yield token;
+        await new Promise<void>(resolve => setImmediate(resolve));
+        if (eosIds.has(token) || generated >= maxNewTokens) {
+          return;
+        }
+      }
+    }
+  } finally {
+    if (timing) {
+      timing.planMs = 0;
+      timing.execMs = execMs;
+      timing.idleMs = 0;
+      timing.warmupSteps = warmupSteps;
+      timing.graphSteps = graphSteps;
+      timing.warmupTokPerSec = postWarmupTokenCount > 1 && firstPostWarmupTime > 0
+        ? postWarmupTokenCount / ((lastTokenTime - firstPostWarmupTime) / 1000)
+        : 0;
+    }
+  }
+}
+
 export async function* generateStream(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
   timing?: DecodeTiming, mtp?: boolean, mtpDraftTopk?: number[],
 ): AsyncGenerator<number> {
-  const tokenizer = model.tokenizer;
+  const topks = mtp && mtpDraftTopk && mtpDraftTopk.length > 0 &&
+    model.planPrefillMtpDraftExtend && model.planTargetVerification
+    ? mtpDraftTopk
+    : [];
+  if (topks.length > 0) {
+    if (sampling) {
+      throw new Error("Plan-based MTP decoding currently supports greedy sampling only");
+    }
+    yield* generateMtpStream(model, ws, glm, cache, inputIds, maxNewTokens, eosIds, topks, graphState, timing);
+    return;
+  }
 
   using sampleWorkspace = new WorkspaceBase(glm);
   const greedy = !sampling;
@@ -200,63 +303,22 @@ export async function* generateStream(
     }
   }
 
-  const tokenHistory = inputIds.slice();
-
   using captureManager = new CaptureManager(glm);
-  const topks = (mtp && model.forwardMtp && mtpDraftTopk && mtpDraftTopk.length > 0) ? mtpDraftTopk : [];
-  const usingMtp = topks.length > 0;
-  const mtpStats = usingMtp ? new MtpStats(topks.length) : undefined;
-  if (timing && mtpStats) timing.mtpStats = mtpStats;
-  using mtpHiddenStates = new UsingHolder<Tensor>(undefined!);
   let currentToken: number;
 
   captureManager.disabled = graphState === undefined;
 
-  // needed by mtp
-  using sharedSlots = new UsingHolder<Tensor>(undefined!);
-  using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
   {
     const suffixIds = cache.prefixMatch(0, inputIds);
-    const inputIdsList = usingMtp
-      ? model.prepareMtpInput(cache, [suffixIds])
-      : [suffixIds];
+    const inputIdsList = [suffixIds];
     const batchSize = inputIdsList.length;
     const seqLens = inputIdsList.map(ids => ids.length);
     const state = ws.planPrefill(model, batchSize, seqLens, cache);
-    state.sharedSlots = sharedSlots;
-    state.sharedSlotsLength = sharedSlotsLength;
     state.setInput(inputIdsList);
 
-    if (!usingMtp) {
-      using hiddenStates = model.forward(state);
-      using firstTokens = state.computeLogits(hiddenStates, model);
-      doSample(firstTokens);
-    }
-    else {
-      using _tracker = state.ws.startTracking();
-
-      const mtpDraftExtendResult = model.forwardMtpDraftExtend!(state, topks, (hiddenStates) => {
-        using firstTokens = state.computeLogits(hiddenStates, model);
-        doSample(firstTokens);
-        return gpuSampleResult!.viewClone();
-      });
-      state.sharedSlots.value?.removeTracking();
-      state.sharedSlotsLength.value?.removeTracking();
-      using _mtpHiddenStates = mtpDraftExtendResult.mtpHiddenStates;
-      using _token = mtpDraftExtendResult.token;
-
-      let maxIntermediateWidth = 1;
-      let width = 1;
-      for (const topk of topks.slice(0, -1)) {
-        width *= topk;
-        maxIntermediateWidth = Math.max(maxIntermediateWidth, width);
-      }
-      const scratchShape = [ws.maxBatch * maxIntermediateWidth, ..._mtpHiddenStates.shape.slice(1)];
-      const mtpHiddenStatesScratch = ws.alloc(scratchShape, _mtpHiddenStates.type);
-      mtpHiddenStatesScratch.memcpy(_mtpHiddenStates, _mtpHiddenStates.bytes, MemcpyKind.DeviceToDevice);
-
-      mtpHiddenStates.replace(mtpHiddenStatesScratch.removeTracking());
-    }
+    using hiddenStates = model.forward(state);
+    using firstTokens = state.computeLogits(hiddenStates, model);
+    doSample(firstTokens);
 
     sampleResult = sampleWorkspace.ensureAllocPinned(gpuSampleResult!.shape, gpuSampleResult!.type, "sampleResult");
     sampleResult.memcpy(gpuSampleResult!, gpuSampleResult!.bytes, MemcpyKind.DeviceToHost);
@@ -266,7 +328,6 @@ export async function* generateStream(
     cache.reportTokens(0, [currentToken]);
   }
 
-  tokenHistory.push(currentToken);
   yield currentToken;
   await new Promise<void>(resolve => setImmediate(resolve));
   if (eosIds.has(currentToken)) return;
@@ -288,51 +349,6 @@ export async function* generateStream(
   try {
     for (let i = 1; generated < maxNewTokens; i++) {
       using _tracking = sampleWorkspace.startTracking();
-
-      if (mtp && model.forwardMtp && topks.length > 0) {
-        if (process.env.GLM_STEP_LOG === '1') process.stderr.write(`[step ${i}] seqLen=${cache.getPagedKV().sequences[0].allocLen} histLen=${tokenHistory.length}\n`);
-        const { warmup, tokens, numAccepted, numDraftTokens } = await mtpTreeDecode(captureManager, model, mtpHiddenStates.value, sharedSlots.value, sharedSlotsLength.value, ws, [currentToken], topks, cache);
-        if (mtpStats && !warmup) mtpStats.observe(numDraftTokens, numAccepted[0]);
-        // glm.synchronize();
-        for (const t of tokens[0]) {
-          currentToken = t;
-          cache.reportTokens(0, [t]);
-          tokenHistory.push(t);
-
-          const now = performance.now();
-          if (firstPostWarmupTime === 0)
-            firstPostWarmupTime = now;
-          lastTokenTime = now;
-
-          if (warmup) {
-            warmupSteps++;
-            firstPostWarmupTime = 0;
-            postWarmupTokenCount = 0;
-          }
-          else {
-            graphSteps++;
-            postWarmupTokenCount++;
-          }
-
-          yield t;
-          await new Promise<void>(resolve => setImmediate(resolve));
-          generated++;
-          if (eosIds.has(t))
-            return;
-          // Stop mid-batch: the rest of this step's accepted tokens are over
-          // budget. Their KV is already in the cache, exactly as on the EOS
-          // path above -- reportTokens has run for them but they are not
-          // yielded, so the caller never sees them.
-          if (generated >= maxNewTokens)
-            return;
-        }
-
-        continue;
-        // console.log(`MTP accepted=${verifyResult.numAccepted}/${topks.length} replacement=${tokenizer.decode([verifyResult.replacementToken]) ?? verifyResult.replacementToken}`);
-        // if (verifyResult.acceptedTokens.length > 0) {
-        //   console.log(`MTP accepted tokens: ${verifyResult.acceptedTokens.map(t => tokenizer.decode([t]) ?? `?${t}`).join(" ")}`);
-        // }
-      }
 
       using _tracking2 = ws.startTracking();
 
@@ -389,7 +405,6 @@ export async function* generateStream(
       execMs += performance.now() - tExec;
       tAfterSync = performance.now();
       cache.reportTokens(0, [currentToken]);
-      tokenHistory.push(currentToken);
 
       yield currentToken;
       await new Promise<void>(resolve => setImmediate(resolve));
@@ -457,7 +472,7 @@ async function interactiveChat(
   args: CliArgs, graphState: GraphState | undefined,
 ): Promise<void> {
   const tokenizer = model.tokenizer;
-  const sp = makeSamplingParams(args);
+  const sp = !args.greedy ? makeSamplingParams(args) : undefined;
   const eosIds = model.eosIds;
   const messages: Array<{ role: string; content: string }> = [];
 

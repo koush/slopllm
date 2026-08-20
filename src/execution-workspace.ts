@@ -5,7 +5,6 @@ import { MemcpyKind } from "./enums";
 import { I32 } from "./glm_ops";
 import { type PagedKVCache } from "./paged_kv";
 import { Tensor } from "./tensor";
-import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
 export const DECODE_PLAN_INFO_SIZE = 10;
@@ -85,12 +84,6 @@ export async function executePlan<T>(captureManager: CaptureManager, ws: Executi
 
 export class ExecutionState {
   input?: Tensor;
-  // Persisted per-group sparse-slot cache, populated once at the full layer and
-  // reused by the following shared layers. Two separate Tensor holders (not a
-  // {slots,length} object) so each keeps UsingHolder's dispose-on-replace
-  // semantics; sharedSlotsLength is the length paired with sharedSlots' slots.
-  sharedSlots?: UsingHolder<Tensor>;
-  sharedSlotsLength?: UsingHolder<Tensor>;
   paddedKvLenInvariant = true;
   private readonly paddedKvLen: number;
 
