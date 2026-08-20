@@ -132,7 +132,7 @@ export class ParallelTensor extends Tensor {
       shard.stage();
     }
   }
-  
+
   unstage() {
     super.unstage();
     for (const shard of this.shards) {
@@ -2630,7 +2630,7 @@ export class ParallelOps implements DeviceOps {
     for (const group of this.p2pGroups.values()) {
       group.cleanupSources();
       for (const w of group.workspaces) {
-        using _ = w.startTracking();
+        w.clearTracking();
       }
     }
     notifySynchronizedWorkspaces(this.synchronizeListeners);
@@ -2641,7 +2641,7 @@ export class ParallelOps implements DeviceOps {
     for (const group of this.p2pGroups.values()) {
       group.cleanupSources();
       for (const w of group.workspaces) {
-        using _ = w.startTracking();
+        w.clearTracking();
       }
     }
     notifySynchronizedWorkspaces(this.synchronizeListeners);
@@ -2655,7 +2655,7 @@ export class ParallelOps implements DeviceOps {
     if (group) {
       group.cleanupSources();
       for (const w of group.workspaces) {
-        using _ = w.startTracking();
+        w.clearTracking();
       }
     }
   }
@@ -2666,7 +2666,7 @@ export class ParallelOps implements DeviceOps {
     if (group) {
       group.cleanupSources();
       for (const w of group.workspaces) {
-        using _ = w.startTracking();
+        w.clearTracking();
       }
     }
   }

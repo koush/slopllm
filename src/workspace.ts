@@ -28,12 +28,13 @@ export class WorkspaceBase implements Disposable {
     this.synchronizingHost.clear();
   }
 
-  startTracking(keepExports = new Set<Tensor>()): Disposable & { [Symbol.dispose](): void } {
+
+  clearTracking(keepExports = new Set<Tensor>()) {
     if (this.tracking !== null) {
-      throw new Error("startTracking already active");
+      throw new Error("tracking already active");
     }
     if (this.staged.size) {
-      throw new Error("startTracking was called with staged tensors already allocated, this may result in non-deterministic allocations.");
+      throw new Error("clearTracking was called with staged tensors already allocated, this may result in non-deterministic allocations.");
     }
     const keep = new Set<Tensor>();
     for (const tensor of keepExports) {
@@ -46,12 +47,17 @@ export class WorkspaceBase implements Disposable {
     }
     for (const tracked of this.tracked) {
       if (!keep.has(tracked)) {
-        console.warn(new Error("startTracking was called with tensors already allocated that were not in keepExports, this may result in non-deterministic allocations."));
+        console.warn(new Error("clearTracking was called with tensors already allocated that were not in keepExports, this may result in non-deterministic allocations."));
         // console.warn(tracked.shape, this.tracked.size, tracked.stack);
         tracked[Symbol.dispose]();
         // break;
       }
     }
+  }
+
+  startTracking(keepExports = new Set<Tensor>()): Disposable & { [Symbol.dispose](): void } {
+    this.clearTracking(keepExports);
+
     const ws = this;
     const tracker: Disposable & { [Symbol.dispose](): void } = {
       [Symbol.dispose]() {
