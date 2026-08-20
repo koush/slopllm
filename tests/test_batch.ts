@@ -95,6 +95,24 @@ describe("Qwen3-0.6B batch tests", () => {
     assert.equal(typeof decodeTokens[1], "number", `Decode token 1 not a number: ${decodeTokens[1]}`);
   });
 
+  it("decode refreshes cumulative KV token offsets", () => {
+    using pagedKV = makePagedKV();
+    pagedKV.reset(2);
+    ws.planPrefill(model, 2, [PROMPT1.length, PROMPT2.length], pagedKV);
+
+    const state = ws.planDecode(model, 2, pagedKV);
+    const actual: number[] = [];
+    state.kvTokenIndptrH.withPinnedBuffer(buf => {
+      for (let i = 0; i <= 2; i++) actual.push(buf.readInt32LE(i * 4));
+    });
+
+    assert.deepEqual(actual, [
+      0,
+      PROMPT1.length + 1,
+      PROMPT1.length + PROMPT2.length + 2,
+    ]);
+  });
+
   it("batch prefill append", () => {
     using pagedKV = makePagedKV(1, 64);
     using singleKV = makePagedKV(1, 64);
@@ -338,7 +356,8 @@ describe("Qwen3-0.6B batch tests", () => {
   it("batch sampling matches sequential sampling", () => {
     using pagedKV = model.createChatCache(64, 4) as PagedKVCache;
     const greedy: SamplingParams = makeSamplingParams({
-      temperature: 0, topP: 1.0, topK: 0,
+      // Temperature zero must remain greedy even when a default top-k is set.
+      temperature: 0, topP: 1.0, topK: 20,
       repetitionPenalty: 1.0, presencePenalty: 0, repetitionPenaltyWindow: 64,
     });
     const sampling: SamplingParams = makeSamplingParams({
@@ -362,6 +381,8 @@ describe("Qwen3-0.6B batch tests", () => {
       sampler.updateSampler([greedy], [history]);
       return sampler.sample(logits).readInt32LEArray()[0];
     })();
+    assert.equal(greedySingle, firstToken,
+      `Temperature-zero sampling should match argmax: ${greedySingle} != ${firstToken}`);
     const batchResults = (() => {
       using sampler = new SamplingWorkspace(logits.workspace.glm, 2, model.cfg.vocabSize, sampling.repetitionPenaltyWindow);
       sampler.updateSampler([greedy, sampling], [history, history]);

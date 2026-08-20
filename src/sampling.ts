@@ -157,7 +157,7 @@ export class SamplingWorkspace extends WorkspaceBase {
       const topK = p.topK > 0 ? p.topK : 0;
       const temperature = p.temperature > 0 ? p.temperature : 0;
       let effectiveK: number;
-      if (temperature <= 0 && topK <= 0) {
+      if (temperature <= 0) {
         effectiveK = 1;
       } else if (topK > 0) {
         effectiveK = topK < vs ? topK : vs;

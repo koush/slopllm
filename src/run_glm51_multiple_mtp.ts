@@ -20,6 +20,7 @@ interface Args extends ModelCliArgs {
   maxPages: number;
   mtpDraftTopk: number[];
   noCudaGraph: boolean;
+  prompt?: string;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -31,6 +32,7 @@ function parseArgs(argv: string[]): Args {
     maxPages: 256,
     mtpDraftTopk: [1, 1, 1],
     noCudaGraph: false,
+    prompt: undefined,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -39,6 +41,7 @@ function parseArgs(argv: string[]): Args {
     else if (arg === "--max-new-tokens" && i + 1 < argv.length) args.maxNewTokens = parseInt(argv[++i], 10);
     else if (arg === "--max-seq-len" && i + 1 < argv.length) args.maxSeqLen = parseInt(argv[++i], 10);
     else if (arg === "--max-pages" && i + 1 < argv.length) args.maxPages = parseInt(argv[++i], 10);
+    else if (arg === "--prompt" && i + 1 < argv.length) args.prompt = argv[++i];
     else if (arg === "--mtp-draft-topk" && i + 1 < argv.length) {
       args.mtpDraftTopk = argv[++i].split(",").map(value => parseInt(value.trim(), 10));
     } else if (arg === "--no-cuda-graph") args.noCudaGraph = true;
@@ -98,7 +101,7 @@ function freeResources(model: ChatModel | undefined, cache: ChatCache | undefine
 }
 
 async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args): Promise<void> {
-  const prompts = PROMPTS.slice(0, args.batchSize);
+  const prompts = args.prompt ? Array(args.batchSize).fill(args.prompt) : PROMPTS.slice(0, args.batchSize);
   const inputIds = prompts.map(prompt => tokenizePrompt(model.tokenizer, prompt));
   const longestPrompt = Math.max(...inputIds.map(ids => ids.length));
   if (longestPrompt + args.maxNewTokens > args.maxSeqLen) {

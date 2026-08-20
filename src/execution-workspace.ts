@@ -624,6 +624,15 @@ export class ExecutionWorkspace extends WorkspaceBase {
       pagedKV.allocDecodeToken(seqIdx);
     }
 
+    state.kvTokenIndptrH.withPinnedBuffer(buf => {
+      buf.writeInt32LE(0, 0);
+      let cumulative = 0;
+      for (let i = 0; i < batchSize; i++) {
+        cumulative += pagedKV.sequences[i].allocLen;
+        buf.writeInt32LE(cumulative, (i + 1) * I32);
+      }
+    });
+
     this.updateIndptr(state, pagedKV);
 
     if (!cfg.kvLoraRank) {
@@ -652,6 +661,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.contentPages, 0);
     state.indices.memcpy(state.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
     state.indptrD.memcpy(state.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    state.kvTokenIndptrD.memcpy(state.kvTokenIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
 
     return state;
   }

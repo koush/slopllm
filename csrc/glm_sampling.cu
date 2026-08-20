@@ -105,7 +105,7 @@ __device__ SamplingParams sampling_load_params(
         p.num_penalty_tokens = min(penalty_count[seq_idx], max_window);
         p.pen_start = (penalty_count[seq_idx] - p.num_penalty_tokens) % max_window;
     }
-    if (p.temperature <= 0.0f && p.top_k <= 0) {
+    if (p.temperature <= 0.0f) {
         p.effective_k = 1;
     } else if (p.top_k > 0) {
         p.effective_k = (p.top_k < vocab_size) ? p.top_k : vocab_size;

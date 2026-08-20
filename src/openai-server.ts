@@ -8,6 +8,7 @@ import { ExecutionWorkspace } from "./execution-workspace";
 import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
+import { Tensor } from "./tensor";
 
 const PAGE_SIZE = 64;
 
@@ -25,6 +26,7 @@ interface ServerArgs extends ModelCliArgs {
   presencePenalty: number;
   repetitionPenaltyWindow: number;
   decodeLatency: number;
+  noCudaGraph: boolean;
 }
 
 function parseArgs(argv: string[]): ServerArgs {
@@ -43,6 +45,7 @@ function parseArgs(argv: string[]): ServerArgs {
     presencePenalty: 0,
     repetitionPenaltyWindow: 64,
     decodeLatency: 0,
+    noCudaGraph: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -59,6 +62,7 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--presence-penalty" && i + 1 < argv.length) args.presencePenalty = parseFloat(argv[++i]);
     else if (a === "--repetition-penalty-window" && i + 1 < argv.length) args.repetitionPenaltyWindow = parseInt(argv[++i], 10);
     else if (a === "--decode-latency" && i + 1 < argv.length) args.decodeLatency = parseInt(argv[++i], 10);
+    else if (a === "--no-cuda-graph") args.noCudaGraph = true;
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
   }
   if (args.maxPages === 0) {
@@ -90,6 +94,7 @@ Options:
   --presence-penalty <float>    Default presence penalty (default: 0)
   --repetition-penalty-window <int>  Repetition penalty window (default: 64)
   --decode-latency <int>        Artificial delay per decode step in ms (default: 0)
+  --no-cuda-graph               Disable CUDA graph capture
   --help, -h                    Show this help message
 `);
 }
@@ -199,12 +204,13 @@ async function generateContinuousBatch(
   metrics: ServerMetrics,
   captureManager: CaptureManager,
   samplingWorkspace: SamplingWorkspace,
-): Promise<void> {
+): Promise<number> {
   const tokenizer = model.tokenizer;
   const pagedKV = cache.getPagedKV();
   const eosToken = [...eosIds][0];
   const active: ActiveSequence[] = [];
   let nextStagingKey = 0;
+  let admittedRequests = 0;
 
   while (active.length > 0 || pendingQueue.length > 0) {
     // 1. Remove finished sequences (reverse order to avoid index shift)
@@ -223,6 +229,7 @@ async function generateContinuousBatch(
     if (pendingQueue.length > 0 && availableSlots > 0) {
       const newCount = Math.min(pendingQueue.length, availableSlots);
       const newRequests = pendingQueue.splice(0, newCount);
+      admittedRequests += newCount;
       metrics.runningRequests += newCount;
 
       const inputIdsList: number[][] = [];
@@ -313,21 +320,31 @@ async function generateContinuousBatch(
     // 4. Update sampling workspace for current batch composition
     const params = active.map(a => a.request.samplingParams);
     const tokenHistories = pagedKV.sequences.slice(0, active.length).map(s => s.getTokenIds());
-    samplingWorkspace.updateSampler(params, tokenHistories);
+    const useArgmax = params.every(param =>
+      param.temperature <= 0 && param.repetitionPenalty === 1 && param.presencePenalty === 0,
+    );
+    if (!useArgmax) samplingWorkspace.updateSampler(params, tokenHistories);
 
     // 5. Decode one step
     const inputTokens = active.map(a => a.lastToken);
     const state = ws.planDecode(model, active.length, cache, true);
     state.setInput([inputTokens]);
-    state.capture(captureManager, {}, () => {
+    const decodeResult = state.capture(captureManager, {}, () => {
       ws.positionStep(state, model);
       using hiddenStates = model.forwardModel(state);
       using decodeLogits = state.computeLogits(hiddenStates, model);
+      if (useArgmax) return decodeLogits.argmax();
       samplingWorkspace.sample(decodeLogits);
       return undefined;
-    }, ["openai-decode"]);
+    }, [useArgmax ? "openai-decode-argmax" : "openai-decode-sample"]);
     await glm.synchronizeAsync();
-    const newTokens = samplingWorkspace.outToken.readInt32LEArray();
+    let newTokens: number[];
+    if (useArgmax) {
+      using argmaxResult = decodeResult as Tensor;
+      newTokens = argmaxResult.readInt32LEArray();
+    } else {
+      newTokens = samplingWorkspace.outToken.readInt32LEArray();
+    }
     ws.clearTracking();
     metrics.generationTokensTotal += newTokens.length;
 
@@ -358,6 +375,8 @@ async function generateContinuousBatch(
       await new Promise(resolve => setImmediate(resolve));
     }
   }
+
+  return admittedRequests;
 }
 
 async function generateBatch(
@@ -581,6 +600,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const cache = model.createChatCache(args.maxPages, args.batchSize, args.ctxSize);
   const ws = new ExecutionWorkspace(glm, args.batchSize, args.ctxSize);
   const captureManager = new CaptureManager(glm);
+  captureManager.disabled = args.noCudaGraph;
   const samplingWorkspace = new SamplingWorkspace(glm, args.batchSize, model.cfg.vocabSize, args.repetitionPenaltyWindow);
   const tokenizer = model.tokenizer;
   const eosIds = model.eosIds;
@@ -644,11 +664,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     busy = true;
     try {
       const t0 = performance.now();
-      let totalTokens = 0;
-      let totalPrompt = 0;
-      const requestCount = pendingQueue.length;
+      let requestCount = 0;
       try {
-        await generateContinuousBatch(
+        requestCount = await generateContinuousBatch(
           model,
           ws,
           glm,
@@ -664,9 +682,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         );
       } catch (err) {
         console.error("Continuous batch error:", err);
-      }
-      for (let i = 0; i < requestCount; i++) {
-        // tokens already counted per-request via onToken
       }
       const elapsed = (performance.now() - t0) / 1000;
       if (elapsed > 0) {
@@ -955,7 +970,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  GET  /metrics              - Prometheus metrics`);
     console.log(`  GET  /v1/models            - List models`);
     console.log(`  GET  /health               - Health check`);
-    console.log(`  CUDA graphs: enabled`);
+    console.log(`  CUDA graphs: ${args.noCudaGraph ? "disabled" : "enabled"}`);
     console.log(`  Model: ${modelName}  |  GPU: ${args.gpus.join(",")}  |  ctx-size=${args.ctxSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);
   });
 
