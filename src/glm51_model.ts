@@ -55,13 +55,16 @@ export interface MtpDraftBatch {
 interface MtpVerificationArtifacts {
   kvCacheLayers: Array<{
     appendCkv: Tensor;
+    appendCkvOrig: Tensor;
     appendKpe: Tensor;
+    appendKpeOrig: Tensor;
     cacheIdx: number;
     kvLoraRank: number;
     qkRopeDim: number;
   }>;
   indexerKvCacheLayers: Array<{
     appendIdxK: Tensor;
+    appendIdxKOrig: Tensor;
     cacheIdx: number;
     indexHeadDim: number;
   }>;
@@ -917,10 +920,7 @@ export class Glm51Model extends ChatModel {
       residual.replace(result.residual);
     }
 
-    // Export the cache so it survives a caller's MTP tracking region (see mtp.ts).
-    sharedSlots?.value?.removeTracking();
-    sharedSlotsLength?.value?.removeTracking();
-    return normed.detach().removeTracking();
+    return normed.detach();
   }
 
   forwardMtp(state: ExecutionState, previousHiddenState: Tensor, sharedSlots = state.sharedSlots, sharedSlotsLength = state.sharedSlotsLength) {
@@ -974,16 +974,10 @@ export class Glm51Model extends ChatModel {
     const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state, sharedSlots, sharedSlotsLength);
     using _residual = result.residual;
 
-    // Export the cache (slots + length) so it survives the caller's MTP tracking
-    // region — otherwise startTracking's dispose frees the tensors the holders
-    // still point to, causing a use-after-free on the next pass.
-    sharedSlots?.value?.removeTracking();
-    sharedSlotsLength?.value?.removeTracking();
-
     // Return shared_head.norm(residual) so the recycled seed for the next MTP
     // step is already normed — matches sglang Glm4MoeModelNextN and vLLM v1
     // deepseek_mtp which both recycle the post-shared_head-norm state.
-    return result.normed.removeTracking();
+    return result.normed;
   }
 
   private planMtpDraftDepths(ws: ExecutionWorkspace, cache: ChatCache, originalAllocLens: readonly number[], topks: readonly number[]) {
@@ -1082,6 +1076,8 @@ export class Glm51Model extends ChatModel {
         next.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
         seed.memcpy(hiddenStates, hiddenStates.bytes, MemcpyKind.DeviceToDevice);
       }
+      stateSharedSlots.value.resumeTracking();
+      stateSharedSlotsLength.value.resumeTracking();
     }
   }
 
@@ -1203,13 +1199,13 @@ export class Glm51Model extends ChatModel {
         state.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
           appendCkv.removeTracking();
           appendKpe.removeTracking();
-          kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendKpe: appendKpe.capture(), cacheIdx, kvLoraRank, qkRopeDim });
+          kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendCkvOrig: appendCkv, appendKpe: appendKpe.capture(), appendKpeOrig: appendKpe, cacheIdx, kvLoraRank, qkRopeDim });
           return appendMla(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
         };
         const appendIndexer = state.indexerKvCacheAppend.bind(state);
         state.indexerKvCacheAppend = (appendIdxK, cacheIdx, indexHeadDim) => {
           appendIdxK.removeTracking();
-          indexerKvCacheLayers.push({ appendIdxK: appendIdxK.capture(), cacheIdx, indexHeadDim });
+          indexerKvCacheLayers.push({ appendIdxK: appendIdxK.capture(), appendIdxKOrig: appendIdxK, cacheIdx, indexHeadDim });
           return appendIndexer(appendIdxK, cacheIdx, indexHeadDim);
         };
         using hiddenStates = this.forwardModel(state, slots, slotsLength);
@@ -1286,10 +1282,12 @@ export class Glm51Model extends ChatModel {
     const committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
     const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
     const seed = ws.ensureAlloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16", `glm51_mtp_seed_${topks.join("_")}`);
-    for (let layerIndex = 0; layerIndex < artifacts.kvCacheLayers.length; layerIndex++) {
-      const layer = artifacts.kvCacheLayers[layerIndex];
-      const appendCkv = layer.appendCkv;
-      const appendKpe = layer.appendKpe;
+    for (const layer of artifacts.kvCacheLayers) {
+      const { appendCkv, appendKpe } = layer;
+      using appendCkvOrig = layer.appendCkvOrig;
+      using appendKpeOrig = layer.appendKpeOrig;
+      appendCkvOrig.resumeTracking();
+      appendKpeOrig.resumeTracking();
       let destinationBase = 0;
       for (let batch = 0; batch < batchSize; batch++) {
         const sourceBase = batch * numVerificationTokens;
@@ -1305,9 +1303,10 @@ export class Glm51Model extends ChatModel {
       }
       commitState.mlaKvCacheAppend(appendCkv, appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
     }
-    for (let layerIndex = 0; layerIndex < artifacts.indexerKvCacheLayers.length; layerIndex++) {
-      const layer = artifacts.indexerKvCacheLayers[layerIndex];
-      const appendIdxK = layer.appendIdxK;
+    for (const layer of artifacts.indexerKvCacheLayers) {
+      const { appendIdxK } = layer;
+      using appendIdxKOrig = layer.appendIdxKOrig;
+      appendIdxKOrig.resumeTracking();
       let destinationBase = 0;
       for (let batch = 0; batch < batchSize; batch++) {
         const sourceBase = batch * numVerificationTokens;

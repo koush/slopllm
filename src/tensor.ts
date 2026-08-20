@@ -35,7 +35,7 @@ export abstract class Tensor implements Disposable {
     this.name = name;
     this.pinned = pinned;
     this.view = view;
-    // this.stack = new Error("Tensor allocated at:").stack!;
+    // this.stack = this.name ? undefined! : new Error("Tensor allocated at:").stack!;
     if (view) {
       view.views.add(this);
     }
@@ -53,7 +53,6 @@ export abstract class Tensor implements Disposable {
       return;
     }
     this.workspace.tracked.delete(this);
-    this.workspace.exported.delete(this);
     this.workspace.staged.add(this);
   }
   
@@ -162,7 +161,7 @@ export abstract class Tensor implements Disposable {
       if (this.same(tracked))
         return tracked.viewClone();
     }
-    for (const exported of this.workspace.exported) {
+    for (const exported of this.workspace.staged) {
       if (this.same(exported))
         return exported.viewClone();
     }
@@ -188,7 +187,7 @@ export abstract class Tensor implements Disposable {
       // return false?
       throw new Error(`Cannot dispose named tensor ${this.name}`);
     }
-    if (this.workspace.exported.has(this)) {
+    if (this.workspace.staged.has(this)) {
       return false;
     }
     return true;
@@ -226,8 +225,9 @@ export abstract class Tensor implements Disposable {
     }
     if (this.captured)
       return this;
-    this.workspace.tracked.delete(this);
-    this.workspace.exported.add(this);
+    if (this.workspace.tracking) {
+      this.stage();
+    }
     return this;
   }
 
@@ -235,8 +235,15 @@ export abstract class Tensor implements Disposable {
     if (this.name !== undefined) {
       throw new Error(`Cannot resumeTracking on named tensor ${this.name}`);
     }
+    if (this.disposed) {
+      return this;
+    }
+    if (this.view) {
+      this.view.resumeTracking();
+      return this;
+    }
     this.workspace.tracked.add(this);
-    this.workspace.exported.delete(this);
+    this.workspace.staged.delete(this);
     return this;
   }
 

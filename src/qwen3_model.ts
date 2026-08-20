@@ -179,6 +179,6 @@ export class Qwen3Model extends ChatModel {
       residual.replace(mlpResult.residual);
     }
 
-    return normed.detach().removeTracking();
+    return normed.detach();
   }
 }

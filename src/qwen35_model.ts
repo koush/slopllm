@@ -461,6 +461,6 @@ export class Qwen35Model extends ChatModel {
       residual.replace(result.residual);
     }
 
-    return normed.detach().removeTracking();
+    return normed.detach();
   }
 }

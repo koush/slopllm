@@ -240,6 +240,8 @@ export async function* generateStream(
         doSample(firstTokens);
         return gpuSampleResult!.viewClone();
       });
+      state.sharedSlots.value?.removeTracking();
+      state.sharedSlotsLength.value?.removeTracking();
       using _mtpHiddenStates = mtpDraftExtendResult.mtpHiddenStates;
       using _token = mtpDraftExtendResult.token;
 

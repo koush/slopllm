@@ -9,10 +9,9 @@ export class WorkspaceBase implements Disposable {
   staged = new Set<Tensor>();
   disposedDevice = new Set<Tensor>();
   disposedHost = new Set<Tensor>();
-  exported = new Set<Tensor>();
   frozen = false;
   allocLogger = false;
-  protected tracking: Disposable & { [Symbol.dispose](): void } | null = null;
+  tracking: Disposable & { [Symbol.dispose](): void } | null = null;
 
   constructor(glm: DeviceOps) {
     this.glm = glm;
@@ -26,16 +25,17 @@ export class WorkspaceBase implements Disposable {
       throw new Error("startTracking was called with staged tensors already allocated, this may result in non-deterministic allocations.");
     }
     if (this.tracked.size) {
-      console.warn(new Error("startTracking was called with tensors already allocated, this may result in non-deterministic allocations."));
+      for (const tracked of this.tracked) {
+        if (!keepExports.has(tracked)) {
+          console.warn(new Error("startTracking was called with tensors already allocated that were not in keepExports, this may result in non-deterministic allocations."));
+          // console.warn(tracked.shape, this.tracked.size, tracked.stack);
+          tracked[Symbol.dispose]();
+          // break;
+        }
+      }
       // for (const tracked of this.tracked) {
       //   console.warn(tracked.stack);
       // }
-    }
-    for (const tensor of this.exported) {
-      if (!keepExports.has(tensor)) {
-        this.exported.delete(tensor);
-        tensor[Symbol.dispose]();
-      }
     }
     const ws = this;
     const tracker: Disposable & { [Symbol.dispose](): void } = {
@@ -45,6 +45,10 @@ export class WorkspaceBase implements Disposable {
           tensor[Symbol.dispose]();
         }
         ws.tracked.clear();
+        for (const tensor of ws.staged) {
+          ws.tracked.add(tensor);
+        }
+        ws.staged.clear();
         ws.tracking = null;
       },
     };
@@ -177,9 +181,6 @@ export class WorkspaceBase implements Disposable {
     for (const tensor of this.disposedDevice) {
       tensor.free();
     }
-    for (const tensor of this.exported) {
-      tensor.free();
-    }
     for (const tensor of this.staged) {
       tensor.free();
     }
@@ -187,7 +188,6 @@ export class WorkspaceBase implements Disposable {
     this.tracked.clear();
     this.disposedHost.clear();
     this.disposedDevice.clear();
-    this.exported.clear();
     this.staged.clear();
   }
 

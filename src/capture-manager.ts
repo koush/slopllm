@@ -23,6 +23,28 @@ interface LengthVariant {
     kvLen: boolean;
 }
 
+type CaptureReturn = Tensor | CaptureReturn[] | string | number | boolean | null | undefined | { [name: string]: CaptureReturn };
+
+function mapCaptureTensors(object: CaptureReturn, mapTensor: (tensor: Tensor) => Tensor): CaptureReturn {
+    if (object instanceof Tensor) {
+        return mapTensor(object);
+    }
+    else if (Array.isArray(object)) {
+        return object.map(item => mapCaptureTensors(item, mapTensor));
+    }
+    else if (object && typeof object === "object") {
+        const result: Record<string, CaptureReturn> = {};
+        for (const [key, item] of Object.entries(object)) {
+            result[key] = mapCaptureTensors(item, mapTensor);
+        }
+        return result;
+    }
+    else {
+        return object;
+    }
+}
+
+
 export class CaptureManager implements Disposable {
     static capturing?: Captured;
     disabled = false;
@@ -45,8 +67,8 @@ export class CaptureManager implements Disposable {
         if (capturedWorkspaces.has(workspace)) {
             return;
         }
-        if (workspace.exported.size || workspace.tracked.size) {
-            throw new Error("Cannot capture a workspace that has exported or tracked tensors");
+        if (workspace.tracked.size) {
+            throw new Error("Cannot capture a workspace that has tracked tensors");
         }
         capturedWorkspaces.add(workspace);
     }
@@ -76,7 +98,7 @@ export class CaptureManager implements Disposable {
         }
     }
 
-    run<T , I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, keyParams?: any[]): T {
+    run<T, I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, keyParams?: any[]): T {
         if (CaptureManager.capturing) {
             throw new Error("Cannot run a capture while another capture is in progress");
         }
@@ -101,7 +123,7 @@ export class CaptureManager implements Disposable {
                         }
                     }
                     for (const ws of captured.capturedWorkspaces) {
-                        if (ws.exported.size || ws.tracked.size) {
+                        if (ws.tracked.size) {
                             throw new Error("Cannot replay a capture with exported or tracked tensors in a captured workspace");
                         }
                     }

@@ -72,7 +72,7 @@ export abstract class ChatModel extends WorkspaceBase {
 
   forward(state: ExecutionState): Tensor {
     using _tracker = state.ws.startTracking();
-    return this.forwardModel(state);
+    return this.forwardModel(state).removeTracking();
   }
 
   protected initInvFreq(ropeDim: number, ropeTheta: number): Tensor {

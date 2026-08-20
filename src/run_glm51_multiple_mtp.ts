@@ -9,7 +9,7 @@ import { MtpStats } from "./mtp";
 import { ParallelOps } from "./parallel_ops";
 
 const PROMPTS = [
-  "tell me a 1000 word story",
+  "tell me about india",
   "tell me a 1000 word story",
 ];
 

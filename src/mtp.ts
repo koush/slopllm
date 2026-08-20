@@ -499,18 +499,14 @@ export async function mtpTreeDecode(
 
     const mlaKVCacheAppendOrig = targetPrefillState.mlaKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
-      // need to prevent this from being recycled into workspace
-      appendCkv.removeTracking();
-      appendKpe.removeTracking();
-      // and capture the tensors for graph playback
-      kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendKpe: appendKpe.capture(), appendCkvOrig: appendCkv, appendKpeOrig: appendKpe, cacheIdx, kvLoraRank, qkRopeDim });
+      // viewclone and and capture the tensors for graph playback
+      kvCacheLayers.push({ appendCkv: appendCkv.capture(), appendKpe: appendKpe.capture(), appendCkvOrig: appendCkv.viewClone(), appendKpeOrig: appendKpe.viewClone(), cacheIdx, kvLoraRank, qkRopeDim });
       return mlaKVCacheAppendOrig(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
     };
 
     const indexerKvCacheAppendOrig = targetPrefillState.indexerKvCacheAppend.bind(targetPrefillState);
     targetPrefillState.indexerKvCacheAppend = (idxKOut, cacheIdx, indexHeadDim) => {
-      idxKOut.removeTracking();
-      indexerKvCacheLayers.push({ appendIdxK: idxKOut.capture(), appendIdxKOrig: idxKOut, cacheIdx, indexHeadDim });
+      indexerKvCacheLayers.push({ appendIdxK: idxKOut.capture(), appendIdxKOrig: idxKOut.viewClone(), cacheIdx, indexHeadDim });
       return indexerKvCacheAppendOrig(idxKOut, cacheIdx, indexHeadDim);
     };
 

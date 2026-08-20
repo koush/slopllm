@@ -188,6 +188,10 @@ async function main(): Promise<void> {
       });
       return;
     }
+    if (req.method === "GET" && url.pathname === "/model-args") {
+      sendJson(res, 200, { args: loaderArgs.sharedArgs });
+      return;
+    }
     if (req.method === "POST" && url.pathname === "/run") {
       void readWorkerCommand(req, loaderArgs.sharedArgs).then(command => {
         if (worker) {
