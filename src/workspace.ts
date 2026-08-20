@@ -35,18 +35,22 @@ export class WorkspaceBase implements Disposable {
     if (this.staged.size) {
       throw new Error("startTracking was called with staged tensors already allocated, this may result in non-deterministic allocations.");
     }
-    if (this.tracked.size) {
-      for (const tracked of this.tracked) {
-        if (!keepExports.has(tracked)) {
-          console.warn(new Error("startTracking was called with tensors already allocated that were not in keepExports, this may result in non-deterministic allocations."));
-          // console.warn(tracked.shape, this.tracked.size, tracked.stack);
-          tracked[Symbol.dispose]();
-          // break;
-        }
+    const keep = new Set<Tensor>();
+    for (const tensor of keepExports) {
+      keep.add(tensor);
+      let root = tensor;
+      while (root.view) {
+        root = root.view;
+        keep.add(root);
       }
-      // for (const tracked of this.tracked) {
-      //   console.warn(tracked.stack);
-      // }
+    }
+    for (const tracked of this.tracked) {
+      if (!keep.has(tracked)) {
+        console.warn(new Error("startTracking was called with tensors already allocated that were not in keepExports, this may result in non-deterministic allocations."));
+        // console.warn(tracked.shape, this.tracked.size, tracked.stack);
+        tracked[Symbol.dispose]();
+        // break;
+      }
     }
     const ws = this;
     const tracker: Disposable & { [Symbol.dispose](): void } = {

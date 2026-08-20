@@ -50,7 +50,6 @@ export abstract class Tensor implements Disposable {
       return;
     if (this.view) {
       this.view.stage();
-      return;
     }
     this.workspace.tracked.delete(this);
     this.workspace.staged.add(this);
@@ -63,7 +62,6 @@ export abstract class Tensor implements Disposable {
       return;
     if (this.view) {
       this.view.unstage();
-      return;
     }
     this.workspace.staged.delete(this);
     this.workspace.tracked.add(this);
@@ -273,7 +271,6 @@ export abstract class Tensor implements Disposable {
     }
     if (this.view) {
       this.view.resumeTracking();
-      return this;
     }
     this.workspace.tracked.add(this);
     this.workspace.staged.delete(this);

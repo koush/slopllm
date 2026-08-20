@@ -47,6 +47,8 @@ export interface Glm51Config extends CommonModelConfig {
 }
 
 interface MtpVerificationArtifacts {
+  seed: Tensor;
+  mtpHiddenStaging: Tensor;
   kvCacheLayers: Array<{
     appendCkv: Tensor;
     appendKpe: Tensor;
@@ -1080,18 +1082,17 @@ export class Glm51Model extends ChatModel {
     };
 
     const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
-    const seed = ws.ensureAlloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16", `glm51_mtp_seed_${topks.join("_")}`);
-    const targetHost = ws.ensureAllocPinned([ws.maxBatch], "I32", "glm51_mtp_target_tokens_host");
     const numTreeNodes = mtpTotalTreeNodes(topks);
-    const treeHost = ws.ensureAllocPinned([ws.maxBatch * numTreeNodes], "I32", `glm51_mtp_draft_host_${numTreeNodes}`);
     using sharedSlots = new UsingHolder<Tensor>(undefined!);
     using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
 
-    yield* executionPhase({
+    const prefillArtifacts = yield* executionPhase({
       states: [prefillState],
       inputs: {},
       captureKey: [],
       run: () => {
+        const seed = ws.alloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16");
+        const targetHost = ws.allocPinned([ws.maxBatch], "I32");
         using targetDevice = ws.alloc([ws.maxBatch], "I32");
         using hiddenStates = this.forwardModel(prefillState, sharedSlots, sharedSlotsLength);
         using logits = prefillState.computeLogits(hiddenStates, this);
@@ -1104,32 +1105,47 @@ export class Glm51Model extends ChatModel {
         using lastHidden = mtpHidden.indexSelect(lastIdx, -1);
         seed.memcpy(lastHidden, lastHidden.bytes, MemcpyKind.DeviceToDevice);
         targetHost.memcpy(targetDevice, batchSize * I32, MemcpyKind.DeviceToHost);
+        return { seed, targetHost };
       },
     });
 
+    let targetTokens: number[];
+    {
+      using targetHost = prefillArtifacts.targetHost;
+      const targetBuf = targetHost.readPinnedBuffer();
+      targetTokens = Array.from({ length: batchSize }, (_, batch) => targetBuf.readInt32LE(batch * I32));
+    }
+
     const draftPlan = this.planMtpDraftDepths(ws, cache, committedAllocLens, topks);
-    yield* executionPhase({
+    const draftArtifacts = yield* executionPhase({
       states: draftPlan.states,
       inputs: {
+        seed: prefillArtifacts.seed,
         sharedSlots: sharedSlots.value,
         sharedSlotsLength: sharedSlotsLength.value,
       },
       captureKey: [],
       run: (inputs) => {
-        this.runMtpDraft(ws, topks, batchSize, seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
+        const treeHost = ws.allocPinned([ws.maxBatch * numTreeNodes], "I32");
+        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
+        return { treeHost };
       },
     });
 
     for (let batch = 0; batch < batchSize; batch++) {
       cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
     }
-    const targetBuf = targetHost.readPinnedBuffer();
-    const treeBuf = treeHost.readPinnedBuffer();
+    let treeTokens: number[][];
+    {
+      using treeHost = draftArtifacts.treeHost;
+      const treeBuf = treeHost.readPinnedBuffer();
+      treeTokens = Array.from({ length: batchSize }, (_, batch) =>
+        Array.from({ length: numTreeNodes }, (_, node) => treeBuf.readInt32LE((batch * numTreeNodes + node) * I32)));
+    }
     completed = true;
     return {
-      targetTokens: Array.from({ length: batchSize }, (_, batch) => targetBuf.readInt32LE(batch * I32)),
-      treeTokens: Array.from({ length: batchSize }, (_, batch) =>
-        Array.from({ length: numTreeNodes }, (_, node) => treeBuf.readInt32LE((batch * numTreeNodes + node) * I32))),
+      targetTokens,
+      treeTokens,
       topks,
     };
   }
@@ -1162,7 +1178,7 @@ export class Glm51Model extends ChatModel {
       positionIds: ensureMtpVerificationPositionIds(ws, originalAllocLens, targetTopks),
     });
     state.setInput(verificationTokens);
-    const mtpHiddenStaging = ws.ensureAlloc([ws.maxBatch * numVerificationTokens, this.cfg.hiddenSize], "BF16", `glm51_mtp_hidden_staging_${numVerificationTokens}`);
+    const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
     const argmaxHost = ws.ensureAllocPinned([ws.maxBatch * numVerificationTokens], "I32", `glm51_mtp_verify_argmax_host_${numVerificationTokens}`);
 
     const artifacts = yield* executionPhase({
@@ -1170,6 +1186,8 @@ export class Glm51Model extends ChatModel {
       inputs: {},
       captureKey: ["glm51-mtp-verify", topks.join(",")],
       run: () => {
+        const seed = ws.alloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16");
+        const mtpHiddenStaging = ws.alloc([ws.maxBatch * numVerificationTokens, this.cfg.hiddenSize], "BF16");
         using slots = new UsingHolder<Tensor>(undefined!);
         using slotsLength = new UsingHolder<Tensor>(undefined!);
         const kvCacheLayers: MtpVerificationArtifacts["kvCacheLayers"] = [];
@@ -1192,6 +1210,8 @@ export class Glm51Model extends ChatModel {
         using mtpHidden = this.forwardMtp(state, hiddenStates, slots, slotsLength);
         mtpHiddenStaging.memcpy(mtpHidden, mtpHidden.bytes, MemcpyKind.DeviceToDevice);
         return {
+          seed,
+          mtpHiddenStaging,
           kvCacheLayers,
           indexerKvCacheLayers,
           sharedSlots: slots.detach(),
@@ -1200,49 +1220,51 @@ export class Glm51Model extends ChatModel {
       },
     });
 
-    const argmaxBuf = argmaxHost.readPinnedBuffer();
-    const targetBoundaries = mtpDepthBoundaries(targetTopks);
-    const strides = topks.map((_, index) => mtpTotalPaths(topks.slice(index + 1)));
-    const numPaths = mtpTotalPaths(topks);
     const numAccepted: number[] = [];
     const acceptedTokens: number[][] = [];
     const replacements: number[] = [];
     const acceptedNodes: number[][] = [];
-    for (let batch = 0; batch < batchSize; batch++) {
-      let bestPath = 0;
-      let bestAccepted = -1;
-      let replacement = -1;
-      const argmaxOffset = batch * numVerificationTokens;
-      for (let path = 0; path < numPaths; path++) {
-        let accepted = 0;
-        let node = 0;
-        for (let layer = 0; layer < topks.length; layer++) {
-          const digit = mtpPathDigit(topks, path, layer, strides);
-          const child = mtpChildIndex(targetTopks, node, digit, targetBoundaries);
-          if (verificationTokens[batch][child] !== argmaxBuf.readInt32LE((argmaxOffset + node) * I32)) {
-            break;
+    {
+      const argmaxBuf = argmaxHost.readPinnedBuffer();
+      const targetBoundaries = mtpDepthBoundaries(targetTopks);
+      const strides = topks.map((_, index) => mtpTotalPaths(topks.slice(index + 1)));
+      const numPaths = mtpTotalPaths(topks);
+      for (let batch = 0; batch < batchSize; batch++) {
+        let bestPath = 0;
+        let bestAccepted = -1;
+        let replacement = -1;
+        const argmaxOffset = batch * numVerificationTokens;
+        for (let path = 0; path < numPaths; path++) {
+          let accepted = 0;
+          let node = 0;
+          for (let layer = 0; layer < topks.length; layer++) {
+            const digit = mtpPathDigit(topks, path, layer, strides);
+            const child = mtpChildIndex(targetTopks, node, digit, targetBoundaries);
+            if (verificationTokens[batch][child] !== argmaxBuf.readInt32LE((argmaxOffset + node) * I32)) {
+              break;
+            }
+            accepted++;
+            node = child;
           }
-          accepted++;
-          node = child;
+          if (accepted > bestAccepted) {
+            bestAccepted = accepted;
+            bestPath = path;
+            replacement = argmaxBuf.readInt32LE((argmaxOffset + node) * I32);
+          }
         }
-        if (accepted > bestAccepted) {
-          bestAccepted = accepted;
-          bestPath = path;
-          replacement = argmaxBuf.readInt32LE((argmaxOffset + node) * I32);
+        const tokens: number[] = [];
+        const nodes = [0];
+        let node = 0;
+        for (let layer = 0; layer < bestAccepted; layer++) {
+          node = mtpChildIndex(targetTopks, node, mtpPathDigit(topks, bestPath, layer, strides), targetBoundaries);
+          tokens.push(verificationTokens[batch][node]);
+          nodes.push(node);
         }
+        numAccepted.push(bestAccepted);
+        acceptedTokens.push(tokens);
+        replacements.push(replacement);
+        acceptedNodes.push(nodes);
       }
-      const tokens: number[] = [];
-      const nodes = [0];
-      let node = 0;
-      for (let layer = 0; layer < bestAccepted; layer++) {
-        node = mtpChildIndex(targetTopks, node, mtpPathDigit(topks, bestPath, layer, strides), targetBoundaries);
-        tokens.push(verificationTokens[batch][node]);
-        nodes.push(node);
-      }
-      numAccepted.push(bestAccepted);
-      acceptedTokens.push(tokens);
-      replacements.push(replacement);
-      acceptedNodes.push(nodes);
     }
 
     const finishCounts = numAccepted.map(value => value + 1);
@@ -1252,8 +1274,6 @@ export class Glm51Model extends ChatModel {
     const commitState = ws.planPrefill(this, batchSize, finishCounts, cache);
     commitState.setInput(acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]));
     const committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
-    const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
-    const seed = ws.ensureAlloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16", `glm51_mtp_seed_${topks.join("_")}`);
     for (const layer of artifacts.kvCacheLayers) {
       using appendCkv = layer.appendCkv;
       using appendKpe = layer.appendKpe;
@@ -1293,15 +1313,20 @@ export class Glm51Model extends ChatModel {
     }
 
     const rowBytes = this.cfg.hiddenSize * BF16;
-    for (let batch = 0; batch < batchSize; batch++) {
-      const finalNode = acceptedNodes[batch][acceptedNodes[batch].length - 1];
-      const source = batch * numVerificationTokens + finalNode;
-      seed.memcpy2d(batch * rowBytes, rowBytes, mtpHiddenStaging, source * rowBytes, rowBytes, rowBytes, 1, MemcpyKind.DeviceToDevice);
+    {
+      using mtpHiddenStaging = artifacts.mtpHiddenStaging;
+      mtpHiddenStaging.resumeTracking();
+      for (let batch = 0; batch < batchSize; batch++) {
+        const finalNode = acceptedNodes[batch][acceptedNodes[batch].length - 1];
+        const source = batch * numVerificationTokens + finalNode;
+        artifacts.seed.memcpy2d(batch * rowBytes, rowBytes, mtpHiddenStaging, source * rowBytes, rowBytes, rowBytes, 1, MemcpyKind.DeviceToDevice);
+      }
     }
 
     const draftPlan = this.planMtpDraftDepths(ws, cache, committedAllocLens, topks);
     const treeHost = ws.ensureAllocPinned([ws.maxBatch * numTreeNodes], "I32", `glm51_mtp_draft_host_${numTreeNodes}`);
     const draftInputs: { [name: string]: Tensor } = {
+      seed: artifacts.seed,
       sharedSlots: artifacts.sharedSlots,
       sharedSlotsLength: artifacts.sharedSlotsLength,
     };
@@ -1311,7 +1336,7 @@ export class Glm51Model extends ChatModel {
       inputs: draftInputs,
       captureKey: ["glm51-mtp-draft", topks.join(","), `batchSize:${batchSize}`],
       run: (inputs) => {
-        this.runMtpDraft(ws, topks, batchSize, seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
+        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
       },
     });
 
@@ -1319,12 +1344,13 @@ export class Glm51Model extends ChatModel {
       cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
     }
     const treeBuf = treeHost.readPinnedBuffer();
+    const treeTokens = Array.from({ length: batchSize }, (_, batch) =>
+      Array.from({ length: numTreeNodes }, (_, node) => treeBuf.readInt32LE((batch * numTreeNodes + node) * I32)));
     completed = true;
     return {
       draft: {
         targetTokens: replacements,
-        treeTokens: Array.from({ length: batchSize }, (_, batch) =>
-          Array.from({ length: numTreeNodes }, (_, node) => treeBuf.readInt32LE((batch * numTreeNodes + node) * I32))),
+        treeTokens,
         topks,
       },
       tokens: acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]),

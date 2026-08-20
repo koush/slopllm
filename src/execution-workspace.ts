@@ -407,7 +407,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     };
   }
 
-  async withTrackingAsync<T>(fn: () => Promise<T>, keepExports = new Set<Tensor>()): Promise<T> {
+  async withTrackingAsync<T>(keepExports = new Set<Tensor>(), fn: () => Promise<T>): Promise<T> {
     using _tracking = this.startTracking(keepExports);
     return await fn();
   }
