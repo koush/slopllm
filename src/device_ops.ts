@@ -30,8 +30,20 @@ export interface StridedMmap {
 // a slots buffer is only meaningful alongside the length that bounds it.
 export type SlotSet = { slots: Tensor, length: Tensor };
 
+export function notifySynchronizedWorkspaces(workspaces: WeakRef<WorkspaceBase>[]): void {
+  for (let index = workspaces.length - 1; index >= 0; index--) {
+    const workspace = workspaces[index].deref();
+    if (workspace) {
+      workspace.synchronizeComplete();
+    } else {
+      workspaces.splice(index, 1);
+    }
+  }
+}
+
 export interface DeviceOps extends Disposable {
   readonly worldSize: number;
+  synchronizeListeners: WeakRef<WorkspaceBase>[];
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined): Tensor;
   synchronize(): void;

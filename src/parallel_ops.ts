@@ -1,4 +1,4 @@
-import { DeviceOps, MaskMode, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
 import { Glm51Config } from "./glm51_model";
@@ -2078,6 +2078,7 @@ class P2PAllReduceGroup {
 export class ParallelOps implements DeviceOps {
   readonly devices: readonly GlmOps[];
   readonly worldSize: number;
+  synchronizeListeners: WeakRef<WorkspaceBase>[] = [];
   readonly comms: number[];
   private readonly shardWorkspaces = new WeakMap<WorkspaceBase, WorkspaceBase[]>();
   /** Lazy-initialized P2P groups per stream. */
@@ -2632,6 +2633,7 @@ export class ParallelOps implements DeviceOps {
         using _ = w.startTracking();
       }
     }
+    notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
   async synchronizeAsync(): Promise<void> {
@@ -2642,6 +2644,7 @@ export class ParallelOps implements DeviceOps {
         using _ = w.startTracking();
       }
     }
+    notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
   synchronizeStream(streamIdx: number): void {

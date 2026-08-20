@@ -9,12 +9,23 @@ export class WorkspaceBase implements Disposable {
   staged = new Set<Tensor>();
   disposedDevice = new Set<Tensor>();
   disposedHost = new Set<Tensor>();
+  synchronizingHost = new Set<Tensor>();
   frozen = false;
   allocLogger = false;
   tracking: Disposable & { [Symbol.dispose](): void } | null = null;
+  private readonly synchronizeRef: WeakRef<WorkspaceBase>;
 
   constructor(glm: DeviceOps) {
     this.glm = glm;
+    this.synchronizeRef = new WeakRef(this);
+    this.glm.synchronizeListeners.push(this.synchronizeRef);
+  }
+
+  synchronizeComplete(): void {
+    for (const tensor of this.synchronizingHost) {
+      this.disposedHost.add(tensor);
+    }
+    this.synchronizingHost.clear();
   }
 
   startTracking(keepExports = new Set<Tensor>()): Disposable & { [Symbol.dispose](): void } {
@@ -169,6 +180,10 @@ export class WorkspaceBase implements Disposable {
   }
 
   free(): void {
+    const synchronizeIndex = this.glm.synchronizeListeners.indexOf(this.synchronizeRef);
+    if (synchronizeIndex !== -1) {
+      this.glm.synchronizeListeners.splice(synchronizeIndex, 1);
+    }
     for (const tensor of this.tensors.values()) {
       tensor.free();
     }
@@ -181,6 +196,9 @@ export class WorkspaceBase implements Disposable {
     for (const tensor of this.disposedDevice) {
       tensor.free();
     }
+    for (const tensor of this.synchronizingHost) {
+      tensor.free();
+    }
     for (const tensor of this.staged) {
       tensor.free();
     }
@@ -188,6 +206,7 @@ export class WorkspaceBase implements Disposable {
     this.tracked.clear();
     this.disposedHost.clear();
     this.disposedDevice.clear();
+    this.synchronizingHost.clear();
     this.staged.clear();
   }
 

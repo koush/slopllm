@@ -247,7 +247,7 @@ export abstract class Tensor implements Disposable {
     }
     if (this.data === 0) return;
     if (this.pinned)
-      this.workspace.disposedHost.add(this);
+      this.workspace.synchronizingHost.add(this);
     else
       this.workspace.disposedDevice.add(this);
   }

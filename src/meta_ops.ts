@@ -1,4 +1,4 @@
-import { DeviceOps, MaskMode, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
 import { MemcpyKind } from "./sampling";
@@ -277,6 +277,7 @@ export class MetaTensor extends Tensor {
 
 export class MetaOps implements DeviceOps {
     readonly worldSize = 1;
+    synchronizeListeners: WeakRef<WorkspaceBase>[] = [];
     totalAllocs = 0;
     totalBytes = 0;
 
@@ -298,10 +299,11 @@ export class MetaOps implements DeviceOps {
     }
 
     synchronize(): void {
+        notifySynchronizedWorkspaces(this.synchronizeListeners);
     }
 
-    synchronizeAsync(): Promise<void> {
-        return Promise.resolve();
+    async synchronizeAsync(): Promise<void> {
+        notifySynchronizedWorkspaces(this.synchronizeListeners);
     }
 
     synchronizeStream(streamIdx: number): void {

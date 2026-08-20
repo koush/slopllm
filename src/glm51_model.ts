@@ -125,7 +125,7 @@ function ensureMtpTargetMask(ws: ExecutionWorkspace, topks: readonly number[]) {
   let mask = ws.tensors.get(`glm51_mtp_target_mask_${key}`);
   let indptr = ws.tensors.get(`glm51_mtp_target_mask_indptr_${key}`);
   if (!mask || !indptr) {
-    const maskH = ws.allocPinned([ws.maxBatch * byteLen], "U8", `glm51_mtp_target_mask_host_${key}`);
+    using maskH = ws.allocPinned([ws.maxBatch * byteLen], "U8");
     const boundaries = mtpDepthBoundaries(topks);
     maskH.withPinnedBuffer(buf => {
       buf.fill(0);
@@ -144,7 +144,7 @@ function ensureMtpTargetMask(ws: ExecutionWorkspace, topks: readonly number[]) {
         }
       }
     });
-    const indptrH = ws.allocPinned([ws.maxBatch + 1], "I32", `glm51_mtp_target_mask_indptr_host_${key}`);
+    using indptrH = ws.allocPinned([ws.maxBatch + 1], "I32");
     indptrH.withPinnedBuffer(buf => {
       for (let batch = 0; batch <= ws.maxBatch; batch++) {
         buf.writeInt32LE(batch * byteLen, batch * I32);
@@ -169,7 +169,7 @@ function ensureMtpChunkMask(ws: ExecutionWorkspace, topks: readonly number[], de
   let indptr = ws.tensors.get(`glm51_mtp_chunk_mask_indptr_${key}`);
   let maskKvLen = ws.tensors.get(`glm51_mtp_chunk_mask_kvlen_${key}`);
   if (!mask || !indptr || !maskKvLen) {
-    const maskH = ws.allocPinned([ws.maxBatch * byteLen], "U8", `glm51_mtp_chunk_mask_host_${key}`);
+    using maskH = ws.allocPinned([ws.maxBatch * byteLen], "U8");
     maskH.withPinnedBuffer(buf => {
       buf.fill(0);
       for (let batch = 0; batch < ws.maxBatch; batch++) {
@@ -184,13 +184,13 @@ function ensureMtpChunkMask(ws: ExecutionWorkspace, topks: readonly number[], de
         }
       }
     });
-    const indptrH = ws.allocPinned([ws.maxBatch + 1], "I32", `glm51_mtp_chunk_mask_indptr_host_${key}`);
+    using indptrH = ws.allocPinned([ws.maxBatch + 1], "I32");
     indptrH.withPinnedBuffer(buf => {
       for (let batch = 0; batch <= ws.maxBatch; batch++) {
         buf.writeInt32LE(batch * byteLen, batch * I32);
       }
     });
-    const maskKvLenH = ws.allocPinned([ws.maxBatch], "I32", `glm51_mtp_chunk_mask_kvlen_host_${key}`);
+    using maskKvLenH = ws.allocPinned([ws.maxBatch], "I32");
     maskKvLenH.withPinnedBuffer(buf => {
       for (let batch = 0; batch < ws.maxBatch; batch++) {
         buf.writeInt32LE(maskKvLenValue, batch * I32);
@@ -1081,7 +1081,6 @@ export class Glm51Model extends ChatModel {
 
     const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
     const seed = ws.ensureAlloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16", `glm51_mtp_seed_${topks.join("_")}`);
-    const targetDevice = ws.ensureAlloc([ws.maxBatch], "I32", "glm51_mtp_target_tokens");
     const targetHost = ws.ensureAllocPinned([ws.maxBatch], "I32", "glm51_mtp_target_tokens_host");
     const numTreeNodes = mtpTotalTreeNodes(topks);
     const treeHost = ws.ensureAllocPinned([ws.maxBatch * numTreeNodes], "I32", `glm51_mtp_draft_host_${numTreeNodes}`);
@@ -1093,6 +1092,7 @@ export class Glm51Model extends ChatModel {
       inputs: {},
       captureKey: [],
       run: () => {
+        using targetDevice = ws.alloc([ws.maxBatch], "I32");
         using hiddenStates = this.forwardModel(prefillState, sharedSlots, sharedSlotsLength);
         using logits = prefillState.computeLogits(hiddenStates, this);
         using target = logits.argmax();

@@ -1,5 +1,5 @@
 import { Allocator, ArenaAllocator } from "./allocator";
-import { DeviceOps, MaskMode, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
 import { Tensor } from "./tensor";
@@ -698,6 +698,7 @@ export class GlmTensor extends Tensor {
 
 export class GlmOps implements DeviceOps {
   readonly worldSize = 1;
+  synchronizeListeners: WeakRef<WorkspaceBase>[] = [];
   ctx: number;
   device: number;
   allocator: Allocator;
@@ -768,10 +769,12 @@ export class GlmOps implements DeviceOps {
 
   synchronize(): void {
     getNativeAddon().synchronize(this.ctx);
+    notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
-  synchronizeAsync(): Promise<void> {
-    return getNativeAddon().synchronizeAsync(this.ctx);
+  async synchronizeAsync(): Promise<void> {
+    await getNativeAddon().synchronizeAsync(this.ctx);
+    notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
   synchronizeStream(streamIdx: number): void {
