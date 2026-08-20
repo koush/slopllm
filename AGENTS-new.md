@@ -1,0 +1,242 @@
+# GLM.js Architecture Notes
+
+## Overview
+
+TypeScript inference engine for the GLM-5.1 model on NVIDIA GPUs. Ships a native C++/CUDA addon (`glm.node`) wrapped by TypeScript operator classes. Supports multi-GPU via tensor parallelism and context parallelism, CUDA graph capture for decode and prefill, and paged KV caching with prefix sharing. Qwen3 and Qwen3.5 are also implemented but serve primarily as broader correctness test targets, not production targets.
+
+## Core Abstractions
+
+### Tensor (`src/tensor.ts`)
+- Abstract base class. Concrete implementations: `GlmTensor` (single GPU) and `ParallelTensor` (multi-GPU).
+- Each tensor owns a GPU memory pointer (`data`), shape, dtype, and a reference to its `WorkspaceBase`.
+- Operations (`.linear()`, `.rmsnorm()`, `.bmm()`, etc.) allocate output tensors from the workspace and call into the native addon.
+- `SamplingWorkspace` extends `WorkspaceBase` for GPU-side top-k/top-p sampling with repetition penalty.
+
+### Workspace (`src/workspace.ts`)
+- `WorkspaceBase` manages GPU memory lifecycle via **dispose-recycle pooling**:
+  - `alloc()` → checks `disposed` set for best-fit reuse; only calls `newTensor()` (real GPU alloc) if no match found.
+  - `disposed` set: tensors whose `[Symbol.dispose]()` was called but whose memory hasn't been freed. Next alloc reuses the pointer.
+  - Named tensors: re-allocating with the same name disposes the old one, recycling its memory.
+  - **`freeze()`**: after model loading, prevents further allocations — all weight addresses are stable for graph capture.
+  - **`startTracking()`**: returns a scope that disposes all unnamed temporaries when exited, returning their memory to the pool for the next forward pass.
+- This pattern is what makes the inference loop graph-capturable: the same GPU addresses are reused each step deterministically.
+
+### Tensor Lifetime and `using` Pattern
+
+Tensors implement `Disposable` via `[Symbol.dispose]()`. TypeScript 5.2+ explicit resource management (`using`) provides scoped cleanup:
+
+```typescript
+// Forward pass: startTracking creates a scope where all unnamed allocs are tracked.
+// When the scope exits, every tracked tensor is disposed → its GPU memory returns
+// to the workspace's "disposed" pool for reuse next step. Same addresses, deterministic.
+using _tracker = ws.startTracking();
+{
+  // Unnamed allocs go into the tracked set. On warmup step, these are real GPU allocations.
+  // On subsequent steps, ws.alloc() finds a matching buffer in the "disposed" pool
+  // and reuses it deterministically — same GPU address each time → graph capturable.
+  using gateBuf = ws.alloc([BS, intermediate], "BF16");  // disposed when this block exits
+  normed.linear(weights.gate_proj, BS, gateBuf);
+  using upBuf = ws.alloc([BS, intermediate], "BF16");    // disposed when this block exits
+  normed.linear(weights.up_proj, BS, upBuf);
+  using siluBuf = gateBuf.siluAndMul(upBuf, intermediate, BS);
+  // gateBuf, upBuf, siluBuf all disposed here ←
+}
+// All tracked tensors disposed here ← (when _tracker goes out of scope)
+// Next forward pass: same alloc sequence → same addresses from disposed pool → CUDA graph replay safe
+
+// Named tensors (model weights) throw on dispose — they persist for the model's lifetime
+const w = ws.alloc([N, K], "BF16", "model.layers.0.mlp.gate_proj.weight");
+
+// removeTracking() opts out: tensor survives the tracking scope (used for forward outputs)
+const output = hiddenStates.linear(lmHead, BS);
+return output.removeTracking();  // caller is responsible for disposing this
+```
+
+Here's another example that demonstrates stream mechanics, tensors created in a stream are delay disposed when the stream goes out of scope:
+
+```typescript
+using _tracker = ws.startTracking();
+{
+  using stream = ws.glm.withStream(() => {
+    using gateBuf = ws.alloc([BS, intermediate], "BF16");  // disposed when this block exits
+    normed.linear(weights.gate_proj, BS, gateBuf);
+    using upBuf = ws.alloc([BS, intermediate], "BF16");    // disposed when this block exits
+    normed.linear(weights.up_proj, BS, upBuf);
+    using siluBuf = gateBuf.siluAndMul(upBuf, intermediate, BS);
+    // gateBuf, upBuf, siluBuf are NOT disposed here ←
+  });
+
+  // make the default/current stream wait for the other stream
+  stream.streamWaitEvent();
+  // stream is disposed here when it goes out of scope, and NOW gateBuf, upBuf, and siluBuf are placed back into the workspace.
+}
+```
+
+Key rules:
+- Named tensors (allocated with a name) cannot be disposed — they live until replaced or the workspace is freed.
+- `using` on an unnamed tensor auto-disposes at block scope exit.
+- `startTracking()` / its `[Symbol.dispose]()` cleans up all tracked tensors at once — cheaper than individual `using` per tensor in hot loops.
+- `removeTracking()` moves a tensor from `tracked` to `exported`, exempting it from the bulk dispose.
+
+### Allocator (`src/allocator.ts`)
+- `ArenaAllocator`: bump allocator with 256-byte alignment. `free()` is a no-op. Used for the weight arena when `--arena` flag is set — a single large `cudaMalloc` carved up linearly.
+- For non-arena mode, `WorkspaceBase` uses `GlmOps.alloc/free` (real `cudaMalloc`/`cudaFree`) but the dispose-recycle pool means actual allocations rarely happen after warmup.
+
+### GlmOps (`src/glm_ops.ts`)
+- Single-GPU device backend. Wraps the native addon (`glm.node`).
+- Owns CUDA context, stream management (7 alternate streams via `withStream()`), and the allocator.
+- CUDA graph API: `graphBeginCapture/EndCapture/Instantiate/Launch/Destroy`.
+- FlashInfer integration: plan/run split for batch prefill/decode and MLA attention.
+- NCCL and P2P primitives exposed for `ParallelOps`.
+
+### ParallelOps (`src/parallel_ops.ts`)
+- Multi-GPU backend implementing `DeviceOps`. Wraps N `GlmOps` instances.
+- `ParallelTensor`: has N shards (one per GPU), delegates ops to each shard, inserts collective communication (AllReduce, AllGather) as needed based on `TensorParallelism` annotations.
+- `TensorParallelism` enum: `Replicated`, `Column` (output-dim sharded), `Row` (input-dim sharded), `PartialSum` (needs AllReduce), `PartialSoftmax` (for CP merge).
+- Communication: NCCL AllReduce/AllGather for large tensors; custom P2P kernels for small AllReduce/AllGather (≤8192 elements) and fused RMSNorm+AllReduce.
+- Per-device shard workspaces created lazily via `getShardWorkspaces()`.
+
+## Tensor Parallelism
+
+Weight parallelism is assigned per-tensor during loading:
+- **Column**: gate_proj, up_proj, embed_tokens, q_nope_proj, k_nope_proj, absorbed weight (output dim sharded across GPUs; linear output is Row-parallel)
+- **Row**: o_proj, down_proj, lm_head (input dim sharded; linear output is PartialSum, needs AllReduce)
+- **Replicated**: norms, bias, RoPE freqs, position IDs, q_pe_proj, v_proj, ckv_proj, k_pe_proj
+
+Linear op parallelism rules (weight × input → output):
+- Column × Replicated → Row (no comm)
+- Row × Row → PartialSum (AllReduce needed)
+- Replicated × Replicated → Replicated (no comm)
+- Row weight → AllGather weight to Replicated, then proceed (K-dim mismatch)
+- Row input → AllGather input to Replicated, then proceed (K-dim mismatch)
+
+## Context Parallelism (Interleaved Token-per-GPU)
+
+When `--cp` flag is set (GLM-5.1 only), GPUs operate as context-parallel shards for attention while retaining tensor-parallel sharding for linear layers:
+
+- **KV cache is Row-sharded**: each GPU stores every Nth token's KV (tokens interleaved across GPUs). `PagedKVCache` uses `TensorParallelism.Row` for ckv/kpe tensors.
+- **MLA weights split by role**:
+  - **Replicated in CP** (were Column in TP-only): q_pe_proj, v_proj — so each GPU can compute attention independently over its KV shard.
+  - **Still Column-parallel in CP**: q_nope_proj, k_nope_proj, absorbed weight — the absorbed weight is computed from k_nope_proj × q_nope_proj BMM (Column × Column → Column). This causes Q to be Row-parallel after the absorbed projection, requiring an AllGather to Replicated before attention.
+  - **Still Row/Column-parallel in CP**: o_proj (Row → AllReduce), down_proj (Row → AllReduce), gate_proj/up_proj (Column) — same as TP-only mode.
+- **Position IDs**: decode/prefill kernels receive `cpWorldSize=N` and `cpRank=i`. The CUDA kernel assigns position `i, i+N, i+2N, ...` to GPU `i`.
+- **Prefill**: Each GPU runs MLA prefill over its token subset with `cpWorldSize`/`cpRank` params. The FlashInfer plan computes `effectivePageSize = pageSize / worldSize` and `effectiveNumHeads = numHeads` (not sharded). Output is `PartialSoftmax` — each shard has partial attention output + log-sum-exp.
+- **CP Merge**: After prefill/decode, partial softmax outputs are combined across GPUs using the online softmax trick: `merged_v = Σ(exp(lse_i - lse_max) * v_i) / Σ(exp(lse_i - lse_max))`. Two paths:
+  - **P2P fast path** (small batches, decode): single barrier + flat all-to-all merge kernel. Each GPU reads all N peers' data via P2P and merges in one kernel launch. Gated by a element-count threshold.
+  - **AG+RS** (prefill, large batches): AllGather LSE (tiny), correct v_out in-place by rescaling with `exp2(lse_local - global_lse)`, transpose v_out to `[N, B, H/N, D]`, then ReduceScatter — each rank receives its head group summed across all GPUs. Communication per rank: `(N-1)/N × B×H×D` vs `log2(N) × B×H×D` for the old butterfly.
+- **Page allocation**: `PagedKVCache` distributes pages round-robin across GPUs. Page `p` is stored on GPU `p % worldSize`. The effective page size per GPU is `pageSize / worldSize`.
+
+## Paged KV Cache (`src/paged_kv.ts`)
+
+- Fixed `PAGE_SIZE=64` tokens per page. Pages are ref-counted for prefix sharing (only full pages are shared; partial last pages are copied).
+- `Sequence`: ordered list of pages tracking `allocLen` and `tokenIds`.
+- `PagedKVCache` extends `WorkspaceBase` — KV cache tensors (`kData[]`/`vData[]` or `ckvData[]`/`kpeData[]`) are pre-allocated GPU buffers indexed by layer and page ID.
+- Dirty flags (`pagesDirtyHost`, `pagesDirtyDevice`, `positionIdsDirty`) control conditional updates — plan calls and host→device copies are skipped if nothing changed.
+- MLA path: uses `ckvData[layer]` `[maxPages, pageSize, kvLoraRank]` and `kpeData[layer]` `[maxPages, pageSize, qkRopeDim]` instead of separate K/V.
+- Standard path: uses `kData[layer]` `[maxPages, nKv*pageSize*hd]` and `vData[layer]`.
+
+## Execution Workspace (`src/execution-workspace.ts`)
+
+- `ExecutionWorkspace` extends `WorkspaceBase`, pre-allocating all GPU and pinned buffers needed for prefill/decode at construction time. No GPU allocations happen in the hot path.
+- `ExecutionState`: holds per-step context (batchSize, totalTokens, seqLens, isDecode, cache reference).
+- **Plan/Run split**:
+  - `planPrefill()`: allocates pages, fills indptr/positionIds/slotMapping on host, calls FlashInfer plan kernel, copies indices to device.
+  - `planDecode()`: allocates decode token pages, updates position IDs (only if dirty), calls FlashInfer decode plan (only if pages changed), copies indices.
+  - `forwardPrefill/forwardDecode()`: runs the model forward pass using the planned state.
+- FlashInfer plan writes workspace buffers (floatWs, intWs, planInfo). Run reads them. This split is essential for CUDA graph capture — plan runs outside the graph, run is captured.
+
+## CUDA Graph Capture (`src/capture-manager.ts`)
+
+- `CaptureManager`: key → `{warmupSteps, graphExec}`. First 3 calls run eagerly (warmup). On the 3rd warmup call, `graphBeginCapture()` is called, the lambda runs, then `graphEndCapture()` + `graphInstantiate()`. Subsequent calls with the same key launch the cached graph directly via `graphLaunch()`.
+- Works because all GPU pointers are stable (workspace recycling). The plan step (which writes to plan buffers and may change kernel selection) runs outside the graph.
+- Decode path: `captureManager.run(() => { inputIdsBuf.memcpy, decodeStep, model.forward, computeLogits, doSample }, ['decode'])`.
+
+## Model Loading (`src/chat_model.ts`, `src/glm51_model.ts`)
+
+- `ChatModel` extends `WorkspaceBase` — the model IS its weight workspace.
+- `fromPretrained(modelDir)`: scans for safetensors files, memory-maps each shard, calls `loadTensor()` for each weight. After loading, calls `freeze()` to lock the workspace.
+- `loadTensor()` is model-specific:
+  - GLM-5.1: splits MLA fused weights (q_b_proj → q_nope_proj + q_pe_proj, kv_b_proj → k_nope_proj + v_proj), computes absorbed weight (k_nope_proj @ q_nope_proj), handles NVFP4 scale renaming.
+  - Weights are loaded with mmap+DMA (`mmapLoadAsync`) for zero-copy GPU upload.
+  - F32 weights (norms, A_log) are converted to BF16 on load.
+
+## Inference Flow
+
+1. **Prefill**: `planPrefill()` → `prepareInput()` → `forwardInput()` → `model.forward(state)` → `computeLogits()`
+2. **Decode loop**: `planDecode()` → `captureManager.run({ inputIdsBuf.memcpy, decodeStep, model.forward, computeLogits, doSample })` → copy token to host → `reportTokens()` → yield
+
+## Scratchpad
+
+The `scratchpad/` directory is gitignored and intended for ad-hoc scripts, diagnostics, and experimentation. It is not checked in — use it for anything temporary that shouldn't pollute the repo (e.g., comparing hidden states across layers, debugging KV cache issues, testing new kernels in isolation).
+
+## Testing
+
+```bash
+npm run build:all          # build CUDA addon + TypeScript (required before any tests)
+npm run test:python        # Python tests: pytest tests/python/ - validates CUDA kernels against PyTorch
+npm run test:node          # TypeScript tests: end-to-end model inference via tsx --test
+npm test                   # runs both
+# individual tests:
+cd tests/python && pytest -v test_linear.py   # single Python test
+pytest -v test_linear.py            # specific GPU
+npx tsx --test tests/test_glm51.ts            # single TS test
+npx tsx --test tests/test_parallel.ts  # multi-GPU
+```
+
+## Key Design Decisions
+
+- **Dispose-recycle workspace**: enables CUDA graph capture without explicit memory pool management. Tensors are allocated once, disposed into a pool, and reused at the same addresses.
+- **Pre-allocated buffers**: `ExecutionWorkspace` constructor allocates all plan/work/index buffers. No dynamic GPU allocation during inference.
+- **Plan/Run split**: FlashInfer plan is not graph-capturable (writes host buffers, may compile kernels), but run is. Plan only executes when dirty flags indicate changes.
+- **P2P AllReduce**: custom kernel for small AllReduce/AllGather avoids NCCL overhead for partial sums in tensor-parallel decode.
+- **Multi-stream**: `GlmOps.withStream()` provides alternate CUDA streams with event-based synchronization. Used in GLM-5.1 MoE to overlap shared expert computation with routed expert computation.
+- **Strided mmap loading**: weight tensors loaded via `memcpy2dHostToDeviceAsync` with pitch/width/height for row-parallel or column-parallel sharding, avoiding host-side copies.
+
+## Vendor
+
+The vendor subdirectory contains flashinfer, llama.cpp, vllm, and sglang, and can be serve as a reference for implementations of cuda kernels or other algorithms like MTP. Flashinfer has been forked to add support for context parallelism.
+
+# Workflow
+
+You must NEVER "git commit" unless the user explicitly asks you to commit. If you think the user intends to commit, you must ask for permission per commit. There may be multiple changes that may need to be in multiple commits. You must not proactively commit a change just because you made a prior commit. You must wait for explicit permission to commit every change to ensure the user has fully reviewed it. Instructions to make a change is not implicit permission to commit. Permission to commit is only for a single commit.
+
+You must NEVER use "git stash pop" to reapply stashed changes. You MUST use "git stash apply" instead. "git stash pop" is potentially destructive and may cause data loss when used in conjunction with an coding agent harness rollback. The user will clean up any entries left behind from usage of "git stash apply".
+
+# Production GLM-5.1 Model Config (zai-org/GLM-5.1)
+
+Model Path:
+`/mnt/storage/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/`
+
+| Key | Value |
+|---|---|
+| architectures | GlmMoeDsaForCausalLM |
+| model_type | glm_moe_dsa |
+| dtype | bfloat16 |
+| hidden_size | 6144 |
+| intermediate_size | 12288 |
+| moe_intermediate_size | 2048 |
+| num_hidden_layers | 78 |
+| num_attention_heads | 64 |
+| num_key_value_heads | 64 |
+| kv_lora_rank | 512 (attn output dim, input to v_expand) |
+| q_lora_rank | 2048 |
+| qk_nope_head_dim | 192 |
+| qk_rope_head_dim | 64 |
+| qk_head_dim | 256 (= qk_nope + qk_rope) |
+| v_head_dim | 256 (output of v_expand; note: ≠ qk_nope_head_dim) |
+| head_dim | 192 (= qk_nope_head_dim) |
+| n_routed_experts | 256 |
+| n_shared_experts | 1 |
+| num_experts_per_tok | 8 |
+| routed_scaling_factor | 2.5 |
+| scoring_func | sigmoid |
+| topk_method | noaux_tc |
+| index_topk | 2048 |
+| index_head_dim | 128 |
+| index_n_heads | 32 |
+| first_k_dense_replace | 3 |
+| num_nextn_predict_layers | 1 |
+| max_position_embeddings | 202752 |
+| vocab_size | 154880 |
+| rms_norm_eps | 1e-05 |
+| rope_interleave | true |
