@@ -44,7 +44,7 @@ function preserveExecutionInputs(inputs: { [name: string]: Tensor }): Set<Tensor
 }
 
 export async function executePlan<T>(captureManager: CaptureManager, ws: ExecutionWorkspace, plan: ExecutionPlan<T>): Promise<ExecutionPlanResult<T>> {
-  let tracking: (Disposable & { [Symbol.dispose](): void }) | undefined = ws.startTracking();
+  // let tracking: (Disposable & { [Symbol.dispose](): void }) | undefined = ws.startTracking();
   let completed = false;
   let warmup = false;
   try {
@@ -65,9 +65,10 @@ export async function executePlan<T>(captureManager: CaptureManager, ws: Executi
       const next = plan.next(phaseResult);
       if (!next.done) {
         const keepExports = preserveExecutionInputs(next.value.inputs);
-        tracking[Symbol.dispose]();
-        tracking = undefined;
-        tracking = ws.startTracking(keepExports);
+        ws.clearTracking(keepExports);
+      }
+      else {
+        ws.clearTracking();
       }
       step = next;
     }
@@ -77,7 +78,6 @@ export async function executePlan<T>(captureManager: CaptureManager, ws: Executi
     try {
       if (!completed) plan.return(undefined as never);
     } finally {
-      tracking?.[Symbol.dispose]();
     }
   }
 }
@@ -407,16 +407,18 @@ export class ExecutionWorkspace extends WorkspaceBase {
     };
   }
 
+  clearTracking(keepExports = new Set<Tensor>()): void {
+    this._clearTracking(keepExports);
+    this.planSlot = 0;
+  }
+
   async withTrackingAsync<T>(keepExports = new Set<Tensor>(), fn: () => Promise<T>): Promise<T> {
     using _tracking = this.startTracking(keepExports);
     return await fn();
   }
 
   private nextPlanSlot(): number {
-    if (this.tracking !== null) {
       return this.planSlot++;
-    }
-    return 0;
   }
 
   private allocStateBuffers(state: ExecutionState, slot: number, B: number, S: number): void {

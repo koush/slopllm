@@ -1083,14 +1083,14 @@ export class Glm51Model extends ChatModel {
 
     const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
     const numTreeNodes = mtpTotalTreeNodes(topks);
-    using sharedSlots = new UsingHolder<Tensor>(undefined!);
-    using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
 
     const prefillArtifacts = yield* executionPhase({
       states: [prefillState],
       inputs: {},
       captureKey: [],
       run: () => {
+        using sharedSlots = new UsingHolder<Tensor>(undefined!);
+        using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
         const seed = ws.alloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16");
         const targetHost = ws.allocPinned([ws.maxBatch], "I32");
         using targetDevice = ws.alloc([ws.maxBatch], "I32");
@@ -1105,7 +1105,7 @@ export class Glm51Model extends ChatModel {
         using lastHidden = mtpHidden.indexSelect(lastIdx, -1);
         seed.memcpy(lastHidden, lastHidden.bytes, MemcpyKind.DeviceToDevice);
         targetHost.memcpy(targetDevice, batchSize * I32, MemcpyKind.DeviceToHost);
-        return { seed, targetHost };
+        return { seed, targetHost, sharedSlots: sharedSlots.detach(), sharedSlotsLength: sharedSlotsLength.detach() };
       },
     });
 
@@ -1116,13 +1116,16 @@ export class Glm51Model extends ChatModel {
       targetTokens = Array.from({ length: batchSize }, (_, batch) => targetBuf.readInt32LE(batch * I32));
     }
 
+    using seed = prefillArtifacts.seed;
+    using sharedSlots = prefillArtifacts.sharedSlots;
+    using sharedSlotsLength = prefillArtifacts.sharedSlotsLength;
     const draftPlan = this.planMtpDraftDepths(ws, cache, committedAllocLens, topks);
     const draftArtifacts = yield* executionPhase({
       states: draftPlan.states,
       inputs: {
-        seed: prefillArtifacts.seed,
-        sharedSlots: sharedSlots.value,
-        sharedSlotsLength: sharedSlotsLength.value,
+        seed,
+        sharedSlots: sharedSlots,
+        sharedSlotsLength: sharedSlotsLength,
       },
       captureKey: [],
       run: (inputs) => {
@@ -1219,6 +1222,10 @@ export class Glm51Model extends ChatModel {
         };
       },
     });
+
+    using seed = artifacts.seed;
+    using sharedSlots = artifacts.sharedSlots;
+    using sharedSlotsLength = artifacts.sharedSlotsLength;
 
     const numAccepted: number[] = [];
     const acceptedTokens: number[][] = [];
@@ -1319,16 +1326,16 @@ export class Glm51Model extends ChatModel {
       for (let batch = 0; batch < batchSize; batch++) {
         const finalNode = acceptedNodes[batch][acceptedNodes[batch].length - 1];
         const source = batch * numVerificationTokens + finalNode;
-        artifacts.seed.memcpy2d(batch * rowBytes, rowBytes, mtpHiddenStaging, source * rowBytes, rowBytes, rowBytes, 1, MemcpyKind.DeviceToDevice);
+        seed.memcpy2d(batch * rowBytes, rowBytes, mtpHiddenStaging, source * rowBytes, rowBytes, rowBytes, 1, MemcpyKind.DeviceToDevice);
       }
     }
 
     const draftPlan = this.planMtpDraftDepths(ws, cache, committedAllocLens, topks);
     const treeHost = ws.ensureAllocPinned([ws.maxBatch * numTreeNodes], "I32", `glm51_mtp_draft_host_${numTreeNodes}`);
     const draftInputs: { [name: string]: Tensor } = {
-      seed: artifacts.seed,
-      sharedSlots: artifacts.sharedSlots,
-      sharedSlotsLength: artifacts.sharedSlotsLength,
+      seed,
+      sharedSlots,
+      sharedSlotsLength,
     };
 
     yield* executionPhase({

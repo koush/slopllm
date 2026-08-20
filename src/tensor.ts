@@ -183,7 +183,7 @@ export abstract class Tensor implements Disposable {
 
     const disposed = this.pinned ? this.workspace.disposedHost : this.workspace.disposedDevice;
     for (const check of disposed) {
-      if (this.same(check)) {
+      if (this.data === check.data && this.allocSize === check.allocSize) {
         // console.warn('Tensor found in disposed set after uncapture check');
         disposed.delete(check);
         check.detachData();

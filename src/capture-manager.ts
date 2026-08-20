@@ -68,7 +68,7 @@ export class CaptureManager implements Disposable {
             return;
         }
         if (workspace.tracked.size) {
-            throw new Error("Cannot capture a workspace that has tracked tensors");
+            throw new Error("Cannot capture a workspace that has tracked tensors: " + workspace.tracked.size);
         }
         capturedWorkspaces.add(workspace);
     }
@@ -133,7 +133,7 @@ export class CaptureManager implements Disposable {
                         input.unstage();
                     }
                     this.ops.graphLaunch(captured.graphExec);
-                    return mapCaptureTensors(captured.result, tensor => tensor.uncapture().removeTracking());
+                    return mapCaptureTensors(captured.result, tensor => tensor.uncapture());
                 }
 
                 if (captured.warmupSteps === 3) {
@@ -205,7 +205,7 @@ export class CaptureManager implements Disposable {
             }
             this.ops.graphLaunch(captured!.graphExec);
         }
-        return mapCaptureTensors(result, tensor => tensor.removeTracking());
+        return result;
     }
 
     isCaptured(keyParams: any[]): boolean {
