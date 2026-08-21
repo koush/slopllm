@@ -84,10 +84,11 @@ export class WorkspaceBase implements Disposable {
           tensor[Symbol.dispose]();
         }
         ws.tracked.clear();
-        for (const tensor of ws.staged) {
-          ws.tracked.add(tensor);
+        // Restore exports through the tensor API so composite tensors also
+        // unstage their backing shards and views in their owning workspaces.
+        for (const tensor of [...ws.staged]) {
+          tensor.unstage();
         }
-        ws.staged.clear();
         ws.tracking = null;
       },
     };

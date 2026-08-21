@@ -733,12 +733,11 @@ extern "C" {
 
 size_t glm_mma_moe_coop_workspace_size(int count, int N, int K, int num_experts) {
     size_t sorted_input = (size_t)count * K * 2;
-    size_t sorted_output = (size_t)count * N * 2;
     size_t expert_counts = (size_t)num_experts * 4;
     size_t expert_offsets = (size_t)(num_experts + 1) * 4;
     size_t sorted_to_original = (size_t)count * 4;
     size_t tile_counter = 4;
-    return sorted_input + sorted_output + expert_counts + expert_offsets + sorted_to_original + tile_counter;
+    return sorted_input + expert_counts + expert_offsets + sorted_to_original + tile_counter;
 }
 
 void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void* input,
@@ -753,7 +752,6 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void
     uint8_t* ws = static_cast<uint8_t*>(workspace);
     size_t offset = 0;
     __nv_bfloat16* sorted_input = reinterpret_cast<__nv_bfloat16*>(ws + offset); offset += (size_t)count * K * 2;
-    offset += (size_t)count * N * 2; // sorted_output (unused — kernel writes directly to output)
     int* expert_counts = reinterpret_cast<int*>(ws + offset); offset += (size_t)num_experts * 4;
     int* expert_offsets = reinterpret_cast<int*>(ws + offset); offset += (size_t)(num_experts + 1) * 4;
     int* sorted_to_original = reinterpret_cast<int*>(ws + offset); offset += (size_t)count * 4;

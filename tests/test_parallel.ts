@@ -357,6 +357,37 @@ describe("ParallelTensor disposal and recycling", () => {
     glm1.free();
   });
 
+  it("restores exported shards when a tracking scope exits", () => {
+    const glm0 = new GlmOps(0);
+    const glm1 = new GlmOps(1);
+    const po = new ParallelOps([glm0, glm1]);
+    const ws = new WorkspaceBase(po);
+
+    let exported: ParallelTensor;
+    {
+      using _tracker = ws.startTracking();
+      exported = (ws.alloc([8, 4], "F32", undefined, TensorParallelism.Column) as ParallelTensor).removeTracking();
+      const sws = po.shardWorkspacesFor(ws);
+      assert.equal(sws[0].staged.size, 1);
+      assert.equal(sws[1].staged.size, 1);
+    }
+
+    const sws = po.shardWorkspacesFor(ws);
+    assert.equal(sws[0].staged.size, 0, "shard 0 should leave staging with its parent");
+    assert.equal(sws[1].staged.size, 0, "shard 1 should leave staging with its parent");
+    assert.equal(sws[0].tracked.size, 1);
+    assert.equal(sws[1].tracked.size, 1);
+
+    exported![Symbol.dispose]();
+    assert.equal(sws[0].disposedDevice.size, 1, "exported shard 0 should be recyclable");
+    assert.equal(sws[1].disposedDevice.size, 1, "exported shard 1 should be recyclable");
+
+    ws.free();
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
+
   it("different requesting workspaces get isolated shard pools", () => {
     const glm0 = new GlmOps(0);
     const glm1 = new GlmOps(1);
