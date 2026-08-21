@@ -2452,6 +2452,29 @@ static Napi::Value MlaKvCacheAppend(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value IndexerKvCacheAppendFlat(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 9) {
+        Napi::TypeError::New(env, "Expected 9 args (ctx, k_data, append_k, kv_token_indptr, batch_indices, positions, nnz, head_dim, append_stride_n)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_indexer_kv_cache_append_flat(
+        reinterpret_cast<GlmCtx*>((uintptr_t)info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<void*>((uintptr_t)info[1].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>((uintptr_t)info[2].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[3].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[4].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[5].As<Napi::Number>().Int64Value()),
+        info[6].As<Napi::Number>().Uint32Value(),
+        info[7].As<Napi::Number>().Uint32Value(),
+        (size_t)info[8].As<Napi::Number>().Int64Value());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("indexerKvCacheAppendFlat failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value ConcatAndCacheDsMla(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 14) {
@@ -3792,6 +3815,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "mlaDecodePlan"), Napi::Function::New(env, MlaDecodePlan));
     exports.Set(Napi::String::New(env, "mlaDecodeRun"), Napi::Function::New(env, MlaDecodeRun));
     exports.Set(Napi::String::New(env, "mlaKvCacheAppend"), Napi::Function::New(env, MlaKvCacheAppend));
+    exports.Set(Napi::String::New(env, "indexerKvCacheAppendFlat"), Napi::Function::New(env, IndexerKvCacheAppendFlat));
     exports.Set(Napi::String::New(env, "concatAndCacheDsMla"), Napi::Function::New(env, ConcatAndCacheDsMla));
     exports.Set(Napi::String::New(env, "sparseMlaPrefill"), Napi::Function::New(env, SparseMlaPrefill));
     exports.Set(Napi::String::New(env, "sparseMlaDecode"), Napi::Function::New(env, SparseMlaDecode));

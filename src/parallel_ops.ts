@@ -17,9 +17,6 @@ import { WorkspaceBase } from "./workspace";
 // the indexer flat-slot mode (topkToSlots ignores kvTokenIndptr when off)
 // read this so they never diverge.
 export const CP_GATHER_KV = process.env.GLM_CP_GATHER_KV !== "0";
-// When enabled, kData is AllGathered to Replicated before indexerTopk (old path).
-// When disabled, kData stays Row-parallel and a per-shard topk merge is done.
-export const CP_GATHER_KDATA = process.env.GLM_CP_GATHER_KDATA === "1";
 // Fall back to the read-based (pull) CP merge; the push path is the default.
 export const CP_MERGE_PULL = process.env.GLM_CP_MERGE_PULL === "1";
 // Sort the CP top-k merge result ascending by global index. ON by default;
@@ -2076,7 +2073,12 @@ class P2PAllReduceGroup {
 }
 
 interface SparseMlaPrefetchExtra {
-  stream: Disposable & {
+  stream?: Disposable & {
+    result: ParallelTensor;
+    streamWaitEvent(): void;
+    synchronize(): void;
+  };
+  indexerStream?: Disposable & {
     result: ParallelTensor;
     streamWaitEvent(): void;
     synchronize(): void;
@@ -3049,6 +3051,42 @@ export class ParallelOps implements DeviceOps {
       using _ckv = cache.ckv;
       using _kpe = cache.kpe;
     }
+
+    const isIndexer = !pKpeData && !pAppendKpe && headDimKpe === 0;
+    if (isIndexer && contextParallel) {
+      const cfg = state.model.cfg as Glm51Config;
+      const prefetchKey = `sparseMlaPrefetchLayer_${cacheIdx}`;
+      using prefetchedStream = this.takeSparseMlaPrefetchStream(state, prefetchKey, "indexerStream");
+      prefetchedStream?.streamWaitEvent();
+      const prefetched = prefetchedStream?.result;
+
+      if (prefetched) {
+        const pKvTokenIndptr = this.cast(state.kvTokenIndptrD);
+        for (let i = 0; i < this.worldSize; i++) {
+          this.devices[i].indexerKvCacheAppendFlat(
+            prefetched.shards[i], pAppendCkv.shards[i], pKvTokenIndptr.shards[i],
+            pBatchIndices.shards[i], pPositions.shards[i], nnz, headDimCkv,
+            appendCkvStrideN,
+          );
+        }
+        return { ckv: prefetched };
+      }
+
+      if (this.shouldGatherKv(state, false)) {
+        if (cacheIdx !== 0) {
+          throw new Error(`mlaKvCacheAppend: expected indexer prefetch for full layer ${cacheIdx}`);
+        }
+        const pagedKV = state.cache.getPagedKV();
+        return {
+          ckv: this.gatherPages(
+            ckvData, indices, indptr, lastPageLen,
+            state.batchSize,
+            pagedKV.maxPages * pagedKV.pageSize,
+            state.kvTokenIndptrD, true,
+          ),
+        };
+      }
+    }
     return { ckv: pCkvData.viewClone(), kpe: pKpeData?.viewClone() };
   }
 
@@ -3065,28 +3103,22 @@ export class ParallelOps implements DeviceOps {
 
     const pagedKV = state.cache.getPagedKV();
 
-    // get the gathering stream if it is available — retrieve BEFORE cleaning
-    // up the previous layer's entry so that distance-based keys don't
-    // collide (consecutive full layers all share distance 0; cleaning up
-    // first would delete the current layer's own prefetch).
+    // Get this layer's gathering stream before cleaning up a skipped previous
+    // layer. Extras use exact layer keys; buffers use distance-based names.
     const prefetchDist = this.prefetchDistance(cacheIdx, cfg);
-    const prefetchKey = `sparseMlaPrefetch_${prefetchDist}`;
-    const prefetchExtra = state.ws.extras.get(prefetchKey) as SparseMlaPrefetchExtra | undefined;
-    using prefetchedStream = prefetchExtra?.stream;
+    const prefetchBufferKey = `sparseMlaPrefetch_${prefetchDist}`;
+    const prefetchKey = `sparseMlaPrefetchLayer_${cacheIdx}`;
+    using prefetchedStream = this.takeSparseMlaPrefetchStream(state, prefetchKey, "stream");
     prefetchedStream?.streamWaitEvent();
-    state.ws.extras.delete(prefetchKey);
 
     // the previous layer may not be processed due to either incorrect usage (so being defensive here)
     // or because it is an mtp layer that was skipped.
     {
       const prevCacheIndex = (cacheIdx - 1 + pagedKV.ckvData.length) % pagedKV.ckvData.length;
-      const prevDist = this.prefetchDistance(prevCacheIndex, cfg);
-      const prevKey = `sparseMlaPrefetch_${prevDist}`;
-      const existingExtra = state.ws.extras.get(prevKey) as SparseMlaPrefetchExtra | undefined;
-      using existing = existingExtra?.stream;
-      using _existing = existing?.result;
-      state.ws.extras.delete(prevKey);
-      existing?.streamWaitEvent();
+      const prevKey = `sparseMlaPrefetchLayer_${prevCacheIndex}`;
+      if (prevKey !== prefetchKey) {
+        this.cleanupSparseMlaPrefetch(state, prevKey);
+      }
     }
 
     // the gathering stream returns a tensor if its a full gather.
@@ -3101,7 +3133,7 @@ export class ParallelOps implements DeviceOps {
         // stream), so the gathered flat buffer lives as a named workspace
         // tensor materialized by topkToSlots' gatherGroupCkv loop
         // (ensureAlloc), not as a stream result in extras.
-        prefetched = pIndptr.workspace.tensors.get(prefetchKey) as ParallelTensor;
+        prefetched = pIndptr.workspace.tensors.get(prefetchBufferKey) as ParallelTensor;
         if (!prefetched) {
           if (!groupSlots) {
             throw new Error(`sparseMlaPrepareCache: shared layer ${cacheIdx} has no group slots`);
@@ -3111,7 +3143,7 @@ export class ParallelOps implements DeviceOps {
           prefetched = pIndptr.workspace.ensureAlloc(
             [paddedKvLen / shardPageSize, shardPageSize, pKvCache.shape[2]],
             pKvCache.type,
-            prefetchKey,
+            prefetchBufferKey,
           ) as ParallelTensor;
           this.gatherTopkCkv(
             state, kvCache, [prefetched], groupSlots, indices,
@@ -3161,6 +3193,15 @@ export class ParallelOps implements DeviceOps {
     // Do not carry a prefetched tensor across forwardModel's tracking scope.
     // The MTP layer runs in a separate forward and gathers its cache there.
     if (nextCacheIdx < cfg.numHiddenLayers && pagedKV.ckvData[nextCacheIdx]) {
+      const nextKData = pagedKV.kData[nextCacheIdx];
+      const indexerStream = nextKData?.parallelism === TensorParallelism.Row
+        ? this.withStream<ParallelTensor>(() => this.gatherPages(
+            nextKData, indices!, indptr, state.lastPageLen,
+            state.batchSize,
+            pagedKV.maxPages * pagedKV.pageSize,
+            state.kvTokenIndptrD, true,
+          ) as ParallelTensor)
+        : undefined;
       const nextStream = this.withStream<ParallelTensor>(() => {
         const nextKvCache = pagedKV.ckvData[nextCacheIdx];
 
@@ -3174,17 +3215,12 @@ export class ParallelOps implements DeviceOps {
 
       // due to mtp usage being potentially dynamic (mtp or incorrect usage), only clean up after the layer is finished and before a prefetch overwrites.
       {
-        const nextDist = this.prefetchDistance(nextCacheIdx, cfg);
-        const nextKey = `sparseMlaPrefetch_${nextDist}`;
-        const existingExtra = state.ws.extras.get(nextKey) as SparseMlaPrefetchExtra | undefined;
-        using existing = existingExtra?.stream;
-        using _existing = existing?.result;
-        state.ws.extras.delete(nextKey);
-        existing?.streamWaitEvent();
+        const nextKey = `sparseMlaPrefetchLayer_${nextCacheIdx}`;
+        this.cleanupSparseMlaPrefetch(state, nextKey);
       }
 
-      const nextExtra: SparseMlaPrefetchExtra = { stream: nextStream };
-      state.ws.extras.set(`sparseMlaPrefetch_${this.prefetchDistance(nextCacheIdx, cfg)}`, nextExtra);
+      const nextExtra: SparseMlaPrefetchExtra = { stream: nextStream, indexerStream };
+      state.ws.extras.set(`sparseMlaPrefetchLayer_${nextCacheIdx}`, nextExtra);
     }
 
     if (prefetched) {
@@ -3263,12 +3299,35 @@ export class ParallelOps implements DeviceOps {
 
   // Distance from the last full layer: full layers return 0, shared layers
   // return the number of consecutive shared layers since the last full one.
-  // Used as the workspace/extras key so that layers at the same position
-  // within their group reuse the same buffer (4 unique keys instead of 78).
+  // Used as the workspace buffer key so layers at the same position within
+  // their group reuse the same allocation (4 unique keys instead of 78).
   private prefetchDistance(cacheIdx: number, cfg: Glm51Config): number {
     let d = 0;
     for (let i = cacheIdx; i >= 0 && cfg.indexerTypes[i] === "shared"; i--) d++;
     return d;
+  }
+
+  private takeSparseMlaPrefetchStream(state: ExecutionState, key: string, field: "stream" | "indexerStream") {
+    const extra = state.ws.extras.get(key) as SparseMlaPrefetchExtra | undefined;
+    const stream = extra?.[field];
+    if (!extra || !stream) return undefined;
+    delete extra[field];
+    if (!extra.stream && !extra.indexerStream) {
+      state.ws.extras.delete(key);
+    }
+    return stream;
+  }
+
+  private cleanupSparseMlaPrefetch(state: ExecutionState, key: string): void {
+    const extra = state.ws.extras.get(key) as SparseMlaPrefetchExtra | undefined;
+    if (!extra) return;
+    state.ws.extras.delete(key);
+    for (const stream of [extra.indexerStream, extra.stream]) {
+      if (!stream) continue;
+      stream.streamWaitEvent();
+      stream.result[Symbol.dispose]();
+      stream[Symbol.dispose]();
+    }
   }
 
   // determines the gather type to be used depending on the state.
@@ -3493,7 +3552,7 @@ export class ParallelOps implements DeviceOps {
 
   }
 
-  indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void {
+  indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean, kvTokenIndptr?: Tensor): void {
     const pOut = this.cast(out);
     const pQ = this.cast(q);
     const pKData = this.cast(kData);
@@ -3502,8 +3561,9 @@ export class ParallelOps implements DeviceOps {
     const pIndptr = this.cast(pageIndptr);
     const pLastPageLen = this.cast(lastPageLen);
     const pQoIndptr = this.cast(qoIndptr);
+    const pKvTokenIndptr = kvTokenIndptr ? this.cast(kvTokenIndptr) : undefined;
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].indexerScore(pOut.shards[i], pQ.shards[i], pKData.shards[i], pWeights.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal);
+      this.devices[i].indexerScore(pOut.shards[i], pQ.shards[i], pKData.shards[i], pWeights.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal, pKvTokenIndptr?.shards[i]);
     }
   }
 
@@ -3522,9 +3582,7 @@ export class ParallelOps implements DeviceOps {
   indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { values: Tensor, indices: Tensor } {
     const totalQ = idxQ.shape[0];
     using pQ = idxQ.parallelism === TensorParallelism.Replicated ? idxQ.viewClone() as ParallelTensor : this.cast(idxQ).allGather(idxQ.workspace);
-    using pKData = CP_GATHER_KDATA && kData.parallelism === TensorParallelism.Row
-      ? this.cast(kData).allGather(idxQ.workspace)
-      : this.cast(kData).viewClone() as ParallelTensor;
+    using pKData = this.cast(kData).viewClone() as ParallelTensor;
     const pWeights = this.cast(weights);
     const pPageIndices = this.cast(pageIndices);
     const pIndptr = this.cast(indptr);
@@ -3536,9 +3594,11 @@ export class ParallelOps implements DeviceOps {
     const pCustomMask = customMask ? this.cast(customMask) : undefined;
     const pMaskIndptr = maskIndptr ? this.cast(maskIndptr) : undefined;
     const pMaskKvLen = maskKvLen ? this.cast(maskKvLen) : undefined;
+    const flatKData = state.cache.getPagedKV().contextParallel && pKData.parallelism === TensorParallelism.Replicated;
+    const pKvTokenIndptr = flatKData ? this.cast(state.kvTokenIndptrD) : undefined;
 
     const W = this.worldSize;
-    const kDataReplicated = kData.parallelism === TensorParallelism.Replicated;
+    const kDataReplicated = pKData.parallelism === TensorParallelism.Replicated;
     using colIdxQ = this.tryNarrowToColumnParallel(pQ);
     using colWeights = this.tryNarrowToColumnParallel(pWeights);
     const canShard = !decode && W > 1 && kDataReplicated
@@ -3550,7 +3610,7 @@ export class ParallelOps implements DeviceOps {
       const topkIdxShards: Tensor[] = [];
       const topkValShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
-        const r = this.devices[i].indexerTopk(state, pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, topk, decode, qGlobalStart ?? 0, pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i], kIsRow ? W : 0, kIsRow ? i : 0, pGlobalLastPageLen.shards[i]);
+        const r = this.devices[i].indexerTopk(state, pQ.shards[i], pKData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, topk, decode, qGlobalStart ?? 0, pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i], kIsRow ? W : 0, kIsRow ? i : 0, pGlobalLastPageLen.shards[i], pKvTokenIndptr?.shards[i]);
         topkIdxShards.push(r.indices);
         topkValShards.push(r.values);
       }
@@ -3599,7 +3659,7 @@ export class ParallelOps implements DeviceOps {
         scale, topk,
         decode, qStart,
         pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i],
-        kIsRow ? W : 0, kIsRow ? i : 0, pGlobalLastPageLen.shards[i],
+        kIsRow ? W : 0, kIsRow ? i : 0, pGlobalLastPageLen.shards[i], pKvTokenIndptr?.shards[i],
       );
       topkIdxShards.push(r.indices);
       topkValShards.push(r.values);

@@ -926,8 +926,8 @@ export class GlmOps implements DeviceOps {
     );
   }
 
-  indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean): void {
-    getNativeAddon().indexerScore(this.ctx, out.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal ? 1 : 0);
+  indexerScore(out: Tensor, q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean, kvTokenIndptr?: Tensor): void {
+    getNativeAddon().indexerScore(this.ctx, out.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal ? 1 : 0, kvTokenIndptr?.data ?? 0);
   }
 
   // Indexer top-k selection -> physical KV slots. Runs the full pipeline
@@ -940,7 +940,7 @@ export class GlmOps implements DeviceOps {
   // Writes the compacted valid-slot count per query into `topkLength` (a stable
   // caller buffer), which feeds the sparse kernel's topk_length so it only walks
   // ceil(count/BI) candidate tiles instead of the full topk.
-  indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart: number = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor): { values: Tensor, indices: Tensor } {
+  indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart: number = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor): { values: Tensor, indices: Tensor } {
     const totalQ = idxQ.shape[0];
     const idxNHeads = idxQ.shape[1];
     const idxHeadDim = idxQ.shape[2];
@@ -948,8 +948,8 @@ export class GlmOps implements DeviceOps {
     const maxKv = kData.shape[0] * kData.shape[1];
     const useDirect = totalQ <= INDEXER_DIRECT_DISPATCH_MAX;
     return useDirect
-      ? this.indexerScoreTopkV2(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen)
-      : this.indexerScoreTopkPrefill(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen);
+      ? this.indexerScoreTopkV2(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr)
+      : this.indexerScoreTopkPrefill(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr);
   }
 
   // Sort each top-k row ascending by index (-1 padding last), in place.
@@ -990,7 +990,7 @@ export class GlmOps implements DeviceOps {
     };
   }
 
-  private indexerScoreTopkPrefill(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor): { values: Tensor, indices: Tensor } {
+  private indexerScoreTopkPrefill(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor): { values: Tensor, indices: Tensor } {
     const numSplits = Math.min(256, Math.max(1, Math.ceil(maxKv / 256)));
     const indices = q.workspace.alloc([totalQ, topk], "I32");
     const values = q.workspace.alloc([totalQ, topk], "BF16");
@@ -999,11 +999,11 @@ export class GlmOps implements DeviceOps {
     using coarseHist = q.workspace.alloc([totalQ, 1024], "I32");
     using fineHist = q.workspace.alloc([totalQ, 64], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
-    getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, values.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, maxKv, coarseHist.data, fineHist.data, meta.data, numSplits, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0);
+    getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, values.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, maxKv, coarseHist.data, fineHist.data, meta.data, numSplits, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0);
     return { values, indices };
   }
 
-  private indexerScoreTopkV2(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, causal = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor): { values: Tensor, indices: Tensor } {
+  private indexerScoreTopkV2(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, causal = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor): { values: Tensor, indices: Tensor } {
     const numSplits = Math.min(256, Math.max(1, Math.ceil(maxKv / 256)));
     const indices = q.workspace.alloc([totalQ, topk], "I32");
     const values = q.workspace.alloc([totalQ, topk], "BF16");
@@ -1011,7 +1011,7 @@ export class GlmOps implements DeviceOps {
     using rowLen = q.workspace.alloc([totalQ], "I32");
     using hist = q.workspace.alloc([totalQ, 65536], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
-    getNativeAddon().indexerScoreTopkV2(this.ctx, indices.data, values.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, hist.data, meta.data, maxKv, numSplits, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0);
+    getNativeAddon().indexerScoreTopkV2(this.ctx, indices.data, values.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, hist.data, meta.data, maxKv, numSplits, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0);
     return { values, indices };
   }
 
@@ -1122,6 +1122,10 @@ export class GlmOps implements DeviceOps {
   mlaKvCacheAppend(_state: ExecutionState, _cacheIdx: number, ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize: number = ckvData.shape[1], cpWorldSize: number = 0, cpRank: number = 0): { ckv: Tensor; kpe?: Tensor } {
     getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), kpeData ? ptr(kpeData) : 0, ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), appendKpe ? ptr(appendKpe) : 0, ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
     return { ckv: ckvData.viewClone(), kpe: kpeData?.viewClone() };
+  }
+
+  indexerKvCacheAppendFlat(kData: Tensor, appendK: Tensor, kvTokenIndptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, headDim: number, appendStrideN: number): void {
+    getNativeAddon().indexerKvCacheAppendFlat(this.ctx, ptr(kData), ptr(appendK), ptr(kvTokenIndptr), ptr(batchIndices), ptr(positions), nnz, headDim, appendStrideN);
   }
 
   concatAndCacheDsMla(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | undefined, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize: number = kvCache.shape[1], cpWorldSize: number = 0, cpRank: number = 0): Tensor {
