@@ -3,9 +3,9 @@ import crypto from "node:crypto";
 import { parentPort } from "node:worker_threads";
 import { CaptureManager } from "./capture-manager";
 import { type OutputParserEvent } from "./chat-model-parser";
-import { ChatModel, ChatCache, ChatTemplateKwargs, SamplingParams, Tokenizer } from "./chat_model";
+import { ChatModel, ChatCache, ChatTemplateKwargs, loadGenerationConfig, SamplingParams, Tokenizer } from "./chat_model";
 import { DeviceOps } from "./device_ops";
-import { ExecutionWorkspace } from "./execution-workspace";
+import { executePlan, ExecutionWorkspace } from "./execution-workspace";
 import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
@@ -40,6 +40,7 @@ interface ServerArgs extends ModelCliArgs {
   repetitionPenaltyWindow: number;
   decodeLatency: number;
   noCudaGraph: boolean;
+  mtpDraftTopk: number[];
 }
 
 function parseArgs(argv: string[]): ServerArgs {
@@ -59,6 +60,7 @@ function parseArgs(argv: string[]): ServerArgs {
     repetitionPenaltyWindow: 64,
     decodeLatency: 0,
     noCudaGraph: false,
+    mtpDraftTopk: [],
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -76,7 +78,12 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--repetition-penalty-window" && i + 1 < argv.length) args.repetitionPenaltyWindow = parseInt(argv[++i], 10);
     else if (a === "--decode-latency" && i + 1 < argv.length) args.decodeLatency = parseInt(argv[++i], 10);
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
+    else if (a === "--mtp-draft-topk" && i + 1 < argv.length) args.mtpDraftTopk = argv[++i].split(",").map(value => parseInt(value.trim(), 10));
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
+  }
+  if (args.mtp && args.mtpDraftTopk.length === 0) args.mtpDraftTopk = [2, 2, 2];
+  if (args.mtpDraftTopk.some(topk => !Number.isInteger(topk) || topk < 1)) {
+    throw new Error(`Invalid --mtp-draft-topk: ${args.mtpDraftTopk.join(",")}`);
   }
   if (args.maxPages === 0) {
     args.maxPages = args.batchSize * Math.ceil(args.ctxSize / PAGE_SIZE);
@@ -100,14 +107,16 @@ Options:
   --max-pages <int>             KV cache pages (default: batch-size * ceil(ctx-size / 16))
   --max-tokens <int>            Default max completion tokens (default: 512)
   --model-dir <string>          Model directory path (default: auto-detect from HF cache)
-  --temperature <float>         Default sampling temperature (default: 0.6)
-  --top-p <float>               Default top-p (default: 0.95)
-  --top-k <int>                 Default top-k (default: 20)
-  --repetition-penalty <float>  Default repetition penalty (default: 1.0)
+  --temperature <float>         Override model default sampling temperature
+  --top-p <float>               Override model default top-p
+  --top-k <int>                 Override model default top-k
+  --repetition-penalty <float>  Override model default repetition penalty
   --presence-penalty <float>    Default presence penalty (default: 0)
   --repetition-penalty-window <int>  Repetition penalty window (default: 64)
   --decode-latency <int>        Artificial delay per decode step in ms (default: 0)
   --no-cuda-graph               Disable CUDA graph capture
+  --mtp                         Enable greedy MTP speculative decoding
+  --mtp-draft-topk <list>       MTP draft top-k per depth (default: 2,2,2)
   --help, -h                    Show this help message
 `);
 }
@@ -231,6 +240,146 @@ interface ServerMetrics {
   requestSuccessTotal: number;
   prefillTimeSecondsCount: number;
   prefillTimeSecondsSum: number;
+}
+
+async function generateMtpBatches(
+  model: ChatModel,
+  ws: ExecutionWorkspace,
+  glm: DeviceOps,
+  cache: ChatCache,
+  eosIds: Set<number>,
+  pendingQueue: CompletionRequest[],
+  maxBatchSize: number,
+  decodeLatencyMs: number,
+  metrics: ServerMetrics,
+  captureManager: CaptureManager,
+  topks: readonly number[],
+): Promise<number> {
+  if (!model.planPrefillMtpDraftExtend || !model.planTargetVerification) {
+    throw new Error("The selected model does not support plan-based MTP decoding");
+  }
+
+  const pagedKV = cache.getPagedKV();
+  let admittedRequests = 0;
+
+  while (pendingQueue.length > 0) {
+    const cohort = pendingQueue.splice(0, maxBatchSize);
+    const requests = [...cohort];
+    const notified = new Set<CompletionRequest>();
+    admittedRequests += requests.length;
+    metrics.runningRequests += requests.length;
+
+    const finish = (req: CompletionRequest): void => {
+      if (notified.has(req)) return;
+      notified.add(req);
+      metrics.runningRequests--;
+      metrics.requestSuccessTotal++;
+      try { req.onFinish(); } catch {}
+    };
+
+    try {
+      cache.reset(requests.length);
+      const suffixIds = requests.map((req, index) => cache.prefixMatch(index, req.inputIds));
+      const mtpInputIds = model.prepareMtpInput(cache, suffixIds);
+      for (const req of requests) metrics.promptTokensTotal += req.promptTokenCount;
+
+      const prefillStart = performance.now();
+      let draft = (await executePlan(
+        captureManager,
+        ws,
+        model.planPrefillMtpDraftExtend(ws, cache, mtpInputIds, topks),
+      )).result;
+      const prefillSeconds = (performance.now() - prefillStart) / 1000;
+      metrics.prefillTimeSecondsCount += requests.length;
+      metrics.prefillTimeSecondsSum += prefillSeconds * requests.length;
+
+      const removeFinishedRows = (): void => {
+        const retained: number[] = [];
+        for (let i = 0; i < requests.length; i++) {
+          if (!requests[i].finished) retained.push(i);
+        }
+        for (let i = requests.length - 1; i >= 0; i--) {
+          if (requests[i].finished) {
+            pagedKV.removeSequence(i);
+            requests.splice(i, 1);
+          }
+        }
+        if (retained.length !== draft.targetTokens.length) {
+          draft = {
+            targetTokens: retained.map(index => draft.targetTokens[index]),
+            treeTokens: retained.map(index => draft.treeTokens[index]),
+            topks: draft.topks,
+          };
+        }
+      };
+
+      for (let i = 0; i < requests.length; i++) {
+        const req = requests[i];
+        const token = draft.targetTokens[i];
+        pagedKV.reportTokens(i, suffixIds[i]);
+        pagedKV.reportTokens(i, [token]);
+        if (!req.finished) {
+          req.generatedIds.push(token);
+          metrics.generationTokensTotal++;
+          const isEos = eosIds.has(token);
+          if (!isEos) processOutputToken(req, token);
+          if (isEos || req.generatedIds.length >= req.maxTokens) {
+            req.finished = true;
+            req.finishReason = isEos ? "stop" : "length";
+          }
+          if (!req.finished) checkStopSequences(req);
+        }
+        if (req.finished) finish(req);
+      }
+      removeFinishedRows();
+
+      while (requests.length > 0) {
+        const step = await executePlan(captureManager, ws, model.planTargetVerification(ws, cache, draft));
+        draft = step.result.draft;
+
+        for (let i = 0; i < requests.length; i++) {
+          const req = requests[i];
+          const tokens = step.result.tokens[i];
+          pagedKV.reportTokens(i, tokens);
+
+          for (const token of tokens) {
+            req.generatedIds.push(token);
+            metrics.generationTokensTotal++;
+            const isEos = eosIds.has(token);
+            if (!isEos) processOutputToken(req, token);
+            if (isEos || req.generatedIds.length >= req.maxTokens) {
+              req.finished = true;
+              req.finishReason = isEos ? "stop" : "length";
+            }
+            if (!req.finished) checkStopSequences(req);
+            if (req.finished) {
+              finish(req);
+              break;
+            }
+          }
+        }
+        removeFinishedRows();
+
+        if (decodeLatencyMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, decodeLatencyMs));
+        } else {
+          await new Promise(resolve => setImmediate(resolve));
+        }
+      }
+    } catch (error) {
+      ws.clearTracking();
+      for (const req of cohort) {
+        if (notified.has(req)) continue;
+        notified.add(req);
+        req.finished = true;
+        metrics.runningRequests = Math.max(0, metrics.runningRequests - 1);
+        try { req.onError(error); } catch {}
+      }
+      throw error;
+    }
+  }
+
+  return admittedRequests;
 }
 
 async function generateContinuousBatch(
@@ -516,6 +665,17 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   console.log(`Loading model from ${modelDir}...`);
   const { glm, gpuDevices } = createDeviceOps(args);
   const model = await loadModel(glm, args, modelDir);
+  const generationConfig = model.cfg.generationConfig ?? loadGenerationConfig(modelDir);
+  model.cfg.generationConfig = generationConfig;
+  if (!argv.includes("--temperature") && generationConfig.temperature !== undefined) args.temperature = generationConfig.temperature;
+  if (!argv.includes("--top-p") && generationConfig.topP !== undefined) args.topP = generationConfig.topP;
+  if (!argv.includes("--top-k") && generationConfig.topK !== undefined) args.topK = generationConfig.topK;
+  if (!argv.includes("--repetition-penalty") && generationConfig.repetitionPenalty !== undefined) {
+    args.repetitionPenalty = generationConfig.repetitionPenalty;
+  }
+  if (args.mtp && (!model.planPrefillMtpDraftExtend || !model.planTargetVerification)) {
+    throw new Error("--mtp requires a model with plan-based MTP decoding support");
+  }
   const cache = model.createChatCache(args.maxPages, args.batchSize, args.ctxSize);
   const ws = new ExecutionWorkspace(glm, args.batchSize, args.ctxSize);
   const captureManager = new CaptureManager(glm);
@@ -525,6 +685,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const eosIds = model.eosIds;
 
   console.log(`Model loaded. ctx-size=${args.ctxSize} batch-size=${args.batchSize} max-pages=${args.maxPages} max-tokens=${args.maxTokens}`);
+  console.log(`Generation defaults: temperature=${args.temperature} top-p=${args.topP} top-k=${args.topK} repetition-penalty=${args.repetitionPenalty}`);
 
   {
     console.log("Warming up...");
@@ -584,19 +745,33 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const t0 = performance.now();
       let requestCount = 0;
       try {
-        requestCount = await generateContinuousBatch(
-          model,
-          ws,
-          glm,
-          cache,
-          eosIds,
-          pendingQueue,
-          args.batchSize,
-          args.decodeLatency,
-          metrics,
-          captureManager,
-          samplingWorkspace,
-        );
+        requestCount = args.mtp
+          ? await generateMtpBatches(
+            model,
+            ws,
+            glm,
+            cache,
+            eosIds,
+            pendingQueue,
+            args.batchSize,
+            args.decodeLatency,
+            metrics,
+            captureManager,
+            args.mtpDraftTopk,
+          )
+          : await generateContinuousBatch(
+            model,
+            ws,
+            glm,
+            cache,
+            eosIds,
+            pendingQueue,
+            args.batchSize,
+            args.decodeLatency,
+            metrics,
+            captureManager,
+            samplingWorkspace,
+          );
       } catch (err) {
         console.error("Continuous batch error:", err);
       }
@@ -698,6 +873,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         presencePenalty,
         repetitionPenaltyWindow: args.repetitionPenaltyWindow,
       };
+      if (args.mtp && (samplingParams.temperature > 0 || samplingParams.repetitionPenalty !== 1 || samplingParams.presencePenalty !== 0)) {
+        sendJSON(res, 400, {
+          error: {
+            message: "MTP decoding currently requires temperature=0, repetition_penalty=1, and presence_penalty=0",
+            type: "invalid_request_error",
+          },
+        });
+        return;
+      }
 
       const id = generateId();
       const created = Math.floor(Date.now() / 1000);
@@ -963,6 +1147,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  GET  /v1/models            - List models`);
     console.log(`  GET  /health               - Health check`);
     console.log(`  CUDA graphs: ${args.noCudaGraph ? "disabled" : "enabled"}`);
+    console.log(`  MTP: ${args.mtp ? `enabled (draft top-k ${args.mtpDraftTopk.join(",")})` : "disabled"}`);
     console.log(`  Model: ${modelName}  |  GPU: ${args.gpus.join(",")}  |  ctx-size=${args.ctxSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);
   });
 

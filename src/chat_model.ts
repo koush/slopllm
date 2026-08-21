@@ -21,6 +21,13 @@ export interface SamplingParams {
   repetitionPenaltyWindow: number;
 }
 
+export interface GenerationConfig {
+  temperature?: number;
+  topP?: number;
+  topK?: number;
+  repetitionPenalty?: number;
+}
+
 export interface ChatCache extends Disposable {
   getPagedKV(): PagedKVCache;
   reset(batchSize: number): void;
@@ -59,6 +66,21 @@ export interface CommonModelConfig {
   scaling: number;
   kvLoraRank?: number;
   qkRopeHeadDim?: number;
+  generationConfig?: GenerationConfig;
+}
+
+export function loadGenerationConfig(modelDir: string): GenerationConfig {
+  const readJson = (filename: string): Record<string, unknown> => {
+    const filePath = path.join(modelDir, filename);
+    return fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, "utf-8")) : {};
+  };
+  const raw = { ...readJson("config.json"), ...readJson("generation_config.json") } as Record<string, any>;
+  return {
+    temperature: typeof raw.temperature === "number" ? raw.temperature : undefined,
+    topP: typeof raw.top_p === "number" ? raw.top_p : undefined,
+    topK: typeof raw.top_k === "number" ? raw.top_k : undefined,
+    repetitionPenalty: typeof raw.repetition_penalty === "number" ? raw.repetition_penalty : undefined,
+  };
 }
 
 export type Tokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
@@ -180,6 +202,7 @@ export abstract class ChatModel extends WorkspaceBase {
       this.tokenizer.chat_template = fs.readFileSync(chatTemplatePath, "utf-8")
         .replace(/\.(\d+)\b/g, "[$1]");
     }
+    this.cfg.generationConfig = loadGenerationConfig(modelDir);
     this.freeze();
   }
 }
