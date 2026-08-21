@@ -83,7 +83,13 @@ void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
                        const int32_t* pageIndptr, const int32_t* lastPageLen,
                        const int32_t* qoIndptr, float scale,
                        int totalQ, int idxNHeads, int idxHeadDim,
-                       int pageSize, int maxKvLen, int causal);
+                       int pageSize, int maxKvLen, int causal,
+                       const int32_t* kvTokenIndptr);
+
+void glm_indexer_kv_cache_append_flat(GlmCtx* ctx, void* kData,
+    const void* appendK, const int32_t* kvTokenIndptr,
+    const int32_t* batchIndices, const int32_t* positions,
+    uint32_t nnz, uint32_t headDim, size_t appendStrideN);
 
 
 
@@ -98,7 +104,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     void* scores, int32_t* rowLen, int maxKv,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
     int numSplits, int cpWorldSize, int cpRank,
-    const int32_t* globalLastPageLen);
+    const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr);
 
 void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     __nv_bfloat16* out_scores,
@@ -110,7 +116,7 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int32_t* hist, int32_t* meta,
     int maxKv, int num_splits, int cpWorldSize, int cpRank,
-    const int32_t* globalLastPageLen);
+    const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr);
 
 void glm_sort_topk_by_index(GlmCtx* ctx, int32_t* out_idx,
     __nv_bfloat16* out_scores, int batch, int topk);

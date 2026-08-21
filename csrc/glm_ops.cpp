@@ -369,6 +369,9 @@ static Napi::Value IndexerScore(const Napi::CallbackInfo& info) {
     int pageSize = info[13].As<Napi::Number>().Int32Value();
     int maxKvLen = info[14].As<Napi::Number>().Int32Value();
     int causal = info[15].As<Napi::Number>().Int32Value();
+    const int32_t* kv_token_indptr = info.Length() > 16
+        ? reinterpret_cast<const int32_t*>(info[16].As<Napi::Number>().Int64Value())
+        : nullptr;
     glm_indexer_score(reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(out_ptr),
         reinterpret_cast<const void*>(q_ptr),
@@ -378,7 +381,8 @@ static Napi::Value IndexerScore(const Napi::CallbackInfo& info) {
         reinterpret_cast<const int32_t*>(pageIndptr_ptr),
         reinterpret_cast<const int32_t*>(lastPageLen_ptr),
         reinterpret_cast<const int32_t*>(qoIndptr_ptr),
-        scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal);
+        scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal,
+        kv_token_indptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("indexerScore failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -426,6 +430,9 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     int cpWorldSize = info[28].As<Napi::Number>().Int32Value();
     int cpRank = info[29].As<Napi::Number>().Int32Value();
     const int32_t* global_last_page_len = reinterpret_cast<const int32_t*>((uintptr_t)info[30].As<Napi::Number>().Int64Value());
+    const int32_t* kv_token_indptr = info.Length() > 31
+        ? reinterpret_cast<const int32_t*>((uintptr_t)info[31].As<Napi::Number>().Int64Value())
+        : nullptr;
     glm_indexer_score_topk_prefill(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<int32_t*>(out_idx_ptr),
@@ -445,7 +452,7 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(coarseHist_ptr),
         reinterpret_cast<int32_t*>(fineHist_ptr),
         reinterpret_cast<int32_t*>(meta_ptr),
-        numSplits, cpWorldSize, cpRank, global_last_page_len);
+        numSplits, cpWorldSize, cpRank, global_last_page_len, kv_token_indptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("indexerScoreTopkPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -489,7 +496,10 @@ static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
         info[26].As<Napi::Number>().Int32Value(),
         info[27].As<Napi::Number>().Int32Value(),
         info[28].As<Napi::Number>().Int32Value(),
-        reinterpret_cast<const int32_t*>((uintptr_t)info[29].As<Napi::Number>().Int64Value()));
+        reinterpret_cast<const int32_t*>((uintptr_t)info[29].As<Napi::Number>().Int64Value()),
+        info.Length() > 30
+            ? reinterpret_cast<const int32_t*>((uintptr_t)info[30].As<Napi::Number>().Int64Value())
+            : nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("indexerScoreTopkV2 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

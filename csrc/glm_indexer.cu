@@ -17,6 +17,7 @@ static __device__ __forceinline__ int cp_remap(int pos, int cpWorldSize, int cpR
 // Invalid positions (beyond kvLen or causal limit) remain -inf.
 // ---------------------------------------------------------------------------
 
+template <bool FLAT>
 __global__ void indexer_score_kernel(
     __nv_bfloat16* __restrict__ out,          // [totalQ, maxKvLen]
     const __nv_bfloat16* __restrict__ q,      // [totalQ, idxNHeads, idxHeadDim]
@@ -28,7 +29,8 @@ __global__ void indexer_score_kernel(
     const int32_t* __restrict__ qoIndptr,     // [B+1]
     float scale,
     int idxNHeads, int idxHeadDim, int pageSize, int maxKvLen,
-    int causal
+    int causal,
+    const int32_t* __restrict__ kvTokenIndptr
 ) {
     const int qIdx = blockIdx.x;
     const int tid = threadIdx.x;
@@ -42,10 +44,13 @@ __global__ void indexer_score_kernel(
     const int qLocalPos = qIdx - qoIndptr[seq];
     const int numQueries = qoIndptr[seq + 1] - qoIndptr[seq];
 
-    const int pageStart = pageIndptr[seq];
-    const int pageEnd = pageIndptr[seq + 1];
+    const int pageStart = FLAT ? 0 : pageIndptr[seq];
+    const int pageEnd = FLAT ? 0 : pageIndptr[seq + 1];
     const int numPages = pageEnd - pageStart;
-    const int kvLen = numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0;
+    const int flatStart = FLAT ? kvTokenIndptr[seq] : 0;
+    const int kvLen = FLAT
+        ? kvTokenIndptr[seq + 1] - flatStart
+        : (numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0);
     const int prefixLen = max(0, kvLen - numQueries);
     const int causalLimit = causal ? (prefixLen + qLocalPos) : (kvLen - 1);
 
@@ -69,52 +74,78 @@ __global__ void indexer_score_kernel(
     }
     __syncthreads();
 
-    // Iterate over pages
-    for (int pageIdx = pageStart; pageIdx < pageEnd; pageIdx++) {
-        const int localPageIdx = pageIdx - pageStart;
-        const int firstLocalK = localPageIdx * pageSize;
-        if (firstLocalK > causalLimit) break;
-
-        const int32_t pageId = pageIndices[pageIdx];
-        const bool isLastPage = (pageIdx == pageEnd - 1);
-        const int tokensInPage = isLastPage ? lastPageLen[seq] : pageSize;
-
-        for (int t = 0; t < tokensInPage; t++) {
-            const int localK = firstLocalK + t;
-            if (localK > causalLimit) break;
-
-            // Each warp computes one head's dot product
+    if constexpr (FLAT) {
+        for (int localK = 0; localK < kvLen && localK <= causalLimit; localK++) {
             if (warpIdx < idxNHeads) {
-                const __nv_bfloat16* k_ptr = kData + (size_t)pageId * pageSize * idxHeadDim + t * idxHeadDim;
+                const __nv_bfloat16* k_ptr = kData + (size_t)(flatStart + localK) * idxHeadDim;
                 const __nv_bfloat16* q_ptr = q_s + warpIdx * idxHeadDim;
-
                 float partial = 0.0f;
-                for (int d = lane; d < idxHeadDim; d += 32) {
+                for (int d = lane; d < idxHeadDim; d += 32)
                     partial += __bfloat162float(q_ptr[d]) * __bfloat162float(k_ptr[d]);
-                }
-                // Warp reduce
-                for (int offset = 16; offset > 0; offset >>= 1) {
+                for (int offset = 16; offset > 0; offset >>= 1)
                     partial += __shfl_xor_sync(0xffffffff, partial, offset);
-                }
                 if (lane == 0) {
                     partial *= scale;
-                    partial = fmaxf(partial, 0.0f);
-                    score_s[warpIdx] = partial;
+                    score_s[warpIdx] = fmaxf(partial, 0.0f);
                 }
             }
-
             __syncthreads();
-
-            // Thread 0 computes weighted sum and writes output
             if (tid == 0) {
                 float indexScore = 0.0f;
-                for (int h = 0; h < idxNHeads; h++) {
+                for (int h = 0; h < idxNHeads; h++)
                     indexScore += __bfloat162float(w_s[h]) * score_s[h];
-                }
                 out[(size_t)qIdx * maxKvLen + localK] = __float2bfloat16(indexScore);
             }
-
             __syncthreads();
+        }
+    } else {
+        // Iterate over pages
+        for (int pageIdx = pageStart; pageIdx < pageEnd; pageIdx++) {
+            const int localPageIdx = pageIdx - pageStart;
+            const int firstLocalK = localPageIdx * pageSize;
+            if (firstLocalK > causalLimit) break;
+
+            const int32_t pageId = pageIndices[pageIdx];
+            const bool isLastPage = (pageIdx == pageEnd - 1);
+            const int tokensInPage = isLastPage ? lastPageLen[seq] : pageSize;
+
+            for (int t = 0; t < tokensInPage; t++) {
+                const int localK = firstLocalK + t;
+                if (localK > causalLimit) break;
+
+                // Each warp computes one head's dot product
+                if (warpIdx < idxNHeads) {
+                    const __nv_bfloat16* k_ptr = kData + (size_t)pageId * pageSize * idxHeadDim + t * idxHeadDim;
+                    const __nv_bfloat16* q_ptr = q_s + warpIdx * idxHeadDim;
+
+                    float partial = 0.0f;
+                    for (int d = lane; d < idxHeadDim; d += 32) {
+                        partial += __bfloat162float(q_ptr[d]) * __bfloat162float(k_ptr[d]);
+                    }
+                    // Warp reduce
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        partial += __shfl_xor_sync(0xffffffff, partial, offset);
+                    }
+                    if (lane == 0) {
+                        partial *= scale;
+                        partial = fmaxf(partial, 0.0f);
+                        score_s[warpIdx] = partial;
+                    }
+                }
+
+                __syncthreads();
+
+                // Thread 0 computes weighted sum and writes output
+                if (tid == 0) {
+                    float indexScore = 0.0f;
+                    for (int h = 0; h < idxNHeads; h++) {
+                        indexScore += __bfloat162float(w_s[h]) * score_s[h];
+                    }
+                    out[(size_t)qIdx * maxKvLen + localK] = __float2bfloat16(indexScore);
+                }
+
+                __syncthreads();
+            }
         }
     }
 }
@@ -124,17 +155,61 @@ void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
                        const int32_t* pageIndptr, const int32_t* lastPageLen,
                        const int32_t* qoIndptr, float scale,
                        int totalQ, int idxNHeads, int idxHeadDim,
-                       int pageSize, int maxKvLen, int causal) {
+                       int pageSize, int maxKvLen, int causal,
+                       const int32_t* kvTokenIndptr) {
     cudaSetDevice(ctx->device_id);
     int block_size = idxNHeads * 32;
     if (block_size > 1024) block_size = 1024;
     int smem_size = idxNHeads * idxHeadDim * sizeof(__nv_bfloat16)  // q_s
                   + idxNHeads * sizeof(__nv_bfloat16)                // w_s
                   + idxNHeads * sizeof(float);                       // score_s
-    indexer_score_kernel<<<totalQ, block_size, smem_size, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
-        (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
-        scale, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal);
+    if (kvTokenIndptr) {
+        indexer_score_kernel<true><<<totalQ, block_size, smem_size, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
+            (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
+            scale, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal, kvTokenIndptr);
+    } else {
+        indexer_score_kernel<false><<<totalQ, block_size, smem_size, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
+            (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
+            scale, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal, nullptr);
+    }
+}
+
+template <int HEAD_DIM>
+__global__ void indexer_kv_cache_append_flat_kernel(
+    __nv_bfloat16* __restrict__ kData,
+    const __nv_bfloat16* __restrict__ appendK,
+    const int32_t* __restrict__ kvTokenIndptr,
+    const int32_t* __restrict__ batchIndices,
+    const int32_t* __restrict__ positions,
+    uint32_t nnz, size_t appendStrideN) {
+    for (uint32_t i = blockIdx.x; i < nnz; i += gridDim.x) {
+        const size_t dstRow = (size_t)kvTokenIndptr[batchIndices[i]] + positions[i];
+        __nv_bfloat16* dst = kData + dstRow * HEAD_DIM;
+        const __nv_bfloat16* src = appendK + (size_t)i * appendStrideN;
+        for (int d = threadIdx.x; d < HEAD_DIM; d += blockDim.x)
+            dst[d] = src[d];
+    }
+}
+
+void glm_indexer_kv_cache_append_flat(GlmCtx* ctx, void* kData,
+    const void* appendK, const int32_t* kvTokenIndptr,
+    const int32_t* batchIndices, const int32_t* positions,
+    uint32_t nnz, uint32_t headDim, size_t appendStrideN) {
+    cudaSetDevice(ctx->device_id);
+    const int blocks = min((uint32_t)65535, max((uint32_t)1, nnz));
+    if (headDim == 128) {
+        indexer_kv_cache_append_flat_kernel<128><<<blocks, 128, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)kData, (const __nv_bfloat16*)appendK,
+            kvTokenIndptr, batchIndices, positions, nnz, appendStrideN);
+    } else if (headDim == 64) {
+        indexer_kv_cache_append_flat_kernel<64><<<blocks, 64, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)kData, (const __nv_bfloat16*)appendK,
+            kvTokenIndptr, batchIndices, positions, nnz, appendStrideN);
+    } else {
+        fprintf(stderr, "glm_indexer_kv_cache_append_flat: unsupported headDim=%u\n", headDim);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -747,7 +822,7 @@ static __device__ __forceinline__ int idx_local_causal_limit(
 // nothing. The masked variant writes -inf for masked positions so they land in
 // the lowest histogram bucket and are never selected — identical semantics to
 // the two-level prefill score kernel.
-template <bool HAS_MASK>
+template <bool HAS_MASK, bool FLAT>
 __global__ void idx_score_kernel(
     __nv_bfloat16* __restrict__ scores,       // [totalQ, maxKv]
     int32_t* __restrict__ row_len,            // [totalQ]  (numValid per query)
@@ -761,16 +836,20 @@ __global__ void idx_score_kernel(
     const uint8_t* __restrict__ custom_mask,
     const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len,
     int cpWorldSize, int cpRank,
-    const int32_t* __restrict__ globalLastPageLen
+    const int32_t* __restrict__ globalLastPageLen,
+    const int32_t* __restrict__ kvTokenIndptr
 ) {
     const int qIdx = blockIdx.y;
     int seq = 0;
     while (qoIndptr[seq + 1] <= qIdx) seq++;
     const int qLocalPos = qIdx - qoIndptr[seq];
     const int numQueries = qoIndptr[seq + 1] - qoIndptr[seq];
-    const int pageStart = pageIndptr[seq];
-    const int numPages = pageIndptr[seq + 1] - pageStart;
-    const int kvLen = numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0;
+    const int pageStart = FLAT ? 0 : pageIndptr[seq];
+    const int numPages = FLAT ? 0 : pageIndptr[seq + 1] - pageStart;
+    const int flatStart = FLAT ? kvTokenIndptr[seq] : 0;
+    const int kvLen = FLAT
+        ? kvTokenIndptr[seq + 1] - flatStart
+        : (numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0);
     // Under CP this shard holds every cpWorldSize-th token, so the causal bound
     // must be taken in global coordinates and mapped back (see the helper).
     const int cpW = (cpWorldSize > 1 && globalLastPageLen) ? cpWorldSize : 1;
@@ -821,9 +900,14 @@ __global__ void idx_score_kernel(
                 continue;
             }
         }
-        const int pageId = pageIndices[pageStart + pos / pageSize];
-        const __nv_bfloat16* kbase = kData + (size_t)pageId * pageSize * idxHeadDim
-                                     + (pos % pageSize) * idxHeadDim;
+        const __nv_bfloat16* kbase;
+        if constexpr (FLAT) {
+            kbase = kData + (size_t)(flatStart + pos) * idxHeadDim;
+        } else {
+            const int pageId = pageIndices[pageStart + pos / pageSize];
+            kbase = kData + (size_t)pageId * pageSize * idxHeadDim
+                    + (pos % pageSize) * idxHeadDim;
+        }
         float acc = 0.f;
         for (int h = 0; h < idxNHeads; h++) {
             const __nv_bfloat16* qh = q_s + h * idxHeadDim;
@@ -853,24 +937,33 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int32_t* hist, int32_t* meta,
     int maxKv, int num_splits, int cpWorldSize, int cpRank,
-    const int32_t* globalLastPageLen) {
+    const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     dim3 grid(num_splits, totalQ);
     int block = 256;
     size_t smem = (size_t)idxNHeads * idxHeadDim * sizeof(__nv_bfloat16)
                 + idxNHeads * sizeof(__nv_bfloat16);
+    const int effectiveCpWorldSize = kvTokenIndptr ? 0 : cpWorldSize;
+    const int effectiveCpRank = kvTokenIndptr ? 0 : cpRank;
     // Dispatch the mask-free variant when there is no custom mask so its bit-test
     // path is compiled out (zero cost for the common case).
-    auto kern = (custom_mask && mask_indptr) ? idx_score_kernel<true> : idx_score_kernel<false>;
-    kern<<<grid, block, smem, stream>>>(
-        (__nv_bfloat16*)scores, rowLen, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData,
-        (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
-        scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal,
-        qGlobalStart, custom_mask, mask_indptr, mask_kv_len,
-        cpWorldSize, cpRank, globalLastPageLen);
+    const bool hasMask = custom_mask && mask_indptr;
+#define LAUNCH_IDX_SCORE(HAS_MASK, FLAT) \
+    idx_score_kernel<(HAS_MASK), (FLAT)><<<grid, block, smem, stream>>>( \
+        (__nv_bfloat16*)scores, rowLen, (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData, \
+        (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr, \
+        scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal, \
+        qGlobalStart, custom_mask, mask_indptr, mask_kv_len, \
+        effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, kvTokenIndptr)
+    if (kvTokenIndptr) {
+        if (hasMask) LAUNCH_IDX_SCORE(true, true); else LAUNCH_IDX_SCORE(false, true);
+    } else {
+        if (hasMask) LAUNCH_IDX_SCORE(true, false); else LAUNCH_IDX_SCORE(false, false);
+    }
+#undef LAUNCH_IDX_SCORE
     glm_topk_from_scores(ctx, out_idx, out_scores, scores, rowLen, hist, meta,
-                         totalQ, maxKv, topk, num_splits, cpWorldSize, cpRank);
+                         totalQ, maxKv, topk, num_splits, effectiveCpWorldSize, effectiveCpRank);
 }
 
 // ---------------------------------------------------------------------------
@@ -977,7 +1070,7 @@ __device__ __forceinline__ void ldm_b(FragB& b, const __nv_bfloat16* s, int stri
 // positions are written -inf (lowest histogram bucket); positions beyond the
 // causal limit / kvLen are left untouched (never read by the histogram passes).
 // ---------------------------------------------------------------------------
-template <int TM, int TN, int WARPS, int Q_BUFFERS>
+template <int TM, int TN, int WARPS, int Q_BUFFERS, bool FLAT>
 __global__ void __launch_bounds__(WARPS * 32)
 idx_prefill_score_mma_kernel(
     __nv_bfloat16* __restrict__ scores,       // [totalQ, maxKv]
@@ -992,7 +1085,8 @@ idx_prefill_score_mma_kernel(
     const uint8_t* __restrict__ custom_mask,
     const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len,
     int cpWorldSize, int cpRank,
-    const int32_t* __restrict__ globalLastPageLen)
+    const int32_t* __restrict__ globalLastPageLen,
+    const int32_t* __restrict__ kvTokenIndptr)
 {
     using namespace idxmma;
     constexpr int CTA = WARPS * 32;
@@ -1027,9 +1121,12 @@ idx_prefill_score_mma_kernel(
     const int numQueries = qoIndptr[seq + 1] - qoStart;
     // Clamp to both the sequence end (multi-seq) and the local row count (shard).
     const int m_valid   = min(TM, min(qoIndptr[seq + 1], totalQ) - qStart);
-    const int pageStart = pageIndptr[seq];
-    const int numPages  = pageIndptr[seq + 1] - pageStart;
-    const int kvLen     = numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0;
+    const int pageStart = FLAT ? 0 : pageIndptr[seq];
+    const int numPages  = FLAT ? 0 : pageIndptr[seq + 1] - pageStart;
+    const int flatStart = FLAT ? kvTokenIndptr[seq] : 0;
+    const int kvLen = FLAT
+        ? kvTokenIndptr[seq + 1] - flatStart
+        : (numPages > 0 ? (numPages - 1) * pageSize + lastPageLen[seq] : 0);
     // Under CP this shard holds every cpWorldSize-th token, so the causal bound
     // must be taken in global coordinates and mapped back (see the helper).
     const int cpW = (cpWorldSize > 1 && globalLastPageLen) ? cpWorldSize : 1;
@@ -1096,8 +1193,12 @@ idx_prefill_score_mma_kernel(
         int gpos = tileStart + pos;
         __nv_bfloat16 v = __float2bfloat16(0.f);
         if (gpos < kvLen) {
-            int pageId = pageIndices[pageStart + gpos / pageSize];
-            v = kData[(size_t)pageId * pageSize * idxHeadDim + (gpos % pageSize) * idxHeadDim + d];
+            if constexpr (FLAT) {
+                v = kData[((size_t)flatStart + gpos) * idxHeadDim + d];
+            } else {
+                int pageId = pageIndices[pageStart + gpos / pageSize];
+                v = kData[(size_t)pageId * pageSize * idxHeadDim + (gpos % pageSize) * idxHeadDim + d];
+            }
         }
         smem_b[(size_t)d * strideB + pos] = v;
     }
@@ -1500,9 +1601,11 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     void* scores, int32_t* rowLen, int maxKv,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
     int numSplits, int cpWorldSize, int cpRank,
-    const int32_t* globalLastPageLen) {
+    const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
+    const int effectiveCpWorldSize = kvTokenIndptr ? 0 : cpWorldSize;
+    const int effectiveCpRank = kvTokenIndptr ? 0 : cpRank;
 
     // Zero histograms and meta.
     cudaMemsetAsync(coarseHist, 0, (size_t)totalQ * IDX_COARSE_BUCKETS * sizeof(int32_t), stream);
@@ -1513,7 +1616,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     // the +slop covers per-sequence tile rounding without needing a batch count
     // (out-of-range tiles map to seq<0 and return immediately).
     {
-#define LAUNCH_INDEXER_PREFILL(TM, TN, WARPS, Q_BUFFERS) do { \
+#define LAUNCH_INDEXER_PREFILL(TM, TN, WARPS, Q_BUFFERS, FLAT) do { \
         constexpr int cta = (WARPS) * 32; \
         const int strideA = idxHeadDim + idxmma::PAD_A; \
         const int strideB = (TN) + idxmma::PAD_B; \
@@ -1521,27 +1624,31 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
                            + (size_t)(Q_BUFFERS) * (TM) * strideA \
                            + (size_t)(TM) * idxNHeads) * sizeof(__nv_bfloat16); \
         cudaFuncSetAttribute( \
-            (void*)idx_prefill_score_mma_kernel<(TM), (TN), (WARPS), (Q_BUFFERS)>, \
+            (void*)idx_prefill_score_mma_kernel<(TM), (TN), (WARPS), (Q_BUFFERS), (FLAT)>, \
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mma_smem); \
         dim3 grid((maxKv + (TN) - 1) / (TN), (totalQ + (TM) - 1) / (TM) + 256); \
-        idx_prefill_score_mma_kernel<(TM), (TN), (WARPS), (Q_BUFFERS)> \
+        idx_prefill_score_mma_kernel<(TM), (TN), (WARPS), (Q_BUFFERS), (FLAT)> \
             <<<grid, cta, mma_smem, stream>>>( \
                 (__nv_bfloat16*)scores, rowLen, \
                 (const __nv_bfloat16*)q, (const __nv_bfloat16*)kData, \
                 (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr, \
                 totalQ, scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal, \
                 qGlobalStart, custom_mask, mask_indptr, mask_kv_len, \
-                cpWorldSize, cpRank, globalLastPageLen); \
+                effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, kvTokenIndptr); \
     } while (0)
 
         const char* config = std::getenv("GLM_INDEXER_PREFILL_CONFIG");
-        if (!config || std::strcmp(config, "q64_k256_w16_q1") == 0)
-            LAUNCH_INDEXER_PREFILL(64, 256, 16, 1);
-        else if (std::strcmp(config, "q64_k192_w8_q2") == 0)
-            LAUNCH_INDEXER_PREFILL(64, 192, 8, 2);
+        if (!config || std::strcmp(config, "q64_k256_w16_q1") == 0) {
+            if (kvTokenIndptr) LAUNCH_INDEXER_PREFILL(64, 256, 16, 1, true);
+            else LAUNCH_INDEXER_PREFILL(64, 256, 16, 1, false);
+        } else if (std::strcmp(config, "q64_k192_w8_q2") == 0) {
+            if (kvTokenIndptr) LAUNCH_INDEXER_PREFILL(64, 192, 8, 2, true);
+            else LAUNCH_INDEXER_PREFILL(64, 192, 8, 2, false);
+        }
         else {
             fprintf(stderr, "Unknown GLM_INDEXER_PREFILL_CONFIG=%s\n", config);
-            LAUNCH_INDEXER_PREFILL(64, 256, 16, 1);
+            if (kvTokenIndptr) LAUNCH_INDEXER_PREFILL(64, 256, 16, 1, true);
+            else LAUNCH_INDEXER_PREFILL(64, 256, 16, 1, false);
         }
 #undef LAUNCH_INDEXER_PREFILL
     }
@@ -1554,7 +1661,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 
         // Pass 3: coarse threshold (1 block per query)
         idx_prefill_coarse_threshold_kernel<<<totalQ, 256, 0, stream>>>(
-            coarseHist, meta, out_idx, out_scores, topk, (const __nv_bfloat16*)scores, rowLen, maxKv, cpWorldSize, cpRank);
+            coarseHist, meta, out_idx, out_scores, topk, (const __nv_bfloat16*)scores, rowLen, maxKv, effectiveCpWorldSize, effectiveCpRank);
 
         // Pass 4: fine histogram — one block per row
         idx_prefill_fine_hist_buf_kernel<<<totalQ, 256, 0, stream>>>(
@@ -1566,6 +1673,6 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 
         // Pass 6: gather from buffer — one block per row
         idx_prefill_gather_buf_kernel<<<totalQ, 256, 0, stream>>>(
-            out_idx, out_scores, meta, (const __nv_bfloat16*)scores, rowLen, maxKv, topk, cpWorldSize, cpRank);
+            out_idx, out_scores, meta, (const __nv_bfloat16*)scores, rowLen, maxKv, topk, effectiveCpWorldSize, effectiveCpRank);
     }
 }

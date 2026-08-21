@@ -233,7 +233,8 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_float,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p,
         ]
 
         self.lib.glm_topk_to_slots.restype = None
@@ -283,7 +284,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
         ]
 
         self.lib.glm_indexer_score_topk_prefill.restype = None
@@ -296,7 +297,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
         ]
 
         self.lib.glm_cat_last_dim.restype = None
@@ -647,6 +648,14 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_size_t, ctypes.c_size_t,
             ctypes.c_uint32, ctypes.c_uint32,  # cp_rank, cp_world_size
+        ]
+
+        self.lib.glm_indexer_kv_cache_append_flat.restype = None
+        self.lib.glm_indexer_kv_cache_append_flat.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_size_t,
         ]
 
         self.lib.glm_concat_and_cache_ds_mla.restype = None
@@ -1107,7 +1116,7 @@ class GlmOps:
 
     def indexer_score(self, output, q, k_data, weights, page_indices, page_indptr,
                       last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
-                      page_size, max_kv_len, causal):
+                      page_size, max_kv_len, causal, kv_token_indptr=None):
         self.lib.glm_indexer_score(
             self.ctx,
             self._ptr(output),
@@ -1119,7 +1128,8 @@ class GlmOps:
             self._ptr(last_page_len),
             self._ptr(qo_indptr),
             ctypes.c_float(scale),
-            total_q, n_heads, head_dim, page_size, max_kv_len, 1 if causal else 0
+            total_q, n_heads, head_dim, page_size, max_kv_len, 1 if causal else 0,
+            self._ptr(kv_token_indptr) if kv_token_indptr is not None else ctypes.c_void_p(0),
         )
 
     def indexer_score_topk_v2(self, out_idx, out_scores, q, k_data, weights, page_indices, page_indptr,
@@ -1127,7 +1137,8 @@ class GlmOps:
                               page_size, topk, causal,
                               scores, row_len, hist, meta, max_kv, num_splits,
                               custom_mask=None, mask_indptr=None, mask_kv_len=None,
-                              q_global_start=0, cp_world_size=0, cp_rank=0, global_last_page_len=None):
+                               q_global_start=0, cp_world_size=0, cp_rank=0, global_last_page_len=None,
+                               kv_token_indptr=None):
         self.lib.glm_indexer_score_topk_v2(
             self.ctx, self._ptr(out_idx), self._ptr(out_scores), self._ptr(q), self._ptr(k_data), self._ptr(weights),
             self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
@@ -1139,6 +1150,7 @@ class GlmOps:
             self._ptr(scores), self._ptr(row_len), self._ptr(hist), self._ptr(meta),
             max_kv, num_splits, cp_world_size, cp_rank,
             self._ptr(global_last_page_len) if global_last_page_len is not None else ctypes.c_void_p(0),
+            self._ptr(kv_token_indptr) if kv_token_indptr is not None else ctypes.c_void_p(0),
         )
 
     def indexer_score_topk_prefill(self, out_idx, out_scores, q, k_data, weights, page_indices, page_indptr,
@@ -1147,7 +1159,8 @@ class GlmOps:
                                    scores, row_len, max_kv,
                                    coarse_hist, fine_hist, meta, num_splits,
                                    custom_mask=None, mask_indptr=None, mask_kv_len=None,
-                                   q_global_start=0, cp_world_size=0, cp_rank=0, global_last_page_len=None):
+                                    q_global_start=0, cp_world_size=0, cp_rank=0, global_last_page_len=None,
+                                    kv_token_indptr=None):
         self.lib.glm_indexer_score_topk_prefill(
             self.ctx, self._ptr(out_idx), self._ptr(out_scores), self._ptr(q), self._ptr(k_data), self._ptr(weights),
             self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
@@ -1160,6 +1173,7 @@ class GlmOps:
             self._ptr(coarse_hist), self._ptr(fine_hist), self._ptr(meta),
             num_splits, cp_world_size, cp_rank,
             self._ptr(global_last_page_len) if global_last_page_len is not None else ctypes.c_void_p(0),
+            self._ptr(kv_token_indptr) if kv_token_indptr is not None else ctypes.c_void_p(0),
         )
 
     def topk_to_slots(self, slots, topk_idx, page_indices, page_indptr,
@@ -1692,6 +1706,17 @@ class GlmOps:
             ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe),
             ctypes.c_size_t(append_ckv_stride_n), ctypes.c_size_t(append_kpe_stride_n),
             ctypes.c_uint32(cp_rank), ctypes.c_uint32(cp_world_size)
+        )
+
+    def indexer_kv_cache_append_flat(self, k_data, append_k, kv_token_indptr,
+                                     batch_indices, positions, nnz, head_dim,
+                                     append_stride_n):
+        self.lib.glm_indexer_kv_cache_append_flat(
+            self.ctx,
+            self._ptr(k_data), self._ptr(append_k),
+            self._ptr(kv_token_indptr), self._ptr(batch_indices), self._ptr(positions),
+            ctypes.c_uint32(nnz), ctypes.c_uint32(head_dim),
+            ctypes.c_size_t(append_stride_n),
         )
 
     def concat_and_cache_ds_mla(self, kv_cache, append_ckv, append_kpe,
