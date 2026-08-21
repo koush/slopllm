@@ -3030,7 +3030,7 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, _pageSize?: number, _cpWorldSize?: number, _cpRank?: number): void {
+  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, _pageSize?: number, _cpWorldSize?: number, _cpRank?: number): { ckv: Tensor; kpe?: Tensor } {
     const pCkvData = this.cast(ckvData);
     const pKpeData = kpeData ? this.cast(kpeData) : null;
     const pIndices = this.cast(indices);
@@ -3045,8 +3045,11 @@ export class ParallelOps implements DeviceOps {
     const pageSize = pCkvData.shape[1];
     for (let i = 0; i < this.worldSize; i++) {
       const effectiveCpRank = contextParallel ? i : undefined;
-      this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData?.shards[i] ?? null, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe?.shards[i] ?? null, pBatchIndices.shards[i], pPositions.shards[i], nnz, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, pageSize, effectiveCpWorldSize, effectiveCpRank);
+      const cache = this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData?.shards[i] ?? null, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe?.shards[i] ?? null, pBatchIndices.shards[i], pPositions.shards[i], nnz, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, pageSize, effectiveCpWorldSize, effectiveCpRank);
+      using _ckv = cache.ckv;
+      using _kpe = cache.kpe;
     }
+    return { ckv: pCkvData.viewClone(), kpe: pKpeData?.viewClone() };
   }
 
   sparseMlaPrepareCache(state: ExecutionState, groupSlots: Tensor, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
@@ -3136,7 +3139,7 @@ export class ParallelOps implements DeviceOps {
       // because the topk may reference those new-token positions.
 
       for (let i = 0; i < this.worldSize; i++) {
-        this.devices[i].concatAndCacheDsMla(state, cacheIdx, prefetched!.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i],
+        using _cache = this.devices[i].concatAndCacheDsMla(state, cacheIdx, prefetched!.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i],
           // prefetch tensor is flat, so no need for indices — and in that mode
           // the kernel indexes by kvTokenIndptr (the de-interleaved token prefix
           // sum the gather used), NOT the page indptr. They only coincide for
@@ -3198,7 +3201,7 @@ export class ParallelOps implements DeviceOps {
     );
   }
 
-  concatAndCacheDsMla(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | undefined, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number) {
+  concatAndCacheDsMla(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | undefined, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
     const pKvCache = this.cast(kvCache);
     const pAppendCkv = this.cast(appendCkv);
     const pAppendKpe = this.cast(appendKpe);
@@ -3212,8 +3215,9 @@ export class ParallelOps implements DeviceOps {
 
     for (let i = 0; i < this.worldSize; i++) {
       const cpRank = contextParallel ? i : 0;
-      this.devices[i].concatAndCacheDsMla(state, cacheIdx, pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices?.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, pageSize, cpWorldSize, cpRank);
+      using _cache = this.devices[i].concatAndCacheDsMla(state, cacheIdx, pKvCache.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i], pIndices?.shards[i], pIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, pageSize, cpWorldSize, cpRank);
     }
+    return pKvCache.viewClone();
   }
 
   gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {

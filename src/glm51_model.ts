@@ -720,7 +720,7 @@ export class Glm51Model extends ChatModel {
           })()
           : idxKNormed.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
 
-        state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
+        return state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
       });
 
     using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
@@ -742,11 +742,12 @@ export class Glm51Model extends ChatModel {
         using idxQ = idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
 
         kvcacheIndex?.streamWaitEvent();
+        using kData = kvcacheIndex!.result;
 
         // Store the raw indexer top-k (token positions); slots are derived
         // per-layer/per-mode below and in the gather (slotsReady).
         return state.indexerTopk(
-          idxQ, layerIdx, idxWeights,
+          idxQ, kData, idxWeights,
           Math.pow(idxHeadDim, -0.5), idxTopk,
         );
       });
@@ -1378,7 +1379,7 @@ export class Glm51Model extends ChatModel {
         }
         destinationBase += finishCounts[batch];
       }
-      commitState.indexerKvCacheAppend(appendIdxK, layer.cacheIdx, layer.indexHeadDim);
+      using _kData = commitState.indexerKvCacheAppend(appendIdxK, layer.cacheIdx, layer.indexHeadDim);
     }
 
     const rowBytes = this.cfg.hiddenSize * BF16;

@@ -199,19 +199,20 @@ export class ExecutionState {
     const ckv = pagedKV.ckvData[cacheIdx];
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     if (pagedKV.sparseMode) {
-      this.ws.glm.concatAndCacheDsMla(
-        this, cacheIdx,
-        ckv,
-        appendCkv, appendKpe,
-        this.indices, this.indptrD,
-        this.mlaBatchIndices, this.positionIds,
-        nnz, kvLoraRank, qkRopeDim,
-        kvLoraRank, qkRopeDim,
-      );
-      return { ckv: ckv.viewClone() };
+      return {
+        ckv: this.ws.glm.concatAndCacheDsMla(
+          this, cacheIdx,
+          ckv,
+          appendCkv, appendKpe,
+          this.indices, this.indptrD,
+          this.mlaBatchIndices, this.positionIds,
+          nnz, kvLoraRank, qkRopeDim,
+          kvLoraRank, qkRopeDim,
+        ),
+      };
     } else {
       const kpe = pagedKV.kpeData[cacheIdx];
-      this.ws.glm.mlaKvCacheAppend(
+      return this.ws.glm.mlaKvCacheAppend(
         ckv, kpe,
         this.indices, this.indptrD, this.lastPageLen,
         appendCkv, appendKpe,
@@ -219,21 +220,22 @@ export class ExecutionState {
         nnz, kvLoraRank, qkRopeDim,
         kvLoraRank, qkRopeDim,
       );
-      return { ckv: ckv.viewClone(), kpe: kpe.viewClone() };
     }
   }
 
-  indexerKvCacheAppend(idxKOut: Tensor, cacheIdx: number, indexHeadDim: number) {
+  indexerKvCacheAppend(idxKOut: Tensor, cacheIdx: number, indexHeadDim: number): Tensor {
     const pagedKV = this.cache.getPagedKV();
+    const kData = pagedKV.kData[cacheIdx];
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
-    this.ws.glm.mlaKvCacheAppend(
-      pagedKV.kData[cacheIdx], null,
+    const cache = this.ws.glm.mlaKvCacheAppend(
+      kData, null,
       this.indices, this.indptrD, this.lastPageLen,
       idxKOut, null,
       this.mlaBatchIndices, this.positionIds,
       nnz, indexHeadDim, 0,
       indexHeadDim, 0
     );
+    return cache.ckv;
   }
 
   // Run the indexer and return the raw top-k token positions (Replicated
@@ -241,9 +243,7 @@ export class ExecutionState {
   // conversion is deferred to the GLM attention layer so the same top-k can be
   // reused across shared layers and mapped to whichever addressing
   // (flat/paged) each layer's CKV buffer requires.
-  indexerTopk(idxQ: Tensor, cacheIdx: number, weights: Tensor, scale: number, topk: number): { values: Tensor, indices: Tensor } {
-    const pagedKV = this.cache.getPagedKV();
-    const kData = pagedKV.kData[cacheIdx];
+  indexerTopk(idxQ: Tensor, kData: Tensor, weights: Tensor, scale: number, topk: number): { values: Tensor, indices: Tensor } {
     const cm = (!this.isDecode && this.customMask?.mode === MaskMode.CausalCustom) ? this.customMask : undefined;
     return this.ws.glm.indexerTopk(
       this,
