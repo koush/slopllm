@@ -1,11 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ChatCache, MtpDraftBatch, MtpStepResult } from "./chat_model";
+import type { ChatCache, ChatTemplateKwargs, MtpDraftBatch, MtpStepResult } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
 import { executionPhase, type ExecutionPlan, ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { MemcpyKind } from "./enums";
 import { BF16, f32ToBf16Bytes, I32 } from "./glm_ops";
+import { GlmParser } from "./glm-parser";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
@@ -320,6 +321,12 @@ export class Glm51Model extends ChatModel {
     this.invFreq = this.initInvFreq(config.qkRopeHeadDim, config.ropeTheta);
     this.contextParallel = contextParallel;
     this.mtp = mtp;
+  }
+
+  override createParser(chatTemplateKwargs: ChatTemplateKwargs = {}): GlmParser {
+    return new GlmParser(this.tokenizer, {
+      enable_thinking: chatTemplateKwargs.enable_thinking,
+    });
   }
 
   static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, contextParallel = false, mtp = false): Promise<Glm51Model> {

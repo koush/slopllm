@@ -1,6 +1,7 @@
 import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
+import { ChatModelParser, DefaultChatModelParser } from "./chat-model-parser";
 import { DeviceOps } from "./device_ops";
 import { type ExecutionPlan, ExecutionState, type ExecutionWorkspace } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
@@ -62,6 +63,11 @@ export interface CommonModelConfig {
 
 export type Tokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
 
+export interface ChatTemplateKwargs {
+  enable_thinking?: boolean;
+  [key: string]: unknown;
+}
+
 export abstract class ChatModel extends WorkspaceBase {
   abstract readonly eosIds: Set<number>;
   abstract readonly cfg: CommonModelConfig;
@@ -78,6 +84,10 @@ export abstract class ChatModel extends WorkspaceBase {
 
   prepareMtpInput(_cache: ChatCache, inputIdsList: number[][]): number[][] {
     return inputIdsList.map(inputIds => [...inputIds]);
+  }
+
+  createParser(_chatTemplateKwargs: ChatTemplateKwargs = {}): ChatModelParser {
+    return new DefaultChatModelParser(this.tokenizer);
   }
 
   forward(state: ExecutionState): Tensor {
@@ -165,7 +175,10 @@ export abstract class ChatModel extends WorkspaceBase {
       .map(dir => path.join(dir, "chat_template.jinja"))
       .find(candidate => fs.existsSync(candidate));
     if (chatTemplatePath) {
-      this.tokenizer.chat_template = fs.readFileSync(chatTemplatePath, "utf-8");
+      // @huggingface/jinja requires bracket syntax for numeric member access.
+      // Some upstream templates use Python/Jinja-style `content.0` instead.
+      this.tokenizer.chat_template = fs.readFileSync(chatTemplatePath, "utf-8")
+        .replace(/\.(\d+)\b/g, "[$1]");
     }
     this.freeze();
   }

@@ -2,7 +2,8 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { parentPort } from "node:worker_threads";
 import { CaptureManager } from "./capture-manager";
-import { ChatModel, ChatCache, SamplingParams, Tokenizer } from "./chat_model";
+import { type OutputParserEvent } from "./chat-model-parser";
+import { ChatModel, ChatCache, ChatTemplateKwargs, SamplingParams, Tokenizer } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { SamplingWorkspace } from "./sampling";
@@ -11,6 +12,18 @@ import { ParallelOps } from "./parallel_ops";
 import { Tensor } from "./tensor";
 
 const PAGE_SIZE = 64;
+
+interface ChatMessage {
+  role: string;
+  content: unknown;
+  reasoning_content?: string;
+  tool_calls?: Array<{
+    id?: string;
+    type?: string;
+    function: { name: string; arguments: unknown };
+  }>;
+  [key: string]: unknown;
+}
 
 interface ServerArgs extends ModelCliArgs {
   port: number;
@@ -32,7 +45,7 @@ interface ServerArgs extends ModelCliArgs {
 function parseArgs(argv: string[]): ServerArgs {
   const args: ServerArgs = {
     ...parseModelArgs(argv),
-    port: 8010,
+    port: 8000,
     host: "0.0.0.0",
     ctxSize: 4096,
     batchSize: 1,
@@ -101,67 +114,64 @@ Options:
 
 function tokenizeMessages(
   tokenizer: Tokenizer,
-  messages: Array<{ role: string; content: string }>,
+  messages: ChatMessage[],
+  tools?: unknown[],
+  chatTemplateKwargs: ChatTemplateKwargs = {},
 ): number[] {
   try {
     const opts: any = {
+      ...chatTemplateKwargs,
       tokenize: true,
       add_generation_prompt: true,
       return_tensor: false,
       return_dict: true,
     };
-    const result = tokenizer.apply_chat_template(messages, opts) as unknown as { input_ids: number[] | number[][] };
+    if (tools !== undefined) opts.tools = tools;
+    const result = tokenizer.apply_chat_template(messages as any, opts) as unknown as { input_ids: number[] | number[][] };
     return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
-  } catch {
+  } catch (error) {
+    // The basic fallback cannot represent tools, so failing visibly is safer
+    // than prompting the model as though no tools were supplied.
+    if (tools !== undefined || Object.keys(chatTemplateKwargs).length > 0) throw error;
     const text = messages.map(m => `<|${m.role}|>\n${m.content}`).join("\n") + "\n\n\n";
     return tokenizer.encode(text, { add_special_tokens: false });
   }
 }
 
-class TokenStreamDecoder {
-  private tokenCache: number[] = [];
-  private emittedText = "";
+function normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map(message => {
+    const normalized: ChatMessage = {
+      ...message,
+      content: message.content ?? "",
+    };
+    if (!message.tool_calls) return normalized;
 
-  push(tokenId: number, tokenizer: Tokenizer, skipSpecialTokens: boolean): string {
-    this.tokenCache.push(tokenId);
-    const text = tokenizer.decode(this.tokenCache, { skip_special_tokens: skipSpecialTokens });
+    normalized.tool_calls = message.tool_calls.map(toolCall => {
+      const args = toolCall.function.arguments;
+      return {
+        ...toolCall,
+        function: {
+          ...toolCall.function,
+          arguments: typeof args === "string" ? JSON.parse(args) : args,
+        },
+      };
+    });
+    return normalized;
+  });
+}
 
-    let safeEnd = text.length;
-    while (safeEnd > 0 && text.charCodeAt(safeEnd - 1) === 0xFFFD) {
-      safeEnd--;
-    }
-
-    const safeText = text.slice(0, safeEnd);
-    const delta = safeText.startsWith(this.emittedText)
-      ? safeText.slice(this.emittedText.length)
-      : this._diffFrom(safeText);
-    this.emittedText = safeText;
-    return delta;
-  }
-
-  flush(tokenizer: Tokenizer, skipSpecialTokens: boolean): string {
-    if (this.tokenCache.length === 0) return "";
-    const text = tokenizer.decode(this.tokenCache, { skip_special_tokens: skipSpecialTokens });
-    const delta = text.startsWith(this.emittedText)
-      ? text.slice(this.emittedText.length)
-      : this._diffFrom(text);
-    this.tokenCache = [];
-    this.emittedText = "";
-    return delta;
-  }
-
-  private _diffFrom(text: string): string {
-    let i = 0;
-    while (i < this.emittedText.length && i < text.length && this.emittedText[i] === text[i]) {
-      i++;
-    }
-    return text.slice(i);
-  }
+interface ResponseToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
 }
 
 interface CompletionRequest {
   id: string;
-  messages: Array<{ role: string; content: string }>;
+  messages: ChatMessage[];
+  tools?: unknown[];
+  chatTemplateKwargs: ChatTemplateKwargs;
+  inputIds: number[];
   maxTokens: number;
   samplingParams: SamplingParams;
   stream: boolean;
@@ -169,12 +179,44 @@ interface CompletionRequest {
   stopSequences: string[];
   generatedIds: number[];
   generatedText: string;
-  decoder: TokenStreamDecoder;
+  reasoningText: string;
+  toolCalls: ResponseToolCall[];
+  parser: ReturnType<ChatModel["createParser"]>;
   finished: boolean;
   finishReason: string;
   promptTokenCount: number;
-  onToken: (tokenId: number, tokenText: string) => void;
+  onOutput: (events: OutputParserEvent[]) => void;
   onFinish: () => void;
+  onError: (error: unknown) => void;
+}
+
+function processOutputEvents(req: CompletionRequest, events: OutputParserEvent[]): void {
+  for (const event of events) {
+    if (event.type === "reasoning_delta") {
+      req.reasoningText += event.text;
+    } else if (event.type === "content_delta") {
+      req.generatedText += event.text;
+    } else if (event.type === "tool_call") {
+      req.toolCalls[event.index] = {
+        id: `call_${crypto.randomBytes(12).toString("hex")}`,
+        type: "function",
+        function: { name: event.name, arguments: event.arguments },
+      };
+    } else {
+      console.warn(`Output parser error: ${event.message}`);
+      req.generatedText += event.raw;
+    }
+  }
+  if (events.length > 0) req.onOutput(events);
+}
+
+function processOutputToken(req: CompletionRequest, tokenId: number): void {
+  processOutputEvents(req, req.parser.onToken(tokenId));
+}
+
+function finishOutput(req: CompletionRequest): void {
+  processOutputEvents(req, req.parser.finish());
+  if (req.toolCalls.length > 0) req.finishReason = "tool_calls";
 }
 
 interface ActiveSequence {
@@ -198,21 +240,21 @@ async function generateContinuousBatch(
   cache: ChatCache,
   eosIds: Set<number>,
   pendingQueue: CompletionRequest[],
-  maxSeqLen: number,
   maxBatchSize: number,
   decodeLatencyMs: number,
   metrics: ServerMetrics,
   captureManager: CaptureManager,
   samplingWorkspace: SamplingWorkspace,
 ): Promise<number> {
-  const tokenizer = model.tokenizer;
   const pagedKV = cache.getPagedKV();
   const eosToken = [...eosIds][0];
   const active: ActiveSequence[] = [];
   let nextStagingKey = 0;
   let admittedRequests = 0;
+  const admitted = new Set<CompletionRequest>();
 
-  while (active.length > 0 || pendingQueue.length > 0) {
+  try {
+    while (active.length > 0 || pendingQueue.length > 0) {
     // 1. Remove finished sequences (reverse order to avoid index shift)
     for (let i = active.length - 1; i >= 0; i--) {
       if (active[i].request.finished) {
@@ -220,6 +262,7 @@ async function generateContinuousBatch(
         metrics.runningRequests--;
         metrics.requestSuccessTotal++;
         try { active[i].request.onFinish(); } catch {}
+        admitted.delete(active[i].request);
         active.splice(i, 1);
       }
     }
@@ -229,20 +272,12 @@ async function generateContinuousBatch(
     if (pendingQueue.length > 0 && availableSlots > 0) {
       const newCount = Math.min(pendingQueue.length, availableSlots);
       const newRequests = pendingQueue.splice(0, newCount);
+      for (const req of newRequests) admitted.add(req);
       admittedRequests += newCount;
       metrics.runningRequests += newCount;
 
-      const inputIdsList: number[][] = [];
-      for (const req of newRequests) {
-        const ids = tokenizeMessages(tokenizer, req.messages);
-        req.maxTokens = Math.max(1, req.maxTokens);
-        if (ids.length > maxSeqLen - req.maxTokens) {
-          ids.splice(0, ids.length - (maxSeqLen - req.maxTokens));
-        }
-        inputIdsList.push(ids);
-        req.promptTokenCount = ids.length;
-        metrics.promptTokensTotal += ids.length;
-      }
+      const inputIdsList = newRequests.map(req => req.inputIds);
+      for (const req of newRequests) metrics.promptTokensTotal += req.promptTokenCount;
 
       if (active.length === 0) {
         // Fast path: no active sequences, no staging needed
@@ -272,9 +307,7 @@ async function generateContinuousBatch(
         newRequests[i].generatedIds.push(firstTokens[i]);
         const isEos = eosIds.has(firstTokens[i]);
         if (!isEos) {
-          const chunk = newRequests[i].decoder.push(firstTokens[i], tokenizer, true);
-          newRequests[i].generatedText += chunk;
-          newRequests[i].onToken(firstTokens[i], chunk);
+          processOutputToken(newRequests[i], firstTokens[i]);
         }
         if (isEos || newRequests[i].generatedIds.length >= newRequests[i].maxTokens) {
           newRequests[i].finished = true;
@@ -311,6 +344,7 @@ async function generateContinuousBatch(
         metrics.runningRequests--;
         metrics.requestSuccessTotal++;
         try { active[i].request.onFinish(); } catch {}
+        admitted.delete(active[i].request);
         active.splice(i, 1);
       }
     }
@@ -355,9 +389,7 @@ async function generateContinuousBatch(
       req.generatedIds.push(newTokens[i]);
       const isEos = eosIds.has(newTokens[i]);
       if (!isEos) {
-        const chunk = req.decoder.push(newTokens[i], tokenizer, true);
-        req.generatedText += chunk;
-        req.onToken(newTokens[i], chunk);
+        processOutputToken(req, newTokens[i]);
       }
       if (isEos || req.generatedIds.length >= req.maxTokens) {
         req.finished = true;
@@ -368,134 +400,23 @@ async function generateContinuousBatch(
       }
     }
 
-    if (decodeLatencyMs > 0) {
-      await new Promise(resolve => setTimeout(resolve, decodeLatencyMs));
-    } else {
-      await new Promise(resolve => setImmediate(resolve));
+      if (decodeLatencyMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, decodeLatencyMs));
+      } else {
+        await new Promise(resolve => setImmediate(resolve));
+      }
     }
+  } catch (error) {
+    ws.clearTracking();
+    for (const req of admitted) {
+      req.finished = true;
+      metrics.runningRequests = Math.max(0, metrics.runningRequests - 1);
+      try { req.onError(error); } catch {}
+    }
+    throw error;
   }
 
   return admittedRequests;
-}
-
-async function generateBatch(
-  model: ChatModel,
-  ws: ExecutionWorkspace,
-  glm: DeviceOps,
-  cache: ChatCache,
-  eosIds: Set<number>,
-  requests: CompletionRequest[],
-  maxSeqLen: number,
-): Promise<void> {
-  const tokenizer = model.tokenizer;
-  if (requests.length === 0) return;
-  const batchSize = requests.length;
-  for (const req of requests) {
-    req.maxTokens = Math.max(1, req.maxTokens);
-  }
-
-  try {
-    cache.reset(batchSize);
-
-    const inputIdsList: number[][] = [];
-    for (const req of requests) {
-      const ids = tokenizeMessages(tokenizer, req.messages);
-      const maxTok = req.maxTokens;
-      if (ids.length > maxSeqLen - maxTok) {
-        ids.splice(0, ids.length - (maxSeqLen - maxTok));
-      }
-      inputIdsList.push(ids);
-      req.promptTokenCount = ids.length;
-    }
-
-    const samplingParams = requests.map(r => r.samplingParams);
-    const maxWindow = Math.max(...samplingParams.map(p => p.repetitionPenaltyWindow));
-    using samplingWorkspace = new SamplingWorkspace(
-      glm, requests.length, model.cfg.vocabSize, maxWindow,
-    );
-    samplingWorkspace.updateSampler(samplingParams, inputIdsList);
-
-    using prefillLogits = ws.forwardPrefill(model, inputIdsList, cache);
-    const firstSampled = samplingWorkspace.sample(prefillLogits);
-    const firstTokens = firstSampled.readInt32LEArray();
-
-    for (let i = 0; i < batchSize; i++) {
-      cache.reportTokens(i, inputIdsList[i]);
-      cache.reportTokens(i, [firstTokens[i]]);
-      requests[i].generatedIds.push(firstTokens[i]);
-      const isEos = eosIds.has(firstTokens[i]);
-      if (!isEos) {
-        const chunk = requests[i].decoder.push(firstTokens[i], tokenizer, true);
-        requests[i].generatedText += chunk;
-        requests[i].onToken(firstTokens[i], chunk);
-      }
-      if (isEos || requests[i].generatedIds.length >= requests[i].maxTokens) {
-        requests[i].finished = true;
-        requests[i].finishReason = isEos ? "stop" : "length";
-      }
-      if (!requests[i].finished) {
-        checkStopSequences(requests[i]);
-      }
-    }
-
-    const finished = requests.map(r => r.finished);
-    let lastTokens = [...firstTokens];
-    const eosToken = [...eosIds][0];
-    const maxSteps = Math.max(...requests.map(r => r.maxTokens));
-
-    for (let step = 1; step < maxSteps; step++) {
-      if (finished.every(f => f)) break;
-
-      const inputTokens = lastTokens.map((t, i) => finished[i] ? eosToken : t);
-
-      const state = ws.planDecode(model, batchSize, cache);
-      state.setInput([inputTokens]);
-      using hiddenStates = model.forward(state);
-      using decodeLogits = state.computeLogits(hiddenStates, model);
-      const newSampled = samplingWorkspace.sample(decodeLogits);
-      const newTokens = newSampled.readInt32LEArray();
-
-      for (let i = 0; i < batchSize; i++) {
-        if (!finished[i]) {
-          cache.reportTokens(i, [newTokens[i]]);
-          requests[i].generatedIds.push(newTokens[i]);
-          const isEos = eosIds.has(newTokens[i]);
-          if (!isEos) {
-            const chunk = requests[i].decoder.push(newTokens[i], tokenizer, true);
-            requests[i].generatedText += chunk;
-            requests[i].onToken(newTokens[i], chunk);
-          }
-          if (isEos || requests[i].generatedIds.length >= requests[i].maxTokens) {
-            finished[i] = true;
-            requests[i].finished = true;
-            requests[i].finishReason = isEos ? "stop" : "length";
-          }
-          if (!finished[i]) {
-            checkStopSequences(requests[i]);
-            if (requests[i].finished) {
-              finished[i] = true;
-            }
-          }
-        } else {
-          cache.reportTokens(i, [eosToken]);
-        }
-        lastTokens[i] = finished[i] ? eosToken : newTokens[i];
-      }
-
-      await new Promise(resolve => setImmediate(resolve));
-    }
-
-    for (const req of requests) {
-      if (!req.finished) {
-        req.finished = true;
-        req.finishReason = "length";
-      }
-    }
-  } finally {
-    for (const req of requests) {
-      try { req.onFinish(); } catch {}
-    }
-  }
 }
 
 function checkStopSequences(req: CompletionRequest): void {
@@ -670,7 +591,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           cache,
           eosIds,
           pendingQueue,
-          args.ctxSize,
           args.batchSize,
           args.decodeLatency,
           metrics,
@@ -686,6 +606,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       }
     } finally {
       busy = false;
+      if (pendingQueue.length > 0) setImmediate(() => { void processQueue(); });
     }
   }
 
@@ -716,17 +637,47 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         return;
       }
 
-      const messages = params.messages as Array<{ role: string; content: string }> | undefined;
-      if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      const inputMessages = params.messages as ChatMessage[] | undefined;
+      if (!inputMessages || !Array.isArray(inputMessages) || inputMessages.length === 0) {
         sendJSON(res, 400, { error: { message: "messages is required and must be a non-empty array", type: "invalid_request_error" } });
         return;
       }
+      let messages: ChatMessage[];
+      try {
+        messages = normalizeMessages(inputMessages);
+      } catch {
+        sendJSON(res, 400, { error: { message: "tool call arguments must contain valid JSON", type: "invalid_request_error" } });
+        return;
+      }
+      const tools = params.tools as unknown[] | undefined;
+      if (tools !== undefined && !Array.isArray(tools)) {
+        sendJSON(res, 400, { error: { message: "tools must be an array", type: "invalid_request_error" } });
+        return;
+      }
+      if (
+        params.chat_template_kwargs !== undefined &&
+        (params.chat_template_kwargs === null || typeof params.chat_template_kwargs !== "object" || Array.isArray(params.chat_template_kwargs))
+      ) {
+        sendJSON(res, 400, { error: { message: "chat_template_kwargs must be an object", type: "invalid_request_error" } });
+        return;
+      }
+      const chatTemplateKwargs: ChatTemplateKwargs = { ...(params.chat_template_kwargs ?? {}) };
+      if (params.enable_thinking !== undefined) {
+        if (typeof params.enable_thinking !== "boolean") {
+          sendJSON(res, 400, { error: { message: "enable_thinking must be a boolean", type: "invalid_request_error" } });
+          return;
+        }
+        chatTemplateKwargs.enable_thinking = params.enable_thinking;
+      }
+      if (params.reasoning_effort !== undefined) {
+        chatTemplateKwargs.reasoning_effort = params.reasoning_effort;
+      }
 
       const stream = params.stream === true;
-      const maxTokens = Math.min(
+      const maxTokens = Math.max(1, Math.min(
         params.max_tokens ?? params.max_completion_tokens ?? args.maxTokens,
         args.ctxSize,
-      );
+      ));
       const temperature = params.temperature ?? args.temperature;
       const topP = params.top_p ?? args.topP;
       const topK = params.top_k ?? args.topK;
@@ -750,10 +701,26 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
       const id = generateId();
       const created = Math.floor(Date.now() / 1000);
+      let inputIds: number[];
+      let parser: ReturnType<ChatModel["createParser"]>;
+      try {
+        inputIds = tokenizeMessages(tokenizer, messages, tools, chatTemplateKwargs);
+        parser = model.createParser(chatTemplateKwargs);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unable to prepare chat prompt";
+        sendJSON(res, 400, { error: { message, type: "invalid_request_error" } });
+        return;
+      }
+      if (inputIds.length > args.ctxSize - maxTokens) {
+        inputIds.splice(0, inputIds.length - (args.ctxSize - maxTokens));
+      }
 
       const completionReq: CompletionRequest = {
         id,
         messages,
+        tools,
+        chatTemplateKwargs,
+        inputIds,
         maxTokens,
         samplingParams,
         stream,
@@ -761,12 +728,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         stopSequences,
         generatedIds: [],
         generatedText: "",
-        decoder: new TokenStreamDecoder(),
+        reasoningText: "",
+        toolCalls: [],
+        parser,
         finished: false,
         finishReason: "stop",
-        promptTokenCount: 0,
-        onToken: () => {},
+        promptTokenCount: inputIds.length,
+        onOutput: () => {},
         onFinish: () => {},
+        onError: () => {},
       };
 
       if (stream) {
@@ -785,38 +755,34 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
         });
 
-        let lastSentLen = 0;
-        completionReq.onToken = (_tokenId: number, _tokenText: string) => {
-          if (completionReq.finished && completionReq.stopSequences.length > 0) return;
-          const currentText = completionReq.generatedText;
-          if (currentText.length > lastSentLen) {
-            const delta = currentText.slice(lastSentLen);
-            lastSentLen = currentText.length;
-            writeSSE(res, {
-              id,
-              object: "chat.completion.chunk",
-              created,
-              model: modelName,
-              choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-            });
+        completionReq.onOutput = events => {
+          for (const event of events) {
+            let delta: Record<string, unknown> | undefined;
+            if (event.type === "reasoning_delta") {
+              delta = { reasoning_content: event.text };
+            } else if (event.type === "content_delta") {
+              delta = { content: event.text };
+            } else if (event.type === "tool_call") {
+              const toolCall = completionReq.toolCalls[event.index];
+              delta = { tool_calls: [{ index: event.index, ...toolCall }] };
+            } else if (event.raw) {
+              delta = { content: event.raw };
+            }
+
+            if (delta) {
+              writeSSE(res, {
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: modelName,
+                choices: [{ index: 0, delta, finish_reason: null }],
+              });
+            }
           }
         };
 
         completionReq.onFinish = () => {
-          const remaining = completionReq.decoder.flush(tokenizer, true);
-          if (remaining) completionReq.generatedText += remaining;
-          const currentText = completionReq.generatedText;
-          if (currentText.length > lastSentLen) {
-            const delta = currentText.slice(lastSentLen);
-            lastSentLen = currentText.length;
-            writeSSE(res, {
-              id,
-              object: "chat.completion.chunk",
-              created,
-              model: modelName,
-              choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-            });
-          }
+          finishOutput(completionReq);
 
           writeSSE(res, {
             id,
@@ -844,15 +810,28 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           writeSSEDone(res);
           res.end();
         };
+        completionReq.onError = error => {
+          if (res.writableEnded) return;
+          const message = error instanceof Error ? error.message : "Generation failed";
+          writeSSE(res, { error: { message, type: "server_error" } });
+          writeSSEDone(res);
+          res.end();
+        };
 
         req.on("close", () => {
           completionReq.finished = true;
         });
       } else {
         completionReq.onFinish = () => {
-          const remaining = completionReq.decoder.flush(tokenizer, true);
-          if (remaining) completionReq.generatedText += remaining;
-          const content = completionReq.generatedText;
+          finishOutput(completionReq);
+          const message: Record<string, unknown> = {
+            role: "assistant",
+            content: completionReq.toolCalls.length > 0 && !completionReq.generatedText
+              ? null
+              : completionReq.generatedText,
+          };
+          if (completionReq.reasoningText) message.reasoning_content = completionReq.reasoningText;
+          if (completionReq.toolCalls.length > 0) message.tool_calls = completionReq.toolCalls;
           sendJSON(res, 200, {
             id,
             object: "chat.completion",
@@ -860,7 +839,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             model: modelName,
             choices: [{
               index: 0,
-              message: { role: "assistant", content },
+              message,
               finish_reason: completionReq.finishReason,
             }],
             usage: {
@@ -869,6 +848,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               total_tokens: completionReq.promptTokenCount + completionReq.generatedIds.length,
             },
           });
+        };
+        completionReq.onError = error => {
+          if (res.writableEnded) return;
+          const message = error instanceof Error ? error.message : "Generation failed";
+          sendJSON(res, 500, { error: { message, type: "server_error" } });
         };
 
         req.on("close", () => {
@@ -895,14 +879,25 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         return;
       }
 
-      const messages = params?.messages as Array<{ role: string; content: string }> | undefined;
-      if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      const inputMessages = params?.messages as ChatMessage[] | undefined;
+      if (!inputMessages || !Array.isArray(inputMessages) || inputMessages.length === 0) {
         sendJSON(res, 400, { error: { message: "messages is required and must be a non-empty array", type: "invalid_request_error" } });
         return;
       }
 
       try {
-        const tokens = tokenizeMessages(tokenizer, messages);
+        const messages = normalizeMessages(inputMessages);
+        const tools = params.tools as unknown[] | undefined;
+        if (tools !== undefined && !Array.isArray(tools)) {
+          sendJSON(res, 400, { error: { message: "tools must be an array", type: "invalid_request_error" } });
+          return;
+        }
+        const chatTemplateKwargs = params.chat_template_kwargs ?? {};
+        if (chatTemplateKwargs === null || typeof chatTemplateKwargs !== "object" || Array.isArray(chatTemplateKwargs)) {
+          sendJSON(res, 400, { error: { message: "chat_template_kwargs must be an object", type: "invalid_request_error" } });
+          return;
+        }
+        const tokens = tokenizeMessages(tokenizer, messages, tools, chatTemplateKwargs);
         sendJSON(res, 200, {
           count: tokens.length,
           max_model_len: args.ctxSize,
