@@ -2075,6 +2075,14 @@ class P2PAllReduceGroup {
   }
 }
 
+interface SparseMlaPrefetchExtra {
+  stream: Disposable & {
+    result: ParallelTensor;
+    streamWaitEvent(): void;
+    synchronize(): void;
+  };
+}
+
 export class ParallelOps implements DeviceOps {
   readonly devices: readonly GlmOps[];
   readonly worldSize: number;
@@ -3060,7 +3068,8 @@ export class ParallelOps implements DeviceOps {
     // first would delete the current layer's own prefetch).
     const prefetchDist = this.prefetchDistance(cacheIdx, cfg);
     const prefetchKey = `sparseMlaPrefetch_${prefetchDist}`;
-    using prefetchedStream = state.ws.extras.get(prefetchKey) as ReturnType<typeof this.withStream<ParallelTensor>>;
+    const prefetchExtra = state.ws.extras.get(prefetchKey) as SparseMlaPrefetchExtra | undefined;
+    using prefetchedStream = prefetchExtra?.stream;
     prefetchedStream?.streamWaitEvent();
     state.ws.extras.delete(prefetchKey);
 
@@ -3070,7 +3079,8 @@ export class ParallelOps implements DeviceOps {
       const prevCacheIndex = (cacheIdx - 1 + pagedKV.ckvData.length) % pagedKV.ckvData.length;
       const prevDist = this.prefetchDistance(prevCacheIndex, cfg);
       const prevKey = `sparseMlaPrefetch_${prevDist}`;
-      using existing = state.ws.extras.get(prevKey) as ReturnType<typeof this.withStream<ParallelTensor>>;
+      const existingExtra = state.ws.extras.get(prevKey) as SparseMlaPrefetchExtra | undefined;
+      using existing = existingExtra?.stream;
       using _existing = existing?.result;
       state.ws.extras.delete(prevKey);
       existing?.streamWaitEvent();
@@ -3163,13 +3173,15 @@ export class ParallelOps implements DeviceOps {
       {
         const nextDist = this.prefetchDistance(nextCacheIdx, cfg);
         const nextKey = `sparseMlaPrefetch_${nextDist}`;
-        using existing = state.ws.extras.get(nextKey) as ReturnType<typeof this.withStream<ParallelTensor>>;
+        const existingExtra = state.ws.extras.get(nextKey) as SparseMlaPrefetchExtra | undefined;
+        using existing = existingExtra?.stream;
         using _existing = existing?.result;
         state.ws.extras.delete(nextKey);
         existing?.streamWaitEvent();
       }
 
-      state.ws.extras.set(`sparseMlaPrefetch_${this.prefetchDistance(nextCacheIdx, cfg)}`, nextStream);
+      const nextExtra: SparseMlaPrefetchExtra = { stream: nextStream };
+      state.ws.extras.set(`sparseMlaPrefetch_${this.prefetchDistance(nextCacheIdx, cfg)}`, nextExtra);
     }
 
     if (prefetched) {
