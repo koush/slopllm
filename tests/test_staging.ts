@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { GlmOps } from "../src/glm_ops";
-import { PagedKVCache } from "../src/paged_kv";
+import { PAGE_SIZE, PagedKVCache } from "../src/paged_kv";
 import { Qwen3Model } from "../src/qwen3_model";
 
 
@@ -350,6 +350,29 @@ describe("PagedKVCache staging", () => {
 
     assert.ok(pagedKV.availablePages.length > availableAfterReset,
       "clearStaging should increase availablePages");
+  });
+
+  it("lets the consumer truncate staged sequences on page pressure", () => {
+    using pagedKV = makePagedKV(1, 2);
+    pagedKV.reset(1);
+    pagedKV.allocAppendPages(0, PAGE_SIZE * 2);
+    pagedKV.reportTokens(0, Array.from({ length: PAGE_SIZE * 2 }, (_, i) => i));
+    pagedKV.stageSequence(0, -1);
+    pagedKV.reset(1);
+
+    let requiredPages = 0;
+    pagedKV.onPagePressure = required => {
+      requiredPages = required;
+      pagedKV.staging.get(-1)!.popPage();
+    };
+
+    pagedKV.allocAppendPages(0, 1);
+
+    assert.equal(requiredPages, 1);
+    assert.equal(pagedKV.staging.size, 1);
+    assert.equal(pagedKV.staging.get(-1)!.pages.length, 1);
+    assert.equal(pagedKV.sequences[0].pages.length, 1);
+    assert.equal(pagedKV.availablePages.length, 0);
   });
 
   it("removeSequence splices out sequence and frees its pages", () => {

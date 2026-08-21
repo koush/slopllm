@@ -572,6 +572,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       decodePagesNeeded += pagedKV.pagesNeededForDecodeToken(seqIdx);
     }
+    pagedKV.ensureAvailablePages(decodePagesNeeded);
     if (decodePagesNeeded > pagedKV.availablePages.length) {
       throw new Error(`planDecode: need ${decodePagesNeeded} pages, ${pagedKV.availablePages.length} available`);
     }
@@ -687,6 +688,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       prefillPagesNeeded += pagedKV.pagesNeededForAppend(seqIdx, seqLens[seqIdx]);
     }
+    pagedKV.ensureAvailablePages(prefillPagesNeeded);
     if (prefillPagesNeeded > pagedKV.availablePages.length) {
       throw new Error(`planPrefill: need ${prefillPagesNeeded} pages, ${pagedKV.availablePages.length} available`);
     }

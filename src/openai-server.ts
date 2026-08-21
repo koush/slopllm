@@ -247,6 +247,57 @@ interface ServerMetrics {
   prefillTimeSecondsSum: number;
 }
 
+class StagedPrefixPolicy {
+  private nextKey = -1;
+  private readonly retainedKeys = new Set<number>();
+
+  constructor(private readonly pagedKV: ReturnType<ChatCache["getPagedKV"]>) {
+    pagedKV.onPagePressure = requiredPages => this.evictUntilAvailable(requiredPages);
+  }
+
+  retainSequence(seqIdx: number): void {
+    const key = this.nextKey--;
+    this.pagedKV.stageSequence(seqIdx, key);
+    this.retainedKeys.add(key);
+  }
+
+  clearStaging(): void {
+    this.pagedKV.clearStaging();
+    this.retainedKeys.clear();
+  }
+
+  private evictUntilAvailable(requiredPages: number): void {
+    while (this.pagedKV.availablePages.length < requiredPages && this.retainedKeys.size > 0) {
+      let longestKey: number | undefined;
+      let longestPages = 0;
+      for (const key of this.retainedKeys) {
+        const sequence = this.pagedKV.staging.get(key);
+        if (!sequence) {
+          this.retainedKeys.delete(key);
+          continue;
+        }
+        if (sequence.pages.length === 0) {
+          this.retainedKeys.delete(key);
+          this.pagedKV.removeStagedSequence(key);
+          continue;
+        }
+        if (sequence.pages.length > longestPages) {
+          longestKey = key;
+          longestPages = sequence.pages.length;
+        }
+      }
+      if (longestKey === undefined) break;
+
+      const sequence = this.pagedKV.staging.get(longestKey)!;
+      sequence.popPage();
+      if (sequence.pages.length === 0) {
+        this.retainedKeys.delete(longestKey);
+        this.pagedKV.removeStagedSequence(longestKey);
+      }
+    }
+  }
+}
+
 interface PromptPrefillRow {
   request: CompletionRequest;
   inputIds: number[];
@@ -306,6 +357,7 @@ async function generateMtpBatches(
   samplingWorkspace: SamplingWorkspace,
   topks: readonly number[],
   chunkSize: number,
+  stagedPrefixes: StagedPrefixPolicy,
 ): Promise<number> {
   if (!model.planPrefillMtpDraftExtend || !model.planTargetVerification) {
     throw new Error("The selected model does not support plan-based MTP decoding");
@@ -361,7 +413,7 @@ async function generateMtpBatches(
     for (let i = requests.length - 1; i >= 0; i--) {
       if (requests[i].finished) {
         finish(requests[i]);
-        pagedKV.removeSequence(i);
+        stagedPrefixes.retainSequence(i);
         requests.splice(i, 1);
       }
     }
@@ -466,7 +518,7 @@ async function generateMtpBatches(
     }
   } catch (error) {
     ws.clearTracking();
-    pagedKV.clearStaging();
+    stagedPrefixes.clearStaging();
     cache.reset(0);
     for (const req of admitted) {
       req.finished = true;
@@ -491,6 +543,7 @@ async function generateContinuousBatch(
   metrics: ServerMetrics,
   captureManager: CaptureManager,
   samplingWorkspace: SamplingWorkspace,
+  stagedPrefixes: StagedPrefixPolicy,
 ): Promise<number> {
   const pagedKV = cache.getPagedKV();
   const eosToken = [...eosIds][0];
@@ -510,7 +563,7 @@ async function generateContinuousBatch(
     // 1. Remove finished sequences (reverse order to avoid index shift)
     for (let i = active.length - 1; i >= 0; i--) {
       if (active[i].request.finished) {
-        pagedKV.removeSequence(i);
+        stagedPrefixes.retainSequence(i);
         metrics.runningRequests--;
         metrics.requestSuccessTotal++;
         try { active[i].request.onFinish(); } catch {}
@@ -612,7 +665,7 @@ async function generateContinuousBatch(
     // 3. Remove any newly-finished sequences (e.g. first-token EOS)
     for (let i = active.length - 1; i >= 0; i--) {
       if (active[i].request.finished) {
-        pagedKV.removeSequence(i);
+        stagedPrefixes.retainSequence(i);
         metrics.runningRequests--;
         metrics.requestSuccessTotal++;
         try { active[i].request.onFinish(); } catch {}
@@ -680,6 +733,7 @@ async function generateContinuousBatch(
     }
   } catch (error) {
     ws.clearTracking();
+    stagedPrefixes.clearStaging();
     for (const req of admitted) {
       req.finished = true;
       metrics.runningRequests = Math.max(0, metrics.runningRequests - 1);
@@ -856,6 +910,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   const pendingQueue: CompletionRequest[] = [];
+  const stagedPrefixes = new StagedPrefixPolicy(cache.getPagedKV());
   const metrics: ServerMetrics = {
     runningRequests: 0,
     generationTokensTotal: 0,
@@ -887,6 +942,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             mtpSamplingWorkspace!,
             args.mtpDraftTopk,
             args.chunkSize,
+            stagedPrefixes,
           )
           : await generateContinuousBatch(
             model,
@@ -900,6 +956,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             metrics,
             captureManager,
             samplingWorkspace,
+            stagedPrefixes,
           );
       } catch (err) {
         console.error("Continuous batch error:", err);

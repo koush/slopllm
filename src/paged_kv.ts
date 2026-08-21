@@ -83,6 +83,7 @@ export class Sequence {
     const page = this.pages[pageIdx];
     if (page.refs === 1) return;
 
+    this.pagedKvCache.ensureAvailablePages(1);
     const newPageId = this.pagedKvCache.availablePages.shift();
     if (newPageId === undefined) {
       throw new Error("truncate: no available page for copy-on-write");
@@ -152,6 +153,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   availablePages: number[];
   sequences: Sequence[];
   staging: Map<number, Sequence>;
+  onPagePressure?: (requiredPages: number) => void;
 
   getPagedKV(): PagedKVCache { return this; }
 
@@ -277,6 +279,12 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const seq = this.sequences[seqIdx];
     seq.clear();
     this.sequences.splice(seqIdx, 1);
+  }
+
+  ensureAvailablePages(requiredPages: number): void {
+    if (requiredPages > this.availablePages.length) {
+      this.onPagePressure?.(requiredPages);
+    }
   }
 
   copySequence(dstSeqIdx: number, srcSeqIdx: number) {
@@ -417,6 +425,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const newTotalLen = currentLen + numNewTokens;
     const newPageCount = Math.ceil(newTotalLen / this.pageSize);
     const numNewPages = newPageCount - currentPageCount;
+    this.ensureAvailablePages(numNewPages);
     if (numNewPages > this.availablePages.length) {
       throw new Error(`allocAppendPages: need ${numNewPages} pages, ${this.availablePages.length} available`);
     }
