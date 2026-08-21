@@ -255,7 +255,6 @@ describe("Qwen3-0.6B batch tests", () => {
 
     const stateRef = gws.planDecode(model, 1, pagedKV, true);
     stateRef.setInput([[tokens[0]]]);
-    gws.positionStep(stateRef, model);
     let tokensRef: number[];
     {
       using hiddenStatesRef = model.forward(stateRef);
@@ -274,7 +273,6 @@ describe("Qwen3-0.6B batch tests", () => {
       state.setInput([[tokens2[0]]]);
       {
         using captureArgmax = state.capture(captureManager, {}, () => {
-          gws.positionStep(state, model);
           using hiddenStates = model.forwardModel(state);
           using logits = state.computeLogits(hiddenStates, model);
           return logits.argmax();
@@ -305,7 +303,6 @@ describe("Qwen3-0.6B batch tests", () => {
     for (let step = 0; step < numSteps; step++) {
       const state = gws.planDecode(model, 1, pagedKV, true);
       state.setInput([[current]]);
-      gws.positionStep(state, model);
       {
         using hiddenStates = model.forward(state);
         using lastLogits = state.computeLogits(hiddenStates, model);
@@ -327,7 +324,6 @@ describe("Qwen3-0.6B batch tests", () => {
       state.setInput([[current]]);
       {
         using captureArgmax = state.capture(captureManager, {}, () => {
-          gws.positionStep(state, model);
           using hiddenStates = model.forwardModel(state);
           using logits = state.computeLogits(hiddenStates, model);
           return logits.argmax();
@@ -581,14 +577,12 @@ describe("Qwen3-0.6B batch tests", () => {
 
       // run1
       state1.setInput([[current2]]);
-      ws.positionStep(state1, model);
       using hiddenStates1 = model.forwardModel(state1);
       using logits1 = state1.computeLogits(hiddenStates1, model);
       using argmax1 = logits1.argmax();
 
       // run2 — input is argmax1 directly (D2D copy, no host round-trip)
       state2.setInput(argmax1);
-      ws.positionStep(state2, model);
       using hiddenStates2 = model.forwardModel(state2);
       using logits2 = state2.computeLogits(hiddenStates2, model);
       using argmax2 = logits2.argmax();

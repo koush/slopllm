@@ -168,7 +168,6 @@ async function runSummarize(
 
     const state = ws.planDecode(model, 1, cache);
     state.setInput([[cur]]);
-    ws.positionStep(state, model);
     using hiddenStates = model.forward(state);
     using logits = state.computeLogits(hiddenStates, model);
     using argmax = logits.argmax();

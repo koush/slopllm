@@ -2759,29 +2759,6 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  positionStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number, steps?: number): void {
-    const pPositionIds = this.cast(positionIds);
-    const pLastPageLen = this.cast(lastPageLen);
-    const pSlotMapping = this.cast(slotMapping);
-    const pIndptr = this.cast(indptr);
-    const pIndices = this.cast(indices);
-    for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].positionStep(pPositionIds.shards[i], pLastPageLen.shards[i], pSlotMapping.shards[i], pIndptr.shards[i], pIndices.shards[i], pageSize, batchSize, steps);
-    }
-  }
-
-  mlaPositionStep(positionIds: Tensor, lastPageLen: Tensor, indptr: Tensor, pageSize: number, batchSize: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, steps?: number, globalLastPageLen?: Tensor): void {
-    const pPositionIds = this.cast(positionIds);
-    const pLastPageLen = this.cast(lastPageLen);
-    const pIndptr = this.cast(indptr);
-    const pGlobalLastPageLen = globalLastPageLen ? this.cast(globalLastPageLen) : undefined;
-    const cpWs = contextParallel ? this.worldSize : 1;
-    for (let i = 0; i < this.worldSize; i++) {
-      const cpR = contextParallel ? i : 0;
-      this.devices[i].mlaPositionStep(pPositionIds.shards[i], pLastPageLen.shards[i], pIndptr.shards[i], pageSize, batchSize, contextParallel, cpWs, cpR, steps, pGlobalLastPageLen?.shards[i]);
-    }
-  }
-
   batchDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, enableCudaGraph: boolean): void {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
@@ -2868,14 +2845,17 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  private cpLocalKvLen(globalKvLen: number, rank: number): number {
+    return globalKvLen > rank ? Math.floor((globalKvLen - 1 - rank) / this.worldSize) + 1 : 0;
+  }
+
   private adjustCpLastPageLen(lastPageLenH: ParallelTensor, batchSize: number, seqKvLens: number[], pageSize: number): void {
     const cpWorldSize = this.worldSize;
     const effectivePageSize = pageSize / cpWorldSize;
     for (let r = 0; r < cpWorldSize; r++) {
       lastPageLenH.shards[r].withPinnedBuffer(buf => {
         for (let s = 0; s < batchSize; s++) {
-          const N = seqKvLens[s];
-          const localKvLen = N > r ? Math.floor((N - 1 - r) / cpWorldSize) + 1 : 0;
+          const localKvLen = this.cpLocalKvLen(seqKvLens[s], r);
           const remainder = localKvLen % effectivePageSize;
           buf.writeInt32LE(localKvLen > 0 ? (remainder !== 0 ? remainder : effectivePageSize) : 0, s * 4);
         }
@@ -2968,7 +2948,7 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, lastPageLenH: Tensor, batchSize: number, numQoHeads: number, pageSize: number, enableCudaGraph: boolean, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number, seqKvLens?: number[]): void {
+  mlaDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, lastPageLenH: Tensor, batchSize: number, numQoHeads: number, pageSize: number, enableCudaGraph: boolean, headDimCkv: number, headDimKpe: number, seqKvLens: number[], contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): void {
     const pFloatWs = this.cast(floatWs);
     const pIntWs = this.cast(intWs);
     const pPinnedIntWs = this.cast(pinnedIntWs);
@@ -2977,11 +2957,20 @@ export class ParallelOps implements DeviceOps {
     const pLastPageLenH = this.cast(lastPageLenH);
     const effectiveNumQoHeads = contextParallel ? numQoHeads : this.shardDim(numQoHeads, "mlaDecodePlan numQoHeads");
     const effectivePageSize = contextParallel ? pageSize / this.worldSize : pageSize;
-    if (contextParallel && seqKvLens) {
+    if (contextParallel) {
       this.adjustCpLastPageLen(pLastPageLenH, batchSize, seqKvLens, pageSize);
     }
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].mlaDecodePlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pIndptrH.shards[i], pLastPageLenH.shards[i], batchSize, effectiveNumQoHeads, effectivePageSize, enableCudaGraph, headDimCkv, headDimKpe, contextParallel);
+      const localSeqKvLens = contextParallel
+        ? seqKvLens.map(length => this.cpLocalKvLen(length, i))
+        : seqKvLens;
+      this.devices[i].mlaDecodePlan(pFloatWs.shards[i], floatWsSize, pIntWs.shards[i], pPinnedIntWs.shards[i], intWsSize, pPlanInfo.shards[i], pIndptrH.shards[i], pLastPageLenH.shards[i], batchSize, effectiveNumQoHeads, effectivePageSize, enableCudaGraph, headDimCkv, headDimKpe, localSeqKvLens, contextParallel);
+    }
+  }
+
+  sparseMlaDecodePlan(lastPageLenH: Tensor, batchSize: number, seqKvLens: number[], pageSize: number, contextParallel: boolean): void {
+    if (contextParallel) {
+      this.adjustCpLastPageLen(this.cast(lastPageLenH), batchSize, seqKvLens, pageSize);
     }
   }
 

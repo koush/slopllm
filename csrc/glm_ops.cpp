@@ -1620,64 +1620,6 @@ static Napi::Value KvCacheWrite(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-static Napi::Value PositionStep(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 7) {
-        Napi::TypeError::New(env, "Expected (ctx, position_ids, last_page_len, slot_mapping, indptr, indices, page_size, batch_size[, steps])").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t position_ids_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t last_page_len_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t slot_mapping_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t indptr_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t indices_ptr = info[5].As<Napi::Number>().Int64Value();
-    uint32_t page_size = info[6].As<Napi::Number>().Uint32Value();
-    uint32_t batch_size = info[7].As<Napi::Number>().Uint32Value();
-    int32_t steps = (info.Length() > 8) ? info[8].As<Napi::Number>().Int32Value() : 1;
-    glm_position_step(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                       reinterpret_cast<int32_t*>(position_ids_ptr),
-                       reinterpret_cast<int32_t*>(last_page_len_ptr),
-                       reinterpret_cast<int32_t*>(slot_mapping_ptr),
-                       reinterpret_cast<const int32_t*>(indptr_ptr),
-                       reinterpret_cast<const int32_t*>(indices_ptr),
-                       page_size, batch_size, steps);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        Napi::Error::New(env, std::string("positionStep failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
-    }
-    return env.Undefined();
-}
-
-static Napi::Value MlaPositionStep(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 5) {
-        Napi::TypeError::New(env, "Expected (ctx, position_ids, last_page_len, indptr, page_size, batch_size[, cp_world_size, cp_rank, steps, global_last_page_len])").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t position_ids_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t last_page_len_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t indptr_ptr = info[3].As<Napi::Number>().Int64Value();
-    uint32_t page_size = info[4].As<Napi::Number>().Uint32Value();
-    uint32_t batch_size = info[5].As<Napi::Number>().Uint32Value();
-    uint32_t cp_world_size = (info.Length() > 6) ? info[6].As<Napi::Number>().Uint32Value() : 1;
-    uint32_t cp_rank = (info.Length() > 7) ? info[7].As<Napi::Number>().Uint32Value() : 0;
-    int32_t steps = (info.Length() > 8) ? info[8].As<Napi::Number>().Int32Value() : 1;
-    uintptr_t global_last_page_len_ptr = (info.Length() > 9) ? info[9].As<Napi::Number>().Int64Value() : 0;
-    glm_mla_position_step(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                           reinterpret_cast<int32_t*>(position_ids_ptr),
-                           reinterpret_cast<int32_t*>(last_page_len_ptr),
-                           reinterpret_cast<int32_t*>(global_last_page_len_ptr),
-                           reinterpret_cast<const int32_t*>(indptr_ptr),
-                           page_size, batch_size, cp_world_size, cp_rank, steps);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        Napi::Error::New(env, std::string("mlaPositionStep failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
-    }
-    return env.Undefined();
-}
-
 static Napi::Value Memcpy(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 5) {
@@ -3815,8 +3757,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "max"), Napi::Function::New(env, Max));
     exports.Set(Napi::String::New(env, "memcpy"), Napi::Function::New(env, Memcpy));
     exports.Set(Napi::String::New(env, "kvCacheWrite"), Napi::Function::New(env, KvCacheWrite));
-    exports.Set(Napi::String::New(env, "positionStep"), Napi::Function::New(env, PositionStep));
-    exports.Set(Napi::String::New(env, "mlaPositionStep"), Napi::Function::New(env, MlaPositionStep));
     exports.Set(Napi::String::New(env, "synchronize"), Napi::Function::New(env, Synchronize));
     exports.Set(Napi::String::New(env, "synchronizeStream"), Napi::Function::New(env, SynchronizeStream));
     exports.Set(Napi::String::New(env, "synchronizeAsync"), Napi::Function::New(env, SynchronizeAsync));

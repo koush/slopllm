@@ -447,28 +447,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     state.indicesH = this.ensureAllocPinned([B * S], "I32", s("indicesH"));
   }
 
-  positionStep(state: ExecutionState, model: ChatModel, steps = 1): void {
-    const pagedKV = state.cache.getPagedKV();
-    const batchSize = state.batchSize;
-    if (!model.cfg.kvLoraRank) {
-      this.glm.positionStep(
-        state.positionIds, state.lastPageLen, state.slotMapping,
-        state.indptrD, state.indices,
-        pagedKV.pageSize, batchSize, steps
-      );
-    } else {
-      this.glm.mlaPositionStep(
-        state.positionIds, state.lastPageLen,
-        state.indptrD,
-        pagedKV.pageSize, batchSize,
-        pagedKV.contextParallel,
-        undefined, undefined, steps,
-        state.globalLastPageLen,
-      );
-    }
-  }
-
-
   flashDecode(state: ExecutionState, query: Tensor, cacheIdx: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
     const pagedKV = state.cache.getPagedKV();
     const out = this.alloc([state.batchSize, nHeads, 1, hd], query.type, undefined, query.parallelism);
@@ -602,27 +580,15 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const state = new ExecutionState(model, batchSize, totalTokens, seqLens, true, this, cache);
     this.allocStateBuffers(state, slot, this.maxBatch, this.maxSeqLen);
 
+    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+      pagedKV.allocDecodeToken(seqIdx);
+    }
+
     state.positionIdsH.withPinnedBuffer(buf => {
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
         buf.writeInt32LE(pagedKV.sequences[seqIdx].allocLen - 1, seqIdx * I32);
       }
     });
-    state.positionIds.memcpy(state.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
-
-    if (cfg.kvLoraRank) {
-      state.mlaBatchIndicesH.withPinnedBuffer(buf => {
-        for (let i = 0; i < batchSize; i++) buf.writeInt32LE(i, i * I32);
-      });
-      state.mlaBatchIndices.memcpy(state.mlaBatchIndicesH, batchSize * I32, MemcpyKind.HostToDevice);
-      state.qoIndptrH.withPinnedBuffer(buf => {
-        for (let i = 0; i <= batchSize; i++) buf.writeInt32LE(i, i * I32);
-      });
-      state.qoIndptrD.memcpy(state.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-    }
-
-    for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
-      pagedKV.allocDecodeToken(seqIdx);
-    }
 
     state.kvTokenIndptrH.withPinnedBuffer(buf => {
       buf.writeInt32LE(0, 0);
@@ -635,7 +601,41 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
     this.updateIndptr(state, pagedKV);
 
-    if (!cfg.kvLoraRank) {
+    if (cfg.kvLoraRank) {
+      state.mlaBatchIndicesH.withPinnedBuffer(buf => {
+        for (let i = 0; i < batchSize; i++) buf.writeInt32LE(i, i * I32);
+      });
+      state.mlaBatchIndices.memcpy(state.mlaBatchIndicesH, batchSize * I32, MemcpyKind.HostToDevice);
+      state.qoIndptrH.withPinnedBuffer(buf => {
+        for (let i = 0; i <= batchSize; i++) buf.writeInt32LE(i, i * I32);
+      });
+      state.qoIndptrD.memcpy(state.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+      const seqKvLens = pagedKV.sequences.map(sequence => sequence.allocLen);
+      if (pagedKV.sparseMode) {
+        this.glm.sparseMlaDecodePlan(
+          state.lastPageLenH, batchSize, seqKvLens,
+          pagedKV.pageSize, pagedKV.contextParallel,
+        );
+      } else {
+        this.glm.mlaDecodePlan(
+          pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
+          state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
+          state.mlaDecodePlanInfo,
+          state.indptrH, state.lastPageLenH,
+          batchSize, model.cfg.numAttentionHeads, pagedKV.pageSize, enableCudaGraph,
+          cfg.kvLoraRank, cfg.qkRopeHeadDim!, seqKvLens, pagedKV.contextParallel,
+        );
+      }
+    } else {
+      state.slotMappingH.withPinnedBuffer(buf => {
+        for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
+          const position = pagedKV.sequences[seqIdx].allocLen - 1;
+          const pageIdx = Math.floor(position / pagedKV.pageSize);
+          const pageOffset = position % pagedKV.pageSize;
+          const absPage = pagedKV.sequences[seqIdx].pages[pageIdx].id;
+          buf.writeInt32LE(absPage * pagedKV.pageSize + pageOffset, seqIdx * I32);
+        }
+      });
       this.glm.batchDecodePlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
         state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
@@ -646,22 +646,17 @@ export class ExecutionWorkspace extends WorkspaceBase {
         enableCudaGraph
       );
     }
-    else if (!pagedKV.sparseMode) {
-      this.glm.mlaDecodePlan(
-        pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-        state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
-        state.mlaDecodePlanInfo,
-        state.indptrH, state.lastPageLenH,
-        batchSize, model.cfg.numAttentionHeads, pagedKV.pageSize, enableCudaGraph,
-        model.cfg.kvLoraRank!, model.cfg.qkRopeHeadDim!, pagedKV.contextParallel,
-        undefined, undefined, pagedKV.sequences.map(s => s.allocLen)
-      );
-    }
 
     const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.contentPages, 0);
+    state.positionIds.memcpy(state.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
     state.indices.memcpy(state.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
     state.indptrD.memcpy(state.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    state.lastPageLen.memcpy(state.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
+    state.globalLastPageLen.memcpy(state.globalLastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
     state.kvTokenIndptrD.memcpy(state.kvTokenIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    if (!cfg.kvLoraRank) {
+      state.slotMapping.memcpy(state.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
+    }
 
     return state;
   }
@@ -831,7 +826,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
   forwardEagerDecode(model: ChatModel, tokenIdsList: number[], cache: ChatCache): number[] {
     const state = this.planDecode(model, tokenIdsList.length, cache);
     state.setInput([tokenIdsList]);
-    this.positionStep(state, model);
     using hiddenStates = model.forward(state);
     using logits = state.computeLogits(hiddenStates, model);
     using argmaxResult = logits.argmax();

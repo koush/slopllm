@@ -1015,14 +1015,6 @@ export class GlmOps implements DeviceOps {
     return { values, indices };
   }
 
-  positionStep(positionIds: Tensor, lastPageLen: Tensor, slotMapping: Tensor, indptr: Tensor, indices: Tensor, pageSize: number, batchSize: number, steps = 1): void {
-    getNativeAddon().positionStep(this.ctx, ptr(positionIds), ptr(lastPageLen), ptr(slotMapping), ptr(indptr), ptr(indices), pageSize, batchSize, steps);
-  }
-
-  mlaPositionStep(positionIds: Tensor, lastPageLen: Tensor, indptr: Tensor, pageSize: number, batchSize: number, _contextParallel?: boolean, cpWorldSize = 1, cpRank = 0, steps = 1, globalLastPageLen?: Tensor): void {
-    getNativeAddon().mlaPositionStep(this.ctx, ptr(positionIds), ptr(lastPageLen), ptr(indptr), pageSize, batchSize, cpWorldSize, cpRank, steps, globalLastPageLen ? ptr(globalLastPageLen) : 0);
-  }
-
   hostPointerToBuffer(ptr: number, size: number): Buffer {
     return getNativeAddon().hostPointerToBuffer(ptr, size);
   }
@@ -1109,8 +1101,11 @@ export class GlmOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, lastPageLenH: Tensor, batchSize: number, numQoHeads: number, pageSize: number, enableCudaGraph: boolean, headDimCkv: number, headDimKpe: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, _seqKvLens?: number[]): void {
+  mlaDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, lastPageLenH: Tensor, batchSize: number, numQoHeads: number, pageSize: number, enableCudaGraph: boolean, headDimCkv: number, headDimKpe: number, _seqKvLens: number[], contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): void {
     getNativeAddon().mlaDecodePlan(this.ctx, ptr(floatWs), floatWsSize, ptr(intWs), ptr(pinnedIntWs), intWsSize, ptr(planInfo), ptr(indptrH), batchSize, numQoHeads, pageSize, enableCudaGraph, headDimCkv, headDimKpe);
+  }
+
+  sparseMlaDecodePlan(_lastPageLenH: Tensor, _batchSize: number, _seqKvLens: number[], _pageSize: number, _contextParallel: boolean): void {
   }
 
   mlaDecodeRun(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, smScale: number): { o: Tensor, lse: Tensor } {

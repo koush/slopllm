@@ -77,7 +77,6 @@ function generateWithGraph(
     state.setInput([[currentToken]]);
     {
       using argmaxResult = state.capture(captureManager, {}, () => {
-        ws.positionStep(state, model);
         using hiddenStates = model.forwardModel(state);
         using logits = state.computeLogits(hiddenStates, model);
         return logits.argmax();

@@ -71,7 +71,6 @@ async function main() {
       using _t = ws.startTracking();
       const st = ws.planDecode(model, 1, cache, false);
       st.setInput([[cur]]);
-      ws.positionStep(st, model);
       using hs = model.forwardModel(st);
       using lg = st.computeLogits(hs, model);
       glm.synchronize();

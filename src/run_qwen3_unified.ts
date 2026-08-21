@@ -369,7 +369,6 @@ export async function* generateStream(
         }
 
         state.capture(captureManager, {}, () => {
-          ws.positionStep(state, model);
           using hiddenStates = model.forwardModel(state);
           doSample(state.computeLogits(hiddenStates, model));
         }, ['decode']);

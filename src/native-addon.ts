@@ -61,8 +61,6 @@ export interface NativeAddon {
   max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
-  positionStep(ctx: number, positionIds: number, lastPageLen: number, slotMapping: number, indptr: number, indices: number, pageSize: number, batchSize: number, steps: number): void;
-  mlaPositionStep(ctx: number, positionIds: number, lastPageLen: number, indptr: number, pageSize: number, batchSize: number, cpWorldSize: number, cpRank: number, steps: number, globalLastPageLen: number): void;
   synchronize(ctx: number): void;
   synchronizeAsync(ctx: number): Promise<void>;
   synchronizeStream(ctx: number, streamIdx: number): void;
