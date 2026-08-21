@@ -3030,7 +3030,7 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaKvCacheAppend(ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, _pageSize?: number, _cpWorldSize?: number, _cpRank?: number): { ckv: Tensor; kpe?: Tensor } {
+  mlaKvCacheAppend(state: ExecutionState, cacheIdx: number, ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, _pageSize?: number, _cpWorldSize?: number, _cpRank?: number): { ckv: Tensor; kpe?: Tensor } {
     const pCkvData = this.cast(ckvData);
     const pKpeData = kpeData ? this.cast(kpeData) : null;
     const pIndices = this.cast(indices);
@@ -3045,7 +3045,7 @@ export class ParallelOps implements DeviceOps {
     const pageSize = pCkvData.shape[1];
     for (let i = 0; i < this.worldSize; i++) {
       const effectiveCpRank = contextParallel ? i : undefined;
-      const cache = this.devices[i].mlaKvCacheAppend(pCkvData.shards[i], pKpeData?.shards[i] ?? null, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe?.shards[i] ?? null, pBatchIndices.shards[i], pPositions.shards[i], nnz, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, pageSize, effectiveCpWorldSize, effectiveCpRank);
+      const cache = this.devices[i].mlaKvCacheAppend(state, cacheIdx, pCkvData.shards[i], pKpeData?.shards[i] ?? null, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pAppendCkv.shards[i], pAppendKpe?.shards[i] ?? null, pBatchIndices.shards[i], pPositions.shards[i], nnz, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, pageSize, effectiveCpWorldSize, effectiveCpRank);
       using _ckv = cache.ckv;
       using _kpe = cache.kpe;
     }

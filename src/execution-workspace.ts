@@ -213,6 +213,7 @@ export class ExecutionState {
     } else {
       const kpe = pagedKV.kpeData[cacheIdx];
       return this.ws.glm.mlaKvCacheAppend(
+        this, cacheIdx,
         ckv, kpe,
         this.indices, this.indptrD, this.lastPageLen,
         appendCkv, appendKpe,
@@ -228,6 +229,7 @@ export class ExecutionState {
     const kData = pagedKV.kData[cacheIdx];
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     const cache = this.ws.glm.mlaKvCacheAppend(
+      this, cacheIdx,
       kData, null,
       this.indices, this.indptrD, this.lastPageLen,
       idxKOut, null,
