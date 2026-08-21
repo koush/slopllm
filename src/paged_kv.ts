@@ -247,6 +247,15 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     return seq;
   }
 
+  removeStagedSequence(stagingKey: number): void {
+    const seq = this.staging.get(stagingKey);
+    if (!seq) {
+      throw new Error(`removeStagedSequence: no staged sequence with key ${stagingKey}`);
+    }
+    seq.clear();
+    this.staging.delete(stagingKey);
+  }
+
   unstageAll(): void {
     const keys = [...this.staging.keys()];
     for (const key of keys) {

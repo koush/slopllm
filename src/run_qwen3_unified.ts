@@ -124,7 +124,7 @@ function parseArgs(argv: string[]): CliArgs {
   }
 
   if (args.mtp && args.mtpDraftTopk.length === 0) {
-    args.mtpDraftTopk = [2, 2, 2];
+    args.mtpDraftTopk = [1, 1, 1];
   }
   if (args.mtpDraftTopk.some(topk => !Number.isInteger(topk) || topk < 1)) {
     throw new Error(`Invalid --mtp-draft-topk: ${args.mtpDraftTopk.join(",")}`);

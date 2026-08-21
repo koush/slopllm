@@ -3,9 +3,10 @@ import crypto from "node:crypto";
 import { parentPort } from "node:worker_threads";
 import { CaptureManager } from "./capture-manager";
 import { type OutputParserEvent } from "./chat-model-parser";
-import { ChatModel, ChatCache, ChatTemplateKwargs, loadGenerationConfig, SamplingParams, Tokenizer } from "./chat_model";
+import { ChatModel, ChatCache, ChatTemplateKwargs, loadGenerationConfig, loadMaxPositionEmbeddings, type MtpDraftBatch, SamplingParams, type TokenSelector, Tokenizer } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { executePlan, ExecutionWorkspace } from "./execution-workspace";
+import { mtpTotalTreeNodes } from "./glm51_model";
 import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
@@ -28,7 +29,7 @@ interface ChatMessage {
 interface ServerArgs extends ModelCliArgs {
   port: number;
   host: string;
-  ctxSize: number;
+  chunkSize: number;
   batchSize: number;
   maxPages: number;
   maxTokens: number;
@@ -40,6 +41,7 @@ interface ServerArgs extends ModelCliArgs {
   repetitionPenaltyWindow: number;
   decodeLatency: number;
   noCudaGraph: boolean;
+  noMtp: boolean;
   mtpDraftTopk: number[];
 }
 
@@ -48,7 +50,7 @@ function parseArgs(argv: string[]): ServerArgs {
     ...parseModelArgs(argv),
     port: 8000,
     host: "0.0.0.0",
-    ctxSize: 4096,
+    chunkSize: 8192,
     batchSize: 1,
     maxPages: 0,
     maxTokens: 512,
@@ -60,13 +62,14 @@ function parseArgs(argv: string[]): ServerArgs {
     repetitionPenaltyWindow: 64,
     decodeLatency: 0,
     noCudaGraph: false,
+    noMtp: false,
     mtpDraftTopk: [],
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--port" && i + 1 < argv.length) args.port = parseInt(argv[++i], 10);
     else if (a === "--host" && i + 1 < argv.length) args.host = argv[++i];
-    else if (a === "--ctx-size" && i + 1 < argv.length) args.ctxSize = parseInt(argv[++i], 10);
+    else if (a === "--chunk-size" && i + 1 < argv.length) args.chunkSize = parseInt(argv[++i], 10);
     else if (a === "--batch-size" && i + 1 < argv.length) args.batchSize = parseInt(argv[++i], 10);
     else if (a === "--max-pages" && i + 1 < argv.length) args.maxPages = parseInt(argv[++i], 10);
     else if (a === "--max-tokens" && i + 1 < argv.length) args.maxTokens = parseInt(argv[++i], 10);
@@ -78,15 +81,16 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--repetition-penalty-window" && i + 1 < argv.length) args.repetitionPenaltyWindow = parseInt(argv[++i], 10);
     else if (a === "--decode-latency" && i + 1 < argv.length) args.decodeLatency = parseInt(argv[++i], 10);
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
+    else if (a === "--no-mtp") args.noMtp = true;
     else if (a === "--mtp-draft-topk" && i + 1 < argv.length) args.mtpDraftTopk = argv[++i].split(",").map(value => parseInt(value.trim(), 10));
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
   }
-  if (args.mtp && args.mtpDraftTopk.length === 0) args.mtpDraftTopk = [2, 2, 2];
+  if (args.mtp && !args.noMtp && args.mtpDraftTopk.length === 0) args.mtpDraftTopk = [1, 1, 1];
   if (args.mtpDraftTopk.some(topk => !Number.isInteger(topk) || topk < 1)) {
     throw new Error(`Invalid --mtp-draft-topk: ${args.mtpDraftTopk.join(",")}`);
   }
   if (args.maxPages === 0) {
-    args.maxPages = args.batchSize * Math.ceil(args.ctxSize / PAGE_SIZE);
+    args.maxPages = args.batchSize * Math.ceil(args.chunkSize / PAGE_SIZE);
   }
   return args;
 }
@@ -102,9 +106,9 @@ Options:
   --gpu <int>                   GPU device ID (default: 0)
   --gpus <list>                 GPU device IDs
   --arena <int>                 Arena size in GiB per GPU
-  --ctx-size <int>              Context size / max sequence length (default: 4096)
+  --chunk-size <int>            Maximum prefill chunk per sequence (default: 8192)
   --batch-size <int>            Maximum concurrent requests (default: 1)
-  --max-pages <int>             KV cache pages (default: batch-size * ceil(ctx-size / 16))
+  --max-pages <int>             KV cache pages (default: batch-size * ceil(chunk-size / 64))
   --max-tokens <int>            Default max completion tokens (default: 512)
   --model-dir <string>          Model directory path (default: auto-detect from HF cache)
   --temperature <float>         Override model default sampling temperature
@@ -115,8 +119,9 @@ Options:
   --repetition-penalty-window <int>  Repetition penalty window (default: 64)
   --decode-latency <int>        Artificial delay per decode step in ms (default: 0)
   --no-cuda-graph               Disable CUDA graph capture
-  --mtp                         Enable greedy MTP speculative decoding
-  --mtp-draft-topk <list>       MTP draft top-k per depth (default: 2,2,2)
+  --mtp                         Enable MTP speculative decoding
+  --no-mtp                      Disable MTP decoding for an MTP-loaded model
+  --mtp-draft-topk <list>       MTP draft top-k per depth (default: 1,1,1)
   --help, -h                    Show this help message
 `);
 }
@@ -242,10 +247,55 @@ interface ServerMetrics {
   prefillTimeSecondsSum: number;
 }
 
+interface PromptPrefillRow {
+  request: CompletionRequest;
+  inputIds: number[];
+}
+
+async function prefillPromptChunks(
+  pagedKV: ReturnType<ChatCache["getPagedKV"]>,
+  rows: PromptPrefillRow[],
+  chunkSize: number,
+  nextStagingKey: number,
+  runChunk: (inputIds: number[][], nextTokens: number[]) => Promise<void>,
+  onCancelled: (row: PromptPrefillRow) => void,
+): Promise<number> {
+  const removeCancelledRows = (): void => {
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (!rows[i].request.finished) continue;
+      const [row] = rows.splice(i, 1);
+      pagedKV.removeSequence(i);
+      onCancelled(row);
+    }
+  };
+
+  removeCancelledRows();
+  while (rows.some(row => row.inputIds.length > chunkSize)) {
+    const staged = rows.map(row => ({ row, key: nextStagingKey++ }));
+    for (const entry of staged) pagedKV.stageSequence(0, entry.key);
+
+    const chunked = staged.filter(entry => entry.row.inputIds.length > chunkSize);
+    const deferred = staged.filter(entry => entry.row.inputIds.length <= chunkSize);
+    for (const entry of chunked) pagedKV.unstageSequence(entry.key);
+
+    const inputIds = chunked.map(entry => entry.row.inputIds.slice(0, chunkSize));
+    const nextTokens = chunked.map(entry => entry.row.inputIds[chunkSize]);
+    await runChunk(inputIds, nextTokens);
+    for (let i = 0; i < chunked.length; i++) {
+      pagedKV.reportTokens(i, inputIds[i]);
+      chunked[i].row.inputIds = chunked[i].row.inputIds.slice(chunkSize);
+    }
+
+    for (const entry of deferred) pagedKV.unstageSequence(entry.key);
+    rows.splice(0, rows.length, ...chunked.map(entry => entry.row), ...deferred.map(entry => entry.row));
+    removeCancelledRows();
+  }
+  return nextStagingKey;
+}
+
 async function generateMtpBatches(
   model: ChatModel,
   ws: ExecutionWorkspace,
-  glm: DeviceOps,
   cache: ChatCache,
   eosIds: Set<number>,
   pendingQueue: CompletionRequest[],
@@ -253,130 +303,177 @@ async function generateMtpBatches(
   decodeLatencyMs: number,
   metrics: ServerMetrics,
   captureManager: CaptureManager,
+  samplingWorkspace: SamplingWorkspace,
   topks: readonly number[],
+  chunkSize: number,
 ): Promise<number> {
   if (!model.planPrefillMtpDraftExtend || !model.planTargetVerification) {
     throw new Error("The selected model does not support plan-based MTP decoding");
   }
 
   const pagedKV = cache.getPagedKV();
+  const requests: CompletionRequest[] = [];
+  const admitted = new Set<CompletionRequest>();
+  const notified = new Set<CompletionRequest>();
+  let draft: MtpDraftBatch | undefined;
+  let nextStagingKey = 0;
   let admittedRequests = 0;
+  const numVerificationTokens = mtpTotalTreeNodes(topks) + 1;
+  const selectTokens: TokenSelector = (logits: Tensor): Tensor => samplingWorkspace.sample(logits);
+  const updateSamplingParams = (params: SamplingParams[]): void => {
+    samplingWorkspace.updateSampler(params, params.map(() => []));
+    selectTokens.captureKey = Math.max(...params.map(param => {
+      if (param.temperature <= 0) return 1;
+      if (param.topK > 0) return Math.min(param.topK, model.cfg.vocabSize);
+      return 32;
+    }));
+  };
 
-  while (pendingQueue.length > 0) {
-    const cohort = pendingQueue.splice(0, maxBatchSize);
-    const requests = [...cohort];
-    const notified = new Set<CompletionRequest>();
-    admittedRequests += requests.length;
-    metrics.runningRequests += requests.length;
+  const finish = (req: CompletionRequest): void => {
+    if (notified.has(req)) return;
+    notified.add(req);
+    admitted.delete(req);
+    metrics.runningRequests--;
+    metrics.requestSuccessTotal++;
+    try { req.onFinish(); } catch {}
+  };
 
-    const finish = (req: CompletionRequest): void => {
-      if (notified.has(req)) return;
-      notified.add(req);
-      metrics.runningRequests--;
-      metrics.requestSuccessTotal++;
-      try { req.onFinish(); } catch {}
-    };
+  const processToken = (req: CompletionRequest, token: number): void => {
+    if (req.finished) return;
+    req.generatedIds.push(token);
+    metrics.generationTokensTotal++;
+    const isEos = eosIds.has(token);
+    if (!isEos) processOutputToken(req, token);
+    if (isEos || req.generatedIds.length >= req.maxTokens) {
+      req.finished = true;
+      req.finishReason = isEos ? "stop" : "length";
+    }
+    if (!req.finished) checkStopSequences(req);
+    if (req.finished) finish(req);
+  };
 
-    try {
-      cache.reset(requests.length);
-      const suffixIds = requests.map((req, index) => cache.prefixMatch(index, req.inputIds));
-      const mtpInputIds = model.prepareMtpInput(cache, suffixIds);
-      for (const req of requests) metrics.promptTokensTotal += req.promptTokenCount;
-
-      const prefillStart = performance.now();
-      let draft = (await executePlan(
-        captureManager,
-        ws,
-        model.planPrefillMtpDraftExtend(ws, cache, mtpInputIds, topks),
-      )).result;
-      const prefillSeconds = (performance.now() - prefillStart) / 1000;
-      metrics.prefillTimeSecondsCount += requests.length;
-      metrics.prefillTimeSecondsSum += prefillSeconds * requests.length;
-
-      const removeFinishedRows = (): void => {
-        const retained: number[] = [];
-        for (let i = 0; i < requests.length; i++) {
-          if (!requests[i].finished) retained.push(i);
-        }
-        for (let i = requests.length - 1; i >= 0; i--) {
-          if (requests[i].finished) {
-            pagedKV.removeSequence(i);
-            requests.splice(i, 1);
-          }
-        }
-        if (retained.length !== draft.targetTokens.length) {
-          draft = {
-            targetTokens: retained.map(index => draft.targetTokens[index]),
-            treeTokens: retained.map(index => draft.treeTokens[index]),
-            topks: draft.topks,
-          };
-        }
+  const removeFinishedRows = (): void => {
+    if (!draft) return;
+    const retained: number[] = [];
+    for (let i = 0; i < requests.length; i++) {
+      if (!requests[i].finished) retained.push(i);
+    }
+    for (let i = requests.length - 1; i >= 0; i--) {
+      if (requests[i].finished) {
+        finish(requests[i]);
+        pagedKV.removeSequence(i);
+        requests.splice(i, 1);
+      }
+    }
+    if (retained.length !== draft.targetTokens.length) {
+      draft = {
+        targetTokens: retained.map(index => draft!.targetTokens[index]),
+        treeTokens: retained.map(index => draft!.treeTokens[index]),
+        topks: draft.topks,
       };
+    }
+  };
 
-      for (let i = 0; i < requests.length; i++) {
-        const req = requests[i];
-        const token = draft.targetTokens[i];
-        pagedKV.reportTokens(i, suffixIds[i]);
-        pagedKV.reportTokens(i, [token]);
-        if (!req.finished) {
-          req.generatedIds.push(token);
-          metrics.generationTokensTotal++;
-          const isEos = eosIds.has(token);
-          if (!isEos) processOutputToken(req, token);
-          if (isEos || req.generatedIds.length >= req.maxTokens) {
-            req.finished = true;
-            req.finishReason = isEos ? "stop" : "length";
+  try {
+    while (requests.length > 0 || pendingQueue.length > 0) {
+      const newCount = Math.min(pendingQueue.length, maxBatchSize - requests.length);
+      if (newCount > 0) {
+        const newRequests = pendingQueue.splice(0, newCount);
+        for (const req of newRequests) admitted.add(req);
+        admittedRequests += newCount;
+        metrics.runningRequests += newCount;
+        metrics.promptTokensTotal += newRequests.reduce((sum, req) => sum + req.promptTokenCount, 0);
+
+        // Recondition at a verification boundary. Existing rows retain their
+        // committed KV and reprocess only their outstanding replacement token.
+        const activeEntries = requests.map(request => ({ request, key: nextStagingKey++ }));
+        for (const entry of activeEntries) pagedKV.stageSequence(0, entry.key);
+        cache.reset(newCount);
+        const suffixIds = newRequests.map((req, index) => cache.prefixMatch(index, req.inputIds));
+        const newRows = newRequests.map((request, index) => ({ request, inputIds: suffixIds[index] }));
+        if (!model.planPrefillMtpChunk) throw new Error("The selected model does not support chunked MTP prefill");
+        const prefillStart = performance.now();
+        nextStagingKey = await prefillPromptChunks(
+          pagedKV,
+          newRows,
+          chunkSize,
+          nextStagingKey,
+          async (inputIds, nextTokens) => {
+            await executePlan(captureManager, ws, model.planPrefillMtpChunk!(ws, cache, inputIds, nextTokens));
+          },
+          row => finish(row.request),
+        );
+        const retainedActive: CompletionRequest[] = [];
+        for (const entry of activeEntries) {
+          if (entry.request.finished) {
+            pagedKV.removeStagedSequence(entry.key);
+            finish(entry.request);
+          } else {
+            pagedKV.unstageSequence(entry.key);
+            retainedActive.push(entry.request);
           }
-          if (!req.finished) checkStopSequences(req);
         }
-        if (req.finished) finish(req);
+        requests.splice(0, requests.length, ...newRows.map(row => row.request), ...retainedActive);
+        if (requests.length === 0) {
+          draft = undefined;
+          continue;
+        }
+
+        const mtpInputIds = model.prepareMtpInput(cache, [
+          ...newRows.map(row => row.inputIds),
+          ...Array.from({ length: retainedActive.length }, () => [] as number[]),
+        ]);
+        const targetParams = requests.map(req => req.samplingParams);
+        updateSamplingParams(targetParams);
+        draft = (await executePlan(
+          captureManager,
+          ws,
+          model.planPrefillMtpDraftExtend(ws, cache, mtpInputIds, topks, selectTokens),
+        )).result;
+        const prefillSeconds = (performance.now() - prefillStart) / 1000;
+        metrics.prefillTimeSecondsCount += newCount;
+        metrics.prefillTimeSecondsSum += prefillSeconds * newCount;
+
+        for (let i = 0; i < requests.length; i++) {
+          if (i < newRows.length) pagedKV.reportTokens(i, newRows[i].inputIds);
+          pagedKV.reportTokens(i, [draft.targetTokens[i]]);
+          processToken(requests[i], draft.targetTokens[i]);
+        }
+        removeFinishedRows();
+        continue;
+      }
+
+      const verificationParams = requests.flatMap(req =>
+        Array.from({ length: numVerificationTokens }, () => req.samplingParams));
+      updateSamplingParams(verificationParams);
+      const step = await executePlan(captureManager, ws, model.planTargetVerification(ws, cache, draft!, selectTokens));
+      draft = step.result.draft;
+      for (let i = 0; i < requests.length; i++) {
+        const tokens = step.result.tokens[i];
+        pagedKV.reportTokens(i, tokens);
+        for (const token of tokens) {
+          processToken(requests[i], token);
+          if (requests[i].finished) break;
+        }
       }
       removeFinishedRows();
 
-      while (requests.length > 0) {
-        const step = await executePlan(captureManager, ws, model.planTargetVerification(ws, cache, draft));
-        draft = step.result.draft;
-
-        for (let i = 0; i < requests.length; i++) {
-          const req = requests[i];
-          const tokens = step.result.tokens[i];
-          pagedKV.reportTokens(i, tokens);
-
-          for (const token of tokens) {
-            req.generatedIds.push(token);
-            metrics.generationTokensTotal++;
-            const isEos = eosIds.has(token);
-            if (!isEos) processOutputToken(req, token);
-            if (isEos || req.generatedIds.length >= req.maxTokens) {
-              req.finished = true;
-              req.finishReason = isEos ? "stop" : "length";
-            }
-            if (!req.finished) checkStopSequences(req);
-            if (req.finished) {
-              finish(req);
-              break;
-            }
-          }
-        }
-        removeFinishedRows();
-
-        if (decodeLatencyMs > 0) {
-          await new Promise(resolve => setTimeout(resolve, decodeLatencyMs));
-        } else {
-          await new Promise(resolve => setImmediate(resolve));
-        }
+      if (decodeLatencyMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, decodeLatencyMs));
+      } else {
+        await new Promise(resolve => setImmediate(resolve));
       }
-    } catch (error) {
-      ws.clearTracking();
-      for (const req of cohort) {
-        if (notified.has(req)) continue;
-        notified.add(req);
-        req.finished = true;
-        metrics.runningRequests = Math.max(0, metrics.runningRequests - 1);
-        try { req.onError(error); } catch {}
-      }
-      throw error;
     }
+  } catch (error) {
+    ws.clearTracking();
+    pagedKV.clearStaging();
+    cache.reset(0);
+    for (const req of admitted) {
+      req.finished = true;
+      metrics.runningRequests = Math.max(0, metrics.runningRequests - 1);
+      try { req.onError(error); } catch {}
+    }
+    throw error;
   }
 
   return admittedRequests;
@@ -401,6 +498,12 @@ async function generateContinuousBatch(
   let nextStagingKey = 0;
   let admittedRequests = 0;
   const admitted = new Set<CompletionRequest>();
+  const finishCancelled = (req: CompletionRequest): void => {
+    if (!admitted.delete(req)) return;
+    metrics.runningRequests--;
+    metrics.requestSuccessTotal++;
+    try { req.onFinish(); } catch {}
+  };
 
   try {
     while (active.length > 0 || pendingQueue.length > 0) {
@@ -425,63 +528,83 @@ async function generateContinuousBatch(
       admittedRequests += newCount;
       metrics.runningRequests += newCount;
 
-      const inputIdsList = newRequests.map(req => req.inputIds);
       for (const req of newRequests) metrics.promptTokensTotal += req.promptTokenCount;
 
-      if (active.length === 0) {
-        // Fast path: no active sequences, no staging needed
-        pagedKV.reset(newCount);
-      } else {
-        // Stage active sequences to preserve their KV cache
-        for (let i = 0; i < active.length; i++) {
-          pagedKV.stageSequence(0, nextStagingKey++);
-        }
-        pagedKV.reset(newCount);
-      }
+      const activeEntries = active.map(sequence => ({ sequence, key: nextStagingKey++ }));
+      for (const entry of activeEntries) pagedKV.stageSequence(0, entry.key);
+      pagedKV.reset(newCount);
+      const newRows = newRequests.map((request, index) => ({
+        request,
+        inputIds: cache.prefixMatch(index, request.inputIds),
+      }));
 
       // Prefill new requests
       const prefillStart = performance.now();
+      nextStagingKey = await prefillPromptChunks(
+        pagedKV,
+        newRows,
+        ws.maxSeqLen,
+        nextStagingKey,
+        async inputIds => {
+          {
+            using _logits = ws.forwardPrefill(model, inputIds, cache);
+            await glm.synchronizeAsync();
+          }
+          ws.clearTracking();
+        },
+        row => finishCancelled(row.request),
+      );
+      const retainedActive: ActiveSequence[] = [];
+      for (const entry of activeEntries) {
+        if (entry.sequence.request.finished) {
+          pagedKV.removeStagedSequence(entry.key);
+          finishCancelled(entry.sequence.request);
+        } else {
+          pagedKV.unstageSequence(entry.key);
+          retainedActive.push(entry.sequence);
+        }
+      }
+      if (newRows.length === 0) {
+        active.splice(0, active.length, ...retainedActive);
+        continue;
+      }
+      const inputIdsList = newRows.map(row => row.inputIds);
       const firstTokens = ws.forwardEagerPrefill(model, inputIdsList, cache);
       await glm.synchronizeAsync();
       ws.clearTracking();
       const prefillSeconds = (performance.now() - prefillStart) / 1000;
-      metrics.prefillTimeSecondsCount += newCount;
-      metrics.prefillTimeSecondsSum += prefillSeconds * newCount;
+      metrics.prefillTimeSecondsCount += newRows.length;
+      metrics.prefillTimeSecondsSum += prefillSeconds * newRows.length;
       metrics.generationTokensTotal += firstTokens.length;
 
       // Report tokens and check for first-token EOS
-      for (let i = 0; i < newCount; i++) {
+      for (let i = 0; i < newRows.length; i++) {
         pagedKV.reportTokens(i, inputIdsList[i]);
         pagedKV.reportTokens(i, [firstTokens[i]]);
-        newRequests[i].generatedIds.push(firstTokens[i]);
+        newRows[i].request.generatedIds.push(firstTokens[i]);
         const isEos = eosIds.has(firstTokens[i]);
         if (!isEos) {
-          processOutputToken(newRequests[i], firstTokens[i]);
+          processOutputToken(newRows[i].request, firstTokens[i]);
         }
-        if (isEos || newRequests[i].generatedIds.length >= newRequests[i].maxTokens) {
-          newRequests[i].finished = true;
-          newRequests[i].finishReason = isEos ? "stop" : "length";
+        if (isEos || newRows[i].request.generatedIds.length >= newRows[i].request.maxTokens) {
+          newRows[i].request.finished = true;
+          newRows[i].request.finishReason = isEos ? "stop" : "length";
       }
 
-        if (!newRequests[i].finished) {
-          checkStopSequences(newRequests[i]);
+        if (!newRows[i].request.finished) {
+          checkStopSequences(newRows[i].request);
         }
-      }
-
-      // Unstage active sequences (if any)
-      if (active.length > 0) {
-        pagedKV.unstageAll();
       }
 
       // Build new active list matching pagedKV sequence order: [new..., old...]
       const newActiveSequences: ActiveSequence[] = [];
-      for (let i = 0; i < newCount; i++) {
+      for (let i = 0; i < newRows.length; i++) {
         newActiveSequences.push({
-          request: newRequests[i],
+          request: newRows[i].request,
           lastToken: firstTokens[i],
         });
       }
-      newActiveSequences.push(...active);
+      newActiveSequences.push(...retainedActive);
       active.length = 0;
       active.push(...newActiveSequences);
     }
@@ -665,6 +788,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   console.log(`Loading model from ${modelDir}...`);
   const { glm, gpuDevices } = createDeviceOps(args);
   const model = await loadModel(glm, args, modelDir);
+  const maxModelLen = model.cfg.maxPositionEmbeddings ?? loadMaxPositionEmbeddings(modelDir) ?? args.chunkSize;
+  model.cfg.maxPositionEmbeddings = maxModelLen;
   const generationConfig = model.cfg.generationConfig ?? loadGenerationConfig(modelDir);
   model.cfg.generationConfig = generationConfig;
   if (!argv.includes("--temperature") && generationConfig.temperature !== undefined) args.temperature = generationConfig.temperature;
@@ -673,18 +798,21 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   if (!argv.includes("--repetition-penalty") && generationConfig.repetitionPenalty !== undefined) {
     args.repetitionPenalty = generationConfig.repetitionPenalty;
   }
-  if (args.mtp && (!model.planPrefillMtpDraftExtend || !model.planTargetVerification)) {
+  if (args.mtp && !args.noMtp && (!model.planPrefillMtpDraftExtend || !model.planTargetVerification)) {
     throw new Error("--mtp requires a model with plan-based MTP decoding support");
   }
-  const cache = model.createChatCache(args.maxPages, args.batchSize, args.ctxSize);
-  const ws = new ExecutionWorkspace(glm, args.batchSize, args.ctxSize);
+  const cache = model.createChatCache(args.maxPages, args.batchSize, args.chunkSize);
+  const ws = new ExecutionWorkspace(glm, args.batchSize, args.chunkSize);
   const captureManager = new CaptureManager(glm);
   captureManager.disabled = args.noCudaGraph;
   const samplingWorkspace = new SamplingWorkspace(glm, args.batchSize, model.cfg.vocabSize, args.repetitionPenaltyWindow);
+  const mtpSamplingWorkspace = args.mtp && !args.noMtp
+    ? new SamplingWorkspace(glm, args.batchSize * (mtpTotalTreeNodes(args.mtpDraftTopk) + 1), model.cfg.vocabSize, 0)
+    : undefined;
   const tokenizer = model.tokenizer;
   const eosIds = model.eosIds;
 
-  console.log(`Model loaded. ctx-size=${args.ctxSize} batch-size=${args.batchSize} max-pages=${args.maxPages} max-tokens=${args.maxTokens}`);
+  console.log(`Model loaded. chunk-size=${args.chunkSize} batch-size=${args.batchSize} max-pages=${args.maxPages} max-tokens=${args.maxTokens}`);
   console.log(`Generation defaults: temperature=${args.temperature} top-p=${args.topP} top-k=${args.topK} repetition-penalty=${args.repetitionPenalty}`);
 
   {
@@ -745,11 +873,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const t0 = performance.now();
       let requestCount = 0;
       try {
-        requestCount = args.mtp
+        requestCount = args.mtp && !args.noMtp
           ? await generateMtpBatches(
             model,
             ws,
-            glm,
             cache,
             eosIds,
             pendingQueue,
@@ -757,7 +884,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             args.decodeLatency,
             metrics,
             captureManager,
+            mtpSamplingWorkspace!,
             args.mtpDraftTopk,
+            args.chunkSize,
           )
           : await generateContinuousBatch(
             model,
@@ -851,7 +980,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const stream = params.stream === true;
       const maxTokens = Math.max(1, Math.min(
         params.max_tokens ?? params.max_completion_tokens ?? args.maxTokens,
-        args.ctxSize,
+        maxModelLen - 1,
       ));
       const temperature = params.temperature ?? args.temperature;
       const topP = params.top_p ?? args.topP;
@@ -873,10 +1002,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         presencePenalty,
         repetitionPenaltyWindow: args.repetitionPenaltyWindow,
       };
-      if (args.mtp && (samplingParams.temperature > 0 || samplingParams.repetitionPenalty !== 1 || samplingParams.presencePenalty !== 0)) {
+      if (args.mtp && !args.noMtp && (samplingParams.repetitionPenalty !== 1 || samplingParams.presencePenalty !== 0)) {
         sendJSON(res, 400, {
           error: {
-            message: "MTP decoding currently requires temperature=0, repetition_penalty=1, and presence_penalty=0",
+            message: "MTP decoding currently requires repetition_penalty=1 and presence_penalty=0",
             type: "invalid_request_error",
           },
         });
@@ -895,8 +1024,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         sendJSON(res, 400, { error: { message, type: "invalid_request_error" } });
         return;
       }
-      if (inputIds.length > args.ctxSize - maxTokens) {
-        inputIds.splice(0, inputIds.length - (args.ctxSize - maxTokens));
+      const maxPromptTokens = Math.max(1, maxModelLen - maxTokens);
+      if (inputIds.length > maxPromptTokens) {
+        inputIds.splice(0, inputIds.length - maxPromptTokens);
       }
 
       const completionReq: CompletionRequest = {
@@ -1002,8 +1132,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           res.end();
         };
 
-        req.on("close", () => {
-          completionReq.finished = true;
+        res.on("close", () => {
+          if (!res.writableEnded) completionReq.finished = true;
         });
       } else {
         completionReq.onFinish = () => {
@@ -1039,8 +1169,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           sendJSON(res, 500, { error: { message, type: "server_error" } });
         };
 
-        req.on("close", () => {
-          completionReq.finished = true;
+        res.on("close", () => {
+          if (!res.writableEnded) completionReq.finished = true;
         });
       }
 
@@ -1084,7 +1214,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         const tokens = tokenizeMessages(tokenizer, messages, tools, chatTemplateKwargs);
         sendJSON(res, 200, {
           count: tokens.length,
-          max_model_len: args.ctxSize,
+          max_model_len: maxModelLen,
           tokens,
           token_strs: null,
         });
@@ -1129,7 +1259,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           object: "model",
           created: Math.floor(Date.now() / 1000),
           owned_by: "local",
-          max_model_len: args.ctxSize,
+          max_model_len: maxModelLen,
         }],
       });
     } else if (req.method === "GET" && url.pathname === "/health") {
@@ -1147,8 +1277,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  GET  /v1/models            - List models`);
     console.log(`  GET  /health               - Health check`);
     console.log(`  CUDA graphs: ${args.noCudaGraph ? "disabled" : "enabled"}`);
-    console.log(`  MTP: ${args.mtp ? `enabled (draft top-k ${args.mtpDraftTopk.join(",")})` : "disabled"}`);
-    console.log(`  Model: ${modelName}  |  GPU: ${args.gpus.join(",")}  |  ctx-size=${args.ctxSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);
+    console.log(`  MTP: ${args.mtp && !args.noMtp ? `enabled (draft top-k ${args.mtpDraftTopk.join(",")})` : "disabled"}`);
+    console.log(`  Model: ${modelName}  |  GPU: ${args.gpus.join(",")}  |  chunk-size=${args.chunkSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);
   });
 
   let cleaningUp = false;
@@ -1159,6 +1289,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     while (busy) await new Promise(resolve => setTimeout(resolve, 10));
     glm.synchronize();
     captureManager[Symbol.dispose]();
+    mtpSamplingWorkspace?.free();
     samplingWorkspace.free();
     cache.free();
     ws.free();

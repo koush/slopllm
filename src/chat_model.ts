@@ -50,6 +50,11 @@ export interface MtpStepResult {
   numDraftTokens: number;
 }
 
+export interface TokenSelector {
+  (logits: Tensor): Tensor;
+  captureKey?: string | number;
+}
+
 export interface CommonModelConfig {
   hiddenSize: number;
   intermediateSize: number;
@@ -66,7 +71,16 @@ export interface CommonModelConfig {
   scaling: number;
   kvLoraRank?: number;
   qkRopeHeadDim?: number;
+  maxPositionEmbeddings?: number;
   generationConfig?: GenerationConfig;
+}
+
+export function loadMaxPositionEmbeddings(modelDir: string): number | undefined {
+  const filePath = path.join(modelDir, "config.json");
+  if (!fs.existsSync(filePath)) return undefined;
+  const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  const config = raw.text_config ?? raw;
+  return typeof config.max_position_embeddings === "number" ? config.max_position_embeddings : undefined;
 }
 
 export function loadGenerationConfig(modelDir: string): GenerationConfig {
@@ -101,8 +115,9 @@ export abstract class ChatModel extends WorkspaceBase {
 
   abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number): ChatCache;
   abstract forwardModel(state: ExecutionState): Tensor;
-  planPrefillMtpDraftExtend?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[]): ExecutionPlan<MtpDraftBatch>;
-  planTargetVerification?(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch): ExecutionPlan<MtpStepResult>;
+  planPrefillMtpChunk?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void>;
+  planPrefillMtpDraftExtend?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens?: TokenSelector): ExecutionPlan<MtpDraftBatch>;
+  planTargetVerification?(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, selectTokens?: TokenSelector): ExecutionPlan<MtpStepResult>;
 
   prepareMtpInput(_cache: ChatCache, inputIdsList: number[][]): number[][] {
     return inputIdsList.map(inputIds => [...inputIds]);
@@ -202,6 +217,7 @@ export abstract class ChatModel extends WorkspaceBase {
       this.tokenizer.chat_template = fs.readFileSync(chatTemplatePath, "utf-8")
         .replace(/\.(\d+)\b/g, "[$1]");
     }
+    this.cfg.maxPositionEmbeddings = loadMaxPositionEmbeddings(modelDir);
     this.cfg.generationConfig = loadGenerationConfig(modelDir);
     this.freeze();
   }

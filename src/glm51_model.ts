@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ChatCache, ChatTemplateKwargs, MtpDraftBatch, MtpStepResult } from "./chat_model";
+import type { ChatCache, ChatTemplateKwargs, MtpDraftBatch, MtpStepResult, TokenSelector } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
 import { executionPhase, type ExecutionPlan, ExecutionState, ExecutionWorkspace } from "./execution-workspace";
@@ -70,7 +70,7 @@ function mtpTotalPaths(topks: readonly number[]): number {
   return topks.reduce((acc, topk) => acc * topk, 1);
 }
 
-function mtpTotalTreeNodes(topks: readonly number[]): number {
+export function mtpTotalTreeNodes(topks: readonly number[]): number {
   let total = 0;
   let width = 1;
   for (const topk of topks) {
@@ -1069,7 +1069,49 @@ export class Glm51Model extends ChatModel {
     }
   }
 
-  *planPrefillMtpDraftExtend(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[]): ExecutionPlan<MtpDraftBatch> {
+  *planPrefillMtpChunk(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void> {
+    if (!this.forwardMtp || inputIds.length !== nextTokens.length || inputIds.some(ids => ids.length === 0)) {
+      throw new Error("MTP chunk prefill requires non-empty inputs and one next token per sequence");
+    }
+    const batchSize = inputIds.length;
+    const originalAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
+    let completed = false;
+    using _rollback = {
+      [Symbol.dispose]: () => {
+        if (!completed) {
+          for (let batch = 0; batch < batchSize; batch++) {
+            cache.getPagedKV().sequences[batch].truncate(originalAllocLens[batch]);
+          }
+        }
+      },
+    };
+    const state = ws.planPrefill(this, batchSize, inputIds.map(ids => ids.length), cache);
+    state.setInput(inputIds);
+
+    yield* executionPhase({
+      states: [state],
+      inputs: {},
+      captureKey: [],
+      run: () => {
+        using sharedSlots = new UsingHolder<Tensor>(undefined!);
+        using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
+        using hiddenStates = this.forwardModel(state, sharedSlots, sharedSlotsLength);
+        using nextDevice = ws.alloc([ws.maxBatch], "I32");
+        const nextBuffer = Buffer.alloc(batchSize * I32);
+        for (let batch = 0; batch < batchSize; batch++) {
+          nextBuffer.writeInt32LE(nextTokens[batch], batch * I32);
+        }
+        nextDevice.h2d(nextBuffer);
+        using rotatedInput = state.input!.rotateInputIds(state.qoIndptrD, nextDevice, batchSize);
+        state.setInput(rotatedInput);
+        using _mtpHidden = this.forwardMtp(state, hiddenStates, sharedSlots, sharedSlotsLength);
+        return undefined;
+      },
+    });
+    completed = true;
+  }
+
+  *planPrefillMtpDraftExtend(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens: TokenSelector = logits => logits.argmax()): ExecutionPlan<MtpDraftBatch> {
     if (!this.forwardMtp || topks.length === 0) {
       throw new Error("MTP draft extend requires an MTP-enabled model and non-empty topks");
     }
@@ -1103,8 +1145,8 @@ export class Glm51Model extends ChatModel {
         using targetDevice = ws.alloc([ws.maxBatch], "I32");
         using hiddenStates = this.forwardModel(prefillState, sharedSlots, sharedSlotsLength);
         using logits = prefillState.computeLogits(hiddenStates, this);
-        using target = logits.argmax();
-        targetDevice.memcpy(target, target.bytes, MemcpyKind.DeviceToDevice);
+        const target = selectTokens(logits);
+        targetDevice.memcpy(target, batchSize * I32, MemcpyKind.DeviceToDevice);
         using rotatedInput = prefillState.input!.rotateInputIds(prefillState.qoIndptrD, targetDevice, batchSize);
         prefillState.setInput(rotatedInput);
         using mtpHidden = this.forwardMtp(prefillState, hiddenStates, sharedSlots, sharedSlotsLength);
@@ -1160,7 +1202,7 @@ export class Glm51Model extends ChatModel {
     };
   }
 
-  *planTargetVerification(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch): ExecutionPlan<MtpStepResult> {
+  *planTargetVerification(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, selectTokens: TokenSelector = logits => logits.argmax()): ExecutionPlan<MtpStepResult> {
     const topks = draft.topks;
     const batchSize = draft.targetTokens.length;
     if (draft.treeTokens.length !== batchSize) {
@@ -1194,7 +1236,7 @@ export class Glm51Model extends ChatModel {
     const artifacts = yield* executionPhase({
       states: [state],
       inputs: {},
-      captureKey: ["glm51-mtp-verify", topks.join(",")],
+      captureKey: ["glm51-mtp-verify", topks.join(","), selectTokens.captureKey ?? "greedy"],
       run: () => {
         const seed = ws.alloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16");
         const mtpHiddenStaging = ws.alloc([ws.maxBatch * numVerificationTokens, this.cfg.hiddenSize], "BF16");
@@ -1214,9 +1256,10 @@ export class Glm51Model extends ChatModel {
         };
         using hiddenStates = this.forwardModel(state, slots, slotsLength);
         using logits = state.computeLogits(hiddenStates, this, true);
-        using argmax = logits.argmax();
-        argmaxHost.memcpy(argmax, argmax.bytes, MemcpyKind.DeviceToHost);
-        state.setInput(argmax);
+        const selected = selectTokens(logits);
+        argmaxHost.memcpy(selected, batchSize * numVerificationTokens * I32, MemcpyKind.DeviceToHost);
+        using selectedInput = selected.narrow(0, batchSize * numVerificationTokens);
+        state.setInput(selectedInput);
         using mtpHidden = this.forwardMtp(state, hiddenStates, slots, slotsLength);
         mtpHiddenStaging.memcpy(mtpHidden, mtpHidden.bytes, MemcpyKind.DeviceToDevice);
         return {

@@ -39,26 +39,26 @@ export class SamplingWorkspace extends WorkspaceBase {
     this.maxWindow = maxWindow;
     this.batchSize = 0;
 
-    this.penaltyTokens = this.alloc([maxWindow > 0 ? maxBatchSize * maxWindow : maxBatchSize], "I32");
-    this.penaltyCount = this.alloc([maxBatchSize], "I32");
-    this.stepCounter = this.alloc([1], "U32");
-    this.temperatures = this.alloc([maxBatchSize], "F32");
-    this.temperaturesH = this.allocPinned([maxBatchSize], "F32");
-    this.repPenalties = this.alloc([maxBatchSize], "F32");
-    this.repPenaltiesH = this.allocPinned([maxBatchSize], "F32");
-    this.presPenalties = this.alloc([maxBatchSize], "F32");
-    this.presPenaltiesH = this.allocPinned([maxBatchSize], "F32");
-    this.topKs = this.alloc([maxBatchSize], "I32");
-    this.topKsH = this.allocPinned([maxBatchSize], "I32");
-    this.topPs = this.alloc([maxBatchSize], "F32");
-    this.topPsH = this.allocPinned([maxBatchSize], "F32");
-    this.outToken = this.alloc([maxBatchSize], "I32");
+    this.penaltyTokens = this.alloc([maxWindow > 0 ? maxBatchSize * maxWindow : maxBatchSize], "I32", "penaltyTokens");
+    this.penaltyCount = this.alloc([maxBatchSize], "I32", "penaltyCount");
+    this.stepCounter = this.alloc([1], "U32", "stepCounter");
+    this.temperatures = this.alloc([maxBatchSize], "F32", "temperatures");
+    this.temperaturesH = this.allocPinned([maxBatchSize], "F32", "temperaturesHost");
+    this.repPenalties = this.alloc([maxBatchSize], "F32", "repetitionPenalties");
+    this.repPenaltiesH = this.allocPinned([maxBatchSize], "F32", "repetitionPenaltiesHost");
+    this.presPenalties = this.alloc([maxBatchSize], "F32", "presencePenalties");
+    this.presPenaltiesH = this.allocPinned([maxBatchSize], "F32", "presencePenaltiesHost");
+    this.topKs = this.alloc([maxBatchSize], "I32", "topKs");
+    this.topKsH = this.allocPinned([maxBatchSize], "I32", "topKsHost");
+    this.topPs = this.alloc([maxBatchSize], "F32", "topPs");
+    this.topPsH = this.allocPinned([maxBatchSize], "F32", "topPsHost");
+    this.outToken = this.alloc([maxBatchSize], "I32", "outToken");
 
     const SAMPLING_MAX_TOPK = 256;
     const SAMPLING_BLOCK_SIZE = 256;
-    this.topkVals = this.alloc([maxBatchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32");
-    this.topkIdxs = this.alloc([maxBatchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32");
-    this.sampleWorkspaceBuf = this.alloc([maxBatchSize * vocabSize], "F32");
+    this.topkVals = this.alloc([maxBatchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32", "topkValues");
+    this.topkIdxs = this.alloc([maxBatchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32", "topkIndices");
+    this.sampleWorkspaceBuf = this.alloc([maxBatchSize * vocabSize], "F32", "sampleWorkspace");
 
     const seedBuf = Buffer.alloc(4);
     seedBuf.writeUInt32LE(Math.floor(Math.random() * 0xFFFFFFFF) >>> 0, 0);
