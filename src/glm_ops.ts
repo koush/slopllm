@@ -934,9 +934,8 @@ export class GlmOps implements DeviceOps {
   // (score+topk, then map token positions to slots) on this device. Decode uses
   // the multi-block score+histogram kernel (v2): totalQ is small (batch), so
   // per-query scratch is tiny. Prefill uses the fused two-level kernel: multi-
-  // block grid (numSplits × totalQ) parallelizes across both KV and query dims,
-  // with a coarse/fine histogram top-K that avoids materializing scores.
-  // Scratch: ~17 MB (coarseHist + fineHist + meta) vs 2.1 GB for v2 on prefill.
+  // block grid parallelizes across both KV and query dims, followed by a
+  // coarse/fine histogram top-K over the materialized BF16 scores.
   // Writes the compacted valid-slot count per query into `topkLength` (a stable
   // caller buffer), which feeds the sparse kernel's topk_length so it only walks
   // ceil(count/BI) candidate tiles instead of the full topk.
@@ -945,11 +944,18 @@ export class GlmOps implements DeviceOps {
     const idxNHeads = idxQ.shape[1];
     const idxHeadDim = idxQ.shape[2];
     const pageSize = kData.shape[1];
-    const maxKv = kData.shape[0] * kData.shape[1];
+    const maxKvCapacity = kData.shape[0] * kData.shape[1];
     const useDirect = totalQ <= INDEXER_DIRECT_DISPATCH_MAX;
+    // Decode graphs are length-invariant and retain capacity-sized scratch.
+    // Large prefill graphs are already bucketed by padded KV length, so avoid
+    // launching and allocating for the unused remainder of the cache.
+    const maxKv = useDirect
+      ? maxKvCapacity
+      : Math.min(maxKvCapacity, state.getGraphVariantPaddedKvLen());
+    const queryTiles = Math.ceil(totalQ / 64) + state.batchSize - 1;
     return useDirect
       ? this.indexerScoreTopkV2(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr)
-      : this.indexerScoreTopkPrefill(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr);
+      : this.indexerScoreTopkPrefill(idxQ, kData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, queryTiles, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr);
   }
 
   // Sort each top-k row ascending by index (-1 padding last), in place.
@@ -990,8 +996,10 @@ export class GlmOps implements DeviceOps {
     };
   }
 
-  private indexerScoreTopkPrefill(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor): { values: Tensor, indices: Tensor } {
-    const numSplits = Math.min(256, Math.max(1, Math.ceil(maxKv / 256)));
+  private indexerScoreTopkPrefill(q: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, queryTiles: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor): { values: Tensor, indices: Tensor } {
+    // sum(ceil(seqQ / 64)) <= ceil(totalQ / 64) + batchSize - 1. This is
+    // exact for the single-sequence query-sharded path and stable for capture
+    // because totalQ and batchSize are both part of the graph key.
     const indices = q.workspace.alloc([totalQ, topk], "I32");
     const values = q.workspace.alloc([totalQ, topk], "BF16");
     using scores = q.workspace.alloc([totalQ, maxKv], "BF16");
@@ -999,7 +1007,7 @@ export class GlmOps implements DeviceOps {
     using coarseHist = q.workspace.alloc([totalQ, 1024], "I32");
     using fineHist = q.workspace.alloc([totalQ, 64], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
-    getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, values.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, maxKv, coarseHist.data, fineHist.data, meta.data, numSplits, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0);
+    getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, values.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, maxKv, coarseHist.data, fineHist.data, meta.data, queryTiles, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0);
     return { values, indices };
   }
 

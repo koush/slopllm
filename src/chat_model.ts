@@ -26,6 +26,7 @@ export interface GenerationConfig {
   topP?: number;
   topK?: number;
   repetitionPenalty?: number;
+  maxNewTokens?: number;
 }
 
 export interface ChatCache extends Disposable {
@@ -94,6 +95,7 @@ export function loadGenerationConfig(modelDir: string): GenerationConfig {
     topP: typeof raw.top_p === "number" ? raw.top_p : undefined,
     topK: typeof raw.top_k === "number" ? raw.top_k : undefined,
     repetitionPenalty: typeof raw.repetition_penalty === "number" ? raw.repetition_penalty : undefined,
+    maxNewTokens: typeof raw.max_new_tokens === "number" ? raw.max_new_tokens : undefined,
   };
 }
 

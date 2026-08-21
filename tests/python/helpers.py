@@ -1160,7 +1160,8 @@ class GlmOps:
                                    coarse_hist, fine_hist, meta, num_splits,
                                    custom_mask=None, mask_indptr=None, mask_kv_len=None,
                                     q_global_start=0, cp_world_size=0, cp_rank=0, global_last_page_len=None,
-                                    kv_token_indptr=None):
+                                     kv_token_indptr=None):
+        query_tiles = (total_q + 63) // 64 + qo_indptr.numel() - 2
         self.lib.glm_indexer_score_topk_prefill(
             self.ctx, self._ptr(out_idx), self._ptr(out_scores), self._ptr(q), self._ptr(k_data), self._ptr(weights),
             self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
@@ -1171,7 +1172,7 @@ class GlmOps:
             self._ptr(mask_kv_len) if mask_kv_len is not None else ctypes.c_void_p(0),
             self._ptr(scores), self._ptr(row_len), max_kv,
             self._ptr(coarse_hist), self._ptr(fine_hist), self._ptr(meta),
-            num_splits, cp_world_size, cp_rank,
+            query_tiles, cp_world_size, cp_rank,
             self._ptr(global_last_page_len) if global_last_page_len is not None else ctypes.c_void_p(0),
             self._ptr(kv_token_indptr) if kv_token_indptr is not None else ctypes.c_void_p(0),
         )

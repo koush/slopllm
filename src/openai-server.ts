@@ -53,7 +53,7 @@ function parseArgs(argv: string[]): ServerArgs {
     chunkSize: 8192,
     batchSize: 1,
     maxPages: 0,
-    maxTokens: 512,
+    maxTokens: 65536,
     temperature: 0.6,
     topP: 0.95,
     topK: 20,
@@ -109,7 +109,7 @@ Options:
   --chunk-size <int>            Maximum prefill chunk per sequence (default: 8192)
   --batch-size <int>            Maximum concurrent requests (default: 1)
   --max-pages <int>             KV cache pages (default: batch-size * ceil(chunk-size / 64))
-  --max-tokens <int>            Default max completion tokens (default: 512)
+  --max-tokens <int>            Default max completion tokens (default: 65536)
   --model-dir <string>          Model directory path (default: auto-detect from HF cache)
   --temperature <float>         Override model default sampling temperature
   --top-p <float>               Override model default top-p
@@ -851,6 +851,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   if (!argv.includes("--top-k") && generationConfig.topK !== undefined) args.topK = generationConfig.topK;
   if (!argv.includes("--repetition-penalty") && generationConfig.repetitionPenalty !== undefined) {
     args.repetitionPenalty = generationConfig.repetitionPenalty;
+  }
+  if (!argv.includes("--max-tokens") && generationConfig.maxNewTokens !== undefined) {
+    args.maxTokens = generationConfig.maxNewTokens;
   }
   if (args.mtp && !args.noMtp && (!model.planPrefillMtpDraftExtend || !model.planTargetVerification)) {
     throw new Error("--mtp requires a model with plan-based MTP decoding support");

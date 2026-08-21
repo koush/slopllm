@@ -426,7 +426,7 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     uintptr_t coarseHist_ptr = info[24].As<Napi::Number>().Int64Value();
     uintptr_t fineHist_ptr = info[25].As<Napi::Number>().Int64Value();
     uintptr_t meta_ptr = info[26].As<Napi::Number>().Int64Value();
-    int numSplits = info[27].As<Napi::Number>().Int32Value();
+    int queryTiles = info[27].As<Napi::Number>().Int32Value();
     int cpWorldSize = info[28].As<Napi::Number>().Int32Value();
     int cpRank = info[29].As<Napi::Number>().Int32Value();
     const int32_t* global_last_page_len = reinterpret_cast<const int32_t*>((uintptr_t)info[30].As<Napi::Number>().Int64Value());
@@ -452,7 +452,7 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(coarseHist_ptr),
         reinterpret_cast<int32_t*>(fineHist_ptr),
         reinterpret_cast<int32_t*>(meta_ptr),
-        numSplits, cpWorldSize, cpRank, global_last_page_len, kv_token_indptr);
+        queryTiles, cpWorldSize, cpRank, global_last_page_len, kv_token_indptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("indexerScoreTopkPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

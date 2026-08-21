@@ -1600,7 +1600,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int maxKv,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
-    int numSplits, int cpWorldSize, int cpRank,
+    int queryTiles, int cpWorldSize, int cpRank,
     const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
@@ -1612,9 +1612,8 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     cudaMemsetAsync(fineHist, 0, (size_t)totalQ * IDX_FINE_BUCKETS * sizeof(int32_t), stream);
     cudaMemsetAsync(meta, 0, (size_t)totalQ * 4 * sizeof(int32_t), stream);
 
-    // Pass 1: tensor-core score into buffer. Grid (ceil(maxKv/TN), queryTiles);
-    // the +slop covers per-sequence tile rounding without needing a batch count
-    // (out-of-range tiles map to seq<0 and return immediately).
+    // Pass 1: tensor-core score into buffer. queryTiles is a graph-stable upper
+    // bound for sum(ceil(sequenceQ/TM)); out-of-range tiles return immediately.
     {
 #define LAUNCH_INDEXER_PREFILL(TM, TN, WARPS, Q_BUFFERS, FLAT) do { \
         constexpr int cta = (WARPS) * 32; \
@@ -1626,7 +1625,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
         cudaFuncSetAttribute( \
             (void*)idx_prefill_score_mma_kernel<(TM), (TN), (WARPS), (Q_BUFFERS), (FLAT)>, \
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mma_smem); \
-        dim3 grid((maxKv + (TN) - 1) / (TN), (totalQ + (TM) - 1) / (TM) + 256); \
+        dim3 grid((maxKv + (TN) - 1) / (TN), queryTiles); \
         idx_prefill_score_mma_kernel<(TM), (TN), (WARPS), (Q_BUFFERS), (FLAT)> \
             <<<grid, cta, mma_smem, stream>>>( \
                 (__nv_bfloat16*)scores, rowLen, \
