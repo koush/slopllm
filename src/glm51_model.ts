@@ -679,15 +679,20 @@ export class Glm51Model extends ChatModel {
       using ckvNormed = ckv.rmsnorm(this.tensors.get(`${pfx}.kv_a_layernorm.weight`)!, cfg.rmsNormEps);
 
       kPeRopeStream.streamWaitEvent();
-      state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
+      const cache = state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
 
       if (dense) {
-        return;
+        return cache;
       }
+
+      using appendedCkv = cache.ckv;
+      using _appendedKpe = cache.kpe;
 
       // The physical slots are derived per-layer from sharedTopk at attention
       // time below; the topk arg here is vestigial.
-      return state.sparseMlaPrepareCache(sharedSlots!.value, ckvNormed, kPeRope, undefined, layerIdx, kvLoraRank, qkRopeDim);
+      return {
+        ckv: state.sparseMlaPrepareCache(sharedSlots!.value, appendedCkv, ckvNormed, kPeRope, undefined, layerIdx, kvLoraRank, qkRopeDim),
+      };
     });
 
     const shared = cfg.indexerTypes[layerIdx] === "shared";
@@ -821,7 +826,9 @@ export class Glm51Model extends ChatModel {
 
     using qAbsorbedR = qAbsorbedRStream.result;
     using qPeR = qPeRStream.result;
-    using ckv = kvcache.result;
+    const cache = kvcache.result;
+    using ckv = cache.ckv;
+    using kpe = cache.kpe;
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     {
@@ -845,7 +852,10 @@ export class Glm51Model extends ChatModel {
         lseBuf = sparseResult.lse;
       } else {
         // Dense MLA path (FlashInfer plan/run)
-        const mlaResult = state.denseMla(qAbsorbedR, qPeR, layerIdx, cfg.scaling);
+        if (!kpe) {
+          throw new Error("Dense MLA requires a separate KPE cache");
+        }
+        const mlaResult = state.denseMla(qAbsorbedR, qPeR, ckv, kpe, cfg.scaling);
         attnOut = mlaResult.o;
         lseBuf = mlaResult.lse;
       }
@@ -1349,7 +1359,9 @@ export class Glm51Model extends ChatModel {
         }
         destinationBase += finishCounts[batch];
       }
-      commitState.mlaKvCacheAppend(appendCkv, appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
+      const cache = commitState.mlaKvCacheAppend(appendCkv, appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
+      using _ckv = cache.ckv;
+      using _kpe = cache.kpe;
     }
     for (const layer of artifacts.indexerKvCacheLayers) {
       using appendIdxK = layer.appendIdxK;

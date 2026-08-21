@@ -181,12 +181,11 @@ export class ExecutionState {
     );
   }
 
-  sparseMlaPrepareCache(slots: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, cacheIdx: number, kvLoraRank: number, qkRopeDim: number) {
-    const pagedKV = this.cache.getPagedKV();
+  sparseMlaPrepareCache(slots: Tensor, ckvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, cacheIdx: number, kvLoraRank: number, qkRopeDim: number) {
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     return this.ws.glm.sparseMlaPrepareCache(
       this, slots, cacheIdx,
-      pagedKV.ckvData[cacheIdx], appendCkv, appendKpe,
+      ckvCache, appendCkv, appendKpe,
       topk,
       this.indices, this.indptrD,
       this.mlaBatchIndices, this.positionIds,
@@ -195,28 +194,32 @@ export class ExecutionState {
     );
   }
 
-  mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number) {
+  mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number): { ckv: Tensor; kpe?: Tensor } {
     const pagedKV = this.cache.getPagedKV();
+    const ckv = pagedKV.ckvData[cacheIdx];
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     if (pagedKV.sparseMode) {
-      return this.ws.glm.concatAndCacheDsMla(
+      this.ws.glm.concatAndCacheDsMla(
         this, cacheIdx,
-        pagedKV.ckvData[cacheIdx],
+        ckv,
         appendCkv, appendKpe,
         this.indices, this.indptrD,
         this.mlaBatchIndices, this.positionIds,
         nnz, kvLoraRank, qkRopeDim,
         kvLoraRank, qkRopeDim,
       );
+      return { ckv: ckv.viewClone() };
     } else {
+      const kpe = pagedKV.kpeData[cacheIdx];
       this.ws.glm.mlaKvCacheAppend(
-        pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
+        ckv, kpe,
         this.indices, this.indptrD, this.lastPageLen,
         appendCkv, appendKpe,
         this.mlaBatchIndices, this.positionIds,
         nnz, kvLoraRank, qkRopeDim,
         kvLoraRank, qkRopeDim,
       );
+      return { ckv: ckv.viewClone(), kpe: kpe.viewClone() };
     }
   }
 
@@ -253,11 +256,11 @@ export class ExecutionState {
     );
   }
 
-  denseMla(qNope: Tensor, qPe: Tensor, cacheIdx: number, smScale: number): { o: Tensor, lse: Tensor } {
+  denseMla(qNope: Tensor, qPe: Tensor, ckv: Tensor, kpe: Tensor, smScale: number): { o: Tensor, lse: Tensor } {
     if (this.isDecode) {
-      return this.ws.mlaDecodePaged(this, qNope, qPe, cacheIdx, smScale);
+      return this.ws.mlaDecodePaged(this, qNope, qPe, ckv, kpe, smScale);
     } else {
-      return this.ws.mlaPrefillPaged(this, qNope, qPe, cacheIdx, smScale, !this.customMask ? MaskMode.Causal : this.customMask.mode, this.customMask?.mask, this.customMask?.indptr, this.customMask?.maskKvLen);
+      return this.ws.mlaPrefillPaged(this, qNope, qPe, ckv, kpe, smScale, !this.customMask ? MaskMode.Causal : this.customMask.mode, this.customMask?.mask, this.customMask?.indptr, this.customMask?.maskKvLen);
     }
   }
 
@@ -492,10 +495,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  mlaPrefillPaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, cacheIdx: number, smScale: number, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
+  mlaPrefillPaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, smScale: number, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
     const pagedKV = state.cache.getPagedKV();
     return this.glm.mlaPrefillRun(
-      state, qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
+      state, qNope, qPe, ckvData, kpeData,
       state.indices,
       pagedKV.floatWs, state.intWs,
       state.mlaPrefillPlanInfo,
@@ -505,10 +508,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
     );
   }
 
-  mlaDecodePaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, cacheIdx: number, smScale: number): { o: Tensor, lse: Tensor } {
+  mlaDecodePaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, smScale: number): { o: Tensor, lse: Tensor } {
     const pagedKV = state.cache.getPagedKV();
     return this.glm.mlaDecodeRun(
-      state, qNope, qPe, pagedKV.ckvData[cacheIdx], pagedKV.kpeData[cacheIdx],
+      state, qNope, qPe, ckvData, kpeData,
       state.indices, state.indptrD, state.lastPageLen,
       pagedKV.floatWs, state.intWs,
       state.mlaDecodePlanInfo,
