@@ -771,6 +771,28 @@ describe("PagedKVCache prefix matching", () => {
     }
   });
 
+  it("shares full pages from a staged sequence", () => {
+    using pagedKV = makePagedKV(1, 64);
+    const base = makeLongPrompt(PAGE_SIZE * 2);
+    const suffix = [200, 201, 202, 203];
+
+    pagedKV.reset(1);
+    pagedKV.allocAppendPages(0, base.length);
+    pagedKV.reportTokens(0, base);
+    const source = pagedKV.sequences[0];
+    pagedKV.stageSequence(0, 7);
+    pagedKV.reset(1);
+
+    const result = pagedKV.prefixMatch(0, [...base, ...suffix]);
+
+    assert.deepStrictEqual(result, suffix);
+    assert.equal(pagedKV.sequences[0].pages.length, 2);
+    assert.equal(pagedKV.sequences[0].pages[0], source.pages[0]);
+    assert.equal(pagedKV.sequences[0].pages[1], source.pages[1]);
+    assert.equal(source.pages[0].refs, 2);
+    assert.equal(source.pages[1].refs, 2);
+  });
+
   it("truncate detaches a shared page before it can be overwritten", () => {
     using pagedKV = makePagedKV(2, 64);
     using ws2 = new ExecutionWorkspace(glm, 2, 4096);

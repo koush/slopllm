@@ -306,55 +306,55 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     return this.sequences[seqIdx];
   }
 
-  // Finds the best prefix match across all sequences and returns the unmatched suffix.
+  // Finds the best prefix match across active and staged sequences and returns the unmatched suffix.
   // Only full pages are kept/shared — the partial page is never shared because
   // the receiving sequence would write into it. Empty pages beyond the content
   // region are discarded. If the entire cache matches (self, no truncation needed),
   // returns the suffix immediately without touching pages.
   prefixMatch(seqIdx: number, inputIds: number[], copyPartial?: boolean): number[] {
-    this.ensureSequence(seqIdx);
+    const targetSeq = this.ensureSequence(seqIdx);
 
-    let bestSeqIdx = -1;
+    let bestSeq: Sequence | undefined;
     let bestMatchTokens = 0;
-    for (let i = 0; i < this.sequences.length; i++) {
-      if (this.sequences[i].pages.length === 0) continue;
-      const matchTokens = this.sequences[i].prefixMatch(inputIds);
+    for (const sequence of [...this.sequences, ...this.staging.values()]) {
+      if (sequence.pages.length === 0) continue;
+      const matchTokens = sequence.prefixMatch(inputIds);
       if (matchTokens > bestMatchTokens) {
         bestMatchTokens = matchTokens;
-        bestSeqIdx = i;
+        bestSeq = sequence;
       }
     }
 
-    if (bestSeqIdx === seqIdx && bestMatchTokens === this.sequences[seqIdx].reportedTokenCount()) {
+    if (bestSeq === targetSeq && bestMatchTokens === targetSeq.reportedTokenCount()) {
       return inputIds.slice(bestMatchTokens);
     }
 
-    if (bestSeqIdx < 0 || bestMatchTokens === 0) {
-      this.sequences[seqIdx].clear();
+    if (!bestSeq || bestMatchTokens === 0) {
+      targetSeq.clear();
       return inputIds.slice();
     }
 
     // full pages can be shared, memcpy is needed for a partial page.
     const keepPages = Math.floor(bestMatchTokens / this.pageSize);
 
-    if (bestSeqIdx === seqIdx) {
-      while (this.sequences[seqIdx].pages.length > keepPages) {
-        this.sequences[seqIdx].popPage();
+    if (bestSeq === targetSeq) {
+      while (targetSeq.pages.length > keepPages) {
+        targetSeq.popPage();
       }
-      return inputIds.slice(this.sequences[seqIdx].allocLen);
+      return inputIds.slice(targetSeq.allocLen);
     }
 
     if (keepPages > 0) {
       const newSeq = new Sequence(this);
       for (let i = 0; i < keepPages; i++) {
-        newSeq.pushPage(this.sequences[bestSeqIdx].pages[i], this.pageSize);
+        newSeq.pushPage(bestSeq.pages[i], this.pageSize);
       }
-      this.sequences[seqIdx].clear();
+      targetSeq.clear();
       this.sequences[seqIdx] = newSeq;
       const partialPage = bestMatchTokens % this.pageSize !== 0;
       if (copyPartial && partialPage) {
         this.allocAppendPages(seqIdx, this.pageSize);
-        const srcPage = this.sequences[bestSeqIdx].pages[keepPages];
+        const srcPage = bestSeq.pages[keepPages];
         const dstPage = this.sequences[seqIdx].pages[keepPages];
         this.copyPage(srcPage.id, dstPage.id);
         dstPage.tokenIds.push(...srcPage.tokenIds);
