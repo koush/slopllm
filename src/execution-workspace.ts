@@ -748,7 +748,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
         );
       }
       else {
-        // sparse mode requires no planning
+        // Sparse prefill has no kernel plan, but CP consumers still need
+        // per-rank physical-page lengths rather than the global logical length.
+        this.glm.sparseMlaDecodePlan(
+          state.lastPageLenH, batchSize, pagedKV.sequences.map(s => s.allocLen),
+          pagedKV.pageSize, pagedKV.contextParallel,
+        );
       }
       state.mlaBatchIndicesH.withPinnedBuffer(buf => {
         let off = 0;
