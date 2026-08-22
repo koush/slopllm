@@ -434,14 +434,17 @@ static __device__ __forceinline__ int idx_ordered_slot(
     return slot;
 }
 
-static __device__ __forceinline__ int bf16_key(const __nv_bfloat16* p) {
+static __device__ __forceinline__ int bf16_key_bits(unsigned short u) {
     // Order-preserving float->uint key: negatives -> [0,0x7FFF] (reversed),
     // non-negatives -> [0x8000,0xFFFF]. Monotonic in value across the full range,
     // so histogram bucket order == score order. Scores are signed (final weighted
     // sum is not ReLU'd), so this must handle the sign bit.
-    unsigned short u = *reinterpret_cast<const unsigned short*>(p);
     unsigned short k = (u & 0x8000) ? (unsigned short)(~u) : (unsigned short)(u | 0x8000);
     return (int)k;
+}
+
+static __device__ __forceinline__ int bf16_key(const __nv_bfloat16* p) {
+    return bf16_key_bits(*reinterpret_cast<const unsigned short*>(p));
 }
 
 __global__ void idx_hist_kernel(
@@ -1016,7 +1019,7 @@ struct FragC { float reg[4]; };
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool pred) {
     unsigned s = __cvta_generic_to_shared(smem);
     int sz = pred ? 16 : 0;
-    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n"
+    asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], %2, %3;\n"
         :: "r"(s), "l"(gmem), "n"(16), "r"(sz));
 }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
@@ -1353,8 +1356,19 @@ __global__ void idx_prefill_coarse_hist_buf_kernel(
     __shared__ int sh[IDX_COARSE_BUCKETS];
     for (int b = threadIdx.x; b < IDX_COARSE_BUCKETS; b += blockDim.x) sh[b] = 0;
     __syncthreads();
-    for (int i = threadIdx.x; i < len; i += blockDim.x)
-        atomicAdd(&sh[bf16_key(&s[i]) / IDX_FINE_BUCKETS], 1);
+    for (int i = threadIdx.x * 8; i < len; i += blockDim.x * 8) {
+        if (i + 7 < len && ((uintptr_t)(s + i) & 15) == 0) {
+            const ulonglong2 packed = *reinterpret_cast<const ulonglong2*>(s + i);
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const unsigned long long word = j < 4 ? packed.x : packed.y;
+                atomicAdd(&sh[bf16_key_bits((unsigned short)(word >> ((j & 3) * 16))) / IDX_FINE_BUCKETS], 1);
+            }
+        } else {
+            for (int j = 0; j < 8 && i + j < len; j++)
+                atomicAdd(&sh[bf16_key(&s[i + j]) / IDX_FINE_BUCKETS], 1);
+        }
+    }
     __syncthreads();
     int32_t* h = coarseHist + (size_t)row * IDX_COARSE_BUCKETS;
     for (int b = threadIdx.x; b < IDX_COARSE_BUCKETS; b += blockDim.x) h[b] = sh[b];
@@ -1483,10 +1497,23 @@ __global__ void idx_prefill_fine_hist_buf_kernel(
     __shared__ int sh[IDX_FINE_BUCKETS];
     for (int b = threadIdx.x; b < IDX_FINE_BUCKETS; b += blockDim.x) sh[b] = 0;
     __syncthreads();
-    for (int i = threadIdx.x; i < len; i += blockDim.x) {
-        int key = bf16_key(&s[i]);
-        if (key / IDX_FINE_BUCKETS == coarseTau)
-            atomicAdd(&sh[key % IDX_FINE_BUCKETS], 1);
+    for (int i = threadIdx.x * 8; i < len; i += blockDim.x * 8) {
+        if (i + 7 < len && ((uintptr_t)(s + i) & 15) == 0) {
+            const ulonglong2 packed = *reinterpret_cast<const ulonglong2*>(s + i);
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const unsigned long long word = j < 4 ? packed.x : packed.y;
+                int key = bf16_key_bits((unsigned short)(word >> ((j & 3) * 16)));
+                if (key / IDX_FINE_BUCKETS == coarseTau)
+                    atomicAdd(&sh[key % IDX_FINE_BUCKETS], 1);
+            }
+        } else {
+            for (int j = 0; j < 8 && i + j < len; j++) {
+                int key = bf16_key(&s[i + j]);
+                if (key / IDX_FINE_BUCKETS == coarseTau)
+                    atomicAdd(&sh[key % IDX_FINE_BUCKETS], 1);
+            }
+        }
     }
     __syncthreads();
     int32_t* h = fineHist + (size_t)row * IDX_FINE_BUCKETS;
@@ -1637,9 +1664,19 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     } while (0)
 
         const char* config = std::getenv("GLM_INDEXER_PREFILL_CONFIG");
-        if (!config || std::strcmp(config, "q64_k256_w16_q1") == 0) {
+        if (!config) {
+            if (kvTokenIndptr && maxKv >= 16384)
+                LAUNCH_INDEXER_PREFILL(64, 288, 12, 1, true);
+            else if (kvTokenIndptr)
+                LAUNCH_INDEXER_PREFILL(64, 256, 16, 1, true);
+            else
+                LAUNCH_INDEXER_PREFILL(64, 256, 16, 1, false);
+        } else if (std::strcmp(config, "q64_k256_w16_q1") == 0) {
             if (kvTokenIndptr) LAUNCH_INDEXER_PREFILL(64, 256, 16, 1, true);
             else LAUNCH_INDEXER_PREFILL(64, 256, 16, 1, false);
+        } else if (std::strcmp(config, "q64_k288_w12_q1") == 0) {
+            if (kvTokenIndptr) LAUNCH_INDEXER_PREFILL(64, 288, 12, 1, true);
+            else LAUNCH_INDEXER_PREFILL(64, 288, 12, 1, false);
         } else if (std::strcmp(config, "q64_k192_w8_q2") == 0) {
             if (kvTokenIndptr) LAUNCH_INDEXER_PREFILL(64, 192, 8, 2, true);
             else LAUNCH_INDEXER_PREFILL(64, 192, 8, 2, false);
