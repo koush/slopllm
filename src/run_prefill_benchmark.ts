@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { CaptureManager } from "./capture-manager";
 import { ChatCache, ChatModel, Tokenizer } from "./chat_model";
 import { DeviceOps } from "./device_ops";
-import { ExecutionWorkspace } from "./execution-workspace";
+import { executePlan, ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { ParallelOps } from "./parallel_ops";
@@ -21,9 +21,12 @@ interface BenchArgs {
   benchRuns: number;
   cp: boolean;
   pageSize: number;
+  maxPages: number | undefined;
   glm51Small: boolean;
   file: string | undefined;
   maxNewTokens: number;
+  mtp: boolean;
+  mtpDraftTopk: number[];
 }
 
 function parseArgs(argv: string[]): BenchArgs {
@@ -39,9 +42,12 @@ function parseArgs(argv: string[]): BenchArgs {
     benchRuns: 1,
     cp: false,
     pageSize: 64,
+    maxPages: undefined,
     glm51Small: false,
     file: undefined,
     maxNewTokens: 512,
+    mtp: false,
+    mtpDraftTopk: [1, 1, 1],
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -54,28 +60,37 @@ function parseArgs(argv: string[]): BenchArgs {
     else if (a === "--runs" && i + 1 < argv.length) args.benchRuns = parseInt(argv[++i], 10);
     else if (a === "--cp") args.cp = true;
     else if (a === "--page-size" && i + 1 < argv.length) args.pageSize = parseInt(argv[++i], 10);
+    else if (a === "--max-pages" && i + 1 < argv.length) args.maxPages = parseInt(argv[++i], 10);
     else if (a === "--glm51-small") args.glm51Small = true;
     else if (a === "--file" && i + 1 < argv.length) args.file = argv[++i];
     else if (a === "--max-new-tokens" && i + 1 < argv.length) args.maxNewTokens = parseInt(argv[++i], 10);
+    else if (a === "--mtp") args.mtp = true;
+    else if (a === "--mtp-draft-topk" && i + 1 < argv.length) args.mtpDraftTopk = argv[++i].split(",").map(s => parseInt(s.trim(), 10));
     else if (a === "--help") {
       console.log(`Usage: npx tsx src/run_prefill_benchmark.ts [options]
 Options:
   --gpus <ids>       GPU IDs (default: 0-7)
-  --seq-len <n>      Total prefill sequence length (default: 65536)
+  --seq-len <n>      Total prefill sequence length (default: 8192)
   --chunk-size <n>   Prefill chunk size (default: 4096)
   --context-len <n>  Dummy context length to pre-fill before the timed prefill (default: 0)
   --arena <n>        Arena size in GB (default: none)
   --warmup <n>       Warmup runs (default: 1)
-  --runs <n>         Benchmark runs (default: 3)
+  --runs <n>         Benchmark runs (default: 1)
   --cp               Enable context parallelism
-  --page-size <n>    KV cache page size (default: 16)
+  --page-size <n>    KV cache page size (default: 64)
+  --max-pages <n>    KV cache page count (default: sequence capacity + 64)
   --glm51-small      Use GLM-5.1 small model
   --file <path>      Read file contents (up to --seq-len tokens), ask the model to
                      summarize it, and print the response (skips benchmarking)
   --max-new-tokens <n>  Max tokens to generate for --file summary (default: 512)
+  --mtp              Run the API-compatible MTP prompt-prefill path
+  --mtp-draft-topk <list>  MTP draft top-k per depth (default: 1,1,1)
   --help             Show this help`);
       process.exit(0);
     }
+  }
+  if (args.mtpDraftTopk.length === 0 || args.mtpDraftTopk.some(topk => !Number.isInteger(topk) || topk < 1)) {
+    throw new Error(`Invalid --mtp-draft-topk: ${args.mtpDraftTopk.join(",")}`);
   }
   return args;
 }
@@ -185,15 +200,18 @@ async function main(): Promise<void> {
   const gpuLabel = args.gpus.length > 1 ? `${args.gpus[0]}-${args.gpus[args.gpus.length - 1]}` : `${args.gpus[0]}`;
 
   const modelDir = args.glm51Small ? GLM51_SMALL_NVFP4 : GLM51_MODEL_DIR;
-  console.log(`GLM-5.1 Prefill Benchmark | GPUs ${gpuLabel} (${args.gpus.length}) | seq_len=${args.seqLen} | chunk_size=${args.chunkSize} | context_len=${args.contextLen} | cp=${args.cp} | model=${args.glm51Small ? "small" : "full"}`);
+  console.log(`GLM-5.1 Prefill Benchmark | GPUs ${gpuLabel} (${args.gpus.length}) | seq_len=${args.seqLen} | chunk_size=${args.chunkSize} | context_len=${args.contextLen} | cp=${args.cp} | mtp=${args.mtp ? args.mtpDraftTopk.join(",") : "off"} | model=${args.glm51Small ? "small" : "full"}`);
 
-  const model: ChatModel = await Glm51Model.fromPretrained(glm, modelDir, args.cp, false);
+  const model: ChatModel = await Glm51Model.fromPretrained(glm, modelDir, args.cp, args.mtp);
+  if (args.mtp && (!model.planPrefillMtpChunk || !model.planPrefillMtpDraftExtend)) {
+    throw new Error("--mtp requires a model with chunked prefill and draft-extend support");
+  }
   const worldSize = args.gpus.length;
   const cachePageSize = args.pageSize;
   // In --file mode, reserve room for the generated summary on top of the prompt.
   const genHeadroom = args.file ? args.maxNewTokens : 0;
   const totalLen = args.contextLen + args.seqLen + genHeadroom;
-  const maxPages = Math.ceil(totalLen / cachePageSize / (args.cp ? worldSize : 1)) + 64;
+  const maxPages = args.maxPages ?? Math.ceil(totalLen / cachePageSize / (args.cp ? worldSize : 1)) + 64;
   const cache = model.createChatCache(maxPages, args.maxBatch, totalLen + 1, cachePageSize);
   const ws = new ExecutionWorkspace(glm, args.maxBatch, args.chunkSize + 1);
 
@@ -261,6 +279,7 @@ async function main(): Promise<void> {
     cache.reset(1);
     const cf0 = performance.now();
     cache.getPagedKV().allocAppendPages(0, args.contextLen);
+    if (args.mtp) cache.reportTokens(0, inputIds.slice(0, args.contextLen));
     glm.synchronize();
     const cf1 = performance.now();
     console.log(`context prepared: ${args.contextLen} tokens in ${(cf1 - cf0).toFixed(0)}ms (pages allocated, no forward)`);
@@ -287,14 +306,26 @@ async function main(): Promise<void> {
       const isLast = c === numChunks - 1;
 
       const tc0 = performance.now();
-      const state = ws.planPrefill(model, 1, [chunkLen], cache);
-      state.setInput([inputIds.slice(chunkStart, chunkStart + chunkLen)]);
+      const chunkIds = inputIds.slice(chunkStart, chunkStart + chunkLen);
+      if (args.mtp) {
+        if (isLast) {
+          const mtpInputIds = model.prepareMtpInput(cache, [chunkIds]);
+          await executePlan(captureManager, ws, model.planPrefillMtpDraftExtend!(ws, cache, mtpInputIds, args.mtpDraftTopk));
+        } else {
+          const nextToken = inputIds[chunkStart + chunkLen];
+          await executePlan(captureManager, ws, model.planPrefillMtpChunk!(ws, cache, [chunkIds], [nextToken]));
+          cache.reportTokens(0, chunkIds);
+        }
+      } else {
+        const state = ws.planPrefill(model, 1, [chunkLen], cache);
+        state.setInput([chunkIds]);
 
-      state.capture(captureManager, {}, () => {
-        using hiddenStates = model.forward(state);
-      }, ['prefill']);
+        state.capture(captureManager, {}, () => {
+          using hiddenStates = model.forward(state);
+        }, ['prefill']);
 
-      glm.synchronize();
+        glm.synchronize();
+      }
       const tc1 = performance.now();
       const chunkTokPerSec = chunkLen / ((tc1 - tc0) / 1000);
       console.log(`  ${runLabel} chunk ${c + 1}/${numChunks}: ${chunkLen} tokens, ${(tc1 - tc0).toFixed(0)}ms (${chunkTokPerSec.toFixed(0)} tok/s)`);

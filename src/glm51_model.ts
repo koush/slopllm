@@ -1156,7 +1156,7 @@ export class Glm51Model extends ChatModel {
         using targetDevice = ws.alloc([ws.maxBatch], "I32");
         using hiddenStates = this.forwardModel(prefillState, sharedSlots, sharedSlotsLength);
         using logits = prefillState.computeLogits(hiddenStates, this);
-        const target = selectTokens(logits);
+        using target = selectTokens(logits);
         targetDevice.memcpy(target, batchSize * I32, MemcpyKind.DeviceToDevice);
         using rotatedInput = prefillState.input!.rotateInputIds(prefillState.qoIndptrD, targetDevice, batchSize);
         prefillState.setInput(rotatedInput);
@@ -1267,7 +1267,7 @@ export class Glm51Model extends ChatModel {
         };
         using hiddenStates = this.forwardModel(state, slots, slotsLength);
         using logits = state.computeLogits(hiddenStates, this, true);
-        const selected = selectTokens(logits);
+        using selected = selectTokens(logits);
         argmaxHost.memcpy(selected, batchSize * numVerificationTokens * I32, MemcpyKind.DeviceToHost);
         using selectedInput = selected.narrow(0, batchSize * numVerificationTokens);
         state.setInput(selectedInput);
