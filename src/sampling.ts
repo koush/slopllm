@@ -143,8 +143,9 @@ export class SamplingWorkspace extends WorkspaceBase {
     }
   }
 
+  /** Returns a caller-owned view of the workspace's reusable output buffer. */
   sample(logits: Tensor): Tensor {
-    return this.sampleInto(logits, this.outToken);
+    return this.sampleInto(logits, this.outToken).viewClone();
   }
 
   sampleInto(logits: Tensor, outToken: Tensor): Tensor {

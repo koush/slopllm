@@ -295,9 +295,7 @@ export async function* generateStream(
       gpuSampleResult.memcpy(argmax, argmax.bytes, MemcpyKind.DeviceToDevice);
     }
     else {
-      // Borrowed, not owned: sample() returns the SamplingWorkspace's
-      // persistent outToken, which must survive for the next decode step.
-      const sampled = samplingWorkspace!.sample(logits);
+      using sampled = samplingWorkspace!.sample(logits);
       gpuSampleResult = sampleWorkspace.ensureAlloc(sampled.shape, sampled.type, "gpuSampleResult");
       gpuSampleResult.memcpy(sampled, sampled.bytes, MemcpyKind.DeviceToDevice);
     }

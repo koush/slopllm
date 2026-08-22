@@ -365,14 +365,16 @@ describe("Qwen3-0.6B batch tests", () => {
     const greedySingle = (() => {
       using sampler = new SamplingWorkspace(logits.workspace.glm, 1, model.cfg.vocabSize, greedy.repetitionPenaltyWindow);
       sampler.updateSampler([greedy], [history]);
-      return sampler.sample(logits).readInt32LEArray()[0];
+      using sampled = sampler.sample(logits);
+      return sampled.readInt32LEArray()[0];
     })();
     assert.equal(greedySingle, firstToken,
       `Temperature-zero sampling should match argmax: ${greedySingle} != ${firstToken}`);
     const batchResults = (() => {
       using sampler = new SamplingWorkspace(logits.workspace.glm, 2, model.cfg.vocabSize, sampling.repetitionPenaltyWindow);
       sampler.updateSampler([greedy, sampling], [history, history]);
-      return sampler.sample(logits).readInt32LEArray();
+      using sampled = sampler.sample(logits);
+      return sampled.readInt32LEArray();
     })();
 
     assert.equal(batchResults[0], greedySingle,
@@ -404,7 +406,8 @@ describe("Qwen3-0.6B batch tests", () => {
     const batchResults = (() => {
       using sampler = new SamplingWorkspace(logits.workspace.glm, 2, model.cfg.vocabSize, greedy.repetitionPenaltyWindow);
       sampler.updateSampler([greedy, greedy], [history1, history2]);
-      return sampler.sample(logits).readInt32LEArray();
+      using sampled = sampler.sample(logits);
+      return sampled.readInt32LEArray();
     })();
 
     assert.equal(batchResults[0], tokens[0],

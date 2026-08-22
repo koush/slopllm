@@ -692,7 +692,7 @@ async function generateContinuousBatch(
       using hiddenStates = model.forwardModel(state);
       using decodeLogits = state.computeLogits(hiddenStates, model);
       if (useArgmax) return decodeLogits.argmax();
-      samplingWorkspace.sample(decodeLogits);
+      using _sampled = samplingWorkspace.sample(decodeLogits);
       return undefined;
     }, [useArgmax ? "openai-decode-argmax" : "openai-decode-sample"]);
     await glm.synchronizeAsync();
@@ -881,7 +881,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     let lastToken: number;
     {
       using warmupLogits = ws.forwardPrefill(model, [warmupIds], cache);
-      const warmupSampled = warmupSw.sample(warmupLogits);
+      using warmupSampled = warmupSw.sample(warmupLogits);
       lastToken = warmupSampled.readInt32LEArray()[0];
     }
     cache.reportTokens(0, warmupIds);
@@ -891,7 +891,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       st.setInput([[lastToken]]);
       using hs = model.forward(st);
       using lg = st.computeLogits(hs, model);
-      const ns = warmupSw.sample(lg);
+      using ns = warmupSw.sample(lg);
       lastToken = ns.readInt32LEArray()[0];
       cache.reportTokens(0, [lastToken]);
     }
