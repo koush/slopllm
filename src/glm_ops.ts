@@ -661,6 +661,7 @@ export class GlmTensor extends Tensor {
     const ctx = this.glm.ctx;
     const gatePtrs = this.getMoeNvfp4Ptrs(weights.gate, `${pfx}.gate_proj`);
     const upPtrs = this.getMoeNvfp4Ptrs(weights.up, `${pfx}.up_proj`);
+    const downPtrs = this.getMoeNvfp4Ptrs(weights.down, `${pfx}.down_proj`);
 
     const scatterWsSize = getNativeAddon().mmaMoeCoopScatterWorkspaceSize(count, hs, numExperts);
     using scatterWs = this.workspace.allocRaw(scatterWsSize);
@@ -672,19 +673,24 @@ export class GlmTensor extends Tensor {
       using gemmWs = this.workspace.allocRaw(gemmWsSize);
       const gateOut = this.workspace.alloc([count, moeIntermediate], this.type);
       getNativeAddon().mmaMoeCoopGemm(ctx, gatePtrs.weightPtrs.data, gatePtrs.scalePtrs.data, gatePtrs.scale2Ptrs.data,
-                                       numExperts, moeIntermediate, hs, count, scatterWs.data, gemmWs.data, gateOut.data);
+                                       numExperts, moeIntermediate, hs, count, hs, scatterWs.data, 0, true, gemmWs.data, gateOut.data);
       return gateOut;
     });
 
     using upGemmWs = this.workspace.allocRaw(gemmWsSize);
     using upOut = this.workspace.alloc([count, moeIntermediate], this.type);
     getNativeAddon().mmaMoeCoopGemm(ctx, upPtrs.weightPtrs.data, upPtrs.scalePtrs.data, upPtrs.scale2Ptrs.data,
-                                     numExperts, moeIntermediate, hs, count, scatterWs.data, upGemmWs.data, upOut.data);
+                                     numExperts, moeIntermediate, hs, count, hs, scatterWs.data, 0, true, upGemmWs.data, upOut.data);
 
     gateStream.streamWaitEvent();
     using gateOut = gateStream.result;
     using siluOut = gateOut.siluAndMul(upOut);
-    return siluOut.mulMatId(weights.down, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
+    using downGemmWs = this.workspace.allocRaw(getNativeAddon().mmaMoeCoopGemmWorkspaceSize(count, hs));
+    const downOut = this.workspace.alloc([count, hs], this.type);
+    getNativeAddon().mmaMoeCoopGemm(ctx, downPtrs.weightPtrs.data, downPtrs.scalePtrs.data, downPtrs.scale2Ptrs.data,
+                                     numExperts, hs, moeIntermediate, count, hs, scatterWs.data, siluOut.data, false,
+                                     downGemmWs.data, downOut.data);
+    return downOut;
   }
 
   scatterAddRows(scales: Tensor, topK: number, numRows: number): Tensor {
@@ -1168,13 +1174,12 @@ export class GlmOps implements DeviceOps {
     const pageBlockSize = kvCache.shape[1];
     const effectiveStrideKvBlock = pageBlockSize * kvCache.shape[2] * elemBytes;
     if (pageBlockSize !== 64) throw new Error(`sparseMlaPrefill: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize} ${kvCache.shape}`);
-    using q = qAbsorbed.cat([qPe], 2);
     // Pad to 16 tokens so cuBLAS TMA kernels (16-wide n-tile) don't over-read
     // the allocation when numTokens < 16.
     const oTokens = Math.max(numTokens, 16);
-    using oFull = q.workspace.alloc([oTokens, numHeads, headDim], "BF16");
+    using oFull = qAbsorbed.workspace.alloc([oTokens, numHeads, headDim], "BF16");
     const o = numTokens < 16 ? oFull.narrow(0, numTokens) : oFull.viewClone();
-    const lse = q.workspace.alloc([numTokens, numHeads], "F32");
+    const lse = qAbsorbed.workspace.alloc([numTokens, numHeads], "F32");
     // Small query counts (e.g. MTP tree verify) starve the prefill kernel: its
     // grid is only numTokens × ceil(NUM_HEADS/HPB) CTAs, leaving the GPU idle.
     // Route to the split-K decode kernel — same mask-free slot attention, but
@@ -1182,12 +1187,12 @@ export class GlmOps implements DeviceOps {
     // identical (causality lives in the slots, not the kernel).
     if (numTokens <= SPARSE_MLA_DECODE_DISPATCH_MAX) {
       const numSplits = Math.ceil(topk / 64);
-      using midOut = q.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
-      using midLse = q.workspace.alloc([numTokens, numHeads, numSplits], "F32");
-      getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, 0, ptr(topkLength));
+      using midOut = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
+      using midLse = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits], "F32");
+      getNativeAddon().sparseMlaDecode(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, 0, ptr(topkLength));
       return { o, lse };
     }
-    getNativeAddon().sparseMlaPrefill(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(o), ptr(lse), numTokens, numHeads, topk, pageBlockSize, smScale, effectiveStrideKvBlock, ptr(topkLength));
+    getNativeAddon().sparseMlaPrefill(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(o), ptr(lse), numTokens, numHeads, topk, smScale, effectiveStrideKvBlock, ptr(topkLength));
     return { o, lse };
   }
 
@@ -1199,16 +1204,15 @@ export class GlmOps implements DeviceOps {
     const pageBlockSize = kvCache.shape[1];
     const effectiveStrideKvBlock = pageBlockSize * kvCache.shape[2] * elemBytes;
     if (pageBlockSize !== 64) throw new Error(`sparseMlaDecode: SM120 kernel requires pageBlockSize=64, got ${pageBlockSize}`);
-    using q = qAbsorbed.cat([qPe], 2);
     // Pad to 16 tokens so cuBLAS TMA kernels (16-wide n-tile) don't over-read
     // the allocation when numTokens < 16.
     const oTokens = Math.max(numTokens, 16);
-    using oFull = q.workspace.alloc([oTokens, numHeads, headDim], "BF16");
+    using oFull = qAbsorbed.workspace.alloc([oTokens, numHeads, headDim], "BF16");
     const o = numTokens < 16 ? oFull.narrow(0, numTokens) : oFull.viewClone();
-    const lse = q.workspace.alloc([numTokens, numHeads], "F32");
-    using midOut = q.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
-    using midLse = q.workspace.alloc([numTokens, numHeads, numSplits], "F32");
-    getNativeAddon().sparseMlaDecode(this.ctx, ptr(q), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, chunksPerBlock, topkLength ? ptr(topkLength) : 0);
+    const lse = qAbsorbed.workspace.alloc([numTokens, numHeads], "F32");
+    using midOut = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
+    using midLse = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits], "F32");
+    getNativeAddon().sparseMlaDecode(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, chunksPerBlock, topkLength ? ptr(topkLength) : 0);
     return { o, lse };
   }
 

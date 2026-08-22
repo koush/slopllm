@@ -227,6 +227,32 @@ def test_sparse_mla_prefill_does_not_crash(small_setup, device):
     assert output.abs().max().item() > 0, "Output is all zeros — kernel may not have written"
 
 
+def test_sparse_mla_prefill_split_q_matches_concat(small_setup, device):
+    glm, q, kv_cache, indices, num_valid, *_ = small_setup
+    num_q = q.shape[0]
+    q_nope = q[:, :, :KV_LORA_RANK].contiguous()
+    q_rope = q[:, :, KV_LORA_RANK:].contiguous()
+    expected = torch.empty(num_q, NUM_HEADS, D_V, dtype=torch.bfloat16, device=device)
+    expected_lse = torch.empty(num_q, NUM_HEADS, dtype=torch.float32, device=device)
+    actual = torch.empty_like(expected)
+    actual_lse = torch.empty_like(expected_lse)
+    stride_kv_block = PAGE_SIZE * BPT
+
+    glm.sparse_mla_prefill(
+        q.data_ptr(), kv_cache.data_ptr(), indices.data_ptr(),
+        expected.data_ptr(), expected_lse.data_ptr(), num_q, NUM_HEADS, TOPK,
+        PAGE_SIZE, SM_SCALE, stride_kv_block, num_valid.data_ptr(),
+    )
+    glm.sparse_mla_prefill_split_q(
+        q_nope.data_ptr(), q_rope.data_ptr(), kv_cache.data_ptr(), indices.data_ptr(),
+        actual.data_ptr(), actual_lse.data_ptr(), num_q, NUM_HEADS, TOPK,
+        SM_SCALE, stride_kv_block, num_valid.data_ptr(),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_lse, expected_lse)
+
 def ref_sparse_mla_decode(q, kv_cache_packed, indices, num_valid_per_token,
                           sm_scale, kv_lora_rank, pe_dim, num_splits):
     """PyTorch reference for sparse MLA decode (split-K)."""
@@ -270,6 +296,44 @@ def test_sparse_mla_decode_basic(small_setup, device):
     max_diff = (output_f - o_ref_f).abs().max().item()
     print(f"Decode max output diff: {max_diff}")
     assert max_diff < 1.0, f"Decode output diff too large: {max_diff}"
+
+
+def test_sparse_mla_decode_split_q_matches_concat(small_setup, device):
+    glm, q, kv_cache, indices, num_valid, *_ = small_setup
+    q = q[:1]
+    q_nope = q[:, :, :KV_LORA_RANK].contiguous()
+    q_rope = q[:, :, KV_LORA_RANK:].contiguous()
+    indices = indices[:1]
+    topk_length = num_valid[:1]
+    num_splits = (TOPK + 63) // 64
+    mid_shape = (1, NUM_HEADS, num_splits, D_V)
+    lse_shape = (1, NUM_HEADS, num_splits)
+    expected_mid = torch.empty(mid_shape, dtype=torch.bfloat16, device=device)
+    expected_mid_lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
+    actual_mid = torch.empty_like(expected_mid)
+    actual_mid_lse = torch.empty_like(expected_mid_lse)
+    expected = torch.empty(1, NUM_HEADS, D_V, dtype=torch.bfloat16, device=device)
+    expected_lse = torch.empty(1, NUM_HEADS, dtype=torch.float32, device=device)
+    actual = torch.empty_like(expected)
+    actual_lse = torch.empty_like(expected_lse)
+    stride_kv_block = PAGE_SIZE * BPT
+
+    glm.sparse_mla_decode(
+        q.data_ptr(), kv_cache.data_ptr(), indices.data_ptr(),
+        expected_mid.data_ptr(), expected_mid_lse.data_ptr(),
+        expected.data_ptr(), expected_lse.data_ptr(), 1, NUM_HEADS, TOPK,
+        num_splits, SM_SCALE, stride_kv_block, topk_length=topk_length.data_ptr(),
+    )
+    glm.sparse_mla_decode_split_q(
+        q_nope.data_ptr(), q_rope.data_ptr(), kv_cache.data_ptr(), indices.data_ptr(),
+        actual_mid.data_ptr(), actual_mid_lse.data_ptr(), actual.data_ptr(), actual_lse.data_ptr(),
+        1, NUM_HEADS, TOPK, num_splits, SM_SCALE, stride_kv_block,
+        topk_length=topk_length.data_ptr(),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_lse, expected_lse)
 
 
 def test_sparse_mla_decode_multiple_steps(small_setup, device):

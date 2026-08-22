@@ -1464,8 +1464,8 @@ static Napi::Value MmaMoeCoopScatter(const Napi::CallbackInfo& info) {
 
 static Napi::Value MmaMoeCoopGemm(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, weight_ptrs, scale_ptrs, scale2_ptrs, num_experts, N, K, count, scatter_workspace, gemm_workspace, output)").ThrowAsJavaScriptException();
+    if (info.Length() < 14) {
+        Napi::TypeError::New(env, "Expected (ctx, weight_ptrs, scale_ptrs, scale2_ptrs, num_experts, N, K, count, scatter_k, scatter_workspace, sorted_input, output_sorted, gemm_workspace, output)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1476,15 +1476,21 @@ static Napi::Value MmaMoeCoopGemm(const Napi::CallbackInfo& info) {
     int N = info[5].As<Napi::Number>().Int32Value();
     int K = info[6].As<Napi::Number>().Int32Value();
     int count = info[7].As<Napi::Number>().Int32Value();
-    uintptr_t scatter_ws_ptr = info[8].As<Napi::Number>().Int64Value();
-    uintptr_t gemm_ws_ptr = info[9].As<Napi::Number>().Int64Value();
-    uintptr_t out_ptr = info[10].As<Napi::Number>().Int64Value();
+    int scatter_k = info[8].As<Napi::Number>().Int32Value();
+    uintptr_t scatter_ws_ptr = info[9].As<Napi::Number>().Int64Value();
+    uintptr_t sorted_input_ptr = info[10].As<Napi::Number>().Int64Value();
+    bool output_sorted = info[11].As<Napi::Boolean>().Value();
+    uintptr_t gemm_ws_ptr = info[12].As<Napi::Number>().Int64Value();
+    uintptr_t out_ptr = info[13].As<Napi::Number>().Int64Value();
     glm_mma_moe_coop_gemm(reinterpret_cast<GlmCtx*>(ctx_ptr),
                           reinterpret_cast<const void* const*>(wptrs_ptr),
                           reinterpret_cast<const void* const*>(sptrs_ptr),
                           reinterpret_cast<const void* const*>(s2ptrs_ptr),
                           num_experts, N, K, count,
+                          scatter_k,
                           reinterpret_cast<const void*>(scatter_ws_ptr),
+                          reinterpret_cast<const void*>(sorted_input_ptr),
+                          output_sorted,
                           reinterpret_cast<void*>(gemm_ws_ptr),
                           reinterpret_cast<void*>(out_ptr));
     cudaError_t err = cudaGetLastError();
@@ -2517,35 +2523,33 @@ static Napi::Value ConcatAndCacheDsMla(const Napi::CallbackInfo& info) {
 
 static Napi::Value SparseMlaPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 12) {
-        Napi::TypeError::New(env, "Expected 12 args (ctx, q, kv_cache, indices, output, out_lse, num_tokens, num_heads, topk, page_block_size, sm_scale, stride_kv_block)").ThrowAsJavaScriptException();
+    if (info.Length() < 13) {
+        Napi::TypeError::New(env, "Expected 13 args (ctx, q_nope, q_rope, kv_cache, indices, output, out_lse, num_tokens, num_heads, topk, sm_scale, stride_kv_block, topk_length)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t kv_cache_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t indices_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t output_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t out_lse_ptr = info[5].As<Napi::Number>().Int64Value();
-    uint32_t num_tokens = info[6].As<Napi::Number>().Uint32Value();
-    uint32_t num_heads = info[7].As<Napi::Number>().Uint32Value();
-    uint32_t topk = info[8].As<Napi::Number>().Uint32Value();
-    uint32_t page_block_size = info[9].As<Napi::Number>().Uint32Value();
+    uintptr_t q_rope_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t kv_cache_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t indices_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t output_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t out_lse_ptr = info[6].As<Napi::Number>().Int64Value();
+    uint32_t num_tokens = info[7].As<Napi::Number>().Uint32Value();
+    uint32_t num_heads = info[8].As<Napi::Number>().Uint32Value();
+    uint32_t topk = info[9].As<Napi::Number>().Uint32Value();
     float sm_scale = info[10].As<Napi::Number>().FloatValue();
     size_t stride_kv_block = info[11].As<Napi::Number>().Int64Value();
-    int32_t* topk_length = nullptr;
-    if (info.Length() >= 13 && info[12].IsNumber()) {
-        topk_length = reinterpret_cast<int32_t*>(info[12].As<Napi::Number>().Int64Value());
-    }
+    int32_t* topk_length = reinterpret_cast<int32_t*>(info[12].As<Napi::Number>().Int64Value());
     glm_sparse_mla_prefill(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(q_ptr),
+        reinterpret_cast<void*>(q_rope_ptr),
         reinterpret_cast<void*>(kv_cache_ptr),
         reinterpret_cast<int32_t*>(indices_ptr),
         reinterpret_cast<void*>(output_ptr),
         reinterpret_cast<float*>(out_lse_ptr),
-        num_tokens, num_heads, topk, page_block_size,
-        sm_scale, stride_kv_block, topk_length);
+        num_tokens, num_heads, topk,
+        64, sm_scale, stride_kv_block, topk_length);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("sparseMlaPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -2555,32 +2559,34 @@ static Napi::Value SparseMlaPrefill(const Napi::CallbackInfo& info) {
 
 static Napi::Value SparseMlaDecode(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 15) {
-        Napi::TypeError::New(env, "Expected 15 args (ctx, q, kv_cache, indices, mid_out, mid_lse, output, out_lse, num_tokens, num_heads, topk, num_splits, sm_scale, stride_kv_block, chunks_per_block)").ThrowAsJavaScriptException();
+    if (info.Length() < 16) {
+        Napi::TypeError::New(env, "Expected 16 args (ctx, q_nope, q_rope, kv_cache, indices, mid_out, mid_lse, output, out_lse, num_tokens, num_heads, topk, num_splits, sm_scale, stride_kv_block, chunks_per_block)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t q_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t kv_cache_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t indices_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t mid_out_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t mid_lse_ptr = info[5].As<Napi::Number>().Int64Value();
-    uintptr_t output_ptr = info[6].As<Napi::Number>().Int64Value();
-    uintptr_t out_lse_ptr = info[7].As<Napi::Number>().Int64Value();
-    uint32_t num_tokens = info[8].As<Napi::Number>().Uint32Value();
-    uint32_t num_heads = info[9].As<Napi::Number>().Uint32Value();
-    uint32_t topk = info[10].As<Napi::Number>().Uint32Value();
-    uint32_t num_splits = info[11].As<Napi::Number>().Uint32Value();
-    float sm_scale = info[12].As<Napi::Number>().FloatValue();
-    size_t stride_kv_block = info[13].As<Napi::Number>().Int64Value();
-    int chunks_per_block = info[14].As<Napi::Number>().Int32Value();
+    uintptr_t q_nope_ptr = info[1].As<Napi::Number>().Int64Value();
+    uintptr_t q_rope_ptr = info[2].As<Napi::Number>().Int64Value();
+    uintptr_t kv_cache_ptr = info[3].As<Napi::Number>().Int64Value();
+    uintptr_t indices_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t mid_out_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t mid_lse_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t output_ptr = info[7].As<Napi::Number>().Int64Value();
+    uintptr_t out_lse_ptr = info[8].As<Napi::Number>().Int64Value();
+    uint32_t num_tokens = info[9].As<Napi::Number>().Uint32Value();
+    uint32_t num_heads = info[10].As<Napi::Number>().Uint32Value();
+    uint32_t topk = info[11].As<Napi::Number>().Uint32Value();
+    uint32_t num_splits = info[12].As<Napi::Number>().Uint32Value();
+    float sm_scale = info[13].As<Napi::Number>().FloatValue();
+    size_t stride_kv_block = info[14].As<Napi::Number>().Int64Value();
+    int chunks_per_block = info[15].As<Napi::Number>().Int32Value();
     int32_t* topk_length = nullptr;
-    if (info.Length() >= 16 && info[15].IsNumber()) {
-        topk_length = reinterpret_cast<int32_t*>(info[15].As<Napi::Number>().Int64Value());
+    if (info.Length() >= 17 && info[16].IsNumber()) {
+        topk_length = reinterpret_cast<int32_t*>(info[16].As<Napi::Number>().Int64Value());
     }
     glm_sparse_mla_decode(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
-        reinterpret_cast<void*>(q_ptr),
+        reinterpret_cast<void*>(q_nope_ptr),
+        reinterpret_cast<void*>(q_rope_ptr),
         reinterpret_cast<void*>(kv_cache_ptr),
         reinterpret_cast<int32_t*>(indices_ptr),
         reinterpret_cast<void*>(mid_out_ptr),

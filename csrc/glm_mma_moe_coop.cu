@@ -545,14 +545,20 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
             __syncthreads();
         }
 
-        // ---- writeback (scattered: write directly to output via sorted_to_original) ----
-        const int* expert_s2o = sorted_to_original + expert_offsets[expert_id];
+        // ---- writeback (expert-sorted, or original route order via lookup) ----
+        const int* expert_s2o = sorted_to_original ? sorted_to_original + expert_offsets[expert_id] : nullptr;
         for (int mt = 0; mt < M_TILES_FOR_WARP; mt++) {
             int m_tile2 = (my_m_start_tile + mt) * 16;
             int row0 = m_tile2 + t1, row1 = m_tile2 + t1 + 8;
             int orig0 = -1, orig1 = -1;
-            if (row0 < m_valid) orig0 = expert_s2o[m_start + row0];
-            if (row1 < m_valid) orig1 = expert_s2o[m_start + row1];
+            if (row0 < m_valid) {
+                int sorted_row = expert_offsets[expert_id] + m_start + row0;
+                orig0 = expert_s2o ? expert_s2o[m_start + row0] : sorted_row;
+            }
+            if (row1 < m_valid) {
+                int sorted_row = expert_offsets[expert_id] + m_start + row1;
+                orig1 = expert_s2o ? expert_s2o[m_start + row1] : sorted_row;
+            }
             for (int n_group = 0; n_group < N_GROUPS_FOR_WARP; n_group++) {
                 int n_start_local = my_n_start_local + n_group * 8;
                 int acc_base = mt * ACC_STRIDE + n_group * 4;
@@ -828,17 +834,21 @@ void glm_mma_moe_coop_gemm(GlmCtx* ctx,
                            const void* const* weight_ptrs, const void* const* scale_ptrs,
                            const void* const* scale2_ptrs,
                            int num_experts, int N, int K, int count,
-                           const void* scatter_workspace, void* gemm_workspace,
+                           int scatter_k, const void* scatter_workspace,
+                           const void* sorted_input_override, bool output_sorted,
+                           void* gemm_workspace,
                            void* output) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     if (count == 0 || N == 0 || K == 0) return;
 
     const uint8_t* sws = static_cast<const uint8_t*>(scatter_workspace);
-    const __nv_bfloat16* sorted_input = reinterpret_cast<const __nv_bfloat16*>(sws);
-    const int* expert_offsets = reinterpret_cast<const int*>(sws + (size_t)count * K * 2 + (size_t)num_experts * 4);
+    const __nv_bfloat16* sorted_input = sorted_input_override
+        ? reinterpret_cast<const __nv_bfloat16*>(sorted_input_override)
+        : reinterpret_cast<const __nv_bfloat16*>(sws);
+    const int* expert_offsets = reinterpret_cast<const int*>(sws + (size_t)count * scatter_k * 2 + (size_t)num_experts * 4);
     const int* sorted_to_original = reinterpret_cast<const int*>(
-        sws + (size_t)count * K * 2 + (size_t)num_experts * 4 + (size_t)(num_experts + 1) * 4);
+        sws + (size_t)count * scatter_k * 2 + (size_t)num_experts * 4 + (size_t)(num_experts + 1) * 4);
 
     uint8_t* gws = static_cast<uint8_t*>(gemm_workspace);
     int* tile_counter = reinterpret_cast<int*>(gws);
@@ -846,7 +856,8 @@ void glm_mma_moe_coop_gemm(GlmCtx* ctx,
     cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
 
     launch_coop_configured(ctx, num_experts, N, sorted_input, reinterpret_cast<__nv_bfloat16*>(output), K,
-                           weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
+                           weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream,
+                           output_sorted ? nullptr : sorted_to_original);
 }
 
 } // extern "C"

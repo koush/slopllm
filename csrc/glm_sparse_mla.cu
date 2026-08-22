@@ -13,7 +13,8 @@ namespace flashinfer::sparse_mla_sm120 {
         __nv_bfloat16* output, float* out_lse, float sm_scale, int num_tokens,
         size_t stride_kv_block, size_t stride_kv_block_extra,
         const float* attn_sink, const int* topk_length,
-        const int* extra_topk_length, cudaStream_t stream);
+        const int* extra_topk_length, cudaStream_t stream,
+        const __nv_bfloat16* Q_rope_split);
 
     bool launch_sparse_mla_decode_dsv3_2(
         ModelType mt, int num_heads, int topk, int num_tokens,
@@ -21,7 +22,8 @@ namespace flashinfer::sparse_mla_sm120 {
         const int32_t* indices, __nv_bfloat16* mid_out, float* mid_lse,
         __nv_bfloat16* output, float* out_lse, const int* topk_length,
         const float* attn_sink, int chunks_per_block_override,
-        float sm_scale, size_t stride_kv_block, cudaStream_t stream);
+        float sm_scale, size_t stride_kv_block, cudaStream_t stream,
+        const __nv_bfloat16* Q_rope_split);
 }
 
 #include "glm_ops.h"
@@ -30,7 +32,8 @@ extern "C" {
 
 void glm_sparse_mla_prefill(
     GlmCtx* ctx,
-    void* q,                  // [num_tokens, num_heads, d_qk] BF16
+    void* q,                  // contiguous Q or split Q_nope
+    void* q_rope,             // split [num_tokens, num_heads, 64] or null
     void* kv_cache,           // [num_pages, page_size, bpt] U8
     int32_t* indices,         // [num_tokens, topk] — flat slot IDs, -1 = invalid
     void* output,             // [num_tokens, num_heads, d_v] BF16
@@ -61,7 +64,8 @@ void glm_sparse_mla_prefill(
         nullptr,  // no attn_sink
         topk_length,
         nullptr,
-        GLM_STREAM(ctx));
+        GLM_STREAM(ctx),
+        (const __nv_bfloat16*)q_rope);
 
     if (!ok) {
         fprintf(stderr, "glm_sparse_mla_prefill: dispatch failed for num_heads=%u topk=%u\n",
@@ -71,7 +75,8 @@ void glm_sparse_mla_prefill(
 
 void glm_sparse_mla_decode(
     GlmCtx* ctx,
-    void* q,                  // [num_tokens, num_heads, d_qk] BF16
+    void* q,                  // contiguous Q or split Q_nope
+    void* q_rope,             // split [num_tokens, num_heads, 64] or null
     void* kv_cache,           // [num_pages, page_size, bpt] U8
     int32_t* indices,         // [num_tokens, topk] — flat slot IDs, -1 = invalid
     void* mid_out,            // [num_tokens, num_heads, num_splits, d_v] BF16
@@ -106,7 +111,8 @@ void glm_sparse_mla_decode(
         chunks_per_block_override,
         sm_scale,
         stride_kv_block,
-        GLM_STREAM(ctx));
+        GLM_STREAM(ctx),
+        (const __nv_bfloat16*)q_rope);
 
     if (!ok) {
         fprintf(stderr, "glm_sparse_mla_decode: dispatch failed for num_heads=%u topk=%u\n",

@@ -684,7 +684,7 @@ void glm_concat_and_cache_ds_mla(
 // topk_length: [num_tokens] int32 or null (effective top-k per token)
 void glm_sparse_mla_prefill(
     GlmCtx* ctx,
-    void* q, void* kv_cache,
+    void* q, void* q_rope, void* kv_cache,
     int32_t* indices,
     void* output, float* out_lse,
     uint32_t num_tokens, uint32_t num_heads, uint32_t topk,
@@ -699,7 +699,7 @@ void glm_sparse_mla_prefill(
 // chunks_per_block_override: 0 = auto-tune
 void glm_sparse_mla_decode(
     GlmCtx* ctx,
-    void* q, void* kv_cache,
+    void* q, void* q_rope, void* kv_cache,
     int32_t* indices,
     void* mid_out, float* mid_lse,
     void* output, float* out_lse,
@@ -708,7 +708,6 @@ void glm_sparse_mla_decode(
     float sm_scale, size_t stride_kv_block,
     int32_t* topk_length,
     int chunks_per_block_override);
-
 // Sparse topk-driven gather of BPT-byte CKV tokens into a flat-format output
 // buffer. Same kernel body for two call shapes:
 //   * N=1, cp_world_size=0 — single-GPU / non-CP. The warp reads BPT bytes
@@ -1013,7 +1012,7 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output,
                                             int count, int N, int K,
                                             int num_experts, void* workspace);
 
-// Split MoE coop: scatter once, GEMM multiple times, unscatter separately.
+// Split MoE coop: scatter once, then optionally keep GEMM outputs expert-sorted.
 size_t glm_mma_moe_coop_scatter_workspace_size(int count, int K, int num_experts);
 size_t glm_mma_moe_coop_gemm_workspace_size(int count, int N);
 void glm_mma_moe_coop_scatter(GlmCtx* ctx, const void* input, const int* expert_ids,
@@ -1023,8 +1022,9 @@ void glm_mma_moe_coop_gemm(GlmCtx* ctx,
                            const void* const* weight_ptrs, const void* const* scale_ptrs,
                            const void* const* scale2_ptrs,
                            int num_experts, int N, int K, int count,
-                            const void* scatter_workspace, void* gemm_workspace,
-                            void* output);
+                           int scatter_k, const void* scatter_workspace,
+                           const void* sorted_input_override, bool output_sorted,
+                           void* gemm_workspace, void* output);
 
 #ifdef __cplusplus
 }
