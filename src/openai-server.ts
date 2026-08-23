@@ -607,17 +607,18 @@ async function generateContinuousBatch(
         },
         row => finishCancelled(row.request),
       );
-      const retainedActive: ActiveSequence[] = [];
+      const retainedActiveEntries: typeof activeEntries = [];
       for (const entry of activeEntries) {
         if (entry.sequence.request.finished) {
           pagedKV.removeStagedSequence(entry.key);
           finishCancelled(entry.sequence.request);
         } else {
-          pagedKV.unstageSequence(entry.key);
-          retainedActive.push(entry.sequence);
+          retainedActiveEntries.push(entry);
         }
       }
       if (newRows.length === 0) {
+        for (const entry of retainedActiveEntries) pagedKV.unstageSequence(entry.key);
+        const retainedActive = retainedActiveEntries.map(entry => entry.sequence);
         active.splice(0, active.length, ...retainedActive);
         continue;
       }
@@ -648,6 +649,9 @@ async function generateContinuousBatch(
           checkStopSequences(newRows[i].request);
         }
       }
+
+      for (const entry of retainedActiveEntries) pagedKV.unstageSequence(entry.key);
+      const retainedActive = retainedActiveEntries.map(entry => entry.sequence);
 
       // Build new active list matching pagedKV sequence order: [new..., old...]
       const newActiveSequences: ActiveSequence[] = [];
