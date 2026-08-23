@@ -162,7 +162,7 @@ The loader currently supports Qwen3 and GLM-5.1. It requires `--arena <GiB>` and
 Start the loader and its initial executor in one command:
 
 ```bash
-npx tsx src/run_model_loader.ts \
+NCCL_P2P_LEVEL=SYS NCCL_TOPO_FILE=/root/chat/vllm/topo_fixed.xml npx tsx src/run_model_loader.ts \
   --arena 92 --gpus 0,1,2,3,4,5,6,7 --cp --glm51 --mtp \
   src/openai-server.ts --host 0.0.0.0 --port 8010
 ```
@@ -208,6 +208,17 @@ curl -N -X POST 'http://127.0.0.1:8099/restart?follow'
 ```
 
 Changing model/shared arguments requires restarting the loader itself. The control server has no authentication, so keep it bound to `127.0.0.1` unless it is protected by other means.
+
+## NCCL Topology
+
+The following environment variables hsould be used to override the default topology which prevents host staged all gather and all reduce when using NCCL.
+
+```
+NCCL_P2P_LEVEL=SYS
+NCCL_TOPO_FILE=/root/chat/vllm/topo_fixed.xml
+```
+
+NCCL erroneously (the 8 GPUs are connected via 2 switches) sees device interconnect as NODE and the environment variables use optimal p2p routing.
 
 ## Vendor
 
