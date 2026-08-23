@@ -186,14 +186,52 @@ __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wai
 
 template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M, int TK>
 struct CoopSmem {
-    alignas(16) __nv_bfloat16 a_buf[DEPTH][TM * TK];
+    alignas(16) __nv_bfloat16 a_buf[DEPTH][(TM < 16 ? 16 : TM) * TK];
     alignas(16) uint8_t fp4_buf[DEPTH][TN * (TK / 2)];
     alignas(16) __nv_fp8_e4m3 scale_batch[DEPTH][TN * SCALE_BATCH];
     int tile_prefix[MaxExperts + 1];
     int work_idx;
 };
 
-template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M, int TK = 32>
+__device__ __forceinline__ uint32_t fp4x2_to_bf16x2(uint8_t packed) {
+    uint32_t result;
+    uint32_t b = packed;
+    asm("{ .reg .b8 fp4_byte; mov.b32 {fp4_byte,_,_,_},%1; "
+        "cvt.rn.bf16x2.e2m1x2 %0,fp4_byte; }"
+        : "=r"(result) : "r"(b));
+    return result;
+}
+
+__device__ __forceinline__ uint32_t fp8_scale_to_bf16x2(uint8_t scale) {
+    uint16_t duplicated = (uint16_t)scale | ((uint16_t)scale << 8);
+    uint32_t converted;
+    asm("cvt.rn.bf16x2.e4m3x2 %0,%1;" : "=r"(converted) : "h"(duplicated));
+    uint32_t high = converted >> 16;
+    return high | (high << 16);
+}
+
+__device__ __forceinline__ void direct_dequant_b_regs(
+    uint32_t regB_0, uint32_t regB_1, uint32_t sfb_packed, uint32_t s2_pair,
+    int sub_ks, int t0, int t1, uint32_t& b_reg_0, uint32_t& b_reg_1) {
+    int k0 = sub_ks * QUANT_GROUP + 2 * t0;
+    int k1 = k0 + 8;
+    int src_lane0 = 4 * t1 + ((k0 & 31) >> 3);
+    int src_lane1 = 4 * t1 + ((k1 & 31) >> 3);
+    uint32_t src0 = __shfl_sync(0xffffffff, (k0 & 32) ? regB_1 : regB_0, src_lane0);
+    uint32_t src1 = __shfl_sync(0xffffffff, (k1 & 32) ? regB_1 : regB_0, src_lane1);
+    uint8_t packed0 = (src0 >> (4 * (k0 & 7))) & 0xff;
+    uint8_t packed1 = (src1 >> (4 * (k1 & 7))) & 0xff;
+    uint32_t scale_pair = fp8_scale_to_bf16x2((sfb_packed >> (8 * sub_ks)) & 0xff);
+    uint32_t fp4_0 = fp4x2_to_bf16x2(packed0);
+    uint32_t fp4_1 = fp4x2_to_bf16x2(packed1);
+    asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_0) : "r"(fp4_0), "r"(scale_pair));
+    asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_1) : "r"(fp4_1), "r"(scale_pair));
+    asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_0) : "r"(b_reg_0), "r"(s2_pair));
+    asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
+}
+
+template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M,
+          int TK = 32, bool DIRECT_DEQUANT = false>
 __global__ void __launch_bounds__(NWARPS * 32, 4)
 coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                 __nv_bfloat16* __restrict__ output, int K,
@@ -206,7 +244,8 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
     constexpr int CTA_THREADS = NWARPS * 32;
     constexpr int KGPS = TK / QUANT_GROUP;
     constexpr int TOTAL_N_GROUPS = TN / 8;
-    constexpr int TOTAL_M_TILES = TM / 16;
+    constexpr int MMA_TM = TM < 16 ? 16 : TM;
+    constexpr int TOTAL_M_TILES = MMA_TM / 16;
 
     // Warp work assignment
     constexpr int N_GROUPS_FOR_WARP = SPLIT_M ? TOTAL_N_GROUPS : (TOTAL_N_GROUPS / NWARPS);
@@ -309,7 +348,7 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                 uint8_t* sfp4 = smem->fp4_buf[buf];
 
                 // --- stage A (swizzled for ldmatrix.x4) ---
-                constexpr int A_OPS = TM * (TK / 8);
+                constexpr int A_OPS = MMA_TM * (TK / 8);
                 for (int idx = tid; idx < A_OPS; idx += CTA_THREADS) {
                     int m = idx / (TK / 8);
                     int c = idx % (TK / 8);
@@ -399,37 +438,42 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                             }
                         }
                         for (int sub_ks = 0; sub_ks < KGPS; sub_ks++) {
-                            int shift = sub_ks * QUANT_GROUP;
-                            uint32_t regA[4] = {0, 0, 0, 0};
-                            for (int reg = 0; reg < 4; reg++) {
-                                int v1 = reg % 2, v2 = reg / 2;
-                                int m = t1 + 8 * v1;
-                                for (int v0 = 0; v0 < 8; v0++) {
-                                    int k = 8 * t0 + v0 + 32 * v2;
-                                    if (k == m + shift) regA[reg] |= (uint32_t)0x2 << (4 * v0);
-                                }
-                            }
-                            float frag_d[4];
-                            asm("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X"
-                                ".m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-                                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
-                                "{%14},{%15,%16},{%17},{%18,%19};\n"
-                                : "=f"(frag_d[0]), "=f"(frag_d[1]), "=f"(frag_d[2]), "=f"(frag_d[3])
-                                : "r"(regA[0]), "r"(regA[1]), "r"(regA[2]), "r"(regA[3]),
-                                "r"(regB_0), "r"(regB_1),
-                                "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f),
-                                "r"(sfa_packed), "h"((uint16_t)0), "h"((uint16_t)0),
-                                "r"(sfb_packed), "h"((uint16_t)0), "h"((uint16_t)0));
-                            uint32_t pack_01, pack_23;
-                            asm("{ .reg .b16 lo,hi; cvt.rn.bf16.f32 lo,%2; cvt.rn.bf16.f32 hi,%3; mov.b32 %0,{lo,hi}; }"
-                                : "=r"(pack_01) : "r"(0), "f"(frag_d[0]), "f"(frag_d[1]));
-                            asm("{ .reg .b16 lo,hi; cvt.rn.bf16.f32 lo,%2; cvt.rn.bf16.f32 hi,%3; mov.b32 %0,{lo,hi}; }"
-                                : "=r"(pack_23) : "r"(0), "f"(frag_d[2]), "f"(frag_d[3]));
                             uint32_t b_reg_0, b_reg_1;
-                            asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(b_reg_0) : "r"(pack_01));
-                            asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(b_reg_1) : "r"(pack_23));
-                            asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_0) : "r"(b_reg_0), "r"(s2_pair));
-                            asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
+                            if constexpr (DIRECT_DEQUANT) {
+                                direct_dequant_b_regs(regB_0, regB_1, sfb_packed, s2_pair,
+                                                      sub_ks, t0, t1, b_reg_0, b_reg_1);
+                            } else {
+                                int shift = sub_ks * QUANT_GROUP;
+                                uint32_t regA[4] = {0, 0, 0, 0};
+                                for (int reg = 0; reg < 4; reg++) {
+                                    int v1 = reg % 2, v2 = reg / 2;
+                                    int m = t1 + 8 * v1;
+                                    for (int v0 = 0; v0 < 8; v0++) {
+                                        int k = 8 * t0 + v0 + 32 * v2;
+                                        if (k == m + shift) regA[reg] |= (uint32_t)0x2 << (4 * v0);
+                                    }
+                                }
+                                float frag_d[4];
+                                asm("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X"
+                                    ".m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
+                                    "{%14},{%15,%16},{%17},{%18,%19};\n"
+                                    : "=f"(frag_d[0]), "=f"(frag_d[1]), "=f"(frag_d[2]), "=f"(frag_d[3])
+                                    : "r"(regA[0]), "r"(regA[1]), "r"(regA[2]), "r"(regA[3]),
+                                    "r"(regB_0), "r"(regB_1),
+                                    "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f),
+                                    "r"(sfa_packed), "h"((uint16_t)0), "h"((uint16_t)0),
+                                    "r"(sfb_packed), "h"((uint16_t)0), "h"((uint16_t)0));
+                                uint32_t pack_01, pack_23;
+                                asm("{ .reg .b16 lo,hi; cvt.rn.bf16.f32 lo,%2; cvt.rn.bf16.f32 hi,%3; mov.b32 %0,{lo,hi}; }"
+                                    : "=r"(pack_01) : "r"(0), "f"(frag_d[0]), "f"(frag_d[1]));
+                                asm("{ .reg .b16 lo,hi; cvt.rn.bf16.f32 lo,%2; cvt.rn.bf16.f32 hi,%3; mov.b32 %0,{lo,hi}; }"
+                                    : "=r"(pack_23) : "r"(0), "f"(frag_d[2]), "f"(frag_d[3]));
+                                asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(b_reg_0) : "r"(pack_01));
+                                asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(b_reg_1) : "r"(pack_23));
+                                asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_0) : "r"(b_reg_0), "r"(s2_pair));
+                                asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
+                            }
                             #pragma unroll
                             for (int mt = 0; mt < M_TILES_FOR_WARP; mt++) {
                                 int m_tile2 = (my_m_start_tile + mt) * 16;
@@ -490,37 +534,42 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                     }
                 }
                 for (int sub_ks = 0; sub_ks < KGPS; sub_ks++) {
-                    int shift = sub_ks * QUANT_GROUP;
-                    uint32_t regA[4] = {0, 0, 0, 0};
-                    for (int reg = 0; reg < 4; reg++) {
-                        int v1 = reg % 2, v2 = reg / 2;
-                        int m = t1 + 8 * v1;
-                        for (int v0 = 0; v0 < 8; v0++) {
-                            int k = 8 * t0 + v0 + 32 * v2;
-                            if (k == m + shift) regA[reg] |= (uint32_t)0x2 << (4 * v0);
-                        }
-                    }
-                    float frag_d[4];
-                    asm("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X"
-                        ".m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
-                        "{%14},{%15,%16},{%17},{%18,%19};\n"
-                        : "=f"(frag_d[0]), "=f"(frag_d[1]), "=f"(frag_d[2]), "=f"(frag_d[3])
-                        : "r"(regA[0]), "r"(regA[1]), "r"(regA[2]), "r"(regA[3]),
-                        "r"(regB_0), "r"(regB_1),
-                        "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f),
-                        "r"(sfa_packed), "h"((uint16_t)0), "h"((uint16_t)0),
-                        "r"(sfb_packed), "h"((uint16_t)0), "h"((uint16_t)0));
-                    uint32_t pack_01, pack_23;
-                    asm("{ .reg .b16 lo,hi; cvt.rn.bf16.f32 lo,%2; cvt.rn.bf16.f32 hi,%3; mov.b32 %0,{lo,hi}; }"
-                        : "=r"(pack_01) : "r"(0), "f"(frag_d[0]), "f"(frag_d[1]));
-                    asm("{ .reg .b16 lo,hi; cvt.rn.bf16.f32 lo,%2; cvt.rn.bf16.f32 hi,%3; mov.b32 %0,{lo,hi}; }"
-                        : "=r"(pack_23) : "r"(0), "f"(frag_d[2]), "f"(frag_d[3]));
                     uint32_t b_reg_0, b_reg_1;
-                    asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(b_reg_0) : "r"(pack_01));
-                    asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(b_reg_1) : "r"(pack_23));
-                    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_0) : "r"(b_reg_0), "r"(s2_pair));
-                    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
+                    if constexpr (DIRECT_DEQUANT) {
+                        direct_dequant_b_regs(regB_0, regB_1, sfb_packed, s2_pair,
+                                              sub_ks, t0, t1, b_reg_0, b_reg_1);
+                    } else {
+                        int shift = sub_ks * QUANT_GROUP;
+                        uint32_t regA[4] = {0, 0, 0, 0};
+                        for (int reg = 0; reg < 4; reg++) {
+                            int v1 = reg % 2, v2 = reg / 2;
+                            int m = t1 + 8 * v1;
+                            for (int v0 = 0; v0 < 8; v0++) {
+                                int k = 8 * t0 + v0 + 32 * v2;
+                                if (k == m + shift) regA[reg] |= (uint32_t)0x2 << (4 * v0);
+                            }
+                        }
+                        float frag_d[4];
+                        asm("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X"
+                            ".m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
+                            "{%14},{%15,%16},{%17},{%18,%19};\n"
+                            : "=f"(frag_d[0]), "=f"(frag_d[1]), "=f"(frag_d[2]), "=f"(frag_d[3])
+                            : "r"(regA[0]), "r"(regA[1]), "r"(regA[2]), "r"(regA[3]),
+                            "r"(regB_0), "r"(regB_1),
+                            "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f),
+                            "r"(sfa_packed), "h"((uint16_t)0), "h"((uint16_t)0),
+                            "r"(sfb_packed), "h"((uint16_t)0), "h"((uint16_t)0));
+                        uint32_t pack_01, pack_23;
+                        asm("{ .reg .b16 lo,hi; cvt.rn.bf16.f32 lo,%2; cvt.rn.bf16.f32 hi,%3; mov.b32 %0,{lo,hi}; }"
+                            : "=r"(pack_01) : "r"(0), "f"(frag_d[0]), "f"(frag_d[1]));
+                        asm("{ .reg .b16 lo,hi; cvt.rn.bf16.f32 lo,%2; cvt.rn.bf16.f32 hi,%3; mov.b32 %0,{lo,hi}; }"
+                            : "=r"(pack_23) : "r"(0), "f"(frag_d[2]), "f"(frag_d[3]));
+                        asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(b_reg_0) : "r"(pack_01));
+                        asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(b_reg_1) : "r"(pack_23));
+                        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_0) : "r"(b_reg_0), "r"(s2_pair));
+                        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
+                    }
                     #pragma unroll
                     for (int mt = 0; mt < M_TILES_FOR_WARP; mt++) {
                         int m_tile2 = (my_m_start_tile + mt) * 16;
@@ -578,7 +627,8 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
     }
 }
 
-template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M, int TK = 32>
+template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M,
+          int TK = 32, bool DIRECT_DEQUANT = false>
 static void launch_coop(GlmCtx* ctx, int num_experts, int N,
                         const __nv_bfloat16* sorted_input, __nv_bfloat16* output, int K,
                         const void* const* weight_ptrs, const void* const* scale_ptrs,
@@ -595,9 +645,9 @@ static void launch_coop(GlmCtx* ctx, int num_experts, int N,
     int cta_per_sm = cta_from_smem < cta_from_threads ? cta_from_smem : cta_from_threads;
     if (cta_per_sm < 1) cta_per_sm = 1;
     int grid = num_SMs * cta_per_sm;
-    cudaFuncSetAttribute((void*)coop_moe_kernel<TM, TN, DEPTH, NWARPS, MaxExperts, SPLIT_M, TK>,
+    cudaFuncSetAttribute((void*)coop_moe_kernel<TM, TN, DEPTH, NWARPS, MaxExperts, SPLIT_M, TK, DIRECT_DEQUANT>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    coop_moe_kernel<TM, TN, DEPTH, NWARPS, MaxExperts, SPLIT_M, TK><<<grid, NWARPS * 32, smem, stream>>>(
+    coop_moe_kernel<TM, TN, DEPTH, NWARPS, MaxExperts, SPLIT_M, TK, DIRECT_DEQUANT><<<grid, NWARPS * 32, smem, stream>>>(
         sorted_input, output, K, weight_ptrs, scale_ptrs, scale2_ptrs,
         expert_offsets, num_experts, N, tile_counter, sorted_to_original);
 }
@@ -615,6 +665,22 @@ static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
         default_cfg = "tm64_tn128_d2_nw4";
     std::string cfg(cfg_env ? cfg_env : default_cfg);
 
+    if (getenv("GLM_MOE_DIRECT_DEQUANT")) {
+        if (cfg == "tm128_tn128_d2_nw2")
+            launch_coop<128, 128, 2, 2, MaxExperts, false, 32, true>(ctx, num_experts, N, sorted_input, output, K,
+                weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
+        else if (cfg == "tm128_tn128_d2_nw4")
+            launch_coop<128, 128, 2, 4, MaxExperts, false, 32, true>(ctx, num_experts, N, sorted_input, output, K,
+                weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
+        else if (N == 6144 && K == 256)
+            launch_coop<64, 128, 2, 4, MaxExperts, false, 32, true>(ctx, num_experts, N, sorted_input, output, K,
+                weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
+        else
+            launch_coop<64, 128, 2, 2, MaxExperts, false, 32, true>(ctx, num_experts, N, sorted_input, output, K,
+                weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
+        return;
+    }
+
     const char* nw_env = getenv("GLM_COOP_NWARPS");
     if (nw_env && !cfg_env) {
         int nw = atoi(nw_env);
@@ -623,7 +689,13 @@ static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
         else cfg = "tm32_nw4";
     }
 
-    if (cfg == "tm32_nw2")
+    if (cfg == "tm8_tn128_d2_nw2")
+        launch_coop<8, 128, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                      weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
+    else if (cfg == "tm16_tn128_d2_nw2")
+        launch_coop<16, 128, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
+    else if (cfg == "tm32_nw2")
         launch_coop<32, 64, 4, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm32_nw8")
@@ -697,6 +769,9 @@ static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
                                                         weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm128_tn128_d2_nw2")
         launch_coop<128, 128, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
+                                                        weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
+    else if (cfg == "tm128_tn128_d2_nw4")
+        launch_coop<128, 128, 2, 4, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
                                                         weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
     else if (cfg == "tm64_tn256_d3_nw2")
         launch_coop<64, 256, 3, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,

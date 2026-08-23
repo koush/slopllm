@@ -20,6 +20,7 @@ interface Args extends ModelCliArgs {
   maxPages: number;
   mtpDraftTopk: number[];
   noCudaGraph: boolean;
+  noMtp: boolean;
   prompt?: string;
 }
 
@@ -32,6 +33,7 @@ function parseArgs(argv: string[]): Args {
     maxPages: 256,
     mtpDraftTopk: [1, 1, 1],
     noCudaGraph: false,
+    noMtp: false,
     prompt: undefined,
   };
 
@@ -45,10 +47,12 @@ function parseArgs(argv: string[]): Args {
     else if (arg === "--mtp-draft-topk" && i + 1 < argv.length) {
       args.mtpDraftTopk = argv[++i].split(",").map(value => parseInt(value.trim(), 10));
     } else if (arg === "--no-cuda-graph") args.noCudaGraph = true;
+    else if (arg === "--no-mtp") args.noMtp = true;
   }
 
-  if (!Number.isInteger(args.batchSize) || args.batchSize < 1 || args.batchSize > PROMPTS.length) {
-    throw new Error(`--batch-size must be between 1 and ${PROMPTS.length}`);
+  const maxBatchSize = args.prompt ? 8 : PROMPTS.length;
+  if (!Number.isInteger(args.batchSize) || args.batchSize < 1 || args.batchSize > maxBatchSize) {
+    throw new Error(`--batch-size must be between 1 and ${maxBatchSize}`);
   }
   if (!Number.isInteger(args.maxNewTokens) || args.maxNewTokens < 1) {
     throw new Error(`Invalid --max-new-tokens: ${args.maxNewTokens}`);
@@ -62,8 +66,8 @@ function parseArgs(argv: string[]): Args {
   if (args.mtpDraftTopk.length === 0 || args.mtpDraftTopk.some(topk => !Number.isInteger(topk) || topk < 1)) {
     throw new Error(`Invalid --mtp-draft-topk: ${args.mtpDraftTopk.join(",")}`);
   }
-  if (!args.useGlm51 || !args.mtp) {
-    throw new Error("run_glm51_multiple_mtp requires --glm51 --mtp");
+  if (!args.useGlm51 || (!args.mtp && !args.noMtp)) {
+    throw new Error("run_glm51_multiple_mtp requires --glm51 and either --mtp or --no-mtp");
   }
 
   return args;
@@ -185,6 +189,85 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOp
   console.log(mtpStats.log() || "MTP metrics: no post-warmup drafts");
 }
 
+async function runBatchWithoutMtp(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args): Promise<void> {
+  const prompts = args.prompt ? Array(args.batchSize).fill(args.prompt) : PROMPTS.slice(0, args.batchSize);
+  const inputIds = prompts.map(prompt => tokenizePrompt(model.tokenizer, prompt));
+  const longestPrompt = Math.max(...inputIds.map(ids => ids.length));
+  if (longestPrompt + args.maxNewTokens > args.maxSeqLen) {
+    throw new Error(`Prompt plus generation budget exceeds --max-seq-len (${longestPrompt} + ${args.maxNewTokens} > ${args.maxSeqLen})`);
+  }
+
+  cache.reset(args.batchSize);
+  const suffixIds = inputIds.map((ids, batch) => cache.prefixMatch(batch, ids));
+  const prefillState = ws.planPrefill(model, args.batchSize, suffixIds.map(ids => ids.length), cache);
+  prefillState.setInput(suffixIds);
+  let currentTokens: number[];
+  {
+    using hiddenStates = model.forward(prefillState);
+    using logits = prefillState.computeLogits(hiddenStates, model);
+    using selected = logits.argmax();
+    currentTokens = selected.readInt32LEArray();
+  }
+  await glm.synchronizeAsync();
+  ws.clearTracking();
+
+  const generated = currentTokens.map(token => [token]);
+  const finished = currentTokens.map(token => model.eosIds.has(token) || args.maxNewTokens === 1);
+  for (let batch = 0; batch < args.batchSize; batch++) {
+    cache.reportTokens(batch, suffixIds[batch]);
+    cache.reportTokens(batch, [currentTokens[batch]]);
+  }
+
+  using captureManager = new CaptureManager(glm);
+  captureManager.disabled = args.noCudaGraph;
+  let firstPostWarmupTime = 0;
+  let lastTokenTime = 0;
+  let postWarmupTokenCount = 0;
+  const started = performance.now();
+
+  while (!finished.some(Boolean)) {
+    using _tracking = ws.startTracking();
+    const state = ws.planDecode(model, args.batchSize, cache, !captureManager.disabled);
+    state.setInput([currentTokens]);
+    const postWarmup = captureManager.disabled || state.isCaptured(captureManager, ["decode"]);
+    using selected = state.capture(captureManager, {}, () => {
+      using hiddenStates = model.forwardModel(state);
+      using logits = state.computeLogits(hiddenStates, model);
+      return logits.argmax();
+    }, ["decode"]);
+    await glm.synchronizeAsync();
+    currentTokens = selected.readInt32LEArray();
+
+    for (let batch = 0; batch < args.batchSize; batch++) {
+      const token = currentTokens[batch];
+      generated[batch].push(token);
+      cache.reportTokens(batch, [token]);
+      if (postWarmup) {
+        const now = performance.now();
+        if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
+        lastTokenTime = now;
+        postWarmupTokenCount++;
+      }
+      if (model.eosIds.has(token) || generated[batch].length >= args.maxNewTokens) {
+        finished[batch] = true;
+      }
+    }
+  }
+
+  const elapsed = (performance.now() - started) / 1000;
+  const decodeTokPerSec = postWarmupTokenCount > 1 && firstPostWarmupTime > 0
+    ? postWarmupTokenCount / ((lastTokenTime - firstPostWarmupTime) / 1000)
+    : 0;
+  console.log(`Stopped when batch ${finished.findIndex(Boolean) + 1} completed after ${elapsed.toFixed(1)}s.`);
+  for (let batch = 0; batch < args.batchSize; batch++) {
+    const visibleTokens = generated[batch].filter(token => !model.eosIds.has(token));
+    console.log(`\n--- Prompt ${batch + 1} ---\n${prompts[batch]}`);
+    console.log(`\n--- Response ${batch + 1} (${visibleTokens.length} tokens) ---`);
+    console.log(model.tokenizer.decode(visibleTokens, { skip_special_tokens: true }));
+  }
+  console.log(`\ndecode=${decodeTokPerSec.toFixed(1)} tok/s`);
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   Error.stackTraceLimit = 20;
   const args = parseArgs(argv);
@@ -200,8 +283,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     model = loadedModel;
     cache = model.createChatCache(args.maxPages, args.batchSize, args.maxSeqLen);
     ws = new ExecutionWorkspace(glm, args.batchSize, args.maxSeqLen);
-    console.log(`GLM-5.1 batched MTP: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, topk=${args.mtpDraftTopk.join(",")}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);
-    await runBatch(model, ws, glm, cache, args);
+    console.log(`GLM-5.1 batched ${args.noMtp ? "decode" : "MTP"}: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, topk=${args.noMtp ? "off" : args.mtpDraftTopk.join(",")}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);
+    await (args.noMtp ? runBatchWithoutMtp(model, ws, glm, cache, args) : runBatch(model, ws, glm, cache, args));
   } finally {
     freeResources(model, cache, ws, glm, gpuDevices);
   }

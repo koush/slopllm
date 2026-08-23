@@ -392,7 +392,7 @@ export class ParallelTensor extends Tensor {
     if (!this.parallelOps.p2pEnabled)
       return false;
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
-    if (count > 65536 * 2)
+    if (count > 65536 * 8)
       return false;
     const elemBytes = ParallelTensor.elemBytes(this.type);
     const shardBytes = count * elemBytes;
@@ -2204,7 +2204,7 @@ export class ParallelOps implements DeviceOps {
     workspace: WorkspaceBase,
   ): ParallelTensor {
     const count = partialVOuts.shards[0].shape.reduce((a, b) => a * b, 1);
-    if (this.p2pEnabled && count <= 65536 * 4) {
+    if (this.p2pEnabled && count <= 65536 * 8) {
       return CP_MERGE_PULL
         ? this.cpMergeTreeReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace)
         : this.cpMergePushReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace);

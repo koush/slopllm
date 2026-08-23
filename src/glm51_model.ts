@@ -1221,6 +1221,7 @@ export class Glm51Model extends ChatModel {
     }
     const originalAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
     const targetTopks = [1, ...topks];
+    const linearDraft = topks.every(topk => topk === 1);
     const numTreeNodes = mtpTotalTreeNodes(topks);
     const numVerificationTokens = numTreeNodes + 1;
     const verificationTokens = draft.treeTokens.map((tokens, batch) => [draft.targetTokens[batch], ...tokens]);
@@ -1257,12 +1258,16 @@ export class Glm51Model extends ChatModel {
         const indexerKvCacheLayers: MtpVerificationArtifacts["indexerKvCacheLayers"] = [];
         const appendMla = state.mlaKvCacheAppend.bind(state);
         state.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
-          kvCacheLayers.push({ appendCkv: appendCkv.viewClone(), appendKpe: appendKpe.viewClone(), cacheIdx, kvLoraRank, qkRopeDim });
+          if (!linearDraft) {
+            kvCacheLayers.push({ appendCkv: appendCkv.viewClone(), appendKpe: appendKpe.viewClone(), cacheIdx, kvLoraRank, qkRopeDim });
+          }
           return appendMla(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
         };
         const appendIndexer = state.indexerKvCacheAppend.bind(state);
         state.indexerKvCacheAppend = (appendIdxK, cacheIdx, indexHeadDim) => {
-          indexerKvCacheLayers.push({ appendIdxK: appendIdxK.viewClone(), cacheIdx, indexHeadDim });
+          if (!linearDraft) {
+            indexerKvCacheLayers.push({ appendIdxK: appendIdxK.viewClone(), cacheIdx, indexHeadDim });
+          }
           return appendIndexer(appendIdxK, cacheIdx, indexHeadDim);
         };
         using hiddenStates = this.forwardModel(state, slots, slotsLength);
@@ -1336,50 +1341,81 @@ export class Glm51Model extends ChatModel {
     }
 
     const finishCounts = numAccepted.map(value => value + 1);
-    for (let batch = 0; batch < batchSize; batch++) {
-      cache.getPagedKV().sequences[batch].truncate(originalAllocLens[batch]);
-    }
-    const commitState = ws.planPrefill(this, batchSize, finishCounts, cache);
-    commitState.setInput(acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]));
-    const committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
-    for (const layer of artifacts.kvCacheLayers) {
-      using appendCkv = layer.appendCkv;
-      using appendKpe = layer.appendKpe;
-      appendCkv.resumeTracking();
-      appendKpe.resumeTracking();
-      let destinationBase = 0;
+    let committedAllocLens: number[];
+    if (linearDraft) {
       for (let batch = 0; batch < batchSize; batch++) {
-        const sourceBase = batch * numVerificationTokens;
-        for (let index = 0; index < finishCounts[batch]; index++) {
-          const source = sourceBase + acceptedNodes[batch][index];
-          const destination = destinationBase + index;
-          if (source !== destination) {
-            appendCkv.memcpy2d(destination * layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, appendCkv, source * layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, 1, MemcpyKind.DeviceToDevice);
-            appendKpe.memcpy2d(destination * layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, appendKpe, source * layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, 1, MemcpyKind.DeviceToDevice);
+        cache.getPagedKV().sequences[batch].truncate(originalAllocLens[batch] + finishCounts[batch]);
+      }
+      committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
+    } else {
+      for (let batch = 0; batch < batchSize; batch++) {
+        cache.getPagedKV().sequences[batch].truncate(originalAllocLens[batch]);
+      }
+      const commitState = ws.planPrefill(this, batchSize, finishCounts, cache);
+      commitState.setInput(acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]));
+      committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
+      let compactSources: Tensor | undefined;
+      if (batchSize >= 4) {
+        const compactSourceRows = acceptedNodes.flatMap((nodes, batch) => nodes.slice(0, finishCounts[batch]).map(node => batch * numVerificationTokens + node));
+        const compactSourceBuf = Buffer.alloc(compactSourceRows.length * I32);
+        for (let index = 0; index < compactSourceRows.length; index++) {
+          compactSourceBuf.writeInt32LE(compactSourceRows[index], index * I32);
+        }
+        compactSources = ws.alloc([compactSourceRows.length], "I32");
+        compactSources.h2d(compactSourceBuf);
+      }
+      for (const layer of artifacts.kvCacheLayers) {
+        using appendCkv = layer.appendCkv;
+        using appendKpe = layer.appendKpe;
+        appendCkv.resumeTracking();
+        appendKpe.resumeTracking();
+        let commitCkv: Tensor = appendCkv;
+        let commitKpe: Tensor = appendKpe;
+        using compactCkv = compactSources ? appendCkv.indexSelect(compactSources) : undefined;
+        using compactKpe = compactSources ? appendKpe.indexSelect(compactSources) : undefined;
+        if (compactCkv && compactKpe) {
+          commitCkv = compactCkv;
+          commitKpe = compactKpe;
+        } else {
+          let destinationBase = 0;
+          for (let batch = 0; batch < batchSize; batch++) {
+            const sourceBase = batch * numVerificationTokens;
+            for (let index = 0; index < finishCounts[batch]; index++) {
+              const source = sourceBase + acceptedNodes[batch][index];
+              const destination = destinationBase + index;
+              if (source !== destination) {
+                appendCkv.memcpy2d(destination * layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, appendCkv, source * layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, 1, MemcpyKind.DeviceToDevice);
+                appendKpe.memcpy2d(destination * layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, appendKpe, source * layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, 1, MemcpyKind.DeviceToDevice);
+              }
+            }
+            destinationBase += finishCounts[batch];
           }
         }
-        destinationBase += finishCounts[batch];
+        const cache = commitState.mlaKvCacheAppend(commitCkv, commitKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
+        using _ckv = cache.ckv;
+        using _kpe = cache.kpe;
       }
-      const cache = commitState.mlaKvCacheAppend(appendCkv, appendKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
-      using _ckv = cache.ckv;
-      using _kpe = cache.kpe;
-    }
-    for (const layer of artifacts.indexerKvCacheLayers) {
-      using appendIdxK = layer.appendIdxK;
-      appendIdxK.resumeTracking();
-      let destinationBase = 0;
-      for (let batch = 0; batch < batchSize; batch++) {
-        const sourceBase = batch * numVerificationTokens;
-        for (let index = 0; index < finishCounts[batch]; index++) {
-          const source = sourceBase + acceptedNodes[batch][index];
-          const destination = destinationBase + index;
-          if (source !== destination) {
-            appendIdxK.memcpy2d(destination * layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, appendIdxK, source * layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, 1, MemcpyKind.DeviceToDevice);
+      for (const layer of artifacts.indexerKvCacheLayers) {
+        using appendIdxK = layer.appendIdxK;
+        appendIdxK.resumeTracking();
+        using compactIdxK = compactSources ? appendIdxK.indexSelect(compactSources) : undefined;
+        if (!compactIdxK) {
+          let destinationBase = 0;
+          for (let batch = 0; batch < batchSize; batch++) {
+            const sourceBase = batch * numVerificationTokens;
+            for (let index = 0; index < finishCounts[batch]; index++) {
+              const source = sourceBase + acceptedNodes[batch][index];
+              const destination = destinationBase + index;
+              if (source !== destination) {
+                appendIdxK.memcpy2d(destination * layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, appendIdxK, source * layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, 1, MemcpyKind.DeviceToDevice);
+              }
+            }
+            destinationBase += finishCounts[batch];
           }
         }
-        destinationBase += finishCounts[batch];
+        using _kData = commitState.indexerKvCacheAppend(compactIdxK ?? appendIdxK, layer.cacheIdx, layer.indexHeadDim);
       }
-      using _kData = commitState.indexerKvCacheAppend(appendIdxK, layer.cacheIdx, layer.indexHeadDim);
+      compactSources?.[Symbol.dispose]();
     }
 
     const rowBytes = this.cfg.hiddenSize * BF16;
