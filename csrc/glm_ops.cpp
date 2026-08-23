@@ -2521,6 +2521,39 @@ static Napi::Value ConcatAndCacheDsMla(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value AppendSelectedMtpCaches(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 22) {
+        Napi::TypeError::New(env, "Expected 22 args for appendSelectedMtpCaches").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto ptr_arg = [&](int index) {
+        return reinterpret_cast<void*>((uintptr_t)info[index].As<Napi::Number>().Int64Value());
+    };
+    glm_append_selected_mtp_caches(
+        reinterpret_cast<GlmCtx*>(ptr_arg(0)),
+        ptr_arg(1), ptr_arg(2), ptr_arg(3), ptr_arg(4), info[5].As<Napi::Number>().Uint32Value(),
+        ptr_arg(6), ptr_arg(7), info[8].As<Napi::Number>().Uint32Value(),
+        reinterpret_cast<int32_t*>(ptr_arg(9)),
+        reinterpret_cast<int32_t*>(ptr_arg(10)),
+        reinterpret_cast<int32_t*>(ptr_arg(11)),
+        reinterpret_cast<int32_t*>(ptr_arg(12)),
+        reinterpret_cast<int32_t*>(ptr_arg(13)),
+        info[14].As<Napi::Number>().Uint32Value(),
+        info[15].As<Napi::Number>().Uint32Value(),
+        info[16].As<Napi::Number>().Uint32Value(),
+        info[17].As<Napi::Number>().Uint32Value(),
+        info[18].As<Napi::Number>().Uint32Value(),
+        info[19].As<Napi::Boolean>().Value(),
+        info[20].As<Napi::Number>().Uint32Value(),
+        info[21].As<Napi::Number>().Uint32Value());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("appendSelectedMtpCaches failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value SparseMlaPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 13) {
@@ -3823,6 +3856,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "mlaKvCacheAppend"), Napi::Function::New(env, MlaKvCacheAppend));
     exports.Set(Napi::String::New(env, "indexerKvCacheAppendFlat"), Napi::Function::New(env, IndexerKvCacheAppendFlat));
     exports.Set(Napi::String::New(env, "concatAndCacheDsMla"), Napi::Function::New(env, ConcatAndCacheDsMla));
+    exports.Set(Napi::String::New(env, "appendSelectedMtpCaches"), Napi::Function::New(env, AppendSelectedMtpCaches));
     exports.Set(Napi::String::New(env, "sparseMlaPrefill"), Napi::Function::New(env, SparseMlaPrefill));
     exports.Set(Napi::String::New(env, "sparseMlaDecode"), Napi::Function::New(env, SparseMlaDecode));
     exports.Set(Napi::String::New(env, "gatherTopkCkv"), Napi::Function::New(env, GatherTopkCkv));

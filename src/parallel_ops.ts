@@ -3256,6 +3256,28 @@ export class ParallelOps implements DeviceOps {
     return pKvCache.viewClone();
   }
 
+  appendSelectedMtpCaches(mlaSrcCkvPtrs: Tensor, mlaSrcKpePtrs: Tensor, mlaDstCkvPtrs: Tensor, mlaDstKpePtrs: Tensor | undefined,
+    indexerSrcPtrs: Tensor | undefined, indexerDstPtrs: Tensor | undefined,
+    sourceRows: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor,
+    pageSize: number, kvLoraRank: number, peDim: number, indexHeadDim: number, sparseMode: boolean,
+    cpWorldSize: number = 0, _cpRank: number = 0): void {
+    const required = [mlaSrcCkvPtrs, mlaSrcKpePtrs, mlaDstCkvPtrs, sourceRows, indices, indptr, batchIndices, positions].map(tensor => this.cast(tensor));
+    const pMlaDstKpePtrs = mlaDstKpePtrs ? this.cast(mlaDstKpePtrs) : undefined;
+    const pIndexerSrcPtrs = indexerSrcPtrs ? this.cast(indexerSrcPtrs) : undefined;
+    const pIndexerDstPtrs = indexerDstPtrs ? this.cast(indexerDstPtrs) : undefined;
+    for (const tensor of [...required, pMlaDstKpePtrs, pIndexerSrcPtrs, pIndexerDstPtrs]) {
+      if (tensor) this.assertParallel("appendSelectedMtpCaches", tensor, TensorParallelism.Replicated);
+    }
+    for (let rank = 0; rank < this.worldSize; rank++) {
+      this.devices[rank].appendSelectedMtpCaches(
+        required[0].shards[rank], required[1].shards[rank], required[2].shards[rank], pMlaDstKpePtrs?.shards[rank],
+        pIndexerSrcPtrs?.shards[rank], pIndexerDstPtrs?.shards[rank],
+        required[3].shards[rank], required[4].shards[rank], required[5].shards[rank], required[6].shards[rank], required[7].shards[rank],
+        pageSize, kvLoraRank, peDim, indexHeadDim, sparseMode, cpWorldSize, cpWorldSize > 0 ? rank : 0,
+      );
+    }
+  }
+
   gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
     const pOutput = this.cast(output);
     const pState = this.cast(recurrentState);

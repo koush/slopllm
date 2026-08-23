@@ -1147,6 +1147,18 @@ export class GlmOps implements DeviceOps {
     return kvCache.viewClone();
   }
 
+  appendSelectedMtpCaches(mlaSrcCkvPtrs: Tensor, mlaSrcKpePtrs: Tensor, mlaDstCkvPtrs: Tensor, mlaDstKpePtrs: Tensor | undefined,
+    indexerSrcPtrs: Tensor | undefined, indexerDstPtrs: Tensor | undefined,
+    sourceRows: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor,
+    pageSize: number, kvLoraRank: number, peDim: number, indexHeadDim: number, sparseMode: boolean,
+    cpWorldSize: number = 0, cpRank: number = 0): void {
+    getNativeAddon().appendSelectedMtpCaches(this.ctx,
+      ptr(mlaSrcCkvPtrs), ptr(mlaSrcKpePtrs), ptr(mlaDstCkvPtrs), ptr(mlaDstKpePtrs), mlaSrcCkvPtrs.numElements,
+      ptr(indexerSrcPtrs), ptr(indexerDstPtrs), indexerSrcPtrs?.numElements ?? 0,
+      ptr(sourceRows), ptr(indices), ptr(indptr), ptr(batchIndices), ptr(positions), sourceRows.numElements,
+      pageSize, kvLoraRank, peDim, indexHeadDim, sparseMode, cpWorldSize, cpRank);
+  }
+
   sparseMlaPrepareCache(state: ExecutionState, groupSlots: Tensor, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor | null, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
     return kvCache.viewClone();
   }

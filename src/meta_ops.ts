@@ -381,6 +381,13 @@ export class MetaOps implements DeviceOps {
         return kvCache.viewClone();
     }
 
+    appendSelectedMtpCaches(mlaSrcCkvPtrs: Tensor, mlaSrcKpePtrs: Tensor, mlaDstCkvPtrs: Tensor, mlaDstKpePtrs: Tensor | undefined,
+        indexerSrcPtrs: Tensor | undefined, indexerDstPtrs: Tensor | undefined,
+        sourceRows: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor,
+        pageSize: number, kvLoraRank: number, peDim: number, indexHeadDim: number, sparseMode: boolean,
+        cpWorldSize?: number, cpRank?: number): void {
+    }
+
     sparseMlaPrepareCache(state: ExecutionState, groupSlots: Tensor, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor | null, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
         return kvCache.viewClone();
     }

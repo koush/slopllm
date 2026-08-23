@@ -1354,68 +1354,70 @@ export class Glm51Model extends ChatModel {
       const commitState = ws.planPrefill(this, batchSize, finishCounts, cache);
       commitState.setInput(acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]));
       committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
-      let compactSources: Tensor | undefined;
-      if (batchSize >= 4) {
-        const compactSourceRows = acceptedNodes.flatMap((nodes, batch) => nodes.slice(0, finishCounts[batch]).map(node => batch * numVerificationTokens + node));
-        const compactSourceBuf = Buffer.alloc(compactSourceRows.length * I32);
-        for (let index = 0; index < compactSourceRows.length; index++) {
-          compactSourceBuf.writeInt32LE(compactSourceRows[index], index * I32);
-        }
-        compactSources = ws.alloc([compactSourceRows.length], "I32");
-        compactSources.h2d(compactSourceBuf);
+      const selectedSourceRows = acceptedNodes.flatMap((nodes, batch) => nodes.slice(0, finishCounts[batch]).map(node => batch * numVerificationTokens + node));
+      const selectedSourceBuf = Buffer.alloc(selectedSourceRows.length * I32);
+      for (let index = 0; index < selectedSourceRows.length; index++) {
+        selectedSourceBuf.writeInt32LE(selectedSourceRows[index], index * I32);
       }
+      using selectedSources = ws.alloc([selectedSourceRows.length], "I32");
+      selectedSources.h2d(selectedSourceBuf);
+
+      const pagedKV = cache.getPagedKV();
+      const mlaSrcCkv: Tensor[] = [];
+      const mlaSrcKpe: Tensor[] = [];
+      const mlaDstCkv: Tensor[] = [];
+      const mlaDstKpe: Tensor[] = [];
       for (const layer of artifacts.kvCacheLayers) {
-        using appendCkv = layer.appendCkv;
-        using appendKpe = layer.appendKpe;
-        appendCkv.resumeTracking();
-        appendKpe.resumeTracking();
-        let commitCkv: Tensor = appendCkv;
-        let commitKpe: Tensor = appendKpe;
-        using compactCkv = compactSources ? appendCkv.indexSelect(compactSources) : undefined;
-        using compactKpe = compactSources ? appendKpe.indexSelect(compactSources) : undefined;
-        if (compactCkv && compactKpe) {
-          commitCkv = compactCkv;
-          commitKpe = compactKpe;
-        } else {
-          let destinationBase = 0;
-          for (let batch = 0; batch < batchSize; batch++) {
-            const sourceBase = batch * numVerificationTokens;
-            for (let index = 0; index < finishCounts[batch]; index++) {
-              const source = sourceBase + acceptedNodes[batch][index];
-              const destination = destinationBase + index;
-              if (source !== destination) {
-                appendCkv.memcpy2d(destination * layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, appendCkv, source * layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, layer.kvLoraRank * BF16, 1, MemcpyKind.DeviceToDevice);
-                appendKpe.memcpy2d(destination * layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, appendKpe, source * layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, layer.qkRopeDim * BF16, 1, MemcpyKind.DeviceToDevice);
-              }
-            }
-            destinationBase += finishCounts[batch];
-          }
+        if (layer.kvLoraRank !== this.cfg.kvLoraRank || layer.qkRopeDim !== this.cfg.qkRopeHeadDim) {
+          throw new Error(`MTP cache dimensions differ at layer ${layer.cacheIdx}`);
         }
-        const cache = commitState.mlaKvCacheAppend(commitCkv, commitKpe, layer.cacheIdx, layer.kvLoraRank, layer.qkRopeDim);
-        using _ckv = cache.ckv;
-        using _kpe = cache.kpe;
+        mlaSrcCkv.push(layer.appendCkv.resumeTracking());
+        mlaSrcKpe.push(layer.appendKpe.resumeTracking());
+        mlaDstCkv.push(pagedKV.ckvData[layer.cacheIdx]);
+        if (!pagedKV.sparseMode) mlaDstKpe.push(pagedKV.kpeData[layer.cacheIdx]);
+      }
+
+      const indexerSrc: Tensor[] = [];
+      const indexerDst: Tensor[] = [];
+      for (const layer of artifacts.indexerKvCacheLayers) {
+        if (layer.indexHeadDim !== this.cfg.indexHeadDim) {
+          throw new Error(`MTP indexer dimension differs at layer ${layer.cacheIdx}`);
+        }
+        const destination = pagedKV.kData[layer.cacheIdx];
+        if (!destination) throw new Error(`Missing indexer cache for layer ${layer.cacheIdx}`);
+        indexerSrc.push(layer.appendIdxK.resumeTracking());
+        indexerDst.push(destination);
+      }
+
+      using mlaSrcCkvPtrs = ws.alloc([mlaSrcCkv.length], "I64");
+      using mlaSrcKpePtrs = ws.alloc([mlaSrcKpe.length], "I64");
+      using mlaDstCkvPtrs = ws.alloc([mlaDstCkv.length], "I64");
+      using mlaDstKpePtrs = pagedKV.sparseMode ? undefined : ws.alloc([mlaDstKpe.length], "I64");
+      mlaSrcCkvPtrs.writePointers(mlaSrcCkv);
+      mlaSrcKpePtrs.writePointers(mlaSrcKpe);
+      mlaDstCkvPtrs.writePointers(mlaDstCkv);
+      mlaDstKpePtrs?.writePointers(mlaDstKpe);
+
+      using indexerSrcPtrs = indexerSrc.length ? ws.alloc([indexerSrc.length], "I64") : undefined;
+      using indexerDstPtrs = indexerDst.length ? ws.alloc([indexerDst.length], "I64") : undefined;
+      indexerSrcPtrs?.writePointers(indexerSrc);
+      indexerDstPtrs?.writePointers(indexerDst);
+
+      ws.glm.appendSelectedMtpCaches(
+        mlaSrcCkvPtrs, mlaSrcKpePtrs, mlaDstCkvPtrs, mlaDstKpePtrs,
+        indexerSrcPtrs, indexerDstPtrs,
+        selectedSources, commitState.indices, commitState.indptrD, commitState.mlaBatchIndices, commitState.positionIds,
+        pagedKV.pageSize, this.cfg.kvLoraRank, this.cfg.qkRopeHeadDim, this.cfg.indexHeadDim,
+        pagedKV.sparseMode, pagedKV.contextParallel ? ws.glm.worldSize : 0,
+      );
+
+      for (const layer of artifacts.kvCacheLayers) {
+        layer.appendCkv[Symbol.dispose]();
+        layer.appendKpe[Symbol.dispose]();
       }
       for (const layer of artifacts.indexerKvCacheLayers) {
-        using appendIdxK = layer.appendIdxK;
-        appendIdxK.resumeTracking();
-        using compactIdxK = compactSources ? appendIdxK.indexSelect(compactSources) : undefined;
-        if (!compactIdxK) {
-          let destinationBase = 0;
-          for (let batch = 0; batch < batchSize; batch++) {
-            const sourceBase = batch * numVerificationTokens;
-            for (let index = 0; index < finishCounts[batch]; index++) {
-              const source = sourceBase + acceptedNodes[batch][index];
-              const destination = destinationBase + index;
-              if (source !== destination) {
-                appendIdxK.memcpy2d(destination * layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, appendIdxK, source * layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, layer.indexHeadDim * BF16, 1, MemcpyKind.DeviceToDevice);
-              }
-            }
-            destinationBase += finishCounts[batch];
-          }
-        }
-        using _kData = commitState.indexerKvCacheAppend(compactIdxK ?? appendIdxK, layer.cacheIdx, layer.indexHeadDim);
+        layer.appendIdxK[Symbol.dispose]();
       }
-      compactSources?.[Symbol.dispose]();
     }
 
     const rowBytes = this.cfg.hiddenSize * BF16;

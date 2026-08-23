@@ -674,6 +674,18 @@ void glm_concat_and_cache_ds_mla(
     size_t append_ckv_stride_n, size_t append_kpe_stride_n,
     uint32_t cp_world_size = 0, uint32_t cp_rank = 0);
 
+// MTP commit: append selected verification rows directly into all paged cache layers.
+void glm_append_selected_mtp_caches(
+    GlmCtx* ctx,
+    void* mla_src_ckv_ptrs, void* mla_src_kpe_ptrs,
+    void* mla_dst_ckv_ptrs, void* mla_dst_kpe_ptrs, uint32_t mla_layer_count,
+    void* indexer_src_ptrs, void* indexer_dst_ptrs, uint32_t indexer_layer_count,
+    int32_t* source_rows, int32_t* indices, int32_t* indptr,
+    int32_t* batch_indices, int32_t* positions,
+    uint32_t nnz, uint32_t page_size,
+    uint32_t kv_lora_rank, uint32_t pe_dim, uint32_t index_head_dim,
+    bool sparse_mode, uint32_t cp_world_size = 0, uint32_t cp_rank = 0);
+
 // Sparse MLA SM120: prefill attention over topk-selected KV slots
 // q: [num_tokens, num_heads, d_qk] BF16 (d_qk = 576 = 512 nope + 64 rope)
 // kv_cache: [num_pages, page_size, BPT] U8 (packed FP8)
