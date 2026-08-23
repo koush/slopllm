@@ -221,7 +221,7 @@ function processOutputEvents(req: CompletionRequest, events: OutputParserEvent[]
       req.generatedText += event.raw;
     }
   }
-  if (events.length > 0) req.onOutput(events);
+  req.onOutput(events);
 }
 
 function processOutputToken(req: CompletionRequest, tokenId: number): void {
@@ -796,8 +796,12 @@ function sendMetrics(
   metrics: ServerMetrics,
   waitingRequests: number,
   cache: ChatCache,
+  batchSize: number,
+  chunkSize: number,
+  maxModelLen: number,
 ): void {
   const pagedKV = cache.getPagedKV();
+  const maxTotalTokens = pagedKV.maxPages * pagedKV.pageSize;
   const kvUsage = pagedKV.maxPages === 0
     ? 0
     : (pagedKV.maxPages - pagedKV.availablePages.length) / pagedKV.maxPages;
@@ -822,7 +826,10 @@ function sendMetrics(
     `vllm:kv_cache_usage_perc ${kvUsage}`,
     "# HELP vllm:cache_config_info GLM.js paged KV cache configuration.",
     "# TYPE vllm:cache_config_info gauge",
-    `vllm:cache_config_info{block_size="${pagedKV.pageSize}",num_gpu_blocks="${pagedKV.maxPages}"} 1`,
+    `vllm:cache_config_info{block_size="${pagedKV.pageSize}",num_gpu_blocks="${pagedKV.maxPages}",max_total_num_tokens="${maxTotalTokens}",cp_world_size="1"} 1`,
+    "# HELP vllm:scheduler_config_info GLM.js request scheduler configuration.",
+    "# TYPE vllm:scheduler_config_info gauge",
+    `vllm:scheduler_config_info{max_num_seqs="${batchSize}",max_num_batched_tokens="${batchSize * chunkSize}",max_model_len="${maxModelLen}"} 1`,
     "# HELP vllm:request_prefill_time_seconds GLM.js request prefill duration.",
     "# TYPE vllm:request_prefill_time_seconds histogram",
     `vllm:request_prefill_time_seconds_bucket{le="+Inf"} ${metrics.prefillTimeSecondsCount}`,
@@ -1114,6 +1121,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       };
 
       if (stream) {
+        const continuousUsage = params.stream_options?.continuous_usage_stats === true;
+        const streamUsage = () => ({
+          prompt_tokens: completionReq.promptTokenCount,
+          completion_tokens: completionReq.generatedIds.length,
+          total_tokens: completionReq.promptTokenCount + completionReq.generatedIds.length,
+        });
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
@@ -1127,9 +1140,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           created,
           model: modelName,
           choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+          ...(continuousUsage ? { usage: streamUsage() } : {}),
         });
 
         completionReq.onOutput = events => {
+          let wroteDelta = false;
           for (const event of events) {
             let delta: Record<string, unknown> | undefined;
             if (event.type === "reasoning_delta") {
@@ -1144,14 +1159,26 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             }
 
             if (delta) {
+              wroteDelta = true;
               writeSSE(res, {
                 id,
                 object: "chat.completion.chunk",
                 created,
                 model: modelName,
                 choices: [{ index: 0, delta, finish_reason: null }],
+                ...(continuousUsage ? { usage: streamUsage() } : {}),
               });
             }
+          }
+          if (continuousUsage && !wroteDelta) {
+            writeSSE(res, {
+              id,
+              object: "chat.completion.chunk",
+              created,
+              model: modelName,
+              choices: [],
+              usage: streamUsage(),
+            });
           }
         };
 
@@ -1164,6 +1191,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             created,
             model: modelName,
             choices: [{ index: 0, delta: {}, finish_reason: completionReq.finishReason }],
+            ...(continuousUsage ? { usage: streamUsage() } : {}),
           });
 
           if (params.stream_options?.include_usage) {
@@ -1310,8 +1338,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     } else if (req.method === "POST" && url.pathname === "/tokenize") {
       handleTokenize(req, res);
     } else if (req.method === "GET" && url.pathname === "/metrics") {
-      sendMetrics(res, metrics, pendingQueue.length, cache);
+      sendMetrics(res, metrics, pendingQueue.length, cache, args.batchSize, args.chunkSize, maxModelLen);
     } else if (req.method === "GET" && url.pathname === "/v1/models") {
+      const pagedKV = cache.getPagedKV();
       sendJSON(res, 200, {
         object: "list",
         data: [{
@@ -1320,8 +1349,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           created: Math.floor(Date.now() / 1000),
           owned_by: "local",
           max_model_len: maxModelLen,
+          max_running_requests: args.batchSize,
+          max_total_num_tokens: pagedKV.maxPages * pagedKV.pageSize,
         }],
       });
+    } else if (req.method === "GET" && url.pathname === "/version") {
+      sendJSON(res, 200, { version: "glm.js" });
     } else if (req.method === "GET" && url.pathname === "/health") {
       sendJSON(res, 200, { status: "ok", model: modelName });
     } else {
@@ -1335,6 +1368,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  POST /tokenize             - Tokenize chat messages`);
     console.log(`  GET  /metrics              - Prometheus metrics`);
     console.log(`  GET  /v1/models            - List models`);
+    console.log(`  GET  /version              - vLLM-compatible server version`);
     console.log(`  GET  /health               - Health check`);
     console.log(`  CUDA graphs: ${args.noCudaGraph ? "disabled" : "enabled"}`);
     console.log(`  MTP: ${args.mtp && !args.noMtp ? `enabled (draft top-k ${args.mtpDraftTopk.join(",")})` : "disabled"}`);
