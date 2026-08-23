@@ -10,7 +10,7 @@ Chains the four Phase 4-6 kernels end-to-end and verifies that:
 import torch
 import pytest
 import numpy as np
-from helpers import GlmOps
+from helpers import GlmOps, pack_indexer_k
 from test_ds_mla_quant import ref_quantize_ds_mla, ref_dequantize_ds_mla
 
 PAGE_SIZE = 64
@@ -94,13 +94,14 @@ def test_sparse_mla_flow_quantize_score_topk_slots(glm, device, kv_lora_rank, pe
     )
 
     # --- 2. Fill indexer K cache at same physical slots ---
-    k_data = torch.randn(max_pages, page_size, idx_head_dim, dtype=torch.bfloat16, device=device)
+    k_data_bf16 = torch.randn(max_pages, page_size, idx_head_dim, dtype=torch.bfloat16, device=device)
     # Write K vectors at the correct slots (same page table as MLA KV)
     for i in range(nnz):
         b = int(batch_indices_t[i])
         pos = int(positions_t[i])
         slot = _slot_for_token(b, pos, page_indices_np, page_indptr_np, page_size)
-        k_data[slot // page_size, slot % page_size, :] = torch.randn(idx_head_dim, dtype=torch.bfloat16, device=device)
+        k_data_bf16[slot // page_size, slot % page_size, :] = torch.randn(idx_head_dim, dtype=torch.bfloat16, device=device)
+    k_data = pack_indexer_k(k_data_bf16)
 
     # --- 3. Indexer score (non-causal = decode mode) ---
     total_q = nnz
@@ -211,7 +212,8 @@ def test_sparse_mla_flow_cp_filter(glm, device, cp_world_size, cp_rank):
     )
 
     # Indexer K + Q + weights
-    k_data = torch.randn(max_pages, page_size, idx_head_dim, dtype=torch.bfloat16, device=device)
+    k_data = pack_indexer_k(torch.randn(
+        max_pages, page_size, idx_head_dim, dtype=torch.bfloat16, device=device))
     idx_q = torch.randn(nnz, idx_n_heads, idx_head_dim, dtype=torch.bfloat16, device=device)
     idx_weights = torch.randn(nnz, idx_n_heads, dtype=torch.bfloat16, device=device)
     qo_indptr = torch.tensor([0, nnz], dtype=torch.int32, device=device)
@@ -303,7 +305,8 @@ def test_sparse_mla_flow_topk_ordering(glm, device):
     page_indptr_np = page_indptr_t.cpu().numpy()
     max_pages = len(page_indices_np) + 4
 
-    k_data = torch.randn(max_pages, page_size, idx_head_dim, dtype=torch.bfloat16, device=device)
+    k_data = pack_indexer_k(torch.randn(
+        max_pages, page_size, idx_head_dim, dtype=torch.bfloat16, device=device))
     idx_q = torch.randn(nnz, idx_n_heads, idx_head_dim, dtype=torch.bfloat16, device=device)
     idx_weights = torch.randn(nnz, idx_n_heads, dtype=torch.bfloat16, device=device)
     qo_indptr = torch.tensor([0, nnz], dtype=torch.int32, device=device)

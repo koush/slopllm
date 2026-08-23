@@ -1,4 +1,5 @@
 #include "glm_ops.h"
+#include "glm_indexer_cache.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -134,6 +135,36 @@ void glm_batch_decode_plan_impl(
 }
 
 } // anonymous namespace
+
+template <int HEAD_DIM>
+__global__ void indexer_kv_cache_append_kernel(
+    uint8_t* __restrict__ k_data,
+    const __nv_bfloat16* __restrict__ append_k,
+    const int32_t* __restrict__ indices,
+    const int32_t* __restrict__ indptr,
+    const int32_t* __restrict__ batch_indices,
+    const int32_t* __restrict__ positions,
+    uint32_t nnz, uint32_t page_size, size_t append_stride_n,
+    uint32_t cp_world_size, uint32_t cp_rank) {
+    const uint32_t token_idx = blockIdx.x;
+    if (token_idx >= nnz) return;
+
+    int pos = positions[token_idx];
+    int effective_page_size = page_size;
+    if (cp_world_size > 1) {
+        if ((uint32_t)pos % cp_world_size != cp_rank) return;
+        pos = (pos - (int)cp_rank) / (int)cp_world_size;
+        effective_page_size = page_size / (int)cp_world_size;
+    }
+    const int batch = batch_indices[token_idx];
+    const int page_id = indices[indptr[batch] + pos / effective_page_size];
+    const size_t slot = (size_t)page_id * effective_page_size + pos % effective_page_size;
+    constexpr int ROW_BYTES = HEAD_DIM + INDEXER_FP8_SCALE_BYTES;
+    uint8_t* dst = k_data + slot * ROW_BYTES;
+    const __nv_bfloat16* src = append_k + (size_t)token_idx * append_stride_n;
+    __shared__ float scratch[4];
+    pack_indexer_k_row<HEAD_DIM>(dst, src, scratch);
+}
 
 extern "C" {
 
@@ -975,49 +1006,24 @@ void glm_mla_kv_cache_append(
 
   uint32_t vPS = (cp_world_size > 1) ? (page_size / cp_world_size) : page_size;
 
-  flashinfer::paged_kv_mla_t<DType, IdType> paged_kv(
-      vPS, head_dim_ckv, head_dim_kpe, 0,
-      static_cast<DType*>(ckv_data), static_cast<DType*>(kpe_data),
-      indices, indptr, last_page_len, nullptr);
-
   int num_sms = 0;
   cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, ctx->device_id);
 
   constexpr uint32_t vec_size = 2;
   cudaError_t status = cudaSuccess;
 
-  // Indexer K-only append: head_dim_kpe == 0 skips kpe writes (kernel guard: tx*vec_size < 0)
+  // Indexer K-only append: BF16 source -> packed FP8 E4M3 row + FP32 scale.
   if (head_dim_kpe == 0) {
     if (head_dim_ckv == 128) {
-      constexpr uint32_t HC = 128;
-      uint32_t bdx = HC / vec_size;
-      auto kernel = flashinfer::AppendPagedKVMlaCacheKernel<HC, 0, vec_size, DType, IdType>;
-      int num_blocks_per_sm = 0;
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, bdx, 0);
-      num_blocks_per_sm = std::min(num_blocks_per_sm, (int)((nnz + num_sms - 1) / num_sms));
-      dim3 nblks(num_blocks_per_sm * num_sms);
-      dim3 nthrs(bdx);
-      void* args[] = {(void*)&paged_kv, (void*)&append_ckv, (void*)&append_kpe,
-                      (void*)&batch_indices, (void*)&positions, (void*)&nnz,
-                      (void*)&append_ckv_stride_n, (void*)&append_kpe_stride_n,
-                      (void*)&cp_rank, (void*)&cp_world_size};
-      cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, GLM_STREAM(ctx));
-      status = cudaGetLastError();
+      indexer_kv_cache_append_kernel<128><<<nnz, 64, 0, GLM_STREAM(ctx)>>>(
+          (uint8_t*)ckv_data, (const __nv_bfloat16*)append_ckv,
+          indices, indptr, batch_indices, positions, nnz, page_size,
+          append_ckv_stride_n, cp_world_size, cp_rank);
     } else if (head_dim_ckv == 64) {
-      constexpr uint32_t HC = 64;
-      uint32_t bdx = HC / vec_size;
-      auto kernel = flashinfer::AppendPagedKVMlaCacheKernel<HC, 0, vec_size, DType, IdType>;
-      int num_blocks_per_sm = 0;
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, bdx, 0);
-      num_blocks_per_sm = std::min(num_blocks_per_sm, (int)((nnz + num_sms - 1) / num_sms));
-      dim3 nblks(num_blocks_per_sm * num_sms);
-      dim3 nthrs(bdx);
-      void* args[] = {(void*)&paged_kv, (void*)&append_ckv, (void*)&append_kpe,
-                      (void*)&batch_indices, (void*)&positions, (void*)&nnz,
-                      (void*)&append_ckv_stride_n, (void*)&append_kpe_stride_n,
-                      (void*)&cp_rank, (void*)&cp_world_size};
-      cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, GLM_STREAM(ctx));
-      status = cudaGetLastError();
+      indexer_kv_cache_append_kernel<64><<<nnz, 32, 0, GLM_STREAM(ctx)>>>(
+          (uint8_t*)ckv_data, (const __nv_bfloat16*)append_ckv,
+          indices, indptr, batch_indices, positions, nnz, page_size,
+          append_ckv_stride_n, cp_world_size, cp_rank);
     } else {
       fprintf(stderr, "glm_mla_kv_cache_append: unsupported indexer head_dim_ckv=%u\n", head_dim_ckv);
     }
@@ -1026,6 +1032,11 @@ void glm_mla_kv_cache_append(
     }
     return;
   }
+
+  flashinfer::paged_kv_mla_t<DType, IdType> paged_kv(
+      vPS, head_dim_ckv, head_dim_kpe, 0,
+      static_cast<DType*>(ckv_data), static_cast<DType*>(kpe_data),
+      indices, indptr, last_page_len, nullptr);
 
   DISPATCH_MLA_HEAD_DIMS(head_dim_ckv, head_dim_kpe, {
     uint32_t bdx = HEAD_DIM_CKV / vec_size;
@@ -1174,7 +1185,7 @@ __global__ void append_selected_mtp_caches_kernel(
     __nv_bfloat16* const* __restrict__ mla_dst_kpe_ptrs,
     uint32_t mla_layer_count,
     const __nv_bfloat16* const* __restrict__ indexer_src_ptrs,
-    __nv_bfloat16* const* __restrict__ indexer_dst_ptrs,
+    uint8_t* const* __restrict__ indexer_dst_ptrs,
     const int32_t* __restrict__ source_rows,
     const int32_t* __restrict__ indices,
     const int32_t* __restrict__ indptr,
@@ -1221,8 +1232,10 @@ __global__ void append_selected_mtp_caches_kernel(
 
     const uint32_t indexer_layer = layer_idx - mla_layer_count;
     const __nv_bfloat16* src = indexer_src_ptrs[indexer_layer] + (size_t)src_row * index_head_dim;
-    __nv_bfloat16* dst = indexer_dst_ptrs[indexer_layer] + slot * index_head_dim;
-    for (int col = threadIdx.x; col < index_head_dim; col += blockDim.x) dst[col] = src[col];
+    uint8_t* dst = indexer_dst_ptrs[indexer_layer] + slot * (index_head_dim + INDEXER_FP8_SCALE_BYTES);
+    __shared__ float scratch[4];
+    if (index_head_dim == 128) pack_indexer_k_row<128>(dst, src, scratch);
+    else if (index_head_dim == 64) pack_indexer_k_row<64>(dst, src, scratch);
 }
 
 extern "C" {
@@ -1294,7 +1307,7 @@ void glm_append_selected_mtp_caches(
         (__nv_bfloat16* const*)mla_dst_kpe_ptrs, \
         mla_layer_count, \
         (const __nv_bfloat16* const*)indexer_src_ptrs, \
-        (__nv_bfloat16* const*)indexer_dst_ptrs, \
+        (uint8_t* const*)indexer_dst_ptrs, \
         source_rows, indices, indptr, batch_indices, positions, \
         page_size, index_head_dim, cp_world_size, cp_rank)
 

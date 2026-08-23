@@ -10,7 +10,7 @@ check the set, not the ordering.
 import numpy as np
 import pytest
 import torch
-from helpers import GlmOps  # noqa: F401
+from helpers import GlmOps, unpack_indexer_k  # noqa: F401
 from test_indexer_score_topk import _setup_random_kv, _get_valid_kv_len
 
 NBUCKET = 65536
@@ -25,7 +25,7 @@ def _ref_scores(q, k_paged, weights, page_indices, page_indptr, page_size, scale
     for j in range(numValid):
         pid = page_indices[j // page_size]
         ks.append(k_paged[pid, j % page_size])
-    K = torch.stack(ks).float()                       # [numValid, hd]
+    K = unpack_indexer_k(torch.stack(ks), hd)         # [numValid, hd]
     qh = q[t].float()                                 # [n_heads, hd]
     dot = qh @ K.T                                    # [n_heads, numValid]
     sc = torch.relu(dot * scale)                      # per-head ReLU

@@ -1,7 +1,9 @@
-"""Parity tests for the flat BF16 indexer cache representation."""
+"""Parity tests for the flat packed-FP8 indexer cache representation."""
 
 import pytest
 import torch
+
+from helpers import pack_indexer_k
 
 
 def _make_caches(device, seq_lens, page_size, head_dim, seed=42):
@@ -10,7 +12,8 @@ def _make_caches(device, seq_lens, page_size, head_dim, seed=42):
     used_pages = sum(page_counts)
     max_pages = used_pages + 5
     page_ids = list(reversed(range(used_pages)))
-    paged = torch.randn(max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device)
+    paged_bf16 = torch.randn(max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device)
+    paged = pack_indexer_k(paged_bf16)
 
     page_indptr = [0]
     last_page_len = []
@@ -50,11 +53,11 @@ def test_flat_append_multi_sequence(glm, device, head_dim):
     stride = head_dim + 8
     source_storage = torch.arange(len(batch_indices) * stride, dtype=torch.float32, device=device)
     source_storage = source_storage.reshape(len(batch_indices), stride).to(torch.bfloat16)
-    destination = torch.full((sum(seq_lens), head_dim), -17, dtype=torch.bfloat16, device=device)
+    destination = torch.full((sum(seq_lens), head_dim + 4), 0xa5, dtype=torch.uint8, device=device)
     expected = destination.clone()
 
     for i, (batch, position) in enumerate(zip(batch_indices.tolist(), positions.tolist())):
-        expected[kv_token_indptr[batch].item() + position] = source_storage[i, :head_dim]
+        expected[kv_token_indptr[batch].item() + position] = pack_indexer_k(source_storage[i:i + 1, :head_dim])[0]
 
     glm.indexer_kv_cache_append_flat(
         destination, source_storage, kv_token_indptr, batch_indices, positions,
@@ -66,16 +69,40 @@ def test_flat_append_multi_sequence(glm, device, head_dim):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_paged_append_cp_packs_owned_tokens(glm, device):
+    head_dim, page_size, world_size, rank = 128, 8, 2, 1
+    append_k = torch.randn(page_size, head_dim, dtype=torch.bfloat16, device=device)
+    destination = torch.zeros(1, page_size // world_size, head_dim + 4,
+                              dtype=torch.uint8, device=device)
+    indices = torch.tensor([0], dtype=torch.int32, device=device)
+    indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    last_page_len = torch.tensor([page_size], dtype=torch.int32, device=device)
+    batches = torch.zeros(page_size, dtype=torch.int32, device=device)
+    positions = torch.arange(page_size, dtype=torch.int32, device=device)
+
+    glm.mla_kv_cache_append(
+        destination.data_ptr(), 0,
+        indices.data_ptr(), indptr.data_ptr(), last_page_len.data_ptr(),
+        append_k.data_ptr(), 0, batches.data_ptr(), positions.data_ptr(),
+        page_size, page_size, head_dim, 0, head_dim, 0,
+        cp_rank=rank, cp_world_size=world_size,
+    )
+    glm.synchronize()
+
+    assert torch.equal(destination[0], pack_indexer_k(append_k[rank::world_size]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_flat_append_patches_gathered_pages(glm, device):
     seq_lens = [29, 11]
     page_size = 16
     head_dim = 128
     caches = _make_caches(device, seq_lens, page_size, head_dim, seed=99)
-    gathered = torch.empty(sum(seq_lens), head_dim, dtype=torch.bfloat16, device=device)
+    gathered = torch.empty(sum(seq_lens), head_dim + 4, dtype=torch.uint8, device=device)
     glm.gather_pages(
         gathered, caches["paged"], caches["page_indices"], caches["page_indptr"],
         caches["last_page_len"], caches["paged"].shape[0], len(seq_lens),
-        page_size, head_dim,
+        page_size, head_dim + 4,
     )
 
     batch_indices = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
@@ -83,7 +110,7 @@ def test_flat_append_patches_gathered_pages(glm, device):
     append_k = torch.randn(len(batch_indices), head_dim, dtype=torch.bfloat16, device=device)
     expected = caches["flat"].clone()
     for i, (batch, position) in enumerate(zip(batch_indices.tolist(), positions.tolist())):
-        expected[caches["kv_token_indptr"][batch].item() + position] = append_k[i]
+        expected[caches["kv_token_indptr"][batch].item() + position] = pack_indexer_k(append_k[i:i + 1])[0]
 
     glm.indexer_kv_cache_append_flat(
         gathered, append_k, caches["kv_token_indptr"], batch_indices, positions,

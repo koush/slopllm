@@ -19,7 +19,7 @@ import time
 
 import torch
 
-from helpers import GlmOps
+from helpers import GlmOps, pack_indexer_k
 
 
 N_HEADS = 32
@@ -67,13 +67,13 @@ class IndexerCase:
         self.q = torch.randn(
             self.local_q, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device
         )
-        self.k_data = torch.randn(
+        self.k_data = pack_indexer_k(torch.randn(
             self.max_kv // self.page_size,
             self.page_size,
             HEAD_DIM,
             dtype=torch.bfloat16,
             device=device,
-        )
+        ))
         self.weights = torch.rand(
             self.local_q, N_HEADS, dtype=torch.bfloat16, device=device
         )

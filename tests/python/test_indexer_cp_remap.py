@@ -8,7 +8,7 @@ against the same reference scoring used by the non-CP tests.
 import numpy as np
 import pytest
 import torch
-from helpers import GlmOps  # noqa: F401
+from helpers import GlmOps, pack_indexer_k  # noqa: F401
 from test_indexer_score_topk import _setup_random_kv, _get_valid_kv_len
 from test_indexer_score_topk_v2 import _ref_scores, _check, _run_v2
 from test_indexer_score_topk_prefill import _run_prefill
@@ -214,7 +214,8 @@ def _setup_cp_shard(L_global, W, r, n_queries, n_heads, head_dim, local_page_siz
     assert 1 <= local_lpl <= local_page_size, f"unsupported slice: local_lpl={local_lpl}"
 
     max_pages = num_pages + 4
-    k_paged = torch.randn(max_pages, local_page_size, head_dim, dtype=torch.bfloat16, device=device)
+    k_paged = pack_indexer_k(torch.randn(
+        max_pages, local_page_size, head_dim, dtype=torch.bfloat16, device=device))
     q = torch.randn(n_queries, n_heads, head_dim, dtype=torch.bfloat16, device=device)
     weights = torch.randn(n_queries, n_heads, dtype=torch.bfloat16, device=device)
 

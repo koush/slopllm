@@ -1,6 +1,6 @@
 import torch
 import pytest
-from helpers import ATOL, RTOL
+from helpers import ATOL, RTOL, pack_indexer_k, unpack_indexer_k
 
 
 def apply_rotary_pos_emb_torch(x, cos, sin, unsqueeze_dim):
@@ -297,6 +297,8 @@ def indexer_score_torch(q, k_paged, weights, page_indices, page_indptr,
                         last_page_len, qo_indptr, scale, page_size, max_kv_len, causal):
     """Pure torch reference for the fused indexer score kernel."""
     totalQ, n_heads, head_dim = q.shape
+    if k_paged.dtype == torch.uint8:
+        k_paged = unpack_indexer_k(k_paged, head_dim)
     out = torch.full((totalQ, max_kv_len), float('-inf'), dtype=torch.bfloat16, device=q.device)
 
     for seq_idx in range(len(qo_indptr) - 1):
@@ -342,7 +344,8 @@ def _run_indexer_score_test(glm, device, B, seq_lens, n_heads, head_dim, page_si
     max_pages = num_pages_total + 16
 
     # Random paged K cache
-    k_paged = torch.randn(max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device)
+    k_paged = pack_indexer_k(torch.randn(
+        max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device))
     # Random q and weights
     q = torch.randn(total_q, n_heads, head_dim, dtype=torch.bfloat16, device=device)
     weights = torch.randn(total_q, n_heads, dtype=torch.bfloat16, device=device)
@@ -458,7 +461,8 @@ def test_indexer_score_chunked_prefill(glm, device):
     num_pages = (kv_len + page_size - 1) // page_size  # 3 pages
     max_pages = num_pages + 8
 
-    k_paged = torch.randn(max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device)
+    k_paged = pack_indexer_k(torch.randn(
+        max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device))
     q = torch.randn(total_q, n_heads, head_dim, dtype=torch.bfloat16, device=device)
     weights = torch.randn(total_q, n_heads, dtype=torch.bfloat16, device=device)
     scale = head_dim ** -0.5

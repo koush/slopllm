@@ -83,3 +83,7 @@ __device__ __forceinline__ __half fp8_e4m3_to_half(__nv_fp8_e4m3 v) {
 __device__ __forceinline__ float fp8_e4m3_to_float(__nv_fp8_e4m3 v) {
     return __half2float(fp8_e4m3_to_half(v));
 }
+
+__device__ __forceinline__ float fp8_e4m3_to_float(uint8_t v) {
+    return __half2float(fp8_e4m3_to_half(v));
+}

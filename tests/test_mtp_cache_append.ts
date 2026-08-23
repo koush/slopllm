@@ -51,8 +51,8 @@ describe("DeviceOps.appendSelectedMtpCaches", () => {
     const srcIndexer = [makeSource(indexDim, 33)];
     const dstCkv = srcCkv.map(() => ws.alloc([maxPages, pageSize, bytesPerToken], "U8"));
     const refCkv = srcCkv.map(() => ws.alloc([maxPages, pageSize, bytesPerToken], "U8"));
-    const dstIndexer = [ws.alloc([maxPages, pageSize, indexDim], "BF16")];
-    const refIndexer = [ws.alloc([maxPages, pageSize, indexDim], "BF16")];
+    const dstIndexer = [ws.alloc([maxPages, pageSize, indexDim + 4], "U8")];
+    const refIndexer = [ws.alloc([maxPages, pageSize, indexDim + 4], "U8")];
     for (const tensor of [...dstCkv, ...refCkv, ...dstIndexer, ...refIndexer]) tensor.h2d(Buffer.alloc(tensor.bytes));
 
     using sourceRows = uploadI32(selected);

@@ -5,6 +5,7 @@ for use by test_indexer_score_topk_v2.py and test_indexer_score_topk_prefill.py.
 """
 
 import torch
+from helpers import pack_indexer_k
 from test_indexer import indexer_score_torch
 
 
@@ -14,7 +15,8 @@ def _setup_random_kv(B, seq_lens, n_heads, head_dim, page_size, device, seed=42)
     num_pages_total = sum((s + page_size - 1) // page_size for s in seq_lens)
     max_pages = num_pages_total + 16
 
-    k_paged = torch.randn(max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device)
+    k_paged = pack_indexer_k(torch.randn(
+        max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device))
     q = torch.randn(total_q, n_heads, head_dim, dtype=torch.bfloat16, device=device)
     weights = torch.randn(total_q, n_heads, dtype=torch.bfloat16, device=device)
     scale = head_dim ** -0.5

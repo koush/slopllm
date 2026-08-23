@@ -8,7 +8,7 @@ Tests the full pipeline: concatAndCacheDsMla -> indexerScoreTopk -> topkToSlots
 import torch
 import pytest
 import numpy as np
-from helpers import GlmOps  # noqa: F401
+from helpers import GlmOps, pack_indexer_k, unpack_indexer_k  # noqa: F401
 from test_ds_mla_quant import ref_quantize_ds_mla, ref_dequantize_ds_mla
 from test_sparse_mla_sm120 import _build_page_table, _slot_for_token, ref_sparse_mla_prefill
 
@@ -60,6 +60,8 @@ def ref_indexer_score_topk(q_idx, k_data, weights, page_indices_np, page_indptr_
                            page_size, topk, causal, device):
     """PyTorch reference for indexer score+topk."""
     total_q = q_idx.shape[0]
+    if k_data.dtype == torch.uint8:
+        k_data = unpack_indexer_k(k_data, idx_head_dim)
     out_idx = torch.full((total_q, topk), -1, dtype=torch.int32, device=device)
 
     for qi in range(total_q):
@@ -138,13 +140,14 @@ def prod_setup(glm, device):
     )
 
     # Create indexer K cache: [max_pages, PAGE_SIZE, INDEX_HEAD_DIM]
-    k_data = torch.randn(max_pages, PAGE_SIZE, INDEX_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k_data_bf16 = torch.randn(max_pages, PAGE_SIZE, INDEX_HEAD_DIM, dtype=torch.bfloat16, device=device)
     # Fill only the valid positions
     for pos in range(seq_len):
         page_in_seq = pos // PAGE_SIZE
         offset = pos % PAGE_SIZE
         page_id = page_indices_np[page_indptr_np[0] + page_in_seq]
-        k_data[page_id, offset] = torch.randn(INDEX_HEAD_DIM, dtype=torch.bfloat16, device=device)
+        k_data_bf16[page_id, offset] = torch.randn(INDEX_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k_data = pack_indexer_k(k_data_bf16)
 
     # Create indexer Q: [num_q, INDEX_N_HEADS, INDEX_HEAD_DIM]
     q_idx = torch.randn(num_q, INDEX_N_HEADS, INDEX_HEAD_DIM, dtype=torch.bfloat16, device=device)

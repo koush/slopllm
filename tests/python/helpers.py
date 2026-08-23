@@ -9,6 +9,22 @@ ATOL = 1e-2
 RTOL = 1e-2
 
 
+def pack_indexer_k(k):
+    """Pack BF16 indexer K rows as E4M3 bytes followed by one FP32 scale."""
+    values = k.float()
+    amax = values.abs().amax(dim=-1, keepdim=True)
+    raw_scale = torch.maximum(amax, torch.tensor(1e-4, device=k.device)) / 448.0
+    scale = torch.pow(2.0, torch.ceil(torch.log2(raw_scale))).float()
+    quant = (values / scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    return torch.cat((quant, scale.contiguous().view(torch.uint8)), dim=-1).contiguous()
+
+
+def unpack_indexer_k(k, head_dim):
+    values = k[..., :head_dim].contiguous().view(torch.float8_e4m3fn).float()
+    scale = k[..., head_dim:head_dim + 4].contiguous().view(torch.float32)
+    return values * scale
+
+
 class ModelNotFoundError(Exception):
     pass
 
@@ -1706,7 +1722,7 @@ class GlmOps:
             ctypes.c_uint32(nnz), ctypes.c_uint32(page_size),
             ctypes.c_uint32(head_dim_ckv), ctypes.c_uint32(head_dim_kpe),
             ctypes.c_size_t(append_ckv_stride_n), ctypes.c_size_t(append_kpe_stride_n),
-            ctypes.c_uint32(cp_rank), ctypes.c_uint32(cp_world_size)
+            ctypes.c_uint32(cp_world_size), ctypes.c_uint32(cp_rank)
         )
 
     def indexer_kv_cache_append_flat(self, k_data, append_k, kv_token_indptr,
