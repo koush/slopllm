@@ -50,7 +50,7 @@ async function main() {
   // Decode mode: prefill a short prefix, then step the remaining tokens one at
   // a time through the decode path (teacher forced). This is the only way to
   // exercise decode-only kernels -- notably the P2P allReduce, which is gated
-  // to <= 131072 elements and so never fires on a long prefill.
+  // to <= 262144 elements and so never fires on a long prefill.
   if (argv.includes("--decode")) {
     const prefixLen = parseInt(opt("--prefix", "16"), 10);
     const prefix = ids.slice(0, prefixLen);

@@ -84,8 +84,8 @@ tokens=1023 vocab=154880 meanNLL=0.16080 ppl=1.1744 top1acc=96.29%
 ```
 
 **`--decode` is not optional for decode-path work.** Decode-only kernels are
-invisible to a prefill run — the P2P allReduce is gated to <= 131072 elements,
-so at hidden 6144 it never fires above ~21 tokens, and a 1024-token prefill
+invisible to a prefill run — the P2P allReduce is gated to <= 262144 elements,
+so at hidden 6144 it never fires above ~42 tokens, and a 1024-token prefill
 returns byte-identical numbers whether it is enabled or not.
 
 **Use `--dump` and compare paired per-token, not by mean.** Mean NLL is

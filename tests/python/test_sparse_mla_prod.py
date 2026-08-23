@@ -423,3 +423,42 @@ def test_sparse_mla_prefill_64_heads(prod_setup, device):
     print(f"Ref[0,0,:8]:    {o_ref_f[0,0,:8].tolist()}")
 
     assert max_diff < 2.0, f"64-head prefill diff too large: {max_diff}"
+
+
+@pytest.mark.parametrize("num_q", [16, 32])
+def test_sparse_mla_prefill_split_q_64_heads(prod_setup, device, num_q):
+    """Production MG prefill must treat split Q identically to contiguous Q."""
+    s = prod_setup
+    glm = s['glm']
+    q = torch.randn(num_q, NUM_HEADS, D_QK, dtype=torch.bfloat16, device=device)
+    q_nope = q[:, :, :KV_LORA_RANK].contiguous()
+    q_rope = q[:, :, KV_LORA_RANK:].contiguous()
+
+    token_slots = [
+        _slot_for_token(0, pos, s['page_indices_np'], s['page_indptr_np'], PAGE_SIZE)
+        for pos in range(s['seq_len'])
+    ]
+    token_slots.extend([-1] * (TOPK - len(token_slots)))
+    indices = torch.tensor([token_slots] * num_q, dtype=torch.int32, device=device)
+    num_valid = torch.full((num_q,), s['seq_len'], dtype=torch.int32, device=device)
+
+    expected = torch.empty(num_q, NUM_HEADS, D_V, dtype=torch.bfloat16, device=device)
+    expected_lse = torch.empty(num_q, NUM_HEADS, dtype=torch.float32, device=device)
+    actual = torch.empty_like(expected)
+    actual_lse = torch.empty_like(expected_lse)
+    stride_kv_block = PAGE_SIZE * BPT
+
+    glm.sparse_mla_prefill(
+        q.data_ptr(), s['kv_cache'].data_ptr(), indices.data_ptr(),
+        expected.data_ptr(), expected_lse.data_ptr(), num_q, NUM_HEADS, TOPK,
+        PAGE_SIZE, SM_SCALE, stride_kv_block, num_valid.data_ptr(),
+    )
+    glm.sparse_mla_prefill_split_q(
+        q_nope.data_ptr(), q_rope.data_ptr(), s['kv_cache'].data_ptr(), indices.data_ptr(),
+        actual.data_ptr(), actual_lse.data_ptr(), num_q, NUM_HEADS, TOPK,
+        SM_SCALE, stride_kv_block, num_valid.data_ptr(),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_lse, expected_lse)

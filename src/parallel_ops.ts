@@ -203,8 +203,8 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism !== TensorParallelism.PartialSum) {
       throw new Error(`allReduce requires PartialSum tensor, got ${this.parallelism}`);
     }
+    const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     if (!this.tryP2PAllReduce()) {
-      const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
       const dtype = this.parallelOps.ncclDatatype(this.type);
       const addon = getNativeAddon();
       addon.ncclGroupStart();
@@ -251,7 +251,7 @@ export class ParallelTensor extends Tensor {
     // caller workspace WOULD race a lagging peer's unrelated in-flight kernel on
     // the same recycled address -- that is the bug the private workspace fixes.)
     // Too big for the P2P group, or an uneven split, falls back to NCCL.
-    if (count > 65536 * 2)
+    if (count > 65536 * 4)
       return false;
     if (count % this.worldSize !== 0)
       return false;
@@ -2204,7 +2204,7 @@ export class ParallelOps implements DeviceOps {
     workspace: WorkspaceBase,
   ): ParallelTensor {
     const count = partialVOuts.shards[0].shape.reduce((a, b) => a * b, 1);
-    if (this.p2pEnabled && count <= 65536 * 8) {
+    if (this.p2pEnabled && count <= 65536 * 16) {
       return CP_MERGE_PULL
         ? this.cpMergeTreeReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace)
         : this.cpMergePushReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace);
@@ -3196,11 +3196,11 @@ export class ParallelOps implements DeviceOps {
       const nextKData = pagedKV.kData[nextCacheIdx];
       const indexerStream = nextKData?.parallelism === TensorParallelism.Row
         ? this.withStream<ParallelTensor>(() => this.gatherPages(
-            nextKData, indices!, indptr, state.lastPageLen,
-            state.batchSize,
-            pagedKV.maxPages * pagedKV.pageSize,
-            state.kvTokenIndptrD, true,
-          ) as ParallelTensor)
+          nextKData, indices!, indptr, state.lastPageLen,
+          state.batchSize,
+          pagedKV.maxPages * pagedKV.pageSize,
+          state.kvTokenIndptrD, true,
+        ) as ParallelTensor)
         : undefined;
       const nextStream = this.withStream<ParallelTensor>(() => {
         const nextKvCache = pagedKV.ckvData[nextCacheIdx];
@@ -3363,8 +3363,13 @@ export class ParallelOps implements DeviceOps {
     if (!CP_GATHER_KV)
       return false;
 
+
+    // disabled
+    const SPARSE_GATHER_THRESHOLD = Infinity;
+    // const SPARSE_GATHER_THRESHOLD = 32;
+
     // if total tokens is under some threshold, use the sparse gather.
-    if (state.totalTokens <= 32) {
+    if (state.totalTokens <= SPARSE_GATHER_THRESHOLD) {
       // decode should only sparse gather.
       return sparseGather;
     }
