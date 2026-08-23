@@ -3363,13 +3363,13 @@ export class ParallelOps implements DeviceOps {
     if (!CP_GATHER_KV)
       return false;
 
-
-    // disabled
-    const SPARSE_GATHER_THRESHOLD = Infinity;
-    // const SPARSE_GATHER_THRESHOLD = 32;
+    // disabled for now
+    if (sparseGather) {
+      return false;
+    }
 
     // if total tokens is under some threshold, use the sparse gather.
-    if (state.totalTokens <= SPARSE_GATHER_THRESHOLD) {
+    if (state.totalTokens <= 32) {
       // decode should only sparse gather.
       return sparseGather;
     }
