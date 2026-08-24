@@ -682,6 +682,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const pageSize = pagedKV.pageSize;
     const totalTokens = seqLens.reduce((a, b) => a + b, 0);
 
+    if (totalTokens > this.maxSeqLen) {
+      throw new Error(`planPrefill: ${totalTokens} total tokens exceed workspace capacity ${this.maxSeqLen}`);
+    }
     if (pagedKV.sequences.length !== batchSize) {
       throw new Error(`planPrefill: pagedKV has ${pagedKV.sequences.length} sequences, expected ${batchSize}`);
     }

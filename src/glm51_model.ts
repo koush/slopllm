@@ -656,8 +656,10 @@ export class Glm51Model extends ChatModel {
     return result.reshape([BS, hs]);
   }
 
-  private mlaLayer(cos: Tensor, sin: Tensor, normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): { normed: Tensor, residual: Tensor } {
+  private mlaLayer(cos: Tensor, sin: Tensor, normedHolder: UsingHolder<Tensor>, residualHolder: UsingHolder<Tensor>, layerIdx: number, state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): { normed: Tensor, residual: Tensor } {
     const cfg = this.cfg;
+    const normed = normedHolder.value;
+    const residual = residualHolder.value;
     const nHeads = cfg.numAttentionHeads;
     const kvLoraRank = cfg.kvLoraRank;
     const qkRopeDim = cfg.qkRopeHeadDim;
@@ -888,6 +890,8 @@ export class Glm51Model extends ChatModel {
     } else {
       nextWeight = this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.shared_head.norm.weight`)!;
     }
+    normedHolder.release();
+    residualHolder.release();
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
 
     slotsStream?.streamWaitEvent();
@@ -916,7 +920,7 @@ export class Glm51Model extends ChatModel {
     sharedSlotsLength ??= _localLength!;
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const result = this.mlaLayer(cos, sin, normed.value, residual.value, i, state, sharedSlots, sharedSlotsLength);
+      const result = this.mlaLayer(cos, sin, normed, residual, i, state, sharedSlots, sharedSlotsLength);
       normed.replace(result.normed);
       residual.replace(result.residual);
     }
@@ -960,8 +964,8 @@ export class Glm51Model extends ChatModel {
     using hnorm = hnormStream.result;
     using cat = enorm.cat([hnorm], 1);
 
-    using residual = cat.linear(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.eh_proj.weight`)!);
-    using normed = residual.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.input_layernorm.weight`)!, cfg.rmsNormEps);
+    using residual = new UsingHolder(cat.linear(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.eh_proj.weight`)!));
+    using normed = new UsingHolder(residual.value.rmsnorm(this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.input_layernorm.weight`)!, cfg.rmsNormEps));
 
     rotaryEmbedding.streamWaitEvent();
     using cos = rotaryEmbedding.result.cos;
@@ -1163,9 +1167,61 @@ export class Glm51Model extends ChatModel {
         using mtpHidden = this.forwardMtp(prefillState, hiddenStates, sharedSlots, sharedSlotsLength);
         using lastIdx = prefillState.lastIdx;
         using lastHidden = mtpHidden.indexSelect(lastIdx, -1);
+        // The draft seed comes from each sequence's final packed row, so retain
+        // the sparse-attention slots from those same rows rather than row zero.
+        const slotWidth = sharedSlots.value.shape[1];
         seed.memcpy(lastHidden, lastHidden.bytes, MemcpyKind.DeviceToDevice);
         targetHost.memcpy(targetDevice, batchSize * I32, MemcpyKind.DeviceToHost);
-        return { seed, targetHost, sharedSlots: sharedSlots.detach(), sharedSlotsLength: sharedSlotsLength.detach() };
+
+        if (inputIds.every(ids => ids.length === 1)) {
+          // Common decode/reconditioning case: the packed rows already are the
+          // final rows, so preserve the original zero-copy path.
+          return {
+            seed,
+            targetHost,
+            sharedSlots: sharedSlots.detach(),
+            sharedSlotsLength: sharedSlotsLength.detach(),
+          };
+        }
+
+        if (inputIds.slice(1).every(ids => ids.length === 1)) {
+          // The first sequence may have several rows, but all selected final
+          // rows are still contiguous and can be retained as views.
+          const start = inputIds[0].length - 1;
+          return {
+            seed,
+            targetHost,
+            sharedSlots: sharedSlots.value.narrow(start, batchSize),
+            sharedSlotsLength: sharedSlotsLength.value.narrow(start, batchSize),
+          };
+        }
+
+        const slotRowBytes = slotWidth * I32;
+        const lastSharedSlots = ws.alloc([batchSize, slotWidth], "I32");
+        const lastSharedSlotsLength = ws.alloc([batchSize], "I32");
+        let rowEnd = 0;
+        for (let batch = 0; batch < batchSize; batch++) {
+          rowEnd += inputIds[batch].length;
+          lastSharedSlots.memcpy2d(
+            batch * slotRowBytes, slotRowBytes,
+            sharedSlots.value, (rowEnd - 1) * slotRowBytes, slotRowBytes,
+            slotRowBytes, 1,
+            MemcpyKind.DeviceToDevice,
+          );
+          lastSharedSlotsLength.memcpy2d(
+            batch * I32, I32,
+            sharedSlotsLength.value, (rowEnd - 1) * I32, I32,
+            I32, 1,
+            MemcpyKind.DeviceToDevice,
+          );
+        }
+
+        return {
+          seed,
+          targetHost,
+          sharedSlots: lastSharedSlots,
+          sharedSlotsLength: lastSharedSlotsLength,
+        };
       },
     });
 

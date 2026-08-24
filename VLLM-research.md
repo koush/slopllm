@@ -22,15 +22,18 @@ imports the actual kernels from `b12x.attention.nsa_indexer`.
 ### Decode and Small-Q Scoring
 
 `src/glm_ops.ts` dispatches `totalQ <= GLM_INDEXER_DIRECT_DISPATCH_MAX` (64 by
-default) to `indexerScoreTopkV2`. The CUDA scorer in
-`csrc/glm_indexer.cu` assigns a warp to each KV position and loops over all
-indexer heads. Each head performs a 128-dimensional BF16 dot product with FP32
-accumulation, followed by ReLU and the weighted head reduction. The final score
-is rounded to BF16 before selection.
+default) to `indexerScoreTopkV2`. Production-shaped noncausal decode
+(`32` heads by `128` dimensions) quantizes Q to FP8 E4M3 and scores packed FP8 K
+with SM120 `m16n8k32` block-scaled MMA. Q scale and the attention scale are
+folded into the FP32 per-head weights. The path is experimental and requires
+`GLM_INDEXER_DECODE_FP8_MMA=1`; other shapes, causal calls, and the default
+configuration use the scalar FP8-K scorer. Both paths round the final weighted
+score to BF16 before exact selection.
 
-The scorer parallelizes long contexts across multiple CTAs, which is important
-when decode has only a few query rows. Its main weakness is scalar CUDA-core
-work over all 32 heads rather than tensor-core MQA scoring.
+Both scorers parallelize long contexts across multiple CTAs, which is important
+when decode has only a few query rows. The MMA path uses the indexer heads as M
+and groups eight cached tokens as N while retaining the existing materialized
+score and histogram top-k pipeline.
 
 ### Prefill Scoring
 
@@ -109,13 +112,7 @@ This is represented by `bytesPerToken` in `src/paged_kv.ts`.
 
 ### Indexer KV
 
-GLM.js currently stores indexer K as BF16:
-
-```text
-128 BF16 values            = 256 bytes/token/layer
-```
-
-The vLLM DeepSeek-V3.2/GLM-style indexer and B12X path use:
+GLM.js, the vLLM DeepSeek-V3.2/GLM-style indexer, and B12X use:
 
 ```text
 128 FP8 E4M3 values        = 128 bytes
@@ -123,15 +120,10 @@ The vLLM DeepSeek-V3.2/GLM-style indexer and B12X path use:
 Total                      = 132 bytes/token/layer
 ```
 
-For the B12X sparse indexer this FP8 layout is mandatory, not an optional cache
-mode. B12X rejects the FP4 indexer-cache option. Selecting B12X is optional via
-`VLLM_USE_B12X_SPARSE_INDEXER=1` or the `B12X_MLA_SPARSE` attention backend,
-but the B12X kernel contract itself requires FP8 indexer K.
-
-Moving only GLM.js indexer K from BF16 to this FP8 representation would reduce
-indexer-cache storage and scan traffic by approximately 48.4%. It is not
-bit-compatible with current BF16 scoring and must be evaluated as a numerical
-change.
+GLM.js stores the FP32 scale directly after each token's 128 FP8 bytes. This
+reduces indexer-cache storage and scan traffic by approximately 48.4% relative
+to the former BF16 representation. B12X likewise requires FP8 indexer K and
+rejects its FP4 cache option.
 
 Sparse selection does not remove historical KV storage. All past indexer keys
 must remain available because the selected set changes for every query. Sparse
@@ -436,9 +428,12 @@ Any replacement must preserve the inference engine's stable-address model:
 
 ## Suggested Implementation Sequence
 
-1. Add decode and component-level CP benchmarks.
-2. Implement the specialized scalar BF16 decode scorer.
-3. Implement and compare a BF16 tensor-core decode scorer.
+1. Add decode and component-level CP benchmarks. Implemented in
+   `tests/python/bench_indexer_decode.py`.
+2. Implement the specialized scalar FP8-K decode scorer. Implemented as the
+   general-shape and opt-out fallback.
+3. Implement and compare an FP8 tensor-core decode scorer. Implemented for the
+   production `32x128` noncausal decode shape.
 4. Pack CP score/index candidates and specialize the 16,384-to-2,048 merge.
 5. Diagnose the sparse-attention ordering dependency and remove the sort if
    possible.
@@ -457,6 +452,8 @@ Any replacement must preserve the inference engine's stable-address model:
 - `src/parallel_ops.ts`: query sharding, CP candidate merge, and index sorting.
 - `src/paged_kv.ts`: main and indexer KV cache layouts.
 - `tests/python/bench_indexer_prefill.py`: production-shaped prefill benchmark.
+- `tests/python/bench_indexer_decode.py`: decode score/top-k, CP candidate merge,
+  sort, and slot-conversion component benchmark.
 - `vendor/vllm-fork/csrc/libtorch_stable/cache_kernels.cu`: FP8 indexer K cache
   insertion and gather.
 - `vendor/vllm-fork/csrc/libtorch_stable/persistent_topk.cuh`: persistent top-k

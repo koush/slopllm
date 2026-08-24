@@ -321,24 +321,46 @@ async function prefillPromptChunks(
   };
 
   removeCancelledRows();
-  while (rows.some(row => row.inputIds.length > chunkSize)) {
+  // prepareMtpInput may prepend one overlap token per row. Keep enough room for
+  // those tokens and cap every intermediate prefill by the workspace's total
+  // token capacity, not by a per-row limit.
+  const finalInputBudget = chunkSize - rows.length;
+  if (finalInputBudget < 0) {
+    throw new Error(`Prefill batch ${rows.length} exceeds chunk size ${chunkSize}`);
+  }
+  while (rows.reduce((sum, row) => sum + row.inputIds.length, 0) > finalInputBudget) {
     const staged = rows.map(row => ({ row, key: nextStagingKey++ }));
     for (const entry of staged) pagedKV.stageSequence(0, entry.key);
 
-    const chunked = staged.filter(entry => entry.row.inputIds.length > chunkSize);
-    const deferred = staged.filter(entry => entry.row.inputIds.length <= chunkSize);
-    for (const entry of chunked) pagedKV.unstageSequence(entry.key);
+    let budget = chunkSize;
+    const chunked: { entry: typeof staged[number]; take: number }[] = [];
+    const deferred: typeof staged = [];
+    for (const entry of staged) {
+      // Keep one token available as nextTokens for the MTP rotation.
+      const take = Math.min(Math.max(0, entry.row.inputIds.length - 1), budget);
+      if (take > 0) {
+        pagedKV.unstageSequence(entry.key);
+        chunked.push({ entry, take });
+        budget -= take;
+      } else {
+        deferred.push(entry);
+      }
+    }
+    if (chunked.length === 0) {
+      throw new Error(`Unable to fit prefill batch within ${chunkSize} tokens`);
+    }
 
-    const inputIds = chunked.map(entry => entry.row.inputIds.slice(0, chunkSize));
-    const nextTokens = chunked.map(entry => entry.row.inputIds[chunkSize]);
+    const inputIds = chunked.map(({ entry, take }) => entry.row.inputIds.slice(0, take));
+    const nextTokens = chunked.map(({ entry, take }) => entry.row.inputIds[take]);
     await runChunk(inputIds, nextTokens);
     for (let i = 0; i < chunked.length; i++) {
       pagedKV.reportTokens(i, inputIds[i]);
-      chunked[i].row.inputIds = chunked[i].row.inputIds.slice(chunkSize);
+      const { entry, take } = chunked[i];
+      entry.row.inputIds = entry.row.inputIds.slice(take);
     }
 
     for (const entry of deferred) pagedKV.unstageSequence(entry.key);
-    rows.splice(0, rows.length, ...chunked.map(entry => entry.row), ...deferred.map(entry => entry.row));
+    rows.splice(0, rows.length, ...chunked.map(({ entry }) => entry.row), ...deferred.map(entry => entry.row));
     removeCancelledRows();
   }
   return nextStagingKey;
@@ -935,6 +957,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   };
   let busy = false;
 
+  const isFatalCudaError = (error: unknown): boolean => {
+    const message = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
+    return /illegal memory access|misaligned address|device-side assert|unspecified launch failure|CUDA context.*destroyed/i.test(message);
+  };
+
   async function processQueue(): Promise<void> {
     if (busy) return;
     busy = true;
@@ -974,6 +1001,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           );
       } catch (err) {
         console.error("Continuous batch error:", err);
+        if (isFatalCudaError(err)) {
+          for (const req of pendingQueue.splice(0)) {
+            req.finished = true;
+            try { req.onError(err); } catch {}
+          }
+          // CUDA faults poison subsequent work. Exit this executor thread so
+          // clients fail immediately and the persistent loader reports idle.
+          setImmediate(() => process.exit(1));
+        }
       }
       const elapsed = (performance.now() - t0) / 1000;
       if (elapsed > 0) {

@@ -308,7 +308,7 @@ export class ParallelTensor extends Tensor {
     return true;
   }
 
-  allGather(workspace: WorkspaceBase): ParallelTensor {
+  allGather(workspace: WorkspaceBase, output?: ParallelTensor): ParallelTensor {
     if (this.parallelism === TensorParallelism.Replicated) {
       return this;
     }
@@ -316,7 +316,22 @@ export class ParallelTensor extends Tensor {
       throw new Error("allGather cannot be used on PartialSum tensors; use allReduce instead");
     }
 
-    const output = workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
+    if (output) {
+      if (output.workspace !== workspace) {
+        throw new Error("allGather: output belongs to a different workspace");
+      }
+      if (output.parallelism !== TensorParallelism.Replicated) {
+        throw new Error(`allGather: output parallelism ${output.parallelism}, expected Replicated`);
+      }
+      if (output.type !== this.type || output.shape.length !== this.shape.length || output.shape.some((dim, i) => dim !== this.shape[i])) {
+        throw new Error(`allGather: output [${output.shape}] ${output.type} does not match input [${this.shape}] ${this.type}`);
+      }
+      if (output.shards.length !== this.worldSize || output.shards.some(shard => shard.disposed)) {
+        throw new Error("allGather: output has invalid or disposed shards");
+      }
+    }
+
+    output ||= workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
 
     if (this.tryP2PAllGather(output)) {
       return output;
@@ -3077,11 +3092,15 @@ export class ParallelOps implements DeviceOps {
           throw new Error(`mlaKvCacheAppend: expected indexer prefetch for full layer ${cacheIdx}`);
         }
         const pagedKV = state.cache.getPagedKV();
+        const paddedKvLen = Math.min(
+          pagedKV.maxPages * pagedKV.pageSize,
+          state.getGraphVariantPaddedKvLen(),
+        );
         return {
           ckv: this.gatherPages(
             ckvData, indices, indptr, lastPageLen,
             state.batchSize,
-            pagedKV.maxPages * pagedKV.pageSize,
+            paddedKvLen,
             state.kvTokenIndptrD, true,
           ),
         };
@@ -3102,6 +3121,10 @@ export class ParallelOps implements DeviceOps {
     const cfg = state.model.cfg as Glm51Config;
 
     const pagedKV = state.cache.getPagedKV();
+    const paddedKvLen = Math.min(
+      pagedKV.maxPages * pagedKV.pageSize,
+      state.getGraphVariantPaddedKvLen(),
+    );
 
     // Get this layer's gathering stream before cleaning up a skipped previous
     // layer. Extras use exact layer keys; buffers use distance-based names.
@@ -3198,7 +3221,7 @@ export class ParallelOps implements DeviceOps {
         ? this.withStream<ParallelTensor>(() => this.gatherPages(
           nextKData, indices!, indptr, state.lastPageLen,
           state.batchSize,
-          pagedKV.maxPages * pagedKV.pageSize,
+          paddedKvLen,
           state.kvTokenIndptrD, true,
         ) as ParallelTensor)
         : undefined;
@@ -3208,7 +3231,7 @@ export class ParallelOps implements DeviceOps {
         return this.gatherPages(
           nextKvCache, indices!, indptr, state.lastPageLen,
           state.batchSize,
-          pagedKV.maxPages * pagedKV.pageSize,
+          paddedKvLen,
           state.kvTokenIndptrD, contextParallel,
         ) as ParallelTensor;
       });
@@ -3232,7 +3255,7 @@ export class ParallelOps implements DeviceOps {
     return this.gatherPages(
       kvCache, indices, indptr, state.lastPageLen,
       state.batchSize,
-      pagedKV.maxPages * pagedKV.pageSize,
+      paddedKvLen,
       state.kvTokenIndptrD, contextParallel,
     );
   }
@@ -3467,32 +3490,62 @@ export class ParallelOps implements DeviceOps {
     const pKvIndptr = this.cast(kvTokenIndptrD);
     const pageSize = srcData.shape[1];
     const D = srcData.shape[2];
+    const maxKvLen = srcData.shape[0] * pageSize;
+    if (paddedKvLen <= 0 || paddedKvLen > maxKvLen) {
+      throw new Error(`gatherPages: paddedKvLen=${paddedKvLen} must be in (0, ${maxKvLen}]`);
+    }
+
+    const narrowLocal = (full: Tensor, activeLen: number): Tensor => {
+      const localPageSize = full.shape[1];
+      const maxLocalLen = full.shape[0] * localPageSize;
+      if (activeLen <= 0 || activeLen > maxLocalLen || activeLen % localPageSize !== 0) {
+        throw new Error(`gatherPages: active local length ${activeLen} is invalid for capacity ${maxLocalLen} and page size ${localPageSize}`);
+      }
+      if (activeLen === maxLocalLen) return full;
+      const active = full.narrow(0, activeLen / localPageSize);
+      full[Symbol.dispose]();
+      return active;
+    };
 
     if (!contextParallel) {
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, paddedKvLen, pKvIndptr.shards[i], false));
+        const shard = pSrc.shards[i];
+        const maxLocalLen = shard.shape[0] * shard.shape[1];
+        const full = this.devices[i].gatherPages(shard, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, maxLocalLen, pKvIndptr.shards[i], false);
+        shards.push(narrowLocal(full, paddedKvLen));
       }
       return this.wrapShards(workspace, shards, [paddedKvLen / pageSize, pageSize, D], pSrc.type, pSrc.parallelism);
     }
 
     // CP: each GPU has every Nth token within each page (Row-parallel, sharded on pageSize dim)
     const cpWorldSize = this.worldSize;
+    if (paddedKvLen % cpWorldSize !== 0) {
+      throw new Error(`gatherPages: paddedKvLen=${paddedKvLen} is not divisible by CP world size ${cpWorldSize}`);
+    }
     const paddedLocalLen = paddedKvLen / cpWorldSize;
 
     // Step 1: Local gather — each GPU gathers from its shard of the KV data
     const localBufs: Tensor[] = [];
     for (let i = 0; i < cpWorldSize; i++) {
-      localBufs.push(this.devices[i].gatherPages(pSrc.shards[i], pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, paddedLocalLen, pKvIndptr.shards[i], false));
+      const shard = pSrc.shards[i];
+      const maxLocalLen = shard.shape[0] * shard.shape[1];
+      const full = this.devices[i].gatherPages(shard, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, maxLocalLen, pKvIndptr.shards[i], false);
+      localBufs.push(narrowLocal(full, paddedLocalLen));
     }
 
     const shardPageSize = pSrc.shards[0].shape[1];
     // Step 2: NCCL all-gather (Column → Replicated)
     using localPar = this.wrapShards(workspace, localBufs, [paddedKvLen / shardPageSize, shardPageSize, D], pSrc.type, TensorParallelism.Column);
-    using gathered = localPar.allGather(workspace);
+    const maxShape = [maxKvLen / shardPageSize, shardPageSize, D];
+    const activeShapeRows = paddedKvLen / shardPageSize;
+    using gatheredFull = workspace.alloc(maxShape, pSrc.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const gatheredOutput = gatheredFull.narrow(0, activeShapeRows) as ParallelTensor;
+    using gathered = localPar.allGather(workspace, gatheredOutput);
 
     // Step 3: Deinterleave — reorder interleaved tokens to sequential
-    const out = workspace.alloc([paddedKvLen / shardPageSize, shardPageSize, D], pSrc.type) as ParallelTensor;
+    using outFull = workspace.alloc(maxShape, pSrc.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const out = outFull.narrow(0, activeShapeRows) as ParallelTensor;
     const pOut = this.cast(out);
     const elemBytes = pSrc.type === "U8" ? 1 : 2;
 
@@ -3763,7 +3816,7 @@ export class ParallelOps implements DeviceOps {
     // Only decode sparse-gather splits the two: the full layer reads its paged
     // CP shard while the group reads the gathered flat buffer. Everywhere else
     // one buffer serves both, and computing a second identical copy would put
-    // another [maxKv, topk] block into the recycle rotation — which moves the
+    // another [maxQ, topk] block into the recycle rotation — which moves the
     // slots address step to step and breaks graph replay.
     const diverges = hasGroup && this.topkSlotMode(state, groupIdx) !== this.topkSlotMode(state, cacheIdx);
 
