@@ -605,7 +605,7 @@ export class Glm51Model extends ChatModel {
     const hs = cfg.hiddenSize;
 
     // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
-    using sharedDownBufStream = this.glm.withStream(() => {
+    using sharedMlpStream = this.glm.withStream(() => {
       const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
       return normed.swiGluMlp(sharedWeights);
     });
@@ -649,8 +649,8 @@ export class Glm51Model extends ChatModel {
     using normalizedWeightsFlat = normalizedWeights.reshape([count]);
     using routedOut = downOut.scatterAddRows(normalizedWeightsFlat, topK, BS);
 
-    sharedDownBufStream.streamWaitEvent();
-    using sharedDownBuf = sharedDownBufStream.result;
+    sharedMlpStream.streamWaitEvent();
+    using sharedDownBuf = sharedMlpStream.result;
 
     using result = routedOut.add(sharedDownBuf, BS * hs);
     return result.reshape([BS, hs]);
