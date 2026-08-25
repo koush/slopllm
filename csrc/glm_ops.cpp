@@ -1119,8 +1119,8 @@ static Napi::Value AddBroadcast(const Napi::CallbackInfo& info) {
 
 static Napi::Value Transpose4d(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, out, input, d0, d1, d2, d3, p0, p1, p2, p3)").ThrowAsJavaScriptException();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, out, input, d0, d1, d2, d3, p0, p1, p2, p3, elemBytes)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1134,10 +1134,11 @@ static Napi::Value Transpose4d(const Napi::CallbackInfo& info) {
     int p1 = info[8].As<Napi::Number>().Int32Value();
     int p2 = info[9].As<Napi::Number>().Int32Value();
     int p3 = info[10].As<Napi::Number>().Int32Value();
-    glm_transpose_4d(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                     reinterpret_cast<void*>(out_ptr),
-                     reinterpret_cast<const void*>(in_ptr),
-                     d0, d1, d2, d3, p0, p1, p2, p3);
+    int elem_bytes = info[11].As<Napi::Number>().Int32Value();
+    glm_transpose_4d_typed(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                           reinterpret_cast<void*>(out_ptr),
+                           reinterpret_cast<const void*>(in_ptr),
+                           d0, d1, d2, d3, p0, p1, p2, p3, elem_bytes);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("transpose4d failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

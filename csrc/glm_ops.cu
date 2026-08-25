@@ -2534,14 +2534,47 @@ __global__ void __launch_bounds__(256, 4) transpose_4d_kernel(
     out[out_idx] = input[idx];
 }
 
-void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
-                      int dim0, int dim1, int dim2, int dim3,
-                      int perm0, int perm1, int perm2, int perm3) {
+// Swap dimensions 0 and 1 while preserving each contiguous [dim2, dim3]
+// row. This is the owner-merge layout conversion [source, query, K] ->
+// [query, source, K], and supports any element size.
+__global__ void __launch_bounds__(256, 4) transpose_swap_first2_bytes_kernel(
+    uint8_t* __restrict__ out, const uint8_t* __restrict__ input,
+    int dim0, int dim1, int row_bytes) {
+    int row = blockIdx.x;
+    int i0 = row / dim1;
+    int i1 = row - i0 * dim1;
+    const uint8_t* src = input + (int64_t)row * row_bytes;
+    uint8_t* dst = out + (int64_t)(i1 * dim0 + i0) * row_bytes;
+
+    constexpr int VEC = 16;
+    if ((row_bytes & (VEC - 1)) == 0) {
+        int vecs = row_bytes / VEC;
+        for (int i = threadIdx.x; i < vecs; i += blockDim.x) {
+            *reinterpret_cast<int4*>(dst + (int64_t)i * VEC) =
+                *reinterpret_cast<const int4*>(src + (int64_t)i * VEC);
+        }
+    } else {
+        for (int i = threadIdx.x; i < row_bytes; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+static void transpose_4d_impl(GlmCtx* ctx, void* out, const void* input,
+                              int dim0, int dim1, int dim2, int dim3,
+                              int perm0, int perm1, int perm2, int perm3,
+                              int elem_bytes) {
     cudaSetDevice(ctx->device_id);
     int total = dim0 * dim1 * dim2 * dim3;
     int block_size = 256;
     int grid = (total + block_size - 1) / block_size;
-    if (perm0 == 0 && perm1 == 2 && perm2 == 1 && perm3 == 3) {
+    if (perm0 == 1 && perm1 == 0 && perm2 == 2 && perm3 == 3) {
+        transpose_swap_first2_bytes_kernel<<<dim0 * dim1, block_size, 0, GLM_STREAM(ctx)>>>(
+            (uint8_t*)out, (const uint8_t*)input,
+            dim0, dim1, dim2 * dim3 * elem_bytes);
+    } else if (elem_bytes != 2) {
+        fprintf(stderr, "glm_transpose_4d_typed: only permutation (1,0,2,3) supports elem_bytes=%d\n", elem_bytes);
+    } else if (perm0 == 0 && perm1 == 2 && perm2 == 1 && perm3 == 3) {
         transpose_0213_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
             dim0, dim1, dim2, dim3);
@@ -2558,6 +2591,21 @@ void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
             dim0, dim1, dim2, dim3, perm0, perm1, perm2, perm3);
     }
+}
+
+void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
+                       int dim0, int dim1, int dim2, int dim3,
+                       int perm0, int perm1, int perm2, int perm3) {
+    transpose_4d_impl(ctx, out, input, dim0, dim1, dim2, dim3,
+                      perm0, perm1, perm2, perm3, sizeof(__nv_bfloat16));
+}
+
+void glm_transpose_4d_typed(GlmCtx* ctx, void* out, const void* input,
+                            int dim0, int dim1, int dim2, int dim3,
+                            int perm0, int perm1, int perm2, int perm3,
+                            int elem_bytes) {
+    transpose_4d_impl(ctx, out, input, dim0, dim1, dim2, dim3,
+                      perm0, perm1, perm2, perm3, elem_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -3235,4 +3283,3 @@ void glm_write_pointers(GlmCtx* ctx, void* dst,
 }
 
 } // extern "C"
-

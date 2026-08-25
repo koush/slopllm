@@ -420,6 +420,14 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
+        self.lib.glm_transpose_4d_typed.restype = None
+        self.lib.glm_transpose_4d_typed.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int
+        ]
+
         self.lib.glm_mul.restype = None
         self.lib.glm_mul.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -1447,6 +1455,14 @@ class GlmOps:
             self._ptr(output),
             self._ptr(input),
             d0, d1, d2, d3, p0, p1, p2, p3
+        )
+
+    def transpose_4d_typed(self, output, input, d0, d1, d2, d3, p0, p1, p2, p3, elem_bytes):
+        self.lib.glm_transpose_4d_typed(
+            self.ctx,
+            self._ptr(output),
+            self._ptr(input),
+            d0, d1, d2, d3, p0, p1, p2, p3, elem_bytes
         )
 
     def mul(self, output, a, b, n):

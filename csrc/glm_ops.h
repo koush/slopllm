@@ -223,8 +223,12 @@ void glm_expand_dim1_strided(GlmCtx* ctx, void* out, const void* input,
                              int batch, int head_stride);
 
 void glm_transpose_4d(GlmCtx* ctx, void* out, const void* input,
-                      int dim0, int dim1, int dim2, int dim3,
-                      int perm0, int perm1, int perm2, int perm3);
+                       int dim0, int dim1, int dim2, int dim3,
+                       int perm0, int perm1, int perm2, int perm3);
+void glm_transpose_4d_typed(GlmCtx* ctx, void* out, const void* input,
+                            int dim0, int dim1, int dim2, int dim3,
+                            int perm0, int perm1, int perm2, int perm3,
+                            int elem_bytes);
 
 void glm_mul(GlmCtx* ctx, void* out, const void* a, const void* b, int n);
 

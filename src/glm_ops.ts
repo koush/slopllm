@@ -109,8 +109,12 @@ export class GlmTensor extends Tensor {
   }
 
   transpose4d(d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number): Tensor {
+    const swapFirstTwo = p0 === 1 && p1 === 0 && p2 === 2 && p3 === 3;
+    if (this.type !== "BF16" && !swapFirstTwo) {
+      throw new Error(`transpose4d: type ${this.type} is only supported for permutation [1,0,2,3]`);
+    }
     const out = this.workspace.alloc([d0 * d1 * d2 * d3], this.type);
-    getNativeAddon().transpose4d(this.glm.ctx, out.data, this.data, d0, d1, d2, d3, p0, p1, p2, p3);
+    getNativeAddon().transpose4d(this.glm.ctx, out.data, this.data, d0, d1, d2, d3, p0, p1, p2, p3, SafeTensorFile.dtypeBytes(this.type));
     return out;
   }
 

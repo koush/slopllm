@@ -28,6 +28,16 @@ def test_transpose_4d_swap_0_1(glm, device):
     assert torch.equal(out.cpu(), expected.cpu())
 
 
+def test_transpose_4d_swap_0_1_i32(glm, device):
+    sources, queries, topk = 8, 5, 37
+    x = torch.arange(sources * queries * topk, dtype=torch.int32, device=device)
+    x = x.reshape(sources, queries, topk, 1)
+    out = torch.empty(queries, sources, topk, 1, dtype=torch.int32, device=device)
+    glm.transpose_4d_typed(out, x, sources, queries, topk, 1, 1, 0, 2, 3, 4)
+    expected = x.permute(1, 0, 2, 3).contiguous()
+    assert torch.equal(out.cpu(), expected.cpu())
+
+
 def test_transpose_4d_reverse_dims(glm, device):
     B, S, H, D = 1, 2, 3, 4
     x = torch.randn(B, S, H, D, dtype=torch.bfloat16, device=device)
