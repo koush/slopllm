@@ -302,7 +302,6 @@ export class ParallelTensor extends Tensor {
     }
 
     group.barrier(this.devices);
-    group.cleanupSources();
     group.sources.push(...staging);
 
     return true;
@@ -451,11 +450,11 @@ export class ParallelTensor extends Tensor {
         output.shards[i].memcpy(shards[i], shards[i].bytes, MemcpyKind.DeviceToDevice);
       }
 
-      // due to the prior barrier, the staging buffers can immediately be recycled.
-      // all peers are done writing to them.
-      group.sources.push(...shards);
-      group.cleanupSources();
-
+      // The barrier completed all peer writes, and the local copies above are
+      // ordered before any same-stream reuse of these staging buffers.
+      for (const shard of shards) {
+        shard[Symbol.dispose]();
+      }
 
       return true;
     }
@@ -489,7 +488,6 @@ export class ParallelTensor extends Tensor {
         output.shards[i].memcpy(shards[i], shards[i].bytes, MemcpyKind.DeviceToDevice);
       }
 
-      group.cleanupSources();
       group.sources.push(...shards);
 
       return true;
@@ -2046,7 +2044,7 @@ class P2PAllReduceGroup {
   sources: Tensor[] = [];
 
   /** Release the sources retained since the previous barrier on this group. */
-  cleanupSources(): void {
+  private cleanupSources(): void {
     while (this.sources.length) {
       using _src = this.sources.pop()!;
     }
@@ -2066,6 +2064,15 @@ class P2PAllReduceGroup {
   barrier(devices: readonly GlmOps[], peerRanks?: number[]): void {
     this.arrive(devices, peerRanks);
     this.wait(devices, peerRanks);
+    this.cleanupSources();
+  }
+
+  /** Release resources after all device streams have been synchronized. */
+  onSynchronized(): void {
+    this.cleanupSources();
+    for (const workspace of this.workspaces) {
+      workspace.clearTracking();
+    }
   }
 
   /** Arrive phase: each rank publishes its flag (release). No spinning. */
@@ -2176,11 +2183,6 @@ export class ParallelOps implements DeviceOps {
     const group = this.getP2PGroup(this.devices[0].currentStream);
     if (!group) throw new Error('P2P not available for source retention');
     group.sources.push(...tensors);
-  }
-
-  /** Release the sources retained by the current stream's group. */
-  sourceCleanup() {
-    this.getP2PGroup(this.devices[0].currentStream)?.cleanupSources();
   }
 
   /** NCCL point-to-point send. Must be paired with ncclRecv on peer. */
@@ -2309,7 +2311,6 @@ export class ParallelOps implements DeviceOps {
       );
     }
 
-    group.cleanupSources();
     group.sources.push(
       ...stageV,
       ...stageLse,
@@ -2349,7 +2350,6 @@ export class ParallelOps implements DeviceOps {
     const shardWss = this.getShardWorkspaces(workspace);
 
     this.p2pBarrier();
-    this.sourceCleanup();
     this.p2pRetainSources(...partialVOuts.map(t => t.viewClone()), ...partialLses.map(t => t.viewClone()));
 
     const vPtrs: number[] = partialVOuts.map(t => t.data);
@@ -2653,10 +2653,7 @@ export class ParallelOps implements DeviceOps {
       device.synchronize();
     }
     for (const group of this.p2pGroups.values()) {
-      group.cleanupSources();
-      for (const w of group.workspaces) {
-        w.clearTracking();
-      }
+      group.onSynchronized();
     }
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
@@ -2664,10 +2661,7 @@ export class ParallelOps implements DeviceOps {
   async synchronizeAsync(): Promise<void> {
     await Promise.all(this.devices.map(device => device.synchronizeAsync()));
     for (const group of this.p2pGroups.values()) {
-      group.cleanupSources();
-      for (const w of group.workspaces) {
-        w.clearTracking();
-      }
+      group.onSynchronized();
     }
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
@@ -2678,10 +2672,7 @@ export class ParallelOps implements DeviceOps {
     }
     const group = this.getP2PGroup(streamIdx);
     if (group) {
-      group.cleanupSources();
-      for (const w of group.workspaces) {
-        w.clearTracking();
-      }
+      group.onSynchronized();
     }
   }
 
@@ -2689,10 +2680,7 @@ export class ParallelOps implements DeviceOps {
     await Promise.all(this.devices.map(device => device.synchronizeStreamAsync(streamIdx)));
     const group = this.getP2PGroup(streamIdx);
     if (group) {
-      group.cleanupSources();
-      for (const w of group.workspaces) {
-        w.clearTracking();
-      }
+      group.onSynchronized();
     }
   }
 
