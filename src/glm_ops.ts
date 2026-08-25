@@ -24,17 +24,18 @@ const MUL_MAT_ID_GROUPED_THRESHOLD = 512;
 // decode kernel for better GPU occupancy (e.g. MTP tree verify). Above it, the
 // prefill kernel's per-token CTAs already fill the GPU and amortize KV loads.
 // Tunable — the crossover is roughly the SM count divided by heads/HPB.
-const SPARSE_MLA_DECODE_DISPATCH_MAX = Number(process.env.GLM_SPARSE_DECODE_DISPATCH_MAX ?? 64);
+const SPARSE_MLA_DECODE_DISPATCH_MAX = 16;
 
 // At or below this query-token count the indexer scores via the "direct" v2 path
-// (simple per-position score kernel + a single 65536-bucket histogram): lowest
+// (simple per-position score kernel + a two-pass 256-bin radix selector): lowest
 // per-launch overhead and best occupancy for small Q, since the tensor-core
 // prefill score kernel underutilizes its TM=64 query tile when Q is tiny (decode,
-// MTP tree verify). The v2 histogram is 256 KB/query so it can't scale — above the
-// threshold the memory-scalable two-level tensor-core prefill path is used. Both
+// MTP tree verify). Above the threshold, the tensor-core prefill scorer better
+// amortizes its setup and processes query tiles together. Both
 // paths support custom masks and query-sharding, so this is a pure occupancy/
 // memory tradeoff. Tunable to align with SPARSE_MLA_DECODE_DISPATCH_MAX.
 const INDEXER_DIRECT_DISPATCH_MAX = Number(process.env.GLM_INDEXER_DIRECT_DISPATCH_MAX ?? 64);
+const TOPK_SCRATCH_I32 = 1056;
 const CUBLASLT_WORKSPACE_BYTES = 2 * 1024 * 1024;
 
 function ptr(t: Tensor | undefined): number {
@@ -385,7 +386,7 @@ export class GlmTensor extends Tensor {
     const values = this.workspace.alloc([batch, k], this.type);
     const indices = this.workspace.alloc([batch, k], "I32");
     if (k > 8) {
-      using hist = this.workspace.alloc([batch, 65536], "I32");
+      using hist = this.workspace.alloc([batch, TOPK_SCRATCH_I32], "I32");
       using meta = this.workspace.alloc([batch, 4], "I32");
       getNativeAddon().topkFromScores(this.glm.ctx, values.data, indices.data, this.data, 0, hist.data, meta.data, batch, dim, k, 1, offset === 0 ? 0 : 1, offset);
     } else {
@@ -1028,7 +1029,7 @@ export class GlmOps implements DeviceOps {
     const values = q.workspace.alloc([totalQ, topk], "BF16");
     using scores = q.workspace.alloc([totalQ, maxKv], "BF16");
     using rowLen = q.workspace.alloc([totalQ], "I32");
-    using hist = q.workspace.alloc([totalQ, 65536], "I32");
+    using hist = q.workspace.alloc([totalQ, TOPK_SCRATCH_I32], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
     getNativeAddon().indexerScoreTopkV2(this.ctx, indices.data, values.data, q.data, kData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, hist.data, meta.data, maxKv, numSplits, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0);
     return { values, indices };

@@ -378,16 +378,18 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const 
 }
 
 // ---------------------------------------------------------------------------
-// Exact large-K top-K over non-negative bf16 scores, by histogram.
+// Exact large-K top-K over bf16 scores, by two-pass radix selection.
 //
-// Indexer scores are ReLU'd and bf16-rounded, so each score is one of only
-// 32768 non-negative bf16 values. Selecting the top-K (K up to a few thousand)
-// out of N (up to ~200k) is therefore an exact histogram problem, done in three
-// fully-parallel multi-block passes — no per-thread K-arrays, no serial heap.
+// Indexer scores are bf16-rounded, so each score is one of only 65536 possible
+// bit patterns. Selecting the top-K (K up to a few thousand)
+// out of N (up to ~200k) is therefore an exact radix problem: histogram the high
+// key byte, then histogram the low byte only in the winning high-byte bucket.
+// Short rows use one block with warp-private shared bins. Long rows use the
+// existing split grid and a compact 256-bin global histogram per row.
 // All passes have a fixed launch shape (grid sized for max context), so this is
 // CUDA-graph capturable; per-row length is read on-device from row_len.
 //
-//   hist:  [batch, 32768] i32 scratch   meta: [batch, 4] i32 scratch
+//   scratch: [batch, 1056] i32          meta: [batch, 4] i32 scratch
 //   meta layout per row: [tau_key, tie_take, out_count, tie_count]
 // Output out_idx[row, 0..K) = selected position indices, -1 padded.
 //
@@ -396,7 +398,12 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const 
 // with key == tau land in out[numAbove, K). See idx_gather_count_kernel.
 // ---------------------------------------------------------------------------
 
-#define IDX_NBUCKET 65536   // full signed bf16 range, mapped to a monotonic key
+#define IDX_RADIX_BUCKETS 256
+
+// Per-row scratch is shared by three non-overlapping phases. FP8 decode needs
+// 4096 bytes of quantized Q followed by 32 fp32 effective weights (4224 bytes),
+// while deterministic gather needs at most 2*256 i32 block counts.
+#define IDX_SCRATCH_I32 1056
 
 // meta[0] sentinel meaning "the threshold pass already wrote the whole row"
 // (len <= topk). No bf16 key can reach it, so the gather is a no-op either way.
@@ -451,25 +458,12 @@ static __device__ __forceinline__ int bf16_key(const __nv_bfloat16* p) {
     return bf16_key_bits(*reinterpret_cast<const unsigned short*>(p));
 }
 
-__global__ void idx_hist_kernel(
-    const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ row_len,
-    int32_t* __restrict__ hist, int stride
-) {
-    const int row = blockIdx.y;
-    const int len = row_len ? row_len[row] : stride;
-    const __nv_bfloat16* s = scores + (size_t)row * stride;
-    int32_t* h = hist + (size_t)row * IDX_NBUCKET;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < len; i += gridDim.x * blockDim.x) {
-        atomicAdd(&h[bf16_key(&s[i])], 1);
-    }
-}
-
-// One block (256 threads) per row: init out_idx to -1, then find the threshold
-// bucket tau (largest set of top buckets whose counts sum to >= topk) with a
-// two-level parallel scan over the 32768 buckets — 128 buckets/thread, a 256-way
-// block scan, then the winning thread refines within its range.
-__global__ void idx_threshold_kernel(
-    const int32_t* __restrict__ hist, int32_t* __restrict__ meta,
+// One block per row performs both radix scans and initializes the output. A
+// private histogram per warp reduces shared-atomic contention; threads then
+// reduce the eight copies while locating the winning byte. The len<=topk branch
+// returns before either score scan.
+__global__ void idx_radix_threshold_kernel(
+    int32_t* __restrict__ meta,
     int32_t* __restrict__ out_idx, __nv_bfloat16* __restrict__ out_scores,
     const int32_t* __restrict__ row_len,
     const __nv_bfloat16* __restrict__ scores, int stride, int topk,
@@ -501,38 +495,62 @@ __global__ void idx_threshold_kernel(
         out_scores[(size_t)row * topk + i] = neg_inf;
     }
 
-    const int t = threadIdx.x;                 // 0..255
-    const int PER = IDX_NBUCKET / 256;         // 128 buckets per thread
-    const int32_t* h = hist + (size_t)row * IDX_NBUCKET;
-    // Thread t owns the t-th band from the top: buckets [hi-PER, hi).
-    const int hi = IDX_NBUCKET - t * PER;
-    long localSum = 0;
-    for (int k = hi - PER; k < hi; k++) localSum += h[k];
-
-    __shared__ long partial[256];
+    __shared__ int sh[IDX_GATHER_WARPS][IDX_RADIX_BUCKETS];
     __shared__ int s_winner;
-    __shared__ long s_above;   // count in bands strictly above the winning band
-    partial[t] = localSum;
+    __shared__ int s_above;
+    int* bins = &sh[0][0];
+    const int warp = threadIdx.x >> 5;
+    for (int i = threadIdx.x; i < IDX_GATHER_WARPS * IDX_RADIX_BUCKETS;
+         i += blockDim.x)
+        bins[i] = 0;
     __syncthreads();
 
-    if (t == 0) {
-        long cum = 0; int winner = 255;
-        for (int j = 0; j < 256; j++) {
-            if (cum + partial[j] >= topk) { winner = j; break; }
-            cum += partial[j];
+    // Pass 1: high byte of the monotonic bf16 key.
+    for (int i = threadIdx.x; i < len; i += blockDim.x)
+        atomicAdd(&sh[warp][bf16_key(&scores[(size_t)row * stride + i]) >> 8], 1);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int cum = 0;
+        for (int bucket = IDX_RADIX_BUCKETS - 1; bucket >= 0; bucket--) {
+            int count = 0;
+#pragma unroll
+            for (int w = 0; w < IDX_GATHER_WARPS; w++) count += sh[w][bucket];
+            if (cum + count >= topk) {
+                s_winner = bucket;
+                s_above = cum;
+                break;
+            }
+            cum += count;
         }
-        s_winner = winner;
-        s_above = cum;         // total in bands 0..winner-1
     }
     __syncthreads();
 
-    if (t == s_winner) {
-        const int whi = IDX_NBUCKET - t * PER;
-        long cum = s_above; long numAbove = s_above; int tau = whi - PER;
-        for (int k = whi - 1; k >= whi - PER; k--) {
-            long c = h[k];
-            if (cum + c >= topk) { tau = k; numAbove = cum; break; }
-            cum += c;
+    for (int i = threadIdx.x; i < IDX_GATHER_WARPS * IDX_RADIX_BUCKETS;
+         i += blockDim.x)
+        bins[i] = 0;
+    __syncthreads();
+
+    // Pass 2: low byte among entries in the winning high-byte bucket.
+    const int winningHigh = s_winner;
+    for (int i = threadIdx.x; i < len; i += blockDim.x) {
+        const int key = bf16_key(&scores[(size_t)row * stride + i]);
+        if ((key >> 8) == winningHigh) atomicAdd(&sh[warp][key & 0xff], 1);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int numAbove = s_above;
+        int tau = winningHigh << 8;
+        for (int bucket = IDX_RADIX_BUCKETS - 1; bucket >= 0; bucket--) {
+            int count = 0;
+#pragma unroll
+            for (int w = 0; w < IDX_GATHER_WARPS; w++) count += sh[w][bucket];
+            if (numAbove + count >= topk) {
+                tau |= bucket;
+                break;
+            }
+            numAbove += count;
         }
         int32_t* m = meta + (size_t)row * 4;
         m[0] = tau;                   // threshold bucket
@@ -540,6 +558,112 @@ __global__ void idx_threshold_kernel(
         m[2] = 0;                     // out_count
         m[3] = 0;                     // tie_count
     }
+}
+
+// Long rows need more than one CTA to saturate the GPU. Each split first builds
+// a shared 256-bin histogram, then contributes its nonzero bins to the compact
+// per-row global histogram. LOW=false selects the high key byte; LOW=true only
+// counts low bytes in the winning high-byte bucket recorded in meta.
+template <bool LOW>
+__global__ void idx_radix_hist_split_kernel(
+    const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ row_len,
+    int32_t* __restrict__ scratch, const int32_t* __restrict__ meta,
+    int stride, int topk
+) {
+    const int row = blockIdx.y;
+    const int len = row_len ? row_len[row] : stride;
+    if (len <= topk) return;
+
+    __shared__ int bins[IDX_RADIX_BUCKETS];
+    bins[threadIdx.x] = 0;
+    __syncthreads();
+
+    const int winningHigh = LOW ? meta[(size_t)row * 4] : 0;
+    const __nv_bfloat16* s = scores + (size_t)row * stride;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < len;
+         i += gridDim.x * blockDim.x) {
+        const int key = bf16_key(&s[i]);
+        if (!LOW || (key >> 8) == winningHigh)
+            atomicAdd(&bins[LOW ? (key & 0xff) : (key >> 8)], 1);
+    }
+    __syncthreads();
+
+    const int count = bins[threadIdx.x];
+    if (count)
+        atomicAdd(scratch + (size_t)row * IDX_SCRATCH_I32 + threadIdx.x, count);
+}
+
+// Resolve the high-byte bucket, initialize outputs, and clear the compact
+// histogram for reuse by the low-byte pass.
+__global__ void idx_radix_high_threshold_kernel(
+    int32_t* __restrict__ scratch, int32_t* __restrict__ meta,
+    int32_t* __restrict__ out_idx, __nv_bfloat16* __restrict__ out_scores,
+    const int32_t* __restrict__ row_len,
+    const __nv_bfloat16* __restrict__ scores, int stride, int topk,
+    int cpWorldSize, int cpRank
+) {
+    const int row = blockIdx.x;
+    const int len = row_len ? row_len[row] : stride;
+    const __nv_bfloat16 neg_inf = __float2bfloat16(-INFINITY);
+    int32_t* m = meta + (size_t)row * 4;
+
+    if (len <= topk) {
+        const __nv_bfloat16* s = scores + (size_t)row * stride;
+        for (int i = threadIdx.x; i < topk; i += blockDim.x) {
+            const bool valid = i < len && bf16_key(&s[i]) > 127;
+            out_idx[(size_t)row * topk + i] =
+                valid ? cp_remap(i, cpWorldSize, cpRank) : -1;
+            out_scores[(size_t)row * topk + i] = valid ? s[i] : neg_inf;
+        }
+        if (threadIdx.x == 0) {
+            m[0] = IDX_TAU_IDENTITY; m[1] = 0; m[2] = topk; m[3] = 0;
+        }
+        return;
+    }
+
+    for (int i = threadIdx.x; i < topk; i += blockDim.x) {
+        out_idx[(size_t)row * topk + i] = -1;
+        out_scores[(size_t)row * topk + i] = neg_inf;
+    }
+    int32_t* hist = scratch + (size_t)row * IDX_SCRATCH_I32;
+    if (threadIdx.x == 0) {
+        int above = 0;
+        for (int bucket = IDX_RADIX_BUCKETS - 1; bucket >= 0; bucket--) {
+            if (above + hist[bucket] >= topk) {
+                m[0] = bucket;
+                m[1] = above;
+                break;
+            }
+            above += hist[bucket];
+        }
+        m[2] = 0; m[3] = 0;
+    }
+    __syncthreads();
+    hist[threadIdx.x] = 0;
+}
+
+__global__ void idx_radix_low_threshold_kernel(
+    const int32_t* __restrict__ scratch, int32_t* __restrict__ meta,
+    const int32_t* __restrict__ row_len, int stride, int topk
+) {
+    const int row = blockIdx.x;
+    const int len = row_len ? row_len[row] : stride;
+    if (len <= topk || threadIdx.x != 0) return;
+
+    int32_t* m = meta + (size_t)row * 4;
+    const int high = m[0];
+    int numAbove = m[1];
+    const int32_t* hist = scratch + (size_t)row * IDX_SCRATCH_I32;
+    int tau = high << 8;
+    for (int bucket = IDX_RADIX_BUCKETS - 1; bucket >= 0; bucket--) {
+        if (numAbove + hist[bucket] >= topk) {
+            tau |= bucket;
+            break;
+        }
+        numAbove += hist[bucket];
+    }
+    m[0] = tau;
+    m[1] = topk - numAbove;
 }
 
 // Gather pass A: per-block candidate counts.
@@ -558,15 +682,15 @@ __global__ void idx_threshold_kernel(
 // leaves a flat slot that no rank ever wrote.
 //
 // Integer counts are order-independent, so the shared-memory atomics here are
-// safe. `counts` is [batch, IDX_NBUCKET] i32 (the histogram buffer, dead by this
-// point) using 2 ints per block; num_splits is <= 256 at every call site.
+// safe. `counts` is [batch, IDX_SCRATCH_I32] using 2 ints per block;
+// num_splits is <= 256 at every call site.
 __global__ void idx_gather_count_kernel(
     const __nv_bfloat16* __restrict__ scores, const int32_t* __restrict__ row_len,
     const int32_t* __restrict__ meta, int32_t* __restrict__ counts, int stride
 ) {
     const int row = blockIdx.y;
     const int tau = meta[(size_t)row * 4];
-    int32_t* c = counts + (size_t)row * IDX_NBUCKET + (size_t)blockIdx.x * 2;
+    int32_t* c = counts + (size_t)row * IDX_SCRATCH_I32 + (size_t)blockIdx.x * 2;
     if (tau == IDX_TAU_IDENTITY) {           // block-uniform
         if (threadIdx.x == 0) { c[0] = 0; c[1] = 0; }
         return;
@@ -624,7 +748,7 @@ __global__ void idx_gather_write_kernel(
     const int hi = min(lo + chunk, len);
 
     // Exclusive prefix over the preceding blocks' counts -> this block's bases.
-    const int32_t* c = counts + (size_t)row * IDX_NBUCKET;
+    const int32_t* c = counts + (size_t)row * IDX_SCRATCH_I32;
     __shared__ int sAboveBase, sTieBase;
     if (threadIdx.x == 0) {
         int a = 0, t = 0;
@@ -742,15 +866,24 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     int cpWorldSize, int cpRank) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
-    cudaMemsetAsync(hist, 0, (size_t)batch * IDX_NBUCKET * sizeof(int32_t), stream);
-    cudaMemsetAsync(meta, 0, (size_t)batch * 4 * sizeof(int32_t), stream);
     dim3 grid(num_splits, batch);
-    idx_hist_kernel<<<grid, 256, 0, stream>>>(
-        (const __nv_bfloat16*)scores, row_len, hist, stride);
-    idx_threshold_kernel<<<batch, 256, 0, stream>>>(hist, meta, out_idx, out_scores, row_len, (const __nv_bfloat16*)scores, stride, topk, cpWorldSize, cpRank);
-    // hist is dead once the threshold pass has read it, so the two-pass gather
-    // borrows it for its per-block counts (2 ints per block) instead of taking
-    // another caller-owned scratch buffer through the API.
+    if (stride <= 32768) {
+        idx_radix_threshold_kernel<<<batch, 256, 0, stream>>>(
+            meta, out_idx, out_scores, row_len, (const __nv_bfloat16*)scores,
+            stride, topk, cpWorldSize, cpRank);
+    } else {
+        cudaMemset2DAsync(hist, (size_t)IDX_SCRATCH_I32 * sizeof(int32_t), 0,
+                          (size_t)IDX_RADIX_BUCKETS * sizeof(int32_t), batch, stream);
+        idx_radix_hist_split_kernel<false><<<grid, 256, 0, stream>>>(
+            (const __nv_bfloat16*)scores, row_len, hist, meta, stride, topk);
+        idx_radix_high_threshold_kernel<<<batch, 256, 0, stream>>>(
+            hist, meta, out_idx, out_scores, row_len,
+            (const __nv_bfloat16*)scores, stride, topk, cpWorldSize, cpRank);
+        idx_radix_hist_split_kernel<true><<<grid, 256, 0, stream>>>(
+            (const __nv_bfloat16*)scores, row_len, hist, meta, stride, topk);
+        idx_radix_low_threshold_kernel<<<batch, 32, 0, stream>>>(
+            hist, meta, row_len, stride, topk);
+    }
     idx_gather_count_kernel<<<grid, IDX_GATHER_THREADS, 0, stream>>>(
         (const __nv_bfloat16*)scores, row_len, meta, hist, stride);
     idx_gather_write_kernel<<<grid, IDX_GATHER_THREADS, 0, stream>>>(
@@ -931,9 +1064,9 @@ __global__ void idx_score_kernel(
     }
 }
 
-// SM120 decode scorer for the production indexer shape.  The histogram is dead
-// until glm_topk_from_scores clears it, so each query borrows the start of its
-// histogram row for an FP8 Q matrix followed by effective FP32 head weights.
+// SM120 decode scorer for the production indexer shape. The selector scratch is
+// idle during scoring, so each query uses its row for an FP8 Q matrix followed by
+// effective FP32 head weights.
 namespace idxfp8 {
 constexpr int NHEADS = 32;
 constexpr int HD = 128;
@@ -1000,7 +1133,7 @@ __global__ void quantize_q_kernel(const __nv_bfloat16* __restrict__ q,
     const int tid = threadIdx.x;
     const int head = tid >> 3;
     const int lane = tid & 7;
-    uint8_t* q8 = reinterpret_cast<uint8_t*>(hist + (size_t)qi * IDX_NBUCKET);
+    uint8_t* q8 = reinterpret_cast<uint8_t*>(hist + (size_t)qi * IDX_SCRATCH_I32);
     float* ew = reinterpret_cast<float*>(q8 + Q_BYTES);
     const __nv_bfloat16* src = q + (size_t)qi * Q_BYTES + head * HD;
 
@@ -1057,7 +1190,7 @@ __global__ void score_kernel(
         qSeqPos, nQuery, 0, kvLen, globalKvLen, cpW, cpRank) + 1;
     if (blockIdx.x == 0 && threadIdx.x == 0) row_len[qi] = numValid;
 
-    const uint8_t* tmp = reinterpret_cast<const uint8_t*>(hist + (size_t)qi * IDX_NBUCKET);
+    const uint8_t* tmp = reinterpret_cast<const uint8_t*>(hist + (size_t)qi * IDX_SCRATCH_I32);
     const float* ew = reinterpret_cast<const float*>(tmp + Q_BYTES);
     extern __shared__ uint8_t smem[];
     uint8_t* sq = smem;
@@ -1140,9 +1273,9 @@ __global__ void score_kernel(
 }
 } // namespace idxfp8
 
-// Full v2 indexer top-k: multi-block score -> histogram select. Drop-in
+// Full v2 indexer top-k: multi-block score -> radix select. Drop-in
 // replacement for glm_indexer_score_topk with the same out_idx semantics.
-// scratch: scores [totalQ, maxKv] bf16, rowLen [totalQ] i32, hist [totalQ,65536]
+// scratch: scores [totalQ, maxKv] bf16, rowLen [totalQ] i32, hist [totalQ,1056]
 // i32, meta [totalQ, 4] i32.
 void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     __nv_bfloat16* out_scores,
@@ -1215,8 +1348,8 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
 // Replaces the v1 serial heap kernel for prefill. Scores are computed once
 // into a [totalQ, maxKv] BF16 buffer (same as v2), then a 2-level histogram
 // (1024 coarse + 64 fine = 65536 total buckets) selects the exact top-K.
-// This avoids v2's 65536-bucket histogram (1.07 GB) while keeping a single
-// scoring pass.
+// This remains the high-throughput path for large query counts while keeping a
+// single scoring pass and bounded histogram scratch.
 //
 // Pipeline (6 kernel launches, same stream):
 //   1. score into buffer     — compute score per position, write to [totalQ, maxKv]
@@ -1237,7 +1370,7 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
 // ---------------------------------------------------------------------------
 
 #define IDX_COARSE_BUCKETS 1024
-#define IDX_FINE_BUCKETS 64   // IDX_NBUCKET / IDX_COARSE_BUCKETS
+#define IDX_FINE_BUCKETS 64   // 65536 bf16 keys / IDX_COARSE_BUCKETS
 
 // ---------------------------------------------------------------------------
 // Tensor-core (mma.sync m16n8k16 bf16) primitives for the score kernel.

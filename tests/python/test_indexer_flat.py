@@ -165,7 +165,7 @@ def _run_topk(glm, mode, q, k_data, weights, caches, qo_indptr, topk, max_kv,
     common = dict(kv_token_indptr=kv_token_indptr)
 
     if mode == "v2":
-        hist = torch.empty(total_q, 65536, dtype=torch.int32, device=q.device)
+        hist = torch.empty(total_q, 1056, dtype=torch.int32, device=q.device)
         glm.indexer_score_topk_v2(
             out, out_scores, q, k_data, weights,
             caches["page_indices"], caches["page_indptr"], caches["last_page_len"], qo_indptr,

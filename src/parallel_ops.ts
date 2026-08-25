@@ -36,7 +36,7 @@ export const CP_MERGE_PULL = process.env.GLM_CP_MERGE_PULL === "1";
 // depend on. That dependency has not been found, and this sort is currently
 // masking it: any other producer of unsorted top-k indices would corrupt too.
 // Costs ~9% of decode throughput (measured 100.4 -> 92.1 tok/s at 8-way CP).
-export const CP_TOPK_SORT = process.env.GLM_CP_TOPK_SORT !== "0";
+export const CP_TOPK_SORT = process.env.GLM_CP_TOPK_SORT === "1";
 
 export class ParallelTensor extends Tensor {
   parallelism: TensorParallelism;

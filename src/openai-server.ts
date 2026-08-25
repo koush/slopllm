@@ -5,7 +5,7 @@ import { CaptureManager } from "./capture-manager";
 import { type OutputParserEvent } from "./chat-model-parser";
 import { ChatModel, ChatCache, ChatTemplateKwargs, loadGenerationConfig, loadMaxPositionEmbeddings, type MtpDraftBatch, SamplingParams, type TokenSelector, Tokenizer } from "./chat_model";
 import { DeviceOps } from "./device_ops";
-import { executePlan, ExecutionWorkspace } from "./execution-workspace";
+import { executePlan, type ExecutionPhase, ExecutionWorkspace } from "./execution-workspace";
 import { mtpTotalTreeNodes } from "./glm51_model";
 import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
@@ -242,6 +242,11 @@ interface ServerMetrics {
   runningRequests: number;
   generationTokensTotal: number;
   promptTokensTotal: number;
+  specDecodeNumDraftsTotal: number;
+  specDecodeNumDraftTokensTotal: number;
+  specDecodeNumAcceptedTokensTotal: number;
+  mtpPhaseSeconds: Map<string, number>;
+  mtpPhaseCount: Map<string, number>;
   requestSuccessTotal: number;
   prefillTimeSecondsCount: number;
   prefillTimeSecondsSum: number;
@@ -393,6 +398,13 @@ async function generateMtpBatches(
   let nextStagingKey = 0;
   let admittedRequests = 0;
   const numVerificationTokens = mtpTotalTreeNodes(topks) + 1;
+  const observeMtpPhase = (phase: ExecutionPhase, elapsedSeconds: number): void => {
+    if (!phase.timingName) return;
+    const batchSize = phase.states[0]?.batchSize ?? 0;
+    const key = `${phase.timingName}|${batchSize}`;
+    metrics.mtpPhaseSeconds.set(key, (metrics.mtpPhaseSeconds.get(key) ?? 0) + elapsedSeconds);
+    metrics.mtpPhaseCount.set(key, (metrics.mtpPhaseCount.get(key) ?? 0) + 1);
+  };
   const selectTokens: TokenSelector = (logits: Tensor): Tensor => samplingWorkspace.sample(logits);
   const updateSamplingParams = (params: SamplingParams[]): void => {
     samplingWorkspace.updateSampler(params, params.map(() => []));
@@ -473,7 +485,7 @@ async function generateMtpBatches(
           chunkSize,
           nextStagingKey,
           async (inputIds, nextTokens) => {
-            await executePlan(captureManager, ws, model.planPrefillMtpChunk!(ws, cache, inputIds, nextTokens));
+            await executePlan(captureManager, ws, model.planPrefillMtpChunk!(ws, cache, inputIds, nextTokens), observeMtpPhase);
           },
           row => finish(row.request),
         );
@@ -503,6 +515,7 @@ async function generateMtpBatches(
           captureManager,
           ws,
           model.planPrefillMtpDraftExtend(ws, cache, mtpInputIds, topks, selectTokens),
+          observeMtpPhase,
         )).result;
         const prefillSeconds = (performance.now() - prefillStart) / 1000;
         metrics.prefillTimeSecondsCount += newCount;
@@ -520,8 +533,11 @@ async function generateMtpBatches(
       const verificationParams = requests.flatMap(req =>
         Array.from({ length: numVerificationTokens }, () => req.samplingParams));
       updateSamplingParams(verificationParams);
-      const step = await executePlan(captureManager, ws, model.planTargetVerification(ws, cache, draft!, selectTokens));
+      const step = await executePlan(captureManager, ws, model.planTargetVerification(ws, cache, draft!, selectTokens), observeMtpPhase);
       draft = step.result.draft;
+      metrics.specDecodeNumDraftsTotal += requests.length;
+      metrics.specDecodeNumDraftTokensTotal += step.result.numDraftTokens * requests.length;
+      metrics.specDecodeNumAcceptedTokensTotal += step.result.numAccepted.reduce((sum, count) => sum + count, 0);
       for (let i = 0; i < requests.length; i++) {
         const tokens = step.result.tokens[i];
         pagedKV.reportTokens(i, tokens);
@@ -831,6 +847,14 @@ function sendMetrics(
   const kvUsage = pagedKV.maxPages === 0
     ? 0
     : (pagedKV.maxPages - pagedKV.availablePages.length) / pagedKV.maxPages;
+  const mtpPhaseLines = Array.from(metrics.mtpPhaseSeconds, ([key, seconds]) => {
+    const [phase, batchSize] = key.split("|");
+    const labels = `{phase="${phase}",batch_size="${batchSize}"}`;
+    return [
+      `glm:mtp_phase_seconds_total${labels} ${seconds}`,
+      `glm:mtp_phase_count_total${labels} ${metrics.mtpPhaseCount.get(key) ?? 0}`,
+    ];
+  }).flat();
   const lines = [
     "# HELP vllm:num_requests_running GLM.js requests admitted for model execution.",
     "# TYPE vllm:num_requests_running gauge",
@@ -841,6 +865,20 @@ function sendMetrics(
     "# HELP vllm:generation_tokens_total GLM.js sampled completion tokens.",
     "# TYPE vllm:generation_tokens_total counter",
     `vllm:generation_tokens_total ${metrics.generationTokensTotal}`,
+    "# HELP vllm:spec_decode_num_drafts_total GLM.js MTP draft sequences verified.",
+    "# TYPE vllm:spec_decode_num_drafts_total counter",
+    `vllm:spec_decode_num_drafts_total ${metrics.specDecodeNumDraftsTotal}`,
+    "# HELP vllm:spec_decode_num_draft_tokens_total GLM.js MTP draft tokens proposed.",
+    "# TYPE vllm:spec_decode_num_draft_tokens_total counter",
+    `vllm:spec_decode_num_draft_tokens_total ${metrics.specDecodeNumDraftTokensTotal}`,
+    "# HELP vllm:spec_decode_num_accepted_tokens_total GLM.js MTP draft tokens accepted.",
+    "# TYPE vllm:spec_decode_num_accepted_tokens_total counter",
+    `vllm:spec_decode_num_accepted_tokens_total ${metrics.specDecodeNumAcceptedTokensTotal}`,
+    "# HELP glm:mtp_phase_seconds_total GPU-complete wall time spent in MTP execution phases.",
+    "# TYPE glm:mtp_phase_seconds_total counter",
+    "# HELP glm:mtp_phase_count_total Completed MTP execution phases.",
+    "# TYPE glm:mtp_phase_count_total counter",
+    ...mtpPhaseLines,
     "# HELP vllm:prompt_tokens_total GLM.js prompt tokens admitted for prefill.",
     "# TYPE vllm:prompt_tokens_total counter",
     `vllm:prompt_tokens_total ${metrics.promptTokensTotal}`,
@@ -951,6 +989,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     runningRequests: 0,
     generationTokensTotal: 0,
     promptTokensTotal: 0,
+    specDecodeNumDraftsTotal: 0,
+    specDecodeNumDraftTokensTotal: 0,
+    specDecodeNumAcceptedTokensTotal: 0,
+    mtpPhaseSeconds: new Map(),
+    mtpPhaseCount: new Map(),
     requestSuccessTotal: 0,
     prefillTimeSecondsCount: 0,
     prefillTimeSecondsSum: 0,

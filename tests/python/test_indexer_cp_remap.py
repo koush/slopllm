@@ -13,7 +13,7 @@ from test_indexer_score_topk import _setup_random_kv, _get_valid_kv_len
 from test_indexer_score_topk_v2 import _ref_scores, _check, _run_v2
 from test_indexer_score_topk_prefill import _run_prefill
 
-NBUCKET = 65536
+TOPK_SCRATCH_I32 = 1056
 
 
 def _run_v2_cp(glm, s, topk, causal, device, cp_world_size, cp_rank):
@@ -27,7 +27,7 @@ def _run_v2_cp(glm, s, topk, causal, device, cp_world_size, cp_rank):
     out_scores = torch.full((total_q, topk), float('-inf'), dtype=torch.bfloat16, device=device)
     scores = torch.zeros(total_q, max_kv, dtype=torch.bfloat16, device=device)
     row_len = torch.zeros(total_q, dtype=torch.int32, device=device)
-    hist = torch.empty(total_q, NBUCKET, dtype=torch.int32, device=device)
+    hist = torch.empty(total_q, TOPK_SCRATCH_I32, dtype=torch.int32, device=device)
     meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
     n_heads, head_dim = q.shape[1], q.shape[2]
     num_splits = min(256, max(1, (max_kv + 255) // 256))
@@ -265,7 +265,7 @@ def _run_cp_shard(glm, s, topk, device, kernel, mask=None):
             s["page_indices"], s["page_indptr"], s["last_page_len"], s["qo_indptr"],
             s["scale"], total_q, s["q"].shape[1], s["q"].shape[2], s["page_size"], topk, True)
     if kernel == "v2":
-        hist = torch.empty(total_q, NBUCKET, dtype=torch.int32, device=device)
+        hist = torch.empty(total_q, TOPK_SCRATCH_I32, dtype=torch.int32, device=device)
         glm.indexer_score_topk_v2(*args, scores, row_len, hist, meta, max_kv, num_splits, **common)
     else:
         coarse = torch.empty(total_q, 1024, dtype=torch.int32, device=device)

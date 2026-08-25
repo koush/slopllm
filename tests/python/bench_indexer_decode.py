@@ -27,7 +27,7 @@ from helpers import GlmOps, pack_indexer_k
 N_HEADS = 32
 HEAD_DIM = 128
 GLOBAL_PAGE_SIZE = 64
-NBUCKET = 65536
+TOPK_SCRATCH_I32 = 1056
 ALL_STAGES = ("score", "merge", "sort", "paged", "flat")
 
 
@@ -143,7 +143,9 @@ class IndexerDecodeCase:
             batch, self.max_kv, dtype=torch.bfloat16, device=device
         )
         self.row_len = torch.empty(batch, dtype=torch.int32, device=device)
-        self.hist = torch.empty(batch, NBUCKET, dtype=torch.int32, device=device)
+        self.hist = torch.empty(
+            batch, TOPK_SCRATCH_I32, dtype=torch.int32, device=device
+        )
         self.meta = torch.empty(batch, 4, dtype=torch.int32, device=device)
 
         # Model the post-AllGather buffers: each rank contributes one contiguous

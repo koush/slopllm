@@ -7,7 +7,7 @@ import torch
 from helpers import pack_indexer_k, unpack_indexer_k
 
 
-NBUCKET = 65536
+TOPK_SCRATCH_I32 = 1056
 
 
 def _quantize_q(q):
@@ -39,7 +39,7 @@ def _run(glm, q, k_data, packed_rows, weights, page_indices, page_indptr,
     out_scores = torch.full((1, topk), -torch.inf, dtype=torch.bfloat16, device=q.device)
     scores = torch.full((1, max_kv), -torch.inf, dtype=torch.bfloat16, device=q.device)
     row_len = torch.zeros(1, dtype=torch.int32, device=q.device)
-    hist = torch.empty(1, NBUCKET, dtype=torch.int32, device=q.device)
+    hist = torch.empty(1, TOPK_SCRATCH_I32, dtype=torch.int32, device=q.device)
     meta = torch.empty(1, 4, dtype=torch.int32, device=q.device)
     glm.indexer_score_topk_v2(
         out, out_scores, q, k_data, weights, page_indices, page_indptr,

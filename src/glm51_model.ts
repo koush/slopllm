@@ -1107,6 +1107,7 @@ export class Glm51Model extends ChatModel {
       states: [state],
       inputs: {},
       captureKey: [],
+      timingName: "prefill_chunk",
       run: () => {
         using sharedSlots = new UsingHolder<Tensor>(undefined!);
         using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
@@ -1152,6 +1153,7 @@ export class Glm51Model extends ChatModel {
       states: [prefillState],
       inputs: {},
       captureKey: [],
+      timingName: "draft_extend",
       run: () => {
         using sharedSlots = new UsingHolder<Tensor>(undefined!);
         using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
@@ -1244,6 +1246,7 @@ export class Glm51Model extends ChatModel {
         sharedSlotsLength: sharedSlotsLength,
       },
       captureKey: [],
+      timingName: "draft",
       run: (inputs) => {
         const treeHost = ws.allocPinned([ws.maxBatch * numTreeNodes], "I32");
         this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
@@ -1305,6 +1308,7 @@ export class Glm51Model extends ChatModel {
       states: [state],
       inputs: {},
       captureKey: ["glm51-mtp-verify", topks.join(","), selectTokens.captureKey ?? "greedy"],
+      timingName: "verification",
       run: () => {
         const seed = ws.alloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16");
         const mtpHiddenStaging = ws.alloc([ws.maxBatch * numVerificationTokens, this.cfg.hiddenSize], "BF16");
@@ -1499,6 +1503,7 @@ export class Glm51Model extends ChatModel {
       states: draftPlan.states,
       inputs: draftInputs,
       captureKey: ["glm51-mtp-draft", topks.join(","), `batchSize:${batchSize}`],
+      timingName: "draft",
       run: (inputs) => {
         this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
       },

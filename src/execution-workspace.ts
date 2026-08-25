@@ -20,6 +20,7 @@ export interface ExecutionPhase<T = TensorTree> {
   readonly states: readonly ExecutionState[];
   readonly inputs: { [name: string]: Tensor };
   readonly captureKey: readonly (string | number)[];
+  readonly timingName?: string;
   run(inputs: { [name: string]: Tensor }): T;
 }
 
@@ -34,7 +35,7 @@ export function* executionPhase<T extends TensorTree>(phase: ExecutionPhase<T>):
   return (yield phase) as T;
 }
 
-export async function executePlan<T>(captureManager: CaptureManager, ws: ExecutionWorkspace, plan: ExecutionPlan<T>): Promise<ExecutionPlanResult<T>> {
+export async function executePlan<T>(captureManager: CaptureManager, ws: ExecutionWorkspace, plan: ExecutionPlan<T>, onPhase?: (phase: ExecutionPhase, elapsedSeconds: number) => void): Promise<ExecutionPlanResult<T>> {
   let warmup = false;
   let step = plan.next();
 
@@ -47,6 +48,7 @@ export async function executePlan<T>(captureManager: CaptureManager, ws: Executi
         warmup ||= !ExecutionState.isCaptured(captureManager, phase.states, captureKey);
       }
 
+      const phaseStart = performance.now();
       const phaseResult = ExecutionState.captureAll(
         captureManager,
         phase.states,
@@ -56,6 +58,7 @@ export async function executePlan<T>(captureManager: CaptureManager, ws: Executi
       );
 
       await captureManager.ops.synchronizeAsync();
+      onPhase?.(phase, (performance.now() - phaseStart) / 1000);
 
       ws.clearTracking([phase.inputs, phaseResult as TensorTree]);
       step = plan.next(phaseResult);

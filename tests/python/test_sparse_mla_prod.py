@@ -183,10 +183,10 @@ def test_indexer_score_topk_prod_dims(prod_setup, device):
     out_scores = torch.full((total_q, TOPK), float('-inf'), dtype=torch.bfloat16, device=device)
 
     max_kv = s['seq_len']
-    NBUCKET = 1024
+    TOPK_SCRATCH_I32 = 1056
     scores = torch.empty(total_q, max_kv, dtype=torch.bfloat16, device=device)
     row_len = torch.zeros(total_q, dtype=torch.int32, device=device)
-    hist = torch.empty(total_q, NBUCKET, dtype=torch.int32, device=device)
+    hist = torch.empty(total_q, TOPK_SCRATCH_I32, dtype=torch.int32, device=device)
     meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
     num_splits = min(256, max(1, (max_kv + 255) // 256))
 
@@ -261,10 +261,10 @@ def test_full_pipeline_decode_prod(prod_setup, device):
     out_idx = torch.full((total_q, TOPK), -1, dtype=torch.int32, device=device)
     out_scores = torch.full((total_q, TOPK), float('-inf'), dtype=torch.bfloat16, device=device)
     max_kv = s['seq_len']
-    NBUCKET = 1024
+    TOPK_SCRATCH_I32 = 1056
     scores = torch.empty(total_q, max_kv, dtype=torch.bfloat16, device=device)
     row_len = torch.zeros(total_q, dtype=torch.int32, device=device)
-    hist = torch.empty(total_q, NBUCKET, dtype=torch.int32, device=device)
+    hist = torch.empty(total_q, TOPK_SCRATCH_I32, dtype=torch.int32, device=device)
     meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
     num_splits = min(256, max(1, (max_kv + 255) // 256))
     glm.indexer_score_topk_v2(

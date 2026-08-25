@@ -1,4 +1,4 @@
-"""Exact large-K top-K selector over non-negative bf16 scores (histogram).
+"""Exact large-K top-K selector over bf16 scores (two-pass radix selection).
 
 Validates glm_topk_from_scores against the exact top-K definition (under bf16
 ties) and measures throughput at long context. This is the selection half of the
@@ -11,7 +11,7 @@ import pytest
 import torch
 from helpers import GlmOps  # noqa: F401
 
-NBUCKET = 65536
+TOPK_SCRATCH_I32 = 1056
 
 
 def _select(glm, scores_bf16, N_per_row, topk, num_splits):
@@ -24,7 +24,7 @@ def _select_with_scores(glm, scores_bf16, N_per_row, topk, num_splits):
     dev = scores_bf16.device
     out = torch.full((batch, topk), -2, dtype=torch.int32, device=dev)
     out_scores = torch.full((batch, topk), float('nan'), dtype=torch.bfloat16, device=dev)
-    hist = torch.empty(batch, NBUCKET, dtype=torch.int32, device=dev)
+    hist = torch.empty(batch, TOPK_SCRATCH_I32, dtype=torch.int32, device=dev)
     meta = torch.empty(batch, 4, dtype=torch.int32, device=dev)
     row_len = None
     if N_per_row is not None:
@@ -109,6 +109,25 @@ def test_topk_from_scores_pairs_scores_with_indices(glm, device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_topk_from_scores_long_stride_short_row(glm, device):
+    """The long-row dispatch must bypass radix scans for short live rows."""
+    N, topk = 65536, 2048
+    torch.manual_seed(19)
+    scores = torch.randn(2, N, device=device).to(torch.bfloat16)
+    row_len = [731, N]
+    idx, val = _select_with_scores(glm, scores, row_len, topk, 64)
+
+    expected = torch.arange(row_len[0], device=device, dtype=torch.int32)
+    assert torch.equal(idx[0, :row_len[0]], expected)
+    assert torch.all(idx[0, row_len[0]:] == -1)
+    assert torch.equal(
+        val[0, :row_len[0]].view(torch.int16),
+        scores[0, :row_len[0]].view(torch.int16),
+    )
+    _check_exact_topk(idx[1], scores[1], N, topk)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_topk_from_scores_perf(glm, device):
     """Throughput at 200k context, batch 1 (the decode-critical case)."""
     N, topk, batch = 200000, 2048, 1
@@ -117,7 +136,7 @@ def test_topk_from_scores_perf(glm, device):
     num_splits = 256
     out = torch.full((batch, topk), -2, dtype=torch.int32, device=device)
     out_scores = torch.empty(batch, topk, dtype=torch.bfloat16, device=device)
-    hist = torch.empty(batch, NBUCKET, dtype=torch.int32, device=device)
+    hist = torch.empty(batch, TOPK_SCRATCH_I32, dtype=torch.int32, device=device)
     meta = torch.empty(batch, 4, dtype=torch.int32, device=device)
     def call():
         glm.topk_from_scores(out, out_scores, scores, None, hist, meta,
