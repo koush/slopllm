@@ -1,4 +1,5 @@
 import { CaptureManager } from "./capture-manager";
+import fs from "node:fs";
 import { type ChatCache, type ChatModel, type Tokenizer } from "./chat_model";
 import { type DeviceOps } from "./device_ops";
 import { executePlan, ExecutionWorkspace } from "./execution-workspace";
@@ -12,6 +13,7 @@ const PROMPTS = [
   "tell me about india",
   "tell me a 1000 word story",
 ];
+const PREFILL_CHUNK_SIZE = 8192;
 
 interface Args extends ModelCliArgs {
   batchSize: number;
@@ -21,7 +23,18 @@ interface Args extends ModelCliArgs {
   mtpDraftTopk: number[];
   noCudaGraph: boolean;
   noMtp: boolean;
+  contextLen?: number;
+  file?: string;
+  ignoreEos: boolean;
+  instruction?: string;
   prompt?: string;
+}
+
+function parseLength(value: string): number {
+  const match = /^(\d+)([kKmM]?)$/.exec(value);
+  if (!match) return NaN;
+  const scale = match[2].toLowerCase() === "k" ? 1024 : match[2].toLowerCase() === "m" ? 1024 * 1024 : 1;
+  return parseInt(match[1], 10) * scale;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -34,6 +47,10 @@ function parseArgs(argv: string[]): Args {
     mtpDraftTopk: [1, 1, 1],
     noCudaGraph: false,
     noMtp: false,
+    contextLen: undefined,
+    file: undefined,
+    ignoreEos: false,
+    instruction: undefined,
     prompt: undefined,
   };
 
@@ -44,13 +61,29 @@ function parseArgs(argv: string[]): Args {
     else if (arg === "--max-seq-len" && i + 1 < argv.length) args.maxSeqLen = parseInt(argv[++i], 10);
     else if (arg === "--max-pages" && i + 1 < argv.length) args.maxPages = parseInt(argv[++i], 10);
     else if (arg === "--prompt" && i + 1 < argv.length) args.prompt = argv[++i];
+    else if (arg === "--file" && i + 1 < argv.length) args.file = argv[++i];
+    else if (arg === "--context-len" && i + 1 < argv.length) args.contextLen = parseLength(argv[++i]);
+    else if (arg === "--instruction" && i + 1 < argv.length) args.instruction = argv[++i];
     else if (arg === "--mtp-draft-topk" && i + 1 < argv.length) {
       args.mtpDraftTopk = argv[++i].split(",").map(value => parseInt(value.trim(), 10));
     } else if (arg === "--no-cuda-graph") args.noCudaGraph = true;
     else if (arg === "--no-mtp") args.noMtp = true;
+    else if (arg === "--ignore-eos") args.ignoreEos = true;
   }
 
-  const maxBatchSize = args.prompt ? 8 : PROMPTS.length;
+  if (args.prompt && args.file) {
+    throw new Error("--prompt and --file cannot be used together");
+  }
+  if (args.contextLen !== undefined && (!Number.isInteger(args.contextLen) || args.contextLen < 1)) {
+    throw new Error(`Invalid --context-len: ${args.contextLen}`);
+  }
+  if (args.contextLen !== undefined && !args.file) {
+    throw new Error("--context-len requires --file");
+  }
+  if (args.instruction !== undefined && !args.file) {
+    throw new Error("--instruction requires --file");
+  }
+  const maxBatchSize = args.prompt || args.file ? 8 : PROMPTS.length;
   if (!Number.isInteger(args.batchSize) || args.batchSize < 1 || args.batchSize > maxBatchSize) {
     throw new Error(`--batch-size must be between 1 and ${maxBatchSize}`);
   }
@@ -69,6 +102,13 @@ function parseArgs(argv: string[]): Args {
   if (!args.useGlm51 || (!args.mtp && !args.noMtp)) {
     throw new Error("run_glm51_multiple_mtp requires --glm51 and either --mtp or --no-mtp");
   }
+  if (args.contextLen !== undefined) {
+    args.maxSeqLen = Math.max(args.maxSeqLen, args.contextLen + args.maxNewTokens);
+    const requiredPages = args.file && args.batchSize > 1
+      ? Math.ceil(args.contextLen / 64) + args.batchSize * (Math.ceil(args.maxNewTokens / 64) + 1)
+      : args.batchSize * Math.ceil((args.contextLen + args.maxNewTokens) / 64);
+    args.maxPages = Math.max(args.maxPages, requiredPages);
+  }
 
   return args;
 }
@@ -83,6 +123,54 @@ function tokenizePrompt(tokenizer: Tokenizer, prompt: string): number[] {
   } catch {
     return tokenizer.encode(`<|user|>\n${prompt}\n\n\n`, { add_special_tokens: false });
   }
+}
+
+function buildFilePromptIds(tokenizer: Tokenizer, file: string, contextLen?: number, instruction?: string): number[] {
+  const content = fs.readFileSync(file, "utf8");
+  const promptFor = (source: string) => instruction ? `${source}\n\n${instruction}` : source;
+  if (contextLen === undefined) return tokenizePrompt(tokenizer, promptFor(content));
+
+  const contentIds = tokenizer.encode(content, { add_special_tokens: false });
+  const fixedPromptLen = tokenizePrompt(tokenizer, promptFor("")).length;
+  if (contentIds.length + fixedPromptLen < contextLen) {
+    throw new Error(`${file} has approximately ${contentIds.length + fixedPromptLen} prompt tokens, fewer than --context-len ${contextLen}`);
+  }
+
+  const tokenizePrefix = (count: number) => {
+    const prefix = tokenizer.decode(contentIds.slice(0, count), { skip_special_tokens: false });
+    return tokenizePrompt(tokenizer, promptFor(prefix));
+  };
+  let contentTokenCount = Math.min(contentIds.length, Math.max(0, contextLen - fixedPromptLen));
+  const tried = new Set<number>();
+  for (let attempt = 0; attempt < 16; attempt++) {
+    if (tried.has(contentTokenCount)) break;
+    tried.add(contentTokenCount);
+    const ids = tokenizePrefix(contentTokenCount);
+    if (ids.length === contextLen) return ids;
+    contentTokenCount = Math.max(0, Math.min(contentIds.length, contentTokenCount + contextLen - ids.length));
+  }
+
+  for (let delta = -64; delta <= 64; delta++) {
+    const candidate = contentTokenCount + delta;
+    if (candidate < 0 || candidate > contentIds.length || tried.has(candidate)) continue;
+    const ids = tokenizePrefix(candidate);
+    if (ids.length === contextLen) return ids;
+  }
+  throw new Error(`Unable to construct an exact ${contextLen}-token chat prompt from ${file}`);
+}
+
+function prepareInputs(tokenizer: Tokenizer, args: Args): { prompts: string[]; inputIds: number[][] } {
+  if (args.file) {
+    const ids = buildFilePromptIds(tokenizer, args.file, args.contextLen, args.instruction);
+    const label = `${args.file} (${ids.length} prompt tokens)`;
+    console.log(`File prompt: ${label}`);
+    return {
+      prompts: Array(args.batchSize).fill(label),
+      inputIds: Array.from({ length: args.batchSize }, () => ids.slice()),
+    };
+  }
+  const prompts = args.prompt ? Array(args.batchSize).fill(args.prompt) : PROMPTS.slice(0, args.batchSize);
+  return { prompts, inputIds: prompts.map(prompt => tokenizePrompt(tokenizer, prompt)) };
 }
 
 function freeResources(model: ChatModel | undefined, cache: ChatCache | undefined, ws: ExecutionWorkspace | undefined, glm: DeviceOps, gpuDevices: GlmOps[]): void {
@@ -105,32 +193,63 @@ function freeResources(model: ChatModel | undefined, cache: ChatCache | undefine
 }
 
 async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args): Promise<void> {
-  const prompts = args.prompt ? Array(args.batchSize).fill(args.prompt) : PROMPTS.slice(0, args.batchSize);
-  const inputIds = prompts.map(prompt => tokenizePrompt(model.tokenizer, prompt));
+  const { prompts, inputIds } = prepareInputs(model.tokenizer, args);
   const longestPrompt = Math.max(...inputIds.map(ids => ids.length));
   if (longestPrompt + args.maxNewTokens > args.maxSeqLen) {
     throw new Error(`Prompt plus generation budget exceeds --max-seq-len (${longestPrompt} + ${args.maxNewTokens} > ${args.maxSeqLen})`);
   }
 
-  cache.reset(args.batchSize);
-  const suffixIds = inputIds.map((ids, batch) => cache.prefixMatch(batch, ids));
-  const mtpInputIds = model.prepareMtpInput(cache, suffixIds);
+  const sharePrefill = args.file !== undefined && args.batchSize > 1;
+  cache.reset(sharePrefill ? 1 : args.batchSize);
 
   using captureManager = new CaptureManager(glm);
   captureManager.disabled = args.noCudaGraph;
 
+  if (args.file) {
+    const prefillStarted = performance.now();
+    let offset = 0;
+    while (inputIds[0].length - offset > PREFILL_CHUNK_SIZE) {
+      const chunkIds = inputIds[0].slice(offset, offset + PREFILL_CHUNK_SIZE);
+      const nextToken = inputIds[0][offset + PREFILL_CHUNK_SIZE];
+      await executePlan(captureManager, ws, model.planPrefillMtpChunk(ws, cache, [chunkIds], [nextToken]));
+      cache.reportTokens(0, chunkIds);
+      offset += chunkIds.length;
+    }
+    console.log(`Prefilled ${offset} tokens in ${((performance.now() - prefillStarted) / 1000).toFixed(1)}s before final draft extension.`);
+  }
+
+  const suffixIds = sharePrefill || args.file
+    ? [cache.prefixMatch(0, inputIds[0])]
+    : inputIds.map((ids, batch) => cache.prefixMatch(batch, ids));
+  const mtpInputIds = model.prepareMtpInput(cache, suffixIds);
+
   let currentDraft = (await executePlan(captureManager, ws, model.planPrefillMtpDraftExtend(ws, cache, mtpInputIds, args.mtpDraftTopk))).result;
+  if (sharePrefill) {
+    currentDraft = {
+      targetTokens: Array(args.batchSize).fill(currentDraft.targetTokens[0]),
+      treeTokens: Array.from({ length: args.batchSize }, () => [...currentDraft.treeTokens[0]]),
+      topks: currentDraft.topks,
+    };
+  }
   const currentTokens = [...currentDraft.targetTokens];
   const generated = currentTokens.map(token => [token]);
-  const finished = currentTokens.map(token => model.eosIds.has(token) || args.maxNewTokens === 1);
+  const finished = currentTokens.map(token => (!args.ignoreEos && model.eosIds.has(token)) || args.maxNewTokens === 1);
   const mtpStats = new MtpStats(args.mtpDraftTopk.length);
   let firstPostWarmupTime = 0;
   let lastTokenTime = 0;
   let postWarmupTokenCount = 0;
 
-  for (let batch = 0; batch < args.batchSize; batch++) {
-    cache.reportTokens(batch, suffixIds[batch]);
-    cache.reportTokens(batch, [currentTokens[batch]]);
+  cache.reportTokens(0, suffixIds[0]);
+  cache.reportTokens(0, [currentTokens[0]]);
+  if (sharePrefill) {
+    for (let batch = 1; batch < args.batchSize; batch++) {
+      cache.getPagedKV().copySequence(batch, 0);
+    }
+  } else {
+    for (let batch = 1; batch < args.batchSize; batch++) {
+      cache.reportTokens(batch, suffixIds[batch]);
+      cache.reportTokens(batch, [currentTokens[batch]]);
+    }
   }
 
   const started = performance.now();
@@ -165,7 +284,7 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOp
           postWarmupTokenCount++;
         }
 
-        if (model.eosIds.has(token) || generated[batch].length >= args.maxNewTokens) {
+        if ((!args.ignoreEos && model.eosIds.has(token)) || generated[batch].length >= args.maxNewTokens) {
           finished[batch] = true;
           break;
         }
@@ -190,16 +309,18 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOp
 }
 
 async function runBatchWithoutMtp(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args): Promise<void> {
-  const prompts = args.prompt ? Array(args.batchSize).fill(args.prompt) : PROMPTS.slice(0, args.batchSize);
-  const inputIds = prompts.map(prompt => tokenizePrompt(model.tokenizer, prompt));
+  const { prompts, inputIds } = prepareInputs(model.tokenizer, args);
   const longestPrompt = Math.max(...inputIds.map(ids => ids.length));
   if (longestPrompt + args.maxNewTokens > args.maxSeqLen) {
     throw new Error(`Prompt plus generation budget exceeds --max-seq-len (${longestPrompt} + ${args.maxNewTokens} > ${args.maxSeqLen})`);
   }
 
-  cache.reset(args.batchSize);
-  const suffixIds = inputIds.map((ids, batch) => cache.prefixMatch(batch, ids));
-  const prefillState = ws.planPrefill(model, args.batchSize, suffixIds.map(ids => ids.length), cache);
+  const sharePrefill = args.file !== undefined && args.batchSize > 1;
+  cache.reset(sharePrefill ? 1 : args.batchSize);
+  const suffixIds = sharePrefill
+    ? [cache.prefixMatch(0, inputIds[0])]
+    : inputIds.map((ids, batch) => cache.prefixMatch(batch, ids));
+  const prefillState = ws.planPrefill(model, suffixIds.length, suffixIds.map(ids => ids.length), cache);
   prefillState.setInput(suffixIds);
   let currentTokens: number[];
   {
@@ -210,12 +331,21 @@ async function runBatchWithoutMtp(model: Glm51Model, ws: ExecutionWorkspace, glm
   }
   await glm.synchronizeAsync();
   ws.clearTracking();
+  if (sharePrefill) currentTokens = Array(args.batchSize).fill(currentTokens[0]);
 
   const generated = currentTokens.map(token => [token]);
-  const finished = currentTokens.map(token => model.eosIds.has(token) || args.maxNewTokens === 1);
-  for (let batch = 0; batch < args.batchSize; batch++) {
-    cache.reportTokens(batch, suffixIds[batch]);
-    cache.reportTokens(batch, [currentTokens[batch]]);
+  const finished = currentTokens.map(token => (!args.ignoreEos && model.eosIds.has(token)) || args.maxNewTokens === 1);
+  cache.reportTokens(0, suffixIds[0]);
+  cache.reportTokens(0, [currentTokens[0]]);
+  if (sharePrefill) {
+    for (let batch = 1; batch < args.batchSize; batch++) {
+      cache.getPagedKV().copySequence(batch, 0);
+    }
+  } else {
+    for (let batch = 1; batch < args.batchSize; batch++) {
+      cache.reportTokens(batch, suffixIds[batch]);
+      cache.reportTokens(batch, [currentTokens[batch]]);
+    }
   }
 
   using captureManager = new CaptureManager(glm);
@@ -248,7 +378,7 @@ async function runBatchWithoutMtp(model: Glm51Model, ws: ExecutionWorkspace, glm
         lastTokenTime = now;
         postWarmupTokenCount++;
       }
-      if (model.eosIds.has(token) || generated[batch].length >= args.maxNewTokens) {
+      if ((!args.ignoreEos && model.eosIds.has(token)) || generated[batch].length >= args.maxNewTokens) {
         finished[batch] = true;
       }
     }
@@ -281,8 +411,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     const loadedModel = await loadModel(glm, args, modelDir);
     if (!(loadedModel instanceof Glm51Model)) throw new Error("run_glm51_multiple_mtp requires a GLM-5.1 model");
     model = loadedModel;
-    cache = model.createChatCache(args.maxPages, args.batchSize, args.maxSeqLen);
-    ws = new ExecutionWorkspace(glm, args.batchSize, args.maxSeqLen);
+    const workspaceSeqLen = args.file ? Math.min(args.maxSeqLen, PREFILL_CHUNK_SIZE + 1) : args.maxSeqLen;
+    cache = model.createChatCache(args.maxPages, args.batchSize, workspaceSeqLen);
+    ws = new ExecutionWorkspace(glm, args.batchSize, workspaceSeqLen);
     console.log(`GLM-5.1 batched ${args.noMtp ? "decode" : "MTP"}: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, topk=${args.noMtp ? "off" : args.mtpDraftTopk.join(",")}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);
     await (args.noMtp ? runBatchWithoutMtp(model, ws, glm, cache, args) : runBatch(model, ws, glm, cache, args));
   } finally {

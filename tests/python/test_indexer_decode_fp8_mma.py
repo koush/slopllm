@@ -75,10 +75,10 @@ def decode_case(device):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("layout", ["paged", "flat"])
-def test_decode_fp8_mma_scores_and_topk(glm, device, decode_case, monkeypatch, layout):
+def test_decode_fp8_mma_default_scores_and_topk(glm, device, decode_case, monkeypatch, layout):
     if torch.cuda.get_device_capability(device)[0] < 12:
         pytest.skip("SM120 required")
-    monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "1")
+    monkeypatch.delenv("GLM_INDEXER_DECODE_FP8_MMA", raising=False)
     q, weights, rows, paged, flat, pi, pip, lpl, qoi, flat_indptr = decode_case
     k_data = paged if layout == "paged" else flat
     out, out_scores, scores, row_len = _run(
@@ -106,6 +106,43 @@ def test_decode_fp8_mma_kill_switch_uses_scalar(glm, device, decode_case, monkey
     assert row_len == rows.shape[0]
     assert len(np.unique(out.cpu().numpy())) == 23
     torch.testing.assert_close(scores.float(), ref.float(), rtol=2e-2, atol=0.5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_decode_fp8_mma_multi_query_causal(glm, device, decode_case, monkeypatch):
+    if torch.cuda.get_device_capability(device)[0] < 12:
+        pytest.skip("SM120 required")
+    monkeypatch.delenv("GLM_INDEXER_DECODE_FP8_MMA", raising=False)
+    _, _, rows, paged, _, pi, pip, lpl, _, _ = decode_case
+    total_q, topk, length = 4, 23, rows.shape[0]
+    q = torch.randn(total_q, 32, 128, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(total_q, 32, dtype=torch.bfloat16, device=device)
+    qoi = torch.tensor([0, total_q], dtype=torch.int32, device=device)
+    out = torch.full((total_q, topk), -2, dtype=torch.int32, device=device)
+    out_scores = torch.full((total_q, topk), -torch.inf, dtype=torch.bfloat16, device=device)
+    scores = torch.full((total_q, length), -torch.inf, dtype=torch.bfloat16, device=device)
+    row_len = torch.zeros(total_q, dtype=torch.int32, device=device)
+    hist = torch.empty(total_q, TOPK_SCRATCH_I32, dtype=torch.int32, device=device)
+    meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
+
+    glm.indexer_score_topk_v2(
+        out, out_scores, q, paged, weights, pi, pip, lpl, qoi,
+        128 ** -0.5, total_q, 32, 128, 64, topk, True,
+        scores, row_len, hist, meta, length, 1,
+    )
+    glm.synchronize()
+
+    k = unpack_indexer_k(rows, 128).float()
+    q8, q_scale = _quantize_q(q)
+    qv = q8 * q_scale
+    ref = (weights.float()[:, :, None] * torch.relu(
+        torch.einsum("qhd,kd->qhk", qv, k) * (128 ** -0.5)
+    )).sum(1).to(torch.bfloat16)
+    expected_lengths = torch.arange(length - total_q + 1, length + 1, device=device)
+    torch.testing.assert_close(row_len, expected_lengths.to(torch.int32), rtol=0, atol=0)
+    for qi, valid in enumerate(expected_lengths.tolist()):
+        torch.testing.assert_close(scores[qi, :valid].float(), ref[qi, :valid].float(), rtol=2e-2, atol=0.5)
+        assert set(out[qi].cpu().tolist()) == set(torch.topk(ref[qi, :valid].float(), topk).indices.cpu().tolist())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

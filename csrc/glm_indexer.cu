@@ -1163,7 +1163,7 @@ __global__ void score_kernel(
     __nv_bfloat16* __restrict__ scores, int32_t* __restrict__ row_len,
     const uint8_t* __restrict__ kData, const int32_t* __restrict__ pageIndices,
     const int32_t* __restrict__ pageIndptr, const int32_t* __restrict__ lastPageLen,
-    const int32_t* __restrict__ qoIndptr, int pageSize, int maxKv, int qGlobalStart,
+    const int32_t* __restrict__ qoIndptr, int pageSize, int maxKv, int causal, int qGlobalStart,
     const uint8_t* __restrict__ custom_mask, const int32_t* __restrict__ mask_indptr,
     const int32_t* __restrict__ mask_kv_len, int cpWorldSize, int cpRank,
     const int32_t* __restrict__ globalLastPageLen,
@@ -1184,10 +1184,8 @@ __global__ void score_kernel(
     const int globalKvLen = cpW > 1
         ? (nPages ? (nPages - 1) * pageSize * cpW + globalLastPageLen[seq] : 0) : kvLen;
     const int qSeqPos = qLocal + qGlobalStart;
-    // This path is noncausal decode, but use the shared coordinate helper so CP
-    // and empty/partial pages retain exactly the scalar row-length semantics.
     const int numValid = idx_local_causal_limit(
-        qSeqPos, nQuery, 0, kvLen, globalKvLen, cpW, cpRank) + 1;
+        qSeqPos, nQuery, causal, kvLen, globalKvLen, cpW, cpRank) + 1;
     if (blockIdx.x == 0 && threadIdx.x == 0) row_len[qi] = numValid;
 
     const uint8_t* tmp = reinterpret_cast<const uint8_t*>(hist + (size_t)qi * IDX_SCRATCH_I32);
@@ -1301,7 +1299,7 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const bool hasMask = custom_mask && mask_indptr;
     const char* fp8Env = std::getenv("GLM_INDEXER_DECODE_FP8_MMA");
     const bool useFp8Mma = idxNHeads == idxfp8::NHEADS && idxHeadDim == idxfp8::HD
-                        && !causal && fp8Env && std::strcmp(fp8Env, "1") == 0;
+                        && (!fp8Env || std::strcmp(fp8Env, "0") != 0);
     if (useFp8Mma) {
         idxfp8::quantize_q_kernel<<<totalQ, 256, 0, stream>>>(
             (const __nv_bfloat16*)q, (const __nv_bfloat16*)weights, hist, scale);
@@ -1311,7 +1309,7 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
 #define LAUNCH_IDX_FP8(HAS_MASK, FLAT) \
         idxfp8::score_kernel<(HAS_MASK), (FLAT)><<<grid, block, fp8Smem, stream>>>( \
             (__nv_bfloat16*)scores, rowLen, (const uint8_t*)kData, pageIndices, pageIndptr, \
-            lastPageLen, qoIndptr, pageSize, maxKv, qGlobalStart, custom_mask, mask_indptr, \
+            lastPageLen, qoIndptr, pageSize, maxKv, causal, qGlobalStart, custom_mask, mask_indptr, \
             mask_kv_len, effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, \
             kvTokenIndptr, hist)
         if (kvTokenIndptr) {

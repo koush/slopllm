@@ -25,10 +25,10 @@ imports the actual kernels from `b12x.attention.nsa_indexer`.
 default) to `indexerScoreTopkV2`. Production-shaped noncausal decode
 (`32` heads by `128` dimensions) quantizes Q to FP8 E4M3 and scores packed FP8 K
 with SM120 `m16n8k32` block-scaled MMA. Q scale and the attention scale are
-folded into the FP32 per-head weights. The path is experimental and requires
-`GLM_INDEXER_DECODE_FP8_MMA=1`; other shapes, causal calls, and the default
-configuration use the scalar FP8-K scorer. Both paths round the final weighted
-score to BF16 before exact selection.
+folded into the FP32 per-head weights. The MMA path is enabled by default; set
+`GLM_INDEXER_DECODE_FP8_MMA=0` to use the scalar FP8-K scorer.
+Other shapes use the scalar scorer. Both paths round the final weighted score
+to BF16 before exact selection, and both support causal and custom-mask bounds.
 
 Both scorers parallelize long contexts across multiple CTAs, which is important
 when decode has only a few query rows. The MMA path uses the indexer heads as M
