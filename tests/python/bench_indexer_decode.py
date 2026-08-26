@@ -106,7 +106,7 @@ class IndexerDecodeCase:
             dtype=torch.bfloat16,
             device=device,
         )
-        self.k_data = pack_indexer_k(unpacked_k)
+        self.k_data, self.k_scale_data = pack_indexer_k(unpacked_k)
         del unpacked_k
 
         self.page_indices = torch.arange(
@@ -191,6 +191,7 @@ class IndexerDecodeCase:
             self.local_scores,
             self.q,
             self.k_data,
+            self.k_scale_data,
             self.weights,
             self.page_indices,
             self.page_indptr,

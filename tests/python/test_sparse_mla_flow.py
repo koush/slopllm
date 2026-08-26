@@ -101,7 +101,7 @@ def test_sparse_mla_flow_quantize_score_topk_slots(glm, device, kv_lora_rank, pe
         pos = int(positions_t[i])
         slot = _slot_for_token(b, pos, page_indices_np, page_indptr_np, page_size)
         k_data_bf16[slot // page_size, slot % page_size, :] = torch.randn(idx_head_dim, dtype=torch.bfloat16, device=device)
-    k_data = pack_indexer_k(k_data_bf16)
+    k_data, k_scale_data = pack_indexer_k(k_data_bf16)
 
     # --- 3. Indexer score (non-causal = decode mode) ---
     total_q = nnz
@@ -112,7 +112,7 @@ def test_sparse_mla_flow_quantize_score_topk_slots(glm, device, kv_lora_rank, pe
     index_scores = torch.full((total_q, max_kv_len), float('-inf'), dtype=torch.bfloat16, device=device)
 
     glm.indexer_score(
-        index_scores, idx_q, k_data, idx_weights,
+        index_scores, idx_q, k_data, k_scale_data, idx_weights,
         page_indices_t, page_indptr_t, last_page_len_t, qo_indptr,
         scale, total_q, idx_n_heads, idx_head_dim,
         page_size, max_kv_len, False,
@@ -212,7 +212,7 @@ def test_sparse_mla_flow_cp_filter(glm, device, cp_world_size, cp_rank):
     )
 
     # Indexer K + Q + weights
-    k_data = pack_indexer_k(torch.randn(
+    k_data, k_scale_data = pack_indexer_k(torch.randn(
         max_pages, page_size, idx_head_dim, dtype=torch.bfloat16, device=device))
     idx_q = torch.randn(nnz, idx_n_heads, idx_head_dim, dtype=torch.bfloat16, device=device)
     idx_weights = torch.randn(nnz, idx_n_heads, dtype=torch.bfloat16, device=device)
@@ -220,7 +220,7 @@ def test_sparse_mla_flow_cp_filter(glm, device, cp_world_size, cp_rank):
 
     index_scores = torch.full((nnz, max_kv_len), float('-inf'), dtype=torch.bfloat16, device=device)
     glm.indexer_score(
-        index_scores, idx_q, k_data, idx_weights,
+        index_scores, idx_q, k_data, k_scale_data, idx_weights,
         page_indices_t, page_indptr_t, last_page_len_t, qo_indptr,
         scale, nnz, idx_n_heads, idx_head_dim,
         page_size, max_kv_len, False,
@@ -305,7 +305,7 @@ def test_sparse_mla_flow_topk_ordering(glm, device):
     page_indptr_np = page_indptr_t.cpu().numpy()
     max_pages = len(page_indices_np) + 4
 
-    k_data = pack_indexer_k(torch.randn(
+    k_data, k_scale_data = pack_indexer_k(torch.randn(
         max_pages, page_size, idx_head_dim, dtype=torch.bfloat16, device=device))
     idx_q = torch.randn(nnz, idx_n_heads, idx_head_dim, dtype=torch.bfloat16, device=device)
     idx_weights = torch.randn(nnz, idx_n_heads, dtype=torch.bfloat16, device=device)
@@ -313,7 +313,7 @@ def test_sparse_mla_flow_topk_ordering(glm, device):
 
     index_scores = torch.full((nnz, max_kv_len), float('-inf'), dtype=torch.bfloat16, device=device)
     glm.indexer_score(
-        index_scores, idx_q, k_data, idx_weights,
+        index_scores, idx_q, k_data, k_scale_data, idx_weights,
         page_indices_t, page_indptr_t, last_page_len_t, qo_indptr,
         scale, nnz, idx_n_heads, idx_head_dim,
         page_size, max_kv_len, False,

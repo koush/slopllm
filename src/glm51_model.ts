@@ -744,12 +744,13 @@ export class Glm51Model extends ChatModel {
         using idxQ = idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
 
         kvcacheIndex?.streamWaitEvent();
-        using kData = kvcacheIndex!.result;
+        using kData = kvcacheIndex!.result.kData;
+        using kScaleData = kvcacheIndex!.result.kScaleData;
 
         // Store the raw indexer top-k (token positions); slots are derived
         // per-layer/per-mode below and in the gather (slotsReady).
         return state.indexerTopk(
-          idxQ, kData, idxWeights,
+          idxQ, kData, kScaleData, idxWeights,
           Math.pow(idxHeadDim, -0.5), idxTopk,
         );
       });
@@ -1439,14 +1440,17 @@ export class Glm51Model extends ChatModel {
 
       const indexerSrc: Tensor[] = [];
       const indexerDst: Tensor[] = [];
+      const indexerDstScale: Tensor[] = [];
       for (const layer of artifacts.indexerKvCacheLayers) {
         if (layer.indexHeadDim !== this.cfg.indexHeadDim) {
           throw new Error(`MTP indexer dimension differs at layer ${layer.cacheIdx}`);
         }
         const destination = pagedKV.kData[layer.cacheIdx];
-        if (!destination) throw new Error(`Missing indexer cache for layer ${layer.cacheIdx}`);
+        const scaleDestination = pagedKV.kScaleData[layer.cacheIdx];
+        if (!destination || !scaleDestination) throw new Error(`Missing indexer cache for layer ${layer.cacheIdx}`);
         indexerSrc.push(layer.appendIdxK.resumeTracking());
         indexerDst.push(destination);
+        indexerDstScale.push(scaleDestination);
       }
 
       using mlaSrcCkvPtrs = ws.alloc([mlaSrcCkv.length], "I64");
@@ -1460,12 +1464,14 @@ export class Glm51Model extends ChatModel {
 
       using indexerSrcPtrs = indexerSrc.length ? ws.alloc([indexerSrc.length], "I64") : undefined;
       using indexerDstPtrs = indexerDst.length ? ws.alloc([indexerDst.length], "I64") : undefined;
+      using indexerDstScalePtrs = indexerDstScale.length ? ws.alloc([indexerDstScale.length], "I64") : undefined;
       indexerSrcPtrs?.writePointers(indexerSrc);
       indexerDstPtrs?.writePointers(indexerDst);
+      indexerDstScalePtrs?.writePointers(indexerDstScale);
 
       ws.glm.appendSelectedMtpCaches(
         mlaSrcCkvPtrs, mlaSrcKpePtrs, mlaDstCkvPtrs, mlaDstKpePtrs,
-        indexerSrcPtrs, indexerDstPtrs,
+        indexerSrcPtrs, indexerDstPtrs, indexerDstScalePtrs,
         selectedSources, commitState.indices, commitState.indptrD, commitState.mlaBatchIndices, commitState.positionIds,
         pagedKV.pageSize, this.cfg.kvLoraRank, this.cfg.qkRopeHeadDim, this.cfg.indexHeadDim,
         pagedKV.sparseMode, pagedKV.contextParallel ? ws.glm.worldSize : 0,

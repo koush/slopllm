@@ -15,7 +15,7 @@ def _setup_random_kv(B, seq_lens, n_heads, head_dim, page_size, device, seed=42)
     num_pages_total = sum((s + page_size - 1) // page_size for s in seq_lens)
     max_pages = num_pages_total + 16
 
-    k_paged = pack_indexer_k(torch.randn(
+    k_paged, k_scale_paged = pack_indexer_k(torch.randn(
         max_pages, page_size, head_dim, dtype=torch.bfloat16, device=device))
     q = torch.randn(total_q, n_heads, head_dim, dtype=torch.bfloat16, device=device)
     weights = torch.randn(total_q, n_heads, dtype=torch.bfloat16, device=device)
@@ -41,7 +41,7 @@ def _setup_random_kv(B, seq_lens, n_heads, head_dim, page_size, device, seed=42)
     last_page_len_t = torch.tensor(last_page_len_list, dtype=torch.int32, device=device)
     qo_indptr_t = torch.tensor(qo_indptr, dtype=torch.int32, device=device)
 
-    return (q, k_paged, weights, page_indices_list, page_indptr, last_page_len_list,
+    return (q, k_paged, k_scale_paged, weights, page_indices_list, page_indptr, last_page_len_list,
             qo_indptr, page_indices_t, page_indptr_t, last_page_len_t, qo_indptr_t,
             scale, total_q, max_pages)
 

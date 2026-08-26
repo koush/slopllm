@@ -17,7 +17,7 @@ TOPK_SCRATCH_I32 = 1056
 
 
 def _run_v2_cp(glm, s, topk, causal, device, cp_world_size, cp_rank):
-    (q, k_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
+    (q, k_paged, k_scale_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
      scale, total_q, max_pages) = s
     max_kv = 0
     for i in range(len(lpl)):
@@ -32,7 +32,7 @@ def _run_v2_cp(glm, s, topk, causal, device, cp_world_size, cp_rank):
     n_heads, head_dim = q.shape[1], q.shape[2]
     num_splits = min(256, max(1, (max_kv + 255) // 256))
     glm.indexer_score_topk_v2(
-        out, out_scores, q, k_paged, weights, pit, pipt, lplt, qoit, scale,
+        out, out_scores, q, k_paged, k_scale_paged, weights, pit, pipt, lplt, qoit, scale,
         total_q, n_heads, head_dim, k_paged.shape[1], topk, causal,
         scores, row_len, hist, meta, max_kv, num_splits,
         cp_world_size=cp_world_size, cp_rank=cp_rank)
@@ -41,7 +41,7 @@ def _run_v2_cp(glm, s, topk, causal, device, cp_world_size, cp_rank):
 
 
 def _run_prefill_cp(glm, s, topk, causal, device, cp_world_size, cp_rank):
-    (q, k_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
+    (q, k_paged, k_scale_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
      scale, total_q, max_pages) = s
     n_heads, head_dim = q.shape[1], q.shape[2]
     page_size = k_paged.shape[1]
@@ -58,7 +58,7 @@ def _run_prefill_cp(glm, s, topk, causal, device, cp_world_size, cp_rank):
     fine_hist = torch.empty(total_q, 64, dtype=torch.int32, device=device)
     meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
     glm.indexer_score_topk_prefill(
-        out, out_scores, q, k_paged, weights, pit, pipt, lplt, qoit, scale,
+        out, out_scores, q, k_paged, k_scale_paged, weights, pit, pipt, lplt, qoit, scale,
         total_q, n_heads, head_dim, page_size, topk, causal,
         scores, row_len, max_kv,
         coarse_hist, fine_hist, meta, num_splits,
@@ -98,7 +98,7 @@ def _check_cp_remap(out_cp, ref_row, numValid, topk, cp_world_size, cp_rank, q_i
 def test_v2_cp_remap(glm, device, seq_lens, topk, causal, cp_world_size, cp_rank):
     n_heads, head_dim, page_size = 32, 128, 64
     s = _setup_random_kv(len(seq_lens), seq_lens, n_heads, head_dim, page_size, device)
-    (q, k_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
+    (q, k_paged, k_scale_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
      scale, total_q, max_pages) = s
     out_cp = _run_v2_cp(glm, s, topk, causal, device, cp_world_size, cp_rank)
 
@@ -108,7 +108,8 @@ def test_v2_cp_remap(glm, device, seq_lens, topk, causal, cp_world_size, cp_rank
             numValid = _get_valid_kv_len(seq_idx, qi, seq_lens, pip, lpl, page_size, qoi, causal)
             page_start = pip[seq_idx]
             seq_page_indices = pil[page_start: pip[seq_idx + 1]]
-            ref = _ref_scores(q, k_paged, weights, seq_page_indices, pip, page_size, scale, numValid, t)
+            ref = _ref_scores(q, k_paged, k_scale_paged, weights, seq_page_indices,
+                              pip, page_size, scale, numValid, t)
             _check_cp_remap(out_cp, ref, numValid, topk, cp_world_size, cp_rank, t)
 
 
@@ -127,7 +128,7 @@ def test_v2_cp_remap(glm, device, seq_lens, topk, causal, cp_world_size, cp_rank
 def test_prefill_cp_remap(glm, device, seq_lens, topk, causal, cp_world_size, cp_rank):
     n_heads, head_dim, page_size = 32, 128, 64
     s = _setup_random_kv(len(seq_lens), seq_lens, n_heads, head_dim, page_size, device)
-    (q, k_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
+    (q, k_paged, k_scale_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
      scale, total_q, max_pages) = s
     out_cp = _run_prefill_cp(glm, s, topk, causal, device, cp_world_size, cp_rank)
 
@@ -141,7 +142,8 @@ def test_prefill_cp_remap(glm, device, seq_lens, topk, causal, cp_world_size, cp
                 continue
             page_start = pip[seq_idx]
             seq_page_indices = pil[page_start: pip[seq_idx + 1]]
-            ref = _ref_scores(q, k_paged, weights, seq_page_indices, pip, page_size, scale, numValid, t)
+            ref = _ref_scores(q, k_paged, k_scale_paged, weights, seq_page_indices,
+                              pip, page_size, scale, numValid, t)
             _check_cp_remap(out_cp, ref, numValid, topk, cp_world_size, cp_rank, t)
 
 
@@ -160,7 +162,7 @@ def test_cp_world_size_zero_is_identity(glm, device, seq_lens, topk):
     """
     n_heads, head_dim, page_size = 32, 128, 64
     s = _setup_random_kv(len(seq_lens), seq_lens, n_heads, head_dim, page_size, device)
-    (q, k_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
+    (q, k_paged, k_scale_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
      scale, total_q, max_pages) = s
     out_nocp, _ = _run_v2(glm, s, topk, False, device)
     out_zero = _run_v2_cp(glm, s, topk, False, device, 0, 3)
@@ -171,7 +173,8 @@ def test_cp_world_size_zero_is_identity(glm, device, seq_lens, topk):
             numValid = _get_valid_kv_len(seq_idx, qi, seq_lens, pip, lpl, page_size, qoi, False)
             page_start = pip[seq_idx]
             seq_page_indices = pil[page_start: pip[seq_idx + 1]]
-            ref = _ref_scores(q, k_paged, weights, seq_page_indices, pip, page_size, scale, numValid, t)
+            ref = _ref_scores(q, k_paged, k_scale_paged, weights, seq_page_indices,
+                              pip, page_size, scale, numValid, t)
             # Both should pass the same reference check
             _check(out_nocp[t], ref, numValid, topk)
             _check(out_zero[t], ref, numValid, topk)
@@ -214,14 +217,14 @@ def _setup_cp_shard(L_global, W, r, n_queries, n_heads, head_dim, local_page_siz
     assert 1 <= local_lpl <= local_page_size, f"unsupported slice: local_lpl={local_lpl}"
 
     max_pages = num_pages + 4
-    k_paged = pack_indexer_k(torch.randn(
+    k_paged, k_scale_paged = pack_indexer_k(torch.randn(
         max_pages, local_page_size, head_dim, dtype=torch.bfloat16, device=device))
     q = torch.randn(n_queries, n_heads, head_dim, dtype=torch.bfloat16, device=device)
     weights = torch.randn(n_queries, n_heads, dtype=torch.bfloat16, device=device)
 
     t = lambda xs: torch.tensor(xs, dtype=torch.int32, device=device)
     return dict(
-        q=q, k_paged=k_paged, weights=weights,
+        q=q, k_paged=k_paged, k_scale_paged=k_scale_paged, weights=weights,
         page_indices=t(list(range(num_pages))), page_indptr=t([0, num_pages]),
         last_page_len=t([local_lpl]), global_last_page_len=t([global_lpl]),
         qo_indptr=t([0, n_queries]),
@@ -261,7 +264,7 @@ def _run_cp_shard(glm, s, topk, device, kernel, mask=None):
                   mask_kv_len=None if mask is None else mask["kv_len"],
                   cp_world_size=s["W"], cp_rank=s["r"],
                   global_last_page_len=s["global_last_page_len"])
-    args = (out, out_scores, s["q"], s["k_paged"], s["weights"],
+    args = (out, out_scores, s["q"], s["k_paged"], s["k_scale_paged"], s["weights"],
             s["page_indices"], s["page_indptr"], s["last_page_len"], s["qo_indptr"],
             s["scale"], total_q, s["q"].shape[1], s["q"].shape[2], s["page_size"], topk, True)
     if kernel == "v2":

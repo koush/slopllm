@@ -145,6 +145,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   readonly sparseMode: boolean;
   readonly bytesPerToken: number;
   kData: Tensor[];
+  kScaleData: Tensor[];
   vData: Tensor[];
   ckvData: Tensor[];
   kpeData: Tensor[];
@@ -171,6 +172,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       ? kvLoraRank + (kvLoraRank / 128) * 4 + qkRopeDim * 2
       : 0;
     this.kData = [];
+    this.kScaleData = [];
     this.vData = [];
     this.ckvData = [];
     this.kpeData = [];
@@ -187,8 +189,11 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
         if (indexHeadDim > 0) {
           if (sharedLayers[i]) {
             this.kData.push(undefined!);
+            this.kScaleData.push(undefined!);
           } else {
-            this.kData.push(this.alloc([maxPages, this.pageSize, indexHeadDim + 4], "U8", "k" + i, contextParallel ? TensorParallelism.Row : undefined));
+            const parallelism = contextParallel ? TensorParallelism.Row : undefined;
+            this.kData.push(this.alloc([maxPages, this.pageSize, indexHeadDim], "U8", "k" + i, parallelism));
+            this.kScaleData.push(this.alloc([maxPages, this.pageSize], "F32", "kScale" + i, parallelism));
           }
         }
       } else {
@@ -377,6 +382,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   copyPage(srcPageId: number, dstPageId: number): void {
     for (let i = 0; i < this.kData.length; i++) {
       if (this.kData[i]) this.copyPageRow(this.kData[i], srcPageId, dstPageId);
+      if (this.kScaleData[i]) this.copyPageRow(this.kScaleData[i], srcPageId, dstPageId);
     }
     for (let i = 0; i < this.vData.length; i++) {
       this.copyPageRow(this.vData[i], srcPageId, dstPageId);

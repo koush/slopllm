@@ -6,8 +6,6 @@
 #include <cfloat>
 #include <cstdint>
 
-constexpr int INDEXER_FP8_SCALE_BYTES = sizeof(float);
-
 __device__ __forceinline__ float indexer_ue8m0_scale(float amax) {
     float raw = fmaxf(amax, 1e-4f) / 448.f;
     uint32_t bits = __float_as_uint(raw);
@@ -18,7 +16,8 @@ __device__ __forceinline__ float indexer_ue8m0_scale(float amax) {
 
 template <int HEAD_DIM>
 __device__ __forceinline__ void pack_indexer_k_row(
-    uint8_t* dst, const __nv_bfloat16* src, float* scratch) {
+    uint8_t* dst, float* dst_scale,
+    const __nv_bfloat16* src, float* scratch) {
     static_assert(HEAD_DIM % 2 == 0);
     const int pair = threadIdx.x;
     float local_max = 0.f;
@@ -38,7 +37,7 @@ __device__ __forceinline__ void pack_indexer_k_row(
         for (int warp = 0; warp < (blockDim.x + 31) / 32; warp++)
             amax = fmaxf(amax, scratch[warp]);
         scratch[0] = indexer_ue8m0_scale(amax);
-        *reinterpret_cast<float*>(dst + HEAD_DIM) = scratch[0];
+        *dst_scale = scratch[0];
     }
     __syncthreads();
 

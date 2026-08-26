@@ -10,19 +10,18 @@ RTOL = 1e-2
 
 
 def pack_indexer_k(k):
-    """Pack BF16 indexer K rows as E4M3 bytes followed by one FP32 scale."""
+    """Quantize BF16 indexer K rows into separate E4M3 data and FP32 scales."""
     values = k.float()
     amax = values.abs().amax(dim=-1, keepdim=True)
     raw_scale = torch.maximum(amax, torch.tensor(1e-4, device=k.device)) / 448.0
     scale = torch.pow(2.0, torch.ceil(torch.log2(raw_scale))).float()
     quant = (values / scale).to(torch.float8_e4m3fn).view(torch.uint8)
-    return torch.cat((quant, scale.contiguous().view(torch.uint8)), dim=-1).contiguous()
+    return quant.contiguous(), scale.squeeze(-1).contiguous()
 
 
-def unpack_indexer_k(k, head_dim):
-    values = k[..., :head_dim].contiguous().view(torch.float8_e4m3fn).float()
-    scale = k[..., head_dim:head_dim + 4].contiguous().view(torch.float32)
-    return values * scale
+def unpack_indexer_k(k_data, k_scales):
+    values = k_data.contiguous().view(torch.float8_e4m3fn).float()
+    return values * k_scales.float().unsqueeze(-1)
 
 
 class ModelNotFoundError(Exception):
@@ -246,7 +245,7 @@ class GlmOps:
 
         self.lib.glm_indexer_score.restype = None
         self.lib.glm_indexer_score.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_float,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -294,6 +293,7 @@ class GlmOps:
         self.lib.glm_indexer_score_topk_v2.restype = None
         self.lib.glm_indexer_score_topk_v2.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -306,6 +306,7 @@ class GlmOps:
         self.lib.glm_indexer_score_topk_prefill.restype = None
         self.lib.glm_indexer_score_topk_prefill.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -677,7 +678,7 @@ class GlmOps:
         self.lib.glm_indexer_kv_cache_append_flat.restype = None
         self.lib.glm_indexer_kv_cache_append_flat.argtypes = [
             ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_uint32, ctypes.c_uint32, ctypes.c_size_t,
         ]
@@ -1138,7 +1139,7 @@ class GlmOps:
             max_pages, batch_size, page_size, D * elem_bytes
         )
 
-    def indexer_score(self, output, q, k_data, weights, page_indices, page_indptr,
+    def indexer_score(self, output, q, k_data, k_scale_data, weights, page_indices, page_indptr,
                       last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
                       page_size, max_kv_len, causal, kv_token_indptr=None):
         self.lib.glm_indexer_score(
@@ -1146,6 +1147,7 @@ class GlmOps:
             self._ptr(output),
             self._ptr(q),
             self._ptr(k_data),
+            self._ptr(k_scale_data),
             self._ptr(weights),
             self._ptr(page_indices),
             self._ptr(page_indptr),
@@ -1156,7 +1158,7 @@ class GlmOps:
             self._ptr(kv_token_indptr) if kv_token_indptr is not None else ctypes.c_void_p(0),
         )
 
-    def indexer_score_topk_v2(self, out_idx, out_scores, q, k_data, weights, page_indices, page_indptr,
+    def indexer_score_topk_v2(self, out_idx, out_scores, q, k_data, k_scale_data, weights, page_indices, page_indptr,
                               last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
                               page_size, topk, causal,
                               scores, row_len, hist, meta, max_kv, num_splits,
@@ -1164,7 +1166,8 @@ class GlmOps:
                                q_global_start=0, cp_world_size=0, cp_rank=0, global_last_page_len=None,
                                kv_token_indptr=None):
         self.lib.glm_indexer_score_topk_v2(
-            self.ctx, self._ptr(out_idx), self._ptr(out_scores), self._ptr(q), self._ptr(k_data), self._ptr(weights),
+            self.ctx, self._ptr(out_idx), self._ptr(out_scores), self._ptr(q), self._ptr(k_data),
+            self._ptr(k_scale_data), self._ptr(weights),
             self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
             ctypes.c_float(scale), total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0,
             q_global_start,
@@ -1177,7 +1180,7 @@ class GlmOps:
             self._ptr(kv_token_indptr) if kv_token_indptr is not None else ctypes.c_void_p(0),
         )
 
-    def indexer_score_topk_prefill(self, out_idx, out_scores, q, k_data, weights, page_indices, page_indptr,
+    def indexer_score_topk_prefill(self, out_idx, out_scores, q, k_data, k_scale_data, weights, page_indices, page_indptr,
                                    last_page_len, qo_indptr, scale, total_q, n_heads, head_dim,
                                    page_size, topk, causal,
                                    scores, row_len, max_kv,
@@ -1187,7 +1190,8 @@ class GlmOps:
                                      kv_token_indptr=None):
         query_tiles = (total_q + 63) // 64 + qo_indptr.numel() - 2
         self.lib.glm_indexer_score_topk_prefill(
-            self.ctx, self._ptr(out_idx), self._ptr(out_scores), self._ptr(q), self._ptr(k_data), self._ptr(weights),
+            self.ctx, self._ptr(out_idx), self._ptr(out_scores), self._ptr(q), self._ptr(k_data),
+            self._ptr(k_scale_data), self._ptr(weights),
             self._ptr(page_indices), self._ptr(page_indptr), self._ptr(last_page_len), self._ptr(qo_indptr),
             ctypes.c_float(scale), total_q, n_heads, head_dim, page_size, topk, 1 if causal else 0,
             q_global_start,
@@ -1741,12 +1745,12 @@ class GlmOps:
             ctypes.c_uint32(cp_world_size), ctypes.c_uint32(cp_rank)
         )
 
-    def indexer_kv_cache_append_flat(self, k_data, append_k, kv_token_indptr,
+    def indexer_kv_cache_append_flat(self, k_data, k_scale_data, append_k, kv_token_indptr,
                                      batch_indices, positions, nnz, head_dim,
                                      append_stride_n):
         self.lib.glm_indexer_kv_cache_append_flat(
             self.ctx,
-            self._ptr(k_data), self._ptr(append_k),
+            self._ptr(k_data), self._ptr(k_scale_data), self._ptr(append_k),
             self._ptr(kv_token_indptr), self._ptr(batch_indices), self._ptr(positions),
             ctypes.c_uint32(nnz), ctypes.c_uint32(head_dim),
             ctypes.c_size_t(append_stride_n),

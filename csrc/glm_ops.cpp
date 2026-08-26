@@ -349,33 +349,35 @@ static Napi::Value Softmax(const Napi::CallbackInfo& info) {
 
 static Napi::Value IndexerScore(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 16) {
-        Napi::TypeError::New(env, "Expected (ctx, out, q, kData, weights, pageIndices, pageIndptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal)").ThrowAsJavaScriptException();
+    if (info.Length() < 17) {
+        Napi::TypeError::New(env, "Expected (ctx, out, q, kData, kScaleData, weights, pageIndices, pageIndptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
     uintptr_t q_ptr = info[2].As<Napi::Number>().Int64Value();
     uintptr_t kData_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t weights_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t pageIndices_ptr = info[5].As<Napi::Number>().Int64Value();
-    uintptr_t pageIndptr_ptr = info[6].As<Napi::Number>().Int64Value();
-    uintptr_t lastPageLen_ptr = info[7].As<Napi::Number>().Int64Value();
-    uintptr_t qoIndptr_ptr = info[8].As<Napi::Number>().Int64Value();
-    float scale = info[9].As<Napi::Number>().FloatValue();
-    int totalQ = info[10].As<Napi::Number>().Int32Value();
-    int idxNHeads = info[11].As<Napi::Number>().Int32Value();
-    int idxHeadDim = info[12].As<Napi::Number>().Int32Value();
-    int pageSize = info[13].As<Napi::Number>().Int32Value();
-    int maxKvLen = info[14].As<Napi::Number>().Int32Value();
-    int causal = info[15].As<Napi::Number>().Int32Value();
-    const int32_t* kv_token_indptr = info.Length() > 16
-        ? reinterpret_cast<const int32_t*>(info[16].As<Napi::Number>().Int64Value())
+    uintptr_t kScaleData_ptr = info[4].As<Napi::Number>().Int64Value();
+    uintptr_t weights_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t pageIndices_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t pageIndptr_ptr = info[7].As<Napi::Number>().Int64Value();
+    uintptr_t lastPageLen_ptr = info[8].As<Napi::Number>().Int64Value();
+    uintptr_t qoIndptr_ptr = info[9].As<Napi::Number>().Int64Value();
+    float scale = info[10].As<Napi::Number>().FloatValue();
+    int totalQ = info[11].As<Napi::Number>().Int32Value();
+    int idxNHeads = info[12].As<Napi::Number>().Int32Value();
+    int idxHeadDim = info[13].As<Napi::Number>().Int32Value();
+    int pageSize = info[14].As<Napi::Number>().Int32Value();
+    int maxKvLen = info[15].As<Napi::Number>().Int32Value();
+    int causal = info[16].As<Napi::Number>().Int32Value();
+    const int32_t* kv_token_indptr = info.Length() > 17
+        ? reinterpret_cast<const int32_t*>(info[17].As<Napi::Number>().Int64Value())
         : nullptr;
     glm_indexer_score(reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(out_ptr),
         reinterpret_cast<const void*>(q_ptr),
         reinterpret_cast<const void*>(kData_ptr),
+        reinterpret_cast<const float*>(kScaleData_ptr),
         reinterpret_cast<const void*>(weights_ptr),
         reinterpret_cast<const int32_t*>(pageIndices_ptr),
         reinterpret_cast<const int32_t*>(pageIndptr_ptr),
@@ -392,8 +394,8 @@ static Napi::Value IndexerScore(const Napi::CallbackInfo& info) {
 
 static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 31) {
-        Napi::TypeError::New(env, "Expected 31 args").ThrowAsJavaScriptException();
+    if (info.Length() < 32) {
+        Napi::TypeError::New(env, "Expected 32 args").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -401,37 +403,38 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     uintptr_t out_scores_ptr = info[2].As<Napi::Number>().Int64Value();
     uintptr_t q_ptr = info[3].As<Napi::Number>().Int64Value();
     uintptr_t kData_ptr = info[4].As<Napi::Number>().Int64Value();
-    uintptr_t weights_ptr = info[5].As<Napi::Number>().Int64Value();
-    uintptr_t pageIndices_ptr = info[6].As<Napi::Number>().Int64Value();
-    uintptr_t pageIndptr_ptr = info[7].As<Napi::Number>().Int64Value();
-    uintptr_t lastPageLen_ptr = info[8].As<Napi::Number>().Int64Value();
-    uintptr_t qoIndptr_ptr = info[9].As<Napi::Number>().Int64Value();
-    float scale = info[10].As<Napi::Number>().FloatValue();
-    int totalQ = info[11].As<Napi::Number>().Int32Value();
-    int idxNHeads = info[12].As<Napi::Number>().Int32Value();
-    int idxHeadDim = info[13].As<Napi::Number>().Int32Value();
-    int pageSize = info[14].As<Napi::Number>().Int32Value();
-    int topk = info[15].As<Napi::Number>().Int32Value();
-    int causal = info[16].As<Napi::Number>().Int32Value();
-    int qGlobalStart = info[17].As<Napi::Number>().Int32Value();
+    uintptr_t kScaleData_ptr = info[5].As<Napi::Number>().Int64Value();
+    uintptr_t weights_ptr = info[6].As<Napi::Number>().Int64Value();
+    uintptr_t pageIndices_ptr = info[7].As<Napi::Number>().Int64Value();
+    uintptr_t pageIndptr_ptr = info[8].As<Napi::Number>().Int64Value();
+    uintptr_t lastPageLen_ptr = info[9].As<Napi::Number>().Int64Value();
+    uintptr_t qoIndptr_ptr = info[10].As<Napi::Number>().Int64Value();
+    float scale = info[11].As<Napi::Number>().FloatValue();
+    int totalQ = info[12].As<Napi::Number>().Int32Value();
+    int idxNHeads = info[13].As<Napi::Number>().Int32Value();
+    int idxHeadDim = info[14].As<Napi::Number>().Int32Value();
+    int pageSize = info[15].As<Napi::Number>().Int32Value();
+    int topk = info[16].As<Napi::Number>().Int32Value();
+    int causal = info[17].As<Napi::Number>().Int32Value();
+    int qGlobalStart = info[18].As<Napi::Number>().Int32Value();
     const uint8_t* custom_mask = nullptr;
     const int32_t* mask_indptr = nullptr;
     const int32_t* mask_kv_len = nullptr;
-    if (info.Length() >= 19 && info[18].IsNumber()) custom_mask = reinterpret_cast<const uint8_t*>(info[18].As<Napi::Number>().Int64Value());
-    if (info.Length() >= 20 && info[19].IsNumber()) mask_indptr = reinterpret_cast<const int32_t*>(info[19].As<Napi::Number>().Int64Value());
-    if (info.Length() >= 21 && info[20].IsNumber()) mask_kv_len = reinterpret_cast<const int32_t*>(info[20].As<Napi::Number>().Int64Value());
-    uintptr_t scores_ptr = info[21].As<Napi::Number>().Int64Value();
-    uintptr_t rowLen_ptr = info[22].As<Napi::Number>().Int64Value();
-    int maxKv = info[23].As<Napi::Number>().Int32Value();
-    uintptr_t coarseHist_ptr = info[24].As<Napi::Number>().Int64Value();
-    uintptr_t fineHist_ptr = info[25].As<Napi::Number>().Int64Value();
-    uintptr_t meta_ptr = info[26].As<Napi::Number>().Int64Value();
-    int queryTiles = info[27].As<Napi::Number>().Int32Value();
-    int cpWorldSize = info[28].As<Napi::Number>().Int32Value();
-    int cpRank = info[29].As<Napi::Number>().Int32Value();
-    const int32_t* global_last_page_len = reinterpret_cast<const int32_t*>((uintptr_t)info[30].As<Napi::Number>().Int64Value());
-    const int32_t* kv_token_indptr = info.Length() > 31
-        ? reinterpret_cast<const int32_t*>((uintptr_t)info[31].As<Napi::Number>().Int64Value())
+    if (info[19].IsNumber()) custom_mask = reinterpret_cast<const uint8_t*>(info[19].As<Napi::Number>().Int64Value());
+    if (info[20].IsNumber()) mask_indptr = reinterpret_cast<const int32_t*>(info[20].As<Napi::Number>().Int64Value());
+    if (info[21].IsNumber()) mask_kv_len = reinterpret_cast<const int32_t*>(info[21].As<Napi::Number>().Int64Value());
+    uintptr_t scores_ptr = info[22].As<Napi::Number>().Int64Value();
+    uintptr_t rowLen_ptr = info[23].As<Napi::Number>().Int64Value();
+    int maxKv = info[24].As<Napi::Number>().Int32Value();
+    uintptr_t coarseHist_ptr = info[25].As<Napi::Number>().Int64Value();
+    uintptr_t fineHist_ptr = info[26].As<Napi::Number>().Int64Value();
+    uintptr_t meta_ptr = info[27].As<Napi::Number>().Int64Value();
+    int queryTiles = info[28].As<Napi::Number>().Int32Value();
+    int cpWorldSize = info[29].As<Napi::Number>().Int32Value();
+    int cpRank = info[30].As<Napi::Number>().Int32Value();
+    const int32_t* global_last_page_len = reinterpret_cast<const int32_t*>((uintptr_t)info[31].As<Napi::Number>().Int64Value());
+    const int32_t* kv_token_indptr = info.Length() > 32
+        ? reinterpret_cast<const int32_t*>((uintptr_t)info[32].As<Napi::Number>().Int64Value())
         : nullptr;
     glm_indexer_score_topk_prefill(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
@@ -439,6 +442,7 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
         reinterpret_cast<__nv_bfloat16*>(out_scores_ptr),
         reinterpret_cast<const void*>(q_ptr),
         reinterpret_cast<const void*>(kData_ptr),
+        reinterpret_cast<const float*>(kScaleData_ptr),
         reinterpret_cast<const void*>(weights_ptr),
         reinterpret_cast<const int32_t*>(pageIndices_ptr),
         reinterpret_cast<const int32_t*>(pageIndptr_ptr),
@@ -462,8 +466,8 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
 
 static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 30) {
-        Napi::TypeError::New(env, "Expected 30 args (…, outScores, causal, qGlobalStart, customMask, maskIndptr, maskKvLen, scores, rowLen, hist, meta, maxKv, numSplits, cpWorldSize, cpRank, globalLastPageLen)").ThrowAsJavaScriptException();
+    if (info.Length() < 31) {
+        Napi::TypeError::New(env, "Expected 31 args").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     glm_indexer_score_topk_v2(
@@ -472,33 +476,34 @@ static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
         reinterpret_cast<__nv_bfloat16*>((uintptr_t)info[2].As<Napi::Number>().Int64Value()),
         reinterpret_cast<const void*>((uintptr_t)info[3].As<Napi::Number>().Int64Value()),
         reinterpret_cast<const void*>((uintptr_t)info[4].As<Napi::Number>().Int64Value()),
-        reinterpret_cast<const void*>((uintptr_t)info[5].As<Napi::Number>().Int64Value()),
-        reinterpret_cast<const int32_t*>((uintptr_t)info[6].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const float*>((uintptr_t)info[5].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>((uintptr_t)info[6].As<Napi::Number>().Int64Value()),
         reinterpret_cast<const int32_t*>((uintptr_t)info[7].As<Napi::Number>().Int64Value()),
         reinterpret_cast<const int32_t*>((uintptr_t)info[8].As<Napi::Number>().Int64Value()),
         reinterpret_cast<const int32_t*>((uintptr_t)info[9].As<Napi::Number>().Int64Value()),
-        info[10].As<Napi::Number>().FloatValue(),
-        info[11].As<Napi::Number>().Int32Value(),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[10].As<Napi::Number>().Int64Value()),
+        info[11].As<Napi::Number>().FloatValue(),
         info[12].As<Napi::Number>().Int32Value(),
         info[13].As<Napi::Number>().Int32Value(),
         info[14].As<Napi::Number>().Int32Value(),
         info[15].As<Napi::Number>().Int32Value(),
         info[16].As<Napi::Number>().Int32Value(),
         info[17].As<Napi::Number>().Int32Value(),
-        reinterpret_cast<const uint8_t*>((uintptr_t)info[18].As<Napi::Number>().Int64Value()),
-        reinterpret_cast<const int32_t*>((uintptr_t)info[19].As<Napi::Number>().Int64Value()),
+        info[18].As<Napi::Number>().Int32Value(),
+        reinterpret_cast<const uint8_t*>((uintptr_t)info[19].As<Napi::Number>().Int64Value()),
         reinterpret_cast<const int32_t*>((uintptr_t)info[20].As<Napi::Number>().Int64Value()),
-        reinterpret_cast<void*>((uintptr_t)info[21].As<Napi::Number>().Int64Value()),
-        reinterpret_cast<int32_t*>((uintptr_t)info[22].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[21].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<void*>((uintptr_t)info[22].As<Napi::Number>().Int64Value()),
         reinterpret_cast<int32_t*>((uintptr_t)info[23].As<Napi::Number>().Int64Value()),
         reinterpret_cast<int32_t*>((uintptr_t)info[24].As<Napi::Number>().Int64Value()),
-        info[25].As<Napi::Number>().Int32Value(),
+        reinterpret_cast<int32_t*>((uintptr_t)info[25].As<Napi::Number>().Int64Value()),
         info[26].As<Napi::Number>().Int32Value(),
         info[27].As<Napi::Number>().Int32Value(),
         info[28].As<Napi::Number>().Int32Value(),
-        reinterpret_cast<const int32_t*>((uintptr_t)info[29].As<Napi::Number>().Int64Value()),
-        info.Length() > 30
-            ? reinterpret_cast<const int32_t*>((uintptr_t)info[30].As<Napi::Number>().Int64Value())
+        info[29].As<Napi::Number>().Int32Value(),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[30].As<Napi::Number>().Int64Value()),
+        info.Length() > 31
+            ? reinterpret_cast<const int32_t*>((uintptr_t)info[31].As<Napi::Number>().Int64Value())
             : nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -2461,20 +2466,21 @@ static Napi::Value MlaKvCacheAppend(const Napi::CallbackInfo& info) {
 
 static Napi::Value IndexerKvCacheAppendFlat(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 9) {
-        Napi::TypeError::New(env, "Expected 9 args (ctx, k_data, append_k, kv_token_indptr, batch_indices, positions, nnz, head_dim, append_stride_n)").ThrowAsJavaScriptException();
+    if (info.Length() < 10) {
+        Napi::TypeError::New(env, "Expected 10 args (ctx, k_data, k_scale_data, append_k, kv_token_indptr, batch_indices, positions, nnz, head_dim, append_stride_n)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     glm_indexer_kv_cache_append_flat(
         reinterpret_cast<GlmCtx*>((uintptr_t)info[0].As<Napi::Number>().Int64Value()),
         reinterpret_cast<void*>((uintptr_t)info[1].As<Napi::Number>().Int64Value()),
-        reinterpret_cast<const void*>((uintptr_t)info[2].As<Napi::Number>().Int64Value()),
-        reinterpret_cast<const int32_t*>((uintptr_t)info[3].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<float*>((uintptr_t)info[2].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>((uintptr_t)info[3].As<Napi::Number>().Int64Value()),
         reinterpret_cast<const int32_t*>((uintptr_t)info[4].As<Napi::Number>().Int64Value()),
         reinterpret_cast<const int32_t*>((uintptr_t)info[5].As<Napi::Number>().Int64Value()),
-        info[6].As<Napi::Number>().Uint32Value(),
+        reinterpret_cast<const int32_t*>((uintptr_t)info[6].As<Napi::Number>().Int64Value()),
         info[7].As<Napi::Number>().Uint32Value(),
-        (size_t)info[8].As<Napi::Number>().Int64Value());
+        info[8].As<Napi::Number>().Uint32Value(),
+        (size_t)info[9].As<Napi::Number>().Int64Value());
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("indexerKvCacheAppendFlat failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -2524,8 +2530,8 @@ static Napi::Value ConcatAndCacheDsMla(const Napi::CallbackInfo& info) {
 
 static Napi::Value AppendSelectedMtpCaches(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 22) {
-        Napi::TypeError::New(env, "Expected 22 args for appendSelectedMtpCaches").ThrowAsJavaScriptException();
+    if (info.Length() < 23) {
+        Napi::TypeError::New(env, "Expected 23 args for appendSelectedMtpCaches").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     auto ptr_arg = [&](int index) {
@@ -2534,20 +2540,20 @@ static Napi::Value AppendSelectedMtpCaches(const Napi::CallbackInfo& info) {
     glm_append_selected_mtp_caches(
         reinterpret_cast<GlmCtx*>(ptr_arg(0)),
         ptr_arg(1), ptr_arg(2), ptr_arg(3), ptr_arg(4), info[5].As<Napi::Number>().Uint32Value(),
-        ptr_arg(6), ptr_arg(7), info[8].As<Napi::Number>().Uint32Value(),
-        reinterpret_cast<int32_t*>(ptr_arg(9)),
+        ptr_arg(6), ptr_arg(7), ptr_arg(8), info[9].As<Napi::Number>().Uint32Value(),
         reinterpret_cast<int32_t*>(ptr_arg(10)),
         reinterpret_cast<int32_t*>(ptr_arg(11)),
         reinterpret_cast<int32_t*>(ptr_arg(12)),
         reinterpret_cast<int32_t*>(ptr_arg(13)),
-        info[14].As<Napi::Number>().Uint32Value(),
+        reinterpret_cast<int32_t*>(ptr_arg(14)),
         info[15].As<Napi::Number>().Uint32Value(),
         info[16].As<Napi::Number>().Uint32Value(),
         info[17].As<Napi::Number>().Uint32Value(),
         info[18].As<Napi::Number>().Uint32Value(),
-        info[19].As<Napi::Boolean>().Value(),
-        info[20].As<Napi::Number>().Uint32Value(),
-        info[21].As<Napi::Number>().Uint32Value());
+        info[19].As<Napi::Number>().Uint32Value(),
+        info[20].As<Napi::Boolean>().Value(),
+        info[21].As<Napi::Number>().Uint32Value(),
+        info[22].As<Napi::Number>().Uint32Value());
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("appendSelectedMtpCaches failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

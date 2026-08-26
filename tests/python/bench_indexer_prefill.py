@@ -67,7 +67,7 @@ class IndexerCase:
         self.q = torch.randn(
             self.local_q, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device
         )
-        self.k_data = pack_indexer_k(torch.randn(
+        self.k_data, self.k_scale_data = pack_indexer_k(torch.randn(
             self.max_kv // self.page_size,
             self.page_size,
             HEAD_DIM,
@@ -111,6 +111,7 @@ class IndexerCase:
             self.out_scores,
             self.q,
             self.k_data,
+            self.k_scale_data,
             self.weights,
             self.page_indices,
             self.page_indptr,
@@ -195,9 +196,11 @@ def main():
     device = torch.device(f"cuda:{gpu}")
     glm = GlmOps(device_id=gpu)
     config = os.environ.get("GLM_INDEXER_PREFILL_CONFIG", "auto")
+    fp8_config = os.environ.get("GLM_INDEXER_PREFILL_FP8_CONFIG", "auto")
 
     print(
-        f"Indexer prefill | GPU {gpu} | config={config} | chunk={args.chunk_size} "
+        f"Indexer prefill | GPU {gpu} | config={config} | fp8_config={fp8_config} "
+        f"| chunk={args.chunk_size} "
         f"| world={args.world_size} | rank={args.rank} | topk={args.topk}"
     )
     print("  kv_len   max_kv    latency   chunk tok/s   scored Gpair/s")

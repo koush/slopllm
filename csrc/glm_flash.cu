@@ -139,6 +139,7 @@ void glm_batch_decode_plan_impl(
 template <int HEAD_DIM>
 __global__ void indexer_kv_cache_append_kernel(
     uint8_t* __restrict__ k_data,
+    float* __restrict__ k_scale_data,
     const __nv_bfloat16* __restrict__ append_k,
     const int32_t* __restrict__ indices,
     const int32_t* __restrict__ indptr,
@@ -159,11 +160,11 @@ __global__ void indexer_kv_cache_append_kernel(
     const int batch = batch_indices[token_idx];
     const int page_id = indices[indptr[batch] + pos / effective_page_size];
     const size_t slot = (size_t)page_id * effective_page_size + pos % effective_page_size;
-    constexpr int ROW_BYTES = HEAD_DIM + INDEXER_FP8_SCALE_BYTES;
-    uint8_t* dst = k_data + slot * ROW_BYTES;
+    uint8_t* dst = k_data + slot * HEAD_DIM;
+    float* dst_scale = k_scale_data + slot;
     const __nv_bfloat16* src = append_k + (size_t)token_idx * append_stride_n;
     __shared__ float scratch[4];
-    pack_indexer_k_row<HEAD_DIM>(dst, src, scratch);
+    pack_indexer_k_row<HEAD_DIM>(dst, dst_scale, src, scratch);
 }
 
 extern "C" {
@@ -1016,12 +1017,12 @@ void glm_mla_kv_cache_append(
   if (head_dim_kpe == 0) {
     if (head_dim_ckv == 128) {
       indexer_kv_cache_append_kernel<128><<<nnz, 64, 0, GLM_STREAM(ctx)>>>(
-          (uint8_t*)ckv_data, (const __nv_bfloat16*)append_ckv,
+          (uint8_t*)ckv_data, (float*)kpe_data, (const __nv_bfloat16*)append_ckv,
           indices, indptr, batch_indices, positions, nnz, page_size,
           append_ckv_stride_n, cp_world_size, cp_rank);
     } else if (head_dim_ckv == 64) {
       indexer_kv_cache_append_kernel<64><<<nnz, 32, 0, GLM_STREAM(ctx)>>>(
-          (uint8_t*)ckv_data, (const __nv_bfloat16*)append_ckv,
+          (uint8_t*)ckv_data, (float*)kpe_data, (const __nv_bfloat16*)append_ckv,
           indices, indptr, batch_indices, positions, nnz, page_size,
           append_ckv_stride_n, cp_world_size, cp_rank);
     } else {
@@ -1186,6 +1187,7 @@ __global__ void append_selected_mtp_caches_kernel(
     uint32_t mla_layer_count,
     const __nv_bfloat16* const* __restrict__ indexer_src_ptrs,
     uint8_t* const* __restrict__ indexer_dst_ptrs,
+    float* const* __restrict__ indexer_dst_scale_ptrs,
     const int32_t* __restrict__ source_rows,
     const int32_t* __restrict__ indices,
     const int32_t* __restrict__ indptr,
@@ -1232,10 +1234,11 @@ __global__ void append_selected_mtp_caches_kernel(
 
     const uint32_t indexer_layer = layer_idx - mla_layer_count;
     const __nv_bfloat16* src = indexer_src_ptrs[indexer_layer] + (size_t)src_row * index_head_dim;
-    uint8_t* dst = indexer_dst_ptrs[indexer_layer] + slot * (index_head_dim + INDEXER_FP8_SCALE_BYTES);
+    uint8_t* dst = indexer_dst_ptrs[indexer_layer] + slot * index_head_dim;
+    float* dst_scale = indexer_dst_scale_ptrs[indexer_layer] + slot;
     __shared__ float scratch[4];
-    if (index_head_dim == 128) pack_indexer_k_row<128>(dst, src, scratch);
-    else if (index_head_dim == 64) pack_indexer_k_row<64>(dst, src, scratch);
+    if (index_head_dim == 128) pack_indexer_k_row<128>(dst, dst_scale, src, scratch);
+    else if (index_head_dim == 64) pack_indexer_k_row<64>(dst, dst_scale, src, scratch);
 }
 
 extern "C" {
@@ -1286,7 +1289,8 @@ void glm_append_selected_mtp_caches(
     GlmCtx* ctx,
     void* mla_src_ckv_ptrs, void* mla_src_kpe_ptrs,
     void* mla_dst_ckv_ptrs, void* mla_dst_kpe_ptrs, uint32_t mla_layer_count,
-    void* indexer_src_ptrs, void* indexer_dst_ptrs, uint32_t indexer_layer_count,
+    void* indexer_src_ptrs, void* indexer_dst_ptrs, void* indexer_dst_scale_ptrs,
+    uint32_t indexer_layer_count,
     int32_t* source_rows, int32_t* indices, int32_t* indptr,
     int32_t* batch_indices, int32_t* positions,
     uint32_t nnz, uint32_t page_size,
@@ -1308,6 +1312,7 @@ void glm_append_selected_mtp_caches(
         mla_layer_count, \
         (const __nv_bfloat16* const*)indexer_src_ptrs, \
         (uint8_t* const*)indexer_dst_ptrs, \
+        (float* const*)indexer_dst_scale_ptrs, \
         source_rows, indices, indptr, batch_indices, positions, \
         page_size, index_head_dim, cp_world_size, cp_rank)
 

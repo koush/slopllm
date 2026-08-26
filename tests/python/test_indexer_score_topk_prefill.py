@@ -14,7 +14,7 @@ from test_indexer_score_topk_v2 import _ref_scores, _check
 
 
 def _run_prefill(glm, s, topk, causal, device):
-    (q, k_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
+    (q, k_paged, k_scale_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
      scale, total_q, max_pages) = s
     n_heads, head_dim = q.shape[1], q.shape[2]
     page_size = k_paged.shape[1]
@@ -34,7 +34,7 @@ def _run_prefill(glm, s, topk, causal, device):
     meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
 
     glm.indexer_score_topk_prefill(
-        out, out_scores, q, k_paged, weights, pit, pipt, lplt, qoit, scale,
+        out, out_scores, q, k_paged, k_scale_paged, weights, pit, pipt, lplt, qoit, scale,
         total_q, n_heads, head_dim, page_size, topk, causal,
         scores, row_len, max_kv,
         coarse_hist, fine_hist, meta, num_splits,
@@ -57,7 +57,7 @@ def _run_prefill(glm, s, topk, causal, device):
 def test_prefill_matches_reference(glm, device, seq_lens, topk, causal):
     n_heads, head_dim, page_size = 32, 128, 64
     s = _setup_random_kv(len(seq_lens), seq_lens, n_heads, head_dim, page_size, device)
-    (q, k_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
+    (q, k_paged, k_scale_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
      scale, total_q, max_pages) = s
     out = _run_prefill(glm, s, topk, causal, device)
 
@@ -70,6 +70,7 @@ def test_prefill_matches_reference(glm, device, seq_lens, topk, causal):
                 continue
             page_start = pip[seq_idx]
             seq_page_indices = pil[page_start: pip[seq_idx + 1]]
-            ref = _ref_scores(q, k_paged, weights, seq_page_indices, pip, page_size, scale, numValid, t)
+            ref = _ref_scores(q, k_paged, k_scale_paged, weights, seq_page_indices,
+                              pip, page_size, scale, numValid, t)
             _check(out[t], ref, numValid, topk)
     print(f"\n[seq_lens={seq_lens} topk={topk} causal={causal}] prefill OK")

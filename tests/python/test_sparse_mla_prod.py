@@ -55,13 +55,13 @@ def _build_page_table_np(seq_lens, page_size, start_page_id=0):
     )
 
 
-def ref_indexer_score_topk(q_idx, k_data, weights, page_indices_np, page_indptr_np,
+def ref_indexer_score_topk(q_idx, k_data, k_scale_data, weights, page_indices_np, page_indptr_np,
                            last_page_len_np, qo_indptr_np, scale, idx_n_heads, idx_head_dim,
                            page_size, topk, causal, device):
     """PyTorch reference for indexer score+topk."""
     total_q = q_idx.shape[0]
     if k_data.dtype == torch.uint8:
-        k_data = unpack_indexer_k(k_data, idx_head_dim)
+        k_data = unpack_indexer_k(k_data, k_scale_data)
     out_idx = torch.full((total_q, topk), -1, dtype=torch.int32, device=device)
 
     for qi in range(total_q):
@@ -147,7 +147,7 @@ def prod_setup(glm, device):
         offset = pos % PAGE_SIZE
         page_id = page_indices_np[page_indptr_np[0] + page_in_seq]
         k_data_bf16[page_id, offset] = torch.randn(INDEX_HEAD_DIM, dtype=torch.bfloat16, device=device)
-    k_data = pack_indexer_k(k_data_bf16)
+    k_data, k_scale_data = pack_indexer_k(k_data_bf16)
 
     # Create indexer Q: [num_q, INDEX_N_HEADS, INDEX_HEAD_DIM]
     q_idx = torch.randn(num_q, INDEX_N_HEADS, INDEX_HEAD_DIM, dtype=torch.bfloat16, device=device)
@@ -162,7 +162,7 @@ def prod_setup(glm, device):
 
     return {
         'glm': glm, 'device': device,
-        'kv_cache': kv_cache, 'k_data': k_data,
+        'kv_cache': kv_cache, 'k_data': k_data, 'k_scale_data': k_scale_data,
         'q_idx': q_idx, 'weights': weights, 'q_mla': q_mla,
         'page_indices': page_indices, 'page_indptr': page_indptr,
         'last_page_len': last_page_len, 'batch_indices': batch_indices,
@@ -191,7 +191,7 @@ def test_indexer_score_topk_prod_dims(prod_setup, device):
     num_splits = min(256, max(1, (max_kv + 255) // 256))
 
     glm.indexer_score_topk_v2(
-        out_idx, out_scores, s['q_idx'], s['k_data'], s['weights'],
+        out_idx, out_scores, s['q_idx'], s['k_data'], s['k_scale_data'], s['weights'],
         s['page_indices'], s['page_indptr'], s['last_page_len'], s['qo_indptr'],
         INDEX_HEAD_DIM ** -0.5, total_q, INDEX_N_HEADS, INDEX_HEAD_DIM,
         PAGE_SIZE, TOPK, False,
@@ -201,7 +201,7 @@ def test_indexer_score_topk_prod_dims(prod_setup, device):
 
     # Reference
     ref_idx = ref_indexer_score_topk(
-        s['q_idx'], s['k_data'], s['weights'],
+        s['q_idx'], s['k_data'], s['k_scale_data'], s['weights'],
         s['page_indices_np'], s['page_indptr_np'], s['last_page_len_np'],
         np.array([0, total_q], dtype=np.int32),
         INDEX_HEAD_DIM ** -0.5, INDEX_N_HEADS, INDEX_HEAD_DIM,
@@ -268,7 +268,7 @@ def test_full_pipeline_decode_prod(prod_setup, device):
     meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
     num_splits = min(256, max(1, (max_kv + 255) // 256))
     glm.indexer_score_topk_v2(
-        out_idx, out_scores, s['q_idx'], s['k_data'], s['weights'],
+        out_idx, out_scores, s['q_idx'], s['k_data'], s['k_scale_data'], s['weights'],
         s['page_indices'], s['page_indptr'], s['last_page_len'], s['qo_indptr'],
         INDEX_HEAD_DIM ** -0.5, total_q, INDEX_N_HEADS, INDEX_HEAD_DIM,
         PAGE_SIZE, TOPK, False,

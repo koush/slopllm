@@ -1,6 +1,8 @@
 #include "glm_ops.h"
 #include "glm_indexer_cache.cuh"
 #include "glm_nvfp4.cuh"
+#include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -23,7 +25,8 @@ template <bool FLAT>
 __global__ void indexer_score_kernel(
     __nv_bfloat16* __restrict__ out,          // [totalQ, maxKvLen]
     const __nv_bfloat16* __restrict__ q,      // [totalQ, idxNHeads, idxHeadDim]
-    const uint8_t* __restrict__ kData,        // [maxPages, pageSize, idxHeadDim + 4]
+    const uint8_t* __restrict__ kData,        // [maxPages, pageSize, idxHeadDim]
+    const float* __restrict__ kScaleData,     // [maxPages, pageSize]
     const __nv_bfloat16* __restrict__ weights,// [totalQ, idxNHeads]
     const int32_t* __restrict__ pageIndices,  // [numPages]
     const int32_t* __restrict__ pageIndptr,   // [B+1]
@@ -79,9 +82,10 @@ __global__ void indexer_score_kernel(
     if constexpr (FLAT) {
         for (int localK = 0; localK < kvLen && localK <= causalLimit; localK++) {
             if (warpIdx < idxNHeads) {
-                const uint8_t* k_ptr = kData + (size_t)(flatStart + localK) * (idxHeadDim + INDEXER_FP8_SCALE_BYTES);
+                const size_t rowId = (size_t)flatStart + localK;
+                const uint8_t* k_ptr = kData + rowId * idxHeadDim;
                 const __nv_bfloat16* q_ptr = q_s + warpIdx * idxHeadDim;
-                const float k_scale = *reinterpret_cast<const float*>(k_ptr + idxHeadDim);
+                const float k_scale = kScaleData[rowId];
                 float partial = 0.0f;
                 for (int d = lane; d < idxHeadDim; d += 32)
                     partial += __bfloat162float(q_ptr[d]) * fp8_e4m3_to_float(k_ptr[d]);
@@ -118,9 +122,10 @@ __global__ void indexer_score_kernel(
 
                 // Each warp computes one head's dot product
                 if (warpIdx < idxNHeads) {
-                    const uint8_t* k_ptr = kData + ((size_t)pageId * pageSize + t) * (idxHeadDim + INDEXER_FP8_SCALE_BYTES);
+                    const size_t rowId = (size_t)pageId * pageSize + t;
+                    const uint8_t* k_ptr = kData + rowId * idxHeadDim;
                     const __nv_bfloat16* q_ptr = q_s + warpIdx * idxHeadDim;
-                    const float k_scale = *reinterpret_cast<const float*>(k_ptr + idxHeadDim);
+                    const float k_scale = kScaleData[rowId];
 
                     float partial = 0.0f;
                     for (int d = lane; d < idxHeadDim; d += 32) {
@@ -155,7 +160,7 @@ __global__ void indexer_score_kernel(
 }
 
 void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
-                       const void* weights, const int32_t* pageIndices,
+                       const float* kScaleData, const void* weights, const int32_t* pageIndices,
                        const int32_t* pageIndptr, const int32_t* lastPageLen,
                        const int32_t* qoIndptr, float scale,
                        int totalQ, int idxNHeads, int idxHeadDim,
@@ -170,11 +175,13 @@ void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
     if (kvTokenIndptr) {
         indexer_score_kernel<true><<<totalQ, block_size, smem_size, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)q, (const uint8_t*)kData,
+            kScaleData,
             (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
             scale, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal, kvTokenIndptr);
     } else {
         indexer_score_kernel<false><<<totalQ, block_size, smem_size, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)q, (const uint8_t*)kData,
+            kScaleData,
             (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr,
             scale, idxNHeads, idxHeadDim, pageSize, maxKvLen, causal, nullptr);
     }
@@ -183,6 +190,7 @@ void glm_indexer_score(GlmCtx* ctx, void* out, const void* q, const void* kData,
 template <int HEAD_DIM>
 __global__ void indexer_kv_cache_append_flat_kernel(
     uint8_t* __restrict__ kData,
+    float* __restrict__ kScaleData,
     const __nv_bfloat16* __restrict__ appendK,
     const int32_t* __restrict__ kvTokenIndptr,
     const int32_t* __restrict__ batchIndices,
@@ -190,14 +198,14 @@ __global__ void indexer_kv_cache_append_flat_kernel(
     uint32_t nnz, size_t appendStrideN) {
     for (uint32_t i = blockIdx.x; i < nnz; i += gridDim.x) {
         const size_t dstRow = (size_t)kvTokenIndptr[batchIndices[i]] + positions[i];
-        uint8_t* dst = kData + dstRow * (HEAD_DIM + INDEXER_FP8_SCALE_BYTES);
+        uint8_t* dst = kData + dstRow * HEAD_DIM;
         const __nv_bfloat16* src = appendK + (size_t)i * appendStrideN;
         __shared__ float scratch[4];
-        pack_indexer_k_row<HEAD_DIM>(dst, src, scratch);
+        pack_indexer_k_row<HEAD_DIM>(dst, kScaleData + dstRow, src, scratch);
     }
 }
 
-void glm_indexer_kv_cache_append_flat(GlmCtx* ctx, void* kData,
+void glm_indexer_kv_cache_append_flat(GlmCtx* ctx, void* kData, float* kScaleData,
     const void* appendK, const int32_t* kvTokenIndptr,
     const int32_t* batchIndices, const int32_t* positions,
     uint32_t nnz, uint32_t headDim, size_t appendStrideN) {
@@ -205,11 +213,11 @@ void glm_indexer_kv_cache_append_flat(GlmCtx* ctx, void* kData,
     const int blocks = min((uint32_t)65535, max((uint32_t)1, nnz));
     if (headDim == 128) {
         indexer_kv_cache_append_flat_kernel<128><<<blocks, 64, 0, GLM_STREAM(ctx)>>>(
-            (uint8_t*)kData, (const __nv_bfloat16*)appendK,
+            (uint8_t*)kData, kScaleData, (const __nv_bfloat16*)appendK,
             kvTokenIndptr, batchIndices, positions, nnz, appendStrideN);
     } else if (headDim == 64) {
         indexer_kv_cache_append_flat_kernel<64><<<blocks, 32, 0, GLM_STREAM(ctx)>>>(
-            (uint8_t*)kData, (const __nv_bfloat16*)appendK,
+            (uint8_t*)kData, kScaleData, (const __nv_bfloat16*)appendK,
             kvTokenIndptr, batchIndices, positions, nnz, appendStrideN);
     } else {
         fprintf(stderr, "glm_indexer_kv_cache_append_flat: unsupported headDim=%u\n", headDim);
@@ -967,7 +975,8 @@ __global__ void idx_score_kernel(
     __nv_bfloat16* __restrict__ scores,       // [totalQ, maxKv]
     int32_t* __restrict__ row_len,            // [totalQ]  (numValid per query)
     const __nv_bfloat16* __restrict__ q,      // [totalQ, idxNHeads, idxHeadDim]
-    const uint8_t* __restrict__ kData,        // [maxPages, pageSize, idxHeadDim + 4]
+    const uint8_t* __restrict__ kData,        // [maxPages, pageSize, idxHeadDim]
+    const float* __restrict__ kScaleData,     // [maxPages, pageSize]
     const __nv_bfloat16* __restrict__ weights,// [totalQ, idxNHeads]
     const int32_t* __restrict__ pageIndices, const int32_t* __restrict__ pageIndptr,
     const int32_t* __restrict__ lastPageLen, const int32_t* __restrict__ qoIndptr,
@@ -1040,15 +1049,15 @@ __global__ void idx_score_kernel(
                 continue;
             }
         }
-        const uint8_t* kbase;
+        size_t rowId;
         if constexpr (FLAT) {
-            kbase = kData + (size_t)(flatStart + pos) * (idxHeadDim + INDEXER_FP8_SCALE_BYTES);
+            rowId = (size_t)flatStart + pos;
         } else {
             const int pageId = pageIndices[pageStart + pos / pageSize];
-            kbase = kData + ((size_t)pageId * pageSize + pos % pageSize)
-                    * (idxHeadDim + INDEXER_FP8_SCALE_BYTES);
+            rowId = (size_t)pageId * pageSize + pos % pageSize;
         }
-        const float kScale = *reinterpret_cast<const float*>(kbase + idxHeadDim);
+        const uint8_t* kbase = kData + rowId * idxHeadDim;
+        const float kScale = kScaleData[rowId];
         float acc = 0.f;
         for (int h = 0; h < idxNHeads; h++) {
             const __nv_bfloat16* qh = q_s + h * idxHeadDim;
@@ -1074,6 +1083,16 @@ constexpr int Q_BYTES = NHEADS * HD;
 constexpr int WARPS = 8;
 constexpr int K_ROWS = 8;
 
+template <bool SWIZZLED>
+__device__ __forceinline__ const uint8_t* smem_row_ptr(
+    const uint8_t* base, int row, int col) {
+    if constexpr (SWIZZLED) {
+        const int swizzledVec = (col >> 4) ^ (row & 7);
+        return base + row * HD + swizzledVec * 16 + (col & 15);
+    }
+    return base + row * HD + col;
+}
+
 __device__ __forceinline__ void ldm_x4(uint32_t& a0, uint32_t& a1,
                                        uint32_t& a2, uint32_t& a3,
                                        const void* ptr) {
@@ -1089,19 +1108,60 @@ __device__ __forceinline__ void ldm_x2(uint32_t& b0, uint32_t& b1,
                  : "=r"(b0), "=r"(b1) : "r"(addr));
 }
 
+template <bool SWIZZLED = false>
 __device__ __forceinline__ void load_a(uint32_t& a0, uint32_t& a1,
                                        uint32_t& a2, uint32_t& a3,
-                                       const uint8_t* base, int lane) {
+                                       const uint8_t* base, int lane,
+                                       int kOffset = 0) {
     const int row = (lane & 7) + ((lane >> 3) & 1) * 8;
-    const int col = (lane >> 4) * 16;
-    ldm_x4(a0, a1, a2, a3, base + row * HD + col);
+    const int col = kOffset + (lane >> 4) * 16;
+    ldm_x4(a0, a1, a2, a3, smem_row_ptr<SWIZZLED>(base, row, col));
 }
 
+template <bool SWIZZLED = false>
 __device__ __forceinline__ void load_b(uint32_t& b0, uint32_t& b1,
-                                       const uint8_t* base, int lane) {
+                                       const uint8_t* base, int lane,
+                                       int kOffset = 0) {
     const int row = lane & 7;
-    const int col = ((lane >> 3) & 1) * 16;
-    ldm_x2(b0, b1, base + row * HD + col);
+    const int col = kOffset + ((lane >> 3) & 1) * 16;
+    ldm_x2(b0, b1, smem_row_ptr<SWIZZLED>(base, row, col));
+}
+
+__device__ __forceinline__ void tma_load_2d(
+    void* dst, const CUtensorMap& map, int x, int y, uint64_t* barrier) {
+    const uint32_t dstAddr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    const uint32_t barrierAddr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.tile "
+        "[%0], [%1, {%2, %3}], [%4];\n"
+        :: "r"(dstAddr), "l"(reinterpret_cast<uint64_t>(&map)),
+           "r"(x), "r"(y), "r"(barrierAddr) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_init(uint64_t* barrier) {
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(addr));
+}
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(
+    uint64_t* barrier, uint32_t bytes) {
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile(
+        "{ .reg .b64 state;\n"
+        "mbarrier.arrive.expect_tx.shared::cta.b64 state, [%0], %1;\n }\n"
+        :: "r"(addr), "r"(bytes) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait(uint64_t* barrier) {
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    uint32_t done = 0;
+    while (!done) {
+        asm volatile(
+            "{ .reg .pred p;\n"
+            "mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0;\n"
+            "selp.u32 %0, 1, 0, p;\n }\n"
+            : "=r"(done) : "r"(addr) : "memory");
+    }
 }
 
 struct Acc { float x0, x1, x2, x3; };
@@ -1128,13 +1188,15 @@ __device__ __forceinline__ Acc mma(uint32_t a0, uint32_t a1, uint32_t a2,
 
 __global__ void quantize_q_kernel(const __nv_bfloat16* __restrict__ q,
                                   const __nv_bfloat16* __restrict__ weights,
-                                  int32_t* __restrict__ hist, float scale) {
+                                  uint8_t* __restrict__ q8Data, int q8Stride,
+                                  float* __restrict__ effectiveWeights, int weightStride,
+                                  float scale) {
     const int qi = blockIdx.x;
     const int tid = threadIdx.x;
     const int head = tid >> 3;
     const int lane = tid & 7;
-    uint8_t* q8 = reinterpret_cast<uint8_t*>(hist + (size_t)qi * IDX_SCRATCH_I32);
-    float* ew = reinterpret_cast<float*>(q8 + Q_BYTES);
+    uint8_t* q8 = q8Data + (size_t)qi * q8Stride;
+    float* ew = effectiveWeights + (size_t)qi * weightStride;
     const __nv_bfloat16* src = q + (size_t)qi * Q_BYTES + head * HD;
 
     float vmax = 0.f;
@@ -1167,7 +1229,10 @@ __global__ void score_kernel(
     const uint8_t* __restrict__ custom_mask, const int32_t* __restrict__ mask_indptr,
     const int32_t* __restrict__ mask_kv_len, int cpWorldSize, int cpRank,
     const int32_t* __restrict__ globalLastPageLen,
-    const int32_t* __restrict__ kvTokenIndptr, int32_t* __restrict__ hist) {
+    const int32_t* __restrict__ kvTokenIndptr,
+    const uint8_t* __restrict__ q8Data, int q8Stride,
+    const float* __restrict__ effectiveWeights, int weightStride,
+    const float* __restrict__ kScaleData) {
     const int qi = blockIdx.y;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -1188,8 +1253,8 @@ __global__ void score_kernel(
         qSeqPos, nQuery, causal, kvLen, globalKvLen, cpW, cpRank) + 1;
     if (blockIdx.x == 0 && threadIdx.x == 0) row_len[qi] = numValid;
 
-    const uint8_t* tmp = reinterpret_cast<const uint8_t*>(hist + (size_t)qi * IDX_SCRATCH_I32);
-    const float* ew = reinterpret_cast<const float*>(tmp + Q_BYTES);
+    const uint8_t* tmp = q8Data + (size_t)qi * q8Stride;
+    const float* ew = effectiveWeights + (size_t)qi * weightStride;
     extern __shared__ uint8_t smem[];
     uint8_t* sq = smem;
     uint8_t* sk = sq + Q_BYTES + warp * K_ROWS * HD;
@@ -1216,14 +1281,17 @@ __global__ void score_kernel(
                 const uint8_t* row;
                 if constexpr (FLAT) {
                     const size_t rowId = (size_t)flatStart + (size_t)pos;
-                    row = kData + rowId * (HD + INDEXER_FP8_SCALE_BYTES);
+                    row = kData + rowId * HD;
+                    if (col == 0) skScale[n] = kScaleData[rowId];
                 } else {
                     const int pid = pageIndices[pageStart + pos / pageSize];
                     const size_t rowId = (size_t)pid * (size_t)pageSize + (size_t)(pos % pageSize);
-                    row = kData + rowId * (HD + INDEXER_FP8_SCALE_BYTES);
+                    row = kData + rowId * HD;
+                    if (col == 0) skScale[n] = kScaleData[rowId];
                 }
                 v = *reinterpret_cast<const uint32_t*>(row + col);
-                if (col == 0) skScale[n] = *reinterpret_cast<const float*>(row + HD);
+            } else if (col == 0) {
+                skScale[n] = 0.f;
             }
             *reinterpret_cast<uint32_t*>(sk + i) = v;
         }
@@ -1271,13 +1339,19 @@ __global__ void score_kernel(
 }
 } // namespace idxfp8
 
+static bool indexer_use_fp8_mma(int nHeads, int headDim) {
+    const char* env = std::getenv("GLM_INDEXER_DECODE_FP8_MMA");
+    return nHeads == idxfp8::NHEADS && headDim == idxfp8::HD
+        && (!env || std::strcmp(env, "0") != 0);
+}
+
 // Full v2 indexer top-k: multi-block score -> radix select. Drop-in
 // replacement for glm_indexer_score_topk with the same out_idx semantics.
 // scratch: scores [totalQ, maxKv] bf16, rowLen [totalQ] i32, hist [totalQ,1056]
 // i32, meta [totalQ, 4] i32.
 void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     __nv_bfloat16* out_scores,
-    const void* q, const void* kData, const void* weights,
+    const void* q, const void* kData, const float* kScaleData, const void* weights,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
     float scale, int totalQ, int idxNHeads, int idxHeadDim,
@@ -1297,12 +1371,14 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     // Dispatch the mask-free variant when there is no custom mask so its bit-test
     // path is compiled out (zero cost for the common case).
     const bool hasMask = custom_mask && mask_indptr;
-    const char* fp8Env = std::getenv("GLM_INDEXER_DECODE_FP8_MMA");
-    const bool useFp8Mma = idxNHeads == idxfp8::NHEADS && idxHeadDim == idxfp8::HD
-                        && (!fp8Env || std::strcmp(fp8Env, "0") != 0);
+    const bool useFp8Mma = indexer_use_fp8_mma(idxNHeads, idxHeadDim);
     if (useFp8Mma) {
+        uint8_t* q8Data = reinterpret_cast<uint8_t*>(hist);
+        float* effectiveWeights = reinterpret_cast<float*>(q8Data + idxfp8::Q_BYTES);
         idxfp8::quantize_q_kernel<<<totalQ, 256, 0, stream>>>(
-            (const __nv_bfloat16*)q, (const __nv_bfloat16*)weights, hist, scale);
+            (const __nv_bfloat16*)q, (const __nv_bfloat16*)weights,
+            q8Data, IDX_SCRATCH_I32 * sizeof(int32_t),
+            effectiveWeights, IDX_SCRATCH_I32, scale);
         const size_t fp8Smem = idxfp8::Q_BYTES
             + idxfp8::WARPS * idxfp8::K_ROWS * idxfp8::HD
             + idxfp8::WARPS * idxfp8::K_ROWS * sizeof(float);
@@ -1311,7 +1387,8 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
             (__nv_bfloat16*)scores, rowLen, (const uint8_t*)kData, pageIndices, pageIndptr, \
             lastPageLen, qoIndptr, pageSize, maxKv, causal, qGlobalStart, custom_mask, mask_indptr, \
             mask_kv_len, effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, \
-            kvTokenIndptr, hist)
+            kvTokenIndptr, q8Data, IDX_SCRATCH_I32 * sizeof(int32_t), \
+            effectiveWeights, IDX_SCRATCH_I32, kScaleData)
         if (kvTokenIndptr) {
             if (hasMask) LAUNCH_IDX_FP8(true, true); else LAUNCH_IDX_FP8(false, true);
         } else {
@@ -1326,7 +1403,7 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
 #define LAUNCH_IDX_SCORE(HAS_MASK, FLAT) \
     idx_score_kernel<(HAS_MASK), (FLAT)><<<grid, block, smem, stream>>>( \
         (__nv_bfloat16*)scores, rowLen, (const __nv_bfloat16*)q, (const uint8_t*)kData, \
-        (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr, \
+        kScaleData, (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr, \
         scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal, \
         qGlobalStart, custom_mask, mask_indptr, mask_kv_len, \
         effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, kvTokenIndptr)
@@ -1450,7 +1527,8 @@ idx_prefill_score_mma_kernel(
     __nv_bfloat16* __restrict__ scores,       // [totalQ, maxKv]
     int32_t* __restrict__ rowLen,             // [totalQ]
     const __nv_bfloat16* __restrict__ q,      // [totalQ, idxNHeads, idxHeadDim]
-    const uint8_t* __restrict__ kData,        // [maxPages, pageSize, idxHeadDim + 4]
+    const uint8_t* __restrict__ kData,        // [maxPages, pageSize, idxHeadDim]
+    const float* __restrict__ kScaleData,     // [maxPages, pageSize]
     const __nv_bfloat16* __restrict__ weights,// [totalQ, idxNHeads]
     const int32_t* __restrict__ pageIndices, const int32_t* __restrict__ pageIndptr,
     const int32_t* __restrict__ lastPageLen, const int32_t* __restrict__ qoIndptr,
@@ -1567,15 +1645,15 @@ idx_prefill_score_mma_kernel(
         int gpos = tileStart + pos;
         __nv_bfloat16 v = __float2bfloat16(0.f);
         if (gpos < kvLen) {
-            const uint8_t* row;
+            size_t rowId;
             if constexpr (FLAT) {
-                row = kData + ((size_t)flatStart + gpos) * (idxHeadDim + INDEXER_FP8_SCALE_BYTES);
+                rowId = (size_t)flatStart + gpos;
             } else {
                 int pageId = pageIndices[pageStart + gpos / pageSize];
-                row = kData + ((size_t)pageId * pageSize + gpos % pageSize)
-                      * (idxHeadDim + INDEXER_FP8_SCALE_BYTES);
+                rowId = (size_t)pageId * pageSize + gpos % pageSize;
             }
-            const float rowScale = *reinterpret_cast<const float*>(row + idxHeadDim);
+            const uint8_t* row = kData + rowId * idxHeadDim;
+            const float rowScale = kScaleData[rowId];
             v = __float2bfloat16(fp8_e4m3_to_float(row[d]) * rowScale);
         }
         smem_b[(size_t)d * strideB + pos] = v;
@@ -1708,6 +1786,319 @@ idx_prefill_score_mma_kernel(
             write_one(ql0, pos_base + 1, acc[mi][ni].reg[1]);
             write_one(ql1, pos_base,     acc[mi][ni].reg[2]);
             write_one(ql1, pos_base + 1, acc[mi][ni].reg[3]);
+        }
+    }
+}
+
+// Production-shape prefill scorer using SM120 block-scaled FP8 MMA. Q is
+// quantized once into caller scratch; each CTA then reuses one packed K tile
+// across a query tile and all 32 heads. Q_BATCH=2 preserves the pipelined
+// single-head staging path; larger batches keep several heads resident and
+// amortize block-wide synchronization across them.
+template <int TM, int TN, int WARPS, int Q_BATCH, bool FLAT, bool TMA_SWIZZLE = false>
+__global__ void __launch_bounds__(WARPS * 32)
+idx_prefill_score_fp8_mma_kernel(
+    __grid_constant__ CUtensorMap const kTensorMap,
+    __nv_bfloat16* __restrict__ scores, int32_t* __restrict__ rowLen,
+    const uint8_t* __restrict__ q8Data, int q8Stride,
+    const float* __restrict__ effectiveWeights, int weightStride,
+    const uint8_t* __restrict__ kData,
+    const float* __restrict__ kScaleData,
+    const int32_t* __restrict__ pageIndices, const int32_t* __restrict__ pageIndptr,
+    const int32_t* __restrict__ lastPageLen, const int32_t* __restrict__ qoIndptr,
+    int totalQ, int pageSize, int maxKv, int causal, int qGlobalStart,
+    const uint8_t* __restrict__ custom_mask,
+    const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len,
+    int cpWorldSize, int cpRank, const int32_t* __restrict__ globalLastPageLen,
+    const int32_t* __restrict__ kvTokenIndptr)
+{
+    constexpr int CTA = WARPS * 32;
+    constexpr int NUM_M = TM / 16;
+    constexpr int NPW = TN / (idxfp8::K_ROWS * WARPS);
+    static_assert(TM % 16 == 0);
+    static_assert(TN % (idxfp8::K_ROWS * WARPS) == 0);
+    static_assert(Q_BATCH >= 2 && idxfp8::NHEADS % Q_BATCH == 0);
+    static_assert(!TMA_SWIZZLE || (FLAT && TN == 256));
+
+    const int gy = blockIdx.y;
+    int seq = -1, qStart = 0;
+    {
+        int acc = 0;
+        for (int s = 0; ; s++) {
+            const int qs = qoIndptr[s], qe = qoIndptr[s + 1];
+            const int nt = (qe - qs + TM - 1) / TM;
+            if (gy < acc + nt) { seq = s; qStart = qs + (gy - acc) * TM; break; }
+            acc += nt;
+            if (qe >= totalQ) break;
+        }
+    }
+    if (seq < 0 || qStart >= totalQ) return;
+
+    const int qoStart = qoIndptr[seq];
+    const int numQueries = qoIndptr[seq + 1] - qoStart;
+    const int mValid = min(TM, min(qoIndptr[seq + 1], totalQ) - qStart);
+    const int pageStart = FLAT ? 0 : pageIndptr[seq];
+    const int numPages = FLAT ? 0 : pageIndptr[seq + 1] - pageStart;
+    const int flatStart = FLAT ? kvTokenIndptr[seq] : 0;
+    const int kvLen = FLAT
+        ? kvTokenIndptr[seq + 1] - flatStart
+        : (numPages ? (numPages - 1) * pageSize + lastPageLen[seq] : 0);
+    const int cpW = (cpWorldSize > 1 && globalLastPageLen) ? cpWorldSize : 1;
+    const int globalKvLen = cpW > 1
+        ? (numPages ? (numPages - 1) * pageSize * cpW + globalLastPageLen[seq] : 0)
+        : kvLen;
+    const int tileStart = blockIdx.x * TN;
+    if (tileStart >= kvLen) return;
+
+    __shared__ int causalLimit[TM];
+    for (int ql = threadIdx.x; ql < mValid; ql += CTA) {
+        causalLimit[ql] = idx_local_causal_limit(
+            qStart + ql - qoStart + qGlobalStart, numQueries, causal,
+            kvLen, globalKvLen, cpW, cpRank);
+    }
+    __syncthreads();
+    if (tileStart > causalLimit[mValid - 1]) return;
+
+    const uint8_t* mask = nullptr;
+    int maskKv = 0, maskPrefix = 0;
+    if (custom_mask && mask_indptr) {
+        mask = custom_mask + mask_indptr[seq];
+        maskKv = mask_kv_len ? mask_kv_len[seq] : numQueries;
+        maskPrefix = max(0, globalKvLen - maskKv);
+    }
+    const int cpMaskW = cpW > 1 ? cpW : 0;
+    if (blockIdx.x == 0) {
+        for (int ql = threadIdx.x; ql < mValid; ql += CTA)
+            rowLen[qStart + ql] = causalLimit[ql] + 1;
+    }
+
+    extern __shared__ __align__(1024) char smem[];
+    uint8_t* sk = reinterpret_cast<uint8_t*>(smem);
+    float* skScale = reinterpret_cast<float*>(sk + TN * idxfp8::HD);
+    uint8_t* sq0 = reinterpret_cast<uint8_t*>(skScale + TN);
+    float* sharedWeights = reinterpret_cast<float*>(
+        sq0 + Q_BATCH * TM * idxfp8::HD);
+    uint64_t* kBarrier = reinterpret_cast<uint64_t*>(
+        sharedWeights + TM * idxfp8::NHEADS);
+
+    if constexpr (TMA_SWIZZLE) {
+        if (threadIdx.x == 0) {
+            idxfp8::mbarrier_init(kBarrier);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            idxfp8::mbarrier_arrive_expect_tx(kBarrier, TN * idxfp8::HD);
+            idxfp8::tma_load_2d(sk, kTensorMap, 0, flatStart + tileStart, kBarrier);
+        }
+        for (int n = threadIdx.x; n < TN; n += CTA) {
+            const int pos = tileStart + n;
+            skScale[n] = pos < kvLen ? kScaleData[flatStart + pos] : 0.f;
+        }
+    } else {
+        for (int i = threadIdx.x * 4; i < TN * idxfp8::HD; i += CTA * 4) {
+            const int n = i / idxfp8::HD, col = i % idxfp8::HD;
+            const int pos = tileStart + n;
+            uint32_t value = 0;
+            float rowScale = 0.f;
+            if (pos < kvLen) {
+                size_t rowId;
+                if constexpr (FLAT) {
+                    rowId = (size_t)flatStart + pos;
+                } else {
+                    const int pageId = pageIndices[pageStart + pos / pageSize];
+                    rowId = (size_t)pageId * pageSize + pos % pageSize;
+                }
+                const uint8_t* row = kData + rowId * idxfp8::HD;
+                value = *reinterpret_cast<const uint32_t*>(row + col);
+                if (col == 0) rowScale = kScaleData[rowId];
+            }
+            *reinterpret_cast<uint32_t*>(sk + i) = value;
+            if (col == 0) skScale[n] = rowScale;
+        }
+    }
+    for (int i = threadIdx.x; i < TM * idxfp8::NHEADS; i += CTA) {
+        const int ql = i / idxfp8::NHEADS, h = i % idxfp8::NHEADS;
+        sharedWeights[i] = ql < mValid
+            ? effectiveWeights[(size_t)(qStart + ql) * weightStride + h] : 0.f;
+    }
+    if constexpr (TMA_SWIZZLE) {
+        if (threadIdx.x == 0) idxfp8::mbarrier_wait(kBarrier);
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warpCol = warp * idxfp8::K_ROWS * NPW;
+
+    for (int i = threadIdx.x; i < Q_BATCH * TM * idxfp8::HD; i += CTA) sq0[i] = 0;
+    __syncthreads();
+
+    idxfp8::Acc acc[NUM_M][NPW];
+#pragma unroll
+    for (int mi = 0; mi < NUM_M; mi++)
+#pragma unroll
+        for (int ni = 0; ni < NPW; ni++)
+            acc[mi][ni] = {0.f, 0.f, 0.f, 0.f};
+
+    auto issueQ = [&](int h, uint8_t* dst) {
+        for (int i = threadIdx.x * 16; i < TM * idxfp8::HD; i += CTA * 16) {
+            const int ql = i / idxfp8::HD, col = i % idxfp8::HD;
+            const uint8_t* src = q8Data + (size_t)(qStart + ql) * q8Stride
+                + h * idxfp8::HD + col;
+            uint8_t* qDst = dst + i;
+            if constexpr (TMA_SWIZZLE) {
+                qDst = const_cast<uint8_t*>(idxfp8::smem_row_ptr<true>(dst, ql, col));
+            }
+            idxmma::cp_async16(qDst, src, ql < mValid);
+        }
+    };
+
+    if constexpr (Q_BATCH == 2) {
+        issueQ(0, sq0);
+        idxmma::cp_commit();
+        for (int h = 0; h < idxfp8::NHEADS; h++) {
+            if (h + 1 < idxfp8::NHEADS) {
+                issueQ(h + 1, sq0 + ((h + 1) & 1) * TM * idxfp8::HD);
+                idxmma::cp_commit();
+                idxmma::cp_wait<1>();
+            } else {
+                idxmma::cp_wait<0>();
+            }
+            __syncthreads();
+            const uint8_t* qHead = sq0 + (h & 1) * TM * idxfp8::HD;
+
+            idxfp8::Acc c[NUM_M][NPW];
+#pragma unroll
+            for (int mi = 0; mi < NUM_M; mi++)
+#pragma unroll
+                for (int ni = 0; ni < NPW; ni++)
+                    c[mi][ni] = {0.f, 0.f, 0.f, 0.f};
+
+#pragma unroll
+            for (int kk = 0; kk < idxfp8::HD; kk += 32) {
+                uint32_t a0[NUM_M], a1[NUM_M], a2[NUM_M], a3[NUM_M];
+#pragma unroll
+                for (int mi = 0; mi < NUM_M; mi++)
+                    idxfp8::load_a<TMA_SWIZZLE>(a0[mi], a1[mi], a2[mi], a3[mi],
+                                   qHead + mi * 16 * idxfp8::HD, lane, kk);
+#pragma unroll
+                for (int ni = 0; ni < NPW; ni++) {
+                    uint32_t b0, b1;
+                    idxfp8::load_b<TMA_SWIZZLE>(b0, b1,
+                        sk + (warpCol + ni * idxfp8::K_ROWS) * idxfp8::HD, lane, kk);
+#pragma unroll
+                    for (int mi = 0; mi < NUM_M; mi++)
+                        c[mi][ni] = idxfp8::mma(a0[mi], a1[mi], a2[mi], a3[mi],
+                                                b0, b1, c[mi][ni]);
+                }
+            }
+
+            const int group = lane >> 2;
+#pragma unroll
+            for (int mi = 0; mi < NUM_M; mi++) {
+                const int q0 = mi * 16 + group;
+                const int q1 = q0 + 8;
+                const float w0 = q0 < mValid
+                    ? sharedWeights[q0 * idxfp8::NHEADS + h] : 0.f;
+                const float w1 = q1 < mValid
+                    ? sharedWeights[q1 * idxfp8::NHEADS + h] : 0.f;
+#pragma unroll
+                for (int ni = 0; ni < NPW; ni++) {
+                    acc[mi][ni].x0 += w0 * fmaxf(c[mi][ni].x0, 0.f);
+                    acc[mi][ni].x1 += w0 * fmaxf(c[mi][ni].x1, 0.f);
+                    acc[mi][ni].x2 += w1 * fmaxf(c[mi][ni].x2, 0.f);
+                    acc[mi][ni].x3 += w1 * fmaxf(c[mi][ni].x3, 0.f);
+                }
+            }
+            __syncthreads();
+        }
+    } else {
+        for (int hBase = 0; hBase < idxfp8::NHEADS; hBase += Q_BATCH) {
+#pragma unroll
+            for (int hi = 0; hi < Q_BATCH; hi++)
+                issueQ(hBase + hi, sq0 + hi * TM * idxfp8::HD);
+            idxmma::cp_commit();
+            idxmma::cp_wait<0>();
+            __syncthreads();
+
+#pragma unroll
+            for (int hi = 0; hi < Q_BATCH; hi++) {
+                const int h = hBase + hi;
+                const uint8_t* qHead = sq0 + hi * TM * idxfp8::HD;
+                idxfp8::Acc c[NUM_M][NPW];
+#pragma unroll
+                for (int mi = 0; mi < NUM_M; mi++)
+#pragma unroll
+                    for (int ni = 0; ni < NPW; ni++)
+                        c[mi][ni] = {0.f, 0.f, 0.f, 0.f};
+
+#pragma unroll
+                for (int kk = 0; kk < idxfp8::HD; kk += 32) {
+                    uint32_t a0[NUM_M], a1[NUM_M], a2[NUM_M], a3[NUM_M];
+#pragma unroll
+                    for (int mi = 0; mi < NUM_M; mi++)
+                        idxfp8::load_a<TMA_SWIZZLE>(a0[mi], a1[mi], a2[mi], a3[mi],
+                                       qHead + mi * 16 * idxfp8::HD, lane, kk);
+#pragma unroll
+                    for (int ni = 0; ni < NPW; ni++) {
+                        uint32_t b0, b1;
+                        idxfp8::load_b<TMA_SWIZZLE>(b0, b1,
+                            sk + (warpCol + ni * idxfp8::K_ROWS) * idxfp8::HD,
+                            lane, kk);
+#pragma unroll
+                        for (int mi = 0; mi < NUM_M; mi++)
+                            c[mi][ni] = idxfp8::mma(a0[mi], a1[mi], a2[mi], a3[mi],
+                                                    b0, b1, c[mi][ni]);
+                    }
+                }
+
+                const int group = lane >> 2;
+#pragma unroll
+                for (int mi = 0; mi < NUM_M; mi++) {
+                    const int q0 = mi * 16 + group;
+                    const int q1 = q0 + 8;
+                    const float w0 = q0 < mValid
+                        ? sharedWeights[q0 * idxfp8::NHEADS + h] : 0.f;
+                    const float w1 = q1 < mValid
+                        ? sharedWeights[q1 * idxfp8::NHEADS + h] : 0.f;
+#pragma unroll
+                    for (int ni = 0; ni < NPW; ni++) {
+                        acc[mi][ni].x0 += w0 * fmaxf(c[mi][ni].x0, 0.f);
+                        acc[mi][ni].x1 += w0 * fmaxf(c[mi][ni].x1, 0.f);
+                        acc[mi][ni].x2 += w1 * fmaxf(c[mi][ni].x2, 0.f);
+                        acc[mi][ni].x3 += w1 * fmaxf(c[mi][ni].x3, 0.f);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    const int group = lane >> 2;
+    const int colBase = (lane & 3) * 2;
+    auto writeOne = [&](int ql, int posInTile, float value) {
+        if (ql >= mValid) return;
+        const int pos = tileStart + posInTile;
+        if (pos >= kvLen || pos > causalLimit[ql]) return;
+        const int qg = qStart + ql;
+        const bool masked = mask && idx_is_masked(
+            cp_remap(pos, cpMaskW, cpRank), qg - qoStart + qGlobalStart,
+            mask, maskKv, maskPrefix);
+        scores[(size_t)qg * maxKv + pos] = masked
+            ? __float2bfloat16(-INFINITY)
+            : __float2bfloat16(value * skScale[posInTile]);
+    };
+#pragma unroll
+    for (int mi = 0; mi < NUM_M; mi++) {
+        const int q0 = mi * 16 + group;
+        const int q1 = q0 + 8;
+#pragma unroll
+        for (int ni = 0; ni < NPW; ni++) {
+            const int pos = warpCol + ni * idxfp8::K_ROWS + colBase;
+            writeOne(q0, pos, acc[mi][ni].x0);
+            writeOne(q0, pos + 1, acc[mi][ni].x1);
+            writeOne(q1, pos, acc[mi][ni].x2);
+            writeOne(q1, pos + 1, acc[mi][ni].x3);
         }
     }
 }
@@ -1991,10 +2382,38 @@ __global__ void idx_prefill_gather_buf_kernel(
     }
 }
 
+static bool make_indexer_k_tma_map(
+    CUtensorMap* map, const void* kData, uint64_t rows) {
+    static PFN_cuTensorMapEncodeTiled_v12000 encode = [] {
+        void* entry = nullptr;
+        cudaDriverEntryPointQueryResult queryResult;
+        cudaError_t status = cudaGetDriverEntryPointByVersion(
+            "cuTensorMapEncodeTiled", &entry, 12000,
+            cudaEnableDefault, &queryResult);
+        if (status != cudaSuccess || queryResult != cudaDriverEntryPointSuccess) {
+            return static_cast<PFN_cuTensorMapEncodeTiled_v12000>(nullptr);
+        }
+        return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(entry);
+    }();
+    if (!encode || rows == 0) return false;
+
+    constexpr uint32_t rank = 2;
+    const uint64_t globalDims[rank] = {idxfp8::HD, rows};
+    const uint64_t globalStrides[rank - 1] = {idxfp8::HD};
+    const uint32_t boxDims[rank] = {idxfp8::HD, 256};
+    const uint32_t elementStrides[rank] = {1, 1};
+    return encode(
+        map, CU_TENSOR_MAP_DATA_TYPE_UINT8, rank,
+        const_cast<void*>(kData), globalDims, globalStrides,
+        boxDims, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+
 // Host function: score once into buffer, then 2-level histogram top-K.
 void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     __nv_bfloat16* out_scores,
-    const void* q, const void* kData, const void* weights,
+    const void* q, const void* kData, const float* kScaleData, const void* weights,
     const int32_t* pageIndices, const int32_t* pageIndptr,
     const int32_t* lastPageLen, const int32_t* qoIndptr,
     float scale, int totalQ, int idxNHeads, int idxHeadDim,
@@ -2009,14 +2428,52 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     const int effectiveCpWorldSize = kvTokenIndptr ? 0 : cpWorldSize;
     const int effectiveCpRank = kvTokenIndptr ? 0 : cpRank;
 
-    // Zero histograms and meta.
-    cudaMemsetAsync(coarseHist, 0, (size_t)totalQ * IDX_COARSE_BUCKETS * sizeof(int32_t), stream);
-    cudaMemsetAsync(fineHist, 0, (size_t)totalQ * IDX_FINE_BUCKETS * sizeof(int32_t), stream);
-    cudaMemsetAsync(meta, 0, (size_t)totalQ * 4 * sizeof(int32_t), stream);
-
     // Pass 1: tensor-core score into buffer. queryTiles is a graph-stable upper
     // bound for sum(ceil(sequenceQ/TM)); out-of-range tiles return immediately.
-    {
+    if (indexer_use_fp8_mma(idxNHeads, idxHeadDim)) {
+        uint8_t* q8Data = reinterpret_cast<uint8_t*>(coarseHist);
+        float* effectiveWeights = reinterpret_cast<float*>(fineHist);
+        idxfp8::quantize_q_kernel<<<totalQ, 256, 0, stream>>>(
+            (const __nv_bfloat16*)q, (const __nv_bfloat16*)weights,
+            q8Data, IDX_COARSE_BUCKETS * sizeof(int32_t),
+            effectiveWeights, IDX_FINE_BUCKETS, scale);
+#define LAUNCH_INDEXER_PREFILL_FP8(TM, TN, WARPS, Q_BATCH, FLAT, TMA_SWIZZLE) do { \
+        const size_t fp8Smem = (TN) * idxfp8::HD + (TN) * sizeof(float) \
+            + (Q_BATCH) * (TM) * idxfp8::HD \
+            + (TM) * idxfp8::NHEADS * sizeof(float) + sizeof(uint64_t); \
+        cudaFuncSetAttribute( \
+            (void*)idx_prefill_score_fp8_mma_kernel<(TM), (TN), (WARPS), (Q_BATCH), (FLAT), (TMA_SWIZZLE)>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)fp8Smem); \
+        dim3 grid((maxKv + (TN) - 1) / (TN), queryTiles * (64 / (TM))); \
+        idx_prefill_score_fp8_mma_kernel<(TM), (TN), (WARPS), (Q_BATCH), (FLAT), (TMA_SWIZZLE)> \
+            <<<grid, (WARPS) * 32, fp8Smem, stream>>>( \
+                kTensorMap, (__nv_bfloat16*)scores, rowLen, q8Data, \
+                IDX_COARSE_BUCKETS * sizeof(int32_t), effectiveWeights, \
+                IDX_FINE_BUCKETS, (const uint8_t*)kData, kScaleData, pageIndices, pageIndptr, \
+                lastPageLen, qoIndptr, totalQ, pageSize, maxKv, causal, \
+                qGlobalStart, custom_mask, mask_indptr, mask_kv_len, \
+                effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, kvTokenIndptr); \
+    } while (0)
+        const char* fp8Config = std::getenv("GLM_INDEXER_PREFILL_FP8_CONFIG");
+        const bool tmaRequested = (fp8Config
+            && std::strcmp(fp8Config, "q32_k256_w8_h8_tma") == 0)
+            || (!fp8Config && kvTokenIndptr);
+        const bool batchedQ = tmaRequested || (fp8Config
+            && std::strcmp(fp8Config, "q32_k256_w8_h8") == 0);
+        CUtensorMap kTensorMap{};
+        const bool useTma = tmaRequested && kvTokenIndptr
+            && make_indexer_k_tma_map(&kTensorMap, kData, maxKv);
+        if (useTma) {
+            LAUNCH_INDEXER_PREFILL_FP8(32, 256, 8, 8, true, true);
+        } else if (batchedQ) {
+            if (kvTokenIndptr) LAUNCH_INDEXER_PREFILL_FP8(32, 256, 8, 8, true, false);
+            else LAUNCH_INDEXER_PREFILL_FP8(32, 256, 8, 8, false, false);
+        } else {
+            if (kvTokenIndptr) LAUNCH_INDEXER_PREFILL_FP8(64, 288, 12, 2, true, false);
+            else LAUNCH_INDEXER_PREFILL_FP8(64, 288, 12, 2, false, false);
+        }
+#undef LAUNCH_INDEXER_PREFILL_FP8
+    } else {
 #define LAUNCH_INDEXER_PREFILL(TM, TN, WARPS, Q_BUFFERS, FLAT) do { \
         constexpr int cta = (WARPS) * 32; \
         const int strideA = idxHeadDim + idxmma::PAD_A; \
@@ -2031,7 +2488,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
         idx_prefill_score_mma_kernel<(TM), (TN), (WARPS), (Q_BUFFERS), (FLAT)> \
             <<<grid, cta, mma_smem, stream>>>( \
                 (__nv_bfloat16*)scores, rowLen, \
-                 (const __nv_bfloat16*)q, (const uint8_t*)kData, \
+                 (const __nv_bfloat16*)q, (const uint8_t*)kData, kScaleData, \
                 (const __nv_bfloat16*)weights, pageIndices, pageIndptr, lastPageLen, qoIndptr, \
                 totalQ, scale, idxNHeads, idxHeadDim, pageSize, maxKv, causal, \
                 qGlobalStart, custom_mask, mask_indptr, mask_kv_len, \
@@ -2063,6 +2520,12 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
         }
 #undef LAUNCH_INDEXER_PREFILL
     }
+
+    // FP8 scoring borrows both histogram buffers for quantized Q and effective
+    // weights. Stream ordering makes them safe to clear once scoring completes.
+    cudaMemsetAsync(coarseHist, 0, (size_t)totalQ * IDX_COARSE_BUCKETS * sizeof(int32_t), stream);
+    cudaMemsetAsync(fineHist, 0, (size_t)totalQ * IDX_FINE_BUCKETS * sizeof(int32_t), stream);
+    cudaMemsetAsync(meta, 0, (size_t)totalQ * 4 * sizeof(int32_t), stream);
 
     // Passes 2-6: histogram + gather from buffer.
     {

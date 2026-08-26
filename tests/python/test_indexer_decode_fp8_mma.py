@@ -19,8 +19,8 @@ def _quantize_q(q):
     return q8, q_scale
 
 
-def _oracle(q, packed_rows, weights, scale, fp8_q):
-    k = unpack_indexer_k(packed_rows, 128).float()
+def _oracle(q, rows, row_scales, weights, scale, fp8_q):
+    k = unpack_indexer_k(rows, row_scales).float()
     if fp8_q:
         qv, q_scale = _quantize_q(q)
         qv = qv * q_scale
@@ -30,10 +30,10 @@ def _oracle(q, packed_rows, weights, scale, fp8_q):
     return (weights[0].float()[:, None] * torch.relu(dots * scale)).sum(0).to(torch.bfloat16)
 
 
-def _run(glm, q, k_data, packed_rows, weights, page_indices, page_indptr,
+def _run(glm, q, k_data, k_scale_data, rows, weights, page_indices, page_indptr,
          last_page_len, qo_indptr, page_size, topk, flat_indptr=None,
          max_kv=None, **kwargs):
-    length = packed_rows.shape[0]
+    length = rows.shape[0]
     max_kv = max_kv or length
     out = torch.full((1, topk), -2, dtype=torch.int32, device=q.device)
     out_scores = torch.full((1, topk), -torch.inf, dtype=torch.bfloat16, device=q.device)
@@ -42,7 +42,7 @@ def _run(glm, q, k_data, packed_rows, weights, page_indices, page_indptr,
     hist = torch.empty(1, TOPK_SCRATCH_I32, dtype=torch.int32, device=q.device)
     meta = torch.empty(1, 4, dtype=torch.int32, device=q.device)
     glm.indexer_score_topk_v2(
-        out, out_scores, q, k_data, weights, page_indices, page_indptr,
+        out, out_scores, q, k_data, k_scale_data, weights, page_indices, page_indptr,
         last_page_len, qo_indptr, 128 ** -0.5, 1, 32, 128, page_size,
         topk, False, scores, row_len, hist, meta, max_kv,
         max(1, (max_kv + 255) // 256), kv_token_indptr=flat_indptr,
@@ -56,21 +56,25 @@ def _run(glm, q, k_data, packed_rows, weights, page_indices, page_indptr,
 def decode_case(device):
     torch.manual_seed(9127)
     length, page_size = 137, 64
-    rows = pack_indexer_k(torch.randn(length, 128, dtype=torch.bfloat16, device=device))
+    rows, row_scales = pack_indexer_k(torch.randn(length, 128, dtype=torch.bfloat16, device=device))
     q = torch.randn(1, 32, 128, dtype=torch.bfloat16, device=device)
     weights = torch.randn(1, 32, dtype=torch.bfloat16, device=device)
 
     page_ids = torch.tensor([3, 1, 5], dtype=torch.int32, device=device)
-    paged = torch.zeros(6, page_size, 132, dtype=torch.uint8, device=device)
+    paged = torch.zeros(6, page_size, 128, dtype=torch.uint8, device=device)
+    paged_scales = torch.zeros(6, page_size, dtype=torch.float32, device=device)
     for p, page_id in enumerate(page_ids.tolist()):
         lo, hi = p * page_size, min((p + 1) * page_size, length)
         paged[page_id, :hi - lo].copy_(rows[lo:hi])
+        paged_scales[page_id, :hi - lo].copy_(row_scales[lo:hi])
     flat = rows.clone()
+    flat_scales = row_scales.clone()
     page_indptr = torch.tensor([0, 3], dtype=torch.int32, device=device)
     last_page_len = torch.tensor([9], dtype=torch.int32, device=device)
     qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
     flat_indptr = torch.tensor([0, length], dtype=torch.int32, device=device)
-    return q, weights, rows, paged, flat, page_ids, page_indptr, last_page_len, qo_indptr, flat_indptr
+    return (q, weights, rows, row_scales, paged, paged_scales, flat, flat_scales,
+            page_ids, page_indptr, last_page_len, qo_indptr, flat_indptr)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -79,13 +83,15 @@ def test_decode_fp8_mma_default_scores_and_topk(glm, device, decode_case, monkey
     if torch.cuda.get_device_capability(device)[0] < 12:
         pytest.skip("SM120 required")
     monkeypatch.delenv("GLM_INDEXER_DECODE_FP8_MMA", raising=False)
-    q, weights, rows, paged, flat, pi, pip, lpl, qoi, flat_indptr = decode_case
+    (q, weights, rows, row_scales, paged, paged_scales, flat, flat_scales,
+     pi, pip, lpl, qoi, flat_indptr) = decode_case
     k_data = paged if layout == "paged" else flat
+    k_scale_data = paged_scales if layout == "paged" else flat_scales
     out, out_scores, scores, row_len = _run(
-        glm, q, k_data, rows, weights, pi, pip, lpl, qoi, 64, 23,
+        glm, q, k_data, k_scale_data, rows, weights, pi, pip, lpl, qoi, 64, 23,
         flat_indptr if layout == "flat" else None,
     )
-    ref = _oracle(q, rows, weights, 128 ** -0.5, fp8_q=True)
+    ref = _oracle(q, rows, row_scales, weights, 128 ** -0.5, fp8_q=True)
 
     assert row_len == rows.shape[0]
     torch.testing.assert_close(scores.float(), ref.float(), rtol=2e-2, atol=0.5)
@@ -97,11 +103,12 @@ def test_decode_fp8_mma_default_scores_and_topk(glm, device, decode_case, monkey
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_decode_fp8_mma_kill_switch_uses_scalar(glm, device, decode_case, monkeypatch):
     monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "0")
-    q, weights, rows, paged, _, pi, pip, lpl, qoi, _ = decode_case
+    (q, weights, rows, row_scales, paged, paged_scales, _, _, pi, pip, lpl,
+     qoi, _) = decode_case
     out, _, scores, row_len = _run(
-        glm, q, paged, rows, weights, pi, pip, lpl, qoi, 64, 23,
+        glm, q, paged, paged_scales, rows, weights, pi, pip, lpl, qoi, 64, 23,
     )
-    ref = _oracle(q, rows, weights, 128 ** -0.5, fp8_q=False)
+    ref = _oracle(q, rows, row_scales, weights, 128 ** -0.5, fp8_q=False)
 
     assert row_len == rows.shape[0]
     assert len(np.unique(out.cpu().numpy())) == 23
@@ -113,7 +120,7 @@ def test_decode_fp8_mma_multi_query_causal(glm, device, decode_case, monkeypatch
     if torch.cuda.get_device_capability(device)[0] < 12:
         pytest.skip("SM120 required")
     monkeypatch.delenv("GLM_INDEXER_DECODE_FP8_MMA", raising=False)
-    _, _, rows, paged, _, pi, pip, lpl, _, _ = decode_case
+    (_, _, rows, row_scales, paged, paged_scales, _, _, pi, pip, lpl, _, _) = decode_case
     total_q, topk, length = 4, 23, rows.shape[0]
     q = torch.randn(total_q, 32, 128, dtype=torch.bfloat16, device=device)
     weights = torch.randn(total_q, 32, dtype=torch.bfloat16, device=device)
@@ -126,13 +133,13 @@ def test_decode_fp8_mma_multi_query_causal(glm, device, decode_case, monkeypatch
     meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
 
     glm.indexer_score_topk_v2(
-        out, out_scores, q, paged, weights, pi, pip, lpl, qoi,
+        out, out_scores, q, paged, paged_scales, weights, pi, pip, lpl, qoi,
         128 ** -0.5, total_q, 32, 128, 64, topk, True,
         scores, row_len, hist, meta, length, 1,
     )
     glm.synchronize()
 
-    k = unpack_indexer_k(rows, 128).float()
+    k = unpack_indexer_k(rows, row_scales).float()
     q8, q_scale = _quantize_q(q)
     qv = q8 * q_scale
     ref = (weights.float()[:, :, None] * torch.relu(
@@ -152,12 +159,14 @@ def test_decode_fp8_mma_cp_partial_page_and_mask(glm, device, monkeypatch):
     monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "1")
     torch.manual_seed(7123)
     world_size, rank, page_size, length = 8, 5, 8, 17
-    rows = pack_indexer_k(torch.randn(length, 128, dtype=torch.bfloat16, device=device))
+    rows, row_scales = pack_indexer_k(torch.randn(length, 128, dtype=torch.bfloat16, device=device))
     page_ids = torch.tensor([2, 0, 3], dtype=torch.int32, device=device)
-    paged = torch.zeros(4, page_size, 132, dtype=torch.uint8, device=device)
+    paged = torch.zeros(4, page_size, 128, dtype=torch.uint8, device=device)
+    paged_scales = torch.zeros(4, page_size, dtype=torch.float32, device=device)
     for page, page_id in enumerate(page_ids.tolist()):
         lo, hi = page * page_size, min((page + 1) * page_size, length)
         paged[page_id, :hi - lo].copy_(rows[lo:hi])
+        paged_scales[page_id, :hi - lo].copy_(row_scales[lo:hi])
     q = torch.randn(1, 32, 128, dtype=torch.bfloat16, device=device)
     weights = torch.randn(1, 32, dtype=torch.bfloat16, device=device)
     page_indptr = torch.tensor([0, 3], dtype=torch.int32, device=device)
@@ -169,12 +178,12 @@ def test_decode_fp8_mma_cp_partial_page_and_mask(glm, device, monkeypatch):
     mask_kv_len = torch.tensor([16], dtype=torch.int32, device=device)
 
     out, _, scores, row_len = _run(
-        glm, q, paged, rows, weights, page_ids, page_indptr, last_page_len,
+        glm, q, paged, paged_scales, rows, weights, page_ids, page_indptr, last_page_len,
         qo_indptr, page_size, 11, cp_world_size=world_size, cp_rank=rank,
         global_last_page_len=global_last_page_len, custom_mask=custom_mask,
         mask_indptr=mask_indptr, mask_kv_len=mask_kv_len,
     )
-    ref = _oracle(q, rows, weights, 128 ** -0.5, fp8_q=True)
+    ref = _oracle(q, rows, row_scales, weights, 128 ** -0.5, fp8_q=True)
     ref[-1] = -torch.inf  # Global position 133 is mask-window column 13.
     expected_local = torch.topk(ref.float(), 11).indices
     expected_global = set((expected_local * world_size + rank).flatten().cpu().tolist())
@@ -200,20 +209,22 @@ def test_decode_fp8_mma_production_cp_geometry(
     local_length = max(0, (global_length - 1 - rank) // world_size + 1)
     local_last = local_length % page_size or page_size
 
-    rows = pack_indexer_k(
+    rows, row_scales = pack_indexer_k(
         torch.randn(local_length, 128, dtype=torch.bfloat16, device=device)
     )
     page_ids = torch.randperm(max_pages, dtype=torch.int32, device=device)[:num_pages]
-    paged = torch.zeros(max_pages, page_size, 132, dtype=torch.uint8, device=device)
+    paged = torch.zeros(max_pages, page_size, 128, dtype=torch.uint8, device=device)
+    paged_scales = torch.zeros(max_pages, page_size, dtype=torch.float32, device=device)
     for page, page_id in enumerate(page_ids.cpu().tolist()):
         lo, hi = page * page_size, min((page + 1) * page_size, local_length)
         if hi > lo:
             paged[page_id, :hi - lo].copy_(rows[lo:hi])
+            paged_scales[page_id, :hi - lo].copy_(row_scales[lo:hi])
 
     q = torch.randn(1, 32, 128, dtype=torch.bfloat16, device=device)
     weights = torch.randn(1, 32, dtype=torch.bfloat16, device=device)
     out, _, scores, row_len = _run(
-        glm, q, paged, rows, weights, page_ids,
+        glm, q, paged, paged_scales, rows, weights, page_ids,
         torch.tensor([0, num_pages], dtype=torch.int32, device=device),
         torch.tensor([local_last], dtype=torch.int32, device=device),
         torch.tensor([0, 1], dtype=torch.int32, device=device),
@@ -223,7 +234,7 @@ def test_decode_fp8_mma_production_cp_geometry(
             [global_last], dtype=torch.int32, device=device
         ),
     )
-    ref = _oracle(q, rows, weights, 128 ** -0.5, fp8_q=True)
+    ref = _oracle(q, rows, row_scales, weights, 128 ** -0.5, fp8_q=True)
     expected = set(
         (torch.topk(ref.float(), 23).indices * world_size + rank).cpu().tolist()
     )

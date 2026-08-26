@@ -16,16 +16,19 @@ from test_indexer_score_topk import _setup_random_kv, _get_valid_kv_len
 TOPK_SCRATCH_I32 = 1056
 
 
-def _ref_scores(q, k_paged, weights, page_indices, page_indptr, page_size, scale, numValid, t):
+def _ref_scores(q, k_paged, k_scale_paged, weights, page_indices, page_indptr,
+                page_size, scale, numValid, t):
     """bf16-rounded indexer score row for query t over its first numValid positions."""
     hd = q.shape[-1]
     # find seq for global query t
     # (page tables are per-seq; caller passes the right numValid)
     ks = []
+    scales = []
     for j in range(numValid):
         pid = page_indices[j // page_size]
         ks.append(k_paged[pid, j % page_size])
-    K = unpack_indexer_k(torch.stack(ks), hd)         # [numValid, hd]
+        scales.append(k_scale_paged[pid, j % page_size])
+    K = unpack_indexer_k(torch.stack(ks), torch.stack(scales))  # [numValid, hd]
     qh = q[t].float()                                 # [n_heads, hd]
     dot = qh @ K.T                                    # [n_heads, numValid]
     sc = torch.relu(dot * scale)                      # per-head ReLU
@@ -35,7 +38,7 @@ def _ref_scores(q, k_paged, weights, page_indices, page_indptr, page_size, scale
 
 
 def _run_v2(glm, s, topk, causal, device):
-    (q, k_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
+    (q, k_paged, k_scale_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
      scale, total_q, max_pages) = s
     max_kv = max(sum(lpl) + 0, k_paged.shape[1])
     max_kv = max((pip[i + 1] - pip[i]) for i in range(len(lpl)))  # placeholder
@@ -53,7 +56,7 @@ def _run_v2(glm, s, topk, causal, device):
     n_heads, head_dim = q.shape[1], q.shape[2]
     num_splits = min(256, max(1, (max_kv + 255) // 256))
     glm.indexer_score_topk_v2(
-        out, out_scores, q, k_paged, weights, pit, pipt, lplt, qoit, scale,
+        out, out_scores, q, k_paged, k_scale_paged, weights, pit, pipt, lplt, qoit, scale,
         total_q, n_heads, head_dim, k_paged.shape[1], topk, causal,
         scores, row_len, hist, meta, max_kv, num_splits)
     glm.synchronize()
@@ -89,7 +92,7 @@ def _check(out_row, ref_row, numValid, topk):
 def test_v2_matches_reference(glm, device, seq_lens, topk, causal):
     n_heads, head_dim, page_size = 32, 128, 64
     s = _setup_random_kv(len(seq_lens), seq_lens, n_heads, head_dim, page_size, device)
-    (q, k_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
+    (q, k_paged, k_scale_paged, weights, pil, pip, lpl, qoi, pit, pipt, lplt, qoit,
      scale, total_q, max_pages) = s
     out, max_kv = _run_v2(glm, s, topk, causal, device)
 
@@ -99,6 +102,7 @@ def test_v2_matches_reference(glm, device, seq_lens, topk, causal):
             numValid = _get_valid_kv_len(seq_idx, qi, seq_lens, pip, lpl, page_size, qoi, causal)
             page_start = pip[seq_idx]
             seq_page_indices = pil[page_start: pip[seq_idx + 1]]
-            ref = _ref_scores(q, k_paged, weights, seq_page_indices, pip, page_size, scale, numValid, t)
+            ref = _ref_scores(q, k_paged, k_scale_paged, weights, seq_page_indices,
+                              pip, page_size, scale, numValid, t)
             _check(out[t], ref, numValid, topk)
     print(f"\n[seq_lens={seq_lens} topk={topk} causal={causal}] v2 exact OK")
