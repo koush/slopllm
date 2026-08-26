@@ -37,6 +37,7 @@ export const CP_MERGE_PULL = process.env.GLM_CP_MERGE_PULL === "1";
 // masking it: any other producer of unsorted top-k indices would corrupt too.
 // Costs ~9% of decode throughput (measured 100.4 -> 92.1 tok/s at 8-way CP).
 export const CP_TOPK_SORT = process.env.GLM_CP_TOPK_SORT === "1";
+export const CP_TOPK_OWNER_MERGE = process.env.GLM_CP_TOPK_OWNER_MERGE !== "0";
 
 export class ParallelTensor extends Tensor {
   parallelism: TensorParallelism;
@@ -408,12 +409,17 @@ export class ParallelTensor extends Tensor {
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     if (count > 65536 * 8)
       return false;
-    const elemBytes = ParallelTensor.elemBytes(this.type);
-    const shardBytes = count * elemBytes;
     const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
     if (!group)
       return false;
 
+    const postBarrier = this.beginP2PAllGather(group, output);
+    group.barrier(this.devices);
+    postBarrier();
+    return true;
+  }
+
+  beginP2PAllGather(group: P2PAllReduceGroup, output: ParallelTensor) {
     const addon = getNativeAddon();
 
     // Guard before allocating so the unsupported path can't leak the shards.
@@ -425,6 +431,10 @@ export class ParallelTensor extends Tensor {
     for (let i = 0; i < this.worldSize; i++) {
       shards.push(group.workspaces[i].alloc(this.shape, this.type));
     }
+
+    const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
+    const elemBytes = ParallelTensor.elemBytes(this.type);
+    const shardBytes = count * elemBytes;
 
     if (this.parallelism === TensorParallelism.Column) {
       const fullBytes = shardBytes * this.worldSize;
@@ -444,19 +454,14 @@ export class ParallelTensor extends Tensor {
           shards[i].data, this.worldSize, shardBytes, fullBytes, 1, i,
         );
       }
-      group.barrier(this.devices);
 
-      for (let i = 0; i < this.worldSize; i++) {
-        output.shards[i].memcpy(shards[i], shards[i].bytes, MemcpyKind.DeviceToDevice);
+      return () => {
+        for (let i = 0; i < this.worldSize; i++) {
+          output.shards[i].memcpy(shards[i], shards[i].bytes, MemcpyKind.DeviceToDevice);
+        }
+
+        group.sources.push(...shards);
       }
-
-      // The barrier completed all peer writes, and the local copies above are
-      // ordered before any same-stream reuse of these staging buffers.
-      for (const shard of shards) {
-        shard[Symbol.dispose]();
-      }
-
-      return true;
     }
 
     if (this.parallelism === TensorParallelism.Row) {
@@ -482,15 +487,14 @@ export class ParallelTensor extends Tensor {
           shards[i].data, this.worldSize, shardDim1Bytes, fullDim1Bytes, outer, i,
         );
       }
-      group.barrier(this.devices);
 
-      for (let i = 0; i < this.worldSize; i++) {
-        output.shards[i].memcpy(shards[i], shards[i].bytes, MemcpyKind.DeviceToDevice);
-      }
+      return () => {
+        for (let i = 0; i < this.worldSize; i++) {
+          output.shards[i].memcpy(shards[i], shards[i].bytes, MemcpyKind.DeviceToDevice);
+        }
 
-      group.sources.push(...shards);
-
-      return true;
+        group.sources.push(...shards);
+      };
     }
 
     throw new Error(`tryP2PAllGather: unsupported parallelism ${this.parallelism}`);
@@ -2175,6 +2179,59 @@ export class ParallelOps implements DeviceOps {
     return this.p2pGroups.get(stream) || null;
   }
 
+  allGatherMultiple(tensors: readonly ParallelTensor[], workspace: WorkspaceBase): ParallelTensor[] {
+    if (tensors.length === 0) return [];
+
+    for (const tensor of tensors) {
+      if (tensor.parallelism === TensorParallelism.PartialSum) {
+        throw new Error("allGatherMultiple cannot be used on PartialSum tensors; use allReduce instead");
+      }
+      if (tensor.parallelism !== TensorParallelism.Replicated &&
+        tensor.parallelism !== TensorParallelism.Column &&
+        tensor.parallelism !== TensorParallelism.Row) {
+        throw new Error(`allGatherMultiple: unsupported parallelism ${tensor.parallelism}`);
+      }
+    }
+
+    if (tensors.every(tensor => tensor.parallelism === TensorParallelism.Replicated)) {
+      return tensors.map(tensor => tensor.viewClone() as ParallelTensor);
+    }
+
+    const outputs: (ParallelTensor | undefined)[] = tensors.map(tensor =>
+      tensor.parallelism === TensorParallelism.Replicated
+        ? tensor.viewClone() as ParallelTensor
+        : undefined);
+    const gatherIndices = tensors.flatMap((tensor, i) =>
+      tensor.parallelism === TensorParallelism.Replicated ? [] : [i]);
+    const fallback = () => {
+      for (const i of gatherIndices) outputs[i] = tensors[i].allGather(workspace);
+      return outputs as ParallelTensor[];
+    };
+    const stream = this.devices[0].currentStream;
+    const supported = gatherIndices.every(i => {
+      const tensor = tensors[i];
+      const count = tensor.shards[0].shape.reduce((a, b) => a * b, 1);
+      return tensor.workspace.glm === this &&
+        tensor.shards.length === this.worldSize &&
+        (tensor.parallelism === TensorParallelism.Column || tensor.parallelism === TensorParallelism.Row) &&
+        count <= 65536 * 8 &&
+        tensor.shards[0].workspace.glm.currentStream === stream;
+    });
+    if (!this.p2pEnabled || !supported) return fallback();
+
+    const group = this.getP2PGroup(stream);
+    if (!group) return fallback();
+
+    for (const i of gatherIndices) {
+      const tensor = tensors[i];
+      outputs[i] = workspace.alloc(tensor.shape, tensor.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
+    }
+    const postBarrier = gatherIndices.map(i => tensors[i].beginP2PAllGather(group, outputs[i]!));
+    group.barrier(this.devices);
+    for (const complete of postBarrier) complete();
+    return outputs as ParallelTensor[];
+  }
+
   /**
    * Retain `tensors` until the next barrier on the current stream's P2P group,
    * because peers are about to read them and must not see the memory recycled.
@@ -3417,16 +3474,11 @@ export class ParallelOps implements DeviceOps {
     const pEffKvCache = this.cast(kvCache);
     const nonCp = pEffKvCache.parallelism !== TensorParallelism.Row;
     const oPar = nonCp ? TensorParallelism.Row : TensorParallelism.PartialSoftmax;
-    using gatheredQAbsorbed: ParallelTensor = (pQAbsorbed.parallelism === TensorParallelism.Row && nonCp)
-      ? pQAbsorbed.viewClone() as ParallelTensor
-      : (contextParallel && pQAbsorbed.parallelism === TensorParallelism.Row)
-        ? pQAbsorbed.allGather(pQAbsorbed.workspace)
-        : pQAbsorbed.viewClone() as ParallelTensor;
-    using gatheredQPe: ParallelTensor = (pQPe.parallelism === TensorParallelism.Row && nonCp)
-      ? pQPe.viewClone() as ParallelTensor
-      : (contextParallel && pQPe.parallelism === TensorParallelism.Row)
-        ? pQPe.allGather(pQPe.workspace)
-        : pQPe.viewClone() as ParallelTensor;
+    const gatheredQ = nonCp
+      ? [pQAbsorbed.viewClone() as ParallelTensor, pQPe.viewClone() as ParallelTensor]
+      : this.allGatherMultiple([pQAbsorbed, pQPe], pQAbsorbed.workspace);
+    using gatheredQAbsorbed = gatheredQ[0];
+    using gatheredQPe = gatheredQ[1];
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
@@ -3451,12 +3503,11 @@ export class ParallelOps implements DeviceOps {
     const headDim = pQAbsorbed.shape[2];
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "sparseMlaDecode numHeads");
     const oPar = contextParallel ? TensorParallelism.PartialSoftmax : TensorParallelism.Row;
-    using gatheredQAbsorbed: ParallelTensor = (contextParallel && pQAbsorbed.parallelism === TensorParallelism.Row)
-      ? pQAbsorbed.allGather(pQAbsorbed.workspace)
-      : pQAbsorbed.viewClone() as ParallelTensor;
-    using gatheredQPe: ParallelTensor = (contextParallel && pQPe.parallelism === TensorParallelism.Row)
-      ? pQPe.allGather(pQPe.workspace)
-      : pQPe.viewClone() as ParallelTensor;
+    const gatheredQ = contextParallel
+      ? this.allGatherMultiple([pQAbsorbed, pQPe], pQAbsorbed.workspace)
+      : [pQAbsorbed.viewClone() as ParallelTensor, pQPe.viewClone() as ParallelTensor];
+    using gatheredQAbsorbed = gatheredQ[0];
+    using gatheredQPe = gatheredQ[1];
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
@@ -3647,6 +3698,86 @@ export class ParallelOps implements DeviceOps {
   // Fall-back (replicated): decode, context-parallel, multi-sequence prefill,
   // or uneven totalQ — every rank runs the full indexer. Decode is cheap;
   // multi-seq / CP need qoIndptr rebasing which is not yet implemented.
+  private tryMergeIndexerTopkByOwner(localValues: ParallelTensor, localIndices: ParallelTensor, totalQ: number, topk: number): { values: Tensor, indices: Tensor } | undefined {
+    const W = this.worldSize;
+    if (!CP_TOPK_OWNER_MERGE || !this.p2pEnabled || totalQ % W !== 0 || ![2, 4, 8].includes(W)) {
+      return undefined;
+    }
+    const group = this.getP2PGroup(this.devices[0].currentStream);
+    if (!group) return undefined;
+
+    const ownerQ = totalQ / W;
+    const ownerValueBytes = ownerQ * topk * 2;
+    const ownerIndexBytes = ownerQ * topk * 4;
+    const stagedValues = group.workspaces.map(ws => ws.alloc([W, ownerQ, topk], "BF16"));
+    const stagedIndices = group.workspaces.map(ws => ws.alloc([W, ownerQ, topk], "I32"));
+    const addon = getNativeAddon();
+
+    for (let source = 0; source < W; source++) {
+      const valuePtrs = new Array<number>(8).fill(0);
+      const indexPtrs = new Array<number>(8).fill(0);
+      for (let owner = 0; owner < W; owner++) {
+        valuePtrs[owner] = stagedValues[owner].data;
+        indexPtrs[owner] = stagedIndices[owner].data;
+      }
+      using valuesStream = this.devices[source].withStream(() => {
+        addon.p2pReduceScatterWrite(
+          this.devices[source].ctx, localValues.shards[source].data,
+          valuePtrs[0], valuePtrs[1], valuePtrs[2], valuePtrs[3],
+          valuePtrs[4], valuePtrs[5], valuePtrs[6], valuePtrs[7],
+          W, ownerValueBytes, source,
+        );
+      });
+      addon.p2pReduceScatterWrite(
+        this.devices[source].ctx, localIndices.shards[source].data,
+        indexPtrs[0], indexPtrs[1], indexPtrs[2], indexPtrs[3],
+        indexPtrs[4], indexPtrs[5], indexPtrs[6], indexPtrs[7],
+        W, ownerIndexBytes, source,
+      );
+      valuesStream.streamWaitEvent();
+    }
+    group.barrier(this.devices);
+
+    const ownerValueShards: Tensor[] = [];
+    const ownerIndexShards: Tensor[] = [];
+    const kTotal = topk * W;
+    for (let owner = 0; owner < W; owner++) {
+      using qvStream = this.devices[owner].withStream(() => {
+        using queryValuesFlat = stagedValues[owner].transpose4d(W, ownerQ, topk, 1, 1, 0, 2, 3);
+        using queryValues = queryValuesFlat.reshape([ownerQ, kTotal]);
+        return queryValues.topk(topk, kTotal);
+      });
+
+      using queryIndicesFlat = stagedIndices[owner].transpose4d(W, ownerQ, topk, 1, 1, 0, 2, 3);
+      using queryIndices = queryIndicesFlat.reshape([ownerQ, kTotal]);
+
+      qvStream.streamWaitEvent();
+      const qvTopk = qvStream.result;
+      const { values, indices: mergedPositions } = qvTopk;
+      using _mergedPositions = mergedPositions;
+      ownerValueShards.push(values);
+      ownerIndexShards.push(queryIndices.gather(mergedPositions, topk, kTotal, ownerQ));
+    }
+    for (const tensor of [...stagedValues, ...stagedIndices]) tensor[Symbol.dispose]();
+
+    const ownerValues = this.wrapShards(localValues.workspace, ownerValueShards, [totalQ, topk], "BF16", TensorParallelism.Column);
+    using ownerIndices = this.wrapShards(localIndices.workspace, ownerIndexShards, [totalQ, topk], "I32", TensorParallelism.Column);
+    if (!CP_TOPK_SORT) {
+      const finalIndices = ownerIndices.allGather(localIndices.workspace);
+      return { values: ownerValues, indices: finalIndices };
+    }
+
+    using _ownerValues = ownerValues;
+    const [mergedValues, finalIndices] = this.allGatherMultiple([ownerValues, ownerIndices], localValues.workspace);
+
+    const pFinalIndices = this.cast(finalIndices);
+    const pMergedValues = this.cast(mergedValues);
+    for (let i = 0; i < W; i++) {
+      this.devices[i].sortTopkByIndex(pFinalIndices.shards[i], pMergedValues.shards[i], totalQ, topk);
+    }
+    return { values: mergedValues, indices: finalIndices };
+  }
+
   indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { values: Tensor, indices: Tensor } {
     const totalQ = idxQ.shape[0];
     using pQ = idxQ.parallelism === TensorParallelism.Replicated ? idxQ.viewClone() as ParallelTensor : this.cast(idxQ).allGather(idxQ.workspace);
@@ -3689,28 +3820,30 @@ export class ParallelOps implements DeviceOps {
         };
       }
 
-      if (true) {
-        // gather indices/values individually here, and then do topk merge
-        using localValues = this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk * W], "BF16", TensorParallelism.Row);
-        using localIndices = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk * W], "I32", TensorParallelism.Row);
-        using gatheredValues = localValues.allGather(idxQ.workspace);
-        using gatheredIndices = localIndices.allGather(idxQ.workspace);
-        const kTotal = topk * W;
-        const { values: mergedValues, indices: mergedIndices } = gatheredValues.topk(topk, kTotal);
-        using _mergedIndices = mergedIndices as ParallelTensor;
-        const finalIndices = gatheredIndices.gather(mergedIndices, topk, kTotal, totalQ);
-
-        // Opt-in: restore ascending-index order so this path is bit-identical to
-        // the replicated-kData build. Off by default -- see CP_TOPK_SORT.
-        if (CP_TOPK_SORT) {
-          const pFinalIndices = this.cast(finalIndices);
-          const pMergedValues = this.cast(mergedValues);
-          for (let i = 0; i < W; i++) {
-            this.devices[i].sortTopkByIndex(pFinalIndices.shards[i], pMergedValues.shards[i], totalQ, topk);
-          }
-        }
-        return { values: mergedValues, indices: finalIndices };
+      // gather indices/values individually here, and then do topk merge
+      using localValues = this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk * W], "BF16", TensorParallelism.Row);
+      using localIndices = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk * W], "I32", TensorParallelism.Row);
+      const ownerMerged = this.tryMergeIndexerTopkByOwner(localValues, localIndices, totalQ, topk);
+      if (ownerMerged) {
+        return ownerMerged;
       }
+      using gatheredValues = localValues.allGather(idxQ.workspace);
+      using gatheredIndices = localIndices.allGather(idxQ.workspace);
+      const kTotal = topk * W;
+      const { values: mergedValues, indices: mergedIndices } = gatheredValues.topk(topk, kTotal);
+      using _mergedIndices = mergedIndices as ParallelTensor;
+      const finalIndices = gatheredIndices.gather(mergedIndices, topk, kTotal, totalQ);
+
+      // Opt-in: restore ascending-index order so this path is bit-identical to
+      // the replicated-kData build. Off by default -- see CP_TOPK_SORT.
+      if (CP_TOPK_SORT) {
+        const pFinalIndices = this.cast(finalIndices);
+        const pMergedValues = this.cast(mergedValues);
+        for (let i = 0; i < W; i++) {
+          this.devices[i].sortTopkByIndex(pFinalIndices.shards[i], pMergedValues.shards[i], totalQ, topk);
+        }
+      }
+      return { values: mergedValues, indices: finalIndices };
     }
 
     // Query-sharded path: each rank processes totalQ/W query rows.
@@ -3735,7 +3868,7 @@ export class ParallelOps implements DeviceOps {
 
     // Column [totalQ, topk] → AllGather → Replicated [totalQ, topk].
     using topkIdxColumn = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Column);
-    using topkValColumn = this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk], "BF16", TensorParallelism.Column);
+    const topkValColumn = this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk], "BF16", TensorParallelism.Column);
     const topkIdxReplicated = topkIdxColumn.allGather(idxQ.workspace);
     // const topkValReplicated = topkValColumn.allGather(idxQ.workspace);
 
