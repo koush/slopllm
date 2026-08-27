@@ -3300,7 +3300,7 @@ export class ParallelOps implements DeviceOps {
       }
 
       const nextExtra: SparseMlaPrefetchExtra = { stream: nextStream, indexerStream };
-      state.ws.extras.set(`sparseMlaPrefetchLayer_${nextCacheIdx}`, nextExtra);
+      state.extras.set(`sparseMlaPrefetchLayer_${nextCacheIdx}`, nextExtra);
     }
 
     if (prefetched) {
@@ -3413,20 +3413,20 @@ export class ParallelOps implements DeviceOps {
   private takeSparseMlaPrefetchStream(state: ExecutionState, key: string, field: "stream"): SparseMlaPrefetchExtra["stream"];
   private takeSparseMlaPrefetchStream(state: ExecutionState, key: string, field: "indexerStream"): SparseMlaPrefetchExtra["indexerStream"];
   private takeSparseMlaPrefetchStream(state: ExecutionState, key: string, field: "stream" | "indexerStream") {
-    const extra = state.ws.extras.get(key) as SparseMlaPrefetchExtra | undefined;
+    const extra = state.extras.get(key) as SparseMlaPrefetchExtra | undefined;
     const stream = extra?.[field];
     if (!extra || !stream) return undefined;
     delete extra[field];
     if (!extra.stream && !extra.indexerStream) {
-      state.ws.extras.delete(key);
+      state.extras.delete(key);
     }
     return stream;
   }
 
   private cleanupSparseMlaPrefetch(state: ExecutionState, key: string): void {
-    const extra = state.ws.extras.get(key) as SparseMlaPrefetchExtra | undefined;
+    const extra = state.extras.get(key) as SparseMlaPrefetchExtra | undefined;
     if (!extra) return;
-    state.ws.extras.delete(key);
+    state.extras.delete(key);
     if (extra.indexerStream) {
       extra.indexerStream.streamWaitEvent();
       extra.indexerStream.result.kData[Symbol.dispose]();

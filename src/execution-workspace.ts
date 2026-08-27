@@ -79,6 +79,7 @@ export async function executePlan<T>(captureManager: CaptureManager, ws: Executi
 
 export class ExecutionState {
   input?: Tensor;
+  extras = new Map<string, any>();
   paddedKvLenInvariant = true;
   private readonly paddedKvLen: number;
 
@@ -387,7 +388,6 @@ export class ExecutionState {
 export class ExecutionWorkspace extends WorkspaceBase {
   readonly maxBatch: number;
   readonly maxSeqLen: number;
-  extras = new Map<string, any>();
   private planSlot = 0;
 
   constructor(glm: DeviceOps, B: number, S: number) {
