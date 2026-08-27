@@ -836,13 +836,15 @@ function sendJSON(res: http.ServerResponse, statusCode: number, data: object): v
 function sendMetrics(
   res: http.ServerResponse,
   metrics: ServerMetrics,
-  waitingRequests: number,
+  pendingRequests: number,
   cache: ChatCache,
   batchSize: number,
   chunkSize: number,
   maxModelLen: number,
 ): void {
   const pagedKV = cache.getPagedKV();
+  const availableSlots = Math.max(0, batchSize - metrics.runningRequests);
+  const waitingRequests = Math.max(0, pendingRequests - availableSlots);
   const maxTotalTokens = pagedKV.maxPages * pagedKV.pageSize;
   const kvUsage = pagedKV.maxPages === 0
     ? 0
@@ -859,7 +861,7 @@ function sendMetrics(
     "# HELP vllm:num_requests_running GLM.js requests admitted for model execution.",
     "# TYPE vllm:num_requests_running gauge",
     `vllm:num_requests_running ${metrics.runningRequests}`,
-    "# HELP vllm:num_requests_waiting GLM.js requests waiting for admission.",
+    "# HELP vllm:num_requests_waiting GLM.js requests blocked on admission capacity.",
     "# TYPE vllm:num_requests_waiting gauge",
     `vllm:num_requests_waiting ${waitingRequests}`,
     "# HELP vllm:generation_tokens_total GLM.js sampled completion tokens.",
@@ -999,6 +1001,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     prefillTimeSecondsSum: 0,
   };
   let busy = false;
+  let queueStartScheduled = false;
 
   const isFatalCudaError = (error: unknown): boolean => {
     const message = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
@@ -1060,13 +1063,24 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       }
     } finally {
       busy = false;
-      if (pendingQueue.length > 0) setImmediate(() => { void processQueue(); });
+      if (pendingQueue.length > 0) scheduleQueueStart();
     }
+  }
+
+  function scheduleQueueStart(): void {
+    if (busy || queueStartScheduled) return;
+    queueStartScheduled = true;
+    setImmediate(() => {
+      queueStartScheduled = false;
+      void processQueue();
+    });
   }
 
   function enqueueRequest(req: CompletionRequest): void {
     pendingQueue.push(req);
-    processQueue();
+    // Let all request callbacks already ready in this event-loop turn enqueue
+    // before the first one starts an underfilled prefill batch.
+    scheduleQueueStart();
   }
 
   function handleChatCompletions(req: http.IncomingMessage, res: http.ServerResponse): void {
