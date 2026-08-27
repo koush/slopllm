@@ -116,7 +116,18 @@ export abstract class ChatModel extends WorkspaceBase {
   }
 
   abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number): ChatCache;
-  abstract forwardModel(state: ExecutionState): Tensor;
+  abstract forwardPhased(state: ExecutionState): Generator<void, Tensor, void>;
+
+  protected runPhased<T>(generator: Generator<void, T, void>): T {
+    while (true) {
+      const iter = generator.next();
+      if (iter.done) return iter.value;
+    }
+  }
+
+  forwardModel(state: ExecutionState): Tensor {
+    return this.runPhased(this.forwardPhased(state));
+  }
   planPrefillMtpChunk?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void>;
   planPrefillMtpDraftExtend?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens?: TokenSelector): ExecutionPlan<MtpDraftBatch>;
   planTargetVerification?(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, selectTokens?: TokenSelector): ExecutionPlan<MtpStepResult>;

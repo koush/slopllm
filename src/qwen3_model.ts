@@ -106,7 +106,7 @@ export class Qwen3Model extends ChatModel {
     return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`));
   }
 
-  forwardModel(state: ExecutionState): Tensor {
+  *forwardPhased(state: ExecutionState): Generator<void, Tensor, void> {
     const ws = state.ws;
     const pagedKV = state.cache.getPagedKV();
     const cfg = this.cfg;
@@ -166,6 +166,7 @@ export class Qwen3Model extends ChatModel {
 
       using reshapedFlashOut = flashOut.value.reshape([BS, nHeads * hd]);
       using oProjBuf = reshapedFlashOut.outputProj(this.tensors.get(`${pfx}.self_attn.o_proj.weight`)!);
+      yield;
       const attnResult = residual.value.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
       using attnNormed = attnResult.normed;
       residual.replace(attnResult.residual);
@@ -174,6 +175,7 @@ export class Qwen3Model extends ChatModel {
       const nextWeight = i < cfg.numHiddenLayers - 1
         ? this.tensors.get(`model.layers.${i + 1}.input_layernorm.weight`)!
         : this.tensors.get("model.norm.weight")!;
+      yield;
       const mlpResult = residual.value.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
       normed.replace(mlpResult.normed);
       residual.replace(mlpResult.residual);

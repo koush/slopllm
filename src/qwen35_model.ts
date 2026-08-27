@@ -260,7 +260,7 @@ export class Qwen35Model extends ChatModel {
     return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`));
   }
 
-  private gdnLayerPrefill(state: ExecutionState, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
+  private *gdnLayerPrefillPhased(state: ExecutionState, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): Generator<void, { normed: Tensor, residual: Tensor }, void> {
     const cfg = this.cfg;
     const ws = state.ws;
     const hs = cfg.hiddenSize;
@@ -305,6 +305,7 @@ export class Qwen35Model extends ChatModel {
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!);
 
+    yield;
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
@@ -313,11 +314,12 @@ export class Qwen35Model extends ChatModel {
     const nextWeight = layerIdx < cfg.numHiddenLayers - 1
       ? this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx + 1}.input_layernorm.weight`)!
       : this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}norm.weight`)!;
+    yield;
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  private gdnLayerDecode(state: ExecutionState, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): { normed: Tensor, residual: Tensor } {
+  private *gdnLayerDecodePhased(state: ExecutionState, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): Generator<void, { normed: Tensor, residual: Tensor }, void> {
     const cfg = this.cfg;
     const ws = state.ws;
     const hs = cfg.hiddenSize;
@@ -359,6 +361,7 @@ export class Qwen35Model extends ChatModel {
 
     using oProjBuf = gatedOut.linear(this.tensors.get(`${pfx}.out_proj.weight`)!);
 
+    yield;
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
@@ -367,11 +370,12 @@ export class Qwen35Model extends ChatModel {
     const nextWeight = layerIdx < cfg.numHiddenLayers - 1
       ? this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx + 1}.input_layernorm.weight`)!
       : this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}norm.weight`)!;
+    yield;
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  private fullAttnLayer(normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState, cos: Tensor, sin: Tensor): { normed: Tensor, residual: Tensor } {
+  private *fullAttnLayerPhased(normed: Tensor, residual: Tensor, layerIdx: number, state: ExecutionState, cos: Tensor, sin: Tensor): Generator<void, { normed: Tensor, residual: Tensor }, void> {
     const cfg = this.cfg;
     const ws = state.ws;
     const hs = cfg.hiddenSize;
@@ -411,6 +415,7 @@ export class Qwen35Model extends ChatModel {
 
     using reshapedFlashOut = flashOut.value.reshape([BS, nHeads * hd]);
     using oProjBuf = reshapedFlashOut.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!);
+    yield;
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
@@ -419,11 +424,12 @@ export class Qwen35Model extends ChatModel {
     const nextWeight = layerIdx < cfg.numHiddenLayers - 1
       ? this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx + 1}.input_layernorm.weight`)!
       : this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}norm.weight`)!;
+    yield;
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  forwardModel(state: ExecutionState): Tensor {
+  *forwardPhased(state: ExecutionState): Generator<void, Tensor, void> {
     const ws = state.ws;
     const cache = state.cache as Qwen35ChatCache;
     const { gdnState } = cache;
@@ -450,12 +456,12 @@ export class Qwen35Model extends ChatModel {
       let result: { normed: Tensor, residual: Tensor };
       if (cfg.layerTypes[i] === "linear_attention") {
         if (state.isDecode) {
-          result = this.gdnLayerDecode(state, normed.value, residual.value, i, gdnState);
+          result = yield* this.gdnLayerDecodePhased(state, normed.value, residual.value, i, gdnState);
         } else {
-          result = this.gdnLayerPrefill(state, normed.value, residual.value, i, gdnState);
+          result = yield* this.gdnLayerPrefillPhased(state, normed.value, residual.value, i, gdnState);
         }
       } else {
-        result = this.fullAttnLayer(normed.value, residual.value, i, state, cos, sin);
+        result = yield* this.fullAttnLayerPhased(normed.value, residual.value, i, state, cos, sin);
       }
       normed.replace(result.normed);
       residual.replace(result.residual);

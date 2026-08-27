@@ -656,7 +656,7 @@ export class Glm51Model extends ChatModel {
     return result.reshape([BS, hs]);
   }
 
-  private mlaLayer(cos: Tensor, sin: Tensor, normedHolder: UsingHolder<Tensor>, residualHolder: UsingHolder<Tensor>, layerIdx: number, state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): { normed: Tensor, residual: Tensor } {
+  private *mlaLayerPhased(cos: Tensor, sin: Tensor, normedHolder: UsingHolder<Tensor>, residualHolder: UsingHolder<Tensor>, layerIdx: number, state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Generator<void, { normed: Tensor, residual: Tensor }, void> {
     const cfg = this.cfg;
     const normed = normedHolder.value;
     const residual = residualHolder.value;
@@ -872,6 +872,7 @@ export class Glm51Model extends ChatModel {
       oProjBuf.replace(vExpanded.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!));
     }
 
+    yield;
     const attnResult = residual.fusedAddRmsnorm(oProjBuf.value, this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
@@ -893,13 +894,18 @@ export class Glm51Model extends ChatModel {
     }
     normedHolder.release();
     residualHolder.release();
+    yield;
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
 
     slotsStream?.streamWaitEvent();
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  forwardModel(state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Tensor {
+  private mlaLayer(cos: Tensor, sin: Tensor, normedHolder: UsingHolder<Tensor>, residualHolder: UsingHolder<Tensor>, layerIdx: number, state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): { normed: Tensor, residual: Tensor } {
+    return this.runPhased(this.mlaLayerPhased(cos, sin, normedHolder, residualHolder, layerIdx, state, sharedSlots, sharedSlotsLength));
+  }
+
+  *forwardPhased(state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Generator<void, Tensor, void> {
     const cfg = this.cfg;
 
     using rotaryEmbedding = this.glm.withStream(() => state.rotaryEmbedding(this.invFreq));
@@ -921,12 +927,16 @@ export class Glm51Model extends ChatModel {
     sharedSlotsLength ??= _localLength!;
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const result = this.mlaLayer(cos, sin, normed, residual, i, state, sharedSlots, sharedSlotsLength);
+      const result = yield* this.mlaLayerPhased(cos, sin, normed, residual, i, state, sharedSlots, sharedSlotsLength);
       normed.replace(result.normed);
       residual.replace(result.residual);
     }
 
     return normed.detach();
+  }
+
+  override forwardModel(state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Tensor {
+    return this.runPhased(this.forwardPhased(state, sharedSlots, sharedSlotsLength));
   }
 
   forwardMtp(state: ExecutionState, previousHiddenState: Tensor, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>) {
@@ -947,6 +957,7 @@ export class Glm51Model extends ChatModel {
     using embedding = state.embedding(embedTable);
 
     // TODO: THIS IS NOT GRAPH CAPTURABLE
+    // position 0 is supposed to be masked
     // there seems to be no adverse affect in NOT doing it, as it only affects short/initial sequence.
     // let row = 0;
     // const sequences = state.cache.getPagedKV().sequences;
