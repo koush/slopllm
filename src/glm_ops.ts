@@ -798,10 +798,27 @@ export class GlmOps implements DeviceOps {
   streamWorkspaces = new Map<number, Set<WorkspaceBase>>();
   setStream(streamIdx: number): void {
     getNativeAddon().setStream(this.ctx, streamIdx);
-    this.currentStream = streamIdx;
+    this.activeStreams[this.activeStreams.length - 1] = streamIdx;
   }
 
-  currentStream = 0;
+  activeStreams = [0];
+  get currentStream(): number {
+    return this.activeStreams[this.activeStreams.length - 1];
+  }
+
+  pushStream(streamIdx: number): void {
+    this.activeStreams.push(streamIdx);
+    getNativeAddon().setStream(this.ctx, streamIdx);
+  }
+
+  popStream(streamIdx: number): void {
+    if (this.currentStream !== streamIdx || this.activeStreams.length === 1) {
+      throw new Error(`Stream stack mismatch while popping ${streamIdx}: [${this.activeStreams.join(",")}]`);
+    }
+    this.activeStreams.pop();
+    getNativeAddon().setStream(this.ctx, this.currentStream);
+  }
+
   availableStreams = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
   disposeStream(stream: number) {
     if (this.availableStreams.includes(stream))
@@ -834,12 +851,22 @@ export class GlmOps implements DeviceOps {
     if (this.streamWorkspaces.has(stream)) {
       throw new Error(`Stream ${stream} already in use`);
     }
-    this.setStream(stream);
+    this.pushStream(stream);
     getNativeAddon().streamWaitEvent(this.ctx, stream, currentStream);
-    const result = fn();
-    // Record event on the alternate stream so others can wait
-    getNativeAddon().eventRecord(this.ctx, stream, stream);
-    this.setStream(currentStream);
+    let result!: T;
+    let completed = false;
+    try {
+      result = fn();
+      completed = true;
+    } finally {
+      // Record event on the alternate stream so others can wait.
+      getNativeAddon().eventRecord(this.ctx, stream, stream);
+      this.popStream(stream);
+      if (!completed) {
+        getNativeAddon().streamWaitEvent(this.ctx, currentStream, stream);
+        this.disposeStream(stream);
+      }
+    }
     return {
       [Symbol.dispose]: () => {
         this.disposeStream(stream);

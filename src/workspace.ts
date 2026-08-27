@@ -115,10 +115,8 @@ export class WorkspaceBase implements Disposable {
 
   getDisposedPools(pinned: boolean): Set<Tensor>[] {
     if (pinned) return [this.disposedHost];
-    const stream = this.glm.currentStream;
-    const current = this.getDisposedDevicePool(stream);
-    if (stream === 0) return [current];
-    return [current, this.getDisposedDevicePool(0)];
+    const streams = [...this.glm.activeStreams].reverse();
+    return [...new Set(streams)].map(stream => this.getDisposedDevicePool(stream));
   }
 
   recycleDevice(tensor: Tensor): void {

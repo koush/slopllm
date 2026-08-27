@@ -471,12 +471,20 @@ describe("Workspace stream recycling", () => {
 
     const outer = glm.withStream(() => {
       outerId = glm.currentStream;
+      assert.deepEqual(glm.activeStreams, [0, outerId]);
+      const outerTensor = ws.alloc([16], "F32");
+      const outerData = outerTensor.data;
+      outerTensor[Symbol.dispose]();
+
       const inner = glm.withStream(() => {
         innerId = glm.currentStream;
+        assert.deepEqual(glm.activeStreams, [0, outerId, innerId]);
         const tensor = ws.alloc([16], "F32");
+        assert.equal(tensor.data, outerData, "nested stream should reuse its parent stream allocation");
         tensor[Symbol.dispose]();
       });
 
+      assert.deepEqual(glm.activeStreams, [0, outerId]);
       inner.streamWaitEvent();
       inner[Symbol.dispose]();
       assert.ok(!ws.disposedDeviceByStream.has(innerId));
@@ -484,12 +492,27 @@ describe("Workspace stream recycling", () => {
       assert.ok(glm.streamWorkspaces.get(outerId)?.has(ws));
     });
 
+    assert.deepEqual(glm.activeStreams, [0]);
     outer.streamWaitEvent();
     outer[Symbol.dispose]();
     assert.ok(!ws.disposedDeviceByStream.has(outerId));
     assert.equal(ws.getDisposedDevicePool(0).size, 1);
 
     ws.free();
+    glm.free();
+  });
+
+  it("restores the stream stack when a callback throws", () => {
+    const glm = new GlmOps(0);
+
+    assert.throws(() => glm.withStream(() => {
+      assert.equal(glm.activeStreams.length, 2);
+      throw new Error("expected failure");
+    }), /expected failure/);
+
+    assert.deepEqual(glm.activeStreams, [0]);
+    assert.equal(glm.currentStream, 0);
+    assert.equal(glm.availableStreams.length, 15);
     glm.free();
   });
 });
