@@ -2382,6 +2382,70 @@ __global__ void idx_prefill_gather_buf_kernel(
     }
 }
 
+// Faster prefill compaction when stable ordering and first-position tie
+// selection are not required. CTAs own contiguous row slices and reserve output
+// ranges a warp at a time, avoiding the block-wide barriers and serial full-row
+// walk in idx_prefill_gather_buf_kernel. The selected score multiset is exact,
+// but output order and the chosen subset of threshold ties are unspecified.
+__global__ void idx_prefill_gather_atomic_buf_kernel(
+    int32_t* __restrict__ out_idx,           // [totalQ, topk]
+    __nv_bfloat16* __restrict__ out_scores,  // [totalQ, topk]
+    int32_t* __restrict__ meta,              // [totalQ, 4]
+    const __nv_bfloat16* __restrict__ scores,// [totalQ, maxKv]
+    const int32_t* __restrict__ rowLen,      // [totalQ]
+    int maxKv, int topk, int cpWorldSize, int cpRank)
+{
+    const int row = blockIdx.y;
+    int32_t* m = meta + (size_t)row * 4;
+    const int tau = m[0];
+    if (tau < 0) return;  // threshold kernel already wrote the identity row
+
+    const int tieTake = m[1];
+    const int aboveTotal = topk - tieTake;
+    const int len = rowLen ? rowLen[row] : maxKv;
+    const int chunk = (len + (int)gridDim.x - 1) / (int)gridDim.x;
+    const int lo = min((int)blockIdx.x * chunk, len);
+    const int hi = min(lo + chunk, len);
+    const __nv_bfloat16* s = scores + (size_t)row * maxKv;
+    int32_t* out = out_idx + (size_t)row * topk;
+    __nv_bfloat16* out_s = out_scores + (size_t)row * topk;
+    const int lane = threadIdx.x & 31;
+
+    for (int base = lo; base < hi; base += blockDim.x) {
+        const int i = base + threadIdx.x;
+        const bool inRange = i < hi;
+        const int key = inRange ? bf16_key(&s[i]) : -1;
+
+        const unsigned aboveVote = __ballot_sync(0xffffffffu, inRange && key > tau);
+        const int aboveCount = __popc(aboveVote);
+        int aboveBase = 0;
+        if (lane == 0 && aboveCount)
+            aboveBase = atomicAdd(m + 2, aboveCount);
+        aboveBase = __shfl_sync(0xffffffffu, aboveBase, 0);
+        if (aboveVote & (1u << lane)) {
+            const int slot = aboveBase + __popc(aboveVote & ((1u << lane) - 1));
+            if (slot < aboveTotal) {
+                out[slot] = cp_remap(i, cpWorldSize, cpRank);
+                out_s[slot] = s[i];
+            }
+        }
+
+        const unsigned tieVote = __ballot_sync(0xffffffffu, inRange && key == tau);
+        const int tieCount = __popc(tieVote);
+        int tieBase = 0;
+        if (lane == 0 && tieCount)
+            tieBase = atomicAdd(m + 3, tieCount);
+        tieBase = __shfl_sync(0xffffffffu, tieBase, 0);
+        if (tieVote & (1u << lane)) {
+            const int slot = tieBase + __popc(tieVote & ((1u << lane) - 1));
+            if (slot < tieTake) {
+                out[aboveTotal + slot] = cp_remap(i, cpWorldSize, cpRank);
+                out_s[aboveTotal + slot] = s[i];
+            }
+        }
+    }
+}
+
 static bool make_indexer_k_tma_map(
     CUtensorMap* map, const void* kData, uint64_t rows) {
     static PFN_cuTensorMapEncodeTiled_v12000 encode = [] {
@@ -2545,8 +2609,19 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
         idx_prefill_fine_threshold_kernel<<<totalQ, 256, 0, stream>>>(
             fineHist, meta, topk);
 
-        // Pass 6: gather from buffer — one block per row
-        idx_prefill_gather_buf_kernel<<<totalQ, 256, 0, stream>>>(
-            out_idx, out_scores, meta, (const __nv_bfloat16*)scores, rowLen, maxKv, topk, effectiveCpWorldSize, effectiveCpRank);
+        // Pass 6: parallel unordered compaction by default. The ordered kernel
+        // remains available for diagnostics that require repeatable tie choice.
+        const char* deterministicGather = std::getenv("GLM_INDEXER_PREFILL_DETERMINISTIC");
+        // A single row scan has less scheduling overhead at short contexts.
+        if (maxKv < 32768 || (deterministicGather && std::strcmp(deterministicGather, "1") == 0)) {
+            idx_prefill_gather_buf_kernel<<<totalQ, 256, 0, stream>>>(
+                out_idx, out_scores, meta, (const __nv_bfloat16*)scores, rowLen,
+                maxKv, topk, effectiveCpWorldSize, effectiveCpRank);
+        } else {
+            const int gatherSplits = min(32, max(1, (maxKv + 4095) / 4096));
+            idx_prefill_gather_atomic_buf_kernel<<<dim3(gatherSplits, totalQ), 256, 0, stream>>>(
+                out_idx, out_scores, meta, (const __nv_bfloat16*)scores, rowLen,
+                maxKv, topk, effectiveCpWorldSize, effectiveCpRank);
+        }
     }
 }

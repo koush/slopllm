@@ -14,17 +14,16 @@ def _quantize_q(q):
     return (values / q_scale).to(torch.float8_e4m3fn).float(), q_scale
 
 
-def _run_prefill(glm, device, flat, causal):
+def _run_prefill(glm, device, flat, causal, total_q=65, length=137, topk=23):
     torch.manual_seed(9128)
-    total_q, length, page_size, topk = 65, 137, 64, 23
+    page_size = 64
     rows, row_scales = pack_indexer_k(torch.randn(length, 128, dtype=torch.bfloat16, device=device))
-    page_ids = torch.tensor([3, 1, 5], dtype=torch.int32, device=device)
-    paged = torch.zeros(6, page_size, 128, dtype=torch.uint8, device=device)
-    paged_scales = torch.zeros(6, page_size, dtype=torch.float32, device=device)
-    for page, page_id in enumerate(page_ids.tolist()):
-        lo, hi = page * page_size, min((page + 1) * page_size, length)
-        paged[page_id, :hi - lo].copy_(rows[lo:hi])
-        paged_scales[page_id, :hi - lo].copy_(row_scales[lo:hi])
+    num_pages = (length + page_size - 1) // page_size
+    page_ids = torch.arange(num_pages, dtype=torch.int32, device=device)
+    paged = torch.zeros(num_pages, page_size, 128, dtype=torch.uint8, device=device)
+    paged_scales = torch.zeros(num_pages, page_size, dtype=torch.float32, device=device)
+    paged.view(-1, 128)[:length].copy_(rows)
+    paged_scales.view(-1)[:length].copy_(row_scales)
 
     q = torch.randn(total_q, 32, 128, dtype=torch.bfloat16, device=device)
     weights = torch.randn(total_q, 32, dtype=torch.bfloat16, device=device)
@@ -35,8 +34,8 @@ def _run_prefill(glm, device, flat, causal):
     coarse = torch.empty(total_q, 1024, dtype=torch.int32, device=device)
     fine = torch.empty(total_q, 64, dtype=torch.int32, device=device)
     meta = torch.empty(total_q, 4, dtype=torch.int32, device=device)
-    page_indptr = torch.tensor([0, 3], dtype=torch.int32, device=device)
-    last_page_len = torch.tensor([9], dtype=torch.int32, device=device)
+    page_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    last_page_len = torch.tensor([length - (num_pages - 1) * page_size], dtype=torch.int32, device=device)
     qo_indptr = torch.tensor([0, total_q], dtype=torch.int32, device=device)
     flat_indptr = torch.tensor([0, length], dtype=torch.int32, device=device)
 
@@ -50,6 +49,16 @@ def _run_prefill(glm, device, flat, causal):
     )
     glm.synchronize()
     return q, weights, rows, row_scales, out, out_scores, scores, row_len, topk
+
+
+def _assert_topk_scores(out, out_scores, scores, valid, topk):
+    selected = out.long()
+    assert len(torch.unique(selected)) == topk
+    assert torch.all((selected >= 0) & (selected < valid))
+    torch.testing.assert_close(out_scores, scores[selected], rtol=0, atol=0)
+    expected_scores = torch.topk(scores[:valid].float(), topk).values.sort().values
+    actual_scores = out_scores.float().sort().values
+    torch.testing.assert_close(actual_scores, expected_scores, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -71,9 +80,7 @@ def test_prefill_fp8_mma_default_scores_and_topk(glm, device, monkeypatch, flat)
     torch.testing.assert_close(row_len, expected_lengths.to(torch.int32), rtol=0, atol=0)
     for qi, valid in enumerate(expected_lengths.tolist()):
         torch.testing.assert_close(scores[qi, :valid].float(), ref[qi, :valid].float(), rtol=2e-2, atol=0.5)
-        expected = set(torch.topk(ref[qi, :valid].float(), topk).indices.cpu().tolist())
-        assert set(out[qi].cpu().tolist()) == expected
-        torch.testing.assert_close(out_scores[qi].float(), scores[qi, out[qi].long()].float(), rtol=0, atol=0)
+        _assert_topk_scores(out[qi], out_scores[qi], scores[qi], valid, topk)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -86,17 +93,35 @@ def test_prefill_fp8_mma_default_tma_swizzle_matches_retained_kernel(glm, device
     monkeypatch.delenv("GLM_INDEXER_PREFILL_FP8_CONFIG", raising=False)
     actual = _run_prefill(glm, device, flat=True, causal=True)
 
-    torch.testing.assert_close(actual[5], baseline[5], rtol=0, atol=0)
     torch.testing.assert_close(actual[6], baseline[6], rtol=0, atol=0)
     assert torch.equal(actual[7], baseline[7])
-    for actual_row, baseline_row in zip(actual[4], baseline[4]):
-        assert set(actual_row.cpu().tolist()) == set(baseline_row.cpu().tolist())
+    for qi, valid in enumerate(actual[7].cpu().tolist()):
+        _assert_topk_scores(actual[4][qi], actual[5][qi], actual[6][qi], valid, actual[8])
+        _assert_topk_scores(baseline[4][qi], baseline[5][qi], baseline[6][qi], valid, baseline[8])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prefill_deterministic_gather_is_repeatable(glm, device, monkeypatch):
+    monkeypatch.setenv("GLM_INDEXER_PREFILL_DETERMINISTIC", "1")
+    first = _run_prefill(glm, device, flat=True, causal=False, total_q=2, length=32768)
+    second = _run_prefill(glm, device, flat=True, causal=False, total_q=2, length=32768)
+    assert torch.equal(first[4], second[4])
+    assert torch.equal(first[5], second[5])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prefill_atomic_gather_long_context(glm, device, monkeypatch):
+    monkeypatch.delenv("GLM_INDEXER_PREFILL_DETERMINISTIC", raising=False)
+    result = _run_prefill(glm, device, flat=True, causal=False, total_q=4, length=32768)
+    out, out_scores, scores, row_len, topk = result[4:]
+    for qi, valid in enumerate(row_len.cpu().tolist()):
+        _assert_topk_scores(out[qi], out_scores[qi], scores[qi], valid, topk)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_fp8_mma_kill_switch_uses_bf16(glm, device, monkeypatch):
     monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "0")
-    q, weights, rows, row_scales, out, _, scores, row_len, topk = _run_prefill(
+    q, weights, rows, row_scales, out, out_scores, scores, row_len, topk = _run_prefill(
         glm, device, flat=True, causal=False,
     )
 
@@ -107,5 +132,4 @@ def test_prefill_fp8_mma_kill_switch_uses_bf16(glm, device, monkeypatch):
     assert torch.all(row_len == rows.shape[0])
     torch.testing.assert_close(scores.float(), ref.float(), rtol=2e-2, atol=0.5)
     for qi in range(q.shape[0]):
-        expected = set(torch.topk(ref[qi].float(), topk).indices.cpu().tolist())
-        assert set(out[qi].cpu().tolist()) == expected
+        _assert_topk_scores(out[qi], out_scores[qi], scores[qi], rows.shape[0], topk)

@@ -1,7 +1,7 @@
 """Validate the fused two-level prefill indexer against a torch reference.
 
-The prefill kernel uses a 5-pass pipeline (score+coarse-hist, coarse-threshold,
-score+fine-hist, fine-threshold, score+gather) with no materialized score buffer.
+The prefill kernel materializes BF16 scores, builds coarse and fine histograms,
+then gathers the selected threshold entries.
 It must produce the same top-K selection as the reference: every strictly-above-
 threshold position included, exactly topk unique valid indices (or all positions
 if numValid <= topk).
