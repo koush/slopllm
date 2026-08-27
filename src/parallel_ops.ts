@@ -2742,7 +2742,10 @@ export class ParallelOps implements DeviceOps {
   }
 
   availableStreams: number[] = [];
-  currentStream = 0;
+  get currentStream() {
+    return this.devices[0].currentStream;
+  }
+
   setStream(streamIdx: number): void {
     for (const device of this.devices) {
       device.setStream(streamIdx);

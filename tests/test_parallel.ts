@@ -291,9 +291,9 @@ describe("ParallelTensor disposal and recycling", () => {
     pt[Symbol.dispose]();
 
     assert.ok(!ws.tracked.has(pt), "ParallelTensor should be removed from main workspace tracked");
-    assert.ok(!ws.disposedDevice.has(pt), "ParallelTensor should NOT be in main workspace disposed");
-    assert.equal(sws[0].disposedDevice.size, 1, "shard 0 should be in device 0 workspace disposed");
-    assert.equal(sws[1].disposedDevice.size, 1, "shard 1 should be in device 1 workspace disposed");
+    assert.ok(!ws.getDisposedDevicePool(0).has(pt), "ParallelTensor should NOT be in main workspace disposed");
+    assert.equal(sws[0].getDisposedDevicePool(0).size, 1, "shard 0 should be in device 0 workspace disposed");
+    assert.equal(sws[1].getDisposedDevicePool(0).size, 1, "shard 1 should be in device 1 workspace disposed");
 
     ws.free();
     po.free();
@@ -320,8 +320,8 @@ describe("ParallelTensor disposal and recycling", () => {
     }
 
     const sws = po.shardWorkspacesFor(ws);
-    assert.equal(sws[0].disposedDevice.size, 1, "device 0 disposed should have 1 shard after scope exit");
-    assert.equal(sws[1].disposedDevice.size, 1, "device 1 disposed should have 1 shard after scope exit");
+    assert.equal(sws[0].getDisposedDevicePool(0).size, 1, "device 0 disposed should have 1 shard after scope exit");
+    assert.equal(sws[1].getDisposedDevicePool(0).size, 1, "device 1 disposed should have 1 shard after scope exit");
 
     const pt2 = ws.alloc([8, 4], "F32", undefined, TensorParallelism.Column) as ParallelTensor;
     assert.equal(pt2.shard(0).data, s0_data, "shard 0 buffer should be recycled");
@@ -348,8 +348,8 @@ describe("ParallelTensor disposal and recycling", () => {
     }
 
     const sws = po.shardWorkspacesFor(ws);
-    assert.equal(sws[0].disposedDevice.size, 1, "shard 0 should be recycled after using scope");
-    assert.equal(sws[1].disposedDevice.size, 1, "shard 1 should be recycled after using scope");
+    assert.equal(sws[0].getDisposedDevicePool(0).size, 1, "shard 0 should be recycled after using scope");
+    assert.equal(sws[1].getDisposedDevicePool(0).size, 1, "shard 1 should be recycled after using scope");
 
     ws.free();
     po.free();
@@ -379,8 +379,8 @@ describe("ParallelTensor disposal and recycling", () => {
     assert.equal(sws[1].tracked.size, 1);
 
     exported![Symbol.dispose]();
-    assert.equal(sws[0].disposedDevice.size, 1, "exported shard 0 should be recyclable");
-    assert.equal(sws[1].disposedDevice.size, 1, "exported shard 1 should be recyclable");
+    assert.equal(sws[0].getDisposedDevicePool(0).size, 1, "exported shard 0 should be recyclable");
+    assert.equal(sws[1].getDisposedDevicePool(0).size, 1, "exported shard 1 should be recyclable");
 
     ws.free();
     po.free();
@@ -410,17 +410,87 @@ describe("ParallelTensor disposal and recycling", () => {
     assert.equal(sws2[0].tracked.size, 1, "ws2 device 0 should have 1 tracked shard");
 
     pt1[Symbol.dispose]();
-    assert.equal(sws1[0].disposedDevice.size, 1, "ws1 device 0 should have 1 disposed after pt1 disposed");
-    assert.equal(sws2[0].disposedDevice.size, 0, "ws2 device 0 should have 0 disposed (unaffected)");
+    assert.equal(sws1[0].getDisposedDevicePool(0).size, 1, "ws1 device 0 should have 1 disposed after pt1 disposed");
+    assert.equal(sws2[0].getDisposedDevicePool(0).size, 0, "ws2 device 0 should have 0 disposed (unaffected)");
 
     pt2[Symbol.dispose]();
-    assert.equal(sws2[0].disposedDevice.size, 1, "ws2 device 0 should have 1 disposed after pt2 disposed");
+    assert.equal(sws2[0].getDisposedDevicePool(0).size, 1, "ws2 device 0 should have 1 disposed after pt2 disposed");
 
     ws1.free();
     ws2.free();
     po.free();
     glm0.free();
     glm1.free();
+  });
+});
+
+describe("Workspace stream recycling", () => {
+  it("reuses eligible pools and returns disposed tensors to stream 0", () => {
+    const glm = new GlmOps(0);
+    const ws = new WorkspaceBase(glm);
+
+    const main = ws.alloc([16], "F32");
+    const mainData = main.data;
+    main[Symbol.dispose]();
+    assert.equal(ws.getDisposedDevicePool(0).size, 1);
+
+    let streamId = 0;
+    const stream = glm.withStream(() => {
+      streamId = glm.currentStream;
+      const inherited = ws.alloc([16], "F32");
+      assert.equal(inherited.data, mainData, "alternate stream should reuse stream 0 allocation");
+      inherited[Symbol.dispose]();
+
+      assert.equal(ws.getDisposedDevicePool(streamId).size, 1);
+      assert.equal(ws.getDisposedDevicePool(0).size, 0);
+
+      const sameStream = ws.alloc([16], "F32");
+      assert.equal(sameStream.data, mainData, "alternate stream should immediately reuse its own allocation");
+      sameStream[Symbol.dispose]();
+    });
+
+    assert.ok(glm.streamWorkspaces.get(streamId)?.has(ws));
+    assert.equal(ws.getDisposedDevicePool(streamId).size, 1);
+    assert.equal(ws.getDisposedDevicePool(0).size, 0);
+
+    stream.streamWaitEvent();
+    stream[Symbol.dispose]();
+    assert.ok(!ws.disposedDeviceByStream.has(streamId));
+    assert.equal(ws.getDisposedDevicePool(0).size, 1);
+    assert.ok(!glm.streamWorkspaces.has(streamId));
+
+    ws.free();
+    glm.free();
+  });
+
+  it("returns nested stream pools through the active parent stream", () => {
+    const glm = new GlmOps(0);
+    const ws = new WorkspaceBase(glm);
+    let outerId = 0;
+    let innerId = 0;
+
+    const outer = glm.withStream(() => {
+      outerId = glm.currentStream;
+      const inner = glm.withStream(() => {
+        innerId = glm.currentStream;
+        const tensor = ws.alloc([16], "F32");
+        tensor[Symbol.dispose]();
+      });
+
+      inner.streamWaitEvent();
+      inner[Symbol.dispose]();
+      assert.ok(!ws.disposedDeviceByStream.has(innerId));
+      assert.equal(ws.getDisposedDevicePool(outerId).size, 1);
+      assert.ok(glm.streamWorkspaces.get(outerId)?.has(ws));
+    });
+
+    outer.streamWaitEvent();
+    outer[Symbol.dispose]();
+    assert.ok(!ws.disposedDeviceByStream.has(outerId));
+    assert.equal(ws.getDisposedDevicePool(0).size, 1);
+
+    ws.free();
+    glm.free();
   });
 });
 

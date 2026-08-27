@@ -49,16 +49,15 @@ export class GlmTensor extends Tensor {
   }
 
   [Symbol.dispose](): void {
-    if (!this.canDispose()) {
-      return;
+    if (this.canDispose() && this.glm.currentStream !== 0) {
+      let workspaces = this.glm.streamWorkspaces.get(this.glm.currentStream);
+      if (!workspaces) {
+        workspaces = new Set<WorkspaceBase>();
+        this.glm.streamWorkspaces.set(this.glm.currentStream, workspaces);
+      }
+      workspaces.add(this.workspace);
     }
-    // if stream is active, defer disposal until stream switch
-    if (this.glm.currentStream) {
-      this.glm.streamTensors.get(this.glm.currentStream)!.add(this);
-    }
-    else {
-      super[Symbol.dispose]();
-    }
+    super[Symbol.dispose]();
   }
 
   free(): void {
@@ -796,14 +795,10 @@ export class GlmOps implements DeviceOps {
     return getNativeAddon().synchronizeStreamAsync(this.ctx, streamIdx);
   }
 
-  streamTensors = new Map<number, Set<GlmTensor>>();
+  streamWorkspaces = new Map<number, Set<WorkspaceBase>>();
   setStream(streamIdx: number): void {
     getNativeAddon().setStream(this.ctx, streamIdx);
     this.currentStream = streamIdx;
-    if (streamIdx) {
-      if (!this.streamTensors.has(streamIdx))
-        this.streamTensors.set(streamIdx, new Set());
-    }
   }
 
   currentStream = 0;
@@ -812,10 +807,19 @@ export class GlmOps implements DeviceOps {
     if (this.availableStreams.includes(stream))
       throw new Error(`Stream ${stream} already disposed`);
     this.availableStreams.push(stream);
-    const tensors = this.streamTensors.get(stream);
-    this.streamTensors.delete(stream);
-    for (const tensor of tensors!) {
-      tensor[Symbol.dispose]();
+    const workspaces = this.streamWorkspaces.get(stream);
+    this.streamWorkspaces.delete(stream);
+    let destinationWorkspaces: Set<WorkspaceBase> | undefined;
+    if (this.currentStream !== 0 && workspaces?.size) {
+      destinationWorkspaces = this.streamWorkspaces.get(this.currentStream);
+      if (!destinationWorkspaces) {
+        destinationWorkspaces = new Set<WorkspaceBase>();
+        this.streamWorkspaces.set(this.currentStream, destinationWorkspaces);
+      }
+    }
+    for (const workspace of workspaces ?? []) {
+      workspace.disposeStream(stream, this.currentStream);
+      destinationWorkspaces?.add(workspace);
     }
   }
 
@@ -827,7 +831,7 @@ export class GlmOps implements DeviceOps {
     // Record event on current stream so the alternate stream can wait for
     // all prior work (e.g. rmsnorm output that K/V will read).
     getNativeAddon().eventRecord(this.ctx, currentStream, currentStream);
-    if (this.streamTensors.has(stream)) {
+    if (this.streamWorkspaces.has(stream)) {
       throw new Error(`Stream ${stream} already in use`);
     }
     this.setStream(stream);

@@ -181,15 +181,16 @@ export abstract class Tensor implements Disposable {
       return this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, uncapturedView);
     }
 
-    const disposed = this.pinned ? this.workspace.disposedHost : this.workspace.disposedDevice;
-    for (const check of disposed) {
-      if (this.data === check.data && this.allocSize === check.allocSize) {
-        // console.warn('Tensor found in disposed set after uncapture check');
-        disposed.delete(check);
-        check.detachData();
-        const ret = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, undefined);
-        this.workspace.addTracked(ret);
-        return ret;
+    for (const disposed of this.workspace.getDisposedPools(this.pinned)) {
+      for (const check of disposed) {
+        if (this.data === check.data && this.allocSize === check.allocSize) {
+          // console.warn('Tensor found in disposed set after uncapture check');
+          disposed.delete(check);
+          check.detachData();
+          const ret = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, undefined);
+          this.workspace.addTracked(ret);
+          return ret;
+        }
       }
     }
 
@@ -247,7 +248,7 @@ export abstract class Tensor implements Disposable {
     if (this.pinned)
       this.workspace.synchronizingHost.add(this);
     else
-      this.workspace.disposedDevice.add(this);
+      this.workspace.recycleDevice(this);
   }
 
   removeTracking(): this {
