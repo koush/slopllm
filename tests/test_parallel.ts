@@ -43,6 +43,36 @@ describe("ParallelOps construction", () => {
     glm1.free();
     glm2.free();
   });
+
+  it("moves communicator ownership across stream waits", () => {
+    const glm0 = new GlmOps(0);
+    const glm1 = new GlmOps(1);
+    const po = new ParallelOps([glm0, glm1]);
+    const mainComms = po.getComms();
+    let childComms: number[] | undefined;
+
+    using child = po.withStream(() => {
+      childComms = po.getComms();
+    });
+    assert.strictEqual(childComms, mainComms, "child should borrow the main stream's communicator set");
+
+    const replacement = po.getComms();
+    assert.notStrictEqual(replacement, mainComms, "main should allocate another set while the child owns its original set");
+    child.streamWaitEvent();
+    child[Symbol.dispose]();
+
+    let reusedComms: number[] | undefined;
+    using nextChild = po.withStream(() => {
+      reusedComms = po.getComms();
+    });
+    assert.strictEqual(reusedComms, mainComms, "the waited communicator set should bubble back to main");
+    nextChild.streamWaitEvent();
+    nextChild[Symbol.dispose]();
+
+    po.free();
+    glm0.free();
+    glm1.free();
+  });
 });
 
 describe("ParallelOps shardShape", () => {
@@ -512,7 +542,7 @@ describe("Workspace stream recycling", () => {
 
     assert.deepEqual(glm.activeStreams, [0]);
     assert.equal(glm.currentStream, 0);
-    assert.equal(glm.availableStreams.length, 15);
+    assert.equal(glm.availableStreams.length, 63);
     glm.free();
   });
 });

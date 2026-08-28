@@ -208,10 +208,11 @@ export class ParallelTensor extends Tensor {
     if (!this.tryP2PAllReduce()) {
       const dtype = this.parallelOps.ncclDatatype(this.type);
       const addon = getNativeAddon();
+      const comms = this.parallelOps.getComms();
       addon.ncclGroupStart();
       for (let i = 0; i < this.worldSize; ++i) {
         addon.ncclAllReduce(
-          this.parallelOps.comms[i], this.devices[i].ctx,
+          comms[i], this.devices[i].ctx,
           this.shards[i].data, this.shards[i].data,
           count, dtype, NCCL_SUM,
         );
@@ -339,7 +340,7 @@ export class ParallelTensor extends Tensor {
 
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     const dtype = this.parallelOps.ncclDatatype(this.type);
-    const comms = this.parallelOps.comms;
+    const comms = this.parallelOps.getComms();
 
     if (this.parallelism === TensorParallelism.Column) {
       getNativeAddon().ncclGroupStart();
@@ -2040,10 +2041,9 @@ class P2PAllReduceGroup {
    * the tensors its peers will read; they are only released once this group's
    * *next* barrier proves every peer is past those reads.
    *
-   * Per-group (i.e. per-stream) on purpose: a barrier on one stream says
-   * nothing about a P2P op still in flight on another, so a shared list would
-   * let one stream's cleanup recycle buffers another stream's peers are still
-   * reading.
+   * Per-group on purpose: the group moves between streams only across an
+   * explicit wait edge, so one stream cannot recycle sources still in use by
+   * another.
    */
   sources: Tensor[] = [];
 
@@ -2111,14 +2111,18 @@ interface SparseMlaPrefetchExtra {
   };
 }
 
+interface CommunicationPool {
+  comms: number[][];
+  p2pGroups: P2PAllReduceGroup[];
+}
+
 export class ParallelOps implements DeviceOps {
   readonly devices: readonly GlmOps[];
   readonly worldSize: number;
   synchronizeListeners: WeakRef<WorkspaceBase>[] = [];
   readonly comms: number[];
   private readonly shardWorkspaces = new WeakMap<WorkspaceBase, WorkspaceBase[]>();
-  /** Lazy-initialized P2P groups per stream. */
-  private p2pGroups = new Map<number, P2PAllReduceGroup>();
+  private readonly communicationPools = new Map<number, CommunicationPool>();
   p2pEnabled: boolean;
   /** When true, all GPUs are context-parallel shards. MLA ops auto-inject cpWorldSize/cpRank. */
 
@@ -2137,6 +2141,7 @@ export class ParallelOps implements DeviceOps {
     } else {
       this.comms = [];
     }
+    this.communicationPools.set(0, { comms: [this.comms], p2pGroups: [] });
     // Enable P2P peer access early, before model weights are loaded,
     // to avoid VA-space fragmentation that can cause cudaDeviceEnablePeerAccess
     // to fail with cudaErrorMemoryAllocation on large models.
@@ -2164,19 +2169,69 @@ export class ParallelOps implements DeviceOps {
     return true;
   }
 
-  /** Get (and lazily create) the P2P group for the given stream. */
+  private getCommunicationPool(stream: number): CommunicationPool {
+    let pool = this.communicationPools.get(stream);
+    if (!pool) {
+      pool = { comms: [], p2pGroups: [] };
+      this.communicationPools.set(stream, pool);
+    }
+    return pool;
+  }
+
+  private communicationLineage(stream: number): readonly number[] {
+    if (stream !== this.currentStream) return [stream];
+    return [...this.activeStreams].reverse();
+  }
+
+  private moveCommunicationPool(sourceStream: number, destinationStream: number): void {
+    if (sourceStream === destinationStream) return;
+    const source = this.communicationPools.get(sourceStream);
+    if (!source) return;
+    const destination = this.getCommunicationPool(destinationStream);
+    destination.comms.push(...source.comms);
+    destination.p2pGroups.push(...source.p2pGroups);
+    this.communicationPools.delete(sourceStream);
+  }
+
+  /** Get a P2P group owned by the current stream, borrowing from its ancestry if possible. */
   getP2PGroup(stream: number): P2PAllReduceGroup | null {
     if (!this.p2pEnabled) return null;
-    if (!this.p2pGroups.has(stream)) {
-      try {
-        this.p2pGroups.set(stream, new P2PAllReduceGroup(this.devices));
-      } catch (e) {
-        console.warn(`P2P AllReduce group creation failed (${e}); falling back to NCCL`);
-        this.p2pEnabled = false;
-        return null;
+    const destination = this.getCommunicationPool(stream);
+    if (destination.p2pGroups.length) return destination.p2pGroups[0];
+    for (const owner of this.communicationLineage(stream)) {
+      if (owner === stream) continue;
+      const group = this.communicationPools.get(owner)?.p2pGroups.pop();
+      if (group) {
+        destination.p2pGroups.push(group);
+        return group;
       }
     }
-    return this.p2pGroups.get(stream) || null;
+    try {
+      const group = new P2PAllReduceGroup(this.devices);
+      destination.p2pGroups.push(group);
+      return group;
+    } catch (e) {
+      console.warn(`P2P AllReduce group creation failed (${e}); falling back to NCCL`);
+      this.p2pEnabled = false;
+      return null;
+    }
+  }
+
+  getComms(stream = this.currentStream): number[] {
+    const destination = this.getCommunicationPool(stream);
+    if (destination.comms.length) return destination.comms[0];
+    for (const owner of this.communicationLineage(stream)) {
+      if (owner === stream) continue;
+      const comms = this.communicationPools.get(owner)?.comms.pop();
+      if (comms) {
+        destination.comms.push(comms);
+        return comms;
+      }
+    }
+    console.log(`Lazy-creating NCCL communicator set for stream ${stream}`);
+    const comms = getNativeAddon().ncclCommInitAll(this.devices.map(device => device.device));
+    destination.comms.push(comms);
+    return comms;
   }
 
   allGatherMultiple(tensors: readonly ParallelTensor[], workspace: WorkspaceBase): ParallelTensor[] {
@@ -2244,12 +2299,12 @@ export class ParallelOps implements DeviceOps {
 
   /** NCCL point-to-point send. Must be paired with ncclRecv on peer. */
   ncclSend(shard: Tensor, rank: number, peer: number, count: number, dtype: number): void {
-    getNativeAddon().ncclSend(this.comms[rank], this.devices[rank].ctx, shard.data, count, dtype, peer);
+    getNativeAddon().ncclSend(this.getComms()[rank], this.devices[rank].ctx, shard.data, count, dtype, peer);
   }
 
   /** NCCL point-to-point recv. Must be paired with ncclSend on peer. */
   ncclRecv(shard: Tensor, rank: number, peer: number, count: number, dtype: number): void {
-    getNativeAddon().ncclRecv(this.comms[rank], this.devices[rank].ctx, shard.data, count, dtype, peer);
+    getNativeAddon().ncclRecv(this.getComms()[rank], this.devices[rank].ctx, shard.data, count, dtype, peer);
   }
 
   /**
@@ -2470,10 +2525,11 @@ export class ParallelOps implements DeviceOps {
     for (let i = 0; i < N; i++) {
       gatheredLse.push(shardWss[i].alloc([N * batchSize, numHeads], "F32"));
     }
+    const comms = this.getComms();
     getNativeAddon().ncclGroupStart();
     for (let i = 0; i < N; i++) {
       getNativeAddon().ncclAllGather(
-        this.comms[i], this.devices[i].ctx,
+        comms[i], this.devices[i].ctx,
         partialLses.shards[i].data, gatheredLse[i].data,
         lseCount, NCCL_FLOAT32,
       );
@@ -2510,7 +2566,7 @@ export class ParallelOps implements DeviceOps {
     getNativeAddon().ncclGroupStart();
     for (let i = 0; i < N; i++) {
       getNativeAddon().ncclReduceScatter(
-        this.comms[i], this.devices[i].ctx,
+        comms[i], this.devices[i].ctx,
         transposed[i].data, outputV[i].data,
         shardVOutCount, NCCL_BFLOAT16, NCCL_SUM,
       );
@@ -2525,15 +2581,19 @@ export class ParallelOps implements DeviceOps {
   }
 
   free(): void {
-    for (const group of this.p2pGroups.values()) {
-      group.free();
+    const groups = new Set<P2PAllReduceGroup>();
+    const communicatorSets = new Set<number[]>();
+    for (const pool of this.communicationPools.values()) {
+      for (const group of pool.p2pGroups) groups.add(group);
+      for (const comms of pool.comms) communicatorSets.add(comms);
     }
-    this.p2pGroups.clear();
-    if (this.comms.length > 0) {
-      for (const comm of this.comms) {
+    for (const group of groups) group.free();
+    for (const comms of communicatorSets) {
+      for (const comm of comms) {
         getNativeAddon().ncclCommDestroy(comm);
       }
     }
+    this.communicationPools.clear();
   }
 
   [Symbol.dispose](): void {
@@ -2709,16 +2769,16 @@ export class ParallelOps implements DeviceOps {
     for (const device of this.devices) {
       device.synchronize();
     }
-    for (const group of this.p2pGroups.values()) {
-      group.onSynchronized();
+    for (const pool of this.communicationPools.values()) {
+      for (const group of pool.p2pGroups) group.onSynchronized();
     }
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
   async synchronizeAsync(): Promise<void> {
     await Promise.all(this.devices.map(device => device.synchronizeAsync()));
-    for (const group of this.p2pGroups.values()) {
-      group.onSynchronized();
+    for (const pool of this.communicationPools.values()) {
+      for (const group of pool.p2pGroups) group.onSynchronized();
     }
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
@@ -2727,18 +2787,12 @@ export class ParallelOps implements DeviceOps {
     for (const device of this.devices) {
       device.synchronizeStream(streamIdx);
     }
-    const group = this.getP2PGroup(streamIdx);
-    if (group) {
-      group.onSynchronized();
-    }
+    for (const group of this.communicationPools.get(streamIdx)?.p2pGroups ?? []) group.onSynchronized();
   }
 
   async synchronizeStreamAsync(streamIdx: number): Promise<void> {
     await Promise.all(this.devices.map(device => device.synchronizeStreamAsync(streamIdx)));
-    const group = this.getP2PGroup(streamIdx);
-    if (group) {
-      group.onSynchronized();
-    }
+    for (const group of this.communicationPools.get(streamIdx)?.p2pGroups ?? []) group.onSynchronized();
   }
 
   availableStreams: number[] = [];
@@ -2790,6 +2844,7 @@ export class ParallelOps implements DeviceOps {
           this.devices[i].disposeStream(streams[i]!);
         }
       }
+      if (!completed) this.moveCommunicationPool(streams[0]!, currentStreams[0]);
     }
     let disposed = false;
     return {
@@ -2797,6 +2852,7 @@ export class ParallelOps implements DeviceOps {
         if (disposed)
           return;
         disposed = true;
+        this.moveCommunicationPool(streams[0]!, this.currentStream);
         for (let i = 0; i < this.devices.length; i++) {
           this.devices[i].disposeStream(streams[i]!);
         }
@@ -2805,8 +2861,11 @@ export class ParallelOps implements DeviceOps {
         // if (disposed)
         //   return;
         for (let i = 0; i < this.devices.length; i++) {
-          this.devices[i].streamWaitEvent(this.devices[i].currentStream, streams[i]!);
+          const destinationStream = this.devices[i].currentStream;
+          this.devices[i].streamWaitEvent(destinationStream, streams[i]!);
+          this.devices[i].disposeStreamTensors(streams[i]!, destinationStream);
         }
+        this.moveCommunicationPool(streams[0]!, this.currentStream);
       },
       synchronize: () => {
         for (let i = 0; i < this.devices.length; i++) {
@@ -3910,13 +3969,12 @@ export class ParallelOps implements DeviceOps {
       topkValShards.push(r.values);
     }
 
-    // Column [totalQ, topk] → AllGather → Replicated [totalQ, topk].
-    using topkIdxColumn = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Column);
+    // Keep indices sharded until topkToSlots so phased forwards can overlap the gather.
+    const topkIdxColumn = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Column);
     const topkValColumn = this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk], "BF16", TensorParallelism.Column);
-    const topkIdxReplicated = topkIdxColumn.allGather(idxQ.workspace);
     // const topkValReplicated = topkValColumn.allGather(idxQ.workspace);
 
-    return { values: topkValColumn, indices: topkIdxReplicated };
+    return { values: topkValColumn, indices: topkIdxColumn };
   }
 
   // Sort each top-k row ascending by index, in place, on every shard. The
@@ -3935,7 +3993,10 @@ export class ParallelOps implements DeviceOps {
   //   every rank (cpW=1) — for the gathered/replicated CKV buffer. "paged": the
   //   per-rank CP shard (cpW=W, cpR=i) with the ownership filter, or non-CP
   //   (cpW=0).
-  topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): { layer: SlotSet, group: SlotSet, stream?: ReturnType<ParallelOps["withStream"]> } {
+  topkToSlots(state: ExecutionState, sourceTopkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): { layer: SlotSet, group: SlotSet, stream?: ReturnType<ParallelOps["withStream"]> } {
+    using topkIdx = sourceTopkIdx.parallelism === TensorParallelism.Replicated
+      ? sourceTopkIdx.viewClone()
+      : this.cast(sourceTopkIdx).allGather(sourceTopkIdx.workspace);
     const pTopkIdx = this.cast(topkIdx);
     const pKvTokenIndptr = this.cast(kvTokenIndptrD);
     const pPageIndices = this.cast(pageIndices);

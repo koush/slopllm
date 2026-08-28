@@ -819,25 +819,33 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().setStream(this.ctx, this.currentStream);
   }
 
-  availableStreams = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-  disposeStream(stream: number) {
-    if (this.availableStreams.includes(stream))
-      throw new Error(`Stream ${stream} already disposed`);
-    this.availableStreams.push(stream);
+  availableStreams = Array.from({ length: 63 }, (_, i) => i + 1);
+  disposeStreamTensors(stream: number, destinationStream = this.currentStream) {
+    if (stream === destinationStream)
+      return;
     const workspaces = this.streamWorkspaces.get(stream);
     this.streamWorkspaces.delete(stream);
     let destinationWorkspaces: Set<WorkspaceBase> | undefined;
-    if (this.currentStream !== 0 && workspaces?.size) {
-      destinationWorkspaces = this.streamWorkspaces.get(this.currentStream);
+    if (destinationStream !== 0 && workspaces?.size) {
+      destinationWorkspaces = this.streamWorkspaces.get(destinationStream);
       if (!destinationWorkspaces) {
         destinationWorkspaces = new Set<WorkspaceBase>();
-        this.streamWorkspaces.set(this.currentStream, destinationWorkspaces);
+        this.streamWorkspaces.set(destinationStream, destinationWorkspaces);
       }
     }
     for (const workspace of workspaces ?? []) {
-      workspace.disposeStream(stream, this.currentStream);
+      workspace.disposeStream(stream, destinationStream);
       destinationWorkspaces?.add(workspace);
     }
+  }
+
+  disposeStream(stream: number) {
+    if (this.availableStreams.includes(stream))
+      throw new Error(`Stream ${stream} already disposed`);
+    // Correct callers transfer at the wait edge. This fallback prevents pools
+    // from being stranded when a stream handle is disposed without a wait.
+    this.disposeStreamTensors(stream);
+    this.availableStreams.push(stream);
   }
 
   withStream<T>(fn: () => T) {
@@ -867,8 +875,13 @@ export class GlmOps implements DeviceOps {
         this.disposeStream(stream);
       }
     }
+    let disposed = false;
+    let waited = false;
     return {
       [Symbol.dispose]: () => {
+        if (disposed)
+          return;
+        disposed = true;
         this.disposeStream(stream);
       },
       result,
@@ -876,7 +889,12 @@ export class GlmOps implements DeviceOps {
         getNativeAddon().synchronizeStream(this.ctx, stream);
       },
       streamWaitEvent: () => {
-        getNativeAddon().streamWaitEvent(this.ctx, this.currentStream, stream);
+        const destinationStream = this.currentStream;
+        getNativeAddon().streamWaitEvent(this.ctx, destinationStream, stream);
+        if (waited)
+          return;
+        waited = true;
+        this.disposeStreamTensors(stream, destinationStream);
       }
     }
   }

@@ -170,6 +170,7 @@ export class Qwen3Model extends ChatModel {
       const attnResult = residual.value.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${pfx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
       using attnNormed = attnResult.normed;
       residual.replace(attnResult.residual);
+      yield;
 
       using downBuf = this.mlp(attnNormed, BS, pfx);
       const nextWeight = i < cfg.numHiddenLayers - 1
@@ -179,6 +180,7 @@ export class Qwen3Model extends ChatModel {
       const mlpResult = residual.value.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
       normed.replace(mlpResult.normed);
       residual.replace(mlpResult.residual);
+      yield;
     }
 
     return normed.detach();

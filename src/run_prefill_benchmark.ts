@@ -65,6 +65,7 @@ function parseArgs(argv: string[]): BenchArgs {
     else if (a === "--file" && i + 1 < argv.length) args.file = argv[++i];
     else if (a === "--max-new-tokens" && i + 1 < argv.length) args.maxNewTokens = parseInt(argv[++i], 10);
     else if (a === "--mtp") args.mtp = true;
+    else if (a === "--no-mtp") args.mtp = false;
     else if (a === "--mtp-draft-topk" && i + 1 < argv.length) args.mtpDraftTopk = argv[++i].split(",").map(s => parseInt(s.trim(), 10));
     else if (a === "--help") {
       console.log(`Usage: npx tsx src/run_prefill_benchmark.ts [options]
@@ -84,6 +85,7 @@ Options:
                      summarize it, and print the response (skips benchmarking)
   --max-new-tokens <n>  Max tokens to generate for --file summary (default: 512)
   --mtp              Run the API-compatible MTP prompt-prefill path
+  --no-mtp           Run ordinary prefill even if the model loader enables MTP
   --mtp-draft-topk <list>  MTP draft top-k per depth (default: 1,1,1)
   --help             Show this help`);
       process.exit(0);

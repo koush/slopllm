@@ -807,6 +807,7 @@ export class Glm51Model extends ChatModel {
         const pagedKV = state.cache.getPagedKV();
         const kData = pagedKV.kData[layerIdx];
         const maxKv = kData.shape[0] * kData.shape[1];
+        yield;
         const { layer, group, stream } = this.glm.topkToSlots(
           state,
           topkIndices, state.kvTokenIndptrD,
@@ -814,6 +815,7 @@ export class Glm51Model extends ChatModel {
           pagedKV.pageSize, maxKv,
           layerIdx, pagedKV.contextParallel,
         );
+        yield;
         sharedSlots.replace(group.slots);
         sharedSlotsLength.replace(group.length);
         sparseSlots = { slots: layer.slots, length: layer.length, stream };
@@ -824,9 +826,9 @@ export class Glm51Model extends ChatModel {
     using slotsLength = sparseSlots?.length;
     using slotsStream = sparseSlots?.stream;
 
+    kvcache.streamWaitEvent();
     qAbsorbedRStream.streamWaitEvent();
     qPeRStream.streamWaitEvent();
-    kvcache.streamWaitEvent();
 
     using qAbsorbedR = qAbsorbedRStream.result;
     using qPeR = qPeRStream.result;
@@ -876,6 +878,7 @@ export class Glm51Model extends ChatModel {
     const attnResult = residual.fusedAddRmsnorm(oProjBuf.value, this.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
+    yield;
 
     const mlpPfx = `${Glm51Model.WEIGHT_PREFIX}${layerIdx}`;
     using downBuf = layerIdx >= cfg.firstSparseMlpLayer
@@ -898,6 +901,7 @@ export class Glm51Model extends ChatModel {
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
 
     slotsStream?.streamWaitEvent();
+    yield;
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 

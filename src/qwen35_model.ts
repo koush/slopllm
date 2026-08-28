@@ -309,6 +309,7 @@ export class Qwen35Model extends ChatModel {
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
+    yield;
 
     using downBuf = this.mlp(attnNormed, `${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}`, BS);
     const nextWeight = layerIdx < cfg.numHiddenLayers - 1
@@ -316,6 +317,7 @@ export class Qwen35Model extends ChatModel {
       : this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}norm.weight`)!;
     yield;
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
+    yield;
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
@@ -365,6 +367,7 @@ export class Qwen35Model extends ChatModel {
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
+    yield;
 
     using downBuf = this.mlp(attnNormed, `${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}`, BS);
     const nextWeight = layerIdx < cfg.numHiddenLayers - 1
@@ -372,6 +375,7 @@ export class Qwen35Model extends ChatModel {
       : this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}norm.weight`)!;
     yield;
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
+    yield;
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
@@ -419,6 +423,7 @@ export class Qwen35Model extends ChatModel {
     const attnResult = residual.fusedAddRmsnorm(oProjBuf, this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.post_attention_layernorm.weight`)!, cfg.rmsNormEps);
     using attnNormed = attnResult.normed;
     using attnResidual = attnResult.residual;
+    yield;
 
     using downBuf = this.mlp(attnNormed, `${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}`, BS);
     const nextWeight = layerIdx < cfg.numHiddenLayers - 1
@@ -426,6 +431,7 @@ export class Qwen35Model extends ChatModel {
       : this.tensors.get(`${Qwen35Model.WEIGHT_PREFIX}norm.weight`)!;
     yield;
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
+    yield;
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
