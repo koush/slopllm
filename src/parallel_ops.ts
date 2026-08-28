@@ -10,13 +10,11 @@ import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
 // Master switch for the CP "gather CKV" path in sparse MLA prefill. When true,
-// CP prefill gathers the CKV cache into a flat Replicated buffer and the indexer
-// emits flat slots to match. When false, both are disabled: Q is AllGathered and
-// the indexer/sparse kernel run against the paged cache (the pre-gather path).
-// Toggle here or via GLM_CP_GATHER_KV=0. Both the gather (sparseMlaPrefill) and
-// the indexer flat-slot mode (topkToSlots ignores kvTokenIndptr when off)
-// read this so they never diverge.
+// CP prefill gathers CKV into a flat Replicated buffer and emits flat slots to
+// match. The indexer cache remains Row-parallel unless separately opted into
+// gathering below; its per-rank top-k results are merged before slot conversion.
 export const CP_GATHER_KV = process.env.GLM_CP_GATHER_KV !== "0";
+export const CP_GATHER_INDEXER_KV = CP_GATHER_KV && process.env.GLM_CP_GATHER_INDEXER_KV !== "0";
 // Fall back to the read-based (pull) CP merge; the push path is the default.
 export const CP_MERGE_PULL = process.env.GLM_CP_MERGE_PULL === "1";
 // Sort the CP top-k merge result ascending by global index. ON by default;
@@ -3188,52 +3186,50 @@ export class ParallelOps implements DeviceOps {
     }
 
     const isIndexer = !!pKpeData && !pAppendKpe && headDimKpe === 0;
-    if (isIndexer && contextParallel) {
-      const cfg = state.model.cfg as Glm51Config;
-      const prefetchKey = `sparseMlaPrefetchLayer_${cacheIdx}`;
-      using prefetchedStream = this.takeSparseMlaPrefetchStream(state, prefetchKey, "indexerStream");
-      prefetchedStream?.streamWaitEvent();
-      const prefetched = prefetchedStream?.result;
-
-      if (prefetched) {
-        const pKvTokenIndptr = this.cast(state.kvTokenIndptrD);
-        for (let i = 0; i < this.worldSize; i++) {
-          this.devices[i].indexerKvCacheAppendFlat(
-            prefetched.kData.shards[i], prefetched.kScaleData.shards[i],
-            pAppendCkv.shards[i], pKvTokenIndptr.shards[i],
-            pBatchIndices.shards[i], pPositions.shards[i], nnz, headDimCkv,
-            appendCkvStrideN,
-          );
-        }
-        return { ckv: prefetched.kData, kpe: prefetched.kScaleData };
-      }
-
-      if (this.shouldGatherKv(state, false)) {
-        if (cacheIdx !== 0) {
-          throw new Error(`mlaKvCacheAppend: expected indexer prefetch for full layer ${cacheIdx}`);
-        }
-        const pagedKV = state.cache.getPagedKV();
-        const paddedKvLen = Math.min(
-          pagedKV.maxPages * pagedKV.pageSize,
-          state.getGraphVariantPaddedKvLen(),
-        );
-        return {
-          ckv: this.gatherPages(
-            ckvData, indices, indptr, lastPageLen,
-            state.batchSize,
-            paddedKvLen,
-            state.kvTokenIndptrD, true,
-          ),
-          kpe: this.gatherPages(
-            kpeData!, indices, indptr, lastPageLen,
-            state.batchSize,
-            paddedKvLen,
-            state.kvTokenIndptrD, true,
-          ),
-        };
-      }
+    if (!isIndexer || !contextParallel || !CP_GATHER_INDEXER_KV || !this.shouldGatherKv(state, false)) {
+      return { ckv: pCkvData.viewClone(), kpe: pKpeData?.viewClone() };
     }
-    return { ckv: pCkvData.viewClone(), kpe: pKpeData?.viewClone() };
+
+    const prefetchKey = `sparseMlaPrefetchLayer_${cacheIdx}`;
+    using prefetchedStream = this.takeSparseMlaPrefetchStream(state, prefetchKey, "indexerStream");
+    prefetchedStream?.streamWaitEvent();
+    const prefetched = prefetchedStream?.result;
+
+    if (prefetched) {
+      const pKvTokenIndptr = this.cast(state.kvTokenIndptrD);
+      for (let i = 0; i < this.worldSize; i++) {
+        this.devices[i].indexerKvCacheAppendFlat(
+          prefetched.kData.shards[i], prefetched.kScaleData.shards[i],
+          pAppendCkv.shards[i], pKvTokenIndptr.shards[i],
+          pBatchIndices.shards[i], pPositions.shards[i], nnz, headDimCkv,
+          appendCkvStrideN,
+        );
+      }
+      return { ckv: prefetched.kData, kpe: prefetched.kScaleData };
+    }
+
+    if (cacheIdx !== 0) {
+      throw new Error(`mlaKvCacheAppend: expected indexer prefetch for full layer ${cacheIdx}`);
+    }
+    const pagedKV = state.cache.getPagedKV();
+    const paddedKvLen = Math.min(
+      pagedKV.maxPages * pagedKV.pageSize,
+      state.getGraphVariantPaddedKvLen(),
+    );
+    return {
+      ckv: this.gatherPages(
+        ckvData, indices, indptr, lastPageLen,
+        state.batchSize,
+        paddedKvLen,
+        state.kvTokenIndptrD, true,
+      ),
+      kpe: this.gatherPages(
+        kpeData!, indices, indptr, lastPageLen,
+        state.batchSize,
+        paddedKvLen,
+        state.kvTokenIndptrD, true,
+      ),
+    };
   }
 
   sparseMlaPrepareCache(state: ExecutionState, groupSlots: Tensor, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
@@ -3345,7 +3341,7 @@ export class ParallelOps implements DeviceOps {
     if (nextCacheIdx < cfg.numHiddenLayers && pagedKV.ckvData[nextCacheIdx]) {
       const nextKData = pagedKV.kData[nextCacheIdx];
       const nextKScaleData = pagedKV.kScaleData[nextCacheIdx];
-      const indexerStream = nextKData?.parallelism === TensorParallelism.Row
+      const indexerStream = CP_GATHER_INDEXER_KV && nextKData?.parallelism === TensorParallelism.Row
         ? this.withStream(() => ({
           kData: this.gatherPages(
             nextKData, indices!, indptr, state.lastPageLen,
