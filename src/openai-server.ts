@@ -10,7 +10,7 @@ import { mtpTotalTreeNodes } from "./glm51_model";
 import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
-import { PhasedPrefillRunner } from "./phased-prefill";
+import { PhasedPrefillRunner, splitRaggedInput } from "./phased-prefill";
 import { Tensor } from "./tensor";
 
 const PAGE_SIZE = 64;
@@ -53,7 +53,7 @@ function parseArgs(argv: string[]): ServerArgs {
     port: 8000,
     host: "0.0.0.0",
     chunkSize: 8192,
-    batchSize: 1,
+    batchSize: 8,
     maxPages: 0,
     maxTokens: 65536,
     temperature: 0.6,
@@ -114,7 +114,7 @@ Options:
   --gpus <list>                 GPU device IDs
   --arena <int>                 Arena size in GiB per GPU
   --chunk-size <int>            Maximum prefill chunk per sequence (default: 8192)
-  --batch-size <int>            Maximum concurrent requests (default: 1)
+  --batch-size <int>            Maximum concurrent requests (default: 8)
   --max-pages <int>             KV cache pages (default: batch-size * ceil(chunk-size / 64))
   --max-tokens <int>            Default max completion tokens (default: 65536)
   --model-dir <string>          Model directory path (default: auto-detect from HF cache)
@@ -494,43 +494,32 @@ async function generateMtpBatches(
         }
         const prefillStart = performance.now();
         const phasedRunner = phasedPrefill ? new PhasedPrefillRunner(model, model.glm) : undefined;
-        const phasedChunkTimings: { start: number, batchSize: number }[] = [];
-        const recordPhasedChunks = (): void => {
-          const elapsedSeconds = (performance.now() - phasedChunkTimings[0].start) / 1000 / phasedChunkTimings.length;
-          for (const timing of phasedChunkTimings) recordMtpPhase("prefill_chunk", timing.batchSize, elapsedSeconds);
-          phasedChunkTimings.length = 0;
-        };
-        try {
-          nextStagingKey = await prefillPromptChunks(
+        nextStagingKey = await prefillPromptChunks(
             pagedKV,
             newRows,
             chunkSize,
             nextStagingKey,
             async (inputIds, nextTokens) => {
               if (phasedRunner) {
-                const planned = model.planPrefillMtpChunkPhased!(ws, cache, inputIds, nextTokens);
-                phasedChunkTimings.push({ start: performance.now(), batchSize: planned.state.batchSize });
-                if (phasedRunner.enqueueGenerator(planned.state, planned.generator, undefined, planned)) {
+                const split = splitRaggedInput(inputIds);
+                if (split) {
+                  const phaseStart = performance.now();
+                  using planA = model.planPrefillMtpChunkPhased!(ws, cache, split.inputA, split.nextA);
+                  using planB = model.planPrefillMtpChunkPhased!(ws, cache, split.inputB, nextTokens);
+                  phasedRunner.runPlanPair(planA, planB);
                   await model.glm.synchronizeAsync();
-                  recordPhasedChunks();
+                  const elapsedSeconds = (performance.now() - phaseStart) / 2000;
+                  recordMtpPhase("prefill_chunk", planA.state.batchSize, elapsedSeconds);
+                  recordMtpPhase("prefill_chunk", planB.state.batchSize, elapsedSeconds);
                   ws.assertClear();
                   ws.resetPlanSlots();
+                  return;
                 }
-                return;
               }
               await executePlan(captureManager, ws, model.planPrefillMtpChunk!(ws, cache, inputIds, nextTokens), observeMtpPhase);
             },
             row => finish(row.request),
           );
-          if (phasedRunner?.flush()) {
-            await model.glm.synchronizeAsync();
-            recordPhasedChunks();
-            ws.assertClear();
-            ws.resetPlanSlots();
-          }
-        } finally {
-          phasedRunner?.[Symbol.dispose]();
-        }
         const retainedActive: CompletionRequest[] = [];
         for (const entry of activeEntries) {
           if (entry.request.finished) {
@@ -675,22 +664,25 @@ async function generateContinuousBatch(
       // Prefill new requests
       const prefillStart = performance.now();
       const phasedRunner = phasedPrefill ? new PhasedPrefillRunner(model, glm) : undefined;
-      try {
-        nextStagingKey = await prefillPromptChunks(
+      nextStagingKey = await prefillPromptChunks(
           pagedKV,
           newRows,
           ws.maxSeqLen,
           nextStagingKey,
           async inputIds => {
             if (phasedRunner) {
-              const state = ws.planPrefill(model, inputIds.length, inputIds.map(ids => ids.length), cache);
-              state.setInput(inputIds);
-              if (phasedRunner.enqueue(state)) {
+              const split = splitRaggedInput(inputIds);
+              if (split) {
+                const stateA = ws.planPrefill(model, split.inputA.length, split.inputA.map(ids => ids.length), cache);
+                stateA.setInput(split.inputA);
+                const stateB = ws.planPrefill(model, split.inputB.length, split.inputB.map(ids => ids.length), cache);
+                stateB.setInput(split.inputB);
+                phasedRunner.runPair(stateA, stateB);
                 await glm.synchronizeAsync();
                 ws.assertClear();
                 ws.resetPlanSlots();
+                return;
               }
-              return;
             }
             {
               using _logits = ws.forwardPrefill(model, inputIds, cache);
@@ -700,14 +692,6 @@ async function generateContinuousBatch(
           },
           row => finishCancelled(row.request),
         );
-        if (phasedRunner?.flush()) {
-          await glm.synchronizeAsync();
-          ws.assertClear();
-          ws.resetPlanSlots();
-        }
-      } finally {
-        phasedRunner?.[Symbol.dispose]();
-      }
       const retainedActiveEntries: typeof activeEntries = [];
       for (const entry of activeEntries) {
         if (entry.sequence.request.finished) {

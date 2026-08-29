@@ -1,111 +1,101 @@
-import { ChatModel } from "./chat_model";
+import { ChatModel, PhasedPrefillPlan } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { ExecutionState } from "./execution-workspace";
 import { Tensor } from "./tensor";
 
-interface PendingForward {
+interface PhasedForward {
   state: ExecutionState;
   generator: Generator<void, Tensor, void>;
-  result: IteratorResult<void, Tensor>;
   owner?: Disposable;
 }
 
 type PairConsumer = (stateA: ExecutionState, hiddenA: Tensor, stateB: ExecutionState, hiddenB: Tensor) => void;
 
+export interface RaggedInputSplit {
+  inputA: number[][];
+  inputB: number[][];
+  nextA: number[];
+}
+
+export function splitRaggedInput(inputIds: number[][]): RaggedInputSplit | undefined {
+  if (inputIds.length === 0 || inputIds.some(ids => ids.length < 2)) return undefined;
+
+  const totalTokens = inputIds.reduce((sum, ids) => sum + ids.length, 0);
+  const targetA = Math.floor(totalTokens / 2);
+  const cuts = inputIds.map(() => 1);
+  let remaining = targetA - cuts.length;
+
+  for (let i = 0; i < inputIds.length && remaining > 0; i++) {
+    const take = Math.min(inputIds[i].length - 2, remaining);
+    cuts[i] += take;
+    remaining -= take;
+  }
+  if (remaining !== 0) return undefined;
+
+  const inputA = inputIds.map((ids, i) => ids.slice(0, cuts[i]));
+  const inputB = inputIds.map((ids, i) => ids.slice(cuts[i]));
+  return { inputA, inputB, nextA: inputB.map(ids => ids[0]) };
+}
+
 function closeGenerator(generator: Generator<void, Tensor, void>): void {
   generator.return(undefined as never);
 }
 
-export class PhasedPrefillRunner implements Disposable {
-  private pending?: PendingForward;
-
+export class PhasedPrefillRunner {
   constructor(private readonly model: ChatModel, private readonly glm: DeviceOps) {}
 
-  get hasPending(): boolean {
-    return this.pending !== undefined;
+  runPair(stateA: ExecutionState, stateB: ExecutionState, consume?: PairConsumer): void {
+    this.runGeneratorPair(
+      { state: stateA, generator: this.model.forwardPhased(stateA) },
+      { state: stateB, generator: this.model.forwardPhased(stateB) },
+      consume,
+    );
   }
 
-  enqueue(state: ExecutionState, consume?: PairConsumer): boolean {
-    return this.enqueueGenerator(state, this.model.forwardPhased(state), consume);
+  runPlanPair(planA: PhasedPrefillPlan, planB: PhasedPrefillPlan, consume?: PairConsumer): void {
+    this.runGeneratorPair(
+      { state: planA.state, generator: planA.generator, owner: planA },
+      { state: planB.state, generator: planB.generator, owner: planB },
+      consume,
+    );
   }
 
-  enqueueGenerator(state: ExecutionState, generator: Generator<void, Tensor, void>, consume?: PairConsumer, owner?: Disposable): boolean {
-    if (!this.pending) {
-      try {
-        const result = generator.next();
-        if (result.done) {
-          result.value[Symbol.dispose]();
-          throw new Error("Phased prefill completed before its first phase boundary");
-        }
-        this.pending = { state, generator, result, owner };
-        return false;
-      } catch (err) {
-        owner?.[Symbol.dispose]();
-        throw err;
-      }
-    }
-
-    const pending = this.pending;
-    this.pending = undefined;
-    const generatorB = generator;
-    let resultA = pending.result;
+  private runGeneratorPair(a: PhasedForward, b: PhasedForward, consume?: PairConsumer): void {
+    let resultA: IteratorResult<void, Tensor> | undefined;
     let resultB: IteratorResult<void, Tensor> | undefined;
-
     try {
+      resultA = a.generator.next();
+      if (resultA.done) {
+        resultA.value[Symbol.dispose]();
+        throw new Error("Phased prefill A completed before its first phase boundary");
+      }
       while (!resultA.done) {
-        using streamB = this.glm.withStream(() => generatorB.next());
+        using streamB = this.glm.withStream(() => b.generator.next());
         try {
-          resultA = pending.generator.next();
+          resultA = a.generator.next();
         } finally {
           streamB.streamWaitEvent();
         }
         resultB = streamB.result;
-        if (resultB.done) throw new Error("Phased prefill B completed before A");
+        if (resultB.done) {
+          resultB.value[Symbol.dispose]();
+          throw new Error("Phased prefill B completed before A");
+        }
       }
 
-      resultB = generatorB.next();
+      resultB = b.generator.next();
       if (!resultB.done) throw new Error("Phased prefill B did not complete one phase after A");
       using hiddenA = resultA.value;
       using hiddenB = resultB.value;
-      consume?.(pending.state, hiddenA, state, hiddenB);
-      return true;
+      consume?.(a.state, hiddenA, b.state, hiddenB);
     } finally {
       try {
-        if (!resultA.done) closeGenerator(pending.generator);
-        if (!resultB?.done) closeGenerator(generatorB);
+        if (!resultB?.done) closeGenerator(b.generator);
+        if (!resultA?.done) closeGenerator(a.generator);
       } finally {
-        pending.owner?.[Symbol.dispose]();
-        owner?.[Symbol.dispose]();
+        b.owner?.[Symbol.dispose]();
+        a.owner?.[Symbol.dispose]();
       }
-    }
-  }
-
-  flush(): boolean {
-    if (!this.pending) return false;
-    const pending = this.pending;
-    this.pending = undefined;
-    let result = pending.result;
-    try {
-      while (!result.done) result = pending.generator.next();
-      using hidden = result.value;
-      return true;
-    } finally {
-      try {
-        if (!result.done) closeGenerator(pending.generator);
-      } finally {
-        pending.owner?.[Symbol.dispose]();
-      }
-    }
-  }
-
-  [Symbol.dispose](): void {
-    if (!this.pending) return;
-    const { generator, owner } = this.pending;
-    this.pending = undefined;
-    try {
-      closeGenerator(generator);
-    } finally {
-      owner?.[Symbol.dispose]();
     }
   }
 }

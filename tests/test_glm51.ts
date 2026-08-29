@@ -10,7 +10,7 @@ import { GlmOps } from "../src/glm_ops";
 import { ParallelOps } from "../src/parallel_ops";
 import { Tensor } from "../src/tensor";
 import { PAGE_SIZE } from "../src/paged_kv";
-import { PhasedPrefillRunner } from "../src/phased-prefill";
+import { PhasedPrefillRunner, splitRaggedInput } from "../src/phased-prefill";
 
 const SMALL_MODEL_DIR = path.resolve(
   __dirname,
@@ -60,10 +60,9 @@ function assertPhasedRaggedMatches(model: Glm51Model, glm: DeviceOps, ws: Execut
 
     if (phased) {
       {
-        using runner = new PhasedPrefillRunner(model, glm);
+        const runner = new PhasedPrefillRunner(model, glm);
         const stateA = ws.planPrefill(model, 2, inputA.map(ids => ids.length), cache);
         stateA.setInput(inputA);
-        assert.equal(runner.enqueue(stateA), false);
         sequence0.reportTokens(inputA[0]);
         sequence1.reportTokens(inputA[1]);
 
@@ -74,14 +73,14 @@ function assertPhasedRaggedMatches(model: Glm51Model, glm: DeviceOps, ws: Execut
         sequence0.reportTokens(inputB[0]);
         sequence2.reportTokens(inputB[1]);
 
-        assert.equal(runner.enqueue(stateB, (pairedA, hiddenA, pairedB, hiddenB) => {
+        runner.runPair(stateA, stateB, (pairedA, hiddenA, pairedB, hiddenB) => {
           using logitsA = pairedA.computeLogits(hiddenA, model);
           using logitsB = pairedB.computeLogits(hiddenB, model);
           using argmaxA = logitsA.argmax();
           using argmaxB = logitsB.argmax();
           tokensA = argmaxA.readInt32LEArray();
           tokensB = argmaxB.readInt32LEArray();
-        }), true);
+        });
       }
       glm.synchronize();
       ws.assertClear();
@@ -386,7 +385,21 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     glm.free();
   });
 
-  it("rolls back unstarted and parked phased MTP plans", async () => {
+  it("splits ragged input into globally balanced non-empty halves", () => {
+    const input = [[1, 2, 3, 4, 5, 6, 7, 8], [11, 12, 13, 14], [21, 22]];
+    const split = splitRaggedInput(input)!;
+    assert.equal(split.inputA.reduce((sum, ids) => sum + ids.length, 0), 7);
+    assert.equal(split.inputB.reduce((sum, ids) => sum + ids.length, 0), 7);
+    assert.deepStrictEqual(split.nextA, split.inputB.map(ids => ids[0]));
+    for (let i = 0; i < input.length; i++) {
+      assert.ok(split.inputA[i].length > 0);
+      assert.ok(split.inputB[i].length > 0);
+      assert.deepStrictEqual([...split.inputA[i], ...split.inputB[i]], input[i]);
+    }
+    assert.equal(splitRaggedInput([[1], [2, 3]]), undefined);
+  });
+
+  it("rolls back an unstarted phased MTP plan", () => {
     using cache = model.createChatCache(32, 1);
     cache.reset(1);
     const sequence = cache.getPagedKV().sequences[0];
@@ -395,16 +408,6 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     assert.equal(sequence.allocLen, 4);
     unstarted[Symbol.dispose]();
     assert.equal(sequence.allocLen, 0);
-    ws.resetPlanSlots();
-
-    const runner = new PhasedPrefillRunner(model, glm);
-    const parked = model.planPrefillMtpChunkPhased(ws, cache, [[1, 2, 3, 4]], [5]);
-    assert.equal(runner.enqueueGenerator(parked.state, parked.generator, undefined, parked), false);
-    assert.equal(sequence.allocLen, 4);
-    runner[Symbol.dispose]();
-    assert.equal(sequence.allocLen, 0);
-    await glm.synchronizeAsync();
-    ws.assertClear();
     ws.resetPlanSlots();
   });
 
@@ -422,13 +425,11 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       const sequence = cache.getPagedKV().sequences[0];
 
       if (phased) {
-        using runner = new PhasedPrefillRunner(model, glm);
-        const planA = model.planPrefillMtpChunkPhased(ws, cache, inputA, nextA);
-        assert.equal(runner.enqueueGenerator(planA.state, planA.generator, undefined, planA), false);
+        const runner = new PhasedPrefillRunner(model, glm);
+        using planA = model.planPrefillMtpChunkPhased(ws, cache, inputA, nextA);
+        using planB = model.planPrefillMtpChunkPhased(ws, cache, inputB, nextB);
+        runner.runPlanPair(planA, planB);
         sequence.reportTokens(inputA[0]);
-
-        const planB = model.planPrefillMtpChunkPhased(ws, cache, inputB, nextB);
-        assert.equal(runner.enqueueGenerator(planB.state, planB.generator, undefined, planB), true);
         sequence.reportTokens(inputB[0]);
         await glm.synchronizeAsync();
         ws.assertClear();
