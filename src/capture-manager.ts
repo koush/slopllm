@@ -77,6 +77,8 @@ export class CaptureManager implements Disposable {
         }
     }
 
+    static NEED_MEMCPY = false;
+
     run<I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => TensorTree, keyParams?: any[]): TensorTree {
         if (CaptureManager.capturing) {
             throw new Error("Cannot run a capture while another capture is in progress");
@@ -97,7 +99,10 @@ export class CaptureManager implements Disposable {
                         input.stage();
                         const capturedInput = captured.inputs[name];
                         if (!capturedInput.same(input)) {
-                            console.warn('need memcpy')
+                            if (!CaptureManager.NEED_MEMCPY) {
+                                CaptureManager.NEED_MEMCPY = true;
+                                console.warn('need memcpy', input.shape)
+                            }
                             capturedInput.memcpy(input, capturedInput.bytes, MemcpyKind.DeviceToDevice);
                         }
                     }

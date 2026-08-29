@@ -199,6 +199,11 @@ interface CompletionRequest {
   finished: boolean;
   finishReason: string;
   promptTokenCount: number;
+  cachedTokenCount: number;
+  prefillTokenCount: number;
+  prefillSeconds: number;
+  decodeStartedAt?: number;
+  performanceLogged: boolean;
   onOutput: (events: OutputParserEvent[]) => void;
   onFinish: () => void;
   onError: (error: unknown) => void;
@@ -231,6 +236,22 @@ function processOutputToken(req: CompletionRequest, tokenId: number): void {
 function finishOutput(req: CompletionRequest): void {
   processOutputEvents(req, req.parser.finish());
   if (req.toolCalls.length > 0) req.finishReason = "tool_calls";
+}
+
+function logRequestPerformance(req: CompletionRequest): void {
+  if (req.performanceLogged) return;
+  req.performanceLogged = true;
+  const decodedTokens = Math.max(0, req.generatedIds.length - 1);
+  const decodeSeconds = req.decodeStartedAt === undefined
+    ? 0
+    : (performance.now() - req.decodeStartedAt) / 1000;
+  const prefillTps = req.prefillSeconds > 0 ? req.prefillTokenCount / req.prefillSeconds : 0;
+  const decodeTps = decodeSeconds > 0 ? decodedTokens / decodeSeconds : 0;
+  console.log(
+    `Request ${req.id}: prompt_tokens=${req.promptTokenCount} cached_tokens=${req.cachedTokenCount}`
+    + ` prefill_tokens=${req.prefillTokenCount} prefill_tokens_per_second=${prefillTps.toFixed(1)}`
+    + ` output_tokens=${req.generatedIds.length} decode_tokens_per_second=${decodeTps.toFixed(1)}`,
+  );
 }
 
 interface ActiveSequence {
@@ -421,6 +442,7 @@ async function generateMtpBatches(
     admitted.delete(req);
     metrics.runningRequests--;
     metrics.requestSuccessTotal++;
+    logRequestPerformance(req);
     try { req.onFinish(); } catch {}
   };
 
@@ -476,6 +498,12 @@ async function generateMtpBatches(
         for (const entry of activeEntries) pagedKV.stageSequence(0, entry.key);
         cache.reset(newCount);
         const suffixIds = newRequests.map((req, index) => cache.prefixMatch(index, req.inputIds));
+        for (let i = 0; i < newRequests.length; i++) {
+          const cachedTokens = newRequests[i].promptTokenCount - suffixIds[i].length;
+          newRequests[i].cachedTokenCount = cachedTokens;
+          // MTP reprocesses the final cached token to condition its extra layer.
+          newRequests[i].prefillTokenCount = suffixIds[i].length + (cachedTokens > 0 ? 1 : 0);
+        }
         const newRows = newRequests.map((request, index) => ({ request, inputIds: suffixIds[index] }));
         if (!model.planPrefillMtpChunk) throw new Error("The selected model does not support chunked MTP prefill");
         const prefillStart = performance.now();
@@ -520,6 +548,11 @@ async function generateMtpBatches(
         const prefillSeconds = (performance.now() - prefillStart) / 1000;
         metrics.prefillTimeSecondsCount += newCount;
         metrics.prefillTimeSecondsSum += prefillSeconds * newCount;
+        const decodeStartedAt = performance.now();
+        for (const req of newRequests) {
+          req.prefillSeconds = prefillSeconds;
+          req.decodeStartedAt = decodeStartedAt;
+        }
 
         for (let i = 0; i < requests.length; i++) {
           if (i < newRows.length) pagedKV.reportTokens(i, newRows[i].inputIds);
@@ -593,6 +626,7 @@ async function generateContinuousBatch(
     if (!admitted.delete(req)) return;
     metrics.runningRequests--;
     metrics.requestSuccessTotal++;
+    logRequestPerformance(req);
     try { req.onFinish(); } catch {}
   };
 
@@ -602,10 +636,7 @@ async function generateContinuousBatch(
     for (let i = active.length - 1; i >= 0; i--) {
       if (active[i].request.finished) {
         stagedPrefixes.retainSequence(i);
-        metrics.runningRequests--;
-        metrics.requestSuccessTotal++;
-        try { active[i].request.onFinish(); } catch {}
-        admitted.delete(active[i].request);
+        finishCancelled(active[i].request);
         active.splice(i, 1);
       }
     }
@@ -628,6 +659,10 @@ async function generateContinuousBatch(
         request,
         inputIds: cache.prefixMatch(index, request.inputIds),
       }));
+      for (const row of newRows) {
+        row.request.cachedTokenCount = row.request.promptTokenCount - row.inputIds.length;
+        row.request.prefillTokenCount = row.inputIds.length;
+      }
 
       // Prefill new requests
       const prefillStart = performance.now();
@@ -667,6 +702,11 @@ async function generateContinuousBatch(
       const prefillSeconds = (performance.now() - prefillStart) / 1000;
       metrics.prefillTimeSecondsCount += newRows.length;
       metrics.prefillTimeSecondsSum += prefillSeconds * newRows.length;
+      const decodeStartedAt = performance.now();
+      for (const row of newRows) {
+        row.request.prefillSeconds = prefillSeconds;
+        row.request.decodeStartedAt = decodeStartedAt;
+      }
       metrics.generationTokensTotal += firstTokens.length;
 
       // Report tokens and check for first-token EOS
@@ -708,10 +748,7 @@ async function generateContinuousBatch(
     for (let i = active.length - 1; i >= 0; i--) {
       if (active[i].request.finished) {
         stagedPrefixes.retainSequence(i);
-        metrics.runningRequests--;
-        metrics.requestSuccessTotal++;
-        try { active[i].request.onFinish(); } catch {}
-        admitted.delete(active[i].request);
+        finishCancelled(active[i].request);
         active.splice(i, 1);
       }
     }
@@ -1212,6 +1249,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         finished: false,
         finishReason: "stop",
         promptTokenCount: inputIds.length,
+        cachedTokenCount: 0,
+        prefillTokenCount: inputIds.length,
+        prefillSeconds: 0,
+        performanceLogged: false,
         onOutput: () => {},
         onFinish: () => {},
         onError: () => {},
