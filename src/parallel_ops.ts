@@ -2121,6 +2121,11 @@ export class ParallelOps implements DeviceOps {
   readonly comms: number[];
   private readonly shardWorkspaces = new WeakMap<WorkspaceBase, WorkspaceBase[]>();
   private readonly communicationPools = new Map<number, CommunicationPool>();
+  private readonly commSetIds = new WeakMap<number[], number>();
+  private readonly p2pGroupIds = new WeakMap<P2PAllReduceGroup, number>();
+  private readonly communicationHistory: string[] = [];
+  private nextCommunicationId = 1;
+  private communicationEventId = 0;
   p2pEnabled: boolean;
   /** When true, all GPUs are context-parallel shards. MLA ops auto-inject cpWorldSize/cpRank. */
 
@@ -2140,6 +2145,8 @@ export class ParallelOps implements DeviceOps {
       this.comms = [];
     }
     this.communicationPools.set(0, { comms: [this.comms], p2pGroups: [] });
+    this.communicationId(this.comms);
+    this.recordCommunication("initialized stream 0 communicator");
     // Enable P2P peer access early, before model weights are loaded,
     // to avoid VA-space fragmentation that can cause cudaDeviceEnablePeerAccess
     // to fail with cudaErrorMemoryAllocation on large models.
@@ -2176,6 +2183,45 @@ export class ParallelOps implements DeviceOps {
     return pool;
   }
 
+  private communicationId(comms: number[]): number {
+    let id = this.commSetIds.get(comms);
+    if (id === undefined) {
+      id = this.nextCommunicationId++;
+      this.commSetIds.set(comms, id);
+    }
+    return id;
+  }
+
+  private p2pGroupId(group: P2PAllReduceGroup): number {
+    let id = this.p2pGroupIds.get(group);
+    if (id === undefined) {
+      id = this.nextCommunicationId++;
+      this.p2pGroupIds.set(group, id);
+    }
+    return id;
+  }
+
+  private recordCommunication(message: string): void {
+    this.communicationHistory.push(`${++this.communicationEventId}: ${message}`);
+    if (this.communicationHistory.length > 256) this.communicationHistory.shift();
+  }
+
+  communicationDiagnostics(): string {
+    const pools = [...this.communicationPools.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([stream, pool]) => {
+        const comms = pool.comms.map(comms => this.communicationId(comms)).join(",");
+        const groups = pool.p2pGroups.map(group => this.p2pGroupId(group)).join(",");
+        return `stream ${stream}: comms=[${comms}] p2p=[${groups}]`;
+      });
+    return [
+      `Communication pools (current=${this.currentStream}, active=[${this.activeStreams.join(",")}])`,
+      ...pools,
+      "Recent communication ownership transitions:",
+      ...this.communicationHistory,
+    ].join("\n");
+  }
+
   private communicationLineage(stream: number): readonly number[] {
     if (stream !== this.currentStream) return [stream];
     return [...this.activeStreams].reverse();
@@ -2185,6 +2231,9 @@ export class ParallelOps implements DeviceOps {
     if (sourceStream === destinationStream) return;
     const source = this.communicationPools.get(sourceStream);
     if (!source) return;
+    this.recordCommunication(
+      `move ${sourceStream}->${destinationStream} comms=[${source.comms.map(comms => this.communicationId(comms)).join(",")}] p2p=[${source.p2pGroups.map(group => this.p2pGroupId(group)).join(",")}]`,
+    );
     const destination = this.getCommunicationPool(destinationStream);
     destination.comms.push(...source.comms);
     destination.p2pGroups.push(...source.p2pGroups);
@@ -2201,12 +2250,14 @@ export class ParallelOps implements DeviceOps {
       const group = this.communicationPools.get(owner)?.p2pGroups.pop();
       if (group) {
         destination.p2pGroups.push(group);
+        this.recordCommunication(`borrow p2p ${this.p2pGroupId(group)} ${owner}->${stream}`);
         return group;
       }
     }
     try {
       const group = new P2PAllReduceGroup(this.devices);
       destination.p2pGroups.push(group);
+      this.recordCommunication(`create p2p ${this.p2pGroupId(group)} on stream ${stream}`);
       return group;
     } catch (e) {
       console.warn(`P2P AllReduce group creation failed (${e}); falling back to NCCL`);
@@ -2223,12 +2274,14 @@ export class ParallelOps implements DeviceOps {
       const comms = this.communicationPools.get(owner)?.comms.pop();
       if (comms) {
         destination.comms.push(comms);
+        this.recordCommunication(`borrow comms ${this.communicationId(comms)} ${owner}->${stream}`);
         return comms;
       }
     }
     console.log(`Lazy-creating NCCL communicator set for stream ${stream}`);
     const comms = getNativeAddon().ncclCommInitAll(this.devices.map(device => device.device));
     destination.comms.push(comms);
+    this.recordCommunication(`create comms ${this.communicationId(comms)} on stream ${stream}`);
     return comms;
   }
 

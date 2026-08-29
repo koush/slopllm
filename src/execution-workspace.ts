@@ -413,6 +413,13 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.planSlot = 0;
   }
 
+  resetPlanSlots(): void {
+    if (this.tracking !== null || this.tracked.size !== 0 || this.staged.size !== 0) {
+      throw new Error("resetPlanSlots requires a clear workspace");
+    }
+    this.planSlot = 0;
+  }
+
   async withTrackingAsync<T>(keepExports = new Set<Tensor>(), fn: () => Promise<T>): Promise<T> {
     using _tracking = this.startTracking(keepExports);
     return await fn();

@@ -10,6 +10,7 @@ import { mtpTotalTreeNodes } from "./glm51_model";
 import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
+import { PhasedPrefillRunner } from "./phased-prefill";
 import { Tensor } from "./tensor";
 
 const PAGE_SIZE = 64;
@@ -42,6 +43,7 @@ interface ServerArgs extends ModelCliArgs {
   decodeLatency: number;
   noCudaGraph: boolean;
   noMtp: boolean;
+  phasedPrefill: boolean;
   mtpDraftTopk: number[];
 }
 
@@ -63,6 +65,7 @@ function parseArgs(argv: string[]): ServerArgs {
     decodeLatency: 0,
     noCudaGraph: false,
     noMtp: false,
+    phasedPrefill: false,
     mtpDraftTopk: [],
   };
   for (let i = 0; i < argv.length; i++) {
@@ -82,12 +85,16 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--decode-latency" && i + 1 < argv.length) args.decodeLatency = parseInt(argv[++i], 10);
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
     else if (a === "--no-mtp") args.noMtp = true;
+    else if (a === "--phased-prefill") args.phasedPrefill = true;
     else if (a === "--mtp-draft-topk" && i + 1 < argv.length) args.mtpDraftTopk = argv[++i].split(",").map(value => parseInt(value.trim(), 10));
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
   }
   if (args.mtp && !args.noMtp && args.mtpDraftTopk.length === 0) args.mtpDraftTopk = [1, 1, 1];
   if (args.mtpDraftTopk.some(topk => !Number.isInteger(topk) || topk < 1)) {
     throw new Error(`Invalid --mtp-draft-topk: ${args.mtpDraftTopk.join(",")}`);
+  }
+  if (args.phasedPrefill && !args.useGlm51) {
+    throw new Error("--phased-prefill currently requires --glm51");
   }
   if (args.maxPages === 0) {
     args.maxPages = args.batchSize * Math.ceil(args.chunkSize / PAGE_SIZE);
@@ -121,6 +128,7 @@ Options:
   --no-cuda-graph               Disable CUDA graph capture
   --mtp                         Enable MTP speculative decoding
   --no-mtp                      Disable MTP decoding for an MTP-loaded model
+  --phased-prefill              Overlap pairs of intermediate GLM-5.1 prefill chunks
   --mtp-draft-topk <list>       MTP draft top-k per depth (default: 1,1,1)
   --help, -h                    Show this help message
 `);
@@ -334,7 +342,7 @@ async function prefillPromptChunks(
     throw new Error(`Prefill batch ${rows.length} exceeds chunk size ${chunkSize}`);
   }
   while (rows.reduce((sum, row) => sum + row.inputIds.length, 0) > finalInputBudget) {
-    const staged = rows.map(row => ({ row, key: nextStagingKey++ }));
+    const staged = rows.map((row, index) => ({ row, sequence: pagedKV.sequences[index], key: nextStagingKey++ }));
     for (const entry of staged) pagedKV.stageSequence(0, entry.key);
 
     let budget = chunkSize;
@@ -359,7 +367,7 @@ async function prefillPromptChunks(
     const nextTokens = chunked.map(({ entry, take }) => entry.row.inputIds[take]);
     await runChunk(inputIds, nextTokens);
     for (let i = 0; i < chunked.length; i++) {
-      pagedKV.reportTokens(i, inputIds[i]);
+      chunked[i].entry.sequence.reportTokens(inputIds[i]);
       const { entry, take } = chunked[i];
       entry.row.inputIds = entry.row.inputIds.slice(take);
     }
@@ -385,6 +393,7 @@ async function generateMtpBatches(
   topks: readonly number[],
   chunkSize: number,
   stagedPrefixes: StagedPrefixPolicy,
+  phasedPrefill: boolean,
 ): Promise<number> {
   if (!model.planPrefillMtpDraftExtend || !model.planTargetVerification) {
     throw new Error("The selected model does not support plan-based MTP decoding");
@@ -398,12 +407,14 @@ async function generateMtpBatches(
   let nextStagingKey = 0;
   let admittedRequests = 0;
   const numVerificationTokens = mtpTotalTreeNodes(topks) + 1;
-  const observeMtpPhase = (phase: ExecutionPhase, elapsedSeconds: number): void => {
-    if (!phase.timingName) return;
-    const batchSize = phase.states[0]?.batchSize ?? 0;
-    const key = `${phase.timingName}|${batchSize}`;
+  const recordMtpPhase = (timingName: string, batchSize: number, elapsedSeconds: number): void => {
+    const key = `${timingName}|${batchSize}`;
     metrics.mtpPhaseSeconds.set(key, (metrics.mtpPhaseSeconds.get(key) ?? 0) + elapsedSeconds);
     metrics.mtpPhaseCount.set(key, (metrics.mtpPhaseCount.get(key) ?? 0) + 1);
+  };
+  const observeMtpPhase = (phase: ExecutionPhase, elapsedSeconds: number): void => {
+    if (!phase.timingName) return;
+    recordMtpPhase(phase.timingName, phase.states[0]?.batchSize ?? 0, elapsedSeconds);
   };
   const selectTokens: TokenSelector = (logits: Tensor): Tensor => samplingWorkspace.sample(logits);
   const updateSamplingParams = (params: SamplingParams[]): void => {
@@ -478,17 +489,48 @@ async function generateMtpBatches(
         const suffixIds = newRequests.map((req, index) => cache.prefixMatch(index, req.inputIds));
         const newRows = newRequests.map((request, index) => ({ request, inputIds: suffixIds[index] }));
         if (!model.planPrefillMtpChunk) throw new Error("The selected model does not support chunked MTP prefill");
+        if (phasedPrefill && !model.planPrefillMtpChunkPhased) {
+          throw new Error("The selected model does not support phased MTP prefill");
+        }
         const prefillStart = performance.now();
-        nextStagingKey = await prefillPromptChunks(
-          pagedKV,
-          newRows,
-          chunkSize,
-          nextStagingKey,
-          async (inputIds, nextTokens) => {
-            await executePlan(captureManager, ws, model.planPrefillMtpChunk!(ws, cache, inputIds, nextTokens), observeMtpPhase);
-          },
-          row => finish(row.request),
-        );
+        const phasedRunner = phasedPrefill ? new PhasedPrefillRunner(model, model.glm) : undefined;
+        const phasedChunkTimings: { start: number, batchSize: number }[] = [];
+        const recordPhasedChunks = (): void => {
+          const elapsedSeconds = (performance.now() - phasedChunkTimings[0].start) / 1000 / phasedChunkTimings.length;
+          for (const timing of phasedChunkTimings) recordMtpPhase("prefill_chunk", timing.batchSize, elapsedSeconds);
+          phasedChunkTimings.length = 0;
+        };
+        try {
+          nextStagingKey = await prefillPromptChunks(
+            pagedKV,
+            newRows,
+            chunkSize,
+            nextStagingKey,
+            async (inputIds, nextTokens) => {
+              if (phasedRunner) {
+                const planned = model.planPrefillMtpChunkPhased!(ws, cache, inputIds, nextTokens);
+                phasedChunkTimings.push({ start: performance.now(), batchSize: planned.state.batchSize });
+                if (phasedRunner.enqueueGenerator(planned.state, planned.generator, undefined, planned)) {
+                  await model.glm.synchronizeAsync();
+                  recordPhasedChunks();
+                  ws.assertClear();
+                  ws.resetPlanSlots();
+                }
+                return;
+              }
+              await executePlan(captureManager, ws, model.planPrefillMtpChunk!(ws, cache, inputIds, nextTokens), observeMtpPhase);
+            },
+            row => finish(row.request),
+          );
+          if (phasedRunner?.flush()) {
+            await model.glm.synchronizeAsync();
+            recordPhasedChunks();
+            ws.assertClear();
+            ws.resetPlanSlots();
+          }
+        } finally {
+          phasedRunner?.[Symbol.dispose]();
+        }
         const retainedActive: CompletionRequest[] = [];
         for (const entry of activeEntries) {
           if (entry.request.finished) {
@@ -582,6 +624,7 @@ async function generateContinuousBatch(
   captureManager: CaptureManager,
   samplingWorkspace: SamplingWorkspace,
   stagedPrefixes: StagedPrefixPolicy,
+  phasedPrefill: boolean,
 ): Promise<number> {
   const pagedKV = cache.getPagedKV();
   const eosToken = [...eosIds][0];
@@ -631,20 +674,40 @@ async function generateContinuousBatch(
 
       // Prefill new requests
       const prefillStart = performance.now();
-      nextStagingKey = await prefillPromptChunks(
-        pagedKV,
-        newRows,
-        ws.maxSeqLen,
-        nextStagingKey,
-        async inputIds => {
-          {
-            using _logits = ws.forwardPrefill(model, inputIds, cache);
-            await glm.synchronizeAsync();
-          }
-          ws.clearTracking();
-        },
-        row => finishCancelled(row.request),
-      );
+      const phasedRunner = phasedPrefill ? new PhasedPrefillRunner(model, glm) : undefined;
+      try {
+        nextStagingKey = await prefillPromptChunks(
+          pagedKV,
+          newRows,
+          ws.maxSeqLen,
+          nextStagingKey,
+          async inputIds => {
+            if (phasedRunner) {
+              const state = ws.planPrefill(model, inputIds.length, inputIds.map(ids => ids.length), cache);
+              state.setInput(inputIds);
+              if (phasedRunner.enqueue(state)) {
+                await glm.synchronizeAsync();
+                ws.assertClear();
+                ws.resetPlanSlots();
+              }
+              return;
+            }
+            {
+              using _logits = ws.forwardPrefill(model, inputIds, cache);
+              await glm.synchronizeAsync();
+            }
+            ws.clearTracking();
+          },
+          row => finishCancelled(row.request),
+        );
+        if (phasedRunner?.flush()) {
+          await glm.synchronizeAsync();
+          ws.assertClear();
+          ws.resetPlanSlots();
+        }
+      } finally {
+        phasedRunner?.[Symbol.dispose]();
+      }
       const retainedActiveEntries: typeof activeEntries = [];
       for (const entry of activeEntries) {
         if (entry.sequence.request.finished) {
@@ -1030,6 +1093,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             args.mtpDraftTopk,
             args.chunkSize,
             stagedPrefixes,
+            args.phasedPrefill,
           )
           : await generateContinuousBatch(
             model,
@@ -1044,10 +1108,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             captureManager,
             samplingWorkspace,
             stagedPrefixes,
+            args.phasedPrefill,
           );
       } catch (err) {
         console.error("Continuous batch error:", err);
         if (isFatalCudaError(err)) {
+          if (glm instanceof ParallelOps) console.error(glm.communicationDiagnostics());
           for (const req of pendingQueue.splice(0)) {
             req.finished = true;
             try { req.onError(err); } catch {}
@@ -1469,6 +1535,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  GET  /health               - Health check`);
     console.log(`  CUDA graphs: ${args.noCudaGraph ? "disabled" : "enabled"}`);
     console.log(`  MTP: ${args.mtp && !args.noMtp ? `enabled (draft top-k ${args.mtpDraftTopk.join(",")})` : "disabled"}`);
+    console.log(`  Phased prefill: ${args.phasedPrefill ? "enabled" : "disabled"}`);
     console.log(`  Model: ${modelName}  |  GPU: ${args.gpus.join(",")}  |  chunk-size=${args.chunkSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);
   });
 

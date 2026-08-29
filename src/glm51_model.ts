@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ChatCache, ChatTemplateKwargs, MtpDraftBatch, MtpStepResult, TokenSelector } from "./chat_model";
+import type { ChatCache, ChatTemplateKwargs, MtpDraftBatch, MtpStepResult, PhasedPrefillPlan, TokenSelector } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
 import { executionPhase, type ExecutionPlan, ExecutionState, ExecutionWorkspace } from "./execution-workspace";
@@ -767,6 +767,12 @@ export class Glm51Model extends ChatModel {
         : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
     });
 
+    const cache = kvcache.result;
+    using ckv = cache.ckv;
+    using kpe = cache.kpe;
+    using qAbsorbedR = qAbsorbedRStream.result;
+    using qPeR = qPeRStream.result;
+
     idxQStream?.streamWaitEvent();
     const topkResult = idxQStream?.result;
     using topkValues = topkResult?.values;
@@ -815,7 +821,6 @@ export class Glm51Model extends ChatModel {
           pagedKV.pageSize, maxKv,
           layerIdx, pagedKV.contextParallel,
         );
-        yield;
         sharedSlots.replace(group.slots);
         sharedSlotsLength.replace(group.length);
         sparseSlots = { slots: layer.slots, length: layer.length, stream };
@@ -825,16 +830,11 @@ export class Glm51Model extends ChatModel {
     using slots = sparseSlots?.slots;
     using slotsLength = sparseSlots?.length;
     using slotsStream = sparseSlots?.stream;
+    yield;
 
     kvcache.streamWaitEvent();
     qAbsorbedRStream.streamWaitEvent();
     qPeRStream.streamWaitEvent();
-
-    using qAbsorbedR = qAbsorbedRStream.result;
-    using qPeR = qPeRStream.result;
-    const cache = kvcache.result;
-    using ckv = cache.ckv;
-    using kpe = cache.kpe;
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     {
@@ -943,7 +943,7 @@ export class Glm51Model extends ChatModel {
     return this.runPhased(this.forwardPhased(state, sharedSlots, sharedSlotsLength));
   }
 
-  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>) {
+  *forwardMtpPhased(state: ExecutionState, previousHiddenState: Tensor, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Generator<void, Tensor, void> {
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const ws = state.ws;
@@ -992,13 +992,17 @@ export class Glm51Model extends ChatModel {
     using _localLength = sharedSlotsLength ? undefined : new UsingHolder<Tensor>(undefined!);
     sharedSlots ??= _localSlots!;
     sharedSlotsLength ??= _localLength!;
-    const result = this.mlaLayer(cos, sin, normed, residual, layerIdx, state, sharedSlots, sharedSlotsLength);
+    const result = yield* this.mlaLayerPhased(cos, sin, normed, residual, layerIdx, state, sharedSlots, sharedSlotsLength);
     using _residual = result.residual;
 
     // Return shared_head.norm(residual) so the recycled seed for the next MTP
     // step is already normed — matches sglang Glm4MoeModelNextN and vLLM v1
     // deepseek_mtp which both recycle the post-shared_head-norm state.
     return result.normed;
+  }
+
+  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>) {
+    return this.runPhased(this.forwardMtpPhased(state, previousHiddenState, sharedSlots, sharedSlotsLength));
   }
 
   private planMtpDraftDepths(ws: ExecutionWorkspace, cache: ChatCache, originalAllocLens: readonly number[], topks: readonly number[]) {
@@ -1141,6 +1145,49 @@ export class Glm51Model extends ChatModel {
       },
     });
     completed = true;
+  }
+
+  planPrefillMtpChunkPhased(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): PhasedPrefillPlan {
+    if (!this.mtp || inputIds.length !== nextTokens.length || inputIds.some(ids => ids.length === 0)) {
+      throw new Error("Phased MTP chunk prefill requires non-empty inputs and one next token per sequence");
+    }
+    const batchSize = inputIds.length;
+    const sequences = cache.getPagedKV().sequences.slice();
+    const originalAllocLens = sequences.map(sequence => sequence.allocLen);
+    let completed = false;
+    const rollback = () => {
+      if (completed) return;
+      for (let batch = 0; batch < batchSize; batch++) {
+        sequences[batch].truncate(originalAllocLens[batch]);
+      }
+      completed = true;
+    };
+    const state = ws.planPrefill(this, batchSize, inputIds.map(ids => ids.length), cache);
+    state.setInput(inputIds);
+    const model = this;
+
+    function* forward(): Generator<void, Tensor, void> {
+      try {
+        using sharedSlots = new UsingHolder<Tensor>(undefined!);
+        using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
+        using hiddenStates = yield* model.forwardPhased(state, sharedSlots, sharedSlotsLength);
+        using nextDevice = ws.alloc([ws.maxBatch], "I32");
+        const nextBuffer = Buffer.alloc(batchSize * I32);
+        for (let batch = 0; batch < batchSize; batch++) {
+          nextBuffer.writeInt32LE(nextTokens[batch], batch * I32);
+        }
+        nextDevice.h2d(nextBuffer);
+        using rotatedInput = state.input!.rotateInputIds(state.qoIndptrD, nextDevice, batchSize);
+        state.setInput(rotatedInput);
+        const mtpHidden = yield* model.forwardMtpPhased(state, hiddenStates, sharedSlots, sharedSlotsLength);
+        completed = true;
+        return mtpHidden;
+      } finally {
+        if (!completed) rollback();
+      }
+    }
+
+    return { state, generator: forward(), [Symbol.dispose]: rollback };
   }
 
   *planPrefillMtpDraftExtend(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens: TokenSelector = logits => logits.argmax()): ExecutionPlan<MtpDraftBatch> {

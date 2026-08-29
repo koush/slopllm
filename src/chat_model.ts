@@ -38,6 +38,11 @@ export interface ChatCache extends Disposable {
   prefillBatchPlanHook?(_batchSize: number, _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void;
 }
 
+export interface PhasedPrefillPlan extends Disposable {
+  state: ExecutionState;
+  generator: Generator<void, Tensor, void>;
+}
+
 export interface MtpDraftBatch {
   targetTokens: number[];
   treeTokens: number[][];
@@ -129,6 +134,7 @@ export abstract class ChatModel extends WorkspaceBase {
     return this.runPhased(this.forwardPhased(state));
   }
   planPrefillMtpChunk?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void>;
+  planPrefillMtpChunkPhased?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): PhasedPrefillPlan;
   planPrefillMtpDraftExtend?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens?: TokenSelector): ExecutionPlan<MtpDraftBatch>;
   planTargetVerification?(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, selectTokens?: TokenSelector): ExecutionPlan<MtpStepResult>;
 
