@@ -813,7 +813,6 @@ export class Glm51Model extends ChatModel {
         const pagedKV = state.cache.getPagedKV();
         const kData = pagedKV.kData[layerIdx];
         const maxKv = kData.shape[0] * kData.shape[1];
-        yield;
         const { layer, group, stream } = this.glm.topkToSlots(
           state,
           topkIndices, state.kvTokenIndptrD,
@@ -830,7 +829,6 @@ export class Glm51Model extends ChatModel {
     using slots = sparseSlots?.slots;
     using slotsLength = sparseSlots?.length;
     using slotsStream = sparseSlots?.stream;
-    yield;
 
     kvcache.streamWaitEvent();
     qAbsorbedRStream.streamWaitEvent();
@@ -903,10 +901,6 @@ export class Glm51Model extends ChatModel {
     slotsStream?.streamWaitEvent();
     yield;
     return { normed: mlpResult.normed, residual: mlpResult.residual };
-  }
-
-  private mlaLayer(cos: Tensor, sin: Tensor, normedHolder: UsingHolder<Tensor>, residualHolder: UsingHolder<Tensor>, layerIdx: number, state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): { normed: Tensor, residual: Tensor } {
-    return this.runPhased(this.mlaLayerPhased(cos, sin, normedHolder, residualHolder, layerIdx, state, sharedSlots, sharedSlotsLength));
   }
 
   *forwardPhased(state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Generator<void, Tensor, void> {
