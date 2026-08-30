@@ -106,7 +106,7 @@ Options:
   --gpus <list>                 GPU device IDs
   --arena <int>                 Arena size in GiB per GPU
   --chunk-size <int>            Maximum prefill chunk per sequence (default: 8192)
-  --batch-size <int>            Maximum concurrent requests (default: 1)
+  --batch-size <int>            Maximum concurrent requests (default: 8)
   --max-pages <int>             KV cache pages (default: batch-size * ceil(chunk-size / 64))
   --max-tokens <int>            Default max completion tokens (default: 65536)
   --model-dir <string>          Model directory path (default: auto-detect from HF cache)
