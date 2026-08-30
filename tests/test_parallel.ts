@@ -484,10 +484,11 @@ describe("Workspace stream recycling", () => {
     assert.equal(ws.getDisposedDevicePool(0).size, 0);
 
     stream.streamWaitEvent();
-    stream[Symbol.dispose]();
     assert.ok(!ws.disposedDeviceByStream.has(streamId));
     assert.equal(ws.getDisposedDevicePool(0).size, 1);
     assert.ok(!glm.streamWorkspaces.has(streamId));
+    stream[Symbol.dispose]();
+    stream[Symbol.dispose]();
 
     ws.free();
     glm.free();
@@ -516,17 +517,17 @@ describe("Workspace stream recycling", () => {
 
       assert.deepEqual(glm.activeStreams, [0, outerId]);
       inner.streamWaitEvent();
-      inner[Symbol.dispose]();
       assert.ok(!ws.disposedDeviceByStream.has(innerId));
       assert.equal(ws.getDisposedDevicePool(outerId).size, 1);
       assert.ok(glm.streamWorkspaces.get(outerId)?.has(ws));
+      inner[Symbol.dispose]();
     });
 
     assert.deepEqual(glm.activeStreams, [0]);
     outer.streamWaitEvent();
-    outer[Symbol.dispose]();
     assert.ok(!ws.disposedDeviceByStream.has(outerId));
     assert.equal(ws.getDisposedDevicePool(0).size, 1);
+    outer[Symbol.dispose]();
 
     ws.free();
     glm.free();

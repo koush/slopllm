@@ -274,7 +274,7 @@ export class ParallelTensor extends Tensor {
     for (let i = 0; i < this.worldSize; i++) {
       const ptrs = new Array<number>(8).fill(0);
       for (let k = 0; k < this.worldSize; k++)
-        ptrs[k] = staging[k].data;
+        ptrs[k] = this.parallelOps.peerArenaPointer(i, k, staging[k].data);
       addon.p2pReduceScatterWrite(
         this.devices[i].ctx,
         this.shards[i].data,
@@ -291,7 +291,7 @@ export class ParallelTensor extends Tensor {
     for (let i = 0; i < this.worldSize; i++) {
       const ptrs = new Array<number>(8).fill(0);
       for (let k = 0; k < this.worldSize; k++)
-        ptrs[k] = this.shards[k].data;
+        ptrs[k] = this.parallelOps.peerArenaPointer(i, k, this.shards[k].data);
       addon.p2pReduceGatherWrite(
         this.devices[i].ctx,
         staging[i].data,
@@ -443,7 +443,8 @@ export class ParallelTensor extends Tensor {
       for (let i = 0; i < this.worldSize; ++i) {
         const rotatedPtrs = new Array<number>(8).fill(0);
         for (let k = 0; k < this.worldSize; k++) {
-          rotatedPtrs[k] = shards[(i + k) % this.worldSize].data;
+          const owner = (i + k) % this.worldSize;
+          rotatedPtrs[k] = this.parallelOps.peerArenaPointer(i, owner, shards[owner].data);
         }
         addon.p2pAllGatherRowWrite(
           this.devices[i].ctx,
@@ -476,7 +477,8 @@ export class ParallelTensor extends Tensor {
       for (let i = 0; i < this.worldSize; ++i) {
         const rotatedPtrs = new Array<number>(8).fill(0);
         for (let k = 0; k < this.worldSize; k++) {
-          rotatedPtrs[k] = shards[(i + k) % this.worldSize].data;
+          const owner = (i + k) % this.worldSize;
+          rotatedPtrs[k] = this.parallelOps.peerArenaPointer(i, owner, shards[owner].data);
         }
         addon.p2pAllGatherRowWrite(
           this.devices[i].ctx,
@@ -2126,6 +2128,9 @@ export class ParallelOps implements DeviceOps {
   private readonly communicationHistory: string[] = [];
   private nextCommunicationId = 1;
   private communicationEventId = 0;
+  /** Arena base as mapped in each reader context, indexed [reader][owner]. */
+  private peerArenaBases: number[][] | undefined;
+  private ipcPeerMappings: { reader: number; base: number }[] = [];
   p2pEnabled: boolean;
   /** When true, all GPUs are context-parallel shards. MLA ops auto-inject cpWorldSize/cpRank. */
 
@@ -2151,9 +2156,80 @@ export class ParallelOps implements DeviceOps {
     // to avoid VA-space fragmentation that can cause cudaDeviceEnablePeerAccess
     // to fail with cudaErrorMemoryAllocation on large models.
     this.p2pEnabled = process.env.GLM_DISABLE_P2P_ALLREDUCE !== "1" && devices.length > 1;
+    // Open every imported arena in every reader context before model replay.
+    // CUDA IPC mappings are context-local and may have a different base in each
+    // context, so direct peer kernels need translated pointers.
     if (this.p2pEnabled) {
-      this.p2pEnabled = this.enablePeerAccess(devices);
+      this.p2pEnabled = this.initializePeerArenaMappings()
+        && this.enablePeerAccess(devices);
+      if (!this.p2pEnabled) this.closePeerArenaMappings();
     }
+  }
+
+  private initializePeerArenaMappings(): boolean {
+    const ipcDevices = this.devices.filter(device => device.usesIpcArena);
+    if (ipcDevices.length === 0) return true;
+    if (ipcDevices.length !== this.worldSize) {
+      console.warn("Mixed owned and imported arenas do not support direct P2P; falling back to NCCL");
+      return false;
+    }
+
+    const addon = getNativeAddon();
+    const bases = this.devices.map(() => new Array<number>(this.worldSize));
+    try {
+      for (let reader = 0; reader < this.worldSize; reader++) {
+        for (let owner = 0; owner < this.worldSize; owner++) {
+          const ownerDevice = this.devices[owner];
+          if (ownerDevice.arenaBase === undefined || ownerDevice.arenaSize === undefined) {
+            throw new Error(`GPU ${ownerDevice.device} has no arena`);
+          }
+          if (reader === owner) {
+            bases[reader][owner] = ownerDevice.arenaBase;
+            continue;
+          }
+          const encoded = process.env[`GLM_ARENA_IPC_HANDLE_${ownerDevice.device}`];
+          if (encoded === undefined) {
+            throw new Error(`Missing GLM_ARENA_IPC_HANDLE_${ownerDevice.device}`);
+          }
+          const handle = Buffer.from(encoded, "base64");
+          if (handle.length !== 64) {
+            throw new Error(`Invalid GLM_ARENA_IPC_HANDLE_${ownerDevice.device}`);
+          }
+          const base = addon.cudaIpcOpenMemHandle(this.devices[reader].ctx, handle);
+          if (!Number.isSafeInteger(base) || base <= 0) {
+            throw new Error(`Failed to map GPU ${ownerDevice.device} arena on GPU ${this.devices[reader].device}`);
+          }
+          bases[reader][owner] = base;
+          this.ipcPeerMappings.push({ reader, base });
+        }
+      }
+      this.peerArenaBases = bases;
+      return true;
+    } catch (error) {
+      console.warn(`CUDA IPC peer arena mapping failed (${error}); falling back to NCCL`);
+      this.closePeerArenaMappings();
+      return false;
+    }
+  }
+
+  private closePeerArenaMappings(): void {
+    const addon = getNativeAddon();
+    for (let i = this.ipcPeerMappings.length - 1; i >= 0; i--) {
+      const mapping = this.ipcPeerMappings[i];
+      addon.cudaIpcCloseMemHandle(this.devices[mapping.reader].ctx, mapping.base);
+    }
+    this.ipcPeerMappings = [];
+    this.peerArenaBases = undefined;
+  }
+
+  peerArenaPointer(reader: number, owner: number, ownerPtr: number): number {
+    if (!this.peerArenaBases || reader === owner) return ownerPtr;
+    const ownerBase = this.devices[owner].arenaBase;
+    const ownerSize = this.devices[owner].arenaSize;
+    if (ownerBase === undefined || ownerSize === undefined || ownerPtr < ownerBase || ownerPtr >= ownerBase + ownerSize) {
+      throw new Error(`P2P pointer 0x${ownerPtr.toString(16)} is outside GPU ${this.devices[owner].device}'s arena`);
+    }
+    return this.peerArenaBases[reader][owner] + (ownerPtr - ownerBase);
   }
 
   /** Enable P2P peer access between all device pairs. Returns true on success. */
@@ -2448,8 +2524,8 @@ export class ParallelOps implements DeviceOps {
       const lsePtrs = new Array<number>(8).fill(0);
       for (let k = 0; k < this.worldSize; k++) {
         const peer = (i + k) % this.worldSize;
-        vPtrs[k] = stageV[peer].data;
-        lsePtrs[k] = stageLse[peer].data;
+        vPtrs[k] = this.peerArenaPointer(i, peer, stageV[peer].data);
+        lsePtrs[k] = this.peerArenaPointer(i, peer, stageLse[peer].data);
       }
       this.devices[i].cpMergeScatter(
         partialVOuts[i], partialLses[i], vPtrs, lsePtrs,
@@ -2515,9 +2591,6 @@ export class ParallelOps implements DeviceOps {
     this.p2pBarrier();
     this.p2pRetainSources(...partialVOuts.map(t => t.viewClone()), ...partialLses.map(t => t.viewClone()));
 
-    const vPtrs: number[] = partialVOuts.map(t => t.data);
-    const lsePtrs: number[] = partialLses.map(t => t.data);
-
     const outputV: Tensor[] = [];
     const outputLse: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
@@ -2526,6 +2599,8 @@ export class ParallelOps implements DeviceOps {
     }
 
     for (let i = 0; i < this.worldSize; i++) {
+      const vPtrs = partialVOuts.map((tensor, owner) => this.peerArenaPointer(i, owner, tensor.data));
+      const lsePtrs = partialLses.map((tensor, owner) => this.peerArenaPointer(i, owner, tensor.data));
       this.devices[i].cpMergeTree(
         vPtrs,
         lsePtrs,
@@ -2645,6 +2720,7 @@ export class ParallelOps implements DeviceOps {
       }
     }
     this.communicationPools.clear();
+    this.closePeerArenaMappings();
   }
 
   [Symbol.dispose](): void {
@@ -2909,8 +2985,6 @@ export class ParallelOps implements DeviceOps {
         }
       },
       streamWaitEvent: () => {
-        // if (disposed)
-        //   return;
         for (let i = 0; i < this.devices.length; i++) {
           const destinationStream = this.devices[i].currentStream;
           this.devices[i].streamWaitEvent(destinationStream, streams[i]!);
@@ -3804,6 +3878,10 @@ export class ParallelOps implements DeviceOps {
     // passed separately and stays the true rank for the CP ownership filter.
     for (let i = 0; i < this.worldSize; i++) {
       const rotatedPeers = [...pOut.shards.slice(i), ...pOut.shards.slice(0, i)];
+      const rotatedPtrs = rotatedPeers.map((peer, k) => {
+        const owner = (i + k) % this.worldSize;
+        return this.peerArenaPointer(i, owner, peer.data);
+      });
       this.devices[i].gatherTopkCkv(
         state,
         pKvCache.shards[i],
@@ -3812,7 +3890,7 @@ export class ParallelOps implements DeviceOps {
         pPageIndices.shards[i], pPageIndptr.shards[i],
         pKvTokenIndptr.shards[i], pBatchIndices.shards[i],
         topk, paddedKvLen,
-        this.worldSize, i, shardPageSize,
+        this.worldSize, i, shardPageSize, rotatedPtrs,
       );
     }
 
@@ -3865,8 +3943,8 @@ export class ParallelOps implements DeviceOps {
       const valuePtrs = new Array<number>(8).fill(0);
       const indexPtrs = new Array<number>(8).fill(0);
       for (let owner = 0; owner < W; owner++) {
-        valuePtrs[owner] = stagedValues[owner].data;
-        indexPtrs[owner] = stagedIndices[owner].data;
+        valuePtrs[owner] = this.peerArenaPointer(source, owner, stagedValues[owner].data);
+        indexPtrs[owner] = this.peerArenaPointer(source, owner, stagedIndices[owner].data);
       }
       using valuesStream = this.devices[source].withStream(() => {
         addon.p2pReduceScatterWrite(

@@ -19,3 +19,4 @@ import "./test_index_select";
 import "./test_mla_custom_mask";
 import "./test_model_loader";
 import "./test_glm_parser";
+import "./test_cuda_ipc";

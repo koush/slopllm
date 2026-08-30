@@ -1,7 +1,7 @@
 import http from "node:http";
 import path from "node:path";
-import { Worker } from "node:worker_threads";
-import { freeModelRuntime, loadModelRuntime, modelLabel, parseModelArgs } from "./model_cli";
+import { fork, type ChildProcess } from "node:child_process";
+import { freeModelRuntime, loadModelRuntime, modelArenaLayoutSignatures, modelLabel, parseModelArgs, type ModelCliArgs } from "./model_cli";
 
 export interface LoaderArgs {
   controlHost: string;
@@ -59,6 +59,13 @@ export function parseWorkerCommand(value: unknown, sharedArgs: string[]): Worker
   return { entry: path.resolve(entry), args: [...sharedArgs, ...args] };
 }
 
+export function validateWorkerModelArgs(commandArgs: string[], expected: ModelCliArgs): void {
+  const actual = parseModelArgs(commandArgs);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error("Executor arguments cannot override the loader's model, GPU, parallelism, or arena configuration");
+  }
+}
+
 async function readWorkerCommand(req: http.IncomingMessage, sharedArgs: string[]): Promise<WorkerCommand | null> {
   const chunks: Buffer[] = [];
   let length = 0;
@@ -81,7 +88,8 @@ async function readWorkerCommand(req: http.IncomingMessage, sharedArgs: string[]
 
 async function main(): Promise<void> {
   const loaderArgs = parseLoaderArgs(process.argv.slice(2));
-  const modelArgs = parseModelArgs(loaderArgs.initialCommand?.args ?? loaderArgs.sharedArgs);
+  const modelArgs = parseModelArgs(loaderArgs.sharedArgs);
+  if (loaderArgs.initialCommand) validateWorkerModelArgs(loaderArgs.initialCommand.args, modelArgs);
   if (!modelArgs.arena) throw new Error("run_model_loader requires --arena <GiB>");
   if (modelArgs.useQwen35 || modelArgs.useFp8) {
     throw new Error("The model loader currently supports Qwen3 and GLM-5.1");
@@ -89,34 +97,49 @@ async function main(): Promise<void> {
 
   console.log(`Loading ${modelLabel(modelArgs)} for persistent worker execution...`);
   const runtime = await loadModelRuntime(modelArgs);
+  const modelLayouts = modelArenaLayoutSignatures(runtime.model, runtime.gpuDevices);
   for (const device of runtime.gpuDevices) {
     if (device.arenaBase === undefined) throw new Error(`GPU ${device.device} did not create an arena`);
-    process.env[`GLM_ARENA_BASE_${device.device}`] = String(device.arenaBase);
+    process.env[`GLM_ARENA_IPC_HANDLE_${device.device}`] = device.exportArenaIpcHandle().toString("base64");
+    process.env[`GLM_ARENA_LAYOUT_${device.device}`] = device.arenaLayoutSignature();
+    process.env[`GLM_MODEL_LAYOUT_${device.device}`] = modelLayouts.get(device.device);
   }
   process.env.GLM_SKIP_MMAP_LOAD = "1";
   process.env.GLM_MODEL_LOAD_REPLAY = "1";
   console.log(`Model loaded from ${runtime.modelDir}`);
 
-  let worker: Worker | null = null;
+  let worker: ChildProcess | null = null;
   let lastExitCode: number | null = null;
+  let lastSignal: NodeJS.Signals | null = null;
   let lastError: string | null = null;
   let stopping: Promise<void> | null = null;
   let workerCommand = loaderArgs.initialCommand;
+  let shuttingDown = false;
+  let lifecycle: Promise<void> = Promise.resolve();
+  const spawnedProcesses = new WeakSet<ChildProcess>();
+
+  const serializeLifecycle = (operation: () => void | Promise<void>): Promise<void> => {
+    const next = lifecycle.then(operation, operation);
+    lifecycle = next.catch(() => {});
+    return next;
+  };
 
   const startWorker = (follow?: http.ServerResponse): void => {
+    if (shuttingDown) throw new Error("Model loader is shutting down");
     if (worker) throw new Error("Executor worker is already running");
     if (!workerCommand) throw new Error("No executor command has been configured");
+    validateWorkerModelArgs(workerCommand.args, modelArgs);
     lastExitCode = null;
+    lastSignal = null;
     lastError = null;
-    const next = new Worker(workerCommand.entry, {
-      argv: workerCommand.args,
+    const next = fork(workerCommand.entry, workerCommand.args, {
       execArgv: ["--require", require.resolve("tsx/cjs")],
-      stdout: true,
-      stderr: true,
+      stdio: ["inherit", "pipe", "pipe", "ipc"],
     });
     worker = next;
-    next.stdout.pipe(process.stdout, { end: false });
-    next.stderr.pipe(process.stderr, { end: false });
+    next.once("spawn", () => spawnedProcesses.add(next));
+    next.stdout!.pipe(process.stdout, { end: false });
+    next.stderr!.pipe(process.stderr, { end: false });
     if (follow) {
       let exited = false;
       let stdoutEnded = false;
@@ -127,25 +150,31 @@ async function main(): Promise<void> {
       const write = (chunk: Buffer | string) => {
         if (!follow.writableEnded && !follow.destroyed) follow.write(chunk);
       };
-      next.stdout.on("data", write);
-      next.stderr.on("data", write);
-      next.stdout.once("end", () => { stdoutEnded = true; finish(); });
-      next.stderr.once("end", () => { stderrEnded = true; finish(); });
+      next.stdout!.on("data", write);
+      next.stderr!.on("data", write);
+      next.stdout!.once("end", () => { stdoutEnded = true; finish(); });
+      next.stderr!.once("end", () => { stderrEnded = true; finish(); });
       next.once("exit", () => {
+        exited = true;
+        setImmediate(finish);
+      });
+      next.once("error", () => {
         exited = true;
         setImmediate(finish);
       });
     }
     next.once("error", error => {
       lastError = error instanceof Error ? (error.stack ?? error.message) : String(error);
-      console.error("Executor worker failed:", error);
+      if (!spawnedProcesses.has(next) && worker === next) worker = null;
+      console.error("Executor process failed:", error);
     });
-    next.once("exit", code => {
+    next.once("exit", (code, signal) => {
       lastExitCode = code;
+      lastSignal = signal;
       if (worker === next) worker = null;
-      console.log(`Executor worker exited with code ${code}`);
+      console.log(`Executor process exited with ${signal ? `signal ${signal}` : `code ${code}`}`);
     });
-    console.log(`Started executor worker ${next.threadId}: ${workerCommand.entry} ${workerCommand.args.join(" ")}`);
+    console.log(`Started executor process ${next.pid}: ${workerCommand.entry} ${workerCommand.args.join(" ")}`);
   };
 
   const stopWorker = (): Promise<void> => {
@@ -162,12 +191,21 @@ async function main(): Promise<void> {
         stopping = null;
         resolve();
       };
-      current.once("exit", finish);
-      current.postMessage({ type: "shutdown" });
       const timeout = setTimeout(() => {
-        console.warn("Executor did not stop gracefully; terminating worker");
-        void current.terminate().then(finish);
+        console.warn("Executor did not stop gracefully; killing process");
+        current.kill("SIGKILL");
       }, 5000);
+      current.once("exit", finish);
+      current.once("error", () => {
+        if (!spawnedProcesses.has(current)) finish();
+      });
+      if (current.connected) {
+        current.send({ type: "shutdown" }, error => {
+          if (error && current.exitCode === null && !current.killed) {
+            console.warn("Failed to request graceful executor shutdown:", error);
+          }
+        });
+      }
     });
     return stopping;
   };
@@ -180,10 +218,11 @@ async function main(): Promise<void> {
     if (req.method === "GET" && url.pathname === "/status") {
       sendJson(res, 200, {
         state: worker ? "running" : "idle",
-        threadId: worker?.threadId ?? null,
+        pid: worker?.pid ?? null,
         entry: workerCommand?.entry ?? null,
         args: workerCommand?.args ?? [],
         lastExitCode,
+        lastSignal,
         lastError,
       });
       return;
@@ -193,16 +232,9 @@ async function main(): Promise<void> {
       return;
     }
     if (req.method === "POST" && url.pathname === "/run") {
-      void readWorkerCommand(req, loaderArgs.sharedArgs).then(command => {
-        if (worker) {
-          sendJson(res, 409, { error: "Executor worker is already running" });
-          return;
-        }
+      void readWorkerCommand(req, loaderArgs.sharedArgs).then(command => serializeLifecycle(() => {
         if (command) workerCommand = command;
-        if (!workerCommand) {
-          sendJson(res, 400, { error: "No executor command was provided" });
-          return;
-        }
+        if (!workerCommand) throw new Error("No executor command was provided");
         if (url.searchParams.has("follow")) {
           res.writeHead(200, {
             "content-type": "text/plain; charset=utf-8",
@@ -214,16 +246,18 @@ async function main(): Promise<void> {
           startWorker(res);
         } else {
           startWorker();
-          sendJson(res, 202, { state: "running", threadId: worker!.threadId });
+          sendJson(res, 202, { state: "running", pid: worker!.pid });
         }
-      }).catch(error => {
+      })).catch(error => {
         if (!res.headersSent) sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
         else if (!res.writableEnded) res.end(`Executor failed: ${error instanceof Error ? error.message : String(error)}\n`);
       });
       return;
     }
     if (req.method === "POST" && url.pathname === "/stop") {
-      void stopWorker().then(() => sendJson(res, 200, { state: "idle" }));
+      void serializeLifecycle(() => stopWorker())
+        .then(() => sendJson(res, 200, { state: "idle" }))
+        .catch(error => sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) }));
       return;
     }
     if (req.method === "POST" && url.pathname === "/restart") {
@@ -231,7 +265,8 @@ async function main(): Promise<void> {
         sendJson(res, 400, { error: "No executor command has been configured" });
         return;
       }
-      void stopWorker().then(() => {
+      void serializeLifecycle(async () => {
+        await stopWorker();
         if (url.searchParams.has("follow")) {
           res.writeHead(200, {
             "content-type": "text/plain; charset=utf-8",
@@ -243,8 +278,11 @@ async function main(): Promise<void> {
           startWorker(res);
         } else {
           startWorker();
-          sendJson(res, 202, { state: "running", threadId: worker!.threadId });
+          sendJson(res, 202, { state: "running", pid: worker!.pid });
         }
+      }).catch(error => {
+        if (!res.headersSent) sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+        else if (!res.writableEnded) res.end(`Executor failed: ${error instanceof Error ? error.message : String(error)}\n`);
       });
       return;
     }
@@ -255,11 +293,10 @@ async function main(): Promise<void> {
     console.log(`Model loader control server: http://${loaderArgs.controlHost}:${loaderArgs.controlPort}`);
   });
 
-  let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    await stopWorker();
+    await serializeLifecycle(() => stopWorker());
     await new Promise<void>(resolve => server.close(() => resolve()));
     freeModelRuntime(runtime);
   };

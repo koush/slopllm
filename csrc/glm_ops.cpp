@@ -49,6 +49,68 @@ static Napi::Value FreeBuf(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value CudaIpcGetMemHandle(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[0].IsNumber() || !info[1].IsNumber() || !info[2].IsBuffer()) {
+        Napi::TypeError::New(env, "Expected (ctx, ptr, outHandle: Buffer)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Buffer<char> handle = info[2].As<Napi::Buffer<char>>();
+    if (handle.Length() != sizeof(cudaIpcMemHandle_t)) {
+        Napi::TypeError::New(env, "CUDA IPC handle buffer must be exactly 64 bytes").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t buf_ptr = info[1].As<Napi::Number>().Int64Value();
+    cudaError_t err = glm_cuda_ipc_get_mem_handle(
+        reinterpret_cast<GlmCtx*>(ctx_ptr),
+        reinterpret_cast<cudaIpcMemHandle_t*>(handle.Data()),
+        reinterpret_cast<void*>(buf_ptr));
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("cudaIpcGetMemHandle failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value CudaIpcOpenMemHandle(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsBuffer()) {
+        Napi::TypeError::New(env, "Expected (ctx, handle: Buffer)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Buffer<char> handle = info[1].As<Napi::Buffer<char>>();
+    if (handle.Length() != sizeof(cudaIpcMemHandle_t)) {
+        Napi::TypeError::New(env, "CUDA IPC handle buffer must be exactly 64 bytes").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    void* ptr = nullptr;
+    cudaError_t err = glm_cuda_ipc_open_mem_handle(
+        reinterpret_cast<GlmCtx*>(ctx_ptr), &ptr,
+        reinterpret_cast<const cudaIpcMemHandle_t*>(handle.Data()));
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("cudaIpcOpenMemHandle failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    return Napi::Number::New(env, reinterpret_cast<uintptr_t>(ptr));
+}
+
+static Napi::Value CudaIpcCloseMemHandle(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected (ctx, ptr)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    uintptr_t buf_ptr = info[1].As<Napi::Number>().Int64Value();
+    cudaError_t err = glm_cuda_ipc_close_mem_handle(
+        reinterpret_cast<GlmCtx*>(ctx_ptr), reinterpret_cast<void*>(buf_ptr));
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("cudaIpcCloseMemHandle failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value H2D(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 3) {
@@ -3777,6 +3839,9 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "free"), Napi::Function::New(env, Free));
     exports.Set(Napi::String::New(env, "alloc"), Napi::Function::New(env, Alloc));
     exports.Set(Napi::String::New(env, "freeBuf"), Napi::Function::New(env, FreeBuf));
+    exports.Set(Napi::String::New(env, "cudaIpcGetMemHandle"), Napi::Function::New(env, CudaIpcGetMemHandle));
+    exports.Set(Napi::String::New(env, "cudaIpcOpenMemHandle"), Napi::Function::New(env, CudaIpcOpenMemHandle));
+    exports.Set(Napi::String::New(env, "cudaIpcCloseMemHandle"), Napi::Function::New(env, CudaIpcCloseMemHandle));
     exports.Set(Napi::String::New(env, "h2d"), Napi::Function::New(env, H2D));
     exports.Set(Napi::String::New(env, "writePointers"), Napi::Function::New(env, WritePointers));
     exports.Set(Napi::String::New(env, "d2h"), Napi::Function::New(env, D2H));
