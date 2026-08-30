@@ -31,6 +31,9 @@ void glm_free(GlmCtx* ctx);
 
 void* glm_alloc(GlmCtx* ctx, size_t bytes);
 void glm_free_buf(GlmCtx* ctx, void* ptr);
+cudaError_t glm_cuda_ipc_get_mem_handle(GlmCtx* ctx, cudaIpcMemHandle_t* handle, void* ptr);
+cudaError_t glm_cuda_ipc_open_mem_handle(GlmCtx* ctx, void** ptr, const cudaIpcMemHandle_t* handle);
+cudaError_t glm_cuda_ipc_close_mem_handle(GlmCtx* ctx, void* ptr);
 
 void glm_h2d(GlmCtx* ctx, void* dst, const void* src, size_t bytes);
 void glm_d2h(GlmCtx* ctx, void* dst, const void* src, size_t bytes);

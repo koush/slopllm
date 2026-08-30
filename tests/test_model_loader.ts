@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { parseLoaderArgs, parseWorkerCommand } from "../src/run_model_loader";
+import { parseLoaderArgs, parseWorkerCommand, validateWorkerModelArgs } from "../src/run_model_loader";
+import { parseModelArgs } from "../src/model_cli";
 
 describe("model loader arguments", () => {
   it("allows startup without an executor command", () => {
@@ -49,5 +50,18 @@ describe("model loader arguments", () => {
     assert.throws(() => parseWorkerCommand([], []), /JSON string array/);
     assert.throws(() => parseWorkerCommand(["executor", 1], []), /JSON string array/);
     assert.throws(() => parseWorkerCommand(["executor"], []), /Invalid executor entry point/);
+  });
+
+  it("rejects executor overrides of the resident model layout", () => {
+    const expected = parseModelArgs(["--arena", "48", "--gpus", "0,1", "--glm51", "--cp"]);
+    validateWorkerModelArgs(["--arena", "48", "--gpus", "0,1", "--glm51", "--cp", "--port", "8000"], expected);
+    assert.throws(
+      () => validateWorkerModelArgs(["--arena", "48", "--gpus", "2,3", "--glm51", "--cp"], expected),
+      /cannot override/,
+    );
+    assert.throws(
+      () => validateWorkerModelArgs(["--arena", "64", "--gpus", "0,1", "--glm51", "--cp"], expected),
+      /cannot override/,
+    );
   });
 });

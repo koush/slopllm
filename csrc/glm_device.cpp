@@ -75,6 +75,24 @@ void glm_free_buf(GlmCtx* ctx, void* ptr) {
     if (ptr) cudaFree(ptr);
 }
 
+cudaError_t glm_cuda_ipc_get_mem_handle(GlmCtx* ctx, cudaIpcMemHandle_t* handle, void* ptr) {
+    cudaError_t err = cudaSetDevice(ctx->device_id);
+    if (err != cudaSuccess) return err;
+    return cudaIpcGetMemHandle(handle, ptr);
+}
+
+cudaError_t glm_cuda_ipc_open_mem_handle(GlmCtx* ctx, void** ptr, const cudaIpcMemHandle_t* handle) {
+    cudaError_t err = cudaSetDevice(ctx->device_id);
+    if (err != cudaSuccess) return err;
+    return cudaIpcOpenMemHandle(ptr, *handle, cudaIpcMemLazyEnablePeerAccess);
+}
+
+cudaError_t glm_cuda_ipc_close_mem_handle(GlmCtx* ctx, void* ptr) {
+    cudaError_t err = cudaSetDevice(ctx->device_id);
+    if (err != cudaSuccess) return err;
+    return cudaIpcCloseMemHandle(ptr);
+}
+
 // ---------------------------------------------------------------------------
 // Pinned host memory
 // ---------------------------------------------------------------------------

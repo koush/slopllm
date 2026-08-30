@@ -715,6 +715,7 @@ export class GlmOps implements DeviceOps {
   allocator: Allocator;
   readonly arenaBase?: number;
   readonly arenaSize?: number;
+  private readonly arenaOwnership?: "owned" | "ipc-imported";
   capturing = false;
 
   constructor(deviceId: number = 0, libPath?: string, arenaGb?: number) {
@@ -727,11 +728,33 @@ export class GlmOps implements DeviceOps {
 
     if (arenaGb) {
       const size = arenaGb * 1024 * 1024 * 1024;
-      const baseEnv = process.env[`GLM_ARENA_BASE_${deviceId}`];
-      const base = baseEnv === undefined ? getNativeAddon().alloc(this.ctx, size) : Number(baseEnv);
+      const ipcHandleEnv = process.env[`GLM_ARENA_IPC_HANDLE_${deviceId}`];
+      let base: number;
+      if (ipcHandleEnv === undefined) {
+        base = native.alloc(this.ctx, size);
+        this.arenaOwnership = "owned";
+      } else {
+        const handle = Buffer.from(ipcHandleEnv, "base64");
+        if (handle.length !== 64) {
+          native.free(this.ctx);
+          this.ctx = 0;
+          throw new Error(`Invalid GLM_ARENA_IPC_HANDLE_${deviceId}`);
+        }
+        try {
+          base = native.cudaIpcOpenMemHandle(this.ctx, handle);
+          this.arenaOwnership = "ipc-imported";
+        } catch (error) {
+          native.free(this.ctx);
+          this.ctx = 0;
+          throw error;
+        }
+      }
       if (!Number.isSafeInteger(base) || base <= 0) {
-        getNativeAddon().free(this.ctx);
-        throw new Error(`Invalid GLM_ARENA_BASE_${deviceId}: ${baseEnv ?? base}`);
+        if (this.arenaOwnership === "owned" && base > 0) native.freeBuf(this.ctx, base);
+        else if (this.arenaOwnership === "ipc-imported" && base > 0) native.cudaIpcCloseMemHandle(this.ctx, base);
+        native.free(this.ctx);
+        this.ctx = 0;
+        throw new Error(`Failed to initialize arena on device ${deviceId}`);
       }
       this.arenaBase = base;
       this.arenaSize = size;
@@ -751,7 +774,35 @@ export class GlmOps implements DeviceOps {
   }
 
   free(): void {
-    getNativeAddon().free(this.ctx);
+    if (!this.ctx) return;
+    const native = getNativeAddon();
+    const ctx = this.ctx;
+    this.ctx = 0;
+    try {
+      if (this.arenaBase !== undefined) {
+        if (this.arenaOwnership === "ipc-imported") native.cudaIpcCloseMemHandle(ctx, this.arenaBase);
+        else if (this.arenaOwnership === "owned") native.freeBuf(ctx, this.arenaBase);
+      }
+    } finally {
+      native.free(ctx);
+    }
+  }
+
+  exportArenaIpcHandle(): Buffer {
+    if (!this.ctx || this.arenaBase === undefined || this.arenaOwnership !== "owned") {
+      throw new Error(`Device ${this.device} does not own an exportable arena`);
+    }
+    const handle = Buffer.alloc(64);
+    getNativeAddon().cudaIpcGetMemHandle(this.ctx, this.arenaBase, handle);
+    return handle;
+  }
+
+  arenaLayoutSignature(): string | undefined {
+    return this.allocator instanceof ArenaAllocator ? this.allocator.layoutSignature() : undefined;
+  }
+
+  get usesIpcArena(): boolean {
+    return this.arenaOwnership === "ipc-imported";
   }
 
   [Symbol.dispose](): void {
@@ -874,7 +925,7 @@ export class GlmOps implements DeviceOps {
     return out;
   }
 
-  gatherTopkCkv(_state: ExecutionState, kvCache: Tensor, outputs: readonly Tensor[], topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, kvTokenIndptr: Tensor, batchIndices: Tensor, topk: number, paddedKvLen: number, cpWorldSize: number = 0, cpRank: number = 0, effPageSize?: number): void {
+  gatherTopkCkv(_state: ExecutionState, kvCache: Tensor, outputs: readonly Tensor[], topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, kvTokenIndptr: Tensor, batchIndices: Tensor, topk: number, paddedKvLen: number, cpWorldSize: number = 0, cpRank: number = 0, effPageSize?: number, outputPtrs?: readonly number[]): void {
     const pageSize = kvCache.shape[1];
     const bpt = kvCache.shape[2];
     const numTokens = topkIdx.shape[0];
@@ -903,7 +954,10 @@ export class GlmOps implements DeviceOps {
     // Build the 8-pointer peer table from the caller-provided outputs. Unused
     // slots stay at 0 (kernel only writes peers [0, N)).
     const peerPtrs = new Array<number>(8).fill(0);
-    for (let j = 0; j < N; j++) peerPtrs[j] = outputs[j].data;
+    if (outputPtrs && outputPtrs.length !== N) {
+      throw new Error(`gatherTopkCkv: outputPtrs.length=${outputPtrs.length}, expected ${N}`);
+    }
+    for (let j = 0; j < N; j++) peerPtrs[j] = outputPtrs?.[j] ?? outputs[j].data;
 
     // Dedup scratch, used only when numTokens > 1.
     //

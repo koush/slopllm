@@ -1,9 +1,10 @@
+import { createHash } from "node:crypto";
 import { ChatModel } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
-import { ParallelOps } from "./parallel_ops";
+import { ParallelOps, ParallelTensor } from "./parallel_ops";
 import { Qwen35Model } from "./qwen35_model";
 import { Qwen3Model } from "./qwen3_model";
 
@@ -105,11 +106,43 @@ export function createDeviceOps(args: ModelCliArgs): { glm: DeviceOps, gpuDevice
 }
 
 export async function loadModel(glm: DeviceOps, args: ModelCliArgs, modelDir: string): Promise<ChatModel> {
-  return args.useGlm51
+  const model = await (args.useGlm51
     ? Glm51Model.fromPretrained(glm, modelDir, args.cp, args.mtp)
     : args.useQwen35
       ? Qwen35Model.fromPretrained(glm, modelDir)
-      : Qwen3Model.fromPretrained(glm, modelDir);
+      : Qwen3Model.fromPretrained(glm, modelDir));
+  const devices = glm instanceof ParallelOps ? glm.devices : [glm as GlmOps];
+  for (const device of devices) {
+    const expected = process.env[`GLM_ARENA_LAYOUT_${device.device}`];
+    const actual = device.arenaLayoutSignature();
+    if (expected !== undefined && actual !== expected) {
+      throw new Error(`Arena replay layout mismatch on device ${device.device}: expected ${expected}, got ${actual}`);
+    }
+  }
+  if (devices.some(device => process.env[`GLM_MODEL_LAYOUT_${device.device}`] !== undefined)) {
+    const modelLayouts = modelArenaLayoutSignatures(model, devices);
+    for (const device of devices) {
+      const expected = process.env[`GLM_MODEL_LAYOUT_${device.device}`];
+      const actual = modelLayouts.get(device.device);
+      if (expected !== undefined && actual !== expected) {
+        throw new Error(`Model arena layout mismatch on device ${device.device}: expected ${expected}, got ${actual}`);
+      }
+    }
+  }
+  return model;
+}
+
+export function modelArenaLayoutSignatures(model: ChatModel, devices: readonly GlmOps[]): Map<number, string> {
+  const hashes = devices.map(() => createHash("sha256"));
+  const tensors = [...model.tensors.entries()].sort(([a], [b]) => a.localeCompare(b));
+  for (const [name, tensor] of tensors) {
+    for (let i = 0; i < devices.length; i++) {
+      if (devices[i].arenaBase === undefined) throw new Error(`Device ${devices[i].device} does not have an arena`);
+      const local = tensor instanceof ParallelTensor ? tensor.shard(i) : tensor;
+      hashes[i].update(`${name}\0${local.data - devices[i].arenaBase!}\0${local.allocSize}\0${local.type}\n`);
+    }
+  }
+  return new Map(devices.map((device, i) => [device.device, hashes[i].digest("hex")]));
 }
 
 export async function loadModelRuntime(args: ModelCliArgs): Promise<ModelRuntime> {

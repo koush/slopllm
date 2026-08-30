@@ -37,6 +37,9 @@ export interface NativeAddon {
   free(ctx: number): void;
   alloc(ctx: number, size: number): number;
   freeBuf(ctx: number, ptr: number): void;
+  cudaIpcGetMemHandle(ctx: number, ptr: number, outHandle: Buffer): void;
+  cudaIpcOpenMemHandle(ctx: number, handle: Buffer): number;
+  cudaIpcCloseMemHandle(ctx: number, ptr: number): void;
   h2d(ctx: number, dst: number, src: Buffer, size: number): void;
   writePointers(ctx: number, dst: number, p0: number, p1: number, p2: number, p3: number, p4: number, p5: number, p6: number, p7: number, n: number): void;
   d2h(ctx: number, dst: Buffer, src: number, size: number): void;

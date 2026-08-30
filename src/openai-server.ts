@@ -1,6 +1,5 @@
 import http from "node:http";
 import crypto from "node:crypto";
-import { parentPort } from "node:worker_threads";
 import { CaptureManager } from "./capture-manager";
 import { type OutputParserEvent } from "./chat-model-parser";
 import { ChatModel, ChatCache, ChatTemplateKwargs, loadGenerationConfig, loadMaxPositionEmbeddings, type MtpDraftBatch, SamplingParams, type TokenSelector, Tokenizer } from "./chat_model";
@@ -51,7 +50,7 @@ function parseArgs(argv: string[]): ServerArgs {
     port: 8000,
     host: "0.0.0.0",
     chunkSize: 8192,
-    batchSize: 1,
+    batchSize: 8,
     maxPages: 0,
     maxTokens: 65536,
     temperature: 0.6,
@@ -1530,13 +1529,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     for (const device of gpuDevices) device.free();
   };
 
-  if (parentPort) {
-    const port = parentPort;
-    port.on("message", message => {
+  if (process.send) {
+    process.on("message", message => {
       if ((message as { type?: string })?.type !== "shutdown") return;
       void cleanup().then(() => {
-        port.postMessage({ type: "stopped" });
-        port.close();
+        process.send?.({ type: "stopped" }, () => process.disconnect?.());
       });
     });
   } else {

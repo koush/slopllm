@@ -153,7 +153,9 @@ npx tsx --test tests/test_parallel.ts  # multi-GPU
 
 # Persistent Model Loader
 
-`src/run_model_loader.ts` loads the model and GPU arena once, then starts executor workers against that resident model. Stopping or restarting a worker does not reload the weights. Stopping the loader process releases the model runtime.
+`src/run_model_loader.ts` loads the model and GPU arena once, then starts executor processes against that resident model. Each arena is exported with CUDA IPC and opened at a process-local address by the executor, which replays the model allocation layout against that imported base. Stopping or restarting an executor does not reload the weights. Stopping the loader process releases the model runtime.
+
+Executor CUDA contexts, streams, cuBLAS handles, NCCL communicators, graphs, and workspaces are process-local and are released by process teardown. The loader remains the sole owner of the exported arena allocations. For custom direct-P2P collectives, each executor GPU context opens every owner's arena handle and translates tensor pointers through the resulting per-reader/per-owner base table; process-local P2P metadata pointers do not require translation. NCCL collectives remain available as fallback.
 
 The loader currently supports Qwen3 and GLM-5.1. It requires `--arena <GiB>` and does not support Qwen3.5 or FP8.
 
@@ -167,32 +169,32 @@ NCCL_P2P_LEVEL=SYS NCCL_TOPO_FILE=/root/chat/vllm/topo_fixed.xml npx tsx src/run
   src/openai-server.ts --host 0.0.0.0 --port 8010
 ```
 
-Arguments before the executor path are shared model arguments and are passed to every worker. Arguments after the path apply only to that executor. Loader options default to `--control-host 127.0.0.1 --control-port 8099` and must appear before the executor path.
+Arguments before the executor path are shared model arguments and are passed to every executor process. Arguments after the path apply only to that executor. Loader options default to `--control-host 127.0.0.1 --control-port 8099` and must appear before the executor path.
 
-The model is ready when the control endpoint responds and the worker reports its own service as ready:
+The model is ready when the control endpoint responds and the executor reports its own service as ready:
 
 ```bash
 curl http://127.0.0.1:8099/status
 curl http://127.0.0.1:8010/health
 ```
 
-## Control the Worker
+## Control the Executor
 
 ```bash
-# Inspect the current command and worker state.
+# Inspect the current command and executor state.
 curl http://127.0.0.1:8099/status
 
-# Restart the configured worker without reloading the model.
+# Restart the configured executor without reloading the model.
 curl -X POST http://127.0.0.1:8099/restart
 
-# Stop only the worker. The model remains resident on the GPUs.
+# Stop only the executor. The model remains resident on the GPUs.
 curl -X POST http://127.0.0.1:8099/stop
 
-# Start the last configured worker again.
+# Start the last configured executor again.
 curl -X POST http://127.0.0.1:8099/run
 ```
 
-To replace the executor or its worker-specific arguments, stop the current worker and provide a JSON command array:
+To replace the executor or its process-specific arguments, stop the current executor and provide a JSON command array:
 
 ```bash
 curl -X POST http://127.0.0.1:8099/stop
@@ -201,7 +203,7 @@ curl -X POST http://127.0.0.1:8099/run \
   -d '["src/openai-server.ts", "--host", "0.0.0.0", "--port", "8010"]'
 ```
 
-Add `?follow` to `/run` or `/restart` to stream worker output until that worker exits:
+Add `?follow` to `/run` or `/restart` to stream executor output until that process exits:
 
 ```bash
 curl -N -X POST 'http://127.0.0.1:8099/restart?follow'
