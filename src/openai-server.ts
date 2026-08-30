@@ -354,7 +354,7 @@ async function prefillPromptChunks(
     throw new Error(`Prefill batch ${rows.length} exceeds chunk size ${chunkSize}`);
   }
   while (rows.reduce((sum, row) => sum + row.inputIds.length, 0) > finalInputBudget) {
-    const staged = rows.map(row => ({ row, key: nextStagingKey++ }));
+    const staged = rows.map((row, index) => ({ row, sequence: pagedKV.sequences[index], key: nextStagingKey++ }));
     for (const entry of staged) pagedKV.stageSequence(0, entry.key);
 
     let budget = chunkSize;
@@ -379,7 +379,7 @@ async function prefillPromptChunks(
     const nextTokens = chunked.map(({ entry, take }) => entry.row.inputIds[take]);
     await runChunk(inputIds, nextTokens);
     for (let i = 0; i < chunked.length; i++) {
-      pagedKV.reportTokens(i, inputIds[i]);
+      chunked[i].entry.sequence.reportTokens(inputIds[i]);
       const { entry, take } = chunked[i];
       entry.row.inputIds = entry.row.inputIds.slice(take);
     }
