@@ -54,6 +54,7 @@ export interface DeviceOps extends Disposable {
   eventRecord(eventIdx: number, streamIdx: number): void;
   streamWaitEvent(streamIdx: number, eventIdx: number): void;
   currentStream: number;
+  readonly activeStreams: readonly number[];
   availableStreams: number[];
   withStream<T>(fn: () => T): Disposable & { result: T, streamWaitEvent(): void, synchronize(): void };
 

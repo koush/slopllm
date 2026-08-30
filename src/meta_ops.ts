@@ -322,7 +322,8 @@ export class MetaOps implements DeviceOps {
     streamWaitEvent(streamIdx: number, eventIdx: number): void {
     }
 
-    currentStream = 0;
+    activeStreams = [0];
+    get currentStream() { return this.activeStreams[this.activeStreams.length - 1]; }
     availableStreams: number[] = [];
 
     withStream<T>(fn: () => T): Disposable & { result: T; streamWaitEvent(): void; synchronize(): void; } {

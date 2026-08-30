@@ -8,7 +8,7 @@ export class WorkspaceBase implements Disposable {
   tensors = new Map<string, Tensor>();
   tracked = new Set<Tensor>();
   staged = new Set<Tensor>();
-  disposedDevice = new Set<Tensor>();
+  disposedDeviceByStream = new Map<number, Set<Tensor>>();
   disposedHost = new Set<Tensor>();
   synchronizingHost = new Set<Tensor>();
   frozen = false;
@@ -104,6 +104,34 @@ export class WorkspaceBase implements Disposable {
     this.frozen = false;
   }
 
+  getDisposedDevicePool(stream: number): Set<Tensor> {
+    let pool = this.disposedDeviceByStream.get(stream);
+    if (!pool) {
+      pool = new Set<Tensor>();
+      this.disposedDeviceByStream.set(stream, pool);
+    }
+    return pool;
+  }
+
+  getDisposedPools(pinned: boolean): Set<Tensor>[] {
+    if (pinned) return [this.disposedHost];
+    const streams = [...this.glm.activeStreams].reverse();
+    return [...new Set(streams)].map(stream => this.getDisposedDevicePool(stream));
+  }
+
+  recycleDevice(tensor: Tensor): void {
+    this.getDisposedDevicePool(this.glm.currentStream).add(tensor);
+  }
+
+  disposeStream(stream: number, destinationStream: number): void {
+    if (stream === destinationStream) return;
+    const streamPool = this.disposedDeviceByStream.get(stream);
+    if (!streamPool) return;
+    const destinationPool = this.getDisposedDevicePool(destinationStream);
+    for (const tensor of streamPool) destinationPool.add(tensor);
+    this.disposedDeviceByStream.delete(stream);
+  }
+
   alloc(shape: number[], type: string, name?: string, parallelism?: TensorParallelism): Tensor {
     return this._alloc(shape, type, false, name, parallelism);
   }
@@ -172,15 +200,19 @@ export class WorkspaceBase implements Disposable {
     }
 
     let best: Tensor | undefined;
-    const disposed = pinned ? this.disposedHost : this.disposedDevice;
-    for (const t of disposed) {
-      if (t.view)
-        throw new Error("disposed tensor should not have a view");
-      if (!t.data)
-        throw new Error("disposed tensor should have data");
-      if (t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
-        if (name === undefined) {
-          best = t;
+    let bestPool: Set<Tensor> | undefined;
+    const disposedPools = this.getDisposedPools(pinned);
+    for (const disposed of disposedPools) {
+      for (const t of disposed) {
+        if (t.view)
+          throw new Error("disposed tensor should not have a view");
+        if (!t.data)
+          throw new Error("disposed tensor should have data");
+        if (t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
+          if (name === undefined) {
+            best = t;
+            bestPool = disposed;
+          }
         }
       }
     }
@@ -189,7 +221,7 @@ export class WorkspaceBase implements Disposable {
       if (best.allocSize !== bytes && this.allocLogger) {
         console.warn(`Reusing disposed tensor of size ${best.allocSize} bytes for allocation of ${bytes} bytes (${shape.join("x")} ${type}${pinned ? " pinned" : ""}${parallelism ? ` ${parallelism}` : ""})`);
       }
-      disposed.delete(best);
+      bestPool!.delete(best);
       const data = best.data;
       best.detachData();
       tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned, undefined);
@@ -222,8 +254,10 @@ export class WorkspaceBase implements Disposable {
     for (const tensor of this.disposedHost) {
       tensor.free();
     }
-    for (const tensor of this.disposedDevice) {
-      tensor.free();
+    for (const pool of this.disposedDeviceByStream.values()) {
+      for (const tensor of pool) {
+        tensor.free();
+      }
     }
     for (const tensor of this.synchronizingHost) {
       tensor.free();
@@ -234,7 +268,7 @@ export class WorkspaceBase implements Disposable {
     this.tensors.clear();
     this.tracked.clear();
     this.disposedHost.clear();
-    this.disposedDevice.clear();
+    this.disposedDeviceByStream.clear();
     this.synchronizingHost.clear();
     this.staged.clear();
   }

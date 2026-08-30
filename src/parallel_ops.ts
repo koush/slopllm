@@ -2816,7 +2816,13 @@ export class ParallelOps implements DeviceOps {
   }
 
   availableStreams: number[] = [];
-  currentStream = 0;
+  get currentStream() {
+    return this.devices[0].currentStream;
+  }
+  get activeStreams() {
+    return this.devices[0].activeStreams;
+  }
+
   setStream(streamIdx: number): void {
     for (const device of this.devices) {
       device.setStream(streamIdx);
@@ -2841,13 +2847,23 @@ export class ParallelOps implements DeviceOps {
     }
     for (let i = 0; i < this.devices.length; i++) {
       this.devices[i].eventRecord(currentStreams[i], currentStreams[i]);
-      this.devices[i].setStream(streams[i]!);
+      this.devices[i].pushStream(streams[i]!);
       this.devices[i].streamWaitEvent(streams[i]!, currentStreams[i]);
     }
-    const result = fn();
-    for (let i = 0; i < this.devices.length; i++) {
-      this.devices[i].eventRecord(streams[i]!, streams[i]!);
-      this.devices[i].setStream(currentStreams[i]);
+    let result!: T;
+    let completed = false;
+    try {
+      result = fn();
+      completed = true;
+    } finally {
+      for (let i = 0; i < this.devices.length; i++) {
+        this.devices[i].eventRecord(streams[i]!, streams[i]!);
+        this.devices[i].popStream(streams[i]!);
+        if (!completed) {
+          this.devices[i].streamWaitEvent(currentStreams[i], streams[i]!);
+          this.devices[i].disposeStream(streams[i]!);
+        }
+      }
     }
     let disposed = false;
     return {
@@ -2860,10 +2876,10 @@ export class ParallelOps implements DeviceOps {
         }
       },
       streamWaitEvent: () => {
-        // if (disposed)
-        //   return;
         for (let i = 0; i < this.devices.length; i++) {
-          this.devices[i].streamWaitEvent(this.devices[i].currentStream, streams[i]!);
+          const destinationStream = this.devices[i].currentStream;
+          this.devices[i].streamWaitEvent(destinationStream, streams[i]!);
+          this.devices[i].disposeStreamTensors(streams[i]!, destinationStream);
         }
       },
       synchronize: () => {
