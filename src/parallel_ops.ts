@@ -2041,9 +2041,8 @@ class P2PAllReduceGroup {
    * the tensors its peers will read; they are only released once this group's
    * *next* barrier proves every peer is past those reads.
    *
-   * Per-group on purpose: the group moves between streams only across an
-   * explicit wait edge, so one stream cannot recycle sources still in use by
-   * another.
+   * Per-group on purpose: each group belongs to one stream, so one stream
+   * cannot recycle sources still in use by another.
    */
   sources: Tensor[] = [];
 
@@ -2113,7 +2112,6 @@ interface SparseMlaPrefetchExtra {
 
 interface CommunicationPool {
   comms: number[][];
-  p2pGroups: P2PAllReduceGroup[];
 }
 
 export class ParallelOps implements DeviceOps {
@@ -2123,6 +2121,8 @@ export class ParallelOps implements DeviceOps {
   readonly comms: number[];
   private readonly shardWorkspaces = new WeakMap<WorkspaceBase, WorkspaceBase[]>();
   private readonly communicationPools = new Map<number, CommunicationPool>();
+  /** P2P groups are stream-local because their barriers cannot overlap. */
+  private readonly p2pGroups = new Map<number, P2PAllReduceGroup>();
   private readonly commSetIds = new WeakMap<number[], number>();
   private readonly p2pGroupIds = new WeakMap<P2PAllReduceGroup, number>();
   private readonly communicationHistory: string[] = [];
@@ -2149,7 +2149,7 @@ export class ParallelOps implements DeviceOps {
     } else {
       this.comms = [];
     }
-    this.communicationPools.set(0, { comms: [this.comms], p2pGroups: [] });
+    this.communicationPools.set(0, { comms: [this.comms] });
     this.communicationId(this.comms);
     this.recordCommunication("initialized stream 0 communicator");
     // Enable P2P peer access early, before model weights are loaded,
@@ -2253,7 +2253,7 @@ export class ParallelOps implements DeviceOps {
   private getCommunicationPool(stream: number): CommunicationPool {
     let pool = this.communicationPools.get(stream);
     if (!pool) {
-      pool = { comms: [], p2pGroups: [] };
+      pool = { comms: [] };
       this.communicationPools.set(stream, pool);
     }
     return pool;
@@ -2283,12 +2283,14 @@ export class ParallelOps implements DeviceOps {
   }
 
   communicationDiagnostics(): string {
-    const pools = [...this.communicationPools.entries()]
-      .sort(([a], [b]) => a - b)
-      .map(([stream, pool]) => {
-        const comms = pool.comms.map(comms => this.communicationId(comms)).join(",");
-        const groups = pool.p2pGroups.map(group => this.p2pGroupId(group)).join(",");
-        return `stream ${stream}: comms=[${comms}] p2p=[${groups}]`;
+    const streams = new Set([...this.communicationPools.keys(), ...this.p2pGroups.keys()]);
+    const pools = [...streams]
+      .sort((a, b) => a - b)
+      .map(stream => {
+        const comms = (this.communicationPools.get(stream)?.comms ?? [])
+          .map(comms => this.communicationId(comms)).join(",");
+        const group = this.p2pGroups.get(stream);
+        return `stream ${stream}: comms=[${comms}] p2p=[${group ? this.p2pGroupId(group) : ""}]`;
       });
     return [
       `Communication pools (current=${this.currentStream}, active=[${this.activeStreams.join(",")}])`,
@@ -2308,31 +2310,21 @@ export class ParallelOps implements DeviceOps {
     const source = this.communicationPools.get(sourceStream);
     if (!source) return;
     this.recordCommunication(
-      `move ${sourceStream}->${destinationStream} comms=[${source.comms.map(comms => this.communicationId(comms)).join(",")}] p2p=[${source.p2pGroups.map(group => this.p2pGroupId(group)).join(",")}]`,
+      `move ${sourceStream}->${destinationStream} comms=[${source.comms.map(comms => this.communicationId(comms)).join(",")}]`,
     );
     const destination = this.getCommunicationPool(destinationStream);
     destination.comms.push(...source.comms);
-    destination.p2pGroups.push(...source.p2pGroups);
     this.communicationPools.delete(sourceStream);
   }
 
-  /** Get a P2P group owned by the current stream, borrowing from its ancestry if possible. */
+  /** Get a P2P group dedicated to this stream. */
   getP2PGroup(stream: number): P2PAllReduceGroup | null {
     if (!this.p2pEnabled) return null;
-    const destination = this.getCommunicationPool(stream);
-    if (destination.p2pGroups.length) return destination.p2pGroups[0];
-    for (const owner of this.communicationLineage(stream)) {
-      if (owner === stream) continue;
-      const group = this.communicationPools.get(owner)?.p2pGroups.pop();
-      if (group) {
-        destination.p2pGroups.push(group);
-        this.recordCommunication(`borrow p2p ${this.p2pGroupId(group)} ${owner}->${stream}`);
-        return group;
-      }
-    }
+    const existing = this.p2pGroups.get(stream);
+    if (existing) return existing;
     try {
       const group = new P2PAllReduceGroup(this.devices);
-      destination.p2pGroups.push(group);
+      this.p2pGroups.set(stream, group);
       this.recordCommunication(`create p2p ${this.p2pGroupId(group)} on stream ${stream}`);
       return group;
     } catch (e) {
@@ -2707,13 +2699,12 @@ export class ParallelOps implements DeviceOps {
   }
 
   free(): void {
-    const groups = new Set<P2PAllReduceGroup>();
     const communicatorSets = new Set<number[]>();
     for (const pool of this.communicationPools.values()) {
-      for (const group of pool.p2pGroups) groups.add(group);
       for (const comms of pool.comms) communicatorSets.add(comms);
     }
-    for (const group of groups) group.free();
+    for (const group of this.p2pGroups.values()) group.free();
+    this.p2pGroups.clear();
     for (const comms of communicatorSets) {
       for (const comm of comms) {
         getNativeAddon().ncclCommDestroy(comm);
@@ -2896,17 +2887,13 @@ export class ParallelOps implements DeviceOps {
     for (const device of this.devices) {
       device.synchronize();
     }
-    for (const pool of this.communicationPools.values()) {
-      for (const group of pool.p2pGroups) group.onSynchronized();
-    }
+    for (const group of this.p2pGroups.values()) group.onSynchronized();
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
   async synchronizeAsync(): Promise<void> {
     await Promise.all(this.devices.map(device => device.synchronizeAsync()));
-    for (const pool of this.communicationPools.values()) {
-      for (const group of pool.p2pGroups) group.onSynchronized();
-    }
+    for (const group of this.p2pGroups.values()) group.onSynchronized();
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
@@ -2914,12 +2901,12 @@ export class ParallelOps implements DeviceOps {
     for (const device of this.devices) {
       device.synchronizeStream(streamIdx);
     }
-    for (const group of this.communicationPools.get(streamIdx)?.p2pGroups ?? []) group.onSynchronized();
+    this.p2pGroups.get(streamIdx)?.onSynchronized();
   }
 
   async synchronizeStreamAsync(streamIdx: number): Promise<void> {
     await Promise.all(this.devices.map(device => device.synchronizeStreamAsync(streamIdx)));
-    for (const group of this.communicationPools.get(streamIdx)?.p2pGroups ?? []) group.onSynchronized();
+    this.p2pGroups.get(streamIdx)?.onSynchronized();
   }
 
   availableStreams: number[] = [];
@@ -2994,8 +2981,9 @@ export class ParallelOps implements DeviceOps {
       },
       synchronize: () => {
         for (let i = 0; i < this.devices.length; i++) {
-          this.devices[i].synchronizeStream(this.devices[i].currentStream);
+          this.devices[i].synchronizeStream(streams[i]!);
         }
+        this.p2pGroups.get(streams[0]!)?.onSynchronized();
       },
       result,
     };
@@ -3946,21 +3934,18 @@ export class ParallelOps implements DeviceOps {
         valuePtrs[owner] = this.peerArenaPointer(source, owner, stagedValues[owner].data);
         indexPtrs[owner] = this.peerArenaPointer(source, owner, stagedIndices[owner].data);
       }
-      using valuesStream = this.devices[source].withStream(() => {
-        addon.p2pReduceScatterWrite(
-          this.devices[source].ctx, localValues.shards[source].data,
-          valuePtrs[0], valuePtrs[1], valuePtrs[2], valuePtrs[3],
-          valuePtrs[4], valuePtrs[5], valuePtrs[6], valuePtrs[7],
-          W, ownerValueBytes, source,
-        );
-      });
+      addon.p2pReduceScatterWrite(
+        this.devices[source].ctx, localValues.shards[source].data,
+        valuePtrs[0], valuePtrs[1], valuePtrs[2], valuePtrs[3],
+        valuePtrs[4], valuePtrs[5], valuePtrs[6], valuePtrs[7],
+        W, ownerValueBytes, source,
+      );
       addon.p2pReduceScatterWrite(
         this.devices[source].ctx, localIndices.shards[source].data,
         indexPtrs[0], indexPtrs[1], indexPtrs[2], indexPtrs[3],
         indexPtrs[4], indexPtrs[5], indexPtrs[6], indexPtrs[7],
         W, ownerIndexBytes, source,
       );
-      valuesStream.streamWaitEvent();
     }
     group.barrier(this.devices);
 
