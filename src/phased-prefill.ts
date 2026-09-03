@@ -63,6 +63,16 @@ export class PhasedPrefillRunner {
   private runGeneratorPair(a: PhasedForward, b: PhasedForward, consume?: PairConsumer): void {
     let resultA: IteratorResult<void, Tensor> | undefined;
     let resultB: IteratorResult<void, Tensor> | undefined;
+    if (a.state.batchSize === 1 && b.state.batchSize === 1) {
+      const installPrefetch = (cacheIdx: number, field: string, stream: unknown) => {
+        const key = `sparseMlaPrefetchLayer_${cacheIdx}`;
+        const extra = b.state.extras.get(key) ?? {};
+        extra[field] = stream;
+        b.state.extras.set(key, extra);
+      };
+      a.state.extras.set("setCkv", (cacheIdx: number, stream: unknown) => installPrefetch(cacheIdx, "stream", stream));
+      a.state.extras.set("setIndexerK", (cacheIdx: number, stream: unknown) => installPrefetch(cacheIdx, "indexerStream", stream));
+    }
     try {
       resultA = a.generator.next();
       if (resultA.done) {
@@ -89,6 +99,8 @@ export class PhasedPrefillRunner {
       using hiddenB = resultB.value;
       consume?.(a.state, hiddenA, b.state, hiddenB);
     } finally {
+      a.state.extras.delete("setCkv");
+      a.state.extras.delete("setIndexerK");
       try {
         if (!resultB?.done) closeGenerator(b.generator);
         if (!resultA?.done) closeGenerator(a.generator);

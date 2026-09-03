@@ -1,4 +1,5 @@
 import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
+import { CaptureManager } from "./capture-manager";
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
 import { Glm51Config } from "./glm51_model";
@@ -3327,11 +3328,8 @@ export class ParallelOps implements DeviceOps {
       throw new Error(`mlaKvCacheAppend: expected indexer prefetch for full layer ${cacheIdx}`);
     }
     const pagedKV = state.cache.getPagedKV();
-    const paddedKvLen = Math.min(
-      pagedKV.maxPages * pagedKV.pageSize,
-      state.getGraphVariantPaddedKvLen(),
-    );
-    return {
+    const paddedKvLen = this.sparseMlaPaddedKvLen(state);
+    const gathered = {
       ckv: this.gatherPages(
         ckvData, indices, indptr, lastPageLen,
         state.batchSize,
@@ -3345,6 +3343,8 @@ export class ParallelOps implements DeviceOps {
         state.kvTokenIndptrD, true,
       ),
     };
+    this.publishIndexerK(state, cacheIdx, gathered.ckv as ParallelTensor, gathered.kpe as ParallelTensor);
+    return gathered;
   }
 
   sparseMlaPrepareCache(state: ExecutionState, groupSlots: Tensor, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
@@ -3359,10 +3359,7 @@ export class ParallelOps implements DeviceOps {
     const cfg = state.model.cfg as Glm51Config;
 
     const pagedKV = state.cache.getPagedKV();
-    const paddedKvLen = Math.min(
-      pagedKV.maxPages * pagedKV.pageSize,
-      state.getGraphVariantPaddedKvLen(),
-    );
+    const paddedKvLen = this.sparseMlaPaddedKvLen(state);
 
     // Get this layer's gathering stream before cleaning up a skipped previous
     // layer. Extras use exact layer keys; buffers use distance-based names.
@@ -3453,7 +3450,8 @@ export class ParallelOps implements DeviceOps {
     const nextCacheIdx = cacheIdx + 1;
     // Do not carry a prefetched tensor across forwardModel's tracking scope.
     // The MTP layer runs in a separate forward and gathers its cache there.
-    if (nextCacheIdx < cfg.numHiddenLayers && pagedKV.ckvData[nextCacheIdx]) {
+    const nextKey = `sparseMlaPrefetchLayer_${nextCacheIdx}`;
+    if (nextCacheIdx < cfg.numHiddenLayers && pagedKV.ckvData[nextCacheIdx] && !state.extras.has(nextKey)) {
       const nextKData = pagedKV.kData[nextCacheIdx];
       const nextKScaleData = pagedKV.kScaleData[nextCacheIdx];
       const indexerStream = CP_GATHER_INDEXER_KV && nextKData?.parallelism === TensorParallelism.Row
@@ -3481,12 +3479,15 @@ export class ParallelOps implements DeviceOps {
 
       // due to mtp usage being potentially dynamic (mtp or incorrect usage), only clean up after the layer is finished and before a prefetch overwrites.
       {
-        const nextKey = `sparseMlaPrefetchLayer_${nextCacheIdx}`;
         this.cleanupSparseMlaPrefetch(state, nextKey);
       }
 
       const nextExtra: SparseMlaPrefetchExtra = { stream: nextStream, indexerStream };
       state.extras.set(`sparseMlaPrefetchLayer_${nextCacheIdx}`, nextExtra);
+      this.publishCkv(state, nextCacheIdx, nextStream.result);
+      if (indexerStream) {
+        this.publishIndexerK(state, nextCacheIdx, indexerStream.result.kData, indexerStream.result.kScaleData);
+      }
     }
 
     if (prefetched) {
@@ -3495,12 +3496,14 @@ export class ParallelOps implements DeviceOps {
     }
 
     // no prefetch was available, so gather the pages now (layer 0).
-    return this.gatherPages(
+    const gathered = this.gatherPages(
       kvCache, indices, indptr, state.lastPageLen,
       state.batchSize,
       paddedKvLen,
       state.kvTokenIndptrD, contextParallel,
     );
+    this.publishCkv(state, cacheIdx, gathered as ParallelTensor);
+    return gathered;
   }
 
   concatAndCacheDsMla(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | undefined, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
@@ -3594,6 +3597,38 @@ export class ParallelOps implements DeviceOps {
     let d = 0;
     for (let i = cacheIdx; i >= 0 && cfg.indexerTypes[i] === "shared"; i--) d++;
     return d;
+  }
+
+  private sparseMlaPaddedKvLen(state: ExecutionState): number {
+    const pagedKV = state.cache.getPagedKV();
+    const exactKvLen = pagedKV.sequences.reduce((sum, sequence) => sum + sequence.allocLen, 0);
+    const eagerKvLen = Math.ceil(exactKvLen / pagedKV.pageSize) * pagedKV.pageSize;
+    return Math.min(
+      pagedKV.maxPages * pagedKV.pageSize,
+      CaptureManager.capturing === undefined ? eagerKvLen : state.getGraphVariantPaddedKvLen(),
+    );
+  }
+
+  private completedPrefetch<T>(result: T): Disposable & { result: T; streamWaitEvent(): void; synchronize(): void } {
+    return {
+      result,
+      streamWaitEvent() {},
+      synchronize() {},
+      [Symbol.dispose]() {},
+    };
+  }
+
+  private publishCkv(state: ExecutionState, cacheIdx: number, ckv: ParallelTensor): void {
+    const setter = state.extras.get("setCkv") as ((cacheIdx: number, stream: SparseMlaPrefetchExtra["stream"]) => void) | undefined;
+    setter?.(cacheIdx, this.completedPrefetch(ckv.viewClone() as ParallelTensor));
+  }
+
+  private publishIndexerK(state: ExecutionState, cacheIdx: number, kData: ParallelTensor, kScaleData: ParallelTensor): void {
+    const setter = state.extras.get("setIndexerK") as ((cacheIdx: number, stream: SparseMlaPrefetchExtra["indexerStream"]) => void) | undefined;
+    setter?.(cacheIdx, this.completedPrefetch({
+      kData: kData.viewClone() as ParallelTensor,
+      kScaleData: kScaleData.viewClone() as ParallelTensor,
+    }));
   }
 
   private takeSparseMlaPrefetchStream(state: ExecutionState, key: string, field: "stream"): SparseMlaPrefetchExtra["stream"];
