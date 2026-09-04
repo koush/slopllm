@@ -55,6 +55,7 @@ describe("model loader arguments", () => {
   it("rejects executor overrides of the resident model layout", () => {
     const expected = parseModelArgs(["--arena", "48", "--gpus", "0,1", "--glm51", "--cp"]);
     validateWorkerModelArgs(["--arena", "48", "--gpus", "0,1", "--glm51", "--cp", "--port", "8000"], expected);
+    validateWorkerModelArgs(["--arena", "48", "--gpus", "0,1", "--glm51", "--port", "8000"], expected);
     assert.throws(
       () => validateWorkerModelArgs(["--arena", "48", "--gpus", "2,3", "--glm51", "--cp"], expected),
       /cannot override/,

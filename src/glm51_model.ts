@@ -494,7 +494,7 @@ export class Glm51Model extends ChatModel {
       const srcPitch = (qkNopeDim + vHeadDim) * inDim * eb;
       const tKNope = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", undefined, nopeParallelism);
       const vName = name.replace(".kv_b_proj.weight", ".v_proj.weight");
-      const vPar = this.contextParallel ? TensorParallelism.Replicated : TensorParallelism.Column;
+      const vPar = TensorParallelism.Replicated;
       using tVRaw = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", undefined, vPar);
       await Promise.all([
         tKNope.mmapLoad(mmapPtr, offset, tKNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),

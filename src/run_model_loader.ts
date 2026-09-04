@@ -61,7 +61,9 @@ export function parseWorkerCommand(value: unknown, sharedArgs: string[]): Worker
 
 export function validateWorkerModelArgs(commandArgs: string[], expected: ModelCliArgs): void {
   const actual = parseModelArgs(commandArgs);
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  const { cp: _actualCp, ...actualLoadArgs } = actual;
+  const { cp: _expectedCp, ...expectedLoadArgs } = expected;
+  if (JSON.stringify(actualLoadArgs) !== JSON.stringify(expectedLoadArgs)) {
     throw new Error("Executor arguments cannot override the loader's model, GPU, parallelism, or arena configuration");
   }
 }
