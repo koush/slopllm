@@ -2,13 +2,14 @@ import { CaptureManager } from "./capture-manager";
 import { DeviceOps, TensorParallelism } from "./device_ops";
 import { Tensor } from "./tensor";
 import { collectTensors, type TensorTree } from "./tensor-tree";
+import { Heap, type HeapKey } from "./heap";
 
 export class WorkspaceBase implements Disposable {
   readonly glm: DeviceOps;
   tensors = new Map<string, Tensor>();
   tracked = new Set<Tensor>();
   staged = new Set<Tensor>();
-  disposedDeviceByStream = new Map<number, Set<Tensor>>();
+  heapByKey = new Map<HeapKey, Heap>();
   disposedHost = new Set<Tensor>();
   synchronizingHost = new Set<Tensor>();
   frozen = false;
@@ -27,6 +28,9 @@ export class WorkspaceBase implements Disposable {
       this.disposedHost.add(tensor);
     }
     this.synchronizingHost.clear();
+    for (const key of [...this.heapByKey.keys()]) {
+      if (key !== undefined) this.drainHeap(key, undefined);
+    }
   }
 
   _runClear(keepExports = new Set<Tensor>(), callback: (tracked: Tensor) => boolean) {
@@ -104,36 +108,56 @@ export class WorkspaceBase implements Disposable {
     this.frozen = false;
   }
 
-  getDisposedDevicePool(stream: number): Set<Tensor> {
-    let pool = this.disposedDeviceByStream.get(stream);
-    if (!pool) {
-      pool = new Set<Tensor>();
-      this.disposedDeviceByStream.set(stream, pool);
+  getHeap(key: HeapKey): Heap {
+    let heap = this.heapByKey.get(key);
+    if (!heap) {
+      heap = new Heap();
+      this.heapByKey.set(key, heap);
     }
-    return pool;
+    return heap;
   }
 
   getDisposedPools(pinned: boolean): Set<Tensor>[] {
-    if (pinned) return [this.disposedHost];
-    const streams = [...this.glm.activeStreams].reverse();
-    return [...new Set(streams)].map(stream => this.getDisposedDevicePool(stream));
+    if (!pinned) throw new Error("Device tensors are recycled through heaps");
+    return [this.disposedHost];
   }
 
-  recycleDevice(tensor: Tensor): void {
-    this.getDisposedDevicePool(this.glm.currentStream).add(tensor);
+  private allocationLineage(lineage?: readonly HeapKey[]): HeapKey[] {
+    if (lineage !== undefined) {
+      if (lineage.length === 0) throw new Error("Allocation lineage must not be empty");
+      return [...new Set(lineage)];
+    }
+    const streams = [...this.glm.activeStreams].reverse();
+    return [...new Set<HeapKey>([...streams, undefined])];
+  }
+
+  recycleDevice(ptr: number, length: number, key: HeapKey): void {
+    this.getHeap(key).manage(ptr, length);
+  }
+
+  claimDevice(ptr: number, length: number, recycleKey: HeapKey | null): boolean {
+    const lineage = recycleKey === null ? undefined : [recycleKey, undefined];
+    for (const key of this.allocationLineage(lineage)) {
+      if (this.heapByKey.get(key)?.claim(ptr, length)) return true;
+    }
+    return false;
+  }
+
+  drainHeap(sourceKey: HeapKey, destinationKey: HeapKey): void {
+    if (sourceKey === destinationKey) return;
+    const source = this.heapByKey.get(sourceKey);
+    if (!source) return;
+    source.drainTo(this.getHeap(destinationKey));
+    this.heapByKey.delete(sourceKey);
   }
 
   disposeStream(stream: number, destinationStream: number): void {
     if (stream === destinationStream) return;
-    const streamPool = this.disposedDeviceByStream.get(stream);
-    if (!streamPool) return;
-    const destinationPool = this.getDisposedDevicePool(destinationStream);
-    for (const tensor of streamPool) destinationPool.add(tensor);
-    this.disposedDeviceByStream.delete(stream);
+    this.drainHeap(stream, destinationStream);
   }
 
-  alloc(shape: number[], type: string, name?: string, parallelism?: TensorParallelism): Tensor {
-    return this._alloc(shape, type, false, name, parallelism);
+  alloc(shape: number[], type: string, name?: string, parallelism?: TensorParallelism, lineage?: readonly HeapKey[]): Tensor {
+    return this._alloc(shape, type, false, name, parallelism, lineage);
   }
 
   ensureAlloc(shape: number[], type: string, name: string, parallelism?: TensorParallelism, fill?: number): Tensor {
@@ -183,7 +207,7 @@ export class WorkspaceBase implements Disposable {
     this.tracked.add(tensor);
   }
 
-  protected _alloc(shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor {
+  protected _alloc(shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism, lineage?: readonly HeapKey[]): Tensor {
     if (this.frozen) {
       throw new Error("Workspace is frozen");
     }
@@ -199,37 +223,48 @@ export class WorkspaceBase implements Disposable {
       }
     }
 
-    let best: Tensor | undefined;
-    let bestPool: Set<Tensor> | undefined;
-    const disposedPools = this.getDisposedPools(pinned);
-    for (const disposed of disposedPools) {
-      for (const t of disposed) {
-        if (t.view)
+    let tensor: Tensor;
+    const recycleKey = lineage === undefined ? null : this.allocationLineage(lineage)[0];
+    if (pinned) {
+      let best: Tensor | undefined;
+      for (const disposed of this.disposedHost) {
+        if (disposed.view)
           throw new Error("disposed tensor should not have a view");
-        if (!t.data)
+        if (!disposed.data)
           throw new Error("disposed tensor should have data");
-        if (t.allocSize >= bytes && (best === undefined || t.allocSize < best.allocSize)) {
+        if (disposed.allocSize >= bytes && (best === undefined || disposed.allocSize < best.allocSize)) {
           if (name === undefined) {
-            best = t;
-            bestPool = disposed;
+            best = disposed;
           }
         }
       }
-    }
-    let tensor: Tensor;
-    if (best !== undefined) {
-      if (best.allocSize !== bytes && this.allocLogger) {
-        console.warn(`Reusing disposed tensor of size ${best.allocSize} bytes for allocation of ${bytes} bytes (${shape.join("x")} ${type}${pinned ? " pinned" : ""}${parallelism ? ` ${parallelism}` : ""})`);
+      if (best !== undefined) {
+        if (best.allocSize !== bytes && this.allocLogger) {
+          console.warn(`Reusing disposed tensor of size ${best.allocSize} bytes for allocation of ${bytes} bytes (${shape.join("x")} ${type} pinned${parallelism ? ` ${parallelism}` : ""})`);
+        }
+        this.disposedHost.delete(best);
+        const data = best.data;
+        best.detachData();
+        tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, true, undefined, recycleKey);
+      } else {
+        tensor = this.glm.newTensor(this, shape, type, true, name, parallelism, recycleKey);
       }
-      bestPool!.delete(best);
-      const data = best.data;
-      best.detachData();
-      tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, pinned, undefined);
     } else {
-      if (this.allocLogger) {
-        console.warn(`Allocating new tensor ${name ?? "<unnamed>"} of size ${bytes} bytes (${shape.join("x")} ${type}${pinned ? " pinned" : ""}${parallelism ? ` ${parallelism}` : ""})`);
+      let allocation;
+      if (name === undefined) {
+        for (const key of this.allocationLineage(lineage)) {
+          allocation = this.heapByKey.get(key)?.tryAlloc(bytes);
+          if (allocation) break;
+        }
       }
-      tensor = this.glm.newTensor(this, shape, type, pinned, name, parallelism);
+      if (allocation) {
+        tensor = this.glm.wrapTensor(this, allocation.ptr, allocation.length, shape, type, false, undefined, recycleKey);
+      } else {
+        if (this.allocLogger) {
+          console.warn(`Allocating new tensor ${name ?? "<unnamed>"} of size ${bytes} bytes (${shape.join("x")} ${type}${parallelism ? ` ${parallelism}` : ""})`);
+        }
+        tensor = this.glm.newTensor(this, shape, type, false, name, parallelism, recycleKey);
+      }
     }
 
     if (name !== undefined) {
@@ -254,11 +289,6 @@ export class WorkspaceBase implements Disposable {
     for (const tensor of this.disposedHost) {
       tensor.free();
     }
-    for (const pool of this.disposedDeviceByStream.values()) {
-      for (const tensor of pool) {
-        tensor.free();
-      }
-    }
     for (const tensor of this.synchronizingHost) {
       tensor.free();
     }
@@ -268,7 +298,7 @@ export class WorkspaceBase implements Disposable {
     this.tensors.clear();
     this.tracked.clear();
     this.disposedHost.clear();
-    this.disposedDeviceByStream.clear();
+    this.heapByKey.clear();
     this.synchronizingHost.clear();
     this.staged.clear();
   }

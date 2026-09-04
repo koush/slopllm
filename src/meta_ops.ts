@@ -4,6 +4,7 @@ import { SafeTensorFile } from "./safetensors";
 import { MemcpyKind } from "./sampling";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
+import type { HeapKey } from "./heap";
 
 export class MetaTensor extends Tensor {
     private fakePinned?: Buffer;
@@ -284,15 +285,15 @@ export class MetaOps implements DeviceOps {
     [Symbol.dispose](): void {
     }
 
-    newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor {
+    newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism, recycleKey: HeapKey | null = null): Tensor {
         const size = Tensor.byteCount(shape, type);
         this.totalAllocs++;
         this.totalBytes += size;
-        return new MetaTensor(workspace, 0, size, shape, type, name, pinned, undefined);
+        return new MetaTensor(workspace, 0, size, shape, type, name, pinned, undefined, recycleKey);
     }
 
-    wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined): Tensor {
-        return new MetaTensor(workspace, data, allocSize, shape, type, undefined, pinned, view);
+    wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined, recycleKey: HeapKey | null = null): Tensor {
+        return new MetaTensor(workspace, data, allocSize, shape, type, undefined, pinned, view, recycleKey);
     }
 
     sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {

@@ -313,6 +313,7 @@ describe("ParallelTensor disposal and recycling", () => {
 
     const pt = ws.alloc([8, 4], "F32", undefined, TensorParallelism.Column) as ParallelTensor;
     const sws = po.shardWorkspacesFor(ws);
+    const shardRanges = pt.shards.map(shard => ({ ptr: shard.data, length: shard.allocSize }));
 
     assert.ok(ws.tracked.has(pt), "ParallelTensor should be in main workspace tracked");
     assert.equal(sws[0].tracked.size, 1, "shard 0 should be in device 0 workspace tracked");
@@ -321,9 +322,9 @@ describe("ParallelTensor disposal and recycling", () => {
     pt[Symbol.dispose]();
 
     assert.ok(!ws.tracked.has(pt), "ParallelTensor should be removed from main workspace tracked");
-    assert.ok(!ws.getDisposedDevicePool(0).has(pt), "ParallelTensor should NOT be in main workspace disposed");
-    assert.equal(sws[0].getDisposedDevicePool(0).size, 1, "shard 0 should be in device 0 workspace disposed");
-    assert.equal(sws[1].getDisposedDevicePool(0).size, 1, "shard 1 should be in device 1 workspace disposed");
+    assert.ok(!ws.heapByKey.has(0), "ParallelTensor should not contribute a range to the main workspace");
+    assert.ok(sws[0].heapByKey.get(0)?.contains(shardRanges[0].ptr, shardRanges[0].length), "shard 0 range should be recyclable");
+    assert.ok(sws[1].heapByKey.get(0)?.contains(shardRanges[1].ptr, shardRanges[1].length), "shard 1 range should be recyclable");
 
     ws.free();
     po.free();
@@ -350,8 +351,8 @@ describe("ParallelTensor disposal and recycling", () => {
     }
 
     const sws = po.shardWorkspacesFor(ws);
-    assert.equal(sws[0].getDisposedDevicePool(0).size, 1, "device 0 disposed should have 1 shard after scope exit");
-    assert.equal(sws[1].getDisposedDevicePool(0).size, 1, "device 1 disposed should have 1 shard after scope exit");
+    assert.ok(sws[0].heapByKey.get(0)?.contains(s0_data, 64), "device 0 should contain the released shard range");
+    assert.ok(sws[1].heapByKey.get(0)?.contains(s1_data, 64), "device 1 should contain the released shard range");
 
     const pt2 = ws.alloc([8, 4], "F32", undefined, TensorParallelism.Column) as ParallelTensor;
     assert.equal(pt2.shard(0).data, s0_data, "shard 0 buffer should be recycled");
@@ -378,8 +379,8 @@ describe("ParallelTensor disposal and recycling", () => {
     }
 
     const sws = po.shardWorkspacesFor(ws);
-    assert.equal(sws[0].getDisposedDevicePool(0).size, 1, "shard 0 should be recycled after using scope");
-    assert.equal(sws[1].getDisposedDevicePool(0).size, 1, "shard 1 should be recycled after using scope");
+    assert.ok(sws[0].heapByKey.has(0), "shard 0 should be recycled after using scope");
+    assert.ok(sws[1].heapByKey.has(0), "shard 1 should be recycled after using scope");
 
     ws.free();
     po.free();
@@ -409,8 +410,8 @@ describe("ParallelTensor disposal and recycling", () => {
     assert.equal(sws[1].tracked.size, 1);
 
     exported![Symbol.dispose]();
-    assert.equal(sws[0].getDisposedDevicePool(0).size, 1, "exported shard 0 should be recyclable");
-    assert.equal(sws[1].getDisposedDevicePool(0).size, 1, "exported shard 1 should be recyclable");
+    assert.ok(sws[0].heapByKey.has(0), "exported shard 0 should be recyclable");
+    assert.ok(sws[1].heapByKey.has(0), "exported shard 1 should be recyclable");
 
     ws.free();
     po.free();
@@ -418,7 +419,7 @@ describe("ParallelTensor disposal and recycling", () => {
     glm1.free();
   });
 
-  it("different requesting workspaces get isolated shard pools", () => {
+  it("different requesting workspaces get isolated shard heaps", () => {
     const glm0 = new GlmOps(0);
     const glm1 = new GlmOps(1);
     const po = new ParallelOps([glm0, glm1]);
@@ -440,11 +441,11 @@ describe("ParallelTensor disposal and recycling", () => {
     assert.equal(sws2[0].tracked.size, 1, "ws2 device 0 should have 1 tracked shard");
 
     pt1[Symbol.dispose]();
-    assert.equal(sws1[0].getDisposedDevicePool(0).size, 1, "ws1 device 0 should have 1 disposed after pt1 disposed");
-    assert.equal(sws2[0].getDisposedDevicePool(0).size, 0, "ws2 device 0 should have 0 disposed (unaffected)");
+    assert.ok(sws1[0].heapByKey.has(0), "ws1 device 0 should have a recyclable range after pt1 disposal");
+    assert.ok(!sws2[0].heapByKey.has(0), "ws2 device 0 should be unaffected");
 
     pt2[Symbol.dispose]();
-    assert.equal(sws2[0].getDisposedDevicePool(0).size, 1, "ws2 device 0 should have 1 disposed after pt2 disposed");
+    assert.ok(sws2[0].heapByKey.has(0), "ws2 device 0 should have a recyclable range after pt2 disposal");
 
     ws1.free();
     ws2.free();
@@ -455,14 +456,14 @@ describe("ParallelTensor disposal and recycling", () => {
 });
 
 describe("Workspace stream recycling", () => {
-  it("reuses eligible pools and returns disposed tensors to stream 0", () => {
+  it("reuses eligible heaps and returns disposed ranges to stream 0", () => {
     const glm = new GlmOps(0);
     const ws = new WorkspaceBase(glm);
 
     const main = ws.alloc([16], "F32");
     const mainData = main.data;
     main[Symbol.dispose]();
-    assert.equal(ws.getDisposedDevicePool(0).size, 1);
+    assert.ok(ws.heapByKey.get(0)?.contains(mainData, main.allocSize));
 
     let streamId = 0;
     const stream = glm.withStream(() => {
@@ -471,8 +472,8 @@ describe("Workspace stream recycling", () => {
       assert.equal(inherited.data, mainData, "alternate stream should reuse stream 0 allocation");
       inherited[Symbol.dispose]();
 
-      assert.equal(ws.getDisposedDevicePool(streamId).size, 1);
-      assert.equal(ws.getDisposedDevicePool(0).size, 0);
+      assert.ok(ws.heapByKey.get(streamId)?.contains(mainData, inherited.allocSize));
+      assert.ok(!ws.heapByKey.get(0)?.contains(mainData, inherited.allocSize));
 
       const sameStream = ws.alloc([16], "F32");
       assert.equal(sameStream.data, mainData, "alternate stream should immediately reuse its own allocation");
@@ -480,12 +481,12 @@ describe("Workspace stream recycling", () => {
     });
 
     assert.ok(glm.streamWorkspaces.get(streamId)?.has(ws));
-    assert.equal(ws.getDisposedDevicePool(streamId).size, 1);
-    assert.equal(ws.getDisposedDevicePool(0).size, 0);
+    assert.ok(ws.heapByKey.has(streamId));
+    assert.ok(!ws.heapByKey.get(0)?.contains(mainData, 64));
 
     stream.streamWaitEvent();
-    assert.ok(!ws.disposedDeviceByStream.has(streamId));
-    assert.equal(ws.getDisposedDevicePool(0).size, 1);
+    assert.ok(!ws.heapByKey.has(streamId));
+    assert.ok(ws.heapByKey.get(0)?.contains(mainData, 64));
     assert.ok(!glm.streamWorkspaces.has(streamId));
     stream[Symbol.dispose]();
     stream[Symbol.dispose]();
@@ -494,7 +495,7 @@ describe("Workspace stream recycling", () => {
     glm.free();
   });
 
-  it("returns nested stream pools through the active parent stream", () => {
+  it("returns nested stream heaps through the active parent stream", () => {
     const glm = new GlmOps(0);
     const ws = new WorkspaceBase(glm);
     let outerId = 0;
@@ -517,16 +518,16 @@ describe("Workspace stream recycling", () => {
 
       assert.deepEqual(glm.activeStreams, [0, outerId]);
       inner.streamWaitEvent();
-      assert.ok(!ws.disposedDeviceByStream.has(innerId));
-      assert.equal(ws.getDisposedDevicePool(outerId).size, 1);
+      assert.ok(!ws.heapByKey.has(innerId));
+      assert.ok(ws.heapByKey.has(outerId));
       assert.ok(glm.streamWorkspaces.get(outerId)?.has(ws));
       inner[Symbol.dispose]();
     });
 
     assert.deepEqual(glm.activeStreams, [0]);
     outer.streamWaitEvent();
-    assert.ok(!ws.disposedDeviceByStream.has(outerId));
-    assert.equal(ws.getDisposedDevicePool(0).size, 1);
+    assert.ok(!ws.heapByKey.has(outerId));
+    assert.ok(ws.heapByKey.has(0));
     outer[Symbol.dispose]();
 
     ws.free();

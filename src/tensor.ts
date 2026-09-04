@@ -3,6 +3,7 @@ import { MemcpyKind } from "./enums";
 import { getNativeAddon } from "./native-addon";
 import { SafeTensorFile } from "./safetensors";
 import { type WorkspaceBase } from "./workspace";
+import type { HeapKey } from "./heap";
 
 function numElements(shape: number[]): number {
   return shape.reduce((a, b) => a * b, 1);
@@ -26,7 +27,8 @@ export abstract class Tensor implements Disposable {
     public readonly type: string,
     public readonly name: string | undefined,
     public readonly pinned: boolean,
-    public readonly view: Tensor | undefined) {
+    public readonly view: Tensor | undefined,
+    public readonly recycleKey: HeapKey | null = null) {
     this.id = Tensor.nextId++;
     this.data = data;
     this.allocSize = allocSize;
@@ -133,7 +135,7 @@ export abstract class Tensor implements Disposable {
       throw new Error(`reshape: cannot reshape [${this.shape}] (${this.type}, ${currentBytes} bytes) to [${newShape}] (${outType}, ${targetBytes} bytes)`);
     }
 
-    const reshaped = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, newShape, outType, this.pinned, this);
+    const reshaped = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, newShape, outType, this.pinned, this, this.recycleKey);
     return reshaped;
   }
 
@@ -144,7 +146,7 @@ export abstract class Tensor implements Disposable {
   abstract free(): void;
 
   capture() {
-    const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, this.view?.capture());
+    const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, this.view?.capture(), this.recycleKey);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
     return captured;
@@ -178,18 +180,24 @@ export abstract class Tensor implements Disposable {
 
     if (this.view) {
       using uncapturedView = this.view.uncapture();
-      return this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, uncapturedView);
+      return this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, uncapturedView, this.recycleKey);
     }
 
-    for (const disposed of this.workspace.getDisposedPools(this.pinned)) {
-      for (const check of disposed) {
-        if (this.data === check.data && this.allocSize === check.allocSize) {
-          // console.warn('Tensor found in disposed set after uncapture check');
-          disposed.delete(check);
-          check.detachData();
-          const ret = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, undefined);
-          this.workspace.addTracked(ret);
-          return ret;
+    if (!this.pinned && this.workspace.claimDevice(this.data, this.allocSize, this.recycleKey)) {
+      const ret = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, false, undefined, this.recycleKey);
+      this.workspace.addTracked(ret);
+      return ret;
+    }
+    if (this.pinned) {
+      for (const disposed of this.workspace.getDisposedPools(true)) {
+        for (const check of disposed) {
+          if (this.data === check.data && this.allocSize === check.allocSize) {
+            disposed.delete(check);
+            check.detachData();
+            const ret = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, true, undefined, this.recycleKey);
+            this.workspace.addTracked(ret);
+            return ret;
+          }
         }
       }
     }
@@ -198,7 +206,8 @@ export abstract class Tensor implements Disposable {
   }
 
   _uncapture() {
-    const copy = this.workspace.alloc(this.shape, this.type, undefined, this.parallelism);
+    const lineage = this.recycleKey === null ? undefined : [this.recycleKey, undefined];
+    const copy = this.workspace.alloc(this.shape, this.type, undefined, this.parallelism, lineage);
     // possible to get the exact same allocation, maybe optimize for this in the future
     if (this.same(copy)) {
       return copy;
@@ -245,10 +254,13 @@ export abstract class Tensor implements Disposable {
       return;
     }
     if (this.data === 0) return;
-    if (this.pinned)
+    if (this.pinned) {
       this.workspace.synchronizingHost.add(this);
-    else
-      this.workspace.recycleDevice(this);
+    } else {
+      const recycleKey = this.recycleKey === null ? this.workspace.glm.currentStream : this.recycleKey;
+      this.workspace.recycleDevice(this.data, this.allocSize, recycleKey);
+      this.detachData();
+    }
   }
 
   removeTracking(): this {

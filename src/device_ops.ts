@@ -1,6 +1,7 @@
 import type { ExecutionState } from "./execution-workspace";
 import type { Tensor } from "./tensor";
 import type { WorkspaceBase } from "./workspace";
+import type { HeapKey } from "./heap";
 
 export enum MaskMode {
   None = 0,
@@ -44,8 +45,8 @@ export function notifySynchronizedWorkspaces(workspaces: WeakRef<WorkspaceBase>[
 export interface DeviceOps extends Disposable {
   readonly worldSize: number;
   synchronizeListeners: WeakRef<WorkspaceBase>[];
-  newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): Tensor;
-  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined): Tensor;
+  newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism, recycleKey?: HeapKey | null): Tensor;
+  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined, recycleKey?: HeapKey | null): Tensor;
   synchronize(): void;
   synchronizeAsync(): Promise<void>;
   synchronizeStream(streamIdx: number): void;

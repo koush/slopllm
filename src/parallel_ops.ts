@@ -9,6 +9,7 @@ import { SafeTensorFile } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
+import type { HeapKey } from "./heap";
 
 // Master switch for the CP "gather CKV" path in sparse MLA prefill. When true,
 // CP prefill gathers CKV into a flat Replicated buffer and emits flat slots to
@@ -54,8 +55,9 @@ export class ParallelTensor extends Tensor {
     name: string | undefined,
     pinned: boolean,
     view: ParallelTensor | undefined,
+    recycleKey: HeapKey | null = null,
   ) {
-    super(workspace, 0, 0, shape, type, name, pinned, view);
+    super(workspace, 0, 0, shape, type, name, pinned, view, recycleKey);
     this.parallelOps = parallelOps;
     this.devices = parallelOps.devices;
     this.parallelism = parallelism;
@@ -117,7 +119,7 @@ export class ParallelTensor extends Tensor {
 
   capture() {
     const capturedShards = this.shards.map(s => s.capture());
-    const captured = new ParallelTensor(this.workspace, this.parallelOps, this.parallelism, capturedShards, this.shape, this.type, undefined, this.pinned, undefined);
+    const captured = new ParallelTensor(this.workspace, this.parallelOps, this.parallelism, capturedShards, this.shape, this.type, undefined, this.pinned, undefined, this.recycleKey);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
     return captured;
@@ -245,12 +247,10 @@ export class ParallelTensor extends Tensor {
     // (no slow P2P reads), bandwidth-optimal at ~2N/GPU.
     //
     // No LEADING barrier is needed even though the scatter writes into peers'
-    // staging: staging is allocated from the group's private workspace
-    // (group.workspaces), which only barrier-bracketed P2P ops ever touch. An
-    // address handed out this iteration was last used (and freed) after a prior
-    // P2P barrier, so no peer can still be writing it. (Staging on the shared
-    // caller workspace WOULD race a lagging peer's unrelated in-flight kernel on
-    // the same recycled address -- that is the bug the private workspace fixes.)
+    // staging: the group's heap key isolates these ranges from ordinary stream
+    // reuse until group synchronization makes them generally reusable again.
+    // An address handed out this iteration was last released after a prior P2P
+    // barrier, so no peer can still be writing it.
     // Too big for the P2P group, or an uneven split, falls back to NCCL.
     if (count > 65536 * 4)
       return false;
@@ -267,7 +267,7 @@ export class ParallelTensor extends Tensor {
     // GPU j's contribution to this rank's chunk.
     const staging: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      staging.push(group.workspaces[i].alloc(this.shape, this.type));
+      staging.push(group.alloc(this.shards[i].workspace, this.shape, this.type));
     }
 
     // Phase 1: scatter. GPU i writes chunk k to peer k's staging slot i. The
@@ -429,7 +429,7 @@ export class ParallelTensor extends Tensor {
 
     const shards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      shards.push(group.workspaces[i].alloc(this.shape, this.type));
+      shards.push(group.alloc(this.shards[i].workspace, this.shape, this.type));
     }
 
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
@@ -2014,7 +2014,8 @@ class P2PAllReduceGroup {
   private readonly flagPtrs: number[];
   readonly worldSize: number;
   private readonly devices: readonly GlmOps[];
-  workspaces: WorkspaceBase[];
+  private readonly usedWorkspaces = new Set<WorkspaceBase>();
+  private readonly scratch = new Set<Tensor>();
 
   constructor(devices: readonly GlmOps[]) {
     this.worldSize = devices.length;
@@ -2034,7 +2035,13 @@ class P2PAllReduceGroup {
       addon.p2pSetPeers(this.devices[i].ctx, this.instances[i], this.flagPtrs);
     }
 
-    this.workspaces = devices.map(d => new WorkspaceBase(d));
+  }
+
+  alloc(workspace: WorkspaceBase, shape: number[], type: string): Tensor {
+    this.usedWorkspaces.add(workspace);
+    const tensor = workspace.alloc(shape, type, undefined, undefined, [this, undefined]);
+    this.scratch.add(tensor);
+    return tensor;
   }
 
   /**
@@ -2050,15 +2057,21 @@ class P2PAllReduceGroup {
   /** Release the sources retained since the previous barrier on this group. */
   private cleanupSources(): void {
     while (this.sources.length) {
-      using _src = this.sources.pop()!;
+      const source = this.sources.pop()!;
+      this.scratch.delete(source);
+      source[Symbol.dispose]();
     }
+  }
+
+  private cleanupScratch(): void {
+    for (const tensor of this.scratch) tensor[Symbol.dispose]();
+    this.scratch.clear();
   }
 
   free(): void {
     this.cleanupSources();
-    for (const ws of this.workspaces) {
-      ws.free();
-    }
+    this.cleanupScratch();
+    this.releaseWorkspaceHeaps();
     for (const inst of this.instances) {
       getNativeAddon().p2pDestroyInstance(inst);
     }
@@ -2074,9 +2087,15 @@ class P2PAllReduceGroup {
   /** Release resources after all device streams have been synchronized. */
   onSynchronized(): void {
     this.cleanupSources();
-    for (const workspace of this.workspaces) {
-      workspace.clearTracking();
+    this.cleanupScratch();
+    this.releaseWorkspaceHeaps();
+  }
+
+  private releaseWorkspaceHeaps(): void {
+    for (const workspace of this.usedWorkspaces) {
+      workspace.drainHeap(this, undefined);
     }
+    this.usedWorkspaces.clear();
   }
 
   /** Arrive phase: each rank publishes its flag (release). No spinning. */
@@ -2505,8 +2524,8 @@ export class ParallelOps implements DeviceOps {
     const stageV: Tensor[] = [];
     const stageLse: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      stageV.push(group.workspaces[i].alloc([this.worldSize * batchSize * shardNHeads, vHeadDim], "BF16"));
-      stageLse.push(group.workspaces[i].alloc([this.worldSize * batchSize, shardNHeads], "F32"));
+      stageV.push(group.alloc(shardWss[i], [this.worldSize * batchSize * shardNHeads, vHeadDim], "BF16"));
+      stageLse.push(group.alloc(shardWss[i], [this.worldSize * batchSize, shardNHeads], "F32"));
     }
 
     // Phase 1: scatter. Destination pointers are rotated by rank here; the
@@ -2792,20 +2811,20 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism): ParallelTensor {
+  newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism, recycleKey: HeapKey | null = null): ParallelTensor {
     const par = parallelism ?? TensorParallelism.Replicated;
     const ss = this.shardShape(shape, par);
     const shardWss = this.getShardWorkspaces(workspace);
     const shards: Tensor[] = shardWss.map(ws =>
-      pinned ? ws.allocPinned(ss, type, name) : ws.alloc(ss, type, name),
+      pinned ? ws.allocPinned(ss, type, name) : ws.alloc(ss, type, name, undefined, recycleKey === null ? undefined : [recycleKey, undefined]),
     );
-    return new ParallelTensor(workspace, this, par, shards, shape, type, name, pinned, undefined);
+    return new ParallelTensor(workspace, this, par, shards, shape, type, name, pinned, undefined, recycleKey);
   }
 
-  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: ParallelTensor | undefined): Tensor {
+  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: ParallelTensor | undefined, recycleKey: HeapKey | null = null): Tensor {
     if (!view)
       throw new Error("ParallelOps.wrapTensor not supported; tensor recycling happens at shard level");
-    return new ParallelTensor(workspace, this, view.parallelism, view.shards, shape, type, undefined, pinned, view);
+    return new ParallelTensor(workspace, this, view.parallelism, view.shards, shape, type, undefined, pinned, view, recycleKey);
   }
 
   sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
@@ -2866,7 +2885,7 @@ export class ParallelOps implements DeviceOps {
         }
         break;
     }
-    const pt = new ParallelTensor(workspace, this, parallelism, shards, fullShape, type, undefined, !!view?.pinned, view);
+    const pt = new ParallelTensor(workspace, this, parallelism, shards, fullShape, type, undefined, !!view?.pinned, view, view ? view.recycleKey : null);
     workspace.addTracked(pt);
     return pt;
   }
@@ -3958,8 +3977,8 @@ export class ParallelOps implements DeviceOps {
     const ownerQ = totalQ / W;
     const ownerValueBytes = ownerQ * topk * 2;
     const ownerIndexBytes = ownerQ * topk * 4;
-    const stagedValues = group.workspaces.map(ws => ws.alloc([W, ownerQ, topk], "BF16"));
-    const stagedIndices = group.workspaces.map(ws => ws.alloc([W, ownerQ, topk], "I32"));
+    const stagedValues = localValues.shards.map(shard => group.alloc(shard.workspace, [W, ownerQ, topk], "BF16"));
+    const stagedIndices = localIndices.shards.map(shard => group.alloc(shard.workspace, [W, ownerQ, topk], "I32"));
     const addon = getNativeAddon();
 
     for (let source = 0; source < W; source++) {

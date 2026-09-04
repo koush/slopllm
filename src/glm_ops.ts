@@ -1,5 +1,5 @@
-import { Allocator, ArenaAllocator } from "./allocator";
 import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
+import { Heap, type HeapAllocation, type HeapKey } from "./heap";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
 import { Tensor } from "./tensor";
@@ -44,12 +44,12 @@ function ptr(t: Tensor | undefined): number {
 
 
 export class GlmTensor extends Tensor {
-  constructor(workspace: WorkspaceBase, public readonly glm: GlmOps, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean, view: GlmTensor | undefined) {
-    super(workspace, data, allocSize, shape, type, name, pinned, view);
+  constructor(workspace: WorkspaceBase, public readonly glm: GlmOps, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean, view: GlmTensor | undefined, recycleKey: HeapKey | null = null) {
+    super(workspace, data, allocSize, shape, type, name, pinned, view, recycleKey);
   }
 
   [Symbol.dispose](): void {
-    if (this.canDispose() && this.glm.currentStream !== 0) {
+    if (this.canDispose() && this.recycleKey === null && this.glm.currentStream !== 0) {
       let workspaces = this.glm.streamWorkspaces.get(this.glm.currentStream);
       if (!workspaces) {
         workspaces = new Set<WorkspaceBase>();
@@ -64,8 +64,6 @@ export class GlmTensor extends Tensor {
     if (this.data !== 0) {
       if (this.pinned) {
         getNativeAddon().freePinned(this.data);
-      } else if (!this.view) {
-        this.glm.allocator.free(this.data);
       }
       this.detachData();
     }
@@ -707,11 +705,13 @@ export class GlmTensor extends Tensor {
 }
 
 export class GlmOps implements DeviceOps {
+  private static readonly GREEDY_ALLOCATION_GUARD_BYTES = 4;
   readonly worldSize = 1;
   synchronizeListeners: WeakRef<WorkspaceBase>[] = [];
   ctx: number;
   device: number;
-  allocator: Allocator;
+  readonly heap = new Heap();
+  private readonly nativeAllocations = new Set<number>();
   readonly arenaBase?: number;
   readonly arenaSize?: number;
   private readonly arenaOwnership?: "owned" | "ipc-imported";
@@ -726,7 +726,7 @@ export class GlmOps implements DeviceOps {
     this.device = deviceId;
 
     if (arenaGb) {
-      const size = arenaGb * 1024 * 1024 * 1024;
+      const size = Math.floor(arenaGb * 1024 * 1024 * 1024);
       const ipcHandleEnv = process.env[`GLM_ARENA_IPC_HANDLE_${deviceId}`];
       let base: number;
       if (ipcHandleEnv === undefined) {
@@ -757,18 +757,7 @@ export class GlmOps implements DeviceOps {
       }
       this.arenaBase = base;
       this.arenaSize = size;
-      this.allocator = new ArenaAllocator(base, size);
-    }
-    else {
-      this.allocator = {
-        alloc: (size: number) => {
-          if (this.capturing) {
-            console.warn("Warning: allocating during capture will fail.");
-          }
-          return getNativeAddon().alloc(this.ctx, size)
-        },
-        free: (ptr: number) => getNativeAddon().freeBuf(this.ctx, ptr),
-      }
+      this.heap.manage(base, size);
     }
   }
 
@@ -781,6 +770,9 @@ export class GlmOps implements DeviceOps {
       if (this.arenaBase !== undefined) {
         if (this.arenaOwnership === "ipc-imported") native.cudaIpcCloseMemHandle(ctx, this.arenaBase);
         else if (this.arenaOwnership === "owned") native.freeBuf(ctx, this.arenaBase);
+      } else {
+        for (const ptr of this.nativeAllocations) native.freeBuf(ctx, ptr);
+        this.nativeAllocations.clear();
       }
     } finally {
       native.free(ctx);
@@ -797,7 +789,7 @@ export class GlmOps implements DeviceOps {
   }
 
   arenaLayoutSignature(): string | undefined {
-    return this.allocator instanceof ArenaAllocator ? this.allocator.layoutSignature() : undefined;
+    return this.arenaBase === undefined ? undefined : this.heap.layoutSignature();
   }
 
   get usesIpcArena(): boolean {
@@ -814,14 +806,34 @@ export class GlmOps implements DeviceOps {
     return p;
   }
 
-  newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, _parallelism?: TensorParallelism): GlmTensor {
-    const size = Tensor.byteCount(shape, type);
-    const data = pinned ? this.allocPinned(size) : this.allocator.alloc(size);
-    return new GlmTensor(workspace, this, data, size, shape, type, name, pinned, undefined);
+  private allocDevice(size: number): HeapAllocation {
+    const existing = this.heap.tryAlloc(size);
+    if (existing) return existing;
+    if (this.arenaBase !== undefined) {
+      throw new Error(`Arena heap OOM: unable to allocate ${size} bytes`);
+    }
+    if (this.capturing) {
+      console.warn("Warning: allocating during capture will fail.");
+    }
+    const nativeSize = size + GlmOps.GREEDY_ALLOCATION_GUARD_BYTES;
+    if (!Number.isSafeInteger(nativeSize)) throw new Error(`Device allocation size is too large: ${size}`);
+    const ptr = getNativeAddon().alloc(this.ctx, nativeSize);
+    if (!Number.isSafeInteger(ptr) || ptr <= 0) {
+      throw new Error(`Device allocation failed for ${nativeSize} bytes`);
+    }
+    this.nativeAllocations.add(ptr);
+    this.heap.manage(ptr, size);
+    return this.heap.alloc(size);
   }
 
-  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: GlmTensor | undefined): Tensor {
-    return new GlmTensor(workspace, this, data, allocSize, shape, type, undefined, pinned, view);
+  newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, _parallelism?: TensorParallelism, recycleKey: HeapKey | null = null): GlmTensor {
+    const size = Tensor.byteCount(shape, type);
+    const allocation = pinned ? { ptr: this.allocPinned(size), length: size } : this.allocDevice(size);
+    return new GlmTensor(workspace, this, allocation.ptr, allocation.length, shape, type, name, pinned, undefined, recycleKey);
+  }
+
+  wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: GlmTensor | undefined, recycleKey: HeapKey | null = null): Tensor {
+    return new GlmTensor(workspace, this, data, allocSize, shape, type, undefined, pinned, view, recycleKey);
   }
 
   sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
