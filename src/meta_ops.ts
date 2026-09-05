@@ -337,6 +337,22 @@ export class MetaOps implements DeviceOps {
         };
     }
 
+    projectMlaQuery(state: ExecutionState, _kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): { qAbsorbed: Tensor, qPe: Tensor } {
+        using qPeStream = this.withStream(() => {
+            using qPeLin = qNormed.linear(qPeWeight);
+            return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, qkRopeDim, ropeInterleave);
+        });
+        using qAbsorbedStream = this.withStream(() => {
+            using qAbsorbedLin = qNormed.linear(absorbedWeight);
+            return state.isDecode
+                ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
+                : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
+        });
+        qAbsorbedStream.streamWaitEvent();
+        qPeStream.streamWaitEvent();
+        return { qAbsorbed: qAbsorbedStream.result, qPe: qPeStream.result };
+    }
+
     kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void {
     }
 

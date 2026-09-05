@@ -3021,6 +3021,32 @@ export class ParallelOps implements DeviceOps {
     };
   }
 
+  projectMlaQuery(state: ExecutionState, kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): { qAbsorbed: Tensor, qPe: Tensor } {
+    using qPeStream = this.withStream(() => {
+      using qPeLin = qNormed.linear(qPeWeight);
+      return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, qkRopeDim, ropeInterleave);
+    });
+    using qAbsorbedStream = this.withStream(() => {
+      using qAbsorbedLin = qNormed.linear(absorbedWeight);
+      return state.isDecode
+        ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
+        : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
+    });
+    qAbsorbedStream.streamWaitEvent();
+    qPeStream.streamWaitEvent();
+    const qAbsorbed = qAbsorbedStream.result as ParallelTensor;
+    const qPe = qPeStream.result as ParallelTensor;
+    const gatherQ = this.cast(kvCache).parallelism === TensorParallelism.Row;
+    if (!gatherQ) {
+      return { qAbsorbed, qPe };
+    }
+
+    using localQAbsorbed = qAbsorbed;
+    using localQPe = qPe;
+    const gathered = this.allGatherMultiple([localQAbsorbed, localQPe], qNormed.workspace);
+    return { qAbsorbed: gathered[0], qPe: gathered[1] };
+  }
+
   private cast(tensor: Tensor): ParallelTensor {
     return tensor as ParallelTensor;
   }
@@ -3730,15 +3756,13 @@ export class ParallelOps implements DeviceOps {
     const pEffKvCache = this.cast(kvCache);
     const nonCp = pEffKvCache.parallelism !== TensorParallelism.Row;
     const oPar = nonCp ? TensorParallelism.Row : TensorParallelism.PartialSoftmax;
-    const gatheredQ = nonCp
-      ? [pQAbsorbed.viewClone() as ParallelTensor, pQPe.viewClone() as ParallelTensor]
-      : this.allGatherMultiple([pQAbsorbed, pQPe], pQAbsorbed.workspace);
-    using gatheredQAbsorbed = gatheredQ[0];
-    using gatheredQPe = gatheredQ[1];
+    if (!nonCp && (pQAbsorbed.parallelism !== TensorParallelism.Replicated || pQPe.parallelism !== TensorParallelism.Replicated)) {
+      throw new Error(`sparseMlaPrefill: CP queries must already be gathered, got qAbsorbed=${pQAbsorbed.parallelism}, qPe=${pQPe.parallelism}`);
+    }
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaPrefill(state, gatheredQAbsorbed.shards[i], gatheredQPe.shards[i], pEffKvCache.shards[i], pIndices.shards[i], topk, smScale, pTopkLength.shards[i], pageIndptrD, lastPageLen, kvTokenIndptrD);
+      const result = this.devices[i].sparseMlaPrefill(state, pQAbsorbed.shards[i], pQPe.shards[i], pEffKvCache.shards[i], pIndices.shards[i], topk, smScale, pTopkLength.shards[i], pageIndptrD, lastPageLen, kvTokenIndptrD);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
@@ -3759,15 +3783,13 @@ export class ParallelOps implements DeviceOps {
     const headDim = pQAbsorbed.shape[2];
     const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "sparseMlaDecode numHeads");
     const oPar = contextParallel ? TensorParallelism.PartialSoftmax : TensorParallelism.Row;
-    const gatheredQ = contextParallel
-      ? this.allGatherMultiple([pQAbsorbed, pQPe], pQAbsorbed.workspace)
-      : [pQAbsorbed.viewClone() as ParallelTensor, pQPe.viewClone() as ParallelTensor];
-    using gatheredQAbsorbed = gatheredQ[0];
-    using gatheredQPe = gatheredQ[1];
+    if (contextParallel && (pQAbsorbed.parallelism !== TensorParallelism.Replicated || pQPe.parallelism !== TensorParallelism.Replicated)) {
+      throw new Error(`sparseMlaDecode: CP queries must already be gathered, got qAbsorbed=${pQAbsorbed.parallelism}, qPe=${pQPe.parallelism}`);
+    }
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaDecode(state, gatheredQAbsorbed.shards[i], gatheredQPe.shards[i], pKvCache.shards[i], pIndices.shards[i], topk, numSplits, smScale, chunksPerBlock, pTopkLength?.shards[i]);
+      const result = this.devices[i].sparseMlaDecode(state, pQAbsorbed.shards[i], pQPe.shards[i], pKvCache.shards[i], pIndices.shards[i], topk, numSplits, smScale, chunksPerBlock, pTopkLength?.shards[i]);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }

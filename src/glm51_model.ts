@@ -755,23 +755,21 @@ export class Glm51Model extends ChatModel {
         );
       });
 
-    using qPeRStream = this.glm.withStream(() => {
-      using qPeLin = qNormed.linear(this.tensors.get(`${pfx}.q_pe_proj.weight`)!);
-      return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, S, B, qkRopeDim, cfg.ropeInterleave);
-    });
-
-    using qAbsorbedRStream = this.glm.withStream(() => {
-      using qAbsorbedLin = qNormed.linear(this.tensors.get(`${pfx}.absorbed.weight`)!);
-      return state.isDecode
-        ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, S, B, kvLoraRank)
-        : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, S, B, kvLoraRank);
-    });
-
     const cache = kvcache.result;
+    using qStream = this.glm.withStream(() => {
+      return this.glm.projectMlaQuery(
+        state, cache.ckv!, qNormed,
+        this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
+        this.tensors.get(`${pfx}.absorbed.weight`)!,
+        cos, sin,
+        qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,
+      );
+    });
+
     using ckv = cache.ckv;
     using kpe = cache.kpe;
-    using qAbsorbedR = qAbsorbedRStream.result;
-    using qPeR = qPeRStream.result;
+    using qAbsorbedR = qStream.result.qAbsorbed;
+    using qPeR = qStream.result.qPe;
 
     idxQStream?.streamWaitEvent();
     const topkResult = idxQStream?.result;
@@ -831,8 +829,7 @@ export class Glm51Model extends ChatModel {
     using slotsStream = sparseSlots?.stream;
 
     kvcache.streamWaitEvent();
-    qAbsorbedRStream.streamWaitEvent();
-    qPeRStream.streamWaitEvent();
+    qStream.streamWaitEvent();
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     {
