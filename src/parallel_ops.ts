@@ -812,8 +812,9 @@ export class ParallelTensor extends Tensor {
       return this.parallelOps.wrapShards(this.workspace, outShards, [batch * M, N], this.type, TensorParallelism.Replicated);
     }
 
-    using gatheredA = this.allGather(this.workspace);
-    using gatheredB = pB.allGather(pB.workspace);
+    const gathered = this.parallelOps.allGatherMultiple([this, pB], this.workspace);
+    using gatheredA = gathered[0];
+    using gatheredB = gathered[1];
     return gatheredA.bmm(gatheredB, batch, M, N, K, transA, transB);
   }
 
@@ -1386,8 +1387,9 @@ export class ParallelTensor extends Tensor {
       return;
     }
 
-    using gatheredThis = this.allGather(this.workspace);
-    using gatheredGate = pGate.allGather(pGate.workspace);
+    const gathered = this.parallelOps.allGatherMultiple([this, pGate], this.workspace);
+    using gatheredThis = gathered[0];
+    using gatheredGate = gathered[1];
     gatheredThis.gateSigmoidMul(gatheredGate, numHeads, headDim);
     for (let i = 0; i < this.worldSize; i++) {
       this.shards[i].memcpy((gatheredThis as ParallelTensor).shards[i]);
@@ -1567,8 +1569,9 @@ export class ParallelTensor extends Tensor {
       }
       using localValues = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch, k * this.worldSize], this.type, TensorParallelism.Row);
       using localIndices = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch, k * this.worldSize], "I32", TensorParallelism.Row);
-      using gatheredValues = localValues.allGather(this.workspace);
-      using gatheredIndices = localIndices.allGather(this.workspace);
+      const gathered = this.parallelOps.allGatherMultiple([localValues, localIndices], this.workspace);
+      using gatheredValues = gathered[0];
+      using gatheredIndices = gathered[1];
       const kTotal = k * this.worldSize;
       const { values: rankValues, indices: rankIndices } = gatheredValues.topk(k, kTotal);
       using _rankIndices = rankIndices as ParallelTensor;
@@ -3192,24 +3195,11 @@ export class ParallelOps implements DeviceOps {
     let gatheredQNope: ParallelTensor | undefined;
     let gatheredQPe: ParallelTensor | undefined;
     if (contextParallel) {
-      if (pQNope.parallelism === TensorParallelism.Row) {
-        if (pQPe.parallelism === TensorParallelism.Row) {
-          using stream = this.withStream(() => {
-            gatheredQPe = pQPe.allGather(pQPe.workspace);
-            pQPe = gatheredQPe;
-          });
-
-          gatheredQNope = pQNope.allGather(pQNope.workspace);
-          pQNope = gatheredQNope;
-
-          stream.streamWaitEvent();
-        }
-        else {
-          gatheredQNope = pQNope.allGather(pQNope.workspace);
-          pQNope = gatheredQNope;
-          gatheredQPe = pQPe;
-        }
-      }
+      const gathered = this.allGatherMultiple([pQNope, pQPe], pQNope.workspace);
+      gatheredQNope = gathered[0];
+      gatheredQPe = gathered[1];
+      pQPe = gatheredQPe;
+      pQNope = gatheredQNope;
     }
     const pCustomMask = customMask ? this.cast(customMask) : undefined;
     const pMaskIndptr = maskIndptr ? this.cast(maskIndptr) : undefined;
@@ -3283,14 +3273,11 @@ export class ParallelOps implements DeviceOps {
     let gatheredQNope: ParallelTensor | undefined;
     let gatheredQPe: ParallelTensor | undefined;
     if (contextParallel) {
-      if (pQNope.parallelism === TensorParallelism.Row) {
-        gatheredQNope = pQNope.allGather(pQNope.workspace);
-        pQNope = gatheredQNope;
-      }
-      if (pQPe.parallelism === TensorParallelism.Row) {
-        gatheredQPe = pQPe.allGather(pQPe.workspace);
-        pQPe = gatheredQPe;
-      }
+      const gathered = this.allGatherMultiple([pQNope, pQPe], pQNope.workspace);
+      gatheredQNope = gathered[0];
+      gatheredQPe = gathered[1];
+      pQPe = gatheredQPe;
+      pQNope = gatheredQNope;
     }
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
@@ -3640,9 +3627,9 @@ export class ParallelOps implements DeviceOps {
   private completedPrefetch<T>(result: T): Disposable & { result: T; streamWaitEvent(): void; synchronize(): void } {
     return {
       result,
-      streamWaitEvent() {},
-      synchronize() {},
-      [Symbol.dispose]() {},
+      streamWaitEvent() { },
+      synchronize() { },
+      [Symbol.dispose]() { },
     };
   }
 
@@ -4087,8 +4074,9 @@ export class ParallelOps implements DeviceOps {
       if (ownerMerged) {
         return ownerMerged;
       }
-      using gatheredValues = localValues.allGather(idxQ.workspace);
-      using gatheredIndices = localIndices.allGather(idxQ.workspace);
+      const gathered = this.allGatherMultiple([localValues, localIndices], idxQ.workspace);
+      using gatheredValues = gathered[0];
+      using gatheredIndices = gathered[1];
       const kTotal = topk * W;
       const { values: mergedValues, indices: mergedIndices } = gatheredValues.topk(topk, kTotal);
       using _mergedIndices = mergedIndices as ParallelTensor;
