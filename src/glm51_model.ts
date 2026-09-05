@@ -230,8 +230,8 @@ function ensureMtpVerificationPositionIds(ws: ExecutionWorkspace, originalAllocL
   const batchSize = originalAllocLens.length;
   const numNodes = mtpTotalTreeNodes(topks);
   const key = `glm51_mtp_verify_pos_${numNodes}`;
-  const positionIds = ws.ensureAlloc([ws.maxBatch * ws.maxSeqLen], "I32", key);
-  const positionIdsH = ws.ensureAllocPinned([ws.maxBatch * ws.maxSeqLen], "I32", `${key}_host`);
+  const positionIds = ws.ensureAlloc([ws.maxBatch * numNodes], "I32", key);
+  const positionIdsH = ws.ensureAllocPinned([ws.maxBatch * numNodes], "I32", `${key}_host`);
   const boundaries = mtpDepthBoundaries(topks);
   positionIdsH.withPinnedBuffer(buf => {
     let offset = 0;
@@ -1126,7 +1126,7 @@ export class Glm51Model extends ChatModel {
         using sharedSlots = new UsingHolder<Tensor>(undefined!);
         using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
         using hiddenStates = this.forwardModel(state, sharedSlots, sharedSlotsLength);
-        using nextDevice = ws.alloc([ws.maxBatch], "I32");
+        using nextDevice = ws.alloc([batchSize], "I32");
         const nextBuffer = Buffer.alloc(batchSize * I32);
         for (let batch = 0; batch < batchSize; batch++) {
           nextBuffer.writeInt32LE(nextTokens[batch], batch * I32);
@@ -1165,7 +1165,7 @@ export class Glm51Model extends ChatModel {
         using sharedSlots = new UsingHolder<Tensor>(undefined!);
         using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
         using hiddenStates = yield* model.forwardPhased(state, sharedSlots, sharedSlotsLength);
-        using nextDevice = ws.alloc([ws.maxBatch], "I32");
+        using nextDevice = ws.alloc([batchSize], "I32");
         const nextBuffer = Buffer.alloc(batchSize * I32);
         for (let batch = 0; batch < batchSize; batch++) {
           nextBuffer.writeInt32LE(nextTokens[batch], batch * I32);
@@ -1214,9 +1214,9 @@ export class Glm51Model extends ChatModel {
       run: () => {
         using sharedSlots = new UsingHolder<Tensor>(undefined!);
         using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
-        const seed = ws.alloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16");
-        const targetHost = ws.allocPinned([ws.maxBatch], "I32");
-        using targetDevice = ws.alloc([ws.maxBatch], "I32");
+        const seed = ws.alloc([batchSize * maxWidth, this.cfg.hiddenSize], "BF16");
+        const targetHost = ws.allocPinned([batchSize], "I32");
+        using targetDevice = ws.alloc([batchSize], "I32");
         using hiddenStates = this.forwardModel(prefillState, sharedSlots, sharedSlotsLength);
         using logits = prefillState.computeLogits(hiddenStates, this);
         using target = selectTokens(logits);
@@ -1305,7 +1305,7 @@ export class Glm51Model extends ChatModel {
       captureKey: [],
       timingName: "draft",
       run: (inputs) => {
-        const treeHost = ws.allocPinned([ws.maxBatch * numTreeNodes], "I32");
+        const treeHost = ws.allocPinned([batchSize * numTreeNodes], "I32");
         this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
         return { treeHost };
       },
@@ -1367,8 +1367,8 @@ export class Glm51Model extends ChatModel {
       captureKey: ["glm51-mtp-verify", topks.join(","), selectTokens.captureKey ?? "greedy"],
       timingName: "verification",
       run: () => {
-        const seed = ws.alloc([ws.maxBatch * maxWidth, this.cfg.hiddenSize], "BF16");
-        const mtpHiddenStaging = ws.alloc([ws.maxBatch * numVerificationTokens, this.cfg.hiddenSize], "BF16");
+        const seed = ws.alloc([batchSize * maxWidth, this.cfg.hiddenSize], "BF16");
+        const mtpHiddenStaging = ws.alloc([batchSize * numVerificationTokens, this.cfg.hiddenSize], "BF16");
         using slots = new UsingHolder<Tensor>(undefined!);
         using slotsLength = new UsingHolder<Tensor>(undefined!);
         const kvCacheLayers: MtpVerificationArtifacts["kvCacheLayers"] = [];

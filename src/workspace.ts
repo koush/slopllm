@@ -143,6 +143,20 @@ export class WorkspaceBase implements Disposable {
     return false;
   }
 
+  describeDeviceRange(ptr: number, length: number): string {
+    const heaps = [...this.heapByKey.entries()].map(([key, heap]) => {
+      const keyName = key === undefined
+        ? "synchronized"
+        : typeof key === "number"
+          ? `stream:${key}`
+          : typeof key === "symbol"
+            ? key.toString()
+            : `object:${key.constructor?.name ?? "unknown"}`;
+      return `${keyName}{${heap.describeRange(ptr, length)}}`;
+    });
+    return heaps.length ? heaps.join(" ") : "no workspace heaps";
+  }
+
   drainHeap(sourceKey: HeapKey, destinationKey: HeapKey): void {
     if (sourceKey === destinationKey) return;
     const source = this.heapByKey.get(sourceKey);

@@ -78,6 +78,15 @@ export class ParallelTensor extends Tensor {
     return true;
   }
 
+  debugDescription(): string {
+    const shards = this.shards.map((shard, index) => `shard${index}{${shard.debugDescription()}}`).join(" ");
+    return `parallel shape=[${this.shape}] type=${this.type} parallelism=${this.parallelism} captured=${this.captured} shards=[${shards}]`;
+  }
+
+  memoryRanges(): readonly { data: number; bytes: number }[] {
+    return this.shards.map(shard => ({ data: shard.data, bytes: shard.bytes }));
+  }
+
   private get worldSize(): number {
     return this.shards.length;
   }
@@ -3796,25 +3805,11 @@ export class ParallelOps implements DeviceOps {
       throw new Error(`gatherPages: paddedKvLen=${paddedKvLen} must be in (0, ${maxKvLen}]`);
     }
 
-    const narrowLocal = (full: Tensor, activeLen: number): Tensor => {
-      const localPageSize = full.shape[1];
-      const maxLocalLen = full.shape[0] * localPageSize;
-      if (activeLen <= 0 || activeLen > maxLocalLen || activeLen % localPageSize !== 0) {
-        throw new Error(`gatherPages: active local length ${activeLen} is invalid for capacity ${maxLocalLen} and page size ${localPageSize}`);
-      }
-      if (activeLen === maxLocalLen) return full;
-      const active = full.narrow(0, activeLen / localPageSize);
-      full[Symbol.dispose]();
-      return active;
-    };
-
     if (!contextParallel) {
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
         const shard = pSrc.shards[i];
-        const maxLocalLen = shard.shape[0] * shard.shape[1];
-        const full = this.devices[i].gatherPages(shard, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, maxLocalLen, pKvIndptr.shards[i], false);
-        shards.push(narrowLocal(full, paddedKvLen));
+        shards.push(this.devices[i].gatherPages(shard, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, paddedKvLen, pKvIndptr.shards[i], false));
       }
       return this.wrapShards(workspace, shards, shapeFor(paddedKvLen / pageSize), pSrc.type, pSrc.parallelism);
     }
@@ -3830,24 +3825,20 @@ export class ParallelOps implements DeviceOps {
     const localBufs: Tensor[] = [];
     for (let i = 0; i < cpWorldSize; i++) {
       const shard = pSrc.shards[i];
-      const maxLocalLen = shard.shape[0] * shard.shape[1];
-      const full = this.devices[i].gatherPages(shard, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, maxLocalLen, pKvIndptr.shards[i], false);
-      localBufs.push(narrowLocal(full, paddedLocalLen));
+      localBufs.push(this.devices[i].gatherPages(shard, pIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], batchSize, paddedLocalLen, pKvIndptr.shards[i], false));
     }
 
     const shardPageSize = pSrc.shards[0].shape[1];
     // Step 2: NCCL all-gather (Column → Replicated)
     const localShapeFor = (rows: number) => [rows, shardPageSize, ...tokenShape];
     using localPar = this.wrapShards(workspace, localBufs, localShapeFor(paddedKvLen / shardPageSize), pSrc.type, TensorParallelism.Column);
-    const maxShape = localShapeFor(maxKvLen / shardPageSize);
     const activeShapeRows = paddedKvLen / shardPageSize;
-    using gatheredFull = workspace.alloc(maxShape, pSrc.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const gatheredOutput = gatheredFull.narrow(0, activeShapeRows) as ParallelTensor;
+    const activeShape = localShapeFor(activeShapeRows);
+    using gatheredOutput = workspace.alloc(activeShape, pSrc.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
     using gathered = localPar.allGather(workspace, gatheredOutput);
 
     // Step 3: Deinterleave — reorder interleaved tokens to sequential
-    using outFull = workspace.alloc(maxShape, pSrc.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
-    const out = outFull.narrow(0, activeShapeRows) as ParallelTensor;
+    const out = workspace.alloc(activeShape, pSrc.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
     const pOut = this.cast(out);
     const tokenBytes = Tensor.byteCount([D], pSrc.type);
 
@@ -4173,17 +4164,15 @@ export class ParallelOps implements DeviceOps {
     const W = this.worldSize;
     const totalQ = topkIdx.shape[0];
     const topk = topkIdx.shape[1];
-    const maxQ = state.positionIds.shape[0];
 
     // One SlotSet in the addressing `modeCacheIdx` requires. The per-shard call
     // has no group of its own — its viewClone is discarded here, and must be,
     // or it would keep the layer's shards from being recycled on schedule.
     const computeSet = (modeCacheIdx: number): SlotSet => {
       const cpW = this.topkSlotMode(state, modeCacheIdx) === "flat" ? 1 : (contextParallel ? W : 0);
-      // One Replicated length allocated up front, its shards handed down — the
-      // per-device alloc order has to stay exactly as it was, or the retained
-      // slots block rotates through the recycle pool and graph replay breaks.
-      const length = this.cast(topkIdx.workspace.alloc([maxQ], "I32"));
+      // Allocate one Replicated length up front and hand its shards down so the
+      // per-device allocation order remains identical on every rank.
+      const length = this.cast(topkIdx.workspace.alloc([totalQ], "I32"));
       const slotShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
         const cpR = (cpW > 1) ? i : 0;
@@ -4208,7 +4197,7 @@ export class ParallelOps implements DeviceOps {
     // Only decode sparse-gather splits the two: the full layer reads its paged
     // CP shard while the group reads the gathered flat buffer. Everywhere else
     // one buffer serves both, and computing a second identical copy would put
-    // another [maxQ, topk] block into the recycle rotation — which moves the
+    // another [totalQ, topk] block into the recycle rotation — which moves the
     // slots address step to step and breaks graph replay.
     const diverges = hasGroup && this.topkSlotMode(state, groupIdx) !== this.topkSlotMode(state, cacheIdx);
 

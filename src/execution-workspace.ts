@@ -57,7 +57,16 @@ export async function executePlan<T>(captureManager: CaptureManager, ws: Executi
         captureKey,
       );
 
-      await captureManager.ops.synchronizeAsync();
+      try {
+        await captureManager.ops.synchronizeAsync();
+      } catch (error) {
+        const stateSummary = phase.states.map((state, index) =>
+          `state${index}{batch=${state.batchSize} totalTokens=${state.totalTokens} seqLens=[${state.seqLens}] decode=${state.isDecode} paddedKvInvariant=${state.paddedKvLenInvariant}}`).join(" ");
+        const inputSummary = Object.entries(phase.inputs).map(([name, tensor]) =>
+          `${name}{${tensor.debugDescription()}}`).join(" ");
+        console.error(`[cuda-graph] phase synchronization failed key=${captureKey.join(",")} timing=${phase.timingName ?? "unnamed"} ${stateSummary} inputs=[${inputSummary}]`, error);
+        throw error;
+      }
       onPhase?.(phase, (performance.now() - phaseStart) / 1000);
 
       ws.clearTracking([phase.inputs, phaseResult as TensorTree]);

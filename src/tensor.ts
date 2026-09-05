@@ -100,6 +100,27 @@ export abstract class Tensor implements Disposable {
     return Math.ceil(this.numElements * SafeTensorFile.dtypeBytes(this.type));
   }
 
+  memoryRanges(): readonly { data: number; bytes: number }[] {
+    return [{ data: this.data, bytes: this.bytes }];
+  }
+
+  debugDescription(): string {
+    const ptr = `0x${this.data.toString(16)}`;
+    const recycleKey = this.recycleKey === null
+      ? "default"
+      : typeof this.recycleKey === "number"
+        ? `stream:${this.recycleKey}`
+        : typeof this.recycleKey === "symbol"
+          ? this.recycleKey.toString()
+          : this.recycleKey === undefined
+            ? "synchronized"
+            : `object:${this.recycleKey.constructor?.name ?? "unknown"}`;
+    const heapState = this.pinned || this.data === 0
+      ? "n/a"
+      : this.workspace.describeDeviceRange(this.data, this.allocSize);
+    return `id=${this.id} shape=[${this.shape}] type=${this.type} ptr=${ptr} bytes=${this.bytes} allocSize=${this.allocSize} parallelism=${this.parallelism} captured=${this.captured} disposed=${this.disposed} recycleKey=${recycleKey} workspace=${this.workspace.constructor.name} heaps=(${heapState})`;
+  }
+
   withPinnedBuffer(fn: (buf: Buffer) => void) {
     if (!this.pinned) {
       throw new Error("Tensor is not pinned");

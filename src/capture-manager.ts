@@ -77,8 +77,6 @@ export class CaptureManager implements Disposable {
         }
     }
 
-    static NEED_MEMCPY = false;
-
     run<I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => TensorTree, keyParams?: any[]): TensorTree {
         if (CaptureManager.capturing) {
             throw new Error("Cannot run a capture while another capture is in progress");
@@ -93,17 +91,56 @@ export class CaptureManager implements Disposable {
 
             if (captured) {
                 if (captured.graphExec !== null) {
+                    const replayInputs = Object.entries(inputs)
+                        .filter((entry): entry is [string, Tensor] => !!entry[1])
+                        .map(([name, input]) => ({
+                            name,
+                            input,
+                            capturedInput: captured!.inputs[name],
+                            needsCopy: !captured!.inputs[name].same(input),
+                        }));
+                    for (let writerIndex = 0; writerIndex < replayInputs.length; writerIndex++) {
+                        const writer = replayInputs[writerIndex];
+                        if (!writer.needsCopy || !writer.capturedInput.matches(writer.input)) continue;
+                        const destinations = writer.capturedInput.memoryRanges();
+                        for (let victimIndex = 0; victimIndex < replayInputs.length; victimIndex++) {
+                            const victim = replayInputs[victimIndex];
+                            const sourceIsStillNeeded = victim.needsCopy
+                                ? victimIndex >= writerIndex
+                                : true;
+                            if (!sourceIsStillNeeded) continue;
+                            const sources = victim.input.memoryRanges();
+                            const numRanges = Math.min(destinations.length, sources.length);
+                            for (let shard = 0; shard < numRanges; shard++) {
+                                const destination = destinations[shard];
+                                const source = sources[shard];
+                                const overlapStart = Math.max(destination.data, source.data);
+                                const overlapEnd = Math.min(destination.data + destination.bytes, source.data + source.bytes);
+                                if (overlapStart >= overlapEnd) continue;
+                                console.warn(
+                                    `[cuda-graph] HAZARDOUS input memcpy overlap key=${key} graphExec=${captured.graphExec}`
+                                    + ` writer=${writer.name} victim=${victim.name} shard=${shard}`
+                                    + ` destination=[0x${destination.data.toString(16)},0x${(destination.data + destination.bytes).toString(16)})`
+                                    + ` source=[0x${source.data.toString(16)},0x${(source.data + source.bytes).toString(16)})`
+                                    + ` overlap=[0x${overlapStart.toString(16)},0x${overlapEnd.toString(16)})`,
+                                );
+                            }
+                        }
+                    }
                     for (const [name, input] of Object.entries(inputs)) {
                         if (!input)
                             continue;
                         input.stage();
                         const capturedInput = captured.inputs[name];
                         if (!capturedInput.same(input)) {
-                            if (!CaptureManager.NEED_MEMCPY) {
-                                CaptureManager.NEED_MEMCPY = true;
-                                console.warn('need memcpy', input.shape)
+                            console.warn(`[cuda-graph] input mismatch key=${key} graphExec=${captured.graphExec} name=${name}`);
+                            console.warn(`[cuda-graph] current input: ${input.debugDescription()}`);
+                            console.warn(`[cuda-graph] captured input: ${capturedInput.debugDescription()}`);
+                            if (!capturedInput.matches(input)) {
+                                throw new Error(`[cuda-graph] incompatible replay input key=${key} name=${name}`);
                             }
                             capturedInput.memcpy(input, capturedInput.bytes, MemcpyKind.DeviceToDevice);
+                            console.warn(`[cuda-graph] enqueued input memcpy key=${key} name=${name} bytes=${capturedInput.bytes}`);
                         }
                     }
                     for (const ws of captured.capturedWorkspaces) {
@@ -116,7 +153,12 @@ export class CaptureManager implements Disposable {
                             continue;
                         input.unstage();
                     }
-                    this.ops.graphLaunch(captured.graphExec);
+                    try {
+                        this.ops.graphLaunch(captured.graphExec);
+                    } catch (error) {
+                        console.error(`[cuda-graph] graphLaunch failed synchronously key=${key} graphExec=${captured.graphExec}`, error);
+                        throw error;
+                    }
                     return mapTensors(captured.result, tensor => tensor.uncapture());
                 }
 

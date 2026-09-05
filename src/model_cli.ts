@@ -15,7 +15,7 @@ export const GLM51_REPO = "local-inference-lab/GLM-5.3-NVFP4";
 
 const GLM51_SMALL_BF16 = "tests/python/test_models/glm51_small/glm51_small_bf16";
 const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp4";
-const GLM51_MODEL_DIR = "/mnt/storage/.cache/huggingface/hub/models--incoai--GLM-5.3-NVFP4/snapshots/54e52520606f96b3d9fc84088ad22882a61648ac/";
+const GLM51_MODEL_DIR = "/mnt/storage/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-NVFP4/snapshots/cca10d1586255195d3279785fc85577bfc1e9227/";
 
 export interface ModelCliArgs {
   gpus: number[];

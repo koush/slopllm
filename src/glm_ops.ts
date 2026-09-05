@@ -1079,16 +1079,12 @@ export class GlmOps implements DeviceOps {
     }
     const maxKvCapacity = kData.shape[0] * kData.shape[1];
     const useDirect = totalQ <= INDEXER_DIRECT_DISPATCH_MAX;
-    // Decode graphs are length-invariant. Prefill launches only over the active
-    // KV bucket, but allocates score scratch at its maximum supported size: arena
-    // allocations cannot be reclaimed, so growing [Q, KV] scratch per bucket
-    // would permanently retain every smaller block.
+    // Decode graphs are length-invariant. Prefill launches over the graph's
+    // padded KV bucket; exact query length is already part of the graph key.
     const maxKv = decode
       ? maxKvCapacity
       : Math.min(maxKvCapacity, state.getGraphVariantPaddedKvLen());
-    const queryShardWidth = state.totalTokens / totalQ;
-    const scoreRows = Math.ceil(state.ws.maxSeqLen / queryShardWidth);
-    const scoreShape = decode ? [totalQ, maxKv] : [scoreRows, maxKvCapacity];
+    const scoreShape = [totalQ, maxKv];
     const queryTiles = Math.ceil(totalQ / 64) + state.batchSize - 1;
     return useDirect
       ? this.indexerScoreTopkV2(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, scoreShape, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr)
@@ -1113,21 +1109,8 @@ export class GlmOps implements DeviceOps {
     if (totalQ > maxQ) {
       throw new Error(`topkToSlots: totalQ=${totalQ} exceeds query capacity ${maxQ}`);
     }
-    // Constant-size across totalQ / graph variants so the allocator layout
-    // stays stable under capture. ParallelOps pre-allocates one Replicated
-    // tensor and hands down its shards, so the per-device alloc order stays
-    // exactly as it was before the group/layer pair was folded in here.
-    const topkLength = providedLength ?? topkIdx.workspace.alloc([state.positionIds.shape[0]], "I32");
-    // Allocate the max query footprint ([maxQ, topk]) and narrow to
-    // [totalQ, topk]:
-    // a plain transient alloc, but constant-sized across totalQ / graph variants
-    // so the workspace allocator layout stays stable under graph capture. Hold
-    // the full allocation with `using` so its disposal is deferred to when the
-    // caller disposes the returned narrow view — returning a bare
-    // `alloc(...).narrow(...)` would leak the parent allocation, since disposing
-    // a view alone never frees its parent.
-    using full = topkIdx.workspace.alloc([maxQ, topk], "I32");
-    const slots = full.narrow(0, totalQ);
+    const topkLength = providedLength ?? topkIdx.workspace.alloc([totalQ], "I32");
+    const slots = topkIdx.workspace.alloc([totalQ, topk], "I32");
     getNativeAddon().topkToSlots(this.ctx, ptr(slots), ptr(topkLength), ptr(topkIdx), ptr(pageIndices), ptr(indptr), ptr(lastPageLen), ptr(batchIndices), totalQ, topk, pageSize, cpWorldSize, cpRank, ptr(kvTokenIndptrD));
     // No group concept at the device level: a following shared layer reads the
     // same slots. Hand back a viewClone so it shares this memory but disposes

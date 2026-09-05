@@ -137,6 +137,17 @@ export class Heap {
     return `${offset}:${this.allocationCount}:${this.allocationHash.toString(16)}`;
   }
 
+  describeRange(ptr: number, length: number): string {
+    Heap.validateRegion(ptr, length);
+    const end = ptr + length;
+    const overlapping = this.regions.filter(region => ptr < region.ptr + region.length && end > region.ptr);
+    const ranges = overlapping.length
+      ? overlapping.map(region => `[0x${region.ptr.toString(16)},0x${(region.ptr + region.length).toString(16)})`).join(",")
+      : "none";
+    const freeBytes = this.regions.reduce((sum, region) => sum + region.length, 0);
+    return `overlappingFree=${ranges} freeRegions=${this.regions.length} freeBytes=${freeBytes} layout=${this.layoutSignature()}`;
+  }
+
   drainTo(destination: Heap): void {
     if (destination === this) return;
 
