@@ -39,7 +39,8 @@ constexpr int P2P_AR_VEC_F32 = 4;    // uint4 = 4 fp32
 // P2P barrier, split into arrive + wait so callers can overlap work between
 // publishing their flag and spinning on peers' flags.
 //
-// arrive: increment my_seq_counter, publish flag to peers (release.sys).
+// arrive: increment my_seq_counter, publish its low 32 bits to peers
+//         (release.sys).
 // wait:   read my_seq_counter back to recover the target, spin on peers' flags
 //         (acquire.sys). Safe because the API is single-stream per instance:
 //         no other arrive touches my_seq_counter between the two launches, so
@@ -64,24 +65,23 @@ p2p_arrive_kernel(
     __shared__ int*         s_peer_flags[P2P_AR_MAX_WORLD];
 
     if (tid == 0) {
-        unsigned long long s = atomicAdd(my_seq_counter, 2ULL) + 2ULL;
+        unsigned long long s = atomicAdd(my_seq_counter, 1ULL) + 1ULL;
         s_seq = (unsigned int)s;
-        if (s_seq == 0) s_seq = 2;
     }
     if (tid < world_size) {
         s_peer_flags[tid] = peer_flags[tid];
     }
     __syncwarp();
 
-    int seq = (int)s_seq;
+    unsigned int seq = s_seq;
 
     bool active = (peer_rank < 0 && tid < world_size) ||
                   (peer_rank >= 0 && tid == peer_rank);
 
     if (active) {
-        int val = seq + 1;
+        unsigned int val = seq;
         if (tid == my_rank) {
-            s_peer_flags[my_rank][my_rank] = val;
+            s_peer_flags[my_rank][my_rank] = (int)val;
         } else {
             // per Claude
             // Kernel completion on GPU *i* is a system-scope synchronizing event:
@@ -120,31 +120,31 @@ p2p_wait_kernel(
 
     if (tid == 0) {
         // arrive already ran on this stream, so *my_seq_counter == s. Recover
-        // the same s_seq arrive published (with the same wrap guard) and derive
-        // the target from it.
+        // the same sequence arrive published. Zero is a valid sequence value
+        // at rollover and must not be remapped, which would duplicate a later
+        // sequence.
         unsigned long long s = *my_seq_counter;
         s_seq = (unsigned int)s;
-        if (s_seq == 0) s_seq = 2;
     }
     if (tid < world_size) {
         s_peer_flags[tid] = peer_flags[tid];
     }
     __syncwarp();
 
-    int seq = (int)s_seq;
+    unsigned int seq = s_seq;
 
     bool active = (peer_rank < 0 && tid < world_size) ||
                   (peer_rank >= 0 && tid == peer_rank);
 
     if (active) {
-        int target = seq + 1;
+        unsigned int target = seq;
         int* my_flags = s_peer_flags[my_rank];
-        int v;
+        unsigned int v;
         do {
             asm volatile("ld.acquire.sys.b32 %0, [%1];"
                          : "=r"(v) : "l"(my_flags + tid));
-            if ((int)((unsigned)v - (unsigned)target) < 0) __nanosleep(nanosleep_ns);
-        } while ((int)((unsigned)v - (unsigned)target) < 0);
+            if ((int)(v - target) < 0) __nanosleep(nanosleep_ns);
+        } while ((int)(v - target) < 0);
     }
     __syncwarp();
 }
