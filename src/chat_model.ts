@@ -2,7 +2,7 @@ import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
 import { ChatModelParser, DefaultChatModelParser } from "./chat-model-parser";
-import { DeviceOps } from "./device_ops";
+import { DeviceOps, type WorkspaceMemoryStats } from "./device_ops";
 import { type ExecutionPlan, ExecutionState, type ExecutionWorkspace } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
@@ -217,6 +217,17 @@ export abstract class ChatModel extends WorkspaceBase {
       st.close();
       mmapClose(mmapPtr, fileSize);
     }
+
+    // const logWorkspaceMemory = (label: string, stats: WorkspaceMemoryStats[]) => {
+    //   const devices = stats.map(({ regions, freeBytes }) => ({ regions, kb: freeBytes / 1024 }));
+    //   console.log(label, {
+    //     totalKb: devices.reduce((sum, device) => sum + device.kb, 0),
+    //     devices,
+    //   });
+    // };
+    // logWorkspaceMemory("Model workspace free memory:", this.glm.workspaceMemoryStats(this));
+    // this.glm.reclaimWorkspaceMemory(this);
+    // logWorkspaceMemory("Device heap after model workspace recovery:", this.glm.deviceHeapStats());
   }
 
   protected async fromPretrained(modelDir: string, tokenizerRepo: string): Promise<void> {

@@ -27,6 +27,11 @@ export interface StridedMmap {
   height: number;
 }
 
+export interface WorkspaceMemoryStats {
+  regions: number;
+  freeBytes: number;
+}
+
 // A slots tensor and its paired per-query valid count. Always travel together —
 // a slots buffer is only meaningful alongside the length that bounds it.
 export type SlotSet = { slots: Tensor, length: Tensor };
@@ -47,6 +52,9 @@ export interface DeviceOps extends Disposable {
   synchronizeListeners: WeakRef<WorkspaceBase>[];
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism, recycleKey?: HeapKey | null): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined, recycleKey?: HeapKey | null): Tensor;
+  workspaceMemoryStats(workspace: WorkspaceBase): WorkspaceMemoryStats[];
+  reclaimWorkspaceMemory(workspace: WorkspaceBase): void;
+  deviceHeapStats(): WorkspaceMemoryStats[];
   synchronize(): void;
   synchronizeAsync(): Promise<void>;
   synchronizeStream(streamIdx: number): void;

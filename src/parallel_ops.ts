@@ -1,4 +1,4 @@
-import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
 import { CaptureManager } from "./capture-manager";
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
@@ -2837,6 +2837,22 @@ export class ParallelOps implements DeviceOps {
     if (!view)
       throw new Error("ParallelOps.wrapTensor not supported; tensor recycling happens at shard level");
     return new ParallelTensor(workspace, this, view.parallelism, view.shards, shape, type, undefined, pinned, view, recycleKey);
+  }
+
+  workspaceMemoryStats(workspace: WorkspaceBase): WorkspaceMemoryStats[] {
+    return this.shardWorkspacesFor(workspace).flatMap((shardWorkspace, index) =>
+      this.devices[index].workspaceMemoryStats(shardWorkspace)
+    );
+  }
+
+  reclaimWorkspaceMemory(workspace: WorkspaceBase): void {
+    this.shardWorkspacesFor(workspace).forEach((shardWorkspace, index) =>
+      this.devices[index].reclaimWorkspaceMemory(shardWorkspace)
+    );
+  }
+
+  deviceHeapStats(): WorkspaceMemoryStats[] {
+    return this.devices.flatMap(device => device.deviceHeapStats());
   }
 
   sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {

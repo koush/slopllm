@@ -1,6 +1,6 @@
 {
-    "version": "0.2.0",
-    "configurations": [
+  "version": "0.2.0",
+  "configurations": [
         {
             "type": "node",
             "request": "launch",
@@ -98,6 +98,37 @@
             "skipFiles": [
                 "<node_internals>/**"
             ]
-        }
-    ]
+        },
+    {
+      "name": "GLM: Model Loader + OpenAI Server",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["--require", "tsx/cjs"],
+      "program": "${workspaceFolder}/src/run_model_loader.ts",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--arena", "92",
+        "--gpus", "0,1,2,3,4,5,6,7",
+        "--cp",
+        "--glm51",
+        "--mtp",
+        "--control-host", "127.0.0.1",
+        "--control-port", "8099",
+        "src/openai-server.ts",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--max-pages", "2048",
+        "--phased-prefill"
+      ],
+      "env": {
+        "NCCL_P2P_LEVEL": "SYS",
+        "NCCL_TOPO_FILE": "/root/chat/vllm/topo_fixed.xml"
+      },
+      "console": "integratedTerminal",
+      "autoAttachChildProcesses": true,
+      "sourceMaps": true,
+      "skipFiles": ["<node_internals>/**", "${workspaceFolder}/node_modules/**"]
+    }
+  ]
 }

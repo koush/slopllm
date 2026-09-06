@@ -1,4 +1,4 @@
-import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
 import { Heap, type HeapAllocation, type HeapKey } from "./heap";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
@@ -806,8 +806,8 @@ export class GlmOps implements DeviceOps {
     return p;
   }
 
-  private allocDevice(size: number): HeapAllocation {
-    const existing = this.heap.tryAlloc(size);
+  private allocDevice(size: number, longTerm = false): HeapAllocation {
+    const existing = this.heap.tryAlloc(size, longTerm);
     if (existing) return existing;
     if (this.arenaBase !== undefined) {
       throw new Error(`Arena heap OOM: unable to allocate ${size} bytes`);
@@ -823,17 +823,34 @@ export class GlmOps implements DeviceOps {
     }
     this.nativeAllocations.add(ptr);
     this.heap.manage(ptr, size);
-    return this.heap.alloc(size);
+    return this.heap.alloc(size, longTerm);
   }
 
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, _parallelism?: TensorParallelism, recycleKey: HeapKey | null = null): GlmTensor {
     const size = Tensor.byteCount(shape, type);
-    const allocation = pinned ? { ptr: this.allocPinned(size), length: size } : this.allocDevice(size);
+    const allocation = pinned ? { ptr: this.allocPinned(size), length: size } : this.allocDevice(size, name !== undefined);
     return new GlmTensor(workspace, this, allocation.ptr, allocation.length, shape, type, name, pinned, undefined, recycleKey);
   }
 
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: GlmTensor | undefined, recycleKey: HeapKey | null = null): Tensor {
     return new GlmTensor(workspace, this, data, allocSize, shape, type, undefined, pinned, view, recycleKey);
+  }
+
+  workspaceMemoryStats(workspace: WorkspaceBase): WorkspaceMemoryStats[] {
+    const heaps = [...workspace.heapByKey.values()];
+    return [{
+      regions: heaps.reduce((sum, heap) => sum + heap.regionCount, 0),
+      freeBytes: heaps.reduce((sum, heap) => sum + heap.freeBytes, 0),
+    }];
+  }
+
+  reclaimWorkspaceMemory(workspace: WorkspaceBase): void {
+    for (const heap of workspace.heapByKey.values()) heap.drainTo(this.heap);
+    workspace.heapByKey.clear();
+  }
+
+  deviceHeapStats(): WorkspaceMemoryStats[] {
+    return [{ regions: this.heap.regionCount, freeBytes: this.heap.freeBytes }];
   }
 
   sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {

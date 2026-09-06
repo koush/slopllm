@@ -51,27 +51,32 @@ export class Heap {
     }
   }
 
-  alloc(size: number): HeapAllocation {
-    const allocation = this.tryAlloc(size);
+  alloc(size: number, longTerm = false): HeapAllocation {
+    const allocation = this.tryAlloc(size, longTerm);
     if (allocation) return allocation;
     throw new Error(`Heap OOM: unable to allocate ${size} bytes`);
   }
 
-  tryAlloc(size: number): HeapAllocation | undefined {
+  tryAlloc(size: number, longTerm = false): HeapAllocation | undefined {
     if (!Number.isSafeInteger(size) || size <= 0) {
       throw new Error(`Heap allocation size must be a positive safe integer, got ${size}`);
     }
 
-    for (let index = 0; index < this.regions.length; index++) {
+    const start = longTerm ? this.regions.length - 1 : 0;
+    const end = longTerm ? -1 : this.regions.length;
+    const step = longTerm ? -1 : 1;
+    for (let index = start; index !== end; index += step) {
       const region = this.regions[index];
-      const alignmentOffset = (Heap.ALIGNMENT - region.ptr % Heap.ALIGNMENT) % Heap.ALIGNMENT;
-      const ptr = region.ptr + alignmentOffset;
       const regionEnd = region.ptr + region.length;
+      const ptr = longTerm
+        ? Math.floor((regionEnd - size) / Heap.ALIGNMENT) * Heap.ALIGNMENT
+        : region.ptr + (Heap.ALIGNMENT - region.ptr % Heap.ALIGNMENT) % Heap.ALIGNMENT;
       const requestedEnd = ptr + size;
-      if (!Number.isSafeInteger(requestedEnd) || requestedEnd > regionEnd) continue;
+      if (ptr < region.ptr || !Number.isSafeInteger(requestedEnd) || requestedEnd > regionEnd) continue;
 
-      const alignedLength = Math.ceil(size / Heap.ALIGNMENT) * Heap.ALIGNMENT;
-      const length = Math.min(alignedLength, regionEnd - ptr);
+      const length = longTerm
+        ? regionEnd - ptr
+        : Math.min(Math.ceil(size / Heap.ALIGNMENT) * Heap.ALIGNMENT, regionEnd - ptr);
       const end = ptr + length;
 
       const prefixLength = ptr - region.ptr;
@@ -132,6 +137,14 @@ export class Heap {
     return this.regions.some(region => ptr >= region.ptr && end <= region.ptr + region.length);
   }
 
+  get regionCount(): number {
+    return this.regions.length;
+  }
+
+  get freeBytes(): number {
+    return this.regions.reduce((sum, region) => sum + region.length, 0);
+  }
+
   layoutSignature(): string {
     const offset = this.layoutBase === undefined ? 0 : (this.layoutEnd ?? this.layoutBase) - this.layoutBase;
     return `${offset}:${this.allocationCount}:${this.allocationHash.toString(16)}`;
@@ -144,8 +157,7 @@ export class Heap {
     const ranges = overlapping.length
       ? overlapping.map(region => `[0x${region.ptr.toString(16)},0x${(region.ptr + region.length).toString(16)})`).join(",")
       : "none";
-    const freeBytes = this.regions.reduce((sum, region) => sum + region.length, 0);
-    return `overlappingFree=${ranges} freeRegions=${this.regions.length} freeBytes=${freeBytes} layout=${this.layoutSignature()}`;
+    return `overlappingFree=${ranges} freeRegions=${this.regions.length} freeBytes=${this.freeBytes} layout=${this.layoutSignature()}`;
   }
 
   drainTo(destination: Heap): void {

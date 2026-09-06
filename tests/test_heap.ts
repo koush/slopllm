@@ -22,6 +22,25 @@ describe("Heap", () => {
     assert.deepEqual(tail.alloc(100), { ptr: 256, length: 100 });
   });
 
+  it("allocates long-term ranges from the end", () => {
+    const heap = new Heap();
+    heap.manage(256, 1024);
+
+    assert.deepEqual(heap.alloc(100, true), { ptr: 1024, length: 256 });
+    assert.deepEqual(heap.alloc(100), { ptr: 256, length: 256 });
+  });
+
+  it("keeps returned front allocations contiguous below long-term allocations", () => {
+    const heap = new Heap();
+    heap.manage(256, 1024);
+
+    const temporary = heap.alloc(256);
+    assert.deepEqual(heap.alloc(256, true), { ptr: 1024, length: 256 });
+    heap.manage(temporary.ptr, temporary.length);
+
+    assert.deepEqual(heap.alloc(768), { ptr: 256, length: 768 });
+  });
+
   it("coalesces adjacent returned ranges", () => {
     const heap = new Heap();
     heap.manage(256, 256);
