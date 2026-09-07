@@ -1,11 +1,11 @@
 import { Tensor } from "./tensor";
 import { type DeviceOps } from "./device_ops";
-import { MemcpyKind } from "./enums";
 import type { WorkspaceBase } from "./workspace";
 import { mapTensors, type TensorTree } from "./tensor-tree";
 
 
 interface Captured {
+    diagnosticBindings?: Record<string, string>;
     warmupSteps: number;
     graphExec: number | null;
     result: TensorTree;
@@ -77,7 +77,15 @@ export class CaptureManager implements Disposable {
         }
     }
 
-    run<I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => TensorTree, keyParams?: any[]): TensorTree {
+    private graphKey(keyParams: any[], inputs: { [name: string]: Tensor }): string {
+        const signature = Object.keys(inputs).sort().filter(name => !!inputs[name]).map(name => {
+            const tensor = inputs[name];
+            return [name, tensor.shape, tensor.type, tensor.pinned, tensor.parallelism, tensor.memoryRanges()];
+        });
+        return keyParams.join(",") + (signature.length ? `,inputs:${JSON.stringify(signature)}` : "");
+    }
+
+    run<I extends { [name: string]: Tensor }>(inputs: I, fn: (capturing: boolean, capturedInputs: I) => TensorTree, keyParams?: any[], diagnosticBindings?: Record<string, string>): TensorTree {
         if (CaptureManager.capturing) {
             throw new Error("Cannot run a capture while another capture is in progress");
         }
@@ -86,46 +94,21 @@ export class CaptureManager implements Disposable {
         let capturing = false;
 
         if (!this.disabled && keyParams?.length) {
-            const key = keyParams.join(",");
+            const key = this.graphKey(keyParams, inputs);
             captured = this.captured.get(key);
 
             if (captured) {
                 if (captured.graphExec !== null) {
-                    const replayInputs = Object.entries(inputs)
-                        .filter((entry): entry is [string, Tensor] => !!entry[1])
-                        .map(([name, input]) => ({
-                            name,
-                            input,
-                            capturedInput: captured!.inputs[name],
-                            needsCopy: !captured!.inputs[name].same(input),
-                        }));
-                    for (let writerIndex = 0; writerIndex < replayInputs.length; writerIndex++) {
-                        const writer = replayInputs[writerIndex];
-                        if (!writer.needsCopy || !writer.capturedInput.matches(writer.input)) continue;
-                        const destinations = writer.capturedInput.memoryRanges();
-                        for (let victimIndex = 0; victimIndex < replayInputs.length; victimIndex++) {
-                            const victim = replayInputs[victimIndex];
-                            const sourceIsStillNeeded = victim.needsCopy
-                                ? victimIndex >= writerIndex
-                                : true;
-                            if (!sourceIsStillNeeded) continue;
-                            const sources = victim.input.memoryRanges();
-                            const numRanges = Math.min(destinations.length, sources.length);
-                            for (let shard = 0; shard < numRanges; shard++) {
-                                const destination = destinations[shard];
-                                const source = sources[shard];
-                                const overlapStart = Math.max(destination.data, source.data);
-                                const overlapEnd = Math.min(destination.data + destination.bytes, source.data + source.bytes);
-                                if (overlapStart >= overlapEnd) continue;
-                                console.warn(
-                                    `[cuda-graph] HAZARDOUS input memcpy overlap key=${key} graphExec=${captured.graphExec}`
-                                    + ` writer=${writer.name} victim=${victim.name} shard=${shard}`
-                                    + ` destination=[0x${destination.data.toString(16)},0x${(destination.data + destination.bytes).toString(16)})`
-                                    + ` source=[0x${source.data.toString(16)},0x${(source.data + source.bytes).toString(16)})`
-                                    + ` overlap=[0x${overlapStart.toString(16)},0x${overlapEnd.toString(16)})`,
-                                );
+                    if (diagnosticBindings && captured.diagnosticBindings) {
+                        for (const name of new Set([...Object.keys(diagnosticBindings), ...Object.keys(captured.diagnosticBindings)])) {
+                            if (diagnosticBindings[name] !== captured.diagnosticBindings[name]) {
+                                console.error(`[cuda-graph] BINDING MISMATCH key=${key} graphExec=${captured.graphExec} name=${name} captured=${captured.diagnosticBindings[name]} current=${diagnosticBindings[name]}`);
                             }
                         }
+                    }
+                    if (process.env.GLM_GRAPH_DIAGNOSTICS === "1") {
+                        console.warn(`[cuda-graph] checkpoint before-replay key=${key} graphExec=${captured.graphExec}`);
+                        this.ops.synchronize();
                     }
                     for (const [name, input] of Object.entries(inputs)) {
                         if (!input)
@@ -133,14 +116,7 @@ export class CaptureManager implements Disposable {
                         input.stage();
                         const capturedInput = captured.inputs[name];
                         if (!capturedInput.same(input)) {
-                            console.warn(`[cuda-graph] input mismatch key=${key} graphExec=${captured.graphExec} name=${name}`);
-                            console.warn(`[cuda-graph] current input: ${input.debugDescription()}`);
-                            console.warn(`[cuda-graph] captured input: ${capturedInput.debugDescription()}`);
-                            if (!capturedInput.matches(input)) {
-                                throw new Error(`[cuda-graph] incompatible replay input key=${key} name=${name}`);
-                            }
-                            capturedInput.memcpy(input, capturedInput.bytes, MemcpyKind.DeviceToDevice);
-                            console.warn(`[cuda-graph] enqueued input memcpy key=${key} name=${name} bytes=${capturedInput.bytes}`);
+                            throw new Error(`[cuda-graph] pointer-keyed replay input mismatch key=${key} name=${name}`);
                         }
                     }
                     for (const ws of captured.capturedWorkspaces) {
@@ -170,6 +146,10 @@ export class CaptureManager implements Disposable {
                         (capturedInputs as any)[name] = tensor.capture();
                     }
                     captured.inputs = capturedInputs;
+                    captured.diagnosticBindings = diagnosticBindings;
+                    if (process.env.GLM_GRAPH_DIAGNOSTICS === "1") {
+                        console.warn(`[cuda-graph] capture bindings key=${key} bindings=${JSON.stringify(diagnosticBindings)}`);
+                    }
 
                     // console.warn("\n====capturing====", key)
                     this.ops.graphBeginCapture();
@@ -234,11 +214,11 @@ export class CaptureManager implements Disposable {
         return result;
     }
 
-    isCaptured(keyParams: any[]): boolean {
+    isCaptured(keyParams: any[], inputs: { [name: string]: Tensor } = {}): boolean {
         if (!keyParams?.length) {
             return false;
         }
-        const key = keyParams.join(",");
+        const key = this.graphKey(keyParams, inputs);
         const captured = this.captured.get(key);
         // graphExec may be 0
         return captured?.graphExec != null;

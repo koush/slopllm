@@ -4039,7 +4039,8 @@ export class ParallelOps implements DeviceOps {
       ownerValueShards.push(values);
       ownerIndexShards.push(queryIndices.gather(mergedPositions, topk, kTotal, ownerQ));
     }
-    for (const tensor of [...stagedValues, ...stagedIndices]) tensor[Symbol.dispose]();
+    // These reads follow the scatter barrier; retain staging until the next one.
+    group.sources.push(...stagedValues, ...stagedIndices);
 
     const ownerValues = this.wrapShards(localValues.workspace, ownerValueShards, [totalQ, topk], "BF16", TensorParallelism.Column);
     using ownerIndices = this.wrapShards(localIndices.workspace, ownerIndexShards, [totalQ, topk], "I32", TensorParallelism.Column);

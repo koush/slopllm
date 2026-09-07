@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { parseLoaderArgs, parseWorkerCommand, validateWorkerModelArgs } from "../src/run_model_loader";
+import { parseLoaderArgs, parseWorkerCommand, validateWorkerModelArgs, workerEnvironment } from "../src/run_model_loader";
 import { parseModelArgs } from "../src/model_cli";
 
 describe("model loader arguments", () => {
@@ -50,6 +50,26 @@ describe("model loader arguments", () => {
     assert.throws(() => parseWorkerCommand([], []), /JSON string array/);
     assert.throws(() => parseWorkerCommand(["executor", 1], []), /JSON string array/);
     assert.throws(() => parseWorkerCommand(["executor"], []), /Invalid executor entry point/);
+  });
+
+  it("supports executor-only environment overrides and unsetting inherited variables", () => {
+    const command = parseWorkerCommand({ command: ["src/openai-server.ts"], env: { GLM_GRAPH_DIAGNOSTICS: "0", REMOVE_ME: null } }, ["--arena", "48"]);
+    const inherited = { GLM_GRAPH_DIAGNOSTICS: "1", REMOVE_ME: "yes", KEEP_ME: "yes" };
+    assert.deepEqual(workerEnvironment(command, inherited), { GLM_GRAPH_DIAGNOSTICS: "0", KEEP_ME: "yes" });
+    assert.equal(inherited.GLM_GRAPH_DIAGNOSTICS, "1");
+    const updated = parseWorkerCommand({ env: { NEW_FLAG: "1" } }, [], command);
+    assert.equal(updated.entry, command.entry);
+    assert.deepEqual(updated.args, command.args);
+    assert.deepEqual(updated.env, { NEW_FLAG: "1" });
+    assert.deepEqual(parseWorkerCommand({ env: {} }, [], updated).env, {});
+  });
+
+  it("rejects invalid or loader-managed environment overrides", () => {
+    for (const env of [[], null, { FLAG: true }, { FLAG: 1 }, { "BAD=NAME": "x" }, { FLAG: "x\0y" },
+      { GLM_SKIP_MMAP_LOAD: "0" }, { GLM_ARENA_IPC_HANDLE_0: null }, { GLM_MODEL_LAYOUT_0: "x" }]) {
+      assert.throws(() => parseWorkerCommand({ command: ["src/openai-server.ts"], env }, []));
+    }
+    assert.throws(() => parseWorkerCommand({ env: {} }, []), /No executor command/);
   });
 
   it("rejects executor overrides of the resident model layout", () => {

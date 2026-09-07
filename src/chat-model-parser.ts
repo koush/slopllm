@@ -45,6 +45,11 @@ export abstract class ChatModelParser {
     return this._state;
   }
 
+  continueFrom(tokenIds: readonly number[]): void {
+    for (const tokenId of tokenIds) this.onToken(tokenId);
+    this.flushText();
+  }
+
   get producedToolCalls(): boolean {
     return this._producedToolCalls;
   }

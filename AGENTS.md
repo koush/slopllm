@@ -211,6 +211,24 @@ curl -N -X POST 'http://127.0.0.1:8099/restart?follow'
 
 Changing model/shared arguments requires restarting the loader itself. The control server has no authentication, so keep it bound to `127.0.0.1` unless it is protected by other means.
 
+Executor environment overrides can be supplied to `/run` with an object instead of a command array:
+
+```bash
+curl -X POST http://127.0.0.1:8099/run \
+  -H 'content-type: application/json' \
+  -d '{"command":["src/openai-server.ts","--port","8000"],"env":{"GLM_GRAPH_DIAGNOSTICS":"0"}}'
+```
+
+To keep the configured command but replace its environment overrides, use `/restart`:
+
+```bash
+curl -X POST http://127.0.0.1:8099/restart \
+  -H 'content-type: application/json' \
+  -d '{"env":{"GLM_GRAPH_DIAGNOSTICS":"0"}}'
+```
+
+Values are strings; `null` unsets an inherited variable. An `env` object replaces the complete override map, and `{}` restores inheritance. Empty-body restarts retain the configured overrides. Overrides affect only the executor, appear in `/status`, and cannot replace loader-managed CUDA IPC/layout variables. A new command array starts with no overrides.
+
 ## NCCL Topology
 
 The following environment variables hsould be used to override the default topology which prevents host staged all gather and all reduce when using NCCL.

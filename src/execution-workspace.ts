@@ -45,10 +45,16 @@ export async function executePlan<T>(captureManager: CaptureManager, ws: Executi
       const captureKey = [...phase.captureKey];
 
       if (!captureManager.disabled && captureKey.length > 0) {
-        warmup ||= !ExecutionState.isCaptured(captureManager, phase.states, captureKey);
+        warmup ||= !ExecutionState.isCaptured(captureManager, phase.states, captureKey, phase.inputs);
       }
 
       const phaseStart = performance.now();
+      if (process.env.GLM_GRAPH_DIAGNOSTICS === "1") {
+        console.warn(`[cuda-graph] phase begin key=${captureKey.join(",")} timing=${phase.timingName} states=${JSON.stringify(phase.states.map(state => ({
+          slot: state.inputIdsBuf.name, batch: state.batchSize, totalTokens: state.totalTokens,
+          seqLens: state.seqLens, kvLens: state.cache.getPagedKV().sequences.map(sequence => sequence.allocLen),
+        })))}`);
+      }
       const phaseResult = ExecutionState.captureAll(
         captureManager,
         phase.states,
@@ -68,6 +74,9 @@ export async function executePlan<T>(captureManager: CaptureManager, ws: Executi
         throw error;
       }
       onPhase?.(phase, (performance.now() - phaseStart) / 1000);
+      if (process.env.GLM_GRAPH_DIAGNOSTICS === "1") {
+        console.warn(`[cuda-graph] phase complete key=${captureKey.join(",")} timing=${phase.timingName}`);
+      }
 
       ws.clearTracking([phase.inputs, phaseResult as TensorTree]);
       step = plan.next(phaseResult);
@@ -354,9 +363,9 @@ export class ExecutionState {
   /**
    * isCaptured for a graph spanning several states. See captureAll.
    */
-  static isCaptured(captureManager: CaptureManager, states: readonly ExecutionState[], providedKeyParams: (string | number)[]): boolean {
+  static isCaptured(captureManager: CaptureManager, states: readonly ExecutionState[], providedKeyParams: (string | number)[], inputs: { [name: string]: Tensor } = {}): boolean {
     if (providedKeyParams.length === 0) return false;
-    return captureManager.isCaptured(this.effectiveKeyParams(captureManager, states, providedKeyParams));
+    return captureManager.isCaptured(this.effectiveKeyParams(captureManager, states, providedKeyParams), inputs);
   }
 
   /**
@@ -372,11 +381,27 @@ export class ExecutionState {
     if (providedKeyParams.length === 0) return fn(false, inputs);
     const baseKey = this.baseKeyParams(states, providedKeyParams).join(",");
     const keyParams = this.effectiveKeyParams(captureManager, states, providedKeyParams);
+    const diagnosticBindings: Record<string, string> | undefined = process.env.GLM_GRAPH_DIAGNOSTICS === "1" ? {} : undefined;
+    if (diagnosticBindings) {
+      const record = (name: string, tensor: Tensor) => {
+        diagnosticBindings[name] = `${tensor.name ?? "unnamed"}:${tensor.type}[${tensor.shape}]:${JSON.stringify(tensor.memoryRanges())}`;
+      };
+      for (const [index, state] of states.entries()) {
+        // These pointers are captured through the closure, not the input shim.
+        for (const [name, value] of Object.entries(state)) {
+          if (value instanceof Tensor && name !== "input") record(`state${index}.${name}`, value);
+        }
+        for (const [name, value] of Object.entries(state.customMask ?? {})) {
+          if (value instanceof Tensor) record(`state${index}.mask.${name}`, value);
+        }
+        for (const [name, value] of state.cache.getPagedKV().tensors) record(`state${index}.cache.${name}`, value);
+      }
+    }
     return captureManager.run(inputs, (capturing, capturedInputs) => {
       const result = fn(capturing, capturedInputs);
       captureManager.recordLengthVariant(baseKey, states.some(s => !s.paddedKvLenInvariant));
       return result as TensorTree;
-    }, keyParams) as T;
+    }, keyParams, diagnosticBindings) as T;
   }
 
   isCaptured(captureManager: CaptureManager, providedKeyParams: (string | number)[]): boolean {

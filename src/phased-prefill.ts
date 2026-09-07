@@ -18,23 +18,10 @@ export interface RaggedInputSplit {
 }
 
 export function splitRaggedInput(inputIds: number[][]): RaggedInputSplit | undefined {
-  if (inputIds.length === 0 || inputIds.some(ids => ids.length < 2)) return undefined;
-
-  const totalTokens = inputIds.reduce((sum, ids) => sum + ids.length, 0);
-  const targetA = Math.floor(totalTokens / 2);
-  const cuts = inputIds.map(() => 1);
-  let remaining = targetA - cuts.length;
-
-  for (let i = 0; i < inputIds.length && remaining > 0; i++) {
-    const take = Math.min(inputIds[i].length - 2, remaining);
-    cuts[i] += take;
-    remaining -= take;
-  }
-  if (remaining !== 0) return undefined;
-
-  const inputA = inputIds.map((ids, i) => ids.slice(0, cuts[i]));
-  const inputB = inputIds.map((ids, i) => ids.slice(cuts[i]));
-  return { inputA, inputB, nextA: inputB.map(ids => ids[0]) };
+  if (inputIds.length !== 1 || inputIds[0].length < 2) return undefined;
+  const ids = inputIds[0];
+  const cut = Math.floor(ids.length / 2);
+  return { inputA: [ids.slice(0, cut)], inputB: [ids.slice(cut)], nextA: [ids[cut]] };
 }
 
 function closeGenerator(generator: Generator<void, Tensor, void>): void {
@@ -63,7 +50,10 @@ export class PhasedPrefillRunner {
   private runGeneratorPair(a: PhasedForward, b: PhasedForward, consume?: PairConsumer): void {
     let resultA: IteratorResult<void, Tensor> | undefined;
     let resultB: IteratorResult<void, Tensor> | undefined;
-    if (a.state.batchSize === 1 && b.state.batchSize === 1) {
+    try {
+      if (a.state.batchSize !== 1 || b.state.batchSize !== 1) {
+        throw new Error("Phased prefill requires a single sequence in each plan");
+      }
       const installPrefetch = (cacheIdx: number, field: string, stream: unknown) => {
         const key = `sparseMlaPrefetchLayer_${cacheIdx}`;
         const extra = b.state.extras.get(key) ?? {};
@@ -72,8 +62,6 @@ export class PhasedPrefillRunner {
       };
       a.state.extras.set("setCkv", (cacheIdx: number, stream: unknown) => installPrefetch(cacheIdx, "stream", stream));
       a.state.extras.set("setIndexerK", (cacheIdx: number, stream: unknown) => installPrefetch(cacheIdx, "indexerStream", stream));
-    }
-    try {
       resultA = a.generator.next();
       if (resultA.done) {
         resultA.value[Symbol.dispose]();

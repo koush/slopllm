@@ -1,10 +1,14 @@
 import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { before, describe, it } from "node:test";
 import { GlmParser } from "../src/glm-parser";
+import { Glm51Model } from "../src/glm51_model";
 import { resolveModelPath } from "../src/model_path";
 import { DefaultChatModelParser, type OutputParserEvent } from "../src/chat-model-parser";
 import { glmParserCorpus } from "./glm_parser_corpus";
+import { tokenizeContinuation } from "../src/chat-continuation";
 
 type LoadedTokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
 
@@ -12,8 +16,12 @@ describe("GlmParser", () => {
   let tokenizer: LoadedTokenizer;
 
   before(async () => {
-    const tokenizerDir = resolveModelPath("lukealonso/GLM-5.2-NVFP4");
+    const tokenizerDir = resolveModelPath(process.env.GLM_TOKENIZER_REPO ?? "lukealonso/GLM-5.2-NVFP4");
     tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
+    const templatePath = path.join(tokenizerDir, "chat_template.jinja");
+    if (fs.existsSync(templatePath)) {
+      tokenizer.chat_template = fs.readFileSync(templatePath, "utf-8").replace(/\.(\d+)\b/g, "[$1]");
+    }
   });
 
   for (const sample of glmParserCorpus) {
@@ -60,6 +68,39 @@ describe("GlmParser", () => {
     events.push(...parser.finish());
 
     assert.deepEqual(events, [{ type: "content_delta", text: "READY" }]);
+  });
+
+  it("continues an assistant prefix without returning the prefix as new output", () => {
+    const parser = new GlmParser(tokenizer, { continue_final_message: true });
+    parser.continueFrom(tokenizer.encode("The answer is", { add_special_tokens: false }));
+    const events = tokenizer.encode(" Paris.", { add_special_tokens: false }).flatMap(id => parser.onToken(id));
+    events.push(...parser.finish());
+    assert.equal(events.map(event => event.type === "content_delta" ? event.text : "").join(""), " Paris.");
+    assert.equal(parser.state, "content");
+  });
+
+  it("forwards continuation mode through the model parser factory", () => {
+    const parser = Glm51Model.prototype.createParser.call({ tokenizer } as Glm51Model, { continue_final_message: true });
+    parser.continueFrom(tokenizer.encode("2", { add_special_tokens: false }));
+    const events = tokenizer.encode(" + 2 = 4", { add_special_tokens: false }).flatMap(id => parser.onToken(id));
+    events.push(...parser.finish());
+    assert.ok(events.every(event => event.type === "content_delta"));
+    assert.equal(events.map(event => event.type === "content_delta" ? event.text : "").join(""), " + 2 = 4");
+  });
+
+  it("renders a continuation with the real GLM chat template", () => {
+    const ids = tokenizeContinuation(tokenizer, [
+      { role: "user", content: "Name the capital of France." },
+      { role: "assistant", content: "The capital is " },
+    ], undefined, { continue_final_message: true });
+    const text = tokenizer.decode(ids, { skip_special_tokens: false });
+    assert.ok(text.endsWith("The capital is "), text);
+  });
+
+  it("preserves an open reasoning block in an assistant continuation", () => {
+    const parser = new GlmParser(tokenizer, { continue_final_message: true });
+    parser.continueFrom(tokenizer.encode("<think>Let me consider", { add_special_tokens: false }));
+    assert.equal(parser.state, "reasoning");
   });
 
   it("reports a tool call truncated by the end of generation", () => {

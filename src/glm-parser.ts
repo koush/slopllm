@@ -7,6 +7,7 @@ import {
 } from "./chat-model-parser";
 
 export interface GlmChatTemplateKwargs {
+   continue_final_message?: boolean;
   enable_thinking?: boolean;
   reasoning_effort?: "high" | "max";
 }
@@ -19,7 +20,7 @@ export class GlmParser extends ChatModelParser {
     super(
       tokenizer,
       resolveGlmControlTokens(tokenizer),
-      kwargs.enable_thinking !== false ? "reasoning" : "content",
+       !kwargs.continue_final_message && kwargs.enable_thinking !== false ? "reasoning" : "content",
     );
   }
 

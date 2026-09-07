@@ -325,6 +325,7 @@ export class Glm51Model extends ChatModel {
 
   override createParser(chatTemplateKwargs: ChatTemplateKwargs = {}): GlmParser {
     return new GlmParser(this.tokenizer, {
+      continue_final_message: chatTemplateKwargs.continue_final_message,
       enable_thinking: chatTemplateKwargs.enable_thinking,
     });
   }

@@ -13,6 +13,7 @@ export interface LoaderArgs {
 export interface WorkerCommand {
   entry: string;
   args: string[];
+  env?: Record<string, string | null>;
 }
 
 export function parseLoaderArgs(argv: string[]): LoaderArgs {
@@ -48,7 +49,28 @@ function sendJson(res: http.ServerResponse, status: number, body: object): void 
   res.end(JSON.stringify(body));
 }
 
-export function parseWorkerCommand(value: unknown, sharedArgs: string[]): WorkerCommand {
+export function parseWorkerCommand(value: unknown, sharedArgs: string[], previous?: WorkerCommand | null): WorkerCommand {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const options = value as { command?: unknown; env?: unknown };
+    if (options.command === undefined && options.env === undefined) {
+      throw new Error("Expected a JSON string array or an object with command and/or env");
+    }
+    const command = options.command === undefined ? previous : parseWorkerCommand(options.command, sharedArgs);
+    if (!command) throw new Error("No executor command has been configured");
+    if (options.env === undefined) return command;
+    if (!options.env || typeof options.env !== "object" || Array.isArray(options.env)) {
+      throw new Error("env must be an object of strings or null (to unset a variable)");
+    }
+    for (const [name, value] of Object.entries(options.env)) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || (value !== null && (typeof value !== "string" || value.includes("\0")))) {
+        throw new Error(`Invalid executor environment variable: ${name}`);
+      }
+      if (/^GLM_(ARENA_IPC_HANDLE_|ARENA_LAYOUT_|MODEL_LAYOUT_)/.test(name) || ["GLM_SKIP_MMAP_LOAD", "GLM_MODEL_LOAD_REPLAY"].includes(name)) {
+        throw new Error(`Cannot override loader-managed environment variable: ${name}`);
+      }
+    }
+    return { ...command, env: { ...options.env } as Record<string, string | null> };
+  }
   if (!Array.isArray(value) || value.length === 0 || value.some(arg => typeof arg !== "string")) {
     throw new Error('Expected a JSON string array such as ["src/run_qwen3_unified.ts", "--batch"]');
   }
@@ -68,7 +90,7 @@ export function validateWorkerModelArgs(commandArgs: string[], expected: ModelCl
   }
 }
 
-async function readWorkerCommand(req: http.IncomingMessage, sharedArgs: string[]): Promise<WorkerCommand | null> {
+async function readWorkerCommand(req: http.IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let length = 0;
   for await (const chunk of req) {
@@ -85,7 +107,16 @@ async function readWorkerCommand(req: http.IncomingMessage, sharedArgs: string[]
   } catch {
     throw new Error("Request body must be valid JSON");
   }
-  return parseWorkerCommand(value, sharedArgs);
+  return value;
+}
+
+export function workerEnvironment(command: WorkerCommand, inherited: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...inherited };
+  for (const [name, value] of Object.entries(command.env ?? {})) {
+    if (value === null) delete env[name];
+    else env[name] = value;
+  }
+  return env;
 }
 
 async function main(): Promise<void> {
@@ -135,6 +166,7 @@ async function main(): Promise<void> {
     lastSignal = null;
     lastError = null;
     const next = fork(workerCommand.entry, workerCommand.args, {
+      env: workerEnvironment(workerCommand, process.env),
       execArgv: ["--require", require.resolve("tsx/cjs")],
       stdio: ["inherit", "pipe", "pipe", "ipc"],
     });
@@ -223,6 +255,7 @@ async function main(): Promise<void> {
         pid: worker?.pid ?? null,
         entry: workerCommand?.entry ?? null,
         args: workerCommand?.args ?? [],
+        env: workerCommand?.env ?? {},
         lastExitCode,
         lastSignal,
         lastError,
@@ -234,8 +267,11 @@ async function main(): Promise<void> {
       return;
     }
     if (req.method === "POST" && url.pathname === "/run") {
-      void readWorkerCommand(req, loaderArgs.sharedArgs).then(command => serializeLifecycle(() => {
-        if (command) workerCommand = command;
+      void readWorkerCommand(req).then(value => serializeLifecycle(() => {
+        if (worker) throw new Error("Executor worker is already running");
+        const command = value === null ? workerCommand : parseWorkerCommand(value, loaderArgs.sharedArgs, workerCommand);
+        if (command) validateWorkerModelArgs(command.args, modelArgs);
+        workerCommand = command;
         if (!workerCommand) throw new Error("No executor command was provided");
         if (url.searchParams.has("follow")) {
           res.writeHead(200, {
@@ -267,8 +303,12 @@ async function main(): Promise<void> {
         sendJson(res, 400, { error: "No executor command has been configured" });
         return;
       }
-      void serializeLifecycle(async () => {
+      void readWorkerCommand(req).then(value => serializeLifecycle(async () => {
+        const command = value === null ? workerCommand : parseWorkerCommand(value, loaderArgs.sharedArgs, workerCommand);
+        if (!command) throw new Error("No executor command has been configured");
+        validateWorkerModelArgs(command.args, modelArgs);
         await stopWorker();
+        workerCommand = command;
         if (url.searchParams.has("follow")) {
           res.writeHead(200, {
             "content-type": "text/plain; charset=utf-8",
@@ -282,7 +322,7 @@ async function main(): Promise<void> {
           startWorker();
           sendJson(res, 202, { state: "running", pid: worker!.pid });
         }
-      }).catch(error => {
+      })).catch(error => {
         if (!res.headersSent) sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
         else if (!res.writableEnded) res.end(`Executor failed: ${error instanceof Error ? error.message : String(error)}\n`);
       });

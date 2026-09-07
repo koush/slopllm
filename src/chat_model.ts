@@ -107,6 +107,7 @@ export function loadGenerationConfig(modelDir: string): GenerationConfig {
 export type Tokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
 
 export interface ChatTemplateKwargs {
+   continue_final_message?: boolean;
   enable_thinking?: boolean;
   [key: string]: unknown;
 }

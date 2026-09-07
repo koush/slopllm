@@ -385,11 +385,11 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     glm.free();
   });
 
-  it("splits ragged input into globally balanced non-empty halves", () => {
-    const input = [[1, 2, 3, 4, 5, 6, 7, 8], [11, 12, 13, 14], [21, 22]];
+  it("splits a single sequence into balanced non-empty halves", () => {
+    const input = [[1, 2, 3, 4, 5, 6, 7]];
     const split = splitRaggedInput(input)!;
-    assert.equal(split.inputA.reduce((sum, ids) => sum + ids.length, 0), 7);
-    assert.equal(split.inputB.reduce((sum, ids) => sum + ids.length, 0), 7);
+    assert.equal(split.inputA[0].length, 3);
+    assert.equal(split.inputB[0].length, 4);
     assert.deepStrictEqual(split.nextA, split.inputB.map(ids => ids[0]));
     for (let i = 0; i < input.length; i++) {
       assert.ok(split.inputA[i].length > 0);
@@ -397,6 +397,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       assert.deepStrictEqual([...split.inputA[i], ...split.inputB[i]], input[i]);
     }
     assert.equal(splitRaggedInput([[1], [2, 3]]), undefined);
+    assert.equal(splitRaggedInput([[1, 2], [3, 4]]), undefined);
   });
 
   it("rolls back an unstarted phased MTP plan", () => {

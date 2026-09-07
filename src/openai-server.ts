@@ -1,6 +1,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { CaptureManager } from "./capture-manager";
+import { tokenizeContinuation } from "./chat-continuation";
 import { type OutputParserEvent } from "./chat-model-parser";
 import { ChatModel, ChatCache, ChatTemplateKwargs, loadGenerationConfig, loadMaxPositionEmbeddings, type MtpDraftBatch, SamplingParams, type TokenSelector, Tokenizer } from "./chat_model";
 import { DeviceOps } from "./device_ops";
@@ -139,6 +140,12 @@ function tokenizeMessages(
   tools?: unknown[],
   chatTemplateKwargs: ChatTemplateKwargs = {},
 ): number[] {
+  if (chatTemplateKwargs.continue_final_message !== undefined && typeof chatTemplateKwargs.continue_final_message !== "boolean") {
+    throw new Error("continue_final_message must be a boolean");
+  }
+  if (chatTemplateKwargs.continue_final_message) {
+    return tokenizeContinuation(tokenizer, messages, tools, chatTemplateKwargs);
+  }
   try {
     const opts: any = {
       ...chatTemplateKwargs,
@@ -1216,6 +1223,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         return;
       }
       const chatTemplateKwargs: ChatTemplateKwargs = { ...(params.chat_template_kwargs ?? {}) };
+      if (params.continue_final_message !== undefined) {
+        chatTemplateKwargs.continue_final_message = params.continue_final_message;
+      }
       if (params.enable_thinking !== undefined) {
         if (typeof params.enable_thinking !== "boolean") {
           sendJSON(res, 400, { error: { message: "enable_thinking must be a boolean", type: "invalid_request_error" } });
@@ -1269,6 +1279,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       try {
         inputIds = tokenizeMessages(tokenizer, messages, tools, chatTemplateKwargs);
         parser = model.createParser(chatTemplateKwargs);
+        if (chatTemplateKwargs.continue_final_message) {
+          parser.continueFrom(tokenizer.encode(messages[messages.length - 1].content as string, { add_special_tokens: false }));
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unable to prepare chat prompt";
         sendJSON(res, 400, { error: { message, type: "invalid_request_error" } });
@@ -1277,6 +1290,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const maxPromptTokens = Math.max(1, maxModelLen - maxTokens);
       if (inputIds.length > maxPromptTokens) {
         inputIds.splice(0, inputIds.length - maxPromptTokens);
+      }
+
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role !== "user") continue;
+        console.log(`Request ${id}: last_user_message=${JSON.stringify(messages[i].content)}`);
+        break;
       }
 
       const completionReq: CompletionRequest = {
@@ -1486,7 +1505,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           sendJSON(res, 400, { error: { message: "chat_template_kwargs must be an object", type: "invalid_request_error" } });
           return;
         }
-        const tokens = tokenizeMessages(tokenizer, messages, tools, chatTemplateKwargs);
+        const tokens = tokenizeMessages(tokenizer, messages, tools, {
+          ...chatTemplateKwargs,
+          ...(params.continue_final_message !== undefined ? { continue_final_message: params.continue_final_message } : {}),
+        });
         sendJSON(res, 200, {
           count: tokens.length,
           max_model_len: maxModelLen,
