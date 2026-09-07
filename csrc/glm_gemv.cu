@@ -728,13 +728,12 @@ nvfp4_dequantize_gemm_smem_kernel(
 // No shared memory — each warp reads input directly from global memory (L1-cached).
 // This eliminates __syncthreads() barriers present in the tiled version.
 //
-// Template parameter RowsPerWarp: 1 for normal K (> 512), 2 for small K (<= 512).
-// When RowsPerWarp=2, lanes 0-15 compute row0 and lanes 16-31 compute row1,
-// doubling throughput when num_k_groups <= 32 (half the warp would otherwise
-// sit idle).  Each block covers GEMV_ROWS_PER_BLOCK * RowsPerWarp rows.
+// RowsPerWarp partitions a warp into independent output-row reductions.
+// <2> uses 16 lanes per row; <8> uses 4 and is restricted to K <= 512.
+// Each block covers GEMV_ROWS_PER_BLOCK * RowsPerWarp rows.
 // ---------------------------------------------------------------------------
 
-template <int RowsPerWarp>
+template <int RowsPerWarp, bool Fixed6144 = false>
 __global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
 nvfp4_mul_mat_id_kernel(
     __nv_bfloat16* __restrict__ output,
@@ -767,7 +766,7 @@ nvfp4_mul_mat_id_kernel(
     const __nv_fp8_e4m3* scale_row = scale_ptrs[eid] + (size_t)row * (K / NVFP4_QUANT_GROUP);
     float scale_2_val = *scale2_ptrs[eid];
 
-    int num_k_groups = K / NVFP4_QUANT_GROUP;
+    int num_k_groups = Fixed6144 ? 6144 / NVFP4_QUANT_GROUP : K / NVFP4_QUANT_GROUP;
     bool row_valid = row < N;
 
     float sum = 0.0f;
@@ -821,6 +820,10 @@ nvfp4_mul_mat_id_kernel(
             sum += gsum * scale;
         }
       } else {
+        // Expose independent group loads for the production gate/up shape.
+        // Two matches the existing compiler unrolling for other shapes.
+        constexpr int OUTER_UNROLL = Fixed6144 ? 4 : 2;
+        #pragma unroll OUTER_UNROLL
         for (int g = inner_lane; g < num_k_groups; g += LANES_PER_ROW) {
             float scale = fp8_e4m3_to_float(scale_row[g]) * scale_2_val;
             int k_start = g * NVFP4_QUANT_GROUP;
@@ -1356,14 +1359,25 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
             constexpr int ROWS_PER_BLOCK_SMALLK = GEMV_ROWS_PER_BLOCK * 2;
             int grid_rpw_smallk = count * ((N + ROWS_PER_BLOCK_SMALLK - 1) / ROWS_PER_BLOCK_SMALLK);
             if (grid_rpw_smallk >= MIN_ROWSPERWARP_BLOCKS) {
-                nvfp4_mul_mat_id_kernel<2><<<grid_rpw_smallk, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-                    (__nv_bfloat16*)output,
-                    (const __nv_bfloat16*)input,
-                    (const uint8_t* const*)weight_ptrs,
-                    (const __nv_fp8_e4m3* const*)scale_ptrs,
-                    (const float* const*)scale2_ptrs,
-                    expert_ids, top_k,
-                    count, N, K);
+                if (N == 256 && K == 6144) {
+                    nvfp4_mul_mat_id_kernel<2, true><<<grid_rpw_smallk, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                        (__nv_bfloat16*)output,
+                        (const __nv_bfloat16*)input,
+                        (const uint8_t* const*)weight_ptrs,
+                        (const __nv_fp8_e4m3* const*)scale_ptrs,
+                        (const float* const*)scale2_ptrs,
+                        expert_ids, top_k,
+                        count, N, K);
+                } else {
+                    nvfp4_mul_mat_id_kernel<2><<<grid_rpw_smallk, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                        (__nv_bfloat16*)output,
+                        (const __nv_bfloat16*)input,
+                        (const uint8_t* const*)weight_ptrs,
+                        (const __nv_fp8_e4m3* const*)scale_ptrs,
+                        (const float* const*)scale2_ptrs,
+                        expert_ids, top_k,
+                        count, N, K);
+                }
                 return;
             }
             int grid_rpw_normalk = count * ((N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);

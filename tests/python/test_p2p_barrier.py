@@ -121,7 +121,7 @@ class TestP2PBarrier:
         self._synchronize_all()
 
     def test_p2p_barrier_matches_split(self):
-        """p2pBarrier (arrive+wait fused at the host) and the explicit arrive/wait
+        """p2pBarrier (fused publish+spin kernel) and the explicit arrive/wait
         pair are interchangeable: interleaving them across rounds completes."""
         instances = self._setup_p2p()
         for round_idx in range(10):

@@ -455,13 +455,14 @@ void glm_p2p_reduce_gather_write(GlmCtx* ctx,
     void* p4, void* p5, void* p6, void* p7,
     int N, int chunk_len, int rank, int dtype);
 
-// P2P barrier: increment seq counter, publish flag, wait for all peers.
+// P2P barrier: single fused kernel that increments the seq counter, publishes
+// the flag, and spins on peers' flags. Same seq-counter progression as the
+// split pair below, one launch instead of two.
 void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank = -1);
 
 // P2P barrier split into two phases. Between arrive and wait the caller may
 // launch other work on the same stream; arrive's release makes prior writes
 // visible, wait's acquire sees peers' writes before subsequent reads.
-// glm_p2p_barrier(ctx, inst, peer_rank) == arrive then wait on the same stream.
 void glm_p2p_arrive(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank = -1);
 void glm_p2p_wait(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank = -1);
 

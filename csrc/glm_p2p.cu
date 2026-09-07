@@ -36,19 +36,89 @@ constexpr int P2P_AR_VEC_BF16 = 8;   // uint4 = 8 bf16
 constexpr int P2P_AR_VEC_F32 = 4;    // uint4 = 4 fp32
 
 // ---------------------------------------------------------------------------
-// P2P barrier, split into arrive + wait so callers can overlap work between
-// publishing their flag and spinning on peers' flags.
+// P2P barrier. Three entry points share the publish/spin device methods below:
 //
-// arrive: increment my_seq_counter, publish its low 32 bits to peers
-//         (release.sys).
-// wait:   read my_seq_counter back to recover the target, spin on peers' flags
-//         (acquire.sys). Safe because the API is single-stream per instance:
-//         no other arrive touches my_seq_counter between the two launches, so
-//         *my_seq_counter == s (the value arrive computed) when wait reads it.
+// arrive:  increment my_seq_counter, publish its low 32 bits to peers
+//          (release.sys).
+// wait:    read my_seq_counter back to recover the target, spin on peers'
+//          flags (acquire.sys). Safe because the API is single-stream per
+//          instance: no other arrive touches my_seq_counter between the two
+//          launches, so *my_seq_counter == s (the value arrive computed) when
+//          wait reads it.
+// barrier: fused arrive + wait in a single launch: publish, then spin. Uses
+//          the atomicAdd result directly, so it does not rely on the read-back
+//          invariant above. Same seq-counter progression as the split pair.
+//
+// The split pair exists so callers can overlap work between publishing their
+// flag and spinning on peers' flags.
 //
 // Graph-capturable: my_seq_counter lives in device memory and is atomicAdd'd
 // fresh each replay; wait reads it device-side, so no host-encoded seq.
 // ---------------------------------------------------------------------------
+
+__device__ __forceinline__ void p2p_barrier_publish(
+    unsigned int seq,
+    int* const* s_peer_flags,
+    int my_rank,
+    int world_size,
+    int peer_rank,
+    int tid)
+{
+    bool active = (peer_rank < 0 && tid < world_size) ||
+                  (peer_rank >= 0 && tid == peer_rank);
+
+    if (active) {
+        unsigned int val = seq;
+        if (tid == my_rank) {
+            s_peer_flags[my_rank][my_rank] = (int)val;
+        } else {
+            // per Claude
+            // Kernel completion on GPU *i* is a system-scope synchronizing event:
+            // it drains the device's caches and write buffers to the point of coherence.
+            // This is exactly why `cudaMemcpyPeerAsync` after a kernel on the same stream works,
+            // and why the host can read results after `cudaStreamSynchronize`. So yes — all
+            // of kernel 1's P2P stores are pushed out before kernel 2 begins issuing. That edge
+            // is real, and the `.release` *ordering* on the flag store is redundant with
+            // respect to it when arrive is a standalone kernel.
+
+            // asm volatile("st.global.relaxed.sys.s32 [%0], %1;"
+            //              :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
+
+            // so this is not needed when arrive is its own kernel because the
+            // kernel boundary gaurantees it. however when the publish is FUSED
+            // with a spin (p2p_barrier_kernel) or with a real op then it would
+            // be needed.
+            asm volatile("st.global.release.sys.s32 [%0], %1;"
+                         :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
+        }
+    }
+    __syncwarp();
+}
+
+__device__ __forceinline__ void p2p_barrier_spin(
+    unsigned int seq,
+    int* const* s_peer_flags,
+    int my_rank,
+    int world_size,
+    int peer_rank,
+    int nanosleep_ns,
+    int tid)
+{
+    bool active = (peer_rank < 0 && tid < world_size) ||
+                  (peer_rank >= 0 && tid == peer_rank);
+
+    if (active) {
+        unsigned int target = seq;
+        int* my_flags = s_peer_flags[my_rank];
+        unsigned int v;
+        do {
+            asm volatile("ld.acquire.sys.b32 %0, [%1];"
+                         : "=r"(v) : "l"(my_flags + tid));
+            if ((int)(v - target) < 0) __nanosleep(nanosleep_ns);
+        } while ((int)(v - target) < 0);
+    }
+    __syncwarp();
+}
 
 __global__ void __launch_bounds__(P2P_BARRIER_BLOCK_SIZE, 1)
 p2p_arrive_kernel(
@@ -73,34 +143,7 @@ p2p_arrive_kernel(
     }
     __syncwarp();
 
-    unsigned int seq = s_seq;
-
-    bool active = (peer_rank < 0 && tid < world_size) ||
-                  (peer_rank >= 0 && tid == peer_rank);
-
-    if (active) {
-        unsigned int val = seq;
-        if (tid == my_rank) {
-            s_peer_flags[my_rank][my_rank] = (int)val;
-        } else {
-            // per Claude
-            // Kernel completion on GPU *i* is a system-scope synchronizing event:
-            // it drains the device's caches and write buffers to the point of coherence.
-            // This is exactly why `cudaMemcpyPeerAsync` after a kernel on the same stream works,
-            // and why the host can read results after `cudaStreamSynchronize`. So yes — all of
-            // kernel 1's P2P stores are pushed out before kernel 2 begins issuing. That edge is
-            // real, and the `.release` *ordering* on the flag store is redundant with respect to it.
-
-            // asm volatile("st.global.relaxed.sys.s32 [%0], %1;"
-            //              :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
-
-            // so this is not needed because the kernel boundary gaurantees it.
-            // however if the arrive/barrier/op is FUSED then it would be needed.
-            asm volatile("st.global.release.sys.s32 [%0], %1;"
-                         :: "l"(s_peer_flags[tid] + my_rank), "r"(val));
-        }
-    }
-    __syncwarp();
+    p2p_barrier_publish(s_seq, s_peer_flags, my_rank, world_size, peer_rank, tid);
     (void)nanosleep_ns;  // unused on the publish side
 }
 
@@ -131,22 +174,34 @@ p2p_wait_kernel(
     }
     __syncwarp();
 
-    unsigned int seq = s_seq;
+    p2p_barrier_spin(s_seq, s_peer_flags, my_rank, world_size, peer_rank, nanosleep_ns, tid);
+}
 
-    bool active = (peer_rank < 0 && tid < world_size) ||
-                  (peer_rank >= 0 && tid == peer_rank);
+__global__ void __launch_bounds__(P2P_BARRIER_BLOCK_SIZE, 1)
+p2p_barrier_kernel(
+    int* const* peer_flags,
+    unsigned long long* my_seq_counter,
+    int my_rank,
+    int world_size,
+    int nanosleep_ns,
+    int peer_rank = -1)
+{
+    int tid = threadIdx.x;
 
-    if (active) {
-        unsigned int target = seq;
-        int* my_flags = s_peer_flags[my_rank];
-        unsigned int v;
-        do {
-            asm volatile("ld.acquire.sys.b32 %0, [%1];"
-                         : "=r"(v) : "l"(my_flags + tid));
-            if ((int)(v - target) < 0) __nanosleep(nanosleep_ns);
-        } while ((int)(v - target) < 0);
+    __shared__ unsigned int s_seq;
+    __shared__ int*         s_peer_flags[P2P_AR_MAX_WORLD];
+
+    if (tid == 0) {
+        unsigned long long s = atomicAdd(my_seq_counter, 1ULL) + 1ULL;
+        s_seq = (unsigned int)s;
+    }
+    if (tid < world_size) {
+        s_peer_flags[tid] = peer_flags[tid];
     }
     __syncwarp();
+
+    p2p_barrier_publish(s_seq, s_peer_flags, my_rank, world_size, peer_rank, tid);
+    p2p_barrier_spin(s_seq, s_peer_flags, my_rank, world_size, peer_rank, nanosleep_ns, tid);
 }
 
 
@@ -620,8 +675,11 @@ void glm_p2p_wait(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank) {
 }
 
 void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank) {
-    glm_p2p_arrive(ctx, inst, peer_rank);
-    glm_p2p_wait(ctx, inst, peer_rank);
+    cudaSetDevice(ctx->device_id);
+    p2p_barrier_kernel<<<1, P2P_BARRIER_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        inst->peer_flags_arr_d, inst->seq_counter_d,
+        inst->my_rank, inst->world_size,
+        inst->nanosleep_ns, peer_rank);
 }
 
 #define LAUNCH_AG_ROW_WRITE(N) \

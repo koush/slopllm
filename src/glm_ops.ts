@@ -1445,8 +1445,7 @@ export class GlmOps implements DeviceOps {
   }
 
   p2pBarrier(instance: number, peerRank: number = -1): void {
-    this.p2pArrive(instance, peerRank);
-    this.p2pWait(instance, peerRank);
+    getNativeAddon().p2pBarrier(this.ctx, instance, peerRank);
   }
 }
 

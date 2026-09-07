@@ -2089,10 +2089,12 @@ class P2PAllReduceGroup {
     }
   }
 
-  /** P2P barrier: sync all GPUs without data transfer. */
+  /** P2P barrier: sync all GPUs without data transfer (single fused kernel). */
   barrier(devices: readonly GlmOps[], peerRanks?: number[]): void {
-    this.arrive(devices, peerRanks);
-    this.wait(devices, peerRanks);
+    for (let i = 0; i < this.worldSize; ++i) {
+      const peerRank = peerRanks ? peerRanks[i] : -1;
+      devices[i].p2pBarrier(this.instances[i], peerRank);
+    }
     this.cleanupSources();
   }
 
