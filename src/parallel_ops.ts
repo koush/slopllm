@@ -3044,22 +3044,18 @@ export class ParallelOps implements DeviceOps {
       using qPeLin = qNormed.linear(qPeWeight);
       return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, qkRopeDim, ropeInterleave);
     });
-    using qAbsorbedStream = this.withStream(() => {
-      using qAbsorbedLin = qNormed.linear(absorbedWeight);
-      return state.isDecode
-        ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
-        : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
-    });
-    qAbsorbedStream.streamWaitEvent();
+    using qAbsorbedLin = qNormed.linear(absorbedWeight);
+    const qAbsorbed = state.isDecode
+      ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
+      : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
     qPeStream.streamWaitEvent();
-    const qAbsorbed = qAbsorbedStream.result as ParallelTensor;
     const qPe = qPeStream.result as ParallelTensor;
     const gatherQ = this.cast(kvCache).parallelism === TensorParallelism.Row;
     if (!gatherQ) {
       return { qAbsorbed, qPe };
     }
 
-    using localQAbsorbed = qAbsorbed;
+    using localQAbsorbed = qAbsorbed as ParallelTensor;
     using localQPe = qPe;
     const gathered = this.allGatherMultiple([localQAbsorbed, localQPe], qNormed.workspace);
     return { qAbsorbed: gathered[0], qPe: gathered[1] };

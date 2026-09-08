@@ -358,15 +358,12 @@ export class MetaOps implements DeviceOps {
             using qPeLin = qNormed.linear(qPeWeight);
             return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, qkRopeDim, ropeInterleave);
         });
-        using qAbsorbedStream = this.withStream(() => {
-            using qAbsorbedLin = qNormed.linear(absorbedWeight);
-            return state.isDecode
-                ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
-                : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
-        });
-        qAbsorbedStream.streamWaitEvent();
+        using qAbsorbedLin = qNormed.linear(absorbedWeight);
+        const qAbsorbed = state.isDecode
+            ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
+            : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
         qPeStream.streamWaitEvent();
-        return { qAbsorbed: qAbsorbedStream.result, qPe: qPeStream.result };
+        return { qAbsorbed, qPe: qPeStream.result };
     }
 
     kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void {

@@ -121,7 +121,7 @@ export class GlmTensor extends Tensor {
     if (n > 8) {
       const ptrs = new BigInt64Array(n);
       for (let i = 0; i < n; i++) {
-         ptrs[i] = BigInt(tensors[i].data);
+        ptrs[i] = BigInt(tensors[i].data);
       }
       this.h2d(Buffer.from(ptrs.buffer));
       return;
@@ -301,7 +301,7 @@ export class GlmTensor extends Tensor {
     // if (copyKind === MemcpyKind.DeviceToDevice && this.glm !== src.glm) {
     //   getNativeAddon().memcpyPeer(src.glm.ctx, this.data, this.glm.device, src.data, src.glm.device, bytes);
     // } else {
-      getNativeAddon().memcpy(src.glm.ctx, this.data, src.data, bytes, memcpyKindToNative(copyKind));
+    getNativeAddon().memcpy(src.glm.ctx, this.data, src.data, bytes, memcpyKindToNative(copyKind));
     // }
   }
 
@@ -321,7 +321,7 @@ export class GlmTensor extends Tensor {
     //     width, height, 1,
     //   );
     // } else {
-      getNativeAddon().memcpy2d(src.glm.ctx, this.data + dstOffset, dpitch, (src as GlmTensor).data + srcOffset, spitch, width, height, memcpyKindToNative(kind));
+    getNativeAddon().memcpy2d(src.glm.ctx, this.data + dstOffset, dpitch, (src as GlmTensor).data + srcOffset, spitch, width, height, memcpyKindToNative(kind));
     // }
   }
 
@@ -675,14 +675,14 @@ export class GlmTensor extends Tensor {
       using gemmWs = this.workspace.allocRaw(gemmWsSize);
       const gateOut = this.workspace.alloc([count, moeIntermediate], this.type);
       getNativeAddon().mmaMoeCoopGemm(ctx, gatePtrs.weightPtrs.data, gatePtrs.scalePtrs.data, gatePtrs.scale2Ptrs.data,
-                                       numExperts, moeIntermediate, hs, count, hs, scatterWs.data, 0, true, gemmWs.data, gateOut.data);
+        numExperts, moeIntermediate, hs, count, hs, scatterWs.data, 0, true, gemmWs.data, gateOut.data);
       return gateOut;
     });
 
     using upGemmWs = this.workspace.allocRaw(gemmWsSize);
     using upOut = this.workspace.alloc([count, moeIntermediate], this.type);
     getNativeAddon().mmaMoeCoopGemm(ctx, upPtrs.weightPtrs.data, upPtrs.scalePtrs.data, upPtrs.scale2Ptrs.data,
-                                     numExperts, moeIntermediate, hs, count, hs, scatterWs.data, 0, true, upGemmWs.data, upOut.data);
+      numExperts, moeIntermediate, hs, count, hs, scatterWs.data, 0, true, upGemmWs.data, upOut.data);
 
     gateStream.streamWaitEvent();
     using gateOut = gateStream.result;
@@ -690,8 +690,8 @@ export class GlmTensor extends Tensor {
     using downGemmWs = this.workspace.allocRaw(getNativeAddon().mmaMoeCoopGemmWorkspaceSize(count, hs));
     const downOut = this.workspace.alloc([count, hs], this.type);
     getNativeAddon().mmaMoeCoopGemm(ctx, downPtrs.weightPtrs.data, downPtrs.scalePtrs.data, downPtrs.scale2Ptrs.data,
-                                     numExperts, hs, moeIntermediate, count, hs, scatterWs.data, siluOut.data, false,
-                                     downGemmWs.data, downOut.data);
+      numExperts, hs, moeIntermediate, count, hs, scatterWs.data, siluOut.data, false,
+      downGemmWs.data, downOut.data);
     return downOut;
   }
 
@@ -984,15 +984,12 @@ export class GlmOps implements DeviceOps {
       using qPeLin = qNormed.linear(qPeWeight);
       return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, qkRopeDim, ropeInterleave);
     });
-    using qAbsorbedStream = this.withStream(() => {
-      using qAbsorbedLin = qNormed.linear(absorbedWeight);
-      return state.isDecode
-        ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
-        : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
-    });
-    qAbsorbedStream.streamWaitEvent();
+    using qAbsorbedLin = qNormed.linear(absorbedWeight);
+    const qAbsorbed = state.isDecode
+      ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
+      : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
     qPeStream.streamWaitEvent();
-    return { qAbsorbed: qAbsorbedStream.result, qPe: qPeStream.result };
+    return { qAbsorbed, qPe: qPeStream.result };
   }
 
   eventRecord(eventIdx: number, streamIdx: number): void {
@@ -1105,9 +1102,9 @@ export class GlmOps implements DeviceOps {
     const idxHeadDim = idxQ.shape[2];
     const pageSize = kData.shape[1];
     if (kData.type !== "U8" || kScaleData.type !== "F32"
-        || kData.shape[0] !== kScaleData.shape[0]
-        || pageSize !== kScaleData.shape[1]
-        || kData.shape[2] !== idxHeadDim) {
+      || kData.shape[0] !== kScaleData.shape[0]
+      || pageSize !== kScaleData.shape[1]
+      || kData.shape[2] !== idxHeadDim) {
       throw new Error(`indexerTopk: incompatible K ${kData.type}[${kData.shape}] and scales ${kScaleData.type}[${kScaleData.shape}]`);
     }
     const maxKvCapacity = kData.shape[0] * kData.shape[1];

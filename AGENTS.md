@@ -68,10 +68,7 @@ Key rules:
 
 ## Tensor Parallelism
 
-Weight parallelism is assigned per-tensor during loading:
-- **Column**: gate_proj, up_proj, embed_tokens, q_nope_proj, k_nope_proj, absorbed weight (output dim sharded across GPUs; linear output is Row-parallel)
-- **Row**: o_proj, down_proj, lm_head (input dim sharded; linear output is PartialSum, needs AllReduce)
-- **Replicated**: norms, bias, RoPE freqs, position IDs, q_pe_proj, v_proj, ckv_proj, k_pe_proj
+Weight parallelism is assigned per-tensor during loading.
 
 Linear op parallelism rules (weight × input → output):
 - Column × Replicated → Row (no comm)
@@ -85,14 +82,11 @@ Linear op parallelism rules (weight × input → output):
 When `--cp` flag is set (GLM-5.1 only), GPUs operate as context-parallel shards for attention while retaining tensor-parallel sharding for linear layers:
 
 - **KV cache is Row-sharded**: each GPU stores every Nth token's KV (tokens interleaved across GPUs). `PagedKVCache` uses `TensorParallelism.Row` for ckv/kpe tensors.
-- **MLA weights split by role**:
-  - **Replicated in CP** (were Column in TP-only): q_pe_proj, v_proj — so each GPU can compute attention independently over its KV shard.
-  - **Still Column-parallel in CP**: q_nope_proj, k_nope_proj, absorbed weight — the absorbed weight is computed from k_nope_proj × q_nope_proj BMM (Column × Column → Column). This causes Q to be Row-parallel after the absorbed projection, requiring an AllGather to Replicated before attention.
-  - **Still Row/Column-parallel in CP**: o_proj (Row → AllReduce), down_proj (Row → AllReduce), gate_proj/up_proj (Column) — same as TP-only mode.
 - **Position IDs**: decode/prefill kernels receive `cpWorldSize=N` and `cpRank=i`. The CUDA kernel assigns position `i, i+N, i+2N, ...` to GPU `i`.
 - **Prefill**: Each GPU runs MLA prefill over its token subset with `cpWorldSize`/`cpRank` params. The FlashInfer plan computes `effectivePageSize = pageSize / worldSize` and `effectiveNumHeads = numHeads` (not sharded). Output is `PartialSoftmax` — each shard has partial attention output + log-sum-exp.
 - **CP Merge**: Partial attention outputs are combined with an online-softmax merge. Small decode workloads use a custom P2P path; larger or prefill workloads use AllGather plus ReduceScatter.
 - **Page allocation**: `PagedKVCache` distributes pages round-robin across GPUs. Page `p` is stored on GPU `p % worldSize`. The effective page size per GPU is `pageSize / worldSize`.
+- **KV and Indexer K Prefetch**: During prefetch, the the next layer's kv is prefetched to avoid exposed q gather and CP merge on the critical path. Sparse CKV prefetc is also implemented for decode, but may be disabled since the performance gain was within run variance.
 
 ## Paged KV Cache (`src/paged_kv.ts`)
 
