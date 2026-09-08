@@ -7,6 +7,7 @@ import "./test_nccl_send_recv";
 import "./test_reduce_scatter";
 import "./test";
 import "./test_batch";
+import "./test_prefix_cache";
 import "./test_fp8";
 import "./test_no_graph";
 import "./test_graph";

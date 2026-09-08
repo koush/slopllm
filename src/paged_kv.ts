@@ -205,7 +205,12 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     let bestMatchTokens = 0;
     for (const sequence of [...this.sequences, ...this.staging.values()]) {
       if (sequence.pages.length === 0) continue;
-      const matchTokens = sequence.prefixMatch(inputIds);
+      let matchTokens = sequence.prefixMatch(inputIds);
+      // Only an exact self-match may retain a reported-but-unprocessed token
+      // for the caller. Reused KV must stop at the materialized boundary.
+      if (sequence !== targetSeq || matchTokens !== sequence.reportedTokenCount()) {
+        matchTokens = Math.min(matchTokens, sequence.allocLen);
+      }
       if (matchTokens > bestMatchTokens) {
         bestMatchTokens = matchTokens;
         bestSeq = sequence;
@@ -244,7 +249,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
         const srcPage = bestSeq.pages[keepPages];
         const dstPage = this.sequences[seqIdx].pages[keepPages];
         this.copyPage(srcPage.id, dstPage.id);
-        dstPage.tokenIds.push(...srcPage.tokenIds);
+        dstPage.tokenIds.push(...srcPage.tokenIds.slice(0, bestMatchTokens % this.pageSize));
         this.sequences[seqIdx].allocLen = bestMatchTokens;
       }
       return inputIds.slice(this.sequences[seqIdx].allocLen);

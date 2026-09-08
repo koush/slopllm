@@ -24,7 +24,7 @@ __device__ void heap_sift_down(HeapEntry* heap, int pos, int size) {
         if (smallest != pos) {
             HeapEntry tmp = heap[pos];
             heap[pos] = heap[smallest];
-            heap[pos] = tmp;
+            heap[smallest] = tmp;
             pos = smallest;
         } else break;
     }
@@ -51,10 +51,14 @@ __device__ void heap_insert(HeapEntry* heap, int& size, int capacity, float val,
 }
 
 __device__ float hash_to_random(unsigned int seed) {
-    seed ^= seed << 13;
-    seed ^= seed >> 17;
-    seed ^= seed << 5;
-    return (float)seed / (float)0xFFFFFFFFu;
+    // lowbias32 mixes consecutive counters; a single xorshift leaves draws correlated.
+    seed ^= seed >> 16;
+    seed *= 0x7feb352du;
+    seed ^= seed >> 15;
+    seed *= 0x846ca68bu;
+    seed ^= seed >> 16;
+    // Use 24 bits so float conversion cannot round the result up to 1.
+    return (float)(seed >> 8) * 0x1p-24f;
 }
 
 __device__ void insertion_sort_descending(HeapEntry* arr, int size) {
@@ -206,7 +210,7 @@ __device__ int sampling_softmax_topp_sample_and_append(
     int sampled = seq_topk_idxs[num_topk - 1];
     for (int i = 0; i < num_topk; i++) {
         cumsum += seq_topk_vals[i];
-        if (random_val <= cumsum) { sampled = seq_topk_idxs[i]; break; }
+        if (random_val < cumsum) { sampled = seq_topk_idxs[i]; break; }
     }
     seq_out[0] = sampled;
 

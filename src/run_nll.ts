@@ -13,7 +13,7 @@ import { Glm51Model } from "./glm51_model";
 import { bf16BytesToF32, GlmOps } from "./glm_ops";
 import { ParallelOps } from "./parallel_ops";
 
-const DEFAULT_MODEL_DIR = "/mnt/storage/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/2eff962076815828e4031aec2834ac6e22fb4434/";
+const DEFAULT_MODEL_DIR = "/mnt/storage/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-NVFP4snapshots/2eff962076815828e4031aec2834ac6e22fb4434/";
 
 const argv = process.argv.slice(2);
 const opt = (name: string, dflt: string) => {

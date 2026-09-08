@@ -7,7 +7,7 @@ import { Glm51Model } from "./glm51_model";
 import { GlmOps } from "./glm_ops";
 import { ParallelOps } from "./parallel_ops";
 
-const GLM51_MODEL_DIR = '/mnt/storage/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/2eff962076815828e4031aec2834ac6e22fb4434/';
+const GLM51_MODEL_DIR = '/mnt/storage/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-NVFP4snapshots/2eff962076815828e4031aec2834ac6e22fb4434/';
 const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp4";
 
 interface BenchArgs {
