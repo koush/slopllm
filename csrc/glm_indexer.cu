@@ -454,6 +454,8 @@ static __device__ __forceinline__ int idx_ordered_slot(
 }
 
 static __device__ __forceinline__ int bf16_key_bits(unsigned short u) {
+    // NaNs are invalid candidates, like masked -inf, not larger than finite logits.
+    if ((u & 0x7FFF) > 0x7F80) return 127;
     // Order-preserving float->uint key: negatives -> [0,0x7FFF] (reversed),
     // non-negatives -> [0x8000,0xFFFF]. Monotonic in value across the full range,
     // so histogram bucket order == score order. Scores are signed (final weighted

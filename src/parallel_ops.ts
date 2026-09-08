@@ -2857,16 +2857,16 @@ export class ParallelOps implements DeviceOps {
     return this.devices.flatMap(device => device.deviceHeapStats());
   }
 
-  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
+  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number, outProbs?: Tensor, outIds?: Tensor, supportCapacity?: number): void {
     const pLogits = logits as ParallelTensor;
     if (pLogits.parallelism === TensorParallelism.Row || pLogits.parallelism === TensorParallelism.Column) {
       using gathered = pLogits.allGather(pLogits.workspace);
-      this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, gathered, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
+      this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, gathered, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK, outProbs, outIds, supportCapacity);
       return;
     }
     if (pLogits.parallelism === TensorParallelism.PartialSum) {
       pLogits.allReduce();
-      this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK);
+      this.sampleBatch(outTokens, topkVals, topkIdxs, workspace, logits, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize, temperatures, repPenalties, presPenalties, topKs, topPs, stepCounter, maxEffectiveK, outProbs, outIds, supportCapacity);
       return;
     }
 
@@ -2882,6 +2882,8 @@ export class ParallelOps implements DeviceOps {
     const pTopKs = topKs as ParallelTensor;
     const pTopPs = topPs as ParallelTensor;
     const pStepCounter = stepCounter as ParallelTensor;
+    const pOutProbs = outProbs as ParallelTensor | undefined;
+    const pOutIds = outIds as ParallelTensor | undefined;
     if (pLogits.parallelism !== TensorParallelism.Replicated) {
       throw new Error(`sampleBatch logits: unsupported parallelism ${pLogits.parallelism}, expected ${TensorParallelism.Replicated}`);
     }
@@ -2889,7 +2891,33 @@ export class ParallelOps implements DeviceOps {
       throw new Error(`sampleBatch: outTokens has ${pOut.shards.length} shards, expected ${this.worldSize} (disposed by a borrower?)`);
     }
     for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].sampleBatch(pOut.shards[i], pTopkVals.shards[i], pTopkIdxs.shards[i], pWorkspace.shards[i], pLogits.shards[i], pPenaltyTokens.shards[i], pPenaltyCount.shards[i], maxWindow, vocabSize, batchSize, pTemps.shards[i], pRepPen.shards[i], pPresPen.shards[i], pTopKs.shards[i], pTopPs.shards[i], pStepCounter.shards[i], maxEffectiveK);
+      this.devices[i].sampleBatch(pOut.shards[i], pTopkVals.shards[i], pTopkIdxs.shards[i], pWorkspace.shards[i], pLogits.shards[i], pPenaltyTokens.shards[i], pPenaltyCount.shards[i], maxWindow, vocabSize, batchSize, pTemps.shards[i], pRepPen.shards[i], pPresPen.shards[i], pTopKs.shards[i], pTopPs.shards[i], pStepCounter.shards[i], maxEffectiveK, pOutProbs?.shards[i], pOutIds?.shards[i], supportCapacity);
+    }
+  }
+
+  sampleCandidates(outTokens: Tensor, outProbs: Tensor, outIds: Tensor, candidateValues: Tensor, candidateIds: Tensor, temperatures: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, batchSize: number, candidateCount: number, supportCapacity: number): void {
+    const tensors = [outTokens, outProbs, outIds, candidateValues, candidateIds, temperatures, topKs, topPs, stepCounter] as ParallelTensor[];
+    for (const tensor of tensors) {
+      if (tensor.parallelism !== TensorParallelism.Replicated || tensor.shards.length !== this.worldSize) {
+        throw new Error(`sampleCandidates requires replicated tensors with ${this.worldSize} shards`);
+      }
+    }
+    const [pOutTokens, pOutProbs, pOutIds, pCandidateValues, pCandidateIds, pTemperatures, pTopKs, pTopPs, pStepCounter] = tensors;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].sampleCandidates(pOutTokens.shards[i], pOutProbs.shards[i], pOutIds.shards[i], pCandidateValues.shards[i], pCandidateIds.shards[i], pTemperatures.shards[i], pTopKs.shards[i], pTopPs.shards[i], pStepCounter.shards[i], batchSize, candidateCount, supportCapacity);
+    }
+  }
+
+  specRejectLinear(outTokens: Tensor, outAccepted: Tensor, draftTokens: Tensor, qProbs: Tensor, qIds: Tensor, pProbs: Tensor, pIds: Tensor, stepCounter: Tensor, batchSize: number, depth: number, capacity: number): void {
+    const tensors = [outTokens, outAccepted, draftTokens, qProbs, qIds, pProbs, pIds, stepCounter] as ParallelTensor[];
+    for (const tensor of tensors) {
+      if (tensor.parallelism !== TensorParallelism.Replicated || tensor.shards.length !== this.worldSize) {
+        throw new Error(`specRejectLinear requires replicated tensors with ${this.worldSize} shards`);
+      }
+    }
+    const [pOutTokens, pOutAccepted, pDraftTokens, pQProbs, pQIds, pPProbs, pPIds, pStepCounter] = tensors;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].specRejectLinear(pOutTokens.shards[i], pOutAccepted.shards[i], pDraftTokens.shards[i], pQProbs.shards[i], pQIds.shards[i], pPProbs.shards[i], pPIds.shards[i], pStepCounter.shards[i], batchSize, depth, capacity);
     }
   }
 

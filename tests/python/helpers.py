@@ -724,16 +724,16 @@ class GlmOps:
         self.lib.glm_graph_end_capture.argtypes = [ctypes.c_void_p]
 
         self.lib.glm_graph_instantiate.restype = ctypes.c_void_p
-        self.lib.glm_graph_instantiate.argtypes = [ctypes.c_void_p]
+        self.lib.glm_graph_instantiate.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
         self.lib.glm_graph_launch.restype = None
         self.lib.glm_graph_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
         self.lib.glm_graph_destroy.restype = None
-        self.lib.glm_graph_destroy.argtypes = [ctypes.c_void_p]
+        self.lib.glm_graph_destroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
         self.lib.glm_graph_exec_destroy.restype = None
-        self.lib.glm_graph_exec_destroy.argtypes = [ctypes.c_void_p]
+        self.lib.glm_graph_exec_destroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
         self.lib.glm_kv_cache_write.restype = None
         self.lib.glm_kv_cache_write.argtypes = [
@@ -1838,17 +1838,17 @@ class GlmOps:
         return ptr.value if hasattr(ptr, 'value') else ptr
 
     def graph_instantiate(self, graph):
-        ptr = self.lib.glm_graph_instantiate(ctypes.c_void_p(graph))
+        ptr = self.lib.glm_graph_instantiate(self.ctx, ctypes.c_void_p(graph))
         return ptr.value if hasattr(ptr, 'value') else ptr
 
     def graph_launch(self, graph_exec):
-        self.lib.glm_graph_launch(ctypes.c_void_p(graph_exec), self.ctx)
+        self.lib.glm_graph_launch(self.ctx, ctypes.c_void_p(graph_exec))
 
     def graph_destroy(self, graph):
-        self.lib.glm_graph_destroy(ctypes.c_void_p(graph))
+        self.lib.glm_graph_destroy(self.ctx, ctypes.c_void_p(graph))
 
     def graph_exec_destroy(self, graph_exec):
-        self.lib.glm_graph_exec_destroy(ctypes.c_void_p(graph_exec))
+        self.lib.glm_graph_exec_destroy(self.ctx, ctypes.c_void_p(graph_exec))
 
     def kv_cache_write(self, src_k, src_v, dst_k, dst_v, slot_mapping,
                         batch_size, n_kv, hd, page_size,

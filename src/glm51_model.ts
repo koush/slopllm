@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ChatCache, ChatTemplateKwargs, MtpDraftBatch, MtpStepResult, PhasedPrefillPlan, TokenSelector } from "./chat_model";
+import type { ChatCache, ChatTemplateKwargs, LinearMtpSampler, MtpDraftBatch, MtpStepResult, PhasedPrefillPlan, TokenSelector } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
 import { executionPhase, type ExecutionPlan, ExecutionState, ExecutionWorkspace } from "./execution-workspace";
@@ -1027,6 +1027,7 @@ export class Glm51Model extends ChatModel {
     states: readonly ExecutionState[],
     metadata: readonly { qoLen: number; previousWidth: number; expandK: number; depth: number }[],
     treeHost: Tensor,
+    linearSampler?: LinearMtpSampler,
   ): void {
     const hiddenSize = this.cfg.hiddenSize;
     const rowBytes = hiddenSize * BF16;
@@ -1036,9 +1037,9 @@ export class Glm51Model extends ChatModel {
 
     using seedRows = seed.narrow(0, batchSize);
     using rootLogits = seedRows.linear(lmHead);
-    const rootTopk = rootLogits.topk(topks[0], this.cfg.vocabSize);
-    using _rootValues = rootTopk.values;
-    using rootIndices = rootTopk.indices;
+    const rootTopk = linearSampler ? undefined : rootLogits.topk(topks[0], this.cfg.vocabSize);
+    using _rootValues = rootTopk?.values;
+    using rootIndices = linearSampler ? linearSampler.sampleDraft(rootLogits, 0) : rootTopk!.indices;
     for (let batch = 0; batch < batchSize; batch++) {
       treeHost.memcpy2d(
         batch * numTreeNodes * I32, topks[0] * I32,
@@ -1076,9 +1077,9 @@ export class Glm51Model extends ChatModel {
 
       using hiddenStates = this.forwardMtp(state, inputHidden, stateSharedSlots, stateSharedSlotsLength);
       using logits = hiddenStates.linear(lmHead);
-      const topk = logits.topk(topks[depth], this.cfg.vocabSize);
-      using _values = topk.values;
-      using indices = topk.indices;
+      const topk = linearSampler ? undefined : logits.topk(topks[depth], this.cfg.vocabSize);
+      using _values = topk?.values;
+      using indices = linearSampler ? linearSampler.sampleDraft(logits, depth) : topk!.indices;
       const depthOffset = boundaries[depth - 1];
       const tokensAtDepth = qoLen * topks[depth];
       for (let batch = 0; batch < batchSize; batch++) {
@@ -1182,11 +1183,15 @@ export class Glm51Model extends ChatModel {
     return { state, generator: forward(), [Symbol.dispose]: rollback };
   }
 
-  *planPrefillMtpDraftExtend(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens: TokenSelector = logits => logits.argmax()): ExecutionPlan<MtpDraftBatch> {
+  *planPrefillMtpDraftExtend(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens: TokenSelector = logits => logits.argmax(), linearSampler?: LinearMtpSampler): ExecutionPlan<MtpDraftBatch> {
     if (!this.forwardMtp || topks.length === 0) {
       throw new Error("MTP draft extend requires an MTP-enabled model and non-empty topks");
     }
+    if (linearSampler && topks.some(topk => topk !== 1)) {
+      throw new Error("Linear MTP sampling requires all draft widths to be 1");
+    }
     const batchSize = inputIds.length;
+    linearSampler?.prepareDraft(batchSize, topks.length);
     let completed = false;
     const prefillState = ws.planPrefill(this, batchSize, inputIds.map(ids => ids.length), cache);
     prefillState.setInput(inputIds);
@@ -1304,10 +1309,11 @@ export class Glm51Model extends ChatModel {
       timingName: "draft",
       run: (inputs) => {
         const treeHost = ws.allocPinned([batchSize * numTreeNodes], "I32");
-        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
+        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost, linearSampler);
         return { treeHost };
       },
     });
+    const proposal = linearSampler?.finishDraft();
 
     for (let batch = 0; batch < batchSize; batch++) {
       cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
@@ -1324,15 +1330,26 @@ export class Glm51Model extends ChatModel {
       targetTokens,
       treeTokens,
       topks,
+      ...(proposal ? { proposal } : {}),
     };
   }
 
-  *planTargetVerification(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, selectTokens: TokenSelector = logits => logits.argmax()): ExecutionPlan<MtpStepResult> {
+  *planTargetVerification(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, selectTokens: TokenSelector = logits => logits.argmax(), linearSampler?: LinearMtpSampler): ExecutionPlan<MtpStepResult> {
     const topks = draft.topks;
     const batchSize = draft.targetTokens.length;
     if (draft.treeTokens.length !== batchSize) {
       throw new Error("MTP draft batch does not match target token batch");
     }
+    if (draft.proposal && !linearSampler) {
+      throw new Error("MTP proposal verification requires a linear sampler");
+    }
+    if (linearSampler && (topks.length === 0 || topks.some(topk => topk !== 1))) {
+      throw new Error("Linear MTP sampling requires non-empty draft widths all equal to 1");
+    }
+    if (linearSampler && !draft.proposal) {
+      throw new Error("Linear MTP verification requires draft proposal probabilities");
+    }
+    linearSampler?.prepareVerification(draft);
     const originalAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
     const targetTopks = [1, ...topks];
     const linearDraft = topks.every(topk => topk === 1);
@@ -1358,11 +1375,12 @@ export class Glm51Model extends ChatModel {
     state.setInput(verificationTokens);
     const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
     const argmaxHost = ws.ensureAllocPinned([ws.maxBatch * numVerificationTokens], "I32", `glm51_mtp_verify_argmax_host_${numVerificationTokens}`);
+    const acceptedHost = linearSampler ? ws.ensureAllocPinned([ws.maxBatch], "I32", "glm51_mtp_verify_accepted_host") : undefined;
 
     const artifacts = yield* executionPhase({
       states: [state],
       inputs: {},
-      captureKey: ["glm51-mtp-verify", topks.join(","), selectTokens.captureKey ?? "greedy"],
+      captureKey: ["glm51-mtp-verify", topks.join(","), selectTokens.captureKey ?? "greedy", ...(linearSampler ? ["linear", linearSampler.captureKey] : [])],
       timingName: "verification",
       run: () => {
         const seed = ws.alloc([batchSize * maxWidth, this.cfg.hiddenSize], "BF16");
@@ -1387,7 +1405,11 @@ export class Glm51Model extends ChatModel {
         };
         using hiddenStates = this.forwardModel(state, slots, slotsLength);
         using logits = state.computeLogits(hiddenStates, this, true);
-        using selected = selectTokens(logits);
+        const verified = linearSampler?.verify(logits);
+        using counts = verified?.numAccepted;
+        // The accepted prefix and correction must also condition the retained MTP rows.
+        using selected = verified ? verified.tokens : selectTokens(logits);
+        if (counts) acceptedHost!.memcpy(counts, batchSize * I32, MemcpyKind.DeviceToHost);
         argmaxHost.memcpy(selected, batchSize * numVerificationTokens * I32, MemcpyKind.DeviceToHost);
         using selectedInput = selected.narrow(0, batchSize * numVerificationTokens);
         state.setInput(selectedInput);
@@ -1414,10 +1436,23 @@ export class Glm51Model extends ChatModel {
     const acceptedNodes: number[][] = [];
     {
       const argmaxBuf = argmaxHost.readPinnedBuffer();
+      const acceptedBuf = acceptedHost?.readPinnedBuffer();
       const targetBoundaries = mtpDepthBoundaries(targetTopks);
       const strides = topks.map((_, index) => mtpTotalPaths(topks.slice(index + 1)));
       const numPaths = mtpTotalPaths(topks);
       for (let batch = 0; batch < batchSize; batch++) {
+        if (acceptedBuf) {
+          const accepted = acceptedBuf.readInt32LE(batch * I32);
+          if (accepted < 0 || accepted > topks.length) {
+            throw new Error(`Invalid linear MTP acceptance count ${accepted}`);
+          }
+          const offset = batch * numVerificationTokens;
+          numAccepted.push(accepted);
+          acceptedTokens.push(Array.from({ length: accepted }, (_, index) => argmaxBuf.readInt32LE((offset + index) * I32)));
+          replacements.push(argmaxBuf.readInt32LE((offset + accepted) * I32));
+          acceptedNodes.push(Array.from({ length: accepted + 1 }, (_, index) => index));
+          continue;
+        }
         let bestPath = 0;
         let bestAccepted = -1;
         let replacement = -1;
@@ -1559,15 +1594,17 @@ export class Glm51Model extends ChatModel {
       sharedSlotsLength,
     };
 
+    linearSampler?.prepareDraft(batchSize, topks.length);
     yield* executionPhase({
       states: draftPlan.states,
       inputs: draftInputs,
-      captureKey: ["glm51-mtp-draft", topks.join(","), `batchSize:${batchSize}`],
+      captureKey: ["glm51-mtp-draft", topks.join(","), `batchSize:${batchSize}`, ...(linearSampler ? ["linear", linearSampler.captureKey] : [])],
       timingName: "draft",
       run: (inputs) => {
-        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost);
+        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost, linearSampler);
       },
     });
+    const proposal = linearSampler?.finishDraft();
 
     for (let batch = 0; batch < batchSize; batch++) {
       cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
@@ -1581,6 +1618,7 @@ export class Glm51Model extends ChatModel {
         targetTokens: replacements,
         treeTokens,
         topks,
+        ...(proposal ? { proposal } : {}),
       },
       tokens: acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]),
       numAccepted,

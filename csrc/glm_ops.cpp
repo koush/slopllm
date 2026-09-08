@@ -3102,7 +3102,7 @@ static Napi::Value RmsnormGated(const Napi::CallbackInfo& info) {
 static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 18) {
-        Napi::TypeError::New(env, "Expected (ctx, out_tokens, topk_vals, topk_idxs, workspace, logits, penalty_tokens, penalty_count, max_window, vocab_size, batch_size, temperatures, repetition_penalties, presence_penalties, top_ks, top_ps, step_counter, max_effective_k)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, out_tokens, topk_vals, topk_idxs, workspace, logits, penalty_tokens, penalty_count, max_window, vocab_size, batch_size, temperatures, repetition_penalties, presence_penalties, top_ks, top_ps, step_counter, max_effective_k[, out_probs, out_ids, support_capacity])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -3123,6 +3123,17 @@ static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
     uintptr_t top_ps_ptr = info[15].As<Napi::Number>().Int64Value();
     uintptr_t step_counter_ptr = info[16].As<Napi::Number>().Int64Value();
     int max_effective_k = info[17].As<Napi::Number>().Int32Value();
+    uintptr_t out_probs_ptr = info.Length() > 18 && info[18].IsNumber()
+        ? info[18].As<Napi::Number>().Int64Value() : 0;
+    uintptr_t out_ids_ptr = info.Length() > 19 && info[19].IsNumber()
+        ? info[19].As<Napi::Number>().Int64Value() : 0;
+    int support_capacity = info.Length() > 20 && info[20].IsNumber()
+        ? info[20].As<Napi::Number>().Int32Value() : 0;
+    if (support_capacity < 0 || support_capacity > 256 ||
+        ((out_probs_ptr || out_ids_ptr) && support_capacity == 0)) {
+        Napi::RangeError::New(env, "sampleBatch export requires support_capacity in [1, 256]").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
     glm_sample_batch(reinterpret_cast<GlmCtx*>(ctx_ptr),
                reinterpret_cast<int*>(out_tokens_ptr),
                reinterpret_cast<float*>(topk_vals_ptr),
@@ -3138,10 +3149,88 @@ static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
                reinterpret_cast<const int*>(top_ks_ptr),
                reinterpret_cast<const float*>(top_ps_ptr),
                reinterpret_cast<unsigned int*>(step_counter_ptr),
-               max_effective_k);
+               max_effective_k, reinterpret_cast<float*>(out_probs_ptr),
+               reinterpret_cast<int*>(out_ids_ptr), support_capacity);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("sampleBatch failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value SampleCandidates(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 13) {
+        Napi::TypeError::New(env, "Expected (ctx, out_tokens, out_probs, out_ids, candidate_values, candidate_ids, temperatures, top_ks, top_ps, step_counter, batch_size, candidate_count, support_capacity)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    for (int i = 0; i < 13; i++) {
+        if (!info[i].IsNumber()) {
+            Napi::TypeError::New(env, "sampleCandidates requires numeric arguments").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+    }
+    int dims[3];
+    for (int i = 0; i < 3; i++) {
+        double value = info[10 + i].As<Napi::Number>().DoubleValue();
+        int limit = i == 0 ? 2147483647 : 256;
+        if (!(value >= (i == 0 ? 0 : 1) && value <= limit) ||
+            value != (double)(int)value) {
+            Napi::RangeError::New(env, "sampleCandidates requires integer batch_size >= 0 and candidate_count/support_capacity in [1, 256]").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        dims[i] = (int)value;
+    }
+    if (dims[2] < dims[1]) {
+        Napi::RangeError::New(env, "sampleCandidates requires support_capacity >= candidate_count").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ptrs[10];
+    for (int i = 0; i < 10; i++) {
+        ptrs[i] = info[i].As<Napi::Number>().Int64Value();
+        if (!ptrs[i] && (i == 0 || dims[0] > 0)) {
+            Napi::TypeError::New(env, "sampleCandidates requires nonzero context and buffers for nonempty batches").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+    }
+    glm_sample_candidates(reinterpret_cast<GlmCtx*>(ptrs[0]),
+                          reinterpret_cast<int*>(ptrs[1]),
+                          reinterpret_cast<float*>(ptrs[2]), reinterpret_cast<int*>(ptrs[3]),
+                          reinterpret_cast<const void*>(ptrs[4]), reinterpret_cast<const int*>(ptrs[5]),
+                          reinterpret_cast<const float*>(ptrs[6]), reinterpret_cast<const int*>(ptrs[7]),
+                          reinterpret_cast<const float*>(ptrs[8]), reinterpret_cast<unsigned int*>(ptrs[9]),
+                          dims[0], dims[1], dims[2]);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("sampleCandidates failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value SpecRejectLinear(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, out_tokens, out_accepted, draft_tokens, q_probs, q_ids, p_probs, p_ids, step_counter, batch_size, depth, capacity)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ptrs[9];
+    for (int i = 0; i < 9; i++) ptrs[i] = info[i].As<Napi::Number>().Int64Value();
+    int batch_size = info[9].As<Napi::Number>().Int32Value();
+    int depth = info[10].As<Napi::Number>().Int32Value();
+    int capacity = info[11].As<Napi::Number>().Int32Value();
+    if (batch_size < 0 || depth < 0 || capacity < 1 || capacity > 256) {
+        Napi::RangeError::New(env, "specRejectLinear requires batch_size >= 0, depth >= 0, capacity in [1, 256]").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_spec_reject_linear(reinterpret_cast<GlmCtx*>(ptrs[0]),
+                          reinterpret_cast<int*>(ptrs[1]), reinterpret_cast<int*>(ptrs[2]),
+                          reinterpret_cast<const int*>(ptrs[3]),
+                          reinterpret_cast<const float*>(ptrs[4]), reinterpret_cast<const int*>(ptrs[5]),
+                          reinterpret_cast<const float*>(ptrs[6]), reinterpret_cast<const int*>(ptrs[7]),
+                          reinterpret_cast<unsigned int*>(ptrs[8]), batch_size, depth, capacity);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("specRejectLinear failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }
     return env.Undefined();
 }
@@ -3951,6 +4040,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "cpMergeLocal"), Napi::Function::New(env, CpMergeLocal));
     exports.Set(Napi::String::New(env, "cpCorrectAttnOut"), Napi::Function::New(env, CpCorrectAttnOut));
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
+    exports.Set(Napi::String::New(env, "sampleCandidates"), Napi::Function::New(env, SampleCandidates));
+    exports.Set(Napi::String::New(env, "specRejectLinear"), Napi::Function::New(env, SpecRejectLinear));
     exports.Set(Napi::String::New(env, "rotateInputIds"), Napi::Function::New(env, RotateInputIds));
     exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));
     exports.Set(Napi::String::New(env, "memcpyPeer"), Napi::Function::New(env, MemcpyPeer));

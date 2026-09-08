@@ -31,6 +31,7 @@ __device__ void heap_sift_down(HeapEntry* heap, int pos, int size) {
 }
 
 __device__ void heap_insert(HeapEntry* heap, int& size, int capacity, float val, int idx) {
+    if (!(val > -INFINITY)) return;
     if (size < capacity) {
         heap[size] = {val, idx};
         int pos = size;
@@ -59,6 +60,11 @@ __device__ float hash_to_random(unsigned int seed) {
     seed ^= seed >> 16;
     // Use 24 bits so float conversion cannot round the result up to 1.
     return (float)(seed >> 8) * 0x1p-24f;
+}
+
+// Stream ordering keeps the base stable for every row, including graph replay.
+__global__ void sampling_advance_counter(unsigned int* counter, unsigned int count) {
+    *counter += count;
 }
 
 __device__ void insertion_sort_descending(HeapEntry* arr, int size) {
@@ -164,23 +170,47 @@ __device__ void sampling_apply_penalties(
     }
 }
 
+template<typename T>
+__device__ int sampling_sparse_draw(const T* probs, const int* ids,
+                                    int capacity, float uniform) {
+    double total = 0.0;
+    for (int i = 0; i < capacity && ids[i] >= 0; i++) total += probs[i];
+    double threshold = (double)uniform * total;
+    double cumulative = 0.0;
+    int sampled = ids[0];
+    for (int i = 0; i < capacity && ids[i] >= 0; i++) {
+        if (probs[i] <= 0.0) continue;
+        sampled = ids[i];
+        cumulative += probs[i];
+        if (threshold < cumulative) break;
+    }
+    return sampled;
+}
+
 __device__ int sampling_softmax_topp_sample_and_append(
     int seq_idx,
     const SamplingParams& p,
     float* seq_topk_vals,
-    int* seq_topk_vals_int,
     int* seq_topk_idxs,
     int* seq_out,
     int* penalty_tokens,
     int* penalty_count,
     int num_topk,
     unsigned int* step_counter,
-    int max_window
+    int max_window,
+    float* out_probs, int* out_ids, int support_capacity
 ) {
+    // Empty support (all NaN/-inf) has a deterministic, valid fallback.
+    if (num_topk == 0) {
+        num_topk = 1;
+        seq_topk_vals[0] = 0.0f;
+        seq_topk_idxs[0] = 0;
+    }
     float max_val = seq_topk_vals[0];
     float sum = 0.0f;
     for (int i = 0; i < num_topk; i++) {
-        float v = __expf(seq_topk_vals[i] - max_val);
+        float v = max_val == INFINITY ? (seq_topk_vals[i] == INFINITY ? 1.0f : 0.0f)
+                                      : __expf(seq_topk_vals[i] - max_val);
         seq_topk_vals[i] = v;
         sum += v;
     }
@@ -203,15 +233,16 @@ __device__ int sampling_softmax_topp_sample_and_append(
         }
     }
 
-    unsigned int step = atomicAdd(step_counter, 1);
+    for (int i = 0; i < support_capacity; i++) {
+        size_t offset = (size_t)seq_idx * support_capacity + i;
+        if (out_probs) out_probs[offset] = i < num_topk ? seq_topk_vals[i] : 0.0f;
+        if (out_ids) out_ids[offset] = i < num_topk ? seq_topk_idxs[i] : -1;
+    }
+
+    unsigned int step = *step_counter + (unsigned int)seq_idx;
     float random_val = hash_to_random(step);
 
-    float cumsum = 0.0f;
-    int sampled = seq_topk_idxs[num_topk - 1];
-    for (int i = 0; i < num_topk; i++) {
-        cumsum += seq_topk_vals[i];
-        if (random_val < cumsum) { sampled = seq_topk_idxs[i]; break; }
-    }
+    int sampled = sampling_sparse_draw(seq_topk_vals, seq_topk_idxs, num_topk, random_val);
     seq_out[0] = sampled;
 
     if (max_window > 0) {
@@ -243,7 +274,8 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
     const float* __restrict__ presence_penalties,
     const int* __restrict__ top_ks,
     const float* __restrict__ top_ps,
-    unsigned int* __restrict__ step_counter
+    unsigned int* __restrict__ step_counter,
+    float* out_probs, int* out_ids, int support_capacity
 ) {
     int seq_idx = blockIdx.x;
     int tid = threadIdx.x;
@@ -261,7 +293,7 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
     HeapEntry local_heap[MAX_K];
     int local_size = 0;
 
-    float inv_temp = (p.temperature > 0.0f) ? (1.0f / p.temperature) : 1.0f;
+    float inv_temp = (p.temperature > 0.0f) ? fminf(1.0f / p.temperature, FLT_MAX) : 1.0f;
 
     if (p.num_penalty_tokens > 0 && (p.repetition_penalty != 1.0f || p.presence_penalty != 0.0f)) {
         sampling_scale_logits(tid, block_size, seq_logits, seq_workspace, vocab_size, inv_temp);
@@ -279,7 +311,7 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
     }
 
     for (int i = local_size; i < p.effective_k; i++) {
-        local_heap[i].val = -FLT_MAX;
+        local_heap[i].val = -INFINITY;
         local_heap[i].idx = -1;
     }
     local_size = p.effective_k;
@@ -333,8 +365,9 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
             seq_topk_idxs[i] = merge_heap[i].idx;
         }
 
-        sampling_softmax_topp_sample_and_append(seq_idx, p, seq_topk_vals, nullptr, seq_topk_idxs,
-            seq_out, penalty_tokens, penalty_count, merge_size, step_counter, max_window);
+        sampling_softmax_topp_sample_and_append(seq_idx, p, seq_topk_vals, seq_topk_idxs,
+            seq_out, penalty_tokens, penalty_count, merge_size, step_counter, max_window,
+            out_probs, out_ids, support_capacity);
     }
 }
 
@@ -358,7 +391,8 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_argmax
     const int* __restrict__ top_ks,
     const float* __restrict__ top_ps,
     unsigned int* __restrict__ step_counter,
-    int max_effective_k
+    int max_effective_k,
+    float* out_probs, int* out_ids, int support_capacity
 ) {
     int seq_idx = blockIdx.x;
     int tid = threadIdx.x;
@@ -376,21 +410,22 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_argmax
     float* s_vals = reinterpret_cast<float*>(smem);
     int* s_idxs = reinterpret_cast<int*>(s_vals + blockDim.x);
 
-    float inv_temp = (p.temperature > 0.0f) ? (1.0f / p.temperature) : 1.0f;
+    float inv_temp = (p.temperature > 0.0f) ? fminf(1.0f / p.temperature, FLT_MAX) : 1.0f;
 
     bool has_penalties = (p.num_penalty_tokens > 0) && (p.repetition_penalty != 1.0f || p.presence_penalty != 0.0f);
+    sampling_scale_logits(tid, blockDim.x, seq_logits, seq_workspace, vocab_size, inv_temp);
+    __syncthreads();
     if (has_penalties) {
-        sampling_scale_logits(tid, blockDim.x, seq_logits, seq_workspace, vocab_size, inv_temp);
-        __syncthreads();
         sampling_apply_penalties(tid, p, penalty_tokens, seq_workspace, vocab_size, max_window);
         __syncthreads();
     }
 
+    int num_topk = 0;
     for (int k = 0; k < p.effective_k; k++) {
-        float my_max = -FLT_MAX;
+        float my_max = -INFINITY;
         int my_idx = -1;
         for (int i = tid; i < vocab_size; i += blockDim.x) {
-            float val = has_penalties ? seq_workspace[i] : (__bfloat162float(seq_logits[i]) * inv_temp);
+            float val = seq_workspace[i];
             if (val > my_max) {
                 my_max = val;
                 my_idx = i;
@@ -410,17 +445,21 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_argmax
             __syncthreads();
         }
 
+        // All threads see the same reduced index, so the exit is block-uniform.
+        if (s_idxs[0] < 0) break;
+        num_topk++;
         if (tid == 0) {
             seq_topk_vals[k] = s_vals[0];
             seq_topk_idxs[k] = s_idxs[0];
-            seq_workspace[s_idxs[0]] = -FLT_MAX;
+            seq_workspace[s_idxs[0]] = -INFINITY;
         }
         __syncthreads();
     }
 
     if (tid == 0) {
-        sampling_softmax_topp_sample_and_append(seq_idx, p, seq_topk_vals, nullptr, seq_topk_idxs,
-            seq_out, penalty_tokens, penalty_count, p.effective_k, step_counter, max_window);
+        sampling_softmax_topp_sample_and_append(seq_idx, p, seq_topk_vals, seq_topk_idxs,
+            seq_out, penalty_tokens, penalty_count, num_topk, step_counter, max_window,
+            out_probs, out_ids, support_capacity);
     }
 }
 
@@ -435,8 +474,10 @@ void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_
                       const float* temperatures, const float* repetition_penalties,
                       const float* presence_penalties, const int* top_ks,
                       const float* top_ps, unsigned int* step_counter,
-                      int max_effective_k) {
+                      int max_effective_k, float* out_probs, int* out_ids,
+                      int support_capacity) {
     cudaSetDevice(ctx->device_id);
+    if (batch_size <= 0) return;
 
     int block_size = SAMPLING_BLOCK_SIZE;
 
@@ -448,41 +489,195 @@ void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
-            top_ks, top_ps, step_counter);
+            top_ks, top_ps, step_counter, out_probs, out_ids, support_capacity);
     } else if (max_effective_k <= 8) {
         size_t smem = num_warps * 8 * (sizeof(float) + sizeof(int));
         sampling_kernel_batch<8><<<batch_size, block_size, smem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
-            top_ks, top_ps, step_counter);
+            top_ks, top_ps, step_counter, out_probs, out_ids, support_capacity);
     } else if (max_effective_k <= 16) {
         size_t smem = num_warps * 16 * (sizeof(float) + sizeof(int));
         sampling_kernel_batch<16><<<batch_size, block_size, smem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
-            top_ks, top_ps, step_counter);
+            top_ks, top_ps, step_counter, out_probs, out_ids, support_capacity);
     } else if (max_effective_k <= 32) {
         size_t smem = num_warps * 32 * (sizeof(float) + sizeof(int));
         sampling_kernel_batch<32><<<batch_size, block_size, smem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
-            top_ks, top_ps, step_counter);
+            top_ks, top_ps, step_counter, out_probs, out_ids, support_capacity);
     } else if (max_effective_k <= 64) {
         size_t smem = num_warps * 64 * (sizeof(float) + sizeof(int));
         sampling_kernel_batch<64><<<batch_size, block_size, smem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
-            top_ks, top_ps, step_counter);
+            top_ks, top_ps, step_counter, out_probs, out_ids, support_capacity);
     } else {
         size_t shared_mem = block_size * (sizeof(float) + sizeof(int));
         sampling_kernel_argmax_batch<<<batch_size, block_size, shared_mem, GLM_STREAM(ctx)>>>(
             out_tokens, topk_vals, topk_idxs, workspace,
             (const __nv_bfloat16*)logits, penalty_tokens, penalty_count,
             max_window, vocab_size, temperatures, repetition_penalties, presence_penalties,
-            top_ks, top_ps, step_counter, max_effective_k);
+            top_ks, top_ps, step_counter, max_effective_k, out_probs, out_ids, support_capacity);
     }
+    sampling_advance_counter<<<1, 1, 0, GLM_STREAM(ctx)>>>(step_counter, (unsigned int)batch_size);
+}
+
+__global__ void sampling_kernel_candidates(
+    int* out_tokens, float* out_probs, int* out_ids,
+    const __nv_bfloat16* candidate_values, const int* candidate_ids,
+    const float* temperatures, const int* top_ks, const float* top_ps,
+    unsigned int* step_counter, int candidate_count, int support_capacity) {
+    __shared__ float vals[256];
+    __shared__ int ids[256];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    SamplingParams p = {};
+    p.temperature = temperatures[row];
+    p.top_k = top_ks[row];
+    p.top_p = top_ps[row];
+    p.effective_k = p.temperature <= 0.0f ? 1
+        : min(p.top_k > 0 ? p.top_k : 32, candidate_count);
+    float inv_temp = p.temperature > 0.0f ? fminf(1.0f / p.temperature, FLT_MAX) : 1.0f;
+    float val = -INFINITY;
+    int id = -1;
+    if (tid < candidate_count) {
+        size_t offset = (size_t)row * candidate_count + tid;
+        id = candidate_ids[offset];
+        float raw = __bfloat162float(candidate_values[offset]);
+        if (id >= 0 && raw > -INFINITY) val = raw * inv_temp;
+        if (!(val > -INFINITY)) id = -1;
+    }
+    vals[tid] = id >= 0 ? val : -INFINITY;
+    ids[tid] = id;
+    __syncthreads();
+
+    // Bitonic paired sort: scaled logits descending, then global token ID ascending.
+    // Sorting after FP32 scaling also makes overflow-induced ties deterministic.
+    for (int size = 2; size <= blockDim.x; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            int other = tid ^ stride;
+            if (other > tid) {
+                bool before = vals[tid] > vals[other] ||
+                    (vals[tid] == vals[other] && ids[tid] < ids[other]);
+                bool after = vals[tid] < vals[other] ||
+                    (vals[tid] == vals[other] && ids[tid] > ids[other]);
+                if ((tid & size) == 0 ? after : before) {
+                    float tmp_val = vals[tid];
+                    int tmp_id = ids[tid];
+                    vals[tid] = vals[other];
+                    ids[tid] = ids[other];
+                    vals[other] = tmp_val;
+                    ids[other] = tmp_id;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    if (tid == 0) {
+        int count = 0;
+        while (count < p.effective_k && ids[count] >= 0) count++;
+        sampling_softmax_topp_sample_and_append(row, p, vals, ids,
+            out_tokens + row, nullptr, nullptr, count, step_counter, 0,
+            out_probs, out_ids, support_capacity);
+    }
+}
+
+void glm_sample_candidates(GlmCtx* ctx, int* out_tokens, float* out_probs, int* out_ids,
+                           const void* candidate_values, const int* candidate_ids,
+                           const float* temperatures, const int* top_ks, const float* top_ps,
+                           unsigned int* step_counter, int batch_size,
+                           int candidate_count, int support_capacity) {
+    if (!ctx || batch_size <= 0 || candidate_count < 1 || candidate_count > 256 ||
+        support_capacity < candidate_count || support_capacity > 256 ||
+        !out_tokens || !out_probs || !out_ids || !candidate_values || !candidate_ids ||
+        !temperatures || !top_ks || !top_ps || !step_counter) return;
+    cudaSetDevice(ctx->device_id);
+    int block_size = 32;
+    while (block_size < candidate_count) block_size <<= 1;
+    sampling_kernel_candidates<<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
+        out_tokens, out_probs, out_ids, (const __nv_bfloat16*)candidate_values,
+        candidate_ids, temperatures, top_ks, top_ps, step_counter,
+        candidate_count, support_capacity);
+    sampling_advance_counter<<<1, 1, 0, GLM_STREAM(ctx)>>>(step_counter, (unsigned int)batch_size);
+}
+
+__device__ float sampling_sparse_lookup(const float* probs, const int* ids,
+                                        int capacity, int token) {
+    for (int i = 0; i < capacity && ids[i] >= 0; i++) {
+        if (ids[i] == token) return probs[i];
+    }
+    return 0.0f;
+}
+
+__global__ void spec_reject_linear_kernel(
+    int* out_tokens, int* out_accepted, const int* draft_tokens,
+    const float* q_probs, const int* q_ids, const float* p_probs, const int* p_ids,
+    const unsigned int* step_counter, int depth, int capacity) {
+    __shared__ double residual[256];
+    if (threadIdx.x != 0) return;
+    size_t seq = blockIdx.x;
+    size_t p_base = seq * ((size_t)depth + 1) * capacity;
+    size_t q_base = seq * (size_t)depth * capacity;
+    int* out = out_tokens + seq * ((size_t)depth + 1);
+    // D+1 target draws, D acceptance draws, one distinct correction draw.
+    unsigned int stride = 2u * (unsigned int)depth + 2u;
+    unsigned int base = *step_counter + (unsigned int)seq * stride;
+    for (int d = 0; d <= depth; d++) {
+        size_t offset = p_base + (size_t)d * capacity;
+        out[d] = sampling_sparse_draw(p_probs + offset, p_ids + offset,
+                                     capacity, hash_to_random(base + (unsigned int)d));
+    }
+    out_accepted[seq] = depth;
+    for (int d = 0; d < depth; d++) {
+        const float* p = p_probs + p_base + (size_t)d * capacity;
+        const int* pi = p_ids + p_base + (size_t)d * capacity;
+        const float* q = q_probs + q_base + (size_t)d * capacity;
+        const int* qi = q_ids + q_base + (size_t)d * capacity;
+        int token = draft_tokens[seq * (size_t)depth + d];
+        double p_total = 0.0, q_total = 0.0;
+        for (int i = 0; i < capacity && pi[i] >= 0; i++) p_total += p[i];
+        for (int i = 0; i < capacity && qi[i] >= 0; i++) q_total += q[i];
+        double px = sampling_sparse_lookup(p, pi, capacity, token);
+        double qx = sampling_sparse_lookup(q, qi, capacity, token);
+        float uniform = hash_to_random(base + (unsigned int)depth + 1u + (unsigned int)d);
+        if (qx > 0.0 && p_total > 0.0 &&
+            uniform < fmin(1.0, (px * q_total) / (qx * p_total))) {
+            out[d] = token;
+            continue;
+        }
+        out_accepted[seq] = d;
+        double total = 0.0;
+        for (int i = 0; i < capacity; i++) {
+            if (pi[i] < 0) break;
+            double pn = p_total > 0.0 ? (double)p[i] / p_total : 0.0;
+            double qn = q_total > 0.0 ? (double)sampling_sparse_lookup(q, qi, capacity, pi[i]) / q_total : 0.0;
+            residual[i] = fmax(0.0, pn - qn);
+            total += residual[i];
+        }
+        float correction = hash_to_random(base + stride - 1u);
+        // A zero residual is only a numerical/invalid-proposal corner case.
+        out[d] = total > 0.0 ? sampling_sparse_draw(residual, pi, capacity, correction)
+                             : sampling_sparse_draw(p, pi, capacity, correction);
+        break;
+    }
+}
+
+void glm_spec_reject_linear(GlmCtx* ctx, int* out_tokens, int* out_accepted,
+                           const int* draft_tokens, const float* q_probs, const int* q_ids,
+                           const float* p_probs, const int* p_ids, unsigned int* step_counter,
+                           int batch_size, int depth, int capacity) {
+    cudaSetDevice(ctx->device_id);
+    if (batch_size <= 0) return;
+    spec_reject_linear_kernel<<<batch_size, 32, 0, GLM_STREAM(ctx)>>>(
+        out_tokens, out_accepted, draft_tokens, q_probs, q_ids, p_probs, p_ids,
+        step_counter, depth, capacity);
+    sampling_advance_counter<<<1, 1, 0, GLM_STREAM(ctx)>>>(
+        step_counter, (unsigned int)batch_size * (2u * (unsigned int)depth + 2u));
 }

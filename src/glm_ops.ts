@@ -853,8 +853,16 @@ export class GlmOps implements DeviceOps {
     return [{ regions: this.heap.regionCount, freeBytes: this.heap.freeBytes }];
   }
 
-  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number): void {
-    getNativeAddon().sampleBatch(this.ctx, outTokens.data, topkVals.data, topkIdxs.data, workspace.data, logits.data, penaltyTokens.data, penaltyCount.data, maxWindow, vocabSize, batchSize, temperatures.data, repPenalties.data, presPenalties.data, topKs.data, topPs.data, stepCounter.data, maxEffectiveK);
+  sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number, outProbs?: Tensor, outIds?: Tensor, supportCapacity?: number): void {
+    getNativeAddon().sampleBatch(this.ctx, outTokens.data, topkVals.data, topkIdxs.data, workspace.data, logits.data, penaltyTokens.data, penaltyCount.data, maxWindow, vocabSize, batchSize, temperatures.data, repPenalties.data, presPenalties.data, topKs.data, topPs.data, stepCounter.data, maxEffectiveK, outProbs?.data, outIds?.data, supportCapacity);
+  }
+
+  sampleCandidates(outTokens: Tensor, outProbs: Tensor, outIds: Tensor, candidateValues: Tensor, candidateIds: Tensor, temperatures: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, batchSize: number, candidateCount: number, supportCapacity: number): void {
+    getNativeAddon().sampleCandidates(this.ctx, outTokens.data, outProbs.data, outIds.data, candidateValues.data, candidateIds.data, temperatures.data, topKs.data, topPs.data, stepCounter.data, batchSize, candidateCount, supportCapacity);
+  }
+
+  specRejectLinear(outTokens: Tensor, outAccepted: Tensor, draftTokens: Tensor, qProbs: Tensor, qIds: Tensor, pProbs: Tensor, pIds: Tensor, stepCounter: Tensor, batchSize: number, depth: number, capacity: number): void {
+    getNativeAddon().specRejectLinear(this.ctx, outTokens.data, outAccepted.data, draftTokens.data, qProbs.data, qIds.data, pProbs.data, pIds.data, stepCounter.data, batchSize, depth, capacity);
   }
 
   synchronize(): void {

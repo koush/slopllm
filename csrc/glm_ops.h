@@ -996,7 +996,9 @@ void glm_gate_sigmoid_mul(GlmCtx* ctx, void* attn_out, const void* gate_interlea
 // penalty_count: [batch_size] int32 - number of entries per sequence (writable, incremented by kernel)
 // max_window: maximum penalty window size (circular buffer stride per sequence)
 // temperatures, repetition_penalties, presence_penalties, top_ks, top_ps: [batch_size]
-// step_counter: [1] uint32 - atomic counter for device-side RNG (writable)
+// step_counter: [1] uint32 - stream-ordered RNG counter; no concurrent stream use
+// Optional out_probs/out_ids: [batch_size, support_capacity], padded with 0/-1.
+// Caller must ensure effective support <= support_capacity <= 256 when exporting.
 void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_idxs,
                       float* workspace, const void* logits,
                       int* penalty_tokens, int* penalty_count,
@@ -1004,7 +1006,28 @@ void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_
                       const float* temperatures, const float* repetition_penalties,
                       const float* presence_penalties, const int* top_ks,
                       const float* top_ps, unsigned int* step_counter,
-                      int max_effective_k);
+                      int max_effective_k, float* out_probs = nullptr,
+                      int* out_ids = nullptr, int support_capacity = 0);
+
+// Penalty-free sampling from unsorted BF16 values and unique global I32 IDs [B,K].
+// Requires B >= 0 and 1 <= K <= support_capacity <= 256; invalid raw C calls are no-ops.
+// out_tokens: [B]; out_probs/out_ids: [B,support_capacity], padded with 0/-1.
+// Parameters are [B]; step_counter is [1], advances by B, and is stream-exclusive.
+void glm_sample_candidates(GlmCtx* ctx, int* out_tokens, float* out_probs, int* out_ids,
+                           const void* candidate_values, const int* candidate_ids,
+                           const float* temperatures, const int* top_ks, const float* top_ps,
+                           unsigned int* step_counter, int batch_size,
+                           int candidate_count, int support_capacity);
+
+// All pointers are device pointers. Sparse supports have unique IDs, trailing -1
+// padding, and finite nonnegative probabilities normalized to one.
+// q: [B,D,C], p: [B,D+1,C], draft_tokens: [B,D]. 1 <= C <= 256.
+// out_tokens: [B,D+1]; out_accepted: [B], accepted prefix length (not bonus).
+// RNG advances by B*(2*D+2); the counter must not be shared across streams.
+void glm_spec_reject_linear(GlmCtx* ctx, int* out_tokens, int* out_accepted,
+                           const int* draft_tokens, const float* q_probs, const int* q_ids,
+                           const float* p_probs, const int* p_ids, unsigned int* step_counter,
+                           int batch_size, int depth, int capacity);
 
 // Grouped MoE using Tensor Core MMA (SM120+)
 // Uses Tensor Core MMA for prefill (M > threshold) instead of scalar GEMV.

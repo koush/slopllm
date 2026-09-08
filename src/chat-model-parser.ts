@@ -24,8 +24,8 @@ export interface ParsedToolCall {
  * Stateful parser for one generated assistant response.
  *
  * Structural markers are handled by token ID. Ordinary text is decoded from
- * the complete token prefix so byte-level tokenizer fragments are not emitted
- * prematurely.
+ * a retained token prefix so byte-level tokenizer fragments are not emitted
+ * prematurely (unsupported decoders retain the complete prefix).
  */
 export abstract class ChatModelParser {
   private readonly textDecoder: IncrementalTokenDecoder;
@@ -168,8 +168,24 @@ export function resolveControlToken(tokenizer: Tokenizer, marker: string): numbe
 class IncrementalTokenDecoder {
   private tokenIds: number[] = [];
   private emittedText = "";
+  private readonly canCompactHistory: boolean;
 
-  constructor(private readonly tokenizer: Tokenizer) {}
+  constructor(private readonly tokenizer: Tokenizer) {
+    const internals = tokenizer as unknown as {
+      _tokenizerJSON?: { decoder?: { type?: string }; model?: { end_of_word_suffix?: unknown } };
+      _tokenizerConfig?: { clean_up_tokenization_spaces?: unknown };
+      _tokenizer?: { clean_up_tokenization_spaces?: unknown; decoder?: { end_of_word_suffix?: unknown } };
+    };
+    // decode_single delegates to the internal tokenizer's cleanup default.
+    const cleanup = internals._tokenizer?.clean_up_tokenization_spaces
+      ?? internals._tokenizerConfig?.clean_up_tokenization_spaces ?? true;
+    // Suffix replacement runs after decoding, independently of cleanup, and
+    // can rewrite text spanning multiple otherwise standalone tokens.
+    const suffix = internals._tokenizer?.decoder?.end_of_word_suffix
+      ?? internals._tokenizerJSON?.model?.end_of_word_suffix;
+    this.canCompactHistory = internals._tokenizerJSON?.decoder?.type === "ByteLevel"
+      && cleanup === false && !suffix;
+  }
 
   push(tokenId: number): string {
     this.tokenIds.push(tokenId);
@@ -181,6 +197,19 @@ class IncrementalTokenDecoder {
     const safeText = text.slice(0, safeEnd);
     const delta = this.deltaFrom(safeText);
     this.emittedText = safeText;
+    if (this.canCompactHistory && safeEnd === text.length) {
+      const lastText = this.tokenIds.length === 1
+        ? text
+        : this.tokenizer.decode([tokenId], { skip_special_tokens: false });
+      if (lastText && !lastText.includes("\uFFFD") && safeText.endsWith(lastText)) {
+        // Keep a real anchor, not an empty history: restarting byte decoding can
+        // change BOM handling. Added tokens also preserve decoder boundaries.
+        // Fragment-only streams can retain unbounded history until a standalone
+        // token arrives; retain the previous anchor and entire pending group.
+        this.tokenIds = [tokenId];
+        this.emittedText = lastText;
+      }
+    }
     return delta;
   }
 

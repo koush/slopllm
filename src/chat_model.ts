@@ -43,10 +43,29 @@ export interface PhasedPrefillPlan extends Disposable {
   generator: Generator<void, Tensor, void>;
 }
 
+export interface MtpProposal {
+  // Owned host snapshots: B buffers each, with depth-major [D, capacity] F32/I32 LE rows.
+  // Both host arrays are empty in device mode; rows map to the owner's original draft batch.
+  probabilities: Buffer[];
+  tokenIds: Buffer[];
+  capacity: number;
+  device?: { owner: object; generation: number; rows: number[] };
+}
+
 export interface MtpDraftBatch {
   targetTokens: number[];
   treeTokens: number[][];
   topks: readonly number[];
+  proposal?: MtpProposal;
+}
+
+export interface LinearMtpSampler {
+  readonly captureKey: string | number;
+  prepareDraft(batchSize: number, depth: number): void;
+  sampleDraft(logits: Tensor, depth: number): Tensor;
+  finishDraft(): MtpProposal;
+  prepareVerification(draft: MtpDraftBatch): void;
+  verify(logits: Tensor): { tokens: Tensor; numAccepted: Tensor };
 }
 
 export interface MtpStepResult {
@@ -136,8 +155,8 @@ export abstract class ChatModel extends WorkspaceBase {
   }
   planPrefillMtpChunk?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void>;
   planPrefillMtpChunkPhased?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): PhasedPrefillPlan;
-  planPrefillMtpDraftExtend?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens?: TokenSelector): ExecutionPlan<MtpDraftBatch>;
-  planTargetVerification?(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, selectTokens?: TokenSelector): ExecutionPlan<MtpStepResult>;
+  planPrefillMtpDraftExtend?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens?: TokenSelector, linearSampler?: LinearMtpSampler): ExecutionPlan<MtpDraftBatch>;
+  planTargetVerification?(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, selectTokens?: TokenSelector, linearSampler?: LinearMtpSampler): ExecutionPlan<MtpStepResult>;
 
   prepareMtpInput(_cache: ChatCache, inputIdsList: number[][]): number[][] {
     return inputIdsList.map(inputIds => [...inputIds]);

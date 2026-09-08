@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { CaptureManager } from "../src/capture-manager";
-import type { ChatCache, ChatModel } from "../src/chat_model";
+import type { ChatCache, ChatModel, LinearMtpSampler, MtpDraftBatch, SamplingParams } from "../src/chat_model";
 import type { DeviceOps } from "../src/device_ops";
 import { executePlan, ExecutionWorkspace } from "../src/execution-workspace";
 import { Glm51Model } from "../src/glm51_model";
@@ -11,6 +11,7 @@ import { ParallelOps } from "../src/parallel_ops";
 import { Tensor } from "../src/tensor";
 import { PAGE_SIZE } from "../src/paged_kv";
 import { PhasedPrefillRunner, splitRaggedInput } from "../src/phased-prefill";
+import { LinearMtpSamplingWorkspace, SamplingWorkspace } from "../src/sampling";
 
 const SMALL_MODEL_DIR = path.resolve(
   __dirname,
@@ -454,5 +455,136 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     const phased = await run(true);
     assert.deepStrictEqual(phased.targetTokens, sequential.targetTokens);
     assert.deepStrictEqual(phased.treeTokens, sequential.treeTokens);
+  });
+
+  const greedy: SamplingParams = {
+    temperature: 0, topK: 1, topP: 1,
+    repetitionPenalty: 1, presencePenalty: 0, repetitionPenaltyWindow: 0,
+  };
+
+  it("linear speculative greedy matches the existing plan across verification iterations", async () => {
+    const topks = [1, 1, 1];
+    using target = new SamplingWorkspace(glm, topks.length + 1, model.cfg.vocabSize, 0);
+    using sampler = new LinearMtpSamplingWorkspace(glm, 1, topks.length, target);
+    sampler.updateSampler([greedy]);
+    target.updateSampler(topks.map(() => greedy).concat(greedy));
+
+    const run = async (linear: boolean) => {
+      using cache = model.createChatCache(32, 1);
+      cache.reset(1);
+      const sequence = cache.getPagedKV().sequences[0];
+      const prompt = [1, 2, 3, 4, 5, 6, 7, 8];
+      let draft = (await executePlan(captureManager, ws,
+        model.planPrefillMtpDraftExtend(ws, cache, model.prepareMtpInput(cache, [prompt]), topks,
+          undefined, linear ? sampler : undefined))).result;
+      sequence.reportTokens([...prompt, ...draft.targetTokens]);
+      const outputs = [{ targetTokens: draft.targetTokens, treeTokens: draft.treeTokens, tokens: [] as number[][], numAccepted: [] as number[] }];
+      for (let iteration = 0; iteration < 4; iteration++) {
+        const originalAllocLen = sequence.allocLen;
+        const step = (await executePlan(captureManager, ws,
+          model.planTargetVerification(ws, cache, draft, undefined, linear ? sampler : undefined))).result;
+        assert.deepStrictEqual(step.tokens[0], [...draft.treeTokens[0].slice(0, step.numAccepted[0]), step.draft.targetTokens[0]]);
+        assert.equal(sequence.allocLen, originalAllocLen + step.numAccepted[0] + 1);
+        sequence.reportTokens(step.tokens[0]);
+        assert.equal(sequence.reportedTokenCount(), sequence.allocLen + 1);
+        draft = step.draft;
+        outputs.push({ targetTokens: draft.targetTokens, treeTokens: draft.treeTokens, tokens: step.tokens, numAccepted: step.numAccepted });
+      }
+      return outputs;
+    };
+
+    assert.deepStrictEqual(await run(true), await run(false));
+  });
+
+  it("linear speculative stochastic rejection preserves target KV and the next MTP seed", async () => {
+    const topks = [1, 1, 1];
+    const stochastic: SamplingParams = { ...greedy, temperature: 1, topK: 16, topP: 0.9 };
+    using target = new SamplingWorkspace(glm, topks.length + 1, model.cfg.vocabSize, 0);
+    using sampler = new LinearMtpSamplingWorkspace(glm, 1, topks.length, target);
+    sampler.updateSampler([stochastic]);
+    target.updateSampler(Array.from({ length: topks.length + 1 }, () => stochastic));
+    using cache = model.createChatCache(32, 1);
+    cache.reset(1);
+    const sequence = cache.getPagedKV().sequences[0];
+    const prompt = [1, 2, 3, 4, 5, 6, 7, 8];
+    let draft = (await executePlan(captureManager, ws,
+      model.planPrefillMtpDraftExtend(ws, cache, model.prepareMtpInput(cache, [prompt]), topks,
+        undefined, sampler))).result;
+    sequence.reportTokens([...prompt, ...draft.targetTokens]);
+
+    let forcedAccepted = 0;
+    let verifying: MtpDraftBatch;
+    const forcedSampler: LinearMtpSampler = {
+      captureKey: "forced-linear-rejection",
+      prepareDraft: (batch, depth) => {
+        // Make the final continuation deterministic for fresh-context comparison.
+        if (forcedAccepted === topks.length - 1) sampler.updateSampler([greedy]);
+        sampler.prepareDraft(batch, depth);
+      },
+      sampleDraft: (logits, depth) => sampler.sampleDraft(logits, depth),
+      finishDraft: () => sampler.finishDraft(),
+      prepareVerification: proposal => {
+        verifying = proposal;
+        sampler.prepareVerification(proposal);
+      },
+      verify: logits => {
+        const result = sampler.verify(logits);
+        // Exercise the real stochastic verifier, then force commit depths without
+        // falsifying q snapshots. This checks pipeline mechanics, not sampling law.
+        using selected = target.sample(logits);
+        const tokens = selected.readInt32LEArray();
+        for (let depth = 0; depth < forcedAccepted; depth++) tokens[depth] = verifying.treeTokens[0][depth];
+        const tokenBytes = Buffer.alloc(tokens.length * 4);
+        tokens.forEach((token, index) => tokenBytes.writeInt32LE(token, index * 4));
+        result.tokens.h2d(tokenBytes);
+        const countBytes = Buffer.alloc(4);
+        countBytes.writeInt32LE(forcedAccepted);
+        result.numAccepted.h2d(countBytes);
+        return result;
+      },
+    };
+
+    for (forcedAccepted = 0; forcedAccepted < topks.length; forcedAccepted++) {
+      assert.ok(draft.proposal, "draft must retain real sampled q snapshots");
+      const snapshots = [...draft.proposal.probabilities, ...draft.proposal.tokenIds].map(buf => Buffer.from(buf));
+      const originalAllocLen = sequence.allocLen;
+      const history = sequence.getTokenIds();
+      const step = (await executePlan(captureManager, ws,
+        model.planTargetVerification(ws, cache, draft, undefined, forcedSampler))).result;
+      assert.deepStrictEqual(step.numAccepted, [forcedAccepted]);
+      assert.equal(step.numDraftTokens, topks.length);
+      assert.deepStrictEqual(step.tokens[0], [...draft.treeTokens[0].slice(0, forcedAccepted), step.draft.targetTokens[0]]);
+      assert.equal(sequence.allocLen, originalAllocLen + forcedAccepted + 1);
+      sequence.reportTokens(step.tokens[0]);
+      assert.deepStrictEqual(sequence.getTokenIds(), [...history, ...step.tokens[0]]);
+      assert.equal(sequence.reportedTokenCount(), sequence.allocLen + 1);
+      assert.deepStrictEqual([...draft.proposal.probabilities, ...draft.proposal.tokenIds], snapshots);
+      draft = step.draft;
+    }
+
+    const history = sequence.getTokenIds();
+    using freshMtpCache = model.createChatCache(32, 1);
+    freshMtpCache.reset(1);
+    // Rebuild shifted MTP inputs from exactly the committed history, including
+    // the outstanding replacement, rather than a newly selected target token.
+    const freshDraft = (await executePlan(captureManager, ws,
+      model.planPrefillMtpDraftExtend(ws, freshMtpCache, [history.slice(0, -1)], topks, logits => {
+        const token = logits.argmax();
+        const bytes = Buffer.alloc(4);
+        bytes.writeInt32LE(history[history.length - 1]);
+        token.h2d(bytes);
+        return token;
+      }, sampler))).result;
+    assert.deepStrictEqual(draft.targetTokens, freshDraft.targetTokens);
+    assert.deepStrictEqual(draft.treeTokens, freshDraft.treeTokens, "MTP continuation after rejection differs from fresh history");
+
+    // Only consume the tested cache's outstanding token after all verify loops.
+    const cachedNext = ws.forwardEagerDecode(model, draft.targetTokens, cache);
+    using freshTargetCache = model.createChatCache(32, 1);
+    freshTargetCache.reset(1);
+    const freshNext = ws.forwardEagerPrefill(model, [history], freshTargetCache);
+    assert.deepStrictEqual(cachedNext, freshNext, "target KV after rejection differs from fresh history");
+    glm.synchronize();
+    ws.assertClear();
   });
 });

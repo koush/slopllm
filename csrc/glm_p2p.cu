@@ -416,8 +416,6 @@ p2p_allgather_row_write_kernel(
 {
     constexpr int VEC = 16;  // int4
     const int tid = threadIdx.x;
-    const int n_vec = shard_dim1_bytes / VEC;
-    const int tail = shard_dim1_bytes - n_vec * VEC;
 
     void* dsts[AG_SMEM_MAX_N] = {
         static_cast<char*>(out0), static_cast<char*>(out1),
@@ -437,13 +435,16 @@ p2p_allgather_row_write_kernel(
             char* dst = static_cast<char*>(dsts[peer])
                         + (int64_t)row * full_dim1_bytes
                         + (int64_t)rank * shard_dim1_bytes;
+            // Row/rank offsets (e.g. 20 BF16 values = 40 bytes) can
+            // misalign even aligned allocations. Only vectorize aligned pairs.
+            const bool aligned = ((reinterpret_cast<uintptr_t>(src) |
+                                   reinterpret_cast<uintptr_t>(dst)) & (VEC - 1)) == 0;
+            const int n_vec = aligned ? shard_dim1_bytes / VEC : 0;
             for (int i = tid; i < n_vec; i += AG_WRITE_THREADS)
                 *reinterpret_cast<int4*>(dst + i * VEC) =
                     *reinterpret_cast<const int4*>(src + i * VEC);
-            if (tail > 0) {
-                int ti = n_vec * VEC + tid;
-                if (ti < shard_dim1_bytes) dst[ti] = src[ti];
-            }
+            for (int i = n_vec * VEC + tid; i < shard_dim1_bytes; i += AG_WRITE_THREADS)
+                dst[i] = src[i];
         }
     }
 }
