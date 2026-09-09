@@ -1181,22 +1181,16 @@ export class ParallelTensor extends Tensor {
       using allValuesPar = this.parallelOps.wrapShards(this.workspace, localValuesShards, [batch, ws], this.type, TensorParallelism.Row);
       using allIndicesPar = this.parallelOps.wrapShards(this.workspace, localIndicesShards, [batch, ws], "I32", TensorParallelism.Row);
 
-      using allValues = allValuesPar.allGather(this.workspace);
-      using allIndices = allIndicesPar.allGather(this.workspace);
+      const gathered = this.parallelOps.allGatherMultiple([allValuesPar, allIndicesPar], this.workspace);
+      using allValues = gathered[0];
+      using allIndices = gathered[1];
 
       const { values: rankValues, indices: rankIndices } = allValues.max(0);
 
       using _rankIndices = rankIndices;
       using gatheredIndices = allIndices.gather(rankIndices, 1, ws, batch);
 
-      const finalIndices = this.workspace.alloc([batch], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;
-      const pGatheredIndices = gatheredIndices as ParallelTensor;
-      const idxBytes = batch * 4;
-      for (let i = 0; i < ws; i++) {
-        finalIndices.shards[i].memcpy(pGatheredIndices.shards[i], idxBytes, MemcpyKind.DeviceToDevice);
-      }
-
-      return { values: rankValues, indices: finalIndices };
+      return { values: rankValues, indices: gatheredIndices.reshape([batch]), };
     }
 
     if (this.parallelism === TensorParallelism.Column) {
@@ -2434,9 +2428,30 @@ export class ParallelOps implements DeviceOps {
       const tensor = tensors[i];
       outputs[i] = workspace.alloc(tensor.shape, tensor.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
     }
-    const postBarrier = gatherIndices.map(i => tensors[i].beginP2PAllGather(group, outputs[i]!));
+    if (gatherIndices.length === 1) {
+      const postBarrier = gatherIndices.map(i => tensors[i].beginP2PAllGather(group, outputs[i]!));
+      group.barrier(this.devices);
+      for (const complete of postBarrier) {
+        complete();
+      }
+      return outputs as ParallelTensor[];
+    }
+
+    // stage everything
+    const beginStreams = gatherIndices.map(i => this.withStream(() => tensors[i].beginP2PAllGather(group, outputs[i]!)));
+    for (const stream of beginStreams) {
+      stream.streamWaitEvent();
+      stream[Symbol.dispose]();
+    }
+    // barrier
     group.barrier(this.devices);
-    for (const complete of postBarrier) complete();
+    // post barrier actions
+    const finishStreams = beginStreams.map(beginStream => this.withStream(() => beginStream.result()));
+    // wait everything
+    for (const stream of finishStreams) {
+      stream.streamWaitEvent();
+      stream[Symbol.dispose]();
+    }
     return outputs as ParallelTensor[];
   }
 
