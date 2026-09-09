@@ -151,12 +151,12 @@ export class CaptureManager implements Disposable {
                         console.warn(`[cuda-graph] capture bindings key=${key} bindings=${JSON.stringify(diagnosticBindings)}`);
                     }
 
-                    // console.warn("\n====capturing====", key)
+                    console.warn("\n====capturing====", key)
                     this.ops.graphBeginCapture();
                     capturing = true;
                 }
                 else {
-                    // console.warn("\n====warmingup====", key)
+                    console.warn("\n====warmingup====", key)
                 }
                 captured.warmupSteps++;
             }

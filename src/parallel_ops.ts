@@ -4179,12 +4179,10 @@ export class ParallelOps implements DeviceOps {
       topkValShards.push(r.values);
     }
 
-    // Keep indices sharded until topkToSlots so phased forwards can overlap the gather.
-    const topkIdxColumn = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Column);
+    using topkIdxColumn = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Column);
     const topkValColumn = this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk], "BF16", TensorParallelism.Column);
-    // const topkValReplicated = topkValColumn.allGather(idxQ.workspace);
 
-    return { values: topkValColumn, indices: topkIdxColumn };
+    return { values: topkValColumn, indices: topkIdxColumn.allGather(idxQ.workspace) };
   }
 
   // Sort each top-k row ascending by index, in place, on every shard. The
