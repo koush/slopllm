@@ -703,6 +703,10 @@ void glm_append_selected_mtp_caches(
 // out_lse: [num_tokens, num_heads] FP32
 // stride_kv_block: page_block_size * bytes_per_token
 // topk_length: [num_tokens] int32 or null (effective top-k per token)
+void glm_quantize_fp8(GlmCtx* ctx, const void* input, uint8_t* values,
+                      float* scales, size_t num_blocks, uint32_t block_size);
+
+// q_scales != null selects split E4M3 Q with four FP32 scales per head.
 void glm_sparse_mla_prefill(
     GlmCtx* ctx,
     void* q, void* q_rope, void* kv_cache,
@@ -711,7 +715,7 @@ void glm_sparse_mla_prefill(
     uint32_t num_tokens, uint32_t num_heads, uint32_t topk,
     uint32_t page_block_size,
     float sm_scale, size_t stride_kv_block,
-    int32_t* topk_length);
+    int32_t* topk_length, const float* q_scales = nullptr);
 
 // Sparse MLA SM120: decode attention (split-K + merge)
 // mid_out: [num_tokens, num_heads, num_splits, d_v] BF16 (scratch)
@@ -728,7 +732,7 @@ void glm_sparse_mla_decode(
     uint32_t num_splits,
     float sm_scale, size_t stride_kv_block,
     int32_t* topk_length,
-    int chunks_per_block_override);
+    int chunks_per_block_override, const float* q_scales = nullptr);
 // Sparse topk-driven gather of BPT-byte CKV tokens into a flat-format output
 // buffer. Same kernel body for two call shapes:
 //   * N=1, cp_world_size=0 — single-GPU / non-CP. The warp reads BPT bytes

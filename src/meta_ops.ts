@@ -1,4 +1,4 @@
-import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
 import { MemcpyKind } from "./sampling";
@@ -356,6 +356,14 @@ export class MetaOps implements DeviceOps {
             result,
             streamWaitEvent() { },
             synchronize() { }
+        };
+    }
+
+    quantizeFp8(input: Tensor, blockSize: number): { values: Tensor, scales: Tensor } {
+        const scaleShape = fp8ScaleShape(input, blockSize);
+        return {
+            values: input.workspace.alloc(input.shape, 'F8_E4M3'),
+            scales: input.workspace.alloc(scaleShape, 'F32'),
         };
     }
 

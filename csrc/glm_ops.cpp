@@ -2623,6 +2623,30 @@ static Napi::Value AppendSelectedMtpCaches(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value QuantizeFp8(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected 6 args (ctx, input, values, scales, num_blocks, block_size)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const uint32_t block_size = info[5].As<Napi::Number>().Uint32Value();
+    if (block_size == 0) {
+        Napi::TypeError::New(env, "quantizeFp8 block_size must be positive").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_quantize_fp8(
+        reinterpret_cast<GlmCtx*>(info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>(info[1].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<uint8_t*>(info[2].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<float*>(info[3].As<Napi::Number>().Int64Value()),
+        info[4].As<Napi::Number>().Int64Value(), block_size);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("quantizeFp8 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value SparseMlaPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 13) {
@@ -2651,7 +2675,8 @@ static Napi::Value SparseMlaPrefill(const Napi::CallbackInfo& info) {
         reinterpret_cast<void*>(output_ptr),
         reinterpret_cast<float*>(out_lse_ptr),
         num_tokens, num_heads, topk,
-        64, sm_scale, stride_kv_block, topk_length);
+        64, sm_scale, stride_kv_block, topk_length,
+        info.Length() > 13 && info[13].IsNumber() ? reinterpret_cast<const float*>(info[13].As<Napi::Number>().Int64Value()) : nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("sparseMlaPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -2696,7 +2721,8 @@ static Napi::Value SparseMlaDecode(const Napi::CallbackInfo& info) {
         reinterpret_cast<void*>(output_ptr),
         reinterpret_cast<float*>(out_lse_ptr),
         num_tokens, num_heads, topk, num_splits,
-        sm_scale, stride_kv_block, topk_length, chunks_per_block);
+        sm_scale, stride_kv_block, topk_length, chunks_per_block,
+        info.Length() > 17 && info[17].IsNumber() ? reinterpret_cast<const float*>(info[17].As<Napi::Number>().Int64Value()) : nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("sparseMlaDecode failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -4019,6 +4045,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "concatAndCacheDsMla"), Napi::Function::New(env, ConcatAndCacheDsMla));
     exports.Set(Napi::String::New(env, "appendSelectedMtpCaches"), Napi::Function::New(env, AppendSelectedMtpCaches));
     exports.Set(Napi::String::New(env, "sparseMlaPrefill"), Napi::Function::New(env, SparseMlaPrefill));
+    exports.Set(Napi::String::New(env, "quantizeFp8"), Napi::Function::New(env, QuantizeFp8));
     exports.Set(Napi::String::New(env, "sparseMlaDecode"), Napi::Function::New(env, SparseMlaDecode));
     exports.Set(Napi::String::New(env, "gatherTopkCkv"), Napi::Function::New(env, GatherTopkCkv));
     exports.Set(Napi::String::New(env, "graphBeginCapture"), Napi::Function::New(env, GraphBeginCapture));

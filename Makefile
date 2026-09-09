@@ -7,6 +7,7 @@ LIB_NAME = libglm_ops.so
 BUILD_DIR := build/Release
 
 SRCS_CU := csrc/glm_ops.cu csrc/glm_flash.cu csrc/glm_gemv.cu csrc/glm_gdn.cu csrc/glm_sampling.cu csrc/glm_p2p.cu csrc/glm_context_parallel.cu csrc/glm_mma_moe.cu csrc/glm_mma_moe_coop.cu csrc/glm_sparse_mla.cu csrc/glm_indexer.cu csrc/glm_gather_topk_ckv.cu vendor/flashinfer/csrc/sparse_mla_sm120_prefill.cu vendor/flashinfer/csrc/sparse_mla_sm120_decode_dsv3_2.cu
+SRCS_CU += csrc/glm_quantize.cu
 SRCS_CPP := csrc/glm_nccl.cpp csrc/glm_device.cpp
 OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(patsubst vendor/flashinfer/csrc/%.cu,$(BUILD_DIR)/flashinfer_%.o,$(SRCS_CU))) $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS_CPP))
 DEPS := $(OBJS:.o=.d)

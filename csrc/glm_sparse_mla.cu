@@ -14,7 +14,7 @@ namespace flashinfer::sparse_mla_sm120 {
         size_t stride_kv_block, size_t stride_kv_block_extra,
         const float* attn_sink, const int* topk_length,
         const int* extra_topk_length, cudaStream_t stream,
-        const __nv_bfloat16* Q_rope_split);
+         const __nv_bfloat16* Q_rope_split, const float* Q_scales);
 
     bool launch_sparse_mla_decode_dsv3_2(
         ModelType mt, int num_heads, int topk, int num_tokens,
@@ -23,7 +23,7 @@ namespace flashinfer::sparse_mla_sm120 {
         __nv_bfloat16* output, float* out_lse, const int* topk_length,
         const float* attn_sink, int chunks_per_block_override,
         float sm_scale, size_t stride_kv_block, cudaStream_t stream,
-        const __nv_bfloat16* Q_rope_split);
+         const __nv_bfloat16* Q_rope_split, const float* Q_scales);
 }
 
 #include "glm_ops.h"
@@ -44,7 +44,8 @@ void glm_sparse_mla_prefill(
     uint32_t page_block_size,
     float sm_scale,
     size_t stride_kv_block,   // page_block_size * bytes_per_token
-    int32_t* topk_length      // [num_tokens] or null
+    int32_t* topk_length,     // [num_tokens] or null
+    const float* q_scales     // [num_tokens, num_heads, 4] or null for BF16 Q
 ) {
     cudaSetDevice(ctx->device_id);
     using flashinfer::sparse_mla_sm120::sparse_mla_prefill_dispatch;
@@ -65,7 +66,7 @@ void glm_sparse_mla_prefill(
         topk_length,
         nullptr,
         GLM_STREAM(ctx),
-        (const __nv_bfloat16*)q_rope);
+        (const __nv_bfloat16*)q_rope, q_scales);
 
     if (!ok) {
         fprintf(stderr, "glm_sparse_mla_prefill: dispatch failed for num_heads=%u topk=%u\n",
@@ -90,7 +91,8 @@ void glm_sparse_mla_decode(
     float sm_scale,
     size_t stride_kv_block,
     int32_t* topk_length,     // [num_tokens] or null
-    int chunks_per_block_override  // 0 = use default heuristic
+    int chunks_per_block_override,  // 0 = use default heuristic
+    const float* q_scales           // [num_tokens, num_heads, 4] or null for BF16 Q
 ) {
     cudaSetDevice(ctx->device_id);
     using flashinfer::sparse_mla_sm120::launch_sparse_mla_decode_dsv3_2;
@@ -112,7 +114,7 @@ void glm_sparse_mla_decode(
         sm_scale,
         stride_kv_block,
         GLM_STREAM(ctx),
-        (const __nv_bfloat16*)q_rope);
+        (const __nv_bfloat16*)q_rope, q_scales);
 
     if (!ok) {
         fprintf(stderr, "glm_sparse_mla_decode: dispatch failed for num_heads=%u topk=%u\n",

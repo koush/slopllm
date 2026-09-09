@@ -696,6 +696,12 @@ class GlmOps:
             ctypes.c_uint32, ctypes.c_uint32,
         ]
 
+        self.lib.glm_quantize_fp8.restype = None
+        self.lib.glm_quantize_fp8.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_uint32,
+        ]
+
         self.lib.glm_sparse_mla_prefill.restype = None
         self.lib.glm_sparse_mla_prefill.argtypes = [
             ctypes.c_void_p,
@@ -703,7 +709,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_float, ctypes.c_size_t,
-            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
         ]
 
         self.lib.glm_sparse_mla_decode.restype = None
@@ -714,7 +720,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_float, ctypes.c_size_t,
-            ctypes.c_void_p, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
         ]
 
         self.lib.glm_graph_begin_capture.restype = None
@@ -1774,6 +1780,12 @@ class GlmOps:
             ctypes.c_uint32(cp_world_size), ctypes.c_uint32(cp_rank),
         )
 
+    def quantize_fp8(self, input, values, scales, num_blocks, block_size):
+        self.lib.glm_quantize_fp8(
+            self.ctx, ctypes.c_void_p(input), ctypes.c_void_p(values), ctypes.c_void_p(scales),
+            ctypes.c_size_t(num_blocks), ctypes.c_uint32(block_size),
+        )
+
     def sparse_mla_prefill(self, q, kv_cache, indices, output, out_lse,
                            num_tokens, num_heads, topk, page_block_size,
                            sm_scale, stride_kv_block, topk_length=None):
@@ -1784,11 +1796,12 @@ class GlmOps:
             ctypes.c_uint32(num_tokens), ctypes.c_uint32(num_heads), ctypes.c_uint32(topk),
             ctypes.c_uint32(page_block_size), ctypes.c_float(sm_scale), ctypes.c_size_t(stride_kv_block),
             ctypes.c_void_p(topk_length) if topk_length is not None else None,
+            None,
         )
 
     def sparse_mla_prefill_split_q(self, q_nope, q_rope, kv_cache, indices, output, out_lse,
                                    num_tokens, num_heads, topk, sm_scale, stride_kv_block,
-                                   topk_length=None):
+                                   topk_length=None, q_scales=None):
         self.lib.glm_sparse_mla_prefill(
             self.ctx,
             ctypes.c_void_p(q_nope), ctypes.c_void_p(q_rope),
@@ -1797,6 +1810,7 @@ class GlmOps:
             ctypes.c_uint32(num_tokens), ctypes.c_uint32(num_heads), ctypes.c_uint32(topk),
             ctypes.c_uint32(64), ctypes.c_float(sm_scale), ctypes.c_size_t(stride_kv_block),
             ctypes.c_void_p(topk_length) if topk_length is not None else None,
+            ctypes.c_void_p(q_scales) if q_scales is not None else None,
         )
 
     def sparse_mla_decode(self, q, kv_cache, indices, mid_out, mid_lse,
@@ -1812,12 +1826,13 @@ class GlmOps:
             ctypes.c_uint32(num_splits), ctypes.c_float(sm_scale), ctypes.c_size_t(stride_kv_block),
             ctypes.c_void_p(topk_length) if topk_length is not None else None,
             ctypes.c_int(chunks_per_block),
+            None,
         )
 
     def sparse_mla_decode_split_q(self, q_nope, q_rope, kv_cache, indices, mid_out, mid_lse,
                                   output, out_lse, num_tokens, num_heads, topk,
                                   num_splits, sm_scale, stride_kv_block,
-                                  chunks_per_block=0, topk_length=None):
+                                  chunks_per_block=0, topk_length=None, q_scales=None):
         self.lib.glm_sparse_mla_decode(
             self.ctx,
             ctypes.c_void_p(q_nope), ctypes.c_void_p(q_rope),
@@ -1828,6 +1843,7 @@ class GlmOps:
             ctypes.c_uint32(num_splits), ctypes.c_float(sm_scale), ctypes.c_size_t(stride_kv_block),
             ctypes.c_void_p(topk_length) if topk_length is not None else None,
             ctypes.c_int(chunks_per_block),
+            ctypes.c_void_p(q_scales) if q_scales is not None else None,
         )
 
     def graph_begin_capture(self):

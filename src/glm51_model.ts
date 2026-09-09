@@ -770,6 +770,7 @@ export class Glm51Model extends ChatModel {
     using ckv = cache.ckv;
     using kpe = cache.kpe;
     using qAbsorbedR = qStream.result.qAbsorbed;
+    using qAbsorbedScales = qStream.result.qAbsorbedScales;
     using qPeR = qStream.result.qPe;
 
     idxQStream?.streamWaitEvent();
@@ -846,7 +847,7 @@ export class Glm51Model extends ChatModel {
         // seqLen=1, batch=BS — which matches token-major layout.
         const sparseResult = state.sparseMla(
           qAbsorbedR, qPeR, ckv!, slots!, slotsLength!,
-          cfg.indexTopk, cfg.scaling,
+          cfg.indexTopk, cfg.scaling, qAbsorbedScales,
         );
         tokenMajor = !state.isDecode;
 

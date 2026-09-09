@@ -1,4 +1,4 @@
-import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MlaQuery, type WorkspaceMemoryStats } from "./device_ops";
 import { CaptureManager } from "./capture-manager";
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
@@ -2785,6 +2785,7 @@ export class ParallelOps implements DeviceOps {
       case "BF16": return NCCL_BFLOAT16;
       case "F32": return NCCL_FLOAT32;
       case "I32": return NCCL_INT32;
+      case "F8_E4M3":
       case "U8": return NCCL_UINT8;
       default: throw new Error(`Unsupported NCCL datatype for type ${type}`);
     }
@@ -3067,7 +3068,20 @@ export class ParallelOps implements DeviceOps {
     };
   }
 
-  projectMlaQuery(state: ExecutionState, kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): { qAbsorbed: Tensor, qPe: Tensor } {
+  quantizeFp8(input: Tensor, blockSize: number): { values: ParallelTensor, scales: ParallelTensor } {
+    const scaleShape = fp8ScaleShape(input, blockSize);
+    const pInput = this.cast(input);
+    this.assertParallel('quantizeFp8', pInput, TensorParallelism.Replicated, TensorParallelism.Column, TensorParallelism.Row);
+    // A shard boundary must not split a quantization block.
+    for (const shard of pInput.shards) fp8ScaleShape(shard, blockSize);
+    const results = pInput.shards.map((shard, i) => this.devices[i].quantizeFp8(shard, blockSize));
+    return {
+      values: this.wrapShards(input.workspace, results.map(r => r.values), input.shape, 'F8_E4M3', pInput.parallelism),
+      scales: this.wrapShards(input.workspace, results.map(r => r.scales), scaleShape, 'F32', pInput.parallelism),
+    };
+  }
+
+  projectMlaQuery(state: ExecutionState, kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): MlaQuery {
     using qPeStream = this.withStream(() => {
       using qPeLin = qNormed.linear(qPeWeight);
       return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, qkRopeDim, ropeInterleave);
@@ -3076,15 +3090,24 @@ export class ParallelOps implements DeviceOps {
     const qAbsorbed = state.isDecode
       ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
       : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
+    const gatherQ = this.cast(kvCache).parallelism === TensorParallelism.Row;
+    const quantized = gatherQ && state.cache.getPagedKV().sparseMode
+      ? this.quantizeFp8(qAbsorbed, 128)
+      : undefined;
+    using localQFp8 = quantized?.values;
+    using localQScales = quantized?.scales;
     qPeStream.streamWaitEvent();
     const qPe = qPeStream.result as ParallelTensor;
-    const gatherQ = this.cast(kvCache).parallelism === TensorParallelism.Row;
     if (!gatherQ) {
       return { qAbsorbed, qPe };
     }
 
     using localQAbsorbed = qAbsorbed as ParallelTensor;
     using localQPe = qPe;
+    if (localQFp8 && localQScales) {
+      const gathered = this.allGatherMultiple([localQFp8, localQScales, localQPe], qNormed.workspace);
+      return { qAbsorbed: gathered[0], qAbsorbedScales: gathered[1], qPe: gathered[2] };
+    }
     const gathered = this.allGatherMultiple([localQAbsorbed, localQPe], qNormed.workspace);
     return { qAbsorbed: gathered[0], qPe: gathered[1] };
   }
@@ -3784,7 +3807,7 @@ export class ParallelOps implements DeviceOps {
     return true;
   }
 
-  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
     const numTokens = state.totalTokens;
     const pQAbsorbed = this.cast(qAbsorbed);
     const pQPe = this.cast(qPe);
@@ -3804,7 +3827,7 @@ export class ParallelOps implements DeviceOps {
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaPrefill(state, pQAbsorbed.shards[i], pQPe.shards[i], pEffKvCache.shards[i], pIndices.shards[i], topk, smScale, pTopkLength.shards[i], pageIndptrD, lastPageLen, kvTokenIndptrD);
+      const result = this.devices[i].sparseMlaPrefill(state, pQAbsorbed.shards[i], pQPe.shards[i], pEffKvCache.shards[i], pIndices.shards[i], topk, smScale, pTopkLength.shards[i], pageIndptrD, lastPageLen, kvTokenIndptrD, qAbsorbedScales ? this.cast(qAbsorbedScales).shards[i] : undefined);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
@@ -3813,7 +3836,7 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
     const numTokens = state.batchSize;
     const pQAbsorbed = this.cast(qAbsorbed);
     const pQPe = this.cast(qPe);
@@ -3831,7 +3854,7 @@ export class ParallelOps implements DeviceOps {
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaDecode(state, pQAbsorbed.shards[i], pQPe.shards[i], pKvCache.shards[i], pIndices.shards[i], topk, numSplits, smScale, chunksPerBlock, pTopkLength?.shards[i]);
+      const result = this.devices[i].sparseMlaDecode(state, pQAbsorbed.shards[i], pQPe.shards[i], pKvCache.shards[i], pIndices.shards[i], topk, numSplits, smScale, chunksPerBlock, pTopkLength?.shards[i], qAbsorbedScales ? this.cast(qAbsorbedScales).shards[i] : undefined);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }

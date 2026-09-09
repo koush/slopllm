@@ -289,20 +289,20 @@ export class ExecutionState {
     }
   }
 
-  sparseMla(qAbsorbed: Tensor, qPe: Tensor, ckv: Tensor, indices: Tensor, length: Tensor, topk: number, smScale: number): { o: Tensor, lse: Tensor } {
+  sparseMla(qAbsorbed: Tensor, qPe: Tensor, ckv: Tensor, indices: Tensor, length: Tensor, topk: number, smScale: number, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
     if (this.isDecode) {
       const numSplits = Math.ceil(topk / 64);
       return this.ws.glm.sparseMlaDecode(
         this, qAbsorbed, qPe, ckv, indices,
         topk, numSplits,
-        smScale, 0, length,
+        smScale, 0, length, qAbsorbedScales,
       );
     } else {
       return this.ws.glm.sparseMlaPrefill(
         this, qAbsorbed, qPe, ckv, indices,
         topk,
         smScale, length,
-        this.indptrD, this.lastPageLen, this.kvTokenIndptrD,
+        this.indptrD, this.lastPageLen, this.kvTokenIndptrD, qAbsorbedScales,
       );
     }
   }

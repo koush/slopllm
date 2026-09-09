@@ -1,4 +1,4 @@
-import { DeviceOps, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
 import { Heap, type HeapAllocation, type HeapKey } from "./heap";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
@@ -987,6 +987,14 @@ export class GlmOps implements DeviceOps {
     }
   }
 
+  quantizeFp8(input: Tensor, blockSize: number): { values: Tensor, scales: Tensor } {
+    const scaleShape = fp8ScaleShape(input, blockSize);
+    const values = input.workspace.alloc(input.shape, 'F8_E4M3');
+    const scales = input.workspace.alloc(scaleShape, 'F32');
+    getNativeAddon().quantizeFp8(this.ctx, ptr(input), ptr(values), ptr(scales), scales.numElements, blockSize);
+    return { values, scales };
+  }
+
   projectMlaQuery(state: ExecutionState, _kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): { qAbsorbed: Tensor, qPe: Tensor } {
     using qPeStream = this.withStream(() => {
       using qPeLin = qNormed.linear(qPeWeight);
@@ -1335,7 +1343,19 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().gdnPrefill(this.ctx, output.data, recurrentState.data, qkv.data, aRaw.data, bRaw.data, aLog.data, dtBias.data, cuSeqlens.data, state.totalTokens, numHeads, dK, dV, state.batchSize, stateStride, qkvChStride, qkvSeqStride);
   }
 
-  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor): { o: Tensor, lse: Tensor } {
+  private validateSparseMlaQuery(q: Tensor, scales?: Tensor): void {
+    if (!scales) {
+      if (q.type !== 'BF16') throw new Error('sparse MLA FP8 Q requires block scales');
+      return;
+    }
+    if (q.type !== 'F8_E4M3' || scales.type !== 'F32' || q.shape.length !== 3 || q.shape[2] !== 512 ||
+      scales.shape.length !== 3 || scales.shape[0] !== q.shape[0] || scales.shape[1] !== q.shape[1] || scales.shape[2] !== 4) {
+      throw new Error('sparse MLA requires E4M3 Q [tokens, heads, 512] and F32 scales [tokens, heads, 4]');
+    }
+  }
+
+  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
+    this.validateSparseMlaQuery(qAbsorbed, qAbsorbedScales);
     const numTokens = state.totalTokens;
     const numHeads = qAbsorbed.shape[1];
     const headDim = qAbsorbed.shape[2];
@@ -1358,14 +1378,15 @@ export class GlmOps implements DeviceOps {
       const numSplits = Math.ceil(topk / 64);
       using midOut = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
       using midLse = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits], "F32");
-      getNativeAddon().sparseMlaDecode(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, 0, ptr(topkLength));
+      getNativeAddon().sparseMlaDecode(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, 0, ptr(topkLength), qAbsorbedScales ? ptr(qAbsorbedScales) : 0);
       return { o, lse };
     }
-    getNativeAddon().sparseMlaPrefill(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(o), ptr(lse), numTokens, numHeads, topk, smScale, effectiveStrideKvBlock, ptr(topkLength));
+    getNativeAddon().sparseMlaPrefill(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(o), ptr(lse), numTokens, numHeads, topk, smScale, effectiveStrideKvBlock, ptr(topkLength), qAbsorbedScales ? ptr(qAbsorbedScales) : 0);
     return { o, lse };
   }
 
-  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
+    this.validateSparseMlaQuery(qAbsorbed, qAbsorbedScales);
     const numTokens = state.batchSize;
     const numHeads = qAbsorbed.shape[1];
     const headDim = qAbsorbed.shape[2];
@@ -1381,7 +1402,7 @@ export class GlmOps implements DeviceOps {
     const lse = qAbsorbed.workspace.alloc([numTokens, numHeads], "F32");
     using midOut = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
     using midLse = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits], "F32");
-    getNativeAddon().sparseMlaDecode(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, chunksPerBlock, topkLength ? ptr(topkLength) : 0);
+    getNativeAddon().sparseMlaDecode(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, chunksPerBlock, topkLength ? ptr(topkLength) : 0, qAbsorbedScales ? ptr(qAbsorbedScales) : 0);
     return { o, lse };
   }
 
