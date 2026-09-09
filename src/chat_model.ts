@@ -59,15 +59,6 @@ export interface MtpDraftBatch {
   proposal?: MtpProposal;
 }
 
-export interface LinearMtpSampler {
-  readonly captureKey: string | number;
-  prepareDraft(batchSize: number, depth: number): void;
-  sampleDraft(logits: Tensor, depth: number): Tensor;
-  finishDraft(): MtpProposal;
-  prepareVerification(draft: MtpDraftBatch): void;
-  verify(logits: Tensor): { tokens: Tensor; numAccepted: Tensor };
-}
-
 export interface MtpStepResult {
   draft: MtpDraftBatch;
   tokens: number[][];
@@ -76,8 +67,17 @@ export interface MtpStepResult {
 }
 
 export interface TokenSelector {
-  (logits: Tensor): Tensor;
+  selectTarget(logits: Tensor): Tensor;
   captureKey?: string | number;
+  /** False/omitted retains token-comparison (greedy/tree) verification. */
+  readonly mtpEnabled?: boolean;
+  readonly mtpCaptureKey?: string | number;
+  /** All MTP methods are required when mtpEnabled is true. */
+  prepareDraft?(batchSize: number, depth: number): void;
+  sampleDraft?(logits: Tensor, depth: number): Tensor;
+  finishDraft?(): MtpProposal;
+  prepareVerification?(draft: MtpDraftBatch): void;
+  verify?(logits: Tensor): { tokens: Tensor; numAccepted: Tensor };
 }
 
 export interface CommonModelConfig {
@@ -155,8 +155,8 @@ export abstract class ChatModel extends WorkspaceBase {
   }
   planPrefillMtpChunk?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void>;
   planPrefillMtpChunkPhased?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): PhasedPrefillPlan;
-  planPrefillMtpDraftExtend?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens?: TokenSelector, linearSampler?: LinearMtpSampler): ExecutionPlan<MtpDraftBatch>;
-  planTargetVerification?(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, selectTokens?: TokenSelector, linearSampler?: LinearMtpSampler): ExecutionPlan<MtpStepResult>;
+  planPrefillMtpDraftExtend?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], samplingPolicy?: TokenSelector): ExecutionPlan<MtpDraftBatch>;
+  planTargetVerification?(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, samplingPolicy?: TokenSelector): ExecutionPlan<MtpStepResult>;
 
   prepareMtpInput(_cache: ChatCache, inputIdsList: number[][]): number[][] {
     return inputIdsList.map(inputIds => [...inputIds]);

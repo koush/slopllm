@@ -5,7 +5,8 @@ import { TensorParallelism } from "../src/device_ops";
 import { MemcpyKind } from "../src/enums";
 import { GlmOps, f32ToBf16Bytes } from "../src/glm_ops";
 import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
-import { LinearMtpSamplingWorkspace, SamplingWorkspace } from "../src/sampling";
+import { SamplingWorkspace } from "../src/sampling";
+import { CaptureManager } from "../src/capture-manager";
 import type { Tensor } from "../src/tensor";
 import { WorkspaceBase } from "../src/workspace";
 
@@ -26,7 +27,7 @@ function readI32(tensor: Tensor): number[] {
 }
 
 for (const parallel of [false, true]) {
-  describe(`LinearMtpSamplingWorkspace (${parallel ? "two GPUs" : "single GPU"})`, {
+  describe(`SamplingWorkspace linear MTP (${parallel ? "two GPUs" : "single GPU"})`, {
     skip: parallel && process.env.TEST_MULTIGPU !== "1",
     concurrency: false,
   }, () => {
@@ -34,7 +35,7 @@ for (const parallel of [false, true]) {
     let glm: GlmOps | ParallelOps;
     let ws: WorkspaceBase;
     let target: SamplingWorkspace;
-    let sampler: LinearMtpSamplingWorkspace;
+    let sampler: SamplingWorkspace;
 
     before(() => {
       const first = parseInt(process.env.GLM_GPU ?? "0", 10);
@@ -42,16 +43,14 @@ for (const parallel of [false, true]) {
       if (parallel) devices.push(new GlmOps(parseInt(process.env.GLM_GPU_SECOND ?? "1", 10)));
       glm = parallel ? new ParallelOps(devices) : devices[0];
       ws = new WorkspaceBase(glm);
-      // Separate workspaces own identically named sampling buffers; no model or KV cache.
-      target = new SamplingWorkspace(glm, B * (D + 1), V, 0);
-      sampler = new LinearMtpSamplingWorkspace(glm, B, D, target);
+      target = new SamplingWorkspace(glm, B * (D + 1), V, 0, { maxBatchSize: B, depth: D });
+      sampler = target;
     });
 
     after(() => {
       try {
         glm?.synchronize();
       } finally {
-        sampler?.free();
         target?.free();
         ws?.free();
         if (glm instanceof ParallelOps) glm.free();
@@ -74,6 +73,50 @@ for (const parallel of [false, true]) {
       });
       tensor.h2d(f32ToBf16Bytes(values));
     }
+
+    it("selectTarget delegates to ordinary target sampling", t => {
+      target.updateSampler(Array.from({ length: B }, () => greedy));
+      using input = logits([7, 300]);
+      const sample = t.mock.method(target, "sample");
+      using selected = target.selectTarget(input);
+      assert.equal(sample.mock.callCount(), 1);
+      assert.equal(sample.mock.calls[0].arguments[0], input);
+      assert.equal(sample.mock.calls[0].result, selected);
+      assert.deepEqual(readI32(selected).slice(0, B), [7, 300]);
+    });
+
+    it("ordinary sampling retains penalty history and caller-owned outputs without MTP allocations", () => {
+      using sampling = new SamplingWorkspace(glm, B, V, 8);
+      using inputs = new WorkspaceBase(glm);
+      using manager = new CaptureManager(glm);
+      const input = inputs.alloc([B, V], "BF16", "logits");
+      assert.equal(sampling.mtpEnabled, false);
+      assert.throws(() => sampling.updateMtpSampler([greedy]), /not enabled/);
+      assert.throws(() => sampling.prepareDraft(B, D), /not enabled/);
+      assert.throws(() => sampling.sampleDraft(input, 0), /not enabled/);
+      assert.throws(() => sampling.finishDraft(), /not enabled/);
+      assert.throws(() => sampling.prepareVerification({ targetTokens: [], treeTokens: [], topks: [] }), /not enabled/);
+      assert.throws(() => sampling.verify(input), /not enabled/);
+      assert.equal(sampling.tensors.has("qDraftProbs"), false);
+      for (let iteration = 0; iteration < 7; iteration++) {
+        const peaks = [7 + iteration * 3, 300 + iteration * 3];
+        uploadLogits(input, peaks);
+        sampling.updateSampler(peaks.map(() => ({ ...greedy, presencePenalty: 2 })), peaks.map(peak => [peak]));
+        using selected = manager.run({}, () => sampling.sample(input), ["sample", sampling.captureKey]) as Tensor;
+        assert.deepEqual(readI32(selected), peaks.map(peak => peak + 1));
+        assert.deepEqual(readI32(sampling.penaltyCount), [2, 2]);
+      }
+      assert.equal(sampling.tracked.size, 0);
+      assert.ok([...manager.captured.values()].every(captured => captured.graphExec !== null && captured.capturedWorkspaces.has(sampling)));
+      {
+        using first = sampling.sample(input);
+        const saved = readI32(first);
+        using second = sampling.sample(input);
+        assert.equal(first.same(second), false);
+        assert.deepEqual(readI32(first), saved);
+      }
+      assert.equal(sampling.tracked.size, 0);
+    });
 
     function noFullGather(t: TestContext, maxK: number) {
       assert.ok(glm instanceof ParallelOps);
@@ -101,7 +144,7 @@ for (const parallel of [false, true]) {
     }
 
     function draft(peaks: number[], params: SamplingParams[]): MtpDraftBatch {
-      sampler.updateSampler(params);
+      sampler.updateMtpSampler(params);
       sampler.prepareDraft(peaks.length, D);
       const treeTokens = peaks.map(() => [] as number[]);
       using input = logits(peaks);
@@ -118,23 +161,20 @@ for (const parallel of [false, true]) {
       return { targetTokens: peaks, treeTokens, topks: [1, 1, 1], proposal: sampler.finishDraft() };
     }
 
-    function guardResidentTransfers(t: TestContext, resident: LinearMtpSamplingWorkspace) {
+    function guardResidentTransfers(t: TestContext, workspace: SamplingWorkspace) {
+      const resident = workspace;
       const copies = [] as { source: Tensor; sourceOffset: number; destinationOffset: number }[];
       for (const name of ["qHostProbs", "qHostIds", "qInputProbsH", "qInputIdsH"]) {
-        const tensor = resident.tensors.get(name)!;
-        // Guard narrow too: draft downloads normally target views of qHost buffers.
-        for (const method of ["narrow", "memcpy", "readPinnedBuffer", "withPinnedBuffer"] as const) {
-          t.mock.method(tensor, method, () => { throw new Error(`Resident proposals touched ${name}.${method}`); });
-        }
+        assert.equal(workspace.tensors.has(name), false);
       }
       for (const name of ["qInputProbs", "qInputIds"]) {
-        const tensor = resident.tensors.get(name)!;
+        const tensor = workspace.tensors.get(name)!;
         t.mock.method(tensor, "memcpy", () => { throw new Error(`Resident proposals uploaded ${name}`); });
         const memcpy2d = tensor.memcpy2d;
         t.mock.method(tensor, "memcpy2d", function (this: Tensor, ...args: Parameters<Tensor["memcpy2d"]>) {
           const [destinationOffset, dpitch, source, sourceOffset, spitch, width, height, kind] = args;
           assert.equal(kind, MemcpyKind.DeviceToDevice);
-          assert.equal(source, resident.tensors.get(name === "qInputProbs" ? "qDraftProbs" : "qDraftIds"));
+          assert.equal(source, workspace.tensors.get(name === "qInputProbs" ? "qDraftProbs" : "qDraftIds"));
           assert.equal(width, resident.capacity * 4);
           assert.equal(dpitch, width);
           assert.equal(spitch, B * width);
@@ -148,21 +188,22 @@ for (const parallel of [false, true]) {
 
     for (const stochastic of [false, true]) {
       it(`matches host ${stochastic ? "stochastic" : "greedy"} proposals with resident reorder and compaction without q host transfers`, (t) => {
-        using resident = new LinearMtpSamplingWorkspace(glm, B, D, target, true);
-        const copies = guardResidentTransfers(t, resident);
+        using residentWs = new SamplingWorkspace(glm, B * (D + 1), V, 0, { maxBatchSize: B, depth: D, retainProposalsOnGpu: true });
+        const resident = residentWs;
+        const copies = guardResidentTransfers(t, residentWs);
         const params = stochastic
           ? [{ ...greedy, temperature: 1, topK: 3 }, { ...greedy, temperature: 0.5, topK: 2 }]
           : [greedy, greedy];
         const seed = Buffer.alloc(4);
         seed.writeUInt32LE(123456);
         for (const mode of [sampler, resident]) {
-          mode.updateSampler(params);
+          mode.updateMtpSampler(params);
           mode.prepareDraft(B, D);
-          mode.draftSampler.stepCounter.h2d(seed);
+          mode.draftStepCounter.h2d(seed);
         }
         glm.synchronize();
-        assert.equal(sampler.captureKey, `linear:${stochastic ? 3 : 1}`);
-        assert.equal(resident.captureKey, `${sampler.captureKey}:gpu`);
+        assert.equal(sampler.mtpCaptureKey, `linear:${stochastic ? 3 : 1}`);
+        assert.equal(resident.mtpCaptureKey, `${sampler.mtpCaptureKey}:gpu`);
         const treeTokens: number[][] = [[], []];
         for (let depth = 0; depth < D; depth++) {
           using input = logits([7 + depth * 4, 29 + depth * 4]);
@@ -184,7 +225,7 @@ for (const parallel of [false, true]) {
         assert.ok(device.device);
         assert.deepEqual(device.device.owner, {}, "owner token must not retain a traversable workspace");
         assert.deepEqual(device.device.rows, [0, 1]);
-        assert.deepEqual(readI32(resident.draftSampler.stepCounter), readI32(sampler.draftSampler.stepCounter));
+        assert.deepEqual(readI32(resident.draftStepCounter), readI32(sampler.draftStepCounter));
         const original: MtpDraftBatch = { targetTokens: [7, 29], treeTokens, topks: [1, 1, 1], proposal: host };
         for (const order of [[0, 1], [1, 0], [1], [0, 1]]) {
           const batch: MtpDraftBatch = {
@@ -195,7 +236,7 @@ for (const parallel of [false, true]) {
           };
           const gpuBatch: MtpDraftBatch = { ...batch, proposal: { ...device, device: { ...device.device, rows: order } } };
           prepare(batch, order.map(row => params[row]));
-          resident.updateSampler(order.map(row => params[row]));
+          resident.updateMtpSampler(order.map(row => params[row]));
           copies.length = 0;
           resident.prepareVerification(gpuBatch);
           assert.equal(copies.length, order.length * 2);
@@ -237,14 +278,12 @@ for (const parallel of [false, true]) {
     }
 
     function prepare(batch: MtpDraftBatch, params: SamplingParams[]): void {
-      // Scheduler policy is per active sequence, target policy is sequence-major [B, D+1].
-      sampler.updateSampler(params);
-      const expanded = params.flatMap(param => Array.from({ length: D + 1 }, () => param));
-      target.updateSampler(expanded, expanded.map(() => []));
+      // MTP owns an explicit sequence-major verification bank, independent of target rows.
+      sampler.updateMtpSampler(params);
       sampler.prepareVerification(batch);
     }
 
-    function check(result: ReturnType<LinearMtpSamplingWorkspace["verify"]>, batch: MtpDraftBatch, stochastic = false): void {
+    function check(result: ReturnType<SamplingWorkspace["verify"]>, batch: MtpDraftBatch, stochastic = false): void {
       assert.deepEqual(result.tokens.shape, [batch.targetTokens.length * (D + 1)]);
       assert.deepEqual(result.numAccepted.shape, [batch.targetTokens.length]);
       const tokenShards = result.tokens instanceof ParallelTensor ? result.tokens.shards : [result.tokens];
@@ -262,20 +301,21 @@ for (const parallel of [false, true]) {
     }
 
     it("validates constructor, policy, draft and verification shapes", () => {
-      using unprepared = new LinearMtpSamplingWorkspace(glm, B, D, target);
+      using unpreparedWs = new SamplingWorkspace(glm, B * (D + 1), V, 0, { maxBatchSize: B, depth: D });
+      const unprepared = unpreparedWs;
       using unpreparedInput = logits([7, 19]);
       assert.throws(() => unprepared.sampleDraft(unpreparedInput, 0), /unprepared batch/);
       assert.throws(() => unprepared.finishDraft(), /not prepared/);
       for (const [batch, depth] of [[0, D], [1.5, D], [B, 0], [B, 1.5], [B + 1, D]]) {
-        assert.throws(() => new LinearMtpSamplingWorkspace(glm, batch, depth, target), /valid batch\/depth/);
+        assert.throws(() => new SamplingWorkspace(glm, B * (D + 1), V, 0, { maxBatchSize: batch, depth }), /valid batch\/depth/);
       }
       for (const patch of [
         { temperature: NaN }, { topP: Infinity }, { topK: 1.5 },
         { temperature: 1, topK: 257 }, { repetitionPenalty: 1.1 }, { presencePenalty: 0.1 },
-      ]) assert.throws(() => sampler.updateSampler([{ ...greedy, ...patch }]), /Linear MTP requires/);
-      assert.throws(() => sampler.updateSampler([greedy, greedy, greedy]), /maxBatchSize/);
-      sampler.updateSampler([greedy, greedy]);
-      assert.equal(sampler.captureKey, "linear:1");
+      ]) assert.throws(() => sampler.updateMtpSampler([{ ...greedy, ...patch }]), /Linear MTP requires/);
+      assert.throws(() => sampler.updateMtpSampler([greedy, greedy, greedy]), /maxBatchSize/);
+      sampler.updateMtpSampler([greedy, greedy]);
+      assert.equal(sampler.mtpCaptureKey, "linear:1");
       for (const [batch, depth] of [[0, D], [1, D], [3, D], [B, D - 1]]) {
         assert.throws(() => sampler.prepareDraft(batch, depth), /batch\/depth/);
       }
@@ -296,13 +336,13 @@ for (const parallel of [false, true]) {
         { ...batch, proposal: { ...proposal, tokenIds: [Buffer.alloc(4), proposal.tokenIds[1]] } },
       ]) assert.throws(() => sampler.prepareVerification(invalid), /Invalid (host )?linear MTP proposal/);
       target.updateSampler([greedy, greedy], [[], []]);
-      assert.throws(() => sampler.verify(input), /B \* \(D \+ 1\) rows/);
+      assert.throws(() => sampler.verify(input), /row capacities/);
       prepare(batch, [greedy, greedy]);
       assert.throws(() => sampler.verify(input), /row capacities/);
     });
 
     it("transposes depth-major q into owned B=2, D=3 host proposal rows", () => {
-      sampler.updateSampler([greedy, greedy]);
+      sampler.updateMtpSampler([greedy, greedy]);
       sampler.prepareDraft(B, D);
       for (let depth = 0; depth < D; depth++) {
         using input = logits([10 + depth, 30 + depth]);
@@ -335,7 +375,7 @@ for (const parallel of [false, true]) {
           ? [{ ...greedy, temperature: 1, topK: 3 }, { ...greedy, temperature: 0.5, topK: 2, topP: 0.9 }]
           : [greedy, greedy];
         const original = draft([7, 29], params);
-        assert.equal(sampler.captureKey, stochastic ? "linear:3" : "linear:1");
+        assert.equal(sampler.mtpCaptureKey, stochastic ? "linear:3" : "linear:1");
         if (stochastic) {
           original.proposal!.probabilities.forEach((probs, row) => {
             const ids = original.proposal!.tokenIds[row];
@@ -364,7 +404,6 @@ for (const parallel of [false, true]) {
             },
           };
           prepare(batch, order.map(i => params[i]));
-          assert.equal(target.batchSize, order.length * (D + 1));
           using input = logits(batch.targetTokens.flatMap(peak => Array(D + 1).fill(peak)));
           for (let repeat = 0; repeat < (stochastic ? 12 : 1); repeat++) {
             const result = sampler.verify(input);
@@ -401,13 +440,13 @@ for (const parallel of [false, true]) {
         assert.equal(input.shards.length, 2);
         for (const shard of input.shards) assert.deepEqual(shard.shape, [B, V / 2]);
         try {
-          sampler.updateSampler(params);
+          sampler.updateMtpSampler(params);
           sampler.prepareDraft(B, D);
           reference.updateSampler(params, params.map(() => []));
-          assert.equal(sampler.captureKey, `linear:${maxK}`);
+          assert.equal(sampler.mtpCaptureKey, `linear:${maxK}`);
           const seed = Buffer.alloc(4);
           seed.writeUInt32LE(123456);
-          sampler.draftSampler.stepCounter.h2d(seed);
+          sampler.draftStepCounter.h2d(seed);
           reference.stepCounter.h2d(seed);
           const expectedProbs: Buffer[] = [];
           const expectedIds: number[][] = [];
@@ -423,8 +462,8 @@ for (const parallel of [false, true]) {
             const bytes = f32ToBf16Bytes(values);
             input.h2d(bytes);
             full.h2d(bytes);
-            reference.sampleInto(full, reference.outToken, probs, ids, sampler.capacity);
-            const expectedTokens = readI32(reference.outToken);
+            using output = reference.sample(full, probs, ids, sampler.capacity);
+            const expectedTokens = readI32(output);
             params.forEach((param, row) => {
               if (param.temperature === 0) assert.equal(expectedTokens[row], (row * 257 + depth * 257) % V);
             });
@@ -476,7 +515,7 @@ for (const parallel of [false, true]) {
               if (params[row].temperature > 0) assert.equal(owners.size, 2);
             }
           }
-          assert.deepEqual(readI32(sampler.draftSampler.stepCounter), readI32(reference.stepCounter));
+          assert.deepEqual(readI32(sampler.draftStepCounter), readI32(reference.stepCounter));
         } finally {
           glm.synchronize();
           reference.free();
@@ -511,10 +550,12 @@ for (const parallel of [false, true]) {
         using tracking = graphWs.startTracking();
         for (let depth = 0; depth < D; depth++) {
           using tokens = sampler.sampleDraft(inputs[depth], depth);
+          lastOutput.memcpy(tokens, B * 4, MemcpyKind.DeviceToDevice);
         }
       };
+      const lastOutput = graphWs.alloc([B], "I32", "lastOutput");
       const lastTokens = () => {
-        const tokens = sampler.draftSampler.outToken;
+        const tokens = lastOutput;
         assert.ok(tokens instanceof ParallelTensor);
         assert.equal(tokens.parallelism, TensorParallelism.Replicated);
         assert.equal(tokens.shards.length, 2);
@@ -526,9 +567,9 @@ for (const parallel of [false, true]) {
         { ...greedy, temperature: 0.75, topK: 20, topP: 0.6 },
         { ...greedy, temperature: 0.5, topK: 20 },
       ];
-      sampler.updateSampler(params);
+      sampler.updateMtpSampler(params);
       sampler.prepareDraft(B, D);
-      assert.equal(sampler.captureKey, "linear:20");
+      assert.equal(sampler.mtpCaptureKey, "linear:20");
       upload(0);
       using guard = noFullGather(t, 20);
       for (let warmup = 0; warmup < 3; warmup++) runDraft();
@@ -537,34 +578,34 @@ for (const parallel of [false, true]) {
       runDraft();
       const graph = glm.graphEndCapture();
       let exec: number | undefined;
-      let previous: ReturnType<LinearMtpSamplingWorkspace["finishDraft"]> | undefined;
+      let previous: ReturnType<SamplingWorkspace["finishDraft"]> | undefined;
       try {
         exec = glm.graphInstantiate(graph);
         for (let iteration = 0; iteration < 3; iteration++) {
           upload(iteration);
-          sampler.updateSampler(params.map(param => ({ ...param, temperature: param.temperature + iteration * 0.25 })));
+          sampler.updateMtpSampler(params.map(param => ({ ...param, temperature: param.temperature + iteration * 0.25 })));
           sampler.prepareDraft(B, D);
           const seed = Buffer.alloc(4);
           seed.writeUInt32LE(123456 + iteration * 97);
-          sampler.draftSampler.stepCounter.h2d(seed);
+          sampler.draftStepCounter.h2d(seed);
           runDraft();
           glm.synchronize();
           const expected = sampler.finishDraft();
           const expectedTokens = lastTokens();
-          const expectedCounter = readI32(sampler.draftSampler.stepCounter);
+          const expectedCounter = readI32(sampler.draftStepCounter);
           const saved = [...expected.probabilities, ...expected.tokenIds].map(buf => Buffer.from(buf));
           if (previous) {
             assert.notDeepEqual(expected.tokenIds, previous.tokenIds);
             assert.notDeepEqual(expected.probabilities, previous.probabilities);
           }
           // RNG and policy uploads stay outside capture; replay must consume the new buffers.
-          sampler.draftSampler.stepCounter.h2d(seed);
+          sampler.draftStepCounter.h2d(seed);
           glm.graphLaunch(exec);
           glm.synchronize();
           const actual = sampler.finishDraft();
           assert.deepEqual(actual, expected);
           assert.deepEqual(lastTokens(), expectedTokens);
-          assert.deepEqual(readI32(sampler.draftSampler.stepCounter), expectedCounter);
+          assert.deepEqual(readI32(sampler.draftStepCounter), expectedCounter);
           assert.deepEqual([...expected.probabilities, ...expected.tokenIds], saved);
           previous = actual;
         }
@@ -578,16 +619,19 @@ for (const parallel of [false, true]) {
     });
 
     it("replays resident draft and verification graphs with fresh generations and no q host transfers", (t) => {
-      using resident = new LinearMtpSamplingWorkspace(glm, B, D, target, true);
-      guardResidentTransfers(t, resident);
-      resident.updateSampler([greedy, greedy]);
-      assert.equal(resident.captureKey, "linear:1:gpu");
+      using residentWs = new SamplingWorkspace(glm, B * (D + 1), V, 0, { maxBatchSize: B, depth: D, retainProposalsOnGpu: true });
+      const resident = residentWs;
+      guardResidentTransfers(t, residentWs);
+      resident.updateMtpSampler([greedy, greedy]);
+      assert.equal(resident.mtpCaptureKey, "linear:1:gpu");
       resident.prepareDraft(B, D);
       using draftInput = logits([7, 29]);
       using targetInput = logits([7, 7, 7, 7, 29, 29, 29, 29]);
+      using lastOutput = ws.alloc([B], "I32");
       const runDraft = () => {
         for (let depth = 0; depth < D; depth++) {
           using tokens = resident.sampleDraft(draftInput, depth);
+          lastOutput.memcpy(tokens, B * 4, MemcpyKind.DeviceToDevice);
         }
       };
       for (let warmup = 0; warmup < 3; warmup++) runDraft();
@@ -597,7 +641,7 @@ for (const parallel of [false, true]) {
       const draftGraph = glm.graphEndCapture();
       let draftExec: number | undefined;
       let verifyExec: number | undefined;
-      let captured: ReturnType<LinearMtpSamplingWorkspace["verify"]> | undefined;
+      let captured: ReturnType<SamplingWorkspace["verify"]> | undefined;
       let previous: MtpDraftBatch | undefined;
       try {
         draftExec = glm.graphInstantiate(draftGraph);
@@ -607,7 +651,7 @@ for (const parallel of [false, true]) {
           if (previous) assert.throws(() => resident.prepareVerification(previous!), /stale/);
           glm.graphLaunch(draftExec);
           glm.synchronize();
-          assert.deepEqual(readI32(resident.draftSampler.outToken), peaks);
+          assert.deepEqual(readI32(lastOutput), peaks);
           const batch: MtpDraftBatch = {
             targetTokens: peaks, treeTokens: peaks.map(peak => Array(D).fill(peak)),
             topks: [1, 1, 1], proposal: resident.finishDraft(),
@@ -617,8 +661,6 @@ for (const parallel of [false, true]) {
           assert.deepEqual(batch.proposal!.device!.owner, {});
           assert.deepEqual(batch.proposal!.device!.rows, [0, 1]);
           if (previous) assert.equal(batch.proposal!.device!.generation, previous.proposal!.device!.generation + 1);
-          const expanded = Array.from({ length: B * (D + 1) }, () => greedy);
-          target.updateSampler(expanded, expanded.map(() => []));
           resident.prepareVerification(batch);
           uploadLogits(targetInput, peaks.flatMap(peak => Array(D + 1).fill(peak)));
           if (verifyExec === undefined) {
@@ -648,8 +690,77 @@ for (const parallel of [false, true]) {
       }
     });
 
+    for (const retainProposalsOnGpu of [false, true]) {
+      it(`tracks one sampling workspace across CaptureManager target/draft/verification replay (${retainProposalsOnGpu ? "GPU" : "host"} q)`, () => {
+        using sampling = new SamplingWorkspace(glm, B * (D + 1), V, 8, { maxBatchSize: B, depth: D, retainProposalsOnGpu });
+        using inputs = new WorkspaceBase(glm);
+        using manager = new CaptureManager(glm);
+        for (const rows of [B, 1, B]) {
+          const input = inputs.ensureAlloc([rows, V], "BF16", `draft${rows}`);
+          const verification = inputs.ensureAlloc([rows * (D + 1), V], "BF16", `verify${rows}`);
+          for (let iteration = 0; iteration < 7; iteration++) {
+            const peaks = Array.from({ length: rows }, (_, b) => 7 + b * 270 + iteration * 3);
+            uploadLogits(input, peaks);
+            uploadLogits(verification, peaks.flatMap(peak => Array(D + 1).fill(peak)));
+            const params = peaks.map((_, b) => ({ ...greedy, temperature: 0.5 + iteration * 0.25 + b, topK: 3 }));
+            // Back-to-back uploads must not rewrite in-flight pinned staging.
+            sampling.updateSampler(params);
+            sampling.updateMtpSampler(params.map(p => ({ ...p, topK: 2 })));
+            assert.equal(sampling.captureKey, 3);
+            assert.equal(sampling.mtpCaptureKey, `linear:2${retainProposalsOnGpu ? ":gpu" : ""}`);
+            sampling.updateMtpSampler(params);
+            assert.equal(sampling.captureKey, 3);
+            assert.equal(sampling.mtpCaptureKey, `linear:3${retainProposalsOnGpu ? ":gpu" : ""}`);
+            sampling.updateSampler(peaks.map(() => greedy), peaks.map(() => []));
+            assert.equal(sampling.captureKey, 1);
+            assert.equal(sampling.mtpCaptureKey, `linear:3${retainProposalsOnGpu ? ":gpu" : ""}`);
+            sampling.prepareDraft(rows, D);
+            const counters = [sampling.stepCounter, sampling.draftStepCounter, sampling.tensors.get("rejectionStepCounter")!];
+            const before = counters.map(counter => readI32(counter)[0]);
+            {
+              using selected = manager.run({}, () => sampling.selectTarget(input), ["target", rows, sampling.captureKey]) as Tensor;
+              assert.deepEqual(readI32(selected), peaks);
+            }
+            assert.deepEqual(counters.map(counter => readI32(counter)[0]), [(before[0] + rows) | 0, before[1], before[2]]);
+            const treeTokens = peaks.map(() => [] as number[]);
+            for (let depth = 0; depth < D; depth++) {
+              using selected = manager.run({}, () => sampling.sampleDraft(input, depth), ["draft", rows, depth, sampling.mtpCaptureKey]) as Tensor;
+              readI32(selected).forEach((token, b) => treeTokens[b].push(token));
+            }
+            assert.deepEqual(counters.map(counter => readI32(counter)[0]), [(before[0] + rows) | 0, (before[1] + rows * D) | 0, before[2]]);
+            const batch: MtpDraftBatch = { targetTokens: peaks, treeTokens, topks: Array(D).fill(1), proposal: sampling.finishDraft() };
+            sampling.prepareVerification(batch);
+            {
+              const result = manager.run({}, () => sampling.verify(verification), ["verify", rows, sampling.mtpCaptureKey]) as ReturnType<SamplingWorkspace["verify"]>;
+              using tokens = result.tokens;
+              using counts = result.numAccepted;
+              check(result, batch, true);
+              assert.equal(tokens.workspace, sampling);
+              assert.equal(counts.workspace, sampling);
+            }
+            assert.deepEqual(counters.map(counter => readI32(counter)[0]), [
+              (before[0] + rows * (D + 2)) | 0, (before[1] + rows * D) | 0, (before[2] + rows * (2 * D + 2)) | 0,
+            ]);
+            assert.equal(sampling.batchSize, rows, "verification must not switch ordinary target rows");
+            assert.deepEqual(readI32(sampling.penaltyCount).slice(0, rows), peaks.map(() => 1), "verification must not modify target penalty history");
+            assert.equal(sampling.tracked.size, 0);
+            if (glm instanceof ParallelOps) {
+              for (const shardWs of glm.getShardWorkspaces(sampling)) assert.equal(shardWs.tracked.size, 0);
+            }
+          }
+        }
+        for (const captured of manager.captured.values()) {
+          assert.notEqual(captured.graphExec, null);
+          assert.ok(captured.capturedWorkspaces.has(sampling), "sampler allocations must participate in capture/replay lifetime checks");
+        }
+        for (const name of ["outToken", "topkValues", "topkIndices", "sampleWorkspace", "pProbs", "pIds", "tokens", "acceptedCounts", "temperaturesHost", "draftTokensH"]) {
+          assert.equal(sampling.tensors.has(name), false, `${name} must not be persistent`);
+        }
+      });
+    }
+
     it("replays captured draft and verification kernels with updated buffers", { skip: parallel }, () => {
-      sampler.updateSampler([greedy, greedy]);
+      sampler.updateMtpSampler([greedy, greedy]);
       sampler.prepareDraft(B, D);
       using draftInput = logits([7, 29]);
       using targetInput = logits([7, 7, 7, 7, 29, 29, 29, 29]);
@@ -665,7 +776,7 @@ for (const parallel of [false, true]) {
       const draftGraph = glm.graphEndCapture();
       let draftExec: number | undefined;
       let verifyExec: number | undefined;
-      let captured: ReturnType<LinearMtpSamplingWorkspace["verify"]> | undefined;
+      let captured: ReturnType<SamplingWorkspace["verify"]> | undefined;
       try {
         draftExec = glm.graphInstantiate(draftGraph);
         for (const peaks of [[7, 29], [43, 61], [11, 37]]) {

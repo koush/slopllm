@@ -7,7 +7,7 @@ import { ChatModel, ChatCache, ChatTemplateKwargs, loadGenerationConfig, loadMax
 import { DeviceOps } from "./device_ops";
 import { executePlan, type ExecutionPhase, ExecutionWorkspace } from "./execution-workspace";
 import { mtpTotalTreeNodes } from "./glm51_model";
-import { LinearMtpSamplingWorkspace, SamplingWorkspace } from "./sampling";
+import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
 import { PhasedPrefillRunner, splitRaggedInput } from "./phased-prefill";
@@ -421,7 +421,6 @@ async function generateMtpBatches(
   chunkSize: number,
   stagedPrefixes: StagedPrefixPolicy,
   phasedPrefill: boolean,
-  linearSampler?: LinearMtpSamplingWorkspace,
 ): Promise<number> {
   if (!model.planPrefillMtpDraftExtend || !model.planTargetVerification) {
     throw new Error("The selected model does not support plan-based MTP decoding");
@@ -445,14 +444,9 @@ async function generateMtpBatches(
     if (!phase.timingName) return;
     recordMtpPhase(phase.timingName, phase.states[0]?.batchSize ?? 0, elapsedSeconds);
   };
-  const selectTokens: TokenSelector = (logits: Tensor): Tensor => samplingWorkspace.sample(logits);
+  const selectTokens: TokenSelector = samplingWorkspace;
   const updateSamplingParams = (params: SamplingParams[]): void => {
     samplingWorkspace.updateSampler(params, params.map(() => []));
-    selectTokens.captureKey = Math.max(...params.map(param => {
-      if (param.temperature <= 0) return 1;
-      if (param.topK > 0) return Math.min(param.topK, model.cfg.vocabSize);
-      return 32;
-    }));
   };
 
   const finish = (req: CompletionRequest): void => {
@@ -587,11 +581,11 @@ async function generateMtpBatches(
         ]);
         const targetParams = requests.map(req => req.samplingParams);
         updateSamplingParams(targetParams);
-        linearSampler?.updateSampler(targetParams);
+        if (samplingWorkspace.mtpEnabled) samplingWorkspace.updateMtpSampler(targetParams);
         draft = (await executePlan(
           captureManager,
           ws,
-          model.planPrefillMtpDraftExtend(ws, cache, mtpInputIds, topks, selectTokens, linearSampler),
+          model.planPrefillMtpDraftExtend(ws, cache, mtpInputIds, topks, selectTokens),
           observeMtpPhase,
         )).result;
         const prefillSeconds = (performance.now() - prefillStart) / 1000;
@@ -617,10 +611,10 @@ async function generateMtpBatches(
       let phaseSeconds = 0;
       const verificationParams = requests.flatMap(req =>
         Array.from({ length: numVerificationTokens }, () => req.samplingParams));
-      updateSamplingParams(verificationParams);
-      linearSampler?.updateSampler(requests.map(req => req.samplingParams));
+      if (!samplingWorkspace.mtpEnabled) updateSamplingParams(verificationParams);
+      if (samplingWorkspace.mtpEnabled) samplingWorkspace.updateMtpSampler(requests.map(req => req.samplingParams));
       const planStart = timing ? performance.now() : 0;
-      const step = await executePlan(captureManager, ws, model.planTargetVerification(ws, cache, draft!, selectTokens, linearSampler), timing ? (phase, seconds) => {
+      const step = await executePlan(captureManager, ws, model.planTargetVerification(ws, cache, draft!, selectTokens), timing ? (phase, seconds) => {
         phaseSeconds += seconds;
         observeMtpPhase(phase, seconds);
       } : observeMtpPhase);
@@ -854,16 +848,13 @@ async function generateContinuousBatch(
       using hiddenStates = model.forwardModel(state);
       using decodeLogits = state.computeLogits(hiddenStates, model);
       if (useArgmax) return decodeLogits.argmax();
-      using _sampled = samplingWorkspace.sample(decodeLogits);
-      return undefined;
-    }, [useArgmax ? "openai-decode-argmax" : "openai-decode-sample"]);
+      return samplingWorkspace.sample(decodeLogits);
+    }, [useArgmax ? "openai-decode-argmax" : "openai-decode-sample", ...(useArgmax ? [] : [samplingWorkspace.captureKey])]);
     await glm.synchronizeAsync();
     let newTokens: number[];
-    if (useArgmax) {
-      using argmaxResult = decodeResult as Tensor;
-      newTokens = argmaxResult.readInt32LEArray();
-    } else {
-      newTokens = samplingWorkspace.outToken.readInt32LEArray();
+    {
+      using selectedTokens = decodeResult as Tensor;
+      newTokens = selectedTokens.readInt32LEArray();
     }
     ws.clearTracking();
     metrics.generationTokensTotal += newTokens.length;
@@ -1055,13 +1046,13 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const ws = new ExecutionWorkspace(glm, args.batchSize, args.chunkSize);
   const captureManager = new CaptureManager(glm);
   captureManager.disabled = args.noCudaGraph;
-  const samplingWorkspace = new SamplingWorkspace(glm, args.batchSize, model.cfg.vocabSize, args.repetitionPenaltyWindow);
-  const mtpSamplingWorkspace = args.mtp && !args.noMtp
-    ? new SamplingWorkspace(glm, args.batchSize * (mtpTotalTreeNodes(args.mtpDraftTopk) + 1), model.cfg.vocabSize, 0)
-    : undefined;
-  const linearMtpSamplingWorkspace = mtpSamplingWorkspace && args.mtpDraftTopk.length > 0 && args.mtpDraftTopk.every(k => k === 1)
-    ? new LinearMtpSamplingWorkspace(glm, args.batchSize, args.mtpDraftTopk.length, mtpSamplingWorkspace, process.env.GLM_MTP_GPU_PROPOSALS !== "0")
-    : undefined;
+  const mtpEnabled = args.mtp && !args.noMtp;
+  const samplingWorkspace = new SamplingWorkspace(glm,
+    args.batchSize * (mtpEnabled ? mtpTotalTreeNodes(args.mtpDraftTopk) + 1 : 1),
+    model.cfg.vocabSize, args.repetitionPenaltyWindow,
+    mtpEnabled && args.mtpDraftTopk.length > 0 && args.mtpDraftTopk.every(k => k === 1)
+      ? { maxBatchSize: args.batchSize, depth: args.mtpDraftTopk.length, retainProposalsOnGpu: process.env.GLM_MTP_GPU_PROPOSALS !== "0" }
+      : undefined);
   const tokenizer = model.tokenizer;
   const eosIds = model.eosIds;
 
@@ -1149,12 +1140,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             args.decodeLatency,
             metrics,
             captureManager,
-            mtpSamplingWorkspace!,
+            samplingWorkspace,
             args.mtpDraftTopk,
             args.chunkSize,
             stagedPrefixes,
             args.phasedPrefill,
-            linearMtpSamplingWorkspace,
           )
           : await generateContinuousBatch(
             model,
@@ -1282,7 +1272,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const repetitionPenalty = params.repetition_penalty ?? params.frequency_penalty ?? args.repetitionPenalty;
       const presencePenalty = params.presence_penalty ?? args.presencePenalty;
 
-      if (linearMtpSamplingWorkspace) {
+      if (samplingWorkspace.mtpEnabled) {
         const effectiveK = temperature <= 0 ? 1 : topK > 0 ? Math.min(topK, model.cfg.vocabSize) : 32;
         if (![temperature, topP, topK, repetitionPenalty, presencePenalty].every(Number.isFinite)
           || !Number.isInteger(topK) || !Number.isInteger(effectiveK)) {
@@ -1628,7 +1618,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  GET  /health               - Health check`);
     console.log(`  CUDA graphs: ${args.noCudaGraph ? "disabled" : "enabled"}`);
     console.log(`  MTP: ${args.mtp && !args.noMtp ? `enabled (draft top-k ${args.mtpDraftTopk.join(",")})` : "disabled"}`);
-    if (linearMtpSamplingWorkspace) console.log(`  MTP proposals: ${linearMtpSamplingWorkspace.retainProposalsOnGpu ? "GPU-resident" : "host baseline"} (GLM_MTP_GPU_PROPOSALS=0 selects host baseline)`);
+    if (samplingWorkspace.mtpEnabled) console.log(`  MTP proposals: ${samplingWorkspace.retainProposalsOnGpu ? "GPU-resident" : "host baseline"} (GLM_MTP_GPU_PROPOSALS=0 selects host baseline)`);
     console.log(`  Phased prefill: ${args.phasedPrefill ? "enabled" : "disabled"}`);
     console.log(`  Model: ${modelName}  |  GPU: ${args.gpus.join(",")}  |  chunk-size=${args.chunkSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);
   });
@@ -1641,8 +1631,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     while (busy) await new Promise(resolve => setTimeout(resolve, 10));
     glm.synchronize();
     captureManager[Symbol.dispose]();
-    linearMtpSamplingWorkspace?.free();
-    mtpSamplingWorkspace?.free();
     samplingWorkspace.free();
     cache.free();
     ws.free();

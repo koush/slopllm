@@ -373,7 +373,12 @@ describe("Qwen3-0.6B batch tests", () => {
     const batchResults = (() => {
       using sampler = new SamplingWorkspace(logits.workspace.glm, 2, model.cfg.vocabSize, sampling.repetitionPenaltyWindow);
       sampler.updateSampler([greedy, sampling], [history, history]);
-      using sampled = sampler.sample(logits);
+      using batchLogits = logits.workspace.alloc([2, model.cfg.vocabSize], "BF16");
+      for (let row = 0; row < 2; row++) {
+        using destination = batchLogits.narrow(row, 1);
+        destination.memcpy(logits);
+      }
+      using sampled = sampler.sample(batchLogits);
       return sampled.readInt32LEArray();
     })();
 

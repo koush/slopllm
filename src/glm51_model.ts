@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ChatCache, ChatTemplateKwargs, LinearMtpSampler, MtpDraftBatch, MtpStepResult, PhasedPrefillPlan, TokenSelector } from "./chat_model";
+import type { ChatCache, ChatTemplateKwargs, MtpDraftBatch, MtpStepResult, PhasedPrefillPlan, TokenSelector } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
 import { executionPhase, type ExecutionPlan, ExecutionState, ExecutionWorkspace } from "./execution-workspace";
@@ -1027,7 +1027,7 @@ export class Glm51Model extends ChatModel {
     states: readonly ExecutionState[],
     metadata: readonly { qoLen: number; previousWidth: number; expandK: number; depth: number }[],
     treeHost: Tensor,
-    linearSampler?: LinearMtpSampler,
+    samplingPolicy: TokenSelector,
   ): void {
     const hiddenSize = this.cfg.hiddenSize;
     const rowBytes = hiddenSize * BF16;
@@ -1037,9 +1037,9 @@ export class Glm51Model extends ChatModel {
 
     using seedRows = seed.narrow(0, batchSize);
     using rootLogits = seedRows.linear(lmHead);
-    const rootTopk = linearSampler ? undefined : rootLogits.topk(topks[0], this.cfg.vocabSize);
+    const rootTopk = samplingPolicy.mtpEnabled ? undefined : rootLogits.topk(topks[0], this.cfg.vocabSize);
     using _rootValues = rootTopk?.values;
-    using rootIndices = linearSampler ? linearSampler.sampleDraft(rootLogits, 0) : rootTopk!.indices;
+    using rootIndices = samplingPolicy.mtpEnabled ? samplingPolicy.sampleDraft!(rootLogits, 0) : rootTopk!.indices;
     for (let batch = 0; batch < batchSize; batch++) {
       treeHost.memcpy2d(
         batch * numTreeNodes * I32, topks[0] * I32,
@@ -1077,9 +1077,9 @@ export class Glm51Model extends ChatModel {
 
       using hiddenStates = this.forwardMtp(state, inputHidden, stateSharedSlots, stateSharedSlotsLength);
       using logits = hiddenStates.linear(lmHead);
-      const topk = linearSampler ? undefined : logits.topk(topks[depth], this.cfg.vocabSize);
+      const topk = samplingPolicy.mtpEnabled ? undefined : logits.topk(topks[depth], this.cfg.vocabSize);
       using _values = topk?.values;
-      using indices = linearSampler ? linearSampler.sampleDraft(logits, depth) : topk!.indices;
+      using indices = samplingPolicy.mtpEnabled ? samplingPolicy.sampleDraft!(logits, depth) : topk!.indices;
       const depthOffset = boundaries[depth - 1];
       const tokensAtDepth = qoLen * topks[depth];
       for (let batch = 0; batch < batchSize; batch++) {
@@ -1183,15 +1183,20 @@ export class Glm51Model extends ChatModel {
     return { state, generator: forward(), [Symbol.dispose]: rollback };
   }
 
-  *planPrefillMtpDraftExtend(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], selectTokens: TokenSelector = logits => logits.argmax(), linearSampler?: LinearMtpSampler): ExecutionPlan<MtpDraftBatch> {
+  *planPrefillMtpDraftExtend(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ExecutionPlan<MtpDraftBatch> {
+    const mtpEnabled = samplingPolicy.mtpEnabled === true;
+    if (mtpEnabled && [samplingPolicy.prepareDraft, samplingPolicy.sampleDraft, samplingPolicy.finishDraft,
+      samplingPolicy.prepareVerification, samplingPolicy.verify].some(method => typeof method !== "function")) {
+      throw new Error("MTP-enabled sampling policy requires all MTP methods");
+    }
     if (!this.forwardMtp || topks.length === 0) {
       throw new Error("MTP draft extend requires an MTP-enabled model and non-empty topks");
     }
-    if (linearSampler && topks.some(topk => topk !== 1)) {
+    if (mtpEnabled && topks.some(topk => topk !== 1)) {
       throw new Error("Linear MTP sampling requires all draft widths to be 1");
     }
     const batchSize = inputIds.length;
-    linearSampler?.prepareDraft(batchSize, topks.length);
+    if (mtpEnabled) samplingPolicy.prepareDraft!(batchSize, topks.length);
     let completed = false;
     const prefillState = ws.planPrefill(this, batchSize, inputIds.map(ids => ids.length), cache);
     prefillState.setInput(inputIds);
@@ -1222,7 +1227,7 @@ export class Glm51Model extends ChatModel {
         using targetDevice = ws.alloc([batchSize], "I32");
         using hiddenStates = this.forwardModel(prefillState, sharedSlots, sharedSlotsLength);
         using logits = prefillState.computeLogits(hiddenStates, this);
-        using target = selectTokens(logits);
+        using target = samplingPolicy.selectTarget(logits);
         targetDevice.memcpy(target, batchSize * I32, MemcpyKind.DeviceToDevice);
         using rotatedInput = prefillState.input!.rotateInputIds(prefillState.qoIndptrD, targetDevice, batchSize);
         prefillState.setInput(rotatedInput);
@@ -1309,11 +1314,11 @@ export class Glm51Model extends ChatModel {
       timingName: "draft",
       run: (inputs) => {
         const treeHost = ws.allocPinned([batchSize * numTreeNodes], "I32");
-        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost, linearSampler);
+        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost, samplingPolicy);
         return { treeHost };
       },
     });
-    const proposal = linearSampler?.finishDraft();
+    const proposal = mtpEnabled ? samplingPolicy.finishDraft!() : undefined;
 
     for (let batch = 0; batch < batchSize; batch++) {
       cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
@@ -1334,22 +1339,27 @@ export class Glm51Model extends ChatModel {
     };
   }
 
-  *planTargetVerification(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, selectTokens: TokenSelector = logits => logits.argmax(), linearSampler?: LinearMtpSampler): ExecutionPlan<MtpStepResult> {
+  *planTargetVerification(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ExecutionPlan<MtpStepResult> {
+    const mtpEnabled = samplingPolicy.mtpEnabled === true;
+    if (mtpEnabled && [samplingPolicy.prepareDraft, samplingPolicy.sampleDraft, samplingPolicy.finishDraft,
+      samplingPolicy.prepareVerification, samplingPolicy.verify].some(method => typeof method !== "function")) {
+      throw new Error("MTP-enabled sampling policy requires all MTP methods");
+    }
     const topks = draft.topks;
     const batchSize = draft.targetTokens.length;
     if (draft.treeTokens.length !== batchSize) {
       throw new Error("MTP draft batch does not match target token batch");
     }
-    if (draft.proposal && !linearSampler) {
+    if (draft.proposal && !mtpEnabled) {
       throw new Error("MTP proposal verification requires a linear sampler");
     }
-    if (linearSampler && (topks.length === 0 || topks.some(topk => topk !== 1))) {
+    if (mtpEnabled && (topks.length === 0 || topks.some(topk => topk !== 1))) {
       throw new Error("Linear MTP sampling requires non-empty draft widths all equal to 1");
     }
-    if (linearSampler && !draft.proposal) {
+    if (mtpEnabled && !draft.proposal) {
       throw new Error("Linear MTP verification requires draft proposal probabilities");
     }
-    linearSampler?.prepareVerification(draft);
+    if (mtpEnabled) samplingPolicy.prepareVerification!(draft);
     const originalAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
     const targetTopks = [1, ...topks];
     const linearDraft = topks.every(topk => topk === 1);
@@ -1375,12 +1385,12 @@ export class Glm51Model extends ChatModel {
     state.setInput(verificationTokens);
     const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
     const argmaxHost = ws.ensureAllocPinned([ws.maxBatch * numVerificationTokens], "I32", `glm51_mtp_verify_argmax_host_${numVerificationTokens}`);
-    const acceptedHost = linearSampler ? ws.ensureAllocPinned([ws.maxBatch], "I32", "glm51_mtp_verify_accepted_host") : undefined;
+    const acceptedHost = mtpEnabled ? ws.ensureAllocPinned([ws.maxBatch], "I32", "glm51_mtp_verify_accepted_host") : undefined;
 
     const artifacts = yield* executionPhase({
       states: [state],
       inputs: {},
-      captureKey: ["glm51-mtp-verify", topks.join(","), selectTokens.captureKey ?? "greedy", ...(linearSampler ? ["linear", linearSampler.captureKey] : [])],
+      captureKey: ["glm51-mtp-verify", topks.join(","), samplingPolicy.captureKey ?? "greedy", ...(mtpEnabled ? ["linear", samplingPolicy.mtpCaptureKey ?? 0] : [])],
       timingName: "verification",
       run: () => {
         const seed = ws.alloc([batchSize * maxWidth, this.cfg.hiddenSize], "BF16");
@@ -1405,10 +1415,10 @@ export class Glm51Model extends ChatModel {
         };
         using hiddenStates = this.forwardModel(state, slots, slotsLength);
         using logits = state.computeLogits(hiddenStates, this, true);
-        const verified = linearSampler?.verify(logits);
+        const verified = mtpEnabled ? samplingPolicy.verify!(logits) : undefined;
         using counts = verified?.numAccepted;
         // The accepted prefix and correction must also condition the retained MTP rows.
-        using selected = verified ? verified.tokens : selectTokens(logits);
+        using selected = verified ? verified.tokens : samplingPolicy.selectTarget(logits);
         if (counts) acceptedHost!.memcpy(counts, batchSize * I32, MemcpyKind.DeviceToHost);
         argmaxHost.memcpy(selected, batchSize * numVerificationTokens * I32, MemcpyKind.DeviceToHost);
         using selectedInput = selected.narrow(0, batchSize * numVerificationTokens);
@@ -1594,17 +1604,17 @@ export class Glm51Model extends ChatModel {
       sharedSlotsLength,
     };
 
-    linearSampler?.prepareDraft(batchSize, topks.length);
+    if (mtpEnabled) samplingPolicy.prepareDraft!(batchSize, topks.length);
     yield* executionPhase({
       states: draftPlan.states,
       inputs: draftInputs,
-      captureKey: ["glm51-mtp-draft", topks.join(","), `batchSize:${batchSize}`, ...(linearSampler ? ["linear", linearSampler.captureKey] : [])],
+      captureKey: ["glm51-mtp-draft", topks.join(","), `batchSize:${batchSize}`, ...(mtpEnabled ? ["linear", samplingPolicy.mtpCaptureKey ?? 0] : [])],
       timingName: "draft",
       run: (inputs) => {
-        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost, linearSampler);
+        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost, samplingPolicy);
       },
     });
-    const proposal = linearSampler?.finishDraft();
+    const proposal = mtpEnabled ? samplingPolicy.finishDraft!() : undefined;
 
     for (let batch = 0; batch < batchSize; batch++) {
       cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);

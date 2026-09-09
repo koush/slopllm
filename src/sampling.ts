@@ -1,39 +1,72 @@
-import { type LinearMtpSampler, type MtpDraftBatch, type MtpProposal, type SamplingParams } from "./chat_model";
+import { type MtpDraftBatch, type MtpProposal, type SamplingParams, type TokenSelector } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
+import { CaptureManager } from "./capture-manager";
 export { MemcpyKind };
 
+interface ParameterBank {
+  params: SamplingParams[];
+  readonly maxWindow: number;
+  temperatures: Tensor;
+  repPenalties: Tensor;
+  presPenalties: Tensor;
+  topKs: Tensor;
+  topPs: Tensor;
+}
 
-export class SamplingWorkspace extends WorkspaceBase {
+export interface MtpSamplingConfig {
+  maxBatchSize: number;
+  depth: number;
+  retainProposalsOnGpu?: boolean;
+}
+
+export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
   readonly vocabSize: number;
   readonly maxBatchSize: number;
   readonly maxWindow: number;
   batchSize: number;
-  params!: SamplingParams[];
+  params: SamplingParams[] = [];
+  captureKey = 0;
 
   readonly penaltyTokens: Tensor;
   readonly penaltyCount: Tensor;
   readonly stepCounter: Tensor;
   readonly temperatures: Tensor;
-  readonly temperaturesH: Tensor;
   readonly repPenalties: Tensor;
-  readonly repPenaltiesH: Tensor;
   readonly presPenalties: Tensor;
-  readonly presPenaltiesH: Tensor;
   readonly topKs: Tensor;
-  readonly topKsH: Tensor;
   readonly topPs: Tensor;
-  readonly topPsH: Tensor;
-  readonly outToken: Tensor;
+  readonly mtpEnabled: boolean;
+  readonly capacity = 256;
+  private readonly draftParams!: ParameterBank;
+  private readonly verificationParams!: ParameterBank;
+  readonly draftStepCounter!: Tensor;
+  mtpCaptureKey = "linear:0";
+  private mtpBatchSize = 0;
+  private draftBatchSize = 0;
+  private generation = 0;
+  private readonly proposalOwner = {};
+  private candidateCount = 0;
+  private readonly qDraftProbs!: Tensor;
+  private readonly qDraftIds!: Tensor;
+  private readonly qHostProbs!: Tensor;
+  private readonly qHostIds!: Tensor;
+  private readonly qInputProbs!: Tensor;
+  private readonly qInputIds!: Tensor;
+  private readonly draftTokens!: Tensor;
+  private readonly rejectionStepCounter!: Tensor;
+  private readonly mtpMaxBatchSize: number;
+  readonly depth: number;
+  readonly retainProposalsOnGpu: boolean;
 
-  private readonly topkVals: Tensor;
-  private readonly topkIdxs: Tensor;
-  private readonly sampleWorkspaceBuf: Tensor;
-
-  constructor(glm: DeviceOps, maxBatchSize: number, vocabSize: number, maxWindow: number) {
+  constructor(glm: DeviceOps, maxBatchSize: number, vocabSize: number, maxWindow: number, mtp?: MtpSamplingConfig) {
     super(glm);
+    if (mtp && (!Number.isInteger(mtp.maxBatchSize) || mtp.maxBatchSize < 1
+      || !Number.isInteger(mtp.depth) || mtp.depth < 1 || maxBatchSize < mtp.maxBatchSize * (mtp.depth + 1))) {
+      throw new Error("Linear MTP requires valid batch/depth and a compatible target sampling workspace");
+    }
     this.vocabSize = vocabSize;
     this.maxBatchSize = maxBatchSize;
     this.maxWindow = maxWindow;
@@ -43,27 +76,76 @@ export class SamplingWorkspace extends WorkspaceBase {
     this.penaltyCount = this.alloc([maxBatchSize], "I32", "penaltyCount");
     this.stepCounter = this.alloc([1], "U32", "stepCounter");
     this.temperatures = this.alloc([maxBatchSize], "F32", "temperatures");
-    this.temperaturesH = this.allocPinned([maxBatchSize], "F32", "temperaturesHost");
     this.repPenalties = this.alloc([maxBatchSize], "F32", "repetitionPenalties");
-    this.repPenaltiesH = this.allocPinned([maxBatchSize], "F32", "repetitionPenaltiesHost");
     this.presPenalties = this.alloc([maxBatchSize], "F32", "presencePenalties");
-    this.presPenaltiesH = this.allocPinned([maxBatchSize], "F32", "presencePenaltiesHost");
     this.topKs = this.alloc([maxBatchSize], "I32", "topKs");
-    this.topKsH = this.allocPinned([maxBatchSize], "I32", "topKsHost");
     this.topPs = this.alloc([maxBatchSize], "F32", "topPs");
-    this.topPsH = this.allocPinned([maxBatchSize], "F32", "topPsHost");
-    this.outToken = this.alloc([maxBatchSize], "I32", "outToken");
-
-    const SAMPLING_MAX_TOPK = 256;
-    const SAMPLING_BLOCK_SIZE = 256;
-    this.topkVals = this.alloc([maxBatchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "F32", "topkValues");
-    this.topkIdxs = this.alloc([maxBatchSize * SAMPLING_MAX_TOPK * SAMPLING_BLOCK_SIZE], "I32", "topkIndices");
-    this.sampleWorkspaceBuf = this.alloc([maxBatchSize * vocabSize], "F32", "sampleWorkspace");
 
     const seedBuf = Buffer.alloc(4);
     seedBuf.writeUInt32LE(Math.floor(Math.random() * 0xFFFFFFFF) >>> 0, 0);
     this.stepCounter.h2d(seedBuf);
+    this.mtpEnabled = mtp !== undefined;
+    this.mtpMaxBatchSize = mtp?.maxBatchSize ?? 0;
+    this.depth = mtp?.depth ?? 0;
+    this.retainProposalsOnGpu = mtp?.retainProposalsOnGpu ?? false;
+    if (mtp) {
+      const { maxBatchSize, depth } = mtp;
+      if (this.retainProposalsOnGpu) this.mtpCaptureKey += ":gpu";
+      this.draftParams = this.createParameterBank(maxBatchSize, "draft");
+      this.verificationParams = this.createParameterBank(maxBatchSize * (depth + 1), "verification");
+      this.draftStepCounter = this.alloc([1], "U32", "draftStepCounter");
+      const C = this.capacity;
+      this.qDraftProbs = this.alloc([depth, maxBatchSize, C], "F32", "qDraftProbs");
+      this.qDraftIds = this.alloc([depth, maxBatchSize, C], "I32", "qDraftIds");
+      if (!this.retainProposalsOnGpu) {
+        this.qHostProbs = this.allocPinned([depth, maxBatchSize, C], "F32", "qHostProbs");
+        this.qHostIds = this.allocPinned([depth, maxBatchSize, C], "I32", "qHostIds");
+      }
+      this.qInputProbs = this.alloc([maxBatchSize, depth, C], "F32", "qInputProbs");
+      this.qInputIds = this.alloc([maxBatchSize, depth, C], "I32", "qInputIds");
+      this.draftTokens = this.alloc([maxBatchSize, depth], "I32", "draftTokens");
+      this.rejectionStepCounter = this.alloc([1], "U32", "rejectionStepCounter");
+      seedBuf.writeUInt32LE(Math.floor(Math.random() * 0xFFFFFFFF) >>> 0);
+      this.rejectionStepCounter.h2d(seedBuf);
+      seedBuf.writeUInt32LE(Math.floor(Math.random() * 0xFFFFFFFF) >>> 0);
+      this.draftStepCounter.h2d(seedBuf);
+    }
   }
+
+  private createParameterBank(rows: number, name: string): ParameterBank {
+    return {
+      params: [],
+      maxWindow: 0,
+      temperatures: this.alloc([rows], "F32", `${name}Temperatures`),
+      repPenalties: this.alloc([rows], "F32", `${name}RepPenalties`),
+      presPenalties: this.alloc([rows], "F32", `${name}PresPenalties`),
+      topKs: this.alloc([rows], "I32", `${name}TopKs`),
+      topPs: this.alloc([rows], "F32", `${name}TopPs`),
+    };
+  }
+
+  private uploadParameters(bank: ParameterBank, params: SamplingParams[]): void {
+    if (CaptureManager.capturing) throw new Error("Sampling parameters must be uploaded outside capture");
+    if (params.length > bank.temperatures.numElements) throw new Error("Sampling params exceeds maxBatchSize");
+    const rows = params.length;
+    if (rows === 0) { bank.params = []; return; }
+    // Disposed pinned staging cannot be reused until the asynchronous upload completes.
+    using staging = this.allocPinned([5, rows], "F32");
+    staging.withPinnedBuffer(buf => params.forEach((p, i) => {
+      buf.writeFloatLE(p.temperature > 0 ? p.temperature : 0, i * 4);
+      buf.writeFloatLE(p.repetitionPenalty, (rows + i) * 4);
+      buf.writeFloatLE(p.presencePenalty, (2 * rows + i) * 4);
+      buf.writeInt32LE(p.topK > 0 ? p.topK : 0, (3 * rows + i) * 4);
+      buf.writeFloatLE(p.topP, (4 * rows + i) * 4);
+    }));
+    [bank.temperatures, bank.repPenalties, bank.presPenalties, bank.topKs, bank.topPs].forEach((device, i) => {
+      using host = staging.narrow(i, 1);
+      device.memcpy(host, rows * 4, MemcpyKind.HostToDevice);
+    });
+    bank.params = params.map(p => ({ ...p }));
+  }
+
+  selectTarget(logits: Tensor): Tensor { return this.sample(logits); }
 
   initPenaltyState(params: SamplingParams[], tokenHistories: number[][]): void {
     const I32 = 4;
@@ -104,57 +186,27 @@ export class SamplingWorkspace extends WorkspaceBase {
     if (params.length > this.maxBatchSize) {
       throw new Error(`updateSampler: ${params.length} params exceeds maxBatchSize ${this.maxBatchSize}`);
     }
+    this.uploadParameters(this, params);
     this.batchSize = params.length;
-    this.params = params;
-
-    const I32 = 4;
-    const batchSize = this.batchSize;
-
-    for (let i = 0; i < batchSize; i++) {
-      const p = params[i];
-      const topK = p.topK > 0 ? p.topK : 0;
-      const temperature = p.temperature > 0 ? p.temperature : 0;
-
-      this.temperaturesH.withPinnedBuffer(buf => {
-        buf.writeFloatLE(temperature, i * 4);
-      });
-      this.repPenaltiesH.withPinnedBuffer(buf => {
-        buf.writeFloatLE(p.repetitionPenalty, i * 4);
-      });
-      this.presPenaltiesH.withPinnedBuffer(buf => {
-        buf.writeFloatLE(p.presencePenalty, i * 4);
-      });
-      this.topKsH.withPinnedBuffer(buf => {
-        buf.writeInt32LE(topK, i * I32);
-      });
-      this.topPsH.withPinnedBuffer(buf => {
-        buf.writeFloatLE(p.topP, i * 4);
-      });
-    }
-
-    this.temperatures.memcpy(this.temperaturesH, batchSize * 4, MemcpyKind.HostToDevice);
-    this.repPenalties.memcpy(this.repPenaltiesH, batchSize * 4, MemcpyKind.HostToDevice);
-    this.presPenalties.memcpy(this.presPenaltiesH, batchSize * 4, MemcpyKind.HostToDevice);
-    this.topKs.memcpy(this.topKsH, batchSize * I32, MemcpyKind.HostToDevice);
-    this.topPs.memcpy(this.topPsH, batchSize * 4, MemcpyKind.HostToDevice);
+    this.captureKey = Math.max(0, ...params.map(p => p.temperature <= 0 ? 1 : p.topK > 0 ? Math.min(p.topK, this.vocabSize) : 32));
 
     if (tokenHistories !== undefined) {
       this.initPenaltyState(params, tokenHistories);
     }
   }
 
-  /** Returns a caller-owned view of the workspace's reusable output buffer. */
-  sample(logits: Tensor): Tensor {
-    return this.sampleInto(logits, this.outToken).viewClone();
-  }
-
-  sampleInto(logits: Tensor, outToken: Tensor, outProbs?: Tensor, outIds?: Tensor, supportCapacity = 0): Tensor {
-    const batchSize = this.batchSize;
+  /** Caller owns the output; return it from captured callbacks to retain replay results. */
+  sample(logits: Tensor, outProbs?: Tensor, outIds?: Tensor, supportCapacity = 0, bank: ParameterBank = this): Tensor {
+    const batchSize = logits.shape[0];
     const vs = this.vocabSize;
+    if (batchSize < 1 || logits.type !== "BF16" || logits.shape.length !== 2 || logits.shape[1] !== vs
+      || bank.params.length !== batchSize || logits.numElements !== batchSize * vs) {
+      throw new Error("sample: invalid parameter or logits row capacities");
+    }
 
     let maxEffectiveK = 0;
     for (let i = 0; i < batchSize; i++) {
-      const p = this.params[i];
+      const p = bank.params[i];
       const topK = p.topK > 0 ? p.topK : 0;
       const temperature = p.temperature > 0 ? p.temperature : 0;
       let effectiveK: number;
@@ -170,31 +222,34 @@ export class SamplingWorkspace extends WorkspaceBase {
 
     if (outProbs || outIds) {
       if (!outProbs || !outIds || !Number.isInteger(supportCapacity) || supportCapacity <= 0 || maxEffectiveK > supportCapacity) {
-        throw new Error(`sampleInto: distribution outputs require capacity >= maxEffectiveK (${maxEffectiveK})`);
+        throw new Error(`sample: distribution outputs require capacity >= maxEffectiveK (${maxEffectiveK})`);
       }
-      if (logits.numElements !== batchSize * vs || outToken.numElements < batchSize
-        || outProbs.numElements < batchSize * supportCapacity || outIds.numElements < batchSize * supportCapacity
+      if (outProbs.numElements < batchSize * supportCapacity || outIds.numElements < batchSize * supportCapacity
         || outProbs.type !== "F32" || outIds.type !== "I32") {
-        throw new Error("sampleInto: invalid distribution output types or row capacities");
+        throw new Error("sample: invalid distribution output types or row capacities");
       }
     }
 
+    const outToken = this.alloc([batchSize], "I32");
+    using topkVals = this.alloc([batchSize * 256 * 256], "F32");
+    using topkIdxs = this.alloc([batchSize * 256 * 256], "I32");
+    using scratch = this.alloc([batchSize * vs], "F32");
     logits.workspace.glm.sampleBatch(
       outToken,
-      this.topkVals,
-      this.topkIdxs,
-      this.sampleWorkspaceBuf,
+      topkVals,
+      topkIdxs,
+      scratch,
       logits,
       this.penaltyTokens,
       this.penaltyCount,
-      this.maxWindow,
+      bank.maxWindow,
       vs,
       batchSize,
-      this.temperatures,
-      this.repPenalties,
-      this.presPenalties,
-      this.topKs,
-      this.topPs,
+      bank.temperatures,
+      bank.repPenalties,
+      bank.presPenalties,
+      bank.topKs,
+      bank.topPs,
       this.stepCounter,
       maxEffectiveK,
       outProbs,
@@ -204,66 +259,12 @@ export class SamplingWorkspace extends WorkspaceBase {
 
     return outToken;
   }
-}
 
-export class LinearMtpSamplingWorkspace extends WorkspaceBase implements LinearMtpSampler {
-  readonly capacity = 256;
-  readonly draftSampler: SamplingWorkspace;
-  captureKey = "linear:0";
-  private batchSize = 0;
-  private draftBatchSize = 0;
-  private generation = 0;
-  private readonly proposalOwner = {};
-  private candidateCount = 0;
-  private readonly qDraftProbs: Tensor;
-  private readonly qDraftIds: Tensor;
-  private readonly qHostProbs: Tensor;
-  private readonly qHostIds: Tensor;
-  private readonly qInputProbs: Tensor;
-  private readonly qInputIds: Tensor;
-  private readonly qInputProbsH: Tensor;
-  private readonly qInputIdsH: Tensor;
-  private readonly draftTokens: Tensor;
-  private readonly draftTokensH: Tensor;
-  private readonly pProbs: Tensor;
-  private readonly pIds: Tensor;
-  private readonly tokens: Tensor;
-  private readonly acceptedCounts: Tensor;
-  private readonly stepCounter: Tensor;
-
-  constructor(glm: DeviceOps, readonly maxBatchSize: number, readonly depth: number, readonly targetSampler: SamplingWorkspace, readonly retainProposalsOnGpu = false) {
-    super(glm);
-    if (retainProposalsOnGpu) this.captureKey += ":gpu";
-    if (!Number.isInteger(maxBatchSize) || maxBatchSize < 1 || !Number.isInteger(depth) || depth < 1
-      || targetSampler.maxBatchSize < maxBatchSize * (depth + 1) || targetSampler.glm !== glm) {
-      throw new Error("Linear MTP requires valid batch/depth and a compatible target sampling workspace");
-    }
-    this.draftSampler = new SamplingWorkspace(glm, maxBatchSize, targetSampler.vocabSize, 0);
-    const C = this.capacity;
-    this.qDraftProbs = this.alloc([depth, maxBatchSize, C], "F32", "qDraftProbs");
-    this.qDraftIds = this.alloc([depth, maxBatchSize, C], "I32", "qDraftIds");
-    this.qHostProbs = this.allocPinned([depth, maxBatchSize, C], "F32", "qHostProbs");
-    this.qHostIds = this.allocPinned([depth, maxBatchSize, C], "I32", "qHostIds");
-    this.qInputProbs = this.alloc([maxBatchSize, depth, C], "F32", "qInputProbs");
-    this.qInputIds = this.alloc([maxBatchSize, depth, C], "I32", "qInputIds");
-    this.qInputProbsH = this.allocPinned([maxBatchSize, depth, C], "F32", "qInputProbsH");
-    this.qInputIdsH = this.allocPinned([maxBatchSize, depth, C], "I32", "qInputIdsH");
-    this.draftTokens = this.alloc([maxBatchSize, depth], "I32", "draftTokens");
-    this.draftTokensH = this.allocPinned([maxBatchSize, depth], "I32", "draftTokensH");
-    this.pProbs = this.alloc([maxBatchSize * (depth + 1), C], "F32", "pProbs");
-    this.pIds = this.alloc([maxBatchSize * (depth + 1), C], "I32", "pIds");
-    this.tokens = this.alloc([maxBatchSize * (depth + 1)], "I32", "tokens");
-    this.acceptedCounts = this.alloc([maxBatchSize], "I32", "acceptedCounts");
-    this.stepCounter = this.alloc([1], "U32", "rejectionStepCounter");
-    const seed = Buffer.alloc(4);
-    seed.writeUInt32LE(Math.floor(Math.random() * 0xFFFFFFFF) >>> 0);
-    this.stepCounter.h2d(seed);
-  }
-
-  updateSampler(params: SamplingParams[]): void {
+  updateMtpSampler(params: SamplingParams[]): void {
+    if (!this.mtpEnabled) throw new Error("MTP sampling is not enabled");
     let maxEffectiveK = 0;
     for (const param of params) {
-      const effectiveK = param.temperature <= 0 ? 1 : param.topK > 0 ? Math.min(param.topK, this.targetSampler.vocabSize) : 32;
+      const effectiveK = param.temperature <= 0 ? 1 : param.topK > 0 ? Math.min(param.topK, this.vocabSize) : 32;
       if (![param.temperature, param.topP, param.topK].every(Number.isFinite) || !Number.isInteger(param.topK)
         || !Number.isInteger(effectiveK) || effectiveK > this.capacity
         || param.repetitionPenalty !== 1 || param.presencePenalty !== 0) {
@@ -271,9 +272,12 @@ export class LinearMtpSamplingWorkspace extends WorkspaceBase implements LinearM
       }
       maxEffectiveK = Math.max(maxEffectiveK, effectiveK);
     }
-    this.draftSampler.updateSampler(params, params.map(() => []));
-    this.candidateCount = Math.min(maxEffectiveK, this.targetSampler.vocabSize);
-    this.captureKey = `linear:${maxEffectiveK}${this.retainProposalsOnGpu ? ":gpu" : ""}`;
+    // Draft rows are [B]; verification is sequence-major [B, D+1].
+    // Ordinary/initial target rows and captureKey are managed only by updateSampler.
+    this.uploadParameters(this.draftParams, params);
+    this.uploadParameters(this.verificationParams, params.flatMap(p => Array.from({ length: this.depth + 1 }, () => p)));
+    this.candidateCount = Math.min(maxEffectiveK, this.vocabSize);
+    this.mtpCaptureKey = `linear:${maxEffectiveK}${this.retainProposalsOnGpu ? ":gpu" : ""}`;
   }
 
   prepareDraft(batchSize: number, depth: number): void {
@@ -283,42 +287,46 @@ export class LinearMtpSamplingWorkspace extends WorkspaceBase implements LinearM
   }
 
   private prepareBatch(batchSize: number, depth: number): void {
-    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > this.maxBatchSize
-      || depth !== this.depth || this.draftSampler.batchSize !== batchSize) {
+    if (!this.mtpEnabled) throw new Error("MTP sampling is not enabled");
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > this.mtpMaxBatchSize
+      || depth !== this.depth || this.draftParams.params.length !== batchSize) {
       throw new Error("Linear MTP draft batch/depth does not match sampling workspace");
     }
-    this.batchSize = batchSize;
+    this.mtpBatchSize = batchSize;
   }
 
   sampleDraft(logits: Tensor, depth: number): Tensor {
-    if (!Number.isInteger(depth) || depth < 0 || depth >= this.depth || this.batchSize < 1) {
+    if (!this.mtpEnabled) throw new Error("MTP sampling is not enabled");
+    if (!Number.isInteger(depth) || depth < 0 || depth >= this.depth || this.mtpBatchSize < 1) {
       throw new Error("Invalid linear MTP draft depth or unprepared batch");
     }
-    if (logits.type !== "BF16" || logits.shape.length !== 2 || logits.shape[0] !== this.batchSize
-      || logits.shape[1] !== this.targetSampler.vocabSize) {
+    if (logits.type !== "BF16" || logits.shape.length !== 2 || logits.shape[0] !== this.mtpBatchSize
+      || logits.shape[1] !== this.vocabSize) {
       throw new Error("sampleDraft: invalid logits type or row capacities");
     }
     using probs = this.qDraftProbs.narrow(depth, 1);
     using ids = this.qDraftIds.narrow(depth, 1);
     // Distributed top-k exchanges candidates, not the full vocabulary logits.
-    const candidates = logits.topk(this.candidateCount, this.targetSampler.vocabSize);
+    const candidates = logits.topk(this.candidateCount, this.vocabSize);
     using values = candidates.values;
     using globalIds = candidates.indices;
-    this.glm.sampleCandidates(this.draftSampler.outToken, probs, ids, values, globalIds,
-      this.draftSampler.temperatures, this.draftSampler.topKs, this.draftSampler.topPs,
-      this.draftSampler.stepCounter, this.batchSize, this.candidateCount, this.capacity);
+    const output = this.alloc([this.mtpBatchSize], "I32");
+    this.glm.sampleCandidates(output, probs, ids, values, globalIds,
+      this.draftParams.temperatures, this.draftParams.topKs, this.draftParams.topPs,
+      this.draftStepCounter, this.mtpBatchSize, this.candidateCount, this.capacity);
     if (!this.retainProposalsOnGpu) {
       using probsH = this.qHostProbs.narrow(depth, 1);
       using idsH = this.qHostIds.narrow(depth, 1);
-      const bytes = this.batchSize * this.capacity * 4;
+      const bytes = this.mtpBatchSize * this.capacity * 4;
       probsH.memcpy(probs, bytes, MemcpyKind.DeviceToHost);
       idsH.memcpy(ids, bytes, MemcpyKind.DeviceToHost);
     }
-    return this.draftSampler.outToken.narrow(0, this.batchSize);
+    return output;
   }
 
   finishDraft(): MtpProposal {
-    if (this.batchSize < 1) throw new Error("Linear MTP draft is not prepared");
+    if (!this.mtpEnabled) throw new Error("MTP sampling is not enabled");
+    if (this.mtpBatchSize < 1) throw new Error("Linear MTP draft is not prepared");
     if (this.retainProposalsOnGpu) {
       return {
         probabilities: [], tokenIds: [], capacity: this.capacity,
@@ -330,12 +338,12 @@ export class LinearMtpSamplingWorkspace extends WorkspaceBase implements LinearM
     const probs = this.qHostProbs.readPinnedBuffer();
     const ids = this.qHostIds.readPinnedBuffer();
     const rowBytes = this.capacity * 4;
-    for (let batch = 0; batch < this.batchSize; batch++) {
+    for (let batch = 0; batch < this.mtpBatchSize; batch++) {
       const p = Buffer.alloc(this.depth * rowBytes);
       const t = Buffer.alloc(this.depth * rowBytes);
       // Each depth packs only the active B rows into its fixed maxB allocation.
       for (let depth = 0; depth < this.depth; depth++) {
-        const offset = (depth * this.maxBatchSize + batch) * rowBytes;
+        const offset = (depth * this.mtpMaxBatchSize + batch) * rowBytes;
         probs.copy(p, depth * rowBytes, offset, offset + rowBytes);
         ids.copy(t, depth * rowBytes, offset, offset + rowBytes);
       }
@@ -346,13 +354,14 @@ export class LinearMtpSamplingWorkspace extends WorkspaceBase implements LinearM
   }
 
   prepareVerification(draft: MtpDraftBatch): void {
+    if (CaptureManager.capturing) throw new Error("MTP verification must be prepared outside capture");
     const B = draft.targetTokens.length;
     const D = this.depth;
     const proposal = draft.proposal;
     const rowBytes = D * this.capacity * 4;
     this.prepareBatch(B, draft.topks.length);
     if (draft.topks.some(k => k !== 1) || draft.treeTokens.length !== B
-      || draft.treeTokens.some(tokens => tokens.length !== D || tokens.some(t => !Number.isInteger(t) || t < 0 || t >= this.targetSampler.vocabSize))
+      || draft.treeTokens.some(tokens => tokens.length !== D || tokens.some(t => !Number.isInteger(t) || t < 0 || t >= this.vocabSize))
       || !proposal || proposal.capacity !== this.capacity) {
       throw new Error("Invalid linear MTP proposal batch, depth, capacity, or buffers");
     }
@@ -366,8 +375,8 @@ export class LinearMtpSamplingWorkspace extends WorkspaceBase implements LinearM
       // Transpose [D, maxB, C] into [B, D, C], retaining the original row mapping after compaction.
       const width = this.capacity * 4;
       device.rows.forEach((row, b) => {
-        this.qInputProbs.memcpy2d(b * rowBytes, width, this.qDraftProbs, row * width, this.maxBatchSize * width, width, D, MemcpyKind.DeviceToDevice);
-        this.qInputIds.memcpy2d(b * rowBytes, width, this.qDraftIds, row * width, this.maxBatchSize * width, width, D, MemcpyKind.DeviceToDevice);
+        this.qInputProbs.memcpy2d(b * rowBytes, width, this.qDraftProbs, row * width, this.mtpMaxBatchSize * width, width, D, MemcpyKind.DeviceToDevice);
+        this.qInputIds.memcpy2d(b * rowBytes, width, this.qDraftIds, row * width, this.mtpMaxBatchSize * width, width, D, MemcpyKind.DeviceToDevice);
       });
     } else {
       if (proposal.device || proposal.probabilities.length !== B || proposal.tokenIds.length !== B
@@ -375,31 +384,34 @@ export class LinearMtpSamplingWorkspace extends WorkspaceBase implements LinearM
         || proposal.tokenIds.some(buf => !Buffer.isBuffer(buf) || buf.length !== rowBytes)) {
         throw new Error("Invalid host linear MTP proposal buffers or mode");
       }
-      this.qInputProbsH.withPinnedBuffer(buf => proposal.probabilities.forEach((row, i) => row.copy(buf, i * rowBytes)));
-      this.qInputIdsH.withPinnedBuffer(buf => proposal.tokenIds.forEach((row, i) => row.copy(buf, i * rowBytes)));
-      this.qInputProbs.memcpy(this.qInputProbsH, B * rowBytes, MemcpyKind.HostToDevice);
-      this.qInputIds.memcpy(this.qInputIdsH, B * rowBytes, MemcpyKind.HostToDevice);
+      using probsH = this.allocPinned([B, D, this.capacity], "F32");
+      using idsH = this.allocPinned([B, D, this.capacity], "I32");
+      probsH.withPinnedBuffer(buf => proposal.probabilities.forEach((row, i) => row.copy(buf, i * rowBytes)));
+      idsH.withPinnedBuffer(buf => proposal.tokenIds.forEach((row, i) => row.copy(buf, i * rowBytes)));
+      this.qInputProbs.memcpy(probsH, B * rowBytes, MemcpyKind.HostToDevice);
+      this.qInputIds.memcpy(idsH, B * rowBytes, MemcpyKind.HostToDevice);
     }
-    this.draftTokensH.withPinnedBuffer(buf => {
+    using draftTokensH = this.allocPinned([B, D], "I32");
+    draftTokensH.withPinnedBuffer(buf => {
       draft.treeTokens.forEach((tokens, b) => tokens.forEach((token, d) => buf.writeInt32LE(token, (b * D + d) * 4)));
     });
-    this.draftTokens.memcpy(this.draftTokensH, B * D * 4, MemcpyKind.HostToDevice);
+    this.draftTokens.memcpy(draftTokensH, B * D * 4, MemcpyKind.HostToDevice);
   }
 
   verify(logits: Tensor): { tokens: Tensor; numAccepted: Tensor } {
-    const rows = this.batchSize * (this.depth + 1);
-    if (this.batchSize < 1 || this.targetSampler.batchSize !== rows) {
+    if (!this.mtpEnabled) throw new Error("MTP sampling is not enabled");
+    const rows = this.mtpBatchSize * (this.depth + 1);
+    if (this.mtpBatchSize < 1 || this.verificationParams.params.length !== rows) {
       throw new Error("Linear MTP target sampler must contain B * (D + 1) rows");
     }
-    this.targetSampler.sampleInto(logits, this.targetSampler.outToken, this.pProbs, this.pIds, this.capacity);
-    this.glm.specRejectLinear(this.tokens, this.acceptedCounts, this.draftTokens,
-      this.qInputProbs, this.qInputIds, this.pProbs, this.pIds, this.stepCounter,
-      this.batchSize, this.depth, this.capacity);
-    return { tokens: this.tokens.narrow(0, rows), numAccepted: this.acceptedCounts.narrow(0, this.batchSize) };
-  }
-
-  override free(): void {
-    this.draftSampler.free();
-    super.free();
+    using pProbs = this.alloc([rows, this.capacity], "F32");
+    using pIds = this.alloc([rows, this.capacity], "I32");
+    using _sampled = this.sample(logits, pProbs, pIds, this.capacity, this.verificationParams);
+    const tokens = this.alloc([rows], "I32");
+    const acceptedCounts = this.alloc([this.mtpBatchSize], "I32");
+    this.glm.specRejectLinear(tokens, acceptedCounts, this.draftTokens,
+      this.qInputProbs, this.qInputIds, pProbs, pIds, this.rejectionStepCounter,
+      this.mtpBatchSize, this.depth, this.capacity);
+    return { tokens, numAccepted: acceptedCounts };
   }
 }
