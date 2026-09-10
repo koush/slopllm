@@ -438,9 +438,11 @@ __global__ void scatter_input_kernel(
 __global__ void restore_offsets_kernel(
     int* __restrict__ expert_offsets,
     const int* __restrict__ expert_counts,
-    int num_experts)
+    int num_experts,
+    int* __restrict__ tile_counter)
 {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e == 0) *tile_counter = 0;
     if (e < num_experts) {
         expert_offsets[e] -= expert_counts[e];
     }
@@ -511,11 +513,12 @@ static void dispatch_sort_scatter(GlmCtx* ctx, const void* input, int K,
                                    const int* expert_ids, int top_k, int count,
                                    int num_experts,
                                    __nv_bfloat16* sorted_input, int* sorted_to_original,
-                                   int* expert_counts, int* expert_offsets,
+                                   int* expert_counts, int* expert_offsets, int* tile_counter,
                                    cudaStream_t stream) {
     int block_size = 256;
 
-    cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
+    // BF16 +0 clears the same bits as an I32 zero; avoid tiny memset graph nodes.
+    glm_fill(ctx, expert_counts, 0.0f, num_experts * 2);
 
     int grid_size = (count + block_size - 1) / block_size;
     histogram_kernel<<<grid_size, block_size, 0, stream>>>(
@@ -532,7 +535,7 @@ static void dispatch_sort_scatter(GlmCtx* ctx, const void* input, int K,
 
     grid_size = (num_experts + block_size - 1) / block_size;
     restore_offsets_kernel<<<grid_size, block_size, 0, stream>>>(
-        expert_offsets, expert_counts, num_experts);
+        expert_offsets, expert_counts, num_experts, tile_counter);
 }
 
 #define DEFINE_MMA_FUNC(NAME, TM_VAL, TN_VAL, QUANT) \
@@ -559,8 +562,7 @@ void NAME(GlmCtx* ctx, void* output, const void* input, \
     offset += (size_t)count * 4; \
     int* tile_counter = reinterpret_cast<int*>(ws + offset); \
     dispatch_sort_scatter(ctx, input, K, expert_ids, top_k, count, num_experts, \
-                          sorted_input, sorted_to_original, expert_counts, expert_offsets, stream); \
-    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream); \
+                          sorted_input, sorted_to_original, expert_counts, expert_offsets, tile_counter, stream); \
     LAUNCH_CALL; \
     int block_size = 256; \
     int unscatter_grid = (count + block_size - 1) / block_size; \
@@ -592,8 +594,7 @@ void NAME(GlmCtx* ctx, void* output, const void* input, \
     offset += (size_t)count * 4; \
     int* tile_counter = reinterpret_cast<int*>(ws + offset); \
     dispatch_sort_scatter(ctx, input, K, expert_ids, top_k, count, num_experts, \
-                          sorted_input, sorted_to_original, expert_counts, expert_offsets, stream); \
-    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream); \
+                          sorted_input, sorted_to_original, expert_counts, expert_offsets, tile_counter, stream); \
     launch_mma_kernel_bf16<TM_VAL, TN_VAL>(ctx, num_experts, N, sorted_output, sorted_input, K, \
                                              weight_ptrs, expert_offsets, tile_counter, stream); \
     int block_size = 256; \

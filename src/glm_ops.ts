@@ -19,6 +19,11 @@ import { getNativeAddon } from "./native-addon";
 // the grouped path only pays off once `count` is large enough to amortize its
 // dispatch overhead against avoided redundant weight reads (true prefill territory).
 const MUL_MAT_ID_GROUPED_THRESHOLD = 512;
+// Independent NVFP4 control for grouped-MoE experiments; BF16 dispatch is separate.
+const NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD = Number(process.env.GLM_NVFP4_MOE_GROUPED_THRESHOLD ?? MUL_MAT_ID_GROUPED_THRESHOLD);
+if (!Number.isInteger(NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD) || NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD < 0) {
+  throw new Error("GLM_NVFP4_MOE_GROUPED_THRESHOLD must be a non-negative integer");
+}
 
 // Below this query-token count, sparse MLA prefill is routed to the split-K
 // decode kernel for better GPU occupancy (e.g. MTP tree verify). Above it, the
@@ -601,7 +606,7 @@ export class GlmTensor extends Tensor {
         scale2Ptrs = this.workspace.alloc([weights.length], "I64", scale2PtrName);
         scale2Ptrs.writePointers(scale2Tensors);
       }
-      if (count > MUL_MAT_ID_GROUPED_THRESHOLD) {
+      if (count > NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD) {
         const numExperts = weights.length;
         const wsSize = getNativeAddon().mmaMoeCoopWorkspaceSize(count, N, K, numExperts);
         using wsTensor = this.workspace.allocRaw(wsSize);
@@ -653,7 +658,7 @@ export class GlmTensor extends Tensor {
   ): Tensor {
     super.swiGluMlpMoe(weights, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
 
-    if (count <= MUL_MAT_ID_GROUPED_THRESHOLD || weights.gate[0].type !== "U8") {
+    if (count <= NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD || weights.gate[0].type !== "U8") {
       using gateOutStream = this.workspace.glm.withStream(() => this.mulMatId(weights.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
       using upOut = this.mulMatId(weights.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
       gateOutStream.streamWaitEvent();

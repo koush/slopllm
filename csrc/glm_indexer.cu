@@ -882,8 +882,16 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
             meta, out_idx, out_scores, row_len, (const __nv_bfloat16*)scores,
             stride, topk, cpWorldSize, cpRank);
     } else {
-        cudaMemset2DAsync(hist, (size_t)IDX_SCRATCH_I32 * sizeof(int32_t), 0,
-                          (size_t)IDX_RADIX_BUCKETS * sizeof(int32_t), batch, stream);
+        // Single-row small memsets have expensive graph-launch overhead. BF16
+        // +0 clears the same bits (two elements per I32). Multi-row pitched
+        // memset has no such overhead in measurements and avoids clearing the
+        // unused scratch columns, which matters for large batches.
+        if (batch == 1) {
+            glm_fill(ctx, hist, 0.0f, IDX_RADIX_BUCKETS * 2);
+        } else {
+            cudaMemset2DAsync(hist, (size_t)IDX_SCRATCH_I32 * sizeof(int32_t), 0,
+                              (size_t)IDX_RADIX_BUCKETS * sizeof(int32_t), batch, stream);
+        }
         idx_radix_hist_split_kernel<false><<<grid, 256, 0, stream>>>(
             (const __nv_bfloat16*)scores, row_len, hist, meta, stride, topk);
         idx_radix_high_threshold_kernel<<<batch, 256, 0, stream>>>(
@@ -2587,11 +2595,11 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 #undef LAUNCH_INDEXER_PREFILL
     }
 
-    // FP8 scoring borrows both histogram buffers for quantized Q and effective
-    // weights. Stream ordering makes them safe to clear once scoring completes.
-    cudaMemsetAsync(coarseHist, 0, (size_t)totalQ * IDX_COARSE_BUCKETS * sizeof(int32_t), stream);
-    cudaMemsetAsync(fineHist, 0, (size_t)totalQ * IDX_FINE_BUCKETS * sizeof(int32_t), stream);
-    cudaMemsetAsync(meta, 0, (size_t)totalQ * 4 * sizeof(int32_t), stream);
+    // FP8 scoring borrows the histogram buffers, but no reset is needed:
+    // coarse_hist overwrites every bucket, coarse_threshold writes all four
+    // metadata fields, and fine_hist overwrites every bucket of non-identity
+    // rows. Identity rows skip every fine-histogram reader. All producers follow
+    // scoring on this stream, so the borrowed storage is no longer in use.
 
     // Passes 2-6: histogram + gather from buffer.
     {

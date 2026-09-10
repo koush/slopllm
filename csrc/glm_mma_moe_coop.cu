@@ -164,8 +164,10 @@ void launch_scatter_input(const int* expert_ids, int count, int top_k,
 }
 
 __global__ void restore_offsets_kernel(int* __restrict__ expert_offsets,
-                                       const int* __restrict__ expert_counts, int num_experts) {
+                                       const int* __restrict__ expert_counts, int num_experts,
+                                       int* __restrict__ tile_counter) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e == 0 && tile_counter) *tile_counter = 0;
     if (e < num_experts) expert_offsets[e] -= expert_counts[e];
 }
 
@@ -839,15 +841,16 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void
     int* tile_counter = reinterpret_cast<int*>(ws + offset);
 
     int block = 256, grid = (count + block - 1) / block;
-    cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
+    // BF16 +0 is all-zero bits; two elements clear one I32 counter.
+    glm_fill(ctx, expert_counts, 0.0f, num_experts * 2);
     histogram_kernel<<<grid, block, 0, stream>>>(expert_ids, count, expert_counts, num_experts);
     prefix_sum_kernel<<<1, 1, 0, stream>>>(expert_counts, expert_offsets, num_experts);
     launch_scatter_input(expert_ids, count, top_k,
         reinterpret_cast<const __nv_bfloat16*>(input), K, sorted_input, sorted_to_original,
         expert_offsets, stream);
     grid = (num_experts + block - 1) / block;
-    restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts);
-    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
+    // The following GEMM runs after every restore CTA completes on this stream.
+    restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts, tile_counter);
 
     launch_coop_configured(ctx, num_experts, N, sorted_input, reinterpret_cast<__nv_bfloat16*>(output), K,
                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
@@ -895,14 +898,14 @@ void glm_mma_moe_coop_scatter(GlmCtx* ctx, const void* input, const int* expert_
     int* sorted_to_original = reinterpret_cast<int*>(ws + offset);
 
     int block = 256, grid = (count + block - 1) / block;
-    cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int), stream);
+    glm_fill(ctx, expert_counts, 0.0f, num_experts * 2);
     histogram_kernel<<<grid, block, 0, stream>>>(expert_ids, count, expert_counts, num_experts);
     prefix_sum_kernel<<<1, 1, 0, stream>>>(expert_counts, expert_offsets, num_experts);
     launch_scatter_input(expert_ids, count, top_k,
         reinterpret_cast<const __nv_bfloat16*>(input), K, sorted_input, sorted_to_original,
         expert_offsets, stream);
     grid = (num_experts + block - 1) / block;
-    restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts);
+    restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts, nullptr);
 }
 
 void glm_mma_moe_coop_gemm(GlmCtx* ctx,
@@ -928,7 +931,8 @@ void glm_mma_moe_coop_gemm(GlmCtx* ctx,
     uint8_t* gws = static_cast<uint8_t*>(gemm_workspace);
     int* tile_counter = reinterpret_cast<int*>(gws);
 
-    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
+    // Split GEMMs own separate counters, allocated after the shared scatter.
+    glm_fill(ctx, tile_counter, 0.0f, 2);
 
     launch_coop_configured(ctx, num_experts, N, sorted_input, reinterpret_cast<__nv_bfloat16*>(output), K,
                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream,
