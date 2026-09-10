@@ -456,6 +456,67 @@ describe("ParallelTensor disposal and recycling", () => {
 });
 
 describe("Workspace stream recycling", () => {
+  it("promotes disposed descendants on a wait while retaining the parent handle", () => {
+    using glm = new GlmOps(0);
+    let parentId = 0, childId = 0;
+    const parent = glm.withStream(() => {
+      parentId = glm.currentStream;
+      const child = glm.withStream(() => { childId = glm.currentStream; });
+      child.streamWaitEvent();
+      child[Symbol.dispose]();
+    });
+    assert.ok(!glm.availableStreams.includes(childId));
+    parent.streamWaitEvent();
+    assert.deepEqual(glm.streamResources.get(parentId)!.joined, [parentId]);
+    assert.ok(!glm.availableStreams.includes(parentId));
+    assert.ok(glm.availableStreams.includes(childId), "tensor-free child should be promoted too");
+
+    const next = glm.withStream(() => assert.equal(glm.currentStream, childId));
+    parent.streamWaitEvent();
+    assert.ok(!glm.availableStreams.includes(childId), "repeated waits must not release the child's new lease");
+    parent[Symbol.dispose]();
+    assert.ok(glm.streamResources.has(childId), "old parent disposal must not touch the reused child");
+    next.streamWaitEvent();
+    next[Symbol.dispose]();
+    glm.synchronize();
+    assert.equal(glm.availableStreams.length, 63);
+    assert.equal(new Set(glm.availableStreams).size, 63);
+  });
+
+  it("promotes descendants through a non-main parallel waiter", () => {
+    using gpu0 = new GlmOps(0);
+    using gpu1 = new GlmOps(1);
+    using po = new ParallelOps([gpu0, gpu1]);
+    const parents: number[] = [], children: number[] = [];
+    const outer = po.withStream(() => {
+      const parent = po.withStream(() => {
+        po.devices.forEach(device => parents.push(device.currentStream));
+        const child = po.withStream(() => {
+          po.devices.forEach(device => children.push(device.currentStream));
+        });
+        child.streamWaitEvent();
+        child[Symbol.dispose]();
+      });
+      parent.streamWaitEvent();
+      const next = po.withStream(() => {
+        po.devices.forEach((device, i) => {
+          assert.equal(device.currentStream, children[i]);
+          assert.deepEqual(device.streamResources.get(parents[i])!.joined, [parents[i]]);
+        });
+      });
+      next.streamWaitEvent();
+      next[Symbol.dispose]();
+      parent[Symbol.dispose]();
+    });
+    outer.streamWaitEvent();
+    outer[Symbol.dispose]();
+    po.synchronize();
+    po.devices.forEach(device => {
+      assert.equal(device.availableStreams.length, 63);
+      assert.equal(new Set(device.availableStreams).size, 63);
+    });
+  });
+
   it("reuses eligible heaps and returns disposed ranges to stream 0", () => {
     const glm = new GlmOps(0);
     const ws = new WorkspaceBase(glm);
@@ -480,16 +541,19 @@ describe("Workspace stream recycling", () => {
       sameStream[Symbol.dispose]();
     });
 
-    assert.ok(glm.streamWorkspaces.get(streamId)?.has(ws));
+    assert.ok(glm.streamResources.get(streamId)?.workspaces.has(ws));
     assert.ok(ws.heapByKey.has(streamId));
     assert.ok(!ws.heapByKey.get(0)?.contains(mainData, 64));
 
     stream.streamWaitEvent();
     assert.ok(!ws.heapByKey.has(streamId));
     assert.ok(ws.heapByKey.get(0)?.contains(mainData, 64));
-    assert.ok(!glm.streamWorkspaces.has(streamId));
+    assert.equal(glm.streamResources.get(streamId)?.workspaces.size, 0);
+    assert.ok(!glm.availableStreams.includes(streamId), "waiting must not release the live stream handle");
     stream[Symbol.dispose]();
     stream[Symbol.dispose]();
+    assert.ok(!glm.streamResources.has(streamId));
+    assert.ok(glm.availableStreams.includes(streamId));
 
     ws.free();
     glm.free();
@@ -520,7 +584,7 @@ describe("Workspace stream recycling", () => {
       inner.streamWaitEvent();
       assert.ok(!ws.heapByKey.has(innerId));
       assert.ok(ws.heapByKey.has(outerId));
-      assert.ok(glm.streamWorkspaces.get(outerId)?.has(ws));
+      assert.ok(glm.streamResources.get(outerId)?.workspaces.has(ws));
       inner[Symbol.dispose]();
     });
 

@@ -3029,9 +3029,20 @@ export class ParallelOps implements DeviceOps {
 
   withStream<T>(fn: () => T) {
     const currentStreams = this.devices.map(device => device.currentStream);
-    const streams = this.devices.map(device => device.availableStreams.pop());
-    if (streams.includes(undefined)) {
-      throw new Error("Not enough available streams on devices");
+    let acquired = false;
+    const streams: number[] = [];
+    try {
+      for (const device of this.devices) {
+        streams.push(device.acquireStream());
+      }
+      acquired = true;
+    }
+    finally {
+      if (!acquired) {
+        for (const [index, stream] of streams.entries()) {
+          this.devices[index].disposeStream(stream);
+        }
+      }
     }
     for (let i = 0; i < this.devices.length; i++) {
       this.devices[i].eventRecord(currentStreams[i], currentStreams[i]);
@@ -3066,14 +3077,18 @@ export class ParallelOps implements DeviceOps {
         }
       },
       streamWaitEvent: () => {
+        if (disposed)
+          throw new Error(`Stream already disposed`);
         for (let i = 0; i < this.devices.length; i++) {
           const destinationStream = this.devices[i].currentStream;
           this.devices[i].streamWaitEvent(destinationStream, streams[i]!);
-          this.devices[i].disposeStreamTensors(streams[i]!, destinationStream);
+          this.devices[i].disposeStreamResources(streams[i]!, destinationStream);
         }
         this.moveCommunicationPool(streams[0]!, this.currentStream);
       },
       synchronize: () => {
+        if (disposed)
+          throw new Error(`Stream already disposed`);
         for (let i = 0; i < this.devices.length; i++) {
           this.devices[i].synchronizeStream(streams[i]!);
         }

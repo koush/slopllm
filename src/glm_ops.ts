@@ -50,12 +50,15 @@ export class GlmTensor extends Tensor {
 
   [Symbol.dispose](): void {
     if (this.canDispose() && this.recycleKey === null && this.glm.currentStream !== 0) {
-      let workspaces = this.glm.streamWorkspaces.get(this.glm.currentStream);
-      if (!workspaces) {
-        workspaces = new Set<WorkspaceBase>();
-        this.glm.streamWorkspaces.set(this.glm.currentStream, workspaces);
+      let resources = this.glm.streamResources.get(this.glm.currentStream);
+      if (!resources) {
+        resources = {
+          workspaces: new Set<WorkspaceBase>(),
+          joined: [],
+        };
+        this.glm.streamResources.set(this.glm.currentStream, resources);
       }
-      workspaces.add(this.workspace);
+      resources.workspaces.add(this.workspace);
     }
     super[Symbol.dispose]();
   }
@@ -883,7 +886,10 @@ export class GlmOps implements DeviceOps {
     return getNativeAddon().synchronizeStreamAsync(this.ctx, streamIdx);
   }
 
-  streamWorkspaces = new Map<number, Set<WorkspaceBase>>();
+  streamResources = new Map<number, {
+    workspaces: Set<WorkspaceBase>
+    joined: number[];
+  }>();
   setStream(streamIdx: number): void {
     getNativeAddon().setStream(this.ctx, streamIdx);
     this.activeStreams[this.activeStreams.length - 1] = streamIdx;
@@ -908,45 +914,110 @@ export class GlmOps implements DeviceOps {
   }
 
   availableStreams = Array.from({ length: 63 }, (_, i) => i + 1);
-  disposeStreamTensors(stream: number, destinationStream = this.currentStream) {
+  disposeStreamResources(stream: number, destinationStream = this.currentStream) {
     if (stream === destinationStream)
       return;
-    const workspaces = this.streamWorkspaces.get(stream);
-    this.streamWorkspaces.delete(stream);
-    let destinationWorkspaces: Set<WorkspaceBase> | undefined;
-    if (destinationStream !== 0 && workspaces?.size) {
-      destinationWorkspaces = this.streamWorkspaces.get(destinationStream);
-      if (!destinationWorkspaces) {
-        destinationWorkspaces = new Set<WorkspaceBase>();
-        this.streamWorkspaces.set(destinationStream, destinationWorkspaces);
+    const resources = this.streamResources.get(stream);
+    if (!resources)
+      throw new Error(`No resources found for stream ${stream}. Was it already disposed?`);
+    // A completion wait also orders the destination after disposed descendants.
+    // Promote those queues now, but keep this handle's own stream reserved until
+    // lexical/explicit disposal so its completion event cannot be reused early.
+    const joined = resources.joined.filter(id => id !== stream);
+    let destinationResources: typeof resources | undefined;
+    if (destinationStream !== 0 && (resources.workspaces.size || joined.length)) {
+      destinationResources = this.streamResources.get(destinationStream);
+      if (!destinationResources) {
+        destinationResources = { workspaces: new Set<WorkspaceBase>(), joined: [] };
+        this.streamResources.set(destinationStream, destinationResources);
       }
     }
-    for (const workspace of workspaces ?? []) {
+    for (const workspace of resources.workspaces) {
       workspace.disposeStream(stream, destinationStream);
-      destinationWorkspaces?.add(workspace);
+      destinationResources?.workspaces.add(workspace);
+    }
+    resources.workspaces.clear();
+    if (joined.length) {
+      if (destinationStream === 0) {
+        this.availableStreams.push(...joined);
+        this.availableStreams.sort((a, b) => a - b);
+      } else {
+        destinationResources!.joined.push(...joined);
+        destinationResources!.joined.sort((a, b) => a - b);
+      }
+      resources.joined = resources.joined.filter(id => id === stream);
     }
   }
 
   disposeStream(stream: number) {
-    if (this.availableStreams.includes(stream))
-      throw new Error(`Stream ${stream} already disposed`);
     // Correct callers transfer at the wait edge. This fallback prevents pools
     // from being stranded when a stream handle is disposed without a wait.
-    this.disposeStreamTensors(stream);
-    this.availableStreams.push(stream);
+    this.disposeStreamResources(stream);
+
+    const resources = this.streamResources.get(stream);
+    if (!resources)
+      throw new Error(`No resources found for stream ${stream}. Was it already disposed?`);
+    this.streamResources.delete(stream);
+    const destinationStream = this.currentStream;
+    if (destinationStream === 0) {
+      this.availableStreams.push(...resources.joined);
+      this.availableStreams.sort((a, b) => a - b);
+    }
+    else {
+      let destinationResources = this.streamResources.get(destinationStream);
+      if (!destinationResources) {
+        destinationResources = { workspaces: new Set<WorkspaceBase>(), joined: [] };
+        this.streamResources.set(destinationStream, destinationResources);
+      }
+      destinationResources.joined.push(...resources.joined);
+      destinationResources.joined.sort((a, b) => a - b);
+    }
+    resources.joined = [];
+  }
+
+  acquireStream() {
+    let stream: number | undefined;
+    for (let i = this.activeStreams.length - 1; i >= 0; i--) {
+      const activeStream = this.activeStreams[i];
+
+      if (activeStream === 0) {
+        stream = this.availableStreams.shift();
+        break;
+      }
+
+      const resources = this.streamResources.get(activeStream);
+      if (!resources)
+        throw new Error(`No resources found while checking active stream ${activeStream}`);
+      for (const joined of resources.joined) {
+        // the joined streams list contain itself, which is invalid
+        if (joined === activeStream) {
+          continue;
+        }
+        stream = joined;
+        resources.joined = resources.joined.filter(s => s !== joined);
+        break;
+      }
+      if (stream !== undefined)
+        break;
+    }
+    if (stream === undefined)
+      throw new Error("No available streams");
+    if (this.streamResources.has(stream)) {
+      throw new Error(`Stream ${stream} already in use`);
+    }
+    this.streamResources.set(stream, {
+      workspaces: new Set<WorkspaceBase>(),
+      joined: [stream],
+    });
+    return stream;
   }
 
   withStream<T>(fn: () => T) {
-    const stream = this.availableStreams.pop();
-    if (stream === undefined)
-      throw new Error("No available streams");
+    const stream = this.acquireStream();
     const currentStream = this.currentStream;
     // Record event on current stream so the alternate stream can wait for
     // all prior work (e.g. rmsnorm output that K/V will read).
     getNativeAddon().eventRecord(this.ctx, currentStream, currentStream);
-    if (this.streamWorkspaces.has(stream)) {
-      throw new Error(`Stream ${stream} already in use`);
-    }
     this.pushStream(stream);
     getNativeAddon().streamWaitEvent(this.ctx, stream, currentStream);
     let result!: T;
@@ -974,15 +1045,19 @@ export class GlmOps implements DeviceOps {
       },
       result,
       synchronize: () => {
+        if (disposed)
+          throw new Error(`Stream ${stream} already disposed`);
         getNativeAddon().synchronizeStream(this.ctx, stream);
       },
       streamWaitEvent: () => {
+        if (disposed)
+          throw new Error(`Stream ${stream} already disposed`);
         const destinationStream = this.currentStream;
         getNativeAddon().streamWaitEvent(this.ctx, destinationStream, stream);
         if (waited)
           return;
         waited = true;
-        this.disposeStreamTensors(stream, destinationStream);
+        this.disposeStreamResources(stream, destinationStream);
       }
     }
   }
