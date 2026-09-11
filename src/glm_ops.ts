@@ -398,9 +398,9 @@ export class GlmTensor extends Tensor {
     if (k > 8) {
       using hist = this.workspace.alloc([batch, TOPK_SCRATCH_I32], "I32");
       using meta = this.workspace.alloc([batch, 4], "I32");
-      // Eight-rank CP merge for batch-1 MTP verification: 32 gather partitions
-      // preserve exact ordering while avoiding 64 serial tiles per query CTA.
-      const numSplits = batch === 4 && dim === 16384 && k === 2048 ? 32 : 1;
+      // Target 512 scores per gather partition, up to 64 partitions per query
+      // and roughly 1024 CTAs overall. Identity selections need no gather work.
+      const numSplits = dim <= k ? 1 : Math.min(64, Math.ceil(dim / 512), Math.max(1, Math.floor(1024 / batch)));
       getNativeAddon().topkFromScores(this.glm.ctx, values.data, indices.data, this.data, 0, hist.data, meta.data, batch, dim, k, numSplits, offset === 0 ? 0 : 1, offset);
     } else {
       getNativeAddon().topk(this.glm.ctx, values.data, indices.data, this.data, k, dim, batch, offset);
