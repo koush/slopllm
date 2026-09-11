@@ -750,6 +750,7 @@ export class GlmTensor extends Tensor {
 export class GlmOps implements DeviceOps {
   private static readonly GREEDY_ALLOCATION_GUARD_BYTES = 4;
   readonly worldSize = 1;
+  readonly smCount: number;
   synchronizeListeners: WeakRef<WorkspaceBase>[] = [];
   ctx: number;
   device: number;
@@ -762,6 +763,7 @@ export class GlmOps implements DeviceOps {
 
   constructor(deviceId: number = 0, libPath?: string, arenaGb?: number) {
     const native = getNativeAddon(libPath);
+    this.smCount = native.deviceSmCount(deviceId);
     this.ctx = native.init(deviceId);
     if (!this.ctx) {
       throw new Error(`glm_init failed on device ${deviceId}`);
@@ -1470,7 +1472,7 @@ export class GlmOps implements DeviceOps {
     }
   }
 
-  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor, chunksPerBlock = 0): { o: Tensor, lse: Tensor } {
     this.validateSparseMlaQuery(qAbsorbed, qAbsorbedScales);
     const numTokens = state.totalTokens;
     const numHeads = qAbsorbed.shape[1];
@@ -1494,14 +1496,14 @@ export class GlmOps implements DeviceOps {
       const numSplits = Math.ceil(topk / 64);
       using midOut = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
       using midLse = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits], "F32");
-      getNativeAddon().sparseMlaDecode(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, 0, ptr(topkLength), qAbsorbedScales ? ptr(qAbsorbedScales) : 0);
+      getNativeAddon().sparseMlaDecode(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(midOut), ptr(midLse), ptr(o), ptr(lse), numTokens, numHeads, topk, numSplits, smScale, effectiveStrideKvBlock, chunksPerBlock, ptr(topkLength), qAbsorbedScales ? ptr(qAbsorbedScales) : 0);
       return { o, lse };
     }
     getNativeAddon().sparseMlaPrefill(this.ctx, ptr(qAbsorbed), ptr(qPe), ptr(kvCache), ptr(indices), ptr(o), ptr(lse), numTokens, numHeads, topk, smScale, effectiveStrideKvBlock, ptr(topkLength), qAbsorbedScales ? ptr(qAbsorbedScales) : 0);
     return { o, lse };
   }
 
-  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, topkLength?: Tensor, qAbsorbedScales?: Tensor, chunksPerBlock = 0): { o: Tensor, lse: Tensor } {
     this.validateSparseMlaQuery(qAbsorbed, qAbsorbedScales);
     const numTokens = state.batchSize;
     const numHeads = qAbsorbed.shape[1];

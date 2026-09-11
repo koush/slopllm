@@ -295,7 +295,7 @@ export class ExecutionState {
       return this.ws.glm.sparseMlaDecode(
         this, qAbsorbed, qPe, ckv, indices,
         topk, numSplits,
-        smScale, 0, length, qAbsorbedScales,
+        smScale, length, qAbsorbedScales,
       );
     } else {
       return this.ws.glm.sparseMlaPrefill(

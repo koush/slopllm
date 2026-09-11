@@ -1,4 +1,5 @@
 import "./test_heap";
+import "./test_sparse_mla_planner";
 import "./test_parallel";
 import "./test_parallel_mla";
 import "./test_nccl";

@@ -6,6 +6,7 @@ import { Glm51Config } from "./glm51_model";
 import { bf16BytesToF32, f32ToBf16Bytes, GlmOps, GlmTensor, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM, NCCL_UINT8 } from "./glm_ops";
 import { getNativeAddon } from "./native-addon";
 import { SafeTensorFile } from "./safetensors";
+import { sparseMlaChunksPerBlock } from "./sparse-mla-planner";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
@@ -3850,7 +3851,16 @@ export class ParallelOps implements DeviceOps {
     return true;
   }
 
-  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
+  private sparseMlaChunkHint(state: ExecutionState, contextParallel: boolean, numQueries: number, numHeads: number, topk: number, device: GlmOps, hint: number): number {
+    if (hint !== 0 || !contextParallel) return hint;
+    // Snapshot bucket, not mutable sequence lengths: the graph key must track
+    // every host-side value that changes the captured launch. Total KV is a
+    // conservative per-sequence bound, including mixed-length batches/masks.
+    const localTopkBound = Math.min(topk, Math.ceil(state.getGraphVariantPaddedKvLen() / this.worldSize));
+    return sparseMlaChunksPerBlock(numQueries, numHeads, localTopkBound, device.smCount);
+  }
+
+  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor, chunksPerBlock = 0): { o: Tensor, lse: Tensor } {
     const numTokens = state.totalTokens;
     const pQAbsorbed = this.cast(qAbsorbed);
     const pQPe = this.cast(qPe);
@@ -3870,7 +3880,8 @@ export class ParallelOps implements DeviceOps {
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaPrefill(state, pQAbsorbed.shards[i], pQPe.shards[i], pEffKvCache.shards[i], pIndices.shards[i], topk, smScale, pTopkLength.shards[i], pageIndptrD, lastPageLen, kvTokenIndptrD, qAbsorbedScales ? this.cast(qAbsorbedScales).shards[i] : undefined);
+      const hint = this.sparseMlaChunkHint(state, contextParallel, numTokens, pQAbsorbed.shards[i].shape[1], topk, this.devices[i], chunksPerBlock);
+      const result = this.devices[i].sparseMlaPrefill(state, pQAbsorbed.shards[i], pQPe.shards[i], pEffKvCache.shards[i], pIndices.shards[i], topk, smScale, pTopkLength.shards[i], pageIndptrD, lastPageLen, kvTokenIndptrD, qAbsorbedScales ? this.cast(qAbsorbedScales).shards[i] : undefined, hint);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
@@ -3879,7 +3890,7 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, chunksPerBlock: number, topkLength?: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, topkLength?: Tensor, qAbsorbedScales?: Tensor, chunksPerBlock = 0): { o: Tensor, lse: Tensor } {
     const numTokens = state.batchSize;
     const pQAbsorbed = this.cast(qAbsorbed);
     const pQPe = this.cast(qPe);
@@ -3897,7 +3908,8 @@ export class ParallelOps implements DeviceOps {
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const result = this.devices[i].sparseMlaDecode(state, pQAbsorbed.shards[i], pQPe.shards[i], pKvCache.shards[i], pIndices.shards[i], topk, numSplits, smScale, chunksPerBlock, pTopkLength?.shards[i], qAbsorbedScales ? this.cast(qAbsorbedScales).shards[i] : undefined);
+      const hint = topkLength ? this.sparseMlaChunkHint(state, contextParallel, numTokens, effectiveNumHeads, topk, this.devices[i], chunksPerBlock) : chunksPerBlock;
+      const result = this.devices[i].sparseMlaDecode(state, pQAbsorbed.shards[i], pQPe.shards[i], pKvCache.shards[i], pIndices.shards[i], topk, numSplits, smScale, pTopkLength?.shards[i], qAbsorbedScales ? this.cast(qAbsorbedScales).shards[i] : undefined, hint);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }

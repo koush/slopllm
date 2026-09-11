@@ -43,6 +43,7 @@ export function profilerStop(): void {
 
 export interface NativeAddon {
   init(deviceId: number): number;
+  deviceSmCount(deviceId: number): number;
   free(ctx: number): void;
   alloc(ctx: number, size: number): number;
   freeBuf(ctx: number, ptr: number): void;

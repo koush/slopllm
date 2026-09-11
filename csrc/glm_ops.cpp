@@ -22,6 +22,21 @@ static Napi::Value ProfilerStop(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value DeviceSmCount(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "Expected device_id (number)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    int count = 0;
+    cudaError_t err = cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, info[0].As<Napi::Number>().Int32Value());
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("cudaDeviceGetAttribute failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    return Napi::Number::New(env, count);
+}
+
 static Napi::Value Init(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsNumber()) {
@@ -3997,6 +4012,7 @@ static Napi::Value RotateInputIds(const Napi::CallbackInfo& info) {
 
 static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "init"), Napi::Function::New(env, Init));
+    exports.Set(Napi::String::New(env, "deviceSmCount"), Napi::Function::New(env, DeviceSmCount));
     exports.Set(Napi::String::New(env, "free"), Napi::Function::New(env, Free));
     exports.Set(Napi::String::New(env, "alloc"), Napi::Function::New(env, Alloc));
     exports.Set(Napi::String::New(env, "freeBuf"), Napi::Function::New(env, FreeBuf));
