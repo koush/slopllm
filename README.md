@@ -68,7 +68,7 @@ and BF16 experts use the existing path.
 Set `GLM_FUSED_MOE_DOWN_REDUCE=0` to run the original model path for comparison;
 unset it or use `1` to enable fusion. The setting is read at process startup.
 With the persistent model loader, set it in the executor environment through
-`/run` or `/restart`; the weights do not need to be reloaded.
+`/fork` or `/restart`; the weights do not need to be reloaded.
 
 The kernel preserves BF16 rounding of each expert result. Shared-expert addition
 and the standalone P2P barriers remain separate. The implementation is in

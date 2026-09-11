@@ -185,19 +185,19 @@ curl -X POST http://127.0.0.1:8099/restart
 curl -X POST http://127.0.0.1:8099/stop
 
 # Start the last configured executor again.
-curl -X POST http://127.0.0.1:8099/run
+curl -X POST http://127.0.0.1:8099/fork
 ```
 
 To replace the executor or its process-specific arguments, stop the current executor and provide a JSON command array:
 
 ```bash
 curl -X POST http://127.0.0.1:8099/stop
-curl -X POST http://127.0.0.1:8099/run \
+curl -X POST http://127.0.0.1:8099/fork \
   -H 'content-type: application/json' \
   -d '["src/openai-server.ts", "--host", "0.0.0.0", "--port", "8000"]'
 ```
 
-Add `?follow` to `/run` or `/restart` to stream executor output until that process exits:
+Add `?follow` to `/fork`, `/spawn`, or `/restart` to stream executor output through process exit and output closure:
 
 ```bash
 curl -N -X POST 'http://127.0.0.1:8099/restart?follow'
@@ -205,10 +205,10 @@ curl -N -X POST 'http://127.0.0.1:8099/restart?follow'
 
 Changing model/shared arguments requires restarting the loader itself. The control server has no authentication, so keep it bound to `127.0.0.1` unless it is protected by other means.
 
-Executor environment overrides can be supplied to `/run` with an object instead of a command array:
+Executor environment overrides can be supplied to `/fork` or `/spawn` with an object instead of a command array:
 
 ```bash
-curl -X POST http://127.0.0.1:8099/run \
+curl -X POST http://127.0.0.1:8099/fork \
   -H 'content-type: application/json' \
   -d '{"command":["src/openai-server.ts","--port","8000"],"env":{"GLM_GRAPH_DIAGNOSTICS":"0"}}'
 ```
@@ -222,6 +222,21 @@ curl -X POST http://127.0.0.1:8099/restart \
 ```
 
 Values are strings; `null` unsets an inherited variable. An `env` object replaces the complete override map, and `{}` restores inheritance. Empty-body restarts retain the configured overrides. Overrides affect only the executor, appear in `/status`, and cannot replace loader-managed CUDA IPC/layout variables. A new command array starts with no overrides.
+
+### Spawn arbitrary executables and profile resident weights
+
+`/fork` (formerly `/run`, which is no longer available) launches a JS/TS entry point with `tsx/cjs` and prepends shared model arguments. `/spawn` launches an exact executable/argument array without a shell or argument injection. Both inherit the loader's CUDA IPC/layout environment. `/status` includes `mode`, and `/restart` preserves the configured mode. Empty-body `/fork` or `/spawn` requires a previously configured command of that same mode.
+
+For `/spawn`, obtain shared model arguments from `GET /model-args` and place them at the appropriate position in the command. The loader cannot validate model flags inside arbitrary commands; executor runtime layout validation still applies. For example, with the GLM loader configuration above:
+
+```bash
+curl -X POST http://127.0.0.1:8099/stop
+curl -N -X POST 'http://127.0.0.1:8099/spawn?follow' \
+  -H 'content-type: application/json' \
+  -d '["nsys","profile","--trace=cuda,nvtx","--cuda-graph-trace=node","--sample=none","--cpuctxsw=none","--output=/tmp/glm-mtp","node","--require","tsx/cjs","src/run_glm51_multiple_mtp.ts","--arena","92","--gpus","0,1,2,3,4,5,6,7","--cp","--glm51","--mtp","--batch-size","1","--max-new-tokens","128","--max-pages","512"]'
+```
+
+Let the benchmark exit naturally to finish the Nsight report. `/stop` sends SIGTERM to a spawned command's process group and allows 30 seconds for shutdown/output draining before SIGKILL. Forked executors retain their Node IPC shutdown request and five-second fallback. Stop the current executor before launching another; the loader and resident weights remain alive throughout.
 
 ## NCCL Topology
 

@@ -28,6 +28,7 @@ describe("model loader arguments", () => {
     ]);
 
     assert.deepEqual(args.initialCommand, {
+      mode: "fork",
       entry: path.resolve("src/run_qwen3_unified.ts"),
       args: ["--arena", "48", "--max-tokens", "32"],
     });
@@ -40,6 +41,7 @@ describe("model loader arguments", () => {
     );
 
     assert.deepEqual(command, {
+      mode: "fork",
       entry: path.resolve("src/run_qwen3_unified.ts"),
       args: ["--arena", "48", "--glm51", "--max-tokens", "32"],
     });
@@ -50,6 +52,22 @@ describe("model loader arguments", () => {
     assert.throws(() => parseWorkerCommand([], []), /JSON string array/);
     assert.throws(() => parseWorkerCommand(["executor", 1], []), /JSON string array/);
     assert.throws(() => parseWorkerCommand(["executor"], []), /Invalid executor entry point/);
+  });
+
+  it("preserves arbitrary spawn commands without injecting model arguments", () => {
+    const args = ["profile", "--output=/tmp/a b", "node", "--require", "tsx/cjs", "src/run_glm51_multiple_mtp.ts", "--arena", "92"];
+    const command = parseWorkerCommand(["nsys", ...args], ["--arena", "48"], null, "spawn");
+    assert.deepEqual(command, { mode: "spawn", entry: "nsys", args });
+    const updated = parseWorkerCommand({ env: { FLAG: "1" } }, [], command);
+    assert.equal(updated.mode, "spawn");
+    assert.deepEqual(updated.args, args);
+    const replaced = parseWorkerCommand(["/bin/true"], ["--arena", "48"], updated);
+    assert.deepEqual(replaced, { mode: "spawn", entry: "/bin/true", args: [] });
+    assert.throws(() => parseWorkerCommand({ env: {} }, [], command, "fork"), /No executor command/);
+    for (const value of [[""], ["nsys\0"], ["nsys", "bad\0arg"]]) {
+      assert.throws(() => parseWorkerCommand(value, [], null, "spawn"));
+    }
+    assert.throws(() => parseWorkerCommand({ command: ["nsys"], env: { GLM_SKIP_MMAP_LOAD: null } }, [], null, "spawn"), /loader-managed/);
   });
 
   it("supports executor-only environment overrides and unsetting inherited variables", () => {

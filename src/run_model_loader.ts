@@ -1,6 +1,6 @@
 import http from "node:http";
 import path from "node:path";
-import { fork, type ChildProcess } from "node:child_process";
+import { fork, spawn, type ChildProcess } from "node:child_process";
 import { freeModelRuntime, loadModelRuntime, modelArenaLayoutSignatures, modelLabel, parseModelArgs, type ModelCliArgs } from "./model_cli";
 
 export interface LoaderArgs {
@@ -11,6 +11,7 @@ export interface LoaderArgs {
 }
 
 export interface WorkerCommand {
+  mode: "fork" | "spawn";
   entry: string;
   args: string[];
   env?: Record<string, string | null>;
@@ -38,6 +39,7 @@ export function parseLoaderArgs(argv: string[]): LoaderArgs {
     controlPort,
     sharedArgs,
     initialCommand: entryIndex < 0 ? null : {
+      mode: "fork",
       entry: path.resolve(argv[entryIndex]),
       args: [...sharedArgs, ...argv.slice(entryIndex + 1)],
     },
@@ -49,13 +51,14 @@ function sendJson(res: http.ServerResponse, status: number, body: object): void 
   res.end(JSON.stringify(body));
 }
 
-export function parseWorkerCommand(value: unknown, sharedArgs: string[], previous?: WorkerCommand | null): WorkerCommand {
+export function parseWorkerCommand(value: unknown, sharedArgs: string[], previous?: WorkerCommand | null, mode: WorkerCommand["mode"] = previous?.mode ?? "fork"): WorkerCommand {
+  if (previous && previous.mode !== mode) previous = null;
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const options = value as { command?: unknown; env?: unknown };
     if (options.command === undefined && options.env === undefined) {
       throw new Error("Expected a JSON string array or an object with command and/or env");
     }
-    const command = options.command === undefined ? previous : parseWorkerCommand(options.command, sharedArgs);
+    const command = options.command === undefined ? previous : parseWorkerCommand(options.command, sharedArgs, null, mode);
     if (!command) throw new Error("No executor command has been configured");
     if (options.env === undefined) return command;
     if (!options.env || typeof options.env !== "object" || Array.isArray(options.env)) {
@@ -71,14 +74,16 @@ export function parseWorkerCommand(value: unknown, sharedArgs: string[], previou
     }
     return { ...command, env: { ...options.env } as Record<string, string | null> };
   }
-  if (!Array.isArray(value) || value.length === 0 || value.some(arg => typeof arg !== "string")) {
+  if (!Array.isArray(value) || value.length === 0 || value.some(arg => typeof arg !== "string" || arg.includes("\0"))) {
     throw new Error('Expected a JSON string array such as ["src/run_qwen3_unified.ts", "--batch"]');
   }
   const [entry, ...args] = value as string[];
+  if (!entry) throw new Error("Executor entry point cannot be empty");
+  if (mode === "spawn") return { mode, entry, args };
   if (!/\.[cm]?[jt]s$/.test(entry)) {
     throw new Error(`Invalid executor entry point: ${entry}`);
   }
-  return { entry: path.resolve(entry), args: [...sharedArgs, ...args] };
+  return { mode, entry: path.resolve(entry), args: [...sharedArgs, ...args] };
 }
 
 export function validateWorkerModelArgs(commandArgs: string[], expected: ModelCliArgs): void {
@@ -161,11 +166,15 @@ async function main(): Promise<void> {
     if (shuttingDown) throw new Error("Model loader is shutting down");
     if (worker) throw new Error("Executor worker is already running");
     if (!workerCommand) throw new Error("No executor command has been configured");
-    validateWorkerModelArgs(workerCommand.args, modelArgs);
+    if (workerCommand.mode === "fork") validateWorkerModelArgs(workerCommand.args, modelArgs);
     lastExitCode = null;
     lastSignal = null;
     lastError = null;
-    const next = fork(workerCommand.entry, workerCommand.args, {
+    const next = workerCommand.mode === "spawn" ? spawn(workerCommand.entry, workerCommand.args, {
+      env: workerEnvironment(workerCommand, process.env),
+      detached: true,
+      stdio: ["inherit", "pipe", "pipe"],
+    }) : fork(workerCommand.entry, workerCommand.args, {
       env: workerEnvironment(workerCommand, process.env),
       execArgv: ["--require", require.resolve("tsx/cjs")],
       stdio: ["inherit", "pipe", "pipe", "ipc"],
@@ -202,7 +211,7 @@ async function main(): Promise<void> {
       if (!spawnedProcesses.has(next) && worker === next) worker = null;
       console.error("Executor process failed:", error);
     });
-    next.once("exit", (code, signal) => {
+    next.once("close", (code, signal) => {
       lastExitCode = code;
       lastSignal = signal;
       if (worker === next) worker = null;
@@ -215,6 +224,13 @@ async function main(): Promise<void> {
     if (!worker) return Promise.resolve();
     if (stopping) return stopping;
     const current = worker;
+    const isSpawn = workerCommand?.mode === "spawn";
+    const signal = (name: NodeJS.Signals) => {
+      if (isSpawn && current.pid) {
+        try { process.kill(-current.pid, name); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      } else current.kill(name);
+    };
     stopping = new Promise<void>(resolve => {
       let settled = false;
       const finish = () => {
@@ -227,13 +243,14 @@ async function main(): Promise<void> {
       };
       const timeout = setTimeout(() => {
         console.warn("Executor did not stop gracefully; killing process");
-        current.kill("SIGKILL");
-      }, 5000);
-      current.once("exit", finish);
+        signal("SIGKILL");
+      }, isSpawn ? 30000 : 5000);
+      current.once("close", finish);
       current.once("error", () => {
         if (!spawnedProcesses.has(current)) finish();
       });
-      if (current.connected) {
+      if (isSpawn) signal("SIGTERM");
+      else if (current.connected) {
         current.send({ type: "shutdown" }, error => {
           if (error && current.exitCode === null && !current.killed) {
             console.warn("Failed to request graceful executor shutdown:", error);
@@ -245,7 +262,7 @@ async function main(): Promise<void> {
   };
 
   if (workerCommand) startWorker();
-  else console.log("No executor command configured; waiting for POST /run");
+  else console.log("No executor command configured; waiting for POST /fork or /spawn");
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? loaderArgs.controlHost}`);
@@ -253,6 +270,7 @@ async function main(): Promise<void> {
       sendJson(res, 200, {
         state: worker ? "running" : "idle",
         pid: worker?.pid ?? null,
+        mode: workerCommand?.mode ?? null,
         entry: workerCommand?.entry ?? null,
         args: workerCommand?.args ?? [],
         env: workerCommand?.env ?? {},
@@ -266,11 +284,13 @@ async function main(): Promise<void> {
       sendJson(res, 200, { args: loaderArgs.sharedArgs });
       return;
     }
-    if (req.method === "POST" && url.pathname === "/run") {
+    if (req.method === "POST" && (url.pathname === "/fork" || url.pathname === "/spawn")) {
       void readWorkerCommand(req).then(value => serializeLifecycle(() => {
         if (worker) throw new Error("Executor worker is already running");
-        const command = value === null ? workerCommand : parseWorkerCommand(value, loaderArgs.sharedArgs, workerCommand);
-        if (command) validateWorkerModelArgs(command.args, modelArgs);
+        const mode = url.pathname === "/fork" ? "fork" : "spawn";
+        const command = value === null ? workerCommand : parseWorkerCommand(value, loaderArgs.sharedArgs, workerCommand, mode);
+        if (command && command.mode !== mode) throw new Error(`No ${mode} command has been configured; provide a command`);
+        if (command?.mode === "fork") validateWorkerModelArgs(command.args, modelArgs);
         workerCommand = command;
         if (!workerCommand) throw new Error("No executor command was provided");
         if (url.searchParams.has("follow")) {
@@ -306,7 +326,7 @@ async function main(): Promise<void> {
       void readWorkerCommand(req).then(value => serializeLifecycle(async () => {
         const command = value === null ? workerCommand : parseWorkerCommand(value, loaderArgs.sharedArgs, workerCommand);
         if (!command) throw new Error("No executor command has been configured");
-        validateWorkerModelArgs(command.args, modelArgs);
+        if (command.mode === "fork") validateWorkerModelArgs(command.args, modelArgs);
         await stopWorker();
         workerCommand = command;
         if (url.searchParams.has("follow")) {
