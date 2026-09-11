@@ -2,6 +2,25 @@
 #include "glm_ops.h"
 #include <cstdint>
 #include <cuda_bf16.h>
+#include <cuda_profiler_api.h>
+
+static Napi::Value ProfilerStart(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    cudaError_t err = cudaProfilerStart();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("cudaProfilerStart failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value ProfilerStop(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    cudaError_t err = cudaProfilerStop();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("cudaProfilerStop failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
 
 static Napi::Value Init(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
@@ -4077,6 +4096,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "sparseMlaDecode"), Napi::Function::New(env, SparseMlaDecode));
     exports.Set(Napi::String::New(env, "gatherTopkCkv"), Napi::Function::New(env, GatherTopkCkv));
     exports.Set(Napi::String::New(env, "graphBeginCapture"), Napi::Function::New(env, GraphBeginCapture));
+    exports.Set(Napi::String::New(env, "profilerStart"), Napi::Function::New(env, ProfilerStart));
+    exports.Set(Napi::String::New(env, "profilerStop"), Napi::Function::New(env, ProfilerStop));
     exports.Set(Napi::String::New(env, "graphEndCapture"), Napi::Function::New(env, GraphEndCapture));
     exports.Set(Napi::String::New(env, "graphInstantiate"), Napi::Function::New(env, GraphInstantiate));
     exports.Set(Napi::String::New(env, "graphLaunch"), Napi::Function::New(env, GraphLaunch));

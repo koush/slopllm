@@ -8,6 +8,7 @@ import { type GlmOps } from "./glm_ops";
 import { createDeviceOps, loadModel, type ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { MtpStats } from "./mtp_stats";
 import { ParallelOps } from "./parallel_ops";
+import { profilerStart, profilerStop } from "./native-addon";
 
 const PROMPTS = [
   "tell me about india",
@@ -28,6 +29,8 @@ interface Args extends ModelCliArgs {
   ignoreEos: boolean;
   instruction?: string;
   prompt?: string;
+  warmupRuns: number;
+  profile: boolean;
 }
 
 function parseLength(value: string): number {
@@ -52,6 +55,8 @@ function parseArgs(argv: string[]): Args {
     ignoreEos: false,
     instruction: undefined,
     prompt: undefined,
+    warmupRuns: 0,
+    profile: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -69,10 +74,15 @@ function parseArgs(argv: string[]): Args {
     } else if (arg === "--no-cuda-graph") args.noCudaGraph = true;
     else if (arg === "--no-mtp") args.noMtp = true;
     else if (arg === "--ignore-eos") args.ignoreEos = true;
+    else if (arg === "--warmup-runs") args.warmupRuns = Number(argv[++i]);
+    else if (arg === "--profile") args.profile = true;
   }
 
   if (args.prompt && args.file) {
     throw new Error("--prompt and --file cannot be used together");
+  }
+  if (!Number.isSafeInteger(args.warmupRuns) || args.warmupRuns < 0) {
+    throw new Error(`Invalid --warmup-runs: ${args.warmupRuns}`);
   }
   if (args.contextLen !== undefined && (!Number.isInteger(args.contextLen) || args.contextLen < 1)) {
     throw new Error(`Invalid --context-len: ${args.contextLen}`);
@@ -192,7 +202,7 @@ function freeResources(model: ChatModel | undefined, cache: ChatCache | undefine
   if (cleanupError) throw cleanupError;
 }
 
-async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args): Promise<void> {
+async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args, captureManager: CaptureManager): Promise<void> {
   const { prompts, inputIds } = prepareInputs(model.tokenizer, args);
   const longestPrompt = Math.max(...inputIds.map(ids => ids.length));
   if (longestPrompt + args.maxNewTokens > args.maxSeqLen) {
@@ -201,9 +211,6 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOp
 
   const sharePrefill = args.file !== undefined && args.batchSize > 1;
   cache.reset(sharePrefill ? 1 : args.batchSize);
-
-  using captureManager = new CaptureManager(glm);
-  captureManager.disabled = args.noCudaGraph;
 
   if (args.file) {
     const prefillStarted = performance.now();
@@ -308,7 +315,7 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOp
   console.log(mtpStats.log() || "MTP metrics: no post-warmup drafts");
 }
 
-async function runBatchWithoutMtp(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args): Promise<void> {
+async function runBatchWithoutMtp(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args, captureManager: CaptureManager): Promise<void> {
   const { prompts, inputIds } = prepareInputs(model.tokenizer, args);
   const longestPrompt = Math.max(...inputIds.map(ids => ids.length));
   if (longestPrompt + args.maxNewTokens > args.maxSeqLen) {
@@ -348,8 +355,6 @@ async function runBatchWithoutMtp(model: Glm51Model, ws: ExecutionWorkspace, glm
     }
   }
 
-  using captureManager = new CaptureManager(glm);
-  captureManager.disabled = args.noCudaGraph;
   let firstPostWarmupTime = 0;
   let lastTokenTime = 0;
   let postWarmupTokenCount = 0;
@@ -415,7 +420,23 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     cache = model.createChatCache(args.maxPages, args.batchSize, workspaceSeqLen);
     ws = new ExecutionWorkspace(glm, args.batchSize, workspaceSeqLen);
     console.log(`GLM-5.1 batched ${args.noMtp ? "decode" : "MTP"}: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, topk=${args.noMtp ? "off" : args.mtpDraftTopk.join(",")}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);
-    await (args.noMtp ? runBatchWithoutMtp(model, ws, glm, cache, args) : runBatch(model, ws, glm, cache, args));
+    using captureManager = new CaptureManager(glm);
+    captureManager.disabled = args.noCudaGraph;
+    for (let run = 0; run <= args.warmupRuns; run++) {
+      const warmup = run < args.warmupRuns;
+      const profiling = args.profile && !warmup;
+      console.log(`\n=== ${warmup ? "Warmup" : "Measured"} run ${run + 1}/${args.warmupRuns + 1} (cached graphs: ${captureManager.captured.size}) ===`);
+      await glm.synchronizeAsync();
+      if (profiling) profilerStart();
+      try {
+        await (args.noMtp ? runBatchWithoutMtp : runBatch)(model, ws, glm, cache, args, captureManager);
+      } finally {
+        // Drain every GPU before ending collection, including on a failed run.
+        try { await glm.synchronizeAsync(); }
+        finally { if (profiling) profilerStop(); }
+      }
+      ws.clearTracking();
+    }
   } finally {
     freeResources(model, cache, ws, glm, gpuDevices);
   }

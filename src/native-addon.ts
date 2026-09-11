@@ -32,6 +32,15 @@ export function mmapClose(mmapPtr: number, size: number): void {
   getNativeAddon().mmapClose(mmapPtr, size);
 }
 
+/** Trigger Nsight collection when launched with --capture-range=cudaProfilerApi. */
+export function profilerStart(): void {
+  getNativeAddon().profilerStart();
+}
+
+export function profilerStop(): void {
+  getNativeAddon().profilerStop();
+}
+
 export interface NativeAddon {
   init(deviceId: number): number;
   free(ctx: number): void;
@@ -80,6 +89,8 @@ export interface NativeAddon {
   batchPrefillPagedRun(ctx: number, q: number, o: number, kData: number, vData: number, indices: number, indptrD: number, lastPageLen: number, floatWs: number, intWs: number, qIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, pageSize: number, qStrideN: number, qStrideH: number, maskMode: number, smScale: number): void;
   batchPrefillRaggedPlan(ctx: number, floatWs: number, floatWsSize: number, intWs: number, pinnedIntWs: number, intWsSize: number, planInfo: number, qoIndptrH: number, kvIndptrH: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, maskMode: number): void;
   batchPrefillRaggedRun(ctx: number, q: number, k: number, v: number, o: number, floatWs: number, intWs: number, qIndptrD: number, kvIndptrD: number, planInfo: number, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: number, smScale: number): void;
+  profilerStart(): void;
+  profilerStop(): void;
   graphBeginCapture(ctx: number): void;
   graphEndCapture(ctx: number): number;
   graphInstantiate(ctx: number, graph: number): number;

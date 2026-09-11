@@ -89,6 +89,20 @@ recycling; its existing `streamWaitEvent()` still waits on every device.
 
 ## Profiling
 
+`run_glm51_multiple_mtp.ts --batch-size 1 --warmup-runs 2 --profile` runs two
+complete warmup generations followed by one measured generation in the same
+executor. It reuses the model, workspace, and CUDA graph cache, resetting sequence
+state for each run. `--warmup-runs` defaults to 0; `--profile` calls
+`cudaProfilerStart/Stop` around only the final run (including its prefill).
+Generation still ends at EOS or the script's token budget (default 2000).
+
+Launch with `nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop`
+to record only that final run. Add `--trace=cuda,nvtx --cuda-graph-trace=node
+--sample=none --cpuctxsw=none` for per-kernel graph tracing. With a resident model,
+send the complete Nsight/Node command to the loader's `/spawn?follow` endpoint,
+placing shared model arguments from `/model-args` after the script path. See
+[loader profiling instructions](AGENTS.md#spawn-arbitrary-executables-and-profile-resident-weights).
+
 Capture an Nsight Systems trace of a Qwen3-32B 8-GPU decode run (skips
 prefill via `--delay`, captures 4s of steady-state decode):
 
