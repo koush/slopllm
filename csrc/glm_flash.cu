@@ -719,13 +719,19 @@ void glm_mla_prefill_plan(
   cudaSetDevice(ctx->device_id);
 
   flashinfer::MLAPlanInfo info;
+  size_t staged_int_workspace_bytes = 0;
   cudaError_t status = flashinfer::MLAPlan<IdType>(
       float_ws, float_ws_size,
       int_ws, pinned_int_ws, int_ws_size,
-      info,
+      info, staged_int_workspace_bytes,
       qo_indptr_h, kv_indptr_h, kv_len_h,
       batch_size, num_heads, head_dim_o,
       causal, GLM_STREAM(ctx), cp_world_size, cp_rank);
+
+  if (status == cudaSuccess) {
+    status = cudaMemcpyAsync(int_ws, pinned_int_ws, staged_int_workspace_bytes,
+                             cudaMemcpyHostToDevice, GLM_STREAM(ctx));
+  }
 
   if (status != cudaSuccess) {
     fprintf(stderr, "glm_mla_prefill_plan failed: %s\n", cudaGetErrorString(status));

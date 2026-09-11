@@ -1,4 +1,5 @@
-"""Blockwise E4M3 quantization and native-FP8 sparse MLA input equivalence."""
+"""Blockwise E4M3 quantization and native-FP8 sparse MLA input correctness."""
+import math
 import pytest
 import torch
 
@@ -74,8 +75,29 @@ def test_sparse_mla_prequantized_q(glm, device, num_heads, decode):
     run(q, expected, expected_lse)
     run(values, output, lse, scales.data_ptr())
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, expected, rtol=0, atol=0)
-    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+    # Upstream swapAB uses arbitrary FP32 scales for online BF16 Q, whereas
+    # our prequantizer uses power-of-two scales. SG/MG/decode still use the
+    # latter online, so exact equivalence is only expected on those paths.
+    if decode or num_heads < 64:
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+
+    # Independently evaluate attention on the actual supplied quantized Q/KV.
+    # This also covers swapAB, without mistaking different quantizers for an
+    # implementation error or merely relaxing the old equivalence tolerance.
+    q_ref = (values.float().reshape(tokens, num_heads, 4, 128) * scales[..., None]).flatten(-2)
+    packed = kv.reshape(256, 656)
+    kv_scales = packed[:, 512:528].contiguous().view(torch.float32)
+    kv_ref = (packed[:, :512].contiguous().view(torch.float8_e4m3fn).float().reshape(256, 4, 128)
+              * kv_scales[..., None]).flatten(-2)
+    rope_ref = packed[:, 528:].contiguous().view(torch.bfloat16).float()
+    for t, length in enumerate(lengths.tolist()):
+        slots = indices[t, :length].long()
+        scores = (q_ref[t] @ kv_ref[slots].T + rope[t].float() @ rope_ref[slots].T) * 0.0791
+        ref = scores.softmax(-1) @ kv_ref[slots]
+        error = (output[t].float() - ref).norm() / ref.norm().clamp_min(1e-6)
+        assert error < 0.01, f"quantized attention NRMSE {error.item()}"
+        torch.testing.assert_close(lse[t], scores.logsumexp(-1) / math.log(2), rtol=0, atol=0.02)
 
     if num_heads == 64:
         glm.graph_begin_capture()
@@ -87,7 +109,17 @@ def test_sparse_mla_prequantized_q(glm, device, num_heads, decode):
             # Replay must read fresh Q and regenerate scales at stable addresses.
             q.mul_(3)
             torch.cuda.synchronize()
-            run(q, expected, expected_lse)
+            if not decode:
+                # Reference quantization is outside the graph and independent
+                # of the native quantizer captured above.
+                raw = q.float().reshape(tokens, num_heads, 4, 128).abs().amax(-1).clamp_min(1e-4) / 448
+                fresh_scales = torch.exp2(torch.ceil(torch.log2(raw)))
+                fresh_values = (q.float().reshape(tokens, num_heads, 4, 128)
+                                / fresh_scales[..., None]).to(torch.float8_e4m3fn).reshape_as(q)
+                torch.cuda.synchronize()
+                run(fresh_values, expected, expected_lse, fresh_scales.data_ptr())
+            else:
+                run(q, expected, expected_lse)
             glm.graph_launch(executable)
             torch.cuda.synchronize()
             torch.testing.assert_close(output, expected, rtol=0, atol=0)

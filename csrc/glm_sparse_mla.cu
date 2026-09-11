@@ -6,12 +6,12 @@
 
 namespace flashinfer::sparse_mla_sm120 {
     bool sparse_mla_prefill_dispatch(
-        ModelType mt, int num_heads, int topk, int page_block_size,
+        ModelType mt, PrefillVariant variant, int num_heads, int topk, int page_block_size,
         int topk_extra, int extra_page_block_size,
         const __nv_bfloat16* Q, const uint8_t* KV_cache, const int32_t* indices,
         const uint8_t* extra_KV_cache, const int32_t* extra_indices,
         __nv_bfloat16* output, float* out_lse, float sm_scale, int num_tokens,
-        size_t stride_kv_block, size_t stride_kv_block_extra,
+        size_t stride_kv_block, size_t stride_kv_block_extra, size_t stride_out_lse,
         const float* attn_sink, const int* topk_length,
         const int* extra_topk_length, cudaStream_t stream,
          const __nv_bfloat16* Q_rope_split, const float* Q_scales);
@@ -22,7 +22,8 @@ namespace flashinfer::sparse_mla_sm120 {
         const int32_t* indices, __nv_bfloat16* mid_out, float* mid_lse,
         __nv_bfloat16* output, float* out_lse, const int* topk_length,
         const float* attn_sink, int chunks_per_block_override,
-        float sm_scale, size_t stride_kv_block, cudaStream_t stream,
+        float sm_scale, size_t stride_kv_block, size_t stride_indices_token,
+        int stride_kv_row, size_t stride_out_lse, cudaStream_t stream,
          const __nv_bfloat16* Q_rope_split, const float* Q_scales);
 }
 
@@ -52,6 +53,7 @@ void glm_sparse_mla_prefill(
 
     bool ok = sparse_mla_prefill_dispatch(
         ModelType::GLM_NSA,
+        num_heads >= 64 ? PrefillVariant::SWAPAB : num_heads >= 32 ? PrefillVariant::MG : PrefillVariant::SG,
         num_heads, topk, page_block_size,
         0, 0,  // no dual-cache
         (const __nv_bfloat16*)q,
@@ -61,7 +63,7 @@ void glm_sparse_mla_prefill(
         (__nv_bfloat16*)output,
         out_lse,
         sm_scale, num_tokens,
-        stride_kv_block, 0,
+        stride_kv_block, 0, num_heads,
         nullptr,  // no attn_sink
         topk_length,
         nullptr,
@@ -113,6 +115,7 @@ void glm_sparse_mla_decode(
         chunks_per_block_override,
         sm_scale,
         stride_kv_block,
+        topk, 656, num_heads,
         GLM_STREAM(ctx),
         (const __nv_bfloat16*)q_rope, q_scales);
 

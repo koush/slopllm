@@ -173,9 +173,9 @@ function runMlaPrefill(
   const lastPageLenH = allocPinnedI32(ws, [batchSize]);
   lastPageLenH.h2d(i32Buf(new Int32Array([lastPageLen])));
 
-  const floatWs = allocBf16(ws, [128 * 1024 * 1024 / 2]);
-  const intWs = allocI32(ws, [8 * 1024 * 1024 / 4]);
-  const pinnedIntWs = allocPinnedI32(ws, [8 * 1024 * 1024 / 4]);
+  const floatWs = ws.ensureAlloc([128 * 1024 * 1024 / 2], "BF16", "mla_test_float_ws");
+  const intWs = ws.ensureAlloc([8 * 1024 * 1024 / 4], "I32", "mla_test_int_ws");
+  using pinnedIntWs = allocPinnedI32(ws, [8 * 1024 * 1024 / 4]);
   const planInfo = allocPinnedI32(ws, [19]);
 
   const kvLenH = allocPinnedI32(ws, [batchSize]);
