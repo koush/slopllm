@@ -36,19 +36,22 @@ def test_quantize_fp8(glm, device, block_size, input_offset, output_offset):
 @pytest.mark.parametrize('decode', [False, True])
 def test_sparse_mla_prequantized_q(glm, device, num_heads, decode):
     torch.manual_seed(123)
-    tokens, topk, splits = 5, 2048, 32
+    h8_prefill = num_heads == 8 and not decode
+    valid_lengths = [0, 1, 63, 65, 129, 256, 2048] if h8_prefill else [1, 63, 65, 129, 256]
+    tokens, topk, splits = len(valid_lengths), 2048, 32
+    kv_tokens = max(valid_lengths)
     q = torch.randn(tokens, num_heads, 512, device=device, dtype=torch.bfloat16)
     q[0, 0] = 0
     rope = torch.randn(tokens, num_heads, 64, device=device, dtype=torch.bfloat16)
     values = torch.empty_like(q, dtype=torch.float8_e4m3fn)
     scales = torch.empty(tokens, num_heads, 4, device=device, dtype=torch.float32)
-    ckv = torch.randn(256, 512, device=device, dtype=torch.bfloat16)
-    kpe = torch.randn(256, 64, device=device, dtype=torch.bfloat16)
-    kv = ref_quantize_ds_mla(ckv, kpe, 512, 64).reshape(4, 64, 656)
+    ckv = torch.randn(kv_tokens, 512, device=device, dtype=torch.bfloat16)
+    kpe = torch.randn(kv_tokens, 64, device=device, dtype=torch.bfloat16)
+    kv = ref_quantize_ds_mla(ckv, kpe, 512, 64).reshape(kv_tokens // 64, 64, 656)
     indices = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
-    lengths = torch.tensor([1, 63, 65, 129, 256], device=device, dtype=torch.int32)
+    lengths = torch.tensor(valid_lengths, device=device, dtype=torch.int32)
     for t, length in enumerate(lengths.tolist()):
-        indices[t, :length] = torch.randperm(256, device=device)[:length].int()
+        indices[t, :length] = torch.randperm(kv_tokens, device=device)[:length].int()
     mid_out = torch.empty(tokens, num_heads, splits, 512, device=device, dtype=torch.bfloat16)
     mid_lse = torch.empty(tokens, num_heads, splits, device=device)
     output = torch.empty_like(q)
@@ -86,12 +89,16 @@ def test_sparse_mla_prequantized_q(glm, device, num_heads, decode):
     # This also covers swapAB, without mistaking different quantizers for an
     # implementation error or merely relaxing the old equivalence tolerance.
     q_ref = (values.float().reshape(tokens, num_heads, 4, 128) * scales[..., None]).flatten(-2)
-    packed = kv.reshape(256, 656)
+    packed = kv.reshape(kv_tokens, 656)
     kv_scales = packed[:, 512:528].contiguous().view(torch.float32)
-    kv_ref = (packed[:, :512].contiguous().view(torch.float8_e4m3fn).float().reshape(256, 4, 128)
+    kv_ref = (packed[:, :512].contiguous().view(torch.float8_e4m3fn).float().reshape(kv_tokens, 4, 128)
               * kv_scales[..., None]).flatten(-2)
     rope_ref = packed[:, 528:].contiguous().view(torch.bfloat16).float()
     for t, length in enumerate(lengths.tolist()):
+        if length == 0:
+            assert torch.count_nonzero(output[t]) == 0
+            assert (lse[t] < -1e20).all()
+            continue
         slots = indices[t, :length].long()
         scores = (q_ref[t] @ kv_ref[slots].T + rope[t].float() @ rope_ref[slots].T) * 0.0791
         ref = scores.softmax(-1) @ kv_ref[slots]
@@ -99,7 +106,24 @@ def test_sparse_mla_prequantized_q(glm, device, num_heads, decode):
         assert error < 0.01, f"quantized attention NRMSE {error.item()}"
         torch.testing.assert_close(lse[t], scores.logsumexp(-1) / math.log(2), rtol=0, atol=0.02)
 
-    if num_heads == 64:
+    if h8_prefill:
+        # H16 SG exercises the unpruned, sequential two-pass implementation.
+        # Duplicating Q preserves the first eight heads' attention problem.
+        q16 = torch.cat((q, q), dim=1)
+        rope16 = torch.cat((rope, rope), dim=1)
+        out16 = torch.empty_like(q16)
+        lse16 = torch.empty(tokens, 16, device=device)
+        torch.cuda.synchronize()
+        glm.sparse_mla_prefill_split_q(
+            q16.data_ptr(), rope16.data_ptr(), kv.data_ptr(), indices.data_ptr(),
+            out16.data_ptr(), lse16.data_ptr(), tokens, 16, topk, 0.0791, 64 * 656,
+            topk_length=lengths.data_ptr())
+        torch.cuda.synchronize()
+        ref = out16[:, :8].float()
+        assert (output.float() - ref).norm() / ref.norm() < 0.003
+        torch.testing.assert_close(lse, lse16[:, :8], rtol=0, atol=0)
+
+    if num_heads in (8, 64):
         glm.graph_begin_capture()
         glm.quantize_fp8(q.data_ptr(), values.data_ptr(), scales.data_ptr(), scales.numel(), 128)
         run(values, output, lse, scales.data_ptr())
