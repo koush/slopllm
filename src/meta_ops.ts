@@ -270,8 +270,14 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([count, N], this.type);
     }
 
-    scatterAddRows(scales: Tensor, topK: number, numRows: number): Tensor {
-        return this.workspace.alloc([numRows, this.shape[1]], this.type);
+    swiGluMlpMoeReduce(
+        inputs: Parameters<Tensor["swiGluMlpMoeReduce"]>[0],
+        topkIndicesFlat: Tensor,
+        topK: number, count: number,
+        moeIntermediate: number, hs: number,
+        pfx: string,
+    ): Tensor {
+        return this.workspace.alloc([count / topK, hs], this.type);
     }
 
 }
@@ -349,10 +355,11 @@ export class MetaOps implements DeviceOps {
     get currentStream() { return this.activeStreams[this.activeStreams.length - 1]; }
     availableStreams: number[] = [];
 
-    withStream<T>(fn: () => T): Disposable & { result: T; streamWaitEvent(): void; synchronize(): void; } {
+    withStream<T>(fn: () => T) {
         const result = fn();
         return {
             [Symbol.dispose]() { },
+            streamId: this.currentStream,
             result,
             streamWaitEvent() { },
             synchronize() { }

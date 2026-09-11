@@ -433,6 +433,21 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
+  /** Routed expert MLP and weighted combine. The routing stream and result are caller-owned. */
+  swiGluMlpMoeReduce(
+    inputs: {
+      gate: Tensor[], up: Tensor[], down: Tensor[],
+      normalizedWeightsStream: Pick<ReturnType<typeof WorkspaceBase.prototype.glm.withStream<Tensor>>,
+        "streamId" | "result" | "streamWaitEvent">,
+    },
+    topkIndicesFlat: Tensor,
+    topK: number, count: number,
+    moeIntermediate: number, hs: number,
+    pfx: string,
+  ): Tensor {
+    return undefined as never;
+  }
+
   arange(start: number, step: number, count: number): void {
     if (count <= 0) throw new Error(`arange: count must be positive, got ${count}`);
   }
@@ -652,10 +667,6 @@ export abstract class Tensor implements Disposable {
   }
 
   mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
-    return undefined as never;
-  }
-
-  scatterAddRows(scales: Tensor, topK: number, numRows: number): Tensor {
     return undefined as never;
   }
 

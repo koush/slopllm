@@ -456,6 +456,33 @@ describe("ParallelTensor disposal and recycling", () => {
 });
 
 describe("Workspace stream recycling", () => {
+  it("supports local waits using stream metadata and recycles at producer disposal", () => {
+    using gpu0 = new GlmOps(0);
+    using gpu1 = new GlmOps(1);
+    using po = new ParallelOps([gpu0, gpu1]);
+    using ws0 = new WorkspaceBase(gpu0);
+    using ws1 = new WorkspaceBase(gpu1);
+    using producer = po.withStream(() => {
+      using t0 = ws0.alloc([16], "F32"); t0.fill(1, 16);
+      using t1 = ws1.alloc([16], "F32"); t1.fill(2, 16);
+      assert.equal(gpu0.currentStream, gpu1.currentStream);
+      return [t0.data, t1.data];
+    });
+    const id = producer.streamId;
+    assert.ok(ws0.heapByKey.get(id)?.contains(producer.result[0], 64));
+    assert.ok(ws1.heapByKey.get(id)?.contains(producer.result[1], 64));
+    gpu0.streamWaitEvent(gpu0.currentStream, id);
+    assert.ok(ws0.heapByKey.get(id)?.contains(producer.result[0], 64));
+    assert.ok(ws1.heapByKey.get(id)?.contains(producer.result[1], 64));
+    assert.ok(!ws1.heapByKey.get(0)?.contains(producer.result[1], 64));
+    gpu1.streamWaitEvent(gpu1.currentStream, id);
+    for (const device of po.devices) assert.ok(!device.availableStreams.includes(id));
+    producer[Symbol.dispose]();
+    assert.ok(ws0.heapByKey.get(0)?.contains(producer.result[0], 64));
+    assert.ok(ws1.heapByKey.get(0)?.contains(producer.result[1], 64));
+    for (const device of po.devices) assert.ok(device.availableStreams.includes(id));
+  });
+
   it("promotes disposed descendants on a wait while retaining the parent handle", () => {
     using glm = new GlmOps(0);
     let parentId = 0, childId = 0;

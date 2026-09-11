@@ -1220,7 +1220,83 @@ nvfp4_linear_splitk_kernel(
     }
 }
 
+// Production TP=8 MoE down shape: K=256, N=6144, eight experts per token.
+// Four warps compute two experts each. A CTA owns eight output columns, so the
+// weighted reduction is deterministic and needs no global intermediate/atomics.
+__global__ void __launch_bounds__(128)
+nvfp4_down_reduce_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const uint8_t* const* __restrict__ weight_ptrs,
+    const __nv_fp8_e4m3* const* __restrict__ scale_ptrs,
+    const float* const* __restrict__ scale2_ptrs,
+    const int* __restrict__ expert_ids,
+    const __nv_bfloat16* __restrict__ routing_weights) {
+    constexpr int N = 6144, K = 256, TOPK = 8, COLS = 8;
+    const int token = blockIdx.x / (N / COLS);
+    const int tile = blockIdx.x % (N / COLS);
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int inner = lane % 4;
+    const int col = lane / 4;
+    const int row = tile * COLS + col;
+    __shared__ __nv_bfloat16 down[TOPK][COLS];
+
+    #pragma unroll
+    for (int e = warp; e < TOPK; e += 4) {
+        const int entry = token * TOPK + e;
+        const int expert = expert_ids[entry];
+        const auto* x = input + (size_t)entry * K;
+        const auto* w = weight_ptrs[expert] + (size_t)row * (K / 2);
+        const auto* scales = scale_ptrs[expert] + (size_t)row * (K / NVFP4_QUANT_GROUP);
+        const float scale2 = *scale2_ptrs[expert];
+        float sum = 0.0f;
+        #pragma unroll
+        for (int g = inner; g < K / NVFP4_QUANT_GROUP; g += 4) {
+            const auto* xv = reinterpret_cast<const uint4*>(x + g * NVFP4_QUANT_GROUP);
+            const uint4 x0 = xv[0], x1 = xv[1];
+            __nv_bfloat16 xb[16];
+            uint4_to_bf16x8(x0, xb);
+            uint4_to_bf16x8(x1, xb + 8);
+            const uint32_t w0 = *reinterpret_cast<const uint32_t*>(w + g * 8);
+            const uint32_t w1 = *reinterpret_cast<const uint32_t*>(w + g * 8 + 4);
+            const float scale = fp8_e4m3_to_float(scales[g]) * scale2;
+            float part = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const uint8_t packed = ((j < 4 ? w0 : w1) >> ((j % 4) * 8)) & 0xff;
+                const float2 v = fp4x2_to_float2(packed);
+                part += v.x * __bfloat162float(xb[j * 2]) + v.y * __bfloat162float(xb[j * 2 + 1]);
+            }
+            sum += part * scale;
+        }
+        sum += __shfl_xor_sync(0xffffffff, sum, 2);
+        sum += __shfl_xor_sync(0xffffffff, sum, 1);
+        if (inner == 0) down[e][col] = __float2bfloat16(sum);
+    }
+    __syncthreads();
+    if (threadIdx.x < COLS) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < TOPK; e++)
+            sum += __bfloat162float(routing_weights[token * TOPK + e]) * __bfloat162float(down[e][threadIdx.x]);
+        output[(size_t)token * N + tile * COLS + threadIdx.x] = __float2bfloat16(sum);
+    }
+}
+
 extern "C" {
+
+void glm_nvfp4_mul_mat_id_reduce(GlmCtx* ctx, void* output, const void* input,
+                                const void* const* weight_ptrs, const void* const* scale_ptrs,
+                                const void* const* scale2_ptrs, const int* expert_ids,
+                                const void* routing_weights, int num_rows) {
+    cudaSetDevice(ctx->device_id);
+    if (num_rows <= 0) return;
+    nvfp4_down_reduce_kernel<<<num_rows * (6144 / 8), 128, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)output, (const __nv_bfloat16*)input,
+        (const uint8_t* const*)weight_ptrs, (const __nv_fp8_e4m3* const*)scale_ptrs,
+        (const float* const*)scale2_ptrs, expert_ids, (const __nv_bfloat16*)routing_weights);
+}
 
 void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
                             const void* fp8_weight, const void* weight_scale,

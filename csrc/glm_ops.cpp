@@ -1389,6 +1389,33 @@ static Napi::Value Nvfp4MulMatId(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value Nvfp4MulMatIdReduce(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 9) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, routing_weights, num_rows)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    int rows = info[8].As<Napi::Number>().Int32Value();
+    if (rows < 1 || rows > 32) {
+        Napi::RangeError::New(env, "nvfp4MulMatIdReduce requires 1..32 rows").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_nvfp4_mul_mat_id_reduce(
+        reinterpret_cast<GlmCtx*>(info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<void*>(info[1].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>(info[2].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void* const*>(info[3].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void* const*>(info[4].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void* const*>(info[5].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int*>(info[6].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>(info[7].As<Napi::Number>().Int64Value()), rows);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("nvfp4MulMatIdReduce failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value ScatterAddRows(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 8) {
@@ -4002,6 +4029,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "groupMaskMul"), Napi::Function::New(env, GroupMaskMul));
     exports.Set(Napi::String::New(env, "mulMatId"), Napi::Function::New(env, MulMatId));
     exports.Set(Napi::String::New(env, "nvfp4MulMatId"), Napi::Function::New(env, Nvfp4MulMatId));
+    exports.Set(Napi::String::New(env, "nvfp4MulMatIdReduce"), Napi::Function::New(env, Nvfp4MulMatIdReduce));
     exports.Set(Napi::String::New(env, "scatterAddRows"), Napi::Function::New(env, ScatterAddRows));
     exports.Set(Napi::String::New(env, "mmaMoeWorkspaceSize"), Napi::Function::New(env, MmaMoeWorkspaceSize));
     exports.Set(Napi::String::New(env, "nvfp4MulMatIdGroupedMmaCoop"), Napi::Function::New(env, Nvfp4MulMatIdGroupedMmaCoop));

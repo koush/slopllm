@@ -257,6 +257,13 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
                              const int* expert_ids, int top_k,
                              int count, int N, int K);
 
+// Fused NVFP4 down + weighted reduction: N=6144, K=256, top_k=8, 1..32 rows.
+// Preserves BF16 rounding of each down result before the weighted sum.
+void glm_nvfp4_mul_mat_id_reduce(GlmCtx* ctx, void* output, const void* input,
+                                const void* const* weight_ptrs, const void* const* scale_ptrs,
+                                const void* const* scale2_ptrs, const int* expert_ids,
+                                const void* routing_weights, int num_rows);
+
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
                              const void* scales, int top_k,
                              int dim, int num_rows, void* workspace);

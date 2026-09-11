@@ -920,6 +920,9 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
 
+        self.lib.glm_nvfp4_mul_mat_id_reduce.restype = None
+        self.lib.glm_nvfp4_mul_mat_id_reduce.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int]
+
         self.lib.glm_scatter_add_rows.restype = None
         self.lib.glm_scatter_add_rows.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -2052,6 +2055,12 @@ class GlmOps:
             self._ptr(expert_ids),
             top_k, count, N, K
         )
+
+    def nvfp4_mul_mat_id_reduce(self, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, expert_ids, routing_weights, num_rows):
+        self.lib.glm_nvfp4_mul_mat_id_reduce(
+            self.ctx, self._ptr(output), self._ptr(input),
+            ctypes.c_void_p(weight_ptrs), ctypes.c_void_p(scale_ptrs), ctypes.c_void_p(scale2_ptrs),
+            self._ptr(expert_ids), self._ptr(routing_weights), num_rows)
 
     def scatter_add_rows(self, out, input, scales, top_k, dim, num_rows, workspace):
         self.lib.glm_scatter_add_rows(

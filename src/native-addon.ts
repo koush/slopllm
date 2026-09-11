@@ -167,6 +167,7 @@ export interface NativeAddon {
   groupMaskMul(ctx: number, scores: number, groupMask: number, numExperts: number, expertsPerGroup: number, nGroup: number, batch: number): void;
   mulMatId(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
   nvfp4MulMatId(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number): void;
+  nvfp4MulMatIdReduce(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, routingWeights: number, numRows: number): void;
   mmaMoeWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   mmaMoeCoopWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   nvfp4MulMatIdGroupedMmaCoop(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;

@@ -19,6 +19,7 @@ import { getNativeAddon } from "./native-addon";
 // the grouped path only pays off once `count` is large enough to amortize its
 // dispatch overhead against avoided redundant weight reads (true prefill territory).
 const MUL_MAT_ID_GROUPED_THRESHOLD = 512;
+export const FUSED_MOE_DOWN_REDUCE = process.env.GLM_FUSED_MOE_DOWN_REDUCE !== "0";
 // Independent NVFP4 control for grouped-MoE experiments; BF16 dispatch is separate.
 const NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD = Number(process.env.GLM_NVFP4_MOE_GROUPED_THRESHOLD ?? MUL_MAT_ID_GROUPED_THRESHOLD);
 if (!Number.isInteger(NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD) || NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD < 0) {
@@ -625,6 +626,44 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
+  swiGluMlpMoeReduce(
+    inputs: Parameters<Tensor["swiGluMlpMoeReduce"]>[0],
+    topkIndicesFlat: Tensor,
+    topK: number, count: number,
+    moeIntermediate: number, hs: number,
+    pfx: string,
+  ): Tensor {
+    const fuseDown = FUSED_MOE_DOWN_REDUCE && this.type === "BF16" &&
+      inputs.down[0]?.type === "U8" && hs === 6144 && moeIntermediate === 256 &&
+      inputs.down[0].shape[0] === hs && inputs.down[0].shape[1] === moeIntermediate / 2 &&
+      topK === 8 && count > 0 && count <= 256 && count % topK === 0;
+    if (!fuseDown) {
+      using downOut = this.swiGluMlpMoe(inputs, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
+      inputs.normalizedWeightsStream.streamWaitEvent();
+      using scales = inputs.normalizedWeightsStream.result.reshape([count]);
+      const out = this.workspace.alloc([count / topK, hs], this.type);
+      getNativeAddon().scatterAddRows(this.glm.ctx, out.data, downOut.data, scales.data, topK, hs, count / topK, 0);
+      return out;
+    }
+    super.swiGluMlpMoe(inputs, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
+    using gateStream = this.glm.withStream(() => this.mulMatId(inputs.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
+    using upOut = this.mulMatId(inputs.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
+    gateStream.streamWaitEvent();
+    using gateOut = gateStream.result;
+    using activated = gateOut.siluAndMul(upOut);
+    inputs.normalizedWeightsStream.streamWaitEvent();
+    using scales = inputs.normalizedWeightsStream.result.reshape([count]);
+    if (scales.type !== "BF16" || topkIndicesFlat.type !== "I32") {
+      throw new Error("swiGluMlpMoeReduce: expected BF16 routing weights and I32 expert ids");
+    }
+    const out = this.workspace.alloc([count / topK, hs], this.type);
+    const ptrs = this.getMoeNvfp4Ptrs(inputs.down, `${pfx}.down_proj`);
+    getNativeAddon().nvfp4MulMatIdReduce(this.glm.ctx, out.data, activated.data,
+      ptrs.weightPtrs.data, ptrs.scalePtrs.data, ptrs.scale2Ptrs.data,
+      topkIndicesFlat.data, scales.data, count / topK);
+    return out;
+  }
+
   private getMoeNvfp4Ptrs(weights: Tensor[], name: string): { weightPtrs: Tensor, scalePtrs: Tensor, scale2Ptrs: Tensor } {
     const ptrName = `__moe_ptrs.${name}`;
     let weightPtrs = this.workspace.tensors.get(ptrName);
@@ -701,13 +740,6 @@ export class GlmTensor extends Tensor {
       numExperts, hs, moeIntermediate, count, hs, scatterWs.data, siluOut.data, false,
       downGemmWs.data, downOut.data);
     return downOut;
-  }
-
-  scatterAddRows(scales: Tensor, topK: number, numRows: number): Tensor {
-    const dim = this.shape[1];
-    const out = this.workspace.alloc([numRows, dim], this.type);
-    getNativeAddon().scatterAddRows(this.glm.ctx, out.data, this.data, scales.data, topK, dim, numRows, 0);
-    return out;
   }
 
 }
@@ -1042,6 +1074,7 @@ export class GlmOps implements DeviceOps {
     let disposed = false;
     let waited = false;
     return {
+      streamId: stream,
       [Symbol.dispose]: () => {
         if (disposed)
           return;

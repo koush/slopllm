@@ -643,12 +643,11 @@ export class Glm51Model extends ChatModel {
     const upWeights = this.getExpertWeights(pfx, "up_proj");
     const downWeights = this.getExpertWeights(pfx, "down_proj");
 
-    using downOut = normed.swiGluMlpMoe({ gate: gateWeights, up: upWeights, down: downWeights }, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
-
-    normalizedWeightsStream.streamWaitEvent();
     using normalizedWeights = normalizedWeightsStream.result;
-    using normalizedWeightsFlat = normalizedWeights.reshape([count]);
-    using routedOut = downOut.scatterAddRows(normalizedWeightsFlat, topK, BS);
+    using routedOut = normed.swiGluMlpMoeReduce({
+      gate: gateWeights, up: upWeights, down: downWeights,
+      normalizedWeightsStream,
+    }, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
 
     sharedMlpStream.streamWaitEvent();
     using sharedDownBuf = sharedMlpStream.result;

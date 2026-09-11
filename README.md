@@ -56,6 +56,37 @@ Install Python dependencies:
 pip install pytest torch safetensors
 ```
 
+## Fused MoE down/reduction
+
+GLM-5.1 enables fused NVFP4 down projection and weighted expert reduction for
+local hidden size 6144, MoE intermediate size 256, eight experts per token,
+and up to 32 token rows. The tested eight-GPU model has global MoE intermediate
+size 2048. This
+covers request batches 1–8 with the default three-token MTP draft. Other shapes
+and BF16 experts use the existing path.
+
+Set `GLM_FUSED_MOE_DOWN_REDUCE=0` to run the original model path for comparison;
+unset it or use `1` to enable fusion. The setting is read at process startup.
+With the persistent model loader, set it in the executor environment through
+`/run` or `/restart`; the weights do not need to be reloaded.
+
+The kernel preserves BF16 rounding of each expert result. Shared-expert addition
+and the standalone P2P barriers remain separate. The implementation is in
+`csrc/glm_gemv.cu`. The model calls `Tensor.swiGluMlpMoeReduce()` with the
+routing-normalization stream result. The parallel backend supplies each shard's
+result and a device-local wait function to `GlmTensor`, which chooses fused or
+unfused execution. Each local implementation waits before
+fused down/combine, or after unfused down projection. Routing tensors remain
+caller-owned.
+
+`swiGluMlpMoeReduce()` is the Tensor-level entry point for both paths. The
+unfused implementation calls the native `scatterAddRows` binding directly;
+neither `scatterAddRows` nor `mulMatIdReduce` is exposed as a Tensor operation.
+
+`withStream()` exposes `streamId`, allowing each shard to enqueue a local
+CUDA wait. The producer wrapper retains ownership of stream disposal and resource
+recycling; its existing `streamWaitEvent()` still waits on every device.
+
 ## Profiling
 
 Capture an Nsight Systems trace of a Qwen3-32B 8-GPU decode run (skips

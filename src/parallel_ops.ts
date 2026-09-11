@@ -1967,21 +1967,33 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, [count, hs], this.type, TensorParallelism.PartialSum);
   }
 
-  scatterAddRows(scales: Tensor, topK: number, numRows: number): Tensor {
-    const pScales = scales as ParallelTensor;
-    const dim = this.shape[1];
-    const outShards: Tensor[] = [];
-    if (this.parallelism === TensorParallelism.PartialSum) {
-      for (let i = 0; i < this.worldSize; i++) {
-        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], topK, numRows));
-      }
-      return this.parallelOps.wrapShards(this.workspace, outShards, [numRows, dim], this.type, TensorParallelism.PartialSum);
-    } else {
-      for (let i = 0; i < this.worldSize; i++) {
-        outShards.push(this.shards[i].scatterAddRows(pScales.shards[i], topK, numRows));
-      }
-      return this.parallelOps.wrapShards(this.workspace, outShards, [numRows, dim], this.type, this.parallelism);
-    }
+  swiGluMlpMoeReduce(
+    inputs: Parameters<Tensor["swiGluMlpMoeReduce"]>[0],
+    topkIndicesFlat: Tensor,
+    topK: number, count: number,
+    moeIntermediate: number, hs: number,
+    pfx: string,
+  ): Tensor {
+    const routingStream = inputs.normalizedWeightsStream;
+    const routingWeights = routingStream.result as ParallelTensor;
+    const expertIds = topkIndicesFlat as ParallelTensor;
+    this.assertParallel("swiGluMlpMoeReduce input", this, TensorParallelism.Replicated);
+    this.assertParallel("swiGluMlpMoeReduce routing weights", routingWeights, TensorParallelism.Replicated);
+    const shardIntermediate = this.shardDim(moeIntermediate, "swiGluMlpMoeReduce moeIntermediate");
+    const shards = this.shards.map((shard, i) => shard.swiGluMlpMoeReduce({
+      gate: inputs.gate.map(w => (w as ParallelTensor).shards[i]),
+      up: inputs.up.map(w => (w as ParallelTensor).shards[i]),
+      down: inputs.down.map(w => (w as ParallelTensor).shards[i]),
+      normalizedWeightsStream: {
+        streamId: routingStream.streamId,
+        result: routingWeights.shards[i],
+        streamWaitEvent() {
+          const device = shard.workspace.glm;
+          device.streamWaitEvent(device.currentStream, routingStream.streamId);
+        },
+      },
+    }, expertIds.shards[i], topK, count, shardIntermediate, hs, pfx));
+    return this.parallelOps.wrapShards(this.workspace, shards, [count / topK, hs], this.type, TensorParallelism.PartialSum);
   }
 
   rotaryEmbedding(positionIds: Tensor, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
@@ -3067,6 +3079,7 @@ export class ParallelOps implements DeviceOps {
     }
     let disposed = false;
     return {
+      streamId: streams[0]!,
       [Symbol.dispose]: () => {
         if (disposed)
           return;
