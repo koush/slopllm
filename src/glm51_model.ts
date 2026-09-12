@@ -643,6 +643,7 @@ export class Glm51Model extends ChatModel {
     const upWeights = this.getExpertWeights(pfx, "up_proj");
     const downWeights = this.getExpertWeights(pfx, "down_proj");
 
+    using _normalizedWeights = normalizedWeightsStream.result;
     using routedOut = normed.swiGluMlpMoeReduce({
       gate: gateWeights, up: upWeights, down: downWeights,
       normalizedWeightsStream,
