@@ -66,12 +66,23 @@ def test_topk_from_scores_exact(glm, device, N, batch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("N,num_splits", [
-    (16384, 1),      # the CP merge shape: topk*worldSize candidates, single split
-    (65536, 16),     # multi-block, so the per-block prefix has to line up
-    (200000, 256),
+@pytest.mark.parametrize("N,num_splits,batch", [
+    (16384, 1, 3),   # single-block radix path
+    (16384, 32, 4),  # CP merge: parallel radix below the general cutoff
+    (16384, 32, 8),
+    (4096, 8, 4),    # short full row: single-block radix
+    (8192, 16, 16),  # enough scan work saved to use parallel radix
+    (8192, 2, 32),   # two partitions do not amortize the extra launches here
+    (12288, 2, 32),  # crossover with two partitions
+    (16384, 32, 1),
+    (16384, 32, 2),
+    (16384, 32, 16),
+    (16384, 16, 64),
+    (32768, 1, 4),   # no histogram parallelism: keep a single-block scan
+    (65536, 16, 3),  # multi-block, so the per-block prefix has to line up
+    (200000, 256, 3),
 ])
-def test_topk_from_scores_deterministic(glm, device, N, num_splits):
+def test_topk_from_scores_deterministic(glm, device, N, num_splits, batch):
     """Repeated selection over identical scores must be bit-identical.
 
     The selection feeds topk_to_slots, which compacts in input order, which sets
@@ -82,13 +93,17 @@ def test_topk_from_scores_deterministic(glm, device, N, num_splits):
     small value range (heavy bf16 tie bucket) plus a -inf pad block like the CP
     merge produces.
     """
-    topk, batch = 2048, 3
+    topk = 2048
     torch.manual_seed(N)
     scores = (torch.randint(0, 24, (batch, N), device=device).float() / 8).to(torch.bfloat16)
     scores[:, : N // 2] = float('-inf')   # pad block, as the per-rank merge emits
 
     ref_idx, ref_val = _select_with_scores(glm, scores, None, topk, num_splits)
     ref_idx, ref_val = ref_idx.clone(), ref_val.clone()
+    if num_splits > 1:
+        single_idx, single_val = _select_with_scores(glm, scores, None, topk, 1)
+        assert torch.equal(ref_idx, single_idx)
+        assert torch.equal(ref_val.view(torch.int16), single_val.view(torch.int16))
     for it in range(8):
         idx, val = _select_with_scores(glm, scores, None, topk, num_splits)
         assert torch.equal(idx, ref_idx), f"iteration {it}: indices differ from first run"

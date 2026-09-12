@@ -877,7 +877,17 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     dim3 grid(num_splits, batch);
-    if (stride <= 32768) {
+    // Full rows (including padded CP candidate merges) amortize the extra
+    // histogram launches once splitting removes about 6K scores from each
+    // CTA's scan. Query count influences this through the caller's split budget:
+    // e.g. 8K/4 splits and 12K/2 splits qualify, but a single split never does.
+    // With device-side lengths, stride is only capacity: retain the conservative
+    // cutoff so short/identity rows in large buffers don't pay extra launches.
+    const int splitScan = (stride + num_splits - 1) / num_splits;
+    const bool parallelRadix = stride > topk && (row_len
+        ? stride > 32768
+        : num_splits > 1 && stride - splitScan >= 6144);
+    if (!parallelRadix) {
         idx_radix_threshold_kernel<<<batch, 256, 0, stream>>>(
             meta, out_idx, out_scores, row_len, (const __nv_bfloat16*)scores,
             stride, topk, cpWorldSize, cpRank);
