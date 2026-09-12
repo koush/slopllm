@@ -44,6 +44,38 @@ def test_topk_small_dim(glm, device):
                 f"Value mismatch at batch {b}, position {i}"
 
 
+@pytest.mark.parametrize("batch", [1, 4, 8, 32, 1024])
+@pytest.mark.parametrize("pattern", ["random", "ties", "zeros", "infinities"])
+def test_router_top8_exact_order(glm, device, batch, pattern):
+    torch.manual_seed(123)
+    if pattern == "random":
+        x = torch.randn(batch, 256, device=device).to(torch.bfloat16)
+    elif pattern == "ties":
+        x = torch.randint(-4, 5, (batch, 256), device=device).to(torch.bfloat16)
+    else:
+        x = torch.zeros(batch, 256, device=device, dtype=torch.bfloat16)
+        x[:, ::2] = -0.0
+        if pattern == "infinities":
+            x[:, 17:33] = float('inf')
+            x[:, 128:] = -float('inf')
+    reference = torch.argsort(x.float(), descending=True, stable=True)[:, :8]
+    # Width 258 exercises the independent generic implementation while keeping
+    # each row aligned for its BF16x2 loads.
+    padded = torch.cat([x, torch.full((batch, 2), -float('inf'), device=device, dtype=torch.bfloat16)], dim=1)
+    vals = torch.empty(batch, 8, dtype=torch.bfloat16, device=device)
+    ids = torch.empty(batch, 8, dtype=torch.int32, device=device)
+    generic_vals, generic_ids = torch.empty_like(vals), torch.empty_like(ids)
+    torch.cuda.synchronize()
+    glm.topk(generic_vals, generic_ids, padded, 8, 258, batch, 13)
+    for _ in range(3):
+        glm.topk(vals, ids, x, 8, 256, batch, 13)
+        glm.synchronize()
+        assert torch.equal(ids.long(), reference + 13)
+        assert torch.equal(vals.view(torch.int16), x.gather(1, reference).view(torch.int16))
+        assert torch.equal(ids, generic_ids)
+        assert torch.equal(vals.view(torch.int16), generic_vals.view(torch.int16))
+
+
 def test_topk_moe_routing(glm, device):
     batch = 4
     num_experts = 256

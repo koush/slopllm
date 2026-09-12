@@ -2182,11 +2182,61 @@ __global__ void __launch_bounds__(256, 4) topk_kernel(
     }
 }
 
+// Router specialization: one warp owns all 256 scores in registers. Retain
+// the generic selector's descending value / ascending index ordering.
+__global__ void topk8_router_kernel(
+    __nv_bfloat16* out_values, int* out_indices,
+    const __nv_bfloat16* input, int offset
+) {
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x;
+    float values[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+        values[j] = __bfloat162float(input[(size_t)row * 256 + lane + j * 32]);
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+        float best = -INFINITY;
+        int index = -1;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int candidate = lane + j * 32;
+            if (values[j] > best || (values[j] == best && candidate < index)) {
+                best = values[j];
+                index = candidate;
+            }
+        }
+#pragma unroll
+        for (int delta = 16; delta > 0; delta >>= 1) {
+            const float other = __shfl_down_sync(0xffffffff, best, delta);
+            const int otherIndex = __shfl_down_sync(0xffffffff, index, delta);
+            if (other > best || (other == best && otherIndex < index)) {
+                best = other;
+                index = otherIndex;
+            }
+        }
+        const int winner = __shfl_sync(0xffffffff, index, 0);
+        if (lane == 0) {
+            out_values[(size_t)row * 8 + k] = __float2bfloat16(best);
+            out_indices[(size_t)row * 8 + k] = winner + offset;
+        }
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            if (lane + j * 32 == winner) values[j] = -INFINITY;
+    }
+}
+
 void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
               const void* input, int k, int dim, int batch, int offset) {
     cudaSetDevice(ctx->device_id);
     int block_size = 256;
     int grid = batch;
+
+    if (k == 8 && dim == 256) {
+        topk8_router_kernel<<<batch, 32, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, offset);
+        return;
+    }
 
     if (k <= 8 && dim <= 1024) {
         // Shared-memory parallel argmax: K passes of warp-shuffle reduction.
