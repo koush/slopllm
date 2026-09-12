@@ -915,6 +915,17 @@ export class GlmOps implements DeviceOps {
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
+  prefetchL2(tensors: readonly Tensor[]): void {
+    if (tensors.length > 8) throw new Error("prefetchL2 supports at most eight tensors");
+    for (const tensor of tensors) {
+      if (tensor.pinned || tensor.workspace.glm !== this) {
+        throw new Error("prefetchL2 requires local device tensors");
+      }
+    }
+    if (!tensors.length) return;
+    getNativeAddon().prefetchL2(this.ctx, tensors.map(tensor => tensor.data), tensors.map(tensor => tensor.bytes));
+  }
+
   async synchronizeAsync(): Promise<void> {
     await getNativeAddon().synchronizeAsync(this.ctx);
     notifySynchronizedWorkspaces(this.synchronizeListeners);

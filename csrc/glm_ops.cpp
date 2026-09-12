@@ -1844,6 +1844,35 @@ private:
     int stream_idx_;
 };
 
+static Napi::Value PrefetchL2(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 3 || !info[0].IsNumber() || !info[1].IsArray() || !info[2].IsArray()) {
+        Napi::TypeError::New(env, "Expected (ctx, pointers, sizes)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const auto pointers = info[1].As<Napi::Array>();
+    const auto sizes = info[2].As<Napi::Array>();
+    const uint32_t count = pointers.Length();
+    if (count > 8 || sizes.Length() != count) {
+        Napi::RangeError::New(env, "prefetchL2 requires matching arrays of at most eight ranges").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const void* data[8]{};
+    size_t bytes[8]{};
+    for (uint32_t i = 0; i < count; i++) {
+        if (!pointers.Get(i).IsNumber() || !sizes.Get(i).IsNumber() || sizes.Get(i).As<Napi::Number>().DoubleValue() < 0) {
+            Napi::TypeError::New(env, "prefetchL2 requires numeric pointers and nonnegative sizes").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        data[i] = reinterpret_cast<const void*>(pointers.Get(i).As<Napi::Number>().Int64Value());
+        bytes[i] = static_cast<size_t>(sizes.Get(i).As<Napi::Number>().Int64Value());
+    }
+    glm_prefetch_l2(
+        reinterpret_cast<GlmCtx*>(info[0].As<Napi::Number>().Int64Value()),
+        data, bytes, count);
+    return env.Undefined();
+}
+
 static Napi::Value SynchronizeAsync(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsNumber()) {
@@ -4082,6 +4111,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "synchronize"), Napi::Function::New(env, Synchronize));
     exports.Set(Napi::String::New(env, "synchronizeStream"), Napi::Function::New(env, SynchronizeStream));
     exports.Set(Napi::String::New(env, "synchronizeAsync"), Napi::Function::New(env, SynchronizeAsync));
+    exports.Set(Napi::String::New(env, "prefetchL2"), Napi::Function::New(env, PrefetchL2));
     exports.Set(Napi::String::New(env, "synchronizeStreamAsync"), Napi::Function::New(env, SynchronizeStreamAsync));
     exports.Set(Napi::String::New(env, "setStream"), Napi::Function::New(env, SetStream));
     exports.Set(Napi::String::New(env, "eventRecord"), Napi::Function::New(env, EventRecord));

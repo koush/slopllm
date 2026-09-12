@@ -643,7 +643,6 @@ export class Glm51Model extends ChatModel {
     const upWeights = this.getExpertWeights(pfx, "up_proj");
     const downWeights = this.getExpertWeights(pfx, "down_proj");
 
-    using normalizedWeights = normalizedWeightsStream.result;
     using routedOut = normed.swiGluMlpMoeReduce({
       gate: gateWeights, up: upWeights, down: downWeights,
       normalizedWeightsStream,
@@ -774,7 +773,7 @@ export class Glm51Model extends ChatModel {
 
     idxQStream?.streamWaitEvent();
     const topkResult = idxQStream?.result;
-    using topkValues = topkResult?.values;
+    using _topkValues = topkResult?.values;
     using topkIndices = topkResult?.indices;
 
     let sparseSlots: {
@@ -833,6 +832,7 @@ export class Glm51Model extends ChatModel {
     qStream.streamWaitEvent();
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
+    using prefetchL2 = new UsingHolder<ReturnType<DeviceOps["withStream"]>>(undefined!);
     {
       let attnOut: Tensor;
       let lseBuf: Tensor;
@@ -866,8 +866,12 @@ export class Glm51Model extends ChatModel {
       using _lseBuf = lseBuf;
 
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
+      const oProj = this.tensors.get(`${pfx}.o_proj.weight`)!;
+      if (BS <= 8 && process.env.GLM_L2_PREFETCH !== "0") {
+        prefetchL2.replace(this.glm.withStream(() => this.glm.prefetchL2([oProj])));
+      }
       using vExpanded = attnOut.mlaVExpand(vProj, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);
-      oProjBuf.replace(vExpanded.outputProj(this.tensors.get(`${pfx}.o_proj.weight`)!));
+      oProjBuf.replace(vExpanded.outputProj(oProj));
     }
 
     yield;
@@ -896,6 +900,9 @@ export class Glm51Model extends ChatModel {
     yield;
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
 
+    // Only close the prefetch branch at layer end: outputProj reads immutable
+    // weights and can use cache hits without waiting for the hint kernel.
+    prefetchL2.value?.streamWaitEvent();
     slotsStream?.streamWaitEvent();
     yield;
     return { normed: mlpResult.normed, residual: mlpResult.residual };

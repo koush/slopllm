@@ -2998,6 +2998,18 @@ export class ParallelOps implements DeviceOps {
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
+  prefetchL2(tensors: readonly Tensor[]): void {
+    if (tensors.length > 8) throw new Error("prefetchL2 supports at most eight tensors");
+    for (const tensor of tensors) {
+      if (!(tensor instanceof ParallelTensor) || tensor.workspace.glm !== this || tensor.pinned) {
+        throw new Error("prefetchL2 requires device tensors owned by this backend");
+      }
+    }
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].prefetchL2(tensors.map(tensor => (tensor as ParallelTensor).shards[i]));
+    }
+  }
+
   async synchronizeAsync(): Promise<void> {
     await Promise.all(this.devices.map(device => device.synchronizeAsync()));
     for (const group of this.p2pGroups.values()) group.onSynchronized();

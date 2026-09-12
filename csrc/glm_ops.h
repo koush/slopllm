@@ -139,6 +139,8 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const 
                        const int32_t* kv_token_indptr);
 
 void glm_fill(GlmCtx* ctx, void* out, float value, int n);
+// Up to eight device ranges, issued concurrently within one bounded grid.
+void glm_prefetch_l2(GlmCtx* ctx, const void* const* data, const size_t* bytes, int count);
 
 void glm_gather(GlmCtx* ctx, void* out, const void* input, const int* indices,
                 int k, int in_dim, int batch, int elem_size);

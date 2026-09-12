@@ -6,8 +6,42 @@
 #include <cuda/barrier>
 #include <cuda/ptx>
 #include <cstdio>
+#include <algorithm>
 
 namespace cg = cooperative_groups;
+
+// Passed by value so captured launches need no temporary pointer/size buffers.
+struct PrefetchL2Inputs {
+    const char* data[8];
+    size_t bytes[8];
+};
+
+// Interleave CTAs across tensors: issuance for later tensors need not wait for
+// earlier tensors' grids. The total budget stays bounded at 32 CTAs.
+__global__ void prefetch_l2_kernel(PrefetchL2Inputs inputs, int count) {
+    const int tensor = blockIdx.x % count;
+    const int blocks = (gridDim.x - 1 - tensor) / count + 1;
+    const size_t stride = size_t(blocks) * blockDim.x * 32;
+    for (size_t offset = (size_t(blockIdx.x / count) * blockDim.x + threadIdx.x) * 32;
+         offset < inputs.bytes[tensor]; offset += stride) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(inputs.data[tensor] + offset) : "memory");
+    }
+}
+
+void glm_prefetch_l2(GlmCtx* ctx, const void* const* data, const size_t* bytes, int count) {
+    PrefetchL2Inputs inputs{};
+    int used = 0;
+    size_t blocks = 0;
+    for (int i = 0; i < count; i++) {
+        if (!bytes[i]) continue;
+        inputs.data[used] = static_cast<const char*>(data[i]);
+        inputs.bytes[used++] = bytes[i];
+        blocks = std::min(size_t(32), blocks + (bytes[i] - 1) / (256 * 32) + 1);
+    }
+    if (!used) return;
+    cudaSetDevice(ctx->device_id);
+    prefetch_l2_kernel<<<blocks, 256, 0, GLM_STREAM(ctx)>>>(inputs, used);
+}
 
 #define CUBLAS(ctx) (*reinterpret_cast<cublasHandle_t*>(&(ctx)->cublas_handle))
 

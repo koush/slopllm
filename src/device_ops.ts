@@ -80,6 +80,8 @@ export interface DeviceOps extends Disposable {
   readonly activeStreams: readonly number[];
   availableStreams: number[];
   withStream<T>(fn: () => T): Disposable & { streamId: number, result: T, streamWaitEvent(): void, synchronize(): void };
+  /** Best-effort L2 warming of up to eight local tensor ranges in one grid. */
+  prefetchL2(tensors: readonly Tensor[]): void;
 
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
 

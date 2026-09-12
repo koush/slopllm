@@ -331,6 +331,9 @@ export class MetaOps implements DeviceOps {
         notifySynchronizedWorkspaces(this.synchronizeListeners);
     }
 
+    prefetchL2(_tensors: readonly Tensor[]): void {
+    }
+
     async synchronizeAsync(): Promise<void> {
         notifySynchronizedWorkspaces(this.synchronizeListeners);
     }
