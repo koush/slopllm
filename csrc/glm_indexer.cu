@@ -603,6 +603,28 @@ __global__ void idx_radix_hist_split_kernel(
         atomicAdd(scratch + (size_t)row * IDX_SCRATCH_I32 + threadIdx.x, count);
 }
 
+// Exclusive descending prefix count for one histogram bucket per thread.
+// All 256 threads participate; integer sums preserve exact cutoff/tie semantics.
+static __device__ __forceinline__ int idx_radix_count_above(int count) {
+    __shared__ int warpTotals[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    int inclusive = count;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int preceding = __shfl_up_sync(0xffffffff, inclusive, offset);
+        if (lane >= offset) inclusive += preceding;
+    }
+    if (lane == 31) warpTotals[warp] = inclusive;
+    __syncthreads();
+    int above = inclusive - count;
+#pragma unroll
+    for (int w = 0; w < 8; w++) {
+        if (w < warp) above += warpTotals[w];
+    }
+    return above;
+}
+
 // Resolve the high-byte bucket, initialize outputs, and clear the compact
 // histogram for reuse by the low-byte pass.
 __global__ void idx_radix_high_threshold_kernel(
@@ -636,18 +658,14 @@ __global__ void idx_radix_high_threshold_kernel(
         out_scores[(size_t)row * topk + i] = neg_inf;
     }
     int32_t* hist = scratch + (size_t)row * IDX_SCRATCH_I32;
-    if (threadIdx.x == 0) {
-        int above = 0;
-        for (int bucket = IDX_RADIX_BUCKETS - 1; bucket >= 0; bucket--) {
-            if (above + hist[bucket] >= topk) {
-                m[0] = bucket;
-                m[1] = above;
-                break;
-            }
-            above += hist[bucket];
-        }
-        m[2] = 0; m[3] = 0;
+    const int bucket = IDX_RADIX_BUCKETS - 1 - threadIdx.x;
+    const int count = hist[bucket];
+    const int above = idx_radix_count_above(count);
+    if (above < topk && above + count >= topk) {
+        m[0] = bucket;
+        m[1] = above;
     }
+    if (threadIdx.x == 0) { m[2] = 0; m[3] = 0; }
     __syncthreads();
     hist[threadIdx.x] = 0;
 }
@@ -658,22 +676,25 @@ __global__ void idx_radix_low_threshold_kernel(
 ) {
     const int row = blockIdx.x;
     const int len = row_len ? row_len[row] : stride;
-    if (len <= topk || threadIdx.x != 0) return;
+    if (len <= topk) return;
 
     int32_t* m = meta + (size_t)row * 4;
-    const int high = m[0];
-    int numAbove = m[1];
-    const int32_t* hist = scratch + (size_t)row * IDX_SCRATCH_I32;
-    int tau = high << 8;
-    for (int bucket = IDX_RADIX_BUCKETS - 1; bucket >= 0; bucket--) {
-        if (numAbove + hist[bucket] >= topk) {
-            tau |= bucket;
-            break;
-        }
-        numAbove += hist[bucket];
+    __shared__ int highState[2];
+    if (threadIdx.x == 0) {
+        highState[0] = m[0];
+        highState[1] = m[1];
     }
-    m[0] = tau;
-    m[1] = topk - numAbove;
+    __syncthreads();
+    const int high = highState[0];
+    const int highAbove = highState[1];
+    const int32_t* hist = scratch + (size_t)row * IDX_SCRATCH_I32;
+    const int bucket = IDX_RADIX_BUCKETS - 1 - threadIdx.x;
+    const int count = hist[bucket];
+    const int numAbove = highAbove + idx_radix_count_above(count);
+    if (numAbove < topk && numAbove + count >= topk) {
+        m[0] = (high << 8) | bucket;
+        m[1] = topk - numAbove;
+    }
 }
 
 // Gather pass A: per-block candidate counts.
@@ -909,7 +930,7 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
             (const __nv_bfloat16*)scores, stride, topk, cpWorldSize, cpRank);
         idx_radix_hist_split_kernel<true><<<grid, 256, 0, stream>>>(
             (const __nv_bfloat16*)scores, row_len, hist, meta, stride, topk);
-        idx_radix_low_threshold_kernel<<<batch, 32, 0, stream>>>(
+        idx_radix_low_threshold_kernel<<<batch, 256, 0, stream>>>(
             hist, meta, row_len, stride, topk);
     }
     idx_gather_count_kernel<<<grid, IDX_GATHER_THREADS, 0, stream>>>(
