@@ -16,6 +16,58 @@ export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
 export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
 
+// One persistent allocation pair per plan slot. Reuse matching views as well:
+// rebuilding every per-GPU view and pinned Buffer would add hot-path GC work.
+class StateBuffers {
+  private readonly device: Tensor;
+  private readonly host: Tensor;
+  private readonly views: { offset: number; count: number; pair: [Tensor, Tensor] }[] = [];
+  private viewIndex = 0;
+  private offset = 0;
+
+  constructor(ws: ExecutionWorkspace, slot: number, capacity: number) {
+    this.device = ws.ensureAlloc([capacity], "I32", `stateBuffers:${slot}`);
+    this.host = ws.ensureAllocPinned([capacity], "I32", `stateBuffersH:${slot}`);
+  }
+
+  reset(): void {
+    this.viewIndex = 0;
+    this.offset = 0;
+  }
+
+  private getViews(offset: number, count: number): [Tensor, Tensor] {
+    if (offset + count > this.device.numElements) {
+      throw new Error("Planning metadata exceeds workspace capacity");
+    }
+    const index = this.viewIndex++;
+    const existing = this.views[index];
+    if (existing?.offset === offset && existing.count === count
+        && existing.pair.every(view => !view.disposed)) return existing.pair;
+    if (existing) for (const view of existing.pair) view[Symbol.dispose]();
+    const device = this.device.narrow(offset, count);
+    const host = this.host.narrow(offset, count);
+    // These views are slot-owned, not forward temporaries. In particular,
+    // ParallelTensor.narrow registers its composite result for tracking.
+    device.workspace.tracked.delete(device);
+    host.workspace.tracked.delete(host);
+    const pair: [Tensor, Tensor] = [device, host];
+    this.views[index] = { offset, count, pair };
+    return pair;
+  }
+
+  alloc(count: number): [Tensor, Tensor] {
+    const pair = this.getViews(this.offset, count);
+    this.offset += count;
+    return pair;
+  }
+
+  upload(inputTokens: number): void {
+    // Input IDs are supplied after planning, by setInput (possibly GPU-to-GPU).
+    const [device, host] = this.getViews(inputTokens, this.offset - inputTokens);
+    device.memcpy(host, device.bytes, MemcpyKind.HostToDevice);
+  }
+}
+
 export interface ExecutionPhase<T = TensorTree> {
   readonly states: readonly ExecutionState[];
   readonly inputs: { [name: string]: Tensor };
@@ -101,7 +153,7 @@ export class ExecutionState {
   paddedKvLenInvariant = true;
   private readonly paddedKvLen: number;
 
-  // Per-state buffers (allocated via ensureAlloc with slot-suffixed names).
+  // Per-state buffers (backed by persistent slot-suffixed allocations).
   // Each plan call gets a unique slot so that plan1+plan2+run1+run2 is safe:
   // host pinned writes are not stream-ordered, so sharing a single host buffer
   // across plans would race. Device buffers also need to be per-state because
@@ -134,11 +186,13 @@ export class ExecutionState {
   mlaBatchIndicesH!: Tensor;
   indices!: Tensor;
   indicesH!: Tensor;
+  private readonly buffers: StateBuffers;
 
   constructor(
     public readonly model: ChatModel,
     public readonly batchSize: number, public readonly totalTokens: number, public readonly seqLens: number[],
     public readonly isDecode: boolean, public readonly ws: ExecutionWorkspace, public readonly cache: ChatCache,
+    slot: number,
     public readonly customMask?: {
       indptr: Tensor;
       mask: Tensor;
@@ -149,6 +203,35 @@ export class ExecutionState {
   ) {
     const totalKvLen = cache.getPagedKV().sequences.reduce((sum, s) => sum + s.allocLen, 0);
     this.paddedKvLen = ExecutionState.getPaddedKvLen(totalKvLen);
+
+    const s = (name: string) => `${name}:${slot}`;
+    // FlashInfer scratch and host-only plan records are not metadata uploads.
+    this.intWs = ws.ensureAlloc([BATCH_INT_WS_SIZE], "U8", s("intWs"));
+    this.intWsH = ws.ensureAllocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", s("intWsH"));
+    this.decodePlanInfo = ws.ensureAllocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", s("decodePlanInfo"));
+    this.prefillPlanInfo = ws.ensureAllocPinned([PREFILL_PLAN_INFO_SIZE * 8], "U8", s("prefillPlanInfo"));
+    this.mlaPrefillPlanInfo = ws.ensureAllocPinned([MLA_PREFILL_PLAN_INFO_SIZE * 8], "U8", s("mlaPrefillPlanInfo"));
+    this.mlaDecodePlanInfo = ws.ensureAllocPinned([MLA_DECODE_PLAN_INFO_SIZE * 8], "U8", s("mlaDecodePlanInfo"));
+
+    this.buffers = ws.getStateBuffers(slot, cache.getPagedKV().maxPages);
+    [this.inputIdsBuf, this.inputIdsBufH] = this.buffers.alloc(totalTokens);
+    [this.positionIds, this.positionIdsH] = this.buffers.alloc(totalTokens);
+    [this.qoIndptrD, this.qoIndptrH] = this.buffers.alloc(batchSize + 1);
+    [this.slotMapping, this.slotMappingH] = this.buffers.alloc(totalTokens);
+    [this.indptrD, this.indptrH] = this.buffers.alloc(batchSize + 1);
+    [this.lastPageLen, this.lastPageLenH] = this.buffers.alloc(batchSize);
+    [this.globalLastPageLen, this.globalLastPageLenH] = this.buffers.alloc(batchSize);
+    [this.kvLenD, this.kvLenH] = this.buffers.alloc(batchSize);
+    [this.kvTokenIndptrD, this.kvTokenIndptrH] = this.buffers.alloc(batchSize + 1);
+    [this.mlaBatchIndices, this.mlaBatchIndicesH] = this.buffers.alloc(totalTokens);
+    // KV page count changes without changing the graph key. Keep this LAST so
+    // it never shifts another pointer; batchSize/totalTokens are in the key.
+    const usedPages = cache.getPagedKV().sequences.reduce((sum, sequence) => sum + sequence.contentPages, 0);
+    [this.indices, this.indicesH] = this.buffers.alloc(usedPages);
+  }
+
+  uploadPlan(): void {
+    this.buffers.upload(this.totalTokens);
   }
 
   private static getPaddedKvLen(totalKvLen: number): number {
@@ -309,12 +392,18 @@ export class ExecutionState {
 
   setInput(tokenIds: number[][] | Tensor) {
     if (tokenIds instanceof Tensor) {
+      if (tokenIds.bytes > this.inputIdsBuf.bytes) {
+        throw new Error("setInput: input exceeds planned token count");
+      }
       this.input = this.inputIdsBuf;
       if (tokenIds !== this.inputIdsBuf) {
         this.input.memcpy(tokenIds, tokenIds.bytes, MemcpyKind.DeviceToDevice);
       }
     }
     else {
+      if (tokenIds.reduce((sum, ids) => sum + ids.length, 0) > this.totalTokens) {
+        throw new Error("setInput: input exceeds planned token count");
+      }
       this.inputIdsBufH.withPinnedBuffer(buf => {
         let idsOff = 0;
         for (const ids of tokenIds) {
@@ -423,6 +512,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   readonly maxBatch: number;
   readonly maxSeqLen: number;
   private planSlot = 0;
+  private readonly stateBuffers: StateBuffers[] = [];
 
   constructor(glm: DeviceOps, B: number, S: number) {
     super(glm);
@@ -463,38 +553,13 @@ export class ExecutionWorkspace extends WorkspaceBase {
       return this.planSlot++;
   }
 
-  private allocStateBuffers(state: ExecutionState, slot: number, B: number, S: number): void {
-    const s = (name: string) => `${name}:${slot}`;
-
-    state.intWs = this.ensureAlloc([BATCH_INT_WS_SIZE], "U8", s("intWs"));
-    state.intWsH = this.ensureAllocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", s("intWsH"));
-    state.decodePlanInfo = this.ensureAllocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", s("decodePlanInfo"));
-    state.prefillPlanInfo = this.ensureAllocPinned([PREFILL_PLAN_INFO_SIZE * 8], "U8", s("prefillPlanInfo"));
-    state.mlaPrefillPlanInfo = this.ensureAllocPinned([MLA_PREFILL_PLAN_INFO_SIZE * 8], "U8", s("mlaPrefillPlanInfo"));
-    state.mlaDecodePlanInfo = this.ensureAllocPinned([MLA_DECODE_PLAN_INFO_SIZE * 8], "U8", s("mlaDecodePlanInfo"));
-
-    state.positionIds = this.ensureAlloc([B * S], "I32", s("positionIds"));
-    state.positionIdsH = this.ensureAllocPinned([B * S], "I32", s("positionIdsH"));
-    state.inputIdsBuf = this.ensureAlloc([B * S], "I32", s("inputIdsBuf"));
-    state.inputIdsBufH = this.ensureAllocPinned([B * S], "I32", s("inputIdsBufH"));
-    state.qoIndptrD = this.ensureAlloc([B + 1], "I32", s("qoIndptrD"));
-    state.qoIndptrH = this.ensureAllocPinned([B + 1], "I32", s("qoIndptrH"));
-    state.slotMapping = this.ensureAlloc([B * S], "I32", s("slotMapping"));
-    state.slotMappingH = this.ensureAllocPinned([B * S], "I32", s("slotMappingH"));
-    state.indptrD = this.ensureAlloc([(B + 1) * I32], "I32", s("indptrD"));
-    state.indptrH = this.ensureAllocPinned([(B + 1) * I32], "I32", s("indptrH"));
-    state.lastPageLen = this.ensureAlloc([B * I32], "I32", s("lastPageLen"));
-    state.lastPageLenH = this.ensureAllocPinned([B], "I32", s("lastPageLenH"));
-    state.globalLastPageLen = this.ensureAlloc([B * I32], "I32", s("globalLastPageLen"));
-    state.globalLastPageLenH = this.ensureAllocPinned([B], "I32", s("globalLastPageLenH"));
-    state.kvLenH = this.ensureAllocPinned([B], "I32", s("kvLenH"));
-    state.kvLenD = this.ensureAlloc([B], "I32", s("kvLenD"));
-    state.kvTokenIndptrH = this.ensureAllocPinned([(B + 1) * I32], "I32", s("kvTokenIndptrH"));
-    state.kvTokenIndptrD = this.ensureAlloc([(B + 1) * I32], "I32", s("kvTokenIndptrD"));
-    state.mlaBatchIndices = this.ensureAlloc([B * S], "I32", s("mlaBatchIndices"));
-    state.mlaBatchIndicesH = this.ensureAllocPinned([B * S], "I32", s("mlaBatchIndicesH"));
-    state.indices = this.ensureAlloc([B * S], "I32", s("indices"));
-    state.indicesH = this.ensureAllocPinned([B * S], "I32", s("indicesH"));
+  getStateBuffers(slot: number, maxPages: number): StateBuffers {
+    // Shared prefixes can repeat a physical page once per sequence.
+    const capacity = 4 * this.maxBatch * this.maxSeqLen + 6 * this.maxBatch + 3
+      + this.maxBatch * Math.max(this.maxSeqLen, maxPages);
+    const buffers = this.stateBuffers[slot] ??= new StateBuffers(this, slot, capacity);
+    buffers.reset();
+    return buffers;
   }
 
   flashDecode(state: ExecutionState, query: Tensor, cacheIdx: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
@@ -628,12 +693,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
 
     const slot = this.nextPlanSlot();
-    const state = new ExecutionState(model, batchSize, totalTokens, seqLens, true, this, cache);
-    this.allocStateBuffers(state, slot, this.maxBatch, this.maxSeqLen);
-
     for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
       pagedKV.allocDecodeToken(seqIdx);
     }
+    const state = new ExecutionState(model, batchSize, totalTokens, seqLens, true, this, cache, slot);
 
     state.positionIdsH.withPinnedBuffer(buf => {
       for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -656,11 +719,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
       state.mlaBatchIndicesH.withPinnedBuffer(buf => {
         for (let i = 0; i < batchSize; i++) buf.writeInt32LE(i, i * I32);
       });
-      state.mlaBatchIndices.memcpy(state.mlaBatchIndicesH, batchSize * I32, MemcpyKind.HostToDevice);
       state.qoIndptrH.withPinnedBuffer(buf => {
         for (let i = 0; i <= batchSize; i++) buf.writeInt32LE(i, i * I32);
       });
-      state.qoIndptrD.memcpy(state.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
       const seqKvLens = pagedKV.sequences.map(sequence => sequence.allocLen);
       if (pagedKV.sparseMode) {
         this.glm.sparseMlaDecodePlan(
@@ -698,16 +759,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       );
     }
 
-    const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.contentPages, 0);
-    state.positionIds.memcpy(state.positionIdsH, batchSize * I32, MemcpyKind.HostToDevice);
-    state.indices.memcpy(state.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
-    state.indptrD.memcpy(state.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-    state.lastPageLen.memcpy(state.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
-    state.globalLastPageLen.memcpy(state.globalLastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
-    state.kvTokenIndptrD.memcpy(state.kvTokenIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-    if (!cfg.kvLoraRank) {
-      state.slotMapping.memcpy(state.slotMappingH, batchSize * I32, MemcpyKind.HostToDevice);
-    }
+    state.uploadPlan();
 
     return state;
   }
@@ -751,8 +803,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     }
 
     const slot = this.nextPlanSlot();
-    const state = new ExecutionState(model, batchSize, totalTokens, seqLens, false, this, cache, customMask);
-    this.allocStateBuffers(state, slot, this.maxBatch, this.maxSeqLen);
+    const state = new ExecutionState(model, batchSize, totalTokens, seqLens, false, this, cache, slot, customMask);
 
     state.qoIndptrH.withPinnedBuffer(buf => {
       buf.writeInt32LE(0, 0);
@@ -772,7 +823,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
         }
       }
     });
-    state.positionIds.memcpy(state.positionIdsH, totalTokens * I32, MemcpyKind.HostToDevice);
 
     state.kvLenH.withPinnedBuffer(buf => {
       for (let i = 0; i < batchSize; i++) {
@@ -819,8 +869,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
           }
         }
       });
-      state.mlaBatchIndices.memcpy(state.mlaBatchIndicesH, totalTokens * I32, MemcpyKind.HostToDevice);
-      state.qoIndptrD.memcpy(state.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     } else {
       this.glm.batchPrefillPagedPlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
@@ -846,18 +894,9 @@ export class ExecutionWorkspace extends WorkspaceBase {
           }
         }
       });
-      state.slotMapping.memcpy(state.slotMappingH, totalTokens * I32, MemcpyKind.HostToDevice);
-      state.qoIndptrD.memcpy(state.qoIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
     }
 
-    const usedPages = pagedKV.sequences.reduce((sum, s) => sum + s.contentPages, 0);
-    state.indices.memcpy(state.indicesH, usedPages * I32, MemcpyKind.HostToDevice);
-    state.indptrD.memcpy(state.indptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
-    state.lastPageLen.memcpy(state.lastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
-    state.globalLastPageLen.memcpy(state.globalLastPageLenH, batchSize * I32, MemcpyKind.HostToDevice);
-
-    state.kvLenD.memcpy(state.kvLenH, batchSize * I32, MemcpyKind.HostToDevice);
-    state.kvTokenIndptrD.memcpy(state.kvTokenIndptrH, (batchSize + 1) * I32, MemcpyKind.HostToDevice);
+    state.uploadPlan();
 
     return state;
   }

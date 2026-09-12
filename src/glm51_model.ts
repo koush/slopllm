@@ -868,7 +868,7 @@ export class Glm51Model extends ChatModel {
 
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
       const oProj = this.tensors.get(`${pfx}.o_proj.weight`)!;
-      if (BS <= 8 && process.env.GLM_L2_PREFETCH !== "0") {
+      if (BS <= 32 && process.env.GLM_L2_PREFETCH !== "0") {
         prefetchL2.replace(this.glm.withStream(() => this.glm.prefetchL2([oProj])));
       }
       using vExpanded = attnOut.mlaVExpand(vProj, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);

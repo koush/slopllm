@@ -128,7 +128,8 @@ export abstract class Tensor implements Disposable {
     if (this.data === 0) {
       throw new Error("Tensor has no data");
     }
-    this.pinnedBuffer ||= getNativeAddon().hostPointerToBuffer(this.data, this.allocSize);
+    // A view may have more backing capacity than its logical byte range.
+    this.pinnedBuffer ||= getNativeAddon().hostPointerToBuffer(this.data, this.bytes);
     fn(this.pinnedBuffer);
   }
 
@@ -139,7 +140,7 @@ export abstract class Tensor implements Disposable {
     if (this.data === 0) {
       throw new Error("Tensor has no data");
     }
-    this.pinnedBuffer ||= getNativeAddon().hostPointerToBuffer(this.data, this.allocSize);
+    this.pinnedBuffer ||= getNativeAddon().hostPointerToBuffer(this.data, this.bytes);
     return this.pinnedBuffer;
   }
 
