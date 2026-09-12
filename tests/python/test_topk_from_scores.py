@@ -143,6 +143,33 @@ def test_topk_from_scores_long_stride_short_row(glm, device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("topk", [1, 2048, 32768])
+@pytest.mark.parametrize("masked", [False, True])
+def test_parallel_cutoff_full_bf16_bucket_range(glm, device, topk, masked):
+    """Cross warp/bucket boundaries, including signed zero and infinities."""
+    raw = torch.arange(65536, device=device, dtype=torch.int32).to(torch.int16)
+    row = raw.view(torch.bfloat16)
+    row = torch.where(torch.isnan(row), -float('inf'), row)
+    scores = torch.stack([row, row.roll(7919), row.flip(0)])
+    lengths = [0, min(731, topk), 65536] if masked else None
+    # A one-split invocation without device lengths uses the independent
+    # single-CTA radix implementation as an exact ordered-output reference.
+    if masked:
+        for r, length in enumerate(lengths):
+            reference_idx, reference_val = _select_with_scores(
+                glm, scores[r:r+1, :max(1, length)].contiguous(),
+                [length] if length == 0 else None, topk, 1)
+            idx, val = _select_with_scores(glm, scores[r:r+1], [length], topk, 64)
+            assert torch.equal(idx, reference_idx)
+            assert torch.equal(val.view(torch.int16), reference_val.view(torch.int16))
+    else:
+        reference_idx, reference_val = _select_with_scores(glm, scores, None, topk, 1)
+        idx, val = _select_with_scores(glm, scores, None, topk, 64)
+        assert torch.equal(idx, reference_idx)
+        assert torch.equal(val.view(torch.int16), reference_val.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_topk_from_scores_perf(glm, device):
     """Throughput at 200k context, batch 1 (the decode-critical case)."""
     N, topk, batch = 200000, 2048, 1
