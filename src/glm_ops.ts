@@ -50,23 +50,85 @@ function ptr(t: Tensor | undefined): number {
 
 
 export class GlmTensor extends Tensor {
+  private disposalPending = false;
   constructor(workspace: WorkspaceBase, public readonly glm: GlmOps, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean, view: GlmTensor | undefined, recycleKey: HeapKey | null = null) {
     super(workspace, data, allocSize, shape, type, name, pinned, view, recycleKey);
   }
 
   [Symbol.dispose](): void {
+    if (!this.canDispose()) {
+      return;
+    }
+    if (this.disposalPending) {
+      // Explicit workspace cleanup can forcibly clear outstanding views.
+      // Repeated ordinary disposal must not transfer a pending request.
+      if (!this.view && !this.views.size) {
+        this.finishDispose();
+      }
+      return;
+    }
+    if (this.view) {
+      const pending = this.glm.getStreamResources(this.glm.currentStream).disposedViews;
+      const root = this.view as GlmTensor;
+      this.disposalPending = true;
+      // An unrelated live root needs only an enqueue. Do not rescan other
+      // pending clones on every layer that releases a view of shared state.
+      if (!pending.has(root) && !root.disposed && root.name === undefined && !root.captured) {
+        pending.add(this);
+        return;
+      }
+      this.releaseDisposedView();
+      if (pending.has(root) && !root.views.size && root.canDispose()) {
+        pending.delete(root);
+        root.finishDispose();
+      }
+      return;
+    }
+    if (this.views.size) {
+      const pending = this.glm.getStreamResources(this.glm.currentStream).disposedViews;
+      this.disposalPending = true;
+      pending.add(this);
+      // Only this root's references can become eligible from its disposal.
+      // References pending on other streams must remain until a join.
+      for (const tensor of this.views) {
+        const view = tensor as GlmTensor;
+        if (pending.has(view)) {
+          view.releaseDisposedView();
+          pending.delete(view);
+        }
+      }
+      if (!this.views.size) {
+        pending.delete(this);
+        this.finishDispose();
+      }
+      return;
+    }
+    this.finishDispose();
+  }
+
+  finishDispose(): void {
     if (this.canDispose() && this.recycleKey === null && this.glm.currentStream !== 0) {
       let resources = this.glm.streamResources.get(this.glm.currentStream);
       if (!resources) {
         resources = {
           workspaces: new Set<WorkspaceBase>(),
           joined: [],
+          disposedViews: new Set<GlmTensor>(),
         };
         this.glm.streamResources.set(this.glm.currentStream, resources);
       }
       resources.workspaces.add(this.workspace);
     }
     super[Symbol.dispose]();
+  }
+
+  releaseDisposedView(): void {
+    // Do not use Tensor's view branch: its unconditional parent retry ignores
+    // which stream owns the parent's pending disposal request.
+    this.view!.views.delete(this);
+    this.disposed = true;
+    this.workspace.tracked.delete(this);
+    this.workspace.staged.delete(this);
   }
 
   free(): void {
@@ -910,9 +972,9 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().specRejectLinear(this.ctx, outTokens.data, outAccepted.data, draftTokens.data, qProbs.data, qIds.data, pProbs.data, pIds.data, stepCounter.data, batchSize, depth, capacity);
   }
 
-  synchronize(): void {
-    getNativeAddon().synchronize(this.ctx);
-    notifySynchronizedWorkspaces(this.synchronizeListeners);
+  synchronize(streamIdx?: number): void {
+    getNativeAddon().synchronize(this.ctx, streamIdx);
+    this.completeDeviceSynchronization();
   }
 
   prefetchL2(tensors: readonly Tensor[]): void {
@@ -926,23 +988,99 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().prefetchL2(this.ctx, tensors.map(tensor => tensor.data), tensors.map(tensor => tensor.bytes));
   }
 
-  async synchronizeAsync(): Promise<void> {
-    await getNativeAddon().synchronizeAsync(this.ctx);
+  async synchronizeAsync(streamIdx?: number): Promise<void> {
+    await getNativeAddon().synchronizeAsync(this.ctx, streamIdx);
+    this.completeDeviceSynchronization();
+  }
+
+  private completeDeviceSynchronization() {
+    // Captured decode usually has no outstanding lexical stream resources.
+    // Avoid constructing an empty stream-0 record on every synchronization.
+    if (!this.streamResources.size) {
+      notifySynchronizedWorkspaces(this.synchronizeListeners);
+      return;
+    }
+    // Intentionally retain device-wide cleanup, although the native wait is
+    // stream-specific. Narrowing this cleanup is a separate lifecycle change.
+    // Merge disposal requests before reconciling roots, including stream 0.
+    const destination = this.getStreamResources(this.currentStream);
+    for (const resources of this.streamResources.values()) {
+      if (resources === destination) {
+        continue;
+      }
+      for (const tensor of resources.disposedViews) {
+        destination.disposedViews.add(tensor);
+      }
+      resources.disposedViews.clear();
+    }
+    this.reconcileDisposedViews(true);
+    let releasedStreams = false;
+    for (const [stream, resources] of this.streamResources) {
+      resources.workspaces.clear();
+      // Only disposed descendants can be released. A live handle's own ID
+      // must stay reserved so subsequent waits still refer to its event.
+      for (const id of resources.joined) {
+        if (id === stream) {
+          continue;
+        }
+        this.availableStreams.push(id);
+        releasedStreams = true;
+      }
+      resources.joined = resources.joined.filter(id => id === stream);
+    }
+    if (releasedStreams) {
+      this.availableStreams.sort((a, b) => a - b);
+    }
+    // Reconciliation may have recycled additional roots: promote heaps and
+    // pinned allocations only after it, and only after successful native sync.
     notifySynchronizedWorkspaces(this.synchronizeListeners);
-  }
-
-  synchronizeStream(streamIdx: number): void {
-    getNativeAddon().synchronizeStream(this.ctx, streamIdx);
-  }
-
-  synchronizeStreamAsync(streamIdx: number): Promise<void> {
-    return getNativeAddon().synchronizeStreamAsync(this.ctx, streamIdx);
+    const main = this.streamResources.get(0);
+    if (main && !main.disposedViews.size) {
+      this.streamResources.delete(0);
+    }
   }
 
   streamResources = new Map<number, {
     workspaces: Set<WorkspaceBase>
     joined: number[];
+    disposedViews: Set<GlmTensor>;
   }>();
+
+  getStreamResources(stream: number) {
+    let resources = this.streamResources.get(stream);
+    if (!resources) {
+      resources = {
+        workspaces: new Set<WorkspaceBase>(),
+        joined: [],
+        disposedViews: new Set<GlmTensor>(),
+      };
+      this.streamResources.set(stream, resources);
+    }
+    return resources;
+  }
+
+  reconcileDisposedViews(deviceCompleted = false) {
+    const pending = this.getStreamResources(this.currentStream).disposedViews;
+    // Roots are flattened by Tensor's constructor. One pass removes eligible
+    // views; the second finalizes roots regardless of insertion/disposal order.
+    for (const tensor of pending) {
+      if (tensor.disposed) {
+        pending.delete(tensor);
+        continue;
+      }
+      const root = tensor.view as GlmTensor | undefined;
+      if (root && (deviceCompleted || pending.has(root) || root.disposed || root.name !== undefined || root.captured)) {
+        tensor.releaseDisposedView();
+        pending.delete(tensor);
+      }
+    }
+    for (const tensor of pending) {
+      if (!tensor.view && !tensor.views.size && tensor.canDispose()) {
+        pending.delete(tensor);
+        tensor.finishDispose();
+      }
+    }
+  }
   setStream(streamIdx: number): void {
     getNativeAddon().setStream(this.ctx, streamIdx);
     this.activeStreams[this.activeStreams.length - 1] = streamIdx;
@@ -968,28 +1106,39 @@ export class GlmOps implements DeviceOps {
 
   availableStreams = Array.from({ length: 63 }, (_, i) => i + 1);
   disposeStreamResources(stream: number, destinationStream = this.currentStream) {
-    if (stream === destinationStream)
+    if (stream === destinationStream) {
       return;
+    }
     const resources = this.streamResources.get(stream);
-    if (!resources)
+    if (!resources) {
       throw new Error(`No resources found for stream ${stream}. Was it already disposed?`);
+    }
     // A completion wait also orders the destination after disposed descendants.
     // Promote those queues now, but keep this handle's own stream reserved until
     // lexical/explicit disposal so its completion event cannot be reused early.
     const joined = resources.joined.filter(id => id !== stream);
-    let destinationResources: typeof resources | undefined;
-    if (destinationStream !== 0 && (resources.workspaces.size || joined.length)) {
-      destinationResources = this.streamResources.get(destinationStream);
-      if (!destinationResources) {
-        destinationResources = { workspaces: new Set<WorkspaceBase>(), joined: [] };
-        this.streamResources.set(destinationStream, destinationResources);
-      }
-    }
+    const destinationResources = this.getStreamResources(destinationStream);
     for (const workspace of resources.workspaces) {
       workspace.disposeStream(stream, destinationStream);
-      destinationResources?.workspaces.add(workspace);
+      destinationResources.workspaces.add(workspace);
     }
     resources.workspaces.clear();
+    for (const tensor of resources.disposedViews) {
+      destinationResources.disposedViews.add(tensor);
+    }
+    resources.disposedViews.clear();
+    // Final allocation recycling must use the stream that acquired the wait.
+    const switchStream = destinationStream !== this.currentStream;
+    if (switchStream) {
+      this.pushStream(destinationStream);
+    }
+    try {
+      this.reconcileDisposedViews();
+    } finally {
+      if (switchStream) {
+        this.popStream(destinationStream);
+      }
+    }
     if (joined.length) {
       if (destinationStream === 0) {
         this.availableStreams.push(...joined);
@@ -1003,13 +1152,18 @@ export class GlmOps implements DeviceOps {
   }
 
   disposeStream(stream: number) {
-    // Correct callers transfer at the wait edge. This fallback prevents pools
-    // from being stranded when a stream handle is disposed without a wait.
+    // Handle disposal without an explicit join must establish ordering before
+    // transferring heaps or pending references. Joined handles have empty queues.
+    const pending = this.streamResources.get(stream);
+    if (pending && (pending.workspaces.size || pending.disposedViews.size || pending.joined.some(id => id !== stream))) {
+      getNativeAddon().streamWaitEvent(this.ctx, this.currentStream, stream);
+    }
     this.disposeStreamResources(stream);
 
     const resources = this.streamResources.get(stream);
-    if (!resources)
+    if (!resources) {
       throw new Error(`No resources found for stream ${stream}. Was it already disposed?`);
+    }
     this.streamResources.delete(stream);
     const destinationStream = this.currentStream;
     if (destinationStream === 0) {
@@ -1019,7 +1173,11 @@ export class GlmOps implements DeviceOps {
     else {
       let destinationResources = this.streamResources.get(destinationStream);
       if (!destinationResources) {
-        destinationResources = { workspaces: new Set<WorkspaceBase>(), joined: [] };
+        destinationResources = {
+          workspaces: new Set<WorkspaceBase>(),
+          joined: [],
+          disposedViews: new Set<GlmTensor>(),
+        };
         this.streamResources.set(destinationStream, destinationResources);
       }
       destinationResources.joined.push(...resources.joined);
@@ -1061,6 +1219,7 @@ export class GlmOps implements DeviceOps {
     this.streamResources.set(stream, {
       workspaces: new Set<WorkspaceBase>(),
       joined: [stream],
+      disposedViews: new Set<GlmTensor>(),
     });
     return stream;
   }
@@ -1099,9 +1258,10 @@ export class GlmOps implements DeviceOps {
       },
       result,
       synchronize: () => {
-        if (disposed)
+        if (disposed) {
           throw new Error(`Stream ${stream} already disposed`);
-        getNativeAddon().synchronizeStream(this.ctx, stream);
+        }
+        this.synchronize(stream);
       },
       streamWaitEvent: () => {
         if (disposed)

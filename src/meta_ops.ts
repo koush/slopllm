@@ -327,22 +327,15 @@ export class MetaOps implements DeviceOps {
     specRejectLinear(outTokens: Tensor, outAccepted: Tensor, draftTokens: Tensor, qProbs: Tensor, qIds: Tensor, pProbs: Tensor, pIds: Tensor, stepCounter: Tensor, batchSize: number, depth: number, capacity: number): void {
     }
 
-    synchronize(): void {
+    synchronize(_streamIdx?: number): void {
         notifySynchronizedWorkspaces(this.synchronizeListeners);
     }
 
     prefetchL2(_tensors: readonly Tensor[]): void {
     }
 
-    async synchronizeAsync(): Promise<void> {
+    async synchronizeAsync(_streamIdx?: number): Promise<void> {
         notifySynchronizedWorkspaces(this.synchronizeListeners);
-    }
-
-    synchronizeStream(streamIdx: number): void {
-    }
-
-    synchronizeStreamAsync(streamIdx: number): Promise<void> {
-        return Promise.resolve();
     }
 
     setStream(streamIdx: number): void {

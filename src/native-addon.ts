@@ -74,11 +74,9 @@ export interface NativeAddon {
   max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
-  synchronize(ctx: number): void;
+  synchronize(ctx: number, streamIdx?: number): void;
   prefetchL2(ctx: number, pointers: number[], sizes: number[]): void;
-  synchronizeAsync(ctx: number): Promise<void>;
-  synchronizeStream(ctx: number, streamIdx: number): void;
-  synchronizeStreamAsync(ctx: number, streamIdx: number): Promise<void>;
+  synchronizeAsync(ctx: number, streamIdx?: number): Promise<void>;
   setStream(ctx: number, streamIdx: number): void;
   eventRecord(ctx: number, eventIdx: number, streamIdx: number): void;
   streamWaitEvent(ctx: number, streamIdx: number, eventIdx: number): void;

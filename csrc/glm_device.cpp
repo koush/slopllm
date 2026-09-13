@@ -229,24 +229,30 @@ void glm_memcpy3d_peer(GlmCtx* ctx,
 // Stream synchronization
 // ---------------------------------------------------------------------------
 
-void glm_synchronize(GlmCtx* ctx) {
-    cudaSetDevice(ctx->device_id);
-    cudaError_t err = cudaStreamSynchronize(ctx->streams[ctx->active_stream]);
+cudaError_t glm_synchronize(GlmCtx* ctx) {
+    cudaError_t err = cudaSetDevice(ctx->device_id);
+    if (err == cudaSuccess) {
+        err = cudaStreamSynchronize(ctx->streams[ctx->active_stream]);
+    }
     if (err != cudaSuccess) {
         fprintf(stderr, "glm_synchronize failed: %s\n", cudaGetErrorString(err));
     }
+    return err;
 }
 
-void glm_synchronize_stream(GlmCtx* ctx, int stream_idx) {
+cudaError_t glm_synchronize_stream(GlmCtx* ctx, int stream_idx) {
     if (stream_idx < 0 || stream_idx >= GLM_MAX_STREAMS) {
         fprintf(stderr, "glm_synchronize_stream: invalid stream index %d\n", stream_idx);
-        return;
+        return cudaErrorInvalidValue;
     }
-    cudaSetDevice(ctx->device_id);
-    cudaError_t err = cudaStreamSynchronize(ctx->streams[stream_idx]);
+    cudaError_t err = cudaSetDevice(ctx->device_id);
+    if (err == cudaSuccess) {
+        err = cudaStreamSynchronize(ctx->streams[stream_idx]);
+    }
     if (err != cudaSuccess) {
         fprintf(stderr, "glm_synchronize_stream failed: %s\n", cudaGetErrorString(err));
     }
+    return err;
 }
 
 void glm_set_stream(GlmCtx* ctx, int stream_idx) {

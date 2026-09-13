@@ -484,9 +484,9 @@ void glm_kv_cache_write(GlmCtx* ctx,
                          uint32_t src_k_token_stride, uint32_t src_k_head_stride,
                          uint32_t src_v_token_stride, uint32_t src_v_head_stride);
 
-void glm_synchronize(GlmCtx* ctx);
+cudaError_t glm_synchronize(GlmCtx* ctx);
 
-void glm_synchronize_stream(GlmCtx* ctx, int stream_idx);
+cudaError_t glm_synchronize_stream(GlmCtx* ctx, int stream_idx);
 
 void glm_set_stream(GlmCtx* ctx, int stream_idx);
 

@@ -69,10 +69,8 @@ export interface DeviceOps extends Disposable {
   workspaceMemoryStats(workspace: WorkspaceBase): WorkspaceMemoryStats[];
   reclaimWorkspaceMemory(workspace: WorkspaceBase): void;
   deviceHeapStats(): WorkspaceMemoryStats[];
-  synchronize(): void;
-  synchronizeAsync(): Promise<void>;
-  synchronizeStream(streamIdx: number): void;
-  synchronizeStreamAsync(streamIdx: number): Promise<void>;
+  synchronize(streamIdx?: number): void;
+  synchronizeAsync(streamIdx?: number): Promise<void>;
   setStream(streamIdx: number): void;
   eventRecord(eventIdx: number, streamIdx: number): void;
   streamWaitEvent(streamIdx: number, eventIdx: number): void;

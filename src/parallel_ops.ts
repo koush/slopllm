@@ -2990,11 +2990,13 @@ export class ParallelOps implements DeviceOps {
     return this.wrapShards(tensor.workspace, shards, tensor.shape, tensor.type, TensorParallelism.Column, tensor);
   }
 
-  synchronize(): void {
+  synchronize(streamIdx?: number): void {
     for (const device of this.devices) {
-      device.synchronize();
+      device.synchronize(streamIdx);
     }
-    for (const group of this.p2pGroups.values()) group.onSynchronized();
+    for (const group of this.p2pGroups.values()) {
+      group.onSynchronized();
+    }
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
@@ -3010,22 +3012,12 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  async synchronizeAsync(): Promise<void> {
-    await Promise.all(this.devices.map(device => device.synchronizeAsync()));
-    for (const group of this.p2pGroups.values()) group.onSynchronized();
-    notifySynchronizedWorkspaces(this.synchronizeListeners);
-  }
-
-  synchronizeStream(streamIdx: number): void {
-    for (const device of this.devices) {
-      device.synchronizeStream(streamIdx);
+  async synchronizeAsync(streamIdx?: number): Promise<void> {
+    await Promise.all(this.devices.map(device => device.synchronizeAsync(streamIdx)));
+    for (const group of this.p2pGroups.values()) {
+      group.onSynchronized();
     }
-    this.p2pGroups.get(streamIdx)?.onSynchronized();
-  }
-
-  async synchronizeStreamAsync(streamIdx: number): Promise<void> {
-    await Promise.all(this.devices.map(device => device.synchronizeStreamAsync(streamIdx)));
-    this.p2pGroups.get(streamIdx)?.onSynchronized();
+    notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
   availableStreams: number[] = [];
@@ -3116,7 +3108,7 @@ export class ParallelOps implements DeviceOps {
         if (disposed)
           throw new Error(`Stream already disposed`);
         for (let i = 0; i < this.devices.length; i++) {
-          this.devices[i].synchronizeStream(streams[i]!);
+          this.devices[i].synchronize(streams[i]!);
         }
         this.p2pGroups.get(streams[0]!)?.onSynchronized();
       },
