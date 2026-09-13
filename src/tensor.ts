@@ -30,16 +30,12 @@ export abstract class Tensor implements Disposable {
     public readonly view: Tensor | undefined,
     public readonly recycleKey: HeapKey | null = null) {
     this.id = Tensor.nextId++;
-    this.data = data;
-    this.allocSize = allocSize;
-    this.shape = shape;
-    this.type = type;
-    this.name = name;
-    this.pinned = pinned;
-    this.view = view;
+    while (this.view?.view) {
+      this.view = this.view.view;
+    }
     // this.stack = this.name ? undefined! : new Error("Tensor allocated at:").stack!;
-    if (view) {
-      view.views.add(this);
+    if (this.view) {
+      this.view.views.add(this);
     }
   }
 
