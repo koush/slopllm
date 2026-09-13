@@ -4225,7 +4225,6 @@ export class ParallelOps implements DeviceOps {
     using colIdxQ = this.tryNarrowToColumnParallel(pQ);
     using colWeights = this.tryNarrowToColumnParallel(pWeights);
     const canShard = !decode && W > 1 && kDataReplicated
-      && pQoIndptr.shards[0].shape[0] === 2
       && colIdxQ && colWeights
       && totalQ % W === 0;
 
@@ -4276,7 +4275,7 @@ export class ParallelOps implements DeviceOps {
     const topkIdxShards: Tensor[] = [];
     const topkValShards: Tensor[] = [];
     for (let i = 0; i < W; i++) {
-      const qStart = i * localQ;
+      const qStart = (qGlobalStart ?? 0) + i * localQ;
       const r = this.devices[i].indexerTopk(
         state,
         colIdxQ!.shards[i], pKData.shards[i], pKScaleData.shards[i], colWeights!.shards[i],

@@ -1030,9 +1030,12 @@ __global__ void idx_score_kernel(
     const int32_t* __restrict__ kvTokenIndptr
 ) {
     const int qIdx = blockIdx.y;
+    const int globalQuery = qIdx + qGlobalStart;
     int seq = 0;
-    while (qoIndptr[seq + 1] <= qIdx) seq++;
-    const int qLocalPos = qIdx - qoIndptr[seq];
+    while (qoIndptr[seq + 1] <= globalQuery) {
+        seq++;
+    }
+    const int qSeqPos = globalQuery - qoIndptr[seq];
     const int numQueries = qoIndptr[seq + 1] - qoIndptr[seq];
     const int pageStart = FLAT ? 0 : pageIndptr[seq];
     const int numPages = FLAT ? 0 : pageIndptr[seq + 1] - pageStart;
@@ -1046,9 +1049,6 @@ __global__ void idx_score_kernel(
     const int globalKvLen = (cpW > 1)
         ? (numPages > 0 ? (numPages - 1) * (pageSize * cpW) + globalLastPageLen[seq] : 0)
         : kvLen;
-    // qGlobalStart shifts a shard's local query row to its true sequence position
-    // (0 outside query-sharding) so the causal limit and mask row stay correct.
-    const int qSeqPos = qLocalPos + qGlobalStart;
     const int numValid = idx_local_causal_limit(
         qSeqPos, numQueries, causal, kvLen, globalKvLen, cpW, cpRank) + 1;
 
@@ -1275,11 +1275,14 @@ __global__ void score_kernel(
     const float* __restrict__ effectiveWeights, int weightStride,
     const float* __restrict__ kScaleData) {
     const int qi = blockIdx.y;
+    const int globalQuery = qi + qGlobalStart;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     int seq = 0;
-    while (qoIndptr[seq + 1] <= qi) seq++;
-    const int qLocal = qi - qoIndptr[seq];
+    while (qoIndptr[seq + 1] <= globalQuery) {
+        seq++;
+    }
+    const int qSeqPos = globalQuery - qoIndptr[seq];
     const int nQuery = qoIndptr[seq + 1] - qoIndptr[seq];
     const int pageStart = FLAT ? 0 : pageIndptr[seq];
     const int nPages = FLAT ? 0 : pageIndptr[seq + 1] - pageStart;
@@ -1289,7 +1292,6 @@ __global__ void score_kernel(
     const int cpW = (cpWorldSize > 1 && globalLastPageLen) ? cpWorldSize : 1;
     const int globalKvLen = cpW > 1
         ? (nPages ? (nPages - 1) * pageSize * cpW + globalLastPageLen[seq] : 0) : kvLen;
-    const int qSeqPos = qLocal + qGlobalStart;
     const int numValid = idx_local_causal_limit(
         qSeqPos, nQuery, causal, kvLen, globalKvLen, cpW, cpRank) + 1;
     if (blockIdx.x == 0 && threadIdx.x == 0) row_len[qi] = numValid;
@@ -1589,31 +1591,35 @@ idx_prefill_score_mma_kernel(
     static_assert(TN % (MMA_N * WARPS) == 0);
     static_assert(Q_BUFFERS == 1 || Q_BUFFERS == 2);
 
-    // Map blockIdx.y -> (seq, qStart). Tiles are laid out per-sequence so a tile
-    // never straddles two sequences. The scan reads qoIndptr[0..B]; it stops once
-    // a sequence reaches totalQ, so no batch count is needed.
+    // Tile each sequence's intersection with this shard. qStart remains local
+    // to q/weights/output; sequence metadata uses the full batch coordinates.
     const int gy = blockIdx.y;
     int seq = -1, qStart = 0;
     {
         int acc = 0;
         for (int s = 0; ; s++) {
-            int qs = qoIndptr[s], qe = qoIndptr[s + 1];
-            int nt = (qe - qs + TM - 1) / TM;
-            if (gy < acc + nt) { seq = s; qStart = qs + (gy - acc) * TM; break; }
+            const int qs = max(qoIndptr[s], qGlobalStart);
+            const int qe = min(qoIndptr[s + 1], qGlobalStart + totalQ);
+            const int nt = (max(0, qe - qs) + TM - 1) / TM;
+            if (gy < acc + nt) {
+                seq = s;
+                qStart = qs - qGlobalStart + (gy - acc) * TM;
+                break;
+            }
             acc += nt;
-            if (qe >= totalQ) break;
+            if (qoIndptr[s + 1] >= qGlobalStart + totalQ) {
+                break;
+            }
         }
     }
-    if (seq < 0) return;
-    // Under query-sharding q/weights/scores/out are the shard's local [totalQ,...]
-    // buffers while qoIndptr still describes the full sequence, so stop once a tile
-    // lands past this shard's local row count (also covers the launch slop blocks).
-    if (qStart >= totalQ) return;
+    if (seq < 0 || qStart >= totalQ) {
+        return;
+    }
 
     const int qoStart   = qoIndptr[seq];
     const int numQueries = qoIndptr[seq + 1] - qoStart;
     // Clamp to both the sequence end (multi-seq) and the local row count (shard).
-    const int m_valid   = min(TM, min(qoIndptr[seq + 1], totalQ) - qStart);
+    const int m_valid   = min(TM, min(qoIndptr[seq + 1] - qGlobalStart, totalQ) - qStart);
     const int pageStart = FLAT ? 0 : pageIndptr[seq];
     const int numPages  = FLAT ? 0 : pageIndptr[seq + 1] - pageStart;
     const int flatStart = FLAT ? kvTokenIndptr[seq] : 0;
@@ -1866,18 +1872,27 @@ idx_prefill_score_fp8_mma_kernel(
     {
         int acc = 0;
         for (int s = 0; ; s++) {
-            const int qs = qoIndptr[s], qe = qoIndptr[s + 1];
-            const int nt = (qe - qs + TM - 1) / TM;
-            if (gy < acc + nt) { seq = s; qStart = qs + (gy - acc) * TM; break; }
+            const int qs = max(qoIndptr[s], qGlobalStart);
+            const int qe = min(qoIndptr[s + 1], qGlobalStart + totalQ);
+            const int nt = (max(0, qe - qs) + TM - 1) / TM;
+            if (gy < acc + nt) {
+                seq = s;
+                qStart = qs - qGlobalStart + (gy - acc) * TM;
+                break;
+            }
             acc += nt;
-            if (qe >= totalQ) break;
+            if (qoIndptr[s + 1] >= qGlobalStart + totalQ) {
+                break;
+            }
         }
     }
-    if (seq < 0 || qStart >= totalQ) return;
+    if (seq < 0 || qStart >= totalQ) {
+        return;
+    }
 
     const int qoStart = qoIndptr[seq];
     const int numQueries = qoIndptr[seq + 1] - qoStart;
-    const int mValid = min(TM, min(qoIndptr[seq + 1], totalQ) - qStart);
+    const int mValid = min(TM, min(qoIndptr[seq + 1] - qGlobalStart, totalQ) - qStart);
     const int pageStart = FLAT ? 0 : pageIndptr[seq];
     const int numPages = FLAT ? 0 : pageIndptr[seq + 1] - pageStart;
     const int flatStart = FLAT ? kvTokenIndptr[seq] : 0;
