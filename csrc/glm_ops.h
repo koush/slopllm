@@ -207,6 +207,9 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        int attn_n_heads, int head_offset,
                        int v_proj_head_offset);
 
+void glm_route_top8(GlmCtx* ctx, void* out_weights, int* out_indices,
+                    const void* logits, const void* bias, int rows, float scale, bool normalize);
+
 void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
               const void* input, int k, int dim, int batch, int offset);
 

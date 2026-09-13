@@ -160,6 +160,7 @@ export interface NativeAddon {
   sigmoid(ctx: number, out: number, input: number, n: number): void;
   relu(ctx: number, out: number, input: number, n: number): void;
   topk(ctx: number, outValues: number, outIndices: number, input: number, k: number, dim: number, batch: number, offset: number): void;
+  routeTop8(ctx: number, outWeights: number, outIndices: number, logits: number, bias: number, rows: number, scale: number, normalize: boolean): void;
   topkFromScores(ctx: number, outValues: number, outIndices: number, scores: number, rowLen: number, hist: number, meta: number, batch: number, stride: number, topk: number, numSplits: number, cpWorldSize?: number, cpRank?: number): void;
   sortTopkByIndex(ctx: number, outIdx: number, outScores: number, batch: number, topk: number): void;
   indexAdd(ctx: number, out: number, indices: number, values: number, nIndices: number, dim: number): void;

@@ -361,6 +361,12 @@ class GlmOps:
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
         ]
 
+        self.lib.glm_route_top8.restype = None
+        self.lib.glm_route_top8.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_float, ctypes.c_bool
+        ]
+
         self.lib.glm_bmm.restype = None
         self.lib.glm_bmm.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -1387,6 +1393,12 @@ class GlmOps:
             self._ptr(out_indices),
             self._ptr(input),
             k, dim, batch, offset
+        )
+
+    def route_top8(self, weights, indices, logits, bias, rows, scale=2.5, normalize=True):
+        self.lib.glm_route_top8(
+            self.ctx, self._ptr(weights), self._ptr(indices), self._ptr(logits),
+            self._ptr(bias), rows, ctypes.c_float(scale), ctypes.c_bool(normalize)
         )
 
     def bmm(self, C, A, B, alpha, beta, batch, M, N, K, transA=0, transB=0):

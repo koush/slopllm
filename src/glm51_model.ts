@@ -599,11 +599,15 @@ export class Glm51Model extends ChatModel {
 
   private mlpSparse(normed: Tensor, pfx: string, BS: number): Tensor {
     const cfg = this.cfg;
-    const numExperts = cfg.nRoutedExperts;
     const topK = cfg.numExpertsPerTok;
     const nGroup = cfg.nGroup;
     const moeIntermediate = cfg.moeIntermediateSize;
     const hs = cfg.hiddenSize;
+
+    if (nGroup > 1) {
+      // removed untested dead code that supported this, just guard
+      throw new Error(`mlpSparse: nGroup > 1 is not supported (got nGroup=${nGroup})`);
+    }
 
     // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
     using sharedMlpStream = this.glm.withStream(() => {
@@ -612,29 +616,15 @@ export class Glm51Model extends ChatModel {
     });
 
     using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!);
-    using gateSigmoid = gateLogitsBuf.sigmoid();
-
-    using topkInputHolder = new UsingHolder<Tensor>(undefined!);
-    const eScoreBias = this.tensors.get(`${pfx}.mlp.gate.e_score_correction_bias`);
-    if (eScoreBias) {
-      topkInputHolder.replace(gateSigmoid.add(eScoreBias));
-    } else {
-      topkInputHolder.replace(gateSigmoid);
-    }
-
-    if (nGroup > 1) {
-      // removed untested dead code that supported this, just guard
-      throw new Error(`mlpSparse: nGroup > 1 is not supported (got nGroup=${nGroup})`);
-    }
-
-    const topkResult = topkInputHolder.value.topk(topK, numExperts);
-    using _topkValues = topkResult.values;
-    using topkIndices = topkResult.indices;
-
-    using normalizedWeightsStream = this.glm.withStream(() => {
-      using selectedScores = gateSigmoid.gather(topkIndices, topK, numExperts, BS);
-      return selectedScores.rowNormalize(cfg.routedScalingFactor, cfg.normTopkProb);
+    const routed = gateLogitsBuf.moeRoute({
+      numExpertsPerToken: topK,
+      correctionBias: this.tensors.get(`${pfx}.mlp.gate.e_score_correction_bias`),
+      scalingFactor: cfg.routedScalingFactor,
+      normalize: cfg.normTopkProb,
     });
+    using topkIndices = routed.indices;
+    using normalizedWeightsStream = routed.normalizedWeightsStream;
+    using _normalizedWeights = normalizedWeightsStream.result;
 
     const count = BS * topK;
     using topkIndicesFlat = topkIndices.reshape([count]);
@@ -643,7 +633,6 @@ export class Glm51Model extends ChatModel {
     const upWeights = this.getExpertWeights(pfx, "up_proj");
     const downWeights = this.getExpertWeights(pfx, "down_proj");
 
-    using _normalizedWeights = normalizedWeightsStream.result;
     using routedOut = normed.swiGluMlpMoeReduce({
       gate: gateWeights, up: upWeights, down: downWeights,
       normalizedWeightsStream,
@@ -1194,7 +1183,7 @@ export class Glm51Model extends ChatModel {
   *planPrefillMtpDraftExtend(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ExecutionPlan<MtpDraftBatch> {
     const mtpEnabled = samplingPolicy.mtpEnabled === true;
     if (mtpEnabled && [samplingPolicy.prepareDraft, samplingPolicy.sampleDraft, samplingPolicy.finishDraft,
-      samplingPolicy.prepareVerification, samplingPolicy.verify].some(method => typeof method !== "function")) {
+    samplingPolicy.prepareVerification, samplingPolicy.verify].some(method => typeof method !== "function")) {
       throw new Error("MTP-enabled sampling policy requires all MTP methods");
     }
     if (!this.forwardMtp || topks.length === 0) {
@@ -1350,7 +1339,7 @@ export class Glm51Model extends ChatModel {
   *planTargetVerification(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ExecutionPlan<MtpStepResult> {
     const mtpEnabled = samplingPolicy.mtpEnabled === true;
     if (mtpEnabled && [samplingPolicy.prepareDraft, samplingPolicy.sampleDraft, samplingPolicy.finishDraft,
-      samplingPolicy.prepareVerification, samplingPolicy.verify].some(method => typeof method !== "function")) {
+    samplingPolicy.prepareVerification, samplingPolicy.verify].some(method => typeof method !== "function")) {
       throw new Error("MTP-enabled sampling policy requires all MTP methods");
     }
     const topks = draft.topks;

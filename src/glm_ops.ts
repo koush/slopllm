@@ -2,7 +2,7 @@ import { DeviceOps, fp8ScaleShape, MaskMode, notifySynchronizedWorkspaces, SlotS
 import { Heap, type HeapAllocation, type HeapKey } from "./heap";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
-import { Tensor } from "./tensor";
+import { Tensor, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
 import type { WorkspaceBase } from "./workspace";
 import { MemcpyKind } from "./enums";
 import { getNativeAddon } from "./native-addon";
@@ -472,6 +472,31 @@ export class GlmTensor extends Tensor {
 
   indexAdd(indices: Tensor, values: Tensor, nIndices: number, dim: number): void {
     getNativeAddon().indexAdd(this.glm.ctx, this.data, indices.data, values.data, nIndices, dim);
+  }
+
+  moeRoute(options: MoeRoutingOptions): MoeRoutingResult {
+    const [rows, experts] = this.shape;
+    // Larger batches retain the default path's overlap with expert computation.
+    if (process.env.GLM_ROUTING_FUSION === "0" || rows > 32 || experts !== 256
+      || options.numExpertsPerToken !== 8 || !options.correctionBias) {
+      return super.moeRoute(options);
+    }
+    this.validateMoeRoute(options);
+    const values = this.workspace.alloc([rows, 8], "BF16");
+    const indices = this.workspace.alloc([rows, 8], "I32");
+    getNativeAddon().routeTop8(this.glm.ctx, values.data, indices.data, this.data,
+      options.correctionBias.data, rows, options.scalingFactor, options.normalize);
+    // Both outputs are ready on the caller's stream; no alternate stream is needed.
+    return {
+      indices,
+      normalizedWeightsStream: {
+        result: values,
+        streamWaitEvent() {
+        },
+        [Symbol.dispose]() {
+        },
+      },
+    };
   }
 
   add(other: Tensor, n?: number): Tensor {

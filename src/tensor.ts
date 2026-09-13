@@ -5,6 +5,25 @@ import { SafeTensorFile } from "./safetensors";
 import { type WorkspaceBase } from "./workspace";
 import type { HeapKey } from "./heap";
 
+export interface MoeRoutingOptions {
+  numExpertsPerToken: number;
+  correctionBias?: Tensor;
+  scalingFactor: number;
+  normalize: boolean;
+}
+
+export interface MoeRoutingWeightsStream extends Disposable {
+  result: Tensor;
+  streamWaitEvent(): void;
+  /** Composite backends retain each device's own wait operation. */
+  shards?: readonly MoeRoutingWeightsStream[];
+}
+
+export interface MoeRoutingResult {
+  indices: Tensor;
+  normalizedWeightsStream: MoeRoutingWeightsStream;
+}
+
 function numElements(shape: number[]): number {
   return shape.reduce((a, b) => a * b, 1);
 }
@@ -434,8 +453,7 @@ export abstract class Tensor implements Disposable {
   swiGluMlpMoeReduce(
     inputs: {
       gate: Tensor[], up: Tensor[], down: Tensor[],
-      normalizedWeightsStream: Pick<ReturnType<typeof WorkspaceBase.prototype.glm.withStream<Tensor>>,
-        "streamId" | "result" | "streamWaitEvent">,
+      normalizedWeightsStream: MoeRoutingWeightsStream,
     },
     topkIndicesFlat: Tensor,
     topK: number, count: number,
@@ -580,6 +598,41 @@ export abstract class Tensor implements Disposable {
 
   topk(k: number, dim: number, offset?: number): { values: Tensor, indices: Tensor } {
     return undefined as never;
+  }
+
+  protected validateMoeRoute(options: MoeRoutingOptions): void {
+    if (this.type !== "BF16" || this.shape.length !== 2) {
+      throw new Error("moeRoute: expected BF16 logits [rows, experts]");
+    }
+    const experts = this.shape[1];
+    const topK = options.numExpertsPerToken;
+    if (!Number.isInteger(topK) || topK < 1 || topK > experts) {
+      throw new Error(`moeRoute: invalid experts per token ${topK} for ${experts} experts`);
+    }
+    const bias = options.correctionBias;
+    if (bias && (bias.type !== "BF16" || bias.shape.length !== 1 || bias.shape[0] !== experts)) {
+      throw new Error(`moeRoute: expected BF16 correction bias [${experts}]`);
+    }
+  }
+
+  /** Sigmoid routing: biased expert selection, unbiased normalized weights. */
+  moeRoute(options: MoeRoutingOptions): MoeRoutingResult {
+    this.validateMoeRoute(options);
+    const [rows, experts] = this.shape;
+    const topK = options.numExpertsPerToken;
+    using sigmoid = this.sigmoid();
+    using selection = options.correctionBias
+      ? sigmoid.add(options.correctionBias)
+      : sigmoid.viewClone();
+    const topk = selection.topk(topK, experts);
+    using values = topk.values;
+    const normalizedWeightsStream = this.workspace.glm.withStream(() => {
+      using scoresView = sigmoid.viewClone();
+      using indicesView = topk.indices.viewClone();
+      using selected = scoresView.gather(indicesView, topK, experts, rows);
+      return selected.rowNormalize(options.scalingFactor, options.normalize);
+    });
+    return { indices: topk.indices, normalizedWeightsStream };
   }
 
   indexAdd(indices: Tensor, values: Tensor, nIndices: number, dim: number): void {

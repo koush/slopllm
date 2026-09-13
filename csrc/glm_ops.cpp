@@ -973,6 +973,27 @@ static Napi::Value MlaVExpand(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value RouteTop8(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 8) {
+        Napi::TypeError::New(env, "Expected (ctx, out_weights, out_indices, logits, bias, rows, scale, normalize)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_route_top8(
+        reinterpret_cast<GlmCtx*>(info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<void*>(info[1].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<int*>(info[2].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>(info[3].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>(info[4].As<Napi::Number>().Int64Value()),
+        info[5].As<Napi::Number>().Int32Value(),
+        info[6].As<Napi::Number>().FloatValue(), info[7].As<Napi::Boolean>().Value());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("routeTop8 failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value Topk(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 7) {
@@ -4058,6 +4079,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "ropeTranspose"), Napi::Function::New(env, RopeTranspose));
     exports.Set(Napi::String::New(env, "mlaVExpand"), Napi::Function::New(env, MlaVExpand));
     exports.Set(Napi::String::New(env, "topk"), Napi::Function::New(env, Topk));
+    exports.Set(Napi::String::New(env, "routeTop8"), Napi::Function::New(env, RouteTop8));
     exports.Set(Napi::String::New(env, "topkFromScores"), Napi::Function::New(env, TopkFromScores));
     exports.Set(Napi::String::New(env, "sortTopkByIndex"), Napi::Function::New(env, SortTopkByIndex));
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));

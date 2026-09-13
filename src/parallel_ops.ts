@@ -7,7 +7,7 @@ import { bf16BytesToF32, f32ToBf16Bytes, GlmOps, GlmTensor, NCCL_BFLOAT16, NCCL_
 import { getNativeAddon } from "./native-addon";
 import { SafeTensorFile } from "./safetensors";
 import { sparseMlaChunksPerBlock } from "./sparse-mla-planner";
-import { Tensor } from "./tensor";
+import { Tensor, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 import type { HeapKey } from "./heap";
@@ -1597,6 +1597,39 @@ export class ParallelTensor extends Tensor {
     return { values, indices };
   }
 
+  moeRoute(options: MoeRoutingOptions): MoeRoutingResult {
+    this.validateMoeRoute(options);
+    const bias = options.correctionBias;
+    if (this.parallelism !== TensorParallelism.Replicated || (bias && (!(bias instanceof ParallelTensor)
+      || bias.parallelOps !== this.parallelOps || bias.parallelism !== TensorParallelism.Replicated))) {
+      throw new Error("moeRoute: requires replicated logits and bias on the same backend");
+    }
+    const results: MoeRoutingResult[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      results.push(this.shards[i].moeRoute({ ...options, correctionBias: bias?.shards[i] }));
+    }
+    const shape = [this.shape[0], options.numExpertsPerToken];
+    const indices = this.parallelOps.wrapShards(this.workspace, results.map(r => r.indices), shape, "I32", TensorParallelism.Replicated);
+    const weights = this.parallelOps.wrapShards(this.workspace, results.map(r => r.normalizedWeightsStream.result), shape, "BF16", TensorParallelism.Replicated);
+    return {
+      indices,
+      normalizedWeightsStream: {
+        result: weights,
+        shards: results.map(r => r.normalizedWeightsStream),
+        streamWaitEvent() {
+          for (const result of results) {
+            result.normalizedWeightsStream.streamWaitEvent();
+          }
+        },
+        [Symbol.dispose]() {
+          for (const result of results) {
+            result.normalizedWeightsStream[Symbol.dispose]();
+          }
+        },
+      },
+    };
+  }
+
   reduceSum(): Tensor {
     const dim = this.shape[1];
     const batch = this.shape[0];
@@ -1977,6 +2010,10 @@ export class ParallelTensor extends Tensor {
   ): Tensor {
     const routingStream = inputs.normalizedWeightsStream;
     const routingWeights = routingStream.result as ParallelTensor;
+    const routingShards = routingStream.shards;
+    if (!routingShards || routingShards.length !== this.worldSize) {
+      throw new Error("swiGluMlpMoeReduce: requires per-device routing streams");
+    }
     const expertIds = topkIndicesFlat as ParallelTensor;
     this.assertParallel("swiGluMlpMoeReduce input", this, TensorParallelism.Replicated);
     this.assertParallel("swiGluMlpMoeReduce routing weights", routingWeights, TensorParallelism.Replicated);
@@ -1985,14 +2022,7 @@ export class ParallelTensor extends Tensor {
       gate: inputs.gate.map(w => (w as ParallelTensor).shards[i]),
       up: inputs.up.map(w => (w as ParallelTensor).shards[i]),
       down: inputs.down.map(w => (w as ParallelTensor).shards[i]),
-      normalizedWeightsStream: {
-        streamId: routingStream.streamId,
-        result: routingWeights.shards[i],
-        streamWaitEvent() {
-          const device = shard.workspace.glm;
-          device.streamWaitEvent(device.currentStream, routingStream.streamId);
-        },
-      },
+      normalizedWeightsStream: routingShards[i],
     }, expertIds.shards[i], topK, count, shardIntermediate, hs, pfx));
     return this.parallelOps.wrapShards(this.workspace, shards, [count / topK, hs], this.type, TensorParallelism.PartialSum);
   }

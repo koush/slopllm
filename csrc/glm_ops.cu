@@ -2226,6 +2226,82 @@ __global__ void topk8_router_kernel(
     }
 }
 
+// Fuse the GLM router's BF16 sigmoid -> biased selection -> unbiased weights.
+// Keep both BF16 materialization points: rounding them away changes expert IDs.
+__global__ void route_top8_kernel(
+    __nv_bfloat16* out_weights, int* out_indices,
+    const __nv_bfloat16* logits, const __nv_bfloat16* bias,
+    float scale, bool normalize
+) {
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x;
+    float scores[8], original[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int expert = lane + j * 32;
+        original[j] = __bfloat162float(__float2bfloat16(
+            sigmoid_f(__bfloat162float(logits[(size_t)row * 256 + expert]))));
+        scores[j] = __bfloat162float(__float2bfloat16(
+            original[j] + __bfloat162float(bias[expert])));
+    }
+    float selected = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+        float best = -INFINITY;
+        int index = -1;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int candidate = lane + j * 32;
+            if (scores[j] > best || (scores[j] == best && candidate < index)) {
+                best = scores[j];
+                index = candidate;
+            }
+        }
+#pragma unroll
+        for (int delta = 16; delta > 0; delta >>= 1) {
+            const float other = __shfl_down_sync(0xffffffff, best, delta);
+            const int other_index = __shfl_down_sync(0xffffffff, index, delta);
+            if (other > best || (other == best && other_index < index)) {
+                best = other;
+                index = other_index;
+            }
+        }
+        const int winner = __shfl_sync(0xffffffff, index, 0);
+        float winner_score = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if (lane + j * 32 == winner) {
+                winner_score = original[j];
+                scores[j] = -INFINITY;
+            }
+        }
+        winner_score = __shfl_sync(0xffffffff, winner_score, winner & 31);
+        if (lane == k) {
+            out_indices[(size_t)row * 8 + k] = winner;
+            selected = winner_score;
+        }
+    }
+    // Same descending-stride addition tree as row_normalize_kernel for cols=8.
+    float sum = fabsf(selected);
+#pragma unroll
+    for (int delta = 16; delta > 0; delta >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, delta);
+    }
+    sum = __shfl_sync(0xffffffff, sum, 0);
+    const float multiplier = normalize ? (sum > 0.0f ? scale / sum : 0.0f) : scale;
+    if (lane < 8) {
+        out_weights[(size_t)row * 8 + lane] = __float2bfloat16(selected * multiplier);
+    }
+}
+
+void glm_route_top8(GlmCtx* ctx, void* out_weights, int* out_indices,
+                    const void* logits, const void* bias, int rows, float scale, bool normalize) {
+    cudaSetDevice(ctx->device_id);
+    route_top8_kernel<<<rows, 32, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out_weights, out_indices,
+        (const __nv_bfloat16*)logits, (const __nv_bfloat16*)bias, scale, normalize);
+}
+
 void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
               const void* input, int k, int dim, int batch, int offset) {
     cudaSetDevice(ctx->device_id);
