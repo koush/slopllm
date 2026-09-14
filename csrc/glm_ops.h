@@ -448,7 +448,8 @@ void glm_p2p_allgather_row_write(GlmCtx* ctx,
     const void* local_shard,
     const void* p0,  const void* p1,  const void* p2,  const void* p3,
     const void* p4,  const void* p5,  const void* p6,  const void* p7,
-    void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer, int rank);
+    void* output, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer, int rank,
+    int src_peer_stride_bytes);
 
 // Push-based reduce-scatter AllReduce (write+write), phase 1: scatter. Each GPU
 // writes its N chunks to peers' staging buffers [N, chunkLen] at slot `rank`.

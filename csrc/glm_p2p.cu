@@ -412,7 +412,8 @@ p2p_allgather_row_write_kernel(
     int shard_dim1_bytes,
     int full_dim1_bytes,
     int outer,
-    int rank)
+    int rank,
+    int src_peer_stride_bytes)
 {
     constexpr int VEC = 16;  // int4
     const int tid = threadIdx.x;
@@ -426,12 +427,15 @@ p2p_allgather_row_write_kernel(
 
     for (int row = blockIdx.x; row < outer; row += gridDim.x)
     {
-        const char* src = static_cast<const char*>(local_shard)
-                          + (int64_t)row * shard_dim1_bytes;
-
         #pragma unroll
         for (int j = 0; j < N; j++) {
             int peer = (j + blockIdx.x) % N;
+            // Peer pointers are rotated by the sender's rank. A zero stride
+            // broadcasts each row; otherwise select the owner's query slice.
+            const int owner = (rank + peer) % N;
+            const char* src = static_cast<const char*>(local_shard)
+                              + (int64_t)owner * src_peer_stride_bytes
+                              + (int64_t)row * shard_dim1_bytes;
             char* dst = static_cast<char*>(dsts[peer])
                         + (int64_t)row * full_dim1_bytes
                         + (int64_t)rank * shard_dim1_bytes;
@@ -691,7 +695,7 @@ void glm_p2p_barrier(GlmCtx* ctx, GlmP2PInstance* inst, int peer_rank) {
             const_cast<void*>(p[2]), const_cast<void*>(p[3]), \
             const_cast<void*>(p[4]), const_cast<void*>(p[5]), \
             const_cast<void*>(p[6]), const_cast<void*>(p[7]), \
-            shard_dim1_bytes, full_dim1_bytes, outer, rank); \
+            shard_dim1_bytes, full_dim1_bytes, outer, rank, src_peer_stride_bytes); \
     } while(0)
 
 void glm_p2p_allgather_row_write(GlmCtx* ctx,
@@ -699,7 +703,7 @@ void glm_p2p_allgather_row_write(GlmCtx* ctx,
     const void* p0,  const void* p1,  const void* p2,  const void* p3,
     const void* p4,  const void* p5,  const void* p6,  const void* p7,
     void* /*output*/, int N, int shard_dim1_bytes, int full_dim1_bytes, int outer,
-    int rank) {
+    int rank, int src_peer_stride_bytes) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     const void* p[8] = {p0, p1, p2, p3, p4, p5, p6, p7};

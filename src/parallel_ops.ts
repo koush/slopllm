@@ -436,10 +436,17 @@ export class ParallelTensor extends Tensor {
     if (this.parallelism !== TensorParallelism.Column && this.parallelism !== TensorParallelism.Row) {
       throw new Error(`tryP2PAllGather: unsupported parallelism ${this.parallelism}`);
     }
+    const toColumn = output.parallelism === TensorParallelism.Column;
+    if (output.parallelism !== TensorParallelism.Replicated && !toColumn) {
+      throw new Error(`beginP2PAllGather: unsupported output parallelism ${output.parallelism}`);
+    }
+    if (toColumn && (this.parallelism !== TensorParallelism.Row || this.shape[0] % this.worldSize !== 0)) {
+      throw new Error("beginP2PAllGather: Column output requires evenly divisible Row input");
+    }
 
     const shards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      shards.push(group.alloc(this.shards[i].workspace, this.shape, this.type));
+      shards.push(group.alloc(this.shards[i].workspace, output.shards[i].shape, this.type));
     }
 
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
@@ -476,7 +483,7 @@ export class ParallelTensor extends Tensor {
     }
 
     if (this.parallelism === TensorParallelism.Row) {
-      const outer = this.shape[0];
+      const outer = toColumn ? this.shape[0] / this.worldSize : this.shape[0];
       const inner = this.shape.slice(2).reduce((a, b) => a * b, 1);
       const shardDim1 = this.shape[1] / this.worldSize;
       const shardDim1Bytes = shardDim1 * inner * elemBytes;
@@ -497,6 +504,7 @@ export class ParallelTensor extends Tensor {
           rotatedPtrs[0], rotatedPtrs[1], rotatedPtrs[2], rotatedPtrs[3],
           rotatedPtrs[4], rotatedPtrs[5], rotatedPtrs[6], rotatedPtrs[7],
           shards[i].data, this.worldSize, shardDim1Bytes, fullDim1Bytes, outer, i,
+          toColumn ? outer * shardDim1Bytes : 0,
         );
       }
 
@@ -2425,31 +2433,64 @@ export class ParallelOps implements DeviceOps {
   }
 
   allGatherMultiple(tensors: readonly ParallelTensor[], workspace: WorkspaceBase): ParallelTensor[] {
-    if (tensors.length === 0) return [];
+    return this.redistributeMultiple(tensors, workspace, TensorParallelism.Replicated);
+  }
+
+  toColumnParallelMultiple(tensors: readonly ParallelTensor[], workspace: WorkspaceBase): ParallelTensor[] {
+    return this.redistributeMultiple(tensors, workspace, TensorParallelism.Column);
+  }
+
+  redistributeMultiple(tensors: readonly ParallelTensor[], workspace: WorkspaceBase,
+    target: TensorParallelism.Replicated | TensorParallelism.Column): ParallelTensor[] {
+    if (target !== TensorParallelism.Replicated && target !== TensorParallelism.Column) {
+      throw new Error(`redistributeMultiple: unsupported target ${target}`);
+    }
+    if (workspace.glm !== this) {
+      throw new Error("redistributeMultiple: output workspace belongs to a different backend");
+    }
+    if (tensors.length === 0) {
+      return [];
+    }
 
     for (const tensor of tensors) {
+      if (tensor.workspace.glm !== this || tensor.shards.length !== this.worldSize || tensor.pinned) {
+        throw new Error("redistributeMultiple: expected device tensors from this backend");
+      }
       if (tensor.parallelism === TensorParallelism.PartialSum) {
-        throw new Error("allGatherMultiple cannot be used on PartialSum tensors; use allReduce instead");
+        throw new Error("redistributeMultiple cannot be used on PartialSum tensors; use allReduce instead");
       }
       if (tensor.parallelism !== TensorParallelism.Replicated &&
         tensor.parallelism !== TensorParallelism.Column &&
         tensor.parallelism !== TensorParallelism.Row) {
-        throw new Error(`allGatherMultiple: unsupported parallelism ${tensor.parallelism}`);
+        throw new Error(`redistributeMultiple: unsupported parallelism ${tensor.parallelism}`);
+      }
+      if (target === TensorParallelism.Column && (tensor.shape.length === 0 || tensor.shape[0] % this.worldSize !== 0)) {
+        throw new Error("redistributeMultiple: first dimension must be divisible by world size for Column output");
       }
     }
 
-    if (tensors.every(tensor => tensor.parallelism === TensorParallelism.Replicated)) {
-      return tensors.map(tensor => tensor.viewClone() as ParallelTensor);
+    const outputs: (ParallelTensor | undefined)[] = tensors.map(tensor => {
+      if (tensor.parallelism === target) {
+        return tensor.viewClone() as ParallelTensor;
+      }
+      if (target === TensorParallelism.Column && tensor.parallelism === TensorParallelism.Replicated) {
+        return this.tryNarrowToColumnParallel(tensor)!;
+      }
+      return undefined;
+    });
+    const gatherIndices = outputs.flatMap((output, i) => output ? [] : [i]);
+    if (gatherIndices.length === 0) {
+      return outputs as ParallelTensor[];
     }
-
-    const outputs: (ParallelTensor | undefined)[] = tensors.map(tensor =>
-      tensor.parallelism === TensorParallelism.Replicated
-        ? tensor.viewClone() as ParallelTensor
-        : undefined);
-    const gatherIndices = tensors.flatMap((tensor, i) =>
-      tensor.parallelism === TensorParallelism.Replicated ? [] : [i]);
     const fallback = () => {
-      for (const i of gatherIndices) outputs[i] = tensors[i].allGather(workspace);
+      for (const i of gatherIndices) {
+        if (target === TensorParallelism.Replicated) {
+          outputs[i] = tensors[i].allGather(workspace);
+        } else {
+          using gathered = tensors[i].allGather(workspace);
+          outputs[i] = this.tryNarrowToColumnParallel(gathered)!;
+        }
+      }
       return outputs as ParallelTensor[];
     };
     const stream = this.devices[0].currentStream;
@@ -2462,14 +2503,18 @@ export class ParallelOps implements DeviceOps {
         count <= 65536 * 8 &&
         tensor.shards[0].workspace.glm.currentStream === stream;
     });
-    if (!this.p2pEnabled || !supported) return fallback();
+    if (!this.p2pEnabled || !supported) {
+      return fallback();
+    }
 
     const group = this.getP2PGroup(stream);
-    if (!group) return fallback();
+    if (!group) {
+      return fallback();
+    }
 
     for (const i of gatherIndices) {
       const tensor = tensors[i];
-      outputs[i] = workspace.alloc(tensor.shape, tensor.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
+      outputs[i] = workspace.alloc(tensor.shape, tensor.type, undefined, target) as ParallelTensor;
     }
     if (gatherIndices.length === 1) {
       const postBarrier = gatherIndices.map(i => tensors[i].beginP2PAllGather(group, outputs[i]!));

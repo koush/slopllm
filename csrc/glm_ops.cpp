@@ -3890,13 +3890,14 @@ static Napi::Value P2PAllGatherRowWrite(const Napi::CallbackInfo& info) {
     int full_dim1_bytes = info[13].As<Napi::Number>().Int32Value();
     int outer = info[14].As<Napi::Number>().Int32Value();
     int rank = info[15].As<Napi::Number>().Int32Value();
+    int src_peer_stride_bytes = info.Length() > 16 ? info[16].As<Napi::Number>().Int32Value() : 0;
     glm_p2p_allgather_row_write(reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<const void*>(local_shard),
         reinterpret_cast<const void*>(p[0]), reinterpret_cast<const void*>(p[1]),
         reinterpret_cast<const void*>(p[2]), reinterpret_cast<const void*>(p[3]),
         reinterpret_cast<const void*>(p[4]), reinterpret_cast<const void*>(p[5]),
         reinterpret_cast<const void*>(p[6]), reinterpret_cast<const void*>(p[7]),
-        reinterpret_cast<void*>(output_ptr), N, shard_dim1_bytes, full_dim1_bytes, outer, rank);
+        reinterpret_cast<void*>(output_ptr), N, shard_dim1_bytes, full_dim1_bytes, outer, rank, src_peer_stride_bytes);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("p2PAllGatherRowWrite failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
