@@ -40,7 +40,7 @@ def test_rope_transpose_with_rope(glm, device):
     out_transpose = torch.empty(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
     glm.ropeTranspose(out_transpose, x, cos_out, sin_out, 0, head_dim, n_heads, seq_len, batch, in_stride)
     out_rope = torch.empty(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
-    glm.apply_rotary_pos_emb(out_rope, out_transpose, cos_out, sin_out, rope_dim, n_heads, seq_len, batch, 0)
+    glm.apply_rotary_pos_emb(out_rope, out_transpose, cos_out, sin_out, rope_dim, rope_dim, n_heads, seq_len, batch, 0)
 
     torch.testing.assert_close(out_cuda.cpu(), out_rope.cpu(), atol=0, rtol=0)
 
@@ -63,11 +63,11 @@ def test_rope_transpose_partial_rope(glm, device):
     out_cuda = torch.empty(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
     glm.ropeTranspose(out_cuda, x, cos_out, sin_out, rope_dim, head_dim, n_heads, seq_len, batch, in_stride)
 
-    # Reference: transpose then apply_rotary_pos_emb_partial
+    # Reference: transpose then apply_rotary_pos_emb with a partial rotary dimension
     out_transpose = torch.empty(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
     glm.ropeTranspose(out_transpose, x, cos_out, sin_out, 0, head_dim, n_heads, seq_len, batch, in_stride)
     out_rope = torch.empty(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
-    glm.apply_rotary_pos_emb_partial(out_rope, out_transpose, cos_out, sin_out, rope_dim, head_dim, n_heads, seq_len, batch, 0)
+    glm.apply_rotary_pos_emb(out_rope, out_transpose, cos_out, sin_out, rope_dim, head_dim, n_heads, seq_len, batch, 0)
 
     torch.testing.assert_close(out_cuda.cpu(), out_rope.cpu(), atol=0, rtol=0)
 

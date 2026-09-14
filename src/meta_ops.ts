@@ -166,8 +166,8 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([batch * seqLen, nHeads, headDim], this.type);
     }
 
-    applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
-        super.applyRotaryPosEmb(cos, sin, ropeDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
+    applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+        super.applyRotaryPosEmb(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
         if (this.shape.length === 2) {
             using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
         }
@@ -248,12 +248,6 @@ export class MetaTensor extends Tensor {
     }
 
     maskedFill(mask: Tensor, value: number, n: number): void {
-    }
-
-    applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
-        super.applyRotaryPosEmbPartial(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
-        using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
-        return this.workspace.alloc(this.shape, this.type);
     }
 
     reduceSum(): Tensor {

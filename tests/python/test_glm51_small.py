@@ -313,12 +313,12 @@ class TestMLA:
         cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
         q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
         q_pe_rope = torch.empty_like(q_pe_4d)
-        glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
+        glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
         q_pe_rope = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
 
         kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
         kpe_rope_4d = torch.empty_like(kpe_4d)
-        glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
+        glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
         kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
 
         ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
@@ -621,7 +621,7 @@ class TestMLA:
         # RoPE for new kpe and append to cache
         kpe_new_4d = kpe_new.view(1, 1, 1, D_KPE)
         kpe_rope_new = torch.empty_like(kpe_new_4d)
-        glm.apply_rotary_pos_emb(kpe_rope_new, kpe_new_4d, cos_d, sin_d, D_KPE, 1, 1, 1, 1, interleaved=True)
+        glm.apply_rotary_pos_emb(kpe_rope_new, kpe_new_4d, cos_d, sin_d, D_KPE, D_KPE, 1, 1, 1, 1, interleaved=True)
 
         page = decode_pos // PAGE
         offset = decode_pos % PAGE
@@ -695,12 +695,12 @@ class TestMLA:
         cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
         q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
         q_pe_rope = torch.empty_like(q_pe_4d)
-        glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
+        glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
         q_pe_rope_flat = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
 
         kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
         kpe_rope_4d = torch.empty_like(kpe_4d)
-        glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
+        glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
         kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
 
         ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
@@ -908,7 +908,7 @@ def _cuda_mla_attention_bmm(glm, device, layer, hidden_gpu, cos_gpu, sin_gpu, ca
     q_pe = query[:, :, :, qk_nope_dim:].to(device).contiguous()
 
     q_pe_rope = torch.empty_like(q_pe)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe, cos_gpu, sin_gpu, qk_rope_dim, num_heads, S, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe, cos_gpu, sin_gpu, qk_rope_dim, qk_rope_dim, num_heads, S, B, 1, interleaved=True)
 
     compressed_flat = torch.empty(BS, kv_lora_rank + qk_rope_dim, dtype=torch.bfloat16, device=device)
     glm.linear(compressed_flat, hidden_gpu, _upload_tensor(glm, layer.self_attn.kv_a_proj_w),
@@ -932,7 +932,7 @@ def _cuda_mla_attention_bmm(glm, device, layer, hidden_gpu, cos_gpu, sin_gpu, ca
 
     k_pe_4d = k_pe.view(B, 1, S, qk_rope_dim).to(device).contiguous()
     k_pe_rope = torch.empty_like(k_pe_4d)
-    glm.apply_rotary_pos_emb(k_pe_rope, k_pe_4d, cos_gpu, sin_gpu, qk_rope_dim, 1, S, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(k_pe_rope, k_pe_4d, cos_gpu, sin_gpu, qk_rope_dim, qk_rope_dim, 1, S, B, 1, interleaved=True)
     k_pe_expanded = k_pe_rope.expand(-1, num_heads, -1, -1).contiguous()
 
     query_full = torch.cat([q_nope, q_pe_rope], dim=-1).contiguous()

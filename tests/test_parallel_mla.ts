@@ -345,6 +345,47 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     glm1.free();
   });
 
+  it("partial RoPE matches split/rotate/concat for packed indexer K rows", () => {
+    const ropeDim = 64;
+    for (const [batch, seqLen] of [[1, 7], [4, 1]]) {
+      for (const headDim of [64, 128]) {
+        for (const interleaved of [false, true]) {
+          const totalRows = batch * seqLen;
+          const inputBytes = f32ToBf16Bytes(Float32Array.from(
+            { length: totalRows * headDim }, (_, i) => (i % 37 - 18) / 16,
+          ));
+          const cosBytes = f32ToBf16Bytes(Float32Array.from(
+            { length: totalRows * ropeDim }, (_, i) => Math.cos(i / 31),
+          ));
+          const sinBytes = f32ToBf16Bytes(Float32Array.from(
+            { length: totalRows * ropeDim }, (_, i) => Math.sin(i / 31),
+          ));
+          using input = ws.alloc([totalRows, headDim], "BF16") as ParallelTensor;
+          using cos = ws.alloc([batch, seqLen, ropeDim], "BF16") as ParallelTensor;
+          using sin = ws.alloc([batch, seqLen, ropeDim], "BF16") as ParallelTensor;
+          input.h2d(inputBytes);
+          cos.h2d(cosBytes);
+          sin.h2d(sinBytes);
+          using pe = input.slice(1, 0, ropeDim);
+          using rotated = pe.applyRotaryPosEmb(cos, sin, ropeDim, ropeDim, 1, seqLen, batch, 1, interleaved);
+          using nope = headDim > ropeDim ? input.slice(1, ropeDim, headDim - ropeDim) : undefined;
+          using expected = (nope ? rotated.cat([nope], 1) : rotated.viewClone()) as ParallelTensor;
+          using actual = input.applyRotaryPosEmb(cos, sin, ropeDim, headDim, 1, seqLen, batch, 1, interleaved) as ParallelTensor;
+          po.synchronize();
+          assert.deepEqual(actual.shape, input.shape);
+          assert.equal(actual.parallelism, TensorParallelism.Replicated);
+          for (let rank = 0; rank < 2; rank++) {
+            const actualBytes = Buffer.alloc(inputBytes.length);
+            const expectedBytes = Buffer.alloc(inputBytes.length);
+            actual.shard(rank).d2h(actualBytes);
+            expected.shard(rank).d2h(expectedBytes);
+            assert.deepEqual(actualBytes, expectedBytes, `batch=${batch} seqLen=${seqLen} headDim=${headDim} interleaved=${interleaved} rank=${rank}`);
+          }
+        }
+      }
+    }
+  });
+
   it("Row-parallel applyRotaryPosEmb matches single-GPU", () => {
     const batch = 2;
     const nHeads = 4;
@@ -378,7 +419,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     refInput.h2d(f32ToBf16Bytes(inputF32));
     ref.synchronize();
 
-    const refOut = refInput.applyRotaryPosEmb(refCos, refSin, ropeDim, nHeads, seqLen, batch, 1);
+    const refOut = refInput.applyRotaryPosEmb(refCos, refSin, ropeDim, ropeDim, nHeads, seqLen, batch, 1);
     ref.synchronize();
     const refBuf = Buffer.alloc(batch * nHeads * seqLen * ropeDim * 2);
     refOut.d2h(refBuf);
@@ -413,7 +454,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     pInput.shard(1).h2d(f32ToBf16Bytes(shard1F32));
     po.synchronize();
 
-    const pOut = pInput.applyRotaryPosEmb(pCos, pSin, ropeDim, nHeads, seqLen, batch, 1) as ParallelTensor;
+    const pOut = pInput.applyRotaryPosEmb(pCos, pSin, ropeDim, ropeDim, nHeads, seqLen, batch, 1) as ParallelTensor;
     po.synchronize();
 
     assert.equal(pOut.parallelism, TensorParallelism.Row);
@@ -494,7 +535,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     refInput.h2d(f32ToBf16Bytes(inputF32));
     ref.synchronize();
 
-    const refOut = refInput.applyRotaryPosEmb(refCos, refSin, ropeDim, nHeads, seqLen, batch, 1);
+    const refOut = refInput.applyRotaryPosEmb(refCos, refSin, ropeDim, ropeDim, nHeads, seqLen, batch, 1);
     ref.synchronize();
     const refBuf = Buffer.alloc(batch * nHeads * seqLen * ropeDim * 2);
     refOut.d2h(refBuf);
@@ -513,7 +554,7 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
     pInput.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    const pOut = pInput.applyRotaryPosEmb(pCos, pSin, ropeDim, nHeads, seqLen, batch, 1) as ParallelTensor;
+    const pOut = pInput.applyRotaryPosEmb(pCos, pSin, ropeDim, ropeDim, nHeads, seqLen, batch, 1) as ParallelTensor;
     po.synchronize();
 
     assert.equal(pOut.parallelism, TensorParallelism.Replicated);

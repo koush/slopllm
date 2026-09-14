@@ -35,7 +35,7 @@ def test_apply_rotary_pos_emb_unsqueeze1(glm, device):
     x_flat = x.reshape(batch * n_heads, seq_len, rope_dim)
     out_flat = out.reshape(batch * n_heads, seq_len, rope_dim)
 
-    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, n_heads, seq_len, batch, 1)
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, rope_dim, n_heads, seq_len, batch, 1)
 
     ref = _ref_apply_rotary_pos_emb(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), unsqueeze_dim=1)
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)
@@ -52,7 +52,7 @@ def test_apply_rotary_pos_emb_unsqueeze2(glm, device):
     x_flat = x.reshape(batch * seq_len, n_heads, rope_dim)
     out_flat = out.reshape(batch * seq_len, n_heads, rope_dim)
 
-    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, n_heads, seq_len, batch, 2)
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, rope_dim, n_heads, seq_len, batch, 2)
 
     ref = _ref_apply_rotary_pos_emb(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), unsqueeze_dim=2)
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)
@@ -69,7 +69,7 @@ def test_apply_rotary_pos_emb_position_zero(glm, device):
     x_flat = x.reshape(batch * n_heads, seq_len, rope_dim)
     out_flat = out.reshape(batch * n_heads, seq_len, rope_dim)
 
-    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, n_heads, seq_len, batch, 1)
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, rope_dim, n_heads, seq_len, batch, 1)
 
     ref = _ref_apply_rotary_pos_emb(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), unsqueeze_dim=1)
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)
@@ -101,7 +101,7 @@ def test_apply_rotary_pos_emb_partial_passthrough(glm, device):
     x_flat = x.reshape(batch * n_heads, seq_len, head_dim)
     out_flat = out.reshape(batch * n_heads, seq_len, head_dim)
 
-    glm.apply_rotary_pos_emb_partial(out_flat, x_flat, cos_emb, sin_emb,
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb,
                                        rope_dim, head_dim, n_heads, seq_len, batch, 1)
 
     ref = _ref_apply_rotary_pos_emb_partial(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), rope_dim, unsqueeze_dim=1)
@@ -126,7 +126,7 @@ def test_apply_rotary_pos_emb_partial_qwen35_dims(glm, device):
     x_flat = x.reshape(batch * n_heads, seq_len, head_dim)
     out_flat = out.reshape(batch * n_heads, seq_len, head_dim)
 
-    glm.apply_rotary_pos_emb_partial(out_flat, x_flat, cos_emb, sin_emb,
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb,
                                        rope_dim, head_dim, n_heads, seq_len, batch, 1)
 
     ref = _ref_apply_rotary_pos_emb_partial(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), rope_dim, unsqueeze_dim=1)
@@ -145,7 +145,7 @@ def test_apply_rotary_pos_emb_glm51_dims(glm, device):
     x_flat = x.reshape(batch * n_heads, seq_len, rope_dim)
     out_flat = out.reshape(batch * n_heads, seq_len, rope_dim)
 
-    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, n_heads, seq_len, batch, 1)
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, rope_dim, n_heads, seq_len, batch, 1)
 
     ref = _ref_apply_rotary_pos_emb(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), unsqueeze_dim=1)
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)

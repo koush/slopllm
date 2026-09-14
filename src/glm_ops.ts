@@ -416,15 +416,15 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
-    super.applyRotaryPosEmb(cos, sin, ropeDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+    super.applyRotaryPosEmb(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
     let inputData = this.data;
     if (this.shape.length === 2) {
       using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
       inputData = reshaped.data;
     }
     const out = this.workspace.alloc(this.shape, this.type);
-    getNativeAddon().applyRotaryPosEmb(this.glm.ctx, out.data, inputData, cos.data, sin.data, ropeDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false);
+    getNativeAddon().applyRotaryPosEmb(this.glm.ctx, out.data, inputData, cos.data, sin.data, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false);
     return out;
   }
 
@@ -643,14 +643,6 @@ export class GlmTensor extends Tensor {
 
   maskedFill(mask: Tensor, value: number, n: number): void {
     getNativeAddon().maskedFill(this.glm.ctx, this.data, this.data, mask.data, value, n);
-  }
-
-  applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
-    super.applyRotaryPosEmbPartial(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
-    using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
-    const out = this.workspace.alloc(this.shape, this.type);
-    getNativeAddon().applyRotaryPosEmbPartial(this.glm.ctx, out.data, reshaped.data, cos.data, sin.data, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false);
-    return out;
   }
 
   reduceSum(): Tensor {

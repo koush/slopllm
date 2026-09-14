@@ -167,10 +167,10 @@ class Qwen3FP8Model(Qwen3Model):
 
         glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
                                   self._ws["cos"], self._ws["sin"],
-                                  hd, n_heads, S, B, 1)
+                                  hd, hd, n_heads, S, B, 1)
         glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
                                   self._ws["cos"], self._ws["sin"],
-                                  hd, n_kv, S, B, 1)
+                                  hd, hd, n_kv, S, B, 1)
 
     def _mlp(self, BS: int, pfx: str) -> None:
         cfg = self.cfg

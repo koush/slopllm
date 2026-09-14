@@ -142,13 +142,13 @@ def test_prefix_chunk_vs_full():
     cos_full, sin_full = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, 1, S_full)
     kpe_4d = kpe_full.reshape(1, 1, S_full, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_full, sin_full, HEAD_DIM_KPE, 1, S_full, 1, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_full, sin_full, HEAD_DIM_KPE, HEAD_DIM_KPE, 1, S_full, 1, 1, interleaved=True)
     kpe_rope_full = kpe_rope_4d.reshape(S_full, HEAD_DIM_KPE)
 
     # Apply RoPE to q_pe
     q_pe_4d = q_pe_full.reshape(1, num_heads, S_full, HEAD_DIM_KPE)
     q_pe_rope_4d = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope_4d, q_pe_4d, cos_full, sin_full, HEAD_DIM_KPE, num_heads, S_full, 1, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope_4d, q_pe_4d, cos_full, sin_full, HEAD_DIM_KPE, HEAD_DIM_KPE, num_heads, S_full, 1, 1, interleaved=True)
     q_pe_rope_full = q_pe_rope_4d.reshape(S_full, num_heads, HEAD_DIM_KPE)
 
     # Test various chunk sizes

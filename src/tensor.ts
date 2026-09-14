@@ -586,7 +586,10 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+    if (!Number.isInteger(headDim) || headDim <= 0 || !Number.isInteger(ropeDim) || ropeDim < 0 || ropeDim > headDim || ropeDim % 2 !== 0) {
+      throw new Error(`applyRotaryPosEmb: invalid ropeDim=${ropeDim}, headDim=${headDim}`);
+    }
     if (this.shape.length === 2) {
       if (this.shape[0] !== batch * seqLen) throw new Error(`applyRotaryPosEmb: input shape[0]=${this.shape[0]} != batch*seqLen=${batch * seqLen}`);
     } else if (this.shape.length === 4) {
@@ -713,11 +716,6 @@ export abstract class Tensor implements Disposable {
   }
 
   maskedFill(mask: Tensor, value: number, n: number): void {
-  }
-
-  applyRotaryPosEmbPartial(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
-    if (this.shape[0] !== batch * seqLen) throw new Error(`applyRotaryPosEmbPartial: input shape[0]=${this.shape[0]} != batch*seqLen=${batch * seqLen}`);
-    return undefined as never;
   }
 
   reduceSum(): Tensor {

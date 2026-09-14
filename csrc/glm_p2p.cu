@@ -463,6 +463,8 @@ p2p_allgather_row_write_kernel(
 // even when the launch is a single block. blockIdx.x only strides threads over
 // the chunk; it is deliberately kept out of the peer index to avoid receiver
 // contention. Fire-and-forget writes avoid slow PCIe P2P reads.
+// Null destinations skip both the source load and the peer write, allowing
+// callers to omit unused owner chunks from the source allocation.
 // ---------------------------------------------------------------------------
 
 constexpr int RS_WRITE_THREADS = 128;
@@ -496,6 +498,7 @@ p2p_reduce_scatter_write_kernel(
             #pragma unroll
             for (int k = 0; k < N; k++) {
                 int peer = (k + rank) % N;   // src chunk == destination peer
+                if (dsts[peer] == nullptr) continue;
                 const char* src = static_cast<const char*>(local_shard)
                                   + (int64_t)peer * chunk_bytes;
                 char* dst = static_cast<char*>(dsts[peer])
@@ -509,6 +512,7 @@ p2p_reduce_scatter_write_kernel(
             #pragma unroll
             for (int k = 0; k < N; k++) {
                 int peer = (k + rank) % N;
+                if (dsts[peer] == nullptr) continue;
                 const char* src = static_cast<const char*>(local_shard)
                                   + (int64_t)peer * chunk_bytes;
                 char* dst = static_cast<char*>(dsts[peer])

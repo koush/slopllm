@@ -178,13 +178,8 @@ void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
 
 void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
                               const void* cos, const void* sin,
-                              int rope_dim, int n_heads, int seq_len,
+                              int rope_dim, int head_dim, int n_heads, int seq_len,
                               int batch, int unsqueeze_dim, bool interleaved);
-
-void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
-                                        const void* cos, const void* sin,
-                                        int rope_dim, int head_dim, int n_heads, int seq_len,
-                                        int batch, int unsqueeze_dim, bool interleaved);
 
 // RoPE + Head Transpose: [B*S, nH*in_stride] -> [B*nH, S, head_dim]
 // Applies RoPE to first rope_dim dims (if rope_dim > 0), then transposes

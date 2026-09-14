@@ -98,7 +98,7 @@ def attention_forward_cuda(glm, device, hidden_states, cos, sin, attention_mask,
     q_nope_buf = query[:, :, :qk_nope_dim].contiguous()
     q_pe_buf = query[:, :, qk_nope_dim:].contiguous()
     q_pe_rope = torch.empty_like(q_pe_buf)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_buf, cos, sin, qk_rope_dim, num_heads, S, B, 1)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_buf, cos, sin, qk_rope_dim, qk_rope_dim, num_heads, S, B, 1)
     query_full = torch.empty(B * num_heads, S, qk_head_dim, dtype=torch.bfloat16, device=device)
     glm.cat_last_dim(query_full.reshape(-1, qk_head_dim),
                      q_nope_buf.reshape(-1, qk_nope_dim),
@@ -133,7 +133,7 @@ def attention_forward_cuda(glm, device, hidden_states, cos, sin, attention_mask,
 
     k_pe_4d = k_pe_raw.reshape(B, 1, S, qk_rope_dim).contiguous()
     k_pe_rope = torch.empty_like(k_pe_4d)
-    glm.apply_rotary_pos_emb(k_pe_rope, k_pe_4d, cos, sin, qk_rope_dim, 1, S, B, 1)
+    glm.apply_rotary_pos_emb(k_pe_rope, k_pe_4d, cos, sin, qk_rope_dim, qk_rope_dim, 1, S, B, 1)
     k_pe_expanded = torch.empty(B, num_heads, S, qk_rope_dim, dtype=torch.bfloat16, device=device)
     glm.expand_dim1(k_pe_expanded.reshape(-1), k_pe_rope.reshape(-1),
                      num_heads, 1, S, qk_rope_dim, B)

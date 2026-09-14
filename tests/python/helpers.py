@@ -345,13 +345,6 @@ class GlmOps:
         self.lib.glm_apply_rotary_pos_emb.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_bool
-        ]
-
-        self.lib.glm_apply_rotary_pos_emb_partial.restype = None
-        self.lib.glm_apply_rotary_pos_emb_partial.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_bool
         ]
 
@@ -1367,18 +1360,8 @@ class GlmOps:
             dim_half, batch, seq_len
         )
 
-    def apply_rotary_pos_emb(self, output, x, cos, sin, rope_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved=False):
+    def apply_rotary_pos_emb(self, output, x, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved=False):
         self.lib.glm_apply_rotary_pos_emb(
-            self.ctx,
-            self._ptr(output),
-            self._ptr(x),
-            self._ptr(cos),
-            self._ptr(sin),
-            rope_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved
-        )
-
-    def apply_rotary_pos_emb_partial(self, output, x, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved=False):
-        self.lib.glm_apply_rotary_pos_emb_partial(
             self.ctx,
             self._ptr(output),
             self._ptr(x),

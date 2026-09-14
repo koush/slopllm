@@ -222,9 +222,9 @@ def qwen3_attention_cuda(glm, device, hidden_states, cos, sin, causal_mask,
                      B, S, num_kv_heads, head_dim, 0, 2, 1, 3)
 
     q_rope = torch.empty_like(q_t)
-    glm.apply_rotary_pos_emb(q_rope, q_t, cos, sin, head_dim, num_heads, S, B, 1)
+    glm.apply_rotary_pos_emb(q_rope, q_t, cos, sin, head_dim, head_dim, num_heads, S, B, 1)
     k_rope = torch.empty_like(k_t)
-    glm.apply_rotary_pos_emb(k_rope, k_t, cos, sin, head_dim, num_kv_heads, S, B, 1)
+    glm.apply_rotary_pos_emb(k_rope, k_t, cos, sin, head_dim, head_dim, num_kv_heads, S, B, 1)
 
     if num_kv_groups > 1:
         k_expanded = torch.empty(B, num_heads, S, head_dim, dtype=torch.bfloat16, device=device)

@@ -86,13 +86,13 @@ def indexer_forward_cuda(glm, device, hidden_states, q_resid, cos, sin, attentio
         q_pe = idx_q[:, :, :, :qk_rope_dim].contiguous()
         q_nope = idx_q[:, :, :, qk_rope_dim:].contiguous()
         q_pe_rope = torch.empty_like(q_pe)
-        glm.apply_rotary_pos_emb(q_pe_rope, q_pe, cos, sin, qk_rope_dim, n_heads, S, B, 2, interleaved=True)
+        glm.apply_rotary_pos_emb(q_pe_rope, q_pe, cos, sin, qk_rope_dim, qk_rope_dim, n_heads, S, B, 2, interleaved=True)
         q_out = torch.empty(B * S * n_heads, head_dim, dtype=torch.bfloat16, device=device)
         glm.cat_last_dim(q_out, q_pe_rope.reshape(-1, qk_rope_dim), q_nope.reshape(-1, nope_dim),
                          qk_rope_dim, nope_dim, B * S * n_heads)
     else:
         q_out = torch.empty_like(idx_q)
-        glm.apply_rotary_pos_emb(q_out, idx_q, cos, sin, qk_rope_dim, n_heads, S, B, 2, interleaved=True)
+        glm.apply_rotary_pos_emb(q_out, idx_q, cos, sin, qk_rope_dim, qk_rope_dim, n_heads, S, B, 2, interleaved=True)
     q_out = q_out.reshape(B, S, n_heads, head_dim)
 
     k = torch.empty(B * S, head_dim, dtype=torch.bfloat16, device=device)
@@ -108,7 +108,7 @@ def indexer_forward_cuda(glm, device, hidden_states, q_resid, cos, sin, attentio
         k_nope = k_normed[:, :, qk_rope_dim:].contiguous()
         k_pe_4d = k_pe.reshape(B, S, 1, qk_rope_dim).contiguous()
         k_pe_rope_4d = torch.empty_like(k_pe_4d)
-        glm.apply_rotary_pos_emb(k_pe_rope_4d, k_pe_4d, cos, sin, qk_rope_dim, 1, S, B, 2, interleaved=True)
+        glm.apply_rotary_pos_emb(k_pe_rope_4d, k_pe_4d, cos, sin, qk_rope_dim, qk_rope_dim, 1, S, B, 2, interleaved=True)
         k_pe_rope = k_pe_rope_4d.reshape(B, S, qk_rope_dim)
         k_out = torch.empty(B * S, head_dim, dtype=torch.bfloat16, device=device)
         glm.cat_last_dim(k_out, k_pe_rope.reshape(-1, qk_rope_dim), k_nope.reshape(-1, nope_dim),
@@ -116,7 +116,7 @@ def indexer_forward_cuda(glm, device, hidden_states, q_resid, cos, sin, attentio
     else:
         k_out = torch.empty_like(k_normed)
         k_pe_4d = k_normed.reshape(B, S, 1, qk_rope_dim).contiguous()
-        glm.apply_rotary_pos_emb(k_out.reshape(B, S, 1, qk_rope_dim), k_pe_4d, cos, sin, qk_rope_dim, 1, S, B, 2, interleaved=True)
+        glm.apply_rotary_pos_emb(k_out.reshape(B, S, 1, qk_rope_dim), k_pe_4d, cos, sin, qk_rope_dim, qk_rope_dim, 1, S, B, 2, interleaved=True)
     k_out = k_out.reshape(B, S, head_dim)
 
     weights = torch.empty(B * S, n_heads, dtype=torch.bfloat16, device=device)

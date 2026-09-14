@@ -662,7 +662,7 @@ export class Glm51Model extends ChatModel {
     using kvcache = this.glm.withStream(() => {
       using kPeRopeStream = this.glm.withStream(() => {
         using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!);
-        return kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave)
+        return kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave)
       });
       using kPeRope = kPeRopeStream.result;
 
@@ -689,27 +689,21 @@ export class Glm51Model extends ChatModel {
     const shared = cfg.indexerTypes[layerIdx] === "shared";
     const skipIndexer = dense || shared;
 
-    // Indexer K: wk(normed) → layernorm → split → RoPE → concat → append to kData
+    // Indexer K: wk(normed) → layernorm → partial RoPE → append to kData
     // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
     using kvcacheIndex = skipIndexer
       ? undefined
       : this.glm.withStream(() => {
         const idxRopeDim = qkRopeDim;
-        const idxNopeDim = cfg.indexHeadDim - idxRopeDim;
         using idxKRaw = normed.linear(this.tensors.get(`${pfx}.indexer.wk.weight`)!);
         using idxKNormed = idxKRaw.layernorm(
           this.tensors.get(`${pfx}.indexer.k_norm.weight`)!,
           this.tensors.get(`${pfx}.indexer.k_norm.bias`)!,
           1e-6,
         );
-        using idxKOut = idxNopeDim > 0
-          ? (() => {
-            using idxKPe = idxKNormed.slice(1, 0, idxRopeDim);
-            using idxKNope = idxKNormed.slice(1, idxRopeDim, idxNopeDim);
-            using idxKPeRope = idxKPe.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
-            return idxKPeRope.cat([idxKNope], 1);
-          })()
-          : idxKNormed.applyRotaryPosEmb(cos, sin, idxRopeDim, 1, S, B, 1, cfg.indexerRopeInterleave);
+        using idxKOut = idxKNormed.applyRotaryPosEmb(
+          cos, sin, idxRopeDim, cfg.indexHeadDim, 1, S, B, 1, cfg.indexerRopeInterleave,
+        );
 
         return state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
       });

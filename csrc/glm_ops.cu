@@ -1856,17 +1856,8 @@ __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
 
 void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
                                const void* cos, const void* sin,
-                               int rope_dim, int n_heads, int seq_len,
+                               int rope_dim, int head_dim, int n_heads, int seq_len,
                                int batch, int unsqueeze_dim, bool interleaved) {
-    glm_apply_rotary_pos_emb_partial(ctx, out, x, cos, sin,
-                                      rope_dim, rope_dim, n_heads, seq_len,
-                                      batch, unsqueeze_dim, interleaved);
-}
-
-void glm_apply_rotary_pos_emb_partial(GlmCtx* ctx, void* out, const void* x,
-                                        const void* cos, const void* sin,
-                                        int rope_dim, int head_dim, int n_heads, int seq_len,
-                                        int batch, int unsqueeze_dim, bool interleaved) {
     cudaSetDevice(ctx->device_id);
     int total = batch * n_heads * seq_len * head_dim;
     int block_size = 256;

@@ -528,10 +528,10 @@ class Qwen3Model:
 
         glm.apply_rotary_pos_emb(self._ws["q_rope"], self._ws["q_t"],
                                   self._ws["cos"], self._ws["sin"],
-                                  hd, n_heads, S, B, 1)
+                                  hd, hd, n_heads, S, B, 1)
         glm.apply_rotary_pos_emb(self._ws["k_rope"], self._ws["k_t"],
                                   self._ws["cos"], self._ws["sin"],
-                                  hd, n_kv, S, B, 1)
+                                  hd, hd, n_kv, S, B, 1)
 
     def _write_kv_flat(self, layer_idx: int, S: int, cache: FlatKVCache,
                        offset: int = 0) -> None:
@@ -664,4 +664,3 @@ class Qwen3Model:
         glm.linear(self._ws["o_proj_buf"], self._ws["flash_out"],
                     self.weights[f"{pfx}.self_attn.o_proj.weight"],
                     BS, hs, n_heads * hd)
-

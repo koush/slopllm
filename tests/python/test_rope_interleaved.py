@@ -46,7 +46,7 @@ def test_apply_rotary_pos_emb_interleaved_basic(glm, device):
     x_flat = x.reshape(batch * n_heads, seq_len, rope_dim)
     out_flat = out.reshape(batch * n_heads, seq_len, rope_dim)
 
-    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, n_heads, seq_len, batch, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, rope_dim, n_heads, seq_len, batch, 1, interleaved=True)
 
     ref = _ref_apply_rotary_pos_emb_interleaved(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), unsqueeze_dim=1)
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)
@@ -63,8 +63,8 @@ def test_apply_rotary_pos_emb_interleaved_vs_neox_differ(glm, device):
 
     x_flat = x.reshape(batch * n_heads, seq_len, rope_dim)
 
-    glm.apply_rotary_pos_emb(out_neox.reshape(batch * n_heads, seq_len, rope_dim), x_flat, cos_emb, sin_emb, rope_dim, n_heads, seq_len, batch, 1, interleaved=False)
-    glm.apply_rotary_pos_emb(out_interleaved.reshape(batch * n_heads, seq_len, rope_dim), x_flat, cos_emb, sin_emb, rope_dim, n_heads, seq_len, batch, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(out_neox.reshape(batch * n_heads, seq_len, rope_dim), x_flat, cos_emb, sin_emb, rope_dim, rope_dim, n_heads, seq_len, batch, 1, interleaved=False)
+    glm.apply_rotary_pos_emb(out_interleaved.reshape(batch * n_heads, seq_len, rope_dim), x_flat, cos_emb, sin_emb, rope_dim, rope_dim, n_heads, seq_len, batch, 1, interleaved=True)
 
     assert not torch.equal(out_neox.cpu(), out_interleaved.cpu()), "Interleaved and non-interleaved RoPE should produce different outputs"
 
@@ -80,7 +80,7 @@ def test_apply_rotary_pos_emb_interleaved_position_zero(glm, device):
     x_flat = x.reshape(batch * n_heads, seq_len, rope_dim)
     out_flat = out.reshape(batch * n_heads, seq_len, rope_dim)
 
-    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, n_heads, seq_len, batch, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, rope_dim, n_heads, seq_len, batch, 1, interleaved=True)
 
     ref = _ref_apply_rotary_pos_emb_interleaved(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), unsqueeze_dim=1)
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)
@@ -100,7 +100,7 @@ def test_apply_rotary_pos_emb_partial_interleaved(glm, device):
     x_flat = x.reshape(batch * n_heads, seq_len, head_dim)
     out_flat = out.reshape(batch * n_heads, seq_len, head_dim)
 
-    glm.apply_rotary_pos_emb_partial(out_flat, x_flat, cos_emb, sin_emb,
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb,
                                        rope_dim, head_dim, n_heads, seq_len, batch, 1, interleaved=True)
 
     x_rot = x[..., :rope_dim]
@@ -142,7 +142,7 @@ def test_rope_transpose_interleaved_with_rope(glm, device):
     out_transpose = torch.empty(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
     glm.ropeTranspose(out_transpose, x, cos_out, sin_out, 0, head_dim, n_heads, seq_len, batch, in_stride)
     out_rope = torch.empty(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
-    glm.apply_rotary_pos_emb(out_rope, out_transpose, cos_out, sin_out, rope_dim, n_heads, seq_len, batch, 0, interleaved=True)
+    glm.apply_rotary_pos_emb(out_rope, out_transpose, cos_out, sin_out, rope_dim, rope_dim, n_heads, seq_len, batch, 0, interleaved=True)
 
     torch.testing.assert_close(out_cuda.cpu(), out_rope.cpu(), atol=0, rtol=0)
 
@@ -159,7 +159,7 @@ def test_apply_rotary_pos_emb_interleaved_glm51_dims(glm, device):
     x_flat = x.reshape(batch * n_heads, seq_len, rope_dim)
     out_flat = out.reshape(batch * n_heads, seq_len, rope_dim)
 
-    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, n_heads, seq_len, batch, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, rope_dim, n_heads, seq_len, batch, 1, interleaved=True)
 
     ref = _ref_apply_rotary_pos_emb_interleaved(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), unsqueeze_dim=1)
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)
@@ -224,7 +224,7 @@ def test_neox_still_works_after_interleaved_change(glm, device):
     x_flat = x.reshape(batch * n_heads, seq_len, rope_dim)
     out_flat = out.reshape(batch * n_heads, seq_len, rope_dim)
 
-    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, n_heads, seq_len, batch, 1, interleaved=False)
+    glm.apply_rotary_pos_emb(out_flat, x_flat, cos_emb, sin_emb, rope_dim, rope_dim, n_heads, seq_len, batch, 1, interleaved=False)
 
     ref = _ref_apply_rotary_pos_emb_neox(x.cpu(), cos_emb.cpu(), sin_emb.cpu(), unsqueeze_dim=1)
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)

@@ -135,12 +135,12 @@ def test_mla_prefill_causal(glm, device):
     cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
     q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
 
     kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
@@ -210,12 +210,12 @@ def test_mla_prefill_noncausal(glm, device):
     cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
     q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
 
     kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
@@ -642,12 +642,12 @@ def test_mla_prefill_lse(glm, device):
     cos, sin = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, S)
     q_pe_4d = q_pe.reshape(B, num_heads, S, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos, sin, HEAD_DIM_KPE, HEAD_DIM_KPE, num_heads, S, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * S, num_heads, HEAD_DIM_KPE)
 
     kpe_4d = kpe.reshape(B, 1, S, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos, sin, HEAD_DIM_KPE, HEAD_DIM_KPE, 1, S, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(S, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(S, PAGE_SIZE, HEAD_DIM_CKV)
@@ -930,12 +930,12 @@ def test_mla_prefill_causal_custom_tree_mask(glm, device):
     cos_k, sin_k = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, kv_len)
     q_pe_4d = q_pe.reshape(B, num_heads, qo_len, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos_q, sin_q, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos_q, sin_q, HEAD_DIM_KPE, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * qo_len, num_heads, HEAD_DIM_KPE)
 
     kpe_4d = kpe.reshape(B, 1, kv_len, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_k, sin_k, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_k, sin_k, HEAD_DIM_KPE, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(kv_len, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(num_pages, page_size, HEAD_DIM_CKV)
@@ -995,12 +995,12 @@ def test_mla_prefill_causal_custom_matches_full_custom(glm, device):
     cos_k, sin_k = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, kv_len)
     q_pe_4d = q_pe.reshape(B, num_heads, qo_len, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos_q, sin_q, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos_q, sin_q, HEAD_DIM_KPE, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * qo_len, num_heads, HEAD_DIM_KPE)
 
     kpe_4d = kpe.reshape(B, 1, kv_len, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_k, sin_k, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_k, sin_k, HEAD_DIM_KPE, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(kv_len, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(num_pages, page_size, HEAD_DIM_CKV)
@@ -1070,12 +1070,12 @@ def test_mla_prefill_causal_custom_causal_suffix_matches_causal(glm, device):
     cos_k, sin_k = _make_rotary_embed(glm, device, HEAD_DIM_KPE // 2, B, kv_len)
     q_pe_4d = q_pe.reshape(B, num_heads, qo_len, HEAD_DIM_KPE)
     q_pe_rope = torch.empty_like(q_pe_4d)
-    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos_q, sin_q, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(q_pe_rope, q_pe_4d, cos_q, sin_q, HEAD_DIM_KPE, HEAD_DIM_KPE, num_heads, qo_len, B, 1, interleaved=True)
     q_pe_rope = q_pe_rope.reshape(B * qo_len, num_heads, HEAD_DIM_KPE)
 
     kpe_4d = kpe.reshape(B, 1, kv_len, HEAD_DIM_KPE)
     kpe_rope_4d = torch.empty_like(kpe_4d)
-    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_k, sin_k, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
+    glm.apply_rotary_pos_emb(kpe_rope_4d, kpe_4d, cos_k, sin_k, HEAD_DIM_KPE, HEAD_DIM_KPE, 1, kv_len, B, 1, interleaved=True)
     kpe_rope = kpe_rope_4d.reshape(kv_len, HEAD_DIM_KPE)
 
     ckv_paged = ckv.reshape(num_pages, page_size, HEAD_DIM_CKV)

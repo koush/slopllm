@@ -318,7 +318,9 @@ export class ParallelTensor extends Tensor {
     return true;
   }
 
-  allGather(workspace: WorkspaceBase, output?: ParallelTensor): ParallelTensor {
+  // lastRank is an exclusive P2P sender limit. Omitted shards are unwritten;
+  // callers must discard those output regions. NCCL still gathers every rank.
+  allGather(workspace: WorkspaceBase, output?: ParallelTensor, lastRank = this.worldSize): ParallelTensor {
     if (this.parallelism === TensorParallelism.Replicated) {
       return this;
     }
@@ -343,7 +345,7 @@ export class ParallelTensor extends Tensor {
 
     output ||= workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
 
-    if (this.tryP2PAllGather(output)) {
+    if (this.tryP2PAllGather(output, lastRank)) {
       return output;
     }
 
@@ -413,7 +415,7 @@ export class ParallelTensor extends Tensor {
    * too large for the P2P group, in which case the caller should use NCCL.
    * Dtype-agnostic: copies raw bytes, supports all element types.
    */
-  private tryP2PAllGather(output: ParallelTensor): boolean {
+  private tryP2PAllGather(output: ParallelTensor, lastRank = this.worldSize): boolean {
     if (!this.parallelOps.p2pEnabled)
       return false;
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
@@ -423,14 +425,17 @@ export class ParallelTensor extends Tensor {
     if (!group)
       return false;
 
-    const postBarrier = this.beginP2PAllGather(group, output);
+    const postBarrier = this.beginP2PAllGather(group, output, lastRank);
     group.barrier(this.devices);
     postBarrier();
     return true;
   }
 
-  beginP2PAllGather(group: P2PAllReduceGroup, output: ParallelTensor) {
+  beginP2PAllGather(group: P2PAllReduceGroup, output: ParallelTensor, lastRank = this.worldSize) {
     const addon = getNativeAddon();
+    if (!Number.isInteger(lastRank) || lastRank < 0 || lastRank > this.worldSize) {
+      throw new Error(`beginP2PAllGather: invalid lastRank ${lastRank}`);
+    }
 
     // Guard before allocating so the unsupported path can't leak the shards.
     if (this.parallelism !== TensorParallelism.Column && this.parallelism !== TensorParallelism.Row) {
@@ -458,7 +463,7 @@ export class ParallelTensor extends Tensor {
       // Write-based Column AllGather: each GPU writes its shard to all peers'
       // output buffers (concatenation along dim 0), then barrier ensures all
       // writes are visible. Uses same kernel as Row with outer=1.
-      for (let i = 0; i < this.worldSize; ++i) {
+      for (let i = 0; i < lastRank; ++i) {
         const rotatedPtrs = new Array<number>(8).fill(0);
         for (let k = 0; k < this.worldSize; k++) {
           const owner = (i + k) % this.worldSize;
@@ -492,7 +497,7 @@ export class ParallelTensor extends Tensor {
       // output buffers, then barrier ensures all writes are visible.
       // Peer pointers are rotated by rank so all N GPUs don't target the
       // same peer's NVLink port simultaneously.
-      for (let i = 0; i < this.worldSize; ++i) {
+      for (let i = 0; i < lastRank; ++i) {
         const rotatedPtrs = new Array<number>(8).fill(0);
         for (let k = 0; k < this.worldSize; k++) {
           const owner = (i + k) % this.worldSize;
@@ -1842,8 +1847,8 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, outShards, [batch * seqLen, nHeads, headDim], this.type, this.parallelism);
   }
 
-  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
-    super.applyRotaryPosEmb(cos, sin, ropeDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+    super.applyRotaryPosEmb(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
     const pCos = cos as ParallelTensor;
     const pSin = sin as ParallelTensor;
     if (pCos.parallelism !== TensorParallelism.Replicated) {
@@ -1860,7 +1865,7 @@ export class ParallelTensor extends Tensor {
       : nHeads;
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      outShards.push(this.shards[i].applyRotaryPosEmb(pCos.shards[i], pSin.shards[i], ropeDim, shardNHeads, seqLen, batch, unsqueezeDim, interleaved));
+      outShards.push(this.shards[i].applyRotaryPosEmb(pCos.shards[i], pSin.shards[i], ropeDim, headDim, shardNHeads, seqLen, batch, unsqueezeDim, interleaved));
     }
     return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
   }
@@ -4183,13 +4188,18 @@ export class ParallelOps implements DeviceOps {
   // multi-seq / CP need qoIndptr rebasing which is not yet implemented.
   private tryMergeIndexerTopkByOwner(localValues: ParallelTensor, localIndices: ParallelTensor, totalQ: number, topk: number): { values: Tensor, indices: Tensor } | undefined {
     const W = this.worldSize;
-    if (!CP_TOPK_OWNER_MERGE || !this.p2pEnabled || totalQ % W !== 0 || ![2, 4, 8].includes(W)) {
+    if (!CP_TOPK_OWNER_MERGE || !this.p2pEnabled || totalQ <= 0 || ![2, 4, 8].includes(W)) {
       return undefined;
     }
     const group = this.getP2PGroup(this.devices[0].currentStream);
     if (!group) return undefined;
 
-    const ownerQ = totalQ / W;
+    // Keep equal-sized owner buffers, but only scatter to owners with real
+    // queries. A partially filled final real owner still needs input padding.
+    const ownerQ = Math.ceil(totalQ / W);
+    const paddedQ = ownerQ * W;
+    const activeOwners = Math.ceil(totalQ / ownerQ);
+    const scatterQ = activeOwners * ownerQ;
     const ownerValueBytes = ownerQ * topk * 2;
     const ownerIndexBytes = ownerQ * topk * 4;
     const stagedValues = localValues.shards.map(shard => group.alloc(shard.workspace, [W, ownerQ, topk], "BF16"));
@@ -4197,24 +4207,40 @@ export class ParallelOps implements DeviceOps {
     const addon = getNativeAddon();
 
     for (let source = 0; source < W; source++) {
+      const sourceValues = localValues.shards[source];
+      const sourceIndices = localIndices.shards[source];
+      using paddedValues = scatterQ === totalQ ? undefined : sourceValues.workspace.alloc([paddedQ, topk], "BF16");
+      using paddedIndices = scatterQ === totalQ ? undefined : sourceIndices.workspace.alloc([paddedQ, topk], "I32");
+      if (paddedValues && paddedIndices) {
+        paddedValues.memcpy(sourceValues, sourceValues.bytes, MemcpyKind.DeviceToDevice);
+        paddedIndices.memcpy(sourceIndices, sourceIndices.bytes, MemcpyKind.DeviceToDevice);
+        using dummyValues = paddedValues.narrow(totalQ, paddedQ - totalQ);
+        using dummyIndices = paddedIndices.narrow(totalQ, paddedQ - totalQ);
+        dummyValues.fill(-Infinity, dummyValues.numElements);
+        // fill writes BF16 elements; zero both halves of each dummy I32.
+        dummyIndices.fill(0, dummyIndices.bytes / 2);
+      }
       const valuePtrs = new Array<number>(8).fill(0);
       const indexPtrs = new Array<number>(8).fill(0);
-      for (let owner = 0; owner < W; owner++) {
+      for (let owner = 0; owner < activeOwners; owner++) {
         valuePtrs[owner] = this.peerArenaPointer(source, owner, stagedValues[owner].data);
         indexPtrs[owner] = this.peerArenaPointer(source, owner, stagedIndices[owner].data);
       }
+      using write = this.devices[source].withStream(() => {
+        addon.p2pReduceScatterWrite(
+          this.devices[source].ctx, (paddedValues ?? sourceValues).data,
+          valuePtrs[0], valuePtrs[1], valuePtrs[2], valuePtrs[3],
+          valuePtrs[4], valuePtrs[5], valuePtrs[6], valuePtrs[7],
+          W, ownerValueBytes, source,
+        );
+      });
       addon.p2pReduceScatterWrite(
-        this.devices[source].ctx, localValues.shards[source].data,
-        valuePtrs[0], valuePtrs[1], valuePtrs[2], valuePtrs[3],
-        valuePtrs[4], valuePtrs[5], valuePtrs[6], valuePtrs[7],
-        W, ownerValueBytes, source,
-      );
-      addon.p2pReduceScatterWrite(
-        this.devices[source].ctx, localIndices.shards[source].data,
+        this.devices[source].ctx, (paddedIndices ?? sourceIndices).data,
         indexPtrs[0], indexPtrs[1], indexPtrs[2], indexPtrs[3],
         indexPtrs[4], indexPtrs[5], indexPtrs[6], indexPtrs[7],
         W, ownerIndexBytes, source,
       );
+      write.streamWaitEvent();
     }
     group.barrier(this.devices);
 
@@ -4222,13 +4248,24 @@ export class ParallelOps implements DeviceOps {
     const ownerIndexShards: Tensor[] = [];
     const kTotal = topk * W;
     for (let owner = 0; owner < W; owner++) {
+      if (owner >= activeOwners) {
+        // Retain dummy merges, but initialize their staging locally instead
+        // of transferring dummy candidates from every source GPU.
+        stagedValues[owner].fill(-Infinity, stagedValues[owner].numElements);
+        stagedIndices[owner].fill(0, stagedIndices[owner].bytes / 2);
+      }
       using qvStream = this.devices[owner].withStream(() => {
-        using queryValuesFlat = stagedValues[owner].transpose4d(W, ownerQ, topk, 1, 1, 0, 2, 3);
+        // Swapping [W, 1, topk] to [1, W, topk] preserves flat order.
+        using queryValuesFlat = ownerQ === 1
+          ? stagedValues[owner].viewClone()
+          : stagedValues[owner].transpose4d(W, ownerQ, topk, 1, 1, 0, 2, 3);
         using queryValues = queryValuesFlat.reshape([ownerQ, kTotal]);
         return queryValues.topk(topk, kTotal);
       });
 
-      using queryIndicesFlat = stagedIndices[owner].transpose4d(W, ownerQ, topk, 1, 1, 0, 2, 3);
+      using queryIndicesFlat = ownerQ === 1
+        ? stagedIndices[owner].viewClone()
+        : stagedIndices[owner].transpose4d(W, ownerQ, topk, 1, 1, 0, 2, 3);
       using queryIndices = queryIndicesFlat.reshape([ownerQ, kTotal]);
 
       qvStream.streamWaitEvent();
@@ -4241,22 +4278,26 @@ export class ParallelOps implements DeviceOps {
     // These reads follow the scatter barrier; retain staging until the next one.
     group.sources.push(...stagedValues, ...stagedIndices);
 
-    const ownerValues = this.wrapShards(localValues.workspace, ownerValueShards, [totalQ, topk], "BF16", TensorParallelism.Column);
-    using ownerIndices = this.wrapShards(localIndices.workspace, ownerIndexShards, [totalQ, topk], "I32", TensorParallelism.Column);
+    const ownerValues = this.wrapShards(localValues.workspace, ownerValueShards, [paddedQ, topk], "BF16", TensorParallelism.Column);
+    using ownerIndices = this.wrapShards(localIndices.workspace, ownerIndexShards, [paddedQ, topk], "I32", TensorParallelism.Column);
     if (!CP_TOPK_SORT) {
-      const finalIndices = ownerIndices.allGather(localIndices.workspace);
-      return { values: ownerValues, indices: finalIndices };
+      using finalIndices = ownerIndices.allGather(localIndices.workspace, undefined, activeOwners);
+      // Values are unused by attention; retain the padded Column layout rather
+      // than adding a values gather. Only real index rows may reach topkToSlots.
+      return { values: ownerValues, indices: finalIndices.narrow(0, totalQ) };
     }
 
     using _ownerValues = ownerValues;
     const [mergedValues, finalIndices] = this.allGatherMultiple([ownerValues, ownerIndices], localValues.workspace);
+    using _mergedValues = mergedValues;
+    using _finalIndices = finalIndices;
 
     const pFinalIndices = this.cast(finalIndices);
     const pMergedValues = this.cast(mergedValues);
     for (let i = 0; i < W; i++) {
       this.devices[i].sortTopkByIndex(pFinalIndices.shards[i], pMergedValues.shards[i], totalQ, topk);
     }
-    return { values: mergedValues, indices: finalIndices };
+    return { values: mergedValues.narrow(0, totalQ), indices: finalIndices.narrow(0, totalQ) };
   }
 
   indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { values: Tensor, indices: Tensor } {
