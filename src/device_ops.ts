@@ -41,6 +41,13 @@ export type MlaQuery = { qAbsorbed: Tensor, qPe: Tensor, qAbsorbedScales?: Tenso
 /** E4M3 values and FP32 power-of-two dequantization scales along the last dimension. */
 export type Fp8Quantized = { values: Tensor, scales: Tensor };
 
+export interface StreamResult<T> extends Disposable {
+  streamId: number;
+  result: T;
+  streamWaitEvent(): void;
+  synchronize(): void;
+}
+
 export function fp8ScaleShape(input: Tensor, blockSize: number): number[] {
   const width = input.shape.at(-1);
   if (input.type !== 'BF16' || !width || !Number.isInteger(blockSize) || blockSize <= 0 || width % blockSize !== 0) {
@@ -77,7 +84,7 @@ export interface DeviceOps extends Disposable {
   currentStream: number;
   readonly activeStreams: readonly number[];
   availableStreams: number[];
-  withStream<T>(fn: () => T): Disposable & { streamId: number, result: T, streamWaitEvent(): void, synchronize(): void };
+  withStream<T>(fn: () => T): StreamResult<T>;
   /** Best-effort L2 warming of up to eight local tensor ranges in one grid. */
   prefetchL2(tensors: readonly Tensor[]): void;
 

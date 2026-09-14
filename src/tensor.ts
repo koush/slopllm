@@ -1,4 +1,4 @@
-import { StridedMmap, TensorParallelism } from "./device_ops";
+import { StridedMmap, TensorParallelism, type StreamResult } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { getNativeAddon } from "./native-addon";
 import { SafeTensorFile } from "./safetensors";
@@ -331,12 +331,49 @@ export abstract class Tensor implements Disposable {
   abstract d2h(buf: Buffer, size?: number): void;
 
   linear(weight: Tensor): Tensor {
+    this.validateLinear(weight);
+    return undefined as never;
+  }
+
+  protected validateLinear(weight: Tensor): void {
     if (this.shape.length !== 2) throw new Error(`linear: input must be 2D, got shape [${this.shape}]`);
     if (weight.shape.length !== 2) throw new Error(`linear: weight must be 2D, got shape [${weight.shape}]`);
     const weightK = weight.type === "U8" ? weight.shape[1] * 2 : weight.shape[1]; // NVFP4: packed K/2
     if (this.shape[1] !== weightK) throw new Error(`linear: input dim ${this.shape[1]} != weight dim ${weightK} (weight type ${weight.type}, shape [${weight.shape}])`);
     if (weight.type !== "BF16" && weight.type !== "F8_E4M3" && weight.type !== "U8") throw new Error(`linear: weight type must be BF16, F8_E4M3, or U8, got ${weight.type}`);
-    return undefined as never;
+  }
+
+  protected validateGroupedLinear(weights: readonly Tensor[]): void {
+    if (this.parallelism !== TensorParallelism.Replicated || this.pinned) {
+      throw new Error("groupedLinear: expected replicated device input");
+    }
+    for (const weight of weights) {
+      this.validateLinear(weight);
+      if (weight.workspace.glm !== this.workspace.glm || weight.pinned || weight.parallelism !== TensorParallelism.Replicated) {
+        throw new Error("groupedLinear: expected replicated device weights from the same backend");
+      }
+    }
+  }
+
+  /** Project the same input with each weight, preserving weight order.
+   * Handles may share completion and disposal; wait on all consumers before
+   * disposing any shared handle. Result tensors are owned by the caller.
+   */
+  groupedLinear(weights: readonly Tensor[]): StreamResult<Tensor>[] {
+    this.validateGroupedLinear(weights);
+    const streams: StreamResult<Tensor>[] = [];
+    try {
+      for (const weight of weights) {
+        streams.push(this.workspace.glm.withStream(() => this.linear(weight)));
+      }
+      return streams;
+    } catch (error) {
+      for (const stream of streams) {
+        stream[Symbol.dispose]();
+        stream.result[Symbol.dispose]();
+      }
+      throw error;
+    }
   }
 
   outputProj(weight: Tensor): Tensor {

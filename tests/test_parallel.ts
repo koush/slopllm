@@ -789,6 +789,110 @@ describe("ParallelOps.linear", () => {
   });
 });
 
+describe("groupedLinear", () => {
+  for (const mode of ["single", "p2p", "nccl"] as const) {
+    it(`${mode}: preserves projection order and stream dependencies through capture/replay`, () => {
+      const devices = [new GlmOps(0)];
+      if (mode !== "single") devices.push(new GlmOps(1));
+      const glm = mode === "single" ? devices[0] : new ParallelOps(devices);
+      if (glm instanceof ParallelOps) {
+        if (mode === "p2p") assert.equal(glm.p2pEnabled, true);
+        else glm.p2pEnabled = false;
+      }
+      const ws = new WorkspaceBase(glm);
+      try {
+        const widths = [64, 512, 128, 2048, 32];
+        const k = 128;
+        const weights = widths.map((n, p) => {
+          const weight = ws.alloc([n, k], "BF16", `grouped-weight-${p}`);
+          const values = Float32Array.from({ length: n * k }, (_, i) => ((i + p) % 9 - 4) / 16);
+          weight.h2d(f32ToBf16Bytes(values));
+          return { weight, values };
+        });
+        // Small decode batches use shared completion; prefill keeps projections independent.
+        for (const batch of [2, 9]) {
+          const input = ws.alloc([batch, k], "BF16", `grouped-input-${batch}`);
+          const outputs = widths.map((n, p) => ws.alloc([batch, n], "BF16", `grouped-output-${batch}-${p}`));
+          const run = () => {
+            using tracking = ws.startTracking();
+            const projections = input.groupedLinear(weights.map(w => w.weight));
+            try {
+              assert.equal(projections.length, widths.length);
+              const shared = glm instanceof ParallelOps && batch <= glm.worldSize;
+              assert.equal(new Set(projections.map(p => p.streamId)).size, shared ? 1 : widths.length);
+              for (const [p, projection] of projections.entries()) {
+                assert.deepEqual(projection.result.shape, [batch, widths[p]]);
+                assert.equal(projection.result.parallelism, TensorParallelism.Replicated);
+                // Each consumer waits independently on a different stream. Waiting
+                // twice must not invalidate the shared completion event/resources.
+                using consumer = glm.withStream(() => {
+                  projection.streamWaitEvent();
+                  projection.streamWaitEvent();
+                  outputs[p].memcpy(projection.result);
+                });
+                consumer.streamWaitEvent();
+              }
+            } finally {
+              for (const projection of projections) {
+                projection[Symbol.dispose]();
+                projection[Symbol.dispose]();
+                projection.result[Symbol.dispose]();
+              }
+            }
+          };
+          const verify = (seed: number) => {
+            glm.synchronize();
+            const inputValues = Float32Array.from({ length: batch * k }, (_, i) => ((i + seed) % 7 - 3) / 8);
+            for (const [p, output] of outputs.entries()) {
+              const expected = refLinear(inputValues, weights[p].values, batch, widths[p], k);
+              const shards = output instanceof ParallelTensor ? output.shards : [output];
+              for (const shard of shards) {
+                const buffer = Buffer.alloc(batch * widths[p] * 2);
+                shard.d2h(buffer);
+                const actual = bf16BytesToF32(buffer);
+                for (let i = 0; i < actual.length; i++) {
+                  assert.ok(Math.abs(actual[i] - expected[i]) <= 0.01,
+                    `${mode}, batch=${batch}, projection=${p}, element=${i}: ${actual[i]} != ${expected[i]}`);
+                }
+              }
+            }
+          };
+          const upload = (seed: number) => input.h2d(f32ToBf16Bytes(
+            Float32Array.from({ length: batch * k }, (_, i) => ((i + seed) % 7 - 3) / 8)));
+          upload(0);
+          run();
+          verify(0);
+          run();
+          glm.synchronize();
+          let graph: number | undefined, exec: number | undefined;
+          try {
+            glm.graphBeginCapture();
+            run();
+            graph = glm.graphEndCapture();
+            exec = glm.graphInstantiate(graph);
+            for (const seed of [1, 3]) {
+              upload(seed);
+              glm.graphLaunch(exec);
+              verify(seed);
+            }
+          } finally {
+            if (exec !== undefined) glm.graphExecDestroy(exec);
+            if (graph !== undefined) glm.graphDestroy(graph);
+          }
+          assert.deepEqual(input.groupedLinear([]), []);
+          using wrong = ws.alloc([16, k + 1], "BF16");
+          assert.throws(() => input.groupedLinear([weights[0].weight, wrong]), /input dim/);
+        }
+      } finally {
+        glm.synchronize();
+        ws.free();
+        if (glm instanceof ParallelOps) glm.free();
+        for (const device of devices) device.free();
+      }
+    });
+  }
+});
+
 describe("ParallelTensor.allReduce", () => {
   let glm0: GlmOps;
   let glm1: GlmOps;

@@ -1,4 +1,4 @@
-import { DeviceOps, fp8ScaleShape, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MlaQuery, type WorkspaceMemoryStats } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MlaQuery, type StreamResult, type WorkspaceMemoryStats } from "./device_ops";
 import { CaptureManager } from "./capture-manager";
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
@@ -794,6 +794,41 @@ export class ParallelTensor extends Tensor {
     throw new Error(`linear: unsupported parallelism combination W=${WP}, X=${XP}`);
   }
 
+  groupedLinear(weights: readonly Tensor[]): StreamResult<Tensor>[] {
+    this.validateGroupedLinear(weights);
+    // Keep replicated computation for prefill. Small batches share one gather
+    // across all eligible BF16 projections, including the tiny indexer weights.
+    if (this.worldSize === 1 || this.shape[0] > this.worldSize ||
+      !weights.some(weight => weight.type === "BF16" && weight.shape[0] % this.worldSize === 0)) {
+      return super.groupedLinear(weights);
+    }
+
+    const gathered = this.parallelOps.withStream(() => {
+      const projections: StreamResult<Tensor>[] = [];
+      try {
+        for (const weight of weights) {
+          projections.push(this.parallelOps.withStream(() => {
+            using narrowed = weight.type === "BF16"
+              ? this.parallelOps.tryNarrowToColumnParallel(weight as ParallelTensor)
+              : undefined;
+            return this.linear(narrowed ?? weight);
+          }));
+        }
+        for (const projection of projections) {
+          projection.streamWaitEvent();
+          projection[Symbol.dispose]();
+        }
+        return this.parallelOps.allGatherMultiple(projections.map(projection => projection.result as ParallelTensor), this.workspace);
+      } finally {
+        for (const projection of projections) {
+          projection[Symbol.dispose]();
+          projection.result[Symbol.dispose]();
+        }
+      }
+    });
+    return gathered.result.map(result => ({ ...gathered, result }));
+  }
+
   bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false, tokenMajor: boolean = false): Tensor {
     super.bmm(B, batch, M, N, K, transA, transB, tokenMajor);
     const pB = B as ParallelTensor;
@@ -977,6 +1012,10 @@ export class ParallelTensor extends Tensor {
 
   layernorm(weight: Tensor, bias: Tensor, eps: number): Tensor {
     super.layernorm(weight, bias, eps);
+    if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
+      using gathered = this.allGather(this.workspace);
+      return gathered.layernorm(weight, bias, eps);
+    }
     const pWeight = weight as ParallelTensor;
     const pBias = bias as ParallelTensor;
     const shards: Tensor[] = [];

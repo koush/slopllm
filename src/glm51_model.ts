@@ -384,8 +384,7 @@ export class Glm51Model extends ChatModel {
       name.endsWith(".mlp.shared_experts.down_proj.weight_weight_scale")) {
       return TensorParallelism.Row;
     }
-    // Indexer weights are always Replicated — the indexer is a small module
-    // that must run identically on every GPU to produce the same topk indices.
+    // Indexer weights stay Replicated.
     if (name.includes('.indexer.wq_b.weight')) {
       return TensorParallelism.Replicated;
     }
