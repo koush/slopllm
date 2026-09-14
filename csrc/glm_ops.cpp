@@ -1092,11 +1092,16 @@ static Napi::Value Bmm(const Napi::CallbackInfo& info) {
     int K = info[9].As<Napi::Number>().Int32Value();
     int transA = info[10].As<Napi::Number>().Int32Value();
     int transB = info[11].As<Napi::Number>().Int32Value();
+    int tokenMajor = info.Length() > 12 && info[12].As<Napi::Boolean>().Value();
+    if (tokenMajor && (transA || transB)) {
+        Napi::TypeError::New(env, "bmm: tokenMajor requires non-transposed operands").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
     glm_bmm(reinterpret_cast<GlmCtx*>(ctx_ptr),
             reinterpret_cast<void*>(c_ptr),
             reinterpret_cast<const void*>(a_ptr),
             reinterpret_cast<const void*>(b_ptr),
-            alpha, beta, batch, M, N, K, transA, transB);
+            alpha, beta, batch, M, N, K, transA, transB, tokenMajor);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("bmm failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

@@ -343,7 +343,12 @@ export abstract class Tensor implements Disposable {
     return this.linear(weight);
   }
 
-  bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
+  // tokenMajor: A=[M,batch,K], B=[batch,K,N], output=[M,batch,N].
+  // Default mode uses contiguous batch-major matrices and returns [batch*M,N].
+  bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false, tokenMajor: boolean = false): Tensor {
+    if (tokenMajor && (transA || transB)) {
+      throw new Error("bmm: tokenMajor requires non-transposed operands");
+    }
     return undefined as never;
   }
 
@@ -563,6 +568,16 @@ export abstract class Tensor implements Disposable {
     if (positionIds.type !== "I32") throw new Error(`rotaryEmbedding: positionIds must be I32, got ${positionIds.type}`);
     if (positionIds.shape[0] !== batch * seqLen) throw new Error(`rotaryEmbedding: positionIds shape[0]=${positionIds.shape[0]} != batch*seqLen=${batch * seqLen}`);
     return undefined as never;
+  }
+
+  absorbMlaQuery(kNopeWeight: Tensor, nHeads: number, kvLoraRank: number): Tensor {
+    const rows = this.shape[0];
+    const nopeDim = this.shape[1] / nHeads;
+    if (this.shape.length !== 2 || !Number.isInteger(nopeDim) ||
+      kNopeWeight.shape.length !== 2 || kNopeWeight.shape[0] !== nHeads * nopeDim || kNopeWeight.shape[1] !== kvLoraRank) {
+      throw new Error("absorbMlaQuery: incompatible query and key projection shapes");
+    }
+    return this.bmm(kNopeWeight, nHeads, rows, kvLoraRank, nopeDim, false, false, true);
   }
 
   ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {

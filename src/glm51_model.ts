@@ -448,8 +448,8 @@ export class Glm51Model extends ChatModel {
     if (!this.pendingKNope.has(kNopeKey) || !this.pendingQNope.has(qNopeKey)) {
       return;
     }
-    using kNopeProj = this.pendingKNope.get(kNopeKey)!;
-    using qNopeProj = this.pendingQNope.get(qNopeKey)!;
+    const kNopeProj = this.pendingKNope.get(kNopeKey)!;
+    const qNopeProj = this.pendingQNope.get(qNopeKey)!;
     this.pendingKNope.delete(kNopeKey);
     this.pendingQNope.delete(qNopeKey);
     using wAbsorbedTmp = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
@@ -482,7 +482,7 @@ export class Glm51Model extends ChatModel {
     if (name.endsWith(".q_b_proj.weight")) {
       const eb = 2;
       const srcPitch = qkHeadDim * inDim * eb;
-      const tQNope = this.alloc([nHeads * qkNopeDim, qLoraRank], "BF16", undefined, nopeParallelism);
+      const tQNope = this.alloc([nHeads * qkNopeDim, qLoraRank], "BF16", `${layerPfx}.q_nope_proj.weight`, nopeParallelism);
       const peName = name.replace(".q_b_proj.weight", ".q_pe_proj.weight");
       const tPe = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", peName, nopeParallelism);
       await Promise.all([
@@ -493,7 +493,7 @@ export class Glm51Model extends ChatModel {
     } else if (name.endsWith(".kv_b_proj.weight")) {
       const eb = 2;
       const srcPitch = (qkNopeDim + vHeadDim) * inDim * eb;
-      const tKNope = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", undefined, nopeParallelism);
+      const tKNope = this.alloc([nHeads * qkNopeDim, kvLoraRank], "BF16", `${layerPfx}.k_nope_proj.weight`, nopeParallelism);
       const vName = name.replace(".kv_b_proj.weight", ".v_proj.weight");
       const vPar = TensorParallelism.Replicated;
       using tVRaw = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", undefined, vPar);
@@ -749,6 +749,8 @@ export class Glm51Model extends ChatModel {
       return this.glm.projectMlaQuery(
         state, cache.ckv!, qNormed,
         this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
+        this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
+        this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
         this.tensors.get(`${pfx}.absorbed.weight`)!,
         cos, sin,
         qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,

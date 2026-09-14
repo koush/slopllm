@@ -789,8 +789,20 @@ export class ParallelTensor extends Tensor {
     throw new Error(`linear: unsupported parallelism combination W=${WP}, X=${XP}`);
   }
 
-  bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
+  bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false, tokenMajor: boolean = false): Tensor {
+    super.bmm(B, batch, M, N, K, transA, transB, tokenMajor);
     const pB = B as ParallelTensor;
+    if (tokenMajor) {
+      const headSharded = this.parallelism === TensorParallelism.Row && pB.parallelism === TensorParallelism.Column;
+      const replicated = this.parallelism === TensorParallelism.Replicated && pB.parallelism === TensorParallelism.Replicated;
+      if ((!headSharded && !replicated) || pB.parallelOps !== this.parallelOps || (headSharded && batch % this.worldSize !== 0)) {
+        throw new Error("bmm: tokenMajor requires replicated operands or Row queries and Column head weights");
+      }
+      const localHeads = headSharded ? batch / this.worldSize : batch;
+      const shards = this.shards.map((query, rank) => query.bmm(pB.shards[rank], localHeads, M, N, K, false, false, true));
+      return this.parallelOps.wrapShards(this.workspace, shards, [M, batch, N], this.type,
+        headSharded ? TensorParallelism.Row : TensorParallelism.Replicated);
+    }
 
     if (this.parallelism === pB.parallelism) {
       const shardBatch = (this.parallelism === TensorParallelism.Column) ? batch / this.worldSize : batch;
@@ -3204,15 +3216,19 @@ export class ParallelOps implements DeviceOps {
     };
   }
 
-  projectMlaQuery(state: ExecutionState, kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): MlaQuery {
+  projectMlaQuery(state: ExecutionState, kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, qNopeWeight: Tensor, kNopeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): MlaQuery {
     using qPeStream = this.withStream(() => {
       using qPeLin = qNormed.linear(qPeWeight);
       return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, qkRopeDim, ropeInterleave);
     });
-    using qAbsorbedLin = qNormed.linear(absorbedWeight);
-    const qAbsorbed = state.isDecode
-      ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
-      : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
+    const qAbsorbed = (() => {
+      if (process.env.GLM_USE_ABSORBED_Q === "1") {
+        using projected = qNormed.linear(absorbedWeight);
+        return projected.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
+      }
+      using qNope = qNormed.linear(qNopeWeight);
+      return qNope.absorbMlaQuery(kNopeWeight, nHeads, kvLoraRank);
+    })();
     const gatherQ = this.cast(kvCache).parallelism === TensorParallelism.Row;
     const quantized = gatherQ && state.cache.getPagedKV().sparseMode
       ? this.quantizeFp8(qAbsorbed, 128)

@@ -371,7 +371,8 @@ class GlmOps:
         self.lib.glm_bmm.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_float,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int
         ]
 
         self.lib.glm_rope_transpose.restype = None
@@ -1401,14 +1402,16 @@ class GlmOps:
             self._ptr(bias), rows, ctypes.c_float(scale), ctypes.c_bool(normalize)
         )
 
-    def bmm(self, C, A, B, alpha, beta, batch, M, N, K, transA=0, transB=0):
+    def bmm(self, C, A, B, alpha, beta, batch, M, N, K, transA=0, transB=0, token_major=False):
+        if token_major and (transA or transB):
+            raise ValueError("token_major requires non-transposed operands")
         self.lib.glm_bmm(
             self.ctx,
             self._ptr(C),
             self._ptr(A),
             self._ptr(B),
             ctypes.c_float(alpha), ctypes.c_float(beta),
-            batch, M, N, K, transA, transB
+            batch, M, N, K, transA, transB, int(token_major)
         )
 
     def ropeTranspose(self, output, input, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved=False):

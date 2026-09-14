@@ -170,9 +170,10 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false): Tensor {
-    const out = this.workspace.alloc([batch * M, N], this.type);
-    getNativeAddon().bmm(this.glm.ctx, out.data, this.data, B.data, 1.0, 0.0, batch, M, N, K, transA ? 1 : 0, transB ? 1 : 0);
+  bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false, tokenMajor: boolean = false): Tensor {
+    super.bmm(B, batch, M, N, K, transA, transB, tokenMajor);
+    const out = this.workspace.alloc(tokenMajor ? [M, batch, N] : [batch * M, N], this.type);
+    getNativeAddon().bmm(this.glm.ctx, out.data, this.data, B.data, 1.0, 0.0, batch, M, N, K, transA ? 1 : 0, transB ? 1 : 0, tokenMajor);
     return out;
   }
 
@@ -1309,15 +1310,19 @@ export class GlmOps implements DeviceOps {
     return { values, scales };
   }
 
-  projectMlaQuery(state: ExecutionState, _kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): { qAbsorbed: Tensor, qPe: Tensor } {
+  projectMlaQuery(state: ExecutionState, _kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, qNopeWeight: Tensor, kNopeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): { qAbsorbed: Tensor, qPe: Tensor } {
     using qPeStream = this.withStream(() => {
       using qPeLin = qNormed.linear(qPeWeight);
       return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, qkRopeDim, ropeInterleave);
     });
-    using qAbsorbedLin = qNormed.linear(absorbedWeight);
-    const qAbsorbed = state.isDecode
-      ? qAbsorbedLin.ropeTranspose(undefined!, undefined!, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank)
-      : qAbsorbedLin.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
+    const qAbsorbed = (() => {
+      if (process.env.GLM_USE_ABSORBED_Q === "1") {
+        using projected = qNormed.linear(absorbedWeight);
+        return projected.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
+      }
+      using qNope = qNormed.linear(qNopeWeight);
+      return qNope.absorbMlaQuery(kNopeWeight, nHeads, kvLoraRank);
+    })();
     qPeStream.streamWaitEvent();
     return { qAbsorbed, qPe: qPeStream.result };
   }

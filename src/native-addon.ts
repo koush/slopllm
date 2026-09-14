@@ -127,7 +127,7 @@ export interface NativeAddon {
   memcpy2d(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number, kind: number): void;
   memcpyPeer(ctx: number, dst: number, dstDevice: number, src: number, srcDevice: number, bytes: number): void;
   memcpy3dPeer(ctx: number, dstPtr: number, dstPitch: number, dstXSize: number, dstYSize: number, dstDevice: number, dstPosX: number, dstPosY: number, dstPosZ: number, srcPtr: number, srcPitch: number, srcXSize: number, srcYSize: number, srcDevice: number, srcPosX: number, srcPosY: number, srcPosZ: number, width: number, height: number, depth: number): void;
-  bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number): void;
+  bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number, tokenMajor?: boolean): void;
   ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, attnNHeads: number, headOffset: number, vProjHeadOffset: number): void;
   transpose4d(ctx: number, out: number, input: number, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number, elemBytes: number): void;

@@ -2385,7 +2385,7 @@ void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
 
 void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
              float alpha, float beta,
-             int batch, int M, int N, int K, int transA, int transB) {
+             int batch, int M, int N, int K, int transA, int transB, int tokenMajor) {
     cudaSetDevice(ctx->device_id);
 
     // cuBLAS computes C_cm = op(A_gemm) @ op(B_gemm) in column-major.
@@ -2439,6 +2439,15 @@ void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
     k_gemm = K;  // cols of op(A_gemm) = rows of op(B_gemm)
     ldc_gemm = N;
     strideC = (long long)M * N;
+
+    if (tokenMajor) {
+        // A=[M,batch,K], B=[batch,K,N], C=[M,batch,N]. Each head's
+        // rows are separated by the other heads, while head bases are adjacent.
+        ldb_gemm = batch * K;
+        strideB_gemm = K;
+        ldc_gemm = batch * N;
+        strideC = N;
+    }
 
     cublasGemmStridedBatchedEx(CUBLAS(ctx),
         transa_gemm, transb_gemm,
