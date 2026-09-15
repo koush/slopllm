@@ -21,7 +21,7 @@ TypeScript inference engine for the GLM-5.1 model on NVIDIA GPUs. Ships a native
   - **`startTracking()`** returns a scope that disposes unnamed temporaries on exit. `clearTracking()` provides explicit phase-boundary cleanup and can preserve tensors from a `TensorTree`.
 - This pattern is what makes the inference loop graph-capturable: the same GPU addresses are reused each step deterministically.
 
-### Tensor Lifetime and `using` Pattern
+### Lifetime and `using` Pattern
 
 Tensors implement `Disposable` via `[Symbol.dispose]()`. Model code can use `using` to release intermediates at the end of a lexical scope:
 
@@ -32,11 +32,14 @@ using activated = gate.siluAndMul(up);
 return activated.linear(weights.down);
 ```
 
-Tracking is normally owned by the caller around a complete model operation. A returned tensor must be removed from that tracking scope:
+Allocation tracking is owned by the caller around a complete model operation. A returned tensor must be removed from that tracking scope:
 
 ```typescript
 function forward(state: ExecutionState): Tensor {
+  // The [Symbol.dispose]() will warn if ANY allocation was not properly disposed, but will dispose it.
+  // Resources should be properly scoped and disposed or removed from the tracking scope.
   using _tracker = state.ws.startTracking();
+  // removeTracking allows the tensor to escape workspace cleanup.
   return model.forwardModel(state).removeTracking();
 }
 ```
@@ -65,6 +68,87 @@ Key rules:
 - `TensorParallelism` enum: `Replicated`, `Column` (output-dim sharded), `Row` (input-dim sharded), `PartialSum` (needs AllReduce), `PartialSoftmax` (for CP merge).
 - Communication: NCCL AllReduce/AllGather for large tensors; custom P2P kernels for small AllReduce/AllGather (≤8192 elements) and fused RMSNorm+AllReduce.
 - Per-device shard workspaces created lazily via `getShardWorkspaces()`.
+
+### CUDA Streams and withStream
+
+`withStream(fn)` runs `fn` right away on the host — host execution never becomes
+asynchronous. The only difference is that GPU kernels launched inside `fn` are queued to a
+separate CUDA stream instead of the current one. The `withStream` wrapper method is an intentional departure from CUDA streams to enforce lexical scoping of streams and their encapsulated resources. Two synchronization points are set up
+automatically:
+
+- On entry, the new stream waits on an event recorded on the calling stream, so the new
+  stream's first kernel cannot start until everything the calling stream queued *before*
+  the `withStream` call has finished.
+- On exit, an event is recorded on the new stream (nothing waits on it yet) and the stream
+  is returned to the pool. The calling stream is ordered behind the new stream's work only
+  when you call `streamWaitEvent()` on the returned result (or `synchronize()`); the
+  result's memory is allocated immediately but its contents are only guaranteed after
+  that wait. Consume `result` only after calling `streamWaitEvent()`.
+
+While the scope is open, the two streams run in parallel. Host code is single-threaded, so
+a scope is always created, run, and joined in order — code on the calling stream cannot
+queue kernels while a scope is open. Kernels are only ever launched inside a scope's
+lexical body; the returned result object can add wait edges later (`streamWaitEvent`) but
+never launches new kernels.
+Streams are created using withStream and are waited using `streamWaitEvent`.
+
+```typescript
+function someOp(normed: Tensor) {
+  using tensorA = normed.linear(someWeight);
+
+  // this stream is synchronized with calling stream up to this point.
+  using stream1 = ops.withStream(() => {
+    return tensorA.linear(otherWeight);
+  });
+
+  // this stream is also synchronized with calling stream up to this point.
+  // but it runs parallel with the prior stream.
+  using stream2 = ops.withStream(() => {
+    return tensorA.linear(anotherWeight);
+  });
+
+  // this runs after tensorA, but in parallel with tensorC and tensorD. Those streams have not been waited.
+  using tensorB = normed.linear(yetAnotherWeight);
+
+  stream1.streamWaitEvent();
+  stream2.streamWaitEvent();
+
+  // the return values must become owned/disposed.
+  // notably, the return values are immediately avialable (their desination allocations are known),
+  // but they are only *ready* after the streamWaitEvent.
+  using tensorC = stream1.value;
+  using tensorD = stream2.value;
+
+  // all tensors and streams are disposed
+}
+```
+
+Streams that outlive their lexical scope should ensure the closure properly captures inputs.
+
+```ts
+function someOpThatReturnsAStream(normed: Tensor) {
+  using tensorA = normed.linear(someWeight);
+
+  const stream1 = ops.withStream(() => {
+    // This is a race, tensorA is disposed at the end of the caller scope,
+    // before a streamWaitEvent occurs. The stream outlives the scope.
+    return tensorA.linear(otherWeight);
+  });
+
+  using stream2 = ops.withStream(() => {
+    // This is correct.
+    // viewClone ensures tensorA stays alive until this lexical scope is also complete.
+    using tensorAClone = tensorA.viewClone();
+    return tensorAClone.linear(anotherWeight);
+  });
+
+  return {
+    stream1,
+    stream2,
+  };
+}
+```
+
 
 ## Tensor Parallelism
 
@@ -297,3 +381,16 @@ Model Path:
 | vocab_size | 154880 |
 | rms_norm_eps | 1e-05 |
 | rope_interleave | true |
+
+# Responding to User Queries
+
+Responses should address the point and not stray on tangents or hypothetical hazards and scenarios that the user is not querying about. Address the question directly; the user is not an idiot and doesn't to sift through several paragraphs of unrelated possible scenarios that aren't being directly asked about.
+
+Be consise. Do not continually hedge. Given a user query about the code, why how something does work, or explain why something does not work. It must not venture into hypothetical failure cases. Your response should be a concrete "this works given X" or "this does not work because of X". Responses like "this works with the following caveats". The caveats are useless filler, the user does not need an exhaustive list of hypothetical failure cases. Answer their question narrowly.
+
+If you add caveats and other useless shit the user will get pissed. Do not do that. It is cognitive overload and non actionable.
+
+- Never emit a "caveats", "conditions", "where this does not hold", or "note that" section. If a condition is load-bearing, it goes inline in the reasoning as a "because X" clause.
+- Before stating a condition, check whether the user already stipulated it in their question; if so, do not restate it.
+- One exception per answer maximum, and only when it changes what code the user would write.
+- Answer only the question asked. Never posit an implementation or objection the user did not state, including "you might instead X" or "the distinction matters because Y" framings. If a distinction is load-bearing, state it inline in one clause; otherwise omit it entirely.
