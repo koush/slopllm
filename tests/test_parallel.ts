@@ -801,7 +801,9 @@ describe("groupedLinear", () => {
       }
       const ws = new WorkspaceBase(glm);
       try {
-        const widths = [64, 512, 128, 2048, 32];
+        // Also include an unshardable width: its replicated result still needs
+        // to wait for its producer when mixed with gathered projections.
+        const widths = [64, 512, 128, 2048, 32, 33];
         const k = 128;
         const weights = widths.map((n, p) => {
           const weight = ws.alloc([n, k], "BF16", `grouped-weight-${p}`);

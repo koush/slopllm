@@ -707,6 +707,13 @@ export class Glm51Model extends ChatModel {
         return state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
       });
 
+    using idxWeightsStream = skipIndexer ? undefined : this.glm.withStream(() => {
+      const idxNHeads = cfg.indexNHeads;
+      const idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!);
+      idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
+      return idxWeights;
+    });
+
     using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
     using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
 
@@ -715,12 +722,11 @@ export class Glm51Model extends ChatModel {
     using idxQStream = skipIndexer
       ? undefined
       : this.glm.withStream(() => {
-        const idxNHeads = cfg.indexNHeads;
         const idxHeadDim = cfg.indexHeadDim;
         const idxTopk = cfg.indexTopk;
 
-        using idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!);
-        idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
+        // | `model.layers.N.self_attn.indexer.weights_proj.weight` | [32, 6144] | bfloat16 | 78 | 29.25 MB |
+        // | `model.layers.N.self_attn.indexer.wq_b.weight` | [4096, 2048] | bfloat16 | 78 | 1.22 GB |
 
         using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!);
         using idxQ = idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
@@ -728,6 +734,9 @@ export class Glm51Model extends ChatModel {
         kvcacheIndex?.streamWaitEvent();
         using kData = kvcacheIndex!.result.kData;
         using kScaleData = kvcacheIndex!.result.kScaleData;
+
+        idxWeightsStream!.streamWaitEvent();
+        using idxWeights = idxWeightsStream!.result;
 
         // Store the raw indexer top-k (token positions); slots are derived
         // per-layer/per-mode below and in the gather (slotsReady).
