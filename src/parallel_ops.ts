@@ -2129,10 +2129,13 @@ class P2PAllReduceGroup {
   private readonly devices: readonly GlmOps[];
   private readonly usedWorkspaces = new Set<WorkspaceBase>();
   private readonly scratch = new Set<Tensor>();
+  /** Stream this group is bound to; its barriers and kernels run there. */
+  readonly stream: number;
 
-  constructor(devices: readonly GlmOps[]) {
+  constructor(devices: readonly GlmOps[], stream: number, private readonly parallelOps: ParallelOps) {
     this.worldSize = devices.length;
     this.devices = devices;
+    this.stream = stream;
     const addon = getNativeAddon();
     const deviceIds = devices.map(d => d.device);
 
@@ -2197,6 +2200,20 @@ class P2PAllReduceGroup {
       devices[i].p2pBarrier(this.instances[i], peerRank);
     }
     this.cleanupSources();
+    // A full-group barrier on stream 0 fences all ranks' prior stream-0 work:
+    // every kernel ordered behind it sees all pre-barrier accesses to group
+    // and heap-0 ranges complete, so both heaps can return their ranges to
+    // the synchronized heap immediately. Pairwise barriers (peerRanks) and
+    // alternate-stream groups do not fence stream 0, so their ranges stay
+    // quarantined until device synchronization. usedWorkspaces is not
+    // cleared so disposals after the last barrier are still released
+    // through releaseWorkspaceHeaps.
+    if (peerRanks === undefined && this.stream === 0 && devices[0].currentStream === this.stream) {
+      for (const workspace of this.usedWorkspaces) {
+        workspace.drainHeap(this, undefined);
+      }
+      this.parallelOps.reclaimMainStreamHeaps();
+    }
   }
 
   /** Release resources after all device streams have been synchronized. */
@@ -2458,7 +2475,7 @@ export class ParallelOps implements DeviceOps {
     const existing = this.p2pGroups.get(stream);
     if (existing) return existing;
     try {
-      const group = new P2PAllReduceGroup(this.devices);
+      const group = new P2PAllReduceGroup(this.devices, stream, this);
       this.p2pGroups.set(stream, group);
       this.recordCommunication(`create p2p ${this.p2pGroupId(group)} on stream ${stream}`);
       return group;
@@ -3129,6 +3146,21 @@ export class ParallelOps implements DeviceOps {
       group.onSynchronized();
     }
     notifySynchronizedWorkspaces(this.synchronizeListeners);
+  }
+
+  /** Promote stream-0 heap ranges to the synchronized heap after a full-group main-stream barrier. Shard workspaces register on the device GlmOps, not ParallelOps. */
+  reclaimMainStreamHeaps(): void {
+    const listeners = [this.synchronizeListeners, ...this.devices.map(device => device.synchronizeListeners)];
+    for (const workspaces of listeners) {
+      for (let index = workspaces.length - 1; index >= 0; index--) {
+        const workspace = workspaces[index].deref();
+        if (workspace) {
+          workspace.drainHeap(0, undefined);
+        } else {
+          workspaces.splice(index, 1);
+        }
+      }
+    }
   }
 
   prefetchL2(tensors: readonly Tensor[]): void {
