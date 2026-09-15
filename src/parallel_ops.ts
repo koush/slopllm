@@ -343,9 +343,22 @@ export class ParallelTensor extends Tensor {
       }
     }
 
-    output ||= workspace.alloc(this.shape, this.type, undefined, TensorParallelism.Replicated) as ParallelTensor;
+    const stageOutput = !!output;
+    if (!output) {
+      const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
+      if (!group) {
+        throw new Error("allGather: failed to get P2P group");
+      }
+      const shards: Tensor[] = [];
+      const shardWss = this.parallelOps.getShardWorkspaces(workspace);
+      for (let i = 0; i < this.worldSize; i++) {
+        shards.push(group.allocClean(shardWss[i], this.shape, this.type));
+      }
 
-    if (this.tryP2PAllGather(output, lastRank)) {
+      output = this.parallelOps.wrapShards(workspace, shards, this.shape, this.type, TensorParallelism.Replicated);
+    }
+
+    if (this.tryP2PAllGather(output, stageOutput, lastRank)) {
       return output;
     }
 
@@ -415,7 +428,7 @@ export class ParallelTensor extends Tensor {
    * too large for the P2P group, in which case the caller should use NCCL.
    * Dtype-agnostic: copies raw bytes, supports all element types.
    */
-  private tryP2PAllGather(output: ParallelTensor, lastRank = this.worldSize): boolean {
+  private tryP2PAllGather(output: ParallelTensor, stageOutput: boolean, lastRank = this.worldSize): boolean {
     if (!this.parallelOps.p2pEnabled)
       return false;
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
@@ -425,13 +438,13 @@ export class ParallelTensor extends Tensor {
     if (!group)
       return false;
 
-    const postBarrier = this.beginP2PAllGather(group, output, lastRank);
+    const postBarrier = this.beginP2PAllGather(group, output, stageOutput, lastRank);
     group.barrier(this.devices);
     postBarrier();
     return true;
   }
 
-  beginP2PAllGather(group: P2PAllReduceGroup, output: ParallelTensor, lastRank = this.worldSize) {
+  beginP2PAllGather(group: P2PAllReduceGroup, output: ParallelTensor, stageOutput: boolean, lastRank = this.worldSize) {
     const addon = getNativeAddon();
     if (!Number.isInteger(lastRank) || lastRank < 0 || lastRank > this.worldSize) {
       throw new Error(`beginP2PAllGather: invalid lastRank ${lastRank}`);
@@ -450,8 +463,13 @@ export class ParallelTensor extends Tensor {
     }
 
     const shards: Tensor[] = [];
-    for (let i = 0; i < this.worldSize; i++) {
-      shards.push(group.alloc(this.shards[i].workspace, output.shards[i].shape, this.type));
+    if (stageOutput) {
+      for (let i = 0; i < this.worldSize; i++) {
+        shards.push(group.alloc(this.shards[i].workspace, output.shards[i].shape, this.type));
+      }
+    }
+    else {
+      shards.push(...output.shards);
     }
 
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
@@ -479,6 +497,10 @@ export class ParallelTensor extends Tensor {
       }
 
       return () => {
+        if (!stageOutput) {
+          return;
+        }
+
         for (let i = 0; i < this.worldSize; i++) {
           output.shards[i].memcpy(shards[i], shards[i].bytes, MemcpyKind.DeviceToDevice);
         }
@@ -514,6 +536,10 @@ export class ParallelTensor extends Tensor {
       }
 
       return () => {
+        if (!stageOutput) {
+          return;
+        }
+
         for (let i = 0; i < this.worldSize; i++) {
           output.shards[i].memcpy(shards[i], shards[i].bytes, MemcpyKind.DeviceToDevice);
         }
@@ -827,7 +853,7 @@ export class ParallelTensor extends Tensor {
               outputs.push(output);
               // Append writes directly to the GEMM's stream, without a transfer
               // stream/event handoff. Only the completion copy needs the barrier.
-              return projected.beginP2PAllGather(group, output);
+              return projected.beginP2PAllGather(group, output, true);
             }
             outputs.push(projected);
             return undefined;
@@ -2188,6 +2214,11 @@ class P2PAllReduceGroup {
     return tensor;
   }
 
+  allocClean(workspace: WorkspaceBase, shape: number[], type: string): Tensor {
+    this.usedWorkspaces.add(workspace);
+    return workspace.alloc(shape, type, undefined, undefined, [undefined]);
+  }
+
   /**
    * Buffers peers are reading through this group's barriers. A P2P op pushes
    * the tensors its peers will read; they are only released once this group's
@@ -2628,7 +2659,7 @@ export class ParallelOps implements DeviceOps {
       outputs[i] = workspace.alloc(tensor.shape, tensor.type, undefined, target) as ParallelTensor;
     }
     if (gatherIndices.length === 1 && !producerStreams) {
-      const postBarrier = gatherIndices.map(i => tensors[i].beginP2PAllGather(group, outputs[i]!));
+      const postBarrier = gatherIndices.map(i => tensors[i].beginP2PAllGather(group, outputs[i]!, true));
       group.barrier(this.devices);
       for (const complete of postBarrier) {
         complete();
@@ -2640,7 +2671,7 @@ export class ParallelOps implements DeviceOps {
     // not depend on another projection's completion on the coordinating stream.
     const beginStreams = gatherIndices.map(i => this.withStream(() => {
       producerStreams?.[i].streamWaitEvent();
-      return tensors[i].beginP2PAllGather(group, outputs[i]!);
+      return tensors[i].beginP2PAllGather(group, outputs[i]!, true);
     }));
     for (const stream of beginStreams) {
       stream.streamWaitEvent();
