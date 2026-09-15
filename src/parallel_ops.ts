@@ -846,14 +846,16 @@ export class ParallelTensor extends Tensor {
               : undefined;
             const projected = this.linear(narrowed ?? weight) as ParallelTensor;
             if (group && narrowed) {
-              // The completion callback still references this tensor's shard
-              // metadata, so retain it through post-barrier completion.
+              // Keep GEMM outputs alive until all producer writes finish.
               gatheredInputs.push(projected);
-              const output = this.workspace.alloc(projected.shape, projected.type) as ParallelTensor;
+              const shards = this.parallelOps.getShardWorkspaces(this.workspace)
+                .map(ws => group.allocClean(ws, projected.shape, projected.type));
+              const output = this.parallelOps.wrapShards(this.workspace, shards,
+                projected.shape, projected.type, TensorParallelism.Replicated);
               outputs.push(output);
               // Append writes directly to the GEMM's stream, without a transfer
-              // stream/event handoff. Only the completion copy needs the barrier.
-              return projected.beginP2PAllGather(group, output, true);
+              // stream/event handoff or post-barrier completion copy.
+              return projected.beginP2PAllGather(group, output, false);
             }
             outputs.push(projected);
             return undefined;
@@ -865,9 +867,6 @@ export class ParallelTensor extends Tensor {
         }
         if (group) {
           group.barrier(this.devices);
-          // Finish on the coordinating stream rather than creating one more
-          // stream per output just for the local completion copy.
-          for (const projection of projections) projection.result?.();
           returnedOutputs = true;
           return outputs;
         }
@@ -2656,14 +2655,14 @@ export class ParallelOps implements DeviceOps {
 
     for (const i of gatherIndices) {
       const tensor = tensors[i];
-      outputs[i] = workspace.alloc(tensor.shape, tensor.type, undefined, target) as ParallelTensor;
+      const shardShape = this.shardShape(tensor.shape, target);
+      const shards = this.getShardWorkspaces(workspace)
+        .map(ws => group.allocClean(ws, shardShape, tensor.type));
+      outputs[i] = this.wrapShards(workspace, shards, tensor.shape, tensor.type, target);
     }
     if (gatherIndices.length === 1 && !producerStreams) {
-      const postBarrier = gatherIndices.map(i => tensors[i].beginP2PAllGather(group, outputs[i]!, true));
+      for (const i of gatherIndices) tensors[i].beginP2PAllGather(group, outputs[i]!, false);
       group.barrier(this.devices);
-      for (const complete of postBarrier) {
-        complete();
-      }
       return outputs as ParallelTensor[];
     }
 
@@ -2671,7 +2670,7 @@ export class ParallelOps implements DeviceOps {
     // not depend on another projection's completion on the coordinating stream.
     const beginStreams = gatherIndices.map(i => this.withStream(() => {
       producerStreams?.[i].streamWaitEvent();
-      return tensors[i].beginP2PAllGather(group, outputs[i]!, true);
+      return tensors[i].beginP2PAllGather(group, outputs[i]!, false);
     }));
     for (const stream of beginStreams) {
       stream.streamWaitEvent();
@@ -2679,13 +2678,6 @@ export class ParallelOps implements DeviceOps {
     }
     // barrier
     group.barrier(this.devices);
-    // post barrier actions
-    const finishStreams = beginStreams.map(beginStream => this.withStream(() => beginStream.result()));
-    // wait everything
-    for (const stream of finishStreams) {
-      stream.streamWaitEvent();
-      stream[Symbol.dispose]();
-    }
     // Replicated inputs bypass communication but still need producer ordering.
     if (producerStreams) {
       for (let i = 0; i < tensors.length; i++) {
