@@ -268,6 +268,10 @@ function logRequestPerformance(req: CompletionRequest): void {
   );
 }
 
+function logPhase(phase: string, detail: string): void {
+  console.log(`${new Date().toISOString()} ${phase} ${detail}`);
+}
+
 interface ActiveSequence {
   request: CompletionRequest;
   lastToken: number;
@@ -433,6 +437,7 @@ async function generateMtpBatches(
   let draft: MtpDraftBatch | undefined;
   let nextStagingKey = 0;
   let admittedRequests = 0;
+  let decodeStep = 0;
   const numVerificationTokens = mtpTotalTreeNodes(topks) + 1;
   const timing = process.env.GLM_MTP_TIMING === "1";
   const recordMtpPhase = (timingName: string, batchSize: number, elapsedSeconds: number): void => {
@@ -531,6 +536,7 @@ async function generateMtpBatches(
         if (phasedPrefill && !model.planPrefillMtpChunkPhased) {
           throw new Error("The selected model does not support phased MTP prefill");
         }
+        logPhase("prefill start", `requests=${newRows.length} tokens=${newRows.reduce((sum, row) => sum + row.inputIds.length, 0)} phased=${phasedPrefill} ids=[${newRows.map(row => row.request.id).join(", ")}]`);
         const prefillStart = performance.now();
         const phasedRunner = phasedPrefill ? new PhasedPrefillRunner(model, model.glm) : undefined;
         nextStagingKey = await prefillPromptChunks(
@@ -591,6 +597,7 @@ async function generateMtpBatches(
         const prefillSeconds = (performance.now() - prefillStart) / 1000;
         metrics.prefillTimeSecondsCount += newCount;
         metrics.prefillTimeSecondsSum += prefillSeconds * newCount;
+        logPhase("prefill finish", `requests=${newRows.length} seconds=${prefillSeconds.toFixed(3)} draft_tokens=[${draft.targetTokens.join(",")}]`);
         const decodeStartedAt = performance.now();
         for (const req of newRequests) {
           req.prefillSeconds = prefillSeconds;
@@ -608,6 +615,8 @@ async function generateMtpBatches(
 
       const iterationBatchSize = requests.length;
       const iterationStart = timing ? performance.now() : 0;
+      decodeStep++;
+      // logPhase("decode start", `step=${decodeStep} batch=${requests.length} verify_tokens=${numVerificationTokens} ids=[${requests.map(req => req.id).join(", ")}]`);
       let phaseSeconds = 0;
       const verificationParams = requests.flatMap(req =>
         Array.from({ length: numVerificationTokens }, () => req.samplingParams));
@@ -632,6 +641,7 @@ async function generateMtpBatches(
         }
       }
       removeFinishedRows();
+      // logPhase("decode finish", `step=${decodeStep} batch=${iterationBatchSize} accepted=[${step.result.numAccepted.join(",")}] tokens=[${step.result.tokens.map(tokens => tokens.join(",")).join(" | ")}]`);
 
       const yieldStart = timing ? performance.now() : 0;
       if (decodeLatencyMs > 0) {
@@ -683,6 +693,7 @@ async function generateContinuousBatch(
   const active: ActiveSequence[] = [];
   let nextStagingKey = 0;
   let admittedRequests = 0;
+  let decodeStep = 0;
   const admitted = new Set<CompletionRequest>();
   const finishCancelled = (req: CompletionRequest): void => {
     if (!admitted.delete(req)) return;
@@ -727,6 +738,7 @@ async function generateContinuousBatch(
       }
 
       // Prefill new requests
+      logPhase("prefill start", `requests=${newRows.length} tokens=${newRows.reduce((sum, row) => sum + row.inputIds.length, 0)} phased=${phasedPrefill} ids=[${newRows.map(row => row.request.id).join(", ")}]`);
       const prefillStart = performance.now();
       const phasedRunner = phasedPrefill ? new PhasedPrefillRunner(model, glm) : undefined;
       nextStagingKey = await prefillPromptChunks(
@@ -779,6 +791,7 @@ async function generateContinuousBatch(
       const prefillSeconds = (performance.now() - prefillStart) / 1000;
       metrics.prefillTimeSecondsCount += newRows.length;
       metrics.prefillTimeSecondsSum += prefillSeconds * newRows.length;
+      logPhase("prefill finish", `requests=${newRows.length} seconds=${prefillSeconds.toFixed(3)} first_tokens=[${firstTokens.join(",")}]`);
       const decodeStartedAt = performance.now();
       for (const row of newRows) {
         row.request.prefillSeconds = prefillSeconds;
@@ -842,6 +855,8 @@ async function generateContinuousBatch(
 
     // 5. Decode one step
     const inputTokens = active.map(a => a.lastToken);
+    decodeStep++;
+    // logPhase("decode start", `step=${decodeStep} batch=${active.length} ids=[${active.map(a => a.request.id).join(", ")}]`);
     const state = ws.planDecode(model, active.length, cache, true);
     state.setInput([inputTokens]);
     const decodeResult = state.capture(captureManager, {}, () => {
@@ -877,6 +892,7 @@ async function generateContinuousBatch(
         checkStopSequences(req);
       }
     }
+    // logPhase("decode finish", `step=${decodeStep} batch=${active.length} tokens=[${newTokens.join(",")}] finished=${active.filter(a => a.request.finished).length}`);
 
       if (decodeLatencyMs > 0) {
         await new Promise(resolve => setTimeout(resolve, decodeLatencyMs));
