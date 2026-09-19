@@ -715,7 +715,9 @@ export class Glm51Model extends ChatModel {
     });
 
     using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
+    yield;
     using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
+    yield;
 
     // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
     // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
