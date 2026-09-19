@@ -135,6 +135,11 @@ export class CaptureManager implements Disposable {
                         console.error(`[cuda-graph] graphLaunch failed synchronously key=${key} graphExec=${captured.graphExec}`, error);
                         throw error;
                     }
+                    // Replay skips the host heap migrations performed while
+                    // recording barriers. Reconcile before claiming outputs.
+                    // The caller synchronizes before subsequent GPU phases;
+                    // this bookkeeping hook does not establish GPU completion.
+                    this.ops.hostSynchronizeWorld();
                     return mapTensors(captured.result, tensor => tensor.uncapture());
                 }
 
@@ -210,6 +215,7 @@ export class CaptureManager implements Disposable {
                 this.ops.graphDestroy(graph);
             }
             this.ops.graphLaunch(captured!.graphExec);
+            this.ops.hostSynchronizeWorld();
         }
         return result;
     }

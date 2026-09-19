@@ -8,14 +8,17 @@ it("reports changed captured bindings without preventing replay", (t) => {
   const events: string[] = [];
   const errors: string[] = [];
   t.mock.method(console, "error", (message: string) => errors.push(message));
-  const ops = { graphLaunch: () => events.push("launch") } as unknown as DeviceOps;
+  const ops = {
+    graphLaunch: () => events.push("launch"),
+    hostSynchronizeWorld: () => events.push("hostSync"),
+  } as unknown as DeviceOps;
   const manager = new CaptureManager(ops);
   manager.captured.set("test", {
     warmupSteps: 4, graphExec: 1, result: undefined, inputs: {}, capturedWorkspaces: new Set(),
     diagnosticBindings: { slot: "old", removed: "old" },
   });
   manager.run({}, () => { throw new Error("must replay"); }, ["test"], { slot: "new", added: "new" });
-  assert.deepEqual(events, ["launch"]);
+  assert.deepEqual(events, ["launch", "hostSync"]);
   assert.equal(errors.length, 3);
   assert.ok(errors.every(message => message.includes("BINDING MISMATCH")));
   assert.ok(errors.some(message => message.includes("captured=old current=new")));
@@ -26,6 +29,7 @@ it("keys replay by every shard pointer and preserves independent warmup", () => 
   const manager = new CaptureManager({
     graphBeginCapture() {}, graphEndCapture: () => 1, graphInstantiate: () => 1,
     graphDestroy() {}, graphLaunch() { launches++; },
+    hostSynchronizeWorld() {},
   } as unknown as DeviceOps);
   const tensor = (addresses: number[], shape = [8192]) => ({
     shape, type: "I32", parallelism: "replicated", pinned: false,
@@ -53,7 +57,7 @@ it("keys replay by every shard pointer and preserves independent warmup", () => 
 it("does not report unchanged bindings", (t) => {
   const errors: string[] = [];
   t.mock.method(console, "error", (message: string) => errors.push(message));
-  const manager = new CaptureManager({ graphLaunch() {} } as unknown as DeviceOps);
+  const manager = new CaptureManager({ graphLaunch() {}, hostSynchronizeWorld() {} } as unknown as DeviceOps);
   manager.captured.set("test", {
     warmupSteps: 4, graphExec: 1, result: undefined, inputs: {}, capturedWorkspaces: new Set(),
     diagnosticBindings: { slot: "same" },

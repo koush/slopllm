@@ -242,16 +242,10 @@ export abstract class Tensor implements Disposable {
     return this._uncapture();
   }
 
-  _uncapture() {
-    const lineage = this.recycleKey === null ? undefined : [this.recycleKey, undefined];
-    const copy = this.workspace.alloc(this.shape, this.type, undefined, this.parallelism, lineage);
-    // possible to get the exact same allocation, maybe optimize for this in the future
-    if (this.same(copy)) {
-      return copy;
-    }
-
-    copy.memcpy(this);
-    return copy;
+  _uncapture(): Tensor {
+    // Output addresses belong to the recorded graph. Allocating a replacement
+    // here could overwrite this or another output before it has been claimed.
+    throw new Error(`Cannot uncapture tensor: recorded allocation is unavailable; heap bookkeeping invariant failed. ${this.debugDescription()}`);
   }
 
   canDispose() {

@@ -1,4 +1,4 @@
-import { DeviceOps, fp8ScaleShape, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
 import { Heap, type HeapAllocation, type HeapKey } from "./heap";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
@@ -993,6 +993,10 @@ export class GlmOps implements DeviceOps {
   synchronize(streamIdx?: number): void {
     getNativeAddon().synchronize(this.ctx, streamIdx);
     this.completeDeviceSynchronization();
+  }
+
+  hostSynchronizeWorld(): void {
+    notifyHostWorldSynchronization(this.synchronizeListeners);
   }
 
   prefetchL2(tensors: readonly Tensor[]): void {

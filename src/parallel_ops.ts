@@ -1,4 +1,4 @@
-import { DeviceOps, fp8ScaleShape, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MlaQuery, type StreamResult, type WorkspaceMemoryStats } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MlaQuery, type StreamResult, type WorkspaceMemoryStats } from "./device_ops";
 import { CaptureManager } from "./capture-manager";
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
@@ -2270,7 +2270,7 @@ class P2PAllReduceGroup {
       for (const workspace of this.usedWorkspaces) {
         workspace.drainHeap(this, undefined);
       }
-      this.parallelOps.reclaimMainStreamHeaps();
+      this.parallelOps.hostSynchronizeWorld();
     }
   }
 
@@ -3219,19 +3219,10 @@ export class ParallelOps implements DeviceOps {
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
-  /** Promote stream-0 heap ranges to the synchronized heap after a full-group main-stream barrier. Shard workspaces register on the device GlmOps, not ParallelOps. */
-  reclaimMainStreamHeaps(): void {
-    const listeners = [this.synchronizeListeners, ...this.devices.map(device => device.synchronizeListeners)];
-    for (const workspaces of listeners) {
-      for (let index = workspaces.length - 1; index >= 0; index--) {
-        const workspace = workspaces[index].deref();
-        if (workspace) {
-          workspace.drainHeap(0, undefined);
-        } else {
-          workspaces.splice(index, 1);
-        }
-      }
-    }
+  /** Host bookkeeping only. Shard workspaces register on GlmOps, not ParallelOps. */
+  hostSynchronizeWorld(): void {
+    notifyHostWorldSynchronization(this.synchronizeListeners);
+    for (const device of this.devices) device.hostSynchronizeWorld();
   }
 
   prefetchL2(tensors: readonly Tensor[]): void {

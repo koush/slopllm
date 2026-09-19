@@ -1,4 +1,4 @@
-import { DeviceOps, fp8ScaleShape, MaskMode, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
 import { MemcpyKind } from "./sampling";
@@ -324,6 +324,10 @@ export class MetaOps implements DeviceOps {
 
     synchronize(_streamIdx?: number): void {
         notifySynchronizedWorkspaces(this.synchronizeListeners);
+    }
+
+    hostSynchronizeWorld(): void {
+        notifyHostWorldSynchronization(this.synchronizeListeners);
     }
 
     prefetchL2(_tensors: readonly Tensor[]): void {

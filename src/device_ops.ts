@@ -67,6 +67,17 @@ export function notifySynchronizedWorkspaces(workspaces: WeakRef<WorkspaceBase>[
   }
 }
 
+export function notifyHostWorldSynchronization(workspaces: WeakRef<WorkspaceBase>[]): void {
+  for (let index = workspaces.length - 1; index >= 0; index--) {
+    const workspace = workspaces[index].deref();
+    if (workspace) {
+      workspace.drainHeap(0, undefined);
+    } else {
+      workspaces.splice(index, 1);
+    }
+  }
+}
+
 export interface DeviceOps extends Disposable {
   quantizeFp8(input: Tensor, blockSize: number): Fp8Quantized;
   readonly worldSize: number;
@@ -78,6 +89,8 @@ export interface DeviceOps extends Disposable {
   deviceHeapStats(): WorkspaceMemoryStats[];
   synchronize(streamIdx?: number): void;
   synchronizeAsync(streamIdx?: number): Promise<void>;
+  /** Host-only stream-0 heap promotion; does not wait for GPU completion or release pinned buffers. */
+  hostSynchronizeWorld(): void;
   setStream(streamIdx: number): void;
   eventRecord(eventIdx: number, streamIdx: number): void;
   streamWaitEvent(streamIdx: number, eventIdx: number): void;
