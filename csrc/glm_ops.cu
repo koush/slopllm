@@ -16,15 +16,31 @@ struct PrefetchL2Inputs {
     size_t bytes[8];
 };
 
-// Interleave CTAs across tensors: issuance for later tensors need not wait for
-// earlier tensors' grids. The total budget stays bounded at 32 CTAs.
+// Bulk range prefetch: each thread covers one contiguous 16B-aligned slice of
+// each tensor with a single cp.async.bulk.prefetch (one instruction per
+// (thread, tensor) instead of one per 32B offset). The fractional evict_last
+// policy marks only 25% of prefetched lines evict_last; the rest insert at
+// evict-normal, so the full range still warms L2 while stale sticky lines are
+// capped at ~6MB and cannot pin the L2 against concurrent kernels.
 __global__ void prefetch_l2_kernel(PrefetchL2Inputs inputs, int count) {
-    const int tensor = blockIdx.x % count;
-    const int blocks = (gridDim.x - 1 - tensor) / count + 1;
-    const size_t stride = size_t(blocks) * blockDim.x * 32;
-    for (size_t offset = (size_t(blockIdx.x / count) * blockDim.x + threadIdx.x) * 32;
-         offset < inputs.bytes[tensor]; offset += stride) {
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(inputs.data[tensor] + offset) : "memory");
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 0.25;" : "=l"(policy));
+    const int total_threads = gridDim.x * blockDim.x;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int t = 0; t < count; t++) {
+        const size_t bytes = inputs.bytes[t];
+        size_t chunk = ((bytes + total_threads - 1) / total_threads + 15) & ~size_t(15);
+        const size_t start = (size_t)tid * chunk;
+        if (start >= bytes) continue;
+        const char* base = inputs.data[t] + start;
+        size_t len = chunk < bytes - start ? chunk : bytes - start;
+        len &= ~size_t(15);  // bulk prefetch requires 16B-multiple size
+        if (len) {
+            asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;"
+                         :: "l"(base), "r"((uint32_t)len), "l"(policy) : "memory");
+        } else {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(base) : "memory");
+        }
     }
 }
 
