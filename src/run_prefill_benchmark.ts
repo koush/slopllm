@@ -171,6 +171,7 @@ async function runSummarize(
     glm.synchronize();
   }
   const prefillMs = performance.now() - tPrefill;
+  cache.reportTokens(0, [...inputIds, firstToken]);
   console.log(`prefill: ${promptLen} tokens in ${prefillMs.toFixed(0)}ms (${(promptLen / (prefillMs / 1000)).toFixed(0)} tok/s)\n`);
 
   // Greedy decode loop, streaming decoded text to stdout.
@@ -178,17 +179,17 @@ async function runSummarize(
   const generatedIds: number[] = [];
   let cur = firstToken;
   const tDecode = performance.now();
-  for (let i = 0; i < args.maxNewTokens; i++) {
-    if (model.eosIds.has(cur)) break;
+  if (args.maxNewTokens > 0 && !model.eosIds.has(cur)) {
     generatedIds.push(cur);
     process.stdout.write(tokenizer.decode([cur], { skip_special_tokens: true }));
-
-    const state = ws.planDecode(model, 1, cache);
-    state.setInput([[cur]]);
-    using hiddenStates = model.forward(state);
-    using logits = state.computeLogits(hiddenStates, model);
-    using argmax = logits.argmax();
-    cur = argmax.readInt32LEArray()[0];
+    if (args.maxNewTokens > 1) for await (const step of model.generateDecode(ws, cache, [cur])) {
+      cur = step.tokens[0][0];
+      if (model.eosIds.has(cur)) break;
+      generatedIds.push(cur);
+      cache.reportTokens(0, [cur]);
+      process.stdout.write(tokenizer.decode([cur], { skip_special_tokens: true }));
+      if (generatedIds.length >= args.maxNewTokens) break;
+    }
   }
   const decodeMs = performance.now() - tDecode;
   process.stdout.write("\n");
@@ -205,7 +206,7 @@ async function main(): Promise<void> {
   console.log(`GLM-5.1 Prefill Benchmark | GPUs ${gpuLabel} (${args.gpus.length}) | seq_len=${args.seqLen} | chunk_size=${args.chunkSize} | context_len=${args.contextLen} | cp=${args.cp} | mtp=${args.mtp ? args.mtpDraftTopk.join(",") : "off"} | model=${args.glm51Small ? "small" : "full"}`);
 
   const model: ChatModel = await Glm51Model.fromPretrained(glm, modelDir, args.cp, args.mtp);
-  if (args.mtp && (!model.planPrefillMtpChunk || !model.planPrefillMtpDraftExtend)) {
+  if (args.mtp && (!model.planPrefillMtpChunk || !model.planPrefillMtp)) {
     throw new Error("--mtp requires a model with chunked prefill and draft-extend support");
   }
   const worldSize = args.gpus.length;
@@ -312,7 +313,7 @@ async function main(): Promise<void> {
       if (args.mtp) {
         if (isLast) {
           const mtpInputIds = model.prepareMtpInput(cache, [chunkIds]);
-          await executePlan(captureManager, ws, model.planPrefillMtpDraftExtend!(ws, cache, mtpInputIds, args.mtpDraftTopk));
+          await executePlan(captureManager, ws, model.planPrefillMtp!(ws, cache, mtpInputIds));
         } else {
           const nextToken = inputIds[chunkStart + chunkLen];
           await executePlan(captureManager, ws, model.planPrefillMtpChunk!(ws, cache, [chunkIds], [nextToken]));

@@ -1,6 +1,7 @@
 import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
+import { EagerExecution, type ExecutionManager } from "./execution-manager";
 import { ChatModelParser, DefaultChatModelParser } from "./chat-model-parser";
 import { DeviceOps, type WorkspaceMemoryStats } from "./device_ops";
 import { type ExecutionPlan, ExecutionState, type ExecutionWorkspace } from "./execution-workspace";
@@ -66,6 +67,11 @@ export interface MtpStepResult {
   numDraftTokens: number;
 }
 
+export interface MtpDecodeStepResult extends Omit<MtpStepResult, "draft"> {
+  /** Startup conditioning (numDraftTokens=0) or a graph warmup/capture step. */
+  warmup: boolean;
+}
+
 export interface TokenSelector {
   selectTarget(logits: Tensor): Tensor;
   captureKey?: string | number;
@@ -77,6 +83,8 @@ export interface TokenSelector {
   sampleDraft?(logits: Tensor, depth: number): Tensor;
   finishDraft?(): MtpProposal;
   prepareVerification?(draft: MtpDraftBatch): void;
+  /** Capture-safe preparation for drafts generated on-device in the same graph. */
+  prepareVerificationFromDevice?(draftTokens: Tensor, batchSize: number): void;
   verify?(logits: Tensor): { tokens: Tensor; numAccepted: Tensor };
 }
 
@@ -153,10 +161,66 @@ export abstract class ChatModel extends WorkspaceBase {
   forwardModel(state: ExecutionState): Tensor {
     return this.runPhased(this.forwardPhased(state));
   }
+
+  /** Decode indefinitely from one outstanding token per sequence after prefill.
+   * The caller reports yielded tokens and handles EOS/budgets. Close and restart
+   * the generator with the current tokens when batch membership changes. */
+  async *generateDecode(
+    ws: ExecutionWorkspace, cache: ChatCache,
+    targetTokens: readonly number[],
+    executionManager: ExecutionManager = new EagerExecution(),
+    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
+  ): AsyncGenerator<MtpStepResult & { warmup: boolean }, void, void> {
+    const batchSize = targetTokens.length;
+    const pagedKV = cache.getPagedKV();
+    const sequences = pagedKV.sequences.slice();
+    if (!batchSize || sequences.length !== batchSize) {
+      throw new Error("Decode requires a non-empty matching batch");
+    }
+    let nextTokens = [...targetTokens];
+    try {
+      while (true) {
+        ws.assertClear();
+        ws.clearTracking();
+        if (pagedKV.sequences.length !== batchSize || sequences.some((sequence, batch) =>
+          pagedKV.sequences[batch] !== sequence)) {
+          throw new Error("Decode batch changed; close and restart the generator");
+        }
+        const state = ws.planDecode(this, batchSize, cache, executionManager.captureEnabled);
+        state.setInput([nextTokens]);
+        const captureKey = ["decode", samplingPolicy.captureKey ?? "greedy"];
+        let warmup: boolean;
+        {
+          const execution = executionManager.execute({ states: [state], inputs: {}, key: captureKey }, () => {
+            using hidden = this.forwardModel(state);
+            using logits = state.computeLogits(hidden, this);
+            return samplingPolicy.selectTarget(logits);
+          });
+          warmup = execution.warmup;
+          using selected = execution.result;
+          await this.glm.synchronizeAsync();
+          nextTokens = selected.readInt32LEArray();
+        }
+        ws.assertClear();
+        ws.clearTracking();
+        // Keep the next input independent of the caller's yielded array.
+        yield {
+          draft: { targetTokens: [...nextTokens], treeTokens: nextTokens.map(() => []), topks: [] },
+          tokens: nextTokens.map(token => [token]),
+          numAccepted: Array(batchSize).fill(0),
+          numDraftTokens: 0,
+          warmup,
+        };
+      }
+    } finally {
+      this.glm.synchronize();
+    }
+  }
+
   planPrefillMtpChunk?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void>;
   planPrefillMtpChunkPhased?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): PhasedPrefillPlan;
-  planPrefillMtpDraftExtend?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], samplingPolicy?: TokenSelector): ExecutionPlan<MtpDraftBatch>;
-  planTargetVerification?(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, samplingPolicy?: TokenSelector): ExecutionPlan<MtpStepResult>;
+  planPrefillMtp?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], samplingPolicy?: TokenSelector): ExecutionPlan<{ targetTokens: number[] }>;
+  generateMtpDecode?(ws: ExecutionWorkspace, cache: ChatCache, targetTokens: readonly number[], topks: readonly number[], executionManager?: ExecutionManager, samplingPolicy?: TokenSelector): AsyncGenerator<MtpDecodeStepResult, void, void>;
 
   prepareMtpInput(_cache: ChatCache, inputIdsList: number[][]): number[][] {
     return inputIdsList.map(inputIds => [...inputIds]);

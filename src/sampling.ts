@@ -414,4 +414,17 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
       this.mtpBatchSize, this.depth, this.capacity);
     return { tokens, numAccepted: acceptedCounts };
   }
+
+  prepareVerificationFromDevice(draftTokens: Tensor, batchSize: number): void {
+    this.prepareBatch(batchSize, this.depth);
+    const width = this.capacity * 4;
+    const rowBytes = this.depth * width;
+    for (let batch = 0; batch < batchSize; batch++) {
+      this.qInputProbs.memcpy2d(batch * rowBytes, width, this.qDraftProbs,
+        batch * width, this.mtpMaxBatchSize * width, width, this.depth, MemcpyKind.DeviceToDevice);
+      this.qInputIds.memcpy2d(batch * rowBytes, width, this.qDraftIds,
+        batch * width, this.mtpMaxBatchSize * width, width, this.depth, MemcpyKind.DeviceToDevice);
+    }
+    this.draftTokens.memcpy(draftTokens, batchSize * this.depth * 4, MemcpyKind.DeviceToDevice);
+  }
 }

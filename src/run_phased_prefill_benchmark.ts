@@ -164,7 +164,7 @@ async function runPrefill(
       const mtpInput = model.prepareMtpInput(cache, [tailInput]);
       const captureManager = new CaptureManager(glm);
       captureManager.disabled = true;
-      await executePlan(captureManager, ws, model.planPrefillMtpDraftExtend!(ws, cache, mtpInput, mtpDraftTopk));
+      await executePlan(captureManager, ws, model.planPrefillMtp!(ws, cache, mtpInput));
     } else {
       runSequentialTail(model, ws, cache, tailInput);
       await glm.synchronizeAsync();
@@ -185,7 +185,7 @@ async function main(): Promise<void> {
   const runtime = await loadModelRuntime(modelArgs);
   const model = runtime.model as Glm51Model;
   const { glm } = runtime;
-  if (modelArgs.mtp && (!model.planPrefillMtpChunkPhased || !model.planPrefillMtpDraftExtend)) {
+  if (modelArgs.mtp && (!model.planPrefillMtpChunkPhased || !model.planPrefillMtp)) {
     throw new Error("MTP phased prefill requires phased chunk and draft-extend support");
   }
   const worldSize = modelArgs.gpus.length;

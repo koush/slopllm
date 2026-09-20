@@ -151,7 +151,8 @@ export class ExecutionState {
   input?: Tensor;
   extras = new Map<string, any>();
   paddedKvLenInvariant = true;
-  private readonly paddedKvLen: number;
+  /** Capture-key metadata; kernel sizing must use getGraphVariantPaddedKvLen(). */
+  readonly paddedKvLen: number;
 
   // Per-state buffers (backed by persistent slot-suffixed allocations).
   // Each plan call gets a unique slot so that plan1+plan2+run1+run2 is safe:
@@ -421,40 +422,11 @@ export class ExecutionState {
     }
   }
 
-  // Stable identity of a captured graph, known before execution. Padded dims
-  // are NOT included here; they are appended to the effective key only once the
-  // graph has been learned to size its buffers by them (see CaptureManager).
-  private static baseKeyParams(states: readonly ExecutionState[], providedKeyParams: (string | number)[]): (string | number)[] {
-    const keyParams = [...(providedKeyParams ?? [])];
-    for (const state of states) {
-      keyParams.push(`batchSize:${state.batchSize}`, `totalTokens:${state.totalTokens}`);
-    }
-    return keyParams;
-  }
-
-  // Effective capture key: base key + any padded dims this base graph is known
-  // to be variant in. Length-invariant graphs collapse all KV-length buckets to
-  // a single key (capture once, replay always); variant graphs (e.g. the CP
-  // CKV-gather prefill) get a distinct key per bucket.
-  //
-  // Every state contributes its own bucket: the states in a multi-state graph
-  // sit at kv lengths separated by a fixed offset, but power-of-2 bucketing is
-  // lossy, so one state's bucket does not determine the others' near a boundary.
-  private static effectiveKeyParams(captureManager: CaptureManager, states: readonly ExecutionState[], providedKeyParams: (string | number)[]): (string | number)[] {
-    const keyParams = this.baseKeyParams(states, providedKeyParams);
-    const variant = captureManager.getLengthVariant(keyParams.join(","));
-    if (variant.kvLen) {
-      for (const state of states) keyParams.push(`paddedKvLen:${state.paddedKvLen}`);
-    }
-    return keyParams;
-  }
-
   /**
    * isCaptured for a graph spanning several states. See captureAll.
    */
   static isCaptured(captureManager: CaptureManager, states: readonly ExecutionState[], providedKeyParams: (string | number)[], inputs: { [name: string]: Tensor } = {}): boolean {
-    if (providedKeyParams.length === 0) return false;
-    return captureManager.isCaptured(this.effectiveKeyParams(captureManager, states, providedKeyParams), inputs);
+    return captureManager.isStateCaptured({ states, inputs, key: providedKeyParams });
   }
 
   /**
@@ -467,30 +439,7 @@ export class ExecutionState {
    * len, and the key then carries every state's bucket.
    */
   static captureAll<T, I extends { [name: string]: Tensor }>(captureManager: CaptureManager, states: readonly ExecutionState[], inputs: I, fn: (capturing: boolean, capturedInputs: I) => T, providedKeyParams: (string | number)[]): T {
-    if (providedKeyParams.length === 0) return fn(false, inputs);
-    const baseKey = this.baseKeyParams(states, providedKeyParams).join(",");
-    const keyParams = this.effectiveKeyParams(captureManager, states, providedKeyParams);
-    const diagnosticBindings: Record<string, string> | undefined = process.env.GLM_GRAPH_DIAGNOSTICS === "1" ? {} : undefined;
-    if (diagnosticBindings) {
-      const record = (name: string, tensor: Tensor) => {
-        diagnosticBindings[name] = `${tensor.name ?? "unnamed"}:${tensor.type}[${tensor.shape}]:${JSON.stringify(tensor.memoryRanges())}`;
-      };
-      for (const [index, state] of states.entries()) {
-        // These pointers are captured through the closure, not the input shim.
-        for (const [name, value] of Object.entries(state)) {
-          if (value instanceof Tensor && name !== "input") record(`state${index}.${name}`, value);
-        }
-        for (const [name, value] of Object.entries(state.customMask ?? {})) {
-          if (value instanceof Tensor) record(`state${index}.mask.${name}`, value);
-        }
-        for (const [name, value] of state.cache.getPagedKV().tensors) record(`state${index}.cache.${name}`, value);
-      }
-    }
-    return captureManager.run(inputs, (capturing, capturedInputs) => {
-      const result = fn(capturing, capturedInputs);
-      captureManager.recordLengthVariant(baseKey, states.some(s => !s.paddedKvLenInvariant));
-      return result as TensorTree;
-    }, keyParams, diagnosticBindings) as T;
+    return captureManager.runStates({ states, inputs, key: providedKeyParams }, fn);
   }
 
   isCaptured(captureManager: CaptureManager, providedKeyParams: (string | number)[]): boolean {

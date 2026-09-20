@@ -1,5 +1,6 @@
 import { CaptureManager } from "./capture-manager";
 import fs from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
 import { type ChatCache, type ChatModel, type Tokenizer } from "./chat_model";
 import { type DeviceOps } from "./device_ops";
 import { executePlan, ExecutionWorkspace } from "./execution-workspace";
@@ -9,6 +10,8 @@ import { createDeviceOps, loadModel, type ModelCliArgs, parseModelArgs, resolveM
 import { MtpStats } from "./mtp_stats";
 import { ParallelOps } from "./parallel_ops";
 import { profilerStart, profilerStop } from "./native-addon";
+import { type Tensor } from "./tensor";
+import { UsingHolder } from "./using-holder";
 
 const PROMPTS = [
   "tell me about india",
@@ -30,6 +33,7 @@ interface Args extends ModelCliArgs {
   instruction?: string;
   prompt?: string;
   warmupRuns: number;
+  cooldownSeconds: number;
   profile: boolean;
 }
 
@@ -56,6 +60,7 @@ function parseArgs(argv: string[]): Args {
     instruction: undefined,
     prompt: undefined,
     warmupRuns: 0,
+    cooldownSeconds: 0,
     profile: false,
   };
 
@@ -75,6 +80,7 @@ function parseArgs(argv: string[]): Args {
     else if (arg === "--no-mtp") args.noMtp = true;
     else if (arg === "--ignore-eos") args.ignoreEos = true;
     else if (arg === "--warmup-runs") args.warmupRuns = Number(argv[++i]);
+    else if (arg === "--cooldown-seconds") args.cooldownSeconds = Number(argv[++i]);
     else if (arg === "--profile") args.profile = true;
   }
 
@@ -83,6 +89,9 @@ function parseArgs(argv: string[]): Args {
   }
   if (!Number.isSafeInteger(args.warmupRuns) || args.warmupRuns < 0) {
     throw new Error(`Invalid --warmup-runs: ${args.warmupRuns}`);
+  }
+  if (!Number.isFinite(args.cooldownSeconds) || args.cooldownSeconds < 0 || args.cooldownSeconds * 1000 > 2147483647) {
+    throw new Error(`Invalid --cooldown-seconds: ${args.cooldownSeconds}`);
   }
   if (args.contextLen !== undefined && (!Number.isInteger(args.contextLen) || args.contextLen < 1)) {
     throw new Error(`Invalid --context-len: ${args.contextLen}`);
@@ -230,15 +239,25 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOp
     : inputIds.map((ids, batch) => cache.prefixMatch(batch, ids));
   const mtpInputIds = model.prepareMtpInput(cache, suffixIds);
 
-  let currentDraft = (await executePlan(captureManager, ws, model.planPrefillMtpDraftExtend(ws, cache, mtpInputIds, args.mtpDraftTopk))).result;
-  if (sharePrefill) {
-    currentDraft = {
-      targetTokens: Array(args.batchSize).fill(currentDraft.targetTokens[0]),
-      treeTokens: Array.from({ length: args.batchSize }, () => [...currentDraft.treeTokens[0]]),
-      topks: currentDraft.topks,
-    };
+  let currentTokens: number[];
+  {
+    const state = ws.planPrefill(model, mtpInputIds.length, mtpInputIds.map(ids => ids.length), cache);
+    state.setInput(mtpInputIds);
+    using slots = new UsingHolder<Tensor>(undefined!);
+    using slotsLength = new UsingHolder<Tensor>(undefined!);
+    using hidden = model.forwardModel(state, slots, slotsLength);
+    using logits = state.computeLogits(hidden, model);
+    using selected = logits.argmax();
+    currentTokens = selected.readInt32LEArray();
+    // Populate shifted MTP KV during prefill, but hand no hidden/slot tensors
+    // to decode. The generator establishes its own conditioning on entry.
+    using rotated = state.input!.rotateInputIds(state.qoIndptrD, selected, mtpInputIds.length);
+    state.setInput(rotated);
+    using mtpHidden = model.forwardMtp(state, hidden, slots, slotsLength);
+    await glm.synchronizeAsync();
   }
-  const currentTokens = [...currentDraft.targetTokens];
+  ws.clearTracking();
+  if (sharePrefill) currentTokens = Array(args.batchSize).fill(currentTokens[0]);
   const generated = currentTokens.map(token => [token]);
   const finished = currentTokens.map(token => (!args.ignoreEos && model.eosIds.has(token)) || args.maxNewTokens === 1);
   const mtpStats = new MtpStats(args.mtpDraftTopk.length);
@@ -260,43 +279,38 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOp
   }
 
   const started = performance.now();
-  while (!finished.some(Boolean)) {
-    const step = await executePlan(captureManager, ws, model.planTargetVerification(ws, cache, currentDraft));
-    const warmup = step.warmup;
-    currentDraft = step.result.draft;
-    const stepTokens = step.result.tokens;
-    const stepAccepted = step.result.numAccepted;
-    const numDraftTokens = step.result.numDraftTokens;
-
-    if (!warmup) {
-      for (const count of stepAccepted) {
-        mtpStats.observe(numDraftTokens, count);
+  if (!finished.some(Boolean)) {
+    for await (const step of model.generateMtpDecode(ws, cache, currentTokens, args.mtpDraftTopk, captureManager)) {
+      const { warmup, tokens: stepTokens, numAccepted, numDraftTokens } = step;
+      if (!warmup) {
+        for (const count of numAccepted) mtpStats.observe(numDraftTokens, count);
       }
-    }
 
-    for (let batch = 0; batch < args.batchSize; batch++) {
-      const reportedTokens: number[] = [];
-      for (const token of stepTokens[batch]) {
-        currentTokens[batch] = token;
-        reportedTokens.push(token);
-        generated[batch].push(token);
+      for (let batch = 0; batch < args.batchSize; batch++) {
+        const reportedTokens: number[] = [];
+        for (const token of stepTokens[batch]) {
+          currentTokens[batch] = token;
+          reportedTokens.push(token);
+          generated[batch].push(token);
 
-        const now = performance.now();
-        if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
-        lastTokenTime = now;
-        if (warmup) {
-          firstPostWarmupTime = 0;
-          postWarmupTokenCount = 0;
-        } else {
-          postWarmupTokenCount++;
+          const now = performance.now();
+          if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
+          lastTokenTime = now;
+          if (warmup) {
+            firstPostWarmupTime = 0;
+            postWarmupTokenCount = 0;
+          } else {
+            postWarmupTokenCount++;
+          }
+
+          if ((!args.ignoreEos && model.eosIds.has(token)) || generated[batch].length >= args.maxNewTokens) {
+            finished[batch] = true;
+            break;
+          }
         }
-
-        if ((!args.ignoreEos && model.eosIds.has(token)) || generated[batch].length >= args.maxNewTokens) {
-          finished[batch] = true;
-          break;
-        }
+        cache.reportTokens(batch, reportedTokens);
       }
-      cache.reportTokens(batch, reportedTokens);
+      if (finished.some(Boolean)) break;
     }
   }
 
@@ -360,18 +374,9 @@ async function runBatchWithoutMtp(model: Glm51Model, ws: ExecutionWorkspace, glm
   let postWarmupTokenCount = 0;
   const started = performance.now();
 
-  while (!finished.some(Boolean)) {
-    using _tracking = ws.startTracking();
-    const state = ws.planDecode(model, args.batchSize, cache, !captureManager.disabled);
-    state.setInput([currentTokens]);
-    const postWarmup = captureManager.disabled || state.isCaptured(captureManager, ["decode"]);
-    using selected = state.capture(captureManager, {}, () => {
-      using hiddenStates = model.forwardModel(state);
-      using logits = state.computeLogits(hiddenStates, model);
-      return logits.argmax();
-    }, ["decode"]);
-    await glm.synchronizeAsync();
-    currentTokens = selected.readInt32LEArray();
+  if (!finished.some(Boolean)) for await (const step of model.generateDecode(ws, cache, currentTokens, captureManager)) {
+    currentTokens = step.tokens.map(tokens => tokens[0]);
+    const postWarmup = !step.warmup;
 
     for (let batch = 0; batch < args.batchSize; batch++) {
       const token = currentTokens[batch];
@@ -387,6 +392,7 @@ async function runBatchWithoutMtp(model: Glm51Model, ws: ExecutionWorkspace, glm
         finished[batch] = true;
       }
     }
+    if (finished.some(Boolean)) break;
   }
 
   const elapsed = (performance.now() - started) / 1000;
@@ -425,6 +431,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     for (let run = 0; run <= args.warmupRuns; run++) {
       const warmup = run < args.warmupRuns;
       const profiling = args.profile && !warmup;
+      if (!warmup && args.cooldownSeconds > 0) {
+        await glm.synchronizeAsync();
+        console.log(`Cooling down for ${args.cooldownSeconds}s before the measured run (keeping cached graphs).`);
+        await sleep(args.cooldownSeconds * 1000);
+      }
       console.log(`\n=== ${warmup ? "Warmup" : "Measured"} run ${run + 1}/${args.warmupRuns + 1} (cached graphs: ${captureManager.captured.size}) ===`);
       await glm.synchronizeAsync();
       if (profiling) profilerStart();

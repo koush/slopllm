@@ -38,6 +38,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "./vendor/transformers.js/packages/transformers",
+    "@scrypted/deferred": "^0.0.8",
     "node-addon-api": "^8.7.0",
     "openai": "^7.5.0"
   }

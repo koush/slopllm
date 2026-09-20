@@ -2,6 +2,8 @@ import { Tensor } from "./tensor";
 import { type DeviceOps } from "./device_ops";
 import type { WorkspaceBase } from "./workspace";
 import { mapTensors, type TensorTree } from "./tensor-tree";
+import type { ExecutionManager, ExecutionOptions, ExecutionResult } from "./execution-manager";
+import type { ExecutionState } from "./execution-workspace";
 
 
 interface Captured {
@@ -24,7 +26,7 @@ interface LengthVariant {
     kvLen: boolean;
 }
 
-export class CaptureManager implements Disposable {
+export class CaptureManager implements Disposable, ExecutionManager {
     static capturing?: Captured;
     disabled = false;
     captured = new Map<string, Captured>();
@@ -33,6 +35,62 @@ export class CaptureManager implements Disposable {
     private lengthVariant = new Map<string, LengthVariant>();
 
     constructor(public ops: DeviceOps) {
+    }
+
+    get captureEnabled(): boolean {
+        return !this.disabled;
+    }
+
+    execute<T, I extends Record<string, Tensor>>(
+        options: ExecutionOptions<I>, fn: (inputs: I) => T,
+    ): ExecutionResult<T> {
+        const warmup = this.captureEnabled && options.key.length > 0 && !this.isStateCaptured(options);
+        const result = this.runStates(options, (_capturing, retained) => fn(retained));
+        return { warmup, result };
+    }
+
+    // Learn length dependence lazily; invariant graphs share one key across KV
+    // lengths. Variant multi-state graphs include each state's own length bucket.
+    private stateKeys(states: readonly ExecutionState[], key: readonly (string | number)[]) {
+        const params = [...key];
+        for (const state of states) params.push(`batchSize:${state.batchSize}`, `totalTokens:${state.totalTokens}`);
+        const base = params.join(",");
+        if (this.getLengthVariant(base).kvLen) {
+            for (const state of states) params.push(`paddedKvLen:${state.paddedKvLen}`);
+        }
+        return { base, params };
+    }
+
+    isStateCaptured<I extends Record<string, Tensor>>(options: ExecutionOptions<I>): boolean {
+        return options.key.length > 0 && this.isCaptured(this.stateKeys(options.states, options.key).params, options.inputs);
+    }
+
+    /** Legacy capture callbacks also receive whether this invocation records a graph. */
+    runStates<T, I extends Record<string, Tensor>>(
+        { states, inputs, key }: ExecutionOptions<I>, fn: (capturing: boolean, inputs: I) => T,
+    ): T {
+        if (!key.length) return fn(false, inputs);
+        const { base, params } = this.stateKeys(states, key);
+        const bindings: Record<string, string> | undefined = process.env.GLM_GRAPH_DIAGNOSTICS === "1" ? {} : undefined;
+        if (bindings) {
+            const record = (name: string, tensor: Tensor) => {
+                bindings[name] = `${tensor.name ?? "unnamed"}:${tensor.type}[${tensor.shape}]:${JSON.stringify(tensor.memoryRanges())}`;
+            };
+            for (const [index, state] of states.entries()) {
+                for (const [name, value] of Object.entries(state)) {
+                    if (value instanceof Tensor && name !== "input") record(`state${index}.${name}`, value);
+                }
+                for (const [name, value] of Object.entries(state.customMask ?? {})) {
+                    if (value instanceof Tensor) record(`state${index}.mask.${name}`, value);
+                }
+                for (const [name, value] of state.cache.getPagedKV().tensors) record(`state${index}.cache.${name}`, value);
+            }
+        }
+        return this.run(inputs, (capturing, retained) => {
+            const result = fn(capturing, retained);
+            this.recordLengthVariant(base, states.some(state => !state.paddedKvLenInvariant));
+            return result as TensorTree;
+        }, params, bindings) as T;
     }
 
     static trackWorkspaceAlloc(workspace: WorkspaceBase) {

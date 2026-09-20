@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ChatCache, ChatTemplateKwargs, MtpDraftBatch, MtpStepResult, PhasedPrefillPlan, TokenSelector } from "./chat_model";
+import type { ChatCache, ChatTemplateKwargs, MtpDecodeStepResult, PhasedPrefillPlan, TokenSelector } from "./chat_model";
+import { EagerExecution, type ExecutionManager } from "./execution-manager";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
 import { executionPhase, type ExecutionPlan, ExecutionState, ExecutionWorkspace } from "./execution-workspace";
@@ -48,8 +49,6 @@ export interface Glm51Config extends CommonModelConfig {
 }
 
 interface MtpVerificationArtifacts {
-  seed: Tensor;
-  mtpHiddenStaging: Tensor;
   kvCacheLayers: Array<{
     appendCkv: Tensor;
     appendKpe: Tensor;
@@ -62,8 +61,6 @@ interface MtpVerificationArtifacts {
     cacheIdx: number;
     indexHeadDim: number;
   }>;
-  sharedSlots: Tensor;
-  sharedSlotsLength: Tensor;
 }
 
 function mtpTotalPaths(topks: readonly number[]): number {
@@ -992,106 +989,6 @@ export class Glm51Model extends ChatModel {
     return this.runPhased(this.forwardMtpPhased(state, previousHiddenState, sharedSlots, sharedSlotsLength));
   }
 
-  private planMtpDraftDepths(ws: ExecutionWorkspace, cache: ChatCache, originalAllocLens: readonly number[], topks: readonly number[]) {
-    const batchSize = originalAllocLens.length;
-    const states: ExecutionState[] = [];
-    const metadata: Array<{ qoLen: number; previousWidth: number; expandK: number; depth: number }> = [];
-    for (let depth = 1; depth < topks.length; depth++) {
-      const qoLen = mtpTotalPaths(topks.slice(0, depth));
-      const previousWidth = depth > 1 ? mtpTotalPaths(topks.slice(0, depth - 1)) : 1;
-      const mask = ensureMtpChunkMask(ws, topks, depth);
-      const positionIds = ensureMtpChunkPositionIds(ws, originalAllocLens, depth, qoLen);
-      const state = ws.planPrefill(this, batchSize, new Array(batchSize).fill(qoLen), cache, {
-        ...mask,
-        mode: MaskMode.CausalCustom,
-        positionIds,
-      });
-      states.push(state);
-      metadata.push({ qoLen, previousWidth, expandK: topks[depth - 1], depth });
-    }
-    return { states, metadata };
-  }
-
-  private runMtpDraft(
-    ws: ExecutionWorkspace,
-    topks: readonly number[],
-    batchSize: number,
-    seed: Tensor,
-    sharedSlots: Tensor,
-    sharedSlotsLength: Tensor,
-    states: readonly ExecutionState[],
-    metadata: readonly { qoLen: number; previousWidth: number; expandK: number; depth: number }[],
-    treeHost: Tensor,
-    samplingPolicy: TokenSelector,
-  ): void {
-    const hiddenSize = this.cfg.hiddenSize;
-    const rowBytes = hiddenSize * BF16;
-    const numTreeNodes = mtpTotalTreeNodes(topks);
-    const boundaries = mtpDepthBoundaries(topks);
-    const lmHead = this.tensors.get("lm_head.weight")!;
-
-    using seedRows = seed.narrow(0, batchSize);
-    using rootLogits = seedRows.linear(lmHead);
-    const rootTopk = samplingPolicy.mtpEnabled ? undefined : rootLogits.topk(topks[0], this.cfg.vocabSize);
-    using _rootValues = rootTopk?.values;
-    using rootIndices = samplingPolicy.mtpEnabled ? samplingPolicy.sampleDraft!(rootLogits, 0) : rootTopk!.indices;
-    for (let batch = 0; batch < batchSize; batch++) {
-      treeHost.memcpy2d(
-        batch * numTreeNodes * I32, topks[0] * I32,
-        rootIndices, batch * topks[0] * I32, topks[0] * I32,
-        topks[0] * I32, 1,
-        MemcpyKind.DeviceToHost,
-      );
-    }
-    if (states.length > 0) {
-      states[0].inputIdsBuf.memcpy(rootIndices, rootIndices.bytes, MemcpyKind.DeviceToDevice);
-    }
-
-    for (let index = 0; index < states.length; index++) {
-      const state = states[index];
-      const { qoLen, previousWidth, expandK, depth } = metadata[index];
-      const next = states[index + 1];
-      using stateSharedSlots = new UsingHolder(sharedSlots.viewClone());
-      using stateSharedSlotsLength = new UsingHolder(sharedSlotsLength.viewClone());
-      state.setInput(state.inputIdsBuf);
-
-      const previousRows = batchSize * previousWidth;
-      using previousHidden = seed.narrow(0, previousRows);
-      using expanded = expandK > 1 ? ws.alloc([batchSize * qoLen, hiddenSize], "BF16") : undefined;
-      const inputHidden = expanded ?? previousHidden;
-      if (expanded) {
-        for (let child = 0; child < expandK; child++) {
-          expanded.memcpy2d(
-            child * rowBytes, expandK * rowBytes,
-            previousHidden, 0, rowBytes,
-            rowBytes, previousRows,
-            MemcpyKind.DeviceToDevice,
-          );
-        }
-      }
-
-      using hiddenStates = this.forwardMtp(state, inputHidden, stateSharedSlots, stateSharedSlotsLength);
-      using logits = hiddenStates.linear(lmHead);
-      const topk = samplingPolicy.mtpEnabled ? undefined : logits.topk(topks[depth], this.cfg.vocabSize);
-      using _values = topk?.values;
-      using indices = samplingPolicy.mtpEnabled ? samplingPolicy.sampleDraft!(logits, depth) : topk!.indices;
-      const depthOffset = boundaries[depth - 1];
-      const tokensAtDepth = qoLen * topks[depth];
-      for (let batch = 0; batch < batchSize; batch++) {
-        treeHost.memcpy2d(
-          (batch * numTreeNodes + depthOffset) * I32, tokensAtDepth * I32,
-          indices, batch * tokensAtDepth * I32, tokensAtDepth * I32,
-          tokensAtDepth * I32, 1,
-          MemcpyKind.DeviceToHost,
-        );
-      }
-      if (next) {
-        next.inputIdsBuf.memcpy(indices, indices.bytes, MemcpyKind.DeviceToDevice);
-        seed.memcpy(hiddenStates, hiddenStates.bytes, MemcpyKind.DeviceToDevice);
-      }
-    }
-  }
-
   *planPrefillMtpChunk(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void> {
     if (!this.forwardMtp || inputIds.length !== nextTokens.length || inputIds.some(ids => ids.length === 0)) {
       throw new Error("MTP chunk prefill requires non-empty inputs and one next token per sequence");
@@ -1178,456 +1075,364 @@ export class Glm51Model extends ChatModel {
     return { state, generator: forward(), [Symbol.dispose]: rollback };
   }
 
-  *planPrefillMtpDraftExtend(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], topks: readonly number[], samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ExecutionPlan<MtpDraftBatch> {
-    const mtpEnabled = samplingPolicy.mtpEnabled === true;
-    if (mtpEnabled && [samplingPolicy.prepareDraft, samplingPolicy.sampleDraft, samplingPolicy.finishDraft,
-    samplingPolicy.prepareVerification, samplingPolicy.verify].some(method => typeof method !== "function")) {
-      throw new Error("MTP-enabled sampling policy requires all MTP methods");
-    }
-    if (!this.forwardMtp || topks.length === 0) {
-      throw new Error("MTP draft extend requires an MTP-enabled model and non-empty topks");
-    }
-    if (mtpEnabled && topks.some(topk => topk !== 1)) {
-      throw new Error("Linear MTP sampling requires all draft widths to be 1");
+  *planPrefillMtp(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ExecutionPlan<{ targetTokens: number[] }> {
+    if (!this.mtp || !inputIds.length || inputIds.some(ids => !ids.length)) {
+      throw new Error("MTP prefill requires an MTP-enabled model and non-empty inputs");
     }
     const batchSize = inputIds.length;
-    if (mtpEnabled) samplingPolicy.prepareDraft!(batchSize, topks.length);
+    const sequences = cache.getPagedKV().sequences.slice();
+    const originalLens = sequences.map(sequence => sequence.allocLen);
     let completed = false;
     const prefillState = ws.planPrefill(this, batchSize, inputIds.map(ids => ids.length), cache);
     prefillState.setInput(inputIds);
-    const committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
     using _rollback = {
       [Symbol.dispose]: () => {
         if (!completed) {
           for (let batch = 0; batch < batchSize; batch++) {
-            cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
+            sequences[batch].truncate(originalLens[batch]);
           }
         }
       },
     };
-
-    const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
-    const numTreeNodes = mtpTotalTreeNodes(topks);
-
-    const prefillArtifacts = yield* executionPhase({
+    using selected = yield* executionPhase({
       states: [prefillState],
       inputs: {},
       captureKey: [],
-      timingName: "draft_extend",
+      timingName: "prefill",
       run: () => {
         using sharedSlots = new UsingHolder<Tensor>(undefined!);
         using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
-        const seed = ws.alloc([batchSize * maxWidth, this.cfg.hiddenSize], "BF16");
-        const targetHost = ws.allocPinned([batchSize], "I32");
-        using targetDevice = ws.alloc([batchSize], "I32");
         using hiddenStates = this.forwardModel(prefillState, sharedSlots, sharedSlotsLength);
         using logits = prefillState.computeLogits(hiddenStates, this);
-        using target = samplingPolicy.selectTarget(logits);
-        targetDevice.memcpy(target, batchSize * I32, MemcpyKind.DeviceToDevice);
-        using rotatedInput = prefillState.input!.rotateInputIds(prefillState.qoIndptrD, targetDevice, batchSize);
+        const target = samplingPolicy.selectTarget(logits);
+        using rotatedInput = prefillState.input!.rotateInputIds(prefillState.qoIndptrD, target, batchSize);
         prefillState.setInput(rotatedInput);
         using mtpHidden = this.forwardMtp(prefillState, hiddenStates, sharedSlots, sharedSlotsLength);
-        using lastIdx = prefillState.lastIdx;
-        using lastHidden = mtpHidden.indexSelect(lastIdx, -1);
-        // The draft seed comes from each sequence's final packed row, so retain
-        // the sparse-attention slots from those same rows rather than row zero.
-        const slotWidth = sharedSlots.value.shape[1];
-        seed.memcpy(lastHidden, lastHidden.bytes, MemcpyKind.DeviceToDevice);
-        targetHost.memcpy(targetDevice, batchSize * I32, MemcpyKind.DeviceToHost);
-
-        if (inputIds.every(ids => ids.length === 1)) {
-          // Common decode/reconditioning case: the packed rows already are the
-          // final rows, so preserve the original zero-copy path.
-          return {
-            seed,
-            targetHost,
-            sharedSlots: sharedSlots.detach(),
-            sharedSlotsLength: sharedSlotsLength.detach(),
-          };
-        }
-
-        if (inputIds.slice(1).every(ids => ids.length === 1)) {
-          // The first sequence may have several rows, but all selected final
-          // rows are still contiguous and can be retained as views.
-          const start = inputIds[0].length - 1;
-          return {
-            seed,
-            targetHost,
-            sharedSlots: sharedSlots.value.narrow(start, batchSize),
-            sharedSlotsLength: sharedSlotsLength.value.narrow(start, batchSize),
-          };
-        }
-
-        const slotRowBytes = slotWidth * I32;
-        const lastSharedSlots = ws.alloc([batchSize, slotWidth], "I32");
-        const lastSharedSlotsLength = ws.alloc([batchSize], "I32");
-        let rowEnd = 0;
-        for (let batch = 0; batch < batchSize; batch++) {
-          rowEnd += inputIds[batch].length;
-          lastSharedSlots.memcpy2d(
-            batch * slotRowBytes, slotRowBytes,
-            sharedSlots.value, (rowEnd - 1) * slotRowBytes, slotRowBytes,
-            slotRowBytes, 1,
-            MemcpyKind.DeviceToDevice,
-          );
-          lastSharedSlotsLength.memcpy2d(
-            batch * I32, I32,
-            sharedSlotsLength.value, (rowEnd - 1) * I32, I32,
-            I32, 1,
-            MemcpyKind.DeviceToDevice,
-          );
-        }
-
-        return {
-          seed,
-          targetHost,
-          sharedSlots: lastSharedSlots,
-          sharedSlotsLength: lastSharedSlotsLength,
-        };
+        return target;
       },
     });
-
-    let targetTokens: number[];
-    {
-      using targetHost = prefillArtifacts.targetHost;
-      const targetBuf = targetHost.readPinnedBuffer();
-      targetTokens = Array.from({ length: batchSize }, (_, batch) => targetBuf.readInt32LE(batch * I32));
-    }
-
-    using seed = prefillArtifacts.seed;
-    using sharedSlots = prefillArtifacts.sharedSlots;
-    using sharedSlotsLength = prefillArtifacts.sharedSlotsLength;
-    const draftPlan = this.planMtpDraftDepths(ws, cache, committedAllocLens, topks);
-    const draftArtifacts = yield* executionPhase({
-      states: draftPlan.states,
-      inputs: {
-        seed,
-        sharedSlots: sharedSlots,
-        sharedSlotsLength: sharedSlotsLength,
-      },
-      captureKey: [],
-      timingName: "draft",
-      run: (inputs) => {
-        const treeHost = ws.allocPinned([batchSize * numTreeNodes], "I32");
-        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost, samplingPolicy);
-        return { treeHost };
-      },
-    });
-    const proposal = mtpEnabled ? samplingPolicy.finishDraft!() : undefined;
-
-    for (let batch = 0; batch < batchSize; batch++) {
-      cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
-    }
-    let treeTokens: number[][];
-    {
-      using treeHost = draftArtifacts.treeHost;
-      const treeBuf = treeHost.readPinnedBuffer();
-      treeTokens = Array.from({ length: batchSize }, (_, batch) =>
-        Array.from({ length: numTreeNodes }, (_, node) => treeBuf.readInt32LE((batch * numTreeNodes + node) * I32)));
-    }
+    const targetTokens = selected.readInt32LEArray();
     completed = true;
-    return {
-      targetTokens,
-      treeTokens,
-      topks,
-      ...(proposal ? { proposal } : {}),
-    };
+    return { targetTokens };
   }
 
-  *planTargetVerification(ws: ExecutionWorkspace, cache: ChatCache, draft: MtpDraftBatch, samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ExecutionPlan<MtpStepResult> {
-    const mtpEnabled = samplingPolicy.mtpEnabled === true;
-    if (mtpEnabled && [samplingPolicy.prepareDraft, samplingPolicy.sampleDraft, samplingPolicy.finishDraft,
-    samplingPolicy.prepareVerification, samplingPolicy.verify].some(method => typeof method !== "function")) {
-      throw new Error("MTP-enabled sampling policy requires all MTP methods");
+  /** Owns the draft/verification intermediates until the caller breaks the loop.
+   * targetTokens are the reported boundary tokens, one position beyond committed KV.
+   * Prefill must have populated both target and shifted MTP KV. Batch changes
+   * require closing this generator and starting a new one to recondition.
+   * The first yield consumes the boundary token and reports one new target token
+   * with numDraftTokens=0; later yields are complete draft/verification steps. */
+  async *generateMtpDecode(
+    ws: ExecutionWorkspace, cache: ChatCache,
+    targetTokens: readonly number[], topks: readonly number[],
+    executionManager: ExecutionManager = new EagerExecution(),
+    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
+  ): AsyncGenerator<MtpDecodeStepResult, void, void> {
+    const batchSize = targetTokens.length;
+    const pagedKV = cache.getPagedKV();
+    const sequences = pagedKV.sequences.slice();
+    if (!this.mtp || !batchSize || sequences.length !== batchSize || !topks.length
+        || topks.some(k => !Number.isInteger(k) || k < 1)) {
+      throw new Error("MTP decode requires an MTP model, a non-empty matching batch, and positive draft widths");
     }
-    const topks = draft.topks;
-    const batchSize = draft.targetTokens.length;
-    if (draft.treeTokens.length !== batchSize) {
-      throw new Error("MTP draft batch does not match target token batch");
+    const sampled = samplingPolicy.mtpEnabled === true;
+    const linear = topks.every(k => k === 1);
+    if (sampled && (!linear || !samplingPolicy.prepareDraft || !samplingPolicy.sampleDraft
+        || !samplingPolicy.prepareVerificationFromDevice || !samplingPolicy.verify)) {
+      throw new Error("Combined MTP sampling requires linear drafts and capture-safe device verification preparation");
     }
-    if (draft.proposal && !mtpEnabled) {
-      throw new Error("MTP proposal verification requires a linear sampler");
-    }
-    if (mtpEnabled && (topks.length === 0 || topks.some(topk => topk !== 1))) {
-      throw new Error("Linear MTP sampling requires non-empty draft widths all equal to 1");
-    }
-    if (mtpEnabled && !draft.proposal) {
-      throw new Error("Linear MTP verification requires draft proposal probabilities");
-    }
-    if (mtpEnabled) samplingPolicy.prepareVerification!(draft);
-    const originalAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
-    const targetTopks = [1, ...topks];
-    const linearDraft = topks.every(topk => topk === 1);
     const numTreeNodes = mtpTotalTreeNodes(topks);
     const numVerificationTokens = numTreeNodes + 1;
-    const verificationTokens = draft.treeTokens.map((tokens, batch) => [draft.targetTokens[batch], ...tokens]);
-    let completed = false;
-    using _rollback = {
-      [Symbol.dispose]: () => {
-        if (!completed) {
-          for (let batch = 0; batch < batchSize; batch++) {
-            cache.getPagedKV().sequences[batch].truncate(originalAllocLens[batch]);
-          }
-        }
-      },
-    };
-
-    const targetMask = ensureMtpTargetMask(ws, targetTopks);
-    const state = ws.planPrefill(this, batchSize, new Array(batchSize).fill(numVerificationTokens), cache, {
-      ...targetMask,
-      positionIds: ensureMtpVerificationPositionIds(ws, originalAllocLens, targetTopks),
-    });
-    state.setInput(verificationTokens);
-    const maxWidth = Math.max(1, ...topks.slice(0, -1).map((_, depth) => mtpTotalPaths(topks.slice(0, depth + 1))));
-    const argmaxHost = ws.ensureAllocPinned([ws.maxBatch * numVerificationTokens], "I32", `glm51_mtp_verify_argmax_host_${numVerificationTokens}`);
-    const acceptedHost = mtpEnabled ? ws.ensureAllocPinned([ws.maxBatch], "I32", "glm51_mtp_verify_accepted_host") : undefined;
-
-    const artifacts = yield* executionPhase({
-      states: [state],
-      inputs: {},
-      captureKey: ["glm51-mtp-verify", topks.join(","), samplingPolicy.captureKey ?? "greedy", ...(mtpEnabled ? ["linear", samplingPolicy.mtpCaptureKey ?? 0] : [])],
-      timingName: "verification",
-      run: () => {
-        const seed = ws.alloc([batchSize * maxWidth, this.cfg.hiddenSize], "BF16");
-        const mtpHiddenStaging = ws.alloc([batchSize * numVerificationTokens, this.cfg.hiddenSize], "BF16");
-        using slots = new UsingHolder<Tensor>(undefined!);
-        using slotsLength = new UsingHolder<Tensor>(undefined!);
-        const kvCacheLayers: MtpVerificationArtifacts["kvCacheLayers"] = [];
-        const indexerKvCacheLayers: MtpVerificationArtifacts["indexerKvCacheLayers"] = [];
-        const appendMla = state.mlaKvCacheAppend.bind(state);
-        state.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
-          if (!linearDraft) {
-            kvCacheLayers.push({ appendCkv: appendCkv.viewClone(), appendKpe: appendKpe.viewClone(), cacheIdx, kvLoraRank, qkRopeDim });
-          }
-          return appendMla(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
-        };
-        const appendIndexer = state.indexerKvCacheAppend.bind(state);
-        state.indexerKvCacheAppend = (appendIdxK, cacheIdx, indexHeadDim) => {
-          if (!linearDraft) {
-            indexerKvCacheLayers.push({ appendIdxK: appendIdxK.viewClone(), cacheIdx, indexHeadDim });
-          }
-          return appendIndexer(appendIdxK, cacheIdx, indexHeadDim);
-        };
-        using hiddenStates = this.forwardModel(state, slots, slotsLength);
-        using logits = state.computeLogits(hiddenStates, this, true);
-        const verified = mtpEnabled ? samplingPolicy.verify!(logits) : undefined;
-        using counts = verified?.numAccepted;
-        // The accepted prefix and correction must also condition the retained MTP rows.
-        using selected = verified ? verified.tokens : samplingPolicy.selectTarget(logits);
-        if (counts) acceptedHost!.memcpy(counts, batchSize * I32, MemcpyKind.DeviceToHost);
-        argmaxHost.memcpy(selected, batchSize * numVerificationTokens * I32, MemcpyKind.DeviceToHost);
-        using selectedInput = selected.narrow(0, batchSize * numVerificationTokens);
-        state.setInput(selectedInput);
-        using mtpHidden = this.forwardMtp(state, hiddenStates, slots, slotsLength);
-        mtpHiddenStaging.memcpy(mtpHidden, mtpHidden.bytes, MemcpyKind.DeviceToDevice);
-        return {
-          seed,
-          mtpHiddenStaging,
-          kvCacheLayers,
-          indexerKvCacheLayers,
-          sharedSlots: slots.detach(),
-          sharedSlotsLength: slotsLength.detach(),
-        };
-      },
-    });
-
-    using seed = artifacts.seed;
-    using sharedSlots = artifacts.sharedSlots;
-    using sharedSlotsLength = artifacts.sharedSlotsLength;
-
-    const numAccepted: number[] = [];
-    const acceptedTokens: number[][] = [];
-    const replacements: number[] = [];
-    const acceptedNodes: number[][] = [];
-    {
-      const argmaxBuf = argmaxHost.readPinnedBuffer();
-      const acceptedBuf = acceptedHost?.readPinnedBuffer();
-      const targetBoundaries = mtpDepthBoundaries(targetTopks);
-      const strides = topks.map((_, index) => mtpTotalPaths(topks.slice(index + 1)));
-      const numPaths = mtpTotalPaths(topks);
-      for (let batch = 0; batch < batchSize; batch++) {
-        if (acceptedBuf) {
-          const accepted = acceptedBuf.readInt32LE(batch * I32);
-          if (accepted < 0 || accepted > topks.length) {
-            throw new Error(`Invalid linear MTP acceptance count ${accepted}`);
-          }
-          const offset = batch * numVerificationTokens;
-          numAccepted.push(accepted);
-          acceptedTokens.push(Array.from({ length: accepted }, (_, index) => argmaxBuf.readInt32LE((offset + index) * I32)));
-          replacements.push(argmaxBuf.readInt32LE((offset + accepted) * I32));
-          acceptedNodes.push(Array.from({ length: accepted + 1 }, (_, index) => index));
-          continue;
-        }
-        let bestPath = 0;
-        let bestAccepted = -1;
-        let replacement = -1;
-        const argmaxOffset = batch * numVerificationTokens;
-        for (let path = 0; path < numPaths; path++) {
-          let accepted = 0;
-          let node = 0;
-          for (let layer = 0; layer < topks.length; layer++) {
-            const digit = mtpPathDigit(topks, path, layer, strides);
-            const child = mtpChildIndex(targetTopks, node, digit, targetBoundaries);
-            if (verificationTokens[batch][child] !== argmaxBuf.readInt32LE((argmaxOffset + node) * I32)) {
-              break;
-            }
-            accepted++;
-            node = child;
-          }
-          if (accepted > bestAccepted) {
-            bestAccepted = accepted;
-            bestPath = path;
-            replacement = argmaxBuf.readInt32LE((argmaxOffset + node) * I32);
-          }
-        }
-        const tokens: number[] = [];
-        const nodes = [0];
-        let node = 0;
-        for (let layer = 0; layer < bestAccepted; layer++) {
-          node = mtpChildIndex(targetTopks, node, mtpPathDigit(topks, bestPath, layer, strides), targetBoundaries);
-          tokens.push(verificationTokens[batch][node]);
-          nodes.push(node);
-        }
-        numAccepted.push(bestAccepted);
-        acceptedTokens.push(tokens);
-        replacements.push(replacement);
-        acceptedNodes.push(nodes);
-      }
-    }
-
-    const finishCounts = numAccepted.map(value => value + 1);
-    let committedAllocLens: number[];
-    if (linearDraft) {
-      for (let batch = 0; batch < batchSize; batch++) {
-        cache.getPagedKV().sequences[batch].truncate(originalAllocLens[batch] + finishCounts[batch]);
-      }
-      committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
-    } else {
-      for (let batch = 0; batch < batchSize; batch++) {
-        cache.getPagedKV().sequences[batch].truncate(originalAllocLens[batch]);
-      }
-      const commitState = ws.planPrefill(this, batchSize, finishCounts, cache);
-      commitState.setInput(acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]));
-      committedAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
-      const selectedSourceRows = acceptedNodes.flatMap((nodes, batch) => nodes.slice(0, finishCounts[batch]).map(node => batch * numVerificationTokens + node));
-      const selectedSourceBuf = Buffer.alloc(selectedSourceRows.length * I32);
-      for (let index = 0; index < selectedSourceRows.length; index++) {
-        selectedSourceBuf.writeInt32LE(selectedSourceRows[index], index * I32);
-      }
-      using selectedSources = ws.alloc([selectedSourceRows.length], "I32");
-      selectedSources.h2d(selectedSourceBuf);
-
-      const pagedKV = cache.getPagedKV();
-      const mlaSrcCkv: Tensor[] = [];
-      const mlaSrcKpe: Tensor[] = [];
-      const mlaDstCkv: Tensor[] = [];
-      const mlaDstKpe: Tensor[] = [];
-      for (const layer of artifacts.kvCacheLayers) {
-        if (layer.kvLoraRank !== this.cfg.kvLoraRank || layer.qkRopeDim !== this.cfg.qkRopeHeadDim) {
-          throw new Error(`MTP cache dimensions differ at layer ${layer.cacheIdx}`);
-        }
-        mlaSrcCkv.push(layer.appendCkv.resumeTracking());
-        mlaSrcKpe.push(layer.appendKpe.resumeTracking());
-        mlaDstCkv.push(pagedKV.ckvData[layer.cacheIdx]);
-        if (!pagedKV.sparseMode) mlaDstKpe.push(pagedKV.kpeData[layer.cacheIdx]);
-      }
-
-      const indexerSrc: Tensor[] = [];
-      const indexerDst: Tensor[] = [];
-      const indexerDstScale: Tensor[] = [];
-      for (const layer of artifacts.indexerKvCacheLayers) {
-        if (layer.indexHeadDim !== this.cfg.indexHeadDim) {
-          throw new Error(`MTP indexer dimension differs at layer ${layer.cacheIdx}`);
-        }
-        const destination = pagedKV.kData[layer.cacheIdx];
-        const scaleDestination = pagedKV.kScaleData[layer.cacheIdx];
-        if (!destination || !scaleDestination) throw new Error(`Missing indexer cache for layer ${layer.cacheIdx}`);
-        indexerSrc.push(layer.appendIdxK.resumeTracking());
-        indexerDst.push(destination);
-        indexerDstScale.push(scaleDestination);
-      }
-
-      using mlaSrcCkvPtrs = ws.alloc([mlaSrcCkv.length], "I64");
-      using mlaSrcKpePtrs = ws.alloc([mlaSrcKpe.length], "I64");
-      using mlaDstCkvPtrs = ws.alloc([mlaDstCkv.length], "I64");
-      using mlaDstKpePtrs = pagedKV.sparseMode ? undefined : ws.alloc([mlaDstKpe.length], "I64");
-      mlaSrcCkvPtrs.writePointers(mlaSrcCkv);
-      mlaSrcKpePtrs.writePointers(mlaSrcKpe);
-      mlaDstCkvPtrs.writePointers(mlaDstCkv);
-      mlaDstKpePtrs?.writePointers(mlaDstKpe);
-
-      using indexerSrcPtrs = indexerSrc.length ? ws.alloc([indexerSrc.length], "I64") : undefined;
-      using indexerDstPtrs = indexerDst.length ? ws.alloc([indexerDst.length], "I64") : undefined;
-      using indexerDstScalePtrs = indexerDstScale.length ? ws.alloc([indexerDstScale.length], "I64") : undefined;
-      indexerSrcPtrs?.writePointers(indexerSrc);
-      indexerDstPtrs?.writePointers(indexerDst);
-      indexerDstScalePtrs?.writePointers(indexerDstScale);
-
-      ws.glm.appendSelectedMtpCaches(
-        mlaSrcCkvPtrs, mlaSrcKpePtrs, mlaDstCkvPtrs, mlaDstKpePtrs,
-        indexerSrcPtrs, indexerDstPtrs, indexerDstScalePtrs,
-        selectedSources, commitState.indices, commitState.indptrD, commitState.mlaBatchIndices, commitState.positionIds,
-        pagedKV.pageSize, this.cfg.kvLoraRank, this.cfg.qkRopeHeadDim, this.cfg.indexHeadDim,
-        pagedKV.sparseMode, pagedKV.contextParallel ? ws.glm.worldSize : 0,
-      );
-
-      for (const layer of artifacts.kvCacheLayers) {
-        layer.appendCkv[Symbol.dispose]();
-        layer.appendKpe[Symbol.dispose]();
-      }
-      for (const layer of artifacts.indexerKvCacheLayers) {
-        layer.appendIdxK[Symbol.dispose]();
-      }
-    }
-
+    const targetTopks = [1, ...topks];
+    const targetBoundaries = mtpDepthBoundaries(targetTopks);
+    const draftBoundaries = mtpDepthBoundaries(topks);
+    const strides = topks.map((_, depth) => mtpTotalPaths(topks.slice(depth + 1)));
+    const numPaths = mtpTotalPaths(topks);
     const rowBytes = this.cfg.hiddenSize * BF16;
-    {
-      using mtpHiddenStaging = artifacts.mtpHiddenStaging;
-      mtpHiddenStaging.resumeTracking();
-      for (let batch = 0; batch < batchSize; batch++) {
-        const finalNode = acceptedNodes[batch][acceptedNodes[batch].length - 1];
-        const source = batch * numVerificationTokens + finalNode;
-        seed.memcpy2d(batch * rowBytes, rowBytes, mtpHiddenStaging, source * rowBytes, rowBytes, rowBytes, 1, MemcpyKind.DeviceToDevice);
+    const lmHead = this.tensors.get("lm_head.weight")!;
+    const key = `glm51_mtp_decode_${batchSize}_${topks.join("_")}`;
+    ws.assertClear();
+    ws.clearTracking();
+    const verifyTokensHost = ws.ensureAllocPinned([batchSize, numVerificationTokens], "I32", `${key}_inputs_host`);
+    const selectedHost = ws.ensureAllocPinned([batchSize, numVerificationTokens], "I32", `${key}_selected_host`);
+    const acceptedHost = sampled ? ws.ensureAllocPinned([batchSize], "I32", `${key}_accepted_host`) : undefined;
+    const draftDevice = sampled ? ws.ensureAlloc([batchSize, numTreeNodes], "I32", `${key}_draft`) : undefined;
+    const seedRows = ws.ensureAlloc([batchSize], "I32", `${key}_seed_rows`);
+    const seedRowsHost = ws.ensureAllocPinned([batchSize], "I32", `${key}_seed_rows_host`);
+    let committedLens = sequences.map(sequence => sequence.allocLen);
+    let nextTargets = [...targetTokens];
+    let nextSeedRows = sequences.map((_, batch) => batch);
+    let speculative = false;
+
+    try {
+      // Fixed generator-owned carry buffers keep graph inputs stable. A step
+      // reads them for drafting before replacing their contents in verification.
+      using seed = new UsingHolder(ws.alloc([batchSize * numVerificationTokens, this.cfg.hiddenSize], "BF16"));
+      using slots = new UsingHolder<Tensor>(undefined!);
+      using slotsLength = new UsingHolder<Tensor>(undefined!);
+
+      // Consume the outstanding boundary token to establish new conditioning.
+      // Do not recompute/overwrite the last committed KV row: it may be shared,
+      // and its original prefill used a different floating-point kernel shape.
+      ws.assertClear(seed.value);
+      ws.clearTracking(seed.value);
+      speculative = true;
+      {
+        const state = ws.planPrefill(this, batchSize, Array(batchSize).fill(1), cache);
+        state.setInput(nextTargets.map(token => [token]));
+        using initialSlots = new UsingHolder<Tensor>(undefined!);
+        using initialSlotsLength = new UsingHolder<Tensor>(undefined!);
+        using hidden = this.forwardModel(state, initialSlots, initialSlotsLength);
+        using logits = state.computeLogits(hidden, this);
+        using selected = samplingPolicy.selectTarget(logits);
+        nextTargets = selected.readInt32LEArray();
+        state.setInput(nextTargets.map(token => [token]));
+        using initialSeed = this.forwardMtp(state, hidden, initialSlots, initialSlotsLength);
+        seed.value.memcpy(initialSeed, initialSeed.bytes, MemcpyKind.DeviceToDevice);
+        if (initialSlots.value) {
+          slots.replace(ws.alloc([batchSize * numVerificationTokens, initialSlots.value.shape[1]], "I32", undefined, initialSlots.value.parallelism));
+          slotsLength.replace(ws.alloc([batchSize * numVerificationTokens], "I32", undefined, initialSlotsLength.value.parallelism));
+          slots.value.memcpy(initialSlots.value, initialSlots.value.bytes, MemcpyKind.DeviceToDevice);
+          slotsLength.value.memcpy(initialSlotsLength.value, initialSlotsLength.value.bytes, MemcpyKind.DeviceToDevice);
+        }
+        await this.glm.synchronizeAsync();
+      }
+      committedLens = sequences.map(sequence => sequence.allocLen);
+      speculative = false;
+      ws.assertClear([seed.value, slots.value, slotsLength.value]);
+      ws.clearTracking([seed.value, slots.value, slotsLength.value]);
+      yield { tokens: nextTargets.map(token => [token]), numAccepted: Array(batchSize).fill(0), numDraftTokens: 0, warmup: true };
+
+      while (true) {
+        ws.assertClear([seed.value, slots.value, slotsLength.value]);
+        ws.clearTracking([seed.value, slots.value, slotsLength.value]);
+        if (pagedKV.sequences.length !== batchSize || sequences.some((sequence, batch) =>
+          pagedKV.sequences[batch] !== sequence || sequence.allocLen !== committedLens[batch])) {
+          throw new Error("MTP decode batch changed; close and restart the generator to recondition");
+        }
+        speculative = true;
+        const draftStates: ExecutionState[] = [];
+        for (let depth = 1; depth < topks.length; depth++) {
+          const qoLen = mtpTotalPaths(topks.slice(0, depth));
+          draftStates.push(ws.planPrefill(this, batchSize, Array(batchSize).fill(qoLen), cache, {
+            ...ensureMtpChunkMask(ws, topks, depth),
+            mode: MaskMode.CausalCustom,
+            positionIds: ensureMtpChunkPositionIds(ws, committedLens, depth, qoLen),
+          }));
+        }
+        // Keep physical pages attached: the draft and verification plans refer
+        // to the same cache capacity, but start at the same committed boundary.
+        for (let batch = 0; batch < batchSize; batch++) sequences[batch].allocLen = committedLens[batch];
+        const verification = ws.planPrefill(this, batchSize, Array(batchSize).fill(numVerificationTokens), cache, {
+          ...ensureMtpTargetMask(ws, targetTopks),
+          positionIds: ensureMtpVerificationPositionIds(ws, committedLens, targetTopks),
+        });
+        verification.setInput(nextTargets.map(token => [token, ...Array(numTreeNodes).fill(0)]));
+        seedRowsHost.withPinnedBuffer(buf => nextSeedRows.forEach((row, batch) => buf.writeInt32LE(row, batch * I32)));
+        seedRows.memcpy(seedRowsHost, batchSize * I32, MemcpyKind.HostToDevice);
+        if (sampled) samplingPolicy.prepareDraft!(batchSize, topks.length);
+
+        const states = [...draftStates, verification];
+        const inputs = { seed: seed.value, slots: slots.value, slotsLength: slotsLength.value };
+        const captureKey = ["glm51-mtp-decode", topks.join(","), samplingPolicy.captureKey ?? "greedy",
+          ...(sampled ? ["linear", samplingPolicy.mtpCaptureKey ?? 0] : [])];
+        const { warmup, result: artifacts } = executionManager.execute({ states, inputs, key: captureKey }, retained => {
+          // Select the accepted row from the previous verification on-device.
+          // The full hidden/slot tensors stay owned by the generator across yields.
+          {
+            using hidden = new UsingHolder(retained.seed.indexSelect(seedRows));
+            // indexSelect copies BF16 words. Reinterpret I32 rows as twice as
+            // many words so slot indices and counts are copied byte-for-byte.
+            using slots2d = retained.slots?.reshape([batchSize * numVerificationTokens, retained.slots.shape[1] * 2], "BF16");
+            using selectedSlots = slots2d?.indexSelect(seedRows);
+            using rootSlots = selectedSlots?.reshape([batchSize, retained.slots.shape[1]], "I32");
+            using lengths2d = retained.slotsLength?.reshape([batchSize * numVerificationTokens, 2], "BF16");
+            using selectedLengths = lengths2d?.indexSelect(seedRows);
+            using rootLengths = selectedLengths?.reshape([batchSize], "I32");
+            for (let depth = 0; depth < topks.length; depth++) {
+              using logits = hidden.value.linear(lmHead);
+              const topk = sampled ? undefined : logits.topk(topks[depth], this.cfg.vocabSize);
+              using values = topk?.values;
+              using indices = sampled ? samplingPolicy.sampleDraft!(logits, depth) : topk!.indices;
+              const previousWidth = depth === 0 ? 1 : mtpTotalPaths(topks.slice(0, depth));
+              const width = previousWidth * topks[depth];
+              const offset = depth === 0 ? 1 : draftBoundaries[depth - 1] + 1;
+              verification.inputIdsBuf.memcpy2d(offset * I32, numVerificationTokens * I32,
+                indices, 0, width * I32, width * I32, batchSize, MemcpyKind.DeviceToDevice);
+              if (depth === topks.length - 1) continue;
+
+              const state = draftStates[depth];
+              state.setInput(indices);
+              using shared = new UsingHolder<Tensor>(rootSlots
+                ? width === 1 ? rootSlots.viewClone() : ws.alloc([batchSize * width, rootSlots.shape[1]], "I32", undefined, rootSlots.parallelism) : undefined!);
+              using sharedLength = new UsingHolder<Tensor>(rootLengths
+                ? width === 1 ? rootLengths.viewClone() : ws.alloc([batchSize * width], "I32", undefined, rootLengths.parallelism) : undefined!);
+              // Every branch reuses its sequence's accepted target row. The
+              // carry buffers contain all verification rows, not draft rows.
+              if (rootSlots && width > 1) {
+                const slotBytes = rootSlots.shape[1] * I32;
+                for (let child = 0; child < width; child++) {
+                  shared.value.memcpy2d(child * slotBytes, width * slotBytes,
+                    rootSlots, 0, slotBytes, slotBytes, batchSize, MemcpyKind.DeviceToDevice);
+                  sharedLength.value.memcpy2d(child * I32, width * I32,
+                    rootLengths!, 0, I32, I32, batchSize, MemcpyKind.DeviceToDevice);
+                }
+              }
+              using expanded = topks[depth] > 1 ? ws.alloc([batchSize * width, this.cfg.hiddenSize], "BF16") : undefined;
+              if (expanded) {
+                for (let child = 0; child < topks[depth]; child++) {
+                  expanded.memcpy2d(child * rowBytes, topks[depth] * rowBytes,
+                    hidden.value, 0, rowBytes, rowBytes, batchSize * previousWidth, MemcpyKind.DeviceToDevice);
+                }
+              }
+              hidden.replace(this.forwardMtp(state, expanded ?? hidden.value, shared, sharedLength));
+            }
+          }
+
+          using inputCopy = this.glm.withStream(() => {
+            using input = verification.inputIdsBuf.viewClone();
+            verifyTokensHost.memcpy(input, batchSize * numVerificationTokens * I32, MemcpyKind.DeviceToHost);
+          });
+          if (sampled) {
+            draftDevice!.memcpy2d(0, numTreeNodes * I32, verification.inputIdsBuf, I32,
+              numVerificationTokens * I32, numTreeNodes * I32, batchSize, MemcpyKind.DeviceToDevice);
+            samplingPolicy.prepareVerificationFromDevice!(draftDevice!, batchSize);
+          }
+          using nextSlots = new UsingHolder<Tensor>(undefined!);
+          using nextSlotsLength = new UsingHolder<Tensor>(undefined!);
+          const kvCacheLayers: MtpVerificationArtifacts["kvCacheLayers"] = [];
+          const indexerKvCacheLayers: MtpVerificationArtifacts["indexerKvCacheLayers"] = [];
+          const appendMla = verification.mlaKvCacheAppend.bind(verification);
+          const appendIndexer = verification.indexerKvCacheAppend.bind(verification);
+          if (!linear) {
+            verification.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
+              kvCacheLayers.push({ appendCkv: appendCkv.viewClone(), appendKpe: appendKpe.viewClone(), cacheIdx, kvLoraRank, qkRopeDim });
+              return appendMla(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
+            };
+            verification.indexerKvCacheAppend = (appendIdxK, cacheIdx, indexHeadDim) => {
+              indexerKvCacheLayers.push({ appendIdxK: appendIdxK.viewClone(), cacheIdx, indexHeadDim });
+              return appendIndexer(appendIdxK, cacheIdx, indexHeadDim);
+            };
+          }
+          try {
+            using hidden = this.forwardModel(verification, nextSlots, nextSlotsLength);
+            using logits = verification.computeLogits(hidden, this, true);
+            const verified = sampled ? samplingPolicy.verify!(logits) : undefined;
+            using counts = verified?.numAccepted;
+            using selected = verified ? verified.tokens : samplingPolicy.selectTarget(logits);
+            using resultCopy = this.glm.withStream(() => {
+              if (counts) acceptedHost!.memcpy(counts, batchSize * I32, MemcpyKind.DeviceToHost);
+              selectedHost.memcpy(selected, batchSize * numVerificationTokens * I32, MemcpyKind.DeviceToHost);
+            });
+            inputCopy.streamWaitEvent();
+            verification.setInput(selected);
+            using nextSeed = this.forwardMtp(verification, hidden, nextSlots, nextSlotsLength);
+            retained.seed.memcpy(nextSeed, nextSeed.bytes, MemcpyKind.DeviceToDevice);
+            if (nextSlots.value) {
+              retained.slots.memcpy(nextSlots.value, nextSlots.value.bytes, MemcpyKind.DeviceToDevice);
+              retained.slotsLength.memcpy(nextSlotsLength.value, nextSlotsLength.value.bytes, MemcpyKind.DeviceToDevice);
+            }
+            resultCopy.streamWaitEvent();
+            return { kvCacheLayers, indexerKvCacheLayers };
+          } finally {
+            verification.mlaKvCacheAppend = appendMla;
+            verification.indexerKvCacheAppend = appendIndexer;
+          }
+        });
+        await this.glm.synchronizeAsync();
+
+        const inputBuf = verifyTokensHost.readPinnedBuffer();
+        const selectedBuf = selectedHost.readPinnedBuffer();
+        const countBuf = acceptedHost?.readPinnedBuffer();
+        const tokens: number[][] = [];
+        const numAccepted: number[] = [];
+        const acceptedNodes: number[][] = [];
+        for (let batch = 0; batch < batchSize; batch++) {
+          const row = batch * numVerificationTokens;
+          let bestAccepted = -1;
+          let bestPath = 0;
+          if (countBuf) {
+            bestAccepted = countBuf.readInt32LE(batch * I32);
+          } else {
+            for (let path = 0; path < numPaths; path++) {
+              let node = 0;
+              let accepted = 0;
+              for (let depth = 0; depth < topks.length; depth++) {
+                const child = mtpChildIndex(targetTopks, node, mtpPathDigit(topks, path, depth, strides), targetBoundaries);
+                if (inputBuf.readInt32LE((row + child) * I32) !== selectedBuf.readInt32LE((row + node) * I32)) break;
+                accepted++;
+                node = child;
+              }
+              if (accepted > bestAccepted) { bestAccepted = accepted; bestPath = path; }
+            }
+          }
+          if (bestAccepted < 0 || bestAccepted > topks.length) throw new Error(`Invalid MTP acceptance count ${bestAccepted}`);
+          const acceptedTokens: number[] = [];
+          const nodes = [0];
+          let node = 0;
+          for (let depth = 0; depth < bestAccepted; depth++) {
+            node = mtpChildIndex(targetTopks, node, mtpPathDigit(topks, bestPath, depth, strides), targetBoundaries);
+            acceptedTokens.push(inputBuf.readInt32LE((row + node) * I32));
+            nodes.push(node);
+          }
+          const replacement = selectedBuf.readInt32LE((row + node) * I32);
+          tokens.push([...acceptedTokens, replacement]);
+          numAccepted.push(bestAccepted);
+          acceptedNodes.push(nodes);
+          nextTargets[batch] = replacement;
+          nextSeedRows[batch] = row + node;
+        }
+
+        if (linear) {
+          for (let batch = 0; batch < batchSize; batch++) sequences[batch].truncate(committedLens[batch] + numAccepted[batch] + 1);
+        } else {
+          // Branched verification writes nodes in tree order. Compact the chosen
+          // path back into the sequence before exposing the committed prefix.
+          ws.clearTracking([seed.value, slots.value, slotsLength.value, artifacts.kvCacheLayers, artifacts.indexerKvCacheLayers]);
+          for (let batch = 0; batch < batchSize; batch++) sequences[batch].truncate(committedLens[batch]);
+          const commit = ws.planPrefill(this, batchSize, numAccepted.map(count => count + 1), cache);
+          const rows = acceptedNodes.flatMap((nodes, batch) => nodes.map(node => batch * numVerificationTokens + node));
+          using sources = ws.alloc([rows.length], "I32");
+          const sourceBuf = Buffer.alloc(rows.length * I32);
+          rows.forEach((row, index) => sourceBuf.writeInt32LE(row, index * I32));
+          sources.h2d(sourceBuf);
+          const layers = artifacts.kvCacheLayers;
+          const indexers = artifacts.indexerKvCacheLayers;
+          using srcCkv = ws.alloc([layers.length], "I64");
+          using srcKpe = ws.alloc([layers.length], "I64");
+          using dstCkv = ws.alloc([layers.length], "I64");
+          using dstKpe = pagedKV.sparseMode ? undefined : ws.alloc([layers.length], "I64");
+          srcCkv.writePointers(layers.map(layer => layer.appendCkv));
+          srcKpe.writePointers(layers.map(layer => layer.appendKpe));
+          dstCkv.writePointers(layers.map(layer => pagedKV.ckvData[layer.cacheIdx]));
+          dstKpe?.writePointers(layers.map(layer => pagedKV.kpeData[layer.cacheIdx]));
+          using srcIndexer = indexers.length ? ws.alloc([indexers.length], "I64") : undefined;
+          using dstIndexer = indexers.length ? ws.alloc([indexers.length], "I64") : undefined;
+          using dstIndexerScale = indexers.length ? ws.alloc([indexers.length], "I64") : undefined;
+          srcIndexer?.writePointers(indexers.map(layer => layer.appendIdxK));
+          dstIndexer?.writePointers(indexers.map(layer => pagedKV.kData[layer.cacheIdx]));
+          dstIndexerScale?.writePointers(indexers.map(layer => pagedKV.kScaleData[layer.cacheIdx]));
+          this.glm.appendSelectedMtpCaches(srcCkv, srcKpe, dstCkv, dstKpe, srcIndexer, dstIndexer, dstIndexerScale,
+            sources, commit.indices, commit.indptrD, commit.mlaBatchIndices, commit.positionIds,
+            pagedKV.pageSize, this.cfg.kvLoraRank, this.cfg.qkRopeHeadDim, this.cfg.indexHeadDim,
+            pagedKV.sparseMode, pagedKV.contextParallel ? this.glm.worldSize : 0);
+          await this.glm.synchronizeAsync();
+          for (const layer of layers) { layer.appendCkv[Symbol.dispose](); layer.appendKpe[Symbol.dispose](); }
+          for (const layer of indexers) layer.appendIdxK[Symbol.dispose]();
+        }
+        committedLens = sequences.map(sequence => sequence.allocLen);
+        speculative = false;
+        ws.assertClear([seed.value, slots.value, slotsLength.value]);
+        ws.clearTracking([seed.value, slots.value, slotsLength.value]);
+        yield { tokens, numAccepted, numDraftTokens: topks.length, warmup };
+      }
+    } finally {
+      // Covers break/return, consumer exceptions, and failed graph submissions.
+      await this.glm.synchronizeAsync();
+      if (speculative) {
+        for (let batch = 0; batch < batchSize; batch++) sequences[batch].truncate(committedLens[batch]);
       }
     }
-
-    const draftPlan = this.planMtpDraftDepths(ws, cache, committedAllocLens, topks);
-    const treeHost = ws.ensureAllocPinned([ws.maxBatch * numTreeNodes], "I32", `glm51_mtp_draft_host_${numTreeNodes}`);
-    const draftInputs: { [name: string]: Tensor } = {
-      seed,
-      sharedSlots,
-      sharedSlotsLength,
-    };
-
-    if (mtpEnabled) samplingPolicy.prepareDraft!(batchSize, topks.length);
-    yield* executionPhase({
-      states: draftPlan.states,
-      inputs: draftInputs,
-      captureKey: ["glm51-mtp-draft", topks.join(","), `batchSize:${batchSize}`, ...(mtpEnabled ? ["linear", samplingPolicy.mtpCaptureKey ?? 0] : [])],
-      timingName: "draft",
-      run: (inputs) => {
-        this.runMtpDraft(ws, topks, batchSize, inputs.seed, inputs.sharedSlots, inputs.sharedSlotsLength, draftPlan.states, draftPlan.metadata, treeHost, samplingPolicy);
-      },
-    });
-    const proposal = mtpEnabled ? samplingPolicy.finishDraft!() : undefined;
-
-    for (let batch = 0; batch < batchSize; batch++) {
-      cache.getPagedKV().sequences[batch].truncate(committedAllocLens[batch]);
-    }
-    const treeBuf = treeHost.readPinnedBuffer();
-    const treeTokens = Array.from({ length: batchSize }, (_, batch) =>
-      Array.from({ length: numTreeNodes }, (_, node) => treeBuf.readInt32LE((batch * numTreeNodes + node) * I32)));
-    completed = true;
-    return {
-      draft: {
-        targetTokens: replacements,
-        treeTokens,
-        topks,
-        ...(proposal ? { proposal } : {}),
-      },
-      tokens: acceptedTokens.map((tokens, batch) => [...tokens, replacements[batch]]),
-      numAccepted,
-      numDraftTokens: topks.length,
-    };
   }
+
 }
