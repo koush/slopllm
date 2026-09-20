@@ -990,42 +990,29 @@ export class Glm51Model extends ChatModel {
   }
 
   *planPrefillMtpChunk(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void> {
-    if (!this.forwardMtp || inputIds.length !== nextTokens.length || inputIds.some(ids => ids.length === 0)) {
-      throw new Error("MTP chunk prefill requires non-empty inputs and one next token per sequence");
-    }
-    const batchSize = inputIds.length;
-    const originalAllocLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
+    const sequences = cache.getPagedKV().sequences.slice();
+    const originalAllocLens = sequences.map(sequence => sequence.allocLen);
     let completed = false;
+    // The phased plan completes at enqueue; the chunk path only commits after
+    // executePlan's post-phase synchronize succeeds. Registered before the
+    // plan so planning-time throws unwind through it.
     using _rollback = {
       [Symbol.dispose]: () => {
         if (!completed) {
-          for (let batch = 0; batch < batchSize; batch++) {
-            cache.getPagedKV().sequences[batch].truncate(originalAllocLens[batch]);
+          for (let batch = 0; batch < sequences.length; batch++) {
+            sequences[batch].truncate(originalAllocLens[batch]);
           }
         }
       },
     };
-    const state = ws.planPrefill(this, batchSize, inputIds.map(ids => ids.length), cache);
-    state.setInput(inputIds);
-
+    using plan = this.planPrefillMtpChunkPhased(ws, cache, inputIds, nextTokens);
     yield* executionPhase({
-      states: [state],
+      states: [plan.state],
       inputs: {},
       captureKey: [],
       timingName: "prefill_chunk",
       run: () => {
-        using sharedSlots = new UsingHolder<Tensor>(undefined!);
-        using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
-        using hiddenStates = this.forwardModel(state, sharedSlots, sharedSlotsLength);
-        using nextDevice = ws.alloc([batchSize], "I32");
-        const nextBuffer = Buffer.alloc(batchSize * I32);
-        for (let batch = 0; batch < batchSize; batch++) {
-          nextBuffer.writeInt32LE(nextTokens[batch], batch * I32);
-        }
-        nextDevice.h2d(nextBuffer);
-        using rotatedInput = state.input!.rotateInputIds(state.qoIndptrD, nextDevice, batchSize);
-        state.setInput(rotatedInput);
-        using _mtpHidden = this.forwardMtp(state, hiddenStates, sharedSlots, sharedSlotsLength);
+        using _mtpHidden = this.runPhased(plan.generator);
         return undefined;
       },
     });
@@ -1056,12 +1043,14 @@ export class Glm51Model extends ChatModel {
         using sharedSlots = new UsingHolder<Tensor>(undefined!);
         using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
         using hiddenStates = yield* model.forwardPhased(state, sharedSlots, sharedSlotsLength);
+        using nextHost = ws.allocPinned([batchSize], "I32");
+        nextHost.withPinnedBuffer(buf => {
+          for (let batch = 0; batch < batchSize; batch++) {
+            buf.writeInt32LE(nextTokens[batch], batch * I32);
+          }
+        });
         using nextDevice = ws.alloc([batchSize], "I32");
-        const nextBuffer = Buffer.alloc(batchSize * I32);
-        for (let batch = 0; batch < batchSize; batch++) {
-          nextBuffer.writeInt32LE(nextTokens[batch], batch * I32);
-        }
-        nextDevice.h2d(nextBuffer);
+        nextDevice.memcpy(nextHost, batchSize * I32, MemcpyKind.HostToDevice);
         using rotatedInput = state.input!.rotateInputIds(state.qoIndptrD, nextDevice, batchSize);
         state.setInput(rotatedInput);
         const mtpHidden = yield* model.forwardMtpPhased(state, hiddenStates, sharedSlots, sharedSlotsLength);
@@ -1392,10 +1381,10 @@ export class Glm51Model extends ChatModel {
           for (let batch = 0; batch < batchSize; batch++) sequences[batch].truncate(committedLens[batch]);
           const commit = ws.planPrefill(this, batchSize, numAccepted.map(count => count + 1), cache);
           const rows = acceptedNodes.flatMap((nodes, batch) => nodes.map(node => batch * numVerificationTokens + node));
+          using sourcesHost = ws.allocPinned([rows.length], "I32");
+          sourcesHost.withPinnedBuffer(buf => rows.forEach((row, index) => buf.writeInt32LE(row, index * I32)));
           using sources = ws.alloc([rows.length], "I32");
-          const sourceBuf = Buffer.alloc(rows.length * I32);
-          rows.forEach((row, index) => sourceBuf.writeInt32LE(row, index * I32));
-          sources.h2d(sourceBuf);
+          sources.memcpy(sourcesHost, rows.length * I32, MemcpyKind.HostToDevice);
           const layers = artifacts.kvCacheLayers;
           const indexers = artifacts.indexerKvCacheLayers;
           using srcCkv = ws.alloc([layers.length], "I64");
