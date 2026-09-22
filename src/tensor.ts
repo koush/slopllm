@@ -180,6 +180,10 @@ export abstract class Tensor implements Disposable {
     return this.reshape(this.shape);
   }
 
+  replicate(): Tensor {
+    return this.viewClone();
+  }
+
   abstract free(): void;
 
   capture() {

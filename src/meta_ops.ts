@@ -1,4 +1,4 @@
-import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
 import { MemcpyKind } from "./sampling";
@@ -298,22 +298,6 @@ export class MetaOps implements DeviceOps {
         return new MetaTensor(workspace, data, allocSize, shape, type, undefined, pinned, view, recycleKey);
     }
 
-    workspaceMemoryStats(workspace: WorkspaceBase): WorkspaceMemoryStats[] {
-        const heaps = [...workspace.heapByKey.values()];
-        return [{
-            regions: heaps.reduce((sum, heap) => sum + heap.regionCount, 0),
-            freeBytes: heaps.reduce((sum, heap) => sum + heap.freeBytes, 0),
-        }];
-    }
-
-    reclaimWorkspaceMemory(workspace: WorkspaceBase): void {
-        workspace.heapByKey.clear();
-    }
-
-    deviceHeapStats(): WorkspaceMemoryStats[] {
-        return [{ regions: 0, freeBytes: 0 }];
-    }
-
     sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number, outProbs?: Tensor, outIds?: Tensor, supportCapacity?: number): void {
     }
 
@@ -425,7 +409,7 @@ export class MetaOps implements DeviceOps {
         return undefined as never;
     }
 
-    mlaKvCacheAppend(_state: ExecutionState, _cacheIdx: number, ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize?: number, cpWorldSize?: number, cpRank?: number): { ckv: Tensor; kpe?: Tensor } {
+    mlaKvCacheAppend(_state: ExecutionState, _cacheIdx: number, ckvData: Tensor, kpeData: Tensor | null, indices: Tensor | undefined, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize?: number, cpWorldSize?: number, cpRank?: number): { ckv: Tensor; kpe?: Tensor } {
         return { ckv: ckvData.viewClone(), kpe: kpeData?.viewClone() };
     }
 
@@ -438,10 +422,6 @@ export class MetaOps implements DeviceOps {
         sourceRows: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor,
         pageSize: number, kvLoraRank: number, peDim: number, indexHeadDim: number, sparseMode: boolean,
         cpWorldSize?: number, cpRank?: number): void {
-    }
-
-    sparseMlaPrepareCache(state: ExecutionState, groupSlots: Tensor, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor | null, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
-        return kvCache.viewClone();
     }
 
     gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
@@ -460,9 +440,6 @@ export class MetaOps implements DeviceOps {
 
     gatherPages(srcData: Tensor, pageIndices: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, batchSize: number, paddedKvLen: number, kvTokenIndptrD: Tensor, contextParallel: boolean): Tensor {
         return undefined as never;
-    }
-
-    gatherTopkCkv(state: ExecutionState, kvCache: Tensor, outputs: readonly Tensor[], topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, kvTokenIndptr: Tensor, batchIndices: Tensor, topk: number, paddedKvLen: number, cpWorldSize?: number, cpRank?: number, effPageSize?: number): void {
     }
 
     indexerScore(out: Tensor, q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean, kvTokenIndptr?: Tensor): void {

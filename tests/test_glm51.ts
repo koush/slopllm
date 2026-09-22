@@ -941,10 +941,10 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     ws.free();
     ws = new ExecutionWorkspace(glm, 2, 128);
     const forwardMtp = model.forwardMtp.bind(model);
-    model.forwardMtp = (state, hidden, slots, lengths) => {
-      assert.equal(slots!.value.shape[0], state.totalTokens);
-      assert.equal(lengths!.value.numElements, state.totalTokens);
-      return forwardMtp(state, hidden, slots, lengths);
+    model.forwardMtp = (state, hidden, holders) => {
+      assert.equal(holders!.sharedSlots!.value.shape[0], state.totalTokens);
+      assert.equal(holders!.sharedSlotsLength!.value.numElements, state.totalTokens);
+      return forwardMtp(state, hidden, holders);
     };
     const run = async (graphs: boolean) => {
       using cache = model.createChatCache(32, 2);
@@ -1382,11 +1382,11 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       state.setInput([[...tokens, ...padding]]);
       using slots = new UsingHolder<Tensor>(undefined!);
       using lengths = new UsingHolder<Tensor>(undefined!);
-      using hidden = model.forwardModel(state, slots, lengths);
+      using hidden = model.forwardModel(state, { sharedSlots: slots, sharedSlotsLength: lengths });
       using shifted = referenceWs.alloc([tokens.length + padding.length], "I32");
       shifted.h2d(Buffer.from(new Int32Array([...tokens.slice(1), next, ...padding]).buffer));
       state.setInput(shifted);
-      using mtp = model.forwardMtp(state, hidden, slots, lengths);
+      using mtp = model.forwardMtp(state, hidden, { sharedSlots: slots, sharedSlotsLength: lengths });
       using last = mtp.narrow(tokens.length - 1, 1);
       const result = readBytes(last);
       reference.getPagedKV().sequences[0].truncate(start + tokens.length);

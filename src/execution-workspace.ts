@@ -218,19 +218,6 @@ export class ExecutionState {
     );
   }
 
-  sparseMlaPrepareCache(slots: Tensor, ckvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, cacheIdx: number, kvLoraRank: number, qkRopeDim: number) {
-    const nnz = this.isDecode ? this.batchSize : this.totalTokens;
-    return this.ws.glm.sparseMlaPrepareCache(
-      this, slots, cacheIdx,
-      ckvCache, appendCkv, appendKpe,
-      topk,
-      this.indices, this.indptrD,
-      this.mlaBatchIndices, this.positionIds,
-      nnz, kvLoraRank, qkRopeDim,
-      kvLoraRank, qkRopeDim
-    );
-  }
-
   mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number): { ckv: Tensor; kpe?: Tensor } {
     const pagedKV = this.cache.getPagedKV();
     const ckv = pagedKV.ckvData[cacheIdx];

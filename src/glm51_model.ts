@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ChatCache, ChatTemplateKwargs, MtpDecodeStepResult, ChunkedPrefillPlan, TokenSelector } from "./chat_model";
 import { EagerExecution, type ExecutionManager } from "./execution-manager";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
-import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
+import { DeviceOps, MaskMode, TensorParallelism, type StreamResult } from "./device_ops";
 import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { MemcpyKind } from "./enums";
 import { BF16, f32ToBf16Bytes, I32 } from "./glm_ops";
@@ -13,12 +13,20 @@ import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
+import { CaptureManager } from "./capture-manager";
 
 export { ExecutionState as BatchState };
 export type { SamplingParams };
 
 const GLM51_REPO = "zai-org/GLM-5.1";
 const GLM51_MODEL_DIR = "tests/python/test_models/glm51_small/glm51_small_bf16";
+
+// Master switch for the CP "gather CKV" path in sparse MLA prefill. When true,
+// CP prefill gathers CKV into a flat Replicated buffer and emits flat slots to
+// match. The indexer cache remains Row-parallel unless separately opted into
+// gathering below; its per-rank top-k results are merged before slot conversion.
+export const CP_GATHER_KV = process.env.GLM_CP_GATHER_KV !== "0";
+export const CP_GATHER_INDEXER_KV = CP_GATHER_KV && process.env.GLM_CP_GATHER_INDEXER_KV !== "0";
 
 export interface Glm51Config extends CommonModelConfig {
   moeIntermediateSize: number;
@@ -46,6 +54,18 @@ export interface Glm51Config extends CommonModelConfig {
   numDenseMlpLayers: number;
   firstSparseMlpLayer: number;
   eosTokenIds: number[];
+}
+
+interface LayerHolders {
+  sharedSlots?: UsingHolder<Tensor>;
+  sharedSlotsLength?: UsingHolder<Tensor>;
+  ckvPrefetchStream?: UsingHolder<StreamResult<void>>;
+  indexerPrefetchStream?: UsingHolder<StreamResult<void>>;
+  ckvPrefetch?: UsingHolder<Tensor>;
+  indexerKPrefetch?: UsingHolder<Tensor>;
+  indexerKScalePrefetch?: UsingHolder<Tensor>;
+  phaseNextLayerHolders?: LayerHolders;
+  phasedPrefill?: boolean;
 }
 
 interface MtpVerificationArtifacts {
@@ -307,6 +327,8 @@ export class Glm51Model extends ChatModel {
   cfg: Glm51Config;
   invFreq: Tensor;
   readonly contextParallel: boolean;
+  private readonly pendingKNope = new Map<string, Tensor>();
+  private readonly pendingQNope = new Map<string, Tensor>();
   private readonly mtp: boolean;
 
   private constructor(glm: DeviceOps, config: Glm51Config, contextParallel = false, mtp = false) {
@@ -437,11 +459,15 @@ export class Glm51Model extends ChatModel {
   }
 
   private tryComputeAbsorbed(layerPfx: string, nHeads: number, kvLoraRank: number, qLoraRank: number, qkNopeDim: number): void {
-    const kNopeProj = this.tensors.get(`${layerPfx}.k_nope_proj.weight`);
-    const qNopeProj = this.tensors.get(`${layerPfx}.q_nope_proj.weight`);
-    if (!kNopeProj || !qNopeProj) {
+    const kNopeKey = `${layerPfx}.k_nope_proj.weight`;
+    const qNopeKey = `${layerPfx}.q_nope_proj.weight`;
+    if (!this.pendingKNope.has(kNopeKey) || !this.pendingQNope.has(qNopeKey)) {
       return;
     }
+    const kNopeProj = this.pendingKNope.get(kNopeKey)!;
+    const qNopeProj = this.pendingQNope.get(qNopeKey)!;
+    this.pendingKNope.delete(kNopeKey);
+    this.pendingQNope.delete(qNopeKey);
     using wAbsorbedTmp = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
     const wAbsorbed = this.alloc(wAbsorbedTmp.shape, wAbsorbedTmp.type, `${layerPfx}.absorbed.weight`, wAbsorbedTmp.parallelism);
     if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") {
@@ -479,6 +505,7 @@ export class Glm51Model extends ChatModel {
         tQNope.mmapLoad(mmapPtr, offset, tQNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
         tPe.mmapLoad(mmapPtr, offset, tPe.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: qkRopeDim * inDim * eb, width: qkRopeDim * inDim * eb, height: nHeads }),
       ]);
+      this.pendingQNope.set(name.replace(".q_b_proj.weight", ".q_nope_proj.weight"), tQNope);
     } else if (name.endsWith(".kv_b_proj.weight")) {
       const eb = 2;
       const srcPitch = (qkNopeDim + vHeadDim) * inDim * eb;
@@ -497,6 +524,7 @@ export class Glm51Model extends ChatModel {
       if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") {
         tV.memcpy(tVT);
       }
+      this.pendingKNope.set(name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), tKNope);
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
       const ckvName = name.replace(".kv_a_proj_with_mqa.weight", ".ckv_proj.weight");
       const kpeName = name.replace(".kv_a_proj_with_mqa.weight", ".k_pe_proj.weight");
@@ -521,6 +549,145 @@ export class Glm51Model extends ChatModel {
       const embedTensor = this.tensors.get("model.embed_tokens.weight");
       if (embedTensor) {
         this.tensors.set("lm_head.weight", embedTensor);
+      }
+    }
+  }
+
+  private sparseMlaPaddedKvLen(state: ExecutionState): number {
+    const pagedKV = state.cache.getPagedKV();
+    // Phased prefill plans both A and B before either forward runs, so the live
+    // sequence allocLen already includes B. Use that length, not A's snapshot:
+    // a gather using A's page metadata must reserve room through B's end so B
+    // can append its new tokens into the shared gathered buffer without resizing.
+    const exactKvLen = pagedKV.sequences.reduce((sum, sequence) => sum + sequence.allocLen, 0);
+    const eagerKvLen = Math.ceil(exactKvLen / pagedKV.pageSize) * pagedKV.pageSize;
+    return Math.min(
+      pagedKV.maxPages * pagedKV.pageSize,
+      CaptureManager.capturing === undefined ? eagerKvLen : state.getGraphVariantPaddedKvLen(),
+    );
+  }
+
+  // determines the gather type to be used depending on the state.
+  // this is called at various states in the pipeline for hooking a all vs sparse gather
+  // "full" layers should never be sparse gathered. (enforced elsewhere)
+  shouldGatherKv(state: ExecutionState, sparseGather: boolean) {
+    // only valid in cp mode
+    if (!state.cache.getPagedKV().contextParallel)
+      return false;
+    // force it off if requested
+    if (!CP_GATHER_KV)
+      return false;
+
+    // disabled for now
+    if (sparseGather) {
+      return false;
+    }
+
+    // if total tokens is under some threshold, use the sparse gather.
+    if (state.totalTokens <= 32) {
+      // decode should only sparse gather.
+      return sparseGather;
+    }
+
+    // prevent high batch decode from using the gather path
+    if (state.isDecode) {
+      return false;
+    }
+
+    // never sparse gather above the threshold
+    if (sparseGather)
+      return false;
+
+    // should do the actual math to see whether q or ckv has a smaller gather
+    // this could be tuned further.
+    const paddedKvLen = state.getGraphVariantPaddedKvLen();
+    if (paddedKvLen > 65536 * 4)
+      return false;
+
+    return true;
+  }
+
+  prefetchLayerResources(state: ExecutionState, layerHolders: LayerHolders, nextCacheIdx: number) {
+    const cfg = this.cfg;
+
+    if (!this.shouldGatherKv(state, false)) {
+      return;
+    }
+
+    const pagedKV = state.cache.getPagedKV();
+
+    const { ckvPrefetchStream, indexerPrefetchStream, ckvPrefetch, indexerKPrefetch, indexerKScalePrefetch, phaseNextLayerHolders, phasedPrefill } = layerHolders;
+
+    // should be unreachable.
+    if (!pagedKV.contextParallel) {
+      throw new Error(`Context parallelism is for ckv prefetch`);
+    }
+
+    const paddedKvLen = this.sparseMlaPaddedKvLen(state);
+    const indices = state.indices;
+    const indptr = state.indptrD;
+
+    // chunk B does not prefetch, it uses chunk A prefetch
+    if (phasedPrefill && !phaseNextLayerHolders) {
+      return;
+    }
+
+    if (indexerPrefetchStream && !indexerPrefetchStream.value) {
+      if (phasedPrefill) {
+        if (indexerKPrefetch?.value) {
+          phaseNextLayerHolders!.indexerKPrefetch!.replace(indexerKPrefetch.detach());
+        }
+        if (indexerKScalePrefetch?.value) {
+          phaseNextLayerHolders!.indexerKScalePrefetch!.replace(indexerKScalePrefetch.detach());
+        }
+      }
+      else {
+        indexerKPrefetch?.release();
+        indexerKScalePrefetch?.release();
+      }
+
+      if (nextCacheIdx < cfg.numHiddenLayers + (cfg.numNextNPredictLayers ?? 0) && pagedKV.ckvData[nextCacheIdx]) {
+        const nextKData = pagedKV.kData[nextCacheIdx];
+        const nextKScaleData = pagedKV.kScaleData[nextCacheIdx];
+        const indexerStream = CP_GATHER_INDEXER_KV && nextKData?.parallelism === TensorParallelism.Row
+          ? this.glm.withStream<void>(() => {
+            indexerKPrefetch!.replace(this.glm.gatherPages(
+              nextKData, indices!, indptr, state.lastPageLen,
+              state.batchSize, paddedKvLen, state.kvTokenIndptrD, true,
+            ));
+            indexerKScalePrefetch!.replace(this.glm.gatherPages(
+              nextKScaleData, indices!, indptr, state.lastPageLen,
+              state.batchSize, paddedKvLen, state.kvTokenIndptrD, true,
+            ));
+          })
+          : undefined;
+        indexerPrefetchStream!.replace(indexerStream!);
+      }
+    }
+
+    if (ckvPrefetchStream && !ckvPrefetchStream.value) {
+      if (phasedPrefill) {
+        if (ckvPrefetch?.value) {
+          phaseNextLayerHolders!.ckvPrefetch!.replace(ckvPrefetch.detach());
+        }
+      }
+      else {
+        ckvPrefetch?.release();
+      }
+
+      if (nextCacheIdx < cfg.numHiddenLayers + (cfg.numNextNPredictLayers ?? 0) && pagedKV.ckvData[nextCacheIdx]) {
+        const nextStream = this.glm.withStream<void>(() => {
+          const nextKvCache = pagedKV.ckvData[nextCacheIdx];
+
+          ckvPrefetch!.replace(this.glm.gatherPages(
+            nextKvCache, indices!, indptr, state.lastPageLen,
+            state.batchSize,
+            paddedKvLen,
+            state.kvTokenIndptrD, pagedKV.contextParallel,
+          ));
+        });
+
+        ckvPrefetchStream!.replace(nextStream);
       }
     }
   }
@@ -598,7 +765,12 @@ export class Glm51Model extends ChatModel {
     return result.reshape([BS, hs]);
   }
 
-  private *mlaLayerPhased(cos: Tensor, sin: Tensor, normedHolder: UsingHolder<Tensor>, residualHolder: UsingHolder<Tensor>, layerIdx: number, state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Generator<void, { normed: Tensor, residual: Tensor }, void> {
+  private * mlaLayerPhased(cos: Tensor, sin: Tensor,
+    normedHolder: UsingHolder<Tensor>, residualHolder: UsingHolder<Tensor>, layerIdx: number, state: ExecutionState,
+    layerHolders?: LayerHolders
+  ): Generator<void, { normed: Tensor, residual: Tensor }, void> {
+    layerHolders ||= {};
+    const { sharedSlots, sharedSlotsLength, ckvPrefetchStream, indexerPrefetchStream, ckvPrefetch, indexerKPrefetch, indexerKScalePrefetch } = layerHolders;
     const cfg = this.cfg;
     const normed = normedHolder.value;
     const residual = residualHolder.value;
@@ -632,11 +804,33 @@ export class Glm51Model extends ChatModel {
       using appendedCkv = cache.ckv;
       using _appendedKpe = cache.kpe;
 
-      // The physical slots are derived per-layer from sharedTopk at attention
-      // time below; the topk arg here is vestigial.
+      const prefetched = ckvPrefetch?.value?.viewClone();
+      using prefetchStream = ckvPrefetchStream?.detach();
+      prefetchStream?.streamWaitEvent();
+      this.prefetchLayerResources(state, layerHolders, layerIdx + 1);
+
+      if (!prefetched) {
+        return {
+          ckv: appendedCkv.viewClone(),
+        }
+      }
+
+      // After a prefetch, this layer's NEW ckv values need to be written to
+      // the flat gathered tensor: the prefetch started on the previous
+      // layer's call and read from pagedKV.ckvData[cacheIdx] BEFORE this
+      // layer's concatAndCacheDsMla ran, so positions [old_seq_len,
+      // new_seq_len) are stale in the gathered buffer. concatAndCacheDsMla
+      // writes them in. This is required in prefill (full gather) and decode (sparse gather)
+      // because the topk may reference those new-token positions.
+
+      // Flat addressing uses token prefix sums rather than page indptr.
+      using _cache = this.glm.concatAndCacheDsMla(state, layerIdx, prefetched, ckvNormed, kPeRope,
+        undefined, state.kvTokenIndptrD, state.mlaBatchIndices, state.positionIds,
+        state.isDecode ? state.batchSize : state.totalTokens,
+        kvLoraRank, qkRopeDim, kvLoraRank, qkRopeDim);
       return {
-        ckv: state.sparseMlaPrepareCache(sharedSlots!.value, appendedCkv, ckvNormed, kPeRope, undefined, layerIdx, kvLoraRank, qkRopeDim),
-      };
+        ckv: prefetched,
+      }
     });
 
     const shared = cfg.indexerTypes[layerIdx] === "shared";
@@ -658,7 +852,35 @@ export class Glm51Model extends ChatModel {
           cos, sin, idxRopeDim, cfg.indexHeadDim, 1, S, B, 1, cfg.indexerRopeInterleave,
         );
 
-        return state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
+        using prefetched = indexerKPrefetch?.value?.viewClone();
+        using prefetchedScale = indexerKScalePrefetch?.value?.viewClone();
+        using prefetchStream = indexerPrefetchStream?.detach();
+        prefetchStream?.streamWaitEvent();
+        this.prefetchLayerResources(state, layerHolders, layerIdx + 1);
+
+        if (!prefetched !== !prefetchedScale) {
+          throw new Error('Prefetched K data and its scale must either both be available or both be absent.');
+        }
+
+        const localIndexer = state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
+        if (!prefetched) {
+          return localIndexer;
+        }
+
+        using _kData = localIndexer.kData;
+        using _kScaleData = localIndexer.kScaleData;
+
+        const nnz = state.isDecode ? state.batchSize : state.totalTokens;
+        const cache = this.glm.mlaKvCacheAppend(
+          state, layerIdx,
+          prefetched, prefetchedScale!,
+          undefined, state.kvTokenIndptrD, state.lastPageLen,
+          idxKOut, null,
+          state.mlaBatchIndices, state.positionIds,
+          nnz, cfg.indexHeadDim, 0,
+          cfg.indexHeadDim, 0
+        );
+        return { kData: cache.ckv, kScaleData: cache.kpe! };
       });
 
     using idxWeightsStream = skipIndexer ? undefined : this.glm.withStream(() => {
@@ -730,7 +952,6 @@ export class Glm51Model extends ChatModel {
     let sparseSlots: {
       slots: Tensor,
       length: Tensor,
-      stream?: Disposable & { streamWaitEvent(): void, synchronize(): void },
     } | undefined;
     if (cfg.indexHeadDim !== 0) {
       if (!sharedSlots || !sharedSlotsLength) {
@@ -762,22 +983,23 @@ export class Glm51Model extends ChatModel {
         const pagedKV = state.cache.getPagedKV();
         const kData = pagedKV.kData[layerIdx];
         const maxKv = kData.shape[0] * kData.shape[1];
-        const { layer, group, stream } = this.glm.topkToSlots(
+        const contextParallel = ckv.parallelism === TensorParallelism.Row;
+        const flat = pagedKV.contextParallel && !contextParallel;
+        const { layer, group } = this.glm.topkToSlots(
           state,
           topkIndices, state.kvTokenIndptrD,
           state.indices, state.indptrD, state.lastPageLen, state.mlaBatchIndices,
           pagedKV.pageSize, maxKv,
-          layerIdx, pagedKV.contextParallel,
+          layerIdx, contextParallel, flat ? 1 : undefined,
         );
         sharedSlots.replace(group.slots);
         sharedSlotsLength.replace(group.length);
-        sparseSlots = { slots: layer.slots, length: layer.length, stream };
+        sparseSlots = { slots: layer.slots, length: layer.length };
       }
     }
 
     using slots = sparseSlots?.slots;
     using slotsLength = sparseSlots?.length;
-    using slotsStream = sparseSlots?.stream;
 
     kvcache.streamWaitEvent();
     qStream.streamWaitEvent();
@@ -854,12 +1076,13 @@ export class Glm51Model extends ChatModel {
     // Only close the prefetch branch at layer end: outputProj reads immutable
     // weights and can use cache hits without waiting for the hint kernel.
     prefetchL2.value?.streamWaitEvent();
-    slotsStream?.streamWaitEvent();
     yield;
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  *forwardPhased(state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Generator<void, Tensor, void> {
+  * forwardPhased(state: ExecutionState, layerHolders?: LayerHolders): Generator<void, Tensor, void> {
+    layerHolders ||= {};
+    let { sharedSlots, sharedSlotsLength, ckvPrefetchStream, indexerPrefetchStream, ckvPrefetch, indexerKPrefetch, indexerKScalePrefetch } = layerHolders;
     const cfg = this.cfg;
 
     using rotaryEmbedding = this.glm.withStream(() => state.rotaryEmbedding(this.invFreq));
@@ -877,11 +1100,24 @@ export class Glm51Model extends ChatModel {
     // ordinary forwards use holders local to this invocation.
     using _localSlots = sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
     using _localLength = sharedSlotsLength ? undefined : new UsingHolder<Tensor>(undefined!);
-    sharedSlots ??= _localSlots!;
-    sharedSlotsLength ??= _localLength!;
+    layerHolders.sharedSlots ??= _localSlots!;
+    layerHolders.sharedSlotsLength ??= _localLength!;
+
+    using _ckvPrefetchStream = ckvPrefetchStream ? undefined : new UsingHolder<StreamResult<void>>(undefined!);
+    using _indexerPrefetchStream = indexerPrefetchStream ? undefined : new UsingHolder<StreamResult<void>>(undefined!);
+    using _ckvPrefetch = ckvPrefetch ? undefined : new UsingHolder<Tensor>(undefined!);
+    using _indexerKPrefetch = indexerKPrefetch ? undefined : new UsingHolder<Tensor>(undefined!);
+    using _indexerKScalePrefetch = indexerKScalePrefetch ? undefined : new UsingHolder<Tensor>(undefined!);
+    layerHolders.ckvPrefetchStream ??= _ckvPrefetchStream!;
+    layerHolders.indexerPrefetchStream ??= _indexerPrefetchStream!;
+    layerHolders.ckvPrefetch ??= _ckvPrefetch!;
+    layerHolders.indexerKPrefetch ??= _indexerKPrefetch!;
+    layerHolders.indexerKScalePrefetch ??= _indexerKScalePrefetch!;
+
+    this.prefetchLayerResources(state, layerHolders, 0);
 
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
-      const result = yield* this.mlaLayerPhased(cos, sin, normed, residual, i, state, sharedSlots, sharedSlotsLength);
+      const result = yield* this.mlaLayerPhased(cos, sin, normed, residual, i, state, layerHolders);
       normed.replace(result.normed);
       residual.replace(result.residual);
     }
@@ -889,11 +1125,13 @@ export class Glm51Model extends ChatModel {
     return normed.detach();
   }
 
-  override forwardModel(state: ExecutionState, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Tensor {
-    return this.runPhased(this.forwardPhased(state, sharedSlots, sharedSlotsLength));
+  override forwardModel(state: ExecutionState, layerHolders?: LayerHolders): Tensor {
+    return this.runPhased(this.forwardPhased(state, layerHolders));
   }
 
-  *forwardMtpPhased(state: ExecutionState, previousHiddenState: Tensor, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>): Generator<void, Tensor, void> {
+  * forwardMtpPhased(state: ExecutionState, previousHiddenState: Tensor, layerHolders?: LayerHolders): Generator<void, Tensor, void> {
+    layerHolders ||= {};
+    let { sharedSlots, sharedSlotsLength, ckvPrefetchStream, indexerPrefetchStream, ckvPrefetch, indexerKPrefetch, indexerKScalePrefetch } = layerHolders;
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const ws = state.ws;
@@ -940,9 +1178,21 @@ export class Glm51Model extends ChatModel {
     const layerIdx = cfg.numHiddenLayers;
     using _localSlots = sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
     using _localLength = sharedSlotsLength ? undefined : new UsingHolder<Tensor>(undefined!);
-    sharedSlots ??= _localSlots!;
-    sharedSlotsLength ??= _localLength!;
-    const result = yield* this.mlaLayerPhased(cos, sin, normed, residual, layerIdx, state, sharedSlots, sharedSlotsLength);
+    layerHolders.sharedSlots ??= _localSlots!;
+    layerHolders.sharedSlotsLength ??= _localLength!;
+
+    using _ckvPrefetchStream = ckvPrefetchStream ? undefined : new UsingHolder<StreamResult<void>>(undefined!);
+    using _indexerPrefetchStream = indexerPrefetchStream ? undefined : new UsingHolder<StreamResult<void>>(undefined!);
+    using _ckvPrefetch = ckvPrefetch ? undefined : new UsingHolder<Tensor>(undefined!);
+    using _indexerKPrefetch = indexerKPrefetch ? undefined : new UsingHolder<Tensor>(undefined!);
+    using _indexerKScalePrefetch = indexerKScalePrefetch ? undefined : new UsingHolder<Tensor>(undefined!);
+    layerHolders.ckvPrefetchStream ??= _ckvPrefetchStream!;
+    layerHolders.indexerPrefetchStream ??= _indexerPrefetchStream!;
+    layerHolders.ckvPrefetch ??= _ckvPrefetch!;
+    layerHolders.indexerKPrefetch ??= _indexerKPrefetch!;
+    layerHolders.indexerKScalePrefetch ??= _indexerKScalePrefetch!;
+
+    const result = yield* this.mlaLayerPhased(cos, sin, normed, residual, layerIdx, state, layerHolders);
     using _residual = result.residual;
 
     // Return shared_head.norm(residual) so the recycled seed for the next MTP
@@ -951,8 +1201,8 @@ export class Glm51Model extends ChatModel {
     return result.normed;
   }
 
-  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, sharedSlots?: UsingHolder<Tensor>, sharedSlotsLength?: UsingHolder<Tensor>) {
-    return this.runPhased(this.forwardMtpPhased(state, previousHiddenState, sharedSlots, sharedSlotsLength));
+  forwardMtp(state: ExecutionState, previousHiddenState: Tensor, layerHolders?: LayerHolders) {
+    return this.runPhased(this.forwardMtpPhased(state, previousHiddenState, layerHolders));
   }
 
   private rewindMtpDecodeInput(cache: ChatCache): number[] {
@@ -972,12 +1222,29 @@ export class Glm51Model extends ChatModel {
     samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ChunkedPrefillPlan {
     const self = this;
     const plan = super.planPhasedPrefill(ws, cache, inputIdsList, samplingPolicy, function* (state, nextState) {
-      if (!self.mtp) {
-        return yield* self.forwardPhased(state);
-      }
       using slots = new UsingHolder<Tensor>(undefined!);
       using slotsLength = new UsingHolder<Tensor>(undefined!);
-      using hidden = yield* self.forwardPhased(state, slots, slotsLength);
+      using ckvPrefetchStream = new UsingHolder<StreamResult<void>>(undefined!);
+      using indexerPrefetchStream = new UsingHolder<StreamResult<void>>(undefined!);
+      using ckvPrefetch = new UsingHolder<Tensor>(undefined!);
+      using indexerKPrefetch = new UsingHolder<Tensor>(undefined!);
+      using indexerKScalePrefetch = new UsingHolder<Tensor>(undefined!);
+      const holders: LayerHolders = { sharedSlots: slots, sharedSlotsLength: slotsLength, ckvPrefetchStream, indexerPrefetchStream, ckvPrefetch, indexerKPrefetch, indexerKScalePrefetch, phasedPrefill: true };
+      if (!nextState) {
+        state.extras.set('layerHolders', holders);
+      }
+      // chunk A waits for chunk B to set the layer holders
+      yield;
+      if (nextState) {
+        holders.phaseNextLayerHolders = nextState.extras.get('layerHolders');
+        if (!holders.phaseNextLayerHolders) {
+          throw new Error("Expected phaseNextLayerHolders to be set in state extras");
+        }
+      }
+      using hidden = yield* self.forwardPhased(state, holders);
+      if (!self.mtp) {
+        return hidden.viewClone();
+      }
 
       // The next prefill overlap recomputes each terminal boundary, so a placeholder suffices.
       using boundary = ws.alloc([state.batchSize], "I32");
@@ -993,28 +1260,9 @@ export class Glm51Model extends ChatModel {
       }
       using rotated = state.input!.rotateInputIds(state.qoIndptrD, boundary, state.batchSize);
       state.setInput(rotated);
-      using mtpHidden = self.forwardMtp(state, hidden, slots, slotsLength);
+      using _mtpHidden = self.forwardMtp(state, hidden, holders);
       return hidden.viewClone();
     });
-    const [stateA, stateB] = plan.states;
-    const generator = plan.generator;
-    plan.generator = (function* () {
-      // Both chunks patch the same prefetched buffers before B consumes them.
-      const installPrefetch = (cacheIdx: number, field: string, stream: unknown) => {
-        const key = `sparseMlaPrefetchLayer_${cacheIdx}`;
-        const extra = stateB.extras.get(key) ?? {};
-        extra[field] = stream;
-        stateB.extras.set(key, extra);
-      };
-      stateA.extras.set("setCkv", (cacheIdx: number, stream: unknown) => installPrefetch(cacheIdx, "stream", stream));
-      stateA.extras.set("setIndexerK", (cacheIdx: number, stream: unknown) => installPrefetch(cacheIdx, "indexerStream", stream));
-      try {
-        return yield* generator;
-      } finally {
-        stateA.extras.delete("setCkv");
-        stateA.extras.delete("setIndexerK");
-      }
-    })();
     return plan;
   }
 
@@ -1067,18 +1315,24 @@ export class Glm51Model extends ChatModel {
     state.setInput(input);
     const self = this;
     return this.createChunkedPrefillPlan([state], cache, input, (function* () {
-        using slots = new UsingHolder<Tensor>(undefined!);
-        using slotsLength = new UsingHolder<Tensor>(undefined!);
-        using hidden = yield* self.forwardPhased(state, slots, slotsLength);
-        using logits = state.computeLogits(hidden, self);
-        using selected = samplingPolicy.selectTarget(logits);
-        using boundary = ws.alloc([batchSize], "I32");
-        boundary.fill(0, batchSize);
-        using rotated = state.input!.rotateInputIds(state.qoIndptrD, boundary, batchSize);
-        state.setInput(rotated);
-        using mtpHidden = self.forwardMtp(state, hidden, slots, slotsLength);
-        return selected.readInt32LEArray();
-      })());
+      using slots = new UsingHolder<Tensor>(undefined!);
+      using slotsLength = new UsingHolder<Tensor>(undefined!);
+      using ckvPrefetchStream = new UsingHolder<StreamResult<void>>(undefined!);
+      using indexerPrefetchStream = new UsingHolder<StreamResult<void>>(undefined!);
+      using ckvPrefetch = new UsingHolder<Tensor>(undefined!);
+      using indexerKPrefetch = new UsingHolder<Tensor>(undefined!);
+      using indexerKScalePrefetch = new UsingHolder<Tensor>(undefined!);
+      const holders: LayerHolders = { sharedSlots: slots, sharedSlotsLength: slotsLength, ckvPrefetchStream, indexerPrefetchStream, ckvPrefetch, indexerKPrefetch, indexerKScalePrefetch };
+      using hidden = yield* self.forwardPhased(state, holders);
+      using logits = state.computeLogits(hidden, self);
+      using selected = samplingPolicy.selectTarget(logits);
+      using boundary = ws.alloc([batchSize], "I32");
+      boundary.fill(0, batchSize);
+      using rotated = state.input!.rotateInputIds(state.qoIndptrD, boundary, batchSize);
+      state.setInput(rotated);
+      using mtpHidden = self.forwardMtp(state, hidden, holders);
+      return selected.readInt32LEArray();
+    })());
   }
 
   /** Owns the draft/verification intermediates until the caller breaks the loop.
@@ -1086,7 +1340,7 @@ export class Glm51Model extends ChatModel {
    * require closing this generator and starting a new one to recondition.
     * Startup replays the last committed token conditioned on the caller-published
     * pending target; every yield is a complete draft/verification step. */
-  async *generateMtpDecode(
+  async * generateMtpDecode(
     ws: ExecutionWorkspace, cache: ChatCache,
     topks: readonly number[],
     executionManager: ExecutionManager = new EagerExecution(),
@@ -1096,13 +1350,13 @@ export class Glm51Model extends ChatModel {
     const sequences = pagedKV.sequences.slice();
     const batchSize = sequences.length;
     if (!this.mtp || !batchSize || !topks.length
-        || topks.some(k => !Number.isInteger(k) || k < 1)) {
+      || topks.some(k => !Number.isInteger(k) || k < 1)) {
       throw new Error("MTP decode requires an MTP model, a non-empty matching batch, and positive draft widths");
     }
     const sampled = samplingPolicy.mtpEnabled === true;
     const linear = topks.every(k => k === 1);
     if (sampled && (!linear || !samplingPolicy.prepareDraft || !samplingPolicy.sampleDraft
-        || !samplingPolicy.prepareVerificationFromDevice || !samplingPolicy.verify)) {
+      || !samplingPolicy.prepareVerificationFromDevice || !samplingPolicy.verify)) {
       throw new Error("Combined MTP sampling requires linear drafts and capture-safe device verification preparation");
     }
     const numTreeNodes = mtpTotalTreeNodes(topks);
@@ -1145,9 +1399,15 @@ export class Glm51Model extends ChatModel {
         state.setInput(initialTargets.map(token => [token]));
         using initialSlots = new UsingHolder<Tensor>(undefined!);
         using initialSlotsLength = new UsingHolder<Tensor>(undefined!);
-        using hidden = this.forwardModel(state, initialSlots, initialSlotsLength);
+        using ckvPrefetchStream = new UsingHolder<StreamResult<void>>(undefined!);
+        using indexerPrefetchStream = new UsingHolder<StreamResult<void>>(undefined!);
+        using ckvPrefetch = new UsingHolder<Tensor>(undefined!);
+        using indexerKPrefetch = new UsingHolder<Tensor>(undefined!);
+        using indexerKScalePrefetch = new UsingHolder<Tensor>(undefined!);
+        const holders: LayerHolders = { sharedSlots: initialSlots, sharedSlotsLength: initialSlotsLength, ckvPrefetchStream, indexerPrefetchStream, ckvPrefetch, indexerKPrefetch, indexerKScalePrefetch };
+        using hidden = this.forwardModel(state, holders);
         state.setInput(nextTargets.map(token => [token]));
-        using initialSeed = this.forwardMtp(state, hidden, initialSlots, initialSlotsLength);
+        using initialSeed = this.forwardMtp(state, hidden, holders);
         seed.value.memcpy(initialSeed, initialSeed.bytes, MemcpyKind.DeviceToDevice);
         if (initialSlots.value) {
           slots.replace(ws.alloc([batchSize * numVerificationTokens, initialSlots.value.shape[1]], "I32", undefined, initialSlots.value.parallelism));
@@ -1244,7 +1504,7 @@ export class Glm51Model extends ChatModel {
                     hidden.value, 0, rowBytes, rowBytes, batchSize * previousWidth, MemcpyKind.DeviceToDevice);
                 }
               }
-              hidden.replace(this.forwardMtp(state, expanded ?? hidden.value, shared, sharedLength));
+              hidden.replace(this.forwardMtp(state, expanded ?? hidden.value, { sharedSlots: shared, sharedSlotsLength: sharedLength }));
             }
           }
 
@@ -1274,7 +1534,13 @@ export class Glm51Model extends ChatModel {
             };
           }
           try {
-            using hidden = this.forwardModel(verification, nextSlots, nextSlotsLength);
+            using ckvPrefetchStream = new UsingHolder<StreamResult<void>>(undefined!);
+            using indexerPrefetchStream = new UsingHolder<StreamResult<void>>(undefined!);
+            using ckvPrefetch = new UsingHolder<Tensor>(undefined!);
+            using indexerKPrefetch = new UsingHolder<Tensor>(undefined!);
+            using indexerKScalePrefetch = new UsingHolder<Tensor>(undefined!);
+            const holders: LayerHolders = { sharedSlots: nextSlots, sharedSlotsLength: nextSlotsLength, ckvPrefetchStream, indexerPrefetchStream, ckvPrefetch, indexerKPrefetch, indexerKScalePrefetch };
+            using hidden = this.forwardModel(verification, holders);
             using logits = verification.computeLogits(hidden, this, true);
             const verified = sampled ? samplingPolicy.verify!(logits) : undefined;
             using counts = verified?.numAccepted;
@@ -1285,7 +1551,7 @@ export class Glm51Model extends ChatModel {
             });
             inputCopy.streamWaitEvent();
             verification.setInput(selected);
-            using nextSeed = this.forwardMtp(verification, hidden, nextSlots, nextSlotsLength);
+            using nextSeed = this.forwardMtp(verification, hidden, holders);
             retained.seed.memcpy(nextSeed, nextSeed.bytes, MemcpyKind.DeviceToDevice);
             if (nextSlots.value) {
               retained.slots.memcpy(nextSlots.value, nextSlots.value.bytes, MemcpyKind.DeviceToDevice);

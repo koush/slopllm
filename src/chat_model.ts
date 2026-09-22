@@ -319,7 +319,8 @@ export abstract class ChatModel extends WorkspaceBase {
     if (!totalTokens) {
       return this.createChunkedPrefillPlan([], cache, inputIdsList, (function* () { return []; })());
     }
-    if (batchSize === 1 && totalTokens >= 4096 && process.env.GLM_PHASED_PREFILL !== "0") {
+
+    if (this.glm.worldSize > 1 && batchSize === 1 && totalTokens >= 4096 && process.env.GLM_PHASED_PREFILL !== "0") {
       return this.planPhasedPrefill(ws, cache, inputIdsList, samplingPolicy);
     }
 
@@ -516,17 +517,6 @@ export abstract class ChatModel extends WorkspaceBase {
       st.close();
       mmapClose(mmapPtr, fileSize);
     }
-
-    // const logWorkspaceMemory = (label: string, stats: WorkspaceMemoryStats[]) => {
-    //   const devices = stats.map(({ regions, freeBytes }) => ({ regions, kb: freeBytes / 1024 }));
-    //   console.log(label, {
-    //     totalKb: devices.reduce((sum, device) => sum + device.kb, 0),
-    //     devices,
-    //   });
-    // };
-    // logWorkspaceMemory("Model workspace free memory:", this.glm.workspaceMemoryStats(this));
-    // this.glm.reclaimWorkspaceMemory(this);
-    // logWorkspaceMemory("Device heap after model workspace recovery:", this.glm.deviceHeapStats());
   }
 
   protected async fromPretrained(modelDir: string, tokenizerRepo: string): Promise<void> {

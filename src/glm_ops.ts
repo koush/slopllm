@@ -1,4 +1,4 @@
-import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type WorkspaceMemoryStats } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
 import { Heap, type HeapAllocation, type HeapKey } from "./heap";
 import type { ExecutionState } from "./execution-workspace";
 import { SafeTensorFile } from "./safetensors";
@@ -962,23 +962,6 @@ export class GlmOps implements DeviceOps {
     return new GlmTensor(workspace, this, data, allocSize, shape, type, undefined, pinned, view, recycleKey);
   }
 
-  workspaceMemoryStats(workspace: WorkspaceBase): WorkspaceMemoryStats[] {
-    const heaps = [...workspace.heapByKey.values()];
-    return [{
-      regions: heaps.reduce((sum, heap) => sum + heap.regionCount, 0),
-      freeBytes: heaps.reduce((sum, heap) => sum + heap.freeBytes, 0),
-    }];
-  }
-
-  reclaimWorkspaceMemory(workspace: WorkspaceBase): void {
-    for (const heap of workspace.heapByKey.values()) heap.drainTo(this.heap);
-    workspace.heapByKey.clear();
-  }
-
-  deviceHeapStats(): WorkspaceMemoryStats[] {
-    return [{ regions: this.heap.regionCount, freeBytes: this.heap.freeBytes }];
-  }
-
   sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number, outProbs?: Tensor, outIds?: Tensor, supportCapacity?: number): void {
     getNativeAddon().sampleBatch(this.ctx, outTokens.data, topkVals.data, topkIdxs.data, workspace.data, logits.data, penaltyTokens.data, penaltyCount.data, maxWindow, vocabSize, batchSize, temperatures.data, repPenalties.data, presPenalties.data, topKs.data, topPs.data, stepCounter.data, maxEffectiveK, outProbs?.data, outIds?.data, supportCapacity);
   }
@@ -1614,8 +1597,15 @@ export class GlmOps implements DeviceOps {
     return { o, lse };
   }
 
-  mlaKvCacheAppend(_state: ExecutionState, _cacheIdx: number, ckvData: Tensor, kpeData: Tensor | null, indices: Tensor, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize: number = ckvData.shape[1], cpWorldSize: number = 0, cpRank: number = 0): { ckv: Tensor; kpe?: Tensor } {
-    getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), kpeData ? ptr(kpeData) : 0, ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), appendKpe ? ptr(appendKpe) : 0, ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
+  mlaKvCacheAppend(_state: ExecutionState, _cacheIdx: number, ckvData: Tensor, kpeData: Tensor | null, indices: Tensor | undefined, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize: number = ckvData.shape[1], cpWorldSize: number = 0, cpRank: number = 0): { ckv: Tensor; kpe?: Tensor } {
+    if (indices === undefined) {
+      if (!kpeData || appendKpe !== null || headDimKpe !== 0) {
+        throw new Error("mlaKvCacheAppend: flat mode requires indexer K and scale buffers");
+      }
+      this.indexerKvCacheAppendFlat(ckvData, kpeData, appendCkv, indptr, batchIndices, positions, nnz, headDimCkv, appendCkvStrideN);
+    } else {
+      getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), kpeData ? ptr(kpeData) : 0, ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), appendKpe ? ptr(appendKpe) : 0, ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
+    }
     return { ckv: ckvData.viewClone(), kpe: kpeData?.viewClone() };
   }
 
@@ -1638,10 +1628,6 @@ export class GlmOps implements DeviceOps {
       ptr(indexerSrcPtrs), ptr(indexerDstPtrs), ptr(indexerDstScalePtrs), indexerSrcPtrs?.numElements ?? 0,
       ptr(sourceRows), ptr(indices), ptr(indptr), ptr(batchIndices), ptr(positions), sourceRows.numElements,
       pageSize, kvLoraRank, peDim, indexHeadDim, sparseMode, cpWorldSize, cpRank);
-  }
-
-  sparseMlaPrepareCache(state: ExecutionState, groupSlots: Tensor, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor | null, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
-    return kvCache.viewClone();
   }
 
   gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
