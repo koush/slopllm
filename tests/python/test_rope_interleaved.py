@@ -120,31 +120,21 @@ def test_apply_rotary_pos_emb_partial_interleaved(glm, device):
     assert torch.equal(nope_dims, ref_nope), "Non-RoPE dims should be unchanged"
 
 
-def test_rope_transpose_interleaved_with_rope(glm, device):
+def test_apply_rotary_pos_emb_interleaved_token_major(glm, device):
     batch, n_heads, seq_len = 2, 4, 8
     rope_dim = 32
     head_dim = 32
-    in_stride = head_dim
+    dim_half = rope_dim // 2
+    cos_emb, sin_emb = _make_rope((batch, seq_len, rope_dim), dim_half, seq_len, batch, device)
 
-    inv_freq = torch.zeros(rope_dim // 2, dtype=torch.bfloat16, device=device)
-    for i in range(rope_dim // 2):
-        inv_freq[i] = 1.0 / (10000.0 ** (2.0 * i / rope_dim))
-    position_ids = torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0).expand(batch, -1).contiguous()
-    cos_out = torch.empty(batch, seq_len, rope_dim, dtype=torch.bfloat16, device=device)
-    sin_out = torch.empty(batch, seq_len, rope_dim, dtype=torch.bfloat16, device=device)
-    glm.rotary_embedding(cos_out, sin_out, inv_freq, position_ids, rope_dim // 2, batch, seq_len)
+    x = torch.randn(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
 
-    x = torch.randn(batch * seq_len, n_heads * in_stride, dtype=torch.bfloat16, device=device)
+    out_cuda = torch.empty_like(x)
+    glm.apply_rotary_pos_emb(out_cuda, x, cos_emb, sin_emb, rope_dim, head_dim, n_heads, seq_len, batch, 2, interleaved=True)
 
-    out_cuda = torch.empty(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
-    glm.ropeTranspose(out_cuda, x, cos_out, sin_out, rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved=True)
-
-    out_transpose = torch.empty(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
-    glm.ropeTranspose(out_transpose, x, cos_out, sin_out, 0, head_dim, n_heads, seq_len, batch, in_stride)
-    out_rope = torch.empty(batch * seq_len, n_heads, head_dim, dtype=torch.bfloat16, device=device)
-    glm.apply_rotary_pos_emb(out_rope, out_transpose, cos_out, sin_out, rope_dim, rope_dim, n_heads, seq_len, batch, 0, interleaved=True)
-
-    torch.testing.assert_close(out_cuda.cpu(), out_rope.cpu(), atol=0, rtol=0)
+    x4 = x.reshape(batch, seq_len, n_heads, head_dim)
+    ref = _ref_apply_rotary_pos_emb_interleaved(x4.cpu(), cos_emb.cpu(), sin_emb.cpu(), unsqueeze_dim=2)
+    torch.testing.assert_close(out_cuda.reshape(batch, seq_len, n_heads, head_dim).cpu(), ref, atol=2e-3, rtol=2e-3)
 
 
 def test_apply_rotary_pos_emb_interleaved_glm51_dims(glm, device):

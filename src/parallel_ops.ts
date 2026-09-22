@@ -1948,52 +1948,37 @@ export class ParallelTensor extends Tensor {
     }
   }
 
-  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
-    super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
-    const pCos = cos ? cos as ParallelTensor : undefined;
-    const pSin = sin ? sin as ParallelTensor : undefined;
-    if (pCos && pCos.parallelism !== TensorParallelism.Replicated) {
-      throw new Error(`ropeTranspose: cos must be Replicated, got ${pCos.parallelism}`);
-    }
-    if (pSin && pSin.parallelism !== TensorParallelism.Replicated) {
-      throw new Error(`ropeTranspose: sin must be Replicated, got ${pSin.parallelism}`);
-    }
-    if (this.parallelism === TensorParallelism.PartialSum || this.parallelism === TensorParallelism.Column) {
-      throw new Error(`ropeTranspose: unsupported input parallelism ${this.parallelism}`);
-    }
-    const shardNHeads = this.parallelism === TensorParallelism.Row
-      ? this.parallelOps.shardDim(nHeads, "ropeTranspose nHeads")
-      : nHeads;
-    const outShards: Tensor[] = [];
-    for (let i = 0; i < this.worldSize; i++) {
-      const shardCos = pCos ? pCos.shards[i] : undefined!;
-      const shardSin = pSin ? pSin.shards[i] : undefined!;
-      outShards.push(this.shards[i].ropeTranspose(shardCos, shardSin, ropeDim, headDim, shardNHeads, seqLen, batch, inStride ?? headDim, interleaved));
-    }
-    return this.parallelOps.wrapShards(this.workspace, outShards, [batch * seqLen, nHeads, headDim], this.type, this.parallelism);
-  }
-
-  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
-    super.applyRotaryPosEmb(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
-    const pCos = cos as ParallelTensor;
-    const pSin = sin as ParallelTensor;
-    if (pCos.parallelism !== TensorParallelism.Replicated) {
-      throw new Error(`applyRotaryPosEmb: cos must be Replicated, got ${pCos.parallelism}`);
-    }
-    if (pSin.parallelism !== TensorParallelism.Replicated) {
-      throw new Error(`applyRotaryPosEmb: sin must be Replicated, got ${pSin.parallelism}`);
-    }
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean, inStride?: number): Tensor {
+    super.applyRotaryPosEmb(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved, inStride);
     if (this.parallelism === TensorParallelism.PartialSum || this.parallelism === TensorParallelism.Column) {
       throw new Error(`applyRotaryPosEmb: unsupported input parallelism ${this.parallelism}`);
+    }
+    if (ropeDim === 0 && (inStride ?? headDim) === headDim) {
+      return this.viewClone();
+    }
+    const pCos = cos as ParallelTensor;
+    const pSin = sin as ParallelTensor;
+    if (ropeDim > 0) {
+      if (pCos.parallelism !== TensorParallelism.Replicated) {
+        throw new Error(`applyRotaryPosEmb: cos must be Replicated, got ${pCos.parallelism}`);
+      }
+      if (pSin.parallelism !== TensorParallelism.Replicated) {
+        throw new Error(`applyRotaryPosEmb: sin must be Replicated, got ${pSin.parallelism}`);
+      }
     }
     const shardNHeads = this.parallelism === TensorParallelism.Row
       ? this.parallelOps.shardDim(nHeads, "applyRotaryPosEmb nHeads")
       : nHeads;
+    const outShape = inStride !== undefined && inStride !== headDim
+      ? [this.shape[0], nHeads, headDim]
+      : this.shape;
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      outShards.push(this.shards[i].applyRotaryPosEmb(pCos.shards[i], pSin.shards[i], ropeDim, headDim, shardNHeads, seqLen, batch, unsqueezeDim, interleaved));
+      const shardCos = ropeDim > 0 ? pCos.shards[i] : undefined!;
+      const shardSin = ropeDim > 0 ? pSin.shards[i] : undefined!;
+      outShards.push(this.shards[i].applyRotaryPosEmb(shardCos, shardSin, ropeDim, headDim, shardNHeads, seqLen, batch, unsqueezeDim, interleaved, inStride));
     }
-    return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, this.parallelism);
+    return this.parallelOps.wrapShards(this.workspace, outShards, outShape, this.type, this.parallelism);
   }
 
   mlaVExpand(vProj: Tensor, seqLen: number, batch: number, lse?: Tensor, _headOffset?: number, _attnNHeads?: number, _vProjHeadOffset?: number, _tokenMajor?: boolean): Tensor {
@@ -3362,12 +3347,13 @@ export class ParallelOps implements DeviceOps {
   projectMlaQuery(state: ExecutionState, kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, qNopeWeight: Tensor, kNopeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): MlaQuery {
     using qPeStream = this.withStream(() => {
       using qPeLin = qNormed.linear(qPeWeight);
-      return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, qkRopeDim, ropeInterleave);
+      using rotated = qPeLin.applyRotaryPosEmb(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, 2, ropeInterleave);
+      return rotated.reshape([batch * seqLen, nHeads, qkRopeDim]);
     });
     const qAbsorbed = (() => {
       if (process.env.GLM_USE_ABSORBED_Q === "1") {
         using projected = qNormed.linear(absorbedWeight);
-        return projected.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
+        return projected.reshape([batch * seqLen, nHeads, kvLoraRank]);
       }
       using qNope = qNormed.linear(qNopeWeight);
       return qNope.absorbMlaQuery(kNopeWeight, nHeads, kvLoraRank);

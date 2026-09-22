@@ -567,78 +567,6 @@ void glm_fused_norm_rope(GlmCtx* ctx, void* out, const void* in,
 }
 
 // ---------------------------------------------------------------------------
-// RoPE + Head Transpose kernel
-// Input: [batch * seq_len, n_heads * in_stride] (projection output, interleaved heads)
-// Output: [batch * n_heads, seq_len, head_dim] (per-head contiguous for attention)
-// Applies RoPE to first rope_dim dimensions if rope_dim > 0; otherwise just transposes.
-// Cos/sin embeddings: [batch, seq_len, rope_dim] (only used if rope_dim > 0)
-// ---------------------------------------------------------------------------
-
-template <bool kInterleaved>
-__global__ void __launch_bounds__(256, 4) rope_transpose_kernel(
-    __nv_bfloat16* __restrict__ out,
-    const __nv_bfloat16* __restrict__ in,
-    const __nv_bfloat16* __restrict__ cos_emb,
-    const __nv_bfloat16* __restrict__ sin_emb,
-    int rope_dim, int head_dim, int n_heads,
-    int seq_len, int batch, int in_stride
-) {
-    int bhs = blockIdx.x;
-    int s = bhs % seq_len;
-    int h = (bhs / seq_len) % n_heads;
-    int b = bhs / (seq_len * n_heads);
-
-    const __nv_bfloat16* x = in + (b * seq_len + s) * n_heads * in_stride + h * in_stride;
-    __nv_bfloat16* o = out + ((b * seq_len + s) * n_heads + h) * head_dim;
-
-    int half = rope_dim / 2;
-    int cos_base = (b * seq_len + s) * rope_dim;
-
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float xi = __bfloat162float(x[i]);
-        if (i < rope_dim && rope_dim > 0) {
-            if constexpr (kInterleaved) {
-                int cos_idx = cos_base + (i >> 1);
-                float ci = __bfloat162float(cos_emb[cos_idx]);
-                float si = __bfloat162float(sin_emb[cos_idx]);
-                int paired_i = (i % 2 == 0) ? i + 1 : i - 1;
-                float paired = __bfloat162float(x[paired_i]);
-                o[i] = __float2bfloat16(rope_rotate_interleaved(xi, paired, ci, si, i));
-            } else {
-                float ci = __bfloat162float(cos_emb[cos_base + i]);
-                float si = __bfloat162float(sin_emb[cos_base + i]);
-                float paired = (i < half)
-                    ? __bfloat162float(x[i + half])
-                    : __bfloat162float(x[i - half]);
-                o[i] = __float2bfloat16(rope_rotate_neox(xi, paired, ci, si, i, half));
-            }
-        } else {
-            o[i] = __float2bfloat16(xi);
-        }
-    }
-}
-
-void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
-                         const void* cos_emb, const void* sin_emb,
-                         int rope_dim, int head_dim, int n_heads,
-                         int seq_len, int batch, int in_stride, bool interleaved) {
-    cudaSetDevice(ctx->device_id);
-    int total_rows = batch * n_heads * seq_len;
-    int block_size = compute_block_size(head_dim, true);
-    if (interleaved) {
-        rope_transpose_kernel<true><<<total_rows, block_size, 0, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
-            (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
-            rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
-    } else {
-        rope_transpose_kernel<false><<<total_rows, block_size, 0, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)out, (const __nv_bfloat16*)in,
-            (const __nv_bfloat16*)cos_emb, (const __nv_bfloat16*)sin_emb,
-            rope_dim, head_dim, n_heads, seq_len, batch, in_stride);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // MLA V-Expand kernel
 // attn_out: [batch, attn_n_heads, seq_len, kv_lora_rank] (HND layout from FlashInfer)
 // v_proj: [n_heads, kv_lora_rank, v_head_dim] (transposed layout for coalesced access)
@@ -1832,11 +1760,15 @@ void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
 // out = x * cos + rotate_half(x) * sin
 // rotate_half(x)[..., d] = (d < half) ? -x[..., d+half] : x[..., d-half]
 //
-// unsqueeze_dim=1: x is [batch, n_heads, seq_len, head_dim]
-// unsqueeze_dim=2: x is [batch, seq_len, n_heads, head_dim]
+// unsqueeze_dim=1: x is [batch, n_heads, seq_len, in_stride] (head-major)
+// unsqueeze_dim=2: x is [batch, seq_len, n_heads, in_stride] (token-major)
 // cos, sin are [batch, seq_len, rope_dim] (broadcast over heads)
 // rope_dim <= head_dim: only first rope_dim dims get RoPE, rest pass through
-// When head_dim == rope_dim, this reduces to the original behavior.
+// in_stride >= head_dim: per-head window stride in x. When in_stride >
+// head_dim, the first head_dim dims of each head window are gathered into a
+// packed [..., n_heads, head_dim] output (stride compaction).
+// When head_dim == rope_dim and in_stride == head_dim, this reduces to the
+// original behavior.
 // ---------------------------------------------------------------------------
 
 template <bool kInterleaved>
@@ -1850,7 +1782,8 @@ __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
     int seq_len,
     int n_heads,
     int batch,
-    int unsqueeze_dim
+    int unsqueeze_dim,
+    int in_stride
 ) {
     int total = batch * n_heads * seq_len * head_dim;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1870,11 +1803,13 @@ __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
         b = rest / (n_heads * seq_len);
     }
 
-    int x_idx;
+    int x_idx, out_idx;
     if (unsqueeze_dim == 1) {
-        x_idx = ((b * n_heads + h) * seq_len + s) * head_dim + d;
+        x_idx = ((b * n_heads + h) * seq_len + s) * in_stride + d;
+        out_idx = ((b * n_heads + h) * seq_len + s) * head_dim + d;
     } else {
-        x_idx = ((b * seq_len + s) * n_heads + h) * head_dim + d;
+        x_idx = ((b * seq_len + s) * n_heads + h) * in_stride + d;
+        out_idx = ((b * seq_len + s) * n_heads + h) * head_dim + d;
     }
 
     if (d < rope_dim) {
@@ -1887,7 +1822,7 @@ __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
             float sin_val = __bfloat162float(sin_emb[cos_idx]);
             int paired_idx = (d % 2 == 0) ? x_idx + 1 : x_idx - 1;
             float paired_val = __bfloat162float(x[paired_idx]);
-            out[x_idx] = __float2bfloat16(rope_rotate_interleaved(x_val, paired_val, cos_val, sin_val, d));
+            out[out_idx] = __float2bfloat16(rope_rotate_interleaved(x_val, paired_val, cos_val, sin_val, d));
         } else {
             int half = rope_dim / 2;
             int cos_idx = cos_base + d;
@@ -1895,17 +1830,17 @@ __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
             float sin_val = __bfloat162float(sin_emb[cos_idx]);
             int paired_idx = (d < half) ? x_idx + half : x_idx - half;
             float paired_val = __bfloat162float(x[paired_idx]);
-            out[x_idx] = __float2bfloat16(rope_rotate_neox(x_val, paired_val, cos_val, sin_val, d, half));
+            out[out_idx] = __float2bfloat16(rope_rotate_neox(x_val, paired_val, cos_val, sin_val, d, half));
         }
     } else {
-        out[x_idx] = x[x_idx];
+        out[out_idx] = x[x_idx];
     }
 }
 
 void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
                                const void* cos, const void* sin,
                                int rope_dim, int head_dim, int n_heads, int seq_len,
-                               int batch, int unsqueeze_dim, bool interleaved) {
+                               int batch, int unsqueeze_dim, int in_stride, bool interleaved) {
     cudaSetDevice(ctx->device_id);
     int total = batch * n_heads * seq_len * head_dim;
     int block_size = 256;
@@ -1914,12 +1849,12 @@ void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
         apply_rotary_pos_emb_kernel<true><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
             (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
-            rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim);
+            rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim, in_stride);
     } else {
         apply_rotary_pos_emb_kernel<false><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
             (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
-            rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim);
+            rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim, in_stride);
     }
 }
 

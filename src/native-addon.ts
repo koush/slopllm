@@ -65,7 +65,7 @@ export interface NativeAddon {
   indexerScoreTopkV2(ctx: number, outIdx: number, outScores: number, q: number, kData: number, kScaleData: number, weights: number, pageIndices: number, pageIndptr: number, lastPageLen: number, qoIndptr: number, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal: number, qGlobalStart: number, customMask: number, maskIndptr: number, maskKvLen: number, scores: number, rowLen: number, hist: number, meta: number, maxKv: number, numSplits: number, cpWorldSize: number, cpRank: number, globalLastPageLen: number, kvTokenIndptr?: number): void;
   topkToSlots(ctx: number, slots: number, topkLength: number, topkIdx: number, pageIndices: number, pageIndptr: number, lastPageLen: number, batchIndices: number, numTokens: number, topk: number, pageSize: number, cpWorldSize: number, cpRank: number, kvTokenIndptr?: number): void;
   rotaryEmbedding(ctx: number, cosOut: number, sinOut: number, invFreq: number, positionIds: number, dimHalf: number, batch: number, seqLen: number): void;
-  applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): void;
+  applyRotaryPosEmb(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean, inStride?: number): void;
   indexSelect(ctx: number, out: number, src: number, indices: number, dim: number, k: number, offset: number): void;
   gather(ctx: number, out: number, input: number, indices: number, k: number, inDim: number, batch: number, elemSize: number): void;
   deinterleave(ctx: number, out: number, input: number, worldSize: number, maxTotalLen: number, pageIndptr: number, kvTokenIndptr: number, batchSize: number, pageSize: number, D: number): void;
@@ -128,7 +128,6 @@ export interface NativeAddon {
   memcpyPeer(ctx: number, dst: number, dstDevice: number, src: number, srcDevice: number, bytes: number): void;
   memcpy3dPeer(ctx: number, dstPtr: number, dstPitch: number, dstXSize: number, dstYSize: number, dstDevice: number, dstPosX: number, dstPosY: number, dstPosZ: number, srcPtr: number, srcPitch: number, srcXSize: number, srcYSize: number, srcDevice: number, srcPosX: number, srcPosY: number, srcPosZ: number, width: number, height: number, depth: number): void;
   bmm(ctx: number, C: number, A: number, B: number, alpha: number, beta: number, batch: number, M: number, N: number, K: number, transA: number, transB: number, tokenMajor?: boolean): void;
-  ropeTranspose(ctx: number, out: number, input: number, cos: number, sin: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   mlaVExpand(ctx: number, result: number, attnOut: number, vProj: number, kvLoraRank: number, vHeadDim: number, nHeads: number, seqLen: number, batch: number, attnNHeads: number, headOffset: number, vProjHeadOffset: number): void;
   transpose4d(ctx: number, out: number, input: number, d0: number, d1: number, d2: number, d3: number, p0: number, p1: number, p2: number, p3: number, elemBytes: number): void;
   ncclUniqueId(outId: Buffer): void;

@@ -620,15 +620,17 @@ export abstract class Tensor implements Disposable {
     return this.bmm(kNopeWeight, nHeads, rows, kvLoraRank, nopeDim, false, false, true);
   }
 
-  ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
-    if (this.shape[0] !== batch * seqLen) throw new Error(`ropeTranspose: input shape[0]=${this.shape[0]} != batch*seqLen=${batch * seqLen}`);
-    if (ropeDim > 0 && cos.shape.length !== sin.shape.length) throw new Error(`ropeTranspose: cos ndim ${cos.shape.length} != sin ndim ${sin.shape.length}`);
-    return undefined as never;
-  }
-
-  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
+  applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean, inStride?: number): Tensor {
     if (!Number.isInteger(headDim) || headDim <= 0 || !Number.isInteger(ropeDim) || ropeDim < 0 || ropeDim > headDim || ropeDim % 2 !== 0) {
       throw new Error(`applyRotaryPosEmb: invalid ropeDim=${ropeDim}, headDim=${headDim}`);
+    }
+    if (inStride !== undefined) {
+      if (!Number.isInteger(inStride) || inStride < headDim) {
+        throw new Error(`applyRotaryPosEmb: invalid inStride=${inStride}, headDim=${headDim}`);
+      }
+      if (inStride !== headDim && this.shape.length !== 2) {
+        throw new Error(`applyRotaryPosEmb: inStride=${inStride} != headDim=${headDim} requires 2D token-major input, got [${this.shape}]`);
+      }
     }
     if (this.shape.length === 2) {
       if (this.shape[0] !== batch * seqLen) throw new Error(`applyRotaryPosEmb: input shape[0]=${this.shape[0]} != batch*seqLen=${batch * seqLen}`);

@@ -345,7 +345,7 @@ class GlmOps:
         self.lib.glm_apply_rotary_pos_emb.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_bool
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_bool
         ]
 
         self.lib.glm_topk.restype = None
@@ -366,14 +366,6 @@ class GlmOps:
             ctypes.c_float, ctypes.c_float,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_int
-        ]
-
-        self.lib.glm_rope_transpose.restype = None
-        self.lib.glm_rope_transpose.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_bool
         ]
 
         self.lib.glm_mla_v_expand.restype = None
@@ -1372,14 +1364,16 @@ class GlmOps:
             dim_half, batch, seq_len
         )
 
-    def apply_rotary_pos_emb(self, output, x, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved=False):
+    def apply_rotary_pos_emb(self, output, x, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, in_stride=None, interleaved=False):
+        if in_stride is None:
+            in_stride = head_dim
         self.lib.glm_apply_rotary_pos_emb(
             self.ctx,
             self._ptr(output),
             self._ptr(x),
             self._ptr(cos),
             self._ptr(sin),
-            rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved
+            rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, in_stride, interleaved
         )
 
     def topk(self, out_values, out_indices, input, k, dim, batch, offset=0):
@@ -1407,15 +1401,6 @@ class GlmOps:
             self._ptr(B),
             ctypes.c_float(alpha), ctypes.c_float(beta),
             batch, M, N, K, transA, transB, int(token_major)
-        )
-
-    def ropeTranspose(self, output, input, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved=False):
-        self.lib.glm_rope_transpose(
-            self.ctx,
-            self._ptr(output), self._ptr(input),
-            self._ptr(cos) if cos is not None else ctypes.c_void_p(0),
-            self._ptr(sin) if sin is not None else ctypes.c_void_p(0),
-            rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved
         )
 
     def mlaVExpand(self, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch, attn_n_heads=None, head_offset=0, v_proj_head_offset=0):

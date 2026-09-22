@@ -161,18 +161,18 @@ export class MetaTensor extends Tensor {
         return { cos, sin };
     }
 
-    ropeTranspose(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride?: number, interleaved?: boolean): Tensor {
-        super.ropeTranspose(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, inStride, interleaved);
-        using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
-        return this.workspace.alloc([batch * seqLen, nHeads, headDim], this.type);
-    }
-
-    applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean): Tensor {
-        super.applyRotaryPosEmb(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved);
+    applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean, inStride?: number): Tensor {
+        super.applyRotaryPosEmb(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved, inStride);
+        if (ropeDim === 0 && (inStride ?? headDim) === headDim) {
+            return this.viewClone();
+        }
         if (this.shape.length === 2) {
             using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
         }
-        return this.workspace.alloc(this.shape, this.type);
+        const outShape = inStride !== undefined && inStride !== headDim
+            ? [this.shape[0], nHeads, headDim]
+            : this.shape;
+        return this.workspace.alloc(outShape, this.type);
     }
 
     mlaVExpand(vProj: Tensor, seqLen: number, batch: number, _lse?: Tensor, _headOffset?: number, _attnNHeads?: number, _vProjHeadOffset?: number, _tokenMajor?: boolean): Tensor {
@@ -357,12 +357,13 @@ export class MetaOps implements DeviceOps {
     projectMlaQuery(state: ExecutionState, _kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, qNopeWeight: Tensor, kNopeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): { qAbsorbed: Tensor, qPe: Tensor } {
         using qPeStream = this.withStream(() => {
             using qPeLin = qNormed.linear(qPeWeight);
-            return qPeLin.ropeTranspose(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, qkRopeDim, ropeInterleave);
+            using rotated = qPeLin.applyRotaryPosEmb(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, 2, ropeInterleave);
+            return rotated.reshape([batch * seqLen, nHeads, qkRopeDim]);
         });
         const qAbsorbed = (() => {
             if (process.env.GLM_USE_ABSORBED_Q === "1") {
                 using projected = qNormed.linear(absorbedWeight);
-                return projected.ropeTranspose(cos, sin, 0, kvLoraRank, nHeads, seqLen, batch, kvLoraRank);
+                return projected.reshape([batch * seqLen, nHeads, kvLoraRank]);
             }
             using qNope = qNormed.linear(qNopeWeight);
             return qNope.absorbMlaQuery(kNopeWeight, nHeads, kvLoraRank);

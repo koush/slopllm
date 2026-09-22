@@ -107,7 +107,7 @@ function gatherRopeTransposeOutput(
   return result;
 }
 
-describe("ParallelOps.ropeTranspose", () => {
+describe("ParallelOps.applyRotaryPosEmb token-major", () => {
   let glm0: GlmOps;
   let glm1: GlmOps;
   let ref: GlmOps;
@@ -133,105 +133,36 @@ describe("ParallelOps.ropeTranspose", () => {
     glm1.free();
   });
 
-  it("Row-parallel ropeTranspose no-RoPE matches single-GPU", () => {
+  it("ropeDim=0 identity returns the input itself", () => {
     const batch = 2;
     const nHeads = 4;
     const seqLen = 3;
     const headDim = 16;
-    const ropeDim = 0;
     const totalRows = batch * seqLen;
 
     const inputF32 = new Float32Array(totalRows * nHeads * headDim);
     for (let i = 0; i < inputF32.length; i++) inputF32[i] = (i % 13 - 6) * 0.1;
 
-    const refInput = refWs.alloc([totalRows, nHeads * headDim], "BF16");
-    refInput.h2d(f32ToBf16Bytes(inputF32));
-    ref.synchronize();
-
-    const refOut = refInput.ropeTranspose(undefined!, undefined!, ropeDim, headDim, nHeads, seqLen, batch);
-    ref.synchronize();
-    const refBuf = Buffer.alloc(batch * nHeads * seqLen * headDim * 2);
-    refOut.d2h(refBuf);
-    const refF32 = bf16BytesToF32(refBuf);
-
-    const pInput = ws.alloc([totalRows, nHeads * headDim], "BF16", undefined, TensorParallelism.Row) as ParallelTensor;
-    const shard0F32 = shardColumnHeads(inputF32, totalRows, nHeads, headDim, 0, 2);
-    const shard1F32 = shardColumnHeads(inputF32, totalRows, nHeads, headDim, 1, 2);
-    pInput.shard(0).h2d(f32ToBf16Bytes(shard0F32));
-    pInput.shard(1).h2d(f32ToBf16Bytes(shard1F32));
-    po.synchronize();
-
-    const pOut = pInput.ropeTranspose(undefined!, undefined!, ropeDim, headDim, nHeads, seqLen, batch) as ParallelTensor;
-    po.synchronize();
-
-    assert.equal(pOut.parallelism, TensorParallelism.Row);
-    assert.deepEqual(pOut.shape, [batch * seqLen, nHeads, headDim]);
-    assert.deepEqual(pOut.shard(0).shape, [batch * seqLen, nHeads / 2, headDim]);
-
-    const out0Buf = Buffer.alloc(batch * seqLen * nHeads / 2 * headDim * 2);
-    const out1Buf = Buffer.alloc(batch * seqLen * nHeads / 2 * headDim * 2);
-    pOut.shard(0).d2h(out0Buf);
-    pOut.shard(1).d2h(out1Buf);
-    const gatheredF32 = gatherRopeTransposeOutput(out0Buf, out1Buf, batch, nHeads, seqLen, headDim);
-
-    for (let i = 0; i < refF32.length; i++) {
-      const relErr = Math.abs(gatheredF32[i] - refF32[i]) / Math.max(Math.abs(refF32[i]), 1e-6);
-      assert.ok(relErr < 0.05, `i=${i}: expected ${refF32[i]}, got ${gatheredF32[i]} (relErr=${relErr})`);
-    }
-
-    refOut[Symbol.dispose]();
-    refInput[Symbol.dispose]();
-    pOut[Symbol.dispose]();
-    pInput[Symbol.dispose]();
-  });
-
-  it("Replicated ropeTranspose no-RoPE (nHeads=1) matches single-GPU", () => {
-    const batch = 2;
-    const nHeads = 1;
-    const seqLen = 4;
-    const headDim = 64;
-    const ropeDim = 0;
-    const totalRows = batch * seqLen;
-
-    const inputF32 = new Float32Array(totalRows * nHeads * headDim);
-    for (let i = 0; i < inputF32.length; i++) inputF32[i] = (i % 17 - 8) * 0.05;
-
-    const refInput = refWs.alloc([totalRows, nHeads * headDim], "BF16");
-    refInput.h2d(f32ToBf16Bytes(inputF32));
-    ref.synchronize();
-
-    const refOut = refInput.ropeTranspose(undefined!, undefined!, ropeDim, headDim, nHeads, seqLen, batch);
-    ref.synchronize();
-    const refBuf = Buffer.alloc(batch * nHeads * seqLen * headDim * 2);
-    refOut.d2h(refBuf);
-    const refF32 = bf16BytesToF32(refBuf);
-
     const pInput = ws.alloc([totalRows, nHeads * headDim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
     pInput.h2d(f32ToBf16Bytes(inputF32));
     po.synchronize();
 
-    const pOut = pInput.ropeTranspose(undefined!, undefined!, ropeDim, headDim, nHeads, seqLen, batch) as ParallelTensor;
-    po.synchronize();
+    const pOut = pInput.applyRotaryPosEmb(undefined!, undefined!, 0, headDim, nHeads, seqLen, batch, 2) as ParallelTensor;
 
-    assert.equal(pOut.parallelism, TensorParallelism.Replicated);
-    assert.deepEqual(pOut.shape, [batch * seqLen, nHeads, headDim]);
+    assert.notEqual(pOut, pInput);
+    assert.deepEqual(pOut.shape, [totalRows, nHeads * headDim]);
 
-    const outBuf = Buffer.alloc(batch * nHeads * seqLen * headDim * 2);
+    const outBuf = Buffer.alloc(totalRows * nHeads * headDim * 2);
     pOut.d2h(outBuf);
     const outF32 = bf16BytesToF32(outBuf);
+    const inF32 = bf16BytesToF32(f32ToBf16Bytes(inputF32));
+    assert.deepEqual(outF32, inF32);
 
-    for (let i = 0; i < refF32.length; i++) {
-      const relErr = Math.abs(outF32[i] - refF32[i]) / Math.max(Math.abs(refF32[i]), 1e-6);
-      assert.ok(relErr < 0.05, `i=${i}: expected ${refF32[i]}, got ${outF32[i]} (relErr=${relErr})`);
-    }
-
-    refOut[Symbol.dispose]();
-    refInput[Symbol.dispose]();
     pOut[Symbol.dispose]();
     pInput[Symbol.dispose]();
   });
 
-  it("Row-parallel ropeTranspose with RoPE matches single-GPU", () => {
+  it("Row-parallel token-major with RoPE matches single-GPU", () => {
     const batch = 1;
     const nHeads = 4;
     const seqLen = 4;
@@ -268,7 +199,8 @@ describe("ParallelOps.ropeTranspose", () => {
     refInput.h2d(f32ToBf16Bytes(inputF32));
     ref.synchronize();
 
-    const refOut = refInput.ropeTranspose(refCos, refSin, ropeDim, headDim, nHeads, seqLen, batch);
+    const refRotated = refInput.applyRotaryPosEmb(refCos, refSin, ropeDim, headDim, nHeads, seqLen, batch, 2);
+    const refOut = refRotated.reshape([batch * seqLen, nHeads, headDim]);
     ref.synchronize();
     const refBuf = Buffer.alloc(batch * nHeads * seqLen * headDim * 2);
     refOut.d2h(refBuf);
@@ -290,8 +222,13 @@ describe("ParallelOps.ropeTranspose", () => {
     pInput.shard(1).h2d(f32ToBf16Bytes(shard1F32));
     po.synchronize();
 
-    const pOut = pInput.ropeTranspose(pCos, pSin, ropeDim, headDim, nHeads, seqLen, batch) as ParallelTensor;
+    const pRotated = pInput.applyRotaryPosEmb(pCos, pSin, ropeDim, headDim, nHeads, seqLen, batch, 2);
+    const pOut = pRotated.reshape([batch * seqLen, nHeads, headDim]) as ParallelTensor;
     po.synchronize();
+
+    assert.equal(pOut.parallelism, TensorParallelism.Row);
+    assert.deepEqual(pOut.shape, [batch * seqLen, nHeads, headDim]);
+    assert.deepEqual(pOut.shard(0).shape, [batch * seqLen, nHeads / 2, headDim]);
 
     const out0Buf = Buffer.alloc(batch * seqLen * nHeads / 2 * headDim * 2);
     const out1Buf = Buffer.alloc(batch * seqLen * nHeads / 2 * headDim * 2);
@@ -305,17 +242,58 @@ describe("ParallelOps.ropeTranspose", () => {
     }
 
     refOut[Symbol.dispose]();
+    refRotated[Symbol.dispose]();
     refInput[Symbol.dispose]();
     refCos[Symbol.dispose]();
     refSin[Symbol.dispose]();
     refInvFreq[Symbol.dispose]();
     refPosIds[Symbol.dispose]();
     pOut[Symbol.dispose]();
+    pRotated[Symbol.dispose]();
     pInput[Symbol.dispose]();
     pCos[Symbol.dispose]();
     pSin[Symbol.dispose]();
     pInvFreq[Symbol.dispose]();
     pPosIds[Symbol.dispose]();
+  });
+
+  it("in_stride compaction gathers per-head windows", () => {
+    const batch = 2;
+    const nHeads = 4;
+    const seqLen = 3;
+    const headDim = 8;
+    const inStride = 12;
+    const totalRows = batch * seqLen;
+
+    const inputF32 = new Float32Array(totalRows * nHeads * inStride);
+    for (let i = 0; i < inputF32.length; i++) inputF32[i] = (i % 19 - 9) * 0.1;
+
+    const pInput = ws.alloc([totalRows, nHeads * inStride], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+    pInput.h2d(f32ToBf16Bytes(inputF32));
+    po.synchronize();
+
+    // ropeDim=0 with inStride > headDim: the kernel runs as a pure gather.
+    const pOut = pInput.applyRotaryPosEmb(undefined!, undefined!, 0, headDim, nHeads, seqLen, batch, 2, undefined, inStride) as ParallelTensor;
+    po.synchronize();
+
+    assert.deepEqual(pOut.shape, [totalRows, nHeads, headDim]);
+
+    const outBuf = Buffer.alloc(totalRows * nHeads * headDim * 2);
+    pOut.d2h(outBuf);
+    const outF32 = bf16BytesToF32(outBuf);
+
+    for (let t = 0; t < totalRows; t++) {
+      for (let h = 0; h < nHeads; h++) {
+        for (let d = 0; d < headDim; d++) {
+          const expected = inputF32[t * nHeads * inStride + h * inStride + d];
+          const got = outF32[(t * nHeads + h) * headDim + d];
+          assert.ok(Math.abs(got - expected) < 1e-3, `t=${t} h=${h} d=${d}: expected ${expected}, got ${got}`);
+        }
+      }
+    }
+
+    pOut[Symbol.dispose]();
+    pInput[Symbol.dispose]();
   });
 });
 

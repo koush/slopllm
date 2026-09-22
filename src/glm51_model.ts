@@ -896,8 +896,8 @@ export class Glm51Model extends ChatModel {
     using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
     yield;
 
-    // Indexer q: wq_b(qNormed) → ropeTranspose → [BS, indexNHeads, indexHeadDim]
-    // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
+// Indexer q: wq_b(qNormed) → rope → [BS, indexNHeads, indexHeadDim]
+        // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
     using idxQStream = skipIndexer
       ? undefined
       : this.glm.withStream(() => {
@@ -908,7 +908,8 @@ export class Glm51Model extends ChatModel {
         // | `model.layers.N.self_attn.indexer.wq_b.weight` | [4096, 2048] | bfloat16 | 78 | 1.22 GB |
 
         using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!);
-        using idxQ = idxQLin.ropeTranspose(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, cfg.indexHeadDim, cfg.indexerRopeInterleave);
+        using rotated = idxQLin.applyRotaryPosEmb(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, 2, cfg.indexerRopeInterleave);
+        using idxQ = rotated.reshape([B * S, cfg.indexNHeads, cfg.indexHeadDim]);
 
         kvcacheIndex?.streamWaitEvent();
         using kData = kvcacheIndex!.result.kData;

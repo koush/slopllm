@@ -853,7 +853,7 @@ static Napi::Value RotaryEmbedding(const Napi::CallbackInfo& info) {
 static Napi::Value ApplyRotaryPosEmb(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, out, x, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim[, interleaved])").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (ctx, out, x, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim[, interleaved[, in_stride]])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -868,46 +868,16 @@ static Napi::Value ApplyRotaryPosEmb(const Napi::CallbackInfo& info) {
     int batch = info[9].As<Napi::Number>().Int32Value();
     int unsqueeze_dim = info[10].As<Napi::Number>().Int32Value();
     bool interleaved = info.Length() > 11 ? info[11].As<Napi::Boolean>().Value() : false;
+    int in_stride = info.Length() > 12 ? info[12].As<Napi::Number>().Int32Value() : head_dim;
     glm_apply_rotary_pos_emb(reinterpret_cast<GlmCtx*>(ctx_ptr),
                                       reinterpret_cast<void*>(out_ptr),
                                       reinterpret_cast<const void*>(x_ptr),
                                       reinterpret_cast<const void*>(cos_ptr),
                                       reinterpret_cast<const void*>(sin_ptr),
-                                      rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, interleaved);
+                                      rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, in_stride, interleaved);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("applyRotaryPosEmb failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
-    }
-    return env.Undefined();
-}
-
-static Napi::Value RopeTranspose(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    if (info.Length() < 11) {
-        Napi::TypeError::New(env, "Expected (ctx, out, in, cos, sin, rope_dim, head_dim, n_heads, seq_len, batch, in_stride[, interleaved])").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
-    uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
-    uintptr_t in_ptr = info[2].As<Napi::Number>().Int64Value();
-    uintptr_t cos_ptr = info[3].As<Napi::Number>().Int64Value();
-    uintptr_t sin_ptr = info[4].As<Napi::Number>().Int64Value();
-    int rope_dim = info[5].As<Napi::Number>().Int32Value();
-    int head_dim = info[6].As<Napi::Number>().Int32Value();
-    int n_heads = info[7].As<Napi::Number>().Int32Value();
-    int seq_len = info[8].As<Napi::Number>().Int32Value();
-    int batch = info[9].As<Napi::Number>().Int32Value();
-    int in_stride = info[10].As<Napi::Number>().Int32Value();
-    bool interleaved = info.Length() > 11 ? info[11].As<Napi::Boolean>().Value() : false;
-    glm_rope_transpose(reinterpret_cast<GlmCtx*>(ctx_ptr),
-                        reinterpret_cast<void*>(out_ptr),
-                        reinterpret_cast<const void*>(in_ptr),
-                        reinterpret_cast<const void*>(cos_ptr),
-                        reinterpret_cast<const void*>(sin_ptr),
-                        rope_dim, head_dim, n_heads, seq_len, batch, in_stride, interleaved);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        Napi::Error::New(env, std::string("ropeTranspose failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }
     return env.Undefined();
 }
@@ -4051,7 +4021,6 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "indexAdd"), Napi::Function::New(env, IndexAdd));
     exports.Set(Napi::String::New(env, "rotaryEmbedding"), Napi::Function::New(env, RotaryEmbedding));
     exports.Set(Napi::String::New(env, "applyRotaryPosEmb"), Napi::Function::New(env, ApplyRotaryPosEmb));
-    exports.Set(Napi::String::New(env, "ropeTranspose"), Napi::Function::New(env, RopeTranspose));
     exports.Set(Napi::String::New(env, "mlaVExpand"), Napi::Function::New(env, MlaVExpand));
     exports.Set(Napi::String::New(env, "topk"), Napi::Function::New(env, Topk));
     exports.Set(Napi::String::New(env, "routeTop8"), Napi::Function::New(env, RouteTop8));

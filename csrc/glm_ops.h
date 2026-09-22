@@ -179,16 +179,7 @@ void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
 void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
                               const void* cos, const void* sin,
                               int rope_dim, int head_dim, int n_heads, int seq_len,
-                              int batch, int unsqueeze_dim, bool interleaved);
-
-// RoPE + Head Transpose: [B*S, nH*in_stride] -> [B*nH, S, head_dim]
-// Applies RoPE to first rope_dim dims (if rope_dim > 0), then transposes
-// from interleaved-heads input to per-head-contiguous output.
-// cos/sin: [B, S, rope_dim] (may be NULL if rope_dim == 0)
-void glm_rope_transpose(GlmCtx* ctx, void* out, const void* in,
-                         const void* cos_emb, const void* sin_emb,
-                         int rope_dim, int head_dim, int n_heads,
-                         int seq_len, int batch, int in_stride, bool interleaved);
+                              int batch, int unsqueeze_dim, int in_stride, bool interleaved);
 
 // MLA V-Expand: per-head matmul attn_out @ v_proj^T
 // attn_out: [B, attn_n_heads, S, kv_lora_rank] (HND)
