@@ -304,9 +304,7 @@ function loadConfig(modelDir: string): Glm51Config {
     normTopkProb: raw.norm_topk_prob ?? false,
     routedScalingFactor: raw.routed_scaling_factor ?? 1.0,
     indexTopk: raw.index_topk ?? 256,
-    // set to 0 to completely disable sparse indexing and fall back to dense attention.
-    // GLM_DENSE_ATTN=1 does the same from the environment.
-    indexHeadDim: process.env.GLM_DENSE_ATTN === "1" ? 0 : (raw.index_head_dim ?? 64),
+    indexHeadDim: raw.index_head_dim ?? 64,
     indexNHeads: raw.index_n_heads ?? 4,
     indexerTypes: raw.indexer_types
       ? [...raw.indexer_types, ...(raw.num_nextn_predict_layers ? [raw.index_share_for_mtp_iteration ? "shared" : "full"] : [])]
@@ -757,7 +755,6 @@ export class Glm51Model extends ChatModel {
     const BS = state.totalTokens;
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : state.totalTokens;
-    const dense = cfg.indexHeadDim === 0;
 
     using kvcache = this.glm.withStream(() => {
       using kPeRopeStream = this.glm.withStream(() => {
@@ -770,14 +767,9 @@ export class Glm51Model extends ChatModel {
       using ckvNormed = ckv.rmsnorm(this.tensors.get(`${pfx}.kv_a_layernorm.weight`)!, cfg.rmsNormEps);
 
       kPeRopeStream.streamWaitEvent();
-      const cache = state.mlaKvCacheAppend(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
+      const cache = state.concatAndCacheDsMla(ckvNormed, kPeRope, layerIdx, kvLoraRank, qkRopeDim);
 
-      if (dense) {
-        return cache;
-      }
-
-      using appendedCkv = cache.ckv;
-      using _appendedKpe = cache.kpe;
+      using appendedCkv = cache;
 
       const prefetched = ckvPrefetch?.value?.viewClone();
       using prefetchStream = ckvPrefetchStream?.detach();
@@ -809,11 +801,10 @@ export class Glm51Model extends ChatModel {
     });
 
     const shared = cfg.indexerTypes[layerIdx] === "shared";
-    const skipIndexer = dense || shared;
 
     // Indexer K: wk(normed) → layernorm → partial RoPE → append to kData
     // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
-    using kvcacheIndex = skipIndexer
+    using kvcacheIndex = shared
       ? undefined
       : this.glm.withStream(() => {
         const idxRopeDim = qkRopeDim;
@@ -858,7 +849,7 @@ export class Glm51Model extends ChatModel {
         return { kData: cache.ckv, kScaleData: cache.kpe! };
       });
 
-    using idxWeightsStream = skipIndexer ? undefined : this.glm.withStream(() => {
+    using idxWeightsStream = shared ? undefined : this.glm.withStream(() => {
       const idxNHeads = cfg.indexNHeads;
       const idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!);
       idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
@@ -893,7 +884,7 @@ export class Glm51Model extends ChatModel {
 
     // Indexer q: wq_b(qNormed) → rope → [BS, indexNHeads, indexHeadDim]
     // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
-    using idxQStream = skipIndexer
+    using idxQStream = shared
       ? undefined
       : this.glm.withStream(() => {
         const idxHeadDim = cfg.indexHeadDim;
@@ -937,7 +928,6 @@ export class Glm51Model extends ChatModel {
     });
 
     using ckv = cache.ckv;
-    using kpe = cache.kpe;
     using qAbsorbedR = qStream.result.qAbsorbed;
     using qAbsorbedScales = qStream.result.qAbsorbedScales;
     using qPeR = qStream.result.qPe;
@@ -950,8 +940,8 @@ export class Glm51Model extends ChatModel {
     let sparseSlots: {
       slots: Tensor,
       length: Tensor,
-    } | undefined;
-    if (cfg.indexHeadDim !== 0) {
+    };
+    {
       if (!sharedSlots || !sharedSlotsLength) {
         throw new Error('Shared slot holders must be installed before sparse MLA attention.');
       }
@@ -996,8 +986,8 @@ export class Glm51Model extends ChatModel {
       }
     }
 
-    using slots = sparseSlots?.slots;
-    using slotsLength = sparseSlots?.length;
+    using slots = sparseSlots.slots;
+    using slotsLength = sparseSlots.length;
 
     kvcache.streamWaitEvent();
     qStream.streamWaitEvent();
@@ -1005,33 +995,17 @@ export class Glm51Model extends ChatModel {
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     using prefetchL2 = new UsingHolder<ReturnType<DeviceOps["withStream"]>>(undefined!);
     {
-      let attnOut: Tensor;
-      let lseBuf: Tensor;
-
-      let tokenMajor = false;
-
-      if (!dense) {
-        // Sparse MLA path: SM120 kernel on packed FP8 KV cache
-        // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
-        // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
-        // seqLen=1, batch=BS — which matches token-major layout.
-        const sparseResult = state.sparseMla(
-          qAbsorbedR, qPeR, ckv!, slots!, slotsLength!,
-          cfg.indexTopk, cfg.scaling, qAbsorbedScales,
-        );
-        tokenMajor = !state.isDecode;
-
-        attnOut = sparseResult.o;
-        lseBuf = sparseResult.lse;
-      } else {
-        // Dense MLA path (FlashInfer plan/run)
-        if (!kpe) {
-          throw new Error("Dense MLA requires a separate KPE cache");
-        }
-        const mlaResult = state.denseMla(qAbsorbedR, qPeR, ckv, kpe, cfg.scaling);
-        attnOut = mlaResult.o;
-        lseBuf = mlaResult.lse;
-      }
+      // Sparse MLA path: SM120 kernel on packed FP8 KV cache
+      // SM120 outputs [BS, nHeads, kvLoraRank] (token-major).
+      // mlaVExpand reads attn_out as [batch * seqLen, heads, kv_lr] when
+      // seqLen=1, batch=BS — which matches token-major layout.
+      const sparseResult = state.sparseMla(
+        qAbsorbedR, qPeR, ckv!, slots, slotsLength,
+        cfg.indexTopk, cfg.scaling, qAbsorbedScales,
+      );
+      const tokenMajor = !state.isDecode;
+      const attnOut = sparseResult.o;
+      const lseBuf = sparseResult.lse;
 
       using _attnOut = attnOut;
       using _lseBuf = lseBuf;
@@ -1519,10 +1493,10 @@ export class Glm51Model extends ChatModel {
           using nextSlotsLength = new UsingHolder<Tensor>(undefined!);
           const kvCacheLayers: MtpVerificationArtifacts["kvCacheLayers"] = [];
           const indexerKvCacheLayers: MtpVerificationArtifacts["indexerKvCacheLayers"] = [];
-          const appendMla = verification.mlaKvCacheAppend.bind(verification);
+          const appendMla = verification.concatAndCacheDsMla.bind(verification);
           const appendIndexer = verification.indexerKvCacheAppend.bind(verification);
           if (!linear) {
-            verification.mlaKvCacheAppend = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
+            verification.concatAndCacheDsMla = (appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim) => {
               kvCacheLayers.push({ appendCkv: appendCkv.viewClone(), appendKpe: appendKpe.viewClone(), cacheIdx, kvLoraRank, qkRopeDim });
               return appendMla(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim);
             };
@@ -1558,7 +1532,7 @@ export class Glm51Model extends ChatModel {
             resultCopy.streamWaitEvent();
             return { kvCacheLayers, indexerKvCacheLayers };
           } finally {
-            verification.mlaKvCacheAppend = appendMla;
+            verification.concatAndCacheDsMla = appendMla;
             verification.indexerKvCacheAppend = appendIndexer;
           }
         });

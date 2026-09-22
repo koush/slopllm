@@ -220,22 +220,14 @@ export class ExecutionState {
 
   mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number): { ckv: Tensor; kpe?: Tensor } {
     const pagedKV = this.cache.getPagedKV();
-    const ckv = pagedKV.ckvData[cacheIdx];
-    const nnz = this.isDecode ? this.batchSize : this.totalTokens;
     if (pagedKV.sparseMode) {
       return {
-        ckv: this.ws.glm.concatAndCacheDsMla(
-          this, cacheIdx,
-          ckv,
-          appendCkv, appendKpe,
-          this.indices, this.indptrD,
-          this.mlaBatchIndices, this.positionIds,
-          nnz, kvLoraRank, qkRopeDim,
-          kvLoraRank, qkRopeDim,
-        ),
+        ckv: this.concatAndCacheDsMla(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim),
       };
     } else {
+      const ckv = pagedKV.ckvData[cacheIdx];
       const kpe = pagedKV.kpeData[cacheIdx];
+      const nnz = this.isDecode ? this.batchSize : this.totalTokens;
       return this.ws.glm.mlaKvCacheAppend(
         this, cacheIdx,
         ckv, kpe,
@@ -246,6 +238,21 @@ export class ExecutionState {
         kvLoraRank, qkRopeDim,
       );
     }
+  }
+
+  concatAndCacheDsMla(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number): Tensor {
+    const pagedKV = this.cache.getPagedKV();
+    const ckv = pagedKV.ckvData[cacheIdx];
+    const nnz = this.isDecode ? this.batchSize : this.totalTokens;
+    return this.ws.glm.concatAndCacheDsMla(
+      this, cacheIdx,
+      ckv,
+      appendCkv, appendKpe,
+      this.indices, this.indptrD,
+      this.mlaBatchIndices, this.positionIds,
+      nnz, kvLoraRank, qkRopeDim,
+      kvLoraRank, qkRopeDim,
+    );
   }
 
   indexerKvCacheAppend(idxKOut: Tensor, cacheIdx: number, indexHeadDim: number): { kData: Tensor; kScaleData: Tensor } {
