@@ -327,8 +327,6 @@ export class Glm51Model extends ChatModel {
   cfg: Glm51Config;
   invFreq: Tensor;
   readonly contextParallel: boolean;
-  private readonly pendingKNope = new Map<string, Tensor>();
-  private readonly pendingQNope = new Map<string, Tensor>();
   private readonly mtp: boolean;
 
   private constructor(glm: DeviceOps, config: Glm51Config, contextParallel = false, mtp = false) {
@@ -458,23 +456,6 @@ export class Glm51Model extends ChatModel {
     }
   }
 
-  private tryComputeAbsorbed(layerPfx: string, nHeads: number, kvLoraRank: number, qLoraRank: number, qkNopeDim: number): void {
-    const kNopeKey = `${layerPfx}.k_nope_proj.weight`;
-    const qNopeKey = `${layerPfx}.q_nope_proj.weight`;
-    if (!this.pendingKNope.has(kNopeKey) || !this.pendingQNope.has(qNopeKey)) {
-      return;
-    }
-    const kNopeProj = this.pendingKNope.get(kNopeKey)!;
-    const qNopeProj = this.pendingQNope.get(qNopeKey)!;
-    this.pendingKNope.delete(kNopeKey);
-    this.pendingQNope.delete(qNopeKey);
-    using wAbsorbedTmp = kNopeProj.bmm(qNopeProj, nHeads, kvLoraRank, qLoraRank, qkNopeDim, true, false);
-    const wAbsorbed = this.alloc(wAbsorbedTmp.shape, wAbsorbedTmp.type, `${layerPfx}.absorbed.weight`, wAbsorbedTmp.parallelism);
-    if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") {
-      wAbsorbed.memcpy(wAbsorbedTmp);
-    }
-  }
-
   private async loadMlaWeight(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
     const cfg = this.cfg;
     const nHeads = cfg.numAttentionHeads;
@@ -492,7 +473,7 @@ export class Glm51Model extends ChatModel {
       throw new Error(`loadMlaWeight: expected BF16, got ${meta.dtype}`);
     }
 
-    // using column parallelism means there's a gather on the absorbed
+    // column-parallel nope weights shard heads so the per-head absorb bmm stays local
     const nopeParallelism = TensorParallelism.Column;
 
     if (name.endsWith(".q_b_proj.weight")) {
@@ -505,7 +486,6 @@ export class Glm51Model extends ChatModel {
         tQNope.mmapLoad(mmapPtr, offset, tQNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
         tPe.mmapLoad(mmapPtr, offset, tPe.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: qkRopeDim * inDim * eb, width: qkRopeDim * inDim * eb, height: nHeads }),
       ]);
-      this.pendingQNope.set(name.replace(".q_b_proj.weight", ".q_nope_proj.weight"), tQNope);
     } else if (name.endsWith(".kv_b_proj.weight")) {
       const eb = 2;
       const srcPitch = (qkNopeDim + vHeadDim) * inDim * eb;
@@ -524,7 +504,6 @@ export class Glm51Model extends ChatModel {
       if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") {
         tV.memcpy(tVT);
       }
-      this.pendingKNope.set(name.replace(".kv_b_proj.weight", ".k_nope_proj.weight"), tKNope);
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
       const ckvName = name.replace(".kv_a_proj_with_mqa.weight", ".ckv_proj.weight");
       const kpeName = name.replace(".kv_a_proj_with_mqa.weight", ".k_pe_proj.weight");
@@ -536,10 +515,6 @@ export class Glm51Model extends ChatModel {
         ckv.mmapLoad(mmapPtr, offset, ckv.bytes),
         kpe.mmapLoad(mmapPtr, offset + kvLoraRank * inDim * eb, kpe.bytes),
       ]);
-    }
-
-    if (name.endsWith(".q_b_proj.weight") || name.endsWith(".kv_b_proj.weight")) {
-      this.tryComputeAbsorbed(layerPfx, nHeads, kvLoraRank, qLoraRank, qkNopeDim);
     }
   }
 
@@ -933,7 +908,7 @@ export class Glm51Model extends ChatModel {
         this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
         this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
         this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
-        this.tensors.get(`${pfx}.absorbed.weight`)!,
+        this.tensors.get(`${pfx}.absorbed.weight`),
         cos, sin,
         qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,
       );

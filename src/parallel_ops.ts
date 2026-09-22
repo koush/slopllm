@@ -3344,14 +3344,14 @@ export class ParallelOps implements DeviceOps {
     };
   }
 
-  projectMlaQuery(state: ExecutionState, kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, qNopeWeight: Tensor, kNopeWeight: Tensor, absorbedWeight: Tensor, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): MlaQuery {
+  projectMlaQuery(state: ExecutionState, kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, qNopeWeight: Tensor, kNopeWeight: Tensor, absorbedWeight: Tensor | undefined, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): MlaQuery {
     using qPeStream = this.withStream(() => {
       using qPeLin = qNormed.linear(qPeWeight);
       using rotated = qPeLin.applyRotaryPosEmb(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, 2, ropeInterleave);
       return rotated.reshape([batch * seqLen, nHeads, qkRopeDim]);
     });
     const qAbsorbed = (() => {
-      if (process.env.GLM_USE_ABSORBED_Q === "1") {
+      if (absorbedWeight) {
         using projected = qNormed.linear(absorbedWeight);
         return projected.reshape([batch * seqLen, nHeads, kvLoraRank]);
       }
