@@ -84,6 +84,8 @@ export interface DeviceOps extends Disposable {
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined, recycleKey?: HeapKey | null): Tensor;
   synchronize(streamIdx?: number): void;
   synchronizeAsync(streamIdx?: number): Promise<void>;
+  /** Logs per-device heap stats: free region count and total free space. */
+  printHeap(): void;
   /** Host-only stream-0 heap promotion; does not wait for GPU completion or release pinned buffers. */
   hostSynchronizeWorld(): void;
   setStream(streamIdx: number): void;

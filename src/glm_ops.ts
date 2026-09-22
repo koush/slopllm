@@ -916,6 +916,12 @@ export class GlmOps implements DeviceOps {
     return this.arenaBase === undefined ? undefined : this.heap.layoutSignature();
   }
 
+  printHeap(): void {
+    const format = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(3)} GiB`;
+    const arena = this.arenaSize !== undefined ? ` of ${format(this.arenaSize)} arena` : "";
+    console.log(`GPU ${this.device} heap:${arena} freeRegions=${this.heap.regionCount} freeBytes=${format(this.heap.freeBytes)}`);
+  }
+
   get usesIpcArena(): boolean {
     return this.arenaOwnership === "ipc-imported";
   }

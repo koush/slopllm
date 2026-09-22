@@ -360,23 +360,15 @@ export class ParallelTensor extends Tensor {
       }
     }
 
-    const stageOutput = !!output;
-    if (!output) {
-      const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
-      if (!group) {
-        throw new Error("allGather: failed to get P2P group");
-      }
-      const shards: Tensor[] = [];
-      const shardWss = this.parallelOps.getShardWorkspaces(workspace);
-      for (let i = 0; i < this.worldSize; i++) {
-        shards.push(group.allocClean(shardWss[i], this.shape, this.type));
-      }
-
-      output = this.parallelOps.wrapShards(workspace, shards, this.shape, this.type, TensorParallelism.Replicated);
+    const p2pOutput = this.tryP2PAllGather(workspace, output, lastRank);
+    if (p2pOutput) {
+      return p2pOutput;
     }
 
-    if (this.tryP2PAllGather(output, stageOutput, lastRank)) {
-      return output;
+    if (!output) {
+      output = workspace.alloc(
+        this.shape, this.type, undefined, TensorParallelism.Replicated,
+      ) as ParallelTensor;
     }
 
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
@@ -445,20 +437,35 @@ export class ParallelTensor extends Tensor {
    * too large for the P2P group, in which case the caller should use NCCL.
    * Dtype-agnostic: copies raw bytes, supports all element types.
    */
-  private tryP2PAllGather(output: ParallelTensor, stageOutput: boolean, lastRank = this.worldSize): boolean {
+  private tryP2PAllGather(workspace: WorkspaceBase, output: ParallelTensor | undefined, lastRank = this.worldSize) {
     if (!this.parallelOps.p2pEnabled)
-      return false;
+      return;
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     if (count > 65536 * 8)
-      return false;
+      return;
     const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
     if (!group)
       return false;
 
+    const stageOutput = !!output;
+    if (!output) {
+      const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
+      if (!group) {
+        throw new Error("allGather: failed to get P2P group");
+      }
+      const shards: Tensor[] = [];
+      const shardWss = this.parallelOps.getShardWorkspaces(workspace);
+      for (let i = 0; i < this.worldSize; i++) {
+        shards.push(group.allocClean(shardWss[i], this.shape, this.type));
+      }
+
+      output = this.parallelOps.wrapShards(workspace, shards, this.shape, this.type, TensorParallelism.Replicated);
+    }
+
     const postBarrier = this.beginP2PAllGather(group, output, stageOutput, lastRank);
     group.barrier(this.devices);
     postBarrier();
-    return true;
+    return output;
   }
 
   beginP2PAllGather(group: P2PAllReduceGroup, output: ParallelTensor, stageOutput: boolean, lastRank = this.worldSize) {
@@ -3223,6 +3230,12 @@ export class ParallelOps implements DeviceOps {
   hostSynchronizeWorld(): void {
     notifyHostWorldSynchronization(this.synchronizeListeners);
     for (const device of this.devices) device.hostSynchronizeWorld();
+  }
+
+  printHeap(): void {
+    for (const device of this.devices) {
+      device.printHeap();
+    }
   }
 
   prefetchL2(tensors: readonly Tensor[]): void {

@@ -397,6 +397,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     throw new Error("--mtp requires a model with MTP generation support");
   }
   const cache = model.createChatCache(args.maxPages, args.batchSize, args.chunkSize);
+  glm.printHeap();
   const ws = new ExecutionWorkspace(glm, args.batchSize, args.chunkSize);
   const captureManager = new CaptureManager(glm);
   captureManager.disabled = args.noCudaGraph;

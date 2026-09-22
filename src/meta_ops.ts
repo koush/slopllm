@@ -311,6 +311,9 @@ export class MetaOps implements DeviceOps {
         notifySynchronizedWorkspaces(this.synchronizeListeners);
     }
 
+    printHeap(): void {
+    }
+
     hostSynchronizeWorld(): void {
         notifyHostWorldSynchronization(this.synchronizeListeners);
     }
