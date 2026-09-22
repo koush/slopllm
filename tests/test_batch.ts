@@ -4,6 +4,7 @@ import { CaptureManager } from "../src/capture-manager";
 import { SamplingParams, makeSamplingParams, type ChatCache, type ChatModel } from "../src/chat_model";
 import { GlmOps } from "../src/glm_ops";
 import { Qwen35Model } from "../src/qwen35_model";
+import type { Qwen35GdnState } from "../src/qwen35_gdn_state";
 import { Qwen3Model } from "../src/qwen3_model";
 import { SamplingWorkspace } from "../src/sampling";
 import { Tensor } from "../src/tensor";
@@ -626,6 +627,84 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
     glm.free();
   });
 
+  it("Qwen3.5 phased prefill keeps unequal halves' sequence boundaries independent", async () => {
+    using cache = model.createChatCache(32, 1, 128);
+    const prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    const run = async (phased: boolean) => {
+      cache.reset(1);
+      if (phased) {
+        const plan = model["planPhasedPrefill"](ws, cache, [prompt]);
+        assert.deepEqual(plan.states.map(state => state.seqLens), [[4], [5]]);
+        try {
+          for (const _ of plan.generator) {}
+          await glm.synchronizeAsync();
+          plan.reportTokens();
+        } finally {
+          plan.generator.return([]);
+        }
+        ws.assertClear();
+        ws.clearTracking();
+      } else {
+        await model.executePrefill(ws, cache, [prompt.slice(0, 4)]);
+        await model.executePrefill(ws, cache, [prompt.slice(4)]);
+      }
+      const { gdnState } = cache as ChatCache & { gdnState: Qwen35GdnState };
+      const state = [...gdnState.convState, ...gdnState.recurrentState].filter(Boolean).map(tensor => {
+        const bytes = Buffer.alloc(tensor.bytes);
+        tensor.d2h(bytes);
+        return bytes;
+      });
+      await glm.synchronizeAsync();
+      return { state, target: cache.getPagedKV().sequences[0].targetToken };
+    };
+    assert.deepEqual(await run(true), await run(false));
+  });
+
+  it("pending-token decode preserves Qwen3.5 recurrent state across restarts", async () => {
+    using cache = model.createChatCache(32, 1, 128);
+    const prompt = [1, 2, 3, 4, 5, 6, 7];
+    const { gdnState } = cache as ChatCache & { gdnState: Qwen35GdnState };
+    const snapshot = () => [...gdnState.convState, ...gdnState.recurrentState]
+      .filter(Boolean).map(tensor => {
+        const bytes = Buffer.alloc(tensor.bytes);
+        tensor.d2h(bytes);
+        return bytes;
+      });
+    const run = async (generator: boolean) => {
+      cache.reset(1);
+      await model.executePrefill(ws, cache, [prompt]);
+      const sequence = cache.getPagedKV().sequences[0];
+      // Ordinary decode may consume any caller-provided token, not only the argmax.
+      cache.reportTokens(0, [], 42);
+      sequence.truncate = () => { assert.fail("plain decode must never rewind recurrent state"); };
+      const output: number[] = [];
+      for (let i = 0; i < 2; i++) {
+        const input = sequence.targetToken!;
+        if (generator) {
+          const decode = model.generateDecode(ws, cache);
+          try {
+            const step = await decode.next();
+            assert.equal(step.done, false);
+            output.push(step.value!.tokens[0][0]);
+          } finally {
+            await decode.return();
+          }
+        } else {
+          const next = ws.forwardEagerDecode(model, [input], cache)[0];
+          cache.reportTokens(0, [input], next);
+          output.push(next);
+        }
+        assert.equal(sequence.allocLen, prompt.length + i + 1);
+        assert.equal(sequence.targetToken, output.at(-1));
+      }
+      assert.deepEqual(sequence.getTokenIds(), [...prompt, 42, output[0]]);
+      await glm.synchronizeAsync();
+      return { output, state: snapshot() };
+    };
+    assert.deepEqual(await run(true), await run(false));
+    ws.assertClear();
+  });
+
   function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[], chunkSizes: number[]): number[] {
     let offset = 0;
     let logits: ReturnType<Tensor["argmax"]> | null = null;
@@ -822,7 +901,8 @@ describe("PagedKVCache prefix matching", () => {
     assert.equal(sharedPage.refs, 1);
     assert.equal(copiedPage.id, copiedPageId);
     assert.equal(copiedPage.refs, 1);
-    assert.deepStrictEqual(copiedPage.tokenIds, sharedPage.tokenIds);
+    assert.deepStrictEqual(copiedPage.tokenIds, base.slice(0, PAGE_SIZE - 1));
+    assert.deepStrictEqual(sharedPage.tokenIds, base);
     assert.equal(pagedKV.sequences[1].allocLen, PAGE_SIZE - 1);
 
     const pageBytes = pagedKV.nKv * PAGE_SIZE * pagedKV.hd * 2;
@@ -850,6 +930,7 @@ describe("PagedKVCache prefix matching", () => {
     assert.equal(pagedKV.sequences[0].pages[0], page);
     assert.equal(page.refs, 1);
     assert.equal(pagedKV.availablePages.length, availablePages);
+    assert.deepStrictEqual(pagedKV.sequences[0].getTokenIds(), base.slice(0, PAGE_SIZE - 1));
   });
 
   it("truncate recycles a released trailing page for copy-on-write", () => {

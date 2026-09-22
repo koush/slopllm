@@ -186,6 +186,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       dstPage.tokenIds.push(...srcPage.tokenIds);
       dstSeq.allocLen = srcSeq.allocLen;
     }
+    dstSeq.targetToken = srcSeq.targetToken;
   }
 
   ensureSequence(seqIdx: number) {
@@ -196,8 +197,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   // Finds the best prefix match across active and staged sequences and returns the unmatched suffix.
   // Only full pages are kept/shared — the partial page is never shared because
   // the receiving sequence would write into it. Empty pages beyond the content
-  // region are discarded. If the entire cache matches (self, no truncation needed),
-  // returns the suffix immediately without touching pages.
+  // region are discarded. A complete prompt match leaves its final token for
+  // prefill so the caller selects a fresh output using its own sampling policy.
   prefixMatch(seqIdx: number, inputIds: number[], copyPartial?: boolean): number[] {
     const targetSeq = this.ensureSequence(seqIdx);
 
@@ -205,12 +206,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     let bestMatchTokens = 0;
     for (const sequence of [...this.sequences, ...this.staging.values()]) {
       if (sequence.pages.length === 0) continue;
-      let matchTokens = sequence.prefixMatch(inputIds);
-      // Only an exact self-match may retain a reported-but-unprocessed token
-      // for the caller. Reused KV must stop at the materialized boundary.
-      if (sequence !== targetSeq || matchTokens !== sequence.reportedTokenCount()) {
-        matchTokens = Math.min(matchTokens, sequence.allocLen);
-      }
+      const matchTokens = Math.min(sequence.prefixMatch(inputIds), sequence.allocLen);
       if (matchTokens > bestMatchTokens) {
         bestMatchTokens = matchTokens;
         bestSeq = sequence;
@@ -218,6 +214,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
 
     if (bestSeq === targetSeq && bestMatchTokens === targetSeq.reportedTokenCount()) {
+      if (bestMatchTokens === inputIds.length) {
+        targetSeq.truncate(--bestMatchTokens);
+      }
       return inputIds.slice(bestMatchTokens);
     }
 
@@ -232,6 +231,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     if (bestSeq === targetSeq) {
       while (targetSeq.pages.length > keepPages) {
         targetSeq.popPage();
+      }
+      if (targetSeq.allocLen === inputIds.length) {
+        targetSeq.truncate(targetSeq.allocLen - 1);
       }
       return inputIds.slice(targetSeq.allocLen);
     }
@@ -252,7 +254,13 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
         dstPage.tokenIds.push(...srcPage.tokenIds.slice(0, bestMatchTokens % this.pageSize));
         this.sequences[seqIdx].allocLen = bestMatchTokens;
       }
-      return inputIds.slice(this.sequences[seqIdx].allocLen);
+      const matched = this.sequences[seqIdx];
+      matched.targetToken = matched.allocLen === bestSeq.reportedTokenCount()
+        ? bestSeq.targetToken : bestSeq.getTokenIds()[matched.allocLen];
+      if (matched.allocLen === inputIds.length) {
+        matched.truncate(matched.allocLen - 1);
+      }
+      return inputIds.slice(matched.allocLen);
     }
 
     this.sequences[seqIdx].clear();
@@ -285,9 +293,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     );
   }
 
-  reportTokens(seqIdx: number, tokens: number[]): void {
+  reportTokens(seqIdx: number, tokens: number[], targetToken?: number): void {
     if (seqIdx >= this.sequences.length) throw new Error(`reportTokens: seqIdx ${seqIdx} out of range (${this.sequences.length} sequences)`);
-    this.sequences[seqIdx].reportTokens(tokens);
+    this.sequences[seqIdx].reportTokens(tokens, targetToken);
   }
 
   pagesNeededForDecodeToken(seqIdx: number): number {

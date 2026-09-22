@@ -1,8 +1,8 @@
 import { createInterface } from "node:readline";
 import { CaptureManager } from "./capture-manager";
-import { ChatCache, ChatModel, SamplingParams, Tokenizer, makeSamplingParams } from "./chat_model";
+import { ChatCache, ChatModel, SamplingParams, Tokenizer, makeSamplingParams, type TokenSelector } from "./chat_model";
 import { DeviceOps } from "./device_ops";
-import { executePlan, ExecutionWorkspace } from "./execution-workspace";
+import { ExecutionWorkspace } from "./execution-workspace";
 import { MetaOps } from "./meta_ops";
 import { createDeviceOps, loadModel, modelLabel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { MtpStats } from "./mtp_stats";
@@ -156,6 +156,16 @@ function tokenizeMessages(
 
 // --- Generation primitives ---
 
+async function prefillChunks(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache,
+  inputIdsList: number[][], captureManager?: CaptureManager, samplingPolicy?: TokenSelector): Promise<void> {
+  let remaining = inputIdsList;
+  while (remaining.some(ids => ids.length)) {
+    const chunk = await model.executePrefill(ws, cache, remaining, captureManager, Math.min(8192, ws.maxSeqLen), samplingPolicy);
+    remaining = chunk.remainingInputIdsList;
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+}
+
 export interface DecodeTiming {
   planMs: number;
   execMs: number;
@@ -171,7 +181,7 @@ async function* generateMtpStream(
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   topks: readonly number[], graphState?: GraphState, timing?: DecodeTiming,
 ): AsyncGenerator<number> {
-  if (!model.planPrefillMtp || !model.generateMtpDecode) {
+  if (!model.generateMtpDecode) {
     throw new Error("The selected model does not support MTP decoding");
   }
 
@@ -191,26 +201,15 @@ async function* generateMtpStream(
 
   try {
     const suffixIds = cache.prefixMatch(0, inputIds);
-    const mtpInputIds = model.prepareMtpInput(cache, [suffixIds]);
-    const currentDraft = (await executePlan(
-      captureManager,
-      ws,
-      model.planPrefillMtp(ws, cache, mtpInputIds),
-    )).result;
-
-    const firstToken = currentDraft.targetTokens[0];
-    cache.reportTokens(0, suffixIds);
-    cache.reportTokens(0, [firstToken]);
-    let generated = 1;
-
-    yield firstToken;
+    await prefillChunks(model, ws, cache, [suffixIds], captureManager);
+    const target = cache.getPagedKV().sequences[0].targetToken!;
+    yield target;
     await new Promise<void>(resolve => setImmediate(resolve));
-    if (eosIds.has(firstToken) || generated >= maxNewTokens) {
-      return;
-    }
+    let generated = 1;
+    if (eosIds.has(target) || generated >= maxNewTokens) return;
 
     let started = performance.now();
-    for await (const result of model.generateMtpDecode(ws, cache, currentDraft.targetTokens, topks, captureManager)) {
+    for await (const result of model.generateMtpDecode(ws, cache, topks, captureManager)) {
       const step = { result, warmup: result.warmup };
       execMs += performance.now() - started;
 
@@ -219,7 +218,6 @@ async function* generateMtpStream(
       }
 
       for (const token of step.result.tokens[0]) {
-        cache.reportTokens(0, [token]);
         const now = performance.now();
         if (step.warmup) {
           warmupSteps++;
@@ -263,8 +261,11 @@ export async function* generateStream(
   sampling: SamplingParams | undefined, graphState?: GraphState,
   timing?: DecodeTiming, mtp?: boolean, mtpDraftTopk?: number[],
 ): AsyncGenerator<number> {
+  if (maxNewTokens <= 0) {
+    return;
+  }
   const topks = mtp && mtpDraftTopk && mtpDraftTopk.length > 0 &&
-    model.planPrefillMtp && model.generateMtpDecode
+    model.generateMtpDecode
     ? mtpDraftTopk
     : [];
   if (topks.length > 0) {
@@ -283,33 +284,13 @@ export async function* generateStream(
 
   captureManager.disabled = graphState === undefined;
 
-  {
-    const suffixIds = cache.prefixMatch(0, inputIds);
-    const inputIdsList = [suffixIds];
-    const batchSize = inputIdsList.length;
-    const seqLens = inputIdsList.map(ids => ids.length);
-    const state = ws.planPrefill(model, batchSize, seqLens, cache);
-    state.setInput(inputIdsList);
-
-    using hiddenStates = model.forward(state);
-    using firstTokens = state.computeLogits(hiddenStates, model);
-    using selected = samplingWorkspace ? samplingWorkspace.selectTarget(firstTokens) : firstTokens.argmax();
-    await glm.synchronizeAsync();
-    currentToken = selected.readInt32LEArray()[0];
-    cache.reportTokens(0, suffixIds);
-    cache.reportTokens(0, [currentToken]);
-  }
-  ws.assertClear();
-  ws.clearTracking();
-
-  yield currentToken;
-  await new Promise<void>(resolve => setImmediate(resolve));
-  if (eosIds.has(currentToken) || maxNewTokens <= 1) return;
+  const suffixIds = cache.prefixMatch(0, inputIds);
+  await prefillChunks(model, ws, cache, [suffixIds], captureManager, samplingWorkspace);
 
   // Budget is in TOKENS, not loop iterations. One plain decode step emits one
   // token, but one MTP step emits 1 + (accepted drafts), so bounding the loop
   // counter overshoots by the mean acceptance length (~2.2x at topk 1,1,1).
-  let generated = 1;
+  let generated = 0;
   let execMs = 0;
   let warmupSteps = 0;
   let graphSteps = 0;
@@ -318,8 +299,14 @@ export async function* generateStream(
   let postWarmupTokenCount = 0;
 
   try {
+    currentToken = cache.getPagedKV().sequences[0].targetToken!;
+    yield currentToken;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    generated++;
+    if (eosIds.has(currentToken) || generated >= maxNewTokens) return;
+    if (samplingWorkspace) samplingWorkspace.updateSampler([sampling!], [[...inputIds, currentToken]]);
     let started = performance.now();
-    for await (const step of model.generateDecode(ws, cache, [currentToken], captureManager, samplingWorkspace)) {
+    for await (const step of model.generateDecode(ws, cache, captureManager, samplingWorkspace)) {
       execMs += performance.now() - started;
       currentToken = step.tokens[0][0];
       if (step.warmup) {
@@ -333,7 +320,6 @@ export async function* generateStream(
         lastTokenTime = now;
         postWarmupTokenCount++;
       }
-      cache.reportTokens(0, [currentToken]);
 
       yield currentToken;
       await new Promise<void>(resolve => setImmediate(resolve));
@@ -362,30 +348,30 @@ export async function generateBatchTokens(
 ): Promise<number[][]> {
   const batchSize = inputIdsList.length;
   cache.reset(batchSize);
-  const firstTokens = ws.forwardEagerPrefill(model, inputIdsList, cache);
-
-  const nextTokens = [...firstTokens];
-  const generated: number[][] = nextTokens.map(t => [t]);
-  const finished = nextTokens.map(t => eosIds.has(t));
-  inputIdsList.forEach((ids, batch) => cache.reportTokens(batch, [...ids, firstTokens[batch]]));
-
-  ws.assertClear();
-  ws.clearTracking();
-  if (maxNewTokens > 1 && !finished.every(Boolean)) for await (const step of model.generateDecode(ws, cache, nextTokens)) {
-    const newTokens = step.tokens.map(tokens => tokens[0]);
-
+  const generated: number[][] = inputIdsList.map(() => []);
+  if (!batchSize || maxNewTokens <= 0) {
+    return generated;
+  }
+  await prefillChunks(model, ws, cache, inputIdsList);
+  const finished = cache.getPagedKV().sequences.map((sequence, index) => {
+    const token = sequence.targetToken!;
+    generated[index].push(token);
+    return eosIds.has(token) || generated[index].length >= maxNewTokens;
+  });
+  if (finished.every(Boolean)) return generated;
+  for await (const step of model.generateDecode(ws, cache)) {
     for (let i = 0; i < batchSize; i++) {
-      nextTokens[i] = newTokens[i];
-      cache.reportTokens(i, [newTokens[i]]);
       if (!finished[i]) {
-        if (eosIds.has(newTokens[i])) {
-          finished[i] = true;
-        } else {
-          generated[i].push(newTokens[i]);
+        const token = step.tokens[i][0];
+        if (!eosIds.has(token) || !generated[i].length) {
+          generated[i].push(token);
         }
+        finished[i] = eosIds.has(token) || generated[i].length >= maxNewTokens;
       }
     }
-    if (finished.every(Boolean) || generated.every((tokens, batch) => finished[batch] || tokens.length >= maxNewTokens)) break;
+    if (finished.every(Boolean)) {
+      break;
+    }
   }
 
   return generated;
@@ -587,8 +573,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     const cache = model.createChatCache(args.maxPages, args.maxBatch, args.maxSeqLen);
     const ws = new ExecutionWorkspace(metaOps, args.maxBatch, args.maxSeqLen);
     const inputIds = [1, 2, 3, 4, 5];
-    const logits = ws.forwardPrefill(model, [inputIds], cache);
-    cache.reportTokens(0, inputIds);
+    cache.reset(1);
+    await prefillChunks(model, ws, cache, [inputIds]);
     const forwardAllocs = metaOps.totalAllocs;
     const forwardBytes = metaOps.totalBytes;
 

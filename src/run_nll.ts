@@ -54,15 +54,13 @@ async function main() {
   if (argv.includes("--decode")) {
     const prefixLen = parseInt(opt("--prefix", "16"), 10);
     const prefix = ids.slice(0, prefixLen);
-    {
-      const st = ws.planPrefill(model, 1, [prefix.length], cache);
-      st.setInput([prefix]);
-      using hs = model.forward(st);
-      using lg = st.computeLogits(hs, model);
-      void lg;
+    let remaining = [prefix];
+    while (remaining.some(tokens => tokens.length)) {
+      const chunk = await model.executePrefill(ws, cache, remaining, undefined, Math.min(8192, ws.maxSeqLen));
+      remaining = chunk.remainingInputIdsList;
     }
-    cache.reportTokens(0, prefix);
-    glm.synchronize();
+    // Replay the last prefix token at its original position to score the first target.
+    cache.getPagedKV().sequences[0].truncate(prefix.length - 1);
 
     let nllD = 0, nD = 0, top1D = 0;
     const perToken: number[] = [];
@@ -90,8 +88,8 @@ async function main() {
       nD++;
 
       perToken.push(-(row[target] - mx - Math.log(sm)));
+      cache.reportTokens(0, [cur], target);
       cur = target;
-      cache.reportTokens(0, [target]);
     }
     const mD = nllD / nD;
     console.log(`[decode] tokens=${nD} meanNLL=${mD.toFixed(5)} ppl=${Math.exp(mD).toFixed(4)} top1acc=${(top1D / nD * 100).toFixed(2)}%`);

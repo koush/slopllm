@@ -1509,12 +1509,39 @@ export class ParallelTensor extends Tensor {
   }
 
   fill(value: number, n: number): void {
-    const shardN = this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column
-      ? n / this.worldSize
-      : n;
-    for (let i = 0; i < this.worldSize; i++) {
-      this.shards[i].fill(value, shardN);
+    super.fill(value, n);
+    if (this.parallelism === TensorParallelism.Replicated) {
+      for (const shard of this.shards) {
+        shard.fill(value, n);
+      }
+      return;
     }
+    if (this.parallelism === TensorParallelism.Column) {
+      // Leading-dimension shards are contiguous pieces of the logical prefix.
+      let remaining = n;
+      for (const shard of this.shards) {
+        const shardN = Math.min(remaining, shard.numElements);
+        shard.fill(value, shardN);
+        remaining -= shardN;
+      }
+      return;
+    }
+    if (this.parallelism === TensorParallelism.Row) {
+      if (n === 0) {
+        return;
+      }
+      // Dimension-1 shards wrap at each leading-dimension slice, including its trailing dimensions.
+      const width = this.shape.slice(1).reduce((size, dim) => size * dim, 1);
+      const shardWidth = width / this.worldSize;
+      const fullRows = Math.floor(n / width);
+      const remainder = n % width;
+      for (let i = 0; i < this.worldSize; i++) {
+        const shardN = fullRows * shardWidth + Math.min(shardWidth, Math.max(0, remainder - i * shardWidth));
+        this.shards[i].fill(value, shardN);
+      }
+      return;
+    }
+    throw new Error(`fill: unsupported parallelism ${this.parallelism}`);
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
@@ -3733,12 +3760,8 @@ export class ParallelOps implements DeviceOps {
   sparseMlaPrepareCache(state: ExecutionState, groupSlots: Tensor, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, topk: Tensor | undefined, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor {
     const pKvCache = this.cast(kvCache);
     const pBatchIndices = this.cast(batchIndices);
-    const pPositions = this.cast(positions);
-    const pAppendCkv = this.cast(appendCkv);
-    const pAppendKpe = this.cast(appendKpe);
     const pageSize = pKvCache.shape[1];
     const pIndptr = this.cast(indptr);
-    const pKvTokenIndptr = this.cast(state.kvTokenIndptrD);
     const cfg = state.model.cfg as Glm51Config;
 
     const pagedKV = state.cache.getPagedKV();
@@ -3811,16 +3834,10 @@ export class ParallelOps implements DeviceOps {
       // writes them in. This is required in prefill (full gather) and decode (sparse gather)
       // because the topk may reference those new-token positions.
 
-      for (let i = 0; i < this.worldSize; i++) {
-        using _cache = this.devices[i].concatAndCacheDsMla(state, cacheIdx, prefetched!.shards[i], pAppendCkv.shards[i], pAppendKpe.shards[i],
-          // prefetch tensor is flat, so no need for indices — and in that mode
-          // the kernel indexes by kvTokenIndptr (the de-interleaved token prefix
-          // sum the gather used), NOT the page indptr. They only coincide for
-          // batch 0, so passing the page indptr corrupted the gathered buffer
-          // for every forked sequence in MTP's draft passes.
-          undefined,
-          pKvTokenIndptr.shards[i], pBatchIndices.shards[i], pPositions.shards[i], nnz, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN, pageSize, 0, 0);
-      }
+      // Flat addressing uses token prefix sums rather than page indptr.
+      using _cache = this.concatAndCacheDsMla(state, cacheIdx, prefetched, appendCkv, appendKpe,
+        undefined, state.kvTokenIndptrD, batchIndices, positions,
+        nnz, kvLoraRank, peDim, appendCkvStrideN, appendKpeStrideN);
     }
 
     // if full gather path isn't in use, return whatever was found or fall back
@@ -4350,8 +4367,7 @@ export class ParallelOps implements DeviceOps {
         using dummyValues = paddedValues.narrow(totalQ, paddedQ - totalQ);
         using dummyIndices = paddedIndices.narrow(totalQ, paddedQ - totalQ);
         dummyValues.fill(-Infinity, dummyValues.numElements);
-        // fill writes BF16 elements; zero both halves of each dummy I32.
-        dummyIndices.fill(0, dummyIndices.bytes / 2);
+        dummyIndices.fill(0, dummyIndices.numElements);
       }
       const valuePtrs = new Array<number>(8).fill(0);
       const indexPtrs = new Array<number>(8).fill(0);
@@ -4385,7 +4401,7 @@ export class ParallelOps implements DeviceOps {
         // Retain dummy merges, but initialize their staging locally instead
         // of transferring dummy candidates from every source GPU.
         stagedValues[owner].fill(-Infinity, stagedValues[owner].numElements);
-        stagedIndices[owner].fill(0, stagedIndices[owner].bytes / 2);
+        stagedIndices[owner].fill(0, stagedIndices[owner].numElements);
       }
       using qvStream = this.devices[owner].withStream(() => {
         // Swapping [W, 1, topk] to [1, W, topk] preserves flat order.

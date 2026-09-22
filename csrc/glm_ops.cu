@@ -7,6 +7,9 @@
 #include <cuda/ptx>
 #include <cstdio>
 #include <algorithm>
+#include <cstring>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 namespace cg = cooperative_groups;
 
@@ -1355,19 +1358,48 @@ void glm_causal_mask(GlmCtx* ctx, void* out, int seq_len) {
 // Fill kernel
 // ---------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(256, 4) fill_kernel(__nv_bfloat16* out, float value, int n) {
+template <typename T>
+__global__ void __launch_bounds__(256, 4) fill_kernel(T* out, T value, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        out[idx] = __float2bfloat16(value);
+        out[idx] = value;
     }
 }
 
-void glm_fill(GlmCtx* ctx, void* out, float value, int n) {
-    cudaSetDevice(ctx->device_id);
+template <typename T>
+static cudaError_t launch_fill(GlmCtx* ctx, void* out, T value, int n) {
     int block_size = 256;
     int grid = (n + block_size - 1) / block_size;
-    fill_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, value, n);
+    fill_kernel<T><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        static_cast<T*>(out), value, n);
+    return cudaGetLastError();
+}
+
+cudaError_t glm_fill(GlmCtx* ctx, void* out, double value, int n, const char* dtype) {
+    if (n < 0 || !dtype) return cudaErrorInvalidValue;
+    if (n == 0) return cudaSuccess;
+    cudaError_t err = cudaSetDevice(ctx->device_id);
+    if (err != cudaSuccess) return err;
+#define FILL_TYPE(NAME, TYPE) \
+    if (strcmp(dtype, NAME) == 0) return launch_fill(ctx, out, static_cast<TYPE>(value), n)
+    FILL_TYPE("BF16", __nv_bfloat16);
+    FILL_TYPE("F16", __half);
+    FILL_TYPE("F32", float);
+    FILL_TYPE("F64", double);
+    FILL_TYPE("I8", int8_t);
+    FILL_TYPE("U8", uint8_t);
+    FILL_TYPE("I16", int16_t);
+    FILL_TYPE("U16", uint16_t);
+    FILL_TYPE("I32", int32_t);
+    FILL_TYPE("U32", uint32_t);
+    FILL_TYPE("I64", int64_t);
+    FILL_TYPE("U64", uint64_t);
+    FILL_TYPE("BOOL", bool);
+    FILL_TYPE("F8_E4M3", __nv_fp8_e4m3);
+    FILL_TYPE("F8_E5M2", __nv_fp8_e5m2);
+#undef FILL_TYPE
+    if (strcmp(dtype, "C64") == 0) return launch_fill(ctx, out, make_float2(static_cast<float>(value), 0.0f), n);
+    return cudaErrorInvalidValue;
 }
 
 // ---------------------------------------------------------------------------

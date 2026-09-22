@@ -118,6 +118,57 @@ for (const parallel of [false, true]) {
       assert.equal(sampling.tracked.size, 0);
     });
 
+    it("ordinary sampling advances an ordered penalty ring across replay and restart", () => {
+      const window = 4;
+      using sampling = new SamplingWorkspace(glm, B, V, window);
+      using inputs = new WorkspaceBase(glm);
+      using manager = new CaptureManager(glm);
+      const input = inputs.alloc([B, V], "BF16", "logits");
+      const params = Array.from({ length: B }, () => ({ ...greedy, presencePenalty: 4, repetitionPenaltyWindow: window }));
+      const histories = Array.from({ length: B }, (_, row) => [9, 1, 2, 1, 3].map(token => token + row * 200));
+      let ring = histories.map(history => history.slice(-window));
+      let count = window;
+      sampling.updateSampler(params, histories);
+      assert.deepEqual(readI32(sampling.penaltyTokens), ring.flat());
+      assert.deepEqual(readI32(sampling.penaltyCount), [count, count]);
+      for (let iteration = 0; iteration < 12; iteration++) {
+        if (iteration === 6) {
+          // A restarted batch initializes from history; ongoing steps do not.
+          sampling.updateSampler(params, histories);
+          ring = histories.map(history => history.slice(-window));
+          count = window;
+        }
+        const values = new Float32Array(B * V).fill(-16);
+        const expected = histories.map((history, row) => {
+          const offset = row * 200;
+          values[row * V + offset + 1] = 10;
+          values[row * V + offset + 2] = 11;
+          // First append D and E to [A, B, A, C], then distinguish whether
+          // A or B expired. Later iterations exercise repeated wraparound.
+          if (iteration < 2) values[row * V + offset + iteration + 4] = 20;
+          const seen = new Set(history.slice(-window));
+          let best = 0;
+          let score = -Infinity;
+          for (let token = 0; token < V; token++) {
+            const penalized = values[row * V + token] - (seen.has(token) ? 4 : 0);
+            if (penalized > score) { best = token; score = penalized; }
+          }
+          return best;
+        });
+        input.h2d(f32ToBf16Bytes(values));
+        using selected = manager.run({}, () => sampling.sample(input), ["ordered-penalty-ring", sampling.captureKey]) as Tensor;
+        assert.deepEqual(readI32(selected), expected);
+        expected.forEach((token, row) => {
+          histories[row].push(token);
+          ring[row][count % window] = token;
+        });
+        count++;
+        assert.deepEqual(readI32(sampling.penaltyTokens), ring.flat());
+        assert.deepEqual(readI32(sampling.penaltyCount), [count, count]);
+      }
+      assert.ok([...manager.captured.values()].some(entry => entry.graphExec !== null));
+    });
+
     function noFullGather(t: TestContext, maxK: number) {
       assert.ok(glm instanceof ParallelOps);
       const allGather = ParallelTensor.prototype.allGather;

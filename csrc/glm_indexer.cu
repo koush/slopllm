@@ -918,7 +918,7 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
         // memset has no such overhead in measurements and avoids clearing the
         // unused scratch columns, which matters for large batches.
         if (batch == 1) {
-            glm_fill(ctx, hist, 0.0f, IDX_RADIX_BUCKETS * 2);
+            glm_fill(ctx, hist, 0.0, IDX_RADIX_BUCKETS, "I32");
         } else {
             cudaMemset2DAsync(hist, (size_t)IDX_SCRATCH_I32 * sizeof(int32_t), 0,
                               (size_t)IDX_RADIX_BUCKETS * sizeof(int32_t), batch, stream);

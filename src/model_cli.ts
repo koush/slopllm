@@ -111,7 +111,7 @@ export async function loadModel(glm: DeviceOps, args: ModelCliArgs, modelDir: st
     : args.useQwen35
       ? Qwen35Model.fromPretrained(glm, modelDir)
       : Qwen3Model.fromPretrained(glm, modelDir));
-  const devices = glm instanceof ParallelOps ? glm.devices : [glm as GlmOps];
+  const devices = glm instanceof ParallelOps ? glm.devices : glm instanceof GlmOps ? [glm] : [];
   for (const device of devices) {
     const expected = process.env[`GLM_ARENA_LAYOUT_${device.device}`];
     const actual = device.arenaLayoutSignature();

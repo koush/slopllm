@@ -43,16 +43,13 @@ class Qwen35ChatCache implements ChatCache {
     return inputIds.slice();
   }
 
-  reportTokens(seqIdx: number, tokens: number[]): void {
-    this.pagedKV.reportTokens(seqIdx, tokens);
+  reportTokens(seqIdx: number, tokens: number[], targetToken?: number): void {
+    this.pagedKV.reportTokens(seqIdx, tokens, targetToken);
   }
 
   prefillBatchPlanHook(
-    _batchSize: number, seqLens: number[], totalTokens: number,
-    _startPos: number[], cache: ChatCache,
+    _batchSize: number, _seqLens: number[], totalTokens: number,
   ): void {
-    const { gdnState } = cache as Qwen35ChatCache;
-    gdnState.uploadCuSeqlens(seqLens);
     if (totalTokens > this.maxBatch * this.maxSeqLen) {
       throw new Error(`Total tokens ${totalTokens} exceeds max (B=${this.maxBatch}, S=${this.maxSeqLen})`);
     }
@@ -286,7 +283,7 @@ export class Qwen35Model extends ChatModel {
     const kernelSize = cfg.linearConvKernelDim;
 
     using convOut = ws.alloc([S, fullConvDim], "BF16", undefined, TensorParallelism.Row);
-    convOut.causalConv1d(convState, qkvLinear, this.tensors.get(`${pfx}.conv1d.weight`)!, gdnState.cuSeqlens, fullConvDim, S, kernelSize, batchSize, fullConvStateStride, 1, fullConvDim);
+    convOut.causalConv1d(convState, qkvLinear, this.tensors.get(`${pfx}.conv1d.weight`)!, state.qoIndptrD, fullConvDim, S, kernelSize, batchSize, fullConvStateStride, 1, fullConvDim);
 
     using gdnOut = ws.alloc([S, fullZDim], "BF16", undefined, TensorParallelism.Row);
 
@@ -294,7 +291,7 @@ export class Qwen35Model extends ChatModel {
       state, gdnOut, recurrentState, convOut,
       aBuf, bBuf,
       this.tensors.get(`${pfx}.A_log`)!, this.tensors.get(`${pfx}.dt_bias`)!,
-      gdnState.cuSeqlens, fullLinHeads, linKDim, linVDim,
+      state.qoIndptrD, fullLinHeads, linKDim, linVDim,
       fullRecurrentStateStride, 1, fullConvDim,
     );
 

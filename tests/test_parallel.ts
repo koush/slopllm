@@ -1354,6 +1354,48 @@ describe("ParallelOps.fill and arange", () => {
     }
   });
 
+  for (const parallelism of [TensorParallelism.Replicated, TensorParallelism.Column, TensorParallelism.Row]) {
+    it(`fill preserves the logical suffix for every prefix length (${parallelism})`, () => {
+      for (const shape of [[2, 4], [4, 6], [2, 4, 3]]) {
+        using pt = ws.alloc(shape, "I32", undefined, parallelism) as ParallelTensor;
+        const sentinel = -123;
+        for (let n = 0; n <= pt.numElements; n++) {
+          for (const shard of pt.shards) {
+            shard.fill(sentinel, shard.numElements);
+          }
+          pt.fill(37, n);
+          po.synchronize();
+          const buf = Buffer.alloc(pt.bytes);
+          pt.d2h(buf);
+          const expected = Array.from({ length: pt.numElements }, (_, i) => i < n ? 37 : sentinel);
+          const actual = Array.from({ length: pt.numElements }, (_, i) => buf.readInt32LE(i * 4));
+          assert.deepEqual(actual, expected, `shape=[${shape}], n=${n}`);
+          if (parallelism === TensorParallelism.Replicated) {
+            for (const shard of pt.shards) {
+              assert.deepEqual(shard.readInt32LEArray(), expected);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  it("fill rejects unsupported parallelisms without modifying shards", () => {
+    for (const parallelism of [TensorParallelism.PartialSum, TensorParallelism.PartialSoftmax]) {
+      using pt = ws.alloc([4, 4], "I32", undefined, parallelism) as ParallelTensor;
+      for (const shard of pt.shards) {
+        shard.fill(-123, shard.numElements);
+      }
+      for (const n of [0, 1, pt.numElements]) {
+        assert.throws(() => pt.fill(37, n), /unsupported parallelism/);
+      }
+      po.synchronize();
+      for (const shard of pt.shards) {
+        assert.deepEqual(shard.readInt32LEArray(), Array(shard.numElements).fill(-123));
+      }
+    }
+  });
+
   it("arange on Replicated I32 tensor", () => {
     const count = 8;
     const pt = ws.alloc([count], "I32", undefined, TensorParallelism.Replicated) as ParallelTensor;

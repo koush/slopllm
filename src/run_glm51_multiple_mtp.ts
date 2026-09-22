@@ -3,15 +3,13 @@ import fs from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import { type ChatCache, type ChatModel, type Tokenizer } from "./chat_model";
 import { type DeviceOps } from "./device_ops";
-import { executePlan, ExecutionWorkspace } from "./execution-workspace";
+import { ExecutionWorkspace } from "./execution-workspace";
 import { Glm51Model } from "./glm51_model";
 import { type GlmOps } from "./glm_ops";
 import { createDeviceOps, loadModel, type ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { MtpStats } from "./mtp_stats";
 import { ParallelOps } from "./parallel_ops";
 import { profilerStart, profilerStop } from "./native-addon";
-import { type Tensor } from "./tensor";
-import { UsingHolder } from "./using-holder";
 
 const PROMPTS = [
   "tell me about india",
@@ -121,6 +119,9 @@ function parseArgs(argv: string[]): Args {
   if (!args.useGlm51 || (!args.mtp && !args.noMtp)) {
     throw new Error("run_glm51_multiple_mtp requires --glm51 and either --mtp or --no-mtp");
   }
+  if (args.noMtp) {
+    args.mtp = false;
+  }
   if (args.contextLen !== undefined) {
     args.maxSeqLen = Math.max(args.maxSeqLen, args.contextLen + args.maxNewTokens);
     const requiredPages = args.file && args.batchSize > 1
@@ -211,7 +212,7 @@ function freeResources(model: ChatModel | undefined, cache: ChatCache | undefine
   if (cleanupError) throw cleanupError;
 }
 
-async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args, captureManager: CaptureManager): Promise<void> {
+async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCache, args: Args, captureManager: CaptureManager): Promise<void> {
   const { prompts, inputIds } = prepareInputs(model.tokenizer, args);
   const longestPrompt = Math.max(...inputIds.map(ids => ids.length));
   if (longestPrompt + args.maxNewTokens > args.maxSeqLen) {
@@ -223,74 +224,56 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOp
 
   if (args.file) {
     const prefillStarted = performance.now();
-    let offset = 0;
-    while (inputIds[0].length - offset > PREFILL_CHUNK_SIZE) {
-      const chunkIds = inputIds[0].slice(offset, offset + PREFILL_CHUNK_SIZE);
-      const nextToken = inputIds[0][offset + PREFILL_CHUNK_SIZE];
-      await executePlan(captureManager, ws, model.planPrefillMtpChunk(ws, cache, [chunkIds], [nextToken]));
-      cache.reportTokens(0, chunkIds);
-      offset += chunkIds.length;
+    let remaining = [inputIds[0]];
+    while (remaining[0].length > PREFILL_CHUNK_SIZE) {
+      const result = await model.executePrefill(ws, cache, remaining, captureManager, PREFILL_CHUNK_SIZE);
+      remaining = result.remainingInputIdsList;
     }
-    console.log(`Prefilled ${offset} tokens in ${((performance.now() - prefillStarted) / 1000).toFixed(1)}s before final draft extension.`);
+    const offset = inputIds[0].length - remaining[0].length;
+    console.log(`Prefilled ${offset} tokens in ${((performance.now() - prefillStarted) / 1000).toFixed(1)}s before final prefill.`);
   }
 
   const suffixIds = sharePrefill || args.file
     ? [cache.prefixMatch(0, inputIds[0])]
     : inputIds.map((ids, batch) => cache.prefixMatch(batch, ids));
-  const mtpInputIds = model.prepareMtpInput(cache, suffixIds);
-
-  let currentTokens: number[];
-  {
-    const state = ws.planPrefill(model, mtpInputIds.length, mtpInputIds.map(ids => ids.length), cache);
-    state.setInput(mtpInputIds);
-    using slots = new UsingHolder<Tensor>(undefined!);
-    using slotsLength = new UsingHolder<Tensor>(undefined!);
-    using hidden = model.forwardModel(state, slots, slotsLength);
-    using logits = state.computeLogits(hidden, model);
-    using selected = logits.argmax();
-    currentTokens = selected.readInt32LEArray();
-    // Populate shifted MTP KV during prefill, but hand no hidden/slot tensors
-    // to decode. The generator establishes its own conditioning on entry.
-    using rotated = state.input!.rotateInputIds(state.qoIndptrD, selected, mtpInputIds.length);
-    state.setInput(rotated);
-    using mtpHidden = model.forwardMtp(state, hidden, slots, slotsLength);
-    await glm.synchronizeAsync();
+  let remaining = suffixIds;
+  while (remaining.some(ids => ids.length)) {
+    const result = await model.executePrefill(ws, cache, remaining, captureManager, PREFILL_CHUNK_SIZE);
+    remaining = result.remainingInputIdsList;
   }
-  ws.clearTracking();
-  if (sharePrefill) currentTokens = Array(args.batchSize).fill(currentTokens[0]);
-  const generated = currentTokens.map(token => [token]);
-  const finished = currentTokens.map(token => (!args.ignoreEos && model.eosIds.has(token)) || args.maxNewTokens === 1);
-  const mtpStats = new MtpStats(args.mtpDraftTopk.length);
+  const generated: number[][] = Array.from({ length: args.batchSize }, () => []);
+  const finished = Array(args.batchSize).fill(args.maxNewTokens === 0);
+  const mtpStats = args.noMtp ? undefined : new MtpStats(args.mtpDraftTopk.length);
   let firstPostWarmupTime = 0;
   let lastTokenTime = 0;
   let postWarmupTokenCount = 0;
 
-  cache.reportTokens(0, suffixIds[0]);
-  cache.reportTokens(0, [currentTokens[0]]);
   if (sharePrefill) {
     for (let batch = 1; batch < args.batchSize; batch++) {
       cache.getPagedKV().copySequence(batch, 0);
     }
-  } else {
-    for (let batch = 1; batch < args.batchSize; batch++) {
-      cache.reportTokens(batch, suffixIds[batch]);
-      cache.reportTokens(batch, [currentTokens[batch]]);
-    }
   }
 
   const started = performance.now();
+  if (args.maxNewTokens > 0) {
+    cache.getPagedKV().sequences.forEach((sequence, batch) => {
+      const token = sequence.targetToken!;
+      generated[batch].push(token);
+      finished[batch] = (!args.ignoreEos && model.eosIds.has(token)) || generated[batch].length >= args.maxNewTokens;
+    });
+  }
   if (!finished.some(Boolean)) {
-    for await (const step of model.generateMtpDecode(ws, cache, currentTokens, args.mtpDraftTopk, captureManager)) {
+    const generator = args.noMtp
+      ? model.generateDecode(ws, cache, captureManager)
+      : model.generateMtpDecode(ws, cache, args.mtpDraftTopk, captureManager);
+    for await (const step of generator) {
       const { warmup, tokens: stepTokens, numAccepted, numDraftTokens } = step;
-      if (!warmup) {
+      if (!warmup && mtpStats) {
         for (const count of numAccepted) mtpStats.observe(numDraftTokens, count);
       }
 
       for (let batch = 0; batch < args.batchSize; batch++) {
-        const reportedTokens: number[] = [];
         for (const token of stepTokens[batch]) {
-          currentTokens[batch] = token;
-          reportedTokens.push(token);
           generated[batch].push(token);
 
           const now = performance.now();
@@ -308,7 +291,6 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOp
             break;
           }
         }
-        cache.reportTokens(batch, reportedTokens);
       }
       if (finished.some(Boolean)) break;
     }
@@ -326,87 +308,9 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOp
     console.log(model.tokenizer.decode(visibleTokens, { skip_special_tokens: true }));
   }
   console.log(`\ndecode=${decodeTokPerSec.toFixed(1)} tok/s`);
-  console.log(mtpStats.log() || "MTP metrics: no post-warmup drafts");
-}
-
-async function runBatchWithoutMtp(model: Glm51Model, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache, args: Args, captureManager: CaptureManager): Promise<void> {
-  const { prompts, inputIds } = prepareInputs(model.tokenizer, args);
-  const longestPrompt = Math.max(...inputIds.map(ids => ids.length));
-  if (longestPrompt + args.maxNewTokens > args.maxSeqLen) {
-    throw new Error(`Prompt plus generation budget exceeds --max-seq-len (${longestPrompt} + ${args.maxNewTokens} > ${args.maxSeqLen})`);
+  if (mtpStats) {
+    console.log(mtpStats.log() || "MTP metrics: no post-warmup drafts");
   }
-
-  const sharePrefill = args.file !== undefined && args.batchSize > 1;
-  cache.reset(sharePrefill ? 1 : args.batchSize);
-  const suffixIds = sharePrefill
-    ? [cache.prefixMatch(0, inputIds[0])]
-    : inputIds.map((ids, batch) => cache.prefixMatch(batch, ids));
-  const prefillState = ws.planPrefill(model, suffixIds.length, suffixIds.map(ids => ids.length), cache);
-  prefillState.setInput(suffixIds);
-  let currentTokens: number[];
-  {
-    using hiddenStates = model.forward(prefillState);
-    using logits = prefillState.computeLogits(hiddenStates, model);
-    using selected = logits.argmax();
-    currentTokens = selected.readInt32LEArray();
-  }
-  await glm.synchronizeAsync();
-  ws.clearTracking();
-  if (sharePrefill) currentTokens = Array(args.batchSize).fill(currentTokens[0]);
-
-  const generated = currentTokens.map(token => [token]);
-  const finished = currentTokens.map(token => (!args.ignoreEos && model.eosIds.has(token)) || args.maxNewTokens === 1);
-  cache.reportTokens(0, suffixIds[0]);
-  cache.reportTokens(0, [currentTokens[0]]);
-  if (sharePrefill) {
-    for (let batch = 1; batch < args.batchSize; batch++) {
-      cache.getPagedKV().copySequence(batch, 0);
-    }
-  } else {
-    for (let batch = 1; batch < args.batchSize; batch++) {
-      cache.reportTokens(batch, suffixIds[batch]);
-      cache.reportTokens(batch, [currentTokens[batch]]);
-    }
-  }
-
-  let firstPostWarmupTime = 0;
-  let lastTokenTime = 0;
-  let postWarmupTokenCount = 0;
-  const started = performance.now();
-
-  if (!finished.some(Boolean)) for await (const step of model.generateDecode(ws, cache, currentTokens, captureManager)) {
-    currentTokens = step.tokens.map(tokens => tokens[0]);
-    const postWarmup = !step.warmup;
-
-    for (let batch = 0; batch < args.batchSize; batch++) {
-      const token = currentTokens[batch];
-      generated[batch].push(token);
-      cache.reportTokens(batch, [token]);
-      if (postWarmup) {
-        const now = performance.now();
-        if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
-        lastTokenTime = now;
-        postWarmupTokenCount++;
-      }
-      if ((!args.ignoreEos && model.eosIds.has(token)) || generated[batch].length >= args.maxNewTokens) {
-        finished[batch] = true;
-      }
-    }
-    if (finished.some(Boolean)) break;
-  }
-
-  const elapsed = (performance.now() - started) / 1000;
-  const decodeTokPerSec = postWarmupTokenCount > 1 && firstPostWarmupTime > 0
-    ? postWarmupTokenCount / ((lastTokenTime - firstPostWarmupTime) / 1000)
-    : 0;
-  console.log(`Stopped when batch ${finished.findIndex(Boolean) + 1} completed after ${elapsed.toFixed(1)}s.`);
-  for (let batch = 0; batch < args.batchSize; batch++) {
-    const visibleTokens = generated[batch].filter(token => !model.eosIds.has(token));
-    console.log(`\n--- Prompt ${batch + 1} ---\n${prompts[batch]}`);
-    console.log(`\n--- Response ${batch + 1} (${visibleTokens.length} tokens) ---`);
-    console.log(model.tokenizer.decode(visibleTokens, { skip_special_tokens: true }));
-  }
-  console.log(`\ndecode=${decodeTokPerSec.toFixed(1)} tok/s`);
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -440,7 +344,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       await glm.synchronizeAsync();
       if (profiling) profilerStart();
       try {
-        await (args.noMtp ? runBatchWithoutMtp : runBatch)(model, ws, glm, cache, args, captureManager);
+        await runBatch(model, ws, cache, args, captureManager);
       } finally {
         // Drain every GPU before ending collection, including on a failed run.
         try { await glm.synchronizeAsync(); }

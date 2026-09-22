@@ -336,7 +336,8 @@ export class GlmTensor extends Tensor {
   }
 
   fill(value: number, n: number): void {
-    getNativeAddon().fill(this.glm.ctx, this.data, value, n);
+    super.fill(value, n);
+    getNativeAddon().fill(this.glm.ctx, this.data, value, n, this.type);
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {

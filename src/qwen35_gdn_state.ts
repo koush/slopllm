@@ -6,7 +6,6 @@ import { WorkspaceBase } from "./workspace";
 export class Qwen35GdnState extends WorkspaceBase {
   convState: Tensor[];
   recurrentState: Tensor[];
-  cuSeqlens: Tensor;
   private cfg: Qwen35Config;
   readonly batchSize: number;
 
@@ -31,7 +30,6 @@ export class Qwen35GdnState extends WorkspaceBase {
         this.recurrentState.push(null!);
       }
     }
-    this.cuSeqlens = this.alloc([batchSize + 1], "I32", "cuSeqlens");
     this.zeroStates();
   }
 
@@ -44,19 +42,10 @@ export class Qwen35GdnState extends WorkspaceBase {
     const fullRecurrentStateSize = fullLinHeads * linKDim * linVDim;
     for (let i = 0; i < this.cfg.numHiddenLayers; i++) {
       if (this.cfg.layerTypes[i] === "linear_attention") {
-        this.recurrentState[i].fill(0, 2 * this.batchSize * fullRecurrentStateSize);
+        this.recurrentState[i].fill(0, this.batchSize * fullRecurrentStateSize);
         this.convState[i].fill(0, this.batchSize * fullConvStateSize);
       }
     }
-  }
-
-  uploadCuSeqlens(seqLens: number[]): void {
-    const cu = new Int32Array(this.batchSize + 1);
-    cu[0] = 0;
-    for (let i = 0; i < this.batchSize; i++) {
-      cu[i + 1] = cu[i] + seqLens[i];
-    }
-    this.cuSeqlens.h2d(Buffer.from(cu.buffer, cu.byteOffset, cu.byteLength));
   }
 
   reset(): void {

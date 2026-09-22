@@ -559,7 +559,12 @@ export abstract class Tensor implements Disposable {
     if (gate.type !== this.type) throw new Error(`gateSigmoidMul: gate type ${gate.type} != output type ${this.type}`);
   }
 
-  abstract fill(value: number, n: number): void;
+  /** Fill the first n elements, converting value to this tensor's dtype. */
+  fill(value: number, n: number): void {
+    if (!Number.isSafeInteger(n) || n < 0 || n > this.numElements || n > 0x7fffffff) {
+      throw new Error(`fill: invalid element count ${n} for tensor with ${this.numElements} elements`);
+    }
+  }
   abstract mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void>;
   abstract mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void>;
   abstract memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void>;

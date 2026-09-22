@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ChatCache, ChatTemplateKwargs, MtpDecodeStepResult, PhasedPrefillPlan, TokenSelector } from "./chat_model";
+import type { ChatCache, ChatTemplateKwargs, MtpDecodeStepResult, ChunkedPrefillPlan, TokenSelector } from "./chat_model";
 import { EagerExecution, type ExecutionManager } from "./execution-manager";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, MaskMode, TensorParallelism } from "./device_ops";
-import { executionPhase, type ExecutionPlan, ExecutionState, ExecutionWorkspace } from "./execution-workspace";
+import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { MemcpyKind } from "./enums";
 import { BF16, f32ToBf16Bytes, I32 } from "./glm_ops";
 import { GlmParser } from "./glm-parser";
@@ -537,41 +537,6 @@ export class Glm51Model extends ChatModel {
     return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim, sharedLayers);
   }
 
-  prepareMtpInput(cache: ChatCache, inputIdsList: number[][]): number[][] {
-    const input = super.prepareMtpInput(cache, inputIdsList);
-    if (!this.mtp) {
-      return input;
-    }
-
-    const sequences = cache.getPagedKV().sequences;
-    if (sequences.length !== input.length) {
-      throw new Error(`prepareMtpInput: cache has ${sequences.length} sequences, received ${input.length} inputs`);
-    }
-
-    for (let i = 0; i < input.length; i++) {
-      const sequence = sequences[i];
-      const tokenIds = sequence.getTokenIds();
-      const reportedLen = tokenIds.length;
-      if (reportedLen === 0) {
-        continue;
-      }
-
-      let previousToken: number;
-      if (reportedLen === sequence.allocLen + 1) {
-        // The sampled token is reported but has not passed through the target
-        // model yet. It is already the overlap token for this prefill.
-        previousToken = tokenIds[sequence.allocLen];
-      } else if (reportedLen === sequence.allocLen && sequence.allocLen > 0) {
-        previousToken = tokenIds[sequence.allocLen - 1];
-        sequence.truncate(sequence.allocLen - 1);
-      } else {
-        throw new Error(`prepareMtpInput: sequence ${i} has allocLen ${sequence.allocLen} but ${reportedLen} reported tokens`);
-      }
-      input[i].unshift(previousToken);
-    }
-    return input;
-  }
-
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
     return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`));
   }
@@ -702,6 +667,7 @@ export class Glm51Model extends ChatModel {
       idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
       return idxWeights;
     });
+    using _idxWeights = idxWeightsStream?.result;
 
     using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
     yield;
@@ -989,138 +955,147 @@ export class Glm51Model extends ChatModel {
     return this.runPhased(this.forwardMtpPhased(state, previousHiddenState, sharedSlots, sharedSlotsLength));
   }
 
-  *planPrefillMtpChunk(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void> {
-    const sequences = cache.getPagedKV().sequences.slice();
-    const originalAllocLens = sequences.map(sequence => sequence.allocLen);
-    let completed = false;
-    // The phased plan completes at enqueue; the chunk path only commits after
-    // executePlan's post-phase synchronize succeeds. Registered before the
-    // plan so planning-time throws unwind through it.
-    using _rollback = {
-      [Symbol.dispose]: () => {
-        if (!completed) {
-          for (let batch = 0; batch < sequences.length; batch++) {
-            sequences[batch].truncate(originalAllocLens[batch]);
-          }
-        }
-      },
-    };
-    using plan = this.planPrefillMtpChunkPhased(ws, cache, inputIds, nextTokens);
-    yield* executionPhase({
-      states: [plan.state],
-      inputs: {},
-      captureKey: [],
-      timingName: "prefill_chunk",
-      run: () => {
-        using _mtpHidden = this.runPhased(plan.generator);
-        return undefined;
-      },
-    });
-    completed = true;
+  private rewindMtpDecodeInput(cache: ChatCache): number[] {
+    const sequences = cache.getPagedKV().sequences;
+    if (!sequences.length || sequences.some(sequence => !sequence.allocLen
+      || sequence.reportedTokenCount() !== sequence.allocLen)) {
+      throw new Error("MTP decode requires a non-empty committed prefix for every sequence");
+    }
+    for (const sequence of sequences) {
+      sequence.truncate(sequence.allocLen - 1);
+    }
+    return sequences.map(sequence => sequence.targetToken!);
   }
 
-  planPrefillMtpChunkPhased(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): PhasedPrefillPlan {
-    if (!this.mtp || inputIds.length !== nextTokens.length || inputIds.some(ids => ids.length === 0)) {
-      throw new Error("Phased MTP chunk prefill requires non-empty inputs and one next token per sequence");
-    }
-    const batchSize = inputIds.length;
-    const sequences = cache.getPagedKV().sequences.slice();
-    const originalAllocLens = sequences.map(sequence => sequence.allocLen);
-    let completed = false;
-    const rollback = () => {
-      if (completed) return;
-      for (let batch = 0; batch < batchSize; batch++) {
-        sequences[batch].truncate(originalAllocLens[batch]);
+  protected override planPhasedPrefill(ws: ExecutionWorkspace, cache: ChatCache,
+    inputIdsList: readonly number[][],
+    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ChunkedPrefillPlan {
+    const self = this;
+    const plan = super.planPhasedPrefill(ws, cache, inputIdsList, samplingPolicy, function* (state, nextState) {
+      if (!self.mtp) {
+        return yield* self.forwardPhased(state);
       }
-      completed = true;
-    };
-    const state = ws.planPrefill(this, batchSize, inputIds.map(ids => ids.length), cache);
-    state.setInput(inputIds);
-    const model = this;
+      using slots = new UsingHolder<Tensor>(undefined!);
+      using slotsLength = new UsingHolder<Tensor>(undefined!);
+      using hidden = yield* self.forwardPhased(state, slots, slotsLength);
 
-    function* forward(): Generator<void, Tensor, void> {
+      // The next prefill overlap recomputes each terminal boundary, so a placeholder suffices.
+      using boundary = ws.alloc([state.batchSize], "I32");
+      boundary.fill(0, state.batchSize);
+
+      // A's crossing sequence needs B's actual first token because there is no overlap between halves.
+      if (nextState) {
+        const crossing = state.seqLens.findIndex((length, index) => length > 0 && nextState.seqLens[index] > 0);
+        if (crossing >= 0) {
+          boundary.memcpy2d(crossing * I32, I32, nextState.inputIdsBuf, 0, I32,
+            I32, 1, MemcpyKind.DeviceToDevice);
+        }
+      }
+      using rotated = state.input!.rotateInputIds(state.qoIndptrD, boundary, state.batchSize);
+      state.setInput(rotated);
+      using mtpHidden = self.forwardMtp(state, hidden, slots, slotsLength);
+      return hidden.viewClone();
+    });
+    const [stateA, stateB] = plan.states;
+    const generator = plan.generator;
+    plan.generator = (function* () {
+      // Both chunks patch the same prefetched buffers before B consumes them.
+      const installPrefetch = (cacheIdx: number, field: string, stream: unknown) => {
+        const key = `sparseMlaPrefetchLayer_${cacheIdx}`;
+        const extra = stateB.extras.get(key) ?? {};
+        extra[field] = stream;
+        stateB.extras.set(key, extra);
+      };
+      stateA.extras.set("setCkv", (cacheIdx: number, stream: unknown) => installPrefetch(cacheIdx, "stream", stream));
+      stateA.extras.set("setIndexerK", (cacheIdx: number, stream: unknown) => installPrefetch(cacheIdx, "indexerStream", stream));
       try {
-        using sharedSlots = new UsingHolder<Tensor>(undefined!);
-        using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
-        using hiddenStates = yield* model.forwardPhased(state, sharedSlots, sharedSlotsLength);
-        using nextHost = ws.allocPinned([batchSize], "I32");
-        nextHost.withPinnedBuffer(buf => {
-          for (let batch = 0; batch < batchSize; batch++) {
-            buf.writeInt32LE(nextTokens[batch], batch * I32);
-          }
-        });
-        using nextDevice = ws.alloc([batchSize], "I32");
-        nextDevice.memcpy(nextHost, batchSize * I32, MemcpyKind.HostToDevice);
-        using rotatedInput = state.input!.rotateInputIds(state.qoIndptrD, nextDevice, batchSize);
-        state.setInput(rotatedInput);
-        const mtpHidden = yield* model.forwardMtpPhased(state, hiddenStates, sharedSlots, sharedSlotsLength);
-        completed = true;
-        return mtpHidden;
+        return yield* generator;
       } finally {
-        if (!completed) rollback();
+        stateA.extras.delete("setCkv");
+        stateA.extras.delete("setIndexerK");
       }
-    }
-
-    return { state, generator: forward(), [Symbol.dispose]: rollback };
+    })();
+    return plan;
   }
 
-  *planPrefillMtp(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ExecutionPlan<{ targetTokens: number[] }> {
-    if (!this.mtp || !inputIds.length || inputIds.some(ids => !ids.length)) {
-      throw new Error("MTP prefill requires an MTP-enabled model and non-empty inputs");
+  override planChunkedPrefill(
+    ws: ExecutionWorkspace, cache: ChatCache,
+    inputIdsList: readonly number[][], chunkSize = 8192,
+    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
+  ): ChunkedPrefillPlan {
+    if (!this.mtp) {
+      return super.planChunkedPrefill(ws, cache, inputIdsList, chunkSize, samplingPolicy);
     }
-    const batchSize = inputIds.length;
-    const sequences = cache.getPagedKV().sequences.slice();
-    const originalLens = sequences.map(sequence => sequence.allocLen);
-    let completed = false;
-    const prefillState = ws.planPrefill(this, batchSize, inputIds.map(ids => ids.length), cache);
-    prefillState.setInput(inputIds);
-    using _rollback = {
-      [Symbol.dispose]: () => {
-        if (!completed) {
-          for (let batch = 0; batch < batchSize; batch++) {
-            sequences[batch].truncate(originalLens[batch]);
-          }
-        }
-      },
-    };
-    using selected = yield* executionPhase({
-      states: [prefillState],
-      inputs: {},
-      captureKey: [],
-      timingName: "prefill",
-      run: () => {
-        using sharedSlots = new UsingHolder<Tensor>(undefined!);
-        using sharedSlotsLength = new UsingHolder<Tensor>(undefined!);
-        using hiddenStates = this.forwardModel(prefillState, sharedSlots, sharedSlotsLength);
-        using logits = prefillState.computeLogits(hiddenStates, this);
-        const target = samplingPolicy.selectTarget(logits);
-        using rotatedInput = prefillState.input!.rotateInputIds(prefillState.qoIndptrD, target, batchSize);
-        prefillState.setInput(rotatedInput);
-        using mtpHidden = this.forwardMtp(prefillState, hiddenStates, sharedSlots, sharedSlotsLength);
-        return target;
-      },
+    const sequences = cache.getPagedKV().sequences;
+    if (sequences.length !== inputIdsList.length) {
+      throw new Error("Chunked MTP prefill requires one input row per cached sequence");
+    }
+    const overlaps = sequences.map((sequence, index) => {
+      if (!inputIdsList[index].length) return undefined;
+      if (sequence.reportedTokenCount() !== sequence.allocLen) {
+        throw new Error(`Chunked MTP prefill requires committed history for sequence ${index}`);
+      }
+      return sequence.getTokenIds().at(-1);
     });
-    const targetTokens = selected.readInt32LEArray();
-    completed = true;
-    return { targetTokens };
+    const chunk = this.selectPrefillChunk(inputIdsList, chunkSize, overlaps);
+    // Only selected rows rewind; deferred rows retain their cache and history.
+    for (let i = 0; i < sequences.length; i++) {
+      if (chunk.prefillInputIdsList[i].length && overlaps[i] !== undefined) {
+        sequences[i].truncate(sequences[i].allocLen - 1);
+      }
+    }
+    const plan = this.planPrefillChunk(ws, cache, chunk.prefillInputIdsList, samplingPolicy);
+    plan.remainingInputIdsList = chunk.remainingInputIdsList;
+    return plan;
+  }
+
+  protected override planPrefillChunk(
+    ws: ExecutionWorkspace, cache: ChatCache,
+    inputIdsList: readonly number[][],
+    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
+  ): ChunkedPrefillPlan {
+    if (!this.mtp || !inputIdsList.some(ids => ids.length)) {
+      return super.planPrefillChunk(ws, cache, inputIdsList, samplingPolicy);
+    }
+    const input = inputIdsList;
+    if (input.length === 1 && process.env.GLM_PHASED_PREFILL !== "0"
+      && input.reduce((sum, ids) => sum + ids.length, 0) >= 4096) {
+      return this.planPhasedPrefill(ws, cache, input, samplingPolicy);
+    }
+    const batchSize = input.length;
+    const state = ws.planPrefill(this, batchSize, input.map(ids => ids.length), cache);
+    state.setInput(input);
+    const self = this;
+    return this.createChunkedPrefillPlan([state], cache, input, (function* () {
+        using slots = new UsingHolder<Tensor>(undefined!);
+        using slotsLength = new UsingHolder<Tensor>(undefined!);
+        using hidden = yield* self.forwardPhased(state, slots, slotsLength);
+        using logits = state.computeLogits(hidden, self);
+        using selected = samplingPolicy.selectTarget(logits);
+        using boundary = ws.alloc([batchSize], "I32");
+        boundary.fill(0, batchSize);
+        using rotated = state.input!.rotateInputIds(state.qoIndptrD, boundary, batchSize);
+        state.setInput(rotated);
+        using mtpHidden = self.forwardMtp(state, hidden, slots, slotsLength);
+        return selected.readInt32LEArray();
+      })());
   }
 
   /** Owns the draft/verification intermediates until the caller breaks the loop.
-   * targetTokens are the reported boundary tokens, one position beyond committed KV.
    * Prefill must have populated both target and shifted MTP KV. Batch changes
    * require closing this generator and starting a new one to recondition.
-   * The first yield consumes the boundary token and reports one new target token
-   * with numDraftTokens=0; later yields are complete draft/verification steps. */
+    * Startup replays the last committed token conditioned on the caller-published
+    * pending target; every yield is a complete draft/verification step. */
   async *generateMtpDecode(
     ws: ExecutionWorkspace, cache: ChatCache,
-    targetTokens: readonly number[], topks: readonly number[],
+    topks: readonly number[],
     executionManager: ExecutionManager = new EagerExecution(),
     samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
   ): AsyncGenerator<MtpDecodeStepResult, void, void> {
-    const batchSize = targetTokens.length;
     const pagedKV = cache.getPagedKV();
     const sequences = pagedKV.sequences.slice();
-    if (!this.mtp || !batchSize || sequences.length !== batchSize || !topks.length
+    const batchSize = sequences.length;
+    if (!this.mtp || !batchSize || !topks.length
         || topks.some(k => !Number.isInteger(k) || k < 1)) {
       throw new Error("MTP decode requires an MTP model, a non-empty matching batch, and positive draft widths");
     }
@@ -1148,8 +1123,9 @@ export class Glm51Model extends ChatModel {
     const draftDevice = sampled ? ws.ensureAlloc([batchSize, numTreeNodes], "I32", `${key}_draft`) : undefined;
     const seedRows = ws.ensureAlloc([batchSize], "I32", `${key}_seed_rows`);
     const seedRowsHost = ws.ensureAllocPinned([batchSize], "I32", `${key}_seed_rows_host`);
+    let nextTargets = await this.prepareDecodeInput(ws, cache, samplingPolicy);
+    const initialTargets = this.rewindMtpDecodeInput(cache);
     let committedLens = sequences.map(sequence => sequence.allocLen);
-    let nextTargets = [...targetTokens];
     let nextSeedRows = sequences.map((_, batch) => batch);
     let speculative = false;
 
@@ -1160,21 +1136,16 @@ export class Glm51Model extends ChatModel {
       using slots = new UsingHolder<Tensor>(undefined!);
       using slotsLength = new UsingHolder<Tensor>(undefined!);
 
-      // Consume the outstanding boundary token to establish new conditioning.
-      // Do not recompute/overwrite the last committed KV row: it may be shared,
-      // and its original prefill used a different floating-point kernel shape.
+      // Replay the last committed token and replace its temporary MTP boundary.
       ws.assertClear(seed.value);
       ws.clearTracking(seed.value);
       speculative = true;
       {
         const state = ws.planPrefill(this, batchSize, Array(batchSize).fill(1), cache);
-        state.setInput(nextTargets.map(token => [token]));
+        state.setInput(initialTargets.map(token => [token]));
         using initialSlots = new UsingHolder<Tensor>(undefined!);
         using initialSlotsLength = new UsingHolder<Tensor>(undefined!);
         using hidden = this.forwardModel(state, initialSlots, initialSlotsLength);
-        using logits = state.computeLogits(hidden, this);
-        using selected = samplingPolicy.selectTarget(logits);
-        nextTargets = selected.readInt32LEArray();
         state.setInput(nextTargets.map(token => [token]));
         using initialSeed = this.forwardMtp(state, hidden, initialSlots, initialSlotsLength);
         seed.value.memcpy(initialSeed, initialSeed.bytes, MemcpyKind.DeviceToDevice);
@@ -1186,12 +1157,11 @@ export class Glm51Model extends ChatModel {
         }
         await this.glm.synchronizeAsync();
       }
+      initialTargets.forEach((token, batch) => cache.reportTokens(batch, [token], nextTargets[batch]));
       committedLens = sequences.map(sequence => sequence.allocLen);
       speculative = false;
       ws.assertClear([seed.value, slots.value, slotsLength.value]);
       ws.clearTracking([seed.value, slots.value, slotsLength.value]);
-      yield { tokens: nextTargets.map(token => [token]), numAccepted: Array(batchSize).fill(0), numDraftTokens: 0, warmup: true };
-
       while (true) {
         ws.assertClear([seed.value, slots.value, slotsLength.value]);
         ws.clearTracking([seed.value, slots.value, slotsLength.value]);
@@ -1409,6 +1379,9 @@ export class Glm51Model extends ChatModel {
           for (const layer of layers) { layer.appendCkv[Symbol.dispose](); layer.appendKpe[Symbol.dispose](); }
           for (const layer of indexers) layer.appendIdxK[Symbol.dispose]();
         }
+        // Only the committed verification inputs belong to cache history, not the replacement.
+        acceptedNodes.forEach((nodes, batch) => cache.reportTokens(batch,
+          nodes.map(node => inputBuf.readInt32LE((batch * numVerificationTokens + node) * I32)), nextTargets[batch]));
         committedLens = sequences.map(sequence => sequence.allocLen);
         speculative = false;
         ws.assertClear([seed.value, slots.value, slotsLength.value]);

@@ -163,10 +163,11 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
       let numTokens = 0;
       if (hasPenalty && maxWindow > 0) {
         const history = tokenHistories[i];
-        const seen = new Set<number>();
+        // Preserve token positions for ring eviction; the kernel deduplicates
+        // only when applying penalties.
         const start = Math.max(0, history.length - maxWindow);
-        for (let j = start; j < history.length; j++) seen.add(history[j]);
-        for (const tid of seen) {
+        for (let j = start; j < history.length; j++) {
+          const tid = history[j];
           if (tid < vs) {
             penaltyBuf.writeInt32LE(tid, (i * maxWindow + numTokens) * I32);
             numTokens++;

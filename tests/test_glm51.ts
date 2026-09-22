@@ -4,13 +4,12 @@ import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { CaptureManager } from "../src/capture-manager";
 import type { ChatCache, ChatModel, TokenSelector, SamplingParams } from "../src/chat_model";
 import type { DeviceOps } from "../src/device_ops";
-import { executePlan, ExecutionWorkspace } from "../src/execution-workspace";
+import { ExecutionWorkspace } from "../src/execution-workspace";
 import { Glm51Model } from "../src/glm51_model";
 import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { ParallelOps } from "../src/parallel_ops";
 import { Tensor } from "../src/tensor";
 import { PAGE_SIZE } from "../src/paged_kv";
-import { PhasedPrefillRunner, splitRaggedInput } from "../src/phased-prefill";
 import { SamplingWorkspace } from "../src/sampling";
 import { UsingHolder } from "../src/using-holder";
 import { WorkspaceBase } from "../src/workspace";
@@ -25,6 +24,13 @@ const SMALL_MODEL_DIR = path.resolve(
 
 function makeLongPrompt(length: number, prefix: number[] = [1, 2, 3]): number[] {
   return [...prefix, ...Array.from({ length: length - prefix.length }, (_, i) => 100 + i)];
+}
+
+function prefillTargets(cache: ChatCache): number[] {
+  return cache.getPagedKV().sequences.map(sequence => {
+    assert.notEqual(sequence.targetToken, undefined);
+    return sequence.targetToken!;
+  });
 }
 
 function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[], chunkSizes: number[]): number[] {
@@ -48,98 +54,54 @@ function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCac
   return argmaxOut.readInt32LEArray();
 }
 
-function assertPhasedRaggedMatches(model: Glm51Model, glm: DeviceOps, ws: ExecutionWorkspace): void {
-  const inputA = [[1, 2, 3], [11, 12]];
-  const inputB = [[4, 5], [21, 22, 23, 24]];
-
-  const run = (phased: boolean): { tokensA: number[]; tokensB: number[]; decode: number[] } => {
+async function assertBatchedPrefillMatches(model: Glm51Model, glm: DeviceOps, ws: ExecutionWorkspace): Promise<void> {
+  const prompts = [[1, 2, 3, 4, 5], [11, 12], [21, 22, 23, 24]];
+  const run = async (chunked: boolean) => {
     using cache = model.createChatCache(32, 3);
-    const pagedKV = cache.getPagedKV();
     cache.reset(3);
-    const [sequence0, sequence1, sequence2] = pagedKV.sequences;
-
-    // A runs rows 0/1. B then runs rows 0/2, matching the server chunker's
-    // selected/deferred row behavior while preserving each Sequence object.
-    pagedKV.stageSequence(2, 2);
-    let tokensA: number[] = undefined!;
-    let tokensB: number[] = undefined!;
-
-    if (phased) {
-      {
-        const runner = new PhasedPrefillRunner(model, glm);
-        const stateA = ws.planPrefill(model, 2, inputA.map(ids => ids.length), cache);
-        stateA.setInput(inputA);
-        sequence0.reportTokens(inputA[0]);
-        sequence1.reportTokens(inputA[1]);
-
-        pagedKV.stageSequence(1, 1);
-        pagedKV.unstageSequence(2);
-        const stateB = ws.planPrefill(model, 2, inputB.map(ids => ids.length), cache);
-        stateB.setInput(inputB);
-        sequence0.reportTokens(inputB[0]);
-        sequence2.reportTokens(inputB[1]);
-
-        runner.runPair(stateA, stateB, (pairedA, hiddenA, pairedB, hiddenB) => {
-          using logitsA = pairedA.computeLogits(hiddenA, model);
-          using logitsB = pairedB.computeLogits(hiddenB, model);
-          using argmaxA = logitsA.argmax();
-          using argmaxB = logitsB.argmax();
-          tokensA = argmaxA.readInt32LEArray();
-          tokensB = argmaxB.readInt32LEArray();
-        });
-      }
-      glm.synchronize();
+    if (chunked) {
+      assert.throws(() => model["planPhasedPrefill"](ws, cache, prompts), /batch size 1/);
+      const plan = model.planChunkedPrefill(ws, cache, prompts);
+      assert.deepEqual(plan.states.map(state => state.seqLens), [[5, 2, 4]]);
+      for (const _ of plan.generator) {}
+      await glm.synchronizeAsync();
+      plan.reportTokens();
       ws.assertClear();
+      ws.clearTracking();
     } else {
+      let targets: number[];
       {
-        const stateA = ws.planPrefill(model, 2, inputA.map(ids => ids.length), cache);
-        stateA.setInput(inputA);
-        using hiddenA = model.forward(stateA);
-        using logitsA = stateA.computeLogits(hiddenA, model);
-        using argmaxA = logitsA.argmax();
-        tokensA = argmaxA.readInt32LEArray();
+        const state = ws.planPrefill(model, prompts.length, prompts.map(ids => ids.length), cache);
+        state.setInput(prompts);
+        using hidden = model.forward(state);
+        using logits = state.computeLogits(hidden, model);
+        using selected = logits.argmax();
+        targets = selected.readInt32LEArray();
       }
-      sequence0.reportTokens(inputA[0]);
-      sequence1.reportTokens(inputA[1]);
-      glm.synchronize();
+      await glm.synchronizeAsync();
+      prompts.forEach((ids, batch) => cache.reportTokens(batch, ids, targets[batch]));
       ws.assertClear();
-
-      pagedKV.stageSequence(1, 1);
-      pagedKV.unstageSequence(2);
-      {
-        const stateB = ws.planPrefill(model, 2, inputB.map(ids => ids.length), cache);
-        stateB.setInput(inputB);
-        using hiddenB = model.forward(stateB);
-        using logitsB = stateB.computeLogits(hiddenB, model);
-        using argmaxB = logitsB.argmax();
-        tokensB = argmaxB.readInt32LEArray();
-      }
-      sequence0.reportTokens(inputB[0]);
-      sequence2.reportTokens(inputB[1]);
-      glm.synchronize();
-      ws.assertClear();
+      ws.clearTracking();
     }
-
-    // Restore the deferred A-only row. Active order is now 0/2/1.
-    pagedKV.unstageSequence(1);
-    const firstTokens = [tokensB[0], tokensB[1], tokensA[1]];
-    sequence0.reportTokens([firstTokens[0]]);
-    sequence2.reportTokens([firstTokens[1]]);
-    sequence1.reportTokens([firstTokens[2]]);
-    const decode = ws.forwardEagerDecode(model, firstTokens, cache);
-    glm.synchronize();
+    assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()), prompts);
+    const output: number[][][] = [];
+    for await (const step of model.generateDecode(ws, cache)) {
+      output.push(step.tokens);
+      if (output.length === 2) break;
+    }
     ws.assertClear();
-    return { tokensA, tokensB, decode };
+    return output;
   };
+  assert.deepEqual(await run(true), await run(false));
+}
 
-  // The server warms this workspace before serving requests. Establish the
-  // same allocator/recycle state before comparing the two execution modes.
-  run(false);
-  const sequential = run(false);
-  const phased = run(true);
-  assert.deepStrictEqual(phased.tokensA, sequential.tokensA, "A prefill tokens differ");
-  assert.deepStrictEqual(phased.tokensB, sequential.tokensB, "B prefill tokens differ");
-  assert.deepStrictEqual(phased.decode, sequential.decode, "decode tokens differ after phased prefill");
+async function prefillChunks(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCache,
+  input: number[][], manager: CaptureManager, samplingPolicy?: TokenSelector): Promise<{ targetTokens: number[] }> {
+  let remaining = input;
+  while (remaining.some(ids => ids.length)) {
+    remaining = (await model.executePrefill(ws, cache, remaining, manager, ws.maxSeqLen, samplingPolicy)).remainingInputIdsList;
+  }
+  return { targetTokens: cache.getPagedKV().sequences.map(sequence => sequence.targetToken!) };
 }
 
 describe("GLM-5.1 small model smoke test", () => {
@@ -147,14 +109,14 @@ describe("GLM-5.1 small model smoke test", () => {
   let model: Glm51Model;
   let ws: ExecutionWorkspace;
 
-  before(async () => {
+  beforeEach(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
     model = await Glm51Model.fromPretrained(glm, SMALL_MODEL_DIR);
     ws = new ExecutionWorkspace(glm, 3, 128);
   });
 
-  after(() => {
+  afterEach(() => {
     ws.free();
     model.free();
     glm.free();
@@ -186,6 +148,135 @@ describe("GLM-5.1 small model smoke test", () => {
     );
 
     cache.free();
+  });
+
+  it("planChunkedPrefill only interleaves single-sequence prompts", async () => {
+    using prefillWs = new ExecutionWorkspace(glm, 2, 4097);
+    using cache = model.createChatCache(128, 2, 4097);
+    for (const lengths of [[4097], [2049, 2048], [4095, 1], [1, 4095], [2048, 2048], [4096, 0], [0, 4096]]) {
+      cache.reset(lengths.length);
+      const plan = model.planChunkedPrefill(prefillWs, cache, lengths.map(length => makeLongPrompt(length).slice(0, length)));
+      assert.equal(plan.states.length, lengths.length === 1 ? 2 : 1);
+      if (lengths.length === 1) {
+        assert.equal(plan.states[0].totalTokens, Math.floor(lengths[0] / 2));
+        assert.notEqual(plan.states[0].inputIdsBuf.data, plan.states[1].inputIdsBuf.data);
+      } else {
+        assert.deepEqual(plan.states[0].seqLens, lengths);
+      }
+      assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.allocLen), lengths,
+        "planning appends each prompt exactly once");
+      plan.generator.return([]);
+      await glm.synchronizeAsync();
+      prefillWs.clearTracking();
+    }
+    // Exercise both paths with small inputs alongside resident model weights.
+    for (const lengths of [[9], [5, 4], [1, 8], [8, 1], [4, 5]]) {
+      const inputs = lengths.map((length, index) => makeLongPrompt(length, [index + 1, 2, 3]).slice(0, length));
+      const tail = inputs.map((_, index) => [7 + index]);
+      cache.reset(inputs.length);
+      prefillWs.forwardEagerPrefill(model, inputs, cache);
+      prefillWs.clearTracking();
+      const expected = prefillWs.forwardEagerPrefill(model, tail, cache);
+      prefillWs.clearTracking();
+
+      cache.reset(inputs.length);
+      const plan = inputs.length === 1 ? model["planPhasedPrefill"](prefillWs, cache, inputs)
+        : model.planChunkedPrefill(prefillWs, cache, inputs);
+      assert.equal(plan.states.length, inputs.length === 1 ? 2 : 1);
+      assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.allocLen), lengths,
+        "planning appends each prompt exactly once");
+      let phases = 0;
+      while (true) {
+        const step = plan.generator.next();
+        if (step.done) {
+          assert.equal(step.value, undefined);
+          await glm.synchronizeAsync();
+          break;
+        }
+        phases++;
+      }
+      assert.ok(phases > 0);
+      plan.reportTokens();
+      prefillWs.assertClear();
+      prefillWs.clearTracking();
+
+      await model.executePrefill(prefillWs, cache, tail);
+      assert.deepEqual(prefillTargets(cache), expected);
+      prefillWs.assertClear();
+      prefillWs.clearTracking();
+    }
+  });
+
+  it("executePrefill stays eager with a capture manager and reports plain inputs", async () => {
+    using prefillWs = new ExecutionWorkspace(glm, 1, 128);
+    using cache = model.createChatCache(32, 1);
+    using manager = new CaptureManager(glm);
+    for (const graphs of [false, true]) {
+      for (let run = 0; run < 7; run++) {
+        cache.reset(1);
+        const input = [1, 2, 3, run + 4];
+        const result = await model.executePrefill(prefillWs, cache, [input], graphs ? manager : undefined);
+        assert.equal("nextTokens" in result, false);
+        assert.deepEqual(cache.getPagedKV().sequences[0].getTokenIds(), input);
+        assert.equal(result.warmup, false);
+        assert.equal(manager.captured.size, 0);
+      }
+    }
+  });
+
+  it("plain generator consumers publish the prefill target exactly once", async () => {
+    using cache = model.createChatCache(32, 1);
+    const prompt = [1, 2, 3, 4];
+    cache.reset(1);
+    let current = ws.forwardEagerPrefill(model, [prompt], cache)[0];
+    cache.reportTokens(0, prompt, current);
+    const expected = [current];
+    for (let i = 1; i < 6; i++) {
+      const next = ws.forwardEagerDecode(model, [current], cache)[0];
+      cache.reportTokens(0, [current], next);
+      expected.push(next);
+      current = next;
+    }
+    for (const graphs of [false, true]) {
+      cache.reset(1);
+      const output: number[] = [];
+      for await (const token of generateStream(model, ws, glm, cache, prompt, 6, new Set(), undefined,
+        graphs ? { graphExec: null, warmupRemaining: 3 } : undefined)) {
+        output.push(token);
+      }
+      assert.deepEqual(output, expected);
+      assert.deepEqual(cache.getPagedKV().sequences[0].getTokenIds(), [...prompt, ...output.slice(0, -1)]);
+      assert.equal(cache.getPagedKV().sequences[0].targetToken, output.at(-1));
+    }
+    ws.assertClear();
+  });
+
+  it("plain chunked prefill returns selected inputs and unconsumed rows", async () => {
+    using cache = model.createChatCache(32, 2);
+    using prefillWs = new ExecutionWorkspace(glm, 2, 128);
+    cache.reset(2);
+    const inputs = [[1, 2, 3, 4, 5], [6, 7, 8]];
+    const first = await model.executePrefill(prefillWs, cache, inputs, undefined, 4);
+    assert.deepEqual(first.prefillInputIdsList, [[1, 2, 3, 4], []]);
+    assert.deepEqual(first.remainingInputIdsList, [[5], [6, 7, 8]]);
+    assert.deepEqual(cache.getPagedKV().sequences.map(s => s.getTokenIds()), [[1, 2, 3, 4], []]);
+    const last = await model.executePrefill(prefillWs, cache, first.remainingInputIdsList, undefined, 4);
+    assert.deepEqual(last.prefillInputIdsList, [[5], [6, 7, 8]]);
+    assert.deepEqual(last.remainingInputIdsList, [[], []]);
+    assert.deepEqual(cache.getPagedKV().sequences.map(s => s.getTokenIds()), inputs);
+  });
+
+  for (const phased of [false, true]) it(`prefill releases tensors when closed after its first yield (phased=${phased})`, async () => {
+    using prefillWs = new ExecutionWorkspace(glm, 1, 128);
+    using cache = model.createChatCache(32, 1, 128);
+    cache.reset(1);
+    const plan = phased
+      ? model["planPhasedPrefill"](prefillWs, cache, [makeLongPrompt(9)])
+      : model.planChunkedPrefill(prefillWs, cache, [makeLongPrompt(9)]);
+    assert.equal(plan.generator.next().done, false);
+    plan.generator.return([]);
+    await glm.synchronizeAsync();
+    prefillWs.assertClear();
   });
 
   it("decode step produces valid token after prefill", () => {
@@ -291,8 +382,8 @@ describe("GLM-5.1 small model smoke test", () => {
       `Chunked decode token mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
   });
 
-  it("phased prefill matches sequential prefill for different ragged row sets", () => {
-    assertPhasedRaggedMatches(model, glm, ws);
+  it("batched chunked prefill matches an independent sequential forward", async () => {
+    await assertBatchedPrefillMatches(model, glm, ws);
   });
 });
 
@@ -364,8 +455,8 @@ describe("GLM-5.1 small model with context parallelism", () => {
       `Chunked decode mismatch: chunked=${chunkedDecode}, full=${fullDecode}`);
   });
 
-  it("phased prefill matches sequential prefill for different ragged row sets", () => {
-    assertPhasedRaggedMatches(modelCp, po, wsCp);
+  it("batched chunked prefill matches an independent sequential forward", async () => {
+    await assertBatchedPrefillMatches(modelCp, po, wsCp);
   });
 });
 
@@ -395,28 +486,26 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
 
   it("splits a single sequence into balanced non-empty halves", () => {
     const input = [[1, 2, 3, 4, 5, 6, 7]];
-    const split = splitRaggedInput(input)!;
-    assert.equal(split.inputA[0].length, 3);
-    assert.equal(split.inputB[0].length, 4);
-    assert.deepStrictEqual(split.nextA, split.inputB.map(ids => ids[0]));
-    for (let i = 0; i < input.length; i++) {
-      assert.ok(split.inputA[i].length > 0);
-      assert.ok(split.inputB[i].length > 0);
-      assert.deepStrictEqual([...split.inputA[i], ...split.inputB[i]], input[i]);
-    }
-    assert.equal(splitRaggedInput([[1], [2, 3]]), undefined);
-    assert.equal(splitRaggedInput([[1, 2], [3, 4]]), undefined);
+    using cache = model.createChatCache(32, 1);
+    cache.reset(1);
+    const plan = model["planPhasedPrefill"](ws, cache, input);
+    assert.deepEqual(plan.states.map(state => state.seqLens), [[3], [4]]);
+    assert.deepEqual(plan.prefillInputIdsList, input);
+    plan.generator.return([]);
+    ws.clearTracking();
   });
 
-  it("rolls back an unstarted phased MTP plan", () => {
+  it("does not report an unstarted chunked MTP plan", () => {
     using cache = model.createChatCache(32, 1);
     cache.reset(1);
     const sequence = cache.getPagedKV().sequences[0];
 
-    const unstarted = model.planPrefillMtpChunkPhased(ws, cache, [[1, 2, 3, 4]], [5]);
+    const unstarted = model.planChunkedPrefill(ws, cache, [[1, 2, 3, 4]]);
     assert.equal(sequence.allocLen, 4);
-    unstarted[Symbol.dispose]();
-    assert.equal(sequence.allocLen, 0);
+    unstarted.generator.return([]);
+    assert.deepEqual(sequence.getTokenIds(), []);
+    cache.reset(1);
+    assert.equal(cache.getPagedKV().sequences[0].allocLen, 0);
     ws.resetPlanSlots();
   });
 
@@ -438,18 +527,25 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         using selected = logits.argmax();
         current = selected.readInt32LEArray();
       }
-      prompts.forEach((ids, batch) => cache.reportTokens(batch, [...ids, current[batch]]));
+      prompts.forEach((ids, batch) => cache.reportTokens(batch, ids, current[batch]));
       ws.clearTracking();
       const output: number[][] = [];
+      const histories = prompts.map(ids => [...ids]);
       let replayed = false;
       const record = (tokens: number[]) => {
         output.push([...tokens]);
+        if (!generator) {
+          current.forEach((token, batch) => cache.reportTokens(batch, [token]));
+        }
+        current.forEach((token, batch) => {
+          histories[batch].push(token);
+          assert.deepEqual(cache.getPagedKV().sequences[batch].getTokenIds(), histories[batch]);
+        });
         current = [...tokens];
-        tokens.forEach((token, batch) => cache.reportTokens(batch, [token]));
       };
       if (generator) {
         while (output.length < 12) {
-          for await (const step of model.generateDecode(ws, cache, current, graphs ? manager : undefined,
+          for await (const step of model.generateDecode(ws, cache, graphs ? manager : undefined,
             graphs ? { selectTarget: logits => logits.argmax(), captureKey: "test-selector" } : undefined)) {
             assert.ok(step.tokens.every(tokens => tokens.length === 1));
             assert.deepEqual(step.numAccepted, [0, 0]);
@@ -483,7 +579,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       }
       cache.getPagedKV().sequences.forEach((sequence, batch) => {
         assert.equal(sequence.allocLen, prompts[batch].length + 12);
-        assert.equal(sequence.getTokenIds().length, sequence.allocLen + 1);
+        assert.equal(sequence.getTokenIds().length, sequence.allocLen);
       });
       return output;
     };
@@ -494,15 +590,16 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     using cache = model.createChatCache(32, 1);
     cache.reset(1);
     let targets = chunkedPrefill(model, ws, cache, [1, 2, 3], [3]);
+    cache.reportTokens(0, [1, 2, 3], targets[0]);
     ws.assertClear();
     ws.clearTracking();
     {
       using callerTensor = ws.alloc([1], "I32");
-      const generator = model.generateDecode(ws, cache, targets);
+      const generator = model.generateDecode(ws, cache);
       await assert.rejects(generator.next(), /assertClear/);
       assert.equal(callerTensor.disposed, false);
     }
-    const generator = model.generateDecode(ws, cache, targets);
+    const generator = model.generateDecode(ws, cache);
     const first = await generator.next();
     assert.equal(first.done, false);
     targets = first.value!.tokens.map(tokens => tokens[0]);
@@ -513,7 +610,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     }
     let callerTensor: Tensor | undefined;
     try {
-      for await (const step of model.generateDecode(ws, cache, targets)) {
+      for await (const step of model.generateDecode(ws, cache)) {
         callerTensor = ws.alloc([1], "I32");
         break;
       }
@@ -546,8 +643,47 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     ws.assertClear();
   });
 
+  it("generator consumers chunk ragged prompts and bootstrap plain and MTP streams", async () => {
+    ws.free();
+    ws = new ExecutionWorkspace(glm, 2, 8);
+    using cache = model.createChatCache(32, 2);
+    const prompts = [Array.from({ length: 21 }, (_, i) => i + 1), [7, 8, 9, 10]];
+    const batch = await generateBatchTokens(model, ws, cache, prompts, 3, new Set());
+    assert.deepEqual(batch.map(tokens => tokens.length), [3, 3]);
+    for (const [index, sequence] of cache.getPagedKV().sequences.entries()) {
+      assert.deepEqual(sequence.getTokenIds(), [...prompts[index], ...batch[index].slice(0, -1)]);
+    }
+    for (const mtp of [false, true]) {
+      for (const graphs of [false, true]) {
+        for (const budget of [0, 1, 9]) {
+          cache.reset(1);
+          const tokens: number[] = [];
+          for await (const token of generateStream(model, ws, glm, cache, prompts[0], budget, new Set(), undefined,
+            graphs ? { graphExec: null, warmupRemaining: 3 } : undefined, undefined, mtp, [1, 1])) {
+            tokens.push(token);
+          }
+          assert.equal(tokens.length, budget);
+          const history = cache.getPagedKV().sequences[0].getTokenIds();
+          assert.deepEqual(history.slice(0, budget ? prompts[0].length + budget - 1 : 0),
+            budget ? [...prompts[0], ...tokens.slice(0, -1)] : []);
+          ws.assertClear();
+        }
+      }
+    }
+  });
+
   for (const mtp of [false, true]) it(`queued scheduler admits, drains, cancels, and returns to idle (mtp=${mtp})`, async () => {
     ws.free();
+    if (!mtp) {
+      // Exercise the actual non-MTP bootstrap, releasing pooled GPU memory before reload.
+      captureManager[Symbol.dispose]();
+      model.free();
+      glm.free();
+      glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+      model = await Glm51Model.fromPretrained(glm, SMALL_MODEL_DIR, false, false);
+      captureManager = new CaptureManager(glm);
+    }
+    captureManager.disabled = false;
     ws = new ExecutionWorkspace(glm, 2, 128);
     using cache = model.createChatCache(32, 2);
     using sampler = new SamplingWorkspace(glm, 6, model.cfg.vocabSize, 8);
@@ -566,7 +702,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     });
     const scheduler = new GenerationScheduler({ requests, model, ws, cache, captureManager,
       samplingWorkspace: sampler, metrics, maxBatchSize: 2, chunkSize: 8,
-      decodeLatencyMs: 0, phasedPrefill: false, topks: mtp ? [1, 1] : undefined });
+      decodeLatencyMs: 0, topks: mtp ? [1, 1] : undefined });
     let stopped = false;
     const running = scheduler.run().finally(() => { stopped = true; });
     const long = makeRequest("long", 24);
@@ -574,6 +710,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     const cancelled = makeRequest("cancelled", 100);
     const abandoned = makeRequest("abandoned", 100);
     abandoned.tokens.end();
+    let longSequence: ReturnType<typeof cache.getPagedKV>["sequences"][number] | undefined;
     try {
       await new Promise<void>(resolve => setImmediate(resolve));
       assert.equal(stopped, false, "scheduler waits for its first request");
@@ -584,6 +721,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
           for await (const token of long.tokens.queue) {
             tokens.push(token);
             if (tokens.length === 1) {
+              longSequence = cache.getPagedKV().sequences[0];
               requests.submit(abandoned);
               requests.submit(short);
               requests.submit(cancelled);
@@ -602,6 +740,8 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         })(),
       ]);
       assert.deepEqual(output.map(tokens => tokens.length), [24, 3, 1]);
+      assert.deepEqual(longSequence!.getTokenIds().slice(0, 27), [1, 2, 3, 4, ...output[0].slice(0, -1)],
+        "batch restarts commit emitted tokens exactly once without skipping or duplicating history");
       assert.equal(abandoned.generatedTokenCount, 0);
       assert.equal(cancelled.tokens.submit(0), false);
       await new Promise<void>(resolve => setImmediate(resolve));
@@ -611,16 +751,42 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       const final: number[] = [];
       for await (const token of next.tokens.queue) final.push(token);
       assert.equal(final.length, 1);
-      const forward = model.forwardModel;
+      const planPrefill = model.planChunkedPrefill;
       try {
-        model.forwardModel = () => { throw new Error("expected prefill failure"); };
+        for (const selectedToken of [70, 71]) {
+          model.planChunkedPrefill = function (workspace, chatCache, inputs, chunkSize, policy) {
+            return planPrefill.call(this, workspace, chatCache, inputs, chunkSize, {
+              selectTarget: logits => {
+                const selected = policy ? policy.selectTarget(logits) : logits.argmax();
+                selected.fill(selectedToken, selected.numElements);
+                return selected;
+              },
+            });
+          };
+          const exact = makeRequest(`exact-prefix-${selectedToken}`, 1);
+          exact.inputIds = Array.from({ length: PAGE_SIZE }, (_, i) => i + 100);
+          exact.promptTokenCount = exact.inputIds.length;
+          requests.submit(exact);
+          const tokens: number[] = [];
+          for await (const token of exact.tokens.queue) tokens.push(token);
+          assert.deepEqual(tokens, [selectedToken], "a full prefix hit publishes a fresh prefill selection");
+          if (selectedToken === 71) {
+            assert.equal(exact.cachedTokenCount, PAGE_SIZE - 1);
+            assert.equal(exact.prefillTokenCount, mtp ? 2 : 1);
+          }
+        }
+      } finally {
+        model.planChunkedPrefill = planPrefill;
+      }
+      try {
+        model.planChunkedPrefill = () => { throw new Error("expected prefill failure"); };
         const failed = makeRequest("failed", 1);
         requests.submit(failed);
         await assert.rejects(async () => {
           for await (const token of failed.tokens.queue) assert.fail(`unexpected token ${token}`);
         }, /expected prefill failure/);
       } finally {
-        model.forwardModel = forward;
+        model.planChunkedPrefill = planPrefill;
       }
       const recovered = makeRequest("recovered", 1);
       requests.submit(recovered);
@@ -636,10 +802,13 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       let joinedDuringPrefill = false;
       let replacedDuringPrefill = false;
       let submittedJoining = false;
-      const originalForward = model.forwardModel;
+      const originalForward = model.forwardPhased;
+      const captureDisabled = captureManager.disabled;
+      // This admission probe observes host forwards, which graph replay bypasses.
+      captureManager.disabled = true;
       try {
-        model.forwardModel = function (...args) {
-          if (!submittedJoining) {
+        model.forwardPhased = function* (...args) {
+          if (!submittedJoining && prefilling.inputIds.length < 32) {
             assert.ok(prefilling.inputIds.length > 1 && prefilling.inputIds.length < 32);
             submittedJoining = true;
             requests.submit(joining);
@@ -649,12 +818,11 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
             prefilling.tokens.end();
             requests.submit(replacement);
           } else if (joinedDuringPrefill && !replacedDuringPrefill && replacement.cachedTokenCount >= 0) {
-            assert.equal(joining.generatedTokenCount, mtp ? 0 : 1,
-              "non-MTP publishes the first token as soon as its prompt fits a chunk");
-            assert.equal(joining.inputIds.length, mtp ? 1 : 0);
+            assert.equal(joining.generatedTokenCount, 1, "the completed row publishes its prefill target once");
+            assert.equal(joining.inputIds.length, 0);
             replacedDuringPrefill = true;
           }
-          return originalForward.apply(this, args);
+          return yield* originalForward.apply(this, args);
         };
         requests.submit(prefilling);
         const resumed = await Promise.all([joining, replacement].map(async request => {
@@ -673,13 +841,16 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         assert.deepEqual(joining.inputIds, []);
         assert.deepEqual(replacement.inputIds, []);
       } finally {
-        model.forwardModel = originalForward;
+        model.forwardPhased = originalForward;
+        captureManager.disabled = captureDisabled;
       }
     } finally {
       scheduler.stop();
       await running;
     }
     assert.equal(metrics.runningRequests, 0);
+    assert.ok(captureManager.captured.size > 0, "decode uses the capture manager");
+    assert.ok([...captureManager.captured.keys()].every(key => !key.startsWith("prefill")), "prefill never captures");
     ws.assertClear();
   });
 
@@ -693,35 +864,31 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     // near-tied BF16 argmax decisions. Compare each verification against the
     // independent causal forward using the SAME linear draft. For branching,
     // compare eager execution with replay of the complete generator instead.
-    const trace: { input: number[]; tokens: number[]; accepted: number; bootstrap: boolean }[] = [];
+    const trace: { input: number[]; tokens: number[]; accepted: number; restart: boolean }[] = [];
     const run = async (generator: boolean) => {
       using cache = model.createChatCache(32, 1);
       cache.reset(1);
       using manager = new CaptureManager(glm);
       manager.disabled = !graphs || !generator;
       const prompt = makeLongPrompt(63);
-      const draft0 = (await executePlan(manager, ws,
-        model.planPrefillMtp(ws, cache, [prompt]))).result;
-      cache.reportTokens(0, prompt);
-      cache.reportTokens(0, draft0.targetTokens);
+      const draft0 = await prefillChunks(model, ws, cache, [prompt], manager);
       const output = [...draft0.targetTokens];
       if (generator || topks.some(k => k > 1)) {
-        let current = draft0.targetTokens;
         let replayed = false;
         while (output.length < 32) {
           let steps = 0;
-          for await (const step of model.generateMtpDecode(ws, cache, current, topks, graphs ? manager : undefined)) {
-            assert.ok(step.numDraftTokens === 0 || step.numDraftTokens === topks.length);
+          for await (const step of model.generateMtpDecode(ws, cache, topks, graphs ? manager : undefined)) {
+            assert.equal(step.numDraftTokens, topks.length);
             assert.equal(step.tokens[0].length, step.numAccepted[0] + 1);
-            const bootstrap = step.numDraftTokens === 0;
             const buf = ws.tensors.get(`glm51_mtp_decode_1_${topks.join("_")}_inputs_host`)!.readPinnedBuffer();
-            trace.push({ input: bootstrap ? [...current] : Array.from({ length: buf.length / 4 }, (_, i) => buf.readInt32LE(i * 4)),
-              tokens: [...step.tokens[0]], accepted: step.numAccepted[0], bootstrap });
-            cache.reportTokens(0, step.tokens[0]);
+            trace.push({ input: Array.from({ length: buf.length / 4 }, (_, i) => buf.readInt32LE(i * 4)),
+              tokens: [...step.tokens[0]], accepted: step.numAccepted[0], restart: steps === 0 });
+            assert.equal(cache.getPagedKV().sequences[0].reportedTokenCount(), cache.getPagedKV().sequences[0].allocLen);
             output.push(...step.tokens[0]);
-            current = [step.tokens[0].at(-1)!];
+            assert.deepEqual(cache.getPagedKV().sequences[0].getTokenIds(), [...prompt, ...output.slice(0, -1)]);
             replayed ||= !step.warmup;
-            if (output.length >= 32 || (restart && ++steps === 3)) break;
+            steps++;
+            if (output.length >= 32 || (restart && steps === 3)) break;
           }
           ws.assertClear();
           assert.equal(ws.staged.size, 0);
@@ -730,22 +897,20 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         assert.ok(replayed, "the generator must reach graph replay");
       } else {
         for (const expected of trace) {
-          if (expected.bootstrap) {
+          if (expected.restart) {
+            const sequence = cache.getPagedKV().sequences[0];
+            const replayToken = sequence.getTokenIds().at(-1)!;
+            sequence.truncate(sequence.allocLen - 1);
             const state = ws.planPrefill(model, 1, [1], cache);
-            state.setInput([expected.input]);
+            state.setInput([[replayToken]]);
             {
-              using slots = new UsingHolder<Tensor>(undefined!);
-              using lengths = new UsingHolder<Tensor>(undefined!);
-              using hidden = model.forwardModel(state, slots, lengths);
-              using logits = state.computeLogits(hidden, model);
-              using selected = logits.argmax();
-              assert.deepEqual(selected.readInt32LEArray(), expected.tokens);
-              state.setInput([expected.tokens]);
-              using mtpHidden = model.forwardMtp(state, hidden, slots, lengths);
+              using hidden = model.forwardModel(state);
               await glm.synchronizeAsync();
             }
+            cache.reportTokens(0, [replayToken], expected.input[0]);
             ws.clearTracking();
-          } else {
+          }
+          {
             const originalLen = cache.getPagedKV().sequences[0].allocLen;
             const state = ws.planPrefill(model, 1, [expected.input.length], cache);
             state.setInput([expected.input]);
@@ -763,7 +928,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
             ws.assertClear();
             ws.clearTracking();
           }
-          cache.reportTokens(0, expected.tokens);
+          cache.reportTokens(0, expected.input.slice(0, expected.accepted + 1));
           output.push(...expected.tokens);
         }
       }
@@ -787,11 +952,9 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       using manager = new CaptureManager(glm);
       manager.disabled = !graphs;
       const prompts = [makeLongPrompt(63), makeLongPrompt(31, [11, 12, 13])];
-      const initial = (await executePlan(manager, ws, model.planPrefillMtp(ws, cache, prompts))).result;
-      prompts.forEach((ids, batch) => cache.reportTokens(batch, [...ids, initial.targetTokens[batch]]));
+      await prefillChunks(model, ws, cache, prompts, manager);
       const result: number[][][] = [];
-      for await (const step of model.generateMtpDecode(ws, cache, initial.targetTokens, [2, 1], manager)) {
-        step.tokens.forEach((tokens, batch) => cache.reportTokens(batch, tokens));
+      for await (const step of model.generateMtpDecode(ws, cache, [2, 1], manager)) {
         result.push(step.tokens);
         if (result.length === 10) break;
       }
@@ -808,23 +971,16 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     cache.reset(1);
     const topks = [1, 1, 1];
     const prompt = [1, 2, 3, 4];
-    const draft = (await executePlan(captureManager, ws,
-      model.planPrefillMtp(ws, cache, [prompt]))).result;
-    cache.reportTokens(0, prompt);
-    cache.reportTokens(0, draft.targetTokens);
-    let targets = draft.targetTokens;
+    await prefillChunks(model, ws, cache, [prompt], captureManager);
     const failure = new Error("consumer stopped");
     await assert.rejects(async () => {
-      for await (const step of model.generateMtpDecode(ws, cache, targets, topks, captureManager)) {
-        cache.reportTokens(0, step.tokens[0]);
-        targets = [step.tokens[0].at(-1)!];
+      for await (const step of model.generateMtpDecode(ws, cache, topks, captureManager)) {
         throw failure;
       }
     }, error => error === failure);
     ws.assertClear();
     const oldSequence = cache.getPagedKV().sequences[0];
-    for await (const step of model.generateMtpDecode(ws, cache, targets, topks, captureManager)) {
-      cache.reportTokens(0, step.tokens[0]);
+    for await (const step of model.generateMtpDecode(ws, cache, topks, captureManager)) {
       cache.getPagedKV().removeSequence(0);
       break;
     }
@@ -845,10 +1001,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       using manager = new CaptureManager(glm);
       manager.disabled = !graphs;
       const prompt = [1, 2, 3, 4];
-      const draft = (await executePlan(manager, ws,
-        model.planPrefillMtp(ws, cache, [prompt]))).result;
-      cache.reportTokens(0, prompt);
-      cache.reportTokens(0, draft.targetTokens);
+      const draft = await prefillChunks(model, ws, cache, [prompt], manager);
       for (const name of ["stepCounter", "draftStepCounter", "rejectionStepCounter"]) {
         const seed = Buffer.alloc(4);
         seed.writeUInt32LE(123456);
@@ -857,8 +1010,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       sampler.updateMtpSampler([params]);
       sampler.updateSampler([params], [[]]);
       const output = [...draft.targetTokens];
-      for await (const step of model.generateMtpDecode(ws, cache, draft.targetTokens, topks, graphs ? manager : undefined, sampler)) {
-        cache.reportTokens(0, step.tokens[0]);
+      for await (const step of model.generateMtpDecode(ws, cache, topks, graphs ? manager : undefined, sampler)) {
         output.push(...step.tokens[0]);
         if (output.length >= 32) break;
       }
@@ -868,41 +1020,281 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     assert.deepEqual(await run(true), await run(false));
   });
 
+  for (const graphs of [false, true]) it(`executePrefill stays eager and initializes MTP decode (graphs=${graphs})`, async () => {
+    using cache = model.createChatCache(32, 1);
+    using manager = new CaptureManager(glm);
+    manager.disabled = !graphs;
+    for (let run = 0; run < 7; run++) {
+      const prompt = [1, 2, 3, 4 + run];
+      const generate = async (override: boolean) => {
+        cache.reset(1);
+        if (override) {
+          const result = await model.executePrefill(ws, cache, [prompt], graphs ? manager : undefined);
+          assert.equal("nextTokens" in result, false);
+          assert.equal(result.warmup, false);
+          assert.equal(manager.captured.size, 0);
+          assert.deepEqual(cache.getPagedKV().sequences[0].getTokenIds(), prompt);
+        } else {
+          await model.executePrefill(ws, cache, [prompt]);
+        }
+        const output: number[] = [];
+        let steps = 0;
+        for await (const step of model.generateMtpDecode(ws, cache, [1, 1])) {
+          output.push(...step.tokens[0]);
+          if (++steps === 4) {
+            break;
+          }
+        }
+        ws.assertClear();
+        return output;
+      };
+      assert.deepEqual(await generate(true), await generate(false));
+    }
+    assert.equal(manager.captured.size, 0);
+  });
+
+  it("GLM prefill conditions single-sequence phases and unphased batches", async () => {
+    ws.free();
+    ws = new ExecutionWorkspace(glm, 2, 128);
+    using cache = model.createChatCache(32, 2);
+    for (const lengths of [[9], [1, 8], [4, 5], [8, 1], [5, 4]]) {
+      const prompts = lengths.map((length, batch) => Array.from({ length }, (_, i) => 10 + batch * 20 + i));
+      const tail = prompts.map((_, batch) => [50 + batch]);
+      cache.reset(prompts.length);
+      await model.executePrefill(ws, cache, prompts);
+      await model.executePrefill(ws, cache, tail);
+      const expected = prefillTargets(cache);
+      {
+        cache.reset(prompts.length);
+        const plan = prompts.length === 1 ? model["planPhasedPrefill"](ws, cache, prompts)
+          : model.planChunkedPrefill(ws, cache, prompts);
+        const rotations: number[][] = [];
+        const forwardMtp = model.forwardMtp;
+        model.forwardMtp = function (state, ...args) {
+          rotations.push(state.input!.readInt32LEArray().slice(0, state.totalTokens));
+          return forwardMtp.call(this, state, ...args);
+        };
+        try {
+          let step = plan.generator.next();
+          while (!step.done) {
+            step = plan.generator.next();
+          }
+          assert.equal(step.value, undefined);
+          await glm.synchronizeAsync();
+          assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()), prompts.map(() => []));
+          plan.reportTokens();
+        } finally {
+          model.forwardMtp = forwardMtp;
+          plan.generator.return([]);
+        }
+        ws.assertClear();
+        ws.clearTracking();
+        assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()), prompts);
+        {
+          assert.equal(rotations.length, prompts.length === 1 ? 2 : 1);
+          for (let part = 0; part < plan.states.length; part++) {
+            let packed = 0;
+            for (let batch = 0; batch < prompts.length; batch++) {
+              const start = part ? plan.states[0].seqLens[batch] : 0;
+              const length = plan.states[part].seqLens[batch];
+              for (let i = 0; i < length; i++) {
+                if (start + i + 1 < prompts[batch].length) {
+                  assert.equal(rotations[part][packed + i], prompts[batch][start + i + 1]);
+                }
+              }
+              packed += length;
+            }
+          }
+        }
+        await model.executePrefill(ws, cache, tail);
+        assert.deepEqual(prefillTargets(cache), expected);
+      }
+    }
+  });
+
+  it("decode consumes the published target without modifying a shared source prefix", async () => {
+    using cache = model.createChatCache(32, 2);
+    for (const mtp of [false, true]) {
+      for (const length of [1, 64, 65]) {
+        cache.reset(1);
+        const prompt = Array.from({ length }, (_, i) => i + 1);
+        const result = await model.executePrefill(ws, cache, [prompt]);
+        assert.equal("nextTokens" in result, false);
+        const paged = cache.getPagedKV();
+        const source = paged.sequences[0];
+        const publishedTarget = 42;
+        cache.reportTokens(0, [], publishedTarget);
+        paged.copySequence(1, 0);
+        paged.stageSequence(0, 123);
+        const generator = mtp ? model.generateMtpDecode(ws, cache, [1, 1]) : model.generateDecode(ws, cache);
+        try {
+          const step = await generator.next();
+          assert.equal(step.done, false);
+          const tokens = step.value!.tokens[0];
+          assert.deepEqual(paged.sequences[0].getTokenIds(), [...prompt, publishedTarget, ...tokens.slice(0, -1)]);
+          assert.equal(paged.sequences[0].allocLen, length + tokens.length);
+          assert.deepEqual(source.getTokenIds(), prompt, "replay must preserve the shared source prefix");
+          assert.equal(source.allocLen, length);
+        } finally {
+          await generator.return();
+        }
+        paged.unstageSequence(123);
+        ws.assertClear();
+      }
+    }
+  });
+
+  it("MTP planChunkedPrefill replays boundary tokens and reports only consumed input", async () => {
+    ws.free();
+    ws = new ExecutionWorkspace(glm, 2, 128);
+    using cache = model.createChatCache(32, 2);
+    cache.reset(1);
+    const first = makeLongPrompt(65);
+    const initial = await model.executePrefill(ws, cache, [first]);
+    assert.equal("nextTokens" in initial, false);
+    assert.deepEqual(cache.getPagedKV().sequences[0].getTokenIds(), first);
+
+    // The existing sequence rewinds across a page boundary; the new row has no overlap.
+    cache.getPagedKV().ensureSequence(1);
+    const second = [[10, 11], [12, 13, 14]];
+    const plan = model.planChunkedPrefill(ws, cache, second);
+    assert.deepEqual(plan.states[0].seqLens, [3, 3]);
+    assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()), [first.slice(0, -1), []]);
+    let step = plan.generator.next();
+    while (!step.done) {
+      step = plan.generator.next();
+    }
+    {
+      assert.equal(step.value.length, 2);
+      assert.ok(step.value.every(token => token !== undefined));
+      await glm.synchronizeAsync();
+      assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()), [first.slice(0, -1), []],
+        "GPU execution does not report tokens until the executor calls reportTokens");
+      plan.reportTokens();
+    }
+    ws.assertClear();
+    ws.clearTracking();
+    const histories = [[...first, ...second[0]], second[1]];
+    assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()), histories);
+
+    const third = [[15, 16], [17]];
+    const result = await model.executePrefill(ws, cache, third);
+    histories.forEach((history, i) => history.push(...third[i]));
+    assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()), histories);
+    for await (const output of model.generateMtpDecode(ws, cache, [1, 1])) {
+      assert.equal(output.numDraftTokens, 2);
+      assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()),
+        histories.map((history, i) => [...history, result.targetTokens[i], ...output.tokens[i].slice(0, -1)]));
+      break;
+    }
+    ws.assertClear();
+  });
+
+  it("chunked MTP prefill budgets overlap and preserves deferred sequences", async () => {
+    ws.free();
+    ws = new ExecutionWorkspace(glm, 2, 128);
+    using cache = model.createChatCache(32, 2);
+    cache.reset(2);
+    const input = [[10, 11, 12, 13, 14], [20, 21, 22, 23]];
+    const first = await model.executePrefill(ws, cache, input, undefined, 4, {
+      selectTarget: logits => {
+        const selected = logits.argmax();
+        selected.fill(42, selected.numElements);
+        return selected;
+      },
+    });
+    assert.deepEqual(first.targetTokens, [42, undefined]);
+    assert.equal(cache.getPagedKV().sequences[0].targetToken, 42);
+    assert.deepEqual(first.prefillInputIdsList, [[10, 11, 12, 13], []]);
+    assert.deepEqual(first.remainingInputIdsList, [[14], [20, 21, 22, 23]]);
+    const second = await model.executePrefill(ws, cache, first.remainingInputIdsList, undefined, 4);
+    assert.deepEqual(second.prefillInputIdsList, [[13, 14], [20, 21]]);
+    assert.deepEqual(second.remainingInputIdsList, [[], [22, 23]]);
+    assert.deepEqual(second.targetTokens, cache.getPagedKV().sequences.map(s => s.targetToken));
+    assert.ok(second.targetTokens.every(token => token !== undefined));
+    assert.deepEqual(cache.getPagedKV().sequences.map(s => s.getTokenIds()), [input[0], [20, 21]]);
+    const third = await model.executePrefill(ws, cache, second.remainingInputIdsList, undefined, 4);
+    assert.deepEqual(third.prefillInputIdsList, [[], [21, 22, 23]]);
+    assert.deepEqual(third.remainingInputIdsList, [[], []]);
+    assert.deepEqual(third.targetTokens, [undefined, cache.getPagedKV().sequences[1].targetToken]);
+    assert.equal(cache.getPagedKV().sequences[0].targetToken, second.targetTokens[0]);
+    assert.deepEqual(cache.getPagedKV().sequences.map(s => s.getTokenIds()), input);
+    assert.throws(() => model.planChunkedPrefill(ws, cache, [[30], []], 1), /required overlap/);
+    assert.deepEqual(cache.getPagedKV().sequences.map(s => s.getTokenIds()), input);
+    const empty = await model.executePrefill(ws, cache, [[], []], undefined, 4);
+    assert.deepEqual(empty.prefillInputIdsList, [[], []]);
+    assert.deepEqual(empty.remainingInputIdsList, [[], []]);
+    assert.deepEqual(empty.targetTokens, [undefined, undefined]);
+    assert.deepEqual(cache.getPagedKV().sequences.map(s => s.getTokenIds()), input);
+  });
+
+  it("large batched MTP prefill stays unphased with cached prefixes", async () => {
+    ws.free();
+    ws = new ExecutionWorkspace(glm, 2, 8192);
+    using cache = model.createChatCache(160, 2, 8192);
+    cache.reset(2);
+    // This is a planning-only regression; reserve prefix pages without a large forward.
+    ws.planPrefill(model, 2, [1000, 1000], cache);
+    cache.reportTokens(0, Array(1000).fill(7));
+    cache.reportTokens(1, Array(1000).fill(8));
+    await glm.synchronizeAsync();
+    ws.clearTracking();
+    const inputs = [Array(3000).fill(11), Array(2000).fill(12)];
+    assert.throws(() => model["planPhasedPrefill"](ws, cache, inputs), /batch size 1/);
+    const plan = model.planChunkedPrefill(ws, cache, inputs);
+    assert.equal(plan.states.length, 1);
+    assert.deepEqual(plan.states[0].seqLens, [3001, 2001]);
+    assert.deepEqual(plan.remainingInputIdsList, [[], []]);
+    plan.generator.return([]);
+    await glm.synchronizeAsync();
+    ws.assertClear();
+    ws.clearTracking();
+  });
+
+  it("chunked MTP prefill defaults to 8192 execution rows including overlap", async () => {
+    ws.free();
+    ws = new ExecutionWorkspace(glm, 1, 8192);
+    using cache = model.createChatCache(160, 1, 8192);
+    const input = [Array(9000).fill(11) as number[]];
+    for (const existing of [false, true]) {
+      cache.reset(1);
+      if (existing) await model.executePrefill(ws, cache, [[7]]);
+      const plan = model.planChunkedPrefill(ws, cache, input);
+      assert.deepEqual(plan.states.map(state => state.totalTokens), [4096, 4096]);
+      assert.equal(plan.prefillInputIdsList[0].length, 8192);
+      assert.equal(plan.prefillInputIdsList[0][0], existing ? 7 : 11);
+      assert.equal(plan.remainingInputIdsList[0].length, existing ? 809 : 808);
+      assert.deepEqual(input, [Array(9000).fill(11)]);
+      plan.generator.return([]);
+      await glm.synchronizeAsync();
+      ws.assertClear();
+      ws.clearTracking();
+    }
+  });
+
   it("matches sequential MTP chunks and final prefill", async () => {
     const inputA = [[1, 2, 3, 4]];
     const inputB = [[5, 6, 7, 8]];
-    const nextA = [5];
-    const nextB = [9];
     const finalInput = [[9, 10]];
 
     const run = async (phased: boolean) => {
       using cache = model.createChatCache(32, 1);
       cache.reset(1);
-      const sequence = cache.getPagedKV().sequences[0];
-
       if (phased) {
-        const runner = new PhasedPrefillRunner(model, glm);
-        using planA = model.planPrefillMtpChunkPhased(ws, cache, inputA, nextA);
-        using planB = model.planPrefillMtpChunkPhased(ws, cache, inputB, nextB);
-        runner.runPlanPair(planA, planB);
-        sequence.reportTokens(inputA[0]);
-        sequence.reportTokens(inputB[0]);
+        const plan = model["planPhasedPrefill"](ws, cache, [[...inputA[0], ...inputB[0]]]);
+        let result = plan.generator.next();
+        while (!result.done) result = plan.generator.next();
         await glm.synchronizeAsync();
+        plan.reportTokens();
+        assert.deepEqual(result.value, [cache.getPagedKV().sequences[0].targetToken]);
+        assert.notEqual(result.value[0], undefined);
         ws.assertClear();
-        ws.resetPlanSlots();
+        ws.clearTracking();
       } else {
-        await executePlan(captureManager, ws, model.planPrefillMtpChunk(ws, cache, inputA, nextA));
-        sequence.reportTokens(inputA[0]);
-        await executePlan(captureManager, ws, model.planPrefillMtpChunk(ws, cache, inputB, nextB));
-        sequence.reportTokens(inputB[0]);
+        await model.executePrefill(ws, cache, inputA);
+        await model.executePrefill(ws, cache, inputB);
       }
-
-      const mtpInput = model.prepareMtpInput(cache, finalInput);
-      return (await executePlan(
-        captureManager,
-        ws,
-        model.planPrefillMtp(ws, cache, mtpInput),
-      )).result;
+      return await prefillChunks(model, ws, cache, finalInput, captureManager);
     };
 
     const sequential = await run(false);
@@ -935,16 +1327,12 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       const sequence = cache.getPagedKV().sequences[0];
       const prompt = [1, 2, 3, 4, 5, 6, 7, 8];
       target.updateSampler([greedy]);
-      const draft = (await executePlan(manager, ws,
-        model.planPrefillMtp(ws, cache, model.prepareMtpInput(cache, [prompt]),
-          linear ? target : undefined))).result;
-      sequence.reportTokens([...prompt, ...draft.targetTokens]);
+      await prefillChunks(model, ws, cache, [prompt], manager, linear ? target : undefined);
       const outputs: { tokens: number[][]; numAccepted: number[] }[] = [];
       let originalAllocLen = sequence.allocLen;
-      for await (const step of model.generateMtpDecode(ws, cache, draft.targetTokens, topks, manager, linear ? target : undefined)) {
+      for await (const step of model.generateMtpDecode(ws, cache, topks, manager, linear ? target : undefined)) {
         assert.equal(sequence.allocLen, originalAllocLen + step.numAccepted[0] + 1);
-        sequence.reportTokens(step.tokens[0]);
-        assert.equal(sequence.reportedTokenCount(), sequence.allocLen + 1);
+        assert.equal(sequence.reportedTokenCount(), sequence.allocLen);
         outputs.push({ tokens: step.tokens, numAccepted: step.numAccepted });
         originalAllocLen = sequence.allocLen;
         if (outputs.length === 9) break;
@@ -1032,12 +1420,11 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         return manager.execute(options, fn);
       },
     };
-    const draft = (await executePlan(manager, ws,
-      model.planPrefillMtp(ws, cache, model.prepareMtpInput(cache, [prompt]),
-        target))).result;
-    sequence.reportTokens([...prompt, ...draft.targetTokens]);
-    causalChunk(prompt, draft.targetTokens[0]);
+    const draft = await prefillChunks(model, ws, cache, [prompt], manager, target);
+    causalChunk(prompt, 0);
     assertCaches();
+    reference.getPagedKV().sequences[0].truncate(prompt.length - 1);
+    causalChunk([prompt.at(-1)!], draft.targetTokens[0], false);
 
     let forcedAccepted = 0;
     let verifyRuns = 0;
@@ -1069,15 +1456,8 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       },
     };
 
-    const generator = model.generateMtpDecode(ws, cache, draft.targetTokens, topks, executionManager, forcedSampler);
+    const generator = model.generateMtpDecode(ws, cache, topks, executionManager, forcedSampler);
     let outstanding = draft.targetTokens[0];
-    const bootstrap = await generator.next();
-    assert.equal(bootstrap.done, false);
-    const initial = bootstrap.value!.tokens[0];
-    causalChunk([outstanding], initial[0], false);
-    outstanding = initial[0];
-    sequence.reportTokens(initial);
-    assertCaches();
     if (force) target.updateSampler(Array.from({ length: topks.length + 1 }, () => stochastic), Array.from({ length: topks.length + 1 }, () => []));
     try {
       for (let iteration = 0; iteration < 18; iteration++) {
@@ -1091,9 +1471,8 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         if (force) assert.deepStrictEqual(step.numAccepted, [forcedAccepted]);
         assert.equal(step.numDraftTokens, topks.length);
         assert.equal(sequence.allocLen, originalAllocLen + step.numAccepted[0] + 1);
-        sequence.reportTokens(step.tokens[0]);
-        assert.deepStrictEqual(sequence.getTokenIds(), [...history, ...step.tokens[0]]);
-        assert.equal(sequence.reportedTokenCount(), sequence.allocLen + 1);
+        assert.deepStrictEqual(sequence.getTokenIds(), [...history, outstanding, ...step.tokens[0].slice(0, -1)]);
+        assert.equal(sequence.reportedTokenCount(), sequence.allocLen);
         const expectedSeed = causalChunk([outstanding, ...step.tokens[0].slice(0, -1)], step.tokens[0].at(-1)!);
         assertCaches();
         {
@@ -1103,7 +1482,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         assert.ok(bf16BytesToF32(expectedSeed).every(Number.isFinite));
         outstanding = step.tokens[0].at(-1)!;
         assert.equal(target.batchSize, force ? topks.length + 1 : 1);
-        assert.equal(target.penaltyCount.readInt32LEArray()[0], force ? iteration + 1 : 2, "verification/draft must not advance ordinary target penalty history");
+        assert.equal(target.penaltyCount.readInt32LEArray()[0], force ? iteration + 1 : 1, "verification/draft must not advance ordinary target penalty history");
         target.assertClear();
       }
     } finally {
@@ -1182,10 +1561,10 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         assert.deepEqual(readBytes(logits), referenceBytes, `decode logits iteration=${iteration}`);
         token = selected.readInt32LEArray()[0];
         assert.equal(token, expected, `CPU penalty oracle iteration=${iteration}`);
-        assert.equal(sampling.penaltyCount.readInt32LEArray()[0], seen.size + 1);
+        assert.equal(sampling.penaltyCount.readInt32LEArray()[0], penaltyHistory.length + 1);
         const penaltyTokens = Array(8).fill(0);
-        [...seen].forEach((id, index) => { penaltyTokens[index] = id; });
-        penaltyTokens[seen.size % 8] = expected;
+        penaltyHistory.forEach((id, index) => { penaltyTokens[index] = id; });
+        penaltyTokens[penaltyHistory.length % 8] = expected;
         assert.deepEqual(sampling.penaltyTokens.readInt32LEArray().slice(0, 8), penaltyTokens);
         assert.equal(readBytes(sampling.stepCounter).readUInt32LE(), 123456 + iteration + 1);
       }

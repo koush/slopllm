@@ -518,7 +518,7 @@ static void dispatch_sort_scatter(GlmCtx* ctx, const void* input, int K,
     int block_size = 256;
 
     // BF16 +0 clears the same bits as an I32 zero; avoid tiny memset graph nodes.
-    glm_fill(ctx, expert_counts, 0.0f, num_experts * 2);
+    glm_fill(ctx, expert_counts, 0.0, num_experts, "I32");
 
     int grid_size = (count + block_size - 1) / block_size;
     histogram_kernel<<<grid_size, block_size, 0, stream>>>(

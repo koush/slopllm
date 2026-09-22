@@ -327,8 +327,7 @@ class TestCausalConv1d:
         x_gpu = _upload_bf16(glm, x_flat)
         w_gpu = _upload_bf16(glm, w_flat)
         out_gpu = glm.alloc(conv_dim * S * BF16)
-        cs_gpu = glm.alloc(conv_dim * (kernel_size - 1) * BF16)
-        glm.fill(cs_gpu, 0, conv_dim * (kernel_size - 1))
+        cs_gpu = _upload_bf16(glm, np.zeros(conv_dim * (kernel_size - 1), dtype=np.float32))
         cu_seqlens = np.array([0, S], dtype=np.int32)
         cu_gpu = _upload_i32(glm, cu_seqlens)
 
@@ -412,8 +411,7 @@ class TestCausalConv1dStrided:
         x_gpu = _upload_bf16(glm, x_transposed)
         w_gpu = _upload_bf16(glm, w_flat)
         out_gpu = glm.alloc(conv_dim * S * BF16)
-        cs_gpu = glm.alloc(conv_dim * (kernel_size - 1) * BF16)
-        glm.fill(cs_gpu, 0, conv_dim * (kernel_size - 1))
+        cs_gpu = _upload_bf16(glm, np.zeros(conv_dim * (kernel_size - 1), dtype=np.float32))
         cu_seqlens = np.array([0, S], dtype=np.int32)
         cu_gpu = _upload_i32(glm, cu_seqlens)
 
@@ -636,6 +634,37 @@ class TestGdnPrefillBatch:
 
 
 class TestCausalConv1dBatch:
+    @pytest.mark.parametrize("kernel_size", [4, 8])
+    def test_empty_and_short_rows_preserve_history(self, glm, kernel_size):
+        conv_dim = 32
+        state_len = kernel_size - 1
+        lengths = [0, 1, state_len - 1, state_len, state_len + 2]
+        batch_size = len(lengths)
+        total = sum(lengths)
+        state = (np.arange(batch_size * conv_dim * state_len, dtype=np.float32)
+                 .reshape(batch_size, conv_dim, state_len) % 31 + 1)
+        inputs = -(np.arange(conv_dim * total, dtype=np.float32)
+                   .reshape(conv_dim, total) % 31 + 1)
+        boundaries = np.cumsum([0, *lengths], dtype=np.int32)
+        expected = np.stack([
+            np.concatenate([state[b], inputs[:, boundaries[b]:boundaries[b + 1]]], axis=1)[:, -state_len:]
+            for b in range(batch_size)
+        ])
+        cs_gpu = _upload_bf16(glm, state)
+        x_gpu = _upload_bf16(glm, inputs)
+        w_gpu = _upload_bf16(glm, np.ones((conv_dim, kernel_size), dtype=np.float32))
+        cu_gpu = _upload_i32(glm, boundaries)
+        out_gpu = glm.alloc(conv_dim * total * BF16)
+        try:
+            glm.causal_conv1d(out_gpu, cs_gpu, x_gpu, w_gpu, cu_gpu,
+                             conv_dim, total, kernel_size, batch_size, conv_dim * state_len)
+            glm.synchronize()
+            actual = _download_bf16(glm, cs_gpu, state.size).reshape(state.shape)
+            np.testing.assert_array_equal(actual, expected)
+        finally:
+            for ptr in [cs_gpu, x_gpu, w_gpu, cu_gpu, out_gpu]:
+                glm.free_buf(ptr)
+
     def test_batch2(self, glm):
         conv_dim = 32
         kernel_size = 4
@@ -658,8 +687,7 @@ class TestCausalConv1dBatch:
         x_gpu = _upload_bf16(glm, x_packed.numpy())
         w_gpu = _upload_bf16(glm, weight.numpy())
         out_gpu = glm.alloc(conv_dim * total_S * BF16)
-        cs_gpu = glm.alloc(B * cs_stride * BF16)
-        glm.fill(cs_gpu, 0, B * cs_stride)
+        cs_gpu = _upload_bf16(glm, np.zeros(B * cs_stride, dtype=np.float32))
 
         cu_seqlens = np.array([0, S1, total_S], dtype=np.int32)
         cu_gpu = _upload_i32(glm, cu_seqlens)

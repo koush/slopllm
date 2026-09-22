@@ -35,6 +35,8 @@ export interface SequenceCache {
 export class Sequence {
   pages: Page[] = [];
   allocLen = 0;
+  /** Selected next input, not part of committed token history or KV. */
+  targetToken?: number;
 
   constructor(public pagedKvCache: SequenceCache) {
   }
@@ -50,8 +52,11 @@ export class Sequence {
   }
 
   popPage() {
+    const newLen = Math.min(this.allocLen, (this.pages.length - 1) * this.pagedKvCache.pageSize);
+    const targetToken = this.tokenAfter(newLen);
     const page = this.pages.pop()!;
-    this.allocLen = Math.min(this.allocLen, this.pages.length * this.pagedKvCache.pageSize);
+    this.allocLen = newLen;
+    this.targetToken = targetToken;
     page.refs--;
     if (!page.refs) {
       // unshift to return pages in order of allocation (FIFO) for better cache locality.
@@ -63,6 +68,16 @@ export class Sequence {
     while (this.pages.length > 0) {
       this.popPage();
     }
+    this.targetToken = undefined;
+  }
+
+  private tokenAfter(length: number): number | undefined {
+    const pageSize = this.pagedKvCache.pageSize;
+    const token = this.pages[Math.floor(length / pageSize)]?.tokenIds[length % pageSize];
+    if (token !== undefined) {
+      return token;
+    }
+    return length === this.reportedTokenCount() ? this.targetToken : undefined;
   }
 
   truncate(newLen: number) {
@@ -71,11 +86,13 @@ export class Sequence {
     }
     if (newLen === this.allocLen) return;
 
+    const targetToken = this.tokenAfter(newLen);
     const pageSize = this.pagedKvCache.pageSize;
     this.allocLen = newLen;
     while (this.pages.length > 0 && newLen <= (this.pages.length - 1) * pageSize) {
       this.popPage();
     }
+    this.targetToken = targetToken;
 
     if (newLen % pageSize === 0) return;
 
@@ -83,18 +100,19 @@ export class Sequence {
     // page. Detach it first so another sequence sharing the full page keeps its
     // original KV contents.
     const pageIdx = Math.floor(newLen / pageSize);
-    const page = this.pages[pageIdx];
-    if (page.refs === 1) return;
-
-    this.pagedKvCache.ensureAvailablePages(1);
-    const newPageId = this.pagedKvCache.availablePages.shift();
-    if (newPageId === undefined) {
-      throw new Error("truncate: no available page for copy-on-write");
+    let page = this.pages[pageIdx];
+    if (page.refs > 1) {
+      this.pagedKvCache.ensureAvailablePages(1);
+      const newPageId = this.pagedKvCache.availablePages.shift();
+      if (newPageId === undefined) {
+        throw new Error("truncate: no available page for copy-on-write");
+      }
+      const newPage: Page = { id: newPageId, tokenIds: [...page.tokenIds], refs: 1 };
+      this.pagedKvCache.copyPage(page.id, newPage.id);
+      page.refs--;
+      this.pages[pageIdx] = page = newPage;
     }
-    const newPage: Page = { id: newPageId, tokenIds: [...page.tokenIds], refs: 1 };
-    this.pagedKvCache.copyPage(page.id, newPage.id);
-    page.refs--;
-    this.pages[pageIdx] = newPage;
+    page.tokenIds.length = Math.min(page.tokenIds.length, newLen % pageSize);
   }
 
   // Returns the number of matching tokens at the start of this sequence and inputIds.
@@ -118,33 +136,17 @@ export class Sequence {
     return count;
   }
 
-  reportTokens(tokenIds: number[]) {
+  reportTokens(tokenIds: number[], targetToken?: number) {
     const pageSize = this.pagedKvCache.pageSize;
-    // Pushes append at the flatten tail (sum of page arrays), which can be one
-    // ahead of `allocLen - tokenIds.length` while a reported-but-unprocessed
-    // peek token is present. Derive the starting page/offset from the array
-    // state — a pos-derived offset rolls page boundaries one token late and
-    // overfills pages, corrupting prefix sharing.
-    let flattenLen = 0;
-    for (const page of this.pages) flattenLen += page.tokenIds.length;
-    if (flattenLen + tokenIds.length > this.allocLen + 1) {
+    // Append committed inputs after the reported history, within reserved space.
+    const flattenLen = this.reportedTokenCount();
+    if (flattenLen + tokenIds.length > this.allocLen) {
       throw new Error(
         `reportTokens: ${tokenIds.length} tokens at flatten offset ${flattenLen} exceed allocated region (allocLen ${this.allocLen})`);
     }
     let currentPageIndex = Math.floor(flattenLen / pageSize);
     let offset = flattenLen % pageSize;
     for (let i = 0; i < tokenIds.length; i++) {
-      if (!this.pages[currentPageIndex]) {
-        // The final reported token can be the peek one slot past allocLen; if
-        // that slot opens a new page, attach it now — the next
-        // allocDecodeToken would have attached it anyway.
-        this.pagedKvCache.ensureAvailablePages(1);
-        const pageId = this.pagedKvCache.availablePages.shift();
-        if (pageId === undefined) {
-          throw new Error(`reportTokens: no available page at index ${currentPageIndex}`);
-        }
-        this.pushPage({ id: pageId, tokenIds: [], refs: 0 }, 0);
-      }
       this.pages[currentPageIndex].tokenIds.push(tokenIds[i]);
 
       offset++;
@@ -153,5 +155,6 @@ export class Sequence {
         currentPageIndex++;
       }
     }
+    this.targetToken = targetToken;
   }
 }

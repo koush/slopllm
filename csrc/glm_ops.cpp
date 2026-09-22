@@ -648,17 +648,17 @@ static Napi::Value TopkToSlots(const Napi::CallbackInfo& info) {
 
 static Napi::Value Fill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 4) {
-        Napi::TypeError::New(env, "Expected (ctx, out, value, n)").ThrowAsJavaScriptException();
+    if (info.Length() < 5) {
+        Napi::TypeError::New(env, "Expected (ctx, out, value, n, dtype)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
     uintptr_t out_ptr = info[1].As<Napi::Number>().Int64Value();
-    float value = info[2].As<Napi::Number>().FloatValue();
+    double value = info[2].As<Napi::Number>().DoubleValue();
     int n = info[3].As<Napi::Number>().Int32Value();
-    glm_fill(reinterpret_cast<GlmCtx*>(ctx_ptr),
-             reinterpret_cast<void*>(out_ptr), value, n);
-    cudaError_t err = cudaGetLastError();
+    std::string dtype = info[4].As<Napi::String>().Utf8Value();
+    cudaError_t err = glm_fill(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                             reinterpret_cast<void*>(out_ptr), value, n, dtype.c_str());
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("fill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }

@@ -842,7 +842,7 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void
 
     int block = 256, grid = (count + block - 1) / block;
     // BF16 +0 is all-zero bits; two elements clear one I32 counter.
-    glm_fill(ctx, expert_counts, 0.0f, num_experts * 2);
+    glm_fill(ctx, expert_counts, 0.0, num_experts, "I32");
     histogram_kernel<<<grid, block, 0, stream>>>(expert_ids, count, expert_counts, num_experts);
     prefix_sum_kernel<<<1, 1, 0, stream>>>(expert_counts, expert_offsets, num_experts);
     launch_scatter_input(expert_ids, count, top_k,
@@ -898,7 +898,7 @@ void glm_mma_moe_coop_scatter(GlmCtx* ctx, const void* input, const int* expert_
     int* sorted_to_original = reinterpret_cast<int*>(ws + offset);
 
     int block = 256, grid = (count + block - 1) / block;
-    glm_fill(ctx, expert_counts, 0.0f, num_experts * 2);
+    glm_fill(ctx, expert_counts, 0.0, num_experts, "I32");
     histogram_kernel<<<grid, block, 0, stream>>>(expert_ids, count, expert_counts, num_experts);
     prefix_sum_kernel<<<1, 1, 0, stream>>>(expert_counts, expert_offsets, num_experts);
     launch_scatter_input(expert_ids, count, top_k,
@@ -932,7 +932,7 @@ void glm_mma_moe_coop_gemm(GlmCtx* ctx,
     int* tile_counter = reinterpret_cast<int*>(gws);
 
     // Split GEMMs own separate counters, allocated after the shared scatter.
-    glm_fill(ctx, tile_counter, 0.0f, 2);
+    glm_fill(ctx, tile_counter, 0.0, 1, "I32");
 
     launch_coop_configured(ctx, num_experts, N, sorted_input, reinterpret_cast<__nv_bfloat16*>(output), K,
                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream,

@@ -407,7 +407,7 @@ __global__ void __launch_bounds__(256, 4) causal_conv1d_kernel(
 
     for (int i = 0; i < state_len && i < 8; i++) {
         int src_t = seq_len - state_len + i;
-        cs_base[i] = (src_t >= 0) ? x[src_t * seq_stride] : float2bf16(0.0f);
+        cs_base[i] = (src_t >= 0) ? x[src_t * seq_stride] : float2bf16(state_buf[src_t + state_len]);
     }
 }
 
@@ -545,5 +545,4 @@ void glm_rmsnorm_gated(
         eps, dim, batch
     );
 }
-
 

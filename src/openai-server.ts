@@ -113,7 +113,7 @@ Options:
   --gpu <int>                   GPU device ID (default: 0)
   --gpus <list>                 GPU device IDs
   --arena <int>                 Arena size in GiB per GPU
-  --chunk-size <int>            Maximum prefill chunk per sequence (default: 8192)
+  --chunk-size <int>            Prefill execution-token budget including overlap (default: 8192)
   --batch-size <int>            Maximum concurrent requests (default: 8)
   --max-pages <int>             KV cache pages (default: batch-size * ceil(chunk-size / 64))
   --max-tokens <int>            Default max completion tokens (default: 65536)
@@ -359,7 +359,7 @@ function sendMetrics(
     `vllm:cache_config_info{block_size="${pagedKV.pageSize}",num_gpu_blocks="${pagedKV.maxPages}",max_total_num_tokens="${maxTotalTokens}",cp_world_size="1"} 1`,
     "# HELP vllm:scheduler_config_info GLM.js request scheduler configuration.",
     "# TYPE vllm:scheduler_config_info gauge",
-    `vllm:scheduler_config_info{max_num_seqs="${batchSize}",max_num_batched_tokens="${batchSize * chunkSize}",max_model_len="${maxModelLen}"} 1`,
+    `vllm:scheduler_config_info{max_num_seqs="${batchSize}",max_num_batched_tokens="${chunkSize}",max_model_len="${maxModelLen}"} 1`,
     "# HELP vllm:request_prefill_time_seconds GLM.js request prefill duration.",
     "# TYPE vllm:request_prefill_time_seconds histogram",
     `vllm:request_prefill_time_seconds_bucket{le="+Inf"} ${metrics.prefillTimeSecondsCount}`,
@@ -373,6 +373,7 @@ function sendMetrics(
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const args = parseArgs(argv);
+  process.env.GLM_PHASED_PREFILL = args.phasedPrefill ? "1" : "0";
 
   const { modelDir, repoId: modelName } = resolveModelSelection(args);
 
@@ -392,7 +393,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   if (!argv.includes("--max-tokens") && generationConfig.maxNewTokens !== undefined) {
     args.maxTokens = generationConfig.maxNewTokens;
   }
-  if (args.mtp && !args.noMtp && (!model.planPrefillMtp || !model.generateMtpDecode)) {
+  if (args.mtp && !args.noMtp && !model.generateMtpDecode) {
     throw new Error("--mtp requires a model with MTP generation support");
   }
   const cache = model.createChatCache(args.maxPages, args.batchSize, args.chunkSize);
@@ -418,19 +419,23 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     cache.reset(1);
     using warmupSw = new SamplingWorkspace(glm, 1, model.cfg.vocabSize, args.repetitionPenaltyWindow);
     warmupSw.updateSampler([makeSamplingParamsHelper(args)], [warmupIds]);
-    let lastToken: number;
-    {
-      using warmupLogits = ws.forwardPrefill(model, [warmupIds], cache);
-      using warmupSampled = warmupSw.sample(warmupLogits);
-      lastToken = warmupSampled.readInt32LEArray()[0];
+    let remainingInputIdsList = [warmupIds];
+    while (remainingInputIdsList.some(ids => ids.length)) {
+      const plan = model.planChunkedPrefill(ws, cache, remainingInputIdsList, args.chunkSize, warmupSw);
+      for (const _ of plan.generator) {
+        // Warmup consumes one chunk at a time, just like the scheduler.
+      }
+      await glm.synchronizeAsync();
+      plan.reportTokens();
+      remainingInputIdsList = plan.remainingInputIdsList;
+      ws.assertClear();
+      ws.clearTracking();
     }
-    cache.reportTokens(0, warmupIds);
-    cache.reportTokens(0, [lastToken]);
     let warmupSteps = 0;
-    for await (const step of model.generateDecode(ws, cache, [lastToken], undefined, warmupSw)) {
-      lastToken = step.tokens[0][0];
-      cache.reportTokens(0, [lastToken]);
-      if (++warmupSteps === 3) break;
+    for await (const _ of model.generateDecode(ws, cache, undefined, warmupSw)) {
+      if (++warmupSteps === 3) {
+        break;
+      }
     }
     await glm.synchronizeAsync();
     ws.clearTracking();
@@ -466,7 +471,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const scheduler = new GenerationScheduler({
     requests: decodeQueue, model, ws, cache, captureManager, samplingWorkspace, metrics,
     maxBatchSize: args.batchSize, chunkSize: args.chunkSize, decodeLatencyMs: args.decodeLatency,
-    phasedPrefill: args.phasedPrefill, topks: mtpEnabled ? args.mtpDraftTopk : undefined,
+    topks: mtpEnabled ? args.mtpDraftTopk : undefined,
   });
   const decoding = scheduler.run().catch(error => {
     console.error("Decode scheduler stopped:", error);
@@ -919,7 +924,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     scheduler.stop();
     await decoding;
     await closed;
-    glm.synchronize();
+    await glm.synchronizeAsync();
     captureManager[Symbol.dispose]();
     samplingWorkspace.free();
     cache.free();

@@ -68,85 +68,6 @@ class StateBuffers {
   }
 }
 
-export interface ExecutionPhase<T = TensorTree> {
-  readonly states: readonly ExecutionState[];
-  readonly inputs: { [name: string]: Tensor };
-  readonly captureKey: readonly (string | number)[];
-  readonly timingName?: string;
-  run(inputs: { [name: string]: Tensor }): T;
-}
-
-export type ExecutionPlan<T> = Generator<ExecutionPhase, T, unknown>;
-
-export interface ExecutionPlanResult<T> {
-  result: T;
-  warmup: boolean;
-}
-
-export function* executionPhase<T extends TensorTree>(phase: ExecutionPhase<T>): Generator<ExecutionPhase, T, unknown> {
-  return (yield phase) as T;
-}
-
-export async function executePlan<T>(captureManager: CaptureManager, ws: ExecutionWorkspace, plan: ExecutionPlan<T>, onPhase?: (phase: ExecutionPhase, elapsedSeconds: number) => void): Promise<ExecutionPlanResult<T>> {
-  let warmup = false;
-  let step = plan.next();
-
-  try {
-    while (!step.done) {
-      const phase = step.value;
-      const captureKey = [...phase.captureKey];
-
-      if (!captureManager.disabled && captureKey.length > 0) {
-        warmup ||= !ExecutionState.isCaptured(captureManager, phase.states, captureKey, phase.inputs);
-      }
-
-      const phaseStart = performance.now();
-      if (process.env.GLM_GRAPH_DIAGNOSTICS === "1") {
-        console.warn(`[cuda-graph] phase begin key=${captureKey.join(",")} timing=${phase.timingName} states=${JSON.stringify(phase.states.map(state => ({
-          slot: state.inputIdsBuf.name, batch: state.batchSize, totalTokens: state.totalTokens,
-          seqLens: state.seqLens, kvLens: state.cache.getPagedKV().sequences.map(sequence => sequence.allocLen),
-        })))}`);
-      }
-      const phaseResult = ExecutionState.captureAll(
-        captureManager,
-        phase.states,
-        phase.inputs,
-        (_capturing, inputs) => phase.run(inputs),
-        captureKey,
-      );
-
-      try {
-        await captureManager.ops.synchronizeAsync();
-      } catch (error) {
-        const stateSummary = phase.states.map((state, index) =>
-          `state${index}{batch=${state.batchSize} totalTokens=${state.totalTokens} seqLens=[${state.seqLens}] decode=${state.isDecode} paddedKvInvariant=${state.paddedKvLenInvariant}}`).join(" ");
-        const inputSummary = Object.entries(phase.inputs).map(([name, tensor]) =>
-          `${name}{${tensor.debugDescription()}}`).join(" ");
-        console.error(`[cuda-graph] phase synchronization failed key=${captureKey.join(",")} timing=${phase.timingName ?? "unnamed"} ${stateSummary} inputs=[${inputSummary}]`, error);
-        throw error;
-      }
-      onPhase?.(phase, (performance.now() - phaseStart) / 1000);
-      if (process.env.GLM_GRAPH_DIAGNOSTICS === "1") {
-        console.warn(`[cuda-graph] phase complete key=${captureKey.join(",")} timing=${phase.timingName}`);
-      }
-
-      ws.clearTracking([phase.inputs, phaseResult as TensorTree]);
-      step = plan.next(phaseResult);
-    }
-
-    ws.clearTracking(step.value as TensorTree);
-    return { result: step.value, warmup };
-  } finally {
-    if (!step.done) {
-      try {
-        plan.return(undefined as never);
-      } finally {
-        ws.clearTracking();
-      }
-    }
-  }
-}
-
 export class ExecutionState {
   input?: Tensor;
   extras = new Map<string, any>();
@@ -250,6 +171,16 @@ export class ExecutionState {
     }
     else if (allTokens) {
       return hiddenStates.linear(lmHead);
+    }
+    else if (this.seqLens.some(length => length === 0)) {
+      // A deferred row has no final hidden state. Gather a valid dummy row;
+      // its selection is ignored when the prefill plan reports consumed inputs.
+      let end = 0;
+      const indices = this.seqLens.map(length => { end += length; return Math.max(0, end - 1); });
+      using rows = this.ws.alloc([this.batchSize], "I32");
+      rows.h2d(Buffer.from(new Int32Array(indices).buffer));
+      using hiddenLast = hiddenStates.indexSelect(rows);
+      return hiddenLast.linear(lmHead);
     }
     else {
       using lastIdxFromIndptr = this.lastIdx;
@@ -391,7 +322,7 @@ export class ExecutionState {
     }
   }
 
-  setInput(tokenIds: number[][] | Tensor) {
+  setInput(tokenIds: readonly number[][] | Tensor) {
     if (tokenIds instanceof Tensor) {
       if (tokenIds.bytes > this.inputIdsBuf.bytes) {
         throw new Error("setInput: input exceeds planned token count");

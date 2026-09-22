@@ -1,9 +1,8 @@
 import { createAsyncQueue } from "@scrypted/deferred";
 import type { CaptureManager } from "./capture-manager";
 import type { ChatCache, ChatModel, SamplingParams, TokenSelector } from "./chat_model";
-import { executePlan, type ExecutionPhase, type ExecutionWorkspace } from "./execution-workspace";
+import type { ExecutionWorkspace } from "./execution-workspace";
 import { mtpTotalTreeNodes } from "./glm51_model";
-import { PhasedPrefillRunner, splitRaggedInput } from "./phased-prefill";
 import type { SamplingWorkspace } from "./sampling";
 
 export interface GenerationRequest {
@@ -88,11 +87,6 @@ class StagedPrefixPolicy {
   }
 }
 
-interface ActiveSequence {
-  request: GenerationRequest;
-  lastToken: number;
-}
-
 interface SchedulerOptions {
   requests: ReturnType<typeof createAsyncQueue<GenerationRequest>>;
   model: ChatModel;
@@ -104,13 +98,12 @@ interface SchedulerOptions {
   maxBatchSize: number;
   chunkSize: number;
   decodeLatencyMs: number;
-  phasedPrefill: boolean;
   topks?: readonly number[];
 }
 
 /** Owns batch membership and GPU execution; HTTP handlers own token consumption. */
 export class GenerationScheduler {
-  private active: ActiveSequence[] = [];
+  private active: GenerationRequest[] = [];
   private readonly admitted = new Set<GenerationRequest>();
   private readonly prefixes: StagedPrefixPolicy;
   private nextStagingKey = 0;
@@ -140,7 +133,7 @@ export class GenerationScheduler {
 
   private removeFinished(): void {
     for (let index = this.active.length - 1; index >= 0; index--) {
-      const { request } = this.active[index];
+      const request = this.active[index];
       if (!request.tokens.ended) {
         continue;
       }
@@ -178,22 +171,16 @@ export class GenerationScheduler {
     metrics.mtpPhaseCount.set(key, (metrics.mtpPhaseCount.get(key) ?? 0) + 1);
   }
 
-  private observePhase = (phase: ExecutionPhase, seconds: number): void => {
-    if (phase.timingName) {
-      this.recordPhase(phase.timingName, phase.states[0]?.batchSize ?? 0, seconds);
-    }
-  };
-
   /** Only called at a generator boundary, with active rows in cache order. */
-  private prepareSampling(bootstrap: boolean): TokenSelector | undefined {
+  private prepareSampling(prefill: boolean): TokenSelector | undefined {
     const { samplingWorkspace: sampler, cache, topks } = this.options;
-    const params = this.active.map(row => row.request.samplingParams);
+    const params = this.active.map(request => request.samplingParams);
     if (topks) {
       if (sampler.mtpEnabled) {
         sampler.updateMtpSampler(params);
       }
-      if (bootstrap || !sampler.mtpEnabled) {
-        const targetParams = bootstrap ? params : params.flatMap(param =>
+      if (prefill || !sampler.mtpEnabled) {
+        const targetParams = prefill ? params : params.flatMap(param =>
           Array.from({ length: mtpTotalTreeNodes(topks) + 1 }, () => param));
         sampler.updateSampler(targetParams, targetParams.map(() => []));
       }
@@ -202,53 +189,16 @@ export class GenerationScheduler {
     if (params.every(param => param.temperature <= 0 && param.repetitionPenalty === 1 && param.presencePenalty === 0)) {
       return undefined;
     }
-    sampler.updateSampler(params, cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()));
+    sampler.updateSampler(params, cache.getPagedKV().sequences.map((sequence, index) => {
+      const request = this.active[index];
+      return [...sequence.getTokenIds(), ...(request.inputIds.length ? request.inputIds
+        : sequence.targetToken === undefined ? [] : [sequence.targetToken])];
+    }));
     return sampler;
   }
 
-  private async runChunk(inputIds: number[][], nextTokens: number[], sample = false): Promise<number[] | undefined> {
-    const { model, ws, cache, captureManager, phasedPrefill, topks } = this.options;
-    let firstTokens: number[] | undefined;
-    const split = phasedPrefill ? splitRaggedInput(inputIds) : undefined;
-    if (split) {
-      const start = performance.now();
-      const runner = new PhasedPrefillRunner(model, model.glm);
-      if (topks) {
-        using a = model.planPrefillMtpChunkPhased!(ws, cache, split.inputA, split.nextA);
-        using b = model.planPrefillMtpChunkPhased!(ws, cache, split.inputB, nextTokens);
-        runner.runPlanPair(a, b);
-      } else {
-        const a = ws.planPrefill(model, split.inputA.length, split.inputA.map(ids => ids.length), cache);
-        a.setInput(split.inputA);
-        const b = ws.planPrefill(model, split.inputB.length, split.inputB.map(ids => ids.length), cache);
-        b.setInput(split.inputB);
-        runner.runPair(a, b, (_stateA, _hiddenA, stateB, hiddenB) => {
-          if (sample) {
-            using logits = stateB.computeLogits(hiddenB, model);
-            using selected = logits.argmax();
-            firstTokens = selected.readInt32LEArray();
-          }
-        });
-      }
-      await model.glm.synchronizeAsync();
-      this.recordPhase("prefill_chunk", inputIds.length, (performance.now() - start) / 1000);
-    } else if (topks) {
-      await executePlan(captureManager, ws, model.planPrefillMtpChunk!(ws, cache, inputIds, nextTokens), this.observePhase);
-    } else {
-      using logits = ws.forwardPrefill(model, inputIds, cache);
-      if (sample) {
-        using selected = logits.argmax();
-        firstTokens = selected.readInt32LEArray();
-      }
-      await model.glm.synchronizeAsync();
-    }
-    ws.assertClear();
-    ws.clearTracking();
-    return firstTokens;
-  }
-
   private admit(requests: GenerationRequest[]): void {
-    const { cache, metrics, topks } = this.options;
+    const { cache, metrics } = this.options;
     const pagedKV = cache.getPagedKV();
     for (const request of requests) {
       this.admitted.add(request);
@@ -264,107 +214,59 @@ export class GenerationScheduler {
     for (const [index, request] of requests.entries()) {
       request.inputIds = cache.prefixMatch(index, request.inputIds);
       request.cachedTokenCount = request.promptTokenCount - request.inputIds.length;
-      request.prefillTokenCount = request.inputIds.length + (topks && request.cachedTokenCount > 0 ? 1 : 0);
+      request.prefillTokenCount = 0;
     }
     for (const entry of saved) {
       pagedKV.unstageSequence(entry.key);
     }
-    this.active = [...requests.map(request => ({ request, lastToken: -1 })), ...saved.map(entry => entry.row)];
+    this.active = [...requests, ...saved.map(entry => entry.row)];
     console.log(`Prefill: requests=${requests.length} tokens=${requests.reduce((sum, request) => sum + request.inputIds.length, 0)}`);
   }
 
   /** Run one chunk, leaving unfinished input on its request for the next scheduler turn. */
   private async prefill(): Promise<boolean> {
-    const { model, ws, cache, captureManager, samplingWorkspace, metrics, topks, chunkSize } = this.options;
-    const pending = this.active.filter(row => row.request.inputIds.length);
-    if (!pending.length) {
+    const { model, ws, cache, captureManager, metrics, chunkSize } = this.options;
+    const inputIds = this.active.map(request => request.inputIds);
+    if (!inputIds.some(ids => ids.length)) {
       return true;
     }
-    const pagedKV = cache.getPagedKV();
     const start = performance.now();
-    // prepareMtpInput may prepend an overlap token to every row, including decode rows.
-    const finalSize = pending.reduce((sum, row) => sum + row.request.inputIds.length, 0)
-      + (topks ? this.active.length : 0);
-    if (!topks || finalSize > chunkSize) {
-      // Take one chunk. Only MTP reserves a boundary token for final prefill.
-      const staged = this.active.map(row => ({ row, key: this.nextStagingKey++ }));
-      for (const entry of staged) {
-        pagedKV.stageSequence(0, entry.key);
-      }
-      let budget = chunkSize;
-      const inputIds: number[][] = [];
-      const nextTokens: number[] = [];
-      const chunked: ActiveSequence[] = [];
-      const deferred: typeof staged = [];
-      for (const entry of staged) {
-        const { request } = entry.row;
-        const take = Math.min(Math.max(0, request.inputIds.length - (topks ? 1 : 0)), budget);
-        if (!take) {
-          deferred.push(entry);
-          continue;
+    ws.assertClear();
+    ws.clearTracking();
+    const plan = model.planChunkedPrefill(ws, cache, inputIds, chunkSize, this.prepareSampling(true));
+    let targetTokens: (number | undefined)[];
+    try {
+      // All prefill chunks are eager; graph capture belongs to decode only.
+      const execution = captureManager.execute({ states: plan.states, inputs: {}, key: [] }, () => {
+        while (true) {
+          const result = plan.generator.next();
+          if (result.done) return result.value;
         }
-        pagedKV.unstageSequence(entry.key);
-        inputIds.push(request.inputIds.slice(0, take));
-        request.inputIds = request.inputIds.slice(take);
-        if (topks) {
-          nextTokens.push(request.inputIds[0]);
-        }
-        chunked.push(entry.row);
-        budget -= take;
-      }
-      if (!chunked.length) {
-        throw new Error(`Unable to fit prefill batch within ${chunkSize} tokens`);
-      }
-      const sample = !topks && chunked.some(row => !row.request.inputIds.length);
-      const firstTokens = await this.runChunk(inputIds, nextTokens, sample);
-      inputIds.forEach((ids, index) => cache.reportTokens(index, ids));
-      for (const entry of deferred) {
-        pagedKV.unstageSequence(entry.key);
-      }
-      this.active = [...chunked, ...deferred.map(entry => entry.row)];
-      const seconds = (performance.now() - start) / 1000;
-      for (const { request } of pending) {
-        request.prefillSeconds += seconds;
-      }
-      // Non-MTP rows finish independently; their first generated token seeds decode.
-      chunked.forEach((row, index) => {
-        const { request } = row;
-        if (request.inputIds.length) {
-          return;
-        }
-        metrics.prefillTimeSecondsCount++;
-        metrics.prefillTimeSecondsSum += request.prefillSeconds;
-        request.decodeStartedAt = performance.now();
-        row.lastToken = firstTokens![index];
-        cache.reportTokens(index, [row.lastToken]);
-        this.publish(request, [row.lastToken]);
       });
-      return this.active.every(row => !row.request.inputIds.length);
+      targetTokens = execution.result;
+      await model.glm.synchronizeAsync();
+      plan.reportTokens();
+    } finally {
+      plan.generator.return([]);
     }
-    // MTP final prefill: consume remaining input and recondition existing decode rows.
-    const prefilled = this.active;
-    const input = model.prepareMtpInput(cache, prefilled.map(row => row.request.inputIds));
-    this.prepareSampling(true);
-    const firstTokens = (await executePlan(captureManager, ws,
-      model.planPrefillMtp!(ws, cache, input, samplingWorkspace), this.observePhase)).result.targetTokens;
+    ws.assertClear();
+    ws.clearTracking();
     const seconds = (performance.now() - start) / 1000;
-    metrics.prefillTimeSecondsCount += pending.length;
-    for (const { request } of pending) {
-      request.prefillSeconds += seconds;
-      metrics.prefillTimeSecondsSum += request.prefillSeconds;
-      request.decodeStartedAt = performance.now();
-    }
-    firstTokens.forEach((token, index) => {
-      const { request } = prefilled[index];
+    this.recordPhase("prefill_chunk", this.active.length, seconds);
+    // Adopt remainders only after execution and token reporting succeed.
+    this.active.forEach((request, index) => {
       if (request.inputIds.length) {
-        cache.reportTokens(index, request.inputIds);
+        request.inputIds = plan.remainingInputIdsList[index];
+        request.prefillTokenCount += plan.prefillInputIdsList[index].length;
+        request.prefillSeconds += seconds;
+        if (!request.inputIds.length) {
+          metrics.prefillTimeSecondsCount++;
+          metrics.prefillTimeSecondsSum += request.prefillSeconds;
+          this.publish(request, [targetTokens[index]!]);
+        }
       }
-      request.inputIds = [];
-      cache.reportTokens(index, [token]);
-      prefilled[index].lastToken = token;
-      this.publish(request, [token]);
     });
-    return true;
+    return plan.remainingInputIdsList.every(ids => !ids.length);
   }
 
   private async yieldToRequests(): Promise<void> {
@@ -421,7 +323,7 @@ export class GenerationScheduler {
         // Prefill: run one chunk, then revisit admission if more input or batch changes remain.
         const finalPrefill = await this.prefill();
         await this.yieldToRequests();
-        if (!finalPrefill || requests.ended || this.active.some(row => row.request.tokens.ended)
+        if (!finalPrefill || requests.ended || this.active.some(request => request.tokens.ended)
           || (this.active.length < maxBatchSize && requests.queued.length > 0)) {
           continue;
         }
@@ -429,11 +331,13 @@ export class GenerationScheduler {
           continue;
         }
         // Decode: keep the batch stable until termination or a pending admission.
-        const samplingPolicy = this.prepareSampling(true);
-        const targetTokens = this.active.map(row => row.lastToken);
+        for (const request of this.active) {
+          request.decodeStartedAt ??= performance.now();
+        }
+        const samplingPolicy = this.prepareSampling(false);
         const generator = topks
-          ? model.generateMtpDecode!(ws, cache, targetTokens, topks, captureManager, samplingPolicy)
-          : model.generateDecode(ws, cache, targetTokens, captureManager, samplingPolicy);
+          ? model.generateMtpDecode!(ws, cache, topks, captureManager, samplingPolicy)
+          : model.generateDecode(ws, cache, captureManager, samplingPolicy);
         let stepStart = performance.now();
         for await (const step of generator) {
           if (process.env.GLM_MTP_TIMING === "1") {
@@ -445,16 +349,13 @@ export class GenerationScheduler {
           metrics.specDecodeNumDraftTokensTotal += step.numDraftTokens * this.active.length;
           metrics.specDecodeNumAcceptedTokensTotal += step.numAccepted.reduce((sum, count) => sum + count, 0);
           step.tokens.forEach((tokens, index) => {
-            cache.reportTokens(index, tokens);
-            this.active[index].lastToken = tokens.at(-1)!;
-            this.publish(this.active[index].request, tokens);
+            this.publish(this.active[index], tokens);
           });
           await this.yieldToRequests();
-          if (requests.ended || this.active.some(row => row.request.tokens.ended)
+          if (requests.ended || this.active.some(request => request.tokens.ended)
             || (this.active.length < maxBatchSize && requests.queued.length > 0)) {
             break;
           }
-          this.prepareSampling(false);
           stepStart = performance.now();
         }
         // for-await has closed the generator before any sequence is removed.

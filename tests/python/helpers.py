@@ -211,9 +211,9 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int
         ]
 
-        self.lib.glm_fill.restype = None
+        self.lib.glm_fill.restype = ctypes.c_int
         self.lib.glm_fill.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_double, ctypes.c_int, ctypes.c_char_p
         ]
 
         self.lib.glm_gather.restype = None
@@ -1097,12 +1097,24 @@ class GlmOps:
         )
 
     def fill(self, output, value, n):
-        self.lib.glm_fill(
+        dtype = {
+            torch.bfloat16: b"BF16", torch.float16: b"F16",
+            torch.float32: b"F32", torch.float64: b"F64",
+            torch.int8: b"I8", torch.uint8: b"U8", torch.int16: b"I16",
+            torch.int32: b"I32", torch.int64: b"I64", torch.bool: b"BOOL",
+            torch.complex64: b"C64",
+            torch.float8_e4m3fn: b"F8_E4M3", torch.float8_e5m2: b"F8_E5M2",
+            torch.uint16: b"U16", torch.uint32: b"U32", torch.uint64: b"U64",
+        }[output.dtype]
+        error = self.lib.glm_fill(
             self.ctx,
             self._ptr(output),
-            ctypes.c_float(value),
-            n
+            ctypes.c_double(value),
+            n,
+            dtype,
         )
+        if error:
+            raise RuntimeError(f"glm_fill failed with CUDA error {error}")
 
     def gather(self, output, input, indices, k, in_dim, batch, elem_size=2):
         self.lib.glm_gather(

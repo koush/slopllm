@@ -1,16 +1,17 @@
 import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
-import { EagerExecution, type ExecutionManager } from "./execution-manager";
 import { ChatModelParser, DefaultChatModelParser } from "./chat-model-parser";
-import { DeviceOps, type WorkspaceMemoryStats } from "./device_ops";
-import { type ExecutionPlan, ExecutionState, type ExecutionWorkspace } from "./execution-workspace";
+import { DeviceOps } from "./device_ops";
+import { EagerExecution, type ExecutionManager } from "./execution-manager";
+import { ExecutionState, type ExecutionWorkspace } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { mmapClose, mmapOpen } from "./native-addon";
 import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
+import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
 export interface SamplingParams {
@@ -35,13 +36,20 @@ export interface ChatCache extends Disposable {
   reset(batchSize: number): void;
   free(): void;
   prefixMatch(seqIdx: number, inputIds: number[]): number[];
-  reportTokens(seqIdx: number, tokens: number[]): void;
+  reportTokens(seqIdx: number, tokens: number[], targetToken?: number): void;
   prefillBatchPlanHook?(_batchSize: number, _seqLens: number[], _totalTokens: number, _startPos: number[], _cache: ChatCache): void;
 }
 
-export interface PhasedPrefillPlan extends Disposable {
-  state: ExecutionState;
-  generator: Generator<void, Tensor, void>;
+export interface ChunkedPrefillPlan {
+  states: ExecutionState[];
+  /** Returns selected targets in batch order; rows without input return undefined. */
+  generator: Generator<void, (number | undefined)[], void>;
+  /** Selected execution inputs, including any replayed overlap tokens. */
+  prefillInputIdsList: number[][];
+  /** Unconsumed caller input; adopt after successful execution and reporting. */
+  remainingInputIdsList: number[][];
+  /** Called by the executor after successful eager execution. */
+  reportTokens(): void;
 }
 
 export interface MtpProposal {
@@ -68,7 +76,7 @@ export interface MtpStepResult {
 }
 
 export interface MtpDecodeStepResult extends Omit<MtpStepResult, "draft"> {
-  /** Startup conditioning (numDraftTokens=0) or a graph warmup/capture step. */
+  /** Whether this is a graph warmup/capture step. */
   warmup: boolean;
 }
 
@@ -134,7 +142,7 @@ export function loadGenerationConfig(modelDir: string): GenerationConfig {
 export type Tokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
 
 export interface ChatTemplateKwargs {
-   continue_final_message?: boolean;
+  continue_final_message?: boolean;
   enable_thinking?: boolean;
   [key: string]: unknown;
 }
@@ -162,22 +170,234 @@ export abstract class ChatModel extends WorkspaceBase {
     return this.runPhased(this.forwardPhased(state));
   }
 
-  /** Decode indefinitely from one outstanding token per sequence after prefill.
-   * The caller reports yielded tokens and handles EOS/budgets. Close and restart
-   * the generator with the current tokens when batch membership changes. */
+  protected createChunkedPrefillPlan(states: ExecutionState[], cache: ChatCache,
+    inputIdsList: readonly number[][], generator: Generator<void, (number | undefined)[], void>): ChunkedPrefillPlan {
+    let targetTokens: (number | undefined)[] = [];
+    const reportTokens = () => {
+      inputIdsList.forEach((ids, index) => {
+        if (ids.length) {
+          cache.reportTokens(index, ids, targetTokens[index]);
+        }
+      });
+    };
+    return {
+      states,
+      reportTokens,
+      generator: (function* () {
+        const selected = yield* generator;
+        targetTokens = inputIdsList.map((ids, index) => ids.length ? selected[index] : undefined);
+        return targetTokens;
+      })(),
+      prefillInputIdsList: inputIdsList.map(ids => [...ids]),
+      remainingInputIdsList: inputIdsList.map(() => []),
+    };
+  }
+
+  protected planPhasedPrefill(ws: ExecutionWorkspace, cache: ChatCache,
+    inputIdsList: readonly number[][],
+    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
+    forward: (state: ExecutionState, nextState?: ExecutionState) => Generator<void, Tensor, void>
+      = state => this.forwardPhased(state)): ChunkedPrefillPlan {
+    if (inputIdsList.length !== 1) {
+      throw new Error("Phased prefill requires batch size 1");
+    }
+    let remainingA = Math.floor(inputIdsList.reduce((sum, ids) => sum + ids.length, 0) / 2);
+    const inputA: number[][] = [];
+    const inputB: number[][] = [];
+    for (const ids of inputIdsList) {
+      const take = Math.min(ids.length, remainingA);
+      inputA.push(ids.slice(0, take));
+      inputB.push(ids.slice(take));
+      remainingA -= take;
+    }
+    // Zero-query rows preserve the original cache sequence indices in both plans.
+    const stateA = ws.planPrefill(this, inputA.length, inputA.map(ids => ids.length), cache);
+    stateA.setInput(inputA);
+    const stateB = ws.planPrefill(this, inputB.length, inputB.map(ids => ids.length), cache);
+    stateB.setInput(inputB);
+    const self = this;
+    const targetTokens: (number | undefined)[] = [];
+    return this.createChunkedPrefillPlan([stateA, stateB], cache, inputIdsList, (function* () {
+        const a = forward(stateA, stateB);
+        const b = forward(stateB);
+        using hiddenA = new UsingHolder<Tensor>(undefined!);
+        using hiddenB = new UsingHolder<Tensor>(undefined!);
+        const advance = (generator: Generator<void, Tensor, void>, hidden: UsingHolder<Tensor>) => {
+          const result = generator.next();
+          if (result.done && result.value) {
+            hidden.replace(result.value);
+          }
+          return !!result.done;
+        };
+        let doneA = false;
+        let doneB = false;
+        try {
+          // A stays one phase ahead so B can attend to A's newly written KV.
+          doneA = advance(a, hiddenA);
+          while (!doneA) {
+            using streamB = self.glm.withStream(() => {
+              if (!doneB) {
+                doneB = advance(b, hiddenB);
+              }
+            });
+            try {
+              doneA = advance(a, hiddenA);
+            } finally {
+              streamB.streamWaitEvent();
+            }
+            yield;
+          }
+          while (!doneB) {
+            doneB = advance(b, hiddenB);
+            if (!doneB) {
+              yield;
+            }
+          }
+          if (hiddenB.value) {
+            using logits = stateB.computeLogits(hiddenB.value, self);
+            using selected = samplingPolicy.selectTarget(logits);
+            targetTokens.push(...selected.readInt32LEArray());
+          }
+        } finally {
+          try {
+            if (!doneB) {
+              b.return(undefined!);
+            }
+          } finally {
+            if (!doneA) {
+              a.return(undefined!);
+            }
+          }
+        }
+        return targetTokens;
+      })());
+  }
+
+  protected selectPrefillChunk(inputIdsList: readonly number[][], chunkSize: number,
+    overlapTokens: readonly (number | undefined)[] = []): {
+      prefillInputIdsList: number[][];
+      remainingInputIdsList: number[][];
+    } {
+    if (!Number.isSafeInteger(chunkSize) || chunkSize < 1) {
+      throw new Error(`Invalid prefill chunk size: ${chunkSize}`);
+    }
+    let budget = chunkSize;
+    const prefillInputIdsList: number[][] = [];
+    const remainingInputIdsList: number[][] = [];
+    for (const [index, ids] of inputIdsList.entries()) {
+      const overlap = overlapTokens[index];
+      const take = Math.min(ids.length, Math.max(0, budget - (overlap === undefined ? 0 : 1)));
+      const input = ids.slice(0, take);
+      if (take && overlap !== undefined) {
+        input.unshift(overlap);
+      }
+      prefillInputIdsList.push(input);
+      remainingInputIdsList.push(ids.slice(take));
+      budget -= input.length;
+    }
+    if (budget === chunkSize && inputIdsList.some(ids => ids.length)) {
+      throw new Error(`Prefill chunk size ${chunkSize} cannot fit input and its required overlap`);
+    }
+    return { prefillInputIdsList, remainingInputIdsList };
+  }
+
+  planChunkedPrefill(ws: ExecutionWorkspace, cache: ChatCache,
+    inputIdsList: readonly number[][], chunkSize = 8192,
+    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ChunkedPrefillPlan {
+    const chunk = this.selectPrefillChunk(inputIdsList, chunkSize);
+    const plan = this.planPrefillChunk(ws, cache, chunk.prefillInputIdsList, samplingPolicy);
+    plan.remainingInputIdsList = chunk.remainingInputIdsList;
+    return plan;
+  }
+
+  protected planPrefillChunk(ws: ExecutionWorkspace, cache: ChatCache,
+    inputIdsList: readonly number[][],
+    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): ChunkedPrefillPlan {
+    const batchSize = inputIdsList.length;
+    const seqLens = inputIdsList.map(ids => ids.length);
+    const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+    if (!totalTokens) {
+      return this.createChunkedPrefillPlan([], cache, inputIdsList, (function* () { return []; })());
+    }
+    if (batchSize === 1 && totalTokens >= 4096 && process.env.GLM_PHASED_PREFILL !== "0") {
+      return this.planPhasedPrefill(ws, cache, inputIdsList, samplingPolicy);
+    }
+
+    const state = ws.planPrefill(this, batchSize, seqLens, cache);
+    state.setInput(inputIdsList);
+    const self = this;
+    return this.createChunkedPrefillPlan([state], cache, inputIdsList, (function* () {
+        using hiddenStates = yield* self.forwardPhased(state);
+        using logits = state.computeLogits(hiddenStates, self);
+        using selected = samplingPolicy.selectTarget(logits);
+        return selected.readInt32LEArray();
+      })());
+  }
+
+  async executePrefill(ws: ExecutionWorkspace, cache: ChatCache,
+    inputIdsList: readonly number[][],
+    executionManager: ExecutionManager = new EagerExecution(), chunkSize = 8192,
+    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() }): Promise<{
+      warmup: boolean;
+      targetTokens: (number | undefined)[];
+      prefillInputIdsList: number[][];
+      remainingInputIdsList: number[][];
+    }> {
+    ws.assertClear();
+    ws.clearTracking();
+    const plan = this.planChunkedPrefill(ws, cache, inputIdsList, chunkSize, samplingPolicy);
+    const { states, generator } = plan;
+    let warmup: boolean;
+    let targetTokens: (number | undefined)[];
+    {
+      // Prefill is always eager, including single-state chunks.
+      const execution = executionManager.execute({ states, inputs: {}, key: [] }, () => {
+        try {
+          while (true) {
+            const iter = generator.next();
+            if (iter.done) {
+              return iter.value;
+            }
+          }
+        }
+        catch (e) {
+          generator.return([]);
+          throw e;
+        }
+      });
+
+      warmup = execution.warmup;
+      targetTokens = execution.result;
+      await this.glm.synchronizeAsync();
+      plan.reportTokens();
+    }
+    ws.assertClear();
+    ws.clearTracking();
+    return { warmup, targetTokens, prefillInputIdsList: plan.prefillInputIdsList, remainingInputIdsList: plan.remainingInputIdsList };
+  }
+
+  /** Read the caller-published pending token without modifying committed model state. */
+  protected async prepareDecodeInput(_ws: ExecutionWorkspace, cache: ChatCache,
+    _samplingPolicy: TokenSelector): Promise<number[]> {
+    const sequences = cache.getPagedKV().sequences;
+    if (!sequences.length || sequences.some(sequence => sequence.targetToken === undefined
+      || sequence.reportedTokenCount() !== sequence.allocLen)) {
+      throw new Error("Decode requires committed history and a pending target token for every sequence");
+    }
+    return sequences.map(sequence => sequence.targetToken!);
+  }
+
+  /** Consume the caller-published pending target and yield newly selected tokens. */
   async *generateDecode(
     ws: ExecutionWorkspace, cache: ChatCache,
-    targetTokens: readonly number[],
     executionManager: ExecutionManager = new EagerExecution(),
     samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
   ): AsyncGenerator<MtpStepResult & { warmup: boolean }, void, void> {
-    const batchSize = targetTokens.length;
     const pagedKV = cache.getPagedKV();
     const sequences = pagedKV.sequences.slice();
-    if (!batchSize || sequences.length !== batchSize) {
-      throw new Error("Decode requires a non-empty matching batch");
-    }
-    let nextTokens = [...targetTokens];
+    const batchSize = sequences.length;
+    ws.assertClear();
+    let nextTokens = await this.prepareDecodeInput(ws, cache, samplingPolicy);
     try {
       while (true) {
         ws.assertClear();
@@ -187,10 +407,11 @@ export abstract class ChatModel extends WorkspaceBase {
           throw new Error("Decode batch changed; close and restart the generator");
         }
         const state = ws.planDecode(this, batchSize, cache, executionManager.captureEnabled);
+        const inputTokens = nextTokens;
         state.setInput([nextTokens]);
-        const captureKey = ["decode", samplingPolicy.captureKey ?? "greedy"];
         let warmup: boolean;
         {
+          const captureKey = ["decode", samplingPolicy.captureKey ?? "greedy"];
           const execution = executionManager.execute({ states: [state], inputs: {}, key: captureKey }, () => {
             using hidden = this.forwardModel(state);
             using logits = state.computeLogits(hidden, this);
@@ -201,6 +422,7 @@ export abstract class ChatModel extends WorkspaceBase {
           await this.glm.synchronizeAsync();
           nextTokens = selected.readInt32LEArray();
         }
+        inputTokens.forEach((token, batch) => cache.reportTokens(batch, [token], nextTokens[batch]));
         ws.assertClear();
         ws.clearTracking();
         // Keep the next input independent of the caller's yielded array.
@@ -213,18 +435,11 @@ export abstract class ChatModel extends WorkspaceBase {
         };
       }
     } finally {
-      this.glm.synchronize();
+      await this.glm.synchronizeAsync();
     }
   }
 
-  planPrefillMtpChunk?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): ExecutionPlan<void>;
-  planPrefillMtpChunkPhased?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], nextTokens: number[]): PhasedPrefillPlan;
-  planPrefillMtp?(ws: ExecutionWorkspace, cache: ChatCache, inputIds: number[][], samplingPolicy?: TokenSelector): ExecutionPlan<{ targetTokens: number[] }>;
-  generateMtpDecode?(ws: ExecutionWorkspace, cache: ChatCache, targetTokens: readonly number[], topks: readonly number[], executionManager?: ExecutionManager, samplingPolicy?: TokenSelector): AsyncGenerator<MtpDecodeStepResult, void, void>;
-
-  prepareMtpInput(_cache: ChatCache, inputIdsList: number[][]): number[][] {
-    return inputIdsList.map(inputIds => [...inputIds]);
-  }
+  generateMtpDecode?(ws: ExecutionWorkspace, cache: ChatCache, topks: readonly number[], executionManager?: ExecutionManager, samplingPolicy?: TokenSelector): AsyncGenerator<MtpDecodeStepResult, void, void>;
 
   createParser(_chatTemplateKwargs: ChatTemplateKwargs = {}): ChatModelParser {
     return new DefaultChatModelParser(this.tokenizer);
@@ -295,7 +510,7 @@ export abstract class ChatModel extends WorkspaceBase {
       }
     }
 
-    this.glm.synchronize();
+    await this.glm.synchronizeAsync();
 
     for (const { st, mmapPtr, fileSize } of openShards) {
       st.close();

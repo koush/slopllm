@@ -138,7 +138,7 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const 
                        uint32_t cp_world_size, uint32_t cp_rank,
                        const int32_t* kv_token_indptr);
 
-void glm_fill(GlmCtx* ctx, void* out, float value, int n);
+cudaError_t glm_fill(GlmCtx* ctx, void* out, double value, int n, const char* dtype);
 // Up to eight device ranges, issued concurrently within one bounded grid.
 void glm_prefetch_l2(GlmCtx* ctx, const void* const* data, const size_t* bytes, int count);
 

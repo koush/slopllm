@@ -29,6 +29,7 @@ export class MetaTensor extends Tensor {
     }
 
     fill(value: number, n: number): void {
+        super.fill(value, n);
     }
 
     mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
