@@ -4081,11 +4081,9 @@ export class ParallelOps implements DeviceOps {
 
     const W = this.worldSize;
     const kDataReplicated = pKData.parallelism === TensorParallelism.Replicated;
-    using colIdxQ = this.tryNarrowToColumnParallel(pQ);
-    using colWeights = this.tryNarrowToColumnParallel(pWeights);
-    const canShard = !decode && W > 1 && kDataReplicated
-      && colIdxQ && colWeights
-      && totalQ % W === 0;
+    const canShard = !decode && W > 1 && totalQ >= W && kDataReplicated
+      && pQ.parallelism === TensorParallelism.Replicated
+      && pWeights.parallelism === TensorParallelism.Replicated;
 
     if (!canShard) {
       const topkIdxShards: Tensor[] = [];
@@ -4129,15 +4127,31 @@ export class ParallelOps implements DeviceOps {
       return { values: mergedValues, indices: finalIndices };
     }
 
-    // Query-sharded path: each rank processes totalQ/W query rows.
-    const localQ = totalQ / W;
+    // Only output rows are padded for the equal-size gather. Each indexer
+    // invocation sees real queries and the original sequence metadata.
+    const localQ = Math.ceil(totalQ / W);
+    const paddedQ = localQ * W;
     const topkIdxShards: Tensor[] = [];
     const topkValShards: Tensor[] = [];
     for (let i = 0; i < W; i++) {
-      const qStart = (qGlobalStart ?? 0) + i * localQ;
+      const offset = i * localQ;
+      const rows = Math.min(localQ, Math.max(0, totalQ - offset));
+      const shardWs = pQ.shards[i].workspace;
+      if (rows === 0) {
+        const indices = shardWs.alloc([localQ, topk], "I32");
+        const values = shardWs.alloc([localQ, topk], "BF16");
+        indices.fill(-1, indices.numElements);
+        values.fill(0, values.numElements);
+        topkIdxShards.push(indices);
+        topkValShards.push(values);
+        continue;
+      }
+      using localQueries = pQ.shards[i].narrow(offset, rows);
+      using localWeights = pWeights.shards[i].narrow(offset, rows);
+      const qStart = (qGlobalStart ?? 0) + offset;
       const r = this.devices[i].indexerTopk(
         state,
-        colIdxQ!.shards[i], pKData.shards[i], pKScaleData.shards[i], colWeights!.shards[i],
+        localQueries, pKData.shards[i], pKScaleData.shards[i], localWeights,
         pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i],
         pQoIndptr.shards[i],
         scale, topk,
@@ -4145,14 +4159,31 @@ export class ParallelOps implements DeviceOps {
         pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i],
         kIsRow ? W : 0, kIsRow ? i : 0, pGlobalLastPageLen.shards[i], pKvTokenIndptr?.shards[i],
       );
-      topkIdxShards.push(r.indices);
-      topkValShards.push(r.values);
+      if (rows === localQ) {
+        topkIdxShards.push(r.indices);
+        topkValShards.push(r.values);
+      } else {
+        using indices = r.indices;
+        using values = r.values;
+        const paddedIndices = shardWs.alloc([localQ, topk], "I32");
+        const paddedValues = shardWs.alloc([localQ, topk], "BF16");
+        paddedIndices.fill(-1, paddedIndices.numElements);
+        paddedValues.fill(0, paddedValues.numElements);
+        using indexRows = paddedIndices.narrow(0, rows);
+        using valueRows = paddedValues.narrow(0, rows);
+        indexRows.memcpy(indices);
+        valueRows.memcpy(values);
+        topkIdxShards.push(paddedIndices);
+        topkValShards.push(paddedValues);
+      }
     }
 
-    using topkIdxColumn = this.wrapShards(idxQ.workspace, topkIdxShards, [totalQ, topk], "I32", TensorParallelism.Column);
-    const topkValColumn = this.wrapShards(idxQ.workspace, topkValShards, [totalQ, topk], "BF16", TensorParallelism.Column);
+    using topkIdxColumn = this.wrapShards(idxQ.workspace, topkIdxShards, [paddedQ, topk], "I32", TensorParallelism.Column);
+    const topkValColumn = this.wrapShards(idxQ.workspace, topkValShards, [paddedQ, topk], "BF16", TensorParallelism.Column);
+    using indices = topkIdxColumn.allGather(idxQ.workspace);
 
-    return { values: topkValColumn, indices: topkIdxColumn.allGather(idxQ.workspace) };
+    // Attention only consumes indices; keep unused values in padded Column layout.
+    return { values: topkValColumn, indices: indices.narrow(0, totalQ) };
   }
 
   // Sort each top-k row ascending by index, in place, on every shard. The

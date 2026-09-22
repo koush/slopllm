@@ -364,6 +364,10 @@ export class ExecutionState {
     return ExecutionState.isCaptured(captureManager, [this], providedKeyParams);
   }
 
+  getEagerKvLen(): number {
+    return this.cache.getPagedKV().sequences.reduce((sum, sequence) => sum + sequence.allocLen, 0);
+  }
+
   getGraphVariantPaddedKvLen() {
     this.paddedKvLenInvariant = false;
     return this.paddedKvLen;

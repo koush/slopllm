@@ -1,6 +1,7 @@
 import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
 import { Heap, type HeapAllocation, type HeapKey } from "./heap";
 import type { ExecutionState } from "./execution-workspace";
+import { CaptureManager } from "./capture-manager";
 import { SafeTensorFile } from "./safetensors";
 import { Tensor, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
 import type { WorkspaceBase } from "./workspace";
@@ -1429,11 +1430,13 @@ export class GlmOps implements DeviceOps {
     }
     const maxKvCapacity = kData.shape[0] * kData.shape[1];
     const useDirect = totalQ <= INDEXER_DIRECT_DISPATCH_MAX;
-    // Decode graphs are length-invariant. Prefill launches over the graph's
-    // padded KV bucket; exact query length is already part of the graph key.
+    // Decode graphs are length-invariant. Eager prefill uses exact KV length;
+    // captured prefill uses the padded KV bucket for graph-stable sizing.
     const maxKv = decode
       ? maxKvCapacity
-      : Math.min(maxKvCapacity, state.getGraphVariantPaddedKvLen());
+      : Math.min(maxKvCapacity, CaptureManager.capturing === undefined
+        ? state.getEagerKvLen()
+        : state.getGraphVariantPaddedKvLen());
     const scoreShape = [totalQ, maxKv];
     const queryTiles = Math.ceil(totalQ / 64) + state.batchSize - 1;
     return useDirect
