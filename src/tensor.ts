@@ -58,6 +58,13 @@ export abstract class Tensor implements Disposable {
     }
   }
 
+  setViewWorkspace(workspace: WorkspaceBase) {
+    if (!this.view) {
+      throw new Error("Tensor has no view to set workspace from.");
+    }
+    this.workspace = workspace;
+  }
+
   stage() {
     if (this.name)
       throw new Error(`Cannot stage named tensor ${this.name}`);

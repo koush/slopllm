@@ -867,12 +867,32 @@ export class Glm51Model extends ChatModel {
     using _idxWeights = idxWeightsStream?.result;
 
     using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
+
+    // absorbed weight seems to only be worthwhile if precomputed, but its prefill throughput 10% gain max.
+    // weight is substantial, but could maybe be useful for very large prefills.
+    using absorbedWeightStream = false && state.totalTokens < 4096
+      ? undefined
+      : this.glm.withStream(() => {
+        const kNopeProj = this.tensors.get(`${pfx}.k_nope_proj.weight`)!;
+        const qNopeProj = this.tensors.get(`${pfx}.q_nope_proj.weight`)!;
+        using kNope = kNopeProj.viewClone();
+        const savedWorkspace = kNope.workspace;
+        kNope.setViewWorkspace(state.ws);
+        try {
+          const absorbed = kNope.bmm(qNopeProj, nHeads, kvLoraRank, cfg.qLoraRank, cfg.qkNopeHeadDim, true, false);
+          return absorbed;
+        }
+        finally {
+          kNope.setViewWorkspace(savedWorkspace);
+        }
+      });
+
     yield;
     using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
     yield;
 
-// Indexer q: wq_b(qNormed) → rope → [BS, indexNHeads, indexHeadDim]
-        // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
+    // Indexer q: wq_b(qNormed) → rope → [BS, indexNHeads, indexHeadDim]
+    // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
     using idxQStream = skipIndexer
       ? undefined
       : this.glm.withStream(() => {
@@ -903,12 +923,14 @@ export class Glm51Model extends ChatModel {
 
     const cache = kvcache.result;
     using qStream = this.glm.withStream(() => {
+      absorbedWeightStream?.streamWaitEvent();
+      using absorbedWeight = absorbedWeightStream?.result;
       return this.glm.projectMlaQuery(
         state, cache.ckv!, qNormed,
         this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
         this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
         this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
-        this.tensors.get(`${pfx}.absorbed.weight`),
+        absorbedWeight,
         cos, sin,
         qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,
       );

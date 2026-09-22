@@ -127,6 +127,16 @@ export class ParallelTensor extends Tensor {
     return captured;
   }
 
+
+  setViewWorkspace(workspace: WorkspaceBase) {
+    super.setViewWorkspace(workspace);
+    const shardWss = this.parallelOps.getShardWorkspaces(workspace);
+    for (let i = 0; i < this.shards.length; i++) {
+      this.shards[i].setViewWorkspace(shardWss[i]);
+    }
+  }
+
+
   stage() {
     super.stage();
     for (const shard of this.shards) {
