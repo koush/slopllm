@@ -2833,15 +2833,13 @@ export class ParallelOps implements DeviceOps {
 
     // Phase 2: local online-softmax merge of the world_size staging slots.
     const outputV: Tensor[] = [];
-    const outputLse: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       outputV.push(shardWss[i].alloc([batchSize, shardNHeads * vHeadDim], "BF16"));
-      outputLse.push(shardWss[i].alloc([batchSize, shardNHeads], "F32"));
     }
 
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].cpMergeLocal(
-        stageV[i], stageLse[i], outputV[i], outputLse[i],
+        stageV[i], stageLse[i], outputV[i], null,
         this.worldSize, batchSize, shardNHeads, vHeadDim,
       );
     }
@@ -2850,12 +2848,6 @@ export class ParallelOps implements DeviceOps {
       ...stageV,
       ...stageLse,
     );
-
-    // outputLse is local-only and unused downstream; any reuse of its address is
-    // on this device's stream, hence ordered behind the merge kernel above.
-    for (const lse of outputLse) {
-      lse[Symbol.dispose]();
-    }
 
     return this.wrapShards(workspace, outputV, [batchSize, numHeads * vHeadDim], "BF16", TensorParallelism.Row);
   }
@@ -2888,10 +2880,8 @@ export class ParallelOps implements DeviceOps {
     this.p2pRetainSources(...partialVOuts.map(t => t.viewClone()), ...partialLses.map(t => t.viewClone()));
 
     const outputV: Tensor[] = [];
-    const outputLse: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       outputV.push(shardWss[i].alloc([batchSize, shardNHeads * vHeadDim], "BF16"));
-      outputLse.push(shardWss[i].alloc([batchSize, shardNHeads], "F32"));
     }
 
     for (let i = 0; i < this.worldSize; i++) {
@@ -2901,14 +2891,10 @@ export class ParallelOps implements DeviceOps {
         vPtrs,
         lsePtrs,
         this.worldSize,
-        outputV[i], outputLse[i],
+        outputV[i], null,
         shardNumel, batchSize, numHeads, vHeadDim,
         shardNHeads, i * shardNHeads, numHeads,
       );
-    }
-
-    for (const lse of outputLse) {
-      lse[Symbol.dispose]();
     }
 
     return this.wrapShards(workspace, outputV, [batchSize, numHeads * vHeadDim], "BF16", TensorParallelism.Row);
