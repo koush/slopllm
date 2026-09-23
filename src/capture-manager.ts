@@ -219,11 +219,12 @@ export class CaptureManager implements Disposable, ExecutionManager {
                     capturing = true;
                 }
                 else {
-                    console.warn("\n====warmingup====", key)
+                    console.warn("\n====warmup+1====", key)
                 }
                 captured.warmupSteps++;
             }
             else {
+                console.warn("\n====warmup====", key)
                 captured = { warmupSteps: 1, graphExec: null, result: undefined, inputs: undefined!, capturedWorkspaces: new Set() };
                 this.captured.set(key, captured);
             }

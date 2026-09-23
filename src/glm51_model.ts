@@ -368,7 +368,7 @@ export class Glm51Model extends ChatModel {
   // determines the gather type to be used depending on the state.
   // this is called at various states in the pipeline for hooking a all vs sparse gather
   // "full" layers should never be sparse gathered. (enforced elsewhere)
-  shouldGatherKv(state: ExecutionState, sparseGather: boolean) {
+  shouldGatherKv(state: ExecutionState, sparseGather: boolean, indexer: boolean) {
     // only valid in cp mode
     if (!state.cache.getPagedKV().contextParallel)
       return false;
@@ -398,8 +398,10 @@ export class Glm51Model extends ChatModel {
 
     // should do the actual math to see whether q or ckv has a smaller gather
     // this could be tuned further.
+    // the indexer is exempt because score buffer gets massive (can this be fixed without major performance loss?)
+    // when indexer is not replicated. indexer is half the size of ckv though.
     const paddedKvLen = state.getGraphVariantPaddedKvLen();
-    if (paddedKvLen > 65536 * 4)
+    if (!indexer && paddedKvLen > 65536 * 4)
       return false;
 
     return true;
@@ -408,17 +410,12 @@ export class Glm51Model extends ChatModel {
   prefetchLayerResources(state: ExecutionState, layerHolders: LayerHolders, nextCacheIdx: number) {
     const cfg = this.cfg;
 
-    if (!this.shouldGatherKv(state, false)) {
-      return;
-    }
-
     const pagedKV = state.cache.getPagedKV();
 
     const { ckvPrefetchStream, indexerPrefetchStream, ckvPrefetch, indexerKPrefetch, indexerKScalePrefetch, phaseNextLayerHolders, phasedPrefill } = layerHolders;
 
-    // should be unreachable.
     if (!pagedKV.contextParallel) {
-      throw new Error(`Context parallelism is for ckv prefetch`);
+      return;
     }
 
     const paddedKvLen = this.sparseMlaPaddedKvLen(state);
@@ -430,7 +427,7 @@ export class Glm51Model extends ChatModel {
       return;
     }
 
-    if (indexerPrefetchStream && !indexerPrefetchStream.value) {
+    if (indexerPrefetchStream && !indexerPrefetchStream.value && this.shouldGatherKv(state, false, true)) {
       if (phasedPrefill) {
         if (indexerKPrefetch?.value) {
           phaseNextLayerHolders!.indexerKPrefetch!.replace(indexerKPrefetch.detach());
@@ -463,7 +460,7 @@ export class Glm51Model extends ChatModel {
       }
     }
 
-    if (ckvPrefetchStream && !ckvPrefetchStream.value) {
+    if (ckvPrefetchStream && !ckvPrefetchStream.value && this.shouldGatherKv(state, false, false)) {
       if (phasedPrefill) {
         if (ckvPrefetch?.value) {
           phaseNextLayerHolders!.ckvPrefetch!.replace(ckvPrefetch.detach());

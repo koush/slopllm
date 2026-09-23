@@ -1,3 +1,4 @@
+import { CaptureManager } from "./capture-manager";
 import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MlaQuery, type StreamResult } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
@@ -4086,6 +4087,28 @@ export class ParallelOps implements DeviceOps {
       && pWeights.parallelism === TensorParallelism.Replicated;
 
     if (!canShard) {
+      const i = 0;
+      const k = pKData.shards[i];
+      const q = pQ.shards[i];
+      const capacity = k.shape[0] * k.shape[1];
+      const maxKv = decode
+        ? capacity
+        : Math.min(capacity, CaptureManager.capturing === undefined
+          ? state.getEagerKvLen()
+          : state.getGraphVariantPaddedKvLen());
+
+      const scoreBytes = q.shape[0] * maxKv * 2; // BF16
+      if (!decode && scoreBytes >= 1024 ** 3) {
+        console.warn("Large unsharded indexer score buffer", {
+          device: i,
+          totalQ: q.shape[0],
+          maxKv,
+          scoreBytes,
+          kParallelism: pKData.parallelism,
+          qParallelism: pQ.parallelism,
+          weightsParallelism: pWeights.parallelism,
+        });
+      }
       const topkIdxShards: Tensor[] = [];
       const topkValShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
