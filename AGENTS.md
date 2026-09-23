@@ -317,7 +317,7 @@ For `/spawn`, obtain shared model arguments from `GET /model-args` and place the
 curl -X POST http://127.0.0.1:8099/stop
 curl -N -X POST 'http://127.0.0.1:8099/spawn?follow' \
   -H 'content-type: application/json' \
-  -d '["nsys","profile","--trace=cuda,nvtx","--cuda-graph-trace=node","--sample=none","--cpuctxsw=none","--output=/tmp/glm-mtp","node","--require","tsx/cjs","src/run_glm51_multiple_mtp.ts","--arena","92","--gpus","0,1,2,3,4,5,6,7","--cp","--glm51","--mtp","--batch-size","1","--max-new-tokens","128","--max-pages","512"]'
+  -d '["nsys","profile","--trace=cuda,nvtx","--cuda-graph-trace=node","--sample=none","--cpuctxsw=none","--output=/tmp/glm-mtp","node","--require","tsx/cjs","src/run_glm51_multiple_mtp.ts","--arena","92","--gpus","0,4,5,7,1,2,3,6","--cp","--glm51","--mtp","--batch-size","1","--max-new-tokens","128","--max-pages","512"]'
 ```
 
 Let the benchmark exit naturally to finish the Nsight report. `/stop` sends SIGTERM to a spawned command's process group and allows 30 seconds for shutdown/output draining before SIGKILL. Forked executors retain their Node IPC shutdown request and five-second fallback. Stop the current executor before launching another; the loader and resident weights remain alive throughout.
