@@ -27,7 +27,8 @@ export interface ModelCliArgs {
   useFp8: boolean;
   useNvfp4: boolean;
   cp: boolean;
-  mtp: boolean;
+  /** Number of MTP draft tokens per step; 0 disables MTP. */
+  mtp: number;
 }
 
 export interface ModelRuntime {
@@ -50,7 +51,7 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     useFp8: false,
     useNvfp4: false,
     cp: false,
-    mtp: false,
+    mtp: 0,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -65,7 +66,11 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     else if (a === "--fp8") args.useFp8 = true;
     else if (a === "--nvfp4") args.useNvfp4 = true;
     else if (a === "--cp") args.cp = true;
-    else if (a === "--mtp") args.mtp = true;
+    else if (a === "--mtp") {
+      const next = argv[i + 1];
+      if (next !== undefined && /^-?\d+$/.test(next)) args.mtp = parseInt(argv[++i], 10);
+      else args.mtp = 3;
+    }
   }
 
   if (args.gpus.length === 0 || args.gpus.some(gpu => !Number.isInteger(gpu) || gpu < 0)) {
@@ -78,6 +83,7 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
   if (args.useQwen35 && args.useFp8) throw new Error("--fp8 is not supported with --qwen35");
   if (args.useGlm51 && args.useFp8) throw new Error("--fp8 is not supported with --glm51");
   if (args.useNvfp4 && !args.useGlm51) throw new Error("--nvfp4 is only supported with --glm51");
+  if (!Number.isInteger(args.mtp) || args.mtp < 0) throw new Error(`Invalid --mtp draft depth: ${args.mtp}`);
   return args;
 }
 
@@ -107,7 +113,7 @@ export function createDeviceOps(args: ModelCliArgs): { glm: DeviceOps, gpuDevice
 
 export async function loadModel(glm: DeviceOps, args: ModelCliArgs, modelDir: string): Promise<ChatModel> {
   const model = await (args.useGlm51
-    ? Glm51Model.fromPretrained(glm, modelDir, args.cp, args.mtp)
+    ? Glm51Model.fromPretrained(glm, modelDir, args.cp, args.mtp > 0)
     : args.useQwen35
       ? Qwen35Model.fromPretrained(glm, modelDir)
       : Qwen3Model.fromPretrained(glm, modelDir));

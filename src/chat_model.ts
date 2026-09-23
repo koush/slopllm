@@ -440,7 +440,7 @@ export abstract class ChatModel extends WorkspaceBase {
     }
   }
 
-  generateMtpDecode?(ws: ExecutionWorkspace, cache: ChatCache, topks: readonly number[], executionManager?: ExecutionManager, samplingPolicy?: TokenSelector): AsyncGenerator<MtpDecodeStepResult, void, void>;
+  generateMtpDecode?(ws: ExecutionWorkspace, cache: ChatCache, numDraftTokens: number, executionManager?: ExecutionManager, samplingPolicy?: TokenSelector): AsyncGenerator<MtpDecodeStepResult, void, void>;
 
   createParser(_chatTemplateKwargs: ChatTemplateKwargs = {}): ChatModelParser {
     return new DefaultChatModelParser(this.tokenizer);

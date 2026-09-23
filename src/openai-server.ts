@@ -6,7 +6,6 @@ import { type OutputParserEvent } from "./chat-model-parser";
 import { ChatModel, ChatCache, ChatTemplateKwargs, loadGenerationConfig, loadMaxPositionEmbeddings, SamplingParams, Tokenizer } from "./chat_model";
 import { ExecutionWorkspace } from "./execution-workspace";
 import { GenerationScheduler, isFatalCudaError, type GenerationRequest, type ServerMetrics } from "./generation-scheduler";
-import { mtpTotalTreeNodes } from "./glm51_model";
 import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
@@ -44,7 +43,6 @@ interface ServerArgs extends ModelCliArgs {
   noCudaGraph: boolean;
   noMtp: boolean;
   phasedPrefill: boolean;
-  mtpDraftTopk: number[];
 }
 
 function parseArgs(argv: string[]): ServerArgs {
@@ -66,7 +64,6 @@ function parseArgs(argv: string[]): ServerArgs {
     noCudaGraph: false,
     noMtp: false,
     phasedPrefill: false,
-    mtpDraftTopk: [],
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -86,12 +83,7 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
     else if (a === "--no-mtp") args.noMtp = true;
     else if (a === "--phased-prefill") args.phasedPrefill = true;
-    else if (a === "--mtp-draft-topk" && i + 1 < argv.length) args.mtpDraftTopk = argv[++i].split(",").map(value => parseInt(value.trim(), 10));
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
-  }
-  if (args.mtp && !args.noMtp && args.mtpDraftTopk.length === 0) args.mtpDraftTopk = [1, 1, 1];
-  if (args.mtpDraftTopk.some(topk => !Number.isInteger(topk) || topk < 1)) {
-    throw new Error(`Invalid --mtp-draft-topk: ${args.mtpDraftTopk.join(",")}`);
   }
   if (args.phasedPrefill && !args.useGlm51) {
     throw new Error("--phased-prefill currently requires --glm51");
@@ -126,10 +118,9 @@ Options:
   --repetition-penalty-window <int>  Repetition penalty window (default: 64)
   --decode-latency <int>        Artificial delay per decode step in ms (default: 0)
   --no-cuda-graph               Disable CUDA graph capture
-  --mtp                         Enable MTP speculative decoding
+  --mtp [int]                   MTP speculative decoding draft tokens (default: 3)
   --no-mtp                      Disable MTP decoding for an MTP-loaded model
   --phased-prefill              Overlap pairs of intermediate GLM-5.1 prefill chunks
-  --mtp-draft-topk <list>       MTP draft top-k per depth (default: 1,1,1)
   --help, -h                    Show this help message
 `);
 }
@@ -393,7 +384,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   if (!argv.includes("--max-tokens") && generationConfig.maxNewTokens !== undefined) {
     args.maxTokens = generationConfig.maxNewTokens;
   }
-  if (args.mtp && !args.noMtp && !model.generateMtpDecode) {
+  if (args.mtp > 0 && !args.noMtp && !model.generateMtpDecode) {
     throw new Error("--mtp requires a model with MTP generation support");
   }
   const cache = model.createChatCache(args.maxPages, args.batchSize, args.chunkSize);
@@ -401,12 +392,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const ws = new ExecutionWorkspace(glm, args.batchSize, args.chunkSize);
   const captureManager = new CaptureManager(glm);
   captureManager.disabled = args.noCudaGraph;
-  const mtpEnabled = args.mtp && !args.noMtp;
+  const mtpEnabled = args.mtp > 0 && !args.noMtp;
   const samplingWorkspace = new SamplingWorkspace(glm,
-    args.batchSize * (mtpEnabled ? mtpTotalTreeNodes(args.mtpDraftTopk) + 1 : 1),
+    args.batchSize * (mtpEnabled ? args.mtp + 1 : 1),
     model.cfg.vocabSize, args.repetitionPenaltyWindow,
-    mtpEnabled && args.mtpDraftTopk.length > 0 && args.mtpDraftTopk.every(k => k === 1)
-      ? { maxBatchSize: args.batchSize, depth: args.mtpDraftTopk.length, retainProposalsOnGpu: process.env.GLM_MTP_GPU_PROPOSALS !== "0" }
+    mtpEnabled
+      ? { maxBatchSize: args.batchSize, depth: args.mtp, retainProposalsOnGpu: process.env.GLM_MTP_GPU_PROPOSALS !== "0" }
       : undefined);
   const tokenizer = model.tokenizer;
   const eosIds = model.eosIds;
@@ -472,7 +463,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const scheduler = new GenerationScheduler({
     requests: decodeQueue, model, ws, cache, captureManager, samplingWorkspace, metrics,
     maxBatchSize: args.batchSize, chunkSize: args.chunkSize, decodeLatencyMs: args.decodeLatency,
-    topks: mtpEnabled ? args.mtpDraftTopk : undefined,
+    numDraftTokens: mtpEnabled ? args.mtp : undefined,
   });
   const decoding = scheduler.run().catch(error => {
     console.error("Decode scheduler stopped:", error);
@@ -911,7 +902,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  GET  /version              - vLLM-compatible server version`);
     console.log(`  GET  /health               - Health check`);
     console.log(`  CUDA graphs: ${args.noCudaGraph ? "disabled" : "enabled"}`);
-    console.log(`  MTP: ${args.mtp && !args.noMtp ? `enabled (draft top-k ${args.mtpDraftTopk.join(",")})` : "disabled"}`);
+    console.log(`  MTP: ${args.mtp > 0 && !args.noMtp ? `enabled (draft tokens ${args.mtp})` : "disabled"}`);
     if (samplingWorkspace.mtpEnabled) console.log(`  MTP proposals: ${samplingWorkspace.retainProposalsOnGpu ? "GPU-resident" : "host baseline"} (GLM_MTP_GPU_PROPOSALS=0 selects host baseline)`);
     console.log(`  Phased prefill: ${args.phasedPrefill ? "enabled" : "disabled"}`);
     console.log(`  Model: ${modelName}  |  GPU: ${args.gpus.join(",")}  |  chunk-size=${args.chunkSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);

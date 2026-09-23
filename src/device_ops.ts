@@ -113,11 +113,6 @@ export interface DeviceOps extends Disposable {
   // Undefined indices selects flat indexer addressing; indptr then holds token prefix sums.
   mlaKvCacheAppend(state: ExecutionState, cacheIdx: number, ckvData: Tensor, kpeData: Tensor | null, indices: Tensor | undefined, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize?: number, cpWorldSize?: number, cpRank?: number): { ckv: Tensor; kpe?: Tensor };
   concatAndCacheDsMla(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | undefined, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor;
-  appendSelectedMtpCaches(mlaSrcCkvPtrs: Tensor, mlaSrcKpePtrs: Tensor, mlaDstCkvPtrs: Tensor, mlaDstKpePtrs: Tensor | undefined,
-    indexerSrcPtrs: Tensor | undefined, indexerDstPtrs: Tensor | undefined, indexerDstScalePtrs: Tensor | undefined,
-    sourceRows: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor,
-    pageSize: number, kvLoraRank: number, peDim: number, indexHeadDim: number, sparseMode: boolean,
-    cpWorldSize?: number, cpRank?: number): void;
   quantizeFp8(input: Tensor, blockSize: number): Fp8Quantized;
 
   // Decode chunking hint: 0 selects automatic planning; the actual prefill kernel ignores it.

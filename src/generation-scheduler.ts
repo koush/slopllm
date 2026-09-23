@@ -2,7 +2,6 @@ import { createAsyncQueue } from "@scrypted/deferred";
 import type { CaptureManager } from "./capture-manager";
 import type { ChatCache, ChatModel, SamplingParams, TokenSelector } from "./chat_model";
 import type { ExecutionWorkspace } from "./execution-workspace";
-import { mtpTotalTreeNodes } from "./glm51_model";
 import type { SamplingWorkspace } from "./sampling";
 
 export interface GenerationRequest {
@@ -98,7 +97,7 @@ interface SchedulerOptions {
   maxBatchSize: number;
   chunkSize: number;
   decodeLatencyMs: number;
-  topks?: readonly number[];
+  numDraftTokens?: number;
 }
 
 /** Owns batch membership and GPU execution; HTTP handlers own token consumption. */
@@ -162,8 +161,8 @@ export class GenerationScheduler {
   }
 
   private recordPhase(name: string, batchSize: number, seconds: number): void {
-    const { metrics, topks } = this.options;
-    if (!topks) {
+    const { metrics, numDraftTokens } = this.options;
+    if (!numDraftTokens) {
       return;
     }
     const key = `${name}|${batchSize}`;
@@ -173,15 +172,15 @@ export class GenerationScheduler {
 
   /** Only called at a generator boundary, with active rows in cache order. */
   private prepareSampling(prefill: boolean): TokenSelector | undefined {
-    const { samplingWorkspace: sampler, cache, topks } = this.options;
+    const { samplingWorkspace: sampler, cache, numDraftTokens } = this.options;
     const params = this.active.map(request => request.samplingParams);
-    if (topks) {
+    if (numDraftTokens) {
       if (sampler.mtpEnabled) {
         sampler.updateMtpSampler(params);
       }
       if (prefill || !sampler.mtpEnabled) {
         const targetParams = prefill ? params : params.flatMap(param =>
-          Array.from({ length: mtpTotalTreeNodes(topks) + 1 }, () => param));
+          Array.from({ length: numDraftTokens + 1 }, () => param));
         sampler.updateSampler(targetParams, targetParams.map(() => []));
       }
       return sampler;
@@ -280,7 +279,7 @@ export class GenerationScheduler {
 
   /** One lifetime-long scheduler task; generators are scoped to stable batches. */
   async run(): Promise<void> {
-    const { requests, model, ws, cache, captureManager, metrics, maxBatchSize, topks } = this.options;
+    const { requests, model, ws, cache, captureManager, metrics, maxBatchSize, numDraftTokens } = this.options;
     cache.reset(0);
     while (!requests.ended) {
       // Admission: remove terminated rows, wait if empty, then fill available slots.
@@ -335,8 +334,8 @@ export class GenerationScheduler {
           request.decodeStartedAt ??= performance.now();
         }
         const samplingPolicy = this.prepareSampling(false);
-        const generator = topks
-          ? model.generateMtpDecode!(ws, cache, topks, captureManager, samplingPolicy)
+        const generator = numDraftTokens
+          ? model.generateMtpDecode!(ws, cache, numDraftTokens, captureManager, samplingPolicy)
           : model.generateDecode(ws, cache, captureManager, samplingPolicy);
         let stepStart = performance.now();
         for await (const step of generator) {

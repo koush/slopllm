@@ -116,8 +116,8 @@ export class ExecutionState {
     public readonly isDecode: boolean, public readonly ws: ExecutionWorkspace, public readonly cache: ChatCache,
     slot: number,
     public readonly customMask?: {
-      indptr: Tensor;
-      mask: Tensor;
+      indptr?: Tensor;
+      mask?: Tensor;
       mode?: MaskMode;
       positionIds?: Tensor;
       maskKvLen?: Tensor;
@@ -294,7 +294,7 @@ export class ExecutionState {
     if (this.isDecode) {
       return this.ws.mlaDecodePaged(this, qNope, qPe, ckv, kpe, smScale);
     } else {
-      return this.ws.mlaPrefillPaged(this, qNope, qPe, ckv, kpe, smScale, !this.customMask ? MaskMode.Causal : this.customMask.mode, this.customMask?.mask, this.customMask?.indptr, this.customMask?.maskKvLen);
+      return this.ws.mlaPrefillPaged(this, qNope, qPe, ckv, kpe, smScale, this.customMask?.mode ?? MaskMode.Causal, this.customMask?.mask, this.customMask?.indptr, this.customMask?.maskKvLen);
     }
   }
 
@@ -643,8 +643,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   planPrefill(model: ChatModel, batchSize: number, seqLens: number[], cache: ChatCache, customMask?: {
-    indptr: Tensor;
-    mask: Tensor;
+    indptr?: Tensor;
+    mask?: Tensor;
     mode?: MaskMode;
     positionIds?: Tensor;
     maskKvLen?: Tensor;
@@ -725,7 +725,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
           state.mlaPrefillPlanInfo,
           state.qoIndptrH, state.indptrH,
           state.kvLenH, state.lastPageLenH,
-          batchSize, nHeads, cfg.kvLoraRank!, !customMask || customMask.mode === MaskMode.CausalCustom || customMask.mode === MaskMode.Causal,
+          batchSize, nHeads, cfg.kvLoraRank!, !customMask || (customMask.mode ?? MaskMode.Causal) === MaskMode.Causal || customMask.mode === MaskMode.CausalCustom,
           pagedKV.pageSize, pagedKV.sequences.map(s => s.allocLen),
           pagedKV.contextParallel
         );

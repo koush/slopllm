@@ -1184,69 +1184,6 @@ __global__ void concat_and_cache_ds_mla_kernel(
     pack_ds_mla_row<KV_LORA_RANK, PE_DIM>(dst, src_ckv, src_kpe);
 }
 
-template <int KV_LORA_RANK, int PE_DIM, bool SPARSE_MODE>
-__global__ void append_selected_mtp_caches_kernel(
-    const __nv_bfloat16* const* __restrict__ mla_src_ckv_ptrs,
-    const __nv_bfloat16* const* __restrict__ mla_src_kpe_ptrs,
-    void* const* __restrict__ mla_dst_ckv_ptrs,
-    __nv_bfloat16* const* __restrict__ mla_dst_kpe_ptrs,
-    uint32_t mla_layer_count,
-    const __nv_bfloat16* const* __restrict__ indexer_src_ptrs,
-    uint8_t* const* __restrict__ indexer_dst_ptrs,
-    float* const* __restrict__ indexer_dst_scale_ptrs,
-    const int32_t* __restrict__ source_rows,
-    const int32_t* __restrict__ indices,
-    const int32_t* __restrict__ indptr,
-    const int32_t* __restrict__ batch_indices,
-    const int32_t* __restrict__ positions,
-    uint32_t page_size,
-    uint32_t index_head_dim,
-    uint32_t cp_world_size,
-    uint32_t cp_rank
-) {
-    const uint32_t token_idx = blockIdx.x;
-    const uint32_t layer_idx = blockIdx.y;
-    const int batch = batch_indices[token_idx];
-    int pos = positions[token_idx];
-
-    int eff_page_size = page_size;
-    if (cp_world_size > 0) {
-        if ((uint32_t)pos % cp_world_size != cp_rank) return;
-        pos = ((uint32_t)pos - cp_rank) / cp_world_size;
-        eff_page_size = page_size / (int)cp_world_size;
-    }
-
-    const int page_in_seq = pos / eff_page_size;
-    const int offset_in_page = pos % eff_page_size;
-    const int page_id = indices[indptr[batch] + page_in_seq];
-    const size_t slot = (size_t)page_id * eff_page_size + offset_in_page;
-    const int src_row = source_rows[token_idx];
-
-    if (layer_idx < mla_layer_count) {
-        const __nv_bfloat16* src_ckv = mla_src_ckv_ptrs[layer_idx] + (size_t)src_row * KV_LORA_RANK;
-        const __nv_bfloat16* src_kpe = mla_src_kpe_ptrs[layer_idx] + (size_t)src_row * PE_DIM;
-        if constexpr (SPARSE_MODE) {
-            constexpr int BPT = KV_LORA_RANK + (KV_LORA_RANK / 128) * 4 + PE_DIM * 2;
-            uint8_t* dst = (uint8_t*)mla_dst_ckv_ptrs[layer_idx] + slot * BPT;
-            pack_ds_mla_row<KV_LORA_RANK, PE_DIM>(dst, src_ckv, src_kpe);
-        } else {
-            __nv_bfloat16* dst_ckv = (__nv_bfloat16*)mla_dst_ckv_ptrs[layer_idx] + slot * KV_LORA_RANK;
-            __nv_bfloat16* dst_kpe = mla_dst_kpe_ptrs[layer_idx] + slot * PE_DIM;
-            for (int col = threadIdx.x; col < KV_LORA_RANK; col += blockDim.x) dst_ckv[col] = src_ckv[col];
-            for (int col = threadIdx.x; col < PE_DIM; col += blockDim.x) dst_kpe[col] = src_kpe[col];
-        }
-        return;
-    }
-
-    const uint32_t indexer_layer = layer_idx - mla_layer_count;
-    const __nv_bfloat16* src = indexer_src_ptrs[indexer_layer] + (size_t)src_row * index_head_dim;
-    uint8_t* dst = indexer_dst_ptrs[indexer_layer] + slot * index_head_dim;
-    float* dst_scale = indexer_dst_scale_ptrs[indexer_layer] + slot;
-    __shared__ float scratch[4];
-    if (index_head_dim == 128) pack_indexer_k_row<128>(dst, dst_scale, src, scratch);
-    else if (index_head_dim == 64) pack_indexer_k_row<64>(dst, dst_scale, src, scratch);
-}
-
 extern "C" {
 
 void glm_concat_and_cache_ds_mla(
@@ -1289,50 +1226,6 @@ void glm_concat_and_cache_ds_mla(
     if (err != cudaSuccess) {
         fprintf(stderr, "glm_concat_and_cache_ds_mla failed: %s\n", cudaGetErrorString(err));
     }
-}
-
-void glm_append_selected_mtp_caches(
-    GlmCtx* ctx,
-    void* mla_src_ckv_ptrs, void* mla_src_kpe_ptrs,
-    void* mla_dst_ckv_ptrs, void* mla_dst_kpe_ptrs, uint32_t mla_layer_count,
-    void* indexer_src_ptrs, void* indexer_dst_ptrs, void* indexer_dst_scale_ptrs,
-    uint32_t indexer_layer_count,
-    int32_t* source_rows, int32_t* indices, int32_t* indptr,
-    int32_t* batch_indices, int32_t* positions,
-    uint32_t nnz, uint32_t page_size,
-    uint32_t kv_lora_rank, uint32_t pe_dim, uint32_t index_head_dim,
-    bool sparse_mode, uint32_t cp_world_size, uint32_t cp_rank
-) {
-    cudaSetDevice(ctx->device_id);
-    const uint32_t layer_count = mla_layer_count + indexer_layer_count;
-    if (nnz == 0 || layer_count == 0) return;
-
-    dim3 grid(nnz, layer_count);
-    constexpr int BLOCK_SIZE = 128;
-#define LAUNCH_SELECTED_MTP(KV_RANK, PE_DIM, SPARSE) \
-    append_selected_mtp_caches_kernel<KV_RANK, PE_DIM, SPARSE><<<grid, BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>( \
-        (const __nv_bfloat16* const*)mla_src_ckv_ptrs, \
-        (const __nv_bfloat16* const*)mla_src_kpe_ptrs, \
-        (void* const*)mla_dst_ckv_ptrs, \
-        (__nv_bfloat16* const*)mla_dst_kpe_ptrs, \
-        mla_layer_count, \
-        (const __nv_bfloat16* const*)indexer_src_ptrs, \
-        (uint8_t* const*)indexer_dst_ptrs, \
-        (float* const*)indexer_dst_scale_ptrs, \
-        source_rows, indices, indptr, batch_indices, positions, \
-        page_size, index_head_dim, cp_world_size, cp_rank)
-
-    if (kv_lora_rank == 512 && pe_dim == 64) {
-        if (sparse_mode) LAUNCH_SELECTED_MTP(512, 64, true);
-        else LAUNCH_SELECTED_MTP(512, 64, false);
-    } else if (kv_lora_rank == 128 && pe_dim == 64) {
-        if (sparse_mode) LAUNCH_SELECTED_MTP(128, 64, true);
-        else LAUNCH_SELECTED_MTP(128, 64, false);
-    } else {
-        fprintf(stderr, "glm_append_selected_mtp_caches: unsupported kv_lora_rank=%u pe_dim=%u\n",
-                kv_lora_rank, pe_dim);
-    }
-#undef LAUNCH_SELECTED_MTP
 }
 
 } // extern "C"

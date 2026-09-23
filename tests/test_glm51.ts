@@ -659,7 +659,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
           cache.reset(1);
           const tokens: number[] = [];
           for await (const token of generateStream(model, ws, glm, cache, prompts[0], budget, new Set(), undefined,
-            graphs ? { graphExec: null, warmupRemaining: 3 } : undefined, undefined, mtp, [1, 1])) {
+            graphs ? { graphExec: null, warmupRemaining: 3 } : undefined, undefined, mtp ? 2 : 0)) {
             tokens.push(token);
           }
           assert.equal(tokens.length, budget);
@@ -702,7 +702,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     });
     const scheduler = new GenerationScheduler({ requests, model, ws, cache, captureManager,
       samplingWorkspace: sampler, metrics, maxBatchSize: 2, chunkSize: 8,
-      decodeLatencyMs: 0, topks: mtp ? [1, 1] : undefined });
+      decodeLatencyMs: 0, numDraftTokens: mtp ? 2 : undefined });
     let stopped = false;
     const running = scheduler.run().finally(() => { stopped = true; });
     const long = makeRequest("long", 24);
@@ -854,16 +854,15 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     ws.assertClear();
   });
 
-  for (const { topks, graphs, restart } of [
-    { topks: [1, 1, 1], graphs: true, restart: false },
-    { topks: [1], graphs: false, restart: true },
-    { topks: [2, 1], graphs: true, restart: false },
-    { topks: [2, 1], graphs: false, restart: false },
-  ]) it(`stateful MTP generator matches independent verification and cleans up (${topks}, graphs=${graphs}, restart=${restart})`, async () => {
+  for (const { depth, graphs, restart } of [
+    { depth: 3, graphs: true, restart: false },
+    { depth: 1, graphs: false, restart: true },
+    { depth: 2, graphs: true, restart: false },
+    { depth: 2, graphs: false, restart: false },
+  ]) it(`stateful MTP generator matches independent verification and cleans up (depth=${depth}, graphs=${graphs}, restart=${restart})`, async () => {
     // Reconditioning changes forward shapes and therefore can change later
     // near-tied BF16 argmax decisions. Compare each verification against the
-    // independent causal forward using the SAME linear draft. For branching,
-    // compare eager execution with replay of the complete generator instead.
+    // independent causal forward using the SAME linear draft.
     const trace: { input: number[]; tokens: number[]; accepted: number; restart: boolean }[] = [];
     const run = async (generator: boolean) => {
       using cache = model.createChatCache(32, 1);
@@ -873,14 +872,14 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       const prompt = makeLongPrompt(63);
       const draft0 = await prefillChunks(model, ws, cache, [prompt], manager);
       const output = [...draft0.targetTokens];
-      if (generator || topks.some(k => k > 1)) {
+      if (generator) {
         let replayed = false;
         while (output.length < 32) {
           let steps = 0;
-          for await (const step of model.generateMtpDecode(ws, cache, topks, graphs ? manager : undefined)) {
-            assert.equal(step.numDraftTokens, topks.length);
+          for await (const step of model.generateMtpDecode(ws, cache, depth, graphs ? manager : undefined)) {
+            assert.equal(step.numDraftTokens, depth);
             assert.equal(step.tokens[0].length, step.numAccepted[0] + 1);
-            const buf = ws.tensors.get(`glm51_mtp_decode_1_${topks.join("_")}_inputs_host`)!.readPinnedBuffer();
+            const buf = ws.tensors.get(`glm51_mtp_decode_1_${depth}_inputs_host`)!.readPinnedBuffer();
             trace.push({ input: Array.from({ length: buf.length / 4 }, (_, i) => buf.readInt32LE(i * 4)),
               tokens: [...step.tokens[0]], accepted: step.numAccepted[0], restart: steps === 0 });
             assert.equal(cache.getPagedKV().sequences[0].reportedTokenCount(), cache.getPagedKV().sequences[0].allocLen);
@@ -920,7 +919,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
               using selected = logits.argmax();
               const predicted = selected.readInt32LEArray();
               let accepted = 0;
-              while (accepted < topks.length && predicted[accepted] === expected.input[accepted + 1]) accepted++;
+              while (accepted < depth && predicted[accepted] === expected.input[accepted + 1]) accepted++;
               assert.equal(accepted, expected.accepted);
               assert.deepEqual(predicted.slice(0, accepted + 1), expected.tokens);
             }
@@ -937,7 +936,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     assert.deepEqual(await run(true), await run(false));
   });
 
-  it("stateful MTP generator supplies one shared sparse-slot row per branch in a batch", async () => {
+  it("stateful MTP generator supplies one shared sparse-slot row per sequence in a batch", async () => {
     ws.free();
     ws = new ExecutionWorkspace(glm, 2, 128);
     const forwardMtp = model.forwardMtp.bind(model);
@@ -954,14 +953,14 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       const prompts = [makeLongPrompt(63), makeLongPrompt(31, [11, 12, 13])];
       await prefillChunks(model, ws, cache, prompts, manager);
       const result: number[][][] = [];
-      for await (const step of model.generateMtpDecode(ws, cache, [2, 1], manager)) {
+      for await (const step of model.generateMtpDecode(ws, cache, 2, manager)) {
         result.push(step.tokens);
         if (result.length === 10) break;
       }
       ws.assertClear();
       return result;
     };
-    // Exercise variable branch-commit sizes eagerly before recording graphs.
+    // Exercise variable commit sizes eagerly before recording graphs.
     const expected = await run(false);
     assert.deepEqual(await run(true), expected);
   });
@@ -969,18 +968,18 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
   it("stateful MTP generator unwinds on a consumer exception and can recondition again", async () => {
     using cache = model.createChatCache(32, 1);
     cache.reset(1);
-    const topks = [1, 1, 1];
+    const depth = 3;
     const prompt = [1, 2, 3, 4];
     await prefillChunks(model, ws, cache, [prompt], captureManager);
     const failure = new Error("consumer stopped");
     await assert.rejects(async () => {
-      for await (const step of model.generateMtpDecode(ws, cache, topks, captureManager)) {
+      for await (const step of model.generateMtpDecode(ws, cache, depth, captureManager)) {
         throw failure;
       }
     }, error => error === failure);
     ws.assertClear();
     const oldSequence = cache.getPagedKV().sequences[0];
-    for await (const step of model.generateMtpDecode(ws, cache, topks, captureManager)) {
+    for await (const step of model.generateMtpDecode(ws, cache, depth, captureManager)) {
       cache.getPagedKV().removeSequence(0);
       break;
     }
@@ -990,9 +989,9 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
   });
 
   for (const temperature of [0, 0.7]) it(`stateful MTP generator supports device-side acceptance (temperature=${temperature})`, async () => {
-    const topks = [1, 1, 1];
+    const depth = 3;
     using sampler = new SamplingWorkspace(glm, 4, model.cfg.vocabSize, 8,
-      { maxBatchSize: 1, depth: topks.length, retainProposalsOnGpu: true });
+      { maxBatchSize: 1, depth, retainProposalsOnGpu: true });
     const params: SamplingParams = { temperature, topK: temperature ? 8 : 1, topP: 1,
       repetitionPenalty: 1, presencePenalty: 0, repetitionPenaltyWindow: 8 };
     const run = async (graphs: boolean) => {
@@ -1010,7 +1009,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       sampler.updateMtpSampler([params]);
       sampler.updateSampler([params], [[]]);
       const output = [...draft.targetTokens];
-      for await (const step of model.generateMtpDecode(ws, cache, topks, graphs ? manager : undefined, sampler)) {
+      for await (const step of model.generateMtpDecode(ws, cache, depth, graphs ? manager : undefined, sampler)) {
         output.push(...step.tokens[0]);
         if (output.length >= 32) break;
       }
@@ -1039,7 +1038,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         }
         const output: number[] = [];
         let steps = 0;
-        for await (const step of model.generateMtpDecode(ws, cache, [1, 1])) {
+        for await (const step of model.generateMtpDecode(ws, cache, 2)) {
           output.push(...step.tokens[0]);
           if (++steps === 4) {
             break;
@@ -1126,7 +1125,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         cache.reportTokens(0, [], publishedTarget);
         paged.copySequence(1, 0);
         paged.stageSequence(0, 123);
-        const generator = mtp ? model.generateMtpDecode(ws, cache, [1, 1]) : model.generateDecode(ws, cache);
+        const generator = mtp ? model.generateMtpDecode(ws, cache, 2) : model.generateDecode(ws, cache);
         try {
           const step = await generator.next();
           assert.equal(step.done, false);
@@ -1181,7 +1180,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     const result = await model.executePrefill(ws, cache, third);
     histories.forEach((history, i) => history.push(...third[i]));
     assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()), histories);
-    for await (const output of model.generateMtpDecode(ws, cache, [1, 1])) {
+    for await (const output of model.generateMtpDecode(ws, cache, 2)) {
       assert.equal(output.numDraftTokens, 2);
       assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()),
         histories.map((history, i) => [...history, result.targetTokens[i], ...output.tokens[i].slice(0, -1)]));
@@ -1315,8 +1314,8 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
   };
 
   it("linear speculative greedy matches token-comparison verification across generator iterations", async () => {
-    const topks = [1, 1, 1];
-    using target = new SamplingWorkspace(glm, topks.length + 1, model.cfg.vocabSize, 0, { maxBatchSize: 1, depth: topks.length, retainProposalsOnGpu: true });
+    const depth = 3;
+    using target = new SamplingWorkspace(glm, depth + 1, model.cfg.vocabSize, 0, { maxBatchSize: 1, depth, retainProposalsOnGpu: true });
     target.updateMtpSampler([greedy]);
 
     const run = async (linear: boolean) => {
@@ -1330,7 +1329,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       await prefillChunks(model, ws, cache, [prompt], manager, linear ? target : undefined);
       const outputs: { tokens: number[][]; numAccepted: number[] }[] = [];
       let originalAllocLen = sequence.allocLen;
-      for await (const step of model.generateMtpDecode(ws, cache, topks, manager, linear ? target : undefined)) {
+      for await (const step of model.generateMtpDecode(ws, cache, depth, manager, linear ? target : undefined)) {
         assert.equal(sequence.allocLen, originalAllocLen + step.numAccepted[0] + 1);
         assert.equal(sequence.reportedTokenCount(), sequence.allocLen);
         outputs.push({ tokens: step.tokens, numAccepted: step.numAccepted });
@@ -1349,13 +1348,13 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     { graphs: false, retainProposalsOnGpu: true }, { graphs: true, retainProposalsOnGpu: true },
     { graphs: true, retainProposalsOnGpu: true, force: false },
   ]) it(`linear speculative stochastic rejection preserves target KV and the next MTP seed (${graphs ? "replay" : "eager"}, ${retainProposalsOnGpu ? "GPU" : "host"} q, ${force ? "forced" : "exact"})`, async t => {
-    const topks = [1, 1, 1];
+    const depth = 3;
     const stochastic: SamplingParams = { ...greedy, temperature: 1, topK: 16, topP: 0.9 };
-    using target = new SamplingWorkspace(glm, topks.length + 1, model.cfg.vocabSize, 8, { maxBatchSize: 1, depth: topks.length, retainProposalsOnGpu });
+    using target = new SamplingWorkspace(glm, depth + 1, model.cfg.vocabSize, 8, { maxBatchSize: 1, depth, retainProposalsOnGpu });
     using manager = new CaptureManager(glm);
     manager.disabled = !graphs;
     using controls = new WorkspaceBase(glm);
-    const forcedPrefix = controls.alloc([topks.length], "I32", "forcedPrefix");
+    const forcedPrefix = controls.alloc([depth], "I32", "forcedPrefix");
     const forcedCount = controls.alloc([1], "I32", "forcedCount");
     for (const name of ["stepCounter", "draftStepCounter", "rejectionStepCounter"]) {
       const seed = Buffer.alloc(4);
@@ -1377,7 +1376,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       // Match the verifier's four-row kernel dispatch without its custom mask,
       // rejected tokens, sampling, or commit machinery. Future zero rows cannot
       // condition the causal prefix; truncate them after the independent forward.
-      const padding = Array(pad ? Math.max(0, topks.length + 1 - tokens.length) : 0).fill(0);
+      const padding = Array(pad ? Math.max(0, depth + 1 - tokens.length) : 0).fill(0);
       const state = referenceWs.planPrefill(model, 1, [tokens.length + padding.length], reference);
       state.setInput([[...tokens, ...padding]]);
       using slots = new UsingHolder<Tensor>(undefined!);
@@ -1437,7 +1436,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       sampleDraft: (logits, depth) => { draftRuns++; return target.sampleDraft(logits, depth); },
       prepareVerificationFromDevice: (draftTokens, batchSize) => {
         target.prepareVerificationFromDevice(draftTokens, batchSize);
-        forcedPrefix.memcpy(draftTokens, topks.length * 4);
+        forcedPrefix.memcpy(draftTokens, depth * 4);
       },
       verify: logits => {
         verifyRuns++;
@@ -1456,12 +1455,12 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       },
     };
 
-    const generator = model.generateMtpDecode(ws, cache, topks, executionManager, forcedSampler);
+    const generator = model.generateMtpDecode(ws, cache, depth, executionManager, forcedSampler);
     let outstanding = draft.targetTokens[0];
-    if (force) target.updateSampler(Array.from({ length: topks.length + 1 }, () => stochastic), Array.from({ length: topks.length + 1 }, () => []));
+    if (force) target.updateSampler(Array.from({ length: depth + 1 }, () => stochastic), Array.from({ length: depth + 1 }, () => []));
     try {
       for (let iteration = 0; iteration < 18; iteration++) {
-        forcedAccepted = iteration % topks.length;
+        forcedAccepted = iteration % depth;
         forcedCount.h2d(Buffer.from(new Int32Array([forcedAccepted]).buffer));
         const originalAllocLen = sequence.allocLen;
         const history = sequence.getTokenIds();
@@ -1469,7 +1468,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         assert.equal(next.done, false);
         const step = next.value!;
         if (force) assert.deepStrictEqual(step.numAccepted, [forcedAccepted]);
-        assert.equal(step.numDraftTokens, topks.length);
+        assert.equal(step.numDraftTokens, depth);
         assert.equal(sequence.allocLen, originalAllocLen + step.numAccepted[0] + 1);
         assert.deepStrictEqual(sequence.getTokenIds(), [...history, outstanding, ...step.tokens[0].slice(0, -1)]);
         assert.equal(sequence.reportedTokenCount(), sequence.allocLen);
@@ -1481,7 +1480,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         }
         assert.ok(bf16BytesToF32(expectedSeed).every(Number.isFinite));
         outstanding = step.tokens[0].at(-1)!;
-        assert.equal(target.batchSize, force ? topks.length + 1 : 1);
+        assert.equal(target.batchSize, force ? depth + 1 : 1);
         assert.equal(target.penaltyCount.readInt32LEArray()[0], force ? iteration + 1 : 1, "verification/draft must not advance ordinary target penalty history");
         target.assertClear();
       }
@@ -1495,7 +1494,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     assert.deepStrictEqual(cachedNext, freshNext, "target KV after rejection differs from fresh history");
     if (graphs) {
       assert.ok(verifyRuns < 18, "verification must replay without calling the JS sampler");
-      assert.ok(draftRuns < 18 * topks.length, "draft must replay without calling the JS sampler");
+      assert.ok(draftRuns < 18 * depth, "draft must replay without calling the JS sampler");
       assert.ok([...manager.captured].some(([key, entry]) => key.startsWith("glm51-mtp-decode") && entry.graphExec !== null && entry.capturedWorkspaces.has(target)));
     }
     t.diagnostic(`${comparedBytes} committed cache bytes and 18 BF16 seeds equal exactly; verification JS runs=${verifyRuns}/18, draft JS runs=${draftRuns}/54`);

@@ -22,7 +22,6 @@ interface Args extends ModelCliArgs {
   maxNewTokens: number;
   maxSeqLen: number;
   maxPages: number;
-  mtpDraftTopk: number[];
   noCudaGraph: boolean;
   noMtp: boolean;
   contextLen?: number;
@@ -49,7 +48,6 @@ function parseArgs(argv: string[]): Args {
     maxNewTokens: 2000,
     maxSeqLen: 4096,
     maxPages: 256,
-    mtpDraftTopk: [1, 1, 1],
     noCudaGraph: false,
     noMtp: false,
     contextLen: undefined,
@@ -72,9 +70,7 @@ function parseArgs(argv: string[]): Args {
     else if (arg === "--file" && i + 1 < argv.length) args.file = argv[++i];
     else if (arg === "--context-len" && i + 1 < argv.length) args.contextLen = parseLength(argv[++i]);
     else if (arg === "--instruction" && i + 1 < argv.length) args.instruction = argv[++i];
-    else if (arg === "--mtp-draft-topk" && i + 1 < argv.length) {
-      args.mtpDraftTopk = argv[++i].split(",").map(value => parseInt(value.trim(), 10));
-    } else if (arg === "--no-cuda-graph") args.noCudaGraph = true;
+    else if (arg === "--no-cuda-graph") args.noCudaGraph = true;
     else if (arg === "--no-mtp") args.noMtp = true;
     else if (arg === "--ignore-eos") args.ignoreEos = true;
     else if (arg === "--warmup-runs") args.warmupRuns = Number(argv[++i]);
@@ -113,14 +109,11 @@ function parseArgs(argv: string[]): Args {
   if (!Number.isInteger(args.maxPages) || args.maxPages < 1) {
     throw new Error(`Invalid --max-pages: ${args.maxPages}`);
   }
-  if (args.mtpDraftTopk.length === 0 || args.mtpDraftTopk.some(topk => !Number.isInteger(topk) || topk < 1)) {
-    throw new Error(`Invalid --mtp-draft-topk: ${args.mtpDraftTopk.join(",")}`);
-  }
-  if (!args.useGlm51 || (!args.mtp && !args.noMtp)) {
+  if (!args.useGlm51 || (args.mtp === 0 && !args.noMtp)) {
     throw new Error("run_glm51_multiple_mtp requires --glm51 and either --mtp or --no-mtp");
   }
   if (args.noMtp) {
-    args.mtp = false;
+    args.mtp = 0;
   }
   if (args.contextLen !== undefined) {
     args.maxSeqLen = Math.max(args.maxSeqLen, args.contextLen + args.maxNewTokens);
@@ -243,7 +236,7 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCa
   }
   const generated: number[][] = Array.from({ length: args.batchSize }, () => []);
   const finished = Array(args.batchSize).fill(args.maxNewTokens === 0);
-  const mtpStats = args.noMtp ? undefined : new MtpStats(args.mtpDraftTopk.length);
+  const mtpStats = args.noMtp ? undefined : new MtpStats(args.mtp);
   let firstPostWarmupTime = 0;
   let lastTokenTime = 0;
   let postWarmupTokenCount = 0;
@@ -265,7 +258,7 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCa
   if (!finished.some(Boolean)) {
     const generator = args.noMtp
       ? model.generateDecode(ws, cache, captureManager)
-      : model.generateMtpDecode(ws, cache, args.mtpDraftTopk, captureManager);
+      : model.generateMtpDecode(ws, cache, args.mtp, captureManager);
     for await (const step of generator) {
       const { warmup, tokens: stepTokens, numAccepted, numDraftTokens } = step;
       if (!warmup && mtpStats) {
@@ -329,7 +322,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     const workspaceSeqLen = args.file ? Math.min(args.maxSeqLen, PREFILL_CHUNK_SIZE + 1) : args.maxSeqLen;
     cache = model.createChatCache(args.maxPages, args.batchSize, workspaceSeqLen);
     ws = new ExecutionWorkspace(glm, args.batchSize, workspaceSeqLen);
-    console.log(`GLM-5.1 batched ${args.noMtp ? "decode" : "MTP"}: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, topk=${args.noMtp ? "off" : args.mtpDraftTopk.join(",")}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);
+    console.log(`GLM-5.1 batched ${args.noMtp ? "decode" : "MTP"}: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, depth=${args.noMtp ? "off" : args.mtp}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);
     using captureManager = new CaptureManager(glm);
     captureManager.disabled = args.noCudaGraph;
     for (let run = 0; run <= args.warmupRuns; run++) {

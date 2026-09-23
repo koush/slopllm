@@ -33,7 +33,6 @@ interface CliArgs extends ModelCliArgs {
   greedy: boolean;
   stats: boolean;
   meta: boolean;
-  mtpDraftTopk: number[];
 }
 
 class ExecutionResources implements Disposable {
@@ -92,7 +91,6 @@ function parseArgs(argv: string[]): CliArgs {
     greedy: false,
     stats: false,
     meta: false,
-    mtpDraftTopk: [],
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -117,14 +115,6 @@ function parseArgs(argv: string[]): CliArgs {
     }
     else if (a === "--stats") args.stats = true;
     else if (a === "--meta") args.meta = true;
-    else if (a === "--mtp-draft-topk" && i + 1 < argv.length) args.mtpDraftTopk = argv[++i].split(",").map(s => parseInt(s.trim(), 10));
-  }
-
-  if (args.mtp && args.mtpDraftTopk.length === 0) {
-    args.mtpDraftTopk = [1, 1, 1];
-  }
-  if (args.mtpDraftTopk.some(topk => !Number.isInteger(topk) || topk < 1)) {
-    throw new Error(`Invalid --mtp-draft-topk: ${args.mtpDraftTopk.join(",")}`);
   }
 
   if (args.useQwen35 && args.temperature > 0 && args.topP === 0.95 && args.topK === 0 && args.repetitionPenalty === 1.0 && args.presencePenalty === 0) {
@@ -179,7 +169,7 @@ export interface DecodeTiming {
 async function* generateMtpStream(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
-  topks: readonly number[], graphState?: GraphState, timing?: DecodeTiming,
+  numDraftTokens: number, graphState?: GraphState, timing?: DecodeTiming,
 ): AsyncGenerator<number> {
   if (!model.generateMtpDecode) {
     throw new Error("The selected model does not support MTP decoding");
@@ -187,7 +177,7 @@ async function* generateMtpStream(
 
   using captureManager = new CaptureManager(glm);
   captureManager.disabled = graphState === undefined;
-  const mtpStats = new MtpStats(topks.length);
+  const mtpStats = new MtpStats(numDraftTokens);
   if (timing) {
     timing.mtpStats = mtpStats;
   }
@@ -209,7 +199,7 @@ async function* generateMtpStream(
     if (eosIds.has(target) || generated >= maxNewTokens) return;
 
     let started = performance.now();
-    for await (const result of model.generateMtpDecode(ws, cache, topks, captureManager)) {
+    for await (const result of model.generateMtpDecode(ws, cache, numDraftTokens, captureManager)) {
       const step = { result, warmup: result.warmup };
       execMs += performance.now() - started;
 
@@ -259,20 +249,17 @@ export async function* generateStream(
   model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
-  timing?: DecodeTiming, mtp?: boolean, mtpDraftTopk?: number[],
+  timing?: DecodeTiming, numDraftTokens?: number,
 ): AsyncGenerator<number> {
   if (maxNewTokens <= 0) {
     return;
   }
-  const topks = mtp && mtpDraftTopk && mtpDraftTopk.length > 0 &&
-    model.generateMtpDecode
-    ? mtpDraftTopk
-    : [];
-  if (topks.length > 0) {
+  const useMtp = (numDraftTokens ?? 0) > 0 && !!model.generateMtpDecode;
+  if (useMtp) {
     if (sampling) {
       throw new Error("Plan-based MTP decoding currently supports greedy sampling only");
     }
-    yield* generateMtpStream(model, ws, glm, cache, inputIds, maxNewTokens, eosIds, topks, graphState, timing);
+    yield* generateMtpStream(model, ws, glm, cache, inputIds, maxNewTokens, eosIds, numDraftTokens!, graphState, timing);
     return;
   }
 
@@ -430,7 +417,7 @@ async function interactiveChat(
       const generatedIds: number[] = [];
       const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-      for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk)) {
+      for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp)) {
         generatedIds.push(tokenId);
         tokCount++;
         const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -471,7 +458,7 @@ async function singlePrompt(
   const generatedIds: number[] = [];
   const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-  for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp, args.mtpDraftTopk)) {
+  for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -609,7 +596,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const samplingStr = !args.greedy ? samplingParts.join(" ") : "greedy";
 
   const arenaStr = args.arena ? `  |  arena=${args.arena}GB` : "";
-  const mtpStr = args.mtp ? `  |  mtp=${args.mtpDraftTopk.join(',')}` : "";
+  const mtpStr = args.mtp > 0 ? `  |  mtp=${args.mtp}` : "";
   console.log(`${modelLabel(args)}  |  GPU${args.gpus.length > 1 ? "s" : ""} ${gpuLabel}  |  max_seq_len=${args.maxSeqLen}  |  max_tokens=${args.maxNewTokens}  |  ${args.useBatch ? `batch=${args.maxBatch}` : (args.noCudaGraph ? "cuda_graph=off" : `cuda_graph=on(warmup=${args.warmupSteps})`)}  |  ${samplingStr}${arenaStr}${mtpStr}`);
 
   if (args.useBatch) {

@@ -1626,18 +1626,6 @@ export class GlmOps implements DeviceOps {
     return kvCache.viewClone();
   }
 
-  appendSelectedMtpCaches(mlaSrcCkvPtrs: Tensor, mlaSrcKpePtrs: Tensor, mlaDstCkvPtrs: Tensor, mlaDstKpePtrs: Tensor | undefined,
-    indexerSrcPtrs: Tensor | undefined, indexerDstPtrs: Tensor | undefined, indexerDstScalePtrs: Tensor | undefined,
-    sourceRows: Tensor, indices: Tensor, indptr: Tensor, batchIndices: Tensor, positions: Tensor,
-    pageSize: number, kvLoraRank: number, peDim: number, indexHeadDim: number, sparseMode: boolean,
-    cpWorldSize: number = 0, cpRank: number = 0): void {
-    getNativeAddon().appendSelectedMtpCaches(this.ctx,
-      ptr(mlaSrcCkvPtrs), ptr(mlaSrcKpePtrs), ptr(mlaDstCkvPtrs), ptr(mlaDstKpePtrs), mlaSrcCkvPtrs.numElements,
-      ptr(indexerSrcPtrs), ptr(indexerDstPtrs), ptr(indexerDstScalePtrs), indexerSrcPtrs?.numElements ?? 0,
-      ptr(sourceRows), ptr(indices), ptr(indptr), ptr(batchIndices), ptr(positions), sourceRows.numElements,
-      pageSize, kvLoraRank, peDim, indexHeadDim, sparseMode, cpWorldSize, cpRank);
-  }
-
   gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void {
     if (recurrentState.type !== "F32") throw new Error(`gdnRecurrentStep: state must be F32, got ${recurrentState.type}`);
     if (aLog.type !== "F32") throw new Error(`gdnRecurrentStep: aLog must be F32, got ${aLog.type}`);
