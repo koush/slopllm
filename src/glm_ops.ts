@@ -1262,7 +1262,7 @@ export class GlmOps implements DeviceOps {
   withStream<T>(highPriority: boolean | (() => T), fn?: () => T) {
     if (typeof highPriority === 'function') {
       fn = highPriority;
-      highPriority = GlmOps.isHighPriorityStream(this.currentStream);
+      highPriority = false;
     }
     if (!fn) throw new Error('withStream requires a callback');
 

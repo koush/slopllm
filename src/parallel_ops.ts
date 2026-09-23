@@ -3983,7 +3983,7 @@ export class ParallelOps implements DeviceOps {
         valuePtrs[owner] = this.peerArenaPointer(source, owner, stagedValues[owner].data);
         indexPtrs[owner] = this.peerArenaPointer(source, owner, stagedIndices[owner].data);
       }
-      using write = this.devices[source].withStream(() => {
+      using write = this.devices[source].withStream(true, () => {
         addon.p2pReduceScatterWrite(
           this.devices[source].ctx, (paddedValues ?? sourceValues).data,
           valuePtrs[0], valuePtrs[1], valuePtrs[2], valuePtrs[3],
@@ -4011,7 +4011,7 @@ export class ParallelOps implements DeviceOps {
         stagedValues[owner].fill(-Infinity, stagedValues[owner].numElements);
         stagedIndices[owner].fill(0, stagedIndices[owner].numElements);
       }
-      using qvStream = this.devices[owner].withStream(() => {
+      using qvStream = this.devices[owner].withStream(true, () => {
         // Swapping [W, 1, topk] to [1, W, topk] preserves flat order.
         using queryValuesFlat = ownerQ === 1
           ? stagedValues[owner].viewClone()

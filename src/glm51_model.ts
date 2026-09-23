@@ -527,7 +527,7 @@ export class Glm51Model extends ChatModel {
       throw new Error(`mlpSparse: nGroup > 1 is not supported (got nGroup=${nGroup})`);
     }
 
-    using routedStream = this.glm.withStream(() => {
+    using routedStream = this.glm.withStream(true, () => {
       using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!);
       const routed = gateLogitsBuf.moeRoute({
         numExpertsPerToken: topK,
@@ -535,37 +535,32 @@ export class Glm51Model extends ChatModel {
         scalingFactor: cfg.routedScalingFactor,
         normalize: cfg.normTopkProb,
       });
-      return routed;
+
+      using topkIndices = routed.indices;
+      using normalizedWeightsStream = routed.normalizedWeightsStream;
+      using _normalizedWeights = normalizedWeightsStream.result;
+
+      const count = BS * topK;
+      using topkIndicesFlat = topkIndices.reshape([count]);
+
+      const gateWeights = this.getExpertWeights(pfx, "gate_proj");
+      const upWeights = this.getExpertWeights(pfx, "up_proj");
+      const downWeights = this.getExpertWeights(pfx, "down_proj");
+
+      const routedOut = normed.swiGluMlpMoeReduce({
+        gate: gateWeights, up: upWeights, down: downWeights,
+        normalizedWeightsStream,
+      }, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
+
+      return routedOut;
     });
-    const routed = routedStream.result;
 
     // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
-    using sharedMlpStream = this.glm.withStream(() => {
-      const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
-      return normed.swiGluMlp(sharedWeights);
-    });
+    const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
+    using sharedDownBuf = normed.swiGluMlp(sharedWeights);
 
     routedStream.streamWaitEvent();
-
-    using topkIndices = routed.indices;
-    using normalizedWeightsStream = routed.normalizedWeightsStream;
-    using _normalizedWeights = normalizedWeightsStream.result;
-
-    const count = BS * topK;
-    using topkIndicesFlat = topkIndices.reshape([count]);
-
-    const gateWeights = this.getExpertWeights(pfx, "gate_proj");
-    const upWeights = this.getExpertWeights(pfx, "up_proj");
-    const downWeights = this.getExpertWeights(pfx, "down_proj");
-
-    using routedOut = normed.swiGluMlpMoeReduce({
-      gate: gateWeights, up: upWeights, down: downWeights,
-      normalizedWeightsStream,
-    }, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
-
-    sharedMlpStream.streamWaitEvent();
-    using sharedDownBuf = sharedMlpStream.result;
-
+    using routedOut = routedStream.result;
     using result = routedOut.add(sharedDownBuf, BS * hs);
     return result.reshape([BS, hs]);
   }
@@ -589,11 +584,11 @@ export class Glm51Model extends ChatModel {
     const S = state.isDecode ? 1 : state.totalTokens;
 
     // start asap for idxq and q
-    using qNormedStream = this.glm.withStream(() => {
+    using qNormedStream = this.glm.withStream(true, () => {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
       return qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
     });
-    using _qNormed = qNormedStream.result;
+    using qNormed = qNormedStream.result;
 
     const shared = cfg.indexerTypes[layerIdx] === "shared";
 
@@ -601,13 +596,14 @@ export class Glm51Model extends ChatModel {
     // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
     using idxQStream = shared
       ? undefined
-      : this.glm.withStream(() => {
+      : this.glm.withStream(true, () => {
         using idxWeightsStream = this.glm.withStream(() => {
           const idxNHeads = cfg.indexNHeads;
           const idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!);
           idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
           return idxWeights;
         });
+        using idxWeights = idxWeightsStream?.result;
 
         // Indexer K: wk(normed) → layernorm → partial RoPE → append to kData
         // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
@@ -653,8 +649,8 @@ export class Glm51Model extends ChatModel {
           );
           return { kData: cache.ckv, kScaleData: cache.kpe! };
         });
-
-        using idxWeights = idxWeightsStream?.result;
+        using kData = kvcacheIndex!.result.kData;
+        using kScaleData = kvcacheIndex!.result.kScaleData;
 
         const idxHeadDim = cfg.indexHeadDim;
         const idxTopk = cfg.indexTopk;
@@ -663,14 +659,11 @@ export class Glm51Model extends ChatModel {
         // | `model.layers.N.self_attn.indexer.wq_b.weight` | [4096, 2048] | bfloat16 | 78 | 1.22 GB |
 
         qNormedStream.streamWaitEvent();
-        using idxQLin = qNormedStream.result.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!);
+        using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!);
         using rotated = idxQLin.applyRotaryPosEmb(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, 2, cfg.indexerRopeInterleave);
         using idxQ = rotated.reshape([B * S, cfg.indexNHeads, cfg.indexHeadDim]);
 
         kvcacheIndex?.streamWaitEvent();
-        using kData = kvcacheIndex!.result.kData;
-        using kScaleData = kvcacheIndex!.result.kScaleData;
-
         idxWeightsStream!.streamWaitEvent();
 
         // Store the raw indexer top-k (token positions); slots are derived
@@ -753,7 +746,7 @@ export class Glm51Model extends ChatModel {
       using absorbedWeight = absorbedWeightStream?.result;
       qNormedStream.streamWaitEvent();
       return this.glm.projectMlaQuery(
-        state, cache.ckv!, qNormedStream.result,
+        state, cache.ckv!, qNormed,
         this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
         this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
         this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
@@ -849,10 +842,18 @@ export class Glm51Model extends ChatModel {
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
       const oProj = this.tensors.get(`${pfx}.o_proj.weight`)!;
       if (BS <= 32 && process.env.GLM_L2_PREFETCH !== "0") {
+        using vExpandStream = this.glm.withStream(true, () => {
+          return attnOut.mlaVExpand(vProj, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);
+        });
+        using vExpanded = vExpandStream.result;
         prefetchL2.replace(this.glm.withStream(() => this.glm.prefetchL2([oProj])));
+        vExpandStream.streamWaitEvent();
+        oProjBuf.replace(vExpanded.outputProj(oProj));
       }
-      using vExpanded = attnOut.mlaVExpand(vProj, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);
-      oProjBuf.replace(vExpanded.outputProj(oProj));
+      else {
+        using vExpanded = attnOut.mlaVExpand(vProj, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);
+        oProjBuf.replace(vExpanded.outputProj(oProj));
+      }
     }
 
     yield;
