@@ -2,13 +2,13 @@ import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, not
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
 import { bf16BytesToF32, f32ToBf16Bytes, GlmOps, GlmTensor, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM, NCCL_UINT8 } from "./glm_ops";
+import type { HeapKey } from "./heap";
 import { getNativeAddon } from "./native-addon";
 import { SafeTensorFile } from "./safetensors";
 import { sparseMlaChunksPerBlock } from "./sparse-mla-planner";
 import { Tensor, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
-import type { HeapKey } from "./heap";
 
 // Fall back to the read-based (pull) CP merge; the push path is the default.
 export const CP_MERGE_PULL = process.env.GLM_CP_MERGE_PULL === "1";
@@ -1767,6 +1767,10 @@ export class ParallelTensor extends Tensor {
 
   moeRoute(options: MoeRoutingOptions): MoeRoutingResult {
     this.validateMoeRoute(options);
+    if (this.parallelism === TensorParallelism.Row) {
+      using gathered = this.allGather(this.workspace);
+      return gathered.moeRoute(options);
+    }
     const bias = options.correctionBias;
     if (this.parallelism !== TensorParallelism.Replicated || (bias && (!(bias instanceof ParallelTensor)
       || bias.parallelOps !== this.parallelOps || bias.parallelism !== TensorParallelism.Replicated))) {
@@ -3354,39 +3358,52 @@ export class ParallelOps implements DeviceOps {
   }
 
   projectMlaQuery(state: ExecutionState, kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, qNopeWeight: Tensor, kNopeWeight: Tensor, absorbedWeight: Tensor | undefined, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): MlaQuery {
+    const gatherQ = this.cast(kvCache).parallelism === TensorParallelism.Row;
+
     using qPeStream = this.withStream(() => {
       using qPeLin = qNormed.linear(qPeWeight);
       using rotated = qPeLin.applyRotaryPosEmb(cos, sin, qkRopeDim, qkRopeDim, nHeads, seqLen, batch, 2, ropeInterleave);
-      return rotated.reshape([batch * seqLen, nHeads, qkRopeDim]);
+      using reshaped = rotated.reshape([batch * seqLen, nHeads, qkRopeDim]);
+
+      if (!gatherQ) {
+        return reshaped.viewClone();
+      }
+      return this.cast(reshaped).allGather(qNormed.workspace);
     });
     const qAbsorbed = (() => {
+      const quantizeAndGather = (qAbsorbed: Tensor) => {
+        if (gatherQ && state.cache.getPagedKV().sparseMode) {
+          const quantized = this.quantizeFp8(qAbsorbed, 128);
+          using localQFp8 = quantized.values;
+          using localQScales = quantized.scales;
+
+          const gathered = this.allGatherMultiple([localQFp8, localQScales], qNormed.workspace);
+          return gathered;
+        }
+
+        if (gatherQ) {
+          return [this.cast(qAbsorbed).allGather(qNormed.workspace)];
+        }
+        return [qAbsorbed.viewClone()];
+      };
+
       if (absorbedWeight) {
         using projected = qNormed.linear(absorbedWeight);
-        return projected.reshape([batch * seqLen, nHeads, kvLoraRank]);
+        using reshaped = projected.reshape([batch * seqLen, nHeads, kvLoraRank]);
+        return quantizeAndGather(reshaped);
       }
       using qNope = qNormed.linear(qNopeWeight);
-      return qNope.absorbMlaQuery(kNopeWeight, nHeads, kvLoraRank);
+      using qAbsorbed = qNope.absorbMlaQuery(kNopeWeight, nHeads, kvLoraRank);
+      return quantizeAndGather(qAbsorbed);
     })();
-    const gatherQ = this.cast(kvCache).parallelism === TensorParallelism.Row;
-    const quantized = gatherQ && state.cache.getPagedKV().sparseMode
-      ? this.quantizeFp8(qAbsorbed, 128)
-      : undefined;
-    using localQFp8 = quantized?.values;
-    using localQScales = quantized?.scales;
+
     qPeStream.streamWaitEvent();
     const qPe = qPeStream.result as ParallelTensor;
     if (!gatherQ) {
-      return { qAbsorbed, qPe };
+      return { qAbsorbed: qAbsorbed[0], qPe };
     }
 
-    using localQAbsorbed = qAbsorbed as ParallelTensor;
-    using localQPe = qPe;
-    if (localQFp8 && localQScales) {
-      const gathered = this.allGatherMultiple([localQFp8, localQScales, localQPe], qNormed.workspace);
-      return { qAbsorbed: gathered[0], qAbsorbedScales: gathered[1], qPe: gathered[2] };
-    }
-    const gathered = this.allGatherMultiple([localQAbsorbed, localQPe], qNormed.workspace);
-    return { qAbsorbed: gathered[0], qPe: gathered[1] };
+    return { qAbsorbed: qAbsorbed[0], qAbsorbedScales: qAbsorbed[1], qPe };
   }
 
   private cast(tensor: Tensor): ParallelTensor {
