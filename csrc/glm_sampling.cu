@@ -132,6 +132,20 @@ __device__ void sampling_scale_logits(
     int vocab_size,
     float inv_temp
 ) {
+    // Odd vocabulary strides can leave later rows unaligned for paired accesses.
+    if ((reinterpret_cast<uintptr_t>(seq_logits) % alignof(__nv_bfloat162)) == 0 &&
+        (reinterpret_cast<uintptr_t>(seq_workspace) % alignof(float2)) == 0) {
+        const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(seq_logits);
+        auto* output = reinterpret_cast<float2*>(seq_workspace);
+        for (int i = tid; i < vocab_size / 2; i += block_size) {
+            float2 val = __bfloat1622float2(pairs[i]);
+            output[i] = make_float2(val.x * inv_temp, val.y * inv_temp);
+        }
+        if ((vocab_size & 1) && tid == 0) {
+            seq_workspace[vocab_size - 1] = __bfloat162float(seq_logits[vocab_size - 1]) * inv_temp;
+        }
+        return;
+    }
     for (int i = tid; i < vocab_size; i += block_size) {
         float val = __bfloat162float(seq_logits[i]);
         seq_workspace[i] = val * inv_temp;
@@ -302,6 +316,17 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
         __syncthreads();
         for (int i = tid; i < vocab_size; i += block_size) {
             heap_insert(local_heap, local_size, p.effective_k, seq_workspace[i], i);
+        }
+    } else if ((reinterpret_cast<uintptr_t>(seq_logits) % alignof(__nv_bfloat162)) == 0) {
+        const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(seq_logits);
+        for (int i = tid; i < vocab_size / 2; i += block_size) {
+            float2 val = __bfloat1622float2(pairs[i]);
+            heap_insert(local_heap, local_size, p.effective_k, val.x * inv_temp, 2 * i);
+            heap_insert(local_heap, local_size, p.effective_k, val.y * inv_temp, 2 * i + 1);
+        }
+        if ((vocab_size & 1) && tid == 0) {
+            float val = __bfloat162float(seq_logits[vocab_size - 1]) * inv_temp;
+            heap_insert(local_heap, local_size, p.effective_k, val, vocab_size - 1);
         }
     } else {
         for (int i = tid; i < vocab_size; i += block_size) {

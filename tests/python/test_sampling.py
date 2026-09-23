@@ -138,7 +138,7 @@ def _sample_buffers(glm, device, logits, top_ks, temperatures, top_ps, seed,
     return launch, out, probs, ids, counter
 
 
-@pytest.mark.parametrize("vocab", [1024, 154880])
+@pytest.mark.parametrize("vocab", [1024, 1025, 154880])
 @pytest.mark.parametrize("top_ks", [
     [1], [8, 1], [16, 8, 1], [20, 8, 0, -1, 1],
     [64, 20, 0, 1], [65, 20, 0, 1], [256, 65, 20, 0, 1],
@@ -156,6 +156,8 @@ def test_sample_batch_compact_distribution(glm, device, vocab, top_ks):
             -torch.arange(224).float() / 128,
         ))
     logits = logits.bfloat16()
+    # Exercise the paired scan's scalar tail and unaligned odd-stride rows.
+    logits[:, -1] = 8
     temperatures = [0.75 if row % 2 == 0 else 1.5 for row in range(batch)]
     temperatures[-1] = 0.0
     top_ps = [0.55] * batch
