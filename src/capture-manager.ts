@@ -201,7 +201,7 @@ export class CaptureManager implements Disposable, ExecutionManager {
                     return mapTensors(captured.result, tensor => tensor.uncapture());
                 }
 
-                if (captured.warmupSteps === 3) {
+                if (captured.warmupSteps === 1) {
                     const capturedInputs: typeof inputs = {} as any;
                     for (const [name, tensor] of Object.entries(inputs)) {
                         if (!tensor)
