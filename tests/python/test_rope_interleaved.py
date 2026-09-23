@@ -2,6 +2,32 @@ import torch
 import pytest
 
 
+@pytest.mark.parametrize("head_dim,n_heads", [(64, 8), (128, 4)])
+@pytest.mark.parametrize("batch,seq_len", [(1, 4), (2, 5), (1, 512)])
+@pytest.mark.parametrize("padding", [0, 32])
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_apply_rotary_pos_emb_glm_shapes(glm, device, head_dim, n_heads,
+                                       batch, seq_len, padding, interleaved):
+    rope_dim = 64
+    in_stride = head_dim + padding
+    cos, sin = _make_rope((batch, seq_len, rope_dim), rope_dim // 2,
+                         seq_len, batch, device)
+    x = torch.randn(batch, seq_len, n_heads, in_stride,
+                    dtype=torch.bfloat16, device=device)
+    out = torch.empty(batch, seq_len, n_heads, head_dim,
+                      dtype=torch.bfloat16, device=device)
+    glm.apply_rotary_pos_emb(out, x, cos, sin, rope_dim, head_dim,
+                            n_heads, seq_len, batch, 2,
+                            interleaved=interleaved, in_stride=in_stride)
+    ref = x[..., :head_dim].clone()
+    rotate = (_ref_apply_rotary_pos_emb_interleaved if interleaved
+              else _ref_apply_rotary_pos_emb_neox)
+    ref[..., :rope_dim] = rotate(x[..., :rope_dim], cos, sin, unsqueeze_dim=2)
+    torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(out[..., rope_dim:], x[..., rope_dim:head_dim],
+                               atol=0, rtol=0)
+
+
 def _ref_apply_rotary_pos_emb_neox(x, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)

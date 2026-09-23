@@ -1771,7 +1771,7 @@ void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
 // original behavior.
 // ---------------------------------------------------------------------------
 
-template <bool kInterleaved>
+template <bool kInterleaved, int kHeadDim = 0, int kRopeDim = 0, int kUnsqueezeDim = 0>
 __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* x,
@@ -1785,22 +1785,36 @@ __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
     int unsqueeze_dim,
     int in_stride
 ) {
-    int total = batch * n_heads * seq_len * head_dim;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
+    if constexpr (kHeadDim > 0) head_dim = kHeadDim;
+    if constexpr (kHeadDim > 0) rope_dim = kRopeDim;
+    if constexpr (kUnsqueezeDim > 0) unsqueeze_dim = kUnsqueezeDim;
 
-    int d = idx % head_dim;
-    int b, h, s;
-    if (unsqueeze_dim == 1) {
-        int rest = idx / head_dim;
-        s = rest % seq_len;
-        h = (rest / seq_len) % n_heads;
-        b = rest / (n_heads * seq_len);
+    int d, b, h, s;
+    if constexpr (kHeadDim > 0) {
+        // Common GLM shapes: preserve ropeTranspose's one token/head per
+        // block, including its sequence-first block order. Small decode
+        // workloads otherwise collapse into too few 256-thread blocks.
+        d = threadIdx.x;
+        s = blockIdx.x % seq_len;
+        h = (blockIdx.x / seq_len) % n_heads;
+        b = blockIdx.x / (seq_len * n_heads);
     } else {
-        int rest = idx / head_dim;
-        h = rest % n_heads;
-        s = (rest / n_heads) % seq_len;
-        b = rest / (n_heads * seq_len);
+        int total = batch * n_heads * seq_len * head_dim;
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total) return;
+
+        d = idx % head_dim;
+        if (unsqueeze_dim == 1) {
+            int rest = idx / head_dim;
+            s = rest % seq_len;
+            h = (rest / seq_len) % n_heads;
+            b = rest / (n_heads * seq_len);
+        } else {
+            int rest = idx / head_dim;
+            h = rest % n_heads;
+            s = (rest / n_heads) % seq_len;
+            b = rest / (n_heads * seq_len);
+        }
     }
 
     int x_idx, out_idx;
@@ -1837,24 +1851,47 @@ __global__ void __launch_bounds__(256, 4) apply_rotary_pos_emb_kernel(
     }
 }
 
+template <bool kInterleaved>
+static void launch_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
+                                      const void* cos, const void* sin,
+                                      int rope_dim, int head_dim, int n_heads, int seq_len,
+                                      int batch, int unsqueeze_dim, int in_stride) {
+    const int rows = batch * n_heads * seq_len;
+    if (unsqueeze_dim == 2 && rope_dim == 64) {
+        if (head_dim == 64) {
+            apply_rotary_pos_emb_kernel<kInterleaved, 64, 64, 2><<<rows, 64, 0, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
+                (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
+                rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim, in_stride);
+            return;
+        }
+        if (head_dim == 128) {
+            apply_rotary_pos_emb_kernel<kInterleaved, 128, 64, 2><<<rows, 128, 0, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
+                (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
+                rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim, in_stride);
+            return;
+        }
+    }
+    const int block_size = 256;
+    const int grid = (rows * head_dim + block_size - 1) / block_size;
+    apply_rotary_pos_emb_kernel<kInterleaved><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
+        (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
+        rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim, in_stride);
+}
+
 void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
                                const void* cos, const void* sin,
                                int rope_dim, int head_dim, int n_heads, int seq_len,
                                int batch, int unsqueeze_dim, int in_stride, bool interleaved) {
     cudaSetDevice(ctx->device_id);
-    int total = batch * n_heads * seq_len * head_dim;
-    int block_size = 256;
-    int grid = (total + block_size - 1) / block_size;
     if (interleaved) {
-        apply_rotary_pos_emb_kernel<true><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
-            (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
-            rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim, in_stride);
+        launch_apply_rotary_pos_emb<true>(ctx, out, x, cos, sin,
+            rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, in_stride);
     } else {
-        apply_rotary_pos_emb_kernel<false><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
-            (__nv_bfloat16*)out, (const __nv_bfloat16*)x,
-            (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
-            rope_dim, head_dim, seq_len, n_heads, batch, unsqueeze_dim, in_stride);
+        launch_apply_rotary_pos_emb<false>(ctx, out, x, cos, sin,
+            rope_dim, head_dim, n_heads, seq_len, batch, unsqueeze_dim, in_stride);
     }
 }
 
