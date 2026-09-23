@@ -3248,18 +3248,13 @@ export class ParallelOps implements DeviceOps {
     notifySynchronizedWorkspaces(this.synchronizeListeners);
   }
 
-  availableStreams: number[] = [];
+  normalPriorityStreams: number[] = [];
+  highPriorityStreams: number[] = [];
   get currentStream() {
     return this.devices[0].currentStream;
   }
   get activeStreams() {
     return this.devices[0].activeStreams;
-  }
-
-  setStream(streamIdx: number): void {
-    for (const device of this.devices) {
-      device.setStream(streamIdx);
-    }
   }
 
   eventRecord(eventIdx: number, streamIdx: number): void {
@@ -3272,13 +3267,38 @@ export class ParallelOps implements DeviceOps {
     throw new Error("ParallelOps.streamWaitEvent should be used on the device level, not on ParallelOps");
   }
 
-  withStream<T>(fn: () => T) {
+  acquireStream(highPriority: boolean): number {
+    let acquired = false;
+    const streams: number[] = [];
+    try {
+      for (const device of this.devices) {
+        streams.push(device.acquireStream(highPriority));
+      }
+      acquired = true;
+      return streams[0]!;
+    }
+    finally {
+      if (!acquired) {
+        for (const [index, stream] of streams.entries()) {
+          this.devices[index].disposeStream(stream);
+        }
+      }
+    }
+  }
+
+  withStream<T>(highPriority: boolean | (() => T), fn?: () => T): StreamResult<T> {
+    if (typeof highPriority === 'function') {
+      fn = highPriority;
+      highPriority = false;
+    }
+    if (!fn) throw new Error('withStream requires a callback');
+
     const currentStreams = this.devices.map(device => device.currentStream);
     let acquired = false;
     const streams: number[] = [];
     try {
       for (const device of this.devices) {
-        streams.push(device.acquireStream());
+        streams.push(device.acquireStream(highPriority));
       }
       acquired = true;
     }

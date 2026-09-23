@@ -78,7 +78,8 @@ export interface DeviceOps extends Disposable {
   synchronizeListeners: WeakRef<WorkspaceBase>[];
   currentStream: number;
   readonly activeStreams: readonly number[];
-  availableStreams: number[];
+  highPriorityStreams: number[];
+  normalPriorityStreams: number[];
 
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism, recycleKey?: HeapKey | null): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined, recycleKey?: HeapKey | null): Tensor;
@@ -88,9 +89,10 @@ export interface DeviceOps extends Disposable {
   printHeap(): void;
   /** Host-only stream-0 heap promotion; does not wait for GPU completion or release pinned buffers. */
   hostSynchronizeWorld(): void;
-  setStream(streamIdx: number): void;
+  acquireStream(highPriority?: boolean): number;
   eventRecord(eventIdx: number, streamIdx: number): void;
   streamWaitEvent(streamIdx: number, eventIdx: number): void;
+  withStream<T>(highPriority: boolean, fn: () => T): StreamResult<T>;
   withStream<T>(fn: () => T): StreamResult<T>;
   /** Best-effort L2 warming of up to eight local tensor ranges in one grid. */
   prefetchL2(tensors: readonly Tensor[]): void;

@@ -37,13 +37,34 @@ for (const asynchronous of [false, true]) {
       assert.equal(resources.disposedViews.size, 0);
       assert.equal(resources.workspaces.size, 0);
       assert.deepEqual(resources.joined, [handle.streamId]);
-      assert.equal(glm.availableStreams.includes(handle.streamId), false);
+      assert.equal(glm.normalPriorityStreams.includes(handle.streamId), false);
       // The handle and its event must still work after the device sync.
       handle.streamWaitEvent();
       handle[Symbol.dispose]();
     }
-    assert.equal(new Set(glm.availableStreams).size, 63);
-    assert.equal(glm.availableStreams.length, 63);
+    assert.equal(glm.normalPriorityStreams.length + glm.highPriorityStreams.length, 63);
+    assert.equal(new Set([...glm.normalPriorityStreams, ...glm.highPriorityStreams]).size, 63);
+  }));
+}
+
+for (const highPriority of [false, true]) {
+  it(`nested stream reuse respects requested priority ${highPriority}`, () => fixture((glm) => {
+    using parent = glm.withStream(() => {
+      let childId = -1;
+      {
+        using child = glm.withStream(!highPriority, () => {});
+        childId = child.streamId;
+        child.streamWaitEvent();
+      }
+      using requested = glm.withStream(highPriority, () => {});
+      assert.equal(GlmOps.isHighPriorityStream(requested.streamId), highPriority);
+      assert.notEqual(requested.streamId, childId);
+      using reused = glm.withStream(!highPriority, () => {});
+      assert.equal(reused.streamId, childId);
+      requested.streamWaitEvent();
+      reused.streamWaitEvent();
+    });
+    parent.streamWaitEvent();
   }));
 }
 
@@ -92,13 +113,13 @@ it("device synchronization returns disposed descendants without reusing live str
     using child = glm.withStream(() => { using tensor = ws.alloc([1024], "BF16"); });
     childId = child.streamId;
   });
-  assert.equal(glm.availableStreams.includes(childId), false);
+  assert.equal(glm.normalPriorityStreams.includes(childId), false);
   glm.synchronize();
-  assert.equal(glm.availableStreams.includes(childId), true);
-  assert.equal(glm.availableStreams.includes(parent.streamId), false);
+  assert.equal(glm.normalPriorityStreams.includes(childId), true);
+  assert.equal(glm.normalPriorityStreams.includes(parent.streamId), false);
   assert.deepEqual(glm.streamResources.get(parent.streamId)!.joined, [parent.streamId]);
   parent.streamWaitEvent();
-  assert.equal(glm.availableStreams.filter(id => id === childId).length, 1);
+  assert.equal(glm.normalPriorityStreams.filter(id => id === childId).length, 1);
 }));
 
 it("stream handles use the same device-wide cleanup policy", () => fixture(async (glm, ws) => {

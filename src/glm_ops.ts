@@ -1,4 +1,4 @@
-import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StreamResult, StridedMmap, TensorParallelism } from "./device_ops";
 import { Heap, type HeapAllocation, type HeapKey } from "./heap";
 import type { ExecutionState } from "./execution-workspace";
 import { CaptureManager } from "./capture-manager";
@@ -1034,13 +1034,14 @@ export class GlmOps implements DeviceOps {
         if (id === stream) {
           continue;
         }
-        this.availableStreams.push(id);
+        this.returnStream(id);
         releasedStreams = true;
       }
       resources.joined = resources.joined.filter(id => id === stream);
     }
     if (releasedStreams) {
-      this.availableStreams.sort((a, b) => a - b);
+      this.normalPriorityStreams.sort((a, b) => a - b);
+      this.highPriorityStreams.sort((a, b) => a - b);
     }
     // Reconciliation may have recycled additional roots: promote heaps and
     // pinned allocations only after it, and only after successful native sync.
@@ -1115,7 +1116,20 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().setStream(this.ctx, this.currentStream);
   }
 
-  availableStreams = Array.from({ length: 63 }, (_, i) => i + 1);
+  static readonly MAX_STREAMS = 63;
+  static isHighPriorityStream(stream: number): boolean {
+    return stream % 2 === 1;
+  }
+  normalPriorityStreams = Array.from({ length: 63 }, (_, i) => i + 1).filter(i => !GlmOps.isHighPriorityStream(i));
+  highPriorityStreams = Array.from({ length: 63 }, (_, i) => i + 1).filter(i => GlmOps.isHighPriorityStream(i));
+  returnStream(stream: number) {
+    if (!GlmOps.isHighPriorityStream(stream)) {
+      this.normalPriorityStreams.push(stream);
+    } else {
+      this.highPriorityStreams.push(stream);
+    }
+  }
+
   disposeStreamResources(stream: number, destinationStream = this.currentStream) {
     if (stream === destinationStream) {
       return;
@@ -1152,8 +1166,11 @@ export class GlmOps implements DeviceOps {
     }
     if (joined.length) {
       if (destinationStream === 0) {
-        this.availableStreams.push(...joined);
-        this.availableStreams.sort((a, b) => a - b);
+        for (const join of joined) {
+          this.returnStream(join);
+        }
+        this.normalPriorityStreams.sort((a, b) => a - b);
+        this.highPriorityStreams.sort((a, b) => a - b);
       } else {
         destinationResources!.joined.push(...joined);
         destinationResources!.joined.sort((a, b) => a - b);
@@ -1178,8 +1195,11 @@ export class GlmOps implements DeviceOps {
     this.streamResources.delete(stream);
     const destinationStream = this.currentStream;
     if (destinationStream === 0) {
-      this.availableStreams.push(...resources.joined);
-      this.availableStreams.sort((a, b) => a - b);
+      for (const id of resources.joined) {
+        this.returnStream(id);
+      }
+      this.normalPriorityStreams.sort((a, b) => a - b);
+      this.highPriorityStreams.sort((a, b) => a - b);
     }
     else {
       let destinationResources = this.streamResources.get(destinationStream);
@@ -1197,13 +1217,17 @@ export class GlmOps implements DeviceOps {
     resources.joined = [];
   }
 
-  acquireStream() {
+  acquireStream(highPriority: boolean) {
     let stream: number | undefined;
     for (let i = this.activeStreams.length - 1; i >= 0; i--) {
       const activeStream = this.activeStreams[i];
 
       if (activeStream === 0) {
-        stream = this.availableStreams.shift();
+        if (highPriority) {
+          stream = this.highPriorityStreams.shift();
+        } else {
+          stream = this.normalPriorityStreams.shift();
+        }
         break;
       }
 
@@ -1211,8 +1235,8 @@ export class GlmOps implements DeviceOps {
       if (!resources)
         throw new Error(`No resources found while checking active stream ${activeStream}`);
       for (const joined of resources.joined) {
-        // the joined streams list contain itself, which is invalid
-        if (joined === activeStream) {
+        // Reuse only inactive descendants with the requested priority.
+        if (joined === activeStream || GlmOps.isHighPriorityStream(joined) !== highPriority) {
           continue;
         }
         stream = joined;
@@ -1235,8 +1259,14 @@ export class GlmOps implements DeviceOps {
     return stream;
   }
 
-  withStream<T>(fn: () => T) {
-    const stream = this.acquireStream();
+  withStream<T>(highPriority: boolean | (() => T), fn?: () => T) {
+    if (typeof highPriority === 'function') {
+      fn = highPriority;
+      highPriority = GlmOps.isHighPriorityStream(this.currentStream);
+    }
+    if (!fn) throw new Error('withStream requires a callback');
+
+    const stream = this.acquireStream(highPriority);
     const currentStream = this.currentStream;
     // Record event on current stream so the alternate stream can wait for
     // all prior work (e.g. rmsnorm output that K/V will read).

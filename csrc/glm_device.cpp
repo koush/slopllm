@@ -25,7 +25,8 @@ GlmCtx* glm_init(int device_id) {
     ctx->device_id = device_id;
     ctx->active_stream = 0;
     for (int i = 0; i < GLM_MAX_STREAMS; i++) {
-        cudaStreamCreate(&ctx->streams[i]);
+        cudaStreamCreateWithPriority(&ctx->streams[i], cudaStreamNonBlocking,
+                                     (i % 2 == 1) ? -1 : 0);
         cudaEventCreate(&ctx->events[i]);
     }
     cublasCreate(&CUBLAS(ctx));

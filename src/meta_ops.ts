@@ -1,5 +1,6 @@
 import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
 import type { ExecutionState } from "./execution-workspace";
+import { GlmOps } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { MemcpyKind } from "./sampling";
 import { Tensor } from "./tensor";
@@ -325,9 +326,6 @@ export class MetaOps implements DeviceOps {
         notifySynchronizedWorkspaces(this.synchronizeListeners);
     }
 
-    setStream(streamIdx: number): void {
-    }
-
     eventRecord(eventIdx: number, streamIdx: number): void {
     }
 
@@ -335,10 +333,20 @@ export class MetaOps implements DeviceOps {
     }
 
     activeStreams = [0];
+    normalPriorityStreams = Array.from({ length: 63 }, (_, i) => i + 1).filter(i => !GlmOps.isHighPriorityStream(i));
+    highPriorityStreams = Array.from({ length: 63 }, (_, i) => i + 1).filter(i => GlmOps.isHighPriorityStream(i));
     get currentStream() { return this.activeStreams[this.activeStreams.length - 1]; }
-    availableStreams: number[] = [];
 
-    withStream<T>(fn: () => T) {
+    acquireStream(highPriority?: boolean): number {
+        return 2;
+    }
+
+    withStream<T>(highPriority: boolean | (() => T), fn?: () => T) {
+        if (typeof highPriority === 'function') {
+            fn = highPriority;
+            highPriority = false;
+        }
+        if (!fn) throw new Error('withStream requires a callback');
         const result = fn();
         return {
             [Symbol.dispose]() { },

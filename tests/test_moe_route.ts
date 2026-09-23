@@ -75,7 +75,7 @@ for (const { rows, experts, topK, biased, disabled } of [
         }
         glm.synchronize();
         assert.equal(ws.tracked.size, 0);
-        assert.equal(glm.availableStreams.length, 63);
+        assert.equal(glm.normalPriorityStreams.length + glm.highPriorityStreams.length, 63);
       } finally {
         native.routeTop8 = original;
         if (previousEnv === undefined) {
@@ -146,7 +146,7 @@ for (const rows of [4, 33]) {
       glm.synchronize();
       assert.equal(ws.tracked.size, 0);
       for (const device of devices) {
-        assert.equal(device.availableStreams.length, 63);
+        assert.equal(device.normalPriorityStreams.length + device.highPriorityStreams.length, 63);
       }
     } finally {
       ws.free();

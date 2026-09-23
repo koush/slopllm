@@ -476,11 +476,11 @@ describe("Workspace stream recycling", () => {
     assert.ok(ws1.heapByKey.get(id)?.contains(producer.result[1], 64));
     assert.ok(!ws1.heapByKey.get(0)?.contains(producer.result[1], 64));
     gpu1.streamWaitEvent(gpu1.currentStream, id);
-    for (const device of po.devices) assert.ok(!device.availableStreams.includes(id));
+    for (const device of po.devices) assert.ok(!device.normalPriorityStreams.includes(id));
     producer[Symbol.dispose]();
     assert.ok(ws0.heapByKey.get(0)?.contains(producer.result[0], 64));
     assert.ok(ws1.heapByKey.get(0)?.contains(producer.result[1], 64));
-    for (const device of po.devices) assert.ok(device.availableStreams.includes(id));
+    for (const device of po.devices) assert.ok(device.normalPriorityStreams.includes(id));
   });
 
   it("promotes disposed descendants on a wait while retaining the parent handle", () => {
@@ -492,22 +492,22 @@ describe("Workspace stream recycling", () => {
       child.streamWaitEvent();
       child[Symbol.dispose]();
     });
-    assert.ok(!glm.availableStreams.includes(childId));
+    assert.ok(!glm.normalPriorityStreams.includes(childId));
     parent.streamWaitEvent();
     assert.deepEqual(glm.streamResources.get(parentId)!.joined, [parentId]);
-    assert.ok(!glm.availableStreams.includes(parentId));
-    assert.ok(glm.availableStreams.includes(childId), "tensor-free child should be promoted too");
+    assert.ok(!glm.normalPriorityStreams.includes(parentId));
+    assert.ok(glm.normalPriorityStreams.includes(childId), "tensor-free child should be promoted too");
 
     const next = glm.withStream(() => assert.equal(glm.currentStream, childId));
     parent.streamWaitEvent();
-    assert.ok(!glm.availableStreams.includes(childId), "repeated waits must not release the child's new lease");
+    assert.ok(!glm.normalPriorityStreams.includes(childId), "repeated waits must not release the child's new lease");
     parent[Symbol.dispose]();
     assert.ok(glm.streamResources.has(childId), "old parent disposal must not touch the reused child");
     next.streamWaitEvent();
     next[Symbol.dispose]();
     glm.synchronize();
-    assert.equal(glm.availableStreams.length, 63);
-    assert.equal(new Set(glm.availableStreams).size, 63);
+    assert.equal(glm.normalPriorityStreams.length + glm.highPriorityStreams.length, 63);
+    assert.equal(new Set([...glm.normalPriorityStreams, ...glm.highPriorityStreams]).size, 63);
   });
 
   it("promotes descendants through a non-main parallel waiter", () => {
@@ -539,8 +539,8 @@ describe("Workspace stream recycling", () => {
     outer[Symbol.dispose]();
     po.synchronize();
     po.devices.forEach(device => {
-      assert.equal(device.availableStreams.length, 63);
-      assert.equal(new Set(device.availableStreams).size, 63);
+      assert.equal(device.normalPriorityStreams.length + device.highPriorityStreams.length, 63);
+      assert.equal(new Set([...device.normalPriorityStreams, ...device.highPriorityStreams]).size, 63);
     });
   });
 
@@ -576,11 +576,11 @@ describe("Workspace stream recycling", () => {
     assert.ok(!ws.heapByKey.has(streamId));
     assert.ok(ws.heapByKey.get(0)?.contains(mainData, 64));
     assert.equal(glm.streamResources.get(streamId)?.workspaces.size, 0);
-    assert.ok(!glm.availableStreams.includes(streamId), "waiting must not release the live stream handle");
+    assert.ok(!glm.normalPriorityStreams.includes(streamId), "waiting must not release the live stream handle");
     stream[Symbol.dispose]();
     stream[Symbol.dispose]();
     assert.ok(!glm.streamResources.has(streamId));
-    assert.ok(glm.availableStreams.includes(streamId));
+    assert.ok(glm.normalPriorityStreams.includes(streamId));
 
     ws.free();
     glm.free();
@@ -635,7 +635,7 @@ describe("Workspace stream recycling", () => {
 
     assert.deepEqual(glm.activeStreams, [0]);
     assert.equal(glm.currentStream, 0);
-    assert.equal(glm.availableStreams.length, 63);
+    assert.equal(glm.normalPriorityStreams.length + glm.highPriorityStreams.length, 63);
     glm.free();
   });
 });
