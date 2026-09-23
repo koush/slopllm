@@ -1221,7 +1221,7 @@ nvfp4_linear_splitk_kernel(
 }
 
 // Production TP=8 MoE down shape: K=256, N=6144, eight experts per token.
-// Four warps compute two experts each. A CTA owns eight output columns, so the
+// Four warps compute two experts each. A CTA owns sixteen output columns, so the
 // weighted reduction is deterministic and needs no global intermediate/atomics.
 __global__ void __launch_bounds__(128)
 nvfp4_down_reduce_kernel(
@@ -1232,7 +1232,7 @@ nvfp4_down_reduce_kernel(
     const float* const* __restrict__ scale2_ptrs,
     const int* __restrict__ expert_ids,
     const __nv_bfloat16* __restrict__ routing_weights) {
-    constexpr int N = 6144, K = 256, TOPK = 8, COLS = 8;
+    constexpr int N = 6144, K = 256, TOPK = 8, COLS = 16;
     const int token = blockIdx.x / (N / COLS);
     const int tile = blockIdx.x % (N / COLS);
     const int warp = threadIdx.x / 32;
@@ -1250,7 +1250,7 @@ nvfp4_down_reduce_kernel(
         const auto* w = weight_ptrs[expert] + (size_t)row * (K / 2);
         const auto* scales = scale_ptrs[expert] + (size_t)row * (K / NVFP4_QUANT_GROUP);
         const float scale2 = *scale2_ptrs[expert];
-        float sum = 0.0f;
+        float sum[2] = {0.0f, 0.0f};
         #pragma unroll
         for (int g = inner; g < K / NVFP4_QUANT_GROUP; g += 4) {
             const auto* xv = reinterpret_cast<const uint4*>(x + g * NVFP4_QUANT_GROUP);
@@ -1258,21 +1258,28 @@ nvfp4_down_reduce_kernel(
             __nv_bfloat16 xb[16];
             uint4_to_bf16x8(x0, xb);
             uint4_to_bf16x8(x1, xb + 8);
-            const uint32_t w0 = *reinterpret_cast<const uint32_t*>(w + g * 8);
-            const uint32_t w1 = *reinterpret_cast<const uint32_t*>(w + g * 8 + 4);
-            const float scale = fp8_e4m3_to_float(scales[g]) * scale2;
-            float part = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                const uint8_t packed = ((j < 4 ? w0 : w1) >> ((j % 4) * 8)) & 0xff;
-                const float2 v = fp4x2_to_float2(packed);
-                part += v.x * __bfloat162float(xb[j * 2]) + v.y * __bfloat162float(xb[j * 2 + 1]);
+            for (int r = 0; r < 2; r++) {
+                const auto* wr = w + r * 8 * (K / 2);
+                const uint32_t w0 = *reinterpret_cast<const uint32_t*>(wr + g * 8);
+                const uint32_t w1 = *reinterpret_cast<const uint32_t*>(wr + g * 8 + 4);
+                const float scale = fp8_e4m3_to_float(scales[r * 8 * (K / NVFP4_QUANT_GROUP) + g]) * scale2;
+                float part = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const uint8_t packed = ((j < 4 ? w0 : w1) >> ((j % 4) * 8)) & 0xff;
+                    const float2 v = fp4x2_to_float2(packed);
+                    part += v.x * __bfloat162float(xb[j * 2]) + v.y * __bfloat162float(xb[j * 2 + 1]);
+                }
+                sum[r] += part * scale;
             }
-            sum += part * scale;
         }
-        sum += __shfl_xor_sync(0xffffffff, sum, 2);
-        sum += __shfl_xor_sync(0xffffffff, sum, 1);
-        if (inner == 0) down[e][col] = __float2bfloat16(sum);
+        #pragma unroll
+        for (int r = 0; r < 2; r++) {
+            sum[r] += __shfl_xor_sync(0xffffffff, sum[r], 2);
+            sum[r] += __shfl_xor_sync(0xffffffff, sum[r], 1);
+            if (inner == 0) down[e][col + r * 8] = __float2bfloat16(sum[r]);
+        }
     }
     __syncthreads();
     if (threadIdx.x < COLS) {
@@ -1292,7 +1299,7 @@ void glm_nvfp4_mul_mat_id_reduce(GlmCtx* ctx, void* output, const void* input,
                                 const void* routing_weights, int num_rows) {
     cudaSetDevice(ctx->device_id);
     if (num_rows <= 0) return;
-    nvfp4_down_reduce_kernel<<<num_rows * (6144 / 8), 128, 0, GLM_STREAM(ctx)>>>(
+    nvfp4_down_reduce_kernel<<<num_rows * (6144 / 16), 128, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)output, (const __nv_bfloat16*)input,
         (const uint8_t* const*)weight_ptrs, (const __nv_fp8_e4m3* const*)scale_ptrs,
         (const float* const*)scale2_ptrs, expert_ids, (const __nv_bfloat16*)routing_weights);
