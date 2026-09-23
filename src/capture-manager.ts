@@ -53,7 +53,8 @@ export class CaptureManager implements Disposable, ExecutionManager {
     // lengths. Variant multi-state graphs include each state's own length bucket.
     private stateKeys(states: readonly ExecutionState[], key: readonly (string | number)[]) {
         const params = [...key];
-        for (const state of states) params.push(`batchSize:${state.batchSize}`, `totalTokens:${state.totalTokens}`);
+        for (const state of states) params.push(`batchSize:${state.batchSize}`, `totalTokens:${state.totalTokens}`,
+            ...this.ops.getCaptureKeys(state));
         const base = params.join(",");
         if (this.getLengthVariant(base).kvLen) {
             for (const state of states) params.push(`paddedKvLen:${state.paddedKvLen}`);

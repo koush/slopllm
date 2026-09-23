@@ -72,7 +72,7 @@ export class ExecutionState {
   input?: Tensor;
   extras = new Map<string, any>();
   paddedKvLenInvariant = true;
-  /** Capture-key metadata; kernel sizing must use getGraphVariantPaddedKvLen(). */
+  /** Length snapshot; launch decisions must use getGraphVariantPaddedKvLen() or DeviceOps.getCaptureKeys(). */
   readonly paddedKvLen: number;
 
   // Per-state buffers (backed by persistent slot-suffixed allocations).

@@ -81,6 +81,9 @@ export interface DeviceOps extends Disposable {
   highPriorityStreams: number[];
   normalPriorityStreams: number[];
 
+  /** Backend launch decisions that must distinguish captured graphs. */
+  getCaptureKeys(state: ExecutionState): readonly (string | number)[];
+
   newTensor(workspace: WorkspaceBase, shape: number[], type: string, pinned: boolean, name?: string, parallelism?: TensorParallelism, recycleKey?: HeapKey | null): Tensor;
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined, recycleKey?: HeapKey | null): Tensor;
   synchronize(streamIdx?: number): void;
@@ -118,8 +121,8 @@ export interface DeviceOps extends Disposable {
   quantizeFp8(input: Tensor, blockSize: number): Fp8Quantized;
 
   // Decode chunking hint: 0 selects automatic planning; the actual prefill kernel ignores it.
-  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor, chunksPerBlock?: number): { o: Tensor, lse: Tensor };
-  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, topkLength?: Tensor, qAbsorbedScales?: Tensor, chunksPerBlock?: number): { o: Tensor, lse: Tensor };
+  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor };
+  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, topkLength?: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor };
   gdnRecurrentStep(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
   gdnPrefill(state: ExecutionState, output: Tensor, recurrentState: Tensor, qkv: Tensor, aRaw: Tensor, bRaw: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, numHeads: number, dK: number, dV: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
 

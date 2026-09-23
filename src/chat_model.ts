@@ -112,6 +112,7 @@ export interface CommonModelConfig {
   scaling: number;
   kvLoraRank?: number;
   qkRopeHeadDim?: number;
+  indexTopk?: number;
   maxPositionEmbeddings?: number;
   generationConfig?: GenerationConfig;
 }

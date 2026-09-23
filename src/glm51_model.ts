@@ -418,7 +418,6 @@ export class Glm51Model extends ChatModel {
       return;
     }
 
-    const paddedKvLen = this.sparseMlaPaddedKvLen(state);
     const indices = state.indices;
     const indptr = state.indptrD;
 
@@ -446,6 +445,8 @@ export class Glm51Model extends ChatModel {
         const nextKScaleData = pagedKV.kScaleData[nextCacheIdx];
         const indexerStream = CP_GATHER_INDEXER_KV && nextKData?.parallelism === TensorParallelism.Row
           ? this.glm.withStream<void>(() => {
+            const paddedKvLen = this.sparseMlaPaddedKvLen(state);
+
             indexerKPrefetch!.replace(this.glm.gatherPages(
               nextKData, indices!, indptr, state.lastPageLen,
               state.batchSize, paddedKvLen, state.kvTokenIndptrD, true,
@@ -473,6 +474,7 @@ export class Glm51Model extends ChatModel {
       if (nextCacheIdx < cfg.numHiddenLayers + (cfg.numNextNPredictLayers ?? 0) && pagedKV.ckvData[nextCacheIdx]) {
         const nextStream = this.glm.withStream<void>(() => {
           const nextKvCache = pagedKV.ckvData[nextCacheIdx];
+          const paddedKvLen = this.sparseMlaPaddedKvLen(state);
 
           ckvPrefetch!.replace(this.glm.gatherPages(
             nextKvCache, indices!, indptr, state.lastPageLen,

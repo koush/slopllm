@@ -7,6 +7,7 @@ import { Tensor, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor"
 import type { WorkspaceBase } from "./workspace";
 import { MemcpyKind } from "./enums";
 import { getNativeAddon } from "./native-addon";
+import { sparseMlaChunksPerBlock } from "./sparse-mla-planner";
 
 // Above `count == topK` (single-token decode), mulMatId can either:
 //  - run the direct per-(token,expert) GEMV kernel (mulMatId/nvfp4MulMatId), which
@@ -828,6 +829,23 @@ export class GlmTensor extends Tensor {
 }
 
 export class GlmOps implements DeviceOps {
+  getCaptureKeys(state: ExecutionState): readonly (string | number)[] {
+    const pagedKV = state.cache.getPagedKV();
+    if (!pagedKV.sparseMode || !pagedKV.contextParallel) return [];
+    const numQueries = state.isDecode ? state.batchSize : state.totalTokens;
+    if (!state.isDecode && numQueries > SPARSE_MLA_DECODE_DISPATCH_MAX) return [];
+    const { numAttentionHeads, indexTopk } = state.model.cfg;
+    if (indexTopk === undefined) throw new Error("Sparse MLA capture keys require indexTopk");
+    return [`sparseMlaChunksPerBlock:${this.sparseMlaChunkHint(state, numQueries, numAttentionHeads, indexTopk)}`];
+  }
+
+  private sparseMlaChunkHint(state: ExecutionState, numQueries: number, numHeads: number, topk: number): number {
+    const pagedKV = state.cache.getPagedKV();
+    if (!pagedKV.contextParallel) return 0;
+    // Key the resulting launch decision, not the snapshot bucket used to plan it.
+    const localTopkBound = Math.min(topk, Math.ceil(state.paddedKvLen / pagedKV.glm.worldSize));
+    return sparseMlaChunksPerBlock(numQueries, numHeads, localTopkBound, this.smCount);
+  }
   private static readonly GREEDY_ALLOCATION_GUARD_BYTES = 4;
   readonly worldSize = 1;
   readonly smCount: number;
@@ -1682,7 +1700,7 @@ export class GlmOps implements DeviceOps {
     }
   }
 
-  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor, chunksPerBlock = 0): { o: Tensor, lse: Tensor } {
+  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, _pageIndptrD: Tensor, _lastPageLen: Tensor, _kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
     this.validateSparseMlaQuery(qAbsorbed, qAbsorbedScales);
     const numTokens = state.totalTokens;
     const numHeads = qAbsorbed.shape[1];
@@ -1703,6 +1721,7 @@ export class GlmOps implements DeviceOps {
     // numTokens × ceil(topk/64) CTAs — which fills the SMs. Correctness is
     // identical (causality lives in the slots, not the kernel).
     if (numTokens <= SPARSE_MLA_DECODE_DISPATCH_MAX) {
+      const chunksPerBlock = this.sparseMlaChunkHint(state, numTokens, numHeads, topk);
       const numSplits = Math.ceil(topk / 64);
       using midOut = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits, headDim], "BF16");
       using midLse = qAbsorbed.workspace.alloc([numTokens, numHeads, numSplits], "F32");
@@ -1713,10 +1732,11 @@ export class GlmOps implements DeviceOps {
     return { o, lse };
   }
 
-  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, topkLength?: Tensor, qAbsorbedScales?: Tensor, chunksPerBlock = 0): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, topkLength?: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
     this.validateSparseMlaQuery(qAbsorbed, qAbsorbedScales);
     const numTokens = state.batchSize;
     const numHeads = qAbsorbed.shape[1];
+    const chunksPerBlock = topkLength ? this.sparseMlaChunkHint(state, numTokens, numHeads, topk) : 0;
     const headDim = qAbsorbed.shape[2];
     const elemBytes = SafeTensorFile.dtypeBytes(kvCache.type);
     const pageBlockSize = kvCache.shape[1];

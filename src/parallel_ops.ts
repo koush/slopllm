@@ -6,7 +6,6 @@ import { bf16BytesToF32, f32ToBf16Bytes, GlmOps, GlmTensor, NCCL_BFLOAT16, NCCL_
 import type { HeapKey } from "./heap";
 import { getNativeAddon } from "./native-addon";
 import { SafeTensorFile } from "./safetensors";
-import { sparseMlaChunksPerBlock } from "./sparse-mla-planner";
 import { Tensor, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
@@ -3785,16 +3784,12 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  private sparseMlaChunkHint(state: ExecutionState, contextParallel: boolean, numQueries: number, numHeads: number, topk: number, device: GlmOps, hint: number): number {
-    if (hint !== 0 || !contextParallel) return hint;
-    // Snapshot bucket, not mutable sequence lengths: the graph key must track
-    // every host-side value that changes the captured launch. Total KV is a
-    // conservative per-sequence bound, including mixed-length batches/masks.
-    const localTopkBound = Math.min(topk, Math.ceil(state.getGraphVariantPaddedKvLen() / this.worldSize));
-    return sparseMlaChunksPerBlock(numQueries, numHeads, localTopkBound, device.smCount);
+  getCaptureKeys(state: ExecutionState): readonly (string | number)[] {
+    return this.devices.flatMap((device, rank) =>
+      device.getCaptureKeys(state).map(key => `device:${rank}:${key}`));
   }
 
-  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor, chunksPerBlock = 0): { o: Tensor, lse: Tensor } {
+  sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
     const numTokens = state.totalTokens;
     const pQAbsorbed = this.cast(qAbsorbed);
     const pQPe = this.cast(qPe);
@@ -3814,8 +3809,7 @@ export class ParallelOps implements DeviceOps {
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const hint = this.sparseMlaChunkHint(state, contextParallel, numTokens, pQAbsorbed.shards[i].shape[1], topk, this.devices[i], chunksPerBlock);
-      const result = this.devices[i].sparseMlaPrefill(state, pQAbsorbed.shards[i], pQPe.shards[i], pEffKvCache.shards[i], pIndices.shards[i], topk, smScale, pTopkLength.shards[i], pageIndptrD, lastPageLen, kvTokenIndptrD, qAbsorbedScales ? this.cast(qAbsorbedScales).shards[i] : undefined, hint);
+      const result = this.devices[i].sparseMlaPrefill(state, pQAbsorbed.shards[i], pQPe.shards[i], pEffKvCache.shards[i], pIndices.shards[i], topk, smScale, pTopkLength.shards[i], pageIndptrD, lastPageLen, kvTokenIndptrD, qAbsorbedScales ? this.cast(qAbsorbedScales).shards[i] : undefined);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
@@ -3824,7 +3818,7 @@ export class ParallelOps implements DeviceOps {
     return { o, lse };
   }
 
-  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, topkLength?: Tensor, qAbsorbedScales?: Tensor, chunksPerBlock = 0): { o: Tensor, lse: Tensor } {
+  sparseMlaDecode(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, numSplits: number, smScale: number, topkLength?: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
     const numTokens = state.batchSize;
     const pQAbsorbed = this.cast(qAbsorbed);
     const pQPe = this.cast(qPe);
@@ -3834,7 +3828,6 @@ export class ParallelOps implements DeviceOps {
     const contextParallel = pKvCache.parallelism === TensorParallelism.Row;
     const numHeads = pQAbsorbed.shape[1];
     const headDim = pQAbsorbed.shape[2];
-    const effectiveNumHeads = contextParallel ? numHeads : this.shardDim(numHeads, "sparseMlaDecode numHeads");
     const oPar = contextParallel ? TensorParallelism.PartialSoftmax : TensorParallelism.Row;
     if (contextParallel && (pQAbsorbed.parallelism !== TensorParallelism.Replicated || pQPe.parallelism !== TensorParallelism.Replicated)) {
       throw new Error(`sparseMlaDecode: CP queries must already be gathered, got qAbsorbed=${pQAbsorbed.parallelism}, qPe=${pQPe.parallelism}`);
@@ -3842,8 +3835,7 @@ export class ParallelOps implements DeviceOps {
     const oShards: Tensor[] = [];
     const lseShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const hint = topkLength ? this.sparseMlaChunkHint(state, contextParallel, numTokens, effectiveNumHeads, topk, this.devices[i], chunksPerBlock) : chunksPerBlock;
-      const result = this.devices[i].sparseMlaDecode(state, pQAbsorbed.shards[i], pQPe.shards[i], pKvCache.shards[i], pIndices.shards[i], topk, numSplits, smScale, pTopkLength?.shards[i], qAbsorbedScales ? this.cast(qAbsorbedScales).shards[i] : undefined, hint);
+      const result = this.devices[i].sparseMlaDecode(state, pQAbsorbed.shards[i], pQPe.shards[i], pKvCache.shards[i], pIndices.shards[i], topk, numSplits, smScale, pTopkLength?.shards[i], qAbsorbedScales ? this.cast(qAbsorbedScales).shards[i] : undefined);
       oShards.push(result.o);
       lseShards.push(result.lse);
     }
@@ -4087,28 +4079,6 @@ export class ParallelOps implements DeviceOps {
       && pWeights.parallelism === TensorParallelism.Replicated;
 
     if (!canShard) {
-      const i = 0;
-      const k = pKData.shards[i];
-      const q = pQ.shards[i];
-      const capacity = k.shape[0] * k.shape[1];
-      const maxKv = decode
-        ? capacity
-        : Math.min(capacity, CaptureManager.capturing === undefined
-          ? state.getEagerKvLen()
-          : state.getGraphVariantPaddedKvLen());
-
-      const scoreBytes = q.shape[0] * maxKv * 2; // BF16
-      if (!decode && scoreBytes >= 1024 ** 3) {
-        console.warn("Large unsharded indexer score buffer", {
-          device: i,
-          totalQ: q.shape[0],
-          maxKv,
-          scoreBytes,
-          kParallelism: pKData.parallelism,
-          qParallelism: pQ.parallelism,
-          weightsParallelism: pWeights.parallelism,
-        });
-      }
       const topkIdxShards: Tensor[] = [];
       const topkValShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
