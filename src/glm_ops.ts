@@ -1501,7 +1501,7 @@ export class GlmOps implements DeviceOps {
     const useDirect = totalQ <= INDEXER_DIRECT_DISPATCH_MAX;
     // Decode graphs are length-invariant. Eager prefill uses exact KV length;
     // captured prefill uses the padded KV bucket for graph-stable sizing.
-    const maxKv = decode
+    const maxKv = decode || useDirect
       ? maxKvCapacity
       : Math.min(maxKvCapacity, CaptureManager.capturing === undefined
         ? state.getEagerKvLen()
