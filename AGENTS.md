@@ -346,7 +346,7 @@ You must NEVER use "git stash pop" to reapply stashed changes. You MUST use "git
 # Production GLM-5.1 Model Config (zai-org/GLM-5.1)
 
 Model Path:
-`/mnt/storage/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-NVFP4`
+`$HF_HOME/hub/models--local-inference-lab--GLM-5.3-NVFP4`
 
 | Key | Value |
 |---|---|

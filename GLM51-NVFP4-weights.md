@@ -1,6 +1,6 @@
 # GLM-5.1 NVFP4 Weight Reference
 
-Source: `/mnt/storage/GLM-5.1-NVFP4-Fixed/` (80 safetensors shards)
+Source: `$HF_HOME/hub/models--local-inference-lab--GLM-5.3-NVFP4`
 
 ## Overview
 
