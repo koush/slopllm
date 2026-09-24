@@ -56,6 +56,10 @@ const CONSOLE_LOG_LIMIT = 128 * 1024;
 const consoleLog: Buffer[] = [];
 let consoleLogSize = 0;
 const consoleFollowers = new Set<http.ServerResponse>();
+// Bumped by every startWorker; a finishing worker must not end followers
+// registered for a newer worker (its setImmediate(finishOutput) can run
+// after a restart has already attached the follow response).
+let outputGeneration = 0;
 
 function recordConsoleOutput(chunk: Buffer): void {
   consoleLog.push(chunk);
@@ -208,6 +212,7 @@ async function main(): Promise<void> {
       execArgv: ["--require", require.resolve("tsx/cjs")],
       stdio: ["inherit", "pipe", "pipe", "ipc"],
     });
+    const generation = ++outputGeneration;
     worker = next;
     next.once("spawn", () => spawnedProcesses.add(next));
     next.stdout!.pipe(process.stdout, { end: false });
@@ -222,6 +227,7 @@ async function main(): Promise<void> {
     let stdoutEnded = false;
     let stderrEnded = false;
     const finishOutput = () => {
+      if (generation !== outputGeneration) return;
       if (!exited || !stdoutEnded || !stderrEnded) return;
       const followers = [...consoleFollowers];
       consoleFollowers.clear();
