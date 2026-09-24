@@ -2,19 +2,19 @@
 
 ## Overview
 
-TypeScript inference engine for the GLM-5.1 model on NVIDIA GPUs. Ships a native C++/CUDA addon (`glm.node`) wrapped by TypeScript operator classes. Supports multi-GPU via tensor parallelism and context parallelism, CUDA graph capture for decode and prefill, and paged KV caching with prefix sharing. Qwen3 and Qwen3.5 are also implemented but serve primarily as broader correctness test targets, not production targets.
+TypeScript inference engine for GLM models on NVIDIA GPUs. The production default is `local-inference-lab/GLM-5.3-NVFP4`; the implementation and CLI retain the names `Glm51Model` and `--glm51`. Ships a native C++/CUDA addon (`glm.node`) wrapped by TypeScript operator classes. Supports tensor and context parallelism, CUDA graph capture for decode, eager chunked/phased prefill, paged KV caching with prefix sharing, and MTP speculative decoding. Qwen3 and Qwen3.5 are also implemented but serve primarily as broader correctness test targets, not production targets.
 
 ## Core Abstractions
 
 ### Tensor (`src/tensor.ts`)
 - Abstract base class. Concrete implementations: `GlmTensor` (single GPU) and `ParallelTensor` (multi-GPU).
-- Each tensor owns a GPU memory pointer (`data`), shape, dtype, and a reference to its `WorkspaceBase`.
+- Tensors carry shape, dtype, and a `WorkspaceBase` reference. `GlmTensor` wraps device or pinned-host memory; views share backing allocations, while `ParallelTensor` owns per-device shards.
 - Operations (`.linear()`, `.rmsnorm()`, `.bmm()`, etc.) allocate output tensors from the workspace and call into the native addon.
-- `SamplingWorkspace` extends `WorkspaceBase` for GPU-side top-k/top-p sampling with repetition penalty.
+- `SamplingWorkspace` (`src/sampling.ts`) extends `WorkspaceBase` for GPU-side top-k/top-p sampling, repetition/presence penalties, and speculative sampling support.
 
 ### Workspace (`src/workspace.ts`)
-- `WorkspaceBase` manages GPU memory lifecycle via **dispose-recycle pooling**:
-  - `alloc()` checks the device or pinned-host disposed pool for best-fit reuse and only calls `newTensor()` when no reusable allocation exists.
+- `WorkspaceBase` manages GPU memory lifecycle via **stream-aware heaps**:
+  - Unnamed device allocations search `heapByKey` along the active stream lineage, then the synchronized heap. `Heap` splits/coalesces free address ranges; `newTensor()` is called when no reusable range exists. Pinned-host temporaries use a separate best-fit disposed-tensor pool.
   - Unnamed tensors are tracked temporaries. Named tensors are persistent; duplicate named allocations throw, while `ensureAlloc()` returns a compatible existing tensor.
   - Disposed pinned tensors remain in `synchronizingHost` until device synchronization completes, preventing reuse while an asynchronous copy may still reference them.
   - **`freeze()`** prevents further allocations after model loading so weight addresses remain stable.
@@ -36,8 +36,8 @@ Allocation tracking is owned by the caller around a complete model operation. A 
 
 ```typescript
 function forward(state: ExecutionState): Tensor {
-  // The [Symbol.dispose]() will warn if ANY allocation was not properly disposed, but will dispose it.
-  // Resources should be properly scoped and disposed or removed from the tracking scope.
+  // Scope exit disposes remaining tracked tensors. clearTracking/startTracking
+  // warn when cleaning up leftovers from the preceding operation.
   using _tracker = state.ws.startTracking();
   // removeTracking allows the tensor to escape workspace cleanup.
   return model.forwardModel(state).removeTracking();
@@ -49,15 +49,16 @@ Key rules:
 - `using` on an unnamed tensor auto-disposes at block scope exit.
 - `startTracking()` cleans all tracked tensors at once; use individual `using` declarations when an intermediate should be released earlier.
 - `removeTracking()` stages the tensor and its backing view chain. When the tracking scope exits, the tensor returns to `tracked` under caller ownership.
-- Allocations made on an alternate stream are not recycled until its `withStream()` wrapper is disposed. Call `streamWaitEvent()` before consuming the result on the current stream.
+- Disposed device ranges can be reused within an ordered stream lineage. A completion wait promotes stream-local heaps and deferred view references to the waiting stream; the stream handle remains reserved until disposal. Call `streamWaitEvent()` before consuming the result on the current stream.
 
-### Allocator (`src/allocator.ts`)
-- `ArenaAllocator`: bump allocator with 256-byte alignment. `free()` is a no-op. Used for the weight arena when `--arena` flag is set — a single large `cudaMalloc` carved up linearly.
-- For non-arena mode, `WorkspaceBase` uses `GlmOps.alloc/free` (real `cudaMalloc`/`cudaFree`) but the dispose-recycle pool means actual allocations rarely happen after warmup.
+### Allocator (`src/heap.ts`, `src/glm_ops.ts`)
+- `Heap` manages free address ranges with 256-byte alignment, splitting, coalescing, and exact-range `claim()` for captured tensors. Ordinary allocations use the low end; long-term named allocations use the high end.
+- `GlmOps.heap` owns the device allocation pool. `--arena <GiB>` supplies one large CUDA allocation per GPU (or imports it through CUDA IPC); weights and runtime allocations share that arena.
+- Without an arena, `GlmOps` obtains additional native allocations when its heap cannot satisfy a request and releases those native allocations when the backend is freed. Workspace heaps recycle temporary ranges between operations.
 
 ### GlmOps (`src/glm_ops.ts`)
 - Single-GPU device backend. Wraps the native addon (`glm.node`).
-- Owns CUDA context, stream management (7 alternate streams via `withStream()`), and the allocator.
+- Owns CUDA context, device heap, and alternate streams. `withStream(fn)` uses normal priority; `withStream(true, fn)` uses high priority.
 - CUDA graph API: `graphBeginCapture/EndCapture/Instantiate/Launch/Destroy`.
 - FlashInfer integration: plan/run split for batch prefill/decode and MLA attention.
 - NCCL and P2P primitives exposed for `ParallelOps`.
@@ -65,8 +66,8 @@ Key rules:
 ### ParallelOps (`src/parallel_ops.ts`)
 - Multi-GPU backend implementing `DeviceOps`. Wraps N `GlmOps` instances.
 - `ParallelTensor`: has N shards (one per GPU), delegates ops to each shard, inserts collective communication (AllReduce, AllGather) as needed based on `TensorParallelism` annotations.
-- `TensorParallelism` enum: `Replicated`, `Column` (output-dim sharded), `Row` (input-dim sharded), `PartialSum` (needs AllReduce), `PartialSoftmax` (for CP merge).
-- Communication: NCCL AllReduce/AllGather for large tensors; custom P2P kernels for small AllReduce/AllGather (≤8192 elements) and fused RMSNorm+AllReduce.
+- `TensorParallelism` enum: `Replicated`, `Column` (first-dimension sharding for matrices), `Row` (last-dimension sharding for matrices), `PartialSum` (needs reduction), `PartialSoftmax` (for CP merge). Weight matrices use `[output, input]`; activations use `[tokens, features]`.
+- Communication: custom P2P collectives with NCCL fallbacks, including AllReduce/AllGather, reduce-scatter, CP merge, and fused RMSNorm+AllReduce. Dispatch depends on tensor size, dtype, layout, and P2P availability. `P2PGroup` isolates staging allocations under group-specific heap keys until barriers make them reusable.
 - Per-device shard workspaces created lazily via `getShardWorkspaces()`.
 
 ### CUDA Streams and withStream
@@ -79,11 +80,12 @@ automatically:
 - On entry, the new stream waits on an event recorded on the calling stream, so the new
   stream's first kernel cannot start until everything the calling stream queued *before*
   the `withStream` call has finished.
-- On exit, an event is recorded on the new stream (nothing waits on it yet) and the stream
-  is returned to the pool. The calling stream is ordered behind the new stream's work only
-  when you call `streamWaitEvent()` on the returned result (or `synchronize()`); the
-  result's memory is allocated immediately but its contents are only guaranteed after
-  that wait. Consume `result` only after calling `streamWaitEvent()`.
+- When the callback returns, an event is recorded on the new stream and the calling
+  stream becomes current again. The handle still reserves the alternate stream.
+  `streamWaitEvent()` orders the current stream behind its work and promotes its
+  reusable resources; `synchronize()` waits on the host. Handle disposal returns the
+  stream and establishes ordering when pending resources need transferring.
+  Consume the returned `.result` only after the explicit completion wait.
 
 While the scope is open, the two streams run in parallel. Host code is single-threaded, so
 a scope is always created, run, and joined in order — code on the calling stream cannot
@@ -114,10 +116,10 @@ function someOp(normed: Tensor) {
   stream2.streamWaitEvent();
 
   // the return values must become owned/disposed.
-  // notably, the return values are immediately avialable (their desination allocations are known),
+  // notably, the return values are immediately available (their destination allocations are known),
   // but they are only *ready* after the streamWaitEvent.
-  using tensorC = stream1.value;
-  using tensorD = stream2.value;
+  using tensorC = stream1.result;
+  using tensorD = stream2.result;
 
   // all tensors and streams are disposed
 }
@@ -129,24 +131,17 @@ Streams that outlive their lexical scope should ensure the closure properly capt
 function someOpThatReturnsAStream(normed: Tensor) {
   using tensorA = normed.linear(someWeight);
 
-  const stream1 = ops.withStream(() => {
-    // This is a race, tensorA is disposed at the end of the caller scope,
-    // before a streamWaitEvent occurs. The stream outlives the scope.
-    return tensorA.linear(otherWeight);
-  });
-
-  using stream2 = ops.withStream(() => {
-    // This is correct.
-    // viewClone ensures tensorA stays alive until this lexical scope is also complete.
+  // The caller owns this handle; do not declare it with `using` here.
+  return ops.withStream(() => {
+    // Retain the input in the alternate stream's deferred view references.
     using tensorAClone = tensorA.viewClone();
     return tensorAClone.linear(anotherWeight);
   });
-
-  return {
-    stream1,
-    stream2,
-  };
 }
+
+using stream = someOpThatReturnsAStream(normed);
+stream.streamWaitEvent();
+using tensorB = stream.result;
 ```
 
 
@@ -158,58 +153,59 @@ Linear op parallelism rules (weight × input → output):
 - Column × Replicated → Row (no comm)
 - Row × Row → PartialSum (AllReduce needed)
 - Replicated × Replicated → Replicated (no comm)
-- Row weight → AllGather weight to Replicated, then proceed (K-dim mismatch)
-- Row input → AllGather input to Replicated, then proceed (K-dim mismatch)
+- Replicated × Column → Column (token/batch sharding)
+- Replicated × PartialSum → PartialSum; PartialSum × Replicated → PartialSum
+- When no direct path applies: reduce a PartialSum input, gather a Row weight/input, or gather a Column input for Column × Column, then retry.
+- Selected large replicated attention/indexer projections are narrowed to column-parallel weights for small decode batches.
 
 ## Context Parallelism (Interleaved Token-per-GPU)
 
-When `--cp` flag is set (GLM-5.1 only), GPUs operate as context-parallel shards for attention while retaining tensor-parallel sharding for linear layers:
+When `--cp` is set on the GLM backend, GPUs operate as context-parallel shards for attention while retaining tensor-parallel sharding for linear layers:
 
 - **KV cache is Row-sharded**: each GPU stores every Nth token's KV (tokens interleaved across GPUs). `PagedKVCache` uses `TensorParallelism.Row` for ckv/kpe tensors.
-- **Position IDs**: decode/prefill kernels receive `cpWorldSize=N` and `cpRank=i`. The CUDA kernel assigns position `i, i+N, i+2N, ...` to GPU `i`.
-- **Prefill**: Each GPU runs MLA prefill over its token subset with `cpWorldSize`/`cpRank` params. The FlashInfer plan computes `effectivePageSize = pageSize / worldSize` and `effectiveNumHeads = numHeads` (not sharded). Output is `PartialSoftmax` — each shard has partial attention output + log-sum-exp.
-- **CP Merge**: Partial attention outputs are combined with an online-softmax merge. Small decode workloads use a custom P2P path; larger or prefill workloads use AllGather plus ReduceScatter.
-- **Page allocation**: `PagedKVCache` distributes pages round-robin across GPUs. Page `p` is stored on GPU `p % worldSize`. The effective page size per GPU is `pageSize / worldSize`.
-- **KV and Indexer K Prefetch**: During prefetch, the the next layer's kv is prefetched to avoid exposed q gather and CP merge on the critical path. Sparse CKV prefetc is also implemented for decode, but may be disabled since the performance gain was within run variance.
+- **Position IDs**: planning supplies global token positions. CP-aware cache/attention kernels use rank and world size to map tokens `i, i+N, i+2N, ...` to GPU `i`.
+- **Attention**: shard-local attention produces partial output plus log-sum-exp for CP merging. GLM also gathers CKV/indexer caches for selected workloads to run against flat gathered buffers. Production GLM uses sparse MLA; dense MLA uses the FlashInfer plan/run path.
+- **CP Merge**: Partial attention outputs are combined with an online-softmax merge using a custom P2P push or tree-reduce path, or AllGather plus ReduceScatter, depending on output size and P2P availability.
+- **Page allocation**: every logical page spans all CP GPUs. `pageSize = physicalPageSize * worldSize`, so the default physical page holds 64 tokens per GPU and a logical page holds `64 * worldSize` interleaved tokens.
+- **KV and Indexer K Prefetch**: `prefetchLayerResources()` gathers future-layer CKV and indexer K/scales on alternate streams when the selected attention path uses gathered KV. Phased prefill shares gathered buffers between paired chunks.
 
 ## Paged KV Cache (`src/paged_kv.ts`)
 
-- Fixed `PAGE_SIZE=64` tokens per page. Pages are ref-counted for prefix sharing (only full pages are shared; partial last pages are copied).
-- `Sequence`: ordered list of pages tracking `allocLen` and `tokenIds`.
+- Default physical `PAGE_SIZE=64`, defined in `src/paged_sequence.ts`; logical page size grows by world size under CP. GLM requires physical page size 64. Pages are ref-counted for prefix sharing; full pages are shared and partial-page copying is supported.
+- `Sequence` (`src/paged_sequence.ts`): ordered pages with allocation length, committed token history, and a pending `targetToken` for the next decode input.
 - `PagedKVCache` extends `WorkspaceBase` — KV cache tensors (`kData[]`/`vData[]` or `ckvData[]`/`kpeData[]`) are pre-allocated GPU buffers indexed by layer and page ID.
-- Dirty flags (`pagesDirtyHost`, `pagesDirtyDevice`, `positionIdsDirty`) control conditional updates — plan calls and host→device copies are skipped if nothing changed.
-- MLA path: uses `ckvData[layer]` `[maxPages, pageSize, kvLoraRank]` and `kpeData[layer]` `[maxPages, pageSize, qkRopeDim]` instead of separate K/V.
+- Planning metadata belongs to `ExecutionState` and is rebuilt/uploaded per plan; the old page/position dirty flags are gone.
+- Dense MLA uses BF16 `ckvData[layer]` `[maxPages, pageSize, kvLoraRank]` and `kpeData[layer]` `[maxPages, pageSize, qkRopeDim]`.
+- Sparse MLA packs FP8 CKV, FP32 block scales, and BF16 rotary keys into U8 `ckvData[layer]` `[maxPages, pageSize, bytesPerToken]`. Indexer keys use U8 `kData` with F32 `kScaleData`; shared-indexer layers omit their own indexer cache and reuse prior top-k selections.
 - Standard path: uses `kData[layer]` `[maxPages, nKv*pageSize*hd]` and `vData[layer]`.
 
 ## Execution Workspace (`src/execution-workspace.ts`)
 
-- `ExecutionWorkspace` extends `WorkspaceBase`, pre-allocating all GPU and pinned buffers needed for prefill/decode at construction time. No GPU allocations happen in the hot path.
+- `ExecutionWorkspace` extends `WorkspaceBase`. Persistent device/pinned planning buffers are allocated lazily per plan slot using `ensureAlloc()`. Forward temporaries use workspace heaps; warmup establishes reusable allocations before capture.
 - `ExecutionState`: holds per-step context (batchSize, totalTokens, seqLens, isDecode, cache reference).
+- Each plan gets a distinct slot, allowing plan+plan+run+run without overwriting metadata. Tracking/clear boundaries reset the slot counter. Each slot packs metadata into one device/host buffer pair with stable views; page indices come last so changing page count does not shift other pointers.
 - **Plan/Run split**:
-  - `planPrefill()`: allocates pages, fills indptr/positionIds/slotMapping on host, calls FlashInfer plan kernel, copies indices to device.
-  - `planDecode()`: allocates decode token pages, updates position IDs (only if dirty), calls FlashInfer decode plan (only if pages changed), copies indices.
+  - `planPrefill()` / `planDecode()`: reserve pages, fill position/page/sequence metadata, invoke the appropriate dense FlashInfer or sparse-MLA planning path, and upload metadata. Sparse prefill has no attention-kernel plan but still prepares CP page lengths.
+  - `state.setInput()`: uploads host token IDs or copies a GPU token tensor into the slot's input buffer.
   - `forwardPrefill/forwardDecode()`: runs the model forward pass using the planned state.
 - FlashInfer plan writes workspace buffers (floatWs, intWs, planInfo). Run reads them. This split is essential for CUDA graph capture — plan runs outside the graph, run is captured.
 
 ## CUDA Graph Capture (`src/capture-manager.ts`)
 
-- `CaptureManager`: key → `{warmupSteps, graphExec}`. First 3 calls run eagerly (warmup). On the 3rd warmup call, `graphBeginCapture()` is called, the lambda runs, then `graphEndCapture()` + `graphInstantiate()`. Subsequent calls with the same key launch the cached graph directly via `graphLaunch()`.
-- Works because all GPU pointers are stable (workspace recycling). The plan step (which writes to plan buffers and may change kernel selection) runs outside the graph.
-- Decode path: `captureManager.run(() => { inputIdsBuf.memcpy, decodeStep, model.forward, computeLogits, doSample }, ['decode'])`.
+- `CaptureManager` implements `ExecutionManager.execute({ states, inputs, key }, fn)`. For a stable key, the first call runs eagerly; the second records, instantiates, and launches the graph; subsequent calls replay it. An empty key executes eagerly.
+- Keys include caller parameters, each state's batch size/total tokens, backend capture keys, and explicit input tensor signatures including memory ranges. Padded KV-length buckets are added when execution calls `getGraphVariantPaddedKvLen()`.
+- Captures retain input/output tensors and the set of participating workspaces. Replay validates inputs and clear workspace ownership, launches the graph, reconciles host heap bookkeeping, and returns uncaptured output views.
+- Planning and input upload run outside the normal decode graph; model forward, logits, and token selection run inside it. `ExecutionState.captureAll()` supports graphs spanning multiple planned states. `GLM_GRAPH_DIAGNOSTICS=1` enables binding/replay diagnostics.
+- `ChatModel.executePrefill()` always uses an empty capture key, so production chunked/phased prefill executes eagerly.
 
 ## Model Loading (`src/chat_model.ts`, `src/glm51_model.ts`)
 
 - `ChatModel` extends `WorkspaceBase` — the model IS its weight workspace.
 - `fromPretrained(modelDir)`: scans for safetensors files, memory-maps each shard, calls `loadTensor()` for each weight. After loading, calls `freeze()` to lock the workspace.
 - `loadTensor()` is model-specific:
-  - GLM-5.1: splits MLA fused weights (q_b_proj → q_nope_proj + q_pe_proj, kv_b_proj → k_nope_proj + v_proj), computes absorbed weight (k_nope_proj @ q_nope_proj), handles NVFP4 scale renaming.
-  - Weights are loaded with mmap+DMA (`mmapLoadAsync`) for zero-copy GPU upload.
+  - GLM: splits MLA fused weights (`q_b_proj` → `q_nope_proj` + `q_pe_proj`, `kv_b_proj` → `k_nope_proj` + transposed `v_proj`, `kv_a_proj_with_mqa` → `ckv_proj` + `k_pe_proj`) and handles NVFP4 scale renaming. The query path uses factorized projections rather than a load-time precomputed absorbed weight.
+  - Weights are uploaded from memory-mapped safetensors with `mmapLoadAsync`, avoiding a JavaScript-side weight-buffer copy.
   - F32 weights (norms, A_log) are converted to BF16 on load.
-
-## Inference Flow
-
-1. **Prefill**: `planPrefill()` → `prepareInput()` → `forwardInput()` → `model.forward(state)` → `computeLogits()`
-2. **Decode loop**: `planDecode()` → `captureManager.run({ inputIdsBuf.memcpy, decodeStep, model.forward, computeLogits, doSample })` → copy token to host → `reportTokens()` → yield
 
 ## Scratchpad
 
@@ -220,11 +216,10 @@ The `scratchpad/` directory is gitignored and intended for ad-hoc scripts, diagn
 ```bash
 npm run build:all          # build CUDA addon + TypeScript (required before any tests)
 npm run test:python        # Python tests: pytest tests/python/ - validates CUDA kernels against PyTorch
-npm run test:node          # TypeScript tests: end-to-end model inference via tsx --test
+npm run test:node          # TypeScript suite entry point: tsx --test tests/test_all.ts
 npm test                   # runs both
 # individual tests:
-cd tests/python && pytest -v test_linear.py   # single Python test
-pytest -v test_linear.py            # specific GPU
+pytest -v tests/python/test_linear.py        # single Python test
 npx tsx --test tests/test_glm51.ts            # single TS test
 npx tsx --test tests/test_parallel.ts  # multi-GPU
 ```
@@ -235,7 +230,7 @@ npx tsx --test tests/test_parallel.ts  # multi-GPU
 
 Executor CUDA contexts, streams, cuBLAS handles, NCCL communicators, graphs, and workspaces are process-local and are released by process teardown. The loader remains the sole owner of the exported arena allocations. For custom direct-P2P collectives, each executor GPU context opens every owner's arena handle and translates tensor pointers through the resulting per-reader/per-owner base table; process-local P2P metadata pointers do not require translation. NCCL collectives remain available as fallback.
 
-The loader currently supports Qwen3 and GLM-5.1. It requires `--arena <GiB>` and does not support Qwen3.5 or FP8.
+The loader supports Qwen3 and the GLM backend (including the default GLM-5.3 checkpoint via `--glm51`). It requires `--arena <GiB>` and rejects `--qwen35` and `--fp8`.
 
 ## Start the Loader
 
@@ -330,7 +325,7 @@ Let the benchmark exit naturally to finish the Nsight report. `/stop` sends SIGT
 
 ## NCCL Topology
 
-The following environment variables hsould be used to override the default topology which prevents host staged all gather and all reduce when using NCCL.
+On the production eight-GPU/two-switch host, use the following topology override to avoid host-staged NCCL AllGather and AllReduce:
 
 ```
 NCCL_P2P_LEVEL=SYS
@@ -349,10 +344,12 @@ You must NEVER "git commit" unless the user explicitly asks you to commit. If yo
 
 You must NEVER use "git stash pop" to reapply stashed changes. You MUST use "git stash apply" instead. "git stash pop" is potentially destructive and may cause data loss when used in conjunction with an coding agent harness rollback. The user will clean up any entries left behind from usage of "git stash apply".
 
-# Production GLM-5.1 Model Config (zai-org/GLM-5.1)
+# Production GLM-5.3 Model Config (local-inference-lab/GLM-5.3-NVFP4)
 
 Model Path:
-`$HF_HOME/hub/models--local-inference-lab--GLM-5.3-NVFP4`
+`$HF_HOME/hub/models--local-inference-lab--GLM-5.3-NVFP4/snapshots/<revision>`
+
+`src/model_cli.ts` selects this repository by default for `--glm51`. The cache's `refs/main` identifies the snapshot revision. Values below are from the checkpoint's `config.json`.
 
 | Key | Value |
 |---|---|
@@ -381,22 +378,15 @@ Model Path:
 | index_topk | 2048 |
 | index_head_dim | 128 |
 | index_n_heads | 32 |
+| index_topk_freq | 4 |
+| index_skip_topk_offset | 3 |
+| index_share_for_mtp_iteration | true |
+| indexer_types | full at layers 0, 1, 2, then 6, 10, …, 74; shared otherwise |
 | first_k_dense_replace | 3 |
 | num_nextn_predict_layers | 1 |
-| max_position_embeddings | 202752 |
+| max_position_embeddings | 1048576 |
 | vocab_size | 154880 |
 | rms_norm_eps | 1e-05 |
 | rope_interleave | true |
-
-# Responding to User Queries
-
-Responses should address the point and not stray on tangents or hypothetical hazards and scenarios that the user is not querying about. Address the question directly; the user is not an idiot and doesn't to sift through several paragraphs of unrelated possible scenarios that aren't being directly asked about.
-
-Be consise. Do not continually hedge. Given a user query about the code, why how something does work, or explain why something does not work. It must not venture into hypothetical failure cases. Your response should be a concrete "this works given X" or "this does not work because of X". Responses like "this works with the following caveats". The caveats are useless filler, the user does not need an exhaustive list of hypothetical failure cases. Answer their question narrowly.
-
-If you add caveats and other useless shit the user will get pissed. Do not do that. It is cognitive overload and non actionable.
-
-- Never emit a "caveats", "conditions", "where this does not hold", or "note that" section. If a condition is load-bearing, it goes inline in the reasoning as a "because X" clause.
-- Before stating a condition, check whether the user already stipulated it in their question; if so, do not restate it.
-- One exception per answer maximum, and only when it changes what code the user would write.
-- Answer only the question asked. Never posit an implementation or objection the user did not state, including "you might instead X" or "the distinction matters because Y" framings. If a distinction is load-bearing, state it inline in one clause; otherwise omit it entirely.
+| indexer_rope_interleave | true |
+| rope_parameters | default RoPE, rope_theta = 8000000 |
