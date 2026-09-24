@@ -239,7 +239,7 @@ Start the loader and its initial executor in one command:
 ```bash
 NCCL_P2P_LEVEL=SYS NCCL_TOPO_FILE=/root/chat/vllm/topo_fixed.xml npx tsx src/run_model_loader.ts \
   --arena 92 --gpus 0,4,5,7,1,2,3,6 --cp --glm51 --mtp \
-  src/openai-server.ts --host 0.0.0.0 --port 8000 --max-pages 2048 --phased-prefill
+  src/openai-server.ts --host 0.0.0.0 --port 8000 --max-pages 8192 --phased-prefill
 ```
 
 Arguments before the executor path are shared model arguments and are passed to every executor process. Arguments after the path apply only to that executor. Loader options default to `--control-host 127.0.0.1 --control-port 8099` and must appear before the executor path.
