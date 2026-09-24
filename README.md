@@ -1,4 +1,4 @@
-# glm.js
+# slopllm
 
 GPU-accelerated inference for the GLM-5.1 model (1.5TB BF16 MoE with MLA+DSA attention), implemented in CUDA with Node.js bindings.
 
