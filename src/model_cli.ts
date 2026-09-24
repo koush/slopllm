@@ -15,7 +15,6 @@ export const GLM51_REPO = "local-inference-lab/GLM-5.3-NVFP4";
 
 const GLM51_SMALL_BF16 = "tests/python/test_models/glm51_small/glm51_small_bf16";
 const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp4";
-const GLM51_MODEL_DIR = "/mnt/storage/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-NVFP4/snapshots/cca10d1586255195d3279785fc85577bfc1e9227/";
 
 export interface ModelCliArgs {
   gpus: number[];
@@ -100,7 +99,7 @@ export function resolveModelSelection(args: ModelCliArgs): { modelDir: string, r
   const modelDir = args.modelDir ?? (args.useGlm51
     ? (args.glm51Small
       ? (args.useNvfp4 ? GLM51_SMALL_NVFP4 : GLM51_SMALL_BF16)
-      : GLM51_MODEL_DIR)
+      : GLM51_REPO)
     : resolveModelPath(repoId));
   return { modelDir, repoId };
 }
