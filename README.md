@@ -5,6 +5,7 @@ GPU-accelerated inference for the GLM-5.1 model (1.5TB BF16 MoE with MLA+DSA att
 ## Goals
 
 - Fast inference of GLM-5.x (glm_moe_dsa) on 8x RTX 6000 Pro GPUs.
+- Persistent model loader process for instant server updates (developments or restarts).
 - OpenAI-compatible serving (`src/openai-server.ts`) with:
   - Continuous batching and chunked prefill via a generation scheduler
   - Paged KV cache with prefix sharing across requests
