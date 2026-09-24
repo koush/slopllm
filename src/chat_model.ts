@@ -153,8 +153,8 @@ export abstract class ChatModel extends WorkspaceBase {
   abstract readonly cfg: CommonModelConfig;
   tokenizer!: Tokenizer;
 
-  constructor(glm: DeviceOps) {
-    super(glm);
+  constructor(ops: DeviceOps) {
+    super(ops);
   }
 
   abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number): ChatCache;
@@ -236,7 +236,7 @@ export abstract class ChatModel extends WorkspaceBase {
           // A stays one phase ahead so B can attend to A's newly written KV.
           doneA = advance(a, hiddenA);
           while (!doneA) {
-            using streamB = self.glm.withStream(() => {
+            using streamB = self.ops.withStream(() => {
               if (!doneB) {
                 doneB = advance(b, hiddenB);
               }
@@ -321,7 +321,7 @@ export abstract class ChatModel extends WorkspaceBase {
       return this.createChunkedPrefillPlan([], cache, inputIdsList, (function* () { return []; })());
     }
 
-    if (this.glm.worldSize > 1 && batchSize === 1 && totalTokens >= 4096 && process.env.GLM_PHASED_PREFILL !== "0") {
+    if (this.ops.worldSize > 1 && batchSize === 1 && totalTokens >= 4096 && process.env.GLM_PHASED_PREFILL !== "0") {
       return this.planPhasedPrefill(ws, cache, inputIdsList, samplingPolicy);
     }
 
@@ -370,7 +370,7 @@ export abstract class ChatModel extends WorkspaceBase {
 
       warmup = execution.warmup;
       targetTokens = execution.result;
-      await this.glm.synchronizeAsync();
+      await this.ops.synchronizeAsync();
       plan.reportTokens();
     }
     ws.assertClear();
@@ -421,7 +421,7 @@ export abstract class ChatModel extends WorkspaceBase {
           });
           warmup = execution.warmup;
           using selected = execution.result;
-          await this.glm.synchronizeAsync();
+          await this.ops.synchronizeAsync();
           nextTokens = selected.readInt32LEArray();
         }
         inputTokens.forEach((token, batch) => cache.reportTokens(batch, [token], nextTokens[batch]));
@@ -437,7 +437,7 @@ export abstract class ChatModel extends WorkspaceBase {
         };
       }
     } finally {
-      await this.glm.synchronizeAsync();
+      await this.ops.synchronizeAsync();
     }
   }
 
@@ -512,7 +512,7 @@ export abstract class ChatModel extends WorkspaceBase {
       }
     }
 
-    await this.glm.synchronizeAsync();
+    await this.ops.synchronizeAsync();
 
     for (const { st, mmapPtr, fileSize } of openShards) {
       st.close();

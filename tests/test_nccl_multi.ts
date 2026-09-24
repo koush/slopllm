@@ -33,7 +33,7 @@ for (const numGpus of GPU_COUNTS) {
         getNativeAddon().ncclCommDestroy(comm);
       }
       for (const ws of workspaces) ws.free();
-      for (const glm of devices) glm.free();
+      for (const ops of devices) ops.free();
     });
 
     it("allReduce BF16 sums across all ranks", () => {

@@ -11,7 +11,7 @@ const FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 const BF16_REPO = "Qwen/Qwen3-0.6B";
 
 function makeKV(m: Qwen3Model, maxPages = 256, maxBatch = 1): PagedKVCache {
-  return new PagedKVCache(m.glm, m.cfg.numKeyValueHeads, m.cfg.headDim, m.cfg.numHiddenLayers, maxPages, maxBatch);
+  return new PagedKVCache(m.ops, m.cfg.numKeyValueHeads, m.cfg.headDim, m.cfg.numHiddenLayers, maxPages, maxBatch);
 }
 
 function cosineSimilarity(a: Float32Array, b: Float32Array): number {
@@ -34,21 +34,21 @@ function readLogits(logitsBuf: Tensor): Float32Array {
 }
 
 describe("Qwen3-0.6B-FP8 model", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let model: Qwen3Model;
   let ws: ExecutionWorkspace;
 
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    model = await Qwen3Model.fromPretrained(glm, FP8_REPO);
-    ws = new ExecutionWorkspace(glm, 1, 64);
+    ops = new GlmOps(deviceId);
+    model = await Qwen3Model.fromPretrained(ops, FP8_REPO);
+    ws = new ExecutionWorkspace(ops, 1, 64);
   });
 
   after(() => {
     ws.free();
     model.free();
-    glm.free();
+    ops.free();
   });
 
   it("loads FP8 weights as F8_E4M3 and scale_inv as F32", () => {
@@ -102,8 +102,8 @@ describe("Qwen3-0.6B-FP8 model", () => {
 
   it("FP8 logits correlate with BF16 logits (cosine sim >= 0.99)", async () => {
     const fp8KV = makeKV(model, 4);
-    const bf16Model = await Qwen3Model.fromPretrained(glm, BF16_REPO);
-    const bf16Ws = new ExecutionWorkspace(glm, 1, 64);
+    const bf16Model = await Qwen3Model.fromPretrained(ops, BF16_REPO);
+    const bf16Ws = new ExecutionWorkspace(ops, 1, 64);
     const bf16KV = makeKV(bf16Model, 4);
     try {
       fp8KV.reset(1);

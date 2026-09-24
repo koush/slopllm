@@ -9,13 +9,13 @@ import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
 
 describe("ParallelOps construction", () => {
   it("accepts a single device", () => {
-    const glm = new GlmOps(0);
-    const po = new ParallelOps([glm]);
+    const ops = new GlmOps(0);
+    const po = new ParallelOps([ops]);
     assert.equal(po.worldSize, 1);
     assert.equal(po.devices.length, 1);
     assert.equal(po.comms.length, 0);
     po.free();
-    glm.free();
+    ops.free();
   });
 
   it("accepts two devices", () => {
@@ -484,30 +484,30 @@ describe("Workspace stream recycling", () => {
   });
 
   it("promotes disposed descendants on a wait while retaining the parent handle", () => {
-    using glm = new GlmOps(0);
+    using ops = new GlmOps(0);
     let parentId = 0, childId = 0;
-    const parent = glm.withStream(() => {
-      parentId = glm.currentStream;
-      const child = glm.withStream(() => { childId = glm.currentStream; });
+    const parent = ops.withStream(() => {
+      parentId = ops.currentStream;
+      const child = ops.withStream(() => { childId = ops.currentStream; });
       child.streamWaitEvent();
       child[Symbol.dispose]();
     });
-    assert.ok(!glm.normalPriorityStreams.includes(childId));
+    assert.ok(!ops.normalPriorityStreams.includes(childId));
     parent.streamWaitEvent();
-    assert.deepEqual(glm.streamResources.get(parentId)!.joined, [parentId]);
-    assert.ok(!glm.normalPriorityStreams.includes(parentId));
-    assert.ok(glm.normalPriorityStreams.includes(childId), "tensor-free child should be promoted too");
+    assert.deepEqual(ops.streamResources.get(parentId)!.joined, [parentId]);
+    assert.ok(!ops.normalPriorityStreams.includes(parentId));
+    assert.ok(ops.normalPriorityStreams.includes(childId), "tensor-free child should be promoted too");
 
-    const next = glm.withStream(() => assert.equal(glm.currentStream, childId));
+    const next = ops.withStream(() => assert.equal(ops.currentStream, childId));
     parent.streamWaitEvent();
-    assert.ok(!glm.normalPriorityStreams.includes(childId), "repeated waits must not release the child's new lease");
+    assert.ok(!ops.normalPriorityStreams.includes(childId), "repeated waits must not release the child's new lease");
     parent[Symbol.dispose]();
-    assert.ok(glm.streamResources.has(childId), "old parent disposal must not touch the reused child");
+    assert.ok(ops.streamResources.has(childId), "old parent disposal must not touch the reused child");
     next.streamWaitEvent();
     next[Symbol.dispose]();
-    glm.synchronize();
-    assert.equal(glm.normalPriorityStreams.length + glm.highPriorityStreams.length, 63);
-    assert.equal(new Set([...glm.normalPriorityStreams, ...glm.highPriorityStreams]).size, 63);
+    ops.synchronize();
+    assert.equal(ops.normalPriorityStreams.length + ops.highPriorityStreams.length, 63);
+    assert.equal(new Set([...ops.normalPriorityStreams, ...ops.highPriorityStreams]).size, 63);
   });
 
   it("promotes descendants through a non-main parallel waiter", () => {
@@ -545,8 +545,8 @@ describe("Workspace stream recycling", () => {
   });
 
   it("reuses eligible heaps and returns disposed ranges to stream 0", () => {
-    const glm = new GlmOps(0);
-    const ws = new WorkspaceBase(glm);
+    const ops = new GlmOps(0);
+    const ws = new WorkspaceBase(ops);
 
     const main = ws.alloc([16], "F32");
     const mainData = main.data;
@@ -554,8 +554,8 @@ describe("Workspace stream recycling", () => {
     assert.ok(ws.heapByKey.get(0)?.contains(mainData, main.allocSize));
 
     let streamId = 0;
-    const stream = glm.withStream(() => {
-      streamId = glm.currentStream;
+    const stream = ops.withStream(() => {
+      streamId = ops.currentStream;
       const inherited = ws.alloc([16], "F32");
       assert.equal(inherited.data, mainData, "alternate stream should reuse stream 0 allocation");
       inherited[Symbol.dispose]();
@@ -568,75 +568,75 @@ describe("Workspace stream recycling", () => {
       sameStream[Symbol.dispose]();
     });
 
-    assert.ok(glm.streamResources.get(streamId)?.workspaces.has(ws));
+    assert.ok(ops.streamResources.get(streamId)?.workspaces.has(ws));
     assert.ok(ws.heapByKey.has(streamId));
     assert.ok(!ws.heapByKey.get(0)?.contains(mainData, 64));
 
     stream.streamWaitEvent();
     assert.ok(!ws.heapByKey.has(streamId));
     assert.ok(ws.heapByKey.get(0)?.contains(mainData, 64));
-    assert.equal(glm.streamResources.get(streamId)?.workspaces.size, 0);
-    assert.ok(!glm.normalPriorityStreams.includes(streamId), "waiting must not release the live stream handle");
+    assert.equal(ops.streamResources.get(streamId)?.workspaces.size, 0);
+    assert.ok(!ops.normalPriorityStreams.includes(streamId), "waiting must not release the live stream handle");
     stream[Symbol.dispose]();
     stream[Symbol.dispose]();
-    assert.ok(!glm.streamResources.has(streamId));
-    assert.ok(glm.normalPriorityStreams.includes(streamId));
+    assert.ok(!ops.streamResources.has(streamId));
+    assert.ok(ops.normalPriorityStreams.includes(streamId));
 
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("returns nested stream heaps through the active parent stream", () => {
-    const glm = new GlmOps(0);
-    const ws = new WorkspaceBase(glm);
+    const ops = new GlmOps(0);
+    const ws = new WorkspaceBase(ops);
     let outerId = 0;
     let innerId = 0;
 
-    const outer = glm.withStream(() => {
-      outerId = glm.currentStream;
-      assert.deepEqual(glm.activeStreams, [0, outerId]);
+    const outer = ops.withStream(() => {
+      outerId = ops.currentStream;
+      assert.deepEqual(ops.activeStreams, [0, outerId]);
       const outerTensor = ws.alloc([16], "F32");
       const outerData = outerTensor.data;
       outerTensor[Symbol.dispose]();
 
-      const inner = glm.withStream(() => {
-        innerId = glm.currentStream;
-        assert.deepEqual(glm.activeStreams, [0, outerId, innerId]);
+      const inner = ops.withStream(() => {
+        innerId = ops.currentStream;
+        assert.deepEqual(ops.activeStreams, [0, outerId, innerId]);
         const tensor = ws.alloc([16], "F32");
         assert.equal(tensor.data, outerData, "nested stream should reuse its parent stream allocation");
         tensor[Symbol.dispose]();
       });
 
-      assert.deepEqual(glm.activeStreams, [0, outerId]);
+      assert.deepEqual(ops.activeStreams, [0, outerId]);
       inner.streamWaitEvent();
       assert.ok(!ws.heapByKey.has(innerId));
       assert.ok(ws.heapByKey.has(outerId));
-      assert.ok(glm.streamResources.get(outerId)?.workspaces.has(ws));
+      assert.ok(ops.streamResources.get(outerId)?.workspaces.has(ws));
       inner[Symbol.dispose]();
     });
 
-    assert.deepEqual(glm.activeStreams, [0]);
+    assert.deepEqual(ops.activeStreams, [0]);
     outer.streamWaitEvent();
     assert.ok(!ws.heapByKey.has(outerId));
     assert.ok(ws.heapByKey.has(0));
     outer[Symbol.dispose]();
 
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("restores the stream stack when a callback throws", () => {
-    const glm = new GlmOps(0);
+    const ops = new GlmOps(0);
 
-    assert.throws(() => glm.withStream(() => {
-      assert.equal(glm.activeStreams.length, 2);
+    assert.throws(() => ops.withStream(() => {
+      assert.equal(ops.activeStreams.length, 2);
       throw new Error("expected failure");
     }), /expected failure/);
 
-    assert.deepEqual(glm.activeStreams, [0]);
-    assert.equal(glm.currentStream, 0);
-    assert.equal(glm.normalPriorityStreams.length + glm.highPriorityStreams.length, 63);
-    glm.free();
+    assert.deepEqual(ops.activeStreams, [0]);
+    assert.equal(ops.currentStream, 0);
+    assert.equal(ops.normalPriorityStreams.length + ops.highPriorityStreams.length, 63);
+    ops.free();
   });
 });
 
@@ -794,12 +794,12 @@ describe("groupedLinear", () => {
     it(`${mode}: preserves projection order and stream dependencies through capture/replay`, () => {
       const devices = [new GlmOps(0)];
       if (mode !== "single") devices.push(new GlmOps(1));
-      const glm = mode === "single" ? devices[0] : new ParallelOps(devices);
-      if (glm instanceof ParallelOps) {
-        if (mode === "p2p") assert.equal(glm.p2pEnabled, true);
-        else glm.p2pEnabled = false;
+      const ops = mode === "single" ? devices[0] : new ParallelOps(devices);
+      if (ops instanceof ParallelOps) {
+        if (mode === "p2p") assert.equal(ops.p2pEnabled, true);
+        else ops.p2pEnabled = false;
       }
-      const ws = new WorkspaceBase(glm);
+      const ws = new WorkspaceBase(ops);
       try {
         // Also include an unshardable width: its replicated result still needs
         // to wait for its producer when mixed with gathered projections.
@@ -820,14 +820,14 @@ describe("groupedLinear", () => {
             const projections = input.groupedLinear(weights.map(w => w.weight));
             try {
               assert.equal(projections.length, widths.length);
-              const shared = glm instanceof ParallelOps && batch <= glm.worldSize;
+              const shared = ops instanceof ParallelOps && batch <= ops.worldSize;
               assert.equal(new Set(projections.map(p => p.streamId)).size, shared ? 1 : widths.length);
               for (const [p, projection] of projections.entries()) {
                 assert.deepEqual(projection.result.shape, [batch, widths[p]]);
                 assert.equal(projection.result.parallelism, TensorParallelism.Replicated);
                 // Each consumer waits independently on a different stream. Waiting
                 // twice must not invalidate the shared completion event/resources.
-                using consumer = glm.withStream(() => {
+                using consumer = ops.withStream(() => {
                   projection.streamWaitEvent();
                   projection.streamWaitEvent();
                   outputs[p].memcpy(projection.result);
@@ -843,7 +843,7 @@ describe("groupedLinear", () => {
             }
           };
           const verify = (seed: number) => {
-            glm.synchronize();
+            ops.synchronize();
             const inputValues = Float32Array.from({ length: batch * k }, (_, i) => ((i + seed) % 7 - 3) / 8);
             for (const [p, output] of outputs.entries()) {
               const expected = refLinear(inputValues, weights[p].values, batch, widths[p], k);
@@ -865,30 +865,30 @@ describe("groupedLinear", () => {
           run();
           verify(0);
           run();
-          glm.synchronize();
+          ops.synchronize();
           let graph: number | undefined, exec: number | undefined;
           try {
-            glm.graphBeginCapture();
+            ops.graphBeginCapture();
             run();
-            graph = glm.graphEndCapture();
-            exec = glm.graphInstantiate(graph);
+            graph = ops.graphEndCapture();
+            exec = ops.graphInstantiate(graph);
             for (const seed of [1, 3]) {
               upload(seed);
-              glm.graphLaunch(exec);
+              ops.graphLaunch(exec);
               verify(seed);
             }
           } finally {
-            if (exec !== undefined) glm.graphExecDestroy(exec);
-            if (graph !== undefined) glm.graphDestroy(graph);
+            if (exec !== undefined) ops.graphExecDestroy(exec);
+            if (graph !== undefined) ops.graphDestroy(graph);
           }
           assert.deepEqual(input.groupedLinear([]), []);
           using wrong = ws.alloc([16, k + 1], "BF16");
           assert.throws(() => input.groupedLinear([weights[0].weight, wrong]), /input dim/);
         }
       } finally {
-        glm.synchronize();
+        ops.synchronize();
         ws.free();
-        if (glm instanceof ParallelOps) glm.free();
+        if (ops instanceof ParallelOps) ops.free();
         for (const device of devices) device.free();
       }
     });
@@ -1963,14 +1963,14 @@ describe("ParallelTensor.max", () => {
     const inputF32 = new Float32Array(batch * dim);
     for (let i = 0; i < batch * dim; i++) inputF32[i] = Math.sin(i * 0.7) * 10;
 
-    const refGlm = new GlmOps(2);
-    const refWs = new WorkspaceBase(refGlm);
+    const refops = new GlmOps(2);
+    const refWs = new WorkspaceBase(refops);
     const refInput = refWs.alloc([batch, dim], "BF16");
     refInput.h2d(f32ToBf16Bytes(inputF32));
-    refGlm.synchronize();
+    refops.synchronize();
 
     const { values: refValues, indices: refIndices } = refInput.max();
-    refGlm.synchronize();
+    refops.synchronize();
 
     const refValuesBuf = Buffer.alloc(batch * 2);
     const refIndicesBuf = Buffer.alloc(batch * 4);
@@ -1998,7 +1998,7 @@ describe("ParallelTensor.max", () => {
     }
 
     refWs.free();
-    refGlm.free();
+    refops.free();
   });
 
   it("max on Column-parallel BF16 matches single-GPU reference", () => {
@@ -2008,14 +2008,14 @@ describe("ParallelTensor.max", () => {
     const inputF32 = new Float32Array(batch * dim);
     for (let i = 0; i < batch * dim; i++) inputF32[i] = Math.cos(i * 0.3) * 5;
 
-    const refGlm = new GlmOps(2);
-    const refWs = new WorkspaceBase(refGlm);
+    const refops = new GlmOps(2);
+    const refWs = new WorkspaceBase(refops);
     const refInput = refWs.alloc([batch, dim], "BF16");
     refInput.h2d(f32ToBf16Bytes(inputF32));
-    refGlm.synchronize();
+    refops.synchronize();
 
     const { values: refValues, indices: refIndices } = refInput.max();
-    refGlm.synchronize();
+    refops.synchronize();
 
     const refValuesBuf = Buffer.alloc(batch * 2);
     const refIndicesBuf = Buffer.alloc(batch * 4);
@@ -2043,7 +2043,7 @@ describe("ParallelTensor.max", () => {
     }
 
     refWs.free();
-    refGlm.free();
+    refops.free();
   });
 });
 
@@ -2115,14 +2115,14 @@ describe("ParallelTensor.topk", () => {
     const inputF32 = new Float32Array(batch * dim);
     for (let i = 0; i < batch * dim; i++) inputF32[i] = Math.sin(i * 0.7) * 10;
 
-    const refGlm = new GlmOps(2);
-    const refWs = new WorkspaceBase(refGlm);
+    const refops = new GlmOps(2);
+    const refWs = new WorkspaceBase(refops);
     const refInput = refWs.alloc([batch, dim], "BF16");
     refInput.h2d(f32ToBf16Bytes(inputF32));
-    refGlm.synchronize();
+    refops.synchronize();
 
     const { values: refValues, indices: refIndices } = refInput.topk(k, dim);
-    refGlm.synchronize();
+    refops.synchronize();
 
     const refValuesBuf = Buffer.alloc(batch * k * 2);
     const refIndicesBuf = Buffer.alloc(batch * k * 4);
@@ -2156,7 +2156,7 @@ describe("ParallelTensor.topk", () => {
     }
 
     refWs.free();
-    refGlm.free();
+    refops.free();
   });
 
   it("topk on Column-parallel BF16 tensor matches single-GPU reference", () => {
@@ -2167,14 +2167,14 @@ describe("ParallelTensor.topk", () => {
     const inputF32 = new Float32Array(batch * dim);
     for (let i = 0; i < batch * dim; i++) inputF32[i] = Math.cos(i * 0.3) * 5;
 
-    const refGlm = new GlmOps(2);
-    const refWs = new WorkspaceBase(refGlm);
+    const refops = new GlmOps(2);
+    const refWs = new WorkspaceBase(refops);
     const refInput = refWs.alloc([batch, dim], "BF16");
     refInput.h2d(f32ToBf16Bytes(inputF32));
-    refGlm.synchronize();
+    refops.synchronize();
 
     const { values: refValues, indices: refIndices } = refInput.topk(k, dim);
-    refGlm.synchronize();
+    refops.synchronize();
 
     const refValuesBuf = Buffer.alloc(batch * k * 2);
     const refIndicesBuf = Buffer.alloc(batch * k * 4);
@@ -2208,7 +2208,7 @@ describe("ParallelTensor.topk", () => {
     }
 
     refWs.free();
-    refGlm.free();
+    refops.free();
   });
 
   it("topk with offset on Row-parallel BF16 tensor", () => {
@@ -2227,14 +2227,14 @@ describe("ParallelTensor.topk", () => {
     const { values, indices } = input.topk(k, dim, offset);
     po.synchronize();
 
-    const refGlm = new GlmOps(2);
-    const refWs = new WorkspaceBase(refGlm);
+    const refops = new GlmOps(2);
+    const refWs = new WorkspaceBase(refops);
     const refInput = refWs.alloc([batch, dim], "BF16");
     refInput.h2d(f32ToBf16Bytes(inputF32));
-    refGlm.synchronize();
+    refops.synchronize();
 
     const { values: refValues, indices: refIndices } = refInput.topk(k, dim, offset);
-    refGlm.synchronize();
+    refops.synchronize();
 
     const refValuesBuf = Buffer.alloc(batch * k * 2);
     const refIndicesBuf = Buffer.alloc(batch * k * 4);
@@ -2258,7 +2258,7 @@ describe("ParallelTensor.topk", () => {
     }
 
     refWs.free();
-    refGlm.free();
+    refops.free();
   });
 
   it("topk with k>8 uses histogram path on single GPU", () => {
@@ -2269,14 +2269,14 @@ describe("ParallelTensor.topk", () => {
     const inputF32 = new Float32Array(batch * dim);
     for (let i = 0; i < batch * dim; i++) inputF32[i] = (i * 7919) % 1000;
 
-    const refGlm = new GlmOps(2);
-    const refWs = new WorkspaceBase(refGlm);
+    const refops = new GlmOps(2);
+    const refWs = new WorkspaceBase(refops);
     const refInput = refWs.alloc([batch, dim], "BF16");
     refInput.h2d(f32ToBf16Bytes(inputF32));
-    refGlm.synchronize();
+    refops.synchronize();
 
     const { values: refValues, indices: refIndices } = refInput.topk(k, dim);
-    refGlm.synchronize();
+    refops.synchronize();
 
     const refValuesBuf = Buffer.alloc(batch * k * 2);
     const refIndicesBuf = Buffer.alloc(batch * k * 4);
@@ -2314,7 +2314,7 @@ describe("ParallelTensor.topk", () => {
     }
 
     refWs.free();
-    refGlm.free();
+    refops.free();
   });
 });
 

@@ -16,17 +16,17 @@ import { WorkspaceBase } from "../src/workspace";
 import { Tensor } from "../src/tensor";
 
 describe("memcpy2d", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ws: WorkspaceBase;
 
   before(() => {
-    glm = new GlmOps(0);
-    ws = new WorkspaceBase(glm);
+    ops = new GlmOps(0);
+    ws = new WorkspaceBase(ops);
   });
 
   after(() => {
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("extracts a column shard from a D2D 2D copy (BF16)", () => {
@@ -54,7 +54,7 @@ describe("memcpy2d", () => {
 
     const dstBuf = Buffer.alloc(rows * shardCols * elemBytes);
     dstGpu.d2h(dstBuf, rows * shardCols * elemBytes);
-    glm.synchronize();
+    ops.synchronize();
 
     const dstF32 = bf16BytesToF32(dstBuf);
     for (let r = 0; r < rows; r++) {
@@ -89,7 +89,7 @@ describe("memcpy2d", () => {
 
     const dstBuf = Buffer.alloc(totalBytes);
     dstGpu.d2h(dstBuf, totalBytes);
-    glm.synchronize();
+    ops.synchronize();
 
     const dstF32 = bf16BytesToF32(dstBuf);
     for (let i = 0; i < rows * cols; i++) {
@@ -111,8 +111,8 @@ describe("memcpy2d", () => {
     for (let i = 0; i < rows * cols; i++) srcF32[i] = i + 0.5;
 
     const hostBuf = f32ToBf16Bytes(srcF32);
-    const hostPtr = glm.allocPinned(hostBuf.length);
-    const hostTensor = new GlmTensor(ws, glm, hostPtr, hostBuf.length, [hostBuf.length], "U8", undefined, true, undefined);
+    const hostPtr = ops.allocPinned(hostBuf.length);
+    const hostTensor = new GlmTensor(ws, ops, hostPtr, hostBuf.length, [hostBuf.length], "U8", undefined, true, undefined);
     hostTensor.withPinnedBuffer(buf => buf.set(hostBuf));
 
     const dstGpu = ws.alloc([rows * shardCols * elemBytes], "U8");
@@ -128,7 +128,7 @@ describe("memcpy2d", () => {
 
     const dstBuf = Buffer.alloc(rows * shardCols * elemBytes);
     dstGpu.d2h(dstBuf, rows * shardCols * elemBytes);
-    glm.synchronize();
+    ops.synchronize();
 
     const dstF32 = bf16BytesToF32(dstBuf);
     for (let r = 0; r < rows; r++) {
@@ -148,17 +148,17 @@ describe("memcpy2d", () => {
 });
 
 describe("NCCL single-rank", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ws: WorkspaceBase;
 
   before(() => {
-    glm = new GlmOps(0);
-    ws = new WorkspaceBase(glm);
+    ops = new GlmOps(0);
+    ws = new WorkspaceBase(ops);
   });
 
   after(() => {
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("generates a 128-byte unique ID", () => {
@@ -171,8 +171,8 @@ describe("NCCL single-rank", () => {
   it("initializes and destroys a single-rank communicator", () => {
     const idBuf = Buffer.alloc(NCCL_UNIQUE_ID_BYTES);
     getNativeAddon().ncclUniqueId(idBuf);
-    const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
-    const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
+    const idPtr = ops.allocPinned(NCCL_UNIQUE_ID_BYTES);
+    const idTensor = new GlmTensor(ws, ops, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
     idTensor.withPinnedBuffer(buf => buf.set(idBuf));
 
     const comm = getNativeAddon().ncclCommInitRank(0, 0, 1, idPtr);
@@ -185,8 +185,8 @@ describe("NCCL single-rank", () => {
   it("allReduce with worldSize=1 is identity (BF16)", () => {
     const idBuf = Buffer.alloc(NCCL_UNIQUE_ID_BYTES);
     getNativeAddon().ncclUniqueId(idBuf);
-    const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
-    const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
+    const idPtr = ops.allocPinned(NCCL_UNIQUE_ID_BYTES);
+    const idTensor = new GlmTensor(ws, ops, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
     idTensor.withPinnedBuffer(buf => buf.set(idBuf));
 
     const comm = getNativeAddon().ncclCommInitRank(0, 0, 1, idPtr);
@@ -201,8 +201,8 @@ describe("NCCL single-rank", () => {
     const recvGpu = ws.alloc([bytes], "U8");
     sendGpu.h2d(srcBuf);
 
-    getNativeAddon().ncclAllReduce(comm, glm.ctx, sendGpu.data, recvGpu.data, count, NCCL_BFLOAT16, NCCL_SUM);
-    glm.synchronize();
+    getNativeAddon().ncclAllReduce(comm, ops.ctx, sendGpu.data, recvGpu.data, count, NCCL_BFLOAT16, NCCL_SUM);
+    ops.synchronize();
 
     const dstBuf = Buffer.alloc(bytes);
     recvGpu.d2h(dstBuf, bytes);
@@ -222,8 +222,8 @@ describe("NCCL single-rank", () => {
   it("allReduce with worldSize=1 is identity (F32)", () => {
     const idBuf = Buffer.alloc(NCCL_UNIQUE_ID_BYTES);
     getNativeAddon().ncclUniqueId(idBuf);
-    const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
-    const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
+    const idPtr = ops.allocPinned(NCCL_UNIQUE_ID_BYTES);
+    const idTensor = new GlmTensor(ws, ops, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
     idTensor.withPinnedBuffer(buf => buf.set(idBuf));
 
     const comm = getNativeAddon().ncclCommInitRank(0, 0, 1, idPtr);
@@ -238,8 +238,8 @@ describe("NCCL single-rank", () => {
     const recvGpu = ws.alloc([bytes], "U8");
     sendGpu.h2d(srcBuf);
 
-    getNativeAddon().ncclAllReduce(comm, glm.ctx, sendGpu.data, recvGpu.data, count, NCCL_FLOAT32, NCCL_SUM);
-    glm.synchronize();
+    getNativeAddon().ncclAllReduce(comm, ops.ctx, sendGpu.data, recvGpu.data, count, NCCL_FLOAT32, NCCL_SUM);
+    ops.synchronize();
 
     const dstBuf = Buffer.alloc(bytes);
     recvGpu.d2h(dstBuf, bytes);
@@ -259,8 +259,8 @@ describe("NCCL single-rank", () => {
   it("allGather with worldSize=1 is identity (BF16)", () => {
     const idBuf = Buffer.alloc(NCCL_UNIQUE_ID_BYTES);
     getNativeAddon().ncclUniqueId(idBuf);
-    const idPtr = glm.allocPinned(NCCL_UNIQUE_ID_BYTES);
-    const idTensor = new GlmTensor(ws, glm, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
+    const idPtr = ops.allocPinned(NCCL_UNIQUE_ID_BYTES);
+    const idTensor = new GlmTensor(ws, ops, idPtr, NCCL_UNIQUE_ID_BYTES, [NCCL_UNIQUE_ID_BYTES], "U8", undefined, true, undefined);
     idTensor.withPinnedBuffer(buf => buf.set(idBuf));
 
     const comm = getNativeAddon().ncclCommInitRank(0, 0, 1, idPtr);
@@ -275,8 +275,8 @@ describe("NCCL single-rank", () => {
     const recvGpu = ws.alloc([bytes], "U8");
     sendGpu.h2d(srcBuf);
 
-    getNativeAddon().ncclAllGather(comm, glm.ctx, sendGpu.data, recvGpu.data, count, NCCL_BFLOAT16);
-    glm.synchronize();
+    getNativeAddon().ncclAllGather(comm, ops.ctx, sendGpu.data, recvGpu.data, count, NCCL_BFLOAT16);
+    ops.synchronize();
 
     const dstBuf = Buffer.alloc(bytes);
     recvGpu.d2h(dstBuf, bytes);

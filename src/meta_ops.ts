@@ -243,7 +243,7 @@ export class MetaTensor extends Tensor {
         const byteOffset = start * innerElements * elemBytes;
         const newShape = [length, ...this.shape.slice(1)];
         const newAllocSize = this.allocSize - byteOffset;
-        return this.workspace.glm.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this);
+        return this.workspace.ops.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this);
     }
 
     scatterScalar(indices: Tensor, value: number, k: number): void {

@@ -61,8 +61,8 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
   readonly depth: number;
   readonly retainProposalsOnGpu: boolean;
 
-  constructor(glm: DeviceOps, maxBatchSize: number, vocabSize: number, maxWindow: number, mtp?: MtpSamplingConfig) {
-    super(glm);
+  constructor(ops: DeviceOps, maxBatchSize: number, vocabSize: number, maxWindow: number, mtp?: MtpSamplingConfig) {
+    super(ops);
     if (mtp && (!Number.isInteger(mtp.maxBatchSize) || mtp.maxBatchSize < 1
       || !Number.isInteger(mtp.depth) || mtp.depth < 1 || maxBatchSize < mtp.maxBatchSize * (mtp.depth + 1))) {
       throw new Error("Linear MTP requires valid batch/depth and a compatible target sampling workspace");
@@ -235,7 +235,7 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
     using topkVals = this.alloc([batchSize * 256 * 256], "F32");
     using topkIdxs = this.alloc([batchSize * 256 * 256], "I32");
     using scratch = this.alloc([batchSize * vs], "F32");
-    logits.workspace.glm.sampleBatch(
+    logits.workspace.ops.sampleBatch(
       outToken,
       topkVals,
       topkIdxs,
@@ -312,7 +312,7 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
     using values = candidates.values;
     using globalIds = candidates.indices;
     const output = this.alloc([this.mtpBatchSize], "I32");
-    this.glm.sampleCandidates(output, probs, ids, values, globalIds,
+    this.ops.sampleCandidates(output, probs, ids, values, globalIds,
       this.draftParams.temperatures, this.draftParams.topKs, this.draftParams.topPs,
       this.draftStepCounter, this.mtpBatchSize, this.candidateCount, this.capacity);
     if (!this.retainProposalsOnGpu) {
@@ -410,7 +410,7 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
     using _sampled = this.sample(logits, pProbs, pIds, this.capacity, this.verificationParams);
     const tokens = this.alloc([rows], "I32");
     const acceptedCounts = this.alloc([this.mtpBatchSize], "I32");
-    this.glm.specRejectLinear(tokens, acceptedCounts, this.draftTokens,
+    this.ops.specRejectLinear(tokens, acceptedCounts, this.draftTokens,
       this.qInputProbs, this.qInputIds, pProbs, pIds, this.rejectionStepCounter,
       this.mtpBatchSize, this.depth, this.capacity);
     return { tokens, numAccepted: acceptedCounts };

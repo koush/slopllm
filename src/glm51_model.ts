@@ -152,8 +152,8 @@ export class Glm51Model extends ChatModel {
   readonly contextParallel: boolean;
   private readonly mtp: boolean;
 
-  private constructor(glm: DeviceOps, config: Glm51Config, contextParallel = false, mtp = false) {
-    super(glm);
+  private constructor(ops: DeviceOps, config: Glm51Config, contextParallel = false, mtp = false) {
+    super(ops);
     this.cfg = config;
     this.eosIds = new Set(config.eosTokenIds);
     this.invFreq = this.initInvFreq(config.qkRopeHeadDim, config.ropeTheta);
@@ -168,10 +168,10 @@ export class Glm51Model extends ChatModel {
     });
   }
 
-  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, contextParallel = false, mtp = false): Promise<Glm51Model> {
+  static async fromPretrained(ops: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, contextParallel = false, mtp = false): Promise<Glm51Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
-    const model = new Glm51Model(glm, config, contextParallel, mtp);
+    const model = new Glm51Model(ops, config, contextParallel, mtp);
     await model.fromPretrained(modelDir, GLM51_REPO);
     return model;
   }
@@ -444,14 +444,14 @@ export class Glm51Model extends ChatModel {
         const nextKData = pagedKV.kData[nextCacheIdx];
         const nextKScaleData = pagedKV.kScaleData[nextCacheIdx];
         const indexerStream = CP_GATHER_INDEXER_KV && nextKData?.parallelism === TensorParallelism.Row
-          ? this.glm.withStream<void>(() => {
+          ? this.ops.withStream<void>(() => {
             const paddedKvLen = this.sparseMlaPaddedKvLen(state);
 
-            indexerKPrefetch!.replace(this.glm.gatherPages(
+            indexerKPrefetch!.replace(this.ops.gatherPages(
               nextKData, indices!, indptr, state.lastPageLen,
               state.batchSize, paddedKvLen, state.kvTokenIndptrD, true,
             ));
-            indexerKScalePrefetch!.replace(this.glm.gatherPages(
+            indexerKScalePrefetch!.replace(this.ops.gatherPages(
               nextKScaleData, indices!, indptr, state.lastPageLen,
               state.batchSize, paddedKvLen, state.kvTokenIndptrD, true,
             ));
@@ -472,11 +472,11 @@ export class Glm51Model extends ChatModel {
       }
 
       if (nextCacheIdx < cfg.numHiddenLayers + (cfg.numNextNPredictLayers ?? 0) && pagedKV.ckvData[nextCacheIdx]) {
-        const nextStream = this.glm.withStream<void>(() => {
+        const nextStream = this.ops.withStream<void>(() => {
           const nextKvCache = pagedKV.ckvData[nextCacheIdx];
           const paddedKvLen = this.sparseMlaPaddedKvLen(state);
 
-          ckvPrefetch!.replace(this.glm.gatherPages(
+          ckvPrefetch!.replace(this.ops.gatherPages(
             nextKvCache, indices!, indptr, state.lastPageLen,
             state.batchSize,
             paddedKvLen,
@@ -498,7 +498,7 @@ export class Glm51Model extends ChatModel {
     const hd = cfg.headDim;
     const nLayers = cfg.numHiddenLayers + (this.mtp ? cfg.numNextNPredictLayers ?? 0 : 0);
     const sharedLayers = cfg.indexerTypes.map(t => t === "shared");
-    return new PagedKVCache(this.glm, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim, sharedLayers);
+    return new PagedKVCache(this.ops, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim, sharedLayers);
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
@@ -526,7 +526,7 @@ export class Glm51Model extends ChatModel {
       throw new Error(`mlpSparse: nGroup > 1 is not supported (got nGroup=${nGroup})`);
     }
 
-    using routedStream = this.glm.withStream(true, () => {
+    using routedStream = this.ops.withStream(true, () => {
       using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!);
       const routed = gateLogitsBuf.moeRoute({
         numExpertsPerToken: topK,
@@ -583,7 +583,7 @@ export class Glm51Model extends ChatModel {
     const S = state.isDecode ? 1 : state.totalTokens;
 
     // start asap for idxq and q
-    using qNormedStream = this.glm.withStream(true, () => {
+    using qNormedStream = this.ops.withStream(true, () => {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
       return qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
     });
@@ -595,8 +595,8 @@ export class Glm51Model extends ChatModel {
     // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
     using idxQStream = shared
       ? undefined
-      : this.glm.withStream(true, () => {
-        using idxWeightsStream = this.glm.withStream(() => {
+      : this.ops.withStream(true, () => {
+        using idxWeightsStream = this.ops.withStream(() => {
           const idxNHeads = cfg.indexNHeads;
           const idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!);
           idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
@@ -606,7 +606,7 @@ export class Glm51Model extends ChatModel {
 
         // Indexer K: wk(normed) → layernorm → partial RoPE → append to kData
         // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
-        using kvcacheIndex = this.glm.withStream(() => {
+        using kvcacheIndex = this.ops.withStream(() => {
           const idxRopeDim = qkRopeDim;
           using idxKRaw = normed.linear(this.tensors.get(`${pfx}.indexer.wk.weight`)!);
           using idxKNormed = idxKRaw.layernorm(
@@ -637,7 +637,7 @@ export class Glm51Model extends ChatModel {
           using _kScaleData = localIndexer.kScaleData;
 
           const nnz = state.isDecode ? state.batchSize : state.totalTokens;
-          const cache = this.glm.mlaKvCacheAppend(
+          const cache = this.ops.mlaKvCacheAppend(
             state, layerIdx,
             prefetched, prefetchedScale!,
             undefined, state.kvTokenIndptrD, state.lastPageLen,
@@ -663,7 +663,7 @@ export class Glm51Model extends ChatModel {
         using idxQ = rotated.reshape([B * S, cfg.indexNHeads, cfg.indexHeadDim]);
 
         idxWeightsStream!.streamWaitEvent();
-        const idxQuantResult = this.glm.indexerQuantizeQ(idxQ, idxWeights, Math.pow(cfg.indexHeadDim, -0.5));
+        const idxQuantResult = this.ops.indexerQuantizeQ(idxQ, idxWeights, Math.pow(cfg.indexHeadDim, -0.5));
         using idxQFp8 = idxQuantResult.q8;
         using effectiveWeights = idxQuantResult.effectiveWeights;
 
@@ -677,8 +677,8 @@ export class Glm51Model extends ChatModel {
         );
       });
 
-    using kvcache = this.glm.withStream(() => {
-      using kPeRopeStream = this.glm.withStream(() => {
+    using kvcache = this.ops.withStream(() => {
+      using kPeRopeStream = this.ops.withStream(() => {
         using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!);
         return kPeRaw.applyRotaryPosEmb(cos, sin, qkRopeDim, qkRopeDim, 1, S, B, 1, cfg.ropeInterleave)
       });
@@ -713,7 +713,7 @@ export class Glm51Model extends ChatModel {
       // because the topk may reference those new-token positions.
 
       // Flat addressing uses token prefix sums rather than page indptr.
-      using _cache = this.glm.concatAndCacheDsMla(state, layerIdx, prefetched, ckvNormed, kPeRope,
+      using _cache = this.ops.concatAndCacheDsMla(state, layerIdx, prefetched, ckvNormed, kPeRope,
         undefined, state.kvTokenIndptrD, state.mlaBatchIndices, state.positionIds,
         state.isDecode ? state.batchSize : state.totalTokens,
         kvLoraRank, qkRopeDim, kvLoraRank, qkRopeDim);
@@ -727,7 +727,7 @@ export class Glm51Model extends ChatModel {
     // disabling for now.
     using absorbedWeightStream = true || state.totalTokens < 4096
       ? undefined
-      : this.glm.withStream(() => {
+      : this.ops.withStream(() => {
         const kNopeProj = this.tensors.get(`${pfx}.k_nope_proj.weight`)!;
         const qNopeProj = this.tensors.get(`${pfx}.q_nope_proj.weight`)!;
         using kNope = kNopeProj.viewClone();
@@ -744,11 +744,11 @@ export class Glm51Model extends ChatModel {
 
 
     const cache = kvcache.result;
-    using qStream = this.glm.withStream(() => {
+    using qStream = this.ops.withStream(() => {
       absorbedWeightStream?.streamWaitEvent();
       using absorbedWeight = absorbedWeightStream?.result;
       qNormedStream.streamWaitEvent();
-      return this.glm.projectMlaQuery(
+      return this.ops.projectMlaQuery(
         state, cache.ckv!, qNormed,
         this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
         this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
@@ -805,7 +805,7 @@ export class Glm51Model extends ChatModel {
         const maxKv = kData.shape[0] * kData.shape[1];
         const contextParallel = ckv.parallelism === TensorParallelism.Row;
         const flat = pagedKV.contextParallel && !contextParallel;
-        const { layer, group } = this.glm.topkToSlots(
+        const { layer, group } = this.ops.topkToSlots(
           state,
           topkIndices, state.kvTokenIndptrD,
           state.indices, state.indptrD, state.lastPageLen, state.mlaBatchIndices,
@@ -845,11 +845,11 @@ export class Glm51Model extends ChatModel {
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
       const oProj = this.tensors.get(`${pfx}.o_proj.weight`)!;
       if (BS <= 32 && process.env.GLM_L2_PREFETCH !== "0") {
-        using vExpandStream = this.glm.withStream(true, () => {
+        using vExpandStream = this.ops.withStream(true, () => {
           return attnOut.mlaVExpand(vProj, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);
         });
         using vExpanded = vExpandStream.result;
-        prefetchL2.replace(this.glm.withStream(() => this.glm.prefetchL2([oProj])));
+        prefetchL2.replace(this.ops.withStream(() => this.ops.prefetchL2([oProj])));
         vExpandStream.streamWaitEvent();
         oProjBuf.replace(vExpanded.outputProj(oProj));
       }
@@ -901,7 +901,7 @@ export class Glm51Model extends ChatModel {
 
     const freshRotary = !layerHolders.rotaryEmbedding.value;
     if (freshRotary) {
-      layerHolders.rotaryEmbedding.replace(this.glm.withStream(() => state.rotaryEmbedding(this.invFreq)));
+      layerHolders.rotaryEmbedding.replace(this.ops.withStream(() => state.rotaryEmbedding(this.invFreq)));
     }
     const rotaryEmbedding = layerHolders.rotaryEmbedding.value;
     using _ownedCos = freshRotary ? new UsingHolder<Tensor>(rotaryEmbedding.result.cos) : undefined;
@@ -984,7 +984,7 @@ export class Glm51Model extends ChatModel {
       }
 
       const embedTable = self.tensors.get("model.embed_tokens.weight")!;
-      using hnormStream = ws.glm.withStream(() => {
+      using hnormStream = ws.ops.withStream(() => {
         return previousHiddenState.rmsnorm(self.tensors.get(`${Glm51Model.WEIGHT_PREFIX}${cfg.numHiddenLayers}.hnorm.weight`)!, cfg.rmsNormEps);
       });
       using embedding = state.embedding(embedTable);
@@ -1206,7 +1206,7 @@ export class Glm51Model extends ChatModel {
             slotsLength.value.memcpy(initialSlotsLength.value, initialSlotsLength.value.bytes, MemcpyKind.DeviceToDevice);
           }
         }));
-        await this.glm.synchronizeAsync();
+        await this.ops.synchronizeAsync();
       }
       initialTargets.forEach((token, batch) => cache.reportTokens(batch, [token], nextTargets[batch]));
       committedLens = sequences.map(sequence => sequence.allocLen);
@@ -1273,7 +1273,7 @@ export class Glm51Model extends ChatModel {
             }
           }
 
-          using inputCopy = this.glm.withStream(() => {
+          using inputCopy = this.ops.withStream(() => {
             using input = verification.inputIdsBuf.viewClone();
             verifyTokensHost.memcpy(input, batchSize * numVerificationTokens * I32, MemcpyKind.DeviceToHost);
           });
@@ -1291,7 +1291,7 @@ export class Glm51Model extends ChatModel {
             const verified = sampled ? samplingPolicy.verify!(logits) : undefined;
             using counts = verified?.numAccepted;
             using selected = verified ? verified.tokens : samplingPolicy.selectTarget(logits);
-            using resultCopy = self.glm.withStream(() => {
+            using resultCopy = self.ops.withStream(() => {
               if (counts) acceptedHost!.memcpy(counts, batchSize * I32, MemcpyKind.DeviceToHost);
               selectedHost.memcpy(selected, batchSize * numVerificationTokens * I32, MemcpyKind.DeviceToHost);
             });
@@ -1306,7 +1306,7 @@ export class Glm51Model extends ChatModel {
             resultCopy.streamWaitEvent();
           }));
         });
-        await this.glm.synchronizeAsync();
+        await this.ops.synchronizeAsync();
 
         const inputBuf = verifyTokensHost.readPinnedBuffer();
         const selectedBuf = selectedHost.readPinnedBuffer();
@@ -1355,7 +1355,7 @@ export class Glm51Model extends ChatModel {
       }
     } finally {
       // Covers break/return, consumer exceptions, and failed graph submissions.
-      await this.glm.synchronizeAsync();
+      await this.ops.synchronizeAsync();
       if (speculative) {
         for (let batch = 0; batch < batchSize; batch++) sequences[batch].truncate(committedLens[batch]);
       }

@@ -22,7 +22,7 @@ function tokenizePrompt(tokenizer: any, prompt: string): number[] {
 }
 
 describe("Qwen3-0.6B batch smoke test", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let model: Qwen3Model;
   let ws: ExecutionWorkspace;
   let tokenizer: any;
@@ -30,11 +30,11 @@ describe("Qwen3-0.6B batch smoke test", () => {
 
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
-    ws = new ExecutionWorkspace(glm, 4, 2048);
+    ops = new GlmOps(deviceId);
+    model = await Qwen3Model.fromPretrained(ops, QWEN3_REPO);
+    ws = new ExecutionWorkspace(ops, 4, 2048);
     const cfg = model.cfg;
-    cache = new PagedKVCache(glm, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, 128, 4);
+    cache = new PagedKVCache(ops, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, 128, 4);
     tokenizer = model.tokenizer;
   });
 
@@ -42,7 +42,7 @@ describe("Qwen3-0.6B batch smoke test", () => {
     cache.free();
     ws.free();
     model.free();
-    glm.free();
+    ops.free();
   });
 
   it("2 identical 'hi' prompts produce responses containing 'hello' and 'assist'", () => {

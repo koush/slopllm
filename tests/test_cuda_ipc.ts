@@ -9,20 +9,20 @@ describe("CUDA IPC arena", () => {
   it("shares an owned arena with a separate process", async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
     const arenaGb = 1 / 1024;
-    const glm = new GlmOps(deviceId, undefined, arenaGb);
-    const workspace = new WorkspaceBase(glm);
+    const ops = new GlmOps(deviceId, undefined, arenaGb);
+    const workspace = new WorkspaceBase(ops);
 
     try {
       const shared = workspace.alloc([4], "BF16", "shared");
       shared.h2d(f32ToBf16Bytes(new Float32Array([1, 2, 3, 4])));
-      glm.synchronize();
+      ops.synchronize();
 
       const child = fork(path.resolve("tests/fixtures/cuda_ipc_child.ts"), [String(deviceId)], {
         execArgv: ["--require", require.resolve("tsx/cjs")],
         stdio: ["ignore", "pipe", "pipe", "ipc"],
         env: {
           ...process.env,
-          [`GLM_ARENA_IPC_HANDLE_${deviceId}`]: glm.exportArenaIpcHandle().toString("base64"),
+          [`GLM_ARENA_IPC_HANDLE_${deviceId}`]: ops.exportArenaIpcHandle().toString("base64"),
         },
       });
       let stderr = "";
@@ -50,8 +50,8 @@ describe("CUDA IPC arena", () => {
       assert.deepEqual([...bf16BytesToF32(updated)], [2, 4, 6, 8]);
     } finally {
       workspace.free();
-      glm.free();
-      glm.free();
+      ops.free();
+      ops.free();
     }
   });
 

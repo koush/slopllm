@@ -4,18 +4,18 @@ import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 
 describe("GlmTensor.indexSelect (single GPU)", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ws: WorkspaceBase;
 
   before(() => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    ws = new WorkspaceBase(glm);
+    ops = new GlmOps(deviceId);
+    ws = new WorkspaceBase(ops);
   });
 
   after(() => {
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("selects two rows from a 4×8 BF16 tensor", () => {
@@ -41,10 +41,10 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     const idx = ws.alloc([k], "I32");
     src.h2d(f32ToBf16Bytes(srcF32));
     idx.h2d(idxBuf);
-    glm.synchronize();
+    ops.synchronize();
 
     using out = src.indexSelect(idx);
-    glm.synchronize();
+    ops.synchronize();
 
     const outBuf = Buffer.alloc(k * dim * 2);
     out.d2h(outBuf);
@@ -72,10 +72,10 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     const idx = ws.alloc([k], "I32");
     src.h2d(f32ToBf16Bytes(srcF32));
     idx.h2d(idxBuf);
-    glm.synchronize();
+    ops.synchronize();
 
     using out = src.indexSelect(idx);
-    glm.synchronize();
+    ops.synchronize();
 
     const outBuf = Buffer.alloc(k * dim * 2);
     out.d2h(outBuf);
@@ -111,10 +111,10 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     const idx = ws.alloc([k], "I32");
     src.h2d(f32ToBf16Bytes(srcF32));
     idx.h2d(idxBuf);
-    glm.synchronize();
+    ops.synchronize();
 
     using out = src.indexSelect(idx);
-    glm.synchronize();
+    ops.synchronize();
 
     const outBuf = Buffer.alloc(k * dim * 2);
     out.d2h(outBuf);
@@ -149,10 +149,10 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     const idx = ws.alloc([k], "I32");
     src.h2d(f32ToBf16Bytes(srcF32));
     idx.h2d(idxBuf);
-    glm.synchronize();
+    ops.synchronize();
 
     using out = src.indexSelect(idx);
-    glm.synchronize();
+    ops.synchronize();
 
     const outBuf = Buffer.alloc(k * dim * 2);
     out.d2h(outBuf);
@@ -187,10 +187,10 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     const idx = ws.alloc([k], "I32");
     src.h2d(f32ToBf16Bytes(srcF32));
     idx.h2d(idxBuf);
-    glm.synchronize();
+    ops.synchronize();
 
     using out = src.indexSelect(idx);
-    glm.synchronize();
+    ops.synchronize();
 
     const outBuf = Buffer.alloc(k * dim * 2);
     out.d2h(outBuf);
@@ -216,17 +216,17 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     const indptr = ws.alloc([batchSize + 1], "I32");
     const indptrData = new Int32Array([0, 3, 7, 10]);
     indptr.h2d(Buffer.from(indptrData.buffer));
-    glm.synchronize();
+    ops.synchronize();
 
     const src = ws.alloc([totalTokens, dim], "BF16");
     const srcF32 = new Float32Array(totalTokens * dim);
     for (let i = 0; i < srcF32.length; i++) srcF32[i] = i * 0.1;
     src.h2d(f32ToBf16Bytes(srcF32));
-    glm.synchronize();
+    ops.synchronize();
 
     const indptrTail = indptr.narrow(1, batchSize);
     using selected = src.indexSelect(indptrTail, -1);
-    glm.synchronize();
+    ops.synchronize();
 
     const buf = Buffer.alloc(batchSize * dim * 2);
     selected.d2h(buf);
@@ -255,10 +255,10 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     const srcF32 = new Float32Array(rows * dim);
     for (let i = 0; i < srcF32.length; i++) srcF32[i] = i;
     src.h2d(f32ToBf16Bytes(srcF32));
-    glm.synchronize();
+    ops.synchronize();
 
     using out = src.indexSelect(indices, 2);
-    glm.synchronize();
+    ops.synchronize();
 
     const buf = Buffer.alloc(2 * dim * 2);
     out.d2h(buf);

@@ -186,7 +186,7 @@ function prepareInputs(tokenizer: Tokenizer, args: Args): { prompts: string[]; i
   return { prompts, inputIds: prompts.map(prompt => tokenizePrompt(tokenizer, prompt)) };
 }
 
-function freeResources(model: ChatModel | undefined, cache: ChatCache | undefined, ws: ExecutionWorkspace | undefined, glm: DeviceOps, gpuDevices: GlmOps[]): void {
+function freeResources(model: ChatModel | undefined, cache: ChatCache | undefined, ws: ExecutionWorkspace | undefined, ops: DeviceOps, gpuDevices: GlmOps[]): void {
   let cleanupError: unknown;
   const dispose = (fn: () => void) => {
     try {
@@ -196,11 +196,11 @@ function freeResources(model: ChatModel | undefined, cache: ChatCache | undefine
     }
   };
 
-  dispose(() => glm.synchronize());
+  dispose(() => ops.synchronize());
   if (cache) dispose(() => cache[Symbol.dispose]());
   if (ws) dispose(() => ws[Symbol.dispose]());
   if (model) dispose(() => model[Symbol.dispose]());
-  if (glm instanceof ParallelOps) dispose(() => glm[Symbol.dispose]());
+  if (ops instanceof ParallelOps) dispose(() => ops[Symbol.dispose]());
   for (const device of gpuDevices) dispose(() => device[Symbol.dispose]());
   if (cleanupError) throw cleanupError;
 }
@@ -310,43 +310,43 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   Error.stackTraceLimit = 20;
   const args = parseArgs(argv);
   const { modelDir } = resolveModelSelection(args);
-  const { glm, gpuDevices } = createDeviceOps(args);
+  const { ops, gpuDevices } = createDeviceOps(args);
   let model: Glm51Model | undefined;
   let cache: ChatCache | undefined;
   let ws: ExecutionWorkspace | undefined;
 
   try {
-    const loadedModel = await loadModel(glm, args, modelDir);
+    const loadedModel = await loadModel(ops, args, modelDir);
     if (!(loadedModel instanceof Glm51Model)) throw new Error("run_glm51_multiple_mtp requires a GLM-5.1 model");
     model = loadedModel;
     const workspaceSeqLen = args.file ? Math.min(args.maxSeqLen, PREFILL_CHUNK_SIZE + 1) : args.maxSeqLen;
     cache = model.createChatCache(args.maxPages, args.batchSize, workspaceSeqLen);
-    ws = new ExecutionWorkspace(glm, args.batchSize, workspaceSeqLen);
+    ws = new ExecutionWorkspace(ops, args.batchSize, workspaceSeqLen);
     console.log(`GLM-5.1 batched ${args.noMtp ? "decode" : "MTP"}: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, depth=${args.noMtp ? "off" : args.mtp}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);
-    using captureManager = new CaptureManager(glm);
+    using captureManager = new CaptureManager(ops);
     captureManager.disabled = args.noCudaGraph;
     for (let run = 0; run <= args.warmupRuns; run++) {
       const warmup = run < args.warmupRuns;
       const profiling = args.profile && !warmup;
       if (!warmup && args.cooldownSeconds > 0) {
-        await glm.synchronizeAsync();
+        await ops.synchronizeAsync();
         console.log(`Cooling down for ${args.cooldownSeconds}s before the measured run (keeping cached graphs).`);
         await sleep(args.cooldownSeconds * 1000);
       }
       console.log(`\n=== ${warmup ? "Warmup" : "Measured"} run ${run + 1}/${args.warmupRuns + 1} (cached graphs: ${captureManager.captured.size}) ===`);
-      await glm.synchronizeAsync();
+      await ops.synchronizeAsync();
       if (profiling) profilerStart();
       try {
         await runBatch(model, ws, cache, args, captureManager);
       } finally {
         // Drain every GPU before ending collection, including on a failed run.
-        try { await glm.synchronizeAsync(); }
+        try { await ops.synchronizeAsync(); }
         finally { if (profiling) profilerStop(); }
       }
       ws.clearTracking();
     }
   } finally {
-    freeResources(model, cache, ws, glm, gpuDevices);
+    freeResources(model, cache, ws, ops, gpuDevices);
   }
 }
 

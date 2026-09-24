@@ -32,7 +32,7 @@ export interface ModelCliArgs {
 
 export interface ModelRuntime {
   model: ChatModel;
-  glm: DeviceOps;
+  ops: DeviceOps;
   gpuDevices: GlmOps[];
   modelDir: string;
   repoId: string;
@@ -104,19 +104,19 @@ export function resolveModelSelection(args: ModelCliArgs): { modelDir: string, r
   return { modelDir, repoId };
 }
 
-export function createDeviceOps(args: ModelCliArgs): { glm: DeviceOps, gpuDevices: GlmOps[] } {
+export function createDeviceOps(args: ModelCliArgs): { ops: DeviceOps, gpuDevices: GlmOps[] } {
   const gpuDevices = args.gpus.map(id => new GlmOps(id, undefined, args.arena || undefined));
-  const glm: DeviceOps = gpuDevices.length > 1 ? new ParallelOps(gpuDevices) : gpuDevices[0];
-  return { glm, gpuDevices };
+  const ops: DeviceOps = gpuDevices.length > 1 ? new ParallelOps(gpuDevices) : gpuDevices[0];
+  return { ops, gpuDevices };
 }
 
-export async function loadModel(glm: DeviceOps, args: ModelCliArgs, modelDir: string): Promise<ChatModel> {
+export async function loadModel(ops: DeviceOps, args: ModelCliArgs, modelDir: string): Promise<ChatModel> {
   const model = await (args.useGlm51
-    ? Glm51Model.fromPretrained(glm, modelDir, args.cp, args.mtp > 0)
+    ? Glm51Model.fromPretrained(ops, modelDir, args.cp, args.mtp > 0)
     : args.useQwen35
-      ? Qwen35Model.fromPretrained(glm, modelDir)
-      : Qwen3Model.fromPretrained(glm, modelDir));
-  const devices = glm instanceof ParallelOps ? glm.devices : glm instanceof GlmOps ? [glm] : [];
+      ? Qwen35Model.fromPretrained(ops, modelDir)
+      : Qwen3Model.fromPretrained(ops, modelDir));
+  const devices = ops instanceof ParallelOps ? ops.devices : ops instanceof GlmOps ? [ops] : [];
   for (const device of devices) {
     const expected = process.env[`GLM_ARENA_LAYOUT_${device.device}`];
     const actual = device.arenaLayoutSignature();
@@ -152,20 +152,20 @@ export function modelArenaLayoutSignatures(model: ChatModel, devices: readonly G
 
 export async function loadModelRuntime(args: ModelCliArgs): Promise<ModelRuntime> {
   const { modelDir, repoId } = resolveModelSelection(args);
-  const { glm, gpuDevices } = createDeviceOps(args);
+  const { ops, gpuDevices } = createDeviceOps(args);
   try {
-    const model = await loadModel(glm, args, modelDir);
-    return { model, glm, gpuDevices, modelDir, repoId };
+    const model = await loadModel(ops, args, modelDir);
+    return { model, ops, gpuDevices, modelDir, repoId };
   } catch (error) {
-    if (glm instanceof ParallelOps) glm.free();
+    if (ops instanceof ParallelOps) ops.free();
     for (const device of gpuDevices) device.free();
     throw error;
   }
 }
 
 export function freeModelRuntime(runtime: ModelRuntime): void {
-  runtime.glm.synchronize();
+  runtime.ops.synchronize();
   runtime.model.free();
-  if (runtime.glm instanceof ParallelOps) runtime.glm.free();
+  if (runtime.ops instanceof ParallelOps) runtime.ops.free();
   for (const device of runtime.gpuDevices) device.free();
 }

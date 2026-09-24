@@ -179,7 +179,7 @@ export abstract class Tensor implements Disposable {
       throw new Error(`reshape: cannot reshape [${this.shape}] (${this.type}, ${currentBytes} bytes) to [${newShape}] (${outType}, ${targetBytes} bytes)`);
     }
 
-    const reshaped = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, newShape, outType, this.pinned, this, this.recycleKey);
+    const reshaped = this.workspace.ops.wrapTensor(this.workspace, this.data, this.allocSize, newShape, outType, this.pinned, this, this.recycleKey);
     return reshaped;
   }
 
@@ -194,7 +194,7 @@ export abstract class Tensor implements Disposable {
   abstract free(): void;
 
   capture() {
-    const captured = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, this.view?.capture(), this.recycleKey);
+    const captured = this.workspace.ops.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, this.view?.capture(), this.recycleKey);
     (captured as { name: string | undefined }).name = this.name;
     captured.captured = true;
     return captured;
@@ -228,11 +228,11 @@ export abstract class Tensor implements Disposable {
 
     if (this.view) {
       using uncapturedView = this.view.uncapture();
-      return this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, uncapturedView, this.recycleKey);
+      return this.workspace.ops.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, this.pinned, uncapturedView, this.recycleKey);
     }
 
     if (!this.pinned && this.workspace.claimDevice(this.data, this.allocSize, this.recycleKey)) {
-      const ret = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, false, undefined, this.recycleKey);
+      const ret = this.workspace.ops.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, false, undefined, this.recycleKey);
       this.workspace.addTracked(ret);
       return ret;
     }
@@ -242,7 +242,7 @@ export abstract class Tensor implements Disposable {
           if (this.data === check.data && this.allocSize === check.allocSize) {
             disposed.delete(check);
             check.detachData();
-            const ret = this.workspace.glm.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, true, undefined, this.recycleKey);
+            const ret = this.workspace.ops.wrapTensor(this.workspace, this.data, this.allocSize, this.shape, this.type, true, undefined, this.recycleKey);
             this.workspace.addTracked(ret);
             return ret;
           }
@@ -299,7 +299,7 @@ export abstract class Tensor implements Disposable {
     if (this.pinned) {
       this.workspace.synchronizingHost.add(this);
     } else {
-      const recycleKey = this.recycleKey === null ? this.workspace.glm.currentStream : this.recycleKey;
+      const recycleKey = this.recycleKey === null ? this.workspace.ops.currentStream : this.recycleKey;
       this.workspace.recycleDevice(this.data, this.allocSize, recycleKey);
       this.detachData();
     }
@@ -354,7 +354,7 @@ export abstract class Tensor implements Disposable {
     }
     for (const weight of weights) {
       this.validateLinear(weight);
-      if (weight.workspace.glm !== this.workspace.glm || weight.pinned || weight.parallelism !== TensorParallelism.Replicated) {
+      if (weight.workspace.ops !== this.workspace.ops || weight.pinned || weight.parallelism !== TensorParallelism.Replicated) {
         throw new Error("groupedLinear: expected replicated device weights from the same backend");
       }
     }
@@ -369,7 +369,7 @@ export abstract class Tensor implements Disposable {
     const streams: StreamResult<Tensor>[] = [];
     try {
       for (const weight of weights) {
-        streams.push(this.workspace.glm.withStream(() => this.linear(weight)));
+        streams.push(this.workspace.ops.withStream(() => this.linear(weight)));
       }
       return streams;
     } catch (error) {
@@ -468,7 +468,7 @@ export abstract class Tensor implements Disposable {
   }
 
   swiGluMlp(weights: { gate: Tensor, up: Tensor, down: Tensor }): Tensor {
-    using upStream = this.workspace.glm.withStream(() => this.linear(weights.up));
+    using upStream = this.workspace.ops.withStream(() => this.linear(weights.up));
     using upBuf = upStream.result;
     using gateBuf = this.linear(weights.gate);
     upStream.streamWaitEvent();
@@ -693,7 +693,7 @@ export abstract class Tensor implements Disposable {
       : sigmoid.viewClone();
     const topk = selection.topk(topK, experts);
     using values = topk.values;
-    const normalizedWeightsStream = this.workspace.glm.withStream(() => {
+    const normalizedWeightsStream = this.workspace.ops.withStream(() => {
       using scoresView = sigmoid.viewClone();
       using indicesView = topk.indices.viewClone();
       using selected = scoresView.gather(indicesView, topK, experts, rows);

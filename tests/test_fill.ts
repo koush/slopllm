@@ -4,15 +4,15 @@ import { GlmOps } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 
 describe("dtype-aware tensor fill", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ws: WorkspaceBase;
   before(() => {
-    glm = new GlmOps(Number(process.env.GLM_GPU ?? 0));
-    ws = new WorkspaceBase(glm);
+    ops = new GlmOps(Number(process.env.GLM_GPU ?? 0));
+    ws = new WorkspaceBase(ops);
   });
   after(() => {
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   const cases: { type: string; value: number; encode: (b: Buffer) => void }[] = [
@@ -44,7 +44,7 @@ describe("dtype-aware tensor fill", () => {
       view.fill(0, 0);
       const actual = Buffer.alloc(tensor.bytes);
       tensor.d2h(actual);
-      glm.synchronize();
+      ops.synchronize();
       const expected = Buffer.from(poison);
       const width = tensor.bytes / tensor.numElements;
       for (let i = 1; i < 4; i++) encode(expected.subarray(i * width, (i + 1) * width));
@@ -52,7 +52,7 @@ describe("dtype-aware tensor fill", () => {
 
       tensor.fill(0, tensor.numElements);
       tensor.d2h(actual);
-      glm.synchronize();
+      ops.synchronize();
       assert.deepEqual(actual, Buffer.alloc(tensor.bytes));
     });
   }
@@ -67,21 +67,21 @@ describe("dtype-aware tensor fill", () => {
   it("captures and replays I32 fill", () => {
     using tensor = ws.alloc([5], "I32");
     tensor.fill(0, 5);
-    glm.synchronize();
-    glm.graphBeginCapture();
+    ops.synchronize();
+    ops.graphBeginCapture();
     tensor.fill(-123456789, 5);
-    const graph = glm.graphEndCapture();
-    const exec = glm.graphInstantiate(graph);
+    const graph = ops.graphEndCapture();
+    const exec = ops.graphInstantiate(graph);
     try {
       for (let i = 0; i < 2; i++) {
         tensor.fill(0, 5);
-        glm.graphLaunch(exec);
+        ops.graphLaunch(exec);
         assert.deepEqual(tensor.readInt32LEArray(), Array(5).fill(-123456789));
       }
     } finally {
-      glm.synchronize();
-      glm.graphExecDestroy(exec);
-      glm.graphDestroy(graph);
+      ops.synchronize();
+      ops.graphExecDestroy(exec);
+      ops.graphDestroy(graph);
     }
   });
 });

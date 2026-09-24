@@ -54,7 +54,7 @@ function chunkedPrefill(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCac
   return argmaxOut.readInt32LEArray();
 }
 
-async function assertBatchedPrefillMatches(model: Glm51Model, glm: DeviceOps, ws: ExecutionWorkspace): Promise<void> {
+async function assertBatchedPrefillMatches(model: Glm51Model, ops: DeviceOps, ws: ExecutionWorkspace): Promise<void> {
   const prompts = [[1, 2, 3, 4, 5], [11, 12], [21, 22, 23, 24]];
   const run = async (chunked: boolean) => {
     using cache = model.createChatCache(32, 3);
@@ -64,7 +64,7 @@ async function assertBatchedPrefillMatches(model: Glm51Model, glm: DeviceOps, ws
       const plan = model.planChunkedPrefill(ws, cache, prompts);
       assert.deepEqual(plan.states.map(state => state.seqLens), [[5, 2, 4]]);
       for (const _ of plan.generator) {}
-      await glm.synchronizeAsync();
+      await ops.synchronizeAsync();
       plan.reportTokens();
       ws.assertClear();
       ws.clearTracking();
@@ -78,7 +78,7 @@ async function assertBatchedPrefillMatches(model: Glm51Model, glm: DeviceOps, ws
         using selected = logits.argmax();
         targets = selected.readInt32LEArray();
       }
-      await glm.synchronizeAsync();
+      await ops.synchronizeAsync();
       prompts.forEach((ids, batch) => cache.reportTokens(batch, ids, targets[batch]));
       ws.assertClear();
       ws.clearTracking();
@@ -105,21 +105,21 @@ async function prefillChunks(model: Glm51Model, ws: ExecutionWorkspace, cache: C
 }
 
 describe("GLM-5.1 small model smoke test", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let model: Glm51Model;
   let ws: ExecutionWorkspace;
 
   beforeEach(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    model = await Glm51Model.fromPretrained(glm, SMALL_MODEL_DIR);
-    ws = new ExecutionWorkspace(glm, 3, 128);
+    ops = new GlmOps(deviceId);
+    model = await Glm51Model.fromPretrained(ops, SMALL_MODEL_DIR);
+    ws = new ExecutionWorkspace(ops, 3, 128);
   });
 
   afterEach(() => {
     ws.free();
     model.free();
-    glm.free();
+    ops.free();
   });
 
   it("loads model and checks config", () => {
@@ -151,7 +151,7 @@ describe("GLM-5.1 small model smoke test", () => {
   });
 
   it("planChunkedPrefill only interleaves single-sequence prompts", async () => {
-    using prefillWs = new ExecutionWorkspace(glm, 2, 4097);
+    using prefillWs = new ExecutionWorkspace(ops, 2, 4097);
     using cache = model.createChatCache(128, 2, 4097);
     for (const lengths of [[4097], [2049, 2048], [4095, 1], [1, 4095], [2048, 2048], [4096, 0], [0, 4096]]) {
       cache.reset(lengths.length);
@@ -166,7 +166,7 @@ describe("GLM-5.1 small model smoke test", () => {
       assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.allocLen), lengths,
         "planning appends each prompt exactly once");
       plan.generator.return([]);
-      await glm.synchronizeAsync();
+      await ops.synchronizeAsync();
       prefillWs.clearTracking();
     }
     // Exercise both paths with small inputs alongside resident model weights.
@@ -190,7 +190,7 @@ describe("GLM-5.1 small model smoke test", () => {
         const step = plan.generator.next();
         if (step.done) {
           assert.equal(step.value, undefined);
-          await glm.synchronizeAsync();
+          await ops.synchronizeAsync();
           break;
         }
         phases++;
@@ -208,9 +208,9 @@ describe("GLM-5.1 small model smoke test", () => {
   });
 
   it("executePrefill stays eager with a capture manager and reports plain inputs", async () => {
-    using prefillWs = new ExecutionWorkspace(glm, 1, 128);
+    using prefillWs = new ExecutionWorkspace(ops, 1, 128);
     using cache = model.createChatCache(32, 1);
-    using manager = new CaptureManager(glm);
+    using manager = new CaptureManager(ops);
     for (const graphs of [false, true]) {
       for (let run = 0; run < 7; run++) {
         cache.reset(1);
@@ -240,7 +240,7 @@ describe("GLM-5.1 small model smoke test", () => {
     for (const graphs of [false, true]) {
       cache.reset(1);
       const output: number[] = [];
-      for await (const token of generateStream(model, ws, glm, cache, prompt, 6, new Set(), undefined,
+      for await (const token of generateStream(model, ws, ops, cache, prompt, 6, new Set(), undefined,
         graphs ? { graphExec: null, warmupRemaining: 3 } : undefined)) {
         output.push(token);
       }
@@ -253,7 +253,7 @@ describe("GLM-5.1 small model smoke test", () => {
 
   it("plain chunked prefill returns selected inputs and unconsumed rows", async () => {
     using cache = model.createChatCache(32, 2);
-    using prefillWs = new ExecutionWorkspace(glm, 2, 128);
+    using prefillWs = new ExecutionWorkspace(ops, 2, 128);
     cache.reset(2);
     const inputs = [[1, 2, 3, 4, 5], [6, 7, 8]];
     const first = await model.executePrefill(prefillWs, cache, inputs, undefined, 4);
@@ -267,7 +267,7 @@ describe("GLM-5.1 small model smoke test", () => {
   });
 
   for (const phased of [false, true]) it(`prefill releases tensors when closed after its first yield (phased=${phased})`, async () => {
-    using prefillWs = new ExecutionWorkspace(glm, 1, 128);
+    using prefillWs = new ExecutionWorkspace(ops, 1, 128);
     using cache = model.createChatCache(32, 1, 128);
     cache.reset(1);
     const plan = phased
@@ -275,7 +275,7 @@ describe("GLM-5.1 small model smoke test", () => {
       : model.planChunkedPrefill(prefillWs, cache, [makeLongPrompt(9)]);
     assert.equal(plan.generator.next().done, false);
     plan.generator.return([]);
-    await glm.synchronizeAsync();
+    await ops.synchronizeAsync();
     prefillWs.assertClear();
   });
 
@@ -383,7 +383,7 @@ describe("GLM-5.1 small model smoke test", () => {
   });
 
   it("batched chunked prefill matches an independent sequential forward", async () => {
-    await assertBatchedPrefillMatches(model, glm, ws);
+    await assertBatchedPrefillMatches(model, ops, ws);
   });
 });
 
@@ -461,7 +461,7 @@ describe("GLM-5.1 small model with context parallelism", () => {
 });
 
 describe("GLM-5.1 small model phased MTP prefill", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let model: Glm51Model;
   let ws: ExecutionWorkspace;
   let captureManager: CaptureManager;
@@ -470,10 +470,10 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
   // the resident loader leaves only a small amount of GPU memory for tests.
   beforeEach(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    model = await Glm51Model.fromPretrained(glm, SMALL_MODEL_DIR, false, true);
-    ws = new ExecutionWorkspace(glm, 1, 128);
-    captureManager = new CaptureManager(glm);
+    ops = new GlmOps(deviceId);
+    model = await Glm51Model.fromPretrained(ops, SMALL_MODEL_DIR, false, true);
+    ws = new ExecutionWorkspace(ops, 1, 128);
+    captureManager = new CaptureManager(ops);
     captureManager.disabled = true;
   });
 
@@ -481,7 +481,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     captureManager[Symbol.dispose]();
     ws.free();
     model.free();
-    glm.free();
+    ops.free();
   });
 
   it("splits a single sequence into balanced non-empty halves", () => {
@@ -511,12 +511,12 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
 
   for (const graphs of [false, true]) it(`stateful decode generator matches batched decode and restarts (graphs=${graphs})`, async () => {
     ws.free();
-    ws = new ExecutionWorkspace(glm, 2, 128);
+    ws = new ExecutionWorkspace(ops, 2, 128);
     const prompts = [makeLongPrompt(63), makeLongPrompt(61, [11, 12, 13])];
     const run = async (generator: boolean) => {
       using cache = model.createChatCache(32, 2);
       cache.reset(2);
-      using manager = new CaptureManager(glm);
+      using manager = new CaptureManager(ops);
       manager.disabled = !graphs;
       const state = ws.planPrefill(model, 2, prompts.map(ids => ids.length), cache);
       state.setInput(prompts);
@@ -630,7 +630,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     for (const graphs of [false, true]) {
       cache.reset(1);
       const tokens: number[] = [];
-      for await (const token of generateStream(model, ws, glm, cache, prompt, 12, new Set(), undefined,
+      for await (const token of generateStream(model, ws, ops, cache, prompt, 12, new Set(), undefined,
         graphs ? { graphExec: null, warmupRemaining: 3 } : undefined)) tokens.push(token);
       assert.deepEqual(tokens, expected[0]);
       assert.equal(cache.getPagedKV().sequences[0].allocLen, prompt.length + tokens.length - 1);
@@ -638,14 +638,14 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     }
     cache.reset(1);
     const single: number[] = [];
-    for await (const token of generateStream(model, ws, glm, cache, prompt, 1, new Set(), undefined)) single.push(token);
+    for await (const token of generateStream(model, ws, ops, cache, prompt, 1, new Set(), undefined)) single.push(token);
     assert.deepEqual(single, expected[0].slice(0, 1));
     ws.assertClear();
   });
 
   it("generator consumers chunk ragged prompts and bootstrap plain and MTP streams", async () => {
     ws.free();
-    ws = new ExecutionWorkspace(glm, 2, 8);
+    ws = new ExecutionWorkspace(ops, 2, 8);
     using cache = model.createChatCache(32, 2);
     const prompts = [Array.from({ length: 21 }, (_, i) => i + 1), [7, 8, 9, 10]];
     const batch = await generateBatchTokens(model, ws, cache, prompts, 3, new Set());
@@ -658,7 +658,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         for (const budget of [0, 1, 9]) {
           cache.reset(1);
           const tokens: number[] = [];
-          for await (const token of generateStream(model, ws, glm, cache, prompts[0], budget, new Set(), undefined,
+          for await (const token of generateStream(model, ws, ops, cache, prompts[0], budget, new Set(), undefined,
             graphs ? { graphExec: null, warmupRemaining: 3 } : undefined, undefined, mtp ? 2 : 0)) {
             tokens.push(token);
           }
@@ -678,15 +678,15 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       // Exercise the actual non-MTP bootstrap, releasing pooled GPU memory before reload.
       captureManager[Symbol.dispose]();
       model.free();
-      glm.free();
-      glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
-      model = await Glm51Model.fromPretrained(glm, SMALL_MODEL_DIR, false, false);
-      captureManager = new CaptureManager(glm);
+      ops.free();
+      ops = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+      model = await Glm51Model.fromPretrained(ops, SMALL_MODEL_DIR, false, false);
+      captureManager = new CaptureManager(ops);
     }
     captureManager.disabled = false;
-    ws = new ExecutionWorkspace(glm, 2, 128);
+    ws = new ExecutionWorkspace(ops, 2, 128);
     using cache = model.createChatCache(32, 2);
-    using sampler = new SamplingWorkspace(glm, 6, model.cfg.vocabSize, 8);
+    using sampler = new SamplingWorkspace(ops, 6, model.cfg.vocabSize, 8);
     const requests = createAsyncQueue<GenerationRequest>();
     const metrics: ServerMetrics = {
       runningRequests: 0, generationTokensTotal: 0, promptTokensTotal: 0,
@@ -867,7 +867,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     const run = async (generator: boolean) => {
       using cache = model.createChatCache(32, 1);
       cache.reset(1);
-      using manager = new CaptureManager(glm);
+      using manager = new CaptureManager(ops);
       manager.disabled = !graphs || !generator;
       const prompt = makeLongPrompt(63);
       const draft0 = await prefillChunks(model, ws, cache, [prompt], manager);
@@ -904,7 +904,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
             state.setInput([[replayToken]]);
             {
               using hidden = model.forwardModel(state);
-              await glm.synchronizeAsync();
+              await ops.synchronizeAsync();
             }
             cache.reportTokens(0, [replayToken], expected.input[0]);
             ws.clearTracking();
@@ -938,7 +938,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
 
   it("stateful MTP generator supplies one shared sparse-slot row per sequence in a batch", async () => {
     ws.free();
-    ws = new ExecutionWorkspace(glm, 2, 128);
+    ws = new ExecutionWorkspace(ops, 2, 128);
     const forwardMtp = model.forwardMtp.bind(model);
     model.forwardMtp = (state, hidden, holders) => {
       assert.equal(holders!.sharedSlots!.value.shape[0], state.totalTokens);
@@ -948,7 +948,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     const run = async (graphs: boolean) => {
       using cache = model.createChatCache(32, 2);
       cache.reset(2);
-      using manager = new CaptureManager(glm);
+      using manager = new CaptureManager(ops);
       manager.disabled = !graphs;
       const prompts = [makeLongPrompt(63), makeLongPrompt(31, [11, 12, 13])];
       await prefillChunks(model, ws, cache, prompts, manager);
@@ -990,14 +990,14 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
 
   for (const temperature of [0, 0.7]) it(`stateful MTP generator supports device-side acceptance (temperature=${temperature})`, async () => {
     const depth = 3;
-    using sampler = new SamplingWorkspace(glm, 4, model.cfg.vocabSize, 8,
+    using sampler = new SamplingWorkspace(ops, 4, model.cfg.vocabSize, 8,
       { maxBatchSize: 1, depth, retainProposalsOnGpu: true });
     const params: SamplingParams = { temperature, topK: temperature ? 8 : 1, topP: 1,
       repetitionPenalty: 1, presencePenalty: 0, repetitionPenaltyWindow: 8 };
     const run = async (graphs: boolean) => {
       using cache = model.createChatCache(32, 1);
       cache.reset(1);
-      using manager = new CaptureManager(glm);
+      using manager = new CaptureManager(ops);
       manager.disabled = !graphs;
       const prompt = [1, 2, 3, 4];
       const draft = await prefillChunks(model, ws, cache, [prompt], manager);
@@ -1021,7 +1021,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
 
   for (const graphs of [false, true]) it(`executePrefill stays eager and initializes MTP decode (graphs=${graphs})`, async () => {
     using cache = model.createChatCache(32, 1);
-    using manager = new CaptureManager(glm);
+    using manager = new CaptureManager(ops);
     manager.disabled = !graphs;
     for (let run = 0; run < 7; run++) {
       const prompt = [1, 2, 3, 4 + run];
@@ -1054,7 +1054,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
 
   it("GLM prefill conditions single-sequence phases and unphased batches", async () => {
     ws.free();
-    ws = new ExecutionWorkspace(glm, 2, 128);
+    ws = new ExecutionWorkspace(ops, 2, 128);
     using cache = model.createChatCache(32, 2);
     for (const lengths of [[9], [1, 8], [4, 5], [8, 1], [5, 4]]) {
       const prompts = lengths.map((length, batch) => Array.from({ length }, (_, i) => 10 + batch * 20 + i));
@@ -1079,7 +1079,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
             step = plan.generator.next();
           }
           assert.equal(step.value, undefined);
-          await glm.synchronizeAsync();
+          await ops.synchronizeAsync();
           assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()), prompts.map(() => []));
           plan.reportTokens();
         } finally {
@@ -1145,7 +1145,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
 
   it("MTP planChunkedPrefill replays boundary tokens and reports only consumed input", async () => {
     ws.free();
-    ws = new ExecutionWorkspace(glm, 2, 128);
+    ws = new ExecutionWorkspace(ops, 2, 128);
     using cache = model.createChatCache(32, 2);
     cache.reset(1);
     const first = makeLongPrompt(65);
@@ -1166,7 +1166,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     {
       assert.equal(step.value.length, 2);
       assert.ok(step.value.every(token => token !== undefined));
-      await glm.synchronizeAsync();
+      await ops.synchronizeAsync();
       assert.deepEqual(cache.getPagedKV().sequences.map(sequence => sequence.getTokenIds()), [first.slice(0, -1), []],
         "GPU execution does not report tokens until the executor calls reportTokens");
       plan.reportTokens();
@@ -1191,7 +1191,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
 
   it("chunked MTP prefill budgets overlap and preserves deferred sequences", async () => {
     ws.free();
-    ws = new ExecutionWorkspace(glm, 2, 128);
+    ws = new ExecutionWorkspace(ops, 2, 128);
     using cache = model.createChatCache(32, 2);
     cache.reset(2);
     const input = [[10, 11, 12, 13, 14], [20, 21, 22, 23]];
@@ -1229,14 +1229,14 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
 
   it("large batched MTP prefill stays unphased with cached prefixes", async () => {
     ws.free();
-    ws = new ExecutionWorkspace(glm, 2, 8192);
+    ws = new ExecutionWorkspace(ops, 2, 8192);
     using cache = model.createChatCache(160, 2, 8192);
     cache.reset(2);
     // This is a planning-only regression; reserve prefix pages without a large forward.
     ws.planPrefill(model, 2, [1000, 1000], cache);
     cache.reportTokens(0, Array(1000).fill(7));
     cache.reportTokens(1, Array(1000).fill(8));
-    await glm.synchronizeAsync();
+    await ops.synchronizeAsync();
     ws.clearTracking();
     const inputs = [Array(3000).fill(11), Array(2000).fill(12)];
     assert.throws(() => model["planPhasedPrefill"](ws, cache, inputs), /batch size 1/);
@@ -1245,14 +1245,14 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     assert.deepEqual(plan.states[0].seqLens, [3001, 2001]);
     assert.deepEqual(plan.remainingInputIdsList, [[], []]);
     plan.generator.return([]);
-    await glm.synchronizeAsync();
+    await ops.synchronizeAsync();
     ws.assertClear();
     ws.clearTracking();
   });
 
   it("chunked MTP prefill defaults to 8192 execution rows including overlap", async () => {
     ws.free();
-    ws = new ExecutionWorkspace(glm, 1, 8192);
+    ws = new ExecutionWorkspace(ops, 1, 8192);
     using cache = model.createChatCache(160, 1, 8192);
     const input = [Array(9000).fill(11) as number[]];
     for (const existing of [false, true]) {
@@ -1265,7 +1265,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       assert.equal(plan.remainingInputIdsList[0].length, existing ? 809 : 808);
       assert.deepEqual(input, [Array(9000).fill(11)]);
       plan.generator.return([]);
-      await glm.synchronizeAsync();
+      await ops.synchronizeAsync();
       ws.assertClear();
       ws.clearTracking();
     }
@@ -1283,7 +1283,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
         const plan = model["planPhasedPrefill"](ws, cache, [[...inputA[0], ...inputB[0]]]);
         let result = plan.generator.next();
         while (!result.done) result = plan.generator.next();
-        await glm.synchronizeAsync();
+        await ops.synchronizeAsync();
         plan.reportTokens();
         assert.deepEqual(result.value, [cache.getPagedKV().sequences[0].targetToken]);
         assert.notEqual(result.value[0], undefined);
@@ -1309,17 +1309,17 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
   const readBytes = (tensor: Tensor): Buffer => {
     const bytes = Buffer.alloc(tensor.bytes);
     tensor.d2h(bytes);
-    glm.synchronize();
+    ops.synchronize();
     return bytes;
   };
 
   it("linear speculative greedy matches token-comparison verification across generator iterations", async () => {
     const depth = 3;
-    using target = new SamplingWorkspace(glm, depth + 1, model.cfg.vocabSize, 0, { maxBatchSize: 1, depth, retainProposalsOnGpu: true });
+    using target = new SamplingWorkspace(ops, depth + 1, model.cfg.vocabSize, 0, { maxBatchSize: 1, depth, retainProposalsOnGpu: true });
     target.updateMtpSampler([greedy]);
 
     const run = async (linear: boolean) => {
-      using manager = new CaptureManager(glm);
+      using manager = new CaptureManager(ops);
       manager.disabled = !linear;
       using cache = model.createChatCache(32, 1);
       cache.reset(1);
@@ -1350,10 +1350,10 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
   ]) it(`linear speculative stochastic rejection preserves target KV and the next MTP seed (${graphs ? "replay" : "eager"}, ${retainProposalsOnGpu ? "GPU" : "host"} q, ${force ? "forced" : "exact"})`, async t => {
     const depth = 3;
     const stochastic: SamplingParams = { ...greedy, temperature: 1, topK: 16, topP: 0.9 };
-    using target = new SamplingWorkspace(glm, depth + 1, model.cfg.vocabSize, 8, { maxBatchSize: 1, depth, retainProposalsOnGpu });
-    using manager = new CaptureManager(glm);
+    using target = new SamplingWorkspace(ops, depth + 1, model.cfg.vocabSize, 8, { maxBatchSize: 1, depth, retainProposalsOnGpu });
+    using manager = new CaptureManager(ops);
     manager.disabled = !graphs;
-    using controls = new WorkspaceBase(glm);
+    using controls = new WorkspaceBase(ops);
     const forcedPrefix = controls.alloc([depth], "I32", "forcedPrefix");
     const forcedCount = controls.alloc([1], "I32", "forcedCount");
     for (const name of ["stepCounter", "draftStepCounter", "rejectionStepCounter"]) {
@@ -1369,7 +1369,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     const prompt = [1, 2, 3, 4, 5, 6, 7, 8];
     using reference = model.createChatCache(32, 1);
     reference.reset(1);
-    using referenceWs = new ExecutionWorkspace(glm, 1, 128);
+    using referenceWs = new ExecutionWorkspace(ops, 1, 128);
     const causalChunk = (tokens: number[], next: number, pad = true): Buffer => {
       using tracking = referenceWs.startTracking();
       const start = reference.getPagedKV().sequences[0].allocLen;
@@ -1498,16 +1498,16 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       assert.ok([...manager.captured].some(([key, entry]) => key.startsWith("glm51-mtp-decode") && entry.graphExec !== null && entry.capturedWorkspaces.has(target)));
     }
     t.diagnostic(`${comparedBytes} committed cache bytes and 18 BF16 seeds equal exactly; verification JS runs=${verifyRuns}/18, draft JS runs=${draftRuns}/54`);
-    glm.synchronize();
+    ops.synchronize();
     ws.assertClear();
   });
 
   it("linear speculative workspace samples real decode logits with penalties through CaptureManager replay", t => {
-    using sampling = new SamplingWorkspace(glm, 4, model.cfg.vocabSize, 8, { maxBatchSize: 1, depth: 3, retainProposalsOnGpu: true });
-    using manager = new CaptureManager(glm);
+    using sampling = new SamplingWorkspace(ops, 4, model.cfg.vocabSize, 8, { maxBatchSize: 1, depth: 3, retainProposalsOnGpu: true });
+    using manager = new CaptureManager(ops);
     using cache = model.createChatCache(32, 1);
     using reference = model.createChatCache(32, 1);
-    using referenceWs = new ExecutionWorkspace(glm, 1, 128);
+    using referenceWs = new ExecutionWorkspace(ops, 1, 128);
     cache.reset(1);
     reference.reset(1);
     const prompt = [1, 2, 3, 4, 5, 6, 7, 8];

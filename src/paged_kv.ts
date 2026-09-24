@@ -33,14 +33,14 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
   getPagedKV(): PagedKVCache { return this; }
 
-  constructor(glm: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0, sharedLayers: boolean[] = []) {
-    super(glm);
+  constructor(ops: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0, sharedLayers: boolean[] = []) {
+    super(ops);
     this.nKv = nKv;
     this.hd = hd;
     this.nLayers = nLayers;
     this.maxPages = maxPages;
     this.maxBatch = maxBatch;
-    this.pageSize = contextParallel ? physicalPageSize * glm.worldSize : physicalPageSize;
+    this.pageSize = contextParallel ? physicalPageSize * ops.worldSize : physicalPageSize;
     this.contextParallel = contextParallel;
     this.sparseMode = indexHeadDim > 0 && kvLoraRank > 0;
     this.bytesPerToken = kvLoraRank > 0

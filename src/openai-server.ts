@@ -369,8 +369,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const { modelDir, repoId: modelName } = resolveModelSelection(args);
 
   console.log(`Loading model from ${modelDir}...`);
-  const { glm, gpuDevices } = createDeviceOps(args);
-  const model = await loadModel(glm, args, modelDir);
+  const { ops, gpuDevices } = createDeviceOps(args);
+  const model = await loadModel(ops, args, modelDir);
   const maxModelLen = model.cfg.maxPositionEmbeddings ?? loadMaxPositionEmbeddings(modelDir) ?? args.chunkSize;
   model.cfg.maxPositionEmbeddings = maxModelLen;
   const generationConfig = model.cfg.generationConfig ?? loadGenerationConfig(modelDir);
@@ -388,12 +388,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     throw new Error("--mtp requires a model with MTP generation support");
   }
   const cache = model.createChatCache(args.maxPages, args.batchSize, args.chunkSize);
-  glm.printHeap();
-  const ws = new ExecutionWorkspace(glm, args.batchSize, args.chunkSize);
-  const captureManager = new CaptureManager(glm);
+  ops.printHeap();
+  const ws = new ExecutionWorkspace(ops, args.batchSize, args.chunkSize);
+  const captureManager = new CaptureManager(ops);
   captureManager.disabled = args.noCudaGraph;
   const mtpEnabled = args.mtp > 0 && !args.noMtp;
-  const samplingWorkspace = new SamplingWorkspace(glm,
+  const samplingWorkspace = new SamplingWorkspace(ops,
     args.batchSize * (mtpEnabled ? args.mtp + 1 : 1),
     model.cfg.vocabSize, args.repetitionPenaltyWindow,
     mtpEnabled
@@ -409,7 +409,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log("Warming up...");
     const warmupIds = tokenizeMessages(tokenizer, [{ role: "user", content: "Hello" }]);
     cache.reset(1);
-    using warmupSw = new SamplingWorkspace(glm, 1, model.cfg.vocabSize, args.repetitionPenaltyWindow);
+    using warmupSw = new SamplingWorkspace(ops, 1, model.cfg.vocabSize, args.repetitionPenaltyWindow);
     warmupSw.updateSampler([makeSamplingParamsHelper(args)], [warmupIds]);
     let remainingInputIdsList = [warmupIds];
     while (remainingInputIdsList.some(ids => ids.length)) {
@@ -417,7 +417,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       for (const _ of plan.generator) {
         // Warmup consumes one chunk at a time, just like the scheduler.
       }
-      await glm.synchronizeAsync();
+      await ops.synchronizeAsync();
       plan.reportTokens();
       remainingInputIdsList = plan.remainingInputIdsList;
       ws.assertClear();
@@ -429,7 +429,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         break;
       }
     }
-    await glm.synchronizeAsync();
+    await ops.synchronizeAsync();
     ws.clearTracking();
     cache.reset(1);
     console.log("Warmup complete.");
@@ -468,7 +468,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const decoding = scheduler.run().catch(error => {
     console.error("Decode scheduler stopped:", error);
     scheduler.stop(error instanceof Error ? error : new Error(String(error)));
-    if (isFatalCudaError(error) && glm instanceof ParallelOps) console.error(glm.communicationDiagnostics());
+    if (isFatalCudaError(error) && ops instanceof ParallelOps) console.error(ops.communicationDiagnostics());
     setImmediate(() => process.exit(1));
   });
 
@@ -916,13 +916,13 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     scheduler.stop();
     await decoding;
     await closed;
-    await glm.synchronizeAsync();
+    await ops.synchronizeAsync();
     captureManager[Symbol.dispose]();
     samplingWorkspace.free();
     cache.free();
     ws.free();
     model.free();
-    if (glm instanceof ParallelOps) glm.free();
+    if (ops instanceof ParallelOps) ops.free();
     for (const device of gpuDevices) device.free();
   };
 

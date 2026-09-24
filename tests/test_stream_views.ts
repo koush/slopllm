@@ -4,15 +4,15 @@ import { GlmOps } from "../src/glm_ops";
 import { Tensor } from "../src/tensor";
 import { WorkspaceBase } from "../src/workspace";
 
-function fixture(run: (glm: GlmOps, ws: WorkspaceBase) => void) {
-  const glm = new GlmOps(Number(process.env.GLM_GPU ?? 0));
-  const ws = new WorkspaceBase(glm);
+function fixture(run: (ops: GlmOps, ws: WorkspaceBase) => void) {
+  const ops = new GlmOps(Number(process.env.GLM_GPU ?? 0));
+  const ws = new WorkspaceBase(ops);
   try {
-    run(glm, ws);
+    run(ops, ws);
   } finally {
-    glm.synchronize();
+    ops.synchronize();
     ws.free();
-    glm.free();
+    ops.free();
   }
 }
 
@@ -22,22 +22,22 @@ function input(ws: WorkspaceBase) {
   return tensor;
 }
 
-function checkOutput(tensor: Tensor, glm: GlmOps) {
+function checkOutput(tensor: Tensor, ops: GlmOps) {
   const buffer = Buffer.alloc(tensor.bytes);
   tensor.d2h(buffer);
-  glm.synchronize();
+  ops.synchronize();
   assert.deepEqual([...new Int32Array(buffer.buffer, buffer.byteOffset, 1024)], new Array(1024).fill(42));
 }
 
 for (const parentFirst of [false, true]) {
-  it(`alternate view protects allocation (${parentFirst ? "parent" : "view"} disposed first)`, () => fixture((glm, ws) => {
+  it(`alternate view protects allocation (${parentFirst ? "parent" : "view"} disposed first)`, () => fixture((ops, ws) => {
     const root = input(ws);
     const pointer = root.data;
     const view = root.viewClone();
     if (parentFirst) {
       root[Symbol.dispose]();
     }
-    using stream = glm.withStream(() => {
+    using stream = ops.withStream(() => {
       using v = view;
       const output = ws.alloc(root.shape, root.type);
       output.memcpy(v);
@@ -61,11 +61,11 @@ for (const parentFirst of [false, true]) {
     using reused = ws.alloc([1024], "I32");
     assert.equal(reused.data, pointer);
     using output = stream.result;
-    checkOutput(output, glm);
+    checkOutput(output, ops);
   }));
 }
 
-it("flattened nested views retain the root independently", () => fixture((glm, ws) => {
+it("flattened nested views retain the root independently", () => fixture((ops, ws) => {
   const root = input(ws);
   const middle = root.narrow(0, 512);
   const leaf = middle.reshape([256, 2]);
@@ -74,17 +74,17 @@ it("flattened nested views retain the root independently", () => fixture((glm, w
   root[Symbol.dispose]();
   assert.equal(root.disposed, false);
   assert.deepEqual([...root.views], [leaf]);
-  using stream = glm.withStream(() => { leaf[Symbol.dispose](); });
+  using stream = ops.withStream(() => { leaf[Symbol.dispose](); });
   assert.equal(root.disposed, false);
   stream.streamWaitEvent();
   assert.equal(root.disposed, true);
   assert.equal(root.views.size, 0);
 }));
 
-it("all reader streams must join before the root is released", () => fixture((glm, ws) => {
+it("all reader streams must join before the root is released", () => fixture((ops, ws) => {
   const root = input(ws);
-  using first = glm.withStream(() => { using view = root.viewClone(); });
-  using second = glm.withStream(() => { using view = root.viewClone(); });
+  using first = ops.withStream(() => { using view = root.viewClone(); });
+  using second = ops.withStream(() => { using view = root.viewClone(); });
   root[Symbol.dispose]();
   first.streamWaitEvent();
   assert.equal(root.disposed, false);
@@ -93,12 +93,12 @@ it("all reader streams must join before the root is released", () => fixture((gl
   assert.equal(root.disposed, true);
 }));
 
-it("alternate-to-alternate joins preserve protection until the parent joins", () => fixture((glm, ws) => {
+it("alternate-to-alternate joins preserve protection until the parent joins", () => fixture((ops, ws) => {
   const root = input(ws);
   const pointer = root.data;
-  using reader = glm.withStream(() => { using view = root.viewClone(); });
+  using reader = ops.withStream(() => { using view = root.viewClone(); });
   root[Symbol.dispose]();
-  using bridge = glm.withStream(() => { reader.streamWaitEvent(); });
+  using bridge = ops.withStream(() => { reader.streamWaitEvent(); });
   assert.equal(root.disposed, false);
   using replacement = ws.alloc([1024], "I32");
   assert.notEqual(replacement.data, pointer);
@@ -106,10 +106,10 @@ it("alternate-to-alternate joins preserve protection until the parent joins", ()
   assert.equal(root.disposed, true);
 }));
 
-it("explicit tracking cleanup force-releases even pending roots", () => fixture((glm, ws) => {
+it("explicit tracking cleanup force-releases even pending roots", () => fixture((ops, ws) => {
   const tracking = ws.startTracking();
   const root = input(ws);
-  using reader = glm.withStream(() => { using view = root.viewClone(); });
+  using reader = ops.withStream(() => { using view = root.viewClone(); });
   root[Symbol.dispose]();
   assert.equal(root.disposed, false);
   assert.equal(root.views.size, 1);
@@ -118,12 +118,12 @@ it("explicit tracking cleanup force-releases even pending roots", () => fixture(
   assert.equal(ws.tracked.size, 0);
   reader.streamWaitEvent();
   assert.equal(root.disposed, true);
-  assert.equal(glm.getStreamResources(0).disposedViews.size, 0);
+  assert.equal(ops.getStreamResources(0).disposedViews.size, 0);
 }));
 
-it("handle disposal without an explicit join safely drains pending references", () => fixture((glm, ws) => {
+it("handle disposal without an explicit join safely drains pending references", () => fixture((ops, ws) => {
   const root = input(ws);
-  const reader = glm.withStream(() => {
+  const reader = ops.withStream(() => {
     using view = root.viewClone();
     const output = ws.alloc(root.shape, root.type);
     output.memcpy(view);
@@ -133,10 +133,10 @@ it("handle disposal without an explicit join safely drains pending references", 
   reader[Symbol.dispose]();
   assert.equal(root.disposed, true);
   using output = reader.result;
-  checkOutput(output, glm);
+  checkOutput(output, ops);
 }));
 
-it("captured nested view restores its own pointer and shape", () => fixture((glm, ws) => {
+it("captured nested view restores its own pointer and shape", () => fixture((ops, ws) => {
   const root = input(ws);
   const middle = root.narrow(256, 512);
   const leaf = middle.reshape([256, 2]);
@@ -151,9 +151,9 @@ it("captured nested view restores its own pointer and shape", () => fixture((glm
 }));
 
 for (const parentFirst of [false, true]) {
-  it(`ordinary disposal avoids scanning unrelated pending clones (${parentFirst ? "parent" : "view"} first)`, () => fixture((glm, ws) => {
+  it(`ordinary disposal avoids scanning unrelated pending clones (${parentFirst ? "parent" : "view"} first)`, () => fixture((ops, ws) => {
     const shared = input(ws);
-    const pending = glm.getStreamResources(0).disposedViews;
+    const pending = ops.getStreamResources(0).disposedViews;
     const originalIterator = pending[Symbol.iterator];
     let scans = 0;
     pending[Symbol.iterator] = () => {

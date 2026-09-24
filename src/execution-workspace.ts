@@ -209,7 +209,7 @@ export class ExecutionState {
     const kHeadStride = this.isDecode ? hd : BS * hd;
     const vTokenStride = nKv * hd;
     const vHeadStride = hd;
-    this.ws.glm.kvCacheWrite(
+    this.ws.ops.kvCacheWrite(
       kRope, vBuf,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
       this.slotMapping,
@@ -228,7 +228,7 @@ export class ExecutionState {
       const ckv = pagedKV.ckvData[cacheIdx];
       const kpe = pagedKV.kpeData[cacheIdx];
       const nnz = this.isDecode ? this.batchSize : this.totalTokens;
-      return this.ws.glm.mlaKvCacheAppend(
+      return this.ws.ops.mlaKvCacheAppend(
         this, cacheIdx,
         ckv, kpe,
         this.indices, this.indptrD, this.lastPageLen,
@@ -244,7 +244,7 @@ export class ExecutionState {
     const pagedKV = this.cache.getPagedKV();
     const ckv = pagedKV.ckvData[cacheIdx];
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
-    return this.ws.glm.concatAndCacheDsMla(
+    return this.ws.ops.concatAndCacheDsMla(
       this, cacheIdx,
       ckv,
       appendCkv, appendKpe,
@@ -260,7 +260,7 @@ export class ExecutionState {
     const kData = pagedKV.kData[cacheIdx];
     const kScaleData = pagedKV.kScaleData[cacheIdx];
     const nnz = this.isDecode ? this.batchSize : this.totalTokens;
-    const cache = this.ws.glm.mlaKvCacheAppend(
+    const cache = this.ws.ops.mlaKvCacheAppend(
       this, cacheIdx,
       kData, kScaleData,
       this.indices, this.indptrD, this.lastPageLen,
@@ -279,7 +279,7 @@ export class ExecutionState {
   // (flat/paged) each layer's CKV buffer requires.
   indexerTopk(idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, scale: number, topk: number, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
     const cm = (!this.isDecode && this.customMask?.mode === MaskMode.CausalCustom) ? this.customMask : undefined;
-    return this.ws.glm.indexerTopk(
+    return this.ws.ops.indexerTopk(
       this,
       idxQ, kData, kScaleData, weights,
       this.indices, this.indptrD, this.globalLastPageLen, this.qoIndptrD,
@@ -301,13 +301,13 @@ export class ExecutionState {
   sparseMla(qAbsorbed: Tensor, qPe: Tensor, ckv: Tensor, indices: Tensor, length: Tensor, topk: number, smScale: number, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
     if (this.isDecode) {
       const numSplits = Math.ceil(topk / 64);
-      return this.ws.glm.sparseMlaDecode(
+      return this.ws.ops.sparseMlaDecode(
         this, qAbsorbed, qPe, ckv, indices,
         topk, numSplits,
         smScale, length, qAbsorbedScales,
       );
     } else {
-      return this.ws.glm.sparseMlaPrefill(
+      return this.ws.ops.sparseMlaPrefill(
         this, qAbsorbed, qPe, ckv, indices,
         topk,
         smScale, length,
@@ -392,8 +392,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
   private planSlot = 0;
   private readonly stateBuffers: StateBuffers[] = [];
 
-  constructor(glm: DeviceOps, B: number, S: number) {
-    super(glm);
+  constructor(ops: DeviceOps, B: number, S: number) {
+    super(ops);
     this.maxBatch = B;
     this.maxSeqLen = S;
   }
@@ -443,7 +443,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   flashDecode(state: ExecutionState, query: Tensor, cacheIdx: number, nHeads: number, nKv: number, hd: number, smScale: number): Tensor {
     const pagedKV = state.cache.getPagedKV();
     const out = this.alloc([state.batchSize, nHeads, 1, hd], query.type, undefined, query.parallelism);
-    this.glm.batchDecodeRun(
+    this.ops.batchDecodeRun(
       state, query, out,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
       state.indices, state.indptrD, state.lastPageLen,
@@ -457,7 +457,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   batchPrefillRagged(state: ExecutionState, q: Tensor, k: Tensor, v: Tensor, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, kvStrideN: number, kvStrideH: number, vStrideN: number, vStrideH: number, maskMode: MaskMode, smScale: number): Tensor {
     const pagedKV = state.cache.getPagedKV();
     const out = this.alloc([1, nHeads, state.totalTokens, hd], q.type, undefined, q.parallelism);
-    this.glm.batchPrefillRaggedRun(
+    this.ops.batchPrefillRaggedRun(
       state, q, k, v, out,
       pagedKV.floatWs, state.intWs,
       state.qoIndptrD, state.kvTokenIndptrD,
@@ -472,7 +472,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   flashPrefillPaged(state: ExecutionState, query: Tensor, cacheIdx: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: MaskMode, smScale: number): Tensor {
     const pagedKV = state.cache.getPagedKV();
     const out = this.alloc([1, nHeads, state.totalTokens, hd], query.type, undefined, query.parallelism);
-    this.glm.batchPrefillPagedRun(
+    this.ops.batchPrefillPagedRun(
       state, query, out,
       pagedKV.kData[cacheIdx], pagedKV.vData[cacheIdx],
       state.indices, state.indptrD, state.lastPageLen,
@@ -487,7 +487,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
   mlaPrefillPaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, smScale: number, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
     const pagedKV = state.cache.getPagedKV();
-    return this.glm.mlaPrefillRun(
+    return this.ops.mlaPrefillRun(
       state, qNope, qPe, ckvData, kpeData,
       state.indices,
       pagedKV.floatWs, state.intWs,
@@ -500,7 +500,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
   mlaDecodePaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, smScale: number): { o: Tensor, lse: Tensor } {
     const pagedKV = state.cache.getPagedKV();
-    return this.glm.mlaDecodeRun(
+    return this.ops.mlaDecodeRun(
       state, qNope, qPe, ckvData, kpeData,
       state.indices, state.indptrD, state.lastPageLen,
       pagedKV.floatWs, state.intWs,
@@ -602,12 +602,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
       });
       const seqKvLens = pagedKV.sequences.map(sequence => sequence.allocLen);
       if (pagedKV.sparseMode) {
-        this.glm.sparseMlaDecodePlan(
+        this.ops.sparseMlaDecodePlan(
           state.lastPageLenH, batchSize, seqKvLens,
           pagedKV.pageSize, pagedKV.contextParallel,
         );
       } else {
-        this.glm.mlaDecodePlan(
+        this.ops.mlaDecodePlan(
           pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
           state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
           state.mlaDecodePlanInfo,
@@ -626,7 +626,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
           buf.writeInt32LE(absPage * pagedKV.pageSize + pageOffset, seqIdx * I32);
         }
       });
-      this.glm.batchDecodePlan(
+      this.ops.batchDecodePlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
         state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
         state.decodePlanInfo,
@@ -719,7 +719,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
 
     if (cfg.kvLoraRank) {
       if (!pagedKV.sparseMode) {
-        this.glm.mlaPrefillPlan(
+        this.ops.mlaPrefillPlan(
           pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
           state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
           state.mlaPrefillPlanInfo,
@@ -733,7 +733,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
       else {
         // Sparse prefill has no kernel plan, but CP consumers still need
         // per-rank physical-page lengths rather than the global logical length.
-        this.glm.sparseMlaDecodePlan(
+        this.ops.sparseMlaDecodePlan(
           state.lastPageLenH, batchSize, pagedKV.sequences.map(s => s.allocLen),
           pagedKV.pageSize, pagedKV.contextParallel,
         );
@@ -748,7 +748,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         }
       });
     } else {
-      this.glm.batchPrefillPagedPlan(
+      this.ops.batchPrefillPagedPlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
         state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
         state.prefillPlanInfo,

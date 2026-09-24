@@ -32,7 +32,7 @@ for (const numGpus of GPU_COUNTS) {
         getNativeAddon().ncclCommDestroy(comm);
       }
       for (const ws of workspaces) ws.free();
-      for (const glm of devices) glm.free();
+      for (const ops of devices) ops.free();
     });
 
     it("send/recv BF16 ring: each rank sends to next, receives from prev", () => {

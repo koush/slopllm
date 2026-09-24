@@ -126,7 +126,7 @@ interface PrefillResult {
 }
 
 function runMlaPrefill(
-  glm: GlmOps,
+  ops: GlmOps,
   ws: WorkspaceBase,
   qNopeF32: Float32Array,
   qPeF32: Float32Array,
@@ -184,7 +184,7 @@ function runMlaPrefill(
   const qoIndptrH = allocPinnedI32(ws, [batchSize + 1]);
   qoIndptrH.h2d(i32Buf(new Int32Array([0, totalQTokens])));
 
-  glm.mlaPrefillPlan(
+  ops.mlaPrefillPlan(
     floatWs, 128 * 1024 * 1024,
     intWs, pinnedIntWs, 8 * 1024 * 1024,
     planInfo,
@@ -219,7 +219,7 @@ function runMlaPrefill(
   }
 
   const execState = { batchSize, totalTokens: totalQTokens, cache: { getPagedKV: () => ({ pageSize }) } } as ExecutionState;
-  const result = glm.mlaPrefillRun(
+  const result = ops.mlaPrefillRun(
     execState,
     qNope, qPe, ckv, kpe, indices,
     floatWs, intWs, planInfo,
@@ -227,7 +227,7 @@ function runMlaPrefill(
     0, 0,
     customMask, maskIndptr,
   );
-  glm.synchronize();
+  ops.synchronize();
 
   return result;
 }
@@ -248,18 +248,18 @@ function readLse(lseTensor: Tensor, totalTokens: number, nHeads: number): Float3
 }
 
 describe("MLA custom mask", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ws: WorkspaceBase;
 
   before(() => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    ws = new WorkspaceBase(glm);
+    ops = new GlmOps(deviceId);
+    ws = new WorkspaceBase(ops);
   });
 
   after(() => {
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("tree mask: no crash and valid output", () => {
@@ -295,7 +295,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const { o, lse } = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       numTokens, numTokens, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       false,
@@ -358,7 +358,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const { o: treeO, lse: treeLse } = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       numTokens, numTokens, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       false,
@@ -395,7 +395,7 @@ describe("MLA custom mask", () => {
     }
 
     const { o: pathO, lse: pathLse } = runMlaPrefill(
-      glm, ws, qNopePath, qPePath, ckvPath, kpePath,
+      ops, ws, qNopePath, qPePath, ckvPath, kpePath,
       pathLen, pathLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, pathMaxPages,
       true,
@@ -443,7 +443,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const customResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, seqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       false,
@@ -451,7 +451,7 @@ describe("MLA custom mask", () => {
     );
 
     const builtinResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, seqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -504,7 +504,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const ccResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       qoLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -513,7 +513,7 @@ describe("MLA custom mask", () => {
     );
 
     const customResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       qoLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       false,
@@ -560,7 +560,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const ccResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       qoLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -569,7 +569,7 @@ describe("MLA custom mask", () => {
     );
 
     const causalResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       qoLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -622,7 +622,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const ccResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       qoLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -676,7 +676,7 @@ describe("MLA custom mask", () => {
       }
 
       const { o: pathO, lse: pathLse } = runMlaPrefill(
-        glm, ws, qNopePath, qPePath, ckvPath, kpePath,
+        ops, ws, qNopePath, qPePath, ckvPath, kpePath,
         pathLen, pathKvLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
         pageSize, pathMaxPages,
         true,
@@ -732,7 +732,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const ccResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       qoLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -741,7 +741,7 @@ describe("MLA custom mask", () => {
     );
 
     const causalResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       qoLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -791,7 +791,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const { o, lse } = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       qoLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -838,7 +838,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const ccResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -847,7 +847,7 @@ describe("MLA custom mask", () => {
     );
 
     const causalResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -891,7 +891,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const ccResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -900,7 +900,7 @@ describe("MLA custom mask", () => {
     );
 
     const causalResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -944,7 +944,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const ccCausalPlanResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -953,7 +953,7 @@ describe("MLA custom mask", () => {
     );
 
     const ccNonCausalPlanResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       false,
@@ -1000,7 +1000,7 @@ describe("MLA custom mask", () => {
 
     // CausalCustom with causal=FALSE plan (matches the production bug config)
     const ccResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       false,
@@ -1010,7 +1010,7 @@ describe("MLA custom mask", () => {
 
     // Built-in causal with causal=TRUE plan
     const causalResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, kvSeqLen, 1, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -1054,7 +1054,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const ccResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, seqLen, 1, N_HEADS_8, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -1063,7 +1063,7 @@ describe("MLA custom mask", () => {
     );
 
     const causalResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       seqLen, seqLen, 1, N_HEADS_8, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -1119,7 +1119,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE);
 
     const ccResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       numTokens, numTokens, 1, N_HEADS_8, HEAD_DIM_CKV, HEAD_DIM_KPE,
       pageSize, maxPages,
       true,
@@ -1162,7 +1162,7 @@ describe("MLA custom mask", () => {
       }
 
       const { o: pathO, lse: pathLse } = runMlaPrefill(
-        glm, ws, qNopePath, qPePath, ckvPath, kpePath,
+        ops, ws, qNopePath, qPePath, ckvPath, kpePath,
         pathLen, pathLen, 1, N_HEADS_8, HEAD_DIM_CKV, HEAD_DIM_KPE,
         pageSize, pathMaxPages,
         true,
@@ -1226,7 +1226,7 @@ describe("MLA custom mask", () => {
     const kpeF32 = randomData(numPages * pageSize * HEAD_DIM_KPE_64);
 
     const ccResult = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+      ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
       numTokens, numTokens, 1, N_HEADS_8, HEAD_DIM_CKV_128, HEAD_DIM_KPE_64,
       pageSize, maxPages,
       true,
@@ -1269,7 +1269,7 @@ describe("MLA custom mask", () => {
       }
 
       const { o: pathO, lse: pathLse } = runMlaPrefill(
-        glm, ws, qNopePath, qPePath, ckvPath, kpePath,
+        ops, ws, qNopePath, qPePath, ckvPath, kpePath,
         pathLen, pathLen, 1, N_HEADS_8, HEAD_DIM_CKV_128, HEAD_DIM_KPE_64,
         pageSize, pathMaxPages,
         true,

@@ -261,7 +261,7 @@ export class ParallelTensor extends Tensor {
       return false;
     if (this.type !== "BF16" && this.type !== "F32")
       return false;
-    const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream)!;
+    const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.ops.currentStream)!;
     if (!group)
       return false;
 
@@ -443,13 +443,13 @@ export class ParallelTensor extends Tensor {
     const count = this.shards[0].shape.reduce((a, b) => a * b, 1);
     if (count > 65536 * 8)
       return;
-    const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
+    const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.ops.currentStream);
     if (!group)
       return false;
 
     const stageOutput = !!output;
     if (!output) {
-      const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.glm.currentStream);
+      const group = this.parallelOps.getP2PGroup(this.shards[0].workspace.ops.currentStream);
       if (!group) {
         throw new Error("allGather: failed to get P2P group");
       }
@@ -2611,7 +2611,7 @@ export class ParallelOps implements DeviceOps {
     if (target !== TensorParallelism.Replicated && target !== TensorParallelism.Column) {
       throw new Error(`redistributeMultiple: unsupported target ${target}`);
     }
-    if (workspace.glm !== this) {
+    if (workspace.ops !== this) {
       throw new Error("redistributeMultiple: output workspace belongs to a different backend");
     }
     if (tensors.length === 0) {
@@ -2619,7 +2619,7 @@ export class ParallelOps implements DeviceOps {
     }
 
     for (const tensor of tensors) {
-      if (tensor.workspace.glm !== this || tensor.shards.length !== this.worldSize || tensor.pinned) {
+      if (tensor.workspace.ops !== this || tensor.shards.length !== this.worldSize || tensor.pinned) {
         throw new Error("redistributeMultiple: expected device tensors from this backend");
       }
       if (tensor.parallelism === TensorParallelism.PartialSum) {
@@ -2665,11 +2665,11 @@ export class ParallelOps implements DeviceOps {
     const supported = gatherIndices.every(i => {
       const tensor = tensors[i];
       const count = tensor.shards[0].shape.reduce((a, b) => a * b, 1);
-      return tensor.workspace.glm === this &&
+      return tensor.workspace.ops === this &&
         tensor.shards.length === this.worldSize &&
         (tensor.parallelism === TensorParallelism.Column || tensor.parallelism === TensorParallelism.Row) &&
         count <= 65536 * 8 &&
-        tensor.shards[0].workspace.glm.currentStream === stream;
+        tensor.shards[0].workspace.ops.currentStream === stream;
     });
     if (!this.p2pEnabled || !supported) {
       return fallback();
@@ -3231,7 +3231,7 @@ export class ParallelOps implements DeviceOps {
   prefetchL2(tensors: readonly Tensor[]): void {
     if (tensors.length > 8) throw new Error("prefetchL2 supports at most eight tensors");
     for (const tensor of tensors) {
-      if (!(tensor instanceof ParallelTensor) || tensor.workspace.glm !== this || tensor.pinned) {
+      if (!(tensor instanceof ParallelTensor) || tensor.workspace.ops !== this || tensor.pinned) {
         throw new Error("prefetchL2 requires device tensors owned by this backend");
       }
     }

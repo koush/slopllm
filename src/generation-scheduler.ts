@@ -243,7 +243,7 @@ export class GenerationScheduler {
         }
       });
       targetTokens = execution.result;
-      await model.glm.synchronizeAsync();
+      await model.ops.synchronizeAsync();
       plan.reportTokens();
     } finally {
       plan.generator.return([]);

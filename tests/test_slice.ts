@@ -4,18 +4,18 @@ import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 
 describe("GlmTensor.slice (single GPU)", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ws: WorkspaceBase;
 
   before(() => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    ws = new WorkspaceBase(glm);
+    ops = new GlmOps(deviceId);
+    ws = new WorkspaceBase(ops);
   });
 
   after(() => {
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("slice 2D F32 along dim 0 (first rows)", () => {

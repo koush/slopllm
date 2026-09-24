@@ -4135,4 +4135,4 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     return exports;
 }
 
-NODE_API_MODULE(glm, InitModule)
+NODE_API_MODULE(ops, InitModule)

@@ -19,10 +19,10 @@ const greedy: SamplingParams = {
 };
 
 function readI32(tensor: Tensor): number[] {
-  tensor.workspace.glm.synchronize();
+  tensor.workspace.ops.synchronize();
   const buf = Buffer.alloc(tensor.bytes);
   tensor.d2h(buf);
-  tensor.workspace.glm.synchronize();
+  tensor.workspace.ops.synchronize();
   return Array.from({ length: tensor.numElements }, (_, i) => buf.readInt32LE(i * 4));
 }
 
@@ -32,7 +32,7 @@ for (const parallel of [false, true]) {
     concurrency: false,
   }, () => {
     const devices: GlmOps[] = [];
-    let glm: GlmOps | ParallelOps;
+    let ops: GlmOps | ParallelOps;
     let ws: WorkspaceBase;
     let target: SamplingWorkspace;
     let sampler: SamplingWorkspace;
@@ -41,19 +41,19 @@ for (const parallel of [false, true]) {
       const first = parseInt(process.env.GLM_GPU ?? "0", 10);
       devices.push(new GlmOps(first));
       if (parallel) devices.push(new GlmOps(parseInt(process.env.GLM_GPU_SECOND ?? "1", 10)));
-      glm = parallel ? new ParallelOps(devices) : devices[0];
-      ws = new WorkspaceBase(glm);
-      target = new SamplingWorkspace(glm, B * (D + 1), V, 0, { maxBatchSize: B, depth: D });
+      ops = parallel ? new ParallelOps(devices) : devices[0];
+      ws = new WorkspaceBase(ops);
+      target = new SamplingWorkspace(ops, B * (D + 1), V, 0, { maxBatchSize: B, depth: D });
       sampler = target;
     });
 
     after(() => {
       try {
-        glm?.synchronize();
+        ops?.synchronize();
       } finally {
         target?.free();
         ws?.free();
-        if (glm instanceof ParallelOps) glm.free();
+        if (ops instanceof ParallelOps) ops.free();
         for (const device of devices) device.free();
       }
     });
@@ -86,9 +86,9 @@ for (const parallel of [false, true]) {
     });
 
     it("ordinary sampling retains penalty history and caller-owned outputs without MTP allocations", () => {
-      using sampling = new SamplingWorkspace(glm, B, V, 8);
-      using inputs = new WorkspaceBase(glm);
-      using manager = new CaptureManager(glm);
+      using sampling = new SamplingWorkspace(ops, B, V, 8);
+      using inputs = new WorkspaceBase(ops);
+      using manager = new CaptureManager(ops);
       const input = inputs.alloc([B, V], "BF16", "logits");
       assert.equal(sampling.mtpEnabled, false);
       assert.throws(() => sampling.updateMtpSampler([greedy]), /not enabled/);
@@ -120,9 +120,9 @@ for (const parallel of [false, true]) {
 
     it("ordinary sampling advances an ordered penalty ring across replay and restart", () => {
       const window = 4;
-      using sampling = new SamplingWorkspace(glm, B, V, window);
-      using inputs = new WorkspaceBase(glm);
-      using manager = new CaptureManager(glm);
+      using sampling = new SamplingWorkspace(ops, B, V, window);
+      using inputs = new WorkspaceBase(ops);
+      using manager = new CaptureManager(ops);
       const input = inputs.alloc([B, V], "BF16", "logits");
       const params = Array.from({ length: B }, () => ({ ...greedy, presencePenalty: 4, repetitionPenaltyWindow: window }));
       const histories = Array.from({ length: B }, (_, row) => [9, 1, 2, 1, 3].map(token => token + row * 200));
@@ -170,17 +170,17 @@ for (const parallel of [false, true]) {
     });
 
     function noFullGather(t: TestContext, maxK: number) {
-      assert.ok(glm instanceof ParallelOps);
+      assert.ok(ops instanceof ParallelOps);
       const allGather = ParallelTensor.prototype.allGather;
-      const allGatherMultiple = glm.allGatherMultiple;
-      const batchMock = t.mock.method(glm, "sampleBatch", () => {
+      const allGatherMultiple = ops.allGatherMultiple;
+      const batchMock = t.mock.method(ops, "sampleBatch", () => {
         throw new Error("sampleDraft must not call ParallelOps.sampleBatch");
       });
       const gatherMock = t.mock.method(ParallelTensor.prototype, "allGather", function (this: ParallelTensor, ...args: Parameters<ParallelTensor["allGather"]>) {
         assert.ok(this.numElements < B * V, "sampleDraft must not gather full logits");
         return allGather.apply(this, args);
       });
-      const multipleMock = t.mock.method(glm, "allGatherMultiple", function (this: ParallelOps, ...args: Parameters<ParallelOps["allGatherMultiple"]>) {
+      const multipleMock = t.mock.method(ops, "allGatherMultiple", function (this: ParallelOps, ...args: Parameters<ParallelOps["allGatherMultiple"]>) {
         for (const tensor of args[0]) assert.deepEqual(tensor.shape, [B, maxK * 2]);
         return allGatherMultiple.apply(this, args);
       });
@@ -208,7 +208,7 @@ for (const parallel of [false, true]) {
         }
         sampled.forEach((token, row) => treeTokens[row].push(token));
       }
-      glm.synchronize();
+      ops.synchronize();
       return { targetTokens: peaks, treeTokens, topks: [1, 1, 1], proposal: sampler.finishDraft() };
     }
 
@@ -239,7 +239,7 @@ for (const parallel of [false, true]) {
 
     for (const stochastic of [false, true]) {
       it(`matches host ${stochastic ? "stochastic" : "greedy"} proposals with resident reorder and compaction without q host transfers`, (t) => {
-        using residentWs = new SamplingWorkspace(glm, B * (D + 1), V, 0, { maxBatchSize: B, depth: D, retainProposalsOnGpu: true });
+        using residentWs = new SamplingWorkspace(ops, B * (D + 1), V, 0, { maxBatchSize: B, depth: D, retainProposalsOnGpu: true });
         const resident = residentWs;
         const copies = guardResidentTransfers(t, residentWs);
         const params = stochastic
@@ -252,7 +252,7 @@ for (const parallel of [false, true]) {
           mode.prepareDraft(B, D);
           mode.draftStepCounter.h2d(seed);
         }
-        glm.synchronize();
+        ops.synchronize();
         assert.equal(sampler.mtpCaptureKey, `linear:${stochastic ? 3 : 1}`);
         assert.equal(resident.mtpCaptureKey, `${sampler.mtpCaptureKey}:gpu`);
         const treeTokens: number[][] = [[], []];
@@ -264,7 +264,7 @@ for (const parallel of [false, true]) {
           assert.deepEqual(readI32(gpuTokens), expected);
           expected.forEach((token, row) => treeTokens[row].push(token));
         }
-        glm.synchronize();
+        ops.synchronize();
         const host = sampler.finishDraft();
         const device = resident.finishDraft();
         assert.equal(host.device, undefined);
@@ -324,7 +324,7 @@ for (const parallel of [false, true]) {
         const next = resident.finishDraft();
         assert.equal(next.device!.owner, device.device.owner);
         assert.equal(next.device!.generation, device.device.generation + 1);
-        glm.synchronize();
+        ops.synchronize();
       });
     }
 
@@ -352,13 +352,13 @@ for (const parallel of [false, true]) {
     }
 
     it("validates constructor, policy, draft and verification shapes", () => {
-      using unpreparedWs = new SamplingWorkspace(glm, B * (D + 1), V, 0, { maxBatchSize: B, depth: D });
+      using unpreparedWs = new SamplingWorkspace(ops, B * (D + 1), V, 0, { maxBatchSize: B, depth: D });
       const unprepared = unpreparedWs;
       using unpreparedInput = logits([7, 19]);
       assert.throws(() => unprepared.sampleDraft(unpreparedInput, 0), /unprepared batch/);
       assert.throws(() => unprepared.finishDraft(), /not prepared/);
       for (const [batch, depth] of [[0, D], [1.5, D], [B, 0], [B, 1.5], [B + 1, D]]) {
-        assert.throws(() => new SamplingWorkspace(glm, B * (D + 1), V, 0, { maxBatchSize: batch, depth }), /valid batch\/depth/);
+        assert.throws(() => new SamplingWorkspace(ops, B * (D + 1), V, 0, { maxBatchSize: batch, depth }), /valid batch\/depth/);
       }
       for (const patch of [
         { temperature: NaN }, { topP: Infinity }, { topK: 1.5 },
@@ -400,7 +400,7 @@ for (const parallel of [false, true]) {
         using tokens = sampler.sampleDraft(input, depth);
         assert.deepEqual(readI32(tokens), [10 + depth, 30 + depth]);
       }
-      glm.synchronize();
+      ops.synchronize();
       const proposal = sampler.finishDraft();
       assert.equal(proposal.capacity, 256);
       assert.equal(proposal.probabilities.length, B);
@@ -480,8 +480,8 @@ for (const parallel of [false, true]) {
     ]) {
       const maxK = params[0].topK === 0 ? 32 : 20;
       it(`matches full sampling with Row-sharded ${withNaNs ? "finite and NaN " : ""}logits and heterogeneous maxK=${maxK}`, { skip: !parallel }, (t) => {
-        assert.ok(glm instanceof ParallelOps);
-        const reference = new SamplingWorkspace(glm, B, V, 0);
+        assert.ok(ops instanceof ParallelOps);
+        const reference = new SamplingWorkspace(ops, B, V, 0);
         using input = ws.alloc([B, V], "BF16", undefined, TensorParallelism.Row);
         using full = ws.alloc([B, V], "BF16", undefined, TensorParallelism.Replicated);
         using probs = ws.alloc([B, sampler.capacity], "F32");
@@ -520,7 +520,7 @@ for (const parallel of [false, true]) {
             });
             const probabilityBuffer = Buffer.alloc(probs.bytes);
             probs.d2h(probabilityBuffer);
-            glm.synchronize();
+            ops.synchronize();
             expectedProbs.push(probabilityBuffer);
             expectedIds.push(readI32(ids));
             for (let row = 0; row < B; row++) {
@@ -568,15 +568,15 @@ for (const parallel of [false, true]) {
           }
           assert.deepEqual(readI32(sampler.draftStepCounter), readI32(reference.stepCounter));
         } finally {
-          glm.synchronize();
+          ops.synchronize();
           reference.free();
         }
       });
     }
 
     it("replays Row-sharded topk20 draft graphs with seeded tokens and exported q/ids", { skip: !parallel }, (t) => {
-      assert.ok(glm instanceof ParallelOps);
-      using graphWs = new WorkspaceBase(glm);
+      assert.ok(ops instanceof ParallelOps);
+      using graphWs = new WorkspaceBase(ops);
       const inputs = Array.from({ length: D }, (_, depth) =>
         graphWs.alloc([B, V], "BF16", `graphDraftInput${depth}`, TensorParallelism.Row));
       for (const input of inputs) {
@@ -624,14 +624,14 @@ for (const parallel of [false, true]) {
       upload(0);
       using guard = noFullGather(t, 20);
       for (let warmup = 0; warmup < 3; warmup++) runDraft();
-      glm.synchronize();
-      glm.graphBeginCapture();
+      ops.synchronize();
+      ops.graphBeginCapture();
       runDraft();
-      const graph = glm.graphEndCapture();
+      const graph = ops.graphEndCapture();
       let exec: number | undefined;
       let previous: ReturnType<SamplingWorkspace["finishDraft"]> | undefined;
       try {
-        exec = glm.graphInstantiate(graph);
+        exec = ops.graphInstantiate(graph);
         for (let iteration = 0; iteration < 3; iteration++) {
           upload(iteration);
           sampler.updateMtpSampler(params.map(param => ({ ...param, temperature: param.temperature + iteration * 0.25 })));
@@ -640,7 +640,7 @@ for (const parallel of [false, true]) {
           seed.writeUInt32LE(123456 + iteration * 97);
           sampler.draftStepCounter.h2d(seed);
           runDraft();
-          glm.synchronize();
+          ops.synchronize();
           const expected = sampler.finishDraft();
           const expectedTokens = lastTokens();
           const expectedCounter = readI32(sampler.draftStepCounter);
@@ -651,8 +651,8 @@ for (const parallel of [false, true]) {
           }
           // RNG and policy uploads stay outside capture; replay must consume the new buffers.
           sampler.draftStepCounter.h2d(seed);
-          glm.graphLaunch(exec);
-          glm.synchronize();
+          ops.graphLaunch(exec);
+          ops.synchronize();
           const actual = sampler.finishDraft();
           assert.deepEqual(actual, expected);
           assert.deepEqual(lastTokens(), expectedTokens);
@@ -663,14 +663,14 @@ for (const parallel of [false, true]) {
         assert.equal(guard.batchMock.mock.callCount(), 0);
         assert.equal(guard.multipleMock.mock.callCount(), (3 + 1 + 3) * D);
       } finally {
-        glm.synchronize();
-        if (exec !== undefined) glm.graphExecDestroy(exec);
-        glm.graphDestroy(graph);
+        ops.synchronize();
+        if (exec !== undefined) ops.graphExecDestroy(exec);
+        ops.graphDestroy(graph);
       }
     });
 
     it("replays resident draft and verification graphs with fresh generations and no q host transfers", (t) => {
-      using residentWs = new SamplingWorkspace(glm, B * (D + 1), V, 0, { maxBatchSize: B, depth: D, retainProposalsOnGpu: true });
+      using residentWs = new SamplingWorkspace(ops, B * (D + 1), V, 0, { maxBatchSize: B, depth: D, retainProposalsOnGpu: true });
       const resident = residentWs;
       guardResidentTransfers(t, residentWs);
       resident.updateMtpSampler([greedy, greedy]);
@@ -686,22 +686,22 @@ for (const parallel of [false, true]) {
         }
       };
       for (let warmup = 0; warmup < 3; warmup++) runDraft();
-      glm.synchronize();
-      glm.graphBeginCapture();
+      ops.synchronize();
+      ops.graphBeginCapture();
       runDraft();
-      const draftGraph = glm.graphEndCapture();
+      const draftGraph = ops.graphEndCapture();
       let draftExec: number | undefined;
       let verifyExec: number | undefined;
       let captured: ReturnType<SamplingWorkspace["verify"]> | undefined;
       let previous: MtpDraftBatch | undefined;
       try {
-        draftExec = glm.graphInstantiate(draftGraph);
+        draftExec = ops.graphInstantiate(draftGraph);
         for (const peaks of [[7, 29], [43, 61], [11, 37]]) {
           uploadLogits(draftInput, peaks);
           resident.prepareDraft(B, D);
           if (previous) assert.throws(() => resident.prepareVerification(previous!), /stale/);
-          glm.graphLaunch(draftExec);
-          glm.synchronize();
+          ops.graphLaunch(draftExec);
+          ops.synchronize();
           assert.deepEqual(readI32(lastOutput), peaks);
           const batch: MtpDraftBatch = {
             targetTokens: peaks, treeTokens: peaks.map(peak => Array(D).fill(peak)),
@@ -720,22 +720,22 @@ for (const parallel of [false, true]) {
               using tokens = result.tokens;
               using counts = result.numAccepted;
             }
-            glm.synchronize();
-            glm.graphBeginCapture();
+            ops.synchronize();
+            ops.graphBeginCapture();
             captured = resident.verify(targetInput);
-            const graph = glm.graphEndCapture();
-            try { verifyExec = glm.graphInstantiate(graph); }
-            finally { glm.graphDestroy(graph); }
+            const graph = ops.graphEndCapture();
+            try { verifyExec = ops.graphInstantiate(graph); }
+            finally { ops.graphDestroy(graph); }
           }
-          glm.graphLaunch(verifyExec);
+          ops.graphLaunch(verifyExec);
           check(captured!, batch);
           previous = batch;
         }
       } finally {
-        glm.synchronize();
-        if (verifyExec !== undefined) glm.graphExecDestroy(verifyExec);
-        if (draftExec !== undefined) glm.graphExecDestroy(draftExec);
-        glm.graphDestroy(draftGraph);
+        ops.synchronize();
+        if (verifyExec !== undefined) ops.graphExecDestroy(verifyExec);
+        if (draftExec !== undefined) ops.graphExecDestroy(draftExec);
+        ops.graphDestroy(draftGraph);
         captured?.tokens[Symbol.dispose]();
         captured?.numAccepted[Symbol.dispose]();
       }
@@ -743,9 +743,9 @@ for (const parallel of [false, true]) {
 
     for (const retainProposalsOnGpu of [false, true]) {
       it(`tracks one sampling workspace across CaptureManager target/draft/verification replay (${retainProposalsOnGpu ? "GPU" : "host"} q)`, () => {
-        using sampling = new SamplingWorkspace(glm, B * (D + 1), V, 8, { maxBatchSize: B, depth: D, retainProposalsOnGpu });
-        using inputs = new WorkspaceBase(glm);
-        using manager = new CaptureManager(glm);
+        using sampling = new SamplingWorkspace(ops, B * (D + 1), V, 8, { maxBatchSize: B, depth: D, retainProposalsOnGpu });
+        using inputs = new WorkspaceBase(ops);
+        using manager = new CaptureManager(ops);
         for (const rows of [B, 1, B]) {
           const input = inputs.ensureAlloc([rows, V], "BF16", `draft${rows}`);
           const verification = inputs.ensureAlloc([rows * (D + 1), V], "BF16", `verify${rows}`);
@@ -795,8 +795,8 @@ for (const parallel of [false, true]) {
             assert.equal(sampling.batchSize, rows, "verification must not switch ordinary target rows");
             assert.deepEqual(readI32(sampling.penaltyCount).slice(0, rows), peaks.map(() => 1), "verification must not modify target penalty history");
             assert.equal(sampling.tracked.size, 0);
-            if (glm instanceof ParallelOps) {
-              for (const shardWs of glm.getShardWorkspaces(sampling)) assert.equal(shardWs.tracked.size, 0);
+            if (ops instanceof ParallelOps) {
+              for (const shardWs of ops.getShardWorkspaces(sampling)) assert.equal(shardWs.tracked.size, 0);
             }
           }
         }
@@ -821,19 +821,19 @@ for (const parallel of [false, true]) {
         }
       };
       runDraft();
-      glm.synchronize();
-      glm.graphBeginCapture();
+      ops.synchronize();
+      ops.graphBeginCapture();
       runDraft();
-      const draftGraph = glm.graphEndCapture();
+      const draftGraph = ops.graphEndCapture();
       let draftExec: number | undefined;
       let verifyExec: number | undefined;
       let captured: ReturnType<SamplingWorkspace["verify"]> | undefined;
       try {
-        draftExec = glm.graphInstantiate(draftGraph);
+        draftExec = ops.graphInstantiate(draftGraph);
         for (const peaks of [[7, 29], [43, 61], [11, 37]]) {
           uploadLogits(draftInput, peaks);
-          glm.graphLaunch(draftExec);
-          glm.synchronize();
+          ops.graphLaunch(draftExec);
+          ops.synchronize();
           const batch: MtpDraftBatch = {
             targetTokens: peaks, treeTokens: peaks.map(peak => Array(D).fill(peak)),
             topks: [1, 1, 1], proposal: sampler.finishDraft(),
@@ -847,21 +847,21 @@ for (const parallel of [false, true]) {
             const warmup = sampler.verify(targetInput);
             warmup.tokens[Symbol.dispose]();
             warmup.numAccepted[Symbol.dispose]();
-            glm.synchronize();
-            glm.graphBeginCapture();
+            ops.synchronize();
+            ops.graphBeginCapture();
             captured = sampler.verify(targetInput);
-            const graph = glm.graphEndCapture();
-            try { verifyExec = glm.graphInstantiate(graph); }
-            finally { glm.graphDestroy(graph); }
+            const graph = ops.graphEndCapture();
+            try { verifyExec = ops.graphInstantiate(graph); }
+            finally { ops.graphDestroy(graph); }
           }
-          glm.graphLaunch(verifyExec);
+          ops.graphLaunch(verifyExec);
           check(captured!, batch);
         }
       } finally {
-        glm.synchronize();
-        if (verifyExec !== undefined) glm.graphExecDestroy(verifyExec);
-        if (draftExec !== undefined) glm.graphExecDestroy(draftExec);
-        glm.graphDestroy(draftGraph);
+        ops.synchronize();
+        if (verifyExec !== undefined) ops.graphExecDestroy(verifyExec);
+        if (draftExec !== undefined) ops.graphExecDestroy(draftExec);
+        ops.graphDestroy(draftGraph);
         captured?.tokens[Symbol.dispose]();
         captured?.numAccepted[Symbol.dispose]();
       }

@@ -4,17 +4,17 @@ import { GlmOps } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 
 describe("GlmTensor.transpose4d", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ws: WorkspaceBase;
 
   before(() => {
-    glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
-    ws = new WorkspaceBase(glm);
+    ops = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+    ws = new WorkspaceBase(ops);
   });
 
   after(() => {
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("swaps the first two dimensions of I32 tensors", () => {

@@ -96,13 +96,13 @@ async function main(): Promise<void> {
   }
 
   const runtime = await loadModelRuntime(modelArgs);
-  const { model, glm } = runtime;
+  const { model, ops } = runtime;
   try {
     const worldSize = modelArgs.gpus.length;
     const maxPages = args.maxPages
       ?? Math.ceil(args.seqLen / args.pageSize / (modelArgs.cp ? worldSize : 1)) + 64;
     using cache = model.createChatCache(maxPages, 1, args.seqLen + 1, args.pageSize);
-    using ws = new ExecutionWorkspace(glm, 1, Math.min(args.chunkSize, args.seqLen));
+    using ws = new ExecutionWorkspace(ops, 1, Math.min(args.chunkSize, args.seqLen));
     const inputIds = new Array<number>(args.seqLen).fill(1);
 
     console.log(`GLM-5.1 Prefill | GPUs ${modelArgs.gpus.join(",")} | seq_len=${args.seqLen} | chunk_size=${args.chunkSize} | cp=${modelArgs.cp} | mtp=${modelArgs.mtp} | phased=${process.env.GLM_PHASED_PREFILL !== "0"}`);

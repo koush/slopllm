@@ -33,7 +33,7 @@ function makeLongPrompt(length: number, prefix: number[] = [151643, 151644, 1516
 }
 
 describe("Qwen3-0.6B batch tests", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let model: Qwen3Model;
   let ws: ExecutionWorkspace;
   let tokenizer: any;
@@ -46,9 +46,9 @@ describe("Qwen3-0.6B batch tests", () => {
 
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
-    ws = new ExecutionWorkspace(glm, 4, 4096);
+    ops = new GlmOps(deviceId);
+    model = await Qwen3Model.fromPretrained(ops, QWEN3_REPO);
+    ws = new ExecutionWorkspace(ops, 4, 4096);
     tokenizer = model.tokenizer;
     PROMPT1 = tokenizePrompt(tokenizer, "Hi");
     PROMPT2 = tokenizePrompt(tokenizer, "Hello");
@@ -60,12 +60,12 @@ describe("Qwen3-0.6B batch tests", () => {
   after(() => {
     ws[Symbol.dispose]();
     model.free();
-    glm.free();
+    ops.free();
   });
 
   function makePagedKV(maxBatch = 4, maxPages = 128): PagedKVCache {
     const cfg = model.cfg;
-    return new PagedKVCache(glm, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, maxPages, maxBatch);
+    return new PagedKVCache(ops, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, maxPages, maxBatch);
   }
 
   it("batch prefill vs single prefill", () => {
@@ -180,7 +180,7 @@ describe("Qwen3-0.6B batch tests", () => {
   it("batch decode vs single decode", () => {
     using pagedKV = makePagedKV();
     using singleKV = makePagedKV(1);
-    using singleWs = new ExecutionWorkspace(glm, 1, 4096);
+    using singleWs = new ExecutionWorkspace(ops, 1, 4096);
     pagedKV.reset(2);
     const batchTokens = ws.forwardEagerPrefill(model, [PROMPT1, PROMPT2], pagedKV);
     const token1 = batchTokens[0];
@@ -244,14 +244,14 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("cuda graph decode", () => {
-    using gws = new ExecutionWorkspace(glm, 4, 4096);
+    using gws = new ExecutionWorkspace(ops, 4, 4096);
     using pagedKV = makePagedKV();
-    using captureManager = new CaptureManager(glm);
+    using captureManager = new CaptureManager(ops);
     const prompt = PROMPT_GRAPH;
 
     pagedKV.reset(1);
     const tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
-    glm.synchronize();
+    ops.synchronize();
     gws.clearTracking();
 
     const stateRef = gws.planDecode(model, 1, pagedKV, true);
@@ -268,7 +268,7 @@ describe("Qwen3-0.6B batch tests", () => {
     for (let run = 0; run < 5; run++) {
       pagedKV.reset(1);
       const tokens2 = gws.forwardEagerPrefill(model, [prompt], pagedKV);
-      glm.synchronize();
+      ops.synchronize();
       gws.clearTracking();
       const state = gws.planDecode(model, 1, pagedKV, true);
       state.setInput([[tokens2[0]]]);
@@ -278,7 +278,7 @@ describe("Qwen3-0.6B batch tests", () => {
           using logits = state.computeLogits(hiddenStates, model);
           return logits.argmax();
         }, ["batch-single-decode"]);
-        glm.synchronize();
+        ops.synchronize();
         const tokensReplay = captureArgmax.readInt32LEArray();
         assert.deepEqual(tokensReplay, tokensRef,
           `Graph run ${run} mismatch: replay=${tokensReplay}, ref=${tokensRef}`);
@@ -288,15 +288,15 @@ describe("Qwen3-0.6B batch tests", () => {
   });
 
   it("cuda graph multi-step decode", () => {
-    using gws = new ExecutionWorkspace(glm, 4, 4096);
+    using gws = new ExecutionWorkspace(ops, 4, 4096);
     using pagedKV = makePagedKV();
-    using captureManager = new CaptureManager(glm);
+    using captureManager = new CaptureManager(ops);
     const numSteps = 10;
     const prompt = PROMPT_GRAPH;
 
     pagedKV.reset(1);
     let tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
-    glm.synchronize();
+    ops.synchronize();
     gws.clearTracking();
 
     const refTokens: number[] = [];
@@ -316,7 +316,7 @@ describe("Qwen3-0.6B batch tests", () => {
 
     pagedKV.reset(1);
     tokens = gws.forwardEagerPrefill(model, [prompt], pagedKV);
-    glm.synchronize();
+    ops.synchronize();
     gws.clearTracking();
     current = tokens[0];
 
@@ -329,7 +329,7 @@ describe("Qwen3-0.6B batch tests", () => {
           using logits = state.computeLogits(hiddenStates, model);
           return logits.argmax();
         }, ["batch-multi-step-decode"]);
-        glm.synchronize();
+        ops.synchronize();
         current = captureArgmax.readInt32LEArray()[0];
       }
 
@@ -364,7 +364,7 @@ describe("Qwen3-0.6B batch tests", () => {
     const history = [...PROMPT_GRAPH, firstToken];
 
     const greedySingle = (() => {
-      using sampler = new SamplingWorkspace(logits.workspace.glm, 1, model.cfg.vocabSize, greedy.repetitionPenaltyWindow);
+      using sampler = new SamplingWorkspace(logits.workspace.ops, 1, model.cfg.vocabSize, greedy.repetitionPenaltyWindow);
       sampler.updateSampler([greedy], [history]);
       using sampled = sampler.sample(logits);
       return sampled.readInt32LEArray()[0];
@@ -372,7 +372,7 @@ describe("Qwen3-0.6B batch tests", () => {
     assert.equal(greedySingle, firstToken,
       `Temperature-zero sampling should match argmax: ${greedySingle} != ${firstToken}`);
     const batchResults = (() => {
-      using sampler = new SamplingWorkspace(logits.workspace.glm, 2, model.cfg.vocabSize, sampling.repetitionPenaltyWindow);
+      using sampler = new SamplingWorkspace(logits.workspace.ops, 2, model.cfg.vocabSize, sampling.repetitionPenaltyWindow);
       sampler.updateSampler([greedy, sampling], [history, history]);
       using batchLogits = logits.workspace.alloc([2, model.cfg.vocabSize], "BF16");
       for (let row = 0; row < 2; row++) {
@@ -410,7 +410,7 @@ describe("Qwen3-0.6B batch tests", () => {
     const history2 = [...PROMPT2, tokens[1]];
 
     const batchResults = (() => {
-      using sampler = new SamplingWorkspace(logits.workspace.glm, 2, model.cfg.vocabSize, greedy.repetitionPenaltyWindow);
+      using sampler = new SamplingWorkspace(logits.workspace.ops, 2, model.cfg.vocabSize, greedy.repetitionPenaltyWindow);
       sampler.updateSampler([greedy, greedy], [history1, history2]);
       using sampled = sampler.sample(logits);
       return sampled.readInt32LEArray();
@@ -609,22 +609,22 @@ describe("Qwen3-0.6B batch tests", () => {
 });
 
 describe("Qwen3.5-0.8B chunked prefill tests", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let model: Qwen35Model;
   let ws: ExecutionWorkspace;
   const PROMPT = [151643, 151644, 151645, 1, 2, 3, 4, 5, 6, 7];
 
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    model = await Qwen35Model.fromPretrained(glm, "Qwen/Qwen3.5-0.8B");
-    ws = new ExecutionWorkspace(glm, 1, 128);
+    ops = new GlmOps(deviceId);
+    model = await Qwen35Model.fromPretrained(ops, "Qwen/Qwen3.5-0.8B");
+    ws = new ExecutionWorkspace(ops, 1, 128);
   });
 
   after(() => {
     ws[Symbol.dispose]();
     model.free();
-    glm.free();
+    ops.free();
   });
 
   it("Qwen3.5 phased prefill keeps unequal halves' sequence boundaries independent", async () => {
@@ -637,7 +637,7 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
         assert.deepEqual(plan.states.map(state => state.seqLens), [[4], [5]]);
         try {
           for (const _ of plan.generator) {}
-          await glm.synchronizeAsync();
+          await ops.synchronizeAsync();
           plan.reportTokens();
         } finally {
           plan.generator.return([]);
@@ -654,7 +654,7 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
         tensor.d2h(bytes);
         return bytes;
       });
-      await glm.synchronizeAsync();
+      await ops.synchronizeAsync();
       return { state, target: cache.getPagedKV().sequences[0].targetToken };
     };
     assert.deepEqual(await run(true), await run(false));
@@ -698,7 +698,7 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
         assert.equal(sequence.targetToken, output.at(-1));
       }
       assert.deepEqual(sequence.getTokenIds(), [...prompt, 42, output[0]]);
-      await glm.synchronizeAsync();
+      await ops.synchronizeAsync();
       return { output, state: snapshot() };
     };
     assert.deepEqual(await run(true), await run(false));

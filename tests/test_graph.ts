@@ -34,10 +34,10 @@ function tokenizePrompt(tokenizer: any, prompt: string): number[] {
   return (Array.isArray(result.input_ids[0]) ? result.input_ids[0] : result.input_ids) as number[];
 }
 
-async function loadQwen3(glm: DeviceOps, repoId: string): Promise<ModelContext> {
-  const model = await Qwen3Model.fromPretrained(glm, repoId);
-  const ws = new ExecutionWorkspace(glm, 1, 128);
-  const cache = new PagedKVCache(glm, model.cfg.numKeyValueHeads, model.cfg.headDim, model.cfg.numHiddenLayers, 256, 1);
+async function loadQwen3(ops: DeviceOps, repoId: string): Promise<ModelContext> {
+  const model = await Qwen3Model.fromPretrained(ops, repoId);
+  const ws = new ExecutionWorkspace(ops, 1, 128);
+  const cache = new PagedKVCache(ops, model.cfg.numKeyValueHeads, model.cfg.headDim, model.cfg.numHiddenLayers, 256, 1);
   return {
     model, ws, cache,
     eosIds: model.eosIds,
@@ -46,9 +46,9 @@ async function loadQwen3(glm: DeviceOps, repoId: string): Promise<ModelContext> 
   };
 }
 
-async function loadQwen35(glm: DeviceOps): Promise<ModelContext> {
-  const model = await Qwen35Model.fromPretrained(glm, QWEN35_REPO);
-  const ws = new ExecutionWorkspace(glm, 1, 128);
+async function loadQwen35(ops: DeviceOps): Promise<ModelContext> {
+  const model = await Qwen35Model.fromPretrained(ops, QWEN35_REPO);
+  const ws = new ExecutionWorkspace(ops, 1, 128);
   const cache = model.createChatCache(256);
   return {
     model, ws, cache,
@@ -103,58 +103,58 @@ function assertParis(generated: number[], text: string, parisTokenId: number) {
 // --- Single GPU ---
 
 describe("Qwen3-0.6B Paris (1 GPU, graph)", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ctx: ModelContext;
   let tokenizer: any;
 
   before(async () => {
-    glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
-    ctx = await loadQwen3(glm, QWEN3_REPO);
+    ops = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+    ctx = await loadQwen3(ops, QWEN3_REPO);
     tokenizer = ctx.model.tokenizer;
   });
-  after(() => { ctx[Symbol.dispose](); glm.free(); });
+  after(() => { ctx[Symbol.dispose](); ops.free(); });
 
   it("generates 'Paris'", () => {
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
-    const generated = generateWithGraph(ctx, glm, inputIds, 64);
+    const generated = generateWithGraph(ctx, ops, inputIds, 64);
     assertParis(generated, tokenizer.decode(generated, { skip_special_tokens: true }), ctx.parisTokenId);
   });
 });
 
 describe("Qwen3-0.6B-FP8 Paris (1 GPU, graph)", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ctx: ModelContext;
   let tokenizer: any;
 
   before(async () => {
-    glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
-    ctx = await loadQwen3(glm, FP8_REPO);
+    ops = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+    ctx = await loadQwen3(ops, FP8_REPO);
     tokenizer = ctx.model.tokenizer;
   });
-  after(() => { ctx[Symbol.dispose](); glm.free(); });
+  after(() => { ctx[Symbol.dispose](); ops.free(); });
 
   it("generates 'Paris'", () => {
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
-    const generated = generateWithGraph(ctx, glm, inputIds, 64);
+    const generated = generateWithGraph(ctx, ops, inputIds, 64);
     assertParis(generated, tokenizer.decode(generated, { skip_special_tokens: true }), ctx.parisTokenId);
   });
 });
 
 describe("Qwen3.5-0.8B Paris (1 GPU, graph)", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ctx: ModelContext;
   let tokenizer: any;
 
   before(async () => {
-    glm = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
-    ctx = await loadQwen35(glm);
+    ops = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+    ctx = await loadQwen35(ops);
     tokenizer = ctx.model.tokenizer;
   });
-  after(() => { ctx[Symbol.dispose](); glm.free(); });
+  after(() => { ctx[Symbol.dispose](); ops.free(); });
 
   it("generates 'Paris'", () => {
     const inputIds = tokenizePrompt(tokenizer, "The capital of France is");
-    const generated = generateWithGraph(ctx, glm, inputIds, 64);
+    const generated = generateWithGraph(ctx, ops, inputIds, 64);
     assertParis(generated, tokenizer.decode(generated, { skip_special_tokens: true }), ctx.parisTokenId);
   });
 });

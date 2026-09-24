@@ -124,18 +124,18 @@ export class Qwen35Model extends ChatModel {
   cfg: Qwen35Config;
   invFreq: Tensor;
 
-  private constructor(glm: DeviceOps, config: Qwen35Config) {
-    super(glm);
+  private constructor(ops: DeviceOps, config: Qwen35Config) {
+    super(ops);
     this.cfg = config;
     this.eosIds = new Set(config.eosTokenIds);
     const ropeDim = Math.floor(config.headDim * config.partialRotaryFactor);
     this.invFreq = this.initInvFreq(ropeDim, config.ropeTheta);
   }
 
-  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string = QWEN35_REPO): Promise<Qwen35Model> {
+  static async fromPretrained(ops: DeviceOps, repoIdOrDir: string = QWEN35_REPO): Promise<Qwen35Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
-    const model = new Qwen35Model(glm, config);
+    const model = new Qwen35Model(ops, config);
     await model.fromPretrained(modelDir, QWEN35_REPO);
     return model;
   }
@@ -240,8 +240,8 @@ export class Qwen35Model extends ChatModel {
   }
 
   createChatCache(maxPages = 256, maxBatch = 1, maxSeqLen = 4096, _pageSize = 16): ChatCache {
-    const pagedKV = new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, maxBatch);
-    const gdnState = new Qwen35GdnState(this.glm, this.cfg, maxBatch);
+    const pagedKV = new PagedKVCache(this.ops, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, maxBatch);
+    const gdnState = new Qwen35GdnState(this.ops, this.cfg, maxBatch);
     return new Qwen35ChatCache(pagedKV, gdnState, maxBatch, maxSeqLen);
   }
 
@@ -287,7 +287,7 @@ export class Qwen35Model extends ChatModel {
 
     using gdnOut = ws.alloc([S, fullZDim], "BF16", undefined, TensorParallelism.Row);
 
-    ws.glm.gdnPrefill(
+    ws.ops.gdnPrefill(
       state, gdnOut, recurrentState, convOut,
       aBuf, bBuf,
       this.tensors.get(`${pfx}.A_log`)!, this.tensors.get(`${pfx}.dt_bias`)!,
@@ -345,7 +345,7 @@ export class Qwen35Model extends ChatModel {
 
     using gdnOut = ws.alloc([BS, fullZDim], "BF16", undefined, TensorParallelism.Row);
 
-    ws.glm.gdnRecurrentStep(
+    ws.ops.gdnRecurrentStep(
       state, gdnOut, recurrentState, convOut,
       aBuf, bBuf,
       this.tensors.get(`${pfx}.A_log`)!, this.tensors.get(`${pfx}.dt_bias`)!,

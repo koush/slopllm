@@ -56,7 +56,7 @@ interface PrefillResult {
 }
 
 function runMlaPrefill(
-  glm: GlmOps,
+  ops: GlmOps,
   ws: WorkspaceBase,
   qNopeF32: Float32Array,
   qPeF32: Float32Array,
@@ -120,7 +120,7 @@ function runMlaPrefill(
   const qoIndptrH = allocPinnedI32(ws, [batchSize + 1]);
   qoIndptrH.h2d(i32Buf(new Int32Array([0, totalQTokens])));
 
-  glm.mlaPrefillPlan(
+  ops.mlaPrefillPlan(
     floatWs, 128 * 1024 * 1024,
     intWs, pinnedIntWs, 8 * 1024 * 1024,
     planInfo,
@@ -140,14 +140,14 @@ function runMlaPrefill(
   const oStrideH = totalQTokens * headDimCkv;
 
   const execState = { batchSize, totalTokens: totalQTokens, cache: { getPagedKV: () => ({ pageSize }) } } as ExecutionState;
-  const { o: vOut, lse } = glm.mlaPrefillRun(
+  const { o: vOut, lse } = ops.mlaPrefillRun(
     execState,
     qNope, qPe, ckv, kpe, indices,
     floatWs, intWs, planInfo,
     SM_SCALE, 1,
     cpWorldSize, cpRank,
   );
-  glm.synchronize();
+  ops.synchronize();
 
   return { vOut, lse };
 }
@@ -188,7 +188,7 @@ function shardKV(
 }
 
 function runCpPrefillTest(
-  glm: GlmOps,
+  ops: GlmOps,
   ws: WorkspaceBase,
   seqLen: number,
   batchSize: number,
@@ -211,7 +211,7 @@ function runCpPrefillTest(
   vProj.h2d(f32ToBf16Bytes(vProjF32));
 
   const baseline = runMlaPrefill(
-    glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+    ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
     seqLen, seqLen, seqLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
     pageSize, maxPages,
     pageSize * HEAD_DIM_CKV, pageSize * HEAD_DIM_KPE,
@@ -235,7 +235,7 @@ function runCpPrefillTest(
     const kpeStridePageShard = vPS * HEAD_DIM_KPE;
 
     const result = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvShard, kpeShard,
+      ops, ws, qNopeF32, qPeF32, ckvShard, kpeShard,
       seqLen, shardLen, seqLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       vPS, maxShardPages,
       ckvStridePageShard, kpeStridePageShard,
@@ -252,12 +252,12 @@ function runCpPrefillTest(
   const vPtrs8 = new Array<number>(8).fill(0);
   const lsePtrs8 = new Array<number>(8).fill(0);
   for (let i = 0; i < worldSize; i++) { vPtrs8[i] = shardVPtrs[i]; lsePtrs8[i] = shardLsePtrs[i]; }
-  glm.cpMergeTree(
+  ops.cpMergeTree(
     vPtrs8, lsePtrs8, worldSize,
     mergedVOut, null,
     totalTokens * N_HEADS * V_HEAD_DIM, totalTokens, N_HEADS, V_HEAD_DIM,
   );
-  glm.synchronize();
+  ops.synchronize();
 
   const mergedBuf = Buffer.alloc(totalTokens * N_HEADS * V_HEAD_DIM * 2);
   mergedVOut.d2h(mergedBuf);
@@ -292,46 +292,46 @@ function runCpPrefillTest(
 }
 
 describe("CP MLA Prefill", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ws: WorkspaceBase;
 
   before(() => {
-    glm = new GlmOps(0);
-    ws = new WorkspaceBase(glm);
+    ops = new GlmOps(0);
+    ws = new WorkspaceBase(ops);
   });
 
   after(() => {
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("2-shard CP prefill matches baseline (seqLen=32, batch=1, pageSize=16)", () => {
-    runCpPrefillTest(glm, ws, 32, 1, 16, 2);
+    runCpPrefillTest(ops, ws, 32, 1, 16, 2);
   });
 
   it("2-shard CP prefill matches baseline (seqLen=33, batch=1, pageSize=16) — odd seqLen", () => {
-    runCpPrefillTest(glm, ws, 33, 1, 16, 2);
+    runCpPrefillTest(ops, ws, 33, 1, 16, 2);
   });
 
   it("2-shard CP prefill matches baseline (seqLen=64, batch=1, pageSize=16) — longer seqLen", () => {
-    runCpPrefillTest(glm, ws, 64, 1, 16, 2);
+    runCpPrefillTest(ops, ws, 64, 1, 16, 2);
   });
 
   it("4-shard CP prefill matches baseline (seqLen=32, batch=1, pageSize=16)", () => {
-    runCpPrefillTest(glm, ws, 32, 1, 16, 4);
+    runCpPrefillTest(ops, ws, 32, 1, 16, 4);
   });
 
   it("2-shard CP prefill matches baseline (seqLen=64, batch=1, pageSize=16) — 4-shard", () => {
-    runCpPrefillTest(glm, ws, 64, 1, 16, 4);
+    runCpPrefillTest(ops, ws, 64, 1, 16, 4);
   });
 
   it("2-shard CP prefill matches baseline (seqLen=128, batch=1, pageSize=16)", () => {
-    runCpPrefillTest(glm, ws, 128, 1, 16, 2);
+    runCpPrefillTest(ops, ws, 128, 1, 16, 2);
   });
 });
 
 function runCpAppendPrefillTest(
-  glm: GlmOps,
+  ops: GlmOps,
   ws: WorkspaceBase,
   prefixLen: number,
   newLen: number,
@@ -356,7 +356,7 @@ function runCpAppendPrefillTest(
   vProj.h2d(f32ToBf16Bytes(vProjF32));
 
   const baseline = runMlaPrefill(
-    glm, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
+    ops, ws, qNopeF32, qPeF32, ckvF32, kpeF32,
     newLen, totalKvLen, totalKvLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
     pageSize, maxPages,
     pageSize * HEAD_DIM_CKV, pageSize * HEAD_DIM_KPE,
@@ -380,7 +380,7 @@ function runCpAppendPrefillTest(
     const kpeStridePageShard = vPS * HEAD_DIM_KPE;
 
     const result = runMlaPrefill(
-      glm, ws, qNopeF32, qPeF32, ckvShard, kpeShard,
+      ops, ws, qNopeF32, qPeF32, ckvShard, kpeShard,
       newLen, shardLen, totalKvLen, batchSize, N_HEADS, HEAD_DIM_CKV, HEAD_DIM_KPE,
       vPS, maxShardPages,
       ckvStridePageShard, kpeStridePageShard,
@@ -397,12 +397,12 @@ function runCpAppendPrefillTest(
   const vPtrs8 = new Array<number>(8).fill(0);
   const lsePtrs8 = new Array<number>(8).fill(0);
   for (let i = 0; i < worldSize; i++) { vPtrs8[i] = shardVPtrs[i]; lsePtrs8[i] = shardLsePtrs[i]; }
-  glm.cpMergeTree(
+  ops.cpMergeTree(
     vPtrs8, lsePtrs8, worldSize,
     mergedVOut, null,
     totalQTokens * N_HEADS * V_HEAD_DIM, totalQTokens, N_HEADS, V_HEAD_DIM,
   );
-  glm.synchronize();
+  ops.synchronize();
 
   const mergedBuf = Buffer.alloc(totalQTokens * N_HEADS * V_HEAD_DIM * 2);
   mergedVOut.d2h(mergedBuf);
@@ -437,29 +437,29 @@ function runCpAppendPrefillTest(
 }
 
 describe("CP MLA Append Prefill (qSeqLen < kvSeqLen)", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ws: WorkspaceBase;
 
   before(() => {
-    glm = new GlmOps(0);
-    ws = new WorkspaceBase(glm);
+    ops = new GlmOps(0);
+    ws = new WorkspaceBase(ops);
   });
 
   after(() => {
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("2-shard CP append prefill matches baseline (prefix=32, new=9, pageSize=16)", () => {
-    runCpAppendPrefillTest(glm, ws, 32, 9, 1, 16, 2);
+    runCpAppendPrefillTest(ops, ws, 32, 9, 1, 16, 2);
   });
 
   it("2-shard CP append prefill matches baseline (prefix=16, new=8, pageSize=16)", () => {
-    runCpAppendPrefillTest(glm, ws, 16, 8, 1, 16, 2);
+    runCpAppendPrefillTest(ops, ws, 16, 8, 1, 16, 2);
   });
 
   it("2-shard CP append prefill matches baseline (prefix=16, new=1, pageSize=16)", () => {
-    runCpAppendPrefillTest(glm, ws, 16, 1, 1, 16, 2);
+    runCpAppendPrefillTest(ops, ws, 16, 1, 1, 16, 2);
   });
 });
 

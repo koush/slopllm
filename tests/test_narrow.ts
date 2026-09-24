@@ -4,25 +4,25 @@ import { GlmOps, f32ToBf16Bytes, bf16BytesToF32 } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 
 describe("GlmTensor.narrow (single GPU)", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let ws: WorkspaceBase;
 
   before(() => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    ws = new WorkspaceBase(glm);
+    ops = new GlmOps(deviceId);
+    ws = new WorkspaceBase(ops);
   });
 
   after(() => {
     ws.free();
-    glm.free();
+    ops.free();
   });
 
   it("narrow 1D I32 (skip first element)", () => {
     const t = ws.alloc([5], "I32");
     const data = new Int32Array([10, 20, 30, 40, 50]);
     t.h2d(Buffer.from(data.buffer));
-    glm.synchronize();
+    ops.synchronize();
 
     const view = t.narrow(1, 4);
     assert.deepEqual(view.shape, [4]);
@@ -37,7 +37,7 @@ describe("GlmTensor.narrow (single GPU)", () => {
     const t = ws.alloc([5], "I32");
     const data = new Int32Array([10, 20, 30, 40, 50]);
     t.h2d(Buffer.from(data.buffer));
-    glm.synchronize();
+    ops.synchronize();
 
     const view = t.narrow(4, 1);
     assert.deepEqual(view.shape, [1]);
@@ -51,7 +51,7 @@ describe("GlmTensor.narrow (single GPU)", () => {
     const t = ws.alloc([5], "I32");
     const data = new Int32Array([10, 20, 30, 40, 50]);
     t.h2d(Buffer.from(data.buffer));
-    glm.synchronize();
+    ops.synchronize();
 
     const view = t.narrow(-2, 2);
     assert.deepEqual(view.shape, [2]);
@@ -68,7 +68,7 @@ describe("GlmTensor.narrow (single GPU)", () => {
     const t = ws.alloc([rows, cols], "F32");
     const data = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     t.h2d(Buffer.from(data.buffer));
-    glm.synchronize();
+    ops.synchronize();
 
     const view = t.narrow(1, 3);
     assert.deepEqual(view.shape, [3, 3]);
@@ -87,7 +87,7 @@ describe("GlmTensor.narrow (single GPU)", () => {
     const data = new Float32Array(5 * 4);
     for (let i = 0; i < data.length; i++) data[i] = i;
     t.h2d(Buffer.from(data.buffer));
-    glm.synchronize();
+    ops.synchronize();
 
     const view = t.narrow(2, 2);
     assert.deepEqual(view.shape, [2, 4]);
@@ -105,14 +105,14 @@ describe("GlmTensor.narrow (single GPU)", () => {
     const t = ws.alloc([4, 3], "F32");
     const data = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     t.h2d(Buffer.from(data.buffer));
-    glm.synchronize();
+    ops.synchronize();
 
     const view = t.narrow(1, 3);
     assert.deepEqual(view.shape, [3, 3]);
 
     const overwrite = new Float32Array([99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99]);
     t.h2d(Buffer.from(overwrite.buffer));
-    glm.synchronize();
+    ops.synchronize();
 
     const buf = Buffer.alloc(9 * 4);
     view.d2h(buf);
@@ -127,7 +127,7 @@ describe("GlmTensor.narrow (single GPU)", () => {
     const t = ws.alloc([4, 3], "BF16");
     const f32 = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     t.h2d(f32ToBf16Bytes(f32));
-    glm.synchronize();
+    ops.synchronize();
 
     const view = t.narrow(2, 2);
     assert.deepEqual(view.shape, [2, 3]);
@@ -167,7 +167,7 @@ describe("GlmTensor.narrow (single GPU)", () => {
     const indptr = ws.alloc([batchSize + 1], "I32");
     const indptrData = new Int32Array([0, 3, 7, 10]);
     indptr.h2d(Buffer.from(indptrData.buffer));
-    glm.synchronize();
+    ops.synchronize();
 
     const indptrTail = indptr.narrow(1, batchSize);
     assert.deepEqual(indptrTail.shape, [batchSize]);

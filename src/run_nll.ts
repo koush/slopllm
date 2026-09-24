@@ -31,11 +31,11 @@ async function main() {
   const maxSeqLen = Math.max(4096, 1 << Math.ceil(Math.log2(nTokens + 8)));
 
   const gpuDevices = gpus.map(id => new GlmOps(id, undefined, arena || undefined));
-  const glm: DeviceOps = gpuDevices.length > 1 ? new ParallelOps(gpuDevices) : gpuDevices[0];
+  const ops: DeviceOps = gpuDevices.length > 1 ? new ParallelOps(gpuDevices) : gpuDevices[0];
 
-  const model = await Glm51Model.fromPretrained(glm, modelDir, false, false);
+  const model = await Glm51Model.fromPretrained(ops, modelDir, false, false);
   const cache = model.createChatCache(4096, 1, maxSeqLen);
-  const ws = new ExecutionWorkspace(glm, 1, maxSeqLen);
+  const ws = new ExecutionWorkspace(ops, 1, maxSeqLen);
 
   const tokenizer = model.tokenizer;
   const text = fs.readFileSync(textPath, "utf-8").slice(skip, skip + nTokens * 24);
@@ -71,7 +71,7 @@ async function main() {
       st.setInput([[cur]]);
       using hs = model.forwardModel(st);
       using lg = st.computeLogits(hs, model);
-      glm.synchronize();
+      ops.synchronize();
 
       const vv = lg.shape[lg.shape.length - 1];
       const b = Buffer.alloc(lg.bytes);
@@ -95,11 +95,11 @@ async function main() {
     console.log(`[decode] tokens=${nD} meanNLL=${mD.toFixed(5)} ppl=${Math.exp(mD).toFixed(4)} top1acc=${(top1D / nD * 100).toFixed(2)}%`);
     const dump = opt("--dump", "");
     if (dump) fs.writeFileSync(dump, JSON.stringify(perToken));
-    glm.synchronize();
+    ops.synchronize();
     cache.free();
     ws.free();
     model.free();
-    if (glm instanceof ParallelOps) glm.free();
+    if (ops instanceof ParallelOps) ops.free();
     for (const d of gpuDevices) d.free();
     return;
   }
@@ -108,7 +108,7 @@ async function main() {
   state.setInput([ids]);
   using hiddenStates = model.forward(state);
   using logits = state.computeLogits(hiddenStates, model, true);
-  glm.synchronize();
+  ops.synchronize();
 
   const V = logits.shape[logits.shape.length - 1];
   const rows = logits.numElements / V;
@@ -142,11 +142,11 @@ async function main() {
   const mean = nll / n;
   console.log(`tokens=${n} vocab=${V} meanNLL=${mean.toFixed(5)} ppl=${Math.exp(mean).toFixed(4)} top1acc=${(top1 / n * 100).toFixed(2)}%`);
 
-  glm.synchronize();
+  ops.synchronize();
   cache.free();
   ws.free();
   model.free();
-  if (glm instanceof ParallelOps) glm.free();
+  if (ops instanceof ParallelOps) ops.free();
   for (const d of gpuDevices) d.free();
 }
 

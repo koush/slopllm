@@ -29,10 +29,10 @@ function bytes(tensor: Tensor) {
 function combine(down: Tensor, routing: Tensor, topK: number, rows: number): Tensor {
   if (down instanceof ParallelTensor && routing instanceof ParallelTensor) {
     const shards = down.shards.map((shard, i) => combine(shard, routing.shards[i], topK, rows));
-    return (down.workspace.glm as ParallelOps).wrapShards(down.workspace, shards, [rows, down.shape[1]], down.type, down.parallelism);
+    return (down.workspace.ops as ParallelOps).wrapShards(down.workspace, shards, [rows, down.shape[1]], down.type, down.parallelism);
   }
   const out = down.workspace.alloc([rows, down.shape[1]], down.type);
-  getNativeAddon().scatterAddRows((down.workspace.glm as GlmOps).ctx, out.data, down.data,
+  getNativeAddon().scatterAddRows((down.workspace.ops as GlmOps).ctx, out.data, down.data,
     routing.data, topK, down.shape[1], rows, 0);
   return out;
 }

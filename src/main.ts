@@ -6,10 +6,10 @@ import { WorkspaceBase } from "./workspace";
 import { Tensor } from "./tensor";
 
 async function main() {
-  const glm = new GlmOps(0);
-  console.log("GLM context:", glm.ctx);
+  const ops = new GlmOps(0);
+  console.log("GLM context:", ops.ctx);
 
-  const ws = new WorkspaceBase(glm);
+  const ws = new WorkspaceBase(ops);
   const buf = ws.alloc([256], "U8");
   console.log("GPU buffer:", buf.data);
   buf.free();
@@ -30,7 +30,7 @@ async function main() {
   console.log(`First shard: ${shardPaths[0]}`);
   console.log(`File exists: ${fs.existsSync(shardPaths[0])}`);
 
-  glm.free();
+  ops.free();
   console.log("Done.");
 }
 

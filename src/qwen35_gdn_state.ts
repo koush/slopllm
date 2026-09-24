@@ -9,8 +9,8 @@ export class Qwen35GdnState extends WorkspaceBase {
   private cfg: Qwen35Config;
   readonly batchSize: number;
 
-  constructor(glm: DeviceOps, cfg: Qwen35Config, batchSize = 1) {
-    super(glm);
+  constructor(ops: DeviceOps, cfg: Qwen35Config, batchSize = 1) {
+    super(ops);
     this.cfg = cfg;
     this.batchSize = batchSize;
     const fullLinHeads = cfg.linearNumKeyHeads;

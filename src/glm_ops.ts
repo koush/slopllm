@@ -55,7 +55,7 @@ function ptr(t: Tensor | undefined): number {
 
 export class GlmTensor extends Tensor {
   private disposalPending = false;
-  constructor(workspace: WorkspaceBase, public readonly glm: GlmOps, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean, view: GlmTensor | undefined, recycleKey: HeapKey | null = null) {
+  constructor(workspace: WorkspaceBase, public readonly ops: GlmOps, data: number, allocSize: number, shape: number[], type: string, name: string | undefined, pinned: boolean, view: GlmTensor | undefined, recycleKey: HeapKey | null = null) {
     super(workspace, data, allocSize, shape, type, name, pinned, view, recycleKey);
   }
 
@@ -72,7 +72,7 @@ export class GlmTensor extends Tensor {
       return;
     }
     if (this.view) {
-      const pending = this.glm.getStreamResources(this.glm.currentStream).disposedViews;
+      const pending = this.ops.getStreamResources(this.ops.currentStream).disposedViews;
       const root = this.view as GlmTensor;
       this.disposalPending = true;
       // An unrelated live root needs only an enqueue. Do not rescan other
@@ -89,7 +89,7 @@ export class GlmTensor extends Tensor {
       return;
     }
     if (this.views.size) {
-      const pending = this.glm.getStreamResources(this.glm.currentStream).disposedViews;
+      const pending = this.ops.getStreamResources(this.ops.currentStream).disposedViews;
       this.disposalPending = true;
       pending.add(this);
       // Only this root's references can become eligible from its disposal.
@@ -111,15 +111,15 @@ export class GlmTensor extends Tensor {
   }
 
   finishDispose(): void {
-    if (this.canDispose() && this.recycleKey === null && this.glm.currentStream !== 0) {
-      let resources = this.glm.streamResources.get(this.glm.currentStream);
+    if (this.canDispose() && this.recycleKey === null && this.ops.currentStream !== 0) {
+      let resources = this.ops.streamResources.get(this.ops.currentStream);
       if (!resources) {
         resources = {
           workspaces: new Set<WorkspaceBase>(),
           joined: [],
           disposedViews: new Set<GlmTensor>(),
         };
-        this.glm.streamResources.set(this.glm.currentStream, resources);
+        this.ops.streamResources.set(this.ops.currentStream, resources);
       }
       resources.workspaces.add(this.workspace);
     }
@@ -145,11 +145,11 @@ export class GlmTensor extends Tensor {
   }
 
   h2d(data: Buffer, size?: number): void {
-    getNativeAddon().h2d(this.glm.ctx, this.data, data, size ?? data.length);
+    getNativeAddon().h2d(this.ops.ctx, this.data, data, size ?? data.length);
   }
 
   d2h(buf: Buffer, size?: number): void {
-    getNativeAddon().d2h(this.glm.ctx, buf, this.data, size ?? buf.length);
+    getNativeAddon().d2h(this.ops.ctx, buf, this.data, size ?? buf.length);
   }
 
   linear(weight: Tensor): Tensor {
@@ -161,15 +161,15 @@ export class GlmTensor extends Tensor {
     const out = this.workspace.alloc(outShape, this.type);
     if (weight.type === "F8_E4M3") {
       const scale = weight.workspace.tensors.get(weight.name! + "_scale_inv")!;
-      getNativeAddon().fp8LinearDecode(this.glm.ctx, out.data, this.data, weight.data, scale.data, batch, n, k);
+      getNativeAddon().fp8LinearDecode(this.ops.ctx, out.data, this.data, weight.data, scale.data, batch, n, k);
     } else if (weight.type === "U8") {
       k = k * 2; // NVFP4: weight is [N, K/2] packed, kernel expects K
       const scale = weight.workspace.tensors.get(weight.name! + "_weight_scale")!;
       const scale2 = weight.workspace.tensors.get(weight.name! + "_weight_scale_2")!;
-      getNativeAddon().nvfp4LinearDecode(this.glm.ctx, out.data, this.data, weight.data, scale.data, scale2.data, batch, n, k, 0);
+      getNativeAddon().nvfp4LinearDecode(this.ops.ctx, out.data, this.data, weight.data, scale.data, scale2.data, batch, n, k, 0);
     } else {
       using workspace = batch >= 3 ? this.workspace.allocRaw(CUBLASLT_WORKSPACE_BYTES) : undefined;
-      getNativeAddon().linear(this.glm.ctx, out.data, this.data, weight.data, batch, n, k, workspace?.data ?? 0, workspace?.bytes ?? 0);
+      getNativeAddon().linear(this.ops.ctx, out.data, this.data, weight.data, batch, n, k, workspace?.data ?? 0, workspace?.bytes ?? 0);
     }
     return out;
   }
@@ -177,7 +177,7 @@ export class GlmTensor extends Tensor {
   bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false, tokenMajor: boolean = false): Tensor {
     super.bmm(B, batch, M, N, K, transA, transB, tokenMajor);
     const out = this.workspace.alloc(tokenMajor ? [M, batch, N] : [batch * M, N], this.type);
-    getNativeAddon().bmm(this.glm.ctx, out.data, this.data, B.data, 1.0, 0.0, batch, M, N, K, transA ? 1 : 0, transB ? 1 : 0, tokenMajor);
+    getNativeAddon().bmm(this.ops.ctx, out.data, this.data, B.data, 1.0, 0.0, batch, M, N, K, transA ? 1 : 0, transB ? 1 : 0, tokenMajor);
     return out;
   }
 
@@ -187,7 +187,7 @@ export class GlmTensor extends Tensor {
       throw new Error(`transpose4d: type ${this.type} is only supported for permutation [1,0,2,3]`);
     }
     const out = this.workspace.alloc([d0 * d1 * d2 * d3], this.type);
-    getNativeAddon().transpose4d(this.glm.ctx, out.data, this.data, d0, d1, d2, d3, p0, p1, p2, p3, SafeTensorFile.dtypeBytes(this.type));
+    getNativeAddon().transpose4d(this.ops.ctx, out.data, this.data, d0, d1, d2, d3, p0, p1, p2, p3, SafeTensorFile.dtypeBytes(this.type));
     return out;
   }
 
@@ -206,7 +206,7 @@ export class GlmTensor extends Tensor {
     for (let i = 0; i < n; i++) {
       ptrs[i] = tensors[i].data;
     }
-    getNativeAddon().writePointers(this.glm.ctx, this.data,
+    getNativeAddon().writePointers(this.ops.ctx, this.data,
       ptrs[0], ptrs[1], ptrs[2], ptrs[3],
       ptrs[4], ptrs[5], ptrs[6], ptrs[7], n);
   }
@@ -216,7 +216,7 @@ export class GlmTensor extends Tensor {
     const batch = this.shape[0];
     const dim = this.shape[1];
     const out = this.workspace.alloc([batch, dim], this.type);
-    getNativeAddon().rmsnorm(this.glm.ctx, out.data, this.data, weight.data, eps, dim, batch);
+    getNativeAddon().rmsnorm(this.ops.ctx, out.data, this.data, weight.data, eps, dim, batch);
     return out;
   }
 
@@ -225,7 +225,7 @@ export class GlmTensor extends Tensor {
     const batch = this.shape[0];
     const dim = this.shape[1];
     const out = this.workspace.alloc([batch, dim], this.type);
-    getNativeAddon().layernorm(this.glm.ctx, out.data, this.data, weight.data, bias.data, eps, dim, batch);
+    getNativeAddon().layernorm(this.ops.ctx, out.data, this.data, weight.data, bias.data, eps, dim, batch);
     return out;
   }
 
@@ -235,7 +235,7 @@ export class GlmTensor extends Tensor {
     const dim = this.shape[1];
     const normed = this.workspace.alloc([batch, dim], this.type);
     const residual = this.workspace.alloc([batch, dim], this.type);
-    getNativeAddon().fusedAddRmsnorm(this.glm.ctx, normed.data, residual.data, this.data, input.data, weight.data, eps, dim, batch);
+    getNativeAddon().fusedAddRmsnorm(this.ops.ctx, normed.data, residual.data, this.data, input.data, weight.data, eps, dim, batch);
     return { normed, residual };
   }
 
@@ -246,7 +246,7 @@ export class GlmTensor extends Tensor {
     const nHeads = this.shape[1] / stride;
     using reshaped = this.reshape([batch, seqLen, ...this.shape.slice(1)]);
     const out = this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
-    getNativeAddon().fusedNormRope(this.glm.ctx, out.data, reshaped.data, weight.data, cos.data, sin.data, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim, interleaved ?? false);
+    getNativeAddon().fusedNormRope(this.ops.ctx, out.data, reshaped.data, weight.data, cos.data, sin.data, eps, ropeDim, headDim, nHeads, seqLen, batch, inStride ?? headDim, interleaved ?? false);
     return out;
   }
 
@@ -255,7 +255,7 @@ export class GlmTensor extends Tensor {
     const hidden = this.shape[1];
     const seqLen = ids.numElements;
     const out = ids.workspace.alloc([seqLen, hidden], this.type);
-    getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, ids.data, hidden, seqLen, 0);
+    getNativeAddon().indexSelect(this.ops.ctx, out.data, this.data, ids.data, hidden, seqLen, 0);
     return out;
   }
 
@@ -264,13 +264,13 @@ export class GlmTensor extends Tensor {
     const batch = this.shape[0];
     const intermediate = this.shape[1];
     const out = this.workspace.alloc([batch, intermediate], this.type);
-    getNativeAddon().siluAndMul(this.glm.ctx, out.data, this.data, up.data, intermediate, batch);
+    getNativeAddon().siluAndMul(this.ops.ctx, out.data, this.data, up.data, intermediate, batch);
     return out;
   }
 
   arange(start: number, step: number, count: number): void {
     super.arange(start, step, count);
-    getNativeAddon().arange(this.glm.ctx, this.data, start, step, count);
+    getNativeAddon().arange(this.ops.ctx, this.data, start, step, count);
   }
 
   argmax(): Tensor {
@@ -286,7 +286,7 @@ export class GlmTensor extends Tensor {
     const batch = this.shape[0];
     const values = this.workspace.alloc([batch], this.type);
     const indices = this.workspace.alloc([batch], "I32");
-    getNativeAddon().max(this.glm.ctx, values.data, indices.data, this.data, dim, batch, offset);
+    getNativeAddon().max(this.ops.ctx, values.data, indices.data, this.data, dim, batch, offset);
     return { values, indices };
   }
 
@@ -295,7 +295,7 @@ export class GlmTensor extends Tensor {
     const batch = indices.numElements;
     const dim = this.shape[1];
     const out = this.workspace.alloc([batch, dim], this.type);
-    getNativeAddon().indexSelect(this.glm.ctx, out.data, this.data, indices.data, dim, batch, offset);
+    getNativeAddon().indexSelect(this.ops.ctx, out.data, this.data, indices.data, dim, batch, offset);
     return out;
   }
 
@@ -303,26 +303,26 @@ export class GlmTensor extends Tensor {
     super.gather(indices, k, inDim, batch);
     const out = this.workspace.alloc([batch, k], this.type);
     const elemSize = SafeTensorFile.dtypeBytes(this.type);
-    getNativeAddon().gather(this.glm.ctx, out.data, this.data, indices.data, k, inDim, batch, elemSize);
+    getNativeAddon().gather(this.ops.ctx, out.data, this.data, indices.data, k, inDim, batch, elemSize);
     return out;
   }
 
   rotateInputIds(qoIndptr: Tensor, newTokens: Tensor, batchSize: number): Tensor {
     super.rotateInputIds(qoIndptr, newTokens, batchSize);
     const out = this.workspace.alloc(this.shape, this.type);
-    getNativeAddon().rotateInputIds(this.glm.ctx, out.data, this.data, qoIndptr.data, newTokens.data, batchSize);
+    getNativeAddon().rotateInputIds(this.ops.ctx, out.data, this.data, qoIndptr.data, newTokens.data, batchSize);
     return out;
   }
 
   causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
     super.causalConv1d(convState, input, weight, cuSeqlens, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
-    getNativeAddon().causalConv1d(this.glm.ctx, this.data, convState.data, input.data, weight.data, cuSeqlens.data, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
+    getNativeAddon().causalConv1d(this.ops.ctx, this.data, convState.data, input.data, weight.data, cuSeqlens.data, convDim, totalSeqLen, kernelSize, batchSize, convStateStride, chStride, seqStride);
   }
 
   causalConv1dUpdate(convState: Tensor, input: Tensor, weight: Tensor, convDim: number, kernelSize: number, batchSize: number, convStateStride: number): Tensor {
     super.causalConv1dUpdate(convState, input, weight, convDim, kernelSize, batchSize, convStateStride);
     const out = this.workspace.alloc([batchSize * convDim], this.type);
-    getNativeAddon().causalConv1dUpdate(this.glm.ctx, out.data, convState.data, input.data, weight.data, convDim, kernelSize, batchSize, convStateStride);
+    getNativeAddon().causalConv1dUpdate(this.ops.ctx, out.data, convState.data, input.data, weight.data, convDim, kernelSize, batchSize, convStateStride);
     return out;
   }
 
@@ -330,18 +330,18 @@ export class GlmTensor extends Tensor {
     super.rmsnormGated(input, gate, weight, eps);
     const dim = input.shape[1];
     const batch = input.shape[0];
-    getNativeAddon().rmsnormGated(this.glm.ctx, this.data, input.data, gate.data, weight.data, eps, dim, batch);
+    getNativeAddon().rmsnormGated(this.ops.ctx, this.data, input.data, gate.data, weight.data, eps, dim, batch);
   }
 
   gateSigmoidMul(gate: Tensor, numHeads: number, headDim: number): void {
     super.gateSigmoidMul(gate, numHeads, headDim);
     const batchSeq = this.numElements / (numHeads * headDim);
-    getNativeAddon().gateSigmoidMul(this.glm.ctx, this.data, gate.data, batchSeq, numHeads, headDim);
+    getNativeAddon().gateSigmoidMul(this.ops.ctx, this.data, gate.data, batchSeq, numHeads, headDim);
   }
 
   fill(value: number, n: number): void {
     super.fill(value, n);
-    getNativeAddon().fill(this.glm.ctx, this.data, value, n, this.type);
+    getNativeAddon().fill(this.ops.ctx, this.data, value, n, this.type);
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
@@ -361,11 +361,11 @@ export class GlmTensor extends Tensor {
       // for testing: skip actual load
       return;
     }
-    return getNativeAddon().mmapLoadAsync(this.glm.ctx, this.data, mmapPtr, offset, nbytes);
+    return getNativeAddon().mmapLoadAsync(this.ops.ctx, this.data, mmapPtr, offset, nbytes);
   }
 
   memcpy2dHostToDeviceAsync(dstOffset: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void> {
-    return getNativeAddon().memcpy2dHostToDeviceAsync(this.glm.ctx, this.data + dstOffset, dpitch, src, spitch, width, height);
+    return getNativeAddon().memcpy2dHostToDeviceAsync(this.ops.ctx, this.data + dstOffset, dpitch, src, spitch, width, height);
   }
 
   memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {
@@ -378,7 +378,7 @@ export class GlmTensor extends Tensor {
     // if (copyKind === MemcpyKind.DeviceToDevice && this.glm !== src.glm) {
     //   getNativeAddon().memcpyPeer(src.glm.ctx, this.data, this.glm.device, src.data, src.glm.device, bytes);
     // } else {
-    getNativeAddon().memcpy(src.glm.ctx, this.data, src.data, bytes, memcpyKindToNative(copyKind));
+    getNativeAddon().memcpy(src.ops.ctx, this.data, src.data, bytes, memcpyKindToNative(copyKind));
     // }
   }
 
@@ -398,7 +398,7 @@ export class GlmTensor extends Tensor {
     //     width, height, 1,
     //   );
     // } else {
-    getNativeAddon().memcpy2d(src.glm.ctx, this.data + dstOffset, dpitch, (src as GlmTensor).data + srcOffset, spitch, width, height, memcpyKindToNative(kind));
+    getNativeAddon().memcpy2d(src.ops.ctx, this.data + dstOffset, dpitch, (src as GlmTensor).data + srcOffset, spitch, width, height, memcpyKindToNative(kind));
     // }
   }
 
@@ -409,7 +409,7 @@ export class GlmTensor extends Tensor {
     using reshaped = positionIds.reshape([batch, seqLen]);
     const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
     const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
-    getNativeAddon().rotaryEmbedding(this.glm.ctx, cos.data, sin.data, this.data, reshaped.data, dimHalf, batch, seqLen);
+    getNativeAddon().rotaryEmbedding(this.ops.ctx, cos.data, sin.data, this.data, reshaped.data, dimHalf, batch, seqLen);
     return { cos, sin };
   }
 
@@ -427,7 +427,7 @@ export class GlmTensor extends Tensor {
       ? [this.shape[0], nHeads, headDim]
       : this.shape;
     const out = this.workspace.alloc(outShape, this.type);
-    getNativeAddon().applyRotaryPosEmb(this.glm.ctx, out.data, inputData, ropeDim > 0 ? cos.data : 0, ropeDim > 0 ? sin.data : 0, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false, inStride ?? headDim);
+    getNativeAddon().applyRotaryPosEmb(this.ops.ctx, out.data, inputData, ropeDim > 0 ? cos.data : 0, ropeDim > 0 ? sin.data : 0, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved ?? false, inStride ?? headDim);
     return out;
   }
 
@@ -446,14 +446,14 @@ export class GlmTensor extends Tensor {
     const out = this.workspace.alloc([BS, nHeads * vHeadDim], this.type);
     const effSeqLen = tokenMajor ? 1 : seqLen;
     const effBatch = tokenMajor ? BS : batch;
-    getNativeAddon().mlaVExpand(this.glm.ctx, out.data, inputData, vProj.data, kvLoraRank, vHeadDim, nHeads, effSeqLen, effBatch, attnNHeads, headOffset, vProjHeadOffset);
+    getNativeAddon().mlaVExpand(this.ops.ctx, out.data, inputData, vProj.data, kvLoraRank, vHeadDim, nHeads, effSeqLen, effBatch, attnNHeads, headOffset, vProjHeadOffset);
     return out;
   }
 
   sigmoid(): Tensor {
     const n = this.shape.reduce((a, b) => a * b, 1);
     const out = this.workspace.alloc(this.shape, this.type);
-    getNativeAddon().sigmoid(this.glm.ctx, out.data, this.data, n);
+    getNativeAddon().sigmoid(this.ops.ctx, out.data, this.data, n);
     return out;
   }
 
@@ -467,15 +467,15 @@ export class GlmTensor extends Tensor {
       // Target 512 scores per gather partition, up to 64 partitions per query
       // and roughly 1024 CTAs overall. Identity selections need no gather work.
       const numSplits = dim <= k ? 1 : Math.min(64, Math.ceil(dim / 512), Math.max(1, Math.floor(1024 / batch)));
-      getNativeAddon().topkFromScores(this.glm.ctx, values.data, indices.data, this.data, 0, hist.data, meta.data, batch, dim, k, numSplits, offset === 0 ? 0 : 1, offset);
+      getNativeAddon().topkFromScores(this.ops.ctx, values.data, indices.data, this.data, 0, hist.data, meta.data, batch, dim, k, numSplits, offset === 0 ? 0 : 1, offset);
     } else {
-      getNativeAddon().topk(this.glm.ctx, values.data, indices.data, this.data, k, dim, batch, offset);
+      getNativeAddon().topk(this.ops.ctx, values.data, indices.data, this.data, k, dim, batch, offset);
     }
     return { values, indices };
   }
 
   indexAdd(indices: Tensor, values: Tensor, nIndices: number, dim: number): void {
-    getNativeAddon().indexAdd(this.glm.ctx, this.data, indices.data, values.data, nIndices, dim);
+    getNativeAddon().indexAdd(this.ops.ctx, this.data, indices.data, values.data, nIndices, dim);
   }
 
   moeRoute(options: MoeRoutingOptions): MoeRoutingResult {
@@ -488,7 +488,7 @@ export class GlmTensor extends Tensor {
     this.validateMoeRoute(options);
     const values = this.workspace.alloc([rows, 8], "BF16");
     const indices = this.workspace.alloc([rows, 8], "I32");
-    getNativeAddon().routeTop8(this.glm.ctx, values.data, indices.data, this.data,
+    getNativeAddon().routeTop8(this.ops.ctx, values.data, indices.data, this.data,
       options.correctionBias.data, rows, options.scalingFactor, options.normalize);
     // Both outputs are ready on the caller's stream; no alternate stream is needed.
     return {
@@ -506,12 +506,12 @@ export class GlmTensor extends Tensor {
   add(other: Tensor, n?: number): Tensor {
     if (this.shape.length === 2 && other.shape.length === 1 && this.shape[1] === other.shape[0]) {
       const out = this.workspace.alloc(this.shape, this.type);
-      getNativeAddon().addBroadcast(this.glm.ctx, out.data, this.data, other.data, this.shape[1], this.shape[0]);
+      getNativeAddon().addBroadcast(this.ops.ctx, out.data, this.data, other.data, this.shape[1], this.shape[0]);
       return out;
     }
     const count = n ?? this.shape.reduce((a, b) => a * b, 1);
     const out = this.workspace.alloc(this.shape, this.type);
-    getNativeAddon().add(this.glm.ctx, out.data, this.data, other.data, count);
+    getNativeAddon().add(this.ops.ctx, out.data, this.data, other.data, count);
     return out;
   }
 
@@ -522,7 +522,7 @@ export class GlmTensor extends Tensor {
     const ptrs = new Array<number>(8).fill(0);
     for (let i = 0; i < N; i++) ptrs[i] = inputs[i].data;
     getNativeAddon().sumPointers(
-      this.glm.ctx,
+      this.ops.ctx,
       ptrs[0], ptrs[1], ptrs[2], ptrs[3],
       ptrs[4], ptrs[5], ptrs[6], ptrs[7],
       output.data, N, numel, dtype, writeback,
@@ -543,7 +543,7 @@ export class GlmTensor extends Tensor {
     const ptrs = new Array<number>(8).fill(0);
     for (let i = 0; i < N; i++) ptrs[i] = peers[i].data;
     getNativeAddon().rmsNormPointers(
-      this.glm.ctx,
+      this.ops.ctx,
       ptrs[0], ptrs[1], ptrs[2], ptrs[3],
       ptrs[4], ptrs[5], ptrs[6], ptrs[7],
       inputA.data, weight.data, out.data, residual.data,
@@ -564,18 +564,18 @@ export class GlmTensor extends Tensor {
   }
 
   scaleInPlace(scale: number, n: number): void {
-    getNativeAddon().scale(this.glm.ctx, this.data, this.data, scale, n);
+    getNativeAddon().scale(this.ops.ctx, this.data, this.data, scale, n);
   }
 
   mul(other: Tensor, n?: number): Tensor {
     if (this.shape.length === 2 && other.shape.length === 1 && this.shape[1] === other.shape[0]) {
       const out = this.workspace.alloc(this.shape, this.type);
-      getNativeAddon().mulBroadcast(this.glm.ctx, out.data, this.data, other.data, this.shape[1], this.shape[0]);
+      getNativeAddon().mulBroadcast(this.ops.ctx, out.data, this.data, other.data, this.shape[1], this.shape[0]);
       return out;
     }
     const count = n ?? this.shape.reduce((a, b) => a * b, 1);
     const out = this.workspace.alloc(this.shape, this.type);
-    getNativeAddon().mul(this.glm.ctx, out.data, this.data, other.data, count);
+    getNativeAddon().mul(this.ops.ctx, out.data, this.data, other.data, count);
     return out;
   }
 
@@ -635,24 +635,24 @@ export class GlmTensor extends Tensor {
     const byteOffset = start * innerElements * elemBytes;
     const newShape = [length, ...this.shape.slice(1)];
     const newAllocSize = this.allocSize - byteOffset;
-    return this.workspace.glm.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this);
+    return this.workspace.ops.wrapTensor(this.workspace, this.data + byteOffset, newAllocSize, newShape, this.type, this.pinned, this);
   }
 
   scatterScalar(indices: Tensor, value: number, k: number): void {
     const outDim = this.shape[1];
     const batch = this.shape[0];
-    getNativeAddon().scatterScalar(this.glm.ctx, this.data, indices.data, value, k, outDim, batch);
+    getNativeAddon().scatterScalar(this.ops.ctx, this.data, indices.data, value, k, outDim, batch);
   }
 
   maskedFill(mask: Tensor, value: number, n: number): void {
-    getNativeAddon().maskedFill(this.glm.ctx, this.data, this.data, mask.data, value, n);
+    getNativeAddon().maskedFill(this.ops.ctx, this.data, this.data, mask.data, value, n);
   }
 
   reduceSum(): Tensor {
     const batch = this.shape[0];
     const dim = this.shape[1];
     const out = this.workspace.alloc([batch], this.type);
-    getNativeAddon().reduceSum(this.glm.ctx, out.data, this.data, batch, dim);
+    getNativeAddon().reduceSum(this.ops.ctx, out.data, this.data, batch, dim);
     return out;
   }
 
@@ -660,14 +660,14 @@ export class GlmTensor extends Tensor {
     const batch = this.shape[0];
     const dim = this.shape[1];
     const out = this.workspace.alloc([batch, dim], this.type);
-    getNativeAddon().rowNormalize(this.glm.ctx, out.data, this.data, scale, batch, dim, normalize);
+    getNativeAddon().rowNormalize(this.ops.ctx, out.data, this.data, scale, batch, dim, normalize);
     return out;
   }
 
   groupMaskMul(groupMask: Tensor, expertsPerGroup: number, nGroup: number): void {
     const batch = this.shape[0];
     const numExperts = this.shape[1];
-    getNativeAddon().groupMaskMul(this.glm.ctx, this.data, groupMask.data, numExperts, expertsPerGroup, nGroup, batch);
+    getNativeAddon().groupMaskMul(this.ops.ctx, this.data, groupMask.data, numExperts, expertsPerGroup, nGroup, batch);
   }
 
   mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
@@ -697,17 +697,17 @@ export class GlmTensor extends Tensor {
         const numExperts = weights.length;
         const wsSize = getNativeAddon().mmaMoeCoopWorkspaceSize(count, N, K, numExperts);
         using wsTensor = this.workspace.allocRaw(wsSize);
-        getNativeAddon().nvfp4MulMatIdGroupedMmaCoop(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
+        getNativeAddon().nvfp4MulMatIdGroupedMmaCoop(this.ops.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
       } else {
-        getNativeAddon().nvfp4MulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K);
+        getNativeAddon().nvfp4MulMatId(this.ops.ctx, out.data, this.data, weightPtrs.data, scalePtrs.data, scale2Ptrs.data, expertIds.data, topK, count, N, K);
       }
     } else if (count > MUL_MAT_ID_GROUPED_THRESHOLD) {
       const numExperts = weights.length;
       const wsSize = getNativeAddon().mmaMoeWorkspaceSize(count, N, K, numExperts);
       using wsTensor = this.workspace.allocRaw(wsSize);
-      getNativeAddon().bf16MulMatIdGroupedMma(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
+      getNativeAddon().bf16MulMatIdGroupedMma(this.ops.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K, numExperts, wsTensor.data);
     } else {
-      getNativeAddon().mulMatId(this.glm.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K);
+      getNativeAddon().mulMatId(this.ops.ctx, out.data, this.data, weightPtrs.data, expertIds.data, topK, count, N, K);
     }
     return out;
   }
@@ -728,11 +728,11 @@ export class GlmTensor extends Tensor {
       inputs.normalizedWeightsStream.streamWaitEvent();
       using scales = inputs.normalizedWeightsStream.result.reshape([count]);
       const out = this.workspace.alloc([count / topK, hs], this.type);
-      getNativeAddon().scatterAddRows(this.glm.ctx, out.data, downOut.data, scales.data, topK, hs, count / topK, 0);
+      getNativeAddon().scatterAddRows(this.ops.ctx, out.data, downOut.data, scales.data, topK, hs, count / topK, 0);
       return out;
     }
     super.swiGluMlpMoe(inputs, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
-    using gateStream = this.glm.withStream(() => this.mulMatId(inputs.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
+    using gateStream = this.ops.withStream(() => this.mulMatId(inputs.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
     using upOut = this.mulMatId(inputs.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
     gateStream.streamWaitEvent();
     using gateOut = gateStream.result;
@@ -744,7 +744,7 @@ export class GlmTensor extends Tensor {
     }
     const out = this.workspace.alloc([count / topK, hs], this.type);
     const ptrs = this.getMoeNvfp4Ptrs(inputs.down, `${pfx}.down_proj`);
-    getNativeAddon().nvfp4MulMatIdReduce(this.glm.ctx, out.data, activated.data,
+    getNativeAddon().nvfp4MulMatIdReduce(this.ops.ctx, out.data, activated.data,
       ptrs.weightPtrs.data, ptrs.scalePtrs.data, ptrs.scale2Ptrs.data,
       topkIndicesFlat.data, scales.data, count / topK);
     return out;
@@ -784,7 +784,7 @@ export class GlmTensor extends Tensor {
     super.swiGluMlpMoe(weights, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
 
     if (count <= NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD || weights.gate[0].type !== "U8") {
-      using gateOutStream = this.workspace.glm.withStream(() => this.mulMatId(weights.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
+      using gateOutStream = this.workspace.ops.withStream(() => this.mulMatId(weights.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
       using upOut = this.mulMatId(weights.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
       gateOutStream.streamWaitEvent();
       using gateOut = gateOutStream.result;
@@ -793,7 +793,7 @@ export class GlmTensor extends Tensor {
     }
 
     const numExperts = weights.gate.length;
-    const ctx = this.glm.ctx;
+    const ctx = this.ops.ctx;
     const gatePtrs = this.getMoeNvfp4Ptrs(weights.gate, `${pfx}.gate_proj`);
     const upPtrs = this.getMoeNvfp4Ptrs(weights.up, `${pfx}.up_proj`);
     const downPtrs = this.getMoeNvfp4Ptrs(weights.down, `${pfx}.down_proj`);
@@ -804,7 +804,7 @@ export class GlmTensor extends Tensor {
 
     const gemmWsSize = getNativeAddon().mmaMoeCoopGemmWorkspaceSize(count, moeIntermediate);
 
-    using gateStream = this.workspace.glm.withStream(() => {
+    using gateStream = this.workspace.ops.withStream(() => {
       using gemmWs = this.workspace.allocRaw(gemmWsSize);
       const gateOut = this.workspace.alloc([count, moeIntermediate], this.type);
       getNativeAddon().mmaMoeCoopGemm(ctx, gatePtrs.weightPtrs.data, gatePtrs.scalePtrs.data, gatePtrs.scale2Ptrs.data,
@@ -845,7 +845,7 @@ export class GlmOps implements DeviceOps {
     const pagedKV = state.cache.getPagedKV();
     if (!pagedKV.contextParallel) return 0;
     // Key the resulting launch decision, not the snapshot bucket used to plan it.
-    const localTopkBound = Math.min(topk, Math.ceil(state.paddedKvLen / pagedKV.glm.worldSize));
+    const localTopkBound = Math.min(topk, Math.ceil(state.paddedKvLen / pagedKV.ops.worldSize));
     return sparseMlaChunksPerBlock(numQueries, numHeads, localTopkBound, this.smCount);
   }
   private static readonly GREEDY_ALLOCATION_GUARD_BYTES = 4;
@@ -1011,7 +1011,7 @@ export class GlmOps implements DeviceOps {
   prefetchL2(tensors: readonly Tensor[]): void {
     if (tensors.length > 8) throw new Error("prefetchL2 supports at most eight tensors");
     for (const tensor of tensors) {
-      if (tensor.pinned || tensor.workspace.glm !== this) {
+      if (tensor.pinned || tensor.workspace.ops !== this) {
         throw new Error("prefetchL2 requires local device tensors");
       }
     }

@@ -53,10 +53,10 @@ async function main() {
   const maxSeqLen = parseInt(opt("--max-seq-len", "8192"), 10);
 
   const gpuDevices = gpus.map(id => new GlmOps(id, undefined, arena || undefined));
-  const glm: DeviceOps = gpuDevices.length > 1 ? new ParallelOps(gpuDevices) : gpuDevices[0];
-  const model = await Glm51Model.fromPretrained(glm, modelDir, false, false);
+  const ops: DeviceOps = gpuDevices.length > 1 ? new ParallelOps(gpuDevices) : gpuDevices[0];
+  const model = await Glm51Model.fromPretrained(ops, modelDir, false, false);
   const cache = model.createChatCache(parseInt(opt("--max-pages", "8192"), 10), 1, maxSeqLen);
-  const ws = new ExecutionWorkspace(glm, 1, maxSeqLen);
+  const ws = new ExecutionWorkspace(ops, 1, maxSeqLen);
 
   const tokenizer = model.tokenizer;
   const effort = process.env.GLM_REASONING_EFFORT;
@@ -73,7 +73,7 @@ async function main() {
     const graphState = { graphExec: null as number | null, warmupRemaining: 3 };
     const ids: number[] = [];
     let sawEos = false;
-    for await (const t of generateStream(model, ws, glm, cache, inputIds, maxNew, model.eosIds, undefined, graphState)) {
+    for await (const t of generateStream(model, ws, ops, cache, inputIds, maxNew, model.eosIds, undefined, graphState)) {
       ids.push(t);
       if (model.eosIds.has(t)) { sawEos = true; break; }
     }
@@ -86,9 +86,9 @@ async function main() {
   }
   console.log(`\nglm.js greedy ${process.env.GLM_DENSE_ATTN === "1" ? "DENSE " : "SPARSE"}: ${bad}/${n} prompts non-terminating or looping`);
 
-  glm.synchronize();
+  ops.synchronize();
   cache.free(); ws.free(); model.free();
-  if (glm instanceof ParallelOps) glm.free();
+  if (ops instanceof ParallelOps) ops.free();
   for (const d of gpuDevices) d.free();
 }
 

@@ -42,17 +42,17 @@ export class Qwen3Model extends ChatModel {
   cfg: Qwen3Config;
   invFreq: Tensor;
 
-  private constructor(glm: DeviceOps, config: Qwen3Config) {
-    super(glm);
+  private constructor(ops: DeviceOps, config: Qwen3Config) {
+    super(ops);
     this.cfg = config;
     this.eosIds = new Set(config.eosTokenIds);
     this.invFreq = this.initInvFreq(config.headDim, config.ropeTheta);
   }
 
-  static async fromPretrained(glm: DeviceOps, repoIdOrDir: string): Promise<Qwen3Model> {
+  static async fromPretrained(ops: DeviceOps, repoIdOrDir: string): Promise<Qwen3Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
-    const model = new Qwen3Model(glm, config);
+    const model = new Qwen3Model(ops, config);
     await model.fromPretrained(modelDir, QWEN3_REPO);
     return model;
   }
@@ -99,7 +99,7 @@ export class Qwen3Model extends ChatModel {
   }
 
   createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, _pageSize = 16): ChatCache {
-    return new PagedKVCache(this.glm, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, maxPages, maxBatch);
+    return new PagedKVCache(this.ops, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, maxPages, maxBatch);
   }
 
   private mlp(normed: Tensor, BS: number, pfx: string): Tensor {
@@ -123,7 +123,7 @@ export class Qwen3Model extends ChatModel {
     const embedTable = this.tensors.get("model.embed_tokens.weight")!;
     using residual = new UsingHolder(state.embedding(embedTable));
 
-    using rotaryEmbedding = this.glm.withStream(() => state.rotaryEmbedding(this.invFreq));
+    using rotaryEmbedding = this.ops.withStream(() => state.rotaryEmbedding(this.invFreq));
     using cos = rotaryEmbedding.result.cos;
     using sin = rotaryEmbedding.result.sin;
 
@@ -132,10 +132,10 @@ export class Qwen3Model extends ChatModel {
     for (let i = 0; i < cfg.numHiddenLayers; i++) {
       const pfx = `model.layers.${i}`;
 
-      using vStream = this.glm.withStream(() => normed.value.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!));
+      using vStream = this.ops.withStream(() => normed.value.linear(this.tensors.get(`${pfx}.self_attn.v_proj.weight`)!));
       using vBuf = vStream.result;
 
-      using kStream = this.glm.withStream(() => {
+      using kStream = this.ops.withStream(() => {
         using kBuf = normed.value.linear(this.tensors.get(`${pfx}.self_attn.k_proj.weight`)!);
 
         if (!i) {

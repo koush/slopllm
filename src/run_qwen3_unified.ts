@@ -42,7 +42,7 @@ class ExecutionResources implements Disposable {
   private disposed = false;
 
   constructor(
-    private readonly glm: DeviceOps,
+    private readonly ops: DeviceOps,
     private readonly gpuDevices: readonly DeviceOps[],
   ) { }
 
@@ -59,11 +59,11 @@ class ExecutionResources implements Disposable {
       }
     };
 
-    dispose(() => this.glm.synchronize());
+    dispose(() => this.ops.synchronize());
     if (this.cache) dispose(() => this.cache![Symbol.dispose]());
     if (this.ws) dispose(() => this.ws![Symbol.dispose]());
     if (this.model) dispose(() => this.model![Symbol.dispose]());
-    if (this.glm instanceof ParallelOps) dispose(() => this.glm[Symbol.dispose]());
+    if (this.ops instanceof ParallelOps) dispose(() => this.ops[Symbol.dispose]());
     for (const device of this.gpuDevices) dispose(() => device[Symbol.dispose]());
 
     if (cleanupError) throw cleanupError;
@@ -167,7 +167,7 @@ export interface DecodeTiming {
 }
 
 async function* generateMtpStream(
-  model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, ops: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   numDraftTokens: number, graphState?: GraphState, timing?: DecodeTiming,
 ): AsyncGenerator<number> {
@@ -175,7 +175,7 @@ async function* generateMtpStream(
     throw new Error("The selected model does not support MTP decoding");
   }
 
-  using captureManager = new CaptureManager(glm);
+  using captureManager = new CaptureManager(ops);
   captureManager.disabled = graphState === undefined;
   const mtpStats = new MtpStats(numDraftTokens);
   if (timing) {
@@ -246,7 +246,7 @@ async function* generateMtpStream(
 }
 
 export async function* generateStream(
-  model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, ops: DeviceOps, cache: ChatCache,
   inputIds: number[], maxNewTokens: number, eosIds: Set<number>,
   sampling: SamplingParams | undefined, graphState?: GraphState,
   timing?: DecodeTiming, numDraftTokens?: number,
@@ -259,14 +259,14 @@ export async function* generateStream(
     if (sampling) {
       throw new Error("Plan-based MTP decoding currently supports greedy sampling only");
     }
-    yield* generateMtpStream(model, ws, glm, cache, inputIds, maxNewTokens, eosIds, numDraftTokens!, graphState, timing);
+    yield* generateMtpStream(model, ws, ops, cache, inputIds, maxNewTokens, eosIds, numDraftTokens!, graphState, timing);
     return;
   }
 
-  using samplingWorkspace = sampling ? new SamplingWorkspace(glm, 1, model.cfg.vocabSize, sampling!.repetitionPenaltyWindow) : undefined;
+  using samplingWorkspace = sampling ? new SamplingWorkspace(ops, 1, model.cfg.vocabSize, sampling!.repetitionPenaltyWindow) : undefined;
   if (samplingWorkspace) samplingWorkspace.updateSampler([sampling!], [inputIds]);
 
-  using captureManager = new CaptureManager(glm);
+  using captureManager = new CaptureManager(ops);
   let currentToken: number;
 
   captureManager.disabled = graphState === undefined;
@@ -367,7 +367,7 @@ export async function generateBatchTokens(
 // --- Interactive / single-prompt modes ---
 
 async function interactiveChat(
-  model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, ops: DeviceOps, cache: ChatCache,
   args: CliArgs, graphState: GraphState | undefined,
 ): Promise<void> {
   const tokenizer = model.tokenizer;
@@ -417,7 +417,7 @@ async function interactiveChat(
       const generatedIds: number[] = [];
       const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-      for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp)) {
+      for await (const tokenId of generateStream(model, ws, ops, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp)) {
         generatedIds.push(tokenId);
         tokCount++;
         const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -434,13 +434,13 @@ async function interactiveChat(
       messages.push({ role: "assistant", content: responseText });
     }
   } finally {
-    if (graphState?.graphExec !== null && graphState?.graphExec !== undefined) glm.graphExecDestroy(graphState.graphExec);
+    if (graphState?.graphExec !== null && graphState?.graphExec !== undefined) ops.graphExecDestroy(graphState.graphExec);
     rl.close();
   }
 }
 
 async function singlePrompt(
-  model: ChatModel, ws: ExecutionWorkspace, glm: DeviceOps, cache: ChatCache,
+  model: ChatModel, ws: ExecutionWorkspace, ops: DeviceOps, cache: ChatCache,
   args: CliArgs, graphState: GraphState | undefined,
 ): Promise<void> {
   const tokenizer = model.tokenizer;
@@ -458,7 +458,7 @@ async function singlePrompt(
   const generatedIds: number[] = [];
   const timing: DecodeTiming = { planMs: 0, execMs: 0, idleMs: 0, warmupSteps: 0, graphSteps: 0, warmupTokPerSec: 0 };
 
-  for await (const tokenId of generateStream(model, ws, glm, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp)) {
+  for await (const tokenId of generateStream(model, ws, ops, cache, inputIds, args.maxNewTokens, eosIds, sp, graphState, timing, args.mtp)) {
     generatedIds.push(tokenId);
     tokCount++;
     const chunk = tokenizer.decode([tokenId], { skip_special_tokens: false });
@@ -471,7 +471,7 @@ async function singlePrompt(
   console.log(`timing: plan=${timing.planMs.toFixed(1)}ms exec=${timing.execMs.toFixed(1)}ms idle=${timing.idleMs.toFixed(1)}ms (warmup=${timing.warmupSteps} graph=${timing.graphSteps}) decode=${timing.warmupTokPerSec.toFixed(1)} tok/s`);
   if (timing.mtpStats) console.log(timing.mtpStats.log());
 
-  if (graphState?.graphExec !== null && graphState?.graphExec !== undefined) glm.graphExecDestroy(graphState.graphExec);
+  if (graphState?.graphExec !== null && graphState?.graphExec !== undefined) ops.graphExecDestroy(graphState.graphExec);
 }
 
 // --- Batch mode ---
@@ -573,17 +573,17 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
 
-  const { glm, gpuDevices } = createDeviceOps(args);
-  using resources = new ExecutionResources(glm, gpuDevices);
+  const { ops, gpuDevices } = createDeviceOps(args);
+  using resources = new ExecutionResources(ops, gpuDevices);
 
   const gpuLabel = args.gpus.join(",");
 
-  const model = await loadModel(glm, args, modelDir);
+  const model = await loadModel(ops, args, modelDir);
   resources.model = model;
 
   const cache = model.createChatCache(args.maxPages, args.maxBatch, args.maxSeqLen);
   resources.cache = cache;
-  const ws = new ExecutionWorkspace(glm, args.maxBatch, args.maxSeqLen);
+  const ws = new ExecutionWorkspace(ops, args.maxBatch, args.maxSeqLen);
   resources.ws = ws;
 
   const sp = makeSamplingParams(args);
@@ -605,9 +605,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     const graphState = args.noCudaGraph ? undefined : { graphExec: null as number | null, warmupRemaining: args.warmupSteps };
 
     if (args.prompt) {
-      await singlePrompt(model, ws, glm, cache, args, graphState);
+      await singlePrompt(model, ws, ops, cache, args, graphState);
     } else {
-      await interactiveChat(model, ws, glm, cache, args, graphState);
+      await interactiveChat(model, ws, ops, cache, args, graphState);
     }
   }
 

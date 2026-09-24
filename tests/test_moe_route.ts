@@ -16,7 +16,7 @@ function upload(tensor: Tensor, bias = false) {
 function read(tensor: Tensor) {
   const buffer = Buffer.alloc(tensor.bytes);
   tensor.d2h(buffer);
-  tensor.workspace.glm.synchronize();
+  tensor.workspace.ops.synchronize();
   return buffer;
 }
 
@@ -33,8 +33,8 @@ for (const { rows, experts, topK, biased, disabled } of [
 ]) {
   for (const normalize of [false, true]) {
     it(`moeRoute exact default/backend match rows=${rows} experts=${experts} k=${topK} bias=${biased} disabled=${disabled} normalize=${normalize}`, () => {
-      const glm = new GlmOps(Number(process.env.GLM_GPU ?? 0));
-      const ws = new WorkspaceBase(glm);
+      const ops = new GlmOps(Number(process.env.GLM_GPU ?? 0));
+      const ws = new WorkspaceBase(ops);
       const native = getNativeAddon();
       const original = native.routeTop8;
       const previousEnv = process.env.GLM_ROUTING_FUSION;
@@ -73,9 +73,9 @@ for (const { rows, experts, topK, biased, disabled } of [
           assert.equal(actualIndices.disposed, false);
           assert.equal(actualWeights.disposed, false);
         }
-        glm.synchronize();
+        ops.synchronize();
         assert.equal(ws.tracked.size, 0);
-        assert.equal(glm.normalPriorityStreams.length + glm.highPriorityStreams.length, 63);
+        assert.equal(ops.normalPriorityStreams.length + ops.highPriorityStreams.length, 63);
       } finally {
         native.routeTop8 = original;
         if (previousEnv === undefined) {
@@ -84,15 +84,15 @@ for (const { rows, experts, topK, biased, disabled } of [
           process.env.GLM_ROUTING_FUSION = previousEnv;
         }
         ws.free();
-        glm.free();
+        ops.free();
       }
     });
   }
 }
 
 it("MetaTensor inherits generic routing and releases all outputs", () => {
-  const glm = new MetaOps();
-  const ws = new WorkspaceBase(glm);
+  const ops = new MetaOps();
+  const ws = new WorkspaceBase(ops);
   try {
     {
       using logits = ws.alloc([7, 64], "BF16");
@@ -108,15 +108,15 @@ it("MetaTensor inherits generic routing and releases all outputs", () => {
     assert.equal(ws.tracked.size, 0);
   } finally {
     ws.free();
-    glm[Symbol.dispose]();
+    ops[Symbol.dispose]();
   }
 });
 
 for (const rows of [4, 33]) {
   it(`parallel moeRoute delegates per shard and owns independent stream results (rows=${rows})`, () => {
     const devices = [new GlmOps(0), new GlmOps(1)];
-    const glm = new ParallelOps(devices);
-    const ws = new WorkspaceBase(glm);
+    const ops = new ParallelOps(devices);
+    const ws = new WorkspaceBase(ops);
     try {
       {
         // Deliberately make per-device stream IDs differ for the fallback.
@@ -143,14 +143,14 @@ for (const rows of [4, 33]) {
           assert.deepEqual(read(weights.shards[rank]), read(expected.normalizedWeightsStream.result));
         }
       }
-      glm.synchronize();
+      ops.synchronize();
       assert.equal(ws.tracked.size, 0);
       for (const device of devices) {
         assert.equal(device.normalPriorityStreams.length + device.highPriorityStreams.length, 63);
       }
     } finally {
       ws.free();
-      glm.free();
+      ops.free();
       for (const device of devices) {
         device.free();
       }

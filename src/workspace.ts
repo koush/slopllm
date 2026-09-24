@@ -5,7 +5,7 @@ import { collectTensors, type TensorTree } from "./tensor-tree";
 import { Heap, type HeapKey } from "./heap";
 
 export class WorkspaceBase implements Disposable {
-  readonly glm: DeviceOps;
+  readonly ops: DeviceOps;
   tensors = new Map<string, Tensor>();
   tracked = new Set<Tensor>();
   staged = new Set<Tensor>();
@@ -17,10 +17,10 @@ export class WorkspaceBase implements Disposable {
   tracking: Disposable & { [Symbol.dispose](): void } | null = null;
   private readonly synchronizeRef: WeakRef<WorkspaceBase>;
 
-  constructor(glm: DeviceOps) {
-    this.glm = glm;
+  constructor(ops: DeviceOps) {
+    this.ops = ops;
     this.synchronizeRef = new WeakRef(this);
-    this.glm.synchronizeListeners.push(this.synchronizeRef);
+    this.ops.synchronizeListeners.push(this.synchronizeRef);
   }
 
   synchronizeComplete(): void {
@@ -127,7 +127,7 @@ export class WorkspaceBase implements Disposable {
       if (lineage.length === 0) throw new Error("Allocation lineage must not be empty");
       return [...new Set(lineage)];
     }
-    const streams = [...this.glm.activeStreams].reverse();
+    const streams = [...this.ops.activeStreams].reverse();
     return [...new Set<HeapKey>([...streams, undefined])];
   }
 
@@ -259,9 +259,9 @@ export class WorkspaceBase implements Disposable {
         this.disposedHost.delete(best);
         const data = best.data;
         best.detachData();
-        tensor = this.glm.wrapTensor(this, data, best.allocSize, shape, type, true, undefined, recycleKey);
+        tensor = this.ops.wrapTensor(this, data, best.allocSize, shape, type, true, undefined, recycleKey);
       } else {
-        tensor = this.glm.newTensor(this, shape, type, true, name, parallelism, recycleKey);
+        tensor = this.ops.newTensor(this, shape, type, true, name, parallelism, recycleKey);
       }
     } else {
       let allocation;
@@ -272,12 +272,12 @@ export class WorkspaceBase implements Disposable {
         }
       }
       if (allocation) {
-        tensor = this.glm.wrapTensor(this, allocation.ptr, allocation.length, shape, type, false, undefined, recycleKey);
+        tensor = this.ops.wrapTensor(this, allocation.ptr, allocation.length, shape, type, false, undefined, recycleKey);
       } else {
         if (this.allocLogger) {
           console.warn(`Allocating new tensor ${name ?? "<unnamed>"} of size ${bytes} bytes (${shape.join("x")} ${type}${parallelism ? ` ${parallelism}` : ""})`);
         }
-        tensor = this.glm.newTensor(this, shape, type, false, name, parallelism, recycleKey);
+        tensor = this.ops.newTensor(this, shape, type, false, name, parallelism, recycleKey);
       }
     }
 
@@ -290,9 +290,9 @@ export class WorkspaceBase implements Disposable {
   }
 
   free(): void {
-    const synchronizeIndex = this.glm.synchronizeListeners.indexOf(this.synchronizeRef);
+    const synchronizeIndex = this.ops.synchronizeListeners.indexOf(this.synchronizeRef);
     if (synchronizeIndex !== -1) {
-      this.glm.synchronizeListeners.splice(synchronizeIndex, 1);
+      this.ops.synchronizeListeners.splice(synchronizeIndex, 1);
     }
     for (const tensor of this.tensors.values()) {
       tensor.free();

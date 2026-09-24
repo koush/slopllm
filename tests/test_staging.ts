@@ -11,26 +11,26 @@ const PROMPT1 = [151643, 151644, 151645, 1, 2, 3];
 const PROMPT2 = [151643, 151644, 1, 2, 3, 4, 5];
 
 describe("PagedKVCache staging", () => {
-  let glm: GlmOps;
+  let ops: GlmOps;
   let model: Qwen3Model;
   let ws: ExecutionWorkspace;
 
   before(async () => {
     const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
-    glm = new GlmOps(deviceId);
-    model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
-    ws = new ExecutionWorkspace(glm, 4, 4096);
+    ops = new GlmOps(deviceId);
+    model = await Qwen3Model.fromPretrained(ops, QWEN3_REPO);
+    ws = new ExecutionWorkspace(ops, 4, 4096);
   });
 
   after(() => {
     ws[Symbol.dispose]();
     model.free();
-    glm.free();
+    ops.free();
   });
 
   function makePagedKV(maxBatch = 4, maxPages = 128): PagedKVCache {
     const cfg = model.cfg;
-    return new PagedKVCache(glm, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, maxPages, maxBatch);
+    return new PagedKVCache(ops, cfg.numKeyValueHeads, cfg.headDim, cfg.numHiddenLayers, maxPages, maxBatch);
   }
 
   it("stageSequence moves sequence to staging and removes from sequences", () => {
