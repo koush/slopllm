@@ -2,7 +2,7 @@ import { CaptureManager } from "./capture-manager";
 import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MlaQuery, type StreamResult } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
-import { bf16BytesToF32, f32ToBf16Bytes, GlmOps, GlmTensor, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM, NCCL_UINT8 } from "./glm_ops";
+import { bf16BytesToF32, f32ToBf16Bytes, GlmOps, GlmTensor, INDEXER_FP8_MMA_DISABLED, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM, NCCL_UINT8 } from "./glm_ops";
 import type { HeapKey } from "./heap";
 import { getNativeAddon } from "./native-addon";
 import { SafeTensorFile } from "./safetensors";
@@ -4050,12 +4050,19 @@ export class ParallelOps implements DeviceOps {
     return { values: mergedValues.narrow(0, totalQ), indices: finalIndices.narrow(0, totalQ) };
   }
 
-  indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { values: Tensor, indices: Tensor } {
+  indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, _cpWorldSize?: number, _cpRank?: number, _globalLastPageLen?: Tensor, _kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
     const totalQ = idxQ.shape[0];
     using pQ = idxQ.parallelism === TensorParallelism.Replicated ? idxQ.viewClone() as ParallelTensor : this.cast(idxQ).allGather(idxQ.workspace);
+    // Precomputed FP8 q8/effectiveWeights pair from indexerQuantizeQ. Row-sharded
+    // outputs are gathered the same way as idxQ above; the pair stays consistent
+    // since both use one Row split (heads for q8, weight columns for ew).
+    using pEw = effectiveWeights === undefined ? undefined
+      : effectiveWeights.parallelism === TensorParallelism.Replicated
+        ? effectiveWeights.viewClone() as ParallelTensor
+        : this.cast(effectiveWeights).allGather(effectiveWeights.workspace);
     using pKData = this.cast(kData).viewClone() as ParallelTensor;
     using pKScaleData = this.cast(kScaleData).viewClone() as ParallelTensor;
-    const pWeights = this.cast(weights);
+    const pWeights = weights === undefined ? undefined : this.cast(weights);
     const pPageIndices = this.cast(pageIndices);
     const pIndptr = this.cast(indptr);
     const kIsRow = pKData.parallelism === TensorParallelism.Row;
@@ -4076,13 +4083,13 @@ export class ParallelOps implements DeviceOps {
     const kDataReplicated = pKData.parallelism === TensorParallelism.Replicated;
     const canShard = !decode && W > 1 && totalQ >= W && kDataReplicated
       && pQ.parallelism === TensorParallelism.Replicated
-      && pWeights.parallelism === TensorParallelism.Replicated;
+      && (pWeights === undefined || pWeights.parallelism === TensorParallelism.Replicated);
 
     if (!canShard) {
       const topkIdxShards: Tensor[] = [];
       const topkValShards: Tensor[] = [];
       for (let i = 0; i < W; i++) {
-        const r = this.devices[i].indexerTopk(state, pQ.shards[i], pKData.shards[i], pKScaleData.shards[i], pWeights.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, topk, decode, qGlobalStart ?? 0, pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i], kIsRow ? W : 0, kIsRow ? i : 0, pGlobalLastPageLen.shards[i], pKvTokenIndptr?.shards[i]);
+        const r = this.devices[i].indexerTopk(state, pQ.shards[i], pKData.shards[i], pKScaleData.shards[i], pWeights?.shards[i], pPageIndices.shards[i], pIndptr.shards[i], pLastPageLen.shards[i], pQoIndptr.shards[i], scale, topk, decode, qGlobalStart ?? 0, pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i], kIsRow ? W : 0, kIsRow ? i : 0, pGlobalLastPageLen.shards[i], pKvTokenIndptr?.shards[i], pEw?.shards[i]);
         topkIdxShards.push(r.indices);
         topkValShards.push(r.values);
       }
@@ -4140,7 +4147,8 @@ export class ParallelOps implements DeviceOps {
         continue;
       }
       using localQueries = pQ.shards[i].narrow(offset, rows);
-      using localWeights = pWeights.shards[i].narrow(offset, rows);
+      using localWeights = pWeights?.shards[i].narrow(offset, rows);
+      using localEw = pEw?.shards[i].narrow(offset, rows);
       const qStart = (qGlobalStart ?? 0) + offset;
       const r = this.devices[i].indexerTopk(
         state,
@@ -4151,6 +4159,7 @@ export class ParallelOps implements DeviceOps {
         decode, qStart,
         pCustomMask?.shards[i], pMaskIndptr?.shards[i], pMaskKvLen?.shards[i],
         kIsRow ? W : 0, kIsRow ? i : 0, pGlobalLastPageLen.shards[i], pKvTokenIndptr?.shards[i],
+        localEw,
       );
       if (rows === localQ) {
         topkIdxShards.push(r.indices);
@@ -4187,6 +4196,56 @@ export class ParallelOps implements DeviceOps {
     for (let i = 0; i < this.worldSize; i++) {
       this.devices[i].sortTopkByIndex(pIndices.shards[i], pValues.shards[i], batch, topk);
     }
+  }
+
+  // Row-sharded indexer Q quantization: each rank quantizes its head slice in
+  // place against the Replicated weights (or its Row weight shard) and the
+  // outputs stay sharded — deliberately no gather, matching the fused paths'
+  // head-split GEMM output. Global eligibility follows the FP8 MMA shape
+  // (32 global heads); otherwise returns the identity fallback with q8 still
+  // BF16 so indexerTopk behaves exactly as the fused scorer would.
+  indexerQuantizeQ(q: Tensor, weights: Tensor, scale: number): { q8: Tensor, effectiveWeights: Tensor | undefined } {
+    const IDX_QUANT_HEAD_DIM = 128;
+    const pQ = this.cast(q);
+    const pWeights = this.cast(weights);
+    if (pQ.parallelism !== TensorParallelism.Replicated && pQ.parallelism !== TensorParallelism.Row) {
+      throw new Error(`indexerQuantizeQ: unsupported q parallelism ${pQ.parallelism}`);
+    }
+    if (pWeights.parallelism !== TensorParallelism.Replicated && pWeights.parallelism !== TensorParallelism.Row) {
+      throw new Error(`indexerQuantizeQ: unsupported weights parallelism ${pWeights.parallelism}`);
+    }
+    if (pQ.parallelism === TensorParallelism.Replicated && pWeights.parallelism === TensorParallelism.Row) {
+      throw new Error("indexerQuantizeQ: Replicated q with Row weights would need a gather");
+    }
+    const rows = pQ.shape[0];
+    const headDim = pQ.shape.length === 3 ? pQ.shape[2] : IDX_QUANT_HEAD_DIM;
+    const globalNHeads = pQ.shape.length === 3 ? pQ.shape[1] : pQ.shape[1] / IDX_QUANT_HEAD_DIM;
+    // Global fallback: the FP8 score path exists only for the full 32-head
+    // query. Shard-level dispatch ({32,16,8,4}) covers head splits of 32.
+    if (headDim !== IDX_QUANT_HEAD_DIM || globalNHeads !== 32 || INDEXER_FP8_MMA_DISABLED) {
+      return { q8: pQ.viewClone(), effectiveWeights: undefined };
+    }
+    const shardNHeads = pQ.shards[0].shape.length === 3
+      ? pQ.shards[0].shape[1]
+      : pQ.shards[0].shape[1] / IDX_QUANT_HEAD_DIM;
+    const q8Shards: Tensor[] = [];
+    const ewShards: Tensor[] = [];
+    for (let i = 0; i < this.worldSize; i++) {
+      const weightHeadOffset = pQ.parallelism === TensorParallelism.Row
+        && pWeights.parallelism === TensorParallelism.Replicated
+        ? i * shardNHeads
+        : 0;
+      const r = this.devices[i].indexerQuantizeQ(pQ.shards[i], pWeights.shards[i], scale, weightHeadOffset);
+      q8Shards.push(r.q8!);
+      ewShards.push(r.effectiveWeights!);
+    }
+    using q8 = this.wrapShards(pQ.workspace, q8Shards, [rows, globalNHeads, IDX_QUANT_HEAD_DIM], "U8", pQ.parallelism);
+    using effectiveWeights = this.wrapShards(pQ.workspace, ewShards, [rows, globalNHeads], "F32", pQ.parallelism);
+    const gathered = this.allGatherMultiple([q8, effectiveWeights], q.workspace);
+    return {
+      q8: gathered[0],
+      effectiveWeights: gathered[1],
+    };
   }
 
   topkToSlots(state: ExecutionState, sourceTopkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, _cpWorldSize?: number, _cpRank?: number): { layer: SlotSet, group: SlotSet } {

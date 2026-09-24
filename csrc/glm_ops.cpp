@@ -532,6 +532,9 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     const int32_t* kv_token_indptr = info.Length() > 32
         ? reinterpret_cast<const int32_t*>((uintptr_t)info[32].As<Napi::Number>().Int64Value())
         : nullptr;
+    const float* precomputed_ew = info.Length() > 33 && info[33].IsNumber() && info[33].As<Napi::Number>().Int64Value() != 0
+        ? reinterpret_cast<const float*>((uintptr_t)info[33].As<Napi::Number>().Int64Value())
+        : nullptr;
     glm_indexer_score_topk_prefill(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<int32_t*>(out_idx_ptr),
@@ -552,7 +555,7 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(coarseHist_ptr),
         reinterpret_cast<int32_t*>(fineHist_ptr),
         reinterpret_cast<int32_t*>(meta_ptr),
-        queryTiles, cpWorldSize, cpRank, global_last_page_len, kv_token_indptr);
+        queryTiles, cpWorldSize, cpRank, global_last_page_len, kv_token_indptr, precomputed_ew);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("indexerScoreTopkPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -598,8 +601,11 @@ static Napi::Value IndexerScoreTopkV2(const Napi::CallbackInfo& info) {
         info[28].As<Napi::Number>().Int32Value(),
         info[29].As<Napi::Number>().Int32Value(),
         reinterpret_cast<const int32_t*>((uintptr_t)info[30].As<Napi::Number>().Int64Value()),
-        info.Length() > 31
+        info.Length() > 31 && info[31].IsNumber()
             ? reinterpret_cast<const int32_t*>((uintptr_t)info[31].As<Napi::Number>().Int64Value())
+            : nullptr,
+        info.Length() > 32 && info[32].IsNumber() && info[32].As<Napi::Number>().Int64Value() != 0
+            ? reinterpret_cast<const float*>((uintptr_t)info[32].As<Napi::Number>().Int64Value())
             : nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -991,6 +997,30 @@ static Napi::Value TopkFromScores(const Napi::CallbackInfo& info) {
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("topkFromScores failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value IndexerQuantizeQ(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 10) {
+        Napi::TypeError::New(env, "Expected (ctx, outQ8, outEw, q, weights, nHeads, weightsStride, weightsOffset, totalQ, scale)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_indexer_quantize_q(
+        reinterpret_cast<GlmCtx*>((uintptr_t)info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<uint8_t*>((uintptr_t)info[1].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<float*>((uintptr_t)info[2].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>((uintptr_t)info[3].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>((uintptr_t)info[4].As<Napi::Number>().Int64Value()),
+        info[5].As<Napi::Number>().Int32Value(),
+        info[6].As<Napi::Number>().Int32Value(),
+        info[7].As<Napi::Number>().Int32Value(),
+        info[8].As<Napi::Number>().Int32Value(),
+        info[9].As<Napi::Number>().FloatValue());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("indexerQuantizeQ failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }
     return env.Undefined();
 }
@@ -3993,6 +4023,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "routeTop8"), Napi::Function::New(env, RouteTop8));
     exports.Set(Napi::String::New(env, "topkFromScores"), Napi::Function::New(env, TopkFromScores));
     exports.Set(Napi::String::New(env, "sortTopkByIndex"), Napi::Function::New(env, SortTopkByIndex));
+    exports.Set(Napi::String::New(env, "indexerQuantizeQ"), Napi::Function::New(env, IndexerQuantizeQ));
     exports.Set(Napi::String::New(env, "bmm"), Napi::Function::New(env, Bmm));
     exports.Set(Napi::String::New(env, "scale"), Napi::Function::New(env, Scale));
     exports.Set(Napi::String::New(env, "sumPointers"), Napi::Function::New(env, SumPointers));

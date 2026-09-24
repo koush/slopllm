@@ -1227,18 +1227,25 @@ __device__ __forceinline__ Acc mma(uint32_t a0, uint32_t a1, uint32_t a2,
     return d;
 }
 
+// NH heads per call: 32 for the replicated/standalone path, 32/worldSize for
+// Row-sharded quantization. 8 lanes per head, 4 heads per warp. weightsOffset
+// shifts into a Replicated [rows, globalNHeads] weight row so a Row-sharded
+// caller reads its contiguous head slice in place (no gather).
+template <int NH>
 __global__ void quantize_q_kernel(const __nv_bfloat16* __restrict__ q,
                                   const __nv_bfloat16* __restrict__ weights,
+                                  int weightsStride, int weightsOffset,
                                   uint8_t* __restrict__ q8Data, int q8Stride,
-                                  float* __restrict__ effectiveWeights, int weightStride,
+                                  float* __restrict__ effectiveWeights, int ewStride,
                                   float scale) {
+    static_assert(NH % 4 == 0, "4 head groups per warp");
     const int qi = blockIdx.x;
     const int tid = threadIdx.x;
     const int head = tid >> 3;
     const int lane = tid & 7;
     uint8_t* q8 = q8Data + (size_t)qi * q8Stride;
-    float* ew = effectiveWeights + (size_t)qi * weightStride;
-    const __nv_bfloat16* src = q + (size_t)qi * Q_BYTES + head * HD;
+    float* ew = effectiveWeights + (size_t)qi * ewStride;
+    const __nv_bfloat16* src = q + (size_t)qi * (NH * HD) + head * HD;
 
     float vmax = 0.f;
 #pragma unroll
@@ -1249,7 +1256,7 @@ __global__ void quantize_q_kernel(const __nv_bfloat16* __restrict__ q,
         vmax = fmaxf(vmax, __shfl_down_sync(0xffffffffu, vmax, off, 8));
     if (lane == 0) {
         const float qs = indexer_ue8m0_scale(vmax);
-        ew[head] = __bfloat162float(weights[(size_t)qi * NHEADS + head]) * qs * scale;
+        ew[head] = __bfloat162float(weights[(size_t)qi * weightsStride + weightsOffset + head]) * qs * scale;
     }
     __syncwarp();
     const float inv = 1.f / __shfl_sync(0xffffffffu, lane == 0 ? indexer_ue8m0_scale(vmax) : 0.f,
@@ -1402,7 +1409,8 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int32_t* hist, int32_t* meta,
     int maxKv, int num_splits, int cpWorldSize, int cpRank,
-    const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr) {
+    const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr,
+    const float* precomputed_ew) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     dim3 grid(num_splits, totalQ);
@@ -1414,14 +1422,38 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     // Dispatch the mask-free variant when there is no custom mask so its bit-test
     // path is compiled out (zero cost for the common case).
     const bool hasMask = custom_mask && mask_indptr;
-    const bool useFp8Mma = indexer_use_fp8_mma(idxNHeads, idxHeadDim);
+    // precomputed_ew: q is already-quantized FP8 [totalQ, idxNHeads, idxHeadDim]
+    // with a matching [totalQ, idxNHeads] F32 effective-weights tensor; the
+    // internal quantize launch is skipped. Only valid for the FP8 shape.
+    const bool precomputed = precomputed_ew != nullptr;
+    if (precomputed && !indexer_use_fp8_mma(idxNHeads, idxHeadDim)) {
+        fprintf(stderr, "glm_indexer_score_topk_v2: precomputed_ew requires "
+                        "idxNHeads=%d idxHeadDim=%d and FP8 MMA enabled (got %d/%d)\n",
+                idxfp8::NHEADS, idxfp8::HD, idxNHeads, idxHeadDim);
+        return;
+    }
+    const bool useFp8Mma = indexer_use_fp8_mma(idxNHeads, idxHeadDim) || precomputed;
     if (useFp8Mma) {
-        uint8_t* q8Data = reinterpret_cast<uint8_t*>(hist);
-        float* effectiveWeights = reinterpret_cast<float*>(q8Data + idxfp8::Q_BYTES);
-        idxfp8::quantize_q_kernel<<<totalQ, 256, 0, stream>>>(
-            (const __nv_bfloat16*)q, (const __nv_bfloat16*)weights,
-            q8Data, IDX_SCRATCH_I32 * sizeof(int32_t),
-            effectiveWeights, IDX_SCRATCH_I32, scale);
+        const uint8_t* q8Data;
+        const float* effectiveWeights;
+        int q8StrideBytes, ewStride;
+        if (precomputed) {
+            q8Data = reinterpret_cast<const uint8_t*>(q);
+            effectiveWeights = precomputed_ew;
+            q8StrideBytes = idxNHeads * idxHeadDim;
+            ewStride = idxNHeads;
+        } else {
+            uint8_t* q8Scratch = reinterpret_cast<uint8_t*>(hist);
+            q8Data = q8Scratch;
+            effectiveWeights = reinterpret_cast<float*>(q8Scratch + idxfp8::Q_BYTES);
+            q8StrideBytes = IDX_SCRATCH_I32 * sizeof(int32_t);
+            ewStride = IDX_SCRATCH_I32;
+            idxfp8::quantize_q_kernel<idxfp8::NHEADS><<<totalQ, idxfp8::NHEADS * 8, 0, stream>>>(
+                (const __nv_bfloat16*)q, (const __nv_bfloat16*)weights,
+                idxfp8::NHEADS, 0,
+                q8Scratch, IDX_SCRATCH_I32 * sizeof(int32_t),
+                reinterpret_cast<float*>(q8Scratch + idxfp8::Q_BYTES), IDX_SCRATCH_I32, scale);
+        }
         const size_t fp8Smem = idxfp8::Q_BYTES
             + idxfp8::WARPS * idxfp8::K_ROWS * idxfp8::HD
             + idxfp8::WARPS * idxfp8::K_ROWS * sizeof(float);
@@ -1430,8 +1462,8 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
             (__nv_bfloat16*)scores, rowLen, (const uint8_t*)kData, pageIndices, pageIndptr, \
             lastPageLen, qoIndptr, pageSize, maxKv, causal, qGlobalStart, custom_mask, mask_indptr, \
             mask_kv_len, effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, \
-            kvTokenIndptr, q8Data, IDX_SCRATCH_I32 * sizeof(int32_t), \
-            effectiveWeights, IDX_SCRATCH_I32, kScaleData)
+            kvTokenIndptr, q8Data, q8StrideBytes, \
+            effectiveWeights, ewStride, kScaleData)
         if (kvTokenIndptr) {
             if (hasMask) LAUNCH_IDX_FP8(true, true); else LAUNCH_IDX_FP8(false, true);
         } else {
@@ -1458,6 +1490,31 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
 #undef LAUNCH_IDX_SCORE
     glm_topk_from_scores(ctx, out_idx, out_scores, scores, rowLen, hist, meta,
                          totalQ, maxKv, topk, num_splits, effectiveCpWorldSize, effectiveCpRank);
+}
+
+// Standalone indexer Q quantization for Row-sharded callers. Outputs are
+// dedicated contiguous tensors: q8 [rows, nHeads*HD] U8 and effectiveWeights
+// [rows, nHeads] F32 — the same per-row layout the fused paths carve out of
+// their histogram scratch, so results can feed those kernels unchanged.
+void glm_indexer_quantize_q(GlmCtx* ctx, uint8_t* out_q8, float* out_ew,
+    const void* q, const void* weights, int nHeads, int weightsStride,
+    int weightsOffset, int totalQ, float scale) {
+    cudaSetDevice(ctx->device_id);
+    cudaStream_t stream = GLM_STREAM(ctx);
+    const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(q);
+    const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(weights);
+    switch (nHeads) {
+#define IDX_QUANT(NH) idxfp8::quantize_q_kernel<NH><<<totalQ, NH * 8, 0, stream>>>( \
+        qb, wb, weightsStride, weightsOffset, out_q8, NH * idxfp8::HD, out_ew, NH, scale)
+      case 32: IDX_QUANT(32); break;
+      case 16: IDX_QUANT(16); break;
+      case 8:  IDX_QUANT(8);  break;
+      case 4:  IDX_QUANT(4);  break;
+      default:
+        fprintf(stderr, "glm_indexer_quantize_q: unsupported nHeads=%d\n", nHeads);
+        break;
+#undef IDX_QUANT
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2542,7 +2599,8 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     void* scores, int32_t* rowLen, int maxKv,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
     int queryTiles, int cpWorldSize, int cpRank,
-    const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr) {
+    const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr,
+    const float* precomputed_ew) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     const int effectiveCpWorldSize = kvTokenIndptr ? 0 : cpWorldSize;
@@ -2550,13 +2608,38 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 
     // Pass 1: tensor-core score into buffer. queryTiles is a graph-stable upper
     // bound for sum(ceil(sequenceQ/TM)); out-of-range tiles return immediately.
-    if (indexer_use_fp8_mma(idxNHeads, idxHeadDim)) {
-        uint8_t* q8Data = reinterpret_cast<uint8_t*>(coarseHist);
-        float* effectiveWeights = reinterpret_cast<float*>(fineHist);
-        idxfp8::quantize_q_kernel<<<totalQ, 256, 0, stream>>>(
-            (const __nv_bfloat16*)q, (const __nv_bfloat16*)weights,
-            q8Data, IDX_COARSE_BUCKETS * sizeof(int32_t),
-            effectiveWeights, IDX_FINE_BUCKETS, scale);
+    // precomputed_ew: q is already-quantized FP8 [totalQ, idxNHeads, idxHeadDim]
+    // with a matching [totalQ, idxNHeads] F32 effective-weights tensor; the
+    // internal quantize launch is skipped and the histogram scratch stays
+    // untouched by the scoring pass.
+    const bool precomputed = precomputed_ew != nullptr;
+    if (precomputed && !indexer_use_fp8_mma(idxNHeads, idxHeadDim)) {
+        fprintf(stderr, "glm_indexer_score_topk_prefill: precomputed_ew requires "
+                        "idxNHeads=%d idxHeadDim=%d and FP8 MMA enabled (got %d/%d)\n",
+                idxfp8::NHEADS, idxfp8::HD, idxNHeads, idxHeadDim);
+        return;
+    }
+    if (indexer_use_fp8_mma(idxNHeads, idxHeadDim) || precomputed) {
+        const uint8_t* q8Data;
+        const float* effectiveWeights;
+        int q8StrideBytes, ewStride;
+        if (precomputed) {
+            q8Data = reinterpret_cast<const uint8_t*>(q);
+            effectiveWeights = precomputed_ew;
+            q8StrideBytes = idxNHeads * idxHeadDim;
+            ewStride = idxNHeads;
+        } else {
+            uint8_t* q8Scratch = reinterpret_cast<uint8_t*>(coarseHist);
+            q8Data = q8Scratch;
+            effectiveWeights = reinterpret_cast<float*>(fineHist);
+            q8StrideBytes = IDX_COARSE_BUCKETS * sizeof(int32_t);
+            ewStride = IDX_FINE_BUCKETS;
+            idxfp8::quantize_q_kernel<idxfp8::NHEADS><<<totalQ, idxfp8::NHEADS * 8, 0, stream>>>(
+                (const __nv_bfloat16*)q, (const __nv_bfloat16*)weights,
+                idxfp8::NHEADS, 0,
+                q8Scratch, IDX_COARSE_BUCKETS * sizeof(int32_t),
+                reinterpret_cast<float*>(fineHist), IDX_FINE_BUCKETS, scale);
+        }
 #define LAUNCH_INDEXER_PREFILL_FP8(TM, TN, WARPS, Q_BATCH, FLAT, TMA_SWIZZLE) do { \
         const size_t fp8Smem = (TN) * idxfp8::HD + (TN) * sizeof(float) \
             + (Q_BATCH) * (TM) * idxfp8::HD \
@@ -2568,8 +2651,8 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
         idx_prefill_score_fp8_mma_kernel<(TM), (TN), (WARPS), (Q_BATCH), (FLAT), (TMA_SWIZZLE)> \
             <<<grid, (WARPS) * 32, fp8Smem, stream>>>( \
                 kTensorMap, (__nv_bfloat16*)scores, rowLen, q8Data, \
-                IDX_COARSE_BUCKETS * sizeof(int32_t), effectiveWeights, \
-                IDX_FINE_BUCKETS, (const uint8_t*)kData, kScaleData, pageIndices, pageIndptr, \
+                q8StrideBytes, effectiveWeights, \
+                ewStride, (const uint8_t*)kData, kScaleData, pageIndices, pageIndptr, \
                 lastPageLen, qoIndptr, totalQ, pageSize, maxKv, causal, \
                 qGlobalStart, custom_mask, mask_indptr, mask_kv_len, \
                 effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, kvTokenIndptr); \

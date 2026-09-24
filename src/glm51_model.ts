@@ -602,7 +602,7 @@ export class Glm51Model extends ChatModel {
           idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
           return idxWeights;
         });
-        using idxWeights = idxWeightsStream?.result;
+        using idxWeights = idxWeightsStream.result;
 
         // Indexer K: wk(normed) → layernorm → partial RoPE → append to kData
         // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
@@ -662,14 +662,18 @@ export class Glm51Model extends ChatModel {
         using rotated = idxQLin.applyRotaryPosEmb(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, 2, cfg.indexerRopeInterleave);
         using idxQ = rotated.reshape([B * S, cfg.indexNHeads, cfg.indexHeadDim]);
 
-        kvcacheIndex?.streamWaitEvent();
         idxWeightsStream!.streamWaitEvent();
+        const idxQuantResult = this.glm.indexerQuantizeQ(idxQ, idxWeights, Math.pow(cfg.indexHeadDim, -0.5));
+        using idxQFp8 = idxQuantResult.q8;
+        using effectiveWeights = idxQuantResult.effectiveWeights;
+
+        kvcacheIndex?.streamWaitEvent();
 
         // Store the raw indexer top-k (token positions); slots are derived
         // per-layer/per-mode below and in the gather (slotsReady).
         return state.indexerTopk(
-          idxQ, kData, kScaleData, idxWeights,
-          Math.pow(idxHeadDim, -0.5), idxTopk,
+          idxQFp8, kData, kScaleData, undefined,
+          Math.pow(idxHeadDim, -0.5), idxTopk, effectiveWeights
         );
       });
 

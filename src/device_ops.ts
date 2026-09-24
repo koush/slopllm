@@ -130,9 +130,25 @@ export interface DeviceOps extends Disposable {
 
   indexerScore(out: Tensor, q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, maxKvLen: number, causal: boolean, kvTokenIndptr?: Tensor): void;
   // Indexer top-k scoring: returns { values: [totalQ, topk] BF16 scores, indices: [totalQ, topk] I32 positions }.
-  indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, cpWorldSize?: number, cpRank?: number, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor): { values: Tensor, indices: Tensor };
+  // effectiveWeights: when provided (from indexerQuantizeQ), idxQ is interpreted as
+  // pre-quantized FP8 U8 [totalQ, idxNHeads, idxHeadDim] and the scorer consumes
+  // the provided weights directly, skipping the internal quantize launch.
+  // When undefined, idxQ is BF16 and behavior is unchanged.
+  // weights may be undefined when effectiveWeights is provided.
+  indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, cpWorldSize?: number, cpRank?: number, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor };
   // Sort each top-k row ascending by index (-1 padding last), in place.
   sortTopkByIndex(indices: Tensor, values: Tensor, batch: number, topk: number): void;
+  // Quantize the indexer query for the FP8 scoring path. q is BF16
+  // [rows, nHeads, 128] (or [rows, nHeads*128]); weights is BF16
+  // [rows, weightsStride] with weightsStride >= weightHeadOffset + nHeads so
+  // Row-sharded callers can read their head slice of Replicated weights in
+  // place. Returns q8 [rows, nHeads, 128] U8 and effectiveWeights
+  // [rows, nHeads] F32 — the layout indexerTopk's FP8 path consumes — when
+  // quantization is available (nHeads in the dispatch set and FP8 MMA not
+  // disabled by GLM_INDEXER_DECODE_FP8_MMA=0). Otherwise returns the identity
+  // fallback { q8: q.viewClone() (still BF16), effectiveWeights: undefined },
+  // matching what the fused scorer would do for the same shape.
+  indexerQuantizeQ(q: Tensor, weights: Tensor, scale: number, weightHeadOffset?: number): { q8: Tensor, effectiveWeights: Tensor | undefined };
   // Convert top-k indices to physical KV slots. Layer and group share memory
   // through independent views, allowing the caller to retain the group slots.
   topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, pageSize: number, maxKv: number, cacheIdx: number, contextParallel?: boolean, cpWorldSize?: number, cpRank?: number, providedLength?: Tensor): {

@@ -277,7 +277,7 @@ export class ExecutionState {
   // conversion is deferred to the GLM attention layer so the same top-k can be
   // reused across shared layers and mapped to whichever addressing
   // (flat/paged) each layer's CKV buffer requires.
-  indexerTopk(idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor, scale: number, topk: number): { values: Tensor, indices: Tensor } {
+  indexerTopk(idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, scale: number, topk: number, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
     const cm = (!this.isDecode && this.customMask?.mode === MaskMode.CausalCustom) ? this.customMask : undefined;
     return this.ws.glm.indexerTopk(
       this,
@@ -286,7 +286,7 @@ export class ExecutionState {
       scale, topk,
       this.isDecode,
       0,
-      cm?.mask, cm?.indptr, cm?.maskKvLen,
+      cm?.mask, cm?.indptr, cm?.maskKvLen, undefined, undefined, undefined, undefined, effectiveWeights,
     );
   }
 

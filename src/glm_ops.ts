@@ -43,6 +43,8 @@ const SPARSE_MLA_DECODE_DISPATCH_MAX = 16;
 // paths support custom masks and query-sharding, so this is a pure occupancy/
 // memory tradeoff. Tunable to align with SPARSE_MLA_DECODE_DISPATCH_MAX.
 const INDEXER_DIRECT_DISPATCH_MAX = Number(process.env.GLM_INDEXER_DIRECT_DISPATCH_MAX ?? 64);
+// Mirrors indexer_use_fp8_mma's env kill switch in glm_indexer.cu.
+export const INDEXER_FP8_MMA_DISABLED = process.env.GLM_INDEXER_DECODE_FP8_MMA === "0";
 const TOPK_SCRATCH_I32 = 1056;
 const CUBLASLT_WORKSPACE_BYTES = 2 * 1024 * 1024;
 
@@ -1465,7 +1467,10 @@ export class GlmOps implements DeviceOps {
   // Writes the compacted valid-slot count per query into `topkLength` (a stable
   // caller buffer), which feeds the sparse kernel's topk_length so it only walks
   // ceil(count/BI) candidate tiles instead of the full topk.
-  indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart: number = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor): { values: Tensor, indices: Tensor } {
+  indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart: number = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
+    if (weights === undefined && effectiveWeights === undefined) {
+      throw new Error("indexerTopk: weights is required when effectiveWeights is not provided");
+    }
     const totalQ = idxQ.shape[0];
     const idxNHeads = idxQ.shape[1];
     const idxHeadDim = idxQ.shape[2];
@@ -1475,6 +1480,22 @@ export class GlmOps implements DeviceOps {
       || pageSize !== kScaleData.shape[1]
       || kData.shape[2] !== idxHeadDim) {
       throw new Error(`indexerTopk: incompatible K ${kData.type}[${kData.shape}] and scales ${kScaleData.type}[${kScaleData.shape}]`);
+    }
+    if (effectiveWeights) {
+      // idxQ is pre-quantized FP8 (from indexerQuantizeQ); the scorer consumes
+      // the provided effective weights and skips the internal quantize launch.
+      if (idxQ.type !== "U8" || idxQ.shape.length !== 3) {
+        throw new Error(`indexerTopk: effectiveWeights requires pre-quantized idxQ U8 [rows, nHeads, headDim], got ${idxQ.type}[${idxQ.shape}]`);
+      }
+      if (effectiveWeights.type !== "F32"
+        || effectiveWeights.shape.length !== 2
+        || effectiveWeights.shape[0] !== totalQ
+        || effectiveWeights.shape[1] !== idxNHeads) {
+        throw new Error(`indexerTopk: expected effectiveWeights F32 [${totalQ}, ${idxNHeads}], got ${effectiveWeights.type}[${effectiveWeights.shape}]`);
+      }
+      if (idxNHeads !== 32 || idxHeadDim !== 128 || INDEXER_FP8_MMA_DISABLED) {
+        throw new Error(`indexerTopk: effectiveWeights provided but the FP8 MMA path requires idxNHeads=32 idxHeadDim=128 with GLM_INDEXER_DECODE_FP8_MMA!=0 (got ${idxNHeads}/${idxHeadDim})`);
+      }
     }
     const maxKvCapacity = kData.shape[0] * kData.shape[1];
     const useDirect = totalQ <= INDEXER_DIRECT_DISPATCH_MAX;
@@ -1488,8 +1509,8 @@ export class GlmOps implements DeviceOps {
     const scoreShape = [totalQ, maxKv];
     const queryTiles = Math.ceil(totalQ / 64) + state.batchSize - 1;
     return useDirect
-      ? this.indexerScoreTopkV2(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, scoreShape, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr)
-      : this.indexerScoreTopkPrefill(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, scoreShape, queryTiles, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr);
+      ? this.indexerScoreTopkV2(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, scoreShape, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights)
+      : this.indexerScoreTopkPrefill(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, scoreShape, queryTiles, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights);
   }
 
   // Sort each top-k row ascending by index (-1 padding last), in place.
@@ -1497,6 +1518,54 @@ export class GlmOps implements DeviceOps {
   // concatenates per-shard lists rank-major. See idx_sort_by_index_kernel.
   sortTopkByIndex(indices: Tensor, values: Tensor, batch: number, topk: number): void {
     getNativeAddon().sortTopkByIndex(this.ctx, indices.data, values.data, batch, topk);
+  }
+
+  // Standalone indexer Q quantization (FP8 scoring path). Row-sharded callers
+  // quantize their head slice directly against Replicated weights via
+  // weightHeadOffset; no gather. q8 layout ([rows, nHeads, 128] U8 + [rows,
+  // nHeads] F32 effective weights) matches what indexerTopk's FP8 path consumes.
+  // When the shape is not eligible for FP8 MMA (headDim != 128, nHeads outside
+  // the dispatch set) or FP8 MMA is disabled via GLM_INDEXER_DECODE_FP8_MMA=0,
+  // returns the identity fallback { q8: q view, effectiveWeights: undefined } —
+  // the same thing the fused scorer would do for that shape.
+  indexerQuantizeQ(q: Tensor, weights: Tensor, scale: number, weightHeadOffset = 0): { q8: Tensor, effectiveWeights: Tensor | undefined } {
+    const IDX_QUANT_HEAD_DIM = 128;
+    const rows = q.shape[0];
+    let nHeads: number;
+    let headDim: number;
+    if (q.shape.length === 3) {
+      nHeads = q.shape[1];
+      headDim = q.shape[2];
+    } else if (q.shape.length === 2) {
+      headDim = IDX_QUANT_HEAD_DIM;
+      if (q.shape[1] % IDX_QUANT_HEAD_DIM !== 0) {
+        throw new Error(`indexerQuantizeQ: q width ${q.shape[1]} is not a multiple of headDim ${IDX_QUANT_HEAD_DIM}`);
+      }
+      nHeads = q.shape[1] / IDX_QUANT_HEAD_DIM;
+    } else {
+      throw new Error(`indexerQuantizeQ: expected q as [rows, nHeads, headDim] or [rows, nHeads*headDim], got [${q.shape}]`);
+    }
+    if (q.type !== "BF16") {
+      throw new Error(`indexerQuantizeQ: q must be BF16, got ${q.type}`);
+    }
+    if (weights.type !== "BF16" || weights.shape.length !== 2 || weights.shape[0] !== rows) {
+      throw new Error(`indexerQuantizeQ: expected weights BF16 [${rows}, nHeads], got ${weights.type}[${weights.shape}]`);
+    }
+    // Identity fallback: not an FP8 MMA shape (or disabled). q8 stays BF16 so
+    // indexerTopk's BF16 path handles it exactly as the fused scorer would.
+    if (headDim !== IDX_QUANT_HEAD_DIM
+      || ![32, 16, 8, 4].includes(nHeads)
+      || INDEXER_FP8_MMA_DISABLED) {
+      return { q8: q.viewClone(), effectiveWeights: undefined };
+    }
+    const weightsStride = weights.shape[1];
+    if (weightsStride < weightHeadOffset + nHeads) {
+      throw new Error(`indexerQuantizeQ: weights stride ${weightsStride} < headOffset ${weightHeadOffset} + nHeads ${nHeads}`);
+    }
+    const q8 = q.workspace.alloc([rows, nHeads, headDim], "U8");
+    const effectiveWeights = q.workspace.alloc([rows, nHeads], "F32");
+    getNativeAddon().indexerQuantizeQ(this.ctx, q8.data, effectiveWeights.data, q.data, weights.data, nHeads, weightsStride, weightHeadOffset, rows, scale);
+    return { q8, effectiveWeights };
   }
 
   topkToSlots(state: ExecutionState, topkIdx: Tensor, kvTokenIndptrD: Tensor, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, batchIndices: Tensor, pageSize: number, _maxKv: number, _cacheIdx: number, _contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0, providedLength?: Tensor): { layer: SlotSet, group: SlotSet } {
@@ -1522,7 +1591,7 @@ export class GlmOps implements DeviceOps {
     };
   }
 
-  private indexerScoreTopkPrefill(q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, scoreShape: number[], queryTiles: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor): { values: Tensor, indices: Tensor } {
+  private indexerScoreTopkPrefill(q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, scoreShape: number[], queryTiles: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
     // sum(ceil(seqQ / 64)) <= ceil(totalQ / 64) + batchSize - 1. This is
     // exact for the single-sequence query-sharded path and stable for capture
     // because totalQ and batchSize are both part of the graph key.
@@ -1533,11 +1602,11 @@ export class GlmOps implements DeviceOps {
     using coarseHist = q.workspace.alloc([totalQ, 1024], "I32");
     using fineHist = q.workspace.alloc([totalQ, 64], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
-    getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, values.data, q.data, kData.data, kScaleData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, maxKv, coarseHist.data, fineHist.data, meta.data, queryTiles, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0);
+    getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, values.data, q.data, kData.data, kScaleData.data, weights?.data ?? 0, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, maxKv, coarseHist.data, fineHist.data, meta.data, queryTiles, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0, effectiveWeights?.data ?? 0);
     return { values, indices };
   }
 
-  private indexerScoreTopkV2(q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, scoreShape: number[], causal = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor): { values: Tensor, indices: Tensor } {
+  private indexerScoreTopkV2(q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, scoreShape: number[], causal = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
     const numSplits = Math.min(256, Math.max(1, Math.ceil(maxKv / 256)));
     const indices = q.workspace.alloc([totalQ, topk], "I32");
     const values = q.workspace.alloc([totalQ, topk], "BF16");
@@ -1545,7 +1614,7 @@ export class GlmOps implements DeviceOps {
     using rowLen = q.workspace.alloc([totalQ], "I32");
     using hist = q.workspace.alloc([totalQ, TOPK_SCRATCH_I32], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
-    getNativeAddon().indexerScoreTopkV2(this.ctx, indices.data, values.data, q.data, kData.data, kScaleData.data, weights.data, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, hist.data, meta.data, maxKv, numSplits, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0);
+    getNativeAddon().indexerScoreTopkV2(this.ctx, indices.data, values.data, q.data, kData.data, kScaleData.data, weights?.data ?? 0, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, hist.data, meta.data, maxKv, numSplits, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0, effectiveWeights?.data ?? 0);
     return { values, indices };
   }
 
