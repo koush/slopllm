@@ -1241,8 +1241,9 @@ export class Glm51Model extends ChatModel {
             }
           }
           const totalBytes = state.totalTokens * I32;
-          if (idsOff < totalBytes)
+          if (idsOff < totalBytes) {
             buf.fill(0, idsOff, totalBytes);
+          }
         });
         nextInput.memcpy(nextInputH, state.totalTokens * I32, MemcpyKind.HostToDevice);
 
@@ -1297,12 +1298,16 @@ export class Glm51Model extends ChatModel {
         }
         // Keep physical pages attached: the draft and verification plans refer
         // to the same cache capacity, but start at the same committed boundary.
-        for (let batch = 0; batch < batchSize; batch++) sequences[batch].allocLen = committedLens[batch];
+        for (let batch = 0; batch < batchSize; batch++) {
+          sequences[batch].allocLen = committedLens[batch];
+        }
         const verification = ws.planPrefill(this, batchSize, Array(batchSize).fill(numVerificationTokens), cache);
         verification.setInput(nextTargets.map(token => [token, ...Array(numDraftTokens).fill(0)]));
         seedRowsHost.withPinnedBuffer(buf => nextSeedRows.forEach((row, batch) => buf.writeInt32LE(row, batch * I32)));
         seedRows.memcpy(seedRowsHost, batchSize * I32, MemcpyKind.HostToDevice);
-        if (sampled) samplingPolicy.prepareDraft!(batchSize, numDraftTokens);
+        if (sampled) {
+          samplingPolicy.prepareDraft!(batchSize, numDraftTokens);
+        }
 
         const states = [...draftStates, verification];
         const inputs = { seed: seed.value, slots: slots.value, slotsLength: slotsLength.value };
@@ -1328,7 +1333,9 @@ export class Glm51Model extends ChatModel {
               using indices = sampled ? samplingPolicy.sampleDraft!(logits, depth) : topk!.indices;
               verification.inputIdsBuf.memcpy2d((depth + 1) * I32, numVerificationTokens * I32,
                 indices, 0, I32, I32, batchSize, MemcpyKind.DeviceToDevice);
-              if (depth === numDraftTokens - 1) continue;
+              if (depth === numDraftTokens - 1) {
+                continue;
+              }
 
               const state = draftStates[depth];
               state.setInput(indices);
@@ -1359,7 +1366,9 @@ export class Glm51Model extends ChatModel {
             using counts = verified?.numAccepted;
             using selected = verified ? verified.tokens : samplingPolicy.selectTarget(logits);
             using resultCopy = self.ops.withStream(() => {
-              if (counts) acceptedHost!.memcpy(counts, batchSize * I32, MemcpyKind.DeviceToHost);
+              if (counts) {
+                acceptedHost!.memcpy(counts, batchSize * I32, MemcpyKind.DeviceToHost);
+              }
               selectedHost.memcpy(selected, batchSize * numVerificationTokens * I32, MemcpyKind.DeviceToHost);
             });
             inputCopy.streamWaitEvent();
@@ -1388,11 +1397,15 @@ export class Glm51Model extends ChatModel {
           } else {
             bestAccepted = 0;
             for (let depth = 0; depth < numDraftTokens; depth++) {
-              if (inputBuf.readInt32LE((row + depth + 1) * I32) !== selectedBuf.readInt32LE((row + depth) * I32)) break;
+              if (inputBuf.readInt32LE((row + depth + 1) * I32) !== selectedBuf.readInt32LE((row + depth) * I32)) {
+                break;
+              }
               bestAccepted++;
             }
           }
-          if (bestAccepted < 0 || bestAccepted > numDraftTokens) throw new Error(`Invalid MTP acceptance count ${bestAccepted}`);
+          if (bestAccepted < 0 || bestAccepted > numDraftTokens) {
+            throw new Error(`Invalid MTP acceptance count ${bestAccepted}`);
+          }
           const acceptedTokens: number[] = [];
           for (let depth = 1; depth <= bestAccepted; depth++) {
             acceptedTokens.push(inputBuf.readInt32LE((row + depth) * I32));
@@ -1404,7 +1417,9 @@ export class Glm51Model extends ChatModel {
           nextSeedRows[batch] = row + bestAccepted;
         }
 
-        for (let batch = 0; batch < batchSize; batch++) sequences[batch].truncate(committedLens[batch] + numAccepted[batch] + 1);
+        for (let batch = 0; batch < batchSize; batch++) {
+          sequences[batch].truncate(committedLens[batch] + numAccepted[batch] + 1);
+        }
         // Only the committed verification inputs belong to cache history, not the replacement.
         for (let batch = 0; batch < batchSize; batch++) {
           const row = batch * numVerificationTokens;
@@ -1424,7 +1439,9 @@ export class Glm51Model extends ChatModel {
       // Covers break/return, consumer exceptions, and failed graph submissions.
       await this.ops.synchronizeAsync();
       if (speculative) {
-        for (let batch = 0; batch < batchSize; batch++) sequences[batch].truncate(committedLens[batch]);
+        for (let batch = 0; batch < batchSize; batch++) {
+          sequences[batch].truncate(committedLens[batch]);
+        }
       }
     }
   }
