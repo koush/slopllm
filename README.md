@@ -68,6 +68,7 @@ Arguments before the executor path are shared model arguments passed to every ex
 
 ```bash
 curl http://127.0.0.1:8099/status      # inspect loader and executor state
+curl -N http://127.0.0.1:8099/follow   # stream loader + executor console output
 curl http://127.0.0.1:8000/health      # server is ready
 curl -X POST http://127.0.0.1:8099/stop     # stop the executor, model stays on GPU
 curl -X POST http://127.0.0.1:8099/fork     # start it (or a new command) again

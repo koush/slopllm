@@ -287,6 +287,12 @@ Add `?follow` to `/fork`, `/spawn`, or `/restart` to stream executor output thro
 curl -N -X POST 'http://127.0.0.1:8099/restart?follow'
 ```
 
+`GET /follow` streams the loader's console output — the most recent 128KB of loader and executor messages, followed by live output — and ends when the current executor's output closes:
+
+```bash
+curl -N http://127.0.0.1:8099/follow
+```
+
 Changing model/shared arguments requires restarting the loader itself. The control server has no authentication, so keep it bound to `127.0.0.1` unless it is protected by other means.
 
 Executor environment overrides can be supplied to `/fork` or `/spawn` with an object instead of a command array:

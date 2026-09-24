@@ -1,5 +1,6 @@
 import http from "node:http";
 import path from "node:path";
+import util from "node:util";
 import { fork, spawn, type ChildProcess } from "node:child_process";
 import { freeModelRuntime, loadModelRuntime, modelArenaLayoutSignatures, modelLabel, parseModelArgs, type ModelCliArgs } from "./model_cli";
 
@@ -49,6 +50,33 @@ export function parseLoaderArgs(argv: string[]): LoaderArgs {
 function sendJson(res: http.ServerResponse, status: number, body: object): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+const CONSOLE_LOG_LIMIT = 128 * 1024;
+const consoleLog: Buffer[] = [];
+let consoleLogSize = 0;
+const consoleFollowers = new Set<http.ServerResponse>();
+
+function recordConsoleOutput(chunk: Buffer): void {
+  consoleLog.push(chunk);
+  consoleLogSize += chunk.length;
+  while (consoleLogSize > CONSOLE_LOG_LIMIT && consoleLog.length > 1) {
+    consoleLogSize -= consoleLog[0].length;
+    consoleLog.shift();
+  }
+  for (const follower of consoleFollowers) {
+    if (!follower.writableEnded && !follower.destroyed) follower.write(chunk);
+  }
+}
+
+function mirrorConsole(): void {
+  const patch = (orig: (...args: any[]) => void) => (...args: any[]) => {
+    recordConsoleOutput(Buffer.from(`${util.format(...args)}\n`));
+    orig(...args);
+  };
+  console.log = patch(console.log);
+  console.warn = patch(console.warn);
+  console.error = patch(console.error);
 }
 
 export function parseWorkerCommand(value: unknown, sharedArgs: string[], previous?: WorkerCommand | null, mode: WorkerCommand["mode"] = previous?.mode ?? "fork"): WorkerCommand {
@@ -125,6 +153,7 @@ export function workerEnvironment(command: WorkerCommand, inherited: NodeJS.Proc
 }
 
 async function main(): Promise<void> {
+  mirrorConsole();
   const loaderArgs = parseLoaderArgs(process.argv.slice(2));
   const modelArgs = parseModelArgs(loaderArgs.sharedArgs);
   if (loaderArgs.initialCommand) validateWorkerModelArgs(loaderArgs.initialCommand.args, modelArgs);
@@ -183,29 +212,27 @@ async function main(): Promise<void> {
     next.once("spawn", () => spawnedProcesses.add(next));
     next.stdout!.pipe(process.stdout, { end: false });
     next.stderr!.pipe(process.stderr, { end: false });
+    next.stdout!.on("data", recordConsoleOutput);
+    next.stderr!.on("data", recordConsoleOutput);
     if (follow) {
-      let exited = false;
-      let stdoutEnded = false;
-      let stderrEnded = false;
-      const finish = () => {
-        if (exited && stdoutEnded && stderrEnded && !follow.writableEnded) follow.end();
-      };
-      const write = (chunk: Buffer | string) => {
-        if (!follow.writableEnded && !follow.destroyed) follow.write(chunk);
-      };
-      next.stdout!.on("data", write);
-      next.stderr!.on("data", write);
-      next.stdout!.once("end", () => { stdoutEnded = true; finish(); });
-      next.stderr!.once("end", () => { stderrEnded = true; finish(); });
-      next.once("exit", () => {
-        exited = true;
-        setImmediate(finish);
-      });
-      next.once("error", () => {
-        exited = true;
-        setImmediate(finish);
-      });
+      consoleFollowers.add(follow);
+      follow.once("close", () => consoleFollowers.delete(follow));
     }
+    let exited = false;
+    let stdoutEnded = false;
+    let stderrEnded = false;
+    const finishOutput = () => {
+      if (!exited || !stdoutEnded || !stderrEnded) return;
+      const followers = [...consoleFollowers];
+      consoleFollowers.clear();
+      for (const follower of followers) {
+        if (!follower.writableEnded && !follower.destroyed) follower.end();
+      }
+    };
+    next.stdout!.once("end", () => { stdoutEnded = true; finishOutput(); });
+    next.stderr!.once("end", () => { stderrEnded = true; finishOutput(); });
+    next.once("exit", () => { exited = true; setImmediate(finishOutput); });
+    next.once("error", () => { exited = true; setImmediate(finishOutput); });
     next.once("error", error => {
       lastError = error instanceof Error ? (error.stack ?? error.message) : String(error);
       if (!spawnedProcesses.has(next) && worker === next) worker = null;
@@ -282,6 +309,19 @@ async function main(): Promise<void> {
     }
     if (req.method === "GET" && url.pathname === "/model-args") {
       sendJson(res, 200, { args: loaderArgs.sharedArgs });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/follow") {
+      res.writeHead(200, {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "no-cache",
+        "x-accel-buffering": "no",
+      });
+      res.socket?.setNoDelay(true);
+      res.flushHeaders();
+      if (consoleLog.length > 0) res.write(Buffer.concat(consoleLog));
+      consoleFollowers.add(res);
+      res.once("close", () => consoleFollowers.delete(res));
       return;
     }
     if (req.method === "POST" && (url.pathname === "/fork" || url.pathname === "/spawn")) {
