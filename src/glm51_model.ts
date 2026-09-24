@@ -1228,21 +1228,51 @@ export class Glm51Model extends ChatModel {
       {
         const state = ws.planPrefill(this, batchSize, Array(batchSize).fill(1), cache);
         state.setInput(initialTargets.map(token => [token]));
-        const self = this;
-        this.runPhased(this.forwardWithLayerHolders(state, undefined, function* (holders) {
-          using hidden = self.forwardModel(state, holders);
-          state.setInput(nextTargets.map(token => [token]));
-          using initialSeed = self.forwardMtp(state, hidden, holders);
-          seed.value.memcpy(initialSeed, initialSeed.bytes, MemcpyKind.DeviceToDevice);
-          const initialSlots = holders.sharedSlots!;
-          const initialSlotsLength = holders.sharedSlotsLength!;
-          if (initialSlots.value) {
-            slots.replace(ws.alloc([batchSize * numVerificationTokens, initialSlots.value.shape[1]], "I32", undefined, initialSlots.value.parallelism));
-            slotsLength.replace(ws.alloc([batchSize * numVerificationTokens], "I32", undefined, initialSlotsLength.value.parallelism));
-            slots.value.memcpy(initialSlots.value, initialSlots.value.bytes, MemcpyKind.DeviceToDevice);
-            slotsLength.value.memcpy(initialSlotsLength.value, initialSlotsLength.value.bytes, MemcpyKind.DeviceToDevice);
+
+        const nextInput = ws.ensureAlloc([ws.maxBatch], state.inputIdsBuf.type, `nextInput_${ws.maxBatch}`);
+        const nextInputH = ws.ensureAllocPinned([ws.maxBatch], state.inputIdsBufH.type, `nextInput_host_${ws.maxBatch}`);
+        nextInputH.withPinnedBuffer(buf => {
+          const tokenIds = nextTargets.map(token => [token]);
+          let idsOff = 0;
+          for (const ids of tokenIds) {
+            for (const id of ids) {
+              buf.writeInt32LE(id, idsOff);
+              idsOff += I32;
+            }
           }
-        }));
+          const totalBytes = state.totalTokens * I32;
+          if (idsOff < totalBytes)
+            buf.fill(0, idsOff, totalBytes);
+        });
+        nextInput.memcpy(nextInputH, state.totalTokens * I32, MemcpyKind.HostToDevice);
+
+        const self = this;
+        const captureKey = ["glm51-mtp-replay"];
+        const initial = executionManager.execute({ states: [state], inputs: { seed: seed.value }, key: captureKey }, retained => {
+          const initial = this.runPhased(this.forwardWithLayerHolders(state, undefined, function* (holders) {
+            using hidden = self.forwardModel(state, holders);
+            state.input!.memcpy(nextInput, state.totalTokens * I32, MemcpyKind.DeviceToDevice);
+            using initialSeed = self.forwardMtp(state, hidden, holders);
+            retained.seed.memcpy(initialSeed, initialSeed.bytes, MemcpyKind.DeviceToDevice);
+            const initialSlots = holders.sharedSlots!;
+            const initialSlotsLength = holders.sharedSlotsLength!;
+            return {
+              initialSlots: initialSlots.detach(),
+              initialSlotsLength: initialSlotsLength.detach(),
+            };
+          }));
+          return initial;
+        });
+
+        using initialSlots = initial.result.initialSlots;
+        using initialSlotsLength = initial.result.initialSlotsLength;
+        if (initialSlots) {
+          slots.replace(ws.alloc([batchSize * numVerificationTokens, initialSlots.shape[1]], "I32", undefined, initialSlots.parallelism));
+          slotsLength.replace(ws.alloc([batchSize * numVerificationTokens], "I32", undefined, initialSlotsLength.parallelism));
+          slots.value.memcpy(initialSlots, initialSlots.bytes, MemcpyKind.DeviceToDevice);
+          slotsLength.value.memcpy(initialSlotsLength, initialSlotsLength.bytes, MemcpyKind.DeviceToDevice);
+        }
+
         await this.ops.synchronizeAsync();
       }
       initialTargets.forEach((token, batch) => cache.reportTokens(batch, [token], nextTargets[batch]));

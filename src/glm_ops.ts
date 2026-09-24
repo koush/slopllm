@@ -833,12 +833,27 @@ export class GlmTensor extends Tensor {
 export class GlmOps implements DeviceOps {
   getCaptureKeys(state: ExecutionState): readonly (string | number)[] {
     const pagedKV = state.cache.getPagedKV();
-    if (!pagedKV.sparseMode || !pagedKV.contextParallel) return [];
+    if (!pagedKV.sparseMode || !pagedKV.contextParallel) {
+      return [];
+    }
     const numQueries = state.isDecode ? state.batchSize : state.totalTokens;
-    if (!state.isDecode && numQueries > SPARSE_MLA_DECODE_DISPATCH_MAX) return [];
+    if (!state.isDecode && numQueries > SPARSE_MLA_DECODE_DISPATCH_MAX) {
+      return [];
+    }
     const { numAttentionHeads, indexTopk } = state.model.cfg;
-    if (indexTopk === undefined) throw new Error("Sparse MLA capture keys require indexTopk");
-    return [`sparseMlaChunksPerBlock:${this.sparseMlaChunkHint(state, numQueries, numAttentionHeads, indexTopk)}`];
+    if (indexTopk === undefined) {
+      throw new Error("Sparse MLA capture keys require indexTopk");
+    }
+    // The hint reads state.paddedKvLen, but this key does not make the graph
+    // length-variant: localTopkBound = min(topk, ceil(paddedKvLen / worldSize))
+    // saturates at topk once total KV exceeds topk * worldSize, and the wave-
+    // filling policy quantizes it further. Distinct paddedKvLen buckets collapse
+    // into a small set of shared launch configs, so long conversations reuse a
+    // single captured graph instead of paying a capture per bucket.
+    const chunksPerBlock = this.sparseMlaChunkHint(state, numQueries, numAttentionHeads, indexTopk);
+    return [
+      `sparseMlaChunksPerBlock:${chunksPerBlock}`,
+    ];
   }
 
   private sparseMlaChunkHint(state: ExecutionState, numQueries: number, numHeads: number, topk: number): number {
