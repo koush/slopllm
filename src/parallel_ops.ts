@@ -2594,6 +2594,49 @@ export class ParallelOps implements DeviceOps {
     return this.redistributeMultiple(tensors, workspace, TensorParallelism.Replicated);
   }
 
+  /** Gather two independent tensors with one write launch per GPU and one barrier.
+   * Outputs retain their own contiguous layouts; no packing copies are needed.
+   */
+  allGatherTwo<A extends ParallelTensor | undefined, B extends ParallelTensor | undefined>(a: A, b: B, workspace: WorkspaceBase): [A, B];
+  allGatherTwo(a: ParallelTensor | undefined, b: ParallelTensor | undefined, workspace: WorkspaceBase): [ParallelTensor | undefined, ParallelTensor | undefined] {
+    if (workspace.ops !== this || [a, b].some(t => t && (t.workspace.ops !== this || t.pinned || t.shards.length !== this.worldSize))) {
+      throw new Error("allGatherTwo: expected device tensors and workspace from this backend");
+    }
+    if (!a || !b) return [a?.allGather(workspace), b?.allGather(workspace)];
+    const stream = this.devices[0].currentStream;
+    const layout = (t: ParallelTensor) => {
+      if (t.parallelism !== TensorParallelism.Row && t.parallelism !== TensorParallelism.Column) return;
+      const outer = t.parallelism === TensorParallelism.Row ? t.shape[0] : 1;
+      const bytes = t.shards[0].bytes;
+      if (!outer || !bytes || bytes % outer || t.bytes !== bytes * this.worldSize ||
+        t.shards.some(s => s.bytes !== bytes) ||
+        t.shards[0].numElements > 65536 * 8) return;
+      return { outer, rowBytes: bytes / outer };
+    };
+    const la = layout(a), lb = layout(b);
+    const group = this.p2pEnabled && la && lb && [1, 2, 4, 8].includes(this.worldSize)
+      ? this.getP2PGroup(stream) : undefined;
+    if (!group || !la || !lb) {
+      return this.redistributeMultiple([a, b], workspace, TensorParallelism.Replicated) as [ParallelTensor, ParallelTensor];
+    }
+    const shardWorkspaces = this.getShardWorkspaces(workspace);
+    const allocOutput = (t: ParallelTensor) => this.wrapShards(workspace,
+      shardWorkspaces.map(ws => group.allocClean(ws, t.shape, t.type)),
+      t.shape, t.type, TensorParallelism.Replicated);
+    const outA = allocOutput(a), outB = allocOutput(b);
+    const addon = getNativeAddon();
+    for (let rank = 0; rank < this.worldSize; rank++) {
+      const pointers = (out: ParallelTensor) => Array.from({ length: this.worldSize }, (_, peer) => {
+        const owner = (rank + peer) % this.worldSize;
+        return this.peerArenaPointer(rank, owner, out.shards[owner].data);
+      });
+      addon.p2pAllGatherTwoWrite(this.devices[rank].ctx, a.shards[rank].data, b.shards[rank].data,
+        pointers(outA), pointers(outB), this.worldSize, la.rowBytes, la.outer, lb.rowBytes, lb.outer, rank);
+    }
+    group.barrier(this.devices);
+    return [outA, outB];
+  }
+
   /** Enqueue each P2P transfer after its own producer, then share one barrier.
    * Producer handles and their result tensors remain owned by the caller.
    */

@@ -3851,6 +3851,36 @@ static Napi::Value P2PAllGatherRowWrite(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value P2PAllGatherTwoWrite(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 11 || !info[3].IsArray() || !info[4].IsArray()) {
+        Napi::TypeError::New(env, "Expected (ctx, a, b, outputsA, outputsB, N, rowBytesA, outerA, rowBytesB, outerB, rank)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const int N = info[5].As<Napi::Number>().Int32Value();
+    const int rank = info[10].As<Napi::Number>().Int32Value();
+    const int rowA = info[6].As<Napi::Number>().Int32Value(), outerA = info[7].As<Napi::Number>().Int32Value();
+    const int rowB = info[8].As<Napi::Number>().Int32Value(), outerB = info[9].As<Napi::Number>().Int32Value();
+    const auto a = info[3].As<Napi::Array>(), b = info[4].As<Napi::Array>();
+    if ((N != 1 && N != 2 && N != 4 && N != 8) || rank < 0 || rank >= N ||
+        a.Length() != (uint32_t)N || b.Length() != (uint32_t)N || rowA < 0 || rowB < 0 || outerA < 0 || outerB < 0) {
+        Napi::RangeError::New(env, "Invalid two-input AllGather layout").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    void* outputsA[8]{}, *outputsB[8]{};
+    for (int i = 0; i < N; ++i) {
+        outputsA[i] = reinterpret_cast<void*>(a.Get(i).As<Napi::Number>().Int64Value());
+        outputsB[i] = reinterpret_cast<void*>(b.Get(i).As<Napi::Number>().Int64Value());
+    }
+    glm_p2p_allgather_two_write(reinterpret_cast<GlmCtx*>(info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>(info[1].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>(info[2].As<Napi::Number>().Int64Value()),
+        outputsA, outputsB, N, rowA, outerA, rowB, outerB, rank);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) Napi::Error::New(env, std::string("p2pAllGatherTwoWrite failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    return env.Undefined();
+}
+
 static Napi::Value P2PReduceScatterWrite(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 13) {
@@ -4131,6 +4161,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "p2pGetFlagPtr"), Napi::Function::New(env, P2PGetFlagPtr));
     exports.Set(Napi::String::New(env, "p2pSetPeers"), Napi::Function::New(env, P2PSetPeers));
     exports.Set(Napi::String::New(env, "p2pAllGatherRowWrite"), Napi::Function::New(env, P2PAllGatherRowWrite));
+    exports.Set(Napi::String::New(env, "p2pAllGatherTwoWrite"), Napi::Function::New(env, P2PAllGatherTwoWrite));
     exports.Set(Napi::String::New(env, "p2pReduceScatterWrite"), Napi::Function::New(env, P2PReduceScatterWrite));
     exports.Set(Napi::String::New(env, "p2pReduceGatherWrite"), Napi::Function::New(env, P2PReduceGatherWrite));
     exports.Set(Napi::String::New(env, "p2pBarrier"), Napi::Function::New(env, P2PBarrier));

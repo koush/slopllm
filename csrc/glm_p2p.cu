@@ -454,6 +454,75 @@ p2p_allgather_row_write_kernel(
 }
 
 // ---------------------------------------------------------------------------
+struct AllGatherTwoOutputs {
+    void* a[8];
+    void* b[8];
+};
+
+// Treat A and B as one virtual byte buffer. Each block handles 2 KiB source
+// tiles, including tiles crossing the A/B boundary, and broadcasts to all peers.
+// The two destination regions retain their independent row layouts/dtypes.
+template <int N>
+__global__ void __launch_bounds__(AG_WRITE_THREADS, 4)
+p2p_allgather_two_write_kernel(const void* a, const void* b,
+    AllGatherTwoOutputs outputs, int rowBytesA, int outerA,
+    int rowBytesB, int outerB, int rank) {
+    constexpr int VEC = 16;
+    constexpr int TILE_BYTES = AG_WRITE_THREADS * VEC;
+    const int64_t bytesA = (int64_t)rowBytesA * outerA;
+    const int64_t totalBytes = bytesA + (int64_t)rowBytesB * outerB;
+    for (int64_t tile = (int64_t)blockIdx.x * TILE_BYTES; tile < totalBytes;
+         tile += (int64_t)gridDim.x * TILE_BYTES) {
+        const int64_t begin = tile + threadIdx.x * VEC;
+        const int64_t end = min(begin + VEC, totalBytes);
+        int64_t pos = begin;
+        while (pos < end) {
+            const bool second = pos >= bytesA;
+            const int rowBytes = second ? rowBytesB : rowBytesA;
+            const int64_t offset = second ? pos - bytesA : pos;
+            const int64_t row = offset / rowBytes;
+            const int col = offset % rowBytes;
+            const int count = (int)min(end - pos, (int64_t)(rowBytes - col));
+            const char* src = static_cast<const char*>(second ? b : a) + offset;
+            // Resolve the virtual source offset once, not once per peer.
+            #pragma unroll
+            for (int j = 0; j < N; ++j) {
+                // Caller rotates peer pointers by sender rank, as in row-write.
+                const int peer = (j + blockIdx.x) % N;
+                char* dst = static_cast<char*>(second ? outputs.b[peer] : outputs.a[peer])
+                    + (row * N + rank) * rowBytes + col;
+                if (count == VEC && ((reinterpret_cast<uintptr_t>(src) |
+                    reinterpret_cast<uintptr_t>(dst)) & (VEC - 1)) == 0) {
+                    *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
+                } else {
+                    for (int i = 0; i < count; ++i) dst[i] = src[i];
+                }
+            }
+            pos += count;
+        }
+    }
+}
+
+void launch_allgather_two_write(GlmCtx* ctx, const void* a, const void* b,
+    void* const* outputsA, void* const* outputsB, int N,
+    int rowBytesA, int outerA, int rowBytesB, int outerB, int rank) {
+    cudaSetDevice(ctx->device_id);
+    AllGatherTwoOutputs outputs{};
+    for (int i = 0; i < N; ++i) { outputs.a[i] = outputsA[i]; outputs.b[i] = outputsB[i]; }
+    const int64_t totalBytes = (int64_t)rowBytesA * outerA + (int64_t)rowBytesB * outerB;
+    constexpr int TILE_BYTES = AG_WRITE_THREADS * 16;
+    const int grid = (int)std::min<int64_t>(512, (totalBytes + TILE_BYTES - 1) / TILE_BYTES);
+    if (!grid) return;
+    #define LAUNCH_AG_TWO(N) p2p_allgather_two_write_kernel<N><<<grid, AG_WRITE_THREADS, 0, GLM_STREAM(ctx)>>>(a, b, outputs, rowBytesA, outerA, rowBytesB, outerB, rank)
+    switch (N) {
+        case 1: LAUNCH_AG_TWO(1); break;
+        case 2: LAUNCH_AG_TWO(2); break;
+        case 4: LAUNCH_AG_TWO(4); break;
+        case 8: LAUNCH_AG_TWO(8); break;
+    }
+    #undef LAUNCH_AG_TWO
+}
+
 // Push-based reduce-scatter (write+write AllReduce), phase 1: scatter.
 // Each GPU splits its shard into N chunks and *writes* chunk `peer` into that
 // peer's staging buffer at slot `rank` (offset rank*chunk_bytes). Destination
@@ -578,6 +647,13 @@ p2p_reduce_gather_write_kernel(
 // ---------------------------------------------------------------------------
 
 extern "C" {
+
+void glm_p2p_allgather_two_write(GlmCtx* ctx, const void* a, const void* b,
+    void* const* outputsA, void* const* outputsB, int N,
+    int rowBytesA, int outerA, int rowBytesB, int outerB, int rank) {
+    launch_allgather_two_write(ctx, a, b, outputsA, outputsB, N,
+        rowBytesA, outerA, rowBytesB, outerB, rank);
+}
 
 int glm_p2p_enable_peer_access(GlmCtx* ctx, int peer_device) {
     cudaSetDevice(ctx->device_id);

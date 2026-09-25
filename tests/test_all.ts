@@ -1,6 +1,7 @@
 import "./test_heap";
 import "./test_sparse_mla_planner";
 import "./test_parallel";
+import "./test_all_gather_two";
 import "./test_parallel_mla";
 import "./test_nccl";
 import "./test_nccl_multi";
