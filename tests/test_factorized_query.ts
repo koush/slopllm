@@ -55,7 +55,7 @@ for (const mode of ["single", "tp", "cp"]) {
         }
         const state = { isDecode: rows === 1, cache: { getPagedKV: () => ({ sparseMode: false }) } } as unknown as ExecutionState;
         using absorbed = wk.bmm(wq, heads, latent, rank, nope, true, false);
-        using stream = ops.withStream(() => ops.projectMlaQuery(state, kv, x, wp, wq, wk, absorbed, cos, sin,
+        using stream = ops.withStream(() => ops.projectMlaQuery(state, kv.parallelism, x, wp, wq, wk, absorbed, cos, sin,
           rope, latent, heads, rows, 1, true));
         stream.streamWaitEvent();
         using q = stream.result.qAbsorbed;

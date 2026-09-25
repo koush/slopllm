@@ -772,6 +772,7 @@ export class ParallelTensor extends Tensor {
             return this.linear(narrowed);
           }
         }
+        // mlp.gate.weight ended up being slightly slower, and while it does overlap with shared, its still on the critical path.
         if (!pWeight.name?.includes(".mlp.gate.weight")) {
           console.log(`[shard-candidate] weight=${pWeight.name ?? "(unnamed)"} shape=[${n}, ${weight.shape[1]}] batch=${batch} n/W=${n / W} allgather=${n * batch * 2}B`);
         }
@@ -2591,11 +2592,14 @@ export class ParallelOps implements DeviceOps {
   }
 
   allGatherMultiple(tensors: readonly ParallelTensor[], workspace: WorkspaceBase): ParallelTensor[] {
+    // if (tensors.length === 2) {
+    //   return this.allGatherTwo(tensors[0], tensors[1], workspace);
+    // }
     return this.redistributeMultiple(tensors, workspace, TensorParallelism.Replicated);
   }
 
   /** Gather two independent tensors with one write launch per GPU and one barrier.
-   * Outputs retain their own contiguous layouts; no packing copies are needed.
+   * Return contiguous views of one [gathered A, padding, gathered B] allocation per GPU.
    */
   allGatherTwo<A extends ParallelTensor | undefined, B extends ParallelTensor | undefined>(a: A, b: B, workspace: WorkspaceBase): [A, B];
   allGatherTwo(a: ParallelTensor | undefined, b: ParallelTensor | undefined, workspace: WorkspaceBase): [ParallelTensor | undefined, ParallelTensor | undefined] {
@@ -2620,18 +2624,26 @@ export class ParallelOps implements DeviceOps {
       return this.redistributeMultiple([a, b], workspace, TensorParallelism.Replicated) as [ParallelTensor, ParallelTensor];
     }
     const shardWorkspaces = this.getShardWorkspaces(workspace);
-    const allocOutput = (t: ParallelTensor) => this.wrapShards(workspace,
-      shardWorkspaces.map(ws => group.allocClean(ws, t.shape, t.type)),
-      t.shape, t.type, TensorParallelism.Replicated);
-    const outA = allocOutput(a), outB = allocOutput(b);
+    // Match the native layout; align B for mixed dtypes and vectorized writes.
+    const offsetB = Math.ceil(a.bytes / 256) * 256;
+    const shardsA: Tensor[] = [], shardsB: Tensor[] = [];
+    for (const ws of shardWorkspaces) {
+      using packed = group.allocClean(ws, [offsetB + b.bytes], "U8");
+      using bytesA = packed.narrow(0, a.bytes);
+      using bytesB = packed.narrow(offsetB, b.bytes);
+      shardsA.push(bytesA.reshape(a.shape, a.type));
+      shardsB.push(bytesB.reshape(b.shape, b.type));
+    }
+    const outA = this.wrapShards(workspace, shardsA, a.shape, a.type, TensorParallelism.Replicated);
+    const outB = this.wrapShards(workspace, shardsB, b.shape, b.type, TensorParallelism.Replicated);
     const addon = getNativeAddon();
     for (let rank = 0; rank < this.worldSize; rank++) {
-      const pointers = (out: ParallelTensor) => Array.from({ length: this.worldSize }, (_, peer) => {
+      const pointers = Array.from({ length: this.worldSize }, (_, peer) => {
         const owner = (rank + peer) % this.worldSize;
-        return this.peerArenaPointer(rank, owner, out.shards[owner].data);
+        return this.peerArenaPointer(rank, owner, outA.shards[owner].data);
       });
       addon.p2pAllGatherTwoWrite(this.devices[rank].ctx, a.shards[rank].data, b.shards[rank].data,
-        pointers(outA), pointers(outB), this.worldSize, la.rowBytes, la.outer, lb.rowBytes, lb.outer, rank);
+        pointers, this.worldSize, la.rowBytes, la.outer, lb.rowBytes, lb.outer, rank);
     }
     group.barrier(this.devices);
     return [outA, outB];
@@ -3420,8 +3432,8 @@ export class ParallelOps implements DeviceOps {
     };
   }
 
-  projectMlaQuery(state: ExecutionState, kvCache: Tensor, qNormed: Tensor, qPeWeight: Tensor, qNopeWeight: Tensor, kNopeWeight: Tensor, absorbedWeight: Tensor | undefined, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): MlaQuery {
-    const gatherQ = this.cast(kvCache).parallelism === TensorParallelism.Row;
+  projectMlaQuery(state: ExecutionState, kvParallelism: TensorParallelism, qNormed: Tensor, qPeWeight: Tensor, qNopeWeight: Tensor, kNopeWeight: Tensor, absorbedWeight: Tensor | undefined, cos: Tensor, sin: Tensor, qkRopeDim: number, kvLoraRank: number, nHeads: number, seqLen: number, batch: number, ropeInterleave: boolean): MlaQuery {
+    const gatherQ = kvParallelism === TensorParallelism.Row;
 
     using qPeStream = this.withStream(() => {
       using qPeLin = qNormed.linear(qPeWeight);
@@ -4284,7 +4296,7 @@ export class ParallelOps implements DeviceOps {
     }
     using q8 = this.wrapShards(pQ.workspace, q8Shards, [rows, globalNHeads, IDX_QUANT_HEAD_DIM], "U8", pQ.parallelism);
     using effectiveWeights = this.wrapShards(pQ.workspace, ewShards, [rows, globalNHeads], "F32", pQ.parallelism);
-    const gathered = this.allGatherMultiple([q8, effectiveWeights], q.workspace);
+    const gathered = this.allGatherTwo(q8, effectiveWeights, q.workspace);
     return {
       q8: gathered[0],
       effectiveWeights: gathered[1],

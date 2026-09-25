@@ -401,9 +401,10 @@ rmsnorm_pointers_smem_kernel(
 
 constexpr int AG_WRITE_THREADS = 128;
 
+// Shared verbatim row-write body. The fused wrapper only selects its inputs
+// and supplies the block/grid coordinates of the original per-source launch.
 template <int N>
-__global__ void __launch_bounds__(AG_WRITE_THREADS, 4)
-p2p_allgather_row_write_kernel(
+__device__ __forceinline__ void p2p_allgather_row_write_body(
     const void* __restrict__ local_shard,
     void* __restrict__ out0,  void* __restrict__ out1,
     void* __restrict__ out2,  void* __restrict__ out3,
@@ -413,7 +414,9 @@ p2p_allgather_row_write_kernel(
     int full_dim1_bytes,
     int outer,
     int rank,
-    int src_peer_stride_bytes)
+    int src_peer_stride_bytes,
+    int source_block,
+    int source_grid)
 {
     constexpr int VEC = 16;  // int4
     const int tid = threadIdx.x;
@@ -425,11 +428,11 @@ p2p_allgather_row_write_kernel(
         static_cast<char*>(out6), static_cast<char*>(out7),
     };
 
-    for (int row = blockIdx.x; row < outer; row += gridDim.x)
+    for (int row = source_block; row < outer; row += source_grid)
     {
         #pragma unroll
         for (int j = 0; j < N; j++) {
-            int peer = (j + blockIdx.x) % N;
+            int peer = (j + source_block) % N;
             // Peer pointers are rotated by the sender's rank. A zero stride
             // broadcasts each row; otherwise select the owner's query slice.
             const int owner = (rank + peer) % N;
@@ -453,67 +456,76 @@ p2p_allgather_row_write_kernel(
     }
 }
 
-// ---------------------------------------------------------------------------
-struct AllGatherTwoOutputs {
-    void* a[8];
-    void* b[8];
-};
-
-// Treat A and B as one virtual byte buffer. Each block handles 2 KiB source
-// tiles, including tiles crossing the A/B boundary, and broadcasts to all peers.
-// The two destination regions retain their independent row layouts/dtypes.
 template <int N>
 __global__ void __launch_bounds__(AG_WRITE_THREADS, 4)
-p2p_allgather_two_write_kernel(const void* a, const void* b,
-    AllGatherTwoOutputs outputs, int rowBytesA, int outerA,
+p2p_allgather_row_write_kernel(
+    const void* __restrict__ local_shard,
+    void* __restrict__ out0,  void* __restrict__ out1,
+    void* __restrict__ out2,  void* __restrict__ out3,
+    void* __restrict__ out4,  void* __restrict__ out5,
+    void* __restrict__ out6,  void* __restrict__ out7,
+    int shard_dim1_bytes,
+    int full_dim1_bytes,
+    int outer,
+    int rank,
+    int src_peer_stride_bytes)
+{
+    p2p_allgather_row_write_body<N>(local_shard,
+        out0, out1, out2, out3, out4, out5, out6, out7,
+        shard_dim1_bytes, full_dim1_bytes, outer, rank,
+        src_peer_stride_bytes, blockIdx.x, gridDim.x);
+}
+
+// ---------------------------------------------------------------------------
+// Concatenate the two original row-write grids into one launch. Each source
+// keeps its own row stride, 512-block cap, and block-local peer rotation.
+// Each peer has one [gathered A, padding, gathered B] allocation. The two
+// contiguous regions retain their row layouts/dtypes and are returned as views.
+template <int N>
+__global__ void __launch_bounds__(AG_WRITE_THREADS, 4)
+p2p_allgather_two_write_kernel(const void* __restrict__ a, const void* __restrict__ b,
+    void* __restrict__ out0, void* __restrict__ out1,
+    void* __restrict__ out2, void* __restrict__ out3,
+    void* __restrict__ out4, void* __restrict__ out5,
+    void* __restrict__ out6, void* __restrict__ out7,
+    int rowBytesA, int outerA,
     int rowBytesB, int outerB, int rank) {
-    constexpr int VEC = 16;
-    constexpr int TILE_BYTES = AG_WRITE_THREADS * VEC;
+    const int gridA = max(1, min(512, outerA));
+    const bool second = blockIdx.x >= gridA;
+    const int block = second ? blockIdx.x - gridA : blockIdx.x;
+    const int outer = second ? outerB : outerA;
+    const int rowBytes = second ? rowBytesB : rowBytesA;
+    const int rowStride = max(1, min(512, outer));
     const int64_t bytesA = (int64_t)rowBytesA * outerA;
-    const int64_t totalBytes = bytesA + (int64_t)rowBytesB * outerB;
-    for (int64_t tile = (int64_t)blockIdx.x * TILE_BYTES; tile < totalBytes;
-         tile += (int64_t)gridDim.x * TILE_BYTES) {
-        const int64_t begin = tile + threadIdx.x * VEC;
-        const int64_t end = min(begin + VEC, totalBytes);
-        int64_t pos = begin;
-        while (pos < end) {
-            const bool second = pos >= bytesA;
-            const int rowBytes = second ? rowBytesB : rowBytesA;
-            const int64_t offset = second ? pos - bytesA : pos;
-            const int64_t row = offset / rowBytes;
-            const int col = offset % rowBytes;
-            const int count = (int)min(end - pos, (int64_t)(rowBytes - col));
-            const char* src = static_cast<const char*>(second ? b : a) + offset;
-            // Resolve the virtual source offset once, not once per peer.
-            #pragma unroll
-            for (int j = 0; j < N; ++j) {
-                // Caller rotates peer pointers by sender rank, as in row-write.
-                const int peer = (j + blockIdx.x) % N;
-                char* dst = static_cast<char*>(second ? outputs.b[peer] : outputs.a[peer])
-                    + (row * N + rank) * rowBytes + col;
-                if (count == VEC && ((reinterpret_cast<uintptr_t>(src) |
-                    reinterpret_cast<uintptr_t>(dst)) & (VEC - 1)) == 0) {
-                    *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
-                } else {
-                    for (int i = 0; i < count; ++i) dst[i] = src[i];
-                }
-            }
-            pos += count;
-        }
+    const int64_t offsetB = (bytesA * N + 255) & ~int64_t(255);
+    const int64_t dstOffset = second ? offsetB : 0;
+    out0 = static_cast<char*>(out0) + dstOffset;
+    if constexpr (N > 1) out1 = static_cast<char*>(out1) + dstOffset;
+    if constexpr (N > 2) {
+        out2 = static_cast<char*>(out2) + dstOffset;
+        out3 = static_cast<char*>(out3) + dstOffset;
     }
+    if constexpr (N > 4) {
+        out4 = static_cast<char*>(out4) + dstOffset;
+        out5 = static_cast<char*>(out5) + dstOffset;
+        out6 = static_cast<char*>(out6) + dstOffset;
+        out7 = static_cast<char*>(out7) + dstOffset;
+    }
+    p2p_allgather_row_write_body<N>(second ? b : a,
+        out0, out1, out2, out3, out4, out5, out6, out7,
+        rowBytes, rowBytes * N, outer, rank, 0, block, rowStride);
 }
 
 void launch_allgather_two_write(GlmCtx* ctx, const void* a, const void* b,
-    void* const* outputsA, void* const* outputsB, int N,
+    void* const* peerOutputs, int N,
     int rowBytesA, int outerA, int rowBytesB, int outerB, int rank) {
     cudaSetDevice(ctx->device_id);
-    AllGatherTwoOutputs outputs{};
-    for (int i = 0; i < N; ++i) { outputs.a[i] = outputsA[i]; outputs.b[i] = outputsB[i]; }
-    const int64_t totalBytes = (int64_t)rowBytesA * outerA + (int64_t)rowBytesB * outerB;
-    constexpr int TILE_BYTES = AG_WRITE_THREADS * 16;
-    const int grid = (int)std::min<int64_t>(512, (totalBytes + TILE_BYTES - 1) / TILE_BYTES);
-    if (!grid) return;
-    #define LAUNCH_AG_TWO(N) p2p_allgather_two_write_kernel<N><<<grid, AG_WRITE_THREADS, 0, GLM_STREAM(ctx)>>>(a, b, outputs, rowBytesA, outerA, rowBytesB, outerB, rank)
+    void* outputs[8]{};
+    for (int i = 0; i < N; ++i) outputs[i] = peerOutputs[i];
+    const int grid = std::max(1, std::min(512, outerA)) + std::max(1, std::min(512, outerB));
+    #define LAUNCH_AG_TWO(N) p2p_allgather_two_write_kernel<N><<<grid, AG_WRITE_THREADS, 0, GLM_STREAM(ctx)>>>( \
+        a, b, outputs[0], outputs[1], outputs[2], outputs[3], \
+        outputs[4], outputs[5], outputs[6], outputs[7], rowBytesA, outerA, rowBytesB, outerB, rank)
     switch (N) {
         case 1: LAUNCH_AG_TWO(1); break;
         case 2: LAUNCH_AG_TWO(2); break;
@@ -649,9 +661,9 @@ p2p_reduce_gather_write_kernel(
 extern "C" {
 
 void glm_p2p_allgather_two_write(GlmCtx* ctx, const void* a, const void* b,
-    void* const* outputsA, void* const* outputsB, int N,
+    void* const* outputs, int N,
     int rowBytesA, int outerA, int rowBytesB, int outerB, int rank) {
-    launch_allgather_two_write(ctx, a, b, outputsA, outputsB, N,
+    launch_allgather_two_write(ctx, a, b, outputs, N,
         rowBytesA, outerA, rowBytesB, outerB, rank);
 }
 

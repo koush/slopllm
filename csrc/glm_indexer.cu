@@ -420,37 +420,51 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const 
 #define IDX_GATHER_THREADS 256
 #define IDX_GATHER_WARPS   (IDX_GATHER_THREADS / 32)
 
-// Block-wide ordered slot assignment for one tile of candidates. Every thread
-// in the block must call this with the same `base`; `take` marks the calling
-// thread's candidate. Selected threads receive consecutive slots in ascending
-// threadIdx.x order via a ballot prefix sum, so the assignment depends only on
-// the input -- never on the order warps happen to retire. `*total` receives the
-// block-wide count (uniform), which the caller adds to `base` for the next tile.
-// Requires blockDim.x == IDX_GATHER_THREADS.
-static __device__ __forceinline__ int idx_ordered_slot(
-    bool take, int base, int* __restrict__ s_warp, int* __restrict__ total)
+// Block-wide ordered slot assignment for one tile of candidates, fused across
+// the two selection classes (key > tau and key == tau, which are mutually
+// exclusive). Every thread in the block must call this with the same `base*`;
+// `takeA`/`takeT` mark the calling thread's candidate for each class, where a
+// thread takes at most one. Selected threads receive consecutive slots in
+// ascending threadIdx.x order via a ballot prefix sum, so the assignment depends
+// only on the input -- never on the order warps happen to retire. `*total*`
+// receives the block-wide count (uniform), which the caller adds to its base
+// for the next tile. One barrier pair and one warp-count scan serve both
+// classes, halving the per-tile barrier traffic versus two idx_ordered_slot
+// calls. Requires blockDim.x == IDX_GATHER_THREADS.
+static __device__ __forceinline__ void idx_ordered_slot_pair(
+    bool takeA, int baseA, bool takeT, int baseT,
+    int* __restrict__ s_warp,   // [2 * IDX_GATHER_WARPS]
+    int* __restrict__ slotA, int* __restrict__ slotT,
+    int* __restrict__ totalA, int* __restrict__ totalT)
 {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
 
-    const unsigned vote = __ballot_sync(0xffffffffu, take);
-    if (lane == 0) s_warp[warp] = __popc(vote);
+    const unsigned voteA = __ballot_sync(0xffffffffu, takeA);
+    const unsigned voteT = __ballot_sync(0xffffffffu, takeT);
+    if (lane == 0) {
+        s_warp[warp] = __popc(voteA);
+        s_warp[IDX_GATHER_WARPS + warp] = __popc(voteT);
+    }
     __syncthreads();
 
-    // Every thread scans the warp counts: prefix -> this warp's base, sum ->
-    // the block total. Cheaper than a real scan at this width.
-    int warpOff = 0, sum = 0;
+    // Every thread scans the warp counts once for both classes: prefix -> this
+    // warp's base, sum -> the block total. Cheaper than a real scan at this
+    // width.
+    int warpOffA = 0, warpOffT = 0, sumA = 0, sumT = 0;
 #pragma unroll
     for (int w = 0; w < IDX_GATHER_WARPS; w++) {
-        const int c = s_warp[w];
-        if (w < warp) warpOff += c;
-        sum += c;
+        const int cA = s_warp[w];
+        const int cT = s_warp[IDX_GATHER_WARPS + w];
+        if (w < warp) { warpOffA += cA; warpOffT += cT; }
+        sumA += cA; sumT += cT;
     }
 
-    const int slot = take ? (base + warpOff + __popc(vote & ((1u << lane) - 1))) : -1;
+    *slotA = takeA ? (baseA + warpOffA + __popc(voteA & ((1u << lane) - 1))) : -1;
+    *slotT = takeT ? (baseT + warpOffT + __popc(voteT & ((1u << lane) - 1))) : -1;
     __syncthreads();   // s_warp is reused by the next tile
-    *total = sum;
-    return slot;
+    *totalA = sumA;
+    *totalT = sumT;
 }
 
 static __device__ __forceinline__ int bf16_key_bits(unsigned short u) {
@@ -789,30 +803,33 @@ __global__ void idx_gather_write_kernel(
     __syncthreads();
     int aboveOff = sAboveBase, tieOff = sTieBase;
 
-    __shared__ int s_warp[IDX_GATHER_WARPS];
+    __shared__ int s_warp[2 * IDX_GATHER_WARPS];
     // The tile loop is block-uniform (threads past hi carry take = false) so the
-    // ballot and __syncthreads() inside idx_ordered_slot see the whole block.
+    // ballots and __syncthreads() inside idx_ordered_slot_pair see the whole
+    // block.
     for (int base = lo; base < hi; base += blockDim.x) {
         const int i = base + threadIdx.x;
         const bool inRange = i < hi;
         const int key = inRange ? bf16_key(&s[i]) : -1;   // -1 matches no tau
-        int total;
-
         const bool isAbove = inRange && key > tau;
-        const int aSlot = idx_ordered_slot(isAbove, aboveOff, s_warp, &total);
-        if (isAbove && aSlot < aboveTotal) {
-            out[aSlot] = cp_remap(i, cpWorldSize, cpRank);
-            out_s[aSlot] = s[i];
-        }
-        aboveOff += total;
-
         const bool isTie = inRange && key == tau;
-        const int tRank = idx_ordered_slot(isTie, tieOff, s_warp, &total);
-        if (isTie && tRank < tieTake) {
-            out[aboveTotal + tRank] = cp_remap(i, cpWorldSize, cpRank);
-            out_s[aboveTotal + tRank] = s[i];
+        int aSlot, tRank, aTotal, tTotal;
+
+        idx_ordered_slot_pair(isAbove, aboveOff, isTie, tieOff,
+                              s_warp, &aSlot, &tRank, &aTotal, &tTotal);
+        if (isAbove) {
+            if (aSlot < aboveTotal) {
+                out[aSlot] = cp_remap(i, cpWorldSize, cpRank);
+                out_s[aSlot] = s[i];
+            }
+        } else if (isTie) {
+            if (tRank < tieTake) {
+                out[aboveTotal + tRank] = cp_remap(i, cpWorldSize, cpRank);
+                out_s[aboveTotal + tRank] = s[i];
+            }
         }
-        tieOff += total;
+        aboveOff += aTotal;
+        tieOff += tTotal;
     }
 }
 
@@ -2467,31 +2484,34 @@ __global__ void idx_prefill_gather_buf_kernel(
     int32_t* out = out_idx + (size_t)row * topk;
     __nv_bfloat16* out_s = out_scores + (size_t)row * topk;
 
-    __shared__ int s_warp[IDX_GATHER_WARPS];
+    __shared__ int s_warp[2 * IDX_GATHER_WARPS];
     int aboveOff = 0, tieOff = 0;
-    // The tile loop is block-uniform (threads past len carry take = false) so the
-    // ballot and __syncthreads() inside idx_ordered_slot see the whole block.
+    // The tile loop is block-uniform (threads past len carry take = false) so
+    // the ballots and __syncthreads() inside idx_ordered_slot_pair see the
+    // whole block.
     for (int base = 0; base < len; base += blockDim.x) {
         const int i = base + threadIdx.x;
         const bool inRange = i < len;
         const int key = inRange ? bf16_key(&s[i]) : -1;   // -1 matches no tau
-        int total;
-
         const bool isAbove = inRange && key > tau;
-        const int aSlot = idx_ordered_slot(isAbove, aboveOff, s_warp, &total);
-        if (isAbove && aSlot < aboveTotal) {
-            out[aSlot] = cp_remap(i, cpWorldSize, cpRank);
-            out_s[aSlot] = s[i];
-        }
-        aboveOff += total;
-
         const bool isTie = inRange && key == tau;
-        const int tRank = idx_ordered_slot(isTie, tieOff, s_warp, &total);
-        if (isTie && tRank < tieTake) {
-            out[aboveTotal + tRank] = cp_remap(i, cpWorldSize, cpRank);
-            out_s[aboveTotal + tRank] = s[i];
+        int aSlot, tRank, aTotal, tTotal;
+
+        idx_ordered_slot_pair(isAbove, aboveOff, isTie, tieOff,
+                              s_warp, &aSlot, &tRank, &aTotal, &tTotal);
+        if (isAbove) {
+            if (aSlot < aboveTotal) {
+                out[aSlot] = cp_remap(i, cpWorldSize, cpRank);
+                out_s[aSlot] = s[i];
+            }
+        } else if (isTie) {
+            if (tRank < tieTake) {
+                out[aboveTotal + tRank] = cp_remap(i, cpWorldSize, cpRank);
+                out_s[aboveTotal + tRank] = s[i];
+            }
         }
-        tieOff += total;
+        aboveOff += aTotal;
+        tieOff += tTotal;
     }
 }
 

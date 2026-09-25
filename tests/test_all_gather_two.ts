@@ -5,7 +5,7 @@ import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
 import { TensorParallelism as TP } from "../src/device_ops";
 import { WorkspaceBase } from "../src/workspace";
 
-test("allGatherTwo: mixed layouts/dtypes, byte tails, stream waits, graph replay and fallback", () => {
+test("allGatherTwo: shared backing, mixed layouts/dtypes, byte tails, stream waits, graph replay and fallback", () => {
   const devices = [new GlmOps(0), new GlmOps(1)];
   const ops = new ParallelOps(devices);
   const ws = new WorkspaceBase(ops);
@@ -15,7 +15,7 @@ test("allGatherTwo: mixed layouts/dtypes, byte tails, stream waits, graph replay
       [[4, 32, 128], TP.Row, [4, 32], TP.Row],
       [[3, 6], TP.Row, [5, 10], TP.Row],
       [[257, 34], TP.Row, [7, 6], TP.Row],
-      // Combined payload exceeds the 512-block grid cap; exercise tile striding.
+      // A exceeds its 512-block grid cap; B uses exactly 512 row blocks.
       [[1024, 1024], TP.Row, [512, 1024], TP.Row],
       [[4, 7], TP.Column, [3, 6], TP.Row],
       [[3, 6], TP.Row, [4, 5], TP.Column],
@@ -35,6 +35,15 @@ test("allGatherTwo: mixed layouts/dtypes, byte tails, stream waits, graph replay
       using outA = stream.result[0];
       using outB = stream.result[1];
       ops.synchronize();
+      if (parA !== TP.Replicated) {
+        for (let rank = 0; rank < devices.length; rank++) {
+          const sa = outA.shards[rank], sb = outB.shards[rank];
+          assert.ok(sa.view, "gathered output must be a view");
+          assert.equal(sa.view, sb.view, "both outputs must share one allocation");
+          assert.equal(sa.data, sa.view.data);
+          assert.equal(sb.data - sa.data, Math.ceil(a.bytes / 256) * 256);
+        }
+      }
       for (const [out, expected] of [[outA, dataA], [outB, dataB]] as const) {
         assert.equal(out.parallelism, TP.Replicated);
         for (const shard of out.shards) {
@@ -42,6 +51,17 @@ test("allGatherTwo: mixed layouts/dtypes, byte tails, stream waits, graph replay
           shard.d2h(actual);
           assert.deepEqual(actual, expected);
         }
+      }
+      // Releasing one view must not make the backing allocation reusable while
+      // the other view is still live, including after the alternate-stream wait.
+      outA[Symbol.dispose]();
+      using overwrite = ws.alloc([Math.ceil(a.bytes / 256) * 256 + b.bytes], "U8");
+      overwrite.fill(0, overwrite.numElements);
+      ops.synchronize();
+      for (const shard of outB.shards) {
+        const actual = Buffer.alloc(dataB.length);
+        shard.d2h(actual);
+        assert.deepEqual(actual, dataB);
       }
     }
 

@@ -438,7 +438,7 @@ void glm_p2p_set_peers(GlmCtx* ctx, GlmP2PInstance* inst,
 // after. Each GPU reads its local shard and writes to all N peers' outputs.
 //   peer_j_output + row * full_dim1_bytes + rank * shard_dim1_bytes
 void glm_p2p_allgather_two_write(GlmCtx* ctx, const void* a, const void* b,
-    void* const* outputsA, void* const* outputsB, int N,
+    void* const* outputs, int N,
     int rowBytesA, int outerA, int rowBytesB, int outerB, int rank);
 
 void glm_p2p_allgather_row_write(GlmCtx* ctx,

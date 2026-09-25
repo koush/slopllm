@@ -664,8 +664,8 @@ export class Glm51Model extends ChatModel {
 
         idxWeightsStream!.streamWaitEvent();
 
-        // this is slower due to double gather
-        if (false) {
+        // Quantize before gathering Q and effective weights in one transfer.
+        if (true) {
           const idxQuantResult = this.ops.indexerQuantizeQ(idxQ, idxWeights, Math.pow(cfg.indexHeadDim, -0.5));
           using idxQFp8 = idxQuantResult.q8;
           using effectiveWeights = idxQuantResult.effectiveWeights;
@@ -690,6 +690,42 @@ export class Glm51Model extends ChatModel {
           );
         }
       });
+
+    // absorbed weight seems to only be worthwhile if precomputed, but its prefill throughput 10% gain max.
+    // weight is substantial, but could maybe be useful for very large prefills.
+    // disabling for now.
+    using absorbedWeightStream = true || state.totalTokens < 4096
+      ? undefined
+      : this.ops.withStream(() => {
+        const kNopeProj = this.tensors.get(`${pfx}.k_nope_proj.weight`)!;
+        const qNopeProj = this.tensors.get(`${pfx}.q_nope_proj.weight`)!;
+        using kNope = kNopeProj.viewClone();
+        const savedWorkspace = kNope.workspace;
+        kNope.setViewWorkspace(state.ws);
+        try {
+          const absorbed = kNope.bmm(qNopeProj, nHeads, kvLoraRank, cfg.qLoraRank, cfg.qkNopeHeadDim, true, false);
+          return absorbed;
+        }
+        finally {
+          kNope.setViewWorkspace(savedWorkspace);
+        }
+      });
+
+    using qStream = this.ops.withStream(shared, () => {
+      absorbedWeightStream?.streamWaitEvent();
+      using absorbedWeight = absorbedWeightStream?.result;
+      qNormedStream.streamWaitEvent();
+      const ckvParallelism = ckvPrefetch?.value?.parallelism || state.cache.getPagedKV().ckvData[layerIdx].parallelism;
+      return this.ops.projectMlaQuery(
+        state, ckvParallelism, qNormed,
+        this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
+        this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
+        this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
+        absorbedWeight,
+        cos, sin,
+        qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,
+      );
+    });
 
     using kvcache = this.ops.withStream(() => {
       using kPeRopeStream = this.ops.withStream(() => {
@@ -736,42 +772,7 @@ export class Glm51Model extends ChatModel {
       }
     });
 
-    // absorbed weight seems to only be worthwhile if precomputed, but its prefill throughput 10% gain max.
-    // weight is substantial, but could maybe be useful for very large prefills.
-    // disabling for now.
-    using absorbedWeightStream = true || state.totalTokens < 4096
-      ? undefined
-      : this.ops.withStream(() => {
-        const kNopeProj = this.tensors.get(`${pfx}.k_nope_proj.weight`)!;
-        const qNopeProj = this.tensors.get(`${pfx}.q_nope_proj.weight`)!;
-        using kNope = kNopeProj.viewClone();
-        const savedWorkspace = kNope.workspace;
-        kNope.setViewWorkspace(state.ws);
-        try {
-          const absorbed = kNope.bmm(qNopeProj, nHeads, kvLoraRank, cfg.qLoraRank, cfg.qkNopeHeadDim, true, false);
-          return absorbed;
-        }
-        finally {
-          kNope.setViewWorkspace(savedWorkspace);
-        }
-      });
-
-
     const cache = kvcache.result;
-    using qStream = this.ops.withStream(() => {
-      absorbedWeightStream?.streamWaitEvent();
-      using absorbedWeight = absorbedWeightStream?.result;
-      qNormedStream.streamWaitEvent();
-      return this.ops.projectMlaQuery(
-        state, cache.ckv!, qNormed,
-        this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
-        this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
-        this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
-        absorbedWeight,
-        cos, sin,
-        qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,
-      );
-    });
 
     using ckv = cache.ckv;
     using qAbsorbedR = qStream.result.qAbsorbed;
@@ -1191,7 +1192,7 @@ export class Glm51Model extends ChatModel {
     let nextSeedRows = sequences.map((_, batch) => batch);
     let speculative = false;
 
-    let pending: MtpDecodeStepResult|undefined;
+    let pending: MtpDecodeStepResult | undefined;
 
     try {
       // Fixed generator-owned carry buffers keep graph inputs stable. A step
