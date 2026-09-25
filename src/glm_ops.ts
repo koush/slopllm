@@ -370,6 +370,12 @@ export class GlmTensor extends Tensor {
     return getNativeAddon().memcpy2dHostToDeviceAsync(this.ops.ctx, this.data + dstOffset, dpitch, src, spitch, width, height);
   }
 
+  checkHostMemcpyCapture(kind?: MemcpyKind) {
+    if (CaptureManager.capturing && kind === MemcpyKind.HostToDevice) {
+      throw new Error("Host to device memcpy captured? Is this intentional?");
+    }
+  }
+
   memcpy(src: Tensor, size?: number, kind?: MemcpyKind): void {
     super.memcpy(src, size, kind);
     if (!(src instanceof GlmTensor)) {
@@ -377,6 +383,7 @@ export class GlmTensor extends Tensor {
     }
     const bytes = size ?? Math.min(this.allocSize, src.allocSize);
     const copyKind = kind ?? (src.pinned ? MemcpyKind.HostToDevice : MemcpyKind.DeviceToDevice);
+    this.checkHostMemcpyCapture(copyKind);
     // if (copyKind === MemcpyKind.DeviceToDevice && this.glm !== src.glm) {
     //   getNativeAddon().memcpyPeer(src.glm.ctx, this.data, this.glm.device, src.data, src.glm.device, bytes);
     // } else {
@@ -389,6 +396,7 @@ export class GlmTensor extends Tensor {
     if (!(src instanceof GlmTensor)) {
       throw new Error("GlmTensor.memcpy requires GlmTensor source");
     }
+    this.checkHostMemcpyCapture(kind);
     // if (kind === MemcpyKind.DeviceToDevice && this.glm !== (src as GlmTensor).glm) {
     //   const s = src as GlmTensor;
     //   getNativeAddon().memcpy3dPeer(
@@ -836,12 +844,15 @@ export class GlmTensor extends Tensor {
 export class GlmOps implements DeviceOps {
   getCaptureKeys(state: ExecutionState): readonly (string | number)[] {
     const pagedKV = state.cache.getPagedKV();
-    if (!pagedKV.sparseMode || !pagedKV.contextParallel) {
+    if (!pagedKV.sparseMode) {
       return [];
     }
+    // Query sharding can select direct indexer dispatch even for larger plans.
+    // Key its launch budget independently of the stable score-buffer capacity.
+    const keys = [`indexerNumSplits:${this.indexerNumSplits(state)}`];
     const numQueries = state.isDecode ? state.batchSize : state.totalTokens;
-    if (!state.isDecode && numQueries > SPARSE_MLA_DECODE_DISPATCH_MAX) {
-      return [];
+    if (!pagedKV.contextParallel || (!state.isDecode && numQueries > SPARSE_MLA_DECODE_DISPATCH_MAX)) {
+      return keys;
     }
     const { numAttentionHeads, indexTopk } = state.model.cfg;
     if (indexTopk === undefined) {
@@ -855,8 +866,13 @@ export class GlmOps implements DeviceOps {
     // single captured graph instead of paying a capture per bucket.
     const chunksPerBlock = this.sparseMlaChunkHint(state, numQueries, numAttentionHeads, indexTopk);
     return [
+      ...keys,
       `sparseMlaChunksPerBlock:${chunksPerBlock}`,
     ];
+  }
+
+  private indexerNumSplits(state: ExecutionState): number {
+    return Math.min(256, Math.max(1, Math.ceil(state.paddedKvLen / 256)));
   }
 
   private sparseMlaChunkHint(state: ExecutionState, numQueries: number, numHeads: number, topk: number): number {
@@ -1517,18 +1533,17 @@ export class GlmOps implements DeviceOps {
     }
     const maxKvCapacity = kData.shape[0] * kData.shape[1];
     const useDirect = totalQ <= INDEXER_DIRECT_DISPATCH_MAX;
-    // Decode graphs are length-invariant. Eager prefill uses exact KV length;
-    // captured prefill uses the padded KV bucket for graph-stable sizing.
+    // Direct dispatch keeps storage capacity stable; its split count is keyed
+    // separately from paddedKvLen. Larger prefill uses length-bounded storage.
     const maxKv = decode || useDirect
       ? maxKvCapacity
       : Math.min(maxKvCapacity, CaptureManager.capturing === undefined
         ? state.getEagerKvLen()
         : state.getGraphVariantPaddedKvLen());
-    const scoreShape = [totalQ, maxKv];
     const queryTiles = Math.ceil(totalQ / 64) + state.batchSize - 1;
     return useDirect
-      ? this.indexerScoreTopkV2(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, scoreShape, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights)
-      : this.indexerScoreTopkPrefill(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, scoreShape, queryTiles, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights);
+      ? this.indexerScoreTopkV2(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, this.indexerNumSplits(state), decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights)
+      : this.indexerScoreTopkPrefill(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, queryTiles, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights);
   }
 
   // Sort each top-k row ascending by index (-1 padding last), in place.
@@ -1609,13 +1624,13 @@ export class GlmOps implements DeviceOps {
     };
   }
 
-  private indexerScoreTopkPrefill(q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, scoreShape: number[], queryTiles: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
+  private indexerScoreTopkPrefill(q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, queryTiles: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
     // sum(ceil(seqQ / 64)) <= ceil(totalQ / 64) + batchSize - 1. This is
     // exact for the single-sequence query-sharded path and stable for capture
     // because totalQ and batchSize are both part of the graph key.
     const indices = q.workspace.alloc([totalQ, topk], "I32");
     const values = q.workspace.alloc([totalQ, topk], "BF16");
-    using scores = q.workspace.alloc(scoreShape, "BF16");
+    using scores = q.workspace.alloc([totalQ, maxKv], "BF16");
     using rowLen = q.workspace.alloc([totalQ], "I32");
     using coarseHist = q.workspace.alloc([totalQ, 1024], "I32");
     using fineHist = q.workspace.alloc([totalQ, 64], "I32");
@@ -1624,11 +1639,10 @@ export class GlmOps implements DeviceOps {
     return { values, indices };
   }
 
-  private indexerScoreTopkV2(q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, scoreShape: number[], causal = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
-    const numSplits = Math.min(256, Math.max(1, Math.ceil(maxKv / 256)));
+  private indexerScoreTopkV2(q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, numSplits: number, causal = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
     const indices = q.workspace.alloc([totalQ, topk], "I32");
     const values = q.workspace.alloc([totalQ, topk], "BF16");
-    using scores = q.workspace.alloc(scoreShape, "BF16");
+    using scores = q.workspace.alloc([totalQ, maxKv], "BF16");
     using rowLen = q.workspace.alloc([totalQ], "I32");
     using hist = q.workspace.alloc([totalQ, TOPK_SCRATCH_I32], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
