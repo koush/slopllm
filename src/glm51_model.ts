@@ -663,18 +663,35 @@ export class Glm51Model extends ChatModel {
         using idxQ = rotated.reshape([B * S, cfg.indexNHeads, cfg.indexHeadDim]);
 
         idxWeightsStream!.streamWaitEvent();
-        const idxQuantResult = this.ops.indexerQuantizeQ(idxQ, idxWeights, Math.pow(cfg.indexHeadDim, -0.5));
-        using idxQFp8 = idxQuantResult.q8;
-        using effectiveWeights = idxQuantResult.effectiveWeights;
 
-        kvcacheIndex?.streamWaitEvent();
 
-        // Store the raw indexer top-k (token positions); slots are derived
-        // per-layer/per-mode below and in the gather (slotsReady).
-        return state.indexerTopk(
-          idxQFp8, kData, kScaleData, undefined,
-          Math.pow(idxHeadDim, -0.5), idxTopk, effectiveWeights
-        );
+        // this is slower due to double gather
+        if (false) {
+          const idxQuantResult = this.ops.indexerQuantizeQ(idxQ, idxWeights, Math.pow(cfg.indexHeadDim, -0.5));
+          using idxQFp8 = idxQuantResult.q8;
+          using effectiveWeights = idxQuantResult.effectiveWeights;
+
+          kvcacheIndex?.streamWaitEvent();
+
+          // Store the raw indexer top-k (token positions); slots are derived
+          // per-layer/per-mode below and in the gather (slotsReady).
+          return state.indexerTopk(
+            idxQFp8, kData, kScaleData, undefined,
+            Math.pow(idxHeadDim, -0.5), idxTopk, effectiveWeights
+          );
+        }
+        else {
+          kvcacheIndex?.streamWaitEvent();
+
+          // Store the raw indexer top-k (token positions); slots are derived
+          // per-layer/per-mode below and in the gather (slotsReady).
+          return state.indexerTopk(
+            idxQ, kData, kScaleData, idxWeights,
+            Math.pow(idxHeadDim, -0.5), idxTopk
+          );
+        }
+
+
       });
 
     using kvcache = this.ops.withStream(() => {
