@@ -202,7 +202,38 @@ export class CaptureManager implements Disposable, ExecutionManager {
                     return mapTensors(captured.result, tensor => tensor.uncapture());
                 }
 
-                if (captured.warmupSteps === 1) {
+                // Run three eager executions per key before capturing on the
+                // fourth invocation. This is a conservative performance mitigation,
+                // not a CUDA requirement or a substitute for correct initialization.
+                //
+                // In the eight-GPU GLM CP/MTP investigation (September 2026),
+                // capturing after one eager execution left steady-state replay
+                // roughly 0.5-0.7 ms/step slower (~3-4%). Two eager executions
+                // recovered most of the loss; use three to leave some margin.
+                // The gap persisted with KV length fixed and matching acceptance,
+                // and thousands of graph replays did not recover it. Forcing
+                // KV-length graph variants also helped, but changing capture
+                // history was sufficient: increasing KV length was not required.
+                //
+                // Slow/fast graph dumps matched kernel names, displayed launch
+                // attributes, node types, and dependency edges on all eight GPUs
+                // after address normalization. No extra initialization nodes were
+                // found. Crucially, ONE eager main-decode execution made the SAME
+                // retained graph faster, without prefill, boundary replay, or
+                // recapture; replay-only controls remained slower. This points to
+                // execution-history-dependent state outside graph structure, not
+                // necessarily a bad graph captured on the earlier invocation.
+                // Kernel arguments, buffer contents/aliasing, and library/runtime
+                // state were not fully isolated. Explicit cuBLAS workspaces did
+                // not remove the gap; sampled SM/memory clocks showed no matching
+                // frequency increase across recovery, but that was not a definitive
+                // exclusion of all power-management effects.
+                //
+                // Root cause remains unresolved. Do not reduce this count based
+                // only on successful capture or matching outputs: compare sustained
+                // replay timing, including fixed-length and retained-graph/eager
+                // conditioning controls. Extra warmup is not a correctness proof.
+                if (captured.warmupSteps === 3) {
                     const capturedInputs: typeof inputs = {} as any;
                     for (const [name, tensor] of Object.entries(inputs)) {
                         if (!tensor)
