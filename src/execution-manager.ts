@@ -4,7 +4,8 @@ import type { Tensor } from "./tensor";
 export interface ExecutionOptions<I extends Record<string, Tensor>> {
   states: readonly ExecutionState[];
   inputs: I;
-  key: readonly (string | number)[];
+  /** An omitted or empty key executes eagerly. */
+  key?: readonly (string | number)[];
 }
 
 export interface ExecutionResult<T> {

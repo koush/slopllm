@@ -1651,6 +1651,10 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
             &entry.heuristic.algo, workspace, workspace_size,
             GLM_STREAM(ctx));
     } else {
+        // Reuse the caller's stream-ordered Lt workspace for the fallback.
+        // Bind after stream selection, which resets the handle's workspace.
+        cublasSetStream(CUBLAS(ctx), GLM_STREAM(ctx));
+        cublasSetWorkspace(CUBLAS(ctx), workspace, workspace_size);
         cublasGemmEx(CUBLAS(ctx),
             CUBLAS_OP_T, CUBLAS_OP_N,
             n, batch, k,
@@ -1661,6 +1665,9 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
             out,    CUDA_R_16BF, n,
             CUDA_R_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        // Other cuBLAS entry points share this handle; do not leave them bound
+        // to a temporary workspace whose lifetime belongs to this call.
+        cublasSetStream(CUBLAS(ctx), GLM_STREAM(ctx));
     }
 
 }

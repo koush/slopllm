@@ -44,7 +44,7 @@ export class CaptureManager implements Disposable, ExecutionManager {
     execute<T, I extends Record<string, Tensor>>(
         options: ExecutionOptions<I>, fn: (inputs: I) => T,
     ): ExecutionResult<T> {
-        const warmup = this.captureEnabled && options.key.length > 0 && !this.isStateCaptured(options);
+        const warmup = this.captureEnabled && !!options.key?.length && !this.isStateCaptured(options);
         const result = this.runStates(options, (_capturing, retained) => fn(retained));
         return { warmup, result };
     }
@@ -63,14 +63,14 @@ export class CaptureManager implements Disposable, ExecutionManager {
     }
 
     isStateCaptured<I extends Record<string, Tensor>>(options: ExecutionOptions<I>): boolean {
-        return options.key.length > 0 && this.isCaptured(this.stateKeys(options.states, options.key).params, options.inputs);
+        return !!options.key?.length && this.isCaptured(this.stateKeys(options.states, options.key).params, options.inputs);
     }
 
     /** Legacy capture callbacks also receive whether this invocation records a graph. */
     runStates<T, I extends Record<string, Tensor>>(
         { states, inputs, key }: ExecutionOptions<I>, fn: (capturing: boolean, inputs: I) => T,
     ): T {
-        if (!key.length) return fn(false, inputs);
+        if (!key?.length) return fn(false, inputs);
         const { base, params } = this.stateKeys(states, key);
         const bindings: Record<string, string> | undefined = process.env.GLM_GRAPH_DIAGNOSTICS === "1" ? {} : undefined;
         if (bindings) {

@@ -365,14 +365,14 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_float, ctypes.c_float,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t
         ]
 
         self.lib.glm_mla_v_expand.restype = None
         self.lib.glm_mla_v_expand.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t
         ]
 
         self.lib.glm_scale.restype = None
@@ -1394,23 +1394,29 @@ class GlmOps:
     def bmm(self, C, A, B, alpha, beta, batch, M, N, K, transA=0, transB=0, token_major=False):
         if token_major and (transA or transB):
             raise ValueError("token_major requires non-transposed operands")
+        if not hasattr(self, "_cublas_workspace"):
+            self._cublas_workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=C.device)
         self.lib.glm_bmm(
             self.ctx,
             self._ptr(C),
             self._ptr(A),
             self._ptr(B),
             ctypes.c_float(alpha), ctypes.c_float(beta),
-            batch, M, N, K, transA, transB, int(token_major)
+            batch, M, N, K, transA, transB, int(token_major),
+            self._ptr(self._cublas_workspace), self._cublas_workspace.numel()
         )
 
     def mlaVExpand(self, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch, attn_n_heads=None, head_offset=0, v_proj_head_offset=0):
         if attn_n_heads is None:
             attn_n_heads = n_heads
+        if not hasattr(self, "_cublas_workspace"):
+            self._cublas_workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=result.device)
         self.lib.glm_mla_v_expand(
             self.ctx,
             self._ptr(result), self._ptr(attn_out), self._ptr(v_proj),
             kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
-            attn_n_heads, head_offset, v_proj_head_offset
+            attn_n_heads, head_offset, v_proj_head_offset,
+            self._ptr(self._cublas_workspace), self._cublas_workspace.numel()
         )
 
     def scale(self, output, input, scale, n):

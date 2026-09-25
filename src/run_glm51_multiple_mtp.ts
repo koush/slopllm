@@ -236,9 +236,10 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCa
   }
   const generated: number[][] = Array.from({ length: args.batchSize }, () => []);
   const finished = Array(args.batchSize).fill(args.maxNewTokens === 0);
-  const mtpStats = args.noMtp ? undefined : new MtpStats(args.mtp);
-  let firstPostWarmupTime = 0;
-  let lastTokenTime = 0;
+  let mtpStats = args.noMtp ? undefined : new MtpStats(args.mtp);
+  let measurementStart = 0;
+  let measurementEnd = 0;
+  let postWarmupStepCount = 0;
   let postWarmupTokenCount = 0;
 
   if (sharePrefill) {
@@ -260,24 +261,29 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCa
       ? model.generateDecode(ws, cache, captureManager)
       : model.generateMtpDecode(ws, cache, args.mtp, captureManager);
     for await (const step of generator) {
+      const completedAt = performance.now();
       const { warmup, tokens: stepTokens, numAccepted, numDraftTokens } = step;
-      if (!warmup && mtpStats) {
-        for (const count of numAccepted) mtpStats.observe(numDraftTokens, count);
+      if (warmup || measurementStart === 0) {
+        // Anchor at completion, excluding initialization and every warmup/capture.
+        // With no warmup, the first yielded step establishes the baseline.
+        measurementStart = completedAt;
+        measurementEnd = completedAt;
+        postWarmupStepCount = 0;
+        postWarmupTokenCount = 0;
+        mtpStats = args.noMtp ? undefined : new MtpStats(args.mtp);
+      } else {
+        measurementEnd = completedAt;
+        postWarmupStepCount++;
+        // Count the complete executed step, including any final budget overshoot.
+        postWarmupTokenCount += stepTokens.reduce((count, tokens) => count + tokens.length, 0);
+        if (mtpStats) {
+          for (const count of numAccepted) mtpStats.observe(numDraftTokens, count);
+        }
       }
 
       for (let batch = 0; batch < args.batchSize; batch++) {
         for (const token of stepTokens[batch]) {
           generated[batch].push(token);
-
-          const now = performance.now();
-          if (firstPostWarmupTime === 0) firstPostWarmupTime = now;
-          lastTokenTime = now;
-          if (warmup) {
-            firstPostWarmupTime = 0;
-            postWarmupTokenCount = 0;
-          } else {
-            postWarmupTokenCount++;
-          }
 
           if ((!args.ignoreEos && model.eosIds.has(token)) || generated[batch].length >= args.maxNewTokens) {
             finished[batch] = true;
@@ -290,8 +296,9 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCa
   }
 
   const elapsed = (performance.now() - started) / 1000;
-  const decodeTokPerSec = postWarmupTokenCount > 1 && firstPostWarmupTime > 0
-    ? postWarmupTokenCount / ((lastTokenTime - firstPostWarmupTime) / 1000)
+  const measuredMs = measurementEnd - measurementStart;
+  const decodeTokPerSec = measuredMs > 0
+    ? postWarmupTokenCount * 1000 / measuredMs
     : 0;
   console.log(`Stopped when batch ${finished.findIndex(Boolean) + 1} completed after ${elapsed.toFixed(1)}s.`);
   for (let batch = 0; batch < args.batchSize; batch++) {
@@ -301,6 +308,14 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCa
     console.log(model.tokenizer.decode(visibleTokens, { skip_special_tokens: true }));
   }
   console.log(`\ndecode=${decodeTokPerSec.toFixed(1)} tok/s`);
+  if (postWarmupStepCount > 0) {
+    console.log(`Decode timing: ${(measuredMs / postWarmupStepCount).toFixed(4)} ms/step, ` +
+      `${postWarmupStepCount} steps, ${measuredMs.toFixed(3)} ms, ${postWarmupTokenCount} tokens, ` +
+      `${(postWarmupTokenCount / postWarmupStepCount).toFixed(4)} tokens/step ` +
+      `(wall clock after last warmup; complete steps across batch)`);
+  } else {
+    console.log("Decode timing: no measured steps after the last warmup/baseline step");
+  }
   if (mtpStats) {
     console.log(mtpStats.log() || "MTP metrics: no post-warmup drafts");
   }
@@ -344,6 +359,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         finally { if (profiling) profilerStop(); }
       }
       ws.clearTracking();
+      const capturedGraphs = [...captureManager.captured.values()].filter(entry => entry.graphExec !== null).length;
+      console.log(`CUDA graphs after ${warmup ? "warmup" : "measured"} run: ${capturedGraphs} captured, ${captureManager.captured.size - capturedGraphs} warming up (currently cached logical graphs across GPUs).`);
     }
   } finally {
     freeResources(model, cache, ws, ops, gpuDevices);

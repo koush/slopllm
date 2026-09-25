@@ -47,6 +47,7 @@ const INDEXER_DIRECT_DISPATCH_MAX = Number(process.env.GLM_INDEXER_DIRECT_DISPAT
 export const INDEXER_FP8_MMA_DISABLED = process.env.GLM_INDEXER_DECODE_FP8_MMA === "0";
 const TOPK_SCRATCH_I32 = 1056;
 const CUBLASLT_WORKSPACE_BYTES = 2 * 1024 * 1024;
+const CUBLAS_WORKSPACE_BYTES = 32 * 1024 * 1024;
 
 function ptr(t: Tensor | undefined): number {
   return t ? t.data : 0;
@@ -177,7 +178,8 @@ export class GlmTensor extends Tensor {
   bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false, tokenMajor: boolean = false): Tensor {
     super.bmm(B, batch, M, N, K, transA, transB, tokenMajor);
     const out = this.workspace.alloc(tokenMajor ? [M, batch, N] : [batch * M, N], this.type);
-    getNativeAddon().bmm(this.ops.ctx, out.data, this.data, B.data, 1.0, 0.0, batch, M, N, K, transA ? 1 : 0, transB ? 1 : 0, tokenMajor);
+    using workspace = this.workspace.allocRaw(CUBLAS_WORKSPACE_BYTES);
+    getNativeAddon().bmm(this.ops.ctx, out.data, this.data, B.data, 1.0, 0.0, batch, M, N, K, transA ? 1 : 0, transB ? 1 : 0, tokenMajor, workspace.data, workspace.bytes);
     return out;
   }
 
@@ -446,7 +448,8 @@ export class GlmTensor extends Tensor {
     const out = this.workspace.alloc([BS, nHeads * vHeadDim], this.type);
     const effSeqLen = tokenMajor ? 1 : seqLen;
     const effBatch = tokenMajor ? BS : batch;
-    getNativeAddon().mlaVExpand(this.ops.ctx, out.data, inputData, vProj.data, kvLoraRank, vHeadDim, nHeads, effSeqLen, effBatch, attnNHeads, headOffset, vProjHeadOffset);
+    using workspace = effBatch === 1 || effSeqLen === 1 ? this.workspace.allocRaw(CUBLAS_WORKSPACE_BYTES) : undefined;
+    getNativeAddon().mlaVExpand(this.ops.ctx, out.data, inputData, vProj.data, kvLoraRank, vHeadDim, nHeads, effSeqLen, effBatch, attnNHeads, headOffset, vProjHeadOffset, workspace?.data ?? 0, workspace?.bytes ?? 0);
     return out;
   }
 

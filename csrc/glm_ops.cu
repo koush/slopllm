@@ -810,7 +810,7 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        int kv_lora_rank, int v_head_dim, int n_heads,
                        int seq_len, int batch,
                        int attn_n_heads, int head_offset,
-                       int v_proj_head_offset) {
+                       int v_proj_head_offset, void* workspace, size_t workspace_size) {
     cudaSetDevice(ctx->device_id);
 
     // cuBLAS strided batched GEMM: for each head h,
@@ -854,44 +854,24 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
 
         float alpha = 1.0f, beta = 0.0f;
 
-        if (true) {
-            // this works for dense MLA but not for sparse MLA path?
-            cublasGemmStridedBatchedEx(CUBLAS(ctx),
-                CUBLAS_OP_N, CUBLAS_OP_N,
-                V,          // m
-                BS,         // n
-                Lkv,        // k
-                &alpha,
-                A_base, CUDA_R_16BF, lda, strideA,
-                B_base, CUDA_R_16BF, ldb, strideB,
-                &beta,
-                result, CUDA_R_16BF, ldc, strideC,
-                n_heads,    // batchCount
-                CUDA_R_32F,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        }
-        else {
-            // NOTE: this no longer seems true and the issue may have been another bug in the code being reflected here?
-
-            // Use cublasGemmEx per-head loop instead of cublasGemmStridedBatchedEx.
-            // The strided batched API causes illegal memory access on SM120 with
-            // the decode layout (seq_len=1, ldb=attn_n_heads*Lkv).
-            for (int h = 0; h < n_heads; h++) {
-                const void* A_h = (const char*)A_base + (long long)h * strideA * sizeof(__nv_bfloat16);
-                const void* B_h = (const char*)B_base + (long long)h * strideB * sizeof(__nv_bfloat16);
-                void* C_h = (char*)result + (long long)h * strideC * sizeof(__nv_bfloat16);
-                cublasGemmEx(CUBLAS(ctx),
-                    CUBLAS_OP_N, CUBLAS_OP_N,
-                    V, BS, Lkv,
-                    &alpha,
-                    A_h, CUDA_R_16BF, lda,
-                    B_h, CUDA_R_16BF, ldb,
-                    &beta,
-                    C_h, CUDA_R_16BF, ldc,
-                    CUDA_R_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            }
-        }
+        // this works for dense MLA but not for sparse MLA path?
+        cublasSetStream(CUBLAS(ctx), GLM_STREAM(ctx));
+        cublasSetWorkspace(CUBLAS(ctx), workspace, workspace_size);
+        cublasGemmStridedBatchedEx(CUBLAS(ctx),
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            V,          // m
+            BS,         // n
+            Lkv,        // k
+            &alpha,
+            A_base, CUDA_R_16BF, lda, strideA,
+            B_base, CUDA_R_16BF, ldb, strideB,
+            &beta,
+            result, CUDA_R_16BF, ldc, strideC,
+            n_heads,    // batchCount
+            CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        // Release the handle's binding to caller-owned temporary scratch.
+        cublasSetStream(CUBLAS(ctx), GLM_STREAM(ctx));
         return;
     }
 
@@ -2396,7 +2376,8 @@ void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
 
 void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
              float alpha, float beta,
-             int batch, int M, int N, int K, int transA, int transB, int tokenMajor) {
+             int batch, int M, int N, int K, int transA, int transB, int tokenMajor,
+             void* workspace, size_t workspace_size) {
     cudaSetDevice(ctx->device_id);
 
     // cuBLAS computes C_cm = op(A_gemm) @ op(B_gemm) in column-major.
@@ -2460,6 +2441,8 @@ void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
         strideC = N;
     }
 
+    cublasSetStream(CUBLAS(ctx), GLM_STREAM(ctx));
+    cublasSetWorkspace(CUBLAS(ctx), workspace, workspace_size);
     cublasGemmStridedBatchedEx(CUBLAS(ctx),
         transa_gemm, transb_gemm,
         m_gemm, n_gemm, k_gemm,
@@ -2471,6 +2454,8 @@ void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
         batch,
         CUDA_R_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    // Release the handle's binding to caller-owned temporary scratch.
+    cublasSetStream(CUBLAS(ctx), GLM_STREAM(ctx));
 }
 
 // ---------------------------------------------------------------------------

@@ -197,7 +197,7 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
                        int kv_lora_rank, int v_head_dim, int n_heads,
                        int seq_len, int batch,
                        int attn_n_heads, int head_offset,
-                       int v_proj_head_offset);
+                       int v_proj_head_offset, void* workspace, size_t workspace_size);
 
 void glm_route_top8(GlmCtx* ctx, void* out_weights, int* out_indices,
                     const void* logits, const void* bias, int rows, float scale, bool normalize);
@@ -207,7 +207,8 @@ void glm_topk(GlmCtx* ctx, void* out_values, int* out_indices,
 
 void glm_bmm(GlmCtx* ctx, void* C, const void* A, const void* B,
              float alpha, float beta,
-             int batch, int M, int N, int K, int transA, int transB, int tokenMajor = 0);
+             int batch, int M, int N, int K, int transA, int transB, int tokenMajor,
+             void* workspace, size_t workspace_size);
 
 void glm_scale(GlmCtx* ctx, void* out, const void* input, float scale, int n);
 

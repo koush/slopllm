@@ -890,8 +890,8 @@ static Napi::Value ApplyRotaryPosEmb(const Napi::CallbackInfo& info) {
 
 static Napi::Value MlaVExpand(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 12) {
-        Napi::TypeError::New(env, "Expected (ctx, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch, attn_n_heads, head_offset, v_proj_head_offset)").ThrowAsJavaScriptException();
+    if (info.Length() < 14) {
+        Napi::TypeError::New(env, "Expected (ctx, result, attn_out, v_proj, kv_lora_rank, v_head_dim, n_heads, seq_len, batch, attn_n_heads, head_offset, v_proj_head_offset, workspace, workspace_size)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -911,7 +911,9 @@ static Napi::Value MlaVExpand(const Napi::CallbackInfo& info) {
                       reinterpret_cast<const void*>(attn_out_ptr),
                       reinterpret_cast<const void*>(v_proj_ptr),
                       kv_lora_rank, v_head_dim, n_heads, seq_len, batch,
-                      attn_n_heads, head_offset, v_proj_head_offset);
+                      attn_n_heads, head_offset, v_proj_head_offset,
+                      reinterpret_cast<void*>(info[12].As<Napi::Number>().Int64Value()),
+                      static_cast<size_t>(info[13].As<Napi::Number>().Int64Value()));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("mlaVExpand failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -1046,8 +1048,8 @@ static Napi::Value SortTopkByIndex(const Napi::CallbackInfo& info) {
 
 static Napi::Value Bmm(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 12) {
-        Napi::TypeError::New(env, "Expected (ctx, C, A, B, alpha, beta, batch, M, N, K, transA, transB)").ThrowAsJavaScriptException();
+    if (info.Length() < 15) {
+        Napi::TypeError::New(env, "Expected (ctx, C, A, B, alpha, beta, batch, M, N, K, transA, transB, tokenMajor, workspace, workspace_size)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -1071,7 +1073,9 @@ static Napi::Value Bmm(const Napi::CallbackInfo& info) {
             reinterpret_cast<void*>(c_ptr),
             reinterpret_cast<const void*>(a_ptr),
             reinterpret_cast<const void*>(b_ptr),
-            alpha, beta, batch, M, N, K, transA, transB, tokenMajor);
+            alpha, beta, batch, M, N, K, transA, transB, tokenMajor,
+            reinterpret_cast<void*>(info[13].As<Napi::Number>().Int64Value()),
+            static_cast<size_t>(info[14].As<Napi::Number>().Int64Value()));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("bmm failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
