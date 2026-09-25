@@ -1254,24 +1254,30 @@ nvfp4_down_reduce_kernel(
         #pragma unroll
         for (int g = inner; g < K / NVFP4_QUANT_GROUP; g += 4) {
             const auto* xv = reinterpret_cast<const uint4*>(x + g * NVFP4_QUANT_GROUP);
-            const uint4 x0 = xv[0], x1 = xv[1];
-            __nv_bfloat16 xb[16];
-            uint4_to_bf16x8(x0, xb);
-            uint4_to_bf16x8(x1, xb + 8);
+            const uint4 xw[2] = {xv[0], xv[1]};
+            const __nv_bfloat162* xpair = reinterpret_cast<const __nv_bfloat162*>(xw);
             #pragma unroll
             for (int r = 0; r < 2; r++) {
                 const auto* wr = w + r * 8 * (K / 2);
                 const uint32_t w0 = *reinterpret_cast<const uint32_t*>(wr + g * 8);
                 const uint32_t w1 = *reinterpret_cast<const uint32_t*>(wr + g * 8 + 4);
                 const float scale = fp8_e4m3_to_float(scales[r * 8 * (K / NVFP4_QUANT_GROUP) + g]) * scale2;
-                float part = 0.0f;
+                float pa = 0.0f, pb = 0.0f;
                 #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const uint8_t packed = ((j < 4 ? w0 : w1) >> ((j % 4) * 8)) & 0xff;
-                    const float2 v = fp4x2_to_float2(packed);
-                    part += v.x * __bfloat162float(xb[j * 2]) + v.y * __bfloat162float(xb[j * 2 + 1]);
+                for (int j = 0; j < 4; j++) {
+                    const float2 v = fp4x2_to_float2((w0 >> (j * 8)) & 0xff);
+                    const float2 xf = __bfloat1622float2(xpair[j]);
+                    pa = fmaf(v.x, xf.x, pa);
+                    pb = fmaf(v.y, xf.y, pb);
                 }
-                sum[r] += part * scale;
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const float2 v = fp4x2_to_float2((w1 >> (j * 8)) & 0xff);
+                    const float2 xf = __bfloat1622float2(xpair[4 + j]);
+                    pa = fmaf(v.x, xf.x, pa);
+                    pb = fmaf(v.y, xf.y, pb);
+                }
+                sum[r] = fmaf(pa + pb, scale, sum[r]);
             }
         }
         #pragma unroll
