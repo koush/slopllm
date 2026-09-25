@@ -1191,6 +1191,8 @@ export class Glm51Model extends ChatModel {
     let nextSeedRows = sequences.map((_, batch) => batch);
     let speculative = false;
 
+    let pending: MtpDecodeStepResult|undefined;
+
     try {
       // Fixed generator-owned carry buffers keep graph inputs stable. A step
       // reads them for drafting before replacing their contents in verification.
@@ -1258,6 +1260,7 @@ export class Glm51Model extends ChatModel {
       speculative = false;
       ws.assertClear([seed.value, slots.value, slotsLength.value]);
       ws.clearTracking([seed.value, slots.value, slotsLength.value]);
+
       while (true) {
         ws.assertClear([seed.value, slots.value, slotsLength.value]);
         ws.clearTracking([seed.value, slots.value, slotsLength.value]);
@@ -1359,6 +1362,13 @@ export class Glm51Model extends ChatModel {
             resultCopy.streamWaitEvent();
           }));
         });
+
+        if (pending) {
+          const copy = pending;
+          pending = undefined;
+          yield copy;
+        }
+
         await this.ops.synchronizeAsync();
 
         const inputBuf = verifyTokensHost.readPinnedBuffer();
@@ -1410,7 +1420,7 @@ export class Glm51Model extends ChatModel {
         speculative = false;
         ws.assertClear([seed.value, slots.value, slotsLength.value]);
         ws.clearTracking([seed.value, slots.value, slotsLength.value]);
-        yield { tokens, numAccepted, numDraftTokens, warmup };
+        pending = { tokens, numAccepted, numDraftTokens, warmup };
       }
     } finally {
       // Covers break/return, consumer exceptions, and failed graph submissions.
