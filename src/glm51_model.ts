@@ -664,7 +664,6 @@ export class Glm51Model extends ChatModel {
 
         idxWeightsStream!.streamWaitEvent();
 
-
         // this is slower due to double gather
         if (false) {
           const idxQuantResult = this.ops.indexerQuantizeQ(idxQ, idxWeights, Math.pow(cfg.indexHeadDim, -0.5));
@@ -690,8 +689,6 @@ export class Glm51Model extends ChatModel {
             Math.pow(idxHeadDim, -0.5), idxTopk
           );
         }
-
-
       });
 
     using kvcache = this.ops.withStream(() => {
@@ -1155,49 +1152,12 @@ export class Glm51Model extends ChatModel {
     })());
   }
 
-  // prefetches next token on gpu immediately to remove host latency
-  async * generateMtpDecode(
-    ws: ExecutionWorkspace, cache: ChatCache,
-    numDraftTokens: number,
-    executionManager: ExecutionManager = new EagerExecution(),
-    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
-  ): AsyncGenerator<MtpDecodeStepResult, void, void> {
-    const gen = this.generateMtpDecodeInternal(ws, cache, numDraftTokens, executionManager, samplingPolicy);
-    let cur: Promise<IteratorResult<MtpDecodeStepResult, void>> | undefined = gen.next();
-    try {
-      while (true) {
-        const result = await cur;
-        if (result.done) {
-          cur = undefined;
-          return;
-        }
-        cur = gen.next();
-        void cur.catch(() => { });
-        yield result.value;
-      }
-    }
-    finally {
-      if (cur) {
-        const result = await cur;
-        if (!result.done) {
-          await gen.return();
-          // Discard the prefetched step and restore each sequence's pending target.
-          const sequences = cache.getPagedKV().sequences;
-          for (let batch = 0; batch < sequences.length; batch++) {
-            const sequence = sequences[batch];
-            sequence.truncate(sequence.allocLen - result.value.numAccepted[batch] - 1);
-          }
-        }
-      }
-    }
-  }
-
   /** Owns the draft/verification intermediates until the caller breaks the loop.
      * Prefill must have populated both target and shifted MTP KV. Batch changes
      * require closing this generator and starting a new one to recondition.
      * Startup replays the last committed token conditioned on the caller-published
      * pending target; every yield is a complete draft/verification step. */
-  private async * generateMtpDecodeInternal(
+  async * generateMtpDecode(
     ws: ExecutionWorkspace, cache: ChatCache,
     numDraftTokens: number,
     executionManager: ExecutionManager = new EagerExecution(),
