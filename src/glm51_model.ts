@@ -711,22 +711,6 @@ export class Glm51Model extends ChatModel {
         }
       });
 
-    using qStream = this.ops.withStream(shared, () => {
-      absorbedWeightStream?.streamWaitEvent();
-      using absorbedWeight = absorbedWeightStream?.result;
-      qNormedStream.streamWaitEvent();
-      const ckvParallelism = ckvPrefetch?.value?.parallelism || state.cache.getPagedKV().ckvData[layerIdx].parallelism;
-      return this.ops.projectMlaQuery(
-        state, ckvParallelism, qNormed,
-        this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
-        this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
-        this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
-        absorbedWeight,
-        cos, sin,
-        qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,
-      );
-    });
-
     using kvcache = this.ops.withStream(() => {
       using kPeRopeStream = this.ops.withStream(() => {
         using kPeRaw = normed.linear(this.tensors.get(`${pfx}.k_pe_proj.weight`)!);
@@ -773,6 +757,21 @@ export class Glm51Model extends ChatModel {
     });
 
     const cache = kvcache.result;
+    using qStream = this.ops.withStream(() => {
+      absorbedWeightStream?.streamWaitEvent();
+      using absorbedWeight = absorbedWeightStream?.result;
+      qNormedStream.streamWaitEvent();
+      const ckvParallelism = ckvPrefetch?.value?.parallelism || state.cache.getPagedKV().ckvData[layerIdx].parallelism;
+      return this.ops.projectMlaQuery(
+        state, ckvParallelism, qNormed,
+        this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
+        this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
+        this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
+        absorbedWeight,
+        cos, sin,
+        qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,
+      );
+    });
 
     using ckv = cache.ckv;
     using qAbsorbedR = qStream.result.qAbsorbed;
