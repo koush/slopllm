@@ -21,12 +21,18 @@ GlmCtx* glm_init(int device_id) {
         fprintf(stderr, "glm_init: cudaSetDevice(%d) failed: %s\n", device_id, cudaGetErrorString(err));
         return nullptr;
     }
+    int highestPriority;
+    err = cudaDeviceGetStreamPriorityRange(nullptr, &highestPriority);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm_init: cudaDeviceGetStreamPriorityRange(%d) failed: %s\n", device_id, cudaGetErrorString(err));
+        return nullptr;
+    }
     GlmCtx* ctx = new GlmCtx();
     ctx->device_id = device_id;
     ctx->active_stream = 0;
     for (int i = 0; i < GLM_MAX_STREAMS; i++) {
         cudaStreamCreateWithPriority(&ctx->streams[i], cudaStreamNonBlocking,
-                                     (i % 2 == 1) ? -1 : 0);
+                                      (i % 2 == 1) ? highestPriority : 0);
         cudaEventCreate(&ctx->events[i]);
     }
     cublasCreate(&CUBLAS(ctx));
@@ -313,7 +319,8 @@ void* glm_graph_end_capture(GlmCtx* ctx) {
 void* glm_graph_instantiate(GlmCtx* ctx, void* graph) {
     cudaSetDevice(ctx->device_id);
     cudaGraphExec_t graph_exec = nullptr;
-    cudaError_t err = cudaGraphInstantiate(&graph_exec, reinterpret_cast<cudaGraph_t>(graph), nullptr, nullptr, 0);
+    cudaError_t err = cudaGraphInstantiateWithFlags(&graph_exec, reinterpret_cast<cudaGraph_t>(graph),
+                                                  cudaGraphInstantiateFlagUseNodePriority);
     if (err != cudaSuccess) {
         fprintf(stderr, "glm_graph_instantiate failed: %s\n", cudaGetErrorString(err));
         return nullptr;
