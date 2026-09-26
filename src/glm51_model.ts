@@ -761,9 +761,12 @@ export class Glm51Model extends ChatModel {
       absorbedWeightStream?.streamWaitEvent();
       using absorbedWeight = absorbedWeightStream?.result;
       qNormedStream.streamWaitEvent();
-      const ckvParallelism = ckvPrefetch?.value?.parallelism || state.cache.getPagedKV().ckvData[layerIdx].parallelism;
+      // const ckvParallelism = ckvPrefetch?.value?.parallelism || state.cache.getPagedKV().ckvData[layerIdx].parallelism;
+      // if (cache.ckv.parallelism !== ckvParallelism) {
+      //   throw new Error(`MLA query/cache parallelism mismatch at layer ${layerIdx}: query=${ckvParallelism}, cache=${cache.ckv.parallelism}`);
+      // }
       return this.ops.projectMlaQuery(
-        state, ckvParallelism, qNormed,
+        state, cache.ckv.parallelism, qNormed,
         this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
         this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
         this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
