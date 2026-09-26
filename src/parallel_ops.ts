@@ -997,6 +997,10 @@ export class ParallelTensor extends Tensor {
       return this.parallelOps.wrapShards(this.workspace, outShards, this.shape, this.type, TensorParallelism.PartialSum);
     }
 
+    if (this.parallelism === TensorParallelism.Replicated && pOther.parallelism === TensorParallelism.PartialSum) {
+      return pOther.add(this, n);
+    }
+
     return this.elementwiseBinary(pOther, (a, b) => a.add(b, n));
   }
 
