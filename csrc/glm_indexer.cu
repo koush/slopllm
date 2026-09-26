@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 
 // Remap a local KV position to its global position for context-parallel
 // interleaved sharding. cpWorldSize=0 (non-CP) is a no-op identity.
@@ -598,6 +599,11 @@ __global__ void idx_radix_hist_split_kernel(
     const int len = row_len ? row_len[row] : stride;
     if (len <= topk) return;
 
+    // Surplus split: this block's first grid-stride position already exceeds
+    // the row, so the scan loop below cannot run; skip the shared-memory
+    // clear and barriers.
+    if ((int)blockIdx.x * blockDim.x >= len) return;
+
     __shared__ int bins[IDX_RADIX_BUCKETS];
     bins[threadIdx.x] = 0;
     __syncthreads();
@@ -747,6 +753,14 @@ __global__ void idx_gather_count_kernel(
     const int lo = min((int)blockIdx.x * chunk, len);
     const int hi = min(lo + chunk, len);
 
+    // Surplus split: contiguous window empty. Pass B's exclusive prefix sums
+    // every preceding block's counts slot unconditionally, so the zero counts
+    // must still be written; the scan, atomics, and barriers can be skipped.
+    if (lo >= hi) {
+        if (threadIdx.x == 0) { c[0] = 0; c[1] = 0; }
+        return;
+    }
+
     int nAbove = 0, nTie = 0;
     for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
         const int key = bf16_key(&s[i]);
@@ -791,6 +805,10 @@ __global__ void idx_gather_write_kernel(
     const int chunk = (len + (int)gridDim.x - 1) / (int)gridDim.x;
     const int lo = min((int)blockIdx.x * chunk, len);
     const int hi = min(lo + chunk, len);
+
+    // Surplus split: contiguous window empty and this pass emits nothing, so
+    // skip the prefix scan over the preceding blocks' counts.
+    if (lo >= hi) return;
 
     // Exclusive prefix over the preceding blocks' counts -> this block's bases.
     const int32_t* c = counts + (size_t)row * IDX_SCRATCH_I32;
@@ -906,6 +924,55 @@ void glm_sort_topk_by_index(GlmCtx* ctx, int32_t* out_idx, __nv_bfloat16* out_sc
         out_idx, out_scores, topk, n2);
 }
 
+// ---------------------------------------------------------------------------
+// Automatic split budget (num_splits == 0 sentinel). Sizes the launch to one
+// resident wave of split blocks spread across all query rows: SM count x
+// per-SM occupancy, divided by the row count, clamped to the 256 split cap
+// shared by every call site. Every input is a shape or config constant — no KV length — so
+// CUDA-graph callers can pass the sentinel and keep a stable launch geometry
+// across replays. Surplus splits are correct: the score kernels grid-stride
+// over device-side numValid and exit block-uniformly before their Q smem
+// load, and the merge kernels clip their scan windows to device-side
+// row_len, so blocks beyond the useful range find no work early and exit.
+//
+// Occupancy is specific to the compiled kernel: template instantiations can
+// differ in register usage even at identical block size and shared memory.
+// Callers must therefore query idx_query_occupancy on the exact
+// specialization(s) the launch will select.
+// ---------------------------------------------------------------------------
+
+// Per-SM resident-block count for one compiled kernel instantiation.
+// Returns 1 on any query failure so callers fall back to a conservative
+// single-block budget.
+template <typename Kernel>
+static int idx_query_occupancy(Kernel kernel, int blockThreads, size_t dynamicSmem) {
+    int resident = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &resident, kernel, blockThreads, dynamicSmem) != cudaSuccess
+        || resident < 1) {
+        return 1;
+    }
+    return resident;
+}
+
+static int idx_auto_num_splits(int resident, int rows) {
+    if (rows < 1) rows = 1;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return 1;
+    }
+    int smCount = 0;
+    if (cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device) != cudaSuccess
+        || smCount <= 0) {
+        return 1;
+    }
+    long long budget = ((long long)smCount * resident + rows - 1) / rows;
+    if (budget < 1) {
+        return 1;
+    }
+    return budget > 256 ? 256 : (int)budget;
+}
+
 void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     __nv_bfloat16* out_scores,
     const void* scores, const int32_t* row_len,
@@ -914,6 +981,19 @@ void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     int cpWorldSize, int cpRank) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
+    // 0 = automatic budget (see idx_auto_num_splits); negative clamps to 1.
+    // The split grid is shared by both radix passes and the gather kernels, so
+    // size it by the least resident of those instantiations.
+    if (num_splits == 0) {
+        const int resident = std::min(std::min(
+            idx_query_occupancy(idx_radix_hist_split_kernel<false>, IDX_GATHER_THREADS, 0),
+            idx_query_occupancy(idx_radix_hist_split_kernel<true>, IDX_GATHER_THREADS, 0)),
+            std::min(idx_query_occupancy(idx_gather_count_kernel, IDX_GATHER_THREADS, 0),
+                     idx_query_occupancy(idx_gather_write_kernel, IDX_GATHER_THREADS, 0)));
+        num_splits = idx_auto_num_splits(resident, batch);
+    } else if (num_splits < 0) {
+        num_splits = 1;
+    }
     dim3 grid(num_splits, batch);
     // Full rows (including padded CP candidate merges) amortize the extra
     // histogram launches once splitting removes about 6K scores from each
@@ -1070,6 +1150,12 @@ __global__ void idx_score_kernel(
         qSeqPos, numQueries, causal, kvLen, globalKvLen, cpW, cpRank) + 1;
 
     if (blockIdx.x == 0 && threadIdx.x == 0) row_len[qIdx] = numValid;
+
+    // Block-uniform early exit: this block's first candidate position is
+    // blockIdx.x * warpsPerBlock; if it already exceeds the causal limit the
+    // grid-stride loop below cannot run, and the Q smem load + barrier would
+    // be wasted. Placed after the row_len write so block 0 still records it.
+    if (blockIdx.x * (blockDim.x >> 5) >= numValid) return;
 
     // Custom-mask setup — compiled out entirely when !HAS_MASK.
     const uint8_t* mask_ptr = nullptr;
@@ -1320,6 +1406,12 @@ __global__ void score_kernel(
         qSeqPos, nQuery, causal, kvLen, globalKvLen, cpW, cpRank) + 1;
     if (blockIdx.x == 0 && threadIdx.x == 0) row_len[qi] = numValid;
 
+    // Block-uniform early exit: this block's first tile is blockIdx.x * WARPS;
+    // when its base position is already past the causal limit the tile loop
+    // cannot run, and the Q smem load + barrier would be wasted. Placed after
+    // the row_len write so block 0 still records it.
+    if (blockIdx.x * WARPS * K_ROWS >= numValid) return;
+
     const uint8_t* tmp = q8Data + (size_t)qi * q8Stride;
     const float* ew = effectiveWeights + (size_t)qi * weightStride;
     extern __shared__ uint8_t smem[];
@@ -1430,10 +1522,12 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     const float* precomputed_ew) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
-    dim3 grid(num_splits, totalQ);
     int block = 256;
     size_t smem = (size_t)idxNHeads * idxHeadDim * sizeof(__nv_bfloat16)
                 + idxNHeads * sizeof(__nv_bfloat16);
+    const size_t fp8Smem = (size_t)idxfp8::Q_BYTES
+        + idxfp8::WARPS * idxfp8::K_ROWS * idxfp8::HD
+        + idxfp8::WARPS * idxfp8::K_ROWS * sizeof(float);
     const int effectiveCpWorldSize = kvTokenIndptr ? 0 : cpWorldSize;
     const int effectiveCpRank = kvTokenIndptr ? 0 : cpRank;
     // Dispatch the mask-free variant when there is no custom mask so its bit-test
@@ -1450,6 +1544,37 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
         return;
     }
     const bool useFp8Mma = indexer_use_fp8_mma(idxNHeads, idxHeadDim) || precomputed;
+    // 0 = automatic budget (see idx_auto_num_splits), resolved after the
+    // dispatch variant is known so the occupancy query targets the exact
+    // specialization the LAUNCH macros select below (HAS_MASK, FLAT);
+    // negative clamps to 1. The resolved budget is deliberately forwarded to
+    // glm_topk_from_scores, sizing both stages from one wave calculation:
+    // the stages' grids are independent, and their 256-thread blocks are
+    // thread-bound at the same resident count on current targets. Direct
+    // callers can still pass 0 to glm_topk_from_scores for per-stage sizing
+    // if the merge kernels' occupancy ever diverges.
+    if (num_splits == 0) {
+        const bool flat = kvTokenIndptr != nullptr;
+        const int resident = useFp8Mma
+            ? (flat
+                ? (hasMask
+                    ? idx_query_occupancy(idxfp8::score_kernel<true, true>, block, fp8Smem)
+                    : idx_query_occupancy(idxfp8::score_kernel<false, true>, block, fp8Smem))
+                : (hasMask
+                    ? idx_query_occupancy(idxfp8::score_kernel<true, false>, block, fp8Smem)
+                    : idx_query_occupancy(idxfp8::score_kernel<false, false>, block, fp8Smem)))
+            : (flat
+                ? (hasMask
+                    ? idx_query_occupancy(idx_score_kernel<true, true>, block, smem)
+                    : idx_query_occupancy(idx_score_kernel<false, true>, block, smem))
+                : (hasMask
+                    ? idx_query_occupancy(idx_score_kernel<true, false>, block, smem)
+                    : idx_query_occupancy(idx_score_kernel<false, false>, block, smem)));
+        num_splits = idx_auto_num_splits(resident, totalQ);
+    } else if (num_splits < 0) {
+        num_splits = 1;
+    }
+    dim3 grid(num_splits, totalQ);
     if (useFp8Mma) {
         const uint8_t* q8Data;
         const float* effectiveWeights;
@@ -1471,10 +1596,7 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
                 q8Scratch, IDX_SCRATCH_I32 * sizeof(int32_t),
                 reinterpret_cast<float*>(q8Scratch + idxfp8::Q_BYTES), IDX_SCRATCH_I32, scale);
         }
-        const size_t fp8Smem = idxfp8::Q_BYTES
-            + idxfp8::WARPS * idxfp8::K_ROWS * idxfp8::HD
-            + idxfp8::WARPS * idxfp8::K_ROWS * sizeof(float);
-#define LAUNCH_IDX_FP8(HAS_MASK, FLAT) \
+        #define LAUNCH_IDX_FP8(HAS_MASK, FLAT) \
         idxfp8::score_kernel<(HAS_MASK), (FLAT)><<<grid, block, fp8Smem, stream>>>( \
             (__nv_bfloat16*)scores, rowLen, (const uint8_t*)kData, pageIndices, pageIndptr, \
             lastPageLen, qoIndptr, pageSize, maxKv, causal, qGlobalStart, custom_mask, mask_indptr, \

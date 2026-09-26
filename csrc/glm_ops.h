@@ -119,6 +119,8 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     int pageSize, int topk, int causal, int qGlobalStart,
     const uint8_t* custom_mask, const int32_t* mask_indptr, const int32_t* mask_kv_len,
     void* scores, int32_t* rowLen, int32_t* hist, int32_t* meta,
+    // num_splits: 0 = auto (one resident wave across all query rows; see
+    // idx_auto_num_splits), negative clamps to 1.
     int maxKv, int num_splits, int cpWorldSize, int cpRank,
     const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr,
     const float* precomputed_ew);
@@ -130,6 +132,8 @@ void glm_indexer_quantize_q(GlmCtx* ctx, uint8_t* out_q8, float* out_ew,
     const void* q, const void* weights, int nHeads, int weightsStride,
     int weightsOffset, int totalQ, float scale);
 
+// num_splits: 0 = auto (one resident wave across all rows; see
+// idx_auto_num_splits), negative clamps to 1.
 void glm_topk_from_scores(GlmCtx* ctx, int32_t* out_idx,
     __nv_bfloat16* out_scores,
     const void* scores, const int32_t* row_len,

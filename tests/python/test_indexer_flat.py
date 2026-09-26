@@ -193,6 +193,8 @@ def _run_topk(glm, mode, q, k_data, k_scale_data, weights, caches, qo_indptr, to
     num_splits = max(1, (max_kv + 255) // 256)
     common = dict(kv_token_indptr=kv_token_indptr)
 
+    # PyTorch initialization and GLM kernels use different CUDA streams.
+    torch.cuda.synchronize(q.device)
     if mode == "v2":
         hist = torch.empty(total_q, 1056, dtype=torch.int32, device=q.device)
         glm.indexer_score_topk_v2(
@@ -210,6 +212,9 @@ def _run_topk(glm, mode, q, k_data, k_scale_data, weights, caches, qo_indptr, to
             scale, total_q, n_heads, head_dim, page_size, topk, causal,
             scores, row_len, max_kv, coarse_hist, fine_hist, meta, num_splits, **common,
         )
+    # Keep scratch tensors alive until GLM has finished using them, before
+    # the next invocation can recycle their PyTorch allocations.
+    glm.synchronize()
     return out, out_scores, row_len
 
 

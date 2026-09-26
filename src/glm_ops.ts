@@ -848,28 +848,20 @@ export class GlmOps implements DeviceOps {
     if (!pagedKV.sparseMode) {
       return [];
     }
-    // Query sharding can select direct indexer dispatch even for larger plans.
-    // Key its launch budget independently of the stable score-buffer capacity.
-    const keys = [`indexerNumSplits:${this.indexerNumSplits(state)}`];
+    // The indexer launches with the native auto split budget under capture
+    // (see indexerTopk), so it contributes no key: no capture depends on KV
+    // length through the indexer. Only the sparse MLA chunk hint remains,
+    // and it saturates once total KV exceeds topk * worldSize.
     const numQueries = state.isDecode ? state.batchSize : state.totalTokens;
     if (!pagedKV.contextParallel || (!state.isDecode && numQueries > SPARSE_MLA_DECODE_DISPATCH_MAX)) {
-      return keys;
+      return [];
     }
     const { numAttentionHeads, indexTopk } = state.model.cfg;
     if (indexTopk === undefined) {
       throw new Error("Sparse MLA capture keys require indexTopk");
     }
-    // The hint reads state.paddedKvLen, but this key does not make the graph
-    // length-variant: localTopkBound = min(topk, ceil(paddedKvLen / worldSize))
-    // saturates at topk once total KV exceeds topk * worldSize, and the wave-
-    // filling policy quantizes it further. Distinct paddedKvLen buckets collapse
-    // into a small set of shared launch configs, so long conversations reuse a
-    // single captured graph instead of paying a capture per bucket.
     const chunksPerBlock = this.sparseMlaChunkHint(state, numQueries, numAttentionHeads, indexTopk);
-    return [
-      ...keys,
-      `sparseMlaChunksPerBlock:${chunksPerBlock}`,
-    ];
+    return [`sparseMlaChunksPerBlock:${chunksPerBlock}`];
   }
 
   private indexerNumSplits(state: ExecutionState): number {
@@ -1534,16 +1526,22 @@ export class GlmOps implements DeviceOps {
     }
     const maxKvCapacity = kData.shape[0] * kData.shape[1];
     const useDirect = totalQ <= INDEXER_DIRECT_DISPATCH_MAX;
-    // Direct dispatch keeps storage capacity stable; its split count is keyed
-    // separately from paddedKvLen. Larger prefill uses length-bounded storage.
+    // Direct dispatch keeps storage capacity stable. Larger prefill uses
+    // length-bounded storage.
     const maxKv = decode || useDirect
       ? maxKvCapacity
       : Math.min(maxKvCapacity, CaptureManager.capturing === undefined
         ? state.getEagerKvLen()
         : state.getGraphVariantPaddedKvLen());
+    // Under graph capture the split budget must not depend on paddedKvLen —
+    // that would re-key the graph per KV bucket. Pass the native auto
+    // sentinel (0): one resident wave derived from occupancy and totalQ,
+    // both stable across replays. Eager launches keep the KV-bucketed
+    // heuristic.
+    const numSplits = CaptureManager.capturing !== undefined ? 0 : this.indexerNumSplits(state);
     const queryTiles = Math.ceil(totalQ / 64) + state.batchSize - 1;
     return useDirect
-      ? this.indexerScoreTopkV2(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, this.indexerNumSplits(state), decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights)
+      ? this.indexerScoreTopkV2(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, numSplits, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights)
       : this.indexerScoreTopkPrefill(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, queryTiles, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights);
   }
 
