@@ -21,13 +21,12 @@ struct PrefetchL2Inputs {
 
 // Bulk range prefetch: each thread covers one contiguous 16B-aligned slice of
 // each tensor with a single cp.async.bulk.prefetch (one instruction per
-// (thread, tensor) instead of one per 32B offset). The fractional evict_last
-// policy marks only 25% of prefetched lines evict_last; the rest insert at
-// evict-normal, so the full range still warms L2 while stale sticky lines are
-// capped at ~6MB and cannot pin the L2 against concurrent kernels.
+// (thread, tensor) instead of one per 32B offset). The fractional policy gives
+// 25% of accesses normal L2 eviction priority and leaves the remainder's
+// priority unchanged, avoiding evict_last promotion during the CP merge.
 __global__ void prefetch_l2_kernel(PrefetchL2Inputs inputs, int count) {
     uint64_t policy;
-    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 0.25;" : "=l"(policy));
+    asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0, 0.25;" : "=l"(policy));
     const int total_threads = gridDim.x * blockDim.x;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     for (int t = 0; t < count; t++) {
