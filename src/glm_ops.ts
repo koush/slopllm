@@ -743,7 +743,8 @@ export class GlmTensor extends Tensor {
       return out;
     }
     super.swiGluMlpMoe(inputs, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
-    using gateStream = this.ops.withStream(() => this.mulMatId(inputs.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
+    // The routed parent runs at high priority; keep gate competitive with up during graph replay.
+    using gateStream = this.ops.withStream(true, () => this.mulMatId(inputs.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
     using upOut = this.mulMatId(inputs.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
     gateStream.streamWaitEvent();
     using gateOut = gateStream.result;

@@ -583,7 +583,7 @@ export class Glm51Model extends ChatModel {
     const S = state.isDecode ? 1 : state.totalTokens;
 
     // start asap for idxq and q
-    using qNormedStream = this.ops.withStream(true, () => {
+    using qNormedStream = this.ops.withStream(() => {
       using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
       return qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
     });
