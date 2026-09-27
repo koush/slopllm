@@ -13,6 +13,29 @@
 
 namespace cg = cooperative_groups;
 
+// Launch with the programmatic-stream-serialization (PDL) attribute: the kernel
+// may launch as soon as its stream predecessor fires
+// cudaTriggerProgrammaticLaunchCompletion() instead of waiting for full grid
+// completion. Correctness requires the kernel to call
+// cudaGridDependencySynchronize() before consuming predecessor data. Kernels
+// launched this way after a non-PDL predecessor serialize normally (implicit
+// trigger at predecessor completion), so the attribute is always safe to set.
+template <typename... ExpTypes, typename... ActTypes>
+static inline void launch_pdl(void (*kernel)(ExpTypes...), int grid, int block,
+                              size_t smem, cudaStream_t stream, ActTypes&&... args) {
+    cudaLaunchConfig_t cfg = {};
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cfg.gridDim = dim3((unsigned)grid);
+    cfg.blockDim = dim3((unsigned)block);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, kernel, args...);
+}
+
 // Passed by value so captured launches need no temporary pointer/size buffers.
 struct PrefetchL2Inputs {
     const char* data[8];
@@ -190,6 +213,10 @@ __global__ void __launch_bounds__(1024) rmsnorm_kernel(
     float eps,
     int dim
 ) {
+    // Let downstream PDL consumers prepare early, but wait for the upstream
+    // producer (including gather barriers) before reading the input.
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
     int row = blockIdx.x;
     const __nv_bfloat16* x = input + row * dim;
     __nv_bfloat16* o = out + row * dim;
@@ -242,6 +269,9 @@ __global__ void __launch_bounds__(1024, 1) rmsnorm_kernel_stride(
     float eps,
     int dim
 ) {
+    // Preserve the same PDL chain for the large-dimension fallback.
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
     int row = blockIdx.x;
     const __nv_bfloat16* x = input + row * dim;
     __nv_bfloat16* o = out + row * dim;
@@ -274,7 +304,7 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
     bool even = (dim & 1) == 0;
 
 #define DISPATCH_RMS(P, EV) \
-    rmsnorm_kernel<P, EV><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>( \
+    launch_pdl(rmsnorm_kernel<P, EV>, batch, block_size, shared_mem, GLM_STREAM(ctx), \
         (__nv_bfloat16*)out, (const __nv_bfloat16*)input, \
         (const __nv_bfloat16*)weight, eps, dim)
 #define DISPATCH_RMS_PAIRS(P) do { \
@@ -295,11 +325,11 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
         }
     } else {
         if (even) {
-            rmsnorm_kernel_stride<true><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            launch_pdl(rmsnorm_kernel_stride<true>, batch, block_size, shared_mem, GLM_STREAM(ctx),
                 (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
                 (const __nv_bfloat16*)weight, eps, dim);
         } else {
-            rmsnorm_kernel_stride<false><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            launch_pdl(rmsnorm_kernel_stride<false>, batch, block_size, shared_mem, GLM_STREAM(ctx),
                 (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
                 (const __nv_bfloat16*)weight, eps, dim);
         }
@@ -323,6 +353,11 @@ __global__ void __launch_bounds__(1024) fused_add_rmsnorm_kernel(
     const __nv_bfloat16* __restrict__ weight,
     float eps, int dim
 ) {
+    // PDL: release our stream dependent (e.g. the cuBLAS linear that follows)
+    // immediately, then wait for the upstream grid (the p2p barrier that
+    // guards peers' all-reduce writes to input_b) before touching any input.
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
     int row = blockIdx.x;
     const __nv_bfloat16* a = input_a + row * dim;
     const __nv_bfloat16* b = input_b + row * dim;
@@ -387,6 +422,9 @@ __global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel_stride(
     const __nv_bfloat16* __restrict__ weight,
     float eps, int dim
 ) {
+    // PDL: see fused_add_rmsnorm_kernel.
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
     int row = blockIdx.x;
     const __nv_bfloat16* a = input_a + row * dim;
     const __nv_bfloat16* b = input_b + row * dim;
@@ -448,7 +486,7 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
     bool even = (dim & 1) == 0;
 
 #define DISPATCH_FUSED(P, EV) \
-    fused_add_rmsnorm_kernel<P, EV><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>( \
+    launch_pdl(fused_add_rmsnorm_kernel<P, EV>, batch, block_size, shared_mem, GLM_STREAM(ctx), \
         (__nv_bfloat16*)out, (__nv_bfloat16*)residual, \
         (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b, \
         (const __nv_bfloat16*)weight, eps, dim)
@@ -470,12 +508,12 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
         }
     } else {
         if (even) {
-            fused_add_rmsnorm_kernel_stride<true><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            launch_pdl(fused_add_rmsnorm_kernel_stride<true>, batch, block_size, shared_mem, GLM_STREAM(ctx),
                 (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
                 (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
                 (const __nv_bfloat16*)weight, eps, dim);
         } else {
-            fused_add_rmsnorm_kernel_stride<false><<<batch, block_size, shared_mem, GLM_STREAM(ctx)>>>(
+            launch_pdl(fused_add_rmsnorm_kernel_stride<false>, batch, block_size, shared_mem, GLM_STREAM(ctx),
                 (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
                 (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
                 (const __nv_bfloat16*)weight, eps, dim);

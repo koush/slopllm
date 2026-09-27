@@ -1384,6 +1384,10 @@ __global__ void score_kernel(
     const uint8_t* __restrict__ q8Data, int q8Stride,
     const float* __restrict__ effectiveWeights, int weightStride,
     const float* __restrict__ kScaleData) {
+    cudaTriggerProgrammaticLaunchCompletion();
+    // Q and effective weights may still be completing their P2P gather barrier.
+    cudaGridDependencySynchronize();
+
     const int qi = blockIdx.y;
     const int globalQuery = qi + qGlobalStart;
     const int warp = threadIdx.x >> 5;
@@ -1596,8 +1600,18 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
                 q8Scratch, IDX_SCRATCH_I32 * sizeof(int32_t),
                 reinterpret_cast<float*>(q8Scratch + idxfp8::Q_BYTES), IDX_SCRATCH_I32, scale);
         }
+        cudaLaunchAttribute attr{};
+        attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr.val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t config{};
+        config.gridDim = grid;
+        config.blockDim = dim3(block);
+        config.dynamicSmemBytes = fp8Smem;
+        config.stream = stream;
+        config.attrs = &attr;
+        config.numAttrs = 1;
         #define LAUNCH_IDX_FP8(HAS_MASK, FLAT) \
-        idxfp8::score_kernel<(HAS_MASK), (FLAT)><<<grid, block, fp8Smem, stream>>>( \
+        cudaLaunchKernelEx(&config, idxfp8::score_kernel<(HAS_MASK), (FLAT)>, \
             (__nv_bfloat16*)scores, rowLen, (const uint8_t*)kData, pageIndices, pageIndptr, \
             lastPageLen, qoIndptr, pageSize, maxKv, causal, qGlobalStart, custom_mask, mask_indptr, \
             mask_kv_len, effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, \

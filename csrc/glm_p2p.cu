@@ -186,6 +186,12 @@ p2p_barrier_kernel(
     int nanosleep_ns,
     int peer_rank = -1)
 {
+    // PDL: let dependents launched with the programmatic-serialization
+    // attribute (e.g. fused_add_rmsnorm_kernel) become resident while this
+    // kernel spins on peers. Their griddepcontrol.wait still releases only at
+    // this grid's completion - i.e. after all peers' flags arrived - so the
+    // barrier contract is unchanged. No-op for normal launches.
+    cudaTriggerProgrammaticLaunchCompletion();
     int tid = threadIdx.x;
 
     __shared__ unsigned int s_seq;
@@ -561,6 +567,9 @@ p2p_reduce_scatter_write_kernel(
     int chunk_bytes,
     int rank)
 {
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+
     constexpr int VEC = 16;  // int4
     void* dsts[AG_SMEM_MAX_N] = {
         out0, out1, out2, out3, out4, out5, out6, out7,
@@ -624,6 +633,10 @@ p2p_reduce_gather_write_kernel(
     int chunk_len,
     int rank)
 {
+    cudaTriggerProgrammaticLaunchCompletion();
+    // In particular, wait for the preceding peer barrier before reading staging.
+    cudaGridDependencySynchronize();
+
     scalar_t* dsts[AG_SMEM_MAX_N] = {
         out0, out1, out2, out3, out4, out5, out6, out7,
     };
@@ -817,7 +830,7 @@ void glm_p2p_allgather_row_write(GlmCtx* ctx,
 
 #define LAUNCH_RS_WRITE(N) \
     do { \
-        p2p_reduce_scatter_write_kernel<N><<<grid, RS_WRITE_THREADS, 0, stream>>>( \
+        cudaLaunchKernelEx(&config, p2p_reduce_scatter_write_kernel<N>, \
             local_shard, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], \
             chunk_bytes, rank); \
     } while(0)
@@ -837,6 +850,16 @@ void glm_p2p_reduce_scatter_write(GlmCtx* ctx,
     if (grid > 512) grid = 512;
     if (grid < 1) grid = 1;
 
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(grid);
+    config.blockDim = dim3(RS_WRITE_THREADS);
+    config.stream = stream;
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
     switch (N) {
         case 2:  LAUNCH_RS_WRITE(2);  break;
         case 4:  LAUNCH_RS_WRITE(4);  break;
@@ -850,7 +873,7 @@ void glm_p2p_reduce_scatter_write(GlmCtx* ctx,
 
 #define LAUNCH_RG_WRITE(SCT, N) \
     do { \
-        p2p_reduce_gather_write_kernel<SCT, N><<<grid, RS_WRITE_THREADS, 0, stream>>>( \
+        cudaLaunchKernelEx(&config, p2p_reduce_gather_write_kernel<SCT, N>, \
             (const SCT*)staging, \
             (SCT*)p[0], (SCT*)p[1], (SCT*)p[2], (SCT*)p[3], \
             (SCT*)p[4], (SCT*)p[5], (SCT*)p[6], (SCT*)p[7], \
@@ -869,6 +892,16 @@ void glm_p2p_reduce_gather_write(GlmCtx* ctx,
     int grid = (chunk_len + RS_WRITE_THREADS - 1) / RS_WRITE_THREADS;
     if (grid > 512) grid = 512;
     if (grid < 1) grid = 1;
+
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(grid);
+    config.blockDim = dim3(RS_WRITE_THREADS);
+    config.stream = stream;
+    config.attrs = &attr;
+    config.numAttrs = 1;
 
     if (dtype == 9) {
         switch (N) {

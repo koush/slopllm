@@ -375,6 +375,12 @@ cp_merge_local_kernel(
     int batch_size,
     int shard_n_heads)
 {
+    // Chain PDL through the merge: allow a dependent V expansion to start
+    // preparing weights while we wait for the scatter barrier. Staging reads
+    // must still wait for all peers' writes to become visible.
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+
     constexpr int head_dim = VEC_SIZE * BDX;
     const int tid = threadIdx.x;
     const int64_t bh = blockIdx.x;
@@ -473,8 +479,18 @@ void glm_cp_merge_local(
     const int grid = batch_size * shard_n_heads;
     if (grid <= 0) return;
 
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t launch{};
+    launch.gridDim = dim3(grid);
+    launch.stream = GLM_STREAM(ctx);
+    launch.attrs = &attr;
+    launch.numAttrs = 1;
+
     #define LAUNCH_CP_LOCAL(NS, VEC_SIZE, BDX) \
-        cp_merge_local_kernel<NS, VEC_SIZE, BDX><<<grid, BDX, 0, GLM_STREAM(ctx)>>>( \
+        launch.blockDim = dim3(BDX); \
+        cudaLaunchKernelEx(&launch, cp_merge_local_kernel<NS, VEC_SIZE, BDX>, \
             reinterpret_cast<const __nv_bfloat16*>(stage_v), stage_lse, \
             reinterpret_cast<__nv_bfloat16*>(output_v), output_lse, \
             batch_size, shard_n_heads)

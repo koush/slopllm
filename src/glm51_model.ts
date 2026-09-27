@@ -3,7 +3,7 @@ import path from "node:path";
 import { CaptureManager } from "./capture-manager";
 import type { ChatCache, ChatTemplateKwargs, ChunkedPrefillPlan, MtpDecodeStepResult, TokenSelector } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
-import { DeviceOps, MaskMode, TensorParallelism, type StreamResult } from "./device_ops";
+import { DeviceOps, MaskMode, MlaQuery, TensorParallelism, type StreamResult } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { EagerExecution, type ExecutionManager } from "./execution-manager";
 import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
@@ -526,8 +526,16 @@ export class Glm51Model extends ChatModel {
       throw new Error(`mlpSparse: nGroup > 1 is not supported (got nGroup=${nGroup})`);
     }
 
+    using sharedStream = this.ops.withStream(() => {
+      // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
+      const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
+      return normed.swiGluMlp(sharedWeights);
+    });
+    using sharedDownBuf = sharedStream.result;
+
+    using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!);
+
     using routedStream = this.ops.withStream(true, () => {
-      using gateLogitsBuf = normed.linear(this.tensors.get(`${pfx}.mlp.gate.weight`)!);
       const routed = gateLogitsBuf.moeRoute({
         numExpertsPerToken: topK,
         correctionBias: this.tensors.get(`${pfx}.mlp.gate.e_score_correction_bias`),
@@ -554,10 +562,7 @@ export class Glm51Model extends ChatModel {
       return routedOut;
     });
 
-    // low occupancy during decode, start this first so it can run in parallel with the rest of the code and hopefully be done by the time we need it
-    const sharedWeights = this.swiGluMlpWeights(`${pfx}.mlp.shared_experts`);
-    using sharedDownBuf = normed.swiGluMlp(sharedWeights);
-
+    sharedStream.streamWaitEvent();
     routedStream.streamWaitEvent();
     using routedOut = routedStream.result;
     using result = routedOut.add(sharedDownBuf, BS * hs);
@@ -581,135 +586,59 @@ export class Glm51Model extends ChatModel {
     const BS = state.totalTokens;
     const B = state.isDecode ? batchSize : 1;
     const S = state.isDecode ? 1 : state.totalTokens;
-
-    // start asap for idxq and q
-    using qNormedStream = this.ops.withStream(() => {
-      using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
-      return qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);
-    });
-    using qNormed = qNormedStream.result;
-
     const shared = cfg.indexerTypes[layerIdx] === "shared";
 
-    // Indexer q: wq_b(qNormed) → rope → [BS, indexNHeads, indexHeadDim]
-    // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
-    using idxQStream = shared
-      ? undefined
-      : this.ops.withStream(true, () => {
-        using idxWeightsStream = this.ops.withStream(() => {
-          const idxNHeads = cfg.indexNHeads;
-          const idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!);
-          idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
-          return idxWeights;
-        });
-        using idxWeights = idxWeightsStream.result;
+    using idxWeightsStream = shared ? undefined : this.ops.withStream(() => {
+      const idxNHeads = cfg.indexNHeads;
+      const idxWeights = normed.linear(this.tensors.get(`${pfx}.indexer.weights_proj.weight`)!);
+      idxWeights.scaleInPlace(Math.sqrt(1.0 / idxNHeads), BS * idxNHeads);
+      return idxWeights;
+    });
 
-        // Indexer K: wk(normed) → layernorm → partial RoPE → append to kData
-        // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
-        using kvcacheIndex = this.ops.withStream(() => {
-          const idxRopeDim = qkRopeDim;
-          using idxKRaw = normed.linear(this.tensors.get(`${pfx}.indexer.wk.weight`)!);
-          using idxKNormed = idxKRaw.layernorm(
-            this.tensors.get(`${pfx}.indexer.k_norm.weight`)!,
-            this.tensors.get(`${pfx}.indexer.k_norm.bias`)!,
-            1e-6,
-          );
-          using idxKOut = idxKNormed.applyRotaryPosEmb(
-            cos, sin, idxRopeDim, cfg.indexHeadDim, 1, S, B, 1, cfg.indexerRopeInterleave,
-          );
+    // Indexer K: wk(normed) → layernorm → partial RoPE → append to kData
+    // Only 'full' layers have indexer weights; 'shared' layers reuse previous topk.
+    using kvcacheIndex = shared ? undefined : this.ops.withStream(() => {
+      const idxRopeDim = qkRopeDim;
+      using idxKRaw = normed.linear(this.tensors.get(`${pfx}.indexer.wk.weight`)!);
+      using idxKNormed = idxKRaw.layernorm(
+        this.tensors.get(`${pfx}.indexer.k_norm.weight`)!,
+        this.tensors.get(`${pfx}.indexer.k_norm.bias`)!,
+        1e-6,
+      );
+      using idxKOut = idxKNormed.applyRotaryPosEmb(
+        cos, sin, idxRopeDim, cfg.indexHeadDim, 1, S, B, 1, cfg.indexerRopeInterleave,
+      );
 
-          using prefetched = indexerKPrefetch?.value?.viewClone();
-          using prefetchedScale = indexerKScalePrefetch?.value?.viewClone();
-          using prefetchStream = indexerPrefetchStream?.detach();
-          prefetchStream?.streamWaitEvent();
-          this.prefetchLayerResources(state, layerHolders, layerIdx + 1);
+      using prefetched = indexerKPrefetch?.value?.viewClone();
+      using prefetchedScale = indexerKScalePrefetch?.value?.viewClone();
+      using prefetchStream = indexerPrefetchStream?.detach();
+      prefetchStream?.streamWaitEvent();
+      this.prefetchLayerResources(state, layerHolders, layerIdx + 1);
 
-          if (!prefetched !== !prefetchedScale) {
-            throw new Error('Prefetched K data and its scale must either both be available or both be absent.');
-          }
+      if (!prefetched !== !prefetchedScale) {
+        throw new Error('Prefetched K data and its scale must either both be available or both be absent.');
+      }
 
-          const localIndexer = state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
-          if (!prefetched) {
-            return localIndexer;
-          }
+      const localIndexer = state.indexerKvCacheAppend(idxKOut, layerIdx, cfg.indexHeadDim);
+      if (!prefetched) {
+        return localIndexer;
+      }
 
-          using _kData = localIndexer.kData;
-          using _kScaleData = localIndexer.kScaleData;
+      using _kData = localIndexer.kData;
+      using _kScaleData = localIndexer.kScaleData;
 
-          const nnz = state.isDecode ? state.batchSize : state.totalTokens;
-          const cache = this.ops.mlaKvCacheAppend(
-            state, layerIdx,
-            prefetched, prefetchedScale!,
-            undefined, state.kvTokenIndptrD, state.lastPageLen,
-            idxKOut, null,
-            state.mlaBatchIndices, state.positionIds,
-            nnz, cfg.indexHeadDim, 0,
-            cfg.indexHeadDim, 0
-          );
-          return { kData: cache.ckv, kScaleData: cache.kpe! };
-        });
-        using kData = kvcacheIndex!.result.kData;
-        using kScaleData = kvcacheIndex!.result.kScaleData;
-
-        const idxHeadDim = cfg.indexHeadDim;
-        const idxTopk = cfg.indexTopk;
-
-        // | `model.layers.N.self_attn.indexer.weights_proj.weight` | [32, 6144] | bfloat16 | 78 | 29.25 MB |
-        // | `model.layers.N.self_attn.indexer.wq_b.weight` | [4096, 2048] | bfloat16 | 78 | 1.22 GB |
-
-        qNormedStream.streamWaitEvent();
-        using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!);
-        using rotated = idxQLin.applyRotaryPosEmb(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, 2, cfg.indexerRopeInterleave);
-        using idxQ = rotated.reshape([B * S, cfg.indexNHeads, cfg.indexHeadDim]);
-
-        idxWeightsStream!.streamWaitEvent();
-
-        // Quantize before gathering Q and effective weights in one transfer.
-        if (true) {
-          const idxQuantResult = this.ops.indexerQuantizeQ(idxQ, idxWeights, Math.pow(cfg.indexHeadDim, -0.5));
-          using idxQFp8 = idxQuantResult.q8;
-          using effectiveWeights = idxQuantResult.effectiveWeights;
-
-          kvcacheIndex?.streamWaitEvent();
-
-          // Store the raw indexer top-k (token positions); slots are derived
-          // per-layer/per-mode below and in the gather (slotsReady).
-          return state.indexerTopk(
-            idxQFp8, kData, kScaleData, undefined,
-            Math.pow(idxHeadDim, -0.5), idxTopk, effectiveWeights
-          );
-        }
-        else {
-          kvcacheIndex?.streamWaitEvent();
-
-          // Store the raw indexer top-k (token positions); slots are derived
-          // per-layer/per-mode below and in the gather (slotsReady).
-          return state.indexerTopk(
-            idxQ, kData, kScaleData, idxWeights,
-            Math.pow(idxHeadDim, -0.5), idxTopk
-          );
-        }
-      });
-
-    // absorbed weight seems to only be worthwhile if precomputed, but its prefill throughput 10% gain max.
-    // weight is substantial, but could maybe be useful for very large prefills.
-    // disabling for now.
-    using absorbedWeightStream = true || state.totalTokens < 4096
-      ? undefined
-      : this.ops.withStream(() => {
-        const kNopeProj = this.tensors.get(`${pfx}.k_nope_proj.weight`)!;
-        const qNopeProj = this.tensors.get(`${pfx}.q_nope_proj.weight`)!;
-        using kNope = kNopeProj.viewClone();
-        const savedWorkspace = kNope.workspace;
-        kNope.setViewWorkspace(state.ws);
-        try {
-          const absorbed = kNope.bmm(qNopeProj, nHeads, kvLoraRank, cfg.qLoraRank, cfg.qkNopeHeadDim, true, false);
-          return absorbed;
-        }
-        finally {
-          kNope.setViewWorkspace(savedWorkspace);
-        }
-      });
+      const nnz = state.isDecode ? state.batchSize : state.totalTokens;
+      const cache = this.ops.mlaKvCacheAppend(
+        state, layerIdx,
+        prefetched, prefetchedScale!,
+        undefined, state.kvTokenIndptrD, state.lastPageLen,
+        idxKOut, null,
+        state.mlaBatchIndices, state.positionIds,
+        nnz, cfg.indexHeadDim, 0,
+        cfg.indexHeadDim, 0
+      );
+      return { kData: cache.ckv, kScaleData: cache.kpe! };
+    });
 
     using kvcache = this.ops.withStream(() => {
       using kPeRopeStream = this.ops.withStream(() => {
@@ -756,33 +685,131 @@ export class Glm51Model extends ChatModel {
       }
     });
 
+    // absorbed weight seems to only be worthwhile if precomputed, but its prefill throughput 10% gain max.
+    // weight is substantial, but could maybe be useful for very large prefills.
+    // disabling for now.
+    using absorbedWeightStream = true || state.totalTokens < 4096
+      ? undefined
+      : this.ops.withStream(() => {
+        const kNopeProj = this.tensors.get(`${pfx}.k_nope_proj.weight`)!;
+        const qNopeProj = this.tensors.get(`${pfx}.q_nope_proj.weight`)!;
+        using kNope = kNopeProj.viewClone();
+        const savedWorkspace = kNope.workspace;
+        kNope.setViewWorkspace(state.ws);
+        try {
+          const absorbed = kNope.bmm(qNopeProj, nHeads, kvLoraRank, cfg.qLoraRank, cfg.qkNopeHeadDim, true, false);
+          return absorbed;
+        }
+        finally {
+          kNope.setViewWorkspace(savedWorkspace);
+        }
+      });
+
+    // start asap for idxq and q
+    using qResidBuf = normed.linear(this.tensors.get(`${pfx}.q_a_proj.weight`)!);
+    using qNormed = qResidBuf.rmsnorm(this.tensors.get(`${pfx}.q_a_layernorm.weight`)!, cfg.rmsNormEps);;
+
+
     const cache = kvcache.result;
-    using qStream = this.ops.withStream(() => {
-      absorbedWeightStream?.streamWaitEvent();
-      using absorbedWeight = absorbedWeightStream?.result;
-      qNormedStream.streamWaitEvent();
-      // const ckvParallelism = ckvPrefetch?.value?.parallelism || state.cache.getPagedKV().ckvData[layerIdx].parallelism;
-      // if (cache.ckv.parallelism !== ckvParallelism) {
-      //   throw new Error(`MLA query/cache parallelism mismatch at layer ${layerIdx}: query=${ckvParallelism}, cache=${cache.ckv.parallelism}`);
-      // }
-      return this.ops.projectMlaQuery(
-        state, cache.ckv.parallelism, qNormed,
-        this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
-        this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
-        this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
-        absorbedWeight,
-        cos, sin,
-        qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,
-      );
-    });
+    using qStreamHolder = new UsingHolder<ReturnType<typeof this.ops.withStream<MlaQuery>>>(undefined!);
+
+
+    const indexerFn = () => {
+      using kData = kvcacheIndex!.result.kData;
+      using kScaleData = kvcacheIndex!.result.kScaleData;
+
+      const idxHeadDim = cfg.indexHeadDim;
+      const idxTopk = cfg.indexTopk;
+
+      // | `model.layers.N.self_attn.indexer.weights_proj.weight` | [32, 6144] | bfloat16 | 78 | 29.25 MB |
+      // | `model.layers.N.self_attn.indexer.wq_b.weight` | [4096, 2048] | bfloat16 | 78 | 1.22 GB |
+
+      using idxQLin = qNormed.linear(this.tensors.get(`${pfx}.indexer.wq_b.weight`)!);
+      using rotated = idxQLin.applyRotaryPosEmb(cos, sin, qkRopeDim, cfg.indexHeadDim, cfg.indexNHeads, S, B, 2, cfg.indexerRopeInterleave);
+      using idxQ = rotated.reshape([B * S, cfg.indexNHeads, cfg.indexHeadDim]);
+
+      idxWeightsStream!.streamWaitEvent();
+      using idxWeights = idxWeightsStream!.result;
+
+      // Quantize before gathering Q and effective weights in one transfer.
+      if (true) {
+        const idxQuantResult = this.ops.indexerQuantizeQ(idxQ, idxWeights, Math.pow(cfg.indexHeadDim, -0.5));
+        using idxQFp8 = idxQuantResult.q8;
+        using effectiveWeights = idxQuantResult.effectiveWeights;
+
+        kvcacheIndex?.streamWaitEvent();
+
+        // Store the raw indexer top-k (token positions); slots are derived
+        // per-layer/per-mode below and in the gather (slotsReady).
+        return state.indexerTopk(
+          idxQFp8, kData, kScaleData, undefined,
+          Math.pow(idxHeadDim, -0.5), idxTopk, effectiveWeights
+        );
+      }
+      else {
+        kvcacheIndex?.streamWaitEvent();
+
+        // Store the raw indexer top-k (token positions); slots are derived
+        // per-layer/per-mode below and in the gather (slotsReady).
+        return state.indexerTopk(
+          idxQ, kData, kScaleData, idxWeights,
+          Math.pow(idxHeadDim, -0.5), idxTopk
+        );
+      }
+    };
+
+
+    if (!shared) {
+      qStreamHolder.replace(this.ops.withStream(() => {
+        absorbedWeightStream?.streamWaitEvent();
+        using absorbedWeight = absorbedWeightStream?.result;
+        // const ckvParallelism = ckvPrefetch?.value?.parallelism || state.cache.getPagedKV().ckvData[layerIdx].parallelism;
+        // if (cache.ckv.parallelism !== ckvParallelism) {
+        //   throw new Error(`MLA query/cache parallelism mismatch at layer ${layerIdx}: query=${ckvParallelism}, cache=${cache.ckv.parallelism}`);
+        // }
+        return this.ops.projectMlaQuery(
+          state, cache.ckv.parallelism, qNormed,
+          this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
+          this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
+          this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
+          absorbedWeight,
+          cos, sin,
+          qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,
+        );
+      }));
+    }
+
+    // Indexer q: wq_b(qNormed) → rope → [BS, indexNHeads, indexHeadDim]
+    // Only 'full' layers compute indexer Q; 'shared' layers reuse previous topk.
+    const topkResult = shared ? undefined! : indexerFn();
+
+    if (shared) {
+      qStreamHolder.replace({
+        [Symbol.dispose]() { },
+        streamWaitEvent() { },
+        result: (() => {
+          absorbedWeightStream?.streamWaitEvent();
+          using absorbedWeight = absorbedWeightStream?.result;
+          return this.ops.projectMlaQuery(
+            state, cache.ckv.parallelism, qNormed,
+            this.tensors.get(`${pfx}.q_pe_proj.weight`)!,
+            this.tensors.get(`${pfx}.q_nope_proj.weight`)!,
+            this.tensors.get(`${pfx}.k_nope_proj.weight`)!,
+            absorbedWeight,
+            cos, sin,
+            qkRopeDim, kvLoraRank, nHeads, S, B, cfg.ropeInterleave,
+          );
+        })(),
+      } as ReturnType<typeof this.ops.withStream<MlaQuery>>);
+    }
 
     using ckv = cache.ckv;
-    using qAbsorbedR = qStream.result.qAbsorbed;
-    using qAbsorbedScales = qStream.result.qAbsorbedScales;
-    using qPeR = qStream.result.qPe;
+    using qAbsorbedR = qStreamHolder.value.result.qAbsorbed;
+    using qAbsorbedScales = qStreamHolder.value.result.qAbsorbedScales;
+    using qPeR = qStreamHolder.value.result.qPe;
 
-    idxQStream?.streamWaitEvent();
-    const topkResult = idxQStream?.result;
+    // idxQStream?.streamWaitEvent();
+    // const topkResult = idxQStream?.result;
     using _topkValues = topkResult?.values;
     using topkIndices = topkResult?.indices;
 
@@ -839,7 +866,7 @@ export class Glm51Model extends ChatModel {
     using slotsLength = sparseSlots.length;
 
     kvcache.streamWaitEvent();
-    qStream.streamWaitEvent();
+    qStreamHolder.value.streamWaitEvent();
 
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     using prefetchL2 = new UsingHolder<ReturnType<DeviceOps["withStream"]>>(undefined!);
