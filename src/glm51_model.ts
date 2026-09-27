@@ -866,7 +866,7 @@ export class Glm51Model extends ChatModel {
           return attnOut.mlaVExpand(vProj, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);
         });
         using vExpanded = vExpandStream.result;
-        prefetchL2.replace(this.ops.withStream(() => this.ops.prefetchL2([oProj])));
+        prefetchL2.replace(this.ops.withStream(() => this.ops.prefetchL2Linear([oProj], BS)));
         vExpandStream.streamWaitEvent();
         oProjBuf.replace(vExpanded.outputProj(oProj));
       }

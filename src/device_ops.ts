@@ -97,8 +97,8 @@ export interface DeviceOps extends Disposable {
   streamWaitEvent(streamIdx: number, eventIdx: number): void;
   withStream<T>(highPriority: boolean, fn: () => T): StreamResult<T>;
   withStream<T>(fn: () => T): StreamResult<T>;
-  /** Best-effort L2 warming of up to eight local tensor ranges in one grid. */
-  prefetchL2(tensors: readonly Tensor[]): void;
+  /** Best-effort L2 warming of up to eight local tensor ranges in one grid; batch enables decode column-narrow mirroring. */
+  prefetchL2Linear(tensors: readonly Tensor[], batch?: number): void;
 
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
 

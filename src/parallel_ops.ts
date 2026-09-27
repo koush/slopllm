@@ -766,11 +766,9 @@ export class ParallelTensor extends Tensor {
       const W = this.worldSize;
       if (n % W === 0 && batch <= W && pWeight.numElements > 1048576) {
         // these weights are better as column parallel for decode but replicated for prefill
-        if (pWeight.name?.includes(".self_attn.q_a_proj.weight") || pWeight.name?.includes(".indexer.wq_b.weight") || pWeight.name?.includes(".ckv_proj.weight")) {
-          using narrowed = pWeight.parallelOps.tryNarrowToColumnParallel(pWeight);
-          if (narrowed) {
-            return this.linear(narrowed);
-          }
+        using narrowed = this.parallelOps.tryNarrowLinearCandidate(pWeight, batch);
+        if (narrowed) {
+          return this.linear(narrowed);
         }
         // mlp.gate.weight ended up being slightly slower, and while it does overlap with shared, its still on the critical path.
         if (!pWeight.name?.includes(".mlp.gate.weight")) {
@@ -3265,6 +3263,18 @@ export class ParallelOps implements DeviceOps {
     return this.wrapShards(tensor.workspace, shards, tensor.shape, tensor.type, TensorParallelism.Column, tensor);
   }
 
+  /** Decode-sized batches narrow these replicated weights to column-parallel on demand. */
+  tryNarrowLinearCandidate(weight: ParallelTensor, batch: number): ParallelTensor | undefined {
+    const name = weight.name;
+    if (!name?.includes(".self_attn.q_a_proj.weight") && !name?.includes(".indexer.wq_b.weight") && !name?.includes(".ckv_proj.weight")) {
+      return undefined;
+    }
+    if (batch > this.worldSize || weight.numElements <= 1048576 || weight.shape[0] % this.worldSize !== 0) {
+      return undefined;
+    }
+    return this.tryNarrowToColumnParallel(weight);
+  }
+
   synchronize(streamIdx?: number): void {
     for (const device of this.devices) {
       device.synchronize(streamIdx);
@@ -3287,15 +3297,26 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  prefetchL2(tensors: readonly Tensor[]): void {
+  prefetchL2Linear(tensors: readonly Tensor[], batch?: number): void {
     if (tensors.length > 8) throw new Error("prefetchL2 supports at most eight tensors");
     for (const tensor of tensors) {
       if (!(tensor instanceof ParallelTensor) || tensor.workspace.ops !== this || tensor.pinned) {
         throw new Error("prefetchL2 requires device tensors owned by this backend");
       }
     }
-    for (let i = 0; i < this.worldSize; i++) {
-      this.devices[i].prefetchL2(tensors.map(tensor => (tensor as ParallelTensor).shards[i]));
+    // linear() may column-split replicated weights on demand (see
+    // ParallelTensor.linear); device i then reads only rows
+    // [i*shardSize, (i+1)*shardSize) of its shard, so warm just that range.
+    const narrowed = tensors.map(tensor =>
+      batch !== undefined ? this.tryNarrowLinearCandidate(tensor as ParallelTensor, batch) : undefined);
+    try {
+      for (let i = 0; i < this.worldSize; i++) {
+        const shards = tensors.map((tensor, t) =>
+          narrowed[t] ? narrowed[t]!.shards[i] : (tensor as ParallelTensor).shards[i]);
+        this.devices[i].prefetchL2Linear(shards);
+      }
+    } finally {
+      for (const n of narrowed) n?.[Symbol.dispose]();
     }
   }
 

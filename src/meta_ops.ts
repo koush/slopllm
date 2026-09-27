@@ -322,7 +322,7 @@ export class MetaOps implements DeviceOps {
         notifyHostWorldSynchronization(this.synchronizeListeners);
     }
 
-    prefetchL2(_tensors: readonly Tensor[]): void {
+    prefetchL2Linear(_tensors: readonly Tensor[], _batch?: number): void {
     }
 
     async synchronizeAsync(_streamIdx?: number): Promise<void> {

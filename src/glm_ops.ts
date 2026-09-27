@@ -1035,7 +1035,7 @@ export class GlmOps implements DeviceOps {
     notifyHostWorldSynchronization(this.synchronizeListeners);
   }
 
-  prefetchL2(tensors: readonly Tensor[]): void {
+  prefetchL2Linear(tensors: readonly Tensor[], _batch?: number): void {
     if (tensors.length > 8) throw new Error("prefetchL2 supports at most eight tensors");
     for (const tensor of tensors) {
       if (tensor.pinned || tensor.workspace.ops !== this) {
