@@ -382,7 +382,9 @@ export class GlmTensor extends Tensor {
       throw new Error("GlmTensor.memcpy requires GlmTensor source");
     }
     const bytes = size ?? Math.min(this.allocSize, src.allocSize);
-    const copyKind = kind ?? (src.pinned ? MemcpyKind.HostToDevice : MemcpyKind.DeviceToDevice);
+    const copyKind = kind ?? (src.pinned
+      ? (this.pinned ? MemcpyKind.HostToHost : MemcpyKind.HostToDevice)
+      : (this.pinned ? MemcpyKind.DeviceToHost : MemcpyKind.DeviceToDevice));
     this.checkHostMemcpyCapture(copyKind);
     // if (copyKind === MemcpyKind.DeviceToDevice && this.glm !== src.glm) {
     //   getNativeAddon().memcpyPeer(src.glm.ctx, this.data, this.glm.device, src.data, src.glm.device, bytes);
