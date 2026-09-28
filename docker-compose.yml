@@ -7,7 +7,9 @@
 #   docker compose logs -f
 #   docker compose down
 #
-# The image must be built first: docker build -t glmjs:runtime .
+# The image must be built first: `docker compose build`. Because BuildKit
+# caches the repo clone by its arguments, pick up new commits with
+#   REPO_REF=$(git rev-parse origin/main) docker compose build
 # The server binds host port ${PORT:-8000} directly (host networking).
 #
 # Overrides (environment or a .env file next to this file):
@@ -23,6 +25,14 @@
 
 services:
   glmjs:
+    build:
+      context: .
+      args:
+        # REPO_REF may be a branch name or a commit SHA. BuildKit caches the
+        # clone layer by its arguments, so pass the current remote SHA to
+        # pick up new commits: REPO_REF=$(git rev-parse origin/main)
+        # docker compose build
+        REPO_REF: "${REPO_REF:-main}"
     image: "${IMAGE:-glmjs:runtime}"
     container_name: "${CONTAINER_NAME:-glmjs}"
     command:
@@ -30,6 +40,8 @@ services:
       - --require
       - tsx/cjs
       - src/openai-server.ts
+      - --arena
+      - "92"
       - --host
       - 0.0.0.0
       - --port

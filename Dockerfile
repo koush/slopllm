@@ -42,9 +42,17 @@ RUN git config --global url."https://github.com/".insteadOf "git@github.com:"
 
 WORKDIR /build
 
-# Shallow-clone the superproject, then fetch submodules fully so their pinned
+# Clone the superproject, then fetch submodules fully so their pinned
 # commits (e.g. flashinfer -> 3rdparty/cccl) are always available.
-RUN git clone --depth 1 --branch "${REPO_REF}" --recurse-submodules -j8 "${REPO_URL}" glm.js
+#
+# REPO_REF may be a branch name or a commit SHA. BuildKit caches this layer
+# by its arguments, so a rebuild with an unchanged REPO_REF (e.g. the
+# default "main") can reuse a cached clone that predates newer commits.
+# To build from fresh source, pass the current remote SHA:
+#   REPO_REF=$(git rev-parse origin/main) docker compose build
+RUN git clone "${REPO_URL}" glm.js \
+    && git -C glm.js checkout "${REPO_REF}" \
+    && git -C glm.js submodule update --init --recursive --jobs 8
 
 WORKDIR /build/glm.js
 
