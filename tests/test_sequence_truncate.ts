@@ -91,17 +91,17 @@ it("prefix sharing copies the target at the retained boundary", () => {
   assert.deepEqual(cache.prefixMatch(1, tokens), tokens.slice(PAGE_SIZE));
   assert.equal(cache.sequences[1].targetToken, tokens[PAGE_SIZE]);
   cache.sequences[1].clear();
-  assert.deepEqual(cache.prefixMatch(1, tokens, true), tokens.slice(-1));
-  assert.equal(cache.sequences[1].targetToken, tokens.at(-1));
-  assert.equal(cache.sequences[1].allocLen, tokens.length - 1);
+  assert.deepEqual(cache.prefixMatch(1, tokens), tokens.slice(PAGE_SIZE));
+  assert.equal(cache.sequences[1].targetToken, tokens[PAGE_SIZE]);
+  assert.equal(cache.sequences[1].allocLen, PAGE_SIZE);
 });
 
 for (const donorKind of ["self", "active", "staged"]) {
   for (const extra of [0, 3]) {
-    it(`full prefix match replays the last prompt token (${donorKind}, donor extra=${extra})`, () => {
+    it(`full prefix match replays the last page (${donorKind}, donor extra=${extra})`, () => {
       using cache = new PagedKVCache(new MetaOps(), 1, 8, 1, 4, 2);
       cache.reset(2);
-      const prompt = Array.from({ length: PAGE_SIZE }, (_, i) => i + 1);
+      const prompt = Array.from({ length: 2 * PAGE_SIZE }, (_, i) => i + 1);
       const donorTokens = [...prompt, ...Array(extra).fill(888)];
       cache.allocAppendPages(0, donorTokens.length);
       cache.reportTokens(0, donorTokens, 999);
@@ -111,15 +111,15 @@ for (const donorKind of ["self", "active", "staged"]) {
         cache.stageSequence(0, 123);
         index = 0;
       }
-      assert.deepEqual(cache.prefixMatch(index, prompt), prompt.slice(-1));
+      assert.deepEqual(cache.prefixMatch(index, prompt), prompt.slice(PAGE_SIZE));
       const matched = cache.sequences[index];
-      assert.equal(matched.allocLen, prompt.length - 1);
-      assert.deepEqual(matched.getTokenIds(), prompt.slice(0, -1));
-      assert.equal(matched.targetToken, prompt.at(-1));
+      assert.equal(matched.allocLen, PAGE_SIZE);
+      assert.deepEqual(matched.getTokenIds(), prompt.slice(0, PAGE_SIZE));
+      assert.equal(matched.targetToken, prompt[PAGE_SIZE]);
       if (donorKind !== "self") {
         assert.deepEqual(donor.getTokenIds(), donorTokens);
         assert.equal(donor.targetToken, 999);
-        assert.notEqual(matched.pages[0], donor.pages[0]);
+        assert.equal(matched.pages[0], donor.pages[0]);
       }
     });
   }

@@ -242,18 +242,17 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
    * Materializes the full-page prefix of a sequence from another cache into
    * dstSeqIdx and returns the uncopied suffix.
    *
-   * The destination first prefix-matches against its own cache (full pages
-   * can be shared/COWed as usual, with the standard prefill semantics — a
-   * complete match's final token comes back in the suffix). The remaining
-   * full pages are copied in one batched CUDA submission issued from the
-   * source's stream (posted writes; cross-device use needs the usual P2P
+   * The destination first reuses full pages from its own cache, without
+   * reserving a final token for resampling. The remaining full pages are
+   * copied in one batched CUDA submission issued from the source's stream
+   * (posted writes; cross-device use needs the usual P2P
    * barrier before consuming). Reservation runs through the normal
    * page-allocation path (page pressure applies). Requires identical cache
    * layout: same pageSize, nLayers, and per-layer row layout.
    *
-   * Returns the uncopied suffix — the partial-page tail plus the final token
-   * on a complete match — for the caller to prefill through the normal
-   * chunked-prefill path, appending srcSeq.targetToken to the last chunk to
+   * Returns the uncopied suffix — the partial-page tail — for the caller to
+   * prefill through the normal chunked-prefill path, appending
+   * srcSeq.targetToken to the last chunk to
    * continue the sequence exactly. When the suffix is empty (page-aligned
    * content), srcSeq.targetToken is already pending as the decode input.
    * Requires identical cache layout: same pageSize, nLayers, and per-layer
@@ -266,20 +265,15 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.assertCacheLayoutCompatible(src);
     const pageSize = this.pageSize;
     const srcTokens = srcSeq.getTokenIds();
-    const matched = srcTokens.length - this.prefixMatch(dstSeqIdx, srcTokens).length;
     const fullPages = Math.floor(srcTokens.length / pageSize);
-    // First full src page the match did not materialize in dst. On a complete
-    // match the truncated final token rounds up past the last page; on a
-    // partial match every skipped page is shared or dst-owned with correct
-    // content, so copying starts at the next page boundary.
-    const firstCopyPage = Math.ceil(matched / pageSize);
+    const matched = srcTokens.length - this.matchFullPages(dstSeqIdx, srcTokens, fullPages).length;
+    const firstCopyPage = matched / pageSize;
     const dstSeq = this.ensureSequence(dstSeqIdx);
     if (fullPages > firstCopyPage) {
       this.allocAppendPages(dstSeqIdx, (fullPages - firstCopyPage) * pageSize);
     }
 
-    // Copy only whole pages: every copied page is freshly allocated (or, on a
-    // complete match, COW'd by the truncation), so a shared page is never
+    // Every copied page is freshly allocated, so a shared page is never
     // overwritten. The partial tail is left for the caller to prefill.
     const entries: MemcpyBatchEntry[] = [];
     let runSrc = -2, runDst = -2, runPages = 0;
@@ -322,7 +316,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     // Commit the copied tokens (fresh pages have empty tokenIds) and leave
     // the first uncopied token pending as the next input — or, once the whole
     // history is materialized, the source's own pending decode input.
-    const contentLen = Math.max(matched, fullPages * pageSize);
+    const contentLen = fullPages * pageSize;
     const nextInput = contentLen < srcTokens.length ? srcTokens[contentLen] : srcSeq.targetToken;
     this.reportTokens(dstSeqIdx, srcTokens.slice(matched, contentLen), nextInput);
     return srcTokens.slice(contentLen);
@@ -334,76 +328,55 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   }
 
   // Finds the best prefix match across active and staged sequences and returns the unmatched suffix.
-  // Only full pages are kept/shared — the partial page is never shared because
-  // the receiving sequence would write into it. Empty pages beyond the content
-  // region are discarded. A complete prompt match leaves its final token for
-  // prefill so the caller selects a fresh output using its own sampling policy.
-  prefixMatch(seqIdx: number, inputIds: number[], copyPartial?: boolean): number[] {
+  // Reuse only full pages, leaving at least one prompt token for prefill so
+  // the caller selects a fresh output using its own sampling policy. An exact
+  // page-aligned match replays the last full page. No partial pages are copied
+  // or kept, including on self-matches; prefill starts at a page boundary.
+  prefixMatch(seqIdx: number, inputIds: number[]): number[] {
+    const maxPages = Math.floor(Math.max(0, inputIds.length - 1) / this.pageSize);
+    return this.matchFullPages(seqIdx, inputIds, maxPages);
+  }
+
+  private matchFullPages(seqIdx: number, inputIds: number[], maxPages: number): number[] {
     const targetSeq = this.ensureSequence(seqIdx);
 
     let bestSeq: Sequence | undefined;
     let bestMatchTokens = 0;
     for (const sequence of [...this.sequences, ...this.staging.values()]) {
       if (sequence.pages.length === 0) continue;
-      const matchTokens = Math.min(sequence.prefixMatch(inputIds), sequence.allocLen);
+      const matchTokens = Math.min(
+        Math.floor(Math.min(sequence.prefixMatch(inputIds), sequence.allocLen) / this.pageSize),
+        maxPages,
+      ) * this.pageSize;
       if (matchTokens > bestMatchTokens) {
         bestMatchTokens = matchTokens;
         bestSeq = sequence;
       }
     }
 
-    if (bestSeq === targetSeq && bestMatchTokens === targetSeq.reportedTokenCount()) {
-      if (bestMatchTokens === inputIds.length) {
-        targetSeq.truncate(--bestMatchTokens);
-      }
-      return inputIds.slice(bestMatchTokens);
-    }
-
     if (!bestSeq || bestMatchTokens === 0) {
       targetSeq.clear();
+      targetSeq.targetToken = inputIds[0];
       return inputIds.slice();
     }
 
-    // full pages can be shared, memcpy is needed for a partial page.
-    const keepPages = Math.floor(bestMatchTokens / this.pageSize);
+    const keepPages = bestMatchTokens / this.pageSize;
+    const nextInput = inputIds[bestMatchTokens] ?? bestSeq.targetToken;
 
     if (bestSeq === targetSeq) {
       while (targetSeq.pages.length > keepPages) {
         targetSeq.popPage();
       }
-      if (targetSeq.allocLen === inputIds.length) {
-        targetSeq.truncate(targetSeq.allocLen - 1);
-      }
-      return inputIds.slice(targetSeq.allocLen);
-    }
-
-    if (keepPages > 0) {
+    } else {
       const newSeq = new Sequence(this);
       for (let i = 0; i < keepPages; i++) {
         newSeq.pushPage(bestSeq.pages[i], this.pageSize);
       }
       targetSeq.clear();
       this.sequences[seqIdx] = newSeq;
-      const partialPage = bestMatchTokens % this.pageSize !== 0;
-      if (copyPartial && partialPage) {
-        this.allocAppendPages(seqIdx, this.pageSize);
-        const srcPage = bestSeq.pages[keepPages];
-        const dstPage = this.sequences[seqIdx].pages[keepPages];
-        this.copyPage(srcPage.id, dstPage.id);
-        dstPage.tokenIds.push(...srcPage.tokenIds.slice(0, bestMatchTokens % this.pageSize));
-        this.sequences[seqIdx].allocLen = bestMatchTokens;
-      }
-      const matched = this.sequences[seqIdx];
-      matched.targetToken = matched.allocLen === bestSeq.reportedTokenCount()
-        ? bestSeq.targetToken : bestSeq.getTokenIds()[matched.allocLen];
-      if (matched.allocLen === inputIds.length) {
-        matched.truncate(matched.allocLen - 1);
-      }
-      return inputIds.slice(matched.allocLen);
     }
-
-    this.sequences[seqIdx].clear();
-    return inputIds.slice();
+    this.sequences[seqIdx].targetToken = nextInput;
+    return inputIds.slice(bestMatchTokens);
   }
 
   copyPage(srcPageId: number, dstPageId: number): void {

@@ -19,48 +19,89 @@ function makeCache() {
 
 const tokens = (length: number) => Array.from({ length }, (_, i) => i + 100);
 
+for (const donorKind of ["self", "active", "staged"]) {
+  for (const length of [0, 1, 63, 64, 65, 128, 130]) {
+    test(`exact match uses only full pages without allocations: ${donorKind}, length=${length}`, () => {
+      const { cache, copies } = makeCache();
+      cache.availablePages = Array.from({ length: Math.ceil(length / PAGE_SIZE) }, (_, i) => i);
+      const source = cache.ensureSequence(0);
+      const input = tokens(length);
+      cache.allocAppendPages(0, length);
+      cache.reportTokens(0, input, 999);
+      const sourcePages = [...source.pages];
+      let index = donorKind === "self" ? 0 : 1;
+      if (donorKind === "staged") {
+        cache.stageSequence(0, 123);
+        index = 0;
+      }
+      cache.onPagePressure = () => assert.fail("prefix matching must not allocate or cause eviction");
+      assert.equal(cache.availablePages.length, 0);
+      const kept = Math.floor(Math.max(0, length - 1) / PAGE_SIZE) * PAGE_SIZE;
+      assert.deepEqual(cache.prefixMatch(index, input), input.slice(kept));
+      const matched = cache.sequences[index];
+      assert.equal(matched.allocLen, kept);
+      assert.deepEqual(matched.getTokenIds(), input.slice(0, kept));
+      assert.equal(matched.targetToken, input[kept]);
+      assert.deepEqual(copies, []);
+      for (let i = 0; i < kept / PAGE_SIZE; i++) {
+        assert.equal(matched.pages[i], sourcePages[i]);
+        assert.equal(sourcePages[i].refs, donorKind === "self" ? 1 : 2);
+      }
+      if (donorKind !== "self") {
+        assert.deepEqual(source.getTokenIds(), input);
+        assert.equal(source.targetToken, 999);
+      }
+    });
+  }
+}
+
+test("self-match releases partial and unreported reserved pages", () => {
+  const { cache, copies } = makeCache();
+  const seq = cache.ensureSequence(0);
+  cache.allocAppendPages(0, 4 * PAGE_SIZE);
+  cache.reportTokens(0, tokens(70));
+  const suffix = cache.prefixMatch(0, tokens(80));
+  assert.deepEqual(suffix, tokens(80).slice(PAGE_SIZE));
+  assert.equal(seq.allocLen, PAGE_SIZE);
+  assert.equal(seq.pages.length, 1);
+  assert.equal(cache.availablePages.length, 15);
+  assert.deepEqual(copies, []);
+});
+
 for (const staged of [false, true]) {
-  for (const copyPartial of [false, true]) {
-    for (const allocLen of [63, 64, 127, 128]) {
-      test(`pending target boundary: allocLen=${allocLen}, staged=${staged}, copyPartial=${copyPartial}`, () => {
-        const { cache, copies } = makeCache();
-        const source = cache.ensureSequence(0);
-        cache.allocAppendPages(0, allocLen);
-        const reported = tokens(allocLen + 1);
-        cache.reportTokens(0, reported.slice(0, -1), reported.at(-1));
-        const sourcePages = [...source.pages];
-        const targetIndex = staged ? 0 : 1;
-        if (staged) cache.stageSequence(0, 123);
+  for (const allocLen of [63, 64, 127, 128]) {
+    test(`pending target boundary: allocLen=${allocLen}, staged=${staged}`, () => {
+      const { cache, copies } = makeCache();
+      const source = cache.ensureSequence(0);
+      cache.allocAppendPages(0, allocLen);
+      const reported = tokens(allocLen + 1);
+      cache.reportTokens(0, reported.slice(0, -1), reported.at(-1));
+      const sourcePages = [...source.pages];
+      const targetIndex = staged ? 0 : 1;
+      if (staged) cache.stageSequence(0, 123);
 
-        const input = [...reported, 999];
-        const fullPages = Math.floor(allocLen / PAGE_SIZE);
-        // Preserve the existing policy: copyPartial requires a full shared page.
-        const reused = copyPartial && fullPages > 0 ? allocLen : fullPages * PAGE_SIZE;
-        const suffix = cache.prefixMatch(targetIndex, input, copyPartial);
-        const target = cache.sequences[targetIndex];
-        assert.deepEqual(suffix, input.slice(reused));
-        assert.equal(target.allocLen, reused);
-        assert.deepEqual(target.getTokenIds(), input.slice(0, reused));
-        assert.equal(target.pages.length, Math.ceil(reused / PAGE_SIZE));
-        for (let i = 0; i < fullPages; i++) {
-          assert.equal(target.pages[i], sourcePages[i]);
-          assert.equal(sourcePages[i].refs, 2);
-        }
-        if (allocLen % PAGE_SIZE) assert.equal(sourcePages[fullPages].refs, 1, "partial page must not be shared");
-        if (reused % PAGE_SIZE !== 0) {
-          assert.deepEqual(copies, [[sourcePages[fullPages].id, target.pages[fullPages].id]]);
-          assert.notEqual(target.pages[fullPages], sourcePages[fullPages]);
-        } else {
-          assert.deepEqual(copies, []);
-        }
+      const input = [...reported, 999];
+      const fullPages = Math.floor(allocLen / PAGE_SIZE);
+      const reused = fullPages * PAGE_SIZE;
+      const suffix = cache.prefixMatch(targetIndex, input);
+      const target = cache.sequences[targetIndex];
+      assert.deepEqual(suffix, input.slice(reused));
+      assert.equal(target.allocLen, reused);
+      assert.deepEqual(target.getTokenIds(), input.slice(0, reused));
+      assert.equal(target.pages.length, Math.ceil(reused / PAGE_SIZE));
+      for (let i = 0; i < fullPages; i++) {
+        assert.equal(target.pages[i], sourcePages[i]);
+        assert.equal(sourcePages[i].refs, 2);
+      }
+      if (allocLen % PAGE_SIZE) assert.equal(sourcePages[fullPages].refs, 1, "partial page must not be shared");
+      assert.deepEqual(copies, []);
 
-        cache.allocAppendPages(targetIndex, suffix.length);
-        cache.reportTokens(targetIndex, suffix);
-        assert.deepEqual(target.getTokenIds(), input, "suffix must not duplicate the source peek");
-        assert.deepEqual(source.getTokenIds(), reported.slice(0, -1));
-        assert.equal(source.allocLen, allocLen);
-      });
-    }
+      cache.allocAppendPages(targetIndex, suffix.length);
+      cache.reportTokens(targetIndex, suffix);
+      assert.deepEqual(target.getTokenIds(), input, "suffix must not duplicate the source peek");
+      assert.deepEqual(source.getTokenIds(), reported.slice(0, -1));
+      assert.equal(source.allocLen, allocLen);
+    });
   }
 }
 
@@ -85,12 +126,13 @@ for (const allocLen of [63, 64, 127, 128]) {
     const reported = tokens(allocLen + 1);
     cache.reportTokens(0, reported.slice(0, -1), reported.at(-1));
     const pages = [...source.pages];
-    assert.deepEqual(cache.prefixMatch(0, reported), reported.slice(-1));
-    assert.deepEqual(cache.prefixMatch(0, [...reported, 999], true), [reported.at(-1), 999]);
-    assert.equal(source.allocLen, allocLen);
-    assert.deepEqual(source.getTokenIds(), reported.slice(0, -1));
+    const reused = Math.floor(allocLen / PAGE_SIZE) * PAGE_SIZE;
+    assert.deepEqual(cache.prefixMatch(0, reported), reported.slice(reused));
+    assert.deepEqual(cache.prefixMatch(0, [...reported, 999]), [...reported.slice(reused), 999]);
+    assert.equal(source.allocLen, reused);
+    assert.deepEqual(source.getTokenIds(), reported.slice(0, reused));
     assert.equal(source.reportedTokenCount(), source.allocLen);
-    pages.forEach((page, i) => {
+    pages.slice(0, reused / PAGE_SIZE).forEach((page, i) => {
       assert.equal(source.pages[i], page);
       assert.equal(page.refs, 1);
     });
@@ -98,17 +140,17 @@ for (const allocLen of [63, 64, 127, 128]) {
   });
 }
 
-test("copyPartial trims metadata at a mismatch before the source KV boundary", () => {
+test("a mismatch within a page leaves the entire partial page for prefill", () => {
   const { cache } = makeCache();
   const source = cache.ensureSequence(0);
   cache.allocAppendPages(0, 70);
   const reported = tokens(71);
   cache.reportTokens(0, reported.slice(0, -1), reported.at(-1));
   const input = [...reported.slice(0, 67), 999, 998];
-  const suffix = cache.prefixMatch(1, input, true);
-  assert.deepEqual(suffix, [999, 998]);
-  assert.equal(cache.sequences[1].allocLen, 67);
-  assert.deepEqual(cache.sequences[1].getTokenIds(), input.slice(0, 67));
+  const suffix = cache.prefixMatch(1, input);
+  assert.deepEqual(suffix, input.slice(64));
+  assert.equal(cache.sequences[1].allocLen, 64);
+  assert.deepEqual(cache.sequences[1].getTokenIds(), input.slice(0, 64));
   cache.allocAppendPages(1, suffix.length);
   cache.reportTokens(1, suffix);
   assert.deepEqual(cache.sequences[1].getTokenIds(), input);
@@ -122,9 +164,9 @@ test("self-match with a different pending target preserves the committed prefix"
   const reported = tokens(128);
   cache.reportTokens(0, reported.slice(0, -1), reported.at(-1));
   const input = [...reported.slice(0, 127), 999];
-  assert.deepEqual(cache.prefixMatch(0, input), [999]);
-  assert.equal(source.allocLen, 127);
-  assert.deepEqual(source.getTokenIds(), input.slice(0, 127));
+  assert.deepEqual(cache.prefixMatch(0, input), input.slice(64));
+  assert.equal(source.allocLen, 64);
+  assert.deepEqual(source.getTokenIds(), input.slice(0, 64));
 });
 
 // Shell caches for copyPrefixFrom: real bookkeeping methods plus fake layer
@@ -208,10 +250,10 @@ test("copyPrefixFrom into a cache that already holds the sequence copies nothing
   dst.reportTokens(0, tokens(130), 77);
 
   const suffix = dst.copyPrefixFrom(src, srcSeq, 0);
-  assert.deepEqual(suffix, [tokens(130)[129]], "complete match returns its truncated final token");
-  assert.equal(dstSeq.allocLen, 129);
-  assert.deepEqual(dstSeq.getTokenIds(), tokens(129));
-  assert.equal(dstSeq.targetToken, tokens(130)[129]);
+  assert.deepEqual(suffix, tokens(130).slice(128), "complete match returns the partial-page tail");
+  assert.equal(dstSeq.allocLen, 128);
+  assert.deepEqual(dstSeq.getTokenIds(), tokens(128));
+  assert.equal(dstSeq.targetToken, tokens(130)[128]);
   assert.deepEqual(entries, [], "complete self-restore must not copy pages");
 
   dst.allocAppendPages(0, suffix.length);
@@ -255,6 +297,30 @@ test("copyPrefixFrom leaves no suffix for a page-aligned sequence and keeps the 
   assert.deepEqual(dstSeq.getTokenIds(), tokens(128));
   assert.equal(dstSeq.targetToken, 77, "aligned restore leaves the source's pending token for decode");
   assert.deepEqual(pageCopies(entries), [[0, 0, 2, K_ROW], [0, 0, 2, K_SCALE_ROW], [0, 0, 2, CKV_ROW]]);
+});
+
+test("repeated aligned restores share complete pages without final-token repriming", () => {
+  const { cache: src } = makeCopyCache();
+  const { cache: dst, entries } = makeCopyCache();
+  const source = src.ensureSequence(0);
+  src.allocAppendPages(0, 128);
+  src.reportTokens(0, tokens(128), 77);
+  // Exactly enough destination space for the first restore, with no spare
+  // page for copy-on-write during subsequent self/cross-sequence matches.
+  dst.availablePages = [0, 1];
+  assert.deepEqual(dst.copyPrefixFrom(src, source, 0), []);
+  entries.length = 0;
+  for (const index of [0, 1, 2]) {
+    assert.deepEqual(dst.copyPrefixFrom(src, source, index), []);
+    assert.equal(dst.sequences[index].allocLen, 128);
+    assert.deepEqual(dst.sequences[index].getTokenIds(), tokens(128));
+    assert.equal(dst.sequences[index].targetToken, 77);
+    assert.equal(dst.sequences[index].pages[0], dst.sequences[0].pages[0]);
+    assert.equal(dst.sequences[index].pages[1], dst.sequences[0].pages[1]);
+  }
+  assert.deepEqual(entries, []);
+  assert.equal(dst.sequences[0].pages[0].refs, 3);
+  assert.equal(dst.sequences[0].pages[1].refs, 3);
 });
 
 test("copyPrefixFrom from an empty sequence clears the destination", () => {
