@@ -1,5 +1,5 @@
 import { type ChatCache } from "./chat_model";
-import { DeviceOps, TensorParallelism } from "./device_ops";
+import { DeviceOps, TensorParallelism, type MemcpyBatchEntry } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
@@ -191,6 +191,141 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       dstSeq.allocLen = srcSeq.allocLen;
     }
     dstSeq.targetToken = srcSeq.targetToken;
+  }
+
+  // Layer tensors [dst, src] for the layer's allocated caches (undefined
+  // entries — shared-indexer layers — are skipped).
+  private layerCachePairs(src: PagedKVCache, layer: number): [Tensor, Tensor][] {
+    const pairs: [Tensor, Tensor][] = [];
+    const add = (dst: Tensor | undefined, s: Tensor | undefined) => {
+      if (dst && s) pairs.push([dst, s]);
+    };
+    add(this.kData[layer], src.kData[layer]);
+    add(this.kScaleData[layer], src.kScaleData[layer]);
+    add(this.vData[layer], src.vData[layer]);
+    add(this.ckvData[layer], src.ckvData[layer]);
+    add(this.kpeData[layer], src.kpeData[layer]);
+    return pairs;
+  }
+
+  private assertCacheLayoutCompatible(src: PagedKVCache): void {
+    if (src.pageSize !== this.pageSize) {
+      throw new Error(`copyPrefixFrom: pageSize mismatch (dst ${this.pageSize}, src ${src.pageSize})`);
+    }
+    if (src.nLayers !== this.nLayers) {
+      throw new Error(`copyPrefixFrom: nLayers mismatch (dst ${this.nLayers}, src ${src.nLayers})`);
+    }
+    if (src.sparseMode !== this.sparseMode || src.bytesPerToken !== this.bytesPerToken) {
+      throw new Error("copyPrefixFrom: KV packing mismatch (sparse/dense or bytesPerToken)");
+    }
+    for (let i = 0; i < this.nLayers; i++) {
+      const check = (dst: Tensor | undefined, s: Tensor | undefined, what: string) => {
+        if (!!dst !== !!s) {
+          throw new Error(`copyPrefixFrom: ${what}${i} present in only one cache`);
+        }
+        if (!dst || !s) return;
+        const dstRow = Tensor.byteCount(dst.shape.slice(1), dst.type);
+        const srcRow = Tensor.byteCount(s.shape.slice(1), s.type);
+        if (dst.type !== s.type || dstRow !== srcRow) {
+          throw new Error(`copyPrefixFrom: ${what}${i} layout mismatch (${dst.type} ${dstRow}B vs ${s.type} ${srcRow}B)`);
+        }
+      };
+      check(this.kData[i], src.kData[i], "k");
+      check(this.kScaleData[i], src.kScaleData[i], "kScale");
+      check(this.vData[i], src.vData[i], "v");
+      check(this.ckvData[i], src.ckvData[i], "ckv");
+      check(this.kpeData[i], src.kpeData[i], "kpe");
+    }
+  }
+
+  /**
+   * Materializes the full-page prefix of a sequence from another cache into
+   * dstSeqIdx and returns the uncopied suffix.
+   *
+   * The destination first prefix-matches against its own cache (full pages
+   * can be shared/COWed as usual, with the standard prefill semantics — a
+   * complete match's final token comes back in the suffix). The remaining
+   * full pages are copied in one batched CUDA submission issued from the
+   * source's stream (posted writes; cross-device use needs the usual P2P
+   * barrier before consuming). Reservation runs through the normal
+   * page-allocation path (page pressure applies). Requires identical cache
+   * layout: same pageSize, nLayers, and per-layer row layout.
+   *
+   * Returns the uncopied suffix — the partial-page tail plus the final token
+   * on a complete match — for the caller to prefill through the normal
+   * chunked-prefill path, appending srcSeq.targetToken to the last chunk to
+   * continue the sequence exactly. When the suffix is empty (page-aligned
+   * content), srcSeq.targetToken is already pending as the decode input.
+   * Requires identical cache layout: same pageSize, nLayers, and per-layer
+   * row layout.
+   */
+  copyPrefixFrom(src: PagedKVCache, srcSeq: Sequence, dstSeqIdx: number): number[] {
+    if (srcSeq.pagedKvCache !== src) {
+      throw new Error("copyPrefixFrom: sequence does not belong to src cache");
+    }
+    this.assertCacheLayoutCompatible(src);
+    const pageSize = this.pageSize;
+    const srcTokens = srcSeq.getTokenIds();
+    const matched = srcTokens.length - this.prefixMatch(dstSeqIdx, srcTokens).length;
+    const fullPages = Math.floor(srcTokens.length / pageSize);
+    // First full src page the match did not materialize in dst. On a complete
+    // match the truncated final token rounds up past the last page; on a
+    // partial match every skipped page is shared or dst-owned with correct
+    // content, so copying starts at the next page boundary.
+    const firstCopyPage = Math.ceil(matched / pageSize);
+    const dstSeq = this.ensureSequence(dstSeqIdx);
+    if (fullPages > firstCopyPage) {
+      this.allocAppendPages(dstSeqIdx, (fullPages - firstCopyPage) * pageSize);
+    }
+
+    // Copy only whole pages: every copied page is freshly allocated (or, on a
+    // complete match, COW'd by the truncation), so a shared page is never
+    // overwritten. The partial tail is left for the caller to prefill.
+    const entries: MemcpyBatchEntry[] = [];
+    let runSrc = -2, runDst = -2, runPages = 0;
+    const flushRun = () => {
+      if (runPages === 0) return;
+      for (let i = 0; i < this.nLayers; i++) {
+        for (const [dstT, srcT] of this.layerCachePairs(src, i)) {
+          const rowBytes = Tensor.byteCount(dstT.shape.slice(1), dstT.type);
+          entries.push({
+            dst: dstT,
+            src: srcT,
+            bytes: runPages * rowBytes,
+            dstOffset: runDst * rowBytes,
+            srcOffset: runSrc * rowBytes,
+          });
+        }
+      }
+      runPages = 0;
+    };
+    for (let p = firstCopyPage; p < fullPages; p++) {
+      const sp = srcSeq.pages[p];
+      const dp = dstSeq.pages[p];
+      if (!sp || !dp) {
+        throw new Error(`copyPrefixFrom: missing page ${p} (src ${!!sp}, dst ${!!dp})`);
+      }
+      if (sp.id === runSrc + runPages && dp.id === runDst + runPages) {
+        runPages++;
+      } else {
+        flushRun();
+        runSrc = sp.id;
+        runDst = dp.id;
+        runPages = 1;
+      }
+    }
+    flushRun();
+    if (entries.length) {
+      this.ops.memcpyBatchAsync(entries);
+    }
+
+    // Commit the copied tokens (fresh pages have empty tokenIds) and leave
+    // the first uncopied token pending as the next input — or, once the whole
+    // history is materialized, the source's own pending decode input.
+    const contentLen = Math.max(matched, fullPages * pageSize);
+    const nextInput = contentLen < srcTokens.length ? srcTokens[contentLen] : srcSeq.targetToken;
+    this.reportTokens(dstSeqIdx, srcTokens.slice(matched, contentLen), nextInput);
+    return srcTokens.slice(contentLen);
   }
 
   ensureSequence(seqIdx: number) {

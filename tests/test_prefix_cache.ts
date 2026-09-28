@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import type { MemcpyBatchEntry } from "../src/device_ops";
+import { Tensor } from "../src/tensor";
 import { PAGE_SIZE, PagedKVCache, Sequence } from "../src/paged_kv";
 
 function makeCache() {
@@ -123,4 +125,160 @@ test("self-match with a different pending target preserves the committed prefix"
   assert.deepEqual(cache.prefixMatch(0, input), [999]);
   assert.equal(source.allocLen, 127);
   assert.deepEqual(source.getTokenIds(), input.slice(0, 127));
+});
+
+// Shell caches for copyPrefixFrom: real bookkeeping methods plus fake layer
+// tensors (shape/type only) so layerCachePairs/assertCacheLayoutCompatible and
+// the batched-memcpy construction run without GPU allocations.
+function makeCopyCache(overrides?: { bytesPerToken?: number }) {
+  const bytesPerToken = overrides?.bytesPerToken ?? 656;
+  const entries: MemcpyBatchEntry[] = [];
+  const tensor = (shape: number[], type: string) => ({ shape: [...shape], type } as unknown as Tensor);
+  const cache: PagedKVCache = Object.assign(Object.create(PagedKVCache.prototype), {
+    pageSize: PAGE_SIZE,
+    availablePages: Array.from({ length: 16 }, (_, i) => i),
+    sequences: [],
+    staging: new Map<number, Sequence>(),
+    copyPage(_srcPageId: number, _dstPageId: number) {},
+    nLayers: 1,
+    nKv: 1,
+    hd: 1,
+    maxPages: 16,
+    maxBatch: 4,
+    contextParallel: false,
+    sparseMode: true,
+    bytesPerToken,
+    kData: [tensor([16, PAGE_SIZE, 128], "U8")],
+    kScaleData: [tensor([16, PAGE_SIZE], "F32")],
+    vData: [],
+    ckvData: [tensor([16, PAGE_SIZE, bytesPerToken], "U8")],
+    kpeData: [],
+    ops: { memcpyBatchAsync(copies: readonly MemcpyBatchEntry[]) { entries.push(...copies); } },
+  });
+  return { cache, entries };
+}
+
+// Decodes batched-memcpy entries to [srcPage, dstPage, pages, rowBytes] so
+// tests can assert exactly which pages were copied for each cache tensor.
+function pageCopies(entries: readonly MemcpyBatchEntry[]) {
+  return entries.map(copy => {
+    const rowBytes = Tensor.byteCount(copy.dst.shape.slice(1), copy.dst.type);
+    return [(copy.srcOffset ?? 0) / rowBytes, (copy.dstOffset ?? 0) / rowBytes, copy.bytes / rowBytes, rowBytes];
+  });
+}
+
+const K_ROW = PAGE_SIZE * 128;
+const K_SCALE_ROW = PAGE_SIZE * 4;
+const CKV_ROW = PAGE_SIZE * 656;
+
+test("copyPrefixFrom copies full pages and returns the partial-page tail", () => {
+  const { cache: src } = makeCopyCache();
+  const { cache: dst, entries } = makeCopyCache();
+  const srcSeq = src.ensureSequence(0);
+  src.allocAppendPages(0, 130);
+  src.reportTokens(0, tokens(130), 77);
+
+  const suffix = dst.copyPrefixFrom(src, srcSeq, 0);
+  const dstSeq = dst.sequences[0];
+  assert.deepEqual(suffix, tokens(130).slice(128));
+  assert.equal(dstSeq.allocLen, 128);
+  assert.deepEqual(dstSeq.getTokenIds(), tokens(128));
+  assert.deepEqual(dstSeq.pages.map(page => page.id), [0, 1]);
+  assert.equal(dstSeq.targetToken, tokens(130)[128], "first uncopied token must be pending");
+  assert.deepEqual(pageCopies(entries), [[0, 0, 2, K_ROW], [0, 0, 2, K_SCALE_ROW], [0, 0, 2, CKV_ROW]]);
+  assert.equal(srcSeq.allocLen, 130);
+  assert.deepEqual(srcSeq.getTokenIds(), tokens(130));
+  assert.equal(srcSeq.targetToken, 77);
+
+  // The caller finishes the restore by prefilling the tail and feeding the source's pending token.
+  dst.allocAppendPages(0, suffix.length);
+  dst.reportTokens(0, suffix, 77);
+  assert.deepEqual(dstSeq.getTokenIds(), tokens(130));
+  assert.equal(dstSeq.targetToken, 77);
+});
+
+test("copyPrefixFrom into a cache that already holds the sequence copies nothing", () => {
+  const { cache: src } = makeCopyCache();
+  const { cache: dst, entries } = makeCopyCache();
+  const srcSeq = src.ensureSequence(0);
+  src.allocAppendPages(0, 130);
+  src.reportTokens(0, tokens(130), 77);
+  const dstSeq = dst.ensureSequence(0);
+  dst.allocAppendPages(0, 130);
+  dst.reportTokens(0, tokens(130), 77);
+
+  const suffix = dst.copyPrefixFrom(src, srcSeq, 0);
+  assert.deepEqual(suffix, [tokens(130)[129]], "complete match returns its truncated final token");
+  assert.equal(dstSeq.allocLen, 129);
+  assert.deepEqual(dstSeq.getTokenIds(), tokens(129));
+  assert.equal(dstSeq.targetToken, tokens(130)[129]);
+  assert.deepEqual(entries, [], "complete self-restore must not copy pages");
+
+  dst.allocAppendPages(0, suffix.length);
+  dst.reportTokens(0, suffix, 77);
+  assert.deepEqual(dstSeq.getTokenIds(), tokens(130));
+  assert.equal(dstSeq.targetToken, 77);
+});
+
+test("copyPrefixFrom shares full pages with the destination's own cache", () => {
+  const { cache: src } = makeCopyCache();
+  const { cache: dst, entries } = makeCopyCache();
+  const srcSeq = src.ensureSequence(0);
+  src.allocAppendPages(0, 130);
+  src.reportTokens(0, tokens(130));
+  dst.ensureSequence(1);
+  dst.allocAppendPages(1, 64);
+  dst.reportTokens(1, tokens(64));
+
+  const suffix = dst.copyPrefixFrom(src, srcSeq, 0);
+  const dstSeq = dst.sequences[0];
+  assert.deepEqual(suffix, tokens(130).slice(128));
+  assert.equal(dstSeq.allocLen, 128);
+  assert.deepEqual(dstSeq.getTokenIds(), tokens(128));
+  assert.equal(dstSeq.targetToken, tokens(130)[128]);
+  assert.equal(dstSeq.pages[0], dst.sequences[1].pages[0], "matched full page must be shared, not copied");
+  assert.equal(dstSeq.pages[0].refs, 2);
+  assert.deepEqual(pageCopies(entries), [[1, 1, 1, K_ROW], [1, 1, 1, K_SCALE_ROW], [1, 1, 1, CKV_ROW]]);
+});
+
+test("copyPrefixFrom leaves no suffix for a page-aligned sequence and keeps the pending token", () => {
+  const { cache: src } = makeCopyCache();
+  const { cache: dst, entries } = makeCopyCache();
+  const srcSeq = src.ensureSequence(0);
+  src.allocAppendPages(0, 128);
+  src.reportTokens(0, tokens(128), 77);
+
+  const suffix = dst.copyPrefixFrom(src, srcSeq, 0);
+  const dstSeq = dst.sequences[0];
+  assert.deepEqual(suffix, []);
+  assert.equal(dstSeq.allocLen, 128);
+  assert.deepEqual(dstSeq.getTokenIds(), tokens(128));
+  assert.equal(dstSeq.targetToken, 77, "aligned restore leaves the source's pending token for decode");
+  assert.deepEqual(pageCopies(entries), [[0, 0, 2, K_ROW], [0, 0, 2, K_SCALE_ROW], [0, 0, 2, CKV_ROW]]);
+});
+
+test("copyPrefixFrom from an empty sequence clears the destination", () => {
+  const { cache: src } = makeCopyCache();
+  const { cache: dst, entries } = makeCopyCache();
+  const srcSeq = src.ensureSequence(0);
+  dst.ensureSequence(0);
+  dst.allocAppendPages(0, 64);
+  dst.reportTokens(0, tokens(64));
+
+  const suffix = dst.copyPrefixFrom(src, srcSeq, 0);
+  assert.deepEqual(suffix, []);
+  const dstSeq = dst.sequences[0];
+  assert.equal(dstSeq.allocLen, 0);
+  assert.equal(dstSeq.pages.length, 0);
+  assert.deepEqual(dstSeq.getTokenIds(), []);
+  assert.deepEqual(entries, []);
+});
+
+test("copyPrefixFrom rejects an incompatible cache layout", () => {
+  const { cache: src } = makeCopyCache({ bytesPerToken: 512 });
+  const { cache: dst } = makeCopyCache();
+  const srcSeq = src.ensureSequence(0);
+  src.allocAppendPages(0, 64);
+  src.reportTokens(0, tokens(64));
+  assert.throws(() => dst.copyPrefixFrom(src, srcSeq, 0), /KV packing mismatch/);
 });
