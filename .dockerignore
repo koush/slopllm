@@ -1,0 +1,4 @@
+# The Dockerfile clones the repository itself and COPYs nothing from the
+# build context, so exclude the entire local working tree to keep the
+# context (and the local build/, node_modules/, model weights, etc.) out.
+*

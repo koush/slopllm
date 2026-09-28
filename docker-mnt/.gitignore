@@ -1,0 +1,5 @@
+# Host-specific runtime files for docker compose (e.g. NCCL topology XML),
+# mounted read-only into the container at /docker-mnt. Contents are local
+# and never checked in.
+*
+!.gitignore
