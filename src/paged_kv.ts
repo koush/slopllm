@@ -9,6 +9,13 @@ import { PAGE_SIZE, Sequence, type Page } from "./paged_sequence";
 export { PAGE_SIZE, Sequence } from "./paged_sequence";
 export type { Page } from "./paged_sequence";
 
+export class PageAllocationError extends Error {
+  constructor(requiredPages: number, availablePages: number) {
+    super(`allocAppendPages: need ${requiredPages} pages, ${availablePages} available`);
+    this.name = "PageAllocationError";
+  }
+}
+
 export class PagedKVCache extends WorkspaceBase implements ChatCache {
   readonly nKv: number;
   readonly hd: number;
@@ -255,17 +262,23 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
    * srcSeq.targetToken to the last chunk to
    * continue the sequence exactly. When the suffix is empty (page-aligned
    * content), srcSeq.targetToken is already pending as the decode input.
-   * Requires identical cache layout: same pageSize, nLayers, and per-layer
-   * row layout.
+   * Requires identical cache layout: same pageSize, nLayers, and per-layer row
+   * layout.
+   *
+   * maxPages bounds the number of full pages materialized, regardless of how
+   * much the source holds. This bounds the copy both by the caller's device
+   * budget and — critically — by the caller's prompt, so a source whose
+   * history runs past the prompt cannot inject foreign tokens into the
+   * destination.
    */
-  copyPrefixFrom(src: PagedKVCache, srcSeq: Sequence, dstSeqIdx: number): number[] {
+  copyPrefixFrom(src: PagedKVCache, srcSeq: Sequence, dstSeqIdx: number, maxPages?: number): number[] {
     if (srcSeq.pagedKvCache !== src) {
       throw new Error("copyPrefixFrom: sequence does not belong to src cache");
     }
     this.assertCacheLayoutCompatible(src);
     const pageSize = this.pageSize;
     const srcTokens = srcSeq.getTokenIds();
-    const fullPages = Math.floor(srcTokens.length / pageSize);
+    const fullPages = Math.min(Math.floor(srcTokens.length / pageSize), maxPages ?? Infinity);
     const matched = srcTokens.length - this.matchFullPages(dstSeqIdx, srcTokens, fullPages).length;
     const firstCopyPage = matched / pageSize;
     const dstSeq = this.ensureSequence(dstSeqIdx);
@@ -432,7 +445,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const numNewPages = newPageCount - currentPageCount;
     this.ensureAvailablePages(numNewPages);
     if (numNewPages > this.availablePages.length) {
-      throw new Error(`allocAppendPages: need ${numNewPages} pages, ${this.availablePages.length} available`);
+      throw new PageAllocationError(numNewPages, this.availablePages.length);
     }
     for (let i = 0; i < numNewPages; i++) {
       const pageId = this.availablePages.shift()!;

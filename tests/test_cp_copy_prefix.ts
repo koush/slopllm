@@ -2,6 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { GlmOps } from "../src/glm_ops";
 import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
+import { PrefixTierPolicy } from "../src/generation-scheduler";
 import { PAGE_SIZE, PagedKVCache } from "../src/paged_kv";
 import { Tensor } from "../src/tensor";
 
@@ -110,6 +111,90 @@ it("copyPrefixFrom round-trips full pages between pinned-host and CP device cach
   } finally {
     pinnedFrom?.free();
     device?.free();
+    pinnedBack?.free();
+    ops.free();
+    glm0.free();
+    glm1.free();
+  }
+});
+
+// End-to-end PrefixTierPolicy under context parallelism: a pinned-host cache
+// as the offload/restore tier behind the CP device cache. Exercises both
+// tiers' real parallel-tensor bookkeeping and both copy directions through
+// parallel_ops memcpyBatchAsync: host->device restore at admit time, and
+// device->host offload under page pressure.
+it("PrefixTierPolicy restores from and offloads into a pinned-host CP tier", async () => {
+  const glm0 = new GlmOps(0);
+  const glm1 = new GlmOps(1);
+  const ops = new ParallelOps([glm0, glm1]);
+  let host: PagedKVCache | undefined;
+  let device: PagedKVCache | undefined;
+  let victimSource: PagedKVCache | undefined;
+  let pinnedBack: PagedKVCache | undefined;
+  try {
+    host = makeCpCache(ops, true);
+    device = makeCpCache(ops, false);
+    victimSource = makeCpCache(ops, true);
+    pinnedBack = makeCpCache(ops, true);
+    const policy = new PrefixTierPolicy(device, ops, host);
+
+    // Host tier: 260 committed tokens = 2 full 128-token CP pages + a tail.
+    const original = host.ensureSequence(0);
+    host.allocAppendPages(0, 260);
+    host.reportTokens(0, tokens(260));
+    fillPageRows(host, 5);
+
+    // Admit one request whose prompt extends the host content: the host prime
+    // moves both full pages into an active slot, the device is empty, so the
+    // restore copies the delta across tiers inside the policy's drain.
+    const prompt = [...tokens(260), 501, 502];
+    const suffixes = await policy.prefixMatch([prompt]);
+    assert.deepEqual(suffixes, [prompt.slice(256)]);
+    const restored = device.sequences[0];
+    assert.equal(restored.allocLen, 256);
+    assert.deepEqual(restored.getTokenIds(), tokens(256));
+    assert.equal(restored.targetToken, tokens(260)[256]);
+    assert.equal(host.staging.size, 1, "the staged original survives the restore");
+    assert.equal(original.pages[0].refs, 2, "the active host prime slot shares its pages");
+    assert.equal(host.sequences.length, 1);
+
+    // Byte-verify the H2D restore with a device->pinned round trip.
+    assert.deepEqual(pinnedBack.copyPrefixFrom(device, restored, 0), []);
+    await ops.synchronizeAsync();
+    assert.deepEqual(readPinnedPageRows(pinnedBack, [0, 1]), readPinnedPageRows(host, [0, 1]));
+
+    // Offload direction: fill a device row with known bytes from another
+    // pinned cache, retain it as a finished row, then allocate past the
+    // remaining device pool. The victim is evicted and lands as a fresh
+    // active host slot, byte-for-byte.
+    const victimTokens = Array.from({ length: 2 * device.pageSize }, (_, i) => i + 5000);
+    const victimSeq = victimSource.ensureSequence(0);
+    victimSource.allocAppendPages(0, victimTokens.length);
+    victimSource.reportTokens(0, victimTokens);
+    fillPageRows(victimSource, 9);
+    const expectedVictimRows = readPinnedPageRows(victimSource, [0, 1]);
+
+    device.copyPrefixFrom(victimSource, victimSeq, 1);
+    policy.retainSequence(1);
+    assert.equal(device.staging.size, 1);
+
+    // 8 device pages: 2 restored + 2 victim = 4 available; this allocation
+    // needs 5, so the victim must be offloaded to free its pages.
+    device.ensureSequence(2);
+    device.allocAppendPages(2, 5 * device.pageSize);
+    assert.equal(device.staging.size, 0, "victim fully evicted");
+
+    const offloaded = host.sequences[1];
+    assert.equal(host.sequences.length, 2, "offload destination appended as a second active slot");
+    assert.deepEqual(offloaded.getTokenIds(), victimTokens);
+    assert.deepEqual(offloaded.pages.map(page => page.id), [3, 4], "fresh host pages past the original's three");
+
+    await ops.synchronizeAsync();
+    assert.deepEqual(readPinnedPageRows(host, [3, 4]), expectedVictimRows, "D2H offload must preserve every page byte");
+  } finally {
+    host?.free();
+    device?.free();
+    victimSource?.free();
     pinnedBack?.free();
     ops.free();
     glm0.free();

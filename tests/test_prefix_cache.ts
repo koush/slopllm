@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { MemcpyBatchEntry } from "../src/device_ops";
+import type { DeviceOps, MemcpyBatchEntry } from "../src/device_ops";
+import { PrefixTierPolicy } from "../src/generation-scheduler";
 import { Tensor } from "../src/tensor";
-import { PAGE_SIZE, PagedKVCache, Sequence } from "../src/paged_kv";
+import { PAGE_SIZE, PageAllocationError, PagedKVCache, Sequence } from "../src/paged_kv";
 
 function makeCache() {
   const copies: number[][] = [];
@@ -347,4 +348,361 @@ test("copyPrefixFrom rejects an incompatible cache layout", () => {
   src.allocAppendPages(0, 64);
   src.reportTokens(0, tokens(64));
   assert.throws(() => dst.copyPrefixFrom(src, srcSeq, 0), /KV packing mismatch/);
+});
+
+test("copyPrefixFrom maxPages clamps the materialized page count", () => {
+  const { cache: src } = makeCopyCache();
+  const { cache: dst, entries } = makeCopyCache();
+  const srcSeq = src.ensureSequence(0);
+  src.allocAppendPages(0, 192);
+  src.reportTokens(0, tokens(192), 77);
+
+  const suffix = dst.copyPrefixFrom(src, srcSeq, 0, 2);
+  const dstSeq = dst.sequences[0];
+  assert.deepEqual(suffix, tokens(192).slice(128));
+  assert.equal(dstSeq.allocLen, 128);
+  assert.deepEqual(dstSeq.getTokenIds(), tokens(128));
+  assert.equal(dstSeq.pages.length, 2, "the clamped third page must not be allocated");
+  assert.equal(dstSeq.targetToken, tokens(192)[128]);
+  assert.deepEqual(pageCopies(entries), [[0, 0, 2, K_ROW], [0, 0, 2, K_SCALE_ROW], [0, 0, 2, CKV_ROW]]);
+});
+
+// ---------------------------------------------------------------------------
+// PrefixTierPolicy. Shell caches from makeCopyCache (page copies land in the
+// per-cache entries array), plus a fake ops recording synchronizeAsync calls —
+// the policy's only direct ops use in these tests.
+// ---------------------------------------------------------------------------
+
+function makePrefixOps() {
+  const state = { syncs: 0 };
+  const ops = {
+    synchronizeAsync: async () => {
+      state.syncs++;
+    },
+  } as unknown as DeviceOps;
+  return { ops, state };
+}
+
+test("prefixMatch without a host tier passes through to the device cache", async () => {
+  const { cache: gpu } = makeCopyCache();
+  const { ops, state } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops);
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, 64);
+  gpu.reportTokens(0, tokens(64));
+  policy.retainSequence(0);
+  const retained = gpu.staging.get(-1)!;
+  assert.equal(retained.pages.length, 1);
+
+  const prompt = [...tokens(64), 7, 8, 9];
+  const suffixes = await policy.prefixMatch([prompt]);
+  assert.deepEqual(suffixes, [[7, 8, 9]]);
+  assert.equal(state.syncs, 0, "no host tier => no drain to await");
+  const slot = gpu.sequences[0];
+  assert.equal(slot.pages[0], retained.pages[0], "primed slot shares the retained page");
+  assert.equal(retained.pages[0].refs, 2);
+});
+
+test("prefixMatch restores a host-tier prefix into an empty device cache", async () => {
+  const { cache: host } = makeCopyCache();
+  const { cache: gpu, entries } = makeCopyCache();
+  const { ops, state } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+
+  const original = host.ensureSequence(0);
+  host.allocAppendPages(0, 130);
+  host.reportTokens(0, tokens(130), 77);
+  const prompt = [...tokens(130), 900];
+
+  const suffixes = await policy.prefixMatch([prompt]);
+  // Restore copies both full pages; the 2-token partial tail plus the new
+  // token remain for prefill. The suffix derives from the prompt.
+  assert.deepEqual(suffixes, [prompt.slice(128)]);
+  assert.equal(state.syncs, 1, "host tier => one drain per invocation");
+
+  const slot = gpu.sequences[0];
+  assert.equal(slot.allocLen, 128);
+  assert.deepEqual(slot.getTokenIds(), tokens(128));
+  assert.equal(slot.targetToken, tokens(130)[128]);
+  assert.deepEqual(pageCopies(entries), [[0, 0, 2, K_ROW], [0, 0, 2, K_SCALE_ROW], [0, 0, 2, CKV_ROW]]);
+
+  // The staged original survives with its pages shared by the active host
+  // prime slot; the offload/restore machinery never reads host pages out from
+  // under an active slot.
+  assert.equal(host.staging.size, 1, "only the original is staged");
+  assert.equal(original.pages[0].refs, 2);
+  assert.equal(host.sequences[0].pages[0], original.pages[0]);
+  // 130 tokens reserve three host pages (two full + the partial); only the
+  // device consumed exactly two.
+  assert.equal(host.availablePages.length, 13);
+  assert.equal(gpu.availablePages.length, 14);
+});
+
+test("prefixMatch stages superseded host slots instead of restoring them", async () => {
+  const { cache: host } = makeCopyCache();
+  const { cache: gpu, entries } = makeCopyCache();
+  const { ops } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+
+  // Device already holds two full pages of the prompt in a retained row.
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, 128);
+  gpu.reportTokens(0, tokens(128));
+  policy.retainSequence(0);
+  const retained = gpu.staging.get(-1)!;
+
+  // Host holds the same first two pages; the device match equals the host
+  // match (both prime to 128 tokens), so the host slot is superseded.
+  host.ensureSequence(0);
+  host.allocAppendPages(0, 128);
+  host.reportTokens(0, tokens(128));
+  const prompt = [...tokens(200)];
+
+  const suffixes = await policy.prefixMatch([prompt]);
+  assert.deepEqual(suffixes, [prompt.slice(128)]);
+  assert.deepEqual(entries, [], "equal matches must not copy");
+  assert.equal(gpu.sequences[0].pages[0], retained.pages[0]);
+
+  // Both the original and the superseded prime slot sit in host staging; no
+  // active host slots remain.
+  assert.equal(host.staging.size, 2);
+  assert.equal(host.sequences.length, 0);
+});
+
+test("prefixMatch restores only the device-side delta past the device match", async () => {
+  const { cache: host } = makeCopyCache();
+  const { cache: gpu, entries } = makeCopyCache();
+  const { ops } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+
+  // Device: retained row with the first two pages of the prompt.
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, 128);
+  gpu.reportTokens(0, tokens(128));
+  policy.retainSequence(0);
+  const retained = gpu.staging.get(-1)!;
+
+  // Host: four full pages of the same prompt.
+  host.ensureSequence(0);
+  host.allocAppendPages(0, 256);
+  host.reportTokens(0, tokens(256));
+  const prompt = [...tokens(256), 700];
+
+  const suffixes = await policy.prefixMatch([prompt]);
+  assert.deepEqual(suffixes, [[700]]);
+
+  const slot = gpu.sequences[0];
+  assert.equal(slot.allocLen / PAGE_SIZE, 4);
+  assert.deepEqual(slot.getTokenIds(), tokens(256));
+  assert.equal(slot.pages[0], retained.pages[0], "pages the device already holds are shared");
+  assert.equal(slot.pages[0].refs, 2);
+  // Only the two delta pages cross tiers.
+  assert.deepEqual(pageCopies(entries), [[2, 2, 2, K_ROW], [2, 2, 2, K_SCALE_ROW], [2, 2, 2, CKV_ROW]]);
+  assert.equal(gpu.availablePages.length, 12, "two shared + two copied pages are consumed");
+});
+
+test("device eviction offloads a finished row into the host tier", () => {
+  const { cache: host, entries: hostEntries } = makeCopyCache();
+  const { cache: gpu } = makeCopyCache();
+  const { ops } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+
+  // A finished row (as retained by removeFinished) holding 12 pages that do
+  // not match the incoming request's token space.
+  const victimTokens = Array.from({ length: 12 * PAGE_SIZE }, (_, i) => i + 5000);
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, victimTokens.length);
+  gpu.reportTokens(0, victimTokens);
+  policy.retainSequence(0);
+  assert.equal(gpu.availablePages.length, 4);
+
+  // The next allocation needs more than the 4 remaining pages: the retained
+  // row is evicted whole, offloaded to an appended, born-active host slot,
+  // and its device pages return to the pool.
+  gpu.ensureSequence(1);
+  gpu.allocAppendPages(1, 6 * PAGE_SIZE);
+  assert.equal(gpu.staging.size, 0, "victim left device staging");
+  assert.equal(gpu.availablePages.length, 16 - 6);
+
+  const offloaded = host.sequences[0];
+  assert.deepEqual(offloaded.getTokenIds(), victimTokens);
+  assert.equal(offloaded.pages.length, 12);
+  assert.equal(host.sequences.length, 1, "offload destination appends and is born active");
+  assert.equal(host.availablePages.length, 16 - 12);
+  // The offload copied every victim page (D2H) as one contiguous run per
+  // layer cache family.
+  assert.deepEqual(pageCopies(hostEntries), [[0, 0, 12, K_ROW], [0, 0, 12, K_SCALE_ROW], [0, 0, 12, CKV_ROW]]);
+});
+
+test("device eviction drops a victim when the host tier cannot hold it", () => {
+  const { cache: host } = makeCopyCache();
+  const { cache: gpu } = makeCopyCache();
+  const { ops } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+
+  const victimTokens = Array.from({ length: 13 * PAGE_SIZE }, (_, i) => i + 5000);
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, victimTokens.length);
+  gpu.reportTokens(0, victimTokens);
+  policy.retainSequence(0);
+  // Host tier starts with only 12 pages free: the 13-page victim must drop
+  // without any host copy; the failed destination must be removed.
+  host.availablePages.length = 12;
+
+  gpu.ensureSequence(1);
+  gpu.allocAppendPages(1, 16 * PAGE_SIZE);
+  assert.equal(gpu.staging.size, 0);
+  assert.equal(host.sequences.length, 0, "failed offload destination was removed");
+  assert.equal(host.availablePages.length, 12);
+});
+
+test("device eviction reclaims host staging to make room for an offload", () => {
+  const { cache: host } = makeCopyCache();
+  const { cache: gpu } = makeCopyCache();
+  const { ops } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+
+  // Twelve pages of cold staged host content (a previously offloaded prefix).
+  const coldTokens = Array.from({ length: 12 * PAGE_SIZE }, (_, i) => i + 5000);
+  host.ensureSequence(0);
+  host.allocAppendPages(0, coldTokens.length);
+  host.reportTokens(0, coldTokens);
+  host.stageSequence(0, 12345);
+  assert.equal(host.availablePages.length, 4);
+
+  // A 5-page device victim arrives but the host tier has only 4 free pages:
+  // the allocator first reclaims the host tier's own staging — the cold
+  // sequence is dropped (largest staged first, no exemptions), then the
+  // offload proceeds into a fresh active slot.
+  const victimTokens = Array.from({ length: 5 * PAGE_SIZE }, (_, i) => i + 7000);
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, victimTokens.length);
+  gpu.reportTokens(0, victimTokens);
+  policy.retainSequence(0);
+
+  gpu.ensureSequence(1);
+  gpu.allocAppendPages(1, 16 * PAGE_SIZE);
+  assert.equal(gpu.staging.size, 0, "victim fully evicted");
+  assert.equal(gpu.availablePages.length, 0, "the 16-page allocation consumed the freed pool");
+  assert.equal(host.staging.size, 0, "cold staged content was reclaimed");
+  assert.deepEqual(host.sequences[0].getTokenIds(), victimTokens);
+  assert.equal(host.sequences[0].pages.length, 5);
+  assert.equal(host.availablePages.length, 16 - 5);
+
+  // Active host content is never reclaimed: with host staging empty and the
+  // device pool exhausted, pressure surfaces as an allocation error rather
+  // than dropping the born-active offload destination.
+  gpu.ensureSequence(2);
+  assert.throws(() => gpu.allocAppendPages(2, PAGE_SIZE), /need 1 pages, 0 available/);
+  assert.equal(host.sequences.length, 1);
+  assert.equal(host.sequences[0].pages.length, 5);
+});
+
+test("offload reuses a matching host prefix even with no free host pages", () => {
+  const { cache: host, entries } = makeCopyCache();
+  const { cache: gpu } = makeCopyCache();
+  const { ops } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+  host.ensureSequence(0);
+  host.allocAppendPages(0, 16 * PAGE_SIZE);
+  host.reportTokens(0, tokens(16 * PAGE_SIZE));
+  const original = host.sequences[0];
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, 130);
+  gpu.reportTokens(0, tokens(130));
+  policy.retainSequence(0);
+
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, 16 * PAGE_SIZE);
+  assert.equal(gpu.staging.size, 0);
+  assert.equal(host.sequences.length, 2);
+  assert.deepEqual(host.sequences[1].getTokenIds(), tokens(128));
+  assert.equal(host.sequences[1].pages[0], original.pages[0]);
+  assert.equal(host.sequences[1].pages[1], original.pages[1]);
+  assert.equal(original.pages[0].refs, 2);
+  assert.equal(host.availablePages.length, 0);
+  assert.deepEqual(entries, [], "the existing prefix needs no transfer");
+});
+
+test("failed host offload removes its slot and releases shared prefix refs", () => {
+  const { cache: host, entries } = makeCopyCache();
+  const { cache: gpu } = makeCopyCache();
+  const { ops } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+  host.ensureSequence(0);
+  host.allocAppendPages(0, 16 * PAGE_SIZE);
+  const history = [...tokens(PAGE_SIZE), ...Array(15 * PAGE_SIZE).fill(9000)];
+  host.reportTokens(0, history);
+  const original = host.sequences[0];
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, 3 * PAGE_SIZE);
+  gpu.reportTokens(0, tokens(3 * PAGE_SIZE));
+  policy.retainSequence(0);
+
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, 16 * PAGE_SIZE);
+  assert.equal(gpu.staging.size, 0, "the GPU victim is dropped despite host exhaustion");
+  assert.deepEqual(host.sequences, [original]);
+  assert.deepEqual(original.getTokenIds(), history);
+  assert(original.pages.every(page => page.refs === 1), "failed destination must release its prefix refs");
+  assert.equal(host.availablePages.length, 0);
+  assert.deepEqual(entries, [], "reservation failure precedes copy submission");
+});
+
+test("host offload propagates errors other than page exhaustion", () => {
+  const { cache: host } = makeCopyCache();
+  const { cache: gpu } = makeCopyCache();
+  const { ops } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+  const failure = new Error("transfer failed");
+  host.ops.memcpyBatchAsync = () => { throw failure; };
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, PAGE_SIZE);
+  gpu.reportTokens(0, tokens(PAGE_SIZE));
+  policy.retainSequence(0);
+  gpu.ensureSequence(0);
+  assert.throws(() => gpu.allocAppendPages(0, 16 * PAGE_SIZE), error => error === failure);
+  assert.equal(gpu.staging.size, 1, "source remains alive for caller error handling");
+});
+
+test("restore uses page pressure instead of capping the prefix to free pages", async () => {
+  const { cache: host } = makeCopyCache();
+  const { cache: gpu } = makeCopyCache();
+  const { ops } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+  host.ensureSequence(0);
+  host.allocAppendPages(0, 4 * PAGE_SIZE);
+  host.reportTokens(0, tokens(4 * PAGE_SIZE));
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, 14 * PAGE_SIZE);
+  gpu.reportTokens(0, Array(14 * PAGE_SIZE).fill(9000));
+  policy.retainSequence(0);
+  assert.equal(gpu.availablePages.length, 2);
+
+  const prompt = [...tokens(4 * PAGE_SIZE), 777];
+  assert.deepEqual(await policy.prefixMatch([prompt]), [[777]]);
+  assert.deepEqual(gpu.sequences[0].getTokenIds(), tokens(4 * PAGE_SIZE));
+  assert.equal(gpu.staging.size, 0);
+  assert.equal(gpu.availablePages.length, 12);
+  // The 14-page victim cannot fit beside the protected host restore source.
+  assert.equal(host.sequences.length, 1, "failed offload did not leave an extra host slot");
+});
+
+test("restore page exhaustion bubbles up when protected GPU pages prevent admission", async () => {
+  const { cache: host } = makeCopyCache();
+  const { cache: gpu } = makeCopyCache();
+  const { ops } = makePrefixOps();
+  const policy = new PrefixTierPolicy(gpu, ops, host);
+  host.ensureSequence(0);
+  host.allocAppendPages(0, 4 * PAGE_SIZE);
+  host.reportTokens(0, tokens(4 * PAGE_SIZE));
+  gpu.ensureSequence(0);
+  gpu.allocAppendPages(0, 15 * PAGE_SIZE);
+  gpu.reportTokens(0, Array(15 * PAGE_SIZE).fill(9000));
+  // A scheduler-staged active row is not an eviction candidate.
+  gpu.stageSequence(0, 123);
+  await assert.rejects(policy.prefixMatch([[...tokens(4 * PAGE_SIZE), 777]]), PageAllocationError);
+  assert.equal(gpu.staging.get(123)!.pages.length, 15);
+  assert.equal(gpu.availablePages.length, 1);
+  assert.equal(gpu.sequences[0].allocLen, 0, "failed reservation did not allocate any pages");
 });

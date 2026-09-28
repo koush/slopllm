@@ -32,6 +32,7 @@ interface ServerArgs extends ModelCliArgs {
   chunkSize: number;
   batchSize: number;
   maxPages: number;
+  maxHostPages: number;
   maxTokens: number;
   temperature: number;
   topP: number;
@@ -53,6 +54,7 @@ function parseArgs(argv: string[]): ServerArgs {
     chunkSize: 8192,
     batchSize: 8,
     maxPages: 0,
+    maxHostPages: 0,
     maxTokens: 65536,
     temperature: 0.6,
     topP: 0.95,
@@ -72,6 +74,7 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--chunk-size" && i + 1 < argv.length) args.chunkSize = parseInt(argv[++i], 10);
     else if (a === "--batch-size" && i + 1 < argv.length) args.batchSize = parseInt(argv[++i], 10);
     else if (a === "--max-pages" && i + 1 < argv.length) args.maxPages = parseInt(argv[++i], 10);
+    else if (a === "--max-host-pages" && i + 1 < argv.length) args.maxHostPages = parseInt(argv[++i], 10);
     else if (a === "--max-tokens" && i + 1 < argv.length) args.maxTokens = parseInt(argv[++i], 10);
     else if (a === "--temperature" && i + 1 < argv.length) args.temperature = parseFloat(argv[++i]);
     else if (a === "--top-p" && i + 1 < argv.length) args.topP = parseFloat(argv[++i]);
@@ -91,6 +94,9 @@ function parseArgs(argv: string[]): ServerArgs {
   if (args.maxPages === 0) {
     args.maxPages = args.batchSize * Math.ceil(args.chunkSize / PAGE_SIZE);
   }
+  if (args.maxHostPages < 0 || !Number.isInteger(args.maxHostPages)) {
+    throw new Error(`--max-host-pages must be a non-negative integer, got ${args.maxHostPages}`);
+  }
   return args;
 }
 
@@ -108,6 +114,7 @@ Options:
   --chunk-size <int>            Prefill execution-token budget including overlap (default: 8192)
   --batch-size <int>            Maximum concurrent requests (default: 8)
   --max-pages <int>             KV cache pages (default: batch-size * ceil(chunk-size / 64))
+  --max-host-pages <int>        Pinned-host KV cache pages for prefix offload/restore (default: 0, disabled)
   --max-tokens <int>            Default max completion tokens (default: 65536)
   --model-dir <string>          Model directory path (default: auto-detect from HF cache)
   --temperature <float>         Override model default sampling temperature
@@ -388,6 +395,19 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     throw new Error("--mtp requires a model with MTP generation support");
   }
   const cache = model.createChatCache(args.maxPages, args.batchSize, args.chunkSize);
+  // Pinned-host tier: same cache family and layout as the device cache, never
+  // reset — the prefix policy owns its sequences as a persistent offload pool.
+  // Pinning physical RAM happens here at startup, so an oversized request
+  // fails fast rather than mid-serving.
+  const hostCache = args.maxHostPages > 0
+    ? model.createChatCache(args.maxHostPages, args.batchSize, args.chunkSize, undefined, /*pinned*/ true)
+    : undefined;
+  if (hostCache) {
+    const hostKV = hostCache.getPagedKV();
+    if (hostKV.pageSize !== cache.getPagedKV().pageSize || hostKV.nLayers !== cache.getPagedKV().nLayers) {
+      throw new Error("host cache layout must match the device cache layout");
+    }
+  }
   ops.printHeap();
   const ws = new ExecutionWorkspace(ops, args.batchSize, args.chunkSize);
   const captureManager = new CaptureManager(ops);
@@ -402,7 +422,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const tokenizer = model.tokenizer;
   const eosIds = model.eosIds;
 
-  console.log(`Model loaded. chunk-size=${args.chunkSize} batch-size=${args.batchSize} max-pages=${args.maxPages} max-tokens=${args.maxTokens}`);
+  console.log(`Model loaded. chunk-size=${args.chunkSize} batch-size=${args.batchSize} max-pages=${args.maxPages} max-host-pages=${args.maxHostPages} max-tokens=${args.maxTokens}`);
   console.log(`Generation defaults: temperature=${args.temperature} top-p=${args.topP} top-k=${args.topK} repetition-penalty=${args.repetitionPenalty}`);
 
   {
@@ -461,7 +481,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     prefillTimeSecondsSum: 0,
   };
   const scheduler = new GenerationScheduler({
-    requests: decodeQueue, model, ws, cache, captureManager, samplingWorkspace, metrics,
+    requests: decodeQueue, model, ws, cache, hostCache, captureManager, samplingWorkspace, metrics,
     maxBatchSize: args.batchSize, chunkSize: args.chunkSize, decodeLatencyMs: args.decodeLatency,
     numDraftTokens: mtpEnabled ? args.mtp : undefined,
   });
@@ -919,6 +939,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     await ops.synchronizeAsync();
     captureManager[Symbol.dispose]();
     samplingWorkspace.free();
+    hostCache?.free();
     cache.free();
     ws.free();
     model.free();

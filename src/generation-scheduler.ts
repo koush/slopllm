@@ -1,7 +1,9 @@
 import { createAsyncQueue } from "@scrypted/deferred";
 import type { CaptureManager } from "./capture-manager";
 import type { ChatCache, ChatModel, SamplingParams, TokenSelector } from "./chat_model";
+import type { DeviceOps } from "./device_ops";
 import type { ExecutionWorkspace } from "./execution-workspace";
+import { PageAllocationError, type PagedKVCache, type Sequence } from "./paged_kv";
 import type { SamplingWorkspace } from "./sampling";
 
 export interface GenerationRequest {
@@ -38,12 +40,29 @@ export function isFatalCudaError(error: unknown): boolean {
   return /illegal memory access|misaligned address|device-side assert|unspecified launch failure|CUDA context.*destroyed/i.test(message);
 }
 
-class StagedPrefixPolicy {
+/**
+ * Two-tier prefix policy over the device KV cache and an optional pinned-host
+ * KV cache.
+ *
+ * Evictability is staging membership and nothing else: an active sequence
+ * holds its own page refs and is protected; a staged sequence is reclaimable.
+ * Staged GPU content is limited to finished rows retained via
+ * retainSequence() (negative staging keys) — rows the scheduler stages around
+ * cache.reset() use non-negative keys and are never eviction candidates. The
+ * policy is the only writer of host staging.
+ */
+export class PrefixTierPolicy {
   private nextKey = -1;
   private readonly retainedKeys = new Set<number>();
+  private nextHostKey = 0;
+  private host?: PagedKVCache;
 
-  constructor(private readonly pagedKV: ReturnType<ChatCache["getPagedKV"]>) {
-    pagedKV.onPagePressure = requiredPages => this.evictUntilAvailable(requiredPages);
+  constructor(private readonly pagedKV: PagedKVCache, private readonly ops: DeviceOps, host?: PagedKVCache) {
+    pagedKV.onPagePressure = requiredPages => this.evictGpuStaged(requiredPages);
+    if (host) {
+      this.host = host;
+      host.onPagePressure = requiredPages => this.evictHostStaged(requiredPages);
+    }
   }
 
   retainSequence(index: number): void {
@@ -55,32 +74,160 @@ class StagedPrefixPolicy {
   clear(): void {
     this.pagedKV.clearStaging();
     this.retainedKeys.clear();
+    this.host?.clearStaging();
   }
 
-  private evictUntilAvailable(requiredPages: number): void {
+  /**
+   * Admit-time tier match: returns each request's uncached suffix to prefill.
+   * Without a host tier this is exactly the single-tier prefixMatch and no
+   * await is reached inside. Suffixes derive from the prompt, never from
+   * cache bookkeeping.
+   */
+  async prefixMatch(prompts: number[][]): Promise<number[][]> {
+    const gpu = this.pagedKV;
+    const host = this.host;
+    if (!host) {
+      return prompts.map((p, i) => gpu.prefixMatch(i, p));
+    }
+    const pageSize = gpu.pageSize;
+
+    // Stage the entire host tier; discard empties. Everything unstaged here
+    // is provably drained — every earlier invocation ended in the trailing
+    // sync and decode steps sync in between.
+    for (let i = host.sequences.length - 1; i >= 0; i--) {
+      if (host.sequences[i].pages.length) {
+        host.stageSequence(i, this.nextHostKey++);
+      } else {
+        host.removeSequence(i);
+      }
+    }
+
+    // Host prime: the request's reusable prefix moves out of staging into
+    // an active, request-indexed host slot. The slot's page refs protect
+    // the content for the whole window: eviction may drop the staged
+    // original, the shared pages survive.
+    const hostSuffix = prompts.map((p, i) => host.prefixMatch(i, p));
+
+    // Device prime: fresh slots only clear or share full pages, so nothing
+    // allocates. Rows the
+    // scheduler staged around cache.reset() are visible candidates but
+    // never evictable (negative keys only).
+    const suffixes = prompts.map((p, i) => gpu.prefixMatch(i, p));
+
+    // Restage superseded host slots: where the device match is at least as
+    // long as the host match, no restore will read the slot, so it rejoins
+    // the eviction pool now instead of holding refs through the restore
+    // below. Snapshot restore sources — the staging splices scramble
+    // indices.
+    const restoreSources = new Map<number, Sequence>();
+    for (let i = prompts.length - 1; i >= 0; i--) {
+      const hostSeq = host.sequences[i];
+      if (suffixes[i].length <= hostSuffix[i].length) {
+        if (hostSeq.pages.length) {
+          host.stageSequence(i, this.nextHostKey++);
+        } else {
+          host.removeSequence(i);
+        }
+      } else {
+        restoreSources.set(i, hostSeq);
+      }
+    }
+
+    // Restore: where the host tier holds strictly more full pages than the
+    // device, move the delta across. Page counts stay floored (the
+    // partial-page margin is intentionally forgone) and the prompt bounds
+    // the copy, so a host history running past the prompt cannot inject
+    // foreign tokens. Pressure here offloads whole finished rows to host,
+    // best-effort.
+    for (const [i, src] of restoreSources) {
+      const prompt = prompts[i];
+      const gpuPages = Math.floor((prompt.length - suffixes[i].length) / pageSize);
+      const hostPages = Math.floor((prompt.length - hostSuffix[i].length) / pageSize);
+      const pages = Math.min(hostPages, Math.floor(prompt.length / pageSize));
+      if (pages <= gpuPages) {
+        continue;
+      }
+      gpu.copyPrefixFrom(host, src, i, pages);
+      suffixes[i] = prompt.slice(pages * pageSize);
+    }
+
+    // Drain every copy this invocation enqueued. The active host slots left
+    // behind (restore sources, offload destinations) are staged by the
+    // stage-all of the next invocation, from a provably drained state.
+    await this.ops.synchronizeAsync();
+    return suffixes;
+  }
+
+  // Device page pressure: whole-victim eviction of finished rows. Offload to
+  // the host tier is best-effort: its allocator reclaims drained host staging
+  // as needed. If it still cannot allocate, discard the failed destination
+  // and drop the victim. The destination appends a fresh active host slot
+  // (born protected; staged by the next prefixMatch).
+  private evictGpuStaged(requiredPages: number): void {
+    const host = this.host;
     while (this.pagedKV.availablePages.length < requiredPages && this.retainedKeys.size) {
-      let longestKey: number | undefined;
-      let longestPages = 0;
+      let victimKey: number | undefined;
+      let victimPages = 0;
       for (const key of this.retainedKeys) {
-        const sequence = this.pagedKV.staging.get(key);
-        if (!sequence || !sequence.pages.length) {
+        const seq = this.pagedKV.staging.get(key);
+        if (!seq || !seq.pages.length) {
           this.retainedKeys.delete(key);
-          if (sequence) {
+          if (seq) {
             this.pagedKV.removeStagedSequence(key);
           }
-        } else if (sequence.pages.length > longestPages) {
-          longestKey = key;
-          longestPages = sequence.pages.length;
+        } else if (seq.pages.length > victimPages) {
+          victimKey = key;
+          victimPages = seq.pages.length;
         }
       }
-      if (longestKey === undefined) {
+      if (victimKey === undefined) {
         break;
       }
-      const sequence = this.pagedKV.staging.get(longestKey)!;
-      sequence.popPage();
-      if (!sequence.pages.length) {
-        this.retainedKeys.delete(longestKey);
-        this.pagedKV.removeStagedSequence(longestKey);
+      const victim = this.pagedKV.staging.get(victimKey)!;
+      if (host) {
+        const dstSeqIdx = host.sequences.length;
+        try {
+          host.copyPrefixFrom(this.pagedKV, victim, dstSeqIdx);
+        } catch (error) {
+          if (!(error instanceof PageAllocationError)) {
+            throw error;
+          }
+          // Page reservation fails before the copy is submitted. Release any
+          // prefix refs acquired by this fresh destination before dropping it.
+          host.removeSequence(dstSeqIdx);
+        }
+      }
+      this.retainedKeys.delete(victimKey);
+      this.pagedKV.removeStagedSequence(victimKey);
+    }
+  }
+
+  // Host page pressure: drop the largest staged whole sequence first. No
+  // exemptions — anything worth protecting is active and holds its own refs.
+  private evictHostStaged(requiredPages: number): void {
+    const host = this.host;
+    if (!host) {
+      return;
+    }
+    while (host.availablePages.length < requiredPages && host.staging.size) {
+      let victimKey: number | undefined;
+      let victimPages = 0;
+      let emptied = false;
+      for (const [key, seq] of host.staging) {
+        if (!seq.pages.length) {
+          host.removeStagedSequence(key);
+          emptied = true;
+          continue;
+        }
+        if (seq.pages.length > victimPages) {
+          victimKey = key;
+          victimPages = seq.pages.length;
+        }
+      }
+      if (victimKey !== undefined) {
+        host.removeStagedSequence(victimKey);
+      } else if (!emptied) {
+        break;
       }
     }
   }
@@ -91,6 +238,8 @@ interface SchedulerOptions {
   model: ChatModel;
   ws: ExecutionWorkspace;
   cache: ChatCache;
+  /** Pinned-host KV tier for prefix offload/restore; omitted => single-tier. */
+  hostCache?: ChatCache;
   captureManager: CaptureManager;
   samplingWorkspace: SamplingWorkspace;
   metrics: ServerMetrics;
@@ -104,11 +253,11 @@ interface SchedulerOptions {
 export class GenerationScheduler {
   private active: GenerationRequest[] = [];
   private readonly admitted = new Set<GenerationRequest>();
-  private readonly prefixes: StagedPrefixPolicy;
+  private readonly prefixes: PrefixTierPolicy;
   private nextStagingKey = 0;
 
   constructor(private readonly options: SchedulerOptions) {
-    this.prefixes = new StagedPrefixPolicy(options.cache.getPagedKV());
+    this.prefixes = new PrefixTierPolicy(options.cache.getPagedKV(), options.model.ops, options.hostCache?.getPagedKV());
   }
 
   stop(error = new Error("Server shutting down")): void {
@@ -196,7 +345,14 @@ export class GenerationScheduler {
     return sampler;
   }
 
-  private admit(requests: GenerationRequest[]): void {
+  /**
+   * Moves incoming requests into the batch: saves active rows into staging,
+   * resets the cache batch, prime-matches each request's prefix against both
+   * tiers (see PrefixTierPolicy.prefixMatch), then restores the saved rows.
+   * Async only when a host tier restores copies; a tier-less call reaches no
+   * await.
+   */
+  private async admit(requests: GenerationRequest[]): Promise<void> {
     const { cache, metrics } = this.options;
     const pagedKV = cache.getPagedKV();
     for (const request of requests) {
@@ -210,8 +366,12 @@ export class GenerationScheduler {
     }
     this.active = [];
     cache.reset(requests.length);
+    // Tier-aware prefix match: device slots primed, host prefix restored
+    // where it extends the device match. Async only when a host tier is
+    // attached (the trailing copy drain); otherwise no await is reached.
+    const suffixes = await this.prefixes.prefixMatch(requests.map(request => request.inputIds));
     for (const [index, request] of requests.entries()) {
-      request.inputIds = cache.prefixMatch(index, request.inputIds);
+      request.inputIds = suffixes[index];
       request.cachedTokenCount = request.promptTokenCount - request.inputIds.length;
       request.prefillTokenCount = 0;
     }
@@ -317,7 +477,7 @@ export class GenerationScheduler {
       }
       try {
         if (incoming.length) {
-          this.admit(incoming);
+          await this.admit(incoming);
         }
         // Prefill: run one chunk, then revisit admission if more input or batch changes remain.
         const finalPrefill = await this.prefill();
@@ -360,6 +520,13 @@ export class GenerationScheduler {
         // for-await has closed the generator before any sequence is removed.
         this.removeFinished();
       } catch (error) {
+        // Planning/allocation can enqueue offloads before a later allocation
+        // fails. Drain them before the batch rollback recycles their pages.
+        try {
+          await model.ops.synchronizeAsync();
+        } catch (syncError) {
+          error = syncError;
+        }
         console.error("Generation batch error:", error);
         for (const request of this.admitted) {
           request.tokens.end(error instanceof Error ? error : new Error(String(error)));
