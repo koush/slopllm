@@ -18,6 +18,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   readonly pageSize: number;
   readonly contextParallel: boolean;
   readonly sparseMode: boolean;
+  readonly pinned: boolean;
   readonly bytesPerToken: number;
   kData: Tensor[];
   kScaleData: Tensor[];
@@ -33,8 +34,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
   getPagedKV(): PagedKVCache { return this; }
 
-  constructor(ops: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0, sharedLayers: boolean[] = []) {
+  constructor(ops: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0, sharedLayers: boolean[] = [], pinned = false) {
     super(ops);
+    this.pinned = pinned;
     this.nKv = nKv;
     this.hd = hd;
     this.nLayers = nLayers;
@@ -54,12 +56,14 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     if (sharedLayers.length > 0 && sharedLayers.length < nLayers)
       throw new Error(`PagedKVCache: sharedLayers length ${sharedLayers.length} != nLayers ${nLayers}`);
     for (let i = 0; i < nLayers; i++) {
+      const alloc = (shape: number[], type: string, name: string, parallelism?: TensorParallelism): Tensor =>
+        pinned ? this.allocPinned(shape, type, name, parallelism) : this.alloc(shape, type, name, parallelism);
       if (kvLoraRank > 0) {
         if (this.sparseMode) {
-          this.ckvData.push(this.alloc([maxPages, this.pageSize, this.bytesPerToken], "U8", "ckv" + i, contextParallel ? TensorParallelism.Row : undefined));
+          this.ckvData.push(alloc([maxPages, this.pageSize, this.bytesPerToken], "U8", "ckv" + i, contextParallel ? TensorParallelism.Row : undefined));
         } else {
-          this.ckvData.push(this.alloc([maxPages, this.pageSize, kvLoraRank], "BF16", "ckv" + i, contextParallel ? TensorParallelism.Row : undefined));
-          this.kpeData.push(this.alloc([maxPages, this.pageSize, qkRopeDim], "BF16", "kpe" + i, contextParallel ? TensorParallelism.Row : undefined));
+          this.ckvData.push(alloc([maxPages, this.pageSize, kvLoraRank], "BF16", "ckv" + i, contextParallel ? TensorParallelism.Row : undefined));
+          this.kpeData.push(alloc([maxPages, this.pageSize, qkRopeDim], "BF16", "kpe" + i, contextParallel ? TensorParallelism.Row : undefined));
         }
         if (indexHeadDim > 0) {
           if (sharedLayers[i]) {
@@ -67,13 +71,13 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
             this.kScaleData.push(undefined!);
           } else {
             const parallelism = contextParallel ? TensorParallelism.Row : undefined;
-            this.kData.push(this.alloc([maxPages, this.pageSize, indexHeadDim], "U8", "k" + i, parallelism));
-            this.kScaleData.push(this.alloc([maxPages, this.pageSize], "F32", "kScale" + i, parallelism));
+            this.kData.push(alloc([maxPages, this.pageSize, indexHeadDim], "U8", "k" + i, parallelism));
+            this.kScaleData.push(alloc([maxPages, this.pageSize], "F32", "kScale" + i, parallelism));
           }
         }
       } else {
-        this.kData.push(this.alloc([maxPages, nKv * this.pageSize * hd], "BF16", "k" + i, TensorParallelism.Row));
-        this.vData.push(this.alloc([maxPages, nKv * this.pageSize * hd], "BF16", "v" + i, TensorParallelism.Row));
+        this.kData.push(alloc([maxPages, nKv * this.pageSize * hd], "BF16", "k" + i, TensorParallelism.Row));
+        this.vData.push(alloc([maxPages, nKv * this.pageSize * hd], "BF16", "v" + i, TensorParallelism.Row));
       }
     }
     this.availablePages = Array.from({ length: maxPages }, (_, i) => i);
@@ -289,7 +293,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       dstPageId * rowBytes, rowBytes,
       tensor, srcPageId * rowBytes,
       rowBytes, rowBytes, 1,
-      MemcpyKind.DeviceToDevice,
+      tensor.pinned ? MemcpyKind.HostToHost : MemcpyKind.DeviceToDevice,
     );
   }
 

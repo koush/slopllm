@@ -6,7 +6,7 @@ import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
 import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
-import { PagedKVCache } from "./paged_kv";
+import { PagedKVCache, PAGE_SIZE } from "./paged_kv";
 import { Qwen35GdnState } from "./qwen35_gdn_state";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
@@ -239,8 +239,8 @@ export class Qwen35Model extends ChatModel {
     }
   }
 
-  createChatCache(maxPages = 256, maxBatch = 1, maxSeqLen = 4096, _pageSize = 16): ChatCache {
-    const pagedKV = new PagedKVCache(this.ops, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, maxBatch);
+  createChatCache(maxPages = 256, maxBatch = 1, maxSeqLen = 4096, _pageSize = 16, pinned = false): ChatCache {
+    const pagedKV = new PagedKVCache(this.ops, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, maxBatch, PAGE_SIZE, 0, 0, false, 0, [], pinned);
     const gdnState = new Qwen35GdnState(this.ops, this.cfg, maxBatch);
     return new Qwen35ChatCache(pagedKV, gdnState, maxBatch, maxSeqLen);
   }

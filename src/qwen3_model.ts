@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { PagedKVCache } from "../src/paged_kv";
+import { PagedKVCache, PAGE_SIZE } from "../src/paged_kv";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
@@ -98,8 +98,8 @@ export class Qwen3Model extends ChatModel {
     }
   }
 
-  createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, _pageSize = 16): ChatCache {
-    return new PagedKVCache(this.ops, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, maxPages, maxBatch);
+  createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, _pageSize = 16, pinned = false): ChatCache {
+    return new PagedKVCache(this.ops, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numHiddenLayers, maxPages, maxBatch, PAGE_SIZE, 0, 0, false, 0, [], pinned);
   }
 
   private mlp(normed: Tensor, BS: number, pfx: string): Tensor {

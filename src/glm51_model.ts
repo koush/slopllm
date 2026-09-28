@@ -489,7 +489,7 @@ export class Glm51Model extends ChatModel {
     }
   }
 
-  createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, pageSize = 64): ChatCache {
+  createChatCache(maxPages = 256, maxBatch = 1, _maxSeqLen = 4096, pageSize = 64, pinned = false): ChatCache {
     if (pageSize !== 64) {
       throw new Error(`createChatCache: pageSize must be 64, got ${pageSize}`);
     }
@@ -498,7 +498,7 @@ export class Glm51Model extends ChatModel {
     const hd = cfg.headDim;
     const nLayers = cfg.numHiddenLayers + (this.mtp ? cfg.numNextNPredictLayers ?? 0 : 0);
     const sharedLayers = cfg.indexerTypes.map(t => t === "shared");
-    return new PagedKVCache(this.ops, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim, sharedLayers);
+    return new PagedKVCache(this.ops, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim, sharedLayers, pinned);
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {

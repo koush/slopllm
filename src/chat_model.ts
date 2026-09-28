@@ -157,7 +157,7 @@ export abstract class ChatModel extends WorkspaceBase {
     super(ops);
   }
 
-  abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number): ChatCache;
+  abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number, pinned?: boolean): ChatCache;
   abstract forwardPhased(state: ExecutionState): Generator<void, Tensor, void>;
 
   protected runPhased<T>(generator: Generator<void, T, void>): T {
