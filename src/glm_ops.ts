@@ -1442,7 +1442,7 @@ export class GlmOps implements DeviceOps {
     const effPs = effPageSize ?? pageSize;
     // Build the 8-pointer peer table from the caller-provided outputs. Unused
     // slots stay at 0 (kernel only writes peers [0, N)).
-    const peerPtrs = new Array<number>(8).fill(0);
+    const peerPtrs = new Float64Array(8);
     if (outputPtrs && outputPtrs.length !== N) {
       throw new Error(`gatherTopkCkv: outputPtrs.length=${outputPtrs.length}, expected ${N}`);
     }
@@ -1470,8 +1470,7 @@ export class GlmOps implements DeviceOps {
 
     getNativeAddon().gatherTopkCkv(
       this.ctx,
-      peerPtrs[0], peerPtrs[1], peerPtrs[2], peerPtrs[3],
-      peerPtrs[4], peerPtrs[5], peerPtrs[6], peerPtrs[7],
+      peerPtrs,
       kvCache.data, topkIdx.data, batchIndices.data,
       pageIndices.data, pageIndptr.data, kvTokenIndptr.data,
       N, cpWorldSize, cpRank,
