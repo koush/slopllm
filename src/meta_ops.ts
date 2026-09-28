@@ -1,4 +1,4 @@
-import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MemcpyBatchEntry } from "./device_ops";
 import type { ExecutionState } from "./execution-workspace";
 import { GlmOps } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
@@ -300,6 +300,9 @@ export class MetaOps implements DeviceOps {
 
     wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: Tensor | undefined, recycleKey: HeapKey | null = null): Tensor {
         return new MetaTensor(workspace, data, allocSize, shape, type, undefined, pinned, view, recycleKey);
+    }
+
+    memcpyBatchAsync(_copies: readonly MemcpyBatchEntry[]): void {
     }
 
     sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number, outProbs?: Tensor, outIds?: Tensor, supportCapacity?: number): void {

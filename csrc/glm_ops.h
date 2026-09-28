@@ -310,6 +310,17 @@ void glm_max(GlmCtx* ctx, void* out_values, int* out_indices, const void* input,
 
 void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes, int kind);
 
+// Batched flat copies in a single submission (async on stream, CUDA 12.8+).
+// kinds uses MemcpyKind values per entry. Returns the validation error, if
+// any; *failIdx receives the index of the first rejected entry when the
+// API reports one (SIZE_MAX otherwise — not all validation failures
+// populate it).
+#if CUDART_VERSION >= 12080
+cudaError_t glm_memcpy_batch_async(GlmCtx* ctx, void* const* dsts, const void* const* srcs,
+                                   const size_t* sizes, const int* kinds, size_t count,
+                                   size_t* failIdx);
+#endif
+
 // 2D memory copy (async on stream)
 // kind: MemcpyKind values (0=H2H, 1=H2D, 2=D2H, 3=D2D, 4=Default)
 void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,

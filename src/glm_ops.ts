@@ -1,4 +1,4 @@
-import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StreamResult, StridedMmap, TensorParallelism } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StreamResult, StridedMmap, TensorParallelism, type MemcpyBatchEntry } from "./device_ops";
 import { Heap, type HeapAllocation, type HeapKey } from "./heap";
 import type { ExecutionState } from "./execution-workspace";
 import { CaptureManager } from "./capture-manager";
@@ -1414,6 +1414,47 @@ export class GlmOps implements DeviceOps {
     const maxPages = srcData.shape[0];
     getNativeAddon().gatherPages(this.ctx, out.data, srcData.data, pageIndices.data, pageIndptrD.data, lastPageLen.data, maxPages, batchSize, pageSize, tokenBytes);
     return out;
+  }
+
+  memcpyBatchAsync(copies: readonly MemcpyBatchEntry[]): void {
+    const count = copies.length;
+    if (count === 0) return;
+    const dsts = new Float64Array(count);
+    const srcs = new Float64Array(count);
+    const sizes = new Float64Array(count);
+    const kinds = new Int32Array(count);
+    // Posted-write convention (matching GlmTensor.memcpy): the batch is issued
+    // on the copy sources' context/stream. A single submission needs a uniform
+    // source ops instance.
+const srcOps = (copies[0].src as GlmTensor).ops;
+      for (let i = 0; i < count; i++) {
+        const c = copies[i];
+        if (c.bytes <= 0) {
+          throw new Error(`memcpyBatchAsync: entry ${i} must copy at least one byte (got ${c.bytes})`);
+        }
+        if (!(c.dst instanceof GlmTensor) || !(c.src instanceof GlmTensor)) {
+        throw new Error("GlmOps.memcpyBatchAsync requires GlmTensor entries");
+      }
+      if ((c.src as GlmTensor).ops !== srcOps) {
+        throw new Error("GlmOps.memcpyBatchAsync: mixed source ops in one batch");
+      }
+      const dstOffset = c.dstOffset ?? 0;
+      const srcOffset = c.srcOffset ?? 0;
+      if (dstOffset < 0 || srcOffset < 0 || dstOffset + c.bytes > c.dst.bytes || srcOffset + c.bytes > c.src.bytes) {
+        throw new Error(`memcpyBatchAsync: entry ${i} region exceeds tensor bounds`);
+      }
+      const kind = c.kind ?? (c.src.pinned
+        ? (c.dst.pinned ? MemcpyKind.HostToHost : MemcpyKind.HostToDevice)
+        : (c.dst.pinned ? MemcpyKind.DeviceToHost : MemcpyKind.DeviceToDevice));
+      if (CaptureManager.capturing && kind === MemcpyKind.HostToDevice) {
+        throw new Error("Host to device memcpy captured? Is this intentional?");
+      }
+      dsts[i] = c.dst.data + dstOffset;
+      srcs[i] = c.src.data + srcOffset;
+      sizes[i] = c.bytes;
+      kinds[i] = memcpyKindToNative(kind);
+    }
+    getNativeAddon().memcpyBatchAsync(srcOps.ctx, dsts, srcs, sizes, kinds);
   }
 
   gatherTopkCkv(_state: ExecutionState, kvCache: Tensor, outputs: readonly Tensor[], topkIdx: Tensor, pageIndices: Tensor, pageIndptr: Tensor, kvTokenIndptr: Tensor, batchIndices: Tensor, topk: number, paddedKvLen: number, cpWorldSize: number = 0, cpRank: number = 0, effPageSize?: number, outputPtrs?: readonly number[]): void {

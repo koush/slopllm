@@ -1,4 +1,5 @@
 import type { ExecutionState } from "./execution-workspace";
+import type { MemcpyKind } from "./enums";
 import type { Tensor } from "./tensor";
 import type { WorkspaceBase } from "./workspace";
 import type { HeapKey } from "./heap";
@@ -41,6 +42,16 @@ export interface StreamResult<T> extends Disposable {
   result: T;
   streamWaitEvent(): void;
   synchronize(): void;
+}
+
+export interface MemcpyBatchEntry {
+  dst: Tensor;
+  src: Tensor;
+  bytes: number;
+  dstOffset?: number;
+  srcOffset?: number;
+  /** Defaults from both endpoints' pinned state. */
+  kind?: MemcpyKind;
 }
 
 export function fp8ScaleShape(input: Tensor, blockSize: number): number[] {
@@ -99,6 +110,23 @@ export interface DeviceOps extends Disposable {
   withStream<T>(fn: () => T): StreamResult<T>;
   /** Best-effort L2 warming of up to eight local tensor ranges in one grid; batch enables decode column-narrow mirroring. */
   prefetchL2Linear(tensors: readonly Tensor[], batch?: number): void;
+
+  /**
+   * Executes many flat copies in a single CUDA submission.
+   *
+   * Entries describe flat regions with optional byte offsets, in logical-tensor
+   * units, and must copy at least one byte; zero-byte entries are rejected
+   * rather than forwarded to CUDA. Parallel backends treat a uniform-parallelism batch as a
+   * shard-to-shard copy: each shard copies the sub-range it holds, in
+   * shard-local units, and skips regions it does not hold. Regions that would
+   * map dst/src differently across shards (cross-shard redistribution) and
+   * mixed-parallelism batches are rejected. The copy runs on the source's
+   * current stream — the posted-write direction — so cross-device batches need
+   * a P2P barrier before the destinations are consumed, and cross-device
+   * consumers must wait on the source stream. CUDA does not order copies
+   * within a batch: dependent or overlapping copies must be split across calls.
+   */
+  memcpyBatchAsync(copies: readonly MemcpyBatchEntry[]): void;
 
   kvCacheWrite(srcK: Tensor, srcV: Tensor, dstK: Tensor, dstV: Tensor, slotMapping: Tensor, batchSize: number, nKv: number, hd: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
 

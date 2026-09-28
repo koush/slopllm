@@ -1,5 +1,5 @@
 import { CaptureManager } from "./capture-manager";
-import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MlaQuery, type StreamResult } from "./device_ops";
+import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MemcpyBatchEntry, type MlaQuery, type StreamResult } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
 import { bf16BytesToF32, f32ToBf16Bytes, GlmOps, GlmTensor, INDEXER_FP8_MMA_DISABLED, NCCL_BFLOAT16, NCCL_FLOAT32, NCCL_INT32, NCCL_SUM, NCCL_UINT8 } from "./glm_ops";
@@ -3151,6 +3151,130 @@ export class ParallelOps implements DeviceOps {
       pinned ? ws.allocPinned(ss, type, name) : ws.alloc(ss, type, name, undefined, recycleKey === null ? undefined : [recycleKey, undefined]),
     );
     return new ParallelTensor(workspace, this, par, shards, shape, type, name, pinned, undefined, recycleKey);
+  }
+
+  memcpyBatchAsync(copies: readonly MemcpyBatchEntry[]): void {
+    // A uniform-parallelism batch is a shard-to-shard copy. Each entry's
+    // logical region is divided into the pieces individual shards hold; a
+    // piece records its shard and its region-relative start, so dst and src
+    // pieces must cover the same relative bytes on the same shards — anything
+    // else is cross-shard redistribution and is rejected, as are
+    // mixed-parallelism batches.
+    let uniformPar: TensorParallelism | undefined;
+    for (const c of copies) {
+      if (c.bytes <= 0) {
+        throw new Error(`memcpyBatchAsync: entries must copy at least one byte (got ${c.bytes})`);
+      }
+      if (!(c.dst instanceof ParallelTensor) || !(c.src instanceof ParallelTensor)) {
+        throw new Error("ParallelOps.memcpyBatchAsync requires ParallelTensor entries");
+      }
+      const par = (c.dst as ParallelTensor).parallelism;
+      if ((c.src as ParallelTensor).parallelism !== par) {
+        throw new Error(`ParallelOps.memcpyBatchAsync: dst/src parallelism mismatch (${par} vs ${(c.src as ParallelTensor).parallelism})`);
+      }
+      if (uniformPar === undefined) {
+        uniformPar = par;
+      } else if (par !== uniformPar) {
+        throw new Error(`ParallelOps.memcpyBatchAsync: mixed parallelism in batch (${uniformPar} and ${par})`);
+      }
+    }
+    if (uniformPar !== undefined && uniformPar !== TensorParallelism.Replicated && uniformPar !== TensorParallelism.Row && uniformPar !== TensorParallelism.Column) {
+      throw new Error(`ParallelOps.memcpyBatchAsync: unsupported parallelism ${uniformPar}`);
+    }
+    const worldSize = this.devices.length;
+    // Divides the flat logical region [start, end) of tensor t into at most
+    // one piece per shard: which shard holds it and its shard-local byte
+    // range. With uniform parallelism and matching region phase, both sides
+    // of an entry divide identically — only their base offsets differ.
+    const divide = (t: ParallelTensor, start: number, end: number): { shard: number; local: number; len: number }[] => {
+      const pieces: { shard: number; local: number; len: number }[] = [];
+      const row = Tensor.byteCount(t.shape.slice(1), t.type);
+      if (uniformPar === TensorParallelism.Row) {
+        // Every page exists on every shard; a shard holds a column slice of
+        // each page's row, contiguous across the region's pages.
+        const firstPage = Math.floor(start / row), startWithin = start - firstPage * row;
+        const lastPage = Math.floor(end / row), endWithin = end - lastPage * row;
+        const shardRow = Tensor.byteCount(t.shards[0].shape.slice(1), t.shards[0].type);
+        for (let j = 0; j < worldSize; j++) {
+          const blockStart = j * shardRow;
+          const clamp = (w: number): number => Math.min(Math.max(w - blockStart, 0), shardRow);
+          const lo = firstPage * shardRow + clamp(startWithin);
+          const hi = lastPage * shardRow + clamp(endWithin);
+          if (hi > lo) {
+            pieces.push({ shard: j, local: lo, len: hi - lo });
+          }
+        }
+      } else {
+        // Column: a shard holds one contiguous block of the flat byte space —
+        // intersect the region with it in bytes.
+        const blockBytes = (t.shape[0] * row) / worldSize;
+        for (let j = 0; j < worldSize; j++) {
+          const blockStart = j * blockBytes;
+          const lo = Math.max(start, blockStart);
+          const hi = Math.min(end, blockStart + blockBytes);
+          if (hi > lo) {
+            pieces.push({ shard: j, local: lo - blockStart, len: hi - lo });
+          }
+        }
+      }
+      return pieces;
+    };
+    const redistribution = "ParallelOps.memcpyBatchAsync: dst/src regions map differently across shards; cross-shard redistribution is not supported";
+    const shardCopies: MemcpyBatchEntry[][] = Array.from({ length: worldSize }, () => []);
+    for (const c of copies) {
+      const dst = c.dst as ParallelTensor;
+      const src = c.src as ParallelTensor;
+      if (uniformPar === undefined || uniformPar === TensorParallelism.Replicated) {
+        // Shards are full copies of the logical tensor: pass through.
+        for (let j = 0; j < worldSize; j++) {
+          shardCopies[j].push({ dst: dst.shards[j], src: src.shards[j], bytes: c.bytes, dstOffset: c.dstOffset, srcOffset: c.srcOffset, kind: c.kind });
+        }
+        continue;
+      }
+      const dStart = c.dstOffset ?? 0;
+      const sStart = c.srcOffset ?? 0;
+      // The dst and src grids must match, per parallelism:
+      //   Row — every page exists on every shard, so regions at the same
+      //         within-row phase map identically on every shard regardless
+      //         of which pages they occupy.
+      //   Column — shards own disjoint page blocks, so a region lives on
+      //         exactly the shards whose blocks it intersects; dst and src
+      //         must address the identical logical range or the bytes would
+      //         change shards mid-copy.
+      const row = Tensor.byteCount(dst.shape.slice(1), dst.type);
+      if (Tensor.byteCount(src.shape.slice(1), src.type) !== row) {
+        throw new Error("ParallelOps.memcpyBatchAsync: dst/src row size mismatch");
+      }
+      let localDelta: number; // dst base minus src base, shard-local bytes
+      if (uniformPar === TensorParallelism.Row) {
+        const shardRow = Tensor.byteCount(dst.shards[0].shape.slice(1), dst.shards[0].type);
+        if (dStart % row !== sStart % row) {
+          throw new Error(redistribution);
+        }
+        localDelta = ((dStart - sStart) / row) * shardRow;
+      } else {
+        if (dst.shape[0] !== src.shape[0]) {
+          throw new Error("ParallelOps.memcpyBatchAsync: dst/src leading dimension mismatch");
+        }
+        if (dStart !== sStart) {
+          throw new Error(redistribution);
+        }
+        localDelta = 0;
+      }
+      for (const piece of divide(dst, dStart, dStart + c.bytes)) {
+        shardCopies[piece.shard].push({
+          dst: dst.shards[piece.shard],
+          src: src.shards[piece.shard],
+          bytes: piece.len,
+          dstOffset: piece.local,
+          srcOffset: piece.local - localDelta,
+          kind: c.kind,
+        });
+      }
+    }
+    for (let j = 0; j < worldSize; j++) {
+      this.devices[j].memcpyBatchAsync(shardCopies[j]);
+    }
   }
 
   wrapTensor(workspace: WorkspaceBase, data: number, allocSize: number, shape: number[], type: string, pinned: boolean, view: ParallelTensor | undefined, recycleKey: HeapKey | null = null): Tensor {

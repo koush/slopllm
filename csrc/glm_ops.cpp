@@ -1,6 +1,7 @@
 #include <napi.h>
 #include "glm_ops.h"
 #include <cstdint>
+#include <vector>
 #include <cuda_bf16.h>
 #include <cuda_profiler_api.h>
 
@@ -1783,6 +1784,70 @@ static Napi::Value Memcpy(const Napi::CallbackInfo& info) {
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("memcpy failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }
+    return env.Undefined();
+}
+
+// Typed-array extraction helper: verifies the arg is a typed array of the
+// expected element type and returns it.
+template <typename T>
+static T GetTypedArrayArg(const Napi::CallbackInfo& info, size_t argIdx,
+                          const char* what, napi_typedarray_type expected) {
+    if (!info[argIdx].IsTypedArray() ||
+        info[argIdx].As<Napi::TypedArray>().TypedArrayType() != expected) {
+        Napi::TypeError::New(info.Env(), std::string(what) + " must be a " +
+                              (expected == napi_float64_array ? "Float64Array" : "Int32Array"))
+            .ThrowAsJavaScriptException();
+        return T();
+    }
+    return info[argIdx].As<T>();
+}
+
+static Napi::Value MemcpyBatchAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5) {
+        Napi::TypeError::New(env, "Expected (ctx, dsts, srcs, sizes (Float64Array), kinds (Int32Array))").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
+    Napi::Float64Array dsts = GetTypedArrayArg<Napi::Float64Array>(info, 1, "dsts", napi_float64_array);
+    if (env.IsExceptionPending()) return env.Undefined();
+    Napi::Float64Array srcs = GetTypedArrayArg<Napi::Float64Array>(info, 2, "srcs", napi_float64_array);
+    if (env.IsExceptionPending()) return env.Undefined();
+    Napi::Float64Array sizes = GetTypedArrayArg<Napi::Float64Array>(info, 3, "sizes", napi_float64_array);
+    if (env.IsExceptionPending()) return env.Undefined();
+    Napi::Int32Array kinds = GetTypedArrayArg<Napi::Int32Array>(info, 4, "kinds", napi_int32_array);
+    if (env.IsExceptionPending()) return env.Undefined();
+    size_t count = dsts.ElementLength();
+    if (srcs.ElementLength() != count || sizes.ElementLength() != count ||
+        kinds.ElementLength() != count) {
+        Napi::TypeError::New(env, "memcpyBatchAsync: dsts/srcs/sizes/kinds must have equal length").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    std::vector<void*> dstv(count);
+    std::vector<const void*> srcv(count);
+    std::vector<size_t> sizev(count);
+    std::vector<int> kindv(count);
+    for (size_t i = 0; i < count; i++) {
+        dstv[i] = reinterpret_cast<void*>(static_cast<uintptr_t>(dsts[i]));
+        srcv[i] = reinterpret_cast<const void*>(static_cast<uintptr_t>(srcs[i]));
+        sizev[i] = static_cast<size_t>(sizes[i]);
+        kindv[i] = kinds[i];
+    }
+#if CUDART_VERSION >= 12080
+    size_t failIdx = 0;
+    cudaError_t err = glm_memcpy_batch_async(reinterpret_cast<GlmCtx*>(ctx_ptr),
+                                             dstv.data(), srcv.data(), sizev.data(),
+                                             kindv.data(), count, &failIdx);
+    if (err != cudaSuccess) {
+        std::string msg = "memcpyBatchAsync failed: " + std::string(cudaGetErrorString(err));
+        if (failIdx != SIZE_MAX) {
+            msg += " (first failing entry: " + std::to_string(failIdx) + ")";
+        }
+        Napi::Error::New(env, msg).ThrowAsJavaScriptException();
+    }
+#else
+    Napi::Error::New(env, "memcpyBatchAsync requires CUDA 12.8+").ThrowAsJavaScriptException();
+#endif
     return env.Undefined();
 }
 
@@ -4094,6 +4159,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "arange"), Napi::Function::New(env, Arange));
     exports.Set(Napi::String::New(env, "max"), Napi::Function::New(env, Max));
     exports.Set(Napi::String::New(env, "memcpy"), Napi::Function::New(env, Memcpy));
+    exports.Set(Napi::String::New(env, "memcpyBatchAsync"), Napi::Function::New(env, MemcpyBatchAsync));
     exports.Set(Napi::String::New(env, "kvCacheWrite"), Napi::Function::New(env, KvCacheWrite));
     exports.Set(Napi::String::New(env, "synchronize"), Napi::Function::New(env, Synchronize));
     exports.Set(Napi::String::New(env, "synchronizeAsync"), Napi::Function::New(env, SynchronizeAsync));

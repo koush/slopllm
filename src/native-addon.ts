@@ -74,6 +74,10 @@ export interface NativeAddon {
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
   max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
+  // Batched flat copies in a single submission on ctx's current stream.
+  // Parallel arrays of equal length; pointers/sizes as float64, kinds as
+  // MemcpyKind ints (0=H2H, 1=H2D, 2=D2H, 3=D2D).
+  memcpyBatchAsync(ctx: number, dsts: Float64Array, srcs: Float64Array, sizes: Float64Array, kinds: Int32Array): void;
   kvCacheWrite(ctx: number, srcK: number, srcV: number, dstK: number, dstV: number, slotMapping: number, batchSize: number, nKv: number, hd: number, pageSize: number, srcKTokenStride: number, srcKHeadStride: number, srcVTokenStride: number, srcVHeadStride: number): void;
   synchronize(ctx: number, streamIdx?: number): void;
   prefetchL2(ctx: number, pointers: number[], sizes: number[]): void;

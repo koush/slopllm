@@ -4,6 +4,7 @@
 #include <cublasLt.h>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -187,6 +188,43 @@ void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes, int kind)
     cudaSetDevice(ctx->device_id);
     cudaMemcpyAsync(dst, src, bytes, static_cast<cudaMemcpyKind>(kind), GLM_STREAM(ctx));
 }
+
+#if CUDART_VERSION >= 12080
+// Batched flat copies in a single submission. Kinds use the cudaMemcpyKind
+// values; they select the loc hints for each contiguous run of entries (the
+// batch API infers direction from the pointers itself). Attribute sets apply
+// to contiguous runs, so a new attrs entry is emitted at every kind change.
+// Copy order within a batch is unspecified, so regrouping is not needed.
+cudaError_t glm_memcpy_batch_async(GlmCtx* ctx, void* const* dsts, const void* const* srcs,
+                                   const size_t* sizes, const int* kinds, size_t count,
+                                   size_t* failIdx) {
+    // Sentinel: the API does not populate failIdx for every validation
+    // failure (pointer errors on 13.3 leave it untouched), so the caller
+    // distinguishes "unset" from "entry 0" via SIZE_MAX.
+    *failIdx = SIZE_MAX;
+    if (count == 0) return cudaSuccess;
+    cudaSetDevice(ctx->device_id);
+    std::vector<cudaMemcpyAttributes> attrs;
+    std::vector<size_t> attrsIdxs;
+    for (size_t i = 0; i < count; i++) {
+        if (i == 0 || kinds[i] != kinds[i - 1]) {
+            cudaMemcpyAttributes attr = {};
+            attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+            const cudaMemcpyKind kind = static_cast<cudaMemcpyKind>(kinds[i]);
+            const bool srcHost = kind == cudaMemcpyHostToDevice || kind == cudaMemcpyHostToHost;
+            const bool dstHost = kind == cudaMemcpyDeviceToHost || kind == cudaMemcpyHostToHost;
+            attr.srcLocHint.type = srcHost ? cudaMemLocationTypeHost : cudaMemLocationTypeDevice;
+            attr.srcLocHint.id = srcHost ? 0 : ctx->device_id;
+            attr.dstLocHint.type = dstHost ? cudaMemLocationTypeHost : cudaMemLocationTypeDevice;
+            attr.dstLocHint.id = dstHost ? 0 : ctx->device_id;
+            attrs.push_back(attr);
+            attrsIdxs.push_back(i);
+        }
+    }
+    return cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs.data(), attrsIdxs.data(),
+                                attrs.size(), GLM_STREAM(ctx));
+}
+#endif
 
 void glm_memcpy2d(GlmCtx* ctx, void* dst, size_t dpitch,
                    const void* src, size_t spitch,
