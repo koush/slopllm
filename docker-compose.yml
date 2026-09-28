@@ -39,7 +39,7 @@ services:
       - --mtp
       - --cp
       - --gpus
-      - "${GPUS:-0,4,5,7,1,2,3,6}"
+      - "${GPUS:-0,1,2,3,4,5,6,7}"
       - --max-pages
       - "${MAX_PAGES:-8192}"
       - --phased-prefill
