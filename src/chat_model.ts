@@ -493,6 +493,12 @@ export abstract class ChatModel extends WorkspaceBase {
       }
     }
 
+    // Iterating the index's weight_map gives shards in first-mention order
+    // (arbitrary: lm_head/embed sort before model.layers.*, so the shard
+    // with the final layers loads first). Load in filename order so
+    // progress tracks the checkpoint layout.
+    shards.sort();
+
     const openShards = shards.map(stPath => {
       const st = SafeTensorFile.open(stPath);
       const mmapPtr = mmapOpen(stPath);
@@ -522,10 +528,13 @@ export abstract class ChatModel extends WorkspaceBase {
     let lastDrawMs = 0;
     let lastLineLength = 0;
     const giB = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
-    let lastLoggedPercent = 0;
+    let lastLoggedPercent = -1;
     const drawProgress = (force: boolean): void => {
       const now = performance.now();
-      const fraction = totalTensors > 0 ? loadedTensors / totalTensors : 1;
+      // Progress by bytes: tensor counts race through clusters of tiny
+      // scale tensors (e.g. the 57.6k input_scale entries) while the
+      // actual transfer barely moves.
+      const fraction = totalBytes > 0 ? loadedBytes / totalBytes : 1;
       const layerInfo = currentLayer >= 0 ? ` layer ${currentLayer}/${maxLayer + 1}` : "";
       const status = `${loadedTensors}/${totalTensors} tensors${layerInfo} ${giB(loadedBytes)}/${giB(totalBytes)} ${((now - startedMs) / 1000).toFixed(1)}s`;
       if (isTty) {
@@ -545,6 +554,8 @@ export abstract class ChatModel extends WorkspaceBase {
       lastLoggedPercent = percent;
       console.log(`Loading weights: ${percent}% ${status}`);
     };
+
+    drawProgress(false);
 
     for (const { st, mmapPtr } of openShards) {
       const names = st.tensorNames();
