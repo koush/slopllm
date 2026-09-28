@@ -501,18 +501,75 @@ export abstract class ChatModel extends WorkspaceBase {
     });
 
     const loadBatchSize = parseInt(process.env.GLM_LOAD_BATCH_SIZE ?? "8", 10);
+    const layerRe = /^model\.layers\.(\d+)\./;
+    let totalTensors = 0;
+    let totalBytes = 0;
+    let maxLayer = -1;
+    for (const { st } of openShards) {
+      for (const name of st.tensorNames()) {
+        totalTensors++;
+        totalBytes += st.meta(name).dataOffsets[1] - st.meta(name).dataOffsets[0];
+        const layerMatch = layerRe.exec(name);
+        if (layerMatch) maxLayer = Math.max(maxLayer, Number(layerMatch[1]));
+      }
+    }
+
+    let loadedTensors = 0;
+    let loadedBytes = 0;
+    let currentLayer = -1;
+    const startedMs = performance.now();
+    const isTty = process.stderr.isTTY === true;
+    let lastDrawMs = 0;
+    let lastLineLength = 0;
+    const giB = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+    let lastLoggedPercent = 0;
+    const drawProgress = (force: boolean): void => {
+      const now = performance.now();
+      const fraction = totalTensors > 0 ? loadedTensors / totalTensors : 1;
+      const layerInfo = currentLayer >= 0 ? ` layer ${currentLayer}/${maxLayer + 1}` : "";
+      const status = `${loadedTensors}/${totalTensors} tensors${layerInfo} ${giB(loadedBytes)}/${giB(totalBytes)} ${((now - startedMs) / 1000).toFixed(1)}s`;
+      if (isTty) {
+        if (!force && now - lastDrawMs < 100) return;
+        lastDrawMs = now;
+        const width = 24;
+        const filled = Math.min(width, Math.round(fraction * width));
+        const bar = `${"=".repeat(filled)}${filled < width ? ">" : ""}${" ".repeat(Math.max(0, width - filled - (filled < width ? 1 : 0)))}`;
+        const line = `Loading weights [${bar}] ${Math.floor(fraction * 100)}% ${status}`;
+        process.stderr.write(`\r${line}${" ".repeat(Math.max(0, lastLineLength - line.length))}`);
+        lastLineLength = line.length;
+        return;
+      }
+      const percent = Math.floor(fraction * 100);
+      if (!force && percent <= lastLoggedPercent) return;
+      if (force && lastLoggedPercent >= 100) return;
+      lastLoggedPercent = percent;
+      console.log(`Loading weights: ${percent}% ${status}`);
+    };
+
     for (const { st, mmapPtr } of openShards) {
       const names = st.tensorNames();
       for (let i = 0; i < names.length; i += loadBatchSize) {
+        const batch = names.slice(i, i + loadBatchSize);
         await Promise.all(
-          names.slice(i, i + loadBatchSize).map(name =>
+          batch.map(name =>
             this.loadTensor(name, st.meta(name), st, mmapPtr)
           )
         );
+        for (const name of batch) {
+          loadedBytes += st.meta(name).dataOffsets[1] - st.meta(name).dataOffsets[0];
+        }
+        loadedTensors += batch.length;
+        const layerMatch = layerRe.exec(batch[batch.length - 1]);
+        if (layerMatch) currentLayer = Math.max(currentLayer, Number(layerMatch[1]));
+        drawProgress(false);
       }
     }
 
     await this.ops.synchronizeAsync();
+
+    drawProgress(true);
+    if (isTty) process.stderr.write(`\r${" ".repeat(lastLineLength)}\r`);
+    console.log(`Loaded ${totalTensors} weight tensors (${giB(totalBytes)}) in ${((performance.now() - startedMs) / 1000).toFixed(1)}s`);
 
     for (const { st, mmapPtr, fileSize } of openShards) {
       st.close();
