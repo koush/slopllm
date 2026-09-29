@@ -1,4 +1,4 @@
-# glm.js OpenAI server on glmjs:runtime (see Dockerfile).
+# slopllm OpenAI server on slopllm:runtime (see Dockerfile).
 #
 # Mirrors the GPU passthrough pattern from ~/chat/vllm/docker-compose.yml:
 # `gpus: all` plus host networking/IPC, which are what work on this system.
@@ -24,7 +24,7 @@
 # the health check has a long start period to match.
 
 services:
-  glmjs:
+slopllm:
     build:
       context: .
       args:
@@ -33,8 +33,8 @@ services:
         # pick up new commits: REPO_REF=$(git rev-parse origin/main)
         # docker compose build
         REPO_REF: "${REPO_REF:-main}"
-    image: "${IMAGE:-glmjs:runtime}"
-    container_name: "${CONTAINER_NAME:-glmjs}"
+    image: "${IMAGE:-slopllm:runtime}"
+    container_name: "${CONTAINER_NAME:-slopllm}"
     command:
       - node
       - --require

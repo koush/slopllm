@@ -356,22 +356,22 @@ function sendMetrics(
     ];
   }).flat();
   const lines = [
-    "# HELP vllm:num_requests_running GLM.js requests admitted for model execution.",
+    "# HELP vllm:num_requests_running slopllm requests admitted for model execution.",
     "# TYPE vllm:num_requests_running gauge",
     `vllm:num_requests_running ${metrics.runningRequests}`,
-    "# HELP vllm:num_requests_waiting GLM.js requests blocked on admission capacity.",
+    "# HELP vllm:num_requests_waiting slopllm requests blocked on admission capacity.",
     "# TYPE vllm:num_requests_waiting gauge",
     `vllm:num_requests_waiting ${waitingRequests}`,
-    "# HELP vllm:generation_tokens_total GLM.js sampled completion tokens.",
+    "# HELP vllm:generation_tokens_total slopllm sampled completion tokens.",
     "# TYPE vllm:generation_tokens_total counter",
     `vllm:generation_tokens_total ${metrics.generationTokensTotal}`,
-    "# HELP vllm:spec_decode_num_drafts_total GLM.js MTP draft sequences verified.",
+    "# HELP vllm:spec_decode_num_drafts_total slopllm MTP draft sequences verified.",
     "# TYPE vllm:spec_decode_num_drafts_total counter",
     `vllm:spec_decode_num_drafts_total ${metrics.specDecodeNumDraftsTotal}`,
-    "# HELP vllm:spec_decode_num_draft_tokens_total GLM.js MTP draft tokens proposed.",
+    "# HELP vllm:spec_decode_num_draft_tokens_total slopllm MTP draft tokens proposed.",
     "# TYPE vllm:spec_decode_num_draft_tokens_total counter",
     `vllm:spec_decode_num_draft_tokens_total ${metrics.specDecodeNumDraftTokensTotal}`,
-    "# HELP vllm:spec_decode_num_accepted_tokens_total GLM.js MTP draft tokens accepted.",
+    "# HELP vllm:spec_decode_num_accepted_tokens_total slopllm MTP draft tokens accepted.",
     "# TYPE vllm:spec_decode_num_accepted_tokens_total counter",
     `vllm:spec_decode_num_accepted_tokens_total ${metrics.specDecodeNumAcceptedTokensTotal}`,
     "# HELP glm:mtp_phase_seconds_total GPU-complete wall time spent in MTP execution phases.",
@@ -379,22 +379,22 @@ function sendMetrics(
     "# HELP glm:mtp_phase_count_total Completed MTP execution phases.",
     "# TYPE glm:mtp_phase_count_total counter",
     ...mtpPhaseLines,
-    "# HELP vllm:prompt_tokens_total GLM.js prompt tokens admitted for prefill.",
+    "# HELP vllm:prompt_tokens_total slopllm prompt tokens admitted for prefill.",
     "# TYPE vllm:prompt_tokens_total counter",
     `vllm:prompt_tokens_total ${metrics.promptTokensTotal}`,
-    "# HELP vllm:request_success_total GLM.js successfully completed requests.",
+    "# HELP vllm:request_success_total slopllm successfully completed requests.",
     "# TYPE vllm:request_success_total counter",
     `vllm:request_success_total ${metrics.requestSuccessTotal}`,
-    "# HELP vllm:kv_cache_usage_perc GLM.js fraction of KV cache pages in use.",
+    "# HELP vllm:kv_cache_usage_perc slopllm fraction of KV cache pages in use.",
     "# TYPE vllm:kv_cache_usage_perc gauge",
     `vllm:kv_cache_usage_perc ${kvUsage}`,
-    "# HELP vllm:cache_config_info GLM.js paged KV cache configuration.",
+    "# HELP vllm:cache_config_info slopllm paged KV cache configuration.",
     "# TYPE vllm:cache_config_info gauge",
     `vllm:cache_config_info{block_size="${pagedKV.pageSize}",num_gpu_blocks="${pagedKV.maxPages}",max_total_num_tokens="${maxTotalTokens}",cp_world_size="1"} 1`,
-    "# HELP vllm:scheduler_config_info GLM.js request scheduler configuration.",
+    "# HELP vllm:scheduler_config_info slopllm request scheduler configuration.",
     "# TYPE vllm:scheduler_config_info gauge",
     `vllm:scheduler_config_info{max_num_seqs="${batchSize}",max_num_batched_tokens="${chunkSize}",max_model_len="${maxModelLen}"} 1`,
-    "# HELP vllm:request_prefill_time_seconds GLM.js request prefill duration.",
+    "# HELP vllm:request_prefill_time_seconds slopllm request prefill duration.",
     "# TYPE vllm:request_prefill_time_seconds histogram",
     `vllm:request_prefill_time_seconds_bucket{le="+Inf"} ${metrics.prefillTimeSecondsCount}`,
     `vllm:request_prefill_time_seconds_sum ${metrics.prefillTimeSecondsSum}`,
@@ -1014,7 +1014,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         }],
       });
     } else if (req.method === "GET" && url.pathname === "/version") {
-      sendJSON(res, 200, { version: "glm.js" });
+      sendJSON(res, 200, { version: "slopllm" });
     } else if (req.method === "GET" && url.pathname === "/health") {
       sendJSON(res, 200, { status: "ok", model: modelName });
     } else {

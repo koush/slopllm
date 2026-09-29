@@ -84,7 +84,7 @@ async function main() {
     console.log(`${sawEos ? "    stop" : "  LENGTH"} ${String(ids.length).padStart(5)}tok  loop=${String(lp).padEnd(5)} ${prompt.slice(0, 42)}` +
       `${!sawEos ? " NON-TERMINATING" : ""}${lp ? " LOOPED" : ""}`);
   }
-  console.log(`\nglm.js greedy ${process.env.GLM_DENSE_ATTN === "1" ? "DENSE " : "SPARSE"}: ${bad}/${n} prompts non-terminating or looping`);
+  console.log(`\nslopllm greedy ${process.env.GLM_DENSE_ATTN === "1" ? "DENSE " : "SPARSE"}: ${bad}/${n} prompts non-terminating or looping`);
 
   ops.synchronize();
   cache.free(); ws.free(); model.free();

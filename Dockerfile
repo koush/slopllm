@@ -1,12 +1,12 @@
-# Builds glm.js from a fresh checkout of the repository and produces a slim
+# Builds slopllm from a fresh checkout of the repository and produces a slim
 # runtime image.
 #
 # Stage 1 (builder): CUDA devel toolchain compiles the sm_120a kernels (nvcc),
 # links the native node addon (node-gyp), and compiles TypeScript (tsc).
 # Stage 2 (runtime): only CUDA runtime libraries, Node.js, and the built tree.
 #
-#   docker build -t glmjs .
-#   docker run --gpus all -it glmjs
+#   docker build -t slopllm .
+#   docker run --gpus all -it slopllm
 #
 # Toolchain choices mirror the development host: CUDA 13.3 on Ubuntu 24.04,
 # gcc 13, Node 24.
@@ -50,11 +50,11 @@ WORKDIR /build
 # default "main") can reuse a cached clone that predates newer commits.
 # To build from fresh source, pass the current remote SHA:
 #   REPO_REF=$(git rev-parse origin/main) docker compose build
-RUN git clone "${REPO_URL}" glm.js \
-    && git -C glm.js checkout "${REPO_REF}" \
-    && git -C glm.js submodule update --init --recursive --jobs 8
+RUN git clone "${REPO_URL}" slopllm \
+    && git -C slopllm checkout "${REPO_REF}" \
+    && git -C slopllm submodule update --init --recursive --jobs 8
 
-WORKDIR /build/glm.js
+WORKDIR /build/slopllm
 
 # Install exactly what package-lock.json resolves (includes the vendored
 # @huggingface/transformers package via symlink into vendor/). npm also
@@ -125,12 +125,12 @@ FROM nvidia/cuda:13.3.1-runtime-ubuntu24.04
 COPY --from=builder /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/
 COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
 
-WORKDIR /build/glm.js
+WORKDIR /build/slopllm
 
 # The pruned tree: dist/ (compiled JS), src/ (for tsx entry points),
 # build/Release/{glm.node,libglm_ops.so}, node_modules without onnx, and the
 # vendored transformers package's src/types.
-COPY --from=builder /build/glm.js .
+COPY --from=builder /build/slopllm .
 
 # Sanity-check the stripped tree at build time: the addon and CUDA ops library
 # must be present, all shared-library dependencies (cudart/cublas/nccl from

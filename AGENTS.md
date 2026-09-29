@@ -1,4 +1,4 @@
-# GLM.js Architecture Notes
+# slopllm Architecture Notes
 
 ## Overview
 
