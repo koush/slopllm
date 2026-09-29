@@ -27,25 +27,21 @@ Fetch the model into the HF cache:
 hf download local-inference-lab/GLM-5.3-NVFP4
 ```
 
-## Building
+## Docker
+
+The prebuilt image is published on Docker Hub (`koush/slopllm`). Clone the repository for its `docker-compose.yml`, then start the server:
 
 ```bash
-git submodule init
-git submodule update
-npm install                    # install node dependencies
-npm run build:all              # build CUDA lib + Node addon + TypeScript
+git clone https://github.com/koush/slopllm.git
+cd slopllm
+docker compose up -d --wait    # pulls koush/slopllm and starts the server (all GPUs, host networking + IPC)
+docker compose logs -f         # follow server output
+docker compose down            # stop
 ```
 
-This produces:
-- `build/Release/libglm_ops.so` — shared CUDA library
-- `build/Release/glm.node` — Node.js addon
+Requirements: the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and the model already downloaded into the host Hugging Face cache (see [Requirements](#requirements)).
 
-Individual build steps:
-```bash
-npm run build:cuda             # build libglm_ops.so only
-npm run build:addon            # build CUDA lib + Node addon
-npm run build                  # build TypeScript only
-```
+The compose file runs the OpenAI server with `--arena 92 --mtp --cp` across all GPUs, mounts the host Hugging Face cache read-only at its default path, and sets `NCCL_P2P_LEVEL=SYS` by default — tuned with the best defaults for an 8x RTX Pro 6000 host. Edit `docker-compose.yml` (or its environment variables) to customize. Model load takes several minutes (~90GB of weights across 8 GPUs); the health check has a long start period to match.
 
 ## Running
 
@@ -87,7 +83,29 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 | `--api-key <key>` | Bearer token required on all endpoints | unset |
 | `--admin-api-key <key>` | Bearer token enabling `/admin` endpoints (cache flush) | unset |
 
-### Persistent model loader
+> **Note:** the server does not perform an exhaustive warmup across all context length and batch size combinations. When a new combination is first encountered, CUDA graphs must be captured for it, causing a momentary stall at these graph compile points. Subsequent requests with the same shape replay the captured graph without stalling.
+
+## Building
+
+```bash
+git submodule init
+git submodule update
+npm install                    # install node dependencies
+npm run build:all              # build CUDA lib + Node addon + TypeScript
+```
+
+This produces:
+- `build/Release/libglm_ops.so` — shared CUDA library
+- `build/Release/glm.node` — Node.js addon
+
+Individual build steps:
+```bash
+npm run build:cuda             # build libglm_ops.so only
+npm run build:addon            # build CUDA lib + Node addon
+npm run build                  # build TypeScript only
+```
+
+## Development and the Model Loader
 
 `src/run_model_loader.ts` decouples the model lifetime from the server lifetime. The loader process loads the weights and GPU arena once, then starts executor processes (e.g. the OpenAI server) against that resident model. The arena is exported with CUDA IPC and mapped at a process-local address by each executor, which replays the model allocation layout against the imported base. Stopping, restarting, or replacing an executor — for profiling, benchmarking, or config changes — does not reload the weights; only tearing down the loader releases the model runtime.
 
