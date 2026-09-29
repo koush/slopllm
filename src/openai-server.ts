@@ -452,7 +452,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     args.batchSize * (mtpEnabled ? args.mtp + 1 : 1),
     model.cfg.vocabSize, args.repetitionPenaltyWindow,
     mtpEnabled
-      ? { maxBatchSize: args.batchSize, depth: args.mtp, retainProposalsOnGpu: process.env.GLM_MTP_GPU_PROPOSALS !== "0" }
+      ? { maxBatchSize: args.batchSize, depth: args.mtp, retainProposalsOnGpu: true }
       : undefined);
   const tokenizer = model.tokenizer;
   const eosIds = model.eosIds;
@@ -476,7 +476,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       args.batchSize * (mtpEnabled ? args.mtp + 1 : 1),
       model.cfg.vocabSize, args.repetitionPenaltyWindow,
       mtpEnabled
-        ? { maxBatchSize: args.batchSize, depth: args.mtp, retainProposalsOnGpu: process.env.GLM_MTP_GPU_PROPOSALS !== "0" }
+        ? { maxBatchSize: args.batchSize, depth: args.mtp, retainProposalsOnGpu: true }
         : undefined);
     const warmupParams = (rows: number) => Array.from({ length: rows }, () => makeSamplingParamsHelper(args));
     const preparePrefillSampling = (rows: number) => {
@@ -1034,7 +1034,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  GET  /health               - Health check`);
     console.log(`  CUDA graphs: ${args.noCudaGraph ? "disabled" : "enabled"}`);
     console.log(`  MTP: ${args.mtp > 0 && !args.noMtp ? `enabled (draft tokens ${args.mtp})` : "disabled"}`);
-    if (samplingWorkspace.mtpEnabled) console.log(`  MTP proposals: ${samplingWorkspace.retainProposalsOnGpu ? "GPU-resident" : "host baseline"} (GLM_MTP_GPU_PROPOSALS=0 selects host baseline)`);
+    if (samplingWorkspace.mtpEnabled) console.log(`  MTP proposals: GPU-resident`);
     console.log(`  Phased prefill: ${args.phasedPrefill ? "enabled" : "disabled"}`);
     console.log(`  API key: ${args.apiKey !== undefined ? "required" : "disabled"}`);
     console.log(`  Admin API key: ${args.adminApiKey !== undefined ? "required for /admin endpoints" : "disabled (/admin endpoints return 401)"}`);

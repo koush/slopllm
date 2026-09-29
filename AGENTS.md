@@ -195,7 +195,7 @@ When `--cp` is set on the GLM backend, GPUs operate as context-parallel shards f
 - `CaptureManager` implements `ExecutionManager.execute({ states, inputs, key }, fn)`. For a stable key, the first call runs eagerly; the second records, instantiates, and launches the graph; subsequent calls replay it. An empty key executes eagerly.
 - Keys include caller parameters, each state's batch size/total tokens, backend capture keys, and explicit input tensor signatures including memory ranges. Padded KV-length buckets are added when execution calls `getGraphVariantPaddedKvLen()`.
 - Captures retain input/output tensors and the set of participating workspaces. Replay validates inputs and clear workspace ownership, launches the graph, reconciles host heap bookkeeping, and returns uncaptured output views.
-- Planning and input upload run outside the normal decode graph; model forward, logits, and token selection run inside it. `ExecutionState.captureAll()` supports graphs spanning multiple planned states. `GLM_GRAPH_DIAGNOSTICS=1` enables binding/replay diagnostics.
+- Planning and input upload run outside the normal decode graph; model forward, logits, and token selection run inside it. `ExecutionState.captureAll()` supports graphs spanning multiple planned states.
 - `ChatModel.executePrefill()` always uses an empty capture key, so production chunked/phased prefill executes eagerly.
 
 ## Model Loading (`src/chat_model.ts`, `src/glm51_model.ts`)
@@ -295,7 +295,7 @@ Executor environment overrides can be supplied to `/fork` or `/spawn` with an ob
 ```bash
 curl -X POST http://127.0.0.1:8099/fork \
   -H 'content-type: application/json' \
-  -d '{"command":["src/openai-server.ts","--port","8000"],"env":{"GLM_GRAPH_DIAGNOSTICS":"0"}}'
+  -d '{"command":["src/openai-server.ts","--port","8000"],"env":{"GLM_CHAT_DEBUG":"0"}}'
 ```
 
 To keep the configured command but replace its environment overrides, use `/restart`:
@@ -303,7 +303,7 @@ To keep the configured command but replace its environment overrides, use `/rest
 ```bash
 curl -X POST http://127.0.0.1:8099/restart \
   -H 'content-type: application/json' \
-  -d '{"env":{"GLM_GRAPH_DIAGNOSTICS":"0"}}'
+  -d '{"env":{"GLM_CHAT_DEBUG":"0"}}'
 ```
 
 Values are strings; `null` unsets an inherited variable. An `env` object replaces the complete override map, and `{}` restores inheritance. Empty-body restarts retain the configured overrides. Overrides affect only the executor, appear in `/status`, and cannot replace loader-managed CUDA IPC/layout variables. A new command array starts with no overrides.

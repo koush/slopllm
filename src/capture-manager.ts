@@ -72,26 +72,11 @@ export class CaptureManager implements Disposable, ExecutionManager {
     ): T {
         if (!key?.length) return fn(false, inputs);
         const { base, params } = this.stateKeys(states, key);
-        const bindings: Record<string, string> | undefined = process.env.GLM_GRAPH_DIAGNOSTICS === "1" ? {} : undefined;
-        if (bindings) {
-            const record = (name: string, tensor: Tensor) => {
-                bindings[name] = `${tensor.name ?? "unnamed"}:${tensor.type}[${tensor.shape}]:${JSON.stringify(tensor.memoryRanges())}`;
-            };
-            for (const [index, state] of states.entries()) {
-                for (const [name, value] of Object.entries(state)) {
-                    if (value instanceof Tensor && name !== "input") record(`state${index}.${name}`, value);
-                }
-                for (const [name, value] of Object.entries(state.customMask ?? {})) {
-                    if (value instanceof Tensor) record(`state${index}.mask.${name}`, value);
-                }
-                for (const [name, value] of state.cache.getPagedKV().tensors) record(`state${index}.cache.${name}`, value);
-            }
-        }
         return this.run(inputs, (capturing, retained) => {
             const result = fn(capturing, retained);
             this.recordLengthVariant(base, states.some(state => !state.paddedKvLenInvariant));
             return result as TensorTree;
-        }, params, bindings) as T;
+        }, params) as T;
     }
 
     static trackWorkspaceAlloc(workspace: WorkspaceBase) {
@@ -164,10 +149,6 @@ export class CaptureManager implements Disposable, ExecutionManager {
                                 console.error(`[cuda-graph] BINDING MISMATCH key=${key} graphExec=${captured.graphExec} name=${name} captured=${captured.diagnosticBindings[name]} current=${diagnosticBindings[name]}`);
                             }
                         }
-                    }
-                    if (process.env.GLM_GRAPH_DIAGNOSTICS === "1") {
-                        console.warn(`[cuda-graph] checkpoint before-replay key=${key} graphExec=${captured.graphExec}`);
-                        this.ops.synchronize();
                     }
                     for (const [name, input] of Object.entries(inputs)) {
                         if (!input)
@@ -242,9 +223,6 @@ export class CaptureManager implements Disposable, ExecutionManager {
                     }
                     captured.inputs = capturedInputs;
                     captured.diagnosticBindings = diagnosticBindings;
-                    if (process.env.GLM_GRAPH_DIAGNOSTICS === "1") {
-                        console.warn(`[cuda-graph] capture bindings key=${key} bindings=${JSON.stringify(diagnosticBindings)}`);
-                    }
 
                     if (process.env.GLM_CAPTURE_DEBUG === "1") console.warn("\n====capturing====", key)
                     this.ops.graphBeginCapture();

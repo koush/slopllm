@@ -626,11 +626,7 @@ export class GenerationScheduler {
         const generator = numDraftTokens
           ? model.generateMtpDecode!(ws, cache, numDraftTokens, captureManager, samplingPolicy)
           : model.generateDecode(ws, cache, captureManager, samplingPolicy);
-        let stepStart = performance.now();
         for await (const step of generator) {
-          if (process.env.GLM_MTP_TIMING === "1") {
-            this.recordPhase("decode", this.active.length, (performance.now() - stepStart) / 1000);
-          }
           if (step.numDraftTokens > 0) {
             metrics.specDecodeNumDraftsTotal += this.active.length;
           }
@@ -644,7 +640,6 @@ export class GenerationScheduler {
             || (!this.pendingFlush && this.active.length < maxBatchSize && requests.queued.length > 0)) {
             break;
           }
-          stepStart = performance.now();
         }
         // for-await has closed the generator before any sequence is removed.
         this.removeFinished();
