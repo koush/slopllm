@@ -102,6 +102,28 @@ export class PrefixTierPolicy {
     this.host?.clearStaging();
   }
 
+  private matchGpuPrefixes(prompts: number[][]): number[][] {
+    const gpu = this.pagedKV;
+    const resumable = new Map<Sequence, number>();
+    for (const key of this.retainedKeys) {
+      const sequence = gpu.staging.get(key);
+      if (sequence) resumable.set(sequence, key);
+      else this.retainedKeys.delete(key);
+    }
+    return prompts.map((prompt, index) => {
+      const suffix = gpu.prefixMatch(index, prompt, sequence => resumable.has(sequence));
+      const key = resumable.get(gpu.sequences[index]);
+      if (key !== undefined && !gpu.staging.has(key)) {
+        // Ownership moved to this request. Do not let a later request in the
+        // same admission batch consume it again; permission checks are pure.
+        resumable.delete(gpu.sequences[index]);
+        this.retainedKeys.delete(key);
+        console.log(`GPU cache resume: sequence=${index} cached-tokens=${prompt.length - suffix.length} partial-tokens=${gpu.sequences[index].allocLen % gpu.pageSize}`);
+      }
+      return suffix;
+    });
+  }
+
   // Only stage host slots after all earlier transfers have drained.
   private stageHostSequences(): void {
     const host = this.host;
@@ -156,15 +178,15 @@ export class PrefixTierPolicy {
 
   /**
    * Admit-time tier match: returns each request's uncached suffix to prefill.
-   * Without a host tier this is exactly the single-tier prefixMatch and no
-   * await is reached inside. Suffixes derive from the prompt, never from
-   * cache bookkeeping.
+   * Finished GPU rows may be consumed to resume a private partial page.
+   * Without a host tier no await is reached inside. Suffixes derive from the
+   * prompt, never from cache bookkeeping.
    */
   async prefixMatch(prompts: number[][]): Promise<number[][]> {
     const gpu = this.pagedKV;
     const host = this.host;
     if (!host) {
-      return prompts.map((p, i) => gpu.prefixMatch(i, p));
+      return this.matchGpuPrefixes(prompts);
     }
     const pageSize = gpu.pageSize;
 
@@ -179,11 +201,11 @@ export class PrefixTierPolicy {
     // original, the shared pages survive.
     const hostSuffix = prompts.map((p, i) => host.prefixMatch(i, p));
 
-    // Device prime: fresh slots only clear or share full pages, so nothing
-    // allocates. Rows the
+    // Device prime shares full pages or resumes a finished retained row, so
+    // nothing allocates. Rows the
     // scheduler staged around cache.reset() are visible candidates but
     // never evictable (negative keys only).
-    const suffixes = prompts.map((p, i) => gpu.prefixMatch(i, p));
+    const suffixes = this.matchGpuPrefixes(prompts);
     for (let i = 0; i < prompts.length; i++) {
       const hostTokens = prompts[i].length - hostSuffix[i].length;
       if (hostTokens) {

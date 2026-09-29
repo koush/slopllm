@@ -279,7 +279,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     const pageSize = this.pageSize;
     const srcTokens = srcSeq.getTokenIds();
     const fullPages = Math.min(Math.floor(srcTokens.length / pageSize), maxPages ?? Infinity);
-    const matched = srcTokens.length - this.matchFullPages(dstSeqIdx, srcTokens, fullPages).length;
+    const matched = srcTokens.length - this.matchPrefix(dstSeqIdx, srcTokens, fullPages).length;
     const firstCopyPage = matched / pageSize;
     const dstSeq = this.ensureSequence(dstSeqIdx);
     if (fullPages > firstCopyPage) {
@@ -343,27 +343,41 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   // Finds the best prefix match across active and staged sequences and returns the unmatched suffix.
   // Reuse only full pages, leaving at least one prompt token for prefill so
   // the caller selects a fresh output using its own sampling policy. An exact
-  // page-aligned match replays the last full page. No partial pages are copied
-  // or kept, including on self-matches; prefill starts at a page boundary.
-  prefixMatch(seqIdx: number, inputIds: number[]): number[] {
+  // page-aligned match replays the last full page. An optional pure permission
+  // callback may authorize consuming an entire sequence when the prompt
+  // strictly extends its committed history and its partial page is private.
+  // Such a resume transfers ownership without copies/allocations; an active
+  // donor slot is left empty (indices stay stable), or its staging entry is
+  // removed. The callback may be consulted for candidates that do not win.
+  // Without permission, matching remains full-page-only, even for self-matches.
+  prefixMatch(seqIdx: number, inputIds: number[], allowResume?: (sequence: Sequence) => boolean): number[] {
     const maxPages = Math.floor(Math.max(0, inputIds.length - 1) / this.pageSize);
-    return this.matchFullPages(seqIdx, inputIds, maxPages);
+    return this.matchPrefix(seqIdx, inputIds, maxPages, allowResume);
   }
 
-  private matchFullPages(seqIdx: number, inputIds: number[], maxPages: number): number[] {
+  private matchPrefix(seqIdx: number, inputIds: number[], maxPages: number, allowResume?: (sequence: Sequence) => boolean): number[] {
     const targetSeq = this.ensureSequence(seqIdx);
 
     let bestSeq: Sequence | undefined;
     let bestMatchTokens = 0;
+    let bestResume = false;
     for (const sequence of [...this.sequences, ...this.staging.values()]) {
       if (sequence.pages.length === 0) continue;
-      const matchTokens = Math.min(
-        Math.floor(Math.min(sequence.prefixMatch(inputIds), sequence.allocLen) / this.pageSize),
-        maxPages,
-      ) * this.pageSize;
+      const commonTokens = Math.min(sequence.prefixMatch(inputIds), sequence.allocLen);
+      let matchTokens = Math.min(Math.floor(commonTokens / this.pageSize), maxPages) * this.pageSize;
+      const resume = !!allowResume
+        && commonTokens === sequence.allocLen
+        && commonTokens < inputIds.length
+        && commonTokens % this.pageSize !== 0
+        && sequence.reportedTokenCount() === sequence.allocLen
+        && sequence.pages.length === Math.ceil(commonTokens / this.pageSize)
+        && sequence.pages.at(-1)!.refs === 1
+        && allowResume(sequence);
+      if (resume) matchTokens = commonTokens;
       if (matchTokens > bestMatchTokens) {
         bestMatchTokens = matchTokens;
         bestSeq = sequence;
+        bestResume = resume;
       }
     }
 
@@ -371,6 +385,28 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       targetSeq.clear();
       targetSeq.targetToken = inputIds[0];
       return inputIds.slice();
+    }
+
+    if (bestResume) {
+      if (bestSeq !== targetSeq) {
+        const sourceIndex = this.sequences.indexOf(bestSeq);
+        if (sourceIndex !== -1) {
+          this.sequences[sourceIndex] = new Sequence(this);
+        } else {
+          for (const [key, sequence] of this.staging) {
+            if (sequence === bestSeq) {
+              this.staging.delete(key);
+              break;
+            }
+          }
+        }
+        targetSeq.clear();
+        this.sequences[seqIdx] = bestSeq;
+      }
+      // The rendered prompt supplies the next input; the donor's sampled
+      // targetToken is not committed KV and must not be injected here.
+      bestSeq.targetToken = inputIds[bestMatchTokens];
+      return inputIds.slice(bestMatchTokens);
     }
 
     const keepPages = bestMatchTokens / this.pageSize;

@@ -10,6 +10,7 @@ import "./test_reduce_scatter";
 import "./test";
 import "./test_batch";
 import "./test_prefix_cache";
+import "./test_prefix_resume";
 import "./test_generation_scheduler";
 import "./test_fp8";
 import "./test_quantize_fp8";
