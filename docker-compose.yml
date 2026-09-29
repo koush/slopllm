@@ -1,4 +1,4 @@
-# slopllm OpenAI server on slopllm:runtime (see Dockerfile).
+# slopllm OpenAI server on koush/slopllm (see Dockerfile).
 #
 # Mirrors the GPU passthrough pattern from ~/chat/vllm/docker-compose.yml:
 # `gpus: all` plus host networking/IPC, which are what work on this system.
@@ -16,9 +16,11 @@
 #   IMAGE, CONTAINER_NAME, PORT, GPUS (GPU order for tensor/context
 #   parallelism), MAX_PAGES, HF_HOME (host Hugging Face cache;
 #   defaults to the standard ~/.cache/huggingface), NCCL_P2P_LEVEL
-#   and NCCL_TOPO_FILE (optional, no defaults — empty/unset lets NCCL
-#   auto-detect; host files go in ./docker-mnt, mounted at /docker-mnt),
-#   DOCKER_MNT (host directory to mount at /docker-mnt).
+#   (defaults to SYS, the known-good setting for this host's dual-switch
+#   interconnect), NCCL_TOPO_FILE (optional pass-through from the compose
+#   shell or .env; unset lets NCCL auto-detect; host files go in
+#   ./docker-mnt, mounted at /docker-mnt), DOCKER_MNT (host directory
+#   to mount at /docker-mnt).
 #
 # Model load takes several minutes (~90GB of weights across 8 GPUs);
 # the health check has a long start period to match.
@@ -47,7 +49,6 @@ services:
       - --port
       - "${PORT:-8000}"
       # Shared model arguments (same parser as run_model_loader executors).
-      - --glm51
       - --mtp
       - --cp
       - --gpus
@@ -55,10 +56,14 @@ services:
       - --max-pages
       - "${MAX_PAGES:-8192}"
     network_mode: host
+    # ipc: host shares the host's /dev/shm outright (shm_size is ignored
+    # with host IPC); NCCL staging buffers need a large host /dev/shm.
     ipc: host
-    restart: unless-stopped
+    # Bound retries: a boot crash (e.g. missing HF cache) otherwise loops
+    # a multi-minute ~90GB weight reload forever. Clean exits (docker stop,
+    # reboot) are not restarted — run `docker compose up -d` after a reboot.
+    restart: on-failure:3
     init: true
-    shm_size: 32gb
     gpus: all
     ulimits:
       nofile:
@@ -70,15 +75,15 @@ services:
       # unspecified default (~/.cache/huggingface, i.e. /root/.cache/huggingface
       # in this image) exactly like the Hugging Face convention, and the
       # volume below puts the host cache at that path.
-      # NCCL_P2P_LEVEL is host-specific tuning (e.g. SYS alongside a
-      # NCCL_TOPO_FILE override); empty/unset lets NCCL use its defaults.
-      # NCCL_TOPO_FILE has no default. When set, it is a container-side
-      # path; host files can be exposed via the docker-mnt volume below,
-      # e.g. NCCL_TOPO_FILE=/docker-mnt/topo_fixed.xml with the host file
-      # at ./docker-mnt/topo_fixed.xml.
-      NCCL_P2P_LEVEL: "${NCCL_P2P_LEVEL:-}"
-      NCCL_TOPO_FILE: "${NCCL_TOPO_FILE:-}"
-      PORT: "${PORT:-8000}"
+      # NCCL_P2P_LEVEL defaults to SYS: on this host NCCL misreads the
+      # dual-switch interconnect and falls back to host-staged collectives.
+      # NCCL_TOPO_FILE is a pass-through (null value): set it in the shell
+      # or a .env file to use a topology override, e.g.
+      # NCCL_TOPO_FILE=/docker-mnt/topo_fixed.xml with the host file at
+      # ./docker-mnt/topo_fixed.xml. Unset, the variable is truly absent
+      # from the container and NCCL auto-detects.
+      NCCL_P2P_LEVEL: "${NCCL_P2P_LEVEL:-SYS}"
+      NCCL_TOPO_FILE:
     volumes:
       # Host Hugging Face cache (default: ~/.cache/huggingface) mounted at the
       # container's own default location. Models must live under
@@ -92,7 +97,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        - node -e "fetch('http://127.0.0.1:${PORT:-8000}/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 10s
       retries: 10
