@@ -444,7 +444,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       throw new Error("host cache layout must match the device cache layout");
     }
   }
-  ops.printHeap();
   const ws = new ExecutionWorkspace(ops, args.batchSize, args.chunkSize);
   const captureManager = new CaptureManager(ops);
   captureManager.disabled = args.noCudaGraph;
@@ -470,25 +469,60 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   console.log(`Generation defaults: temperature=${args.temperature} top-p=${args.topP} top-k=${args.topK} repetition-penalty=${args.repetitionPenalty}`);
 
   {
+    // Peak warmup: grow workspace heaps to the serving high-water mark so the
+    // arena never needs to satisfy a first-seen allocation mid-serving.
     console.log("Warming up...");
-    const warmupIds = tokenizeMessages(tokenizer, [{ role: "user", content: "Hello" }]);
-    cache.reset(1);
-    using warmupSw = new SamplingWorkspace(ops, 1, model.cfg.vocabSize, args.repetitionPenaltyWindow);
-    warmupSw.updateSampler([makeSamplingParamsHelper(args)], [warmupIds]);
-    let remainingInputIdsList = [warmupIds];
-    while (remainingInputIdsList.some(ids => ids.length)) {
-      const plan = model.planChunkedPrefill(ws, cache, remainingInputIdsList, args.chunkSize, warmupSw);
-      for (const _ of plan.generator) {
-        // Warmup consumes one chunk at a time, just like the scheduler.
+    using warmupSw = new SamplingWorkspace(ops,
+      args.batchSize * (mtpEnabled ? args.mtp + 1 : 1),
+      model.cfg.vocabSize, args.repetitionPenaltyWindow,
+      mtpEnabled
+        ? { maxBatchSize: args.batchSize, depth: args.mtp, retainProposalsOnGpu: process.env.GLM_MTP_GPU_PROPOSALS !== "0" }
+        : undefined);
+    const warmupParams = (rows: number) => Array.from({ length: rows }, () => makeSamplingParamsHelper(args));
+    const preparePrefillSampling = (rows: number) => {
+      const params = warmupParams(rows);
+      if (warmupSw.mtpEnabled) {
+        warmupSw.updateMtpSampler(params);
       }
-      await ops.synchronizeAsync();
-      plan.reportTokens();
-      remainingInputIdsList = plan.remainingInputIdsList;
-      ws.assertClear();
-      ws.clearTracking();
+      warmupSw.updateSampler(params, params.map(() => []));
+    };
+    // Garbage input is fine: forward temporaries scale with token count.
+    const runPrefill = async (inputIdsList: number[][]): Promise<void> => {
+      preparePrefillSampling(inputIdsList.length);
+      let remainingInputIdsList = inputIdsList;
+      while (remainingInputIdsList.some(ids => ids.length)) {
+        const plan = model.planChunkedPrefill(ws, cache, remainingInputIdsList, args.chunkSize, warmupSw);
+        for (const _ of plan.generator) {
+          // Warmup consumes one chunk at a time, just like the scheduler.
+        }
+        await ops.synchronizeAsync();
+        plan.reportTokens();
+        remainingInputIdsList = plan.remainingInputIdsList;
+        ws.assertClear();
+        ws.clearTracking();
+      }
+    };
+
+    // Max-chunk single-sequence prefill: peak chunk temporaries (phased path).
+    cache.reset(1);
+    await runPrefill([new Array<number>(args.chunkSize).fill(0)]);
+
+    // Full-batch prefill at peak total tokens; commits the decode batch.
+    cache.reset(args.batchSize);
+    const batchLen = Math.max(1, Math.floor(args.chunkSize / args.batchSize));
+    await runPrefill(Array.from({ length: args.batchSize }, () => new Array<number>(batchLen).fill(0)));
+
+    // Max-batch decode: peak decode/MTP temporaries.
+    if (warmupSw.mtpEnabled) {
+      warmupSw.updateMtpSampler(warmupParams(args.batchSize));
+    } else {
+      warmupSw.updateSampler(warmupParams(args.batchSize), warmupParams(args.batchSize).map(() => []));
     }
     let warmupSteps = 0;
-    for await (const _ of model.generateDecode(ws, cache, undefined, warmupSw)) {
+    const decode = mtpEnabled
+      ? model.generateMtpDecode!(ws, cache, args.mtp, undefined, warmupSw)
+      : model.generateDecode(ws, cache, undefined, warmupSw);
+    for await (const _ of decode) {
       if (++warmupSteps === 3) {
         break;
       }
@@ -498,6 +532,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     cache.reset(1);
     console.log("Warmup complete.");
   }
+  ops.printHeap();
 
   function makeSamplingParamsHelper(a: { temperature: number; topP: number; topK: number; repetitionPenalty: number; presencePenalty: number; repetitionPenaltyWindow: number }): SamplingParams {
     return {
