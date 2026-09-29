@@ -45,7 +45,7 @@ services:
       - --arena
       - "92"
       - --host
-      - 127.0.0.1
+      - "${HOST:-127.0.0.1}"
       - --port
       - "${PORT:-8000}"
       # Shared model arguments (same parser as run_model_loader executors).
