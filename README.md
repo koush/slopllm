@@ -12,8 +12,8 @@ GPU-accelerated inference for local-inference-lab/GLM-5.3-NVFP4, implemented in 
   - CUDA graph capture for decode, MTP speculative decoding, and phased prefill
   - Streaming (SSE) and non-streaming chat completions, tool calls, and reasoning content
   - Sampling controls (temperature, top-p, top-k, repetition/presence penalty, stop sequences)
-  - Multi-GPU serving via the persistent model loader (tensor + context parallelism)
   - Prometheus metrics (`/metrics`), health check, and tokenization endpoints
+- Multi-GPU serving with tensor parallelism and context parallelism via the persistent model loader.
 
 ## Requirements
 
