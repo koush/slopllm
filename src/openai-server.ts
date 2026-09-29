@@ -52,7 +52,7 @@ function parseArgs(argv: string[]): ServerArgs {
   const args: ServerArgs = {
     ...parseModelArgs(argv),
     port: 8000,
-    host: "0.0.0.0",
+    host: "127.0.0.1",
     chunkSize: 8192,
     batchSize: 8,
     maxPages: 0,
@@ -67,8 +67,9 @@ function parseArgs(argv: string[]): ServerArgs {
     decodeLatency: 0,
     noCudaGraph: false,
     noMtp: false,
-    phasedPrefill: false,
+    phasedPrefill: true,
   };
+  let phasedPrefillExplicit = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--port" && i + 1 < argv.length) args.port = parseInt(argv[++i], 10);
@@ -87,13 +88,15 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--decode-latency" && i + 1 < argv.length) args.decodeLatency = parseInt(argv[++i], 10);
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
     else if (a === "--no-mtp") args.noMtp = true;
-    else if (a === "--phased-prefill") args.phasedPrefill = true;
+    else if (a === "--phased-prefill") { args.phasedPrefill = true; phasedPrefillExplicit = true; }
+    else if (a === "--no-phased-prefill") args.phasedPrefill = false;
     else if (a === "--api-key" && i + 1 < argv.length) args.apiKey = argv[++i];
     else if (a === "--admin-api-key" && i + 1 < argv.length) args.adminApiKey = argv[++i];
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
   }
-  if (args.phasedPrefill && !args.useGlm51) {
-    throw new Error("--phased-prefill currently requires --glm51");
+  if (!args.useGlm51) {
+    if (phasedPrefillExplicit) throw new Error("--phased-prefill requires the GLM model");
+    args.phasedPrefill = false;
   }
   if (args.maxPages === 0) {
     args.maxPages = args.batchSize * Math.ceil(args.chunkSize / PAGE_SIZE);
@@ -105,16 +108,17 @@ function parseArgs(argv: string[]): ServerArgs {
 }
 
 function printHelp() {
-  console.log(`OpenAI-compatible server for Qwen3-0.6B
+  console.log(`OpenAI-compatible server for the GLM production checkpoint
 
 Usage: npx tsx src/openai-server.ts [options]
 
 Options:
   --port <int>                  Server port (default: 8000)
-  --host <string>               Server host (default: 0.0.0.0)
+  --host <string>               Server host (default: 127.0.0.1)
   --gpu <int>                   GPU device ID (default: 0)
   --gpus <list>                 GPU device IDs
   --arena <int>                 Arena size in GiB per GPU
+  --qwen3 / --qwen35            Serve a Qwen test model instead of the default GLM
   --chunk-size <int>            Prefill execution-token budget including overlap (default: 8192)
   --batch-size <int>            Maximum concurrent requests (default: 8)
   --max-pages <int>             KV cache pages (default: batch-size * ceil(chunk-size / 64))
@@ -131,7 +135,8 @@ Options:
   --no-cuda-graph               Disable CUDA graph capture
   --mtp [int]                   MTP speculative decoding draft tokens (default: 3)
   --no-mtp                      Disable MTP decoding for an MTP-loaded model
-  --phased-prefill              Overlap pairs of intermediate GLM-5.1 prefill chunks
+  --phased-prefill              Overlap pairs of intermediate prefill chunks (default: on)
+  --no-phased-prefill           Disable phased prefill
   --api-key <string>            Require this API key (Bearer token) on all endpoints
   --admin-api-key <string>      Require this API key on /admin endpoints (enables them)
   --help, -h                    Show this help message

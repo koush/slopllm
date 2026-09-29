@@ -92,7 +92,7 @@ async function main(): Promise<void> {
   const args = parseArgs(argv);
   const modelArgs = parseModelArgs(argv);
   if (!modelArgs.useGlm51) {
-    throw new Error("Prefill benchmark requires --glm51");
+    throw new Error("Prefill benchmark requires the GLM model (default; drop --qwen3/--qwen35/--fp8)");
   }
 
   const runtime = await loadModelRuntime(modelArgs);

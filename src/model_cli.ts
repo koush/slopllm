@@ -45,13 +45,16 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     arena: 0,
     modelDir: undefined,
     useQwen35: false,
-    useGlm51: false,
+    useGlm51: true,
     glm51Small: false,
     useFp8: false,
     useNvfp4: false,
     cp: false,
     mtp: 0,
   };
+  let glm51Explicit = false;
+  let qwen3Explicit = false;
+  let qwen35Explicit = false;
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -59,10 +62,11 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     else if (a === "--gpu" && i + 1 < argv.length) args.gpus = [parseInt(argv[++i], 10)];
     else if (a === "--arena" && i + 1 < argv.length) args.arena = parseInt(argv[++i], 10);
     else if (a === "--model-dir" && i + 1 < argv.length) args.modelDir = argv[++i];
-    else if (a === "--qwen35") args.useQwen35 = true;
-    else if (a === "--glm51") args.useGlm51 = true;
-    else if (a === "--glm51-small") { args.useGlm51 = true; args.glm51Small = true; }
-    else if (a === "--fp8") args.useFp8 = true;
+    else if (a === "--qwen3") { args.useGlm51 = false; qwen3Explicit = true; }
+    else if (a === "--qwen35") { args.useQwen35 = true; args.useGlm51 = false; qwen35Explicit = true; }
+    else if (a === "--glm51") { args.useGlm51 = true; glm51Explicit = true; }
+    else if (a === "--glm51-small") { args.useGlm51 = true; args.glm51Small = true; glm51Explicit = true; }
+    else if (a === "--fp8") { args.useFp8 = true; args.useGlm51 = false; }
     else if (a === "--nvfp4") args.useNvfp4 = true;
     else if (a === "--cp") args.cp = true;
     else if (a === "--mtp") {
@@ -78,10 +82,11 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
   if (!Number.isInteger(args.arena) || args.arena < 0) {
     throw new Error(`Invalid arena size: ${args.arena}`);
   }
-  if (args.useQwen35 && args.useGlm51) throw new Error("--qwen35 and --glm51 are mutually exclusive");
-  if (args.useQwen35 && args.useFp8) throw new Error("--fp8 is not supported with --qwen35");
-  if (args.useGlm51 && args.useFp8) throw new Error("--fp8 is not supported with --glm51");
-  if (args.useNvfp4 && !args.useGlm51) throw new Error("--nvfp4 is only supported with --glm51");
+  if (glm51Explicit && (qwen3Explicit || qwen35Explicit)) throw new Error("--glm51 cannot be combined with --qwen3 or --qwen35");
+  if (qwen3Explicit && qwen35Explicit) throw new Error("--qwen3 and --qwen35 are mutually exclusive");
+  if (qwen35Explicit && args.useFp8) throw new Error("--fp8 is not supported with --qwen35");
+  if (glm51Explicit && args.useFp8) throw new Error("--fp8 is not supported with --glm51 (use --qwen3 --fp8)");
+  if (args.useNvfp4 && !args.useGlm51) throw new Error("--nvfp4 requires the GLM model");
   if (!Number.isInteger(args.mtp) || args.mtp < 0) throw new Error(`Invalid --mtp draft depth: ${args.mtp}`);
   return args;
 }
