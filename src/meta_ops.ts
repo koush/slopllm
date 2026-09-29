@@ -144,6 +144,17 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([batchSize * convDim], this.type);
     }
 
+    dflash2Select(ids: Tensor, logits: Tensor, predecessor: Tensor, successor: Tensor, anchors: Tensor, depth: number): { scores: Tensor, tokens: Tensor } {
+        super.dflash2Select(ids, logits, predecessor, successor, anchors, depth);
+        return { scores: this.workspace.alloc([this.shape[0], ids.shape[1], ids.shape[1]], "F32"),
+            tokens: this.workspace.alloc([anchors.numElements, depth], "I32") };
+    }
+
+    dflash2Conv(coefficients: Tensor, base: Tensor, blockSize: number, groupSize: number, side: number): Tensor {
+        super.dflash2Conv(coefficients, base, blockSize, groupSize, side);
+        return this.workspace.alloc(this.shape, this.type);
+    }
+
     rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number): void {
         super.rmsnormGated(input, gate, weight, eps);
     }
@@ -157,8 +168,8 @@ export class MetaTensor extends Tensor {
         const dimHalf = this.shape[0];
         const hd = dimHalf * 2;
         using reshaped = positionIds.reshape([batch, seqLen]);
-        const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
-        const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
+        const cos = positionIds.workspace.alloc([batch, seqLen, hd], "BF16");
+        const sin = positionIds.workspace.alloc([batch, seqLen, hd], "BF16");
         return { cos, sin };
     }
 

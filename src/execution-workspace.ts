@@ -121,6 +121,7 @@ export class ExecutionState {
       mode?: MaskMode;
       positionIds?: Tensor;
       maskKvLen?: Tensor;
+      windowLeft?: number;
     },
   ) {
     const totalKvLen = cache.getPagedKV().sequences.reduce((sum, s) => sum + s.allocLen, 0);
@@ -648,6 +649,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     mode?: MaskMode;
     positionIds?: Tensor;
     maskKvLen?: Tensor;
+    windowLeft?: number;
   }): ExecutionState {
     const pagedKV = cache.getPagedKV();
     const cfg = model.cfg;
@@ -656,6 +658,13 @@ export class ExecutionWorkspace extends WorkspaceBase {
     const hd = cfg.headDim;
     const pageSize = pagedKV.pageSize;
     const totalTokens = seqLens.reduce((a, b) => a + b, 0);
+
+    if (customMask?.windowLeft !== undefined && (!Number.isInteger(customMask.windowLeft) || customMask.windowLeft < -1 || cfg.kvLoraRank)) {
+      throw new Error("Sliding-window prefill requires standard attention and windowLeft >= -1");
+    }
+    if (!cfg.kvLoraRank && customMask?.mode !== undefined && customMask.mode !== MaskMode.None && customMask.mode !== MaskMode.Causal) {
+      throw new Error("Standard paged prefill supports None or Causal masks");
+    }
 
     if (totalTokens > this.maxSeqLen) {
       throw new Error(`planPrefill: ${totalTokens} total tokens exceed workspace capacity ${this.maxSeqLen}`);
@@ -756,7 +765,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         totalTokens, batchSize,
         nHeads, nKv, hd,
         pageSize,
-        1
+        customMask?.mode ?? MaskMode.Causal
       );
       state.slotMappingH.withPinnedBuffer(buf => {
         let slotOff = 0;

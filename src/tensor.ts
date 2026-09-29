@@ -546,6 +546,33 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
+  dflash2Select(ids: Tensor, logits: Tensor, predecessor: Tensor, successor: Tensor, anchors: Tensor, depth: number): { scores: Tensor, tokens: Tensor } {
+    const [rows, rank] = this.shape;
+    if (this.type !== "BF16" || this.shape.length !== 2 || ids.type !== "I32" || logits.type !== "F32"
+      || ids.shape.length !== 2 || ids.shape[0] !== rows || ids.shape[1] < 1
+      || !ids.shape.every((n, i) => n === logits.shape[i]) || logits.shape.length !== 2
+      || predecessor.type !== "BF16" || successor.type !== "BF16" || predecessor.shape.length !== 2
+      || successor.shape.length !== 2 || predecessor.shape[1] !== rank || successor.shape[1] !== rank
+      || predecessor.shape[0] !== successor.shape[0] || anchors.type !== "I32"
+      || !Number.isInteger(depth) || depth < 1 || rows !== anchors.numElements * depth) {
+      throw new Error("Invalid DFlash2 selector inputs");
+    }
+    return undefined as never;
+  }
+
+  dflash2Conv(coefficients: Tensor, base: Tensor, blockSize: number, groupSize: number, side: number): Tensor {
+    const [rows, channels] = this.shape;
+    if (this.shape.length !== 2 || this.type !== "BF16" || coefficients.type !== "BF16" || base.type !== "BF16"
+      || !Number.isInteger(blockSize) || blockSize < 1 || rows % blockSize
+      || !Number.isInteger(groupSize) || groupSize < 1 || channels % groupSize
+      || (side !== 0 && side !== 1) || coefficients.shape.length !== 2
+      || coefficients.shape[0] !== rows || coefficients.shape[1] !== 4 * channels / groupSize
+      || base.numElements !== 4 * channels) {
+      throw new Error("Invalid DFlash2 two-tap convolution inputs");
+    }
+    return undefined as never;
+  }
+
   causalConv1d(convState: Tensor, input: Tensor, weight: Tensor, cuSeqlens: Tensor, convDim: number, totalSeqLen: number, kernelSize: number, batchSize: number, convStateStride: number, chStride: number, seqStride: number): void {
     if (cuSeqlens.type !== "I32") throw new Error(`causalConv1d: cuSeqlens must be I32, got ${cuSeqlens.type}`);
   }
@@ -612,6 +639,7 @@ export abstract class Tensor implements Disposable {
     }
   }
   rotaryEmbedding(positionIds: Tensor, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
+    if (this.type !== "BF16" && this.type !== "F32") throw new Error("rotaryEmbedding: expected BF16/F32 inverse frequencies");
     if (positionIds.type !== "I32") throw new Error(`rotaryEmbedding: positionIds must be I32, got ${positionIds.type}`);
     if (positionIds.shape[0] !== batch * seqLen) throw new Error(`rotaryEmbedding: positionIds shape[0]=${positionIds.shape[0]} != batch*seqLen=${batch * seqLen}`);
     return undefined as never;

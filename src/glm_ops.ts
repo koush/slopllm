@@ -328,6 +328,24 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
+  dflash2Select(ids: Tensor, logits: Tensor, predecessor: Tensor, successor: Tensor, anchors: Tensor, depth: number): { scores: Tensor, tokens: Tensor } {
+    super.dflash2Select(ids, logits, predecessor, successor, anchors, depth);
+    const k = ids.shape[1], batch = anchors.numElements;
+    const scores = this.workspace.alloc([this.shape[0], k, k], "F32");
+    const tokens = this.workspace.alloc([batch, depth], "I32");
+    getNativeAddon().dflash2Select(this.ops.ctx, scores.data, tokens.data, this.data, ids.data, logits.data,
+      predecessor.data, successor.data, anchors.data, batch, depth, k, this.shape[1], predecessor.shape[0]);
+    return { scores, tokens };
+  }
+
+  dflash2Conv(coefficients: Tensor, base: Tensor, blockSize: number, groupSize: number, side: number): Tensor {
+    super.dflash2Conv(coefficients, base, blockSize, groupSize, side);
+    const out = this.workspace.alloc(this.shape, this.type);
+    getNativeAddon().dflash2Conv(this.ops.ctx, out.data, this.data, coefficients.data, base.data,
+      this.shape[0], this.shape[1], blockSize, groupSize, side);
+    return out;
+  }
+
   rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number): void {
     super.rmsnormGated(input, gate, weight, eps);
     const dim = input.shape[1];
@@ -419,9 +437,9 @@ export class GlmTensor extends Tensor {
     const dimHalf = this.shape[0];
     const hd = dimHalf * 2;
     using reshaped = positionIds.reshape([batch, seqLen]);
-    const cos = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
-    const sin = positionIds.workspace.alloc([batch, seqLen, hd], this.type);
-    getNativeAddon().rotaryEmbedding(this.ops.ctx, cos.data, sin.data, this.data, reshaped.data, dimHalf, batch, seqLen);
+    const cos = positionIds.workspace.alloc([batch, seqLen, hd], "BF16");
+    const sin = positionIds.workspace.alloc([batch, seqLen, hd], "BF16");
+    getNativeAddon().rotaryEmbedding(this.ops.ctx, cos.data, sin.data, this.data, reshaped.data, dimHalf, batch, seqLen, this.type === "F32");
     return { cos, sin };
   }
 
@@ -1710,7 +1728,7 @@ const srcOps = (copies[0].src as GlmTensor).ops;
 
   batchPrefillPagedRun(state: ExecutionState, q: Tensor, o: Tensor, kData: Tensor, vData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, qIndptrD: Tensor, planInfo: Tensor, numQoHeads: number, numKvHeads: number, headDim: number, qStrideN: number, qStrideH: number, maskMode: MaskMode, smScale: number): void {
     const pageSize = kData.shape[1] / (numKvHeads * headDim);
-    getNativeAddon().batchPrefillPagedRun(this.ctx, ptr(q), ptr(o), ptr(kData), ptr(vData), ptr(indices), ptr(indptrD), ptr(lastPageLen), ptr(floatWs), ptr(intWs), ptr(qIndptrD), ptr(planInfo), state.totalTokens, state.batchSize, numQoHeads, numKvHeads, headDim, pageSize, qStrideN, qStrideH, maskMode, smScale);
+    getNativeAddon().batchPrefillPagedRun(this.ctx, ptr(q), ptr(o), ptr(kData), ptr(vData), ptr(indices), ptr(indptrD), ptr(lastPageLen), ptr(floatWs), ptr(intWs), ptr(qIndptrD), ptr(planInfo), state.totalTokens, state.batchSize, numQoHeads, numKvHeads, headDim, pageSize, qStrideN, qStrideH, maskMode, smScale, state.customMask?.windowLeft ?? -1);
   }
 
   batchPrefillRaggedPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, kvIndptrH: Tensor, totalQoRows: number, batchSize: number, numQoHeads: number, numKvHeads: number, headDim: number, maskMode: MaskMode): void {

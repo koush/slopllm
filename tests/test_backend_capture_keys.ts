@@ -47,6 +47,21 @@ test("capture lookup incorporates each state's backend launch keys", () => {
   assert.equal(lookup(16384).filter(key => String(key).includes("sparseMlaChunksPerBlock:")).length, 16);
 });
 
+test("standard attention graphs distinguish mask and sliding-window modes", () => {
+  const { ops, state } = fixture();
+  const manager = new CaptureManager(ops);
+  let keys: unknown[] = [];
+  manager.isCaptured = params => { keys = params; return false; };
+  const lookup = (mode: number, windowLeft: number) => {
+    const planned = Object.assign(state(4096, 8, false, false), { customMask: { mode, windowLeft } });
+    manager.isStateCaptured({ key: ["draft"], inputs: {}, states: [planned] });
+    return keys;
+  };
+  assert.notDeepEqual(lookup(0, -1), lookup(1, -1));
+  assert.notDeepEqual(lookup(0, -1), lookup(0, 2047));
+  assert.deepEqual(lookup(0, 2047), lookup(0, 2047));
+});
+
 test("device capture keys own dispatch and ParallelOps preserves each device's decision", () => {
   const { ops, state } = fixture();
   const s = state(16384);

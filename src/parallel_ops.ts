@@ -1434,6 +1434,28 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, shardOuts, [batchSize, convDim], this.type, parallelism);
   }
 
+  dflash2Select(ids: Tensor, logits: Tensor, predecessor: Tensor, successor: Tensor, anchors: Tensor, depth: number): { scores: Tensor, tokens: Tensor } {
+    super.dflash2Select(ids, logits, predecessor, successor, anchors, depth);
+    const args = [ids, logits, predecessor, successor, anchors].map(t => this.cast(t));
+    for (const t of [this, ...args]) this.assertParallel("dflash2Select", t, TensorParallelism.Replicated);
+    const results = this.shards.map((gate, i) => gate.dflash2Select(args[0].shards[i], args[1].shards[i],
+      args[2].shards[i], args[3].shards[i], args[4].shards[i], depth));
+    const wrap = (key: "scores" | "tokens", shape: number[], type: string) =>
+      this.parallelOps.wrapShards(this.workspace, results.map(r => r[key]), shape, type, TensorParallelism.Replicated);
+    return { scores: wrap("scores", [this.shape[0], ids.shape[1], ids.shape[1]], "F32"), tokens: wrap("tokens", [anchors.numElements, depth], "I32") };
+  }
+
+  dflash2Conv(coefficients: Tensor, base: Tensor, blockSize: number, groupSize: number, side: number): Tensor {
+    super.dflash2Conv(coefficients, base, blockSize, groupSize, side);
+    const pc = this.cast(coefficients);
+    const pb = this.cast(base);
+    this.assertParallel("dflash2Conv input", this, TensorParallelism.Replicated, TensorParallelism.PartialSum);
+    this.assertParallel("dflash2Conv coefficients", pc, TensorParallelism.Replicated);
+    this.assertParallel("dflash2Conv base", pb, TensorParallelism.Replicated);
+    const shards = this.shards.map((x, i) => x.dflash2Conv(pc.shards[i], pb.shards[i], blockSize, groupSize, side));
+    return this.parallelOps.wrapShards(this.workspace, shards, this.shape, this.type, this.parallelism);
+  }
+
   rmsnormGated(input: Tensor, gate: Tensor, weight: Tensor, eps: number): void {
     super.rmsnormGated(input, gate, weight, eps);
     const pInput = input as ParallelTensor;
@@ -2187,8 +2209,8 @@ export class ParallelTensor extends Tensor {
       sinShards.push(result.sin);
     }
     const hd = dimHalf * 2;
-    const cos = this.parallelOps.wrapShards(pPositionIds.workspace, cosShards, [batch, seqLen, hd], this.type, TensorParallelism.Replicated);
-    const sin = this.parallelOps.wrapShards(pPositionIds.workspace, sinShards, [batch, seqLen, hd], this.type, TensorParallelism.Replicated);
+    const cos = this.parallelOps.wrapShards(pPositionIds.workspace, cosShards, [batch, seqLen, hd], "BF16", TensorParallelism.Replicated);
+    const sin = this.parallelOps.wrapShards(pPositionIds.workspace, sinShards, [batch, seqLen, hd], "BF16", TensorParallelism.Replicated);
     return { cos, sin };
   }
 

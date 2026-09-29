@@ -1733,10 +1733,11 @@ void glm_index_add(GlmCtx* ctx, void* out, const int* indices, const void* value
 // inv_freq: [dim_half], position_ids: [batch, seq_len] (int32)
 // ---------------------------------------------------------------------------
 
+template <typename Freq>
 __global__ void __launch_bounds__(256, 4) rotary_embedding_kernel(
     __nv_bfloat16* cos_out,
     __nv_bfloat16* sin_out,
-    const __nv_bfloat16* inv_freq,
+    const Freq* inv_freq,
     const int* position_ids,
     int dim_half,
     int seq_len,
@@ -1749,7 +1750,7 @@ __global__ void __launch_bounds__(256, 4) rotary_embedding_kernel(
         int d = idx % dim;
         int s = (idx / dim) % seq_len;
         int b = idx / (seq_len * dim);
-        float freq = __bfloat162float(inv_freq[d % dim_half]) *
+        float freq = float(inv_freq[d % dim_half]) *
                      (float)position_ids[b * seq_len + s];
         float cos_val, sin_val;
         sincosf(freq, &sin_val, &cos_val);
@@ -1770,6 +1771,15 @@ void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
         (__nv_bfloat16*)cos_out, (__nv_bfloat16*)sin_out,
         (const __nv_bfloat16*)inv_freq, position_ids,
         dim_half, seq_len, batch);
+}
+
+void glm_rotary_embedding_f32(GlmCtx* ctx, void* cos_out, void* sin_out,
+    const void* inv_freq, const int* position_ids, int dim_half, int batch, int seq_len) {
+    cudaSetDevice(ctx->device_id);
+    int total = batch * seq_len * dim_half * 2;
+    rotary_embedding_kernel<<<(total + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
+        static_cast<__nv_bfloat16*>(cos_out), static_cast<__nv_bfloat16*>(sin_out),
+        static_cast<const float*>(inv_freq), position_ids, dim_half, seq_len, batch);
 }
 
 // ---------------------------------------------------------------------------

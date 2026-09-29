@@ -185,6 +185,8 @@ void glm_index_add(GlmCtx* ctx, void* out, const int* indices, const void* value
 void glm_rotary_embedding(GlmCtx* ctx, void* cos_out, void* sin_out,
                           const void* inv_freq, const int* position_ids,
                           int dim_half, int batch, int seq_len);
+void glm_rotary_embedding_f32(GlmCtx* ctx, void* cos_out, void* sin_out,
+    const void* inv_freq, const int* position_ids, int dim_half, int batch, int seq_len);
 
 void glm_apply_rotary_pos_emb(GlmCtx* ctx, void* out, const void* x,
                               const void* cos, const void* sin,
@@ -577,6 +579,21 @@ void glm_batch_prefill_paged_run(
     uint32_t page_size,
     int32_t q_stride_n, int32_t q_stride_h,
     int mask_mode, float sm_scale);
+
+void glm_batch_prefill_paged_run_window(
+    GlmCtx* ctx, void* q, void* o, void* k_data, void* v_data,
+    int32_t* indices, int32_t* indptr_d, int32_t* last_page_len,
+    void* float_ws, void* int_ws, int32_t* q_indptr_d, int64_t* plan_info,
+    uint32_t total_qo_rows, uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size,
+    int32_t q_stride_n, int32_t q_stride_h, int mask_mode, float sm_scale, int window_left);
+
+void glm_dflash2_conv(GlmCtx* ctx, void* out, const void* input,
+    const void* coefficients, const void* base, int rows, int channels,
+    int block_size, int group_size, int side);
+void glm_dflash2_select(GlmCtx* ctx, float* scores, int* tokens, const void* gates,
+    const int* candidates, const float* logits, const void* predecessor,
+    const void* successor, const int* anchors, int batch, int depth, int top_k, int rank, int vocab);
 
 void glm_batch_prefill_ragged_plan(
     GlmCtx* ctx,

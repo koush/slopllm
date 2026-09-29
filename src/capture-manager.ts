@@ -1,5 +1,5 @@
 import { Tensor } from "./tensor";
-import { type DeviceOps } from "./device_ops";
+import { MaskMode, type DeviceOps } from "./device_ops";
 import type { WorkspaceBase } from "./workspace";
 import { mapTensors, type TensorTree } from "./tensor-tree";
 import type { ExecutionManager, ExecutionOptions, ExecutionResult } from "./execution-manager";
@@ -54,6 +54,7 @@ export class CaptureManager implements Disposable, ExecutionManager {
     private stateKeys(states: readonly ExecutionState[], key: readonly (string | number)[]) {
         const params = [...key];
         for (const state of states) params.push(`batchSize:${state.batchSize}`, `totalTokens:${state.totalTokens}`,
+            `mask:${state.customMask?.mode ?? MaskMode.Causal}`, `windowLeft:${state.customMask?.windowLeft ?? -1}`,
             ...this.ops.getCaptureKeys(state));
         const base = params.join(",");
         if (this.getLengthVariant(base).kvLen) {

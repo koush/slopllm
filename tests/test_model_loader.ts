@@ -5,6 +5,19 @@ import { parseLoaderArgs, parseWorkerCommand, validateWorkerModelArgs, workerEnv
 import { parseModelArgs } from "../src/model_cli";
 
 describe("model loader arguments", () => {
+  it("loads a standalone DFlash2 workspace and rejects target-model flags", () => {
+    const args = parseModelArgs(["--dflash2", "--arena", "8", "--gpus", "0,1"]);
+    assert.equal(args.useDflash2, true);
+    assert.equal(args.useGlm51, false);
+    assert.equal(parseModelArgs(["--dflash2"]).arena, 0);
+    for (const flag of ["--glm51", "--qwen3", "--qwen35", "--cp", "--mtp", "--fp8", "--nvfp4"]) {
+      assert.throws(() => parseModelArgs(["--dflash2", flag]));
+      assert.throws(() => parseModelArgs([flag, "--dflash2"]));
+    }
+    validateWorkerModelArgs(["--dflash2", "--arena", "8", "--gpus", "0,1", "--layerwise"], args);
+    assert.throws(() => validateWorkerModelArgs(["--qwen3", "--arena", "8", "--gpus", "0,1"], args), /cannot override/);
+  });
+
   it("allows startup without an executor command", () => {
     const args = parseLoaderArgs([
       "--control-host", "0.0.0.0",

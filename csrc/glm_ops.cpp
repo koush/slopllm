@@ -844,7 +844,9 @@ static Napi::Value RotaryEmbedding(const Napi::CallbackInfo& info) {
     int dim_half = info[5].As<Napi::Number>().Int32Value();
     int batch = info[6].As<Napi::Number>().Int32Value();
     int seq_len = info[7].As<Napi::Number>().Int32Value();
-    glm_rotary_embedding(reinterpret_cast<GlmCtx*>(ctx_ptr),
+    auto rotary = info.Length() > 8 && info[8].As<Napi::Boolean>().Value()
+        ? glm_rotary_embedding_f32 : glm_rotary_embedding;
+    rotary(reinterpret_cast<GlmCtx*>(ctx_ptr),
                          reinterpret_cast<void*>(cos_ptr),
                          reinterpret_cast<void*>(sin_ptr),
                          reinterpret_cast<const void*>(inv_ptr),
@@ -2288,7 +2290,7 @@ static Napi::Value BatchPrefillPagedPlan(const Napi::CallbackInfo& info) {
 
 static Napi::Value BatchPrefillPagedRun(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 21) {
+    if (info.Length() < 22) {
         Napi::TypeError::New(env, "Expected (ctx, q, o, k_data, v_data, indices, indptr_d, last_page_len, float_ws, int_ws, q_indptr_d, plan_info, total_qo_rows, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, q_stride_n, q_stride_h, mask_mode, sm_scale)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -2314,7 +2316,7 @@ static Napi::Value BatchPrefillPagedRun(const Napi::CallbackInfo& info) {
     int32_t q_stride_h = info[19].As<Napi::Number>().Int32Value();
     int mask_mode = info[20].As<Napi::Number>().Int32Value();
     float sm_scale = info[21].As<Napi::Number>().FloatValue();
-    glm_batch_prefill_paged_run(
+    glm_batch_prefill_paged_run_window(
         reinterpret_cast<GlmCtx*>(ctx_ptr),
         reinterpret_cast<void*>(q_ptr), reinterpret_cast<void*>(o_ptr),
         reinterpret_cast<void*>(k_data_ptr), reinterpret_cast<void*>(v_data_ptr),
@@ -2327,7 +2329,7 @@ static Napi::Value BatchPrefillPagedRun(const Napi::CallbackInfo& info) {
         total_qo_rows, batch_size,
         num_qo_heads, num_kv_heads, head_dim, page_size,
         q_stride_n, q_stride_h,
-        mask_mode, sm_scale);
+        mask_mode, sm_scale, info.Length() > 22 ? info[22].As<Napi::Number>().Int32Value() : -1);
     {
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -3207,6 +3209,36 @@ static Napi::Value CausalConv1dUpdate(const Napi::CallbackInfo& info) {
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("causalConv1dUpdate failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }
+    return env.Undefined();
+}
+
+static Napi::Value Dflash2Select(const Napi::CallbackInfo& info) {
+    auto env = info.Env();
+    if (info.Length() != 14) {
+        Napi::TypeError::New(env, "Expected 14 DFlash2 selector arguments").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto ptr = [&](int i) { return reinterpret_cast<void*>(info[i].As<Napi::Number>().Int64Value()); };
+    auto val = [&](int i) { return info[i].As<Napi::Number>().Int32Value(); };
+    glm_dflash2_select(static_cast<GlmCtx*>(ptr(0)), static_cast<float*>(ptr(1)), static_cast<int*>(ptr(2)),
+        ptr(3), static_cast<int*>(ptr(4)), static_cast<float*>(ptr(5)), ptr(6), ptr(7),
+        static_cast<int*>(ptr(8)), val(9), val(10), val(11), val(12), val(13));
+    auto err = cudaGetLastError();
+    if (err != cudaSuccess) Napi::Error::New(env, cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    return env.Undefined();
+}
+
+static Napi::Value Dflash2Conv(const Napi::CallbackInfo& info) {
+    auto env = info.Env();
+    if (info.Length() != 10) {
+        Napi::TypeError::New(env, "Expected ctx, out, input, coefficients, base, rows, channels, blockSize, groupSize, side").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto ptr = [&](int i) { return reinterpret_cast<void*>(info[i].As<Napi::Number>().Int64Value()); };
+    auto val = [&](int i) { return info[i].As<Napi::Number>().Int32Value(); };
+    glm_dflash2_conv(static_cast<GlmCtx*>(ptr(0)), ptr(1), ptr(2), ptr(3), ptr(4), val(5), val(6), val(7), val(8), val(9));
+    auto err = cudaGetLastError();
+    if (err != cudaSuccess) Napi::Error::New(env, cudaGetErrorString(err)).ThrowAsJavaScriptException();
     return env.Undefined();
 }
 
@@ -4205,6 +4237,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "gdnPrefill"), Napi::Function::New(env, GdnPrefill));
     exports.Set(Napi::String::New(env, "causalConv1d"), Napi::Function::New(env, CausalConv1d));
     exports.Set(Napi::String::New(env, "causalConv1dUpdate"), Napi::Function::New(env, CausalConv1dUpdate));
+    exports.Set(Napi::String::New(env, "dflash2Conv"), Napi::Function::New(env, Dflash2Conv));
+    exports.Set(Napi::String::New(env, "dflash2Select"), Napi::Function::New(env, Dflash2Select));
     exports.Set(Napi::String::New(env, "rmsnormGated"), Napi::Function::New(env, RmsnormGated));
     exports.Set(Napi::String::New(env, "gateSigmoidMul"), Napi::Function::New(env, GateSigmoidMul));
     exports.Set(Napi::String::New(env, "cpMergeTree"), Napi::Function::New(env, CpMergeTree));

@@ -7,6 +7,7 @@ import { resolveModelPath } from "./model_path";
 import { ParallelOps, ParallelTensor } from "./parallel_ops";
 import { Qwen35Model } from "./qwen35_model";
 import { Qwen3Model } from "./qwen3_model";
+import { Dflash2Model, DFLASH2_REPO } from "./dflash2_model";
 
 export const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 export const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
@@ -23,6 +24,7 @@ export interface ModelCliArgs {
   modelDir: string | undefined;
   useQwen35: boolean;
   useGlm51: boolean;
+  useDflash2?: boolean;
   glm51Small: boolean;
   useFp8: boolean;
   useNvfp4: boolean;
@@ -68,6 +70,7 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     else if (a === "--qwen35") { args.useQwen35 = true; args.useGlm51 = false; qwen35Explicit = true; }
     else if (a === "--glm51") { args.useGlm51 = true; glm51Explicit = true; }
     else if (a === "--glm51-small") { args.useGlm51 = true; args.glm51Small = true; glm51Explicit = true; }
+    else if (a === "--dflash2") { args.useDflash2 = true; args.useGlm51 = false; }
     else if (a === "--fp8") { args.useFp8 = true; args.useGlm51 = false; }
     else if (a === "--nvfp4") args.useNvfp4 = true;
     else if (a === "--cp") args.cp = true;
@@ -78,6 +81,12 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     }
   }
 
+  if (args.useDflash2) {
+    if (glm51Explicit || qwen3Explicit || qwen35Explicit || args.useFp8 || args.useNvfp4 || args.cp || args.mtp) {
+      throw new Error("--dflash2 is a standalone BF16 TP draft; it cannot be combined with target-model, CP, or MTP flags");
+    }
+    args.useGlm51 = false;
+  }
   if (!args.arenaExplicit && args.useGlm51 && !args.glm51Small) args.arena = 92;
   if (args.gpus.length === 0 || args.gpus.some(gpu => !Number.isInteger(gpu) || gpu < 0)) {
     throw new Error(`Invalid GPU list: ${args.gpus.join(",")}`);
@@ -95,12 +104,14 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
 }
 
 export function modelLabel(args: ModelCliArgs): string {
+  if (args.useDflash2) return "GLM-5.3-DFlash2";
   if (args.useQwen35) return "Qwen3.5-0.8B";
   if (args.useGlm51) return args.glm51Small ? "GLM-5.1-small" : (args.useNvfp4 ? "GLM-5.1-NVFP4" : "GLM-5.1");
   return args.useFp8 ? "Qwen3-0.6B-FP8" : "Qwen3-0.6B";
 }
 
 export function resolveModelSelection(args: ModelCliArgs): { modelDir: string, repoId: string } {
+  if (args.useDflash2) return { modelDir: args.modelDir ?? resolveModelPath(DFLASH2_REPO), repoId: DFLASH2_REPO };
   const repoId = args.useGlm51 ? GLM51_REPO
     : args.useQwen35 ? QWEN35_REPO
       : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
@@ -119,11 +130,13 @@ export function createDeviceOps(args: ModelCliArgs): { ops: DeviceOps, gpuDevice
 }
 
 export async function loadModel(ops: DeviceOps, args: ModelCliArgs, modelDir: string): Promise<ChatModel> {
-  const model = await (args.useGlm51
-    ? Glm51Model.fromPretrained(ops, modelDir, args.cp, args.mtp > 0)
-    : args.useQwen35
-      ? Qwen35Model.fromPretrained(ops, modelDir)
-      : Qwen3Model.fromPretrained(ops, modelDir));
+  const model = await (args.useDflash2
+    ? Dflash2Model.fromPretrained(ops, modelDir)
+    : args.useGlm51
+      ? Glm51Model.fromPretrained(ops, modelDir, args.cp, args.mtp > 0)
+      : args.useQwen35
+        ? Qwen35Model.fromPretrained(ops, modelDir)
+        : Qwen3Model.fromPretrained(ops, modelDir));
   const devices = ops instanceof ParallelOps ? ops.devices : ops instanceof GlmOps ? [ops] : [];
   for (const device of devices) {
     const expected = process.env[`SLOPLLM_ARENA_LAYOUT_${device.device}`];

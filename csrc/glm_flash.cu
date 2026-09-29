@@ -56,15 +56,25 @@ cudaError_t dispatch_decode_work_est(
       batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
 }
 
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, flashinfer::MaskMode MASK_MODE>
-cudaError_t dispatch_batch_prefill_paged_run_inner(
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, flashinfer::MaskMode MASK_MODE, bool WINDOW>
+cudaError_t dispatch_batch_prefill_paged_run_window(
     flashinfer::BatchPrefillPagedParams<DType, DType, DTypeO, IdType>& params,
     DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream) {
   return flashinfer::BatchPrefillWithPagedKVCacheDispatched<
       CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENC, false, MASK_MODE,
-      AttentionVariant,
+      flashinfer::DefaultAttention<false, WINDOW, false, false>,
       flashinfer::BatchPrefillPagedParams<DType, DType, DTypeO, IdType>>(
       params, tmp_v, tmp_s, enable_pdl, stream);
+}
+
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, flashinfer::MaskMode MASK_MODE>
+cudaError_t dispatch_batch_prefill_paged_run_inner(
+    flashinfer::BatchPrefillPagedParams<DType, DType, DTypeO, IdType>& params,
+    DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream) {
+  if (params.window_left >= 0) {
+    return dispatch_batch_prefill_paged_run_window<CTA_TILE_Q, HEAD_DIM, MASK_MODE, true>(params, tmp_v, tmp_s, enable_pdl, stream);
+  }
+  return dispatch_batch_prefill_paged_run_window<CTA_TILE_Q, HEAD_DIM, MASK_MODE, false>(params, tmp_v, tmp_s, enable_pdl, stream);
 }
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, flashinfer::MaskMode MASK_MODE>
@@ -425,6 +435,19 @@ void glm_batch_prefill_paged_plan(
 }
 
 void glm_batch_prefill_paged_run(
+    GlmCtx* ctx, void* q, void* o, void* k_data, void* v_data,
+    int32_t* indices, int32_t* indptr_d, int32_t* last_page_len,
+    void* float_ws, void* int_ws, int32_t* q_indptr_d, int64_t* plan_info,
+    uint32_t total_qo_rows, uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size,
+    int32_t q_stride_n, int32_t q_stride_h, int mask_mode, float sm_scale) {
+  glm_batch_prefill_paged_run_window(ctx, q, o, k_data, v_data, indices,
+      indptr_d, last_page_len, float_ws, int_ws, q_indptr_d, plan_info,
+      total_qo_rows, batch_size, num_qo_heads, num_kv_heads, head_dim,
+      page_size, q_stride_n, q_stride_h, mask_mode, sm_scale, -1);
+}
+
+void glm_batch_prefill_paged_run_window(
     GlmCtx* ctx,
     void* q, void* o,
     void* k_data, void* v_data,
@@ -436,7 +459,7 @@ void glm_batch_prefill_paged_run(
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
     uint32_t page_size,
     int32_t q_stride_n, int32_t q_stride_h,
-    int mask_mode, float sm_scale) {
+    int mask_mode, float sm_scale, int window_left) {
 
   cudaSetDevice(ctx->device_id);
 
@@ -467,7 +490,7 @@ void glm_batch_prefill_paged_run(
       num_qo_heads,
       q_stride_n,
       q_stride_h,
-      -1, // window_left
+      window_left,
       0.0f, // logits_soft_cap
       sm_scale,
       1.0f, // rope_scale
