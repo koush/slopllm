@@ -26,13 +26,25 @@ export interface GpuCacheFlushResult {
   hostPagesUsed: number;
 }
 
+export interface HostCacheFlushResult {
+  hostPagesFreed: number;
+}
+
 interface GpuCacheFlushEvent {
   kind: "flush_gpu_cache";
   resolve: (result: GpuCacheFlushResult) => void;
   reject: (error: unknown) => void;
 }
 
-export type GenerationEvent = GenerationRequest | GpuCacheFlushEvent;
+interface HostCacheFlushEvent {
+  kind: "flush_host_cache";
+  resolve: (result: HostCacheFlushResult) => void;
+  reject: (error: unknown) => void;
+}
+
+export type CacheFlushEvent = GpuCacheFlushEvent | HostCacheFlushEvent;
+
+export type GenerationEvent = GenerationRequest | CacheFlushEvent;
 
 export interface ServerMetrics {
   runningRequests: number;
@@ -123,6 +135,23 @@ export class PrefixTierPolicy {
     const hostPagesUsed = this.host ? this.host.maxPages - this.host.availablePages.length : 0;
     console.log(`GPU cache flushed: freed-pages=${gpuPagesFreed} host-pages=${hostPagesUsed}`);
     return { gpuPagesFreed, hostPagesUsed };
+  }
+
+  /** Called by the scheduler with no active requests or open generators. */
+  async flushHostCache(): Promise<HostCacheFlushResult> {
+    const host = this.host;
+    if (!host) {
+      throw new Error("Host cache flush requires a host cache (--max-host-pages > 0)");
+    }
+    await this.ops.synchronizeAsync();
+    const hostPagesFreed = host.maxPages - host.availablePages.length;
+    // clearStaging releases staged page refs; reset(0) drops the remaining
+    // active slots and rebuilds the free list. Host pages are never shared
+    // with the device tier, so dropping every ref frees them all.
+    host.clearStaging();
+    host.reset(0);
+    console.log(`Host cache flushed: freed-pages=${hostPagesFreed}`);
+    return { hostPagesFreed };
   }
 
   /**
@@ -308,7 +337,7 @@ export class GenerationScheduler {
   private readonly admitted = new Set<GenerationRequest>();
   private readonly prefixes: PrefixTierPolicy;
   private nextStagingKey = 0;
-  private pendingFlush?: GpuCacheFlushEvent;
+  private pendingFlush?: CacheFlushEvent;
 
   constructor(private readonly options: SchedulerOptions) {
     this.prefixes = new PrefixTierPolicy(options.cache.getPagedKV(), options.model.ops, options.hostCache?.getPagedKV());
@@ -318,6 +347,15 @@ export class GenerationScheduler {
   flushGpuCache(): Promise<GpuCacheFlushResult> {
     return new Promise((resolve, reject) => {
       if (!this.options.requests.submit({ kind: "flush_gpu_cache", resolve, reject })) {
+        reject(new Error("Server is shutting down"));
+      }
+    });
+  }
+
+  /** Queue an admission barrier; resolves after existing requests finish and the host cache is flushed. */
+  flushHostCache(): Promise<HostCacheFlushResult> {
+    return new Promise((resolve, reject) => {
+      if (!this.options.requests.submit({ kind: "flush_host_cache", resolve, reject })) {
         reject(new Error("Server is shutting down"));
       }
     });
@@ -513,7 +551,11 @@ export class GenerationScheduler {
       if (!this.active.length && this.pendingFlush) {
         const flush = this.pendingFlush;
         try {
-          flush.resolve(await this.prefixes.flushGpuCache());
+          if (flush.kind === "flush_gpu_cache") {
+            flush.resolve(await this.prefixes.flushGpuCache());
+          } else {
+            flush.resolve(await this.prefixes.flushHostCache());
+          }
         } catch (error) {
           flush.reject(error);
           throw error;

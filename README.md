@@ -82,8 +82,13 @@ Start the server with `--max-host-pages <pages>` to enable pinned-host KV cachin
 After a completion, flush the GPU KV cache with:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/flush_gpu_cache
+curl -X POST http://127.0.0.1:8000/admin/flush_gpu_cache \
+  -H "Authorization: Bearer $ADMIN_API_KEY"
 ```
+
+The server must be started with `--admin-api-key <key>`; without it the
+endpoint returns 401. With `--api-key <key>`, all endpoints additionally
+require `Authorization: Bearer <key>`.
 
 The call waits for earlier generation requests to finish, offloads retained GPU
 prefixes to the host cache where capacity permits, and empties the GPU cache.
@@ -94,6 +99,17 @@ prefixes are discarded.
 Repeat the completion to exercise host restoration. Server output includes
 `Host cache hit` with matched token counts and `Host cache restore complete`
 with the restored prefix length and remaining prefill tokens.
+
+To discard all offloaded host prefixes, flush the pinned-host cache with:
+
+```bash
+curl -X POST http://127.0.0.1:8000/admin/flush_host_cache \
+  -H "Authorization: Bearer $ADMIN_API_KEY"
+```
+
+Like the GPU flush, it waits for earlier generation requests to finish. The
+response reports `hostPagesFreed`. It requires a host tier
+(`--max-host-pages <pages>`).
 
 For prompt/output diagnostics, set `GLM_CHAT_DEBUG=1` in the server environment.
 `Chat debug` log records include the exact prompt token IDs and decoded prompt,

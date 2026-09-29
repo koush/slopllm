@@ -44,6 +44,8 @@ interface ServerArgs extends ModelCliArgs {
   noCudaGraph: boolean;
   noMtp: boolean;
   phasedPrefill: boolean;
+  apiKey?: string;
+  adminApiKey?: string;
 }
 
 function parseArgs(argv: string[]): ServerArgs {
@@ -86,6 +88,8 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
     else if (a === "--no-mtp") args.noMtp = true;
     else if (a === "--phased-prefill") args.phasedPrefill = true;
+    else if (a === "--api-key" && i + 1 < argv.length) args.apiKey = argv[++i];
+    else if (a === "--admin-api-key" && i + 1 < argv.length) args.adminApiKey = argv[++i];
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
   }
   if (args.phasedPrefill && !args.useGlm51) {
@@ -128,6 +132,8 @@ Options:
   --mtp [int]                   MTP speculative decoding draft tokens (default: 3)
   --no-mtp                      Disable MTP decoding for an MTP-loaded model
   --phased-prefill              Overlap pairs of intermediate GLM-5.1 prefill chunks
+  --api-key <string>            Require this API key (Bearer token) on all endpoints
+  --admin-api-key <string>      Require this API key on /admin endpoints (enables them)
   --help, -h                    Show this help message
 `);
 }
@@ -293,6 +299,36 @@ function writeSSEDone(res: http.ServerResponse): void {
 function sendJSON(res: http.ServerResponse, statusCode: number, data: object): void {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  const ha = crypto.createHash("sha256").update(a).digest();
+  const hb = crypto.createHash("sha256").update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+function extractBearerToken(req: http.IncomingMessage): string | undefined {
+  const header = req.headers.authorization;
+  if (!header) return undefined;
+  const match = /^Bearer\s+(.*)$/i.exec(header);
+  return match?.[1]?.trim() || undefined;
+}
+
+function checkApiKey(req: http.IncomingMessage, expected: string): boolean {
+  const token = extractBearerToken(req);
+  return token !== undefined && timingSafeEqual(token, expected);
+}
+
+function sendUnauthorized(res: http.ServerResponse): void {
+  res.setHeader("WWW-Authenticate", "Bearer");
+  sendJSON(res, 401, {
+    error: {
+      message: "Invalid or missing API key",
+      type: "invalid_request_error",
+      param: "Authorization",
+      code: "invalid_api_key",
+    },
+  });
 }
 
 function sendMetrics(
@@ -896,16 +932,34 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
     res.setHeader("Access-Control-Allow-Origin", "*");
 
+    const isAdminEndpoint = url.pathname === "/admin" || url.pathname.startsWith("/admin/");
+    if (isAdminEndpoint && (args.adminApiKey === undefined || !checkApiKey(req, args.adminApiKey))) {
+      sendUnauthorized(res);
+      return;
+    }
+    if (args.apiKey !== undefined && !isAdminEndpoint && !checkApiKey(req, args.apiKey)) {
+      sendUnauthorized(res);
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
       void handleChatCompletions(req, res);
     } else if (req.method === "POST" && url.pathname === "/tokenize") {
       handleTokenize(req, res);
-    } else if (req.method === "POST" && url.pathname === "/flush_gpu_cache") {
+    } else if (req.method === "POST" && url.pathname === "/admin/flush_gpu_cache") {
       void scheduler.flushGpuCache().then(result => {
         sendJSON(res, 200, { status: "ok", ...result });
       }, error => {
         sendJSON(res, decodeQueue.ended ? 503 : 500, {
           error: { message: error instanceof Error ? error.message : "GPU cache flush failed", type: "server_error" },
+        });
+      });
+    } else if (req.method === "POST" && url.pathname === "/admin/flush_host_cache") {
+      void scheduler.flushHostCache().then(result => {
+        sendJSON(res, 200, { status: "ok", ...result });
+      }, error => {
+        sendJSON(res, decodeQueue.ended ? 503 : 500, {
+          error: { message: error instanceof Error ? error.message : "Host cache flush failed", type: "server_error" },
         });
       });
     } else if (req.method === "GET" && url.pathname === "/metrics") {
@@ -937,7 +991,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`OpenAI-compatible server running at http://${args.host}:${args.port}`);
     console.log(`  POST /v1/chat/completions  - Chat completions (streaming & non-streaming)`);
     console.log(`  POST /tokenize             - Tokenize chat messages`);
-    console.log(`  POST /flush_gpu_cache      - Wait for idle, offload retained prefixes, and flush GPU KV`);
+    console.log(`  POST /admin/flush_gpu_cache - Wait for idle, offload retained prefixes, and flush GPU KV (requires --admin-api-key)`);
+    console.log(`  POST /admin/flush_host_cache - Wait for idle and flush pinned-host KV (requires --admin-api-key)`);
     console.log(`  GET  /metrics              - Prometheus metrics`);
     console.log(`  GET  /v1/models            - List models`);
     console.log(`  GET  /version              - vLLM-compatible server version`);
@@ -946,6 +1001,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  MTP: ${args.mtp > 0 && !args.noMtp ? `enabled (draft tokens ${args.mtp})` : "disabled"}`);
     if (samplingWorkspace.mtpEnabled) console.log(`  MTP proposals: ${samplingWorkspace.retainProposalsOnGpu ? "GPU-resident" : "host baseline"} (GLM_MTP_GPU_PROPOSALS=0 selects host baseline)`);
     console.log(`  Phased prefill: ${args.phasedPrefill ? "enabled" : "disabled"}`);
+    console.log(`  API key: ${args.apiKey !== undefined ? "required" : "disabled"}`);
+    console.log(`  Admin API key: ${args.adminApiKey !== undefined ? "required for /admin endpoints" : "disabled (/admin endpoints return 401)"}`);
     console.log(`  Model: ${modelName}  |  GPU: ${args.gpus.join(",")}  |  chunk-size=${args.chunkSize}  |  batch-size=${args.batchSize}  |  max-pages=${args.maxPages}`);
   });
 
