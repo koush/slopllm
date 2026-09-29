@@ -472,7 +472,7 @@ export class MetaOps implements DeviceOps {
         const rows = q.shape[0];
         const headDim = q.shape.length === 3 ? q.shape[2] : 128;
         const nHeads = q.shape.length === 3 ? q.shape[1] : q.shape[1] / 128;
-        if (headDim !== 128 || nHeads !== 32 || process.env.GLM_INDEXER_DECODE_FP8_MMA === "0") {
+        if (headDim !== 128 || nHeads !== 32 || process.env.SLOPLLM_INDEXER_DECODE_FP8_MMA === "0") {
             return { q8: q.viewClone(), effectiveWeights: undefined };
         }
         const q8 = q.workspace.alloc([rows, nHeads, 128], "U8");

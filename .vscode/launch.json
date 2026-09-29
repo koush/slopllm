@@ -21,7 +21,7 @@
             "runtimeExecutable": "tsx",
             "console": "integratedTerminal",
             "env": {
-                "GLM_SKIP_MMAP_LOAD": "1"
+                "SLOPLLM_SKIP_MMAP_LOAD": "1"
             },
             "runtimeArgs": [
                 "${workspaceFolder}/src/run_qwen3_unified.ts",
@@ -82,7 +82,7 @@
             "runtimeExecutable": "tsx",
             "console": "integratedTerminal",
             "env": {
-                "GLM_SKIP_MMAP_LOAD": "1"
+                "SLOPLLM_SKIP_MMAP_LOAD": "1"
                 // "NCCL_DEBUG": "INFO",
             },
             "runtimeArgs": [

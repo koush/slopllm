@@ -8,7 +8,7 @@ describe("GlmTensor.transpose4d", () => {
   let ws: WorkspaceBase;
 
   before(() => {
-    ops = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+    ops = new GlmOps(parseInt(process.env.SLOPLLM_GPU ?? "0", 10));
     ws = new WorkspaceBase(ops);
   });
 

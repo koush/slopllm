@@ -173,7 +173,7 @@ export interface DeviceOps extends Disposable {
   // place. Returns q8 [rows, nHeads, 128] U8 and effectiveWeights
   // [rows, nHeads] F32 — the layout indexerTopk's FP8 path consumes — when
   // quantization is available (nHeads in the dispatch set and FP8 MMA not
-  // disabled by GLM_INDEXER_DECODE_FP8_MMA=0). Otherwise returns the identity
+  // disabled by SLOPLLM_INDEXER_DECODE_FP8_MMA=0). Otherwise returns the identity
   // fallback { q8: q.viewClone() (still BF16), effectiveWeights: undefined },
   // matching what the fused scorer would do for the same shape.
   indexerQuantizeQ(q: Tensor, weights: Tensor, scale: number, weightHeadOffset?: number): { q8: Tensor, effectiveWeights: Tensor | undefined };

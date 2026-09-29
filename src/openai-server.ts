@@ -407,7 +407,7 @@ function sendMetrics(
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const args = parseArgs(argv);
-  process.env.GLM_PHASED_PREFILL = args.phasedPrefill ? "1" : "0";
+  process.env.SLOPLLM_PHASED_PREFILL = args.phasedPrefill ? "1" : "0";
 
   const { modelDir, repoId: modelName } = resolveModelSelection(args);
 
@@ -458,7 +458,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const eosIds = model.eosIds;
 
   function logChatDebug(id: string, phase: string, tokenIds: number[], chatTemplateKwargs?: ChatTemplateKwargs): void {
-    if (process.env.GLM_CHAT_DEBUG !== "1") return;
+    if (process.env.SLOPLLM_CHAT_DEBUG !== "1") return;
     console.log(`Chat debug: ${JSON.stringify({
       id, phase, chatTemplateKwargs, tokenIds,
       text: tokenizer.decode(tokenIds, { skip_special_tokens: false, clean_up_tokenization_spaces: false }),

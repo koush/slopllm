@@ -46,7 +46,7 @@ Options:
   --help            Show this help
 
 Phased prefill is selected automatically for eligible chunks.
-Set GLM_PHASED_PREFILL=0 to disable it.`);
+Set SLOPLLM_PHASED_PREFILL=0 to disable it.`);
       process.exit(0);
     }
   }
@@ -105,7 +105,7 @@ async function main(): Promise<void> {
     using ws = new ExecutionWorkspace(ops, 1, Math.min(args.chunkSize, args.seqLen));
     const inputIds = new Array<number>(args.seqLen).fill(1);
 
-    console.log(`GLM-5.1 Prefill | GPUs ${modelArgs.gpus.join(",")} | seq_len=${args.seqLen} | chunk_size=${args.chunkSize} | cp=${modelArgs.cp} | mtp=${modelArgs.mtp} | phased=${process.env.GLM_PHASED_PREFILL !== "0"}`);
+    console.log(`GLM-5.1 Prefill | GPUs ${modelArgs.gpus.join(",")} | seq_len=${args.seqLen} | chunk_size=${args.chunkSize} | cp=${modelArgs.cp} | mtp=${modelArgs.mtp} | phased=${process.env.SLOPLLM_PHASED_PREFILL !== "0"}`);
     console.log(`max_pages=${maxPages} | warmup=${args.warmupRuns} | runs=${args.benchRuns}`);
 
     for (let run = 0; run < args.warmupRuns + args.benchRuns; run++) {

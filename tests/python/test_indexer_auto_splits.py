@@ -54,7 +54,7 @@ def test_auto_selector_replay_lengths(glm, device, topk):
 def test_auto_scorer_replay_lengths(glm, device, monkeypatch, layout, fp8, masked):
     if fp8 and torch.cuda.get_device_capability(device)[0] < 12:
         pytest.skip("FP8 MMA requires SM120")
-    monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "1" if fp8 else "0")
+    monkeypatch.setenv("SLOPLLM_INDEXER_DECODE_FP8_MMA", "1" if fp8 else "0")
     torch.manual_seed(928)
     rows, heads, dim, page_size, capacity, topk = 4, 32, 128, 64, 65536, 2048
     q = torch.randn(rows, heads, dim, dtype=torch.bfloat16, device=device)

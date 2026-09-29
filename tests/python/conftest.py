@@ -7,7 +7,7 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 from helpers import GlmOps, ATOL, RTOL
 
-GPU_ID = int(os.environ.get("GLM_GPU", "0"))
+GPU_ID = int(os.environ.get("SLOPLLM_GPU", "0"))
 
 
 @pytest.fixture(scope="session")

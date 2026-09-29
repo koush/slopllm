@@ -7,7 +7,7 @@ describe("dtype-aware tensor fill", () => {
   let ops: GlmOps;
   let ws: WorkspaceBase;
   before(() => {
-    ops = new GlmOps(Number(process.env.GLM_GPU ?? 0));
+    ops = new GlmOps(Number(process.env.SLOPLLM_GPU ?? 0));
     ws = new WorkspaceBase(ops);
   });
   after(() => {

@@ -5,7 +5,7 @@ rank-major merge candidates are built before timing; no model weights or peer
 GPUs are required.
 
 Examples:
-  GLM_GPU=0 python bench_indexer_decode.py
+  SLOPLLM_GPU=0 python bench_indexer_decode.py
   python bench_indexer_decode.py --batch 1,8 --kv-lens 32768,131072 --cp-world-size 8
   nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
     --capture-range=cudaProfilerApi --capture-range-end=stop \
@@ -371,7 +371,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--gpu", type=int, default=int(os.environ.get("GLM_GPU", "0")))
+    parser.add_argument("--gpu", type=int, default=int(os.environ.get("SLOPLLM_GPU", "0")))
     parser.add_argument(
         "--profile", action="store_true",
         help="capture the largest matrix case with the CUDA profiler API",

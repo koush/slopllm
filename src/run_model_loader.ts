@@ -100,7 +100,7 @@ export function parseWorkerCommand(value: unknown, sharedArgs: string[], previou
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || (value !== null && (typeof value !== "string" || value.includes("\0")))) {
         throw new Error(`Invalid executor environment variable: ${name}`);
       }
-      if (/^GLM_(ARENA_IPC_HANDLE_|ARENA_LAYOUT_|MODEL_LAYOUT_)/.test(name) || ["GLM_SKIP_MMAP_LOAD", "GLM_MODEL_LOAD_REPLAY"].includes(name)) {
+      if (/^SLOPLLM_(ARENA_IPC_HANDLE_|ARENA_LAYOUT_|MODEL_LAYOUT_)/.test(name) || ["SLOPLLM_SKIP_MMAP_LOAD", "SLOPLLM_MODEL_LOAD_REPLAY"].includes(name)) {
         throw new Error(`Cannot override loader-managed environment variable: ${name}`);
       }
     }
@@ -171,12 +171,12 @@ async function main(): Promise<void> {
   const modelLayouts = modelArenaLayoutSignatures(runtime.model, runtime.gpuDevices);
   for (const device of runtime.gpuDevices) {
     if (device.arenaBase === undefined) throw new Error(`GPU ${device.device} did not create an arena`);
-    process.env[`GLM_ARENA_IPC_HANDLE_${device.device}`] = device.exportArenaIpcHandle().toString("base64");
-    process.env[`GLM_ARENA_LAYOUT_${device.device}`] = device.arenaLayoutSignature();
-    process.env[`GLM_MODEL_LAYOUT_${device.device}`] = modelLayouts.get(device.device);
+    process.env[`SLOPLLM_ARENA_IPC_HANDLE_${device.device}`] = device.exportArenaIpcHandle().toString("base64");
+    process.env[`SLOPLLM_ARENA_LAYOUT_${device.device}`] = device.arenaLayoutSignature();
+    process.env[`SLOPLLM_MODEL_LAYOUT_${device.device}`] = modelLayouts.get(device.device);
   }
-  process.env.GLM_SKIP_MMAP_LOAD = "1";
-  process.env.GLM_MODEL_LOAD_REPLAY = "1";
+  process.env.SLOPLLM_SKIP_MMAP_LOAD = "1";
+  process.env.SLOPLLM_MODEL_LOAD_REPLAY = "1";
   console.log(`Model loaded from ${runtime.modelDir}`);
 
   let worker: ChildProcess | null = null;

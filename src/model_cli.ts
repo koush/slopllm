@@ -39,7 +39,7 @@ export interface ModelRuntime {
 }
 
 export function parseModelArgs(argv: string[]): ModelCliArgs {
-  const gpusEnv = process.env.GLM_GPU ?? "0";
+  const gpusEnv = process.env.SLOPLLM_GPU ?? "0";
   const args: ModelCliArgs = {
     gpus: gpusEnv.split(",").map(s => parseInt(s.trim(), 10)),
     arena: 0,
@@ -118,16 +118,16 @@ export async function loadModel(ops: DeviceOps, args: ModelCliArgs, modelDir: st
       : Qwen3Model.fromPretrained(ops, modelDir));
   const devices = ops instanceof ParallelOps ? ops.devices : ops instanceof GlmOps ? [ops] : [];
   for (const device of devices) {
-    const expected = process.env[`GLM_ARENA_LAYOUT_${device.device}`];
+    const expected = process.env[`SLOPLLM_ARENA_LAYOUT_${device.device}`];
     const actual = device.arenaLayoutSignature();
     if (expected !== undefined && actual !== expected) {
       throw new Error(`Arena replay layout mismatch on device ${device.device}: expected ${expected}, got ${actual}`);
     }
   }
-  if (devices.some(device => process.env[`GLM_MODEL_LAYOUT_${device.device}`] !== undefined)) {
+  if (devices.some(device => process.env[`SLOPLLM_MODEL_LAYOUT_${device.device}`] !== undefined)) {
     const modelLayouts = modelArenaLayoutSignatures(model, devices);
     for (const device of devices) {
-      const expected = process.env[`GLM_MODEL_LAYOUT_${device.device}`];
+      const expected = process.env[`SLOPLLM_MODEL_LAYOUT_${device.device}`];
       const actual = modelLayouts.get(device.device);
       if (expected !== undefined && actual !== expected) {
         throw new Error(`Model arena layout mismatch on device ${device.device}: expected ${expected}, got ${actual}`);

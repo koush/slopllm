@@ -82,7 +82,7 @@ def decode_case(device):
 def test_decode_fp8_mma_default_scores_and_topk(glm, device, decode_case, monkeypatch, layout):
     if torch.cuda.get_device_capability(device)[0] < 12:
         pytest.skip("SM120 required")
-    monkeypatch.delenv("GLM_INDEXER_DECODE_FP8_MMA", raising=False)
+    monkeypatch.delenv("SLOPLLM_INDEXER_DECODE_FP8_MMA", raising=False)
     (q, weights, rows, row_scales, paged, paged_scales, flat, flat_scales,
      pi, pip, lpl, qoi, flat_indptr) = decode_case
     k_data = paged if layout == "paged" else flat
@@ -102,7 +102,7 @@ def test_decode_fp8_mma_default_scores_and_topk(glm, device, decode_case, monkey
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_decode_fp8_mma_kill_switch_uses_scalar(glm, device, decode_case, monkeypatch):
-    monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "0")
+    monkeypatch.setenv("SLOPLLM_INDEXER_DECODE_FP8_MMA", "0")
     (q, weights, rows, row_scales, paged, paged_scales, _, _, pi, pip, lpl,
      qoi, _) = decode_case
     out, _, scores, row_len = _run(
@@ -119,7 +119,7 @@ def test_decode_fp8_mma_kill_switch_uses_scalar(glm, device, decode_case, monkey
 def test_decode_fp8_mma_multi_query_causal(glm, device, decode_case, monkeypatch):
     if torch.cuda.get_device_capability(device)[0] < 12:
         pytest.skip("SM120 required")
-    monkeypatch.delenv("GLM_INDEXER_DECODE_FP8_MMA", raising=False)
+    monkeypatch.delenv("SLOPLLM_INDEXER_DECODE_FP8_MMA", raising=False)
     (_, _, rows, row_scales, paged, paged_scales, _, _, pi, pip, lpl, _, _) = decode_case
     total_q, topk, length = 4, 23, rows.shape[0]
     q = torch.randn(total_q, 32, 128, dtype=torch.bfloat16, device=device)
@@ -156,7 +156,7 @@ def test_decode_fp8_mma_multi_query_causal(glm, device, decode_case, monkeypatch
 def test_decode_fp8_mma_cp_partial_page_and_mask(glm, device, monkeypatch):
     if torch.cuda.get_device_capability(device)[0] < 12:
         pytest.skip("SM120 required")
-    monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "1")
+    monkeypatch.setenv("SLOPLLM_INDEXER_DECODE_FP8_MMA", "1")
     torch.manual_seed(7123)
     world_size, rank, page_size, length = 8, 5, 8, 17
     rows, row_scales = pack_indexer_k(torch.randn(length, 128, dtype=torch.bfloat16, device=device))
@@ -200,7 +200,7 @@ def test_decode_fp8_mma_production_cp_geometry(
 ):
     if torch.cuda.get_device_capability(device)[0] < 12:
         pytest.skip("SM120 required")
-    monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "1")
+    monkeypatch.setenv("SLOPLLM_INDEXER_DECODE_FP8_MMA", "1")
     torch.manual_seed(8100 + rank)
     world_size, page_size, max_pages = 8, 64, 512
     global_page_size = world_size * page_size

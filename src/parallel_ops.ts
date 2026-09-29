@@ -11,12 +11,12 @@ import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 
 // Fall back to the read-based (pull) CP merge; the push path is the default.
-export const CP_MERGE_PULL = process.env.GLM_CP_MERGE_PULL === "1";
+export const CP_MERGE_PULL = process.env.SLOPLLM_CP_MERGE_PULL === "1";
 // The owner-merge path emits positions ordered by (P % W, P / W) rather than
 // by global position P, which is acceptable to everything downstream. An
 // opt-in index sort existed as a diagnostic (bit-identical parity with the
 // replicated-kData build) but cost ~9% of decode throughput and was removed.
-export const CP_TOPK_OWNER_MERGE = process.env.GLM_CP_TOPK_OWNER_MERGE !== "0";
+export const CP_TOPK_OWNER_MERGE = process.env.SLOPLLM_CP_TOPK_OWNER_MERGE !== "0";
 
 export class ParallelTensor extends Tensor {
   parallelism: TensorParallelism;
@@ -2380,7 +2380,7 @@ export class ParallelOps implements DeviceOps {
     // Enable P2P peer access early, before model weights are loaded,
     // to avoid VA-space fragmentation that can cause cudaDeviceEnablePeerAccess
     // to fail with cudaErrorMemoryAllocation on large models.
-    this.p2pEnabled = process.env.GLM_DISABLE_P2P_ALLREDUCE !== "1" && devices.length > 1;
+    this.p2pEnabled = process.env.SLOPLLM_DISABLE_P2P_ALLREDUCE !== "1" && devices.length > 1;
     // Open every imported arena in every reader context before model replay.
     // CUDA IPC mappings are context-local and may have a different base in each
     // context, so direct peer kernels need translated pointers.
@@ -2412,13 +2412,13 @@ export class ParallelOps implements DeviceOps {
             bases[reader][owner] = ownerDevice.arenaBase;
             continue;
           }
-          const encoded = process.env[`GLM_ARENA_IPC_HANDLE_${ownerDevice.device}`];
+          const encoded = process.env[`SLOPLLM_ARENA_IPC_HANDLE_${ownerDevice.device}`];
           if (encoded === undefined) {
-            throw new Error(`Missing GLM_ARENA_IPC_HANDLE_${ownerDevice.device}`);
+            throw new Error(`Missing SLOPLLM_ARENA_IPC_HANDLE_${ownerDevice.device}`);
           }
           const handle = Buffer.from(encoded, "base64");
           if (handle.length !== 64) {
-            throw new Error(`Invalid GLM_ARENA_IPC_HANDLE_${ownerDevice.device}`);
+            throw new Error(`Invalid SLOPLLM_ARENA_IPC_HANDLE_${ownerDevice.device}`);
           }
           const base = addon.cudaIpcOpenMemHandle(this.devices[reader].ctx, handle);
           if (!Number.isSafeInteger(base) || base <= 0) {

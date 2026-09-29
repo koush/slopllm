@@ -66,7 +66,7 @@ def _assert_topk_scores(out, out_scores, scores, valid, topk):
 def test_prefill_fp8_mma_default_scores_and_topk(glm, device, monkeypatch, flat):
     if torch.cuda.get_device_capability(device)[0] < 12:
         pytest.skip("SM120 required")
-    monkeypatch.delenv("GLM_INDEXER_DECODE_FP8_MMA", raising=False)
+    monkeypatch.delenv("SLOPLLM_INDEXER_DECODE_FP8_MMA", raising=False)
     q, weights, rows, row_scales, out, out_scores, scores, row_len, topk = _run_prefill(
         glm, device, flat, causal=True,
     )
@@ -88,9 +88,9 @@ def test_prefill_fp8_mma_default_tma_swizzle_matches_retained_kernel(glm, device
     if torch.cuda.get_device_capability(device)[0] < 12:
         pytest.skip("SM120 required")
 
-    monkeypatch.setenv("GLM_INDEXER_PREFILL_FP8_CONFIG", "q32_k256_w8_h8")
+    monkeypatch.setenv("SLOPLLM_INDEXER_PREFILL_FP8_CONFIG", "q32_k256_w8_h8")
     baseline = _run_prefill(glm, device, flat=True, causal=True)
-    monkeypatch.delenv("GLM_INDEXER_PREFILL_FP8_CONFIG", raising=False)
+    monkeypatch.delenv("SLOPLLM_INDEXER_PREFILL_FP8_CONFIG", raising=False)
     actual = _run_prefill(glm, device, flat=True, causal=True)
 
     torch.testing.assert_close(actual[6], baseline[6], rtol=0, atol=0)
@@ -102,7 +102,7 @@ def test_prefill_fp8_mma_default_tma_swizzle_matches_retained_kernel(glm, device
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_deterministic_gather_is_repeatable(glm, device, monkeypatch):
-    monkeypatch.setenv("GLM_INDEXER_PREFILL_DETERMINISTIC", "1")
+    monkeypatch.setenv("SLOPLLM_INDEXER_PREFILL_DETERMINISTIC", "1")
     first = _run_prefill(glm, device, flat=True, causal=False, total_q=2, length=32768)
     second = _run_prefill(glm, device, flat=True, causal=False, total_q=2, length=32768)
     assert torch.equal(first[4], second[4])
@@ -111,7 +111,7 @@ def test_prefill_deterministic_gather_is_repeatable(glm, device, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_atomic_gather_long_context(glm, device, monkeypatch):
-    monkeypatch.delenv("GLM_INDEXER_PREFILL_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("SLOPLLM_INDEXER_PREFILL_DETERMINISTIC", raising=False)
     result = _run_prefill(glm, device, flat=True, causal=False, total_q=4, length=32768)
     out, out_scores, scores, row_len, topk = result[4:]
     for qi, valid in enumerate(row_len.cpu().tolist()):
@@ -120,7 +120,7 @@ def test_prefill_atomic_gather_long_context(glm, device, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_fp8_mma_kill_switch_uses_bf16(glm, device, monkeypatch):
-    monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "0")
+    monkeypatch.setenv("SLOPLLM_INDEXER_DECODE_FP8_MMA", "0")
     q, weights, rows, row_scales, out, out_scores, scores, row_len, topk = _run_prefill(
         glm, device, flat=True, causal=False,
     )

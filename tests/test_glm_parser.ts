@@ -16,7 +16,7 @@ describe("GlmParser", () => {
   let tokenizer: LoadedTokenizer;
 
   before(async () => {
-    const tokenizerDir = resolveModelPath(process.env.GLM_TOKENIZER_REPO ?? "lukealonso/GLM-5.2-NVFP4");
+    const tokenizerDir = resolveModelPath(process.env.SLOPLLM_TOKENIZER_REPO ?? "lukealonso/GLM-5.2-NVFP4");
     tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
     const templatePath = path.join(tokenizerDir, "chat_template.jinja");
     if (fs.existsSync(templatePath)) {

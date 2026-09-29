@@ -7,7 +7,7 @@ import { WorkspaceBase } from "../src/workspace";
 
 describe("CUDA IPC arena", () => {
   it("shares an owned arena with a separate process", async () => {
-    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    const deviceId = parseInt(process.env.SLOPLLM_GPU ?? "0", 10);
     const arenaGb = 1 / 1024;
     const ops = new GlmOps(deviceId, undefined, arenaGb);
     const workspace = new WorkspaceBase(ops);
@@ -22,7 +22,7 @@ describe("CUDA IPC arena", () => {
         stdio: ["ignore", "pipe", "pipe", "ipc"],
         env: {
           ...process.env,
-          [`GLM_ARENA_IPC_HANDLE_${deviceId}`]: ops.exportArenaIpcHandle().toString("base64"),
+          [`SLOPLLM_ARENA_IPC_HANDLE_${deviceId}`]: ops.exportArenaIpcHandle().toString("base64"),
         },
       });
       let stderr = "";
@@ -77,8 +77,8 @@ describe("CUDA IPC arena", () => {
         stdio: ["ignore", "pipe", "pipe", "ipc"],
         env: {
           ...process.env,
-          GLM_ARENA_IPC_HANDLE_0: devices[0].exportArenaIpcHandle().toString("base64"),
-          GLM_ARENA_IPC_HANDLE_1: devices[1].exportArenaIpcHandle().toString("base64"),
+          SLOPLLM_ARENA_IPC_HANDLE_0: devices[0].exportArenaIpcHandle().toString("base64"),
+          SLOPLLM_ARENA_IPC_HANDLE_1: devices[1].exportArenaIpcHandle().toString("base64"),
         },
       });
       let stderr = "";

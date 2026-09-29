@@ -67,14 +67,14 @@ describe("model loader arguments", () => {
     for (const value of [[""], ["nsys\0"], ["nsys", "bad\0arg"]]) {
       assert.throws(() => parseWorkerCommand(value, [], null, "spawn"));
     }
-    assert.throws(() => parseWorkerCommand({ command: ["nsys"], env: { GLM_SKIP_MMAP_LOAD: null } }, [], null, "spawn"), /loader-managed/);
+    assert.throws(() => parseWorkerCommand({ command: ["nsys"], env: { SLOPLLM_SKIP_MMAP_LOAD: null } }, [], null, "spawn"), /loader-managed/);
   });
 
   it("supports executor-only environment overrides and unsetting inherited variables", () => {
-    const command = parseWorkerCommand({ command: ["src/openai-server.ts"], env: { GLM_CHAT_DEBUG: "0", REMOVE_ME: null } }, ["--arena", "48"]);
-    const inherited = { GLM_CHAT_DEBUG: "1", REMOVE_ME: "yes", KEEP_ME: "yes" };
-    assert.deepEqual(workerEnvironment(command, inherited), { GLM_CHAT_DEBUG: "0", KEEP_ME: "yes" });
-    assert.equal(inherited.GLM_CHAT_DEBUG, "1");
+    const command = parseWorkerCommand({ command: ["src/openai-server.ts"], env: { SLOPLLM_CHAT_DEBUG: "0", REMOVE_ME: null } }, ["--arena", "48"]);
+    const inherited = { SLOPLLM_CHAT_DEBUG: "1", REMOVE_ME: "yes", KEEP_ME: "yes" };
+    assert.deepEqual(workerEnvironment(command, inherited), { SLOPLLM_CHAT_DEBUG: "0", KEEP_ME: "yes" });
+    assert.equal(inherited.SLOPLLM_CHAT_DEBUG, "1");
     const updated = parseWorkerCommand({ env: { NEW_FLAG: "1" } }, [], command);
     assert.equal(updated.entry, command.entry);
     assert.deepEqual(updated.args, command.args);
@@ -84,7 +84,7 @@ describe("model loader arguments", () => {
 
   it("rejects invalid or loader-managed environment overrides", () => {
     for (const env of [[], null, { FLAG: true }, { FLAG: 1 }, { "BAD=NAME": "x" }, { FLAG: "x\0y" },
-      { GLM_SKIP_MMAP_LOAD: "0" }, { GLM_ARENA_IPC_HANDLE_0: null }, { GLM_MODEL_LAYOUT_0: "x" }]) {
+      { SLOPLLM_SKIP_MMAP_LOAD: "0" }, { SLOPLLM_ARENA_IPC_HANDLE_0: null }, { SLOPLLM_MODEL_LAYOUT_0: "x" }]) {
       assert.throws(() => parseWorkerCommand({ command: ["src/openai-server.ts"], env }, []));
     }
     assert.throws(() => parseWorkerCommand({ env: {} }, []), /No executor command/);

@@ -46,7 +46,7 @@ def test_dedup_matches_original_bytes(glm, device, num_tokens, cp_world_size):
     kti = torch.from_numpy(kv_token_indptr).to(device)
 
     def run(no_dedup):
-        os.environ["GLM_GATHER_NO_DEDUP"] = "1" if no_dedup else "0"
+        os.environ["SLOPLLM_GATHER_NO_DEDUP"] = "1" if no_dedup else "0"
         bufs = [torch.full((total_tokens, BPT), 0x77, dtype=torch.uint8, device=device)
                 for _ in range(cp_world_size)]
         ptrs = [b.data_ptr() for b in bufs]
@@ -66,7 +66,7 @@ def test_dedup_matches_original_bytes(glm, device, num_tokens, cp_world_size):
 
     ref = run(no_dedup=True)
     got = run(no_dedup=False)
-    os.environ.pop("GLM_GATHER_NO_DEDUP", None)
+    os.environ.pop("SLOPLLM_GATHER_NO_DEDUP", None)
     for j in range(cp_world_size):
         if not np.array_equal(ref[j], got[j]):
             bad = np.where((ref[j] != got[j]).any(axis=1))[0]

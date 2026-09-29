@@ -21,11 +21,11 @@ import { sparseMlaChunksPerBlock } from "./sparse-mla-planner";
 // the grouped path only pays off once `count` is large enough to amortize its
 // dispatch overhead against avoided redundant weight reads (true prefill territory).
 const MUL_MAT_ID_GROUPED_THRESHOLD = 512;
-export const FUSED_MOE_DOWN_REDUCE = process.env.GLM_FUSED_MOE_DOWN_REDUCE !== "0";
+export const FUSED_MOE_DOWN_REDUCE = process.env.SLOPLLM_FUSED_MOE_DOWN_REDUCE !== "0";
 // Independent NVFP4 control for grouped-MoE experiments; BF16 dispatch is separate.
-const NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD = Number(process.env.GLM_NVFP4_MOE_GROUPED_THRESHOLD ?? MUL_MAT_ID_GROUPED_THRESHOLD);
+const NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD = Number(process.env.SLOPLLM_NVFP4_MOE_GROUPED_THRESHOLD ?? MUL_MAT_ID_GROUPED_THRESHOLD);
 if (!Number.isInteger(NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD) || NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD < 0) {
-  throw new Error("GLM_NVFP4_MOE_GROUPED_THRESHOLD must be a non-negative integer");
+  throw new Error("SLOPLLM_NVFP4_MOE_GROUPED_THRESHOLD must be a non-negative integer");
 }
 
 // Below this query-token count, sparse MLA prefill is routed to the split-K
@@ -42,9 +42,9 @@ const SPARSE_MLA_DECODE_DISPATCH_MAX = 16;
 // amortizes its setup and processes query tiles together. Both
 // paths support custom masks and query-sharding, so this is a pure occupancy/
 // memory tradeoff. Tunable to align with SPARSE_MLA_DECODE_DISPATCH_MAX.
-const INDEXER_DIRECT_DISPATCH_MAX = Number(process.env.GLM_INDEXER_DIRECT_DISPATCH_MAX ?? 64);
+const INDEXER_DIRECT_DISPATCH_MAX = Number(process.env.SLOPLLM_INDEXER_DIRECT_DISPATCH_MAX ?? 64);
 // Mirrors indexer_use_fp8_mma's env kill switch in glm_indexer.cu.
-export const INDEXER_FP8_MMA_DISABLED = process.env.GLM_INDEXER_DECODE_FP8_MMA === "0";
+export const INDEXER_FP8_MMA_DISABLED = process.env.SLOPLLM_INDEXER_DECODE_FP8_MMA === "0";
 const TOPK_SCRATCH_I32 = 1056;
 const CUBLASLT_WORKSPACE_BYTES = 2 * 1024 * 1024;
 const CUBLAS_WORKSPACE_BYTES = 32 * 1024 * 1024;
@@ -347,7 +347,7 @@ export class GlmTensor extends Tensor {
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
-    if (process.env.GLM_SKIP_MMAP_LOAD) {
+    if (process.env.SLOPLLM_SKIP_MMAP_LOAD) {
       // for testing: skip actual load
       return;
     }
@@ -359,7 +359,7 @@ export class GlmTensor extends Tensor {
   }
 
   async mmapLoadAsync(mmapPtr: number, offset: number, nbytes: number): Promise<void> {
-    if (process.env.GLM_SKIP_MMAP_LOAD) {
+    if (process.env.SLOPLLM_SKIP_MMAP_LOAD) {
       // for testing: skip actual load
       return;
     }
@@ -494,7 +494,7 @@ export class GlmTensor extends Tensor {
   moeRoute(options: MoeRoutingOptions): MoeRoutingResult {
     const [rows, experts] = this.shape;
     // Larger batches retain the default path's overlap with expert computation.
-    if (process.env.GLM_ROUTING_FUSION === "0" || rows > 32 || experts !== 256
+    if (process.env.SLOPLLM_ROUTING_FUSION === "0" || rows > 32 || experts !== 256
       || options.numExpertsPerToken !== 8 || !options.correctionBias) {
       return super.moeRoute(options);
     }
@@ -901,7 +901,7 @@ export class GlmOps implements DeviceOps {
 
     if (arenaGb) {
       const size = Math.floor(arenaGb * 1024 * 1024 * 1024);
-      const ipcHandleEnv = process.env[`GLM_ARENA_IPC_HANDLE_${deviceId}`];
+      const ipcHandleEnv = process.env[`SLOPLLM_ARENA_IPC_HANDLE_${deviceId}`];
       let base: number;
       if (ipcHandleEnv === undefined) {
         base = native.alloc(this.ctx, size);
@@ -911,7 +911,7 @@ export class GlmOps implements DeviceOps {
         if (handle.length !== 64) {
           native.free(this.ctx);
           this.ctx = 0;
-          throw new Error(`Invalid GLM_ARENA_IPC_HANDLE_${deviceId}`);
+          throw new Error(`Invalid SLOPLLM_ARENA_IPC_HANDLE_${deviceId}`);
         }
         try {
           base = native.cudaIpcOpenMemHandle(this.ctx, handle);
@@ -1563,7 +1563,7 @@ const srcOps = (copies[0].src as GlmTensor).ops;
         throw new Error(`indexerTopk: expected effectiveWeights F32 [${totalQ}, ${idxNHeads}], got ${effectiveWeights.type}[${effectiveWeights.shape}]`);
       }
       if (idxNHeads !== 32 || idxHeadDim !== 128 || INDEXER_FP8_MMA_DISABLED) {
-        throw new Error(`indexerTopk: effectiveWeights provided but the FP8 MMA path requires idxNHeads=32 idxHeadDim=128 with GLM_INDEXER_DECODE_FP8_MMA!=0 (got ${idxNHeads}/${idxHeadDim})`);
+        throw new Error(`indexerTopk: effectiveWeights provided but the FP8 MMA path requires idxNHeads=32 idxHeadDim=128 with SLOPLLM_INDEXER_DECODE_FP8_MMA!=0 (got ${idxNHeads}/${idxHeadDim})`);
       }
     }
     const maxKvCapacity = kData.shape[0] * kData.shape[1];
@@ -1599,7 +1599,7 @@ const srcOps = (copies[0].src as GlmTensor).ops;
   // weightHeadOffset; no gather. q8 layout ([rows, nHeads, 128] U8 + [rows,
   // nHeads] F32 effective weights) matches what indexerTopk's FP8 path consumes.
   // When the shape is not eligible for FP8 MMA (headDim != 128, nHeads outside
-  // the dispatch set) or FP8 MMA is disabled via GLM_INDEXER_DECODE_FP8_MMA=0,
+  // the dispatch set) or FP8 MMA is disabled via SLOPLLM_INDEXER_DECODE_FP8_MMA=0,
   // returns the identity fallback { q8: q view, effectiveWeights: undefined } —
   // the same thing the fused scorer would do for that shape.
   indexerQuantizeQ(q: Tensor, weights: Tensor, scale: number, weightHeadOffset = 0): { q8: Tensor, effectiveWeights: Tensor | undefined } {

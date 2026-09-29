@@ -1639,7 +1639,7 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
         // DIAGNOSTIC: forbid split-K reduction schemes that accumulate via atomics
         // (nondeterministic run-to-run). Guarded so we can A/B; NONE-only algos are
         // deterministic. Falls back to cublasGemmEx if the heuristic returns nothing.
-        if (getenv("GLM_CUBLAS_DETERMINISTIC")) {
+        if (getenv("SLOPLLM_CUBLAS_DETERMINISTIC")) {
             uint32_t redMask = CUBLASLT_REDUCTION_SCHEME_NONE;
             cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &redMask, sizeof(redMask));
         }

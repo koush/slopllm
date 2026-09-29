@@ -661,13 +661,13 @@ static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
                                    int* tile_counter, cudaStream_t stream,
                                    const int* sorted_to_original) {
     constexpr int MaxExperts = 256;
-    const char* cfg_env = getenv("GLM_COOP_CONFIG");
+    const char* cfg_env = getenv("SLOPLLM_COOP_CONFIG");
     const char* default_cfg = "tm64_tn128_d2_nw2";
     if (N == 6144 && K == 256)
         default_cfg = "tm64_tn128_d2_nw4";
     std::string cfg(cfg_env ? cfg_env : default_cfg);
 
-    if (getenv("GLM_MOE_DIRECT_DEQUANT")) {
+    if (getenv("SLOPLLM_MOE_DIRECT_DEQUANT")) {
         if (cfg == "tm128_tn128_d2_nw2")
             launch_coop<128, 128, 2, 2, MaxExperts, false, 32, true>(ctx, num_experts, N, sorted_input, output, K,
                 weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);

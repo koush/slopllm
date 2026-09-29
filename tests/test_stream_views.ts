@@ -5,7 +5,7 @@ import { Tensor } from "../src/tensor";
 import { WorkspaceBase } from "../src/workspace";
 
 function fixture(run: (ops: GlmOps, ws: WorkspaceBase) => void) {
-  const ops = new GlmOps(Number(process.env.GLM_GPU ?? 0));
+  const ops = new GlmOps(Number(process.env.SLOPLLM_GPU ?? 0));
   const ws = new WorkspaceBase(ops);
   try {
     run(ops, ws);

@@ -25,8 +25,8 @@ const GLM51_MODEL_DIR = "tests/python/test_models/glm51_small/glm51_small_bf16";
 // CP prefill gathers CKV into a flat Replicated buffer and emits flat slots to
 // match. The indexer cache remains Row-parallel unless separately opted into
 // gathering below; its per-rank top-k results are merged before slot conversion.
-export const CP_GATHER_KV = process.env.GLM_CP_GATHER_KV !== "0";
-export const CP_GATHER_INDEXER_KV = CP_GATHER_KV && process.env.GLM_CP_GATHER_INDEXER_KV !== "0";
+export const CP_GATHER_KV = process.env.SLOPLLM_CP_GATHER_KV !== "0";
+export const CP_GATHER_INDEXER_KV = CP_GATHER_KV && process.env.SLOPLLM_CP_GATHER_INDEXER_KV !== "0";
 
 export interface Glm51Config extends CommonModelConfig {
   moeIntermediateSize: number;
@@ -321,7 +321,7 @@ export class Glm51Model extends ChatModel {
       // The transposed layout enables coalesced reads in mla_v_expand_kernel.
       using tVT = tVRaw.transpose4d(1, nHeads, vHeadDim, kvLoraRank, 0, 1, 3, 2);
       const tV = this.alloc([nHeads * kvLoraRank, vHeadDim], "BF16", vName, vPar);
-      if (process.env.GLM_MODEL_LOAD_REPLAY !== "1") {
+      if (process.env.SLOPLLM_MODEL_LOAD_REPLAY !== "1") {
         tV.memcpy(tVT);
       }
     } else if (name.endsWith(".kv_a_proj_with_mqa.weight")) {
@@ -885,7 +885,7 @@ export class Glm51Model extends ChatModel {
 
       const vProj = this.tensors.get(`${pfx}.v_proj.weight`)!;
       const oProj = this.tensors.get(`${pfx}.o_proj.weight`)!;
-      if (BS <= 32 && process.env.GLM_L2_PREFETCH !== "0") {
+      if (BS <= 32 && process.env.SLOPLLM_L2_PREFETCH !== "0") {
         using vExpandStream = this.ops.withStream(true, () => {
           return attnOut.mlaVExpand(vProj, S, B, lseBuf, undefined, undefined, undefined, tokenMajor);
         });
@@ -1156,7 +1156,7 @@ export class Glm51Model extends ChatModel {
       return super.planPrefillChunk(ws, cache, inputIdsList, samplingPolicy);
     }
     const input = inputIdsList;
-    if (input.length === 1 && process.env.GLM_PHASED_PREFILL !== "0"
+    if (input.length === 1 && process.env.SLOPLLM_PHASED_PREFILL !== "0"
       && input.reduce((sum, ids) => sum + ids.length, 0) >= 4096) {
       return this.planPhasedPrefill(ws, cache, input, samplingPolicy);
     }

@@ -9,7 +9,7 @@ describe("GlmTensor.cat (single GPU)", () => {
   let ws: WorkspaceBase;
 
   before(() => {
-    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    const deviceId = parseInt(process.env.SLOPLLM_GPU ?? "0", 10);
     ops = new GlmOps(deviceId);
     ws = new WorkspaceBase(ops);
   });

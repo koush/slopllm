@@ -110,7 +110,7 @@ describe("GLM-5.1 small model smoke test", () => {
   let ws: ExecutionWorkspace;
 
   beforeEach(async () => {
-    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    const deviceId = parseInt(process.env.SLOPLLM_GPU ?? "0", 10);
     ops = new GlmOps(deviceId);
     model = await Glm51Model.fromPretrained(ops, SMALL_MODEL_DIR);
     ws = new ExecutionWorkspace(ops, 3, 128);
@@ -469,7 +469,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
   // Releasing the device backend between cases also releases pooled scratch;
   // the resident loader leaves only a small amount of GPU memory for tests.
   beforeEach(async () => {
-    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    const deviceId = parseInt(process.env.SLOPLLM_GPU ?? "0", 10);
     ops = new GlmOps(deviceId);
     model = await Glm51Model.fromPretrained(ops, SMALL_MODEL_DIR, false, true);
     ws = new ExecutionWorkspace(ops, 1, 128);
@@ -679,7 +679,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
       captureManager[Symbol.dispose]();
       model.free();
       ops.free();
-      ops = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+      ops = new GlmOps(parseInt(process.env.SLOPLLM_GPU ?? "0", 10));
       model = await Glm51Model.fromPretrained(ops, SMALL_MODEL_DIR, false, false);
       captureManager = new CaptureManager(ops);
     }

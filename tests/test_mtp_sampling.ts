@@ -38,9 +38,9 @@ for (const parallel of [false, true]) {
     let sampler: SamplingWorkspace;
 
     before(() => {
-      const first = parseInt(process.env.GLM_GPU ?? "0", 10);
+      const first = parseInt(process.env.SLOPLLM_GPU ?? "0", 10);
       devices.push(new GlmOps(first));
-      if (parallel) devices.push(new GlmOps(parseInt(process.env.GLM_GPU_SECOND ?? "1", 10)));
+      if (parallel) devices.push(new GlmOps(parseInt(process.env.SLOPLLM_GPU_SECOND ?? "1", 10)));
       ops = parallel ? new ParallelOps(devices) : devices[0];
       ws = new WorkspaceBase(ops);
       target = new SamplingWorkspace(ops, B * (D + 1), V, 0, { maxBatchSize: B, depth: D });

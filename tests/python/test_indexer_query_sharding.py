@@ -12,7 +12,7 @@ from test_indexer_cp_remap import _build_window_mask
 @pytest.mark.parametrize("flat", [False, True])
 @pytest.mark.parametrize("masked", [False, True])
 def test_batched_query_shards(glm, device, monkeypatch, kernel, fp8, flat, masked):
-    monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "1" if fp8 else "0")
+    monkeypatch.setenv("SLOPLLM_INDEXER_DECODE_FP8_MMA", "1" if fp8 else "0")
     query_lengths = [4, 4] if kernel == "v2" else [35, 70, 29]
     kv_lengths = [length + 73 + i * 31 for i, length in enumerate(query_lengths)]
     caches = _make_caches(device, kv_lengths, 64, 128)

@@ -1503,7 +1503,7 @@ __global__ void score_kernel(
 } // namespace idxfp8
 
 static bool indexer_use_fp8_mma(int nHeads, int headDim) {
-    const char* env = std::getenv("GLM_INDEXER_DECODE_FP8_MMA");
+    const char* env = std::getenv("SLOPLLM_INDEXER_DECODE_FP8_MMA");
     return nHeads == idxfp8::NHEADS && headDim == idxfp8::HD
         && (!env || std::strcmp(env, "0") != 0);
 }
@@ -2813,7 +2813,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
                 qGlobalStart, custom_mask, mask_indptr, mask_kv_len, \
                 effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, kvTokenIndptr); \
     } while (0)
-        const char* fp8Config = std::getenv("GLM_INDEXER_PREFILL_FP8_CONFIG");
+        const char* fp8Config = std::getenv("SLOPLLM_INDEXER_PREFILL_FP8_CONFIG");
         const bool tmaRequested = (fp8Config
             && std::strcmp(fp8Config, "q32_k256_w8_h8_tma") == 0)
             || (!fp8Config && kvTokenIndptr);
@@ -2854,7 +2854,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
                 effectiveCpWorldSize, effectiveCpRank, globalLastPageLen, kvTokenIndptr); \
     } while (0)
 
-        const char* config = std::getenv("GLM_INDEXER_PREFILL_CONFIG");
+        const char* config = std::getenv("SLOPLLM_INDEXER_PREFILL_CONFIG");
         if (!config) {
             if (kvTokenIndptr && maxKv >= 16384)
                 LAUNCH_INDEXER_PREFILL(64, 288, 12, 1, true);
@@ -2873,7 +2873,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
             else LAUNCH_INDEXER_PREFILL(64, 192, 8, 2, false);
         }
         else {
-            fprintf(stderr, "Unknown GLM_INDEXER_PREFILL_CONFIG=%s\n", config);
+            fprintf(stderr, "Unknown SLOPLLM_INDEXER_PREFILL_CONFIG=%s\n", config);
             if (kvTokenIndptr) LAUNCH_INDEXER_PREFILL(64, 256, 16, 1, true);
             else LAUNCH_INDEXER_PREFILL(64, 256, 16, 1, false);
         }
@@ -2906,7 +2906,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 
         // Pass 6: parallel unordered compaction by default. The ordered kernel
         // remains available for diagnostics that require repeatable tie choice.
-        const char* deterministicGather = std::getenv("GLM_INDEXER_PREFILL_DETERMINISTIC");
+        const char* deterministicGather = std::getenv("SLOPLLM_INDEXER_PREFILL_DETERMINISTIC");
         // A single row scan has less scheduling overhead at short contexts.
         if (maxKv < 32768 || (deterministicGather && std::strcmp(deterministicGather, "1") == 0)) {
             idx_prefill_gather_buf_kernel<<<totalQ, 256, 0, stream>>>(

@@ -321,7 +321,7 @@ export abstract class ChatModel extends WorkspaceBase {
       return this.createChunkedPrefillPlan([], cache, inputIdsList, (function* () { return []; })());
     }
 
-    if (this.ops.worldSize > 1 && batchSize === 1 && totalTokens >= 4096 && process.env.GLM_PHASED_PREFILL !== "0") {
+    if (this.ops.worldSize > 1 && batchSize === 1 && totalTokens >= 4096 && process.env.SLOPLLM_PHASED_PREFILL !== "0") {
       return this.planPhasedPrefill(ws, cache, inputIdsList, samplingPolicy);
     }
 
@@ -506,7 +506,7 @@ export abstract class ChatModel extends WorkspaceBase {
       return { st, mmapPtr, fileSize };
     });
 
-    const loadBatchSize = parseInt(process.env.GLM_LOAD_BATCH_SIZE ?? "8", 10);
+    const loadBatchSize = parseInt(process.env.SLOPLLM_LOAD_BATCH_SIZE ?? "8", 10);
     const layerRe = /^model\.layers\.(\d+)\./;
     let totalTensors = 0;
     let totalBytes = 0;

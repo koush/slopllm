@@ -108,7 +108,7 @@ describe("Qwen3-0.6B Paris (1 GPU, graph)", () => {
   let tokenizer: any;
 
   before(async () => {
-    ops = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+    ops = new GlmOps(parseInt(process.env.SLOPLLM_GPU ?? "0", 10));
     ctx = await loadQwen3(ops, QWEN3_REPO);
     tokenizer = ctx.model.tokenizer;
   });
@@ -127,7 +127,7 @@ describe("Qwen3-0.6B-FP8 Paris (1 GPU, graph)", () => {
   let tokenizer: any;
 
   before(async () => {
-    ops = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+    ops = new GlmOps(parseInt(process.env.SLOPLLM_GPU ?? "0", 10));
     ctx = await loadQwen3(ops, FP8_REPO);
     tokenizer = ctx.model.tokenizer;
   });
@@ -146,7 +146,7 @@ describe("Qwen3.5-0.8B Paris (1 GPU, graph)", () => {
   let tokenizer: any;
 
   before(async () => {
-    ops = new GlmOps(parseInt(process.env.GLM_GPU ?? "0", 10));
+    ops = new GlmOps(parseInt(process.env.SLOPLLM_GPU ?? "0", 10));
     ctx = await loadQwen35(ops);
     tokenizer = ctx.model.tokenizer;
   });

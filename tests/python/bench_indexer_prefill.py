@@ -4,8 +4,8 @@ This exercises one GPU's query-sharded work with flat replicated K, matching
 the 8-GPU CP prefill path without loading model weights.
 
 Examples:
-  GLM_GPU=0 python bench_indexer_prefill.py
-  GLM_INDEXER_PREFILL_CONFIG=q64_k192_w8_q2 python bench_indexer_prefill.py --kv-lens 131072
+  SLOPLLM_GPU=0 python bench_indexer_prefill.py
+  SLOPLLM_INDEXER_PREFILL_CONFIG=q64_k192_w8_q2 python bench_indexer_prefill.py --kv-lens 131072
   nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
     --capture-range=cudaProfilerApi --capture-range-end=stop \
     -o ../../scratchpad/indexer \
@@ -191,12 +191,12 @@ def main():
     parser.add_argument("--profile-iterations", type=int, default=1)
     args = parser.parse_args()
 
-    gpu = int(os.environ.get("GLM_GPU", "0"))
+    gpu = int(os.environ.get("SLOPLLM_GPU", "0"))
     torch.cuda.set_device(gpu)
     device = torch.device(f"cuda:{gpu}")
     glm = GlmOps(device_id=gpu)
-    config = os.environ.get("GLM_INDEXER_PREFILL_CONFIG", "auto")
-    fp8_config = os.environ.get("GLM_INDEXER_PREFILL_FP8_CONFIG", "auto")
+    config = os.environ.get("SLOPLLM_INDEXER_PREFILL_CONFIG", "auto")
+    fp8_config = os.environ.get("SLOPLLM_INDEXER_PREFILL_FP8_CONFIG", "auto")
 
     print(
         f"Indexer prefill | GPU {gpu} | config={config} | fp8_config={fp8_config} "

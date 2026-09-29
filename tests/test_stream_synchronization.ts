@@ -4,7 +4,7 @@ import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
 
 async function fixture(run: (ops: GlmOps, ws: WorkspaceBase) => void | Promise<void>) {
-  const ops = new GlmOps(Number(process.env.GLM_GPU ?? 0));
+  const ops = new GlmOps(Number(process.env.SLOPLLM_GPU ?? 0));
   const ws = new WorkspaceBase(ops);
   try {
     await run(ops, ws);

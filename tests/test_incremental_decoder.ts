@@ -54,8 +54,8 @@ describe("incremental token history compaction (CPU)", () => {
   const encode = (text: string) => tokenizer.encode(text, { add_special_tokens: false });
 
   before(async () => {
-    const modelDir = process.env.GLM_TOKENIZER_REPO
-      ? resolveModelPath(process.env.GLM_TOKENIZER_REPO)
+    const modelDir = process.env.SLOPLLM_TOKENIZER_REPO
+      ? resolveModelPath(process.env.SLOPLLM_TOKENIZER_REPO)
       : resolveModelSelection({
         useGlm51: true, useQwen35: false, useFp8: false, useNvfp4: true,
         glm51Small: false, modelDir: undefined, gpus: [], arena: 0, cp: false, mtp: 0,

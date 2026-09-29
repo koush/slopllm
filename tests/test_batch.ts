@@ -45,7 +45,7 @@ describe("Qwen3-0.6B batch tests", () => {
   const EOS_TOKEN_IDS = new Set([151645, 151643]);
 
   before(async () => {
-    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    const deviceId = parseInt(process.env.SLOPLLM_GPU ?? "0", 10);
     ops = new GlmOps(deviceId);
     model = await Qwen3Model.fromPretrained(ops, QWEN3_REPO);
     ws = new ExecutionWorkspace(ops, 4, 4096);
@@ -615,7 +615,7 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
   const PROMPT = [151643, 151644, 151645, 1, 2, 3, 4, 5, 6, 7];
 
   before(async () => {
-    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    const deviceId = parseInt(process.env.SLOPLLM_GPU ?? "0", 10);
     ops = new GlmOps(deviceId);
     model = await Qwen35Model.fromPretrained(ops, "Qwen/Qwen3.5-0.8B");
     ws = new ExecutionWorkspace(ops, 1, 128);
@@ -785,7 +785,7 @@ describe("PagedKVCache prefix matching", () => {
   let PROMPT1: number[];
 
   before(async () => {
-    const deviceId = parseInt(process.env.GLM_GPU ?? "0", 10);
+    const deviceId = parseInt(process.env.SLOPLLM_GPU ?? "0", 10);
     glm = new GlmOps(deviceId);
     model = await Qwen3Model.fromPretrained(glm, QWEN3_REPO);
     ws = new ExecutionWorkspace(glm, 4, 4096);

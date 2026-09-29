@@ -59,7 +59,7 @@ async function main() {
   const ws = new ExecutionWorkspace(ops, 1, maxSeqLen);
 
   const tokenizer = model.tokenizer;
-  const effort = process.env.GLM_REASONING_EFFORT;
+  const effort = process.env.SLOPLLM_REASONING_EFFORT;
   console.log(`[template]${effort ? ` reasoning_effort=${effort}` : ""}`);
 
   let bad = 0, n = 0;

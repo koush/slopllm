@@ -299,11 +299,11 @@ void glm_gather_topk_ckv(
     int total_entries = num_tokens * topk;
     cudaStream_t stream = GLM_STREAM(ctx);
 
-    // Escape hatch: GLM_GATHER_NO_DEDUP=1 forces the original one-warp-per-entry
+    // Escape hatch: SLOPLLM_GATHER_NO_DEDUP=1 forces the original one-warp-per-entry
     // kernel for every num_tokens, so the dedup pass can be A/B'd against it
     // without a rebuild. Duplicates then write the same bytes to the same
     // addresses again, which is redundant but correct.
-    const char* nd = getenv("GLM_GATHER_NO_DEDUP");
+    const char* nd = getenv("SLOPLLM_GATHER_NO_DEDUP");
     const bool no_dedup = nd && nd[0] == '1';
 
     if (num_tokens <= 1 || no_dedup) {

@@ -33,17 +33,17 @@ for (const { rows, experts, topK, biased, disabled } of [
 ]) {
   for (const normalize of [false, true]) {
     it(`moeRoute exact default/backend match rows=${rows} experts=${experts} k=${topK} bias=${biased} disabled=${disabled} normalize=${normalize}`, () => {
-      const ops = new GlmOps(Number(process.env.GLM_GPU ?? 0));
+      const ops = new GlmOps(Number(process.env.SLOPLLM_GPU ?? 0));
       const ws = new WorkspaceBase(ops);
       const native = getNativeAddon();
       const original = native.routeTop8;
-      const previousEnv = process.env.GLM_ROUTING_FUSION;
+      const previousEnv = process.env.SLOPLLM_ROUTING_FUSION;
       let fusedCalls = 0;
       native.routeTop8 = (...args) => {
         fusedCalls++;
         original(...args);
       };
-      process.env.GLM_ROUTING_FUSION = disabled ? "0" : "1";
+      process.env.SLOPLLM_ROUTING_FUSION = disabled ? "0" : "1";
       try {
         {
           using logits = ws.alloc([rows, experts], "BF16");
@@ -79,9 +79,9 @@ for (const { rows, experts, topK, biased, disabled } of [
       } finally {
         native.routeTop8 = original;
         if (previousEnv === undefined) {
-          delete process.env.GLM_ROUTING_FUSION;
+          delete process.env.SLOPLLM_ROUTING_FUSION;
         } else {
-          process.env.GLM_ROUTING_FUSION = previousEnv;
+          process.env.SLOPLLM_ROUTING_FUSION = previousEnv;
         }
         ws.free();
         ops.free();

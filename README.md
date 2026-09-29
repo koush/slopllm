@@ -111,7 +111,7 @@ Like the GPU flush, it waits for earlier generation requests to finish. The
 response reports `hostPagesFreed`. It requires a host tier
 (`--max-host-pages <pages>`).
 
-For prompt/output diagnostics, set `GLM_CHAT_DEBUG=1` in the server environment.
+For prompt/output diagnostics, set `SLOPLLM_CHAT_DEBUG=1` in the server environment.
 `Chat debug` log records include the exact prompt token IDs and decoded prompt,
 plus generated token IDs and raw decoded output, preserving special tokens.
 Call `POST /tokenize` with `messages` and `chat_template_kwargs` to log the

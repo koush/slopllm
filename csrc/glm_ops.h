@@ -1060,7 +1060,7 @@ void glm_bf16_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inpu
 
 // Cooperative all-warps kernel (B12X-style): all warps stage cp.async loads
 // then all warps run MMA. No producer/consumer split, no mbarriers.
-// Uses TM=64, TN=128, DEPTH=2, NWARPS=2 by default (GLM_COOP_CONFIG env override).
+// Uses TM=64, TN=128, DEPTH=2, NWARPS=2 by default (SLOPLLM_COOP_CONFIG env override).
 size_t glm_mma_moe_coop_workspace_size(int count, int N, int K, int num_experts);
 
 void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output,

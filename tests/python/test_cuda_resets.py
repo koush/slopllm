@@ -62,7 +62,7 @@ def test_topk_dirty_scratch_graph(glm, device, stride, rows):
 
 @pytest.mark.parametrize("fp8", [False, True])
 def test_prefill_overwrites_dirty_histograms(glm, device, monkeypatch, fp8):
-    monkeypatch.setenv("GLM_INDEXER_DECODE_FP8_MMA", "1" if fp8 else "0")
+    monkeypatch.setenv("SLOPLLM_INDEXER_DECODE_FP8_MMA", "1" if fp8 else "0")
     torch.manual_seed(802)
     rows, length, topk = 65, 65, 32
     q = torch.randn(rows, 32, 128, dtype=torch.bfloat16, device=device)
