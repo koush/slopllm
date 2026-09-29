@@ -5,6 +5,7 @@ GPU-accelerated inference for local-inference-lab/GLM-5.3-NVFP4, implemented in 
 ## Goals
 
 - Fast inference of GLM-5.x (glm_moe_dsa) on 8x RTX 6000 Pro GPUs.
+- Multi-GPU serving with tensor parallelism and context parallelism.
 - Persistent model loader process for instant server updates (developments or restarts).
 - OpenAI-compatible serving (`src/openai-server.ts`) with:
   - Continuous batching and chunked prefill via a generation scheduler
@@ -13,7 +14,6 @@ GPU-accelerated inference for local-inference-lab/GLM-5.3-NVFP4, implemented in 
   - Streaming (SSE) and non-streaming chat completions, tool calls, and reasoning content
   - Sampling controls (temperature, top-p, top-k, repetition/presence penalty, stop sequences)
   - Prometheus metrics (`/metrics`), health check, and tokenization endpoints
-- Multi-GPU serving with tensor parallelism and context parallelism via the persistent model loader.
 
 ## Requirements
 
@@ -72,7 +72,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 | Argument | Description | Default |
 |---|---|---|
 | `--host`, `--port` | Listen address | `127.0.0.1:8000` |
-| `--gpus <list>` | GPU device IDs for tensor + context parallelism | `0` |
+| `--gpus <list>` | GPU device IDs for tensor + context parallelism (4MM+ context) | `0` |
 | `--arena <int>` | Per-GPU arena (GiB): one large CUDA allocation shared by weights and KV | `92` with the GLM model |
 | `--cp` | Context parallelism: interleave KV tokens across GPUs | off |
 | `--mtp [int]` | MTP speculative decoding draft tokens | off; `3` when passed without a value |
