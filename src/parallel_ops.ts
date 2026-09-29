@@ -12,24 +12,10 @@ import { WorkspaceBase } from "./workspace";
 
 // Fall back to the read-based (pull) CP merge; the push path is the default.
 export const CP_MERGE_PULL = process.env.GLM_CP_MERGE_PULL === "1";
-// Sort the CP top-k merge result ascending by global index. ON by default;
-// GLM_CP_TOPK_SORT=0 disables it (diagnostic only -- see below).
-//
-// The gathered buffer is rank-major, so the merge emits positions ordered by
-// (P % W, P / W) rather than by global position P. Sorting also makes this path
-// bit-identical to the replicated-kData build, which is what makes `diff`
-// against that build a usable regression test here.
-//
-// It is NOT only about parity: with the sort off, long generations degenerate
-// into repeated literal "truncated" / "end of output" tokens once the context
-// gets large. Sorting fixes that. Since the sort runs after selection it cannot
-// change WHICH positions are selected, only their order -- so something
-// downstream (topk_to_slots -> gatherTopkCkv -> sparse MLA) depends on the index
-// list being ascending, beyond the float accumulation order it is allowed to
-// depend on. That dependency has not been found, and this sort is currently
-// masking it: any other producer of unsorted top-k indices would corrupt too.
-// Costs ~9% of decode throughput (measured 100.4 -> 92.1 tok/s at 8-way CP).
-export const CP_TOPK_SORT = process.env.GLM_CP_TOPK_SORT === "1";
+// The owner-merge path emits positions ordered by (P % W, P / W) rather than
+// by global position P, which is acceptable to everything downstream. An
+// opt-in index sort existed as a diagnostic (bit-identical parity with the
+// replicated-kData build) but cost ~9% of decode throughput and was removed.
 export const CP_TOPK_OWNER_MERGE = process.env.GLM_CP_TOPK_OWNER_MERGE !== "0";
 
 export class ParallelTensor extends Tensor {
@@ -256,7 +242,6 @@ export class ParallelTensor extends Tensor {
    * too large for the P2P group, in which case the caller should NCCL.
    */
   private tryP2PAllReduce(): boolean {
-    if (process.env.GLM_P2P_ALLREDUCE === "0") return false;
     if (!this.parallelOps.p2pEnabled)
       return false;
     if (this.type !== "BF16" && this.type !== "F32")
@@ -4232,26 +4217,12 @@ export class ParallelOps implements DeviceOps {
     // These reads follow the scatter barrier; retain staging until the next one.
     group.sources.push(...stagedValues, ...stagedIndices);
 
-    const ownerValues = this.wrapShards(localValues.workspace, ownerValueShards, [paddedQ, topk], "BF16", TensorParallelism.Column);
+    using ownerValues = this.wrapShards(localValues.workspace, ownerValueShards, [paddedQ, topk], "BF16", TensorParallelism.Column);
     using ownerIndices = this.wrapShards(localIndices.workspace, ownerIndexShards, [paddedQ, topk], "I32", TensorParallelism.Column);
-    if (!CP_TOPK_SORT) {
-      using finalIndices = ownerIndices.allGather(localIndices.workspace, undefined, activeOwners);
-      // Values are unused by attention; retain the padded Column layout rather
-      // than adding a values gather. Only real index rows may reach topkToSlots.
-      return { values: ownerValues, indices: finalIndices.narrow(0, totalQ) };
-    }
-
-    using _ownerValues = ownerValues;
-    const [mergedValues, finalIndices] = this.allGatherMultiple([ownerValues, ownerIndices], localValues.workspace);
-    using _mergedValues = mergedValues;
-    using _finalIndices = finalIndices;
-
-    const pFinalIndices = this.cast(finalIndices);
-    const pMergedValues = this.cast(mergedValues);
-    for (let i = 0; i < W; i++) {
-      this.devices[i].sortTopkByIndex(pFinalIndices.shards[i], pMergedValues.shards[i], totalQ, topk);
-    }
-    return { values: mergedValues.narrow(0, totalQ), indices: finalIndices.narrow(0, totalQ) };
+    using finalIndicesRaw = ownerIndices.allGather(localIndices.workspace, undefined, activeOwners);
+    // Values are unused by attention; retain the padded Column layout rather
+    // than adding a values gather. Only real index rows may reach topkToSlots.
+    return { values: ownerValues, indices: finalIndicesRaw.narrow(0, totalQ) };
   }
 
   indexerTopk(state: ExecutionState, idxQ: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, indptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, topk: number, decode: boolean, qGlobalStart?: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, _cpWorldSize?: number, _cpRank?: number, _globalLastPageLen?: Tensor, _kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
@@ -4319,15 +4290,6 @@ export class ParallelOps implements DeviceOps {
       using _mergedIndices = mergedIndices as ParallelTensor;
       const finalIndices = gatheredIndices.gather(mergedIndices, topk, kTotal, totalQ);
 
-      // Opt-in: restore ascending-index order so this path is bit-identical to
-      // the replicated-kData build. Off by default -- see CP_TOPK_SORT.
-      if (CP_TOPK_SORT) {
-        const pFinalIndices = this.cast(finalIndices);
-        const pMergedValues = this.cast(mergedValues);
-        for (let i = 0; i < W; i++) {
-          this.devices[i].sortTopkByIndex(pFinalIndices.shards[i], pMergedValues.shards[i], totalQ, topk);
-        }
-      }
       return { values: mergedValues, indices: finalIndices };
     }
 

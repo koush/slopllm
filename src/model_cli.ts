@@ -39,7 +39,7 @@ export interface ModelRuntime {
 }
 
 export function parseModelArgs(argv: string[]): ModelCliArgs {
-  const gpusEnv = process.env.GLM_GPUS ?? process.env.GLM_GPU ?? "0";
+  const gpusEnv = process.env.GLM_GPU ?? "0";
   const args: ModelCliArgs = {
     gpus: gpusEnv.split(",").map(s => parseInt(s.trim(), 10)),
     arena: 0,

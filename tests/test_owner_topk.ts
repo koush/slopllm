@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { CaptureManager } from "../src/capture-manager";
 import { TensorParallelism } from "../src/device_ops";
 import { bf16BytesToF32, f32ToBf16Bytes, GlmOps } from "../src/glm_ops";
-import { CP_TOPK_SORT, ParallelOps, ParallelTensor } from "../src/parallel_ops";
+import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
 import { Tensor } from "../src/tensor";
 import { WorkspaceBase } from "../src/workspace";
 
@@ -56,16 +56,16 @@ function checkOwnerMerge(totalQ: number, topk: number): void {
       using mergedIndices = result.indices;
       ops.synchronize();
 
-      assert.equal(mergedValues.parallelism, CP_TOPK_SORT ? TensorParallelism.Replicated : TensorParallelism.Column);
+      assert.equal(mergedValues.parallelism, TensorParallelism.Column);
       assert.equal(mergedIndices.parallelism, TensorParallelism.Replicated);
       const ownerQ = Math.ceil(totalQ / worldSize);
-      assert.deepEqual(mergedValues.shape, [CP_TOPK_SORT ? totalQ : ownerQ * worldSize, topk]);
+      assert.deepEqual(mergedValues.shape, [ownerQ * worldSize, topk]);
       assert.deepEqual(mergedIndices.shape, [totalQ, topk]);
 
       for (let rank = 0; rank < worldSize; rank++) {
         assert.deepEqual(mergedIndices.shard(rank).shape, [totalQ, topk]);
-        const localQ = CP_TOPK_SORT ? totalQ : Math.max(0, Math.min(ownerQ, totalQ - rank * ownerQ));
-        const queryStart = CP_TOPK_SORT ? 0 : rank * ownerQ;
+        const localQ = Math.max(0, Math.min(ownerQ, totalQ - rank * ownerQ));
+        const queryStart = rank * ownerQ;
         const valueBuffer = Buffer.alloc(mergedValues.shard(rank).bytes);
         mergedValues.shard(rank).d2h(valueBuffer);
         const values = bf16BytesToF32(valueBuffer);

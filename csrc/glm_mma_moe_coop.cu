@@ -683,14 +683,6 @@ static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
         return;
     }
 
-    const char* nw_env = getenv("GLM_COOP_NWARPS");
-    if (nw_env && !cfg_env) {
-        int nw = atoi(nw_env);
-        if (nw == 2) cfg = "tm32_nw2";
-        else if (nw == 8) cfg = "tm32_nw8";
-        else cfg = "tm32_nw4";
-    }
-
     if (cfg == "tm8_tn128_d2_nw2")
         launch_coop<8, 128, 2, 2, MaxExperts, false>(ctx, num_experts, N, sorted_input, output, K,
                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
