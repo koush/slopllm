@@ -246,17 +246,17 @@ export class CaptureManager implements Disposable, ExecutionManager {
                         console.warn(`[cuda-graph] capture bindings key=${key} bindings=${JSON.stringify(diagnosticBindings)}`);
                     }
 
-                    console.warn("\n====capturing====", key)
+                    if (process.env.GLM_CAPTURE_DEBUG === "1") console.warn("\n====capturing====", key)
                     this.ops.graphBeginCapture();
                     capturing = true;
                 }
                 else {
-                    console.warn("\n====warmup+1====", key)
+                    if (process.env.GLM_CAPTURE_DEBUG === "1") console.warn("\n====warmup+1====", key)
                 }
                 captured.warmupSteps++;
             }
             else {
-                console.warn("\n====warmup====", key)
+                if (process.env.GLM_CAPTURE_DEBUG === "1") console.warn("\n====warmup====", key)
                 captured = { warmupSteps: 1, graphExec: null, result: undefined, inputs: undefined!, capturedWorkspaces: new Set() };
                 this.captured.set(key, captured);
             }
