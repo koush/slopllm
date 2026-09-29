@@ -24,7 +24,7 @@
 # the health check has a long start period to match.
 
 services:
-slopllm:
+  slopllm:
     build:
       context: .
       args:
@@ -33,7 +33,7 @@ slopllm:
         # pick up new commits: REPO_REF=$(git rev-parse origin/main)
         # docker compose build
         REPO_REF: "${REPO_REF:-main}"
-    image: "${IMAGE:-slopllm:runtime}"
+    image: "${IMAGE:-koush/slopllm}"
     container_name: "${CONTAINER_NAME:-slopllm}"
     command:
       - node
@@ -43,7 +43,7 @@ slopllm:
       - --arena
       - "92"
       - --host
-      - 0.0.0.0
+      - 127.0.0.1
       - --port
       - "${PORT:-8000}"
       # Shared model arguments (same parser as run_model_loader executors).
@@ -54,7 +54,6 @@ slopllm:
       - "${GPUS:-0,1,2,3,4,5,6,7}"
       - --max-pages
       - "${MAX_PAGES:-8192}"
-      - --phased-prefill
     network_mode: host
     ipc: host
     restart: unless-stopped

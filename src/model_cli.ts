@@ -19,6 +19,7 @@ const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp
 export interface ModelCliArgs {
   gpus: number[];
   arena: number;
+  arenaExplicit: boolean;
   modelDir: string | undefined;
   useQwen35: boolean;
   useGlm51: boolean;
@@ -43,6 +44,7 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
   const args: ModelCliArgs = {
     gpus: gpusEnv.split(",").map(s => parseInt(s.trim(), 10)),
     arena: 0,
+    arenaExplicit: false,
     modelDir: undefined,
     useQwen35: false,
     useGlm51: true,
@@ -60,7 +62,7 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     const a = argv[i];
     if (a === "--gpus" && i + 1 < argv.length) args.gpus = argv[++i].split(",").map(s => parseInt(s.trim(), 10));
     else if (a === "--gpu" && i + 1 < argv.length) args.gpus = [parseInt(argv[++i], 10)];
-    else if (a === "--arena" && i + 1 < argv.length) args.arena = parseInt(argv[++i], 10);
+    else if (a === "--arena" && i + 1 < argv.length) { args.arena = parseInt(argv[++i], 10); args.arenaExplicit = true; }
     else if (a === "--model-dir" && i + 1 < argv.length) args.modelDir = argv[++i];
     else if (a === "--qwen3") { args.useGlm51 = false; qwen3Explicit = true; }
     else if (a === "--qwen35") { args.useQwen35 = true; args.useGlm51 = false; qwen35Explicit = true; }
@@ -76,6 +78,7 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     }
   }
 
+  if (!args.arenaExplicit && args.useGlm51 && !args.glm51Small) args.arena = 92;
   if (args.gpus.length === 0 || args.gpus.some(gpu => !Number.isInteger(gpu) || gpu < 0)) {
     throw new Error(`Invalid GPU list: ${args.gpus.join(",")}`);
   }

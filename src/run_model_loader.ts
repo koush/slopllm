@@ -161,7 +161,7 @@ async function main(): Promise<void> {
   const loaderArgs = parseLoaderArgs(process.argv.slice(2));
   const modelArgs = parseModelArgs(loaderArgs.sharedArgs);
   if (loaderArgs.initialCommand) validateWorkerModelArgs(loaderArgs.initialCommand.args, modelArgs);
-  if (!modelArgs.arena) throw new Error("run_model_loader requires --arena <GiB>");
+  if (!modelArgs.arenaExplicit) throw new Error("run_model_loader requires --arena <GiB>");
   if (modelArgs.useQwen35 || modelArgs.useFp8) {
     throw new Error("The model loader currently supports Qwen3 and GLM-5.1");
   }

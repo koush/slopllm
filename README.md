@@ -55,7 +55,7 @@ The following command runs the server standalone, but for instant restarts and d
 
 ```bash
 NCCL_P2P_LEVEL=SYS \
-npx tsx src/openai-server.ts --gpus 0,1,2,3,4,5,6,7 --arena 92 --cp --mtp \
+npx tsx src/openai-server.ts --gpus 0,1,2,3,4,5,6,7 --cp --mtp \
   --host 127.0.0.1 --port 8000
 ```
 
@@ -77,7 +77,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 |---|---|---|
 | `--host`, `--port` | Listen address | `127.0.0.1:8000` |
 | `--gpus <list>` | GPU device IDs for tensor + context parallelism | `0` |
-| `--arena <int>` | Per-GPU arena size in GiB | — |
+| `--arena <int>` | Per-GPU arena (GiB): one large CUDA allocation shared by weights and KV | `92` with the GLM model |
 | `--cp` | Context parallelism: interleave KV tokens across GPUs | off |
 | `--mtp [int]` | MTP speculative decoding draft tokens | off; `3` when passed without a value |
 | `--batch-size <int>` | Maximum concurrent requests | `8` |

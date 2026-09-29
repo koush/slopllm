@@ -117,7 +117,7 @@ Options:
   --host <string>               Server host (default: 127.0.0.1)
   --gpu <int>                   GPU device ID (default: 0)
   --gpus <list>                 GPU device IDs
-  --arena <int>                 Arena size in GiB per GPU
+  --arena <int>                 Arena size in GiB per GPU (default: 92 with the GLM model)
   --qwen3 / --qwen35            Serve a Qwen test model instead of the default GLM
   --chunk-size <int>            Prefill execution-token budget including overlap (default: 8192)
   --batch-size <int>            Maximum concurrent requests (default: 8)
