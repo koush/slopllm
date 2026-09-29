@@ -7,9 +7,35 @@ import {
 } from "./chat-model-parser";
 
 export interface GlmChatTemplateKwargs {
-   continue_final_message?: boolean;
+  continue_final_message?: boolean;
   enable_thinking?: boolean;
-  reasoning_effort?: "high" | "max";
+  reasoning_effort?: "low" | "high" | "max";
+}
+
+const templateStates = new WeakMap<Tokenizer, { template: string; options: string; reasoning: boolean }>();
+
+function startsInReasoning(tokenizer: Tokenizer, kwargs: GlmChatTemplateKwargs): boolean {
+  // Continuations establish their state by consuming the existing assistant
+  // text through continueFrom(), not by adding a new generation prompt.
+  if (kwargs.continue_final_message) return false;
+
+  const template = tokenizer.get_chat_template();
+  const options = JSON.stringify(kwargs);
+  const cached = templateStates.get(tokenizer);
+  if (cached?.template === template && cached.options === options) return cached.reasoning;
+
+  // GLM-5.1/5.2 can close the thinking block when enable_thinking is false;
+  // GLM-5.3 ignores that option and always opens it. Probe rendered behavior
+  // rather than model architecture or the presence of a variable in Jinja.
+  const rendered = tokenizer.apply_chat_template([{ role: "user", content: "Hello" }], {
+    ...kwargs,
+    tokenize: false,
+    add_generation_prompt: true,
+  });
+  const assistantPrefix = rendered.slice(rendered.lastIndexOf("<|assistant|>") + "<|assistant|>".length);
+  const reasoning = assistantPrefix.lastIndexOf("<think>") > assistantPrefix.lastIndexOf("</think>");
+  templateStates.set(tokenizer, { template, options, reasoning });
+  return reasoning;
 }
 
 /** Parser for the GLM chat-template output protocol. */
@@ -20,7 +46,7 @@ export class GlmParser extends ChatModelParser {
     super(
       tokenizer,
       resolveGlmControlTokens(tokenizer),
-       !kwargs.continue_final_message && kwargs.enable_thinking !== false ? "reasoning" : "content",
+      startsInReasoning(tokenizer, kwargs) ? "reasoning" : "content",
     );
   }
 

@@ -24,6 +24,19 @@ describe("GlmParser", () => {
     }
   });
 
+  const switchableTemplate = `{% for message in messages %}<|user|>{{ message.content }}{% endfor %}{% if add_generation_prompt %}<|assistant|><think>{% if enable_thinking is defined and not enable_thinking %}</think>{% endif %}{% endif %}`;
+  const alwaysThinkingTemplate = `{# enable_thinking is intentionally ignored, as in GLM-5.3 #}{% for message in messages %}<|user|>{{ message.content }}{% endfor %}{% if add_generation_prompt %}<|assistant|><think>{% endif %}`;
+
+  function withTemplate(template: string, fn: () => void) {
+    const previous = tokenizer.chat_template;
+    tokenizer.chat_template = template;
+    try {
+      fn();
+    } finally {
+      tokenizer.chat_template = previous;
+    }
+  }
+
   for (const sample of glmParserCorpus) {
     it(`parses model output token by token: ${sample.name}`, () => {
       const parser = new GlmParser(tokenizer);
@@ -59,15 +72,65 @@ describe("GlmParser", () => {
     });
   }
 
-  it("starts in content mode when thinking is disabled", () => {
-    const parser = new GlmParser(tokenizer, { enable_thinking: false });
-    const events: OutputParserEvent[] = [];
-    const tokenIds = tokenizer.encode("READY", { add_special_tokens: false });
+  it("starts in content mode when the template disables thinking", () => {
+    withTemplate(switchableTemplate, () => {
+      const parser = new GlmParser(tokenizer, { enable_thinking: false });
+      const events: OutputParserEvent[] = [];
+      const tokenIds = tokenizer.encode("READY", { add_special_tokens: false });
 
-    for (const tokenId of tokenIds) events.push(...parser.onToken(tokenId));
-    events.push(...parser.finish());
+      for (const tokenId of tokenIds) events.push(...parser.onToken(tokenId));
+      events.push(...parser.finish());
 
-    assert.deepEqual(events, [{ type: "content_delta", text: "READY" }]);
+      assert.deepEqual(events, [{ type: "content_delta", text: "READY" }]);
+    });
+  });
+
+  it("keeps implicit reasoning separate when the template ignores enable_thinking=false", () => {
+    withTemplate(alwaysThinkingTemplate, () => {
+      const parser = Glm51Model.prototype.createParser.call({ tokenizer } as Glm51Model, { enable_thinking: false });
+      assert.equal(parser.state, "reasoning");
+      const events = tokenizer.encode('The user asked for only OK.</think>OK', { add_special_tokens: false })
+        .flatMap(token => parser.onToken(token));
+      events.push(...parser.finish());
+      assert.equal(events.filter(event => event.type === "reasoning_delta").map(event => event.text).join(""), "The user asked for only OK.");
+      assert.equal(events.filter(event => event.type === "content_delta").map(event => event.text).join(""), "OK");
+    });
+  });
+
+  it("refreshes the probed state when thinking options or the template change", t => {
+    const render = t.mock.method(tokenizer, "apply_chat_template");
+    withTemplate(switchableTemplate, () => {
+      assert.equal(new GlmParser(tokenizer, { enable_thinking: false }).state, "content");
+      const renders = render.mock.callCount();
+      assert.equal(new GlmParser(tokenizer, { enable_thinking: false }).state, "content");
+      assert.equal(render.mock.callCount(), renders, "unchanged templates/options reuse the probe");
+      assert.equal(new GlmParser(tokenizer, { enable_thinking: true }).state, "reasoning");
+      assert.equal(new GlmParser(tokenizer, { enable_thinking: false }).state, "content");
+    });
+    withTemplate(alwaysThinkingTemplate, () => {
+      assert.equal(new GlmParser(tokenizer, { enable_thinking: false }).state, "reasoning");
+    });
+  });
+
+  it("matches the real checkpoint generation prefix with thinking enabled or disabled", () => {
+    for (const enable_thinking of [true, false]) {
+      const options = { enable_thinking, tokenize: false as const, add_generation_prompt: true };
+      const rendered = tokenizer.apply_chat_template([{ role: "user", content: "Hello" }], options);
+      const parser = Glm51Model.prototype.createParser.call({ tokenizer } as Glm51Model, { enable_thinking });
+      assert.equal(parser.state, rendered.trimEnd().endsWith("<think>") ? "reasoning" : "content");
+    }
+  });
+
+  it("preserves continuation state even with an always-thinking template", () => {
+    withTemplate(alwaysThinkingTemplate, () => {
+      const parser = new GlmParser(tokenizer, { enable_thinking: false, continue_final_message: true });
+      assert.equal(parser.state, "content");
+      parser.continueFrom(tokenizer.encode("<think>Existing reasoning", { add_special_tokens: false }));
+      assert.equal(parser.state, "reasoning");
+      const events = tokenizer.encode("</think>OK", { add_special_tokens: false }).flatMap(id => parser.onToken(id));
+      events.push(...parser.finish());
+      assert.equal(events.filter(event => event.type === "content_delta").map(event => event.text).join(""), "OK");
+    });
   });
 
   it("continues an assistant prefix without returning the prefix as new output", () => {

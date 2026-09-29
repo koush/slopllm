@@ -75,3 +75,29 @@ curl -X POST http://127.0.0.1:8099/stop     # stop the executor, model stays on 
 curl -X POST http://127.0.0.1:8099/fork     # start it (or a new command) again
 curl -X POST http://127.0.0.1:8099/restart   # stop + start the configured executor
 ```
+
+### Testing host prefix caching
+
+Start the server with `--max-host-pages <pages>` to enable pinned-host KV caching.
+After a completion, flush the GPU KV cache with:
+
+```bash
+curl -X POST http://127.0.0.1:8000/flush_gpu_cache
+```
+
+The call waits for earlier generation requests to finish, offloads retained GPU
+prefixes to the host cache where capacity permits, and empties the GPU cache.
+Later requests wait behind the flush. The response reports `gpuPagesFreed` and
+`hostPagesUsed`; model weights remain resident. Without a host tier, retained
+prefixes are discarded.
+
+Repeat the completion to exercise host restoration. Server output includes
+`Host cache hit` with matched token counts and `Host cache restore complete`
+with the restored prefix length and remaining prefill tokens.
+
+For prompt/output diagnostics, set `GLM_CHAT_DEBUG=1` in the server environment.
+`Chat debug` log records include the exact prompt token IDs and decoded prompt,
+plus generated token IDs and raw decoded output, preserving special tokens.
+Call `POST /tokenize` with `messages` and `chat_template_kwargs` to log the
+rendered prompt and return without generation. With the model loader, inspect
+these records using `curl -N http://127.0.0.1:8099/follow`.

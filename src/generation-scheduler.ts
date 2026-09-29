@@ -21,6 +21,19 @@ export interface GenerationRequest {
   decodeStartedAt?: number;
 }
 
+export interface GpuCacheFlushResult {
+  gpuPagesFreed: number;
+  hostPagesUsed: number;
+}
+
+interface GpuCacheFlushEvent {
+  kind: "flush_gpu_cache";
+  resolve: (result: GpuCacheFlushResult) => void;
+  reject: (error: unknown) => void;
+}
+
+export type GenerationEvent = GenerationRequest | GpuCacheFlushEvent;
+
 export interface ServerMetrics {
   runningRequests: number;
   generationTokensTotal: number;
@@ -77,6 +90,41 @@ export class PrefixTierPolicy {
     this.host?.clearStaging();
   }
 
+  // Only stage host slots after all earlier transfers have drained.
+  private stageHostSequences(): void {
+    const host = this.host;
+    if (!host) return;
+    for (let i = host.sequences.length - 1; i >= 0; i--) {
+      if (host.sequences[i].pages.length) {
+        host.stageSequence(i, this.nextHostKey++);
+      } else {
+        host.removeSequence(i);
+      }
+    }
+  }
+
+  /** Called by the scheduler with no active requests or open generators. */
+  async flushGpuCache(): Promise<GpuCacheFlushResult> {
+    const gpu = this.pagedKV;
+    if (gpu.sequences.some(seq => seq.pages.length)
+      || [...gpu.staging.keys()].some(key => !this.retainedKeys.has(key))) {
+      throw new Error("Cannot flush GPU cache while sequences are active");
+    }
+    await this.ops.synchronizeAsync();
+    this.stageHostSequences();
+    const gpuPagesFreed = gpu.maxPages - gpu.availablePages.length;
+    try {
+      this.evictGpuStaged(gpu.maxPages);
+    } finally {
+      // Finish offloads before acknowledging the flush or allowing admission.
+      await this.ops.synchronizeAsync();
+    }
+    gpu.reset(0);
+    const hostPagesUsed = this.host ? this.host.maxPages - this.host.availablePages.length : 0;
+    console.log(`GPU cache flushed: freed-pages=${gpuPagesFreed} host-pages=${hostPagesUsed}`);
+    return { gpuPagesFreed, hostPagesUsed };
+  }
+
   /**
    * Admit-time tier match: returns each request's uncached suffix to prefill.
    * Without a host tier this is exactly the single-tier prefixMatch and no
@@ -94,13 +142,7 @@ export class PrefixTierPolicy {
     // Stage the entire host tier; discard empties. Everything unstaged here
     // is provably drained — every earlier invocation ended in the trailing
     // sync and decode steps sync in between.
-    for (let i = host.sequences.length - 1; i >= 0; i--) {
-      if (host.sequences[i].pages.length) {
-        host.stageSequence(i, this.nextHostKey++);
-      } else {
-        host.removeSequence(i);
-      }
-    }
+    this.stageHostSequences();
 
     // Host prime: the request's reusable prefix moves out of staging into
     // an active, request-indexed host slot. The slot's page refs protect
@@ -113,6 +155,12 @@ export class PrefixTierPolicy {
     // scheduler staged around cache.reset() are visible candidates but
     // never evictable (negative keys only).
     const suffixes = prompts.map((p, i) => gpu.prefixMatch(i, p));
+    for (let i = 0; i < prompts.length; i++) {
+      const hostTokens = prompts[i].length - hostSuffix[i].length;
+      if (hostTokens) {
+        console.log(`Host cache hit: sequence=${i} matched-tokens=${hostTokens} gpu-matched-tokens=${prompts[i].length - suffixes[i].length}`);
+      }
+    }
 
     // Restage superseded host slots: where the device match is at least as
     // long as the host match, no restore will read the slot, so it rejoins
@@ -139,6 +187,7 @@ export class PrefixTierPolicy {
     // the copy, so a host history running past the prompt cannot inject
     // foreign tokens. Pressure here offloads whole finished rows to host,
     // best-effort.
+    const restored: { sequence: number; tokens: number }[] = [];
     for (const [i, src] of restoreSources) {
       const prompt = prompts[i];
       const gpuPages = Math.floor((prompt.length - suffixes[i].length) / pageSize);
@@ -149,12 +198,16 @@ export class PrefixTierPolicy {
       }
       gpu.copyPrefixFrom(host, src, i, pages);
       suffixes[i] = prompt.slice(pages * pageSize);
+      restored.push({ sequence: i, tokens: pages * pageSize });
     }
 
     // Drain every copy this invocation enqueued. The active host slots left
     // behind (restore sources, offload destinations) are staged by the
     // stage-all of the next invocation, from a provably drained state.
     await this.ops.synchronizeAsync();
+    for (const { sequence, tokens } of restored) {
+      console.log(`Host cache restore complete: sequence=${sequence} prefix-tokens=${tokens} prefill-tokens=${suffixes[sequence].length}`);
+    }
     return suffixes;
   }
 
@@ -234,7 +287,7 @@ export class PrefixTierPolicy {
 }
 
 interface SchedulerOptions {
-  requests: ReturnType<typeof createAsyncQueue<GenerationRequest>>;
+  requests: ReturnType<typeof createAsyncQueue<GenerationEvent>>;
   model: ChatModel;
   ws: ExecutionWorkspace;
   cache: ChatCache;
@@ -255,16 +308,29 @@ export class GenerationScheduler {
   private readonly admitted = new Set<GenerationRequest>();
   private readonly prefixes: PrefixTierPolicy;
   private nextStagingKey = 0;
+  private pendingFlush?: GpuCacheFlushEvent;
 
   constructor(private readonly options: SchedulerOptions) {
     this.prefixes = new PrefixTierPolicy(options.cache.getPagedKV(), options.model.ops, options.hostCache?.getPagedKV());
   }
 
+  /** Queue an admission barrier; resolves after existing requests finish and the cache is flushed. */
+  flushGpuCache(): Promise<GpuCacheFlushResult> {
+    return new Promise((resolve, reject) => {
+      if (!this.options.requests.submit({ kind: "flush_gpu_cache", resolve, reject })) {
+        reject(new Error("Server is shutting down"));
+      }
+    });
+  }
+
   stop(error = new Error("Server shutting down")): void {
     this.options.requests.end();
     for (const request of this.options.requests.clear()) {
-      request.tokens.end(error);
+      if ("kind" in request) request.reject(error);
+      else request.tokens.end(error);
     }
+    this.pendingFlush?.reject(error);
+    this.pendingFlush = undefined;
     for (const request of this.admitted) {
       request.tokens.end(error);
     }
@@ -444,10 +510,27 @@ export class GenerationScheduler {
     while (!requests.ended) {
       // Admission: remove terminated rows, wait if empty, then fill available slots.
       this.removeFinished();
+      if (!this.active.length && this.pendingFlush) {
+        const flush = this.pendingFlush;
+        try {
+          flush.resolve(await this.prefixes.flushGpuCache());
+        } catch (error) {
+          flush.reject(error);
+          throw error;
+        } finally {
+          this.pendingFlush = undefined;
+        }
+        continue;
+      }
       const incoming: GenerationRequest[] = [];
       if (!this.active.length) {
         try {
           const request = await requests.dequeue();
+          if ("kind" in request) {
+            if (requests.ended) request.reject(new Error("Server is shutting down"));
+            else this.pendingFlush = request;
+            continue;
+          }
           if (!request.tokens.ended) {
             incoming.push(request);
           }
@@ -466,9 +549,13 @@ export class GenerationScheduler {
         }
         break;
       }
-      while (this.active.length + incoming.length < maxBatchSize) {
+      while (!this.pendingFlush && this.active.length + incoming.length < maxBatchSize) {
         const request = requests.take();
         if (!request) {
+          break;
+        }
+        if ("kind" in request) {
+          this.pendingFlush = request;
           break;
         }
         if (!request.tokens.ended) {
@@ -483,7 +570,7 @@ export class GenerationScheduler {
         const finalPrefill = await this.prefill();
         await this.yieldToRequests();
         if (!finalPrefill || requests.ended || this.active.some(request => request.tokens.ended)
-          || (this.active.length < maxBatchSize && requests.queued.length > 0)) {
+          || (!this.pendingFlush && this.active.length < maxBatchSize && requests.queued.length > 0)) {
           continue;
         }
         if (!this.active.length) {
@@ -512,7 +599,7 @@ export class GenerationScheduler {
           });
           await this.yieldToRequests();
           if (requests.ended || this.active.some(request => request.tokens.ended)
-            || (this.active.length < maxBatchSize && requests.queued.length > 0)) {
+            || (!this.pendingFlush && this.active.length < maxBatchSize && requests.queued.length > 0)) {
             break;
           }
           stepStart = performance.now();

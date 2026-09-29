@@ -5,7 +5,7 @@ import { tokenizeContinuation } from "./chat-continuation";
 import { type OutputParserEvent } from "./chat-model-parser";
 import { ChatModel, ChatCache, ChatTemplateKwargs, loadGenerationConfig, loadMaxPositionEmbeddings, SamplingParams, Tokenizer } from "./chat_model";
 import { ExecutionWorkspace } from "./execution-workspace";
-import { GenerationScheduler, isFatalCudaError, type GenerationRequest, type ServerMetrics } from "./generation-scheduler";
+import { GenerationScheduler, isFatalCudaError, type GenerationEvent, type GenerationRequest, type ServerMetrics } from "./generation-scheduler";
 import { SamplingWorkspace } from "./sampling";
 import { createDeviceOps, loadModel, ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { ParallelOps } from "./parallel_ops";
@@ -422,6 +422,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const tokenizer = model.tokenizer;
   const eosIds = model.eosIds;
 
+  function logChatDebug(id: string, phase: string, tokenIds: number[], chatTemplateKwargs?: ChatTemplateKwargs): void {
+    if (process.env.GLM_CHAT_DEBUG !== "1") return;
+    console.log(`Chat debug: ${JSON.stringify({
+      id, phase, chatTemplateKwargs, tokenIds,
+      text: tokenizer.decode(tokenIds, { skip_special_tokens: false, clean_up_tokenization_spaces: false }),
+    })}`);
+  }
+
   console.log(`Model loaded. chunk-size=${args.chunkSize} batch-size=${args.batchSize} max-pages=${args.maxPages} max-host-pages=${args.maxHostPages} max-tokens=${args.maxTokens}`);
   console.log(`Generation defaults: temperature=${args.temperature} top-p=${args.topP} top-k=${args.topK} repetition-penalty=${args.repetitionPenalty}`);
 
@@ -466,7 +474,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     };
   }
 
-  const decodeQueue = createAsyncQueue<GenerationRequest>();
+  const decodeQueue = createAsyncQueue<GenerationEvent>();
   const metrics: ServerMetrics = {
     runningRequests: 0,
     generationTokensTotal: 0,
@@ -621,6 +629,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       if (inputIds.length > maxPromptTokens) {
         inputIds.splice(0, inputIds.length - maxPromptTokens);
       }
+      logChatDebug(id, "prompt", inputIds, chatTemplateKwargs);
 
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i].role !== "user") continue;
@@ -809,6 +818,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       } finally {
         closeTokens();
         res.off("close", closeTokens);
+        logChatDebug(id, "output", completionReq.generatedIds);
         if (completionReq.decodeStartedAt !== undefined) logRequestPerformance(completionReq);
       }
     } catch (err) {
@@ -847,10 +857,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           sendJSON(res, 400, { error: { message: "chat_template_kwargs must be an object", type: "invalid_request_error" } });
           return;
         }
-        const tokens = tokenizeMessages(tokenizer, messages, tools, {
+        const effectiveKwargs = {
           ...chatTemplateKwargs,
           ...(params.continue_final_message !== undefined ? { continue_final_message: params.continue_final_message } : {}),
-        });
+        };
+        const tokens = tokenizeMessages(tokenizer, messages, tools, effectiveKwargs);
+        logChatDebug(generateId(), "tokenize", tokens, effectiveKwargs);
         sendJSON(res, 200, {
           count: tokens.length,
           max_model_len: maxModelLen,
@@ -888,8 +900,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       void handleChatCompletions(req, res);
     } else if (req.method === "POST" && url.pathname === "/tokenize") {
       handleTokenize(req, res);
+    } else if (req.method === "POST" && url.pathname === "/flush_gpu_cache") {
+      void scheduler.flushGpuCache().then(result => {
+        sendJSON(res, 200, { status: "ok", ...result });
+      }, error => {
+        sendJSON(res, decodeQueue.ended ? 503 : 500, {
+          error: { message: error instanceof Error ? error.message : "GPU cache flush failed", type: "server_error" },
+        });
+      });
     } else if (req.method === "GET" && url.pathname === "/metrics") {
-      sendMetrics(res, metrics, decodeQueue.queued.length, cache, args.batchSize, args.chunkSize, maxModelLen);
+      sendMetrics(res, metrics, decodeQueue.queued.filter(({ item }) => !("kind" in item)).length, cache, args.batchSize, args.chunkSize, maxModelLen);
     } else if (req.method === "GET" && url.pathname === "/v1/models") {
       const pagedKV = cache.getPagedKV();
       sendJSON(res, 200, {
@@ -917,6 +937,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`OpenAI-compatible server running at http://${args.host}:${args.port}`);
     console.log(`  POST /v1/chat/completions  - Chat completions (streaming & non-streaming)`);
     console.log(`  POST /tokenize             - Tokenize chat messages`);
+    console.log(`  POST /flush_gpu_cache      - Wait for idle, offload retained prefixes, and flush GPU KV`);
     console.log(`  GET  /metrics              - Prometheus metrics`);
     console.log(`  GET  /v1/models            - List models`);
     console.log(`  GET  /version              - vLLM-compatible server version`);

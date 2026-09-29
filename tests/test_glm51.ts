@@ -15,7 +15,7 @@ import { UsingHolder } from "../src/using-holder";
 import { WorkspaceBase } from "../src/workspace";
 import { generateBatchTokens, generateStream } from "../src/run_qwen3_unified";
 import { createAsyncQueue } from "@scrypted/deferred";
-import { GenerationScheduler, type GenerationRequest, type ServerMetrics } from "../src/generation-scheduler";
+import { GenerationScheduler, type GenerationEvent, type GenerationRequest, type ServerMetrics } from "../src/generation-scheduler";
 
 const SMALL_MODEL_DIR = path.resolve(
   __dirname,
@@ -687,7 +687,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     ws = new ExecutionWorkspace(ops, 2, 128);
     using cache = model.createChatCache(32, 2);
     using sampler = new SamplingWorkspace(ops, 6, model.cfg.vocabSize, 8);
-    const requests = createAsyncQueue<GenerationRequest>();
+    const requests = createAsyncQueue<GenerationEvent>();
     const metrics: ServerMetrics = {
       runningRequests: 0, generationTokensTotal: 0, promptTokensTotal: 0,
       specDecodeNumDraftsTotal: 0, specDecodeNumDraftTokensTotal: 0, specDecodeNumAcceptedTokensTotal: 0,
