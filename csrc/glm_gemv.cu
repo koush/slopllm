@@ -1240,14 +1240,15 @@ nvfp4_down_reduce_kernel(
         const auto* w = weight_ptrs[expert] + (size_t)row * (K / 2);
         const auto* scales = scale_ptrs[expert] + (size_t)row * (K / NVFP4_QUANT_GROUP);
         const float scale2 = *scale2_ptrs[expert];
-        float sum[2] = {0.0f, 0.0f};
+        // Compute, reduce, and store each output row before moving to the next.
         #pragma unroll
-        for (int g = inner; g < K / NVFP4_QUANT_GROUP; g += 4) {
-            const auto* xv = reinterpret_cast<const uint4*>(x + g * NVFP4_QUANT_GROUP);
-            const uint4 xw[2] = {xv[0], xv[1]};
-            const __nv_bfloat162* xpair = reinterpret_cast<const __nv_bfloat162*>(xw);
+        for (int r = 0; r < 2; r++) {
+            float sum = 0.0f;
             #pragma unroll
-            for (int r = 0; r < 2; r++) {
+            for (int g = inner; g < K / NVFP4_QUANT_GROUP; g += 4) {
+                const auto* xv = reinterpret_cast<const uint4*>(x + g * NVFP4_QUANT_GROUP);
+                const uint4 xw[2] = {xv[0], xv[1]};
+                const __nv_bfloat162* xpair = reinterpret_cast<const __nv_bfloat162*>(xw);
                 const auto* wr = w + r * 8 * (K / 2);
                 const uint32_t w0 = *reinterpret_cast<const uint32_t*>(wr + g * 8);
                 const uint32_t w1 = *reinterpret_cast<const uint32_t*>(wr + g * 8 + 4);
@@ -1264,14 +1265,11 @@ nvfp4_down_reduce_kernel(
                     accum = __hfma2(fp4x2_to_bfloat162((w1 >> (j * 8)) & 0xff), xpair[4 + j], accum);
                 }
                 const float2 pair = __bfloat1622float2(accum);
-                sum[r] = fmaf(pair.x + pair.y, scale, sum[r]);
+                sum = fmaf(pair.x + pair.y, scale, sum);
             }
-        }
-        #pragma unroll
-        for (int r = 0; r < 2; r++) {
-            sum[r] += __shfl_xor_sync(0xffffffff, sum[r], 2);
-            sum[r] += __shfl_xor_sync(0xffffffff, sum[r], 1);
-            if (inner == 0) down[e][col + r * 8] = __float2bfloat16(sum[r]);
+            sum += __shfl_xor_sync(0xffffffff, sum, 2);
+            sum += __shfl_xor_sync(0xffffffff, sum, 1);
+            if (inner == 0) down[e][col + r * 8] = __float2bfloat16(sum);
         }
     }
     __syncthreads();
